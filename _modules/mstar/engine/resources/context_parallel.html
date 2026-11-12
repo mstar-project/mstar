@@ -1039,7 +1039,9 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">Page ids stay logical and are the same on every rank, so allocation, prefix keys,</span>
 <span class="sd">offload and admission need nothing new. Within a page, logical slot ``s`` belongs to</span>
 <span class="sd">partner ``s % P`` and sits at its physical slot ``s // P``, so each rank stores</span>
-<span class="sd">``page_size // P`` slots a page. ``PagedKVConfig.place`` resolves the placement.</span>
+<span class="sd">``page_size // P`` slots a page. ``PagedKVConfig.place`` resolves the placement. A pool that keeps</span>
+<span class="sd">a sliding window places its first group of layers alone; the window's stay whole on every partner</span>
+<span class="sd">(``PagedKVConfig.placed_groups``).</span>
 
 <span class="sd">Attention over such a pool (``ContextParallelWrapper``) runs on each rank over its own slots and</span>
 <span class="sd">returns the partial with its log-sum-exp; the partners exchange partials and ``merge`` them,</span>
@@ -1705,12 +1707,12 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">    masked the same way. A row this partner holds no query of is left out of its plan.</span>
 
 <span class="sd">    ``paged`` is one eager kernel over this rank's slots per partner, all planned per step.</span>
-<span class="sd">    Eager only: a striped shard plans a leased step copied. The partner plans differ by rank and</span>
-<span class="sd">    no admission bounds them: FlashInfer's paged manager, the one backend that takes a placed pool</span>
-<span class="sd">    (``PlacedAttention``), so the one that plans a ring, bounds no plan at admission, as no refusal</span>
-<span class="sd">    of its planner on lengths is known. A backend whose planner may refuse on lengths (MLA's FA</span>
-<span class="sd">    planner) would have to bound every rank's partner plans at admission before it could plan a</span>
-<span class="sd">    ring, or one rank alone could refuse a lockstep step."""</span>
+<span class="sd">    Eager only: the node never splits a captured step (``SeqShardSpec.eager``). The partner</span>
+<span class="sd">    plans differ by rank and no admission bounds them: FlashInfer's paged manager, the one backend</span>
+<span class="sd">    that takes a placed pool (``PlacedAttention``), so the one that plans a ring, bounds no plan at</span>
+<span class="sd">    admission, as no refusal of its planner on lengths is known. A backend whose planner may refuse</span>
+<span class="sd">    on lengths (MLA's FA planner) would have to bound every rank's partner plans at admission before</span>
+<span class="sd">    it could plan a ring, or one rank alone could refuse a lockstep step."""</span>
 
     <span class="c1"># the step attends its own tokens from the pages, written first (`PlacedAttention.reads_step_kv`)</span>
     <span class="n">reads_step_kv</span> <span class="o">=</span> <span class="kc">False</span>
@@ -1961,10 +1963,11 @@ window.runMermaid = runMermaid;</script>
 <a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.context_parallel.html#mstar.engine.resources.context_parallel.position_pools">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">position_pools</span><span class="p">(</span><span class="n">specs</span><span class="p">:</span> <span class="n">Iterable</span><span class="p">[</span><span class="n">NodeResourceSpec</span><span class="p">],</span> <span class="n">node</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">bool</span><span class="p">]:</span>
 <span class="w">    </span><span class="sd">"""``node``'s resources that hold token positions, each to whether it places them</span>
-<span class="sd">    (``NodeResourceSpec.places_positions``). Raises when one is placed and another isn't."""</span>
+<span class="sd">    (``NodeResourceSpec.storage`` by position or by head; a copied one goes with either). Raises</span>
+<span class="sd">    when one is placed and another isn't."""</span>
     <span class="n">pools</span> <span class="o">=</span> <span class="p">{</span>
-        <span class="n">spec</span><span class="o">.</span><span class="n">resource_key</span><span class="p">:</span> <span class="n">placed</span> <span class="k">for</span> <span class="n">spec</span> <span class="ow">in</span> <span class="n">specs</span>
-        <span class="k">if</span> <span class="n">node</span> <span class="ow">in</span> <span class="n">spec</span><span class="o">.</span><span class="n">nodes</span> <span class="ow">and</span> <span class="p">(</span><span class="n">placed</span> <span class="o">:=</span> <span class="n">spec</span><span class="o">.</span><span class="n">places_positions</span><span class="p">)</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+        <span class="n">spec</span><span class="o">.</span><span class="n">resource_key</span><span class="p">:</span> <span class="n">spec</span><span class="o">.</span><span class="n">storage</span> <span class="o">==</span> <span class="s2">"by_position"</span> <span class="k">for</span> <span class="n">spec</span> <span class="ow">in</span> <span class="n">specs</span>
+        <span class="k">if</span> <span class="n">node</span> <span class="ow">in</span> <span class="n">spec</span><span class="o">.</span><span class="n">nodes</span> <span class="ow">and</span> <span class="n">spec</span><span class="o">.</span><span class="n">storage</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">"by_head"</span><span class="p">,</span> <span class="s2">"by_position"</span><span class="p">)</span>
     <span class="p">}</span>
     <span class="k">if</span> <span class="nb">any</span><span class="p">(</span><span class="n">pools</span><span class="o">.</span><span class="n">values</span><span class="p">())</span> <span class="ow">and</span> <span class="ow">not</span> <span class="nb">all</span><span class="p">(</span><span class="n">pools</span><span class="o">.</span><span class="n">values</span><span class="p">()):</span>
         <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>

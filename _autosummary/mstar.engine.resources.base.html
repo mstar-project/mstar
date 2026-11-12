@@ -928,8 +928,8 @@
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.base.build_resource" title="mstar.engine.resources.base.build_resource"><code class="xref py py-obj docutils literal notranslate"><span class="pre">build_resource</span></code></a>(spec, info)</p></td>
 <td><p></p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.base.head_shards" title="mstar.engine.resources.base.head_shards"><code class="xref py py-obj docutils literal notranslate"><span class="pre">head_shards</span></code></a>(group[, places_positions])</p></td>
-<td><p>How many ways a node's ranks split its attention heads: its TP and SP ranks (CFG ranks run whole branches, every head), or TP alone when its pools place positions over the SP ranks (<code class="docutils literal notranslate"><span class="pre">PagedKVConfig.context_parallel</span></code>).</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.base.head_shards" title="mstar.engine.resources.base.head_shards"><code class="xref py py-obj docutils literal notranslate"><span class="pre">head_shards</span></code></a>(group[, tp_only])</p></td>
+<td><p>How many ways a node's ranks split its attention heads: its TP and SP ranks (CFG ranks run whole branches, every head), or TP alone (<code class="docutils literal notranslate"><span class="pre">tp_only</span></code>) where its pools place positions over the SP ranks (<code class="docutils literal notranslate"><span class="pre">PagedKVConfig.context_parallel</span></code>), or for a resource over pools every SP rank stores whole (<code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.storage</span></code>).</p></td>
 </tr>
 </tbody>
 </table>
@@ -2547,15 +2547,16 @@ step, once its last copy has landed.</p>
 
 <dl class="py function">
 <dt class="sig sig-object py" id="mstar.engine.resources.base.head_shards">
-<span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.base.</span></span><span class="sig-name descname"><span class="pre">head_shards</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">group</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">places_positions</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/base.html#head_shards"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.base.head_shards" title="Link to this definition">#</a></dt>
+<span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.base.</span></span><span class="sig-name descname"><span class="pre">head_shards</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">group</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tp_only</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/base.html#head_shards"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.base.head_shards" title="Link to this definition">#</a></dt>
 <dd><p>How many ways a node’s ranks split its attention heads: its TP and SP ranks (CFG ranks run
-whole branches, every head), or TP alone when its pools place positions over the SP ranks
-(<code class="docutils literal notranslate"><span class="pre">PagedKVConfig.context_parallel</span></code>).</p>
+whole branches, every head), or TP alone (<code class="docutils literal notranslate"><span class="pre">tp_only</span></code>) where its pools place positions over the
+SP ranks (<code class="docutils literal notranslate"><span class="pre">PagedKVConfig.context_parallel</span></code>), or for a resource over pools every SP rank
+stores whole (<code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.storage</span></code>).</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>group</strong> (<em>JointGroups</em><em> | </em><em>None</em>)</p></li>
-<li><p><strong>places_positions</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
+<li><p><strong>tp_only</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
 </ul>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>

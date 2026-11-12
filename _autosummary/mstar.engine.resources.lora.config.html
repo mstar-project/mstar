@@ -1230,9 +1230,9 @@ resource stays free of the manager and its kernels.</p>
 
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.lora.config.LoraSpec.split_step_refusals">
-<span class="sig-name descname"><span class="pre">split_step_refusals</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">node</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">shard</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tp</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">sp</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/lora/config.html#LoraSpec.split_step_refusals"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.lora.config.LoraSpec.split_step_refusals" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">split_step_refusals</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">node</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">shard</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tp</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">sp</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">specs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/lora/config.html#LoraSpec.split_step_refusals"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.lora.config.LoraSpec.split_step_refusals" title="Link to this definition">#</a></dt>
 <dd><p>What this resource can’t run on <code class="docutils literal notranslate"><span class="pre">node</span></code>, whose steps <code class="docutils literal notranslate"><span class="pre">shard</span></code> splits over <code class="docutils literal notranslate"><span class="pre">sp</span></code> SP
-ranks (<code class="docutils literal notranslate"><span class="pre">tp</span></code> TP ranks each); each a sentence.</p>
+ranks (<code class="docutils literal notranslate"><span class="pre">tp</span></code> TP ranks each), among <code class="docutils literal notranslate"><span class="pre">specs</span></code> (every spec, by key); each a sentence.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
@@ -1240,6 +1240,7 @@ ranks (<code class="docutils literal notranslate"><span class="pre">tp</span></c
 <li><p><strong>shard</strong> (<a class="reference internal" href="mstar.engine.resources.html#mstar.engine.resources.SeqShardSpec" title="mstar.engine.resources.SeqShardSpec"><em>SeqShardSpec</em></a>)</p></li>
 <li><p><strong>tp</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
 <li><p><strong>sp</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>specs</strong> (<em>Mapping</em><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference internal" href="mstar.engine.resources.html#mstar.engine.resources.NodeResourceSpec" title="mstar.engine.resources.NodeResourceSpec"><em>NodeResourceSpec</em></a><em>]</em>)</p></li>
 </ul>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>

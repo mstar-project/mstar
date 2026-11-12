@@ -788,6 +788,9 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.AttentionSpec.resolve_exchange"><code class="docutils literal notranslate"><span class="pre">AttentionSpec.resolve_exchange()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.AttentionSpec.resource_class"><code class="docutils literal notranslate"><span class="pre">AttentionSpec.resource_class</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.AttentionSpec.shard_key"><code class="docutils literal notranslate"><span class="pre">AttentionSpec.shard_key</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.AttentionSpec.split_step_refusals"><code class="docutils literal notranslate"><span class="pre">AttentionSpec.split_step_refusals()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.AttentionSpec.splits_eagerly"><code class="docutils literal notranslate"><span class="pre">AttentionSpec.splits_eagerly()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.AttentionSpec.stores_whole"><code class="docutils literal notranslate"><span class="pre">AttentionSpec.stores_whole()</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.AttentionStep"><code class="docutils literal notranslate"><span class="pre">AttentionStep</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -911,10 +914,10 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.KVSpec.derive"><code class="docutils literal notranslate"><span class="pre">KVSpec.derive()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.KVSpec.keeps_prefix_cache"><code class="docutils literal notranslate"><span class="pre">KVSpec.keeps_prefix_cache()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.KVSpec.leader"><code class="docutils literal notranslate"><span class="pre">KVSpec.leader</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.KVSpec.places_positions"><code class="docutils literal notranslate"><span class="pre">KVSpec.places_positions</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.KVSpec.resource_class"><code class="docutils literal notranslate"><span class="pre">KVSpec.resource_class</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.KVSpec.routing_mirror"><code class="docutils literal notranslate"><span class="pre">KVSpec.routing_mirror()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.KVSpec.split_step_refusals"><code class="docutils literal notranslate"><span class="pre">KVSpec.split_step_refusals()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.KVSpec.storage"><code class="docutils literal notranslate"><span class="pre">KVSpec.storage</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.KVStep"><code class="docutils literal notranslate"><span class="pre">KVStep</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -944,7 +947,6 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.NodeResourceSpec.nodes"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.nodes</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.NodeResourceSpec.opt_in"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.opt_in</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.NodeResourceSpec.per_node"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.per_node</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.NodeResourceSpec.places_positions"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.places_positions</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.NodeResourceSpec.prefix_variant"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.prefix_variant()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.NodeResourceSpec.request_config"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.request_config()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.NodeResourceSpec.resolve_exchange"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.resolve_exchange()</span></code></a></li>
@@ -953,6 +955,8 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.NodeResourceSpec.restores_prefix"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.restores_prefix</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.NodeResourceSpec.routing_mirror"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.routing_mirror()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.NodeResourceSpec.split_step_refusals"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.split_step_refusals()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.NodeResourceSpec.splits_eagerly"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.splits_eagerly()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.NodeResourceSpec.storage"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.storage</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.NodeResourceSpec.writes_prefix_snapshots"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.writes_prefix_snapshots</span></code></a></li>
 </ul>
 </li>
@@ -971,8 +975,10 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.PagedKVConfig.max_seq_len"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.max_seq_len</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.PagedKVConfig.num_units"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.num_units</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.PagedKVConfig.page_size"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.page_size</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.PagedKVConfig.paged_for"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.paged_for()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.PagedKVConfig.pages_of"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.pages_of()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.PagedKVConfig.place"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.place()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.PagedKVConfig.placed_groups"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.placed_groups()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.PagedKVConfig.prefix_cache"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.prefix_cache</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.PagedKVConfig.prefix_cache_given"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.prefix_cache_given</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.PagedKVConfig.prefix_cache_salt"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.prefix_cache_salt</span></code></a></li>
@@ -1253,11 +1259,13 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SeqShardSpec.axis"><code class="docutils literal notranslate"><span class="pre">SeqShardSpec.axis</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SeqShardSpec.depends_on"><code class="docutils literal notranslate"><span class="pre">SeqShardSpec.depends_on()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SeqShardSpec.derive"><code class="docutils literal notranslate"><span class="pre">SeqShardSpec.derive()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SeqShardSpec.eager"><code class="docutils literal notranslate"><span class="pre">SeqShardSpec.eager</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SeqShardSpec.exchange"><code class="docutils literal notranslate"><span class="pre">SeqShardSpec.exchange</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SeqShardSpec.exchange_over"><code class="docutils literal notranslate"><span class="pre">SeqShardSpec.exchange_over()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SeqShardSpec.exchanges"><code class="docutils literal notranslate"><span class="pre">SeqShardSpec.exchanges</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SeqShardSpec.labels"><code class="docutils literal notranslate"><span class="pre">SeqShardSpec.labels</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SeqShardSpec.min_tokens"><code class="docutils literal notranslate"><span class="pre">SeqShardSpec.min_tokens</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SeqShardSpec.node_exchange"><code class="docutils literal notranslate"><span class="pre">SeqShardSpec.node_exchange()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SeqShardSpec.resource_class"><code class="docutils literal notranslate"><span class="pre">SeqShardSpec.resource_class</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SeqShardSpec.splits"><code class="docutils literal notranslate"><span class="pre">SeqShardSpec.splits</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SeqShardSpec.stripe_pool"><code class="docutils literal notranslate"><span class="pre">SeqShardSpec.stripe_pool</span></code></a></li>
@@ -1666,13 +1674,14 @@ Idempotent: it runs wherever the specs resolve (<cite>resolve_spec_dependencies<
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.AttentionSpec.resolve_exchange">
 <span class="sig-name descname"><span class="pre">resolve_exchange</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">specs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/attn/config.html#AttentionSpec.resolve_exchange"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.AttentionSpec.resolve_exchange" title="Link to this definition">#</a></dt>
-<dd><p>Its node’s sequence shard’s <code class="docutils literal notranslate"><span class="pre">exchange</span></code> over its pool’s storage.</p>
+<dd><p>Its node’s sequence shard’s <code class="docutils literal notranslate"><span class="pre">exchange</span></code> over its pool’s storage; over KV every rank
+stores whole (<code class="docutils literal notranslate"><span class="pre">stores_whole</span></code>), <code class="docutils literal notranslate"><span class="pre">kv_gather</span></code> wherever the node splits.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><p><strong>specs</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Mapping" title="(in Python v3.12)"><em>Mapping</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference internal" href="mstar.engine.resources.spec.html#mstar.engine.resources.spec.NodeResourceSpec" title="mstar.engine.resources.spec.NodeResourceSpec"><em>NodeResourceSpec</em></a><em>]</em>)</p>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
-<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Literal" title="(in Python v3.12)"><em>Literal</em></a>[‘none’, ‘ulysses’, ‘all_gather’, ‘ring’]</p>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Literal" title="(in Python v3.12)"><em>Literal</em></a>[‘none’, ‘ulysses’, ‘all_gather’, ‘ring’, ‘kv_gather’]</p>
 </dd>
 </dl>
 </dd></dl>
@@ -1690,6 +1699,60 @@ resource stays free of the manager and its kernels.</p>
 <dt class="sig sig-object py" id="mstar.engine.resources.AttentionSpec.shard_key">
 <span class="sig-name descname"><span class="pre">shard_key</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.engine.resources.AttentionSpec.shard_key" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.AttentionSpec.split_step_refusals">
+<span class="sig-name descname"><span class="pre">split_step_refusals</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">node</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">shard</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tp</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">sp</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">specs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/attn/config.html#AttentionSpec.split_step_refusals"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.AttentionSpec.split_step_refusals" title="Link to this definition">#</a></dt>
+<dd><p>What this resource can’t run on <code class="docutils literal notranslate"><span class="pre">node</span></code>, whose steps <code class="docutils literal notranslate"><span class="pre">shard</span></code> splits over <code class="docutils literal notranslate"><span class="pre">sp</span></code> SP
+ranks (<code class="docutils literal notranslate"><span class="pre">tp</span></code> TP ranks each), among <code class="docutils literal notranslate"><span class="pre">specs</span></code> (every spec, by key); each a sentence.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>node</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>shard</strong> (<a class="reference internal" href="#mstar.engine.resources.SeqShardSpec" title="mstar.engine.resources.SeqShardSpec"><em>SeqShardSpec</em></a>)</p></li>
+<li><p><strong>tp</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>sp</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>specs</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Mapping" title="(in Python v3.12)"><em>Mapping</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference internal" href="mstar.engine.resources.spec.html#mstar.engine.resources.spec.NodeResourceSpec" title="mstar.engine.resources.spec.NodeResourceSpec"><em>NodeResourceSpec</em></a><em>]</em>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)">list</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>]</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.AttentionSpec.splits_eagerly">
+<span class="sig-name descname"><span class="pre">splits_eagerly</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">specs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/attn/config.html#AttentionSpec.splits_eagerly"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.AttentionSpec.splits_eagerly" title="Link to this definition">#</a></dt>
+<dd><p>Whether this resource’s split steps run eagerly only, their plans differing by rank
+where a graph holds one: a node with one captures no step that may split
+(<code class="docutils literal notranslate"><span class="pre">SeqShardSpec.eager</span></code>). False (the default) for one whose split steps replay in a graph.
+From raw fields, as <code class="docutils literal notranslate"><span class="pre">resolve_exchange</span></code>.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>specs</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Mapping" title="(in Python v3.12)"><em>Mapping</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference internal" href="mstar.engine.resources.spec.html#mstar.engine.resources.spec.NodeResourceSpec" title="mstar.engine.resources.spec.NodeResourceSpec"><em>NodeResourceSpec</em></a><em>]</em>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)">bool</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.AttentionSpec.stores_whole">
+<span class="sig-name descname"><span class="pre">stores_whole</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">kv</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/attn/config.html#AttentionSpec.stores_whole"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.AttentionSpec.stores_whole" title="Link to this definition">#</a></dt>
+<dd><p>Whether every rank holds this attention’s KV whole: its window layers of a pool placed
+by position, which keeps them whole on every partner so a decode step reads them with no
+collective (<cite>PagedKVConfig.placed_groups</cite>). From raw fields.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>kv</strong> (<a class="reference internal" href="mstar.engine.resources.spec.html#mstar.engine.resources.spec.NodeResourceSpec" title="mstar.engine.resources.spec.NodeResourceSpec"><em>NodeResourceSpec</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)">bool</a></p>
+</dd>
+</dl>
+</dd></dl>
 
 </dd></dl>
 
@@ -2536,14 +2599,6 @@ or not. False (the default) keeps nothing across requests.
 <dd></dd></dl>
 
 <dl class="py property">
-<dt class="sig sig-object py" id="mstar.engine.resources.KVSpec.places_positions">
-<span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">places_positions</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><a class="headerlink" href="#mstar.engine.resources.KVSpec.places_positions" title="Link to this definition">#</a></dt>
-<dd><p>Whether this resource places its token positions over ranks that would otherwise hold
-the same copy (<code class="docutils literal notranslate"><span class="pre">mstar.engine.resources.context_parallel</span></code>); None for one that holds no
-positions to place. A node whose resources place them runs replicated across its SP ranks.</p>
-</dd></dl>
-
-<dl class="py property">
 <dt class="sig sig-object py" id="mstar.engine.resources.KVSpec.resource_class">
 <span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">resource_class</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#type" title="(in Python v3.12)"><span class="pre">type</span></a><span class="p"><span class="pre">[</span></span><a class="reference internal" href="#mstar.engine.resources.Resource" title="mstar.engine.resources.Resource"><span class="pre">Resource</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.engine.resources.KVSpec.resource_class" title="Link to this definition">#</a></dt>
 <dd><p>What builds this spec. Imported inside the property, so declaring a
@@ -2565,9 +2620,9 @@ resource stays free of the manager and its kernels.</p>
 
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.KVSpec.split_step_refusals">
-<span class="sig-name descname"><span class="pre">split_step_refusals</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">node</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">shard</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tp</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">sp</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/config.html#KVSpec.split_step_refusals"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.KVSpec.split_step_refusals" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">split_step_refusals</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">node</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">shard</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tp</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">sp</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">specs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/config.html#KVSpec.split_step_refusals"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.KVSpec.split_step_refusals" title="Link to this definition">#</a></dt>
 <dd><p>What this resource can’t run on <code class="docutils literal notranslate"><span class="pre">node</span></code>, whose steps <code class="docutils literal notranslate"><span class="pre">shard</span></code> splits over <code class="docutils literal notranslate"><span class="pre">sp</span></code> SP
-ranks (<code class="docutils literal notranslate"><span class="pre">tp</span></code> TP ranks each); each a sentence.</p>
+ranks (<code class="docutils literal notranslate"><span class="pre">tp</span></code> TP ranks each), among <code class="docutils literal notranslate"><span class="pre">specs</span></code> (every spec, by key); each a sentence.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
@@ -2575,10 +2630,29 @@ ranks (<code class="docutils literal notranslate"><span class="pre">tp</span></c
 <li><p><strong>shard</strong> (<a class="reference internal" href="#mstar.engine.resources.SeqShardSpec" title="mstar.engine.resources.SeqShardSpec"><em>SeqShardSpec</em></a>)</p></li>
 <li><p><strong>tp</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
 <li><p><strong>sp</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>specs</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Mapping" title="(in Python v3.12)"><em>Mapping</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference internal" href="#mstar.engine.resources.NodeResourceSpec" title="mstar.engine.resources.NodeResourceSpec"><em>NodeResourceSpec</em></a><em>]</em>)</p></li>
 </ul>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)">list</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>]</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py property">
+<dt class="sig sig-object py" id="mstar.engine.resources.KVSpec.storage">
+<span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">storage</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">Storage</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><a class="headerlink" href="#mstar.engine.resources.KVSpec.storage" title="Link to this definition">#</a></dt>
+<dd><p><code class="docutils literal notranslate"><span class="pre">by_head</span></code> (each
+rank a slice of the heads, over TP x SP), <code class="docutils literal notranslate"><span class="pre">by_position</span></code> (each a share of every page’s
+token positions over ranks that would otherwise hold the same heads, heads over TP:
+<code class="docutils literal notranslate"><span class="pre">mstar.engine.resources.context_parallel</span></code>), or <code class="docutils literal notranslate"><span class="pre">copied</span></code> (heads over TP, every SP rank the
+whole state: a recurrent pool). None for one holding none. A resource
+over pools that are all <code class="docutils literal notranslate"><span class="pre">copied</span></code> shards its heads over TP (<code class="docutils literal notranslate"><span class="pre">EngineResourceInfo.head_shards</span></code>),
+and a node whose pools store by position runs copied unless its shard’s exchange splits it.
+From raw fields, as the shard’s hooks.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>How this resource stores its per-request state over a node’s ranks</p>
 </dd>
 </dl>
 </dd></dl>
@@ -2796,14 +2870,6 @@ or not. False (the default) keeps nothing across requests.
 <span class="sig-name descname"><span class="pre">per_node</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.ClassVar" title="(in Python v3.12)"><span class="pre">ClassVar</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a><span class="p"><span class="pre">]</span></span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></span><a class="headerlink" href="#mstar.engine.resources.NodeResourceSpec.per_node" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
-<dl class="py property">
-<dt class="sig sig-object py" id="mstar.engine.resources.NodeResourceSpec.places_positions">
-<span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">places_positions</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><a class="headerlink" href="#mstar.engine.resources.NodeResourceSpec.places_positions" title="Link to this definition">#</a></dt>
-<dd><p>Whether this resource places its token positions over ranks that would otherwise hold
-the same copy (<code class="docutils literal notranslate"><span class="pre">mstar.engine.resources.context_parallel</span></code>); None for one that holds no
-positions to place. A node whose resources place them runs replicated across its SP ranks.</p>
-</dd></dl>
-
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.NodeResourceSpec.prefix_variant">
 <span class="sig-name descname"><span class="pre">prefix_variant</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">model_kwargs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/spec.html#NodeResourceSpec.prefix_variant"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.NodeResourceSpec.prefix_variant" title="Link to this definition">#</a></dt>
@@ -2842,10 +2908,13 @@ settings.</p>
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.NodeResourceSpec.resolve_exchange">
 <span class="sig-name descname"><span class="pre">resolve_exchange</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">specs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/spec.html#NodeResourceSpec.resolve_exchange"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.NodeResourceSpec.resolve_exchange" title="Link to this definition">#</a></dt>
-<dd><p>How a split step’s tokens reach this attention (<code class="docutils literal notranslate"><span class="pre">sequence_shard</span></code>): <code class="docutils literal notranslate"><span class="pre">none</span></code> (the
+<dd><p>How a split step’s tokens reach this resource (<code class="docutils literal notranslate"><span class="pre">sequence_shard</span></code>): <code class="docutils literal notranslate"><span class="pre">none</span></code> (the
 default) for a resource that takes none. From raw fields, so the sequence shard’s
-<code class="docutils literal notranslate"><span class="pre">derive</span></code> can ask in any order; a node’s steps split where any of its attentions answers
-otherwise (<code class="docutils literal notranslate"><span class="pre">SeqShardSpec.splits</span></code>).</p>
+<code class="docutils literal notranslate"><span class="pre">derive</span></code> can ask in any order; a node’s steps split where its shard’s <code class="docutils literal notranslate"><span class="pre">node_exchange</span></code>
+isn’t <code class="docutils literal notranslate"><span class="pre">none</span></code> and any of its resources answers otherwise (<code class="docutils literal notranslate"><span class="pre">SeqShardSpec.splits</span></code>).</p>
+<p>Every hook the sequence shard reads is computed from the spec’s own raw fields and other
+specs’ hooks, never from a field <code class="docutils literal notranslate"><span class="pre">derive</span></code> sets: specs derive in key order, so such a
+field may still hold its default when the shard derives.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><p><strong>specs</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Mapping" title="(in Python v3.12)"><em>Mapping</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference internal" href="#mstar.engine.resources.NodeResourceSpec" title="mstar.engine.resources.NodeResourceSpec"><em>NodeResourceSpec</em></a><em>]</em>)</p>
@@ -2895,9 +2964,9 @@ those of the resources it depends on that restore.</p>
 
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.NodeResourceSpec.split_step_refusals">
-<span class="sig-name descname"><span class="pre">split_step_refusals</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">node</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">shard</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tp</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">sp</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/spec.html#NodeResourceSpec.split_step_refusals"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.NodeResourceSpec.split_step_refusals" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">split_step_refusals</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">node</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">shard</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tp</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">sp</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">specs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/spec.html#NodeResourceSpec.split_step_refusals"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.NodeResourceSpec.split_step_refusals" title="Link to this definition">#</a></dt>
 <dd><p>What this resource can’t run on <code class="docutils literal notranslate"><span class="pre">node</span></code>, whose steps <code class="docutils literal notranslate"><span class="pre">shard</span></code> splits over <code class="docutils literal notranslate"><span class="pre">sp</span></code> SP
-ranks (<code class="docutils literal notranslate"><span class="pre">tp</span></code> TP ranks each); each a sentence.</p>
+ranks (<code class="docutils literal notranslate"><span class="pre">tp</span></code> TP ranks each), among <code class="docutils literal notranslate"><span class="pre">specs</span></code> (every spec, by key); each a sentence.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
@@ -2905,10 +2974,46 @@ ranks (<code class="docutils literal notranslate"><span class="pre">tp</span></c
 <li><p><strong>shard</strong> (<a class="reference internal" href="#mstar.engine.resources.SeqShardSpec" title="mstar.engine.resources.SeqShardSpec"><em>SeqShardSpec</em></a>)</p></li>
 <li><p><strong>tp</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
 <li><p><strong>sp</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>specs</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Mapping" title="(in Python v3.12)"><em>Mapping</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference internal" href="#mstar.engine.resources.NodeResourceSpec" title="mstar.engine.resources.NodeResourceSpec"><em>NodeResourceSpec</em></a><em>]</em>)</p></li>
 </ul>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)">list</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>]</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.NodeResourceSpec.splits_eagerly">
+<span class="sig-name descname"><span class="pre">splits_eagerly</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">specs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/spec.html#NodeResourceSpec.splits_eagerly"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.NodeResourceSpec.splits_eagerly" title="Link to this definition">#</a></dt>
+<dd><p>Whether this resource’s split steps run eagerly only, their plans differing by rank
+where a graph holds one: a node with one captures no step that may split
+(<code class="docutils literal notranslate"><span class="pre">SeqShardSpec.eager</span></code>). False (the default) for one whose split steps replay in a graph.
+From raw fields, as <code class="docutils literal notranslate"><span class="pre">resolve_exchange</span></code>.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>specs</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Mapping" title="(in Python v3.12)"><em>Mapping</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference internal" href="mstar.engine.resources.spec.html#mstar.engine.resources.spec.NodeResourceSpec" title="mstar.engine.resources.spec.NodeResourceSpec"><em>NodeResourceSpec</em></a><em>]</em>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)">bool</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py property">
+<dt class="sig sig-object py" id="mstar.engine.resources.NodeResourceSpec.storage">
+<span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">storage</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Literal" title="(in Python v3.12)"><span class="pre">Literal</span></a><span class="p"><span class="pre">[</span></span><span class="s"><span class="pre">'by_head'</span></span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="s"><span class="pre">'by_position'</span></span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="s"><span class="pre">'copied'</span></span><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><a class="headerlink" href="#mstar.engine.resources.NodeResourceSpec.storage" title="Link to this definition">#</a></dt>
+<dd><p><code class="docutils literal notranslate"><span class="pre">by_head</span></code> (each
+rank a slice of the heads, over TP x SP), <code class="docutils literal notranslate"><span class="pre">by_position</span></code> (each a share of every page’s
+token positions over ranks that would otherwise hold the same heads, heads over TP:
+<code class="docutils literal notranslate"><span class="pre">mstar.engine.resources.context_parallel</span></code>), or <code class="docutils literal notranslate"><span class="pre">copied</span></code> (heads over TP, every SP rank the
+whole state: a recurrent pool). None for one holding none. A resource
+over pools that are all <code class="docutils literal notranslate"><span class="pre">copied</span></code> shards its heads over TP (<code class="docutils literal notranslate"><span class="pre">EngineResourceInfo.head_shards</span></code>),
+and a node whose pools store by position runs copied unless its shard’s exchange splits it.
+From raw fields, as the shard’s hooks.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>How this resource stores its per-request state over a node’s ranks</p>
 </dd>
 </dl>
 </dd></dl>
@@ -3091,6 +3196,26 @@ could not be told apart.</p>
 <dd></dd></dl>
 
 <dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.PagedKVConfig.paged_for">
+<span class="sig-name descname"><span class="pre">paged_for</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">pool</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tp</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">sp</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/config.html#PagedKVConfig.paged_for"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.PagedKVConfig.paged_for" title="Link to this definition">#</a></dt>
+<dd><p>This config as a rank of a node of <code class="docutils literal notranslate"><span class="pre">tp</span></code> x <code class="docutils literal notranslate"><span class="pre">sp</span></code> ranks pages it (<cite>place</cite>): a copy with
+the groups placed when <code class="docutils literal notranslate"><span class="pre">context_parallel</span></code> is on, else this config. What the conductor
+counts a request’s pages with, so its count is the worker’s.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>pool</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>tp</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>sp</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference internal" href="mstar.engine.resources.kv.config.html#mstar.engine.resources.kv.config.PagedKVConfig" title="mstar.engine.resources.kv.config.PagedKVConfig"><em>PagedKVConfig</em></a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.PagedKVConfig.pages_of">
 <span class="sig-name descname"><span class="pre">pages_of</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">units</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">round_up</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/config.html#PagedKVConfig.pages_of"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.PagedKVConfig.pages_of" title="Link to this definition">#</a></dt>
 <dd><p><code class="docutils literal notranslate"><span class="pre">units</span></code> arena pages in pages as <code class="docutils literal notranslate"><span class="pre">max_num_pages</span></code> counts them, rounded down (what
@@ -3124,6 +3249,28 @@ otherwise the block of TP ranks holding this rank’s KV head (<cite>kv_head_rep
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p><a class="reference internal" href="mstar.engine.resources.context_parallel.html#mstar.engine.resources.context_parallel.ContextParallel" title="mstar.engine.resources.context_parallel.ContextParallel">ContextParallel</a> | None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.PagedKVConfig.placed_groups">
+<span class="sig-name descname"><span class="pre">placed_groups</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">pool</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">size</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/config.html#PagedKVConfig.placed_groups"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.PagedKVConfig.placed_groups" title="Link to this definition">#</a></dt>
+<dd><p>The pool’s groups (<cite>keep_window</cite>) with its positions placed over <code class="docutils literal notranslate"><span class="pre">size</span></code> partners: the
+first group’s slots stripe over them, and each window group stays whole on every partner,
+so a decode step attends it with no collective. An arena page then holds <code class="docutils literal notranslate"><span class="pre">1/size</span></code> of a
+first-group page’s slots a rank, so a window group’s page is <code class="docutils literal notranslate"><span class="pre">1/size</span></code> of its unplaced
+tokens; its retention (whole unplaced pages) still keeps the window. From the groups
+<code class="docutils literal notranslate"><span class="pre">keep_window</span></code> derived, so it can run again.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>pool</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>size</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)">tuple</a>[<a class="reference internal" href="mstar.engine.resources.kv.config.html#mstar.engine.resources.kv.config.KVGroup" title="mstar.engine.resources.kv.config.KVGroup"><em>KVGroup</em></a>, …]</p>
 </dd>
 </dl>
 </dd></dl>
@@ -3699,9 +3846,9 @@ resource stays free of the manager and its kernels.</p>
 
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.RaggedAttentionSpec.split_step_refusals">
-<span class="sig-name descname"><span class="pre">split_step_refusals</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">node</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">shard</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tp</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">sp</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/attn/ragged/config.html#RaggedAttentionSpec.split_step_refusals"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.RaggedAttentionSpec.split_step_refusals" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">split_step_refusals</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">node</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">shard</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tp</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">sp</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">specs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/attn/ragged/config.html#RaggedAttentionSpec.split_step_refusals"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.RaggedAttentionSpec.split_step_refusals" title="Link to this definition">#</a></dt>
 <dd><p>What this resource can’t run on <code class="docutils literal notranslate"><span class="pre">node</span></code>, whose steps <code class="docutils literal notranslate"><span class="pre">shard</span></code> splits over <code class="docutils literal notranslate"><span class="pre">sp</span></code> SP
-ranks (<code class="docutils literal notranslate"><span class="pre">tp</span></code> TP ranks each); each a sentence.</p>
+ranks (<code class="docutils literal notranslate"><span class="pre">tp</span></code> TP ranks each), among <code class="docutils literal notranslate"><span class="pre">specs</span></code> (every spec, by key); each a sentence.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
@@ -3709,6 +3856,7 @@ ranks (<code class="docutils literal notranslate"><span class="pre">tp</span></c
 <li><p><strong>shard</strong> (<a class="reference internal" href="#mstar.engine.resources.SeqShardSpec" title="mstar.engine.resources.SeqShardSpec"><em>SeqShardSpec</em></a>)</p></li>
 <li><p><strong>tp</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
 <li><p><strong>sp</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>specs</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Mapping" title="(in Python v3.12)"><em>Mapping</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference internal" href="#mstar.engine.resources.NodeResourceSpec" title="mstar.engine.resources.NodeResourceSpec"><em>NodeResourceSpec</em></a><em>]</em>)</p></li>
 </ul>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
@@ -3833,9 +3981,9 @@ resource stays free of the manager and its kernels.</p>
 
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.RaggedCrossAttentionSpec.split_step_refusals">
-<span class="sig-name descname"><span class="pre">split_step_refusals</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">node</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">shard</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tp</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">sp</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/attn/ragged/config.html#RaggedCrossAttentionSpec.split_step_refusals"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.RaggedCrossAttentionSpec.split_step_refusals" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">split_step_refusals</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">node</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">shard</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tp</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">sp</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">specs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/attn/ragged/config.html#RaggedCrossAttentionSpec.split_step_refusals"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.RaggedCrossAttentionSpec.split_step_refusals" title="Link to this definition">#</a></dt>
 <dd><p>What this resource can’t run on <code class="docutils literal notranslate"><span class="pre">node</span></code>, whose steps <code class="docutils literal notranslate"><span class="pre">shard</span></code> splits over <code class="docutils literal notranslate"><span class="pre">sp</span></code> SP
-ranks (<code class="docutils literal notranslate"><span class="pre">tp</span></code> TP ranks each); each a sentence.</p>
+ranks (<code class="docutils literal notranslate"><span class="pre">tp</span></code> TP ranks each), among <code class="docutils literal notranslate"><span class="pre">specs</span></code> (every spec, by key); each a sentence.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
@@ -3843,6 +3991,7 @@ ranks (<code class="docutils literal notranslate"><span class="pre">tp</span></c
 <li><p><strong>shard</strong> (<a class="reference internal" href="#mstar.engine.resources.SeqShardSpec" title="mstar.engine.resources.SeqShardSpec"><em>SeqShardSpec</em></a>)</p></li>
 <li><p><strong>tp</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
 <li><p><strong>sp</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>specs</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Mapping" title="(in Python v3.12)"><em>Mapping</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference internal" href="#mstar.engine.resources.NodeResourceSpec" title="mstar.engine.resources.NodeResourceSpec"><em>NodeResourceSpec</em></a><em>]</em>)</p></li>
 </ul>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
@@ -5495,9 +5644,10 @@ into contiguous ranges; <code class="docutils literal notranslate"><span class="
 of a label one length). <code class="docutils literal notranslate"><span class="pre">walks</span></code> lists the walks that may split (None: every walk); the
 others plan copied. A step splits only when it is not one token a row, its listed tokens are
 at least <code class="docutils literal notranslate"><span class="pre">max(sp,</span> <span class="pre">min_tokens)</span></code>, and every listed label has at least <code class="docutils literal notranslate"><span class="pre">sp</span></code> tokens (a row,
-for <code class="docutils literal notranslate"><span class="pre">axis</span></code> 1), so no rank gets an empty range. <code class="docutils literal notranslate"><span class="pre">min_tokens</span></code> is a <code class="docutils literal notranslate"><span class="pre">resources:</span></code> override.</p>
+for <code class="docutils literal notranslate"><span class="pre">axis</span></code> 1), so no rank gets an empty range. <code class="docutils literal notranslate"><span class="pre">min_tokens</span></code> is a <code class="docutils literal notranslate"><span class="pre">resources:</span></code> override,
+a floor above the one the node sets itself (below).</p>
 <p><code class="docutils literal notranslate"><span class="pre">exchange</span></code>, also a <code class="docutils literal notranslate"><span class="pre">resources:</span></code> override, is how a split step’s tokens reach the node’s
-paged attentions, from the storage of their KV:</p>
+paged attentions, from the storage of the node’s pools (<code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.storage</span></code>):</p>
 <ul class="simple">
 <li><p><code class="docutils literal notranslate"><span class="pre">auto</span></code> (the default): Ulysses over KV stored by head; over KV stored by position
 (<code class="docutils literal notranslate"><span class="pre">context_parallel</span></code>) the node runs copied, so splitting there is the deployment’s to opt into;</p></li>
@@ -5505,9 +5655,11 @@ paged attentions, from the storage of their KV:</p>
 stored position): split;</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">none</span></code>: never split.</p></li>
 </ul>
-<p>A ragged attention takes a split label by Ulysses wherever it plans one this shard lists
-(<code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec.labels</span></code>), which <code class="docutils literal notranslate"><span class="pre">exchange</span></code> doesn’t change; a shard that never splits
-stops it splitting too.</p>
+<p>Where the node splits, a resource over state every rank stores whole takes its own exchange
+whatever this one is: a window attention gathers the step’s keys (<code class="docutils literal notranslate"><span class="pre">kv_gather</span></code>), a recurrent
+layer the one its head counts allow. So does a ragged attention, by Ulysses wherever it plans a
+label this shard lists (<code class="docutils literal notranslate"><span class="pre">RaggedAttentionSpec.labels</span></code>); a shard that never splits stops them
+all splitting.</p>
 <p><code class="docutils literal notranslate"><span class="pre">exchanges=False</span></code> declares that no op on the node mixes a listed label’s units (a video
 decoder’s independent clips): nothing exchanges them, so the node needs no attention, and a
 rank may get an empty range (fewer units than ranks still splits; <code class="docutils literal notranslate"><span class="pre">gather</span></code> takes it).</p>
@@ -5515,10 +5667,16 @@ rank may get an empty range (fewer units than ranks still splits; <code class="d
 <code class="docutils literal notranslate"><span class="pre">derive</span></code>. A model declares no step for it: its step is the node’s segments and
 <code class="docutils literal notranslate"><span class="pre">combined_labels</span></code> (<code class="docutils literal notranslate"><span class="pre">Resource.steps_from_segments</span></code>), so a combined plan label gets a range
 over its sources too; at one SP rank it plans copied at no cost.</p>
-<p>Two fields are derived from <code class="docutils literal notranslate"><span class="pre">exchange</span></code> and the resources on its nodes (<code class="docutils literal notranslate"><span class="pre">derive</span></code>):
-<code class="docutils literal notranslate"><span class="pre">splits</span></code>, whether the node’s steps may split (not where <code class="docutils literal notranslate"><span class="pre">exchange</span></code> resolves to <code class="docutils literal notranslate"><span class="pre">none</span></code>,
-or where no attention there takes split steps and <code class="docutils literal notranslate"><span class="pre">exchanges</span></code> is True), and <code class="docutils literal notranslate"><span class="pre">stripe_pool</span></code>, the pool a ring
-attention reads, by whose stored positions each step is striped.</p>
+<p>Two fields are derived from <code class="docutils literal notranslate"><span class="pre">exchange</span></code> and the resources on its nodes (<code class="docutils literal notranslate"><span class="pre">derive</span></code>), from
+their hooks alone: <code class="docutils literal notranslate"><span class="pre">splits</span></code>, whether the node’s steps may split (not where <code class="docutils literal notranslate"><span class="pre">exchange</span></code>
+resolves to <code class="docutils literal notranslate"><span class="pre">none</span></code>, or where no resource there takes split steps and <code class="docutils literal notranslate"><span class="pre">exchanges</span></code> is True);
+<code class="docutils literal notranslate"><span class="pre">stripe_pool</span></code>, the pool a ring attention reads, by whose stored positions each step is
+striped; and <code class="docutils literal notranslate"><span class="pre">eager</span></code>, whether a resource there splits its steps eagerly only
+(<code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.splits_eagerly</span></code>: a ring, <code class="docutils literal notranslate"><span class="pre">kv_gather</span></code>, a recurrent layer). Such a node
+never splits a captured step: at load the shard sets, for each walk it splits, a floor one
+past that walk’s largest captured bucket (<code class="docutils literal notranslate"><span class="pre">SequenceShard.check_captures</span></code>), the same on
+every rank, so a step that fits a captured bucket runs copied in its graph and a bigger one
+runs eagerly and splits (<code class="docutils literal notranslate"><span class="pre">min_tokens</span></code> raises the floor, never lowers it).</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
@@ -5583,6 +5741,11 @@ Idempotent: it runs wherever the specs resolve (<cite>resolve_spec_dependencies<
 </dd></dl>
 
 <dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.resources.SeqShardSpec.eager">
+<span class="sig-name descname"><span class="pre">eager</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">False</span></span><a class="headerlink" href="#mstar.engine.resources.SeqShardSpec.eager" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.engine.resources.SeqShardSpec.exchange">
 <span class="sig-name descname"><span class="pre">exchange</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">SpExchange</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">Literal</span><span class="p"><span class="pre">[</span></span><span class="s"><span class="pre">'auto'</span></span><span class="p"><span class="pre">]</span></span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'auto'</span></span><a class="headerlink" href="#mstar.engine.resources.SeqShardSpec.exchange" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
@@ -5615,6 +5778,20 @@ Idempotent: it runs wherever the specs resolve (<cite>resolve_spec_dependencies<
 <dt class="sig sig-object py" id="mstar.engine.resources.SeqShardSpec.min_tokens">
 <span class="sig-name descname"><span class="pre">min_tokens</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">0</span></span><a class="headerlink" href="#mstar.engine.resources.SeqShardSpec.min_tokens" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.SeqShardSpec.node_exchange">
+<span class="sig-name descname"><span class="pre">node_exchange</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">specs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/sequence_shard.html#SeqShardSpec.node_exchange"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.SeqShardSpec.node_exchange" title="Link to this definition">#</a></dt>
+<dd><p><code class="docutils literal notranslate"><span class="pre">exchange</span></code> over the storage of the pools on its nodes, from raw fields.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>specs</strong> (<em>Mapping</em><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference internal" href="#mstar.engine.resources.NodeResourceSpec" title="mstar.engine.resources.NodeResourceSpec"><em>NodeResourceSpec</em></a><em>]</em>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>SpExchange</p>
+</dd>
+</dl>
+</dd></dl>
 
 <dl class="py property">
 <dt class="sig sig-object py" id="mstar.engine.resources.SeqShardSpec.resource_class">
@@ -6901,6 +7078,9 @@ conductor validates a deployment.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.AttentionSpec.resolve_exchange"><code class="docutils literal notranslate"><span class="pre">AttentionSpec.resolve_exchange()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.AttentionSpec.resource_class"><code class="docutils literal notranslate"><span class="pre">AttentionSpec.resource_class</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.AttentionSpec.shard_key"><code class="docutils literal notranslate"><span class="pre">AttentionSpec.shard_key</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.AttentionSpec.split_step_refusals"><code class="docutils literal notranslate"><span class="pre">AttentionSpec.split_step_refusals()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.AttentionSpec.splits_eagerly"><code class="docutils literal notranslate"><span class="pre">AttentionSpec.splits_eagerly()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.AttentionSpec.stores_whole"><code class="docutils literal notranslate"><span class="pre">AttentionSpec.stores_whole()</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.AttentionStep"><code class="docutils literal notranslate"><span class="pre">AttentionStep</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -7024,10 +7204,10 @@ conductor validates a deployment.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.KVSpec.derive"><code class="docutils literal notranslate"><span class="pre">KVSpec.derive()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.KVSpec.keeps_prefix_cache"><code class="docutils literal notranslate"><span class="pre">KVSpec.keeps_prefix_cache()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.KVSpec.leader"><code class="docutils literal notranslate"><span class="pre">KVSpec.leader</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.KVSpec.places_positions"><code class="docutils literal notranslate"><span class="pre">KVSpec.places_positions</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.KVSpec.resource_class"><code class="docutils literal notranslate"><span class="pre">KVSpec.resource_class</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.KVSpec.routing_mirror"><code class="docutils literal notranslate"><span class="pre">KVSpec.routing_mirror()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.KVSpec.split_step_refusals"><code class="docutils literal notranslate"><span class="pre">KVSpec.split_step_refusals()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.KVSpec.storage"><code class="docutils literal notranslate"><span class="pre">KVSpec.storage</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.KVStep"><code class="docutils literal notranslate"><span class="pre">KVStep</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -7057,7 +7237,6 @@ conductor validates a deployment.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.NodeResourceSpec.nodes"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.nodes</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.NodeResourceSpec.opt_in"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.opt_in</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.NodeResourceSpec.per_node"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.per_node</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.NodeResourceSpec.places_positions"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.places_positions</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.NodeResourceSpec.prefix_variant"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.prefix_variant()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.NodeResourceSpec.request_config"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.request_config()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.NodeResourceSpec.resolve_exchange"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.resolve_exchange()</span></code></a></li>
@@ -7066,6 +7245,8 @@ conductor validates a deployment.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.NodeResourceSpec.restores_prefix"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.restores_prefix</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.NodeResourceSpec.routing_mirror"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.routing_mirror()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.NodeResourceSpec.split_step_refusals"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.split_step_refusals()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.NodeResourceSpec.splits_eagerly"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.splits_eagerly()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.NodeResourceSpec.storage"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.storage</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.NodeResourceSpec.writes_prefix_snapshots"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.writes_prefix_snapshots</span></code></a></li>
 </ul>
 </li>
@@ -7084,8 +7265,10 @@ conductor validates a deployment.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.PagedKVConfig.max_seq_len"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.max_seq_len</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.PagedKVConfig.num_units"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.num_units</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.PagedKVConfig.page_size"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.page_size</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.PagedKVConfig.paged_for"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.paged_for()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.PagedKVConfig.pages_of"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.pages_of()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.PagedKVConfig.place"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.place()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.PagedKVConfig.placed_groups"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.placed_groups()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.PagedKVConfig.prefix_cache"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.prefix_cache</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.PagedKVConfig.prefix_cache_given"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.prefix_cache_given</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.PagedKVConfig.prefix_cache_salt"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.prefix_cache_salt</span></code></a></li>
@@ -7366,11 +7549,13 @@ conductor validates a deployment.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SeqShardSpec.axis"><code class="docutils literal notranslate"><span class="pre">SeqShardSpec.axis</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SeqShardSpec.depends_on"><code class="docutils literal notranslate"><span class="pre">SeqShardSpec.depends_on()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SeqShardSpec.derive"><code class="docutils literal notranslate"><span class="pre">SeqShardSpec.derive()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SeqShardSpec.eager"><code class="docutils literal notranslate"><span class="pre">SeqShardSpec.eager</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SeqShardSpec.exchange"><code class="docutils literal notranslate"><span class="pre">SeqShardSpec.exchange</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SeqShardSpec.exchange_over"><code class="docutils literal notranslate"><span class="pre">SeqShardSpec.exchange_over()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SeqShardSpec.exchanges"><code class="docutils literal notranslate"><span class="pre">SeqShardSpec.exchanges</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SeqShardSpec.labels"><code class="docutils literal notranslate"><span class="pre">SeqShardSpec.labels</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SeqShardSpec.min_tokens"><code class="docutils literal notranslate"><span class="pre">SeqShardSpec.min_tokens</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SeqShardSpec.node_exchange"><code class="docutils literal notranslate"><span class="pre">SeqShardSpec.node_exchange()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SeqShardSpec.resource_class"><code class="docutils literal notranslate"><span class="pre">SeqShardSpec.resource_class</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SeqShardSpec.splits"><code class="docutils literal notranslate"><span class="pre">SeqShardSpec.splits</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.SeqShardSpec.stripe_pool"><code class="docutils literal notranslate"><span class="pre">SeqShardSpec.stripe_pool</span></code></a></li>

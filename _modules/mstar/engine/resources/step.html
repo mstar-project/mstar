@@ -1356,7 +1356,7 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># declared array or sampler -&gt; what this step does to it, which the engine</span>
     <span class="c1"># expands into ``steps`` (`mstar.engine.state.adapters.state_steps`)</span>
     <span class="n">state</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Any</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default_factory</span><span class="o">=</span><span class="nb">dict</span><span class="p">)</span>
-    <span class="c1"># the handles of what ``state`` lists, set by that expansion</span>
+    <span class="c1"># the handles of what ``state`` lists, and of the node's sequence shard, set by that expansion</span>
     <span class="n">state_handles</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="n">StepHandle</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="p">(),</span> <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">__post_init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>

@@ -1051,7 +1051,7 @@ window.runMermaid = runMermaid;</script>
 
 <span class="c1"># The DiT's self-attention: the array over its tokens, and the read that names its resource.</span>
 <span class="n">DIT_TOKENS</span><span class="p">,</span> <span class="n">SELF_ATTN</span> <span class="o">=</span> <span class="s2">"dit_tokens"</span><span class="p">,</span> <span class="s2">"dit_self_attn"</span>
-<span class="c1"># On SP ranks, splits each row of the DiT's tokens over them (Wan22Model.get_node_resources).</span>
+<span class="c1"># On SP ranks, splits each row of the DiT's tokens over them (the SeqShard in Wan22Model.declare_state).</span>
 <span class="n">DIT_SHARD</span> <span class="o">=</span> <span class="s2">"dit_seq_shard"</span>
 
 

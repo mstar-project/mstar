@@ -1043,7 +1043,7 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Mapping</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">enum</span><span class="w"> </span><span class="kn">import</span> <span class="n">Enum</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">TYPE_CHECKING</span><span class="p">,</span> <span class="n">Literal</span><span class="p">,</span> <span class="n">get_args</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">TYPE_CHECKING</span><span class="p">,</span> <span class="n">Literal</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.kv.config</span><span class="w"> </span><span class="kn">import</span> <span class="n">KVConfig</span><span class="p">,</span> <span class="n">KVLayout</span><span class="p">,</span> <span class="n">PagedKVConfig</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.spec</span><span class="w"> </span><span class="kn">import</span> <span class="n">CombinedSplit</span><span class="p">,</span> <span class="n">NodeResourceSpec</span>
@@ -1051,6 +1051,7 @@ window.runMermaid = runMermaid;</script>
 
 <span class="k">if</span> <span class="n">TYPE_CHECKING</span><span class="p">:</span>
     <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">Resource</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.sequence_shard</span><span class="w"> </span><span class="kn">import</span> <span class="n">SeqShardSpec</span>
 
 <span class="n">logger</span> <span class="o">=</span> <span class="n">logging</span><span class="o">.</span><span class="n">getLogger</span><span class="p">(</span><span class="vm">__name__</span><span class="p">)</span>
 
@@ -1118,8 +1119,11 @@ window.runMermaid = runMermaid;</script>
 
 
 
-<span class="n">SpExchange</span> <span class="o">=</span> <span class="n">Literal</span><span class="p">[</span><span class="s2">"none"</span><span class="p">,</span> <span class="s2">"ulysses"</span><span class="p">,</span> <span class="s2">"all_gather"</span><span class="p">,</span> <span class="s2">"ring"</span><span class="p">]</span>
-<span class="n">SP_EXCHANGES</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="n">SpExchange</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span> <span class="o">=</span> <span class="n">get_args</span><span class="p">(</span><span class="n">SpExchange</span><span class="p">)</span>
+<span class="c1"># how a split step's tokens reach an attention (`sequence_shard`); "kv_gather" is what one over</span>
+<span class="c1"># layers every SP rank stores whole takes wherever its node splits, never a deployment's choice</span>
+<span class="n">SpExchange</span> <span class="o">=</span> <span class="n">Literal</span><span class="p">[</span><span class="s2">"none"</span><span class="p">,</span> <span class="s2">"ulysses"</span><span class="p">,</span> <span class="s2">"all_gather"</span><span class="p">,</span> <span class="s2">"ring"</span><span class="p">,</span> <span class="s2">"kv_gather"</span><span class="p">]</span>
+<span class="c1"># the values a sequence shard's ``exchange`` takes besides ``auto``</span>
+<span class="n">SP_EXCHANGES</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="n">SpExchange</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span> <span class="o">=</span> <span class="p">(</span><span class="s2">"none"</span><span class="p">,</span> <span class="s2">"ulysses"</span><span class="p">,</span> <span class="s2">"all_gather"</span><span class="p">,</span> <span class="s2">"ring"</span><span class="p">)</span>
 
 
 <div class="viewcode-block" id="AttentionSpec">
@@ -1152,10 +1156,48 @@ window.runMermaid = runMermaid;</script>
 <div class="viewcode-block" id="AttentionSpec.resolve_exchange">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.attn.config.html#mstar.engine.resources.AttentionSpec.resolve_exchange">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">resolve_exchange</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">specs</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">NodeResourceSpec</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="n">SpExchange</span><span class="p">:</span>
-<span class="w">        </span><span class="sd">"""Its node's sequence shard's ``exchange`` over its pool's storage."""</span>
+<span class="w">        </span><span class="sd">"""Its node's sequence shard's ``exchange`` over its pool's storage; over KV every rank</span>
+<span class="sd">        stores whole (``stores_whole``), ``kv_gather`` wherever the node splits."""</span>
         <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.sequence_shard</span><span class="w"> </span><span class="kn">import</span> <span class="n">shard_exchange</span>
 
-        <span class="k">return</span> <span class="n">shard_exchange</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">specs</span><span class="p">,</span> <span class="nb">bool</span><span class="p">(</span><span class="n">specs</span><span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">kv_cache</span><span class="p">]</span><span class="o">.</span><span class="n">places_positions</span><span class="p">))</span></div>
+        <span class="n">exchange</span> <span class="o">=</span> <span class="n">shard_exchange</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">specs</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">exchange</span> <span class="o">!=</span> <span class="s2">"none"</span> <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">stores_whole</span><span class="p">(</span><span class="n">specs</span><span class="p">[</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">kv_cache</span><span class="p">]):</span>
+            <span class="k">return</span> <span class="s2">"kv_gather"</span>
+        <span class="k">return</span> <span class="n">exchange</span></div>
+
+
+<div class="viewcode-block" id="AttentionSpec.splits_eagerly">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.attn.config.html#mstar.engine.resources.AttentionSpec.splits_eagerly">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">splits_eagerly</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">specs</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">NodeResourceSpec</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+        <span class="c1"># the ring's partner plans and kv_gather's own-query plans differ by rank</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">resolve_exchange</span><span class="p">(</span><span class="n">specs</span><span class="p">)</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">"ring"</span><span class="p">,</span> <span class="s2">"kv_gather"</span><span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="AttentionSpec.stores_whole">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.attn.config.html#mstar.engine.resources.AttentionSpec.stores_whole">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">stores_whole</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">kv</span><span class="p">:</span> <span class="n">NodeResourceSpec</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Whether every rank holds this attention's KV whole: its window layers of a pool placed</span>
+<span class="sd">        by position, which keeps them whole on every partner so a decode step reads them with no</span>
+<span class="sd">        collective (`PagedKVConfig.placed_groups`). From raw fields."""</span>
+        <span class="n">window</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="p">,</span> <span class="s2">"sliding_window"</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">kv</span><span class="o">.</span><span class="n">storage</span> <span class="o">==</span> <span class="s2">"by_position"</span> <span class="ow">and</span> <span class="n">window</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">window</span> <span class="o">&lt;</span> <span class="n">kv</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">max_seq_len</span></div>
+
+
+<div class="viewcode-block" id="AttentionSpec.split_step_refusals">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.attn.config.html#mstar.engine.resources.AttentionSpec.split_step_refusals">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">split_step_refusals</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">node</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">shard</span><span class="p">:</span> <span class="s2">"SeqShardSpec"</span><span class="p">,</span> <span class="n">tp</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">sp</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">specs</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">NodeResourceSpec</span><span class="p">],</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]:</span>
+        <span class="c1"># kv_gather plans each rank's contiguous pieces of a row (`SeqRange.row_pieces`), which a</span>
+        <span class="c1"># ring's striped step doesn't give it; an axis-1 split the pool stored by position refuses</span>
+        <span class="k">if</span> <span class="n">shard</span><span class="o">.</span><span class="n">stripe_pool</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">resolve_exchange</span><span class="p">(</span><span class="n">specs</span><span class="p">)</span> <span class="o">!=</span> <span class="s2">"kv_gather"</span><span class="p">:</span>
+            <span class="k">return</span> <span class="p">[]</span>
+        <span class="k">return</span> <span class="p">[</span>
+            <span class="sa">f</span><span class="s2">"attention </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">resource_key</span><span class="si">!r}</span><span class="s2"> gathers a split step's keys into KV </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">kv_cache</span><span class="si">!r}</span><span class="s2">, which "</span>
+            <span class="sa">f</span><span class="s2">"every rank stores whole (kv_gather), planning each rank's contiguous pieces of a row, and node "</span>
+            <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">node</span><span class="si">!r}</span><span class="s2">'s sequence shard stripes its steps by KV </span><span class="si">{</span><span class="n">shard</span><span class="o">.</span><span class="n">stripe_pool</span><span class="si">!r}</span><span class="s2">'s stored positions (its "</span>
+            <span class="s2">"exchange ring): split it by all_gather"</span>
+        <span class="p">]</span></div>
 
 
 <div class="viewcode-block" id="AttentionSpec.combined_splits">

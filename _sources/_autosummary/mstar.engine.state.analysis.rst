@@ -17,6 +17,7 @@ mstar.engine.state.analysis
       deployment_problems
       position_key
       query_array
+      shard_axis
       split_read_problems
       state_declaration_problems
    

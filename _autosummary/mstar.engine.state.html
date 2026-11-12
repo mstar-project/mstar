@@ -891,6 +891,14 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.Segment.span"><code class="docutils literal notranslate"><span class="pre">Segment.span</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.SeqShard"><code class="docutils literal notranslate"><span class="pre">SeqShard</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.SeqShard.exchange"><code class="docutils literal notranslate"><span class="pre">SeqShard.exchange</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.SeqShard.labels"><code class="docutils literal notranslate"><span class="pre">SeqShard.labels</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.SeqShard.name"><code class="docutils literal notranslate"><span class="pre">SeqShard.name</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.SeqShard.nodes"><code class="docutils literal notranslate"><span class="pre">SeqShard.nodes</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.SeqShard.walks"><code class="docutils literal notranslate"><span class="pre">SeqShard.walks</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.SlotLease"><code class="docutils literal notranslate"><span class="pre">SlotLease</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.SlotLease.bucket"><code class="docutils literal notranslate"><span class="pre">SlotLease.bucket</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.SlotLease.slot"><code class="docutils literal notranslate"><span class="pre">SlotLease.slot</span></code></a></li>
@@ -921,12 +929,15 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.at_last_token"><code class="docutils literal notranslate"><span class="pre">at_last_token()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.causal_conv"><code class="docutils literal notranslate"><span class="pre">causal_conv()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.gated_delta_net"><code class="docutils literal notranslate"><span class="pre">gated_delta_net()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.gather"><code class="docutils literal notranslate"><span class="pre">gather()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.host"><code class="docutils literal notranslate"><span class="pre">host()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.last_sampled"><code class="docutils literal notranslate"><span class="pre">last_sampled()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.position"><code class="docutils literal notranslate"><span class="pre">position()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.positions"><code class="docutils literal notranslate"><span class="pre">positions()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.rope"><code class="docutils literal notranslate"><span class="pre">rope()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.sample"><code class="docutils literal notranslate"><span class="pre">sample()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.scatter"><code class="docutils literal notranslate"><span class="pre">scatter()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.split_range"><code class="docutils literal notranslate"><span class="pre">split_range()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.state_op"><code class="docutils literal notranslate"><span class="pre">state_op()</span></code></a></li>
 </ul>
             </nav>
@@ -1806,6 +1817,60 @@ __init__ is the expensive way to do that.</p>
 </dd></dl>
 
 <dl class="py class">
+<dt class="sig sig-object py" id="mstar.engine.state.SeqShard">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.state.</span></span><span class="sig-name descname"><span class="pre">SeqShard</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">name</span></span></em>, <em class="sig-param"><span class="keyword-only-separator o"><abbr title="Keyword-only parameters separator (PEP 3102)"><span class="pre">*</span></abbr></span></em>, <em class="sig-param"><span class="n"><span class="pre">nodes</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">labels</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">frozenset({'main'})</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">walks</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">exchange</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">'auto'</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/state/contract.html#SeqShard"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.state.SeqShard" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
+<p>A node’s steps may split over its SP ranks: per step, the engine decides from the step whether <code class="docutils literal notranslate"><span class="pre">labels</span></code>’
+tokens split, each rank running the token-local layers on its share, or are copied. A layer stack calls
+<cite>scatter</cite> before and <cite>gather</cite> after; at one SP rank, and on a copied step, both pass their inputs through. Reads
+and updates of the node’s arrays exchange what a split step needs by themselves.</p>
+<p><code class="docutils literal notranslate"><span class="pre">labels</span></code> lists one label, which an array on <code class="docutils literal notranslate"><span class="pre">nodes</span></code> opens, since the shard’s handle brackets one; a node with
+no arrays declares a <cite>SeqShardSpec</cite> itself. The shard cuts the label’s tensors as the node’s reads take queries on
+it: rows of one span (<code class="docutils literal notranslate"><span class="pre">Read.packed</span></code> False, not <code class="docutils literal notranslate"><span class="pre">segmented</span></code>) each row alike, packed tokens or a request’s
+segments in one row contiguously; the reads take one of the two. <code class="docutils literal notranslate"><span class="pre">walks</span></code> are the walks whose steps may split,
+as a row’s walk (a combined walk splits where a walk it combines is listed); None: every walk. <code class="docutils literal notranslate"><span class="pre">exchange</span></code> is the
+author’s default for how a split step reaches the node’s paged attentions, which the deployment’s <code class="docutils literal notranslate"><span class="pre">resources:</span></code>
+block overrides under the shard’s name: <code class="docutils literal notranslate"><span class="pre">auto</span></code> (Ulysses over KV stored by head, copied over KV stored by
+position), <code class="docutils literal notranslate"><span class="pre">none</span></code> (never split), <code class="docutils literal notranslate"><span class="pre">ulysses</span></code>, <code class="docutils literal notranslate"><span class="pre">all_gather</span></code> or <code class="docutils literal notranslate"><span class="pre">ring</span></code>.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>name</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>nodes</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#frozenset" title="(in Python v3.12)"><em>frozenset</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>]</em>)</p></li>
+<li><p><strong>labels</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#frozenset" title="(in Python v3.12)"><em>frozenset</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>]</em>)</p></li>
+<li><p><strong>walks</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#frozenset" title="(in Python v3.12)"><em>frozenset</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>] </em><em>| </em><em>None</em>)</p></li>
+<li><p><strong>exchange</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Literal" title="(in Python v3.12)"><em>Literal</em></a><em>[</em><em>'auto'</em><em>, </em><em>'none'</em><em>, </em><em>'ulysses'</em><em>, </em><em>'all_gather'</em><em>, </em><em>'ring'</em><em>]</em>)</p></li>
+</ul>
+</dd>
+</dl>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.state.SeqShard.exchange">
+<span class="sig-name descname"><span class="pre">exchange</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Literal" title="(in Python v3.12)"><span class="pre">Literal</span></a><span class="p"><span class="pre">[</span></span><span class="s"><span class="pre">'auto'</span></span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="s"><span class="pre">'none'</span></span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="s"><span class="pre">'ulysses'</span></span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="s"><span class="pre">'all_gather'</span></span><span class="p"><span class="pre">,</span></span><span class="w"> </span><span class="s"><span class="pre">'ring'</span></span><span class="p"><span class="pre">]</span></span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">'auto'</span></span><a class="headerlink" href="#mstar.engine.state.SeqShard.exchange" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.state.SeqShard.labels">
+<span class="sig-name descname"><span class="pre">labels</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#frozenset" title="(in Python v3.12)"><span class="pre">frozenset</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">]</span></span></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">frozenset({'main'})</span></span><a class="headerlink" href="#mstar.engine.state.SeqShard.labels" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.state.SeqShard.name">
+<span class="sig-name descname"><span class="pre">name</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a></span><a class="headerlink" href="#mstar.engine.state.SeqShard.name" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.state.SeqShard.nodes">
+<span class="sig-name descname"><span class="pre">nodes</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#frozenset" title="(in Python v3.12)"><span class="pre">frozenset</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.engine.state.SeqShard.nodes" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.engine.state.SeqShard.walks">
+<span class="sig-name descname"><span class="pre">walks</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#frozenset" title="(in Python v3.12)"><span class="pre">frozenset</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">]</span></span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.engine.state.SeqShard.walks" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
 <dt class="sig sig-object py" id="mstar.engine.state.SlotLease">
 <span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.state.</span></span><span class="sig-name descname"><span class="pre">SlotLease</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">slot</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">bucket</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/step.html#SlotLease"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.state.SlotLease" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
@@ -2031,6 +2096,21 @@ commits into those slots, as a denoised window does.</p>
 </dd></dl>
 
 <dl class="py function">
+<dt class="sig sig-object py" id="mstar.engine.state.gather">
+<span class="sig-prename descclassname"><span class="pre">mstar.engine.state.</span></span><span class="sig-name descname"><span class="pre">gather</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">h</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">*</span></span><span class="n"><span class="pre">xs</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">dim</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/state/calls.html#gather"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.state.gather" title="Link to this definition">#</a></dt>
+<dd><p><cite>scatter</cite>’s inverse: every rank’s share of each of <code class="docutils literal notranslate"><span class="pre">xs</span></code>, back whole.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>h</strong> (<a class="reference internal" href="mstar.engine.state.calls.html#mstar.engine.state.calls.ShardHandle" title="mstar.engine.state.calls.ShardHandle"><em>ShardHandle</em></a>)</p></li>
+<li><p><strong>xs</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>dim</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><em>None</em>)</p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
 <dt class="sig sig-object py" id="mstar.engine.state.host">
 <span class="sig-prename descclassname"><span class="pre">mstar.engine.state.</span></span><span class="sig-name descname"><span class="pre">host</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">h</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">request</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">label</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">layer</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/state/calls.html#host"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.state.host" title="Link to this definition">#</a></dt>
 <dd><p>One entry’s host fields on the host, as the last committed step left them.</p>
@@ -2132,6 +2212,35 @@ length, past the step’s tokens.</p>
 </dd></dl>
 
 <dl class="py function">
+<dt class="sig sig-object py" id="mstar.engine.state.scatter">
+<span class="sig-prename descclassname"><span class="pre">mstar.engine.state.</span></span><span class="sig-name descname"><span class="pre">scatter</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">h</span></span></em>, <em class="sig-param"><span class="o"><span class="pre">*</span></span><span class="n"><span class="pre">xs</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">dim</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/state/calls.html#scatter"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.state.scatter" title="Link to this definition">#</a></dt>
+<dd><p>This rank’s share of each of <code class="docutils literal notranslate"><span class="pre">xs</span></code>, whole on every rank, along <code class="docutils literal notranslate"><span class="pre">dim</span></code> (the shard’s axis by default), where
+this step splits the label; <code class="docutils literal notranslate"><span class="pre">xs</span></code> as they are otherwise. One tensor in, one out; several in, a tuple out. None
+passes through.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>h</strong> (<a class="reference internal" href="mstar.engine.state.calls.html#mstar.engine.state.calls.ShardHandle" title="mstar.engine.state.calls.ShardHandle"><em>ShardHandle</em></a>)</p></li>
+<li><p><strong>xs</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>dim</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em> | </em><em>None</em>)</p></li>
+</ul>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.engine.state.split_range">
+<span class="sig-prename descclassname"><span class="pre">mstar.engine.state.</span></span><span class="sig-name descname"><span class="pre">split_range</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">h</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/state/calls.html#split_range"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.state.split_range" title="Link to this definition">#</a></dt>
+<dd><p>This rank’s range of the label (<code class="docutils literal notranslate"><span class="pre">start</span></code>, <code class="docutils literal notranslate"><span class="pre">count</span></code>, and every rank’s <code class="docutils literal notranslate"><span class="pre">counts</span></code>) where this step splits it;
+None where it is copied or the step doesn’t open the label.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>h</strong> (<a class="reference internal" href="mstar.engine.state.calls.html#mstar.engine.state.calls.ShardHandle" title="mstar.engine.state.calls.ShardHandle"><em>ShardHandle</em></a>)</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
 <dt class="sig sig-object py" id="mstar.engine.state.state_op">
 <span class="sig-prename descclassname"><span class="pre">mstar.engine.state.</span></span><span class="sig-name descname"><span class="pre">state_op</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="keyword-only-separator o"><abbr title="Keyword-only parameters separator (PEP 3102)"><span class="pre">*</span></abbr></span></em>, <em class="sig-param"><span class="n"><span class="pre">adds</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">()</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">writes</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">()</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">reads</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">()</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">mutates</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">()</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">formats</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">reference</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/state/state_op.html#state_op"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.state.state_op" title="Link to this definition">#</a></dt>
 <dd><p>Make a kernel a state op: <code class="docutils literal notranslate"><span class="pre">adds</span></code>, <code class="docutils literal notranslate"><span class="pre">writes</span></code> and <code class="docutils literal notranslate"><span class="pre">reads</span></code> name the handle parameters it touches, and
@@ -2163,7 +2272,7 @@ and on a name another op holds.</p>
 <td><p>What the engine works out from declarations: the checks that need the model, and their digest.</p></td>
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="mstar.engine.state.calls.html#module-mstar.engine.state.calls" title="mstar.engine.state.calls"><code class="xref py py-obj docutils literal notranslate"><span class="pre">calls</span></code></a></p></td>
-<td><p>What layers and submodules hold for declared state: a handle per array or sampler, over today's resources.</p></td>
+<td><p>What layers and submodules hold for declared state: a handle per array, sampler or sequence shard, over today's resources.</p></td>
 </tr>
 <tr class="row-odd"><td><p><a class="reference internal" href="mstar.engine.state.contract.html#module-mstar.engine.state.contract" title="mstar.engine.state.contract"><code class="xref py py-obj docutils literal notranslate"><span class="pre">contract</span></code></a></p></td>
 <td><p>What a model declares about the state it keeps between steps.</p></td>
@@ -2375,6 +2484,14 @@ and on a name another op holds.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.Segment.span"><code class="docutils literal notranslate"><span class="pre">Segment.span</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.SeqShard"><code class="docutils literal notranslate"><span class="pre">SeqShard</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.SeqShard.exchange"><code class="docutils literal notranslate"><span class="pre">SeqShard.exchange</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.SeqShard.labels"><code class="docutils literal notranslate"><span class="pre">SeqShard.labels</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.SeqShard.name"><code class="docutils literal notranslate"><span class="pre">SeqShard.name</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.SeqShard.nodes"><code class="docutils literal notranslate"><span class="pre">SeqShard.nodes</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.SeqShard.walks"><code class="docutils literal notranslate"><span class="pre">SeqShard.walks</span></code></a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.SlotLease"><code class="docutils literal notranslate"><span class="pre">SlotLease</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.SlotLease.bucket"><code class="docutils literal notranslate"><span class="pre">SlotLease.bucket</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.SlotLease.slot"><code class="docutils literal notranslate"><span class="pre">SlotLease.slot</span></code></a></li>
@@ -2405,12 +2522,15 @@ and on a name another op holds.</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.at_last_token"><code class="docutils literal notranslate"><span class="pre">at_last_token()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.causal_conv"><code class="docutils literal notranslate"><span class="pre">causal_conv()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.gated_delta_net"><code class="docutils literal notranslate"><span class="pre">gated_delta_net()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.gather"><code class="docutils literal notranslate"><span class="pre">gather()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.host"><code class="docutils literal notranslate"><span class="pre">host()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.last_sampled"><code class="docutils literal notranslate"><span class="pre">last_sampled()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.position"><code class="docutils literal notranslate"><span class="pre">position()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.positions"><code class="docutils literal notranslate"><span class="pre">positions()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.rope"><code class="docutils literal notranslate"><span class="pre">rope()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.sample"><code class="docutils literal notranslate"><span class="pre">sample()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.scatter"><code class="docutils literal notranslate"><span class="pre">scatter()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.split_range"><code class="docutils literal notranslate"><span class="pre">split_range()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.state_op"><code class="docutils literal notranslate"><span class="pre">state_op()</span></code></a></li>
 </ul>
   </nav></div>

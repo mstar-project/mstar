@@ -1033,10 +1033,12 @@ window.runMermaid = runMermaid;</script>
                 <article class="bd-article">
                   
   <h1>Source code for mstar.engine.state.calls</h1><div class="highlight"><pre>
-<span></span><span class="sd">"""What layers and submodules hold for declared state: a handle per array or sampler, over today's resources.</span>
+<span></span><span class="sd">"""What layers and submodules hold for declared state: a handle per array, sampler or sequence shard, over today's</span>
+<span class="sd">resources.</span>
 
-<span class="sd">A call that touches state runs behind a graph break, so it is plain Python in eager steps and at capture, it never runs</span>
-<span class="sd">on a replay, and its checks live in it.</span>
+<span class="sd">A call that touches an array or a sampler runs behind a graph break, so it is plain Python in eager steps and at</span>
+<span class="sd">capture, it never runs on a replay, and its checks live in it. A shard's `scatter` and `gather` deliberately don't break</span>
+<span class="sd">the graph: a compiled frame of a walk the shard never splits traces them straight through.</span>
 <span class="sd">"""</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">abstractmethod</span>
@@ -1046,7 +1048,7 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.step</span><span class="w"> </span><span class="kn">import</span> <span class="n">Segment</span><span class="p">,</span> <span class="n">StepHandle</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.state.contract</span><span class="w"> </span><span class="kn">import</span> <span class="n">EMPTY</span><span class="p">,</span> <span class="n">Array</span><span class="p">,</span> <span class="n">ArrayStep</span><span class="p">,</span> <span class="n">CausalConv</span><span class="p">,</span> <span class="n">GatedDeltaNet</span><span class="p">,</span> <span class="n">Op</span><span class="p">,</span> <span class="n">Sampler</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.state.contract</span><span class="w"> </span><span class="kn">import</span> <span class="n">EMPTY</span><span class="p">,</span> <span class="n">Array</span><span class="p">,</span> <span class="n">ArrayStep</span><span class="p">,</span> <span class="n">CausalConv</span><span class="p">,</span> <span class="n">GatedDeltaNet</span><span class="p">,</span> <span class="n">Op</span><span class="p">,</span> <span class="n">Sampler</span><span class="p">,</span> <span class="n">SeqShard</span>
 
 <span class="k">if</span> <span class="n">TYPE_CHECKING</span><span class="p">:</span>
     <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.state.state_op</span><span class="w"> </span><span class="kn">import</span> <span class="n">StateOp</span>
@@ -1364,6 +1366,61 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<div class="viewcode-block" id="ShardHandle">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.state.calls.html#mstar.engine.state.ShardHandle">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">ShardHandle</span><span class="p">(</span><span class="n">StepHandle</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""A node's calls on its declared `SeqShard`. Its step is the node's segments, so the engine opens it on every</span>
+<span class="sd">    step of the node, with no entry in ``state``. It takes the label it brackets from the step's segments, as the</span>
+<span class="sd">    array handles do, and the walk from the step, so a compiled frame of a walk the shard never splits traces the</span>
+<span class="sd">    bracket straight through. Closed, it holds neither, and the bracket is the resource's outside a step: the</span>
+<span class="sd">    identity."""</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">shard</span><span class="p">:</span> <span class="n">SeqShard</span><span class="p">,</span> <span class="n">resource</span><span class="p">:</span> <span class="n">Any</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">shard</span> <span class="o">=</span> <span class="n">shard</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">name</span> <span class="o">=</span> <span class="n">shard</span><span class="o">.</span><span class="n">name</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">resource</span> <span class="o">=</span> <span class="n">resource</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">label</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">walk</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">ranks</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""The sequence-parallel ranks the node's tokens split over: what a layout that must tile evenly rounds to."""</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">resource</span><span class="o">.</span><span class="n">group</span><span class="o">.</span><span class="n">world_size</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">needs_step</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Whether a step must plan the shard: where it can split. Elsewhere its plan is copied, and a step nothing</span>
+<span class="sd">        else needs skips it, the bracket then the identity."""</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">resource</span><span class="o">.</span><span class="n">can_split</span>
+
+<div class="viewcode-block" id="ShardHandle.begin_step">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.state.calls.html#mstar.engine.state.ShardHandle.begin_step">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">begin_step</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">step</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="p">(</span><span class="n">label</span><span class="p">,)</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">shard</span><span class="o">.</span><span class="n">labels</span>  <span class="c1"># analysis refuses a shard of several</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">label</span> <span class="o">=</span> <span class="n">label</span> <span class="k">if</span> <span class="nb">any</span><span class="p">(</span><span class="n">segment</span><span class="o">.</span><span class="n">label</span> <span class="o">==</span> <span class="n">label</span> <span class="k">for</span> <span class="n">segment</span> <span class="ow">in</span> <span class="n">step</span><span class="o">.</span><span class="n">segments</span> <span class="ow">or</span> <span class="p">())</span> <span class="k">else</span> <span class="kc">None</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">walk</span> <span class="o">=</span> <span class="n">step</span><span class="o">.</span><span class="n">ctx</span><span class="o">.</span><span class="n">graph_walk</span></div>
+
+
+<div class="viewcode-block" id="ShardHandle.check_step">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.state.calls.html#mstar.engine.state.ShardHandle.check_step">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">check_step</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">step</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="k">return</span></div>
+
+
+<div class="viewcode-block" id="ShardHandle.commit_step">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.state.calls.html#mstar.engine.state.ShardHandle.commit_step">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">commit_step</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">step</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Nothing: a shard holds no state across steps."""</span></div>
+
+
+<div class="viewcode-block" id="ShardHandle.end_step">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.state.calls.html#mstar.engine.state.ShardHandle.end_step">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">end_step</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">step</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">label</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">walk</span> <span class="o">=</span> <span class="kc">None</span></div>
+</div>
+
+
+
 <div class="viewcode-block" id="causal_conv">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.engine.state.calls.html#mstar.engine.state.causal_conv">[docs]</a>
 <span class="nd">@torch</span><span class="o">.</span><span class="n">compiler</span><span class="o">.</span><span class="n">disable</span>
@@ -1387,6 +1444,33 @@ window.runMermaid = runMermaid;</script>
 <span class="w">    </span><span class="sd">"""The declared `GatedDeltaNet`, which reads and writes ``layer``'s ``state`` field in place."""</span>
     <span class="n">run</span><span class="p">,</span> <span class="n">state</span> <span class="o">=</span> <span class="n">h</span><span class="o">.</span><span class="n">_update</span><span class="p">(</span><span class="n">GatedDeltaNet</span><span class="p">,</span> <span class="s2">"state"</span><span class="p">,</span> <span class="n">h</span><span class="o">.</span><span class="n">_layer_id</span><span class="p">(</span><span class="n">layer</span><span class="p">))</span>
     <span class="k">return</span> <span class="n">run</span><span class="o">.</span><span class="n">run</span><span class="p">(</span><span class="n">q</span><span class="p">,</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span><span class="p">,</span> <span class="n">a</span><span class="p">,</span> <span class="n">b</span><span class="p">,</span> <span class="n">state_layer</span><span class="o">=</span><span class="n">state</span><span class="p">,</span> <span class="n">a_log</span><span class="o">=</span><span class="n">a_log</span><span class="p">,</span> <span class="n">dt_bias</span><span class="o">=</span><span class="n">dt_bias</span><span class="p">,</span> <span class="n">label</span><span class="o">=</span><span class="n">h</span><span class="o">.</span><span class="n">label</span><span class="p">)</span></div>
+
+
+
+<div class="viewcode-block" id="scatter">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.state.calls.html#mstar.engine.state.scatter">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">scatter</span><span class="p">(</span><span class="n">h</span><span class="p">:</span> <span class="n">ShardHandle</span><span class="p">,</span> <span class="o">*</span><span class="n">xs</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span> <span class="n">dim</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""This rank's share of each of ``xs``, whole on every rank, along ``dim`` (the shard's axis by default), where</span>
+<span class="sd">    this step splits the label; ``xs`` as they are otherwise. One tensor in, one out; several in, a tuple out. None</span>
+<span class="sd">    passes through."""</span>
+    <span class="k">return</span> <span class="n">h</span><span class="o">.</span><span class="n">resource</span><span class="o">.</span><span class="n">scatter</span><span class="p">(</span><span class="n">h</span><span class="o">.</span><span class="n">label</span><span class="p">,</span> <span class="o">*</span><span class="n">xs</span><span class="p">,</span> <span class="n">dim</span><span class="o">=</span><span class="n">dim</span><span class="p">,</span> <span class="n">walk</span><span class="o">=</span><span class="n">h</span><span class="o">.</span><span class="n">walk</span><span class="p">)</span></div>
+
+
+
+<div class="viewcode-block" id="gather">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.state.calls.html#mstar.engine.state.gather">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">gather</span><span class="p">(</span><span class="n">h</span><span class="p">:</span> <span class="n">ShardHandle</span><span class="p">,</span> <span class="o">*</span><span class="n">xs</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span> <span class="n">dim</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""`scatter`'s inverse: every rank's share of each of ``xs``, back whole."""</span>
+    <span class="k">return</span> <span class="n">h</span><span class="o">.</span><span class="n">resource</span><span class="o">.</span><span class="n">gather</span><span class="p">(</span><span class="n">h</span><span class="o">.</span><span class="n">label</span><span class="p">,</span> <span class="o">*</span><span class="n">xs</span><span class="p">,</span> <span class="n">dim</span><span class="o">=</span><span class="n">dim</span><span class="p">,</span> <span class="n">walk</span><span class="o">=</span><span class="n">h</span><span class="o">.</span><span class="n">walk</span><span class="p">)</span></div>
+
+
+
+<div class="viewcode-block" id="split_range">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.state.calls.html#mstar.engine.state.split_range">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">split_range</span><span class="p">(</span><span class="n">h</span><span class="p">:</span> <span class="n">ShardHandle</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">"""This rank's range of the label (``start``, ``count``, and every rank's ``counts``) where this step splits it;</span>
+<span class="sd">    None where it is copied or the step doesn't open the label."""</span>
+    <span class="k">return</span> <span class="n">h</span><span class="o">.</span><span class="n">resource</span><span class="o">.</span><span class="n">split_range</span><span class="p">(</span><span class="n">h</span><span class="o">.</span><span class="n">label</span><span class="p">)</span></div>
 
 
 

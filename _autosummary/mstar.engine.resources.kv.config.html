@@ -794,10 +794,10 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVSpec.derive"><code class="docutils literal notranslate"><span class="pre">KVSpec.derive()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVSpec.keeps_prefix_cache"><code class="docutils literal notranslate"><span class="pre">KVSpec.keeps_prefix_cache()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVSpec.leader"><code class="docutils literal notranslate"><span class="pre">KVSpec.leader</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVSpec.places_positions"><code class="docutils literal notranslate"><span class="pre">KVSpec.places_positions</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVSpec.resource_class"><code class="docutils literal notranslate"><span class="pre">KVSpec.resource_class</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVSpec.routing_mirror"><code class="docutils literal notranslate"><span class="pre">KVSpec.routing_mirror()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVSpec.split_step_refusals"><code class="docutils literal notranslate"><span class="pre">KVSpec.split_step_refusals()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVSpec.storage"><code class="docutils literal notranslate"><span class="pre">KVSpec.storage</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVStep"><code class="docutils literal notranslate"><span class="pre">KVStep</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -826,8 +826,10 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PagedKVConfig.max_seq_len"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.max_seq_len</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PagedKVConfig.num_units"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.num_units</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PagedKVConfig.page_size"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.page_size</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PagedKVConfig.paged_for"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.paged_for()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PagedKVConfig.pages_of"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.pages_of()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PagedKVConfig.place"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.place()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PagedKVConfig.placed_groups"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.placed_groups()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PagedKVConfig.prefix_cache"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.prefix_cache</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PagedKVConfig.prefix_cache_given"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.prefix_cache_given</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PagedKVConfig.prefix_cache_salt"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.prefix_cache_salt</span></code></a></li>
@@ -1441,14 +1443,6 @@ or not. False (the default) keeps nothing across requests.
 <dd></dd></dl>
 
 <dl class="py property">
-<dt class="sig sig-object py" id="mstar.engine.resources.kv.config.KVSpec.places_positions">
-<span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">places_positions</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><span class="pre">bool</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><a class="headerlink" href="#mstar.engine.resources.kv.config.KVSpec.places_positions" title="Link to this definition">#</a></dt>
-<dd><p>Whether this resource places its token positions over ranks that would otherwise hold
-the same copy (<code class="docutils literal notranslate"><span class="pre">mstar.engine.resources.context_parallel</span></code>); None for one that holds no
-positions to place. A node whose resources place them runs replicated across its SP ranks.</p>
-</dd></dl>
-
-<dl class="py property">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.config.KVSpec.resource_class">
 <span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">resource_class</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#type" title="(in Python v3.12)"><span class="pre">type</span></a><span class="p"><span class="pre">[</span></span><a class="reference internal" href="mstar.engine.resources.html#mstar.engine.resources.Resource" title="mstar.engine.resources.Resource"><span class="pre">Resource</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.engine.resources.kv.config.KVSpec.resource_class" title="Link to this definition">#</a></dt>
 <dd><p>What builds this spec. Imported inside the property, so declaring a
@@ -1470,9 +1464,9 @@ resource stays free of the manager and its kernels.</p>
 
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.config.KVSpec.split_step_refusals">
-<span class="sig-name descname"><span class="pre">split_step_refusals</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">node</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">shard</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tp</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">sp</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/config.html#KVSpec.split_step_refusals"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.config.KVSpec.split_step_refusals" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">split_step_refusals</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">node</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">shard</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tp</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">sp</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">specs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/config.html#KVSpec.split_step_refusals"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.config.KVSpec.split_step_refusals" title="Link to this definition">#</a></dt>
 <dd><p>What this resource can’t run on <code class="docutils literal notranslate"><span class="pre">node</span></code>, whose steps <code class="docutils literal notranslate"><span class="pre">shard</span></code> splits over <code class="docutils literal notranslate"><span class="pre">sp</span></code> SP
-ranks (<code class="docutils literal notranslate"><span class="pre">tp</span></code> TP ranks each); each a sentence.</p>
+ranks (<code class="docutils literal notranslate"><span class="pre">tp</span></code> TP ranks each), among <code class="docutils literal notranslate"><span class="pre">specs</span></code> (every spec, by key); each a sentence.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
@@ -1480,10 +1474,29 @@ ranks (<code class="docutils literal notranslate"><span class="pre">tp</span></c
 <li><p><strong>shard</strong> (<a class="reference internal" href="mstar.engine.resources.html#mstar.engine.resources.SeqShardSpec" title="mstar.engine.resources.SeqShardSpec"><em>SeqShardSpec</em></a>)</p></li>
 <li><p><strong>tp</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
 <li><p><strong>sp</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>specs</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Mapping" title="(in Python v3.12)"><em>Mapping</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference internal" href="mstar.engine.resources.html#mstar.engine.resources.NodeResourceSpec" title="mstar.engine.resources.NodeResourceSpec"><em>NodeResourceSpec</em></a><em>]</em>)</p></li>
 </ul>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)">list</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>]</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py property">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.config.KVSpec.storage">
+<span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">storage</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="pre">Storage</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><a class="headerlink" href="#mstar.engine.resources.kv.config.KVSpec.storage" title="Link to this definition">#</a></dt>
+<dd><p><code class="docutils literal notranslate"><span class="pre">by_head</span></code> (each
+rank a slice of the heads, over TP x SP), <code class="docutils literal notranslate"><span class="pre">by_position</span></code> (each a share of every page’s
+token positions over ranks that would otherwise hold the same heads, heads over TP:
+<code class="docutils literal notranslate"><span class="pre">mstar.engine.resources.context_parallel</span></code>), or <code class="docutils literal notranslate"><span class="pre">copied</span></code> (heads over TP, every SP rank the
+whole state: a recurrent pool). None for one holding none. A resource
+over pools that are all <code class="docutils literal notranslate"><span class="pre">copied</span></code> shards its heads over TP (<code class="docutils literal notranslate"><span class="pre">EngineResourceInfo.head_shards</span></code>),
+and a node whose pools store by position runs copied unless its shard’s exchange splits it.
+From raw fields, as the shard’s hooks.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>How this resource stores its per-request state over a node’s ranks</p>
 </dd>
 </dl>
 </dd></dl>
@@ -1721,6 +1734,26 @@ could not be told apart.</p>
 <dd></dd></dl>
 
 <dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.config.PagedKVConfig.paged_for">
+<span class="sig-name descname"><span class="pre">paged_for</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">pool</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tp</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">sp</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/config.html#PagedKVConfig.paged_for"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.config.PagedKVConfig.paged_for" title="Link to this definition">#</a></dt>
+<dd><p>This config as a rank of a node of <code class="docutils literal notranslate"><span class="pre">tp</span></code> x <code class="docutils literal notranslate"><span class="pre">sp</span></code> ranks pages it (<cite>place</cite>): a copy with
+the groups placed when <code class="docutils literal notranslate"><span class="pre">context_parallel</span></code> is on, else this config. What the conductor
+counts a request’s pages with, so its count is the worker’s.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>pool</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>tp</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>sp</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference internal" href="#mstar.engine.resources.kv.config.PagedKVConfig" title="mstar.engine.resources.kv.config.PagedKVConfig"><em>PagedKVConfig</em></a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.config.PagedKVConfig.pages_of">
 <span class="sig-name descname"><span class="pre">pages_of</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">units</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">round_up</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">False</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/config.html#PagedKVConfig.pages_of"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.config.PagedKVConfig.pages_of" title="Link to this definition">#</a></dt>
 <dd><p><code class="docutils literal notranslate"><span class="pre">units</span></code> arena pages in pages as <code class="docutils literal notranslate"><span class="pre">max_num_pages</span></code> counts them, rounded down (what
@@ -1754,6 +1787,28 @@ otherwise the block of TP ranks holding this rank’s KV head (<cite>kv_head_rep
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p><a class="reference internal" href="mstar.engine.resources.context_parallel.html#mstar.engine.resources.context_parallel.ContextParallel" title="mstar.engine.resources.context_parallel.ContextParallel">ContextParallel</a> | None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.config.PagedKVConfig.placed_groups">
+<span class="sig-name descname"><span class="pre">placed_groups</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">pool</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">size</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/config.html#PagedKVConfig.placed_groups"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.config.PagedKVConfig.placed_groups" title="Link to this definition">#</a></dt>
+<dd><p>The pool’s groups (<cite>keep_window</cite>) with its positions placed over <code class="docutils literal notranslate"><span class="pre">size</span></code> partners: the
+first group’s slots stripe over them, and each window group stays whole on every partner,
+so a decode step attends it with no collective. An arena page then holds <code class="docutils literal notranslate"><span class="pre">1/size</span></code> of a
+first-group page’s slots a rank, so a window group’s page is <code class="docutils literal notranslate"><span class="pre">1/size</span></code> of its unplaced
+tokens; its retention (whole unplaced pages) still keeps the window. From the groups
+<code class="docutils literal notranslate"><span class="pre">keep_window</span></code> derived, so it can run again.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>pool</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>size</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#tuple" title="(in Python v3.12)">tuple</a>[<a class="reference internal" href="#mstar.engine.resources.kv.config.KVGroup" title="mstar.engine.resources.kv.config.KVGroup"><em>KVGroup</em></a>, …]</p>
 </dd>
 </dl>
 </dd></dl>
@@ -2450,7 +2505,8 @@ same walk that doesn’t open a step, in one row, as text around an attachment i
 <dd><p>The resources that can’t restore what a hit skips while <code class="docutils literal notranslate"><span class="pre">opened</span></code> open:
 those that set <cite>NodeResourceSpec.restores_prefix</cite> and keep no open cache of
 their own, unless they are over open caches that restore. Each keeps every
-cache on its nodes shut.</p>
+cache on its nodes shut. A dependency that plans from the step a hit trimmed
+(<code class="docutils literal notranslate"><span class="pre">prefix_skip_safe</span></code>, a sequence shard’s say) holds nothing to restore.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
@@ -2580,10 +2636,10 @@ before the configs go out with every frame between workers.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVSpec.derive"><code class="docutils literal notranslate"><span class="pre">KVSpec.derive()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVSpec.keeps_prefix_cache"><code class="docutils literal notranslate"><span class="pre">KVSpec.keeps_prefix_cache()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVSpec.leader"><code class="docutils literal notranslate"><span class="pre">KVSpec.leader</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVSpec.places_positions"><code class="docutils literal notranslate"><span class="pre">KVSpec.places_positions</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVSpec.resource_class"><code class="docutils literal notranslate"><span class="pre">KVSpec.resource_class</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVSpec.routing_mirror"><code class="docutils literal notranslate"><span class="pre">KVSpec.routing_mirror()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVSpec.split_step_refusals"><code class="docutils literal notranslate"><span class="pre">KVSpec.split_step_refusals()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVSpec.storage"><code class="docutils literal notranslate"><span class="pre">KVSpec.storage</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.KVStep"><code class="docutils literal notranslate"><span class="pre">KVStep</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -2612,8 +2668,10 @@ before the configs go out with every frame between workers.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PagedKVConfig.max_seq_len"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.max_seq_len</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PagedKVConfig.num_units"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.num_units</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PagedKVConfig.page_size"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.page_size</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PagedKVConfig.paged_for"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.paged_for()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PagedKVConfig.pages_of"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.pages_of()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PagedKVConfig.place"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.place()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PagedKVConfig.placed_groups"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.placed_groups()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PagedKVConfig.prefix_cache"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.prefix_cache</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PagedKVConfig.prefix_cache_given"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.prefix_cache_given</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.config.PagedKVConfig.prefix_cache_salt"><code class="docutils literal notranslate"><span class="pre">PagedKVConfig.prefix_cache_salt</span></code></a></li>

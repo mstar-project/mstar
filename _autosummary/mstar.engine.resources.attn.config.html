@@ -763,6 +763,9 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.config.AttentionSpec.resolve_exchange"><code class="docutils literal notranslate"><span class="pre">AttentionSpec.resolve_exchange()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.config.AttentionSpec.resource_class"><code class="docutils literal notranslate"><span class="pre">AttentionSpec.resource_class</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.config.AttentionSpec.shard_key"><code class="docutils literal notranslate"><span class="pre">AttentionSpec.shard_key</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.config.AttentionSpec.split_step_refusals"><code class="docutils literal notranslate"><span class="pre">AttentionSpec.split_step_refusals()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.config.AttentionSpec.splits_eagerly"><code class="docutils literal notranslate"><span class="pre">AttentionSpec.splits_eagerly()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.config.AttentionSpec.stores_whole"><code class="docutils literal notranslate"><span class="pre">AttentionSpec.stores_whole()</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.config.AttentionStep"><code class="docutils literal notranslate"><span class="pre">AttentionStep</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -1003,13 +1006,14 @@ Idempotent: it runs wherever the specs resolve (<cite>resolve_spec_dependencies<
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.attn.config.AttentionSpec.resolve_exchange">
 <span class="sig-name descname"><span class="pre">resolve_exchange</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">specs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/attn/config.html#AttentionSpec.resolve_exchange"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.attn.config.AttentionSpec.resolve_exchange" title="Link to this definition">#</a></dt>
-<dd><p>Its node’s sequence shard’s <code class="docutils literal notranslate"><span class="pre">exchange</span></code> over its pool’s storage.</p>
+<dd><p>Its node’s sequence shard’s <code class="docutils literal notranslate"><span class="pre">exchange</span></code> over its pool’s storage; over KV every rank
+stores whole (<code class="docutils literal notranslate"><span class="pre">stores_whole</span></code>), <code class="docutils literal notranslate"><span class="pre">kv_gather</span></code> wherever the node splits.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><p><strong>specs</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Mapping" title="(in Python v3.12)"><em>Mapping</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference internal" href="mstar.engine.resources.spec.html#mstar.engine.resources.spec.NodeResourceSpec" title="mstar.engine.resources.spec.NodeResourceSpec"><em>NodeResourceSpec</em></a><em>]</em>)</p>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
-<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Literal" title="(in Python v3.12)"><em>Literal</em></a>[‘none’, ‘ulysses’, ‘all_gather’, ‘ring’]</p>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/typing.html#typing.Literal" title="(in Python v3.12)"><em>Literal</em></a>[‘none’, ‘ulysses’, ‘all_gather’, ‘ring’, ‘kv_gather’]</p>
 </dd>
 </dl>
 </dd></dl>
@@ -1027,6 +1031,60 @@ resource stays free of the manager and its kernels.</p>
 <dt class="sig sig-object py" id="mstar.engine.resources.attn.config.AttentionSpec.shard_key">
 <span class="sig-name descname"><span class="pre">shard_key</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.engine.resources.attn.config.AttentionSpec.shard_key" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.attn.config.AttentionSpec.split_step_refusals">
+<span class="sig-name descname"><span class="pre">split_step_refusals</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">node</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">shard</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">tp</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">sp</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">specs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/attn/config.html#AttentionSpec.split_step_refusals"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.attn.config.AttentionSpec.split_step_refusals" title="Link to this definition">#</a></dt>
+<dd><p>What this resource can’t run on <code class="docutils literal notranslate"><span class="pre">node</span></code>, whose steps <code class="docutils literal notranslate"><span class="pre">shard</span></code> splits over <code class="docutils literal notranslate"><span class="pre">sp</span></code> SP
+ranks (<code class="docutils literal notranslate"><span class="pre">tp</span></code> TP ranks each), among <code class="docutils literal notranslate"><span class="pre">specs</span></code> (every spec, by key); each a sentence.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>node</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>shard</strong> (<a class="reference internal" href="mstar.engine.resources.html#mstar.engine.resources.SeqShardSpec" title="mstar.engine.resources.SeqShardSpec"><em>SeqShardSpec</em></a>)</p></li>
+<li><p><strong>tp</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>sp</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>specs</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Mapping" title="(in Python v3.12)"><em>Mapping</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference internal" href="mstar.engine.resources.spec.html#mstar.engine.resources.spec.NodeResourceSpec" title="mstar.engine.resources.spec.NodeResourceSpec"><em>NodeResourceSpec</em></a><em>]</em>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)">list</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>]</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.attn.config.AttentionSpec.splits_eagerly">
+<span class="sig-name descname"><span class="pre">splits_eagerly</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">specs</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/attn/config.html#AttentionSpec.splits_eagerly"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.attn.config.AttentionSpec.splits_eagerly" title="Link to this definition">#</a></dt>
+<dd><p>Whether this resource’s split steps run eagerly only, their plans differing by rank
+where a graph holds one: a node with one captures no step that may split
+(<code class="docutils literal notranslate"><span class="pre">SeqShardSpec.eager</span></code>). False (the default) for one whose split steps replay in a graph.
+From raw fields, as <code class="docutils literal notranslate"><span class="pre">resolve_exchange</span></code>.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>specs</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Mapping" title="(in Python v3.12)"><em>Mapping</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference internal" href="mstar.engine.resources.spec.html#mstar.engine.resources.spec.NodeResourceSpec" title="mstar.engine.resources.spec.NodeResourceSpec"><em>NodeResourceSpec</em></a><em>]</em>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)">bool</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.attn.config.AttentionSpec.stores_whole">
+<span class="sig-name descname"><span class="pre">stores_whole</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">kv</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/attn/config.html#AttentionSpec.stores_whole"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.attn.config.AttentionSpec.stores_whole" title="Link to this definition">#</a></dt>
+<dd><p>Whether every rank holds this attention’s KV whole: its window layers of a pool placed
+by position, which keeps them whole on every partner so a decode step reads them with no
+collective (<cite>PagedKVConfig.placed_groups</cite>). From raw fields.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>kv</strong> (<a class="reference internal" href="mstar.engine.resources.spec.html#mstar.engine.resources.spec.NodeResourceSpec" title="mstar.engine.resources.spec.NodeResourceSpec"><em>NodeResourceSpec</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)">bool</a></p>
+</dd>
+</dl>
+</dd></dl>
 
 </dd></dl>
 
@@ -1361,6 +1419,9 @@ the step’s queries would attend to the tokens it appends as well.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.config.AttentionSpec.resolve_exchange"><code class="docutils literal notranslate"><span class="pre">AttentionSpec.resolve_exchange()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.config.AttentionSpec.resource_class"><code class="docutils literal notranslate"><span class="pre">AttentionSpec.resource_class</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.config.AttentionSpec.shard_key"><code class="docutils literal notranslate"><span class="pre">AttentionSpec.shard_key</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.config.AttentionSpec.split_step_refusals"><code class="docutils literal notranslate"><span class="pre">AttentionSpec.split_step_refusals()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.config.AttentionSpec.splits_eagerly"><code class="docutils literal notranslate"><span class="pre">AttentionSpec.splits_eagerly()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.config.AttentionSpec.stores_whole"><code class="docutils literal notranslate"><span class="pre">AttentionSpec.stores_whole()</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.attn.config.AttentionStep"><code class="docutils literal notranslate"><span class="pre">AttentionStep</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">

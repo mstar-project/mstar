@@ -1098,14 +1098,15 @@ window.runMermaid = runMermaid;</script>
 
 <div class="viewcode-block" id="head_shards">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.base.html#mstar.engine.resources.head_shards">[docs]</a>
-<span class="k">def</span><span class="w"> </span><span class="nf">head_shards</span><span class="p">(</span><span class="n">group</span><span class="p">:</span> <span class="n">JointGroups</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span> <span class="n">places_positions</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">head_shards</span><span class="p">(</span><span class="n">group</span><span class="p">:</span> <span class="n">JointGroups</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span> <span class="n">tp_only</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">"""How many ways a node's ranks split its attention heads: its TP and SP ranks (CFG ranks run</span>
-<span class="sd">    whole branches, every head), or TP alone when its pools place positions over the SP ranks</span>
-<span class="sd">    (``PagedKVConfig.context_parallel``)."""</span>
+<span class="sd">    whole branches, every head), or TP alone (``tp_only``) where its pools place positions over the</span>
+<span class="sd">    SP ranks (``PagedKVConfig.context_parallel``), or for a resource over pools every SP rank</span>
+<span class="sd">    stores whole (``NodeResourceSpec.storage``)."""</span>
     <span class="k">if</span> <span class="n">group</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
         <span class="k">return</span> <span class="mi">1</span>
     <span class="n">tp</span> <span class="o">=</span> <span class="n">group</span><span class="o">.</span><span class="n">tp_group</span><span class="o">.</span><span class="n">world_size</span>
-    <span class="k">return</span> <span class="n">tp</span> <span class="k">if</span> <span class="n">places_positions</span> <span class="k">else</span> <span class="n">tp</span> <span class="o">*</span> <span class="n">group</span><span class="o">.</span><span class="n">sp_group</span><span class="o">.</span><span class="n">world_size</span></div>
+    <span class="k">return</span> <span class="n">tp</span> <span class="k">if</span> <span class="n">tp_only</span> <span class="k">else</span> <span class="n">tp</span> <span class="o">*</span> <span class="n">group</span><span class="o">.</span><span class="n">sp_group</span><span class="o">.</span><span class="n">world_size</span></div>
 
 
 
@@ -1142,9 +1143,9 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># the prefix caches this engine opens (`opening_prefix_caches`), decided</span>
     <span class="c1"># before any resource is built, for one that sizes itself by its own</span>
     <span class="n">prefix_caches</span><span class="p">:</span> <span class="nb">frozenset</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="nb">frozenset</span><span class="p">()</span>
-    <span class="c1"># whether the resource's nodes run replicated over their SP ranks, because their pools place</span>
-    <span class="c1"># positions over them (``PagedKVConfig.context_parallel``), rather than splitting their steps</span>
-    <span class="c1"># over them (``SeqShardSpec``)</span>
+    <span class="c1"># whether every SP rank holds this resource's heads whole, so they split over TP alone: its</span>
+    <span class="c1"># nodes' pools place positions over the SP ranks (``PagedKVConfig.context_parallel``), or it is</span>
+    <span class="c1"># a pool stored ``copied`` or a resource over such pools alone (``NodeResourceSpec.storage``)</span>
     <span class="n">replicated_over_sp</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
     <span class="c1"># what each step may still copy to the host once its outputs are sent, or on a pass that runs no step</span>
     <span class="n">host_allowance</span><span class="p">:</span> <span class="n">StepAllowance</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span>

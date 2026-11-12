@@ -16,6 +16,7 @@ mstar.engine.state.calls
       at_last_token
       causal_conv
       gated_delta_net
+      gather
       host
       kernel_setting
       last_sampled
@@ -24,7 +25,9 @@ mstar.engine.state.calls
       positions
       rope
       sample
+      scatter
       segments_of
+      split_range
    
    
 
@@ -36,6 +39,7 @@ mstar.engine.state.calls
    
       ArrayHandle
       SamplerHandle
+      ShardHandle
    
    
 

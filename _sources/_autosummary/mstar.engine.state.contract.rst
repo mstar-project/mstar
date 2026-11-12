@@ -48,6 +48,7 @@ mstar.engine.state.contract
       SampleSettings
       SampleStep
       Sampler
+      SeqShard
       TensorType
       Window
    

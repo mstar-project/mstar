@@ -1579,6 +1579,28 @@ to 2048 for <code class="docutils literal notranslate"><span class="pre">prefill
 since the LLM’s 2048-token step budget (<code class="docutils literal notranslate"><span class="pre">MAX_BATCH_TOKENS</span></code>) caps both and at
 the default <code class="docutils literal notranslate"><span class="pre">min_chunk_tokens</span></code> no step passes it. Each bucket adds captures
 and startup time.</p>
+<p>On <code class="docutils literal notranslate"><span class="pre">sp_size</span></code> above 1 the LLM declares a sequence shard (<code class="docutils literal notranslate"><span class="pre">llm_shard</span></code>, its
+prefill and mixed walks; decode never splits, and its compiled frame keeps the
+bracket out). With its KV pool stored by position (<code class="docutils literal notranslate"><span class="pre">kv_cache:</span>
+<span class="pre">{context_parallel:</span> <span class="pre">true}</span></code>) and the shard’s default <code class="docutils literal notranslate"><span class="pre">exchange</span></code> (<code class="docutils literal notranslate"><span class="pre">none</span></code>), every step
+runs copied, each rank attending its share of the stored context (more KV
+capacity, no faster prefill). Over KV stored by head the LLM on SP ranks is
+refused unless the deployment sets <code class="docutils literal notranslate"><span class="pre">llm_shard:</span> <span class="pre">{exchange:</span> <span class="pre">ulysses}</span></code>, which
+has run on CPU only. With <code class="docutils literal notranslate"><span class="pre">llm_shard:</span> <span class="pre">{exchange:</span> <span class="pre">all_gather}</span></code> a
+step of at least <code class="docutils literal notranslate"><span class="pre">llm_shard.min_tokens</span></code> tokens splits over
+the SP ranks: each runs the layers on its part of the prompt, attention gathers
+the step’s queries, keys and values, and the gated DeltaNet layers trade tokens
+for heads (<code class="docutils literal notranslate"><span class="pre">ulysses</span></code>, or <code class="docutils literal notranslate"><span class="pre">state_passing</span></code> where
+their heads per TP rank don’t divide by <code class="docutils literal notranslate"><span class="pre">sp_size</span></code>). The DeltaNet split runs
+eagerly only, so the LLM never splits a captured step: the shard sets its own floor for
+each of its text prefill, vision prefill and mixed walks, one past that walk’s largest
+captured bucket (<a class="reference internal" href="serving.html"><span class="doc">Serving</span></a>). A prompt that fits a bucket runs copied in its graph, a longer
+one runs eagerly and splits, and decode keeps its graphs; <code class="docutils literal notranslate"><span class="pre">llm_shard.min_tokens</span></code>
+only raises the floor. Chunked prefill is off
+on SP ranks, so a long prompt splits whole.
+The recurrent state is held whole on every SP rank, so decode is unchanged. No
+shipped config splits yet: a TP2 x SP2 9B config lands with its GPU parity run.
+Prefix caching stays on at one rank as before; above one rank it is off.</p>
 <p>A captured decode step builds its rotary tables inside the graph from the
 planned positions, rather than staging tables built eagerly before the replay
 (that build sat on the per-step critical path: +13% output tok/s at c=32 on

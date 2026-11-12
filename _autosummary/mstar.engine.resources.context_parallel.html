@@ -841,7 +841,9 @@ that would otherwise hold the same KV heads.</p>
 <p>Page ids stay logical and are the same on every rank, so allocation, prefix keys,
 offload and admission need nothing new. Within a page, logical slot <code class="docutils literal notranslate"><span class="pre">s</span></code> belongs to
 partner <code class="docutils literal notranslate"><span class="pre">s</span> <span class="pre">%</span> <span class="pre">P</span></code> and sits at its physical slot <code class="docutils literal notranslate"><span class="pre">s</span> <span class="pre">//</span> <span class="pre">P</span></code>, so each rank stores
-<code class="docutils literal notranslate"><span class="pre">page_size</span> <span class="pre">//</span> <span class="pre">P</span></code> slots a page. <code class="docutils literal notranslate"><span class="pre">PagedKVConfig.place</span></code> resolves the placement.</p>
+<code class="docutils literal notranslate"><span class="pre">page_size</span> <span class="pre">//</span> <span class="pre">P</span></code> slots a page. <code class="docutils literal notranslate"><span class="pre">PagedKVConfig.place</span></code> resolves the placement. A pool that keeps
+a sliding window places its first group of layers alone; the window’s stay whole on every partner
+(<code class="docutils literal notranslate"><span class="pre">PagedKVConfig.placed_groups</span></code>).</p>
 <p>Attention over such a pool (<code class="docutils literal notranslate"><span class="pre">ContextParallelWrapper</span></code>) runs on each rank over its own slots and
 returns the partial with its log-sum-exp; the partners exchange partials and <code class="docutils literal notranslate"><span class="pre">merge</span></code> them,
 exactly.</p>
@@ -864,7 +866,7 @@ over its own slots, and the partials go back to their queries’ rank.</p>
 <td><p><code class="docutils literal notranslate"><span class="pre">merge</span></code>, and the union's natural-log lse, fp32, to merge again.</p></td>
 </tr>
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.context_parallel.position_pools" title="mstar.engine.resources.context_parallel.position_pools"><code class="xref py py-obj docutils literal notranslate"><span class="pre">position_pools</span></code></a>(specs, node)</p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">node</span></code>'s resources that hold token positions, each to whether it places them (<code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.places_positions</span></code>).</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">node</span></code>'s resources that hold token positions, each to whether it places them (<code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.storage</span></code> by position or by head; a copied one goes with either).</p></td>
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.context_parallel.ring_hop" title="mstar.engine.resources.context_parallel.ring_hop"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ring_hop</span></code></a>(size, rank, offset, send, recv)</p></td>
 <td><p>A ring hop's <code class="docutils literal notranslate"><span class="pre">all_to_all_rows</span></code> counts at <code class="docutils literal notranslate"><span class="pre">offset</span></code>: <code class="docutils literal notranslate"><span class="pre">send</span></code> rows to rank <code class="docutils literal notranslate"><span class="pre">rank</span> <span class="pre">+</span> <span class="pre">offset</span></code>, <code class="docutils literal notranslate"><span class="pre">recv</span></code> back from rank <code class="docutils literal notranslate"><span class="pre">rank</span> <span class="pre">-</span> <span class="pre">offset</span></code>, of <code class="docutils literal notranslate"><span class="pre">size</span></code>.</p></td>
@@ -1293,12 +1295,12 @@ over one sink slot, masked out of the merge (<code class="docutils literal notra
 of it. Not causal, each row’s queries see its whole length, and a row with no slot here is
 masked the same way. A row this partner holds no query of is left out of its plan.</p>
 <p><code class="docutils literal notranslate"><span class="pre">paged</span></code> is one eager kernel over this rank’s slots per partner, all planned per step.
-Eager only: a striped shard plans a leased step copied. The partner plans differ by rank and
-no admission bounds them: FlashInfer’s paged manager, the one backend that takes a placed pool
-(<code class="docutils literal notranslate"><span class="pre">PlacedAttention</span></code>), so the one that plans a ring, bounds no plan at admission, as no refusal
-of its planner on lengths is known. A backend whose planner may refuse on lengths (MLA’s FA
-planner) would have to bound every rank’s partner plans at admission before it could plan a
-ring, or one rank alone could refuse a lockstep step.</p>
+Eager only: the node never splits a captured step (<code class="docutils literal notranslate"><span class="pre">SeqShardSpec.eager</span></code>). The partner
+plans differ by rank and no admission bounds them: FlashInfer’s paged manager, the one backend
+that takes a placed pool (<code class="docutils literal notranslate"><span class="pre">PlacedAttention</span></code>), so the one that plans a ring, bounds no plan at
+admission, as no refusal of its planner on lengths is known. A backend whose planner may refuse
+on lengths (MLA’s FA planner) would have to bound every rank’s partner plans at admission before
+it could plan a ring, or one rank alone could refuse a lockstep step.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
@@ -1680,7 +1682,8 @@ fp32.</p>
 <dt class="sig sig-object py" id="mstar.engine.resources.context_parallel.position_pools">
 <span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.context_parallel.</span></span><span class="sig-name descname"><span class="pre">position_pools</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">specs</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">node</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/context_parallel.html#position_pools"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.context_parallel.position_pools" title="Link to this definition">#</a></dt>
 <dd><p><code class="docutils literal notranslate"><span class="pre">node</span></code>’s resources that hold token positions, each to whether it places them
-(<code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.places_positions</span></code>). Raises when one is placed and another isn’t.</p>
+(<code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.storage</span></code> by position or by head; a copied one goes with either). Raises
+when one is placed and another isn’t.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">

@@ -1039,6 +1039,7 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">without pulling FlashInfer in behind it.</span>
 <span class="sd">"""</span>
 
+<span class="kn">import</span><span class="w"> </span><span class="nn">copy</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">math</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">ABC</span><span class="p">,</span> <span class="n">abstractmethod</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Collection</span><span class="p">,</span> <span class="n">Iterable</span><span class="p">,</span> <span class="n">Mapping</span><span class="p">,</span> <span class="n">Sequence</span>
@@ -1054,6 +1055,7 @@ window.runMermaid = runMermaid;</script>
     <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">Resource</span>
     <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.context_parallel</span><span class="w"> </span><span class="kn">import</span> <span class="n">ContextParallel</span>
     <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.sequence_shard</span><span class="w"> </span><span class="kn">import</span> <span class="n">SeqShardSpec</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources.spec</span><span class="w"> </span><span class="kn">import</span> <span class="n">Storage</span>
 
 
 <div class="viewcode-block" id="KVLayout">
@@ -1181,6 +1183,8 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># is kept for first (`keep_window`, which `derive_kv_groups` calls as the specs resolve,</span>
     <span class="c1"># before anything builds or sizes from the pool). One group of every layer until then.</span>
     <span class="n">groups</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="s2">"KVGroup"</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="p">(),</span> <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="nb">repr</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">compare</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
+    <span class="c1"># the groups as `keep_window` derived them, which a placement re-pages (`placed_groups`)</span>
+    <span class="n">_kept_groups</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="s2">"KVGroup"</span><span class="p">,</span> <span class="o">...</span><span class="p">]</span> <span class="o">=</span> <span class="n">field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="p">(),</span> <span class="n">init</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="nb">repr</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span> <span class="n">compare</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">__post_init__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_check_sizes</span><span class="p">()</span>
@@ -1233,7 +1237,7 @@ window.runMermaid = runMermaid;</script>
             <span class="n">page</span> <span class="o">=</span> <span class="n">tokens</span> <span class="o">*</span> <span class="nb">len</span><span class="p">(</span><span class="n">full</span><span class="p">)</span> <span class="o">//</span> <span class="nb">len</span><span class="p">(</span><span class="n">layers</span><span class="p">)</span>
             <span class="c1"># the window in whole pages: a stream releases its front pages past it at commit</span>
             <span class="n">groups</span> <span class="o">+=</span> <span class="p">(</span><span class="n">KVGroup</span><span class="p">(</span><span class="nb">tuple</span><span class="p">(</span><span class="n">layers</span><span class="p">),</span> <span class="n">page</span><span class="p">,</span> <span class="n">RetentionPolicy</span><span class="p">(</span><span class="n">context_budget</span><span class="o">=-</span><span class="p">(</span><span class="o">-</span><span class="n">window</span> <span class="o">//</span> <span class="n">page</span><span class="p">)</span> <span class="o">*</span> <span class="n">page</span><span class="p">)),)</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">groups</span> <span class="o">=</span> <span class="n">groups</span></div>
+        <span class="bp">self</span><span class="o">.</span><span class="n">groups</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_kept_groups</span> <span class="o">=</span> <span class="n">groups</span></div>
 
 
     <span class="nd">@property</span>
@@ -1302,18 +1306,49 @@ window.runMermaid = runMermaid;</script>
 
         <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">context_parallel</span><span class="p">:</span>
             <span class="k">return</span> <span class="kc">None</span>
-        <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">groups</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
-            <span class="c1"># a page of a group's layers holds another page size, which the placed storage doesn't stripe</span>
-            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"KV </span><span class="si">{</span><span class="n">pool</span><span class="si">!r}</span><span class="s2">: context_parallel is unsupported over a pool that keeps a sliding window"</span><span class="p">)</span>
         <span class="n">tp_size</span><span class="p">,</span> <span class="n">sp_size</span> <span class="o">=</span> <span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span> <span class="k">if</span> <span class="n">joint</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="p">(</span><span class="n">joint</span><span class="o">.</span><span class="n">tp_group</span><span class="o">.</span><span class="n">world_size</span><span class="p">,</span> <span class="n">joint</span><span class="o">.</span><span class="n">sp_group</span><span class="o">.</span><span class="n">world_size</span><span class="p">)</span>
         <span class="c1"># raises on one rank alone, so past here there is a joint group</span>
         <span class="n">size</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">context_parallel_size</span><span class="p">(</span><span class="n">pool</span><span class="p">,</span> <span class="n">tp_size</span><span class="p">,</span> <span class="n">sp_size</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">groups</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">placed_groups</span><span class="p">(</span><span class="n">pool</span><span class="p">,</span> <span class="n">size</span><span class="p">)</span>
         <span class="k">if</span> <span class="n">sp_size</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">:</span>
             <span class="n">sp</span> <span class="o">=</span> <span class="n">joint</span><span class="o">.</span><span class="n">sp_group</span>
             <span class="k">return</span> <span class="n">SPPlacement</span><span class="p">(</span><span class="n">size</span><span class="o">=</span><span class="n">size</span><span class="p">,</span> <span class="n">index</span><span class="o">=</span><span class="n">sp</span><span class="o">.</span><span class="n">rank</span><span class="p">,</span> <span class="n">group</span><span class="o">=</span><span class="n">sp</span><span class="p">)</span>
         <span class="n">tp</span> <span class="o">=</span> <span class="n">joint</span><span class="o">.</span><span class="n">tp_group</span>
         <span class="n">first</span> <span class="o">=</span> <span class="n">tp</span><span class="o">.</span><span class="n">rank</span> <span class="o">//</span> <span class="n">size</span> <span class="o">*</span> <span class="n">size</span>
         <span class="k">return</span> <span class="n">TPPlacement</span><span class="p">(</span><span class="n">size</span><span class="o">=</span><span class="n">size</span><span class="p">,</span> <span class="n">index</span><span class="o">=</span><span class="n">tp</span><span class="o">.</span><span class="n">rank</span> <span class="o">%</span> <span class="n">size</span><span class="p">,</span> <span class="n">group</span><span class="o">=</span><span class="n">tp</span><span class="p">,</span> <span class="n">partners</span><span class="o">=</span><span class="nb">tuple</span><span class="p">(</span><span class="nb">range</span><span class="p">(</span><span class="n">first</span><span class="p">,</span> <span class="n">first</span> <span class="o">+</span> <span class="n">size</span><span class="p">)))</span></div>
+
+
+<div class="viewcode-block" id="PagedKVConfig.paged_for">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.PagedKVConfig.paged_for">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">paged_for</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">pool</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">tp</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">sp</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">"PagedKVConfig"</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""This config as a rank of a node of ``tp`` x ``sp`` ranks pages it (`place`): a copy with</span>
+<span class="sd">        the groups placed when ``context_parallel`` is on, else this config. What the conductor</span>
+<span class="sd">        counts a request's pages with, so its count is the worker's."""</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">context_parallel</span><span class="p">:</span>
+            <span class="k">return</span> <span class="bp">self</span>
+        <span class="n">placed</span> <span class="o">=</span> <span class="n">copy</span><span class="o">.</span><span class="n">copy</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span>
+        <span class="n">placed</span><span class="o">.</span><span class="n">groups</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">placed_groups</span><span class="p">(</span><span class="n">pool</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">context_parallel_size</span><span class="p">(</span><span class="n">pool</span><span class="p">,</span> <span class="n">tp</span><span class="p">,</span> <span class="n">sp</span><span class="p">))</span>
+        <span class="k">return</span> <span class="n">placed</span></div>
+
+
+<div class="viewcode-block" id="PagedKVConfig.placed_groups">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.PagedKVConfig.placed_groups">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">placed_groups</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">pool</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">size</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">"tuple[KVGroup, ...]"</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""The pool's groups (`keep_window`) with its positions placed over ``size`` partners: the</span>
+<span class="sd">        first group's slots stripe over them, and each window group stays whole on every partner,</span>
+<span class="sd">        so a decode step attends it with no collective. An arena page then holds ``1/size`` of a</span>
+<span class="sd">        first-group page's slots a rank, so a window group's page is ``1/size`` of its unplaced</span>
+<span class="sd">        tokens; its retention (whole unplaced pages) still keeps the window. From the groups</span>
+<span class="sd">        ``keep_window`` derived, so it can run again."""</span>
+        <span class="n">kept</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_kept_groups</span>
+        <span class="k">for</span> <span class="n">group</span> <span class="ow">in</span> <span class="n">kept</span><span class="p">[</span><span class="mi">1</span><span class="p">:]:</span>
+            <span class="k">if</span> <span class="n">group</span><span class="o">.</span><span class="n">page_size</span> <span class="o">%</span> <span class="n">size</span><span class="p">:</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                    <span class="sa">f</span><span class="s2">"KV </span><span class="si">{</span><span class="n">pool</span><span class="si">!r}</span><span class="s2">: context_parallel keeps its sliding-window layers whole on each of its </span><span class="si">{</span><span class="n">size</span><span class="si">}</span><span class="s2"> "</span>
+                    <span class="sa">f</span><span class="s2">"partners in </span><span class="si">{</span><span class="n">group</span><span class="o">.</span><span class="n">page_size</span><span class="si">}</span><span class="s2">-token pages, which a partner's 1/</span><span class="si">{</span><span class="n">size</span><span class="si">}</span><span class="s2"> of an arena page "</span>
+                    <span class="sa">f</span><span class="s2">"doesn't hold whole: use a page_size giving them pages of a multiple of </span><span class="si">{</span><span class="n">size</span><span class="si">}</span><span class="s2"> tokens"</span>
+                <span class="p">)</span>
+        <span class="k">return</span> <span class="p">(</span><span class="n">kept</span><span class="p">[</span><span class="mi">0</span><span class="p">],</span> <span class="o">*</span><span class="p">(</span><span class="n">replace</span><span class="p">(</span><span class="n">group</span><span class="p">,</span> <span class="n">page_size</span><span class="o">=</span><span class="n">group</span><span class="o">.</span><span class="n">page_size</span> <span class="o">//</span> <span class="n">size</span><span class="p">)</span> <span class="k">for</span> <span class="n">group</span> <span class="ow">in</span> <span class="n">kept</span><span class="p">[</span><span class="mi">1</span><span class="p">:]))</span></div>
 
 
 <div class="viewcode-block" id="PagedKVConfig.context_parallel_size">
@@ -1858,11 +1893,15 @@ window.runMermaid = runMermaid;</script>
 <span class="w">    </span><span class="sd">"""The resources that can't restore what a hit skips while ``opened`` open:</span>
 <span class="sd">    those that set `NodeResourceSpec.restores_prefix` and keep no open cache of</span>
 <span class="sd">    their own, unless they are over open caches that restore. Each keeps every</span>
-<span class="sd">    cache on its nodes shut."""</span>
+<span class="sd">    cache on its nodes shut. A dependency that plans from the step a hit trimmed</span>
+<span class="sd">    (``prefix_skip_safe``, a sequence shard's say) holds nothing to restore."""</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">held</span><span class="p">(</span><span class="n">spec</span><span class="p">:</span> <span class="n">NodeResourceSpec</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">set</span><span class="p">[</span><span class="nb">str</span><span class="p">]:</span>
+        <span class="k">return</span> <span class="p">{</span><span class="n">dep</span> <span class="k">for</span> <span class="n">dep</span> <span class="ow">in</span> <span class="n">spec</span><span class="o">.</span><span class="n">depends_on</span><span class="p">()</span> <span class="k">if</span> <span class="ow">not</span> <span class="n">specs</span><span class="p">[</span><span class="n">dep</span><span class="p">]</span><span class="o">.</span><span class="n">resource_class</span><span class="o">.</span><span class="n">prefix_skip_safe</span><span class="p">}</span>
+
     <span class="k">return</span> <span class="p">[</span>
         <span class="n">spec</span> <span class="k">for</span> <span class="n">spec</span> <span class="ow">in</span> <span class="n">specs</span><span class="o">.</span><span class="n">values</span><span class="p">()</span>
         <span class="k">if</span> <span class="n">spec</span><span class="o">.</span><span class="n">restores_prefix</span> <span class="ow">and</span> <span class="n">spec</span><span class="o">.</span><span class="n">resource_key</span> <span class="ow">not</span> <span class="ow">in</span> <span class="n">opened</span> <span class="ow">and</span> <span class="ow">not</span> <span class="p">(</span>
-            <span class="n">spec</span><span class="o">.</span><span class="n">depends_on</span><span class="p">()</span> <span class="ow">and</span> <span class="nb">all</span><span class="p">(</span><span class="n">dep</span> <span class="ow">in</span> <span class="n">opened</span> <span class="ow">and</span> <span class="n">specs</span><span class="p">[</span><span class="n">dep</span><span class="p">]</span><span class="o">.</span><span class="n">restores_prefix</span> <span class="k">for</span> <span class="n">dep</span> <span class="ow">in</span> <span class="n">spec</span><span class="o">.</span><span class="n">depends_on</span><span class="p">())</span>
+            <span class="p">(</span><span class="n">deps</span> <span class="o">:=</span> <span class="n">held</span><span class="p">(</span><span class="n">spec</span><span class="p">))</span> <span class="ow">and</span> <span class="nb">all</span><span class="p">(</span><span class="n">dep</span> <span class="ow">in</span> <span class="n">opened</span> <span class="ow">and</span> <span class="n">specs</span><span class="p">[</span><span class="n">dep</span><span class="p">]</span><span class="o">.</span><span class="n">restores_prefix</span> <span class="k">for</span> <span class="n">dep</span> <span class="ow">in</span> <span class="n">deps</span><span class="p">)</span>
         <span class="p">)</span>
     <span class="p">]</span></div>
 
@@ -1949,13 +1988,18 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="n">KVManager</span>
 
     <span class="nd">@property</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">places_positions</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">storage</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">"Storage | None"</span><span class="p">:</span>
         <span class="c1"># a paged pool's (`PagedKVConfig.context_parallel`); a ring keeps every position on each rank</span>
-        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">context_parallel</span> <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="p">,</span> <span class="n">PagedKVConfig</span><span class="p">)</span> <span class="k">else</span> <span class="kc">None</span>
+        <span class="n">cfg</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">cfg</span><span class="p">,</span> <span class="n">PagedKVConfig</span><span class="p">):</span>
+            <span class="k">return</span> <span class="kc">None</span>
+        <span class="k">return</span> <span class="s2">"by_position"</span> <span class="k">if</span> <span class="n">cfg</span><span class="o">.</span><span class="n">context_parallel</span> <span class="k">else</span> <span class="s2">"by_head"</span>
 
 <div class="viewcode-block" id="KVSpec.split_step_refusals">
 <a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.KVSpec.split_step_refusals">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">split_step_refusals</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">node</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">shard</span><span class="p">:</span> <span class="s2">"SeqShardSpec"</span><span class="p">,</span> <span class="n">tp</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">sp</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]:</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">split_step_refusals</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">node</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">shard</span><span class="p">:</span> <span class="s2">"SeqShardSpec"</span><span class="p">,</span> <span class="n">tp</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">sp</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">specs</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="s2">"NodeResourceSpec"</span><span class="p">],</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]:</span>
         <span class="c1"># stored by position, a split step's packed tokens are gathered or passed round; stored by</span>
         <span class="c1"># head, they trade for heads over every TP and SP rank (Ulysses)</span>
         <span class="n">cfg</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span>
