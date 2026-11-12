@@ -3,7 +3,7 @@ FlashInfer's ragged prefill where neither has a kernel for the GPU."""
 
 import functools
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 import torch
 
@@ -111,15 +111,32 @@ def _views_as_int64(t: torch.Tensor) -> bool:
     )
 
 
-def _cat_rows(parts: list[torch.Tensor]) -> torch.Tensor:
-    """``torch.cat(parts)`` along dim 0, through int64 views when every part
-    has one: the same bytes, but a strided part (V sliced out of a fused QKV
-    projection) moves 8 bytes per element instead of 2. On Qwen-Image-2.1
-    (H200) that is 1.6 ms of a 111.5 ms denoise step instead of 3.4."""
-    dtype = parts[0].dtype
-    if all(p.dtype == dtype and _views_as_int64(p) for p in parts):
-        return torch.cat([p.view(torch.int64) for p in parts]).view(dtype)
-    return torch.cat(parts)
+def _copy_rows(dst: torch.Tensor, src: torch.Tensor) -> None:
+    """``dst.copy_(src)``, through int64 views when both have one: the same
+    bytes, but a strided ``src`` (V sliced out of a fused QKV projection)
+    moves 8 bytes per element instead of 2. On Qwen-Image-2.1 (H200) that is
+    1.6 ms of a 111.5 ms denoise step instead of 3.4."""
+    if src.dtype == dst.dtype and _views_as_int64(src) and _views_as_int64(dst):
+        dst.view(torch.int64).copy_(src.view(torch.int64))
+    else:
+        dst.copy_(src)
+
+
+def _gather_rows(dst: torch.Tensor, layer: torch.Tensor, rows: torch.Tensor) -> None:
+    """Write rows ``rows`` of ``layer`` read as [pages * 2 * page_size, heads,
+    head_dim] into ``dst``: one gather, straight into place, through int64
+    views when both have one. A layer that isn't one block (a pool with groups
+    of two page sizes) is indexed by page and slot instead, through a copy."""
+    if layer.is_contiguous() and layer.dtype == dst.dtype:
+        flat = layer.view(-1, *layer.shape[-2:])
+        if _views_as_int64(flat) and _views_as_int64(dst):
+            torch.index_select(flat.view(torch.int64), 0, rows, out=dst.view(torch.int64))
+        else:
+            torch.index_select(flat, 0, rows, out=dst)
+        return
+    per_page = 2 * layer.shape[2]
+    plane, slot = (rows % per_page).div(layer.shape[2], rounding_mode="floor"), rows % layer.shape[2]
+    dst.copy_(layer[rows.div(per_page, rounding_mode="floor"), plane, slot])
 
 
 @dataclass(frozen=True)
@@ -127,13 +144,10 @@ class DenseSegment:
     """(request, label) of dense plan; frozen prefix and fresh tokens"""
     request_id: str
     label: str
-    # the prefix's pages, in stream order; a host tuple, moved to the device
-    # only when the prefix is gathered (a per-step H2D from pageable memory
-    # would sync the stream)
+    # the prefix's pages, in stream order
     pages: tuple[int, ...]
     prefix_len: int
     q_len: int
-    generation: int  # of the stream, at plan time; see CacheStream.generation
 
 
 @dataclass(frozen=True)
@@ -147,17 +161,11 @@ class DensePlan:
     causal: bool
     # the wrapper this layout was planned into
     wrapper: PrefixedPrefillWrapper | None = None
-
-
-@dataclass
-class _GatheredPrefix:
-    """One stream's gathered prefix, per layer, tagged with what it was read
-    from so a stale gather cannot be served."""
-    generation: int
-    length: int
-    layers: dict[int, tuple[torch.Tensor, torch.Tensor]] = field(default_factory=dict)
-    # the prefix's page index on the device: one H2D per gather, not per layer
-    pages: torch.Tensor | None = None
+    # On the device: every segment's prefix rows in a layer read as [pages * 2 * page_size, heads, head_dim],
+    # K's for all segments then V's. A segment's K rows start at `rows_at`, and its V rows `prefix_rows` later.
+    rows: torch.Tensor | None = None
+    rows_at: tuple[int, ...] = ()
+    prefix_rows: int = 0
 
 
 class DenseAttentionManager(AttentionManager):
@@ -170,11 +178,13 @@ class DenseAttentionManager(AttentionManager):
     For a workload that recomputes every one of its K/V every step and only
     reuses a small frozen prefix — diffusion denoise, where the prefix is the
     text conditioning — the paged path's per-step full-buffer K/V write and
-    ``wrapper.plan`` are pure overhead. This gathers the prefix once per
-    (stream, layer), concatenates it with the freshly projected K/V, and runs
-    one kernel. The gathered prefix is reused across steps: it is keyed on the
-    stream's ``generation``, so a fork, a reset, or a page-table move
-    invalidates it (``CacheStream.generation``).
+    ``wrapper.plan`` are pure overhead. Each layer gathers the prefix out of
+    the pages straight into place beside the freshly projected K/V, and runs
+    one kernel. Nothing is held between layers or steps: a copy of every
+    layer's prefix, held for the whole denoise, was several GiB per request
+    outside the pool, and the gather moves the same bytes the concatenation
+    of a held copy did. So a fork, a reset or a page-table move has nothing
+    here to invalidate.
 
     The layer does not write its K/V to the pages here (``requires_kv_write``
     is False) — nothing would ever read it back.
@@ -197,7 +207,7 @@ class DenseAttentionManager(AttentionManager):
     (``PositionManager`` would only work for labels supplying explicit pos_ids).
     """
 
-    # the gathered prefix is keyed on the stream's generation, which the KV's drop moves on
+    # it holds nothing per request
     supports_drop = True
 
     def __init__(
@@ -217,8 +227,6 @@ class DenseAttentionManager(AttentionManager):
 
         # plan label -> this step's layout
         self._current_plans: dict[str, DensePlan] = {}
-        # (request, label) -> the prefix gathered out of the pages
-        self._prefix_cache: dict[tuple[str, str], _GatheredPrefix] = {}
 
         self._wrapper_class = wrapper_class
         self._wrappers: dict[EagerSlotKey, PrefixedPrefillWrapper] = {}
@@ -293,23 +301,6 @@ class DenseAttentionManager(AttentionManager):
     def requires_kv_write(self) -> bool:
         return False
 
-    # the gathered prefix is per-request state, so unlike the paged backend
-    # these are not no-ops
-    def ingest_request(self, rid: str, overrides=None):
-        del overrides
-        self._drop_prefixes(rid)
-
-    def remove_request(self, rid: str):
-        self._drop_prefixes(rid)
-
-    def reset_request(self, rid: str, free: bool=False):
-        del free
-        self._drop_prefixes(rid)
-
-    def _drop_prefixes(self, rid: str) -> None:
-        for key in [k for k in self._prefix_cache if k[0] == rid]:
-            del self._prefix_cache[key]
-
     def plan(self, step: AttentionStep, ctx: StepContext):
         refuse_context_only(step, type(self).__name__)
         self.reset_default_cursors()
@@ -351,7 +342,6 @@ class DenseAttentionManager(AttentionManager):
                 pages=tuple(view.page_idxs[:n_pages]),
                 prefix_len=prefix_len,
                 q_len=view.to_compute,
-                generation=view.generation,
             ))
             cu_q.append(cu_q[-1] + view.to_compute)
             cu_k.append(cu_k[-1] + view.length)
@@ -369,6 +359,7 @@ class DenseAttentionManager(AttentionManager):
             torch.tensor(cu_k, dtype=torch.int32, pin_memory=pin),
             causal=causal,
         )
+        rows, rows_at = self._prefix_rows(segments, page_size)
         return DensePlan(
             segments=tuple(segments),
             cu_q=tuple(cu_q),
@@ -377,42 +368,32 @@ class DenseAttentionManager(AttentionManager):
             max_k=max_k,
             causal=causal,
             wrapper=wrapper,
+            rows=rows,
+            rows_at=rows_at,
+            prefix_rows=rows_at[-1] if rows_at else 0,
         )
 
-    def _prefix_kv(
-        self, segment: DenseSegment, layer_idx: int, kv_cache_layer: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """This segment's frozen prefix for one layer, gathered out of the
-        pages on first use and held until the stream moves under it."""
-        key = (segment.request_id, segment.label)
-        entry = self._prefix_cache.get(key)
-        if (
-            entry is None
-            or entry.generation != segment.generation
-            or entry.length != segment.prefix_len
-        ):
-            entry = self._prefix_cache[key] = _GatheredPrefix(
-                generation=segment.generation, length=segment.prefix_len
-            )
-
-        cached = entry.layers.get(layer_idx)
-        if cached is not None:
-            return cached
-
-        cfg = self._kv_config
-        if entry.pages is None:
-            entry.pages = torch.tensor(segment.pages, dtype=torch.long, device=kv_cache_layer.device)
-        # [n_pages, 2, page_size, num_kv_heads, head_dim] -> the prefix's rows
-        pages = kv_cache_layer[entry.pages]
-        k_pref = pages[:, 0].reshape(-1, cfg.num_kv_heads, cfg.head_dim)
-        v_pref = pages[:, 1].reshape(-1, cfg.num_kv_heads, cfg.head_dim)
-        # the gather already copied; the slice keeps the trailing slots of the
-        # last page out, and `clone` keeps the whole page span from being held
-        cached = (
-            k_pref[:segment.prefix_len].clone(), v_pref[:segment.prefix_len].clone()
-        )
-        entry.layers[layer_idx] = cached
-        return cached
+    def _prefix_rows(
+        self, segments: list[DenseSegment], page_size: int,
+    ) -> tuple[torch.Tensor | None, tuple[int, ...]]:
+        """The rows every layer's gather reads, built once per step and moved to the device in one copy from
+        pinned memory (from pageable memory it would sync the stream)."""
+        rows_at = [0]
+        for segment in segments:
+            rows_at.append(rows_at[-1] + segment.prefix_len)
+        if not rows_at[-1]:
+            return None, tuple(rows_at)
+        slots = torch.arange(page_size, dtype=torch.long)
+        k_rows = torch.cat([
+            (torch.tensor(segment.pages, dtype=torch.long)[:, None] * (2 * page_size) + slots).flatten()[
+                :segment.prefix_len
+            ]
+            for segment in segments if segment.prefix_len
+        ])
+        host = torch.cat([k_rows, k_rows + page_size])
+        if self._on_cuda:
+            host = host.pin_memory()
+        return host.to(self._device, non_blocking=True), tuple(rows_at)
 
     @torch.compiler.disable
     def run(
@@ -436,19 +417,19 @@ class DenseAttentionManager(AttentionManager):
         )
         plan = self._current_plans[label]
 
-        k_parts: list[torch.Tensor] = []
-        v_parts: list[torch.Tensor] = []
+        # [prefix | fresh] per segment, in the plan's order
+        key = k.new_empty((plan.cu_k[-1], *k.shape[1:]))
+        val = v.new_empty((plan.cu_k[-1], *v.shape[1:]))
         offset = 0
-        for segment in plan.segments:
+        for segment, start, rows_at in zip(plan.segments, plan.cu_k, plan.rows_at, strict=False):
+            fresh = start + segment.prefix_len
             if segment.prefix_len:
-                k_pref, v_pref = self._prefix_kv(segment, layer_idx, kv_cache_layer)
-                k_parts.append(k_pref)
-                v_parts.append(v_pref)
-            k_parts.append(k[offset:offset + segment.q_len])
-            v_parts.append(v[offset:offset + segment.q_len])
+                rows = plan.rows[rows_at:rows_at + segment.prefix_len]
+                _gather_rows(key[start:fresh], kv_cache_layer, rows)
+                rows = plan.rows[plan.prefix_rows + rows_at:plan.prefix_rows + rows_at + segment.prefix_len]
+                _gather_rows(val[start:fresh], kv_cache_layer, rows)
+            _copy_rows(key[fresh:fresh + segment.q_len], k[offset:offset + segment.q_len])
+            _copy_rows(val[fresh:fresh + segment.q_len], v[offset:offset + segment.q_len])
             offset += segment.q_len
-
-        key = _cat_rows(k_parts)
-        val = _cat_rows(v_parts)
         return plan.wrapper.run(q, key, val)
 

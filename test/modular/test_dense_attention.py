@@ -168,69 +168,6 @@ class TestPrefixGather:
         manager.plan(AttentionStep(causal=False), _ctx(views))
         return manager._current_plans["main"].segments
 
-    def test_gather_reads_the_prefix_rows_and_stops_at_its_length(self):
-        manager = _manager()
-        layer = _layer_tensor()
-        (segment,) = self._planned(manager, [_view("r0", [5, 6], prefix=6, fresh=2)])
-
-        k, v = manager._prefix_kv(segment, 0, layer)
-        assert k.shape == (6, NUM_KV_HEADS, HEAD_DIM)
-        assert torch.equal(k, _expected_prefix(layer, [5, 6], 6, 0))
-        assert torch.equal(v, _expected_prefix(layer, [5, 6], 6, 1))
-
-    def test_gather_is_reused_across_steps_and_layers(self):
-        manager = _manager()
-        layer = _layer_tensor()
-        (segment,) = self._planned(manager, [_view("r0", [0], prefix=3, fresh=2)])
-        first_k, _ = manager._prefix_kv(segment, 0, layer)
-
-        # each layer is its own gather off its own layer view...
-        other_k, _ = manager._prefix_kv(segment, 1, _layer_tensor(fill=1000.0))
-        assert torch.equal(other_k, first_k + 1000.0)
-
-        # ...but the same (stream, layer) is served from the cache, which is
-        # the point: the pages are read once, not once per denoise step
-        layer.mul_(-1)
-        (again,) = self._planned(manager, [_view("r0", [0], prefix=3, fresh=2)])
-        cached_k, _ = manager._prefix_kv(again, 0, layer)
-        assert cached_k is first_k
-
-    def test_a_bumped_generation_invalidates_the_gather(self):
-        """The stream epoch is the whole invalidation story: same request,
-        same label, same length, same pages — different contents."""
-        manager = _manager()
-        layer = _layer_tensor()
-        (segment,) = self._planned(manager, [_view("r0", [0], prefix=3, fresh=2)])
-        stale, _ = manager._prefix_kv(segment, 0, layer)
-
-        layer.mul_(-1)
-        (moved,) = self._planned(
-            manager, [_view("r0", [0], prefix=3, fresh=2, generation=1)]
-        )
-        fresh, _ = manager._prefix_kv(moved, 0, layer)
-        assert not torch.equal(fresh, stale)
-        assert torch.equal(fresh, _expected_prefix(layer, [0], 3, 0))
-
-    def test_a_grown_prefix_invalidates_the_gather(self):
-        manager = _manager()
-        layer = _layer_tensor()
-        (segment,) = self._planned(manager, [_view("r0", [0, 1], prefix=3, fresh=1)])
-        manager._prefix_kv(segment, 0, layer)
-
-        (grown,) = self._planned(manager, [_view("r0", [0, 1], prefix=5, fresh=1)])
-        k, _ = manager._prefix_kv(grown, 0, layer)
-        assert torch.equal(k, _expected_prefix(layer, [0, 1], 5, 0))
-
-    def test_request_lifecycle_drops_the_gather(self):
-        manager = _manager()
-        layer = _layer_tensor()
-        (segment,) = self._planned(manager, [_view("r0", [0], prefix=3, fresh=1)])
-        manager._prefix_kv(segment, 0, layer)
-        assert manager._prefix_cache
-
-        manager.remove_request("r0")
-        assert not manager._prefix_cache
-
     def test_run_without_the_fresh_kv_is_an_error(self):
         manager = _manager()
         self._planned(manager, [_view("r0", [0], prefix=3, fresh=1)])
@@ -426,16 +363,45 @@ def test_flashinfer_backend_the_gpu_cannot_run_fails_at_build(backend):
 
 
 @pytest.mark.parametrize("head_dim, offset", [(128, 0), (128, 1), (3, 0)], ids=["int64", "unaligned", "odd-dim"])
-def test_cat_rows_is_torch_cat_for_strided_parts(head_dim, offset):
-    """The K/V assembly reads a strided V (a slice of a fused QKV row) and a
-    contiguous prefix as int64 words where it can; any part it cannot read
-    that way sends the whole cat down the plain path. Same bytes either way."""
-    qkv = torch.randn(9, 3 * 2 * head_dim + offset, dtype=torch.bfloat16)
-    v = qkv[:, offset + 2 * 2 * head_dim:offset + 3 * 2 * head_dim].reshape(9, 2, head_dim)
-    prefix = torch.randn(4, 2, head_dim, dtype=torch.bfloat16)
-    parts = [prefix, v[:5], prefix[:2], v[5:]]
-    out = dense_module._cat_rows(parts)
-    assert out.dtype == torch.bfloat16 and torch.equal(out, torch.cat(parts))
+@pytest.mark.parametrize("contiguous", [True, False], ids=["one-block", "strided-layer"])
+def test_each_layer_gathers_the_prefix_beside_the_fresh_kv_and_holds_nothing(monkeypatch, head_dim, offset, contiguous):
+    """Every run assembles [prefix | fresh] per segment straight from the pages: the bytes of the prefix rows and
+    the fresh rows concatenated, with a strided V (a slice of a fused QKV row) and a layer that isn't one block.
+    Nothing is held between steps (a copy of every layer's prefix held for a whole denoise was GiBs per request),
+    so a step after the pages changed reads the new pages."""
+    page, hkv = 4, 2
+    cfg = PagedKVConfig(
+        num_layers=1, num_kv_heads=hkv, head_dim=head_dim, max_seq_len=64, max_num_pages=8, page_size=page,
+    )
+    manager = DenseAttentionManager(
+        kv_cache="kv", device=torch.device("cpu"), dtype=torch.bfloat16, kv_config=cfg,
+        wrapper_class=DensePrefixedPrefillWrapper,
+    )
+    seen = []
+    monkeypatch.setattr(
+        DensePrefixedPrefillWrapper, "run", lambda self, q, k, v, return_lse=False: seen.append((k, v)) or q,
+    )
+    layer = torch.randn(8, 2, page, hkv, head_dim + (not contiguous), dtype=torch.bfloat16)[..., :head_dim]
+    segs = [("r0", [5, 2], 6, 3), ("r1", [], 0, 2), ("r2", [7], 3, 4)]  # rid, prefix pages, prefix, fresh
+    total = sum(fr for *_, fr in segs)
+    width = hkv * head_dim
+    qkv = torch.randn(total, 3 * width + offset, dtype=torch.bfloat16)
+    k = qkv[:, offset:offset + width].reshape(total, hkv, head_dim)
+    v = qkv[:, offset + 2 * width:offset + 3 * width].reshape(total, hkv, head_dim)
+    for _ in range(2):
+        manager.plan(AttentionStep(causal=False), _ctx([
+            _view(rid, pages + [0], prefix=pre, fresh=fr) for rid, pages, pre, fr in segs
+        ]))
+        manager.run(torch.zeros(total, 2, head_dim), "main", layer, k=k, v=v, layer_idx=0)
+        key, val = seen.pop()
+        off, want_k, want_v = 0, [], []
+        for _, pages, pre, fr in segs:
+            rows = layer[pages]
+            want_k += [rows[:, 0].reshape(-1, hkv, head_dim)[:pre], k[off:off + fr]]
+            want_v += [rows[:, 1].reshape(-1, hkv, head_dim)[:pre], v[off:off + fr]]
+            off += fr
+        assert torch.equal(key, torch.cat(want_k)) and torch.equal(val, torch.cat(want_v))
+        layer.mul_(-1)
 
 
 def _wrapper_classes():
