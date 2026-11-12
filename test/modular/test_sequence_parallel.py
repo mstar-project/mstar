@@ -254,3 +254,43 @@ def test_wan_dit_under_ulysses_matches_one_rank(tmp_path, grid):
     frame)."""
     _run(_wan_dit, 2, tmp_path / "two", grid, str(tmp_path / "two.pt"))
     torch.testing.assert_close(torch.load(tmp_path / "two.pt"), _wan_dit_forward(grid))
+
+
+def _wan_dit_reuse_forward(sp_group=None) -> torch.Tensor:
+    """Step caching under SP: one step keeps this rank's residual, the next reuses it on new inputs."""
+    from mstar.model.wan22.components.dit import Wan22DiT
+    from mstar.model.wan22.config import Wan22Config
+
+    config = Wan22Config(
+        num_attention_heads=6, attention_head_dim=12, num_layers=2, ffn_dim=32,
+        in_channels=4, out_channels=4, text_dim=8, freq_dim=16, rope_max_seq_len=16,
+    )
+    torch.manual_seed(0)
+    dit = Wan22DiT(config, sp_group=sp_group)
+    for param in dit.parameters():
+        torch.nn.init.normal_(param, std=0.2)
+    gen = torch.Generator().manual_seed(1)
+    grid = (3, 4, 6)
+    if sp_group is not None:
+        _opened_on_sdpa(dit, config, sp_group, 3 * 2 * 3)
+    first, second = (torch.randn(1, 4, *grid, generator=gen) for _ in range(2))
+    timestep = torch.rand(1, 3, generator=gen) * 1000
+    text = torch.randn(1, 5, 8, generator=gen)
+    with torch.no_grad():
+        _, residual = dit(first, timestep, text, return_residual=True)
+        if sp_group is not None:
+            assert residual.shape[1] == sp_seq_split(18, sp_group.world_size)[sp_group.rank]
+        return dit(second, timestep * 0.9, text, cached_residual=residual)
+
+
+def _wan_dit_reuse(rank, world, out_path):
+    out = _wan_dit_reuse_forward(_group(rank, world))
+    if rank == 0:
+        torch.save(out, out_path)
+
+
+def test_wan_dit_step_cache_under_ulysses_keeps_each_ranks_shard(tmp_path):
+    """Each SP rank keeps the residual of its own token slice and reuses it there; the gathered reusing step is the
+    one-rank one."""
+    _run(_wan_dit_reuse, 2, tmp_path / "two", str(tmp_path / "two.pt"))
+    torch.testing.assert_close(torch.load(tmp_path / "two.pt"), _wan_dit_reuse_forward())

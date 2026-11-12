@@ -33,10 +33,11 @@ from mstar.model.components.diffusion.decode_utils import latent_affine, wan_vae
 from mstar.model.components.diffusion.denoise_loop import UniPCDenoiseLoopSubmodule
 from mstar.model.components.diffusion.flow_match import FlowMatchSchedule
 from mstar.model.components.diffusion.image_io import truncate_to_uint8
+from mstar.model.components.diffusion.step_cache import BlockCache, step_cache_policy
 from mstar.model.components.diffusion.unipc import make_unipc_tables
 from mstar.model.components.distributed.sequence_parallel import my_rows
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
-from mstar.model.wan22.config import DIT_TOKENS, Wan22Config
+from mstar.model.wan22.config import DIT_TOKENS, MAG_RATIOS, Wan22Config
 
 logger = logging.getLogger(__name__)
 
@@ -318,7 +319,10 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
     CFG_BRANCHES = 2
 
     def __init__(self, transformer: nn.Module, config: Wan22Config, cfg_group=None):
-        super().__init__(loop_name=DENOISE_LOOP_NAME, max_batch_size=config.dit_max_batch_size)
+        super().__init__(
+            loop_name=DENOISE_LOOP_NAME, max_batch_size=config.dit_max_batch_size,
+            step_cache=step_cache_policy(config.step_cache, MAG_RATIOS),
+        )
         self.transformer = transformer
         self.config = config
         # CFG parallelism (cfg_size: 2; not passed on one GPU, so trivial here):
@@ -448,7 +452,7 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
         temp_ts = (mask[0, 0, :, 0, 0] * timestep[:, None]).squeeze(0)
         output = self._noise_prediction(
             model_input.to(self.transformer.dtype), temp_ts, text_embeds_pos.flatten(0, 1),
-            text_embeds_neg.flatten(0, 1), bucket_key.guidance,
+            text_embeds_neg.flatten(0, 1), bucket_key.guidance, self.block_cache(engine_inputs),
         )
         return output[:, None]
 
@@ -459,11 +463,13 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
         text_embeds_pos: torch.Tensor,
         text_embeds_neg: torch.Tensor,
         guidance_scale: float,
+        block_cache: BlockCache | None = None,
     ) -> torch.Tensor:
         """CFG noise prediction; one forward over every row's two branches instead
         of the reference's two sequential forwards. The combine runs in the
         transformer's output dtype (bf16), like the reference. ``temp_ts`` is per
-        row, ``[B, frames]``, or one row's ``[frames]``."""
+        row, ``[B, frames]``, or one row's ``[frames]``. Under a step cache a row
+        keeps its residual as ``[branches, tokens, dim]`` over this rank's branches."""
         do_cfg = guidance_scale > 1.0
         rows = model_input.shape[0]
         branch_rows = self._branch_rows(guidance_scale)
@@ -493,11 +499,22 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
         transformer = self.transformer
         if not compiled and self._eager_forward is not None and self._eager_forward[0] is transformer:
             transformer = self._eager_forward[1]
+        cache = {}
+        if block_cache is not None:
+            # the forward's batch is branch-major, [branches * rows]; the cache is row-leading
+            if block_cache.reuse:
+                cache["cached_residual"] = block_cache.residual.transpose(0, 1).flatten(0, 1)
+            else:
+                cache["return_residual"] = True
         out = transformer(
             hidden_states=hidden_states,
             timestep=timestep,
             encoder_hidden_states=encoder_hidden_states.to(self.transformer.dtype),
+            **cache,
         )
+        if cache.get("return_residual"):
+            out, residual = out
+            block_cache.keep(residual.unflatten(0, (branches, rows)).transpose(0, 1))
         if not do_cfg:
             return out
         out = self.cfg_group.all_gather(out.contiguous(), dim=0)

@@ -47,9 +47,10 @@ from mstar.graph.base import (
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import Model, WalkStep
 from mstar.model.components.diffusion.attention import dit_entry, refuse_attention_backend_kwarg
+from mstar.model.components.diffusion.step_cache import step_cache_policy
 from mstar.model.components.video_encode import encode_mp4
 from mstar.model.submodule_base import NodeSubmodule
-from mstar.model.wan22.config import DIT_TOKENS, SELF_ATTN, WAN22_VARIANT_TI2V_5B, Wan22Config
+from mstar.model.wan22.config import DIT_TOKENS, MAG_RATIOS, SELF_ATTN, WAN22_VARIANT_TI2V_5B, Wan22Config
 from mstar.model.wan22.submodules import (
     DENOISE_LOOP_NAME,
     Wan22DitSubmodule,
@@ -96,6 +97,7 @@ class Wan22Model(Model):
         skip_weight_loading: bool = False,
         vae_decode_fast: bool = True,
         vae_decode_fast_sizes: tuple[str, ...] | None = None,
+        step_cache: dict | None = None,
         **kwargs,
     ):
         refuse_attention_backend_kwarg(kwargs)
@@ -110,9 +112,10 @@ class Wan22Model(Model):
             variant=variant, compile_dit_sizes=compile_dit_sizes,
             dit_max_batch_size=self._require_positive_int("dit_max_batch_size", dit_max_batch_size),
             max_video_pixels=self._require_positive_int("max_video_pixels", max_video_pixels),
-            vae_decode_fast=vae_decode_fast, vae_decode_fast_sizes=vae_decode_fast_sizes,
+            vae_decode_fast=vae_decode_fast, vae_decode_fast_sizes=vae_decode_fast_sizes, step_cache=step_cache,
         )
         self.config.compile_dit_grids()  # a malformed list fails at startup
+        step_cache_policy(step_cache, MAG_RATIOS)  # and so does a malformed step cache
         # Dummy mode: get_submodule returns None for every node, so engines run
         # without weights, GPU or network.
         self.skip_weight_loading = skip_weight_loading

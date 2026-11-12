@@ -339,12 +339,18 @@ class Wan22DiT(nn.Module):
         hidden_states: torch.Tensor,
         timestep: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
-    ) -> torch.Tensor:
+        cached_residual: torch.Tensor | None = None,
+        return_residual: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """``hidden_states`` ``[B, C, F, H, W]`` (bf16 latents), ``timestep``
         ``[B, F // p_t]`` per post-patch frame (``expand_timesteps``: each
         token takes its frame's value), text embeds ``[B, 512, text_dim]``
         bf16. Returns ``[B, C_out, F, H, W]`` bf16. The self-attention reads the
-        array bound to it, and the cross-attention always runs SDPA."""
+        array bound to it, and the cross-attention always runs SDPA.
+
+        Step caching (``step_cache.py``): with ``cached_residual`` (fp32, ``[B, S, dim]`` over this rank's tokens) the
+        blocks are skipped and their output is the stream plus it; ``return_residual`` also returns what the blocks
+        added, in that layout."""
         batch_size, _, num_frames, height, width = hidden_states.shape
         p_t, p_h, p_w = self.config.patch_size
         grid = (num_frames // p_t, height // p_h, width // p_w)
@@ -374,8 +380,13 @@ class Wan22DiT(nn.Module):
             timestep, encoder_hidden_states
         )
 
-        for block in self.blocks:
-            hidden_states = block(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb)
+        before = hidden_states
+        if cached_residual is not None:
+            hidden_states = (hidden_states.float() + cached_residual).type_as(hidden_states)
+        else:
+            for block in self.blocks:
+                hidden_states = block(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb)
+        residual = hidden_states.float() - before.float() if return_residual else None
 
         # Output head: 2-chunk adaLN in fp32 ([1, 1, 2, dim] island table +
         # bf16 temb promotes, per group of tokens), then project and unpatchify.
@@ -385,4 +396,5 @@ class Wan22DiT(nn.Module):
 
         hidden_states = hidden_states.reshape(batch_size, *grid, p_t, p_h, p_w, -1)
         hidden_states = hidden_states.permute(0, 7, 1, 4, 2, 5, 3, 6)
-        return hidden_states.flatten(6, 7).flatten(4, 5).flatten(2, 3)
+        out = hidden_states.flatten(6, 7).flatten(4, 5).flatten(2, 3)
+        return (out, residual) if return_residual else out
