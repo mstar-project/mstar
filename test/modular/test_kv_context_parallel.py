@@ -1596,7 +1596,7 @@ def _thinker_over_ranks(rank, world, store, placed, exchange):
     from mstar.engine.state import ArrayStep
     from mstar.engine.state.adapters import node_handles, node_resources, state_steps
     from mstar.model.components import MoeParallelConfig
-    from mstar.model.qwen3_omni.components.attention import qk_norm_rope_table_kv_write
+    from mstar.model.qwen3_omni.components.attention import qk_norm_rope_table_attend
     from mstar.model.qwen3_omni.components.thinker import Qwen3OmniThinkerModel
     from mstar.model.qwen3_omni.config import (
         THINKER_ATTN,
@@ -1708,7 +1708,7 @@ def _thinker_over_ranks(rank, world, store, placed, exchange):
                 # on CUDA the state op fuses the write (CPU always takes its reference): never on a step that
                 # exchanges, and on the copied decode over KV stored by position, which reads only the pages
                 kv = handles[THINKER_KV]
-                kv.fused_ops = frozenset({qk_norm_rope_table_kv_write.op.name})
+                kv.fused_ops = frozenset({qk_norm_rope_table_attend.op.name})
                 if decode and placed and not splits:
                     assert kv.fused_ops
                 else:
