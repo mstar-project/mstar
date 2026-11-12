@@ -32,6 +32,7 @@ from mstar.model.components.diffusion.compile_utils import compile_blocks as com
 from mstar.model.components.diffusion.denoise_loop import DenoiseLoopSubmodule, StepScalar
 from mstar.model.components.diffusion.qwen3.encoder import qwen3_inv_freq
 from mstar.model.components.diffusion.qwen3.vl_prompt import qwen3_vl_prompt
+from mstar.model.components.diffusion.step_cache import StepCachePolicy
 from mstar.model.components.qwen3_vit import vision_interpolation, vision_position_ids, vision_seq_lengths
 from mstar.model.components.qwen_vision import VISION_ATTN, QwenVisionModel
 from mstar.model.minimax_h3.components.layout import (
@@ -273,14 +274,15 @@ class H3PackedDenoise(DenoiseLoopSubmodule):
     float32_matmul_precision = "highest"
 
     def __init__(self, transformer: nn.Module, config, *, loop_name: str, max_batch_size: int = 1,
-                 compile_blocks: bool = False, row_bucket: int = 1, capture_buckets=()):
+                 compile_blocks: bool = False, row_bucket: int = 1, capture_buckets=(),
+                 step_cache: StepCachePolicy | None = None):
         if max_batch_size != 1:
             # a batch's rows would have to agree on the step's first-step decisions (denoise)
             raise ValueError(f"the MiniMax-H3 dit runs one request per step; got max_batch_size={max_batch_size}")
         if int(row_bucket) < 1:
             raise ValueError(f"row_bucket must be a positive int; got {row_bucket!r}")
         super().__init__(loop_name=loop_name, max_batch_size=1, capture_buckets=capture_buckets,
-                         capture_batch_sizes=(1,))
+                         capture_batch_sizes=(1,), step_cache=step_cache)
         self.transformer = transformer
         self.config = config
         self.compiled = bool(compile_blocks)
@@ -465,7 +467,16 @@ class H3DenoiseSubmodule(H3PackedDenoise):
         else:
             timesteps = torch.stack([timestep, audio_timestep, cond_timestep], dim=-1).float()
         inputs = H3Inputs(video=latents, audio=audio_latents, text=text_embeds, timesteps=timesteps)
-        video_v, audio_v = self.transformer(inputs, layout, shard=self.shard)
+        block_cache = self.block_cache(engine_inputs)
+        if block_cache is None:
+            video_v, audio_v = self.transformer(inputs, layout, shard=self.shard)
+        elif block_cache.reuse:
+            video_v, audio_v = self.transformer(
+                inputs, layout, shard=self.shard, cached_residual=block_cache.residual,
+            )
+        else:
+            video_v, audio_v, residual = self.transformer(inputs, layout, shard=self.shard, return_residual=True)
+            block_cache.keep(residual)
         generated = h3_step(latents[:, n:], video_v[:, n:], timestep.view(-1, 1, 1), sigma, sigma_next)
         return {
             LATENTS: torch.cat([latents[:, :n], generated], dim=1) if n else generated,
