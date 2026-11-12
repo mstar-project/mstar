@@ -740,6 +740,8 @@ class ConvOnLinearAttn(OpBinding):
 class PagedArrayHandle(ArrayHandle):
     """Adds and reads through the KV pages of an array that keeps entries."""
 
+    _write_refused = "write on an append-only array"
+
     def __init__(
         self, array: Array, resources: Mapping[str, Any], bindings: tuple[BoundOp, ...], resolved: "Resolved",
     ):
@@ -1143,6 +1145,8 @@ class WithinStepHandle(ArrayHandle):
     exchange: Ulysses when both sides are sharded, none when only the queries are, and a merge of the
     ranks' partial attentions when only the keys are. The read's binding supplies the attention each exchange runs.
     """
+
+    _write_refused = "write on an append-only array"
 
     def __init__(
         self, array: Array, resources: Mapping[str, Any], bindings: tuple[BoundOp, ...], resolved: "Resolved", *,

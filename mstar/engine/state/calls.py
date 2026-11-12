@@ -45,6 +45,8 @@ class ArrayHandle(StepHandle):
     # the position resource and the dtype its `Rope` rotates in, where the array declares positions
     positions: Any = None
     rope_dtype: torch.dtype | None = None
+    # the cause `write` is refused with on an append-only array's handle; None leaves it "no layout yet"
+    _write_refused: str | None = None
 
     def __init__(self, array: Array, resources: Mapping[str, Any]):
         self.array = array
@@ -205,8 +207,8 @@ class ArrayHandle(StepHandle):
     def write(self, layer: int | torch.Tensor, *, at: torch.Tensor | None = None, **fields: torch.Tensor) -> None:
         """Overwrite entries in place, on a rewritable array. ``at`` gives each token's log position, and is omitted
         for a Value."""
-        if not self.array.rewritable:
-            raise self._refusal("write on an append-only array")
+        if self._write_refused is not None:
+            raise self._refusal(self._write_refused)
         raise self._unsupported("write")
 
     def block(self, field: str, layer: int) -> torch.Tensor:
