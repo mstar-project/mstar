@@ -815,6 +815,42 @@ def test_null_sampling_options_mean_unset(tmp_path, name):
     assert (text.temperature, text.top_k, depth.temperature, depth.top_k) == (0.7, 25, 0.8, 250)
 
 
+class _ReadKeys(dict):
+    """model_kwargs that records each key read."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.read = set()
+
+    def get(self, key, default=None):
+        self.read.add(key)
+        return super().get(key, default)
+
+    def __getitem__(self, key):
+        self.read.add(key)
+        return super().__getitem__(key)
+
+
+def test_request_kwargs_cover_every_key_the_model_reads(caplog):
+    from mstar.api_server import entrypoint
+
+    model = _model()
+    kwargs = _ReadKeys(voice="NATF2", text_prompt="Be kind.", greedy=False, temp_text=0.7, temp_audio=0.8,
+                       topk_text=25, topk_audio=250)
+    model.get_request_resource_configs(["audio"], ["audio"], kwargs)
+    model._validate_sampling(kwargs)
+    assert kwargs.read <= model.request_kwargs()
+    # The server's own check: a real request's keys are not reported, an unread one is.
+    server = types.SimpleNamespace(model=model)
+    with caplog.at_level("WARNING", logger=entrypoint.logger.name):
+        entrypoint.APIServer._report_ignored_params(server, {**kwargs, "seed": 1, "max_output_tokens": 8})
+        assert not caplog.records
+        entrypoint.APIServer._report_ignored_params(server, {**kwargs, "temperature": 0.5})
+    assert [r.getMessage() for r in caplog.records] == [
+        "Ignoring model_kwargs this model does not read: ['temperature']"
+    ]
+
+
 def test_postprocess_text_pieces_and_pcm16():
     model = _model()
     assert model.postprocess(torch.tensor([42]), "text") == b" w42"

@@ -65,6 +65,9 @@ LM_LOOP_BACKS = {
 DEFAULT_KV_PAGES = 128
 # process_prompt's frame counts, read back by get_loop_caps; a client cannot set it.
 LOOP_FRAMES_KWARG = "personaplex_loop_frames"
+# The request keys process_prompt and get_request_resource_configs read.
+SAMPLING_KWARGS = ("temp_text", "temp_audio", "topk_text", "topk_audio", "greedy")
+REQUEST_KWARGS = frozenset({"voice", "text_prompt", *SAMPLING_KWARGS})
 
 
 class PersonaPlexModel(Model):
@@ -400,6 +403,10 @@ class PersonaPlexModel(Model):
         growth = ((cfg.CONDITIONING_WALK, cfg.CONDITIONING_LOOP), (cfg.GENERATE_WALK, cfg.DECODE_LOOP),
                   (cfg.GENERATE_AUDIO_WALK, cfg.DECODE_LOOP))
         return {cfg.LM_KV: {cfg.KV_LABEL: KVLabel(growth=growth)}}
+
+    def request_kwargs(self) -> frozenset[str]:
+        # max_output_tokens is not read: the user audio fixes the length
+        return REQUEST_KWARGS
 
     def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
         # Each loop runs exactly this many frames, and the runtime ends it at its cap (no stop check reads a row).
