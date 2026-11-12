@@ -15,6 +15,7 @@ none of them trips the new checks.
 import importlib.util
 import sys
 import types
+import urllib.error
 from pathlib import Path
 
 import pytest
@@ -981,7 +982,13 @@ def test_shipped_config_passes_startup_validation(config_path, tmp_path, monkeyp
     if name not in MODEL_REGISTRY:
         pytest.skip(f"model {name!r} is not in MODEL_REGISTRY")
     factory = _FACTORIES.get(MODEL_REGISTRY[name][1], _default)
-    model = factory(name, config.get("model_kwargs") or {}, tmp_path, monkeypatch)
+    try:
+        model = factory(name, config.get("model_kwargs") or {}, tmp_path, monkeypatch)
+    except (urllib.error.URLError, ConnectionError, TimeoutError) as e:
+        # A model that downloads a small file when built (Omnilingual ASR's tokenizer, from Meta's
+        # CDN) can't be checked while that host is down or its certificate has lapsed; that is the
+        # host's outage, not this config's.
+        pytest.skip(f"model {name!r} could not download what it is built from: {e}")
     conductor = _start_conductor(model, str(config_path), tmp_path, monkeypatch)
     assert conductor.worker_graphs
     # the workers the API server places from the config are the ones the walks run on
