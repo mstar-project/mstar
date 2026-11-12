@@ -23,6 +23,7 @@ from mstar.engine.resources.attn.kept_window import KeptWindowAttention
 from mstar.engine.resources.base import EngineResourceInfo
 from mstar.engine.resources.kv.config import (
     KVReqConfig,
+    KVSpec,
     KVStep,
     PagedKVConfig,
     RetentionPolicy,
@@ -610,6 +611,27 @@ def test_the_staged_reach_is_each_row_s_reach_end_to_end():
     assert staged.lengths == (4, 6)
     assert staged.pages.tolist() == [p for row in rows for p in row.pages.tolist()]
     assert staged.offsets.tolist() == [o for row in rows for o in row.offsets.tolist()]
+
+
+def test_an_exact_window_on_a_pool_with_window_groups_is_refused_at_intake():
+    """The release keeps an exact window in the first group alone. A kept-window read is its array's only read, so
+    only a layout written by hand reaches this."""
+    from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec
+    from mstar.engine.resources.spec import resolve_spec_dependencies
+
+    cfg = PagedKVConfig(num_layers=3, num_kv_heads=1, head_dim=8, max_seq_len=64, page_size=16, max_num_pages=64)
+    spec = KVSpec(resource_key="kv", nodes={"dit"}, config=cfg)
+    resolve_spec_dependencies([
+        spec, AttentionSpec(resource_key="local", nodes={"dit"}, config=AttentionConfig("kv", sliding_window=4,
+                                                                                         layers=(1, 2))),
+        AttentionSpec(resource_key="full", nodes={"dit"}, config=AttentionConfig("kv")),
+    ])
+    assert len(cfg.groups) > 1
+    request = KVReqConfig(needed_labels=["main"])
+    exact = LabelLayout(growth=(("rollout", 1),), retention=RetentionPolicy(32, 8, exact=True))
+    request.apply_conductor_config(kv_layout={"main": exact.row()}, loop_caps={"rollout": 100})
+    with pytest.raises(ValueError, match="label 'main' keeps an exact window, and the pool has window groups"):
+        request.validate(spec)
 
 
 def test_a_removed_request_leaves_the_exact_set():

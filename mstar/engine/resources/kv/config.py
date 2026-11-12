@@ -574,6 +574,11 @@ class KVReqConfig(ResourceReqConfig):
         if spec is None or not isinstance(spec.config, PagedKVConfig):
             return
         for label, layout in (self.kv_layout or {}).items():
+            # the release keeps an exact window in the first group alone, and a kept-window read is its array's only one
+            if layout.retention is not None and layout.retention.exact and len(spec.config.groups) > 1:
+                raise ValueError(
+                    f"{spec.resource_key!r}: label {label!r} keeps an exact window, and the pool has window groups"
+                )
             positions = layout.positions(self.loop_caps or {})
             if layout.retention is None and positions > spec.config.max_seq_len:
                 raise ValueError(
