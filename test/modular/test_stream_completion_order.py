@@ -115,7 +115,7 @@ class _Producer:
             partition="LLM", graph_walk="decode", node_name="LLM",
             output_signals=[EDGE], wg_ids=ParallelList([self.rid], [0]),
             tensors=[] if inline else [uuid], num_tensors=[0 if inline else 1],
-            **({"inline_signal": EDGE, "inline_values": [uuid]} if inline else {}),
+            **({"inline_signals": [EDGE], "inline_values": [uuid]} if inline else {}),
         ))
         self.route = out
         fwd = CurrentForwardPassInfo(

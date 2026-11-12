@@ -35,7 +35,7 @@ from mstar.engine.state import (
     Window,
     state_op,
 )
-from mstar.engine.state.adapters import PAGED, Resolved, StateSetup, _bindings, _resolve, build_handle
+from mstar.engine.state.adapters import Resolved, StateSetup, _resolve, build_handle
 from mstar.engine.state.calls import ArrayHandle
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.testing_utils.model import make_model
@@ -96,16 +96,22 @@ class _StubKV:
 class _StubAttn:
     """Reads from the pages it is handed, or takes K/V at its read when told to."""
 
-    def __init__(self, requires_kv_write=True):
+    def __init__(self, requires_kv_write=True, step_kv=False):
         self.requires_kv_write = requires_kv_write
+        self.step_kv = step_kv
+        self.read_kv = []
+
+    def reads_step_kv(self, label=None):
+        return self.step_kv or not self.requires_kv_write
 
     def run(self, q, label=None, kv_cache_layer=None, k=None, v=None, layer_idx=None):
+        self.read_kv.append(k is not None)
         return q
 
 
-def _kv_array(**fields) -> Array:
+def _kv_array() -> Array:
     return Array("kv", nodes={"llm"}, layers={0, 1}, entry=KVEntry(heads=HEADS, head_dim=DIM), max_len=16,
-                 reads={"attn": Read(mask=Causal(), op=Attend(q_heads=HEADS))}, **fields)
+                 reads={"attn": Read(mask=Causal(), op=Attend(q_heads=HEADS))})
 
 
 def _handle(kv=None, attn=None, array=None) -> ArrayHandle:
@@ -242,6 +248,23 @@ def test_a_listed_format_runs_the_fused_kernel_and_counts_as_the_layers_add():
     h.read(0, q)
 
 
+def test_a_step_whose_read_attends_its_own_k_and_v_runs_the_reference():
+    """A context-parallel pool's multi-token step attends the k and v its add holds (`reads_step_kv`). A fused kernel
+    writes the pages and holds nothing, so on that step the op runs its reference, and the read gets k and v."""
+    call = _fused_op()
+    attn = _StubAttn(step_kv=True)
+    h = _handle(attn=attn)
+    state_op_module.bind_state_ops({"kv": h})
+    _open(h)
+    q, k, v = _tensors()
+    call(h, 0, q, k, v)
+    h.read(0, q)
+    assert h._kv.writes == [0], "the reference adds"
+    assert attn.read_kv == [True]
+    attn.step_kv = False
+    assert "write_q" in h.fused_ops, "a step that attends the pages alone runs the kernel"
+
+
 def test_fused_and_reference_write_the_same_and_the_layer_goes_through_the_normalizer():
     call = _fused_op()
     fused, reference = _handle(), _handle()
@@ -312,16 +335,6 @@ def test_no_fused_op_runs_on_an_array_where_one_layers_read_takes_k_and_v_at_its
     assert h.fused_ops == frozenset(), "layer 1's read would refuse a read with no add before it"
 
 
-def test_a_state_op_on_a_seq_sharded_array_is_refused():
-    array = _kv_array(seq_sharded=True)
-    # resolve refuses a seq_sharded paged array, so its bound read and that read's resource are given here
-    resolved = Resolved({}, {array.name: _bindings(PAGED, array)}, {"attn": "attn"}, {})
-    h = build_handle(array, {array.name: _StubKV(), "attn": _StubAttn()}, resolved)
-    _open(h)
-    with pytest.raises(ValueError, match="no layout yet: state op 'write_q' on a seq_sharded array"):
-        _fused_op()(h, 0, *_tensors())
-
-
 def test_a_compiled_caller_breaks_at_a_state_op(monkeypatch):
     seen = []
 
@@ -368,6 +381,16 @@ def test_an_op_that_reads_an_array_with_max_len_0_is_refused():
     _open(h)
     with pytest.raises(ValueError, match="state op 'attend_q' reads kv with max_len 0, whose read a compiled block"):
         _attending_op()(h, 0, *_tensors())
+
+
+def test_a_state_op_that_only_adds_to_an_array_with_max_len_0_adds_as_a_direct_add_does():
+    array = Array("kv", nodes={"llm"}, layers={0, 1}, entry=KVEntry(heads=HEADS, head_dim=DIM), max_len=0,
+                  reads={"attn": Read(mask=Block(), op=Attend(q_heads=HEADS))})
+    h = _handle(array=array)
+    _open(h)
+    q, k, v = _tensors()
+    _fused_op()(h, 0, q, k, v)
+    assert torch.equal(h._held[0], k + 1), "the op's reference should hold k, as a direct add does"
 
 
 # The debug check

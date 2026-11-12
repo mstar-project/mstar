@@ -149,6 +149,9 @@ class _AttendCore:
     def __init__(self, lengths):
         self.attend = _Attend(lengths)
 
+    def reads_step_kv(self, label=None):
+        return True
+
     def run(self, q, *, label, kv_cache_layer, k, v, layer_idx):
         return self.attend(q, k, v)
 
@@ -367,8 +370,10 @@ def _higgs() -> ModelSpec:
 
 
 def _qwen3_omni() -> ModelSpec:
+    from mstar.distributed.communication import CommGroup
+    from mstar.engine.resources.sequence_shard import SequenceShard
     from mstar.engine.state.adapters import node_handles
-    from mstar.model.qwen3_omni.config import THINKER_ATTN, THINKER_KV, THINKER_POS, THINKER_SAMPLER
+    from mstar.model.qwen3_omni.config import THINKER_ATTN, THINKER_KV, THINKER_POS, THINKER_SAMPLER, THINKER_SHARD
     from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
     from mstar.model.submodule_base import engine_step
 
@@ -379,6 +384,8 @@ def _qwen3_omni() -> ModelSpec:
         sub.bind_node_state(node_handles(declaring, "Thinker", {
             THINKER_KV: _Unread(), THINKER_ATTN: _AttendCore(lengths), THINKER_POS: _Positions(rope),
             THINKER_SAMPLER: None,
+            # one SP rank's shard, whose bracket traces straight through
+            THINKER_SHARD: SequenceShard(("main",), 0, None, 0, CommGroup.trivial()),
         }))
 
     def run(sub, ids, lengths, rope=None):

@@ -32,7 +32,7 @@ from torch import nn
 from mstar.distributed.communication import CommGroup
 from mstar.model.voxcpm2.components.local import LocalDiT, LocalEncoder, ScalarQuantization, solve_cfm
 from mstar.model.voxcpm2.components.minicpm import MiniCPMLM
-from mstar.model.voxcpm2.config import BASE_ATTN, BASE_KV, BASE_POS, RES_ATTN, RES_KV, VoxCPM2Config
+from mstar.model.voxcpm2.config import BASE_KV, RES_KV, VoxCPM2Config
 
 
 class _FeatDecoder(nn.Module):
@@ -51,17 +51,15 @@ class VoxCPM2Generator(nn.Module):
         hidden, dit_hidden = lm.hidden_size, config.dit.hidden_size
         self.base_lm = MiniCPMLM(
             lm,
-            attn_key=BASE_ATTN,
             kv_key=BASE_KV,
-            pos_key=BASE_POS,
+            positions_from=BASE_KV,
             max_len=config.max_length,
             comm_group=comm_group,
         )
         self.residual_lm = MiniCPMLM(
             config.residual,
-            attn_key=RES_ATTN,
             kv_key=RES_KV,
-            pos_key=None if config.residual.no_rope else BASE_POS,
+            positions_from=None if config.residual.no_rope else BASE_KV,
             max_len=config.max_length,
             comm_group=comm_group,
         )
@@ -126,16 +124,11 @@ class VoxCPM2Generator(nn.Module):
         noise: torch.Tensor,
         cfg_value: torch.Tensor,
         t_span: torch.Tensor,
-        *,
-        label: str = "main",
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """One AR step for a batch of one-token rows: ``(patch, stop_logits)``."""
         embed = self.embed_patches(prev_patch)
-        lm_hidden = self.fsq_layer(self.base_lm(embed, label=label))
-        res_hidden = self.residual_lm(
-            self.fusion_concat_proj(torch.cat([lm_hidden, embed], dim=-1)),
-            label=label,
-        )
+        lm_hidden = self.fsq_layer(self.base_lm(embed))
+        res_hidden = self.residual_lm(self.fusion_concat_proj(torch.cat([lm_hidden, embed], dim=-1)))
         patch = self.predict_patch(lm_hidden, res_hidden, prev_patch, noise, cfg_value, t_span)
         return patch, self.stop_logits(lm_hidden)
 
@@ -149,8 +142,6 @@ class VoxCPM2Generator(nn.Module):
         noise: torch.Tensor,
         cfg_value: torch.Tensor,
         t_span: torch.Tensor,
-        *,
-        label: str = "main",
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Packed prompts -> first patch and stop logits per request.
 
@@ -159,9 +150,7 @@ class VoxCPM2Generator(nn.Module):
         continuation patches) are the ``text_mask`` holes. Mirrors
         ``VoxCPM2Model._inference`` up to its first patch.
         """
-        lm_hidden, res_hidden = self.prefill_states(
-            token_ids, text_mask, audio_patches, last_token_indices, label=label
-        )
+        lm_hidden, res_hidden = self.prefill_states(token_ids, text_mask, audio_patches, last_token_indices)
         return self.first_patch(lm_hidden, res_hidden, cond_patch, noise, cfg_value, t_span)
 
     def first_patch(
@@ -184,8 +173,6 @@ class VoxCPM2Generator(nn.Module):
         text_mask: torch.Tensor,
         audio_patches: torch.Tensor,
         last_token_indices: torch.Tensor,
-        *,
-        label: str = "main",
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Both LMs over the packed prompts: each row's last-position
         ``(lm_hidden, res_hidden)``, ``[rows, hidden]``. Every position's patch is
@@ -195,10 +182,7 @@ class VoxCPM2Generator(nn.Module):
         audio_mask = 1 - text_mask
         text_embed = self.embed_text(token_ids)
         feat_embed = self.embed_patches(audio_patches) * audio_mask
-        hidden = self.base_lm(text_mask * text_embed + audio_mask * feat_embed, label=label)
+        hidden = self.base_lm(text_mask * text_embed + audio_mask * feat_embed)
         hidden = self.fsq_layer(hidden) * audio_mask + hidden * text_mask
-        res = self.residual_lm(
-            self.fusion_concat_proj(torch.cat([hidden, audio_mask * feat_embed], dim=-1)),
-            label=label,
-        )
+        res = self.residual_lm(self.fusion_concat_proj(torch.cat([hidden, audio_mask * feat_embed], dim=-1)))
         return hidden.index_select(0, last_token_indices), res.index_select(0, last_token_indices)

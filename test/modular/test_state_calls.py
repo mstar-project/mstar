@@ -22,6 +22,7 @@ import torch
 from torch._dynamo.utils import counters
 
 from mstar.engine import state
+from mstar.engine.resources.attn.base import AttentionManager
 from mstar.engine.resources.kv.bounded.manager import BoundedKVManager
 from mstar.engine.resources.recurrent.config import RecurrentStep
 from mstar.engine.resources.recurrent.pool import RecurrentStatePool
@@ -90,7 +91,7 @@ class _StubKV:
     def layer_view(self, i):
         return self.pages[i]
 
-    def write_kv(self, k, v, layer_idx=None, label=None):
+    def write_kv(self, k, v, layer_idx=None, label=None, tokens=None):
         self.writes.append((layer_idx, label))
         self.pages[layer_idx, :k.shape[0], 0] = k
         self.pages[layer_idx, :k.shape[0], 1] = v
@@ -115,11 +116,29 @@ class _StubAttn:
     def select_last_hidden(self, x, label="main"):
         return x[-1:]
 
+    def reads_step_kv(self, label=None):
+        return not self.requires_kv_write
+
 
 class _StubDense(_StubAttn):
     """Takes k and v at the read, as the dense backend does."""
 
     requires_kv_write = False
+
+
+class _StubExchange(_StubAttn, AttentionManager):
+    """Attention whose every call goes through its exchange, which hands its run the step whole."""
+
+    def __init__(self):
+        super().__init__()
+        self.exchanges = []
+
+    def step_exchanges(self, label=None):
+        return True
+
+    def exchange(self, run, q, k, v, label=None):
+        self.exchanges.append("attend" if q is not None else "write")
+        return run(q, k, v)
 
 
 class _StubRagged:
@@ -267,7 +286,7 @@ def test_a_read_sees_this_layers_add_through_the_layers_own_pages():
     q, k, v = _tensors()
     h.add(2, k=k, v=v)
     out = h.read(2, q)
-    assert kv.writes == [(2, "main")] and attn.runs == [(2, "main", False)]
+    assert kv.writes == [(2, "main")] and attn.runs == [(2, "main", True)]
     assert torch.equal(out, q + k), "the read should see the k this layer just added"
     assert kv.pages[0].abs().sum() == 0 and kv.pages[3].abs().sum() == 0, "the add should touch only its own layer"
 
@@ -279,7 +298,7 @@ def test_a_layer_id_is_the_models_and_the_pool_counts_among_the_arrays_layers():
     q, k, v = _tensors()
     h.add(7, k=k, v=v)
     h.read(7, q)
-    assert kv.writes == [(1, "main")] and attn.runs == [(1, "main", False)]
+    assert kv.writes == [(1, "main")] and attn.runs == [(1, "main", True)]
 
 
 def test_a_label_comes_from_the_steps_segments():
@@ -289,7 +308,7 @@ def test_a_label_comes_from_the_steps_segments():
     q, k, v = _tensors()
     h.add(0, k=k, v=v)
     h.read(0, q)
-    assert kv.writes == [(0, "cfg")] and attn.runs == [(0, "cfg", False)]
+    assert kv.writes == [(0, "cfg")] and attn.runs == [(0, "cfg", True)]
 
 
 def test_an_array_steps_own_segments_win_over_the_steps():
@@ -710,6 +729,42 @@ def test_each_replay_starts_clean_for_an_add_that_runs_outside_the_graph():
         step = _begin(h, ctx=_ctx(leased=True), kv=ArrayStep(eager_add=True))
         _add(h, 1)
         h.end_step(step)
+
+
+def test_adds_outside_the_graph_write_every_layer_before_a_read_attends_the_pages():
+    kv, attn = _StubKV(), _StubAttn()
+    h = _kv_handle(kv=kv, attn=attn)
+    _begin(h, kv=ArrayStep(eager_add=True))
+    q, k, v = _tensors()
+    for layer in range(LAYERS):
+        h.add(layer, k=k + layer, v=v)
+    out = h.read(0, q)
+    assert kv.writes == [(layer, "main") for layer in range(LAYERS)]
+    assert attn.runs == [(0, "main", False)] and torch.equal(out, q + k)
+
+
+def test_an_exchanging_step_writes_each_add_once_through_the_exchange():
+    # an add waits for its read's exchange, so one its layer never reads is written at the next add or the check
+    kv, attn = _StubKV(), _StubExchange()
+    h = _kv_handle(kv=kv, attn=attn)
+    step = _begin(h)
+    q, k, v = _tensors()
+    for layer in range(LAYERS):
+        h.add(layer, k=k, v=v)
+        if layer == 1:
+            h.read(1, q)
+    h.check_step(step)
+    assert kv.writes == [(layer, "main") for layer in range(LAYERS)]
+    assert attn.exchanges == ["write", "attend", "write", "write"]
+
+
+@pytest.mark.parametrize("attn", [_StubDense, _StubExchange], ids=["dense", "exchange"])
+def test_an_add_outside_the_graph_is_refused_where_its_read_needs_the_steps_kv(attn):
+    h = _kv_handle(attn=attn())
+    _begin(h, kv=ArrayStep(eager_add=True))
+    _, k, v = _tensors()
+    _refused(r"Array 'kv': an eager_add step adds layer 0 outside the graph .* needs the step's own k and v",
+             lambda: h.add(0, k=k, v=v))
 
 
 @pytest.mark.parametrize("make, declared, cause", [
@@ -1355,6 +1410,13 @@ def test_a_read_on_a_value_with_only_host_fields_is_refused():
     _refused(r"Array 'host': no layout yet: read on a HostValueHandle", lambda: h.read(0))
 
 
+def test_a_write_on_a_value_with_only_host_fields_is_refused():
+    array = Value("host", nodes={"LLM"}, layers={0}, entry=Entry({}, host={"n": int}))
+    setup = StateSetup(host_fields=HostFields())
+    h = build_handle(array, {}, _resolve([array], setup), setup)
+    _refused(r"Array 'host': no layout yet: write on a HostValueHandle", lambda: h.write(0, n=torch.ones(1)))
+
+
 def test_set_start_on_an_array_that_isnt_a_value_is_refused():
     _refused(r"Array 'kv': no layout yet: set_start on a PagedArrayHandle",
              lambda: _kv_handle().set_start({"k": torch.ones(1)}))
@@ -1525,7 +1587,8 @@ def test_fused_draws_stop_where_fused_sample_leaves_the_layout_draw_row_assumes(
     s = _drawing(vocab_size=vocab_size)
     _begin(s)
     assert (fused_draw_args(s) is not None) == fused
-    assert (launched["num_warps"] == 4) == fused, "draw_row_layout is the 4-warp layout, so the cap has to follow it"
+    assert (launched["num_warps"] == sampler_utils.FUSED_DRAW_WARPS) == fused, \
+        "draw_row's layout takes FUSED_DRAW_WARPS warps, so the cap has to follow the launch"
 
 
 def test_a_vocabulary_above_the_cap_draws_through_sample():

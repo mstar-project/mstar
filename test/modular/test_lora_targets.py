@@ -706,7 +706,7 @@ def _fastconformer(part: str) -> nn.Module:
     from mstar.model.components import fastconformer as fc
 
     config = fc.FastConformerConfig(hidden_size=HIDDEN, num_heads=2, num_mel_bins=16, subsampling_channels=4)
-    return fc.RelPositionAttention(config) if part == "attention" else fc._Subsampling(config)
+    return fc.RelPositionAttention(config) if part == "attention" else fc.DwStridingSubsampling(config)
 
 
 def _chatterbox_attention() -> nn.Module:

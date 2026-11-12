@@ -154,7 +154,7 @@ def _conv_out_len(lengths, kernel: int, stride: int, causal: bool):
     return (lengths + pad - kernel) // stride + 1
 
 
-class _Subsampling(nn.Module):
+class DwStridingSubsampling(nn.Module):
     """Depthwise-separable striding over (time, mel): a full conv into
     ``subsampling_channels``, then depthwise + pointwise pairs, then a linear
     from the flattened channels x remaining mel bins.
@@ -477,7 +477,7 @@ class FastConformerEncoder(nn.Module):
         super().__init__()
         self.config = config
         self.kv_key, self.conv_key = kv_key, conv_key
-        self.subsampling = _Subsampling(config)
+        self.subsampling = DwStridingSubsampling(config)
         self.layers = nn.ModuleList(
             FastConformerBlock(config, i, kv_key, conv_key) for i in range(config.num_layers)
         )

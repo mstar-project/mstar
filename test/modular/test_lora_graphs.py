@@ -511,7 +511,7 @@ def test_the_recompile_limit_counts_each_lean_twin(monkeypatch):
             declare_step=lambda slot_lease, **kwargs: SimpleNamespace(steps={"lora": object()}),
             compiled_entries_per_shape=1,
         ),
-        autocast_dtype=None, joint_comm_group=SimpleNamespace(world_size=1), num_slots=2,
+        autocast_dtype=None, joint_comm_group=SimpleNamespace(world_size=1), num_slots=2, head_shards=1,
     )
 
     # bs 1 and 2, each plain and lean

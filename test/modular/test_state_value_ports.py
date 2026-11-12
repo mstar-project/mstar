@@ -121,7 +121,7 @@ def _asr_reference(model) -> list:
     text, audio = model.config.text, model.config.audio
     return [
         RaggedAttentionSpec(
-            resource_key="aut_attn", nodes={"audio_encoder"},
+            resource_key="aut_attn", nodes={"audio_encoder"}, labels={"main"},
             config=RaggedAttentionConfig(
                 num_qo_heads=audio.encoder_attention_heads, num_kv_heads=audio.encoder_attention_heads,
                 head_dim=audio.head_dim, max_segments_per_request=model.max_windows_per_request,

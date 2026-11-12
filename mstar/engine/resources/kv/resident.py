@@ -61,8 +61,9 @@ class KVResidentTables:
         if len(pages) > self.block_table.width:
             raise ValueError(f"{len(pages)} pages of a stream don't fit a block table row of {self.block_table.width}")
         page = self.page_size
-        # a stream that appends holds the page its next token goes to, too
-        cols = -(-stored_len // page) if writes.streams[self.key].reads else stored_len // page + 1
+        # a stream that appends holds the pages its next tokens go to, too
+        reads = writes.streams[self.key].reads
+        cols = -(-stored_len // page) if reads else (stored_len + writes.repeats - 1) // page + 1
         row[self.kv_len.col] = stored_len
         writes.kv_len[self.key] = stored_len
         if cols:
@@ -71,8 +72,13 @@ class KVResidentTables:
         self.host_cols[slot] = cols
 
     def refresh_len(self, stored_len: int, slot: int, writes: ResidentWrites) -> None:
-        """A row a host-planned step advanced; its columns stay until `stage_step`."""
-        writes.put(self.kv_len.cell(slot), stored_len)
+        """A row a host-planned step advanced; its columns stay until `stage_step`.
+        A cell, which rides the graph's scatter; a step that repeats writes it
+        once, ahead of the replays, since `cells` replay with the graph."""
+        if writes.repeats == 1:
+            writes.put(self.kv_len.cell(slot), stored_len)
+        else:
+            writes.run(slot, self.kv_len.col, [stored_len])
         self.host_len[slot] = stored_len
 
     def stage_step(self, plan: ResidentPlan, stream_len, stream_pages, rewrite) -> None:
@@ -95,7 +101,9 @@ class KVResidentTables:
             return
         slots = plan.slots
         cols = self.host_cols[slots]
-        need = self.host_len[slots] // self.page_size + 1
+        # a step that repeats needs the page of its last replay's token
+        tail = self.host_len[slots] if plan.repeats == 1 else self.host_len[slots] + (plan.repeats - 1)
+        need = tail // self.page_size + 1
         rows = np.flatnonzero(need > cols)
         if not rows.size:
             return
@@ -115,12 +123,13 @@ class KVResidentTables:
         row's page count and length, in its row order, with the step's token
         unless it only reads the stream. A row with nothing to read, as a
         padding row on the trash row, reads one sink page token, as the graph
-        does. No page indices."""
+        does. No page indices. A step that repeats plans its last replay: the
+        graph fills each replay's own arrays, and a shorter row fits the plan."""
         stored = self.host_len[plan.slots]
         n = stored.shape[0]
         appends = not plan.writes.streams[self.key].reads
         lens = np.ones(bs, dtype=np.int32)
-        lens[:n] = np.maximum(stored + appends, 1)
+        lens[:n] = np.maximum(stored + appends * plan.repeats, 1)
         pages = (lens - 1) // self.page_size + 1
         indptr = np.zeros(bs + 1, dtype=np.int32)
         np.cumsum(pages, out=indptr[1:])
@@ -138,7 +147,7 @@ class KVResidentTables:
     def advance(self, plan: ResidentPlan) -> None:
         if plan.writes.streams[self.key].reads:
             return
-        self.host_len[plan.slots] += 1
+        self.host_len[plan.slots] += plan.repeats
         crossed = plan.crossed.get(self.key)
         if crossed is not None:
             rows, need = crossed

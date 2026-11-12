@@ -15,13 +15,15 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-# Talker resources: the base LM's paged KV + attention + RoPE positions, and
-# the residual LM's paged KV + attention (it has no RoPE).
+# The Talker's arrays and reads: the base LM's and the residual LM's paged KV
+# and attention, and each request's progress.
 BASE_KV = "base_kv"
 BASE_ATTN = "base_attn"
-BASE_POS = "base_pos"
 RES_KV = "res_kv"
 RES_ATTN = "res_attn"
+TALKER_STEP = "talker_step"
+# The engine's default page, restated since a model on the state contract doesn't import the engine's resources.
+PAGE_TOKENS = 128
 
 # Special token ids of the VoxCPM2 tokenizer (``VoxCPM2Model.__init__``).
 AUDIO_START_TOKEN = 101
@@ -44,7 +46,9 @@ PROMPT_MODE_KEY = "voxcpm2_prompt_mode"
 MIN_LEN_KEY = "voxcpm2_min_len"
 # content hash of the reference clip, the RefEncoder's memo key with the mode
 REF_DIGEST_KEY = "voxcpm2_ref_digest"
-TALKER_STEP_METADATA = (PATCH_BUDGET_KEY, PROMPT_MODE_KEY, MIN_LEN_KEY, REF_DIGEST_KEY)
+CFG_KEY = "voxcpm2_cfg_value"
+TALKER_STEP_METADATA = (PATCH_BUDGET_KEY, PROMPT_MODE_KEY, MIN_LEN_KEY, REF_DIGEST_KEY, CFG_KEY)
+TALKER_DECODE_METADATA = (PATCH_BUDGET_KEY, MIN_LEN_KEY, CFG_KEY)
 
 
 @dataclass
