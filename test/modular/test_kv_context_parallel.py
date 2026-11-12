@@ -1602,6 +1602,7 @@ def _thinker_over_ranks(rank, world, store, placed, exchange):
         Qwen3OmniModelConfig,
     )
     from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
+    from mstar.model.qwen3_omni.submodules import ThinkerSubmodule
 
     dist.init_process_group("gloo", init_method=f"file://{store}", rank=rank, world_size=world)
     torch.set_num_threads(1)
@@ -1675,8 +1676,9 @@ def _thinker_over_ranks(rank, world, store, placed, exchange):
             for module in thinker.modules():
                 if hasattr(module, "bind_state"):
                     module.bind_state(handles)
-            # what its submodule binds (`ThinkerSubmodule.bind_node_resources`)
-            thinker.sequence_shard = res[THINKER_SHARD]
+            # the submodule hands the model its node's shard
+            ThinkerSubmodule(thinker, cfg).bind_node_resources(res)
+            assert thinker.sequence_shard is res[THINKER_SHARD]
             res[THINKER_SHARD].min_tokens = 0 if split else 1 << 20
             runner = StepRunner(res)
             for rid in ("r0", "r1", "r2"):
@@ -1702,10 +1704,10 @@ def _thinker_over_ranks(rank, world, store, placed, exchange):
                 # exchanges, and on the copied decode over KV stored by position, which reads only the pages
                 kv = handles[THINKER_KV]
                 kv.fused_ops = frozenset({qk_norm_rope_table_kv_write.op.name})
-                if splits or not placed:
-                    assert not kv.fused_ops
-                elif decode:
+                if decode and placed and not splits:
                     assert kv.fused_ops
+                else:
+                    assert not kv.fused_ops
                 kv.fused_ops = frozenset()
                 with torch.no_grad():
                     hidden, layer_0, layer_n = forward(**step_inputs)
