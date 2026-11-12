@@ -1,13 +1,17 @@
-"""Wan22Model: Wan2.2-TI2V-5B text/image-to-video generation.
+"""Wan22Model: Wan2.2 text/image-to-video generation (TI2V-5B), and text-to-video (T2V-A14B).
 
 Architecture (4 nodes; nothing here is cached, the dit's self-attention reads an array with max_len 0):
     text_encoder - UMT5-XXL prompt encoder (thin HF wrapper)
-    vae_encoder  - Wan2.2-VAE encode of the conditioning frame (I2V)
-    dit          - dense 5B video DiT; CFG as one batch-2 forward,
+    vae_encoder  - Wan2.2-VAE encode of the conditioning frame (I2V; not on A14B)
+    dit          - dense 5B video DiT, or A14B's high- and low-noise experts (both
+                   resident); CFG as one batch-2 forward,
                    UniPC (bh2, order 2, flow prediction) run inline
-    vae_decoder  - Wan2.2-VAE latent -> pixel decode
+    vae_decoder  - Wan2.2-VAE latent -> pixel decode (the Wan2.1 VAE on A14B)
 
-Graph walks (4):
+The variant is ``model_kwargs.variant`` (``ti2v_5b``, the default, or ``t2v_a14b``),
+with ``model_path_hf`` pointing at its checkpoint; see ``Wan22Config.for_variant``.
+
+Graph walks (4; A14B has no image walks):
     encode_text   - text_encoder; persists text_embeds_pos / text_embeds_neg
     encode_image  - vae_encoder; persists image_latent (I2V requests only)
     video_gen     - T2V: Loop("denoise_loop") over dit, then vae_decoder ->
@@ -68,7 +72,10 @@ _MP4_MAX_SIDE = 16384
 # onto height/width and forwards num_frames and fps.
 REQUEST_KWARGS = frozenset({
     "height", "width", "num_frames", "fps", "num_inference_steps", "guidance_scale", "negative_prompt",
+    "flow_shift",
 })
+# A14B's low-noise expert's guidance
+MOE_REQUEST_KWARGS = REQUEST_KWARGS | {"guidance_scale_2"}
 
 
 def _is_number(value) -> bool:
@@ -76,7 +83,7 @@ def _is_number(value) -> bool:
 
 
 class Wan22Model(Model):
-    """Wan2.2-TI2V-5B video generation model (TI2V-5B variant only)."""
+    """Wan2.2 video generation model: TI2V-5B, or T2V-A14B (``variant``)."""
 
     ENCODE_TEXT_WALK = "encode_text"
     ENCODE_IMAGE_WALK = "encode_image"
@@ -99,15 +106,11 @@ class Wan22Model(Model):
         **kwargs,
     ):
         refuse_attention_backend_kwarg(kwargs)
-        if variant != WAN22_VARIANT_TI2V_5B:
-            raise NotImplementedError(
-                f"Wan2.2 variant {variant!r} is not implemented; only "
-                f"{WAN22_VARIANT_TI2V_5B!r} is. The A14B variants are a MoE dual-DiT."
-            )
         self.model_path_hf = model_path_hf
         self.cache_dir = cache_dir
-        self.config = Wan22Config(
-            variant=variant, compile_dit_sizes=compile_dit_sizes,
+        # an unknown variant raises NotImplementedError
+        self.config = Wan22Config.for_variant(
+            variant, compile_dit_sizes=compile_dit_sizes,
             dit_max_batch_size=self._require_positive_int("dit_max_batch_size", dit_max_batch_size),
             max_video_pixels=self._require_positive_int("max_video_pixels", max_video_pixels),
             vae_decode_fast=vae_decode_fast, vae_decode_fast_sizes=vae_decode_fast_sizes,
@@ -191,12 +194,14 @@ class Wan22Model(Model):
             ],
         )
 
-        return {
+        walks = {
             self.ENCODE_TEXT_WALK: encode_text,
-            self.ENCODE_IMAGE_WALK: encode_image,
             self.VIDEO_GEN_WALK: self._build_video_gen_walk(i2v=False),
-            self.VIDEO_GEN_I2V_WALK: self._build_video_gen_walk(i2v=True),
         }
+        if self.config.supports_i2v:
+            walks[self.ENCODE_IMAGE_WALK] = encode_image
+            walks[self.VIDEO_GEN_I2V_WALK] = self._build_video_gen_walk(i2v=True)
+        return walks
 
     def _build_video_gen_walk(self, i2v: bool) -> GraphSection:
         """Denoise loop + VAE decode.
@@ -306,7 +311,7 @@ class Wan22Model(Model):
     def _validate_generation_size(self, model_kwargs: dict) -> None:
         """Reject a request geometry the model cannot produce. Raises ``ValueError``.
 
-        height and width must be multiples of 32 (VAE downsample 16 x DiT patch 2),
+        height and width must be multiples of 32 (VAE downsample 16 x DiT patch 2; 16 on A14B),
         num_frames must be 4k+1 (the VAE compresses time by 4 around an anchor
         frame), height x width x num_frames must not exceed ``max_video_pixels``, each
         axis must fit the DiT's rotary table and each side the mp4 encoder, and fps
@@ -391,7 +396,8 @@ class Wan22Model(Model):
         return default if value is None else value
 
     def _resolve_denoise_knobs(self, model_kwargs: dict) -> dict:
-        """num_inference_steps, guidance_scale and negative_prompt, validated; ``ValueError`` names the bad one."""
+        """num_inference_steps, guidance_scale (A14B: and guidance_scale_2) and negative_prompt, validated;
+        ``ValueError`` names the bad one."""
         cfg = self.config
         steps = self._get(model_kwargs, "num_inference_steps", cfg.default_num_inference_steps)
         # past the denoise loop's max_iters, the conductor refuses it (get_loop_caps)
@@ -403,7 +409,23 @@ class Wan22Model(Model):
         negative = self._get(model_kwargs, "negative_prompt", cfg.default_negative_prompt)
         if not isinstance(negative, str):
             raise ValueError(f"Wan2.2 negative_prompt must be a string; got {negative!r}.")
-        return {"num_inference_steps": steps, "guidance_scale": float(guidance), "negative_prompt": negative}
+        knobs = {"num_inference_steps": steps, "guidance_scale": float(guidance), "negative_prompt": negative}
+        # Unset, the dit uses the checkpoint's flow_shift (read on its worker at load);
+        # the official Wan2.2 A14B recipe runs 12.0 where the diffusers checkpoint says 3.0.
+        shift = model_kwargs.get("flow_shift")
+        if shift is not None:
+            if not _is_number(shift) or shift <= 0:
+                raise ValueError(f"Wan2.2 flow_shift must be a positive finite number; got {shift!r}.")
+            knobs["flow_shift"] = float(shift)
+        if cfg.is_moe:
+            # a request that sets guidance_scale alone gets it for both experts, as
+            # in diffusers' WanPipeline; one that sets neither gets the checkpoint's pair
+            default_2 = cfg.guidance_scale_2 if model_kwargs.get("guidance_scale") is None else guidance
+            guidance_2 = self._get(model_kwargs, "guidance_scale_2", default_2)
+            if not _is_number(guidance_2):
+                raise ValueError(f"Wan2.2 guidance_scale_2 must be a finite number; got {guidance_2!r}.")
+            knobs["guidance_scale_2"] = float(guidance_2)
+        return knobs
 
     def process_prompt(
         self,
@@ -456,6 +478,10 @@ class Wan22Model(Model):
                 "Wan2.2 requires a text prompt for both text-to-video and "
                 "image-to-video requests."
             )
+        if "image" in input_modalities and not self.config.supports_i2v:
+            raise ValueError(
+                f"Wan2.2 {self.config.variant} is text-to-video only; send no image."
+            )
         if "image" in input_modalities and not (tensors or {}).get("image_inputs"):
             # A declared-but-missing input is a malformed request, not a mode
             # preference — do not silently downgrade an I2V request to T2V.
@@ -499,14 +525,15 @@ class Wan22Model(Model):
         return {}
 
     def request_kwargs(self) -> frozenset[str]:
-        return REQUEST_KWARGS
+        return MOE_REQUEST_KWARGS if self.config.is_moe else REQUEST_KWARGS
 
     def postprocess(self, output: torch.Tensor, modality: str, request_kwargs: dict | None = None) -> bytes:
         """Mux the emitted uint8 ``[F, H, W, 3]`` frames to mp4 bytes.
 
         PyAV is the encoder because it bundles its own FFmpeg; torchcodec needs
         system FFmpeg libraries. ``fps`` is a PLAYBACK rate, not a generation knob:
-        the model always makes a fixed ``num_frames`` clip at an implied 24 fps, so
+        the model always makes a fixed ``num_frames`` clip at an implied 24 fps
+        (16 on A14B, ``config.video_fps``), so
         another value only rescales its duration.
         """
         if modality != "video":
@@ -546,13 +573,16 @@ class Wan22Model(Model):
         decode_policy = normalize_decode_tiling_mode(
             os.environ.get("WAN22_VAE_DECODE_TILING", self.config.vae_decode_tiling)
         )
+        guidance = resolved["guidance_scale"]
+        if "guidance_scale_2" in resolved:
+            guidance = f"{guidance}/{resolved['guidance_scale_2']}"
         logger.info(
             "Wan2.2 request: height=%d width=%d frames=%d steps=%d guidance=%s seed=%s "
-            "negative_prompt=%s fps=%s decode=%s compile=%s",
+            "negative_prompt=%s fps=%s flow_shift=%s decode=%s compile=%s",
             resolved["height"], resolved["width"], resolved["num_frames"],
-            resolved["num_inference_steps"], resolved["guidance_scale"],
+            resolved["num_inference_steps"], guidance,
             seed if seed is not None else "auto",
-            "present" if negative.strip() else "absent", fps, decode_policy,
+            "present" if negative.strip() else "absent", fps, resolved.get("flow_shift", "checkpoint"), decode_policy,
             "on" if self.config.compile_dit else "off",
         )
 
@@ -576,6 +606,8 @@ class Wan22Model(Model):
                 "Wan2.2 requires a text prompt (text_inputs) for both "
                 "text-to-video and image-to-video requests."
             )
+        if "image" in input_modalities and not self.config.supports_i2v:
+            raise ValueError(f"Wan2.2 {self.config.variant} is text-to-video only; send no image.")
         is_i2v = "image" in input_modalities and bool(input_signals.get("image_inputs"))
         if "image" in input_modalities and not is_i2v:
             raise ValueError(
@@ -597,6 +629,9 @@ class Wan22Model(Model):
             "width": self._get(model_kwargs, "width", self.config.default_width),
             "num_frames": self._get(model_kwargs, "num_frames", self.config.default_num_frames),
         }
+        for name in ("guidance_scale_2", "flow_shift"):
+            if name in knobs:
+                request[name] = knobs[name]
         self._log_config_echo(model_kwargs, request)
         return [WalkStep(walk, step_metadata=request) for walk in walks]
 
@@ -630,9 +665,9 @@ class Wan22Model(Model):
         """Construct one node's submodule from the checkpoint.
 
         The wrapped components load on CPU and the EngineManager moves them; the
-        native DiT materializes straight onto ``device``, with no CPU staging copy
-        of the 5B weights. Returns None in dummy mode and for unknown nodes, which
-        makes the engine run that node without real computation.
+        native DiT (both of A14B's experts) materializes straight onto ``device``, with
+        no CPU staging copy of the weights. Returns None in dummy mode and for unknown
+        nodes, which makes the engine run that node without real computation.
         """
         if self.skip_weight_loading:
             return None
@@ -660,11 +695,17 @@ class Wan22Model(Model):
             from mstar.model.wan22.weight_loader import build_wan22_dit
 
             self._refresh_checkpoint_defaults()
-            transformer = build_wan22_dit(
-                self.config, self.model_path_hf, device=device, cache_dir=self.cache_dir,
-                sp_group=sp_group,
+            experts = [
+                build_wan22_dit(
+                    self.config, self.model_path_hf, device=device, cache_dir=self.cache_dir,
+                    sp_group=sp_group, subfolder=subfolder,
+                )
+                for subfolder in (("transformer", "transformer_2") if self.config.is_moe else ("transformer",))
+            ]
+            return Wan22DitSubmodule(
+                experts[0], self.config, cfg_group=cfg_group,
+                transformer_2=experts[1] if len(experts) > 1 else None,
             )
-            return Wan22DitSubmodule(transformer, self.config, cfg_group=cfg_group)
         logger.warning("Wan2.2 has no submodule for node %r; running it dummy.", node_name)
         return None
 
@@ -713,3 +754,19 @@ class Wan22Model(Model):
                 checkpoint_shift, self.config.flow_shift,
             )
             self.config.flow_shift = checkpoint_shift
+        if self.config.is_moe:
+            from diffusers import DiffusionPipeline
+
+            # the experts' split; the checkpoint's model_index.json carries it
+            boundary = DiffusionPipeline.load_config(self.model_path_hf, cache_dir=self.cache_dir).get("boundary_ratio")
+            if boundary is None:
+                raise ValueError(
+                    f"Wan2.2 {self.config.variant} needs the checkpoint's boundary_ratio, and "
+                    f"{self.model_path_hf}'s model_index.json has none."
+                )
+            if boundary != self.config.boundary_ratio:
+                logger.warning(
+                    "Wan2.2 checkpoint boundary_ratio=%s differs from the documented default %s; "
+                    "using the checkpoint value.", boundary, self.config.boundary_ratio,
+                )
+                self.config.boundary_ratio = boundary

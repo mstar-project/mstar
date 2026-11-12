@@ -1,17 +1,45 @@
-"""Configuration for Wan2.2-TI2V-5B (dense video DiT + UMT5-XXL + Wan2.2-VAE).
+"""Configuration for Wan2.2: TI2V-5B (dense video DiT + UMT5-XXL + Wan2.2-VAE)
+and T2V-A14B (two experts of one video DiT + UMT5-XXL + the Wan2.1 VAE).
 
-The architecture values are facts of the ``Wan-AI/Wan2.2-TI2V-5B-Diffusers``
-checkpoint, hardcoded so that constructing the model never touches the network.
-``Wan22Model._refresh_checkpoint_defaults`` re-reads ``flow_shift`` from the
-checkpoint at load time and hard-fails if the solver order or train-timestep
-count drift from what the inline UniPC port implements.
+The architecture values are facts of the ``Wan-AI/Wan2.2-TI2V-5B-Diffusers`` and
+``Wan-AI/Wan2.2-T2V-A14B-Diffusers`` checkpoints, hardcoded so that constructing
+the model never touches the network: the dataclass defaults are TI2V-5B's, and
+``Wan22Config.for_variant`` lays A14B's over them. ``Wan22Model._refresh_checkpoint_defaults``
+re-reads ``flow_shift`` (and A14B's ``boundary_ratio``) from the checkpoint at load
+time and hard-fails if the solver order or train-timestep count drift from what the
+inline UniPC port implements; the DiT loader hard-fails on a transformer config
+that is not the variant's.
 """
 
 from dataclasses import dataclass
 
-# The only variant implemented. ``Wan22Model.__init__`` rejects any other; the
-# A14B variants are a MoE dual-DiT and a separate piece of work.
 WAN22_VARIANT_TI2V_5B = "ti2v_5b"
+WAN22_VARIANT_T2V_A14B = "t2v_a14b"
+
+# What T2V-A14B changes from the dataclass defaults (TI2V-5B). The DiT values are
+# transformer/config.json's (transformer_2 has the same), the VAE's are the Wan2.1
+# VAE's, and boundary_ratio is model_index.json's. The sampling defaults are the
+# checkpoint's model card (40 steps, guidance 4.0 on the high-noise expert and 3.0
+# on the low-noise one, 1280x720 at 81 frames) with the checkpoint scheduler's
+# flow_shift (3.0) and the Wan2.1 frame rate (16 fps).
+_A14B = {
+    "num_attention_heads": 40,
+    "num_layers": 40,
+    "ffn_dim": 13824,
+    "in_channels": 16,
+    "out_channels": 16,
+    "vae_scale_factor_spatial": 8,
+    "flow_shift": 3.0,
+    "boundary_ratio": 0.875,
+    "expand_timesteps": False,
+    "guidance_scale": 4.0,
+    "guidance_scale_2": 3.0,
+    "default_num_inference_steps": 40,
+    "default_height": 720,
+    "default_width": 1280,
+    "video_fps": 16,
+}
+_VARIANTS = {WAN22_VARIANT_TI2V_5B: {}, WAN22_VARIANT_T2V_A14B: _A14B}
 
 
 # The DiT's self-attention: the array over its tokens, and the read that names its resource.
@@ -20,12 +48,17 @@ DIT_TOKENS, SELF_ATTN = "dit_tokens", "dit_self_attn"
 
 @dataclass
 class Wan22Config:
-    """Wan2.2-TI2V-5B model configuration.
+    """Wan2.2 model configuration; the defaults are TI2V-5B's (``for_variant`` builds A14B's).
 
-    A single dense video DiT driven by UMT5-XXL embeddings, denoising Wan2.2-VAE
-    latents with UniPC. T2V and I2V share the one transformer: I2V injects the
+    TI2V-5B: a single dense video DiT driven by UMT5-XXL embeddings, denoising
+    Wan2.2-VAE latents with UniPC. T2V and I2V share the one transformer: I2V injects the
     encoded first frame into the latent grid and zeroes its per-token timestep,
     rather than concatenating on the channel axis.
+
+    T2V-A14B: two DiTs of one architecture, the high-noise expert for the steps whose
+    timestep is at least ``boundary_ratio * 1000`` and the low-noise expert after,
+    each with its own guidance scale, denoising Wan2.1-VAE latents with UniPC. Text to
+    video only, and one timestep per sample rather than per frame.
     """
 
     variant: str = WAN22_VARIANT_TI2V_5B
@@ -44,6 +77,12 @@ class Wan22Config:
     qk_norm: str = "rms_norm_across_heads"
     cross_attn_norm: bool = True
     eps: float = 1e-6
+    # A timestep per latent frame (TI2V-5B, whose I2V zeroes frame 0), or one per
+    # sample (A14B).
+    expand_timesteps: bool = True
+    # A14B: the share of the 1000 train timesteps run by the high-noise expert
+    # (``transformer``); the steps below it run ``transformer_2``. None is one DiT.
+    boundary_ratio: float | None = None
 
     # UMT5-XXL: tokenizer truncation and the padded embedding length.
     text_max_seq_len: int = 512
@@ -58,9 +97,12 @@ class Wan22Config:
 
     # Generation defaults, each overridable per request via model_kwargs. The
     # sampling knobs match the diffusers WanPipeline defaults; the size defaults to
-    # the checkpoint's native 720P tier (1280x704) rather than diffusers' 832x480,
-    # so a no-size request produces full-resolution output.
+    # the checkpoint's native 720P tier (1280x704; A14B 1280x720) rather than diffusers'
+    # 832x480, so a no-size request produces full-resolution output.
     guidance_scale: float = 5.0
+    # The low-noise expert's guidance (A14B only). A request that sets
+    # guidance_scale alone gets it for both experts, as in diffusers' WanPipeline.
+    guidance_scale_2: float | None = None
     default_num_inference_steps: int = 50
     default_height: int = 704  # must be a multiple of spatial_alignment
     default_width: int = 1280  # must be a multiple of spatial_alignment
@@ -80,11 +122,11 @@ class Wan22Config:
     # build with this False to hold the eager path against the reference.
     compile_dit: bool = True
     # "WxHxF" request shapes (width x height x num_frames) the compiled DiT
-    # serves; None is the default shape (1280x704x81). Every other shape runs
+    # serves; None is the default shape (TI2V-5B 1280x704x81). Every other shape runs
     # the transformer eager. The compile traces one graph per input shape and
     # requests choose theirs, so an open set would let each new shape cost a
     # compile on the shared worker. A listed shape compiles at most twice (CFG
-    # on and off).
+    # on and off), for each of A14B's experts.
     compile_dit_sizes: tuple[str, ...] | None = None
     # Requests at one latent grid sharing a dit forward. Each row count traces its
     # own compiled graph, on top of the shapes above.
@@ -104,6 +146,25 @@ class Wan22Config:
     # (1280x704). Requests choose their size, so an open list would let each new
     # size cost a compile on the shared worker.
     vae_decode_fast_sizes: tuple[str, ...] | None = None
+
+    @classmethod
+    def for_variant(cls, variant: str = WAN22_VARIANT_TI2V_5B, **overrides) -> "Wan22Config":
+        """The config of ``variant`` with ``overrides`` (serving knobs) laid over it."""
+        if variant not in _VARIANTS:
+            raise NotImplementedError(
+                f"Wan2.2 variant {variant!r} is not implemented; the variants are {sorted(_VARIANTS)}."
+            )
+        return cls(variant=variant, **{**_VARIANTS[variant], **overrides})
+
+    @property
+    def is_moe(self) -> bool:
+        """Two experts split the denoise steps at ``boundary_ratio`` (A14B)."""
+        return self.boundary_ratio is not None
+
+    @property
+    def supports_i2v(self) -> bool:
+        """Image conditioning, which only TI2V-5B's per-frame timestep path has."""
+        return self.expand_timesteps
 
     def __post_init__(self):
         # A yaml "false" is a truthy string, so a non-boolean is rejected here
@@ -141,9 +202,10 @@ class Wan22Config:
 
     @property
     def spatial_alignment(self) -> tuple[int, int]:
-        """(height, width) pixel multiples a request's size must satisfy — 32 each.
+        """(height, width) pixel multiples a request's size must satisfy: 32 each on
+        TI2V-5B, 16 on A14B.
 
-        The VAE downsamples a pixel dimension by 16 and the DiT then patchifies by
+        The VAE downsamples a pixel dimension by 16 (8 on A14B) and the DiT then patchifies by
         2, so only exact multiples of the product survive both. An unaligned size
         has no clean failure inside the model, so it is rejected at the request
         seam (``Wan22Model.process_prompt``).

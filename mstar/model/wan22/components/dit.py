@@ -1,13 +1,14 @@
-"""Native Wan2.2-TI2V-5B video DiT (dense 5B transformer).
+"""Native Wan2.2 video DiT (TI2V-5B's dense 5B transformer, and each of T2V-A14B's two experts).
 
-Port of diffusers 0.39.0 ``WanTransformer3DModel``, restricted to the TI2V-5B
-checkpoint's configuration: no image-conditioning branch, and the per-token
-timestep path (``expand_timesteps``). Every token of a latent frame shares its
-frame's timestep (I2V zeroes frame 0 only), so the timestep comes in per frame,
-``[batch, frames]``, and the time embedding and the modulation are computed once
-per frame and broadcast over the frame's tokens. cuBLAS may pick a different
-GEMM kernel at the per-frame row count than at the reference's per-token one, so
-these rows match the reference's to rounding rather than bitwise; given the same
+Port of diffusers 0.39.0 ``WanTransformer3DModel``, restricted to the Wan2.2
+checkpoints' configuration: no image-conditioning branch. The timestep comes in
+per group of tokens, ``[batch, groups]``, and the time embedding and the
+modulation are computed once per group and broadcast over the group's tokens.
+TI2V-5B (``expand_timesteps``) has one group per latent frame, since every token
+of a frame shares its frame's timestep (I2V zeroes frame 0 only); cuBLAS may pick
+a different GEMM kernel at the per-frame row count than at the reference's
+per-token one, so these rows match the reference's to rounding rather than
+bitwise. A14B has one group per sample, the reference's own rows. Given the same
 rows, the blocks and the head are the reference's bits.
 
 Numerics contract (bf16 weights with fp32 islands):
@@ -194,9 +195,9 @@ class Wan22DiTAttention(nn.Module):
 
 
 class Wan22TimeTextEmbedding(nn.Module):
-    """Condition embedder: per-frame timestep embedding + text projection
+    """Condition embedder: per-group timestep embedding + text projection
     (reference ``WanTimeTextImageEmbedding``, image branch absent on
-    TI2V-5B, its per-token rows computed once per frame).
+    Wan2.2, TI2V-5B's per-token rows computed once per frame).
 
     ``time_embedder`` is an fp32 island: the sinusoidal embedding and both
     its Linears run fp32; ``temb`` crosses to bf16 at ``type_as(text)``, so
@@ -214,7 +215,8 @@ class Wan22TimeTextEmbedding(nn.Module):
         self, timestep: torch.Tensor, encoder_hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """``timestep`` ``[B, frames]``, one per latent frame (under SP, one per
-        run of a frame's tokens on this rank: ``Wan22DiT.forward``); returns
+        run of a frame's tokens on this rank: ``Wan22DiT.forward``), or ``[B, 1]``
+        one per sample; returns
         ``temb [B, frames, dim]``, ``timestep_proj [B, frames, 6, dim]``,
         projected text ``[B, 512, dim]`` — all in the text embeds' dtype."""
         batch, frames = timestep.shape
@@ -254,7 +256,7 @@ class Wan22DiTBlock(nn.Module):
     ) -> torch.Tensor:
         # [1, 1, 6, dim] + [B, G, 6, dim] -> six [B, G, dim] fp32 tensors, each
         # applied to one of G equal groups of tokens: a frame, or under SP a run
-        # of a frame's tokens.
+        # of a frame's tokens, or all of them (a per-sample timestep).
         shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (
             self.scale_shift_table.unsqueeze(0) + timestep_proj.float()
         ).unbind(2)
@@ -279,7 +281,7 @@ class Wan22DiTBlock(nn.Module):
 
 
 class Wan22DiT(nn.Module):
-    """The dense 5B TI2V video DiT: Conv3d patchify -> 30 blocks -> adaLN
+    """The Wan2.2 video DiT: Conv3d patchify -> ``num_layers`` blocks -> adaLN
     output head + unpatchify. Built on the meta device and materialized by
     ``weight_loader.build_wan22_dit`` (meta -> ``cast_serving_dtypes`` ->
     ``to_empty(device)`` -> checkpoint load).
@@ -342,15 +344,17 @@ class Wan22DiT(nn.Module):
     ) -> torch.Tensor:
         """``hidden_states`` ``[B, C, F, H, W]`` (bf16 latents), ``timestep``
         ``[B, F // p_t]`` per post-patch frame (``expand_timesteps``: each
-        token takes its frame's value), text embeds ``[B, 512, text_dim]``
-        bf16. Returns ``[B, C_out, F, H, W]`` bf16. The self-attention reads the
-        array bound to it, and the cross-attention always runs SDPA."""
+        token takes its frame's value) or ``[B, 1]`` per sample (every token
+        takes it), text embeds ``[B, 512, text_dim]`` bf16. Returns
+        ``[B, C_out, F, H, W]`` bf16. The self-attention reads the array bound
+        to it, and the cross-attention always runs SDPA."""
         batch_size, _, num_frames, height, width = hidden_states.shape
         p_t, p_h, p_w = self.config.patch_size
         grid = (num_frames // p_t, height // p_h, width // p_w)
-        if timestep.ndim != 2 or timestep.shape[1] != grid[0]:
+        if timestep.ndim != 2 or timestep.shape[1] not in (grid[0], 1):
             raise ValueError(
-                f"Wan22DiT requires a per-frame [batch, {grid[0]}] timestep; got {tuple(timestep.shape)}."
+                f"Wan22DiT requires a per-frame [batch, {grid[0]}] or a per-sample [batch, 1] timestep; "
+                f"got {tuple(timestep.shape)}."
             )
 
         rotary_emb = tuple(t.contiguous() for t in self.rope(grid, hidden_states.device))
@@ -360,9 +364,10 @@ class Wan22DiT(nn.Module):
         # every per-token tensor is cut to this rank's tokens (a no-op on one rank)
         sizes = sp_seq_split(hidden_states.shape[1], self.sp_group.world_size)
         sp = SeqParallel(self.sp_group, sizes)
-        if self.sp_group.world_size > 1:
+        if self.sp_group.world_size > 1 and timestep.shape[1] > 1:
             # a rank's tokens need not be whole frames, so it modulates per run of
             # tokens: the longest run that tiles a frame and every rank's share
+            # (a per-sample timestep is one group of all of a rank's tokens already)
             per_frame = hidden_states.shape[1] // grid[0]
             run = math.gcd(per_frame, *sizes)
             runs = SeqParallel(self.sp_group, [n // run for n in sizes])
