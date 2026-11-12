@@ -110,6 +110,16 @@ def dense_or_flashinfer(device: torch.device, dense, flashinfer, what: str):
     return flashinfer
 
 
+def _build_fa4_or_flashinfer(spec, info: EngineResourceInfo, fa4_cls, flashinfer_cls):
+    from mstar.engine.resources.attn.ragged.dense import _warn_ragged_fallback, fa4_unavailable_reason
+
+    reason = fa4_unavailable_reason(info.device)
+    if reason is None:
+        return _build_ragged(spec, info, fa4_cls)
+    _warn_ragged_fallback(RaggedAttnBackend.FA4, reason, RaggedAttnBackend.FLASHINFER)
+    return _build_ragged(spec, info, flashinfer_cls)
+
+
 def _build_dense_or_flashinfer(spec, info: EngineResourceInfo, dense_cls, flashinfer_cls):
     return _build_ragged(
         spec, info, dense_or_flashinfer(info.device, dense_cls, flashinfer_cls, "Ragged attention"),
@@ -137,6 +147,11 @@ class RaggedAttnManager(AttentionResource):
             from mstar.engine.resources.attn.ragged.flashinfer import FlashInferRaggedManager
 
             return _build_ragged(spec, info, FlashInferRaggedManager, cudnn=True)
+        if backend is RaggedAttnBackend.FA4:
+            from mstar.engine.resources.attn.ragged.dense import Fa4RaggedManager
+            from mstar.engine.resources.attn.ragged.flashinfer import FlashInferRaggedManager
+
+            return _build_fa4_or_flashinfer(spec, info, Fa4RaggedManager, FlashInferRaggedManager)
         if backend is RaggedAttnBackend.FLASHINFER:
             # Deferred so naming the spec does not load FlashInfer, and because
             # `flashinfer` imports this class back.
@@ -166,6 +181,11 @@ class RaggedCrossAttnManager(AttentionResource):
             return _build_dense_or_flashinfer(
                 spec, info, DenseRaggedCrossManager, FlashInferRaggedCrossManager,
             )
+        if backend is RaggedAttnBackend.FA4:
+            from mstar.engine.resources.attn.ragged.dense import Fa4RaggedCrossManager
+            from mstar.engine.resources.attn.ragged.flashinfer import FlashInferRaggedCrossManager
+
+            return _build_fa4_or_flashinfer(spec, info, Fa4RaggedCrossManager, FlashInferRaggedCrossManager)
         if backend is RaggedAttnBackend.FLASHINFER:
             from mstar.engine.resources.attn.ragged.flashinfer import (
                 FlashInferRaggedCrossManager,
@@ -184,12 +204,12 @@ class RaggedBlockCausalAttnManager(AttentionResource):
     @classmethod
     def build(cls, spec: RaggedBlockCausalAttentionSpec, info: EngineResourceInfo):
         backend = _refuse_cudnn(spec, resolve_ragged_attn_backend(spec.config.backend, info.device), "block-causal")
-        if backend is RaggedAttnBackend.DENSE:
-            from mstar.engine.resources.attn.ragged.dense import _warn_ragged_dense_fallback
+        if backend in (RaggedAttnBackend.DENSE, RaggedAttnBackend.FA4):
+            from mstar.engine.resources.attn.ragged.dense import _warn_ragged_fallback
 
             # a block's keys are a prefix of its span, and the prefixes overlap:
             # varlen's one key range per query segment cannot express that
-            _warn_ragged_dense_fallback("it has no block-causal kernel", RaggedAttnBackend.FLASHINFER)
+            _warn_ragged_fallback(backend, "it has no block-causal kernel", RaggedAttnBackend.FLASHINFER)
             backend = RaggedAttnBackend.FLASHINFER
         if backend is RaggedAttnBackend.FLASHINFER:
             from mstar.engine.resources.attn.ragged.flashinfer import (
