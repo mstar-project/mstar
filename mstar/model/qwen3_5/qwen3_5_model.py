@@ -71,6 +71,7 @@ logger = logging.getLogger(__name__)
 class Qwen3_5DenseModel(MultimodalDecoderModel):
     NAME = "Qwen3.5"
     REASONING_END = "</think>"
+    STRUCTURED_OUTPUTS = True
     METADATA_FILES = (
         "config.json",
         "preprocessor_config.json",

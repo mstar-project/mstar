@@ -782,15 +782,15 @@ supported yet. On any deployment,
 (``{"token_ids": [...]}``), stop tokens included, so a trainer need not
 re-tokenize the text.
 
-**Structured output.** With ``resources: {sampler: {enable_grammar: true}}`` in the
-deployment's YAML (on the text sampler of a model with several), a request may constrain its
+**Structured output** (Qwen3.5 for now: a model declares ``STRUCTURED_OUTPUTS``, and
+``enable_grammar`` on any other model is refused at startup). With
+``resources: {sampler: {enable_grammar: true}}`` in the deployment's YAML (on the text sampler of a model with several), a request may constrain its
 reply: chat ``response_format`` (``json_object``, or ``json_schema`` with its ``schema``), or
 ``structured_outputs`` in ``model_kwargs`` / ``extra_body`` with exactly one of ``json`` (a
 JSON schema), ``json_object``, ``regex``, ``choice`` (a list of strings) or ``grammar`` (EBNF),
 as vLLM takes it. ``"after": "</think>"`` starts the constraint once the reply holds that text,
-so a reasoning model thinks freely first; a model that declares the text that ends its
-reasoning (Qwen3.5's and MiniCPM-o's ``</think>``, Muse Glimmer's ``to=user<|message|>``, the
-end of its answer's header) sets it on any turn whose prompt leaves the reasoning open. An
+so a reasoning model thinks freely first; Qwen3.5 declares the text that ends its reasoning
+(``</think>``), so it sets ``after`` itself on any turn whose prompt leaves the reasoning open. An
 unsupported schema is a 400, and so is a request on a deployment without ``enable_grammar`` or a
 grammar and ``after`` over 131072 characters, or one that also sends ``min_tokens`` or
 ``ignore_eos``.

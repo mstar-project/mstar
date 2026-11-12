@@ -230,8 +230,8 @@ class HiggsAudioModel(MultimodalDecoderModel):
         return PreparedMedia({"audio_features": feat["input_features"]}, [tokens], [lens])
 
     def text_output(self) -> TextOutput:
-        # a transcript, its special tokens dropped; the loop ends on the config's stop ids
-        return TextOutput(self._detokenizer, self.config.stop_token_ids)
+        # a transcript, its special tokens dropped
+        return TextOutput(self._detokenizer)
 
     # -------------------------------------------------------------------
     # Submodules

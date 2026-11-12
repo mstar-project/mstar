@@ -658,6 +658,10 @@ class Model(ABC):
         "seed", "prefix_cache", "return_token_ids", "return_logprobs", LORA_ADAPTER_KWARG, LORA_DIGEST_KWARG,
         "structured_outputs",
     )
+    # Whether a deployment may turn on ``enable_grammar`` (structured outputs) for this model. A model
+    # declares it once its reasoning end, stop tokens and tests are in place; on any other, the switch is
+    # refused at startup rather than served half right.
+    STRUCTURED_OUTPUTS: bool = False
     # Output modalities a client plays as they stream, where a pause is a gap. A streamed request with one of
     # them reserves its whole KV footprint and is never preempted. ``unpausable_outputs`` in the serving config
     # overrides it.
