@@ -1,7 +1,7 @@
 model: "lingbot_world_1_3b"
 
 # max_seq_len only satisfies the conductor's config check and matches the UMT5
-# text length; the dit's rolling K/V live in its own store (resources below).
+# text length; the dit's K/V live in their own pool (resources below).
 max_seq_len: 512
 
 # Numerics (model_kwargs), shown at their defaults. reference_numerics: true runs
@@ -9,23 +9,37 @@ max_seq_len: 512
 # contiguous encode and decode, with which the rollout is bit-identical to the
 # reference's. The default runs the engine's ragged attention, compiled DiT
 # blocks, a channels-last encode and a bf16 (cuDNN >= 9.16), channels-last,
-# compiled decode; the compiles happen at load for 464x832, the output size of
-# a 480x832 image (LingBotWorldModel.geometry).
+# compiled decode; at 464x832, the output size of a 480x832 image
+# (LingBotWorldModel.geometry), the decode compiles at load and the DiT in the
+# warm-up request below.
 # model_kwargs:
 #   reference_numerics: false
 #   dit_compile_autotune: false
 
-# One rollout at a time; the model refuses any other value. Each rollout's text
-# K/V (90 MiB) and VAE caches live outside the K/V pool below, so this is their
-# only bound until they are engine resources.
+# One rollout at a time; the model refuses any other value. Each rollout's VAE
+# caches go from chunk to chunk on the rollout loop's edges, outside the K/V
+# pool, so this is their only bound.
 max_concurrent_requests: 1
 
-# K/V memory for the DiT, reserved at startup. 64800 tokens = 11.1 GiB: room for
-# one rollout at the largest size (720x1280); one at the default size (464x832)
-# takes 4.7 GiB.
-resources:
-  dit_kv:
-    pool_tokens: 64800
+# The DiT's K/V pool, reserved at startup, holds one rollout's sink and latest
+# window at the largest size (720x1280): 509 pages of 128 tokens, 12.0 GB. A
+# deployment that serves only the default size (464x832) can set
+# resources: {dit_kv: {max_num_pages: 215}}, 5.1 GB.
+
+# A two-chunk rollout at the default size before the server binds, so the first
+# client doesn't pay the DiT blocks' compiles (one per kind of pass) at that
+# size. The image is the model repo's teaser (1868x1040), whose output is
+# 464x832; the camera stands still.
+warmup_requests:
+  - text: warmup
+    files: [hf://robbyant/lingbot-world-v2-1.3b-causal-fast/assets/teaser.png]
+    output_modalities: [video_frame]
+    model_kwargs:
+      num_frames: 29
+      intrinsics: [480.0, 480.0, 416.0, 240.0]
+      camera_poses: [&still [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0]],
+        *still, *still, *still, *still, *still, *still, *still, *still, *still, *still, *still, *still, *still, *still,
+        *still, *still, *still, *still, *still, *still, *still, *still, *still, *still, *still, *still, *still, *still]
 
 # Single-GPU colocated; the Wan VAE encode and decode are fused into the dit forward.
 node_groups:

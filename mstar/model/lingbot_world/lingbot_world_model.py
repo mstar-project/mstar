@@ -1,6 +1,6 @@
 """LingBotWorldModel: LingBot-World-V2 causal-fast, camera-controlled image-to-world.
 
-Architecture (2 nodes; the dit's rolling K/V and its attention are engine resources):
+Architecture (2 nodes; the dit declares its K/V, its text K/V and its draws' state):
     text_encoder - UMT5-XXL prompt encoder (wan22's submodule, reused)
     dit          - the 1.3B causal DiT. One rollout iteration is one chunk of
                    4 latent frames: the chunk's I2V condition (a warm-cache
@@ -12,8 +12,9 @@ Architecture (2 nodes; the dit's rolling K/V and its attention are engine resour
 
 Graph walks (2), run in order:
     encode_text  - text_encoder; persists text_embeds_pos
-    rollout      - Loop("rollout_loop") over dit with a self loop-back ("clock");
-                   each iteration emits its chunk's frames (``video_frame``)
+    rollout      - Loop("rollout_loop") over dit with self loop-backs ("clock" and
+                   the VAE encoder's and decoder's caches); each iteration
+                   emits its chunk's frames (``video_frame``)
 
 The camera trajectory is the action input: per-frame OpenCV c2w poses plus
 intrinsics, as in the reference's ``poses.npy`` / ``intrinsics.npy``. The
@@ -31,11 +32,11 @@ import numpy as np
 import torch
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.engine.resources import NodeResourceSpec, RaggedAttentionConfig, RaggedCrossAttentionSpec, ResourceReqConfig
-from mstar.engine.resources.kv.rolling import RollingKVConfig, RollingKVReqConfig, RollingKVSpec
+from mstar.engine.resources.kv.config import DEFAULT_PAGE_SIZE
+from mstar.engine.state import Array, Attend, Bidirectional, Block, Entry, KVEntry, Layout, Read, Value
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.base import Model, ProcessPromptOutput, TensorAndMetadata, WalkStep
+from mstar.model.base import KVLabel, Model, ProcessPromptOutput, TensorAndMetadata, WalkStep
 from mstar.model.lingbot_world.components.camera import latent_camera_poses, scale_intrinsics
 from mstar.model.lingbot_world.config import (
     LINGBOT_CONFIGS,
@@ -45,34 +46,36 @@ from mstar.model.lingbot_world.config import (
     WAN21_VAE_DIFFUSERS_REPO,
 )
 from mstar.model.lingbot_world.submodules import (
-    DIT_ATTN,
+    CHUNK_OUTPUTS,
+    DECODER_CACHE,
     DIT_KV,
+    ENCODER_CACHE,
+    PROGRESS,
     ROLLOUT_LOOP_NAME,
     ROLLOUT_WALK,
+    SELF_ATTN,
+    TEXT,
+    TEXT_ATTN,
     LingBotDitSubmodule,
-    rolling_extent,
 )
 from mstar.model.media_limits import PILLOW_IMAGE_FORMATS, check_image_size, decoding_upload, open_upright_image
 from mstar.model.submodule_base import NodeSubmodule
+from mstar.model.utils import check_kv_pools_fit
 
 logger = logging.getLogger(__name__)
 
 # LingBotWorldConfig switches a deployment sets in model_kwargs
-_CONFIG_KWARGS = ("reference_numerics", "dit_compile_autotune")
+_CONFIG_KWARGS = ("reference_numerics", "dit_compile_autotune", "keep_chunk_outputs")
 
 # The reference's numerics: FA2 attention, an eager DiT, the fp32 contiguous eager encode and decode, with which
 # the rollout is bit-identical to the reference's (test/lingbot_world/run_parity.py).
 REFERENCE_MODEL_KWARGS = {"reference_numerics": True}
 
 ENCODE_TEXT_WALK = "encode_text"
-_DIT_INPUTS = ("text_embeds_pos", "image_inputs", "camera_poses", "intrinsics", "clock")
-# the rollout's rolling K/V tokens a layer, which process_prompt settles from the output size
-DIT_KV_TOKENS = "dit_kv_tokens"
+_DIT_INPUTS = ("text_embeds_pos", "image_inputs", "camera_poses", "intrinsics", "clock", ENCODER_CACHE, DECODER_CACHE)
 
 
 class LingBotWorldModel(Model):
-    INTERNAL_KWARGS = (DIT_KV_TOKENS,)
-
     def __init__(
         self,
         model_path_hf: str | None = None,
@@ -105,57 +108,62 @@ class LingBotWorldModel(Model):
     # Structure
     # ------------------------------------------------------------------
 
-    def get_node_resources(self) -> list[NodeResourceSpec]:
-        """The rolling K/V store, and the ragged attention over it unless
-        ``reference_numerics`` attends with the reference's FA2 instead."""
+    def declare_state(self) -> list[Array]:
+        """Each chunk's self-attention K/V, of which a chunk reads the sink and the latest window; where the
+        request's draws stand; and, unless ``reference_numerics`` attends with the reference's FA2, each chunk's text
+        K/V, whose queries are the chunk's."""
         cfg = self.config
-        specs: list[NodeResourceSpec] = [RollingKVSpec(
-            resource_key=DIT_KV, nodes={"dit"},
-            config=RollingKVConfig(
-                num_layers=cfg.num_layers, num_heads=cfg.num_heads, head_dim=cfg.head_dim,
-                pool_tokens=self.max_window_tokens(), dtype=torch.bfloat16,
-            ),
-        )]
+        blocks = frozenset(range(cfg.num_layers))
+        entry = KVEntry(heads=cfg.num_heads, head_dim=cfg.head_dim)
+        op = None if cfg.reference_numerics else Attend(q_heads=cfg.num_heads)
+        arrays = [
+            Array(DIT_KV, nodes={"dit"}, layers=blocks, entry=entry, max_len=cfg.max_rollout_tokens(),
+                  reads={SELF_ATTN: Read(mask=Bidirectional(kept_window=True), op=op)}),
+            Value(PROGRESS, nodes={"dit"}, layers=frozenset({0}), entry=Entry({}, host={"rng": bytes})),
+        ]
         if not cfg.reference_numerics:
-            specs.append(RaggedCrossAttentionSpec(
-                resource_key=DIT_ATTN, nodes={"dit"},
-                config=RaggedAttentionConfig(
-                    num_qo_heads=cfg.num_heads, num_kv_heads=cfg.num_heads, head_dim=cfg.head_dim,
-                    dtype=torch.bfloat16,
-                ),
+            arrays.append(Array(
+                TEXT, nodes={"dit"}, layers=blocks, entry=entry, max_len=0, labels={"text"},
+                reads={TEXT_ATTN: Read(mask=Block(), op=Attend(q_heads=cfg.num_heads), queries=DIT_KV, packed=False)},
             ))
-        return specs
+        return arrays
 
-    def max_window_tokens(self) -> int:
-        """Tokens of rolling K/V one rollout keeps per layer at the largest area
-        a request may ask for: ``local_attn_size`` latent frames of at most
-        ``max_area / 256`` tokens each, whatever the aspect (see ``geometry``).
-        The default pool: room for any one rollout, or several smaller ones."""
+    def kernel_settings(self) -> dict:
+        """A pool for one rollout's window at the largest area, beside its sink page."""
         cfg = self.config
-        cell = cfg.vae_stride[1] * cfg.vae_stride[2] * cfg.patch_size[1] * cfg.patch_size[2]
-        frames = cfg.local_attn_size if cfg.local_attn_size > -1 else cfg.max_chunks * cfg.chunk_size
-        return frames * (cfg.max_area // cell)
+        return {DIT_KV: {"max_num_pages": 1 + cfg.window_pages(cfg.max_frame_tokens, DEFAULT_PAGE_SIZE)}}
+
+    def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
+        return {DIT_KV: {"main": KVLabel(growth=((ROLLOUT_WALK, ROLLOUT_LOOP_NAME),))}}
+
+    def state_layout(self, lat_h: int, lat_w: int) -> dict[str, dict[str, Layout]]:
+        """What a rollout at a ``lat_h`` by ``lat_w`` latent writes: a chunk's tokens an iteration of the rollout loop,
+        of which the pool keeps the sink and the latest window."""
+        cfg = self.config
+        frame = cfg.frame_tokens(lat_h, lat_w)
+        return {DIT_KV: {"main": Layout(
+            growth=((ROLLOUT_LOOP_NAME, cfg.chunk_size * frame),), kept_windows={SELF_ATTN: cfg.kept_window(frame)},
+        )}}
 
     def validate_config_yaml(self, config: dict, config_path: str) -> None:
-        """Refuse to serve more than one rollout at a time.
+        """Refuse to serve more than one rollout at a time, and a pool short of one rollout at the default size.
 
-        The pool bounds each rollout's rolling K/V, not how many rollouts run: at
-        small output sizes it admits many. Each one's text K/V and VAE caches are
-        allocated by the dit outside the engine's resources, so until they are
-        resources, the conductor's admit queue, which exists only when
-        ``max_concurrent_requests`` is set, has to hold them to one rollout.
+        The pool admits a rollout's K/V, and at small output sizes it admits many. Each one's VAE caches go from
+        chunk to chunk on the rollout loop's edges, outside admission, so the conductor's admit queue, which exists
+        only when ``max_concurrent_requests`` is set, has to hold them to one rollout.
         """
         limit = config.get("max_concurrent_requests")
-        if type(limit) is int and limit == 1:
-            return
+        if not (type(limit) is int and limit == 1):
+            raise ValueError(
+                f"LingBot-World requires `max_concurrent_requests: 1` in {config_path}; got {limit!r}. "
+                "The K/V pool admits each rollout's K/V, not its VAE caches, which go from chunk to chunk on the "
+                "rollout loop's edges, so the admit queue that this key enables is the only bound on them."
+            )
         cfg = self.config
-        text_kv_mib = cfg.num_layers * 2 * cfg.text_len * cfg.dim * torch.bfloat16.itemsize / 2**20
-        raise ValueError(
-            f"LingBot-World requires `max_concurrent_requests: 1` in {config_path}; got {limit!r}. "
-            f"The rolling K/V pool bounds each rollout's K/V, not how many run, and each rollout's "
-            f"text K/V ({text_kv_mib:.0f} MiB) and VAE caches are allocated by the dit outside the "
-            "engine's resources, so the admit queue that this key enables is the only bound on them."
-        )
+        size = (cfg.default_height, cfg.default_width)
+        lat_h, lat_w = self.geometry(size, *size)
+        check_kv_pools_fit(self, config, config_path, logger, request_layouts=self.state_layout(lat_h, lat_w),
+                           loop_caps={ROLLOUT_LOOP_NAME: cfg.max_chunks})
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         encode_text = GraphNode(
@@ -173,7 +181,11 @@ class LingBotWorldModel(Model):
                 input_names=list(_DIT_INPUTS),
                 outputs=[
                     GraphEdge(next_node="dit", name="clock"),
+                    GraphEdge(next_node="dit", name=ENCODER_CACHE),
+                    GraphEdge(next_node="dit", name=DECODER_CACHE),
                     GraphEdge(next_node=EMIT_TO_CLIENT, name="video_output", output_modality="video_frame"),
+                    *(GraphEdge(next_node=EMPTY_DESTINATION, name=name)
+                      for name in CHUNK_OUTPUTS if self.config.keep_chunk_outputs),
                 ],
                 enable_async_scheduling=True,
             ),
@@ -290,7 +302,7 @@ class LingBotWorldModel(Model):
             "image_inputs": [image],
             "camera_poses": [latent_camera_poses(poses[:frame_num], lat_f)],
             "intrinsics": [scale_intrinsics(intrinsics, cfg.intrinsics_height, cfg.intrinsics_width, height, width)],
-        }, {DIT_KV_TOKENS: sum(rolling_extent(cfg, (height, width), lat_f))})
+        }, {"state_layout": self.state_layout(lat_h, lat_w)})
 
     def _preprocess_image(self, image: torch.Tensor, kwargs: dict) -> torch.Tensor:
         """``[3, h, w]`` float32 in [-1, 1] at the output size: the reference's
@@ -350,22 +362,14 @@ class LingBotWorldModel(Model):
         request = {"guidance_scale": 1.0, "num_latent_frames": lat_f}
         return [WalkStep(walk, step_metadata=request) for walk in (ENCODE_TEXT_WALK, ROLLOUT_WALK)]
 
-    def get_request_resource_configs(
-        self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
-    ) -> dict[str, ResourceReqConfig]:
-        """The rollout's rolling K/V, declared up front so it waits in the engine's
-        queue for room in the pool, and a size the pool can never hold is a 400.
-        ``process_prompt`` sizes it (``DIT_KV_TOKENS``), once it knows the output size."""
-        del input_modalities, output_modalities
-        tokens = model_kwargs.get(DIT_KV_TOKENS)
-        return {} if tokens is None else {DIT_KV: RollingKVReqConfig(tokens=int(tokens))}
-
     # ------------------------------------------------------------------
     # Submodule loading
     # ------------------------------------------------------------------
 
     def get_autocast_dtype(self):
-        return None
+        """The K/V pool's and the attention kernels' bf16. Neither node runs under autocast: the DiT enters the
+        reference's autocast contexts itself, and the VAE and the text encoder run in the dtypes they load in."""
+        return torch.bfloat16
 
     def get_submodule(
         self, node_name: str, device: str = "cpu", tp_group=None,
@@ -389,7 +393,9 @@ class LingBotWorldModel(Model):
                 UMT5_DIFFUSERS_REPO, subfolder="text_encoder", torch_dtype=torch.bfloat16,
                 cache_dir=self.cache_dir, attn_implementation="eager",
             ).eval()
-            return Wan22TextEncoderSubmodule(encoder, Wan22Config(text_max_seq_len=self.config.text_len))
+            text_encoder = Wan22TextEncoderSubmodule(encoder, Wan22Config(text_max_seq_len=self.config.text_len))
+            text_encoder.disable_autocast = True
+            return text_encoder
         if node_name == "dit":
             from mstar.model.lingbot_world.components.dit import require_flash_attn
             from mstar.model.lingbot_world.weight_loader import build_lingbot_dit

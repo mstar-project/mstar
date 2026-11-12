@@ -14,6 +14,8 @@ re-noising between steps, then one t=0 pass over the clean chunk to commit its K
 
 from dataclasses import dataclass
 
+from mstar.engine.state import KeptWindow
+
 LINGBOT_VARIANT_1_3B = "1.3b_causal_fast"
 
 LINGBOT_HF_REPOS = {
@@ -93,10 +95,42 @@ class LingBotWorldConfig:
     # (-O2), but each server process picks its own kernels, so one seed gives
     # a different rollout per process. No effect under reference_numerics.
     dit_compile_autotune: bool = False
+    # Add each chunk's x0 latents, float frames and I2V condition to its outputs (``CHUNK_OUTPUTS``), for the parity
+    # harnesses.
+    keep_chunk_outputs: bool = False
 
     @property
     def head_dim(self) -> int:
         return self.dim // self.num_heads
+
+    def frame_tokens(self, lat_h: int, lat_w: int) -> int:
+        """A latent frame's tokens at a ``lat_h`` by ``lat_w`` latent: one per DiT patch."""
+        return lat_h * lat_w // (self.patch_size[1] * self.patch_size[2])
+
+    @property
+    def max_frame_tokens(self) -> int:
+        """The most tokens a frame has at any aspect: ``max_area`` holds that many DiT patches of pixels."""
+        return self.max_area // (self.vae_stride[1] * self.vae_stride[2] * self.patch_size[1] * self.patch_size[2])
+
+    def kept_window(self, frame_tokens: int) -> KeptWindow:
+        """What a chunk's queries attend before its own frames, at ``frame_tokens`` a frame: the sink, then the latest
+        frames up to ``local_attn_size``. Without a window, every frame of the longest rollout."""
+        if self.local_attn_size == -1:
+            return KeptWindow(0, window=self.max_chunks * self.chunk_size * frame_tokens)
+        return KeptWindow(self.sink_size * frame_tokens,
+                          window=(self.local_attn_size - self.sink_size - self.chunk_size) * frame_tokens)
+
+    def window_pages(self, frame_tokens: int, page_size: int) -> int:
+        """The most pages of ``page_size`` a rollout at ``frame_tokens`` a frame holds as the pool releases them: its
+        sink in whole pages, the window, less than a page past it, and the chunk a step writes. This is
+        ``RetentionPolicy.max_pages`` of the kept window, which the model can't import."""
+        kept = self.kept_window(frame_tokens)
+        sink = -(-kept.sink // page_size) * page_size
+        return -(-(sink + kept.window + page_size - 1 + self.chunk_size * frame_tokens) // page_size)
+
+    def max_rollout_tokens(self) -> int:
+        """The self-attention entries of the longest rollout at the largest area."""
+        return self.max_chunks * self.chunk_size * self.max_frame_tokens
 
 
 def lingbot_world_1_3b() -> LingBotWorldConfig:

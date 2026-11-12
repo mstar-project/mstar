@@ -16,15 +16,13 @@
     dit          -> LingBotDitSubmodule (one chunk per rollout iteration: the
                     chunk's I2V condition and Plucker rays, the DiT, the decode)
 
-The rolling self-attention K/V live in the engine's rolling KV store
-(``DIT_KV``): each request takes a region of the pool, its sink plus the
-latest window kept compacted, so a chunk's keys are one contiguous range. The
-attention over them is a ragged cross-attention (``DIT_ATTN``) whose step
-pairs the chunk's queries with that range and with the text. The text K/V
-(computed once per request) and the VAE encoder's and decoder's causal-conv
-caches stay in the request's ``PerRequestState``, outside the pool. Nothing in
-the engine counts them, and at small output sizes the pool admits many
-rollouts, so the model refuses a config that runs more than one at a time
+The dit declares its state (``LingBotWorldModel.declare_state``): the
+self-attention K/V of each chunk in ``DIT_KV``, whose pages the pool releases
+past the sink and the latest window; each chunk's text K/V in ``TEXT``, which
+no step keeps; and where the request's draws stand in ``PROGRESS``. The VAE
+encoder's and decoder's causal-conv caches go from one chunk to the next on
+the rollout loop's edges, outside admission, so the model refuses a config
+that runs more than one rollout at a time
 (``LingBotWorldModel.validate_config_yaml``).
 
 Numerics are the model's, not the engine's: ``LingBotWorldModel.get_autocast_dtype``
@@ -33,29 +31,21 @@ encode runs fp32 as the reference does; the decode runs bf16 (cuDNN >= 9.16)
 unless ``reference_numerics``.
 """
 
-import functools
 import logging
-from typing import NamedTuple
+from collections.abc import Mapping
+from typing import Any
 
 import torch
 from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.resources import RaggedCrossAttentionStep, Segment, SubmoduleStep, cross_label
-from mstar.engine.resources.kv.rolling import RollingKVStep, RollingPosition
+from mstar.engine.state import ArrayStep, Segment, SubmoduleStep, host
 from mstar.model.components import wan_vae
-from mstar.model.components.diffusion.attention import joint_attention, sdpa_attention
 from mstar.model.components.diffusion.decode_utils import latent_affine, wan_vae_decode_dtype
 from mstar.model.components.diffusion.image_io import truncate_to_uint8
 from mstar.model.lingbot_world.components.camera import plucker_embedding
-from mstar.model.lingbot_world.components.dit import (
-    REFERENCE_ATTENTION,
-    ChunkOnlyStore,
-    DitAttention,
-    LingBotCausalDiT,
-    attended_frames,
-)
+from mstar.model.lingbot_world.components.dit import DIT_KV, TEXT, LingBotCausalDiT
 from mstar.model.lingbot_world.components.schedule import add_noise, flow_to_x0, make_fast_schedule
 from mstar.model.lingbot_world.config import LingBotWorldConfig
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule, StepOrder
@@ -65,44 +55,38 @@ logger = logging.getLogger(__name__)
 ROLLOUT_LOOP_NAME = "rollout_loop"
 ROLLOUT_WALK = "rollout"
 
-DIT_ATTN = "dit_attn"
-DIT_KV = "dit_kv"
-CHUNK_SPAN, WINDOW_SPAN, TEXT_SPAN = "chunk", "window", "text"
-DIT_ATTN_PAIRS = ((CHUNK_SPAN, WINDOW_SPAN), (CHUNK_SPAN, TEXT_SPAN))
+# the declared state beside the blocks' arrays: where the request's draws stand
+PROGRESS = "progress"
+# the reads of DIT_KV and TEXT
+SELF_ATTN, TEXT_ATTN = "self_attn", "text_attn"
+# the rollout loop's loop-back edges: the VAE encoder's and decoder's causal-conv caches
+ENCODER_CACHE, DECODER_CACHE = "encoder_cache", "decoder_cache"
+# what a chunk adds to its outputs under keep_chunk_outputs
+CHUNK_OUTPUTS = ("chunk_latents", "chunk_pixels", "chunk_condition")
+# diffusers' marker in a temporal upsample's slot on a stream's first call
+_REPEAT = "Rep"
 
 
-@torch.compiler.disable
-def _warmup_ragged(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
-    """SDPA over one packed ``[L, H, D]`` sequence, standing in for the
-    ragged callable at load: compiled blocks trace the same graphs around it."""
-    return sdpa_attention(q[None], k[None], v[None])[0]
+def to_edge(cache: list, device: torch.device) -> list[torch.Tensor]:
+    """A causal-conv cache as an edge carries it: an empty slot as a 0-element tensor and diffusers' ``"Rep"`` as one
+    ``int8``, since an edge holds tensors only."""
+    return [
+        slot if torch.is_tensor(slot)
+        else torch.zeros(1, dtype=torch.int8, device=device) if slot == _REPEAT
+        else torch.empty(0, device=device)
+        for slot in cache
+    ]
 
 
-class ChunkSpans(NamedTuple):
-    """Tokens of one chunk's attentions: its queries, the rolling K/V window
-    they attend (sink, history, the chunk itself) and the padded text; and the
-    chunk's place in the rolling K/V stream: the tokens written before it, the
-    sink, and the trailing tokens kept with the chunk's own."""
-
-    chunk: int
-    window: int
-    text: int
-    position: RollingPosition
+def from_edge(signal: list[torch.Tensor]) -> list:
+    """The cache `to_edge` carried, its markers back to ``None`` and ``"Rep"``."""
+    return [None if t.numel() == 0 else _REPEAT if t.dtype == torch.int8 else t for t in signal]
 
 
-def rolling_extent(
-    cfg: LingBotWorldConfig, image_hw: tuple[int, int], num_latent_frames: int | None = None,
-) -> tuple[int, int]:
-    """A rollout's rolling K/V per layer, ``(sink, window)`` in tokens, at the
-    output size ``image_hw``. ``num_latent_frames`` is needed only without a
-    window, where the K/V keep the whole rollout."""
-    lat_h, lat_w = image_hw[0] // cfg.vae_stride[1], image_hw[1] // cfg.vae_stride[2]
-    frame_seqlen = lat_h * lat_w // (cfg.patch_size[1] * cfg.patch_size[2])
-    if cfg.local_attn_size > -1:
-        return cfg.sink_size * frame_seqlen, (cfg.local_attn_size - cfg.sink_size) * frame_seqlen
-    if num_latent_frames is None:
-        raise ValueError("without a window, the rolling K/V extent needs the rollout's num_latent_frames")
-    return 0, num_latent_frames * frame_seqlen
+def decoder_cache(vae: nn.Module, signal: list[torch.Tensor]) -> wan_vae.FeatCache:
+    """The decoder's cache from ``DECODER_CACHE``, empty at a stream's first chunk. A compiled decode guards on the
+    cache's type, so it comes back a ``FeatCache``."""
+    return wan_vae.FeatCache(from_edge(signal)) if signal else wan_vae.new_feat_cache(vae)
 
 
 def first_frame_mask(num_latent_frames: int, lat_h: int, lat_w: int, device) -> torch.Tensor:
@@ -119,9 +103,12 @@ def first_frame_mask(num_latent_frames: int, lat_h: int, lat_w: int, device) -> 
 class EncoderStream:
     """A request's place in its condition encode: the encoder's causal-conv
     cache, then, once the black frames have driven that cache to a fixed
-    point, the one encoder output every later call would return."""
+    point, the one encoder output every later call would return.
 
-    def __init__(self, vae: nn.Module):
+    It goes from one chunk to the next on ``ENCODER_CACHE``: the cache's slots
+    (`to_edge`), or the one steady output in their place."""
+
+    def __init__(self, vae: nn.Module, signal: list[torch.Tensor] = ()):
         counts = getattr(vae, "_cached_conv_counts", None)
         if counts is not None:
             num_convs = counts["encoder"]
@@ -130,6 +117,13 @@ class EncoderStream:
         # One slot per causal conv, as ``AutoencoderKLWan.clear_cache`` builds it.
         self.cache: list | None = [None] * num_convs
         self.steady: torch.Tensor | None = None
+        if len(signal) == 1:
+            self.cache, self.steady = None, signal[0]
+        elif signal:
+            self.cache = from_edge(signal)
+
+    def edge(self, device: torch.device) -> list[torch.Tensor]:
+        return [self.steady] if self.steady is not None else to_edge(self.cache, device)
 
     def encode_black(self, vae: nn.Module, x: torch.Tensor) -> torch.Tensor:
         """One encoder call on black frames. When a call leaves every cache
@@ -197,19 +191,17 @@ class LingBotDitSubmodule(NodeSubmodule):
       * the chunk's I2V condition (``encode_condition_chunk``, continuing the
         request's VAE encoder cache) and its Plucker rays, then
       * ``len(timesteps_index)`` denoise forwards, each converting the flow
-        prediction to x0 and re-noising it to the next timestep from the
-        request's generator, then
-      * one commit forward over the clean x0 at t=0, which leaves the chunk's
-        settled K/V in the rolling cache for the chunks after it, then
+        prediction to x0 and re-noising it to the next timestep, then
+      * one commit forward over the clean x0 at t=0, whose K/V the step keeps
+        for the chunks after it, then
       * a decode of the chunk's latents that continues the request's Wan VAE
         decoder cache (#425's ``decode_causal``), so the frames are those of one
         decode of the whole rollout, emitted as ``video_output``.
 
-    At the first iteration the request's state is seeded: the K/V cache, the
-    generator (seeded with the request seed) and the full rollout's initial
-    noise drawn from it in one call. The reference draws the initial noise the
-    same way, which is what makes the rollout reproducible bit for bit; it
-    requires the rollout length up front.
+    ``prepare_inputs`` draws the chunk's noise from the request's seed and the
+    generator state ``PROGRESS`` holds: the rollout's initial noise in one call,
+    as the reference does, which is what makes the rollout reproducible bit for
+    bit and requires its length up front, then the chunk's re-noise draws.
 
     ``image`` arrives resized and normalized to [-1, 1] by
     ``LingBotWorldModel.process_prompt``, which runs the reference's CPU bicubic
@@ -219,6 +211,8 @@ class LingBotDitSubmodule(NodeSubmodule):
     """
 
     disable_torch_compile = True
+    # the DiT enters the reference's autocast contexts itself, and the VAE runs in the dtype it was cast to
+    disable_autocast = True
 
     def __init__(self, dit: LingBotCausalDiT, vae: nn.Module, config: LingBotWorldConfig,
                  encoder_vae: nn.Module | None = None, warmup_latent_sizes: list[tuple[int, int]] = ()):
@@ -246,15 +240,15 @@ class LingBotDitSubmodule(NodeSubmodule):
             self._latents_mean, self._latents_inv_std = latent_affine(vae, torch.float32, device)
             if fast:
                 for lat_hw in warmup_latent_sizes:
-                    self.warmup_decode(lat_hw)
+                    cache = self.warmup_decode(lat_hw)
+                    logger.info("LingBot-World: a %dx%d latent's decoder cache rides the rollout loop's edge, "
+                                "%.0f MiB", *lat_hw, wan_vae.feat_cache_bytes(cache) / 2**20)
         if dit is not None and fast:
             dit.compile_blocks(autotune=config.dit_compile_autotune)
-            for lat_hw in warmup_latent_sizes:
-                self.warmup_dit(lat_hw)
-        self._attention: DitAttention | None = None
-        # Debug hook for the parity harness: keep the last chunk's latents and
-        # float frames in the request state.
-        self.keep_chunk_outputs = False
+        self.progress = None
+
+    def bind_state(self, handles: Mapping[str, Any]) -> None:
+        self.progress = handles[PROGRESS]
 
     def step_order(self, graph_walk: str) -> StepOrder:
         """Every rollout chunk emits frames to the client, so a session's
@@ -263,207 +257,136 @@ class LingBotDitSubmodule(NodeSubmodule):
         return StepOrder.TURNS
 
     def max_batch_size(self, graph_walk: str):
-        # not batched: each request rolls out its own K/V cache, generator and VAE caches
+        # not batched: each request rolls out its own K/V, draws and VAE caches
         return 1
 
-    def bind_node_resources(self, resources) -> None:
-        super().bind_node_resources(resources)
-        self._attention = None
-
-    def attention(self) -> DitAttention:
-        """The DiT's attentions through ``DIT_ATTN``, or the reference's FA2
-        under ``reference_numerics`` (the parity harness binds no resource)."""
-        if self._attention is None:
-            resource = self.node_resources.get(DIT_ATTN)
-            if resource is None:
-                if not self.config.reference_numerics:
-                    raise RuntimeError(
-                        f"LingBot dit: no {DIT_ATTN} resource is bound; only reference_numerics attends without one"
-                    )
-                self._attention = REFERENCE_ATTENTION
-            else:
-                def on(kv_label):
-                    ragged = functools.partial(resource.run, label=cross_label(CHUNK_SPAN, kv_label))
-                    return functools.partial(joint_attention, ragged=ragged)
-                self._attention = DitAttention(window=on(WINDOW_SPAN), text=on(TEXT_SPAN))
-        return self._attention
-
-    def chunk_spans(self, chunk: int, image_hw: tuple[int, int], num_latent_frames: int | None = None) -> ChunkSpans:
-        """``num_latent_frames`` (the rollout's) is needed only without a window,
-        where the rolling K/V keep the whole rollout."""
-        cfg = self.config
-        lat_h, lat_w = image_hw[0] // cfg.vae_stride[1], image_hw[1] // cfg.vae_stride[2]
-        frame_seqlen = lat_h * lat_w // (cfg.patch_size[1] * cfg.patch_size[2])
-        chunk_tokens = cfg.chunk_size * frame_seqlen
-        written = chunk * chunk_tokens
-        sink, trailing = rolling_extent(cfg, image_hw, num_latent_frames)
-        return ChunkSpans(
-            chunk=chunk_tokens,
-            window=attended_frames(cfg, chunk) * frame_seqlen,
-            text=cfg.text_len,
-            position=RollingPosition(written=written, sink=sink, window=trailing),
-        )
-
     def prepare_inputs(self, graph_walk, fwd_info: CurrentForwardPassInfo, inputs, **kwargs) -> NodeInputs:
+        cfg = self.config
         # the loop's cap is the request's chunk count, so this stays in range
         chunk = int(fwd_info.dynamic_loop_iter_counts[ROLLOUT_LOOP_NAME])
         image = inputs["image_inputs"][0]
+        lat_h, lat_w = image.shape[1] // cfg.vae_stride[1], image.shape[2] // cfg.vae_stride[2]
+        latent, renoise, rng = self._draws(
+            chunk, int(fwd_info.random_seed), int(fwd_info.step_metadata["num_latent_frames"]), lat_h, lat_w,
+            host(self.progress, fwd_info.rid_handle, "main", 0)["rng"],
+        )
         return NodeInputs(
             tensor_inputs={
                 "text_embeds": inputs["text_embeds_pos"][0],
                 "image": image,
                 "camera_poses": inputs["camera_poses"][0],
                 "intrinsics": inputs["intrinsics"][0],
+                "latent": latent,
             },
-            resource_step_info=self.chunk_spans(
-                chunk, tuple(image.shape[1:]), int(fwd_info.step_metadata["num_latent_frames"])),
+            kwargs={
+                "chunk": chunk, "renoise": renoise, "rng": rng,
+                # chunk 0 finds neither cache and starts each empty
+                "encoder_signal": inputs.get(ENCODER_CACHE) or [], "decoder_signal": inputs.get(DECODER_CACHE) or [],
+            },
+            resource_step_info=cfg.chunk_size * cfg.frame_tokens(lat_h, lat_w),
         )
 
-    def declare_step(self, graph_walk, request_ids, inputs, **kwargs) -> SubmoduleStep | None:
-        steps = {}
-        spans: list[ChunkSpans] = [inp.resource_step_info for inp in inputs]
-        if DIT_KV in self.node_resources:
-            steps[DIT_KV] = RollingKVStep(
-                segments=tuple(Segment(request_id=rid, label=CHUNK_SPAN, span=s.chunk)
-                               for rid, s in zip(request_ids, spans, strict=True)),
-                positions={rid: s.position for rid, s in zip(request_ids, spans, strict=True)},
-            )
-        if DIT_ATTN in self.node_resources:
-            segments = []
-            for rid, s in zip(request_ids, spans, strict=True):
-                segments += [Segment(request_id=rid, label=CHUNK_SPAN, span=s.chunk),
-                             Segment(request_id=rid, label=WINDOW_SPAN, span=s.window),
-                             Segment(request_id=rid, label=TEXT_SPAN, span=s.text)]
-            steps[DIT_ATTN] = RaggedCrossAttentionStep(segments=tuple(segments), pairs=DIT_ATTN_PAIRS)
-        return SubmoduleStep(steps=steps) if steps else None
-
-    def kv_store(self):
-        """The rolling K/V the DiT writes and attends, the engine's ``DIT_KV``."""
-        store = self.node_resources.get(DIT_KV)
-        if store is None:
-            raise RuntimeError(f"LingBot dit: no {DIT_KV} resource is bound; the rolling K/V live there")
-        return store
-
-    def _seed_request(self, state, md: dict, seed: int, image: torch.Tensor, context: torch.Tensor, device):
+    def _draws(
+        self, chunk: int, seed: int, num_latent_frames: int, lat_h: int, lat_w: int, rng: bytes,
+    ) -> tuple[torch.Tensor, list[torch.Tensor], bytes]:
+        """Chunk ``chunk``'s initial noise and re-noise draws, and the generator state after them, which the step
+        writes to ``PROGRESS``. The rollout's initial noise is one draw from the seed, as the reference makes it, so
+        each chunk draws it again and keeps its own frames. ``rng`` is the state the last chunk left, empty before the
+        first, where the draws go on from the initial noise's."""
         cfg = self.config
-        lat_f = int(md["num_latent_frames"])
-        lat_h, lat_w = image.shape[1] // cfg.vae_stride[1], image.shape[2] // cfg.vae_stride[2]
-        frame_seqlen = lat_h * lat_w // (cfg.patch_size[1] * cfg.patch_size[2])
+        device = self.get_device()
         generator = torch.Generator(device=device)
         generator.manual_seed(seed)
-        noise = torch.randn(cfg.out_dim, lat_f, lat_h, lat_w, dtype=torch.float32, generator=generator, device=device)
-        # inference tensors, as the warmup's are: the compiled blocks guard on the dispatch keys
-        with torch.inference_mode():
-            text_kv = self.dit.text_kv(context)
-        state.add_all(
-            frame_seqlen=frame_seqlen,
-            generator=generator,
-            noise=noise,
-            text_kv=text_kv,
-            encoder_stream=EncoderStream(self.encoder_vae) if self.encoder_vae is not None else None,
-            feat_cache=wan_vae.new_feat_cache(self.vae) if self.vae is not None else None,
-        )
+        shape = (cfg.out_dim, num_latent_frames, lat_h, lat_w)
+        noise = torch.randn(shape, dtype=torch.float32, generator=generator, device=device)
+        # a copy, so the rollout's noise, up to 940 MB, is freed here and not held through the step
+        latent = noise[:, chunk * cfg.chunk_size:(chunk + 1) * cfg.chunk_size].clone()
+        if rng:
+            generator.set_state(torch.frombuffer(bytearray(rng), dtype=torch.uint8))
+        renoise = [
+            torch.randn(latent.shape, generator=generator, device=device, dtype=torch.float32)
+            for _ in self.schedule.step_timesteps[1:]
+        ]
+        return latent, renoise, generator.get_state().numpy().tobytes()
+
+    def declare_step(self, graph_walk, request_ids, inputs, **kwargs) -> SubmoduleStep:
+        """A segment of the chunk's tokens a row, the text's under ``TEXT``, and the draws' state under ``PROGRESS``."""
+        state = {
+            DIT_KV: ArrayStep(),
+            PROGRESS: ArrayStep(host={
+                (rid, "main", 0): {"rng": inp.kwargs["rng"]} for rid, inp in zip(request_ids, inputs, strict=True)
+            }),
+        }
+        if not self.config.reference_numerics:
+            state[TEXT] = ArrayStep(segments=tuple(Segment(rid, "text", self.config.text_len) for rid in request_ids))
+        rows = zip(request_ids, inputs, strict=True)
+        return SubmoduleStep(segments=[Segment(rid, "main", inp.resource_step_info) for rid, inp in rows], state=state)
 
     def forward(
-        self, graph_walk, engine_inputs: ModelInputsFromEngine, text_embeds, image,
-        camera_poses, intrinsics, **kwargs,
+        self, graph_walk, engine_inputs: ModelInputsFromEngine, text_embeds, image, camera_poses, intrinsics,
+        latent, chunk, renoise, encoder_signal, decoder_signal, **kwargs,
     ) -> NameToTensorList:
         cfg = self.config
-        rid = engine_inputs.request_ids[0]
-        info = engine_inputs.per_request_info[rid]
-        state = self.request_state(rid)
         device = self.get_device()
         image = image.to(device)
         context = text_embeds.to(device)
         context = context[0] if context.dim() == 3 else context
-        if "text_kv" not in state:
-            self._seed_request(state, info.step_metadata, info.random_seed, image, context, device)
-        chunk = int(info.dynamic_loop_iter_counts[ROLLOUT_LOOP_NAME])
-        frame_seqlen = int(state["frame_seqlen"])
         cs = cfg.chunk_size
         frames = slice(chunk * cs, (chunk + 1) * cs)
-        latent = state["noise"][:, frames]
-        y = encode_condition_chunk(self.encoder_vae, image, state["encoder_stream"], chunk * cs, cs, cfg)
+        stream = EncoderStream(self.encoder_vae, encoder_signal)
+        y = encode_condition_chunk(self.encoder_vae, image, stream, chunk * cs, cs, cfg)
         _, height, width = image.shape
         plucker = plucker_embedding(
             camera_poses[frames].float().to(device), intrinsics.float(), height, width,
             height // cfg.vae_stride[1], width // cfg.vae_stride[2],
         ).to(torch.bfloat16)
-        store = self.kv_store()
-        text_kv = state["text_kv"]
-        generator = state["generator"]
-        # the attention step declared the window from the chunk index; the store's plan must agree
-        kept = store.window(0)[0].shape[1]
-        if kept != attended_frames(cfg, chunk) * frame_seqlen:
-            raise RuntimeError(f"LingBot dit: chunk {chunk} attends {kept} tokens of the rolling K/V, "
-                               "not the declared window")
-        attention = self.attention()
 
         with torch.inference_mode():
             # per chunk, and freed before the decode rather than kept with the request
+            text_kv = self.dit.text_kv(context)
             conditioning = self.dit.chunk_conditioning(plucker, chunk * cs)
             steps = self.schedule.step_timesteps
             for i, t in enumerate(steps):
                 timestep = torch.stack([t]).to(device)
-                # each pass rewrites the chunk's K/V in the store; the commit pass's stay
-                flow = self.dit(latent, timestep, text_kv, y, conditioning, store, attention)
+                # each denoise pass adds the chunk's K/V for its own read, and the step keeps the commit pass's
+                flow = self.dit(latent, timestep, text_kv, y, conditioning, keep=False)
                 x0 = flow_to_x0(flow, latent, t, self.schedule)
                 if i < len(steps) - 1:
-                    noise = torch.randn(x0.shape, generator=generator, device=x0.device, dtype=x0.dtype)
-                    latent = add_noise(x0, noise, steps[i + 1], self.schedule)
+                    latent = add_noise(x0, renoise[i], steps[i + 1], self.schedule)
             commit_t = torch.stack([steps[-1] * 0.0]).to(device)
-            self.dit(x0, commit_t, text_kv, y, conditioning, store, attention)
-            del conditioning
-            pixels = self._decode(x0, state, clip_start=chunk == 0)
+            self.dit(x0, commit_t, text_kv, y, conditioning, keep=True)
+            del conditioning, text_kv
+            feat_cache = decoder_cache(self.vae, decoder_signal)
+            pixels = self._decode(x0, feat_cache, clip_start=chunk == 0)
 
-        if self.keep_chunk_outputs:
-            state.add_all(chunk_latents=x0.clone(), chunk_pixels=pixels.clone(), chunk_condition=y.clone())
         # quantize from fp32; a bf16 decode's frames round once, here
         frames_u8 = truncate_to_uint8(pixels[0].float()).permute(1, 2, 3, 0).contiguous()
-        return {
+        outputs = {
             "clock": [torch.full((1,), chunk + 1, dtype=torch.int64, device=device)],
             "video_output": [frames_u8],
+            ENCODER_CACHE: stream.edge(device),
+            DECODER_CACHE: to_edge(feat_cache, device),
         }
+        if cfg.keep_chunk_outputs:
+            outputs.update(chunk_latents=[x0], chunk_pixels=[pixels], chunk_condition=[y])
+        return outputs
 
-    def warmup_dit(self, lat_hw: tuple[int, int]) -> None:
-        """One chunk's DiT forward on zeros at ``lat_hw`` against a scratch
-        store that keeps nothing (chunk 0's window), so the compiled blocks are
-        traced and tuned before a request at that size. The window and chunk
-        index never reach a compiled graph, so one chunk covers a rollout; the
-        attention has the bound one's call structure, which decides where the
-        graphs split."""
-        cfg = self.config
-        device = self.dit.patch_embedding.weight.device
-        lat_h, lat_w = lat_hw
-        zeros = functools.partial(torch.zeros, device=device)
-        with torch.inference_mode():
-            conditioning = self.dit.chunk_conditioning(
-                zeros(1, cfg.control_dim * 64, cfg.chunk_size, lat_h, lat_w, dtype=torch.bfloat16), 0)
-            latents = zeros(cfg.out_dim, cfg.chunk_size, lat_h, lat_w)
-            text = zeros(cfg.text_len, cfg.text_dim, dtype=torch.bfloat16)
-            condition = zeros(cfg.in_dim - cfg.out_dim, cfg.chunk_size, lat_h, lat_w)
-            if cfg.reference_numerics:
-                attention = REFERENCE_ATTENTION
-            else:
-                attend = functools.partial(joint_attention, ragged=_warmup_ragged)
-                attention = DitAttention(window=attend, text=attend)
-            self.dit(latents, zeros(1), self.dit.text_kv(text), condition, conditioning, ChunkOnlyStore(), attention)
-
-    def warmup_decode(self, lat_hw: tuple[int, int]) -> None:
+    def warmup_decode(self, lat_hw: tuple[int, int]) -> wan_vae.FeatCache:
         """Decode two chunks of zero latents through a fresh stream at
         ``lat_hw``, so every call signature of the compiled decode is compiled
-        before a request at that size."""
+        before a request at that size. Returns the stream's cache."""
         cfg = self.config
         device = next(self.vae.parameters()).device
-        state = {"feat_cache": wan_vae.new_feat_cache(self.vae)}
+        feat_cache = wan_vae.new_feat_cache(self.vae)
         with torch.inference_mode():
             for k in range(2):
-                self._decode(torch.zeros(cfg.out_dim, cfg.chunk_size, *lat_hw, device=device), state, clip_start=k == 0)
+                self._decode(torch.zeros(cfg.out_dim, cfg.chunk_size, *lat_hw, device=device), feat_cache,
+                             clip_start=k == 0)
+        return feat_cache
 
-    def _decode(self, latents: torch.Tensor, state, clip_start: bool) -> torch.Tensor:
+    def _decode(self, latents: torch.Tensor, feat_cache: list, clip_start: bool) -> torch.Tensor:
         """``[1, 3, frames, H, W]`` in [-1, 1]: the chunk decoded as the
-        continuation of the request's stream."""
+        continuation of the stream whose cache is ``feat_cache``."""
         # the de-normalize in fp32 whatever the decode's dtype
         z = (latents[None].float() / self._latents_inv_std + self._latents_mean).to(self._decode_dtype)
-        return self._decoder.decode_stream(z, state["feat_cache"], clip_start=clip_start)
-
+        return self._decoder.decode_stream(z, feat_cache, clip_start=clip_start)
