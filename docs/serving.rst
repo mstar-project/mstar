@@ -533,7 +533,7 @@ them by that name:
        max_segments_per_request: 2  # also: max_segments_per_step, max_tokens_per_request,
                                     # flashinfer_backend
      seq_shard:                 # a node's sequence shard (SP ranks)
-       min_tokens: 2048         # steps below this run copied on every SP rank
+       min_tokens: 2048         # steps below this run copied on every SP rank; also: exchange
      sampler:
        greedy_capture: false    # also: enable_logprobs, enable_processed_logprobs
 
@@ -566,17 +566,42 @@ a sliding window (``AttentionConfig.sliding_window``) has no prefix cache yet: i
 ``prefix_cache: true`` on it is refused.
 
 A node on ``sp_size`` above 1 shares each step over its SP ranks along two axes. A model that
-declares a sequence shard (``SeqShardSpec``: the DiTs of LTX-2.5, Cosmos3, Wan2.2 and MiniMax-H3) splits a step's tokens
+declares a sequence shard (``SeqShardSpec``: the DiTs of LTX-2.5, Cosmos3, Wan2.2 and MiniMax-H3, and
+Qwen3-Omni's Thinker) splits a step's tokens
 over them; its ``min_tokens`` runs smaller steps copied on every rank instead (default 0: every
 step that can split does). A captured step decides from its bucket's size, not its prompt's.
 Separately, ``context_parallel: true`` stores a paged pool's K/V by position rather than by
 head: each request's positions split over the ranks that would otherwise hold the same KV
 heads, the TP ranks that share a KV head or the node's SP ranks, which is how a model with no
 sequence shard (such as Qwen3.5) runs on ``sp_size`` above 1. Raise ``max_num_pages`` by that
-factor to turn the freed memory into context. A node on SP ranks needs at least one of the two,
-and can't yet have both: a node that splits its steps stores its pools by head.
-**Sequence and context parallelism** in :doc:`adding_models` covers what each combination does
-and what is refused.
+factor to turn the freed memory into context. A node on SP ranks needs at least one of the two.
+
+The sequence shard's ``exchange`` picks how a split step reaches the node's paged attentions,
+from where their KV is stored. ``auto`` (the default) splits by Ulysses over KV stored by head,
+and over KV stored by position runs the node's steps copied (KV capacity alone). Over KV stored by
+position, ``all_gather`` splits them, and ``ring`` also bounds the attention phase's memory to
+this rank's tokens and runs eager only. ``ulysses`` (by head) states the default, and ``none``
+never splits. A value the node's storage can't take fails at load, at any SP size, and so does
+``ring`` over an attention backend other than ``flashinfer`` (when the engine builds it):
+
+.. code-block:: yaml
+
+   resources:
+     kv_cache:
+       context_parallel: true   # store K/V by position over the SP ranks
+     seq_shard:
+       min_tokens: 8192
+       exchange: all_gather     # auto / none / ulysses (by head) / all_gather / ring (by position)
+
+Ragged (cacheless) attentions run Ulysses over the labels the shard lists, whatever ``exchange`` says;
+a shard that never splits (``none``, or ``auto`` over KV stored by position) stops them splitting too.
+
+A step's peak memory is its residents plus the larger of its attention and its MLP or MoE phase,
+so ring lowers it only where attention is the larger, which comes with more SP ranks (about four
+for Qwen3-Omni's Thinker, estimated from its geometry; the measured peaks are in
+:doc:`adding_models`). Chunked prefill stays off on SP ranks.
+**Sequence and context parallelism** in :doc:`adding_models` covers what each combination does,
+how to pick, and what is refused.
 
 A request waits at the head of its pool's queue until its reservation fits beside the
 reservations already admitted. A request behind it starts first when its own pages fit, output

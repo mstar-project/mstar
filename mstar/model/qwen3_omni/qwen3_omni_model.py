@@ -40,6 +40,7 @@ from transformers import AutoTokenizer
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import FINAL_PREFILL, PartitionDefinition
+from mstar.engine.resources import SeqShardSpec
 from mstar.engine.resources.lora import LoraSpec
 from mstar.engine.state import (
     Array,
@@ -99,6 +100,7 @@ from mstar.model.qwen3_omni.config import (
     THINKER_KV,
     THINKER_MIXED,
     THINKER_SAMPLER,
+    THINKER_SHARD,
     THINKER_TEXT_DECODE,
     VISION_ATTN,
     VISION_TOKENS,
@@ -357,7 +359,14 @@ class Qwen3OmniModel(Model):
         )
 
     def get_node_resources(self):
-        return [self._lora_spec()]
+        return [
+            # every walk may split, where the deployment sets the shard's exchange: all_gather or
+            # ring over KV stored by position, ulysses over KV stored by head. A decode step never
+            # does. "none" by default, so a Thinker on SP ranks over KV stored by head is refused
+            # until a deployment opts into Ulysses, which has run on CPU only
+            SeqShardSpec(resource_key=THINKER_SHARD, nodes={"Thinker"}, labels=("main",), axis=0, exchange="none"),
+            self._lora_spec(),
+        ]
 
     def kernel_settings(self) -> dict[str, dict[str, Any]]:
         from mstar.model.components.aut_submodule import AuTEncoderSubmodule
