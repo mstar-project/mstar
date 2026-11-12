@@ -907,6 +907,9 @@ class NodeSubmodule(torch.nn.Module, ABC):
         # embedder, scratch caches), bound once at load. Empty until then
         # and on engines that build none.
         self.node_resources: dict[str, Any] = {}
+        # This node's sequence shard (`SeqShardSpec`; a node takes one), whose `scatter` / `gather` bracket the layer
+        # stack under sequence parallelism; None on a node that declares none. Set by `bind_node_resources`.
+        self.sequence_shard: Any = None
         # This node's handles on its declared state (`mstar.engine.state`), bound once at load.
         self.state_handles: Mapping[str, Any] = {}
 
@@ -921,10 +924,13 @@ class NodeSubmodule(torch.nn.Module, ABC):
         ``get_node_resources``; a layer that names a label this node doesn't
         have fails at bind rather than in the middle of a forward.
         """
+        from mstar.engine.resources.sequence_shard import SequenceShard
+
         self.segment_keys = tuple(
             key for key, resource in resources.items() if getattr(resource, "steps_from_segments", False)
         )
         self.node_resources = resources
+        self.sequence_shard = next((r for r in resources.values() if isinstance(r, SequenceShard)), None)
         for module in self.modules():
             bind = getattr(module, "bind_resources", None)
             if bind is not None and module is not self:

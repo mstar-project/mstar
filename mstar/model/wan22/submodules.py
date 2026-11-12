@@ -35,7 +35,7 @@ from mstar.model.components.diffusion.flow_match import FlowMatchSchedule
 from mstar.model.components.diffusion.image_io import truncate_to_uint8
 from mstar.model.components.diffusion.unipc import make_unipc_tables
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
-from mstar.model.wan22.config import DIT_SHARD, DIT_TOKENS, Wan22Config
+from mstar.model.wan22.config import DIT_TOKENS, Wan22Config
 
 logger = logging.getLogger(__name__)
 
@@ -496,7 +496,7 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
             hidden_states=hidden_states,
             timestep=timestep,
             encoder_hidden_states=encoder_hidden_states.to(self.transformer.dtype),
-            shard=self.node_resources.get(DIT_SHARD),
+            shard=self.sequence_shard,
         )
         if not do_cfg:
             return out

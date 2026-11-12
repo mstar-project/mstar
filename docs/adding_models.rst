@@ -3155,7 +3155,8 @@ Splitting is declared in four places:
   that declares no segments has no shard plan, and the attention resources refuse it, so it fails
   on one GPU. The diffusion scaffold's step holds each label's segments once, however many
   arrays attend them (LTX-2.5's video tokens are the keys of two).
-- The forward **brackets** its layer stack: ``shard.scatter(label, *xs, dim=None)`` before it
+- The forward **brackets** its layer stack on the node's shard (the submodule's ``sequence_shard``,
+  bound with its resources): ``shard.scatter(label, *xs, dim=None)`` before it
   (this rank's share of each tensor, ``dim`` the spec's axis by default; ``None`` passes through),
   ``shard.gather(label, x)`` after it. Both are the identity on a copied step, at one SP rank, and
   outside a step (a warmup compile); at one rank they trace straight through a compiled frame,

@@ -42,7 +42,6 @@ from mstar.model.ltx2_5.config import (
     TEXT_SPAN,
     VIDEO,
     VIDEO_FOR_AUDIO,
-    VIDEO_SHARD,
     VIDEO_SPAN,
     LTX25Config,
 )
@@ -310,7 +309,7 @@ class LTXDenoiseSubmodule(DenoiseLoopSubmodule):
         rope = self.layout(bucket_key, latents.device)
         # on a step the sequence shard splits, the DiT runs on this rank's share of each
         # row's video tokens (the scatter is the identity otherwise)
-        shard = self.node_resources.get(VIDEO_SHARD)
+        shard = self.sequence_shard
         video = latents
         if shard is not None:
             video, *tables = shard.scatter(VIDEO_SPAN, latents, *rope.video, *rope.cross_video)

@@ -49,7 +49,6 @@ from mstar.model.minimax_h3.components.transformer import (
 from mstar.model.minimax_h3.config import (
     AUDIO_CHANNELS,
     DIT_ROWS,
-    DIT_SHARD,
     KEYFRAME_ENCODE_SEED,
     KEYFRAME_NOISE_AUG,
     NUM_MODALITIES,
@@ -300,7 +299,7 @@ class H3DenoiseSubmodule(DenoiseLoopSubmodule):
         compiled blocks see one shape per bucket rather than per prompt length, and the rows
         split evenly over the sequence shard's SP ranks, which keeps the exchanges on their
         copy-free path."""
-        shard = self.node_resources.get(DIT_SHARD)
+        shard = self.sequence_shard
         return math.lcm(self.row_bucket, 1 if shard is None else shard.group.world_size)
 
     def padded_rows(self, bucket_key: H3Layout) -> int:
@@ -366,7 +365,7 @@ class H3DenoiseSubmodule(DenoiseLoopSubmodule):
         else:
             timesteps = torch.stack([timestep, audio_timestep, cond_timestep], dim=-1).float()
         inputs = H3Inputs(video=latents, audio=audio_latents, text=text_embeds, timesteps=timesteps)
-        video_v, audio_v = self.transformer(inputs, layout, shard=self.node_resources.get(DIT_SHARD))
+        video_v, audio_v = self.transformer(inputs, layout, shard=self.sequence_shard)
         generated = h3_step(latents[:, n:], video_v[:, n:], timestep.view(-1, 1, 1), sigma, sigma_next)
         return {
             LATENTS: torch.cat([latents[:, :n], generated], dim=1) if n else generated,
@@ -420,7 +419,7 @@ class H3VideoDecoderSubmodule(_LayoutBatched, BatchedRows, NodeSubmodule):
     dropped, unpatchified, denormalized with the VAE's latent statistics, decoded in
     clips and tiles, the ImageNet normalization undone, clamped and rounded.
 
-    On SP ranks its sequence shard (``shard_resource_key``, ``exchanges=False``: nothing mixes
+    On SP ranks its sequence shard (``vae_shard``, ``exchanges=False``: nothing mixes
     clips but the cross-fade after the gather) splits each request's clips: each rank decodes
     its contiguous share and the shares are gathered on every rank, the DiT's ranks decoding
     in lockstep, scheduled by its rank 0 between denoise steps."""
@@ -432,10 +431,9 @@ class H3VideoDecoderSubmodule(_LayoutBatched, BatchedRows, NodeSubmodule):
     output_keys = (VIDEO_OUTPUT,)
 
     def __init__(self, vae: nn.Module, config: H3Config, *, max_batch_size: int = 1, tile_batch: int = 1,
-                 compile_blocks: bool = False, shard_resource_key: str | None = None):
+                 compile_blocks: bool = False):
         super().__init__()
         self.vae = vae
-        self.shard_resource_key = shard_resource_key
         if compile_blocks and vae is not None:
             # static per tile count: a rank's tiles (its clips' times the canvas's) go
             # tile_batch at a time, so a count tile_batch doesn't divide, e.g. 2 x 16 at
@@ -455,7 +453,7 @@ class H3VideoDecoderSubmodule(_LayoutBatched, BatchedRows, NodeSubmodule):
                 "layout": inputs[0].resource_step_info}
 
     def declare_step(self, graph_walk, request_ids, inputs: list[NodeInputs], **kwargs) -> SubmoduleStep | None:
-        if self.shard_resource_key is None:
+        if self.sequence_shard is None:
             return None
         # a batch shares one layout (`can_batch`), so every request's clips are one count
         segments = [
@@ -468,7 +466,7 @@ class H3VideoDecoderSubmodule(_LayoutBatched, BatchedRows, NodeSubmodule):
         # SDPA within each fixed-size tile, as the reference: dense, one segment, no capture,
         # so a ragged resource would add planning for nothing
         z = self.ends.latents(latents.to(self.get_device()), layout)
-        shard = self.node_resources.get(self.shard_resource_key) if self.shard_resource_key else None
+        shard = self.sequence_shard
         split = None if shard is None else shard.split_range(self.CLIPS)
         if split is None:
             return {VIDEO_OUTPUT: self.ends.frames(self.vae.decode(z, sdpa_attention, tile_batch=self.tile_batch))}

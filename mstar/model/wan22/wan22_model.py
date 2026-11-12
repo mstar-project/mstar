@@ -35,7 +35,7 @@ import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.distributed.base import ShardingConfig
-from mstar.engine.resources import NodeResourceSpec, SeqShardSpec
+from mstar.engine.resources import SeqShardSpec
 from mstar.engine.state import Array, Attend, Block, Read
 from mstar.graph.base import (
     GraphEdge,
@@ -158,7 +158,7 @@ class Wan22Model(Model):
         # SP the op runs the exchange inside it)
         return {SELF_ATTN: {"max_segments_per_request": Wan22DitSubmodule.CFG_BRANCHES, "compile_op": True}}
 
-    def get_node_resources(self) -> list[NodeResourceSpec]:
+    def get_node_resources(self) -> list[SeqShardSpec]:
         """The DiT's sequence shard, which on SP ranks splits each row's tokens: the self-attention exchanges them
         for heads (Ulysses), and the cross-attention over the text attends a rank's share of them. Every row of a
         step is one length (a bucket's), so each row splits alike (``axis`` 1). On SDPA the self-attention can't run

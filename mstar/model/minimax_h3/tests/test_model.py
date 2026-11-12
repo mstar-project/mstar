@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from mstar.engine.resources.sequence_shard import SequenceShard
 from mstar.engine.resources.step import StepContext
 from mstar.engine.state.adapters import node_handles, state_setup
 from mstar.graph.base import GraphNode, Loop, Parallel, Sequential, TensorPointerInfo
@@ -564,7 +565,7 @@ def _sp_decode(rank: int, world: int, store: str, out: str) -> None:
         decode = vae.decoder.forward
         vae.decoder.forward = lambda *args, **kwargs: calls.append(1) or decode(*args, **kwargs)
         with torch.no_grad():
-            split = H3VideoDecoderSubmodule(vae, config, shard_resource_key=VAE_SHARD)
+            split = H3VideoDecoderSubmodule(vae, config)
             _plan(split, _sp_resources(_model(), [VAE_SHARD], group), ["r0", "r1"], layout)
             frames = split.run_batch(rows, layout)["video_output"]
             torch.save(len(calls), f"{out}.{rank}.calls")
@@ -687,7 +688,7 @@ def test_the_padded_rows_split_evenly_over_the_sp_ranks_at_every_prompt_length(w
 
     node = H3DenoiseSubmodule(_SPStub(), H3Config(), loop_name=DENOISE_LOOP, row_bucket=row_bucket)
     # the bound shard's group is all the layout reads
-    node.bind_node_resources({DIT_SHARD: SimpleNamespace(group=SimpleNamespace(world_size=world))})
+    node.bind_node_resources({DIT_SHARD: SequenceShard(("main",), 0, None, 0, SimpleNamespace(world_size=world))})
     multiple = math.lcm(row_bucket, world)
     for text_len in range(1, 600):
         layout = H3Layout(text_len=text_len, latent_frames=2, latent_height=4, latent_width=6, audio_latents=3,

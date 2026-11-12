@@ -38,7 +38,7 @@ import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.distributed.base import ShardingConfig
-from mstar.engine.resources import NodeResourceSpec, SeqShardSpec
+from mstar.engine.resources import SeqShardSpec
 from mstar.engine.state import Array, Attend, Block, Read
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Parallel, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
@@ -224,7 +224,7 @@ class LTX25Model(Model):
             within(VIDEO_FOR_AUDIO, *audio, VIDEO_TO_AUDIO, VIDEO_SPAN, queries=AUDIO),
         ]
 
-    def get_node_resources(self) -> list[NodeResourceSpec]:
+    def get_node_resources(self) -> list[SeqShardSpec]:
         """The DiT's sequence shard, which on SP ranks splits each row's video tokens and never the audio or text:
         every row of a step is one shape, so each splits alike (``axis`` 1)."""
         return [SeqShardSpec(resource_key=VIDEO_SHARD, nodes={DIT_NODE}, labels=(VIDEO_SPAN,), axis=1)]

@@ -26,7 +26,7 @@ import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.distributed.base import ShardingConfig
-from mstar.engine.resources import NodeResourceSpec, SeqShardSpec
+from mstar.engine.resources import SeqShardSpec
 from mstar.engine.state import Array, Attend, Block, Read
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Parallel, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
@@ -251,7 +251,7 @@ class H3Model(Model):
         # the DiT's two segments are a request's rows and their padding
         return {DIT_ATTN: {"max_segments_per_request": 2, "workspace_mb": 128}, REFINER_ATTN: {"workspace_mb": 128}}
 
-    def get_node_resources(self) -> list[NodeResourceSpec]:
+    def get_node_resources(self) -> list[SeqShardSpec]:
         """The sequence shards. On SP ranks the DiT's splits the packed rows (one row a step, so ``axis`` 0), which
         its attention exchanges for heads (Ulysses); on SDPA it can't run there. The video decoder's splits each
         request's clips, which nothing exchanges (``exchanges=False``); every request of a decoder batch is one
@@ -644,8 +644,7 @@ class H3Model(Model):
             )
         if node_name == VAE_DECODER_NODE:
             return H3VideoDecoderSubmodule(weight_loader.build_video_decoder(config, snapshot, device), config,
-                                           tile_batch=self.vae_tile_batch, compile_blocks=self.vae_compile,
-                                           shard_resource_key=VAE_SHARD)
+                                           tile_batch=self.vae_tile_batch, compile_blocks=self.vae_compile)
         if node_name == AUDIO_DECODER_NODE:
             return H3AudioDecoderSubmodule(weight_loader.build_audio_vae(config, snapshot, device), config)
         logger.warning("MiniMax-H3 has no submodule for node %r; running it dummy", node_name)

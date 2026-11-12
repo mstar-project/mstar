@@ -626,7 +626,7 @@ def _h3_layout() -> H3Layout:
 def _h3_dit(world: int) -> H3DenoiseSubmodule:
     """The DiT's submodule bound to a sequence shard over ``world`` SP ranks, whose size pads its rows."""
     sub = H3DenoiseSubmodule(SimpleNamespace(), H3Config(), loop_name=DENOISE_LOOP)
-    sub.bind_node_resources({DIT_SHARD: SimpleNamespace(group=SimpleNamespace(world_size=world))})
+    sub.bind_node_resources({DIT_SHARD: SequenceShard(("main",), 0, None, 0, SimpleNamespace(world_size=world))})
     return sub
 
 
