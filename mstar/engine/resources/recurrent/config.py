@@ -6,6 +6,7 @@ layer, so capacity is a slot count and a fork is a fixed-size copy.
 """
 
 from abc import ABC, abstractmethod
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING
 
@@ -367,7 +368,9 @@ class RecurrentStateSpec(NodeResourceSpec):
     def restores_prefix(self) -> bool:
         return True
 
-    def capacity_problem(self, requests: int, request: ResourceReqConfig | None) -> str | None:
+    def capacity_problem(
+        self, requests: int, request: ResourceReqConfig | None, node_groups: Sequence[Mapping] = (),
+    ) -> str | None:
         """A request keeps a slot for each label until it is torn down, and offloading frees none."""
         state = self.config
         need = requests * len(state.labels)

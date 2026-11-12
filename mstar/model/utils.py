@@ -760,6 +760,6 @@ def check_kv_pools_fit(
         requests[key] = KVReqConfig(needed_labels=list(rows))
         requests[key].apply_conductor_config(kv_layout=rows, loop_caps=loop_caps)
     for spec in specs:
-        problem = spec.capacity_problem(cap, requests.get(spec.resource_key))
+        problem = spec.capacity_problem(cap, requests.get(spec.resource_key), config.get("node_groups") or ())
         if problem is not None:
             raise ValueError(f"{config_path}: {problem}")
