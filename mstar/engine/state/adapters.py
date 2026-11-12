@@ -653,13 +653,6 @@ class PagedAttend(OpBinding):
         if decode:
             spec.apply_yaml_overrides(**decode)
 
-    def apply(self, spec: NodeResourceSpec | None, settings: Mapping[str, Any]) -> None:
-        """The decode keys go through the spec's own YAML path and its checks, as they do under `resources:`."""
-        decode = {field: settings[field] for field in settings.keys() & {"decode_tensor_cores", "decode_fmha"}}
-        super().apply(spec, {field: settings[field] for field in settings.keys() - decode.keys()})
-        if decode:
-            spec.apply_yaml_overrides(**decode)
-
     def attach(self, handle: "PagedArrayHandle", key: str, run: Any) -> None:
         handle.reads[key] = run
 
