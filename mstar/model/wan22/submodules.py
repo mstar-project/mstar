@@ -340,7 +340,7 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
     ):
         super().__init__(
             loop_name=DENOISE_LOOP_NAME, max_batch_size=config.dit_max_batch_size,
-            step_cache=step_cache_policy(config.step_cache, MAG_RATIOS),
+            step_cache=step_cache_policy(config.step_cache, MAG_RATIOS[config.variant]),
         )
         if config.is_moe and transformer is not None and transformer_2 is None:
             raise ValueError("Wan2.2 A14B needs both experts: transformer_2 is missing.")

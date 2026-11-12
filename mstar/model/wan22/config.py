@@ -53,15 +53,26 @@ _DISTILL_DEFAULTS = {
     SAMPLER_STEP_DISTILL: ((1000, 750, 500, 250), 5.0),
 }
 
-# MagCache tables (``step_cache``): the residual magnitude ratio per step of a dense run, by name. "default" is
-# TI2V-5B at 1280x704x81, 50 UniPC steps, CFG 5: the mean of ``{method: magcache_calibrate}`` over 9 VBench prompts
-# on an H200 (the prompts' tables differ by under 0.01 per step up to step 44, 0.05 at step 48).
-MAG_RATIOS: dict[str, tuple[float, ...]] = {"default": (
-    1.0, 0.992, 0.99471, 0.99518, 0.99368, 0.9951, 0.99502, 0.99488, 0.99479, 0.99471, 0.99341, 0.99581, 0.99314,
-    0.99347, 0.99443, 0.99429, 0.99342, 0.99339, 0.99263, 0.99164, 0.99186, 0.99173, 0.99149, 0.99054, 0.98872,
-    0.9899, 0.9893, 0.98968, 0.98803, 0.98681, 0.98472, 0.98486, 0.98457, 0.9828, 0.98185, 0.98046, 0.9772, 0.97628,
-    0.97319, 0.97305, 0.96804, 0.96475, 0.96176, 0.95681, 0.95313, 0.94797, 0.94417, 0.94284, 0.94411, 0.97743,
-)}
+# MagCache tables (``step_cache``) per variant: the residual magnitude ratio per step of a dense run, by name.
+# TI2V-5B's "default" is 1280x704x81, 50 UniPC steps, CFG 5: the mean of ``{method: magcache_calibrate}`` over 9
+# VBench prompts on an H200 (the prompts' tables differ by under 0.01 per step up to step 44, 0.05 at step 48).
+# T2V-A14B's "default" is 832x480x81, 40 UniPC steps, flow shift 12, CFG 4.0/3.0: the mean over 8 VBench prompts on
+# a B300 (under 0.006 apart per step; the 1280x720 mean is within 0.005 of it). Its step 26 is the first low-noise
+# step at shift 12, where the ratio compares the two experts' residuals; MagCache computes there and never reads it.
+MAG_RATIOS: dict[str, dict[str, tuple[float, ...]]] = {
+    WAN22_VARIANT_TI2V_5B: {"default": (
+        1.0, 0.992, 0.99471, 0.99518, 0.99368, 0.9951, 0.99502, 0.99488, 0.99479, 0.99471, 0.99341, 0.99581, 0.99314,
+        0.99347, 0.99443, 0.99429, 0.99342, 0.99339, 0.99263, 0.99164, 0.99186, 0.99173, 0.99149, 0.99054, 0.98872,
+        0.9899, 0.9893, 0.98968, 0.98803, 0.98681, 0.98472, 0.98486, 0.98457, 0.9828, 0.98185, 0.98046, 0.9772, 0.97628,
+        0.97319, 0.97305, 0.96804, 0.96475, 0.96176, 0.95681, 0.95313, 0.94797, 0.94417, 0.94284, 0.94411, 0.97743,
+    )},
+    WAN22_VARIANT_T2V_A14B: {"default": (
+        1.0, 0.99349, 0.99473, 0.99664, 0.9956, 0.99397, 0.99571, 0.99553, 0.99464, 0.99614, 0.9977, 0.99575,
+        0.99457, 0.9963, 0.99542, 0.99433, 0.99542, 0.99498, 0.99374, 0.99399, 0.99345, 0.9939, 0.99236, 0.99289,
+        0.98938, 0.99105, 0.65324, 0.98935, 0.98976, 0.98648, 0.98557, 0.98296, 0.9788, 0.97336, 0.97015, 0.9599,
+        0.94539, 0.92479, 0.88328, 0.79866,
+    )},
+}
 
 # The DiT's self-attention: the array over its tokens, and the read that names its resource.
 DIT_TOKENS, SELF_ATTN = "dit_tokens", "dit_self_attn"
@@ -203,7 +214,8 @@ class Wan22Config:
 
     # Opt-in step caching, lossy (``components/diffusion/step_cache.py``); None runs every step. E.g.
     # ``{method: magcache, threshold: 0.06, max_skip_steps: 2, retention_ratio: 0.2}`` reuses the block residual on
-    # the steps MagCache picks from the calibrated table in ``MAG_RATIOS`` (or a ``mag_ratios`` list given here);
+    # the steps MagCache picks from the variant's calibrated table in ``MAG_RATIOS`` (or a ``mag_ratios`` list given
+    # here); on A14B keep the high-noise steps that set the layout with ``retention_ratio: 0.4``;
     # ``{method: magcache_calibrate}`` logs a table from a dense run.
     step_cache: dict | None = None
 

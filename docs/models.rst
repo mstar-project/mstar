@@ -2204,8 +2204,8 @@ step) and no component offload.
 skips the DiT's 30 blocks on the steps MagCache picks and adds back the residual
 they produced at the last step that ran them
 (``components/diffusion/step_cache.py``); off by default. The pick comes from a
-per-step table calibrated on this model (``MAG_RATIOS["default"]``: TI2V-5B at
-1280x704x81, 50 steps) and the step index alone, so it costs no host sync and
+per-step table calibrated on this model (``MAG_RATIOS["ti2v_5b"]["default"]``: TI2V-5B
+at 1280x704x81, 50 steps) and the step index alone, so it costs no host sync and
 every CFG and SP rank makes the same one. On one H200 at 1280x704x81, 50 steps,
 against the dense output on 8 VBench prompts:
 
@@ -2334,6 +2334,43 @@ GPUs (``cfg_size: 2``), each rank holding both experts, and
 ``configs/wan22_a14b_sp2.yaml`` splits the tokens instead (``sp_size: 2``, 20 of the
 40 heads per rank). Both compile the DiT for ``1280x720x81`` and ``832x480x81``, each
 expert once per CFG setting.
+
+**Step caching on A14B.** ``step_cache`` works on A14B as on TI2V-5B, with A14B's own
+table (``MAG_RATIOS["t2v_a14b"]["default"]``: 832x480x81, 40 steps, shift 12, from a
+B300). The low-noise expert's first step always computes and starts the skip rule over,
+so neither expert reuses the other's residual. Keep the first 40% of the steps
+(``retention_ratio: 0.4``): the high-noise steps set the layout, and skipping them costs
+3 dB at the same speed. On one B300 at 832x480x81, 40 steps, shift 12, CFG 4.0/3.0,
+against the dense output on 8 VBench prompts (a lossless kernel swap, cuDNN for FA4
+attention, scores 25.9 dB / 0.860 / 0.094 here):
+
+.. list-table::
+   :header-rows: 1
+
+   * - ``step_cache``
+     - steps computed
+     - s/video
+     - PSNR (dB)
+     - SSIM
+     - LPIPS
+   * - none
+     - 40
+     - 95.1
+     -
+     -
+     -
+   * - ``{threshold: 0.12, max_skip_steps: 4, retention_ratio: 0.4}``
+     - 24
+     - 57.3
+     - 24.5
+     - 0.844
+     - 0.110
+   * - ``{threshold: 0.04, max_skip_steps: 2}`` (retention 0.2)
+     - 23
+     - 54.6
+     - 21.2
+     - 0.743
+     - 0.175
 
 **Four steps (LightX2V's distill LoRAs).** ``configs/wan22_a14b_distill.yaml`` folds
 LightX2V's 4-step distill LoRAs (``lightx2v/Wan2.2-Distill-Loras``, t2v high/low-noise,

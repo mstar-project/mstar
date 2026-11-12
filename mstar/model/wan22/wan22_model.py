@@ -139,7 +139,7 @@ class Wan22Model(Model):
             step_cache=step_cache,
         )
         self.config.compile_dit_grids()  # a malformed list fails at startup
-        step_cache_policy(step_cache, MAG_RATIOS)  # and so does a malformed step cache
+        step_cache_policy(step_cache, MAG_RATIOS[self.config.variant])  # and so does a malformed step cache
         # LoRA adapters folded into the DiT (A14B: each expert its own) at load, a static merge
         self.loras = [LoraFile.parse(item) for item in self.config.lora]
         self.loras_2 = [LoraFile.parse(item) for item in self.config.lora_2]
