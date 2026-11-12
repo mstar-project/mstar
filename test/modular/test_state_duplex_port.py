@@ -439,7 +439,13 @@ def test_the_talker_s_first_step_reads_the_warm_up_codes():
     assert talker.runner.admit(step).ok
     talker.runner.plan(step)
     step.begin_calls()
-    assert torch.equal(talker.node.prev.read(0).fields["codes"], talker.node.warmup()[2].unsqueeze(0))
+    node = talker.node
+    first = node.prepare_inputs("talker_decode", SimpleNamespace(rid_handle="a", dynamic_loop_iter_counts={}),
+                                {"new_token": [torch.tensor([5])]})
+    read, frame_inputs = [], node.talker.frame_inputs
+    node.talker.frame_inputs = lambda prev_codes, *args: read.append(prev_codes) or frame_inputs(prev_codes, *args)
+    node.preprocess("talker_decode", None, [first])
+    assert torch.equal(read[0], node.warmup()[2].unsqueeze(0)), "the first frame's previous codes are the warm-up's"
 
 
 def test_duplex_layers_run_standalone_with_no_handle():
@@ -495,8 +501,9 @@ PER_SESSION_POOLS = (MAMBA_STATE, ENCODER_STATE, ENCODER_FRONT, CODEC_STATE, TAL
 @pytest.mark.parametrize("key", PER_SESSION_POOLS)
 def test_duplex_refuses_a_cap_past_any_per_session_pool(key):
     """Every session holds a slot in each Value's pool and in ``encoder_kv``, and its nano and talker pages, from start
-    to end, through the layouts ``process_prompt`` builds with both loops at their cap. A cap of 33 needs each pool
-    raised past its default 32 sessions, and a deployment that misses one is refused at startup, naming it."""
+    to end, through the layouts a request with the longest system prompt gets, with both loops at their cap. A cap of
+    33 needs each pool raised past its default 32 sessions, and a deployment that misses one is refused at startup,
+    naming it."""
     model = _model()
     raised = {pool: {"max_slots": 34} for pool in (MAMBA_STATE, ENCODER_STATE, ENCODER_FRONT, CODEC_STATE, TALKER_PREV)}
     raised[ENCODER_KV] = {"max_slots": 33}

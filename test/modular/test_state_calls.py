@@ -1874,7 +1874,8 @@ def test_a_step_s_own_replay_records_no_region_rows():
 
 
 def test_a_region_s_rows_reach_a_value_with_host_fields():
-    """Its host calls commit the step's host writes, and a region's step still records its rows."""
+    """A region's step records its rows on a Value with host fields too, since that handle's commit reaches the
+    base's."""
     entry = Entry({"x": TensorType((2, 3), dtype=torch.float32)}, host={"n": int})
     array = Value("state", nodes={"LLM"}, layers={0}, entry=entry)
     (spec,) = build_specs([array], kernel_settings={"state": {"max_slots": 4}})
