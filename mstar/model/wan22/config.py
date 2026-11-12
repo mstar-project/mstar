@@ -42,15 +42,19 @@ _A14B = {
 _VARIANTS = {WAN22_VARIANT_TI2V_5B: {}, WAN22_VARIANT_T2V_A14B: _A14B}
 
 
-# MagCache tables (``step_cache``): the residual magnitude ratio per step of a dense run, by name. "default" is
-# TI2V-5B at 1280x704x81, 50 UniPC steps, CFG 5: the mean of ``{method: magcache_calibrate}`` over 9 VBench prompts
-# on an H200 (the prompts' tables differ by under 0.01 per step up to step 44, 0.05 at step 48).
-MAG_RATIOS: dict[str, tuple[float, ...]] = {"default": (
-    1.0, 0.992, 0.99471, 0.99518, 0.99368, 0.9951, 0.99502, 0.99488, 0.99479, 0.99471, 0.99341, 0.99581, 0.99314,
-    0.99347, 0.99443, 0.99429, 0.99342, 0.99339, 0.99263, 0.99164, 0.99186, 0.99173, 0.99149, 0.99054, 0.98872,
-    0.9899, 0.9893, 0.98968, 0.98803, 0.98681, 0.98472, 0.98486, 0.98457, 0.9828, 0.98185, 0.98046, 0.9772, 0.97628,
-    0.97319, 0.97305, 0.96804, 0.96475, 0.96176, 0.95681, 0.95313, 0.94797, 0.94417, 0.94284, 0.94411, 0.97743,
-)}
+# MagCache tables (``step_cache``) per variant: the residual magnitude ratio per step of a dense run, by name.
+# TI2V-5B's "default" is 1280x704x81, 50 UniPC steps, CFG 5: the mean of ``{method: magcache_calibrate}`` over 9
+# VBench prompts on an H200 (the prompts' tables differ by under 0.01 per step up to step 44, 0.05 at step 48).
+# T2V-A14B has none yet: its ``step_cache`` brings a ``mag_ratios`` list, or calibrates one.
+MAG_RATIOS: dict[str, dict[str, tuple[float, ...]]] = {
+    WAN22_VARIANT_TI2V_5B: {"default": (
+        1.0, 0.992, 0.99471, 0.99518, 0.99368, 0.9951, 0.99502, 0.99488, 0.99479, 0.99471, 0.99341, 0.99581, 0.99314,
+        0.99347, 0.99443, 0.99429, 0.99342, 0.99339, 0.99263, 0.99164, 0.99186, 0.99173, 0.99149, 0.99054, 0.98872,
+        0.9899, 0.9893, 0.98968, 0.98803, 0.98681, 0.98472, 0.98486, 0.98457, 0.9828, 0.98185, 0.98046, 0.9772, 0.97628,
+        0.97319, 0.97305, 0.96804, 0.96475, 0.96176, 0.95681, 0.95313, 0.94797, 0.94417, 0.94284, 0.94411, 0.97743,
+    )},
+    WAN22_VARIANT_T2V_A14B: {},
+}
 
 # The dit's samplers: the checkpoint's UniPC, or a DMD-distilled checkpoint's few fixed steps.
 SAMPLER_UNIPC, SAMPLER_DMD = "unipc", "dmd"
@@ -176,7 +180,8 @@ class Wan22Config:
 
     # Opt-in step caching, lossy (``components/diffusion/step_cache.py``); None runs every step. E.g.
     # ``{method: magcache, threshold: 0.06, max_skip_steps: 2, retention_ratio: 0.2}`` reuses the block residual on
-    # the steps MagCache picks from the calibrated table in ``MAG_RATIOS`` (or a ``mag_ratios`` list given here);
+    # the steps MagCache picks from the variant's calibrated table in ``MAG_RATIOS`` (or a ``mag_ratios`` list given
+    # here);
     # ``{method: magcache_calibrate}`` logs a table from a dense run.
     step_cache: dict | None = None
 
@@ -205,11 +210,6 @@ class Wan22Config:
         if not isinstance(self.vae_decode_fast, bool):
             raise ValueError(f"Wan2.2 vae_decode_fast must be true or false, got {self.vae_decode_fast!r}.")
         self.fast_decode_sizes()
-        if self.is_moe and self.step_cache is not None:
-            # MAG_RATIOS is TI2V-5B's table, and one expert's residual says nothing about the other's
-            raise ValueError(
-                f"Wan2.2 step_cache is not supported on {self.variant}: the calibrated table is TI2V-5B's."
-            )
         samplers = (SAMPLER_UNIPC, *_DISTILL_DEFAULTS)
         if self.sampler not in samplers:
             raise ValueError(f"Wan2.2 sampler must be one of {samplers}, got {self.sampler!r}.")
