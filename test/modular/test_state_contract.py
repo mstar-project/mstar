@@ -27,6 +27,7 @@ from mstar.engine.state import (
     Fork,
     GatedDeltaNet,
     KVEntry,
+    Mamba2,
     PagedNHD,
     Positions,
     Read,
@@ -310,3 +311,26 @@ def test_a_scalar_field_has_no_axis_to_shard():
 def test_a_scalar_field_has_no_kv_layout():
     with pytest.raises(ValueError, match="Attend needs entry fields"):
         _array(entry=_entry(TensorType((), dtype=None), TensorType((), dtype=None)), reads={"attn": _read()})
+
+
+_SSM = Entry({
+    "ssm": TensorType((4, 8, 16), dtype=torch.float32, shard=0),
+    "conv": TensorType((4 * 8 + 2 * 16, 3), dtype=None, shard=0),
+})
+
+
+def test_a_mamba2_update_needs_a_rank_three_ssm():
+    _value(entry=_SSM, updates={"ssm": Mamba2()})
+    with pytest.raises(ValueError, match=re.escape(
+        "Array 'gdn'.updates['ssm']: Mamba2 needs entry field ssm of shape (heads, head_dim, state_size)",
+    )):
+        _value(entry=Entry({"ssm": TensorType((4, 8), dtype=torch.float32)}), updates={"ssm": Mamba2()})
+
+
+@pytest.mark.parametrize("limit", [(1.0, 0.0), (0.5, 0.5), (-1.0, 1.0), (0.0, 1.0, 2.0), [0.0, 1.0], ("0", "1")])
+def test_a_mamba2_time_step_limit_is_an_increasing_range(limit):
+    _value(entry=_SSM, updates={"ssm": Mamba2(time_step_limit=(0.001, 0.1))})
+    with pytest.raises(ValueError, match=re.escape(
+        f"Array 'gdn'.updates['ssm'].time_step_limit must be a tuple (low, high) with 0 <= low < high, got {limit!r}",
+    )):
+        _value(entry=_SSM, updates={"ssm": Mamba2(time_step_limit=limit)})

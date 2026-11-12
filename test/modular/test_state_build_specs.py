@@ -37,6 +37,7 @@ from mstar.engine.state import (
     Entry,
     GatedDeltaNet,
     KVEntry,
+    Mamba2,
     Positions,
     Read,
     Sampler,
@@ -84,6 +85,22 @@ def _gdn(**overrides) -> Array:
     return Value("gdn", **{
         "nodes": {"llm"}, "layers": {0, 1, 3}, "entry": _gdn_entry(),
         "updates": {"conv": CausalConv(), "delta": GatedDeltaNet()}, **overrides,
+    })
+
+
+def _ssm_entry(ssm_dtype=torch.float32, conv_channels=4 * 16 + 2 * 16, **extra) -> Entry:
+    """A Mamba-2 Value's entry, 4 heads of 16 over a state of 16 in one group, which a conv of 96 channels matches."""
+    return Entry({
+        "ssm": TensorType((4, 16, 16), dtype=ssm_dtype, shard=0),
+        "conv": TensorType((conv_channels, 3), dtype=None, shard=0),
+        **extra,
+    })
+
+
+def _mamba(**overrides) -> Array:
+    return Value("mamba", **{
+        "nodes": {"llm"}, "layers": {2, 4}, "entry": _ssm_entry(),
+        "updates": {"conv": CausalConv(), "ssm": Mamba2()}, **overrides,
     })
 
 
@@ -810,3 +827,48 @@ def test_decode_tensor_cores_on_a_within_step_read_is_refused():
                   reads={"r": _read(mask=Block(), op=Attend(q_heads=4))})
     with pytest.raises(ValueError, match=r"Array 'a': kernel_settings\['r'\] sets \['decode_tensor_cores'\]"):
         build_specs([array], kernel_settings={"r": {"decode_tensor_cores": False}})
+
+
+_EXTRA = {"extra": TensorType((2,), dtype=None)}
+
+
+@pytest.mark.parametrize("value, refusal", [
+    (lambda: _gdn(entry=Entry({**_gdn_entry().tensors, **_EXTRA})),
+     "Array 'gdn': no layout yet: entry must be exactly state and conv, the blocks DeltaNetGeometry reads"),
+    (lambda: _mamba(entry=_ssm_entry(**_EXTRA)),
+     "Array 'mamba': no layout yet: entry must be exactly ssm and conv, the blocks Mamba2Geometry reads"),
+], ids=["gdn", "mamba2"])
+def test_a_linear_value_holds_its_op_s_field_and_a_conv(value, refusal):
+    with pytest.raises(ValueError, match=re.escape(refusal)):
+        build_specs([_kv(), value()])
+
+
+@pytest.mark.parametrize("value, field", [
+    (lambda: _gdn(entry=_gdn_entry(state_dtype=None)), "Array 'gdn'.entry.tensors['state']"),
+    (lambda: _mamba(entry=_ssm_entry(ssm_dtype=None)), "Array 'mamba'.entry.tensors['ssm']"),
+], ids=["gdn", "mamba2"])
+def test_a_linear_value_declares_its_state_dtype(value, field):
+    with pytest.raises(ValueError, match=re.escape(f"{field}.dtype must be declared")):
+        build_specs([_kv(), value()])
+
+
+def test_a_mamba2_conv_matches_its_heads_and_groups():
+    """A conv one channel short of ``heads * head_dim + 2 * groups * state_size`` matches no group count."""
+    with pytest.raises(ValueError, match=re.escape("Array 'mamba': no layout yet: conv block (95, 3) does not match")):
+        build_specs([_kv(), _mamba(entry=_ssm_entry(conv_channels=95))])
+
+
+def test_a_mamba2_update_takes_no_kernel_settings():
+    with pytest.raises(ValueError, match=re.escape(
+        "kernel_settings['ssm'] names no read or update of the declarations that takes kernel settings",
+    )):
+        build_specs([_kv(), _mamba()], kernel_settings={"ssm": {"splits": (_SPLIT,)}})
+
+
+def test_only_a_snapshot_writing_value_links_its_pool_to_the_kv():
+    specs = _by_key(_kv(), _gdn(), _mamba())
+    assert specs["gdn"].config.kv_cache == "kv", "GDN's kernels write the snapshots a prefix hit restores"
+    assert specs["mamba"].config.kv_cache is None, "no Mamba-2 kernel writes a snapshot, so the pool keeps none"
+    assert specs["ssm"].config.variant is LinearAttnVariant.MAMBA2
+    alone = _by_key(_mamba())
+    assert alone["mamba"].config.kv_cache is None, "a Mamba-2 Value needs no paged array on its nodes"

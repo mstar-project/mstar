@@ -39,6 +39,7 @@ from mstar.engine.state import (
     Fork,
     GatedDeltaNet,
     KVEntry,
+    Mamba2,
     Positions,
     Read,
     Rope,
@@ -54,6 +55,7 @@ from mstar.engine.state import (
     gated_delta_net,
     kernel_setting,
     last_sampled,
+    mamba2,
     position,
     positions,
     rope,
@@ -152,6 +154,16 @@ class _StubLinear:
         self.labels.append(label)
         state_layer[0] = 1
         return v + 1
+
+
+class _StubMamba2(_StubLinear):
+    """Records what `Mamba2Manager.run` would get, and writes the ssm block in place as its kernels do."""
+
+    def run(self, x, dt, b, c, ssm_layer, a_log, d, dt_bias, label):
+        self.labels.append(label)
+        self.ran = (x, dt, b, c, a_log, d, dt_bias)
+        ssm_layer[0] = 1
+        return x + 1
 
 
 class _StubPositions:
@@ -368,6 +380,28 @@ def test_updates_run_on_the_layers_own_field_and_write_it_in_place():
     core = gated_delta_net(h, 1, q, k, v, q, q, q, q)
     assert torch.equal(core, v + 1)
     assert h._pool.blocks["state"][0].abs().sum() > 0 and h._pool.blocks["state"][1].abs().sum() == 0
+
+
+def test_mamba2_and_causal_conv_reach_the_mamba2_manager():
+    channels = HEADS * DIM + 2 * 4
+    entry = Entry({
+        "ssm": TensorType((HEADS, DIM, 4), dtype=torch.float32, shard=0),
+        "conv": TensorType((channels, 3), dtype=None, shard=0),
+    })
+    array = Value("ssm", nodes={"LLM"}, layers={1, 5}, entry=entry, updates={"c": CausalConv(), "m": Mamba2()})
+    pool = _StubPool({"ssm": torch.zeros(2, SLOTS, HEADS, DIM, 4), "conv": torch.zeros(2, SLOTS, channels, 3)})
+    run = _StubMamba2()
+    h = build_handle(array, {"ssm": pool, "m": run}, _resolve([array], StateSetup()))
+    _begin(h)
+    xbc = torch.randn(TOKENS, channels)
+    assert torch.equal(causal_conv(h, 5, xbc, weight=torch.ones(channels, 4)), xbc * 2)
+    assert pool.blocks["conv"][1].abs().sum() > 0 and pool.blocks["conv"][0].abs().sum() == 0, "the conv ran on layer 5"
+    x, dt, b = torch.randn(TOKENS, HEADS, DIM), torch.randn(TOKENS, HEADS), torch.randn(TOKENS, 1, 4)
+    a_log, d, dt_bias = torch.randn(HEADS), torch.randn(HEADS), torch.randn(HEADS)
+    assert torch.equal(mamba2(h, 1, x, dt, b, -b, a_log, d, dt_bias), x + 1)
+    assert all(map(torch.equal, run.ran, (x, dt, b, -b, a_log, d, dt_bias))), "run takes the call's tensors as given"
+    assert pool.blocks["ssm"][0].abs().sum() > 0 and pool.blocks["ssm"][1].abs().sum() == 0, "the update ran on layer 1"
+    assert run.labels == ["main", "main"], "both kernels run on the Mamba-2 manager, under the step's label"
 
 
 def test_positions_read_the_resource_at_the_steps_label():
