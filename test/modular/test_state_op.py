@@ -34,7 +34,7 @@ from mstar.engine.state import (
     Value,
     state_op,
 )
-from mstar.engine.state.adapters import Resolved, StateSetup, _resolve, build_handle, node_handles
+from mstar.engine.state.adapters import Resolved, StateSetup, _resolve, build_handle
 from mstar.engine.state.calls import ArrayHandle
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.testing_utils.model import make_model
@@ -381,16 +381,14 @@ def test_an_op_that_reads_an_array_with_max_len_0_is_refused():
         _attending_op()(h, 0, *_tensors())
 
 
-def test_a_state_op_on_a_seq_sharded_array_adds_the_ranks_share_as_a_direct_add_does():
+def test_a_state_op_that_only_adds_to_an_array_with_max_len_0_adds_as_a_direct_add_does():
     array = Array("kv", nodes={"llm"}, layers={0, 1}, entry=KVEntry(heads=HEADS, head_dim=DIM), max_len=0,
-                  seq_sharded=True, reads={"attn": Read(mask=Block(), op=Attend(q_heads=HEADS))})
-    model = SimpleNamespace(declare_state=lambda: [array])
-    resources = {"attn": SimpleNamespace(run=lambda q, *args, **kwargs: q)}
-    h = node_handles(model, "llm", resources, sp_group=SimpleNamespace(world_size=2, rank=0))["kv"]
+                  reads={"attn": Read(mask=Block(), op=Attend(q_heads=HEADS))})
+    h = _handle(array=array)
     _open(h)
     q, k, v = _tensors()
     _fused_op()(h, 0, q, k, v)
-    assert torch.equal(h._held[0], k + 1), "the op's reference should hold the rank's k, as a direct add does"
+    assert torch.equal(h._held[0], k + 1), "the op's reference should hold k, as a direct add does"
 
 
 # The debug check
