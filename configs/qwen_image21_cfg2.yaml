@@ -5,6 +5,7 @@ model: "qwen_image21"
 # step costs one branch's forward. Both ranks run every prefix walk and hold both labels' prefixes, so
 # each rank's KV pool is a full copy and the prefix cache serves both (rank 0 decides each hit).
 # The encoders and the VAE run on rank 0. An unguided request runs its one branch on both ranks.
+# The denoise steps run eager (dense attention): accelerator_graph is refused on cfg ranks.
 max_seq_len: 65536
 
 model_kwargs:

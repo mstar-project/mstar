@@ -3234,8 +3234,9 @@ guidance combine and solver step on replicated latents. CFG ranks keep every att
 head; only TP and SP ranks split them. The ranks run in lockstep on the same requests, so
 any per-request resource the node declares must stay the same shape on every rank. A paged KV
 cache on such a node is a full copy on every cfg rank: declare its steps over every branch, not
-over the rank's share (``key.branches``), so that every rank takes the same pages. The node then
-stays on one lockstep instance, since placement refuses replicas of it. Branches that should hold
+over the rank's share (``key.branches``), so that every rank takes the same pages. The pool keeps
+a page trail on cfg ranks, and a follower whose pages part from rank 0's stops its worker at the
+next step. The node then stays on one lockstep instance, since placement refuses replicas of it. Branches that should hold
 their KV apart are separate nodes in a graph ``Parallel`` instead, on a node group with
 ``cfg_size: 1``, as BAGEL's ``LLM_cfg_text`` and ``LLM_cfg_img`` are. ``Wan22DitSubmodule`` is the
 reference, and ``QwenImage21DenoiseSubmodule`` the one with a paged KV.
