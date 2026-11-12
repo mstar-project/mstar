@@ -111,6 +111,8 @@ def test_a_step_over_two_labels_binds_one_plan_named_for_both():
     h = _two_label_handle()
     step = state_steps(_step(h, segments=_label_major()), {"kv": h}, graph_walk="decode")
     assert step.steps["kv"].combined_labels == {LABELS: "main+uncond"}, "the KV resource would plan each label alone"
+    assert all(built.combined_labels == step.combined_labels for built in step.steps.values()), \
+        "a resource that plans the step's rows would pack them by their own labels"
     step.set_ctx(_ctx(rows=(1, 2)))
     h.begin_step(step)
     assert h.label == "main+uncond", "add, read and rope would plan under one label's rows"
