@@ -500,7 +500,7 @@ class DiT(nn.Module):
         ``final_mod [2, r, 1, 512]`` the step's time modulations (``ChunkCFM.constants``),
         ``cnn_cache [depth, N, 1024, 2]`` and ``kv`` (one per block) its caches."""
         if x.is_cuda and kv and isinstance(kv[0], BoundedLayerKV):
-            from mstar.model.minicpm_o.components.token2wav_kernels import dit_forward
+            from mstar.model.components.token2wav.kernels import dit_forward
 
             return dit_forward(self, x, mu, mods, final_mod, spks, cond, cnn_cache, kv)
         x = torch.cat([x, mu, spks.unsqueeze(-1).expand(-1, -1, x.shape[-1]), cond], dim=1)
