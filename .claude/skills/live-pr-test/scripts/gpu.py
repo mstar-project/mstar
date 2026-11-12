@@ -912,6 +912,9 @@ def check_total(cfg, committed: float, allow: bool) -> None:
             f"over budget.max_total_usd ${max_total}; ask before passing --allow-over-budget")
 
 
+COUNT_FAILED = "can't count this tool's instances for budget.max_running"  # what launch dies with, then
+
+
 def cmd_launch(args, cfg):
     if args.boxes < 1:  # fewer would let budget.max_running pass a launch past it
         die(f"--boxes is {args.boxes}; it counts this launch, so it is at least 1")
@@ -946,7 +949,7 @@ def cmd_launch(args, cfg):
                         print(f"gpu.py: {line}", file=sys.stderr)
                     up = running(cfg)
                 except ApiError as err:
-                    die(f"can't count this tool's instances for budget.max_running: {err}")
+                    die(f"{COUNT_FAILED}: {err}")
                 if len(up) + args.boxes > max_running:
                     die(f"{len(up)} of this tool's instances are up, from every session, and this launch needs room "
                         f"for {args.boxes}; budget.max_running is {max_running}. Wait for one to end, or ask before "

@@ -7,7 +7,8 @@ Nothing here runs a model or the PR's code: the live-test session runs on the GP
 (gpu_review_box.sh), and this script only gets it GPUs, waits for it, collects what it wrote,
 decides approval by a fixed rule and renders what gets posted. GPUs come from
 .claude/skills/live-pr-test/scripts/gpu.py, whose config `configure` writes: the cheapest open
-listing under the hourly cap, Eras before DigitalOcean (PREFERENCE). A PR whose diff names AMD
+listing under the hourly cap, RunPod and Lambda before Eras before DigitalOcean (RANK). When no
+provider has the GPUs, `start` keeps trying for GPU_WAIT seconds. A PR whose diff names AMD
 hardware gets a second box, an AMD one, and passes only when both do (bot.VENDORS). The live test's
 files are in $RUNNER_TEMP/lt, one directory per vendor's box; `start` and `wait` exit 3, with
 `unavailable` set, when no box could start or none left results (no GPUs free, the bot has
@@ -54,9 +55,14 @@ NEVER_FILES = ("AGENTS.md", "CLAUDE.md", "CLAUDE.local.md", "MANIFEST.in", "pypr
                ".mcp.json", ".claude.json", ".ripgreprc")
 # A submodule's commit in a file's patch, how the compare API shows a gitlink (mode 160000; it gives no mode).
 GITLINK = re.compile(r"^[-+]Subproject commit [0-9a-f]{40}$", re.MULTILINE)
-# Where a box comes from, by vendor in effect: Eras for NVIDIA while it has GPUs free, DigitalOcean otherwise,
-# and for AMD, which Eras doesn't have. Not by price: Eras is the provider the bot's caches and limits are for.
-PREFERENCE = ("eras", "digitalocean")
+# Where a box comes from, by vendor in effect: RunPod and Lambda (the cheaper of the two) while they have GPUs
+# free, then Eras, then DigitalOcean, which is also AMD's only source. Lower first; price decides within a rank.
+RANK = {"runpod": 0, "lambda": 0, "eras": 1, "digitalocean": 2}
+# What RunPod's pods run: gpu.py's own example config names it. Local disk only: the bot has no volumes there.
+RUNPOD_IMAGE = "runpod/pytorch:1.0.2-cu1281-torch280-ubuntu2404"
+USER_DATA = ("digitalocean", "lambda")  # the providers that carry a run's files in the create request
+GPU_WAIT = 300  # seconds `start` keeps trying for GPUs before it says there are none
+GPU_RETRY = 30  # seconds between its tries
 BOX_OUT = "/workspace/live-pr/out"
 # The kinds of check the review can ask for (the schema's `checks`), as the brief names them.
 CHECKS = {"correctness": "correctness (served output, parity, regressions)",
@@ -82,7 +88,10 @@ def configure(out, runner_temp, ssh_key="", hours="4", max_usd="30", max_runs="2
               eras_cache_volumes=""):
     """gpu.py's config.local.json from the workflow's variables and secrets, and the runner's ssh key
     (`ssh_key`, REVIEW_SSH_KEY, stored in the environment; it stays on the runner and never reaches the
-    box). Eras only with that key and ERAS_API_KEY (gpu.py checks). ERAS_CACHE_VOLUMES: the Eras cache
+    box). Every provider is written; gpu.py enables one only with its API key (ERAS_API_KEY, RUNPOD_API_KEY,
+    LAMBDA_API_KEY, DIGITALOCEAN_TOKEN) in the environment. RunPod and Lambda have no team storage here, and
+    the bot counts and reaps its boxes there by the name prefix `live-pr-`, so RUNPOD_API_KEY and
+    LAMBDA_API_KEY must be for an account (a team) that only the bot uses. ERAS_CACHE_VOLUMES: the Eras cache
     volumes' ids, space-separated."""
     Path(os.environ["LIVE_PR_STATE"]).mkdir(parents=True, exist_ok=True)
     ssh = Path.home() / ".ssh"
@@ -99,8 +108,8 @@ def configure(out, runner_temp, ssh_key="", hours="4", max_usd="30", max_runs="2
     eras = {"cache_volume_ids": eras_cache_volumes.split(), **reachable}
     if eras_secret:
         eras["run_secret_id"] = eras_secret
-    # run_secret_env: a DigitalOcean box's Anthropic key is the review's own, from the start step's environment,
-    # written into the droplet's user_data.
+    # run_secret_env: a box's Anthropic key on every provider but Eras is the review's own, from the start step's
+    # environment: in the instance's user_data, or over scp on RunPod.
     cfg = {"mode": "cloud", "results_dir": "results", "run_secret_env": "ANTHROPIC_API_KEY",
            "ssh_public_key": str(ssh / "live_pr.pub"),
            "identity_file": str(ssh / "live_pr"),
@@ -108,7 +117,9 @@ def configure(out, runner_temp, ssh_key="", hours="4", max_usd="30", max_runs="2
            "budget": {"max_usd_per_hour": usd, "max_hours": hours, "max_concurrent_instances": len(bot.VENDORS),
                       "max_total_usd": usd * hours * len(bot.VENDORS), "max_running": int(max_runs)},
            "eras": eras, "digitalocean": reachable,
-           "runpod": {"enabled": False}, "lambda": {"enabled": False}}
+           "runpod": {"image": RUNPOD_IMAGE, "disk_gb": 300, "hf_home": "/workspace/live-pr/hf", "storage": False,
+                      **reachable},
+           "lambda": {"storage": False, **reachable}}
     (GPU.parent.parent / "config.local.json").write_text(json.dumps(cfg, indent=1))
 
 
@@ -329,12 +340,12 @@ cluster mode: the box is already provisioned, and it ends when you exit.
 
 def free_offers(gpus, vendor, max_usd_per_hour=None):
     """(the offers of `vendor`'s GPUs that can start now, the listing they came from): `gpu.py offers`, keeping those
-    under `max_usd_per_hour` (default gpu.py's cap), by PREFERENCE, then price. check=False: offers exits 1 with its
+    under `max_usd_per_hour` (default gpu.py's cap), by RANK, then price. check=False: offers exits 1 with its
     JSON when something errored and nothing has an offer, which is "no GPUs" here too, with the errors listed."""
     listing = json.loads(gpu("offers", "--gpus", str(gpus), "--vendor", vendor, "--json", check=False).stdout)
     cap = listing["max_usd_per_hour"] if max_usd_per_hour is None else max_usd_per_hour
     free = [o for o in listing["offers"] if o["usd_per_hour"] <= cap and o["availability"] != "none"]
-    return sorted(free, key=lambda o: PREFERENCE.index(o["provider"])), listing
+    return sorted(free, key=lambda o: (RANK[o["provider"]], o["usd_per_hour"])), listing
 
 
 def launch_first(offers, launch):
@@ -367,11 +378,13 @@ def start(out, pr, head_sha, runner_temp, tag, base, gpus, hours, run, checks, v
           forced="", asked="", asked_checks="", turns="2000"):
     """Get GPUs and start the live-test session on them, a box per vendor (lt/<vendor>): the brief (fixed text, the
     commits, carry's call and the box's vendor), the review's notes (findings.json) and the PR's title and
-    description (pr-body.md) as data, and an Anthropic key (an Eras box's own spend-capped one; a DigitalOcean
-    box gets the review's own ANTHROPIC_API_KEY, in its user_data). Every vendor's box or none: when one has no
-    GPUs free, none starts, and the first launch asks budget.max_running for room for them all; when a box then
-    fails to start (its offer taken meanwhile), those already started go. Each box that doesn't run gets an
-    unavailable.md, and the step exits 3 with `unavailable` set."""
+    description (pr-body.md) as data, and an Anthropic key (an Eras box's own spend-capped one; every other box
+    gets the review's own ANTHROPIC_API_KEY, in its user_data or over scp). Every vendor's box or none: when one
+    has no GPUs free, none starts, and the first launch asks budget.max_running for room for them all; when a box
+    then fails to start (its offer taken meanwhile), those already started go. Until every vendor has a box, a pass
+    of listing and launching repeats every GPU_RETRY seconds for GPU_WAIT. budget.max_running's refusal (launch
+    exits 4) is not retried: it says now, as every pass would. Each box that doesn't run gets an unavailable.md,
+    and the step exits 3 with `unavailable` set."""
     pr, gpus, hours, turns = int(pr), int(gpus), float(hours), int(turns)
     base, checks, vendors = branch(base), check_kinds(checks), vendor_list(vendors)
     since = commit(since) if since else ""
@@ -394,76 +407,105 @@ def start(out, pr, head_sha, runner_temp, tag, base, gpus, hours, run, checks, v
     (lt / "run.json").write_text(json.dumps({"repo": REPO, "pr": pr, "sha": head_sha, "main_sha": main_sha,
                                              "model": MODEL, "turns": turns, "claude": CLAUDE, "end_by": end_by}))
     cfg = gpu_py.load_config()
-    found = {}  # vendor -> (the offers that can start now, the listing, what was left out and why)
     for vendor in vendors:
         (lt / vendor).mkdir(exist_ok=True)
         (lt / vendor / "brief.md").write_text(brief(pr, head_sha, main_sha, base, run, checks, since, forced, asked,
                                                     asked_checks, vendor, vendors, end_by=end_by))
+    secret = os.environ.get(cfg.get("run_secret_env") or "", "")
+
+    def listed(vendor):
+        """(the offers of `vendor` that can start now, the listing they came from, what was left out and why)."""
         free, listing = free_offers(gpus, vendor)
         tried = []
         # The box's Anthropic key on Eras is a saved Eras secret: without it a box would be paid for and do nothing.
         if not cfg.get("eras", {}).get("run_secret_id") and any(o["provider"] == "eras" for o in free):
             tried, free = ["eras: ERAS_RUN_SECRET_ID is not set"], [o for o in free if o["provider"] != "eras"]
-        found[vendor] = free, listing, tried
+        return free, listing, tried
 
-    def none_free(vendor):
+    def none_free(vendor, found):
         _, listing, tried = found[vendor]
         everything = json.loads(gpu("offers", "--gpus", str(gpus), "--vendor", vendor, "--json", "--all-regions",
                                     check=False).stdout)
+        uncounted = any(gpu_py.COUNT_FAILED in t for t in tried)
         lines = [f"No {bot.VENDORS[vendor]} GPUs for the live test: it needs {gpus}, at most "
                  f"${listing['max_usd_per_hour']}/hr."]
+        if uncounted:
+            lines = [f"The live test started no {bot.VENDORS[vendor]} box: the bot couldn't count its running "
+                     "boxes (a provider's API failed), so every launch was refused."]
         lines += [f"- tried {t}" for t in tried]
         lines += [f"- `{o['id']}`: {o['count']}x {o['gpu']}, ${o['usd_per_hour']}/hr, {o['availability']}"
                   for o in everything["offers"]] or [f"- no listing has that many {bot.VENDORS[vendor]} GPUs"]
         lines += [f"- {e}" for e in everything["errors"]]
         unavailable(lt / vendor, "\n".join(lines))
 
-    def stop():
-        """No box runs: the PR is approvable only when every vendor's box passes, so one alone would be paid for
-        nothing. Those this run started go."""
+    def end_boxes():
+        """Terminate the boxes this run has started."""
         for box in boxes(lt):
             if (box / "instance").exists():
                 gpu("terminate", (box / "instance").read_text().strip(), check=False)
                 (box / "instance").unlink()
+
+    def stop():
+        """No box runs: the PR is approvable only when every vendor's box passes, so one alone would be paid for
+        nothing. Those this run started go."""
+        end_boxes()
+        for box in boxes(lt):
             if not (box / "unavailable.md").exists():
                 unavailable(box, "No box: another vendor's couldn't start, and the PR passes only when every box "
                                  "does.")
         out["unavailable"] = "true"
         sys.exit(3)
 
+    def attempt():
+        """One pass: list every vendor's GPUs, and when each has some, launch a box each. (the listings, how it
+        went: "started", "none" for a vendor with no GPUs, "taken" for a launch that failed, or "full" for
+        budget.max_running's refusal, and the vendor whose launch that was)."""
+        found = {vendor: listed(vendor) for vendor in vendors}
+        if not all(found[v][0] for v in vendors):
+            return found, "none", None
+        for i, vendor in enumerate(vendors):
+            box = lt / vendor
+            free, _, tried = found[vendor]
+
+            # The first launch checks budget.max_running has room for every box this run needs.
+            def launch(o, vendor=vendor, box=box, tried=tried, boxes=len(vendors) if i == 0 else 1):
+                data = fit_user_data(lt, box, len(secret)) if o["provider"] in USER_DATA \
+                    else [lt / "findings.json", lt / "pr-body.md"]
+                inputs = [x for f in (box / "brief.md", *data, lt / "run.json", BOX_COMMON)
+                          for x in ("--input", str(f))]
+                r = gpu("launch", o["id"], "--pr", str(pr), "--hours", str(hours), "--tag", f"{tag}-{vendor}",
+                        "--run", str(BOX), *inputs, "--boxes", str(boxes), check=False)
+                if r.returncode:
+                    tried.append(f"{o['id']}: {gpu_py.tail_lines(r.stderr or r.stdout, 400)}")
+                return r
+
+            o, r = launch_first(free, launch)
+            if o:
+                (box / "instance").write_text(r.stdout.strip().splitlines()[-1])
+                (box / "offer.json").write_text(json.dumps(o))
+                print(f"launched {vendor} on {o['id']} ({o['count']}x {o['gpu']}, ${o['usd_per_hour']}/hr)")
+                continue
+            end_boxes()  # a vendor's box is paid for nothing without the others
+            return found, "full" if r and r.returncode == 4 else "taken", vendor
+        return found, "started", None
+
+    give_up = time.time() + GPU_WAIT
+    while True:
+        found, how, failed = attempt()
+        if how == "started":
+            return
+        if how == "full":
+            unavailable(lt / failed, f"The bot's GPU boxes would go past {cfg['budget']['max_running']} with this "
+                                     f"run's {len(vendors)} (REVIEW_GPU_MAX_RUNS); comment `/review` again when one "
+                                     "finishes.")
+            stop()
+        if time.time() >= give_up:
+            break
+        time.sleep(GPU_RETRY)
     for vendor in vendors:
-        if not found[vendor][0]:
-            none_free(vendor)
-    if any((lt / v / "unavailable.md").exists() for v in vendors):
-        stop()
-    secret = os.environ.get(cfg.get("run_secret_env") or "", "")
-    for i, vendor in enumerate(vendors):
-        box = lt / vendor
-        free, _, tried = found[vendor]
-
-        # The first launch checks budget.max_running has room for every box this run needs.
-        def launch(o, vendor=vendor, box=box, tried=tried, boxes=len(vendors) if i == 0 else 1):
-            data = fit_user_data(lt, box, len(secret)) if o["provider"] == "digitalocean" \
-                else [lt / "findings.json", lt / "pr-body.md"]
-            inputs = [x for f in (box / "brief.md", *data, lt / "run.json", BOX_COMMON) for x in ("--input", str(f))]
-            r = gpu("launch", o["id"], "--pr", str(pr), "--hours", str(hours), "--tag", f"{tag}-{vendor}",
-                    "--run", str(BOX), *inputs, "--boxes", str(boxes), check=False)
-            if r.returncode:
-                tried.append(f"{o['id']}: {gpu_py.tail_lines(r.stderr or r.stdout, 400)}")
-            return r
-
-        o, r = launch_first(free, launch)
-        if o:
-            (box / "instance").write_text(r.stdout.strip().splitlines()[-1])
-            (box / "offer.json").write_text(json.dumps(o))
-            print(f"launched {vendor} on {o['id']} ({o['count']}x {o['gpu']}, ${o['usd_per_hour']}/hr)")
-            continue
-        if r and r.returncode == 4:  # budget.max_running
-            unavailable(box, f"The bot's GPU boxes would go past {cfg['budget']['max_running']} with this run's "
-                             f"{len(vendors)} (REVIEW_GPU_MAX_RUNS); comment `/review` again when one finishes.")
-        else:
-            none_free(vendor)  # its offers were taken since the listing
-        stop()
+        if not found[vendor][0] or vendor == failed:  # no GPUs, or its offers were taken since the listing
+            none_free(vendor, found)
+    stop()
 
 
 CUT = "\n\n(cut to fit)\n"
@@ -573,7 +615,7 @@ def finished(box, cfg):
         with gpu_py.ledger_txn() as d:
             if key in d:  # its watchdog may have dropped it since the read
                 d[key].update(host=host, port=port)
-    if st.lower().startswith("run ") or st.lower() in ("ended", "releasing"):
+    if st.lower().startswith("run ") or st.lower() in gpu_py.TERMINAL:
         return st  # the box is gone, and its results with it
     if host and gpu("ssh", key, f"test -f {BOX_OUT}/done", check=False, timeout=120).returncode == 0:
         return st
@@ -689,8 +731,10 @@ def wait(out, runner_temp):
     message; exits 3, with `unavailable` set, when no box left any."""
     lt = Path(runner_temp, "lt")
     cfg = gpu_py.load_config()
-    # what progress lines are redacted of: the review's own key, which a DigitalOcean box holds, and the cloud keys
-    exact = exact_lines(os.environ.get(k, "") for k in ("ANTHROPIC_API_KEY", "ERAS_API_KEY", "DIGITALOCEAN_TOKEN"))
+    # what progress lines are redacted of: the review's own key, which every box but an Eras one holds, and the
+    # cloud keys
+    exact = exact_lines(os.environ.get(k, "") for k in ("ANTHROPIC_API_KEY", "ERAS_API_KEY", "RUNPOD_API_KEY",
+                                                       "LAMBDA_API_KEY", "DIGITALOCEAN_TOKEN"))
     pending = [box for box in boxes(lt) if (box / "instance").exists()]
     seen = dict.fromkeys(pending, 0)
     label = {box: f"{box.name}: " if len(pending) > 1 else "" for box in pending}
@@ -731,7 +775,8 @@ def cleanup(out, pr, tag):
 
 def reap(out, hours="4"):
     """review-monitor.yml, hourly: release the bot's boxes that outlived REVIEW_GPU_HOURS by an hour (gpu.py reap),
-    for a run whose runner died before its cleanup. Only DigitalOcean's: an Eras Pod's deadline ends it anyway."""
+    for a run whose runner died before its cleanup. Every provider's but Eras's: an Eras Pod's deadline ends it
+    anyway."""
     for line in gpu_py.reap({"budget": {"max_hours": float(hours)}}) or ["nothing past its deadline"]:
         print(line)
 
@@ -1124,14 +1169,14 @@ def remove(path):
         path.unlink(missing_ok=True)
 
 
-def redact(out, runner_temp, s2="", s3="", s4=""):
+def redact(out, runner_temp, s2="", s3="", s4="", s5="", s6=""):
     """What the boxes and the providers wrote, redacted in place before anything reads it, so the comment,
     the kept reports and the artifact all get the redacted copy: the exact values of the secrets this job
-    holds (S2-S4), then bot.redact's credential patterns, which also strip a box's own Anthropic key. For a box
+    holds (S2-S6), then bot.redact's credential patterns, which also strip a box's own Anthropic key. For a box
     with no pass, partial or fail, the redacted tail of its session's stderr (claude.err.tail, for the artifact),
     so a session that died at once leaves its reason. First, anything but a regular file at a path the artifact
     uploads (UPLOADED) goes: redact would skip it, and the upload would take a directory's files unredacted."""
-    exact = exact_lines((s2, s3, s4))
+    exact = exact_lines((s2, s3, s4, s5, s6))
     for box in boxes(Path(runner_temp, "lt")):
         for path in (box / "results" / name for name in UPLOADED):
             if path.is_symlink() or not path.is_file():

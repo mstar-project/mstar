@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
 # The live-test session on a GPU box: one Claude Code run of the live-pr-test skill against the
 # reviewed commit. gpu_review.py launches it with `gpu.py launch --run`: on Eras the box (a Pod) is
-# this script, and its GPUs go when it ends; on DigitalOcean cloud-init starts it at boot, and the
-# runner deletes the droplet once it has the results.
+# this script, and its GPUs go when it ends; on DigitalOcean and Lambda cloud-init starts it at boot, on
+# RunPod `gpu.py launch` copies it over ssh and starts it, and the runner deletes the box once it has the
+# results.
 #
 # Its inputs, in /run/live-pr, are box_common.sh, run.json (repo, PR, commits, model), brief.md (what
 # to do), findings.json (the review's notes for the run: model text, which the brief calls untrusted
 # data) and pr-body.md (the PR's title and description, untrusted data too). The Anthropic key is at
-# /run/live-pr-key/value: an Eras secret, or on DigitalOcean the review's own key. Nothing here holds a
+# /run/live-pr-key/value: an Eras secret, or elsewhere the review's own key. Nothing here holds a
 # GitHub token or a cloud key.
 set -uo pipefail
 
@@ -44,7 +45,7 @@ finish() {
   await_collection
   exit 0
 }
-# However bash exits (an unset variable, say), the runner sees `done`: a DigitalOcean droplet has no deadline
+# However bash exits (an unset variable, say), the runner sees `done`: any box but an Eras Pod has no deadline
 # of its own, so without it the runner would wait out its timeout on a box billing for nothing.
 trap 'finish "the box script stopped early (exit $?)"' EXIT
 # Trusted: main's skills, AGENTS.md and scripts, at the commit the workflow read its rules from.
