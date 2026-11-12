@@ -381,7 +381,7 @@ class _OtherLinear(LinearAttnBinding):
 
 
 def test_an_op_with_no_binding_on_its_storage_is_refused_as_no_layout_yet():
-    refusal = "Array 'gdn': no layout yet: updates ['other'] must be CausalConv or GatedDeltaNet"
+    refusal = "Array 'gdn': no layout yet: updates ['other'] must be CausalConv or GatedDeltaNet or Mamba2"
     with pytest.raises(ValueError, match=re.escape(refusal)):
         build_specs([_kv(), _gdn(updates={"delta": GatedDeltaNet(), "other": _OtherRecurrence()})])
 
@@ -419,7 +419,7 @@ def test_a_conv_needs_exactly_one_linear_attention_update_to_run_inside(monkeypa
     monkeypatch.setitem(BINDINGS, (VALUE, _OtherRecurrence), _OtherLinear())
     with pytest.raises(ValueError, match=re.escape(
         f"Array 'gdn': no layout yet: updates['conv'] is a CausalConv, which today's resources run inside one linear "
-        f"attention update (GatedDeltaNet, _OtherRecurrence), and the array has {linear}",
+        f"attention update (GatedDeltaNet, Mamba2, _OtherRecurrence), and the array has {linear}",
     )):
         build_specs([_kv(), _gdn(updates=updates)])
 

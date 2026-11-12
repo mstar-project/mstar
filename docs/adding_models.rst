@@ -724,8 +724,9 @@ deployment YAML tunes them under ``resources:`` (see :ref:`Step 6 <config-yaml>`
   the entry's heads.
 - ``Value(name, nodes=, layers=, entry=, updates=)``: a rewritable array of one entry, such
   as a recurrent state. ``updates`` names the kernels that read and write one of its fields
-  in place: ``CausalConv()`` needs a field ``conv`` of shape ``(channels, kernel - 1)``, and
-  ``GatedDeltaNet()`` a field ``state`` of shape ``(h_v, d_k, d_v)``.
+  in place: ``CausalConv()`` needs a field ``conv`` of shape ``(channels, kernel - 1)``,
+  ``GatedDeltaNet()`` a field ``state`` of shape ``(h_v, d_k, d_v)``, and ``Mamba2()`` a field
+  ``ssm`` of shape ``(heads, head_dim, state_size)``.
 - ``max_len=0``: the array keeps nothing between steps, for attention within this step only.
   Its one read uses ``Block()``, which sees only the entries of the token's own segment. See
   `Cacheless attention (encoder towers)`_.
@@ -1179,7 +1180,7 @@ The rows below name specs where a declaration doesn't reach them yet.
    * - A node that carries per-request state between steps of a loop (an RNN-T
        decoder, recurrent attention)
      - A ``Value`` with tensor fields, read and written whole, and for a linear-attention
-       layer stack a ``Value`` with a ``GatedDeltaNet``.
+       layer stack a ``Value`` with a ``GatedDeltaNet`` or a ``Mamba2``.
    * - A node that samples with two different sets of parameters
      - Two ``SamplerSpec`` objects that both name the node, under different keys.
    * - An encoder tower that attends within the segments of one packed forward
@@ -2305,6 +2306,7 @@ The rest are free functions in ``mstar.engine.state``:
    out  = add_read(self.kv, layer, q, k=k, v=v)                            # add, then read, behind one break
    qkv  = causal_conv(self.gdn, layer, qkv, weight=w, bias=b)              # reads and writes `conv`
    core = gated_delta_net(self.gdn, layer, q, k, v, a, b, A_log, dt_bias)  # reads and writes `state`
+   y    = mamba2(self.ssm, layer, x, dt, b, c, A_log, D, dt_bias)          # reads and writes `ssm`
    p    = position(self.kv, fwd_info.rid_handle, label)                    # a request's next position, on the host
    ids  = positions(self.kv)                  # this step's ids, on the device
    q, k = rope(self.kv, q, k)                 # rotate at this step's ids with the declared Rope

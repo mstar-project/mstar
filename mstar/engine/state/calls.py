@@ -12,7 +12,7 @@ import torch
 
 from mstar.engine.resources.sampler.utils import FUSED_DRAW_MAX_VOCAB, FusedDrawArgs
 from mstar.engine.resources.step import Segment, StepHandle
-from mstar.engine.state.contract import EMPTY, Array, ArrayStep, CausalConv, GatedDeltaNet, Op, Sampler
+from mstar.engine.state.contract import EMPTY, Array, ArrayStep, CausalConv, GatedDeltaNet, Mamba2, Op, Sampler
 
 if TYPE_CHECKING:
     from mstar.engine.state.state_op import StateOp
@@ -342,6 +342,17 @@ def gated_delta_net(
     """The declared `GatedDeltaNet`, which reads and writes ``layer``'s ``state`` field in place."""
     run, state = h._update(GatedDeltaNet, "state", h._layer_id(layer))
     return run.run(q, k, v, a, b, state_layer=state, a_log=a_log, dt_bias=dt_bias, label=h.label)
+
+
+@torch.compiler.disable
+def mamba2(
+    h: ArrayHandle, layer: int | torch.Tensor, x: torch.Tensor, dt: torch.Tensor, b: torch.Tensor, c: torch.Tensor,
+    a_log: torch.Tensor, d: torch.Tensor | None, dt_bias: torch.Tensor | None,
+) -> torch.Tensor:
+    """The declared `Mamba2`, which reads and writes ``layer``'s ``ssm`` field in place. ``x`` is (tokens, heads,
+    head_dim), ``dt`` (tokens, heads) before its bias and softplus, and ``b`` and ``c`` (tokens, groups, state_size)."""
+    run, ssm = h._update(Mamba2, "ssm", h._layer_id(layer))
+    return run.run(x, dt, b, c, ssm_layer=ssm, a_log=a_log, d=d, dt_bias=dt_bias, label=h.label)
 
 
 def host(h: ArrayHandle, request: int, label: str, layer: int | torch.Tensor) -> Mapping[str, object]:

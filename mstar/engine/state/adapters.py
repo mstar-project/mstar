@@ -37,7 +37,10 @@ from mstar.engine.resources.linear_attn.config import (
 )
 from mstar.engine.resources.position.config import PositionConfig, PositionSpec, PositionStep
 from mstar.engine.resources.recurrent.config import (
+    DeltaNetGeometry,
+    Mamba2Geometry,
     RecurrentBlockConfig,
+    RecurrentGeometry,
     RecurrentStateConfig,
     RecurrentStateSpec,
     RecurrentStep,
@@ -69,6 +72,7 @@ from mstar.engine.state.contract import (
     GatedDeltaNet,
     KVEntry,
     Layout,
+    Mamba2,
     Op,
     PagedNHDTarget,
     Positions,
@@ -736,7 +740,18 @@ class LinearAttnBinding(OpBinding):
     """A recurrence a `LinearAttnSpec` runs under the op's key. Today's resources run the array's `CausalConv` inside
     it too."""
 
-    kernel_settings = frozenset({"splits"})
+    # what the resource reads the pool's blocks as
+    geometry: ClassVar[type[RecurrentGeometry]]
+
+    def check(self, array: Array, key: str, op: Op) -> None:
+        geometry = self.geometry.__name__
+        if set(array.entry.tensors) != {*op.writes, "conv"}:
+            raise _no_layout(array, f"entry must be exactly {' and '.join([*op.writes, 'conv'])}, the blocks "
+                                    f"{geometry} reads")
+        for field in op.writes:
+            if array.entry.tensors[field].dtype is None:
+                raise ValueError(f"Array {array.name!r}.entry.tensors[{field!r}].dtype must be declared, since the "
+                                 f"rule that picks its stored dtype reads it")
 
     def steps(self, key: str, op: Op, declared: ArrayStep, segments, steps: dict[str, Any]) -> None:
         steps[key] = LinearAttnStep(segments=segments)
@@ -752,12 +767,8 @@ class GDN(LinearAttnBinding):
     """`GatedDeltaNet` on a Value. It stores ``state`` K-last, (h_v, d_v, d_k) where the reference declares
     (h_v, d_k, d_v), since FlashInfer's kernels read it that way."""
 
-    def check(self, array: Array, key: str, op: GatedDeltaNet) -> None:
-        if set(array.entry.tensors) != {"state", "conv"}:
-            raise _no_layout(array, "entry must be exactly state and conv, the blocks DeltaNetGeometry reads")
-        if array.entry.tensors["state"].dtype is None:
-            raise ValueError(f"Array {array.name!r}.entry.tensors['state'].dtype must be declared, since the rule "
-                             f"that picks its stored dtype reads it")
+    kernel_settings = frozenset({"splits"})
+    geometry = DeltaNetGeometry
 
     def specs(self, array: Array, key: str, op: GatedDeltaNet) -> list[NodeResourceSpec]:
         return [LinearAttnSpec(
@@ -781,6 +792,28 @@ class GDN(LinearAttnBinding):
 
     def from_stored(self, stored: torch.Tensor) -> torch.Tensor:
         return stored.transpose(-1, -2)
+
+
+class SSD(LinearAttnBinding):
+    """`Mamba2` on a Value: a `LinearAttnSpec` of the Mamba-2 variant over the Value's pool, which stores ``ssm`` as
+    declared."""
+
+    geometry = Mamba2Geometry
+
+    def check(self, array: Array, key: str, op: Mamba2) -> None:
+        super().check(array, key, op)
+        try:
+            self.geometry.from_blocks({field: _block(tensor) for field, tensor in array.entry.tensors.items()})
+        except ValueError as e:
+            raise _no_layout(array, str(e)) from e
+
+    def specs(self, array: Array, key: str, op: Mamba2) -> list[NodeResourceSpec]:
+        return [LinearAttnSpec(
+            resource_key=key, nodes=array.nodes,
+            config=LinearAttnConfig(
+                recurrent_state=array.name, variant=LinearAttnVariant.MAMBA2, time_step_limit=op.time_step_limit,
+            ),
+        )]
 
 
 class ConvOnLinearAttn(OpBinding):
@@ -1777,8 +1810,9 @@ class ValueStorage(Storage):
 
     def _specs(self, array: Array, arrays: Sequence[Array]) -> tuple[list[NodeResourceSpec], tuple[BoundOp, ...]]:
         bound = _bindings(self, array)
+        ops = _op_specs(array, bound)
         kv_cache = None
-        if bound:
+        if any(spec.writes_prefix_snapshots for spec in ops):
             # the snapshots its update kernels take are keyed by the pages of the one paged array on its nodes
             holders = [other for other in arrays if storage_of(other).holds_row_entries and other.nodes & array.nodes]
             if len(holders) != 1 or not array.nodes <= holders[0].nodes:
@@ -1796,7 +1830,7 @@ class ValueStorage(Storage):
                 labels=tuple(sorted(array.labels)),
             ),
         )
-        return [pool, *_op_specs(array, bound)], bound
+        return [pool, *ops], bound
 
     def steps(self, handle: ArrayHandle, declared: ArrayStep, step: SubmoduleStep, steps: dict[str, Any]) -> None:
         pre, post, rows = _forks(handle.array, declared)
@@ -1912,6 +1946,7 @@ BINDINGS: dict[tuple[Storage, type[Op | Positions]], OpBinding] = {
     (PAGED_CROSS, Positions): PositionsBinding(),
     (WITHIN_STEP, Attend): RaggedAttend(),
     (VALUE, GatedDeltaNet): GDN(),
+    (VALUE, Mamba2): SSD(),
     (VALUE, CausalConv): ConvOnLinearAttn(),
 }
 # What `backend: sdpa` binds in place of the default, for each storage and op type SDPA can run.

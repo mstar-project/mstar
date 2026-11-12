@@ -163,6 +163,24 @@ class GatedDeltaNet(Op):
 
 
 @dataclass(frozen=True, kw_only=True)
+class Mamba2(Op):
+    """Mamba-2's SSD recurrence over each row's ``ssm`` state, (heads, head_dim, state_size), updated in place. Its
+    conv is a separate `CausalConv` update on the same Value."""
+
+    reads = ("ssm",)
+    writes = ("ssm",)
+    time_step_limit: tuple[float, float] = (0.0, float("inf"))    # dt's clamp after softplus, HF's time_step_limit
+
+    def check(self, where: str, entry: Entry) -> None:
+        if len(entry.tensors["ssm"].shape) != 3:
+            raise ValueError(f"{where}: Mamba2 needs entry field ssm of shape (heads, head_dim, state_size)")
+        limit = self.time_step_limit
+        if not (type(limit) is tuple and len(limit) == 2 and all(type(t) in (int, float) for t in limit)
+                and 0.0 <= limit[0] < limit[1]):
+            raise ValueError(f"{where}.time_step_limit must be a tuple (low, high) with 0 <= low < high, got {limit!r}")
+
+
+@dataclass(frozen=True, kw_only=True)
 class Read:
     """A view of the entries a row has kept. ``mask`` says which entries each query can still reach, so the engine
     can free the rest and tell when two requests can share a prefix. A read leaves the entries as they were."""

@@ -24,8 +24,8 @@ from mstar.engine.state.calls import ArrayHandle
 _POSITIONAL = {"PagedNHDTarget", "Segment", "SlotLease", "Span"}
 # The calls take the handle first, then what every call names, and only then keywords.
 _CALLS = {
-    "add_read", "at_last_token", "causal_conv", "gated_delta_net", "host", "last_sampled", "position", "positions",
-    "rope", "sample",
+    "add_read", "at_last_token", "causal_conv", "gated_delta_net", "host", "last_sampled", "mamba2", "position",
+    "positions", "rope", "sample",
 }
 # Each public name's parameters as ``[name, kind, default]``. A dataclass's parameters are its fields.
 SNAPSHOT = {
@@ -84,6 +84,9 @@ SNAPSHOT = {
         ["spans", "KEYWORD_ONLY", '()'],
         ["growth", "KEYWORD_ONLY", '()'],
         ["scratch", "KEYWORD_ONLY", '0'],
+    ],
+    "Mamba2": [
+        ["time_step_limit", "KEYWORD_ONLY", '(0.0, inf)'],
     ],
     "PagedNHD": [
         ["dtypes", "KEYWORD_ONLY", 'None'],
@@ -224,6 +227,17 @@ SNAPSHOT = {
     ],
     "last_sampled": [
         ["s", "POSITIONAL_OR_KEYWORD", None],
+    ],
+    "mamba2": [
+        ["h", "POSITIONAL_OR_KEYWORD", None],
+        ["layer", "POSITIONAL_OR_KEYWORD", None],
+        ["x", "POSITIONAL_OR_KEYWORD", None],
+        ["dt", "POSITIONAL_OR_KEYWORD", None],
+        ["b", "POSITIONAL_OR_KEYWORD", None],
+        ["c", "POSITIONAL_OR_KEYWORD", None],
+        ["a_log", "POSITIONAL_OR_KEYWORD", None],
+        ["d", "POSITIONAL_OR_KEYWORD", None],
+        ["dt_bias", "POSITIONAL_OR_KEYWORD", None],
     ],
     "position": [
         ["h", "POSITIONAL_OR_KEYWORD", None],
