@@ -12,6 +12,7 @@ from typing import NamedTuple
 import numpy as np
 import torch
 
+from mstar.engine.resources.kv.config import RetentionPolicy
 from mstar.engine.resources.step import Segment
 
 
@@ -59,9 +60,38 @@ class SequenceView(NamedTuple):
     to_compute: int # new for this step
     start: int = 0
     generation: int = 0
+    # the stream's exact retention, which a kept-window read reaches through; None for every other stream
+    retention: RetentionPolicy | None = None
 
     def last_page_len(self, page_size: int) -> int:
         return (self.start + self.length)  % page_size
+
+
+class ReachSlots(NamedTuple):
+    """Each entry a kept-window read reaches on one row, in the order it attends them: the entry's page, and its
+    offset in the page."""
+
+    pages: np.ndarray
+    offsets: np.ndarray
+
+
+def kept_reach(view: SequenceView, page_size: int) -> ReachSlots:
+    """The entries ``view``'s row reaches: the first ``protected_prefix`` the stream kept before this step, the last
+    ``context_budget`` of them, then this step's, in log order; every entry where the stream has no retention. An exact
+    retention releases only whole pages between the two, so the window stays whole at the end of what the stream
+    kept, in the view's compacted page list."""
+    policy = view.retention
+    if policy is None:
+        ranges = ((0, view.length),)
+    else:
+        kept = view.length - view.to_compute
+        window = min(kept, max(policy.protected_prefix, kept - policy.context_budget))
+        ranges = ((0, min(policy.protected_prefix, kept)), (window, view.length))
+    # every slot's page and offset, then the ranges cut from them, with no division per entry
+    pages = np.repeat(np.asarray(view.page_idxs, dtype=np.int64), page_size)
+    offsets = np.tile(np.arange(page_size, dtype=np.int64), len(view.page_idxs))
+    cuts = [slice(view.start + a, view.start + b) for a, b in ranges]
+    return ReachSlots(np.concatenate([pages[cut] for cut in cuts]), np.concatenate([offsets[cut] for cut in cuts]))
 
 
 class PagedIndptrs(NamedTuple):

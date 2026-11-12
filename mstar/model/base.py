@@ -240,7 +240,7 @@ class LabelLayout(NamedTuple):
             ],
             [[loop, slots] for loop, slots in self.growth],
             self.scratch,
-            None if retention is None else [retention.context_budget, retention.protected_prefix],
+            None if retention is None else [retention.context_budget, retention.protected_prefix, retention.exact],
             self.keyed_count(),
             self.max_growth,
         ]

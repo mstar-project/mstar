@@ -819,10 +819,16 @@ class RetentionPolicy:
     realized context can run over the budget by up to a page; the excess is
     re-offered at the next commit. ``protected_prefix`` tokens at the head (a
     text prompt, say) are never released.
+
+    A prefix that ends inside a page keeps that whole page, so the release
+    would count the page's later tokens against the budget and could free
+    some of the latest ``context_budget`` tokens. An ``exact`` policy counts
+    the prefix to the end of its page instead, and keeps all of them.
     """
     context_budget: int
     # front tokens the window never releases; only pages within them are indexed
     protected_prefix: int = 0
+    exact: bool = False
 
     def __post_init__(self):
         if self.context_budget <= 0:
@@ -830,12 +836,17 @@ class RetentionPolicy:
         if self.protected_prefix < 0:
             raise ValueError(f"protected_prefix must be >= 0, got {self.protected_prefix}")
 
+    def kept_prefix(self, page_size: int) -> int:
+        """The tokens at the head the release counts as the prefix: ``protected_prefix``, rounded up to a page of
+        ``page_size`` when ``exact``."""
+        return -(-self.protected_prefix // page_size) * page_size if self.exact else self.protected_prefix
+
     def max_pages(self, page_size: int, step: int = 0) -> int:
         """The most pages of ``page_size`` a stream under this policy holds, with a step of
         ``step`` tokens past its prefix. `KVManager._apply_retention` leaves less than a page over
-        the budget, so the window peaks at the protected prefix plus the budget, or at the prefix
+        the budget, so the window peaks at the kept prefix plus the budget, or at the prefix
         rounded up to a page if that is larger, plus a page of overrun and the step."""
-        prefix = self.protected_prefix
+        prefix = self.kept_prefix(page_size)
         window = max(prefix + self.context_budget, -(-prefix // page_size) * page_size)
         return -(-(window + page_size - 1 + step) // page_size)
 

@@ -631,6 +631,9 @@ class KVManager(AttentionResource):
             )
         self._streams: dict[str, LabelToStream] = {}
         self._overrides: dict[str, KVReqConfig] = {}
+        # Each request whose layout holds an exact retention, with each such label's policy. Its commit applies the
+        # policy from the layout, where other requests' come from the step.
+        self._exact: dict[str, dict[str, RetentionPolicy]] = {}
         # dropped request -> what it returns with, until its rebuild lands
         self._dropped: dict[str, Dropped] = {}
         # rebuilt request -> the tokens it had written when its rebuild landed
@@ -1814,6 +1817,12 @@ class KVManager(AttentionResource):
             if rid not in self._streams:
                 self._streams[rid] = {"main": self._new_stream()}
             self._overrides.setdefault(rid, overrides)
+            exact = {
+                label: layout.retention for label, layout in (self._overrides[rid].kv_layout or {}).items()
+                if layout.retention is not None and layout.retention.exact
+            }
+            if exact:
+                self._exact[rid] = exact
             for label, stream in self._streams[rid].items():
                 if stream.span_cursor is None:
                     self._lay_out(rid, label, stream)
@@ -2430,6 +2439,7 @@ class KVManager(AttentionResource):
                 length=length,
                 to_compute=s.span,
                 generation=generation,
+                retention=self._exact.get(s.request_id, {}).get(s.label),
             ))
         return views
 
@@ -2666,7 +2676,7 @@ class KVManager(AttentionResource):
             return [
                 SequenceView(
                     s.request_id, s.label, indices[bounds[i]:bounds[i + 1]].tolist(),
-                    lens[i], s.span, 0, gens[i],
+                    lens[i], s.span, 0, gens[i], self._exact.get(s.request_id, {}).get(s.label),
                 )
                 for i, s in enumerate(segments)
             ]
@@ -2711,7 +2721,7 @@ class KVManager(AttentionResource):
             return [
                 SequenceView(
                     s.request_id, s.label, indices[bounds[i]:bounds[i + 1]].tolist(),
-                    lg[i], s.span, 0, lg[n + i],
+                    lg[i], s.span, 0, lg[n + i], self._exact.get(s.request_id, {}).get(s.label),
                 )
                 for i, s in enumerate(segments)
             ]
@@ -3081,6 +3091,7 @@ class KVManager(AttentionResource):
     def commit(self, step: KVStep, ctx: StepContext):
         streams = self._streams
         retention = step.retention
+        exact = self._exact
         if not step.commit:
             self._readonly_epoch += 1
         rows = self._readonly_rows
@@ -3102,7 +3113,9 @@ class KVManager(AttentionResource):
             is_pad = ctx.is_padding_row
             sink = step.sink
             rows = () if ctx.capture else step.segments
-            if rows and self._index is None and not retention and not windows and not _DEBUG_ASSERTS:
+            if rows and self._index is None and not retention and not windows and not _DEBUG_ASSERTS and not (
+                exact and any(segment.request_id in exact for segment in rows)
+            ):
                 # nothing to index, adopt, retain or check: the arena moves
                 # every row's counts in one call, and hands back the ones it can't
                 slow = self._arena.commit_rows(streams, rows, ctx.real_rows(), sink or None, step.commit)
@@ -3139,6 +3152,11 @@ class KVManager(AttentionResource):
                         retention.get((segment.request_id, segment.label))
                         if retention else None
                     )
+                    if policy is None and exact and segment.request_id in exact:
+                        policy = exact[segment.request_id].get(segment.label)
+                        # adopted at the first commit that reaches the prefix, before which nothing past it exists
+                        if policy is not None and stream.stored_len < policy.protected_prefix:
+                            policy = None
                     if policy is not None:
                         self._adopt_retention(stream, policy, segment)
                     touched = []
@@ -3265,7 +3283,8 @@ class KVManager(AttentionResource):
     ) -> int:
         """Release what ``policy`` no longer keeps of the stream's pages in group ``group``: the
         step's policy, or a group's. ``touch`` runs `_touch_plan_cache`. Under the lock."""
-        excess = stream.group(group).stored_len - policy.protected_prefix - policy.context_budget
+        kept = policy.kept_prefix(self._groups[group].page_size)
+        excess = stream.group(group).stored_len - kept - policy.context_budget
         if excess <= 0:
             return 0
         if touch:
@@ -4155,6 +4174,7 @@ class KVManager(AttentionResource):
             self._streams.pop(rid, None)
             self._looked_up.discard(rid)
             self._overrides.pop(rid, None)
+            self._exact.pop(rid, None)
             self._guaranteed.discard(rid)
             self._footprints.pop(rid, None)
             self._dropped.pop(rid, None)
