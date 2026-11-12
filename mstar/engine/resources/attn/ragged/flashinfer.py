@@ -6,12 +6,14 @@ from mstar.engine.resources.attn.config import AttentionStep, refuse_context_onl
 from mstar.engine.resources.attn.ragged.base import (
     RaggedBlockCausalAttnManager,
     _RaggedCrossManagerBase,
+    _RaggedKeyPrefixManagerBase,
     _RaggedManagerBase,
     _RaggedSelfManagerBase,
 )
 from mstar.engine.resources.attn.ragged.block_causal import RaggedBlockCausalWrapper
 from mstar.engine.resources.attn.ragged.config import RaggedAttentionConfig
 from mstar.engine.resources.attn.ragged.wrappers import (
+    FlashInferKeyPrefixPrefillWrapper,
     FlashInferRaggedCrossPrefillWrapper,
     FlashInferRaggedPrefillWrapper,
     _RaggedPrefillBase,
@@ -66,6 +68,10 @@ class FlashInferRaggedManager(_FlashInferRaggedManagerBase, _RaggedSelfManagerBa
 
 class FlashInferRaggedCrossManager(_FlashInferRaggedManagerBase, _RaggedCrossManagerBase):
     wrapper_class = FlashInferRaggedCrossPrefillWrapper
+
+
+class FlashInferRaggedKeyPrefixManager(_FlashInferRaggedManagerBase, _RaggedKeyPrefixManagerBase):
+    wrapper_class = FlashInferKeyPrefixPrefillWrapper
 
 
 class FlashInferRaggedBlockCausalManager(_FlashInferRaggedManagerBase, RaggedBlockCausalAttnManager):
