@@ -1,5 +1,5 @@
-"""The API server's intra-op thread count: the cgroup quota it is derived from, and
-which of config, model and default wins."""
+"""The API server's and the engine workers' intra-op thread counts: the cgroup quota
+they are derived from, and which of config, model, environment and default wins."""
 
 from __future__ import annotations
 
@@ -70,3 +70,23 @@ def test_config_then_model_then_default(monkeypatch, model, config, expect):
     monkeypatch.setattr(cpus, "_plan", cpus.CpuPlan(frozenset(range(12)), usable=12))  # 3 threads
     entrypoint._set_preprocess_threads(model, config)
     assert calls == ([] if expect is None else [expect])
+
+
+@pytest.mark.parametrize(("usable", "workers", "threads"), [(1, 1, 1), (4, 1, 4), (20, 1, 8), (20, 2, 8),
+                                                            (20, 4, 5), (192, 8, 8), (12, 16, 1)])
+def test_default_worker_threads(usable, workers, threads):
+    assert cpus.CpuPlan(frozenset(range(256)), usable).worker_threads(workers) == threads
+
+
+@pytest.mark.parametrize(("env", "expect"), [(None, [5]), ("3", []), ("", [5])])
+def test_worker_threads_unless_the_environment_names_them(monkeypatch, env, expect):
+    from mstar.worker import worker
+
+    calls = []
+    monkeypatch.setattr("torch.set_num_threads", calls.append)
+    if env is None:
+        monkeypatch.delenv("OMP_NUM_THREADS", raising=False)
+    else:
+        monkeypatch.setenv("OMP_NUM_THREADS", env)
+    worker.set_worker_threads(cpus.CpuPlan(frozenset(range(256)), usable=20), workers=4)
+    assert calls == expect

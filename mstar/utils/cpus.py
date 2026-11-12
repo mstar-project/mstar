@@ -206,6 +206,14 @@ class CpuPlan:
         MB."""
         return max(1, min(4, self.left // 4))
 
+    def worker_threads(self, workers: int) -> int:
+        """An engine worker's intra-op threads, one of ``workers`` on this host:
+        its share of the CPUs left, at most 8. torch's default is the host's
+        cores, and a pool larger than the cgroup quota spins the quota away
+        from the step thread (a 20-CPU pod on a 192-CPU host: the worker at
+        870% CPU, every host op 4x slower)."""
+        return max(1, min(8, self.left // max(1, workers)))
+
     def prepare_workers(self, threads: int) -> int:
         """Requests the data worker prepares at once, for a model that
         declares ``PREPROCESS_PARALLEL``, when each runs on ``threads``
