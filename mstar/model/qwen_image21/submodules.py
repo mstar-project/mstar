@@ -20,13 +20,14 @@ from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources import AttentionStep, KVStep, Segment, SubmoduleStep
 from mstar.engine.resources.convenience import AttentionCallable
+from mstar.model.components.diffusion.attention import FrameSDPA
 from mstar.model.components.diffusion.decode_utils import latent_affine, latent_std
 from mstar.model.components.diffusion.denoise_loop import LATENTS, DenoiseLoopSubmodule, StepKey
 from mstar.model.components.diffusion.flow_match import FlowMatchSchedule
 from mstar.model.components.diffusion.guidance import Guidance, cfg
 from mstar.model.components.diffusion.image_io import pixels_to_uint8, vae_pixels
 from mstar.model.components.diffusion.qwen.vl_prompt import qwen3_vl_tokens
-from mstar.model.components.qwen_vision import VISION_ATTN, FrameSDPA, QwenVisionModel
+from mstar.model.components.qwen_vision import VISION_ATTN, QwenVisionModel
 from mstar.model.qwen_image21.components.transformer import (
     QwenImage21Transformer,
     image_positions,
@@ -435,14 +436,13 @@ class QwenImage21DenoiseSubmodule(DenoiseLoopSubmodule):
     def bucket_key_for(self, fwd_info: CurrentForwardPassInfo) -> DitKey:
         return DitKey(*RequestLayout.from_metadata(fwd_info.step_metadata[LAYOUT]).target)
 
-    def schedule_for(self, fwd_info: CurrentForwardPassInfo, bucket_key: DitKey) -> FlowMatchSchedule:
+    def schedule_for(self, walk: str, num_steps: int, bucket_key: DitKey) -> FlowMatchSchedule:
         cfg = self.qi_config
         if cfg.sample_sigmas is not None:
             return FlowMatchSchedule.from_sigmas(cfg.sample_sigmas)
-        steps = int(fwd_info.step_metadata[STEPS])
-        return FlowMatchSchedule.build(cfg.scheduler, steps, bucket_key.height * bucket_key.width)
+        return FlowMatchSchedule.build(cfg.scheduler, int(num_steps), bucket_key.height * bucket_key.width)
 
-    def seed_latents(self, fwd_info, bucket_key: DitKey, generator: torch.Generator) -> torch.Tensor:
+    def seed_latents(self, bucket_key: DitKey, generator: torch.Generator) -> torch.Tensor:
         """``randn_tensor`` of the packed target, in the transformer's dtype as the pipeline draws it."""
         h, w = bucket_key.height, bucket_key.width
         channels = self.qi_config.transformer.in_channels
