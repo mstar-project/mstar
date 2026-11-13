@@ -65,6 +65,11 @@ def resolve_ragged_attn_backend(
 
 
 def _refuse_cudnn(spec, backend: RaggedAttnBackend, what: str) -> RaggedAttnBackend:
+    if backend is RaggedAttnBackend.VSA:
+        raise ValueError(
+            f"ragged attention {spec.resource_key!r}: backend 'vsa' runs self-attention only, "
+            f"not {what}; name 'auto', 'flashinfer' or 'dense'"
+        )
     if backend is RaggedAttnBackend.CUDNN:
         raise ValueError(
             f"ragged attention {spec.resource_key!r}: backend 'cudnn' runs self-attention only, "
@@ -161,6 +166,14 @@ class RaggedAttnManager(AttentionResource):
             from mstar.engine.resources.attn.ragged.flashinfer import FlashInferRaggedManager
 
             return _build_ragged(spec, info, FlashInferRaggedManager, cudnn=True)
+        if backend is RaggedAttnBackend.VSA:
+            from mstar.engine.resources.attn.ragged.vsa import DEFAULT_VSA_SPARSITY, _vsa_manager_class
+
+            sparsity = spec.config.vsa_sparsity
+            return _build_ragged(
+                spec, info, _vsa_manager_class(), kernel_table=_uses_kernel_table(spec.config),
+                sparsity=DEFAULT_VSA_SPARSITY if sparsity is None else sparsity,
+            )
         if backend is RaggedAttnBackend.FLASHINFER:
             # Deferred so naming the spec does not load FlashInfer, and because
             # `flashinfer` imports this class back.
