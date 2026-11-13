@@ -396,3 +396,76 @@ def test_mask_control_block_causal_would_differ():
     assert not torch.equal(ours, block_causal)
     # and specifically: block-causal admits a pair ours rejects
     assert block_causal[tpc, 0] and not ours[tpc, 0]
+
+
+# ---------------------------------------------------------------------------
+# Rotary positions
+# ---------------------------------------------------------------------------
+
+from mstar.model.praxis1.components import rope as port_rope  # noqa: E402
+
+
+@pytest.mark.parametrize(
+    "frames,height,width,start", [(1, 7, 13, 0), (6, 7, 13, 2), (3, 4, 5, 11)]
+)
+def test_video_positions_match(frames, height, width, start):
+    got = port_rope.video_positions(frames, height, width, start)
+    want = ref_backbone.video_positions(frames, height, width, start)
+    assert torch.equal(got, want)
+
+
+def test_rope_table_matches_reference():
+    """The split-precision table, including the float32 round trips."""
+    ref = ref_layers.RotaryEmbedding()
+    got = port_rope.RotaryEmbedding()
+    assert torch.equal(got.theta, ref.theta)
+    # A full window is 4 chunks of 6 latent frames, and only past 24
+    # frames do positions exceed table_size and engage the high/low
+    # split. A single chunk never does, so testing one would leave the
+    # recombination unexercised.
+    positions = port_rope.video_positions(24, 7, 13, 0)[None]
+    assert int(positions.max()) > 1_000_000
+    assert torch.equal(got(positions), ref(positions))
+
+
+def test_rope_table_control_the_split_engages():
+    """Control: small and large positions must not give the same table.
+
+    If every position stayed under table_size the high half would be zero
+    throughout and the test above would never exercise the recombination.
+    """
+    emb = port_rope.RotaryEmbedding()
+    small = torch.arange(16)[None]
+    large = small + 3_000_000
+    assert not torch.equal(emb(small), emb(large))
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_apply_rope_matches(dtype):
+    torch.manual_seed(0)
+    b, h, n, d = 1, 4, 24, 128
+    q = torch.randn(b, h, n, d, dtype=dtype)
+    k = torch.randn(b, h, n, d, dtype=dtype)
+    table = port_rope.RotaryEmbedding(dim=d)(port_rope.video_positions(2, 3, 4, 0)[None])
+    gq, gk = port_rope.apply_rope(q, k, table)
+    wq, wk = ref_layers._apply_rope_eager(q, k, table)
+    assert torch.equal(gq, wq) and torch.equal(gk, wk)
+
+
+def test_apply_rope_control_only_half_the_pairs_rotate():
+    """Control: the zero-padded frequencies must leave their channels alone.
+
+    effective_dim is 64 of 128, so pairs 32..63 have zero frequency. If the
+    pad were dropped those channels would rotate too and this would fail.
+    """
+    torch.manual_seed(0)
+    b, h, n, d = 1, 2, 12, 128
+    q = torch.randn(b, h, n, d)
+    table = port_rope.RotaryEmbedding(dim=d)(port_rope.video_positions(1, 3, 4, 0)[None])
+    out, _ = port_rope.apply_rope(q, q.clone(), table)
+    half = d // 2
+    # channels 32..63 pair with 96..127 and must pass through unchanged
+    assert torch.allclose(out[..., 32:half], q[..., 32:half], atol=0, rtol=0)
+    assert torch.allclose(out[..., half + 32 :], q[..., half + 32 :], atol=0, rtol=0)
+    # while the rotating channels really did move
+    assert not torch.equal(out[..., :32], q[..., :32])
