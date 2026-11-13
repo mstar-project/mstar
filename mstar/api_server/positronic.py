@@ -45,8 +45,8 @@ def _pack(value: dict) -> bytes:
 def _request(data: bytes, session_id: str) -> tuple[dict | None, bool]:
     try:
         value = msgpack.unpackb(data, raw=False, strict_map_key=False)
-    except (ValueError, TypeError, msgpack.UnpackException) as exc:
-        raise ValueError(f"invalid msgpack request: {exc}") from None
+    except (ValueError, TypeError, msgpack.UnpackException):
+        raise ValueError("invalid msgpack request") from None
     if not isinstance(value, dict) or value.get("session_id") != session_id:
         raise ValueError("The session ID does not belong to this connection")
     if value.get("end_session") is True:
@@ -77,11 +77,11 @@ async def _infer(api, obs: dict, policy: PositronicPolicy, session_id: str, rese
         if chunk.modality == "action":
             data = bytes(chunk.data)
     if data is None:
-        raise RuntimeError("the request finished without actions")
+        raise ValueError("the request finished without actions")
     try:
         rows = _unpack_numpy(data)
-    except (ValueError, TypeError, msgpack.UnpackException) as exc:
-        raise ValueError(f"invalid command result: {exc}") from None
+    except (ValueError, TypeError, msgpack.UnpackException):
+        raise ValueError("invalid command result") from None
     if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
         raise ValueError("the model must return a list of command dictionaries")
     return rows
@@ -108,11 +108,12 @@ async def serve_connection(websocket: WebSocket, api) -> None:
                 return
             data = frame.get("bytes")
             if data is None:
+                reason = "Text frames are not served. Send each observation as one binary msgpack frame."
                 await websocket.send_bytes(_pack({
                     "status": "error",
-                    "error": "Text frames are not served. Send each observation as one binary msgpack frame.",
+                    "error": reason,
                 }))
-                await websocket.close(code=1008)
+                await websocket.close(code=1008, reason=reason[:100])
                 return
             started = time.monotonic()
             try:

@@ -199,3 +199,27 @@ def test_text_frame_is_refused_and_disconnect_releases_the_episode():
         "status": "error", "error": "Text frames are not served. Send each observation as one binary msgpack frame.",
     }
     assert stub.ended == [py_id, rust_id]
+
+
+def test_malformed_binary_frame_fails_in_both_frontends():
+    stub = Stub()
+    with rust(stub) as port:
+        entrypoint.api_server = stub
+        with TestClient(entrypoint.app).websocket_connect("/api/v1/session") as ws:
+            ws.receive_bytes()
+            py_id = msgpack.unpackb(ws.receive_bytes())["session_id"]
+            ws.send_bytes(b"\xc1")
+            py = msgpack.unpackb(ws.receive_bytes())
+            with pytest.raises(WebSocketDisconnect) as close:
+                ws.receive_bytes()
+            assert close.value.code == 1011
+        with websockets.sync.client.connect(f"ws://127.0.0.1:{port}/api/v1/session", compression=None) as ws:
+            ws.recv()
+            rust_id = msgpack.unpackb(ws.recv())["session_id"]
+            ws.send(b"\xc1")
+            rs = msgpack.unpackb(ws.recv())
+            with pytest.raises(websockets.exceptions.ConnectionClosed) as close:
+                ws.recv()
+            assert close.value.rcvd.code == 1011
+    assert py == rs == {"status": "error", "error": "invalid msgpack request"}
+    assert stub.ended == [py_id, rust_id]

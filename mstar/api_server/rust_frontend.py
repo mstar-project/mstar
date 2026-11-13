@@ -901,8 +901,8 @@ class RustFrontendBridge:
             try:
                 self.server.end_episode(msg["episode"])
             except Exception as exc:
-                logger.exception("episode cleanup failed")
-                self._send({"t": "err", "rid": msg["rid"], "sub": msg.get("sub"), "msg": str(exc)})
+                text, _ = client_error_text(exc, "episode cleanup failed", log=logger, type_name=False)
+                self._send({"t": "err", "rid": msg["rid"], "sub": msg.get("sub"), "msg": text})
             else:
                 self._send({"t": "done", "rid": msg["rid"], "sub": msg.get("sub")})
         elif t == "ping":

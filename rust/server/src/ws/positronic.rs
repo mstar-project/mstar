@@ -44,9 +44,11 @@ fn get<'a>(value: &'a Mp, key: &str) -> Option<&'a Mp> {
 }
 
 fn request(data: &[u8], session_id: &str) -> Result<Option<Mp>, String> {
+    rmp_serde::from_slice::<serde::de::IgnoredAny>(data)
+        .map_err(|_| "invalid msgpack request".to_string())?;
     let mut cursor = data;
-    let value = rmpv::decode::read_value(&mut cursor).map_err(|e| format!("invalid msgpack request: {e}"))?;
-    if !cursor.is_empty() { return Err("invalid msgpack request: extra data".into()); }
+    let value = rmpv::decode::read_value(&mut cursor).map_err(|_| "invalid msgpack request".to_string())?;
+    if !cursor.is_empty() { return Err("invalid msgpack request".into()); }
     if !matches!(value, Mp::Map(_)) || get(&value, "session_id").and_then(Mp::as_str) != Some(session_id) {
         return Err("The session ID does not belong to this connection".into());
     }
@@ -81,8 +83,8 @@ async fn infer(st: &AppState, policy: &Policy, obs: &Mp, session_id: &str, reset
     }
     let data = data.ok_or("the request finished without actions")?;
     let mut cursor = data.as_slice();
-    let rows = rmpv::decode::read_value(&mut cursor).map_err(|e| format!("invalid command result: {e}"))?;
-    if !cursor.is_empty() { return Err("invalid command result: extra data".into()); }
+    let rows = rmpv::decode::read_value(&mut cursor).map_err(|_| "invalid command result".to_string())?;
+    if !cursor.is_empty() { return Err("invalid command result".into()); }
     if !matches!(&rows, Mp::Array(items) if items.iter().all(|item| matches!(item, Mp::Map(_)))) {
         return Err("the model must return a list of command dictionaries".into());
     }
@@ -131,8 +133,9 @@ async fn serve(mut socket: WebSocket, st: AppState, policy: &'static Policy) {
             Message::Close(_) => { super::answer_close(&mut socket).await; break; }
             Message::Ping(_) | Message::Pong(_) => continue,
             Message::Text(_) => {
-                let _ = socket.send(Message::Binary(error("Text frames are not served. Send each observation as one binary msgpack frame."))).await;
-                let _ = socket.send(Message::Close(Some(CloseFrame { code: 1008, reason: "text frame".into() }))).await;
+                let reason = "Text frames are not served. Send each observation as one binary msgpack frame.";
+                let _ = socket.send(Message::Binary(error(reason))).await;
+                let _ = socket.send(Message::Close(Some(CloseFrame { code: 1008, reason: reason.into() }))).await;
                 break;
             }
         };
