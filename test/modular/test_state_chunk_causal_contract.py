@@ -12,6 +12,7 @@ import torch
 
 from mstar.conductor.conductor import _with_chunk_causal_layout
 from mstar.conductor.request_info import CurrentForwardPassInfo, WalkStep
+from mstar.engine.accelerator_graph_runner import PiecewiseAcceleratorGraphRunner
 from mstar.engine.resources.attn.ragged.chunk_causal import dense_visibility
 from mstar.engine.resources.attn.ragged.config import RaggedChunkCausalAttentionSpec
 from mstar.engine.resources.base import EngineResourceInfo, build_resource
@@ -157,6 +158,69 @@ def test_missing_or_misaligned_real_request_layout_is_refused():
     }
     with pytest.raises(ValueError, match="spans 20, but its segment spans 28"):
         state_steps(step, handles, per_request_info={"r0": info})
+
+
+@pytest.mark.parametrize("second_lengths", [[4, 8, 0], [3, 9, 0]])
+def test_shared_chunk_resource_aggregates_each_label_layout(second_lengths):
+    arrays = [
+        Array(
+            label, nodes={"dit"}, layers={0}, entry=KVEntry(heads=4, head_dim=32), max_len=0,
+            labels={label}, reads={f"{label}_attn": Read(mask=ChunkCausal(8), op=Attend(q_heads=4))},
+        ) for label in ("a", "b")
+    ]
+    class Model:
+        def declare_state(self):
+            return arrays
+
+    specs = build_specs(arrays)
+    assert len(specs) == 1 and specs[0].resource_key == "a_attn"
+    handles = node_handles(Model(), "dit", {"a_attn": SimpleNamespace(run=lambda *args, **kwargs: None)})
+    info = CurrentForwardPassInfo(
+        request_id="r0", graph_walk="encode", fwd_index=0, random_seed=0, max_tokens=1,
+        step_metadata={CHUNK_CAUSAL_LAYOUT_KWARG: {
+            "a": {"a": {"a_attn": [4, 8, 0]}},
+            "b": {"b": {"b_attn": second_lengths}},
+        }},
+    )
+    step = SubmoduleStep(state={
+        array.name: ArrayStep(segments=(Segment("r0", array.name, 12),)) for array in arrays
+    })
+    expanded = state_steps(step, handles, per_request_info={"r0": info})
+    resource_step = expanded.steps["a_attn"]
+    assert [s.label for s in resource_step.segments] == ["a", "b"]
+    assert resource_step.layouts == (
+        chunk_causal_resource_layout(ChunkCausal(8), ChunkCausalLayout(global_len=4, noised_len=8)),
+        chunk_causal_resource_layout(
+            ChunkCausal(8), ChunkCausalLayout(global_len=second_lengths[0], noised_len=second_lengths[1]),
+        ),
+    )
+    manager = build_resource(specs[0], EngineResourceInfo(device=torch.device("cpu"), kv_dtype=torch.float32))
+    manager.plan(resource_step, StepContext(request_ids=[0], graph_walk="encode", slot=0, capture=False))
+    from test.modular.test_ragged_chunk_causal import dense_from_block_mask
+
+    for label, layout in zip(("a", "b"), resource_step.layouts, strict=True):
+        assert torch.equal(dense_from_block_mask(manager._wrapper(label).block_mask, 12), dense_visibility([layout]))
+    assert torch.equal(dense_visibility(resource_step.layouts), torch.block_diag(
+        dense_visibility(resource_step.layouts[:1]), dense_visibility(resource_step.layouts[1:]),
+    ))
+
+
+def test_piecewise_chunk_mask_refuses_without_request_layout_transport():
+    array = _array()
+    class Model:
+        def declare_state(self):
+            return [array]
+
+    handles = node_handles(Model(), "dit", {"attn": SimpleNamespace(run=lambda *args, **kwargs: None)})
+    runner = object.__new__(PiecewiseAcceleratorGraphRunner)
+    runner._label = "praxis"
+    runner._segment_keys = ()
+    runner._state_handles = handles
+    runner._config = SimpleNamespace(region_step=lambda *args: SubmoduleStep(
+        segments=[Segment("r0", "main", 28)], state={"tokens": ArrayStep()},
+    ))
+    with pytest.raises(ValueError, match="ChunkCausal needs per-request state_layout lengths"):
+        runner._region_step(["r0"], [28])
 
 
 @pytest.mark.parametrize("lengths", [

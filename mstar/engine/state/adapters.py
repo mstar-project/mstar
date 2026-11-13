@@ -532,7 +532,7 @@ class WithinStepSteps(StepBuilder):
         self._queries: dict[str, Queries] = {}
         # a resource's layout is fixed only if every read on it declares it so
         self._fixed: dict[str, bool] = {}
-        self._chunk_layouts: dict[str, tuple[ResourceChunkCausalLayout, ...]] = {}
+        self._chunk_layouts: dict[str, dict[str, tuple[ResourceChunkCausalLayout, ...]]] = {}
         self._per_request_info = per_request_info or {}
         self._info: dict[str | int, Any] | None = None
 
@@ -551,9 +551,13 @@ class WithinStepSteps(StepBuilder):
         if isinstance(handle.queries, ChunkCausalQueries):
             read = handle._bindings[0].declared
             layouts = tuple(self._chunk_layout(handle.array, read, segment) for segment in segments)
-            prior = self._chunk_layouts.setdefault(key, layouts)
+            by_label = self._chunk_layouts.setdefault(key, {})
+            prior = by_label.setdefault(handle._plan_label, layouts)
             if prior != layouts:
-                raise ValueError(f"Array {handle.array.name!r}: reads sharing {key!r} use different chunk layouts")
+                raise ValueError(
+                    f"Array {handle.array.name!r}: reads sharing {key!r}/{handle._plan_label!r} "
+                    "use different chunk layouts"
+                )
 
     def _chunk_layout(self, array: Array, read: Read, segment: Segment) -> ResourceChunkCausalLayout:
         if self._info is None:
@@ -607,7 +611,7 @@ class WithinStepSteps(StepBuilder):
                 next(iter(by_label.values()))
             )
             if isinstance(self._queries[key], ChunkCausalQueries):
-                layouts = self._chunk_layouts[key]
+                layouts = tuple(layout for label in by_label for layout in self._chunk_layouts[key][label])
                 if len(layouts) != len(segments):
                     raise ValueError(f"chunk resource {key!r} has {len(layouts)} layouts for {len(segments)} segments")
                 steps[key] = ChunkCausalAttentionStep(segments=tuple(segments), layouts=layouts)
