@@ -1979,6 +1979,19 @@ image (one latent) keeps the compiled stock ``vae.decode`` on that copy, which
 is faster for a single frame. False decodes everything with the compiled stock
 ``vae.decode`` on the shared instance.
 
+Placed on several ranks with ``tp_size`` (``configs/cosmos3_super_i2v_4step_tp2.yaml``
+puts it on both GPUs), the ``vae_decoder`` node splits every decode by rows over them
+(``HeightShardedDecoder`` in ``mstar/model/components/wan_vae.py``), images included:
+each rank decodes a band of every frame, a 3-row conv takes one row of each neighbour's
+band, the mid-block attention gathers the frame, and the uint8 frames are gathered at
+the end. On Super I2V at 832x480x121 (2x H200) the decode takes 0.95 s instead of 1.56 s.
+The frames match a one-rank decode up to conv-algorithm rounding: a few uint8 levels on
+a minority of pixels, since cuDNN picks its bf16 algorithms per shape. It needs
+``vae_decode_fast``.
+The decode runs in lockstep on the node's ranks, so a rank that fails mid-decode
+(an out-of-memory error, say) leaves the others waiting in a collective: at 1280x720x121 each
+rank peaks about 10 GB above its idle use on an H200, with about 60 GB to spare.
+
 Two or more requests at the same denoise step run one cross-request forward
 (``max_gen_batch_size``, default 8) for video, image, sound and action. With
 ``compile_denoise_batched`` (default on) the layer stack these steps share is
@@ -1990,6 +2003,15 @@ kernel-drift level. At 832x480x121 one request's guidance pair is 24k tokens,
 which already fills the GPU's GEMM and attention throughput, so a batch of N
 costs about N single steps: batching keeps requests in step rather than adding
 throughput.
+
+Captures (the text prefill and the denoise steps) are built for the guidance
+regime the deployment's default ``guidance_scale`` runs: both branches when it
+is not 1, the conditional branch alone when it is 1, which the distilled 4-step
+Super checkpoints force. A request in the other regime runs eager.
+``gen_capture_image`` lists the (height, width) image tiers to capture
+(default 192x320, 480x832 and 720x1280, each still bounded by
+``graph_max_latent_area``); the Super T2I config captures its 1024x1024
+default.
 
 The action policy (``cosmos3_edge_droid``, or ``cosmos3_edge`` with an action
 ``domain_name``) predicts a chunk of robot actions from the current observation:
