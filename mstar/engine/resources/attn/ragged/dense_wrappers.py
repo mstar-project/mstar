@@ -27,11 +27,20 @@ def _max_span(cu_seqlens: torch.Tensor) -> int:
     return int((cu_seqlens[1:] - cu_seqlens[:-1]).max())
 
 
-# Query rows from which every segment of a plan runs on its own fixed-length call,
-# on Hopper (sm_90), where it was measured: an H200 at 32/8 heads of 128 ran 2.7-9.4%
-# under one varlen call for two to eight segments of 1536-3552 rows, but 3-13% over it at
-# 1280, and mixed below.
-_FIXED_SEGMENT_MIN_ROWS = 1536
+# Per GPU architecture, the query rows from which every segment of a plan runs its own
+# fixed-length call. Measured on an H200 (sm_90) at 32/8 heads of 128: 2.7-9.4% under one
+# varlen call for two to eight segments of 1536-3552 rows, but 3-13% over it at 1280, and
+# mixed below. An architecture not listed keeps varlen for several segments until measured.
+_FIXED_SEGMENT_MIN_ROWS: dict[str, int] = {"sm_90": 1536}
+
+
+def fixed_segment_min_rows(device) -> int | None:
+    """The shortest segment, in query rows, for which a plan of several runs FA3's
+    fixed-length kernel once per segment on ``device``; None where that isn't available
+    or hasn't been measured to win."""
+    if fa3_fixed_into is None:
+        return None
+    return _FIXED_SEGMENT_MIN_ROWS.get(current_platform.arch(device))
 
 
 class _FixedSegments(NamedTuple):
@@ -42,7 +51,7 @@ class _FixedSegments(NamedTuple):
 
 class _DenseRaggedPrefillBase(_RaggedPrefillBase):
     """FA3 varlen over packed q/k/v. An eager non-causal plan of one segment, or
-    of segments all at least ``_FIXED_SEGMENT_MIN_ROWS`` long, runs FA3's
+    of segments all at least ``fixed_segment_min_rows`` long, runs FA3's
     fixed-length kernel once per segment instead, with the same output bit for bit.
 
     Graph mode reads the layout from the static buffers and launches at the
@@ -59,7 +68,7 @@ class _DenseRaggedPrefillBase(_RaggedPrefillBase):
         # the segments of a plan FA3's fixed-length kernel runs, else None
         self._fixed: _FixedSegments | None = None
         # several segments only where the split was measured to win
-        self._split_segments = fa3_fixed_into is not None and current_platform.cuda_capability(self.device) == (9, 0)
+        self._split_min_rows = fixed_segment_min_rows(self.device)
 
     def _plan_kernel(
         self, cu: torch.Tensor, kv_cu: torch.Tensor, total_tokens: int, causal: bool,
@@ -86,7 +95,8 @@ class _DenseRaggedPrefillBase(_RaggedPrefillBase):
         self._fixed = None
         if flash_attn_func is not None and not causal and cu_host.numel() == kv_host.numel() >= 2:
             if cu_host.numel() == 2 or (
-                self._split_segments and int((cu_host[1:] - cu_host[:-1]).min()) >= _FIXED_SEGMENT_MIN_ROWS
+                self._split_min_rows is not None
+                and int((cu_host[1:] - cu_host[:-1]).min()) >= self._split_min_rows
             ):
                 self._fixed = _FixedSegments(tuple(cu_host.tolist()), tuple(kv_host.tolist()))
 

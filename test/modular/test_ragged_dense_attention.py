@@ -184,6 +184,8 @@ def _count_fixed_segment_calls(monkeypatch):
 
     if dw.fa3_fixed_into is None:
         pytest.skip("no FA3 fixed-length entry point that writes into an output (fa3-fwd 0.0.2)")
+    if dw.fixed_segment_min_rows(DEVICE) is None:
+        pytest.skip(f"no per-segment threshold measured for {dw.current_platform.arch(DEVICE)}")
     calls, into = [], dw.fa3_fixed_into
     monkeypatch.setattr(dw, "fa3_fixed_into", lambda *a: calls.append(a[0].shape[1]) or into(*a))
     return dw, calls
@@ -231,13 +233,28 @@ def test_short_or_causal_segments_stay_on_varlen(monkeypatch):
     """One segment under the threshold keeps the whole plan on varlen, where the
     launches would cost more than they save; so does a causal plan."""
     dw, calls = _count_fixed_segment_calls(monkeypatch)
-    short = dw._FIXED_SEGMENT_MIN_ROWS - 1
+    short = dw.fixed_segment_min_rows(DEVICE) - 1
     for q_lens, causal in (([2048, short], False), ([2048, 2048], True)):
         q, k, v = (t.repeat(1, 8, 1) for t in qkv(sum(q_lens)))
         w = wrapper(num_qo_heads=HEADS * 8, num_kv_heads=HEADS * 8)
         w.plan(cu(q_lens), causal=causal)
         w.run(q, k, v)
     assert not calls
+
+
+def test_an_unmeasured_architecture_keeps_several_segments_on_varlen(monkeypatch):
+    """The per-segment threshold is looked up per architecture; one with no
+    measurement, or a build without the entry point, gets none."""
+    import mstar.engine.resources.attn.ragged.dense_wrappers as dw
+
+    monkeypatch.setattr(dw, "fa3_fixed_into", lambda *a: None)
+    monkeypatch.setattr(dw.current_platform, "arch", lambda device=None: "sm_90")
+    assert dw.fixed_segment_min_rows(DEVICE) == 1536
+    monkeypatch.setattr(dw.current_platform, "arch", lambda device=None: "sm_100")
+    assert dw.fixed_segment_min_rows(DEVICE) is None
+    monkeypatch.setattr(dw, "fa3_fixed_into", None)
+    monkeypatch.setattr(dw.current_platform, "arch", lambda device=None: "sm_90")
+    assert dw.fixed_segment_min_rows(DEVICE) is None
 
 
 def capture_wrapper(w):
