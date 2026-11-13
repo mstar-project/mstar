@@ -165,6 +165,9 @@ def test_the_search_writes_a_methods_file_whose_plans_spend_their_budget(tmp_pat
     per_prompt = json.loads((tmp_path / "per_prompt.json").read_text())
     assert set(per_prompt) == {"5", "6"} and set(per_prompt["5"]) == {"0", "1"}
     cal = Calibration.from_json(json.loads((tmp_path / "calibration.json").read_text()))
+    # other retained fractions are named by their percent, and keep that many first steps
+    kept = {m["name"]: m["step_cache"]["computed"] for m in search.searched_methods(cal, [6], retentions=(0.2, 0.5))}
+    assert {"dp0_b6", "dp0r_b6", "dp1r50_b6"} <= set(kept) and kept["dp1r50_b6"][:4] == [0, 1, 2, 3]
     agreement = search.plan_agreement(cal, [5, 6])
     assert len(agreement) == 2 and agreement[0].startswith("budget 5: each prompt's own plan shares ")
     assert Calibration.from_json(json.loads((tmp_path / "calibration.json").read_text())).sensitivity is not None

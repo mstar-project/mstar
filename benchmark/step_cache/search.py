@@ -34,6 +34,11 @@ from mstar.model.components.diffusion.step_cache import ExplicitPlan, Forecast
 _RETENTION = 0.2  # MagCache's default: the first fifth of the steps compute
 
 
+def _kept_tag(ratio: float) -> str:
+    """A retained plan's name tag: ``r`` at the default ratio, ``r<percent>`` at another."""
+    return "r" if ratio == _RETENTION else f"r{round(ratio * 100)}"
+
+
 def _method(name: str, label: str, computed: tuple[int, ...], steps: int, forecast: Forecast | None) -> dict[str, Any]:
     spec: dict[str, Any] = {"method": "plan", "computed": list(computed), "num_steps": steps}
     if forecast is not None:
@@ -43,16 +48,20 @@ def _method(name: str, label: str, computed: tuple[int, ...], steps: int, foreca
 
 def searched_methods(
     cal: Calibration, budgets: list[int], restarts: tuple[int, ...] = (), forecast: Forecast = Forecast(order=1),
+    retentions: tuple[float, ...] = (_RETENTION,),
 ) -> list[dict[str, Any]]:
-    """The methods file's entries for ``cal``: per budget, reuse and forecast plans, free and with retained steps,
-    unweighted and (when ``cal`` has them) weighted by sensitivity."""
-    retained = tuple(range(max(1, int(_RETENTION * cal.steps + 0.5))))
+    """The methods file's entries for ``cal``: per budget, reuse and forecast plans, free and with the first
+    ``retentions`` of the steps kept, unweighted and (when ``cal`` has them) weighted by sensitivity."""
+    kept_sets = [((), "", "free")]
+    for ratio in retentions:
+        retained = tuple(range(max(1, int(ratio * cal.steps + 0.5))))
+        kept_sets.append((retained, _kept_tag(ratio), f"first {len(retained)} kept"))
     variants = [("", "", None)]
     if cal.sensitivity:
         variants.append(("s", ", sensitivity-weighted", cal.sensitivity))
     out = []
     for budget in budgets:
-        for tag, forced, kept in (("", (), "free"), ("r", retained, f"first {len(retained)} kept")):
+        for forced, tag, kept in kept_sets:
             if budget < len(set(forced) | {0, cal.steps - 1, *restarts}):
                 continue
             for weight_tag, weight_label, weights in variants:
@@ -166,6 +175,8 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--sensitivity-prompts", type=int, default=0,
                         help="prompts to measure each step's effect on the final latents on (one run per step each)")
     parser.add_argument("--per-prompt", action="store_true", help="also write each prompt's own best plans")
+    parser.add_argument("--retention", default=str(_RETENTION),
+                        help="fractions of the steps the retained plans keep first, comma-separated")
     parser.add_argument("--compare", help="a methods file whose plans to price under the tables")
     parser.add_argument("--refine", action="append", default=[], help="a method name to hill-climb (repeatable)")
     parser.add_argument("--refine-prompts", type=int, default=2, help="prompts the hill-climb measures on")
@@ -189,7 +200,8 @@ def main(argv: list[str] | None = None) -> None:
     (out / "calibration.json").write_text(json.dumps(cal.to_json()))
     restarts = backend.restarts(**request)
     budgets = [int(b) for b in args.budgets.split(",")]
-    methods = searched_methods(cal, budgets, restarts, forecast)
+    retentions = tuple(float(r) for r in args.retention.split(","))
+    methods = searched_methods(cal, budgets, restarts, forecast, retentions)
     compared = json.loads(Path(args.compare).read_text()) if args.compare else []
     by_name = {method["name"]: method for method in methods + compared}
     for name in args.refine:
