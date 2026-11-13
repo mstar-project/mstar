@@ -226,13 +226,15 @@ class _Serve:
 
 
 def _generate_greedy(model, submodule, prompt_ids, max_tokens):
-    """The real serve loop (prefill -> decode to the request's loop cap or a
-    stop) on the sparse path; returns (generated tokens, _stored_rows before
-    retirement)."""
+    """The real serve loop (prefill -> decode -> check_stop, the decode loop capped at the
+    model's get_loop_caps as the graph runtime caps it) on the sparse path; returns
+    (generated tokens, what ended the reply: "stop" or "cap", _stored_rows before retirement)."""
     serve = _Serve(model, submodule)
     dsa = serve.resources[DSA_RESOURCE]
     info = serve.info(max_tokens)
+    cap = model.get_loop_caps(max_output_tokens=max_tokens)["decode_loop"]
     generated: list[int] = []
+    ended = "cap"
     try:
         out = serve.step("prefill", info, prompt_ids)
         new_token = out["new_token"][0]
@@ -240,21 +242,24 @@ def _generate_greedy(model, submodule, prompt_ids, max_tokens):
         generated.append(int(new_token.item()))
         next_token = out["text_inputs"][0]
         # as the runtime: a prefill stop ends the request (END_PARTITION); otherwise decode
-        if END_PARTITION not in submodule.check_stop(serve.rid, info, out):
+        if END_PARTITION in submodule.check_stop(serve.rid, info, out):
+            ended = "stop"
+        else:
             info.graph_walk = "decode"
-            for _ in range(model.get_loop_caps(max_output_tokens=max_tokens)["decode_loop"]):
+            for _ in range(cap):
                 out = serve.step("decode", info, next_token)
                 new_token = out["new_token"][0]
                 submodule.postprocess(serve.rid, info, out)
                 generated.append(int(new_token.item()))
                 next_token = out["text_inputs"][0]
                 if submodule.check_stop(serve.rid, info, out):
+                    ended = "stop"
                     break
         stored = _stored_rows(serve.resources[KV_RESOURCE], serve.rid)
         assert dsa.current() is not None  # the engine planned the declared DSA step
     finally:
         serve.close()
-    return generated, stored
+    return generated, ended, stored
 
 
 def _stored_rows(kv, rid):
@@ -314,8 +319,9 @@ def test_dsa_longctx_decode_past_topk(tmp_path):
     prompt_ids = torch.arange(10, 10 + PROMPT_LEN, device=DEVICE)
 
     # ---- (1) the sparse path serves to the loop cap ------------------
-    generated, stored = _generate_greedy(model, submodule, prompt_ids, MAX_TOKENS)
-    assert len(generated) == MAX_TOKENS, generated  # max_tokens counts the prefill-emitted token (vLLM semantics)
+    generated, ended, stored = _generate_greedy(model, submodule, prompt_ids, MAX_TOKENS)
+    # ignore_eos: only the loop cap ends it, and max_tokens counts the prefill's token (vLLM semantics)
+    assert ended == "cap" and len(generated) == MAX_TOKENS, (ended, generated)
     assert all(0 <= t < cfg.vocab_size for t in generated), generated
 
     # every stored token has its index keys, at its latent's slot

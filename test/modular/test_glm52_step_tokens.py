@@ -29,7 +29,7 @@ def test_longctx_config_window_fits_its_pages():
     assert model.config.dsa_shard_prefill
     # every captured prefill bucket runs in one pass, never in row chunks
     ladders = cfg["prefill_token_buckets"]["LLM"]["prefill"]
-    assert max(max(ladder) for ladder in ladders.values()) <= model.config.prefill_chunk_tokens
+    assert max(n for ladder in ladders.values() for n in ladder) <= model.config.prefill_window_tokens
     assert model.config.max_seq_len == cfg["max_seq_len"]
     assert set(cfg["resources"]) == {"kv"}
     res = cfg["resources"]["kv"]
@@ -37,53 +37,36 @@ def test_longctx_config_window_fits_its_pages():
     assert (res["max_num_pages"] - 1) * res["page_size"] >= model.config.max_seq_len
 
 
-def _kv(pages, page_size):
+def test_long_context_bind_refuses_an_empty_prefill_window():
+    cfg = Glm52ModelConfig(dsa_long_context=True, max_seq_len=262144, prefill_window_tokens=0)
+    with pytest.raises(ValueError, match="must be >= 1"):
+        _submodule(cfg).bind_node_resources({})
+
+
+@pytest.mark.parametrize("serving_ladder, captured", [
+    ({}, [32, 64]),  # the model's own ladder
+    ({"prefill": [32, 128]}, [32]),  # the serving config's
+])
+def test_no_ladder_captures_a_prefill_bucket_past_the_window(serving_ladder, captured):
+    """A prefill step past prefill_window_tokens plans no dense attention and runs eager in
+    windows, so the engine must capture no bucket that large, wherever its ladder came from."""
     import types
 
-    return types.SimpleNamespace(config=types.SimpleNamespace(
-        max_num_pages=pages, page_size=page_size, tokens_per_page=page_size))
-
-
-@pytest.mark.parametrize("change, resources, match", [
-    ({"prefill_chunk_tokens": 0}, {}, "must be >= 1"),
-    ({}, {"kv": _kv(4096, 96)}, "kv page_size=96 must be a power of two"),
-])
-def test_long_context_bind_refuses_what_it_cannot_serve(change, resources, match):
-    cfg = Glm52ModelConfig(dsa_long_context=True, max_seq_len=262144, **change)
-    with pytest.raises(ValueError, match=match):
-        _submodule(cfg).bind_node_resources(resources)
-
-
-def _captured_prefill(sub, ladder=None) -> list[int]:
-    """The prefill token counts the submodule captures at any batch size, once the engine has
-    applied ``ladder`` (a serving config's ``prefill_token_buckets``)."""
     import torch
 
-    from mstar.engine.accelerator_graph_config import apply_token_ladders
+    from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner
 
+    language_model = torch.nn.Module()
+    language_model.lm_head = torch.nn.Identity()
+    sub = Glm52LLMSubmodule(language_model, Glm52ModelConfig(
+        dsa_long_context=True, mla_absorb=True, max_seq_len=262144, prefill_window_tokens=64))
     sub._moe_capture_blocked = lambda tp_world_size: False
-    configs = sub.get_accelerator_graph_configs(torch.device("cpu"))
-    if ladder is not None:
-        apply_token_ladders("LLM", configs, {"prefill": ladder}, lambda walk, rows: None,
-                            lambda config: config.capture_batch_sizes)
-    return [n for c in configs if c.capture_graph_walk == "prefill"
-            for bs in c.capture_batch_sizes for n in c.get_total_tokens(bs)]
+    runner = AcceleratorGraphRunner(
+        submodule_name="LLM", submodule=sub, resources={}, step_runner=None,
+        device=torch.device("cpu"), autocast_dtype=None,
+        joint_comm_group=types.SimpleNamespace(world_size=1), num_slots=1, head_shards=1,
+        token_ladders=serving_ladder, step_tokens=lambda walk, rows: None)
+    got = sorted({spec.bucket.num_tokens for spec in runner._get_slot_specs()
+                  if spec.bucket.graph_walk == "prefill" and spec.bucket.bs == 1})
+    assert got == captured
 
-
-def test_long_context_captures_no_prefill_bucket_past_the_chunk():
-    chunk = max(Glm52LLMSubmodule.PREFILL_TOKEN_BUCKETS) // 2
-    cfg = Glm52ModelConfig(dsa_long_context=True, max_seq_len=262144, prefill_chunk_tokens=chunk)
-    prefill = _captured_prefill(_submodule(cfg))
-    assert prefill and max(prefill) <= chunk
-
-
-def test_long_context_captures_no_prefill_bucket_past_one_sparse_plan():
-    """A captured prefill attends in one sparse plan, which FlashInfer takes up to
-    sparse_mla.MAX_ROWS rows; a longer bucket runs eager, whose plan takes chunks, whatever
-    ladder the deployment names."""
-    from mstar.engine.resources.dsa import sparse_mla
-
-    cfg = Glm52ModelConfig(dsa_long_context=True, max_seq_len=262144,
-                           prefill_chunk_tokens=4 * sparse_mla.MAX_ROWS)
-    prefill = _captured_prefill(_submodule(cfg), {1: [1024], 2: [1024, 2 * sparse_mla.MAX_ROWS]})
-    assert 1024 in prefill and max(prefill) <= sparse_mla.MAX_ROWS

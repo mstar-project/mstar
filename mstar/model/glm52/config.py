@@ -88,7 +88,7 @@ class Glm52ModelConfig:
     dsa_long_context: bool = False
     # dsa_long_context: a prefill step longer than this runs the trunk in row chunks
     # of it, which bound its activations
-    prefill_chunk_tokens: int = 8192
+    prefill_window_tokens: int = 8192
     # under TP, each rank selects a block of a long prefill's rows, all-gathered after
     dsa_shard_prefill: bool = False
 

@@ -21,7 +21,6 @@ from mstar.engine.engine import Engine, ExecutingBatch
 from mstar.engine.resources import SamplingReqConfig
 from mstar.engine.resources.base import Resource
 from mstar.engine.resources.dsa import paged as dsa
-from mstar.engine.resources.dsa import sparse_mla
 from mstar.engine.resources.kv import manager as kv_mod
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.step import StepContext
@@ -372,40 +371,10 @@ def test_one_token_prompts_prefill_eager_in_long_mode():
     assert want[True] == want[False]
 
 
-@pytest.mark.parametrize("change, page_size, match", [
-    ({"max_seq_len": 64}, 128, "past index_topk"),  # reduced index_topk is 64
-    ({}, 18, "multiple of index_kpool"),  # index_kpool is 4: pools would straddle pages
-])
-def test_bind_refuses_what_long_context_cannot_serve(change, page_size, match):
-    sub = object.__new__(Glm5NextLLMSubmodule)
-    sub.config = dataclasses.replace(Glm5NextModelConfig.reduced_long_context(), **change)
-    kv = types.SimpleNamespace(kv_cache=types.SimpleNamespace(page_size=page_size))
-    with pytest.raises(ValueError, match=match):
-        sub.bind_node_resources({} if page_size is None else {KV_CACHE: kv})
-
-
-def test_long_context_captures_no_prefill_bucket_past_one_sparse_plan():
-    """A captured prefill plans its whole bucket in one sparse plan, which FlashInfer takes up to
-    sparse_mla.MAX_ROWS rows; a longer bucket the deployment names runs eager, whose plan takes chunks."""
-    from mstar.engine.accelerator_graph_config import apply_token_ladders
-
-    sub = object.__new__(Glm5NextLLMSubmodule)
-    sub.config = dataclasses.replace(Glm5NextModelConfig.reduced_long_context(), prefill_graphs=True)
-    sub.mtp_k, sub.node_resources = 0, {}
-    sub._moe_capture_blocked = lambda tp_world_size: False
-    sub._kda_max_slots = lambda: None
-    sub._kda_prefill_capturable = lambda: True
-    configs = sub.get_accelerator_graph_configs(torch.device("cpu"))
-    apply_token_ladders("LLM", configs, {"prefill": [128, 2 * sparse_mla.MAX_ROWS]}, lambda walk, rows: None,
-                        lambda config: config.capture_batch_sizes)
-    (prefill,) = [c for c in configs if c.capture_graph_walk == "prefill"]
-    assert prefill.get_total_tokens(1) == [128]
-
-
-def test_long_context_refuses_pools_per_page_off_a_power_of_two():
-    cfg = Glm5NextModelConfig.reduced_long_context()
-    with pytest.raises(ValueError, match="power of two"):
-        cfg.check_long_context(page_size=cfg.index_kpool * 3)
+def test_long_context_refuses_a_window_dense_attention_already_serves():
+    cfg = dataclasses.replace(Glm5NextModelConfig.reduced_long_context(), max_seq_len=64)
+    with pytest.raises(ValueError, match="past index_topk"):  # reduced index_topk is 64
+        cfg.check_long_context()
 
 
 @pytest.mark.parametrize("kwargs", [
@@ -425,31 +394,6 @@ def test_long_context_refuses_a_knob_it_would_misread(kwargs):
 def test_long_context_keys_need_the_long_context_path(key):
     with pytest.raises(ValueError, match="dsa_long_context"):
         Glm5NextModel("x", config_variant="reduced", **{key: 4096})
-
-
-@pytest.mark.parametrize("version, refused", [("0.6.17", True), ("0.6.18", False), (None, False)])
-def test_long_context_refuses_a_flashinfer_without_page_size(monkeypatch, version, refused):
-    # None: a stub module with no version, as the CPU tests install
-    fake = types.SimpleNamespace() if version is None else types.SimpleNamespace(__version__=version)
-    monkeypatch.setitem(sys.modules, "flashinfer", fake)
-    cfg = Glm5NextModelConfig.reduced_long_context()
-    if refused:
-        with pytest.raises(ValueError, match="FlashInfer >= 0.6.18"):
-            cfg.check_long_context()
-    else:
-        cfg.check_long_context()
-
-
-def test_a_non_bf16_cache_on_cuda_is_refused_at_load():
-    """The DSA kernels take a bf16 cache; on another the torch paths sync with the host and
-    nothing captures, so the node refuses it when it binds rather than serving slow."""
-    sub = object.__new__(Glm5NextLLMSubmodule)
-    sub.config = Glm5NextModelConfig.reduced_long_context()
-    cache = types.SimpleNamespace(dtype=torch.float16, device=torch.device("cuda"))
-    kv = types.SimpleNamespace(kv_cache=types.SimpleNamespace(page_size=128),
-                               layer_view=lambda *a: cache)
-    with pytest.raises(ValueError, match="bf16"):
-        sub.bind_node_resources({KV_CACHE: kv})
 
 
 def test_the_engine_plans_the_declared_dsa_step():

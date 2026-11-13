@@ -107,7 +107,7 @@ class Glm5NextMLAAttention(MLAAttention):
     def _attend_selected(self, slots, q_nope, q_pe, latent):
         """Write the step's latents, then attend each row over just its selected slots."""
         self._kv.write_kv(latent, None, layer_idx=self.kv_plane, label=LABEL)
-        return self._dsa.attend(self.kv_plane, q_nope, q_pe, slots, self.softmax_scale, LABEL)
+        return self._dsa.attend(self.kv_plane, q_nope, q_pe, slots, label=LABEL)
 
     def forward_block_row(
         self, hidden_states: torch.Tensor, row: int, latents: torch.Tensor,

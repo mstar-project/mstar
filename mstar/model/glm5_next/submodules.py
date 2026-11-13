@@ -28,7 +28,6 @@ from mstar.engine.resources import (
     SubmoduleStep,
 )
 from mstar.engine.resources.convenience import KDACallable
-from mstar.engine.resources.dsa import sparse_mla
 from mstar.engine.resources.dsa.config import DSAStep
 from mstar.engine.resources.linear_attn.config import LinearAttnStep
 from mstar.engine.resources.recurrent.config import RecurrentStep
@@ -100,19 +99,6 @@ def _upload(stager: PinnedStager, values: list, device: torch.device) -> torch.T
     stager.copy_(out, values)
     return out
 
-class _PrefillConfig(PackedAcceleratorGraphConfig):
-    """Packed prefill capture without the buckets past ``max_step_tokens``, whatever ladder the
-    deployment names: those steps run eager."""
-
-    def __init__(self, *, max_step_tokens: int | None, **kwargs):
-        super().__init__(**kwargs)
-        self.max_step_tokens = max_step_tokens
-
-    def get_total_tokens(self, bs: int) -> list[int]:
-        return [n for n in super().get_total_tokens(bs)
-                if self.max_step_tokens is None or n // self.total_tokens_multiplier <= self.max_step_tokens]
-
-
 class Glm5NextLLMSubmodule(ARNodeSubmodule):
     """Embed + 45 hybrid decoder layers + lm_head, one fat TP node, and with MTP the
     layer-45 draft module."""
@@ -154,13 +140,6 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         return self.mtp_k + 1
 
     def bind_node_resources(self, resources: dict) -> None:
-        if KV_CACHE in resources:
-            self.config.check_long_context(resources[KV_CACHE].kv_cache.page_size)
-            cache = resources[KV_CACHE].layer_view() if self.config.dsa_long_context else None
-            if cache is not None and cache.device.type == "cuda" and cache.dtype != torch.bfloat16:
-                # the DSA kernels take bf16; the torch paths sync with the host and capture nothing
-                raise ValueError(f"dsa_long_context serves a bf16 KV cache on CUDA, not "
-                                 f"{cache.dtype}: set the node's dtype to bfloat16")
         super().bind_node_resources(resources)
         kda = resources.get(KDA)
         self._kda = None if kda is None else KDACallable(resources[KDA_STATE], kda)
@@ -258,9 +237,7 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         elif self.config.prefill_graphs:
             # One graph per (rows, token bucket); a batch past every token bucket
             # runs eager rather than being split.
-            configs.append(_PrefillConfig(
-                # a captured prefill plans its whole bucket at once; the eager plan takes chunks
-                max_step_tokens=sparse_mla.MAX_ROWS if self.config.dsa_long_context else None,
+            configs.append(PackedAcceleratorGraphConfig(
                 capture_graph_walk="prefill",
                 capture_token_lengths=list(PREFILL_TOKEN_BUCKETS),
                 make_node_input=lambda n: ARNodeInputs(

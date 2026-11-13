@@ -20,7 +20,7 @@ def _cpu_flashinfer() -> types.ModuleType:
 
 
 from mstar.engine.resources import StepContext  # noqa: E402
-from mstar.engine.resources.dsa import paged, sparse_mla  # noqa: E402
+from mstar.engine.resources.dsa import paged  # noqa: E402
 from mstar.engine.resources.dsa.config import INDEX_PLANES, DSAStep  # noqa: E402
 from mstar.engine.resources.dsa.paged import DSAContext  # noqa: E402
 from mstar.model.glm52._testing import (  # noqa: E402
@@ -165,26 +165,27 @@ def test_paged_prefill_beyond_topk_equals_prefill_then_decode():
     torch.testing.assert_close(logits_whole[-1], stepwise[-1], rtol=1e-4, atol=1e-5)
 
 
-def test_prefill_chunks_join_at_their_boundaries(monkeypatch):
-    """Prefill rows score in chunks under PREFILL_SCORE_BYTES: the boundaries move no logit."""
+def test_prefill_chunks_join_at_their_boundaries():
+    """Prefill rows score in chunks under ``prefill_score_bytes``: the boundaries move no logit."""
     cfg = _cfg(topk=4)
     sub = Glm52LLMSubmodule(language_model=build_random_model(cfg, seed=2), config=cfg)
     tokens = torch.tensor([5, 9, 2, 7, 1, 8, 3, 6, 4, 11, 13])
     whole = _Driver(sub, cfg).step("prefill", tokens)
     # 3 rows of 11 keys' scores a chunk: 11 rows in 3, 3, 3, 2
-    monkeypatch.setattr(paged, "PREFILL_SCORE_BYTES", 4 * 11 * 3)
-    chunked = _Driver(sub, cfg).step("prefill", tokens)
+    driver = _Driver(sub, cfg)
+    driver.resources[DSA_RESOURCE].config.prefill_score_bytes = 4 * 11 * 3
+    chunked = driver.step("prefill", tokens)
     torch.testing.assert_close(chunked[-1], whole[-1], rtol=0, atol=0)
 
 
 def test_long_prefill_runs_in_row_chunks():
-    """A prefill past prefill_chunk_tokens runs the trunk in row chunks, with the one-pass
+    """A prefill past prefill_window_tokens runs the trunk in row chunks, with the one-pass
     logits, and plans no dense attention."""
     tokens = torch.tensor([5, 9, 2, 7, 1, 8, 3, 6, 4, 11, 13])
     cfg = _cfg(topk=4)
     sub = Glm52LLMSubmodule(language_model=build_random_model(cfg, seed=3), config=cfg)
     whole = _Driver(sub, cfg).step("prefill", tokens)
-    cfg.prefill_chunk_tokens = 3
+    cfg.prefill_window_tokens = 3
     passes = []
     hidden = sub._hidden
     sub._hidden = lambda ids, *a, **k: passes.append(ids.shape[0]) or hidden(ids, *a, **k)
@@ -209,7 +210,7 @@ def test_batched_long_prefill_chunks_cut_across_requests(monkeypatch):
     rids = ["a", "b"]
 
     def run(chunk):
-        cfg.prefill_chunk_tokens = chunk
+        cfg.prefill_window_tokens = chunk
         resources, runner = build_cpu_resources(cfg, rids, page_size=4)
         sub.bind_node_resources(resources)
         ars = [ARNodeInputs(input_ids=p, input_seq_len=p.shape[0]) for p in prompts]
@@ -276,10 +277,9 @@ class _FakeGroup:
         return torch.cat([self.blocks.get(r, filler) for r in range(self.world_size)], dim=dim)
 
 
-def test_sharded_prefill_selection_equals_unsharded(monkeypatch):
+def test_sharded_prefill_selection_equals_unsharded():
     """Each rank's block of a long span, gathered rank-major, is the unsharded selection; a
     span below the shard threshold and a decode row are selected whole on every rank."""
-    monkeypatch.setattr(sparse_mla, "SHARD_MIN_ROWS", 4)
     torch.manual_seed(9)
     nh, d, page, topk = 4, 8, 4, 16
     spans_n = [61, 9, 1]  # rows per request: sharded, too short to shard, decode
@@ -303,7 +303,7 @@ def test_sharded_prefill_selection_equals_unsharded(monkeypatch):
     group = _FakeGroup(4)
     for rank in range(4):  # the last rank's call sees every block
         group.rank = rank
-        got = paged.select(q, w, index_layer, ctx, group)
+        got = paged.select(q, w, index_layer, ctx, group, shard_min_rows=4)
     assert torch.equal(got, want)
 
 
