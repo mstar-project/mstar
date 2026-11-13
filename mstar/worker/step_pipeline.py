@@ -756,10 +756,9 @@ class StepPipeline:
         )
 
     def _wait_with_teardown(self, pending: PendingBatch) -> None:
-        """Service teardown while a serial step's CPU forward is outstanding.
-
-        A speculation may own a pre-plan, and a side step may still be admitting;
-        those paths keep their existing fences. In-flight rows stay protected.
+        """Service teardown during a CPU forward, after admission settles.
+        Speculation and side lanes retain their usual waits to protect
+        pre-plans and admissions; in-flight rows stay protected.
         """
         if self._speculation is not None or self._has_side_lane:
             return

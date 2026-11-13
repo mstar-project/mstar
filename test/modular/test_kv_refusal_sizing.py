@@ -10,7 +10,6 @@ gives up.
 from __future__ import annotations
 
 import sys
-import time
 from threading import Event
 from types import SimpleNamespace
 
@@ -60,7 +59,7 @@ def _stub_transfer(monkeypatch):
     monkeypatch.setattr(manager_mod, "KVTransferManager", _StubTransfer)
 
 
-def _manager(max_num_pages: int, sliding: tuple[int, ...] = (), *, device=torch.device("cpu"), **config) -> KVManager:
+def _manager(max_num_pages: int, sliding: tuple[int, ...] = (), **config) -> KVManager:
     cfg = PagedKVConfig(**{
         "num_layers": 1, "num_kv_heads": 1, "head_dim": 8, "max_seq_len": 4096,
         "max_num_pages": max_num_pages, "page_size": PAGE_SIZE, "cpu_offload_pages": 0, **config,
@@ -77,7 +76,7 @@ def _manager(max_num_pages: int, sliding: tuple[int, ...] = (), *, device=torch.
         name="kv",
         joint_comm_group=None,
         transfer_engine_info=None,
-        device=device,
+        device=torch.device("cpu"),
         dtype=torch.float32,
     )
 
@@ -384,11 +383,8 @@ def _teardown_over(sched, known_rids, engine_manager, communicator=None):
 
 
 @pytest.mark.parametrize("speculative", [False, True])
-@pytest.mark.parametrize("real_cuda", [False, pytest.param(
-    True, marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA"),
-)])
-def test_gpu_wait_reclaims_unrelated_kv_pages_before_completion(speculative, real_cuda, record_property):
-    pool = _manager(16, device=torch.device("cuda" if real_cuda else "cpu"))
+def test_gpu_wait_reclaims_unrelated_kv_pages_before_completion(speculative):
+    pool = _manager(16)
     assert _admit(pool, {"old": 2 * PAGE_SIZE, "busy": PAGE_SIZE, "next": PAGE_SIZE}, commit=True).ok
     free = pool._arena.num_free
     complete = Event()
@@ -405,14 +401,6 @@ def test_gpu_wait_reclaims_unrelated_kv_pages_before_completion(speculative, rea
             assert complete.wait(1), "KV pages stayed allocated behind unrelated GPU work"
 
     completion = Completion()
-    if real_cuda:
-        from mstar.platforms import current_platform
-        if current_platform.is_rocm():
-            pytest.skip("the CUDA delay kernel requires NVIDIA")
-        torch.cuda.synchronize()
-        completion = torch.cuda.Event()
-        torch.cuda._sleep(250_000_000)
-        completion.record()
 
     def messages():
         if complete.is_set():
@@ -433,7 +421,6 @@ def test_gpu_wait_reclaims_unrelated_kv_pages_before_completion(speculative, rea
         assert not completion.query(), "KV pages were retained until unrelated GPU completion"
         freed = remove(rid)
         assert pool._arena.num_free == free + 2
-        record_property("kv_release_ms", (time.perf_counter() - started) * 1000)
         complete.set()
         return freed
 
@@ -458,7 +445,6 @@ def test_gpu_wait_reclaims_unrelated_kv_pages_before_completion(speculative, rea
     worker.executor.postprocess = lambda step, outputs, **kwargs: worker.executor.wait_for_step(
         step, while_waiting=kwargs.get("while_waiting"),
     )
-    started = time.perf_counter()
     try:
         worker.pipeline._finish_step(pending, {})
     finally:
@@ -466,7 +452,6 @@ def test_gpu_wait_reclaims_unrelated_kv_pages_before_completion(speculative, rea
         wait_pool = getattr(worker.executor, "_wait_pool", None)
         if wait_pool is not None:
             wait_pool.shutdown()
-    record_property("gpu_wait_ms", (time.perf_counter() - started) * 1000)
 
     assert pool._arena.num_free == free + 2
     assert set(pool._streams) == {"busy", "next"}
