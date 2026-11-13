@@ -81,11 +81,13 @@ class Priority(RoundRobin):
     """Higher ``priorities`` first, round robin among equals and for an unlisted key (0);
     ahead of both, the keys that have waited their ``max_wait``, longest waiting first.
 
-    A chain also gives up its first step to a ready key above its own or one that has
-    waited its bound. Where round robin would ask anyway, its peek covers those keys
-    too, so a pass makes at most one. A key's wait is the chain steps this worker has
-    taken since that key last ran, so one that comes ready after an idle spell may go
-    first once."""
+    A chain also gives up its first step to a ready key above its own or one that has waited
+    its bound. Past its first step, a chain into a listed key gives way only to keys at its
+    own level or above, or one that has waited its bound; an unlisted chain, or one cutting
+    a prompt into chunks, to any ready key, as round robin's. Where round robin would ask
+    anyway, its peek covers those keys too, so a pass makes at most one. A key's wait is the
+    chain steps this worker has taken since that key last ran, so one that comes ready after
+    an idle spell may go first once."""
 
     def __init__(self, priorities: Mapping[Key, int], max_waits: Mapping[Key, int]):
         self.priorities = dict(priorities)
@@ -94,6 +96,10 @@ class Priority(RoundRobin):
         levels = set(self.priorities.values()) | {0}
         self._above = {
             level: frozenset(key for key, p in self.priorities.items() if p > level) for level in levels
+        }
+        # a listed chain's next steps go to its own level and above: its equals take turns with it
+        self._level_and_above = {
+            level: frozenset(key for key, p in self.priorities.items() if p >= level) for level in levels
         }
 
     def priority(self, key: Key) -> int:
@@ -115,9 +121,13 @@ class Priority(RoundRobin):
         return overdue + [key for key in by_priority if key not in overdue]
 
     def chain_yields(self, chain_key, consecutive, mid_prompt, peek):
-        if consecutive >= 1 or mid_prompt:
+        level = self.priority(chain_key)
+        if mid_prompt or (consecutive >= 1 and level == 0):
             return peek.has_ready_excluding(chain_key)
-        among = self._above[self.priority(chain_key)]
+        # A listed chain keeps its steps from the keys below it: its own next row is still in
+        # flight when this is asked, so a yield would hand the step to a lower key. A decode
+        # loop over a video's clips would otherwise take turns with another request's denoise.
+        among = self._above[level] if consecutive < 1 else self._level_and_above[level] - {chain_key}
         overdue = [key for _, key in self._waited(peek) if key != chain_key]
         if overdue:
             among = among | frozenset(overdue)

@@ -2650,7 +2650,10 @@ it gives way to other ready work. A model that returns ``WalkPriority`` entries 
 walks), a walk (all its nodes) or one (node, walk), and where entries overlap the most
 specific decides: a pair over a walk over a node. Keys with ready rows go in priority order,
 round robin among equals, and a chain gives way at once when a key above its own has a row
-the engine would take. That trades the other keys' steps for the listed one's latency, so it
+the engine would take. Past its first step, a chain into a listed key gives way only to keys at
+its level or above (or one past its ``max_wait``): its own next row is still in flight when it
+asks, so a yield to any ready key would hand every other step to a lower one, and a video's
+streamed decode would take turns clip by clip with another request's denoise. That trades the other keys' steps for the listed one's latency, so it
 suits a walk whose steps are short, such as a TTS model's prefill, whose first audio waits on
 it while decode streams have time to spare: list the walk, and every node on it is covered.
 A key that stays ready holds lower ones back for as long as it does, unless they have a
