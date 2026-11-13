@@ -2069,7 +2069,7 @@ own ``window_decoder`` partition; a request opts in per call:
    * - ``session_id``
      - —
      - Names a world-state session: the DiT node keeps the rollout's last window
-       and the decoder its context. The most recent ``session_store_size`` idle
+       and the stream's decode context. The most recent ``session_store_size`` idle
        sessions are kept; a session with a request in flight is never evicted, and
        a second request on it is refused until the first finishes.
    * - ``resume_session``

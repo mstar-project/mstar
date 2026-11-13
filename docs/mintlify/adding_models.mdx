@@ -790,7 +790,7 @@ A model that hasn't moved declares today's `ResourceStep` objects under `steps`,
 
 **Padding rows.** Under a captured graph, the batch is padded to the shape of the capture bucket, and `request_ids` also contains the ids of the padding rows. Declare segments for those rows in the same way as for real rows. The `zip(..., strict=True)` in the example above already does this.
 
-**The two leases.** `slot_lease` is the CUDA-graph slot on which this step will replay. It is `None` for an eager step. If a submodule's declaration differs between the captured case and the eager case, it must check the lease, not its own capture key. The capture key only says that the batch could be captured. The lease says that the batch was captured. For example, Cosmos3 packs both guidance branches into a single plan for the captured shape, and uses the dense backend otherwise.
+**The two leases.** `slot_lease` is the CUDA-graph slot on which this step will replay. It is `None` for an eager step. If a submodule's declaration differs between the captured case and the eager case, it must check the lease, not its own capture key. The capture key only says that the batch could be captured. The lease says that the batch was captured. For example, Cosmos3's captured denoise step declares both guidance branches, inside a request's guidance interval or not, and its eager step only the branches it runs.
 
 `piecewise_leases` names the inner regions of this node that hold their own slot for this step. Such a region declares, plans and commits its own work. Any resource that the region owns must therefore be excluded from the outer declaration. See [Piecewise CUDA graphs (capturing an inner loop)](/adding_models#piecewise-cuda-graphs-capturing-an-inner-loop).
 

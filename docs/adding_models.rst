@@ -2308,8 +2308,8 @@ example above already does this.
 It is ``None`` for an eager step. If a submodule's declaration differs between the
 captured case and the eager case, it must check the lease, not its own capture key. The
 capture key only says that the batch could be captured. The lease says that the batch was
-captured. For example, Cosmos3 packs both guidance branches into a single plan for the
-captured shape, and uses the dense backend otherwise.
+captured. For example, Cosmos3's captured denoise step declares both guidance branches,
+inside a request's guidance interval or not, and its eager step only the branches it runs.
 
 ``piecewise_leases`` names the inner regions of this node that hold their own slot for
 this step. Such a region declares, plans and commits its own work. Any resource that the

@@ -578,8 +578,8 @@ a sliding window (``AttentionConfig.sliding_window``) has no prefix cache yet: i
 
 A node on ``sp_size`` above 1 shares each step over its SP ranks along two axes. A model that
 declares a sequence shard (a ``SeqShard``: Qwen3.5's LLM, Qwen3-Omni's Thinker and the DiTs of
-LTX-2.5, Wan2.2 and MiniMax-H3; a ``SeqShardSpec``: Cosmos3's DiT and MiniMax-H3's video
-decoder) splits a step's tokens over them; its ``min_tokens`` runs smaller steps copied on every
+Cosmos3, LTX-2.5, Wan2.2 and MiniMax-H3; a ``SeqShardSpec``: MiniMax-H3's video decoder)
+splits a step's tokens over them; its ``min_tokens`` runs smaller steps copied on every
 rank instead (default 0: every step that can split does). A captured step decides from its
 bucket's size, not its prompt's. A node with a resource whose split steps run eagerly only (a
 ring, ``kv_gather``, a recurrent layer such as Qwen3.5's) never splits a captured step: the
