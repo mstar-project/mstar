@@ -744,6 +744,7 @@
                 <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.analysis.declaration_digest"><code class="docutils literal notranslate"><span class="pre">declaration_digest()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.analysis.deployment_problems"><code class="docutils literal notranslate"><span class="pre">deployment_problems()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.analysis.host_field_holders"><code class="docutils literal notranslate"><span class="pre">host_field_holders()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.analysis.position_key"><code class="docutils literal notranslate"><span class="pre">position_key()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.analysis.query_array"><code class="docutils literal notranslate"><span class="pre">query_array()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.analysis.shard_axis"><code class="docutils literal notranslate"><span class="pre">shard_axis()</span></code></a></li>
@@ -772,19 +773,22 @@
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.state.analysis.deployment_problems" title="mstar.engine.state.analysis.deployment_problems"><code class="xref py py-obj docutils literal notranslate"><span class="pre">deployment_problems</span></code></a>(model, resources)</p></td>
 <td><p>What a deployment's <code class="docutils literal notranslate"><span class="pre">resources:</span></code> block asks of the declarations that they can't do: of a sampler.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.state.analysis.position_key" title="mstar.engine.state.analysis.position_key"><code class="xref py py-obj docutils literal notranslate"><span class="pre">position_key</span></code></a>(array)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.state.analysis.host_field_holders" title="mstar.engine.state.analysis.host_field_holders"><code class="xref py py-obj docutils literal notranslate"><span class="pre">host_field_holders</span></code></a>(arrays)</p></td>
+<td><p>The arrays of <code class="docutils literal notranslate"><span class="pre">arrays</span></code> that hold host fields.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.state.analysis.position_key" title="mstar.engine.state.analysis.position_key"><code class="xref py py-obj docutils literal notranslate"><span class="pre">position_key</span></code></a>(array)</p></td>
 <td><p>The resource key of <code class="docutils literal notranslate"><span class="pre">array</span></code>'s positions: <code class="docutils literal notranslate"><span class="pre">thinker_pos</span></code> for <code class="docutils literal notranslate"><span class="pre">thinker_kv</span></code>, <code class="docutils literal notranslate"><span class="pre">rope</span></code> for any other name.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.state.analysis.query_array" title="mstar.engine.state.analysis.query_array"><code class="xref py py-obj docutils literal notranslate"><span class="pre">query_array</span></code></a>(array, read, arrays)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.state.analysis.query_array" title="mstar.engine.state.analysis.query_array"><code class="xref py py-obj docutils literal notranslate"><span class="pre">query_array</span></code></a>(array, read, arrays)</p></td>
 <td><p>The array whose segments lay out the queries of <code class="docutils literal notranslate"><span class="pre">array</span></code>'s <code class="docutils literal notranslate"><span class="pre">read</span></code>: the one of <code class="docutils literal notranslate"><span class="pre">arrays</span></code> its <code class="docutils literal notranslate"><span class="pre">queries</span></code> names, or else <code class="docutils literal notranslate"><span class="pre">array</span></code>.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.state.analysis.shard_axis" title="mstar.engine.state.analysis.shard_axis"><code class="xref py py-obj docutils literal notranslate"><span class="pre">shard_axis</span></code></a>(shard, arrays)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.state.analysis.shard_axis" title="mstar.engine.state.analysis.shard_axis"><code class="xref py py-obj docutils literal notranslate"><span class="pre">shard_axis</span></code></a>(shard, arrays)</p></td>
 <td><p>The axis <code class="docutils literal notranslate"><span class="pre">shard</span></code> cuts its label's tensors on, from how the reads on its nodes take queries on the label: 1 where they take rows of one span (<cite>Read.packed</cite> False, not <cite>segmented</cite>), every row cut alike; 0 where they take packed tokens or a request's segments in one row, cut contiguously.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.state.analysis.split_read_problems" title="mstar.engine.state.analysis.split_read_problems"><code class="xref py py-obj docutils literal notranslate"><span class="pre">split_read_problems</span></code></a>(declarations, ...)</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.state.analysis.split_read_problems" title="mstar.engine.state.analysis.split_read_problems"><code class="xref py py-obj docutils literal notranslate"><span class="pre">split_read_problems</span></code></a>(declarations, ...)</p></td>
 <td><p>What a read within a step asks of a node on SP ranks that no exchange serves, where <code class="docutils literal notranslate"><span class="pre">split</span></code> gives, per such node, the labels its sequence shard lists: SDPA (<code class="docutils literal notranslate"><span class="pre">sdpa_reads</span></code>, the reads a <code class="docutils literal notranslate"><span class="pre">backend:</span> <span class="pre">sdpa</span></code> block binds) over split keys, which runs outside the engine's resources and so would attend one rank's share, and a cross read whose queries split as well as its keys.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.state.analysis.state_declaration_problems" title="mstar.engine.state.analysis.state_declaration_problems"><code class="xref py py-obj docutils literal notranslate"><span class="pre">state_declaration_problems</span></code></a>(model)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.state.analysis.state_declaration_problems" title="mstar.engine.state.analysis.state_declaration_problems"><code class="xref py py-obj docutils literal notranslate"><span class="pre">state_declaration_problems</span></code></a>(model)</p></td>
 <td><p>Every problem with <code class="docutils literal notranslate"><span class="pre">model</span></code>'s declarations that its nodes and walks show.</p></td>
 </tr>
 </tbody>
@@ -818,6 +822,20 @@
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)">list</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>]</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.engine.state.analysis.host_field_holders">
+<span class="sig-prename descclassname"><span class="pre">mstar.engine.state.analysis.</span></span><span class="sig-name descname"><span class="pre">host_field_holders</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">arrays</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/state/analysis.html#host_field_holders"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.state.analysis.host_field_holders" title="Link to this definition">#</a></dt>
+<dd><p>The arrays of <code class="docutils literal notranslate"><span class="pre">arrays</span></code> that hold host fields.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>arrays</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Iterable" title="(in Python v3.12)"><em>Iterable</em></a><em>[</em><a class="reference internal" href="mstar.engine.state.contract.html#mstar.engine.state.contract.Array" title="mstar.engine.state.contract.Array"><em>Array</em></a><em>]</em>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)">list</a>[<a class="reference internal" href="mstar.engine.state.contract.html#mstar.engine.state.contract.Array" title="mstar.engine.state.contract.Array"><em>Array</em></a>]</p>
 </dd>
 </dl>
 </dd></dl>
@@ -962,6 +980,7 @@ from the declarations, so neither waits for a step that splits.</p>
     <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.analysis.declaration_digest"><code class="docutils literal notranslate"><span class="pre">declaration_digest()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.analysis.deployment_problems"><code class="docutils literal notranslate"><span class="pre">deployment_problems()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.analysis.host_field_holders"><code class="docutils literal notranslate"><span class="pre">host_field_holders()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.analysis.position_key"><code class="docutils literal notranslate"><span class="pre">position_key()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.analysis.query_array"><code class="docutils literal notranslate"><span class="pre">query_array()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.state.analysis.shard_axis"><code class="docutils literal notranslate"><span class="pre">shard_axis()</span></code></a></li>

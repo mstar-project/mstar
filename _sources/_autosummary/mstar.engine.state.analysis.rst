@@ -15,6 +15,7 @@ mstar.engine.state.analysis
    
       declaration_digest
       deployment_problems
+      host_field_holders
       position_key
       query_array
       shard_axis

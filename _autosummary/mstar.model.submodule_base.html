@@ -2989,9 +2989,11 @@ once, before any part of it runs.</p>
 <span class="sig-name descname"><span class="pre">step_is_input_free</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">graph_walk</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#NodeSubmodule.step_is_input_free"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.NodeSubmodule.step_is_input_free" title="Link to this definition">#</a></dt>
 <dd><p>Whether <code class="docutils literal notranslate"><span class="pre">declare_step</span></code> for this walk reads nothing from the inputs
 but their spans, and every real row has the span of the template row.
-Then the step a pre-plan declared over the bucket’s template rows is
-the step the forward would declare, and the engine runs it instead of
-declaring and admitting a second time.</p>
+Then the step a pre-plan declared over the bucket’s template rows is the
+step the forward would declare, and the engine runs it instead of
+declaring and admitting a second time, as it does for a pre-plan over the
+prepared rows. A node holding host fields can’t return True here, which
+<cite>Engine._check_host_fields</cite> checks at load.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><p><strong>graph_walk</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p>

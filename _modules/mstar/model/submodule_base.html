@@ -2425,9 +2425,11 @@ window.runMermaid = runMermaid;</script>
     <span class="k">def</span><span class="w"> </span><span class="nf">step_is_input_free</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">graph_walk</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""Whether ``declare_step`` for this walk reads nothing from the inputs</span>
 <span class="sd">        but their spans, and every real row has the span of the template row.</span>
-<span class="sd">        Then the step a pre-plan declared over the bucket's template rows is</span>
-<span class="sd">        the step the forward would declare, and the engine runs it instead of</span>
-<span class="sd">        declaring and admitting a second time."""</span>
+<span class="sd">        Then the step a pre-plan declared over the bucket's template rows is the</span>
+<span class="sd">        step the forward would declare, and the engine runs it instead of</span>
+<span class="sd">        declaring and admitting a second time, as it does for a pre-plan over the</span>
+<span class="sd">        prepared rows. A node holding host fields can't return True here, which</span>
+<span class="sd">        `Engine._check_host_fields` checks at load."""</span>
         <span class="k">del</span> <span class="n">graph_walk</span>
         <span class="k">return</span> <span class="kc">False</span></div>
 

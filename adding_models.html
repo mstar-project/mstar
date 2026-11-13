@@ -1578,7 +1578,9 @@ never ran changes nothing.</p>
 <p><code class="docutils literal notranslate"><span class="pre">kernel_settings(self)</span></code> is a temporary hook for what the engine doesn’t pick itself yet:
 <code class="docutils literal notranslate"><span class="pre">splits</span></code> and <code class="docutils literal notranslate"><span class="pre">decode_fmha</span></code> on a read, <code class="docutils literal notranslate"><span class="pre">splits</span></code> on a <code class="docutils literal notranslate"><span class="pre">GatedDeltaNet</span></code>, and
 <code class="docutils literal notranslate"><span class="pre">max_segments_per_request</span></code>, <code class="docutils literal notranslate"><span class="pre">max_segments_per_step</span></code>, <code class="docutils literal notranslate"><span class="pre">compile_op</span></code> and <code class="docutils literal notranslate"><span class="pre">workspace_mb</span></code> on a
-<code class="docutils literal notranslate"><span class="pre">Block</span></code> read. It refuses anything else.</p>
+<code class="docutils literal notranslate"><span class="pre">Block</span></code> read. Under an array’s name it sets the default size of the array’s pool, <code class="docutils literal notranslate"><span class="pre">max_num_pages</span></code>
+on a paged array and <code class="docutils literal notranslate"><span class="pre">max_slots</span></code> on a <code class="docutils literal notranslate"><span class="pre">Value</span></code> with tensor fields, which a deployment’s
+<code class="docutils literal notranslate"><span class="pre">resources:</span></code> block overrides. It refuses anything else.</p>
 <section id="resource-specs">
 <h3>Resource specs<a class="headerlink" href="#resource-specs" title="Link to this heading">#</a></h3>
 <p>The engine builds these specs from <code class="docutils literal notranslate"><span class="pre">declare_state</span></code>, and a deployment tunes them under the
@@ -1916,43 +1918,28 @@ dropped bucket: its steps replay the plain bucket. Lean resources: the LoRA pool
 steps none of whose rows names an adapter, in every kind of capture; and a sampler (see
 <code class="docutils literal notranslate"><span class="pre">SamplingReqConfig</span></code>), for steps whose rows all sample greedily, in batched captures. A
 model declares nothing for these.</p>
-<p>Orpheus, which hasn’t moved yet, writes four specs for its one autoregressive node. Its
-<code class="docutils literal notranslate"><span class="pre">snac_decoder</span></code> node appears in no spec, so it receives no resources:</p>
+<p>Orpheus’s declarations build four specs for its one autoregressive node, a <code class="docutils literal notranslate"><span class="pre">KVSpec</span></code>, an
+<code class="docutils literal notranslate"><span class="pre">AttentionSpec</span></code>, a <code class="docutils literal notranslate"><span class="pre">PositionSpec</span></code> and a <code class="docutils literal notranslate"><span class="pre">SamplerSpec</span></code>. Its <code class="docutils literal notranslate"><span class="pre">snac_decoder</span></code> node appears
+in no declaration, so it receives no state:</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="c1"># mstar/model/orpheus/config.py: the keys its SampledTokenDecoder reads, and its attention's</span>
 <span class="n">KV_CACHE</span><span class="p">,</span> <span class="n">SAMPLER</span><span class="p">,</span> <span class="n">ROPE</span> <span class="o">=</span> <span class="n">keys</span><span class="o">.</span><span class="n">KV_CACHE</span><span class="p">,</span> <span class="n">keys</span><span class="o">.</span><span class="n">SAMPLER</span><span class="p">,</span> <span class="n">keys</span><span class="o">.</span><span class="n">ROPE</span>
 <span class="n">ATTN</span> <span class="o">=</span> <span class="s2">"attn"</span>
 
 <span class="c1"># mstar/model/orpheus/orpheus_model.py</span>
-<span class="k">def</span><span class="w"> </span><span class="nf">get_node_resources</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="n">NodeResourceSpec</span><span class="p">]:</span>
-    <span class="n">kv_config</span> <span class="o">=</span> <span class="n">PagedKVConfig</span><span class="p">(</span>
-        <span class="n">num_layers</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">num_hidden_layers</span><span class="p">,</span>
-        <span class="n">num_kv_heads</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">num_key_value_heads</span><span class="p">,</span>
-        <span class="n">head_dim</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">head_dim</span><span class="p">,</span>
-        <span class="n">max_seq_len</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">max_position_embeddings</span><span class="p">,</span>
-        <span class="n">num_qo_heads</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">num_attention_heads</span><span class="p">,</span>
-    <span class="p">)</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">declare_state</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="n">Array</span> <span class="o">|</span> <span class="n">Sampler</span><span class="p">]:</span>
+    <span class="n">c</span><span class="p">,</span> <span class="n">scaling</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">rope_scaling</span>
     <span class="k">return</span> <span class="p">[</span>
-        <span class="n">KVSpec</span><span class="p">(</span><span class="n">resource_key</span><span class="o">=</span><span class="n">KV_CACHE</span><span class="p">,</span> <span class="n">nodes</span><span class="o">=</span><span class="p">{</span><span class="s2">"LLM"</span><span class="p">},</span> <span class="n">config</span><span class="o">=</span><span class="n">kv_config</span><span class="p">),</span>
-        <span class="n">AttentionSpec</span><span class="p">(</span>
-            <span class="n">resource_key</span><span class="o">=</span><span class="n">ATTN</span><span class="p">,</span> <span class="n">nodes</span><span class="o">=</span><span class="p">{</span><span class="s2">"LLM"</span><span class="p">},</span>
-            <span class="n">config</span><span class="o">=</span><span class="n">AttentionConfig</span><span class="p">(</span><span class="n">kv_cache</span><span class="o">=</span><span class="n">KV_CACHE</span><span class="p">),</span>
+        <span class="n">Array</span><span class="p">(</span>
+            <span class="n">KV_CACHE</span><span class="p">,</span> <span class="n">nodes</span><span class="o">=</span><span class="p">{</span><span class="s2">"LLM"</span><span class="p">},</span> <span class="n">layers</span><span class="o">=</span><span class="nb">frozenset</span><span class="p">(</span><span class="nb">range</span><span class="p">(</span><span class="n">c</span><span class="o">.</span><span class="n">num_hidden_layers</span><span class="p">)),</span>
+            <span class="n">entry</span><span class="o">=</span><span class="n">KVEntry</span><span class="p">(</span><span class="n">heads</span><span class="o">=</span><span class="n">c</span><span class="o">.</span><span class="n">num_key_value_heads</span><span class="p">,</span> <span class="n">head_dim</span><span class="o">=</span><span class="n">c</span><span class="o">.</span><span class="n">head_dim</span><span class="p">),</span> <span class="n">max_len</span><span class="o">=</span><span class="n">c</span><span class="o">.</span><span class="n">max_position_embeddings</span><span class="p">,</span>
+            <span class="n">positions</span><span class="o">=</span><span class="n">Positions</span><span class="p">(</span><span class="n">rope</span><span class="o">=</span><span class="n">Rope</span><span class="p">(</span>
+                <span class="n">theta</span><span class="o">=</span><span class="n">c</span><span class="o">.</span><span class="n">rope_theta</span><span class="p">,</span> <span class="n">scale</span><span class="o">=</span><span class="n">scaling</span><span class="p">[</span><span class="s2">"factor"</span><span class="p">],</span> <span class="n">low_freq_factor</span><span class="o">=</span><span class="n">scaling</span><span class="p">[</span><span class="s2">"low_freq_factor"</span><span class="p">],</span>
+                <span class="n">high_freq_factor</span><span class="o">=</span><span class="n">scaling</span><span class="p">[</span><span class="s2">"high_freq_factor"</span><span class="p">],</span>
+                <span class="n">old_context_len</span><span class="o">=</span><span class="n">scaling</span><span class="p">[</span><span class="s2">"original_max_position_embeddings"</span><span class="p">],</span>
+            <span class="p">)),</span>
+            <span class="n">reads</span><span class="o">=</span><span class="p">{</span><span class="n">ATTN</span><span class="p">:</span> <span class="n">Read</span><span class="p">(</span><span class="n">mask</span><span class="o">=</span><span class="n">Causal</span><span class="p">(),</span> <span class="n">op</span><span class="o">=</span><span class="n">Attend</span><span class="p">(</span><span class="n">q_heads</span><span class="o">=</span><span class="n">c</span><span class="o">.</span><span class="n">num_attention_heads</span><span class="p">))},</span>
         <span class="p">),</span>
-        <span class="n">SamplerSpec</span><span class="p">(</span>
-            <span class="n">resource_key</span><span class="o">=</span><span class="n">SAMPLER</span><span class="p">,</span> <span class="n">nodes</span><span class="o">=</span><span class="p">{</span><span class="s2">"LLM"</span><span class="p">},</span>
-            <span class="n">vocab_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">vocab_size</span><span class="p">,</span>
-            <span class="n">enable_repetition_penalty</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
-        <span class="p">),</span>
-        <span class="n">PositionSpec</span><span class="p">(</span>
-            <span class="n">resource_key</span><span class="o">=</span><span class="n">ROPE</span><span class="p">,</span> <span class="n">nodes</span><span class="o">=</span><span class="p">{</span><span class="s2">"LLM"</span><span class="p">},</span>
-            <span class="n">config</span><span class="o">=</span><span class="n">PositionConfig</span><span class="p">(</span>
-                <span class="n">kv_cache</span><span class="o">=</span><span class="n">KV_CACHE</span><span class="p">,</span>
-                <span class="n">rope_theta</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">rope_theta</span><span class="p">,</span>
-                <span class="n">rope_scale</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">rope_scaling</span><span class="p">[</span><span class="s2">"factor"</span><span class="p">],</span>
-                <span class="n">low_freq_factor</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">rope_scaling</span><span class="p">[</span><span class="s2">"low_freq_factor"</span><span class="p">],</span>
-                <span class="n">high_freq_factor</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">rope_scaling</span><span class="p">[</span><span class="s2">"high_freq_factor"</span><span class="p">],</span>
-                <span class="n">old_context_len</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">rope_scaling</span><span class="p">[</span><span class="s2">"original_max_position_embeddings"</span><span class="p">],</span>
-            <span class="p">),</span>
-        <span class="p">),</span>
+        <span class="n">Sampler</span><span class="p">(</span><span class="n">SAMPLER</span><span class="p">,</span> <span class="n">nodes</span><span class="o">=</span><span class="p">{</span><span class="s2">"LLM"</span><span class="p">},</span> <span class="n">vocab_size</span><span class="o">=</span><span class="n">c</span><span class="o">.</span><span class="n">vocab_size</span><span class="p">,</span> <span class="n">penalty</span><span class="o">=</span><span class="kc">True</span><span class="p">),</span>
     <span class="p">]</span>
 </pre></div>
 </div>
@@ -4435,10 +4422,9 @@ each against a reference output, and writes the winners with where they were mea
 <h2>Worked example: Orpheus<a class="headerlink" href="#worked-example-orpheus" title="Link to this heading">#</a></h2>
 <p>Orpheus (<code class="docutils literal notranslate"><span class="pre">mstar/model/orpheus/</span></code>) is a small and complete reference. It is a TTS model. A
 Llama 3.2 3B LLM emits audio tokens, and a SNAC decoder converts them into 24 kHz PCM.</p>
-<p>Orpheus hasn’t moved to declarations. The two nodes have different needs. The LLM declares
-the four standard resources, shown under <a class="reference internal" href="#resource-specs">Resource specs</a>. No spec names <code class="docutils literal notranslate"><span class="pre">snac_decoder</span></code>,
-so that node receives no resources. The SNAC decoder instead declares how it must be run,
-using two class attributes on the submodule:</p>
+<p>The two nodes have different needs. The LLM declares a paged array and a sampler, shown under
+<a class="reference internal" href="#resource-specs">Resource specs</a>. No declaration names <code class="docutils literal notranslate"><span class="pre">snac_decoder</span></code>, so that node receives no state. The
+SNAC decoder instead declares how it must be run, using two class attributes on the submodule:</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">class</span><span class="w"> </span><span class="nc">SNACDecoderSubmodule</span><span class="p">(</span><span class="n">NodeSubmodule</span><span class="p">):</span>
     <span class="n">disable_torch_compile</span> <span class="o">=</span> <span class="kc">True</span>   <span class="c1"># runs in fp32, without compilation</span>
     <span class="n">disable_autocast</span> <span class="o">=</span> <span class="kc">True</span>
@@ -4455,9 +4441,10 @@ using two class attributes on the submodule:</p>
 </pre></div>
 </div>
 <p><code class="docutils literal notranslate"><span class="pre">process_prompt</span></code> formats the string <code class="docutils literal notranslate"><span class="pre">&quot;{voice}:</span> <span class="pre">{text}&quot;</span></code>, tokenizes it, wraps the ids in
-the model’s start and end tokens, and returns <code class="docutils literal notranslate"><span class="pre">{&quot;text_inputs&quot;:</span> <span class="pre">[ids]}</span></code>.
+the model’s start and end tokens, and returns <code class="docutils literal notranslate"><span class="pre">{&quot;text_inputs&quot;:</span> <span class="pre">[ids]}</span></code>, with its layout under
+<code class="docutils literal notranslate"><span class="pre">state_layout</span></code>.
 <code class="docutils literal notranslate"><span class="pre">get_submodule</span></code> builds either the Llama LLM submodule, a <code class="docutils literal notranslate"><span class="pre">SampledTokenDecoder</span></code> that
-declares little beyond its walk names, resource steps and capture buckets, or the SNAC
+declares little beyond its walk names, the state its steps list and capture buckets, or the SNAC
 decoder submodule, and caches the result. The SNAC submodule emits int16
 PCM, which the default <code class="docutils literal notranslate"><span class="pre">postprocess</span></code> passes through as raw bytes.</p>
 <p>Orpheus also demonstrates the async partition API, described in the next section. The LLM

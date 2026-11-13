@@ -1295,8 +1295,9 @@ default.</p>
 <span class="sig-prename descclassname"><span class="pre">mstar.model.utils.</span></span><span class="sig-name descname"><span class="pre">check_kv_pools_fit</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">model</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">config</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">config_path</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">log</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/utils.html#check_kv_pools_fit"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.utils.check_kv_pools_fit" title="Link to this definition">#</a></dt>
 <dd><p>Refuse a <code class="docutils literal notranslate"><span class="pre">max_concurrent_requests</span></code> the model’s KV caches cannot hold.</p>
 <p>A request keeps its pages from prefill to its last token. Past a pool, a
-prefill batch is refused and the worker offloads decoding requests to
-admit it, which costs far more than queueing would. So the cap’s requests
+prefill batch is refused. With host pages (<code class="docutils literal notranslate"><span class="pre">cpu_offload_pages</span></code>) the worker
+offloads decoding requests to admit it, which costs far more than queueing
+would. Without them it retries until requests time out. So the cap’s requests
 at full length must fit each cache next to its sink page; the conductor
 queues the rest. Warnings go to the model’s <code class="docutils literal notranslate"><span class="pre">log</span></code>.</p>
 <dl class="field-list simple">

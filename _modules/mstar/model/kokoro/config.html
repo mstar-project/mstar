@@ -1057,10 +1057,12 @@ window.runMermaid = runMermaid;</script>
 
 <span class="c1"># Names of the tensors ``process_prompt`` produces for one request.</span>
 <span class="n">PHONEME_IDS</span> <span class="o">=</span> <span class="s2">"phoneme_ids"</span>
-<span class="n">PHONEME_LENS</span> <span class="o">=</span> <span class="s2">"phoneme_lens"</span>
 <span class="n">REF_STYLE</span> <span class="o">=</span> <span class="s2">"ref_style"</span>
 <span class="n">SPEED</span> <span class="o">=</span> <span class="s2">"speed"</span>
 <span class="n">AUDIO_CHUNK</span> <span class="o">=</span> <span class="s2">"audio_chunk"</span>
+<span class="c1"># Each chunk's length as host ints, from the request's kwargs to the synth walk's ``step_metadata``. The kwargs share a</span>
+<span class="c1"># namespace with the client's, hence the model-prefixed name.</span>
+<span class="n">CHUNK_LENGTHS</span> <span class="o">=</span> <span class="s2">"kokoro_chunk_lengths"</span>
 
 <span class="c1"># Token id used for both the &lt;bos&gt; and the &lt;eos&gt; the model expects around a</span>
 <span class="c1"># phoneme sequence, and for padding (masked out by the lengths).</span>

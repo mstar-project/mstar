@@ -1070,7 +1070,8 @@ window.runMermaid = runMermaid;</script>
 <span class="n">TRANSCRIBE_WALK</span> <span class="o">=</span> <span class="s2">"transcribe"</span>
 <span class="n">WAVEFORM</span> <span class="o">=</span> <span class="s2">"waveform"</span>
 <span class="n">TOKEN_IDS</span> <span class="o">=</span> <span class="s2">"token_ids"</span>
-<span class="c1"># the encoder's varlen self-attention (a ragged attention resource)</span>
+<span class="c1"># the encoder's tokens within one step, and its varlen self-attention over them</span>
+<span class="n">ENCODER_TOKENS</span> <span class="o">=</span> <span class="s2">"encoder_tokens"</span>
 <span class="n">ENCODER_ATTN</span> <span class="o">=</span> <span class="s2">"encoder_attn"</span>
 
 <span class="n">SIZES</span> <span class="o">=</span> <span class="p">(</span><span class="s2">"300m"</span><span class="p">,</span> <span class="s2">"1b"</span><span class="p">,</span> <span class="s2">"3b"</span><span class="p">,</span> <span class="s2">"7b"</span><span class="p">)</span>

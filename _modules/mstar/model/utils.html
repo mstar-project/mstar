@@ -1858,8 +1858,9 @@ window.runMermaid = runMermaid;</script>
 <span class="w">    </span><span class="sd">"""Refuse a ``max_concurrent_requests`` the model's KV caches cannot hold.</span>
 
 <span class="sd">    A request keeps its pages from prefill to its last token. Past a pool, a</span>
-<span class="sd">    prefill batch is refused and the worker offloads decoding requests to</span>
-<span class="sd">    admit it, which costs far more than queueing would. So the cap's requests</span>
+<span class="sd">    prefill batch is refused. With host pages (``cpu_offload_pages``) the worker</span>
+<span class="sd">    offloads decoding requests to admit it, which costs far more than queueing</span>
+<span class="sd">    would. Without them it retries until requests time out. So the cap's requests</span>
 <span class="sd">    at full length must fit each cache next to its sink page; the conductor</span>
 <span class="sd">    queues the rest. Warnings go to the model's ``log``.</span>
 <span class="sd">    """</span>
@@ -1870,8 +1871,9 @@ window.runMermaid = runMermaid;</script>
     <span class="k">if</span> <span class="n">cap</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
         <span class="n">log</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
             <span class="s2">"</span><span class="si">%s</span><span class="s2"> sets no max_concurrent_requests: past the requests the KV caches "</span>
-            <span class="s2">"hold, the worker offloads decoding requests to admit new ones instead "</span>
-            <span class="s2">"of queueing them"</span><span class="p">,</span> <span class="n">config_path</span><span class="p">,</span>
+            <span class="s2">"hold, new ones aren't queued. A cache with cpu_offload_pages offloads "</span>
+            <span class="s2">"decoding requests to admit them, and one without stalls until requests "</span>
+            <span class="s2">"time out"</span><span class="p">,</span> <span class="n">config_path</span><span class="p">,</span>
         <span class="p">)</span>
         <span class="k">return</span>
     <span class="k">if</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">cap</span><span class="p">,</span> <span class="nb">int</span><span class="p">)</span> <span class="ow">or</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">cap</span><span class="p">,</span> <span class="nb">bool</span><span class="p">)</span> <span class="ow">or</span> <span class="n">cap</span> <span class="o">&lt;</span> <span class="mi">1</span><span class="p">:</span>

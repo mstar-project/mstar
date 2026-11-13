@@ -1037,7 +1037,7 @@ window.runMermaid = runMermaid;</script>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">hashlib</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">json</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Collection</span><span class="p">,</span> <span class="n">Mapping</span><span class="p">,</span> <span class="n">Sequence</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Collection</span><span class="p">,</span> <span class="n">Iterable</span><span class="p">,</span> <span class="n">Mapping</span><span class="p">,</span> <span class="n">Sequence</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">fields</span><span class="p">,</span> <span class="n">is_dataclass</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">itertools</span><span class="w"> </span><span class="kn">import</span> <span class="n">product</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">TYPE_CHECKING</span><span class="p">,</span> <span class="n">get_origin</span>
@@ -1091,6 +1091,14 @@ window.runMermaid = runMermaid;</script>
 <span class="k">def</span><span class="w"> </span><span class="nf">position_key</span><span class="p">(</span><span class="n">array</span><span class="p">:</span> <span class="n">Array</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span><span class="p">:</span>
 <span class="w">    </span><span class="sd">"""The resource key of ``array``'s positions: ``thinker_pos`` for ``thinker_kv``, ``rope`` for any other name."""</span>
     <span class="k">return</span> <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">array</span><span class="o">.</span><span class="n">name</span><span class="o">.</span><span class="n">removesuffix</span><span class="p">(</span><span class="s1">'_kv'</span><span class="p">)</span><span class="si">}</span><span class="s2">_pos"</span> <span class="k">if</span> <span class="n">array</span><span class="o">.</span><span class="n">name</span><span class="o">.</span><span class="n">endswith</span><span class="p">(</span><span class="s2">"_kv"</span><span class="p">)</span> <span class="k">else</span> <span class="s2">"rope"</span></div>
+
+
+
+<div class="viewcode-block" id="host_field_holders">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.state.analysis.html#mstar.engine.state.analysis.host_field_holders">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">host_field_holders</span><span class="p">(</span><span class="n">arrays</span><span class="p">:</span> <span class="n">Iterable</span><span class="p">[</span><span class="n">Array</span><span class="p">])</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="n">Array</span><span class="p">]:</span>
+<span class="w">    </span><span class="sd">"""The arrays of ``arrays`` that hold host fields."""</span>
+    <span class="k">return</span> <span class="p">[</span><span class="n">array</span> <span class="k">for</span> <span class="n">array</span> <span class="ow">in</span> <span class="n">arrays</span> <span class="k">if</span> <span class="n">array</span><span class="o">.</span><span class="n">entry</span><span class="o">.</span><span class="n">host</span><span class="p">]</span></div>
 
 
 
@@ -1183,7 +1191,7 @@ window.runMermaid = runMermaid;</script>
 
 <span class="k">def</span><span class="w"> </span><span class="nf">_host_problems</span><span class="p">(</span><span class="n">arrays</span><span class="p">:</span> <span class="n">Sequence</span><span class="p">[</span><span class="n">Array</span><span class="p">],</span> <span class="n">kv_labels</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">object</span><span class="p">]])</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">[</span><span class="nb">str</span><span class="p">]:</span>
 <span class="w">    </span><span class="sd">"""A prefix hit restores a Value's snapshot, and a snapshot doesn't carry host fields yet."""</span>
-    <span class="n">holders</span> <span class="o">=</span> <span class="p">[</span><span class="n">array</span> <span class="k">for</span> <span class="n">array</span> <span class="ow">in</span> <span class="n">arrays</span> <span class="k">if</span> <span class="n">array</span><span class="o">.</span><span class="n">entry</span><span class="o">.</span><span class="n">host</span><span class="p">]</span>
+    <span class="n">holders</span> <span class="o">=</span> <span class="n">host_field_holders</span><span class="p">(</span><span class="n">arrays</span><span class="p">)</span>
     <span class="k">if</span> <span class="ow">not</span> <span class="n">holders</span><span class="p">:</span>
         <span class="k">return</span> <span class="p">[]</span>
     <span class="n">keyed</span> <span class="o">=</span> <span class="p">{</span>

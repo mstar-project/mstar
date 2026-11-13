@@ -1050,13 +1050,15 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">from</span><span class="w"> </span><span class="nn">pathlib</span><span class="w"> </span><span class="kn">import</span> <span class="n">Path</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">Any</span>
 
-<span class="c1"># Talker resources: the base LM's paged KV + attention + RoPE positions, and</span>
-<span class="c1"># the residual LM's paged KV + attention (it has no RoPE).</span>
+<span class="c1"># The Talker's arrays and reads: the base LM's and the residual LM's paged KV</span>
+<span class="c1"># and attention, and each request's progress.</span>
 <span class="n">BASE_KV</span> <span class="o">=</span> <span class="s2">"base_kv"</span>
 <span class="n">BASE_ATTN</span> <span class="o">=</span> <span class="s2">"base_attn"</span>
-<span class="n">BASE_POS</span> <span class="o">=</span> <span class="s2">"base_pos"</span>
 <span class="n">RES_KV</span> <span class="o">=</span> <span class="s2">"res_kv"</span>
 <span class="n">RES_ATTN</span> <span class="o">=</span> <span class="s2">"res_attn"</span>
+<span class="n">TALKER_STEP</span> <span class="o">=</span> <span class="s2">"talker_step"</span>
+<span class="c1"># The engine's default page, restated since a model on the state contract doesn't import the engine's resources.</span>
+<span class="n">PAGE_TOKENS</span> <span class="o">=</span> <span class="mi">128</span>
 
 <span class="c1"># Special token ids of the VoxCPM2 tokenizer (``VoxCPM2Model.__init__``).</span>
 <span class="n">AUDIO_START_TOKEN</span> <span class="o">=</span> <span class="mi">101</span>
@@ -1079,7 +1081,9 @@ window.runMermaid = runMermaid;</script>
 <span class="n">MIN_LEN_KEY</span> <span class="o">=</span> <span class="s2">"voxcpm2_min_len"</span>
 <span class="c1"># content hash of the reference clip, the RefEncoder's memo key with the mode</span>
 <span class="n">REF_DIGEST_KEY</span> <span class="o">=</span> <span class="s2">"voxcpm2_ref_digest"</span>
-<span class="n">TALKER_STEP_METADATA</span> <span class="o">=</span> <span class="p">(</span><span class="n">PATCH_BUDGET_KEY</span><span class="p">,</span> <span class="n">PROMPT_MODE_KEY</span><span class="p">,</span> <span class="n">MIN_LEN_KEY</span><span class="p">,</span> <span class="n">REF_DIGEST_KEY</span><span class="p">)</span>
+<span class="n">CFG_KEY</span> <span class="o">=</span> <span class="s2">"voxcpm2_cfg_value"</span>
+<span class="n">TALKER_STEP_METADATA</span> <span class="o">=</span> <span class="p">(</span><span class="n">PATCH_BUDGET_KEY</span><span class="p">,</span> <span class="n">PROMPT_MODE_KEY</span><span class="p">,</span> <span class="n">MIN_LEN_KEY</span><span class="p">,</span> <span class="n">REF_DIGEST_KEY</span><span class="p">,</span> <span class="n">CFG_KEY</span><span class="p">)</span>
+<span class="n">TALKER_DECODE_METADATA</span> <span class="o">=</span> <span class="p">(</span><span class="n">PATCH_BUDGET_KEY</span><span class="p">,</span> <span class="n">MIN_LEN_KEY</span><span class="p">,</span> <span class="n">CFG_KEY</span><span class="p">)</span>
 
 
 <div class="viewcode-block" id="MiniCPM4Config">
