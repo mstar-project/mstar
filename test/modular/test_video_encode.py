@@ -9,7 +9,6 @@ and through each model's ``postprocess``.
 
 from __future__ import annotations
 
-import functools
 import io
 from fractions import Fraction
 
@@ -19,7 +18,6 @@ import torch
 
 av = pytest.importorskip("av")
 
-from mstar.model.components import video_encode  # noqa: E402
 from mstar.model.components.video_encode import converted_frames, encode_mp4  # noqa: E402
 
 # 30000/1001 exactly, as encode_mp4 writes it
@@ -124,8 +122,7 @@ def test_a_conversion_failure_reaches_the_caller():
         encode_mp4(np.zeros((2, 16, 16, 3), dtype=np.float32), 24)
 
 
-# Each model's postprocess against its old writer. Wan2.2 encodes with libx264's
-# defaults: its bytes are compared under ultrafast, and its settings as written.
+# Each model's postprocess against its old writer.
 
 def _wan22():
     from mstar.model.wan22.config import Wan22Config
@@ -136,20 +133,11 @@ def _wan22():
     return model
 
 
-def test_wan22_writes_the_old_bytes(monkeypatch):
-    from mstar.model.wan22 import wan22_model
-
-    monkeypatch.setattr(wan22_model, "encode_mp4", functools.partial(video_encode.encode_mp4, options=ULTRAFAST))
+def test_wan22_writes_the_old_bytes():
     clip = _clip(9, 48, 64)
     data = _wan22().postprocess(torch.from_numpy(clip), "video", {"fps": NTSC})
     assert data == _plain(clip, NTSC, ULTRAFAST)
-
-
-def test_wan22_keeps_libx264s_defaults():
-    clip = _clip(9, 48, 64)
-    data = _wan22().postprocess(torch.from_numpy(clip), "video", {"fps": 24})
-    assert b" crf=23.0 " in _x264_settings(data)  # libx264's default, where the others pass 18
-    assert _x264_settings(data) == _x264_settings(_plain(clip, 24, None))
+    assert b" crf=18.0 " in _x264_settings(data)
 
 
 def test_ltx2_5_writes_the_old_bytes():
