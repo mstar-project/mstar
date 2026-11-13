@@ -21,8 +21,8 @@ The video a chunk predicts is denoised alongside the actions: the action
 expert reads the backbone's hidden states as the video settles. It does not
 condition the next call. An opt-in episode array retains the real camera
 frames and aligned poses from executed rows, with no predicted frames in the
-window. The VAE node writes and reads that window; a later trunk port must
-consume its clean encoding. The predicted video latents end at the denoise
+window. The VAE node writes and reads that window, and the backbone consumes
+its clean encoding. The predicted video latents end at the denoise
 loop, and nothing predicted leaves the walk except the action rows.
 
 Serving stays gated until the published weights and session path have been

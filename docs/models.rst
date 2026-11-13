@@ -106,10 +106,9 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
        one entry; the server refuses to start otherwise.
    * - ``praxis1_{droid,yam}`` *(Not served yet)*
      - ``runwayml/praxis-1-{droid,yam}``
-     - **Not served yet.** This build has the graph and the checkpoint's config reader
-       but no node computation, so ``mstar serve praxis1_droid`` (or ``praxis1_yam``)
-       refuses to start, before it downloads anything. The rest of this row describes
-       the model as it will be served once the compute lands.
+     - **Not served yet.** This build has the graph and native towers, but serving
+       remains gated while the full session path is checked. ``mstar serve praxis1_droid``
+       (or ``praxis1_yam``) refuses to start before it downloads anything.
        Praxis-1 video-action policy: one call answers one chunk of the future, 6 video
        latents and 6 action tokens. The cold-only openpi bring-up mode returns 21
        denormalized relative Cartesian action rows at 15 Hz; a later context-aware
