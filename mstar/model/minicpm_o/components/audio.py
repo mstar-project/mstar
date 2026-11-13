@@ -38,8 +38,7 @@ class WhisperEncoder(nn.Module):
             activation_function=config.activation_function,
         )
         self.layers = nn.ModuleList(
-            AuTEncoderLayer(layer_config, attn_key=None, array=AUDIO_TOKENS, layer=layer)
-            for layer in range(config.encoder_layers)
+            AuTEncoderLayer(layer_config, array=AUDIO_TOKENS, layer=layer) for layer in range(config.encoder_layers)
         )
         self.layer_norm = nn.LayerNorm(d)
 
