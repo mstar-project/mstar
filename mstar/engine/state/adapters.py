@@ -846,7 +846,7 @@ class PagedReach(KeptWindowBinding):
         if resources[key].placement is not None:
             raise _no_layout(array, "a read with no op gathers its reach from this rank's pages, and "
                                     f"resources.{key} sets context_parallel, which stripes each page's slots over the "
-                                    "node's ranks; turn context_parallel off")
+                                    "node's ranks; run the node on one SP rank, with context_parallel off")
         return ReachRead(array, resources[key])
 
 

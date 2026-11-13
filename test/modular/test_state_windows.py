@@ -1032,7 +1032,8 @@ def test_a_reach_is_refused_on_a_pool_placed_over_ranks():
     )
     assert pool.placement is not None
     with pytest.raises(ValueError, match="Array 'dit_kv': no layout yet: a read with no op gathers its reach from "
-                                         "this rank's pages, and resources.dit_kv sets context_parallel"):
+                                         "this rank's pages, and resources.dit_kv sets context_parallel, .*; run "
+                                         "the node on one SP rank, with context_parallel off"):
         node_handles(SimpleNamespace(declare_state=lambda: [array]), "dit", {"dit_kv": pool})
 
 
