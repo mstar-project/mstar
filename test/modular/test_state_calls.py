@@ -2135,3 +2135,71 @@ def test_a_step_that_keeps_nothing_reads_as_a_kept_one_and_stores_none():
     h.check_step(step)
     kv.commit(step.steps[h.name], step.ctx)
     assert kv.written(1) == 0 and not kv.layer(0).any(), "a step that keeps nothing would have kept its adds"
+
+
+# A region run eagerly inside the open step: its calls answer for its own step, as a replay's would.
+
+
+def _eager_value_region(h, pool, rows) -> SubmoduleStep:
+    """A region's step over ``rows`` at span 1, planned and opened on ``h`` inside its open step, as an eager run of
+    the region opens it."""
+    segments = [Segment(rid, "main", 1) for rid in rows]
+    _, ctx = _plan(pool, segments)
+    region = _step(h, segments=segments, ctx=ctx)
+    h.begin_region(region)
+    return region
+
+
+def test_two_regions_run_eagerly_in_one_step_each_answer_for_their_own_calls():
+    """Two windows' regions each read and write the Value; counted as the open step's, the second read would come
+    after the first write, and the second write would write its fields twice."""
+    h, pool = _plain_value()
+    step, _, _ = _value_step(h, pool, [Segment(1, "main", 1), Segment(2, "main", 1)])
+    for rid in (1, 2):
+        region = _eager_value_region(h, pool, [rid])
+        h.read(0)
+        h.write(0, x=torch.full((1, 2, 3), float(rid)), n=torch.tensor([rid]))
+        h.end_region(region, ran=True)
+    h.check_step(step)
+    assert h._step is step, "the handle would answer for the last region rather than the open step"
+
+
+def test_an_eager_region_that_leaves_a_field_unwritten_is_refused_at_its_end():
+    h, pool = _plain_value()
+    step, _, _ = _value_step(h, pool, [Segment(1, "main", 1)])
+    region = _eager_value_region(h, pool, [1])
+    h.write(0, x=torch.ones(1, 2, 3))
+    _refused(r"Array 'state': layer 0's fields \['n'\] are unwritten in a kept step for rows \[1\]",
+             lambda: h.end_region(region, ran=True))
+    assert h._step is step and h._open, "a refused region would leave the handle answering for it"
+
+
+def test_two_bounded_regions_run_eagerly_in_one_step_each_add_once_per_layer():
+    """A step's full windows and its last ones run in two regions, each adding to every layer once."""
+    h, kv = _bounded()
+    step = _bounded_step(h, kv, spans=(2, 2))
+    for rid in (1, 2):
+        region = state_steps(_step(h, segments=[Segment(rid, "main", 2)], ctx=_ctx(rows=(rid,))), {h.name: h})
+        kv.plan(region.steps[h.name], region.ctx)
+        h.begin_region(region)
+        q, k, v, bias = _frames()
+        for layer in (3, 6):
+            h.add(layer, k=k, v=v)
+            h.read(layer, q, distance_bias=bias)
+        h.end_region(region, ran=True)
+    h.check_step(step)
+
+
+def test_an_eager_region_takes_its_rows_starts_from_the_step_it_runs_in():
+    """The node's step names each row's start, and a region run eagerly inside it answers for its own step, whose rows
+    still begin from those starts."""
+    h, kv, _ = _with_starts(2, 3)
+    _bounded_step(h, kv, spans=(2,), enc_kv=ArrayStep(starts={1: 1}))
+    region = state_steps(_step(h, segments=[Segment(1, "main", 2)]), {h.name: h})
+    kv.plan(region.steps[h.name], region.ctx)
+    h.begin_region(region)
+    q, k, v, _ = _frames()
+    for layer in (3, 6):
+        h.add(layer, k=k, v=v)
+        h.read(layer, q, distance_bias=torch.randn(1, HEADS, 2, 16))
+    h.end_region(region, ran=True)
