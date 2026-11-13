@@ -7,7 +7,12 @@ room for. From the memo two requests of one shape share them.
 
 Every step rebuilds its settings and looks the statics up again. The memo once built a value past an eighth of its
 budget per call and kept it nowhere, so a 720x1280, 289-frame label (34 MB) was built again on every step.
+
+The prefill builds them, as it did when they lived in the request's state. Left to the first denoise step, nine
+720x1280 requests' denoise steps took 110 ms each to prepare, where they had taken 0.8 ms.
 """
+
+from types import SimpleNamespace
 
 import torch
 from diffusers import UniPCMultistepScheduler
@@ -66,6 +71,19 @@ def test_a_request_s_steps_build_its_statics_once(monkeypatch):
     for step in range(4):
         dit._settings(md, step, {}, "cpu")
     assert dit.builds == 2, "every step would build the request's statics again"
+
+
+def test_a_request_s_denoise_steps_find_the_statics_its_prefill_built():
+    dit = _CountingDiT(
+        transformer=None, config=Cosmos3Config(compile_denoise=False), scheduler=UniPCMultistepScheduler(),
+    )
+    md = {"height": 64, "width": 64, "num_frames": 9, "num_inference_steps": 4, PROMPT_LENGTHS: (7, 5)}
+    prompts = {"text_inputs": [torch.arange(7), torch.arange(5)]}
+    dit._prepare_prefill(SimpleNamespace(step_metadata=md), prompts, "cpu")
+    built = dit.builds
+    for step in range(4):
+        dit._settings(md, step, {}, "cpu")
+    assert (built, dit.builds) == (2, 2), "the first denoise step would build the request's statics"
 
 
 def test_a_pin_mask_is_built_once_per_layout():
