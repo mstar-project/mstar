@@ -138,7 +138,7 @@ class ArrayHandle(StepHandle):
         if self._kept and self._kept != self.array.layers:
             raise self._refusal(f"layers {sorted(self.array.layers - self._kept)} have no add in a step that keeps "
                                 "adds on others, and every layer stays the same length")
-        if self._held is not None:
+        if self._unwritten():
             raise self._refusal(f"the step ends with layer {self._held_layer}'s add unread, on a kernel that takes k "
                                 "and v at the read, so nothing keeps it")
         declared = step.state[self.name]
@@ -239,9 +239,13 @@ class ArrayHandle(StepHandle):
 
     def _check_nothing_held(self, layer: int) -> None:
         """Refuse an add on ``layer`` while another layer's add waits for its read, which would then never be stored."""
-        if self._held is not None and self._held_layer != layer:
+        if self._held_layer != layer and self._unwritten():
             raise self._refusal(f"an add on layer {layer} while layer {self._held_layer}'s add waits for its read, on "
                                 "a kernel that takes k and v at the read")
+
+    def _unwritten(self) -> bool:
+        """Whether nothing keeps the held add: here, any add still held, which only its read stores."""
+        return self._held is not None
 
     def _take_hold(self, layer: int) -> tuple[torch.Tensor, torch.Tensor]:
         held = self._held
