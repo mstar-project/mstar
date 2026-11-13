@@ -254,6 +254,12 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
        Qwen3-VL-32B conditioner (keyframes through its vision tower) and a ViT video VAE,
        emitting an H.264 video at 24 fps with 32 kHz stereo audio (one mp4 with AAC on
        ``/v1/videos/generations``). MiniMax H3 Community License Agreement.
+   * - ``minimax_h3_image`` *(Beta)*
+     - ``MiniMaxAI/MiniMax-H3-Image``
+     - MiniMax-H3-Image text-to-image and editing with up to 16 reference images, up to 16 MP:
+       MiniMax-H3's DiT without audio, distilled to a fixed 6-step grid with one output head
+       per step and no guidance, the same Qwen3-VL-32B conditioner (references through its
+       vision tower), and an image VAE. MiniMax-H3-Image Community License Agreement.
    * - ``z_image_turbo``
      - ``Tongyi-MAI/Z-Image-Turbo``
      - Z-Image-Turbo: 8-step distilled single-stream flow DiT (6B) with a Qwen3-4B caption
@@ -2421,6 +2427,108 @@ SGLang ran ``--performance-mode speed`` at Ulysses 4 / 8, without compile or ste
 vllm-omni USP 4 / 8 with the text encoder and VAE split as wide. The DiT's 49 steps are
 ~74 s of the SP4 clip. Not done: CUDA-graph capture, more than one request per step, tensor
 parallelism, ``Ref2VA``.
+
+MiniMax-H3-Image (``minimax_h3_image``)
+---------------------------------------
+
+Text-to-image and reference-image editing on **MiniMax-H3-Image**
+(``MiniMaxAI/MiniMax-H3-Image``; MiniMax-H3-Image Community License Agreement): MiniMax-H3's
+33B packed-sequence DiT without its audio stream, distilled twice over (guidance baked in,
+and a fixed six-step grid with one output head per step), the same Qwen3-VL-32B conditioner
+as ``minimax_h3`` (byte-identical shards), and an image VAE (H3's video encoder on one frame,
+a 2D ViT decoder). The model shares ``minimax_h3``'s DiT, conditioner node and loaders.
+Not ported: the H3-Image-Context-IR prompt rewriter.
+
+Nodes: ``text_encoder`` (``minimax_h3``'s: Qwen3-VL to layer 50, the references through its
+vision tower, then ``condition_proj`` and the token refiner; once per request),
+``vae_encoder`` (the references), ``dit`` (the DiT scaffold's denoise loop, six iterations,
+each through its step's head) and ``vae_decoder`` (256-px tiles).
+
+.. code-block:: bash
+
+   mstar serve minimax_h3_image                                            # 2 GPUs: DiT | encoder + VAE
+   mstar serve minimax_h3_image --config configs/minimax_h3_image_sp2.yaml   # 2 GPUs: DiT SP2
+   mstar serve minimax_h3_image --config configs/minimax_h3_image_1gpu.yaml  # 1 GPU
+
+Request knobs (``model_kwargs``): ``height`` / ``width`` (default 2048x2048; the image comes
+back at exactly this size), ``min_generation_area`` (1024 to 16,777,216 pixels, default
+4,194,304: a smaller size is generated on a canvas of this area at the same aspect, both sides
+rounded to 32, and resized back with LANCZOS; 1024 generates at the asked size), ``seed``,
+and the OpenAI image output knobs. With images (``POST /generate`` with up to 16 images, or
+``/v1/images/edits`` with one), each reference keeps its own size: resized for the VAE to a
+short edge in [1024, 2048] and for the text encoder to 1024, as the reference does, and the
+prompt refers to them as ``<Picture 1>``, ``<Picture 2>``, ... The prompt is cut to 4096 tokens,
+as the reference cuts it. A packed sequence over ``max_packed_rows`` (default 131072, the reference's largest request: 16 MP with 16 references) is a 400.
+One request runs per denoise step.
+
+Deployment knobs (``model_kwargs``; the configs set ``compile`` and ``vae_tile_batch: 64``):
+``compile`` and ``row_bucket`` (the DiT's blocks, as ``minimax_h3``), ``vae_tile_batch``
+(256-px tiles per decoder call: one at a time, the reference's order, leaves the decode
+launch-bound at 9.2 s for 16 MP on a B300 against 0.45 s at 64, and the batched decode is
+bit-identical), ``vae_compile`` and ``text_cache_entries`` (the text node keeps the text rows
+of that many recent prompts and their references, keyed by a digest of the token ids and the
+vision tower's pixels, as SGLang's conditioning cache does: a repeat skips the 33B encoder and
+gets the same image; the configs keep 16, 0 turns it off), ``capture_sizes`` (generated canvases whose
+text-to-image DiT step replays a CUDA graph, one per ``row_bucket`` of prompt rows up to
+``capture_text_rows``, default 512; the per-prompt layout is a step input, so one graph serves
+every prompt length of its bucket; edits, longer prompts and other sizes run eager; the SP2
+config captures 1024², 0.41 -> 0.39 s on 2 H200s, bit-identical); the attention backend is a resource setting
+(``resources: {dit_attn: {backend: sdpa}, refiner_attn: {backend: sdpa}}``). The
+configs: ``minimax_h3_image.yaml`` (2 GPUs, the DiT alone on one), ``minimax_h3_image_sp2.yaml``
+(the DiT Ulysses over 2 GPUs, the decoder in its SP group decoding half of the tiles per rank,
+the conditioner and the VAE encoder on rank 1) and
+``minimax_h3_image_1gpu.yaml`` (~119 GiB in use on one H200 at 16 MP).
+
+At ``backend: sdpa`` the nodes' modules, driven by ``test/minimax_h3_image/parity.py``
+(fp32 matmuls at "highest"), are bit-identical to diffusers' pipeline end to end on a B300 (the
+packed layout, the seeded noise, the references' latents, every step and the decoded image) for
+text-to-image at 1024², 2048² and 4096² and edits with one and four references; a server at
+``sdpa`` returns the same pixels. FlashInfer and the compiled DiT are not bit-exact: served on two
+H200s, images are 19.9-36.8 dB from diffusers', where diffusers on another SDPA kernel moves
+21.3 dB (the four-reference edit, which M* serves 1.4 dB under that) to 38.5 dB (a
+one-reference edit) from itself: the six-step sampler amplifies kernel differences.
+
+Seconds per image, one request at a time, each engine on the same H200s (M* on torch
+2.11.0+cu128 and FlashInfer 0.7.2; text-to-image, seed 42, median of 3 after 2 warmups;
+``benchmark/minimax_h3_image/bench_image.py`` sends these requests, with
+``min_generation_area=1024`` so 1024² is generated at 1024²; the default renders it on the 2048²
+canvas, 2.14 s on M*):
+
+.. list-table::
+   :header-rows: 1
+
+   * - s/image
+     - 1024²
+     - 2048²
+     - 4096²
+   * - M*, 1 GPU (``minimax_h3_image_1gpu.yaml``)
+     - 0.64
+     - 2.20
+     - 11.07
+   * - SGLang (main ``fc6d3b6f9``), 1 GPU
+     - 0.56
+     - 2.08
+     - 10.71
+   * - M*, SP2 (``minimax_h3_image_sp2.yaml``)
+     - 0.51
+     - 1.44
+     - 6.87
+   * - SGLang, Ulysses 2
+     - 0.37
+     - 1.26
+     - 6.24
+   * - vllm-omni (main ``02d7bc47e``), USP 2
+     - (2048² canvas)
+     - 1.41
+     - 6.73
+
+The 2-GPU default config takes 0.65 / 2.18 / 11.13 s, as one GPU at one request (it overlaps
+requests, not steps); diffusers' pipeline on two H200s (encoder | rest, no HTTP) takes 1.05 /
+4.20 / 18.65 s. SGLang ran ``--performance-mode speed``; vllm-omni its H200 recipe's SP2 profile,
+whose ``extra_args.min_generation_area`` was not honoured at 1024². At SP2 and 4096², a step is
+0.94 s; the decode is split over the SP ranks' tiles. Not done: CUDA-graph capture, more than
+one request per step, tensor parallelism, multi-reference edits through ``/v1/images/edits``.
+
 
 FLUX.2 [klein] (``flux2_klein`` / ``flux2_klein_9b``)
 -----------------------------------------------------

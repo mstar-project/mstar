@@ -235,8 +235,23 @@ class H3TextConditioner(nn.Module):
         return self.token_refiner.final_norm(x)
 
 
+class StepHeads(nn.Module):
+    """One linear head per sampling step, stacked: ``weight [n, out, in]``, ``bias [n, out]``.
+    ``forward`` runs the head ``index`` (a ``[1]`` device tensor) names as a plain linear, so
+    a captured step reads its head from the step's scalar rather than a Python int."""
+
+    def __init__(self, num_heads: int, in_features: int, out_features: int):
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(num_heads, out_features, in_features))
+        self.bias = nn.Parameter(torch.empty(num_heads, out_features))
+
+    def forward(self, x: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
+        return F.linear(x, self.weight.index_select(0, index)[0], self.bias.index_select(0, index)[0])
+
+
 class H3FinalLayer(nn.Module):
-    """``norm_out`` + the two fp32 heads. The modulation is per timestep."""
+    """``norm_out`` + the fp32 heads (video, and audio when the model has it). The
+    modulation is per timestep."""
 
     def __init__(self, cfg: H3TransformerConfig):
         super().__init__()
@@ -244,8 +259,11 @@ class H3FinalLayer(nn.Module):
         self.norm = nn.RMSNorm(cfg.hidden_size, eps=cfg.final_norm_eps)
         self.adaln_proj = nn.Module()
         self.adaln_proj.linear = nn.Linear(cfg.time_embed_dim, cfg.final_adaln_out_features)
-        self.video_out = nn.Linear(cfg.hidden_size, cfg.patch_dim)
-        self.audio_out = nn.Linear(cfg.hidden_size, cfg.audio_latents_dim)
+        if cfg.num_output_heads == 1:
+            self.video_out = nn.Linear(cfg.hidden_size, cfg.patch_dim)
+        else:
+            self.video_out = StepHeads(cfg.num_output_heads, cfg.hidden_size, cfg.patch_dim)
+        self.audio_out = nn.Linear(cfg.hidden_size, cfg.audio_latents_dim) if cfg.audio_enabled else None
 
     def forward(self, x: torch.Tensor, temb: torch.Tensor, row_class: torch.Tensor) -> torch.Tensor:
         """``[B, S, hidden]`` -> the normed, modulated rows in the heads' dtype."""
@@ -279,6 +297,13 @@ class H3StepLayout(NamedTuple):
     num_condition_rows: int   # keyframe rows, leading the video rows
     num_audio_rows: int
     num_pad_rows: int = 0
+    # Set where the prompt's length is not the step's to read (one captured graph per row
+    # bucket): the prompt arrives padded with zero rows to the bucket's capacity,
+    # ``row_source`` [S] picks each packed row from ``[prompt rows | video rows]`` (a padding
+    # row from a zero prompt row) and ``video_rows`` [Nv] are the video rows' packed rows.
+    # Video only; ``text_len`` and ``num_pad_rows`` then go unread.
+    row_source: torch.Tensor | None = None
+    video_rows: torch.Tensor | None = None
 
     @property
     def num_rows(self) -> int:
@@ -295,7 +320,7 @@ class H3DiT(nn.Module):
         comm_group = comm_group or CommGroup.trivial()
         self.cfg = cfg
         self.video_patch_proj = nn.Linear(cfg.patch_dim, cfg.hidden_size)
-        self.audio_patch_proj = nn.Linear(cfg.audio_latents_dim, cfg.hidden_size)
+        self.audio_patch_proj = nn.Linear(cfg.audio_latents_dim, cfg.hidden_size) if cfg.audio_enabled else None
         self.time_embedder = H3TimeEmbedder(cfg)
         self.blocks = nn.ModuleList(H3Block(cfg, comm_group, i) for i in range(cfg.num_layers))
         self.final_layer = H3FinalLayer(cfg)
@@ -306,7 +331,10 @@ class H3DiT(nn.Module):
 
     def keep_fp32(self) -> None:
         for name in self.FP32_MODULES:
-            self.get_submodule(name).float()
+            parent, _, leaf = name.rpartition(".")
+            module = getattr(self.get_submodule(parent), leaf)
+            if module is not None:  # a model without audio has no audio modules
+                module.float()
 
     @property
     def dtype(self) -> torch.dtype:
@@ -346,21 +374,36 @@ class H3DiT(nn.Module):
             pieces.append(inputs.text.new_zeros(inputs.text.shape[0], p1 - p0, inputs.text.shape[2]))
         return torch.cat(pieces, dim=1)
 
+    def sourced_rows(self, inputs: H3Inputs, layout: H3StepLayout, start: int, count: int) -> torch.Tensor:
+        """:meth:`packed_rows` by ``layout.row_source``: every video row projected (a row's projection
+        is the same whichever rows run with it), then the range's rows picked."""
+        if layout.num_audio_rows:
+            raise ValueError("a layout of row sources holds no audio rows")
+        linear = self.video_patch_proj
+        video = linear(inputs.video.to(linear.weight.dtype)).to(inputs.text.dtype)
+        return torch.cat([inputs.text, video], dim=1).index_select(1, layout.row_source.narrow(0, start, count))
+
     def forward(
         self, inputs: H3Inputs, layout: H3StepLayout, row_class: torch.Tensor | None = None, shard=None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """``inputs.timesteps`` is ``[B, 3]`` (video, audio, keyframe), or ``[B, 1]`` when all
-        are one value: the reference then runs its AdaLN GEMMs on one row, which rounds
-        differently from three. ``row_class`` (tests) indexes timesteps laid out as the
-        reference's distinct values. `attend` attends within the step's segments
-        (`attention_segments`), so no request row sees a padding row. ``shard``: the node's sequence shard's
-        handle, which on a step it splits
-        gives this rank a contiguous range of the packed rows: only those are built and run, and the attention's
-        resource exchanges them."""
+        head: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """``inputs.timesteps`` is ``[B, n]``: one timestep per class ``layout.row_class``
+        indexes (H3: video, audio, keyframe), or ``[B, 1]`` when all are one value: the
+        reference then runs its AdaLN GEMMs on one row, which rounds differently from three.
+        ``row_class`` (tests) indexes timesteps laid out as the reference's distinct values.
+        `attend` attends within the step's segments (`attention_segments`), so no request row
+        sees a padding row. ``shard``: the node's sequence shard's handle, which on a step it
+        splits gives this rank a contiguous range of the packed rows: only those are built and
+        run, and the attention's resource exchanges them. ``head`` (``[1]``) picks the step's
+        video head when the model has one per step. The audio velocity is None for a model
+        without audio."""
         cond, pad = layout.num_condition_rows, layout.num_pad_rows
         split = None if shard is None else split_range(shard)
         start, count = (0, layout.num_rows) if split is None else (split.start, split.count)
-        x = self.packed_rows(inputs, layout, start, count)
+        if layout.row_source is None:
+            x = self.packed_rows(inputs, layout, start, count)
+        else:
+            x = self.sourced_rows(inputs, layout, start, count)
         rope, row_index = layout.rope, layout.row_index
         if row_class is not None:
             row_class = torch.cat([row_class, row_class.new_zeros(pad)])
@@ -376,12 +419,18 @@ class H3DiT(nn.Module):
         for block in self.blocks:
             x = block(x, temb, row_index, rope)
         h = self.final_layer(x, temb, row_class)
-        # both heads over this rank's rows, then the rows gathered: [B, S, patch_dim + audio_dim]
-        out = torch.cat([self.final_layer.video_out(h), self.final_layer.audio_out(h)], dim=-1)
+        final = self.final_layer
+        video_out = final.video_out(h) if head is None else final.video_out(h, head)
+        # the heads over this rank's rows, then the rows gathered: [B, S, patch_dim (+ audio_dim)]
+        out = video_out if final.audio_out is None else torch.cat([video_out, final.audio_out(h)], dim=-1)
         if split is not None:
             out = gather(shard, out, dim=1)
+        if layout.video_rows is not None:
+            return out.index_select(1, layout.video_rows), None
         text, audio_rows, end = layout.text_len, layout.num_audio_rows, layout.num_rows - pad
         patch_dim = self.cfg.patch_dim
+        if final.audio_out is None:
+            return out[:, text:end], None
         video_v = torch.cat(
             [out[:, text:text + cond, :patch_dim], out[:, text + cond + audio_rows:end, :patch_dim]], dim=1,
         )

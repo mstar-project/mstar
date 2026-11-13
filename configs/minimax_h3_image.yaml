@@ -1,0 +1,24 @@
+model: "minimax_h3_image"
+
+# Required by the config schema. No node keeps a KV cache, so nothing is sized from it: the
+# prompt is cut to 4096 tokens (and each reference's label), the packed sequence bounded by
+# max_packed_rows.
+max_seq_len: 8192
+
+# MiniMax-H3-Image on 2 GPUs: the DiT (66 GB) alone on rank 0; the Qwen3-VL-32B conditioner
+# (~62 GB for the 50 layers it runs) and the VAE on rank 1, so the next request's encode and
+# the last one's decode overlap the denoise. Measured settings and times: docs/models.rst.
+model_kwargs:
+  compile: true
+  # tiles per decoder call: one at a time leaves the decode launch-bound (9.2 s for a 16 MP
+  # image on a B300, 0.45 s at 64), and the batched decode is bit-identical
+  vae_tile_batch: 64
+  # the last 16 prompts' text rows, as SGLang's conditioning cache: a repeated prompt (and
+  # references) skips the text encoder and gets the same image
+  text_cache_entries: 16
+
+node_groups:
+  - node_names: [dit]
+    ranks: [0]
+  - node_names: [text_encoder, vae_encoder, vae_decoder]
+    ranks: [1]

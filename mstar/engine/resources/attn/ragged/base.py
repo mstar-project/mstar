@@ -14,7 +14,7 @@ import weakref
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 
@@ -39,12 +39,16 @@ from mstar.engine.resources.sequence_shard import (
     SequenceShard,
     check_shard_plan,
     head_slice,
+    pipelined_ulysses,
     sharded_key_merge,
     ulysses,
 )
 from mstar.engine.resources.step import BucketKey, Segment, SlotLease, StepContext
 from mstar.kernels.registry import describe_rows
 from mstar.kernels.table import Choice, Rows
+
+if TYPE_CHECKING:
+    from mstar.distributed.ulysses_pipeline import UlyssesPipeline
 
 logger = logging.getLogger(__name__)
 
@@ -130,6 +134,16 @@ def dense_or_flashinfer(device: torch.device, dense, flashinfer, what: str):
     return flashinfer
 
 
+def _build_fa4_or_flashinfer(spec, info: EngineResourceInfo, fa4_cls, flashinfer_cls):
+    from mstar.engine.resources.attn.ragged.dense import _warn_ragged_fallback, fa4_unavailable_reason
+
+    reason = fa4_unavailable_reason(info.device)
+    if reason is None:
+        return _build_ragged(spec, info, fa4_cls)
+    _warn_ragged_fallback(RaggedAttnBackend.FA4, reason, RaggedAttnBackend.FLASHINFER)
+    return _build_ragged(spec, info, flashinfer_cls)
+
+
 def _build_dense_or_flashinfer(spec, info: EngineResourceInfo, dense_cls, flashinfer_cls):
     return _build_ragged(
         spec, info, dense_or_flashinfer(info.device, dense_cls, flashinfer_cls, "Ragged attention"),
@@ -157,6 +171,11 @@ class RaggedAttnManager(AttentionResource):
             from mstar.engine.resources.attn.ragged.flashinfer import FlashInferRaggedManager
 
             return _build_ragged(spec, info, FlashInferRaggedManager, cudnn=True)
+        if backend is RaggedAttnBackend.FA4:
+            from mstar.engine.resources.attn.ragged.dense import Fa4RaggedManager
+            from mstar.engine.resources.attn.ragged.flashinfer import FlashInferRaggedManager
+
+            return _build_fa4_or_flashinfer(spec, info, Fa4RaggedManager, FlashInferRaggedManager)
         if backend is RaggedAttnBackend.FLASHINFER:
             # Deferred so naming the spec does not load FlashInfer, and because
             # `flashinfer` imports this class back.
@@ -186,6 +205,11 @@ class RaggedCrossAttnManager(AttentionResource):
             return _build_dense_or_flashinfer(
                 spec, info, DenseRaggedCrossManager, FlashInferRaggedCrossManager,
             )
+        if backend is RaggedAttnBackend.FA4:
+            from mstar.engine.resources.attn.ragged.dense import Fa4RaggedCrossManager
+            from mstar.engine.resources.attn.ragged.flashinfer import FlashInferRaggedCrossManager
+
+            return _build_fa4_or_flashinfer(spec, info, Fa4RaggedCrossManager, FlashInferRaggedCrossManager)
         if backend is RaggedAttnBackend.FLASHINFER:
             from mstar.engine.resources.attn.ragged.flashinfer import (
                 FlashInferRaggedCrossManager,
@@ -204,12 +228,12 @@ class RaggedBlockCausalAttnManager(AttentionResource):
     @classmethod
     def build(cls, spec: RaggedBlockCausalAttentionSpec, info: EngineResourceInfo):
         backend = _refuse_cudnn(spec, resolve_ragged_attn_backend(spec.config.backend, info.device), "block-causal")
-        if backend is RaggedAttnBackend.DENSE:
-            from mstar.engine.resources.attn.ragged.dense import _warn_ragged_dense_fallback
+        if backend in (RaggedAttnBackend.DENSE, RaggedAttnBackend.FA4):
+            from mstar.engine.resources.attn.ragged.dense import _warn_ragged_fallback
 
             # a block's keys are a prefix of its span, and the prefixes overlap:
             # varlen's one key range per query segment cannot express that
-            _warn_ragged_dense_fallback("it has no block-causal kernel", RaggedAttnBackend.FLASHINFER)
+            _warn_ragged_fallback(backend, "it has no block-causal kernel", RaggedAttnBackend.FLASHINFER)
             backend = RaggedAttnBackend.FLASHINFER
         if backend is RaggedAttnBackend.FLASHINFER:
             from mstar.engine.resources.attn.ragged.flashinfer import (
@@ -284,6 +308,8 @@ class _RaggedManagerBase:
     _ulysses = False
     # the shard, when it can split (`bind_dependencies`)
     _shard: SequenceShard | None = None
+    # the Ulysses exchange pipelined over head groups (`RaggedAttentionConfig.ulysses_head_groups`)
+    _ulysses_pipeline: "UlyssesPipeline | None" = None
 
     def __init__(
         self,
@@ -325,6 +351,10 @@ class _RaggedManagerBase:
         if self._shard_key is None or not resources[self._shard_key].can_split:
             return
         self._shard = resources[self._shard_key]
+        if self._config.ulysses_head_groups > 1:
+            from mstar.distributed.ulysses_pipeline import UlyssesPipeline
+
+            self._ulysses_pipeline = UlyssesPipeline(self._shard.group, self._config.ulysses_head_groups)
         logger.info(
             "%s %r takes split steps over %d SP ranks%s", type(self).__name__, self._key,
             self._shard.group.world_size, " (Ulysses)" if self._ulysses else "",
@@ -552,6 +582,12 @@ def _cudnn_wrapper(manager, label: str, slot: int, config, **graph_kwargs) -> _R
     return CudnnRaggedPrefillWrapper(**manager._kwargs, **graph_kwargs)
 
 
+def _fa4_wrapper(manager, label: str, slot: int, config, **graph_kwargs) -> _RaggedPrefillBase:
+    from mstar.engine.resources.attn.ragged.cudnn_wrappers import Fa4UniformPrefillWrapper
+
+    return Fa4UniformPrefillWrapper(**manager._kwargs, **graph_kwargs)
+
+
 @dataclass(frozen=True)
 class WrapperFactory:
     """How a self-attention manager builds one implementation's wrapper for a
@@ -568,6 +604,7 @@ class WrapperFactory:
 WRAPPER_FACTORIES: Mapping[str, WrapperFactory] = MappingProxyType({
     "flashinfer": WrapperFactory(_flashinfer_wrapper),
     "cudnn": WrapperFactory(_cudnn_wrapper, layout_bound=True),
+    "fa4": WrapperFactory(_fa4_wrapper, layout_bound=True),
 })
 
 # What a layout runs where its row can't take it, and what a resource without a
@@ -652,6 +689,8 @@ class _RaggedSelfManagerBase(_RaggedManagerBase, RaggedAttnManager):
         r = self._shard.split_range(label)
         if r is not None:
             self._shard.check_scattered(label)
+            if self._ulysses_pipeline is not None and self._wrapper(label).any_heads:
+                return functools.partial(pipelined_ulysses, r=r, pipeline=self._ulysses_pipeline)
             return functools.partial(ulysses, r=r)
         return functools.partial(head_slice, group=self._shard.group) if self._ulysses else None
 
