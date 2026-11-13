@@ -23,7 +23,7 @@ from mstar.api_server.request_types import (
     WorkersReady,
 )
 from mstar.communication.communicator import CommProtocol, make_communicator
-from mstar.conductor.episodes import EpisodeCapacityError, EpisodeRecords, EpisodeSlots
+from mstar.conductor.episodes import EpisodeCallLimitError, EpisodeCapacityError, EpisodeRecords, EpisodeSlots
 from mstar.conductor.lora_ops import LoraAdapterOps
 from mstar.conductor.mps import MpsDaemon
 from mstar.conductor.request_info import (
@@ -54,6 +54,7 @@ from mstar.graph.base import GraphEdge, NodeAndGraphWalk, TensorPointerInfo
 from mstar.model.base import Model, WorkerGraph, serving_resources, streamed_inputs
 from mstar.model.submodule_base import chunk_loop_name
 from mstar.observability import catalog
+from mstar.observability.recorders import Counter as MetricCounter
 from mstar.observability.recorders import Gauge, MetricSnapshot, merge
 from mstar.platforms import apply_process_env_defaults, current_platform
 from mstar.profile.format import RxInfo, TxInfo
@@ -611,6 +612,17 @@ class Conductor:
             worker_graph.worker_graph_id: worker_graph
             for worker_graph in worker_graphs
         }
+        for declaration in self._declarations():
+            if getattr(declaration, "lifetime", "request") != "episode":
+                continue
+            groups = {
+                wg._group_id for wg in self.worker_graphs.values()
+                if declaration.nodes & set(wg.section.get_nodes())
+            }
+            if len(groups) != 1:
+                raise ValueError(
+                    f"episode array {declaration.name!r} needs one node group, got {sorted(groups)}"
+                )
 
         # Set up worker graph TP ranks; validate_deployment checked each worker
         # graph belongs to one sharding group of its instance size.
@@ -699,6 +711,9 @@ class Conductor:
         )
         self._requests_gauge = Gauge(catalog.CONDUCTOR_REQUESTS)
         self._in_flight_gauge = Gauge(catalog.COMPONENT_IN_FLIGHT)
+        self._episodes_gauge = Gauge(catalog.EPISODES)
+        self._episode_slots_gauge = Gauge(catalog.EPISODE_SLOTS_USED)
+        self._episode_evictions = MetricCounter(catalog.EPISODE_EVICTIONS)
         # worker id -> its latest WorkerStatus snapshots (cumulative)
         self._worker_metrics: dict[str, list[MetricSnapshot]] = {}
 
@@ -1397,6 +1412,11 @@ class Conductor:
         """
         try:
             self._do_ingest_request(body)
+        except EpisodeCallLimitError as exc:
+            self._drop_request(body.request_id)
+            self._end_episode(EndEpisodeConductor(body.episode))
+            self._reject_request(body.request_id, str(exc), status=400)
+            return True
         except EpisodeCapacityError:
             # Planning registered the request before slot reservation. It sent
             # nothing to workers, so keep the preprocess inputs for the retry.
@@ -1813,9 +1833,12 @@ class Conductor:
         if slot is not None:
             return slot
         for old_id, old in self._episode_records.idle():
+            if old.workers.isdisjoint(workers):
+                continue
             old_slot, old_workers = old.slot, old.workers
             self._send_end_episode(old_id, old_slot, old_workers)
             self._episode_records.evict(old_id)
+            self._episode_evictions.inc(("pressure",))
             self._episode_slots.release(self._episode_owner(old_id, ""), old_workers, old_slot)
             slot = self._episode_slots.reserve(owner, workers)
             if slot is not None:
@@ -1830,6 +1853,7 @@ class Conductor:
             slot, workers = record.slot, record.workers
             self._send_end_episode(episode_id, slot, workers)
             self._episode_records.evict(episode_id, "idle")
+            self._episode_evictions.inc(("idle",))
             self._episode_slots.release(self._episode_owner(episode_id, ""), workers, slot)
             freed = True
         self._episode_records.forget_expired_cold(now, self._episode_idle_timeout_s)
@@ -2664,6 +2688,11 @@ class Conductor:
         states.set(("draining",), len(self.draining))
         for node, count in in_flight.items():
             self._in_flight_gauge.set((node,), count)
+        for state, count in self._episode_records.state_counts().items():
+            self._episodes_gauge.set((state,), count)
+        used = self._episode_slots.used_by_worker()
+        for worker in self.worker_ids:
+            self._episode_slots_gauge.set((worker,), used.get(worker, 0))
         # Summed across workers: a node's replicas each report their own; for
         # the engine families the other ranks of a lockstep instance report
         # nothing, while every rank counts the tensor transfers it reads.
@@ -2672,7 +2701,9 @@ class Conductor:
             for snap in snapshots:
                 by_family.setdefault(snap.name, []).append(snap)
         return ConductorStatus(metrics=[
-            states.snapshot(), self._in_flight_gauge.snapshot(), self._router.predicted_saving.snapshot(),
+            states.snapshot(), self._in_flight_gauge.snapshot(),
+            self._episodes_gauge.snapshot(), self._episode_slots_gauge.snapshot(),
+            self._episode_evictions.snapshot(), self._router.predicted_saving.snapshot(),
             *(merge(family, by_family.get(name, ()))
               for name, family in catalog.WORKER_FAMILIES.items()),
         ])

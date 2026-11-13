@@ -7,6 +7,8 @@ import pytest
 from mstar.conductor.conductor import Conductor
 from mstar.conductor.episodes import EpisodeCapacityError, EpisodeRecords, EpisodeSlots
 from mstar.conductor.routing import Placement
+from mstar.observability import catalog
+from mstar.observability.recorders import Counter as MetricCounter
 from mstar.utils.ipc_format import EndEpisodeConductor, NewRequestConductor, WorkerGraphsDone
 
 
@@ -166,6 +168,7 @@ def test_idle_timeout_sends_end_before_releasing_slot():
     conductor = object.__new__(Conductor)
     conductor._episode_records = EpisodeRecords()
     conductor._episode_slots = EpisodeSlots(1)
+    conductor._episode_evictions = MetricCounter(catalog.EPISODE_EVICTIONS)
     conductor._episode_idle_timeout_s = 10
     workers = {"w0"}
     assert conductor._episode_slots.reserve("episode:robot-a", workers) == 0
@@ -181,6 +184,8 @@ def test_idle_timeout_sends_end_before_releasing_slot():
     ]
     assert conductor._episode_records.view("robot-a").cold == "idle"
     assert conductor._episode_slots.reserve("request:r", workers) == 0
+    assert conductor._episode_evictions.snapshot().label_values == [["idle"]]
+    assert conductor._episode_evictions.snapshot().values == [1.0]
 
 
 def test_slot_pressure_requeues_without_leaking_a_registered_request():
@@ -238,6 +243,7 @@ def test_eviction_sends_end_before_reusing_a_workers_slot():
     conductor = object.__new__(Conductor)
     conductor._episode_records = EpisodeRecords()
     conductor._episode_slots = EpisodeSlots(1)
+    conductor._episode_evictions = MetricCounter(catalog.EPISODE_EVICTIONS)
     workers = {"w0"}
     conductor._episode_slots.reserve("episode:old", workers)
     conductor._episode_records.admit("old", "call-1", 0, _placement(0), workers=workers)
@@ -251,6 +257,8 @@ def test_eviction_sends_end_before_reusing_a_workers_slot():
     assert sent[0][1].body.episode_slot == 0
     assert sent[1][1] == "next NEW_REQUEST"
     assert conductor._episode_records.view("old").cold == "evicted"
+    assert conductor._episode_evictions.snapshot().label_values == [["pressure"]]
+    assert conductor._episode_evictions.snapshot().values == [1.0]
 
 
 def test_failed_end_send_does_not_reassign_a_live_row():
@@ -270,3 +278,20 @@ def test_failed_end_send_does_not_reassign_a_live_row():
         conductor._reserve_episode_slot("episode:new", workers)
     assert conductor._episode_slots.reserve("episode:new", workers) is None
     assert conductor._episode_records.view("old").held["frames"] == 21
+
+
+def test_slot_pressure_does_not_evict_an_unrelated_replica():
+    conductor = object.__new__(Conductor)
+    conductor._episode_records = EpisodeRecords()
+    conductor._episode_slots = EpisodeSlots(1)
+    conductor._episode_slots.reserve("episode:idle", {"w0"})
+    conductor._episode_slots.reserve("request:busy", {"w1"})
+    conductor._episode_records.admit("idle", "call-1", 0, _placement(0), workers={"w0"})
+    conductor._episode_records.finish("idle", "call-1", {"frames": 21})
+    sent = []
+    conductor.communicator = SimpleNamespace(send=lambda worker, msg: sent.append((worker, msg)))
+
+    with pytest.raises(EpisodeCapacityError):
+        conductor._reserve_episode_slot("episode:new", {"w1"})
+    assert sent == []
+    assert conductor._episode_records.view("idle").held["frames"] == 21

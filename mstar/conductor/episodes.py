@@ -18,6 +18,10 @@ class EpisodeCapacityError(Exception):
     """All candidate rows are occupied by calls that cannot be evicted yet."""
 
 
+class EpisodeCallLimitError(ValueError):
+    """A connection used its configured number of admitted calls."""
+
+
 @dataclass(slots=True)
 class EpisodeRecord:
     calls: int
@@ -85,7 +89,7 @@ class EpisodeRecords:
         if record is not None and record.in_flight is not None:
             raise ValueError(f"episode {episode_id!r} already runs request {record.in_flight!r}")
         if max_calls is not None and record is not None and record.calls >= max_calls:
-            raise ValueError(f"episode reached max_calls={max_calls}")
+            raise EpisodeCallLimitError(f"episode reached max_calls={max_calls}")
 
     def busy(self, episode_id: str | None) -> bool:
         record = self._records.get(episode_id) if episode_id is not None else None
@@ -229,6 +233,15 @@ class EpisodeRecords:
             key=lambda item: item[1].last_end,
         )
 
+    def state_counts(self) -> dict[str, int]:
+        counts = {"running": 0, "idle": 0, "cold": 0}
+        for record in self._records.values():
+            state = "running" if record.in_flight is not None else (
+                "cold" if record.slot is None else "idle"
+            )
+            counts[state] += 1
+        return counts
+
     def forget_expired_cold(self, now: float, ttl: float) -> None:
         """Bound records after their slot and frontend connection are gone."""
         for name, record in list(self._records.items()):
@@ -263,6 +276,12 @@ class EpisodeSlots:
             (worker, slot) not in self._owners
             for worker in workers for slot in range(self.capacity)
         )
+
+    def used_by_worker(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for worker, _ in self._owners:
+            counts[worker] = counts.get(worker, 0) + 1
+        return counts
 
     def release(self, owner: str, workers: set[str], slot: int) -> None:
         if any(self._owners.get((worker, slot)) != owner for worker in workers):

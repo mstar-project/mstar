@@ -1,11 +1,13 @@
 """Episode views and row ownership through real conductor intake and teardown."""
 
+import pytest
 import torch
 import yaml
 
 import mstar.conductor.conductor as conductor_mod
 from mstar.conductor.conductor import Conductor
 from mstar.conductor.request_info import WalkStep
+from mstar.conductor.routing import Placement
 from mstar.engine.state import Array, Entry, Read, TensorType, Window
 from mstar.graph.base import GraphEdge, GraphNode
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
@@ -51,13 +53,13 @@ class _Comm:
         self.sent.append((worker, message))
 
 
-def _conductor(tmp_path, monkeypatch, *, replicas=1, capacity=1):
+def _conductor(tmp_path, monkeypatch, *, replicas=1, capacity=1, pool_slots=None, **episode_config):
     config = tmp_path / "cfg.yaml"
     config.write_text(yaml.safe_dump({
         "max_seq_len": 32,
         "node_groups": [{"node_names": ["llm"], "ranks": list(range(replicas))}],
-        "episodes": {"max_episodes": capacity},
-        "resources": {"frames": {"max_slots": capacity + 1}},
+        "episodes": {"max_episodes": capacity, **episode_config},
+        "resources": {"frames": {"max_slots": pool_slots or capacity + 1}},
     }))
     comm = _Comm()
     monkeypatch.setattr(Conductor, "_launch_workers", lambda self: None)
@@ -92,6 +94,10 @@ def _complete(conductor, rid, held=None):
 def test_named_calls_wait_for_teardown_then_plan_from_worker_counts(tmp_path, monkeypatch):
     conductor, model, comm = _conductor(tmp_path, monkeypatch)
     conductor._ingest_request(_request("first", "robot-a"))
+    status = {metric.name: metric for metric in conductor._status().metrics}
+    assert status["mstar_episodes"].label_values == [["running"], ["idle"], ["cold"]]
+    assert status["mstar_episodes"].values == [1.0, 0.0, 0.0]
+    assert status["mstar_episode_slots_used"].values == [1.0]
     first = _new_requests(comm, "first")
     assert len(first) == 1
     assert (first[0][1].episode_id, first[0][1].episode_slot) == ("robot-a", 0)
@@ -112,6 +118,7 @@ def test_idless_calls_are_cold_and_share_the_same_admission_pool(tmp_path, monke
     assert _new_requests(comm, "first")[0][1].episode_slot == 0
     conductor._ingest_request(_request("second"))
     assert _new_requests(comm, "second") == []
+    assert "second" not in conductor.requests
     _complete(conductor, "first", {"frames": 4})
     assert _new_requests(comm, "second")[0][1].episode_slot == 0
     assert [(view.id, view.calls, dict(view.held)) for view in model.views] == [
@@ -161,3 +168,44 @@ def test_changed_content_key_clears_just_its_array_before_planning(tmp_path, mon
     assert model.views[-1].calls == 1
     assert dict(model.views[-1].held) == {}
     assert _new_requests(comm, "second")[0][1].episode_clear == ["frames"]
+
+
+def test_startup_refuses_more_episode_slots_than_the_dense_pool_has(tmp_path, monkeypatch):
+    with pytest.raises(ValueError, match="has 1 usable slots; episodes.max_episodes needs 2"):
+        _conductor(tmp_path, monkeypatch, capacity=2, pool_slots=2)
+
+
+def test_call_budget_refuses_after_the_first_admitted_call(tmp_path, monkeypatch):
+    conductor, _, comm = _conductor(tmp_path, monkeypatch, max_calls=1)
+    conductor._ingest_request(_request("first", "robot-a"))
+    _complete(conductor, "first", {"frames": 4})
+    conductor._ingest_request(_request("second", "robot-a"))
+    assert _new_requests(comm, "second") == []
+    failures = [msg.body for _, msg in comm.sent if msg.message_type == "request_failed"]
+    assert any("max_calls=1" in failure.error_message for failure in failures)
+    assert any(msg.message_type == WorkerMessageType.END_EPISODE for _, msg in comm.sent)
+
+
+def test_only_one_overlapping_call_is_queued_for_an_episode(tmp_path, monkeypatch):
+    conductor, _, comm = _conductor(tmp_path, monkeypatch, max_queued_calls=1)
+    conductor._ingest_request(_request("first", "robot-a"))
+    conductor._ingest_request(_request("second", "robot-a"))
+    conductor._ingest_request(_request("third", "robot-a"))
+    assert [request.request_id for request in conductor.waiting_queue] == ["second"]
+    assert _new_requests(comm, "third") == []
+    failures = [msg.body for _, msg in comm.sent if msg.message_type == "request_failed"]
+    assert any(failure.request_id == "third" and failure.status == 429 for failure in failures)
+
+
+def test_slot_pressure_after_planning_drops_registered_request(tmp_path, monkeypatch):
+    conductor, model, comm = _conductor(tmp_path, monkeypatch, replicas=2)
+    conductor._ingest_request(_request("busy"))
+    busy_worker = _new_requests(comm, "busy")[0][0]
+    # A free slot exists on the other replica, so the cheap precheck passes.
+    # Force this candidate onto the busy replica to exercise late admission.
+    conductor._router.pick = lambda _configs, _groups: Placement({0: int(busy_worker[-1])}, {})
+    conductor._ingest_request(_request("waiting"))
+    assert len(model.views) == 2
+    assert [request.request_id for request in conductor.waiting_queue] == ["waiting"]
+    assert "waiting" not in conductor.requests
+    assert _new_requests(comm, "waiting") == []
