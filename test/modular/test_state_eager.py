@@ -16,6 +16,7 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 from test_state_calls import (
+    DIM,
     HEADS,
     LAYERS,
     SLOTS,
@@ -73,9 +74,9 @@ def _eager(**reads) -> Array:
     })
 
 
-def _handle(kv=None, paged=None, dense=None):
+def _handle(kv=None, paged=None, dense=None, array=None):
     """Built as a node builds it, with the setup the model's kernel settings give."""
-    array = _eager()
+    array = array or _eager()
     setup, problems = state_setup({}, [array], EAGER)
     assert not problems
     model = SimpleNamespace(declare_state=lambda: [array], get_combined_graph_walks=lambda: {})
@@ -349,3 +350,46 @@ def test_a_released_stream_never_plans_under_a_lease():
 def test_a_stream_its_window_reaches_whole_is_not_marked():
     _, planned = _committed(16)
     assert not planned["main"].beyond_reach, "a captured step would refuse a stream that released nothing"
+
+
+# A capture of the paged leg
+
+
+class _StubPaged(_StubAttn):
+    """Records its runs instead of reading the pool's pages."""
+
+    def run(self, q, label=None, kv_cache_layer=None, k=None, v=None, layer_idx=None):
+        self.runs.append((layer_idx, label))
+        return q
+
+
+def test_a_capture_warms_a_kept_window_read_up_on_its_padding_row():
+    """A capture runs its step eagerly on padding rows before it records, and a padding row opens with no layout, so
+    with no kept window. Refused as a request with no window is, no windowed Cosmos3 config that captures could boot."""
+    pool = KVManager(
+        cfg=PagedKVConfig(num_layers=LAYERS, num_qo_heads=HEADS, num_kv_heads=HEADS, head_dim=DIM, max_seq_len=SLOTS,
+                          max_num_pages=8, page_size=16),
+        name="kv", joint_comm_group=None,
+        transfer_engine_info=TransferEngineInfo("h", "h", LocalTransferEngine("h")), device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    pool.build_accelerator_graph_buffers([], 1, TOKENS)
+    pool.ingest_capture_row(-2)
+    paged = _StubPaged()
+    h = _handle(kv=pool, paged=paged, array=_windowed())
+    step = SubmoduleStep(segments=[Segment(-2, "main", TOKENS)], state={"kv": ArrayStep(keep=False)})
+    step = state_steps(step, {"kv": h}, graph_walk="gen", leased=True)
+    lease = _ctx(leased=True).slot_lease
+    ctx = StepContext(request_ids=(-2,), graph_walk="gen", slot=0, capture=True, slot_lease=lease)
+    step.set_ctx(ctx)
+    assert pool.admit(step.steps["kv"], ctx).ok
+    pool.plan(step.steps["kv"], ctx)
+    q, k, v = _tensors()
+    step.begin_calls()
+    for layer in range(LAYERS):
+        h.add(layer, k=k, v=v)
+        h.read(layer, q)
+    step.check_calls()
+    step.end_calls()
+    assert paged.runs == [(layer, "main") for layer in range(LAYERS)], "the capture would record no paged read"
+
