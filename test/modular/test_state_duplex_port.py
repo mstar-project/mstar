@@ -90,6 +90,12 @@ def _model(**model_kwargs) -> NemotronDuplexModel:
     return NemotronDuplexModel("unused", **model_kwargs)
 
 
+def _init_mixer(mixer: Mamba2Mixer) -> None:
+    """Draw A_log, D and dt_bias, which Mamba2Mixer leaves as torch.empty for the checkpoint to fill."""
+    for param in (mixer.A_log, mixer.D, mixer.dt_bias):
+        torch.nn.init.normal_(param)
+
+
 # Specs
 
 
@@ -363,6 +369,7 @@ def test_mamba2_and_causal_conv_on_the_device_equal_the_mixer_s_own_math():
     )
     device = torch.device("cuda")
     layer = Mamba2Mixer(nano, 0).to(device)
+    _init_mixer(layer)
     alone = Mamba2Mixer(nano, 0).to(device)
     alone.load_state_dict(layer.state_dict())
     value = Value(MAMBA_STATE, nodes={"nano_llm"}, layers={0}, entry=Entry({
@@ -464,9 +471,7 @@ def test_duplex_layers_run_standalone_with_no_handle():
     )
     llm = NemotronHLLM(nano)
     mixer = next(m for m in llm.modules() if isinstance(m, Mamba2Mixer))
-    # Mamba2Mixer leaves A_log, D and dt_bias as torch.empty for the checkpoint to fill.
-    for param in (mixer.A_log, mixer.D, mixer.dt_bias):
-        torch.nn.init.normal_(param)
+    _init_mixer(mixer)
     enc_config = FastConformerConfig(hidden_size=32, num_heads=4, num_layers=2, intermediate_size=64, num_mel_bins=16,
                                      subsampling_channels=8, causal=True, left_context=6)
     keyed = FastConformerEncoder(enc_config, kv_key=ENCODER_KV, conv_key=ENCODER_STATE)
