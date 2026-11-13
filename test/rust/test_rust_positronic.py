@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from types import SimpleNamespace
 
 import msgpack
 import numpy as np
@@ -36,6 +37,23 @@ def test_policy_metadata_must_pass_the_rust_launcher_json(meta):
 def test_config_cannot_advertise_ready_without_a_model_session_adapter():
     with pytest.raises(ValueError, match="no ready Positronic session adapter"):
         PositronicPolicy.from_config({"meta": {"robot": "praxis"}}, object())
+
+
+def test_normal_rust_launcher_drops_an_inherited_session_policy(monkeypatch):
+    from mstar.api_server import rust_frontend
+
+    seen = {}
+    monkeypatch.setenv("MSTAR_POSITRONIC", '{"meta": {"robot": "unapproved"}}')
+
+    def fake_popen(args, env):
+        seen["env"] = env
+        return SimpleNamespace(pid=1)
+
+    monkeypatch.setattr(rust_frontend.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(rust_frontend, "soundfile_library", lambda: None)
+    monkeypatch.setattr(rust_frontend, "openai_adapter_class", lambda name: "")
+    rust_frontend.launch_rust_server("bin", "stub", 12345, "bridge", "uploads", positronic=None)
+    assert "MSTAR_POSITRONIC" not in seen["env"]
 
 
 class Stub:
