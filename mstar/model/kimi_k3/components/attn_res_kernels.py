@@ -23,8 +23,6 @@ import os
 
 import torch
 
-from mstar.platforms import current_platform
-
 try:
     import triton
     import triton.language as tl
@@ -44,35 +42,9 @@ def launch_config(rows: int) -> tuple[str, int, int]:
         return "fused", 2048, 4 if rows < 1024 else 8
     return ("split", 512, 2) if rows <= 32 else ("split", 1024, 2)
 
-_PDL: dict[torch.device, bool] = {}
-
-
-def _pdl(device: torch.device) -> bool:
-    """Programmatic dependent launch (Hopper and newer NVIDIA): the mix kernel launches while
-    the partial kernel runs and waits on it in-kernel. Off unless ``MSTAR_ATTN_RES_PDL=1``: with
-    it on, the H200 parity runs had capture replay off eager by 0.73 and, with only the partial
-    kernel releasing, still 2 flipped decisive tokens in one of two TP1 runs; with it off, capture
-    and TP1 passed every run."""
-    if device.type != "cuda" or os.environ.get("MSTAR_ATTN_RES_PDL") != "1":
-        return False
-    if device not in _PDL:
-        _PDL[device] = current_platform.is_cuda() and current_platform.has_cuda_capability(9, device=device)
-    return _PDL[device]
 
 
 if triton is not None:
-
-    @triton.jit
-    def _gdc_wait(PDL: tl.constexpr, RELEASE: tl.constexpr = False):
-        """Wait for the previous grid (PDL). ``RELEASE`` lets the next grid launch now: only the
-        partial kernel does, its successor being the mix kernel, which waits on it. The mix and
-        fused kernels' successors are any kernel, and a PDL-launched one that reads before waiting
-        sees this read unfinished under CUDA-graph replay (H200, a 4-row capture: replay vs eager
-        off by 0.73 with the MLP regions compiled; 0.06 without the release)."""
-        if PDL:
-            tl.extra.cuda.gdc_wait()
-            if RELEASE:
-                tl.extra.cuda.gdc_launch_dependents()
 
     @triton.jit
     def _stream_chunk(prefix_row, addend_row, stream_row, d, dm, HAS_ADD: tl.constexpr,
@@ -91,7 +63,7 @@ if triton is not None:
     def _partial_kernel(
         stack, s_blk, s_tok, prefix, s_pre, addend, s_add, stream, nw, pw, part,
         M: tl.constexpr, MP: tl.constexpr, D: tl.constexpr, CH: tl.constexpr, NS: tl.constexpr,
-        HAS_ADD: tl.constexpr, PDL: tl.constexpr,
+        HAS_ADD: tl.constexpr,
     ):
         """Program (t, s): each candidate's sum of squares and product with the score weight
         over hidden slice s of token t, into ``part[t, s] = [sum_sq (MP), dot (MP)]``.
@@ -102,10 +74,8 @@ if triton is not None:
         j = jv.to(tl.int64)[:, None]
         d = s * CH + tl.arange(0, CH)
         dm = d < D
-        # the weights are no kernel's output: load them before waiting on the one ahead
         sw = (tl.load(nw + d, mask=dm, other=0.0).to(tl.float32)
               * tl.load(pw + d, mask=dm, other=0.0).to(tl.float32))
-        _gdc_wait(PDL, True)
         v = tl.load(stack + j * s_blk + t * s_tok + d[None, :], mask=(j < M) & dm[None, :],
                     other=0.0).to(tl.float32)
         p = _stream_chunk(prefix + t * s_pre, addend + t * s_add, stream + t * D, d, dm,
@@ -127,12 +97,11 @@ if triton is not None:
     def _mix_kernel(
         stack, s_blk, s_tok, cand, s_cand, part, out, eps,
         M: tl.constexpr, MP: tl.constexpr, D: tl.constexpr, CH: tl.constexpr,
-        NS: tl.constexpr, NSP: tl.constexpr, PDL: tl.constexpr,
+        NS: tl.constexpr, NSP: tl.constexpr,
     ):
         """Program (t, s): token t's softmax from its partials, then slice s of the mixture."""
         t = tl.program_id(0).to(tl.int64)
         s = tl.program_id(1)
-        _gdc_wait(PDL)
         k = tl.arange(0, NSP)[:, None]
         jv = tl.arange(0, MP)
         rows = part + (t * NS + k) * (2 * MP) + jv[None, :]
@@ -153,12 +122,11 @@ if triton is not None:
     def _fused_kernel(
         stack, s_blk, s_tok, prefix, s_pre, addend, s_add, stream, nw, pw, out, eps,
         M: tl.constexpr, MP: tl.constexpr, D: tl.constexpr, CH: tl.constexpr,
-        HAS_ADD: tl.constexpr, PDL: tl.constexpr,
+        HAS_ADD: tl.constexpr,
     ):
         """One program per token t: the sums over the hidden dim in CH-wide steps, the softmax,
         then the mixture in a second pass."""
         t = tl.program_id(0).to(tl.int64)
-        _gdc_wait(PDL)
         jv = tl.arange(0, MP)
         j = jv.to(tl.int64)[:, None]
         blk = stack + j * s_blk + t * s_tok
@@ -225,8 +193,6 @@ def attn_res_read_triton(
     if T == 0:
         return out, stream
     mp = triton.next_power_of_2(m + 1)
-    pdl = _pdl(prefix.device)
-    launch = {"launch_pdl": True} if pdl else {}
     auto_path, auto_ch, auto_warps = launch_config(T)
     if path is None:
         path, ch, num_warps = auto_path, ch or auto_ch, num_warps or auto_warps
@@ -235,8 +201,8 @@ def attn_res_read_triton(
         ch = ch or 2048
         _fused_kernel[(T,)](
             stack, s_blk, s_tok, prefix, prefix.stride(0), addend, addend.stride(0), stream,
-            nw, pw, out, float(eps), M=m, MP=mp, D=D, CH=ch, HAS_ADD=has_add, PDL=pdl,
-            num_warps=num_warps or 8, **launch)
+            nw, pw, out, float(eps), M=m, MP=mp, D=D, CH=ch, HAS_ADD=has_add,
+            num_warps=num_warps or 8)
         return out, stream
     ch = ch or 1024
     ns = triton.cdiv(D, ch)
@@ -244,10 +210,10 @@ def attn_res_read_triton(
     warps = num_warps or 2
     _partial_kernel[(T, ns)](
         stack, s_blk, s_tok, prefix, prefix.stride(0), addend, addend.stride(0), stream,
-        nw, pw, part, M=m, MP=mp, D=D, CH=ch, NS=ns, HAS_ADD=has_add, PDL=pdl,
-        num_warps=warps, **launch)
+        nw, pw, part, M=m, MP=mp, D=D, CH=ch, NS=ns, HAS_ADD=has_add,
+        num_warps=warps)
     _mix_kernel[(T, ns)](
         stack, s_blk, s_tok, stream, stream.stride(0), part, out, float(eps),
-        M=m, MP=mp, D=D, CH=ch, NS=ns, NSP=triton.next_power_of_2(ns), PDL=pdl,
-        num_warps=warps, **launch)
+        M=m, MP=mp, D=D, CH=ch, NS=ns, NSP=triton.next_power_of_2(ns),
+        num_warps=warps)
     return out, stream

@@ -77,7 +77,7 @@ def main():
     g = torch.Generator(device=dev).manual_seed(0)
     if args.site:
         return bench_sites(args, g)
-    print(f"# {torch.cuda.get_device_name()} torch {torch.__version__} PDL {K._pdl(dev)}")
+    print(f"# {torch.cuda.get_device_name()} torch {torch.__version__}")
     sink = open(args.out, "a") if args.out else None
     for T, m in itertools.product(map(int, args.tokens.split(",")), map(int, args.depths.split(","))):
         row = bench_shape(T, m, args.reads if T <= 256 else max(2, args.reads // 8),
