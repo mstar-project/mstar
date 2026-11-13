@@ -1,10 +1,9 @@
 """Kokoro's chunk loop as the engine drives it: one sentence chunk per
 iteration, until ``check_stop`` ends the loop after the request's last chunk.
 
-The engine keys a batch by the worker's integer rid handle, not by the
-request id string, so ``prepare_inputs`` and ``check_stop`` only agree on a
-request's chunk count when its per-request state is keyed by that handle.
-CPU only: tiny random weights, no checkpoint and no G2P.
+A request's chunk lengths ride its step metadata, so ``prepare_inputs`` and
+``check_stop`` agree on its chunk count with nothing kept per request. CPU
+only: tiny random weights, no checkpoint and no G2P.
 """
 
 from __future__ import annotations
@@ -19,9 +18,9 @@ from mstar.engine.resources import StepContext  # noqa: E402
 from mstar.model.kokoro.components import KokoroTTS  # noqa: E402
 from mstar.model.kokoro.config import (  # noqa: E402
     AUDIO_CHUNK,
+    CHUNK_LENGTHS,
     CHUNK_LOOP,
     PHONEME_IDS,
-    PHONEME_LENS,
     REF_STYLE,
     SPEED,
     SYNTH_NODE,
@@ -78,7 +77,6 @@ def _prompt_tensors(lengths: list[int], seed: int) -> dict[str, list[torch.Tenso
         ids[row, 1 : n - 1] = torch.randint(1, 16, (n - 2,), generator=generator)
     return {
         PHONEME_IDS: [ids],
-        PHONEME_LENS: [torch.tensor(lengths)],
         REF_STYLE: [torch.randn(len(lengths), 16, generator=generator)],
         SPEED: [torch.tensor([1.0])],
     }
@@ -93,8 +91,9 @@ def test_every_chunk_is_synthesized_before_the_loop_stops():
     infos = {
         handle: CurrentForwardPassInfo(
             request_id=rid, graph_walk=SYNTH_WALK, fwd_index=0, random_seed=0, max_tokens=0, rid_handle=handle,
+            step_metadata={CHUNK_LENGTHS: lengths},
         )
-        for handle, (rid, _) in requests.items()
+        for handle, (rid, lengths) in requests.items()
     }
     tensors = {handle: _prompt_tensors(lengths, seed=handle) for handle, (_, lengths) in requests.items()}
 
@@ -138,7 +137,4 @@ def test_every_chunk_is_synthesized_before_the_loop_stops():
         assert prepared[handle] == lengths, f"{requests[handle][0]} synthesized {prepared[handle]} of {lengths}"
         assert stopped_at[handle] == len(lengths) - 1
 
-    # the engine removes a request by its handle, which must take all its state
-    for handle in requests:
-        submodule.cleanup_request(handle)
-    assert submodule.request_states == {}
+    assert submodule.request_states == {}, "the loop keeps nothing per request"
