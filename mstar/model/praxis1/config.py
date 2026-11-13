@@ -228,6 +228,8 @@ class Praxis1Config:
         chunking = _section(config, "chunking")
         video = _section(config, "video")
         text = _section(config, "text_encoder")
+        if not isinstance(text.get("blank_caption"), str):
+            raise Praxis1ConfigError("text_encoder.blank_caption must be a string")
 
         canvas = video.get("canvas", SUPPORTED_CANVAS)
         if canvas != SUPPORTED_CANVAS:

@@ -367,7 +367,7 @@ class Praxis1Model(Model):
         branch a token to read.
         """
         tok = self._tokenizer()
-        task = prompt if (prompt and prompt.strip()) else " "
+        task = prompt.strip() if (prompt and prompt.strip()) else " "
         blank = self._blank_caption()
         pad = self.config.text_pad_to_multiple_of
 
@@ -396,9 +396,8 @@ class Praxis1Model(Model):
         )
 
     def _blank_caption(self) -> str:
-        """The unconditional caption the checkpoint names, or a single space."""
-        text = str(self.config.raw.get("text_encoder", {}).get("blank_caption", " "))
-        return text if text.strip() else " "
+        """The unconditional caption the checkpoint names, or a dummy-mode space."""
+        return self.config.raw.get("text_encoder", {}).get("blank_caption", " ")
 
     def _tokenizer(self):
         if self._tokenizer_cache is None:

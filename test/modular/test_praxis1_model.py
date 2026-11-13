@@ -82,7 +82,8 @@ DROID_CONFIG = {
         "tile_height": 224,
         "tile_width": 416,
     },
-    "text_encoder": {"model": "Qwen3.5-2B", "hidden_dim": 2048, "hidden_layer": -3},
+    "text_encoder": {"model": "Qwen3.5-2B", "hidden_dim": 2048, "hidden_layer": -3,
+                     "blank_caption": " "},
     "action_space": {"dim": 10},
 }
 
@@ -323,6 +324,35 @@ def test_dummy_prompt_has_the_declared_text_padding(monkeypatch, no_download):
     model.process_prompt("pick up cup")
     assert pads == [32, 32]
     assert no_download == []
+
+
+def test_served_prompt_strips_text_and_keeps_the_checkpoint_blank(tmp_path, monkeypatch, no_download):
+    config = json.loads(json.dumps(DROID_CONFIG))
+    config["text_encoder"]["blank_caption"] = "  "
+    model = _model(tmp_path, config, monkeypatch)
+    seen = []
+
+    class Tokenizer:
+        def __call__(self, *, text, **kwargs):
+            seen.append(text[0])
+            return {"input_ids": torch.tensor([[1]]), "attention_mask": torch.tensor([[1]])}
+
+    tokenizer = Tokenizer()
+
+    def fake_tokenizer():
+        return tokenizer
+
+    monkeypatch.setattr(model, "_tokenizer", fake_tokenizer)
+    model.process_prompt("  pick up cup\n")
+    assert seen == ["pick up cup", "  "]
+    assert no_download == []
+
+
+def test_served_checkpoint_requires_blank_caption():
+    config = json.loads(json.dumps(DROID_CONFIG))
+    del config["text_encoder"]["blank_caption"]
+    with pytest.raises(Praxis1ConfigError, match="blank_caption"):
+        Praxis1Config.from_dict(config)
 
 
 def test_the_config_read_fetches_config_json_only(tmp_path, monkeypatch):
