@@ -1404,6 +1404,8 @@ class RingHandle(ArrayHandle):
     handle's records, and the region would compile again for each kind of step. ``k``, ``v`` and ``q`` come as rows,
     (rows, tokens, heads, head_dim)."""
 
+    _write_refused = "write on an append-only array"
+
     def __init__(
         self, array: Array, resources: Mapping[str, Any], bindings: tuple[BoundOp, ...], resolved: "Resolved",
     ):
