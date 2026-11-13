@@ -196,6 +196,9 @@ def test_episode_layout_plans_both_guidance_branches_on_shared_resource(
         {"executed_rows": rows, "text_tokens": 3, "blank_tokens": 2,
          "action_format": "positronic"}, episode,
     )[-1]
+    from mstar.conductor.conductor import _with_planned_state_layout
+
+    (walk,) = _with_planned_state_layout([walk], model.declare_state())
     info = CurrentForwardPassInfo(
         request_id="r", graph_walk="chunk", fwd_index=0, random_seed=1, max_tokens=1,
         step_metadata=walk.step_metadata,

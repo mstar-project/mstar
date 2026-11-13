@@ -162,6 +162,9 @@ def _run_case(k: int, engine_autocast: bool, declared_resources: bool, video_sca
             {"executed_rows": 21 if k == 2 else 0, "text_tokens": 3,
              "blank_tokens": 2, "action_format": "positronic"}, episode,
         )[-1]
+        from mstar.conductor.conductor import _with_planned_state_layout
+
+        (walk,) = _with_planned_state_layout([walk], model.declare_state())
         metadata = walk.step_metadata
     else:
         bn.state_handles = handles

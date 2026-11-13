@@ -651,7 +651,10 @@ class KeptWindow:
 
 @dataclass(frozen=True, kw_only=True)
 class Layout:
-    """What a request writes to one label of one array, from `process_prompt`'s ``state_layout``."""
+    """What a request writes to one label of one array, from ``process_prompt`` or a planned mask read.
+
+    A walk plan can supply only mask lengths; the conductor rejects other fields before transport.
+    """
 
     spans: tuple[Span, ...] = ()
     growth: tuple[tuple[str, int], ...] = ()    # (loop, entries per iteration)

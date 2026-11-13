@@ -55,12 +55,6 @@ from mstar.engine.state import (
     TensorType,
     Window,
 )
-from mstar.engine.state.adapters import (
-    CHUNK_CAUSAL_LAYOUT_KWARG,
-    EXPERT_LAYOUT_KWARG,
-    chunk_causal_layouts,
-    expert_layouts,
-)
 from mstar.graph.base import (
     GraphEdge,
     GraphNode,
@@ -719,9 +713,7 @@ class Praxis1Model(Model):
                 ATTN_READS[EXPERT_TRUNK_KEYS]: ExpertCrossLayout(k, g + text, depth * f, k * f),
             })},
         }
-        declared = self.declare_state()
-        metadata[CHUNK_CAUSAL_LAYOUT_KWARG] = chunk_causal_layouts(declared, layout)
-        metadata[EXPERT_LAYOUT_KWARG] = expert_layouts(declared, layout)
+        metadata["state_layout"] = layout
         steps.append(
             WalkStep(
                 self.CHUNK_WARM_WALK if has_episode_text else self.CHUNK_WALK,

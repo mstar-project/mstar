@@ -8,17 +8,18 @@ from types import SimpleNamespace
 
 sys.path.insert(0, ".")
 
+import msgpack
 import pytest
 import torch
 
-from mstar.conductor.conductor import _with_chunk_causal_layout
+from mstar.conductor.conductor import Conductor, _with_chunk_causal_layout, _with_planned_state_layout
 from mstar.conductor.request_info import CurrentForwardPassInfo, WalkStep
 from mstar.engine.accelerator_graph_runner import PiecewiseAcceleratorGraphRunner
 from mstar.engine.resources.attn.ragged.chunk_causal import dense_visibility
 from mstar.engine.resources.attn.ragged.config import RaggedChunkCausalAttentionSpec
 from mstar.engine.resources.base import EngineResourceInfo, build_resource
 from mstar.engine.resources.step import Segment, StepContext, SubmoduleStep
-from mstar.engine.state import Array, ArrayStep, Attend, ChunkCausal, ChunkCausalLayout, KVEntry, Layout, Read
+from mstar.engine.state import Array, ArrayStep, Attend, Causal, ChunkCausal, ChunkCausalLayout, KVEntry, Layout, Read
 from mstar.engine.state.adapters import (
     CHUNK_CAUSAL_ATTEND,
     CHUNK_CAUSAL_LAYOUT_KWARG,
@@ -121,6 +122,44 @@ def test_episode_plan_chunk_lengths_replace_only_their_read() -> None:
         },
     }
     assert cold["tokens"]["main"]["attn"] == [4, 8, 0]
+
+
+def test_typed_walk_layout_reaches_forward_args_as_wire_safe_mask_lengths() -> None:
+    planned = {"tokens": {"main": Layout(chunk_causal={"attn": _lengths()})}}
+    (walk,) = _with_planned_state_layout(
+        [WalkStep("encode", step_metadata={"state_layout": planned})], [_array()],
+    )
+    (walk,) = _with_chunk_causal_layout([walk], None, [_array()])
+    conductor = Conductor.__new__(Conductor)
+    conductor._walk_inputs = {"encode": []}
+    args = conductor._plan_step(
+        SimpleNamespace(persist_signals={}), SimpleNamespace(plan=[walk]), 0,
+    )
+    assert args.step_metadata == {
+        CHUNK_CAUSAL_LAYOUT_KWARG: {"tokens": {"main": {"attn": [4, 16, 8]}}},
+    }
+    assert msgpack.unpackb(msgpack.packb(args.step_metadata, use_bin_type=True), raw=False) == args.step_metadata
+
+
+@pytest.mark.parametrize("planned,match", [
+    ({"tokens": {"other": Layout(chunk_causal={"attn": _lengths()})}}, "labels"),
+    ({"tokens": {"main": Layout(chunk_causal={"other": _lengths()})}}, "names no ChunkCausal read"),
+    ({"tokens": {"main": Layout(growth=(("loop", 1),))}}, "supports mask lengths only"),
+])
+def test_typed_walk_layout_rejects_bad_or_dropped_fields(planned, match) -> None:
+    with pytest.raises(RuntimeError, match=match):
+        _with_planned_state_layout(
+            [WalkStep("encode", step_metadata={"state_layout": planned})], [_array()],
+        )
+
+
+def test_typed_walk_layout_does_not_drop_a_paged_array_layout() -> None:
+    paged = replace(_array(), max_len=32, reads={"attn": Read(mask=Causal())})
+    with pytest.raises(RuntimeError, match="within-step mask arrays only"):
+        _with_planned_state_layout(
+            [WalkStep("encode", step_metadata={"state_layout": {"tokens": {"main": Layout()}}})],
+            [paged],
+        )
 
 
 def test_episode_plan_chunk_lengths_reject_an_unknown_read() -> None:

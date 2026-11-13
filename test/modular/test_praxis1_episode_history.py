@@ -150,6 +150,7 @@ def test_warm_openpi_is_refused_before_any_graph_walk() -> None:
 
 
 def test_attention_layout_uses_episode_depth_after_append() -> None:
+    from mstar.conductor.conductor import _with_planned_state_layout
     from mstar.engine.state.adapters import CHUNK_CAUSAL_LAYOUT_KWARG, EXPERT_LAYOUT_KWARG
     from mstar.model.praxis1.submodules import ATTN_READS, ENCODER_COND_KV, EXPERT_TRUNK_KEYS
 
@@ -166,7 +167,10 @@ def test_attention_layout_uses_episode_depth_after_append() -> None:
             {"executed_rows": rows, "text_tokens": 3, "blank_tokens": 2,
              "action_format": "positronic"}, episode,
         )[-1]
-        return walk.step_metadata
+        assert "state_layout" in walk.step_metadata
+        (wire_walk,) = _with_planned_state_layout([walk], model.declare_state())
+        assert "state_layout" not in wire_walk.step_metadata
+        return wire_walk.step_metadata
 
     cold, warm, reset = layout(0, 0), layout(1, FIRST_ROWS), layout(0, 0)
     for metadata, k, d in ((cold, 1, 0), (warm, 2, 1), (reset, 1, 0)):
