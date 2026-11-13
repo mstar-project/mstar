@@ -48,7 +48,12 @@ from mstar.engine.resources.kv.config import (
 )
 from mstar.engine.resources.lora.config import LoraSpec
 from mstar.engine.state import SampleSettings
-from mstar.engine.state.adapters import CHUNK_CAUSAL_LAYOUT_KWARG, EXPERT_LAYOUT_KWARG, sampling_configs
+from mstar.engine.state.adapters import (
+    CHUNK_CAUSAL_LAYOUT_KWARG,
+    EXPERT_LAYOUT_KWARG,
+    checked_step_mask_layouts,
+    sampling_configs,
+)
 from mstar.engine.state.analysis import declaration_digests
 from mstar.graph.base import GraphEdge, NodeAndGraphWalk, TensorPointerInfo
 from mstar.model.base import Model, WorkerGraph, serving_resources, streamed_inputs
@@ -92,24 +97,41 @@ from mstar.validation.resources import streamed_partitions
 logger = logging.getLogger(__name__)
 
 
-def _with_chunk_causal_layout(plan: list[WalkStep], layout: dict | None) -> list[WalkStep]:
+def _with_mask_layout(
+    plan: list[WalkStep], layout: dict | None, key: str, declarations: list | None, *, expert: bool,
+) -> list[WalkStep]:
+    """Carry data-worker lengths, with checked walk-plan lengths for episode-dependent reads."""
+    if not layout and not any(key in step.step_metadata for step in plan):
+        return plan
+    result = []
+    for step in plan:
+        merged = {
+            name: {label: dict(reads) for label, reads in by_label.items()}
+            for name, by_label in (layout or {}).items()
+        }
+        if key in step.step_metadata:
+            if declarations is None:
+                raise RuntimeError("planned mask layout needs state declarations")
+            planned = checked_step_mask_layouts(declarations, step.step_metadata[key], expert=expert)
+            for name, by_label in planned.items():
+                for label, reads in by_label.items():
+                    merged.setdefault(name, {}).setdefault(label, {}).update(reads)
+        result.append(replace(step, step_metadata={**step.step_metadata, key: merged}))
+    return result
+
+
+def _with_chunk_causal_layout(
+    plan: list[WalkStep], layout: dict | None, declarations: list | None = None,
+) -> list[WalkStep]:
     """Carry request mask lengths with each planned walk, including later passes of a partition."""
-    if not layout:
-        return plan
-    return [
-        replace(step, step_metadata={**step.step_metadata, CHUNK_CAUSAL_LAYOUT_KWARG: layout})
-        for step in plan
-    ]
+    return _with_mask_layout(plan, layout, CHUNK_CAUSAL_LAYOUT_KWARG, declarations, expert=False)
 
 
-def _with_expert_layout(plan: list[WalkStep], layout: dict | None) -> list[WalkStep]:
+def _with_expert_layout(
+    plan: list[WalkStep], layout: dict | None, declarations: list | None = None,
+) -> list[WalkStep]:
     """Carry small expert row geometry on every walk of the request."""
-    if not layout:
-        return plan
-    return [
-        replace(step, step_metadata={**step.step_metadata, EXPERT_LAYOUT_KWARG: layout})
-        for step in plan
-    ]
+    return _with_mask_layout(plan, layout, EXPERT_LAYOUT_KWARG, declarations, expert=True)
 
 
 def _walk_io(model: Model) -> tuple[dict[str, tuple[tuple[str, str], ...]], dict[str, frozenset[str]], frozenset[str]]:
@@ -1546,8 +1568,12 @@ class Conductor:
                 self.model.walk_plan(*plan_args, episode=episode_view)
                 if episode_active else self.model.walk_plan(*plan_args)
             )
-            pstate.plan = _with_chunk_causal_layout(pstate.plan, model_kwargs.get(CHUNK_CAUSAL_LAYOUT_KWARG))
-            pstate.plan = _with_expert_layout(pstate.plan, model_kwargs.get(EXPERT_LAYOUT_KWARG))
+            pstate.plan = _with_chunk_causal_layout(
+                pstate.plan, model_kwargs.get(CHUNK_CAUSAL_LAYOUT_KWARG), self._declarations(),
+            )
+            pstate.plan = _with_expert_layout(
+                pstate.plan, model_kwargs.get(EXPERT_LAYOUT_KWARG), self._declarations(),
+            )
             stream_moved = p.name in self.producer_triggered_partitions
             # refuse a plan the conductor can't run: a step whose walk isn't one of the
             # partition's (which startup checked are the model's), or a ``bind`` key

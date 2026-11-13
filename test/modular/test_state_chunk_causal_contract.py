@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+from dataclasses import replace
 from types import SimpleNamespace
 
 sys.path.insert(0, ".")
@@ -98,6 +99,36 @@ def test_request_layout_checks_read_key_before_dropping_within_step_kv_layout():
         kv_layouts([array], {"tokens": {"main": Layout(chunk_causal={"other": _lengths()})}}, {})
     with pytest.raises(RuntimeError, match="must be a ChunkCausalLayout"):
         kv_layouts([array], {"tokens": {"main": Layout(chunk_causal={"attn": "bad"})}}, {})
+
+
+def test_episode_plan_chunk_lengths_replace_only_their_read() -> None:
+    array = replace(_array(), labels={"main", "blank"}, reads={
+        "attn": _array().reads["attn"],
+        "other": Read(mask=ChunkCausal(8), op=Attend(q_heads=4)),
+    })
+    cold = {"tokens": {
+        "main": {"attn": [4, 8, 0], "other": [2, 8, 0]},
+        "blank": {"attn": [2, 8, 0]},
+    }}
+    warm = {"tokens": {"main": {"attn": [4, 16, 8]}}}
+    (walk,) = _with_chunk_causal_layout(
+        [WalkStep("encode", step_metadata={CHUNK_CAUSAL_LAYOUT_KWARG: warm})], cold, [array],
+    )
+    assert walk.step_metadata[CHUNK_CAUSAL_LAYOUT_KWARG] == {
+        "tokens": {
+            "main": {"attn": [4, 16, 8], "other": [2, 8, 0]},
+            "blank": {"attn": [2, 8, 0]},
+        },
+    }
+    assert cold["tokens"]["main"]["attn"] == [4, 8, 0]
+
+
+def test_episode_plan_chunk_lengths_reject_an_unknown_read() -> None:
+    planned = {"tokens": {"main": {"other": [4, 16, 8]}}}
+    with pytest.raises(RuntimeError, match="no matching read"):
+        _with_chunk_causal_layout(
+            [WalkStep("encode", step_metadata={CHUNK_CAUSAL_LAYOUT_KWARG: planned})], None, [_array()],
+        )
 
 
 def test_two_request_layouts_reach_binding_and_plan_without_cross_request_visibility():

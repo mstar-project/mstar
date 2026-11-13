@@ -732,6 +732,56 @@ def expert_layouts(
     return rows
 
 
+def checked_step_mask_layouts(
+    declarations: Sequence[Array | Sampler | SeqShard], wire: Mapping, *, expert: bool,
+) -> dict[str, dict[str, dict[str, list[int]]]]:
+    """Check a walk_plan mask layout against the declared reads and normalize its wire values.
+
+    The data worker checks ``state_layout`` before sending its layout. A walk plan
+    can add episode-dependent lengths later, so the conductor must check that
+    overlay at the same boundary before sending it to workers.
+    """
+    kind = "expert" if expert else "chunk-causal"
+    if not isinstance(wire, Mapping):
+        raise RuntimeError(f"planned {kind} layout must map array names to labels")
+    arrays = {declared.name: declared for declared in declarations if isinstance(declared, Array)}
+    typed: dict[str, dict[str, Layout]] = {}
+    for name, by_label in wire.items():
+        array = arrays.get(name) if type(name) is str else None
+        if array is None:
+            raise RuntimeError(f"planned {kind} layout names undeclared array {name!r}")
+        if not isinstance(by_label, Mapping):
+            raise RuntimeError(f"planned {kind} layout[{name!r}] must map labels to reads")
+        for label, by_read in by_label.items():
+            if type(label) is not str or label not in array.labels:
+                raise RuntimeError(f"planned {kind} layout[{name!r}] names undeclared label {label!r}")
+            if not isinstance(by_read, Mapping):
+                raise RuntimeError(f"planned {kind} layout[{name!r}][{label!r}] must map reads to lengths")
+            chunk: dict[str, ChunkCausalLayout] = {}
+            cross: dict[str, ExpertCrossLayout] = {}
+            self_attn: dict[str, ExpertSelfLayout] = {}
+            for key, lengths in by_read.items():
+                read = array.reads.get(key) if type(key) is str else None
+                where = f"planned {kind} layout[{name!r}][{label!r}][{key!r}]"
+                if not isinstance(lengths, (list, tuple)):
+                    raise RuntimeError(f"{where} must be a list of lengths")
+                if expert and read is not None and isinstance(read.mask, ExpertCross) and len(lengths) == 4:
+                    cross[key] = ExpertCrossLayout(*lengths)
+                elif expert and read is not None and isinstance(read.mask, ExpertSelf) and len(lengths) == 1:
+                    self_attn[key] = ExpertSelfLayout(*lengths)
+                elif not expert and read is not None and isinstance(read.mask, ChunkCausal) and len(lengths) == 3:
+                    chunk[key] = ChunkCausalLayout(
+                        global_len=lengths[0], noised_len=lengths[1], clean_len=lengths[2],
+                    )
+                else:
+                    raise RuntimeError(f"{where} names no matching read or has the wrong number of lengths")
+            typed.setdefault(name, {})[label] = Layout(
+                chunk_causal=chunk, expert_cross=cross, expert_self=self_attn,
+            )
+    # Reuse the declaration validators, including the expert frame offset rule.
+    return expert_layouts(declarations, typed) if expert else chunk_causal_layouts(declarations, typed)
+
+
 def _check_expert_layout(array: Array, label: str, layout: Layout) -> None:
     from mstar.engine.resources.attn.ragged.expert_mask import noised_frame_offset
 
