@@ -373,7 +373,7 @@ def test_a_node_that_splits_its_steps_refuses_block_causal_attention():
         )),
         SeqShardSpec("shard", {NODE}, ("main",), 0),
     ]
-    with pytest.raises(ValueError, match="does not support steps split over SP ranks"):
+    with pytest.raises(ValueError, match="block-causal attention 'attn' takes no split steps"):
         Engine(graph_runtime=None).load_model(
             {NODE: _Submodule()}, specs=specs, parallel_groups=_sp_groups(NODE), device=CPU,
             transfer_engine_info=None,

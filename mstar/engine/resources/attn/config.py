@@ -347,6 +347,16 @@ class BlockCausalAttentionSpec(AttentionSpec):
         if self.config.backend not in (AttnBackend.AUTO, AttnBackend.FLASHINFER):
             raise ValueError(f"block-causal attention runs on flashinfer, not {self.config.backend!r}")
 
+    def split_step_refusals(
+        self, node: str, shard: "SeqShardSpec", tp: int, sp: int, specs: Mapping[str, NodeResourceSpec],
+    ) -> list[str]:
+        # FlashInferBlockCausalManager sets no supports_split_steps, which the engine refuses at build; this says so
+        # from the spec, at validation
+        return [
+            f"block-causal attention {self.resource_key!r} takes no split steps, since its builder sets no sequence "
+            f"shard, so node {node!r} can't split them: run it on TP ranks alone"
+        ]
+
     @property
     def resource_class(self) -> "type[Resource]":
         from mstar.engine.resources.attn.block_causal import BlockCausalAttentionManager
