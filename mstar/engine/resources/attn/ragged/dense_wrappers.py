@@ -27,9 +27,10 @@ def _max_span(cu_seqlens: torch.Tensor) -> int:
     return int((cu_seqlens[1:] - cu_seqlens[:-1]).max())
 
 
-# Query rows from which every segment of a plan runs on its own fixed-length call:
-# H200, FA3 at 32/8 heads of 128, two to six segments: 6-9% under one varlen call
-# at 1536-3552 rows, while at 1024 and under the launches cost more than they save.
+# Query rows from which every segment of a plan runs on its own fixed-length call,
+# on Hopper (sm_90), where it was measured: an H200 at 32/8 heads of 128 ran 2.7-9.4%
+# under one varlen call for two to eight segments of 1536-3552 rows, but 3-13% over it at
+# 1280, and mixed below.
 _FIXED_SEGMENT_MIN_ROWS = 1536
 
 
@@ -57,6 +58,8 @@ class _DenseRaggedPrefillBase(_RaggedPrefillBase):
         self._max_k = 0
         # the segments of a plan FA3's fixed-length kernel runs, else None
         self._fixed: _FixedSegments | None = None
+        # several segments only where the split was measured to win
+        self._split_segments = fa3_fixed_into is not None and current_platform.cuda_capability(self.device) == (9, 0)
 
     def _plan_kernel(
         self, cu: torch.Tensor, kv_cu: torch.Tensor, total_tokens: int, causal: bool,
@@ -83,7 +86,7 @@ class _DenseRaggedPrefillBase(_RaggedPrefillBase):
         self._fixed = None
         if flash_attn_func is not None and not causal and cu_host.numel() == kv_host.numel() >= 2:
             if cu_host.numel() == 2 or (
-                fa3_fixed_into is not None and int((cu_host[1:] - cu_host[:-1]).min()) >= _FIXED_SEGMENT_MIN_ROWS
+                self._split_segments and int((cu_host[1:] - cu_host[:-1]).min()) >= _FIXED_SEGMENT_MIN_ROWS
             ):
                 self._fixed = _FixedSegments(tuple(cu_host.tolist()), tuple(kv_host.tolist()))
 
@@ -107,10 +110,9 @@ class _DenseRaggedPrefillBase(_RaggedPrefillBase):
             else:
                 # each segment writes its rows of one output, so nothing is concatenated after
                 out = q.new_empty(q.shape[0], q.shape[1], v.shape[-1])
-                scale = self.sm_scale if self.sm_scale is not None else q.shape[-1] ** -0.5
                 for i in range(len(fixed.q) - 1):
                     q0, q1, k0, k1 = fixed.q[i], fixed.q[i + 1], fixed.k[i], fixed.k[i + 1]
-                    fa3_fixed_into(q[None, q0:q1], k[None, k0:k1], v[None, k0:k1], out[None, q0:q1], scale)
+                    fa3_fixed_into(q[None, q0:q1], k[None, k0:k1], v[None, k0:k1], out[None, q0:q1], self.sm_scale)
         else:
             out = flash_attn_varlen_func(
                 q, k, v, self._cu_q, self._cu_k, self._max_q, self._max_k,

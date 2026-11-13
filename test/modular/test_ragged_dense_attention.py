@@ -31,6 +31,7 @@ from mstar.engine.resources import (
 from mstar.engine.resources.attn.dense import _fa3_unavailable_reason
 from mstar.engine.resources.attn.ragged.dense import DenseRaggedCrossManager, DenseRaggedManager
 from mstar.engine.resources.attn.ragged.dense_wrappers import (
+    DensePrefixedPrefillWrapper,
     DenseRaggedCrossPrefillWrapper,
     DenseRaggedPrefillWrapper,
 )
@@ -196,20 +197,30 @@ def _varlen_segments(dw, q, k, v, q_lens, kv_lens, scale):
     return out[0] if isinstance(out, tuple) else out
 
 
-# Cosmos3's guidance pair (one context longer than the other) and a three-request pack
+# Cosmos3's guidance pair (one context longer than the other) and a three-request pack,
+# through the cross wrapper and the prefixed one Cosmos3's DiT plans, with q / k / v
+# as separate tensors or as strided slices of one fused projection
 @pytest.mark.parametrize("q_lens,kv_lens", [
     ([1536, 1536], [2436, 1596]),
     ([1600, 2000, 1536], [1700, 2900, 1536]),
 ])
-def test_long_segments_each_run_the_fixed_length_kernel_bit_exactly(monkeypatch, q_lens, kv_lens):
+@pytest.mark.parametrize("cls", [DenseRaggedCrossPrefillWrapper, DensePrefixedPrefillWrapper])
+@pytest.mark.parametrize("strided", [False, True])
+def test_long_segments_each_run_the_fixed_length_kernel_bit_exactly(monkeypatch, q_lens, kv_lens, cls, strided):
     """Every segment of an eager non-causal plan at least the threshold long runs
     on its own fixed-length call into one output, with the varlen kernel's output
     bit for bit."""
     dw, calls = _count_fixed_segment_calls(monkeypatch)
     gen = torch.Generator(device=DEVICE).manual_seed(5)
-    q = torch.randn(sum(q_lens), 32, 128, dtype=DTYPE, device=DEVICE, generator=gen)
-    k, v = (torch.randn(sum(kv_lens), 8, 128, dtype=DTYPE, device=DEVICE, generator=gen) for _ in range(2))
-    w = cross_wrapper(num_qo_heads=32, num_kv_heads=8, head_dim=128)
+    if strided:
+        # one [N, 32 + 8 + 8, 128] projection: the rows of q, k and v are 48 heads apart
+        rows = max(sum(q_lens), sum(kv_lens))
+        fused = torch.randn(rows, 48, 128, dtype=DTYPE, device=DEVICE, generator=gen)
+        q, k, v = fused[:sum(q_lens), :32], fused[:sum(kv_lens), 32:40], fused[:sum(kv_lens), 40:]
+    else:
+        q = torch.randn(sum(q_lens), 32, 128, dtype=DTYPE, device=DEVICE, generator=gen)
+        k, v = (torch.randn(sum(kv_lens), 8, 128, dtype=DTYPE, device=DEVICE, generator=gen) for _ in range(2))
+    w = cls(num_qo_heads=32, num_kv_heads=8, head_dim=128, device=DEVICE, q_data_type=DTYPE)
     w.plan(cu(q_lens), cu(kv_lens))
     got = w.run(q, k, v)
     assert calls == q_lens
