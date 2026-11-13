@@ -1033,6 +1033,24 @@ def test_a_kept_window_picks_its_binding_only_through_for_mask():
     assert isinstance(BINDINGS[PAGED, type(None)].for_mask(plain), PagedNoOp)
 
 
+def test_a_backend_s_binding_keeps_a_window_where_the_default_binding_does(monkeypatch):
+    """A request has no setup, so its layout sizes a read's pages by the binding `BINDINGS` gives the read. A backend
+    whose binding kept no window would run the read over every entry while the pool released the pages behind the
+    window. The setup leaves such a read on its default binding and reports the block."""
+    from mstar.engine.state import adapters
+
+    class _Dense(adapters.OpBinding):
+        """A backend's binding for a paged `Attend`, which keeps no window."""
+
+    monkeypatch.setitem(adapters.SDPA, (adapters.PAGED, Attend), _Dense())
+    setup, (problem,) = adapters.state_setup({"resources": {"self_attn": {"backend": "sdpa"}}}, [_kept_array()])
+    assert problem.startswith(
+        "resources.self_attn: backend sdpa binds Array 'dit_kv'.reads['self_attn'] through _Dense in place of "
+        "KeptWindowAttend, and only one of them keeps a window"
+    ), problem
+    assert setup.by_read == {}, "the read should stay on the binding its layout is sized by"
+
+
 @pytest.mark.parametrize(("tokens", "fits"), [(128, True), (512, True), (64, False), (200, False)])
 def test_a_frame_fits_the_block_mask_by_one_rule(tokens, fits):
     """The read's check at validation and the ring at build ask the same predicate."""
