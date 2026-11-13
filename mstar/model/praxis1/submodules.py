@@ -378,8 +378,10 @@ class Praxis1BackboneSubmodule(_Praxis1Node):
     """
 
     # The reference uses the checkpoint dtype directly and widens the MoE
-    # router GEMM to float32. Autocast would narrow that GEMM again.
+    # router GEMM to float32. Autocast would narrow that GEMM again; the
+    # engine's TF32 default would narrow its float32 mantissa on CUDA.
     disable_autocast = True
+    float32_matmul_precision = "highest"
 
     def __init__(self, config: Praxis1Config, backbone: nn.Module, *, episode_text: bool = False,
                  attention_resources: bool = True) -> None:
@@ -582,6 +584,7 @@ class Praxis1ActionExpertSubmodule(_Praxis1Node):
     """One Euler step of the action expert, over the backbone's taps."""
 
     disable_autocast = True
+    float32_matmul_precision = "highest"
 
     def __init__(self, config: Praxis1Config, expert: nn.Module) -> None:
         super().__init__(config)
