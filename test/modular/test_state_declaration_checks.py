@@ -20,6 +20,7 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 
+from mstar.engine.resources.attn.ragged.config import RaggedAttnBackend
 from mstar.engine.state import (
     Array,
     Attend,
@@ -578,6 +579,13 @@ def test_the_digests_cover_the_kernel_settings_since_a_pool_size_can_follow_the_
     theirs = declaration_digests([a, b], {"kv": {"max_num_pages": 128}})
     message = digest_mismatch(ours, theirs, here="API server", there="conductor")
     assert message is not None and "declare different state: kernel_settings()." in message, message
+
+
+def test_the_digests_take_a_ragged_backend_among_the_kernel_settings():
+    a, b = _declarations()
+    dense = declaration_digests([a, b], {"attn": {"backend": RaggedAttnBackend.DENSE}})
+    auto = declaration_digests([a, b], {"attn": {"backend": RaggedAttnBackend.AUTO}})
+    assert dense != auto, "a worker running another attention kernel would match the conductor"
 
 
 def test_a_worker_whose_declarations_differ_from_the_conductors_fails_before_it_builds(monkeypatch):
