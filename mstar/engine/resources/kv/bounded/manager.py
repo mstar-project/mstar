@@ -47,11 +47,13 @@ class BoundedPlan(NamedTuple):
 
 
 class _Request:
-    __slots__ = ("slot", "written")
+    __slots__ = ("slot", "written", "source")
 
     def __init__(self, slot: int):
         self.slot = slot
         self.written = 0
+        # the source its stream began from, which its retained keys are read from
+        self.source = None
 
 
 class BoundedKVManager(Resource):
@@ -263,6 +265,11 @@ class BoundedKVManager(Resource):
                     return AdmitOutcome(ok=False, ready=False, reason=AdmitRuntimeError(
                         f"{seg.request_id!r} declares {pos.written} written tokens; "
                         f"{req.written} were committed", request_ids=frozenset({seg.request_id})))
+                if req.written and pos.source != req.source:
+                    return AdmitOutcome(ok=False, ready=False, reason=AdmitRuntimeError(
+                        f"{seg.request_id!r} began from source {req.source}; its step names source {pos.source}",
+                        request_ids=frozenset({seg.request_id})))
+                req.source = pos.source
         return ADMIT_OK
 
     def rollback_admit(self, step: BoundedKVStep, ctx: StepContext) -> None:
