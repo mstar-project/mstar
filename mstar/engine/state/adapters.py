@@ -3,7 +3,6 @@ storage and op type, and a handle per storage. It builds the specs, steps and la
 
 import dataclasses
 import functools
-import os
 from abc import ABC, abstractmethod
 from collections import Counter
 from collections.abc import Callable, Collection, Mapping, Sequence
@@ -43,6 +42,7 @@ from mstar.engine.resources.kv.config import (
     RingKVLayerConfig,
     RingKVStep,
 )
+from mstar.engine.resources.kv.manager import _DEBUG_ASSERTS
 from mstar.engine.resources.kv.plan import stage_reach
 from mstar.engine.resources.kv.ring.cache import fits_block_mask
 from mstar.engine.resources.linear_attn.config import (
@@ -116,11 +116,6 @@ from mstar.model.components.diffusion.attention import FrameSDPA, joint_attentio
 if TYPE_CHECKING:
     from mstar.engine.state.state_op import StateOp
     from mstar.model.base import LabelLayout, Model
-
-
-# Off by default: `settle` reads each eager verify step's counts back to the host to check their range, which waits
-# for the step.
-_DEBUG_ASSERTS = os.environ.get("MSTAR_KV_DEBUG_ASSERTS", "0") == "1"
 
 
 def node_resources(model: "Model", *, setup: "StateSetup | None" = None) -> list[NodeResourceSpec]:
