@@ -1,4 +1,4 @@
-"""H200 B1/B8 VoxCPM2 solve. The engine owns compilation, capture and replay."""
+"""H200 B1 VoxCPM2 solve. The engine owns compilation, capture and replay."""
 
 from __future__ import annotations
 
@@ -105,7 +105,7 @@ class PatchSolve(nn.Module):
     def supports(self, lm, residual, cond, noise, cfg, span) -> bool:
         batch = lm.shape[0] if lm.ndim == 2 else 0
         return (
-            batch in (1, 8)
+            batch == 1
             and lm.shape == (batch, 2048) and residual.shape == (batch, 2048)
             and cond.shape == (batch, 4, 64) and noise.shape == (batch, 64, 4)
             and cfg.shape == (batch,) and span.shape == (11,)
@@ -142,5 +142,5 @@ def prepare(model) -> PatchSolve | None:
         logger.info("VoxCPM2 H200 solve unavailable: set CUTLASS_ROOT as documented in installation.rst")
         return None
     load_native()
-    logger.info("VoxCPM2: H200 B1/B8 native solve; other shapes retain the standard path")
+    logger.info("VoxCPM2: H200 B1 native solve; other shapes retain the standard path")
     return PatchSolve(model)

@@ -41,7 +41,7 @@ def test_worker_dtype_cast_preserves_materialized_rotary_values():
     assert torch.equal(obj.cosine, table) and torch.equal(obj.sine, table)
 
 
-@pytest.mark.parametrize("batch", [1, 8])
+@pytest.mark.parametrize("batch", [1, 2, 8])
 def test_dispatch_uses_actual_tensor_layout_and_batch(batch):
     with FakeTensorMode():
         obj = PatchSolve.__new__(PatchSolve)
@@ -50,7 +50,9 @@ def test_dispatch_uses_actual_tensor_layout_and_batch(batch):
         inputs = [torch.empty(s, device="cuda", dtype=torch.bfloat16)
                   for s in ((batch, 2048), (batch, 2048), (batch, 4, 64), (batch, 64, 4), (batch,), (11,))]
         inputs[4] = inputs[4].float()
-        assert obj.supports(*inputs)
+        assert obj.supports(*inputs) == (batch == 1)
+        if batch != 1:
+            return
         changed = list(inputs)
         changed[0] = torch.empty((2, 2048), device="cuda", dtype=torch.bfloat16)
         assert not obj.supports(*changed)
@@ -111,9 +113,8 @@ def test_real_weights_compile_capture_and_fallback(monkeypatch, record_property)
     stream.wait_stream(torch.cuda.current_stream())
     graphs, outputs, expected = [], [], []
     with torch.cuda.stream(stream):
-        # Interleaving batches exercises the per-device, per-batch BLAS cache.
-        for batch in (1, 8, 1, 8):
-            ys = inputs(batch)
+        for _ in range(2):
+            ys = inputs(1)
             expected.append(model.predict_patch(*ys).clone())
             for _ in range(2):
                 compiled(*ys)
@@ -144,8 +145,10 @@ def test_real_weights_compile_capture_and_fallback(monkeypatch, record_property)
 
     # Unsupported batches and schedules still execute the original function.
     solver = model.patch_solver
-    for case in (inputs(2), inputs(1, 8)):
+    for case in (inputs(2), inputs(8), inputs(1, 8)):
         assert not solver.supports(*case)
+        with pytest.raises(RuntimeError, match="invalid tensor shape"):
+            solver(*case)
         actual = model.predict_patch(*case)
         model.patch_solver = None
         reference = model.predict_patch(*case)
@@ -156,7 +159,7 @@ def test_real_weights_compile_capture_and_fallback(monkeypatch, record_property)
     # Shared norm's CUDA fallback otherwise rounds FP32 inputs back to BF16.
     from mstar.model.components import norm
 
-    cases = [inputs(1), inputs(8)]
+    cases = [inputs(1)]
     actual = [model.predict_patch(*case).clone() for case in cases]
     model.patch_solver = None
     model.float()

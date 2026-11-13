@@ -8,9 +8,9 @@ On H200, with the native solve's dependencies from `docs/installation.rst`:
 python -m benchmark.kernels.voxcpm2 --checkpoint /path/to/VoxCPM2 --out solve-timing.json
 ```
 
-This captures the standard O2 and native B1/B8 solves on identical inputs and
-alternates unprofiled replay measurements. `--fixtures` can name a directory of
-recorded `inputs-b1.pt` and `inputs-b8.pt` input lists. The JSON records all samples
+This captures the standard O2 and native B1 solves on identical inputs and
+alternates unprofiled replay measurements. `--fixtures` can name a directory containing
+a recorded `inputs-b1.pt` input list. The JSON records all samples
 and the native binary hash. Region timing does not establish serving throughput
 or audio quality; use `benchmark.eval run tts` for those.
 
