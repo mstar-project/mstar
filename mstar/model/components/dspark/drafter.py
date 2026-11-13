@@ -41,6 +41,7 @@ from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.engine.resources.step import ResourceStep
 from mstar.engine.resources.taps.config import TapSpec, TapStep
 from mstar.model.components.dspark.config import DSparkConfig
+from mstar.model.components.dspark.context_write import write_context
 from mstar.model.components.hosted_drafter import HostedDrafter, HostedDrafterDecl
 from mstar.model.components.norm import RMSNorm
 
@@ -266,8 +267,7 @@ class DSparkDrafter(nn.Module, HostedDrafter):
     def _write_context(self) -> None:
         taps = self.taps.read()
         context = self.hidden_norm(self.fc(taps.reshape(taps.shape[0], -1).to(self.fc.weight.dtype)))
-        # the query half of each layer's projection goes unused; a K/V-only projection would save it
-        self.backbone.write_kv(context, label=LABEL)
+        write_context(self.backbone, context, label=LABEL)
 
 
 class _MarkovHead(nn.Module):
