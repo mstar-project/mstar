@@ -14,6 +14,10 @@ The routed experts are held as ``moe_experts`` says, the same values each way:
   32 inputs. A hit expert is dequantized for the step.
 - ``fp8``: their upcast to E4M3 32 x 32 blocks, in ``fused_moe``'s layout.
 - ``dense``: the model's dtype.
+
+A TP group gives each rank a slice of every expert's intermediate dims, or under the node
+group's ``ep_config: {parallel: ep}`` whole routed experts, an even share of them, of which a
+rank runs its own. Either way one all-reduce sums the ranks; the shared expert stays sliced.
 """
 from __future__ import annotations
 
@@ -23,7 +27,8 @@ from torch import nn
 
 from mstar.distributed.communication import CommGroup
 from mstar.distributed.utils import divide
-from mstar.model.components.moe import NoAuxTcRouter
+from mstar.model.components.moe import NoAuxTcRouter, _sync_routing
+from mstar.model.components.moe_parallel import MoeParallelConfig
 from mstar.model.deepseek_v41.components.linear import fp32_linear
 from mstar.model.deepseek_v41.config import DeepseekV41Config
 from mstar.utils.fp8_block import E8M0_DTYPE, dequantize_fp8_block_weight
@@ -34,7 +39,8 @@ FP4_GROUP = 32
 
 
 class DeepseekV41MoE(nn.Module):
-    def __init__(self, config: DeepseekV41Config, comm_group: CommGroup | None = None) -> None:
+    def __init__(self, config: DeepseekV41Config, comm_group: CommGroup | None = None,
+                 moe_parallel: MoeParallelConfig | None = None) -> None:
         super().__init__()
         self.comm_group = comm_group or CommGroup.trivial()
         self.tp_size = self.comm_group.world_size
@@ -47,9 +53,16 @@ class DeepseekV41MoE(nn.Module):
         self.inter = divide(config.moe_intermediate_size, self.tp_size)
         if self.inter % self.block:
             raise ValueError(f"a rank's {self.inter} intermediate dims are not whole {self.block}-wide scale blocks")
-        if self.layout == "fp4" and (self.inter % FP4_GROUP or self.hidden_size % FP4_GROUP):
+        self.expert_parallel = moe_parallel is not None and moe_parallel.parallel == "ep" and self.tp_size > 1
+        if self.expert_parallel:  # this rank's whole experts, at full width
+            self.local_experts = divide(self.num_experts, self.tp_size)
+            self.expert_start = self.comm_group.rank * self.local_experts
+            self.expert_inter = config.moe_intermediate_size
+        else:
+            self.local_experts, self.expert_start, self.expert_inter = self.num_experts, 0, self.inter
+        if self.layout == "fp4" and (self.expert_inter % FP4_GROUP or self.hidden_size % FP4_GROUP):
             raise ValueError(
-                f"fp4 experts scale {FP4_GROUP} inputs at a time: a rank's {self.inter} intermediate dims and "
+                f"fp4 experts scale {FP4_GROUP} inputs at a time: a rank's {self.expert_inter} intermediate dims and "
                 f"the hidden size {self.hidden_size} must be whole groups (moe_experts: fp8 or dense otherwise)")
 
         self.gate = NoAuxTcRouter(
@@ -60,7 +73,7 @@ class DeepseekV41MoE(nn.Module):
             norm_topk_prob=config.norm_topk_prob,
             scoring_func=config.scoring_func,
         )
-        experts, hidden, inter, block = self.num_experts, self.hidden_size, self.inter, self.block
+        experts, hidden, inter, block = self.local_experts, self.hidden_size, self.expert_inter, self.block
         self.experts = nn.Module()
         if self.layout == "fp4":
             def stored(rows: int, width: int) -> nn.Parameter:
@@ -85,8 +98,8 @@ class DeepseekV41MoE(nn.Module):
             self.experts.gate_up_proj = nn.Parameter(torch.empty(experts, 2 * inter, hidden))
             self.experts.down_proj = nn.Parameter(torch.empty(experts, hidden, inter))
         self.shared = nn.Module()
-        self.shared.gate_up_proj = nn.Parameter(torch.empty(2 * inter, hidden))
-        self.shared.down_proj = nn.Parameter(torch.empty(hidden, inter))
+        self.shared.gate_up_proj = nn.Parameter(torch.empty(2 * self.inter, hidden))
+        self.shared.down_proj = nn.Parameter(torch.empty(hidden, self.inter))
 
     def process_weights_after_loading(self, device) -> None:
         del device
@@ -123,9 +136,10 @@ class DeepseekV41MoE(nn.Module):
         return fp32_linear(round_fp8(act.to(tokens.dtype), self.block), down)
 
     def _dispatch(self, tokens: torch.Tensor, topk_weights: torch.Tensor, topk_ids: torch.Tensor) -> torch.Tensor:
-        """The routed experts' sum in fp32, over the experts this batch hit."""
+        """The routed experts' sum in fp32, over this rank's experts that the batch hit."""
         out = torch.zeros(tokens.shape, dtype=torch.float32, device=tokens.device)
         mask = F.one_hot(topk_ids, num_classes=self.num_experts).permute(2, 1, 0)
+        mask = mask[self.expert_start:self.expert_start + self.local_experts]
         for expert in torch.greater(mask.sum(dim=(-1, -2)), 0).nonzero():
             slot, token = torch.where(mask[expert[0]])
             gate_up, down = self._expert_weights(expert[0], tokens.dtype)
@@ -136,6 +150,9 @@ class DeepseekV41MoE(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         flat = hidden_states.reshape(-1, self.hidden_size)
         topk_weights, topk_ids, _ = self.gate(flat)
+        if self.expert_parallel:
+            # a token's experts sit on several ranks, which must all route it alike
+            topk_weights, topk_ids = _sync_routing(self.comm_group, topk_weights, topk_ids)
         tokens = round_fp8(flat, self.block)
         out = self._dispatch(tokens, topk_weights, topk_ids)
         out = out + self._expert(tokens, self.shared.gate_up_proj, self.shared.down_proj).float()

@@ -22,6 +22,7 @@ import torch
 from safetensors.torch import load_file, save_file
 
 from mstar.distributed.communication import CommGroup
+from mstar.model.components.moe_parallel import MoeParallelConfig
 from mstar.model.deepseek_v41 import _testing
 from mstar.model.deepseek_v41._testing import add_request, cpu_engine, logit_gap, random_ids, run_request, run_step
 from mstar.model.deepseek_v41.components.engram import bucket_primes, table_rows
@@ -127,12 +128,16 @@ class TestCheckpointLayout:
         weights = ((name, torch.empty(shape, dtype=dtype, device="meta")) for name, dtype, shape in served)
         check_loaded(lm, load_deepseek_v41_weights(lm, weights), "checkpoint layout")
 
-    @pytest.mark.parametrize("tp", [1, 8])
-    def test_fp4_experts_are_held_in_the_checkpoints_own_bytes(self, tp):
-        """A rank's routed experts take its share of the bytes the checkpoint stores them in."""
+    @pytest.mark.parametrize("tp, parallel", [(1, "tp"), (8, "tp"), (8, "ep")])
+    def test_fp4_experts_are_held_in_the_checkpoints_own_bytes(self, tp, parallel):
+        """A rank's routed experts take its share of the bytes the checkpoint stores them in:
+        a slice of each, or under ``ep_config: {parallel: ep}`` its 48 whole ones, 2304 wide."""
         config = _checkpoint_config()
         with torch.device("meta"):
-            moe = DeepseekV41MoE(config, _rank(tp - 1, tp))
+            moe = DeepseekV41MoE(config, _rank(tp - 1, tp), MoeParallelConfig(parallel=parallel))
+        whole = parallel == "ep"
+        assert moe.experts.down_proj_packed.shape == (384 // tp if whole else 384, 5120, 1152 if whole else 1152 // tp)
+        assert moe.shared.down_proj.shape == (5120, 2304 // tp)
         held = sum(p.numel() * p.element_size() for p in moe.experts.parameters())
         shipped = sum(math.prod(shape) * dtype.itemsize for name, dtype, shape in _checkpoint_tensors()
                       if re.match(r"layers\.0\.ffn\.experts\.\d+\.", name))
@@ -224,12 +229,12 @@ class TestExpertUpcast:
 class _OneMoE(torch.nn.Module):
     """One block's MoE under the name the loader finds it by, ``model.layers.0.ffn``."""
 
-    def __init__(self, config: DeepseekV41Config, group: CommGroup | None = None) -> None:
+    def __init__(self, config: DeepseekV41Config, group: CommGroup | None = None, moe_parallel=None) -> None:
         super().__init__()
         self.config, self.comm_group = config, group or CommGroup.trivial()
         self.model = torch.nn.Module()
         self.model.layers = torch.nn.ModuleList([torch.nn.Module()])
-        self.model.layers[0].ffn = DeepseekV41MoE(config, group)
+        self.model.layers[0].ffn = DeepseekV41MoE(config, group, moe_parallel)
 
     @property
     def ffn(self) -> DeepseekV41MoE:
@@ -262,13 +267,13 @@ def _all_reduce_after(sums: list[torch.Tensor]):
 
 
 def _run_ranks(config: DeepseekV41Config, tensors: dict[str, torch.Tensor], x: torch.Tensor,
-               tp: int) -> list[torch.Tensor]:
+               tp: int, parallel: str = "tp") -> list[torch.Tensor]:
     """One block's MoE over a ``tp``-wide group, rank after rank: each rank's output, the last
     one's being the group's."""
     sums: list[torch.Tensor] = []
     outs = []
     for rank in range(tp):
-        root = _OneMoE(config, _rank(rank, tp))
+        root = _OneMoE(config, _rank(rank, tp), MoeParallelConfig(parallel=parallel))
         check_loaded(root, load_deepseek_v41_weights(root, tensors.items()), "one block")
         root.ffn.comm_group.all_reduce = _all_reduce_after(sums)
         outs.append(root.ffn(x))
@@ -331,16 +336,26 @@ class TestExpertLayouts:
         assert torch.equal(dense.gate_up_proj[1], gate_up) and torch.equal(dense.down_proj[1], down)
 
     @pytest.mark.usefixtures("cpu")
+    @pytest.mark.parametrize("parallel", ["tp", "ep"])
     @pytest.mark.parametrize("tp", [2, 8])
-    def test_over_a_tp_group_fp4_is_dense_bit_for_bit_and_the_group_matches_one_rank(self, tp):
+    def test_over_a_tp_group_fp4_is_dense_bit_for_bit_and_the_group_matches_one_rank(self, tp, parallel):
+        """A slice of every expert a rank, or whole experts a rank (``ep_config: {parallel: ep}``)."""
         config = DeepseekV41Config.reduced(moe_intermediate_size=32 * tp)
         tensors = {name: t for name, t in _testing.random_checkpoint(config, seed=0).items()
                    if name.startswith("layers.0.ffn.")}
         x = torch.randn(24, config.hidden_size, generator=torch.Generator().manual_seed(1))
-        fp4 = _run_ranks(config, tensors, x, tp)
-        dense = _run_ranks(dataclasses.replace(config, moe_experts="dense"), tensors, x, tp)
+        fp4 = _run_ranks(config, tensors, x, tp, parallel)
+        dense = _run_ranks(dataclasses.replace(config, moe_experts="dense"), tensors, x, tp, parallel)
         assert all(torch.equal(a, b) for a, b in zip(fp4, dense, strict=True))
         assert logit_gap(fp4[-1], _run_ranks(config, tensors, x, 1)[0]) < 1e-5
+
+    def test_a_node_group_may_ask_for_whole_experts_a_rank_and_nothing_else_of_ep(self, snapshot, tmp_path):
+        model = DeepseekV41Model(str(snapshot[0]), max_seq_len=256)
+        group = {"node_names": ["LLM"], "ranks": [0, 1], "tp_size": 2, "ep_config": {"parallel": "ep"}}
+        (tmp_path / "ep.yaml").write_text(json.dumps({"model": "deepseek_v41", "node_groups": [group]}))
+        model.get_sharding_config(str(tmp_path / "ep.yaml"))  # refused for a node that is not EP-enabled
+        with pytest.raises(ValueError, match="ep_config.parallel only"):
+            model.get_submodule("LLM", moe_parallel=MoeParallelConfig(parallel="ep", log_expert_load_every=8))
 
 
 @pytest.fixture

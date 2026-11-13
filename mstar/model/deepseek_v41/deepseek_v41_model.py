@@ -318,7 +318,7 @@ class DeepseekV41Model(ByteLevelTextOutput, Model):
     def get_default_sharding_config(self):
         from mstar.distributed.base import ShardingConfig
 
-        return ShardingConfig(groups=[], tp_enabled_nodes={"LLM"}, shard_dim={})
+        return ShardingConfig(groups=[], tp_enabled_nodes={"LLM"}, shard_dim={}, ep_enabled_nodes={"LLM"})
 
     # -------------------------------------------------------------------
     # Model ABC: submodule loading
@@ -327,11 +327,11 @@ class DeepseekV41Model(ByteLevelTextOutput, Model):
     def get_submodule(
         self, node_name: str, device: str = "cpu", tp_group=None,
         autocast_dtype: torch.dtype | None = None,
-        sp_group=None,
+        sp_group=None, moe_parallel=None,
     ) -> NodeSubmodule | None:
         if node_name not in self._submodule_cache:
             self._submodule_cache[node_name] = self._create_submodule(
-                node_name, device, tp_group=tp_group, autocast_dtype=autocast_dtype)
+                node_name, device, tp_group=tp_group, autocast_dtype=autocast_dtype, moe_parallel=moe_parallel)
         return self._submodule_cache[node_name]
 
     def _adopt_checkpoint_config(self, source: str) -> None:
@@ -347,9 +347,12 @@ class DeepseekV41Model(ByteLevelTextOutput, Model):
 
     def _create_submodule(
         self, node_name: str, device: str, tp_group=None, autocast_dtype: torch.dtype | None = None,
+        moe_parallel=None,
     ) -> NodeSubmodule | None:
         if node_name != "LLM":
             return None
+        if moe_parallel is not None and (moe_parallel.log_expert_load_every or moe_parallel.mask_padding):
+            raise ValueError("DeepSeek-V4.1 takes ep_config.parallel only: no expert-load log, no padding mask")
         source = resolve_checkpoint(self.model_path_hf, self.cache_dir)
         if source is None:
             logger.info("DeepseekV41Model: no checkpoint resolved for node %r: dummy mode (None).", node_name)
@@ -367,7 +370,8 @@ class DeepseekV41Model(ByteLevelTextOutput, Model):
         # built on meta, so nothing is allocated before to_empty; the loader fills every
         # parameter in the dtype the module declared for it
         with torch.device("meta"):
-            language_model = DeepseekV41ForCausalLM(self.config, token_map, comm_group=tp_group)
+            language_model = DeepseekV41ForCausalLM(
+                self.config, token_map, comm_group=tp_group, moe_parallel=moe_parallel)
         if autocast_dtype is not None:
             language_model = _cast_floating(language_model, autocast_dtype)
         language_model.to_empty(device=device)

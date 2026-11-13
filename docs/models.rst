@@ -1016,7 +1016,9 @@ rank). ``model_kwargs``:
 once), ``moe_experts`` (how the routed experts are held: ``fp4``, the default, as the
 checkpoint packs them, 36 GB per GPU at TP8; ``fp8``, their exact upcast to E4M3 blocks, 68 GB;
 ``dense``, bf16, 136 GB; the logits are the same bit for bit). The ``-1017`` refresh has the
-same layout: pass it as ``model_kwargs.checkpoint_path``.
+same layout: pass it as ``model_kwargs.checkpoint_path``. An ``ep_config: {parallel: ep}`` on
+the node group gives each rank whole routed experts (48 of the 384 at TP8, 2304 wide) instead
+of a slice of every one; its other keys are refused.
 
 Chat renders each message in its role through the checkpoint's chat template (``developer``
 as ``system``; tool results fold into the next user turn, as the checkpoint's encoder writes

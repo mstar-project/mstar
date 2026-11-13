@@ -33,11 +33,12 @@ class DeepseekV41Block(nn.Module):
     one sublayer later: the attention collapses with the weights the block before it made at
     its MoE site, the MoE with the ones this block's attention site made."""
 
-    def __init__(self, config: DeepseekV41Config, layer: int, comm_group: CommGroup | None = None) -> None:
+    def __init__(self, config: DeepseekV41Config, layer: int, comm_group: CommGroup | None = None,
+                 moe_parallel=None) -> None:
         super().__init__()
         self.engram = Engram(config, layer, comm_group) if layer in config.engram_layer_ids else None
         self.attn = DeepseekV41Attention(config, layer, comm_group)
-        self.ffn = DeepseekV41MoE(config, comm_group)
+        self.ffn = DeepseekV41MoE(config, comm_group, moe_parallel)
         self.attn_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.ffn_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hc_attn = self._site(config)
@@ -63,13 +64,13 @@ class DeepseekV41Block(nn.Module):
 
 class DeepseekV41LanguageModel(nn.Module):
     def __init__(self, config: DeepseekV41Config, token_map: torch.Tensor | None = None,
-                 comm_group: CommGroup | None = None) -> None:
+                 comm_group: CommGroup | None = None, moe_parallel=None) -> None:
         super().__init__()
         self.hc_mult = config.hc_mult
         self.embed = VocabParallelEmbedding(
             num_embeddings=config.vocab_size, embedding_dim=config.hidden_size, comm_group=comm_group)
         self.layers = nn.ModuleList(
-            DeepseekV41Block(config, layer, comm_group) for layer in range(config.num_hidden_layers))
+            DeepseekV41Block(config, layer, comm_group, moe_parallel) for layer in range(config.num_hidden_layers))
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rope = Rope(config)
         self.hasher = None
@@ -99,11 +100,11 @@ class DeepseekV41LanguageModel(nn.Module):
 
 class DeepseekV41ForCausalLM(nn.Module):
     def __init__(self, config: DeepseekV41Config, token_map: torch.Tensor | None = None,
-                 comm_group: CommGroup | None = None) -> None:
+                 comm_group: CommGroup | None = None, moe_parallel=None) -> None:
         super().__init__()
         self.config = config
         self.comm_group = comm_group or CommGroup.trivial()
-        self.model = DeepseekV41LanguageModel(config, token_map, comm_group)
+        self.model = DeepseekV41LanguageModel(config, token_map, comm_group, moe_parallel)
         self.lm_head = ColumnParallelLinear(
             self.comm_group, input_size=config.hidden_size, output_size=config.vocab_size, bias=False)
 

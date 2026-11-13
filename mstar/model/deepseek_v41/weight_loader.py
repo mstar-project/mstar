@@ -149,8 +149,13 @@ class _Loader:
         ffn, _, expert, which = match.groups()
         moe = self.modules["model." + ffn]
         routed = expert is not None
-        inter, rank = moe.inter, self.group.rank
+        # this rank's intermediate dims of the matrix: all of them of an expert it holds whole
+        inter = moe.expert_inter if routed else moe.inter
+        start = 0 if routed and moe.expert_parallel else self.group.rank * inter
         if routed:  # packed E2M1, a scale per row and 32 inputs
+            index = int(expert) - moe.expert_start
+            if not 0 <= index < moe.local_experts:
+                return  # another rank's expert
             packed, row_scale = weight.view(torch.uint8), scale.view(E8M0_DTYPE)
             if moe.layout == "fp4":
                 stored = [_Stored("_packed", packed, cols=2),
@@ -161,7 +166,7 @@ class _Loader:
                           _Stored("_scale_inv", block_scale, rows=moe.block, cols=moe.block)]
             else:
                 stored = [_Stored("", dequant_row_fp4(packed, row_scale, moe.experts.down_proj.dtype))]
-            holder, index = moe.experts, int(expert)
+            holder = moe.experts
         else:  # the shared expert is a dense fp8 linear
             value = dequant_block_fp8(weight.view(FP8_DTYPE), scale.view(E8M0_DTYPE), moe.shared.down_proj.dtype)
             stored, holder, index = [_Stored("", value)], moe.shared, None
@@ -171,17 +176,16 @@ class _Loader:
             param = getattr(holder, proj + suffix)
             dest = param.data if index is None else param.data[index]
             if which == "2":  # down: this rank's columns
-                n = inter // cols
-                value = value[:, rank * n:(rank + 1) * n]
+                value = value[:, start // cols:(start + inter) // cols]
             else:  # gate (w1) then up (w3): this rank's rows, into that half of the stack
                 n, half = inter // rows, int(which == "3")
-                value, dest = value[rank * n:(rank + 1) * n], dest[half * n:(half + 1) * n]
+                value, dest = value[start // rows:start // rows + n], dest[half * n:(half + 1) * n]
             if tuple(dest.shape) != tuple(value.shape):
                 raise ValueError(f"{prefix}{suffix}: checkpoint gives {tuple(value.shape)}, "
                                  f"the module holds {tuple(dest.shape)}")
             dest.copy_(value.to(param.dtype))
             # two halves (gate, up) of every expert's gate_up, one down per expert
-            want = (1 if which == "2" else 2) * (moe.num_experts if routed else 1)
+            want = (1 if which == "2" else 2) * (moe.local_experts if routed else 1)
             self.parts[prefix + suffix] = self.parts.get(prefix + suffix, 0) + 1
             if self.parts[prefix + suffix] == want:
                 self.loaded.add(prefix + suffix)

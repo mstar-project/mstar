@@ -35,4 +35,5 @@ node_groups:
   - node_names: [LLM]
     ranks: [0, 1, 2, 3, 4, 5, 6, 7]
     tp_size: 8
+    # ep_config: {parallel: ep} gives each rank 48 whole experts instead of a slice of all 384
     graph_walks: [prefill, decode]
