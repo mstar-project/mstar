@@ -45,6 +45,14 @@ def test_a_prompt_past_the_original_context_keys_its_prefix_apart():
     assert spec.prefix_variant({MAX_POSITION_KWARG: 65}) is not None, "a long request would reuse a short one's pages"
 
 
+def test_a_longrope_request_without_its_prompt_length_is_refused():
+    spec = _positions(Rope(longrope=_LONGROPE))
+    with pytest.raises(RuntimeError, match="process_prompt didn't set"):
+        spec.request_config({})
+    with pytest.raises(RuntimeError, match="process_prompt didn't set"):
+        spec.prefix_variant({})
+
+
 @pytest.mark.parametrize("scaling", [
     {"scale": 2.0}, {"low_freq_factor": 1.0, "high_freq_factor": 4.0, "old_context_len": 8192},
 ])
