@@ -470,11 +470,19 @@ class Praxis1BackboneSubmodule(_Praxis1Node):
                 Segment(rid, "cond", inp.kwargs["text_tokens"] if write else 0),
                 Segment(rid, "blank", inp.kwargs["blank_tokens"] if write else 0),
             ))
+        final = [inp.kwargs["step_index"] == inp.kwargs["num_steps"] - 1 for inp in inputs]
+        if len(set(final)) > 1:
+            raise ValueError("Praxis backbone cannot batch final and nonfinal denoise steps")
+        final_step = bool(final) and final[0]
         guided = any(inp.kwargs["cfg_video_scale"] != 1.0 for inp in inputs)
         if guided and any(inp.kwargs["cfg_video_scale"] == 1.0 for inp in inputs):
             raise ValueError("Praxis backbone cannot batch different video guidance modes")
-        names = (ENCODER_COND_KV, DECODER_COND_KV) + (
-            (ENCODER_BLANK_KV, DECODER_BLANK_KV) if guided else ()
+        # The reply exposes only actions. On the final Euler step the expert
+        # still reads conditional encoder taps, but no later step reads the
+        # decoded video. Guidance's blank branch is video-only at cfg_scale=1.
+        names = (ENCODER_COND_KV,) if final_step else (
+            (ENCODER_COND_KV, DECODER_COND_KV) +
+            ((ENCODER_BLANK_KV, DECODER_BLANK_KV) if guided else ())
         )
         state = {name: ArrayStep(segments=tuple(
             Segment(rid, name, int(inp.resource_step_info[name]))
@@ -555,31 +563,35 @@ class Praxis1BackboneSubmodule(_Praxis1Node):
         except StopIteration:
             model_dtype = obs_latents.dtype
         t_cur, t_next = times[step_index:step_index + 2]
+        final_step = step_index == num_steps - 1
         timestep = torch.full((1, k), t_cur, dtype=model_dtype, device=obs_latents.device)
 
-        def branch(text: torch.Tensor, encoder_state, decoder_state):
+        def branch(text: torch.Tensor, encoder_state, decoder_state, *, decode: bool):
             cond, features = encoder.forward_chunk_causal(
                 text.to(model_dtype), anchor.to(model_dtype),
                 None if clean is None else clean.to(model_dtype),
                 video_latents.to(model_dtype), timestep,
                 attend_for_layer=lambda layer: resource_attend(encoder_state, layer),
             )
-            velocity = decoder.forward_chunk_causal(
+            velocity = (decoder.forward_chunk_causal(
                 video_latents.to(model_dtype), cond, timestep,
                 attend_for_layer=lambda layer: resource_attend(decoder_state, layer),
-            )
+            ) if decode else None)
             return velocity, features
 
         velocity, features = branch(
             text_embeds, self.state_handles[ENCODER_COND_KV], self.state_handles[DECODER_COND_KV],
+            decode=not final_step,
         )
-        if cfg_video_scale != 1.0:
+        if cfg_video_scale != 1.0 and not final_step:
             blank_velocity, _ = branch(
                 text_embeds_blank, self.state_handles[ENCODER_BLANK_KV],
                 self.state_handles[DECODER_BLANK_KV],
+                decode=True,
             )
             velocity = blank_velocity.float() + cfg_video_scale * (velocity.float() - blank_velocity.float())
-        video_latents = video_latents + (t_next - t_cur) * velocity.float()
+        if velocity is not None:
+            video_latents = video_latents + (t_next - t_cur) * velocity.float()
         packed = dict(zip(("taps", "tap_embeddings", "tap_rope_ids", "tap_geometry"),
                           pack_tap_features(features), strict=True))
         return {**{name: [value] for name, value in packed.items()},

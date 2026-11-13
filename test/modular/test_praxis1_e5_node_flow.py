@@ -48,8 +48,10 @@ class _Encoder(nn.Module):
     def __init__(self):
         super().__init__()
         self.weight = nn.Parameter(torch.zeros(()))
+        self.calls = 0
 
     def forward_chunk_causal(self, text, anchor, clean, noised, times, *, attend_for_layer):
+        self.calls += 1
         k = times.shape[1]
         f = noised.shape[2] // k
         clean_len = 0 if clean is None else clean.shape[2]
@@ -69,7 +71,12 @@ class _Encoder(nn.Module):
 
 
 class _Decoder(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.calls = 0
+
     def forward_chunk_causal(self, noised, cond, times, *, attend_for_layer):
+        self.calls += 1
         seq = 2 + noised.shape[2] * 4
         dummy = torch.zeros(1, 1, seq, 2)
         attend_for_layer(0)(dummy, dummy, dummy, None)
@@ -111,8 +118,9 @@ def _info(step: int):
 @pytest.mark.parametrize("depth", [0, 1])
 def test_cold_and_warm_node_flow_matches_reference_sampler(depth: int) -> None:
     config = replace(Praxis1Config.for_rig("single_arm"), latent_channels=1, latents_per_chunk=6)
+    encoder, decoder = _Encoder(), _Decoder()
     backbone = Praxis1BackboneSubmodule(
-        config, SimpleNamespace(encoder=_Encoder(), decoder=_Decoder()),
+        config, SimpleNamespace(encoder=encoder, decoder=decoder),
     )
     expert = Praxis1ActionExpertSubmodule(config, _Expert())
     states = {name: _State() for name in (
@@ -141,9 +149,10 @@ def test_cold_and_warm_node_flow_matches_reference_sampler(depth: int) -> None:
                                  proprio_all=[proprio])
         input_tensors.update({name: [value] for name, value in carried.items()})
         prepared = backbone.prepare_inputs("chunk", _info(step), input_tensors)
-        assert set(backbone.declare_step("chunk", ["r"], [prepared]).state) == {
+        expected_resources = ({ENCODER_COND_KV} if step == 1 else {
             ENCODER_COND_KV, ENCODER_BLANK_KV, DECODER_COND_KV, DECODER_BLANK_KV,
-        }
+        })
+        assert set(backbone.declare_step("chunk", ["r"], [prepared]).state) == expected_resources
         out = backbone.forward("chunk", None, **prepared.tensor_inputs, **prepared.kwargs)
         expert_inputs = {name: value for name, value in out.items()}
         expert_inputs["proprio"] = [proprio[:, -1:]]
@@ -163,13 +172,16 @@ def test_cold_and_warm_node_flow_matches_reference_sampler(depth: int) -> None:
     for step in range(2):
         cond_velocity = expected_video * 0.25 + text.mean() * 0.5
         blank_velocity = expected_video * 0.25 + blank.mean() * 0.5
-        expected_video = expected_video + (ts[step + 1] - ts[step]) * guidance_combine(
-            cond_velocity, blank_velocity, 4.0,
-        )
+        if step != 1:
+            expected_video = expected_video + (ts[step + 1] - ts[step]) * guidance_combine(
+                cond_velocity, blank_velocity, 4.0,
+            )
         action_velocity = expected_action * 0.1 + ts[step] * 0.3 + proprio.mean() * 0.2
         expected_action = expected_action + (ts[step + 1] - ts[step]) * action_velocity
     torch.testing.assert_close(carried["video_latents"], expected_video, rtol=0, atol=0)
     torch.testing.assert_close(carried["action_latents"], expected_action, rtol=0, atol=0)
+    assert encoder.calls == 3  # two guided passes, then the final conditional taps
+    assert decoder.calls == 2  # both decoder passes belong to the first Euler step
     for state in states.values():
         assert state.calls
 
