@@ -11,16 +11,20 @@ model: "praxis1_droid"
 max_seq_len: 16384
 
 
-# Praxis-1 on the single-arm DROID rig (runwayml/praxis-1-droid), served the way
-# Runway's own serve_droid recipe runs it.
+# Praxis-1 on the single-arm DROID rig (runwayml/praxis-1-droid). This is a
+# cold-only openpi bring-up mode, not Runway's stateful Positronic session wire.
+# Compare it with reference context_mode=stateless, which is for debugging.
 #
 # A request carries two camera frames, the exterior view then the wrist view, the
 # task text, and robot_state = the arm pose as [xyz(3) quat_wxyz(4) grip(1)]. The
-# reply is [24, 10]: 24 command rows at 15 Hz, each [xyz(3) rot6d(6) grip(1)].
+# reply is [21, 10] denormalized relative Cartesian action rows at 15 Hz,
+# each [xyz(3) rot6d(6) grip(1)]. The gripper is clipped to [0, 1]. Every
+# request starts at depth 0; no predicted video becomes the next call's context.
 #
 # The canvas, the pose frame and the rig all come from the checkpoint's config.json,
 # so none of them is a knob here. num_cameras follows the rig's views and is baked
-# into the CUDA-graph captures, as is the action horizon.
+# into the CUDA-graph captures. The 21-row cold reply horizon is separate from
+# the checkpoint's 24-row action chunk.
 model_kwargs:
   model_path_hf: "runwayml/praxis-1-droid"
   # Public components the checkpoint expects beside it. Neither ships with it.
@@ -32,10 +36,11 @@ model_kwargs:
   t_shift: 12.5
   cfg_scale: 1.0
   cfg_video_scale: 4.0
-  max_context_chunks: 1
+  max_context_chunks: 0
 
-# The openpi WebSocket at ws://<host>:<port>/, which an openpi DROID client connects
-# to unchanged: the cameras in view order, the pose as the state, all 10 action dims.
+# A Praxis-specific openpi schema at ws://<host>:<port>/: cameras in view order,
+# Cartesian pose as state, and 21x10 relative action rows. The stock openpi
+# DROID client expects 10x8 joint-velocity actions and cannot use this unchanged.
 openpi:
   images: [observation/exterior_image_1_left, observation/wrist_image_left]
   state: [observation/cartesian_position, observation/gripper_position]

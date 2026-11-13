@@ -12,9 +12,11 @@ import json
 from pathlib import Path
 
 import huggingface_hub
+import numpy as np
 import pytest
 import yaml
 
+from mstar.api_server.openpi import OpenpiPolicy
 from mstar.conductor.conductor import Conductor
 from mstar.graph.base import GraphNode, Loop, Sequential
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
@@ -141,18 +143,37 @@ def _loop_conductor(model: Praxis1Model) -> Conductor:
 
 
 def test_the_rig_decides_the_wire():
-    """A client's reply shape comes from the checkpoint, not from a default."""
+    """The cold reply trims the anchor token while keeping checkpoint widths."""
     droid = Praxis1Config.from_dict(DROID_CONFIG)
     assert droid.views == ("exterior", "wrist")
-    assert (droid.action_dim, droid.action_horizon) == (10, 24)
-    # 24 rows carried by 6 tokens of 4 frames, which the head's width agrees with.
+    assert (droid.action_dim, droid.action_horizon) == (10, 21)
+    # Six tokens carry 24 subframes, but the depth-0 anchor contributes one row.
     assert droid.action_tokens == 6
     assert droid.action_patch_dim == droid.action_dim * droid.action_frames_per_token
 
     yam = Praxis1Config.from_dict(_yam_config())
     assert yam.views == ("top_left", "wrist_left", "wrist_right")
-    assert (yam.action_dim, yam.action_horizon) == (20, 24)
+    assert (yam.action_dim, yam.action_horizon) == (20, 21)
     assert yam.action_patch_dim == 80
+
+
+@pytest.mark.parametrize(
+    "name,config,width",
+    [
+        ("praxis1_droid", DROID_CONFIG, 10),
+        ("praxis1_yam", _yam_config(), 20),
+    ],
+)
+def test_cold_openpi_reply_has_21_relative_rows(tmp_path, monkeypatch, name, config, width):
+    model = _model(tmp_path, config, monkeypatch)
+    shipped = yaml.safe_load((ROOT / "configs" / f"{name}.yaml").read_text())
+    assert shipped["model_kwargs"]["max_context_chunks"] == 0
+    policy = OpenpiPolicy.from_config(shipped["openpi"], model)
+    assert policy.action_horizon == 21
+    cold_rows = np.zeros((21, width), dtype=np.float32)
+    assert policy.actions(cold_rows.tobytes()).shape == cold_rows.shape
+    with pytest.raises(RuntimeError, match=f"not 21x{width}"):
+        policy.actions(np.zeros((24, width), dtype=np.float32).tobytes())
 
 
 def test_the_canvas_takes_the_views_to_latents():
@@ -187,10 +208,10 @@ def test_a_checkpoint_this_build_does_not_serve_is_refused(mutate, message):
         Praxis1Config.from_dict(config)
 
 
-def test_robot_io_matches_the_checkpoint(tmp_path, monkeypatch):
+def test_robot_io_uses_cold_horizon_and_checkpoint_width(tmp_path, monkeypatch):
     model = _model(tmp_path, DROID_CONFIG, monkeypatch)
     state_kwarg, horizon, dim = model.robot_io()
-    assert (horizon, dim) == (24, 10)
+    assert (horizon, dim) == (21, 10)
     assert state_kwarg in model.request_kwargs()
     # One image per camera view the rig has.
     assert model.max_input_files() == {"image": 2}
@@ -265,8 +286,8 @@ def test_the_served_model_reads_the_checkpoint_config(tmp_path, monkeypatch, no_
 @pytest.mark.parametrize(
     "repo, rig, wire",
     [
-        ("runwayml/praxis-1-droid", "single_arm", (24, 10, 2)),
-        ("runwayml/praxis-1-yam", "bimanual", (24, 20, 3)),
+        ("runwayml/praxis-1-droid", "single_arm", (21, 10, 2)),
+        ("runwayml/praxis-1-yam", "bimanual", (21, 20, 3)),
     ],
 )
 def test_dummy_mode_takes_the_rig_from_the_name_and_reads_nothing(repo, rig, wire, no_download):

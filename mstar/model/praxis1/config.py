@@ -7,8 +7,9 @@ checkpoint that runs and means something else.
 
 The rig follows ``embodiment``: ``single_arm`` is the DROID rig (exterior and
 wrist views, 10-wide action rows), ``bimanual`` is the YAM rig (top and two
-wrists, 20-wide rows). One policy call answers one chunk: 24 command rows at
-15 Hz, carried by 6 action tokens of 4 frames each, beside 6 video latents.
+wrists, 20-wide rows). One cold call answers 21 relative action rows at
+15 Hz: the first of 6 action tokens contributes one row, and the other five
+contribute four each. Later chunks answer 24 rows once episode serving lands.
 
 Shapes worth having in one place, for the droid checkpoint: the canvas is one
 224x416 tile per view stacked side by side (224x832), the VAE takes it to 48
@@ -143,8 +144,8 @@ class Praxis1Config:
 
     @property
     def action_horizon(self) -> int:
-        """Command rows in one answer: what a client gets per policy call."""
-        return self.action_chunk
+        """Rows in a cold openpi reply; the first token owns the anchor frame."""
+        return 1 + (self.action_tokens - 1) * self.action_frames_per_token
 
     @property
     def action_tokens(self) -> int:

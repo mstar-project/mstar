@@ -1,7 +1,8 @@
 """Praxis-1: a video-action policy for robot arms.
 
-One policy call answers one chunk of the future: 6 video latents and 6 action
-tokens (24 command rows at 15 Hz). The backbone denoises the video over a few
+One cold policy call answers one chunk of the future: 6 video latents and 6
+action tokens (21 relative action rows at 15 Hz). Later calls can return 24
+rows once episode state is available. The backbone denoises the video over a few
 Euler steps; each step hands the action expert its hidden states ("taps"), and
 the expert denoises the actions from them. The robot executes the rows and
 asks again.
@@ -107,7 +108,8 @@ class Praxis1Model(Model):
             "t_shift": kwargs.pop("t_shift", 12.5),
             "cfg_scale": kwargs.pop("cfg_scale", 1.0),
             "cfg_video_scale": kwargs.pop("cfg_video_scale", 4.0),
-            "max_context_chunks": kwargs.pop("max_context_chunks", 1),
+            # A cold-only call has no earlier executed-frame context.
+            "max_context_chunks": kwargs.pop("max_context_chunks", 0),
         }
         self._yaml_config_overrides: dict = dict(kwargs)
 
