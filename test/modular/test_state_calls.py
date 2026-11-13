@@ -2119,3 +2119,19 @@ def test_starts_on_an_array_with_no_start_lengths_are_refused():
 def test_a_layout_that_sizes_an_unbounded_kept_window_is_refused():
     with pytest.raises(RuntimeError, match=r"state_layout\['enc_kv'\]\['main'\]\.kept_windows: an unbounded array"):
         kv_layouts([_started()], {"enc_kv": {"main": Layout(kept_windows={"enc": KeptWindow(1, window=2)})}}, {})
+
+
+def test_a_step_that_keeps_nothing_reads_as_a_kept_one_and_stores_none():
+    """A stream's last window attends its own entries and adds none to what the window keeps."""
+    q, k, v, bias = _frames(t=3)
+    reads = []
+    for keep in (True, False):
+        h, kv = _bounded()
+        step = _bounded_step(h, kv, spans=(3,), enc_kv=ArrayStep(keep=keep))
+        h.add(3, k=k, v=v)
+        reads.append(h.read(3, q, distance_bias=bias))
+    assert [segment.span for segment in step.steps[h.name].segments] == [0], "the bounded KV would store the adds"
+    assert torch.equal(reads[0], reads[1]), "a step's read sees its adds whether or not the step keeps them"
+    h.check_step(step)
+    kv.commit(step.steps[h.name], step.ctx)
+    assert kv.written(1) == 0 and not kv.layer(0).any(), "a step that keeps nothing would have kept its adds"
