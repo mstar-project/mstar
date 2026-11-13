@@ -41,10 +41,12 @@ class Stub:
     def __init__(self):
         self.upload_dir = tempfile.mkdtemp(prefix="positronic_stub_")
         self.calls = []
+        self.submissions = []
         self.ended = []
         self.depth = {}
 
     def submit_request(self, **kw):
+        self.submissions.append(kw)
         episode = kw["episode"]
         reset = kw["reset_episode"]
         if reset:
@@ -156,6 +158,31 @@ def test_cold_warm_reset_and_end_match_in_both_frontends():
     assert [c[:1] + c[2:] for c in py_calls] == [c[:1] + c[2:] for c in rust_calls]
     assert all(c[1] == py_ends[0] for c in py_calls)
     assert all(c[1] == rust_ends[0] for c in rust_calls)
+    assert set(py[2]) == {"result", "effective_prompt", "prompt_original", "timing"}
+
+
+def test_praxis_mode_sends_same_original_observation_to_shared_data_worker():
+    stub = Stub()
+    stub.positronic_policy = PositronicPolicy(
+        {"robot": "stub"}, observation_format="praxis1", control_mode="droid_impedance",
+    )
+    with rust(stub) as port:
+        python_session(stub)
+        py = stub.submissions[0]
+        stub.submissions.clear()
+        rust_session(port)
+        rs = stub.submissions[0]
+    for submission in (py, rs):
+        assert submission["input_modalities"] == ["image", "text"]
+        assert submission["model_kwargs"]["control_mode"] == "droid_impedance"
+        assert isinstance(submission["positronic_frame"], bytes)
+        parsed = msgpack.unpackb(submission["positronic_frame"], raw=False)
+        assert parsed["session_id"] == submission["episode"]
+        assert parsed["observation"]["prompt"] == "go"
+        assert b"__ndarray__" in parsed["observation"]["state"]
+    assert py["positronic_frame"].replace(py["episode"].encode(), b"ID") == rs["positronic_frame"].replace(
+        rs["episode"].encode(), b"ID"
+    )
 
 
 def test_wrong_session_id_fails_and_ends_once():

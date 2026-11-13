@@ -287,6 +287,49 @@ def test_frontend_close_sends_end_episode_to_the_conductor():
     assert sent[0].body.episode_id == "robot-episode"
 
 
+def test_positronic_observation_reaches_model_as_raw_pose_and_image_inputs(monkeypatch):
+    from mstar.api_server.openpi import pack
+    from mstar.model.base import TensorAndMetadata
+
+    class PraxisStub(_Serial):
+        config = SimpleNamespace(embodiment="single_arm")
+        PREPROCESS_ONLY_KWARGS = ("robot_state", "pose_descriptor", "action_format")
+
+        def load_decoded_image(self, image, device):
+            return TensorAndMetadata(image.to(device))
+
+        def process_prompt(self, text, input_modalities, output_modalities, **kwargs):
+            self.seen = kwargs
+            return ProcessPromptOutput({"text_inputs": [torch.tensor([1])]}, {})
+
+    monkeypatch.setattr(cpus, "_plan", cpus.CpuPlan(frozenset(range(8)), usable=8))
+    model = PraxisStub()
+    wt = _thread(model)
+    obs = {
+        "prompt": "move", "image.exterior": np.zeros((4, 6, 3), np.uint8),
+        "image.wrist": np.ones((4, 6, 3), np.uint8),
+        "robot_state.ee_pose": [0, 0, 0.6, 1, 0, 0, 0],
+        "grip": 0.25, "descriptor": "remote.robolab.droid",
+    }
+    request = PreprocessInput(
+        request_id="pose", text="move", file_paths=None,
+        input_modalities=["image", "text"], output_modalities=["action"],
+        model_kwargs={"control_mode": "droid_impedance"},
+        positronic_frame=pack({"session_id": "episode", "observation": obs}),
+        episode="episode",
+    )
+    wt._process_waiting_input(request)
+    assert [tuple(t.shape) for t in model.seen["tensors"]["image_inputs"]] == [(3, 4, 6)] * 2
+    assert model.seen["robot_state"] == [0, 0, pytest.approx(0.6), 1, 0, 0, 0, 0.25]
+    assert model.seen["pose_descriptor"] == "remote.robolab.droid"
+    assert model.seen["control_mode"] == "droid_impedance"
+    assert model.seen["action_format"] == "positronic"
+    assert wt.request_model_kwargs["pose"]["robot_state"] == model.seen["robot_state"]
+    sent = [m.body for m in wt.communicator.sent if m.message_type == ConductorMessageType.NEW_REQUEST]
+    assert len(sent) == 1 and sent[0].episode == "episode"
+    assert "robot_state" not in sent[0].model_kwargs
+
+
 def test_requests_overlap_and_reach_the_conductor_in_arrival_order(worker):
     worker._process_waiting_input(_input("a"))
     worker._process_waiting_input(_input("b"))

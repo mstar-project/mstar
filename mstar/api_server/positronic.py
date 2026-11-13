@@ -26,20 +26,28 @@ logger = logging.getLogger(__name__)
 class PositronicPolicy:
     meta: dict
     prompt_key: str = "prompt"
+    observation_format: str = "stub"
+    control_mode: str = "none"
 
     @classmethod
     def from_config(cls, block: dict) -> PositronicPolicy:
-        if not isinstance(block, dict) or set(block) - {"meta", "prompt_key"}:
-            raise ValueError("positronic: takes only meta and prompt_key")
+        if not isinstance(block, dict) or set(block) - {"meta", "prompt_key", "observation_format", "control_mode"}:
+            raise ValueError("positronic: takes only meta, prompt_key, observation_format, and control_mode")
         meta = block.get("meta", {})
         prompt_key = block.get("prompt_key", "prompt")
+        observation_format = block.get("observation_format", "stub")
+        control_mode = block.get("control_mode", "none")
         if not isinstance(meta, dict) or not isinstance(prompt_key, str) or not prompt_key:
             raise ValueError("positronic: meta must be a map and prompt_key a nonempty string")
+        if observation_format not in ("stub", "praxis1"):
+            raise ValueError("positronic: observation_format must be stub or praxis1")
+        if not isinstance(control_mode, str) or control_mode not in ("none", "droid_impedance"):
+            raise ValueError("positronic: control_mode must be none or droid_impedance")
         try:
             json.dumps(meta, allow_nan=False)
         except (TypeError, ValueError):
             raise ValueError("positronic: meta must be JSON serializable") from None
-        return cls(meta, prompt_key)
+        return cls(meta, prompt_key, observation_format, control_mode)
 
 
 def _pack(value: dict) -> bytes:
@@ -63,16 +71,24 @@ def _request(data: bytes, session_id: str) -> tuple[dict | None, bool]:
 
 def _prompt(obs: dict, policy: PositronicPolicy) -> str:
     prompt = obs.get(policy.prompt_key)
+    if policy.observation_format == "praxis1":
+        prompt = obs.get("task") or prompt
+    if isinstance(prompt, bytes):
+        prompt = prompt.decode("utf-8", "replace")
     if not isinstance(prompt, str):
         raise ValueError(f"the observation needs a {policy.prompt_key} string")
     return prompt
 
 
-async def _infer(api, obs: dict, policy: PositronicPolicy, session_id: str, reset: bool) -> list[dict]:
+async def _infer(api, obs: dict, policy: PositronicPolicy, session_id: str, reset: bool, frame: bytes) -> list[dict]:
     prompt = _prompt(obs, policy)
     request_id = api.submit_request(
-        text=prompt, input_modalities=["text"], output_modalities=["action"],
+        text=prompt,
+        input_modalities=["image", "text"] if policy.observation_format == "praxis1" else ["text"],
+        output_modalities=["action"],
         streaming=True, episode=session_id, reset_episode=reset,
+        **({"positronic_frame": frame, "model_kwargs": {"control_mode": policy.control_mode}}
+           if policy.observation_format == "praxis1" else {}),
     )
     data = None
     async for chunk in api.iter_result_chunks(request_id):
@@ -130,7 +146,7 @@ async def serve_connection(websocket: WebSocket, api) -> None:
                 assert obs is not None
                 reset = obs.get("reset_context") is True or obs.get("__reset_context__") is True
                 infer_started = time.monotonic()
-                rows = await _infer(api, obs, policy, session_id, reset)
+                rows = await _infer(api, obs, policy, session_id, reset, data)
                 elapsed = (time.monotonic() - started) * 1000
                 infer_ms = (time.monotonic() - infer_started) * 1000
                 await websocket.send_bytes(_pack({

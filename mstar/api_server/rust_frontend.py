@@ -315,7 +315,10 @@ def openpi_facts(policy) -> dict | None:
 def positronic_facts(policy) -> dict | None:
     if policy is None:
         return None
-    return {"meta": policy.meta, "prompt_key": policy.prompt_key}
+    return {
+        "meta": policy.meta, "prompt_key": policy.prompt_key,
+        "observation_format": policy.observation_format, "control_mode": policy.control_mode,
+    }
 
 
 def onnxruntime_library() -> str | None:
@@ -560,6 +563,8 @@ class RustFrontendBridge:
                 report_usage=bool(msg.get("report_usage")),
                 **({"episode": msg["episode"], "reset_episode": bool(msg.get("reset_episode"))}
                    if msg.get("episode") is not None else {}),
+                **({"positronic_frame": msg["positronic_frame"]}
+                   if msg.get("positronic_frame") is not None else {}),
                 **_stream_and_raw_inputs(msg),
             )
         except (ValueError, TypeError) as e:

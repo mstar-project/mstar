@@ -102,6 +102,8 @@ struct SubmitMsg<'a> {
     episode: Option<&'a str>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     reset_episode: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    positronic_frame: Option<serde_bytes::ByteBuf>,
     /// Pre-tokenized prompt (frontend-tokenizes path); `text` is None then.
     tokens: Option<&'a [u32]>,
     /// The frontend will detokenize: text emissions come back as raw token
@@ -382,6 +384,7 @@ impl Bridge {
             text: args.text.as_deref(),
             episode: args.episode.as_deref(),
             reset_episode: args.reset_episode,
+            positronic_frame: args.positronic_frame.clone().map(serde_bytes::ByteBuf::from),
             tokens: args.tokens.as_deref(),
             frontend_detok: args.tokens.is_some(),
             accepts_chunks: true,
@@ -707,6 +710,7 @@ mod tests {
             text: Some("hi"),
             episode: None,
             reset_episode: false,
+            positronic_frame: None,
             tokens: None,
             frontend_detok: false,
             accepts_chunks: true,

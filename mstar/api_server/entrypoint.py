@@ -823,6 +823,7 @@ class APIServer:
         report_usage: bool = False,
         episode: str | None = None,
         reset_episode: bool = False,
+        positronic_frame: bytes | None = None,
     ) -> str:
         """Build a :class:`NewRequestConductor` and send it to the conductor.
 
@@ -932,6 +933,7 @@ class APIServer:
             text=text,
             episode=episode,
             reset_episode=reset_episode,
+            positronic_frame=positronic_frame,
             file_paths=file_paths,
             input_modalities=input_modalities,
             output_modalities=output_modalities,

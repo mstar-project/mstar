@@ -976,6 +976,21 @@ class PreprocessWorkerThread:
         Runs on the prepare pool when there is one, so it reads only what
         ``__init__`` fixed and writes nothing the thread owns."""
         file_states: dict[str, list[tuple[int, int, int]]] = {}
+        raw_inputs = input.raw_inputs
+        positronic_kwargs = {}
+        if input.positronic_frame is not None:
+            if input.file_paths or raw_inputs:
+                raise ValueError("Positronic observations cannot also carry file or raw inputs")
+            from mstar.api_server.positronic_input import decode_praxis_frame
+
+            embodiment = getattr(getattr(self.model, "config", None), "embodiment", None)
+            decoded = decode_praxis_frame(input.positronic_frame, embodiment)
+            raw_inputs = {"image": decoded.images}
+            positronic_kwargs = {
+                "robot_state": decoded.robot_state,
+                "pose_descriptor": decoded.pose_descriptor,
+                "action_format": "positronic",
+            }
 
         # First, load raw modality tensors from file_paths (images, audio, video)
         # so they can be passed to process_prompt() below.
@@ -984,10 +999,10 @@ class PreprocessWorkerThread:
             # is hashed, its KV would be keyed by bytes we never decoded.
             for modality, paths in input.file_paths.items():
                 file_states[modality] = [_file_state(path) for path in paths]
-        if input.raw_inputs and self._keyed_labels and _prefix_cache(input.model_kwargs or {}):
+        if raw_inputs and self._keyed_labels and _prefix_cache(input.model_kwargs or {}):
             # a prefix key hashes each input's file, and these have none
             raise ValueError("this deployment keys prompts by their media files; send the media as files")
-        tensors, input_metadata = self._load_media(input.file_paths, input.raw_inputs)
+        tensors, input_metadata = self._load_media(input.file_paths, raw_inputs)
 
 
         # Then, tokenize the prompt and let the model augment/transform the
@@ -996,6 +1011,7 @@ class PreprocessWorkerThread:
         # above).  process_prompt receives the raw multimodal tensors
         # and returns any additional tensors to merge into the final dict.
         model_kwargs = dict(input.model_kwargs or {})
+        model_kwargs.update(positronic_kwargs)
         # only this worker keys a prompt: a client that sent its own could name
         # another request's pages and be served that request's KV, and a stream
         # lead past the edge's context would raise in the worker's ingest.

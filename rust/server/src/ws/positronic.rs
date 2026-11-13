@@ -20,6 +20,8 @@ use crate::serving::{rid, try_result_stream, AppState, Out};
 pub struct Policy {
     meta: serde_json::Map<String, Value>,
     prompt_key: String,
+    observation_format: String,
+    control_mode: String,
 }
 
 fn policy() -> Option<&'static Policy> {
@@ -61,15 +63,34 @@ fn request(data: &[u8], session_id: &str) -> Result<Option<Mp>, String> {
     Ok(Some(obs.clone()))
 }
 
-async fn infer(st: &AppState, policy: &Policy, obs: &Mp, session_id: &str, reset: bool) -> Result<Mp, String> {
-    let prompt = get(obs, &policy.prompt_key).and_then(Mp::as_str)
-        .ok_or_else(|| format!("the observation needs a {} string", policy.prompt_key))?;
+fn prompt(obs: &Mp, policy: &Policy) -> Result<String, String> {
+    let value = if policy.observation_format == "praxis1" {
+        get(obs, "task").filter(|v| !matches!(v, Mp::Nil) && v.as_str() != Some(""))
+            .or_else(|| get(obs, &policy.prompt_key))
+    } else { get(obs, &policy.prompt_key) };
+    match value {
+        Some(Mp::String(s)) => s.as_str().map(str::to_string),
+        Some(Mp::Binary(b)) => Some(String::from_utf8_lossy(b).into_owned()),
+        _ => None,
+    }.ok_or_else(|| format!("the observation needs a {} string", policy.prompt_key))
+}
+
+async fn infer(st: &AppState, policy: &Policy, obs: &Mp, session_id: &str, reset: bool, frame: &[u8]) -> Result<(Mp, String), String> {
+    let prompt = prompt(obs, policy)?;
+    let mut model_kwargs = serde_json::Map::new();
+    if policy.observation_format == "praxis1" {
+        model_kwargs.insert("control_mode".into(), Value::String(policy.control_mode.clone()));
+    }
     let args = SubmitArgs {
-        text: Some(prompt.to_string()),
+        text: Some(prompt.clone()),
         episode: Some(session_id.to_string()),
         reset_episode: reset,
-        input_modalities: vec!["text".into()],
+        positronic_frame: (policy.observation_format == "praxis1").then(|| frame.to_vec()),
+        input_modalities: if policy.observation_format == "praxis1" {
+            vec!["image".into(), "text".into()]
+        } else { vec!["text".into()] },
         output_modalities: vec!["action".into()],
+        model_kwargs,
         ..SubmitArgs::default()
     };
     let mut stream = try_result_stream(st, &args, &rid("positronic"), true).map_err(|(_, m)| m)?;
@@ -88,7 +109,7 @@ async fn infer(st: &AppState, policy: &Policy, obs: &Mp, session_id: &str, reset
     if !matches!(&rows, Mp::Array(items) if items.iter().all(|item| matches!(item, Mp::Map(_)))) {
         return Err("the model must return a list of command dictionaries".into());
     }
-    Ok(rows)
+    Ok((rows, prompt))
 }
 
 pub async fn positronic_ws(State(st): State<AppState>, ws: super::Upgrade) -> Response {
@@ -155,7 +176,7 @@ async fn serve(mut socket: WebSocket, st: AppState, policy: &'static Policy) {
             || get(&obs, "__reset_context__") == Some(&Mp::Boolean(true));
         let decode_ms = started.elapsed().as_secs_f64() * 1000.0;
         let infer_started = Instant::now();
-        let rows = match infer(&st, policy, &obs, &id, reset).await {
+        let (rows, effective_prompt) = match infer(&st, policy, &obs, &id, reset, &data).await {
             Ok(rows) => rows,
             Err(e) => { failed(&mut socket, &e).await; break; }
         };
@@ -168,7 +189,7 @@ async fn serve(mut socket: WebSocket, st: AppState, policy: &'static Policy) {
         ]);
         let reply = Mp::Map(vec![
             (Mp::from("result"), rows),
-            (Mp::from("effective_prompt"), get(&obs, &policy.prompt_key).cloned().unwrap_or(Mp::Nil)),
+            (Mp::from("effective_prompt"), Mp::from(effective_prompt)),
             (Mp::from("prompt_original"), Mp::Nil),
             (Mp::from("timing"), timing),
         ]);
