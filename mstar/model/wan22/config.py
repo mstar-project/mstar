@@ -195,6 +195,12 @@ class Wan22Config:
     # size cost a compile on the shared worker.
     vae_decode_fast_sizes: tuple[str, ...] | None = None
 
+    # The VAE decoder as a loop over the clip's latent frames, ``stream_decode_latents`` an
+    # iteration, each iteration's frames encoded by the API server while the next decodes
+    # (``Model.mp4_encoding``). Lossless: the same decoder calls on the same cache.
+    stream_decode: bool = False
+    stream_decode_latents: int = 3
+
     # Opt-in step caching, lossy (``components/diffusion/step_cache.py``); None runs every step. E.g.
     # ``{method: magcache, threshold: 0.06, max_skip_steps: 2, retention_ratio: 0.2}`` reuses the block residual on
     # the steps MagCache picks from the variant's calibrated table in ``MAG_RATIOS`` (or a ``mag_ratios`` list given
@@ -227,6 +233,11 @@ class Wan22Config:
         if not isinstance(self.vae_decode_fast, bool):
             raise ValueError(f"Wan2.2 vae_decode_fast must be true or false, got {self.vae_decode_fast!r}.")
         self.fast_decode_sizes()
+        if not isinstance(self.stream_decode, bool):
+            raise ValueError(f"Wan2.2 stream_decode must be true or false, got {self.stream_decode!r}.")
+        latents = self.stream_decode_latents
+        if isinstance(latents, bool) or not isinstance(latents, int) or latents < 1:
+            raise ValueError(f"Wan2.2 stream_decode_latents must be a positive int, got {latents!r}.")
         samplers = (SAMPLER_UNIPC, *_DISTILL_DEFAULTS)
         if self.sampler not in samplers:
             raise ValueError(f"Wan2.2 sampler must be one of {samplers}, got {self.sampler!r}.")
@@ -258,6 +269,11 @@ class Wan22Config:
             self.guidance_scale = 1.0
             if self.is_moe:
                 self.guidance_scale_2 = 1.0
+
+    def decode_parts(self, num_frames: int) -> int:
+        """The pieces a streamed decode emits a ``num_frames`` clip in."""
+        latents = (num_frames - 1) // self.vae_scale_factor_temporal + 1
+        return -(-latents // self.stream_decode_latents)
 
     def fast_decode_sizes(self) -> frozenset[tuple[int, int]]:
         """``vae_decode_fast_sizes`` as (width, height) pixel pairs."""

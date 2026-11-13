@@ -952,7 +952,7 @@ def test_vae_decode_fast_routes_whole_clips_through_the_shared_decoder(monkeypat
     monkeypatch.setattr(wan_vae, "is_channels_last", lambda vae: "channels_last" in calls)
     monkeypatch.setattr(wan_vae, "new_feat_cache", lambda vae: [])
 
-    def fake_decode_causal(vae, z, feat_cache, step, *, clip_start, latents_per_call=1):
+    def fake_decode_causal(vae, z, feat_cache, step, *, clip_start, latents_per_call=1, post_quantized=False):
         calls.append(("decode_causal", clip_start, feat_cache == []))
         t = 1 + (z.shape[2] - 1) * 4
         return torch.zeros(1, 3, t, 8, 8, dtype=torch.bfloat16)
