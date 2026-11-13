@@ -78,6 +78,15 @@ ALLOWED_BREAKS = {
 }
 # what a module defines to be handed the node's built resources, rather than its handles (`bind_state`)
 RESOURCE_BINDS = {"bind_resources", "bind_node_resources"}
+_LORA = "the opt-in LoRA spec, which the contract doesn't declare"
+# The ported files that still write a spec by hand in `get_node_resources`.
+ALLOWED_NODE_RESOURCES = {
+    "mstar/model/qwen3_5/qwen3_5_model.py": _LORA,
+    "mstar/model/qwen3_omni/qwen3_omni_model.py": _LORA,
+    "mstar/model/minimax_h3/minimax_h3_model.py": (
+        "the video decoder's sequence shard, which a contract SeqShard can't declare since the decoder has no arrays"
+    ),
+}
 ADAPTERS = "mstar.engine.state.adapters"
 _BY_HAND = "the script builds a node's resources and handles by hand, as a test does"
 # the files outside mstar/engine/ and the tests that import the adapters, each with its reason
@@ -130,6 +139,11 @@ def _violations(source: str, path: str = "") -> tuple[list[str], set[tuple[str, 
             found += [f"import {a.name}" for a in node.names if a.name.startswith("mstar.engine")]
         elif isinstance(node, ast.FunctionDef) and node.name in RESOURCE_BINDS:
             found.append(f"def {node.name} at line {node.lineno}, which takes the built resources")
+        elif isinstance(node, ast.FunctionDef) and node.name == "get_node_resources":
+            if path in ALLOWED_NODE_RESOURCES:
+                used.add(path)
+            else:
+                found.append(f"def get_node_resources at line {node.lineno}, where `declare_state` declares the state")
         elif (
             isinstance(node, ast.Attribute) and node.attr in FORBIDDEN_ATTRIBUTES
             and not (node.attr == "sequence_shard" and node.lineno in shard_reads)
@@ -206,7 +220,7 @@ def test_every_exception_is_still_used():
         used |= _violations(path.read_text(), str(path))[1]
     excepted = (
         ALLOWED.keys() | ALLOWED_BREAKS.keys() | ALLOWED_SHARD_READS.keys() | ADAPTER_IMPORTERS.keys()
-        | CONTRACT_RESOURCE_IMPORTS
+        | CONTRACT_RESOURCE_IMPORTS | ALLOWED_NODE_RESOURCES.keys()
     )
     assert excepted <= used, f"delete these exceptions: {sorted(excepted - used, key=str)}"
 
@@ -227,6 +241,7 @@ def test_every_exception_is_still_used():
     ("def f(self): return self.kv.reads['attn']", ".reads"),
     ("@torch.compiler.disable\ndef f(): pass", "torch.compiler.disable"),
     ("class M:\n    def bind_resources(self, resources): pass", "def bind_resources"),
+    ("class M:\n    def get_node_resources(self): return []", "def get_node_resources"),
 ])
 def test_the_lint_catches_each_way_past_the_contract(source, expected):
     found, _ = _violations(source)
