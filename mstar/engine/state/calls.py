@@ -20,6 +20,8 @@ from mstar.engine.state.contract import (
     ArrayStep,
     CausalConv,
     GatedDeltaNet,
+    KimiDelta,
+    KimiDeltaWeights,
     Op,
     Reached,
     Sampler,
@@ -288,9 +290,9 @@ class ArrayHandle(StepHandle):
                                 f"{sorted(binding.read_back) or 'none'}")
         return getattr(self.reads[read], field)
 
-    def _update(self, kind: type[Op], layer: int) -> tuple[Any, torch.Tensor]:
-        """Record the update of type ``kind`` on ``layer``'s field that ``kind`` writes, and return the resource that
-        runs it and the field's view."""
+    def _update(self, kind: type[Op], layer: int) -> tuple[Any, tuple[torch.Tensor, ...]]:
+        """Record the update of type ``kind`` on each of ``layer``'s fields that ``kind`` writes, and return the
+        resource that runs it and the fields' views, in the order of ``kind.writes``."""
         raise self._unsupported(f"an update of type {kind.__name__}")
 
     def _openable(self) -> int:
@@ -409,7 +411,7 @@ def causal_conv(
     bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """The declared `CausalConv` over ``x``, which reads and writes ``layer``'s ``conv`` field in place."""
-    run, conv = h._update(CausalConv, h._layer_id(layer))
+    run, (conv,) = h._update(CausalConv, h._layer_id(layer))
     return run.run_conv(x, conv_layer=conv, weight=weight, bias=bias, label=h.label)
 
 
@@ -419,8 +421,22 @@ def gated_delta_net(
     b: torch.Tensor, a_log: torch.Tensor, dt_bias: torch.Tensor,
 ) -> torch.Tensor:
     """The declared `GatedDeltaNet`, which reads and writes ``layer``'s ``state`` field in place."""
-    run, state = h._update(GatedDeltaNet, h._layer_id(layer))
+    run, (state,) = h._update(GatedDeltaNet, h._layer_id(layer))
     return run.run(q, k, v, a, b, state_layer=state, a_log=a_log, dt_bias=dt_bias, label=h.label)
+
+
+@torch.compiler.disable
+def kimi_delta(
+    h: ArrayHandle, layer: int | torch.Tensor, qkv: torch.Tensor, g: torch.Tensor, beta: torch.Tensor,
+    weights: KimiDeltaWeights, *, gate: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """The declared `KimiDelta`, which reads and writes ``layer``'s ``conv`` and ``state`` in place. ``qkv`` is (tokens,
+    3 * heads * head_dim) before the conv, ``g`` (tokens, head_dim) the forget gate's low-rank factor, ``beta`` (tokens,
+    heads) before its sigmoid, and ``gate`` (tokens, head_dim) the output gate's low-rank factor. Returns (tokens,
+    heads * head_dim) gated and normed, or (tokens, heads, head_dim) under ``full_rank_gate``."""
+    layer = h._layer_id(layer)
+    run, (conv, state) = h._update(KimiDelta, layer)
+    return run.run(h._pool_layer[layer], qkv, g, beta, conv, state, weights, gate=gate, label=h.label)
 
 
 def scatter(h: ShardHandle, *xs: torch.Tensor | None, dim: int | None = None):

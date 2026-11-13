@@ -44,6 +44,7 @@ from mstar.engine.resources.kv.config import (
 from mstar.engine.resources.kv.plan import stage_reach
 from mstar.engine.resources.kv.ring.cache import fits_block_mask
 from mstar.engine.resources.linear_attn.config import (
+    LinearAttnBackend,
     LinearAttnConfig,
     LinearAttnSpec,
     LinearAttnStep,
@@ -83,6 +84,8 @@ from mstar.engine.state.contract import (
     Entry,
     FrameWindow,
     GatedDeltaNet,
+    KimiDelta,
+    KimiDeltaWeights,
     KVEntry,
     Layout,
     Mask,
@@ -678,6 +681,10 @@ class OpBinding:
         """The key of the resource the op under ``key`` runs on."""
         return key
 
+    def layout(self, field: str) -> "OpBinding":
+        """The binding whose `block`, `stored` and `from_stored` lay out ``field``, one the op writes."""
+        return self
+
     def apply(self, spec: NodeResourceSpec | None, settings: Mapping[str, Any]) -> None:
         """Set ``settings``, the op's `kernel_settings`, on ``spec``, its resource's."""
         for field, value in settings.items():
@@ -1069,6 +1076,95 @@ class GDN(LinearAttnBinding):
 
     def from_stored(self, stored: torch.Tensor) -> torch.Tensor:
         return stored.transpose(-1, -2)
+
+
+class KDA(LinearAttnBinding):
+    """`KimiDelta` on a Value: one `LinearAttnSpec` whose kernels read and write ``conv`` and ``state`` together."""
+
+    kernel_settings = frozenset()
+
+    def check(self, array: Array, key: str, op: KimiDelta) -> None:
+        if set(array.entry.tensors) != set(op.writes):
+            raise _no_layout(array, "entry must be exactly conv and state, the blocks the KDA kernels read")
+        dtype = array.entry.tensors["state"].dtype
+        if dtype is not torch.float32:
+            raise _no_layout(array, f"state of dtype {dtype}, and the KDA kernels keep the recurrence in float32")
+
+    def specs(self, array: Array, key: str, op: KimiDelta) -> list[NodeResourceSpec]:
+        return [LinearAttnSpec(
+            resource_key=key, nodes=array.nodes,
+            config=LinearAttnConfig(
+                recurrent_state=array.name, variant=LinearAttnVariant.KDA, backend=LinearAttnBackend.TRITON,
+            ),
+        )]
+
+    def layout(self, field: str) -> OpBinding:
+        return K_LAST_STATE if field == "state" else OpBinding()
+
+    def bind(self, array: Array, key: str, resources: Mapping[str, Any]) -> "_KimiDeltaRun":
+        op = array.updates[key]
+        resources[key].bind_layer(lower_bound=op.lower_bound, full_rank_output_gate=op.full_rank_gate)
+        return _KimiDeltaRun(array, op, resources[key])
+
+
+class KLastState(OpBinding):
+    """A delta rule's ``state``, stored K-last, (h, d_v, d_k), where the op declares (h, d_k, d_v), since the KDA
+    kernels read it that way."""
+
+    def block(self, tensor: TensorType) -> RecurrentBlockConfig:
+        h, d_k, d_v = tensor.shape
+        shard = None if tensor.shard is None else (0, 2, 1)[tensor.shard]
+        return _block(TensorType((h, d_v, d_k), dtype=tensor.dtype, shard=shard))
+
+    def stored(self, value: torch.Tensor) -> torch.Tensor:
+        return value.transpose(-1, -2)
+
+    def from_stored(self, stored: torch.Tensor) -> torch.Tensor:
+        return stored.transpose(-1, -2)
+
+
+K_LAST_STATE = KLastState()
+
+
+class _KimiDeltaRun:
+    """`KDAManager.run` for `kimi_delta`, with each layer's kernel parameters built once per `KimiDeltaWeights`
+    object, so weights rebuilt after a move rebuild them."""
+
+    def __init__(self, array: Array, op: KimiDelta, kda: Any):
+        self._name = array.name
+        self._op = op
+        self._kda = kda
+        # pool layer -> the weights its parameters were built from, and the parameters
+        self._params: dict[int, tuple[KimiDeltaWeights, Any]] = {}
+
+    def run(
+        self, i: int, qkv: torch.Tensor, g: torch.Tensor, beta: torch.Tensor, conv: torch.Tensor, state: torch.Tensor,
+        weights: KimiDeltaWeights, *, gate: torch.Tensor | None, label: str,
+    ) -> torch.Tensor:
+        built = self._params.get(i)
+        if built is None or built[0] is not weights:
+            self._check_gate(weights, gate)
+            built = self._params[i] = (weights, self._kernel_params(weights, state))
+        return self._kda.run(qkv, g, beta, conv, state, built[1], gate=gate, label=label)
+
+    def _check_gate(self, weights: KimiDeltaWeights, gate: torch.Tensor | None) -> None:
+        full = self._op.full_rank_gate
+        given = {"gate": gate, "g_b": weights.g_b, "norm_weight": weights.norm_weight}
+        wrong = sorted(name for name, value in given.items() if (value is not None) == full)
+        if wrong:
+            raise ValueError(f"Array {self._name!r}: kimi_delta under full_rank_gate={full} takes "
+                             f"{'no' if full else 'a'} gate, g_b and norm_weight, and got {wrong} "
+                             f"{'set' if full else 'None'}")
+
+    def _kernel_params(self, weights: KimiDeltaWeights, state: torch.Tensor) -> Any:
+        from mstar.engine.resources.linear_attn.kda import KDAParams
+
+        heads, head_dim = state.shape[1], state.shape[-1]
+        return KDAParams(
+            conv_weight=weights.conv, A_log=weights.a_log, dt_bias=weights.dt_bias, lower_bound=self._op.lower_bound,
+            num_heads=heads, head_dim=head_dim, scale=head_dim ** -0.5 if self._op.scale is None else self._op.scale,
+            f_b=weights.f_b, g_b=weights.g_b, norm_weight=weights.norm_weight, norm_eps=weights.norm_eps,
+        )
 
 
 class ConvOnLinearAttn(OpBinding):
@@ -1621,14 +1717,14 @@ class ValueHandle(ArrayHandle):
             stored = self._stored(field, layer, value, value.shape[1:], "write")
             self._pool.scatter_(field, stored, self._pool_layer[layer], label=self.label)
 
-    def _update(self, kind: type[Op], layer: int) -> tuple[Any, torch.Tensor]:
+    def _update(self, kind: type[Op], layer: int) -> tuple[Any, tuple[torch.Tensor, ...]]:
         runner = self._runners.get(kind)
         if runner is None:
             raise self._refusal(f"an update of type {kind.__name__}, which the array doesn't declare")
-        (field,) = kind.writes
-        view = self.block(field, layer)
-        self._record_update(field, layer)
-        return runner, view
+        views = tuple(self.block(field, layer) for field in kind.writes)
+        for field in kind.writes:
+            self._record_update(field, layer)
+        return runner, views
 
     def _openable(self) -> int:
         return self._pool.num_free_slots
@@ -2416,6 +2512,7 @@ BINDINGS: dict[tuple[Storage, type[Op | Positions | None]], OpBinding] = {
     (WITHIN_STEP, Attend): RaggedAttend(),
     (VALUE, GatedDeltaNet): GDN(),
     (VALUE, CausalConv): ConvOnLinearAttn(),
+    (VALUE, KimiDelta): KDA(),
 }
 # What `backend: sdpa` binds in place of the default, for each storage and op type SDPA can run.
 SDPA: dict[tuple[Storage, type[Op]], OpBinding] = {(WITHIN_STEP, Attend): SdpaAttend()}
@@ -2500,5 +2597,5 @@ def _op_specs(array: Array, bound: Sequence[BoundOp]) -> list[NodeResourceSpec]:
 def _field_layouts(array: Array, bound: Sequence[BoundOp]) -> dict[str, OpBinding]:
     """Each of ``array``'s fields with the binding that lays it out in the pool: the update's that writes it, or the
     base binding's layout as declared."""
-    written = {field: each.binding for each in bound for field in each.declared.writes}
+    written = {field: each.binding.layout(field) for each in bound for field in each.declared.writes}
     return {field: written.get(field, OpBinding()) for field in array.entry.tensors}
