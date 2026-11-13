@@ -9,6 +9,7 @@ import torch
 import torch.nn.functional as F
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.engine.accelerator_graph_runner import PiecewiseAcceleratorGraphRunner
 from mstar.engine.resources.attn.ragged.expert_mask import cross_visibility, self_visibility
 from mstar.engine.resources.base import EngineResourceInfo, build_resource
 from mstar.engine.resources.step import Segment, StepContext, SubmoduleStep
@@ -16,6 +17,7 @@ from mstar.engine.state import (
     Array,
     ArrayStep,
     Attend,
+    Block,
     ExpertCross,
     ExpertCrossLayout,
     ExpertSelf,
@@ -205,3 +207,40 @@ def test_missing_expert_layout_is_refused() -> None:
     step = SubmoduleStep(state={"expert_q": ArrayStep(segments=(Segment("r0", "q", 4),))})
     with pytest.raises(ValueError, match="has no expert state_layout"):
         state_steps(step, handles, per_request_info={"r0": info})
+
+
+@pytest.mark.parametrize("cross", [False, True])
+def test_piecewise_expert_mask_refuses_without_request_layout_transport(cross: bool) -> None:
+    query = Array(
+        "expert_q", nodes={"expert"}, labels={"q"}, layers={0},
+        entry=KVEntry(heads=2, head_dim=32), max_len=0,
+        reads={"self_attn": Read(
+            mask=Block() if cross else ExpertSelf(2, 1), op=Attend(q_heads=2),
+        )},
+    )
+    keys = Array(
+        "trunk_kv", nodes={"expert"}, labels={"kv"}, layers={0},
+        entry=KVEntry(heads=2, head_dim=32), max_len=0,
+        reads={"cross_attn": Read(
+            mask=ExpertCross(2, 1, 1, 2), op=Attend(q_heads=2), queries="expert_q",
+        )},
+    )
+    array = keys if cross else query
+    arrays = [query, keys] if cross else [query]
+    handles = node_handles(
+        SimpleNamespace(declare_state=lambda: arrays), "expert",
+        {"self_attn": SimpleNamespace(run=lambda *args, **kwargs: None),
+         "cross_attn": SimpleNamespace(run=lambda *args, **kwargs: None)},
+    )
+    runner = object.__new__(PiecewiseAcceleratorGraphRunner)
+    runner._label = "expert"
+    runner._segment_keys = ()
+    runner._state_handles = handles
+    runner._config = SimpleNamespace(region_step=lambda request_ids, *args: SubmoduleStep(
+        segments=[Segment(request_ids[0], "kv" if cross else "q", 4)],
+        state={name: ArrayStep(segments=(Segment(request_ids[0], label, 4),))
+               for name, label in (("expert_q", "q"), ("trunk_kv", "kv"))[:(2 if cross else 1)]},
+    ))
+    mask_name = "ExpertCross" if cross else "ExpertSelf"
+    with pytest.raises(ValueError, match=f"{mask_name} needs per-request state_layout lengths"):
+        runner._region_step([-2], [4])
