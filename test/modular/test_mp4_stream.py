@@ -10,9 +10,11 @@ index goes to the front as ffmpeg's ``+faststart`` puts it.
 
 from __future__ import annotations
 
+import gc
 import io
 import queue
 import threading
+import weakref
 from concurrent.futures import CancelledError
 from types import SimpleNamespace
 
@@ -383,3 +385,19 @@ def test_teardown_stops_the_writer_before_the_buffers_go(worker):
     worker._cleanup_request_state("r")
     assert order == [("cleanup", False)]
     assert mp4.future.cancelled() and "r" not in worker.request_output_state
+
+
+def test_teardown_frees_the_writer_without_the_collector(worker):
+    # each holds its encoder and the mp4: left to the cyclic collector, they piled up under load
+    state = _request(worker, "r", ["video"])
+    _output(worker, "r", VIDEO_PART, [torch.from_numpy(p) for p in np.array_split(_clip(), 3)], loop="decode")
+    assert [c.modality for c in _run_until(worker, 3)][-1] == "video"
+    state.mp4.join(timeout=30)
+    refs = weakref.ref(state.mp4), weakref.ref(state)
+    del state
+    gc.disable()
+    try:
+        worker._cleanup_request_state("r")
+        assert [ref() for ref in refs] == [None, None]
+    finally:
+        gc.enable()
