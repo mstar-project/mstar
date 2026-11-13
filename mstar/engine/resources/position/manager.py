@@ -291,8 +291,12 @@ class RopeManager(PositionManager):
         """Apply the held corrections of ``rids``, or every one, as `KVManager._apply_deferred` does."""
         with self._lock:
             for rid in list(self._deferred) if rids is None else rids:
-                for label, correction in self._deferred.pop(rid, {}).items():
-                    self.correct_len(rid, label, correction.delta())
+                held = self._deferred.get(rid, {})
+                for label, correction in list(held.items()):
+                    delta = correction.delta()
+                    del held[label]
+                    self.correct_len(rid, label, delta)
+                self._deferred.pop(rid, None)
 
     def admit(self, step: PositionStep, ctx: StepContext) -> AdmitOutcome:
         if self._deferred:

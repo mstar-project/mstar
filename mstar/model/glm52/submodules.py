@@ -78,7 +78,8 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         )
         # Each captured bucket's mailbox, and the eager steps' under None: the pinned verdict table the host reads
         # and the flag the graph sets once the table is written. `_verdicts` names the mailbox of the step in
-        # flight and each real request's row in it.
+        # flight and each real request's row in it. It holds one step, since the engine unpacks a step's outputs
+        # before it preprocesses the next step.
         self._mailboxes: dict[Any, tuple[torch.Tensor, torch.Tensor]] = {}
         self._verdicts: tuple[Any, dict] | None = None
         self._one: torch.Tensor | None = None

@@ -1,14 +1,16 @@
 """GLM-5.2 on the state contract, against ``main``'s hand-written resources: the specs its declarations
 build are ``main``'s but for three named differences, ``process_prompt`` lays out the latent array and the
 seed, the prompt length rides the walk's step metadata, and a verify step's count edge cuts the verdict as
-``main``'s per-request counters did."""
+``main``'s per-request counters did and reaches the step speculated after it."""
 from __future__ import annotations
 
 from types import SimpleNamespace
 
 import pytest
 import torch
+from request_walks import walk_runtime
 
+from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
@@ -22,11 +24,15 @@ from mstar.engine.resources import (
     SamplerSpec,
 )
 from mstar.engine.resources.position.config import PositionConfig
+from mstar.engine.resources.step import StepContext
 from mstar.engine.state.adapters import node_resources
 from mstar.model.glm52.config import INDEX_KEYS, KV, MTP_SEED, PROMPT_LEN, SAMPLER, Glm52ModelConfig
 from mstar.model.glm52.glm52_model import Glm52Model
 from mstar.model.glm52.submodules import Glm52LLMSubmodule
 from mstar.model.submodule_base import END_PARTITION, ARNodeInputs
+from mstar.testing_utils.worker import make_worker
+from mstar.worker.micro_scheduler import ScheduledBatch
+from mstar.worker.speculation import Speculation
 
 # main's resource keys that the declarations name otherwise: the positions take the latent array's
 # position key, and the DSA resource the index key array's name
@@ -155,6 +161,39 @@ def test_the_count_edge_cuts_a_verdict_as_main_did(max_tokens, count, accepted, 
     assert bool(stops) == (count + len(want) >= budget or (not ignore_eos and want[-1] == eos))
 
 
+def test_a_speculated_step_takes_the_count_its_verify_step_unpacked():
+    """Under async scheduling step N+1 is built before N's outputs reach the conductor, and `thread_outputs` hands
+    it N's outputs on the edges the runtime says the decode loop consumes. A row missing one of them leaves the
+    speculated step."""
+    k = 3
+    consumed = walk_runtime(_model(mtp_num_draft_tokens=k).get_graph_walk_graphs()).get_consumed_edges(
+        "LLM", "LLM", "decode")
+    sub = _submodule(k)
+    sub._mailboxes = {None: (torch.tensor([[11, 12, 13, 14, 2]]), torch.ones(1, dtype=torch.long))}
+    sub._verdicts = None, {"r": 0}
+    inp = ARNodeInputs(input_ids=torch.tensor([11]), input_seq_len=k + 1, kwargs={"count": 5})
+    # the forward's next input, then what the engine's unpack adds
+    outputs = {"r": {"text_inputs": [torch.tensor([13])]}}
+    outputs["r"].update(sub.unpack_packed_outputs(
+        static_output={}, request_ids=["r"], real_seq_lens=[k + 1], inputs=[inp],
+        per_request_info={"r": _info("decode", 64, 5)},
+    )["r"])
+    spec = Speculation(
+        scheduled_batch=ScheduledBatch(node_name="LLM", graph_walk="decode", request_to_worker_graph={"r": "wg"}),
+        node_batch=ExecutingBatch(
+            node_name="LLM", per_request_input_tensors={"r": {}}, per_request_info={"r": object()},
+            per_request_input_metadata={"r": None}, final_stream_rids={"r"}, partition_done_rids={"r"},
+            step_context=StepContext(request_ids=("r",), graph_walk="decode", slot=0, capture=False),
+        ),
+        consumed_edges=consumed, continuing_rids={"r"}, partition="default", is_new_iter=True, is_same_node=True,
+        consumed_streaming_edges={},
+    )
+    make_worker().speculator.thread_outputs(spec, outputs)
+    assert spec.continuing_rids == {"r"}, "the verify step's row would leave the speculated step"
+    threaded = spec.node_batch.per_request_input_tensors["r"]
+    assert [int(t) for t in threaded.get("count", [])] == [5 + 3], "the speculated step would cut by a stale count"
+
+
 @pytest.mark.parametrize("room", [0, 1, 2])
 def test_an_mtp_prefill_at_the_context_limit_stops_after_its_token(room):
     """``main`` clamped the budget in the prefill's preprocess and stopped the prefill row at a budget of 1."""
@@ -190,9 +229,18 @@ def _reduced(monkeypatch, **fields) -> None:
 
 def test_glm52_refuses_an_indexer_that_rotates_its_own_way(monkeypatch):
     """The index keys rotate through the latent array's Rope, which holds the MLA's pairing."""
-    _reduced(monkeypatch, indexer_rope_interleave=not Glm52ModelConfig.reduced().rope_interleave)
+    _reduced(monkeypatch, mla_absorb=True, indexer_rope_interleave=not Glm52ModelConfig.reduced().rope_interleave)
     with pytest.raises(ValueError, match="indexer rotates as its MLA does"):
-        Glm52Model(model_path_hf="", config_variant="reduced", tokenizer_mode="byte")
+        Glm52Model(model_path_hf="", config_variant="reduced", tokenizer_mode="byte", dsa_long_context=True)
+
+
+def test_glm52_without_long_context_loads_whatever_its_indexer_pairing(monkeypatch):
+    """Only dsa_long_context builds an indexer, so without it the indexer's pairing refuses nothing."""
+    _reduced(monkeypatch, indexer_rope_interleave=not Glm52ModelConfig.reduced().rope_interleave)
+    model = Glm52Model(model_path_hf="", config_variant="reduced", tokenizer_mode="byte")
+    assert model.config.indexer_rope_interleave != model.config.rope_interleave, (
+        "a config that builds no indexer would be refused for the pairing its indexer would rotate by"
+    )
 
 
 def test_glm52_refuses_dsa_whose_first_layer_reuses_a_pick(monkeypatch):

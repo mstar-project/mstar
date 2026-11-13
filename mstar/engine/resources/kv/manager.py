@@ -3161,11 +3161,16 @@ class KVManager(AttentionResource):
 
     def _apply_deferred(self, rids: Collection[str] | None = None) -> None:
         """Apply the held corrections of ``rids``, or every one. An admit applies every one, not only its step's
-        rows, so a request the next steps leave out can't find its verify step's count table reused."""
+        rows, so a request the next steps leave out can't find its verify step's count table reused. A correction
+        whose count read raises stays held, and the next admit raises again."""
         with self._lock:
             for rid in list(self._deferred) if rids is None else rids:
-                for label, correction in self._deferred.pop(rid, {}).items():
-                    self.correct_len(rid, label, correction.delta())
+                held = self._deferred.get(rid, {})
+                for label, correction in list(held.items()):
+                    delta = correction.delta()
+                    del held[label]
+                    self.correct_len(rid, label, delta)
+                self._deferred.pop(rid, None)
 
     def correct_len(self, rid: str, label: str, delta: int) -> None:
         """Move a stream's stored length by ``delta`` tokens, pages kept: a
