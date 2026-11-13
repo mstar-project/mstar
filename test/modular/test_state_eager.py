@@ -31,8 +31,10 @@ from test_state_calls import (
 from test_state_kept_reads import _CpuVarlenSdpa
 
 from mstar.communication.tensors import LocalTransferEngine
+from mstar.engine.resources import BucketKey, SlotLease
+from mstar.engine.resources.attn import flashinfer
 from mstar.engine.resources.attn.base import EagerSlotKey
-from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec, AttnBackend
+from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec, AttentionStep, AttnBackend
 from mstar.engine.resources.attn.dense import DenseAttentionManager
 from mstar.engine.resources.kv.config import (
     KVReqConfig,
@@ -305,3 +307,39 @@ def test_a_windowed_array_takes_no_max_seq_len_past_its_max_len():
         f"Array 'kv': resources.kv.max_seq_len is {2 * SLOTS}, past its max_len of {SLOTS}, which its kept window's "
         "requests are checked against; raise max_len"
     ], "a request past max_len would release entries under a window the guard let through"
+
+
+# The paged leg of a kept window
+
+
+def _committed(entries: int):
+    """A pool of pages of 16 whose request ``a`` keeps a sink of 8 and a window of 16, after ``entries`` kept entries:
+    its config, and the plan of a step of 4 after them."""
+    pool = _windowed_pool(16, sink=8, window=16)
+    ctx = StepContext(request_ids=("a",), graph_walk="rollout", slot=0, capture=False)
+    for _ in range(0, entries, 8):
+        step = KVStep(segments=(Segment("a", "main", 8),))
+        assert pool.admit(step, ctx).ok
+        pool.plan(step, ctx)
+        pool.write_kv(*([torch.zeros(8, 1, 1)] * 2), layer_idx=0, label="main")
+        pool.commit(step, ctx)
+    denoise = KVStep(segments=(Segment("a", "main", 4),), commit=False)
+    assert pool.admit(denoise, ctx).ok
+    return pool.config, pool.plan(denoise, ctx)
+
+
+def test_a_released_stream_never_plans_under_a_lease():
+    """The paged kernel attends every page a row holds, which is the window's reach only while the stream keeps no
+    entry past it. A captured step replays the paged kernel, so it refuses such a row."""
+    config, planned = _committed(48)
+    paged = flashinfer.FlashInferManager("kv", torch.device("cpu"), torch.float32, config)
+    lease = SlotLease(slot=0, bucket=BucketKey(graph_walk="rollout", cg_key_info=None, bs=1, num_tokens=4))
+    ctx = SimpleNamespace(resident=None, slot_lease=lease, is_preplan=False, force_prefill=False, slot=0,
+                          plan_phase="res.plan", plan_results={"kv": planned})
+    with pytest.raises(RuntimeError, match="holds entries its kept window no longer reaches"):
+        paged.plan(AttentionStep(causal=False), ctx)
+
+
+def test_a_stream_its_window_reaches_whole_is_not_marked():
+    _, planned = _committed(16)
+    assert not planned["main"].beyond_reach, "a captured step would refuse a stream that released nothing"
