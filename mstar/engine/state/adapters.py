@@ -82,7 +82,7 @@ from mstar.engine.state.analysis import (
     shard_axis,
     written_by_step,
 )
-from mstar.engine.state.calls import ArrayHandle, SamplerHandle, ShardHandle, pool_layers, segments_of
+from mstar.engine.state.calls import STEP_CALLS, ArrayHandle, SamplerHandle, ShardHandle, pool_layers, segments_of
 from mstar.engine.state.contract import (
     EMPTY,
     Array,
@@ -1660,6 +1660,8 @@ class ValueHandle(ArrayHandle):
     """The calls on a Value: its updates, which run in place on one layer's block, and reads and writes of whole
     fields."""
 
+    _step_calls = (*STEP_CALLS, "_written")
+
     def __init__(
         self, array: Array, resources: Mapping[str, Any], bindings: tuple[BoundOp, ...], resolved: "Resolved",
     ):
@@ -2016,6 +2018,8 @@ class BoundedHandle(ArrayHandle):
     """Adds and reads through the bounded KV of an unbounded array, which keeps each row's newest entries in a slot and
     stores a step's keys as it attends, so an add holds k and v for its layer's read."""
 
+    _step_calls = STEP_CALLS
+
     def __init__(
         self, array: Array, resources: Mapping[str, Any], bindings: tuple[BoundOp, ...], resolved: "Resolved",
     ):
@@ -2069,8 +2073,10 @@ class BoundedHandle(ArrayHandle):
         """The index of the start ``rid`` begins from: the step's, or for a region's step that names none the open
         step's. None for a row that neither names, which only a capture's or a replay's padding may be."""
         start = declared.starts.get(rid)
-        if start is None and self._step is not None:
-            start = self._step.state[self.name].starts.get(rid)
+        # inside a region run eagerly, the open step is the one set aside
+        open_step = self._step if self._outer is None else self._outer["_step"]
+        if start is None and open_step is not None:
+            start = open_step.state[self.name].starts.get(rid)
         if start is not None and not 0 <= start < len(self._start_lens):
             raise self._refusal(f"row {rid} begins from start {start}, and set_starts gave {len(self._start_lens)}")
         return start
