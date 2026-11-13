@@ -4,7 +4,8 @@ Each case sends the same multipart body to both frontends, served by one
 scripted ASR stub, and compares the response (status, body, stream events) and
 every window each submitted: the kwargs, the layout, and the window's length
 as the stub hears it. Both decode and cut the upload with the same
-``WindowPlanner``, the Rust side over the bridge's ``windows`` round trip.
+``WindowPlanner``, the Rust side over the bridge's ``windows`` round trip, except
+a PCM WAV of one window, which the Rust side plans from its header.
 """
 
 import asyncio
@@ -29,6 +30,7 @@ sf = pytest.importorskip("soundfile")
 
 from fastapi.testclient import TestClient
 from test_rust_frontend import BINARY, _Chunk, _free_port, _wait_healthy
+from test_rust_release import _leave, _until
 
 from mstar.api_server import entrypoint
 from mstar.api_server.openai.adapters import ADAPTER_REGISTRY
@@ -93,6 +95,10 @@ class _Model:
         return self._kwargs
 
 
+def _hello(record, i):
+    return _pieces("hello")
+
+
 class _ASRStub:
     """Both frontends' data plane: each submission's chunks come from
     ``script(record, index)``, ``record`` being what was submitted."""
@@ -103,7 +109,7 @@ class _ASRStub:
         self.upload_dir = upload_dir
         self.max_concurrent_requests = cap
         self.metrics = None
-        self.script = lambda record, i: _pieces("hello")
+        self.script = _hello
         self.reset()
 
     def reset(self):
@@ -164,7 +170,7 @@ def _rust(model: str, stub: _ASRStub):
     thread.start()
     try:
         assert _wait_healthy(port)
-        yield port
+        yield port, bridge
     finally:
         bridge.stop()
         proc.terminate()
@@ -181,7 +187,7 @@ def stacks():
             key = (model, None if request_kwargs is None else tuple(sorted(request_kwargs)), cap)
             if key not in _STACKS:
                 stub = _ASRStub(model, Path(tempfile.mkdtemp(prefix="mstar_asr_up_")), request_kwargs, cap)
-                _STACKS[key] = (stub, exits.enter_context(_rust(model, stub)))
+                _STACKS[key] = (stub, exits.enter_context(_rust(model, stub))[0])
             return _STACKS[key]
         yield get
         _STACKS.clear()
@@ -411,6 +417,58 @@ def test_an_upload_no_decoder_reads_goes_whole_to_the_model_alike(stacks, monkey
     assert rust_submits == py_submits and len(py_submits) == 1
 
 
+def _as(subtype: str, seconds: float, channels: int = 1, fmt: str = "WAV") -> bytes:
+    """A tone of ``seconds`` as a ``fmt`` file of ``subtype``."""
+    x = np.asarray(sf.read(io.BytesIO(_wav(seconds, channels=channels)))[0])
+    buf = io.BytesIO()
+    sf.write(buf, x, 16_000, format=fmt, subtype=subtype)
+    return buf.getvalue()
+
+
+def _with_header(wav: bytes, riff: int | None = None, data: int | None = None, block: int | None = None) -> bytes:
+    """``wav`` (a canonical 44-byte header) with its RIFF size, data size or block align overwritten."""
+    out = bytearray(wav)
+    for at, value, width in ((4, riff, 4), (40, data, 4), (32, block, 2)):
+        if value is not None:
+            out[at:at + width] = value.to_bytes(width, "little")
+    return bytes(out)
+
+
+WAV_HEADERS = {
+    "pcm16-short": _wav(6.0),
+    "pcm16-over-a-window": _wav(40.0),
+    "pcm8": _as("PCM_U8", 6.0),
+    "pcm24": _as("PCM_24", 6.0),
+    "pcm32": _as("PCM_32", 6.0),
+    "float": _as("FLOAT", 6.0),
+    "double": _as("DOUBLE", 6.0),
+    "extensible": _as("PCM_16", 6.0, channels=3, fmt="WAVEX"),
+    # what libsndfile reads differently from the header, or refuses
+    "unclosed": _with_header(_wav(40.0), riff=8, data=0),
+    "padded-frames": _with_header(_wav(6.0), block=4),
+    "streamed-size": _with_header(_wav(6.0), data=0xFFFF_FFFF),
+}
+# the uploads the Rust side plans from the header, without the planner
+LOCAL = {"pcm16-short", "pcm8", "pcm24", "pcm32", "float", "double", "extensible"}
+
+
+@pytest.mark.parametrize("header", list(WAV_HEADERS))
+def test_a_wav_upload_is_planned_and_answered_alike(stacks, monkeypatch, header):
+    plans = []
+    windows = RustFrontendBridge._windows
+
+    def counted(self, msg):
+        if msg.get("op") == "plan":
+            plans.append(msg)
+        return windows(self, msg)
+
+    monkeypatch.setattr(RustFrontendBridge, "_windows", counted)
+    fields = [("response_format", "verbose_json")]
+    py, rust = _both(stacks, monkeypatch, "whisper_large", fields, ("speech.wav", WAV_HEADERS[header]), _whisper())
+    _assert_same(py, rust)
+    assert (not plans) == (header in LOCAL)
+
+
 def test_an_upload_past_the_cap_is_a_413_alike(stacks, monkeypatch):
     over = _wav(31 * 60, rate=8000)
     (py, _), (rust, _) = _both(stacks, monkeypatch, "whisper_large", [], ("long.wav", over))
@@ -422,6 +480,36 @@ def test_a_model_without_the_route_is_a_404_alike(stacks, monkeypatch):
     (py, _), (rust, _) = _both(stacks, monkeypatch, "kokoro", [])
     assert py[0] == 404
     assert rust == py
+
+
+class _HoldingASRStub(_ASRStub):
+    """Each window sends its script's chunks, then holds until it is aborted."""
+
+    async def iter_result_chunks(self, request_id):
+        for c in self._chunks.get(request_id, []):
+            yield c
+        while request_id not in self.released:
+            await asyncio.sleep(0.005)
+
+
+@pytest.mark.parametrize("audio", ["one-window", "windows"])
+@pytest.mark.parametrize("when", ["before", "mid"])
+def test_a_stream_whose_client_leaves_releases_its_windows_and_upload(audio, when):
+    """Every window still on the engine is aborted, and the upload, its windows
+    and the bridge's planner for them are gone."""
+    stub = _HoldingASRStub("whisper_large", Path(tempfile.mkdtemp(prefix="mstar_asr_up_")))
+    stub.script = _hello if when == "mid" else (lambda record, i: [])
+    file = ("speech.wav", SHORT if audio == "one-window" else LONG)
+    body, ctype = _multipart([("stream", "true")], file)
+    with _rust("whisper_large", stub) as (port, bridge):
+        if when == "mid":
+            _leave(port, "/v1/audio/transcriptions", body, ctype, read=b"hello")
+        else:
+            _leave(port, "/v1/audio/transcriptions", body, ctype, once=lambda: stub.submits)
+        _until(lambda: sorted(stub.released) == sorted(stub._chunks), what="every window's abort")
+        _until(lambda: not bridge._keys and not bridge._planners, what="the bridge to forget the upload")
+        assert _empty(stub.upload_dir), "the upload or its windows were left"
+    assert len(stub.submits) == (1 if audio == "one-window" else 3)
 
 
 # ── the other ASR adapters ───────────────────────────────────────────────────

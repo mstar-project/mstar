@@ -287,10 +287,17 @@ def _serve(args: argparse.Namespace) -> None:
         argv += ["--log-stats-file", args.log_stats_file]
     if args.enable_metrics:
         argv += ["--enable-metrics"]
-    # Passing --rust-frontend-bin implies --rust-frontend: naming a binary but
-    # silently staying on uvicorn would be a footgun.
-    if args.rust_frontend or args.rust_frontend_bin:
-        argv += ["--rust-frontend"]
+    if args.enable_nvtx:
+        argv += ["--enable-nvtx"]
+    if args.timeout is not None:
+        argv += ["--timeout", str(args.timeout)]
+    if args.tcp_transfer_device:
+        argv += ["--tcp-transfer-device", args.tcp_transfer_device]
+    if args.python_frontend:
+        if args.rust_frontend or args.rust_frontend_bin:
+            raise SystemExit("mstar: --python-frontend serves without mstar-server, "
+                             "so it takes no --rust-frontend(-bin)")
+        argv += ["--python-frontend"]
     if args.rust_frontend_bin:
         argv += ["--rust-frontend-bin", args.rust_frontend_bin]
 
@@ -348,10 +355,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="serve Prometheus metrics at /metrics (needs mstar-ai[metrics])",
     )
     serve.add_argument(
-        "--rust-frontend", action="store_true",
-        help="serve HTTP from the Rust mstar-server binary instead of "
-             "uvicorn/FastAPI (see docs: environment variables / installation)",
+        "--enable-nvtx", action="store_true",
+        help="emit NVTX markers for CUDA profiling (disabled on XPU and CPU)",
     )
+    serve.add_argument(
+        "--timeout", type=float, default=None,
+        help="per-request timeout in seconds (the server's default: 600)",
+    )
+    serve.add_argument(
+        "--tcp-transfer-device", default=None,
+        help="network device for TCP tensor transport (default: auto)",
+    )
+    serve.add_argument(
+        "--python-frontend", action="store_true",
+        help="serve HTTP from the deprecated uvicorn/FastAPI frontend instead "
+             "of mstar-server, the default",
+    )
+    # the default since mstar-server became it; kept so existing commands run
+    serve.add_argument("--rust-frontend", action="store_true", help=argparse.SUPPRESS)
     serve.add_argument(
         "--rust-frontend-bin", default=None,
         help="path to the mstar-server binary (default: MSTAR_SERVER_BIN, "
