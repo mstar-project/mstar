@@ -60,6 +60,7 @@ from mstar.model.media_limits import read_image
 from mstar.model.praxis1.components.proprio import normalized_proprio
 from mstar.model.praxis1.config import Praxis1Config, Praxis1ConfigError
 from mstar.model.praxis1.submodules import (
+    Praxis1ActionHeadSubmodule,
     Praxis1TextEncoderSubmodule,
     Praxis1VaeEncoderSubmodule,
 )
@@ -497,7 +498,9 @@ class Praxis1Model(Model):
                 .requires_grad_(False)
             )
             return Praxis1VaeEncoderSubmodule(self.config, vae)
-        if node_name in ("backbone", "action_expert", "action_head"):
+        if node_name == "action_head":
+            return Praxis1ActionHeadSubmodule(self.config)
+        if node_name in ("backbone", "action_expert"):
             raise NotImplementedError(
                 f"the Praxis-1 trunk node {node_name!r} lands with the backbone port"
             )

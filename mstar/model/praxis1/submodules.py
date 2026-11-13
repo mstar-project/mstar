@@ -23,6 +23,13 @@ from torch import nn
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.model.components.diffusion.decode_utils import latent_affine
+from mstar.model.praxis1.components.action_rows import (
+    GRIP_DIMS,
+    Q99_DIMS,
+    clip_grip,
+    denormalize_rows,
+    unpack_action_tokens,
+)
 from mstar.model.praxis1.components.canvas import (
     build_canvas,
     tile_view_single_arm,
@@ -325,12 +332,53 @@ class Praxis1ActionExpertSubmodule(_Praxis1Node):
 
 
 class Praxis1ActionHeadSubmodule(_Praxis1Node):
-    """The settled action latents as command rows.
+    """The settled action tokens as relative rows for cold openpi calls.
 
-    It will emit float32 commands in the rig's own units. Predicted video
-    latents end at the denoise loop; a later call uses the executed camera
-    frames as context.
+    The Positronic session wire composes these relative rows with the current
+    pose into absolute commands in its own serving adapter. The openpi action
+    array keeps the checkpoint's relative xyz and rotation convention.
     """
+
+    # The engine manager casts floating buffers to the node dtype. Keep q99
+    # statistics in float32 so the inverse map matches the checkpoint.
+    disable_autocast = True
+
+    def __init__(self, config: Praxis1Config) -> None:
+        super().__init__(config)
+        stats = config.normalization
+        try:
+            q01 = torch.as_tensor(stats["action_q01"], dtype=torch.float32)
+            q99 = torch.as_tensor(stats["action_q99"], dtype=torch.float32)
+            raw_dims = stats.get("q99_normed_dims", Q99_DIMS[config.embodiment])
+            if not isinstance(raw_dims, (list, tuple)) or any(type(d) is not int for d in raw_dims):
+                raise ValueError("q99_normed_dims must be integer indices")
+            dims = torch.as_tensor(raw_dims, dtype=torch.long)
+        except (KeyError, TypeError, ValueError, RuntimeError) as exc:
+            raise ValueError("checkpoint lacks valid action normalization statistics") from exc
+        dim = config.action_dim
+        if (q01.shape != (dim,) or q99.shape != (dim,) or
+                not torch.isfinite(q01).all() or not torch.isfinite(q99).all()):
+            raise ValueError(f"checkpoint action quantiles need {dim} finite values")
+        if (dims.ndim != 1 or dims.numel() == 0 or (dims < 0).any() or (dims >= dim).any() or
+                dims.unique().numel() != dims.numel()):
+            raise ValueError(f"checkpoint q99 dims must be unique indices in [0, {dim})")
+        if not torch.all(q99[dims] > q01[dims]):
+            raise ValueError("checkpoint action_q99 must exceed action_q01 on normalized dims")
+        self.register_buffer("action_q01", q01, persistent=False)
+        self.register_buffer("action_q99", q99, persistent=False)
+        self.register_buffer("q99_dims", dims, persistent=False)
+        self.register_buffer(
+            "grip_dims", torch.tensor(GRIP_DIMS[config.embodiment], dtype=torch.long), persistent=False,
+        )
+
+    def prepare_inputs(
+        self,
+        graph_walk: str,
+        fwd_info: CurrentForwardPassInfo,
+        inputs: NameToTensorList,
+        **kwargs,
+    ) -> NodeInputs:
+        return NodeInputs(tensor_inputs={"action_latents": inputs["action_latents"][0]})
 
     def forward(
         self,
@@ -339,6 +387,13 @@ class Praxis1ActionHeadSubmodule(_Praxis1Node):
         action_latents: torch.Tensor,
         **kwargs,
     ) -> NameToTensorList:
-        raise NotImplementedError(
-            "Praxis-1 action head: unpatches the action tokens and unnormalizes the rows"
+        rows = unpack_action_tokens(
+            action_latents, depth=0, action_dim=self.config.action_dim,
+            frames_per_token=self.config.action_frames_per_token,
         )
+        if rows.shape[0] != self.config.action_horizon:
+            raise ValueError(
+                f"cold Praxis-1 action head expected {self.config.action_horizon} rows, got {rows.shape[0]}"
+            )
+        relative = denormalize_rows(rows, self.action_q01, self.action_q99, self.q99_dims)
+        return {"actions": [clip_grip(relative, self.grip_dims)]}
