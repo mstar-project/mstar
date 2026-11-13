@@ -96,6 +96,7 @@ from mstar.engine.state.contract import (
     Entry,
     FrameWindow,
     GatedDeltaNet,
+    KeptWindow,
     KVEntry,
     Layout,
     Mamba2,
@@ -826,6 +827,12 @@ class KeptWindowBinding(OpBinding):
         kept = layout.kept_windows.get(key)
         if kept is None:
             raise RuntimeError(f"state_layout: kept_windows gives no sizes for the kept-window read {key!r}")
+        if not kept.window:
+            raise RuntimeError(f"state_layout: kept_windows[{key!r}] keeps no window, and the paged pool keeps one of "
+                               "at least 1 entry")
+        if kept.grows is not None:
+            raise RuntimeError(f"state_layout: kept_windows[{key!r}].grows is {kept.grows!r}, and a request's layout "
+                               "gives its sizes whole")
         return RetentionPolicy(context_budget=kept.window, protected_prefix=kept.sink, exact=True)
 
     def attach(self, handle: ArrayHandle, key: str, run: Any) -> None:
@@ -1014,6 +1021,21 @@ class BoundedAttend(OpBinding):
         if not tiles_head_dim(head_dim):
             raise _no_layout(array, f"entry head_dim {head_dim}, and the bounded kernels tile a power of two of at "
                                     "least 16")
+        if read.queries is not None:
+            raise _no_layout(array, f"reads[{key!r}].queries must be None, since the bounded KV keeps each row's own "
+                                    "entries")
+        kept = isinstance(read.mask, Bidirectional)
+        if kept and array.start_lengths is None:
+            raise _no_layout(array, f"reads[{key!r}] keeps a window whose sizes grow from each row's start, and "
+                                    "start_lengths is None")
+        if kept and key not in array.kept_windows:
+            raise _no_layout(array, f"kept_windows gives no base for the kept-window read {key!r}")
+        if not kept and (array.start_lengths is not None or array.kept_windows):
+            raise _no_layout(array, f"start_lengths or kept_windows beside the Window read {key!r}, whose size is "
+                                    "its own")
+        unread = sorted(array.kept_windows.keys() - {key})
+        if unread:
+            raise _no_layout(array, f"kept_windows names {unread}, which aren't kept-window reads of the array")
 
     def resource(self, array: Array, key: str) -> str:
         return array.name
@@ -1027,12 +1049,14 @@ class BoundedAttend(OpBinding):
 
 def _bounded_attend(
     kv: Any, layer_idx: int, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, distance_bias: torch.Tensor | None,
+    source: torch.Tensor | None,
 ) -> torch.Tensor:
-    """The bounded KV's attention over ``q``, ``k`` and ``v``, (rows, T, heads, head_dim), in that layout too. The
-    kernel takes the head axis second and one dtype, so q takes k's, and returns rows by time by heads."""
+    """The bounded KV's attention over ``q``, ``k`` and ``v``, (rows, T, heads, head_dim), in that layout too, and
+    ``source``, the layer's starts. The kernel takes the head axis second and one dtype, so q takes k's, and returns
+    rows by time by heads."""
     return kv.attend(
-        layer_idx, q.to(k.dtype).transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), rel_bias=distance_bias,
-        ieee=k.dtype == torch.float32,
+        layer_idx, q.to(k.dtype).transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), source,
+        rel_bias=distance_bias, ieee=k.dtype == torch.float32,
     )
 
 
@@ -1999,12 +2023,67 @@ class BoundedHandle(ArrayHandle):
             bound.binding.attach(self, bound.key, run)
         self._attend = self.reads[next(iter(array.reads))]
         self._kv = resources[array.name]
+        # the starts as the kernel reads a source, (starts, layers, 1, heads, longest, 2 * head_dim), and their lengths
+        self._starts: torch.Tensor | None = None
+        self._start_lens: tuple[int, ...] = ()
+        self._stepped = False
 
     def written(self, rid: str) -> int:
         """The entries the bounded KV committed for ``rid``."""
         return self._kv.written(rid)
 
+    def set_starts(self, starts: Sequence[Mapping[str, torch.Tensor]]) -> None:
+        if self._stepped:
+            raise self._refusal("set_starts after the handle's first step, whose captured reads keep the starts "
+                                "they read")
+        lengths = self.array.start_lengths
+        if lengths is None:
+            raise self._refusal("set_starts, and the array declares no start_lengths")
+        if not starts:
+            raise self._refusal("set_starts with no start")
+        heads, head_dim = self.array.entry.tensors["k"].shape
+        layers, dtype = len(self.array.layers), self._kv.layer(0).dtype
+        laid = []
+        for i, start in enumerate(starts):
+            if start.keys() != {"k", "v"}:
+                raise self._refusal(f"start {i} gives fields {sorted(start)}, and the entry holds ['k', 'v']")
+            n = start["k"].shape[1] if start["k"].dim() == 4 else -1
+            for field, value in start.items():
+                if tuple(value.shape) != (layers, n, heads, head_dim) or n not in lengths:
+                    raise self._refusal(f"start {i}'s {field} is {tuple(value.shape)}, and a start is (layers "
+                                        f"{layers}, n, heads {heads}, head_dim {head_dim}) with n in {lengths}")
+                if value.dtype != dtype:
+                    raise self._refusal(f"start {i}'s {field} is {value.dtype}, and the bounded KV holds {dtype}")
+            laid.append(torch.cat([start["k"], start["v"]], dim=-1).transpose(1, 2).unsqueeze(1))
+        longest = max(t.shape[-2] for t in laid)
+        self._starts = torch.stack([
+            torch.nn.functional.pad(t, (0, 0, 0, longest - t.shape[-2])) for t in laid
+        ]).to(self._kv.layer(0).device)
+        self._start_lens = tuple(t.shape[-2] for t in laid)
+
+    def _start_of(self, declared: ArrayStep, rid: str) -> int | None:
+        """The index of the start ``rid`` begins from: the step's, or for a region's step that names none the open
+        step's. None for a row that neither names, which only a capture's or a replay's padding may be."""
+        start = declared.starts.get(rid)
+        if start is None and self._step is not None:
+            start = self._step.state[self.name].starts.get(rid)
+        if start is not None and not 0 <= start < len(self._start_lens):
+            raise self._refusal(f"row {rid} begins from start {start}, and set_starts gave {len(self._start_lens)}")
+        return start
+
+    def begin_step(self, step) -> None:
+        self._stepped = True
+        super().begin_step(step)
+
     def _check_storage(self, declared: ArrayStep, segments, ctx) -> None:
+        if self.array.start_lengths is not None:
+            rows = [
+                rid for rid in (segment.request_id for segment in segments)
+                if not (ctx.capture or ctx.is_padding_row(rid)) and self._start_of(declared, rid) is None
+            ]
+            if rows:
+                raise self._refusal(f"rows {rows} begin from no start: neither the step nor the open step names one "
+                                    "(ArrayStep.starts)")
         if not declared.keep:
             raise self._no_layout("keep=False on an unbounded array, whose kernel stores the step's keys as it attends")
         if declared.forks:
@@ -2033,7 +2112,8 @@ class BoundedHandle(ArrayHandle):
         layer = self._layer_id(layer)
         self._record_read(layer)
         k, v = self._take_hold(layer)
-        return self._attend(self._pool_layer[layer], q, k, v, distance_bias)
+        source = None if self._starts is None else self._starts[:, self._pool_layer[layer]]
+        return self._attend(self._pool_layer[layer], q, k, v, distance_bias, source)
 
 
 class _MaxLenZeroHandle(ArrayHandle):
@@ -2579,9 +2659,15 @@ class QueriesOnlyStorage(Storage):
         return QueriesOnlyHandle(array, resources)
 
 
+def _kept_at(kept: KeptWindow, length: int) -> SinkWindow:
+    """What ``kept``, an unbounded array's base, keeps of a stream whose start holds ``length`` entries."""
+    return SinkWindow(kept.sink + length * (kept.grows == "sink"), kept.window + length * (kept.grows == "window"))
+
+
 class BoundedStorage(Storage):
-    """An unbounded array with one `Window` read, in a bounded KV that keeps each request's newest entries in a slot.
-    Today's bounded pool holds one row per request and keeps the window as ``SinkWindow(0, size - 1)``."""
+    """An unbounded array with one `Window` or kept-window read, in a bounded KV that keeps each request's newest
+    entries in a slot. Today's bounded pool holds one row per request and keeps a window as ``SinkWindow(0, size -
+    1)``, and a kept window as its base grown by the length of the row's start."""
 
     handle_class = BoundedHandle
     kernel_settings = frozenset({"max_slots"})
@@ -2594,12 +2680,19 @@ class BoundedStorage(Storage):
                 raise _no_layout(array, f"an unbounded array takes one label, the bounded KV's one row per request, "
                                         f"and it has {sorted(array.labels)}")
             bound = resolved.bound[array.name] = _bindings(self, array, setup.by_read)
-            reach = next(iter(array.reads.values())).mask.size - 1
+            key, read = next(iter(array.reads.items()))
+            if isinstance(read.mask, Window):
+                reach = read.mask.size - 1
+                window = {"max_source_len": 0, "retention": SinkWindow(0, reach), "query_window": reach}
+            else:
+                lengths = array.start_lengths
+                window = {"min_source_len": lengths[0], "max_source_len": lengths[-1],
+                          "retention": functools.partial(_kept_at, array.kept_windows[key])}
             resolved.specs[array.name] = [BoundedKVSpec(
                 resource_key=array.name, nodes=array.nodes,
                 config=BoundedKVConfig(
-                    num_layers=len(array.layers), num_heads=heads, head_dim=head_dim, rows_per_request=1,
-                    max_source_len=0, retention=SinkWindow(0, reach), query_window=reach, dtype=dtype,
+                    num_layers=len(array.layers), num_heads=heads, head_dim=head_dim, rows_per_request=1, dtype=dtype,
+                    **window,
                 ),
             )]
             resolved.resource_of.update(_resources_of(array, bound))
@@ -2608,10 +2701,25 @@ class BoundedStorage(Storage):
     def steps(
         self, handle: BoundedHandle, declared: ArrayStep, step: SubmoduleStep, segments, steps: dict[str, Any],
     ) -> None:
-        steps[handle.name] = BoundedKVStep(segments=segments, positions={
-            segment.request_id: StreamPosition(source_len=0, written=handle.written(segment.request_id))
-            for segment in segments
-        })
+        positions = {}
+        for segment in segments:
+            rid = segment.request_id
+            if handle.array.start_lengths is None:
+                positions[rid] = StreamPosition(source_len=0, written=handle.written(rid))
+            elif (start := handle._start_of(declared, rid)) is not None:
+                positions[rid] = StreamPosition(
+                    source_len=handle._start_lens[start], written=handle.written(rid), source=start,
+                )
+        steps[handle.name] = BoundedKVStep(segments=segments, positions=positions)
+
+    def layouts(
+        self, array: Array, by_label: Mapping[str, Layout], keyed_spans: Mapping[str, int],
+    ) -> "dict[str, LabelLayout] | None":
+        for label, layout in by_label.items():
+            if layout.kept_windows:
+                raise RuntimeError(f"state_layout[{array.name!r}][{label!r}].kept_windows: an unbounded array's kept "
+                                   "window takes its sizes from Array.kept_windows and each row's start")
+        return None
 
 
 PAGED = PagedStorage()
@@ -2635,10 +2743,13 @@ def storage_of(array: Array) -> Storage:
     if array.rewritable:
         raise _no_layout(array, "a rewritable array has no spec unless it is a Value, of max_len 1")
     if array.max_len is None:
-        if len(array.reads) != 1 or not isinstance(next(iter(array.reads.values())).mask, Window):
-            masks = [type(read.mask).__name__ for read in array.reads.values()]
-            raise _no_layout(array, f"an unbounded array reads through one Window read, whose window the bounded KV "
-                                    f"keeps, and its reads have masks {masks}")
+        masks = [read.mask for read in array.reads.values()]
+        if len(masks) != 1 or not (
+            isinstance(masks[0], Window) or isinstance(masks[0], Bidirectional) and masks[0].kept_window
+        ):
+            raise _no_layout(array, f"an unbounded array reads through one Window or kept-window read, whose window "
+                                    f"the bounded KV keeps, and its reads have masks "
+                                    f"{[type(mask).__name__ for mask in masks]}")
         return BOUNDED
     if array.max_len == 0:
         return WITHIN_STEP if array.reads else QUERIES_ONLY

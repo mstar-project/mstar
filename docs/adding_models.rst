@@ -775,11 +775,19 @@ deployment YAML tunes them under ``resources:`` (see :ref:`Step 6 <config-yaml>`
   ``BlockCausal(size)``, which sees the segment's blocks of ``size`` entries up to the token's
   own, as an audio tower that attends in chunks does. See `Cacheless attention (encoder towers)`_.
 - ``max_len=None``: the log has no bound, and the engine keeps what the reads can still reach.
-  Today such an array takes one label and one ``Window`` read through ``Attend``, with
-  ``packed=False`` and as many query heads as the entry, over every layer. A bounded KV holds it,
-  one slot per request (`Bounded (sink + window) caches`_). Its read takes ``distance_bias``,
+  Today such an array takes one label and one ``Window`` or kept-window read through ``Attend``,
+  with ``packed=False`` and as many query heads as the entry, over every layer. A bounded KV holds
+  it, one slot per request (`Bounded (sink + window) caches`_). Its read takes ``distance_bias``,
   ``(rows, q_heads, T, size)``, whose entry ``d`` adds to the score of the key at distance ``d``,
-  and ``Positions()`` is each request's count of committed entries.
+  and ``Positions()`` is each request's count of committed entries. A kept-window read keeps a
+  sink and a window of a stream that begins with the row's start, entries kept once and read
+  where they live, as a voice prompt every request in the voice reads. ``start_lengths`` is the
+  range of lengths a start may have, and ``kept_windows`` gives the read's base
+  ``KeptWindow(sink, window=, grows=)``, whose ``grows`` side, ``"sink"`` or ``"window"``, adds
+  the start's length; either side may be 0. The handle takes the starts once at bind
+  (``set_starts``, each field ``(layers, n, *shape)``), and each step names each row's by index
+  (``ArrayStep.starts``), which a region's step takes from the open step. Its ``distance_bias``
+  is ``(rows, q_heads, T, R)``, whose entry ``d + T - 1`` adds to the key at distance ``d``.
 - ``Positions(rope=)``: a position counter per request and label, on an append-only array
   that keeps entries. ``rope=None`` is a counter only. ``Rope`` carries ``theta``,
   ``rotary_dim``, ``interleave``, ``scale``, the Llama 3.1 factors (all three or none), the

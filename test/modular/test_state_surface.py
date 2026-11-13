@@ -40,6 +40,8 @@ SNAPSHOT = {
         ["rewritable", "KEYWORD_ONLY", 'False'],
         ["labels", "KEYWORD_ONLY", "frozenset({'main'})"],
         ["positions", "KEYWORD_ONLY", 'None'],
+        ["start_lengths", "KEYWORD_ONLY", 'None'],
+        ["kept_windows", "KEYWORD_ONLY", '{}'],
     ],
     "ArrayStep": [
         ["segments", "KEYWORD_ONLY", 'None'],
@@ -51,6 +53,7 @@ SNAPSHOT = {
         ["advance", "KEYWORD_ONLY", 'None'],
         ["position_ids", "KEYWORD_ONLY", 'None'],
         ["host", "KEYWORD_ONLY", '{}'],
+        ["starts", "KEYWORD_ONLY", '{}'],
     ],
     "Attend": [
         ["q_heads", "POSITIONAL_OR_KEYWORD", None],
@@ -92,6 +95,7 @@ SNAPSHOT = {
     "KeptWindow": [
         ["sink", "POSITIONAL_OR_KEYWORD", None],
         ["window", "KEYWORD_ONLY", None],
+        ["grows", "KEYWORD_ONLY", 'None'],
     ],
     "Layout": [
         ["spans", "KEYWORD_ONLY", '()'],

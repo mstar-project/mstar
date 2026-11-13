@@ -193,6 +193,8 @@ class ArrayHandle(StepHandle):
                                 f"{sorted(declared_labels)}")
         if declared.advance is not None or declared.position_ids is not None:
             _positions(self, "a step sets advance or position_ids, and the array declares no positions")
+        if declared.starts and self.array.start_lengths is None:
+            raise self._refusal("a step names starts, and the array declares no start_lengths")
         self._check_storage(declared, segments, ctx)
 
     def _check_labels(self, labels: set[str], segments) -> None:
@@ -303,6 +305,12 @@ class ArrayHandle(StepHandle):
         (`NodeSubmodule.resident_walks`). The tensors are made at load and never written, since a captured read keeps
         their address."""
         raise self._unsupported("set_start")
+
+    def set_starts(self, starts: Sequence[Mapping[str, torch.Tensor]]) -> None:
+        """The starts an unbounded array's rows may begin from, each giving every entry field its entries, (layers, n,
+        *shape) with n one of ``start_lengths``. Called once at bind; a step names each row's by its index in
+        ``starts`` (`ArrayStep.starts`)."""
+        raise self._unsupported("set_starts")
 
     def block(self, field: str, layer: int) -> torch.Tensor:
         """``layer``'s view of the entry field ``field``, for an update's op."""

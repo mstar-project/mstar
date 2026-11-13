@@ -994,8 +994,8 @@ def test_an_unbounded_array_is_one_bounded_kv_holding_its_window():
     ({}, []),
 ], ids=["causal", "two reads", "no read"])
 def test_an_unbounded_array_reads_through_one_window(reads, masks):
-    _no_layout(f"an unbounded array reads through one Window read, whose window the bounded KV keeps, and its reads "
-               f"have masks {masks}", _unbounded(reads=reads))
+    _no_layout(f"an unbounded array reads through one Window or kept-window read, whose window the bounded KV keeps, "
+               f"and its reads have masks {masks}", _unbounded(reads=reads))
 
 
 def test_an_unbounded_array_has_no_reach_read_yet():
