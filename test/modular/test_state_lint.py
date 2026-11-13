@@ -6,7 +6,8 @@ would notice, so this reads each package's source. The base classes are the brid
 says why it stands or which PR deletes it, and an exception nothing uses any more fails too, so the list only shrinks.
 
 A package that isn't ported has to be on the frozen list of those that predate this rule, so a new model arrives on
-the contract.
+the contract. Only the engine and the tests import the adapters that bind a declaration to a resource, so the adapters
+can be replaced without touching a model.
 """
 
 from __future__ import annotations
@@ -77,6 +78,20 @@ ALLOWED_BREAKS = {
 }
 # what a module defines to be handed the node's built resources, rather than its handles (`bind_state`)
 RESOURCE_BINDS = {"bind_resources", "bind_node_resources"}
+ADAPTERS = "mstar.engine.state.adapters"
+_BY_HAND = "the script builds a node's resources and handles by hand, as a test does"
+# the files outside mstar/engine/ and the tests that import the adapters, each with its reason
+ADAPTER_IMPORTERS = {
+    "mstar/model/base.py": "the model base class resolves a deployment's resource specs from its declarations",
+    "mstar/model/submodule_base.py": "`engine_step` expands a node's declared step for the engine",
+    "mstar/api_server/data_worker.py": "the data worker converts a prompt's state layout into today's KV layouts",
+    "mstar/conductor/conductor.py": "the conductor converts a request's `SampleSettings` into sampler configs",
+    "mstar/validation/__init__.py": "`validate_deployment` checks a deployment's state setup before a worker spawns",
+    "benchmark/command_a_plus/validate_checkpoint.py": _BY_HAND,
+    "benchmark/ltx2_5/profile_step.py": _BY_HAND,
+}
+# the source directories, apart from test/
+SOURCE_ROOTS = ("mstar", "mstar_sim", "benchmark", "examples", "scripts")
 
 
 def _violations(source: str, path: str = "") -> tuple[list[str], set[tuple[str, str]]]:
@@ -136,6 +151,28 @@ def _model_packages() -> list[str]:
     )
 
 
+def _imports_adapters(source: str) -> bool:
+    # Most files never name the adapters, and parsing all of them takes seconds.
+    if "adapters" not in source:
+        return False
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.ImportFrom):
+            names = {alias.name for alias in node.names}
+            if node.module == ADAPTERS or (node.module == "mstar.engine.state" and "adapters" in names):
+                return True
+        elif isinstance(node, ast.Import) and ADAPTERS in {alias.name for alias in node.names}:
+            return True
+    return False
+
+
+def _adapter_importers() -> set[str]:
+    """The files outside mstar/engine/ and the tests that import the adapters."""
+    return {
+        str(path) for root in SOURCE_ROOTS for path in Path(root).rglob("*.py")
+        if path.parts[:2] != ("mstar", "engine") and "tests" not in path.parts and _imports_adapters(path.read_text())
+    }
+
+
 @pytest.mark.parametrize("path", _sources(), ids=str)
 def test_a_ported_package_reaches_the_engine_only_through_the_contract(path):
     found, _ = _violations(path.read_text(), str(path))
@@ -143,11 +180,11 @@ def test_a_ported_package_reaches_the_engine_only_through_the_contract(path):
 
 
 def test_every_exception_is_still_used():
-    used = set()
+    used = _adapter_importers()
     for path in _sources():
         used |= _violations(path.read_text(), str(path))[1]
-    excepted = ALLOWED.keys() | ALLOWED_BREAKS.keys() | ALLOWED_SHARD_READS.keys()
-    assert excepted <= used, f"delete these exceptions: {sorted(excepted - used)}"
+    excepted = ALLOWED.keys() | ALLOWED_BREAKS.keys() | ALLOWED_SHARD_READS.keys() | ADAPTER_IMPORTERS.keys()
+    assert excepted <= used, f"delete these exceptions: {sorted(excepted - used, key=str)}"
 
 
 @pytest.mark.parametrize("source, expected", [
@@ -210,3 +247,22 @@ def test_no_package_is_on_both_lists():
 def test_both_lists_name_only_packages_that_exist():
     gone = sorted(set(PORTED + UNPORTED) - set(_model_packages()))
     assert not gone, f"take {gone} off PORTED and UNPORTED, since mstar/model/ holds no such package"
+
+
+def test_only_the_engine_and_the_tests_import_the_adapters():
+    unlisted = sorted(_adapter_importers() - ADAPTER_IMPORTERS.keys())
+    assert not unlisted, (
+        f"{unlisted} import {ADAPTERS}, which only mstar/engine/ and the tests do. Import from `mstar.engine.state` "
+        "instead."
+    )
+
+
+@pytest.mark.parametrize("source, expected", [
+    ("from mstar.engine.state.adapters import node_handles", True),
+    ("from mstar.engine.state import Array, adapters", True),
+    ("import mstar.engine.state.adapters", True),
+    ("from mstar.engine.state import Array", False),
+    ("from mstar.api_server.openai import adapters", False),
+])
+def test_the_lint_tells_the_state_adapters_from_other_imports(source, expected):
+    assert _imports_adapters(source) is expected, source
