@@ -717,7 +717,7 @@ def test_a_follower_worker_takes_room_past_twice_the_rebuild_pool(monkeypatch):
     monkeypatch.setattr(worker_mod, "EngineManager", SimpleNamespace(
         build=lambda *a, **kw: SimpleNamespace(
             engine=engine, get_engine=lambda node: engine, side_keys=(),
-            inline_streams=InlineStreams(frozenset(), {}),
+            inline_streams=InlineStreams(frozenset(), {}, {}),
         )))
     # the worker runs with no model, so its rebuilds come from one that declares ``NODE``'s policy
     model, make = make_model(rebuild_policies=lambda: {NODE: POLICY}, get_graph_walk_graphs=_graphs), _make_rebuilds

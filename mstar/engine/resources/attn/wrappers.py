@@ -16,6 +16,8 @@ Adapted from VoxServe's flashinfer_utils.py for our KV cache layout:
 
 import functools
 import logging
+import math
+from abc import ABC, abstractmethod
 
 import numpy as np
 import torch
@@ -129,7 +131,34 @@ def _decode_direct_variant(w) -> str | None:
     return None
 
 
-class FlashInferPrefillWrapper:
+class PagedKernel(ABC):
+    """A paged attention kernel as attention over a context-parallel pool plans and runs it
+    (``PlacedAttention.paged_kernel``): over this rank's slots of the pool, or over pages of one
+    slot (``context_parallel.OneSlotPages``)."""
+
+    # the plan's query layout on the device, where a kernel keeps one (``select_last_hidden``)
+    _qo_indptr_buf: torch.Tensor | None = None
+
+    @abstractmethod
+    def plan(
+        self, *, paged_kv_indptr: torch.Tensor, paged_kv_indices: torch.Tensor,
+        paged_kv_last_page_len: torch.Tensor, dtype: torch.dtype, **indptrs,
+    ) -> None:
+        """Plans the rows a ``PagedIndptrs`` lays out (``to_kwargs_dict``: ``qo_indptr`` and
+        ``kv_lens`` too, which a decode kernel, one query a row, takes and ignores) and
+        ``causal``."""
+
+    @abstractmethod
+    def run(
+        self, q: torch.Tensor, kv_cache_layer: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        return_lse: bool = False,
+    ):
+        """The planned attention of ``q`` ``[N, H, D]`` over the paged layer ``kv_cache_layer``, one
+        tensor or its ``(k, v)``. Returns ``out``, and with ``return_lse`` also the natural-log lse
+        ``[N, H]`` fp32."""
+
+
+class FlashInferPrefillWrapper(PagedKernel):
     """Batched prefill attention with paged KV cache.
 
     Wraps flashinfer.BatchPrefillWithPagedKVCacheWrapper with optional
@@ -151,6 +180,8 @@ class FlashInferPrefillWrapper:
     # planned on the host: a resident step fills nothing of it in its graph
     plans_in_graph = False
     supports_gather_resident = False
+    # a replay's lengths are fixed by the host plan
+    supports_repeats = False
 
     def __init__(
         self,
@@ -434,20 +465,27 @@ class FlashInferPrefillWrapper:
         w._plan_info = w._cached_module.plan(*args)
 
     @torch.compiler.disable
-    def run(self, q: torch.Tensor, kv_cache_layer: torch.Tensor) -> torch.Tensor:
+    def run(
+        self, q: torch.Tensor, kv_cache_layer: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        return_lse: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Run planned batched prefill attention.
 
         Args:
             q: [total_tokens, num_qo_heads, head_dim]
             kv_cache_layer: [max_pages, 2, page_size, num_kv_heads, head_dim]
-                (single layer slice of the full KV cache)
+                (single layer slice of the full KV cache), or its ``(k, v)``
+            return_lse: also return each query row's log-sum-exp of its scaled scores
         Returns:
-            output: [total_tokens, num_qo_heads, head_dim]
+            output: [total_tokens, num_qo_heads, head_dim], and with ``return_lse``
+            the log-sum-exp [total_tokens, num_qo_heads], fp32, natural log
         """
-        return self.attn_wrapper.run(q.to(self.dtype), kv_cache_layer)
+        if not return_lse:
+            return self.attn_wrapper.run(q.to(self.dtype), kv_cache_layer)
+        return self.attn_wrapper.run(q.to(self.dtype), kv_cache_layer, return_lse=True, lse_base="ln")
 
 
-class FlashInferDecodeWrapper:
+class FlashInferDecodeWrapper(PagedKernel):
     """Batched decode attention with paged KV cache.
 
     Optimized for the common decode case where each request appends
@@ -467,6 +505,13 @@ class FlashInferDecodeWrapper:
 
     # the host still plans FlashInfer's schedule (`supports_gather_resident`)
     plans_in_graph = False
+
+    @property
+    def supports_repeats(self) -> bool:
+        """Whether the captured kernels see each replay's lengths: the tensor-core
+        kernel with paged arrays its graph builds, its schedule planned for the
+        step's last replay (`resident_gather`)."""
+        return self.supports_gather_resident and self.lengths_move
 
     def __init__(
         self,
@@ -607,6 +652,15 @@ class FlashInferDecodeWrapper:
         if self.accelerator_graph and kv_lens is not None:
             self._planner_args = self._direct_planner_args(n_req)
 
+    @property
+    def lengths_move(self) -> bool:
+        """Whether a plan for longer rows still serves shorter ones, the lengths
+        moving between replays: the tensor-core kernel takes a row's length off
+        ``last_page_len`` at run time and clamps each planned chunk to it. A plan
+        fixes only pages and chunks. The CUDA-core kernel's chunk size underflows
+        on a chunk past the row's end."""
+        return _decode_direct_variant(self.attn_wrapper) == _TENSOR_CORE_DECODE
+
     def _direct_planner_args(self, n_req: int) -> list | None:
         """FlashInfer's planner arguments for this wrapper, fixed but for the
         indptr (and, for tensor-core decode, the lengths), when its plan
@@ -702,16 +756,25 @@ class FlashInferDecodeWrapper:
         )
 
     @torch.compiler.disable
-    def run(self, q: torch.Tensor, kv_cache_layer: torch.Tensor) -> torch.Tensor:
+    def run(
+        self, q: torch.Tensor, kv_cache_layer: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
+        return_lse: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """Run planned batched decode attention.
 
         Args:
             q: [n_req, num_qo_heads, head_dim]
-            kv_cache_layer: [max_pages, 2, page_size, num_kv_heads, head_dim]
+            kv_cache_layer: [max_pages, 2, page_size, num_kv_heads, head_dim], or its ``(k, v)``
+            return_lse: as for the prefill wrapper's ``run``
         Returns:
-            output: [n_req, num_qo_heads, head_dim]
+            output: [n_req, num_qo_heads, head_dim], and with ``return_lse`` the
+            log-sum-exp [n_req, num_qo_heads], fp32, natural log
         """
-        return self.attn_wrapper.run(q.to(self.dtype), kv_cache_layer)
+        if not return_lse:
+            return self.attn_wrapper.run(q.to(self.dtype), kv_cache_layer)
+        out, lse = self.attn_wrapper.run(q.to(self.dtype), kv_cache_layer, return_lse=True)
+        # the decode wrapper has no lse_base: its kernels (fa2, on either core type) report base 2
+        return out, lse * math.log(2)
 
 
 @triton.jit
@@ -771,6 +834,8 @@ class FmhaDecodeWrapper:
     # host plan at all; `supports_gather_resident` is the paged wrappers' half-way case
     plans_in_graph = True
     supports_gather_resident = False
+    # its graph plans it whole, so a replay sees its own lengths
+    supports_repeats = True
 
     def __init__(
         self,
@@ -939,6 +1004,8 @@ class FlashInferMixedWrapper:
     # planned on the host: a resident step fills nothing of it in its graph
     plans_in_graph = False
     supports_gather_resident = False
+    # a replay's lengths are fixed by the host plan
+    supports_repeats = False
 
     def __init__(
         self,

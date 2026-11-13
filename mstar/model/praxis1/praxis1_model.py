@@ -8,17 +8,28 @@ asks again.
 
 The graph follows that shape:
 
-* ``encode_text`` runs once per episode. The task text is fixed for the run,
-  so its embedding (and the blank-caption embedding the video guidance needs)
-  persists at the conductor rather than being recomputed per chunk.
+* ``encode_text`` produces the task and blank-caption embeddings for a
+  request. Its output persists between walks of that request, but a later
+  policy call re-encodes the text until episode state can retain it.
 * ``chunk`` is one policy call: VAE-encode the observation, run the denoise
   loop, emit the action rows. The loop carries the video and action latents;
   the expert reads the backbone's taps inside the same iteration, so the two
   nodes sit in one loop body rather than in separate walks.
 
-The video of a chunk is predicted whether or not anyone wants to look at it:
-it is what conditions the next call. Decoding it back to pixels is not, so the
-VAE decoder only runs for a request that asked for video.
+The video a chunk predicts is denoised alongside the actions: the action
+expert reads the backbone's hidden states as the video settles. It does not
+condition the next call. The next call is conditioned on the real camera
+frames taken while the robot executed the rows: the reference keeps those per
+session, encodes them again on each call, and refuses to condition on its own
+predictions, because the model trained on real frames only. Carrying those
+frames across requests is the episode-state work and not part of this graph.
+The predicted video latents end at the denoise loop, and nothing predicted
+leaves the walk except the action rows.
+
+Nothing here serves yet. The nodes have no computation until the compute port
+lands, so a served model is refused at construction, before it fetches
+anything; dummy mode (``skip_weight_loading``) builds the graph for the startup
+checks and the tests.
 """
 
 from __future__ import annotations
@@ -28,7 +39,6 @@ from pathlib import Path
 
 import torch
 
-from mstar.engine.resources import NodeResourceSpec
 from mstar.graph.base import (
     GraphEdge,
     GraphNode,
@@ -59,6 +69,15 @@ DENOISE_LOOP_NAME = "praxis_denoise"
 # The state kwarg the openpi WebSocket protocol fills from a client's request.
 STATE_KWARG = "robot_state"
 
+# False until get_submodule can build the nodes. Until then a served model is
+# refused in the constructor, the first model code every serving process runs,
+# rather than in get_submodule once every process has started. The PR that
+# ports the compute deletes this.
+_SERVABLE = False
+
+# The denoise loop's ceiling when the checkpoint names none.
+DEFAULT_MAX_DENOISE_STEPS = 8
+
 
 class Praxis1Model(Model):
     """The served Praxis-1 policy.
@@ -86,7 +105,7 @@ class Praxis1Model(Model):
         self.vae_weights_hf: str = kwargs.pop("vae_weights_hf", "Wan-AI/Wan2.2-TI2V-5B")
         self.text_encoder_hf: str = kwargs.pop("text_encoder_hf", "Qwen/Qwen3.5-2B")
         # Sampler defaults of the deployment; a request may ask for fewer
-        # steps, never for more than the loop's cap.
+        # steps than num_steps, never for more (get_loop_caps).
         self.sampler_defaults: dict = {
             "num_steps": kwargs.pop("num_steps", 2),
             "t_shift": kwargs.pop("t_shift", 12.5),
@@ -96,10 +115,26 @@ class Praxis1Model(Model):
         }
         self._yaml_config_overrides: dict = dict(kwargs)
 
+        if not skip_weight_loading and not _SERVABLE:
+            raise NotImplementedError(
+                f"Praxis-1 ({model_path_hf}) is not servable yet: this build has its "
+                "graph and config reader but no node computation, which lands with the "
+                "compute port. Nothing was downloaded."
+            )
+
         self._repo_dir: Path | None = None
         self._submodule_cache: dict = {}
         self._tokenizer_cache = None
         self.config: Praxis1Config = self._load_config()
+        # A recipe past the loop's ceiling would have every request refused at
+        # the conductor, so it is refused once, here.
+        num_steps = self.sampler_defaults["num_steps"]
+        if isinstance(num_steps, bool) or not isinstance(num_steps, int) or not (
+            1 <= num_steps <= self.max_denoise_steps
+        ):
+            raise Praxis1ConfigError(
+                f"num_steps must be an integer in [1, {self.max_denoise_steps}]; got {num_steps!r}"
+            )
 
     # ------------------------------------------------------------------
     # Config
@@ -110,12 +145,15 @@ class Praxis1Model(Model):
             return self._repo_dir
         from huggingface_hub import snapshot_download
 
-        # config.json is all the data worker needs to build the graph; the
-        # weights come later, per submodule, on the worker that holds them.
+        # config.json is all the graph needs, and every process that builds
+        # the model builds the graph: the API server, the conductor and the
+        # data worker read nothing else. The weights are fetched per submodule,
+        # by get_submodule on the worker that holds them, so no other process
+        # pays for a download it never reads.
         local = snapshot_download(
             repo_id=self.model_path_hf,
             cache_dir=self.cache_dir,
-            allow_patterns=["config.json"] if self.skip_weight_loading else None,
+            allow_patterns=["config.json"],
         )
         self._repo_dir = Path(local)
         return self._repo_dir
@@ -145,14 +183,18 @@ class Praxis1Model(Model):
             return Praxis1Config.for_rig(self._rig())
         return Praxis1Config.from_checkpoint(self._ensure_repo())
 
+    @property
+    def max_denoise_steps(self) -> int:
+        """The denoise loop's ``max_iters``: a ceiling, not the step count."""
+        return int(self.config.raw.get("max_denoise_steps", DEFAULT_MAX_DENOISE_STEPS))
+
     # ------------------------------------------------------------------
     # Model ABC: the graph
     # ------------------------------------------------------------------
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
-        # The task text is constant for an episode and the blank caption is
-        # constant for the checkpoint, so both embeddings persist and no
-        # policy call pays for the text encoder.
+        # Both embeddings persist between walks of this request. A later
+        # policy call re-encodes them until episode state can retain them.
         encode_text = GraphNode(
             name="text_encoder",
             input_names=["text_ids", "text_mask", "blank_ids", "blank_mask"],
@@ -163,8 +205,9 @@ class Praxis1Model(Model):
         )
 
         # The observation: one tile per camera view on a single canvas, taken
-        # to latents once per call. The executed past arrives as clean latents
-        # the client already has, so only the new frames are encoded here.
+        # to latents once per call. It encodes only the frames this request
+        # carries; the reference's context of executed real frames needs state
+        # held across requests, which lands with the episode-state work.
         vae_encoder = GraphNode(
             name="vae_encoder",
             input_names=["image_inputs"],
@@ -195,35 +238,36 @@ class Praxis1Model(Model):
                 GraphEdge(next_node="backbone", name="video_latents"),
                 GraphEdge(next_node="backbone", name="action_latents"),
             ],
-            # the loop's cap keeps speculation off a request's last step
+            # get_loop_caps ends the loop on a request's last step, so nothing
+            # speculates past it
             enable_async_scheduling=True,
         )
 
         denoise_loop = Loop(
             name=DENOISE_LOOP_NAME,
             section=Sequential([backbone, action_expert]),
-            # Ceiling only; the request's step count is the loop's cap.
-            max_iters=self.config.raw.get("max_denoise_steps", 8),
+            # Ceiling only; get_loop_caps gives each request its step count.
+            max_iters=self.max_denoise_steps,
+            # Only the actions leave the loop. The predicted video has no
+            # reader after the last step: the reply is command rows, and the
+            # next call is conditioned on real frames, not on this video.
             outputs=[
                 GraphEdge(next_node="action_head", name="action_latents"),
-                GraphEdge(next_node="action_head", name="video_latents"),
             ],
         )
 
-        # The head turns the settled action latents into command rows. It is
-        # its own node because the video latents leave the walk here too: a
-        # request that wants the predicted video takes them to the decoder,
-        # and one that does not pays nothing for it.
+        # The head turns the settled action latents into command rows. That
+        # happens once per call, after the last Euler step, so it sits after
+        # the loop rather than in its body.
         action_head = GraphNode(
             name="action_head",
-            input_names=["action_latents", "video_latents"],
+            input_names=["action_latents"],
             outputs=[
                 GraphEdge(
                     next_node=EMIT_TO_CLIENT,
                     name="actions",
                     output_modality="action",
                 ),
-                GraphEdge(next_node=EMPTY_DESTINATION, name="chunk_latents", persist=True),
             ],
         )
 
@@ -238,8 +282,8 @@ class Praxis1Model(Model):
         The denoise loop carries the video and action latents on its own
         loop-back edges, as Wan2.2's UniPC state does, and those are ordinary
         tensors rather than state the engine admits. The text embeddings
-        persist for the episode on ``persist`` edges at the conductor, which
-        is a signal's lifetime and not a resource either.
+        persist between walks of this request on ``persist`` edges at the
+        conductor; that does not retain them across policy calls.
 
         The one thing that will be declared state is the context cache: the
         backbone's K/V held across the Euler steps of one call, which the
@@ -247,44 +291,6 @@ class Praxis1Model(Model):
         lands with the step that uses it rather than here, because a
         declaration the nodes do not yet read would be a shape nothing
         checks.
-        """
-        return []
-
-    def get_node_resources(self) -> list[NodeResourceSpec]:
-        """No KV cache and no sampler, and no attention resource that fits.
-
-        Nothing here decodes tokens, and the actions come from flow matching
-        rather than from sampling, so there is no sampler. The resource pass
-        on the attention is the part worth writing down, because the answer
-        is that the engine cannot express this mask today.
-
-        The encoder's rule, read off the reference's packed predicate
-        ``(k == q) | (k == 0) | ((k & 1 == 1) & (k <= hi(q)))`` with the
-        codes clean ``2c+1``, noised ``2c+2`` and global ``0``:
-
-        * every token attends the globals (registers, anchor, text), and a
-          global attends nothing else,
-        * a noised token attends the noised tokens of its own chunk, and of
-          no other chunk, bidirectionally within it,
-        * a noised token also attends the clean tokens of strictly earlier
-          chunks,
-        * a clean token attends the clean tokens of its own and earlier
-          chunks, and never a noised one.
-
-        So the clean stream is block-causal, the noised stream is block
-        *diagonal*, and both sit behind a global prefix that everything
-        reads. ``BlockCausalAttentionSpec`` carries a ``block_size`` and
-        nothing else: it expresses the clean stream alone, with no prefix
-        span and no diagonal mode, and a noised query under it would attend
-        earlier chunks' noised tokens, which the checkpoint never saw.
-        ``RaggedAttentionSpec`` drops the structure entirely.
-
-        Declaring the nearest kind and living with the difference would be a
-        different model, so this returns nothing and the trunk's attention
-        runs in the node until the gap is closed. Closing it means either a
-        prefix span and a diagonal mode on the block-causal kind, or a kind
-        of its own under ``mstar/engine/resources/attn/``; that is its own
-        change, and it is the one this series owes the engine.
         """
         return []
 
@@ -297,8 +303,32 @@ class Praxis1Model(Model):
 
     def request_kwargs(self) -> frozenset[str]:
         # The sampler knobs come from the deployment YAML. What a request
-        # carries is the arm's pose and how much of the last chunk it ran.
-        return frozenset({STATE_KWARG, "executed_rows"})
+        # carries is the arm's pose, how much of the last chunk it ran, and
+        # optionally fewer Euler steps than the deployment's recipe.
+        return frozenset({STATE_KWARG, "executed_rows", "num_steps"})
+
+    def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
+        """The denoise loop runs the deployment's ``num_steps``, or the request's if fewer.
+
+        The cap is what ends the loop on a request's last Euler step: without
+        it the loop runs its ``max_iters`` ceiling, and the expert's async
+        scheduling would speculate a step past the last one. A request may ask
+        for fewer steps than the recipe, never more: the recipe is what the
+        checkpoint was tuned for, and the constructor already holds it under
+        the loop's ceiling.
+        """
+        recipe = self.sampler_defaults["num_steps"]
+        steps = model_kwargs.get("num_steps")
+        if steps is None:
+            return {DENOISE_LOOP_NAME: recipe}
+        if isinstance(steps, bool) or not isinstance(steps, int) or steps < 1:
+            raise ValueError(f"num_steps must be an integer >= 1; got {steps!r}")
+        if steps > recipe:
+            raise ValueError(
+                f"num_steps {steps} is more than this deployment's {recipe}; "
+                "a request may ask for fewer steps, never more"
+            )
+        return {DENOISE_LOOP_NAME: steps}
 
     def max_input_files(self) -> dict[str, int]:
         return {"image": self.config.num_cameras}
@@ -387,7 +417,7 @@ class Praxis1Model(Model):
         input_signals: dict[str, list[TensorPointerInfo]],
         model_kwargs: dict,
     ) -> list[WalkStep]:
-        """Encode the text once per episode, then one walk per policy call."""
+        """Encode text if this request lacks embeddings, then run its chunk."""
         if not input_signals.get("image_inputs"):
             raise ValueError("Praxis-1 requires camera images (image_inputs)")
         steps: list[WalkStep] = []

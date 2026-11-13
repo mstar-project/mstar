@@ -1,5 +1,9 @@
 model: "praxis1_droid"
 
+# Not servable yet: this build has the graph and the config reader but no node
+# computation, so `mstar serve praxis1_droid` refuses to start before it downloads
+# anything. The config is here for the startup checks and for the PR that serves.
+
 # Every praxis1 node is stateless (no KV cache); max_seq_len only satisfies the
 # conductor's config check. The value is the backbone's widest encoder sequence:
 # 4 registers + the anchor and the window's video tokens after the (1,2,2) patch
@@ -23,7 +27,7 @@ model_kwargs:
   vae_weights_hf: "Wan-AI/Wan2.2-TI2V-5B"
   text_encoder_hf: "Qwen/Qwen3.5-2B"
   # The recommended recipe of this checkpoint: two Euler steps, text guidance on
-  # the video only. A request may ask for fewer steps, never more than the loop cap.
+  # the video only. A request may ask for fewer steps, never more.
   num_steps: 2
   t_shift: 12.5
   cfg_scale: 1.0

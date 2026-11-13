@@ -24,9 +24,10 @@ from mstar.engine.resources import AttentionStep, Segment, StepContext, Submodul
 from mstar.engine.resources.attn.ragged.config import RaggedAttentionConfig, RaggedAttentionSpec
 from mstar.engine.resources.kv import manager as kv_manager
 from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PagedKVConfig
-from mstar.engine.resources.linear_attn.config import LinearAttnStep
+from mstar.engine.resources.linear_attn.config import LinearAttnStep, bf16_gdn_state_fits
+from mstar.engine.resources.linear_attn.gdn import GDNManager
 from mstar.engine.resources.position.config import PositionConfig, PositionSpec, PositionStep
-from mstar.engine.resources.recurrent.config import RecurrentStep
+from mstar.engine.resources.recurrent.config import DeltaNetGeometry, RecurrentStep
 from mstar.engine.resources.sampler.config import SamplerSpec, SamplerStep, SamplingReqConfig
 from mstar.engine.resources.spec import CombinedSplit
 from mstar.engine.resources.step import BucketKey, SlotLease
@@ -48,15 +49,23 @@ from mstar.engine.state import (
     Sampler,
     SampleSettings,
     SampleStep,
+    SeqShard,
     Span,
     TensorType,
     Value,
     Window,
+    kernel_setting,
+    position,
     sample,
 )
 from mstar.engine.state.adapters import (
+    GDN,
+    VALUE,
     PagedArrayHandle,
     WithinStepHandle,
+    _bindings,
+    _block,
+    _field_layouts,
     build_specs,
     kv_layouts,
     node_handles,
@@ -123,7 +132,8 @@ def _handles(*declarations, node="LLM") -> dict:
         "kv": _StubKV(), "attn": SimpleNamespace(), "local": SimpleNamespace(), "global": SimpleNamespace(),
         "rope": SimpleNamespace(), "kv_pos": SimpleNamespace(), "other_pos": SimpleNamespace(),
         "other_kv": _StubKV(), "gdn": _StubPool(), "linear": SimpleNamespace(), "conv": None,
-        "sampler": SimpleNamespace(), "vision_attn": SimpleNamespace(),
+        "sampler": SimpleNamespace(), "vision_attn": SimpleNamespace(run=lambda *args, **kwargs: None),
+        "shard": SimpleNamespace(can_split=True),
     }
     return node_handles(_StubModel(*declarations), node, resources)
 
@@ -245,6 +255,34 @@ def test_each_step_gets_fresh_step_objects():
     second = state_steps(SubmoduleStep(segments=[Segment(2, "main", 2)], state={"kv": ArrayStep()}), handles)
     assert first.steps["kv"].segments == [Segment(1, "main", 1)], "SubmoduleStep writes segments onto its step objects"
     assert second.steps["kv"].segments == [Segment(2, "main", 2)]
+
+
+def test_a_regions_step_leaves_the_nodes_shard_handle_open():
+    handles = _handles(SeqShard("shard", nodes={"LLM"}))
+    ctx = SimpleNamespace(replays=False, graph_walk="prefill")
+    node_step = state_steps(SubmoduleStep(segments=SEGMENTS), handles)
+    node_step.set_ctx(ctx)
+    node_step.begin_calls()
+    runner = object.__new__(agr.PiecewiseAcceleratorGraphRunner)
+    runner._config = SimpleNamespace(region_step=lambda *args: SubmoduleStep(segments=SEGMENTS))
+    runner._segment_keys, runner._state_handles = (), handles
+    region_step = runner._region_step([1], [4])
+    region_step.set_ctx(ctx)
+    region_step.begin_calls()
+    region_step.end_calls()
+    assert handles["shard"].label == "main", "the node's step is still running"
+
+
+@pytest.mark.parametrize("can_split", [False, True])
+def test_a_shard_holds_a_step_nothing_else_needs_only_where_it_can_split(can_split):
+    # at one SP rank the shard's plan is a constant, so the step skips its resources as on a node with no shard
+    handles = node_handles(
+        _StubModel(SeqShard("shard", nodes={"LLM"})), "LLM", {"shard": SimpleNamespace(can_split=can_split)},
+    )
+    step = state_steps(SubmoduleStep(segments=SEGMENTS), handles)
+    assert (step is not None) == can_split
+    if can_split:
+        assert step.state_handles == (handles["shard"],)
 
 
 def test_a_step_with_no_state_comes_back_as_it_was():
@@ -516,7 +554,7 @@ def test_a_sampler_becomes_a_sampler_spec():
 
 def test_a_block_read_becomes_a_ragged_spec_with_the_default_compile_op():
     assert build_specs([_within()]) == [RaggedAttentionSpec(
-        resource_key="vision_attn", nodes={"vit"},
+        resource_key="vision_attn", nodes={"vit"}, labels={"main"},
         config=RaggedAttentionConfig(num_qo_heads=4, num_kv_heads=4, head_dim=8),
     )]
 
@@ -743,8 +781,11 @@ class _EngineNode(NodeSubmodule):
 
 
 def _load_engine(monkeypatch, node, model):
-    monkeypatch.setattr(engine_module, "node_handles", lambda model, name, resources: {"kv": name})
-    joint = SimpleNamespace(world_size=1, tp_group=SimpleNamespace(barrier=lambda: None))
+    monkeypatch.setattr(engine_module, "node_handles", lambda model, name, resources, **kwargs: {"kv": name})
+    joint = SimpleNamespace(
+        world_size=1, tp_group=SimpleNamespace(barrier=lambda: None, world_size=1),
+        sp_group=SimpleNamespace(world_size=1),
+    )
     groups = SimpleNamespace(
         get_joint_group_for_node=lambda name: joint, get_instance_world_size_for_node=lambda name: 1,
         get_instance_rank_for_node=lambda name: 0,
@@ -791,3 +832,72 @@ def test_a_kv_manager_says_which_labels_a_request_opened(monkeypatch):
     assert kv.opens_label(2, "cfg"), "a padding row has no config"
     kv.ingest_request(3, KVReqConfig(needed_labels_per_node={"LLM": ["cfg"]}))
     assert kv.opens_label(3, "cfg"), "a label opened per node isn't in needed_labels"
+
+
+# One place for each rule that more than one site reads
+
+
+def test_a_windowed_reads_spec_names_the_pool_layers_its_handle_writes():
+    """The spec counts a windowed read's layers among the pool's, and the handle maps layers to the pool the same way,
+    or the read would attend layers the handle never wrote."""
+    array = _kv(layers={1, 4, 6}, reads={
+        "local": Read(mask=Window(4), op=Attend(q_heads=4), layers={4, 6}),
+        "global": Read(mask=Causal(), op=Attend(q_heads=4), layers={1}),
+    })
+    (local,) = [spec for spec in build_specs([array]) if spec.resource_key == "local"]
+    pool = _handles(array)["kv"]._pool_layer
+    assert local.config.layers == tuple(pool[layer] for layer in (4, 6)) == (1, 2)
+
+
+def test_a_read_that_names_no_layers_reads_every_layer_in_the_spec_and_the_handle():
+    array = _kv(reads={"local": Read(mask=Window(4), op=Attend(q_heads=4))})
+    (local,) = [spec for spec in build_specs([array]) if spec.resource_key == "local"]
+    assert local.config.layers == (0, 1) and set(_handles(array)["kv"]._attn) == {0, 1}
+
+
+def test_an_array_step_that_lists_no_segments_of_its_own_is_refused_by_name():
+    """An empty tuple is the array's own layout, of nothing. It doesn't fall back to the step's segments, as None
+    does."""
+    step = SubmoduleStep(segments=SEGMENTS, state={"vision": ArrayStep(segments=())})
+    with pytest.raises(ValueError, match="Array 'vision': a step lays it out over an empty list of segments"):
+        state_steps(step, _handles(_within(), node="vit"))
+
+
+def test_a_value_field_no_update_writes_keeps_its_declared_layout_in_its_block_and_its_writes():
+    """With no `CausalConv`, nothing writes ``conv``, and its block and its writes take the field as declared."""
+    array = replace(_value(), updates={"linear": GatedDeltaNet()})
+    conv = array.entry.tensors["conv"]
+    layout = _field_layouts(array, _bindings(VALUE, array))["conv"]
+    x = torch.ones(32, 3)
+    assert layout.block(conv) == _block(conv) and layout.stored(x) is x
+
+
+def test_a_kernel_setting_its_runner_doesnt_report_is_refused_by_name():
+    """`compile_op` sets the spec, and the ragged resource holds no attribute of that name to read back."""
+    h = _handles(_within(), node="vit")["vision"]
+    with pytest.raises(ValueError, match=r"Array 'vision': no compile_op for read 'vision_attn', whose binding "
+                                         r"RaggedAttend reports back \['max_segments_per_request', "
+                                         r"'max_segments_per_step'\]"):
+        kernel_setting(h, "vision_attn", "compile_op")
+
+
+@pytest.mark.parametrize("k, v", [(128, 128), (64, 128), (128, 64)])
+def test_the_glue_stores_a_bf16_gdn_state_exactly_where_the_resource_takes_one(k, v):
+    stored = GDN().block(TensorType((4, k, v), dtype=torch.bfloat16, shard=0)).dtype
+    assert (stored is torch.bfloat16) == bf16_gdn_state_fits(k, v)
+    if stored is torch.float32:
+        geometry = DeltaNetGeometry(num_k_heads=4, num_v_heads=4, head_k_dim=k, head_v_dim=v, conv_kernel_size=4)
+        with pytest.raises(NotImplementedError, match="a bf16 gdn state needs K=V=128"):
+            GDNManager._check_state_dtype(torch.bfloat16, geometry, False)
+
+
+def test_a_position_call_on_an_array_that_declares_no_positions_is_refused_by_name():
+    with pytest.raises(ValueError, match="Array 'kv': the array declares no positions"):
+        position(_handles(_kv())["kv"], 1, "main")
+
+
+def test_positions_on_an_array_with_no_pool_are_refused_by_name():
+    with pytest.raises(ValueError, match="Array 'vision': no layout yet: positions, which only an append-only array "
+                                         "that keeps entries holds"):
+        build_specs([replace(_within(), positions=Positions())])
+
