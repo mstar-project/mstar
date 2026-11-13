@@ -69,6 +69,8 @@ def resolve_linear_attn_backend(
     if rocm:
         return LinearAttnBackend.AITER
     return LinearAttnBackend.FLASHINFER
+
+
 class Chunk(NamedTuple):
     """One call of the chunked kernel over some prompt rows' pieces on this rank, a sequence each:
     their tokens (``index`` into this rank's) and ``cu_seqlens``, on the device."""

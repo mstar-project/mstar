@@ -603,6 +603,8 @@ class GDNMixedWrapper(GDNWrapper):
     @property
     def takes_strided_inputs(self) -> bool:
         return self._staged
+
+    @property
     def halves(self) -> tuple[GDNDecodeWrapper, GDNPrefillWrapper, int]:
         """The decode half, the chunked half, and the step's token the chunked half starts at
         (past the decode run eagerly), which a step split over SP ranks runs apart

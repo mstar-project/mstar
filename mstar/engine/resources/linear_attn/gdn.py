@@ -24,7 +24,7 @@ from mstar.engine.resources.linear_attn.base import (
     scatter_rows,
 )
 from mstar.engine.resources.linear_attn.config import LinearAttnConfig, LinearAttnStep
-from mstar.engine.resources.linear_attn.gdn_kernels import GDNKernels, gdn_kernel
+from mstar.engine.resources.linear_attn.gdn_kernels import FlashInferGDNKernels, GDNKernels, gdn_kernel
 from mstar.engine.resources.linear_attn.wrappers import (
     GDNDecodeWrapper,
     GDNMixedWrapper,
@@ -404,6 +404,10 @@ class GDNManager(LinearAttnManager):
         no values and its offset from zeros, which needs equal key and value dims), runs a row
         continuing into it from the state it gets, and every row's final state is gathered into
         every replica."""
+        if not isinstance(self._kernels, FlashInferGDNKernels):
+            raise ValueError("a split step whose heads don't divide over the SP ranks passes state with "
+                             "FlashInfer's chunked kernel, which the 'aiter' backend doesn't have; "
+                             "pick an SP size that divides each rank's heads")
         group, plan = split.seq_range.group, split.hand_off
         alpha = torch.exp(-torch.exp(a_log.float()) * torch.nn.functional.softplus(a.float() + dt_bias.float()))
         beta = torch.sigmoid(b.float())
@@ -421,7 +425,7 @@ class GDNManager(LinearAttnManager):
             got, final = gdn_kernel("chunk_gated_delta_rule", q.device)(
                 q=q.index_select(0, chunk.index), k=k.index_select(0, chunk.index), v=values,
                 g=alpha.index_select(0, chunk.index), beta=beta.index_select(0, chunk.index),
-                scale=self.config.sm_scale, initial_state=initial.to(self._prefill_dtype), output_final_state=True,
+                scale=self.config.sm_scale, initial_state=initial.to(self._kernels.prefill_dtype), output_final_state=True,
                 cu_seqlens=chunk.cu, use_qk_l2norm_in_kernel=False,
             )
             if not zero_values:
