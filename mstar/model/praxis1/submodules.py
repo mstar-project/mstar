@@ -325,10 +325,9 @@ class Praxis1ActionExpertSubmodule(_Praxis1Node):
 class Praxis1ActionHeadSubmodule(_Praxis1Node):
     """The settled action latents as command rows.
 
-    Emits ``[action_chunk, action_dim]`` float32 in the rig's own units, which
-    is what the openpi wire sends back. The video latents of the chunk leave
-    here too: they are what conditions the next call, so the session keeps
-    them whether or not anyone decodes them to pixels.
+    It will emit float32 commands in the rig's own units. Predicted video
+    latents end at the denoise loop; a later call uses the executed camera
+    frames as context.
     """
 
     def forward(
@@ -336,7 +335,6 @@ class Praxis1ActionHeadSubmodule(_Praxis1Node):
         graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
         action_latents: torch.Tensor,
-        video_latents: torch.Tensor,
         **kwargs,
     ) -> NameToTensorList:
         raise NotImplementedError(
