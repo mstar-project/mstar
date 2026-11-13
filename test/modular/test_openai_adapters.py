@@ -55,10 +55,13 @@ def test_a_chat_request_keeps_each_message_role(tmp_path):
         {"role": "user", "content": "Name a color."},
         {"role": "assistant", "content": "Blue."},
         {"role": "user", "content": "Another."},
+        # a replayed OpenAI history: the assistant's refusal is what it said (it was a 400)
+        {"role": "assistant", "content": [{"type": "refusal", "refusal": "I can't."}]},
     ])
     sa = adapters.BagelAdapter().chat_to_request(req, tmp_path)
     assert [(p.role, p.text) for p in sa.prompt_parts] == [
         ("system", "Be brief."), ("user", "Name a color."), ("assistant", "Blue."), ("user", "Another."),
+        ("assistant", "I can't."),
     ], "a ChatMessage's role was dropped, so the chat reaches the model as one user turn"
 
 
@@ -385,3 +388,30 @@ def test_text_chat_passes_those_fields_off(tmp_path):
         best_of=1, response_format={"type": "text"}, stop_token_ids=[],
     )
     assert adapters.TextChatAdapter().chat_to_request(req, tmp_path).model_kwargs == {}
+
+
+_IMAGE = {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo="}}
+
+
+@pytest.mark.parametrize("role, part, error", [
+    # empty or unknown parts were dropped, and the model answered without them (200)
+    ("user", {"type": "image_url", "image_url": {"url": ""}}, "the image_url content part needs"),
+    ("user", {"type": "image_url", "image_url": "data:image/png;base64,iVBORw0KGgo="}, "the image_url content part"),
+    ("user", {"type": "input_audio", "input_audio": {"data": "", "format": "wav"}}, "an input_audio content part"),
+    ("user", {"type": "text", "text": ""}, "a text content part needs"),
+    ("user", {"type": "file", "file": {"file_id": "f"}}, "unsupported content part type 'file'"),
+    ("user", {"text": "no type"}, "unsupported content part type None"),
+    # worded as the Rust frontend words it
+    ("user", {"type": True}, "a content part's 'type' must be a string"),
+    ("user", {"type": "refusal", "refusal": "No."}, "only an assistant message takes a refusal part"),
+    ("assistant", {"type": "refusal", "refusal": ""}, "a refusal content part needs a non-empty 'refusal' string"),
+    # a system image reached the model as a user's attachment, which it then refused for another reason
+    ("system", _IMAGE, "a system message takes text parts only"),
+    ("developer", _IMAGE, "a system message takes text parts only"),
+])
+def test_an_empty_unknown_or_misplaced_chat_part_is_refused(tmp_path, role, part, error):
+    # the valid image after it is never saved either
+    messages = [{"role": role, "content": [part]}, {"role": "user", "content": [_IMAGE]}]
+    with pytest.raises(ValueError, match=error):
+        adapters.flatten_messages(messages, tmp_path)
+    assert not list(tmp_path.iterdir())

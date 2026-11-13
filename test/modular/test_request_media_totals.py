@@ -138,6 +138,105 @@ def test_one_ordinary_clip_still_loads(tmp_path, headers, module, cls):
     assert loaded == paths
 
 
+# image and video generators: an audio or video file was decoded and dropped (200)
+IMAGE_MODELS = [
+    ("mstar.model.flux2_klein.flux2_klein_model", "Flux2KleinModel"),
+    ("mstar.model.z_image.z_image_model", "ZImageModel"),
+    ("mstar.model.ltx2_5.ltx2_5_model", "LTX25Model"),
+    ("mstar.model.bagel.bagel_model", "BagelModel"),
+    ("mstar.model.wan22.wan22_model", "Wan22Model"),
+    ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
+    ("mstar.model.lingbot_world.lingbot_world_model", "LingBotWorldModel"),
+    ("mstar.model.waypoint.waypoint_model", "WaypointModel"),
+]
+
+
+# models that read some of their media and dropped the rest: one modality or count each now refuses
+PARTIAL_MEDIA_MODELS = [
+    ("mstar.model.whisper.whisper_model", "WhisperModel", "image", 1),
+    ("mstar.model.parakeet.parakeet_model", "ParakeetModel", "image", 1),
+    ("mstar.model.canary.canary_model", "CanaryModel", "video", 1),
+    ("mstar.model.canary_qwen.canary_qwen_model", "CanaryQwenModel", "image", 1),
+    ("mstar.model.higgs_audio.higgs_audio_model", "HiggsAudioModel", "image", 1),
+    ("mstar.model.qwen3_tts.qwen3_tts_model", "Qwen3TTSModel", "image", 1),
+    ("mstar.model.chatterbox.chatterbox_model", "ChatterboxModel", "video", 1),
+    ("mstar.model.cosyvoice3.cosyvoice3_model", "CosyVoice3Model", "audio", 2),
+    ("mstar.model.fish_s2_pro.fish_s2_pro_model", "FishS2ProModel", "image", 1),
+    ("mstar.model.voxcpm2.voxcpm2_model", "VoxCPM2Model", "video", 1),
+    ("mstar.model.omnivoice.omnivoice_model", "OmniVoiceModel", "audio", 2),
+    ("mstar.model.omnilingual_asr.omnilingual_asr_model", "OmnilingualASRModel", "image", 1),
+    ("mstar.model.nemotron_duplex.nemotron_duplex_model", "NemotronDuplexModel", "image", 1),
+    ("mstar.model.orpheus.orpheus_model", "OrpheusModel", "image", 1),
+    ("mstar.model.kokoro.kokoro_model", "KokoroModel", "audio", 1),
+    ("mstar.model.glm52.glm52_model", "Glm52Model", "image", 1),
+    ("mstar.model.glm5_next.glm5_next_model", "Glm5NextModel", "image", 1),
+    ("mstar.model.command_a_plus.command_a_plus_model", "CommandAPlusModel", "audio", 1),
+    ("mstar.model.vjepa2.vjepa2_model", "VJepa2Model", "audio", 1),
+    ("mstar.model.vjepa2.vjepa2_model", "VJepa2Model", "video", 2),
+    ("mstar.model.pi05.pi05_model", "Pi05Model", "audio", 1),
+    ("mstar.model.minicpm_o.minicpm_o_model", "MiniCPMOModel", "video", 1),
+    # without the reasoner, Cosmos3 conditions on one image or one video
+    ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model", "image", 2),
+]
+
+
+@pytest.mark.parametrize("module, cls, modality, count", [
+    *[(module, cls, "audio", 1) for module, cls in IMAGE_MODELS],
+    # Cosmos3 takes video
+    *[(module, cls, "video", 1) for module, cls in IMAGE_MODELS if cls != "Cosmos3Model"],
+    *PARTIAL_MEDIA_MODELS,
+])
+def test_a_model_refuses_files_it_does_not_take_before_decoding(tmp_path, module, cls, modality, count):
+    from mstar.api_server.request_types import PreprocessInput
+    from mstar.model.flux2_klein.config import Flux2KleinConfig
+
+    model = object.__new__(getattr(importlib.import_module(module), cls))
+    model._config = Flux2KleinConfig()  # FLUX.2 counts reference images by its config
+    if not isinstance(getattr(type(model), "config", None), property):
+        # pi0.5 counts camera images by its config, Cosmos3 its media by whether the reasoner serves
+        model.config = types.SimpleNamespace(num_cameras=1, serves_reasoner=False, enable_reasoner=False)
+    loaded = []
+    setattr(model, f"load_{modality}", lambda path, device: loaded.append(path))
+    paths = []
+    for i in range(count):
+        (tmp_path / f"upload{i}").write_bytes(b"")
+        paths.append(str(tmp_path / f"upload{i}"))
+    request = PreprocessInput(
+        request_id="r1", text="a cat", file_paths={modality: paths},
+        input_modalities=[modality] * count + ["text"], output_modalities=["image"], model_kwargs={},
+    )
+    wt = _preprocess_thread(model)
+    with pytest.raises(ValueError, match=f"this model takes (no {modality} files|at most)") as info:
+        wt._process_input(request)
+    assert loaded == []
+    assert _status(wt, info.value) == 400
+
+
+def test_cosmos3_generation_takes_one_image_or_one_video(tmp_path):
+    """Without the reasoner, a video-to-video or inverse-dynamics upload was
+    refused by a ``video: 0`` declaration; two conditions were decoded and all
+    but the first dropped (200)."""
+    from mstar.api_server.request_types import PreprocessInput
+    from mstar.model.cosmos3.cosmos3_model import Cosmos3Model
+
+    model = object.__new__(Cosmos3Model)
+    model.config = types.SimpleNamespace(serves_reasoner=False, enable_reasoner=False)
+    def load_video(path, device):
+        raise RuntimeError("the count check let the video through")
+
+    model.load_video = load_video
+    (tmp_path / "clip").write_bytes(b"")
+    request = PreprocessInput(
+        request_id="r1", text="a cat", file_paths={"video": [str(tmp_path / "clip")]},
+        input_modalities=["video", "text"], output_modalities=["video"], model_kwargs={},
+    )
+    with pytest.raises(RuntimeError, match="the count check let the video through"):
+        _preprocess_thread(model)._process_input(request)
+    two = {"image_inputs": [torch.zeros(3, 8, 8)], "video_inputs": [torch.zeros(1, 3, 8, 8)]}
+    with pytest.raises(ValueError, match="one image or one video; got 2"):
+        model.process_prompt("a cat", ["image", "video", "text"], ["video"], tensors=two)
+
+
 def test_audio_clips_share_the_audio_limit(tmp_path, headers, monkeypatch):
     """Each 2 s clip fits a 3 s limit; the second is refused from its header
     before it is decoded."""

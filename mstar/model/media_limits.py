@@ -6,7 +6,7 @@ check what a file will decode to, not how big it is. A refusal is a
 ``ValueError``, which the data worker answers with a 400, as is a file its
 decoder can't read (:func:`decoding_upload`).
 
-The pixel and audio caps hold for a whole request: while the data worker loads
+The image, video and audio caps hold for a whole request: while the data worker loads
 a request's files inside :class:`RequestMediaBudget`, every check also counts
 against what the request's other files use, whether finished or still loading.
 """
@@ -36,11 +36,15 @@ def video_decode_threads() -> int:
 
 # PIL's DecompressionBombWarning threshold (about 9459 x 9459 RGB)
 DEFAULT_MAX_IMAGE_PIXELS = 89_478_485
-# about 39 s of 720p30, or 2.6 min of 640x360 at 30 fps, decoded at once: a
-# full decode of every short (up to 2 min) Video-MME clip fits
-DEFAULT_MAX_VIDEO_PIXELS = 1 << 30
-# the least a decoded frame counts against the video cap
-MIN_FRAME_PIXELS = 64 * 64
+# 1 Gi pixels of decoded RGB: about 39 s of 720p30, or 2.6 min of 640x360 at
+# 30 fps, as uint8 frames, so a full decode of every short (up to 2 min)
+# Video-MME clip fits. A loader that also holds their float32 copy is charged
+# for it, so it fits a fifth as many pixels.
+DEFAULT_MAX_VIDEO_BYTES = 3 << 30
+# host bytes of a decoded pixel: uint8 RGB, as every video decoder here returns it
+RGB_BYTES = 3
+# the least a decoded frame counts against the video cap: a 64x64 frame
+MIN_FRAME_BYTES = 64 * 64 * RGB_BYTES
 DEFAULT_MAX_MEDIA_FILES = 16
 # twice the transcription endpoint's 30 min upload cap, so one such upload fits
 # whatever its decoded length rounds to
@@ -72,10 +76,10 @@ def max_image_pixels() -> int:
     return _positive_int_env("MSTAR_MAX_IMAGE_PIXELS", DEFAULT_MAX_IMAGE_PIXELS)
 
 
-def max_video_pixels() -> int:
-    """``MSTAR_MAX_VIDEO_PIXELS``: pixels a request's videos may decode to,
+def max_video_bytes() -> int:
+    """``MSTAR_MAX_VIDEO_BYTES``: host bytes a request's videos may decode to,
     summed over the frames the loader decodes from each."""
-    return _positive_int_env("MSTAR_MAX_VIDEO_PIXELS", DEFAULT_MAX_VIDEO_PIXELS)
+    return _positive_int_env("MSTAR_MAX_VIDEO_BYTES", DEFAULT_MAX_VIDEO_BYTES)
 
 
 def max_media_files() -> int:
@@ -100,7 +104,7 @@ def check_media_limits() -> None:
     from PIL import Image
 
     limit = max_image_pixels()
-    max_video_pixels()
+    max_video_bytes()
     max_media_files()
     max_audio_seconds()
     if Image.MAX_IMAGE_PIXELS is not None and limit > Image.MAX_IMAGE_PIXELS:
@@ -126,7 +130,7 @@ class RequestMediaBudget:
     # kind: what the refusal calls its files, their unit, the env var
     _LIMITS = {
         "image": ("images", "pixels", "MSTAR_MAX_IMAGE_PIXELS"),
-        "video": ("videos", "pixels", "MSTAR_MAX_VIDEO_PIXELS"),
+        "video": ("videos", "bytes", "MSTAR_MAX_VIDEO_BYTES"),
         "audio": ("audio clips", "seconds", "MSTAR_MAX_AUDIO_SECONDS"),
     }
 
@@ -136,7 +140,7 @@ class RequestMediaBudget:
             raise ValueError(
                 f"the request attaches {num_files} media files; the limit is {limit} (MSTAR_MAX_MEDIA_FILES)"
             )
-        self.limits = {"image": max_image_pixels(), "video": max_video_pixels(), "audio": max_audio_seconds()}
+        self.limits = {"image": max_image_pixels(), "video": max_video_bytes(), "audio": max_audio_seconds()}
         self.used = dict.fromkeys(self.limits, 0)
         # one entry per file being loaded: files of a request may load at once
         self._loading: list[dict[str, float]] = []
@@ -182,6 +186,8 @@ def check_file_counts(counts: dict[str, int], model_limits: dict[str, int]) -> N
     (:meth:`mstar.model.base.Model.max_input_files`), before any is decoded."""
     for modality, limit in model_limits.items():
         count = counts.get(modality, 0)
+        if count and not limit:
+            raise ValueError(f"this model takes no {modality} files; the request attaches {count}")
         if count > limit:
             raise ValueError(
                 f"the request attaches {count} {modality} files; this model takes at most {limit}"
@@ -550,22 +556,27 @@ def probe_video(filepath: str) -> tuple[int, float, int, int] | None:
 
 
 class VideoBudget:
-    """Counts decoded frames against ``max_video_pixels()``, so a loader stops
-    before it holds more than the cap whatever the container claims.
+    """Counts the host bytes a loader holds for a video's frames against
+    ``max_video_bytes()``, so it stops before it holds more than the cap
+    whatever the container claims. The loader adds each tensor's ``nbytes``
+    as it decodes it, and a copy's size before making it; a check from the
+    header adds what the decoder will return for the frames it will decode.
 
-    A frame counts as at least ``MIN_FRAME_PIXELS``: each decoded frame costs
-    about 2 KB of tensor and frame objects whatever its size, so a clip of
-    millions of 2x2 frames would otherwise pass the cap at hundreds of GB."""
+    Bytes that hold decoded frames count at least ``MIN_FRAME_BYTES`` a frame:
+    each costs about 2 KB of tensor and frame objects whatever its size, so a
+    clip of millions of 2x2 frames would otherwise pass the cap at hundreds of
+    GB."""
 
     def __init__(self) -> None:
-        self.limit = max_video_pixels()
-        self.pixels = 0
+        self.limit = max_video_bytes()
+        self.bytes = 0
 
-    def add(self, height: int, width: int, frames: int = 1) -> None:
-        self.pixels += max(int(height) * int(width), MIN_FRAME_PIXELS) * int(frames)
-        if self.pixels > self.limit:
+    def add(self, nbytes: int, frames: int = 0) -> None:
+        """Count ``nbytes`` more, which hold ``frames`` decoded frames."""
+        self.bytes += max(int(nbytes), int(frames) * MIN_FRAME_BYTES)
+        if self.bytes > self.limit:
             raise ValueError(
-                f"video decodes to more than {self.limit} pixels; send a shorter "
-                "or smaller clip (the limit is MSTAR_MAX_VIDEO_PIXELS)"
+                f"video decodes to more than {self.limit} bytes; send a shorter "
+                "or smaller clip (the limit is MSTAR_MAX_VIDEO_BYTES)"
             )
-        _charge_request("video", self.pixels)
+        _charge_request("video", self.bytes)

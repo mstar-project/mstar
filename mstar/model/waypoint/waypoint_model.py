@@ -343,6 +343,10 @@ class WaypointModel(Model):
     # Model ABC: I/O
     # ------------------------------------------------------------------
 
+    def max_input_files(self) -> dict[str, int]:
+        # one seed image; the data worker refuses anything else before decoding
+        return {"image": 1, "audio": 0, "video": 0}
+
     def process_prompt(
         self,
         prompt: str | None,

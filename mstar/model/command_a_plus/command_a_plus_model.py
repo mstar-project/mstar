@@ -228,6 +228,10 @@ class CommandAPlusModel(Model):
             ))
         return self._image_tokens
 
+    def max_input_files(self) -> dict[str, int]:
+        # images only; the data worker refuses anything else before decoding
+        return {"audio": 0, "video": 0}
+
     def process_prompt(
         self, prompt, input_modalities, output_modalities, tensors=None, prompt_parts=None, **kwargs,
     ):

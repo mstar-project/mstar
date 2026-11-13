@@ -480,7 +480,8 @@ class WhisperModel(Model):
         return self.tokenizer.encode(" " + prompt.strip(), add_special_tokens=False)
 
     def max_input_files(self) -> dict[str, int]:
-        return {"audio": 1}
+        # one clip; the data worker refuses anything else before decoding
+        return {"audio": 1, "image": 0, "video": 0}
 
     def process_prompt(
         self,

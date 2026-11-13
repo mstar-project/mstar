@@ -711,6 +711,10 @@ class CosyVoice3Model(Model):
             return instruct if END_OF_PROMPT in instruct else f"{SYSTEM_PROMPT} {instruct}{END_OF_PROMPT}"
         return "" if END_OF_PROMPT in text else f"{SYSTEM_PROMPT}{END_OF_PROMPT}"
 
+    def max_input_files(self) -> dict[str, int]:
+        # one reference clip; the data worker refuses anything else before decoding
+        return {"audio": 1, "image": 0, "video": 0}
+
     def process_prompt(
         self,
         prompt: str | None,
@@ -728,8 +732,6 @@ class CosyVoice3Model(Model):
         knobs = self.resolve_generation_kwargs(kwargs)
 
         uploaded = (tensors or {}).get("audio_inputs") or []
-        if len(uploaded) > 1:
-            raise ValueError("Give one reference clip per request")
         if uploaded:
             wav = uploaded[0]
         elif kwargs.get("voice") not in (None, ""):

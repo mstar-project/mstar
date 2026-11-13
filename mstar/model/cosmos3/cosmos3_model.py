@@ -968,6 +968,15 @@ class Cosmos3Model(Model):
     # Model ABC: I/O
     # ------------------------------------------------------------------
 
+    def max_input_files(self) -> dict[str, int]:
+        # the data worker refuses audio before decoding it. The reasoner takes
+        # any number of images and videos; generation conditions on one image
+        # or one video (process_prompt refuses more than one in total), which only a deployment
+        # without the reasoner can say here
+        if self._reasoner_enabled():
+            return {"audio": 0}
+        return {"image": 1, "audio": 0, "video": 1}
+
     def process_prompt(
         self,
         prompt: str | None,
@@ -981,6 +990,12 @@ class Cosmos3Model(Model):
         if "text" in (output_modalities or []):
             return self._process_reasoner_prompt(
                 prompt, input_modalities, tensors or {}, prompt_parts, input_metadata or {}, kwargs,
+            )
+        conditions = [*(tensors or {}).get("image_inputs", ()), *(tensors or {}).get("video_inputs", ())]
+        if len(conditions) > 1:
+            # generation reads the first video, else the first image
+            raise ValueError(
+                f"Cosmos3 generation conditions on one image or one video; got {len(conditions)} files"
             )
         # The DiT prefill waits on text_inputs, so no prompt means the empty
         # prompt (as in the reference), not a missing edge. /generate sends an
@@ -1273,14 +1288,18 @@ class Cosmos3Model(Model):
             rate = stream.average_rate or stream.guessed_rate or stream.base_rate
             fps = float(rate) if rate else None
             for frame in container.decode(stream):
-                budget.add(frame.height, frame.width)
                 frames.append(torch.from_numpy(frame.to_ndarray(format="rgb24")).permute(2, 0, 1))
+                # held as uint8, then beside its float32 copy
+                budget.add(frames[-1].nbytes + frames[-1].numel() * torch.float32.itemsize, frames=1)
         if not frames:
             raise ValueError(f"no video frames decoded from {filepath}")
-        video = torch.stack(frames).to(device).float().div_(255.0)
+        video = torch.stack(frames)
+        num_frames = len(frames)
+        del frames  # freed before the float copy, as the budget counts them
+        video = video.to(device).float().div_(255.0)
         metadata = {
-            "num_frames": len(frames), "average_fps": fps,
-            "duration_seconds": (len(frames) / fps) if fps else None,
+            "num_frames": num_frames, "average_fps": fps,
+            "duration_seconds": (num_frames / fps) if fps else None,
             "height": int(video.shape[-2]), "width": int(video.shape[-1]),
         }
         return TensorAndMetadata(data=video, metadata=metadata)

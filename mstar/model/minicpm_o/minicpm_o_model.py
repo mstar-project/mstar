@@ -512,6 +512,10 @@ class MiniCPMOModel(Model):
             enable_thinking=enable_thinking,
         )
 
+    def max_input_files(self) -> dict[str, int]:
+        # images and audio clips, any number; a video is refused before it is decoded
+        return {"video": 0}
+
     def process_prompt(
         self,
         prompt: str | None,

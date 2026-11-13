@@ -77,13 +77,16 @@ def read_video_whole_budgeted(ele: dict) -> tuple[torch.Tensor, dict, float]:
                 continue
             if end is not None and frame.time is not None and frame.time > end:
                 break
-            budget.add(frame.height, frame.width)
             frames.append(torch.from_numpy(frame.to_ndarray(format="rgb24")).permute(2, 0, 1))
+            budget.add(frames[-1].nbytes, frames=1)
     if not frames:
         raise ValueError("no video frames could be decoded")
     total = len(frames)
     nframes = smart_nframes(ele, total_frames=total, video_fps=fps)
     idx = torch.linspace(0, total - 1, nframes).round().long()
+    # fetch_video's bicubic resize makes a float32 copy of the sampled frames; with
+    # the whole clip charged, that covers their stack here and the uint8 beside it there
+    budget.add(sum(frames[i].numel() for i in idx.tolist()) * torch.float32.itemsize)
     video = torch.stack([frames[i] for i in idx.tolist()])
     metadata = dict(fps=fps, frames_indices=idx, total_num_frames=total, video_backend="torchvision")
     return video, metadata, nframes / max(total, 1e-6) * fps

@@ -578,7 +578,8 @@ class ChatterboxModel(Model):
     # -----------------------------------------------------------------------
 
     def max_input_files(self) -> dict[str, int]:
-        return {"audio": 1}
+        # one clip; the data worker refuses anything else before decoding
+        return {"audio": 1, "image": 0, "video": 0}
 
     def load_audio(self, filepath: str, device: str) -> TensorAndMetadata:
         """Decode a reference clip to 24 kHz mono float32 (the rate S3Gen's
@@ -683,8 +684,6 @@ class ChatterboxModel(Model):
         if voice is not None and (not isinstance(voice, str) or not voice.strip()):
             raise ValueError(f"voice must be a non-empty name; got {voice!r}")
         uploaded = (tensors or {}).get("audio_inputs") or []
-        if len(uploaded) > 1:
-            raise ValueError("Give one reference clip per request")
         wav = None
         if uploaded:
             wav = uploaded[0]

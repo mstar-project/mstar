@@ -285,7 +285,6 @@ def test_process_prompt_modes_and_token_limits(model):
     "kwargs, inputs, message",
     [
         ({}, None, "needs a reference voice"),
-        ({}, [_clip(), _clip()], "one reference clip"),
         ({}, [torch.zeros(SR)], "silent"),
         ({}, [_clip(0.3)], "at least 0.5 s"),
         ({}, [_clip(31.0)], "at most 30"),

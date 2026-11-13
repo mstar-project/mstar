@@ -21,12 +21,13 @@ fn a_reply_stays_its_own_part() {
         r#"[{"role":"system","content":"Be brief."},
             {"role":"user","content":"Name a color."},
             {"role":"assistant","content":"Blue."},
-            {"role":"user","content":"Another."}]"#,
+            {"role":"user","content":"Another."},
+            {"role":"assistant","content":[{"type":"refusal","refusal":"I can't."}]}]"#,
         Path::new("/unused"),
     )
     .unwrap();
-    assert_eq!(text.as_deref(), Some("Be brief.\nName a color.\nBlue.\nAnother."));
-    assert_eq!(in_mods, ["text", "text", "text", "text"]);
+    assert_eq!(text.as_deref(), Some("Be brief.\nName a color.\nBlue.\nAnother.\nI can't."));
+    assert_eq!(in_mods, ["text", "text", "text", "text", "text"]);
     assert_eq!(
         described(&parts),
         [
@@ -34,6 +35,8 @@ fn a_reply_stays_its_own_part() {
             ("text", "user", Some("Name a color."), 0),
             ("text", "assistant", Some("Blue."), 0),
             ("text", "user", Some("Another."), 0),
+            // a replayed OpenAI history: the assistant's refusal is what it said
+            ("text", "assistant", Some("I can't."), 0),
         ],
         "text merged across a role change, so the reply lands inside a user turn"
     );
@@ -72,6 +75,29 @@ fn a_developer_message_is_a_system_message() {
 fn a_role_a_chat_cannot_render_is_refused() {
     let err = flatten(r#"[{"role":"tool","content":"42"}]"#, Path::new("/unused")).unwrap_err();
     assert_eq!(err, "a message's role must be system, developer, user or assistant, not 'tool'");
+}
+
+#[test]
+fn an_empty_unknown_or_misplaced_chat_part_is_refused() {
+    let image = r#"{"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgo="}}"#;
+    let dir = std::env::temp_dir().join(format!("mstar_parts_{}", uuid::Uuid::new_v4().simple()));
+    std::fs::create_dir(&dir).unwrap();
+    for (role, part, error) in [
+        ("user", r#"{"type":"image_url","image_url":{"url":""}}"#, "the image_url content part needs a non-empty 'url' string"),
+        ("user", r#"{"type":"input_audio","input_audio":{"data":""}}"#, "an input_audio content part needs non-empty base64 'data' and a 'format' string"),
+        ("user", r#"{"type":"text","text":""}"#, "a text content part needs a non-empty 'text' string"),
+        ("user", r#"{"type":"file","file":{"file_id":"f"}}"#, "unsupported content part type 'file'; parts are text, image_url, video_url, audio_url or input_audio"),
+        ("user", r#"{"type":true}"#, "a content part's 'type' must be a string"),
+        ("user", r#"{"type":"refusal","refusal":"No."}"#, "only an assistant message takes a refusal part"),
+        ("assistant", r#"{"type":"refusal","refusal":""}"#, "a refusal content part needs a non-empty 'refusal' string"),
+        ("system", image, "a system message takes text parts only, not 'image_url'"),
+        ("developer", image, "a system message takes text parts only, not 'image_url'"),
+    ] {
+        let messages = format!(r#"[{{"role":"{role}","content":[{part}]}},{{"role":"user","content":[{image}]}}]"#);
+        assert_eq!(flatten(&messages, &dir).unwrap_err(), error, "{role} {part}");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0, "{role} {part} left an upload");
+    }
+    std::fs::remove_dir(&dir).unwrap();
 }
 
 /// The surfaces a class serves: chat, speech, images, videos.
