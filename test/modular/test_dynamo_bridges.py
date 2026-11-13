@@ -531,8 +531,8 @@ TOOLS_REFUSED = "tool calling is not supported for this model"
     ({"tool_choice": "required"}, TOOLS_REFUSED),
     ({"tool_choice": {"type": "function", "function": {"name": "get_weather"}}}, TOOLS_REFUSED),
     ({"presence_penalty": 0.5}, "presence_penalty is not supported"),
-    ({"response_format": {"type": "json_object"}},
-     "response_format needs constrained decoding; only {'type': 'text'} is served"),
+    ({"response_format": {"type": "yaml"}},
+     "response_format type must be text, json_object or json_schema; got 'yaml'"),
 ], ids=["tools", "required", "named", "penalty", "json"])
 def test_a_chat_that_asks_for_an_unserved_field_is_a_400_with_the_adapters_message(tmp_path, fields, message):
     """Stripped before the adapter, the fields left a chat that ran and ignored them.

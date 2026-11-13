@@ -470,7 +470,7 @@ class LoraSpec(NodeResourceSpec):
             targets=own, dropped_targets=dropped, ignored_modules=ignored,
         )
 
-    def request_config(self, model_kwargs: dict | None) -> "LoraReqConfig | None":
+    def request_config(self, model_kwargs: dict | None, current=None) -> "LoraReqConfig | None":
         """The adapter the ``lora_adapter`` kwarg names, and the digest it was selected
         under; None for a base-model request, which lets the pool run lean
         (``Resource.lean_capture``)."""

@@ -155,7 +155,8 @@ resources:
   linear_attn:               # a recurrent layer's resource (GDN, Mamba-2)
     backend: flashinfer
   sampler:
-    greedy_capture: false    # also: enable_logprobs, enable_processed_logprobs
+    greedy_capture: false    # also: enable_logprobs, enable_processed_logprobs, enable_grammar,
+                             # grammar_cache_mb (512)
 ```
 
 Use one block per resource. A model with two caches, such as Whisper's decoder cache and its encoder context, can therefore size each one separately. If a block names a resource that the model does not declare, or sets a key that the resource does not accept, loading fails. A misspelled setting is never silently ignored. A top-level `kv_cache:` block is no longer read. It raises an error with a message describing the migration.

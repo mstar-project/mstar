@@ -51,6 +51,8 @@ dependencies = [
     # transformers back to 5.10, which then fails to import GenerationMixin.
     # 3.0 also needs tqdm>=4.66.3.
     "datasets>=3",
+    # grammar-constrained sampling (`structured_outputs`, `response_format`)
+    "xgrammar>=0.2.9",
 ]
 
 [project.urls]

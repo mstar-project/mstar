@@ -37,6 +37,7 @@ from mstar.engine.resources.attn.ragged.config import (
 from mstar.engine.resources.kv.config import KVLayout, KVSpec, PagedKVConfig
 from mstar.engine.resources.linear_attn.config import LinearAttnConfig, LinearAttnSpec, LinearAttnVariant
 from mstar.engine.resources.recurrent.config import DeltaNetGeometry, RecurrentStateConfig, RecurrentStateSpec
+from mstar.engine.resources.sampler.config import SamplerSpec
 from mstar.engine.resources.sequence_shard import SeqShardSpec, sequence_parallel_refusals
 from mstar.engine.resources.spec import NodeResourceSpec, apply_yaml_overrides, resolve_spec_dependencies
 from mstar.graph.base import GraphEdge, GraphNode, Sequential
@@ -585,6 +586,37 @@ def test_a_cfg_instance_is_one_lockstep_group(tmp_path):
     _validate(_CfgModel(), cfg)
     (group,) = _CfgModel().get_sharding_config(cfg).groups
     assert (group.nodes, group.tp_size) == ({"llm"}, 2)
+
+
+@pytest.mark.parametrize("samplers, node_groups, pattern", [
+    (("sampler", "talker"), None, r"enable_grammar is on samplers \['sampler', 'talker'\]"),
+    (("sampler",), [{"node_names": ["llm"], "ranks": [0], "graph_walks": ["prefill"]},
+                    {"node_names": ["llm"], "ranks": [1], "graph_walks": ["decode"]}],
+     r"sampler sampler: enable_grammar is not served on a node whose walks run on different ranks"),
+], ids=["two samplers", "prefill/decode split"])
+def test_enable_grammar_where_one_grammar_cannot_follow_the_draws_is_refused(tmp_path, samplers, node_groups, pattern):
+    """A request's grammar lives with one sampler on one worker."""
+    specs = [SamplerSpec(resource_key=key, nodes={"llm"}, vocab_size=8) for key in samplers]
+    cfg = _cfg(tmp_path, node_groups, resources={key: {"enable_grammar": True} for key in samplers})
+    _refused(_GrammarModel(specs=specs), cfg, pattern)
+
+
+class _GrammarModel(_Model):
+    STRUCTURED_OUTPUTS = True
+
+
+def test_enable_grammar_on_a_model_that_does_not_declare_it_is_refused(tmp_path):
+    """Structured outputs are served only on a model that declares them (Qwen3.5 for now)."""
+    specs = [SamplerSpec(resource_key="sampler", nodes={"llm"}, vocab_size=8)]
+    cfg = _cfg(tmp_path, resources={"sampler": {"enable_grammar": True}})
+    _refused(_Model(specs=specs), cfg, r"_Model does not declare STRUCTURED_OUTPUTS")
+    _validate(_GrammarModel(specs=specs), cfg)
+
+
+def test_qwen3_5_declares_structured_outputs():
+    from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
+
+    assert Qwen3_5DenseModel.STRUCTURED_OUTPUTS
 
 
 def test_a_paged_kv_cache_on_a_cfg_parallel_node_is_refused(tmp_path):

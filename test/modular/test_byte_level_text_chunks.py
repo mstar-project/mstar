@@ -157,6 +157,8 @@ def test_an_added_token_that_decode_writes_as_is_stays_as_is(fast_tokenizer, tmp
 
 def test_a_tokenizer_that_is_not_byte_level_keeps_decode():
     class SentencePieceLike:
+        all_special_ids = ()
+
         def decode(self, ids):
             return "".join(chr(0x4E00 + i) for i in ids)
 
@@ -168,7 +170,7 @@ def test_a_tokenizer_that_is_not_byte_level_keeps_decode():
 def test_cleanup_of_tokenization_spaces_keeps_decode(fast_tokenizer):
     tok = SimpleNamespace(
         clean_up_tokenization_spaces=True, backend_tokenizer=fast_tokenizer.backend_tokenizer,
-        decode=lambda ids: "x",
+        decode=lambda ids: "x", all_special_ids=(),
     )
     assert TextChunkDetokenizer(tok).to_bytes([1]) == b"x"
 

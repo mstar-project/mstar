@@ -250,8 +250,8 @@ pub(super) fn text_only_chat(req: &ChatCompletionRequest, upload_dir: &Path) -> 
     })
 }
 
-/// Fields no chat adapter serves, refused when on (`best_of` and
-/// `response_format` have their own off values).
+/// Fields no chat adapter serves, refused when on (`best_of` has its own off
+/// values).
 const UNSERVED_CHAT_FIELDS: [&str; 6] =
     ["logprobs", "top_logprobs", "logit_bias", "presence_penalty", "frequency_penalty", "stop_token_ids"];
 
@@ -261,8 +261,8 @@ const CHAT_ENVELOPE_FIELDS: [&str; 6] =
     ["stream_options", "parallel_tool_calls", "user", "store", "metadata", "service_tier"];
 
 /// Refuse a chat that asks for more than one plain reply: more choices, stop
-/// sequences, log probs, sampling penalties, a response format, or a tool
-/// call. The rules are `_refuse_unserved_chat` in
+/// sequences, log probs, sampling penalties, or a tool call. A JSON
+/// `response_format` becomes `structured_outputs`. The rules are `_refuse_unserved_chat` in
 /// `api_server/openai/adapters.py`. `mk` is the request's passthrough; an off
 /// value of one of these fields (`logprobs: false`, `tools: []`) is dropped
 /// from it, before any `chat_template_kwargs` key is merged in.
@@ -284,11 +284,13 @@ pub(super) fn refuse_unserved_chat(req: &ChatCompletionRequest, mk: &mut BTreeMa
             return Err("best_of is not supported; this model returns one choice".to_string());
         }
     }
-    if let Some(v) = mk.get("response_format") {
-        if !(v.is_null() || *v == serde_json::json!({"type": "text"})) {
-            return Err(
-                "response_format needs constrained decoding; only {'type': 'text'} is served".to_string(),
-            );
+    // json_object / json_schema become the engine's grammar request (`structured_outputs`)
+    if let Some(v) = mk.remove("response_format") {
+        if let Some(structured) = response_format_request(&v)? {
+            if mk.get("structured_outputs").is_some_and(|x| !x.is_null()) {
+                return Err("send response_format or structured_outputs, not both".to_string());
+            }
+            mk.insert("structured_outputs".to_string(), structured);
         }
     }
     let listed = |field: &str| match mk.get(field) {
@@ -314,11 +316,33 @@ pub(super) fn refuse_unserved_chat(req: &ChatCompletionRequest, mk: &mut BTreeMa
     {
         return Err("tool calling is not supported for this model".to_string());
     }
-    let off = ["best_of", "response_format", "tools", "tool_choice", "functions", "function_call"];
+    let off = ["best_of", "tools", "tool_choice", "functions", "function_call"];
     for name in UNSERVED_CHAT_FIELDS.iter().chain(&off).chain(&CHAT_ENVELOPE_FIELDS) {
         mk.remove(*name);
     }
     Ok(())
+}
+
+/// OpenAI `response_format` as a `structured_outputs` value, None for text:
+/// `response_format_request` in `engine/resources/sampler/grammar.py`.
+fn response_format_request(v: &Value) -> Result<Option<Value>, String> {
+    let obj = match v {
+        Value::Null => return Ok(None),
+        Value::Object(o) => o,
+        _ => return Err(format!("response_format must be an object; got {v}")),
+    };
+    match obj.get("type").and_then(Value::as_str) {
+        Some("text") => Ok(None),
+        Some("json_object") => Ok(Some(serde_json::json!({"json_object": true}))),
+        Some("json_schema") => match obj.get("json_schema").and_then(|s| s.get("schema")) {
+            Some(schema) if !schema.is_null() => Ok(Some(serde_json::json!({"json": schema}))),
+            _ => Err("response_format json_schema needs json_schema.schema".to_string()),
+        },
+        other => Err(format!(
+            "response_format type must be text, json_object or json_schema; got {}",
+            other.map_or("none".to_string(), |t| format!("'{t}'"))
+        )),
+    }
 }
 
 /// Chat `audio.voice` wins over a top-level `voice` (Qwen3-Omni).

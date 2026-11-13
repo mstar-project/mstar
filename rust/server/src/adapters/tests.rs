@@ -282,11 +282,28 @@ fn a_chat_asking_for_more_than_one_plain_reply_is_refused() {
         (r#""logprobs":true"#, "logprobs is not supported"),
         (r#""presence_penalty":1.5"#, "presence_penalty is not supported"),
         (r#""best_of":3"#, "best_of is not supported"),
-        (r#""response_format":{"type":"json_object"}"#, "response_format needs constrained decoding"),
+        (r#""response_format":{"type":"yaml"}"#, "response_format type must be"),
     ] {
         for (name, adapter) in ADAPTERS.iter().filter(|(_, a)| a.supports_chat()) {
             let got = adapter.chat_to_request(&chat_with(fields), Path::new("/unused"), false).unwrap_err();
             assert!(got.starts_with(err), "{fields} on {name}: {got}");
+        }
+    }
+}
+
+#[test]
+fn a_json_response_format_becomes_structured_outputs() {
+    for (fields, want) in [
+        (r#""response_format":{"type":"json_object"}"#, serde_json::json!({"json_object": true})),
+        (
+            r#""response_format":{"type":"json_schema","json_schema":{"name":"n","schema":{"type":"object"}}}"#,
+            serde_json::json!({"json": {"type": "object"}}),
+        ),
+    ] {
+        for (name, adapter) in ADAPTERS.iter().filter(|(_, a)| a.supports_chat()) {
+            let mk = adapter.chat_to_request(&chat_with(fields), Path::new("/unused"), false).unwrap().model_kwargs;
+            assert_eq!(mk.get("structured_outputs"), Some(&want), "{fields} on {name}");
+            assert!(!mk.contains_key("response_format"), "{fields} on {name}");
         }
     }
 }
