@@ -299,6 +299,11 @@ def test_aiter_refuses_prefill_buckets_past_its_bound(on_platform, aiter_install
     assert manager.capture_refusal(batched(16, tokens_per_row=bound // 16)) is None
     # decode is never refused, however wide its bucket
     assert manager.capture_refusal(batched(4 * bound)) is None
+    # a refused bucket warms up on the chunked kernel it runs on when serving, a captured one on the sequential
+    big, small = packed(1, 2 * bound), packed(16, bound)
+    manager.build_accelerator_graph_buffers([big, small], max_bs=16, max_seq_len=2 * bound)
+    assert type(manager._get_wrapper("main", False, lease=SlotLease(0, big.bucket))._kernel) is AiterChunkedPrefill
+    assert type(manager._get_wrapper("main", False, lease=SlotLease(0, small.bucket))._kernel) is AiterSequentialPrefill
 
 
 def test_a_bound_of_zero_leaves_decode_captured(on_platform, aiter_installed):
