@@ -104,15 +104,13 @@ def node_resources(model: "Model", *, setup: "StateSetup | None" = None) -> list
 
 
 def _with_walks(model: "Model", declarations: Sequence[Array | Sampler], setup: "StateSetup") -> "StateSetup":
-    """``setup`` with ``model``'s `Walks`. Building the walk graphs can read checkpoints, so each field is built only
-    when an array's storage takes it: the nodes each walk runs, for a pool on several nodes, and the combined walks, for
-    an array whose reads differ by walk."""
+    """``setup`` with ``model``'s `Walks`. Building the walk graphs can read checkpoints, so they are built only when a
+    pool on several nodes takes its leader from them."""
     held = [(storage_of(declared), declared) for declared in declarations if isinstance(declared, Array)]
     nodes = EMPTY
     if any(storage.takes_leader(array) for storage, array in held):
         nodes = {walk: frozenset(graph.get_nodes()) for walk, graph in model.get_graph_walk_graphs().items()}
-    combined = model.get_combined_graph_walks() if any(storage.takes_combined_walks for storage, _ in held) else EMPTY
-    return replace(setup, walks=Walks(nodes, combined))
+    return replace(setup, walks=Walks(nodes))
 
 
 def build_specs(
@@ -151,15 +149,13 @@ def _resolve(arrays: Sequence[Array], setup: "StateSetup") -> "Resolved":
     bound: dict[str, tuple[BoundOp, ...]] = {}
     resource_of: dict[str, str] = {}
     queries: dict[str, QuerySide] = {}
-    walk_reads: dict[str, WalkReads] = {}
     for storage, held in by_storage.items():
         each = storage.resolve(held, arrays, setup)
         specs |= each.specs
         bound |= each.bound
         resource_of |= each.resource_of
         queries |= each.queries
-        walk_reads |= each.walk_reads
-    return Resolved(specs, bound, resource_of, queries, walk_reads)
+    return Resolved(specs, bound, resource_of, queries)
 
 
 def state_setup(config: Mapping[str, Any], declarations: Sequence[Array | Sampler]) -> tuple["StateSetup", list[str]]:
@@ -338,7 +334,14 @@ def node_handles(
     built = {} if built is None else built
     declarations = model.declare_state()
     setup = _with_walks(model, declarations, setup)
-    resolved = _resolve([declared for declared in declarations if isinstance(declared, Array)], setup)
+    arrays = [declared for declared in declarations if isinstance(declared, Array)]
+    resolved = _resolve(arrays, setup)
+    by_walk = [array for array in arrays if storage_of(array) is PAGED_BY_WALK]
+    if by_walk:
+        combined = model.get_combined_graph_walks()
+        resolved = resolved._replace(walk_reads={
+            array.name: _walk_reads(array, resolved.resource_of, combined_walks(array, combined)) for array in by_walk
+        })
     for declared in declarations:
         if node in declared.nodes and declared.name not in built:
             built[declared.name] = build_handle(declared, resources, resolved, setup)
@@ -1633,7 +1636,7 @@ class WalkReads(NamedTuple):
 class Resolved(NamedTuple):
     """Arrays resolved into today's resources: each array's specs, its ops' included, and its ops with the bindings that
     run them, by its name, the key of the resource each op runs on, how each read within a step or with ``queries``
-    lays out its queries, and the `WalkReads` of each array whose reads differ by walk."""
+    lays out its queries, and, where handles are built, the `WalkReads` of each array whose reads differ by walk."""
 
     specs: dict[str, list[NodeResourceSpec]]
     bound: dict[str, tuple[BoundOp, ...]]
@@ -1648,8 +1651,6 @@ class Storage(ABC):
     handle_class: ClassVar[type[ArrayHandle]]
     # the pool sizes `kernel_settings` may set under the array's name, until the engine sizes its pools itself
     kernel_settings: ClassVar[frozenset[str]] = frozenset()
-    # whether an array here reads by walk, so a combined walk takes its reads from the walks it batches
-    takes_combined_walks: ClassVar[bool] = False
     # whether an array here holds each row's own entries, whose pages a Value's update snapshots are keyed by
     holds_row_entries: ClassVar[bool] = False
 
@@ -1822,14 +1823,6 @@ class PagedByWalkStorage(PagedStorage):
     walk those of the walks it batches."""
 
     handle_class = PagedByWalkHandle
-    takes_combined_walks = True
-
-    def resolve(self, arrays: Sequence[Array], declared: Sequence[Array], setup: "StateSetup") -> Resolved:
-        resolved = super().resolve(arrays, declared, setup)
-        return resolved._replace(walk_reads={
-            array.name: _walk_reads(array, resolved.resource_of, combined_walks(array, setup.walks.combined))
-            for array in arrays
-        })
 
 
 class PagedCrossStorage(PagedStorage):
@@ -2020,10 +2013,9 @@ SDPA: dict[tuple[Storage, type[Op]], OpBinding] = {(WITHIN_STEP, Attend): SdpaAt
 
 class Walks(NamedTuple):
     """The model's walks, where a storage needs them: the nodes each walk runs, from which a pool on several nodes takes
-    its leader, and each node's combined walks, with the walks each batches, which give a combined walk its reads."""
+    its leader."""
 
     nodes: Mapping[str, frozenset[str]] = EMPTY
-    combined: Mapping[str, Mapping[str, Collection[str]]] = EMPTY
 
 
 @dataclass(frozen=True)

@@ -259,11 +259,13 @@ def _per_walk(**reads) -> Array:
     })
 
 
-def _per_walk_handle(array=None) -> ArrayHandle:
+def _per_walk_handle(array=None, attn=None) -> ArrayHandle:
+    """Built as a node builds it, since `node_handles` reads the model's combined walks."""
     array = array or _per_walk()
-    resolved = _resolve([array], StateSetup(walks=Walks(combined={"LLM": COMBINED})))
-    resources = {"kv": _StubKV(), **{key: _StubAttn() for key in set(resolved.resource_of.values())}}
-    return build_handle(array, resources, resolved=resolved)
+    model = SimpleNamespace(declare_state=lambda: [array], get_combined_graph_walks=lambda: {"LLM": COMBINED})
+    keys = set(_resolve([array], StateSetup()).resource_of.values())
+    resources = {"kv": _StubKV(), **{key: attn(key) if attn else _StubAttn() for key in keys}}
+    return node_handles(model, "LLM", resources)["kv"]
 
 
 def _causal(h: ArrayHandle, walk: str | None) -> dict[str, bool]:
@@ -369,9 +371,7 @@ def _two_spec_handle() -> ArrayHandle:
     """Two reads that build different specs over different layers, each on its own walk, and walk ``c`` with none."""
     array = _per_walk(causal=Read(mask=Causal(), op=Attend(q_heads=2), walks={"a"}, layers={0, 1}),
                       local=Read(mask=Window(16), op=Attend(q_heads=2), walks={"b"}, layers={2, 3}))
-    resolved = _resolve([array], StateSetup())
-    resources = {"kv": _StubKV(), **{key: _Named(key) for key in set(resolved.resource_of.values())}}
-    return build_handle(array, resources, resolved=resolved)
+    return _per_walk_handle(array, attn=_Named)
 
 
 def _at_last_token_on(h: ArrayHandle, walk: str):
