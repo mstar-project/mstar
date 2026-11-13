@@ -427,6 +427,46 @@ def test_glm5next_refuses_a_seed_pool_short_of_the_cap():
         model.validate_config_yaml(serve, "glm5_next_tp8_mtp.yaml")
 
 
+# main's configs/glm5_next_tp8_mtp.yaml at f8b875200 without its comments. Main kept the draft seed in the KDA pool, so
+# the YAML sizes no mtp_seed pool.
+_MAIN_MTP_YAML = """
+model: "glm5_next"
+max_seq_len: 2048
+max_concurrent_requests: 64
+tp_allreduce: "flashinfer"
+tp_allreduce_max_kb: 32768
+tp_async_sched: true
+model_kwargs:
+  moe_quant_kernel: "auto"
+  mtp_num_draft_tokens: 3
+  prefill_graphs: true
+resources:
+  kv_cache:
+    max_num_pages: 4097
+    page_size: 128
+  kda_state:
+    max_slots: 65
+node_groups:
+  - node_names: [LLM]
+    ranks: [0, 1, 2, 3, 4, 5, 6, 7]
+    tp_size: 8
+    graph_walks: [prefill, decode]
+"""
+
+
+def test_mains_mtp_yaml_loads_with_the_seed_pool_as_large_as_the_kda_pool():
+    """A deployment copied from main's MTP YAML sizes the KDA pool alone, and the seed pool takes its 65 slots. With
+    a size of its own, the seed pool's 33 would refuse the YAML's 64 concurrent requests at load."""
+    import yaml
+
+    serve = yaml.safe_load(_MAIN_MTP_YAML)
+    model = Glm5NextModel("x", **serve["model_kwargs"])
+    model.validate_config_yaml(serve, "glm5_next_tp8_mtp.yaml")
+    specs = {spec.resource_key: spec for spec in serving_resources(model, serve)}
+    seed, kda = specs[MTP_SEED].config, specs[KDA_STATE].config
+    assert seed.max_slots == kda.max_slots == 65, "the seed pool kept a size of its own"
+
+
 def test_glm5next_model_constructs_from_config():
     """The five node resources the declarations build, full-size and reduced; each builds on CPU."""
     model = Glm5NextModel("zai-org/GLM-5.3-Flash")

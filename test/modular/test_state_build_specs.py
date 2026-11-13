@@ -795,6 +795,21 @@ def test_kernel_settings_sizes_a_plain_value_and_yaml_overrides_it():
     assert hooked.config.max_slots == 9, "YAML wins over the hook"
 
 
+def test_a_value_sized_by_another_takes_its_slot_count_unless_the_yaml_sizes_it():
+    settings = {"state": {"max_slots": 5}, "seed": {"max_slots_of": "state"}}
+    specs = _by_key(_plain(), replace(_plain(), name="seed"), kernel_settings=settings)
+    apply_yaml_overrides(list(specs.values()), {"resources": {"state": {"max_slots": 9}}})
+    assert specs["seed"].config.max_slots == 9, "a YAML that sizes the pool it follows sizes it too"
+    apply_yaml_overrides(list(specs.values()), {"resources": {"seed": {"max_slots": 3}}})
+    assert specs["seed"].config.max_slots == 3, "YAML wins over the link"
+
+
+def test_a_slot_count_taken_from_anything_but_a_recurrent_pool_is_refused():
+    specs = build_specs([_kv(), _plain()], kernel_settings={"state": {"max_slots_of": "kv"}})
+    with pytest.raises(ValueError, match="max_slots_of names 'kv', which is no recurrent state pool"):
+        apply_yaml_overrides(specs, {})
+
+
 @pytest.mark.parametrize("build, cause", [
     (lambda: replace(_plain(), reads={"r": Read(mask=Causal())}), r"reads\['r'\]\.op: today's resources run no read"),
 ])
