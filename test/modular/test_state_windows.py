@@ -984,6 +984,26 @@ def test_a_reach_is_refused_on_a_pool_placed_over_ranks():
         node_handles(SimpleNamespace(declare_state=lambda: [array]), "dit", {"dit_kv": pool})
 
 
+def test_what_runs_a_paged_read_declares_every_call_the_handle_makes():
+    """A paged handle asks whatever runs a layer's read for four things, and a reach read stands in for an attention
+    resource without being one. A stand-in that lacks one of the four fails when it is built, with the handles, and
+    not at the first step that asks for it."""
+    from mstar.engine.state.adapters import PagedRead, ReachRead
+
+    class _NoRun(PagedRead):
+        requires_kv_write = True
+
+        def reads_step_kv(self, label=None):
+            return False
+
+        def select_last_hidden(self, x, label="main"):
+            return x
+
+    assert PagedRead in ReachRead.__mro__
+    with pytest.raises(TypeError, match="abstract method.*run"):
+        _NoRun()
+
+
 def test_a_reach_only_array_has_no_last_token_yet():
     handle, pool = _reach_handle()
     _reach_step(handle, pool, 12).begin_calls()
