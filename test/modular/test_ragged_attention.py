@@ -161,6 +161,21 @@ def test_eager_accepts_device_cu_seqlens():
     close(w.run(q, k, v), ref(q, k, v, layout))
 
 
+def test_eager_replan_from_a_host_layout_leaves_the_stream_running():
+    """A new layout planned from host ``cu_seqlens`` doesn't wait for the work already on the
+    stream. A denoise step at concurrency replans whenever the next request's prompt length
+    differs; a plan that waited for the step in flight left the GPU idle while the host then
+    launched the next one."""
+    w, layout = wrapper(), cu([7, 1, 300])
+    q, k, v = qkv(308)
+    w.plan(cu([128, 96, 40]))
+    torch.cuda.synchronize()
+    torch.cuda._sleep(1_000_000_000)  # about half a second of the stream busy
+    w.plan(layout)
+    assert not torch.cuda.current_stream().query(), "the plan waited for the stream"
+    close(w.run(q, k, v), ref(q, k, v, layout))
+
+
 # --- the wrapper, under CUDA graph -----------------------------------------
 
 def capture_wrapper(w):
