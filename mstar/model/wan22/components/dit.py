@@ -226,6 +226,17 @@ class Wan22TimeTextEmbedding(nn.Module):
         return temb, timestep_proj, self.text_embedder(encoder_hidden_states)
 
 
+def _with_ffn_residual(hidden_states: torch.Tensor, carry: tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+    """The stream with a block's FFN output added under its gate (``Wan22DiTBlock.stream``'s ``carry``): the sum
+    in fp32 per group of tokens, rounded to the stream's dtype."""
+    ff_output, gate = carry
+    groups = gate.shape[1]
+    return (
+        hidden_states.unflatten(1, (groups, -1)).float()
+        + ff_output.unflatten(1, (groups, -1)).float() * gate.unsqueeze(2)
+    ).type_as(hidden_states).flatten(1, 2)
+
+
 class Wan22DiTBlock(nn.Module):
     """One transformer block: adaLN-modulated self-attention, cross-attention
     to the text stream, adaLN-modulated FFN (reference ``WanTransformerBlock``,
@@ -253,6 +264,21 @@ class Wan22DiTBlock(nn.Module):
         timestep_proj: torch.Tensor,
         rotary_emb: tuple[torch.Tensor, torch.Tensor],
     ) -> torch.Tensor:
+        """The block on its own: ``stream``, with its FFN's gated residual added here."""
+        hidden_states, carry = self.stream(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb)
+        return _with_ffn_residual(hidden_states, carry)
+
+    def stream(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        timestep_proj: torch.Tensor,
+        rotary_emb: tuple[torch.Tensor, torch.Tensor],
+        carry: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        """The block in a stack: ``carry``, the previous block's FFN output and gate, joins the stream in this
+        block's first norm (one pass over the stream, as the norm's own residual), and this block's goes back
+        unadded, for the next block's first norm or the output norm. The sum is the one ``forward`` rounds."""
         # [1, 1, 6, dim] + [B, G, 6, dim] -> six [B, G, dim] fp32 tensors, each
         # applied to one of G equal groups of tokens: a frame, or under SP a run
         # of a frame's tokens, or all of them (a per-sample timestep).
@@ -260,7 +286,10 @@ class Wan22DiTBlock(nn.Module):
             self.scale_shift_table.unsqueeze(0) + timestep_proj.float()
         ).unbind(2)
 
-        _, norm_hidden = ada_layer_norm(hidden_states, shift_msa, scale_msa, eps=self.norm1.eps)
+        residual, gate = carry if carry is not None else (None, None)
+        hidden_states, norm_hidden = ada_layer_norm(
+            hidden_states, shift_msa, scale_msa, eps=self.norm1.eps, residual=residual, gate=gate,
+        )
         attn_output = self.self_attn(norm_hidden, rotary_emb=rotary_emb)
         hidden_states, norm_hidden = ada_layer_norm(
             hidden_states, None, None, eps=self.norm2.eps, weight=self.norm2.weight, bias=self.norm2.bias,
@@ -271,12 +300,7 @@ class Wan22DiTBlock(nn.Module):
         hidden_states, norm_hidden = ada_layer_norm(
             hidden_states, c_shift_msa, c_scale_msa, eps=self.norm3.eps, residual=attn_output,
         )
-        ff_output = gelu_tanh_ffn(norm_hidden, self.ffn)
-        groups = timestep_proj.shape[1]
-        return (
-            hidden_states.unflatten(1, (groups, -1)).float()
-            + ff_output.unflatten(1, (groups, -1)).float() * c_gate_msa.unsqueeze(2)
-        ).type_as(hidden_states).flatten(1, 2)
+        return hidden_states, (gelu_tanh_ffn(norm_hidden, self.ffn), c_gate_msa)
 
 
 @torch.compiler.disable
@@ -397,18 +421,35 @@ class Wan22DiT(nn.Module):
             timestep, encoder_hidden_states
         )
 
-        before = hidden_states
+        # each block's FFN residual joins the stream in the next norm (`Wan22DiTBlock.stream`)
+        before, carry = hidden_states, None
         if cached_residual is not None:
             hidden_states = (hidden_states.float() + cached_residual).type_as(hidden_states)
         else:
             for block in self.blocks:
-                hidden_states = block(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb)
-        residual = hidden_states.float() - before.float() if return_residual else None
+                hidden_states, carry = block.stream(
+                    hidden_states, encoder_hidden_states, timestep_proj, rotary_emb, carry,
+                )
+        residual = None
+        if return_residual:
+            # what the blocks added, the last block's FFN residual with it: the stream as that block's own forward
+            # rounds it (the output norm below adds the same carry itself)
+            after = hidden_states if carry is None else _with_ffn_residual(hidden_states, carry)
+            residual = after.float() - before.float()
 
         # Output head: 2-chunk adaLN in fp32 ([1, 1, 2, dim] island table +
         # bf16 temb promotes, per group of tokens), then project and unpatchify.
         shift, scale = (self.scale_shift_table.unsqueeze(0) + temb.unsqueeze(2)).unbind(2)
-        _, hidden_states = ada_layer_norm(hidden_states, shift, scale, eps=self.norm_out.eps)
+        ff_output, gate = carry if carry is not None else (None, None)
+        if gate is not None:
+            # the kernel reads the modulations at one stride, and `contiguous` keeps a size-1 dim's stride as it
+            # is (batch 1, one group: a CFG-parallel rank); dense copies, [B, G, dim] each, small
+            shift, scale, gate = (
+                torch.empty_like(t, memory_format=torch.contiguous_format).copy_(t) for t in (shift, scale, gate)
+            )
+        _, hidden_states = ada_layer_norm(
+            hidden_states, shift, scale, eps=self.norm_out.eps, residual=ff_output, gate=gate,
+        )
         hidden_states = self.proj_out(hidden_states)
         if shard is not None:
             hidden_states = gather(shard, hidden_states)
