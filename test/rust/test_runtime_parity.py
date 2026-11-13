@@ -1585,7 +1585,7 @@ def test_a_local_streams_inline_items_go_to_its_buffer_by_value(streams_to_sibli
             output_signals=["new_token"],
             wg_ids=ParallelList(rids, [0, 0]),
             tensors=[1], num_tensors=[1, 0],
-            inline_signal="new_token", inline_values=[5, 6],
+            inline_signals=["new_token"], inline_values=[5, 6],
         ),
     )
     assert out.local_streaming_by_signal["new_token"].keys == [rids[0]]
@@ -1593,6 +1593,35 @@ def test_a_local_streams_inline_items_go_to_its_buffer_by_value(streams_to_sibli
     assert out.local_stream_values_by_signal["new_token"].keys == [rids[1]]
     assert out.local_stream_values_by_signal["new_token"].values == [6]
     assert out.register_uuids == []
+
+
+def test_a_withheld_local_inline_item_reaches_no_buffer(streams_to_sibling):
+    """A row whose stop check withheld its streamed signal puts no value in
+    the local consumer's buffer and counts no item; the other row's does."""
+    rt, book, store = streams_to_sibling
+    rt.set_inline_streams(frozenset({("LLM", "new_token")}))
+    rids = [
+        rt.add_request(
+            request_id=f"r{i}", partition="default", graph_walk=WALK,
+            partition_worker_graph_ids=[0, 1],
+            worker_graph_to_workers=ParallelList([0, 1], [[WORKER], [WORKER]]),
+            loop_caps={},
+        )
+        for i in (1, 2)
+    ]
+    rt.ingest_inputs_batch(_ingest_block(rids, [_spec("text_inputs", "LLM")] * 2))
+    rt.pop_rids("LLM", WALK, rids)
+    out = rt.complete_and_route_batch(
+        RouteInput(
+            partition="default", graph_walk=WALK, node_name="LLM",
+            output_signals=["new_token"], wg_ids=ParallelList(rids, [0, 0]),
+            tensors=[], num_tensors=[0, 0], inline_signals=["new_token"], inline_values=[5, 6],
+            withheld={"new_token": [rids[1]]},
+        ),
+    )
+    assert out.local_stream_values_by_signal["new_token"].keys == [rids[0]]
+    assert out.local_stream_values_by_signal["new_token"].values == [5]
+    assert out.local_streaming_by_signal == {} and out.register_uuids == []
 
 
 def test_a_row_with_no_tensor_on_a_stream_sends_it_no_item(streams_to_sibling):

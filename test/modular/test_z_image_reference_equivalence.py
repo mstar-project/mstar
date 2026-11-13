@@ -58,7 +58,7 @@ def meta():
 
 @pytest.fixture(scope="module")
 def model():
-    m = ZImageModel(model_path_hf=MODEL_REPO, attention_backend="sdpa", compile=False, accelerator_graph=False)
+    m = ZImageModel(model_path_hf=MODEL_REPO, compile=False, accelerator_graph=False)
     m.set_config(ZImageConfig.from_snapshot(resolve_snapshot_dir(MODEL_REPO)))
     return m
 

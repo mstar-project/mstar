@@ -113,6 +113,7 @@ def test_captured_plan_takes_rows_that_share_a_prefix():
     more page ids than the pool holds: 4 rows x the same 6 pages, a pool of 8.
     The captured kv_indices buffer was sized to the pool (8 + 4 rows)."""
     from mstar.engine.resources.attn import flashinfer_mla as fm
+    from mstar.engine.resources.base import BucketKey
     from mstar.engine.resources.step import SlotLease
 
     kv = PagedKVConfig(num_layers=1, num_kv_heads=1, head_dim=576, max_seq_len=128, page_size=16,
@@ -121,7 +122,7 @@ def test_captured_plan_takes_rows_that_share_a_prefix():
     attn = fm.FlashInferMLAManager("kv", DEV, torch.bfloat16, kv, sm_scale=0.1)
     if not attn.uses_kernel:
         pytest.skip("no FlashInfer MLA kernel")
-    wrapper = attn._cg_wrapper(SlotLease(slot=0, bucket=None), "main", num_rows=4)
+    wrapper = attn._cg_wrapper(SlotLease(slot=0, bucket=BucketKey("decode", bs=4, num_tokens=4)), "main", num_rows=4)
     pages = torch.arange(6, dtype=torch.int32)
     wrapper.plan(
         qo_indptr=torch.arange(5, dtype=torch.int32),
