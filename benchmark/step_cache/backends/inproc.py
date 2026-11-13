@@ -20,6 +20,7 @@ import json
 import time
 from collections.abc import Callable
 from typing import Any, NamedTuple
+from unittest import mock
 
 import torch
 
@@ -103,7 +104,12 @@ class _Wan:
         return self._embeds[prompt]
 
     def decode(self, latents: torch.Tensor, info: CurrentForwardPassInfo) -> torch.Tensor:
-        out = _drive(self.decoder, Wan22Model.VIDEO_GEN_WALK, info, {"latents": [latents]})
+        if self.device.type == "cuda":
+            out = _drive(self.decoder, Wan22Model.VIDEO_GEN_WALK, info, {"latents": [latents]})
+        else:
+            # the decoder sizes its tiling from free VRAM; on the CPU (a smoke run) there is none to ask about
+            with mock.patch.object(torch.cuda, "mem_get_info", lambda device=None: (1 << 40, 1 << 40)):
+                out = _drive(self.decoder, Wan22Model.VIDEO_GEN_WALK, info, {"latents": [latents]})
         return out["video_output"][0].cpu()
 
 
