@@ -1904,7 +1904,14 @@ class Conductor:
         # A graph can finish with stray reads outstanding. Drain workers too;
         # the preprocess worker ACKs itself after delivering all output chunks.
         workers = self._request_workers(request_data)
-        self._send_drain(request_id, workers)
+        # Successful dispatch put NEW_REQUEST ahead of DRAIN on each leader's
+        # FIFO. Leaders forward to followers in step order; every rank still ACKs.
+        drain_targets = workers.copy()
+        if request_data.sharding_config is not None:
+            for group in request_data.sharding_config.groups:
+                if group.tp_size > 1:
+                    drain_targets.difference_update(group._workers[1:])
+        self._send_drain(request_id, drain_targets)
         participants = workers | {self.PREPROCESS_WORKER}
         self._register_draining(
             request_id,
