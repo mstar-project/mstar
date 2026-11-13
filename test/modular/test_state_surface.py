@@ -51,12 +51,14 @@ SNAPSHOT = {
         ["advance", "KEYWORD_ONLY", 'None'],
         ["position_ids", "KEYWORD_ONLY", 'None'],
         ["host", "KEYWORD_ONLY", '{}'],
+        ["prefix_lens", "KEYWORD_ONLY", 'None'],
     ],
     "Attend": [
         ["q_heads", "POSITIONAL_OR_KEYWORD", None],
     ],
     "Bidirectional": [],
     "Block": [],
+    "BlockPrefix": [],
     "Causal": [],
     "CausalConv": [
         ["activation", "KEYWORD_ONLY", "'silu'"],
