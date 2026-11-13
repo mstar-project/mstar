@@ -247,6 +247,25 @@ def test_droid_session_config_keeps_idless_openpi_cold(tmp_path, monkeypatch):
     assert steps[-1].step_metadata["history_append"] == 1
 
 
+@pytest.mark.parametrize("changed", [
+    {"max_context_chunks": 2}, {"max_text_tokens": 128},
+    {"num_steps": 1}, {"t_shift": 1.0},
+    {"cfg_scale": 1.2}, {"cfg_video_scale": 1.0},
+    {"cfg_scale": True},
+])
+def test_untested_droid_session_recipes_stay_closed(tmp_path, monkeypatch, changed):
+    shipped = yaml.safe_load((ROOT / "configs" / "praxis1_droid.yaml").read_text())
+    kwargs = {
+        key: shipped["model_kwargs"][key]
+        for key in ("max_context_chunks", "max_text_tokens", "num_steps", "t_shift",
+                    "cfg_scale", "cfg_video_scale")
+    }
+    kwargs.update(changed)
+    model = _model(tmp_path, DROID_CONFIG, monkeypatch, **kwargs)
+    with pytest.raises(ValueError, match="no ready Positronic session adapter"):
+        PositronicPolicy.from_config(shipped["positronic"], model)
+
+
 def test_the_canvas_takes_the_views_to_latents():
     """One tile per view on one canvas, then the VAE's stride."""
     droid = Praxis1Config.from_dict(DROID_CONFIG)

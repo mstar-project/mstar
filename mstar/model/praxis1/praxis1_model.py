@@ -126,10 +126,19 @@ class Praxis1Model(Model):
 
     @property
     def POSITRONIC_SESSION_READY(self) -> bool:
-        """Only the validated DROID episode mode may expose the session wire."""
+        """Only the DROID episode recipe checked with the live session may serve."""
+        recipe = self.sampler_defaults
         return (
             _SERVABLE and self.config.embodiment == "single_arm"
-            and self.sampler_defaults["max_context_chunks"] > 0
+            and recipe["max_context_chunks"] == 1
+            and self.max_text_tokens == 256
+            and all(
+                type(recipe[name]) in (int, float) and recipe[name] == expected
+                for name, expected in (
+                    ("num_steps", 2), ("t_shift", 12.5),
+                    ("cfg_scale", 1.0), ("cfg_video_scale", 4.0),
+                )
+            )
         )
 
     def __init__(
