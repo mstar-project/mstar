@@ -1008,16 +1008,30 @@ class StepPipeline:
         if freed:
             self.admission.lift_caps(freed)
         laps.lap("engine")
-        self.streams.remove_request(rid)
-        self.request_state.remove_request(rid)
         self.tensor_manager.force_cleanup_request(rid)
         laps.lap("worker_state_tensors")
-        self.profile_info.pop_request(rid)
-        self.scheduler.clear_rid(rid)
-        self.admission.clear(rid)
-        self.lockstep.clear(rid, wire_rid)
         self._rebuilds.remove_request(rid)
-        self.preemption.remove_request(rid)
+        self.scheduler.clear_rid(rid)
+        # Only missing or malformed per-request host bookkeeping is local.
+        # Resource, transport, shared-batch and runtime cleanup stay outside
+        # this boundary because other rows depend on their state.
+        try:
+            self.streams.remove_request(rid)
+            self.request_state.remove_request(rid)
+            self.profile_info.pop_request(rid)
+            self.admission.clear(rid)
+            self.lockstep.clear(rid, wire_rid)
+            self.preemption.remove_request(rid)
+        except (LookupError, TypeError, ValueError):
+            self.lifecycle.teardown_failed(rid)
+            # REMOVE already ended the conductor's request. Keep its handle
+            # quarantined and name it in the log, rather than failing the batch
+            # whose GPU wait happened to service this teardown.
+            logger.exception(
+                "Worker %s failed to clean up request %s; retaining its handle",
+                self.worker_id, wire_rid,
+            )
+            return
         laps.lap("misc")
         # DEBUG: once per request on the main thread, it cost as much as the
         # engine's own removal (test/waypoint/serve_rollout.py, which waits on

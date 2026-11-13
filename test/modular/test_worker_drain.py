@@ -37,6 +37,7 @@ from mstar.utils.ipc_format import (
 )
 from mstar.worker.micro_scheduler import ScheduledBatch
 from mstar.worker.rid_table import RidTable
+from mstar.worker.step_executor import PendingBatch
 from mstar.worker.stream_buffers import StreamBufferManager
 
 # ── worker ──────────────────────────────────────────────────────────────────
@@ -370,6 +371,117 @@ def test_long_gpu_wait_services_cleanup_and_keeps_completion_fence(callback_rais
     finally:
         release.set()
         w.executor._wait_pool.shutdown()
+
+
+@pytest.mark.parametrize("failure_site,error,isolated", [
+    ("request_state", ValueError("bad request bookkeeping"), True),
+    ("profile_info", KeyError("missing request bookkeeping"), True),
+    ("engine_manager", ValueError("bad shared resource state"), False),
+    ("tensor_manager", ValueError("bad tensor store state"), False),
+    ("_rebuilds", ValueError("bad shared host pool state"), False),
+    ("scheduler", ValueError("bad shared batch state"), False),
+    ("_graph_runtime", ValueError("bad runtime state"), False),
+    ("request_state", RuntimeError("device failure"), False),
+    ("request_state", MemoryError("host allocation failure"), False),
+])
+def test_gpu_wait_cleanup_failure_isolation_through_postprocess(failure_site, error, isolated, caplog):
+    w = _worker(known_rids=("old", "busy", "next"), device=torch.device("cuda"))
+    release, finished = Event(), Event()
+    cleaned, stored, routed, sent, completed = [], [], [], [], []
+    runtime, tensors = w._graph_runtime, w.tensor_manager
+    runtime.remove_request = cleaned.append
+    runtime.cleanup_consumed_inputs = lambda *args: FreedTensors.none()
+    runtime.clear_pending_loop_stops = lambda: None
+    runtime.get_dynamic_loop_iters = lambda *args: []
+    runtime.update_dynamic_loop_iters = lambda *args: None
+    runtime.complete_and_route_batch = lambda request: routed.append(request) or RouteOutput(
+        completion_id=42, register_uuids=[], register_rids=[], new_token_output_idxs=[],
+        local_streaming_by_signal={},
+    )
+    runtime.send_outputs = lambda request: sent.append(request) or ["busy"]
+    tensors.cleanup_collectable = lambda *args: None
+    tensors.increment_ref_batch_uniform = lambda *args: None
+    tensors.drop_host_copies = lambda: None
+    token = torch.tensor([17])
+
+    def store(rids, outputs, signals, **kwargs):
+        assert finished.is_set(), "outputs must wait for GPU completion"
+        assert rids == ["busy"] and signals == ["new_token"]
+        stored.append(outputs.get("busy")["new_token"][0])
+        return StoredOutputs([123], ["busy"], [0], [1])
+
+    tensors.store_and_return_tensor_info_batch = store
+    w.engine_manager.get_engine = lambda node: SimpleNamespace(
+        check_stop_for_batch=lambda *args, **kwargs: {},
+        step_finished=lambda *args, **kwargs: None,
+        after_output_copy=lambda batch: None,
+        materialize_publish=lambda batch, rids: None,
+    )
+    w.request_state.get_fwd_info = lambda rid, partition: None
+    w.request_state.get_pending_publish_info = lambda rid, partition: {}
+    w.request_state.flush_publish_info = lambda rid, partition: completed.append(rid)
+    messages = [WorkerMessage(WorkerMessageType.REMOVE_REQUEST, RemoveRequest("old"))]
+    w.communicator.get_all_new_messages = lambda: [messages.pop()] if messages else []
+
+    def cleanup(rid):
+        assert rid == "old" and not finished.is_set()
+        release.set()
+        raise error
+
+    method = {
+        "profile_info": "pop_request", "tensor_manager": "force_cleanup_request", "scheduler": "clear_rid",
+    }.get(
+        failure_site, "remove_request",
+    )
+    setattr(getattr(w, failure_site), method, cleanup)
+
+    def synchronize():
+        assert release.wait(5), "teardown was not serviced during the GPU wait"
+        finished.set()
+
+    node_batch = ExecutingBatch(
+        node_name="LLM", per_request_info={},
+        step_context=StepContext(request_ids=("busy",), graph_walk="decode", slot=0, capture=False),
+    )
+    node_batch.request_ids = ["busy"]
+    node_batch.completion_event = SimpleNamespace(query=lambda: False, synchronize=synchronize)
+    pending = PendingBatch(
+        batch=ScheduledBatch(
+            node_name="LLM", graph_walk="decode", request_to_worker_graph={"busy": 0},
+            output_signals=["new_token"],
+        ),
+        node_batch=node_batch, node_name="LLM", partition="default", graph_walk="decode", future=Future(),
+    )
+    w.pipeline._set_pending(pending)
+    w.pipeline._spec_pending = SimpleNamespace(
+        batch=ScheduledBatch(node_name="LLM", graph_walk="decode", request_to_worker_graph={"next": 0}),
+        node_batch=SimpleNamespace(launch_started_event=None),
+    )
+    outputs = BatchedModelOutput(per_rid_outputs={"busy": {"new_token": [token]}})
+    try:
+        if isolated:
+            w.pipeline._finish_step(pending, outputs)
+        else:
+            with pytest.raises(type(error)) as caught:
+                w.pipeline._finish_step(pending, outputs)
+            assert caught.value is error
+        assert finished.is_set(), "even a fatal callback error must fence the GPU work"
+    finally:
+        release.set()
+        if w.executor._wait_pool is not None:
+            w.executor._wait_pool.shutdown()
+
+    assert w.lifecycle.failed_rids == {"old"}
+    assert not w.lifecycle.pending_removes, "a partial teardown must not be retried"
+    assert cleaned == [], "a partial teardown must not recycle its handle"
+    assert not [m for _, m in w.sent if m.message_type == ConductorMessageType.FAIL_REQUESTS]
+    if isolated:
+        assert stored == [token] and completed == ["busy"]
+        assert list(routed[0].wg_ids.keys) == ["busy"] and routed[0].tensors == [123]
+        assert sent[0].completion_id == 42
+        assert "old" in caplog.text and str(error) in caplog.text
+    else:
+        assert stored == routed == sent == completed == []
 
 
 @pytest.mark.parametrize("enable_nvtx", [False, True])
