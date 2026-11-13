@@ -233,6 +233,24 @@ def test_greedy_tokens_are_plain_and_drafts_are_the_draft_models_own_chain(tmp_p
 
 
 @pytest.mark.parametrize("mode, captured, backend", SETUPS, ids=str)
+def test_a_chunked_prompt_still_drafts_the_draft_models_own_chain(tmp_path, monkeypatch, mode, captured, backend):
+    """Prompts prefilled three tokens a row a step (`Driver.prefill_chunks`, as a budget cuts them) leave the draft
+    model the context a whole prompt does: the replies are plain, and every draft is the dense chain's."""
+    if (reason := _reason(mode)) is not None:
+        pytest.skip(reason)
+    model = _model(tmp_path, mode, captured)
+    probe = _Probe(monkeypatch)
+    eng = _engine(model, backend, captured)
+    driver = Driver(eng, model)
+    for rid, prompt in PROMPTS.items():
+        driver.add(rid, prompt, MAX)
+    assert driver.prefill_chunks(list(PROMPTS), PROMPTS, 3) == 4
+    driver.run(list(PROMPTS))
+    _check_plain(_plain(model, eng), driver.out)
+    assert _check_drafts(eng, driver.out, probe.steps) >= len(PROMPTS) * K
+
+
+@pytest.mark.parametrize("mode, captured, backend", SETUPS, ids=str)
 def test_a_draft_model_that_is_the_target_keeps_row_0_on_its_own_chain(tmp_path, monkeypatch, mode, captured,
                                                                          backend):
     """The draft model is the target toy (its config and weights): nearly every block is accepted in full, so

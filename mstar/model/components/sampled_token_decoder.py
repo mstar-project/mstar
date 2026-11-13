@@ -72,7 +72,13 @@ from mstar.engine.accelerator_graph_config import (
     decode_rows_then_prompt,
 )
 from mstar.engine.resources.attn.config import AttentionStep
-from mstar.engine.resources.draft.drafter import Drafter, PrefillInputs, TargetOutput
+from mstar.engine.resources.draft.drafter import (
+    DRAFT_FOLLOWING,
+    ChunkBoundary,
+    Drafter,
+    PrefillInputs,
+    TargetOutput,
+)
 from mstar.engine.resources.position.config import PositionStep
 from mstar.engine.resources.sampler.config import SamplerStep
 from mstar.engine.resources.step import ResourceStep, Segment, SubmoduleStep
@@ -186,6 +192,17 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
             self.drafter = drafter
             self._drafting = True
         self.token_stop = self.node_token_stop(config.stop_token_ids, self._encoders, text_prompts)
+
+    @property
+    def _reads_following(self) -> bool:
+        """Whether the drafter reads each prompt row's following token (`ChunkBoundary.FOLLOWING`)."""
+        return self._drafting and self.drafter.needs.chunk_boundary == ChunkBoundary.FOLLOWING
+
+    @property
+    def cuts_tensor_inputs(self) -> bool:
+        # a text prompt's one tensor input, `DRAFT_FOLLOWING`, is cut with its ids (`split_inputs`), so the
+        # engine still probes the prefix cache for it
+        return self._reads_following
 
     @property
     def _block(self) -> int:
@@ -360,13 +377,20 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
                 compile_mode=self.capture_compile_mode(self.DECODE_WALK),
             ),
         ]
+        def prompt(n: int) -> ARNodeInputs:
+            row = ids(n)
+            if self._reads_following:
+                row.tensor_inputs = {DRAFT_FOLLOWING: torch.zeros(n, dtype=torch.long, device=device)}
+            return row
+
         if self._text_prompts and self.CAPTURE_PREFILL:
             configs += [PackedAcceleratorGraphConfig(
                 capture_graph_walk=self.PREFILL_WALK,
                 capture_token_lengths=self.PREFILL_TOKEN_BUCKETS,
-                make_node_input=ids,
+                make_node_input=prompt,
                 capture_batch_sizes=self.PREFILL_CAPTURE_BATCH_SIZES,
                 compile_mode=self.capture_compile_mode(self.PREFILL_WALK),
+                input_seq_dims={DRAFT_FOLLOWING: 0} if self._reads_following else None,
             )]
         if self._text_prompts and self.CAPTURE_PREFILL and not self._drafting:
             # a verifying node runs no mixed steps: they aren't supported yet
@@ -497,6 +521,12 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
         if self._drafting and graph_walk == self.DECODE_WALK:
             # a row's first verify step brings its prompt's token routed
             return ARNodeInputs(input_seq_len=self._block, input_ids=input_ids.reshape(-1)[-1:])
+        if self._reads_following and graph_walk == self.PREFILL_WALK:
+            # cut with the ids (`split_inputs`), so a chunk's last row holds the next chunk's first token
+            following = torch.cat([input_ids[1:], input_ids.new_full((1,), -1)])
+            return ARNodeInputs(
+                input_seq_len=input_ids.shape[0], input_ids=input_ids, tensor_inputs={DRAFT_FOLLOWING: following},
+            )
         return ARNodeInputs(input_seq_len=input_ids.shape[0], input_ids=input_ids)
 
     def get_input_sequence_len(
@@ -522,7 +552,12 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
         advance its tokens place: the advance through ``end`` less that
         through ``start``, so a row's chunks advance by the whole row's."""
         if graph_walk not in self._media_walks:
-            return super().split_inputs(graph_walk, fwd_info, inputs, start, end)
+            following = inputs.tensor_inputs.get(DRAFT_FOLLOWING)
+            if following is None:
+                return super().split_inputs(graph_walk, fwd_info, inputs, start, end)
+            cut = super().split_inputs(graph_walk, fwd_info, replace(inputs, tensor_inputs={}), start, end)
+            cut.tensor_inputs = {DRAFT_FOLLOWING: following[start:end]}
+            return cut
         cut = super().split_inputs(
             graph_walk, fwd_info, replace(inputs, tensor_inputs={}, resource_step_info=None), start, end,
         )
@@ -615,10 +650,21 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
             if not decode:
                 # a mixed step's media prompt rows
                 self._pack_media(out, graph_walk, inputs)
+                self._pack_following(out, graph_walk, inputs)
             return out
         out = {"input_ids": torch.cat([inp.input_ids for inp in inputs], dim=0)}
         self._pack_media(out, graph_walk, inputs)
+        self._pack_following(out, graph_walk, inputs)
         return out
+
+    def _pack_following(self, out: dict, graph_walk: str, inputs: list[ARNodeInputs]) -> None:
+        """A prompt step's `DRAFT_FOLLOWING`, its rows' in row order, for a drafter that reads it."""
+        if not self._reads_following or graph_walk != self.PREFILL_WALK:
+            return
+        rows = [inp.tensor_inputs[DRAFT_FOLLOWING] for inp in inputs]
+        out[DRAFT_FOLLOWING] = to_device_nonblocking(
+            rows[0] if len(rows) == 1 else torch.cat(rows), out["input_ids"].device,
+        )
 
     def _pack_media(self, out: dict, graph_walk: str, inputs: list[ARNodeInputs]) -> None:
         """A media step's ``MEDIA_EMBEDS``, its rows' in row order as the

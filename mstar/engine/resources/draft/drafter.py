@@ -40,14 +40,20 @@ DRAFT_CARRY = "draft_carry"
 # target accepted every draft last step, so the drafter's row 0 (the token before the block, which
 # its last block never reached) writes its KV; 0 sends that write to the sink. The engine sets it.
 DRAFT_KEEP_FIRST = "draft_keep_first"
+# A prompt step's ``[tokens]`` input for a drafter whose rule is `ChunkBoundary.FOLLOWING`: each
+# row's following prompt token, -1 at a prompt's last row, which follows with the token the step samples
+DRAFT_FOLLOWING = "draft_following"
 
 
 class ChunkBoundary(Enum):
     """How a drafter's state at a prompt chunk's last row is built."""
     # not said: a chunked prompt is refused on the node
     UNDECLARED = "undeclared"
-    # its state at row ``p`` depends only on the target at ``p`` (DSpark)
+    # its state at row ``p`` depends only on rows up to ``p`` (DSpark: the target's at ``p``; a draft model)
     NONE = "none"
+    # its state at row ``p`` reads the prompt's token at ``p + 1`` (EAGLE-3): the prompt step brings
+    # each row's following token (`DRAFT_FOLLOWING`), so a chunk's last row reads the next chunk's first
+    FOLLOWING = "following"
 
 
 class CarrySpec(NamedTuple):

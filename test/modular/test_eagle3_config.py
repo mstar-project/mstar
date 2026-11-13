@@ -83,15 +83,15 @@ def test_its_declaration_reads_three_taps_carries_its_prenorm_and_joins_one_laye
     needs = decl.needs
     assert needs.taps == (2, 18, 33) and needs.lag is None and not needs.target_hidden
     assert (needs.kv.num_layers, needs.kv.num_kv_heads, needs.kv.head_dim) == (1, 8, 128)
-    assert needs.carry.width == 4096 and needs.chunk_boundary == ChunkBoundary.UNDECLARED
-    # so a target that prefills prompts in chunks refuses it at startup, until one has a next-ids input for it
+    # its prompt rows read the next prompt token, which the prompt step brings, so a target that prefills
+    # prompts in chunks takes it (`test_qwen3_chunked_drafters`)
+    assert needs.carry.width == 4096 and needs.chunk_boundary == ChunkBoundary.FOLLOWING
     from types import SimpleNamespace
 
     from mstar.engine.resources.draft.startup import chunking_problem
 
     node = SimpleNamespace(node="LLM", needs=needs)
-    assert "no chunk-boundary rule" in chunking_problem(node, chunks_prompts=True)
-    assert chunking_problem(node, chunks_prompts=False) is None
+    assert chunking_problem(node, chunks_prompts=True) is None
     assert needs.geometry.hidden_size == 4096 and needs.geometry.vocab_size == 151936
     (taps,) = decl.node_resources({"LLM"})
     assert taps.layers == (2, 18, 33) and taps.hidden_size == 4096

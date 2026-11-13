@@ -23,7 +23,9 @@ from torch import nn
 
 from mstar.distributed.communication import CommGroup
 from mstar.engine.resources.draft.drafter import (
+    DRAFT_FOLLOWING,
     CarrySpec,
+    ChunkBoundary,
     DrafterNeeds,
     DraftInputs,
     ModelGeometry,
@@ -150,9 +152,8 @@ class Eagle3(HostedDrafterDecl):
             taps=self.taps, tap_key=self.tap_key,
             kv=geometry.layer_set(self.kv_key, LAYER_SET),
             carry=CarrySpec(cfg.hidden_size, CARRY_DTYPE),
-            # no chunk_boundary (UNDECLARED): the prefill reads the token sampled at each prompt's last row, so a
-            # chunk's last row would need the next prompt token, which no input carries; the startup gate refuses
-            # a chunking target
+            # each prompt row reads the next prompt token, which the prompt step brings (`DRAFT_FOLLOWING`)
+            chunk_boundary=ChunkBoundary.FOLLOWING,
             geometry=geometry,
         )
 
@@ -295,16 +296,17 @@ class Eagle3Drafter(nn.Module, HostedDrafter):
     # ── prompt step ──
 
     def prefill(self, inputs: PrefillInputs) -> torch.Tensor:
-        """The layer over a whole prompt's rows: each row reads the next prompt token, the last the token the step
-        sampled. Returns each prompt's carry: the output at its last row."""
+        """The layer over a prompt step's rows: each row reads the next prompt token (`DRAFT_FOLLOWING`; a
+        chunk's last row the next chunk's first), a prompt's last row the token the step sampled. Returns
+        each prompt's carry: the output at its last row in the step, which the node keeps from a prompt's
+        last chunk."""
         input_ids, sampled = inputs.input_ids, inputs.sampled
         tokens = input_ids.shape[0]
         last, at = inputs.resources[self.decl.attn_key].prompt_last_rows(tokens, input_ids.device, LABEL)
-        # each row's next prompt token; a prompt's last row the token sampled from it (a padding row's
-        # writes go to the sink at ``tokens``)
+        # -1 marks a prompt's last row (a padding row's writes go to the sink at ``tokens``)
         fill = at_last_rows(sampled.reshape(-1).to(input_ids.dtype), at, tokens)
-        is_last = torch.zeros(tokens + 1, dtype=torch.bool, device=input_ids.device).index_fill(0, at, True)[:tokens]
-        following = torch.where(is_last, fill, input_ids.roll(-1, 0))
+        following = inputs.tensors[DRAFT_FOLLOWING]
+        following = torch.where(following < 0, fill, following)
         out = self._head(self._fused_taps(), following, keep=last)
         return out.to(CARRY_DTYPE)
 
