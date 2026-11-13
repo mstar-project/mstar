@@ -30,6 +30,8 @@ def main() -> None:
                         help="also run the reference policy using M*'s Diffusers VAE encode")
     parser.add_argument("--trace-output", type=Path,
                         help="save reference input tensors and per-step sampler trace for stage isolation")
+    parser.add_argument("--mstar-stage-dir", type=Path,
+                        help="ablate M*'s saved text and VAE stage tensors into the reference cold call")
     parser.add_argument("--mstar-revision", required=True)
     parser.add_argument("--skip-last-video", action="store_true",
                         help="use the reference serving optimization; M* E5 currently decodes both steps")
@@ -169,6 +171,63 @@ def main() -> None:
             result = matched.step(observation)
         torch.cuda.synchronize()
         report("reference_with_native_vae", np.asarray(result.action_rel, dtype=np.float32))
+
+    if args.mstar_stage_dir is not None:
+        def one_stage(name: str) -> dict:
+            paths = list(args.mstar_stage_dir.glob(f"*-{name}.pt"))
+            if len(paths) != 1:
+                raise ValueError(f"expected one saved {name} stage, found {len(paths)}")
+            return torch.load(paths[0], map_location="cpu", weights_only=False)
+
+        text_stage = one_stage("Praxis1TextEncoderSubmodule")
+        vae_stage = one_stage("Praxis1VaeEncoderSubmodule")
+        task_ids = text_stage["inputs"]["text_ids"]
+        blank_ids = text_stage["inputs"]["blank_ids"]
+        processor = pipeline.text.processor
+        for label, value, prompt_value in (
+            ("task", task_ids, prompt),
+            ("blank", blank_ids, pipeline.variant.blank_caption),
+        ):
+            ref_ids = processor(text=[prompt_value], **pipeline.text.call_kwargs)["input_ids"][0]
+            print(json.dumps({"phase": "token_check", "stream": label,
+                              "same_ids": bool(torch.equal(value.cpu(), ref_ids.cpu())),
+                              "mstar_len": int(value.numel()), "reference_len": int(ref_ids.numel())}), flush=True)
+
+        task_embed = text_stage["outputs"]["text_embeds"][0].to("cuda")
+        blank_embed = text_stage["outputs"]["text_embeds_blank"][0].to("cuda")
+        anchor = vae_stage["outputs"]["obs_latents"][0].to("cuda")
+        original_encode_text = pipeline.encode_text
+        for use_text, use_vae in ((True, False), (False, True), (True, True)):
+            current = session()
+            if use_vae:
+                calls = 0
+
+                def encode_once(clip):
+                    nonlocal calls
+                    calls += 1
+                    if calls != 1:
+                        raise ValueError("cold ablation expected one VAE encode")
+                    return anchor
+
+                current.state.encode = encode_once
+            if use_text:
+                def encode_saved(value):
+                    if value == prompt:
+                        return task_embed
+                    if value == pipeline.variant.blank_caption:
+                        return blank_embed
+                    raise ValueError(f"unexpected text in ablation: {value!r}")
+
+                pipeline.encode_text = encode_saved
+            try:
+                with torch.inference_mode():
+                    ablated = current.step(observation)
+                torch.cuda.synchronize()
+                report(f"mstar_{'text' if use_text else 'reference_text'}_"
+                       f"{'vae' if use_vae else 'reference_vae'}",
+                       np.asarray(ablated.action_rel, dtype=np.float32))
+            finally:
+                pipeline.encode_text = original_encode_text
 
 
 if __name__ == "__main__":
