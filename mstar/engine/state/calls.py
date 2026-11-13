@@ -127,6 +127,17 @@ class ArrayHandle(StepHandle):
         self._open = False
         self._held = self._held_layer = None
 
+    def next_round(self) -> None:
+        """Run the step's layers again over the same segments: a fixed-step loop fused into one step (one denoise
+        iteration a round) adds and reads every layer once a round. Scratch adds only, since a kept add would append
+        the same tokens again."""
+        self._check_open("a new round")
+        if self._kept:
+            raise self._refusal(f"a new round after kept adds on layers {sorted(self._kept)}")
+        self._scratch.clear()
+        self._read.clear()
+        self._held = self._held_layer = None
+
     def _check_host_writes(self, declared: ArrayStep, ctx) -> None:
         raise self._refusal("a host write, and the array declares no host fields")
 
