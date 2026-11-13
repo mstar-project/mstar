@@ -13,7 +13,11 @@ wrists, 20-wide rows). One policy call answers one chunk: 24 command rows at
 Shapes worth having in one place, for the droid checkpoint: the canvas is one
 224x416 tile per view stacked side by side (224x832), the VAE takes it to 48
 channels at stride (4, 16, 16), and the backbone is a 3072-wide MoE with 14
-encoder blocks over 129 experts and a 6-block decoder.
+encoder blocks over 128 routed experts plus a shared one, and a 6-block
+decoder.
+
+The MoE's two expert counts are the one place in this file where a field name
+alone will mislead a reader. See :func:`_moe_fields`.
 """
 
 from __future__ import annotations
@@ -39,6 +43,15 @@ SUPPORTED_VAE = "Wan2.2"
 # A base checkpoint has no action heads (upstream refuses it the same way).
 BASE_EMBODIMENT = "base"
 
+# The MoE regime :mod:`mstar.model.praxis1.components.moe` implements. Each of
+# these is a field the checkpoint states and the reference then accepts without
+# reading, because its layer hard-codes the same choice. So a checkpoint that
+# flipped one would be mis-served by the reference too, quietly, and we would
+# have no oracle to catch it with. Refusing is the only honest answer.
+SUPPORTED_ROUTER_ACTIVATION = "sigmoid"
+SUPPORTED_ROUTER_DTYPE = "float32"
+SUPPORTED_ROUTED_WEIGHT_LAYOUT = "expert_first"
+
 
 # The published checkpoints' own shape, for dummy mode: the startup checks and
 # the graph tests construct a model with no checkpoint to read. Serving reads
@@ -54,7 +67,8 @@ _SHARED_DEFAULTS = {
     "tap_blocks": (0, 2, 4, 6, 7, 9, 11, 13),
     "num_heads": 24, "num_kv_heads": 8, "head_dim": 128,
     "flex_block_size": 128, "attention_backend": "flash",
-    "num_experts": 129, "num_routed_experts": 128, "top_k": 9,
+    "num_experts_with_shared": 129, "top_k_with_shared": 9,
+    "num_routed_experts": 128, "top_k_routed": 8, "routed_scaling_factor": 2.5,
     "expert_hidden": 1280, "dense_ffn_hidden": 11520,
     "expert_dim": 1024, "expert_layers": 16, "expert_heads": 16,
     "expert_head_dim": 64, "trunk_dim": 3072, "max_action_tokens": 64,
@@ -78,6 +92,111 @@ def _section(config: Mapping[str, Any], name: str) -> Mapping[str, Any]:
     return value
 
 
+def _moe_fields(moe: Mapping[str, Any]) -> dict[str, Any]:
+    """The MoE widths, with the routed counts held apart from the totals.
+
+    ``backbone.moe`` states the same two quantities twice, and this is the
+    trap the whole function exists for. ``num_experts`` and ``top_k`` are 129
+    and 9 because they *count the shared expert*, which is always on and which
+    the router therefore never picks. ``num_routed_experts`` and
+    ``top_k_routed`` are 128 and 8, and they are the only pair
+    :class:`~mstar.model.praxis1.components.moe.MoEFeedForward` can be built
+    from, exactly as the reference builds its own layer from them.
+
+    Handing the totals to the layer instead is the failure this guards. It
+    does not raise: a 129-way router picking nine experts renormalizes nine
+    gates to one and returns the right shape. Every token simply gets one
+    routed expert too many, and the 129th bank, which the checkpoint never
+    filled because the shared expert lives in its own tensors, is routed to as
+    if it held weights. The output stays plausible and the policy is wrong.
+
+    So the totals are deliberately *not* called ``num_experts`` and ``top_k``
+    on :class:`Praxis1Config`. A caller reaching for the obvious short name
+    gets an :exc:`AttributeError` instead of a number that is off by one, and
+    the translation to the layer's own argument names happens once, in
+    :meth:`Praxis1Config.moe_kwargs`.
+
+    The totals are redundant, so a config may omit them, but if it states them
+    they have to be the routed counts plus the one shared expert. A config
+    where they differ by anything else is not an off-by-one we can absorb: it
+    means one of the four fields does not mean what is assumed here.
+    """
+    if "num_routed_experts" not in moe or "top_k_routed" not in moe:
+        raise Praxis1ConfigError(
+            "backbone.moe must state num_routed_experts and top_k_routed; the "
+            "shared-expert-inclusive num_experts and top_k cannot be used to "
+            "build the router, since neither says how many of their count the "
+            "router actually picks"
+        )
+    num_routed = int(moe["num_routed_experts"])
+    top_k_routed = int(moe["top_k_routed"])
+
+    if not bool(moe.get("shared_expert", True)):
+        raise Praxis1ConfigError(
+            "backbone.moe.shared_expert is false; this build's MoE always adds an "
+            "ungated shared expert and cannot turn it off, so it would add a "
+            "contribution this checkpoint was not trained with"
+        )
+
+    num_total = int(moe.get("num_experts", num_routed + 1))
+    top_k_with_shared = int(moe.get("top_k", top_k_routed + 1))
+    if (num_total, top_k_with_shared) != (num_routed + 1, top_k_routed + 1):
+        raise Praxis1ConfigError(
+            f"backbone.moe has num_experts {num_total} and top_k {top_k_with_shared}, "
+            f"which are not {num_routed} routed experts and {top_k_routed} picks plus "
+            "the one shared expert; the two pairs may differ only by that expert"
+        )
+    if not 0 < top_k_routed <= num_routed:
+        raise Praxis1ConfigError(
+            f"backbone.moe picks {top_k_routed} of {num_routed} routed experts"
+        )
+
+    for key, supported in (
+        ("router_activation", SUPPORTED_ROUTER_ACTIVATION),
+        ("router_dtype", SUPPORTED_ROUTER_DTYPE),
+        ("routed_weight_layout", SUPPORTED_ROUTED_WEIGHT_LAYOUT),
+    ):
+        value = moe.get(key, supported)
+        if value != supported:
+            raise Praxis1ConfigError(
+                f"backbone.moe.{key} is {value!r}; this build implements only "
+                f"{supported!r} and the choice is wired into the layer rather than "
+                "read from here"
+            )
+
+    # The chunked dispatch is a different combine, not a memory split of the
+    # one we implement, and every published checkpoint sets it, so this
+    # refusal currently rejects all of them. That is deliberate: see the
+    # "Not ported" section of :mod:`mstar.model.praxis1.components.moe` for
+    # the measurement and for what implementing it would take.
+    chunk = moe.get("dispatch_chunk_size")
+    if chunk is not None:
+        raise Praxis1ConfigError(
+            f"backbone.moe.dispatch_chunk_size is {chunk!r}, and this build implements "
+            "only the unchunked MoE dispatch. This is a missing feature, not an exotic "
+            "checkpoint: every published config sets this field, so every published "
+            "checkpoint is refused here until the chunked combine is ported. The two "
+            "are different combines rather than one combine split for memory. Chunked "
+            "scales the gate by routed_scaling_factor in float32, sums the top_k rows "
+            "in float32 and rounds once at the end; the unchunked path gates in the row "
+            "dtype, sums, then scales. The reference picks the path on this field alone, "
+            "so a batch smaller than one chunk does not avoid it: measured on CPU, the "
+            "two disagree on every row at every size down to a single row, by up to "
+            "0.25 absolute and 2.8e-3 relative in RMS in bfloat16. Serving these "
+            "weights on the unchunked path would run and answer with a policy the "
+            "reference does not produce"
+        )
+
+    return {
+        "num_experts_with_shared": num_total,
+        "top_k_with_shared": top_k_with_shared,
+        "num_routed_experts": num_routed,
+        "top_k_routed": top_k_routed,
+        "expert_hidden": int(moe.get("expert_hidden", 0)),
+        "routed_scaling_factor": float(moe.get("routed_scaling_factor", 2.5)),
+    }
+
+
 @dataclass(frozen=True)
 class Praxis1Config:
     """What the served graph needs from a checkpoint."""
@@ -99,11 +218,17 @@ class Praxis1Config:
     flex_block_size: int
     attention_backend: str
 
-    # backbone MoE
-    num_experts: int
+    # backbone MoE. There is no ``num_experts`` and no ``top_k`` here on
+    # purpose: both names are ambiguous between the routed count and the count
+    # that includes the always-on shared expert, and the checkpoint uses them
+    # for the second. :func:`_moe_fields` says what breaks when the two are
+    # swapped; :meth:`moe_kwargs` is the only place either is read.
+    num_experts_with_shared: int
+    top_k_with_shared: int
     num_routed_experts: int
-    top_k: int
+    top_k_routed: int
     expert_hidden: int
+    routed_scaling_factor: float
     dense_ffn_hidden: int
 
     # action expert
@@ -166,6 +291,30 @@ class Praxis1Config:
     @property
     def latent_width(self) -> int:
         return self.canvas_width // self.vae_stride[2]
+
+    def moe_kwargs(self) -> dict[str, Any]:
+        """The arguments :class:`...components.moe.MoEFeedForward` is built with.
+
+        The layer's ``num_experts`` and ``top_k`` are the *routed* counts, which
+        is the reference's own naming for its own layer, and the reference feeds
+        them from ``num_routed_experts`` and ``top_k_routed`` too. Those two
+        namings meet here and nowhere else, so a block builder never picks
+        between the config's two pairs and there is one place to read when a
+        routed count looks wrong.
+
+        Returning kwargs rather than letting a caller spell out five arguments
+        is the point: a positional call is what silently puts the right number
+        in the wrong slot, and it is the fifth argument,
+        ``routed_scaling_factor``, that would be hardest to notice, since 2.5
+        is also the layer's default.
+        """
+        return {
+            "dim": self.dim,
+            "hidden": self.expert_hidden,
+            "num_experts": self.num_routed_experts,
+            "top_k": self.top_k_routed,
+            "routed_scaling_factor": self.routed_scaling_factor,
+        }
 
     @classmethod
     def for_rig(cls, rig: str) -> "Praxis1Config":
@@ -281,10 +430,7 @@ class Praxis1Config:
             head_dim=int(attention["head_dim"]),
             flex_block_size=int(attention.get("flex_block_size", 128)),
             attention_backend=str(attention.get("backend", "flash")),
-            num_experts=int(moe.get("num_experts", 0)),
-            num_routed_experts=int(moe.get("num_routed_experts", 0)),
-            top_k=int(moe.get("top_k", 0)),
-            expert_hidden=int(moe.get("expert_hidden", 0)),
+            **_moe_fields(moe),
             dense_ffn_hidden=int(backbone.get("dense_ffn_hidden", 0)),
             expert_dim=int(expert["dim"]),
             expert_layers=int(expert["num_layers"]),

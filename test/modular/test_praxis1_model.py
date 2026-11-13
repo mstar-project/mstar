@@ -28,7 +28,17 @@ DROID_CONFIG = {
         "num_registers": 4,
         "dense_ffn_hidden": 11520,
         "attention": {"num_heads": 24, "num_kv_heads": 8, "head_dim": 128, "flex_block_size": 128},
-        "moe": {"num_experts": 129, "num_routed_experts": 128, "top_k": 9, "expert_hidden": 1280},
+        # Both pairs, as the real configs carry them: 129 and 9 count the
+        # shared expert, 128 and 8 are what the router sees.
+        "moe": {
+            "num_experts": 129,
+            "num_routed_experts": 128,
+            "shared_expert": True,
+            "top_k": 9,
+            "top_k_routed": 8,
+            "expert_hidden": 1280,
+            "routed_scaling_factor": 2.5,
+        },
         "encoder": {
             "depth": 14,
             "tap_blocks": [0, 2, 4, 6, 7, 9, 11, 13],
@@ -133,6 +143,26 @@ def test_the_canvas_takes_the_views_to_latents():
         (lambda c: c["video"].update(views=["exterior"]), "views"),
         (lambda c: c["action_space"].update(dim=7), "action rows"),
         (lambda c: c["action_expert"].update(action_patch_dim=24), "action_patch_dim"),
+        # The MoE regime. dispatch_chunk_size is the one that matters in
+        # practice, since every published config sets it: see
+        # test_praxis1_moe_equivalence for the measurement behind the refusal.
+        (
+            lambda c: c["backbone"]["moe"].update(dispatch_chunk_size=16384),
+            "dispatch_chunk_size",
+        ),
+        (lambda c: c["backbone"]["moe"].update(shared_expert=False), "shared_expert"),
+        (lambda c: c["backbone"]["moe"].update(router_activation="softmax"), "router_activation"),
+        (lambda c: c["backbone"]["moe"].update(router_dtype="bfloat16"), "router_dtype"),
+        (
+            lambda c: c["backbone"]["moe"].update(routed_weight_layout="hidden_first"),
+            "routed_weight_layout",
+        ),
+        # The two pairs of expert counts have to differ by exactly the one
+        # shared expert. Anything else means a field is misunderstood.
+        (lambda c: c["backbone"]["moe"].update(top_k_routed=9), "may differ only by"),
+        (lambda c: c["backbone"]["moe"].update(num_routed_experts=100), "may differ only by"),
+        (lambda c: c["backbone"]["moe"].pop("top_k_routed"), "must state"),
+        (lambda c: c["backbone"]["moe"].pop("num_routed_experts"), "must state"),
     ],
 )
 def test_a_checkpoint_this_build_does_not_serve_is_refused(mutate, message):
@@ -141,6 +171,74 @@ def test_a_checkpoint_this_build_does_not_serve_is_refused(mutate, message):
     mutate(config)
     with pytest.raises(Praxis1ConfigError, match=message):
         Praxis1Config.from_dict(config)
+
+
+def test_the_router_sees_the_routed_counts_and_not_the_totals():
+    """128 of 8, never 129 of 9.
+
+    ``backbone.moe`` states both pairs, and the shared-expert-inclusive one is
+    what it calls ``num_experts`` and ``top_k``. Handing those to the MoE does
+    not raise: a 129-way router picking nine renormalizes nine gates to one and
+    returns the right shape, so the only symptom is a policy that is quietly
+    wrong. This asserts the config cannot be read that way by accident.
+    """
+    droid = Praxis1Config.from_dict(DROID_CONFIG)
+    assert (droid.num_routed_experts, droid.top_k_routed) == (128, 8)
+    assert (droid.num_experts_with_shared, droid.top_k_with_shared) == (129, 9)
+    # The totals exceed the routed counts by exactly the always-on expert.
+    assert droid.num_experts_with_shared == droid.num_routed_experts + 1
+    assert droid.top_k_with_shared == droid.top_k_routed + 1
+
+    # The short names are the ambiguous ones, so they do not exist. A caller
+    # reaching for one gets an AttributeError rather than a number off by one.
+    assert not hasattr(droid, "num_experts")
+    assert not hasattr(droid, "top_k")
+
+    # And the single place the layer's own naming is produced.
+    kwargs = droid.moe_kwargs()
+    assert (kwargs["num_experts"], kwargs["top_k"]) == (128, 8)
+    assert (kwargs["dim"], kwargs["hidden"]) == (3072, 1280)
+    assert kwargs["routed_scaling_factor"] == 2.5
+
+
+def test_the_totals_are_redundant_and_may_be_omitted():
+    """The routed pair is sufficient; the totals are derived when absent.
+
+    Negative control for the consistency check above: dropping the totals must
+    not change the routed numbers, which is what shows the check validates the
+    two readings against each other rather than picking one of them.
+    """
+    config = json.loads(json.dumps(DROID_CONFIG))
+    for redundant in ("num_experts", "top_k"):
+        config["backbone"]["moe"].pop(redundant)
+    terse = Praxis1Config.from_dict(config)
+    assert terse.moe_kwargs() == Praxis1Config.from_dict(DROID_CONFIG).moe_kwargs()
+    assert (terse.num_experts_with_shared, terse.top_k_with_shared) == (129, 9)
+
+
+def test_an_unset_dispatch_chunk_size_is_served():
+    """Negative control for the refusal: absent and explicit null both pass.
+
+    The refusal has to key on the field being *set*, not on it being present,
+    or a config that spells out the reference's own default would be rejected
+    for agreeing with us.
+    """
+    for value in ({}, {"dispatch_chunk_size": None}):
+        config = json.loads(json.dumps(DROID_CONFIG))
+        config["backbone"]["moe"].update(value)
+        assert Praxis1Config.from_dict(config).top_k_routed == 8
+
+
+@pytest.mark.parametrize("rig", ["single_arm", "bimanual"])
+def test_the_dummy_shape_splits_the_experts_the_same_way(rig):
+    """``for_rig`` builds the graph the startup checks run, so its expert
+    counts have to be the published ones or those checks size a router that
+    serving would never build."""
+    config = Praxis1Config.for_rig(rig)
+    assert config.num_experts_with_shared == config.num_routed_experts + 1
+    assert config.top_k_with_shared == config.top_k_routed + 1
+    kwargs = config.moe_kwargs()
+    assert (kwargs["num_experts"], kwargs["top_k"]) == (128, 8)
 
 
 def test_robot_io_matches_the_checkpoint(tmp_path, monkeypatch):

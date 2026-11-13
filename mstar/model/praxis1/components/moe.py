@@ -74,11 +74,39 @@ Not ported
 ----------
 
 The reference's chunked dispatch (``backbone.moe.dispatch_chunk_size``) is a
-*different* combine, not a memory-saving rearrangement of this one: it scales
-in float32 and rounds the routed sum once at the end. The published
-checkpoints set it to null, so this module implements the unchunked regime
-only and takes no chunk size, rather than offering a knob whose two settings
-give two different answers.
+*different* combine, not a memory-saving rearrangement of this one: it applies
+``routed_scaling_factor`` in float32 and rounds the routed sum once at the end.
+This module implements the unchunked regime only and takes no chunk size,
+rather than offering a knob whose two settings give two different answers.
+
+**This is a known gap, not a safe simplification.** ``null`` is the
+*reference's default*, not what the checkpoints carry: all four configs in the
+reference's ``tests/data`` (droid, droid-k, yam, base) set
+``dispatch_chunk_size`` to 16384. So no published checkpoint selects the path
+implemented here, and this module is bit-exact against a regime none of them
+runs.
+
+Nor is the chunk size a threshold a served batch stays under, which is the
+tempting reading and is wrong. The reference picks the path on
+``dispatch_chunk_size is not None`` alone, and the two paths differ in the
+combine rather than in the splitting: chunked multiplies the gate by
+``routed_scaling_factor`` in float32, sums the ``top_k`` rows in float32
+through four interleaved accumulators, and rounds once at the end, where this
+module gates in the row dtype, sums, and scales the sum. Measured against the
+reference on CPU, with 16384 so large that a single chunk covers the batch and
+no boundary is ever crossed, the two disagree at **every** row count tested,
+down to a single row: bf16 differs by up to 0.25 absolute, 2.8e-3 relative in
+RMS, on every row; float32 by about 4e-6 absolute, 7e-8 relative. That is the
+last bits of bf16 per element rather than a wrong answer per element, but it
+is not bit-exactness, it is systematic across every row and every MoE block,
+and bit-exactness is this port's whole acceptance bar.
+
+Until the chunked combine is implemented here as a second regime with its own
+parity tests, :func:`mstar.model.praxis1.config._moe_fields` refuses any
+checkpoint that sets the field, which today is all of them. The refusal is a
+placeholder for the work and not a judgement that the field is exotic: serving
+these weights on this path would run and quietly answer with a policy the
+reference does not produce.
 """
 
 from __future__ import annotations
@@ -231,9 +259,15 @@ class MoEFeedForward(nn.Module):
           -> * routed_scaling_factor + shared(x)
 
     ``num_experts`` and ``top_k`` here count the routed experts only: 128 and
-    8 for the published checkpoints. The config calls the same thing 129 and 9
-    because it counts the shared expert, which is always on and so is not
-    something the router picks.
+    8 for the published checkpoints, and the same naming the reference's own
+    layer uses. The checkpoint's ``backbone.moe`` calls the same two
+    quantities 129 and 9, because *its* ``num_experts`` and ``top_k`` count
+    the shared expert, which is always on and so is not something the router
+    picks; its routed pair is ``num_routed_experts`` and ``top_k_routed``.
+    Build this layer from :meth:`mstar.model.praxis1.config.Praxis1Config.moe_kwargs`
+    and not from fields chosen by name, because 129 and 9 do not fail here:
+    they route to a 129th bank the checkpoint never filled and hand every
+    token one expert too many.
     """
 
     expert_bias: torch.Tensor

@@ -31,6 +31,10 @@ Two measured notes, both recorded as tests rather than as comments:
 
 from __future__ import annotations
 
+import inspect
+import json
+from pathlib import Path
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -40,9 +44,11 @@ pytest.importorskip(
     reason="the Praxis-1 reference checkout is not on PYTHONPATH",
 )
 
+import praxis  # noqa: E402
 from praxis import layers as ref_layers  # noqa: E402
 
 from mstar.model.praxis1.components import moe as port_moe  # noqa: E402
+from mstar.model.praxis1.config import Praxis1Config, Praxis1ConfigError  # noqa: E402
 
 # Small, but every shape the real layer cares about is still distinct: the
 # hidden width is not the model width, 2 * hidden is not either, and there are
@@ -544,3 +550,193 @@ def test_renorm_epsilon_bites_only_at_vanishing_scores():
     total = picked.sum(-1, keepdim=True)
     assert total.item() < 1e-20
     assert not torch.equal(picked / total, picked / (total + 1e-20))
+
+
+# ---------------------------------------------------------------------------
+# The published configs: the routed counts, and the dispatch regime they ask
+# for. These read the reference's own checkpoint fixtures rather than a copy
+# of them in this file, because a copy is exactly how the port came to believe
+# dispatch_chunk_size was null.
+# ---------------------------------------------------------------------------
+
+_DATA = Path(praxis.__file__).resolve().parents[1] / "tests" / "data"
+_FIXTURES = ("praxis-1-base", "praxis-1-droid", "praxis-1-droid-k", "praxis-1-yam")
+# The servable ones. The base checkpoint has no action heads, so the config
+# reader refuses it before it ever reaches the MoE fields.
+_SERVABLE = ("praxis-1-droid", "praxis-1-droid-k", "praxis-1-yam")
+
+
+def _published(name: str) -> dict:
+    path = _DATA / f"{name}.json"
+    if not path.exists():
+        pytest.skip(f"the reference checkout has no {path}")
+    return json.loads(path.read_text())
+
+
+@pytest.mark.parametrize("name", _FIXTURES)
+def test_every_published_config_asks_for_the_chunked_dispatch(name):
+    """The premise this port was built on, checked against the fixtures.
+
+    The module docstring of the port used to say the published checkpoints set
+    ``dispatch_chunk_size`` to null and that the chunked combine was therefore
+    unreachable. ``null`` is the *reference's default*; every published config
+    sets 16384. This test exists so that claim can never be made again from
+    memory, and so that a checkpoint that really does leave it null shows up as
+    a change here rather than as silence.
+    """
+    moe = _published(name)["backbone"]["moe"]
+    assert moe["dispatch_chunk_size"] == 16384
+    # And both pairs of expert counts, which is the other thing a hand-copied
+    # fixture tends to lose.
+    assert (moe["num_experts"], moe["top_k"]) == (129, 9)
+    assert (moe["num_routed_experts"], moe["top_k_routed"]) == (128, 8)
+    assert moe["shared_expert"] is True
+    assert moe["routed_scaling_factor"] == 2.5
+
+
+@pytest.mark.parametrize("name", _SERVABLE)
+def test_a_published_config_is_refused_for_its_dispatch_chunk_size(name):
+    """Loudly, and naming the field, rather than falling through to this path.
+
+    Every published checkpoint fails here today. That is the honest state of
+    the port: it is bit-exact against the unchunked regime and no published
+    checkpoint selects it.
+    """
+    with pytest.raises(Praxis1ConfigError, match="dispatch_chunk_size"):
+        Praxis1Config.from_dict(_published(name))
+
+
+@pytest.mark.parametrize("name", _SERVABLE)
+def test_a_published_config_gives_the_layer_the_routed_counts(name):
+    """128 experts and top-8, read the way the reference reads them.
+
+    ``praxis.backbone`` builds its own ``MoEFeedForward`` from
+    ``moe["num_routed_experts"]`` and ``moe["top_k_routed"]``. This asserts our
+    config arrives at the same two numbers from the same file, so the port
+    cannot drift to the 129 and 9 that sit beside them under the names the
+    layer's own arguments use.
+    """
+    config = _published(name)
+    moe = config["backbone"]["moe"]
+    # Only the unported regime is in the way, so drop it to reach the counts.
+    del config["backbone"]["moe"]["dispatch_chunk_size"]
+    kwargs = Praxis1Config.from_dict(config).moe_kwargs()
+
+    assert kwargs["num_experts"] == moe["num_routed_experts"] == 128
+    assert kwargs["top_k"] == moe["top_k_routed"] == 8
+    assert kwargs["hidden"] == moe["expert_hidden"] == 1280
+    assert kwargs["routed_scaling_factor"] == moe["routed_scaling_factor"] == 2.5
+    assert kwargs["dim"] == config["backbone"]["dim"] == 3072
+    # The totals are the numbers that must not reach the layer.
+    assert kwargs["num_experts"] != moe["num_experts"]
+    assert kwargs["top_k"] != moe["top_k"]
+
+
+def test_moe_kwargs_are_the_arguments_both_layers_take():
+    """The accessor's names are the reference's constructor's names.
+
+    A structural check rather than a numerical one: it is what catches the
+    reference renaming ``top_k``, which would otherwise show up as our kwargs
+    silently landing in ``**kwargs`` or as a TypeError far from here. Bound
+    against both constructors, since the port's signature tracks the
+    reference's on purpose.
+    """
+    kwargs = Praxis1Config.for_rig("single_arm").moe_kwargs()
+    for layer in (ref_layers.MoEFeedForward, port_moe.MoEFeedForward):
+        bound = inspect.signature(layer.__init__).bind_partial(None, **kwargs)
+        assert bound.arguments["num_experts"] == 128
+        assert bound.arguments["top_k"] == 8
+
+
+def test_the_shared_inclusive_counts_build_a_layer_that_does_not_complain():
+    """Why the config refuses to answer to ``num_experts`` at all.
+
+    This is the failure the naming exists to prevent, shown rather than
+    described: build the reference layer from the totals instead of the routed
+    pair and nothing raises. The router is one expert wider, every token takes
+    one expert more, the gates still sum to one and the output still has the
+    right shape. The extra bank is one the checkpoint never filled, because the
+    shared expert lives in its own tensors.
+    """
+    routed = ref_layers.MoEFeedForward(DIM, MOE_HIDDEN, NUM_EXPERTS, TOP_K, SCALE)
+    totals = ref_layers.MoEFeedForward(DIM, MOE_HIDDEN, NUM_EXPERTS + 1, TOP_K + 1, SCALE)
+    for layer, experts, k in ((routed, NUM_EXPERTS, TOP_K), (totals, NUM_EXPERTS + 1, TOP_K + 1)):
+        _fill(layer, seed=0)
+        assert layer.router.weight.shape[0] == experts
+        assert layer.routed.gate_up_weight.shape[0] == experts
+        assert layer.top_k == k
+
+    x = _rand((6, DIM), seed=11, dtype=torch.float32)
+    with torch.no_grad():
+        # Same shape out, and the gates of the wider one still renormalize.
+        assert totals(x).shape == routed(x).shape
+        _, gate = totals._route(x)
+        assert gate.shape[1] == TOP_K + 1
+        torch.testing.assert_close(gate.sum(-1), torch.ones(6))
+    # The weights of the two cannot be exchanged, which is the only loud part
+    # of this failure and it only fires if a loader is strict.
+    with pytest.raises(RuntimeError):
+        totals.load_state_dict(routed.state_dict())
+
+
+# ---------------------------------------------------------------------------
+# The chunked dispatch: measured, not reasoned about
+# ---------------------------------------------------------------------------
+
+PUBLISHED_CHUNK = 16384
+
+
+def _reference_with_chunk(chunk, dtype, bias, seed: int = 0):
+    """A reference MoE with a dispatch chunk size, weights fixed by ``seed``."""
+    ref = ref_layers.MoEFeedForward(DIM, MOE_HIDDEN, NUM_EXPERTS, TOP_K, SCALE, chunk)
+    _fill(ref, seed)
+    with torch.no_grad():
+        ref.expert_bias.copy_(bias)
+    return ref.to(dtype).eval()
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("rows", [1, 40, 512])
+def test_a_single_chunk_is_not_the_unchunked_path(dtype, rows):
+    """The tempting reading of ``dispatch_chunk_size`` is that a served batch
+    stays under it and the chunked path reduces to this one. It does not.
+
+    The reference picks the path on ``dispatch_chunk_size is not None`` alone,
+    and the two paths differ in the *combine*: chunked multiplies the gate by
+    ``routed_scaling_factor`` in float32, sums the ``top_k`` rows in float32
+    through four interleaved accumulators and rounds once at the end, where the
+    unchunked path gates in the row dtype, sums, and scales the sum. Every row
+    count here is far below 16384, so no chunk boundary is ever crossed, and
+    the answers still differ. One row is enough.
+
+    This is the test that says the refusal in the config reader is a missing
+    feature and not a guard against an exotic setting.
+    """
+    assert rows < PUBLISHED_CHUNK  # a single chunk, by construction
+    bias = _spread_bias()
+    unchunked = _reference_with_chunk(None, dtype, bias)
+    chunked = _reference_with_chunk(PUBLISHED_CHUNK, dtype, bias)
+    x = _rand((rows, DIM), seed=41, dtype=dtype)
+    with torch.no_grad():
+        want, got = unchunked(x), chunked(x)
+    assert got.shape == want.shape and got.dtype == want.dtype
+    assert not torch.equal(got, want)
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_our_port_is_the_unchunked_regime_exactly(dtype):
+    """The other half of the finding above, and the reason it is a gap rather
+    than a bug: the port is bit-exact against the unchunked reference and
+    bit-different from the chunked one. So there is nothing wrong with what it
+    computes, only with which of the two regimes it computes."""
+    bias = _spread_bias()
+    unchunked = _reference_with_chunk(None, dtype, bias)
+    chunked = _reference_with_chunk(PUBLISHED_CHUNK, dtype, bias)
+    port = port_moe.MoEFeedForward(DIM, MOE_HIDDEN, NUM_EXPERTS, TOP_K, SCALE)
+    port.load_state_dict(unchunked.state_dict())
+    port = port.to(dtype).eval()
+
+    x = _rand((64, DIM), seed=42, dtype=dtype)
+    with torch.no_grad():
+        assert torch.equal(port(x), unchunked(x))
+        assert not torch.equal(port(x), chunked(x))
