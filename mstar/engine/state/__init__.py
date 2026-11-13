@@ -23,6 +23,7 @@ from mstar.engine.state.calls import (
     rope,
     sample,
     scatter,
+    settle,
     split_range,
 )
 from mstar.engine.state.contract import (
@@ -108,6 +109,7 @@ __all__ = [
     "rope",
     "sample",
     "scatter",
+    "settle",
     "split_range",
     "state_op",
 ]

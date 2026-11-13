@@ -3,6 +3,7 @@ storage and op type, and a handle per storage. It builds the specs, steps and la
 
 import dataclasses
 import functools
+import os
 from abc import ABC, abstractmethod
 from collections import Counter
 from collections.abc import Callable, Collection, Mapping, Sequence
@@ -70,7 +71,7 @@ from mstar.engine.state.analysis import (
     shard_axis,
     written_by_step,
 )
-from mstar.engine.state.calls import ArrayHandle, SamplerHandle, ShardHandle, pool_layers, segments_of
+from mstar.engine.state.calls import ArrayHandle, SamplerHandle, ShardHandle, VerifyRun, pool_layers, segments_of
 from mstar.engine.state.contract import (
     EMPTY,
     Array,
@@ -108,6 +109,11 @@ from mstar.model.components.diffusion.attention import FrameSDPA, joint_attentio
 if TYPE_CHECKING:
     from mstar.engine.state.state_op import StateOp
     from mstar.model.base import LabelLayout, Model
+
+
+# Off by default: `settle` reads each eager verify step's counts back to the host to check their range, which waits
+# for the step.
+_DEBUG_ASSERTS = os.environ.get("MSTAR_KV_DEBUG_ASSERTS", "0") == "1"
 
 
 def node_resources(model: "Model", *, setup: "StateSetup | None" = None) -> list[NodeResourceSpec]:
@@ -616,11 +622,20 @@ def sampling_configs(
 # Bindings
 
 
+@dataclass(frozen=True)
+class Verify:
+    """The key of an array's verify steps in `BINDINGS`, bound after its positions where its ``verify_span``,
+    ``span``, is above 1."""
+
+    span: int
+
+
 class BoundOp(NamedTuple):
-    """One of an array's reads or updates, or its positions, under its key, with the binding that runs it."""
+    """One of an array's reads or updates, its positions or its verify steps, under its key, with the binding that
+    runs it."""
 
     key: str
-    declared: Read | Op | Positions
+    declared: Read | Op | Positions | Verify
     binding: "OpBinding"
 
 
@@ -1022,6 +1037,154 @@ class _Counter:
 
     def apply_qk(self, q: torch.Tensor, k: torch.Tensor, *, label: str, rope_dtype: torch.dtype) -> tuple:
         raise _no_layout(self._array, "rope(), and its positions declare no Rope")
+
+
+class Rewind(OpBinding):
+    """Verify steps on a paged pool. The pool keeps each verify block whole, and the KV and position resources each
+    move their stream back by what its row didn't keep, before anything reads its length again."""
+
+    def check(self, array: Array, key: str, verify: Verify) -> None:
+        windowed = sorted(name for name, read in array.reads.items() if isinstance(read.mask, Window))
+        if windowed:
+            raise _no_layout(array, f"verify_span {verify.span} beside Window reads {windowed}, whose pool keeps KV "
+                                    "groups, and `KVManager.correct_len` moves no grouped stream")
+
+    def resource(self, array: Array, key: str) -> str:
+        return array.name
+
+    def attach(self, handle: ArrayHandle, key: str, run: Any) -> None:
+        """Give ``handle`` the run of its verify steps over ``run``, the array's pool."""
+        handle.verify = RewindRun(handle, run)
+
+
+class _CountTable:
+    """A verify step's counts on the host, row 0 the step's number and row r the count of its row r, copied there
+    from ``staging`` on the device by a copy a capture records."""
+
+    def __init__(self, rows: int, device: torch.device):
+        self.rows = rows
+        self.host = torch.zeros(rows + 1, dtype=torch.int64, pin_memory=device.type == "cuda")
+        self.staging = torch.zeros(rows, dtype=torch.int64, device=device)
+
+
+class _Counts:
+    """A verify step's counts, read from its table once, when the first of its rows is applied."""
+
+    def __init__(self, table: _CountTable, number: int, spans: tuple[int, ...], done: torch.cuda.Event | None):
+        self._table, self._number, self._spans, self._done = table, number, spans, done
+        self._kept: list[int] | None = None
+
+    def delta(self, row: int) -> int:
+        if self._kept is None:
+            if self._done is not None:
+                self._done.synchronize()
+            number = int(self._table.host[0])
+            if number != self._number:
+                raise RuntimeError(f"the count table of verify step {self._number} was overwritten by step {number} "
+                                   "before its counts were applied")
+            self._kept = self._table.host[1:len(self._spans) + 1].tolist()
+        return self._kept[row] - self._spans[row]
+
+
+class _RowCount(NamedTuple):
+    """One row's `Correction`: minus the entries of its verify block it didn't keep."""
+
+    counts: _Counts
+    row: int
+
+    def delta(self) -> int:
+        return self.counts.delta(self.row)
+
+
+class RewindRun(VerifyRun):
+    """The verify steps of a paged array. Each settles into a count table on the host: one per capture slot, made at
+    capture, and two for eager steps, by the parity of the step's number."""
+
+    def __init__(self, handle: ArrayHandle, kv: Any):
+        super().__init__(handle)
+        self._kv = kv
+        self._device = kv.layer_view(0).device
+        self._tables: dict[tuple, _CountTable] = {}
+        self._number = 0
+        # this step's table while it verifies, its segments and its context
+        self._table: _CountTable | None = None
+        self._segments: Sequence[Segment] = ()
+        self._ctx = None
+        self._settled = False
+
+    def begin(self, declared: ArrayStep, segments: Sequence[Segment], ctx) -> None:
+        self._table = None
+        if not declared.verify:
+            return
+        refusal = self.handle._refusal
+        if ctx.repeats > 1:
+            raise refusal(f"a verify step whose capture replays {ctx.repeats} times, and its count table holds one "
+                          "step's counts")
+        if not ctx.replays:
+            self._check(declared, segments)
+        lease = ctx.slot_lease
+        captured = lease is not None and lease.bucket is not None
+        key = (lease.slot, lease.bucket) if captured else ("eager", (self._number + 1) % 2)
+        table = self._tables.get(key)
+        if table is None or (not captured and table.rows < len(segments)):
+            table = self._tables[key] = _CountTable(len(segments), self._device)
+        elif table.rows < len(segments):
+            raise refusal(f"a verify step of {len(segments)} rows on capture slot {lease.slot}, and its slot's count "
+                          f"table holds {table.rows}")
+        self._number += 1
+        # a capture leaves the number to its replays, each of which writes its own before its launch
+        if not ctx.capture:
+            table.host[0] = self._number
+        self._table, self._segments, self._ctx, self._settled = table, segments, ctx, False
+
+    def _check(self, declared: ArrayStep, segments: Sequence[Segment]) -> None:
+        refusal = self.handle._refusal
+        if not declared.keep or declared.forks or declared.placeholders:
+            raise refusal("a verify step with keep=False, forks or placeholders, and a settle cuts only the blocks a "
+                          "step keeps on the streams it adds to")
+        span = self.handle.array.verify_span
+        for segment in segments:
+            if not 1 <= segment.span <= span:
+                raise refusal(f"a verify step adds {segment.span} entries for row {segment.request_id}, and a verify "
+                              f"block holds 1 to verify_span {span}")
+        if len({segment.label for segment in segments}) > 1:
+            raise refusal("a verify step over several labels, and its count table holds one row per request")
+
+    def settle(self, kept: torch.Tensor) -> None:
+        refusal = self.handle._refusal
+        if self._table is None:
+            raise refusal("settle on a step that doesn't verify")
+        if self._settled:
+            raise refusal("a second settle in one verify step")
+        rows = len(self._segments)
+        if _DEBUG_ASSERTS and not self._ctx.capture:
+            for segment, count in zip(self._segments, kept[:rows].tolist(), strict=True):
+                if self._ctx.is_real_row(segment.request_id) and not 1 <= count <= segment.span:
+                    raise refusal(f"settle keeps {count} entries of row {segment.request_id}, whose verify block "
+                                  f"holds {segment.span}")
+        self._settled = True
+        self._table.staging[:rows].copy_(kept[:rows])
+        self._table.host[1:rows + 1].copy_(self._table.staging[:rows], non_blocking=True)
+
+    def end(self, ctx) -> None:
+        if self._table is not None and not self._settled:
+            raise self.handle._refusal("a verify step ends with no settle, and its pages keep every entry it added")
+
+    def commit(self, ctx) -> None:
+        if self._table is None or ctx.capture:
+            return
+        done = None
+        if self._device.type == "cuda":
+            done = torch.cuda.Event()
+            done.record()
+        counts = _Counts(self._table, self._number, tuple(segment.span for segment in self._segments), done)
+        positions = self.handle.positions
+        for row, segment in enumerate(self._segments):
+            if ctx.is_real_row(segment.request_id):
+                count = _RowCount(counts, row)
+                self._kv.defer_correct_len(segment.request_id, segment.label, count)
+                if positions is not None:
+                    positions.defer_correct_len(segment.request_id, segment.label, count)
 
 
 class WithinStepAttend(OpBinding, ABC):
@@ -2540,16 +2703,18 @@ def storage_of(array: Array) -> Storage:
 # `Attend` is an `AttentionSpec` on a paged array, a `CrossAttentionSpec` on one read with another array's queries and a
 # `RaggedAttentionSpec` within a step, so a binding is per storage and op type. A field of a read's mask can still swap
 # the binding, through `OpBinding.for_mask`, as a kept window does, and the `SDPA` table below is the deployment's swap.
-BINDINGS: dict[tuple[Storage, type[Op | Positions | None]], OpBinding] = {
+BINDINGS: dict[tuple[Storage, type[Op | Positions | Verify | None]], OpBinding] = {
     (PAGED, Attend): PagedAttend(),
     (PAGED, type(None)): PagedNoOp(),
     (PAGED, Positions): PositionsBinding(),
+    (PAGED, Verify): Rewind(),
     (PAGED_BY_WALK, Attend): PagedAttend(),
     (PAGED_BY_WALK, Positions): PositionsBinding(),
     (PAGED_CROSS, Attend): PagedCrossAttend(),
     (PAGED_CROSS, Positions): PositionsBinding(),
     (LATENT, LatentAttend): PagedLatentAttend(),
     (LATENT, Positions): PositionsBinding(),
+    (LATENT, Verify): Rewind(),
     (RING, Attend): FlexAttend(),
     (RING, Positions): CounterPositions(),
     (WITHIN_STEP, Attend): RaggedAttend(),
@@ -2586,9 +2751,9 @@ def _default_binding(storage: Storage, read: Read) -> OpBinding | None:
 def _bindings(
     storage: Storage, array: Array, chosen: Mapping[str, OpBinding] = EMPTY,
 ) -> tuple[BoundOp, ...]:
-    """``array``'s reads, then its updates, then its positions, each with the binding that runs it on ``storage``:
-    ``chosen``'s for a read it names, and `BINDINGS`' for the rest. Each binding checks its op. Refuses a pair
-    `BINDINGS` has no entry for, and a second update of one type."""
+    """``array``'s reads, then its updates, then its positions and its verify steps, each with the binding that runs it
+    on ``storage``: ``chosen``'s for a read it names, and `BINDINGS`' for the rest. Each binding checks its op.
+    Refuses a pair `BINDINGS` has no entry for, and a second update of one type."""
     bound = []
     for key, read in array.reads.items():
         binding = _default_binding(storage, read)
@@ -2610,6 +2775,12 @@ def _bindings(
         if binding is None:
             raise _no_layout(array, "positions, which only an append-only array that keeps entries holds")
         bound.append(BoundOp(position_key(array), array.positions, binding))
+    if array.verify_span > 1:
+        binding = BINDINGS.get((storage, Verify))
+        if binding is None:
+            raise _no_layout(array, f"verify_span {array.verify_span}, which today's resources settle on no "
+                                    f"{type(storage).__name__}")
+        bound.append(BoundOp(array.name, Verify(array.verify_span), binding))
     for each in bound:
         each.binding.check(array, each.key, each.declared)
     return tuple(bound)

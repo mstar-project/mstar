@@ -310,7 +310,7 @@ class Rope:
 class Positions:
     """Each row's position on the array, which the model rotates or embeds its next tokens at. It reads no entries,
     and it lives on the host and moves when a step is planned: by the row's span, by ``ArrayStep.advance`` or by
-    ``ArrayStep.position_ids``. It forks and takes prefix hits with its array."""
+    ``ArrayStep.position_ids``, and back by a verify step's settle. It forks and takes prefix hits with its array."""
 
     rope: Rope | None = None    # None: a counter only
 
@@ -337,6 +337,7 @@ class Array:
     rewritable: bool = False
     labels: frozenset[str] = frozenset({"main"})
     positions: Positions | None = None
+    verify_span: int = 1    # the most entries one verify step adds per row (1: no verify step)
 
     def __post_init__(self):
         object.__setattr__(self, "nodes", frozenset(self.nodes))
@@ -355,6 +356,10 @@ class Array:
             raise ValueError(f"{where}.labels must be non-empty")
         if not (type(self.max_len) is int and self.max_len >= 0):
             raise ValueError(f"{where}.max_len must be an int >= 0, got {self.max_len!r}")
+        if not _is_positive(self.verify_span):
+            raise ValueError(f"{where}.verify_span must be a positive int, got {self.verify_span!r}")
+        if self.verify_span > 1 and not self.max_len:
+            raise ValueError(f"{where}.verify_span: max_len 0 keeps nothing for a verify step to settle")
         self._check_entry()
         for key, read in self.reads.items():
             self._check_read(key, read)
@@ -536,6 +541,7 @@ class ArrayStep:
     advance: tuple[int, ...] | None = None         # positions per row; None: the span
     position_ids: torch.Tensor | None = None       # explicit ids, (tokens,) in segment order
     host: Mapping[tuple[int, str, int], Mapping[str, object]] = EMPTY    # (row, label, layer) -> fields, at commit
+    verify: bool = False                           # each row's adds are a verify block, which `settle` cuts
 
 
 @dataclass(frozen=True, kw_only=True)

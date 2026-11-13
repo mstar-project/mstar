@@ -25,7 +25,7 @@ _POSITIONAL = {"PagedNHDTarget", "Segment", "SlotLease", "Span"}
 # The calls take the handle first, then what every call names, and only then keywords.
 _CALLS = {
     "add_read", "at_last_token", "causal_conv", "gated_delta_net", "gather", "host", "last_sampled", "position",
-    "positions", "rope", "sample", "scatter", "split_range",
+    "positions", "rope", "sample", "scatter", "settle", "split_range",
 }
 # Each public name's parameters as ``[name, kind, default]``. A dataclass's parameters are its fields.
 SNAPSHOT = {
@@ -40,6 +40,7 @@ SNAPSHOT = {
         ["rewritable", "KEYWORD_ONLY", 'False'],
         ["labels", "KEYWORD_ONLY", "frozenset({'main'})"],
         ["positions", "KEYWORD_ONLY", 'None'],
+        ["verify_span", "KEYWORD_ONLY", '1'],
     ],
     "ArrayStep": [
         ["segments", "KEYWORD_ONLY", 'None'],
@@ -51,6 +52,7 @@ SNAPSHOT = {
         ["advance", "KEYWORD_ONLY", 'None'],
         ["position_ids", "KEYWORD_ONLY", 'None'],
         ["host", "KEYWORD_ONLY", '{}'],
+        ["verify", "KEYWORD_ONLY", 'False'],
     ],
     "Attend": [
         ["q_heads", "POSITIONAL_OR_KEYWORD", None],
@@ -285,6 +287,10 @@ SNAPSHOT = {
         ["h", "POSITIONAL_OR_KEYWORD", None],
         ["xs", "VAR_POSITIONAL", None],
         ["dim", "KEYWORD_ONLY", "None"],
+    ],
+    "settle": [
+        ["h", "POSITIONAL_OR_KEYWORD", None],
+        ["kept", "POSITIONAL_OR_KEYWORD", None],
     ],
     "split_range": [
         ["h", "POSITIONAL_OR_KEYWORD", None],
