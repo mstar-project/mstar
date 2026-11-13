@@ -22,6 +22,7 @@ from test_rust_frontend import BINARY, _free_port, _wait_healthy
 
 from mstar.api_server import entrypoint, openpi
 from mstar.api_server.positronic import PositronicPolicy
+from mstar.api_server.positronic_input import decode_praxis_frame
 from mstar.api_server.request_types import ResultChunk
 from mstar.api_server.rust_frontend import RustFrontendBridge, positronic_facts
 
@@ -141,12 +142,12 @@ def _normalise(messages):
     return messages
 
 
-def python_session(stub):
+def python_session(stub, make_frame=frame):
     entrypoint.api_server = stub
     with TestClient(entrypoint.app).websocket_connect("/api/v1/session") as ws:
         messages = [msgpack.unpackb(ws.receive_bytes()) for _ in range(2)]
         id = messages[1]["session_id"]
-        for data in (frame(id), frame(id), frame(id, reset_context=True)):
+        for data in (make_frame(id), make_frame(id), make_frame(id, reset_context=True)):
             ws.send_bytes(data)
             messages.append(msgpack.unpackb(ws.receive_bytes()))
         ws.send_bytes(msgpack.packb({"session_id": id, "end_session": True}))
@@ -154,11 +155,11 @@ def python_session(stub):
     return messages
 
 
-def rust_session(port):
+def rust_session(port, make_frame=frame):
     with websockets.sync.client.connect(f"ws://127.0.0.1:{port}/api/v1/session", compression=None) as ws:
         messages = [msgpack.unpackb(ws.recv()) for _ in range(2)]
         id = messages[1]["session_id"]
-        for data in (frame(id), frame(id), frame(id, reset_context=True)):
+        for data in (make_frame(id), make_frame(id), make_frame(id, reset_context=True)):
             ws.send(data)
             messages.append(msgpack.unpackb(ws.recv()))
         ws.send(msgpack.packb({"session_id": id, "end_session": True}))
@@ -189,23 +190,41 @@ def test_praxis_mode_sends_same_original_observation_to_shared_data_worker():
     stub.positronic_policy = PositronicPolicy(
         {"robot": "stub"}, observation_format="praxis1", control_mode="droid_impedance",
     )
+    def stacked_frame(session_id, **extra):
+        images = np.stack([np.full((4, 6, 3), n, np.uint8) for n in (10, 20, 30, 40)])
+        return frame(
+            session_id, **{
+                "image.exterior": images,
+                "image.wrist": images + 1,
+                "robot_state.ee_pose": np.array([[0, 0, n, 1, 0, 0, 0] for n in (0.1, 0.2, 0.3, 0.4)], np.float32),
+                "grip": np.array([0.1, 0.2, 0.3, 0.4], np.float32),
+                "descriptor": "remote.robolab.droid", **extra,
+            },
+        )
+
     with rust(stub) as port:
-        python_session(stub)
-        py = stub.submissions[0]
+        python_session(stub, stacked_frame)
+        py_submissions = list(stub.submissions)
         stub.submissions.clear()
-        rust_session(port)
-        rs = stub.submissions[0]
-    for submission in (py, rs):
-        assert submission["input_modalities"] == ["image", "text"]
-        assert submission["model_kwargs"]["control_mode"] == "droid_impedance"
-        assert isinstance(submission["positronic_frame"], bytes)
-        parsed = msgpack.unpackb(submission["positronic_frame"], raw=False)
-        assert parsed["session_id"] == submission["episode"]
-        assert parsed["observation"]["prompt"] == "go"
-        assert b"__ndarray__" in parsed["observation"]["state"]
-    assert py["positronic_frame"].replace(py["episode"].encode(), b"ID") == rs["positronic_frame"].replace(
-        rs["episode"].encode(), b"ID"
-    )
+        rust_session(port, stacked_frame)
+        rs_submissions = list(stub.submissions)
+    assert len(py_submissions) == len(rs_submissions) == 3
+    for py, rs in zip(py_submissions, rs_submissions, strict=True):
+        for submission in (py, rs):
+            assert submission["input_modalities"] == ["image", "text"]
+            assert submission["model_kwargs"]["control_mode"] == "droid_impedance"
+            parsed = msgpack.unpackb(submission["positronic_frame"], raw=False)
+            assert parsed["session_id"] == submission["episode"]
+            assert parsed["observation"]["prompt"] == "go"
+            assert b"__ndarray__" in parsed["observation"]["image.exterior"]
+            decoded = decode_praxis_frame(submission["positronic_frame"], "single_arm")
+            assert [int(image[0, 0, 0]) for image in decoded.images] == [40, 41]
+            assert decoded.robot_state[2] == pytest.approx(0.4)
+        assert py["positronic_frame"].replace(py["episode"].encode(), b"ID") == rs["positronic_frame"].replace(
+            rs["episode"].encode(), b"ID"
+        )
+    assert [s["reset_episode"] for s in py_submissions] == [False, False, True]
+    assert [s["reset_episode"] for s in rs_submissions] == [False, False, True]
 
 
 def test_wrong_session_id_fails_and_ends_once():
