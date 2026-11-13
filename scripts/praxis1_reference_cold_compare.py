@@ -53,7 +53,12 @@ def main() -> None:
                 "descriptor": str(capture["descriptor"]),
             }
             prompt = str(capture["prompt"])
-            seed = 0
+            seed = int(capture["seed"]) if "seed" in capture.files else 0
+            metadata = json.loads(str(capture["meta"]))
+            if metadata.get("code_version") != args.mstar_revision:
+                raise ValueError("captured M* revision differs from --mstar-revision")
+            if metadata.get("max_context_chunks") != 0:
+                raise ValueError("paired comparison requires a cold-only M* capture")
     else:
         actual = np.load(args.mstar_actions, allow_pickle=False)
         random = np.random.default_rng(71)
