@@ -9,6 +9,7 @@ The production weight loader is still required before serving is enabled.
 from __future__ import annotations
 
 import logging
+from collections import OrderedDict
 
 import torch
 from torch import nn
@@ -100,11 +101,37 @@ class Praxis1TextEncoderSubmodule(_Praxis1Node):
     # hidden_states[-3] even with the same token IDs and frozen weights.
     disable_autocast = True
     float32_matmul_precision = "highest"
+    CACHE_MAX_ENTRIES = 64
+    CACHE_MAX_BYTES = 32 * 1024 * 1024
 
     def __init__(self, config: Praxis1Config, encoder: nn.Module) -> None:
         super().__init__(config)
         self.encoder = encoder
+        self._text_cache: OrderedDict[tuple, tuple[torch.Tensor, int]] = OrderedDict()
+        self._text_cache_bytes = 0
+        self.encoder.register_load_state_dict_post_hook(self._encoder_weights_loaded)
         self._check(encoder)
+
+    def _clear_text_cache(self) -> None:
+        self._text_cache.clear()
+        self._text_cache_bytes = 0
+
+    def _apply(self, fn, recurse=True):
+        self._clear_text_cache()
+        return super()._apply(fn, recurse)
+
+    def _encoder_weights_loaded(self, module, incompatible_keys) -> None:
+        del module, incompatible_keys
+        self._clear_text_cache()
+
+    def train(self, mode: bool = True):
+        self._clear_text_cache()
+        return super().train(mode)
+
+    @staticmethod
+    def _token_key(tensor: torch.Tensor) -> tuple[torch.dtype, tuple[int, ...], bytes]:
+        cpu = tensor.detach().to("cpu").contiguous()
+        return cpu.dtype, tuple(cpu.shape), cpu.numpy().tobytes()
 
     def _check(self, encoder: nn.Module) -> None:
         """Refuse a text encoder the checkpoint cannot have been trained on.
@@ -174,6 +201,14 @@ class Praxis1TextEncoderSubmodule(_Praxis1Node):
         the final norm. The last hidden state is a different tensor.
         """
         device = self.get_device()
+        cacheable = (not self.encoder.training and not torch.is_grad_enabled() and
+                     not torch.is_autocast_enabled(device.type))
+        key = (torch.get_float32_matmul_precision(), self._token_key(ids),
+               self._token_key(mask)) if cacheable else None
+        if key is not None and key in self._text_cache:
+            self._text_cache.move_to_end(key)
+            return self._text_cache[key][0].clone()
+
         ids, mask = ids.to(device), mask.to(device)
         if ids.dim() == 1:
             ids, mask = ids[None], mask[None]
@@ -184,7 +219,19 @@ class Praxis1TextEncoderSubmodule(_Praxis1Node):
             use_cache=False,
         ).hidden_states[self.config.text_hidden_layer]
         length = int(mask.sum(dim=-1)[0])
-        return states[:1, :length]
+        result = states[:1, :length]
+        if key is not None:
+            key_bytes = sum(len(part[2]) for part in key[1:])
+            size = key_bytes + result.numel() * result.element_size()
+            if self.CACHE_MAX_ENTRIES > 0 and size <= self.CACHE_MAX_BYTES:
+                retained = result.detach().clone()
+                while (len(self._text_cache) >= self.CACHE_MAX_ENTRIES or
+                       self._text_cache_bytes + size > self.CACHE_MAX_BYTES):
+                    _, (_, released) = self._text_cache.popitem(last=False)
+                    self._text_cache_bytes -= released
+                self._text_cache[key] = (retained, size)
+                self._text_cache_bytes += size
+        return result
 
 
 class Praxis1VaeEncoderSubmodule(_Praxis1Node):
