@@ -971,15 +971,16 @@ class PagedArrayHandle(ArrayHandle):
 
     def _write_unread(self) -> None:
         """Write the held add of a layer the step didn't read where its write waits for the read's exchange, so
-        each add is written once: when the next add or the step's check finds it still held."""
+        each add is written once: when the next add or the step's check finds it still held. A kernel that takes k
+        and v at the read has no write to make, so its add stays held."""
         layer = self._held_layer
-        if layer is not None and _exchanges(self._attn[layer], self.label):
+        if layer is not None and _exchanges(self._attn[layer], self.label) and self._attn[layer].requires_kv_write:
             self._write(layer, *self._take_hold(layer))
 
     def _unwritten(self) -> bool:
-        """Whether no page holds the held add: its kernel takes k and v at the read, and no exchange writes them."""
+        """Whether no page holds the held add: its kernel takes k and v at the read."""
         attn = self._attn.get(self._held_layer)
-        return attn is not None and not attn.requires_kv_write and not _exchanges(attn, self.label)
+        return attn is not None and not attn.requires_kv_write
 
     def _needs_step_kv(self, attn: Any) -> bool:
         """Whether a read through ``attn`` attends the step's own k and v rather than only the pages, or goes through
