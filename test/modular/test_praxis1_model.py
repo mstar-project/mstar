@@ -215,6 +215,7 @@ def test_droid_session_config_is_sized_and_gated(tmp_path, monkeypatch):
     assert validate_deployment(model, shipped, str(config_path))
     policy = PositronicPolicy.from_config(shipped["positronic"], model)
     assert policy.observation_format == "praxis1"
+    assert policy.control_mode == "droid_impedance"
     assert policy.meta["checkpoint"] == "runwayml/praxis-1-droid"
     assert policy.meta["max_context_chunks"] == defaults["max_context_chunks"] == 1
 

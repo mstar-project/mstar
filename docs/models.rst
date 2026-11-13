@@ -113,7 +113,8 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
        latents and 6 action tokens. Both rigs have a cold openpi adapter returning 21
        denormalized relative Cartesian action rows at 15 Hz. DROID also has a
        Positronic session adapter that retains executed frames and returns 24
-       pose-composed command rows after the first call. The cold openpi parity target
+       pose-composed command rows after the first call, with the DROID impedance
+       control mode. The cold openpi parity target
        is the reference's ``context_mode=stateless``, which it documents for debugging.
        The backbone denoises the video over a few Euler steps and the action expert denoises the
        actions from its hidden states each step.
