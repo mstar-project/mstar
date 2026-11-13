@@ -1,0 +1,17 @@
+model: "minimax_h3"
+
+# See minimax_h3.yaml.
+max_seq_len: 8192
+
+# MiniMax-H3 (FL2VA) on one 275 GB GPU (B300): all five nodes on rank 0, ~125 GB in use at
+# 1344x768x124. Dense, a 50-point clip takes 126.5 s there (SGLang 122.9 s, vLLM-Omni 135.8 s).
+# For 2.35x at SSIM 0.82 add the step cache, opt-in and lossy (docs/models.rst):
+#   step_cache: {mag_ratios: "1344x768x124", threshold: 0.06, max_skip_steps: 3}
+model_kwargs:
+  compile: true
+  vae_tile_batch: 28
+  vae_compile: true
+
+node_groups:
+  - node_names: [dit, text_encoder, vae_encoder, vae_decoder, audio_decoder]
+    ranks: [0]
