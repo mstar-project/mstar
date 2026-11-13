@@ -60,7 +60,7 @@ from __future__ import annotations
 
 import functools
 import threading
-from collections import OrderedDict, deque
+from collections import OrderedDict
 from collections.abc import Hashable, Mapping, Sequence
 from concurrent.futures import Future
 from dataclasses import dataclass
@@ -190,9 +190,11 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         self.max_uncaptured_layouts = int(max_uncaptured_layouts)
         # Draws seeds ahead under PREFETCH_SEEDS; built on first use.
         self._seed_pool: ThreadPool | None = None
-        # One draw per request, as ((bucket key, seed), future), oldest first. An entry goes when taken or evicted.
+        # One draw per request, request id -> ((bucket key, seed), future), oldest first. An entry goes when taken,
+        # when its request is removed (one cancelled before iteration 0 never takes it), or past max_seed_draws.
         # Under a lock, since a request's arrival adds to it on the main thread and iteration 0 takes on the GPU's.
-        self._seed_draws: deque[tuple[tuple[Hashable, int], Future]] = deque(maxlen=_MEMO_ENTRIES)
+        self._seed_draws: OrderedDict[Hashable, tuple[tuple[Hashable, int], Future]] = OrderedDict()
+        self.max_seed_draws = _MEMO_ENTRIES
         self._seed_lock = threading.Lock()
         # Keyed by `schedule_for`'s inputs: the schedule, and the tensors `prepare_inputs` and the solver read on the
         # device.
@@ -265,7 +267,17 @@ class DenoiseLoopSubmodule(NodeSubmodule):
             self._seed_pool = ThreadPool(max_workers=2, thread_name_prefix="mstar-seed")
         draw = self._seed_pool.submit(self._draw_seeds, bucket_key, seed)
         with self._seed_lock:
-            self._seed_draws.append(((bucket_key, seed), draw))
+            self._seed_draws[request_id] = ((bucket_key, seed), draw)
+            while len(self._seed_draws) > self.max_seed_draws:
+                self._seed_draws.popitem(last=False)[1][1].cancel()
+
+    def cleanup_request(self, request_id) -> None:
+        super().cleanup_request(request_id)
+        # a request removed before iteration 0 (a client cancel) never takes its draw
+        with self._seed_lock:
+            entry = self._seed_draws.pop(request_id, None)
+        if entry is not None:
+            entry[1].cancel()
 
     def _draw_seeds(self, bucket_key: Hashable, seed: int) -> dict[str, torch.Tensor]:
         """:meth:`seed_loop_back` as iteration 0 would draw it, made contiguous here so
@@ -276,11 +288,10 @@ class DenoiseLoopSubmodule(NodeSubmodule):
     def _take_drawn_seeds(self, bucket_key: Hashable, seed: int) -> dict[str, torch.Tensor] | None:
         """A draw made at ingest for these inputs, once. None when there is none, and iteration 0 then draws inline."""
         with self._seed_lock:
-            at = next((i for i, (key, _) in enumerate(self._seed_draws) if key == (bucket_key, seed)), None)
-            if at is None:
+            rid = next((rid for rid, (key, _) in self._seed_draws.items() if key == (bucket_key, seed)), None)
+            if rid is None:
                 return None
-            draw = self._seed_draws[at][1]
-            del self._seed_draws[at]
+            draw = self._seed_draws.pop(rid)[1]
         # usually done long before; waiting releases the GIL and syncs no device
         return draw.result()
 
