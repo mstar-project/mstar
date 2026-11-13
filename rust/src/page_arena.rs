@@ -50,6 +50,8 @@ pub struct ArenaCore {
     /// (acquires, a hash of every page they handed out), kept when set: ranks
     /// that allocate the same pages in the same order agree on it
     pub trail: Option<(u64, u64)>,
+    /// moves whenever an owner count or a stream's page list changes
+    pub changes: u64,
     streams: Vec<Vec<i32>>,
     free_sids: Vec<usize>,
 }
@@ -61,6 +63,7 @@ impl ArenaCore {
             owners: vec![0; max_num_pages],
             sealed: vec![false; max_num_pages],
             trail: None,
+            changes: 0,
             streams: Vec::new(),
             free_sids: Vec::new(),
         }
@@ -91,6 +94,7 @@ impl ArenaCore {
         if self.free.len() < n {
             return None;
         }
+        self.changes += 1;
         let pages: Vec<i32> = self.free.drain(..n).collect();
         for &page in &pages {
             self.owners[page as usize] = 1;
@@ -104,6 +108,7 @@ impl ArenaCore {
     /// One more owner for `page`; true when that makes it shared (two owners).
     pub fn retain(&mut self, page: i64) -> Result<bool, ArenaError> {
         let i = self.slot(page)?;
+        self.changes += 1;
         self.owners[i] += 1;
         Ok(self.owners[i] == 2)
     }
@@ -115,6 +120,7 @@ impl ArenaCore {
         if self.owners[i] == 0 {
             return Err(ArenaError::NoOwner(page as i32));
         }
+        self.changes += 1;
         self.owners[i] -= 1;
         Ok(match self.owners[i] {
             0 => {
@@ -139,6 +145,7 @@ impl ArenaCore {
                 return Err(ArenaError::NotSoleOwner(page as i32));
             }
         }
+        self.changes += 1;
         for &page in pages.iter().rev() {
             self.owners[page as usize] = 0;
             self.sealed[page as usize] = false;
@@ -173,6 +180,7 @@ impl ArenaCore {
     }
 
     pub fn drop_stream(&mut self, sid: usize) {
+        self.changes += 1;
         if let Some(pages) = self.streams.get_mut(sid) {
             *pages = Vec::new();
             self.free_sids.push(sid);
@@ -184,6 +192,7 @@ impl ArenaCore {
     }
 
     pub fn pages_mut(&mut self, sid: usize) -> Result<&mut Vec<i32>, ArenaError> {
+        self.changes += 1;
         self.streams.get_mut(sid).ok_or(ArenaError::NoStream(sid))
     }
 
@@ -396,6 +405,11 @@ mod py {
         #[setter]
         fn set_writes(&self, writes: Option<Py<PyAny>>) {
             *self.writes.lock().unwrap_or_else(|e| e.into_inner()) = writes;
+        }
+
+        #[getter]
+        fn changes(&self) -> u64 {
+            self.core().changes
         }
 
         #[getter]

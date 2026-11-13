@@ -76,7 +76,7 @@ from mstar.utils.ipc_format import (
     WorkerMessage,
     WorkerMessageType,
 )
-from mstar.utils.logging_config import quiet_noisy_loggers
+from mstar.utils.logging_config import REQUEST_LOGGER, quiet_noisy_loggers
 from mstar.utils.orphan import exit_when_orphaned
 from mstar.utils.profiler import nvtx_enabled, range_pop, range_push
 from mstar.utils.threads import Thread
@@ -84,6 +84,7 @@ from mstar.validation import validate_deployment
 from mstar.validation.resources import streamed_partitions
 
 logger = logging.getLogger(__name__)
+request_log = logging.getLogger(REQUEST_LOGGER)
 
 
 def _walk_io(model: Model) -> tuple[dict[str, tuple[tuple[str, str], ...]], dict[str, frozenset[str]], frozenset[str]]:
@@ -468,6 +469,15 @@ class Conductor:
     # Metrics are off unless __init__ gets an interval; class-level so an
     # object built without __init__ reads them as off too.
     _status_interval_s: float | None = None
+    # The INFO summary that stands in for the per-request lines, which are
+    # DEBUG: every SUMMARY_PERIOD_S while anything ran, waited or finished, so a
+    # default log shows a server serving, and one that stopped finishing.
+    # Counted since the last line; class-level for an object built without
+    # __init__, and unset until the run loop starts.
+    SUMMARY_PERIOD_S = 60.0
+    _done_since_summary = 0
+    _queued_since_summary = 0
+    _next_summary: float | None = None
 
     def __init__(
         self,
@@ -1255,7 +1265,7 @@ class Conductor:
                     and len(self.requests) >= self.max_concurrent_requests):
                 break
             body = self.waiting_queue.pop(0)
-            logger.info(
+            request_log.debug(
                 "Admitting queued request %s (%d/%s in-flight)",
                 body.request_id, len(self.requests),
                 str(self.max_concurrent_requests),
@@ -1296,7 +1306,8 @@ class Conductor:
                     status=503,
                 )
                 return
-            logger.info(
+            self._queued_since_summary += 1
+            request_log.debug(
                 "Request %s queued (at capacity: %d/%d)",
                 body.request_id, len(self.requests),
                 self.max_concurrent_requests,
@@ -1367,7 +1378,7 @@ class Conductor:
         self, body: NewRequestConductor
     ):
         """Actually dispatch a request to workers (no admission check)."""
-        logger.debug("Conductor ingesting request %s", body.request_id)
+        request_log.debug("Conductor ingesting request %s", body.request_id)
         ingest_time = time.perf_counter()
         # A request admitted on arrival never waited.
         arrival_time = (
@@ -1725,7 +1736,7 @@ class Conductor:
                 ),
             )
         self._drop_request(request_id)
-        logger.info("Tore down request %s; freed worker resources", request_id)
+        request_log.debug("Tore down request %s; freed worker resources", request_id)
         self._try_admit_waiting()
 
     def _handle_reads_done(self, body: ReadsDone):
@@ -1866,7 +1877,8 @@ class Conductor:
         self, request_id: str
     ):
         """Called when all partitions are done."""
-        logger.info("Request %s done", request_id)
+        request_log.debug("Request %s done", request_id)
+        self._done_since_summary += 1
         request_data = self.requests[request_id]
         request_data.conductor_finish_time = time.perf_counter()
 
@@ -2056,7 +2068,7 @@ class Conductor:
         # downstream connections get `producer_done`.
         done = pstate.worker_reported_done
         if pstate.num_output_tokens >= request_data.max_output_tokens:
-            logger.info(
+            request_log.debug(
                 "Partition %s reached max output tokens %d. Ending.",
                 partition_name, request_data.max_output_tokens,
             )
@@ -2401,6 +2413,22 @@ class Conductor:
         except Exception:
             logger.exception("Could not fail request %s", request_id)
 
+    def _maybe_log_summary(self) -> None:
+        """Log at INFO, once a summary period, what finished and queued in it
+        and what runs and waits now, when any of those is non-zero."""
+        now = time.perf_counter()
+        if self._next_summary is None or now < self._next_summary:
+            return
+        self._next_summary = now + self.SUMMARY_PERIOD_S
+        done, queued = self._done_since_summary, self._queued_since_summary
+        running, waiting = len(self.requests), len(self.waiting_queue)
+        if done or queued or running or waiting:
+            logger.info(
+                "Last %.0f s: %d requests done, %d queued for admission; %d running, %d waiting",
+                self.SUMMARY_PERIOD_S, done, queued, running, waiting,
+            )
+        self._done_since_summary = self._queued_since_summary = 0
+
     def _maybe_send_status(self) -> None:
         """Send the API server a ConductorStatus once per status interval.
         The gauges are sampled here rather than kept up to date per message."""
@@ -2458,6 +2486,8 @@ class Conductor:
         due = self._next_liveness_check
         if self._status_interval_s is not None:
             due = min(due, self._next_status)
+        if self._next_summary is not None:
+            due = min(due, self._next_summary)
         for deadlines in (
             self._draining_deadlines, self._early_reads_done_deadlines, self._early_abort_deadlines,
         ):
@@ -2473,6 +2503,7 @@ class Conductor:
         from mstar.utils.profiler import range_pop, range_push
 
         self._wait_for_workers_ready()
+        self._next_summary = time.perf_counter() + self.SUMMARY_PERIOD_S
         # the set-up heap is complete: keep gen-2 collections off it
         freeze_after_setup("Conductor")
 
@@ -2526,6 +2557,7 @@ class Conductor:
                 self._sweep_expiry()
                 if self._status_interval_s is not None:
                     self._maybe_send_status()
+                self._maybe_log_summary()
 
             except Exception:
                 logger.exception("Conductor error in main loop")
