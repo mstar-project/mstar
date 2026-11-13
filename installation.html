@@ -1337,7 +1337,9 @@ frontend (<code class="docutils literal notranslate"><span class="pre">ADAPTER_R
 ported class is served. Chat, speech, images, videos and transcriptions are
 served for every model the Python frontend serves them for; a transcription’s
 upload is decoded and cut into windows by the API server’s <code class="docutils literal notranslate"><span class="pre">WindowPlanner</span></code>,
-over the bridge, so both frontends read the same formats. The WebSocket
+over the bridge, so both frontends read the same formats; a PCM WAV of one
+window, which the planner would pass whole, is planned from its header without
+that round trip. The WebSocket
 routes are served too: <code class="docutils literal notranslate"><span class="pre">/generate/ws</span></code>, <code class="docutils literal notranslate"><span class="pre">/v1/realtime</span></code> (conversations with
 full-duplex models, and transcription, whose server turn detection runs Silero
 through the ONNX Runtime library <code class="docutils literal notranslate"><span class="pre">onnxruntime</span></code> ships; <code class="docutils literal notranslate"><span class="pre">semantic_vad</span></code> asks the
