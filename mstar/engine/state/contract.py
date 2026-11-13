@@ -276,13 +276,14 @@ class Positions:
 
 @dataclass(frozen=True)
 class Array:
-    """Per owner, per label and per declared layer, entries at log positions 0 to n - 1, with n <= ``max_len``.
+    """Per owner, per label and per declared layer, entries at log positions 0 to n - 1.
 
     An append-only array only grows, and a rewritable one also takes writes in place. All layers of an array have
     the same length at the end of every step. ``nodes`` lists who may touch the array, and the engine places it.
     ``updates`` are kernels that replace a Value's entry with its next version. The version they overwrite is gone,
     so prefix caching and undo save a copy before one runs.
-    With ``max_len`` 0 an array keeps nothing between steps, so every add is scratch.
+    With ``max_len`` 0 an array keeps nothing between steps, so every add is scratch. ``None`` gives an unbounded
+    logical log only when all reads are no-op dense windows; storage can then keep their largest window size.
     """
 
     name: str
@@ -290,7 +291,7 @@ class Array:
     nodes: frozenset[str]
     layers: frozenset[int]
     entry: Entry
-    max_len: int
+    max_len: int | None
     reads: Mapping[str, Read] = EMPTY    # empty: read whole
     updates: Mapping[str, Op] = EMPTY
     rewritable: bool = False
@@ -313,8 +314,8 @@ class Array:
             raise ValueError(f"{where}.layers is empty, and only a Value may declare no layers")
         if not self.labels:
             raise ValueError(f"{where}.labels must be non-empty")
-        if not (type(self.max_len) is int and self.max_len >= 0):
-            raise ValueError(f"{where}.max_len must be an int >= 0, got {self.max_len!r}")
+        if self.max_len is not None and not (type(self.max_len) is int and self.max_len >= 0):
+            raise ValueError(f"{where}.max_len must be an int >= 0 or None, got {self.max_len!r}")
         if self.lifetime not in ("request", "episode") or type(self.lifetime) is not str:
             raise ValueError(f"{where}.lifetime must be 'request' or 'episode', got {self.lifetime!r}")
         self._check_entry()
@@ -322,6 +323,20 @@ class Array:
             self._check_read(key, read)
         for key, update in self.updates.items():
             self._check_update(key, update)
+        if self.max_len is None:
+            self._check_unbounded()
+
+    def _check_unbounded(self) -> None:
+        """Only a finite, read-derived dense window can bound an unbounded logical log."""
+        where = f"Array {self.name!r}"
+        if self.rewritable or self.positions is not None or self.entry.host or self.updates or not self.entry.tensors:
+            raise ValueError(f"{where}.max_len=None needs an append-only tensor log without positions or updates")
+        if not self.reads:
+            raise ValueError(f"{where}.max_len=None needs at least one dense Window read")
+        for key, read in self.reads.items():
+            if not isinstance(read.mask, Window) or read.op is not None or read.queries is not None:
+                raise ValueError(f"{where}.reads[{key!r}]: max_len=None supports only a no-op Window read of this "
+                                 "array; no finite retention bound is known for this read")
 
     def _check_entry(self) -> None:
         # a layer reads nothing from an array with no layers and no reads, so an axis may be 0

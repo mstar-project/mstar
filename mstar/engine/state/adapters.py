@@ -2385,6 +2385,9 @@ WITHIN_STEP = WithinStepStorage()
 
 def storage_of(array: Array) -> Storage:
     """The storage today's resources keep ``array`` in."""
+    if array.max_len is None:
+        raise _no_layout(array, "max_len=None needs a dense window storage binding; the existing K/V ring does not "
+                                "store generic tensor entries")
     if is_value(array):
         if not array.entry.tensors:
             return HOST_VALUE

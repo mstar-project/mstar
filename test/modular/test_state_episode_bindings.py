@@ -1,8 +1,9 @@
 """Episode ownership is separate from the resource that stores an array's rows."""
 
 import pytest
+import torch
 
-from mstar.engine.state import Array, KVEntry
+from mstar.engine.state import Array, Block, Entry, KVEntry, Read, TensorType, Window
 from mstar.engine.state.adapters import PAGED, build_specs, storage_of
 from mstar.engine.state.episodes import EpisodeRowBindings
 
@@ -76,3 +77,32 @@ def test_a_live_request_or_another_episode_cannot_take_an_owned_slot():
 def test_a_binding_refuses_invalid_assigned_ids(handle, slot, episode):
     with pytest.raises(ValueError):
         EpisodeRowBindings().bind(handle, slot, episode)
+
+
+def _frames(**overrides):
+    return Array("frames", **{
+        "nodes": {"decoder"}, "layers": {0},
+        "entry": Entry({"rgb": TensorType((3, 8, 8), dtype=torch.uint8)}),
+        "max_len": None, "reads": {"context": Read(mask=Window(4))}, **overrides,
+    })
+
+
+def test_unbounded_dense_log_has_finite_read_derived_retention():
+    frames = _frames(reads={"recent": Read(mask=Window(3)), "long": Read(mask=Window(7))})
+    assert frames.max_len is None
+    assert max(read.mask.size for read in frames.reads.values()) == 7
+    with pytest.raises(ValueError, match="dense window storage binding"):
+        build_specs([frames])
+
+
+@pytest.mark.parametrize("override,match", [
+    ({"reads": {}}, "at least one dense Window read"),
+    ({"reads": {"context": Read(mask=Block())}}, "only a no-op Window read"),
+    ({"reads": {"context": Read(mask=Window(3), queries="other")}}, "queries"),
+    ({"positions": object()}, "append-only tensor log"),
+    ({"rewritable": True}, "append-only tensor log"),
+    ({"entry": Entry({})}, "append-only tensor log"),
+])
+def test_unbounded_log_refuses_declarations_without_provable_dense_retention(override, match):
+    with pytest.raises(ValueError, match=match):
+        _frames(**override)
