@@ -26,6 +26,9 @@ class Segment(NamedTuple):
     request_id: str
     label: str
     span: int
+    # How the span's tokens are arranged, for an attention whose kernel reads structure (VSA's
+    # ``VideoSparseLayout``); None for the rest, which see only the span.
+    layout: Any = None
 
 
 @dataclass(frozen=True)

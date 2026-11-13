@@ -1391,6 +1391,11 @@ class WithinStepHandle(ArrayHandle):
             self._held_layer = self._layer_id(layer)
             self._record_add(self._held_layer, False)
         self._held = fields["k"], fields["v"]
+        # anything beside k and v goes to the read's kernel as is, packed like the queries (VSA's ``gate``)
+        self._held_extra = {name: t for name, t in fields.items() if name not in ("k", "v")}
+        if self._held_extra and not self._plans:
+            raise self._refusal(f"add fields {sorted(self._held_extra)} beside k and v, which only a ragged "
+                                "resource's kernel reads")
 
     def read(self, layer: int | torch.Tensor, q: torch.Tensor | None = None, **mask_args: Any) -> torch.Tensor:
         """Attend ``q`` over this layer's latest add, within each row's segment. ``q`` is (tokens, heads, head_dim), or
@@ -1404,11 +1409,12 @@ class WithinStepHandle(ArrayHandle):
         # Dropped here, not at the step's end: a compiled frame would otherwise return k and v from its graph, which
         # keeps the whole projection they are views of alive through the next layer.
         k, v = self._take_hold(layer)
+        extra, self._held_extra = getattr(self, "_held_extra", None) or {}, {}
         if q.ndim == 3:
             if not self._packed:
                 raise self._refusal("packed queries on a read declared packed=False")
-            return self.first_read.run(q, k, v, label=self._plan_label)
-        return self._attend(q, k, v)
+            return self.first_read.run(q, k, v, label=self._plan_label, **extra)
+        return self._attend(q, k, v, **extra)
 
     def _check_add_read(self, call: str) -> None:
         raise self._refusal(f"{call} with max_len 0, whose read a compiled block traces: a break here takes the read "

@@ -4,6 +4,7 @@ Kept free of the manager and its kernels, like the other resources' configs, so
 a submodule can declare a step without pulling FlashInfer in behind it.
 """
 
+import math
 from collections.abc import Collection, Mapping
 from dataclasses import dataclass, field
 from enum import Enum
@@ -35,6 +36,28 @@ class RaggedAttnBackend(Enum):
     # layout; self-attention only, and refused at build where cuDNN can't run
     # the geometry (GQA, a dtype other than bf16 / fp16, a padded head dim)
     CUDNN = "cudnn"
+    # video sparse attention (``attn.ragged.vsa``) over the segments that carry a
+    # ``VideoSparseLayout``, the ``auto`` kernels over the rest; self-attention only, eager
+    VSA = "vsa"
+
+
+@dataclass(frozen=True)
+class VideoSparseLayout:
+    """One segment's rows in packed order, for VSA: ``parts`` holds runs of dense rows (``int``)
+    and exactly one video token grid ``(t, h, w)``, raster order (``w`` fastest)."""
+
+    parts: tuple[int | tuple[int, int, int], ...]
+
+    def __post_init__(self):
+        grids = [p for p in self.parts if isinstance(p, tuple)]
+        if len(grids) != 1 or len(grids[0]) != 3 or min(grids[0]) <= 0:
+            raise ValueError(f"VideoSparseLayout needs exactly one (t, h, w) video grid, got {self.parts}")
+        if any(not isinstance(p, tuple) and p < 0 for p in self.parts):
+            raise ValueError(f"VideoSparseLayout: negative dense run in {self.parts}")
+
+    @property
+    def rows(self) -> int:
+        return sum(math.prod(p) if isinstance(p, tuple) else p for p in self.parts)
 
 
 @dataclass(frozen=True)
@@ -132,6 +155,8 @@ class RaggedAttentionConfig:
     # serve a call (unequal shares, a captured graph, a kernel planned for a head count, a shape whose result
     # isn't the NCCL exchange's bit for bit) that call takes the NCCL exchange.
     ulysses_head_groups: int = 1
+    # backend ``vsa``: the share of a video query tile's video key tiles it skips
+    vsa_sparsity: float | None = None
 
     def __post_init__(self):
         _head_groups(self.ulysses_head_groups)
@@ -187,6 +212,7 @@ class _RaggedSpecBase(NodeResourceSpec):
         max_segments_per_step: int | None = None,
         max_tokens_per_request: int | None = None,
         ulysses_head_groups: int | None = None,
+        vsa_sparsity: float | None = None,
     ):
         """Which kernel to run is the deployment's call as much as the model's —
         an image that cannot build FA3 pins FA2 here.
@@ -214,6 +240,8 @@ class _RaggedSpecBase(NodeResourceSpec):
             self.config.max_tokens_per_request = max_tokens_per_request
         if ulysses_head_groups is not None:
             self.config.ulysses_head_groups = _head_groups(ulysses_head_groups)
+        if vsa_sparsity is not None:
+            self.config.vsa_sparsity = float(vsa_sparsity)
 
 
 @dataclass

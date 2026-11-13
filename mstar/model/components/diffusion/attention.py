@@ -51,12 +51,16 @@ def refuse_attention_backend_kwarg(kwargs: Mapping[str, Any]) -> None:
                          "`resources: {<the read's resource key>: {backend: sdpa}}`")
 
 
-def attend(state: Any, layer: torch.Tensor | None, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
+def attend(
+    state: Any, layer: torch.Tensor | None, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, **extra: torch.Tensor,
+) -> torch.Tensor:
     """``[B, S, H, D]`` queries over ``[B, S_kv, H_kv, D]`` keys and values through ``state``'s read, or SDPA on a layer
-    no engine bound a handle to."""
+    no engine bound a handle to. ``extra`` per-query tensors (VSA's ``gate``) go to the read's ragged kernel."""
     if state is None:
+        if extra:
+            raise ValueError(f"SDPA takes no {sorted(extra)}: only a ragged resource's kernel reads them")
         return sdpa_attention(q, k, v)
-    state.add(layer, k=k, v=v)
+    state.add(layer, k=k, v=v, **extra)
     return state.read(layer, q)
 
 
@@ -94,7 +98,7 @@ class FrameSDPA:
 
 def joint_attention(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, ragged: RaggedAttentionFn | None = None,
-    return_lse: bool = False,
+    return_lse: bool = False, **extra: torch.Tensor,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Attention of ``[B, S, H, D]`` queries over ``[B, S_kv, H_kv, D]`` keys / values
     (all requests in the batch share ``S`` and ``S_kv``; ``S_kv == S`` for
@@ -103,9 +107,12 @@ def joint_attention(
 
     The ragged kernel wants the batch packed to ``[B * S, H, D]`` / ``[B * S_kv, ...]``
     with one segment per request — exactly what the step declared (a cross read for
-    ``S_kv != S``) — and hands back the query packing.
+    ``S_kv != S``) — and hands back the query packing. ``extra`` per-query tensors (VSA's
+    ``gate``, ``[B, S, H, D]``) go to the ragged kernel packed like ``q``.
     """
     if ragged is None:
+        if extra:
+            raise ValueError(f"SDPA takes no {sorted(extra)}: only a ragged resource's kernel reads them")
         return sdpa_attention(q, k, v, return_lse=return_lse)
     bsz, seq, heads, dim = q.shape
     kv_seq, kv_heads = k.shape[1], k.shape[2]
@@ -114,7 +121,8 @@ def joint_attention(
         k.reshape(bsz * kv_seq, kv_heads, dim),
         v.reshape(bsz * kv_seq, kv_heads, dim),
     )
+    extra = {name: t.reshape(bsz * seq, *t.shape[2:]) for name, t in extra.items()}
     if not return_lse:
-        return ragged(*packed).view(bsz, seq, heads, dim).to(q.dtype)
+        return ragged(*packed, **extra).view(bsz, seq, heads, dim).to(q.dtype)
     out, lse = ragged(*packed, return_lse=True)
     return out.view(bsz, seq, heads, dim).to(q.dtype), lse.reshape(bsz, seq, heads)
