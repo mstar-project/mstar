@@ -14,6 +14,8 @@ import torch
 from safetensors import safe_open
 from torch import nn
 
+from mstar.model.loader.quantization import refuse_unserved_quantization
+
 INDEX = "model.safetensors.index.json"
 SINGLE = "model.safetensors"
 
@@ -53,7 +55,9 @@ def required_shards(root: str | Path, prefix: str) -> tuple[str, ...]:
     """Shard filenames for a component; no weight tensor is read for an index."""
     if not prefix:
         raise ValueError("a component prefix is required")
-    weight_map = _weight_map(Path(root))
+    root = Path(root)
+    refuse_unserved_quantization(root)
+    weight_map = _weight_map(root)
     files = {file for name, file in weight_map.items() if name.startswith(prefix)}
     if not files:
         raise Praxis1WeightError(f"no checkpoint tensors start with {prefix!r}")
@@ -86,6 +90,7 @@ def load_component(
     implicit dtype casts, including a float32 MoE routing bias cast to bf16.
     """
     root = Path(root)
+    refuse_unserved_quantization(root)
     weight_map = _weight_map(root)
     shards = required_shards(root, prefix)
     loaded: dict[str, torch.Tensor] = {}

@@ -32,10 +32,10 @@ def _encoder() -> EncoderTower:
 
 def _checkpoint(root, component, prefix, *, mutate=None):
     tensors = {}
-    for key, value in component.state_dict().items():
+    for index, (key, value) in enumerate(component.state_dict().items()):
         reference_key = key.replace(".ffn.linear.", ".ffn.0.linear.")
         reference_key = reference_key.replace(".ffn.down.weight", ".ffn.1.weight")
-        tensors[prefix + reference_key] = value.clone().contiguous()
+        tensors[prefix + reference_key] = torch.full_like(value, (index + 1) / 100).contiguous()
     if mutate is not None:
         mutate(tensors)
     save_file(tensors, root / "component.safetensors")
@@ -70,10 +70,12 @@ def test_encoder_and_moe_load_without_opening_unrelated_shards(tmp_path, monkeyp
 
 def test_action_expert_block_keeps_reference_names(tmp_path):
     source = ActionExpertBlock(dim=8, num_heads=2, head_dim=4, is_cross=True, kv_dim=12)
-    _checkpoint(tmp_path, source, "action_expert.blocks.0.")
+    expected = _checkpoint(tmp_path, source, "action_expert.blocks.0.")
     target = ActionExpertBlock(dim=8, num_heads=2, head_dim=4, is_cross=True, kv_dim=12)
     loader.load_component(target, tmp_path, "action_expert.blocks.0.")
-    assert all(torch.equal(target.state_dict()[key], value) for key, value in source.state_dict().items())
+    assert all(
+        torch.equal(value, expected["action_expert.blocks.0." + key]) for key, value in target.state_dict().items()
+    )
 
 
 def test_ported_keys_match_reference_modules():
@@ -158,4 +160,19 @@ def test_shard_index_mismatch_is_rejected(tmp_path):
     index["weight_map"]["action_expert.blocks.0.absent"] = "component.safetensors"
     path.write_text(json.dumps(index))
     with pytest.raises(loader.Praxis1WeightError, match="differs from the index"):
+        loader.load_component(source, tmp_path, "action_expert.blocks.0.")
+
+
+def test_fp8_checkpoint_is_refused_before_opening_weights(tmp_path, monkeypatch):
+    source = ActionExpertBlock(dim=8, num_heads=2, head_dim=4, is_cross=True, kv_dim=12)
+    _checkpoint(tmp_path, source, "action_expert.blocks.0.")
+    (tmp_path / "config.json").write_text(json.dumps({"quantization_config": {"quant_method": "fp8"}}))
+
+    def unexpected_open(*args, **kwargs):
+        raise AssertionError("a quantized shard was opened")
+
+    monkeypatch.setattr(loader, "safe_open", unexpected_open)
+    with pytest.raises(ValueError, match="quant_method fp8"):
+        loader.required_shards(tmp_path, "action_expert.blocks.0.")
+    with pytest.raises(ValueError, match="quant_method fp8"):
         loader.load_component(source, tmp_path, "action_expert.blocks.0.")
