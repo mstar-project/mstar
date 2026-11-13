@@ -757,6 +757,31 @@ def test_encoder_an_all_steady_step_leaves_its_resources_to_its_region():
     assert _kv_spans(step) == [mixed[0].kwargs["n"], 1]
 
 
+def test_encoder_steady_steps_write_no_counts_and_keep_them_current():
+    """A live step the whole-step region owns adds one frame of audio, its mel
+    frames and one encoder frame, and the stream's Value holds how far the first
+    two run ahead of the third, so the step writes nothing there. An outer step
+    that wrote them would cost every live step a declare, an admit and a commit.
+    The counts still match a twin stream that ran every step eagerly, and so
+    does the last step after them."""
+    steady, eager = _Encoder(), _Encoder()
+    steady.regions = _encoder_regions(steady, STEP)
+    wavs = {h: torch.randn(1280 * 7 + 500) * 0.1 for h in (1, 2)}
+    held = []
+    for at in range(0, 1280 * 7, 1280):
+        for enc in (steady, eager):
+            enc.step([1, 2], [enc.prepare(h, wavs[h][at:at + 1280]) for h in (1, 2)])
+        held.append(steady.setup.host_fields.fields(1, STREAM, "main", 0))
+        assert [steady.counts(h) for h in (1, 2)] == [eager.counts(h) for h in (1, 2)], at
+    assert steady.regions[STEP].calls == 5
+    assert all(fields is held[1] for fields in held[2:]), "a steady step wrote the stream's counts"
+    ends = [_encode_batch(enc, [(h, wavs[h][1280 * 7:], True) for h in (1, 2)]) for enc in (steady, eager)]
+    assert [steady.counts(h) for h in (1, 2)] == [eager.counts(h) for h in (1, 2)]
+    for h in (1, 2):
+        assert len(ends[0][h]) == len(ends[1][h]) > 0
+        assert torch.allclose(torch.stack(ends[0][h]), torch.stack(ends[1][h]), atol=1e-5), \
+            "the last step after the steady ones sliced the stream's audio elsewhere than an eager twin's"
+
 def test_encoder_a_step_mixes_a_steady_stream_with_eager_chunks_past_the_window():
     """One step holds a stream one frame on, a stream whose chunk adds more frames
     than the attention window (the eager blocks, a step of T > 1 where each
