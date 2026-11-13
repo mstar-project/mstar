@@ -797,6 +797,10 @@ class _Queue:
         del node_name, wg_ids
         self.pushed_back.extend(rids)
 
+    @staticmethod
+    def get_rid_string(handle):
+        return handle
+
 
 def _rank(*, leader: bool, parallel: bool = True) -> Worker:
     """One rank of ``"node"``, the real refusal path over a page-holding "victim"
