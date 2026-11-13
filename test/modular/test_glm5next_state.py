@@ -199,3 +199,18 @@ def test_steps_equal_the_hand_written_ones_apart_from_the_seed(walk, k):
     segments = [Segment(request_id=rid, label="main", span=span) for rid, span in zip([1, 2], spans, strict=True)]
     step = engine_step(_node(model), walk, [1, 2], rows)
     _assert_steps_equal(step, SubmoduleStep(segments=segments, steps=steps))
+
+
+@pytest.mark.parametrize("k", [0, 3])
+def test_only_a_decode_step_is_input_free(k):
+    """Under async scheduling the pre-plan declares and admits each decode step over the capture's template rows. The
+    GPU thread runs that step when the model says the step reads nothing else, rather than declaring and admitting it
+    again before the launch."""
+    node = _node(_model("reduced", k, kda_conv_dtype=torch.float32))
+    template = ARNodeInputs(input_ids=torch.zeros(1, dtype=torch.long), input_seq_len=k + 1)
+    row = ARNodeInputs(input_ids=torch.tensor([7]), input_seq_len=k + 1)
+    declared, real = (node.declare_step("decode", ["a", "b"], [one, one]) for one in (template, row))
+    assert (declared.segments, declared.state) == (real.segments, real.state)
+    assert node.step_is_input_free("decode") and not node.step_is_input_free("prefill"), (
+        "the GPU thread would declare and admit every decode step again before its launch"
+    )
