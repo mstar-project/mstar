@@ -1,4 +1,4 @@
-"""The Praxis-1 action expert: one layer and the pieces it is built from.
+"""The Praxis-1 action expert, from layers to the complete trunk-rope tower.
 
 The expert is a second, smaller transformer beside the video trunk. It reads
 the trunk's hidden states and never writes back, and it predicts the action
@@ -64,14 +64,14 @@ filled by the weight loader, as with
 from __future__ import annotations
 
 import math
-from typing import Callable
+from typing import Callable, Mapping, Sequence
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
 from mstar.model.praxis1.components.norm_time import expert_rms_norm
-from mstar.model.praxis1.components.rope import apply_rope
+from mstar.model.praxis1.components.rope import RotaryEmbedding, apply_rope
 
 
 def geglu(x: torch.Tensor) -> torch.Tensor:
@@ -112,9 +112,7 @@ class ExpertTimestepEmbedder(nn.Module):
         """``t (...)`` to ``(..., dim)``. ``t`` is the raw flow time in ``[0, 1]``."""
         half = self.frequency_dim // 2
         freqs = torch.exp(
-            -math.log(self.max_period)
-            * torch.arange(start=0, end=half, device=t.device, dtype=torch.float32)
-            / half
+            -math.log(self.max_period) * torch.arange(start=0, end=half, device=t.device, dtype=torch.float32) / half
         ).to(dtype=t.dtype)
         args = t.unsqueeze(-1) * freqs.unsqueeze(0)
         # [cos, sin], in that order. The reverse is a column permutation of
@@ -224,9 +222,7 @@ class ExpertKVSource(nn.Module):
         return torch.cat([global_kv.to(feat.dtype), feat], dim=1)
 
 
-def dense_sdpa_attend(
-    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: torch.Tensor | None
-) -> torch.Tensor:
+def dense_sdpa_attend(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: object) -> torch.Tensor:
     """The parity driver: SDPA over a dense ``(Q, KV)`` boolean mask.
 
     The mask is per row of the expert sequence and is shared by every batch
@@ -237,6 +233,8 @@ def dense_sdpa_attend(
     ``enable_gqa`` is deliberately absent. The expert has no GQA: 16 heads of
     64 is the full width 1024 on all three of q, k and v.
     """
+    if mask is not None and not isinstance(mask, torch.Tensor):
+        raise TypeError("dense SDPA needs a tensor mask")
     return F.scaled_dot_product_attention(q, k, v, attn_mask=None if mask is None else mask[None, None])
 
 
@@ -290,7 +288,7 @@ class ActionExpertBlock(nn.Module):
         cond: torch.Tensor,
         *,
         kv_source: torch.Tensor | None,
-        mask: torch.Tensor | None,
+        mask: object,
         q_table: torch.Tensor,
         k_table: torch.Tensor,
         attend: Callable = dense_sdpa_attend,
@@ -364,3 +362,219 @@ class ActionHead(nn.Module):
         if self.head_plus_zero:
             out = out + 0.0
         return out
+
+
+def trunk_query_rope_ids(
+    kv_rope_ids: torch.Tensor,
+    *,
+    num_global_tokens: int,
+    num_clean_frames: int,
+    num_noised_frames: int,
+    tokens_per_frame: int,
+    num_future_per_chunk: int,
+    chunk_size: int,
+) -> torch.Tensor:
+    """Gather one trunk position per expert query from ``[global | clean | noised]``.
+
+    Proprio and future queries use the first noised frame of their chunk.
+    Action query ``i`` uses noised frame ``i``. The minimum position in a
+    frame is its top-left token, including after the trunk's position shifts.
+    """
+    batch = kv_rope_ids.shape[0]
+    frame_tokens = kv_rope_ids[:, num_global_tokens:]
+    n_frames = num_clean_frames + num_noised_frames
+    if frame_tokens.shape[1] != n_frames * tokens_per_frame:
+        raise ValueError("KV positions do not cover the clean and noised frames")
+    if not chunk_size or num_noised_frames % chunk_size:
+        raise ValueError("noised frames must split into full action chunks")
+    noised_ids = frame_tokens.view(batch, n_frames, tokens_per_frame).amin(dim=-1)
+    noised_ids = noised_ids[:, num_clean_frames:]
+    n_chunks = num_noised_frames // chunk_size
+    device = kv_rope_ids.device
+    chunks = torch.arange(n_chunks, device=device)
+    prefix_frames = torch.cat([chunks, chunks.repeat_interleave(num_future_per_chunk)]) * chunk_size
+    action_frames = torch.arange(num_noised_frames, device=device)
+    return noised_ids.index_select(1, torch.cat([prefix_frames, action_frames]))
+
+
+class ActionExpert(nn.Module):
+    """The trunk-rope action expert over one chunk-causal encoder window.
+
+    The caller supplies cross and self attention masks and the attention
+    callable. The masks must encode ``window_size`` and
+    ``clean_only_conditioning`` from the checkpoint config. This keeps mask
+    planning with the attention resource while the model owns its
+    projections, query layout and flow-time conditioning.
+    The parameter names match the reference after ``action_expert.``.
+    """
+
+    def __init__(
+        self,
+        *,
+        action_patch_dim: int,
+        proprio_patch_dim: int,
+        trunk_dim: int,
+        dim: int = 1024,
+        num_layers: int = 16,
+        num_heads: int = 16,
+        head_dim: int = 64,
+        num_future_per_chunk: int = 8,
+        max_chunks: int = 16,
+        max_action_tokens: int = 64,
+        tap_norm: bool = True,
+        clean_only_conditioning: bool = False,
+        rope: Mapping[str, int | float | str],
+        global_order: Sequence[str] = ("register", "anchor", "text"),
+        head_plus_zero: bool = False,
+        layout_stamp: int | None = None,
+    ) -> None:
+        super().__init__()
+        if num_layers < 2 or num_layers % 2:
+            raise ValueError("num_layers must be a positive even count")
+        if tuple(sorted(global_order)) != ("anchor", "register", "text"):
+            raise ValueError("global_order must permute register, anchor and text")
+        if rope.get("kind") != "trunk" or rope.get("order") != "before_norm":
+            raise ValueError("the port supports trunk RoPE before the q/k norm")
+        self.rope_table = RotaryEmbedding(
+            dim=int(rope["dim"]),
+            effective_dim=int(rope["effective_dim"]),
+            base=int(rope["base"]),
+            table_size=int(rope["table_size"]),
+        )
+        if int(rope["dim"]) != head_dim:
+            raise ValueError("expert RoPE width must equal head_dim")
+        self.global_order = tuple(global_order)
+        self.num_future_per_chunk = num_future_per_chunk
+        self.num_cross_layers = num_layers // 2
+        self.dim = dim
+        self.action_patch_dim = action_patch_dim
+        self.trunk_dim = trunk_dim
+        self.clean_only_conditioning = clean_only_conditioning
+        self.head_plus_zero = head_plus_zero
+        self.layout_stamp = layout_stamp
+        self.max_action_tokens = max_action_tokens
+
+        self.action_encoder = ActionTauEncoder(action_patch_dim, dim)
+        self.timestep_embedder = ExpertTimestepEmbedder(dim)
+        self.future_tokens = nn.Parameter(torch.zeros(num_future_per_chunk, dim))
+        self.future_chunk_embed = nn.Embedding(max_chunks, dim)
+        self.proprio_token = nn.Parameter(torch.zeros(1, dim))
+        self.embed_proprio = nn.Linear(proprio_patch_dim, dim) if proprio_patch_dim > 0 else None
+        self.tap_proj = nn.Linear(trunk_dim, dim, bias=False)
+        self.text_proj = nn.Linear(trunk_dim, dim, bias=False)
+        self.tap_norm_scale = nn.Parameter(torch.ones(trunk_dim)) if tap_norm else None
+        self.blocks = nn.ModuleList(
+            [
+                ActionExpertBlock(
+                    dim=dim,
+                    num_heads=num_heads,
+                    head_dim=head_dim,
+                    is_cross=idx % 2 == 0,
+                    kv_dim=dim,
+                )
+                for idx in range(num_layers)
+            ]
+        )
+        self.norm_out = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
+        self.head = nn.Linear(dim, action_patch_dim)
+
+    def forward_trunk_rope(
+        self,
+        *,
+        noised_action_latents: torch.Tensor,
+        action_timesteps: torch.Tensor,
+        trunk_features: Sequence[torch.Tensor],
+        global_tokens: torch.Tensor | None,
+        proprio_latents: torch.Tensor | None,
+        kv_rope_ids: torch.Tensor,
+        chunk_size: int,
+        num_clean_frames: int,
+        num_noised_frames: int,
+        tokens_per_frame: int,
+        window_size: int,
+        cross_mask: object,
+        self_mask: object,
+        attend: Callable = dense_sdpa_attend,
+    ) -> torch.Tensor:
+        """Predict action velocity; masks encode the caller's window policy."""
+        if len(trunk_features) != self.num_cross_layers:
+            raise ValueError(f"expected {self.num_cross_layers} taps, got {len(trunk_features)}")
+        batch, n_actions, _ = noised_action_latents.shape
+        if batch != 1 or n_actions != num_noised_frames:
+            raise ValueError("one sample and one action per noised frame are required")
+        if not chunk_size or n_actions % chunk_size:
+            raise ValueError("action tokens must split into full chunks")
+        n_chunks = n_actions // chunk_size
+        if n_chunks > self.future_chunk_embed.num_embeddings:
+            raise ValueError("future chunk embedding has too few rows")
+        if action_timesteps.ndim == 1:
+            tau = action_timesteps[:, None].expand(-1, n_actions)
+        elif action_timesteps.shape == (batch, n_actions):
+            tau = action_timesteps
+        else:
+            raise ValueError("action timesteps do not cover the action tokens")
+
+        actions = self.action_encoder(noised_action_latents, tau)
+        future = self.future_tokens[None, None].expand(batch, n_chunks, -1, -1)
+        future = future + self.future_chunk_embed.weight[:n_chunks][None, :, None, :].to(future.dtype)
+        future = future.reshape(batch, n_chunks * self.num_future_per_chunk, self.dim)
+        proprio = self.proprio_token[None].expand(batch, n_chunks, -1).to(actions.dtype)
+        if self.embed_proprio is not None and proprio_latents is not None:
+            idx = torch.arange(n_chunks, device=actions.device) * chunk_size
+            proprio = proprio + self.embed_proprio(proprio_latents.index_select(1, idx).to(proprio.dtype))
+        x = torch.cat([proprio, future.to(actions.dtype), actions], dim=1)
+
+        chunks = torch.arange(n_chunks, device=actions.device)
+        query_chunks = torch.cat(
+            [
+                chunks,
+                chunks.repeat_interleave(self.num_future_per_chunk),
+                torch.arange(n_actions, device=actions.device) // chunk_size,
+            ]
+        )
+        query_times = tau.index_select(1, (query_chunks * chunk_size).clamp(max=n_actions - 1))
+        cond = self.timestep_embedder(query_times).to(x.dtype)
+
+        n_globals = 0 if global_tokens is None else global_tokens.shape[1]
+        expected_kv = n_globals + (num_clean_frames + num_noised_frames) * tokens_per_frame
+        if kv_rope_ids.shape != (batch, expected_kv):
+            raise ValueError("KV positions do not match the supplied frame layout")
+        expected_frames = (batch, expected_kv - n_globals, self.trunk_dim)
+        if any(tap.shape != expected_frames for tap in trunk_features):
+            raise ValueError("tap shape does not match the supplied frame layout")
+        if global_tokens is not None and global_tokens.shape != (batch, n_globals, self.trunk_dim):
+            raise ValueError("global tokens must have the trunk width")
+        q_ids = trunk_query_rope_ids(
+            kv_rope_ids,
+            num_global_tokens=n_globals,
+            num_clean_frames=num_clean_frames,
+            num_noised_frames=num_noised_frames,
+            tokens_per_frame=tokens_per_frame,
+            num_future_per_chunk=self.num_future_per_chunk,
+            chunk_size=chunk_size,
+        )
+        q_table = self.rope_table(q_ids)
+        k_table = self.rope_table(kv_rope_ids)
+        if cross_mask is None or self_mask is None:
+            raise ValueError("expert cross and self masks are required")
+        if isinstance(cross_mask, torch.Tensor) and cross_mask.shape != (x.shape[1], expected_kv):
+            raise ValueError("cross mask does not match expert queries and trunk keys")
+        if isinstance(self_mask, torch.Tensor) and self_mask.shape != (x.shape[1], x.shape[1]):
+            raise ValueError("self mask does not match expert queries")
+        global_kv = None if global_tokens is None else self.text_proj(global_tokens)
+        cross_idx = 0
+        for block in self.blocks:
+            if block.is_cross:
+                tap = trunk_features[cross_idx]
+                if self.tap_norm_scale is not None:
+                    tap = (expert_rms_norm(tap) * self.tap_norm_scale).to(tap.dtype)
+                frame_kv = self.tap_proj(tap)
+                kv = frame_kv if global_kv is None else torch.cat([global_kv.to(frame_kv.dtype), frame_kv], dim=1)
+                x = block(x, cond, kv_source=kv, mask=cross_mask, q_table=q_table, k_table=k_table, attend=attend)
+                cross_idx += 1
+            else:
+                x = block(x, cond, kv_source=None, mask=self_mask, q_table=q_table, k_table=q_table, attend=attend)
+        out = self.head(self.norm_out(x[:, -n_actions:]))
+        if self.head_plus_zero:
+            out = out + 0.0
+        return out.view(batch, n_actions, self.action_patch_dim)
