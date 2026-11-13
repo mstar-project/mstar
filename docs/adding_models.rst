@@ -735,8 +735,8 @@ The spec types are:
        ``RaggedAttentionConfig`` holds ``num_qo_heads``, ``num_kv_heads`` and
        ``head_dim`` (all pre-sharding, as in ``KVConfig``), an ``sm_scale`` that
        defaults to ``head_dim ** -0.5``, ``backend`` (``RaggedAttnBackend.AUTO`` by
-       default, which is FlashInfer on NVIDIA and ``DENSE`` on AMD GPUs, or ``FLASHINFER`` /
-       ``DENSE``), ``flashinfer_backend``, the
+       default, which is FlashInfer on NVIDIA and AITER's varlen flash attention on
+       AMD GPUs, or ``FLASHINFER`` / ``AITER`` / ``DENSE``), ``flashinfer_backend``, the
        two CUDA-graph ceilings ``max_segments_per_request`` (``max_segments_per_step``
        for a ``one_row_per_step`` region) and
        ``max_tokens_per_request``, ``compile_op``, ``shard_over_sp`` and
@@ -1000,7 +1000,7 @@ attends through them. A kernel that reads ``cu_seqlens`` as an argument, or buil
 mask from it, cannot be captured this way.
 
 ``RaggedAttnBackend.AUTO`` (and an explicit ``FLASHINFER``) plan through FlashInfer's
-ragged prefill wrapper, except that ``AUTO`` on ROCm is ``DENSE``. ``RaggedAttnBackend.DENSE`` plans the same layouts into static
+ragged prefill wrapper, except that ``AUTO`` on ROCm is ``AITER`` (AITER's varlen flash attention, or FlashInfer if AITER is missing, and always FlashInfer for block-causal attention). ``RaggedAttnBackend.DENSE`` plans the same layouts into static
 ``cu_seqlens`` buffers and runs FA3 ``flash_attn_varlen`` (AITER on ROCm) instead, with
 no page scatter. If that kernel is not importable, or the spec is a
 ``RaggedBlockCausalAttentionSpec`` (whose overlapping prefixes varlen cannot express),
@@ -2437,7 +2437,7 @@ that a misspelled setting is never silently ignored:
      - ``backend`` (``auto`` / ``flashinfer`` / ``aiter``), ``flashinfer_backend``
        (``auto`` / ``fa2`` / ``fa3``), ``decode_tensor_cores`` (``true`` / ``false``)
    * - ``RaggedAttentionSpec``
-     - ``backend`` (``auto`` / ``flashinfer``), ``flashinfer_backend``
+     - ``backend`` (``auto`` / ``flashinfer`` / ``aiter``), ``flashinfer_backend``
        (``auto`` / ``fa2`` / ``fa3``), ``max_segments_per_request``,
        ``max_segments_per_step``, ``max_tokens_per_request``. The ceilings size CUDA-graph
        buckets, which is a memory-against-coverage trade the deployment makes, not the model.
