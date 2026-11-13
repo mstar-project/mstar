@@ -4,7 +4,8 @@ Each case sends the same multipart body to both frontends, served by one
 scripted ASR stub, and compares the response (status, body, stream events) and
 every window each submitted: the kwargs, the layout, and the window's length
 as the stub hears it. Both decode and cut the upload with the same
-``WindowPlanner``, the Rust side over the bridge's ``windows`` round trip.
+``WindowPlanner``, the Rust side over the bridge's ``windows`` round trip, except
+a PCM WAV of one window, which the Rust side plans from its header.
 """
 
 import asyncio
@@ -409,6 +410,58 @@ def test_an_upload_no_decoder_reads_goes_whole_to_the_model_alike(stacks, monkey
         stacks, monkeypatch, "whisper_large", fields, ("speech.webm", b"not audio at all"))
     assert rust == py
     assert rust_submits == py_submits and len(py_submits) == 1
+
+
+def _as(subtype: str, seconds: float, channels: int = 1, fmt: str = "WAV") -> bytes:
+    """A tone of ``seconds`` as a ``fmt`` file of ``subtype``."""
+    x = np.asarray(sf.read(io.BytesIO(_wav(seconds, channels=channels)))[0])
+    buf = io.BytesIO()
+    sf.write(buf, x, 16_000, format=fmt, subtype=subtype)
+    return buf.getvalue()
+
+
+def _with_header(wav: bytes, riff: int | None = None, data: int | None = None, block: int | None = None) -> bytes:
+    """``wav`` (a canonical 44-byte header) with its RIFF size, data size or block align overwritten."""
+    out = bytearray(wav)
+    for at, value, width in ((4, riff, 4), (40, data, 4), (32, block, 2)):
+        if value is not None:
+            out[at:at + width] = value.to_bytes(width, "little")
+    return bytes(out)
+
+
+WAV_HEADERS = {
+    "pcm16-short": _wav(6.0),
+    "pcm16-over-a-window": _wav(40.0),
+    "pcm8": _as("PCM_U8", 6.0),
+    "pcm24": _as("PCM_24", 6.0),
+    "pcm32": _as("PCM_32", 6.0),
+    "float": _as("FLOAT", 6.0),
+    "double": _as("DOUBLE", 6.0),
+    "extensible": _as("PCM_16", 6.0, channels=3, fmt="WAVEX"),
+    # what libsndfile reads differently from the header, or refuses
+    "unclosed": _with_header(_wav(40.0), riff=8, data=0),
+    "padded-frames": _with_header(_wav(6.0), block=4),
+    "streamed-size": _with_header(_wav(6.0), data=0xFFFF_FFFF),
+}
+# the uploads the Rust side plans from the header, without the planner
+LOCAL = {"pcm16-short", "pcm8", "pcm24", "pcm32", "float", "double", "extensible"}
+
+
+@pytest.mark.parametrize("header", list(WAV_HEADERS))
+def test_a_wav_upload_is_planned_and_answered_alike(stacks, monkeypatch, header):
+    plans = []
+    windows = RustFrontendBridge._windows
+
+    def counted(self, msg):
+        if msg.get("op") == "plan":
+            plans.append(msg)
+        return windows(self, msg)
+
+    monkeypatch.setattr(RustFrontendBridge, "_windows", counted)
+    fields = [("response_format", "verbose_json")]
+    py, rust = _both(stacks, monkeypatch, "whisper_large", fields, ("speech.wav", WAV_HEADERS[header]), _whisper())
+    _assert_same(py, rust)
+    assert (not plans) == (header in LOCAL)
 
 
 def test_an_upload_past_the_cap_is_a_413_alike(stacks, monkeypatch):

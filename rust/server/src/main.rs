@@ -267,6 +267,7 @@ async fn main() {
         .with_graceful_shutdown(shutdown_signal())
         .await
         .unwrap();
+    transcription::remove_local_uploads();
 }
 
 /// SIGTERM/SIGINT: stop accepting, drain in-flight requests, exit — with a
@@ -289,6 +290,7 @@ async fn shutdown_signal() {
     tokio::spawn(async {
         tokio::time::sleep(std::time::Duration::from_secs(30)).await;
         eprintln!("mstar-server: drain deadline reached, exiting");
+        transcription::remove_local_uploads();
         std::process::exit(0);
     });
 }
