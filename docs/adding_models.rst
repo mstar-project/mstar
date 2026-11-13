@@ -732,6 +732,10 @@ deployment YAML tunes them under ``resources:`` (see :ref:`Step 6 <config-yaml>`
   ``LatentEntry(rank=, rope_dim=)`` builds an MLA latent: ``ckv`` of ``rank`` and, with
   ``rope_dim`` above 0, the decoupled RoPE key ``kpe``, neither sharded, since every query head
   reads both.
+  A ``LatentEntry`` with ``rope_dim=0`` on an array whose ``verify_span`` is above 1, as GLM-5.3's
+  with MTP, keeps each verify block whole, so the next step's plan doesn't wait on this step's
+  counts: ``settle`` marks a row's rejected entries, which every later read skips. Its pool holds
+  ``max_len * verify_span`` entries a request, and it keeps no positions.
   A paged array's pool is held in the model's ``get_autocast_dtype``. A model that runs
   without the engine's autocast returns its K/V dtype there and sets ``disable_autocast`` on
   each node, as Waypoint and LingBot-World do.
@@ -3544,8 +3548,8 @@ refused at load: a replay's padding rows would sit between its real ones.
 A step of one token a row attends the pages after its KV write (in TP mode on tensor cores
 whatever ``decode_tensor_cores`` says). Any other step attends its stored context on the pages
 and its own tokens from the ``k`` and ``v`` the layer passes ``run``, so a layer that calls
-``attn.run`` itself passes them (``AttentionCallable`` and ``MLAAttention`` without
-``mla_absorb`` do). A fused K/V write that leaves ``k`` unrotated asks ``reads_step_kv()`` first
+``attn.run`` itself passes them (``AttentionCallable`` does).
+A fused K/V write that leaves ``k`` unrotated asks ``reads_step_kv()`` first
 and rotates it when the step attends it (``AttentionCallable.norm_rope_attend``); a state op's fused
 kernel doesn't run on such a step, so its reference's ``add`` hands the handle ``k`` and ``v``.
 In SP mode, rank ``r`` attends only the step's
