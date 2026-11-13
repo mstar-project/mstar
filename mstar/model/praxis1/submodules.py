@@ -575,7 +575,7 @@ class Praxis1BackboneSubmodule(_Praxis1Node):
         packed = dict(zip(("taps", "tap_embeddings", "tap_rope_ids", "tap_geometry"),
                           pack_tap_features(features), strict=True))
         return {**{name: [value] for name, value in packed.items()},
-                "video_latents": [video_latents], "action_latents": [action_latents]}
+                "expert_video_latents": [video_latents], "expert_action_latents": [action_latents]}
 
 
 class Praxis1ActionExpertSubmodule(_Praxis1Node):
@@ -599,8 +599,8 @@ class Praxis1ActionExpertSubmodule(_Praxis1Node):
                 "tap_embeddings": inputs["tap_embeddings"][0],
                 "tap_rope_ids": inputs["tap_rope_ids"][0],
                 "tap_geometry": inputs["tap_geometry"][0],
-                "video_latents": inputs["video_latents"][0],
-                "action_latents": inputs["action_latents"][0],
+                "video_latents": inputs["expert_video_latents"][0],
+                "action_latents": inputs["expert_action_latents"][0],
                 "proprio": inputs["proprio"][0],
         }
         if proprio_all := inputs.get("proprio_all"):
