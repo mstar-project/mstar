@@ -117,8 +117,13 @@ class LingBotWorldConfig:
         frames up to ``local_attn_size``. Without a window, every frame of the longest rollout."""
         if self.local_attn_size == -1:
             return KeptWindow(0, window=self.max_chunks * self.chunk_size * frame_tokens)
-        return KeptWindow(self.sink_size * frame_tokens,
-                          window=(self.local_attn_size - self.sink_size - self.chunk_size) * frame_tokens)
+        frames = self.local_attn_size - self.sink_size - self.chunk_size
+        if frames < 1:
+            raise ValueError(
+                f"LingBotWorldConfig.local_attn_size is {self.local_attn_size}, and the sink's {self.sink_size} frames "
+                f"and a chunk's {self.chunk_size} leave its window no frame; make it at least "
+                f"{self.sink_size + self.chunk_size + 1}, or -1 to attend every frame")
+        return KeptWindow(self.sink_size * frame_tokens, window=frames * frame_tokens)
 
     def window_pages(self, frame_tokens: int, page_size: int) -> int:
         """The most pages of ``page_size`` a rollout at ``frame_tokens`` a frame holds as the pool releases them: its
