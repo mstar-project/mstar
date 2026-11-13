@@ -159,6 +159,32 @@ def _compact(t: torch.Tensor) -> torch.Tensor:
     return torch.empty_strided(t.shape, strides, dtype=t.dtype, device=t.device).copy_(t)
 
 
+# diffusers' marker in a temporal upsample's slot on a stream's first call
+_REPEAT = "Rep"
+
+
+def to_edge(cache: list, device: torch.device) -> list[torch.Tensor]:
+    """A causal-conv cache as an edge carries it: an empty slot as a 0-element tensor and diffusers' ``"Rep"`` as one
+    ``int8``, since an edge holds tensors only."""
+    return [
+        slot if torch.is_tensor(slot)
+        else torch.zeros(1, dtype=torch.int8, device=device) if slot == _REPEAT
+        else torch.empty(0, device=device)
+        for slot in cache
+    ]
+
+
+def from_edge(signal: list[torch.Tensor]) -> list:
+    """The cache `to_edge` carried, its markers back to ``None`` and ``"Rep"``."""
+    return [None if t.numel() == 0 else _REPEAT if t.dtype == torch.int8 else t for t in signal]
+
+
+def decoder_cache(vae: nn.Module, signal: list[torch.Tensor]) -> FeatCache:
+    """The decoder's cache from the edge `to_edge` filled, empty at a stream's first chunk. A compiled decode
+    guards on the cache's type, so it comes back a ``FeatCache``."""
+    return FeatCache(from_edge(signal)) if signal else new_feat_cache(vae)
+
+
 def compact_feat_cache(feat_cache: list) -> None:
     """Give every slot compact storage with ``_compact_strides``, in place,
     so the cache holds only ``feat_cache_bytes``."""

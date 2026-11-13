@@ -64,32 +64,6 @@ SELF_ATTN, TEXT_ATTN = "self_attn", "text_attn"
 ENCODER_CACHE, DECODER_CACHE = "encoder_cache", "decoder_cache"
 # what a chunk adds to its outputs under keep_chunk_outputs
 CHUNK_OUTPUTS = ("chunk_latents", "chunk_pixels", "chunk_condition")
-# diffusers' marker in a temporal upsample's slot on a stream's first call
-_REPEAT = "Rep"
-
-
-def to_edge(cache: list, device: torch.device) -> list[torch.Tensor]:
-    """A causal-conv cache as an edge carries it: an empty slot as a 0-element tensor and diffusers' ``"Rep"`` as one
-    ``int8``, since an edge holds tensors only."""
-    return [
-        slot if torch.is_tensor(slot)
-        else torch.zeros(1, dtype=torch.int8, device=device) if slot == _REPEAT
-        else torch.empty(0, device=device)
-        for slot in cache
-    ]
-
-
-def from_edge(signal: list[torch.Tensor]) -> list:
-    """The cache `to_edge` carried, its markers back to ``None`` and ``"Rep"``."""
-    return [None if t.numel() == 0 else _REPEAT if t.dtype == torch.int8 else t for t in signal]
-
-
-def decoder_cache(vae: nn.Module, signal: list[torch.Tensor]) -> wan_vae.FeatCache:
-    """The decoder's cache from ``DECODER_CACHE``, empty at a stream's first chunk. A compiled decode guards on the
-    cache's type, so it comes back a ``FeatCache``."""
-    return wan_vae.FeatCache(from_edge(signal)) if signal else wan_vae.new_feat_cache(vae)
-
-
 def first_frame_mask(num_latent_frames: int, lat_h: int, lat_w: int, device) -> torch.Tensor:
     """The reference's ``[4, lat_f, lat_h, lat_w]`` I2V mask: the first video
     frame is known, repeated over the first latent's four temporal slots."""
@@ -121,10 +95,10 @@ class EncoderStream:
         if len(signal) == 1:
             self.cache, self.steady = None, signal[0]
         elif signal:
-            self.cache = from_edge(signal)
+            self.cache = wan_vae.from_edge(signal)
 
     def edge(self, device: torch.device) -> list[torch.Tensor]:
-        return [self.steady] if self.steady is not None else to_edge(self.cache, device)
+        return [self.steady] if self.steady is not None else wan_vae.to_edge(self.cache, device)
 
     def encode_black(self, vae: nn.Module, x: torch.Tensor) -> torch.Tensor:
         """One encoder call on black frames. When a call leaves every cache
@@ -357,7 +331,7 @@ class LingBotDitSubmodule(NodeSubmodule):
             commit_t = torch.stack([steps[-1] * 0.0]).to(device)
             self.dit(x0, commit_t, text_kv, y, conditioning, keep=True)
             del conditioning, text_kv
-            feat_cache = decoder_cache(self.vae, decoder_signal)
+            feat_cache = wan_vae.decoder_cache(self.vae, decoder_signal)
             pixels = self._decode(x0, feat_cache, clip_start=chunk == 0)
 
         # quantize from fp32; a bf16 decode's frames round once, here
@@ -366,7 +340,7 @@ class LingBotDitSubmodule(NodeSubmodule):
             "clock": [torch.full((1,), chunk + 1, dtype=torch.int64, device=device)],
             "video_output": [frames_u8],
             ENCODER_CACHE: stream.edge(device),
-            DECODER_CACHE: to_edge(feat_cache, device),
+            DECODER_CACHE: wan_vae.to_edge(feat_cache, device),
         }
         if cfg.keep_chunk_outputs:
             outputs.update(chunk_latents=[x0], chunk_pixels=[pixels], chunk_condition=[y])

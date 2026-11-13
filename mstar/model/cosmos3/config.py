@@ -361,24 +361,19 @@ class Cosmos3Config:
     # mid-stream latent is not a clip start.
     chained_head_context_latents: int = 2
     # Keep each live stream's VAE decoder cache (the last frames every causal
-    # conv saw) in its request state, so a window decodes only its new latents.
+    # conv saw) on its decode loop's loop-back edge, so a window decodes only
+    # its new latents.
     # Without compile, at windowed_decode_latents_per_call=1 and the contiguous
     # layout, the frames are bit-identical to one decode of the whole stream
     # (the CPU tests assert it); under compile, channels-last or =0 they match
     # it to bf16 rounding. Costs the cache per live stream, freed when the
     # stream's last window is decoded or the request goes away: 1.33 GiB of
     # tensors at 832x480 in bf16 (the Wan2.2 VAE), growing with the frame
-    # area, and twice that when the decode runs in fp32 (cuDNN before 9.16).
+    # area, and twice that when the decode runs in fp32 (cuDNN before 9.16),
+    # with a second copy across each window's step boundary.
     # Sessions still store only latents. False re-decodes the context ahead
     # of every window.
     windowed_decode_warm_cache: bool = True
-    # At most this many streams per decoder copy hold a warm cache (0: no cap).
-    # A stream that starts while the cap is reached takes the stateless
-    # re-decode for its whole life. The cap counts streams, not bytes: size it
-    # from the per-stream cache at the served resolution and decode dtype. The caches sit outside any engine resource
-    # pool, and the shipped configs set no max_concurrent_requests, so with no
-    # cap their total is bounded only by how many streams are admitted.
-    windowed_decode_max_warm_streams: int = 0
     # Latent frames per VAE decoder call in the streaming decode. 1 issues the
     # same decoder calls as ``vae.decode`` (bit-exact against it in fp32 and
     # eagerly in the default layout). N > 1 groups N latents per call and 0
@@ -574,15 +569,14 @@ class Cosmos3Config:
     def check_streaming_decode(self) -> None:
         """Reject streaming-decoder settings the decoder would otherwise
         reinterpret silently: a non-boolean switch (a yaml ``"false"`` is
-        truthy), a negative warm-stream cap (read as no cap), or more latents
-        per call than the default window holds (read as one call per window)."""
+        truthy), a negative count, or more latents per call than the default
+        window holds (read as one call per window)."""
         for name in ("windowed_decode_warm_cache", "vae_decode_channels_last", "vae_decode_cudnn_benchmark",
                      "vae_decode_fast"):
             value = getattr(self, name)
             if not isinstance(value, bool):
                 raise ValueError(f"Cosmos3 {name} must be true or false, got {value!r}.")
-        for name in ("windowed_decode_max_warm_streams", "windowed_decode_latents_per_call",
-                     "chained_head_context_latents"):
+        for name in ("windowed_decode_latents_per_call", "chained_head_context_latents"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(f"Cosmos3 {name} must be an integer >= 0, got {value!r}.")

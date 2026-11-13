@@ -27,8 +27,13 @@ from mstar.model.cosmos3.submodules import (
     ATTN,
     CFG_BATCHED_LABEL,
     COND_LABEL,
+    DECODE_CACHE,
+    DECODE_FRAMES,
+    DECODE_SENT,
+    DECODE_TAIL,
     KV_CACHE,
     UNCOND_LABEL,
+    VIDEO_DECODE_AR_LOOP,
     Cosmos3DiTSubmodule,
     Cosmos3VAEDecoderARSubmodule,
 )
@@ -563,6 +568,19 @@ def _ar_decoder(monkeypatch):
     return sub
 
 
+def _loop_edges(outputs: dict) -> dict:
+    return {name: outputs[name] for name in (DECODE_TAIL, DECODE_SENT, DECODE_FRAMES, DECODE_CACHE) if name in outputs}
+
+
+def _decode(sub, engine_inputs, *windows) -> list[dict]:
+    """The decoder's outputs for each of a request's windows, its loop-back edges carried from one to the next."""
+    outs, edges = [], {}
+    for i, latents in enumerate(windows):
+        outs.append(sub.forward(C.VIDEO_DECODE_AR_WALK, engine_inputs, latents, window=i, edges=edges))
+        edges = _loop_edges(outs[-1])
+    return outs
+
+
 def test_windowed_decoder_assembles_stream(monkeypatch) -> None:
     """The AR decoder's context-re-decode + trim reproduces the whole-clip
     decode of the same latent stream, chunk counts drive completion, and the
@@ -574,12 +592,19 @@ def test_windowed_decoder_assembles_stream(monkeypatch) -> None:
     md = {"num_windows": 2, "overlap_latent_units": 1, "num_frames": 45}
     engine_inputs = SimpleNamespace(request_ids=["r"], per_request_info={"r": SimpleNamespace(step_metadata=md)})
 
+    def fwd(window):
+        return SimpleNamespace(dynamic_loop_iter_counts={VIDEO_DECODE_AR_LOOP: window})
+
     assert sub.prepare_inputs(
-        C.VIDEO_DECODE_AR_WALK, None, {"window_latents": []}, is_final_stream_chunk=True,
+        C.VIDEO_DECODE_AR_WALK, fwd(2), {"window_latents": []}, is_final_stream_chunk=True,
     ) is None
-    first = sub.prepare_inputs(C.VIDEO_DECODE_AR_WALK, None, {"window_latents": [stream[:, :, 0:8]]})
-    assert sub.forward(C.VIDEO_DECODE_AR_WALK, engine_inputs, first.tensor_inputs["latents"]) == {}
-    out = sub.forward(C.VIDEO_DECODE_AR_WALK, engine_inputs, stream[:, :, 7:12])
+    first = sub.prepare_inputs(C.VIDEO_DECODE_AR_WALK, fwd(0), {"window_latents": [stream[:, :, 0:8]]})
+    out = sub.forward(C.VIDEO_DECODE_AR_WALK, engine_inputs, **first.tensor_inputs, **first.kwargs)
+    assert "video_output" not in out
+    second = sub.prepare_inputs(
+        C.VIDEO_DECODE_AR_WALK, fwd(1), {"window_latents": [stream[:, :, 7:12]], **_loop_edges(out)},
+    )
+    out = sub.forward(C.VIDEO_DECODE_AR_WALK, engine_inputs, **second.tensor_inputs, **second.kwargs)
     video = out["video_output"][0]
 
     expected = sub._decode_pixels(stream)[0].transpose(0, 1)  # [T, C, H, W] frames
@@ -598,14 +623,13 @@ def test_windowed_decoder_streams_chunks(monkeypatch) -> None:
     md = {"num_windows": 2, "overlap_latent_units": 1, "num_frames": 43, "stream_video": True}
     engine_inputs = SimpleNamespace(request_ids=["r"], per_request_info={"r": SimpleNamespace(step_metadata=md)})
 
-    out0 = sub.forward(C.VIDEO_DECODE_AR_WALK, engine_inputs, stream[:, :, 0:8])
-    out1 = sub.forward(C.VIDEO_DECODE_AR_WALK, engine_inputs, stream[:, :, 7:12])
+    out0, out1 = _decode(sub, engine_inputs, stream[:, :, 0:8], stream[:, :, 7:12])
     c0 = out0["video_output"][0]
     c1 = out1["video_output"][0]
     assert c0.shape[0] == 29 and c1.shape[0] == 14
     expected = sub._decode_pixels(stream)[0].transpose(0, 1)
     assert torch.equal(torch.cat([c0, c1]), expected[:43])
-    assert sub.request_state("r")["ar_pixels"] == []
+    assert out1[DECODE_FRAMES][0].numel() == 0
 
 
 def test_windowed_stream_video_gen_params() -> None:
@@ -817,7 +841,7 @@ def test_session_decoder_resumes_with_context(monkeypatch) -> None:
 
     # Request 1: one 8-unit window under session "w".
     md1 = {"rid": "r1", "num_windows": 1, "overlap_latent_units": 0, "num_frames": 29, "session_id": "w"}
-    out1 = sub.forward(C.VIDEO_DECODE_AR_WALK, infos(md1), stream[:, :, 0:8])
+    out1 = _decode(sub, infos(md1), stream[:, :, 0:8])[0]
     assert "w" in sub._sessions and sub._sessions.get("w").shape[2] == 3
     # Request 2 resumes: its window re-pins units 6..8 and generates 8..16
     # (10 units), asking for the 32 new frames = 8 new units x 4.
@@ -825,7 +849,7 @@ def test_session_decoder_resumes_with_context(monkeypatch) -> None:
         "rid": "r2", "num_windows": 1, "overlap_latent_units": 0, "num_frames": 32,
         "session_id": "w", "resume_latent_units": 2,
     }
-    out2 = sub.forward(C.VIDEO_DECODE_AR_WALK, infos(md2), stream[:, :, 6:16])
+    out2 = _decode(sub, infos(md2), stream[:, :, 6:16])[0]
     video = torch.cat([out1["video_output"][0], out2["video_output"][0]])
     assert torch.equal(video, sub._decode_pixels(stream)[0].transpose(0, 1))
     # A resume whose session this node never saw still decodes, without
@@ -833,7 +857,7 @@ def test_session_decoder_resumes_with_context(monkeypatch) -> None:
     # the next as a mid-stream latent (4) -> 5 frames from the 2 new units.
     md3 = {"rid": "r3", "num_windows": 1, "overlap_latent_units": 0, "num_frames": 8,
            "session_id": "ghost", "resume_latent_units": 2}
-    out3 = sub.forward(C.VIDEO_DECODE_AR_WALK, infos(md3), stream[:, :, 6:10])
+    out3 = _decode(sub, infos(md3), stream[:, :, 6:10])[0]
     assert out3["video_output"][0].shape[0] == 5
 
 
@@ -928,15 +952,15 @@ def test_session_decoder_promotes_on_read_and_ends(monkeypatch) -> None:
 
     base = {"num_windows": 1, "overlap_latent_units": 0, "num_frames": 29}
     for sid in ("a", "b"):
-        sub.forward(C.VIDEO_DECODE_AR_WALK, infos({**base, "rid": f"r-{sid}", "session_id": sid}), stream[:, :, 0:8])
+        _decode(sub, infos({**base, "rid": f"r-{sid}", "session_id": sid}), stream[:, :, 0:8])[0]
     assert sub._sessions.ids() == ["a", "b"]
     # A two-window resume of "a": its first window reads (and promotes) the
     # context without storing anything yet.
     md = {**base, "rid": "r-a2", "num_windows": 2, "num_frames": 40, "session_id": "a", "resume_latent_units": 2}
-    sub.forward(C.VIDEO_DECODE_AR_WALK, infos(md), stream[:, :, 6:12])
+    _decode(sub, infos(md), stream[:, :, 6:12])[0]
     assert sub._sessions.ids() == ["b", "a"]
     md = {**base, "rid": "r-a3", "session_id": "a", "end_session": True}
-    sub.forward(C.VIDEO_DECODE_AR_WALK, infos(md), stream[:, :, 0:8])
+    _decode(sub, infos(md), stream[:, :, 0:8])[0]
     assert sub._sessions.ids() == ["b"]
 
 

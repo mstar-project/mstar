@@ -3032,31 +3032,35 @@ class Cosmos3VAEDecoderSubmodule(NodeSubmodule):
         return {"image_output": [pixels]}
 
 
+# The streaming decoder's loop over a request's windows, and its loop-back edges: the latents behind the next
+# window's first frame, the frames sent to the client so far (a host count), the frames a request that doesn't
+# stream has decoded so far, and the VAE decoder's cache where the warm cache is on.
+VIDEO_DECODE_AR_LOOP = "video_decode_ar_loop"
+DECODE_TAIL, DECODE_SENT, DECODE_FRAMES, DECODE_CACHE = "decode_tail", "decode_sent", "decode_frames", "decode_cache"
+
+
 class Cosmos3VAEDecoderARSubmodule(Cosmos3VAEDecoderSubmodule):
     """Streaming Wan VAE decode for windowed AR video (ported from #198).
 
-    Consumes one committed window's latents per stream chunk; the overlap a
-    window re-pins is trimmed, and the video is either emitted per window
-    (``stream_video``) or assembled and emitted once the last window lands.
+    Runs once per committed window, in a loop over the request's window
+    stream (``VIDEO_DECODE_AR_LOOP``); the overlap a window re-pins is
+    trimmed, and the video is either emitted per window (``stream_video``)
+    or assembled on a loop-back edge and emitted once the last window lands.
 
-    A live stream keeps the VAE decoder's causal conv cache in its request
-    state (``windowed_decode_warm_cache``), so each window decodes only its
-    new latents, continuing the cache the previous window left: the frames
-    are those of one decode of the whole stream. A warm stream's first
+    With ``windowed_decode_warm_cache`` the VAE decoder's causal conv cache
+    rides a loop-back edge (``DECODE_CACHE``), so each window decodes only
+    its new latents, continuing the cache the previous window left: the
+    frames are those of one decode of the whole stream. A stream's first
     window (fresh or resumed) is decoded behind a re-decoded left context
     (the last few latents of the resumed session, if any), so the conv stack
     is warm at the kept frames, and the context-derived pixels are trimmed;
-    that decode leaves the cache the stream continues from. All of a
-    stream's windows reach the decoder copy it was admitted to. With the
-    warm cache off, or for a stream that starts while
-    ``windowed_decode_max_warm_streams`` streams already hold a cache, every
-    window takes that stateless re-decode.
-    Sessions store only the latent context, never the cache.
+    that decode leaves the cache the stream continues from. With the warm
+    cache off, every window takes that stateless re-decode. Sessions store
+    only the latent context, never the cache.
 
-    The chunk count is the completion signal — it is known per request up
-    front — so the stream's terminal flush (an empty pass, and the only pass
-    a non-windowed request's idle stream ever delivers) is declined; the
-    partition still reports done.
+    The stream's terminal flush (an empty pass, and the only pass a
+    non-windowed request's idle stream ever delivers) is declined, which
+    ends the loop.
     """
 
     def __init__(self, vae, config):
@@ -3088,67 +3092,44 @@ class Cosmos3VAEDecoderARSubmodule(Cosmos3VAEDecoderSubmodule):
         if not chunks:
             assert is_final_stream_chunk, "an empty chunk before the end of the stream"
             return None
-        return NodeInputs(tensor_inputs={"latents": chunks[0]})
+        return NodeInputs(
+            tensor_inputs={"latents": chunks[0]},
+            kwargs={
+                "window": int(fwd_info.dynamic_loop_iter_counts[VIDEO_DECODE_AR_LOOP]),
+                "edges": {
+                    name: inputs[name] for name in (DECODE_TAIL, DECODE_SENT, DECODE_FRAMES, DECODE_CACHE)
+                    if name in inputs
+                },
+            },
+        )
 
-    def forward(self, graph_walk, engine_inputs: ModelInputsFromEngine, latents, **kwargs):
-        rid = engine_inputs.request_ids[0]
-        st = self.request_state(rid)
-        if "ar_chunks" not in st:
-            md = engine_inputs.per_request_info[rid].step_metadata
-            session_id = md.get("session_id")
-            resume = int(md.get("resume_latent_units", 0) or 0)
-            st.add_all(
-                ar_chunks=0,
-                ar_windows=int(md["num_windows"]),
-                ar_overlap=int(md["overlap_latent_units"]),
-                ar_ctx=max(1, int(self.config.windowed_decode_context_latents)),
-                # The schedule may be padded up to whole windows; the request's
-                # frame count is what the assembled video is trimmed to.
-                ar_out_frames=int(md["num_frames"]),
-                ar_stream=bool(md.get("stream_video")),
-                ar_emitted=0,
-                ar_pixels=[],
-                ar_session_id=str(session_id) if session_id else None,
-                # A resumed session: window 0's pinned head duplicates frames
-                # the client already has, so it is trimmed like an overlap,
-                # and the session's decode context (when this node still
-                # holds it) warms the conv stack behind the first new frame.
-                ar_resume=resume,
-                ar_end_session=bool(md.get("end_session")),
-                ar_session_ttl=md.get("session_timeout_s"),
-                # Decided once per stream, so a stream never switches paths.
-                ar_warm=self._warm_enabled and self._warm_slot_free(),
-            )
-            if resume and session_id:
-                tail = self._sessions.get(str(session_id))  # promotes, like the DiT
-                if tail is not None:
-                    st.add("ar_tail", tail)
-        index = st["ar_chunks"]
-        overlap = st["ar_overlap"] if index > 0 else st["ar_resume"]
-        new = latents[:, :, overlap:] if overlap else latents
-        tail = st.get("ar_tail")
-        # The retained tail is already capped at ar_ctx latents, so appending
-        # the window's new latents yields the [context | window] decode input
-        # and the next tail in one tensor.
-        stream_tail = new if tail is None else torch.cat([tail, new.to(tail.dtype)], dim=2)
-        feat_cache = st.get("ar_feat_cache")
-        if feat_cache is not None:
-            try:
-                pixels = self._decode_stream(new, feat_cache, clip_start=False)
-            except Exception:
-                # The cache is updated in place, so a decode that raised has
-                # left it half-advanced. Drop it: a retry of this window (the
-                # tail and window count have not moved) re-decodes behind its
-                # context like a stream's first window.
-                st.remove("ar_feat_cache")
-                self._log_warm_streams("dropped", rid)
-                raise
+    def forward(self, graph_walk, engine_inputs: ModelInputsFromEngine, latents, window, edges, **kwargs):
+        md = engine_inputs.per_request_info[engine_inputs.request_ids[0]].step_metadata
+        session_id = str(md["session_id"]) if md.get("session_id") else None
+        if window == 0:
+            # A resumed session: window 0's pinned head duplicates frames the
+            # client already has, so it is trimmed like an overlap, and the
+            # session's decode context (when this node still holds it) warms
+            # the conv stack behind the first new frame.
+            overlap = int(md.get("resume_latent_units", 0) or 0)
+            tail = self._sessions.get(session_id) if overlap and session_id else None  # promotes, like the DiT
+            cache, sent, frames = None, 0, None
         else:
-            if st["ar_warm"]:
-                feat_cache = _wan_vae().new_feat_cache(self.vae)
-                pixels = self._decode_stream(stream_tail, feat_cache, clip_start=True)
-                st.add("ar_feat_cache", feat_cache)
-                self._log_warm_streams("start", rid)
+            overlap = int(md["overlap_latent_units"])
+            (tail,), (frames,) = edges[DECODE_TAIL], edges[DECODE_FRAMES]
+            cache = _wan_vae().decoder_cache(self.vae, edges[DECODE_CACHE]) if self._warm_enabled else None
+            sent = int(edges[DECODE_SENT][0])
+        new = latents[:, :, overlap:] if overlap else latents
+        # The tail is already capped at the context length, so appending the
+        # window's new latents yields the [context | window] decode input and
+        # the next tail in one tensor.
+        stream_tail = new if tail is None else torch.cat([tail, new.to(tail.dtype)], dim=2)
+        if cache is not None:
+            pixels = self._decode_stream(new, cache, clip_start=False)
+        else:
+            if self._warm_enabled:
+                cache = _wan_vae().new_feat_cache(self.vae)
+                pixels = self._decode_stream(stream_tail, cache, clip_start=True)
             else:
                 pixels = self._decode_pixels(stream_tail)
             if tail is not None:
@@ -3157,47 +3138,30 @@ class Cosmos3VAEDecoderARSubmodule(Cosmos3VAEDecoderSubmodule):
                 # inside it) is exactly the part being trimmed.
                 keep = new.shape[2] * self.config.vae.scale_factor_temporal
                 pixels = pixels[:, :, -keep:]
-        st.add("ar_tail", stream_tail[:, :, -st["ar_ctx"]:])
-        st.add("ar_chunks", index + 1)
-        if index + 1 >= st["ar_windows"]:
-            if st.get("ar_feat_cache") is not None:
-                st.remove("ar_feat_cache")
-                self._log_warm_streams("end", rid)
-            if st["ar_session_id"]:
-                if st.get("ar_end_session"):
-                    self._sessions.end(st["ar_session_id"])
-                else:
-                    self._sessions.put(st["ar_session_id"], st["ar_tail"], st.get("ar_session_ttl"))
-        if st["ar_stream"]:
-            # Deliver each window as its own chunk, capped at the frames still
-            # owed (the padded final window can outrun the requested count);
-            # nothing is retained across windows.
-            chunk = pixels[:, :, : st["ar_out_frames"] - st["ar_emitted"]]
-            st.add("ar_emitted", st["ar_emitted"] + chunk.shape[2])
-            return {"video_output": [self._video_frames(chunk)]} if chunk.shape[2] else {}
-        st["ar_pixels"].append(pixels)
-        if index + 1 < st["ar_windows"]:
-            return {}
-        video = torch.cat(st["ar_pixels"], dim=2)[:, :, : st["ar_out_frames"]]
-        return {"video_output": [self._video_frames(video)]}
-
-    def _warm_streams_live(self) -> list:
-        # A snapshot: the worker's main thread removes request states while
-        # forwards run on its GPU thread, and list() copies under the GIL.
-        states = list(self.request_states.values())
-        return [s["ar_feat_cache"] for s in states if s.get("ar_feat_cache") is not None]
-
-    def _warm_slot_free(self) -> bool:
-        cap = int(self.config.windowed_decode_max_warm_streams)
-        return cap <= 0 or len(self._warm_streams_live()) < cap
-
-    def _log_warm_streams(self, event: str, rid: str) -> None:
-        if logger.isEnabledFor(logging.DEBUG):
-            caches = self._warm_streams_live()
-            logger.debug(
-                "vae_decoder_ar: warm stream %s (%s); %d live, %.2f GiB of decoder cache",
-                event, rid, len(caches), sum(_wan_vae().feat_cache_bytes(c) for c in caches) / 2**30,
-            )
+        tail = stream_tail[:, :, -max(1, int(self.config.windowed_decode_context_latents)):]
+        last = window + 1 >= int(md["num_windows"])
+        if last and session_id:
+            if md.get("end_session"):
+                self._sessions.end(session_id)
+            else:
+                self._sessions.put(session_id, tail, md.get("session_timeout_s"))
+        # The schedule may be padded up to whole windows; the request's frame
+        # count caps what the client gets.
+        chunk = pixels[:, :, : int(md["num_frames"]) - sent]
+        outputs = {DECODE_TAIL: [tail], DECODE_SENT: [torch.tensor([sent + chunk.shape[2]])]}
+        if self._warm_enabled:
+            outputs[DECODE_CACHE] = _wan_vae().to_edge(cache, latents.device)
+        if md.get("stream_video"):
+            # each window goes to the client as its own chunk, and nothing is kept across windows
+            outputs[DECODE_FRAMES] = [chunk[:, :, :0]]
+            if chunk.shape[2]:
+                outputs["video_output"] = [self._video_frames(chunk)]
+            return outputs
+        frames = chunk if frames is None else torch.cat([frames, chunk], dim=2)
+        outputs[DECODE_FRAMES] = [frames]
+        if last:
+            outputs["video_output"] = [self._video_frames(frames)]
+        return outputs
 
     def _decode_pixels(self, latents: torch.Tensor) -> torch.Tensor:
         if not self.config.vae_decode_cudnn_benchmark:

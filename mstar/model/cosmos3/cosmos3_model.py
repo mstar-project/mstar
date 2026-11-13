@@ -110,6 +110,10 @@ from mstar.model.cosmos3.submodules import (
     ATTN,
     ATTN_GEN,
     COND_LABEL,
+    DECODE_CACHE,
+    DECODE_FRAMES,
+    DECODE_SENT,
+    DECODE_TAIL,
     DENOISE_LOOP_FOR_WALK,
     GEN_WALKS,
     IMAGE_GEN_LOOP,
@@ -120,6 +124,7 @@ from mstar.model.cosmos3.submodules import (
     SEQ_SHARD,
     SOUND_WALKS,
     UNCOND_LABEL,
+    VIDEO_DECODE_AR_LOOP,
     VIDEO_GEN_AR_LOOP,
     VIDEO_GEN_LOOP,
     VIDEO_SOUND_GEN_LOOP,
@@ -905,19 +910,22 @@ class Cosmos3Model(Model):
                 ),
             ]
         )
-        # The decoder partition's walk must be the bare consumer node (the
-        # streaming consumer lookup resolves the edge's node from a top-level
-        # GraphNode section).
-        video_decode_ar = GraphNode(
-            name=VAE_DECODER_AR_NODE,
-            input_names=["window_latents"],
-            outputs=[
-                GraphEdge(
-                    next_node=EMIT_TO_CLIENT,
-                    name="video_output",
-                    output_modality="video",
-                ),
-            ],
+        decode_edges = [DECODE_TAIL, DECODE_SENT, DECODE_FRAMES]
+        if self.config.windowed_decode_warm_cache:
+            decode_edges.append(DECODE_CACHE)
+        video_decode_ar = Loop(
+            name=VIDEO_DECODE_AR_LOOP,
+            section=GraphNode(
+                name=VAE_DECODER_AR_NODE,
+                input_names=["window_latents", *decode_edges],
+                outputs=[
+                    *(GraphEdge(next_node=VAE_DECODER_AR_NODE, name=name) for name in decode_edges),
+                    GraphEdge(next_node=EMIT_TO_CLIENT, name="video_output", output_modality="video"),
+                ],
+            ),
+            # a window an iteration, and the stream's empty last chunk
+            max_iters=self.config.max_windows + 1,
+            outputs=[],
         )
         return {
             self.VIDEO_GEN_AR_WALK: video_gen_ar,
