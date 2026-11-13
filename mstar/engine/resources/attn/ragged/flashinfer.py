@@ -65,6 +65,17 @@ class _FlashInferRaggedManagerBase(_RaggedManagerBase):
 class FlashInferRaggedManager(_FlashInferRaggedManagerBase, _RaggedSelfManagerBase):
     wrapper_class = FlashInferRaggedPrefillWrapper
 
+    def _build_wrapper(self, label: str, slot: int, **wrapper_kwargs) -> _RaggedPrefillBase:
+        # under a pipelined Ulysses exchange an eager wrapper also plans one head group's
+        # heads, on a workspace of its own, so the pipeline can attend a group at a time
+        groups = self._config.ulysses_head_groups
+        heads = self._kwargs["num_qo_heads"]
+        if (self._ulysses_pipeline is not None and not wrapper_kwargs.get("accelerator_graph")
+                and groups > 1 and heads % groups == 0):
+            wrapper_kwargs.setdefault("group_heads", heads // groups)
+            wrapper_kwargs.setdefault("group_workspace", self._workspaces.get(f"{label}#heads/{groups}", slot))
+        return super()._build_wrapper(label, slot, **wrapper_kwargs)
+
 
 class FlashInferRaggedCrossManager(_FlashInferRaggedManagerBase, _RaggedCrossManagerBase):
     wrapper_class = FlashInferRaggedCrossPrefillWrapper
