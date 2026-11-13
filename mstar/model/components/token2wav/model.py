@@ -1,9 +1,9 @@
-"""MiniCPM-o's token2wav: streamed s3 speech codes -> 24 kHz waveform.
+"""Step-Audio2's token2wav: streamed s3 speech codes -> 24 kHz waveform.
 
 Ported from Step-Audio2's ``Token2wav`` streaming path (``set_stream_cache`` + ``stream``,
 ``minicpmo-utils``, Apache-2.0). A voice's caches are prepared once by running the flow over
 its prompt; each window of 28 codes (25 new, 3 lookahead) then becomes mel
-(``token2wav_flow``) and audio (HiFT), cross-faded with the previous window's tail.
+(``flow``) and audio (HiFT), cross-faded with the previous window's tail.
 
 A window runs in two captured stages: ``window_flow``, whose attention caches are on bounded
 KV resources (``CACHE_FAMILIES``) so windows at any position batch, and ``window_vocode``
@@ -33,8 +33,7 @@ from mstar.engine.resources.kv.bounded import SinkWindow
 from mstar.engine.resources.recurrent.pool import RecurrentAddressing, RecurrentStatePool
 from mstar.model.chatterbox.components.s3gen_hift import HiFTGenerator, HiFTNoise
 from mstar.model.chatterbox.config import S3GenHiFTConfig
-from mstar.model.cosyvoice3.components.onnx_weights import load_campplus, load_speech_tokenizer
-from mstar.model.minicpm_o.components.token2wav_flow import (
+from mstar.model.components.token2wav.flow import (
     DIT_DEPTH,
     DIT_HEAD_DIM,
     DIT_HEADS,
@@ -53,7 +52,8 @@ from mstar.model.minicpm_o.components.token2wav_flow import (
     FlowKV,
     Token2WavFlow,
 )
-from mstar.model.minicpm_o.components.voice_prompt import VoicePrompt, VoicePromptEncoder
+from mstar.model.components.token2wav.voice_prompt import VoicePrompt, VoicePromptEncoder
+from mstar.model.cosyvoice3.components.onnx_weights import load_campplus, load_speech_tokenizer
 
 SAMPLE_RATE = 24000
 SILENCE_CODE = 4218
