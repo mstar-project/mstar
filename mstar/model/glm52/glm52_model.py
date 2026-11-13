@@ -149,8 +149,8 @@ class Glm52Model(ByteLevelTextOutput, Model):
             self.config.mtp_num_draft_tokens = k
         if self.config.mtp_num_draft_tokens > 0:
             self._check_mtp(kwargs)
-        if self.config.rope_interleave != self.config.indexer_rope_interleave:
-            # the index keys rotate through the latent array's Rope
+        if self.config.dsa_long_context and self.config.rope_interleave != self.config.indexer_rope_interleave:
+            # only long context builds the indexer, and its keys rotate through the latent array's Rope
             raise ValueError(
                 f"rope_interleave={self.config.rope_interleave} and indexer_rope_interleave="
                 f"{self.config.indexer_rope_interleave}: GLM-5.2's indexer rotates as its MLA does")

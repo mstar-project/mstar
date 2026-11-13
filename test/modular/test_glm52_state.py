@@ -190,9 +190,9 @@ def _reduced(monkeypatch, **fields) -> None:
 
 def test_glm52_refuses_an_indexer_that_rotates_its_own_way(monkeypatch):
     """The index keys rotate through the latent array's Rope, which holds the MLA's pairing."""
-    _reduced(monkeypatch, indexer_rope_interleave=not Glm52ModelConfig.reduced().rope_interleave)
+    _reduced(monkeypatch, mla_absorb=True, indexer_rope_interleave=not Glm52ModelConfig.reduced().rope_interleave)
     with pytest.raises(ValueError, match="indexer rotates as its MLA does"):
-        Glm52Model(model_path_hf="", config_variant="reduced", tokenizer_mode="byte")
+        Glm52Model(model_path_hf="", config_variant="reduced", tokenizer_mode="byte", dsa_long_context=True)
 
 
 def test_glm52_refuses_dsa_whose_first_layer_reuses_a_pick(monkeypatch):
