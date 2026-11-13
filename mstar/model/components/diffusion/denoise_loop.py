@@ -50,6 +50,12 @@ Conventions the base fixes:
   so rows batch and capture per dtype, the scheduler batches each dtype apart,
   and ``denoise`` reads the step's dtype off :attr:`step_dtype` while the hooks
   keep seeing the model's own key.
+* A fused loop (``fused_steps``, off by default) runs a request's whole fixed
+  schedule in one engine step: the model caps its loop at one iteration, the step
+  inputs carry every step's scalars (``[N]`` per row) and :meth:`_run` calls
+  ``denoise`` once a step, with :meth:`step_index` reading the round. A captured
+  bucket then records the whole loop, scheduler math included, as one graph.
+  The schedule must be fixed by the bucket key (``schedule_settings`` None).
 * Step caching (``step_cache``, off by default) is the base's too: a step's key
   then also says whether it reuses the cached residual (:class:`StepBucket`), so
   rows batch only with rows making the same decision, and ``denoise`` gets the
@@ -170,9 +176,15 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         max_uncaptured_layouts: int = 4,
         step_dtypes: StepDtypes | None = None,
         step_cache: StepCachePolicy | None = None,
+        fused_steps: bool = False,
     ):
         super().__init__()
         self.loop_name = loop_name
+        # the whole schedule in one engine step (see the module docstring); `_fused_round` is the step running
+        self.fused_steps = bool(fused_steps)
+        self._fused_round: int | None = None
+        if self.fused_steps and (step_dtypes is not None or step_cache is not None):
+            raise ValueError(f"{type(self).__name__}: fused_steps takes no step schedule or step cache")
         self._max_batch_size = int(max_batch_size)
         # (graph_walk, bucket_key) pairs to capture; the same key on another walk
         # replays only if ``replay_walks`` says so.
@@ -355,7 +367,11 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         output, and reading it on the host waits for that step to finish, which
         stalls the speculative preparation of this one. A missing counter raises:
         read as 0, it would reseed from noise every iteration.
+
+        In a fused loop's ``_run`` it is the round, the same for every row.
         """
+        if self._fused_round is not None:
+            return self._fused_round
         return int(fwd_info.dynamic_loop_iter_counts[self.loop_name])
 
     def step_key(self, fwd_info: CurrentForwardPassInfo, bucket_key: Hashable, step: int | None = None) -> Hashable:
@@ -391,10 +407,15 @@ class DenoiseLoopSubmodule(NodeSubmodule):
                 f"{num_steps} steps; declare the step count as the loop's cap (Model.get_loop_caps)"
             )
         staged = self._staged_schedules(*schedule_key)
+        # one step's scalars, or under fused_steps every step's ([N] a row; the loop runs one iteration)
+        if self.fused_steps and (k != 0 or schedule_key[1] is not None):
+            raise RuntimeError(f"{type(self).__name__}: a fused loop runs one iteration of a schedule the bucket "
+                               f"fixes; got iteration {k}, settings {schedule_key[1]!r} (cap the loop at 1)")
+        span = num_steps if self.fused_steps else 1
         tensors = {
             **self._carried_inputs(fwd_info, inputs, bucket_key, k, device),
             **{
-                name: staged[scalar.source][k + scalar.offset:k + scalar.offset + 1]
+                name: staged[scalar.source][k + scalar.offset:k + scalar.offset + span]
                 for name, scalar in self.STEP_SCALARS.items()
             },
             **self.request_inputs(fwd_info, inputs, bucket_key),
@@ -477,23 +498,47 @@ class DenoiseLoopSubmodule(NodeSubmodule):
     def preprocess(self, graph_walk: str, engine_inputs: ModelInputsFromEngine, inputs: list[NodeInputs]) -> dict:
         keys = inputs[0].tensor_inputs.keys()
         stacked = {key: torch.stack([inp.tensor_inputs[key] for inp in inputs]) for key in keys}
-        for name, scalar in self.STEP_SCALARS.items():
-            # [B, 1] -> [B, 1, 1] to broadcast over [B, L, C], or a plain [B]
-            stacked[name] = stacked[name].view(-1, 1, 1) if scalar.broadcast else stacked[name].view(-1)
+        if not self.fused_steps:  # fused: [B, N], viewed a step at a time in `_run`
+            for name in self.STEP_SCALARS:
+                stacked[name] = self._step_view(name, stacked[name])
         stacked["bucket_key"] = inputs[0].resource_step_info
         return stacked
+
+    def _step_view(self, name: str, scalar: torch.Tensor) -> torch.Tensor:
+        # [B, 1] -> [B, 1, 1] to broadcast over [B, L, C], or a plain [B]
+        return scalar.view(-1, 1, 1) if self.STEP_SCALARS[name].broadcast else scalar.reshape(-1)
+
+    def round_inputs(self, k: int, cond: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        """A fused loop's conditioning for step ``k``: ``cond`` as prepared for step 0 by default. A model whose
+        ``request_inputs`` read the step index returns step ``k``'s here. Host-side: it runs at capture, not replay."""
+        return cond
 
     def _run(
         self, engine_inputs: ModelInputsFromEngine, kwargs: dict,
     ) -> dict[str, torch.Tensor]:
-        """One stacked step, as ``{loop-back edge: [B, ...]}``."""
+        """One stacked step, as ``{loop-back edge: [B, ...]}``; under ``fused_steps`` every step of the schedule."""
         bucket_key = kwargs.pop("bucket_key")
         if isinstance(bucket_key, StepBucket):
             self.step_dtype, self._step_reuse, bucket_key = bucket_key.dtype, bucket_key.reuse, bucket_key.bucket
         carried = {name: kwargs.pop(name) for name in self.loop_back_names}
         scalars = {name: kwargs.pop(name) for name in self.STEP_SCALARS}
-        out = self.denoise(engine_inputs, bucket_key, **carried, **scalars, **kwargs)
-        return {self.LATENTS: out} if isinstance(out, torch.Tensor) else dict(out)
+        if not self.fused_steps:
+            out = self.denoise(engine_inputs, bucket_key, **carried, **scalars, **kwargs)
+            return {self.LATENTS: out} if isinstance(out, torch.Tensor) else dict(out)
+        handles = [h for h in (getattr(self, "state_handles", None) or {}).values() if hasattr(h, "next_round")]
+        try:
+            for k in range(next(iter(scalars.values())).shape[1]):
+                if k:
+                    for handle in handles:
+                        handle.next_round()
+                self._fused_round = k
+                step = {name: self._step_view(name, scalar[:, k]) for name, scalar in scalars.items()}
+                out = self.denoise(engine_inputs, bucket_key, **carried, **step, **self.round_inputs(k, dict(kwargs)))
+                out = {self.LATENTS: out} if isinstance(out, torch.Tensor) else dict(out)
+                carried = {name: out[name] for name in self.loop_back_names}
+        finally:
+            self._fused_round = None
+        return out
 
     def forward(self, graph_walk: str, engine_inputs: ModelInputsFromEngine, **kwargs) -> NameToTensorList:
         return {name: [value[0]] for name, value in self._run(engine_inputs, kwargs).items()}
@@ -596,9 +641,11 @@ class DenoiseLoopSubmodule(NodeSubmodule):
             )
             for step_key in step_keys:
                 tensors = dict(self.capture_request_inputs(bucket_key, device))
+                # a fused loop's graph holds every step of the bucket's fixed schedule
+                span = self._schedules(walk, None, bucket_key).num_steps if self.fused_steps else 1
                 for name, scalar in self.STEP_SCALARS.items():
                     tensors[name] = torch.full(
-                        (1,), scalar.capture_fill, dtype=torch.float32, device=device,
+                        (span,), scalar.capture_fill, dtype=torch.float32, device=device,
                     )
                 single = NodeInputs(
                     tensor_inputs=tensors, input_seq_len=self.num_tokens(bucket_key), resource_step_info=step_key,
