@@ -888,6 +888,15 @@ def test_a_fused_add_writes_the_pages_a_reach_gathers():
     assert handle.takes_fused(op)
 
 
+def test_a_reach_only_array_keeps_the_fused_ops_it_was_given():
+    """The handle drops its fused ops on a step whose reads attend the step's own k and v, and it asks each read. A
+    reach reads the pages alone."""
+    handle, pool = _reach_handle()
+    handle.fused_ops = frozenset({"gdn"})
+    _reach_step(handle, pool, 12).begin_calls()
+    assert handle.fused_ops == {"gdn"}, "a reach reads the pages, where a fused op's write lands"
+
+
 def test_reference_mode_builds_its_pool():
     """With no read that runs a kernel, the pool takes its KV heads as its query heads, and no attention is built."""
     array = Array("dit_kv", nodes={"dit"}, layers={0, 1}, entry=KVEntry(heads=HEADS, head_dim=DIM), max_len=64,
