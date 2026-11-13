@@ -55,6 +55,8 @@ A node that verifies drafts (speculative decoding) is row 4 whatever its model d
 of the rebuild policies (`Engine.rebuild_policies`), so a request there moves only to the host, and with no host pool
 every one is guaranteed. Its reservation covers the verify slack, 2(k + 1) tokens past its verified length, since the
 conductor floors each label's scratch at it, and startup warns about a verifying node on a pool with no host pool.
+With a host pool, a guaranteed request there lends what it hasn't written of its reservation, the verify slack
+included, as any guaranteed request does; with none, nothing moves, so nothing is lent.
 
 R5 keeps a host copy of the encoder's output for the rebuild of a row 3 request. R5a covers Qwen3.5 images, and R5b covers Bagel, Qwen3-Omni and Higgs. Without a copy, a rebuild of row 3 would have to run the encoder again, which on Bagel and Qwen3-Omni sits on another worker, so such a request stays guaranteed.
 

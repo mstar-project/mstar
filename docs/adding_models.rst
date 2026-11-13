@@ -2005,7 +2005,7 @@ target's KV declares them as a ``KVLayerSet(kv_cache, name, num_layers, num_kv_h
 head_dim)`` in ``DrafterNeeds.kv``, the checkpoint's unsharded counts, derived from its
 ``ModelGeometry`` (``geometry.layer_set(kv_cache, name)``) rather than repeated.
 ``drafter_resources`` joins it to the pool (``PagedKVConfig.join``): the layers are appended
-after the pool's, so they share its pages, lengths, reservations, take-backs, eviction, offload
+after the pool's, so they share its pages, lengths, reservations, verify take-backs, eviction, offload
 and prefix pages, and the pool records each set's slot (``layer_sets``; the declaring stack's
 is ``"target"``). Only a set of the pool's storage geometry (KV heads and head size) joins; a
 set with its own storage geometry is not supported yet and is refused, as is a name joined twice. Query heads are
@@ -2023,7 +2023,9 @@ The engine owns everything across steps: the order inside the step (draft, agree
 drafts, target, verify, observe), the bonus token in the sampler's loop-back slot, the KV
 length the resident graph advances by ``accepted + 1``, the token cut at stop ids and the
 budget, and the take-back of rejected tokens at a later admit. A model keeps no state across
-steps and undoes nothing.
+steps and undoes nothing. That verify take-back lowers lengths only. It is apart from the pool
+taking back pages a guaranteed request lent (``mstar_kv_take_backs_total``), which moves a
+borrower and counts pages.
 
 Every resource on the node states what it can't do, in one ``ResourceCapabilities``: a
 ``verify_refusal`` (fatal for a verifying node) and an ``async_verify_refusal`` (``mode: auto``
