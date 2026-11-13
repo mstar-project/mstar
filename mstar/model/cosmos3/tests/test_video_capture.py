@@ -112,9 +112,27 @@ def test_conditional_only_capture_when_guidance_is_off(monkeypatch) -> None:
     # guided rows can still arrive in this deployment and batch, so its caps stay
     assert sub.max_batch_size(C.IMAGE_GEN_WALK) == sub.max_gen_batch_size
     assert sub.max_batch_size(C.PREFILL_WALK) is None
-    # a distilled checkpoint's rows are all conditional-only: one per step
+    # a distilled checkpoint's rows are all conditional-only: one per step where a
+    # walk has a graph to replay (this deployment captures no prefill)
     sub.config.distilled_sigmas = (1.0, 0.5)
+    assert sub.max_batch_size(C.IMAGE_GEN_WALK) == 1 and sub.max_batch_size(C.PREFILL_WALK) is None
+
+
+def test_distilled_cap_only_on_captured_walks(monkeypatch) -> None:
+    """A distilled deployment takes one row per step on the walks it captures;
+    a walk with no capture (Super I2V's video steps) keeps its rows together."""
+    monkeypatch.setenv("COSMOS3_GEN_CAPTURE_RES", "64x64")
+    monkeypatch.setenv("COSMOS3_GEN_CAPTURE_VIDEO", "")
+    monkeypatch.delenv("COSMOS3_DISABLE_PREFILL_ACCELERATOR_GRAPH", raising=False)
+    monkeypatch.delenv("COSMOS3_DISABLE_ACCELERATOR_GRAPH", raising=False)
+    cfg = Cosmos3Config(compile_denoise=False, guidance_scale=1.0)
+    sub = Cosmos3DiTSubmodule(transformer=_fake_transformer(cfg), config=cfg, scheduler=None)
+    sub.config.distilled_sigmas = (1.0, 0.5)
+    # before the capture configs are declared, nothing replays, so nothing is capped
+    assert sub.max_batch_size(C.IMAGE_GEN_WALK) == sub.max_gen_batch_size
+    sub.get_accelerator_graph_configs("cpu")
     assert sub.max_batch_size(C.IMAGE_GEN_WALK) == 1 and sub.max_batch_size(C.PREFILL_WALK) == 1
+    assert sub.max_batch_size(C.VIDEO_GEN_WALK) == sub.max_gen_batch_size
 
 
 def test_two_branch_deployment_keeps_its_batch_caps(monkeypatch) -> None:
@@ -253,6 +271,59 @@ def test_masked_capture_matches_eager_layout() -> None:
         assert torch.all(e[:, :, 0] == 0)  # the eager unpatchify leaves the clean frame at zero velocity
         assert torch.allclose(e[:, :, 1:], g[:, :, 1:], atol=1e-5, rtol=1e-4)
         assert not torch.all(g[:, :, 0] == 0)  # the graph predicts it too; postprocess masks it away
+
+
+def test_conditional_capture_matches_eager_single_branch() -> None:
+    """``forward_captured_cond`` on a tiny transformer, at the all-frames-noisy
+    graph layout with the clean/noisy mask, gives the eager single-branch
+    ``denoise_step``'s velocity on the noisy frames, for its one row."""
+    from mstar.model.cosmos3.components.packing import build_static_inputs
+    from mstar.model.cosmos3.components.transformer import Cosmos3OmniTransformer
+    from mstar.model.cosmos3.tests.test_edge import _init_all, _OverwriteKV, _tiny_edge_config
+
+    cfg = _tiny_edge_config()
+    model = Cosmos3OmniTransformer(cfg).eval()
+    _init_all(model)
+    res = _OverwriteKV()
+    for child in model.modules():
+        bind = getattr(child, "bind_resources", None)
+        if bind is not None:
+            bind({"kv": res, "attn": res})
+    ids = [3, 5, 7, 11, 13]
+    latents = torch.randn(1, cfg.latent_channel, 3, 4, 4)
+    shape = tuple(latents.shape)
+    eager = build_static_inputs(ids, shape, cfg, 4, 24.0, "cpu", has_image_condition=True)
+    graph = build_static_inputs(ids, shape, cfg, 4, 24.0, "cpu", has_image_condition=False)
+    n_all = graph["num_vision_tokens"]
+    per_frame = n_all // 3
+    mask = torch.cat([torch.zeros(per_frame), torch.ones(n_all - per_frame)])
+    layout = {
+        "vision_token_shapes": graph["vision_token_shapes"],
+        "vision_noisy_frame_indexes": graph["vision_noisy_frame_indexes"],
+        "mse_gen_indexes": graph["vision_mse_loss_indexes"] - graph["und_len"],
+    }
+    sub = SimpleNamespace(transformer=model, _capture_layout={shape: layout}, _gen_attn=lambda engine_inputs: res)
+    with torch.no_grad():
+        res.causal = True
+        model.prefill_und(eager["input_ids"], eager["text_mrope_ids"], COND_LABEL)
+        res.commit()
+        res.causal = False
+        rot_e = model._rotary(eager["gen_position_ids"], latents.device, latents.dtype)
+        cos_g, sin_g = model._rotary(graph["gen_position_ids"], latents.device, latents.dtype)
+        want = model.denoise_step(
+            latents, torch.full((eager["num_noisy_vision_tokens"],), 600.0), rot_e,
+            eager["vision_token_shapes"], eager["vision_noisy_frame_indexes"],
+            eager["vision_mse_loss_indexes"] - eager["und_len"], COND_LABEL, res,
+        )
+        # the captured inputs carry a leading batch dimension of one row
+        out = Cosmos3DiTSubmodule.forward_captured_cond(
+            sub, C.IMAGE_GEN_WALK, SimpleNamespace(request_ids=["r"]),
+            latents[None], torch.full((1, n_all), 600.0), cos_g[None], sin_g[None], mask[None],
+        )
+    assert list(out) == ["r"] and list(out["r"]) == ["cond_v"]
+    got = out["r"]["cond_v"][0]  # [1, C, T, H, W]
+    assert torch.all(want[:, :, 0] == 0)  # the eager unpatchify leaves the clean frame at zero velocity
+    assert torch.allclose(want[:, :, 1:], got[:, :, 1:], atol=1e-5, rtol=1e-4)
 
 
 def test_prefill_capture_inputs_follow_the_regime(monkeypatch) -> None:

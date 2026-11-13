@@ -455,6 +455,8 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         warn_retired_ladder_env("COSMOS3_PREFILL_CAPTURE_TOKENS", "prefill_token_buckets: {dit: {prefill: [...]}}")
         self.transformer = transformer
         self.config = config
+        # walks a declared accelerator graph replays on (get_accelerator_graph_configs)
+        self._captured_walks: frozenset[str] = frozenset()
         # The loop-back edges of this deployment's scheduler, beside the latents.
         self._solver_state = () if config.distilled_sigmas else SOLVER_STATE
         # Re-encodes the frames a chained window (or a resumed session)
@@ -2112,11 +2114,12 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         return False
 
     def max_batch_size(self, graph_walk: str):
-        if (graph_walk in GEN_WALKS or graph_walk in PREFILL_WALKS) and self.config.distilled_sigmas:
+        if graph_walk in self._captured_walks and self.config.distilled_sigmas:
             # A distilled checkpoint's rows are all conditional-only (it refuses
             # any other guidance scale), which never batch (`can_batch`); a step
             # of several unbatched rows runs each eager, without a capture lease,
-            # while one row per step can replay its bs=1 graphs.
+            # while one row per step can replay its bs=1 graphs. A walk with no
+            # capture keeps its rows together.
             return 1
         if graph_walk in GEN_WALKS or graph_walk in SOUND_WALKS or graph_walk in ACTION_WALKS:
             return self.max_gen_batch_size
@@ -2399,6 +2402,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             ))
 
         configs.extend(self._prefill_capture_configs(device, regime))
+        self._captured_walks = frozenset(w for c in configs for w in c.replay_graph_walks)
         return configs
 
     def _capture_regime(self) -> GuidanceRegime:
@@ -2478,7 +2482,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             total_tokens_multiplier=regime.tokens_multiplier,
         )
 
-    def _prefill_capture_configs(self, device, regime: str) -> list:
+    def _prefill_capture_configs(self, device, regime: GuidanceRegime) -> list:
         configs = []
         # Understanding-tower text prefill in the captured regime: cond+uncond
         # packed into one combined sequence (batched CFG), or the conditional
