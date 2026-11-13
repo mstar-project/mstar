@@ -923,8 +923,118 @@ def test_a_window_drawn_again_draws_the_same_noise(random_token2wav):
     assert torch.equal(first.harmonic, again.harmonic), "another request's draw would have moved this one's"
 
 
+def test_a_later_window_takes_its_voice_from_the_step_metadata(random_token2wav):
+    """The worker keeps the step metadata of the partition's one step, the voice included, for every chunk the stream
+    triggers, so a later window reads the voice there and the node keeps no host field for it."""
+    model = random_token2wav
+    served = _Served(model, {"short": _tiny_voice(model), "long": _tiny_voice(model, 9)}, 2)
+    served.open("a", voice=1)
+    codes = torch.randint(0, EOS, (60,), dtype=torch.int32)
+    assert served.prepare("a", codes[22:50], 22).kwargs["voice"] == 1, "a later window would take another voice"
+
+
 def test_a_short_window_before_the_last_is_refused(random_token2wav):
     """Window k's noise counts the draws of k full windows before it, so a shorter one would shift every later draw."""
     served = _Served(random_token2wav, {"v": _tiny_voice(random_token2wav)}, 2)
     with pytest.raises(RuntimeError, match="a window before the last holds 23 codes"):
         served.prepare("a", torch.arange(20), 0)
+
+
+# The node over its declared state, as the engine runs it
+
+
+def _reply_chunks(codes: torch.Tensor) -> list[tuple[torch.Tensor, int, bool]]:
+    """The stream's chunks of a 60-code reply, ``(codes, start_offset, final)``: 25 new codes each after 3 of
+    look-back, and what is left."""
+    return [(codes[:25], 0, False), (codes[22:50], 22, False), (codes[47:], 47, True)]
+
+
+def test_the_declared_cache_steps_are_the_hand_written_ones(random_token2wav):
+    """A first, a full and a last window in two voices: each cache's step, as the engine builds it from what the
+    node declares, has the spans and stream positions the node wrote by hand before it declared its state."""
+    from mstar.engine.resources.kv.bounded import StreamPosition
+    from mstar.model.components.token2wav.model import HOP, LEAD_SILENCE
+
+    model = random_token2wav
+    torch.manual_seed(2)
+    served = _Served(model, {"short": _tiny_voice(model), "long": _tiny_voice(model, 9)}, 3)
+    regions = served.regions()
+    voices = {"a": 0, "b": 1}
+    for rid, voice in voices.items():
+        served.open(rid, voice)
+    codes = torch.randint(0, EOS, (60,), dtype=torch.int32)
+    for k, (chunk, start, final) in enumerate(_reply_chunks(codes)):
+        served.step(list(voices), [served.prepare(rid, chunk, start, final) for rid in voices], regions)
+        num_tokens = len(chunk) + (LEAD_SILENCE if k == 0 else 0)
+        for name, family in CACHE_FAMILIES.items():
+            step = served.last_step.steps[T2W_KV[name]]
+            span = family.rate * window_tokens(num_tokens, final)
+            assert list(step.segments) == [Segment(request_id=rid, label="main", span=span) for rid in voices], (
+                f"{name}'s step would add another number of entries for window {k}"
+            )
+            assert step.positions == {
+                rid: StreamPosition(family.rate * served.bank.prompt_tokens[voice], family.rate * HOP * k, source=voice)
+                for rid, voice in voices.items()
+            }, f"{name}'s rows would stand elsewhere in their voices' streams at window {k}"
+
+
+def test_the_voices_caches_are_each_array_s_starts(random_token2wav):
+    model = random_token2wav
+    torch.manual_seed(2)
+    voices = {"short": _tiny_voice(model), "long": _tiny_voice(model, 9)}
+    served = _Served(model, voices, 2)
+    for name, family in CACHE_FAMILIES.items():
+        starts = served.handles[T2W_KV[name]]._starts
+        for i, voice in enumerate(voices.values()):
+            # [layers, rows, H, L, 2d], the guidance rows as heads of the array's one row
+            source = family.source(voice).flatten(1, 2).unsqueeze(1)
+            assert torch.equal(starts[i][..., :source.shape[-2], :], source), (
+                f"{name}'s rows in voice {i} would begin from other entries than the voice's cache"
+            )
+
+
+def test_a_dit_cache_whose_count_moved_without_the_stream_is_refused(random_token2wav):
+    """The flow's noise offset counts the DiT's kept entries from the window's stream offset. A cache whose committed
+    count moved while the stream offset didn't (``reset_request`` without freeing zeroes it) would take another
+    window's noise."""
+    model = random_token2wav
+    torch.manual_seed(4)
+    served = _Served(model, {"v": _tiny_voice(model)}, 2)
+    regions = served.regions()
+    chunks = _reply_chunks(torch.randint(0, EOS, (60,), dtype=torch.int32))
+    served.step(["a"], [served.prepare("a", *chunks[0])], regions)
+    served.resources[T2W_KV["dit"]].reset_request("a")
+    with pytest.raises(RuntimeError, match="would index another window's noise"):
+        served.step(["a"], [served.prepare("a", *chunks[1])], regions)
+
+
+def test_a_reply_through_the_node_s_regions_is_the_one_request_driver_s(random_token2wav):
+    """Two replies a window apart through the node as the engine runs it, the full windows' flow and HiFT regions
+    warmed up and captured and the rest eager. A step replays a region for its rows or runs two eagerly (a full
+    window beside a last one), and each region steps the Values it writes inside the node's step. Each reply's
+    samples are the one-request driver's on the same noise."""
+    model = random_token2wav
+    torch.manual_seed(4)
+    voice = _tiny_voice(model)
+    served = _Served(model, {"v": voice}, 3)
+    full = window_frames(WINDOW, False)
+    captured = [served.node.flow_region(WINDOW, False), served.node.hift_region(True, full, False),
+                served.node.hift_region(False, full, False)]
+    regions = served.regions(captured)
+    seeds = {"a": 3, "b": 2**40 + 7}
+    codes = {rid: torch.randint(0, EOS, (60,), dtype=torch.int32) for rid in seeds}
+    got = {rid: [] for rid in seeds}
+    for step in range(4):
+        rows = [(rid, step - lag) for rid, lag in (("a", 0), ("b", 1)) if 0 <= step - lag < 3]
+        inputs = [served.prepare(rid, *_reply_chunks(codes[rid])[k], seed=seeds[rid]) for rid, k in rows]
+        out = served.step([rid for rid, _ in rows], inputs, regions)
+        for rid, _ in rows:
+            got[rid].append(out[rid][T2W_KEYS.audio][0])
+    assert all(regions[label].calls for label in captured), "a full window would never have reached its region"
+    for rid, seed in seeds.items():
+        ref = new_state(model, voice)
+        for k, (win, last) in enumerate(reference_windows(codes[rid].tolist())):
+            mel = flow_chunk(model, ref, voice, torch.tensor([win], dtype=torch.int32), last)
+            want = vocode_chunk(model, ref, mel, last, noise=model.window_noise(mel.shape[-1], k == 0, [(seed, k)]))
+            torch.testing.assert_close(got[rid][k][None], want, rtol=1e-4, atol=1e-4,
+                                       msg=f"reply {rid}'s window {k} isn't the one-request driver's")
