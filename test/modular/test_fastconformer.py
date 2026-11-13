@@ -13,7 +13,7 @@ from torch import nn
 from mstar.engine.resources.base import EngineResourceInfo, build_resource
 from mstar.engine.resources.runner import StepRunner
 from mstar.engine.resources.step import StepContext
-from mstar.engine.state import Array, Attend, Entry, KVEntry, Positions, Read, TensorType, Value, Window, host, position
+from mstar.engine.state import Array, Attend, Entry, KVEntry, Positions, Read, TensorType, Value, Window
 from mstar.engine.state.adapters import StateSetup, _resolve, build_handle, build_specs
 from mstar.model.components.audio_features import NemoLogMel
 from mstar.model.components.fastconformer import (
@@ -419,7 +419,7 @@ def _stream_state(config: FastConformerConfig, hop_length: int) -> list[Array]:
               head_dim=config.head_dim), positions=Positions(),
               reads={"encoder_attn": Read(mask=Window(config.left_context + 1), op=Attend(q_heads=config.num_heads),
                                           packed=False)}),
-        Value(STREAM, nodes=node, layers={0}, entry=Entry({}, host={"samples": int, "mels": int})),
+        Value(STREAM, nodes=node, layers={0}, entry=Entry({}, host={"samples_ahead": int, "mels_ahead": int})),
     ]
 
 
@@ -517,17 +517,22 @@ class _Encoder:
         return self.node.prepare_inputs("encode", SimpleNamespace(rid_handle=handle), inputs,
                                         is_final_stream_chunk=final)
 
-    def declare(self, rids, inputs):
-        """The node's step as the engine declares it, with the leases the engine
-        takes for it first, on the step's context."""
+    def lease(self, rids, inputs) -> StepContext:
+        """The step's context, with the leases the engine takes before it declares the step."""
         from mstar.testing_utils.engine import make_engine, make_mgmt
 
         engine = make_engine(_submodules={"conformer_encoder": make_mgmt(piecewise_runners=self.regions)})
         ctx = StepContext(request_ids=tuple(rids), graph_walk="encode", slot=0, capture=False)
         engine._maybe_lease_piecewise_regions("conformer_encoder", ctx, inputs)
+        return ctx
+
+    def declare(self, rids, inputs, ctx=None):
+        """The node's step as the engine declares it, on ``ctx`` (else a fresh lease's), or None."""
+        ctx = ctx or self.lease(rids, inputs)
         step = engine_step(self.node, graph_walk="encode", request_ids=rids, inputs=inputs,
                            piecewise_leases=ctx.piecewise_leases)
-        step.set_ctx(ctx)
+        if step is not None:
+            step.set_ctx(ctx)
         return step
 
     def step(self, rids, inputs) -> BatchedModelOutput:
@@ -541,24 +546,31 @@ class _Encoder:
         return self._step(rids, inputs)
 
     def _step(self, rids, inputs) -> BatchedModelOutput:
-        step = self.declare(rids, inputs)
+        ctx = self.lease(rids, inputs)
+        step = self.declare(rids, inputs, ctx)
+        if step is None:
+            # the whole-step region's own step is the only one
+            return self._forward(rids, inputs, ctx, None)
         assert self.runner.admit(step).ok
         self.runner.plan(step)
-        engine_inputs = ModelInputsFromEngine(
-            request_ids=list(rids), per_request_info={}, resources=dict(self.resources),
-            piecewise_runners=dict(self.regions), piecewise_leases=step.ctx.piecewise_leases, step=step,
-        )
         step.begin_calls()
         try:
-            with torch.no_grad():
-                out = self.node.forward_batched("encode", engine_inputs,
-                                                **self.node.preprocess("encode", engine_inputs, inputs))
+            out = self._forward(rids, inputs, ctx, step)
             step.check_calls()
             self.runner.commit(step)
             step.commit_calls()
         finally:
             step.end_calls()
         return out
+
+    def _forward(self, rids, inputs, ctx, step) -> BatchedModelOutput:
+        engine_inputs = ModelInputsFromEngine(
+            request_ids=list(rids), per_request_info={}, resources=dict(self.resources),
+            piecewise_runners=dict(self.regions), piecewise_leases=ctx.piecewise_leases, step=step,
+        )
+        with torch.no_grad():
+            return self.node.forward_batched("encode", engine_inputs,
+                                             **self.node.preprocess("encode", engine_inputs, inputs))
 
     def end(self, rid):
         """The engine's teardown of a finished stream."""
@@ -569,7 +581,7 @@ class _Encoder:
 
     def counts(self, rid) -> dict:
         """The stream's committed counts: samples and mel frames, and its encoder frames."""
-        return {**host(self.handles[STREAM], rid, "main", 0), "frames": position(self.handles[KV], rid, "main")}
+        return dict(zip(("samples", "mels", "frames"), self.node._counts(rid), strict=True))
 
     def encode(self, handle, chunk, final=False):
         """One step for one stream: what the stream hands the node, then its frames."""
@@ -719,8 +731,9 @@ def _kv_spans(step) -> list[int]:
 
 def test_encoder_an_all_steady_step_leaves_its_resources_to_its_region():
     """When every stream is one frame on and the whole-step region is captured
-    for the batch, the region's own step owns the arrays: the node declares only
-    the streams' counts, so no second plan is built and thrown away. Otherwise
+    for the batch, the region's own step owns the arrays and the streams' counts
+    need no write: the node declares nothing, so no second plan is built and
+    thrown away. Otherwise
     it declares every stream in each, and in the KV its new frames at its
     position."""
     enc = _Encoder()
@@ -733,8 +746,7 @@ def test_encoder_an_all_steady_step_leaves_its_resources_to_its_region():
     assert _kv_spans(step) == [1, 1]
     assert [step.get(KV).positions[h].written for h in (1, 2)] == [enc.counts(h)["frames"] for h in (1, 2)]
     enc.regions = _encoder_regions(enc, STEP)
-    step = enc.declare([1, 2], nxt)
-    assert set(step.state) == {STREAM} and not step.keys()                    # the counts alone
+    assert enc.declare([1, 2], nxt) is None
     for at in range(2560, 1280 * 6, 1280):
         out = enc.step([1, 2], [enc.prepare(h, wavs[h][at:at + 1280]) for h in (1, 2)]).per_rid_outputs
         assert all(len(out[h]["audio_frame"]) == 1 for h in (1, 2))

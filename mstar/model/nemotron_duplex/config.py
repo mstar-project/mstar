@@ -38,7 +38,7 @@ ENCODER_FRONT = "encoder_front"     # each call's streaming-encoder audio and me
 CODEC_STATE = "codec_state"         # each call's streaming codec decoder state
 ENCODER_KV = "encoder_kv"           # each call's streaming-encoder keys, which its attention window reads, per layer
 ENCODER_ATTN = "encoder_attn"       # the streaming encoder's window read of ENCODER_KV
-ENCODER_STREAM = "encoder_stream"   # each call's counts of samples and mel frames, on the host
+ENCODER_STREAM = "encoder_stream"   # how far each call's samples and mel frames run ahead of its encoder frames
 
 # Every node's CUDA-graph batch sizes: a row per live session, up to the sessions
 # a deployment serves by default (``NemotronDuplexModel.DEFAULT_SESSIONS``).

@@ -333,7 +333,7 @@ class NemotronDuplexModel(Model):
                                           packed=False)},
             ),
             Value(ENCODER_STREAM, nodes={"conformer_encoder"}, layers={0},
-                  entry=Entry({}, host={"samples": int, "mels": int})),
+                  entry=Entry({}, host={"samples_ahead": int, "mels_ahead": int})),
             # only the ``*`` (attention) layers hold a KV cache
             Array(
                 NANO_KV, nodes={"nano_llm"}, layers=frozenset(i for i, k in enumerate(kinds) if k == "attention"),

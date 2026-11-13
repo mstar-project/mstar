@@ -4,7 +4,7 @@ The specs, steps and layouts below are the reference, copied from the model as i
 adapter can't pass by agreeing with itself. Each difference is asserted where it shows, with its reason: the nano's
 conv stored in the compute dtype, the talker's positions with no rotary dim, the talker's combined label, the
 ``talker_prev`` Value for the codes the talker kept in request state, and the encoder's conv rows at each stream's new
-frames, its all-steady step and its regions' padding rows.
+frames and its regions' padding rows.
 """
 
 from __future__ import annotations
@@ -264,8 +264,12 @@ def _encoder_steps():
     inputs = [enc.prepare(1, wavs[1][3840:5120]), enc.prepare(2, wavs[2][3840:4000]), enc.prepare(3, wavs[3][:9000])]
     assert [inp.kwargs["n"] for inp in inputs] == [1, 0, 7]
     step = enc.declare(rids, inputs)
-    assert step.state[STREAM].host == {(rid, "main", 0): inp.kwargs["after"]
-                                       for rid, inp in zip(rids, inputs, strict=True)}
+    after = [(inp.kwargs["after"], inp.kwargs["before"][2] + inp.kwargs["n"]) for inp in inputs]
+    assert step.state[STREAM].host == {
+        (rid, "main", 0): {"samples_ahead": counts["samples"] - 1280 * frames,
+                           "mels_ahead": counts["mels"] - 8 * frames}
+        for rid, (counts, frames) in zip(rids, after, strict=True)
+    }, "each stream's counts after the step, ahead of 1280 samples and 8 mel frames per encoder frame"
     _conv_rows_at_the_new_frames(step, inputs)
     yield step, _main_encoder_step(rids, inputs, enc)
 
@@ -279,10 +283,9 @@ def _encoder_steps():
     _conv_rows_at_the_new_frames(step, inputs)
     yield step, _main_encoder_step(rids, inputs, enc)
 
-    step = enc.declare([1, 2], inputs[:2])
-    assert STEP in step.ctx.piecewise_leases
-    assert set(step.state) == {STREAM} and step.steps == {}, \
-        "main declared nothing for an all-steady step; the streams' counts build no resource step"
+    ctx = enc.lease([1, 2], inputs[:2])
+    assert STEP in ctx.piecewise_leases
+    assert enc.declare([1, 2], inputs[:2], ctx) is None, "an all-steady step declares nothing, as main's did"
 
     padded = [1, 2, "pad"]
     for label, keys in ((STEP, (FRONT, CONV)), (LAYERS, (CONV,))):

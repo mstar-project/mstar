@@ -68,8 +68,10 @@ class FastConformerStreamSubmodule(NodeSubmodule):
     append) is not batched (``can_batch``): the engine then runs each stream of
     it on its own. The encoder's layers hold the arrays its ``kv_key`` and
     ``conv_key`` name; ``front_key`` names the Value of each stream's audio and
-    mel tails, and ``stream_key`` the host-only Value of its sample and mel
-    counts.
+    mel tails, and ``stream_key`` the host-only Value of how far its samples
+    and mel frames run ahead of ``frame_samples`` and ``subsampling_factor``
+    per encoder frame. A step of one frame of audio on the frame grid adds one
+    encoder frame and exactly that much audio, so it leaves the Value as it is.
 
     A stream one frame of audio further on the frame grid (every live step of
     a stream that declares ``ClientAudio``) runs whole as a CUDA graph (``STEP_REGION``). The
@@ -181,6 +183,19 @@ class FastConformerStreamSubmodule(NodeSubmodule):
         return (self.has_steady_step and not final and chunk is not None and chunk.numel() == fs
                 and samples >= 2 * fs and samples % fs == 0)
 
+    def _counts(self, rid) -> tuple[int, int, int]:
+        """The stream's committed samples, mel frames and encoder frames."""
+        ahead = host(self.stream_state, rid, "main", 0)
+        frames = position(self.encoder_kv, rid, "main")
+        f = self.encoder.config.subsampling_factor
+        return ahead["samples_ahead"] + frames * self.frame_samples, ahead["mels_ahead"] + frames * f, frames
+
+    def _ahead(self, counts: dict, frames: int) -> dict:
+        """``counts`` as ``stream_key`` holds them for a stream at ``frames`` encoder frames."""
+        f = self.encoder.config.subsampling_factor
+        return {"samples_ahead": counts["samples"] - frames * self.frame_samples,
+                "mels_ahead": counts["mels"] - frames * f}
+
     def bind_state(self, handles: dict) -> None:
         self.encoder_kv, self.front_state = handles[self.encoder.kv_key], handles[self.front_key]
         self.stream_state = handles[self.stream_key]
@@ -203,9 +218,7 @@ class FastConformerStreamSubmodule(NodeSubmodule):
         assert wav is not None or is_final_stream_chunk, "an empty chunk before the end of the stream"
         # Read, not counted here: admit can refuse the step and run this again.
         # The previous step has committed, so the counts are current.
-        rid = fwd_info.rid_handle
-        counts = host(self.stream_state, rid, "main", 0)
-        before = counts["samples"]
+        before, mels, frames = self._counts(fwd_info.rid_handle)
         samples = before + (wav.numel() if wav is not None else 0)
         shortest, rate = self.log_mel.min_samples, self.log_mel.sampling_rate
         if is_final_stream_chunk and samples < shortest:
@@ -215,7 +228,6 @@ class FastConformerStreamSubmodule(NodeSubmodule):
                 f"it needs at least {1000 * shortest / rate:g} ms"
             )
         final = bool(is_final_stream_chunk)
-        frames = position(self.encoder_kv, rid, "main")
         return NodeInputs(
             tensor_inputs={} if wav is None else {"chunk": wav},
             kwargs={
@@ -224,9 +236,9 @@ class FastConformerStreamSubmodule(NodeSubmodule):
                 # here, once, for the declaration and the forward to share
                 "steady": self.is_steady(before, wav, final),
                 # the stream's counts before the step, and after it
-                "before": (before, counts["mels"], frames),
-                "after": {"samples": samples, "mels": self.stream_mels(counts["mels"], samples, final)},
-                "n": self.new_frames(counts["mels"], frames, samples, final),
+                "before": (before, mels, frames),
+                "after": {"samples": samples, "mels": self.stream_mels(mels, samples, final)},
+                "n": self.new_frames(mels, frames, samples, final),
             },
             input_seq_len=0 if wav is None else wav.numel(),   # samples, for can_batch
         )
@@ -268,16 +280,15 @@ class FastConformerStreamSubmodule(NodeSubmodule):
         )
 
     def declare_step(self, graph_walk, request_ids, inputs, slot_lease=None, piecewise_leases=None,
-                     **kwargs) -> SubmoduleStep:
+                     **kwargs) -> SubmoduleStep | None:
         del graph_walk, slot_lease, kwargs
-        counts = {(rid, "main", 0): inp.kwargs["after"] for rid, inp in zip(request_ids, inputs, strict=True)}
         # A live step where every stream is one frame on replays STEP_REGION
         # over the whole batch, at the bucket its lease names, and the region's
-        # own step owns every array but the counts. Each such stream already
-        # holds its slots, from a first step declared below.
-        segments = [Segment(request_id=rid, label="main", span=1) for rid in request_ids]
+        # own step owns every array. The counts have nothing to write: the step
+        # adds one frame and that frame's samples and mel frames. Each such
+        # stream already holds its slots, from a first step declared below.
         if self._region_owns_step(piecewise_leases, [inp.kwargs["steady"] for inp in inputs]):
-            return SubmoduleStep(segments=segments, state={self.stream_key: ArrayStep(host=counts)})
+            return None
         # Otherwise this step reserves and plans every stream's slots and new
         # frames, and the eager path reads that plan. A region the forward still
         # replays for some streams re-plans their rows into its own buffers, after
@@ -291,8 +302,12 @@ class FastConformerStreamSubmodule(NodeSubmodule):
             Segment(request_id=rid, label="main", span=int("chunk" in inp.tensor_inputs or inp.kwargs["final"]))
             for rid, inp in zip(request_ids, inputs, strict=True)
         )
+        counts = {
+            (rid, "main", 0): self._ahead(inp.kwargs["after"], inp.kwargs["before"][2] + inp.kwargs["n"])
+            for rid, inp in zip(request_ids, inputs, strict=True)
+        }
         return SubmoduleStep(
-            segments=segments,
+            segments=[Segment(request_id=rid, label="main", span=1) for rid in request_ids],
             state={
                 self.encoder.kv_key: ArrayStep(segments=frames),
                 self.encoder.conv_key: ArrayStep(segments=frames),
@@ -473,7 +488,7 @@ class FastConformerStreamSubmodule(NodeSubmodule):
                     and layers_runner.can_run(len(new)))
 
         if self._region_owns_step(engine_inputs.piecewise_leases, steady):
-            # declare_step left every array but the counts to the region, which its lease says can replay the batch
+            # declare_step left the step to the region, which its lease says can replay the batch
             steady = list(range(len(rids)))
         else:
             # This step's KV plan writes every stream's new frames, so the region (which
