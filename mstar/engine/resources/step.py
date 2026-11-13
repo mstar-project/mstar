@@ -1,6 +1,7 @@
 
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Collection, KeysView, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterator, KeysView, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 from itertools import combinations
@@ -218,6 +219,9 @@ class StepContext:
 class StepHandle(ABC):
     """What a layer holds for something a step's ``state`` lists. The engine opens it around each step's calls."""
 
+    # the step the handle answers for while open, which a region's step nested in it reopens (`nested_calls`)
+    open_step: "SubmoduleStep | None" = None
+
     @abstractmethod
     def begin_step(self, step: "SubmoduleStep") -> None:
         """Answer for ``step`` from here on. Raises if the handle is already open."""
@@ -309,6 +313,25 @@ class SubmoduleStep:
     def end_calls(self) -> None:
         for handle in self.state_handles:
             handle.end_step(self)
+
+    @contextmanager
+    def nested_calls(self) -> Iterator[None]:
+        """Open this step's calls inside the step of its node, which holds some of its handles open: a piecewise
+        region's eager run inside the node's forward. Each such handle answers for this step until it ends, then for
+        the node's step again, whose call records start afresh."""
+        outer = [(handle, handle.open_step) for handle in self.state_handles if handle.open_step is not None]
+        for handle, step in outer:
+            handle.end_step(step)
+        try:
+            self.begin_calls()
+            try:
+                yield
+                self.check_calls()
+            finally:
+                self.end_calls()
+        finally:
+            for handle, step in outer:
+                handle.begin_step(step)
 
     def get(self, key: str) -> ResourceStep | None:
         return self.steps.get(key)
