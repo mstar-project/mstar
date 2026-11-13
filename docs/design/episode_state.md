@@ -104,7 +104,7 @@ its own request:
 
 ```mermaid
 flowchart LR
-    C[openpi connection] -->|episode id on each call| F[Frontend]
+    C[Positronic session connection] -->|session id on each call| F[Frontend]
     F --> R[Conductor: record and pinned placement]
     R -->|bind request to slot| W[Worker engines: episode arrays]
     W -->|held counts after call| R
@@ -117,7 +117,7 @@ flowchart LR
 
 ## 3. Episode identity
 
-**Proposal.** The frontend mints an episode id for each openpi connection when the socket opens (`ep-<uuid4>`), and every call on that socket carries it. It goes to `submit_request` as a system field beside `request_id` (`episode=`; `SubmitArgs.episode` in Rust), not in `model_kwargs`, through the data worker to `NewRequestConductor.episode`. A model with no episode arrays runs as today. An idless request to a model with episode arrays gets a temporary slot and a cold `EpisodeView` (§5), without creating an episode record.
+**Proposal.** Once E4 lands, the Positronic frontend mints an episode id for each `/api/v1/session` WebSocket connection when it opens, and every call on that socket carries it. Positronic protocol v2 sends a 32-hex `session_id` in its ready frame, requires that same value in every request and rejects a mismatch (`server.py` lines 148-154 and 199-208); that connection-bound value is also its internal episode id. The id goes to `submit_request` as a system field beside `request_id` (`episode=`; `SubmitArgs.episode` in Rust), not in `model_kwargs`, through the data worker to `NewRequestConductor.episode`. A model with no episode arrays runs as today. An idless request to a model with episode arrays gets a temporary slot and a cold `EpisodeView` (§5), without creating an episode record.
 
 The conductor keeps one record per episode:
 
@@ -136,7 +136,7 @@ class EpisodeRecord:
 
 Why this shape:
 
-- **The connection is the episode in both the reference and openpi.** The reference opens a session per connection. openpi's `WebsocketClientPolicy.reset()` is a no-op, so an openpi client tells the server nothing at episode boundaries, and the socket is the only identity it has. A connection-scoped id needs no client change.
+- **The Positronic connection is the episode.** The reference opens one session per connection and ends it when the connection closes. A connection-scoped id follows that lifecycle.
 - **Minted by the system, never chosen by the client.** A client-chosen id can collide with or guess another client's, so it needs scoping to the caller's credentials, and its only cleanup is a timeout. It also survives a reconnect, which the reference does not attempt: a new connection starts cold there. This is left as an open question (§11), and the field is shaped so it can be added.
 - **The conductor owns the record.** It already owns the request lifecycle and the replica pick, and it must decide eviction and slot assignment so every rank of a lockstep instance agrees (invariant 11). A record on a worker would need rank 0 to journal its choices.
 - **The placement is pinned.** The retained arrays live on the replica the first call ran on, so later calls skip `ReplicaRouter.pick` and go there.
@@ -152,9 +152,9 @@ Rejected:
 
 **Proposal.** Three ways a context restarts, and one way an episode ends early:
 
-1. **Explicit.** An observation with `reset_context: true` (or `__reset_context__`, as the reference reads it) sets `episode.reset` on its request. Both frontends' openpi parsers read the key.
+1. **Explicit.** An observation with `reset_context: true` (or `__reset_context__`, as the reference reads it) sets `episode.reset` on its request. Both frontends' Positronic handlers read the key.
 2. **Model-requested.** `process_prompt` sets `reset_episode` when this request's inputs can't continue the context: the reference's missing or short frame stack is the case. The data worker ORs it with the client's flag.
-3. **System.** An evicted, idle-ended or lost episode starts its next call cold (§6, §7), with `EpisodeView.cold` saying why.
+3. **System.** An evicted, idle-ended or lost episode starts its next call cold (§6, §7), with `EpisodeView.cold` giving the internal reason. Whether the wire exposes it is open (§11).
 4. **Budget.** `episodes.max_calls` refuses the call past it with a 400, `episode reached max_calls=N`. Both frontends answer a failure with its text and close the socket, which ends the episode (§7).
 
 A restart clears every episode array of the episode before the request's first step: the conductor marks the request's `NEW_REQUEST` to the episode's workers, and each engine empties the slot when it binds the request. `calls` keeps counting, as the reference's `chunk_index` does, so the seed sequence and the budget run over the whole connection.
@@ -224,7 +224,7 @@ Rejected:
 - **Admission.** A call for a new episode, one whose slot was taken, or an idless call to a model with episode arrays needs a slot on the replica the router picks. It takes a free slot, or evicts the least recently used idle named episode there (no call in flight or queued). A temporary slot belongs to its live request and cannot be evicted. When every slot holds a busy episode or temporary request, the call waits in the conductor's queue, in arrival order, as a request over `max_concurrent_requests` waits today (`conductor.py` lines 1288-1305). A call of an episode that has its slot never waits for one.
 - **Eviction.** The conductor chooses, LRU by `last_end` over idle episodes on that replica, and sends `END_EPISODE` to the episode's workers before the new episode's `NEW_REQUEST`. An episode with a call in flight or queued is never evicted.
 - **Temporary slot release.** An idless request frees its slot on `REMOVE_REQUEST`; no `END_EPISODE`, record, idle timer or later warm call is involved.
-- **What the client sees.** The evicted episode's next call starts cold: `held` is empty, so `walk_plan` runs every producer again, and the call is otherwise correct. Its reply says so (§10): `"episode": {"calls": n, "cold": "evicted"}`. A metric counts evictions and cold starts by reason.
+- **What the client sees.** The evicted episode's next call starts cold: `held` is empty, so `walk_plan` runs every producer again, and the call is otherwise correct. `EpisodeView.cold` gives the model the reason, and a metric counts evictions and cold starts by reason. A wire notice is an open question (§11).
 
 Relation to [admission_and_preemption.md](admission_and_preemption.md): an episode slot is a fixed-size slot like the recurrent state pool and the sampler's rows there (§3: a request waits at admission until a slot is free, and never runs short after), except that it outlives its requests, so its idle time is what eviction takes back. Slots are not KV pages, so KV preemption never touches them, and a KV victim keeps its episode. A node with a rebuild policy needs every resource to support a drop (that doc's §4 table); `EpisodeStorage` supports one by keeping its entries, as attention does.
 
@@ -262,10 +262,11 @@ Rejected:
 
 | Event | Who sends `END_EPISODE` | Notes |
 |---|---|---|
-| Connection close | the frontend, in the handler's `finally` (Python) or when `serve` returns (Rust) | a call in flight runs to its end first, since the handler notices the close only when it sends the reply (`openpi.py` line 305); the end is applied after the call's teardown |
-| A failed or aborted call | the conductor, at the request's teardown | its arrays may hold a partial write, as the reference assumes (`server.py` lines 272-279); openpi closes the socket anyway |
+| Connection close | the Positronic frontend, in the handler's `finally` (Python) or when `serve` returns (Rust) | a call in flight runs to its end first; the end is applied after the call's teardown |
+| Positronic `end_session` | the frontend, after validating the session id and answering the end request | the reference replies with `{session_id, end_session: true}` and closes the session (`server.py` lines 199-208); E4 tests the acknowledgement and exactly one `END_EPISODE` in both frontends |
+| A failed or aborted call | the conductor, at the request's teardown | its arrays may hold a partial write, as the reference assumes (`server.py` lines 272-279); the Positronic handler closes the session |
 | `max_calls` reached | the conductor | the refused call fails, and the socket closes (§4) |
-| Idle for `idle_timeout_s` | the conductor's periodic sweep | the record stays with `cold="idle"` until the connection closes, so the next call reports why it is cold |
+| Idle for `idle_timeout_s` | the conductor's periodic sweep | the record stays with `cold="idle"` until the connection closes, so the next call's internal view says why it is cold |
 | Eviction | the conductor (§6) | as idle, with `cold="evicted"` |
 | A worker holding it is lost | the conductor ends every episode placed there | `cold="lost"` on the next call, if the conductor outlives the worker |
 | Process restart | nothing to send | every episode is in memory and is gone; connection-scoped ids die with their sockets, so no client can name a stale one |
@@ -274,7 +275,7 @@ Leaked episodes are bounded three ways: the slot count is a hard cap on retained
 
 Why this shape:
 
-- **Close is the normal end.** It is the reference's, and openpi gives nothing else.
+- **Close is the normal end.** It follows the reference's connection-scoped session lifecycle.
 - **A failure ends the episode rather than rolling back.** Undoing a partial write needs a copy of every array before every call; ending it costs one cold start in a case where the client has closed the socket anyway.
 - **The timeout is a backstop, not the main path.** With connection-scoped ids it only fires for a frontend that died without closing, or a robot paused longer than the timeout, whose next call then starts cold. The reference's hosted deployment caps a session at an hour (`modal_app.py` line 94).
 
@@ -291,7 +292,7 @@ Why this shape:
 Why this shape:
 
 - **Calls are ordered by their state.** Each call reads the history and appends to it. Two at once would read the same history and both append, so the second's context would miss the first's chunk. The reference serializes every call (`server.py` lines 44-45).
-- **Queue, not refuse.** openpi's frontends never send two calls at once (§0), so for them the queue is always empty. A pipelining client, as the real-time reference (16 in flight) and the Cosmos3 example over `/generate/ws` (`examples/cosmos3_action_ws_client.py`) are, would see a refusal as a dropped observation. A bound keeps a runaway client from building a queue.
+- **Queue, not refuse.** The chunked Positronic session handles one call at a time, so its queue is normally empty. A pipelining client, as the real-time reference (16 in flight) and the Cosmos3 example over `/generate/ws` (`examples/cosmos3_action_ws_client.py`) are, would see a refusal as a dropped observation. A bound keeps a runaway client from building a queue.
 
 Rejected:
 
@@ -309,7 +310,13 @@ Rejected:
 - The seed of call k is the episode's seed plus `episode_calls`, the reference's `base + k`.
 - **Executed frames, not predicted video.** #1460 now leaves predicted video latents inside the denoise loop. The reference conditions on executed real frames and refuses its own predictions as context (`policy.py` lines 271-276; `robot_io.py` lines 298-317). The proposed episode array retains the executed frame window.
 
-Until this lands, Praxis-1 (once its preprocessing and submodules are in) can serve every call cold, which is correct and is the reference's stateless mode, and moves to episodes by changing its declarations and `walk_plan`.
+**Stage 1, before episode state.** A cold-only openpi bring-up mode starts every call at depth 0, matching the reference's `context_mode="stateless"` (`policy.py` lines 571-573). The reference documents that mode as debugging (`policy.py` lines 271-276); it is not production-faithful serving. Predicted video is never carried into the next call.
+
+The parity gate compares model output and `decode_actions` relative rows with the reference's stateless mode, not response bytes. The [reference's protocol test](https://github.com/runwayml/praxis-1-oss/blob/68f4d7a254b4bf41951d2e97f44b07f6cac2bf69/tests/serve/test_serve_protocol.py#L832-L848) confirms that repeated calls stay at depth 0 and each returns 21 commands. A separate openpi wire test checks the array shape and values. The reference still advances `chunk_index` and seeds call `k` with `base + k`, so each parity call supplies that same explicit seed to M*.
+
+The openpi `RobotIO.action_horizon` is 21 in this mode, so the existing fixed-size check holds. DROID returns a 21x10 array and YAM a 21x20 array of denormalized relative Cartesian rows, including clipped gripper values. These are Praxis-specific openpi schemas: the [stock openpi DROID client](https://github.com/Physical-Intelligence/openpi/blob/main/examples/droid/main.py#L778-L866) expects 10x8 joint-velocity/gripper actions and cannot connect unchanged.
+
+**Stage 2, with episode state:** the new Positronic `/api/v1/session` route follows the reference's session wire, including pose-composed command dictionaries and 21 rows at depth 0 versus 24 at warm depth above 0. A reset or eviction can make a later call cold again, returning 21 rows. The E4 frontends carry the session and episode lifecycle; E5 supplies Praxis-specific pose composition and executed-frame context. This route waits for agreement on the episode contract. The cold-only openpi mode remains an explicitly separate bring-up path.
 
 **Other users.** Candidates, not checked against their references:
 
@@ -322,30 +329,31 @@ Until this lands, Praxis-1 (once its preprocessing and submodules are in) can se
 
 ## 10. Migration and compatibility
 
-- **openpi wire.** No new required key. `reset_context` is optional, and today's parsers already ignore keys they don't name (`OpenpiPolicy.request`, `openpi.py` lines 193-215; `request`, `openpi.rs` lines 449-496). The reply gains an optional `"episode"` map; `openpi_client`'s `infer` returns the unpacked reply, so a client that doesn't read it is unaffected. The metadata frame is unchanged.
-- **Both frontends change together** (invariant 15): the id per connection, `reset_context`, `END_EPISODE` on close and the reply field land in `api_server/openpi.py` and `rust/server/src/ws/openpi.rs` in one PR, with a case in `test/rust/test_rust_openpi.py` that runs one episode against both and compares what reaches `submit_request` and what the client gets back.
+- **Stage 1 openpi bring-up.** Before E1-E5, a cold-only Praxis adapter declares a fixed 21-row horizon and returns relative rows in the openpi `"actions"` array. It carries no episode id or history. Its tests compare repeated calls with the reference's stateless mode; this is not Positronic wire parity. The two existing openpi frontends already require a fixed horizon (`openpi.py` lines 217-225; `openpi.rs` lines 532-540), so neither needs a variable-length exception for this stage.
+- **Positronic session wire.** `/api/v1/session` is a new WebSocket API in both frontends, rather than an extension of the openpi reply. It sends a connection-bound `session_id`, checks it on every request, carries reset, `end_session` acknowledgement and errors, and returns pose-composed command dictionaries as the reference does (`praxis/serve/server.py`, `praxis/single_arm.py` `finish`). E4 adds the route and episode plumbing in Python and Rust together; E5 supplies the model-specific command conversion.
+- **Both frontends change together** (invariant 15): the episode id, `reset_context`, `END_EPISODE` on close and reply behavior land in the Python and Rust Positronic handlers in E4. A `test/rust` Positronic parity case uses a stub model reply to compare cold 21-row and warm 24-row protocol behavior across both frontends; E5 tests the real model and pose composition. The cold-only Praxis openpi mode still returns 21 rows on every call.
 - **Models that declare no episode array are untouched.** The conductor knows at startup whether the model declares any. If not, it makes no record, routes as today and never passes `episode` to `walk_plan`, so the request path and its per-request cost are today's (invariant 6). The frontends' minted id is a string on the submission, dropped at the conductor.
-- **Routes other than openpi** pass no episode id. A model with episode arrays still runs: each such request borrows a slot, receives an empty `EpisodeView`, and releases the slot at request teardown. It waits at slot admission under the same rules as a new named episode (§6). Two idless calls cannot share state, even when they run on the same worker.
+- **Routes other than episode-capable WebSockets** pass no episode id. A model with episode arrays still runs: each such request borrows a slot, receives an empty `EpisodeView`, and releases the slot at request teardown. It waits at slot admission under the same rules as a new named episode (§6). Two idless calls cannot share state, even when they run on the same worker.
 
-Staging, each step independently reviewable and testable. This is five PRs because the engine's storage, the conductor's request routing, bounded admission, the two frontends' wire behavior, and Praxis's model wiring have different owners and regression surfaces. E1 and E2 provide internal contracts; they do not expose episode serving on their own. The feature reaches clients only after the lifecycle and frontend work. Praxis's integration waits for those pieces, while independent model component ports can proceed:
+Staging, each step independently reviewable and testable. The cold-only openpi bring-up mode is separate and precedes E1-E5. The episode feature has five work stages because the engine's storage, the conductor's request routing, bounded admission, the two frontends' wire behavior, and Praxis's model wiring have different owners and regression surfaces. A stage may need more than one PR, especially E4's new API. E1 and E2 provide internal contracts; they do not expose episode serving on their own. The episode feature reaches clients only after the lifecycle and frontend work. Praxis's integration waits for those pieces, while independent model component ports can proceed:
 
 | Step | Contents |
 |---|---|
 | E1 | `lifetime`, `retention`, `EpisodeStorage`, bind and detach in the engine, `END_EPISODE`; modular tests append 21 + 24 + 24 + 24 frames into a 69-frame sliding slot, check chronological reads and bounded memory across many calls, and check a temporary slot is freed on `REMOVE_REQUEST` |
 | E2 | The conductor's record, pinned placement, `EpisodeView` to `walk_plan`, per-episode queue, `max_calls`, keys; tests show a named episode resumes warm and separate idless requests start cold |
 | E3 | Shared-slot admission for named and temporary calls, eviction, idle timeout, cleanup on failure and worker loss, metrics; pressure tests cover a full pool and an in-flight temporary request |
-| E4 | Both openpi frontends: the id, `reset_context`, close, the reply field; parity tests check each frontend's request lifecycle and response |
-| E5 | Praxis-1 on episodes; an integration test checks executed-frame history and text reuse across calls, reset and eviction |
+| E4 | Both Python and Rust frontends: the new Positronic `/api/v1/session` API, including connection id, reset, close and reply behavior; `test/rust` checks a stubbed Positronic cold/warm session across both frontends |
+| E5 | Praxis-1 on episodes, including pose-composed Positronic commands; an integration test checks executed-frame history and text reuse across calls, reset, eviction, and 21 rows at cold depth 0 versus 24 when warm |
 
 ---
 
 ## 11. Open questions
 
 1. **Client-supplied ids.** Should a client be able to name its episode, to survive a reconnect or to drive episodes over `/generate/ws`? If so, scoped to its API key, and is the idle timeout then the only cleanup?
-2. **The cold-start notice.** Is a top-level `"episode"` key in the openpi reply acceptable, or should it go under `server_timing`, or be left out of the wire and only counted?
+2. **The cold-start notice.** Should a Positronic reply report when a previously warm session was evicted or ended idle, so the client can tell why its next call is cold? If so, where in the wire reply?
 3. **Text embeddings across episodes.** Is a content-keyed encoder-output cache, as the reference's process-wide memo, worth building alongside, for many robots on one task?
 4. **Idle episodes to host memory** instead of dropping them, once cold-start cost is measured?
 5. **Episode-lifetime K/V arrays** for agent sessions: a follow-up design under the admission doc, or out of scope for M*?
-6. **Per-connection settings.** The reference takes `max_chunks_per_episode` and sampler settings per session from the URL query. Should openpi connections take any, or is the deployment config enough?
+6. **Per-connection settings.** The reference takes `max_chunks_per_episode` and sampler settings per session from the URL query. Should the Positronic route accept the same settings, or is the deployment config enough?
 7. **Restart scope.** Is clearing every array on a restart enough, or does some model need an array kept across `reset_context`?
 8. **Defaults.** `max_episodes` 16 and `idle_timeout_s` 600 are guesses until measured on a robot workload.
