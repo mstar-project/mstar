@@ -2,7 +2,8 @@
 sees every entry of blocks 0 to b, so what the pages hold never changes and a step runs only its new entries.
 
 It runs on the paged block-causal kernel, which takes packed rows and plans whole blocks. A step that ends inside a
-block would cut what the block's queries see, so a walk that regroups steps refuses the read.
+block would cut what the block's queries see, so a walk that regroups steps refuses the read. The kernel takes no split
+steps either, which a node on SP ranks hears at validation instead of when the engine builds.
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ import pytest
 from test_state_windows import _array, _Model, _read
 
 from mstar.engine.resources.attn.config import AttentionConfig, AttentionStep, BlockCausalAttentionSpec
+from mstar.engine.resources.sequence_shard import SeqShardSpec, sequence_parallel_refusals
 from mstar.engine.resources.step import Segment
 from mstar.engine.state import ArrayStep, BlockCausal
 from mstar.engine.state.adapters import _bindings, build_specs, storage_of
@@ -57,3 +59,11 @@ def test_a_block_causal_read_refuses_a_step_that_splits_a_block(kwargs, cause):
     assert "A step boundary inside a block cuts what the block's queries see, so " in problem, (
         "the refusal should give a block-causal read's own cause"
     )
+
+
+def test_a_node_that_splits_its_steps_refuses_a_block_causal_read():
+    specs = [*build_specs([_blocks()]), SeqShardSpec("shard", {"dit"}, ("main",), 0)]
+    assert sequence_parallel_refusals(specs, "dit", 1, 2) == [
+        "block-causal attention 'attn' takes no split steps, since its builder sets no sequence shard, so node 'dit' "
+        "can't split them: run it on TP ranks alone"
+    ], "a node on SP ranks should hear the kernel's refusal at validation, not when the engine builds"
