@@ -15,19 +15,48 @@ sys.path.insert(0, ".")
 
 import pytest
 import torch
-from test_state_calls import HEADS, LAYERS, TOKENS, _array, _ctx, _refused, _StubAttn, _StubDense, _StubKV, _tensors
+from test_state_calls import (
+    HEADS,
+    LAYERS,
+    SLOTS,
+    TOKENS,
+    _array,
+    _ctx,
+    _refused,
+    _StubAttn,
+    _StubDense,
+    _StubKV,
+    _tensors,
+)
 from test_state_kept_reads import _CpuVarlenSdpa
 
 from mstar.communication.tensors import LocalTransferEngine
 from mstar.engine.resources.attn.base import EagerSlotKey
-from mstar.engine.resources.attn.config import AttentionSpec, AttnBackend
+from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec, AttnBackend
 from mstar.engine.resources.attn.dense import DenseAttentionManager
-from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PagedKVConfig, RetentionPolicy
+from mstar.engine.resources.kv.config import (
+    KVReqConfig,
+    KVSpec,
+    KVStep,
+    PagedKVConfig,
+    RetentionPolicy,
+    Span,
+    SpanKind,
+)
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
+from mstar.engine.resources.spec import resolve_spec_dependencies
 from mstar.engine.resources.step import Segment, StepContext, SubmoduleStep
-from mstar.engine.state import Array, ArrayStep, Attend, Bidirectional, Block, Causal, Read
-from mstar.engine.state.adapters import build_specs, node_handles, state_setup, state_steps
+from mstar.engine.state import Array, ArrayStep, Attend, Bidirectional, Block, Causal, KeptWindow, Layout, Read
+from mstar.engine.state.adapters import (
+    KeptWindowEagerDense,
+    build_specs,
+    kv_layouts,
+    node_handles,
+    state_setup,
+    state_steps,
+)
+from mstar.engine.state.analysis import deployment_problems
 from mstar.model.base import LabelLayout
 
 EAGER = {"attn_gen": {"eager_backend": "dense"}}
@@ -194,3 +223,85 @@ def test_the_dense_prefix_is_the_kept_reach(page_size):
         expected = sorted({*range(min(sink, start)), *range(max(sink, start - window), start)})
         assert plan.cu_k == (0, len(expected) + 4), f"the denoise after commit {commit} plans another key length"
         assert k.flatten().long().tolist() == expected, f"the denoise after commit {commit} attends other entries"
+
+
+# Cosmos3's windowed generation read beside its prefill read
+
+
+def _windowed() -> Array:
+    """Cosmos3's windowed array: read causally on its prefill walk and through a kept window on its generation walk."""
+    attend = Attend(q_heads=HEADS)
+    return _array(reads={
+        "attn": Read(mask=Causal(), op=attend, walks=frozenset({"prefill"})),
+        "attn_gen": Read(mask=Bidirectional(kept_window=True), op=attend, walks=frozenset({"gen"})),
+    })
+
+
+def _span(walk: str, length: int) -> Span:
+    return Span(SpanKind.ROWS, walk, length, length, "rows")
+
+
+def _laid_out(layout: Layout):
+    return kv_layouts([_windowed()], {"kv": {"main": layout}}, {})["kv"]["main"]
+
+
+def test_a_windowed_read_on_its_own_walk_takes_its_eager_pair():
+    setup, problems = state_setup({}, [_windowed()], EAGER)
+    assert not problems and type(setup.by_read["attn_gen"]) is KeptWindowEagerDense, (
+        "the windowed generation read would have no kernel beside the prefill read"
+    )
+
+
+def test_a_windowed_deployment_without_its_eager_kernel_has_no_layout():
+    """The gathered kept-window kernel is a spec of its own, over the layers the prefill read's paged spec covers."""
+    _refused(r"Array 'kv': no layout yet: reads\['attn'\] and reads\['attn_gen'\] build different specs and both "
+             "cover layer 0", lambda: build_specs([_windowed()]))
+
+
+def test_a_neighbour_read_stays_inside_the_sink():
+    layout = Layout(spans=(_span("prefill", 10), _span("gen", 20)), kept_windows={"attn_gen": KeptWindow(4, window=8)})
+    with pytest.raises(RuntimeError, match=r"a span of walk 'prefill' ends at entry 10, past the 4 entries "
+                                           r"reads\['attn_gen'\]'s kept window never releases"):
+        _laid_out(layout)
+
+
+def test_growth_beside_a_released_window_has_no_layout():
+    layout = Layout(spans=(_span("prefill", 4),), growth=(("rollout", 8),),
+                    kept_windows={"attn_gen": KeptWindow(4, window=8)})
+    with pytest.raises(RuntimeError, match=r"\['main'\]\.growth: a loop's entries name no walk"):
+        _laid_out(layout)
+
+
+def test_a_window_of_max_len_never_releases():
+    """Cosmos3 gives a request that isn't kv mode a window of the array's whole length, so the prefill read may reach
+    past the empty sink."""
+    layout = Layout(spans=(_span("prefill", 10), _span("gen", 20)),
+                    kept_windows={"attn_gen": KeptWindow(0, window=SLOTS)})
+    retention = _laid_out(layout).retention
+    assert retention == RetentionPolicy(SLOTS, 0, exact=True) and not retention.can_release(SLOTS), (
+        "a window of the array's length would release entries the prefill read reaches"
+    )
+
+
+def test_a_window_that_never_releases_keeps_the_intake_checks():
+    """A request past the pool's length is refused, and its loop's room counted, under a window that never releases as
+    with no window; only a window that releases keeps fewer entries than its positions."""
+    spec = KVSpec(resource_key="kv", nodes={"dit"}, config=PagedKVConfig(
+        num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=64, page_size=16, max_num_pages=64,
+    ))
+    resolve_spec_dependencies([spec, AttentionSpec(resource_key="attn", nodes={"dit"}, config=AttentionConfig("kv"))])
+    never = LabelLayout(growth=(("rollout", 1),), retention=RetentionPolicy(64, 0, exact=True))
+    request = KVReqConfig(needed_labels=["main"])
+    request.apply_conductor_config(kv_layout={"main": never.row()}, loop_caps={"rollout": 100})
+    assert request.loop_room(spec) == {"rollout": 64}, "the loop would run past the pool's length"
+    with pytest.raises(ValueError, match="this request needs 100 positions of 'main', past the model's context of 64"):
+        request.validate(spec)
+
+
+def test_a_windowed_array_takes_no_max_seq_len_past_its_max_len():
+    """The sink guard reads the array's max_len and the intake the pool's max_seq_len, so the two must agree."""
+    model = SimpleNamespace(declare_state=lambda: [_windowed()])
+    assert deployment_problems(model, {"kv": {"max_seq_len": 2 * SLOTS}}) == [
+        f"Array 'kv': resources.kv.max_seq_len is {2 * SLOTS}, past its max_len of {SLOTS}, which its kept window's "
+        "requests are checked against; raise max_len"
+    ], "a request past max_len would release entries under a window the guard let through"

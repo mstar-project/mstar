@@ -22,6 +22,7 @@ from mstar.distributed.communication import CommGroup, JointGroups, WorkerParall
 from mstar.engine.engine import Engine
 from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec, AttentionStep, AttnBackend
 from mstar.engine.resources.attn.kept_window import KeptWindowAttention
+from mstar.engine.resources.attn.ragged.config import KeptWindowAttentionSpec
 from mstar.engine.resources.base import EngineResourceInfo
 from mstar.engine.resources.kv.config import (
     KVReqConfig,
@@ -718,34 +719,38 @@ def _kept_array(**fields) -> Array:
     return _array("dit_kv", reads={"self_attn": _read(Bidirectional(kept_window=True))}, max_len=4096, **fields)
 
 
-@pytest.mark.parametrize("arrays", [
-    [_array("dit_kv", reads={"self_attn": _read(Bidirectional(kept_window=True), layers={0}),
-                             "attn": _read(Causal(), layers={1})}, max_len=4096)],
-    [_array("dit_kv", reads={"self_attn": _read(Bidirectional(kept_window=True), layers={0}),
-                             "other": _read(Bidirectional(kept_window=True), layers={1})}, max_len=4096)],
-    [_array("dit_kv", reads={"self_attn": _read(Bidirectional(kept_window=True), layers={0}),
-                             "reach": Read(mask=Bidirectional(kept_window=True), layers={1})}, max_len=4096)],
-], ids=["beside_causal", "beside_kept_window", "beside_a_read_with_no_op"])
-def test_a_kept_window_read_is_its_array_s_only_read(arrays):
-    """The pool releases what one read's window no longer reaches, which any other read of the array may reach."""
-    with pytest.raises(ValueError, match=r"Array 'dit_kv': no layout yet: reads\['\w+'\] keeps a window beside"):
-        build_specs(arrays)
+@pytest.mark.parametrize(("reads", "message"), [
+    ({"self_attn": _read(Bidirectional(kept_window=True), layers={0}), "attn": _read(Causal(), layers={1})},
+     r"reads\['self_attn'\] keeps a window beside reads \['attn'\], which share one of its walks or name none"),
+    ({"self_attn": _read(Bidirectional(kept_window=True), layers={0}, walks={"rollout"}),
+      "attn": _read(Causal(), layers={1}, walks={"rollout", "prefill"})},
+     r"reads\['self_attn'\] keeps a window beside reads \['attn'\]"),
+    ({"self_attn": _read(Bidirectional(kept_window=True), layers={0}, walks={"rollout"}),
+      "other": _read(Bidirectional(kept_window=True), layers={1}, walks={"prefill"})},
+     r"reads \['self_attn', 'other'\] each keep a window, and the pool keeps one a label"),
+    ({"self_attn": _read(Bidirectional(kept_window=True), layers={0}),
+      "reach": Read(mask=Bidirectional(kept_window=True), layers={1})},
+     r"reads\['self_attn'\] keeps a window beside reads \['reach'\]"),
+], ids=["beside_a_read_on_every_walk", "beside_a_read_on_its_walk", "beside_kept_window", "beside_a_read_with_no_op"])
+def test_a_kept_window_read_shares_no_walk_with_a_neighbour(reads, message):
+    """The pool releases what one read's window no longer reaches, which a read on one of its walks may reach, and it
+    keeps one window a label."""
+    with pytest.raises(ValueError, match=f"Array 'dit_kv': no layout yet: {message}"):
+        build_specs([_array("dit_kv", reads=reads, max_len=4096)])
 
 
-@pytest.mark.parametrize(("arrays", "message"), [
-    ([_array("dit_kv", reads={"self_attn": _read(Bidirectional(kept_window=True), walks={"rollout"}),
-                              "attn": _read(Causal(), walks={"prefill"})}, max_len=4096)],
-     "keeps a window beside reads"),
-    ([_array("dit_kv", reads={"self_attn": _read(Bidirectional(kept_window=True), walks={"rollout"})}, max_len=4096)],
-     r"reads\['self_attn'\].walks must be None"),
-    ([_array("q", reads={"own": _read(Causal())}),
-      _array("dit_kv", reads={"self_attn": _read(Bidirectional(kept_window=True), queries="q")}, max_len=4096)],
-     r"reads\['self_attn'\].queries must be None"),
-], ids=["walks_beside", "walks", "queries"])
-def test_a_kept_window_read_takes_no_queries_or_walks(arrays, message):
-    """A read with walks lands on the by-walk storage and one with queries on the cross storage, and the kept window
-    swaps the binding on each."""
-    with pytest.raises(ValueError, match=f"Array 'dit_kv': no layout yet: .*{message}"):
+def test_a_kept_window_read_may_name_its_walks():
+    _, attn = build_specs([_array("dit_kv", reads={
+        "self_attn": _read(Bidirectional(kept_window=True), walks={"rollout"}),
+    }, max_len=4096)])
+    assert isinstance(attn, KeptWindowAttentionSpec), "a read on its own walks would lose its window"
+
+
+def test_a_kept_window_read_takes_no_queries():
+    """A read with queries lands on the cross storage, and the kept window swaps the binding there too."""
+    arrays = [_array("q", reads={"own": _read(Causal())}),
+              _array("dit_kv", reads={"self_attn": _read(Bidirectional(kept_window=True), queries="q")}, max_len=4096)]
+    with pytest.raises(ValueError, match=r"Array 'dit_kv': no layout yet: .*reads\['self_attn'\].queries must be None"):
         build_specs(arrays)
 
 
