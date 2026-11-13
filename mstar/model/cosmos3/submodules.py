@@ -381,10 +381,11 @@ def _nbytes(value) -> int:
 
 class _Memo:
     """Device tensors kept by the key that builds them, the least recently used dropped first past ``max_bytes``.
-    A value over an eighth of the budget is built per call and not kept."""
+    A value over ``largest`` bytes, the whole budget unless given, is built per call and not kept."""
 
-    def __init__(self, max_bytes: int):
+    def __init__(self, max_bytes: int, largest: int | None = None):
         self.max_bytes = max_bytes
+        self.largest = max_bytes if largest is None else largest
         self.entries: OrderedDict[Hashable, Any] = OrderedDict()
         self.num_bytes = 0
         self._sizes: dict[Hashable, int] = {}
@@ -396,7 +397,7 @@ class _Memo:
             return value
         value = build()
         size = _nbytes(value)
-        if size > self.max_bytes // 8:
+        if size > self.largest:
             return value
         self.entries[key] = value
         self._sizes[key] = size
@@ -477,8 +478,8 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
     prefill_capture_token_buckets: tuple[int, ...] = (16, 32, 64, 128, 256)
     prefill_capture_batch_sizes: tuple[int, ...] = (1,)
 
-    # Statics, layout masks and pin masks by what builds them, shared by requests of one shape. A label's statics
-    # are ~6.4 MB at 480x832 and 121 frames.
+    # Statics, masks and samplers by what builds them, shared by requests of one shape. A label's statics are ~6.4 MB
+    # at 480x832 and 121 frames. Every step looks them up, so any value the budget holds is kept.
     STATICS_BYTES = 256 << 20
 
     def __init__(self, transformer, config, scheduler=None, head_decode_vae=None, head_encode_vae=None):
@@ -3064,7 +3065,7 @@ class Cosmos3VisionEncoderSubmodule(PackedBlockLoopEncoder):
         )
         super().__init__(vision_model, node_config, output="vision_embeds")
         self.model_config = config
-        self._position_tables = _Memo(self.POSITION_TABLE_BYTES)
+        self._position_tables = _Memo(self.POSITION_TABLE_BYTES, largest=self.POSITION_TABLE_BYTES // 8)
         self.vision = None
 
     def bind_state(self, handles: Mapping[str, Any]) -> None:
