@@ -2834,6 +2834,14 @@ kernel-drift level. At 832x480x121 one request’s guidance pair is 24k tokens,
 which already fills the GPU’s GEMM and attention throughput, so a batch of N
 costs about N single steps: batching keeps requests in step rather than adding
 throughput.</p>
+<p>Captures (the text prefill and the denoise steps) are built for the guidance
+regime the deployment’s default <code class="docutils literal notranslate"><span class="pre">guidance_scale</span></code> runs: both branches when it
+is not 1, the conditional branch alone when it is 1, which the distilled 4-step
+Super checkpoints force. A request in the other regime runs eager.
+<code class="docutils literal notranslate"><span class="pre">gen_capture_image</span></code> lists the (height, width) image tiers to capture
+(default 192x320, 480x832 and 720x1280, each still bounded by
+<code class="docutils literal notranslate"><span class="pre">graph_max_latent_area</span></code>); the Super T2I config captures its 1024x1024
+default.</p>
 <p>The action policy (<code class="docutils literal notranslate"><span class="pre">cosmos3_edge_droid</span></code>, or <code class="docutils literal notranslate"><span class="pre">cosmos3_edge</span></code> with an action
 <code class="docutils literal notranslate"><span class="pre">domain_name</span></code>) predicts a chunk of robot actions from the current observation:
 <code class="docutils literal notranslate"><span class="pre">output_modalities=action</span></code> with <code class="docutils literal notranslate"><span class="pre">model_kwargs</span></code>
