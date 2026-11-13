@@ -2205,9 +2205,11 @@ class RingStorage(Storage):
             resolved.resource_of.update(dict.fromkeys(array.reads, shared) | _resources_of(array, others))
         return resolved
 
-    def steps(self, handle: RingHandle, declared: ArrayStep, step: SubmoduleStep, steps: dict[str, Any]) -> None:
-        steps[handle.name] = RingKVStep(segments=declared.segments)
-        steps[handle.flex_key] = AttentionStep(segments=declared.segments)
+    def steps(
+        self, handle: RingHandle, declared: ArrayStep, step: SubmoduleStep, segments, steps: dict[str, Any],
+    ) -> None:
+        steps[handle.name] = RingKVStep(segments=segments)
+        steps[handle.flex_key] = AttentionStep(segments=segments)
 
 
 class ValueStorage(Storage):
