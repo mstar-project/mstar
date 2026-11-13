@@ -1,7 +1,7 @@
 """Compare one saved M* cold DROID action reply with the pinned Praxis pipeline.
 
 Run after the diagnostic M* server has stopped so both models never occupy
-the GPU together. The same generated observation, prompt and seed are used.
+the GPU together. The same saved or generated observation, prompt and seed are used.
 This is a numerical diagnostic; the WAN VAE implementations differ slightly.
 """
 
@@ -20,7 +20,9 @@ from praxis.pipeline import PraxisPipeline
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mstar-actions", type=Path, required=True)
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--mstar-actions", type=Path, help="saved synthetic openpi actions")
+    source.add_argument("--sim-capture", type=Path, help="NPZ from praxis1_sim_first_call_capture.py")
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--vae-pth", type=Path, required=True)
     parser.add_argument("--qwen", type=Path, required=True)
@@ -31,19 +33,33 @@ def main() -> None:
     parser.add_argument("--atol", type=float, default=0.03)
     args = parser.parse_args()
     assert torch.cuda.is_available(), "comparison needs CUDA"
-    for path in (args.mstar_actions, args.vae_pth, args.qwen / "config.json", args.checkpoint / "config.json"):
+    for path in (args.mstar_actions or args.sim_capture, args.vae_pth,
+                 args.qwen / "config.json", args.checkpoint / "config.json"):
         assert path.is_file(), f"missing input: {path}"
-    actual = np.load(args.mstar_actions, allow_pickle=False)
+    if args.sim_capture:
+        with np.load(args.sim_capture, allow_pickle=False) as capture:
+            actual = capture["actions"]
+            observation = {
+                "image.exterior": capture["exterior"], "image.wrist": capture["wrist"],
+                "robot_state.ee_pose": capture["ee_pose"], "grip": capture["grip"],
+                "descriptor": str(capture["descriptor"]),
+            }
+            prompt = str(capture["prompt"])
+            seed = 0
+    else:
+        actual = np.load(args.mstar_actions, allow_pickle=False)
+        random = np.random.default_rng(71)
+        exterior = random.integers(0, 256, size=(224, 224, 3), dtype=np.uint8)
+        wrist = random.integers(0, 256, size=(224, 224, 3), dtype=np.uint8)
+        observation = {
+            "image.exterior": exterior,
+            "image.wrist": wrist,
+            "robot_state.ee_pose": np.array([0.4, 0.0, 0.3, 1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+            "grip": np.array([0.0], dtype=np.float32),
+        }
+        prompt = "pick up the marker"
+        seed = 17
     assert actual.shape == (21, 10) and actual.dtype == np.float32
-    random = np.random.default_rng(71)
-    exterior = random.integers(0, 256, size=(224, 224, 3), dtype=np.uint8)
-    wrist = random.integers(0, 256, size=(224, 224, 3), dtype=np.uint8)
-    observation = {
-        "image.exterior": exterior,
-        "image.wrist": wrist,
-        "robot_state.ee_pose": np.array([0.4, 0.0, 0.3, 1.0, 0.0, 0.0, 0.0], dtype=np.float32),
-        "grip": np.array([0.0], dtype=np.float32),
-    }
     settings = SamplerSettings(num_steps=2, t_shift=12.5, cfg_scale=1.0, cfg_video_scale=4.0)
     started = time.perf_counter()
     pipeline = PraxisPipeline(
@@ -54,7 +70,7 @@ def main() -> None:
 
     def session():
         return pipeline.session(
-            "pick up the marker", seed=17, max_context_chunks=0,
+            prompt, seed=seed, max_context_chunks=0,
             control_mode="none", exec_horizon=None, sampler=settings, skip_last_video=True,
         )
 
