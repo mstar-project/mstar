@@ -168,25 +168,36 @@ def _refuse_unroutable_withholds(submodules: dict, model: Model) -> None:
     item, as a tensor or by value; any other consumer would wait for one), and
     one that no speculated step reads first. The loop-back signal
     (``ARNodeSubmodule.device_loopback``) is kept on the device, so
-    withholding it does nothing."""
+    withholding it does nothing. And the graph runtime's own stop check
+    (``get_stop_policies``) never withholds, so the walk must leave its stops
+    to ``check_stop`` (``ARNodeSubmodule`` does, unless overridden). Only the
+    walks whose rows withhold (``TokenStop.withholds_on``) count."""
     for walk, section in model.get_graph_walk_graphs().items():
         nodes = section.get_nodes()
         for name, node in nodes.items():
             submodule = submodules.get(name)
             stop = getattr(submodule, "token_stop", None)
-            if stop is None:
+            if stop is None or not stop.withholds_on(walk):
                 continue
             loopback = getattr(submodule, "device_loopback", None)
             loopback_signal = loopback.signal if loopback is not None and loopback.covers(walk) else None
             for edge in node.outputs:
-                if edge.name in stop.withhold and (
-                    not edge.is_streaming or edge.name == loopback_signal
-                    or _speculates_into(node, edge, nodes, submodules)
+                if edge.name not in stop.withhold:
+                    continue
+                if not edge.is_streaming or edge.name == loopback_signal or _speculates_into(
+                    node, edge, nodes, submodules,
                 ):
                     raise ValueError(
                         f"{type(model).__name__}: {name!r} withholds {edge.name!r} in walk {walk!r}; "
                         "only a streaming edge's output that no speculated node on this worker reads, "
                         "and not the loop-back signal, can be withheld"
+                    )
+                policies = getattr(submodule, "get_stop_policies", None)
+                if policies is not None and policies(walk) is not None:
+                    raise ValueError(
+                        f"{type(model).__name__}: {name!r} withholds {edge.name!r} in walk {walk!r}, whose "
+                        "stops the graph runtime checks without check_stop, so nothing would withhold it; "
+                        "return None from get_stop_policies for that walk"
                     )
 
 

@@ -110,7 +110,30 @@ class FlowKV(NamedTuple):
     dit: list[list[KVCache]]
 
 
-def rel_position_table(d_model: int, max_len: int = 5000) -> torch.Tensor:
+# relative positions -(REL_POS_MAX_LEN - 1) .. REL_POS_MAX_LEN - 1 (ESPnet's ``max_len``,
+# which the reference's chunked path never extends)
+REL_POS_MAX_LEN = 5000
+
+
+def band_offsets(t: int, width: int, device: torch.device | str | None = None) -> torch.Tensor:
+    """The relative positions a band of ``width`` reads for ``t`` queries
+    (``RelPositionAttention._band``): ``t - 1`` down to ``t - width``."""
+    return (t - 1) - torch.arange(width, device=device)
+
+
+def band_width(max_keys: int, t: int) -> int:
+    """A bounded step's band: ``t`` queries over at most ``max_keys`` retained keys and
+    their own ``t``."""
+    return max_keys + 2 * t - 1
+
+
+def band_fits(max_keys: int, t: int, max_len: int = REL_POS_MAX_LEN) -> bool:
+    """Whether that band stays inside the table. Past it, ``_band``'s index goes negative
+    and wraps silently to positive positions."""
+    return t <= max_len and max_keys + t <= max_len
+
+
+def rel_position_table(d_model: int, max_len: int = REL_POS_MAX_LEN) -> torch.Tensor:
     """ESPnet's relative sinusoid table ``[1, 2 * max_len - 1, d_model]``, positive offsets
     reversed then negative ones; built on the host in float32 as the reference does."""
     pe_pos = torch.zeros(max_len, d_model)
@@ -173,14 +196,14 @@ class RelPositionAttention(nn.Module):
         band = self._bands.get((t, width))
         if band is None:
             center = pe.size(1) // 2  # relative position 0
-            index = center + (t - 1) - torch.arange(width, device=pe.device)
+            index = center + band_offsets(t, width, pe.device)
             band = self.linear_pos(pe[0, index]).view(width, self.h, self.d_k).permute(1, 2, 0).contiguous()
             self._bands[(t, width)] = band
         return band
 
     def _attend_bounded(self, q, k, v, pe: torch.Tensor, kv: BoundedLayerKV) -> torch.Tensor:
         b, t = q.shape[:2]
-        band = self._band(pe, t, kv.max_keys + 2 * t - 1)
+        band = self._band(pe, t, band_width(kv.max_keys, t))
         bd = torch.matmul((q + self.pos_bias_v).transpose(1, 2), band)  # [B, H, T, width]
         out = kv.attend((q + self.pos_bias_u).transpose(1, 2), k, v, rel_bias=bd)
         return self.linear_out(out.reshape(b, t, self.h * self.d_k))

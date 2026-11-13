@@ -25,7 +25,6 @@ from mstar.model.components.token2wav.keys import Token2WavKeys
 from mstar.model.components.token2wav.model import (
     CACHE_FAMILIES,
     LAST_WINDOW_TOKENS,
-    LEAD_SILENCE,
     SILENCE_CODE,
     WINDOW,
     AttentionCache,
@@ -46,11 +45,15 @@ from mstar.utils.h2d import to_device_nonblocking
 
 class Token2WavSubmodule(NodeSubmodule):
     """Speech codes -> 24 kHz audio, one stream window per step: upstream's
-    ``Token2wav.stream``, fed the way its ``streaming_generate`` feeds it (three
-    silence codes first, 28-code windows advancing by 25, a last flush).
+    ``Token2wav.stream``, fed the way the model's reference feeds it: 28-code windows
+    advancing by 25, a last flush, and for MiniCPM-o (``streaming_generate``) three
+    silence codes first. The model's ``Token2WavStreaming`` (``model.streaming``) says
+    which, and which caches its reference cuts.
 
-    The windows are the ``LeftContextChunkPolicy(25, 3)`` stream from the TTS;
-    the first window gets the silence prepended here. A request's attention caches
+    For MiniCPM-o the windows are the ``LeftContextChunkPolicy(25, 3)`` stream from the
+    TTS; the first window gets the silence prepended here. For Step-Audio2 they are the
+    ``SlidingWindowChunkPolicy(28, 25)`` stream of its LLM's speech ids, which carries no
+    stop code (the LLM withholds every other id). A request's attention caches
     are on the ``keys.kv`` bounded KV resources, which start from its voice's
     prepared caches; its conv caches and HiFT tails are its slot of ``keys.state``
     (``RecurrentStatePool``). Its stream position is the chunk's offset in the
@@ -73,17 +76,31 @@ class Token2WavSubmodule(NodeSubmodule):
 
     disable_torch_compile = True
     disable_autocast = True
+    # the caches as the model's reference retains them (``Token2WavStreaming``); MiniCPM-o's
+    # until ``__init__`` reads the model's
+    families = CACHE_FAMILIES
 
-    def __init__(self, model, keys: Token2WavKeys, voices: dict, eos_code: int, dit_dtype: torch.dtype):
+    def __init__(
+        self, model, keys: Token2WavKeys, voices: dict, eos_code: int | None, dit_dtype: torch.dtype,
+        code_offset: int = 0,
+    ):
         """``keys``: the node's input signal and resource keys. ``voices``: the model's
-        bundled ones, by name. ``dit_dtype``: the dtype of the DiT's caches, as the model
-        declares them, which the DiT computes in."""
+        bundled ones, by name. ``eos_code``: the stream's stop code, which ends the speech,
+        or None for a stream that carries none. ``dit_dtype``: the dtype of the DiT's
+        caches, as the model declares them, which the DiT computes in. ``code_offset``:
+        what the stream's items are past the codes (Step-Audio2 streams its LLM's speech
+        ids, ``151696 + code``); subtracted on the device."""
         super().__init__()
         self.model = model
         self.keys = keys
         self.eos_code = eos_code
+        self.code_offset = code_offset
         self.bank = VoiceBank.build(voices, dit_dtype=dit_dtype)
-        self._lead_silence = torch.full((LEAD_SILENCE,), SILENCE_CODE, dtype=torch.int32)
+        # the model's reference's streaming knobs (``Token2WavStreaming``)
+        self.families = model.streaming.cache_families()
+        # in the stream's ids, as the codes they lead
+        self._lead_silence = torch.full(
+            (model.streaming.lead_silence,), SILENCE_CODE + code_offset, dtype=torch.int32)
 
     def compile_regions(self) -> dict[str, list[tuple]]:
         # HiFT up to its spectrum, compiled once with dynamic shapes (every region's
@@ -94,7 +111,7 @@ class Token2WavSubmodule(NodeSubmodule):
     def _caches(self, resources: Mapping) -> WindowCaches:
         """The step's ``WindowCaches``."""
         return WindowCaches(**{
-            name: AttentionCache(resources[self.keys.kv[name]], self.bank.sources[name]) for name in CACHE_FAMILIES
+            name: AttentionCache(resources[self.keys.kv[name]], self.bank.sources[name]) for name in self.families
         })
 
     def _voice_of(self, rid: str) -> tuple[int, int]:
@@ -121,7 +138,7 @@ class Token2WavSubmodule(NodeSubmodule):
                 voice, tokens = self._voice_of(rid)
                 positions.append((tokens, req.get("written", 0), voice))
         steps = {}
-        for name, family in CACHE_FAMILIES.items():
+        for name, family in self.families.items():
             steps[self.keys.kv[name]] = BoundedKVStep(
                 segments=[
                     Segment(request_id=rid, label="main", span=family.span(n, last))
@@ -160,8 +177,11 @@ class Token2WavSubmodule(NodeSubmodule):
         # The TTS's stop code is streamed before its stop is seen. It is not speech, and
         # it ends the speech: the window holding it is the last, as upstream's stream
         # ends there.
-        last = is_final_stream_chunk or bool((codes == self.eos_code).any())
-        codes = codes[codes != self.eos_code]
+        if self.eos_code is None:
+            last = is_final_stream_chunk
+        else:
+            last = is_final_stream_chunk or bool((codes == self.eos_code).any())
+            codes = codes[codes != self.eos_code]
         chunk = input_metadata.stream_chunks[self.keys.codes]
         # keyed by the worker handle, as the forward and the engine's cleanup are
         state = self.request_state(fwd_info.rid_handle)
@@ -181,9 +201,9 @@ class Token2WavSubmodule(NodeSubmodule):
             state.add("voice", fwd_info.step_metadata.get(self.keys.voice))
             # HiFT's excitation, window by window from the request's seed
             state.add("noise", torch.Generator(self.get_device()).manual_seed(fwd_info.random_seed))
-        # Window k starts 25k codes into the silence-led stream (its look-back
-        # included), which is what its caches hold before it (``_cache_steps``).
-        state.add("written", 0 if first else chunk.start_offset + LEAD_SILENCE)
+        # Window k starts 25k codes into the (silence-led, for MiniCPM-o) stream, its
+        # look-back included, which is what its caches hold before it (``_cache_steps``).
+        state.add("written", 0 if first else chunk.start_offset + self._lead_silence.numel())
         return NodeInputs(tensor_inputs={"codes": codes[None]}, kwargs={"last": last, "first": first})
 
     def declare_step(
@@ -325,10 +345,13 @@ class Token2WavSubmodule(NodeSubmodule):
         self, graph_walk: str, engine_inputs: ModelInputsFromEngine, inputs: list[NodeInputs],
     ) -> dict[str, Any]:
         device = self.get_device()
-        return {"rows": [
-            (inp.tensor_inputs["codes"].to(device), inp.kwargs["last"], inp.kwargs.get("first", False))
-            for inp in inputs
-        ]}
+        rows = []
+        for inp in inputs:
+            codes = inp.tensor_inputs["codes"].to(device)
+            if self.code_offset:  # a kernel per row only for a stream that needs it
+                codes = codes - self.code_offset
+            rows.append((codes, inp.kwargs["last"], inp.kwargs.get("first", False)))
+        return {"rows": rows}
 
     def forward_batched(
         self, graph_walk: str, engine_inputs: ModelInputsFromEngine, rows: list | None = None, **kwargs,

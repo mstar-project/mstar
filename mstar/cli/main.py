@@ -45,6 +45,7 @@ DEFAULT_CONFIGS: dict[str, str] = {
     "qwen3_tts": "qwen3tts.yaml",
     "omnivoice": "omnivoice.yaml",
     "minicpm_o": "minicpm_o.yaml",
+    "step_audio2": "step_audio2.yaml",
     "qwen3_tts_1p7b": "qwen3tts_1p7b.yaml",
     "qwen3_tts_voicedesign": "qwen3tts_voicedesign.yaml",
     "qwen3_tts_base": "qwen3tts_base.yaml",
@@ -156,6 +157,7 @@ def _next_steps(model: str, host: str, port: int, api_key_set: bool = False) -> 
     ]
     if model in (
         "bagel", "bagel_cfg_parallel", "qwen3_omni", "command_a_plus", "minicpm_o", "muse_glimmer", "ripple_65b",
+        "step_audio2",
     ):
         lines.append("    print(client.chat(\"Hello!\").text)")
     if model in ("bagel", "bagel_cfg_parallel"):
@@ -179,7 +181,7 @@ def _next_steps(model: str, host: str, port: int, api_key_set: bool = False) -> 
         lines.append("                           images=[\"frame.jpg\"], output_modalities=(\"action\",),")
         lines.append("                           action_mode=\"policy\", domain_name=\"droid_lerobot\",")
         lines.append("                           raw_action_dim=10, action_chunk_size=16)")
-    if model == "qwen3_omni":
+    if model in ("qwen3_omni", "step_audio2"):
         lines.append("    client.chat(\"Say hi\", output_modalities=(\"text\",\"audio\")).save_audio(\"out.wav\")")
     if model == "omnivoice":
         lines.append("    client.tts(\"Xin chào\", language=\"Vietnamese\").to_wav(\"out.wav\")")
