@@ -202,3 +202,197 @@ def test_rows_control_the_anchor_rule_changes_the_answer():
     tokens = torch.from_numpy(ref_io.pack_action_tokens(rows, first_chunk=True))[None]
     assert port_rows.unpack_action_tokens(tokens, 0, 10).shape == (21, 10)
     assert port_rows.unpack_action_tokens(tokens, 1, 10).shape == (24, 10)
+
+
+# ---------------------------------------------------------------------------
+# The trunk's norms and timestep embedding
+# ---------------------------------------------------------------------------
+
+from praxis import action_expert as ref_expert  # noqa: E402
+from praxis import backbone as ref_backbone  # noqa: E402
+from praxis import layers as ref_layers  # noqa: E402
+
+from mstar.model.praxis1.components import norm_time as port_nt  # noqa: E402
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_zero_centered_rms_norm_matches(dtype):
+    """The ``1 + weight`` norm computed in the input's dtype."""
+    torch.manual_seed(0)
+    dim = 64
+    ref = ref_backbone.ZeroCenteredRMSNorm(dim)
+    got = port_nt.ZeroCenteredRMSNorm(dim)
+    with torch.no_grad():
+        w = torch.randn(dim) * 0.1
+        ref.weight.copy_(w)
+        got.weight.copy_(w)
+    x = torch.randn(2, 7, dim, dtype=dtype)
+    assert torch.equal(got(x), ref(x))
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_float32_rms_norm_matches(dtype):
+    """The trunk's norm, which upcasts to float32 and back."""
+    torch.manual_seed(0)
+    dim = 64
+    ref = ref_layers.RMSNorm(dim)
+    got = port_nt.Float32RMSNorm(dim)
+    with torch.no_grad():
+        w = torch.randn(dim) * 0.1
+        ref.weight.copy_(w)
+        got.weight.copy_(w)
+    x = torch.randn(2, 7, dim, dtype=dtype)
+    assert torch.equal(got(x), ref(x))
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_expert_rms_norm_matches(dtype):
+    """No weight, eps 1e-4, square in the input dtype and the rest in f32."""
+    torch.manual_seed(0)
+    x = torch.randn(3, 11, 64, dtype=dtype)
+    assert torch.equal(port_nt.expert_rms_norm(x), ref_expert.rms_norm(x))
+
+
+def test_the_two_norm_families_disagree():
+    """Control: the backbone's norm and the expert's must not coincide.
+
+    They differ in weight and in epsilon, so a test that passed for both
+    would mean one of them is not doing what it claims.
+    """
+    torch.manual_seed(0)
+    dim = 64
+    backbone = port_nt.Float32RMSNorm(dim)
+    with torch.no_grad():
+        backbone.weight.copy_(torch.randn(dim) * 0.1)
+    x = torch.randn(2, 5, dim)
+    assert not torch.equal(backbone(x), port_nt.expert_rms_norm(x))
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_timestep_embedding_matches(dtype):
+    """Fourier features, including the round back to ``t``'s dtype."""
+    torch.manual_seed(0)
+    dim = 128
+    ref = ref_backbone.TimestepEmbedding(dim)
+    got = port_nt.TimestepEmbedding(dim)
+    with torch.no_grad():
+        freqs, phases = torch.randn(1, dim), torch.randn(1, dim)
+        ref.freqs.copy_(freqs), ref.phases.copy_(phases)
+        got.freqs.copy_(freqs), got.phases.copy_(phases)
+    t = torch.rand(4, dtype=dtype)
+    assert torch.equal(got(t), ref(t))
+
+
+def test_timestep_control_bf16_rounds_the_angle():
+    """Control: the cast before the cosine has to change the answer.
+
+    If float32 and bfloat16 timesteps gave the same features, the round trip
+    the reference does would be dead code and the test above would prove
+    nothing about it.
+    """
+    torch.manual_seed(0)
+    dim = 128
+    emb = port_nt.TimestepEmbedding(dim)
+    with torch.no_grad():
+        emb.freqs.copy_(torch.randn(1, dim) * 8)
+        emb.phases.copy_(torch.randn(1, dim))
+    t = torch.rand(4)
+    assert not torch.equal(emb(t).float(), emb(t.to(torch.bfloat16)).float())
+
+
+# ---------------------------------------------------------------------------
+# The chunk-causal mask
+# ---------------------------------------------------------------------------
+
+from mstar.model.praxis1.components import chunk_mask as port_mask  # noqa: E402
+
+
+def _ref_visible(codes: torch.Tensor) -> torch.Tensor:
+    """The reference predicate evaluated densely over one sample's codes."""
+    mod = ref_backbone._tf_packed_mask_mod(codes)
+    s = codes.shape[0]
+    qi = torch.arange(s)[:, None].expand(s, s)
+    ki = torch.arange(s)[None, :].expand(s, s)
+    return mod(None, None, qi, ki)
+
+
+@pytest.mark.parametrize(
+    "n_chunks,n_clean_chunks,tokens_per_chunk",
+    [(1, 0, 6), (2, 1, 6), (4, 3, 6), (3, 2, 4)],
+)
+def test_chunk_mask_matches_reference(n_chunks, n_clean_chunks, tokens_per_chunk):
+    codes = port_mask.encoder_codes(
+        n_registers=4, n_anchor=2, n_text=5,
+        tokens_per_chunk=tokens_per_chunk,
+        n_chunks=n_chunks, n_clean_chunks=n_clean_chunks,
+    )
+    got = port_mask.visible(codes)
+    want = _ref_visible(codes)
+    assert got.shape == want.shape
+    assert torch.equal(got, want)
+
+
+def test_token_codes_match_reference():
+    chunk = torch.tensor([0, 0, 1, 1, 2, 3])
+    is_clean = torch.tensor([True, False, True, False, False, True])
+    is_bc = torch.tensor([True, True, True, True, False, True])
+    got = port_mask.token_codes(chunk, is_clean, is_bc)
+    want = ref_backbone._tf_codes(chunk, is_clean, is_bc)
+    assert torch.equal(got, want)
+
+
+def test_mask_rules_hold_as_described():
+    """The four behaviours stated in the module docstring, read off the mask.
+
+    Worth asserting separately from the reference comparison: if both sides
+    were wrong in the same way the comparison would still pass, and these
+    are the properties the eventual engine resource has to reproduce.
+    """
+    n_reg, n_anchor, n_text, tpc, n_chunks, n_clean = 4, 2, 5, 6, 3, 2
+    n_global = n_reg + n_anchor + n_text
+    codes = port_mask.encoder_codes(
+        n_registers=n_reg, n_anchor=n_anchor, n_text=n_text,
+        tokens_per_chunk=tpc, n_chunks=n_chunks, n_clean_chunks=n_clean,
+    )
+    m = port_mask.visible(codes)
+    noised0 = n_global
+    clean0 = n_global + n_chunks * tpc
+
+    # 1. everyone sees the globals; a global sees only globals
+    assert m[:, :n_global].all()
+    assert not m[:n_global, n_global:].any()
+
+    # 3. a noised token sees its own chunk's noised tokens and no other's
+    q = noised0  # chunk 0, noised
+    assert m[q, noised0 : noised0 + tpc].all()
+    assert not m[q, noised0 + tpc : clean0].any()
+
+    # 4. a noised token of chunk 1 sees clean chunk 0 but not clean chunk 1
+    q1 = noised0 + tpc
+    assert m[q1, clean0 : clean0 + tpc].all()
+    assert not m[q1, clean0 + tpc : clean0 + 2 * tpc].any()
+
+    # 2. a clean token sees its own and earlier clean chunks, never a noised one
+    c1 = clean0 + tpc
+    assert m[c1, clean0 : clean0 + 2 * tpc].all()
+    assert not m[c1, noised0:clean0].any()
+
+
+def test_mask_control_block_causal_would_differ():
+    """Control: plain block causality must NOT reproduce this mask.
+
+    This is the claim the resource pass rests on, so it is asserted rather
+    than argued: a block-causal rule over the same chunks lets a noised
+    query reach earlier chunks' noised tokens, which this mask forbids.
+    """
+    tpc, n_chunks = 6, 3
+    codes = port_mask.encoder_codes(
+        n_registers=0, n_anchor=0, n_text=0,
+        tokens_per_chunk=tpc, n_chunks=n_chunks, n_clean_chunks=0,
+    )
+    ours = port_mask.visible(codes)
+    idx = torch.arange(n_chunks * tpc)
+    block_causal = (idx[:, None] // tpc) >= (idx[None, :] // tpc)
+    assert not torch.equal(ours, block_causal)
+    # and specifically: block-causal admits a pair ours rejects
+    assert block_causal[tpc, 0] and not ours[tpc, 0]
