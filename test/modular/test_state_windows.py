@@ -18,8 +18,9 @@ import torch
 from torch._dynamo.testing import CompileCounter
 
 from mstar.communication.tensors import LocalTransferEngine
-from mstar.distributed.communication import CommGroup, JointGroups
-from mstar.engine.resources.attn.config import AttentionConfig, AttentionStep, AttnBackend
+from mstar.distributed.communication import CommGroup, JointGroups, WorkerParallelGroups
+from mstar.engine.engine import Engine
+from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec, AttentionStep, AttnBackend
 from mstar.engine.resources.attn.kept_window import KeptWindowAttention
 from mstar.engine.resources.base import EngineResourceInfo
 from mstar.engine.resources.kv.config import (
@@ -38,7 +39,7 @@ from mstar.engine.resources.kv.ring import RingKVManager
 from mstar.engine.resources.kv.rolling import RollingKVConfig, RollingKVReqConfig, RollingKVStep, RollingPosition
 from mstar.engine.resources.kv.rolling.manager import RollingKVManager
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
-from mstar.engine.resources.sequence_shard import sequence_parallel_refusals
+from mstar.engine.resources.sequence_shard import SeqShardSpec
 from mstar.engine.resources.step import Segment, StepContext, SubmoduleStep
 from mstar.engine.state import (
     Array,
@@ -345,12 +346,63 @@ def test_a_ring_takes_no_kernel_settings():
         build_specs([_ring_array()], kernel_settings={"local": {"splits": (1,)}})
 
 
+class _Submodule:
+    """What the engine's build asks of a node's submodule."""
+
+    disable_autocast = True
+    forward = forward_batched = None
+
+    def requires_grad_(self, flag):
+        return self
+
+    def bind_node_resources(self, resources):
+        self.resources = resources
+
+
+def _load_on_sp_ranks(specs) -> Engine:
+    """The engine's build of ``specs`` on node dit, as rank 0 of its 2 SP ranks."""
+    ranks = CommGroup(my_global_rank=0, my_group_rank=0, group_members=[0, 1])
+    groups = WorkerParallelGroups(num_workers=2, global_rank=0)
+    groups.add("dit", ranks, "sp")
+    groups.node_to_instance_comm["dit"] = ranks
+    engine = Engine(graph_runtime=None)
+    engine.load_model(
+        {"dit": _Submodule()}, specs=specs, parallel_groups=groups, device=torch.device("cpu"),
+        transfer_engine_info=TransferEngineInfo("h", "h", LocalTransferEngine("h")),
+    )
+    return engine
+
+
+def _text_pool(**config) -> KVSpec:
+    """A paged pool on the ring's node."""
+    return KVSpec(resource_key="text_kv", nodes={"dit"}, config=PagedKVConfig(
+        num_layers=1, num_kv_heads=2, head_dim=64, max_seq_len=256, num_qo_heads=4, max_num_pages=8, page_size=16,
+        **config,
+    ))
+
+
 def test_the_engine_refuses_a_ring_on_sp_ranks():
-    """A ring declares nothing about sequence parallelism and refuses nothing about it. The engine's check refuses its
-    node on SP ranks, and where a shard splits the node's steps the engine refuses the ring at build."""
-    (refusal,) = sequence_parallel_refusals(build_specs([_ring_array()]), "dit", tp=1, sp=2)
-    assert refusal.startswith("node 'dit' runs on 2 SP ranks but neither splits tokens"), refusal
-    assert not RingKVManager.supports_split_steps, "a ring that took split steps would pass the engine's build check"
+    """A ring declares nothing about sequence parallelism and refuses nothing about it. Alone on SP ranks, its node
+    is refused as any node that neither splits its steps nor places a pool. Beside a pool whose attention takes
+    split steps, a shard splits the node's steps, and the engine's build refuses the ring by name."""
+    with pytest.raises(ValueError, match="node 'dit' runs on 2 SP ranks but neither splits tokens"):
+        _load_on_sp_ranks([build_specs([_ring_array()])[0]])
+    attention = AttentionSpec(resource_key="text_attn", nodes={"dit"},
+                              config=AttentionConfig("text_kv", backend=AttnBackend.FLASHINFER))
+    with pytest.raises(ValueError, match=r"resource 'kv' \(RingKVManager\) does not support steps split over SP "
+                                         r"ranks, and node 'dit' splits them"):
+        _load_on_sp_ranks([
+            build_specs([_ring_array()])[0], _text_pool(), attention, SeqShardSpec("shard", {"dit"}, ("main",), 0),
+        ])
+
+
+def test_a_ring_beside_a_placed_pool_is_whole_on_each_rank():
+    """A node whose paged pool is placed over its SP ranks runs every step on each of them, so the ring isn't
+    refused and each rank holds all of it."""
+    engine = _load_on_sp_ranks([build_specs([_ring_array()])[0], _text_pool(context_parallel=True)])
+    ring = engine._resources["kv"]
+    assert engine._resources["text_kv"].placement is not None
+    assert ring.placement is None and ring.config.num_kv_heads == HEADS, "the ring should keep every head here"
 
 
 @pytest.mark.parametrize(("read", "message"), [
