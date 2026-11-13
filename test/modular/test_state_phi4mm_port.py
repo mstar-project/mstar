@@ -3,8 +3,8 @@
 Nothing in the engine changes when a model moves to declarations, because it sees the same objects. The hand-written
 specs and steps below are the reference, copied from the model as it stood before the port, so the adapter can't pass
 by agreeing with itself. Two of its fields had no declaration before: the LLM's LongRoPE factors, which pick a
-request's table by its prompt length, and the vision tower's FA3 kernel, which FlashInfer would replace with one that
-pads the tower's head_dim of 72 to 128.
+request's table by its prompt length, and the vision tower's FA3 kernel, since FlashInfer pads the tower's head_dim of
+72 to 128.
 """
 
 from __future__ import annotations
