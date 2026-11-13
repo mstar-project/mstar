@@ -24,6 +24,7 @@ PORTED = (
     "mstar/model/canary_qwen", "mstar/model/qwen3_asr", "mstar/model/parakeet", "mstar/model/fish_s2_pro",
     "mstar/model/qwen3_tts",
     "mstar/model/pi05", "mstar/model/vjepa2", "mstar/model/canary", "mstar/model/components/encoder_decoder.py",
+    "mstar/model/components/wan_vae.py",
     "mstar/model/bagel", "mstar/model/chatterbox", "mstar/model/whisper",
     "mstar/model/waypoint", "mstar/model/lingbot_world",
 )

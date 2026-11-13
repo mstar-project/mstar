@@ -13,10 +13,17 @@ conv3d kernels run in, so no conv pays a layout conversion on the way in or out.
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
+
 import torch
 import torch.nn.functional as F
 from diffusers.models.autoencoders.autoencoder_kl_wan import WanCausalConv3d, WanUpsample, unpatchify
 from torch import nn
+
+from mstar.engine.state import Size, TensorType
+
+# the sizes a stream's cache fields scale with: its latent's height and width
+LAT_H, LAT_W = "lat_h", "lat_w"
 
 
 class ChannelsLastCausalConv3d(WanCausalConv3d):
@@ -178,6 +185,97 @@ def new_feat_cache(vae: nn.Module) -> FeatCache:
 
 def feat_cache_bytes(feat_cache: list) -> int:
     return sum(t.numel() * t.element_size() for t in feat_cache if torch.is_tensor(t))
+
+
+def _encoder_slots(
+    base_dim: int, dim_mult: Sequence[int], num_res_blocks: int, temporal: Sequence[bool], in_channels: int,
+) -> list[tuple[int, int, int]]:
+    """Each causal conv's cached input in ``WanEncoder3d``'s order, as (channels, frames, scale over the latent)."""
+    dims = [base_dim * mult for mult in (1, *dim_mult)]
+    scale = 2 ** (len(dim_mult) - 1)
+    slots = [(in_channels, 2, scale)]
+    for i, (din, dout) in enumerate(zip(dims[:-1], dims[1:], strict=True)):
+        slots += [(din, 2, scale), *[(dout, 2, scale)] * (2 * num_res_blocks - 1)]
+        if i < len(dim_mult) - 1:
+            scale //= 2
+            if temporal[i]:
+                # a temporal downsample keeps one frame
+                slots.append((dout, 1, scale))
+    # the middle block's four convs and the head's
+    return [*slots, *[(dims[-1], 2, scale)] * 5]
+
+
+def _decoder_slots(
+    base_dim: int, z_dim: int, dim_mult: Sequence[int], num_res_blocks: int, temporal: Sequence[bool],
+) -> list[tuple[int, int, int]]:
+    """As `_encoder_slots`, in ``WanDecoder3d``'s order."""
+    dims = [base_dim * mult for mult in (dim_mult[-1], *dim_mult[::-1])]
+    # the input conv's, then the middle block's four
+    slots, scale = [(z_dim, 2, 1), *[(dims[0], 2, 1)] * 4], 1
+    for i, (din, dout) in enumerate(zip(dims[:-1], dims[1:], strict=True)):
+        if i:
+            # the upsample before this block halved the channels
+            din //= 2
+        slots += [(din, 2, scale), *[(dout, 2, scale)] * (2 * num_res_blocks + 1)]
+        if i < len(dim_mult) - 1:
+            if temporal[::-1][i]:
+                slots.append((dout, 2, scale))
+            scale *= 2
+    return [*slots, (dims[-1], 2, scale)]
+
+
+def stream_cache_fields(
+    part: str, dtype: torch.dtype, prefix: str, *, base_dim: int = 96, z_dim: int = 16,
+    dim_mult: Sequence[int] = (1, 2, 4, 4), num_res_blocks: int = 2, temporal: Sequence[bool] = (False, True, True),
+    in_channels: int = 3,
+) -> dict[str, TensorType]:
+    """The slots a stream's ``part`` (``"encoder"`` or ``"decoder"``) holds a tensor in between calls, as a sized
+    Value's fields, ``{prefix}_{slot:02d}`` by the slot's index in the cache: each
+    ``(1, channels, frames, scale * lat_h, scale * lat_w)``. From the VAE's config, the Wan2.1 VAE's by default,
+    so every process declares them without loading it; `check_stream_cache` holds a loaded VAE's cache to them."""
+    if part == "encoder":
+        slots = _encoder_slots(base_dim, dim_mult, num_res_blocks, temporal, in_channels)
+    else:
+        slots = _decoder_slots(base_dim, z_dim, dim_mult, num_res_blocks, temporal)
+    return {
+        f"{prefix}_{i:02d}": TensorType((1, channels, frames, Size(LAT_H, scale=s), Size(LAT_W, scale=s)), dtype=dtype)
+        for i, (channels, frames, s) in enumerate(slots)
+    }
+
+
+def check_stream_cache(cache: list, fields: Mapping[str, TensorType], prefix: str, lat_hw: tuple[int, int]) -> None:
+    """Raise unless ``cache``, a stream's cache between calls at a ``lat_hw`` latent, holds a tensor of each of
+    ``fields``' shape and dtype at its slot, and none in any other."""
+    sizes = dict(zip((LAT_H, LAT_W), lat_hw, strict=True))
+    for i, slot in enumerate(cache):
+        field = fields.get(f"{prefix}_{i:02d}")
+        declared = field and (
+            tuple(a.scale * sizes[a.name] if isinstance(a, Size) else a for a in field.shape), field.dtype,
+        )
+        held = (tuple(slot.shape), slot.dtype) if torch.is_tensor(slot) else slot
+        if held != declared:
+            raise RuntimeError(f"slot {i} of the VAE's {prefix} cache holds {held} at a {lat_hw[0]}x{lat_hw[1]} "
+                               f"latent, and it is declared as {declared}")
+
+
+def cache_from_fields(slots: int, held: Mapping[str, torch.Tensor | None], prefix: str) -> list:
+    """A cache of ``slots`` slots from the tensors a sized Value's read handed over, by `stream_cache_fields`' names,
+    None where a slot holds nothing: all of them at a stream's first chunk."""
+    return [held.get(f"{prefix}_{i:02d}") for i in range(slots)]
+
+
+def cache_fields(cache: list, prefix: str) -> dict[str, torch.Tensor]:
+    """``cache``'s tensors by `stream_cache_fields`' names, for a sized Value's write."""
+    fields = {}
+    for i, slot in enumerate(cache):
+        if torch.is_tensor(slot):
+            fields[f"{prefix}_{i:02d}"] = slot
+        elif slot is not None:
+            raise RuntimeError(
+                f"slot {i} of the VAE's {prefix} cache holds {slot!r}, which has no field, so the stream's next "
+                "call would find the slot empty and start over; diffusers leaves 'Rep' there after a chunk of one "
+                "latent, so refuse chunks under two where the model declares the fields")
+    return fields
 
 
 def compile_decode(fn, deterministic: bool = False):
