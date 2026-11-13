@@ -203,6 +203,7 @@ class Praxis1Config:
     """What the served graph needs from a checkpoint."""
 
     embodiment: str
+    pose_frame: str
     views: tuple[str, ...]
     action_dim: int
 
@@ -341,6 +342,7 @@ class Praxis1Config:
         action_dim = rig_defaults["action_dim"]
         return cls(
             embodiment=rig,
+            pose_frame="flange" if rig == "single_arm" else "rig",
             views=RIG_VIEWS[rig],
             action_dim=action_dim,
             proprio_patch_dim=action_dim,
@@ -370,6 +372,12 @@ class Praxis1Config:
                 f"{', '.join(sorted(RIG_VIEWS))}"
             )
         embodiment = str(embodiment)
+        pose_frame = str(config.get("pose_frame", "flange" if embodiment == "single_arm" else "rig"))
+        expected_frame = "flange" if embodiment == "single_arm" else "rig"
+        if pose_frame != expected_frame:
+            raise Praxis1ConfigError(
+                f"{embodiment} checkpoint needs pose_frame {expected_frame!r}, got {pose_frame!r}"
+            )
 
         backbone = _section(config, "backbone")
         layout = backbone.get("layout", SUPPORTED_LAYOUT)
@@ -384,6 +392,8 @@ class Praxis1Config:
         chunking = _section(config, "chunking")
         video = _section(config, "video")
         text = _section(config, "text_encoder")
+        if not isinstance(text.get("blank_caption"), str):
+            raise Praxis1ConfigError("text_encoder.blank_caption must be a string")
 
         canvas = video.get("canvas", SUPPORTED_CANVAS)
         if canvas != SUPPORTED_CANVAS:
@@ -430,6 +440,7 @@ class Praxis1Config:
 
         return cls(
             embodiment=embodiment,
+            pose_frame=pose_frame,
             views=views,
             action_dim=action_dim,
             dim=int(backbone["dim"]),

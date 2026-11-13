@@ -529,7 +529,7 @@ class Praxis1Model(Model):
         branch a token to read.
         """
         tok = self._tokenizer()
-        task = prompt if (prompt and prompt.strip()) else " "
+        task = prompt.strip() if (prompt and prompt.strip()) else " "
         blank = self._blank_caption()
         pad = self.config.text_pad_to_multiple_of
 
@@ -563,7 +563,7 @@ class Praxis1Model(Model):
         if kwargs.get("action_format") == "positronic":
             metadata[MODEL_POSE_KWARG] = model_pose.tolist()
         robot_state = model_pose.tolist()
-        proprio = normalized_proprio(robot_state, self.config.embodiment, self.config.normalization)
+        proprio = normalized_proprio(model_pose, self.config.embodiment, self.config.normalization)
         new_tensors = {
             "text_ids": [task_ids],
             "text_mask": [task_mask],

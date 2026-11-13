@@ -64,7 +64,7 @@ def test_time_grid_rejects_invalid_shift(shift: float) -> None:
         window_time_grid(2, shift)
 
 
-def test_cold_pose_and_sampler_match_reference() -> None:
+def test_model_frame_proprio_math_and_sampler_match_reference() -> None:
     pytest.importorskip("praxis", reason="reference checkout is not on PYTHONPATH")
     from praxis.robot_io import pose8_to_10d, proprio_normalize
     from praxis.sampler import seeded_normal as ref_noise
@@ -80,6 +80,35 @@ def test_cold_pose_and_sampler_match_reference() -> None:
     for salt in (VIDEO_SALT, ACTION_SALT):
         assert torch.equal(seeded_normal((2, 3), 79, salt), ref_noise((2, 3), 79, salt))
     assert window_time_grid(3, 12.5) == tuple(ref_times(3, 12.5))
+
+
+@pytest.mark.parametrize("descriptor", ["", "flange"])
+def test_praxis_prompt_converts_client_pose_to_checkpoint_frame(descriptor: str) -> None:
+    pytest.importorskip("praxis", reason="reference checkout is not on PYTHONPATH")
+    from praxis.robot_io import pose8_to_10d
+    from praxis.single_arm import pose8_to_model, proprio_normalize, rig_frame
+
+    model = Praxis1Model("runwayml/praxis-1-droid", skip_weight_loading=True)
+    model.config = replace(model.config, normalization=_stats(10))
+    model._tokenizer_cache = _Tokenizer()
+    pose = np.array([0.3, -0.7, 1.2, 0.6, -0.2, 0.4, 0.1, 1.3], dtype=np.float32)
+    expected_pose = pose8_to_model(pose, rig_frame({"descriptor": descriptor}))
+    expected = proprio_normalize(
+        pose8_to_10d(expected_pose), np.zeros(10, np.float32), np.ones(10, np.float32),
+    )
+    got = model.process_prompt(
+        "pick up cup", [], [], robot_state=pose.tolist(), pose_descriptor=descriptor,
+    ).new_input_tensors["proprio"][0].numpy()[0, 0]
+    np.testing.assert_array_equal(got, expected)
+
+
+def test_bimanual_cold_openpi_rejects_nonunit_pose_quaternion() -> None:
+    model = Praxis1Model("runwayml/praxis-1-yam", skip_weight_loading=True)
+    model.config = replace(model.config, normalization=_stats(20))
+    model._tokenizer_cache = _Tokenizer()
+    pose = [0.0, 0.0, 0.0, 1.05, 0.0, 0.0, 0.0, 0.5] * 2
+    with pytest.raises(ValueError, match="quaternion"):
+        model.process_prompt("pick up cup", [], [], robot_state=pose)
 
 
 class _Tokenizer:
