@@ -1,6 +1,6 @@
 """The DiT components that swap in one-pass kernels inside a compiled region
-(``modulation.ada_layer_norm``, ``qk_norm_rope.rms_norm_rope``, ``ffn.gelu_tanh_ffn``),
-against their eager formulations.
+(``modulation.ada_layer_norm``, ``qk_norm_rope.rms_norm_rope``, ``ffn.gelu_tanh_ffn``,
+the cross-attention's ``attention.text_attention_fn``), against their eager formulations.
 
 The eager formulation is what the reference ports are held bit-exact in, so the
 CPU tests pin it to the expressions a DiT block writes inline. The kernels
@@ -18,9 +18,10 @@ import torch.nn.functional as F
 from torch import nn
 
 from mstar.model.components.diffusion import modulation, qk_norm_rope
+from mstar.model.components.diffusion.attention import sdpa_attention, text_attention_fn
 from mstar.model.components.diffusion.ffn import gelu_tanh_ffn
 from mstar.model.components.mlp import MLP
-from mstar.model.wan22.components.dit import Wan22RoPE3D
+from mstar.model.wan22.components.dit import Wan22DiTAttention, Wan22RoPE3D
 from mstar.model.wan22.config import Wan22Config
 
 CUDA = torch.cuda.is_available()
@@ -210,4 +211,31 @@ def test_gelu_epilogue_matches_eager():
     assert torch.equal(compiled, got)
     # the down-projection sums thousands of rounded activations, so fewer elements
     # come out equal than for the single-pass kernels
+    _assert_bf16_close(got, want, min_equal=0.3)
+
+
+def test_text_attention_is_sdpa_where_fa3_cannot_run():
+    assert text_attention_fn(12, 128, torch.bfloat16, torch.device("cpu")) is sdpa_attention
+
+
+@pytest.mark.skipif(not CUDA, reason="needs CUDA")
+def test_compiled_cross_attention_runs_fa3_without_a_graph_break():
+    """Bound where FA3 runs, the compiled cross-attention traces FA3 into its graph (fullgraph) and launches it,
+    eager stays on SDPA, and the two agree to bf16 attention rounding."""
+    torch.manual_seed(0)
+    attn = Wan22DiTAttention(1536, 12, EPS).to("cuda", torch.bfloat16)
+    attn.bind_state({})
+    if attn.text_attention is sdpa_attention:
+        pytest.skip("FA3 can't run here (needs Hopper and flash_attn_3)")
+    x = torch.randn(2, 600, 1536, device="cuda", dtype=torch.bfloat16)
+    text = torch.randn(2, 512, 1536, device="cuda", dtype=torch.bfloat16)
+    compiled = torch.compile(attn, fullgraph=True, dynamic=False)
+    with torch.inference_mode():
+        want = attn(x, encoder_hidden_states=text)
+        compiled(x, encoder_hidden_states=text)
+        with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as prof:
+            got = compiled(x, encoder_hidden_states=text)
+            torch.cuda.synchronize()
+    kernels = {event.name for event in prof.events()}
+    assert any("flash" in name.lower() for name in kernels), sorted(kernels)
     _assert_bf16_close(got, want, min_equal=0.3)

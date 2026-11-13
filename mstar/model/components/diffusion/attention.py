@@ -76,6 +76,21 @@ def sdpa_attention(
     return out.to(q.dtype).transpose(1, 2), torch.logsumexp(scores, dim=-1).transpose(1, 2)
 
 
+def text_attention_fn(heads: int, head_dim: int, dtype: torch.dtype, device: torch.device) -> Attend:
+    """The kernel a compiled DiT runs for an attention no engine binds an array to (its cross-attention to the
+    text): Dao's FlashAttention-3 where the ragged table's ``fa3`` implementation can run (Hopper, and
+    ``flash_attn_3`` imports), which takes the ``[B, S, H, D]`` layout without a transpose and is faster than
+    cuDNN SDPA at a text's 512 keys; SDPA elsewhere. Decided once, when the layer is bound."""
+    from mstar.engine.resources.attn.ragged.kernels import RAGGED_ATTENTION
+
+    shape = {"num_qo_heads": heads, "num_kv_heads": heads, "head_dim": head_dim}
+    if RAGGED_ATTENTION.impl("fa3").unavailable(RAGGED_ATTENTION.target(dtype, shape, device)) is not None:
+        return sdpa_attention
+    from flash_attn_interface import flash_attn_func
+
+    return flash_attn_func
+
+
 class FrameSDPA:
     """SDPA within each segment of ``lengths``, set before each call. It stands in for a ragged resource's ``run``
     where none is declared (a model's SDPA mode, the reference's own kernel)."""

@@ -43,7 +43,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from mstar.engine.state import gather, scatter, split_range
-from mstar.model.components.diffusion.attention import attend
+from mstar.model.components.diffusion.attention import attend, sdpa_attention, text_attention_fn
 from mstar.model.components.diffusion.ffn import gelu_tanh_ffn
 from mstar.model.components.diffusion.modulation import ada_layer_norm
 from mstar.model.components.diffusion.qk_norm_rope import rms_norm_rope
@@ -164,10 +164,17 @@ class Wan22DiTAttention(nn.Module):
         self.o_proj = nn.Linear(dim, dim, bias=True)
         self.q_norm = nn.RMSNorm(dim, eps=eps, elementwise_affine=True)
         self.k_norm = nn.RMSNorm(dim, eps=eps, elementwise_affine=True)
+        # the cross-attention's kernel inside a compiled forward (`bind_state`); eager runs SDPA
+        self.text_attention = sdpa_attention
 
     def bind_state(self, handles: Mapping[str, Any]) -> None:
-        # the cross-attention declares no array and stays on SDPA, which is faster at the text's shape
+        # the cross-attention declares no array: a ragged schedule over the text's 512 keys is slower than a dense
+        # kernel, so compiled it runs FA3 where it can, which SGLang runs there too
         self.state = handles.get(self.array)
+        if self.array is None:
+            weight = self.q_proj.weight
+            self.text_attention = text_attention_fn(self.num_heads, weight.shape[0] // self.num_heads,
+                                                    weight.dtype, weight.device)
 
     def forward(
         self,
@@ -189,7 +196,10 @@ class Wan22DiTAttention(nn.Module):
 
         # Bidirectional, no mask: SDPA (the reference's dispatch_attention_fn
         # native path) with no array, one segment per guidance branch with one.
-        out = attend(self.state, self.layer, query, key, value)
+        if self.state is None and encoder_hidden_states is not None and torch.compiler.is_compiling():
+            out = self.text_attention(query, key, value)
+        else:
+            out = attend(self.state, self.layer, query, key, value)
         return self.o_proj(out.flatten(2, 3))
 
 
