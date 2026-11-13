@@ -25,6 +25,7 @@ from mstar.engine.state import (
     Attend,
     Bidirectional,
     Block,
+    BlockCausal,
     Causal,
     CausalConv,
     Entry,
@@ -254,6 +255,11 @@ def test_every_read_of_an_array_with_max_len_zero_is_a_block_read():
 
 def test_a_block_read_on_max_len_zero_has_no_problem():
     assert state_declaration_problems(_StubModel(_array(max_len=0, reads={"r": _read(mask=Block())}))) == []
+
+
+def test_a_block_causal_read_on_max_len_zero_has_no_problem():
+    array = _array(max_len=0, reads={"r": _read(mask=BlockCausal(4))})
+    assert state_declaration_problems(_StubModel(array)) == []
 
 
 @pytest.mark.parametrize("array", [

@@ -21,6 +21,7 @@ from test_startup_graph_validation import _prefill_decode, _ToyModel, _validate
 from test_state_ports import QWEN3_5, _qwen3_5
 
 from mstar.engine.resources.attn.config import AttentionSpec
+from mstar.engine.resources.attn.ragged.config import RaggedBlockCausalAttentionSpec
 from mstar.engine.resources.kv.config import KVSpec
 from mstar.engine.resources.linear_attn.config import LinearAttnSpec, LinearAttnVariant
 from mstar.engine.resources.recurrent.config import RecurrentBlockConfig, RecurrentStateSpec
@@ -32,6 +33,7 @@ from mstar.engine.state import (
     Attend,
     Bidirectional,
     Block,
+    BlockCausal,
     Causal,
     CausalConv,
     Entry,
@@ -52,6 +54,7 @@ from mstar.engine.state.adapters import (
     _resolve,
     build_specs,
     node_resources,
+    state_setup,
 )
 from mstar.engine.state.contract import Mask, Op
 from mstar.model.base import Model, enabled_resources, serving_resources
@@ -827,3 +830,26 @@ def test_decode_tensor_cores_on_a_within_step_read_is_refused():
 def test_a_samplers_window_and_top_p_first_reach_its_spec():
     (spec,) = build_specs([Sampler("tts_sampler", nodes={"tts"}, vocab_size=8, repetition_window=16, top_p_first=True)])
     assert spec.max_repetition_window == 16 and spec.enable_top_p_first, "the sampler would refuse the request's window"
+
+
+def test_a_block_causal_read_within_a_step_builds_a_ragged_block_causal_spec():
+    (spec,) = build_specs(
+        [_within(reads={"vision_attn": _read(mask=BlockCausal(50))})],
+        kernel_settings={"vision_attn": {"max_segments_per_request": 4}},
+    )
+    assert type(spec) is RaggedBlockCausalAttentionSpec and spec.block_size == 50, spec
+    assert spec.config.max_segments_per_request == 4, "the ragged kernel's settings reach the block-causal spec too"
+
+
+def test_block_causal_reads_of_two_sizes_keep_two_specs():
+    audio = Array("audio", nodes={"llm"}, layers={0}, entry=KVEntry(heads=4, head_dim=16), max_len=0,
+                  reads={"audio_attn": _read(mask=BlockCausal(25))})
+    specs = build_specs([_within(reads={"vision_attn": _read(mask=BlockCausal(50))}), audio])
+    assert sorted(spec.block_size for spec in specs) == [25, 50], "one shared spec would plan one block size for both"
+
+
+def test_sdpa_refuses_a_block_causal_read():
+    array = _within(reads={"vision_attn": _read(mask=BlockCausal(4), packed=False)})
+    setup, problems = state_setup({"resources": {"vision_attn": {"backend": "sdpa"}}}, [array])
+    assert "vision_attn" not in setup.by_read, "a worker would attend each row whole"
+    assert len(problems) == 1 and "mask must be Block, the mask SdpaAttend runs within a step" in problems[0], problems
