@@ -125,6 +125,9 @@ class ARFusion:
     def graph_capture(self) -> GraphCaptureScope:
         return GraphCaptureScope()
 
+    def close(self) -> None:
+        pass
+
 
 # --- NVIDIA: FlashInfer ------------------------------------------------------
 
@@ -551,6 +554,9 @@ class AiterARFusion(ARFusion):
         if hi:
             self._ca.register_graph_buffers()
         return not failed
+
+    def close(self) -> None:
+        self._ca.close()
 
 
 class _RegisteredCapture(GraphCaptureScope):

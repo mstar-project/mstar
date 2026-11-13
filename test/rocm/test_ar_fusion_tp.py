@@ -188,12 +188,6 @@ def _memory(ranks: _Ranks, fn):
     return out, (free0 - free1) / 2**20
 
 
-def _fusion(group, hidden, dtype):
-    """The group's fused strategy for ``hidden`` x ``dtype``, or None."""
-    ws = group._ar_fusion.get((dtype, hidden))
-    return None if ws is None else ws.fusion
-
-
 def _parity(ranks: _Ranks) -> list[Row]:
     rows = []
     for hidden in ranks.opts.hiddens:
@@ -201,7 +195,7 @@ def _parity(ranks: _Ranks) -> list[Row]:
         fused, mem = _memory(ranks, lambda group=group, hidden=hidden: (
             group.init_allreduce_fusion(hidden, ranks.dtype, ranks.opts.max_tokens)
         ))
-        fusion = _fusion(group, hidden, ranks.dtype)
+        fusion = group._ar_fusion
         rows.append(Row("memory", ranks.rank, ranks.world, hidden, 0,
                         path="fused" if fused else "none", mem_mib=mem,
                         note=f"fused up to {getattr(fusion, 'max_tokens', 0)} tokens"))
@@ -227,6 +221,8 @@ def _parity(ranks: _Ranks) -> list[Row]:
                 )
                 row.inputs_untouched = torch.equal(x, x0) and torch.equal(res, res0)
                 rows.append(row)
+        if fusion is not None:
+            fusion.close()
     return rows
 
 
@@ -238,7 +234,7 @@ def _capture(ranks: _Ranks) -> list[Row]:
     for hidden in ranks.opts.hiddens:
         group = ranks.comm_group()
         group.init_allreduce_fusion(hidden, ranks.dtype, ranks.opts.max_tokens)
-        fusion = _fusion(group, hidden, ranks.dtype)
+        fusion = group._ar_fusion
         if fusion is None:
             rows.append(Row("capture", ranks.rank, ranks.world, hidden, 0,
                             path="none", note="no fusion here"))
@@ -252,6 +248,7 @@ def _capture(ranks: _Ranks) -> list[Row]:
                         ranks, group, pool, hidden, tokens, gemma, registered,
                         GraphCaptureScope,
                     ))
+        fusion.close()
     return rows
 
 
@@ -323,7 +320,7 @@ def _timing(ranks: _Ranks) -> list[Row]:
     for hidden in ranks.opts.hiddens:
         group = ranks.comm_group()
         group.init_allreduce_fusion(hidden, ranks.dtype, ranks.opts.max_tokens)
-        fusion = _fusion(group, hidden, ranks.dtype)
+        fusion = group._ar_fusion
         for tokens in ranks.opts.tokens:
             x, res, w = ranks.inputs(tokens, hidden, False, seed=hidden + tokens)
 
@@ -344,6 +341,8 @@ def _timing(ranks: _Ranks) -> list[Row]:
                 row = Row("timing", ranks.rank, ranks.world, hidden, tokens, path=name)
                 row.us_per_call = _time_in_graph(ranks, group, pool, fn, registered)
                 rows.append(row)
+        if fusion is not None:
+            fusion.close()
     return rows
 
 
