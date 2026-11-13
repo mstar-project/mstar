@@ -261,6 +261,15 @@ def test_auto_stays_synchronous_when_the_verify_walk_has_no_resident_capture(mon
     assert "resident_walks" in eng._drafts[NODE].reason
 
 
+def test_a_verifying_nodes_verify_walk_is_refused_repeated_decode():
+    """The ledger records one accepted count a row per commit, and a repeated step commits once for
+    several replays: the verify walk is refused before main's own checks, whatever they would say."""
+    eng = engine(3)
+    walk = eng.node_drafts()[NODE].walk
+    refusal = eng.repeat_refusal(NODE, walk, ())
+    assert refusal is not None and "verify ledger" in refusal, refusal
+
+
 def test_a_verify_step_run_row_by_row_is_refused(caplog):
     from spec_toy import ToyLM
 
