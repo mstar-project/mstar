@@ -27,6 +27,12 @@ Two measured notes, both recorded as tests rather than as comments:
   across devices: on CUDA it runs a hand-written kernel whose sigmoid rounds
   differently from ``F.silu``. These tests run on CPU and compare eager
   against eager; an accelerated port has to be checked against that kernel.
+
+Both dispatch regimes are covered, unchunked (``dispatch_chunk_size`` null,
+the reference's default) and chunked (what every published config sets).
+The chunked regime's float32 sum order is invisible in bf16, measured, so
+its float32 tests are the ones that protect it; see the notes in that
+section.
 """
 
 from __future__ import annotations
@@ -553,6 +559,401 @@ def test_renorm_epsilon_bites_only_at_vanishing_scores():
 
 
 # ---------------------------------------------------------------------------
+# The chunked dispatch: the regime every published checkpoint selects
+# ---------------------------------------------------------------------------
+
+PUBLISHED_CHUNK = 16384
+# Down to one row, through the published chunk exactly, and past it so the
+# last one crosses a boundary (20000 is 16384 plus a ragged 3616).
+CHUNKED_ROWS = [1, 40, 728, 4096, PUBLISHED_CHUNK, 20000]
+# Chunks small enough that a cheap batch crosses many boundaries, the last
+# chunk ragged. 1 is the degenerate one: every token its own dispatch.
+SMALL_CHUNKS = [1, 7]
+
+
+def _reference_with_chunk(chunk, dtype, bias, seed: int = 0, top_k: int = TOP_K):
+    """A reference MoE with a dispatch chunk size, weights fixed by ``seed``."""
+    ref = ref_layers.MoEFeedForward(DIM, MOE_HIDDEN, NUM_EXPERTS, top_k, SCALE, chunk)
+    _fill(ref, seed)
+    with torch.no_grad():
+        ref.expert_bias.copy_(bias)
+    return ref.to(dtype).eval()
+
+
+def _chunked_pair(
+    dtype: torch.dtype = torch.float32,
+    chunk: int | None = PUBLISHED_CHUNK,
+    top_k: int = TOP_K,
+    seed: int = 0,
+):
+    """A reference MoE and our port in the same dispatch regime, same weights."""
+    ref = _reference_with_chunk(chunk, dtype, _spread_bias(), seed=seed, top_k=top_k)
+    port = port_moe.MoEFeedForward(
+        DIM, MOE_HIDDEN, NUM_EXPERTS, top_k, SCALE, dispatch_chunk_size=chunk
+    )
+    port.load_state_dict(ref.state_dict())
+    return ref, port.to(dtype).eval()
+
+
+def _chunk_pieces(port, x):
+    """One chunk's expert outputs and dispatch metadata, as the port makes them.
+
+    The controls below invert the combine on exactly these tensors, so the
+    only thing that differs between the two sides of each one is the
+    convention under test.
+    """
+    top_idx, gate = port.route(x)
+    rows, sorted_gate, inverse, offsets = port.dispatch(x, top_idx, gate)
+    gate_up = torch._grouped_mm(rows, port.routed.gate_up_weight, offsets)
+    out = torch._grouped_mm(
+        port_moe.expert_swiglu(gate_up), port.routed.down_weight, offsets
+    )
+    return out, sorted_gate, inverse
+
+
+def _terms(out, sorted_gate, inverse, top_k=TOP_K):
+    """The ``top_k`` scaled float32 terms of every token, slot by slot."""
+    rows_of_token = inverse.view(-1, top_k)
+    scale = sorted_gate.to(torch.float32) * SCALE
+    return [
+        out[rows_of_token[:, s]].float() * scale[rows_of_token[:, s]].unsqueeze(-1)
+        for s in range(top_k)
+    ]
+
+
+def _one_accumulator(terms):
+    total = torch.zeros_like(terms[0])
+    for t in terms:
+        total = total + t
+    return total
+
+
+def _pairwise_tree(terms):
+    acc = [torch.zeros_like(terms[0]) for _ in range(4)]
+    for s, t in enumerate(terms):
+        acc[s % 4] = acc[s % 4] + t
+    return (acc[0] + acc[1]) + (acc[2] + acc[3])
+
+
+# --- parity, piece by piece -------------------------------------------------
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_chunk_dispatch_metadata_matches_reference(dtype):
+    """The reference cuts a chunk's metadata with a stable ``sort`` and a
+    ``scatter_add`` histogram; the port reuses its ``argsort`` and
+    ``searchsorted`` dispatch. That reuse is only sound if the two agree on
+    every field, so this asserts it rather than arguing it."""
+    _, port = _chunked_pair(dtype)
+    x = _rand((13, DIM), seed=50, dtype=dtype)
+    with torch.no_grad():
+        top_idx, gate = port.route(x)
+        order, sorted_tokens, want_gate, want_offsets = ref_layers._dispatch_rows(
+            top_idx, gate, NUM_EXPERTS
+        )
+        rows, got_gate, inverse, got_offsets = port.dispatch(x, top_idx, gate)
+    want_inverse = torch.empty_like(order)
+    want_inverse[order] = torch.arange(order.numel())
+    assert torch.equal(rows, x[sorted_tokens].to(port.routed.gate_up_weight.dtype))
+    assert torch.equal(got_gate, want_gate)
+    assert torch.equal(inverse, want_inverse)
+    assert got_offsets.dtype == want_offsets.dtype == torch.int32
+    assert torch.equal(got_offsets, want_offsets)
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_chunked_combine_matches_reference(dtype):
+    """The four-accumulator sum against both of the reference's eager
+    spellings of it: the layer's own and the kernel module's fallback."""
+    from praxis.kernels.layers_triton import moe_chunked_combine
+
+    _, port = _chunked_pair(dtype)
+    x = _rand((29, DIM), seed=51, dtype=dtype)
+    with torch.no_grad():
+        out, sorted_gate, inverse = _chunk_pieces(port, x)
+        got = port_moe.chunked_combine(out, sorted_gate, inverse, TOP_K, SCALE)
+        layer_sum = ref_layers._sum_rows_of_tokens(
+            out, inverse.view(-1, TOP_K), sorted_gate.to(torch.float32) * SCALE
+        )
+        kernel_sum = moe_chunked_combine(out, sorted_gate, inverse, TOP_K, SCALE)
+    assert got.dtype == torch.float32
+    assert torch.equal(got, layer_sum)
+    assert torch.equal(got, kernel_sum)
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_routed_chunk_matches_reference(dtype):
+    ref, port = _chunked_pair(dtype)
+    x = _rand((31, DIM), seed=52, dtype=dtype)
+    with torch.no_grad():
+        top_idx, gate = port.route(x)
+        want = ref_layers._routed_chunk(
+            x, top_idx, gate, ref.routed.gate_up_weight, ref.routed.down_weight, SCALE
+        )
+        got = port.routed_chunk(x, top_idx, gate)
+    assert got.dtype == want.dtype == torch.float32
+    assert torch.equal(got, want)
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("chunk", [*SMALL_CHUNKS, PUBLISHED_CHUNK])
+def test_routed_forward_chunked_matches_reference(dtype, chunk):
+    ref, port = _chunked_pair(dtype, chunk=chunk)
+    x = _rand((40, DIM), seed=53, dtype=dtype)
+    with torch.no_grad():
+        top_idx, gate = port.route(x)
+        want = ref._routed_forward_chunked(x, top_idx, gate)
+        got = port.routed_forward_chunked(x, top_idx, gate)
+    assert got.dtype == want.dtype == dtype
+    assert torch.equal(got, want)
+
+
+# --- parity, end to end -----------------------------------------------------
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("rows", CHUNKED_ROWS)
+def test_chunked_forward_matches_reference(dtype, rows):
+    """The published chunk, from one row to past one chunk."""
+    ref, port = _chunked_pair(dtype)
+    x = _rand((rows, DIM), seed=54, dtype=dtype)
+    with torch.no_grad():
+        want, got = ref(x), port(x)
+    assert got.shape == x.shape
+    assert got.dtype == want.dtype == dtype
+    assert torch.equal(got, want)
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("chunk", SMALL_CHUNKS)
+@pytest.mark.parametrize("rows", [1, 40, 728])
+def test_chunked_forward_matches_reference_across_many_chunks(dtype, chunk, rows):
+    """Many boundaries and a ragged last chunk, cheaply.
+
+    This is the test that pins *where* the chunks are cut. At the published
+    chunk, moving the 16384 boundary by a row was measured to change nothing
+    at these widths, so an off-by-one there passes the test above; at a chunk
+    of 7 the GEMMs see different row counts per expert group and the same
+    misreading shows up.
+    """
+    ref, port = _chunked_pair(dtype, chunk=chunk)
+    x = _rand((rows, DIM), seed=55, dtype=dtype)
+    with torch.no_grad():
+        assert torch.equal(port(x), ref(x))
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("shape", SHAPES)
+def test_chunked_forward_matches_reference_at_every_shape(dtype, shape):
+    """Leading dims are flattened before the chunks are cut, on both sides."""
+    ref, port = _chunked_pair(dtype, chunk=3)
+    x = _rand(shape, seed=56, dtype=dtype)
+    with torch.no_grad():
+        want, got = ref(x), port(x)
+    assert got.shape == want.shape == x.shape
+    assert torch.equal(got, want)
+
+
+@pytest.mark.parametrize("top_k", [1, 3, 4, 8, NUM_EXPERTS])
+def test_chunked_forward_matches_reference_at_every_k(top_k):
+    """Fewer slots than accumulators leaves some of the four at zero, and more
+    than four wraps them; the reference's sum is defined for both and the
+    port has to agree. Float32, because that is where the accumulators are
+    visible (see the bf16 note below)."""
+    ref, port = _chunked_pair(torch.float32, chunk=5, top_k=top_k)
+    x = _rand((23, DIM), seed=57, dtype=torch.float32)
+    with torch.no_grad():
+        assert torch.equal(port(x), ref(x))
+
+
+def test_an_empty_batch_runs_in_both_regimes():
+    """No chunks at all: the float32 buffer is empty and the cast is a no-op."""
+    for chunk in (None, PUBLISHED_CHUNK):
+        ref, port = _chunked_pair(torch.bfloat16, chunk=chunk)
+        x = torch.empty(0, DIM, dtype=torch.bfloat16)
+        with torch.no_grad():
+            got, want = port(x), ref(x)
+        assert got.shape == want.shape == (0, DIM)
+        assert got.dtype == want.dtype == torch.bfloat16
+
+
+@pytest.mark.parametrize("bad", [0, -1])
+def test_a_non_positive_chunk_is_refused_by_both_layers(bad):
+    """The reference's own check. Zero would step the chunk loop by nothing
+    and a negative step yields no chunks, leaving the output uninitialized."""
+    for layer in (ref_layers.MoEFeedForward, port_moe.MoEFeedForward):
+        with pytest.raises(ValueError, match="dispatch_chunk_size must be positive"):
+            layer(DIM, MOE_HIDDEN, NUM_EXPERTS, TOP_K, SCALE, bad)
+
+
+# --- negative controls: one inverted convention each ------------------------
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+@pytest.mark.parametrize("rows", [1, 40, 512])
+def test_a_single_chunk_is_not_the_unchunked_path(dtype, rows):
+    """The tempting reading of ``dispatch_chunk_size`` is that a served batch
+    stays under it and the chunked path reduces to the unchunked one. It does
+    not, in the reference.
+
+    The reference picks the path on ``dispatch_chunk_size is not None`` alone,
+    and the two paths differ in the *combine*: chunked multiplies the gate by
+    ``routed_scaling_factor`` in float32, sums the ``top_k`` rows in float32
+    through four interleaved accumulators and rounds once at the end, where the
+    unchunked path gates in the row dtype, sums, and scales the sum. Every row
+    count here is far below 16384, so no chunk boundary is ever crossed, and
+    the answers still differ. One row is enough.
+    """
+    assert rows < PUBLISHED_CHUNK  # a single chunk, by construction
+    bias = _spread_bias()
+    unchunked = _reference_with_chunk(None, dtype, bias)
+    chunked = _reference_with_chunk(PUBLISHED_CHUNK, dtype, bias)
+    x = _rand((rows, DIM), seed=41, dtype=dtype)
+    with torch.no_grad():
+        want, got = unchunked(x), chunked(x)
+    assert got.shape == want.shape and got.dtype == want.dtype
+    assert not torch.equal(got, want)
+
+
+@pytest.mark.parametrize("dtype", DTYPES)
+def test_the_port_selects_the_regime_the_reference_does(dtype):
+    """And the same split, on our side: each regime of the port is bit-exact
+    against the same regime of the reference and bit-different from the other.
+    A port that ignored the field, or picked on a threshold, fails one half."""
+    bias = _spread_bias()
+    refs = {c: _reference_with_chunk(c, dtype, bias) for c in (None, PUBLISHED_CHUNK)}
+    x = _rand((64, DIM), seed=42, dtype=dtype)
+    with torch.no_grad():
+        for chunk, other in ((None, PUBLISHED_CHUNK), (PUBLISHED_CHUNK, None)):
+            port = port_moe.MoEFeedForward(
+                DIM, MOE_HIDDEN, NUM_EXPERTS, TOP_K, SCALE, dispatch_chunk_size=chunk
+            )
+            port.load_state_dict(refs[None].state_dict())
+            port = port.to(dtype).eval()
+            assert torch.equal(port(x), refs[chunk](x))
+            assert not torch.equal(port(x), refs[other](x))
+
+
+def test_control_one_accumulator_differs():
+    """Four interleaved accumulators are not one running sum.
+
+    The same eight float32 terms, added left to right into a single
+    accumulator, or as a pairwise tree of the four, are other numbers.
+    Float32, because bf16 cannot see it (see the measured note below).
+    """
+    _, port = _chunked_pair(torch.float32)
+    x = _rand((40, DIM), seed=60, dtype=torch.float32)
+    with torch.no_grad():
+        out, sorted_gate, inverse = _chunk_pieces(port, x)
+        want = port_moe.chunked_combine(out, sorted_gate, inverse, TOP_K, SCALE)
+        terms = _terms(out, sorted_gate, inverse)
+        single, tree = _one_accumulator(terms), _pairwise_tree(terms)
+    assert not torch.equal(want, single)
+    assert not torch.equal(want, tree)
+    # Both pass a tolerance check, which is why parity here has to be bit-exact.
+    torch.testing.assert_close(single, want)
+    torch.testing.assert_close(tree, want)
+
+
+def test_control_scaling_after_the_sum_differs():
+    """The chunked regime scales the gate, not the sum.
+
+    This is the unchunked regime's convention carried into the chunked one:
+    the same float32 four-accumulator sum of the unscaled products, then the
+    2.5. In exact arithmetic it is the same number.
+    """
+    _, port = _chunked_pair(torch.float32)
+    x = _rand((40, DIM), seed=61, dtype=torch.float32)
+    with torch.no_grad():
+        out, sorted_gate, inverse = _chunk_pieces(port, x)
+        want = port_moe.chunked_combine(out, sorted_gate, inverse, TOP_K, SCALE)
+        after = port_moe.chunked_combine(out, sorted_gate, inverse, TOP_K, 1.0) * SCALE
+    assert not torch.equal(want, after)
+    torch.testing.assert_close(after, want)
+
+
+def test_control_rounding_the_products_differs():
+    """The products stay float32 until the one rounding.
+
+    Rounding each scaled row to the row dtype before the float32 sum, which is
+    where the unchunked regime rounds, moves bf16 outputs. This one is
+    visible in bf16 where the two controls above are not.
+    """
+    _, port = _chunked_pair(torch.bfloat16)
+    x = _rand((40, DIM), seed=62, dtype=torch.bfloat16)
+    with torch.no_grad():
+        out, sorted_gate, inverse = _chunk_pieces(port, x)
+        want = port_moe.chunked_combine(out, sorted_gate, inverse, TOP_K, SCALE)
+        terms = [t.to(torch.bfloat16).float() for t in _terms(out, sorted_gate, inverse)]
+        acc = [torch.zeros_like(want) for _ in range(4)]
+        for s, t in enumerate(terms):
+            acc[s % 4] = acc[s % 4] + t
+        rounded = ((acc[0] + acc[1]) + acc[2]) + acc[3]
+    assert not torch.equal(want.to(torch.bfloat16), rounded.to(torch.bfloat16))
+
+
+def test_float32_sum_order_is_not_observable_in_bfloat16():
+    """The measured limit of the two float32 controls above, worth pinning.
+
+    In bf16 the one accumulator, the pairwise tree and the scale after the
+    sum each change the float32 sum in many elements, and the single
+    rounding to bf16 absorbs **every** one of those changes. Measured here at
+    728 rows, and at 20000 rows (1.28M elements), the count of changed bf16
+    outputs is zero for all three. This is elementwise IEEE arithmetic on
+    fixed inputs, with no GEMM in it, so it is not a backend property.
+
+    The consequence: every bf16 parity test in this file passes on any of
+    those three misreadings. Only the float32 parity and the controls above
+    protect them, the same limit the unchunked slot order has.
+    """
+    _, port = _chunked_pair(torch.bfloat16)
+    x = _rand((728, DIM), seed=63, dtype=torch.bfloat16)
+    with torch.no_grad():
+        out, sorted_gate, inverse = _chunk_pieces(port, x)
+        want = port_moe.chunked_combine(out, sorted_gate, inverse, TOP_K, SCALE)
+        terms = _terms(out, sorted_gate, inverse)
+        after = port_moe.chunked_combine(out, sorted_gate, inverse, TOP_K, 1.0) * SCALE
+        others = (_one_accumulator(terms), _pairwise_tree(terms), after)
+    for other in others:
+        # The float32 sums do differ, so the bf16 equality is not vacuous.
+        assert not torch.equal(want, other)
+        assert torch.equal(want.to(torch.bfloat16), other.to(torch.bfloat16))
+
+
+@pytest.mark.parametrize(
+    "rows, chunk",
+    [
+        # Many small chunks against one chunk over the same tokens.
+        (40, 7),
+        # The published chunk with a second, ragged chunk: 16384 + 3616.
+        (20000, PUBLISHED_CHUNK),
+    ],
+)
+def test_control_the_chunk_boundary_moves_the_result(rows, chunk):
+    """Where the tokens are cut is part of the arithmetic, in float32.
+
+    The combine is row-wise, so this is not the sum: it is the grouped GEMMs,
+    which see one chunk's rows per call, and on CPU a row's result depends on
+    how many rows its expert group holds. Measured here, one chunk against
+    16384 + 3616 differs in a few dozen of 1.28M elements; 7-row chunks
+    against one chunk differ in hundreds of 2560.
+
+    Recorded alongside, not asserted, because it is a property of the GEMM
+    backend rather than of the arithmetic: in bf16 the published boundary
+    changed nothing at these widths, and moving it by one row (16383, 16385)
+    changed nothing in float32 either.
+    """
+    assert rows > chunk  # more than one chunk, by construction
+    _, port = _chunked_pair(torch.float32, chunk=chunk)
+    x = _rand((rows, DIM), seed=41, dtype=torch.float32)
+    with torch.no_grad():
+        cut = port(x)
+        port.dispatch_chunk_size = rows
+        whole = port(x)
+    assert not torch.equal(cut, whole)
+
+
+# ---------------------------------------------------------------------------
 # The published configs: the routed counts, and the dispatch regime they ask
 # for. These read the reference's own checkpoint fixtures rather than a copy
 # of them in this file, because a copy is exactly how the port came to believe
@@ -575,17 +976,17 @@ def _published(name: str) -> dict:
 
 @pytest.mark.parametrize("name", _FIXTURES)
 def test_every_published_config_asks_for_the_chunked_dispatch(name):
-    """The premise this port was built on, checked against the fixtures.
+    """The premise that the chunked regime is the served one, checked against
+    the fixtures.
 
-    The module docstring of the port used to say the published checkpoints set
-    ``dispatch_chunk_size`` to null and that the chunked combine was therefore
-    unreachable. ``null`` is the *reference's default*; every published config
-    sets 16384. This test exists so that claim can never be made again from
-    memory, and so that a checkpoint that really does leave it null shows up as
-    a change here rather than as silence.
+    The port once believed the published checkpoints set
+    ``dispatch_chunk_size`` to null. ``null`` is the *reference's default*;
+    every published config sets 16384. This test exists so that claim can
+    never be made again from memory, and so that a checkpoint that really does
+    leave it null shows up as a change here rather than as silence.
     """
     moe = _published(name)["backbone"]["moe"]
-    assert moe["dispatch_chunk_size"] == 16384
+    assert moe["dispatch_chunk_size"] == PUBLISHED_CHUNK
     # And both pairs of expert counts, which is the other thing a hand-copied
     # fixture tends to lose.
     assert (moe["num_experts"], moe["top_k"]) == (129, 9)
@@ -594,16 +995,58 @@ def test_every_published_config_asks_for_the_chunked_dispatch(name):
     assert moe["routed_scaling_factor"] == 2.5
 
 
-@pytest.mark.parametrize("name", _SERVABLE)
-def test_a_published_config_is_refused_for_its_dispatch_chunk_size(name):
-    """Loudly, and naming the field, rather than falling through to this path.
+def test_the_base_config_is_refused_for_its_heads_not_its_moe():
+    """The one published config that does not load, and why: it has no action
+    heads. Asserted so that nobody reads its absence from ``_SERVABLE`` as a
+    leftover of the old dispatch refusal."""
+    with pytest.raises(Praxis1ConfigError, match="no action heads"):
+        Praxis1Config.from_dict(_published("praxis-1-base"))
 
-    Every published checkpoint fails here today. That is the honest state of
-    the port: it is bit-exact against the unchunked regime and no published
-    checkpoint selects it.
+
+@pytest.mark.parametrize("name", _SERVABLE)
+def test_a_published_config_loads_with_its_dispatch_chunk_size(name):
+    """Every servable published config loads, and its chunk reaches the layer.
+
+    Built on the meta device: the real widths are 128 banks of 3072 x 2560,
+    and what is under test is which regime the arguments select, not the
+    weights. Both layers are built from the same kwargs, so the reference
+    also agrees the accessor's names are its own.
     """
-    with pytest.raises(Praxis1ConfigError, match="dispatch_chunk_size"):
-        Praxis1Config.from_dict(_published(name))
+    config = Praxis1Config.from_dict(_published(name))
+    assert config.dispatch_chunk_size == PUBLISHED_CHUNK
+    kwargs = config.moe_kwargs()
+    assert kwargs["dispatch_chunk_size"] == PUBLISHED_CHUNK
+    with torch.device("meta"):
+        port = port_moe.MoEFeedForward(**kwargs)
+        ref = ref_layers.MoEFeedForward(**kwargs)
+    assert port.dispatch_chunk_size == ref.dispatch_chunk_size == PUBLISHED_CHUNK
+
+
+@pytest.mark.parametrize("name", _SERVABLE)
+def test_a_published_config_selects_the_chunked_combine(name):
+    """And the regime it selects is the chunked one, measured.
+
+    The published kwargs at this file's small widths: the published chunk,
+    k and scale, with only the widths and the expert count shrunk. The port
+    built that way is bit-exact against the reference built the same way and
+    bit-different from the unchunked reference, so a config reader that lost
+    the field would fail here rather than serve the other combine.
+    """
+    kwargs = Praxis1Config.from_dict(_published(name)).moe_kwargs()
+    assert (kwargs["top_k"], kwargs["routed_scaling_factor"]) == (TOP_K, SCALE)
+    small = {**kwargs, "dim": DIM, "hidden": MOE_HIDDEN, "num_experts": NUM_EXPERTS}
+    ref = ref_layers.MoEFeedForward(**small)
+    _fill(ref, seed=0)
+    with torch.no_grad():
+        ref.expert_bias.copy_(_spread_bias())
+    port = port_moe.MoEFeedForward(**small)
+    port.load_state_dict(ref.state_dict())
+    unchunked = _reference_with_chunk(None, torch.bfloat16, _spread_bias())
+    ref, port = ref.to(torch.bfloat16).eval(), port.to(torch.bfloat16).eval()
+    x = _rand((40, DIM), seed=64, dtype=torch.bfloat16)
+    with torch.no_grad():
+        assert torch.equal(port(x), ref(x))
+        assert not torch.equal(port(x), unchunked(x))
 
 
 @pytest.mark.parametrize("name", _SERVABLE)
@@ -618,8 +1061,6 @@ def test_a_published_config_gives_the_layer_the_routed_counts(name):
     """
     config = _published(name)
     moe = config["backbone"]["moe"]
-    # Only the unported regime is in the way, so drop it to reach the counts.
-    del config["backbone"]["moe"]["dispatch_chunk_size"]
     kwargs = Praxis1Config.from_dict(config).moe_kwargs()
 
     assert kwargs["num_experts"] == moe["num_routed_experts"] == 128
@@ -627,6 +1068,7 @@ def test_a_published_config_gives_the_layer_the_routed_counts(name):
     assert kwargs["hidden"] == moe["expert_hidden"] == 1280
     assert kwargs["routed_scaling_factor"] == moe["routed_scaling_factor"] == 2.5
     assert kwargs["dim"] == config["backbone"]["dim"] == 3072
+    assert kwargs["dispatch_chunk_size"] == moe["dispatch_chunk_size"]
     # The totals are the numbers that must not reach the layer.
     assert kwargs["num_experts"] != moe["num_experts"]
     assert kwargs["top_k"] != moe["top_k"]
@@ -636,16 +1078,17 @@ def test_moe_kwargs_are_the_arguments_both_layers_take():
     """The accessor's names are the reference's constructor's names.
 
     A structural check rather than a numerical one: it is what catches the
-    reference renaming ``top_k``, which would otherwise show up as our kwargs
-    silently landing in ``**kwargs`` or as a TypeError far from here. Bound
-    against both constructors, since the port's signature tracks the
-    reference's on purpose.
+    reference renaming ``top_k`` or ``dispatch_chunk_size``, which would
+    otherwise show up as our kwargs silently landing in ``**kwargs`` or as a
+    TypeError far from here. Bound against both constructors, since the
+    port's signature tracks the reference's on purpose.
     """
     kwargs = Praxis1Config.for_rig("single_arm").moe_kwargs()
     for layer in (ref_layers.MoEFeedForward, port_moe.MoEFeedForward):
         bound = inspect.signature(layer.__init__).bind_partial(None, **kwargs)
         assert bound.arguments["num_experts"] == 128
         assert bound.arguments["top_k"] == 8
+        assert bound.arguments["dispatch_chunk_size"] == PUBLISHED_CHUNK
 
 
 def test_the_shared_inclusive_counts_build_a_layer_that_does_not_complain():
@@ -677,66 +1120,3 @@ def test_the_shared_inclusive_counts_build_a_layer_that_does_not_complain():
     # of this failure and it only fires if a loader is strict.
     with pytest.raises(RuntimeError):
         totals.load_state_dict(routed.state_dict())
-
-
-# ---------------------------------------------------------------------------
-# The chunked dispatch: measured, not reasoned about
-# ---------------------------------------------------------------------------
-
-PUBLISHED_CHUNK = 16384
-
-
-def _reference_with_chunk(chunk, dtype, bias, seed: int = 0):
-    """A reference MoE with a dispatch chunk size, weights fixed by ``seed``."""
-    ref = ref_layers.MoEFeedForward(DIM, MOE_HIDDEN, NUM_EXPERTS, TOP_K, SCALE, chunk)
-    _fill(ref, seed)
-    with torch.no_grad():
-        ref.expert_bias.copy_(bias)
-    return ref.to(dtype).eval()
-
-
-@pytest.mark.parametrize("dtype", DTYPES)
-@pytest.mark.parametrize("rows", [1, 40, 512])
-def test_a_single_chunk_is_not_the_unchunked_path(dtype, rows):
-    """The tempting reading of ``dispatch_chunk_size`` is that a served batch
-    stays under it and the chunked path reduces to this one. It does not.
-
-    The reference picks the path on ``dispatch_chunk_size is not None`` alone,
-    and the two paths differ in the *combine*: chunked multiplies the gate by
-    ``routed_scaling_factor`` in float32, sums the ``top_k`` rows in float32
-    through four interleaved accumulators and rounds once at the end, where the
-    unchunked path gates in the row dtype, sums, and scales the sum. Every row
-    count here is far below 16384, so no chunk boundary is ever crossed, and
-    the answers still differ. One row is enough.
-
-    This is the test that says the refusal in the config reader is a missing
-    feature and not a guard against an exotic setting.
-    """
-    assert rows < PUBLISHED_CHUNK  # a single chunk, by construction
-    bias = _spread_bias()
-    unchunked = _reference_with_chunk(None, dtype, bias)
-    chunked = _reference_with_chunk(PUBLISHED_CHUNK, dtype, bias)
-    x = _rand((rows, DIM), seed=41, dtype=dtype)
-    with torch.no_grad():
-        want, got = unchunked(x), chunked(x)
-    assert got.shape == want.shape and got.dtype == want.dtype
-    assert not torch.equal(got, want)
-
-
-@pytest.mark.parametrize("dtype", DTYPES)
-def test_our_port_is_the_unchunked_regime_exactly(dtype):
-    """The other half of the finding above, and the reason it is a gap rather
-    than a bug: the port is bit-exact against the unchunked reference and
-    bit-different from the chunked one. So there is nothing wrong with what it
-    computes, only with which of the two regimes it computes."""
-    bias = _spread_bias()
-    unchunked = _reference_with_chunk(None, dtype, bias)
-    chunked = _reference_with_chunk(PUBLISHED_CHUNK, dtype, bias)
-    port = port_moe.MoEFeedForward(DIM, MOE_HIDDEN, NUM_EXPERTS, TOP_K, SCALE)
-    port.load_state_dict(unchunked.state_dict())
-    port = port.to(dtype).eval()
-
-    x = _rand((64, DIM), seed=42, dtype=dtype)
-    with torch.no_grad():
-        assert torch.equal(port(x), unchunked(x))
-        assert not torch.equal(port(x), chunked(x))

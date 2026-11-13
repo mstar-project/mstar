@@ -70,43 +70,64 @@ through ``model.to(torch.bfloat16)``, because the scores it is added to are
 float32 and rounding the bias to bf16 would flip the selections it exists to
 make.
 
-Not ported
-----------
+Two dispatch regimes
+--------------------
 
-The reference's chunked dispatch (``backbone.moe.dispatch_chunk_size``) is a
-*different* combine, not a memory-saving rearrangement of this one: it applies
-``routed_scaling_factor`` in float32 and rounds the routed sum once at the end.
-This module implements the unchunked regime only and takes no chunk size,
-rather than offering a knob whose two settings give two different answers.
+The reference has two routed combines and picks between them on
+``dispatch_chunk_size is not None`` alone, so this layer has both and picks
+the same way. They are different arithmetic, not one combine split for
+memory, which is why the chunk size is a regime switch here rather than a
+tuning knob:
 
-**This is a known gap, not a safe simplification.** ``null`` is the
-*reference's default*, not what the checkpoints carry: all four configs in the
-reference's ``tests/data`` (droid, droid-k, yam, base) set
-``dispatch_chunk_size`` to 16384. So no published checkpoint selects the path
-implemented here, and this module is bit-exact against a regime none of them
-runs.
+* **unchunked** (``dispatch_chunk_size`` is ``None``, the reference's
+  default): the conventions above. Each expert row is gated in the row
+  dtype, the ``top_k`` rows are summed, the sum is scaled by
+  ``routed_scaling_factor``, then the shared expert is added,
+* **chunked** (``dispatch_chunk_size`` set; all four published configs set
+  16384, so this is the regime real checkpoints run): the tokens are cut
+  into chunks of ``dispatch_chunk_size`` and each chunk is dispatched on its
+  own. Inside a chunk the gate is widened to float32 and multiplied by
+  ``routed_scaling_factor`` there, each expert row is widened and multiplied
+  by that float32 scale, and the ``top_k`` products of a token are summed in
+  float32 through four interleaved accumulators (slot ``s`` into accumulator
+  ``s % 4``, then ``((a0 + a1) + a2) + a3``). The float32 sums of every chunk
+  land in one float32 buffer, which is rounded to the activation dtype
+  **once**, after the last chunk. Only then is the shared expert added, in
+  the activation dtype.
 
-Nor is the chunk size a threshold a served batch stays under, which is the
-tempting reading and is wrong. The reference picks the path on
-``dispatch_chunk_size is not None`` alone, and the two paths differ in the
-combine rather than in the splitting: chunked multiplies the gate by
-``routed_scaling_factor`` in float32, sums the ``top_k`` rows in float32
-through four interleaved accumulators, and rounds once at the end, where this
-module gates in the row dtype, sums, and scales the sum. Measured against the
-reference on CPU, with 16384 so large that a single chunk covers the batch and
-no boundary is ever crossed, the two disagree at **every** row count tested,
-down to a single row: bf16 differs by up to 0.25 absolute, 2.8e-3 relative in
-RMS, on every row; float32 by about 4e-6 absolute, 7e-8 relative. That is the
-last bits of bf16 per element rather than a wrong answer per element, but it
-is not bit-exactness, it is systematic across every row and every MoE block,
-and bit-exactness is this port's whole acceptance bar.
+So the chunked regime departs from the unchunked one in two places: the
+scale goes on the gate, not on the sum, and nothing rounds between the gate
+product and the end of the sum. The gate itself is still the bf16-cast gate
+of ``route``, widened; the float32 gate from before that cast is a different
+number. In float32 both departures change the output; in bf16 it is the
+rounding of the products that shows, and the scale placement alone does not
+(see the limits below). Measured against the reference on CPU, with a single chunk that covers the
+whole batch, the two regimes disagree at every row count down to one row: by
+up to 0.25 absolute in bf16 and about 6e-6 in float32. A served batch smaller
+than the chunk size does **not** reduce chunked to unchunked, which is the
+reading that makes the switch look safe to ignore.
 
-Until the chunked combine is implemented here as a second regime with its own
-parity tests, :func:`mstar.model.praxis1.config._moe_fields` refuses any
-checkpoint that sets the field, which today is all of them. The refusal is a
-placeholder for the work and not a judgement that the field is exotic: serving
-these weights on this path would run and quietly answer with a policy the
-reference does not produce.
+Two measured limits of the chunked regime on eager CPU, both recorded as
+tests, matter for anyone reading a bf16-only result:
+
+* **inside the combine, bf16 cannot see the order of the float32 sum.**
+  Reassociating the four accumulators, collapsing them into one, or moving
+  the scale from the gate to the sum each change the float32 sum in a few
+  percent of its elements, and the single rounding to bf16 then absorbs
+  every one of those changes (measured: zero of 1.28M output elements at
+  20000 rows). So a bf16 parity test passes on any of those misreadings and
+  only the float32 tests protect them, the same limit the unchunked
+  slot-order convention has,
+* **the chunk boundary reaches the output only through the grouped GEMMs.**
+  The combine is row-wise, so cutting the tokens elsewhere cannot change it,
+  but each chunk's GEMMs see only that chunk's rows, and on CPU the GEMM's
+  per-row result depends on how many rows an expert group has. Measured in
+  float32, 20000 rows as one chunk against 16384 + 3616 differ in a few
+  dozen of 1.28M elements, and small chunks differ widely; moving the 16384 boundary by
+  one row changed nothing at these sizes, and in bf16 the published boundary
+  changed nothing at all. The boundary is ``range(0, tokens,
+  dispatch_chunk_size)``, the last chunk ragged, and it is kept exactly for
+  the cases where it does show.
 """
 
 from __future__ import annotations
@@ -246,6 +267,49 @@ def expert_swiglu(gate_up: torch.Tensor) -> torch.Tensor:
     return F.silu(gate) * up
 
 
+
+def chunked_combine(
+    expert_out: torch.Tensor,
+    sorted_gate: torch.Tensor,
+    inverse: torch.Tensor,
+    top_k: int,
+    routed_scaling_factor: float,
+) -> torch.Tensor:
+    """The chunked regime's combine of one chunk: scaled, summed, **float32**.
+
+    ``out[t] = sum_s expert_out[r] * (float32(gate[r]) * scale)`` with
+    ``r = inverse[t * top_k + s]``. Returns float32 and does not round: the
+    caller rounds once, after every chunk.
+
+    Three choices each change the result when inverted. The scale is folded
+    into the gate in float32, so it multiplies each row rather than the sum.
+    The products are float32 and never round to the row dtype before the
+    sum. And slot ``s`` goes to accumulator ``s % 4``, the four combined as
+    ``((a0 + a1) + a2) + a3``: one accumulator, or a pairwise tree, adds the
+    same eight float32 terms in another order and gives another number.
+
+    Two details are the reference's spelling rather than conventions, and are
+    kept so nothing here has to be argued about. The explicit ``.float()`` on
+    the rows is redundant (a bf16 row times the float32 scale promotes to
+    float32 anyway, exactly). And each accumulator starts as float32 zeros
+    rather than as its first term, which differs only in the sign of a zero.
+    """
+    tokens = inverse.numel() // top_k
+    rows_of_token = inverse.view(tokens, top_k)
+    scale = sorted_gate.to(torch.float32) * routed_scaling_factor
+    # Four, because that is the reduction of the fused kernel the reference
+    # was run with, kept in its eager fallback. Not a free parameter: another
+    # count is another association of the same eight terms.
+    acc = [
+        torch.zeros(tokens, expert_out.shape[1], device=expert_out.device, dtype=torch.float32)
+        for _ in range(4)
+    ]
+    for slot in range(top_k):
+        r = rows_of_token[:, slot]
+        acc[slot % 4] = acc[slot % 4] + expert_out[r].float() * scale[r].unsqueeze(-1)
+    return ((acc[0] + acc[1]) + acc[2]) + acc[3]
+
+
 class MoEFeedForward(nn.Module):
     """One shared expert plus ``top_k`` of ``num_experts`` routed ones.
 
@@ -255,8 +319,13 @@ class MoEFeedForward(nn.Module):
 
         logits (fp32) -> sigmoid -> + expert_bias -> top-k (sorted)
           -> gather UNBIASED scores -> renormalize (fp32, no eps) -> cast
+          unchunked:
           -> dispatch, two grouped GEMMs, SwiGLU, gate, undo sort, sum
           -> * routed_scaling_factor + shared(x)
+          chunked, per chunk of dispatch_chunk_size tokens:
+          -> dispatch, two grouped GEMMs, SwiGLU
+          -> * (fp32 gate * routed_scaling_factor), 4-accumulator fp32 sum
+          then, after the last chunk: -> round once + shared(x)
 
     ``num_experts`` and ``top_k`` here count the routed experts only: 128 and
     8 for the published checkpoints, and the same naming the reference's own
@@ -268,6 +337,13 @@ class MoEFeedForward(nn.Module):
     and not from fields chosen by name, because 129 and 9 do not fail here:
     they route to a 129th bank the checkpoint never filled and hand every
     token one expert too many.
+
+    ``dispatch_chunk_size`` selects the combine (see "Two dispatch regimes"
+    in the module docstring), on ``is not None`` and nothing else, exactly as
+    the reference does. It is ``None`` by default because that is the
+    reference's default, and the published checkpoints all set it, so a
+    layer built by hand without it runs the regime no checkpoint was served
+    in. ``moe_kwargs`` carries the checkpoint's value.
     """
 
     expert_bias: torch.Tensor
@@ -279,8 +355,15 @@ class MoEFeedForward(nn.Module):
         num_experts: int = 128,
         top_k: int = 8,
         routed_scaling_factor: float = 2.5,
+        dispatch_chunk_size: int | None = None,
     ) -> None:
         super().__init__()
+        # The reference's own check. Zero would make the chunk loop step by
+        # nothing, and a negative step yields no chunks and an all-garbage
+        # output buffer, so neither can be let through to forward.
+        if dispatch_chunk_size is not None and dispatch_chunk_size <= 0:
+            raise ValueError("dispatch_chunk_size must be positive")
+        self.dispatch_chunk_size = dispatch_chunk_size
         self.num_experts = num_experts
         self.top_k = top_k
         self.routed_scaling_factor = routed_scaling_factor
@@ -388,6 +471,53 @@ class MoEFeedForward(nn.Module):
         channels = weighted.shape[-1]
         return weighted[inverse].reshape(x_flat.shape[0], self.top_k, channels).sum(1)
 
+    def routed_chunk(
+        self, x: torch.Tensor, top_idx: torch.Tensor, gate: torch.Tensor
+    ) -> torch.Tensor:
+        """One chunk of the chunked regime: the **scaled** routed sum, float32.
+
+        The dispatch and the two grouped GEMMs are the unchunked path's, run
+        on this chunk's tokens alone. The reference builds the chunk's
+        metadata with a stable ``sort`` and a ``scatter_add`` histogram where
+        :meth:`dispatch` uses a stable ``argsort`` and ``searchsorted``; both
+        are the unique stable permutation and the same int32 group ends, so
+        sharing :meth:`dispatch` is a reuse and not a substitution (the
+        metadata is asserted equal to the reference's in the tests).
+        """
+        rows, sorted_gate, inverse, offsets = self.dispatch(x, top_idx, gate)
+        gate_up = torch._grouped_mm(rows, self.routed.gate_up_weight, offsets)
+        out = torch._grouped_mm(
+            expert_swiglu(gate_up), self.routed.down_weight, offsets
+        )
+        return chunked_combine(
+            out, sorted_gate, inverse, self.top_k, float(self.routed_scaling_factor)
+        )
+
+    def routed_forward_chunked(
+        self, x_flat: torch.Tensor, top_idx: torch.Tensor, gate: torch.Tensor
+    ) -> torch.Tensor:
+        """The chunked regime's routed contribution, **scaled**, in ``x``'s dtype.
+
+        Unlike :meth:`routed_forward` the 2.5 is already in, because this
+        regime folds it into the gate. Tokens are cut at
+        ``range(0, tokens, dispatch_chunk_size)``, the last chunk ragged, and
+        each chunk writes its float32 sum into one float32 buffer. The single
+        rounding to the activation dtype is after the loop. Rounding each
+        chunk as it is written gives the same bits, since the rounding is
+        elementwise, but rounding before the scale or before the sum does not.
+        """
+        step = self.dispatch_chunk_size
+        assert step is not None
+        tokens = x_flat.shape[0]
+        channels = self.routed.down_weight.shape[-1]
+        out = x_flat.new_empty(tokens, channels, dtype=torch.float32)
+        for start in range(0, tokens, step):
+            end = min(start + step, tokens)
+            out[start:end] = self.routed_chunk(
+                x_flat[start:end], top_idx[start:end], gate[start:end]
+            )
+        return out.to(x_flat.dtype)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """``(..., dim)`` in, ``(..., dim)`` out; the leading dims are flat
         inside, since routing is per token and knows nothing of the sequence.
@@ -398,8 +528,15 @@ class MoEFeedForward(nn.Module):
         # The shared expert runs on the same rows, with no gate of its own and
         # outside the routed scaling.
         y_shared = self.shared(x_flat)
-        y_routed = self.routed_forward(x_flat, top_idx, gate)
-        # The scale lands on the summed routed output. Rounding happens here,
-        # once per channel, and not eight times inside route().
-        out = y_routed * self.routed_scaling_factor + y_shared
+        if self.dispatch_chunk_size is not None:
+            # Chunked: the scale is already in, folded into the float32 gate,
+            # and the routed sum has rounded once. The shared add is in the
+            # activation dtype.
+            out = self.routed_forward_chunked(x_flat, top_idx, gate) + y_shared
+        else:
+            y_routed = self.routed_forward(x_flat, top_idx, gate)
+            # Unchunked: the scale lands on the summed routed output. Rounding
+            # happens here, once per channel, and not eight times inside
+            # route().
+            out = y_routed * self.routed_scaling_factor + y_shared
         return out.reshape(shape)

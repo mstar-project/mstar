@@ -334,6 +334,12 @@ class TrunkStack(nn.Module):
     why a wrong layout here tends to look like a quality problem instead of a
     crash. The decoder tower shares this class; nothing in it is specific to
     the encoder except the defaults.
+
+    ``moe_dispatch_chunk_size`` is the reference ``Transformer``'s argument
+    of the same name and reaches every MoE block. It defaults to ``None``
+    only because the reference does; every published checkpoint sets it, and
+    a stack built without it runs the other MoE combine (see
+    :mod:`~mstar.model.praxis1.components.moe`).
     """
 
     def __init__(
@@ -351,6 +357,7 @@ class TrunkStack(nn.Module):
         rope_effective_dim: int = 64,
         rope_base: int = 26_000_000,
         rope_table_size: int = 1_000_000,
+        moe_dispatch_chunk_size: int | None = None,
     ) -> None:
         super().__init__()
         if not 0 <= num_dense <= depth:
@@ -362,7 +369,14 @@ class TrunkStack(nn.Module):
             if i < num_dense:
                 ffn = SwiGLUFeedForward(dim, dense_hidden)
             else:
-                ffn = MoEFeedForward(dim, moe_hidden, num_experts, top_k, routed_scaling_factor)
+                ffn = MoEFeedForward(
+                    dim,
+                    moe_hidden,
+                    num_experts,
+                    top_k,
+                    routed_scaling_factor,
+                    dispatch_chunk_size=moe_dispatch_chunk_size,
+                )
             # layer_index is one-based: block 0 scales by 1.
             blocks.append(TrunkBlock(ffn, dim, head_dim, num_kv_heads, layer_index=i + 1))
         self.blocks = nn.ModuleList(blocks)

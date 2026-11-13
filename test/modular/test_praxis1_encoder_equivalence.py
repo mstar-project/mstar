@@ -136,7 +136,9 @@ def _fill(module: torch.nn.Module, seed: int) -> None:
                 buf.copy_(torch.randn(buf.shape, generator=gen))
 
 
-def _ref_core(depth: int = DEPTH, num_dense: int = NUM_DENSE) -> torch.nn.Module:
+def _ref_core(
+    depth: int = DEPTH, num_dense: int = NUM_DENSE, chunk: int | None = None
+) -> torch.nn.Module:
     return ref_layers.Transformer(
         depth=depth,
         num_dense=num_dense,
@@ -151,10 +153,13 @@ def _ref_core(depth: int = DEPTH, num_dense: int = NUM_DENSE) -> torch.nn.Module
         mod_dim=None,
         rope_effective_dim=HEAD_DIM // 2,
         attention_backend="triton",
+        moe_dispatch_chunk_size=chunk,
     )
 
 
-def _port_core(depth: int = DEPTH, num_dense: int = NUM_DENSE) -> port_enc.TrunkStack:
+def _port_core(
+    depth: int = DEPTH, num_dense: int = NUM_DENSE, chunk: int | None = None
+) -> port_enc.TrunkStack:
     return port_enc.TrunkStack(
         depth=depth,
         num_dense=num_dense,
@@ -167,6 +172,7 @@ def _port_core(depth: int = DEPTH, num_dense: int = NUM_DENSE) -> port_enc.Trunk
         top_k=TOP_K,
         routed_scaling_factor=SCALE,
         rope_effective_dim=HEAD_DIM // 2,
+        moe_dispatch_chunk_size=chunk,
     )
 
 
@@ -352,10 +358,20 @@ def test_tower_taps_follow_tap_block_order_not_sorted_order():
     assert not torch.equal(feats.taps[0], sorted_feats.taps[0])
 
 
-def test_stack_matches_reference_transformer_directly():
-    """The stack on its own, without the tower's packing around it."""
+@pytest.mark.parametrize("chunk", [None, 16384, 37])
+def test_stack_matches_reference_transformer_directly(chunk):
+    """The stack on its own, without the tower's packing around it.
+
+    In both MoE dispatch regimes, since the stack is where the chunk size has
+    to reach every MoE block: ``None`` is the reference's default, 16384 is
+    what every published config sets, and 37 cuts this window into several
+    chunks with a ragged last one. A stack that dropped the argument passes
+    the first case and fails the other two.
+    """
     torch.manual_seed(0)
-    ref, port = _ref_core(), _port_core()
+    ref, port = _ref_core(chunk=chunk), _port_core(chunk=chunk)
+    moe_chunks = {b.ffn.dispatch_chunk_size for b in port.blocks[NUM_DENSE:]}
+    assert moe_chunks == {chunk}
     _fill(ref, 11)
     port.load_state_dict(_dense_remap(ref.state_dict()))
     ref.eval()

@@ -38,6 +38,8 @@ DROID_CONFIG = {
             "top_k_routed": 8,
             "expert_hidden": 1280,
             "routed_scaling_factor": 2.5,
+            # Every published config sets it, and it selects the MoE combine.
+            "dispatch_chunk_size": 16384,
         },
         "encoder": {
             "depth": 14,
@@ -143,13 +145,16 @@ def test_the_canvas_takes_the_views_to_latents():
         (lambda c: c["video"].update(views=["exterior"]), "views"),
         (lambda c: c["action_space"].update(dim=7), "action rows"),
         (lambda c: c["action_expert"].update(action_patch_dim=24), "action_patch_dim"),
-        # The MoE regime. dispatch_chunk_size is the one that matters in
-        # practice, since every published config sets it: see
-        # test_praxis1_moe_equivalence for the measurement behind the refusal.
-        (
-            lambda c: c["backbone"]["moe"].update(dispatch_chunk_size=16384),
-            "dispatch_chunk_size",
-        ),
+        # The MoE regime. dispatch_chunk_size is passed through, but only as
+        # the reference's positive int: a zero, a negative, a bool, a float or
+        # a string is refused rather than coerced to a chunk nobody wrote.
+        *[
+            (
+                lambda c, v=v: c["backbone"]["moe"].update(dispatch_chunk_size=v),
+                "dispatch_chunk_size must be a positive int",
+            )
+            for v in (0, -1, True, 16384.0, "16384")
+        ],
         (lambda c: c["backbone"]["moe"].update(shared_expert=False), "shared_expert"),
         (lambda c: c["backbone"]["moe"].update(router_activation="softmax"), "router_activation"),
         (lambda c: c["backbone"]["moe"].update(router_dtype="bfloat16"), "router_dtype"),
@@ -199,6 +204,7 @@ def test_the_router_sees_the_routed_counts_and_not_the_totals():
     assert (kwargs["num_experts"], kwargs["top_k"]) == (128, 8)
     assert (kwargs["dim"], kwargs["hidden"]) == (3072, 1280)
     assert kwargs["routed_scaling_factor"] == 2.5
+    assert kwargs["dispatch_chunk_size"] == 16384
 
 
 def test_the_totals_are_redundant_and_may_be_omitted():
@@ -216,17 +222,26 @@ def test_the_totals_are_redundant_and_may_be_omitted():
     assert (terse.num_experts_with_shared, terse.top_k_with_shared) == (129, 9)
 
 
-def test_an_unset_dispatch_chunk_size_is_served():
-    """Negative control for the refusal: absent and explicit null both pass.
+@pytest.mark.parametrize(
+    "written, read",
+    [({}, None), ({"dispatch_chunk_size": None}, None),
+     ({"dispatch_chunk_size": 16384}, 16384), ({"dispatch_chunk_size": 7}, 7)],
+)
+def test_dispatch_chunk_size_is_passed_through_as_written(written, read):
+    """Set, absent and null all load, and the layer gets exactly what was read.
 
-    The refusal has to key on the field being *set*, not on it being present,
-    or a config that spells out the reference's own default would be rejected
-    for agreeing with us.
+    The field selects the MoE combine on ``is not None``, so the reader must
+    neither default a missing one to the published 16384 nor drop a set one:
+    either serves the weights on the combine the config did not ask for, and
+    nothing downstream notices. Absent and null are the reference's default
+    and both mean the unchunked combine.
     """
-    for value in ({}, {"dispatch_chunk_size": None}):
-        config = json.loads(json.dumps(DROID_CONFIG))
-        config["backbone"]["moe"].update(value)
-        assert Praxis1Config.from_dict(config).top_k_routed == 8
+    config = json.loads(json.dumps(DROID_CONFIG))
+    config["backbone"]["moe"].pop("dispatch_chunk_size")
+    config["backbone"]["moe"].update(written)
+    loaded = Praxis1Config.from_dict(config)
+    assert loaded.dispatch_chunk_size == read
+    assert loaded.moe_kwargs()["dispatch_chunk_size"] == read
 
 
 @pytest.mark.parametrize("rig", ["single_arm", "bimanual"])
@@ -239,6 +254,8 @@ def test_the_dummy_shape_splits_the_experts_the_same_way(rig):
     assert config.top_k_with_shared == config.top_k_routed + 1
     kwargs = config.moe_kwargs()
     assert (kwargs["num_experts"], kwargs["top_k"]) == (128, 8)
+    # And the published chunk, so the dummy graph runs the served combine.
+    assert kwargs["dispatch_chunk_size"] == 16384
 
 
 def test_robot_io_matches_the_checkpoint(tmp_path, monkeypatch):

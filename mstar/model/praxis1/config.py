@@ -69,6 +69,9 @@ _SHARED_DEFAULTS = {
     "flex_block_size": 128, "attention_backend": "flash",
     "num_experts_with_shared": 129, "top_k_with_shared": 9,
     "num_routed_experts": 128, "top_k_routed": 8, "routed_scaling_factor": 2.5,
+    # What all four published configs set, so the dummy graph runs the MoE
+    # combine a served checkpoint runs, not the reference's null default.
+    "dispatch_chunk_size": 16384,
     "expert_hidden": 1280, "dense_ffn_hidden": 11520,
     "expert_dim": 1024, "expert_layers": 16, "expert_heads": 16,
     "expert_head_dim": 64, "trunk_dim": 3072, "max_action_tokens": 64,
@@ -164,27 +167,22 @@ def _moe_fields(moe: Mapping[str, Any]) -> dict[str, Any]:
                 "read from here"
             )
 
-    # The chunked dispatch is a different combine, not a memory split of the
-    # one we implement, and every published checkpoint sets it, so this
-    # refusal currently rejects all of them. That is deliberate: see the
-    # "Not ported" section of :mod:`mstar.model.praxis1.components.moe` for
-    # the measurement and for what implementing it would take.
+    # The chunked dispatch is a different combine from the unchunked one, not
+    # a memory split of it, and the layer picks between the two on this field
+    # being set, exactly as the reference does. So it is passed through
+    # untouched rather than clamped or defaulted: every published config sets
+    # 16384, and a reader that dropped it would serve those weights on the
+    # combine they were not run with. See "Two dispatch regimes" in
+    # :mod:`mstar.model.praxis1.components.moe`.
+    #
+    # The validation is the reference's ``_positive_int``. A bool is refused
+    # although ``True`` is an int, because a chunk of one token is a strange
+    # thing to mean by ``true``; a float or a string is refused rather than
+    # truncated, because ``16384.5`` is not a chunk size anyone wrote.
     chunk = moe.get("dispatch_chunk_size")
-    if chunk is not None:
+    if chunk is not None and (isinstance(chunk, bool) or not isinstance(chunk, int) or chunk <= 0):
         raise Praxis1ConfigError(
-            f"backbone.moe.dispatch_chunk_size is {chunk!r}, and this build implements "
-            "only the unchunked MoE dispatch. This is a missing feature, not an exotic "
-            "checkpoint: every published config sets this field, so every published "
-            "checkpoint is refused here until the chunked combine is ported. The two "
-            "are different combines rather than one combine split for memory. Chunked "
-            "scales the gate by routed_scaling_factor in float32, sums the top_k rows "
-            "in float32 and rounds once at the end; the unchunked path gates in the row "
-            "dtype, sums, then scales. The reference picks the path on this field alone, "
-            "so a batch smaller than one chunk does not avoid it: measured on CPU, the "
-            "two disagree on every row at every size down to a single row, by up to "
-            "0.25 absolute and 2.8e-3 relative in RMS in bfloat16. Serving these "
-            "weights on the unchunked path would run and answer with a policy the "
-            "reference does not produce"
+            f"backbone.moe.dispatch_chunk_size must be a positive int or null, got {chunk!r}"
         )
 
     return {
@@ -194,6 +192,7 @@ def _moe_fields(moe: Mapping[str, Any]) -> dict[str, Any]:
         "top_k_routed": top_k_routed,
         "expert_hidden": int(moe.get("expert_hidden", 0)),
         "routed_scaling_factor": float(moe.get("routed_scaling_factor", 2.5)),
+        "dispatch_chunk_size": chunk,
     }
 
 
@@ -229,6 +228,9 @@ class Praxis1Config:
     top_k_routed: int
     expert_hidden: int
     routed_scaling_factor: float
+    # Selects the MoE combine on ``is not None``, not a memory knob: see
+    # :func:`_moe_fields`.
+    dispatch_chunk_size: int | None
     dense_ffn_hidden: int
 
     # action expert
@@ -306,7 +308,11 @@ class Praxis1Config:
         is the point: a positional call is what silently puts the right number
         in the wrong slot, and it is the fifth argument,
         ``routed_scaling_factor``, that would be hardest to notice, since 2.5
-        is also the layer's default.
+        is also the layer's default. ``dispatch_chunk_size`` is the same
+        trap one argument later: the layer's default is ``None``, which is
+        the other combine, so a builder that spelled out five arguments and
+        forgot the sixth would serve every published checkpoint on a regime
+        none of them selects, and nothing would raise.
         """
         return {
             "dim": self.dim,
@@ -314,6 +320,7 @@ class Praxis1Config:
             "num_experts": self.num_routed_experts,
             "top_k": self.top_k_routed,
             "routed_scaling_factor": self.routed_scaling_factor,
+            "dispatch_chunk_size": self.dispatch_chunk_size,
         }
 
     @classmethod
