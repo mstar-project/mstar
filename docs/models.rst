@@ -2341,9 +2341,8 @@ two-stage recipe), ``num_frames`` (8k+1), ``fps``, ``seed``, and ``recipe``:
   in VAE tiles, as the card does for this decode.
 
 Outputs are an H.264 ``video`` and a 48 kHz stereo ``audio`` chunk (16-bit PCM).
-``POST /v1/videos/generations`` returns one mp4 with the audio muxed in as AAC
-(``"audio": false`` in the body for video alone); the mux needs the ``ffmpeg`` binary
-on the server's ``PATH`` and falls back to video only without it.
+``POST /v1/videos/generations`` returns one mp4 with the audio as AAC, written in the same
+pass as the video (``"audio": false`` in the body for video alone).
 
 ``ltx2_5_sp2`` splits each step's video tokens over the two ranks (the DiT's sequence
 shard): each rank holds the whole DiT and half the tokens, and only the video
@@ -2405,8 +2404,8 @@ lowers it), a packed sequence over ``max_packed_rows`` (default 131072: the long
 clip, 14.4 s, with a ~25k-token prompt), Qwen's vision tokens in the prompt, and a last
 keyframe outside 1:4 to 4:1 next to a first one (it is cropped to the canvas). One request
 runs per denoise step. ``POST /v1/videos/generations``
-returns one mp4 with the audio as AAC (``image`` is the first frame,
-``extra_body.last_image`` the last; the mux needs ``ffmpeg`` on ``PATH``).
+returns one mp4 with the audio as AAC, written in the same pass as the video (``image`` is
+the first frame, ``extra_body.last_image`` the last).
 
 Deployment knobs (``model_kwargs``; the SP configs set ``compile``, ``vae_tile_batch: 28`` and
 ``vae_compile``):
@@ -2423,6 +2422,13 @@ Deployment knobs (``model_kwargs``; the SP configs set ``compile``, ``vae_tile_b
 - ``vae_compile``: the decoder's blocks, static per tile batch; a canvas or clip share with
   another tile count compiles again. A 768p clip's share decodes in 2.1 s instead of 3.2 s
   on one H200, within 62.9 dB of eager.
+- ``stream_decode`` (on in the 1-GPU and FastH3 configs): the video decoder runs as a loop,
+  one temporal clip an iteration, and the API server encodes each clip's frames while the
+  next decodes, so only the last clip's encode is left after the decode (0.22-0.26 s where
+  the whole clip's took 0.72-0.83 s, FastH3 on one B300). The H.264 stream is the same
+  (same frames and settings), as long as a clip's tiles are a multiple of
+  ``vae_tile_batch``, as at 768p. One rank: refused when the decoder's clips are split
+  over SP ranks.
 - ``step_cache`` (off by default; lossy): the DiT's step cache, as for Wan2.2. With the
   table calibrated at 832x480x124 (``MAG_RATIOS["default"]``), on the 2-GPU layout at
   that size and 50 points, ``{threshold: 0.015, max_skip_steps: 2}`` computes 30 of 49
@@ -2478,10 +2484,10 @@ torch 2.12; build it from FastVideo's repository for the GPU and the installed t
 ``TORCH_CUDA_ARCH_LIST=10.3a CMAKE_ARGS=-DFASTVIDEO_KERNEL_BUILD_ULYSSES_A2A=OFF pip install
 --no-build-isolation "git+https://github.com/hao-ai-lab/FastVideo@ec9145ab3d86b2255b6fa3bbbb2845859c72cafd#subdirectory=fastvideo-kernel"``
 (``10.0a`` for B200; needs scikit-build-core and the CUTLASS submodule). On one B300 (1344x768,
-124 frames, compiled, warm) a clip takes 18.5-18.9 s with VSA and 23.0-23.5 s dense, against
-18.0-18.2 s for SGLang's FastH3 with VSA on the same GPU. The DiT forwards are within 1%; the
-rest is the output path: SGLang encodes the mp4 while its VAE decodes and muxes the audio in the
-same ffmpeg pass, where M* encodes after the decode and muxes in a second pass. Each VSA
+124 frames, compiled, warm) a clip takes 17.8-17.9 s with VSA (``stream_decode``; 18.6-18.8 s
+without) and 23.0-23.5 s dense, against 18.1-18.2 s for SGLang's FastH3 with VSA on the same GPU
+and 17.8-18.1 s for it at M*'s encode settings (CRF 18, ultrafast). The DiT forwards are within
+1%. Each VSA
 attention call is 12 ms where dense cuDNN is 26 ms; dense queries (text, audio) attend everything, and each video query tile its 132
 best of 660 video key tiles. VSA's output against dense's on 8 prompts is 10.8 dB / SSIM 0.37 (a
 different clip, not a degraded one), the same as SGLang's VSA against its own dense; against an
@@ -2505,7 +2511,7 @@ The attention kernel is a resource's setting: ``backend: sdpa`` on the ``dit_att
 Async scheduling is on for the DiT and the decoder, the default for parallel nodes
 (``tp_async_sched: false`` turns it off); on and off measured within noise. Runtime needs:
 PyAV, transformers' image processor (a server that can't import it, e.g. next to a
-torchaudio built for another torch, refuses to start), FlashInfer, and ``ffmpeg``. Each DiT
+torchaudio built for another torch, refuses to start), and FlashInfer. Each DiT
 rank holds the whole DiT, and the SP configs put the conditioner beside it on rank 0 (117 GiB
 in use once loaded), so they need 141 GB GPUs (H200); no config has been run on 80 GB cards.
 
