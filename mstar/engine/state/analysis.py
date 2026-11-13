@@ -365,8 +365,8 @@ def _combined_walk_problems(array: Array, combined: Mapping[str, Collection[str]
 
 
 def deployment_problems(model: "Model", resources: Mapping[str, Mapping[str, object]]) -> list[str]:
-    """What a deployment's ``resources:`` block asks of the declarations that they can't do: of a sampler, and of an
-    array whose step writes its state itself."""
+    """What a deployment's ``resources:`` block asks of the declarations that they can't do: of a sampler, of an
+    array whose step writes its state itself, and of an array a kept window reads."""
     declarations = model.declare_state()
     problems = [
         f"Sampler {declared.name!r}.draws: enable_logprobs, and draws is {declared.draws}; log-probs take one token "
@@ -382,6 +382,12 @@ def deployment_problems(model: "Model", resources: Mapping[str, Mapping[str, obj
         if "state_dtype" in resources.get(array.name, {}) and "state" in written_by_step(array):
             problems.append(f"Array {array.name!r}: resources.{array.name}.state_dtype, and its step writes state "
                             "itself, where only a field an update op writes takes a stored dtype")
+        longer = resources.get(array.name, {}).get("max_seq_len")
+        if longer is not None and longer > array.max_len and any(
+            isinstance(read.mask, Bidirectional) and read.mask.kept_window for read in array.reads.values()
+        ):
+            problems.append(f"Array {array.name!r}: resources.{array.name}.max_seq_len is {longer}, past its max_len "
+                            f"of {array.max_len}, which its kept window's requests are checked against; raise max_len")
     return problems
 
 

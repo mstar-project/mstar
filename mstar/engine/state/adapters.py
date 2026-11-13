@@ -848,18 +848,16 @@ class FlexAttend(OpBinding):
 
 
 class KeptWindowBinding(OpBinding):
-    """A read through a kept window on a paged array. The pool releases what the window no longer reaches, so the read
-    is its array's only one, and each request's layout sizes it."""
+    """A read through a kept window on a paged array. The pool releases what the window no longer reaches, so the
+    array's other reads run on other walks, and each request's layout sizes it."""
 
     keeps_window = True
 
     def check(self, array: Array, key: str, read: Read) -> None:
-        others = sorted(set(array.reads) - {key})
-        if others:
-            raise _no_layout(array, f"reads[{key!r}] keeps a window beside reads {others}, which would reach entries "
-                                    "the window releases")
-        if read.walks is not None:
-            raise _no_layout(array, f"reads[{key!r}].walks must be None, since the pool keeps one window a label")
+        shared = sorted(other for other, each in array.reads.items() if other != key and _share_a_walk(read, each))
+        if shared:
+            raise _no_layout(array, f"reads[{key!r}] keeps a window beside reads {shared}, which share one of its "
+                                    "walks or name none, so they would reach entries the window releases")
         if read.queries is not None:
             raise _no_layout(array, f"reads[{key!r}].queries must be None, since the window is cut per row of its "
                                     "own array")
@@ -2133,6 +2131,9 @@ class PagedStorage(Storage):
         for array in arrays:
             bound = resolved.bound[array.name] = _bindings(self, array, setup.by_read)
             reads = [each for each in bound if each.key in array.reads]
+            windows = [each.key for each in reads if each.binding.keeps_window]
+            if len(windows) > 1:
+                raise _no_layout(array, f"reads {windows} each keep a window, and the pool keeps one a label")
             others = [each for each in bound if each.key not in array.reads]
             specs, resource_of = self._read_specs(array, reads)
             resolved.specs[array.name] = [self._pool(array, setup.walks), *specs, *_op_specs(array, others)]
@@ -2214,7 +2215,8 @@ class PagedStorage(Storage):
         self, array: Array, by_label: Mapping[str, Layout], keyed_spans: Mapping[str, int],
     ) -> "dict[str, LabelLayout]":
         """Each read's default binding gives the retention its pages keep, since a request has no setup. The
-        bindings' checks ran when the specs were built, so none runs again on a request."""
+        bindings' checks ran when the specs were built. Under a window that releases, a request's layout is checked
+        to keep the array's other reads inside the window's sink."""
         from mstar.model.base import LabelLayout
 
         kept = [
@@ -2230,12 +2232,30 @@ class PagedStorage(Storage):
                 if unread:
                     raise RuntimeError(f"state_layout[{array.name!r}][{label!r}].kept_windows: {unread} name no "
                                        "kept-window read of the array")
+                for key, policy in policies.items():
+                    if len(array.reads) > 1 and policy.can_release(array.max_len):
+                        _check_sink(array, label, key, policy, layout)
                 retention = next(iter(policies.values()), None)
             layouts[label] = LabelLayout(
                 spans=layout.spans, growth=layout.growth, scratch=layout.scratch, keyed_spans=keyed_spans.get(label),
                 retention=retention,
             )
         return layouts
+
+
+def _check_sink(array: Array, label: str, key: str, policy: RetentionPolicy, layout: Layout) -> None:
+    """Raise ``RuntimeError`` where ``layout`` lets a read beside the kept window ``key`` reach past its sink."""
+    where = f"state_layout[{array.name!r}][{label!r}]"
+    if layout.growth:
+        raise RuntimeError(f"{where}.growth: a loop's entries name no walk, and reads[{key!r}]'s kept window releases "
+                           "entries the array's other reads could then reach")
+    end = 0
+    for span in layout.spans:
+        end += span.length
+        if end > policy.protected_prefix and not runs_on_walk(array.reads[key], span.walk):
+            raise RuntimeError(f"{where}: a span of walk {span.walk!r} ends at entry {end}, past the "
+                               f"{policy.protected_prefix} entries reads[{key!r}]'s kept window never releases, so the "
+                               "reads on that walk would reach released entries")
 
 
 def _leader(array: Array, walks: "Walks") -> str | None:

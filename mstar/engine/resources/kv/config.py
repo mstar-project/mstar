@@ -663,7 +663,7 @@ class KVReqConfig(ResourceReqConfig):
             return {}
         caps, room = self.loop_caps or {}, {}
         for layout in (self.kv_layout or {}).values():
-            if layout.retention is not None:
+            if layout.retention is not None and layout.retention.can_release(spec.config.max_seq_len):
                 continue
             for loop, slots in layout.growth:
                 n = (spec.config.max_seq_len - layout.positions(caps) + slots * caps[loop]) // slots
@@ -684,8 +684,8 @@ class KVReqConfig(ResourceReqConfig):
 
     def validate(self, spec: "KVSpec | None" = None) -> None:
         """``ValueError`` (a 400) when a label would hold more positions at the request's caps
-        than its pool's ``max_seq_len``. A label under retention is left out, since Cosmos3,
-        the one model that declares one, computes its positions in each forward.
+        than its pool's ``max_seq_len``. A label whose retention can release entries is left out,
+        since its positions outrun what it keeps.
 
         Also when the labels ``spec.nodes`` open would hold more pages at the caps than the pool
         has for requests. The pool admits a preemptible request on its prompt alone, so a request this
@@ -699,7 +699,8 @@ class KVReqConfig(ResourceReqConfig):
                     f"{spec.resource_key!r}: label {label!r} keeps an exact window, and the pool has window groups"
                 )
             positions = layout.positions(self.loop_caps or {})
-            if layout.retention is None and positions > spec.config.max_seq_len:
+            releases = layout.retention is not None and layout.retention.can_release(spec.config.max_seq_len)
+            if not releases and positions > spec.config.max_seq_len:
                 raise ValueError(
                     f"this request needs {positions} positions of {label!r}, "
                     f"past the model's context of {spec.config.max_seq_len}"
@@ -1005,6 +1006,10 @@ class RetentionPolicy:
         """The tokens at the head the release counts as the prefix: ``protected_prefix``, rounded up to a page of
         ``page_size`` when ``exact``."""
         return -(-self.protected_prefix // page_size) * page_size if self.exact else self.protected_prefix
+
+    def can_release(self, length: int) -> bool:
+        """Whether a stream of ``length`` entries holds some the window no longer reaches, which a release frees."""
+        return self.protected_prefix + self.context_budget < length
 
     def max_pages(self, page_size: int, step: int = 0) -> int:
         """The most pages of ``page_size`` a stream under this policy holds, with a step of
