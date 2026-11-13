@@ -374,10 +374,11 @@ class DeepseekV41Model(ByteLevelTextOutput, Model):
             return None
         self._adopt_checkpoint_config(source)
 
-        from mstar.model.deepseek_v41.components.engram import compressed_token_map, host_tables
+        from mstar.model.deepseek_v41.components.engram import compressed_token_map
         from mstar.model.deepseek_v41.components.layers import DeepseekV41ForCausalLM
         from mstar.model.deepseek_v41.submodules import DeepseekV41LLMSubmodule
-        from mstar.model.loader.iterators import TensorSlice, iter_safetensors_shards
+        from mstar.model.deepseek_v41.weight_loader import rank_slices
+        from mstar.model.loader.iterators import iter_safetensors_shards
 
         token_map = None
         if self.config.engram_layer_ids:
@@ -390,14 +391,11 @@ class DeepseekV41Model(ByteLevelTextOutput, Model):
         if autocast_dtype is not None:
             language_model = _cast_floating(language_model, autocast_dtype)
         language_model.to_empty(device=device)
-        # a table served from the host is the engine's to map: this rank reads none of its rows
-        on_host = set()
-        if self.config.engram_on_host:
-            on_host = {part.tensor for table in host_tables(self.config).values() for part in table.parts}
+        # a rank reads its own slice of each tensor, and nothing of a table the engine maps
+        # from the host or of the parts not served
         weights = iter_safetensors_shards(
-            source, device=device, quant_methods=QUANT_METHODS,
-            slice_spec=lambda name: TensorSlice(0, 0, 0) if name in on_host else None)
-        check_loaded(language_model, language_model.load_weights(weights), source)
+            source, device=device, quant_methods=QUANT_METHODS, slice_spec=rank_slices(language_model))
+        check_loaded(language_model, language_model.load_weights(weights, sliced=True), source)
         process_weights_after_loading(language_model, torch.device(device))
         language_model.eval()
         logger.info("Successfully loaded DeepSeek-V4.1 submodule for %s", node_name)

@@ -34,7 +34,12 @@ from mstar.model.deepseek_v41.components.layers import DeepseekV41ForCausalLM
 from mstar.model.deepseek_v41.components.moe import DeepseekV41MoE
 from mstar.model.deepseek_v41.config import CSA, ENGRAM, MOE_EXPERTS, STATE, DeepseekV41Config, kv_cache_key
 from mstar.model.deepseek_v41.deepseek_v41_model import DeepseekV41Model
-from mstar.model.deepseek_v41.weight_loader import load_deepseek_v41_weights, skipped, upcast_fp4_block
+from mstar.model.deepseek_v41.weight_loader import (
+    load_deepseek_v41_weights,
+    rank_slices,
+    skipped,
+    upcast_fp4_block,
+)
 from mstar.model.registry import get_model_class, model_init_kwargs
 from mstar.model.utils import check_loaded
 from mstar.utils.mx_round import dequant_row_fp4, pack_e2m1, pow2_ceil, round_e2m1
@@ -134,6 +139,34 @@ class TestCheckpointLayout:
         weights = ((name, torch.empty(shape, dtype=dtype, device="meta")) for name, dtype, shape in served)
         check_loaded(lm, load_deepseek_v41_weights(lm, weights), "checkpoint layout")
 
+    @pytest.mark.parametrize("tp, parallel, tables, kept, read, largest", [
+        (1, "tp", "device", 501.4, 501.4, 98.3),   # everything but the parts not served
+        (8, "tp", "device", 63.6, 149.7, 12.3),    # a down projection's columns are read with their rows
+        (8, "ep", "device", 63.6, 65.5, 12.3),
+        (8, "tp", "host", 38.2, 124.3, 0.2),
+        (8, "ep", "host", 38.2, 40.1, 0.2),
+    ])
+    def test_a_rank_reads_its_slices_of_the_checkpoint(self, tp, parallel, tables, kept, read, largest):
+        """GB of the 510.3 GB checkpoint a rank keeps, GB it reads to get them (the shard reader
+        takes a slice of a tensor's first dim from the file and reads the tensor for another),
+        and its largest piece: at TP8 an eighth of an Engram table, not the 98.3 GB table."""
+        config = dataclasses.replace(_checkpoint_config(), engram_tables=tables)
+        token_map = torch.arange(config.vocab_size) % config.engram_compressed_vocab_size
+        with torch.device("meta"):
+            lm = DeepseekV41ForCausalLM(
+                config, token_map, comm_group=_rank(0, tp), moe_parallel=MoeParallelConfig(parallel=parallel))
+        cut = rank_slices(lm)
+        got = [0, 0, 0]
+        for name, dtype, shape in _checkpoint_tensors():
+            assert shape, f"{name}: a tensor with no first dim has no empty slice"
+            whole = part = math.prod(shape) * dtype.itemsize
+            piece = cut(name)
+            if piece is not None:
+                dim, start, stop = piece
+                part = whole * max(min(stop, shape[dim]) - start, 0) // shape[dim]
+            got = [got[0] + part, got[1] + (part if piece is None or piece.dim == 0 else whole), max(got[2], part)]
+        assert [round(nbytes / 1e9, 1) for nbytes in got] == [kept, read, largest]
+
     @pytest.mark.parametrize("tp, parallel", [(1, "tp"), (8, "tp"), (8, "ep")])
     def test_fp4_experts_are_held_in_the_checkpoints_own_bytes(self, tp, parallel):
         """A rank's routed experts take its share of the bytes the checkpoint stores them in:
@@ -196,6 +229,67 @@ def _variant(snapshot, tmp_path, edit) -> Path:
     edit(tensors)
     save_file(tensors, str(tmp_path / "model.safetensors"))
     return tmp_path
+
+
+@pytest.fixture(scope="module")
+def tp2_snapshot(tmp_path_factory):
+    """A snapshot two ranks can share: a rank's slices hold whole 32-wide scale blocks of the
+    expert width and of the output projection's input."""
+    path = tmp_path_factory.mktemp("dsv41-tp2")
+    _testing.write_snapshot(path, DeepseekV41Config.reduced(moe_intermediate_size=64, o_lora_rank=32), seed=4)
+    return path
+
+
+class TestRankReads:
+    """A TP rank reads its own slices through the shard reader (``rank_slices``) and fills the
+    parameters it fills from whole tensors."""
+
+    @pytest.mark.parametrize("layout, parallel, tables", [
+        ("fp4", "tp", "device"), ("fp8", "tp", "device"), ("dense", "tp", "device"),
+        ("fp4", "ep", "device"), ("fp4", "tp", "host"),
+    ], ids=["fp4", "fp8", "dense", "whole-experts", "host-engram"])
+    def test_sliced_reads_fill_what_whole_tensors_fill(self, tp2_snapshot, monkeypatch, layout, parallel, tables):
+        from mstar.model.deepseek_v41.components.engram import compressed_token_map
+        from mstar.model.loader import iterators
+
+        whole = load_file(str(tp2_snapshot / "model.safetensors"))
+        shards, read = iterators.iter_safetensors_shards, {}
+
+        def recording(*args, **kwargs):
+            for name, tensor in shards(*args, **kwargs):
+                read[name] = tuple(tensor.shape)
+                yield name, tensor
+
+        monkeypatch.setattr(iterators, "iter_safetensors_shards", recording)
+        moe_parallel = MoeParallelConfig(parallel=parallel)
+        for rank in (0, 1):
+            read.clear()
+            model = DeepseekV41Model(str(tp2_snapshot), max_seq_len=256, moe_experts=layout, engram_tables=tables)
+            got = model.get_submodule("LLM", tp_group=_rank(rank, 2), moe_parallel=moe_parallel).language_model
+            token_map = torch.tensor(compressed_token_map(model.tokenizer)[0], dtype=torch.long)
+            want = DeepseekV41ForCausalLM(model.config, token_map, comm_group=_rank(rank, 2), moe_parallel=moe_parallel)
+            check_loaded(want, load_deepseek_v41_weights(want, whole.items()), "whole tensors")
+            filled = dict(got.named_parameters())
+            assert filled.keys() == dict(want.named_parameters()).keys()
+            for name, param in want.named_parameters():
+                assert torch.equal(filled[name], param), name
+
+            # what the reader handed over: this rank's rows, columns or experts, not the tensors
+            vocab, hidden = whole["embed.weight"].shape
+            assert read["embed.weight"] == (vocab // 2, hidden)
+            packed = whole["layers.0.ffn.experts.0.w1.weight"].shape
+            other = 1 if rank == 0 else 0  # an expert of the other rank's, under whole experts a rank
+            if parallel == "ep":
+                mine = f"layers.0.ffn.experts.{4 * rank}.w2.weight"
+                assert read[mine] == whole[mine].shape
+                assert read[f"layers.0.ffn.experts.{4 * other}.w1.weight"][0] == 0
+            else:
+                assert read["layers.0.ffn.experts.0.w1.weight"] == (packed[0] // 2, packed[1])
+                assert read["layers.0.ffn.experts.0.w2.scale"] == (hidden, 1)  # 32 of the 64 columns
+            table = whole["layers.1.engram.embed.weight"].shape
+            rows = -(-table[0] // 2)
+            assert read["layers.1.engram.embed.weight"] == (
+                (0, table[1]) if tables == "host" else (rows if rank == 0 else table[0] - rows, table[1]))
 
 
 class TestLoaderGuards:

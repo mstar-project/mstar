@@ -128,7 +128,7 @@ class DeepseekV41ForCausalLM(nn.Module):
     def forward(self, input_ids: torch.Tensor, rows: torch.Tensor | None = None) -> torch.Tensor:
         return self.logits(self.model(input_ids, rows))
 
-    def load_weights(self, weights, **kwargs) -> set[str]:
+    def load_weights(self, weights, sliced: bool = False, **kwargs) -> set[str]:
         from mstar.model.deepseek_v41.weight_loader import load_deepseek_v41_weights
 
-        return load_deepseek_v41_weights(self, weights)
+        return load_deepseek_v41_weights(self, weights, sliced)
