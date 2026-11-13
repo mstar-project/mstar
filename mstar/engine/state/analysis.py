@@ -465,7 +465,7 @@ def _canonical(value):
         return sorted(value)
     if isinstance(value, list | tuple):
         return [_canonical(item) for item in value]
-    if isinstance(value, torch.dtype) or get_origin(value) is tuple:
+    if isinstance(value, torch.dtype | range) or get_origin(value) is tuple:
         return str(value)
     if isinstance(value, type):
         return value.__name__
