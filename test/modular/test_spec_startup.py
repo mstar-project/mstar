@@ -164,6 +164,17 @@ def test_block_causal_attention_is_refused_though_its_parent_can_verify():
     assert any("'attn'" in p and "block-causal" in p for p in problems), problems
 
 
+@pytest.mark.parametrize("walk,ok", [
+    ("decode", True), (frozenset({"decode", "decode_audio"}), True), ("other", False),
+    (frozenset({"other", "decode_audio"}), False),
+], ids=["own walk", "several with it", "another", "several without it"])
+def test_the_verify_walks_loopback_may_cover_several_walks(walk, ok):
+    """A `DeviceLoopback` over several walks (main's `covers`) serves a verify walk it covers."""
+    decl = _decl(device_loopback=_LOOPBACK._replace(walk=walk))
+    problems = shape_problems(decl, decl.token_stop, _specs())
+    assert (not any("DeviceLoopback on itself" in p for p in problems)) == ok, problems
+
+
 def test_a_context_parallel_pool_is_refused():
     specs = _specs()
     specs["kv_cache"] = KVSpec(
