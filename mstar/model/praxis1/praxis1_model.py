@@ -25,10 +25,9 @@ window. The VAE node writes and reads that window; a later trunk port must
 consume its clean encoding. The predicted video latents end at the denoise
 loop, and nothing predicted leaves the walk except the action rows.
 
-Nothing here serves yet. The production trunk weight loader and session
-validation still need to land, so a served model is refused at construction
-before it fetches anything. Dummy mode (``skip_weight_loading``) builds the
-graph for startup checks and CPU tests.
+Serving stays gated until the published weights and session path have been
+validated. The constructor refuses a served model before it fetches anything.
+Dummy mode (``skip_weight_loading``) builds the graph for CPU tests.
 """
 
 from __future__ import annotations
@@ -109,10 +108,8 @@ TEXT_STATE_NAME = "text_embeds"
 STATE_KWARG = "robot_state"
 MODEL_POSE_KWARG = "_praxis_model_pose"
 
-# False until get_submodule can build the nodes. Until then a served model is
-# refused in the constructor, the first model code every serving process runs,
-# rather than in get_submodule once every process has started. The PR that
-# ports the compute deletes this.
+# The towers exist, but published weights and a served session are not yet
+# validated. Refuse startup before any process downloads the checkpoint.
 _SERVABLE = False
 
 # The denoise loop's ceiling when the checkpoint names none.
@@ -163,8 +160,8 @@ class Praxis1Model(Model):
         if not skip_weight_loading and not _SERVABLE:
             raise NotImplementedError(
                 f"Praxis-1 ({model_path_hf}) is not servable yet: this build has its "
-                "graph and config reader but no node computation, which lands with the "
-                "compute port. Nothing was downloaded."
+                "tower code, but published checkpoint and session validation are pending. "
+                "Nothing was downloaded."
             )
 
         self._repo_dir: Path | None = None
@@ -752,10 +749,8 @@ class Praxis1Model(Model):
         Dummy mode returns None, which is what lets the graph, the walks and
         the request layouts be tested on a machine with no weights.
 
-        The trunk nodes are not here yet. They raise rather than returning
-        None, because None means "run this node without real computation" and
-        a policy that silently emits nothing would look like a working server
-        that commands an arm badly.
+        Live startup remains gated before this method runs. In dummy mode,
+        None lets graph and resource tests inspect the model without weights.
         """
         if self.skip_weight_loading:
             return None

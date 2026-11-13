@@ -1,8 +1,7 @@
 model: "praxis1_yam"
 
-# Not servable yet: this build has the graph and the config reader but no node
-# computation, so `mstar serve praxis1_yam` refuses to start before it downloads
-# anything. The config is here for the startup checks and for the PR that serves.
+# Serving remains gated until the published checkpoint and session path are
+# validated. This config can be checked without downloading model weights.
 
 # Every praxis1 node is stateless (no KV cache); max_seq_len only satisfies the
 # conductor's config check. The value is the backbone's widest encoder sequence:
