@@ -340,7 +340,10 @@ runs the full sampler. By default only a sampler whose ``vocab_size`` is past th
 draw (4096) does this, since a narrower one draws in one kernel already. A deployment's
 ``resources: {<sampler name>: {greedy_capture: false}}`` turns it off, and with it the twins'
 capture memory and time, for a deployment that never samples greedily, and ``true`` turns it
-on whatever the vocabulary. The model declares nothing for it.
+on whatever the vocabulary. The model declares nothing for it. On a node that verifies drafts,
+such a step verifies by the target's argmax alone (``greedy_verify``): the same tokens and
+acceptance as the full verify, without its vocabulary-wide probabilities, in a twin of each
+verify bucket.
 
 A model can pass through what the request set:
 

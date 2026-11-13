@@ -31,6 +31,7 @@ from mstar.engine.resources.sampler.utils import (
     apply_min_p,
     filter_top_k_top_p,
     fused_temperature_softmax,
+    greedy_tokens,
 )
 
 # keys verify's numbers apart from any other stream drawn off the same seed
@@ -112,6 +113,23 @@ def renorm_top_p(top_p: torch.Tensor) -> torch.Tensor:
     """The top-p each row's top-p renorm runs at: its own where `_TwoFilters` reads the renorm (p < 1), and
     `_UNREAD_TOP_P` where it reads ``first`` instead (p = 1 removes nothing)."""
     return torch.where(top_p < 1.0, top_p, _UNREAD_TOP_P)
+
+
+def greedy_verify(logits: torch.Tensor, drafts: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """`chain_verify_rows` over `verify_probs` for rows that all sample greedily, from the
+    target's argmax alone: ``logits`` ``[n * (k + 1), V]``, ``drafts`` ``[n, k]``. A greedy
+    row's filtered distribution is a one-hot at its argmax (`greedy_tokens`: the lowest index
+    among equal maxima, where the fused softmax puts it), so a draft is accepted while it is
+    the argmax, and every token from the first refusal on is the argmax there, as the full
+    path's residual draw gives. The same tokens and counts, without the vocabulary-wide
+    probabilities. Capturable."""
+    n, k = drafts.shape
+    targets = greedy_tokens(logits).view(n, k + 1)
+    drafts = drafts.long()
+    accepted = (drafts == targets[:, :k]).long().cumprod(1).sum(1)
+    last = targets.gather(1, accepted[:, None])
+    keep = torch.arange(k + 1, device=logits.device)[None, :] < accepted[:, None]
+    return torch.where(keep, F.pad(drafts, (0, 1)), last), accepted
 
 
 def chain_verify(

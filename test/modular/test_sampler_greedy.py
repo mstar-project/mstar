@@ -267,14 +267,14 @@ def test_only_batched_buckets_get_a_greedy_twin(wide):
 
 
 @pytest.mark.parametrize("make", [_sampler, lambda: _sampler(V, greedy_capture=True)], ids=["wide", "opted_in"])
-def test_a_verifying_sampler_gets_no_greedy_twin(make):
-    """A verify step reads no greedy flag (`SamplerResource.verify`), so a twin of its bucket
-    would capture the whole verify graph a second time, against the capture budget."""
+def test_a_verifying_sampler_gets_its_greedy_twin(make):
+    """A verify step whose rows all sample greedily verifies by the argmax (`greedy_verify`), so
+    its bucket gets the sampler's twin, as a decode bucket does, keyed apart from the plain one."""
     plain = {(WALK, frozenset()), ("prefill", frozenset())}
-    assert _listed({"sampler": make()}) == plain | {(WALK, GREEDY)}, "a node that doesn't verify keeps its twin"
+    assert _listed({"sampler": make()}) == plain | {(WALK, GREEDY)}
     verifying = make()
     verifying.bind_verify(3)
-    assert _listed({"sampler": verifying}) == plain
+    assert _listed({"sampler": verifying}) == plain | {(WALK, GREEDY)}
 
 
 # ---- the plan's check, and the eager step ----
