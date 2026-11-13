@@ -1132,3 +1132,19 @@ def test_a_base_for_no_kept_window_read_is_refused():
 def test_last_first_reaches_the_bounded_kvs_reverse_order():
     (spec,) = build_specs([_kept(reads={"enc_attn": _window(mask=Bidirectional(kept_window=True, last_first=True))})])
     assert spec.config.reverse_step_order, "the window would cut each step's adds in order, keeping the last longest"
+
+
+_FP32_KV = TensorType((4, 16), dtype=torch.float32, shard=0)
+
+
+def test_a_float32_bounded_read_attends_in_ieee_fp32_by_default():
+    """TF32 would change a float32 cache's attention, so only a kernel setting asks for it."""
+    (fp32,) = build_specs([_kept(entry=Entry({"k": _FP32_KV, "v": _FP32_KV}))])
+    (compute,) = build_specs([_kept()])
+    assert fp32.config.ieee and not compute.config.ieee, "only a float32 entry attends in IEEE fp32 by default"
+
+
+def test_a_bounded_reads_ieee_is_a_kernel_setting():
+    (spec,) = build_specs([_kept(entry=Entry({"k": _FP32_KV, "v": _FP32_KV}))],
+                          kernel_settings={"enc_attn": {"ieee": False}})
+    assert spec.config.ieee is False, "the read's setting under its key would not reach its bounded KV"

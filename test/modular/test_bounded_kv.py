@@ -587,3 +587,18 @@ def test_a_bounded_pool_holds_as_many_requests_as_its_slots():
         "5 concurrent requests (max_concurrent_requests) need 5 slots of resources.enc, which holds 4; raise "
         "max_slots or lower max_concurrent_requests"
     )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the bounded kernels need a GPU")
+def test_attend_takes_its_configs_precision_when_given_none():
+    """A declared read sets ``ieee`` on its config, and its handle passes none."""
+    q = torch.randn(1, 2, 4, 128, generator=torch.Generator().manual_seed(1)).cuda()
+    outs = []
+    for config_ieee, ieee in ((True, None), (False, True)):
+        kv = _manager(8, False, torch.float32, "cuda")
+        kv.config.ieee = config_ieee
+        step, ctx = _step(["a"], [0], [4])
+        assert kv.admit(step, ctx).ok
+        kv.plan(step, ctx)
+        outs.append(kv.attend(0, q, q, q, ieee=ieee))
+    assert torch.equal(outs[0], outs[1]), "ieee=None would run the kernel in TF32 although the config asks for IEEE"
