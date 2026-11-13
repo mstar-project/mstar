@@ -273,14 +273,14 @@ class H3PackedDenoise(DenoiseLoopSubmodule):
     float32_matmul_precision = "highest"
 
     def __init__(self, transformer: nn.Module, config, *, loop_name: str, max_batch_size: int = 1,
-                 compile_blocks: bool = False, row_bucket: int = 1, capture_buckets=()):
+                 compile_blocks: bool = False, row_bucket: int = 1, capture_buckets=(), fused_steps: bool = False):
         if max_batch_size != 1:
             # a batch's rows would have to agree on the step's first-step decisions (denoise)
             raise ValueError(f"the MiniMax-H3 dit runs one request per step; got max_batch_size={max_batch_size}")
         if int(row_bucket) < 1:
             raise ValueError(f"row_bucket must be a positive int; got {row_bucket!r}")
         super().__init__(loop_name=loop_name, max_batch_size=1, capture_buckets=capture_buckets,
-                         capture_batch_sizes=(1,))
+                         capture_batch_sizes=(1,), fused_steps=fused_steps)
         self.transformer = transformer
         self.config = config
         self.compiled = bool(compile_blocks)

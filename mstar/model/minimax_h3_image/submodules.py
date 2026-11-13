@@ -228,6 +228,10 @@ class H3ImageDenoiseSubmodule(H3PackedDenoise):
             tensors[COND_LATENTS] = inputs[COND_LATENTS][0]
         return tensors
 
+    def round_inputs(self, k: int, cond: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        # an edit's first step noises its references; a fused loop's later rounds are not first steps
+        return {**cond, FIRST_STEP: torch.tensor(k == 0)}
+
     def capture_request_inputs(self, bucket_key: H3ImageLayout, device) -> dict[str, torch.Tensor]:
         cfg = self.config.transformer
         self.step_modulation(1, device)  # the rows a captured step reads, outside its capture

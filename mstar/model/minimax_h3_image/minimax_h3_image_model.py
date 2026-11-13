@@ -118,6 +118,7 @@ class H3ImageModel(Model):
         text_cache_entries: int = 0,
         capture_sizes: list[list[int]] | None = None,
         capture_text_rows: int = 512,
+        fused_loop: bool = False,
         **kwargs,
     ):
         refuse_attention_backend_kwarg(kwargs)
@@ -151,6 +152,8 @@ class H3ImageModel(Model):
         for height, width in self.capture_sizes:
             if height % (2 * VAE_RATIO) or width % (2 * VAE_RATIO):
                 raise ValueError(f"capture_sizes: a canvas is whole {2 * VAE_RATIO}-px patches; got {height}x{width}")
+        # the whole six-step grid in one DiT step (one captured graph per bucket under capture_sizes)
+        self.fused_loop = bool(fused_loop)
         self.vae_tile_batch = int(vae_tile_batch)  # 1 decodes one tile a call, as the reference
         self.vae_compile = bool(vae_compile)
         # the text node keeps this many prompts' text rows (0: none), as SGLang's conditioning
@@ -406,7 +409,7 @@ class H3ImageModel(Model):
         return frozenset({"height", "width", "min_generation_area", *OUTPUT_FORMAT_KWARGS})
 
     def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
-        return {DENOISE_LOOP: self.config.num_steps}
+        return {DENOISE_LOOP: 1 if self.fused_loop else self.config.num_steps}
 
     # --------------------------------------------------------------- plan
     def walk_plan(
@@ -508,7 +511,7 @@ class H3ImageModel(Model):
             return H3ImageDenoiseSubmodule(
                 weight_loader.build_transformer(config, snapshot, device, comm_group=tp_group),
                 config, loop_name=DENOISE_LOOP, max_batch_size=1, compile_blocks=self.compile,
-                row_bucket=self.row_bucket, capture_buckets=self.capture_buckets(),
+                row_bucket=self.row_bucket, capture_buckets=self.capture_buckets(), fused_steps=self.fused_loop,
             )
         if node_name == VAE_DECODER_NODE:
             return H3ImageDecoderSubmodule(weight_loader.build_image_decoder(config, snapshot, device), config,
