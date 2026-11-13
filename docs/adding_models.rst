@@ -843,7 +843,10 @@ read, over one label, and its queries come from an append-only array that keeps 
 refused at load on a node that splits its steps over SP ranks, and where its pool or the queried
 array's pool is stored by position (``context_parallel``). A ``max_len=0`` cross read's queries
 come from an array of one label, and ``queries`` never names the
-read's own array. Separate token sets are separate arrays, and arrays of one kind and geometry on one node share one resource,
+read's own array. Queries that nothing on the node attends among themselves, as a resampler's
+learned queries, come from an array with ``max_len=0``, ``entry=Entry({})`` and no reads: its step
+plans nothing, it takes no add or read, and loading refuses one that no read's ``queries`` names.
+Separate token sets are separate arrays, and arrays of one kind and geometry on one node share one resource,
 each under its own label.
 
 Under sequence parallelism an array declares nothing: the node's sequence shard

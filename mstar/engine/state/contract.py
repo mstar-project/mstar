@@ -282,7 +282,8 @@ class Array:
     the same length at the end of every step. ``nodes`` lists who may touch the array, and the engine places it.
     ``updates`` are kernels that replace a Value's entry with its next version. The version they overwrite is gone,
     so prefix caching and undo save a copy before one runs.
-    With ``max_len`` 0 an array keeps nothing between steps, so every add is scratch.
+    With ``max_len`` 0 an array keeps nothing between steps, so every add is scratch, and one with no reads only lays
+    out the queries of a read that names it.
     """
 
     name: str
@@ -291,7 +292,7 @@ class Array:
     layers: frozenset[int]
     entry: Entry
     max_len: int
-    reads: Mapping[str, Read] = EMPTY    # empty: read whole
+    reads: Mapping[str, Read] = EMPTY    # empty: read whole, or with max_len 0 only lay out another read's queries
     updates: Mapping[str, Op] = EMPTY
     rewritable: bool = False
     labels: frozenset[str] = frozenset({"main"})

@@ -258,7 +258,8 @@ def test_a_block_read_on_max_len_zero_has_no_problem():
 
 @pytest.mark.parametrize("array", [
     Value("kv", nodes={"LLM"}, layers={0}, entry=_gdn_entry()),
-    Array("kv", nodes={"LLM"}, layers={0}, entry=KVEntry(heads=4, head_dim=8), max_len=0),
+    Array("kv", nodes={"LLM"}, layers={0}, entry=KVEntry(heads=4, head_dim=8), max_len=0,
+          reads={"r": _read(mask=Block())}),
 ])
 def test_positions_sit_only_on_an_append_only_array_that_keeps_entries(array):
     with_positions = replace(array, positions=Positions())

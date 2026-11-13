@@ -1858,7 +1858,16 @@ class CrossQueries(OtherArrayQueries, Queries):
         return RaggedCrossAttentionStep(segments=tuple(segments), pairs=tuple(pairs))
 
 
-class WithinStepHandle(ArrayHandle):
+class _MaxLenZeroHandle(ArrayHandle):
+    """A handle on an array with ``max_len`` 0, with or without reads."""
+
+    def _check_storage(self, declared: ArrayStep, segments, ctx) -> None:
+        super()._check_storage(declared, segments, ctx)
+        if declared.forks:
+            raise self._refusal("a step forks an array with max_len 0, which keeps nothing to fork")
+
+
+class WithinStepHandle(_MaxLenZeroHandle):
     """The calls on an array with ``max_len`` 0, which a block compiled alone traces. With ``compile_op`` set, the read
     stays in that graph through ``mstar::ragged_attention``. A check here runs only while not compiling: it would guard
     on the layer, and the block would retrace per layer.
@@ -1903,11 +1912,6 @@ class WithinStepHandle(ArrayHandle):
     def check_step(self, step) -> None:
         """Every add is scratch, so a step keeps none and has nothing to refuse as a whole."""
 
-    def _check_storage(self, declared: ArrayStep, segments, ctx) -> None:
-        super()._check_storage(declared, segments, ctx)
-        if declared.forks:
-            raise self._refusal("a step forks an array with max_len 0, which keeps nothing to fork")
-
     def add(self, layer: int | torch.Tensor, *, keep: bool | None = None, **fields: torch.Tensor) -> None:
         """Hold k and v for this layer's read. Every add here is scratch."""
         if keep:
@@ -1938,6 +1942,13 @@ class WithinStepHandle(ArrayHandle):
     def _check_add_read(self, call: str) -> None:
         raise self._refusal(f"{call} with max_len 0, whose read a compiled block traces: a break here takes the read "
                             "out of that graph")
+
+
+class QueriesOnlyHandle(_MaxLenZeroHandle):
+    """An array with ``max_len`` 0 and no reads, whose segments lay out the queries of a read that names it. Its step
+    plans nothing, and it takes no add or read."""
+
+    needs_step = False
 
 
 # Storages
@@ -2364,10 +2375,26 @@ class WithinStepStorage(Storage):
             resolved.specs[array.name] = [spec] if bound.binding.plans and spec.resource_key == key else []
         return resolved
 
+
+class QueriesOnlyStorage(Storage):
+    """An array with ``max_len`` 0 and no reads, which only lays out the queries of a read that names it, so it has no
+    spec."""
+
+    handle_class = QueriesOnlyHandle
+
+    def resolve(self, arrays: Sequence[Array], declared: Sequence[Array], setup: "StateSetup") -> Resolved:
+        for array in arrays:
+            if array.entry != Entry({}):
+                raise ValueError(f"Array {array.name!r}: entry must be Entry({{}}), since an array with max_len 0 and "
+                                 "no reads takes no add")
+        return Resolved(
+            {array.name: [] for array in arrays}, {array.name: _bindings(self, array) for array in arrays}, {}, {},
+        )
+
     def handle(
         self, array: Array, resources: Mapping[str, Any], setup: "StateSetup", resolved: Resolved,
     ) -> ArrayHandle:
-        return WithinStepHandle(array, resources, resolved.bound[array.name], resolved)
+        return QueriesOnlyHandle(array, resources)
 
 
 PAGED = PagedStorage()
@@ -2378,6 +2405,7 @@ VALUE = ValueStorage()
 VALUE_WITH_HOST = ValueWithHostStorage()
 HOST_VALUE = HostValueStorage()
 WITHIN_STEP = WithinStepStorage()
+QUERIES_ONLY = QueriesOnlyStorage()
 
 
 def storage_of(array: Array) -> Storage:
@@ -2389,7 +2417,7 @@ def storage_of(array: Array) -> Storage:
     if array.rewritable:
         raise _no_layout(array, "a rewritable array has no spec unless it is a Value, of max_len 1")
     if not array.max_len:
-        return WITHIN_STEP
+        return WITHIN_STEP if array.reads else QUERIES_ONLY
     if array.reads and all(isinstance(read.mask, FrameWindow) for read in array.reads.values()):
         return RING
     if any(read.queries is not None for read in array.reads.values()):

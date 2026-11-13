@@ -596,7 +596,9 @@ def test_a_value_links_to_the_array_that_keeps_entries_not_a_within_step_one():
 
 
 @pytest.mark.parametrize("array, cause", [
-    (Array("v", nodes={"a"}, layers={0}, entry=KVEntry(heads=4, head_dim=8), max_len=0), "needs one read"),
+    (Array("v", nodes={"a"}, layers={0}, entry=KVEntry(heads=4, head_dim=8), max_len=0,
+           reads={"r": Read(mask=Block(), op=Attend(q_heads=4)), "s": Read(mask=Block(), op=Attend(q_heads=4))}),
+     "needs one read"),
     (Array("v", nodes={"a"}, layers={0}, entry=KVEntry(heads=4, head_dim=8), max_len=0,
            reads={"r": Read(mask=Block())}), r"reads\['r'\].op must be Attend"),
     (Array("v", nodes={"a"}, layers={0}, entry=Entry({"x": TensorType((1,), dtype=None)}), max_len=0,

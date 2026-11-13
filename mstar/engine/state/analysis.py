@@ -160,8 +160,12 @@ def _kv_label_problems(kv_labels: Mapping[str, Mapping[str, object]], arrays: Se
 
 def _cross_read_problems(arrays: Sequence[Array]) -> list[str]:
     by_name = {array.name: array for array in arrays}
+    named = {read.queries for array in arrays for read in array.reads.values()}
     problems: list[str] = []
     for array in arrays:
+        if not array.max_len and not array.reads and array.name not in named:
+            problems.append(f"Array {array.name!r}.reads: with max_len 0 and no reads, the array only lays out another "
+                            f"read's queries, and no read's queries names {array.name!r}")
         for key, read in array.reads.items():
             if read.queries is None:
                 continue
