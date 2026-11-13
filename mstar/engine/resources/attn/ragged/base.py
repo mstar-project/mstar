@@ -560,9 +560,15 @@ def _flashinfer_wrapper(manager, label: str, slot: int, config, **graph_kwargs) 
 
 
 def _cudnn_wrapper(manager, label: str, slot: int, config, **graph_kwargs) -> _RaggedPrefillBase:
+    """torch's cuDNN SDPA; a row's ``{"segments": "runs"}`` lets an eager one take unequal segments."""
     from mstar.engine.resources.attn.ragged.cudnn_wrappers import CudnnRaggedPrefillWrapper
 
-    return CudnnRaggedPrefillWrapper(**manager._kwargs, **graph_kwargs)
+    return CudnnRaggedPrefillWrapper(**manager._kwargs, runs=takes_runs(config) and not graph_kwargs, **graph_kwargs)
+
+
+def takes_runs(config) -> bool:
+    """A layout-bound row whose wrapper also runs, eagerly, a layout of unequal segments."""
+    return (config or {}).get("segments") == "runs"
 
 
 @dataclass(frozen=True)
@@ -571,8 +577,9 @@ class WrapperFactory:
     ``ragged_attention`` row: ``build(manager, label, slot, row config, **graph_kwargs)``."""
 
     build: Callable[..., _RaggedPrefillBase]
-    # Runs only a layout of equal-length segments, and once captured only the
-    # layout it was first planned with (the graph bakes it in).
+    # Runs only a layout of equal-length segments (eagerly, a row's ``{"segments":
+    # "runs"}`` lifts that), and once captured only the layout it was first planned
+    # with (the graph bakes it in).
     layout_bound: bool = False
 
 
@@ -680,7 +687,7 @@ class _RaggedSelfManagerBase(_RaggedManagerBase, RaggedAttnManager):
                     choice, label, lease.slot, **self._graph_kwargs(lease.bucket),
                 )
             return wrapper
-        choice = self._row_for(spans, layout_bound_ok=True)
+        choice = self._row_for(spans, layout_bound_ok=True, eager=True)
         key = _EagerRowKey(label=label, slot=slot, impl=choice.describe())
         wrapper = self._eager_row_states.get(key)
         if wrapper is None:
@@ -690,11 +697,14 @@ class _RaggedSelfManagerBase(_RaggedManagerBase, RaggedAttnManager):
     def _build_row(self, choice: Choice, label: str, slot: int, **graph_kwargs) -> _RaggedPrefillBase:
         return WRAPPER_FACTORIES[choice.impl].build(self, label, slot, choice.config, **graph_kwargs)
 
-    def _row_for(self, spans: list[int], layout_bound_ok: bool) -> Choice:
+    def _row_for(self, spans: list[int], layout_bound_ok: bool, eager: bool = False) -> Choice:
         """The row a layout of ``spans`` runs. ``layout_bound_ok``: its wrapper may
-        bake the layout in (eager, or a captured bucket whose step fixes it)."""
+        bake the layout in (eager, or a captured bucket whose step fixes it); ``eager``:
+        a row that takes runs of unequal segments may have them."""
         choice = RAGGED_ATTENTION.row_for(self._kernel_rows, max(spans, default=0))
-        if WRAPPER_FACTORIES[choice.impl].layout_bound and not (layout_bound_ok and uniform_lengths(spans)):
+        if WRAPPER_FACTORIES[choice.impl].layout_bound and not (
+            layout_bound_ok and (uniform_lengths(spans) or (eager and takes_runs(choice.config)))
+        ):
             return DEFAULT_ROW
         return choice
 
