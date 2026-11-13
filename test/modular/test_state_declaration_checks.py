@@ -30,6 +30,7 @@ from mstar.engine.state import (
     CausalConv,
     Entry,
     GatedDeltaNet,
+    KeptWindow,
     KVEntry,
     Positions,
     Read,
@@ -812,3 +813,17 @@ def test_an_unbounded_array_digests_alike_in_two_processes():
 
 def _unbounded_digests() -> dict[str, str]:
     return declaration_digests([_array(max_len=None, reads={"r": _read(mask=Window(4), packed=False)})])
+
+
+def test_the_digest_takes_an_unbounded_array_s_start_lengths():
+    """Two processes that take their voices' lengths apart would size their bounded KVs apart."""
+    def started(lengths: range) -> Array:
+        return Array(
+            "enc_kv", nodes={"LLM"}, layers={0}, max_len=None, entry=KVEntry(heads=2, head_dim=4),
+            reads={"enc": Read(mask=Bidirectional(kept_window=True), op=Attend(q_heads=2), packed=False)},
+            start_lengths=lengths, kept_windows={"enc": KeptWindow(1, window=2, grows="sink")},
+        )
+
+    assert declaration_digests([started(range(2, 5))]) != declaration_digests([started(range(2, 6))]), (
+        "the conductor would take a worker with other start lengths for its own"
+    )
