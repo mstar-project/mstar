@@ -141,6 +141,7 @@ def _applying_chunking(build):
 
 if TYPE_CHECKING:
     from mstar.model.components.moe_parallel import MoeParallelConfig
+    from mstar.model.components.video_encode import Mp4Encoding
 
 if TYPE_CHECKING:
     from mstar.engine.state import Array, Sampler, SampleSettings, SeqShard
@@ -1217,6 +1218,15 @@ class Model(ABC):
                 pcm = pcm.float().clamp(-1, 1) * 32767
             return pcm.to(torch.int16).numpy().tobytes()
         raise ValueError(f"{type(self).__name__} has no {modality!r} output")
+
+    def mp4_encoding(self, request_kwargs: dict | None = None) -> "Mp4Encoding | None":
+        """How this model writes a request's ``video`` output: the frame rate, libx264 options
+        and odd-size padding its ``postprocess`` hands ``encode_mp4``. Declared, the API
+        server writes the request's generated audio into the same mp4 in the same pass, and
+        a loop that emits the video in pieces (``video_part``: uint8 ``[F, H, W, 3]`` frames,
+        one piece per iteration of a loop ``get_loop_caps`` counts) has them written as they
+        land. None (the default): ``postprocess`` writes the video alone."""
+        return None
 
     def postprocess_inline(
         self,

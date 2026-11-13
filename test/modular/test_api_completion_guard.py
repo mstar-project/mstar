@@ -81,6 +81,7 @@ def _preprocess_failure(model, file_paths=None, upload_dir=None):
     wt._live_requests = {}
     wt._preparing = deque()
     wt._keyed_labels = {}
+    wt.request_output_state = {}
     wt.upload_dir = upload_dir
 
     wt.in_queue.put(PreprocessInput(

@@ -1633,7 +1633,8 @@ fn images_response(chunks: Vec<ResultChunk>) -> Value {
 /// `serving_videos.create_videos`' body: each mp4, with the generated audio
 /// chunk of the same index muxed in as an AAC track (one playable file), its
 /// timestamps rescaled to the request's `fps`. A failed mux returns the video
-/// alone. Blocking.
+/// alone; a chunk marked `audio_muxed` already has its audio (the data worker
+/// wrote it in the encode). Blocking.
 fn videos_response(chunks: Vec<ResultChunk>, fps: Option<&Value>) -> Value {
     let videos = chunks.iter().filter(|c| c.modality == "video");
     let audios: Vec<&ResultChunk> = chunks.iter().filter(|c| c.modality == "audio").collect();
@@ -1654,7 +1655,8 @@ fn videos_response(chunks: Vec<ResultChunk>, fps: Option<&Value>) -> Value {
         .enumerate()
         .map(|(i, video)| {
             let mut mp4 = std::borrow::Cow::Borrowed(&video.data);
-            if let Some(audio) = audios.get(i) {
+            let muxed_already = video.metadata.get("audio_muxed").is_some_and(adapters::truthy);
+            if let Some(audio) = audios.get(i).filter(|_| !muxed_already) {
                 let muxed = fps.clone().and_then(|fps| {
                     let rate = int(&audio.metadata, "sample_rate", 48000);
                     let channels = int(&audio.metadata, "num_channels", 2);
