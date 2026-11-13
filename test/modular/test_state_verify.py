@@ -366,6 +366,7 @@ def _settled_on_two_ranks(other, monkeypatch):
 
 
 def test_tp_ranks_that_settle_alike_apply_their_count(monkeypatch):
+    """The control for `test_the_tp_compare_refuses_counts_that_differ`: it passes without the compare too."""
     assert _settled_on_two_ranks([3, 2], monkeypatch).delta() == -1, "ranks that agree apply the count"
 
 
