@@ -51,3 +51,8 @@ def test_a_prompt_past_the_original_context_keys_its_prefix_apart():
 def test_longrope_refuses_any_other_scaling(scaling):
     with pytest.raises(ValueError, match="takes scale 1.0 and no Llama 3.1"):
         Rope(longrope=_LONGROPE, **scaling)
+
+
+def test_longrope_refuses_a_factor_count_its_rotary_dim_does_not_take():
+    with pytest.raises(ValueError, match="needs 4 factors per set for rotary_dim 8, and got 8"):
+        Rope(rotary_dim=8, longrope=_LONGROPE)
