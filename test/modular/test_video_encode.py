@@ -254,3 +254,20 @@ def test_cosmos3_postprocess_encodes_a_long_clip_in_pieces(monkeypatch):
     clip = torch.from_numpy(_clip(60, 48, 64)).permute(0, 3, 1, 2).contiguous()
     frames, rate = _decoded(model.postprocess(clip, "video", {"fps": 16.0}))
     assert len(frames) == 60 and rate == 16 and sum(f.key_frame for f in frames) == 4
+
+
+def test_a_chunked_encode_without_pyav_says_so(monkeypatch, caplog):
+    """torchcodec can encode but PyAV (which muxes the pieces) is missing: the
+    fallback warns with the import error rather than passing it over."""
+    import logging
+    import sys
+
+    _torchcodec_encoder()
+    from mstar.model.cosmos3.cosmos3_model import Cosmos3Model
+
+    monkeypatch.setitem(sys.modules, "av", None)
+    model = Cosmos3Model(model_path_hf="unused", skip_weight_loading=True)
+    clip = torch.from_numpy(_clip(60, 48, 64)).permute(0, 3, 1, 2).contiguous()
+    with caplog.at_level(logging.WARNING), pytest.raises(ImportError):
+        model.postprocess(clip, "video", {"fps": 16.0})
+    assert any("torchcodec encode failed" in r.getMessage() and "av" in r.getMessage() for r in caplog.records)

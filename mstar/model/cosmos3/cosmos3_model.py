@@ -1350,7 +1350,9 @@ class Cosmos3Model(Model):
                 # decode-only build that lacks VideoEncoder), or a failed
                 # chunked encode: PyAV, whose wheel bundles FFmpeg with
                 # libx264, at the same CRF/preset, in one piece.
-                if not isinstance(exc, ImportError):
+                # torchcodec simply not installed is the expected fallback; any
+                # other failure (PyAV missing for the chunked mux included) says so
+                if not (isinstance(exc, ImportError) and (exc.name or "").startswith("torchcodec")):
                     logger.warning(
                         "Cosmos3 video encode: the torchcodec encode failed (%s: %s); encoding with PyAV",
                         type(exc).__name__, str(exc).splitlines()[0][:160] if str(exc) else "",
