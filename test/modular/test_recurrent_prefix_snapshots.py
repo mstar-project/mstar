@@ -19,7 +19,7 @@ import torch
 
 from mstar.distributed.communication import CommGroup, JointGroups
 from mstar.engine.engine import Engine
-from mstar.engine.resources.base import CachedPrefix, EngineResourceInfo, Resource
+from mstar.engine.resources.base import CachedPrefix, EngineResourceInfo
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig, opening_prefix_caches
 from mstar.engine.resources.kv.keys import chain
@@ -41,6 +41,7 @@ from mstar.graph.base import GraphNode
 from mstar.model.base import KVLabel, PrefixKeys
 from mstar.testing_utils.engine import make_engine
 from mstar.testing_utils.model import StubModel
+from mstar.testing_utils.resource import StubResource
 from mstar.validation.resources import _unskippable_resources
 
 NODE, WALK, PAGE = "llm", "prefill", 4
@@ -69,6 +70,9 @@ class _StubChains:
 
     def keyed_walks(self, label):
         return frozenset({WALK})
+
+    def bind_snapshots(self, pool):
+        del pool
 
 
 def _build(
@@ -274,15 +278,11 @@ def test_a_refused_admit_turns_the_restore_back_into_a_lease():
     assert pool._snap_refs == {pool._leases["b"].slot: 1}, "the re-probe took a second reference"
 
 
-class _StubHit(Resource):
+class _StubHit(StubResource):
     """A KV cache that holds the first ``length`` tokens of every prompt."""
 
     def __init__(self, length: int | None):
         self.length = length
-
-    @classmethod
-    def build(cls, spec, info):
-        raise NotImplementedError
 
     def resolve_cached_prefix(self, rid, node_name, graph_walk, inputs):
         return None if self.length is None else CachedPrefix("main", self.length, self.length)
@@ -338,12 +338,8 @@ class _Keyed(StubModel):
         return {WALK: GraphNode(name="LLM", input_names=["text_inputs"], outputs=[])}
 
 
-class _StubGDN(Resource):
+class _StubGDN(StubResource):
     """A linear-attention resource over the pool, which can't skip a prefix itself."""
-
-    @classmethod
-    def build(cls, spec, info):
-        raise NotImplementedError
 
 
 def _specs(prefix_slots: int) -> dict[str, NodeResourceSpec]:
@@ -514,7 +510,8 @@ def test_a_keyed_node_refuses_a_pool_whose_backend_writes_no_snapshots():
     assert problems and "'state' cannot serve a request" in problems[0], problems
 
 
-@pytest.mark.parametrize("depends_on", [set(), {"kv"}])
+# an undeclared dependency is reported by `spec_dependency_problems`, and mustn't crash this check
+@pytest.mark.parametrize("depends_on", [set(), {"kv"}, {"undeclared"}])
 def test_a_keyed_node_still_refuses_a_resource_that_cant_skip_a_prefix(depends_on):
     class _Unskippable(NodeResourceSpec):
         @property
@@ -731,6 +728,30 @@ def test_a_decode_on_a_walk_the_kv_cache_doesnt_key_saves_no_snapshot():
     pool.plan(step, ctx)
     pool.commit(step, ctx)
     assert not pool._decode and len(pool._snap_free) == 2
+
+
+def test_a_step_that_repeats_snapshots_the_length_its_replays_reach():
+    """One host step stands for five decode iterations: the state it leaves covers
+    3 + 5 tokens, so its snapshot is the second page's, not the first's."""
+    pool = _pool()
+    _reply(pool)
+    step, ctx = _step("a", 1), _ctx("a")
+    ctx.repeats = 5
+    assert pool.admit(step, ctx).ok
+    pool.plan(step, ctx)
+    pool.commit(step, ctx)
+    decode = pool._decode[("a", "main")]
+    assert decode.tokens == 8 and decode.key == pool._kv.chain_key("a", "main", 2)
+
+
+def test_a_run_ends_on_the_next_page_boundary_while_snapshots_are_on():
+    """A replay can't stop to copy the state mid-run, so a run that crossed a
+    boundary would skip that page's snapshot."""
+    pool = _pool()
+    _reply(pool)
+    assert pool.max_repeats(_step("a", 1), _ctx("a")) == 1  # at 3 of a 4-token page
+    _decode(pool, "a", 1)
+    assert pool.max_repeats(_step("a", 1), _ctx("a")) == PAGE
 
 
 def test_a_decode_snapshot_is_filed_once_the_chain_keys_its_page():

@@ -79,6 +79,11 @@ KV_PAGES_CACHED = Family(
     "running requests also hold; the cache frees the others on demand.",
     ("component", "resource"),
 )
+KV_PAGES_LENT = Family(
+    "mstar_kv_pages_lent", GAUGE,
+    "Pages of a paged KV cache that guaranteed requests lent that aren't free.",
+    ("component", "resource"),
+)
 STEP_SECONDS = Family(
     "mstar_step_seconds", HISTOGRAM,
     "Engine steps: from the later of the step's hand-off to the GPU thread and "
@@ -106,6 +111,47 @@ PREFIX_CACHE_HIT_TOKENS = Family(
     "Prompt tokens the prefix cache already held at that lookup.",
     ("component",),
 )
+KV_PREEMPTIONS = Family(
+    "mstar_kv_preemptions_total", COUNTER,
+    "Requests chosen to move to the host or drop when another request's grant, or their own, ran short of KV pages.",
+    ("component",),
+)
+KV_DROPS = Family(
+    "mstar_kv_drops_total", COUNTER,
+    "Preempted requests whose KV was dropped, to be rebuilt from their token ids and any host copies.",
+    ("component",),
+)
+KV_REBUILD_TOKENS = Family(
+    "mstar_kv_rebuild_tokens_total", COUNTER,
+    "Tokens of kept history the rebuild rows prefilled, cache hits included.",
+    ("component",),
+)
+KV_REBUILD_CACHED_PAGES = Family(
+    "mstar_kv_rebuild_cached_pages_total", COUNTER,
+    "Pages a rebuild row found in the prefix cache.",
+    ("component",),
+)
+KV_PREEMPTED_AGAIN = Family(
+    "mstar_kv_preempted_again_total", COUNTER,
+    "Requests preempted a second time.",
+    ("component",),
+)
+KV_RETURNS_PREEMPTED = Family(
+    "mstar_kv_returns_preempted_total", COUNTER,
+    "Requests preempted again before they sampled a token since they were last preempted. Only requests that "
+    "keep a rebuild log are counted.",
+    ("component",),
+)
+KV_TAKE_BACKS = Family(
+    "mstar_kv_take_backs_total", COUNTER,
+    "Preempted requests that moved so a guaranteed request could take back pages it lent.",
+    ("component",),
+)
+KV_TAKE_BACK_WAITS = Family(
+    "mstar_kv_take_back_waits_total", COUNTER,
+    "Waits by guaranteed requests to take back pages they lent, since no request holding them could move.",
+    ("component",),
+)
 COMPONENT_PENDING_STEPS = Family(
     "mstar_component_pending_steps", GAUGE,
     "Requests whose next step on this graph node is ready (its inputs arrived) "
@@ -115,8 +161,8 @@ COMPONENT_PENDING_STEPS = Family(
 )
 REBUILD_HOST_BYTES_USED = Family(
     "mstar_rebuild_host_bytes_used", GAUGE,
-    "Bytes of a worker's rebuild host pool that hold kept prompt ids, which a "
-    "request dropped from the KV cache is rebuilt from.",
+    "Bytes of a worker's rebuild host pool that hold kept prompt ids and host "
+    "copies, which a request dropped from the KV cache is rebuilt from.",
     ("component",),
 )
 REBUILD_HOST_BYTES_TOTAL = Family(
@@ -161,8 +207,10 @@ TRANSFER_SECONDS = Family(
 #: conductor sums the workers' series and forwards them in its status message.
 WORKER_FAMILIES: dict[str, Family] = {
     f.name: f for f in (
-        KV_PAGES_USED, KV_PAGES_TOTAL, KV_PAGES_CACHED, STEP_SECONDS, BATCH_SIZE,
-        PREFIX_CACHE_QUERY_TOKENS, PREFIX_CACHE_HIT_TOKENS, COMPONENT_PENDING_STEPS,
+        KV_PAGES_USED, KV_PAGES_TOTAL, KV_PAGES_CACHED, KV_PAGES_LENT, STEP_SECONDS, BATCH_SIZE,
+        PREFIX_CACHE_QUERY_TOKENS, PREFIX_CACHE_HIT_TOKENS, KV_PREEMPTIONS, KV_DROPS, KV_REBUILD_TOKENS,
+        KV_PREEMPTED_AGAIN, KV_RETURNS_PREEMPTED, KV_TAKE_BACKS, KV_TAKE_BACK_WAITS, KV_REBUILD_CACHED_PAGES,
+        COMPONENT_PENDING_STEPS,
         REBUILD_HOST_BYTES_USED, REBUILD_HOST_BYTES_TOTAL,
         TRANSFER_BYTES, TRANSFERS, TRANSFER_SECONDS,
     )

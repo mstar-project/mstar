@@ -137,7 +137,7 @@ def main() -> None:
     base_cfg["BLOCK_SIZE_K"] = QBLOCK
 
     a_q, a_s = R.per_token_group_quant_fp8(x, QBLOCK)
-    ct = R._tl_compute_type(x.dtype)
+    ct = R.tl_compute_type(x.dtype)
     c1 = torch.empty(T * K, 2 * I, device=dev, dtype=x.dtype)
     c2 = torch.empty(T * K, I, device=dev, dtype=x.dtype)
     c3 = torch.empty(T, K, H, device=dev, dtype=x.dtype)

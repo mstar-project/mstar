@@ -26,11 +26,13 @@ os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 import torch
 import torch.nn.functional as F
 
+from mstar.distributed.communication import CommGroup
 from mstar.engine.resources import AdmitOutcome, StepContext, StepRunner
 from mstar.engine.resources.base import AttentionResource
 from mstar.engine.resources.kv.plan import group_by_plan_label
-from mstar.model.cosmos3.submodules import ATTN, KV_CACHE, LATENT_DTYPE
-from mstar.model.submodule_base import ModelInputsFromEngine
+from mstar.engine.resources.sequence_shard import SequenceShard
+from mstar.model.cosmos3.submodules import ATTN, COND_LABEL, KV_CACHE, LATENT_DTYPE, SEQ_SHARD, UNCOND_LABEL
+from mstar.model.submodule_base import ModelInputsFromEngine, engine_step
 
 PROMPT = "A red cube resting on a polished wooden table, soft daylight."
 # Parity checks here are resolution-independent; 256x256 keeps them quick. The
@@ -51,7 +53,8 @@ class _SdpaResources:
     backed by stored tensors + sdpa (the same kernel as the fused pipeline).
 
     Two objects, matching what the node declares: a ``kv`` that holds each
-    layer's understanding K/V and a ``attn`` that attends over it. Prefill
+    layer's understanding K/V and a ``attn`` that attends over it (and the
+    node's sequence shard, on one rank, which every step declares). Prefill
     writes its K/V pending; the runner's ``commit`` promotes it, and every
     denoise step re-reads it.
 
@@ -65,9 +68,10 @@ class _SdpaResources:
     def __init__(self):
         self.kv = _SdpaKV()
         self.attn = _SdpaAttention(self.kv)
+        self.shard = SequenceShard((COND_LABEL, UNCOND_LABEL), 0, None, 0, CommGroup.trivial())
 
     def as_dict(self):
-        return {KV_CACHE: self.kv, ATTN: self.attn}
+        return {KV_CACHE: self.kv, ATTN: self.attn, SEQ_SHARD: self.shard}
 
     def bind(self, module):
         """Bind these into a bare transformer, the way
@@ -296,7 +300,7 @@ def _forward_step(
         step_fwds = cg_runner.step_metadata(lease, real_ids, step_fwds)
         step_ids = cg_runner.step_ids(lease, real_ids)
 
-    step = dit.declare_step(walk, step_ids, inputs, slot_lease=lease)
+    step = engine_step(dit, walk, step_ids, inputs, slot_lease=lease)
     if step is not None:
         step.set_ctx(StepContext(
             request_ids=tuple(step_ids), graph_walk=walk,
@@ -1101,7 +1105,7 @@ def _run_accelerator_graph_denoise(ctx):
         submodule_name="dit", submodule=dit, resources=resources,
         step_runner=StepRunner(resources), device=dev,
         autocast_dtype=None if dit.disable_autocast else model.get_autocast_dtype(),
-        joint_comm_group=groups, num_slots=1,
+        joint_comm_group=groups, num_slots=1, head_shards=groups.world_size,
     )
     cg_runner.warmup_and_capture()
     assert cg_runner.any_graphs, "no CUDA graph captured for cosmos3 image_gen"

@@ -441,11 +441,11 @@ def _submit(api, adapter, req, window: Window, streaming: bool, inflight: set[st
 async def _collect(api, window: Window, inflight: set[str], raw_request=None) -> str | None:
     """The window's raw text, or None once the client is gone (collect_results
     aborted the window and returned nothing). collect_results releases the
-    request on every path but cancellation, which the caller's ``_release``
-    covers."""
+    request on completion, HTTP errors, and cancellation; ``_release`` covers
+    windows whose collection never started."""
     try:
         chunks = await api.collect_results(window.request_id, raw_request)
-    except HTTPException:
+    except (HTTPException, asyncio.CancelledError):
         inflight.discard(window.request_id)
         raise
     inflight.discard(window.request_id)
@@ -676,7 +676,8 @@ async def create_transcription(
             windows = [w async for w in _sequential(api, adapter, req, planner, inflight, raw_request)]
         duration = planner.duration
     finally:
-        # a read cancelled before its tail finished leaves the tail in inflight for _release
+        # Started reads release themselves on cancellation; _release handles
+        # tails whose read task never started.
         for read in tail_reads.values():
             read.cancel()
         await asyncio.gather(*tail_reads.values(), return_exceptions=True)

@@ -100,22 +100,18 @@ def test_kv_preplan_still_promotes_for_its_own_step() -> None:
 # the whole step, so it drops the stage on every resource before a foreign
 # step admits or plans.
 
-from mstar.engine.resources.base import Resource  # noqa: E402
 from mstar.engine.resources.runner import StepRunner  # noqa: E402
 from mstar.engine.resources.step import ResourceStep, SlotLease, SubmoduleStep  # noqa: E402
+from mstar.testing_utils.resource import StubResource  # noqa: E402
 
 
-class _Blind(Resource):
+class _Blind(StubResource):
     """Promotes a staged pre-plan into whichever step calls `plan` next."""
 
     def __init__(self, deps: tuple[str, ...] = ()):
         self._deps = set(deps)
         self._preplanned = False
         self.events: list[str] = []
-
-    @classmethod
-    def build(cls, spec, info):  # pragma: no cover - not built from a spec here
-        raise NotImplementedError
 
     def depends_on(self):
         return set(self._deps)
@@ -248,15 +244,11 @@ def test_admit_of_a_foreign_step_still_sweeps_everything() -> None:
     assert attn.events == ["pre_admit", "pre_plan", "clear", "admit"]
 
 
-class _RefusesOnce(Resource):
+class _RefusesOnce(StubResource):
     """Admits after KV, doesn't pre-plan, and refuses its first admit."""
 
     def __init__(self):
         self.refused = False
-
-    @classmethod
-    def build(cls, spec, info):  # pragma: no cover - not built from a spec here
-        raise NotImplementedError
 
     def depends_on(self):
         return {"kv"}

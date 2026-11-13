@@ -39,7 +39,6 @@ from mstar.model.components.diffusion.qwen3.submodule import TEXT_EMBEDS, Qwen3T
 from mstar.model.components.quant_linear import BF16, StepDtypes
 from mstar.model.submodule_base import NodeInputs, NodeSubmodule
 from mstar.model.z_image.components.transformer import (
-    ATTENTION_SPANS,
     CAPTION_SPAN,
     IMAGE_SPAN,
     MAIN_SPAN,
@@ -47,7 +46,7 @@ from mstar.model.z_image.components.transformer import (
     patchify_image,
     unpatchify_image,
 )
-from mstar.model.z_image.config import SEQ_MULTIPLE, ZImageConfig
+from mstar.model.z_image.config import CAPTION_TOKENS, IMAGE_TOKENS, JOINT_TOKENS, SEQ_MULTIPLE, ZImageConfig
 
 logger = logging.getLogger(__name__)
 
@@ -122,14 +121,14 @@ class ZImageDenoiseSubmodule(DenoiseLoopSubmodule):
     PREFETCH_SEEDS = True
 
     def __init__(
-        self, transformer: nn.Module, config: ZImageConfig, *, loop_name: str, attn_resource_key: str | None,
+        self, transformer: nn.Module, config: ZImageConfig, *, loop_name: str,
         compile_transformer: bool = True, compile_eager_rounding: bool = True,
         compile_exact_ops: bool | Sequence[str] = False, max_batch_size: int = 8,
         capture_buckets=(), capture_batch_sizes=(1, 2, 4, 8),
         step_dtypes: StepDtypes | None = None, bf16_transformer: nn.Module | None = None,
     ):
         super().__init__(
-            loop_name=loop_name, max_batch_size=max_batch_size, attn_resource_key=attn_resource_key,
+            loop_name=loop_name, max_batch_size=max_batch_size,
             capture_buckets=capture_buckets, capture_batch_sizes=capture_batch_sizes, step_dtypes=step_dtypes,
         )
         self.transformer = transformer
@@ -150,12 +149,10 @@ class ZImageDenoiseSubmodule(DenoiseLoopSubmodule):
     def bucket_key_for(self, fwd_info: CurrentForwardPassInfo) -> ZShape:
         return shape_from_metadata(self.config, fwd_info.step_metadata)
 
-    def schedule_for(self, fwd_info, bucket_key: ZShape) -> FlowMatchSchedule:
-        return FlowMatchSchedule.build(
-            self.config.scheduler, int(fwd_info.step_metadata["num_inference_steps"]), bucket_key.image_tokens,
-        )
+    def schedule_for(self, walk: str, num_steps: int, bucket_key: ZShape) -> FlowMatchSchedule:
+        return FlowMatchSchedule.build(self.config.scheduler, int(num_steps), bucket_key.image_tokens)
 
-    def seed_latents(self, fwd_info, bucket_key: ZShape, generator: torch.Generator) -> torch.Tensor:
+    def seed_latents(self, bucket_key: ZShape, generator: torch.Generator) -> torch.Tensor:
         h, w = bucket_key.grid
         patch = self.config.transformer.patch_size
         # randn_tensor parity: fp32 on the CPU generator, in the unpacked [C, H/8, W/8] layout
@@ -174,16 +171,11 @@ class ZImageDenoiseSubmodule(DenoiseLoopSubmodule):
 
     def attention_segments(self, bucket_key: ZShape):
         # the refiners attend over the padded image tokens / the caption alone, the main layers over both
-        return (
-            (IMAGE_SPAN, bucket_key.image_tokens_padded),
-            (CAPTION_SPAN, bucket_key.cap_len),
-            (MAIN_SPAN, bucket_key.total_tokens),
-        )
-
-    def _ragged_spans(self):
-        if self.ragged_for(MAIN_SPAN) is None:
-            return None
-        return {span: self.ragged_for(span) for span in ATTENTION_SPANS}
+        return {
+            IMAGE_TOKENS: ((IMAGE_SPAN, bucket_key.image_tokens_padded),),
+            CAPTION_TOKENS: ((CAPTION_SPAN, bucket_key.cap_len),),
+            JOINT_TOKENS: ((MAIN_SPAN, bucket_key.total_tokens),),
+        }
 
     def capture_request_inputs(self, bucket_key: ZShape, device) -> dict[str, torch.Tensor]:
         tcfg = self.config.transformer
@@ -223,7 +215,7 @@ class ZImageDenoiseSubmodule(DenoiseLoopSubmodule):
         transformer = self.bf16_transformer if self.step_dtype == BF16 else self.transformer
         out = transformer(
             tokens, cond[TEXT_EMBEDS], cond[CAP_PAD_MASK], layout["image_pad_mask"].expand(tokens.shape[0], -1),
-            t_cond, layout["image_freqs"], layout["caption_freqs"], ragged=self._ragged_spans(),
+            t_cond, layout["image_freqs"], layout["caption_freqs"],
         )
         channels = self.config.transformer.in_channels
         velocity = -torch.stack([unpatchify_image(row, bucket_key.grid, patch, channels) for row in out.float()])

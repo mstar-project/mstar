@@ -16,6 +16,7 @@ import io
 import json
 import math
 import urllib.error
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -26,13 +27,19 @@ import yaml
 from mstar.api_server.openai import adapters
 from mstar.api_server.openai.protocol import SpeechRequest
 from mstar.engine.accelerator_graph_config import PiecewiseBatchedConfig, PiecewiseCallInputs, PiecewiseCaptureShape
+from mstar.engine.engine import Engine
+from mstar.engine.resources.step import StepContext
+from mstar.engine.state import host
+from mstar.engine.state.adapters import StateSetup, kv_layouts, node_resources
 from mstar.model.registry import HF_MODELS, get_model_class
-from mstar.model.submodule_base import InputMetadata
+from mstar.model.submodule_base import ARNodeInputs, InputMetadata, engine_step
 from mstar.model.voxcpm2.components.audio_vae import AudioVAE, CausalResidualUnit, decoder_receptive_field_frames
 from mstar.model.voxcpm2.components.minicpm import RopeTable, longrope_cos_sin
 from mstar.model.voxcpm2.components.talker import VoxCPM2Generator
 from mstar.model.voxcpm2.config import (
     AUDIO_START_TOKEN,
+    BASE_KV,
+    CFG_KEY,
     MIN_LEN_KEY,
     MODE_REF_CONTINUATION,
     MODE_REFERENCE,
@@ -42,6 +49,8 @@ from mstar.model.voxcpm2.config import (
     REF_AUDIO_END_TOKEN,
     REF_AUDIO_START_TOKEN,
     REF_DIGEST_KEY,
+    TALKER_DECODE_METADATA,
+    TALKER_STEP,
     VoxCPM2Config,
 )
 from mstar.model.voxcpm2.submodules import (
@@ -305,7 +314,8 @@ def _request(model, text: str, clip: torch.Tensor | None = None, **kwargs) -> tu
     as the data worker and the conductor build them."""
     modalities = ["text", "audio"] if clip is not None else ["text"]
     tensors = {"audio_inputs": [clip]} if clip is not None else None
-    edges, metadata = model.process_prompt(text, modalities, ["audio"], tensors=tensors, **kwargs)
+    prompt = model.process_prompt(text, modalities, ["audio"], tensors=tensors, **kwargs)
+    edges, metadata = prompt.new_input_tensors, prompt.metadata
     if clip is not None:
         edges = {**edges, "audio_inputs": [clip]}
     return edges, dict(model.walk_plan("Talker", modalities, ["audio"], {}, metadata)[0].step_metadata)
@@ -315,16 +325,22 @@ def _info(rid: str, seed: int = 0, step_metadata: dict | None = None) -> SimpleN
     return SimpleNamespace(rid_handle=rid, request_id=rid, random_seed=seed, step_metadata=step_metadata or {})
 
 
+def _decode_info(rid: str, seed: int, prefill_metadata: dict) -> SimpleNamespace:
+    """A decode step's info, with only the keys the walk plan's decode step carries."""
+    return _info(rid, seed, {key: prefill_metadata[key] for key in TALKER_DECODE_METADATA})
+
+
 def _layout(metadata: dict) -> list:
     return [metadata[PROMPT_MODE_KEY], metadata[PATCH_BUDGET_KEY], metadata[MIN_LEN_KEY]]
 
 
 def test_process_prompt_builds_each_reference_mode(model):
-    zero, zero_meta = model.process_prompt("hello  world\n", ["text"], ["audio"], seed=3, cfg_value=1.5)
+    prompt = model.process_prompt("hello  world\n", ["text"], ["audio"], seed=3, cfg_value=1.5)
+    zero, zero_meta = prompt.new_input_tensors, prompt.metadata
     assert zero["text_inputs"][0].tolist() == [10, 11, AUDIO_START_TOKEN]
     assert _layout(zero_meta) == [MODE_ZERO_SHOT, 2 * 6 + 10, 2] and zero_meta[REF_DIGEST_KEY] is None
-    assert zero["gen_params"][0].tolist() == [1.5]
-    assert set(zero) == {"text_inputs", "gen_params"}
+    assert zero_meta[CFG_KEY] == 1.5
+    assert set(zero) == {"text_inputs"}
 
     design = _prompt(model, "hello", ["text"], ["audio"], instructions="warm")
     assert design["text_inputs"][0].tolist() == [15, AUDIO_START_TOKEN]  # "(warm)hello"
@@ -333,30 +349,31 @@ def test_process_prompt_builds_each_reference_mode(model):
     assert cjk["text_inputs"][0].tolist() == [13, 14, AUDIO_START_TOKEN]  # split like the reference
 
     clip = torch.zeros(16000)  # 1 s: 7 patches of 2560 samples
-    _, ref_meta = model.process_prompt("hello", ["text", "audio"], ["audio"], tensors={"audio_inputs": [clip]})
+    ref_meta = model.process_prompt("hello", ["text", "audio"], ["audio"], tensors={"audio_inputs": [clip]}).metadata
     assert ref_meta[PROMPT_MODE_KEY] == MODE_REFERENCE
     cont = model.process_prompt(
         "hello", ["text", "audio"], ["audio"], tensors={"audio_inputs": [clip]}, ref_text="world "
     )
-    tensors, metadata = cont
+    tensors, metadata = cont.new_input_tensors, cont.metadata
     assert tensors["text_inputs"][0].tolist() == [11, 10, AUDIO_START_TOKEN]  # transcript first
     # transcript and target are tokenized as one string, with no separator added, as the reference does
-    joined, _ = model.process_prompt(
+    joined = model.process_prompt(
         "hello", ["text", "audio"], ["audio"], tensors={"audio_inputs": [clip]}, ref_text="world"
-    )
+    ).new_input_tensors
     assert joined["text_inputs"][0].tolist() == [3, AUDIO_START_TOKEN]  # "worldhello"
     # max patches follow the target text only
     digest = hashlib.blake2b(clip.numpy().tobytes(), digest_size=16).hexdigest()
-    assert {k: v for k, v in metadata.items() if k != "kv_layout"} == {
+    assert {k: v for k, v in metadata.items() if k != "state_layout"} == {
         "stream_lead_items": {STREAM_EDGE: 3},
         PATCH_BUDGET_KEY: 16,
         PROMPT_MODE_KEY: MODE_REF_CONTINUATION,
         MIN_LEN_KEY: 2,
         REF_DIGEST_KEY: digest,
+        CFG_KEY: model.config.cfg_value,
     }
     # every key the conductor reads back is one the data worker strips from the client
     for meta in (zero_meta, ref_meta, metadata):
-        assert set(meta) - {"kv_layout", "stream_lead_items"} <= set(model.INTERNAL_KWARGS)
+        assert set(meta) - {"state_layout", "stream_lead_items"} <= set(model.INTERNAL_KWARGS)
     # only a continuation's stream leads with prompt patches
     assert "stream_lead_items" not in zero_meta and "stream_lead_items" not in ref_meta
 
@@ -390,7 +407,7 @@ def test_patch_cap_reads_the_standard_and_model_knobs_in_one_order(model, kwargs
     """``max_new_tokens``, then the standard ``max_output_tokens``, then ``max_len``,
     the same in the conductor's cap and in the prompt's patch budget."""
     assert model.get_max_output_tokens(**kwargs) == cap
-    _, metadata = model.process_prompt("hello world", ["text"], ["audio"], **kwargs)
+    metadata = model.process_prompt("hello world", ["text"], ["audio"], **kwargs).metadata
     assert metadata[PATCH_BUDGET_KEY] == model.config.max_patches(2, cap)
 
 
@@ -399,9 +416,11 @@ def test_a_one_patch_request_ends_after_prefill(model, budget, done):
     """Prefill has no loop for the Talker's stop to end, so a request whose
     budget the prefill patch spends goes straight to done instead of a decode
     step that would only veto itself."""
-    kwargs = {PATCH_BUDGET_KEY: budget, PROMPT_MODE_KEY: MODE_ZERO_SHOT}
+    kwargs = {PATCH_BUDGET_KEY: budget, PROMPT_MODE_KEY: MODE_ZERO_SHOT, MIN_LEN_KEY: 2, CFG_KEY: 2.0}
     plan = model.walk_plan("Talker", ["text"], ["audio"], {}, kwargs)
     assert [step.walk for step in plan] == ["talker_prefill"] + ([] if done else ["talker_decode"])
+    # the decode loop reads its patch budget, min_len and cfg_value off step metadata
+    assert done or dict(plan[1].step_metadata) == {PATCH_BUDGET_KEY: budget, MIN_LEN_KEY: 2, CFG_KEY: 2.0}
 
 
 @pytest.mark.parametrize("budget", [2, 5])
@@ -410,16 +429,16 @@ def test_talker_caps_decode_where_its_stop_check_ends_it(model, budget):
     iteration fewer than the budget, since the prefill's patch counts."""
     talker, _, _ = _talker(model)
     edges, meta = _request(model, "hello world", max_new_tokens=budget)
-    info = _info("a", 5, meta)
+    infos = {"talker_prefill": _info("a", 5, meta), "talker_decode": _decode_info("a", 5, meta)}
     patch = torch.zeros(model.config.patch_size, model.config.feat_dim)
     walk, inputs, iterations = "talker_prefill", edges, 0
     while True:
-        prepared = talker.prepare_inputs(walk, info, inputs)
+        prepared = talker.prepare_inputs(walk, infos[walk], inputs)
         # the stop head never fires, so only the budget ends decode
         out = {"latent_patch": [patch], "stop_flag": [torch.tensor([0, prepared.kwargs["step"]])]}
-        talker.postprocess("a", info, out)
+        _commit(talker, walk, ["a"], [prepared])
         inputs = {"latent_patch": out["latent_patch"]}
-        stop = talker.check_stop("a", info, out)
+        stop = talker.check_stop("a", infos[walk], out)
         if walk == "talker_decode":
             iterations += 1
             if stop:
@@ -437,7 +456,7 @@ def test_process_prompt_lays_out_the_rows_the_talker_prefill_writes(model, ref_t
     from mstar.engine.resources.kv.config import refuse_undeclared_labels
     from mstar.validation.resources import _undeclared_pools, _unknown_prefix_walks
 
-    specs = model.get_node_resources()
+    specs = node_resources(model)
     assert list(_unknown_prefix_walks(model)) == []
     assert list(_undeclared_pools(specs, model)) == []
 
@@ -447,7 +466,7 @@ def test_process_prompt_lays_out_the_rows_the_talker_prefill_writes(model, ref_t
     kwargs = {} if clip is None else {"ref_text": ref_text}
     out = model.process_prompt("hello world", modalities, ["audio"], tensors=tensors, **kwargs)
     meta = out.metadata
-    layout = meta["kv_layout"]
+    layout = kv_layouts(model.declare_state(), meta["state_layout"], {})
     assert set(layout) == {"base_kv", "res_kv"} and layout["base_kv"] == layout["res_kv"]
     (span,) = layout["base_kv"]["main"].spans
     walk = "talker_prefill" if clip is None else "talker_prefill_clone"
@@ -539,7 +558,7 @@ def test_shipped_cap_fits_both_caches_at_the_full_context(model):
     assert cap == VoxCPM2Model.DEFAULT_MAX_CONCURRENT
     model.validate_config_yaml(deployment, "voxcpm2.yaml")
     per_request = -(-model.config.max_length // 128)
-    for spec in model.get_node_resources():
+    for spec in node_resources(model):
         if hasattr(spec.config, "max_num_pages"):
             assert spec.config.max_num_pages == 1 + cap * per_request
     with pytest.raises(ValueError, match=rf"{cap + 1} concurrent requests .*resources\.base_kv"):
@@ -560,9 +579,13 @@ def test_max_concurrent_requests_must_be_a_positive_int(model, cap):
 
 
 def test_no_request_cap_is_a_warning(model, caplog):
+    """Neither LM cache has host pages, so nothing is offloaded to admit a request past them."""
     with caplog.at_level("WARNING"):
         model.validate_config_yaml({}, "voxcpm2.yaml")
     assert "sets no max_concurrent_requests" in caplog.text
+    assert "one without stalls until requests time out" in caplog.text, "the warning would promise an offload"
+    caches = [spec.config for spec in node_resources(model) if hasattr(spec.config, "cpu_offload_pages")]
+    assert [cache.cpu_offload_pages for cache in caches] == [0, 0]
 
 
 def test_build_prompt_matches_the_reference_layout():
@@ -578,15 +601,18 @@ def test_build_prompt_matches_the_reference_layout():
 
 
 def test_walk_plan_clones_through_the_ref_encoder(model):
-    _, metadata = model.process_prompt(
+    metadata = model.process_prompt(
         "hello", ["text", "audio"], ["audio"], tensors={"audio_inputs": [torch.zeros(16000)]}
-    )
+    ).metadata
     talker = model.walk_plan("Talker", ["text", "audio"], ["audio"], {}, {**metadata, "unrelated": 1})
     assert [step.walk for step in talker] == ["talker_prefill_clone", "talker_decode"]
     # the prompt facts ride step metadata to the Talker partition's nodes
-    keys = (PATCH_BUDGET_KEY, PROMPT_MODE_KEY, MIN_LEN_KEY, REF_DIGEST_KEY)
-    assert [dict(step.step_metadata) for step in talker] == [{key: metadata[key] for key in keys}, {}]
-    _, zero_shot = model.process_prompt("hello", ["text"], ["audio"])
+    keys = (PATCH_BUDGET_KEY, PROMPT_MODE_KEY, MIN_LEN_KEY, REF_DIGEST_KEY, CFG_KEY)
+    decode = (PATCH_BUDGET_KEY, MIN_LEN_KEY, CFG_KEY)
+    assert [dict(step.step_metadata) for step in talker] == [
+        {key: metadata[key] for key in keys}, {key: metadata[key] for key in decode},
+    ]
+    zero_shot = model.process_prompt("hello", ["text"], ["audio"]).metadata
     plain = model.walk_plan("Talker", ["text"], ["audio"], {}, zero_shot)
     assert [step.walk for step in plain] == ["talker_prefill", "talker_decode"]
     assert [step.walk for step in model.walk_plan("VAEDecoder", ["text"], ["audio"], {}, zero_shot)] == ["vae_chunk"]
@@ -597,9 +623,9 @@ def test_the_talker_walk_follows_the_prompt_mode_not_input_modalities(model, ref
     """``/generate`` takes ``input_modalities`` from the client: a clip sent with
     ``["text"]`` builds a cloning prompt, so the conductor must run the
     RefEncoder walk for it too, or the Talker has no reference latents."""
-    _, metadata = model.process_prompt(
+    metadata = model.process_prompt(
         "hello", ["text"], ["audio"], tensors={"audio_inputs": [torch.zeros(16000)]}, ref_text=ref_text
-    )
+    ).metadata
     assert metadata[PROMPT_MODE_KEY] != MODE_ZERO_SHOT
     prefill = model.walk_plan("Talker", ["text"], ["audio"], {}, metadata)[0]
     assert prefill.walk == "talker_prefill_clone"
@@ -727,29 +753,47 @@ def test_load_audio_refuses_non_audio_without_naming_the_path(model, tmp_path, p
 def _talker(model, timesteps: int = 4):
     generator = _random_generator(model.config)
     talker = TalkerSubmodule(generator, model.config, timesteps)
-    plan, reset = bind_dense_resources(generator)
+    plan, reset = bind_dense_resources(talker)
     return talker, plan, reset
+
+
+def _commit(talker, walk: str, rids: list, prepared: list) -> None:
+    """What exec does to the Talker's host fields: declare the step over the prepared rows and commit it. The
+    fields open as a request's handle is minted, which these tests do on its first commit."""
+    fields = talker.progress.host_fields
+    for rid in rids:
+        if not fields.is_open(rid):
+            fields.open(rid)
+    step = talker.declare_step(walk, rids, prepared)
+    step.set_ctx(StepContext(tuple(rids), walk, 0, False))
+    talker.progress.begin_step(step)
+    talker.progress.commit_step(step)
+    talker.progress.end_step(step)
 
 
 def _run(talker, plan, requests: dict, steps: int, trace: dict | None = None, runners: dict | None = None):
     """Prefill every request together, then ``steps - 1`` batched decode steps,
-    each postprocessed as the worker does. ``trace`` collects each decode
-    step's index and noise per request."""
+    each committed as exec does. ``trace`` collects each decode step's index and
+    noise per request."""
     rids = list(requests)
     infos = {rid: _info(rid, seed, meta) for rid, ((_, meta), seed) in requests.items()}
+    decode_infos = {rid: _decode_info(rid, seed, meta) for rid, ((_, meta), seed) in requests.items()}
     engine = SimpleNamespace(request_ids=rids, piecewise_runners=runners or {}, captured=False)
     prepared = [talker.prepare_inputs("talker_prefill", infos[rid], requests[rid][0][0]) for rid in rids]
     plan([p.input_seq_len for p in prepared])
     out = talker.forward_batched("talker_prefill", engine, **talker.preprocess("talker_prefill", engine, prepared))
     patches = {rid: [out[rid]["latent_patch"][0]] for rid in rids}
+    _commit(talker, "talker_prefill", rids, prepared)
     for rid, p in zip(rids, prepared, strict=True):
         talker.postprocess(rid, infos[rid], out[rid], inputs=p)
     for _ in range(steps - 1):
         prepared = [
-            talker.prepare_inputs("talker_decode", infos[rid], {"latent_patch": [patches[rid][-1]]}) for rid in rids
+            talker.prepare_inputs("talker_decode", decode_infos[rid], {"latent_patch": [patches[rid][-1]]})
+            for rid in rids
         ]
         plan([1] * len(rids))
         out = talker.forward_batched("talker_decode", engine, **talker.preprocess("talker_decode", engine, prepared))
+        _commit(talker, "talker_decode", rids, prepared)
         for rid, p in zip(rids, prepared, strict=True):
             talker.postprocess(rid, infos[rid], out[rid], inputs=p)
             patches[rid].append(out[rid]["latent_patch"][0])
@@ -864,39 +908,27 @@ def test_talker_stops_like_the_reference_loop(model):
     """``i > min_len and stop`` on the step that produced patch i (kept), or the patch budget."""
     talker, _, _ = _talker(model)
     request, meta = _request(model, "hello", max_new_tokens=6)
-    talker.prepare_inputs("talker_prefill", _info("r", 0, meta), request)
+    info = _info("r", 0, meta)
+    talker.prepare_inputs("talker_prefill", info, request)
 
     def step(flag: int, index: int) -> set[str]:
-        return talker.check_stop("r", None, {"stop_flag": [torch.tensor([flag, index])]})
+        return talker.check_stop("r", info, {"stop_flag": [torch.tensor([flag, index])]})
 
     assert [step(1, i) for i in range(3)] == [set(), set(), set()]  # i = 0, 1, 2: not past min_len 2
     assert step(1, 3) == {TALKER_LOOP}
     assert [step(0, i) for i in range(6)][-2:] == [set(), {TALKER_LOOP}]  # budget of 6 patches
 
 
-def test_talker_stop_judges_each_step_by_its_own_patch_index(model):
-    """A speculative step postprocessed before the previous step's stop check
-    moves ``generated`` on; the check still counts the patches of its own step."""
-    talker, _, _ = _talker(model)
-    request, meta = _request(model, "hello", max_new_tokens=6)
-    talker.prepare_inputs("talker_prefill", _info("r", 0, meta), request)
-    for _ in range(6):
-        talker.postprocess("r", None, {"stop_flag": [torch.tensor([0, 0])]})
-    assert talker.check_stop("r", None, {"stop_flag": [torch.tensor([0, 4])]}) == set()  # patch 5 of 6
-    assert talker.check_stop("r", None, {"stop_flag": [torch.tensor([1, 2])]}) == set()  # i = 2: not past min_len
-
-
 def test_talker_vetoes_steps_past_the_patch_budget(model):
     talker, _, _ = _talker(model)
     request, meta = _request(model, "hello", max_new_tokens=2)
     info = _info("r", 0, meta)
-    talker.prepare_inputs("talker_prefill", info, request)
-    talker.postprocess("r", None, {"stop_flag": [torch.tensor([0, 0])]})
+    _commit(talker, "talker_prefill", ["r"], [talker.prepare_inputs("talker_prefill", info, request)])
     patch = torch.zeros(4, 8)
-    first = talker.prepare_inputs("talker_decode", info, {"latent_patch": [patch]})
+    first = talker.prepare_inputs("talker_decode", _decode_info("r", 0, meta), {"latent_patch": [patch]})
     assert first is not None and first.kwargs["step"] == 1
-    talker.postprocess("r", None, {"stop_flag": [torch.tensor([0, 1])]})
-    assert talker.prepare_inputs("talker_decode", info, {"latent_patch": [patch]}) is None
+    _commit(talker, "talker_decode", ["r"], [first])
+    assert talker.prepare_inputs("talker_decode", _decode_info("r", 0, meta), {"latent_patch": [patch]}) is None
 
 
 def test_talker_reprepares_a_refused_step_with_the_same_index_and_noise(model):
@@ -905,29 +937,195 @@ def test_talker_reprepares_a_refused_step_with_the_same_index_and_noise(model):
     talker, _, _ = _talker(model)
     request, meta = _request(model, "hello", max_new_tokens=2)
     info = _info("r", 0, meta)
-    talker.prepare_inputs("talker_prefill", info, request)
-    talker.postprocess("r", None, {"stop_flag": [torch.tensor([0, 0])]})
+    _commit(talker, "talker_prefill", ["r"], [talker.prepare_inputs("talker_prefill", info, request)])
     patch = torch.zeros(4, 8)
-    refused = talker.prepare_inputs("talker_decode", info, {"latent_patch": [patch]})
-    retry = talker.prepare_inputs("talker_decode", info, {"latent_patch": [patch]})
+    refused = talker.prepare_inputs("talker_decode", _decode_info("r", 0, meta), {"latent_patch": [patch]})
+    retry = talker.prepare_inputs("talker_decode", _decode_info("r", 0, meta), {"latent_patch": [patch]})
     assert retry is not None and retry.kwargs["step"] == 1
     assert torch.equal(retry.tensor_inputs["noise"], refused.tensor_inputs["noise"])
 
 
-def test_talker_noise_is_drawn_once_per_step(model):
+def test_talker_refuses_a_decode_step_with_no_prefill_committed(model):
+    """A request's fields open at their zero values, so the first decode step of a request whose prefill never
+    committed would take draw 0, which is the prefill's noise."""
     talker, _, _ = _talker(model)
-    state = talker.request_state("n")
-    state.add_all(generator=torch.Generator().manual_seed(4), noise={}, drawn=0)
-    first, second = talker._noise(state, 0), talker._noise(state, 1)
-    assert talker._noise(state, 1) is second  # a re-prepared step reuses its draw
-    expected = torch.Generator().manual_seed(4)
-    torch.testing.assert_close(first, torch.randn((1, 8, 4), generator=expected)[0])
-    torch.testing.assert_close(second, torch.randn((1, 8, 4), generator=expected)[0])
+    _, meta = _request(model, "hello")
+    talker.progress.host_fields.open("r")
+    with pytest.raises(KeyError, match="no prefill committed"):
+        talker.prepare_inputs("talker_decode", _decode_info("r", 0, meta), {"latent_patch": [torch.zeros(4, 8)]})
+
+
+def _committed(talker, rid) -> dict:
+    return dict(host(talker.progress, rid, "main", 0))
+
+
+def test_talker_host_writes_rely_on_exec_declaring_again_after_a_pre_plan(model):
+    """A pre-plan declares over the bucket's template rows, which no request prepared and so write nothing. Were exec
+    to run that step instead of declaring its own, ``generated`` would never move and every decode step would draw the
+    same noise again."""
+    talker, _, _ = _talker(model)
+    [graph] = [
+        g for g in talker.get_accelerator_graph_configs(torch.device("cpu")) if g.capture_graph_walk == "talker_decode"
+    ]
+    request, meta = _request(model, "hello")
+    info = _info("r", 0, meta)
+    _commit(talker, "talker_prefill", ["r"], [talker.prepare_inputs("talker_prefill", info, request)])
+    before = _committed(talker, "r")
+
+    rows = graph.get_node_inputs(2, 0)
+    runner = SimpleNamespace(declare_inputs_for=lambda lease: rows, step_ids=lambda lease, rids: [*rids, "pad"])
+    context = StepContext(("r",), "talker_decode", 0, False)
+    batch = SimpleNamespace(node_name="Talker", inputs=None, request_ids=["r"],
+                            per_request_info={"r": _decode_info("r", 0, meta)}, step=None,
+                            step_context=context)
+    engine = Engine.__new__(Engine)
+    # a refused pre-admit ends the pre-plan with everything this test reads already decided
+    reused = []
+    engine._runner = SimpleNamespace(pre_admit=lambda step: reused.append(batch.step) or SimpleNamespace(ok=False))
+    engine.reset_pre_plan_for_batch = lambda batch: None
+    # no runners, so that `step_is_input_free` alone decides
+    mgmt = SimpleNamespace(submodule=talker, piecewise_runners={})
+    assert engine._pre_plan_for_batch(batch, mgmt, runner, object()) is False
+    assert reused == [None], "exec reuses a pre-planned step only for a walk with no input in its declaration"
+    assert _committed(talker, "r") == before, "a pre-plan writes nothing"
+
+    prepared = talker.prepare_inputs("talker_decode", _decode_info("r", 0, meta), {"latent_patch": [torch.zeros(4, 8)]})
+    step = engine_step(talker, graph_walk="talker_decode", request_ids=["r", "pad"], inputs=[prepared, rows[1]])
+    context.is_preplan = False
+    step.set_ctx(context)
+    step.begin_calls()
+    step.commit_calls()
+    step.end_calls()
+    assert _committed(talker, "r") == {"generated": before["generated"] + 1}
+
+
+def test_talker_declaring_a_step_twice_advances_it_once(model):
+    talker, _, _ = _talker(model)
+    request, meta = _request(model, "hello")
+    info = _info("r", 0, meta)
+    prepared = talker.prepare_inputs("talker_prefill", info, request)
+    talker.declare_step("talker_prefill", ["r"], [prepared])
+    _commit(talker, "talker_prefill", ["r"], [prepared])
+    assert _committed(talker, "r")["generated"] == 1, "only a commit applies a declared write"
+
+
+@pytest.mark.parametrize("walk", ["talker_prefill", "talker_decode"])
+def test_talker_capture_rows_carry_cfg_are_not_from_a_request_and_write_nothing(model, walk):
+    talker, _, _ = _talker(model)
+    graphs = {graph.capture_graph_walk: graph for graph in talker.get_accelerator_graph_configs(torch.device("cpu"))}
+    rows = graphs[walk].get_node_inputs(2, 128)
+    assert all("from_request" not in row.kwargs for row in rows), "a capture's rows have no open fields to write"
+    step = talker.declare_step(walk, [91, 92], rows)
+    assert TALKER_STEP not in step.state
+    packed = talker.preprocess(walk, SimpleNamespace(request_ids=[91, 92]), rows)
+    assert packed["cfg"].tolist() == [model.config.cfg_value] * 2
+
+
+def test_talker_padded_replay_writes_the_real_rows_and_stages_each_rows_cfg(model):
+    """``preprocess`` sees padding rows as copies of the template, and ``declare_step`` tells them from real rows by
+    ``from_request``, so one real row in a padded bucket advances and the padding rows touch no store."""
+    talker, _, _ = _talker(model)
+    [graph] = [
+        g for g in talker.get_accelerator_graph_configs(torch.device("cpu")) if g.capture_graph_walk == "talker_decode"
+    ]
+    request, meta = _request(model, "hello", cfg_value=1.5)
+    info = _info("r", 0, meta)
+    _commit(talker, "talker_prefill", ["r"], [talker.prepare_inputs("talker_prefill", info, request)])
+    prepared = talker.prepare_inputs("talker_decode", _decode_info("r", 0, meta), {"latent_patch": [torch.zeros(4, 8)]})
+    rows, rids = [prepared, *graph.get_node_inputs(3, 0)], ["r", 91, 92, 93]
+
+    packed = talker.preprocess("talker_decode", SimpleNamespace(request_ids=rids), rows)
+    assert packed["cfg"].tolist() == [1.5, *[model.config.cfg_value] * 3]
+    assert packed["step_index"].tolist() == [1, 1, 1, 1]
+
+    step = engine_step(talker, graph_walk="talker_decode", request_ids=rids, inputs=rows)
+    assert set(step.state[TALKER_STEP].host) == {("r", "main", 0)}
+    context = StepContext(("r",), "talker_decode", 0, False, slot_lease=object())
+    context.set_padded_rids(rids)
+    assert context.replays
+    step.set_ctx(context)
+    step.begin_calls()
+    step.commit_calls()
+    step.end_calls()
+    assert _committed(talker, "r")["generated"] == 2
+    assert set(talker.progress.host_fields._fields) == {"r"}, "a padding row opens no fields"
+
+
+def test_talker_fields_go_with_the_request_when_the_engine_removes_it(model):
+    talker, _, _ = _talker(model)
+    request, meta = _request(model, "hello")
+    info = _info("r", 0, meta)
+    _commit(talker, "talker_prefill", ["r"], [talker.prepare_inputs("talker_prefill", info, request)])
+    engine = Engine.__new__(Engine)
+    engine._loopback_steps, engine._resources, engine._submodules = {}, {}, {}
+    engine._runner = SimpleNamespace(remove_request=lambda rid: None)
+    engine._chunking = SimpleNamespace(forget_request=lambda rid: None)
+    engine._state_setup = StateSetup(host_fields=talker.progress.host_fields)
+    engine.remove_request("r")
+    assert talker.progress.host_fields._fields == {}, "a recycled handle would read this request's progress"
+    with pytest.raises(ValueError, match="no host fields"):
+        talker.prepare_inputs("talker_decode", _decode_info("r", 0, meta), {"latent_patch": [torch.zeros(4, 8)]})
+
+
+@pytest.mark.parametrize("no_rope", [True, False])
+def test_the_residual_stack_rotates_at_the_base_arrays_positions_or_not_at_all(model, no_rope):
+    """The released checkpoint sets ``residual_lm_no_rope``, and the flag decides whether its layers read positions."""
+    config = replace(model.config, residual=replace(model.config.residual, no_rope=no_rope))
+    talker = TalkerSubmodule(_random_generator(config), config, 4)
+    bind_dense_resources(talker)
+    layer = talker.model.residual_lm.layers[0].self_attn
+    base = talker.state_handles[BASE_KV]
+    assert (layer.position_source, layer._rope is None) == ((None, True) if no_rope else (base, False))
+
+
+def test_talker_noise_comes_in_order_from_the_seed_and_repeats_for_the_same_count(model):
+    """Draw k is the k-th draw of one generator kept from the seed, whatever the Talker drew before it."""
+    talker, _, _ = _talker(model)
+    kept = torch.Generator().manual_seed(4)
+    expected = [torch.randn((1, 8, 4), generator=kept)[0] for _ in range(4)]
+    for count in (0, 1, 3, 2):
+        assert torch.equal(talker._draw(count, 4), expected[count]), f"draw {count}"
+    assert torch.equal(talker._draw(2, 4), talker._draw(2, 4)), "a refused step prepared again draws the same noise"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize(
+    "seed, dtype", [(4, torch.float32), (2**40 + 4, torch.bfloat16)], ids=["fp32", "bf16_seed_past_32_bits"],
+)
+def test_talker_noise_from_the_seed_and_offset_equals_one_kept_cuda_generator(model, seed, dtype):
+    """Every draw moves a CUDA generator's Philox offset by the same amount, so seeding it and setting the offset draws
+    what one kept generator would have, across a prefill and decode steps with a refused step in between."""
+    talker = TalkerSubmodule(_random_generator(model.config).to("cuda", dtype), model.config, 4)
+    bind_dense_resources(talker)
+    request, meta = _request(model, "hello")
+    kept = torch.Generator(device="cuda").manual_seed(seed)
+    for step in range(6):
+        walk = "talker_prefill" if step == 0 else "talker_decode"
+        info = _info("r", seed, meta) if step == 0 else _decode_info("r", seed, meta)
+        edges = request if step == 0 else {"latent_patch": [torch.zeros(4, 8)]}
+        prepared = talker.prepare_inputs(walk, info, edges)
+        noise = prepared.tensor_inputs["noise"]
+        expected = torch.randn((1, 8, 4), generator=kept, device="cuda", dtype=dtype)[0]
+        assert noise.dtype == dtype and torch.equal(noise, expected), f"draw {step}"
+        if step == 3:
+            again = talker.prepare_inputs(walk, info, edges)
+            assert torch.equal(again.tensor_inputs["noise"], expected), "a refused step draws the same noise again"
+        _commit(talker, walk, ["r"], [prepared])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_talker_cuda_draw_reaches_any_count_from_the_seed_and_the_offset(model):
+    """On CUDA the offset reaches draw k directly, and it is still the k-th draw of one generator kept from the seed."""
+    talker = TalkerSubmodule(_random_generator(model.config).cuda(), model.config, 4)
+    kept = torch.Generator(device="cuda").manual_seed(4)
+    expected = [torch.randn((1, 8, 4), generator=kept, device="cuda", dtype=talker._dtype())[0] for _ in range(8)]
+    for count in (0, 1, 7, 2, 2, 5):
+        assert torch.equal(talker._draw(count, 4), expected[count]), f"draw {count}"
 
 
 def test_talker_declares_the_same_span_in_both_caches(model):
     talker, _, _ = _talker(model)
-    step = talker.declare_step("talker_decode", ["a", "b"], [SimpleNamespace(input_seq_len=1)] * 2)
+    step = engine_step(talker, "talker_decode", ["a", "b"], [ARNodeInputs(input_seq_len=1)] * 2)
     assert set(step.steps) == {"base_kv", "base_attn", "base_pos", "res_kv", "res_attn"}
     assert [(s.request_id, s.span) for s in step.segments] == [("a", 1), ("b", 1)]
     (graph,) = [g for g in talker.get_accelerator_graph_configs(torch.device("cpu"))
@@ -1026,10 +1224,13 @@ def test_talker_packs_a_mixed_batch_like_per_request_prompts(model):
     with torch.inference_mode():
         out = talker.forward_batched("talker_prefill_clone", engine, **packed)
     patches = {rid: out[rid]["latent_patch"][0] for rid in rids}
-    for rid in rids:
-        talker.postprocess(rid, infos[rid], out[rid])
-    talker.postprocess("design", infos["design"], out["design"])  # one row a patch ahead
-    prepared = [talker.prepare_inputs("talker_decode", infos[rid], {"latent_patch": [patches[rid]]}) for rid in rids]
+    _commit(talker, "talker_prefill_clone", rids, prepared)
+    design = ARNodeInputs(input_seq_len=1, kwargs={"step": 1, "from_request": True})
+    _commit(talker, "talker_decode", ["design"], [design])  # one row a patch ahead
+    decode_infos = {rid: _decode_info(rid, i, meta) for i, (rid, (_, meta)) in enumerate(requests.items())}
+    prepared = [
+        talker.prepare_inputs("talker_decode", decode_infos[rid], {"latent_patch": [patches[rid]]}) for rid in rids
+    ]
     packed = talker.preprocess("talker_decode", engine, prepared)
     assert list(packed) == ["noise", "cfg", "step_index", "prev_patch"]
     assert packed["step_index"].dtype == torch.long and packed["step_index"].tolist() == [1, 2, 1, 1]
@@ -1568,10 +1769,10 @@ def test_wrong_types_and_ranges_are_value_errors(model, kwargs, message):
 
 
 def test_whole_floats_pass_for_integer_knobs(model):
-    _, metadata = model.process_prompt(
+    metadata = model.process_prompt(
         "hello world", ["text"], ["audio"], max_new_tokens=9.0, min_len=2.0,
         inference_timesteps=float(model.inference_timesteps), cfg_value=2,
-    )
+    ).metadata
     assert metadata[PATCH_BUDGET_KEY] == model.config.max_patches(2, 9) and metadata[MIN_LEN_KEY] == 2
     assert type(metadata[MIN_LEN_KEY]) is int
     assert model.get_loop_caps(max_new_tokens=9.0) == {TALKER_LOOP: 8}
@@ -1602,3 +1803,125 @@ def test_compile_vae_switch_reaches_the_decoder_region(model, checkpoint):
     assert VoxCPM2Model(model_path_hf=str(checkpoint), compile_vae=False).compile_vae is False
     with pytest.raises(ValueError, match="compile_vae"):
         VoxCPM2Model(model_path_hf=str(checkpoint), compile_vae="no")
+
+
+def test_the_talker_serves_a_ready_prompt_first(model):
+    """Each prefill walk outranks decode, a clone's reference encoding with it:
+    listing a walk covers every node on it, as the worker resolves the entries."""
+    from mstar.worker.services import walk_priorities_of
+
+    priorities = walk_priorities_of(model, model.get_graph_walk_graphs())
+    assert {pair: entry.priority for pair, entry in priorities.items()} == {
+        ("RefEncoder", "talker_prefill_clone"): 1,
+        ("Talker", "talker_prefill"): 1,
+        ("Talker", "talker_prefill_clone"): 1,
+    }
+    assert ("Talker", "talker_decode") not in priorities
+
+
+# -- the local DiT's solve ----------------------------------------------------------------
+
+
+def _stepwise_solve(estimator, noise, mu, cond, cfg_value, t_span, mean_mode=False):
+    """``solve_cfm`` as the reference writes it: every step re-embeds its time
+    and re-projects the condition through ``estimator.forward``."""
+    rows, x = noise.shape[0], noise
+    t, dt = t_span[0], t_span[0] - t_span[1]
+    zero_init_steps = max(1, int(len(t_span) * 0.04))
+    mu_in, cond_in = torch.cat([mu, torch.zeros_like(mu)]), torch.cat([cond, cond])
+    scale = cfg_value.to(x.dtype).view(rows, 1, 1)
+    for step in range(1, len(t_span)):
+        if step <= zero_init_steps:
+            dphi_dt = torch.zeros_like(x)
+        else:
+            t_in = t.expand(2 * rows)
+            dt_in = dt.expand(2 * rows) if mean_mode else torch.zeros_like(t_in)
+            velocity = estimator(torch.cat([x, x]), mu_in, t_in, cond_in, dt_in)
+            pos, neg = velocity[:rows], velocity[rows:]
+            dot = torch.sum(pos.reshape(rows, -1) * neg.reshape(rows, -1), dim=1, keepdim=True)
+            st_star = (dot / (torch.sum(neg.reshape(rows, -1) ** 2, dim=1, keepdim=True) + 1e-8)).view(rows, 1, 1)
+            dphi_dt = neg * st_star + scale * (pos - neg * st_star)
+        x = x - dt * dphi_dt
+        t = t - dt
+        if step < len(t_span) - 1:
+            dt = t - t_span[step + 1]
+    return x
+
+
+@pytest.mark.parametrize("mean_mode", [False, True])
+def test_the_solve_computes_its_per_solve_tokens_once_and_matches_the_stepwise_solve(mean_mode):
+    from mstar.model.voxcpm2.components.local import cfm_t_span, solve_cfm
+
+    config = VoxCPM2Config.from_dict(TINY)
+    estimator = _random_generator(config).feat_decoder.estimator
+    gen = torch.Generator().manual_seed(1)
+    rows, hidden = 3, config.dit.hidden_size
+    noise = torch.randn(rows, config.feat_dim, config.patch_size, generator=gen)
+    mu = torch.randn(rows, 2 * hidden, generator=gen)
+    cond = torch.randn(rows, config.feat_dim, config.patch_size, generator=gen)
+    cfg_value = torch.tensor([1.5, 2.0, 3.0])
+    t_span = cfm_t_span(10, "cpu", torch.float32)
+    with torch.no_grad():
+        got = solve_cfm(estimator, noise, mu, cond, cfg_value, t_span, mean_mode=mean_mode)
+        want = _stepwise_solve(estimator, noise, mu, cond, cfg_value, t_span, mean_mode=mean_mode)
+    torch.testing.assert_close(got, want, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the fused kernel runs on CUDA")
+@pytest.mark.parametrize("seq", [5, 11])
+@pytest.mark.parametrize("rows", [2, 33])
+def test_fused_rope_attention_matches_the_eager_path_at_the_checkpoints_head_size(rows, seq):
+    """The local stacks' shape (16 query and 2 KV heads of 128, rows of the
+    encoder's 5 or the DiT's 11 tokens): rounding apart, the eager result."""
+    from mstar.model.components.rope_attention import rope_attention, rope_attention_reference
+
+    heads, kv_heads, head_dim = 16, 2, 128
+    gen = torch.Generator(device="cuda").manual_seed(0)
+    # any tables: the kernel reads both halves of each, as the eager rotation does
+    cos, sin = (torch.rand(seq, head_dim, device="cuda", generator=gen) * 2 - 1 for _ in range(2))
+    qkv = torch.randn(rows * seq, (heads + 2 * kv_heads) * head_dim, device="cuda", generator=gen).to(torch.bfloat16)
+    got = rope_attention(qkv, cos, sin, rows, seq, heads, kv_heads, head_dim)
+    want = rope_attention_reference(qkv, cos, sin, rows, seq, heads, kv_heads, head_dim)
+    assert got.shape == want.shape == (rows * seq, heads * head_dim)
+    # a table the kernel can't read with cos's strides takes the eager path
+    wide = torch.rand(seq, 2 * head_dim, device="cuda", generator=gen) * 2 - 1
+    sliced = wide[:, :head_dim]
+    assert torch.equal(rope_attention(qkv, cos, sliced, rows, seq, heads, kv_heads, head_dim),
+                       rope_attention_reference(qkv, cos, sliced, rows, seq, heads, kv_heads, head_dim))
+    err = (got.float() - want.float()).abs()
+    # the softmax weights round to bfloat16 before the value product, as SDPA's do,
+    # in another order: a few bfloat16 steps at most, far less on average
+    assert err.max() < 0.07 and err.mean() < 0.003
+
+
+def _local_stack(seed=0):
+    """A local stack the fused paths take: head halves of 32, half precision."""
+    from mstar.model.voxcpm2.components.minicpm import MiniCPMLocalTransformer
+    from mstar.model.voxcpm2.config import MiniCPM4Config
+
+    config = MiniCPM4Config(hidden_size=256, intermediate_size=512, num_hidden_layers=2, num_attention_heads=4,
+                            num_key_value_heads=2, head_dim=64, vocab_size=0)
+    torch.manual_seed(seed)
+    stack = MiniCPMLocalTransformer(config, max_len=11)
+    with torch.no_grad():
+        for name, param in stack.named_parameters():
+            param.copy_(1 + 0.1 * torch.randn_like(param) if "norm" in name else 0.05 * torch.randn_like(param))
+    stack.materialize_buffers()
+    return stack.eval()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the fused paths run on CUDA")
+def test_the_local_stack_compiles_whole_and_its_fused_bf16_path_matches_fp32():
+    """No graph break between layers (attention, add+norm, SiLU are each one op
+    or kernel Dynamo sees whole), and the half-precision fused path within
+    rounding of the float32 portable one on the same weights."""
+    stack = _local_stack()
+    x = torch.randn(6, 11, 256, generator=torch.Generator().manual_seed(1))
+    with torch.no_grad():
+        want = stack(x)  # CPU, float32: the reference rotation, SDPA, unfused add+norm and SiLU
+        fused = stack.to("cuda", torch.bfloat16)
+        got = fused(x.to("cuda", torch.bfloat16))
+        compiled = torch.compile(fused, fullgraph=True)(x.to("cuda", torch.bfloat16))
+    err = (got.float().cpu() - want).norm() / want.norm()
+    assert err < 0.02, err
+    torch.testing.assert_close(compiled, got, rtol=0.02, atol=0.02)

@@ -68,14 +68,20 @@ fn modality_from_ext(suffix: &str) -> &'static str {
     }
 }
 
-/// Infer a modality string from a filename's extension (for `/generate`
-/// multipart uploads, matching mstar's `_detect_modality`).
+/// A file's modality by its name, for `/generate` and `/generate/ws`
+/// uploads: `entrypoint._detect_modality`'s table, which differs from the
+/// media paths' (no `.opus`).
 pub fn modality_from_filename(name: &str) -> &'static str {
     let suffix = Path::new(name)
         .extension()
-        .map(|e| format!(".{}", e.to_string_lossy()))
+        .map(|e| format!(".{}", e.to_string_lossy()).to_lowercase())
         .unwrap_or_default();
-    modality_from_ext(&suffix)
+    match suffix.as_str() {
+        ".png" | ".jpg" | ".jpeg" | ".webp" | ".bmp" | ".tiff" | ".gif" => "image",
+        ".wav" | ".mp3" | ".flac" | ".ogg" | ".m4a" | ".aac" => "audio",
+        ".mp4" | ".avi" | ".mov" | ".mkv" | ".webm" => "video",
+        _ => "unknown",
+    }
 }
 
 /// Map a MIME type to one of the modality strings (image/audio/video).
@@ -96,7 +102,7 @@ pub fn modality_from_mime(mime: &str) -> &'static str {
 /// does: whitespace anywhere is dropped (line-wrapped payloads), missing `=`
 /// padding is restored (some OpenAI clients strip it), and anything else
 /// outside the standard alphabet is refused.
-fn decode_b64_lenient(payload: &str) -> Result<Vec<u8>, base64::DecodeError> {
+pub(crate) fn decode_b64_lenient(payload: &str) -> Result<Vec<u8>, base64::DecodeError> {
     use base64::engine::general_purpose::{GeneralPurpose, GeneralPurposeConfig};
     use base64::engine::DecodePaddingMode;
     // Python ignores the unused low bits of the last symbol too

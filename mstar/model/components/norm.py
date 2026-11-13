@@ -169,9 +169,11 @@ class AdaRMSNorm(nn.Module):
     """RMSNorm with adaRMS conditioning.
 
     A per-norm ``nn.Linear(cond_dim, hidden_size*3)`` maps a shared
-    condition vector to ``(scale, shift, gate)``. The normalization is
-    ``rmsnorm(x) * (1 + scale) + shift`` and the gate is returned for the
-    enclosing decoder layer to apply at the residual.
+    condition vector to the modulation ``(scale, shift, gate)``. The
+    normalization is ``rmsnorm(x) * (1 + scale) + shift`` and the gate is
+    returned for the enclosing decoder layer to apply at the residual. The
+    caller applies ``dense``, so a condition known ahead of a step can be
+    mapped once for every norm.
 
     The ``dense.weight`` and ``dense.bias`` are zero-initialized so the
     norm starts as the identity (matches HF Gemma / lerobot openpi).
@@ -187,22 +189,18 @@ class AdaRMSNorm(nn.Module):
         nn.init.zeros_(self.dense.bias)
 
     def forward(
-        self, x: torch.Tensor, cond: torch.Tensor,
+        self, x: torch.Tensor, modulation: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``modulation`` is ``dense(cond)``, ``[BS, 3 * hidden_size]`` for ``x`` of
+        ``[BS * rows, hidden_size]``."""
         # Lazy import keeps the Triton dependency narrow (only AdaRMSNorm
         # imports it).
         from mstar.utils.adarms_norm import adarms_norm_fused
 
-        BS = cond.shape[0]
-        x_flat = x.view(BS * (x.shape[0] // BS), -1).contiguous()
-
-        modulation = self.dense(cond)  # [BS, 3*H]
         H = self.hidden_size
-        scale = modulation[:, :H]
-        shift = modulation[:, H:2 * H]
-        gate = modulation[:, 2 * H:]
-
-        return adarms_norm_fused(x_flat, scale, shift, gate, self.variance_epsilon)
+        return adarms_norm_fused(
+            x, modulation[:, :H], modulation[:, H:2 * H], modulation[:, 2 * H:], self.variance_epsilon,
+        )
 
 
 class BiasFreeLayerNorm(nn.Module):

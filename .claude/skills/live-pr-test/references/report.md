@@ -35,6 +35,13 @@ Keep it short enough to read in a minute: aim for under ~3,500 characters, about
 | --- | --- | --- |
 | <path → failure mode, from the risk map> | <the input, fault or layout used, and how reach was shown> | ✅ / ❌ / ⚠️ / ➖ <evidence> |
 
+### Tests
+
+| The PR's changed tests that skip without CUDA, on <N> GPU(s) | Result |
+| --- | --- |
+| <files>: <passed> passed, <skipped> skipped (or: none) | ✅ / ❌ / ➖ <failing tests only the PR fails, after the serial rerun> |
+| ➖ Also fail on the base, passed only on the rerun, or all skipped here | <test ids, and which> |
+
 ### Performance
 
 <one table, only when the PR claims a number or a regression suite ran: one row per arm/system, columns per metric, concurrencies inline as "a / b / c">
@@ -56,11 +63,14 @@ Keep it short enough to read in a minute: aim for under ~3,500 characters, about
 
 - ✅ held, ❌ failed on the setup it was measured on, ⚠️ held only partly (some cells, some restarts).
 - Any mark that rests on a measurement that varies run to run (throughput, latency, output identity, a fault-injection outcome) needs repeats, a ✅ included: at least two per arm, three by default. A ⚠️ or ❌ especially: before reporting one, rerun until each arm has at least three, since a negative on one or two runs is the result most often overturned. A deterministic result (a refusal, a crash with a traceback, a test, a token count) needs no repeats; say which it is. A rate that still doesn't separate after the repeats is "not separable", not ❌.
-- ➖ not exercised here, with the reason: the base bug didn't fire on this box (so neither arm can show the fix), or the claim's number came from another GPU, harness or metric and this run can't stand in for it ("not comparable: B200 claim, host-bound H200"). Never ⚠️ for these; ⚠️ says the PR fell short.
+- ➖ not exercised here, with the reason: the base bug didn't fire on this box, so neither arm can show the fix. Never ⚠️ for a ➖; ⚠️ says the PR fell short.
 - ➖ also when the check never reached the changed code (wrong runtime, a layout that doesn't take the branch, a probe that died upstream). Say what would reach it.
+- ➖ not comparable: the claim's number came from another GPU, harness or metric and this run can't stand in for it ("not comparable: B200 claim, host-bound H200").
+- A perf claim that points the right way but measured smaller than stated, or within noise, is ✅ with a note in its row: "the description says X, measured Y", so the author can correct it. A cell worse than the base beyond noise is ❌: a regression.
 - A correctness ✅ needs the reference arm. PR matching main is "unchanged vs main", not "correct". If the reference couldn't run, the mark is ➖ with the reason.
 - 👂 **needs human review**: media output whose correctness the metrics can't decide. List the side-by-side files (reference, PR, main) and what to listen or look for. Never ✅ or ❌ on your own judgement of how media sounds or looks.
-- A verdict of "Works" needs a served run through the changed code. A report with only CPU results says "Partial" in its verdict line.
+- A test in the Tests block that only the PR fails makes the verdict Fail. One that fails on the base too, one that passed only on the serial rerun (a possible flake), and a changed file whose tests all skip on the box are ➖: the verdict is Partial.
+- A verdict of "Works" (`pass`) needs what the change is meant to do to work in a served run through the changed code, the risk checks to show no regression against the base, and every perf claim to point the right way: some claimed gain real (beyond noise), and no measured cell worse than the base beyond noise. For a PR that changes only tests, docs, comments or benchmarks, its changed tests running and passing is enough (not skipping, or failing on the base too). A report with only CPU results, with a ➖ row for something that matters (what the change is meant to do, or a risk check, that couldn't run or didn't reach the changed code: the row says what's missing, hardware this box doesn't have, more GPUs or nodes than it got, weights or a service it can't reach), or with any 👂 row, says "Partial" in its verdict line and names those rows. A claimed number measured smaller than stated, a claimed row the plan cut, or one that isn't a risk (under Not tested), and a ➖ not comparable don't: they are notes on the description, and the report says so.
 - Before marking a parity claim ❌ that the author reports passing, rerun it in the author's library versions, or diff the defaults that changed between them (transformers 5 loads UMT5 with SDPA, 4.x eager). Before any ❌, check which test, harness and inputs the claim was measured with. When your run used a different one (the PR's stricter new test run on base, say), name both in the row, so the ❌ explains itself.
 - A case the description hands to another open PR is "owned by #N" with a link, not a ⚠️ here. Test it on that PR, or on both merged, if it matters to the verdict.
 - The same goes for a failure that matches a known open issue or another PR's fix, even when the description doesn't hand it over: search the issues for the error text before marking ⚠️, and write "owned by #N".
@@ -91,7 +101,7 @@ Keep it short enough to read in a minute: aim for under ~3,500 characters, about
 
 ## Posting to the PR
 
-Only when explicitly asked. Then post the report body (without local paths; media links don't resolve on GitHub, so say "media available on request") under this header:
+Only when explicitly asked. Then post the report body (without local paths; media links don't resolve on GitHub, so say "media available on request", unless the review bot publishes them: it posts its own runs with a link to the media gallery) under this header:
 
 ```markdown
 > 🤖 **Automated live test, AI-generated** (Claude Code). Not checked line by line by a human. Numbers come from one allocation, so treat small deltas as provisional.

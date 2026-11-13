@@ -100,18 +100,22 @@ class _Producer:
             loop_caps={},
         )
 
-    def step(self, uuid):
-        """One LLM pass that streams one item. Returns (descriptor, wgd)."""
+    def step(self, uuid, inline=False):
+        """One LLM pass that streams one item: a stored tensor, or with
+        ``inline`` its value off a step that kept its rows on the device.
+        Returns (descriptor, wgd)."""
         block = ColumnarEdgeSpecs.empty()
         block.add(self.rid, "text_inputs", [], False, next_node="LLM")
         self.rt.ingest_inputs_batch(block)
         assert self.rt.pop_rids("LLM", "decode", [self.rid]) is not None
-        self.book.put_tensor(uuid, _info(uuid))
-        self.book.increment_ref(uuid, 1)
+        if not inline:
+            self.book.put_tensor(uuid, _info(uuid))
+            self.book.increment_ref(uuid, 1)
         out = self.rt.complete_and_route_batch(RouteInput(
             partition="LLM", graph_walk="decode", node_name="LLM",
             output_signals=[EDGE], wg_ids=ParallelList([self.rid], [0]),
-            tensors=[uuid], num_tensors=[1],
+            tensors=[] if inline else [uuid], num_tensors=[0 if inline else 1],
+            **({"inline_signals": [EDGE], "inline_values": [uuid]} if inline else {}),
         ))
         self.route = out
         fwd = CurrentForwardPassInfo(
@@ -194,6 +198,10 @@ def _consumer(policy):
         get_tensor=lambda uuid: torch.tensor([uuid]),
         dereference_batch_uniform=lambda ids: None,
         increment_ref_batch_uniform=lambda ids: None,
+        store_and_return_tensor_info=lambda rid, tensors, skip_cuda_sync=False: {
+            name: [SimpleNamespace(uuid=0)] for name in tensors
+        },
+        increment_ref=lambda uuid: None,
     )
     streams = StreamBufferManager(request_state, tensor_manager, [])
     streams.consumer_node = {EDGE: "snac_decoder"}
@@ -211,7 +219,10 @@ def _consumer(policy):
 
 def _deliver(w, descriptor):
     """The descriptor arrives and its read completes."""
-    if isinstance(descriptor, EdgeItems):
+    if isinstance(descriptor, EdgeItems) and descriptor.values:
+        w.ingest._process_edge_items(descriptor)  # in the buffer, nothing to read
+        edges = []
+    elif isinstance(descriptor, EdgeItems):
         w.ingest._process_edge_items(descriptor)
         edges = [
             GraphEdge(next_node=row.next_node, name=row.signal,
@@ -256,6 +267,24 @@ def test_a_walk_driven_stream_keeps_input_signals(tmp_path, walk_driven):
 def test_done_before_the_last_item_waits_for_it(tmp_path):
     producer = _Producer(tmp_path)
     descriptor, wgd = producer.step(uuid=11)
+    done = _conduct(_conductor(), [wgd])
+
+    w, buf = _consumer(FixedChunkPolicy(25))
+    w.ingest._process_new_inputs(done)
+    assert _chunks(w, buf) == [], "ended the stream before its last item arrived"
+
+    _deliver(w, descriptor)
+    assert _chunks(w, buf) == [(1, True)]
+    assert _chunks(w, buf) == []
+
+
+def test_done_before_the_last_inline_item_waits_for_it(tmp_path):
+    """An item sent as its value counts as one item sent, so a done signal
+    that overtakes it still waits for it."""
+    producer = _Producer(tmp_path)
+    producer.rt.set_inline_streams(frozenset({("LLM", EDGE)}))
+    descriptor, wgd = producer.step(uuid=11, inline=True)
+    assert isinstance(descriptor, EdgeItems) and descriptor.values == [11]
     done = _conduct(_conductor(), [wgd])
 
     w, buf = _consumer(FixedChunkPolicy(25))

@@ -451,3 +451,21 @@ def test_a_teardown_that_frees_none_of_the_capping_pool_leaves_the_cap():
     assert _admit(cross_kv, {"c": 2 * PAGE_SIZE}, commit=True).ok
     _remove(worker, "c")
     assert sched._max_batch_size(SCHED_NODE, SCHED_WALK) == 16
+
+
+def test_a_run_counts_the_room_other_requests_allotments_leave():
+    """11 pages stay free for four decode rows, but a waiting prompt's allotment holds 9 of them:
+    a run needing a page a row would be refused, so the step doesn't repeat."""
+    mgr = _manager(16)
+    rows = {f"d{i}": PAGE_SIZE for i in range(4)}
+    assert _admit(mgr, rows, commit=True).ok
+    step = KVStep(segments=tuple(Segment(rid, "main", 1) for rid in rows))
+    ctx = _ctx(*rows)
+    ctx.resident = object()
+    assert mgr.max_repeats(step, ctx) > 1
+
+    mgr.ingest_request("p")
+    mgr.ask("p", "n", "w")
+    mgr._asks["p"] = 9
+    assert mgr.reserve("p", "n", "w", None) is None
+    assert mgr.max_repeats(step, ctx) == 1

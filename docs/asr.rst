@@ -161,7 +161,7 @@ Both decode loops stream their transcript token by token. A decode step
 keeps its rows' tokens on the device for the next step (the sampler's device
 loop-back, ``device_loopback_signals``), and the worker sends the batch's
 tokens to the client in one frame per step from the stop check's host copy
-(``inline_client_signals``), rather than one tensor message per request. A
+(``inline_signals``), rather than one tensor message per request. A
 streaming request therefore receives one delta per token, and tokens reach
 the API server while the window decodes: a 20 minute Qwen3-ASR window is
 about 3,450 tokens, which, sent as one tensor apiece when the loop ended,

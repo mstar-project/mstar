@@ -14,6 +14,7 @@ pytest.importorskip("transformers.models.qwen3_vl")
 from transformers.models.qwen3_vl.configuration_qwen3_vl import Qwen3VLVisionConfig  # noqa: E402
 from transformers.models.qwen3_vl.modeling_qwen3_vl import Qwen3VLVisionModel  # noqa: E402
 
+from mstar.model.components.diffusion.attention import FrameSDPA  # noqa: E402
 from mstar.model.components.qwen3_vit import (  # noqa: E402
     vision_interpolation,
     vision_position_ids,
@@ -21,7 +22,6 @@ from mstar.model.components.qwen3_vit import (  # noqa: E402
 )
 from mstar.model.components.qwen_vision import (  # noqa: E402
     VISION_ATTN,
-    FrameSDPA,
     QwenVisionConfig,
     QwenVisionModel,
 )

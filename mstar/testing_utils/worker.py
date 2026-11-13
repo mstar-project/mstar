@@ -18,6 +18,7 @@ from mstar.worker.input_ingest import InputIngest
 from mstar.worker.lockstep import Lockstep
 from mstar.worker.micro_scheduler import MicroScheduler
 from mstar.worker.phase_timer import PhaseTimer
+from mstar.worker.preemption import Preemption
 from mstar.worker.rebuild import Rebuilds
 from mstar.worker.request_lifecycle import RequestLifecycle
 from mstar.worker.services import WorkerLayout, WorkerServices
@@ -29,7 +30,11 @@ from mstar.worker.worker import Worker
 # What ``Worker.__init__`` builds from the deployment. No default stands in for a
 # collaborator, and a component left out is built, real, over the others.
 _COLLABORATORS = ("communicator", "tensor_manager", "engine_manager", "request_state", "streams", "parallel_groups")
-_COMPONENTS = ("lifecycle", "admission", "lockstep", "scheduler", "ingest", "executor", "speculator", "pipeline")
+_COMPONENTS = (
+    "lifecycle", "admission", "lockstep", "scheduler", "preemption", "ingest", "executor", "speculator", "pipeline",
+)
+# an engine with no paged KV cache, so the default `Preemption` moves nothing
+_NO_PAGED_KV = SimpleNamespace(engine=SimpleNamespace(paged_kv_caches=list))
 _LAYOUT = frozenset(WorkerLayout.__dataclass_fields__)
 
 
@@ -144,6 +149,8 @@ def make_worker(
         worker.tensor_manager = SimpleNamespace(get_tensor=None)
     # no node declares a rebuild policy unless the test passes one
     worker._rebuilds = rebuilds if rebuilds is not None else Rebuilds({}, {})
+    # no node writes a paged KV cache here, so no request keeps its ids
+    worker._kv_writes = {}
     services = WorkerServices(
         worker_id=worker_id, device=device, graph_runtime=graph_runtime, rebuilds=worker._rebuilds,
         **{name: getattr(worker, name) for name in _COLLABORATORS},
@@ -165,13 +172,17 @@ def make_worker(
         services=services, layout=layout, lifecycle=worker.lifecycle, lockstep=worker.lockstep,
         admission=worker.admission, model_config={},
     ))
+    component("preemption", lambda: Preemption(
+        _NO_PAGED_KV, worker._rebuilds, worker.scheduler, worker.request_state, worker.admission.log_throttled,
+        worker._rid_str,
+    ))
     component("ingest", lambda: InputIngest(
         services=services, layout=layout, lifecycle=worker.lifecycle, lockstep=worker.lockstep,
-        wakeup_event=wakeup_event, metrics=metrics, enable_nvtx=enable_nvtx,
+        wakeup_event=wakeup_event, metrics=metrics, enable_nvtx=enable_nvtx, set_rebuildable=worker._set_rebuildable,
     ))
     component("executor", lambda: StepExecutor(
         services=services, layout=layout, timer=worker.timer, lockstep=worker.lockstep,
-        lifecycle=worker.lifecycle, wakeup_event=wakeup_event, metrics=metrics,
+        lifecycle=worker.lifecycle, preemption=worker.preemption, wakeup_event=wakeup_event, metrics=metrics,
         profile_info=worker.profile_info, enable_nvtx=enable_nvtx, enable_prof=enable_prof,
     ))
     component("speculator", lambda: Speculator(
@@ -182,10 +193,21 @@ def make_worker(
     component("pipeline", lambda: StepPipeline(
         services=services, layout=layout, timer=worker.timer, lifecycle=worker.lifecycle,
         lockstep=worker.lockstep, admission=worker.admission, scheduler=worker.scheduler,
-        executor=worker.executor, ingest=worker.ingest, speculator=worker.speculator, metrics=metrics,
+        executor=worker.executor, ingest=worker.ingest, speculator=worker.speculator, preemption=worker.preemption,
+        metrics=metrics,
         profile_info=worker.profile_info, launch_wait_s=launch_wait_s, enable_nvtx=enable_nvtx,
     ))
     return worker
+
+
+def preempting(worker: Worker) -> Preemption:
+    """A real ``Preemption`` over the worker's engine manager, rebuilds, scheduler and request state, handed to the
+    worker and to the executor and pipeline that call it. For a test that sets those up after ``make_worker``."""
+    worker.preemption = worker.executor.preemption = worker.pipeline.preemption = Preemption(
+        worker.engine_manager, worker._rebuilds, worker.scheduler, worker.request_state,
+        worker.admission.log_throttled, worker._rid_str,
+    )
+    return worker.preemption
 
 
 def deliver(worker: Worker, *messages) -> None:

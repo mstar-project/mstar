@@ -1,17 +1,17 @@
 """Packed prefill, one-token-per-request decode, and the image encoder for Command A+."""
 
+from collections.abc import Mapping
 from typing import Any
 
 import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.engine.accelerator_graph_config import AcceleratorGraphConfig
-from mstar.engine.resources import AttentionStep, KVStep
-from mstar.engine.resources.step import ResourceStep
+from mstar.engine.state import ArrayStep, SampleStep, Segment, SubmoduleStep, at_last_token, position, sample
 from mstar.model.command_a_plus.components.vision import CommandAPlusVisionEncoder
-from mstar.model.command_a_plus.config import GLOBAL_ATTN, KV_CACHE, LOCAL_ATTN
+from mstar.model.command_a_plus.config import KV_CACHE, SAMPLER
 from mstar.model.components.sampled_token_decoder import SampledTokenDecoder
-from mstar.model.submodule_base import NodeInputs, NodeSubmodule
+from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
 
 
 class CommandAPlusVisionSubmodule(NodeSubmodule):
@@ -60,8 +60,6 @@ class CommandAPlusLLMSubmodule(SampledTokenDecoder):
     # off until compiled numerics get their own parity checks.
     disable_torch_compile = True
     PREFILL_WALK = "prefill"
-    # both attention resources plan the same packing
-    ATTN_KEY = LOCAL_ATTN
     # the ladder it captured before moving onto the scaffold: wider decode
     # steps are unmeasured on this MoE (graph memory, fused-MoE tiles)
     DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
@@ -75,13 +73,26 @@ class CommandAPlusLLMSubmodule(SampledTokenDecoder):
         # no prefill is captured, so nothing sizes an image step: uncapped, as before
         return None
 
-    def layer_steps(self) -> dict[str, ResourceStep]:
-        # one KV cache, read through a windowed and an unwindowed resource
-        return {
-            KV_CACHE: KVStep(),
-            LOCAL_ATTN: AttentionStep(causal=True),
-            GLOBAL_ATTN: AttentionStep(causal=True),
-        }
+    def bind_state(self, handles: Mapping[str, Any]) -> None:
+        self.kv = handles[KV_CACHE]
+        self.sampler = handles[SAMPLER]
+
+    def node_step(
+        self, segments: list[Segment], prefill_tokens: Mapping[int, torch.Tensor], advance: tuple[int, ...] | None,
+    ) -> SubmoduleStep:
+        return SubmoduleStep(
+            segments=segments,
+            state={KV_CACHE: ArrayStep(advance=advance), SAMPLER: SampleStep(prompt_tokens=prefill_tokens)},
+        )
+
+    def next_position(self, rid_handle: int) -> int:
+        return position(self.kv, rid_handle, "main")
+
+    def last_token_hidden(self, engine_inputs: ModelInputsFromEngine, hidden: torch.Tensor) -> torch.Tensor:
+        return at_last_token(self.kv, hidden)
+
+    def sample_tokens(self, engine_inputs: ModelInputsFromEngine, logits: torch.Tensor) -> torch.Tensor:
+        return sample(self.sampler, logits)
 
     def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,

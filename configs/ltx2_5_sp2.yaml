@@ -7,7 +7,6 @@ max_seq_len: 1024
 # self-attention exchanges them. The Gemma-4 text encoder + connectors on rank 1,
 # both decoders and the latent upsampler on rank 0.
 model_kwargs:
-  attention_backend: flashinfer
   max_batch_size: 4
   # the video VAE decode compiled, ~55 dB from the eager decode; false for bit-exact output
   vae_compile: true

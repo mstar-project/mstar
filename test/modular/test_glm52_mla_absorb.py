@@ -309,6 +309,22 @@ def test_the_shared_mla_is_glm52s_dense_path(absorb):
     assert torch.equal(a, b)
 
 
+def test_the_unabsorbed_layer_hands_attention_its_k_and_v(monkeypatch):
+    """It runs on ordinary FlashInfer attention, which over a context-parallel pool attends a
+    multi-token step's own tokens from them and raises without."""
+    (naive, cfg), _ = _build_pair(seed=7)
+    path = _Path(naive, cfg, 8)
+    run, seen = path.resources[ATTN_RESOURCE].run, {}
+
+    def recorded(*args, **kwargs):
+        seen.update(kwargs)
+        return run(*args, **kwargs)
+
+    monkeypatch.setattr(path.resources[ATTN_RESOURCE], "run", recorded)
+    path.step(torch.randn(3, cfg.hidden_size) * 0.1, 0)
+    assert seen["k"].shape[0] == seen["v"].shape[0] == 3
+
+
 def test_absorbed_resource_path_matches_naive_and_dense_reference():
     """Prefill 7 tokens, then decode at positions 7, 8, 9 (page size 8: the last two land
     on a second page).

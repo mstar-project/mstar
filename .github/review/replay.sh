@@ -14,7 +14,7 @@
 # would have posted, so you can check them (and their line anchors) by hand.
 #
 #   usage: .github/review/replay.sh <pr-number> [outfile]
-#   MODE=thorough for the on-demand mode (default: light)
+#   MODE=nogpu or full for the mode of `/review nogpu` or `/review` (default: light); a replay runs no live test
 #   MAX_TURNS=<n> for the turn cap (default: 40, as in the workflow)
 #   (a replay that reaches the cap prints only Claude's max-turns error, no findings; rerun it
 #   with a larger MAX_TURNS)
@@ -69,6 +69,12 @@ else
   gh api --paginate "repos/$REPO/pulls/$PR/comments" \
     --jq '[.[] | {id, user: .user.login, path, line, side, in_reply_to_id, body}]' > "$WORK/base/pr-comments.json"
 fi
+# Numbered as the workflow's collect step numbers it: the prompt anchors comments from these.
+PYTHONPATH="$ROOT/.github/review" python3 -c '
+import pathlib, session, sys
+p = pathlib.Path(sys.argv[1])
+p.write_bytes(session.numbered(p.read_bytes().decode("utf-8", "surrogateescape")).encode("utf-8", "surrogateescape"))
+' "$WORK/base/pr.diff"
 lines=$(wc -l < "$WORK/base/pr.diff")
 
 # Overlay the rules and skills you're editing, rather than the versions at the base sha.
@@ -81,7 +87,8 @@ cp -r "$ROOT/.claude/skills" "$WORK/base/.claude/skills"
 
 cd "$WORK/base"
 # The prompt goes before the flags: --disallowedTools takes a variadic list and
-# would otherwise swallow it as one more tool name.
+# would otherwise swallow it as one more tool name. The tools are the workflow's
+# review step's: no shell, web reads only from its sites.
 claude -p "Read .github/review/review-prompt.md from the repository root and follow it exactly.
    It defines your trust boundary, your method, your reporting bar and your output format.
 
@@ -90,13 +97,14 @@ claude -p "Read .github/review/review-prompt.md from the repository root and fol
    pr.diff is $lines lines.
    Turn cap: $MAX_TURNS.
 
-   DRY RUN: nothing will be posted, and you have no posting tools. Where the prompt
-   says to call create_inline_comment, print the call instead as a fenced json block
-   with keys path, line, startLine, side and body. Where it says to return the summary
-   fields, print them as one fenced json block instead. Print nothing else." \
+   DRY RUN: nothing will be posted. Where the prompt says to return the summary
+   fields, inline_comments included, print them as one fenced json block instead.
+   Print nothing else." \
   --model "$MODEL" \
   --max-turns "$MAX_TURNS" \
-  --disallowedTools Edit,Write,MultiEdit,NotebookEdit,WebFetch,WebSearch | tee "$OUT"
+  --permission-mode dontAsk \
+  --allowedTools "WebSearch,WebFetch(domain:github.com),WebFetch(domain:raw.githubusercontent.com),WebFetch(domain:docs.vllm.ai),WebFetch(domain:docs.sglang.ai),WebFetch(domain:docs.sglang.io),WebFetch(domain:huggingface.co),WebFetch(domain:pytorch.org),WebFetch(domain:docs.pytorch.org),WebFetch(domain:arxiv.org)" \
+  --disallowedTools Bash,Edit,Write,MultiEdit,NotebookEdit,Skill | tee "$OUT"
 
 echo >&2
 echo "saved to $OUT" >&2

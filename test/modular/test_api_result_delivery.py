@@ -155,6 +155,10 @@ class _StubPreprocessWorker:
         self.cleaned = []
         self.drained_flags = []
         self.aborted = []
+        self.inputs = []
+
+    def new_request(self, request):
+        self.inputs.append(request)
 
     def abort_request(self, rid):
         self.aborted.append(rid)
@@ -416,6 +420,178 @@ def test_collect_results_still_times_out(generating):
     assert e.value.status_code == 500
     assert pw.aborted == ["r9"]
     assert "r9" not in server.pending_requests
+
+
+async def _start_collecting(server, request_id):
+    """Let the real collector reach its first await before returning its task."""
+    entered = asyncio.Event()
+
+    async def collect():
+        entered.set()
+        # This direct await runs the collector in the same task. The test can
+        # resume only once the collector yields, not between these two lines.
+        return await server.collect_results(request_id)
+
+    task = asyncio.create_task(collect())
+    await entered.wait()
+    assert not task.done()
+    assert server.pending_requests[server.submission_key(request_id)].wake is not None
+    return task
+
+
+def test_collect_results_cancellation_releases_running_submission_once():
+    pw = _StubPreprocessWorker()
+    server = _api_server_stub(pw)
+    server.submit_request(
+        text="prompt", request_id="cancel", streaming=False,
+        input_modalities=["text"], output_modalities=["text"],
+    )
+    key = server.submission_key("cancel")
+    req = server.pending_requests[key]
+    req.chunks.append(ResultChunk(request_id="cancel", modality="text", data=b"unread"))
+    recorded = []
+    server.metrics = SimpleNamespace(record=lambda request, outcome: recorded.append((request, outcome)))
+
+    async def cancel():
+        task = await _start_collecting(server, "cancel")
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert key not in server.pending_requests
+        assert pw.aborted == [key]
+        # A surrounding handler's finally may release the same submission.
+        server.release_submission(key)
+
+    asyncio.run(cancel())
+    assert not server.pending_requests
+    assert not server.recently_completed
+    assert not server._live
+    assert not server._client_ids
+    assert pw.aborted == [key]
+    assert recorded == [(req, "abort")]
+
+
+@pytest.mark.parametrize("error", [None, "worker failed"], ids=["success", "error"])
+@pytest.mark.parametrize("prune_before_cancel", [False, True], ids=["before-prune", "after-prune"])
+def test_collect_results_cancellation_releases_finished_submission(error, prune_before_cancel):
+    pw = _StubPreprocessWorker()
+    server = _api_server_stub(pw)
+    server.submit_request(
+        text="prompt", request_id="finished", streaming=False,
+        input_modalities=["text"], output_modalities=["text"],
+    )
+    key = server.submission_key("finished")
+    req = server.pending_requests[key]
+    req.chunks.append(ResultChunk(request_id="finished", modality="text", data=b"unread"))
+    recorded = []
+    server.metrics = SimpleNamespace(record=lambda request, outcome: recorded.append((request, outcome)))
+
+    async def finish_and_cancel():
+        task = await _start_collecting(server, "finished")
+        # Complete and cancel without yielding to the collector between them.
+        with server.request_lock:
+            req.error = error
+            req.event.set()
+            req.notify()
+            server.recently_completed[key] = time.time()
+            if prune_before_cancel:
+                server._prune_recently_completed()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(finish_and_cancel())
+    assert not server.pending_requests, "the cancelled collector retained unread results"
+    with server.request_lock:
+        server._prune_recently_completed()
+    assert not server.recently_completed
+    assert not server._live
+    assert not server._client_ids
+    assert pw.aborted == [], "a finished request needs no downstream abort"
+    assert pw.cleaned == [key]
+    assert recorded == [(req, "error" if error else "abort")]
+
+
+@pytest.mark.parametrize("old_outcome", ["finished", "aborted"])
+def test_collect_results_cancellation_does_not_release_reused_request_id(old_outcome):
+    pw = _StubPreprocessWorker()
+    server = _api_server_stub(pw)
+    server.submit_request(
+        text="first", request_id="reused", streaming=False,
+        input_modalities=["text"], output_modalities=["text"],
+    )
+    old_key = server.submission_key("reused")
+    old_req = server.pending_requests[old_key]
+    recorded = []
+    server.metrics = SimpleNamespace(record=lambda request, outcome: recorded.append((request, outcome)))
+
+    async def reuse_and_cancel():
+        task = await _start_collecting(server, "reused")
+        if old_outcome == "finished":
+            with server.request_lock:
+                old_req.event.set()
+                old_req.notify()
+                server.recently_completed[old_key] = time.time()
+        else:
+            # Another cleanup path wins the race before task cancellation.
+            server.abort_submission(old_key)
+        server.submit_request(
+            text="second", request_id="reused", streaming=False,
+            input_modalities=["text"], output_modalities=["text"],
+        )
+        new_key = server.submission_key("reused")
+        new_req = server.pending_requests[new_key]
+        assert new_key != old_key
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        return new_key, new_req
+
+    new_key, new_req = asyncio.run(reuse_and_cancel())
+    with server.request_lock:
+        server._prune_recently_completed()
+    assert server.pending_requests == {new_key: new_req}
+    assert server._live == {"reused": new_key}
+    assert server._client_ids == {new_key: "reused"}
+    assert not server.recently_completed
+    assert not new_req.event.is_set()
+    assert pw.aborted == ([old_key] if old_outcome == "aborted" else [])
+    assert recorded == [(old_req, "abort")]
+
+
+def test_collect_results_cancellation_during_disconnect_check(monkeypatch):
+    pw = _StubPreprocessWorker()
+    server = _api_server_stub(pw)
+    server.submit_request(
+        text="prompt", request_id="disconnect", streaming=False,
+        input_modalities=["text"], output_modalities=["text"],
+    )
+    key = server.submission_key("disconnect")
+    # Enter the disconnect check on the first pass, without a timed sleep.
+    monkeypatch.setattr(entrypoint, "DISCONNECT_CHECK_S", 0)
+
+    async def cancel():
+        entered, blocked = asyncio.Event(), asyncio.Event()
+
+        async def is_disconnected():
+            entered.set()
+            await blocked.wait()
+            return False
+
+        task = asyncio.create_task(server.collect_results(
+            "disconnect", SimpleNamespace(is_disconnected=is_disconnected),
+        ))
+        await entered.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(cancel())
+    assert not server.pending_requests
+    assert not server.recently_completed
+    assert not server._live
+    assert not server._client_ids
+    assert pw.aborted == [key]
 
 
 def test_tokens_do_not_wake_a_handler_waiting_for_the_finish():

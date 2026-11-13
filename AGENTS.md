@@ -12,7 +12,7 @@ If a hang, crash, or other bug has several plausible causes, the tempting fix is
 
 | Layer | Path | Owns |
 | --- | --- | --- |
-| API server | `mstar/api_server/` | tokenization, media loading, and the Python HTTP frontend, which is being retired (invariant 15) |
+| API server | `mstar/api_server/` | tokenization, media loading, and the deprecated Python HTTP frontend (`--python-frontend`, invariant 15) |
 | Conductor | `mstar/conductor/` | request lifecycle, graph-walk transitions, worker selection |
 | Worker | `mstar/worker/` | one process per GPU: micro-scheduler, async execution, tensor routing |
 | Engine | `mstar/engine/engine.py` | compiles forwards, captures accelerator graphs, batches, runs admit/plan/forward/commit |
@@ -41,7 +41,7 @@ Model code that reimplements an engine mechanism is a defect even when it works,
 For example, nothing under `mstar/model/` should:
 
 - **Capture accelerator graphs.** No `torch.cuda.graph`, `torch.cuda.CUDAGraph`, `torch.xpu.graph`, `torch.xpu.XPUGraph`, `graph_pool_handle`, or `make_graphed_callables`. Capture belongs to [mstar/engine/accelerator_graph_runner.py](mstar/engine/accelerator_graph_runner.py). A model declares an `AcceleratorGraphConfig`: `BatchedAcceleratorGraphConfig`, `PackedAcceleratorGraphConfig`, or for an inner loop `PiecewiseBatchedConfig` / `PiecewisePackedConfig` from [mstar/engine/accelerator_graph_config.py](mstar/engine/accelerator_graph_config.py), and the engine captures it. As of this writing there are **zero** raw capture calls under `mstar/model/`; keep it that way.
-- **Allocate, free, or evict resource state.** No calls into `PageArena`, `PageAllocator`, `CacheStream`, `CPUPagePool`, or `WorkspacePool`, and no direct `admit`/`commit`. Declare resources in `Model.get_node_resources()` and declare each step's effect on them in `NodeSubmodule.declare_step()`. The engine runs the lifecycle.
+- **Allocate, free, or evict resource state.** No calls into `PageArena`, `PageAllocator`, `CacheStream`, `CPUPagePool`, or `WorkspacePool`, and no direct `admit`/`commit`. Declare state in `Model.declare_state()` and other resources in `Model.get_node_resources()`, and declare each step's effect on them in `NodeSubmodule.declare_step()`. The engine runs the lifecycle.
 - **Choose which requests form a batch.** Batch *selection* is the micro-scheduler's job: implement `can_batch` and `forward_batched`, set `input_seq_len` in `prepare_inputs`, and let it decide. (Note: given a batch, mechanically stacking or concatenating tensors in `preprocess` is normal and expected, and some audio submodules also pad to a maximum sequence length themselves for capture compatibility).
 - **Manage streams or synchronize.** No `torch.Stream`, `torch.Event`, `torch.accelerator.synchronize`, or device-specific equivalents under `mstar/model/`.
 - **Index a resource's storage or hold its plans.** No `pool.block(...).index_select` / `index_copy_`, host-side slot lookups, or keeping `resource.current` to select rows from later. The resource exposes the access, driven by the step (e.g., `RecurrentStatePool.gather` / `scatter_`, `attend` over the current plan), so eager and captured paths address rows the same way.
@@ -59,7 +59,7 @@ The converse matters just as much: **model-level concerns shouldn't leak into en
 
 ### 2. Resources are declared per graph node, and a node gets only what it declares
 
-`get_node_resources()` returns a `NodeResourceSpec` list; the engine builds one object per declaration and binds it into the submodule and its layers. Layers name their resources (`attn_key` / `kv_key` / `pos_key`). A node that declares nothing receives nothing (e.g., encoders and decoders with no persistent state or attention wrappers).
+`declare_state()` declares the state a model keeps, and `get_node_resources()` returns a `NodeResourceSpec` list for anything else; the engine builds one object per declaration and binds it into the submodule and its layers. Layers name their resources (`attn_key` / `kv_key` / `pos_key`). A node that declares nothing receives nothing (e.g., encoders and decoders with no persistent state or attention wrappers).
 
 Per-deployment sizing goes in the config YAML under `resources:` overrides, not into Python constants. See "Tuning resources per deployment" in [docs/adding_models.rst](docs/adding_models.rst).
 
@@ -128,7 +128,7 @@ To branch on the GPU vendor or architecture, ask `mstar.platforms.current_platfo
 
 **Environment variables**: `MSTAR_*` knobs are read all over the codebase and are the main deployment interface. A new one must land with a row in [docs/environment_variables.rst](docs/environment_variables.rst) giving its default and its meaning, and should name the function that reads it. Environment variables that don't make sense to include in production (e.g., for A/B testing of a decision where there is a clear winner, or for debugging) should be removed. A tuning value a deployment may reasonably want to change (e.g., a per-step token budget) belongs in the serving config, not in an env var added for testing.
 
-The same goes for code paths added for performance: A/B them, and delete the ones that don't measurably help rather than leaving them in behind a switch. On the Qwen3.5 PR, a stream manager and a fused-norm flag both measured neutral and were removed, and segment-count graph buckets were built, measured as no gain, and reverted.
+The same goes for code paths added for performance: A/B them, and delete the ones that don't measurably help an SLO (throughput, latency, streaming viability, host time during a step, etc.) rather than leaving them in behind a switch. On the Qwen3.5 PR, a stream manager and a fused-norm flag both measured neutral and were removed, and segment-count graph buckets were built, measured as no gain, and reverted.
 
 ### 10. Performance claims come from the repo's own harnesses
 
@@ -187,7 +187,7 @@ A worker keys its own state by a small integer handle ([mstar/worker/rid_table.p
 
 ### 15. API surfaces land in the Rust frontend
 
-The Python HTTP frontend (the FastAPI routes in `mstar/api_server/entrypoint.py`, `mstar/api_server/openai/router.py` and its `serving_*.py`) is being retired: `mstar serve` is moving to `mstar-server` (`rust/server/`) for every model. Until it is gone, both serve, and nothing new may be served by Python alone:
+`mstar-server` (`rust/server/`) is `mstar serve`'s default HTTP frontend. The Python HTTP frontend (the FastAPI routes in `mstar/api_server/entrypoint.py`, `mstar/api_server/openai/router.py` and its `serving_*.py`), behind `--python-frontend`, is deprecated and due for removal. Until it is gone, both serve, and nothing new may be served by Python alone:
 
 - **A new OpenAI adapter, endpoint, request field, response format or stream shape lands in `rust/server/` in the same PR** as its Python counterpart, with a test in `test/rust/` that sends the same request to both frontends and compares what reaches `submit_request` and what the client gets back (`test_rust_openai_adapters.py` and `test_rust_frontend.py` have the pattern). A model's adapter is a class in `ADAPTER_REGISTRY` plus a type implementing `OpenAIAdapter` in `rust/server/src/adapters/` and its row in `ADAPTERS`.
 - **`NOT_PORTED` in `test/rust/test_rust_openai_adapters.py` only shrinks.** Adding to it is a regression of the migration, not a follow-up.
@@ -205,14 +205,17 @@ CUDA_VISIBLE_DEVICES="" HF_HUB_OFFLINE=1 OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 \
     test/omnivoice test/sampling_test mstar/model/*/tests benchmark/worker_phases \
     -q -p xdist -n 8 --dist worksteal --timeout=120 --basetemp=$(mktemp -d /tmp/s_XXXX)
 pytest test/integration/              # needs GPU + weights
-cd rust && cargo test --release --no-default-features --features python && pytest ../test/rust/
+cd rust && cargo test --release --no-default-features --features python
+# the HTTP tests: they run mstar-server, and skip without a build of it
+cargo build --release --manifest-path server/Cargo.toml && (cd server && cargo test --release)
+pytest ../test/rust/
 ```
 
 Run `python -m pytest mstar_sim/audits` after a FlashInfer bump or changes to functions wrapped by `mstar_sim/patches.py`.
 
 ### Running the CPU suite
 
-It takes 4 to 5 minutes on 8 CPUs from a local disk, and about 10 in CI on 4. If it is taking much longer, something is wrong; don't wait it out.
+It takes 4 to 5 minutes on 8 CPUs from a local disk; CI splits it over two 4-CPU runners, about 5 minutes each. If it is taking much longer, something is wrong; don't wait it out.
 
 - **Run it from a local disk.** The same code on the same 8 CPUs took 4:15 from a local disk and 16:23 from a network volume, where file metadata calls were about 23x slower. The volume also added 9 failures, several at the per-test limit, in `test_tp_read_check.py`, `test_tp_read_failure_acceptance.py`, `test_shm_shutdown_cleanup.py` and `test_transport_microbench.py`. They read like transport bugs. If your checkout is on a network volume, make a worktree on local disk and run from there.
 - **While iterating, run the modules your change touches.** Save the full suite for a commit you intend to push.
@@ -237,7 +240,7 @@ Output-quality artifacts get the same check, against the reference implementatio
 
 When rebasing onto a `main` that moved, check each resolution for hunks that kept **both** sides. Two got through one rebase here: one reinstated a behaviour the commit existed to remove, and the other defeated a guard's fall-through so a step admitted with nothing reserved. Both read as plausible merges, and neither conflicted again afterwards — the modular tests caught them, which is the argument for running them per step rather than at the end.
 
-The Rust extension under `rust/` is a build artifact, so it goes stale after merging or rebasing onto a `main` that changed `rust/`; so does `mstar-server` (`rust/server/`, behind `--rust-frontend`). In a checkout, a stale extension is refused wherever a graph runtime or tensor store is built (`require_rust_extension`), and `find_server_binary` skips a stale `mstar-server` (one named by `MSTAR_SERVER_BIN` or `--rust-frontend-bin` only gets a warning), so a stale build stops the server at startup and fails the tests that need it. Run the rebuild command the refusal prints as given: its `touch` is what makes cargo rebuild sources copied in with old mtimes (`git archive | tar x`, `rsync -a`, `cp -p`). Code that calls `mstar_rust` directly is not checked; there a stale build still imports fine and fails at call time, often as an unexpected-keyword `TypeError`.
+The Rust extension under `rust/` is a build artifact, so it goes stale after merging or rebasing onto a `main` that changed `rust/`; so does `mstar-server` (`rust/server/`, `mstar serve`'s default HTTP frontend). In a checkout, a stale extension is refused wherever a graph runtime or tensor store is built (`require_rust_extension`), and `find_server_binary` skips a stale `mstar-server` (one named by `MSTAR_SERVER_BIN` or `--rust-frontend-bin` only gets a warning), so a stale build stops the server at startup and fails the tests that need it. Run the rebuild command the refusal prints as given: its `touch` is what makes cargo rebuild sources copied in with old mtimes (`git archive | tar x`, `rsync -a`, `cp -p`). Code that calls `mstar_rust` directly is not checked; there a stale build still imports fine and fails at call time, often as an unexpected-keyword `TypeError`.
 
 Unix-socket paths are limited to about 107 characters, so a long `--basetemp` or `TMPDIR` makes the ZMQ-based Rust tests fail with `File name too long`, which reads like a real failure. Use a short `--basetemp`, and a different one per run: pytest empties an existing `--basetemp` at startup, which fails any run already using it.
 

@@ -494,9 +494,7 @@ class FishS2ProModel(Model):
         device: str = "cpu",
         tp_group=None,
         autocast_dtype: torch.dtype | None = None,
-        sp_group=None,
     ) -> NodeSubmodule | None:
-        del sp_group
         if node_name not in ("AR", "Codec", "RefEncoder"):
             raise ValueError(f"Unknown Fish S2-Pro node: {node_name!r}")
         if tp_group is not None and getattr(tp_group, "world_size", 1) > 1:

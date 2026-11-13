@@ -161,7 +161,7 @@ COND_LABEL = "main"
 UNCOND_LABEL = "uncond"
 
 # Combined plan key for the single plan that runs both guidance branches in
-# one forward (``KVStep.combined_labels`` in the step declaration).
+# one forward (``SubmoduleStep.combined_labels`` in the step declaration).
 CFG_BATCHED_LABEL = "_cfg_batched"
 
 # A captured denoise step's static-buffer inputs, each stacked on a leading
@@ -183,6 +183,10 @@ KV_CACHE = "kv"
 ATTN = "attn"
 ATTN_GEN = "attn_gen"
 SAMPLER = "sampler"
+# The sequence shard over the KV pool's nodes: on SP ranks it splits a
+# generation step's tokens over them (the DiT submodule hands it to the transformer at bind).
+# No step declares it: its step is the node's segments (`Resource.steps_from_segments`).
+SEQ_SHARD = "seq_shard"
 
 # Denoise state (initial noise, latents between steps, the guidance combine and
 # the scheduler step) is fp32 for image, video, sound and action requests, as
@@ -455,6 +459,12 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                     self.transformer.gen_layers_batched, **{**kwargs, "dynamic": True},
                 )
             logger.info("Cosmos3 denoise compute torch.compile enabled (%s)", config.denoise_compile_mode)
+
+    def bind_node_resources(self, resources: dict) -> None:
+        super().bind_node_resources(resources)
+        if self.transformer is not None:
+            # the transformer brackets its generation stack on the node's shard
+            self.transformer.sequence_shard = self.sequence_shard
 
     def warmup_compiles(self) -> None:
         """Build the compiled cross-request layer stack before the first
@@ -1052,13 +1062,12 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         read its own context. ``retention`` (per label) rides on the step
         for the pool to apply once the span is counted."""
         labels = (COND_LABEL, UNCOND_LABEL) if cfg else (COND_LABEL,)
-        combined = cfg and self.batched_cfg
         return SubmoduleStep(
             segments=self._segments(request_ids, labels, [spans] * len(labels)),
+            combined_labels={labels: CFG_BATCHED_LABEL} if cfg and self.batched_cfg else {},
             steps={
                 KV_CACHE: KVStep(
                     commit=True,
-                    combined_labels={labels: CFG_BATCHED_LABEL} if combined else {},
                     retention={
                         (rid, label): policy
                         for rid in request_ids
@@ -1503,6 +1512,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             labels = (COND_LABEL, UNCOND_LABEL) if cfg else (COND_LABEL,)
             return SubmoduleStep(
                 cg_key_info=cfg or None,
+                combined_labels={labels: CFG_BATCHED_LABEL} if cfg else {},
                 segments=self._segments(
                     request_ids, labels,
                     [
@@ -1511,12 +1521,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                     ],
                 ),
                 steps={
-                    KV_CACHE: KVStep(
-                        commit=True,
-                        combined_labels=(
-                            {labels: CFG_BATCHED_LABEL} if cfg else {}
-                        ),
-                    ),
+                    KV_CACHE: KVStep(commit=True),
                     ATTN: AttentionStep(causal=True),
                 },
             )
@@ -1610,16 +1615,12 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         committed, non-causal attention over [frozen prefix | fresh tokens]."""
         return SubmoduleStep(
             cg_key_info=cg_key_info,
+            combined_labels={labels: CFG_BATCHED_LABEL} if combined else {},
             segments=self._segments(
                 request_ids, labels, [spans] * len(labels)
             ),
             steps={
-                KV_CACHE: KVStep(
-                    commit=False,
-                    combined_labels=(
-                        {labels: CFG_BATCHED_LABEL} if combined else {}
-                    ),
-                ),
+                KV_CACHE: KVStep(commit=False),
                 attn_key: AttentionStep(causal=False),
             },
         )
@@ -3276,6 +3277,14 @@ class Cosmos3ReasonerSubmodule(SampledTokenDecoder):
     PREFILL_CAPTURE_BATCH_SIZES = [1, 2, 4, 8]
     MIXED_CAPTURE_BATCH_SIZES = [4, 16, 64]
     PREFILL_MEDIA_TOKEN_BUCKETS = [256, 512, 1024, 2048]
+    # Image and video prompts join decode steps too, so a burst of them does
+    # not stop every decode stream for a step each
+    MIXED_MEDIA = True
+    # A long prompt (a video, many images) runs in chunks of at most this many
+    # tokens, a step's decode rows included, rather than as one step that
+    # stops every decode stream for its length: the top of the prefill ladders.
+    CHUNKS_MEDIA = True
+    MAX_BATCH_TOKENS = 2048
 
     def __init__(self, transformer, config, encoders: Sequence[MediaEncoder] = ()):
         super().__init__(Cosmos3TextTower(transformer), config, encoders)
@@ -3312,19 +3321,24 @@ class Cosmos3ReasonerSubmodule(SampledTokenDecoder):
     # ------------------------------------------------------------------
 
     def prompt_positions(self, start: int, layout: dict, num_tokens: int) -> tuple[torch.Tensor, int]:
-        return layout_position_ids(
-            layout, self.config.reasoner.vision.spatial_merge_size, num_tokens, start, self.get_device(),
-        )
+        # built on the host: the scaffold moves them, and a chunk's cut rebuilds them
+        return layout_position_ids(layout, self.config.reasoner.vision.spatial_merge_size, num_tokens, start)
 
-    @staticmethod
-    def _rope_in_graph(engine_inputs: ModelInputsFromEngine, graph_walk: str) -> bool:
+    def resident_walks(self) -> frozenset[str]:
+        # a captured decode step builds its rope inside the graph (`_rope_in_graph`),
+        # so its `preprocess` reads nothing the tables fill
+        return frozenset({self.DECODE_WALK})
+
+    def _rope_in_graph(self, engine_inputs: ModelInputsFromEngine, graph_walk: str) -> bool:
         """A captured step of a text walk, whose rotary tables come from the
         planned positions inside the graph (as Qwen3.5's): always for decode,
-        with ``ingraph_decode_rope`` for text prefill and mixed steps. Only a
-        media walk's rows bring their own 3D positions."""
+        with ``ingraph_decode_rope`` for text prefill. Media rows bring their own
+        3D positions, so a mixed step does too while media rows can join it
+        (``MIXED_MEDIA``)."""
         if not engine_inputs.captured:
             return False
-        return graph_walk == "decode" or (graph_walk in ("prefill_text", MIXED) and ingraph_decode_rope())
+        text_walks = ("prefill_text",) if self._mixes_media else ("prefill_text", MIXED)
+        return graph_walk == "decode" or (graph_walk in text_walks and ingraph_decode_rope())
 
     def preprocess(self, graph_walk: str, engine_inputs: ModelInputsFromEngine, inputs: list[ARNodeInputs]) -> dict:
         out = super().preprocess(graph_walk, engine_inputs, inputs)

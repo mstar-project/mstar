@@ -84,6 +84,7 @@ def _captured_engine(monkeypatch, root):
     from mstar.engine.engine import Engine
     from mstar.engine.resources.kv import manager as manager_mod
     from mstar.engine.resources.kv.config import KVSpec
+    from mstar.engine.state.adapters import node_resources
     from mstar.model.qwen3_5 import qwen3_5_model
     from mstar.model.qwen3_5.components.language_model import Qwen3_5ForCausalLM
     from mstar.model.qwen3_5.submodules import LLMSubmodule
@@ -113,7 +114,7 @@ def _captured_engine(monkeypatch, root):
     lm = lm.eval().to(device="cuda", dtype=torch.bfloat16)
     sub = LLMSubmodule(lm, model.config, model.vision_config, model.encoders)
 
-    specs = model.get_node_resources()
+    specs = node_resources(model)
     for spec in specs:
         if isinstance(spec, KVSpec):
             spec.config.page_size = 16

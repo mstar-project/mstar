@@ -24,7 +24,8 @@ rotation here reads a precomputed cos/sin table, the way the reference
   (without).
 * :class:`MiniCPMLocalTransformer` is a bidirectional stack over a short,
   fixed-length sequence per row (5 tokens for the local encoder, 11 for the
-  local DiT), attended densely with SDPA and kept out of the KV resources.
+  local DiT), attended with the shared RoPE-and-attention kernel
+  (``components/rope_attention.py``) and kept out of the KV resources.
 
 Parameter paths follow the checkpoint (``layers.N.self_attn.q_proj`` ...) once
 ``LLAMA_STACKED_PARAMS`` routes q/k/v and gate/up into the fused projections.
@@ -33,10 +34,10 @@ Parameter paths follow the checkpoint (``layers.N.self_attn.q_proj`` ...) once
 from __future__ import annotations
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
+from mstar.engine.state import positions
 from mstar.model.components.decoder_layer import DecoderLayer
 from mstar.model.components.distributed import (
     ParallelAttention,
@@ -44,6 +45,7 @@ from mstar.model.components.distributed import (
     VocabParallelEmbedding,
 )
 from mstar.model.components.norm import RMSNorm
+from mstar.model.components.rope_attention import rope_attention
 from mstar.model.voxcpm2.config import MiniCPM4Config
 
 
@@ -117,29 +119,38 @@ class RopeTable(nn.Module):
 
 
 class MiniCPMPagedAttention(ParallelAttention):
-    """``ParallelAttention`` whose RoPE is LongRoPE, read from a table by the
-    position resource's planned ids (``pos_key=None`` for the residual LM)."""
+    """``ParallelAttention`` whose RoPE is LongRoPE, read from a table at the
+    planned positions of the array ``positions_from`` names (None for a stack
+    with no RoPE)."""
 
-    def __init__(self, *, rope: RopeTable | None, **kwargs):
-        super().__init__(**kwargs)
+    def __init__(self, *, rope: RopeTable | None, positions_from: str | None, **kwargs):
+        super().__init__(pos_key=None, **kwargs)
         # a plain attribute: the table is registered once, on the owning stack
         self.__dict__["_rope"] = rope
+        self._positions_from = positions_from
+        self.position_source = None
 
-    def _apply_rope(self, q, k, label):
-        if self.pos is None or self._rope is None:
+    def bind_state(self, handles: dict) -> None:
+        super().bind_state(handles)
+        if self._positions_from is not None:
+            self.position_source = handles[self._positions_from]
+
+    def _rotate_state(self, q: torch.Tensor, k: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if self._rope is None:
             return q, k
-        pos_ids = self.pos.pos_ids(label)[: q.shape[0]].long()
+        pos_ids = positions(self.position_source)[: q.shape[0]].long()
         cos = self._rope.cos.index_select(0, pos_ids).unsqueeze(1)
         sin = self._rope.sin.index_select(0, pos_ids).unsqueeze(1)
         return apply_rope(q, k, cos, sin)
 
 
-def _mlp(config: MiniCPM4Config, comm_group: CommGroup) -> ParallelGatedMLP:
+def _mlp(config: MiniCPM4Config, comm_group: CommGroup, fused_silu: bool = False) -> ParallelGatedMLP:
     return ParallelGatedMLP(
         comm_group=comm_group,
         hidden_size=config.hidden_size,
         intermediate_size=config.intermediate_size,
         activation="silu",
+        fused_silu=fused_silu,
     )
 
 
@@ -147,24 +158,22 @@ class MiniCPMLM(nn.Module):
     """Causal MiniCPM-4 stack over the node's paged KV cache.
 
     ``forward`` maps packed ``[tokens, hidden]`` embeddings to normed hidden
-    states. The label and layer index are resource cursors, bound once and
-    advanced per layer (see ``Qwen3DenseLM.forward``).
+    states.
     """
 
     def __init__(
         self,
         config: MiniCPM4Config,
         *,
-        attn_key: str,
         kv_key: str,
-        pos_key: str | None,
+        positions_from: str | None,
         max_len: int,
         comm_group: CommGroup | None = None,
     ):
         super().__init__()
         comm_group = comm_group or CommGroup.trivial()
         self.config = config
-        use_rope = not config.no_rope and pos_key is not None
+        use_rope = not config.no_rope and positions_from is not None
         self.rope = RopeTable(config, max_len) if use_rope else None
         if config.vocab_size > 0:
             self.embed_tokens = VocabParallelEmbedding(
@@ -183,15 +192,15 @@ class MiniCPMLM(nn.Module):
                         num_kv_heads=config.num_key_value_heads,
                         head_dim=config.head_dim,
                         input_hidden_size=config.hidden_size,
-                        attn_key=attn_key,
                         kv_key=kv_key,
-                        pos_key=pos_key if use_rope else None,
+                        positions_from=positions_from if use_rope else None,
+                        layer=layer,
                     ),
                     mlp=_mlp(config, comm_group),
                     input_layernorm=RMSNorm(config.hidden_size, eps=config.rms_norm_eps),
                     post_attention_layernorm=RMSNorm(config.hidden_size, eps=config.rms_norm_eps),
                 )
-                for _ in range(config.num_hidden_layers)
+                for layer in range(config.num_hidden_layers)
             ]
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -200,17 +209,15 @@ class MiniCPMLM(nn.Module):
         if self.rope is not None:
             self.rope.materialize()
 
-    def forward(self, input_embeds: torch.Tensor, *, label: str) -> torch.Tensor:
+    def forward(self, input_embeds: torch.Tensor) -> torch.Tensor:
         hidden_states = input_embeds
-        self.layers[0].self_attn.attend.bind_step(label)
-        for layer_idx, layer in enumerate(self.layers):
-            layer.self_attn.attend.set_layer_idx(layer_idx)
+        for layer in self.layers:
             hidden_states = layer(hidden_states=hidden_states)
         return self.norm(hidden_states)
 
 
 class MiniCPMLocalAttention(ParallelAttention):
-    """Bidirectional attention over ``[rows, seq, hidden]``, dense SDPA.
+    """Bidirectional attention over ``[rows, seq, hidden]``, each row whole.
 
     Reuses the fused QKV / output projections of ``ParallelAttention`` but no
     resource: every row is a complete, short sequence that nothing caches.
@@ -220,25 +227,12 @@ class MiniCPMLocalAttention(ParallelAttention):
         super().__init__(pos_key=None, **kwargs)
         self.__dict__["_rope"] = rope
 
-    def bind_resources(self, resources: dict) -> None:
-        del resources
-
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         rows, seq, _ = hidden_states.shape
-        q, k, v = self._project_qkv(hidden_states.reshape(rows * seq, -1))
-        q = q.view(rows, seq, self.num_heads, self.head_dim)
-        k = k.view(rows, seq, self.num_kv_heads, self.head_dim)
-        v = v.view(rows, seq, self.num_kv_heads, self.head_dim)
-        cos = self._rope.cos[:seq].unsqueeze(1)
-        sin = self._rope.sin[:seq].unsqueeze(1)
-        q, k = apply_rope(q, k, cos, sin)
-        out = F.scaled_dot_product_attention(
-            q.transpose(1, 2),
-            k.transpose(1, 2),
-            v.transpose(1, 2),
-            enable_gqa=self.num_heads != self.num_kv_heads,
+        qkv = self.qkv_proj(hidden_states.reshape(rows * seq, -1))
+        out = rope_attention(
+            qkv, self._rope.cos, self._rope.sin, rows, seq, self.num_heads, self.num_kv_heads, self.head_dim,
         )
-        out = out.transpose(1, 2).reshape(rows * seq, self.num_heads * self.head_dim)
         return self.o_proj(out).view(rows, seq, -1)
 
 
@@ -262,7 +256,7 @@ class MiniCPMLocalTransformer(nn.Module):
                         head_dim=config.head_dim,
                         input_hidden_size=config.hidden_size,
                     ),
-                    mlp=_mlp(config, comm_group),
+                    mlp=_mlp(config, comm_group, fused_silu=True),
                     input_layernorm=RMSNorm(config.hidden_size, eps=config.rms_norm_eps),
                     post_attention_layernorm=RMSNorm(config.hidden_size, eps=config.rms_norm_eps),
                 )
@@ -275,6 +269,12 @@ class MiniCPMLocalTransformer(nn.Module):
         self.rope.materialize()
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        for layer in self.layers:
-            hidden_states = layer(hidden_states=hidden_states)
-        return self.norm(hidden_states)
+        # ``run_layers``' loop, each residual add folded into the next norm, without
+        # its attention cursor: these layers hold no resource, so nothing breaks a
+        # compiled graph between them
+        layers = self.layers
+        h, residual = layers[0].input_layernorm.forward_residual(hidden_states.clone(), None)
+        for i, layer in enumerate(layers):
+            next_norm = layers[i + 1].input_layernorm if i + 1 < len(layers) else self.norm
+            h, residual = layer.forward_mlp_residual(layer.self_attn(h), residual, next_norm)
+        return h

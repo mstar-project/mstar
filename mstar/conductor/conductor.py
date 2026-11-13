@@ -1,5 +1,6 @@
 import atexit
 import hashlib
+import itertools
 import logging
 import math
 import multiprocessing as mp
@@ -36,8 +37,16 @@ from mstar.conductor.workers import accelerator_type, deployment_workers
 from mstar.distributed.base import ShardingConfig
 from mstar.distributed.communication import GlobalParallelConfig, WorkerParallelGroups
 from mstar.engine.resources import KVReqConfig, ResourceReqConfig
-from mstar.engine.resources.kv.config import refuse_undeclared_labels, without_layouts
+from mstar.engine.resources.kv.config import (
+    KVSpec,
+    PagedKVConfig,
+    mark_unpausable,
+    refuse_undeclared_labels,
+    without_layouts,
+)
 from mstar.engine.resources.lora.config import LoraSpec
+from mstar.engine.state import SampleSettings
+from mstar.engine.state.adapters import sampling_configs
 from mstar.graph.base import GraphEdge, NodeAndGraphWalk, TensorPointerInfo
 from mstar.model.base import Model, WorkerGraph, serving_resources, streamed_inputs
 from mstar.model.submodule_base import chunk_loop_name
@@ -67,7 +76,7 @@ from mstar.utils.ipc_format import (
     WorkerMessage,
     WorkerMessageType,
 )
-from mstar.utils.logging_config import quiet_noisy_loggers
+from mstar.utils.logging_config import REQUEST_LOGGER, quiet_noisy_loggers
 from mstar.utils.orphan import exit_when_orphaned
 from mstar.utils.profiler import nvtx_enabled, range_pop, range_push
 from mstar.utils.threads import Thread
@@ -75,6 +84,7 @@ from mstar.validation import validate_deployment
 from mstar.validation.resources import streamed_partitions
 
 logger = logging.getLogger(__name__)
+request_log = logging.getLogger(REQUEST_LOGGER)
 
 
 def _walk_io(model: Model) -> tuple[dict[str, tuple[tuple[str, str], ...]], dict[str, frozenset[str]], frozenset[str]]:
@@ -408,6 +418,8 @@ class RequestData:
     # double-count: rx by (source, dest, edge), tx by (source, edge).
     rx_info: dict[tuple[str, str, str], RxInfo] = field(default_factory=dict)
     tx_info: dict[tuple[str, str], TxInfo] = field(default_factory=dict)
+    # the data worker's count, returned on request_complete
+    prompt_tokens: int | None = None
 
     def remove_persist_signal_uuids(self, uuids: list[int]):
         uuids = set(uuids)
@@ -457,6 +469,15 @@ class Conductor:
     # Metrics are off unless __init__ gets an interval; class-level so an
     # object built without __init__ reads them as off too.
     _status_interval_s: float | None = None
+    # The INFO summary that stands in for the per-request lines, which are
+    # DEBUG: every SUMMARY_PERIOD_S while anything ran, waited or finished, so a
+    # default log shows a server serving, and one that stopped finishing.
+    # Counted since the last line; class-level for an object built without
+    # __init__, and unset until the run loop starts.
+    SUMMARY_PERIOD_S = 60.0
+    _done_since_summary = 0
+    _queued_since_summary = 0
+    _next_summary: float | None = None
 
     def __init__(
         self,
@@ -477,6 +498,7 @@ class Conductor:
         ``model_config_file``, which the model's placement methods read in any case. A
         LoRA adapter without its digest is refused either way."""
         self.requests: dict[str, RequestData] = {}
+        self._arrivals = itertools.count()
         # Requests in teardown: kept in self.requests (so they still count toward
         # concurrency until their GPU state is freed) with barrier state here.
         self.draining: dict[str, DrainingRequest] = {}
@@ -534,6 +556,7 @@ class Conductor:
         self.max_concurrent_requests: int = self.model_config.get(
             "max_concurrent_requests", None
         )
+        self._unpausable_outputs = frozenset(self.model_config.get("unpausable_outputs", model.UNPAUSABLE_OUTPUTS))
         # Optional ``mps: true``: workers run as clients of a CUDA MPS daemon the
         # conductor owns, so workers sharing a GPU overlap their kernels instead
         # of time-slicing. validate_deployment checked the value.
@@ -692,15 +715,34 @@ class Conductor:
 
     def _resource_specs(self) -> list[dict]:
         """Each worker's resource specs by key, after this deployment's YAML, for admission-time checks.
-        A spec's ``nodes`` is cut to the worker's own, as the worker's engine does when it builds the resource."""
+        A spec's ``nodes`` is cut to the worker's own, and a KV pool placed by position is paged for
+        the worker's ranks (`PagedKVConfig.paged_for`), as the worker's engine does when it builds the resource."""
         specs = getattr(self, "_resource_specs_cache", None)
         if specs is None:
             built = self._node_resources()
+            # one entry per set of node groups a worker can run (replicas run alike)
+            workers = {
+                tuple(frozenset(wg.section.get_nodes()) for wg in wgs): wgs for wgs in self._per_worker_graphs.values()
+            }.values()
             specs = self._resource_specs_cache = [
-                {s.resource_key: replace(s, nodes=s.nodes & nodes) for s in built if s.nodes & nodes}
-                for nodes in {frozenset(self._worker_nodes(worker_id)) for worker_id in self._per_worker_graphs}
+                {s.resource_key: self._for_worker(s, wgs) for s in built if s.nodes & self._nodes_of(wgs)}
+                for wgs in workers
             ]
         return specs
+
+    @staticmethod
+    def _nodes_of(wgs) -> frozenset[str]:
+        return frozenset().union(*(wg.section.get_nodes() for wg in wgs))
+
+    @classmethod
+    def _for_worker(cls, spec, wgs):
+        """``spec`` as a worker running ``wgs`` builds it."""
+        spec = replace(spec, nodes=spec.nodes & cls._nodes_of(wgs))
+        if isinstance(spec, KVSpec) and isinstance(spec.config, PagedKVConfig) and spec.config.context_parallel:
+            # every node group the pool spans splits alike (validation refuses a pool across different splits)
+            wg = next(wg for wg in wgs if spec.nodes & set(wg.section.get_nodes()))
+            spec = replace(spec, config=spec.config.paged_for(spec.resource_key, wg.tp_size, wg.sp_size))
+        return spec
 
     def _node_resources(self) -> list:
         """The deployment's resource specs (``serving_resources``), each with all of its nodes."""
@@ -709,6 +751,12 @@ class Conductor:
             built = self._node_resources_cache = serving_resources(
                 self.model, getattr(self, "model_config", None) or {}
             )
+        return built
+
+    def _declarations(self) -> list:
+        built = getattr(self, "_declarations_cache", None)
+        if built is None:
+            built = self._declarations_cache = self.model.declare_state()
         return built
 
     def _streamed_partitions(self) -> frozenset[str]:
@@ -759,6 +807,8 @@ class Conductor:
         (``LoraAdapterOps.refuse_request``).
         """
         configs = self.model.get_request_resource_configs(input_modalities, output_modalities, model_kwargs)
+        if any(isinstance(config, SampleSettings) for config in configs.values()):
+            configs = sampling_configs(configs, self._declarations())
         # a model that builds its sampler config from its own keys would drop it unseen
         if model_kwargs.get("return_logprobs") and not any(
             getattr(cfg, "return_logprobs", False) for cfg in configs.values()
@@ -1215,7 +1265,7 @@ class Conductor:
                     and len(self.requests) >= self.max_concurrent_requests):
                 break
             body = self.waiting_queue.pop(0)
-            logger.info(
+            request_log.debug(
                 "Admitting queued request %s (%d/%s in-flight)",
                 body.request_id, len(self.requests),
                 str(self.max_concurrent_requests),
@@ -1256,7 +1306,8 @@ class Conductor:
                     status=503,
                 )
                 return
-            logger.info(
+            self._queued_since_summary += 1
+            request_log.debug(
                 "Request %s queued (at capacity: %d/%d)",
                 body.request_id, len(self.requests),
                 self.max_concurrent_requests,
@@ -1327,7 +1378,7 @@ class Conductor:
         self, body: NewRequestConductor
     ):
         """Actually dispatch a request to workers (no admission check)."""
-        logger.debug("Conductor ingesting request %s", body.request_id)
+        request_log.debug("Conductor ingesting request %s", body.request_id)
         ingest_time = time.perf_counter()
         # A request admitted on arrival never waited.
         arrival_time = (
@@ -1407,6 +1458,7 @@ class Conductor:
         if not all(partition_states[name].is_done for name in self._streamed_partitions()):
             prefix_cache = False
         kv_layout = kwargs.get("kv_layout") or {}
+        arrival = next(self._arrivals)
         # process_prompt's {stream edge: context-only lead items}; each worker
         # primes the streams its own partition consumes
         stream_lead_items = kwargs.get("stream_lead_items") or {}
@@ -1430,6 +1482,10 @@ class Conductor:
             )
             for key, cfg in resource_configs.items():
                 cfg.apply_conductor_config(seed=seed, resource_key=key, loop_caps=loop_caps)
+        mark_unpausable(
+            resource_configs,
+            body.streaming and not self._unpausable_outputs.isdisjoint(body.initial_output_modalities),
+        )
         for specs in self._resource_specs():
             for key, cfg in resource_configs.items():
                 cfg.validate(specs.get(key))
@@ -1476,6 +1532,7 @@ class Conductor:
             sharding_config=self._build_request_sharding_config(worker_graph_to_workers),
             conductor_ingest_time=ingest_time,
             conductor_arrival_time=arrival_time,
+            prompt_tokens=body.prompt_tokens,
         )
         self._register_request(body.request_id, request_data)
 
@@ -1523,7 +1580,8 @@ class Conductor:
                         random_seed=pstate.random_seed,
                         partition_name=partition_name,
                         max_tokens=request_data.max_output_tokens,
-                        resource_configs=request_data.resource_configs
+                        resource_configs=request_data.resource_configs,
+                        arrival=arrival,
                     ),
                 )
                 self.communicator.send(
@@ -1678,7 +1736,7 @@ class Conductor:
                 ),
             )
         self._drop_request(request_id)
-        logger.info("Tore down request %s; freed worker resources", request_id)
+        request_log.debug("Tore down request %s; freed worker resources", request_id)
         self._try_admit_waiting()
 
     def _handle_reads_done(self, body: ReadsDone):
@@ -1819,7 +1877,8 @@ class Conductor:
         self, request_id: str
     ):
         """Called when all partitions are done."""
-        logger.info("Request %s done", request_id)
+        request_log.debug("Request %s done", request_id)
+        self._done_since_summary += 1
         request_data = self.requests[request_id]
         request_data.conductor_finish_time = time.perf_counter()
 
@@ -1837,6 +1896,8 @@ class Conductor:
                     rx_info=list(request_data.rx_info.values()),
                     tx_info=list(request_data.tx_info.values()),
                     conductor_arrival_time=request_data.conductor_arrival_time,
+                    prompt_tokens=request_data.prompt_tokens,
+                    max_output_tokens=request_data.max_output_tokens,
                 )
             )
         )
@@ -2007,7 +2068,7 @@ class Conductor:
         # downstream connections get `producer_done`.
         done = pstate.worker_reported_done
         if pstate.num_output_tokens >= request_data.max_output_tokens:
-            logger.info(
+            request_log.debug(
                 "Partition %s reached max output tokens %d. Ending.",
                 partition_name, request_data.max_output_tokens,
             )
@@ -2352,6 +2413,22 @@ class Conductor:
         except Exception:
             logger.exception("Could not fail request %s", request_id)
 
+    def _maybe_log_summary(self) -> None:
+        """Log at INFO, once a summary period, what finished and queued in it
+        and what runs and waits now, when any of those is non-zero."""
+        now = time.perf_counter()
+        if self._next_summary is None or now < self._next_summary:
+            return
+        self._next_summary = now + self.SUMMARY_PERIOD_S
+        done, queued = self._done_since_summary, self._queued_since_summary
+        running, waiting = len(self.requests), len(self.waiting_queue)
+        if done or queued or running or waiting:
+            logger.info(
+                "Last %.0f s: %d requests done, %d queued for admission; %d running, %d waiting",
+                self.SUMMARY_PERIOD_S, done, queued, running, waiting,
+            )
+        self._done_since_summary = self._queued_since_summary = 0
+
     def _maybe_send_status(self) -> None:
         """Send the API server a ConductorStatus once per status interval.
         The gauges are sampled here rather than kept up to date per message."""
@@ -2409,6 +2486,8 @@ class Conductor:
         due = self._next_liveness_check
         if self._status_interval_s is not None:
             due = min(due, self._next_status)
+        if self._next_summary is not None:
+            due = min(due, self._next_summary)
         for deadlines in (
             self._draining_deadlines, self._early_reads_done_deadlines, self._early_abort_deadlines,
         ):
@@ -2424,6 +2503,7 @@ class Conductor:
         from mstar.utils.profiler import range_pop, range_push
 
         self._wait_for_workers_ready()
+        self._next_summary = time.perf_counter() + self.SUMMARY_PERIOD_S
         # the set-up heap is complete: keep gen-2 collections off it
         freeze_after_setup("Conductor")
 
@@ -2477,6 +2557,7 @@ class Conductor:
                 self._sweep_expiry()
                 if self._status_interval_s is not None:
                     self._maybe_send_status()
+                self._maybe_log_summary()
 
             except Exception:
                 logger.exception("Conductor error in main loop")

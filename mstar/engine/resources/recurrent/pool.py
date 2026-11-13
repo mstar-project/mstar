@@ -32,6 +32,7 @@ from mstar.engine.resources.recurrent.config import (
     RecurrentStep,
 )
 from mstar.engine.resources.resident import gather_column
+from mstar.engine.resources.resident_hooks import ANY_REPEATS
 from mstar.engine.resources.spec import ResourceReqConfig
 from mstar.engine.resources.step import (
     ADMIT_OK,
@@ -142,6 +143,11 @@ class RecurrentAddressing:
 
 
 class RecurrentStatePool(Resource):
+    # it reads the KV pool only to key prefix snapshots, which are off above one rank. Its heads
+    # shard over TP alone, so every SP replica of a slot holds the same state, which a split step
+    # leaves alike on every one (`linear_attn.base`)
+    supports_context_parallel = True
+    supports_split_steps = True
     # the node's planner and this pool's table of slots, once bound
     _resident: "ResidentPlanner | None" = None
     _resident_table: "ResidentTable | None" = None
@@ -249,7 +255,9 @@ class RecurrentStatePool(Resource):
         # `_snap_meta` maps a filed slot to its key and whether it is a decode snapshot (a reply's),
         # least recently filed or restored first. Eviction takes a reply's first.
         # `_snap_refs` counts the leases and restores holding a slot, which eviction skips.
+        # `filed` counts the snapshots ever filed, which can lower what a request waiting for KV pages needs.
         self._kv: KVManager | None = None
+        self.filed = 0
         first = config.max_slots
         self._snap_free = list(reversed(range(first, first + config.prefix_slots)))
         self._snap_by_key: dict[bytes, int] = {}
@@ -501,9 +509,17 @@ class RecurrentStatePool(Resource):
         return ASKS
 
     def reserve(self, rid: str, node_name: str, graph_walk: str, published: None) -> int | None:
+        return self._reserve(rid, 1)
+
+    def reserve_past(self, rid: str, node_name: str, graph_walk: str, published: None) -> int | None:
+        """`reserve`, leaving the first waiting request its slots."""
+        return self._reserve(rid, 2)
+
+    def _reserve(self, rid: str, requests: int) -> int | None:
+        """Reserve ``rid``'s slots when there is room for ``requests`` requests' slots."""
         with self._lock:
             need, room = len(self.config.labels), len(self._free) - self._kept
-            if need > room:
+            if need * requests > room:
                 return room
             self._reserved[rid] = need
             self._kept += need
@@ -723,7 +739,7 @@ class RecurrentStatePool(Resource):
             if self._admit_restores or self._admit_snaps:
                 self._forget_prefix_admit(lambda key: ctx.is_real_row(key[0]))
             page = self._kv.config.tokens_per_page if self._kv is not None else 0
-            slots, is_pad = self._slots, ctx.is_padding_row
+            slots, is_pad, repeats = self._slots, ctx.is_padding_row, ctx.repeats
             for segment in step.segments or ():
                 if segment.span <= 0 or is_pad(segment.request_id):
                     continue
@@ -734,7 +750,8 @@ class RecurrentStatePool(Resource):
                         # the backend already wrote the pool; a later step resumes
                         slot.has_state = True
                         self._version += 1
-                    slot.tokens += segment.span
+                    # a step that repeats ran its span once a replay
+                    slot.tokens += segment.span * repeats
                     # a row too short to checkpoint that ends on a page (a decode step) is saved
                     # here, after its forward, where the KV cache keys its walk: elsewhere no key
                     # would ever file it, and it would take a slot from a prefill's snapshot
@@ -793,6 +810,8 @@ class RecurrentStatePool(Resource):
         """Key snapshots by the page chains of ``kv``, the cache `config.kv_cache` names.
         A pool with no snapshot slots keys none."""
         self._kv = kv if self.config.prefix_slots else None
+        if self._kv is not None:
+            kv.bind_snapshots(self)
         self._check_snapshot_chunk()
 
     def bind_snapshot_writer(
@@ -838,7 +857,7 @@ class RecurrentStatePool(Resource):
         """The blocks' shapes and dtypes. The state's dtype changes what the
         recurrent layers output, and so every KV page written after them."""
         return fingerprint(sorted(
-            (name, block.shape, str(block.dtype)) for name, block in self.config.blocks.items()
+            (name, block.shape, str(self._blocks[name].dtype)) for name, block in self.config.blocks.items()
         ))
 
     def resolve_cached_prefix(
@@ -892,7 +911,7 @@ class RecurrentStatePool(Resource):
     def _take_snapshot(self, rid: str, label: str, keys: list[bytes], hit: int) -> SnapshotLease:
         """Lease the longest snapshot filed under ``keys`` (the chain's page keys up to the KV
         cache's ``hit``). Caller holds the lock."""
-        pages = next((n for n in range(len(keys), 0, -1) if keys[n - 1] in self._snap_by_key), 0)
+        pages = self.restorable(keys)
         snap = self._snap_by_key[keys[pages - 1]] if pages else None
         if snap is not None:
             self._snap_refs[snap] = self._snap_refs.get(snap, 0) + 1
@@ -966,6 +985,17 @@ class RecurrentStatePool(Resource):
     def page_trail(self) -> tuple[int, int] | None:
         with self._lock:
             return self._trail
+
+    def restorable(self, keys: Sequence[bytes]) -> int:
+        """How many of ``keys``' leading pages a hit can skip: up to the longest prefix this pool holds a
+        snapshot for, or all of them while snapshots are off.
+
+        Takes no lock, since this pool calls into the KV cache with its lock held, and the KV cache asks
+        with its own held.
+        """
+        if self._kv is None:
+            return len(keys)
+        return next((n for n in range(len(keys), 0, -1) if keys[n - 1] in self._snap_by_key), 0)
 
     @staticmethod
     def _cut(prefix: CachedPrefix, tokens: int) -> CachedPrefix:
@@ -1147,6 +1177,7 @@ class RecurrentStatePool(Resource):
             return False
         self._snap_by_key[key] = snap
         self._snap_meta[snap] = (key, reply)
+        self.filed += 1
         return True
 
     def _save_decode(self, rid: str, label: str, slot: SlotState) -> None:
@@ -1359,6 +1390,22 @@ class RecurrentStatePool(Resource):
         return found
 
     # Resident planning
+
+    def max_repeats(self, step, ctx) -> int:
+        """A row's state is updated in place, at its slot. While prefix snapshots
+        are on, a run ends on each keyed row's next page boundary, where commit
+        snapshots it: a replay can't stop to copy the state mid-run."""
+        if self._kv is None:
+            return ANY_REPEATS
+        page = self._kv.config.tokens_per_page
+        room = ANY_REPEATS
+        with self._lock:
+            for segment in step.segments or ():
+                labels = self._slots.get(segment.request_id)
+                slot = labels.get(segment.label) if labels else None
+                if slot is not None and (segment.request_id, segment.label) in self._keyed:
+                    room = min(room, page - slot.tokens % page)
+        return room
 
     def resident_refusal(self) -> str | None:
         if self.config.disable_sink_slot:

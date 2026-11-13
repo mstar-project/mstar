@@ -97,11 +97,11 @@ class _Loop(UniPCDenoiseLoopSubmodule):
     def bucket_key_for(self, fwd_info):
         return "key"
 
-    def schedule_for(self, fwd_info, bucket_key):
-        sigmas, timesteps = make_unipc_tables(fwd_info.step_metadata["steps"], 5.0)
+    def schedule_for(self, walk, num_steps, bucket_key):
+        sigmas, timesteps = make_unipc_tables(num_steps, 5.0)
         return FlowMatchSchedule(sigmas=sigmas, timesteps=timesteps, mu=None)
 
-    def seed_latents(self, fwd_info, bucket_key, generator):
+    def seed_latents(self, bucket_key, generator):
         return torch.randn(1, 4, generator=generator)
 
     def request_inputs(self, fwd_info, inputs, bucket_key):
@@ -117,8 +117,8 @@ class _Loop(UniPCDenoiseLoopSubmodule):
 
 def _info(rid, steps, k):
     return SimpleNamespace(
-        request_id=rid, rid_handle=rid, random_seed=hash(rid) % 1000, step_metadata={"steps": steps},
-        dynamic_loop_iter_counts={"loop": k},
+        request_id=rid, rid_handle=rid, random_seed=hash(rid) % 1000, step_metadata={"num_inference_steps": steps},
+        dynamic_loop_iter_counts={"loop": k}, graph_walk="gen",
     )
 
 

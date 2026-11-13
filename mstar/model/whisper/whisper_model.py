@@ -472,7 +472,7 @@ class WhisperModel(Model):
     # Model ABC: media loading + prompt processing
     # -------------------------------------------------------------------
 
-    def prompt_tokens(self, prompt: str | None) -> list[int]:
+    def _initial_prompt_ids(self, prompt: str | None) -> list[int]:
         """The ``<|startofprev|>`` context: prior transcript text, tokenized
         the way openai-whisper does (a leading space, no specials)."""
         if not prompt or not prompt.strip():
@@ -523,7 +523,7 @@ class WhisperModel(Model):
         if task not in self.config.task_to_id:
             raise ValueError(f"Whisper task must be one of {sorted(self.config.task_to_id)}, got {task!r}")
         timestamps = bool(kw.get("timestamps", False))
-        prev_tokens = self.prompt_tokens(kw.get("initial_prompt"))
+        prev_tokens = self._initial_prompt_ids(kw.get("initial_prompt"))
         prompt_ids = self.config.decoder_prompt_ids(
             language=language, task=task, timestamps=timestamps, prev_tokens=prev_tokens,
         )

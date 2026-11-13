@@ -81,6 +81,21 @@ class DecoderLayer(nn.Module):
         return next_norm.forward_residual(self.mlp(h), residual, comm_group)
 
 
+@torch.compiler.disable
+def no_cursor(i: int, self_attn: nn.Module) -> None:
+    """``run_layers``'s ``set_cursor`` for layers that name themselves to their state handles."""
+
+
+def eager_frame(forward: Callable) -> Callable:
+    """Dynamo skips ``forward``'s frame and still compiles what it calls, for a frame around `run_layers` with no tensor
+    work of its own. Otherwise it and its resume after `run_layers` would recompile on every shape for nothing."""
+    dynamo = torch._dynamo.eval_frame
+    dynamo.set_code_exec_strategy(
+        forward.__code__, dynamo.FrameExecStrategy(dynamo.FrameAction.SKIP, dynamo.FrameAction.DEFAULT),
+    )
+    return forward
+
+
 def run_layers(
     layers: nn.ModuleList, hidden_states: torch.Tensor, norm: nn.Module,
     set_cursor: Callable[[int, nn.Module], None] | None = None,
@@ -115,11 +130,10 @@ def run_layers(
 class GatedDecoderLayer(nn.Module):
     """Pre-norm decoder layer with adaRMS gated residuals.
 
-    The norms must be ``AdaRMSNorm``-shaped: ``forward(x, cond)`` returns
+    The norms must be ``AdaRMSNorm``-shaped: ``forward(x, modulation)`` returns
     ``(normed, gate)``. The residual becomes ``x + gate * y``.
 
-    Used by pi05's action expert; ``adarms_cond`` is the shared condition
-    vector consumed by both norms.
+    Used by pi05's action expert; ``modulation`` is passed to both norms as is.
     """
 
     def __init__(
@@ -136,14 +150,14 @@ class GatedDecoderLayer(nn.Module):
         self.post_attention_layernorm = post_attention_layernorm
 
     def forward(
-        self, hidden_states: torch.Tensor, adarms_cond: torch.Tensor,
+        self, hidden_states: torch.Tensor, modulation: torch.Tensor,
     ) -> torch.Tensor:
         residual = hidden_states
-        normed, gate = self.input_layernorm(hidden_states, adarms_cond)
+        normed, gate = self.input_layernorm(hidden_states, modulation)
         attn_out = self.self_attn(normed)
         hidden_states = _gated_residual(residual, attn_out, gate)
 
         residual = hidden_states
-        normed, gate = self.post_attention_layernorm(hidden_states, adarms_cond)
+        normed, gate = self.post_attention_layernorm(hidden_states, modulation)
         mlp_out = self.mlp(normed)
         return _gated_residual(residual, mlp_out, gate)

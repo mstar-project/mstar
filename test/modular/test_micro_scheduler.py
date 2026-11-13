@@ -23,6 +23,7 @@ sys.path.insert(0, ".")
 import pytest
 
 from mstar.engine.chunking import ChunkingManagement, ChunkRange
+from mstar.engine.resources import Residency
 from mstar.engine.resources.step import (
     FULL_ADMIT_NOT_READY,
     FULL_ADMIT_OK,
@@ -93,6 +94,10 @@ class _Runtime:
     @staticmethod
     def get_rid_handle(wire_rid):
         return wire_rid
+
+    @staticmethod
+    def get_rid_string(handle):
+        return handle
 
     def _names(self, target, node_name, walk):
         return target[0] == node_name and target[1] in (
@@ -252,8 +257,8 @@ class _Manager:
         return self.walks.get(rid, self._walk)
 
     def get_fwd_info(self, rid, partition):
-        del rid, partition
-        return object()
+        del partition
+        return SimpleNamespace(graph_walk=self.walk_of(rid))
 
 
 class _Engine:
@@ -312,6 +317,9 @@ class _Engine:
         del node_name, graph_walk, fwd_info
         self.metadata[rid] = input_metadata
         return self.groups.get(rid)
+
+    def residency(self, node_name, rid):
+        return Residency.RESIDENT
 
     def check_ready(self, node_name, rid, fwd_info, allow_reload=True):
         del node_name, fwd_info

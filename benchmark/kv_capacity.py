@@ -1,7 +1,7 @@
 """How many requests of L tokens a paged KV pool that keeps a window holds, with and without it.
 
 Builds the KV manager as a server would: the model's own KV spec with the serving
-config's ``resources:`` block applied (``apply_yaml_overrides``), sharded to one rank of
+config's ``resources:`` block applied (``serving_resources``), sharded to one rank of
 its node's tp * sp heads, on the GPU. It then admits requests one after another as a
 server does and grows each one: a prefill of L - 128 tokens in one step, then 128 one-token
 decode steps. It stops at the first request admission makes wait, or whose step is refused.
@@ -45,7 +45,6 @@ from mstar.engine.resources.kv.config import (  # noqa: E402
 )
 from mstar.engine.resources.kv.manager import KVManager  # noqa: E402
 from mstar.engine.resources.kv.transfer import TransferEngineInfo  # noqa: E402
-from mstar.engine.resources.spec import apply_yaml_overrides  # noqa: E402
 from mstar.engine.resources.step import Segment, StepContext  # noqa: E402
 
 DECODE = 128
@@ -53,14 +52,14 @@ DECODE = 128
 
 def kv_configs(config, model_path=None):
     """The serving config's sliding KV pool for one rank, with and without its sliding layers."""
+    from mstar.model.base import serving_resources
     from mstar.model.registry import get_model_class, model_init_kwargs
 
     serving = yaml.safe_load(Path(config).read_text())
     kwargs = {**model_init_kwargs(serving["model"]), **(serving.get("model_kwargs") or {})}
     if model_path:
         kwargs["model_path_hf"] = model_path
-    specs = get_model_class(serving["model"])(**kwargs).get_node_resources()
-    apply_yaml_overrides(specs, serving)
+    specs = serving_resources(get_model_class(serving["model"])(**kwargs), serving)
     sliding = [s for s in specs if isinstance(s, KVSpec) and isinstance(s.config, PagedKVConfig)
                and len(s.config.groups) > 1]
     if len(sliding) != 1:

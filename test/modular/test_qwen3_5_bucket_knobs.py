@@ -92,7 +92,7 @@ def _compile_modes(m):
     from mstar.model.multimodal import vision_encoder
 
     submodule = m.LLMSubmodule.__new__(m.LLMSubmodule)
-    submodule._encoders = (vision_encoder((5,)),)
+    submodule._encoders = (vision_encoder(),)
     configs = m.LLMSubmodule.get_accelerator_graph_configs(submodule, torch.device("cpu"))
     return {c.capture_graph_walk: c.compile_mode for c in configs}
 

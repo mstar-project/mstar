@@ -295,6 +295,40 @@ def test_encoder_node_batches_like_single_requests(causal, captured):
 
 
 
+@pytest.mark.parametrize("captured", [False, True], ids=["eager", "captured"])
+def test_encoder_node_keeps_only_eager_attention_off_cudnn(monkeypatch, captured):
+    """Eager encoder calls (a clip past every bucket, or no captures) run their
+    attention with cuDNN disabled; a captured bucket's calls leave it enabled."""
+    from mstar.model.components.fastconformer_submodule import (
+        MEL_BUCKETS,
+        FastConformerEncoderSubmodule,
+        _region,
+    )
+
+    sdpa = torch.nn.functional.scaled_dot_product_attention
+    calls: list[tuple[int, bool]] = []
+
+    def spy(q, *args, **kwargs):
+        calls.append((q.shape[2], torch.backends.cuda.cudnn_sdp_enabled()))
+        return sdpa(q, *args, **kwargs)
+
+    monkeypatch.setattr(torch.nn.functional, "scaled_dot_product_attention", spy)
+    config = FastConformerConfig.from_hf(TINY)
+    node = FastConformerEncoderSubmodule(FastConformerEncoder(config).eval(), normalize_features=False)
+    lens = [100, MEL_BUCKETS[-1] + 104]
+    runners = {_region(b): _PaddedReplay(node, b) for b in MEL_BUCKETS} if captured else {}
+    assert torch.backends.cuda.cudnn_sdp_enabled()
+    with torch.no_grad():
+        node._encode([torch.randn(n, 16) for n in lens], [int(config.output_lengths(n)) for n in lens], runners)
+    assert torch.backends.cuda.cudnn_sdp_enabled()
+
+    per_layer = TINY["num_hidden_layers"]
+    # a captured clip runs padded to its bucket, with cuDNN left on
+    short = (int(config.output_lengths(MEL_BUCKETS[0] if captured else lens[0])), captured)
+    long = (int(config.output_lengths(lens[1])), False)
+    assert calls == [short] * per_layer + [long] * per_layer
+
+
 def test_encoder_node_features_pad_per_group_not_to_the_batch(monkeypatch):
     """``preprocess`` computes log-mel per replay group, so a clip past every
     bucket doesn't pad the batch's short clips to its length, and each row

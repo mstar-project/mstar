@@ -1,3 +1,4 @@
+import enum
 import functools
 import itertools
 import math
@@ -5,7 +6,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from fractions import Fraction
-from typing import TYPE_CHECKING, NamedTuple, Type
+from typing import TYPE_CHECKING, Any, NamedTuple, Type
 
 import torch
 import yaml
@@ -25,7 +26,7 @@ from mstar.distributed.base import (
     node_group_axis_sizes,
 )
 from mstar.engine.resources import NodeResourceSpec, ResourceReqConfig
-from mstar.engine.resources.kv.config import RetentionPolicy, SpanKind
+from mstar.engine.resources.kv.config import RetentionPolicy, Span, SpanKind
 from mstar.engine.resources.lora.config import LORA_ADAPTER_KWARG, LORA_DIGEST_KWARG
 from mstar.engine.resources.sampler.utils import SamplingConfig
 from mstar.graph.base import (
@@ -143,6 +144,8 @@ if TYPE_CHECKING:
     from mstar.quantization.resolve import QuantizationRoot
 
 if TYPE_CHECKING:
+    from mstar.engine.state import Array, Sampler, SampleSettings, SeqShard
+    from mstar.engine.state.adapters import StateSetup
     from mstar.worker.scheduling_policy import WalkPriority
 
 DECODE = "decode"
@@ -164,15 +167,30 @@ class RobotIO(NamedTuple):
     action_dim: int
 
 
+class KeepAdapter(enum.Enum):
+    """``ProcessPromptOutput.lora_adapter`` left unset."""
+    KEEP = "keep"
+
+
+# the request runs on the adapter its client named, or on the base model
+KEEP_ADAPTER = KeepAdapter.KEEP
+
+
 class ProcessPromptOutput(NamedTuple):
     """Tensors from `process_prompt`, and metadata to carry beside them.
 
     The data worker folds ``metadata`` into the request's ``model_kwargs``, so
     what a model settles while tokenizing reaches
     `get_request_resource_configs` without a field of its own on the request.
+
+    ``lora_adapter`` is the LoRA adapter the model runs this prompt on, one of
+    ``Model.prompt_lora_adapters``, or None for the base model; the data worker
+    gives the request what the API server gives a client that names it
+    (``ServedModels.model_chose``). Unset keeps the client's choice.
     """
     new_input_tensors: NameToTensorList
     metadata: dict
+    lora_adapter: str | None | KeepAdapter = KEEP_ADAPTER
 
 
 class ClientChunk(NamedTuple):
@@ -189,39 +207,15 @@ class ClientChunk(NamedTuple):
     request_kwargs: dict
 
 
-class Span(NamedTuple):
-    """One write to a KV stream. A layout lists them in the order the walks write.
-
-    Each span is one step's row, unless a span sets ``opens_step`` False: the step of
-    the span before it then writes it too, in the same row, as text around an attachment is.
-    That span is of the same walk, since a step runs one.
-
-    ``length`` is how many KV slots the write fills, and ``advance`` is how far
-    it moves the position counter, which is the length for text. ``source`` is
-    the tensor whose next entry an ids span keys, or the file of a digest span
-    as ``(modality, index)``. ``params`` are the preprocessing arguments that
-    change the tensors made from the file. A ``rows`` span writes KV made from
-    anything else, such as another node's outputs, and is never keyed.
-    ``scratch`` is the most a non-committing step writes before the span
-    commits into those slots, as a denoised window does.
-    """
-    kind: SpanKind
-    walk: str
-    length: int
-    advance: int
-    source: str | tuple[str, int]
-    params: tuple = ()
-    scratch: int = 0
-    opens_step: bool = True
-
-
 class LabelLayout(NamedTuple):
     """Everything a request writes into one paged KV label, from `process_prompt`'s ``kv_layout``.
 
     ``spans`` are the committed writes known at intake, in walk order. Each
     ``(loop, slots)`` in ``growth`` writes ``slots`` per iteration of the named
-    loop. ``scratch`` is the most one non-committing step writes past the
-    committed length, and ``retention`` the policy the label's committing steps declare.
+    loop, and ``max_growth``, when set, is the most slots ``growth`` writes in all,
+    for loops that end before their caps. ``scratch`` is the most one
+    non-committing step writes past the committed length, and ``retention`` the
+    policy the label's committing steps declare.
     """
     spans: tuple[Span, ...] = ()
     growth: tuple[tuple[str, int], ...] = ()
@@ -229,6 +223,7 @@ class LabelLayout(NamedTuple):
     retention: RetentionPolicy | None = None
     # how many leading spans the label's keys cover, by default every span before the first rows span
     keyed_spans: int | None = None
+    max_growth: int | None = None
 
     def keyed_count(self) -> int:
         if self.keyed_spans is not None:
@@ -236,7 +231,7 @@ class LabelLayout(NamedTuple):
         return next((i for i, span in enumerate(self.spans) if span.kind == SpanKind.ROWS), len(self.spans))
 
     def row(self) -> list:
-        """The layout as ``[spans, growth, scratch, retention, keyed spans]``, a span as
+        """The layout as ``[spans, growth, scratch, retention, keyed spans, max growth]``, a span as
         ``[length, advance, walk, scratch, digest, end key, opens step, kind]``: plain values, which
         keep a request's kwargs on the wire's msgpack path. Digest and end key are None until the
         preprocess worker keys the span."""
@@ -264,6 +259,7 @@ class LabelLayout(NamedTuple):
             self.scratch,
             None if retention is None else [retention.context_budget, retention.protected_prefix],
             self.keyed_count(),
+            self.max_growth,
         ]
 
 
@@ -554,25 +550,35 @@ def streamed_inputs(model: "Model", graph_walk: str, graph: GraphSection) -> set
     }
 
 
-def enabled_resources(model: "Model", model_config: dict) -> list[NodeResourceSpec]:
+def enabled_resources(model: "Model", model_config: dict, setup: "StateSetup") -> list[NodeResourceSpec]:
     """The resource specs a deployment's YAML turns on, before its ``resources:``
     overrides: the model's declaration, less the opt-in specs (``NodeResourceSpec.opt_in``)
-    its ``resources:`` block does not name."""
+    its ``resources:`` block does not name. Raises the first problem with the declaration,
+    for callers that skip ``validate_deployment``, which reports them all."""
+    from mstar.engine.state.adapters import node_resources
+    from mstar.engine.state.analysis import state_declaration_problems
+
+    problems = state_declaration_problems(model)
+    if problems:
+        raise ValueError(problems[0])
     named = (model_config.get("resources") or {}).keys()
     return [
-        spec for spec in model.get_node_resources() or []
+        spec for spec in node_resources(model, setup=setup)
         if not spec.opt_in or spec.resource_key in named
     ]
 
 
-def declared_resources(model: "Model", model_config: dict) -> list[NodeResourceSpec]:
+def declared_resources(
+    model: "Model", model_config: dict, setup: "StateSetup | None" = None,
+) -> list[NodeResourceSpec]:
     """The resource specs a deployment declares: ``enabled_resources`` with the YAML's
     overrides applied. A ``per_node`` spec is whole here, as the API server checks
     requests and adapters against it; ``serving_resources`` splits it."""
     from mstar.engine.resources.spec import apply_yaml_overrides
+    from mstar.engine.state.adapters import spec_overrides
 
-    specs = enabled_resources(model, model_config)
-    apply_yaml_overrides(specs, model_config)
+    specs = enabled_resources(model, model_config, setup or deployment_setup(model, model_config))
+    apply_yaml_overrides(specs, spec_overrides(model_config))
     return specs
 
 
@@ -600,7 +606,20 @@ def parse_autocast_dtype(value) -> torch.dtype | None:
     return dtype
 
 
-def serving_resources(model: "Model", model_config: dict) -> list[NodeResourceSpec]:
+def deployment_setup(model: "Model", model_config: dict) -> "StateSetup":
+    """The `StateSetup` ``model_config`` asks for, raising its first problem, for callers that skip
+    ``validate_deployment``, which reports them all."""
+    from mstar.engine.state.adapters import state_setup
+
+    setup, problems = state_setup(model_config, model.declare_state())
+    if problems:
+        raise ValueError(problems[0])
+    return setup
+
+
+def serving_resources(
+    model: "Model", model_config: dict, setup: "StateSetup | None" = None,
+) -> list[NodeResourceSpec]:
     """The resource specs a deployment builds: ``declared_resources``, as
     ``built_resources``.
 
@@ -609,7 +628,7 @@ def serving_resources(model: "Model", model_config: dict) -> list[NodeResourceSp
     ``validate_deployment`` takes the same steps, reporting every problem rather than
     the first.
     """
-    return built_resources(declared_resources(model, model_config))
+    return built_resources(declared_resources(model, model_config, setup))
 
 
 class Model(ABC):
@@ -639,6 +658,10 @@ class Model(ABC):
     ENGINE_KWARGS: tuple[str, ...] = (
         "seed", "prefix_cache", "return_token_ids", "return_logprobs", LORA_ADAPTER_KWARG, LORA_DIGEST_KWARG,
     )
+    # Output modalities a client plays as they stream, where a pause is a gap. A streamed request with one of
+    # them reserves its whole KV footprint and is never preempted. ``unpausable_outputs`` in the serving config
+    # overrides it.
+    UNPAUSABLE_OUTPUTS: frozenset[str] = frozenset({"audio"})
 
     # Intra-op threads for the API server's preprocessing of this model's
     # inputs (``load_image``, ``process_prompt``, ...). None takes a default
@@ -654,6 +677,10 @@ class Model(ABC):
     # conductor in arrival order. Declare it only once those calls are checked
     # for shared state, and for the GIL: work that holds it gains nothing here.
     PREPROCESS_PARALLEL: bool = False
+    # Also decode one request's images at once, for a ``load_image`` that is mostly
+    # a GIL-free decode: intra-op work in it would run on each of these threads.
+    # It needs PREPROCESS_PARALLEL, since the decode pool is sized like the prepare pool.
+    PREPROCESS_PARALLEL_IMAGES: bool = False
 
     # The rate the default ``load_audio`` decodes an upload to, and the longest
     # clip it decodes (default 30 min). The request's audio budget
@@ -768,17 +795,30 @@ class Model(ABC):
             for node in graph.get_nodes()
         })
 
-    @abstractmethod
     def get_node_resources(self) -> list[NodeResourceSpec]:
         """Declare the resources the engine builds, and which nodes share each.
 
-        The whole declaration: a KV cache's shape, the attention backend over
-        it, positions, samplers. The engine builds one resource per spec and
-        hands each node the subset naming it. An opt-in spec (per-request LoRA
-        adapters) is declared here too, and built only for a deployment whose
-        ``resources:`` block names it.
+        The whole declaration, apart from what `declare_state` declares: a KV
+        cache's shape, the attention backend over it, positions, samplers. The
+        engine builds one resource per spec and hands each node the subset naming it.
+        An opt-in spec (per-request LoRA adapters) is declared here too, and built
+        only for a deployment whose ``resources:`` block names it.
         """
-        pass
+        return []
+
+    def declare_state(self) -> "list[Array | Sampler | SeqShard]":
+        """The state the model keeps between steps, from which the engine builds the specs for it.
+
+        A pure function of the model's config and the deployment's settings, since each process calls it.
+        """
+        return []
+
+    def kernel_settings(self) -> dict[str, dict[str, Any]]:
+        """By read, update or array name, what the engine doesn't pick itself yet: ``splits`` and ``decode_fmha`` on a
+        read, ``splits`` on a GatedDeltaNet, the capture sizes of a ``Block`` read, and a pool's default size,
+        ``max_num_pages`` on a paged array and ``max_slots`` on a Value with tensor fields. A deployment's
+        ``resources:`` block overrides each pool size."""
+        return {}
 
     def get_quantization_roots(self) -> list["QuantizationRoot"]:
         """The weights roots whose linears (and MoE experts) a ``quantization:`` block may set, one per node
@@ -857,7 +897,7 @@ class Model(ABC):
         """The paged KV labels the model's walks write, by resource and label.
 
         `process_prompt` returns a `LabelLayout` for each under ``kv_layout``, as
-        ``{resource: {label: LabelLayout}}``. A label with keys opts its node into
+        ``{resource: {label: LabelLayout}}``, or a `Layout` under ``state_layout``. A label with keys opts its node into
         cross-request prefix reuse: the preprocess worker keys its layout's keyed
         spans and the KV resource matches what it already holds. With no keyed
         label the model is uncached whatever the deployment asks for.
@@ -869,7 +909,7 @@ class Model(ABC):
         input_modalities: list[str],
         output_modalities: list[str],
         model_kwargs: dict,
-    ) -> dict[str, ResourceReqConfig]:
+    ) -> "dict[str, ResourceReqConfig | SampleSettings]":
         """Per-resource config a new request is opened with, by resource label.
 
         Where a request's knobs live now: sampling params, whether it needs
@@ -1041,6 +1081,21 @@ class Model(ABC):
         """
         pass
 
+    def prompt_tokens(self, tensors: NameToTensorList, kv_layout: dict[str, dict[str, LabelLayout]]) -> int:
+        """A response's ``usage.prompt_tokens``: the positions the prompt fills,
+        attachments included, as OpenAI and vLLM count them. ``tensors`` and
+        ``kv_layout`` are what `process_prompt` returned, with a ``state_layout``
+        converted to a ``kv_layout``. By default the ids in
+        ``text_inputs``, which hold each attachment's pads in place; a model
+        that splits ``text_inputs`` around its attachments adds theirs."""
+        return sum(ids.numel() for ids in tensors.get("text_inputs", ()))
+
+    def prompt_lora_adapters(self) -> frozenset[str]:
+        """The LoRA adapters ``process_prompt`` may run a prompt on
+        (``ProcessPromptOutput.lora_adapter``). The API server refuses, at startup, a
+        deployment whose ``resources: lora: adapters:`` block does not serve them all."""
+        return frozenset()
+
     def max_input_files(self) -> dict[str, int]:
         """Most files of each input modality one request may attach, e.g.
         ``{"audio": 1}``. The data worker refuses a request over it before
@@ -1195,7 +1250,7 @@ class Model(ABC):
     @abstractmethod
     def get_submodule(
         self, node_name: str, device="cpu", tp_group=None,
-        autocast_dtype: torch.dtype | None = None, sp_group=None,
+        autocast_dtype: torch.dtype | None = None,
         moe_parallel: "MoeParallelConfig | None" = None, cfg_group=None,
     ) -> torch.nn.Module | None:
         """Return the nn.Module for this node, or None for dummy mode.
@@ -1205,12 +1260,6 @@ class Model(ABC):
         Models that support tensor parallelism should forward it to
         parallel-linear constructors so weight shapes are partitioned at
         init time and the weight loaders shard correctly.
-
-        ``sp_group`` is the node's sequence-parallel comm group, orthogonal
-        to ``tp_group``. The engine manager only passes it when the node
-        participates in a non-trivial SP group, so models without SP support
-        never receive it. Models that support SP forward it to their
-        attention so it can all-to-all the sequence around the kernel.
 
         ``cfg_group`` is the node's classifier-free-guidance comm group, for
         a node in ``cfg_enabled_nodes`` whose group sets ``cfg_size > 1``

@@ -2,7 +2,7 @@
 
 Structural behaviour only — no weights, no GPU: seeded noise at iteration 0, the step
 index from the engine's loop counter, equal-shape batching, stacked preprocess and
-per-row outputs, the CUDA-graph bucket key and the ragged-attention step declaration.
+per-row outputs, the CUDA-graph bucket key and the step's arrays and segments.
 """
 
 from __future__ import annotations
@@ -10,6 +10,7 @@ from __future__ import annotations
 import dataclasses
 import sys
 import threading
+from collections import deque
 
 import pytest
 import torch
@@ -33,8 +34,15 @@ LOOP = "denoise_loop"
 WALK = "image_gen"
 
 
+
+def _schedule(sub, info):
+    """The memoized schedule of ``info``'s walk, at its own bucket key."""
+    return sub.schedule_of(info, sub.bucket_key_for(info))
+
 class ToyDenoise(DenoiseLoopSubmodule):
     """Velocity = -latents scaled by a learned-free constant; shape key = token count."""
+
+    ARRAYS: tuple[str, ...] = ()
 
     def __init__(self, **kwargs):
         super().__init__(loop_name=LOOP, **kwargs)
@@ -44,11 +52,10 @@ class ToyDenoise(DenoiseLoopSubmodule):
     def bucket_key_for(self, fwd_info):
         return (int(fwd_info.step_metadata["tokens"]), 3)
 
-    def schedule_for(self, fwd_info, bucket_key):
-        steps = int(fwd_info.step_metadata["num_inference_steps"])
-        return FlowMatchSchedule.build(FlowMatchConfig(), steps, bucket_key[0])
+    def schedule_for(self, walk, num_steps, bucket_key):
+        return FlowMatchSchedule.build(FlowMatchConfig(), num_steps, bucket_key[0])
 
-    def seed_latents(self, fwd_info, bucket_key, generator):
+    def seed_latents(self, bucket_key, generator):
         return torch.randn(bucket_key[0], 4, generator=generator)
 
     def request_inputs(self, fwd_info, inputs, bucket_key):
@@ -56,6 +63,9 @@ class ToyDenoise(DenoiseLoopSubmodule):
 
     def num_tokens(self, bucket_key):
         return bucket_key[0] + bucket_key[1]
+
+    def attention_segments(self, bucket_key):
+        return {name: ((self.MAIN_SPAN, self.num_tokens(bucket_key)),) for name in self.ARRAYS}
 
     def capture_request_inputs(self, bucket_key, device):
         return {LATENTS: torch.zeros(bucket_key[0], 4, device=device), "cond": torch.zeros(3, device=device)}
@@ -98,11 +108,11 @@ def test_iteration_zero_seeds_from_request_seed_and_is_repeatable():
     assert torch.equal(a.tensor_inputs[LATENTS], b.tensor_inputs[LATENTS])
     assert not torch.equal(a.tensor_inputs[LATENTS], c.tensor_inputs[LATENTS])
     assert a.input_seq_len == 8 + 3 and a.resource_step_info == (8, 3)
-    state = sub.request_state(_handle("r0"))
-    assert state["schedule"].num_steps == 4
-    # step scalars come off the device-resident schedule
-    assert torch.equal(a.tensor_inputs["sigma"], state["sigmas"][0:1])
-    assert torch.equal(a.tensor_inputs["timestep"], state["timesteps"][0:1])
+    schedule = _schedule(sub, _info("r0", 0, seed=7))
+    assert schedule.num_steps == 4
+    # step scalars come off the schedule
+    assert torch.equal(a.tensor_inputs["sigma"], schedule.sigmas[0:1])
+    assert torch.equal(a.tensor_inputs["timestep"], schedule.timesteps[0:1])
 
 
 def test_later_iterations_take_the_loop_back_latents_and_step_k():
@@ -111,7 +121,7 @@ def test_later_iterations_take_the_loop_back_latents_and_step_k():
     x = torch.ones(8, 4)
     out = sub.prepare_inputs(WALK, _info("r0", 2), _inputs(x))
     assert out.tensor_inputs[LATENTS] is x
-    sched = sub.request_state(_handle("r0"))["schedule"]
+    sched = _schedule(sub, _info("r0", 2))
     assert torch.equal(out.tensor_inputs["sigma"], sched.sigmas[2:3])
     assert torch.equal(out.tensor_inputs["sigma_next"], sched.sigmas[3:4])
 
@@ -122,6 +132,16 @@ def test_missing_loop_back_latents_past_iteration_zero_raises():
     with pytest.raises(RuntimeError, match=r"\['latents'\] missing at iteration 2 of request r0"):
         sub.prepare_inputs(WALK, _info("r0", 2), _inputs())
 
+
+
+def test_a_step_builds_each_rows_bucket_key_once():
+    """Each memo and the check past the schedule built the row's key again, three times a row on every step."""
+    sub = ToyDenoise()
+    built = []
+    bucket_key_for = sub.bucket_key_for
+    sub.bucket_key_for = lambda info: built.append(info.request_id) or bucket_key_for(info)
+    sub.prepare_inputs(WALK, _info("r0", 0), _inputs())
+    assert built == ["r0"], f"prepare_inputs built the key {len(built)} times"
 
 def test_a_step_without_the_loop_counter_raises():
     """Read as 0, it would reseed from noise every iteration and run to max_iters."""
@@ -154,7 +174,7 @@ def test_preprocess_stacks_and_forward_batched_splits_rows():
     assert set(out) == {"a", "b"}
     assert out["a"][LATENTS][0].shape == (8, 4)
     # row b took its own sigma pair (step 1 of a 6-step schedule)
-    sched_b = sub.request_state(_handle("b"))["schedule"]
+    sched_b = _schedule(sub, _info("b", 1, steps=6))
     expected_b = euler_step(torch.ones(8, 4), -torch.ones(8, 4) * 0.5, sched_b.sigmas[1], sched_b.sigmas[2])
     assert torch.equal(out["b"][LATENTS][0], expected_b)
     assert sub.calls[-1] == ((2, 8, 4), (2,), (2, 1, 1), (2, 3))
@@ -164,8 +184,12 @@ def test_preprocess_stacks_and_forward_batched_splits_rows():
     assert single[LATENTS][0].shape == (8, 4)
 
 
+class OneArrayDenoise(ToyDenoise):
+    ARRAYS = ("tokens",)
+
+
 def test_cg_key_info_and_declare_step_agree():
-    sub = ToyDenoise(attn_resource_key="dit_attn")
+    sub = OneArrayDenoise()
     infos = {"a": _info("a", 0), "b": _info("b", 3)}
     assert sub.cg_key_info(WALK, infos) == (8, 3)
     infos["c"] = _info("c", 0, tokens=16)
@@ -178,10 +202,10 @@ def test_cg_key_info_and_declare_step_agree():
     step = sub.declare_step(WALK, ["a", "b"], [a, b])
     assert step.cg_key_info == (8, 3)
     assert [(s.request_id, s.label, s.span) for s in step.segments] == [("a", "main", 11), ("b", "main", 11)]
-    assert set(step.steps) == {"dit_attn"} and step.steps["dit_attn"].causal is False
+    assert set(step.state) == {"tokens"} and step.state["tokens"].segments == tuple(step.segments)
     # every row of a bucket spans its tokens, so the bucket's layout is fixed
-    assert step.steps["dit_attn"].fixed_layout is True
-    assert ToyDenoise().declare_step(WALK, ["a"], [a]) is None  # no resource declared -> nothing to plan
+    assert step.state["tokens"].fixed_layout is True
+    assert ToyDenoise().declare_step(WALK, ["a"], [a]) is None  # no array declared -> nothing to plan
 
 
 def test_accelerator_graph_configs_one_bucket_per_shape():
@@ -222,24 +246,24 @@ def test_captured_layouts_are_kept_and_the_rest_are_lru_bounded():
 
 
 class TwoSpanDenoise(ToyDenoise):
-    """A model whose refiner layers attend over the image tokens alone."""
+    """A model whose refiner layers attend over the image tokens alone, through an array of their own."""
 
     def attention_segments(self, bucket_key):
-        return (("image", bucket_key[0]), ("main", self.num_tokens(bucket_key)))
+        return {"image_tokens": (("image", bucket_key[0]),), "tokens": (("main", self.num_tokens(bucket_key)),)}
 
 
 def test_declare_step_lists_every_attention_span_per_row():
-    sub = TwoSpanDenoise(attn_resource_key="dit_attn")
+    sub = TwoSpanDenoise()
     a = sub.prepare_inputs(WALK, _info("a", 0), _inputs())
     b = sub.prepare_inputs(WALK, _info("b", 1), _inputs(torch.ones(8, 4)))
     step = sub.declare_step(WALK, ["a", "b"], [a, b])
     assert [(s.request_id, s.label, s.span) for s in step.segments] == [
         ("a", "image", 8), ("a", "main", 11), ("b", "image", 8), ("b", "main", 11),
     ]
+    assert [(s.request_id, s.span) for s in step.state["image_tokens"].segments] == [("a", 8), ("b", 8)]
+    assert [(s.request_id, s.span) for s in step.state["tokens"].segments] == [("a", 11), ("b", 11)]
     # a capture bucket's rows carry the shape key, so their spans match the real rows'
-    cfg = TwoSpanDenoise(attn_resource_key="dit_attn", capture_buckets=[(WALK, (8, 3))]).get_accelerator_graph_configs(
-        torch.device("cpu"),
-    )[0]
+    cfg = TwoSpanDenoise(capture_buckets=[(WALK, (8, 3))]).get_accelerator_graph_configs(torch.device("cpu"))[0]
     pad = cfg.single_request_inputs
     assert [(s.label, s.span) for s in sub.declare_step(WALK, ["pad"], [pad]).segments] == [("image", 8), ("main", 11)]
 
@@ -250,9 +274,9 @@ class UniPCDenoise(ToyDenoise):
 
     SOLVER_STATE = ("history",)
 
-    def seed_loop_back(self, fwd_info, bucket_key, generator):
+    def seed_loop_back(self, bucket_key, generator):
         return {
-            **super().seed_loop_back(fwd_info, bucket_key, generator),
+            **super().seed_loop_back(bucket_key, generator),
             "history": torch.zeros(bucket_key[0], 4),
         }
 
@@ -325,8 +349,8 @@ class GuidedDenoise(ToyDenoise):
         "guidance": StepScalar("guidances", broadcast=False, capture_fill=3.5),
     }
 
-    def schedule_for(self, fwd_info, bucket_key):
-        base = super().schedule_for(fwd_info, bucket_key)
+    def schedule_for(self, walk, num_steps, bucket_key):
+        base = super().schedule_for(walk, num_steps, bucket_key)
         # the only thing a new scalar needs: a source on the schedule. The base
         # stages it on the device and slices it per step.
         return GuidedSchedule(
@@ -346,7 +370,7 @@ def test_a_declared_step_scalar_is_sliced_reshaped_and_popped():
     # sliced at each row's own step index, and offset=1 still reads k + 1
     assert torch.equal(a.tensor_inputs["guidance"], torch.tensor([0.0]))
     assert torch.equal(b.tensor_inputs["guidance"], torch.tensor([2.0]))
-    sched_b = sub.request_state(_handle("b"))["schedule"]
+    sched_b = _schedule(sub, _info("b", 2))
     assert torch.equal(b.tensor_inputs["sigma_next"], sched_b.sigmas[3:4])
 
     engine_inputs = ModelInputsFromEngine(request_ids=["a", "b"], per_request_info={})
@@ -359,8 +383,10 @@ def test_a_declared_step_scalar_is_sliced_reshaped_and_popped():
     # and the capture bucket stages it at the declared fill
     cfg = GuidedDenoise(capture_buckets=[(WALK, (8, 3))]).get_accelerator_graph_configs(torch.device("cpu"))[0]
     assert torch.equal(cfg.single_request_inputs.tensor_inputs["guidance"], torch.tensor([3.5]))
-    # the base staged it off the schedule, so nothing had to touch the state
-    assert torch.equal(sub.request_state(_handle("a"))["guidances"], torch.arange(4.0))
+    # the base staged it off the schedule, so the model had nothing to keep
+    info = _info("a", 0)
+    assert torch.equal(sub._staged_schedules(*sub._schedule_key(info, sub.bucket_key_for(info)))["guidances"],
+                       torch.arange(4.0))
 
 
 def test_a_step_scalar_the_schedule_does_not_carry_says_so():
@@ -387,30 +413,6 @@ def test_a_step_scalar_too_short_for_its_offset_says_so():
         OffsetPastTheEnd().prepare_inputs(WALK, _info("a", 0), _inputs())
 
 
-def test_ragged_for_binds_the_label():
-    class Resource:
-        def run(self, q, k, v, label=None):
-            return self, label
-
-    sub = TwoSpanDenoise(attn_resource_key="dit_attn")
-    resource = Resource()
-    sub.bind_node_resources({"dit_attn": resource})
-    image = sub.ragged_for("image")
-    assert image(None, None, None) == (resource, "image")
-    assert sub._ragged()(None, None, None) == (resource, "main")
-    # built once per label for the binding, not per step
-    assert sub.ragged_for("image") is image and sub._ragged() is sub._ragged()
-    # a rebinding starts over: a callable holding the old resource would attend
-    # through a plan nothing writes to any more
-    new_resource = Resource()
-    sub.bind_node_resources({"dit_attn": new_resource})
-    assert sub.ragged_for("image")(None, None, None) == (new_resource, "image")
-    assert sub.ragged_for("main")(None, None, None) == (new_resource, "main")
-    assert ToyDenoise().ragged_for("image") is None  # no resource declared -> SDPA
-    unbound = TwoSpanDenoise(attn_resource_key="dit_attn")
-    assert unbound.ragged_for("image") is None  # declared but not bound yet -> SDPA
-
-
 def test_cg_key_info_accepts_the_contract_the_engine_calls_it_with():
     """``Engine.reserve_replay_slot`` passes ``per_request_input_metadata`` by
     keyword. This override did not take it, so every scaffold model raised
@@ -431,6 +433,62 @@ def test_cg_key_info_accepts_the_contract_the_engine_calls_it_with():
     assert sub.cg_key_info(
         WALK, {"a": _info("a", 0)}, per_request_input_metadata={"a": object()},
     ) == (8, 3)
+
+
+# The memos
+
+
+def test_a_schedule_memo_hit_equals_a_recompute():
+    sub = ToyDenoise()
+    memo = _schedule(sub, _info("a", 0, steps=4))
+    fresh = sub.schedule_for(WALK, 4, (8, 3))
+    assert _schedule(sub, _info("b", 2, steps=4)) is memo, "requests with the same settings share one schedule"
+    assert torch.equal(memo.sigmas, fresh.sigmas) and torch.equal(memo.timesteps, fresh.timesteps)
+
+
+def test_each_input_of_the_hook_moves_the_memos_key():
+    sub = ToyDenoise()
+    first = _schedule(sub, _info("a", 0, steps=4, tokens=8))
+    assert _schedule(sub, _info("a", 0, steps=5, tokens=8)) is not first
+    assert _schedule(sub, _info("a", 0, steps=4, tokens=16)) is not first
+    other_walk = dataclasses.replace(_info("a", 0, steps=4, tokens=8), graph_walk="refine")
+    assert _schedule(sub, other_walk) is not first
+
+
+def test_requests_with_the_same_settings_share_one_schedule_on_the_device():
+    sub = ToyDenoise()
+    sub.prepare_inputs(WALK, _info("a", 0, steps=4), _inputs())
+    sub.prepare_inputs(WALK, _info("b", 0, steps=4), _inputs())
+    assert sub._staged_schedules.cache_info().misses == 1
+
+
+def test_a_seed_memo_hit_equals_a_recompute():
+    sub = PrefetchingToy()
+    _added(sub, "p0", seed=11).result()
+    hit = sub.prepare_inputs(WALK, _info("p0", 0, seed=11), _inputs())
+    miss = sub.prepare_inputs(WALK, _info("p1", 0, seed=11), _inputs())
+    assert torch.equal(hit.tensor_inputs[LATENTS], miss.tensor_inputs[LATENTS])
+    assert sub.drawn_on == ["mstar-seed_0", "MainThread"], "the draw is taken once, and the second request misses"
+
+
+def test_requests_with_one_seed_each_take_a_draw_of_their_own():
+    sub = PrefetchingToy()
+    for rid in ("p0", "p1"):
+        _added(sub, rid, seed=11).result()
+    for rid in ("p0", "p1"):
+        sub.prepare_inputs(WALK, _info(rid, 0, seed=11), _inputs())
+    assert threading.current_thread().name not in sub.drawn_on, "one shared draw would have the second draw inline"
+    assert not sub._seed_draws
+
+
+def test_a_draw_nothing_takes_is_evicted_and_only_costs_a_redraw():
+    sub = PrefetchingToy()
+    sub._seed_draws = deque(maxlen=1)
+    _added(sub, "p0", seed=1).result()
+    _added(sub, "p1", seed=2).result()
+    assert [key for key, _ in sub._seed_draws] == [((8, 3), 2)]
+    sub.prepare_inputs(WALK, _info("p0", 0, seed=1), _inputs())
+    assert sub.drawn_on[-1] == threading.current_thread().name, "the evicted draw redraws inline"
 
 
 class ToyRefine(ToyDenoise):
@@ -469,8 +527,7 @@ def test_a_second_walk_through_the_node_gets_its_own_shape_and_schedule():
         step_metadata={"tokens": 16, "num_inference_steps": 2}, dynamic_loop_iter_counts={LOOP: 0},
     )
     out = sub.prepare_inputs("refine", refine, _inputs())
-    state = sub.request_state(_handle("rs"))
-    assert state["schedule"].num_steps == 2 and state["bucket_key"] == (16, 3)
+    assert _schedule(sub, refine).num_steps == 2 and out.resource_step_info == (16, 3)
     assert out.tensor_inputs[LATENTS].shape == (16, 4)
 
 
@@ -481,9 +538,7 @@ class PrefetchingToy(ToyDenoise):
         super().__init__(**kwargs)
         self.drawn_on: list[str] = []
 
-    def seed_latents(self, fwd_info, bucket_key, generator):
-        import threading
-
+    def seed_latents(self, bucket_key, generator):
         self.drawn_on.append(threading.current_thread().name)
         # a permuted view, as klein's packing returns
         return torch.randn(4, bucket_key[0], generator=generator).t()
@@ -493,7 +548,7 @@ def _added(sub, rid, **info):
     """``on_request_added`` as the engine calls it at ingest, with the first walk's info."""
     ingest = dataclasses.replace(_info(rid, 0, **info), graph_walk="encode_text")
     sub.on_request_added(_handle(rid), ingest)
-    return sub.request_state(_handle(rid))["seed_draw"][1]
+    return sub._seed_draws[-1][1]
 
 
 def test_prefetched_seeds_are_drawn_off_the_calling_thread_and_match_an_inline_draw():
@@ -502,12 +557,12 @@ def test_prefetched_seeds_are_drawn_off_the_calling_thread_and_match_an_inline_d
     assert future.result()[LATENTS].is_contiguous()
     got = sub.prepare_inputs(WALK, _info("p0", 0, seed=11), _inputs())
     assert sub.drawn_on == ["mstar-seed_0"]
-    assert "seed_draw" not in sub.request_state(_handle("p0")), "the draw is taken once"
+    assert not sub._seed_draws, "the draw is taken once"
     inline = PrefetchingToy().prepare_inputs(WALK, _info("p1", 0, seed=11), _inputs())
     assert torch.equal(got.tensor_inputs[LATENTS], inline.tensor_inputs[LATENTS])
 
 
-def test_a_draw_for_another_bucket_key_is_dropped_and_drawn_inline():
+def test_a_draw_for_another_bucket_key_is_left_and_iteration_zero_draws_inline():
     sub = PrefetchingToy()
     _added(sub, "p2", tokens=8, seed=3).result()
     got = sub.prepare_inputs(WALK, _info("p2", 0, tokens=16, seed=3), _inputs())
@@ -521,51 +576,7 @@ def test_seeds_are_drawn_once_per_request_and_only_when_asked():
     assert sub.drawn_on == ["mstar-seed_0"]
     plain = ToyDenoise()
     plain.on_request_added(_handle("p4"), _info("p4", 0))
-    assert "seed_draw" not in plain.request_state(_handle("p4"))
-
-
-def test_removing_the_request_drops_its_draw():
-    sub = PrefetchingToy()
-    _added(sub, "p5").result()
-    sub.cleanup_request(_handle("p5"))
-    assert _handle("p5") not in sub.request_states
-
-
-class GatedToy(PrefetchingToy):
-    """Draws on the pool block until the test opens the gate, so a third request's
-    draw stays queued behind the pool's two threads; an inline draw is not gated."""
-
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.gate = threading.Event()
-
-    def seed_latents(self, fwd_info, bucket_key, generator):
-        if threading.current_thread().name.startswith("mstar-seed"):
-            self.gate.wait(timeout=10)
-        return super().seed_latents(fwd_info, bucket_key, generator)
-
-
-def test_removing_a_request_cancels_its_queued_draw():
-    sub = GatedToy()
-    running = [_added(sub, "q0"), _added(sub, "q1")]
-    queued = _added(sub, "q2")
-    sub.cleanup_request(_handle("q2"))
-    assert queued.cancelled(), "a queued draw would delay a live request's"
-    sub.gate.set()
-    for future in running:
-        future.result()
-
-
-def test_a_queued_draw_for_another_bucket_key_is_cancelled():
-    sub = GatedToy()
-    running = [_added(sub, "q3"), _added(sub, "q4")]
-    queued = _added(sub, "q5", tokens=8, seed=3)
-    got = sub.prepare_inputs(WALK, _info("q5", 0, tokens=16, seed=3), _inputs())
-    assert got.tensor_inputs[LATENTS].shape == (16, 4)
-    assert queued.cancelled()
-    sub.gate.set()
-    for future in running:
-        future.result()
+    assert not plain._seed_draws
 
 
 def test_an_initial_loop_back_of_its_own_is_not_handed_the_draw():

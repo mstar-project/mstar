@@ -6,9 +6,12 @@ High-level components
 
 ``mstar`` is organized as a set of cooperating processes:
 
-- **API server** (``mstar/api_server/``): FastAPI layer that accepts ``POST /generate``,
-  tokenizes/loads media, dispatches the request, and streams results back to the client.
-  Entry point: ``mstar.api_server.entrypoint:main`` (the ``mstar-serve`` console script).
+- **API server** (``mstar/api_server/``): accepts ``POST /generate`` and the OpenAI
+  routes, tokenizes/loads media, dispatches the request, and streams results back to the
+  client. Entry point: ``mstar.api_server.entrypoint:main`` (the ``mstar-serve`` console
+  script). HTTP is served by ``mstar-server`` (``rust/server/``), which talks to the
+  Python process over a local bridge; ``--python-frontend`` serves it from the
+  deprecated FastAPI app instead.
 - **Conductor** (``mstar/conductor/``): central coordinator. It manages the request
   lifecycle, handles graph-walk transitions, selects workers, routes inputs, and
   detects completion.
@@ -59,8 +62,8 @@ Core design principles
   ``prefill``, ``decode``, ``image_gen``) via ``get_graph_walk_graphs()``.
 - **Disaggregated.** Logical computation nodes map to physical workers via the YAML
   config's ``node_groups`` (node names → GPU ranks).
-- **Models declare, the engine executes.** A model declares its resources in
-  ``get_node_resources()``, and declares what each step does to them in
+- **Models declare, the engine executes.** A model declares its state in
+  ``declare_state()`` and any other resources in ``get_node_resources()``, and declares what each step does to them in
   ``NodeSubmodule.declare_step()``. The engine performs admission, planning, capture and
   commit. A step that cannot be admitted therefore becomes backpressure that the scheduler
   can resolve by eviction, instead of an error inside a forward pass.

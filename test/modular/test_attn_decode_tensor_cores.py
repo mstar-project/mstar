@@ -21,7 +21,8 @@ from mstar.engine.resources.attn.config import (
     CrossAttentionSpec,
 )
 from mstar.engine.resources.attn.cross import CrossAttentionManager
-from mstar.engine.resources.kv.config import PagedKVConfig
+from mstar.engine.resources.base import EngineResourceInfo
+from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
 from mstar.engine.resources.step import BucketKey, SlotLease
 
 
@@ -64,11 +65,8 @@ def _kv():
 
 
 def _info(kv):
-    return SimpleNamespace(
-        dependency=lambda name: SimpleNamespace(config=kv),
-        device=torch.device("cpu"), kv_dtype=torch.bfloat16,
-        joint_comm_group=None, head_shards=1, max_rows_in_combined={},
-    )
+    spec = KVSpec(resource_key="kv", nodes={"n"}, config=kv)
+    return EngineResourceInfo(device=torch.device("cpu"), dependencies={"kv": spec, "ctx": spec})
 
 
 @pytest.mark.parametrize("flag", [None, False, True])

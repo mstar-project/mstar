@@ -21,16 +21,16 @@ from mstar.engine.resources import (
     AdmitOutcome,
     AllocationFailed,
     KVStep,
-    Resource,
     Segment,
     StepContext,
     StepRunner,
     SubmoduleStep,
     topo_sort,
 )
+from mstar.testing_utils.resource import StubResource
 
 
-class _Stub(Resource):
+class _Stub(StubResource):
     """Records every lifecycle call it receives, in order."""
 
     def __init__(
@@ -55,10 +55,6 @@ class _Stub(Resource):
         self.calls: list[str] = []
         # plan_results as this resource saw it when its own plan ran
         self.deps_seen: dict | None = None
-
-    @classmethod
-    def build(cls, spec, device, comm_group, **engine_kwargs):
-        raise NotImplementedError("stub is constructed directly")
 
     @property
     def supports_preplan(self):

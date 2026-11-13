@@ -43,7 +43,7 @@ class OmniPatchMerger(nn.Module):
 
 
 class Qwen3OmniVisionTower(nn.Module):
-    def __init__(self, config: VisionEncoderConfig, attn_key: str):
+    def __init__(self, config: VisionEncoderConfig, attn_key: str, array: str):
         super().__init__()
         self.config = config
         self.patch_embed = VisionPatchEmbed(config)
@@ -51,7 +51,9 @@ class Qwen3OmniVisionTower(nn.Module):
         # fp32 through the worker's dtype cast, as the reference does: in bf16
         # the far patches of a large image rotate by visibly wrong angles
         self.rotary_pos_emb = VisionRotaryEmbedding(config, keep_fp32=True)
-        self.blocks = nn.ModuleList(VisionBlock(config, attn_key) for _ in range(config.depth))
+        self.blocks = nn.ModuleList(
+            VisionBlock(config, attn_key, array=array, layer=layer) for layer in range(config.depth)
+        )
         self.merger = OmniPatchMerger(config, postshuffle=False)
         self.merger_list = nn.ModuleList(
             OmniPatchMerger(config, postshuffle=True) for _ in config.deepstack_visual_indexes

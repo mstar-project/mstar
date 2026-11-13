@@ -1,7 +1,10 @@
 //! Optional API key (`MSTAR_API_KEY`), the same rule as the Python server's
 //! `mstar/api_server/auth.py`: when set, every route except the probes in
-//! `UNAUTHENTICATED_PATHS` needs `Authorization: Bearer <key>`. Applied once as
-//! a layer over the whole router, so a route added later is covered too.
+//! `UNAUTHENTICATED_PATHS` needs `Authorization: Bearer <key>`, a WebSocket at
+//! its handshake. A deployment that serves the openpi socket also takes
+//! openpi_client's conventions there, and only there: `Authorization: Api-Key
+//! <key>` on the `/` handshake, and `/healthz` without a key. Applied once as a
+//! layer over the whole router, so a route added later is covered too.
 
 use std::sync::Arc;
 
@@ -9,7 +12,7 @@ use axum::{
     extract::{Request, State},
     http::header::{AUTHORIZATION, WWW_AUTHENTICATE},
     middleware::Next,
-    response::Response,
+    response::{IntoResponse, Response},
 };
 use subtle::{Choice, ConstantTimeEq};
 
@@ -40,22 +43,34 @@ impl ApiKey {
         self.0.is_some()
     }
 
-    fn accepts(&self, authorization: Option<&[u8]>) -> bool {
+    fn accepts(&self, authorization: Option<&[u8]>, schemes: &[&[u8]]) -> bool {
         let Some(key) = &self.0 else { return true };
-        let Some(token) = authorization.and_then(bearer_token) else {
+        let Some(token) = authorization.and_then(|v| scheme_token(v, schemes)) else {
             return false;
         };
         ct_eq(key, token)
     }
 }
 
-fn bearer_token(value: &[u8]) -> Option<&[u8]> {
+/// The schemes every route takes, and openpi's socket's.
+const SCHEMES: &[&[u8]] = &[b"bearer"];
+const OPENPI_SCHEMES: &[&[u8]] = &[b"bearer", b"api-key"];
+
+fn scheme_token<'a>(value: &'a [u8], schemes: &[&[u8]]) -> Option<&'a [u8]> {
     let value = value.trim_ascii();
     let split = value.iter().position(|&b| b == b' ')?;
     let (scheme, token) = value.split_at(split);
-    scheme
-        .eq_ignore_ascii_case(b"bearer")
+    schemes
+        .iter()
+        .any(|s| scheme.eq_ignore_ascii_case(s))
         .then(|| token.trim_ascii())
+}
+
+/// A WebSocket handshake.
+fn is_websocket(req: &Request) -> bool {
+    req.headers()
+        .get(axum::http::header::UPGRADE)
+        .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"websocket"))
 }
 
 /// Equal in time that depends only on the key's length, never on how much of
@@ -70,8 +85,17 @@ fn ct_eq(key: &[u8], token: &[u8]) -> bool {
 
 pub async fn require_api_key(State(key): State<ApiKey>, req: Request, next: Next) -> Response {
     let authorization = req.headers().get(AUTHORIZATION).map(|v| v.as_bytes());
-    if UNAUTHENTICATED_PATHS.contains(&req.uri().path()) || key.accepts(authorization) {
+    let path = req.uri().path();
+    let socket = is_websocket(&req);
+    let openpi = matches!(path, "/" | "/healthz") && crate::ws::openpi::policy().is_some();
+    let openpi_health = openpi && path == "/healthz" && !socket;
+    let schemes = if openpi && path == "/" && socket { OPENPI_SCHEMES } else { SCHEMES };
+    if UNAUTHENTICATED_PATHS.contains(&path) || openpi_health || key.accepts(authorization, schemes) {
         return next.run(req).await;
+    }
+    if socket {
+        // the Python frontend refuses the handshake (closing before accept): a 403
+        return axum::http::StatusCode::FORBIDDEN.into_response();
     }
     let mut resp = crate::error(
         401,

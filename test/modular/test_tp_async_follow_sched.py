@@ -17,6 +17,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
+from mstar.engine.resources import Residency  # noqa: E402
 from mstar.engine.resources.step import FULL_ADMIT_NOT_READY, FULL_ADMIT_OK  # noqa: E402
 from mstar.graph.base import GraphNode  # noqa: E402
 from mstar.graph.runtime.base import (
@@ -50,6 +51,9 @@ class _FakeEngine:
         # Retryable not-ready only; a terminal AdmitRuntimeError is the
         # ``Admission.check_ready``'s business, pinned in test_micro_scheduler.
         return FULL_ADMIT_NOT_READY if rid in self.not_ready else FULL_ADMIT_OK
+
+    def residency(self, node_name, rid):
+        return Residency.RESIDENT
 
 
 class _FakeEngineManager:

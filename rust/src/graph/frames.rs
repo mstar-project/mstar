@@ -434,6 +434,12 @@ pub struct EdgeItems {
     dtype_idx: Vec<i64>,
     shm_segment_idx: Vec<i64>,
     shm_offsets: Vec<i64>,
+    /// A frame of inline items: each item's value, in place of the descriptor
+    /// columns, and the producer's (session, entity, node, tp_size, tp_rank)
+    /// in place of the descriptors' shared fields. A frame is one kind or the
+    /// other.
+    values: Vec<i64>,
+    value_source: Option<(String, String, Option<String>, u32, u32)>,
 }
 
 impl EdgeItems {
@@ -448,6 +454,7 @@ impl EdgeItems {
             uuids: Vec::new(), addresses: Vec::new(), nbytes: Vec::new(), offsets: Vec::new(),
             ndims: Vec::new(), dims_flat: Vec::new(), stride_flat: Vec::new(),
             dtype_idx: Vec::new(), shm_segment_idx: Vec::new(), shm_offsets: Vec::new(),
+            values: Vec::new(), value_source: None,
         }
     }
 
@@ -473,6 +480,9 @@ impl EdgeItems {
         infos: &[TensorPointerInfo],
     ) -> bool {
         let Some(first) = infos.first() else { return false };
+        if self.value_source.is_some() {
+            return false;
+        }
         let shared = (
             first.source_session_id, first.source_entity, first.source_node_name,
             first.source_tp_size, first.source_tp_rank,
@@ -519,11 +529,48 @@ impl EdgeItems {
         true
     }
 
+    /// Add one (request, edge) row of inline items: their values, sent instead
+    /// of descriptors (a token off the producer's stop check). False, adding
+    /// nothing, when the frame holds descriptor rows or another producer's.
+    pub fn try_add_values(
+        &mut self, request_id: &str, signal: &str, next_node: &str, walk: Option<&str>,
+        values: &[i64], source: (&str, &str, Option<&str>, u32, u32),
+    ) -> bool {
+        if self.shared.is_some() {
+            return false;
+        }
+        let src = (
+            source.0.to_string(), source.1.to_string(), source.2.map(str::to_string),
+            source.3, source.4,
+        );
+        match &self.value_source {
+            Some(s) if *s != src => return false,
+            Some(_) => {}
+            None => self.value_source = Some(src),
+        }
+        self.request_ids.push(request_id.to_string());
+        let sig = self.name_idx(signal);
+        self.signal_idx.push(sig);
+        let node = self.name_idx(next_node);
+        self.next_node_idx.push(node);
+        let w = walk.map_or(-1, |w| self.name_idx(w));
+        self.walk_idx.push(w);
+        self.num_items.push(values.len() as i64);
+        self.values.extend_from_slice(values);
+        true
+    }
+
     pub fn encode(&self, bk: &StrToId) -> Vec<u8> {
-        let mut out = Vec::with_capacity(256 + 64 * self.uuids.len());
+        let mut out = Vec::with_capacity(256 + 64 * self.uuids.len() + 9 * self.values.len());
         open_frame(&mut out, "worker_msg", "edge_items", Some("edge_items"));
-        let (session, entity, node, tp_size, tp_rank) =
-            self.shared.expect("EdgeItems::encode with no rows");
+        let (session, entity, node, tp_size, tp_rank) = match (&self.shared, &self.value_source) {
+            (Some((s, e, n, size, rank)), _) => (
+                bk.name(*s).to_string(), bk.name(*e).to_string(),
+                n.map(|n| bk.name(n).to_string()), *size, *rank,
+            ),
+            (None, Some((s, e, n, size, rank))) => (s.clone(), e.clone(), n.clone(), *size, *rank),
+            (None, None) => panic!("EdgeItems::encode with no rows"),
+        };
         fn ints(out: &mut Vec<u8>, v: &[i64]) {
             w_arr(out, v.len() as u32);
             for &x in v {
@@ -544,11 +591,11 @@ impl EdgeItems {
         }
         w_map_counted(&mut out, |m| {
             w_str(m.key("partition_name"), &self.partition_name);
-            w_str(m.key("source_session_id"), bk.name(session));
-            w_str(m.key("source_entity"), bk.name(entity));
+            w_str(m.key("source_session_id"), &session);
+            w_str(m.key("source_entity"), &entity);
             // Omitted when absent, so the decoder's None default stands.
-            if let Some(n) = node {
-                w_str(m.key("source_node_name"), bk.name(n));
+            if let Some(n) = &node {
+                w_str(m.key("source_node_name"), n);
             }
             w_u64(m.key("tp_size"), tp_size as u64);
             w_u64(m.key("tp_rank"), tp_rank as u64);
@@ -569,6 +616,10 @@ impl EdgeItems {
             strs(m.key("dtype_names"), &self.dtype_names);
             ints(m.key("shm_segment_idx"), &self.shm_segment_idx);
             ints(m.key("shm_offsets"), &self.shm_offsets);
+            // Omitted on a descriptor frame, so the decoder's empty default stands.
+            if !self.values.is_empty() {
+                ints(m.key("values"), &self.values);
+            }
         });
         out
     }

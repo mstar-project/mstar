@@ -89,6 +89,38 @@ def _text(*parts):
     return [_Chunk("text", p.encode("utf-8")) for p in parts]
 
 
+@pytest.mark.parametrize("started", [False, True], ids=["unstarted", "collecting"])
+def test_cancelled_window_releases_only_windows_not_already_collected(started):
+    stub = _StubAPI()
+    window = serving_transcriptions.Window("window.wav", 0, 1, request_id="current")
+    inflight = {"current", "unread"}
+
+    async def cancel():
+        waiting = asyncio.Event()
+
+        async def collect(request_id, raw_request=None):
+            waiting.set()
+            try:
+                await asyncio.Future()
+            except asyncio.CancelledError:
+                stub.release_request(request_id)  # collect_results owns this release
+                raise
+
+        stub.collect_results = collect
+        task = asyncio.create_task(serving_transcriptions._collect(stub, window, inflight))
+        if started:
+            await waiting.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(cancel())
+    assert inflight == ({"unread"} if started else {"current", "unread"})
+    serving_transcriptions._release(stub, inflight)
+    assert sorted(stub.released) == ["current", "unread"]
+    assert not inflight
+
+
 def _wav_bytes(seconds: float, sample_rate: int = 16_000) -> bytes:
     import io
     import wave

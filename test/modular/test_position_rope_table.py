@@ -103,14 +103,16 @@ def test_explicit_positions_and_a_lone_q(monkeypatch):
     assert calls == [((2, 3, 8), (2, 1, 8), [0, 1]), ((2, 3, 8), (2, 1, 8), [7, 3])]
 
 
-def test_cuda_refuses_a_table_narrower_than_the_kernels_vector(monkeypatch):
-    """FlashInfer's cos/sin-cache kernel moves 16 elements a thread: at a width of 8 it rotated
-    garbage instead of failing."""
+@pytest.mark.parametrize(("interleave", "refused", "served"), [(True, 8, 48), (False, 48, 64)])
+def test_cuda_refuses_a_table_width_the_kernel_gets_wrong(monkeypatch, interleave, refused, served):
+    """FlashInfer's cos/sin-cache kernel moves 16 elements a thread (a width of 8 reads past
+    each head), and with NeoX pairing it is wrong, without failing, at some widths 16 more
+    than a multiple of 32 (measured: 16 of 32, 48 of 80, ...)."""
     monkeypatch.setattr(RopeManager, "_build_rope_cache", lambda self, *args: torch.zeros(1))
-    config = PositionConfig(kv_cache="kv", interleave=True, rotary_dim=8, rope_table_dtype=torch.float32)
-    with pytest.raises(ValueError, match="multiple of 16"):
-        RopeManager(config, torch.device("cuda"), max_seq_len=64, head_dim=8)
-    RopeManager(dataclasses.replace(config, rotary_dim=16), torch.device("cuda"), max_seq_len=64)
+    config = PositionConfig(kv_cache="kv", interleave=interleave, rotary_dim=refused, rope_table_dtype=torch.float32)
+    with pytest.raises(ValueError, match="multiple of"):
+        RopeManager(config, torch.device("cuda"), max_seq_len=64, head_dim=128)
+    RopeManager(dataclasses.replace(config, rotary_dim=served), torch.device("cuda"), max_seq_len=64, head_dim=128)
 
 
 def test_llama31_config_is_refused_at_build():

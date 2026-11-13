@@ -7,6 +7,7 @@ import torch
 from mstar.engine.engine import Engine, SubmoduleManagement
 from mstar.engine.resources.runner import StepRunner
 from mstar.testing_utils.engine import make_engine, make_mgmt
+from mstar.testing_utils.resource import make_resource
 
 
 def test_an_engine_starts_empty_on_the_cpu():
@@ -72,6 +73,5 @@ def test_a_mgmt_refuses_a_field_it_does_not_have():
 
 def test_a_mgmt_double_buffers_for_a_resource_that_asks():
     """The real ``__post_init__`` decides, which a namespace would skip."""
-    resource = SimpleNamespace(force_double_buffer=True, supports_preplan=False, lean_capture=False)
     assert make_mgmt().num_slots == 1
-    assert make_mgmt(resources={"kv": resource}).num_slots == 2
+    assert make_mgmt(resources={"kv": make_resource(force_double_buffer=True)}).num_slots == 2

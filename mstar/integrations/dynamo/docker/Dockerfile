@@ -6,7 +6,7 @@
 #
 # The intermediate `serve` stage is a plain M* serving image with no Dynamo
 # dependency; build it alone with `--target serve -t mstar-serve`. The final
-# stage adds the mstar[dynamo] extra, so the ai-dynamo version pin lives in
+# stage adds the mstar-ai[dynamo] extra, so the ai-dynamo version pin lives in
 # pyproject.toml only.
 #
 # The default is CUDA 13, which needs an r580+ driver: flash-attn publishes

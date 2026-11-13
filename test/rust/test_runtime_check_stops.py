@@ -34,7 +34,7 @@ POLICY = StopPolicy(StopKind.AR, token_signal="new_token", eos_tokens=(EOS,), sa
 
 # no signal stays on the device, so nothing rides inline
 _ENGINE = SimpleNamespace(
-    device_loopback_signals=lambda node, walk: (), inline_client_signals=lambda node, walk: {},
+    device_loopback_signals=lambda node, walk: (), inline_signals=lambda node, walk: {},
 )
 
 

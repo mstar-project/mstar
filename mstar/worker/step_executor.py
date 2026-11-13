@@ -9,7 +9,7 @@ import math
 import threading
 import time
 import time as _time
-from collections.abc import Collection
+from collections.abc import Collection, Mapping
 from concurrent.futures import Future
 from dataclasses import dataclass
 from typing import Any, NamedTuple
@@ -28,6 +28,7 @@ from mstar.graph.runtime.base import (
     RouteOutput,
     RouteTensors,
     SendInput,
+    inline_column,
 )
 from mstar.model.submodule_base import END_PARTITION, BatchedModelOutput, HostRows, chunk_loop_name
 from mstar.profile.worker import WorkerProfileInfo
@@ -40,6 +41,7 @@ from mstar.worker.host_copies import HostCopies, _host_column, _LazyHostOutputs,
 from mstar.worker.lockstep import Lockstep
 from mstar.worker.micro_scheduler import CHAIN_LANE, ScheduledBatch
 from mstar.worker.phase_timer import PhaseTimer, step_key
+from mstar.worker.preemption import Preemption
 from mstar.worker.request_lifecycle import RequestLifecycle
 from mstar.worker.services import WorkerLayout, WorkerServices
 from mstar.worker.speculation import Speculation
@@ -77,6 +79,18 @@ class ModelStops(NamedTuple):
     ended: list[int]
 
 
+def _withheld_by_signal(withheld: Mapping[int, tuple[str, ...]]) -> dict[str, list[int]] | None:
+    """``ExecutingBatch.withheld_outputs`` (rid -> signals) as the route takes
+    it, signal -> rids; None for none. Walks only the withheld rows."""
+    if not withheld:
+        return None
+    out: dict[str, list[int]] = {}
+    for rid, names in withheld.items():
+        for name in names:
+            out.setdefault(name, []).append(rid)
+    return out
+
+
 class GpuStepBody:
     """What runs on the GPU thread: wait for the pre-plan, read check, prepare,
     admit and forward, then publish."""
@@ -85,6 +99,8 @@ class GpuStepBody:
         self, services: WorkerServices, timer: PhaseTimer, lockstep: Lockstep,
         lifecycle: RequestLifecycle, host_copies: HostCopies,
         device_capability: DeviceCapability, enable_nvtx: bool,
+        tensor_streams: Mapping[tuple[str, str], frozenset[str]] | None = None,
+        inline_carried: Mapping[tuple[str, str], frozenset[str]] | None = None,
     ):
         self.worker_id = services.worker_id
         self.device = services.device
@@ -98,6 +114,14 @@ class GpuStepBody:
         self.enable_nvtx = enable_nvtx
         # (node, walk) -> the loop-back signals the node keeps on the device
         self._device_loopback: dict[tuple[str, str], frozenset[str]] = {}
+        # (node, walk) -> its streamed signals that go as tensors, and the
+        # signals its inline column carries on every edge (``WorkerLayout``)
+        self._tensor_streams = tensor_streams or {}
+        self._inline_carried = inline_carried or {}
+        # (node, walk) -> its inline signals; (node, walks) -> whether those
+        # walks' inline signals read one buffer (``_loopback_rids``)
+        self._inline_names: dict[tuple[str, str], frozenset[str]] = {}
+        self._one_buffer: dict[tuple[str, frozenset[str]], bool] = {}
 
     def __call__(
         self,
@@ -239,19 +263,40 @@ class GpuStepBody:
                 range_pop(synchronize=False)
 
     def all_on_device(self, engine, node_name: str, graph_walk: str, signals) -> bool:
-        """Whether every output signal of this step is one the node keeps on
-        the device (cached per node and walk: it depends on the node's
-        resources, not on the step)."""
+        """Whether every output signal of this step needs no tensor: one the
+        node keeps on the device, but not one that streams as a tensor, or one
+        the step's inline column carries on every edge (cached per node and
+        walk: it depends on the node's resources, not on the step)."""
         # without inline emit, a rows-only step has no path for the client's tokens
         if not signals or not self._graph_runtime.supports_inline_emit:
             return False
         key = (node_name, graph_walk)
         on_device = self._device_loopback.get(key)
         if on_device is None:
-            on_device = self._device_loopback[key] = frozenset(
-                engine.device_loopback_signals(node_name, graph_walk)
-            )
+            kept = frozenset(engine.device_loopback_signals(node_name, graph_walk))
+            on_device = self._device_loopback[key] = (
+                kept - self._tensor_streams.get(key, frozenset())
+            ) | self._inline_carried.get(key, frozenset())
         return all(s in on_device for s in signals)
+
+    def _one_inline_buffer(self, engine, node_name: str, walks: frozenset[str]) -> bool:
+        """Whether every walk's inline signals read one stop buffer, so a mixed
+        step's column carries each walk's, whichever of its walks lead
+        (cached: it depends on the walks, not on the step)."""
+        key = (node_name, walks)
+        one = self._one_buffer.get(key)
+        if one is None:
+            one = self._one_buffer[key] = len({
+                buffer for walk in walks for buffer in engine.inline_signals(node_name, walk).values()
+            }) <= 1
+        return one
+
+    def _inline_signal_names(self, engine, node_name: str, walk: str) -> frozenset[str]:
+        key = (node_name, walk)
+        names = self._inline_names.get(key)
+        if names is None:
+            names = self._inline_names[key] = frozenset(engine.inline_signals(node_name, walk))
+        return names
 
     def walk_signals(self, batch: ScheduledBatch, walk: str):
         signals = batch.walk_output_signals.get(walk)
@@ -263,12 +308,19 @@ class GpuStepBody:
         """A mixed step's rows whose own walk keeps every output signal on
         the device. Asked per real walk: the combined label is no walk of the
         submodule's, and would keep none."""
-        on_device = {
-            walk for walk in set(batch.request_walks.values())
-            if self.all_on_device(
-                engine, batch.node_name, walk, self.walk_signals(batch, walk),
-            )
-        }
+        node = batch.node_name
+        walks = frozenset(batch.request_walks.values())
+        on_device = set()
+        for walk in walks:
+            signals = self.walk_signals(batch, walk)
+            if not self.all_on_device(engine, node, walk, signals):
+                continue
+            inline = self._inline_signal_names(engine, node, walk)
+            if inline and not inline.isdisjoint(signals) and not self._one_inline_buffer(engine, node, walks):
+                # the step's one column may not carry this walk's inline
+                # signals (a client emit or a stream), which have no tensor
+                continue
+            on_device.add(walk)
         if not on_device:
             return frozenset()
         return frozenset(
@@ -279,7 +331,7 @@ class GpuStepBody:
 class StepExecutor:
     def __init__(
         self, services: WorkerServices, layout: WorkerLayout, timer: PhaseTimer,
-        lockstep: Lockstep, lifecycle: RequestLifecycle, *,
+        lockstep: Lockstep, lifecycle: RequestLifecycle, preemption: Preemption, *,
         wakeup_event=None, metrics: WorkerMetrics | None = None,
         profile_info: WorkerProfileInfo | None = None,
         device_capability: DeviceCapability | None = None,
@@ -298,6 +350,7 @@ class StepExecutor:
         self.timer = timer
         self.lockstep = lockstep
         self.lifecycle = lifecycle
+        self.preemption = preemption
         self.wakeup_event = wakeup_event
         self._metrics = metrics
         self.profile_info = profile_info if profile_info is not None else WorkerProfileInfo()
@@ -310,6 +363,7 @@ class StepExecutor:
         self._body = GpuStepBody(
             services=services, timer=timer, lockstep=lockstep, lifecycle=lifecycle,
             host_copies=self._host_copies, device_capability=self.device_capability, enable_nvtx=enable_nvtx,
+            tensor_streams=layout.tensor_streams, inline_carried=layout.inline_carried,
         )
         self._gpu_pool: ThreadPool | InlineExecutor | None = None
         self._plan_pool: ThreadPool | InlineExecutor | None = None
@@ -647,8 +701,8 @@ class StepExecutor:
                 torch.accelerator.synchronize(self.device)
 
     def _finish_rebuild_rows(self, batch_N: PendingBatch, outputs: BatchedModelOutput) -> None:
-        """Take the step's rebuild rows off it and advance their rebuilds. A rebuild's last chunk lands it and
-        lets its request's decode row run."""
+        """Take the step's rebuild rows off it and advance their rebuilds. A row's last chunk moves its rebuild to
+        the next row, and the last row's lands the rebuild and lets its request's decode row run."""
         batch, node_batch = batch_N.batch, batch_N.node_batch
         rebuild = batch.rebuild_rids
         if not rebuild:
@@ -664,15 +718,24 @@ class StepExecutor:
             })
         # a row the prefix cache served whole ran no forward, and its rebuild is done all the same
         ran = set(node_batch.request_ids) | node_batch.cached_rids
-        landed = [
-            rid for rid in rebuild if rid in ran and self._rebuilds.land_chunk(rid, node, batch.chunk_ranges.get(rid))
-        ]
-        if landed:
+        ended = {
+            rid: run for rid in rebuild
+            if rid in ran and (run := self._rebuilds.land_chunk(rid, node, batch.chunk_ranges.get(rid)))
+        }
+        if ended:
             # the step's kernels read the prepared input released here
             self.wait_for_step(batch_N)
             engine = self.engine_manager.get_engine(node)
-            for rid in landed:
-                engine.release_chunk_inputs(rid, node)
+            for rid, run in ended.items():
+                self.preemption.rebuilt(rid, node, run.ran)
+                # A row from a record prepared its own input. A prompt's step in progress goes on from the
+                # input the engine keeps for the prompt, which waited aside while the rows before it ran.
+                if run.row.record is not None:
+                    engine.release_chunk_inputs(rid, node)
+                if self._rebuilds.rebuilding(rid, node):
+                    if self._rebuilds.cursor(rid, node).resumes_prefill:
+                        engine.restore_chunk_inputs(rid, node)
+                    continue
                 engine.land_rebuild(node, rid)
         for rid in rebuild:
             outputs.pop(rid, None)
@@ -820,16 +883,19 @@ class StepExecutor:
             outputs, batch_N.node_batch.completion_event,
             request_ids=batch_N.node_batch.request_ids,
         )
-        self._rebuilds.keep_prompts(batch_N.node_batch)
+        self._rebuilds.record(batch_N.node_batch, {
+            rid: self.request_state.get_fwd_info(rid, batch_N.partition) for rid in batch_N.node_batch.cached_rids
+        })
         # Until its last chunk a row's sampled token is not a real sample, so it
         # keys no prefix and decides no stop (`_check_stops`).
         engine.step_finished(
             batch_N.node_batch, cpu_outputs, host_rows=host_rows,
             skip_rids=batch_N.batch.incomplete_node_rids,
         )
-        self._rebuilds.keep_samples(
+        forgot = self._rebuilds.keep_samples(
             batch_N.node_batch, cpu_outputs, host_rows, skip_rids=batch_N.batch.incomplete_node_rids,
         )
+        self.preemption.refuse_drops(forgot, batch_N.node_name)
         _pp_stage("prematerialize")
         runtime_stops, tokens = self._runtime_stop_column(batch_N, host_rows)
         checked = None
@@ -866,12 +932,17 @@ class StepExecutor:
                     rt.mark_partition_done(rid, batch_N.partition)
                 stage = "check_stop"
                 _t_rt = _time.perf_counter() if self.timer.period else 0.0
-                step = rt.resume_postprocess(stops=model_stops.stops, dropped=model_stops.dropped)
+                step = rt.resume_postprocess(
+                    stops=model_stops.stops, dropped=model_stops.dropped,
+                    withheld=_withheld_by_signal(batch_N.node_batch.withheld_outputs),
+                )
             elif step.need is PostprocessNeed.STORE:
                 # What the stop check withheld (``StopCheck.withheld``), and an
                 # output cut to an empty span, is not stored, so not routed: a
                 # streaming edge then carries no item for the row, and the
-                # producer's item count leaves it out as well.
+                # producer's item count leaves it out as well. A signal riding
+                # the inline column also goes by value, which the route drops
+                # for its withheld rows (``PostprocessRequest.withheld``).
                 for withheld in (batch_N.node_batch.withheld_outputs, empty_spans):
                     for rid, names in withheld.items():
                         rid_outputs = outputs.get(rid)
@@ -911,6 +982,7 @@ class StepExecutor:
         # Those sends were the last readers of this step's host copies.
         self.tensor_manager.drop_host_copies()
         _pp_stage("tail")
+        self._rebuilds.flush()
         engine.after_output_copy(batch_N.node_batch)
         _pp_stage("after_output_copy")
 
@@ -979,22 +1051,20 @@ class StepExecutor:
                 stops.setdefault(rid, set()).add(loop_name)
         for rid, loops in (checked or {}).items():
             stops.setdefault(rid, set()).update(loops)
-        # Device loop-back: every routed signal stays on the device and the
-        # client's copy rides inline, so the route stores nothing.
+        # Rows-only: every routed signal stays on the device or rides the
+        # step's inline column, so the route stores nothing; it sends nothing
+        # for what the stop check withheld.
         # A step with log-probs stores instead: STORE passes them to the route.
         inline = None
         if (
             host_rows is not None and rid_walk_idx is None
             and SAMPLED_LOGPROB not in host_rows.buffers
-            # an inline route carries every output, a withheld one too
-            and not batch_N.node_batch.withheld_outputs
             and self._body.all_on_device(engine, batch_N.node_name, batch_N.graph_walk, signals)
         ):
-            client = engine.inline_client_signals(batch_N.node_name, batch_N.graph_walk)
-            signal = next((s for s in client if s in signals), None)
-            column = None if signal is None else _host_column(host_rows, client[signal])
+            step_column = inline_column(engine.inline_signals(batch_N.node_name, batch_N.graph_walk), signals)
+            column = None if step_column.buffer is None else _host_column(host_rows, step_column.buffer)
             if column is not None:
-                inline = InlineColumn(signal, column)
+                inline = InlineColumn(step_column.signals, column)
         return PostprocessRequest(
             partition=batch_N.partition, node_name=batch_N.node_name, graph_walk=walks[0],
             output_signals=signals,
@@ -1002,7 +1072,7 @@ class StepExecutor:
             walks=walks if rid_walk_idx is not None else None, rid_walk_idx=rid_walk_idx,
             stops=stops, runtime_stops=runtime_stops, tokens=tokens,
             row_rids=host_rows.request_ids if host_rows is not None else (),
-            inline=inline,
+            inline=inline, withheld=_withheld_by_signal(batch_N.node_batch.withheld_outputs),
             # the consuming pass (not the earlier ingest) reports the partition
             # done, so it rides the WGD that also counts this pass's last chunks
             partition_done=list(batch_N.node_batch.partition_done_rids),
@@ -1110,9 +1180,9 @@ class StepExecutor:
         # row; anything else goes through the general per-tensor path. Both
         # take the real walk, not the combined label: the runtime keys the
         # store and the route on it.
-        # The client copy first: whether it rides inline decides whether the
+        # The inline column first: whether it rides decides whether the
         # tensors are needed at all.
-        inline_signal, inline_values = self._inline_emit_values(
+        inline_signals, inline_values = self._inline_emit_values(
             engine, batch_N, host_rows, rids, signals,
         )
         logprobs = self._row_logprobs(host_rows, rids)
@@ -1140,15 +1210,15 @@ class StepExecutor:
                 )
             return stored
 
-        loopback = outputs.loopback_rids if inline_signal is not None else ()
-        if inline_signal is not None and self._body.all_on_device(
+        loopback = outputs.loopback_rids if inline_signals else ()
+        if inline_signals and self._body.all_on_device(
             engine, batch_N.node_name, batch_N.graph_walk, signals,
         ):
-            # Device loop-back: the node keeps every routed signal's value on
-            # the device (the sampler's slot master) and the client copy rides
-            # inline, so nothing is stored, held or freed. The route still
-            # runs per request for the loop counters and the fallbacks; it
-            # carries zero tensors per (request, signal).
+            # Rows-only: the node keeps every routed signal's value on the
+            # device (the sampler's slot master) or the inline column carries
+            # it, so nothing is stored, held or freed. The route still runs
+            # per request for the loop counters and the fallbacks; it carries
+            # zero tensors per (request, signal).
             stored = StoredOutputs([], [], [], [0] * (len(rids) * len(signals)))
         elif loopback:
             # A mixed step: the rows whose walk loops back on the device carry
@@ -1181,7 +1251,7 @@ class StepExecutor:
         if flat_uuids:
             self.tensor_manager.increment_ref_batch_uniform(flat_uuids, 1)
 
-        return stored, RouteTensors(flat_uuids, num_tensors, inline_signal, inline_values, logprobs)
+        return stored, RouteTensors(flat_uuids, num_tensors, inline_signals, inline_values, logprobs)
 
     def _send_input(
         self, batch_N: PendingBatch, request: PostprocessRequest, step: PostprocessStep,
@@ -1247,6 +1317,10 @@ class StepExecutor:
                 )
                 for uuid in uuids:
                     stream_buf.put(uuid, uuid)
+        for signal, per_signal in route_output.local_stream_values_by_signal.items():
+            buffers = self.request_state.per_request_info
+            for rid, value in per_signal:
+                buffers[rid].stream_buffers[signal].put_values([value])
         laps.lap("local_streams")
 
         send_rids = [rid for rid in rids if rid not in failed_rids] if failed_rids else list(rids)
@@ -1309,8 +1383,9 @@ class StepExecutor:
     def _inline_emit_values(
         self, engine, batch_N: PendingBatch, host_rows: "HostRows | None",
         rids: list[int], signals,
-    ) -> tuple[str | None, list[int | None]]:
-        """The values of a client signal that can ride inline this step.
+    ) -> tuple[tuple[str, ...], list[int | None]]:
+        """The signals that can ride inline this step (``inline_column``), and
+        their one value per row.
 
         Taken off the stop check's host copy, one ``tolist`` for the batch,
         in ``rids`` order. A row with no host row ran no forward (see
@@ -1318,26 +1393,22 @@ class StepExecutor:
         takes the tensor path.
         """
         if host_rows is None or not self._graph_runtime.supports_inline_emit:
-            return None, []
+            return (), []
         if not batch_N.batch.request_walks:
             return self._inline_emit_one_walk(engine, batch_N, host_rows, rids, signals)
         # Per real walk: a combined walk is no walk of the submodule's.
         walks = list(batch_N.batch.rids_by_walk()) or [batch_N.graph_walk]
         candidates: dict[str, str] = {}
         for walk in walks:
-            for signal, buffer_name in engine.inline_client_signals(
+            for signal, buffer_name in engine.inline_signals(
                 batch_N.node_name, walk,
             ).items():
                 candidates.setdefault(signal, buffer_name)
-        for signal, buffer_name in candidates.items():
-            if signal not in signals:
-                continue
-            buf = host_rows.buffers.get(buffer_name)
-            if not torch.is_tensor(buf) or buf.dim() == 0 or buf.numel() == 0:
-                continue
-            values = buf.reshape(buf.shape[0], -1)[:, 0].tolist()
-            return signal, self._values_by_rid(values, host_rows, rids)
-        return None, []
+        step_column = inline_column(candidates, signals)
+        column = None if step_column.buffer is None else _host_column(host_rows, step_column.buffer)
+        if column is None:
+            return (), []
+        return step_column.signals, self._values_by_rid(column.tolist(), host_rows, rids)
 
     @staticmethod
     def _values_by_rid(values: list[int], host_rows: "HostRows", rids: list[int]) -> list[int | None]:
@@ -1348,23 +1419,19 @@ class StepExecutor:
     def _inline_emit_one_walk(
         self, engine, batch_N: PendingBatch, host_rows: "HostRows",
         rids: list[int], signals,
-    ) -> tuple[str | None, list[int | None]]:
+    ) -> tuple[tuple[str, ...], list[int | None]]:
         """`_inline_emit_values` for a step of one walk: every row takes the
         value, so one comprehension, and a slice when the host rows are in
         the batch's order (the usual case)."""
-        candidates = engine.inline_client_signals(batch_N.node_name, batch_N.graph_walk)
-        for signal, buffer_name in candidates.items():
-            if signal not in signals:
-                continue
-            buf = host_rows.buffers.get(buffer_name)
-            if not torch.is_tensor(buf) or buf.dim() == 0 or buf.numel() == 0:
-                continue
-            values = buf.reshape(buf.shape[0], -1)[:, 0].tolist()
-            n = len(rids)
-            if len(values) >= n and list(host_rows.request_ids[:n]) == rids:
-                return signal, values[:n]
-            return signal, self._values_by_rid(values, host_rows, rids)
-        return None, []
+        step_column = inline_column(engine.inline_signals(batch_N.node_name, batch_N.graph_walk), signals)
+        column = None if step_column.buffer is None else _host_column(host_rows, step_column.buffer)
+        if column is None:
+            return (), []
+        values = column.tolist()
+        n = len(rids)
+        if len(values) >= n and list(host_rows.request_ids[:n]) == rids:
+            return step_column.signals, values[:n]
+        return step_column.signals, self._values_by_rid(values, host_rows, rids)
 
     @staticmethod
     def _row_logprobs(host_rows: "HostRows | None", rids: list[int]) -> list[float | None]:

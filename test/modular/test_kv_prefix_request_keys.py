@@ -96,6 +96,12 @@ class _Model(StubModel):
         # a model that names no checkpoint and sets no salt keys nothing
         return "/a/checkpoint"
 
+    def declare_state(self):
+        return []
+
+    def kernel_settings(self):
+        return {}
+
     def get_node_resources(self):
         return [KVSpec(
             resource_key="kv", nodes={"LLM"},
@@ -336,6 +342,12 @@ def test_a_cache_every_engine_holding_it_keeps_shut_is_not_keyed():
     class _Thinker(StubModel):
         """A cache on a two-rank node without prefix_cache_tp, so its engines keep it shut."""
 
+        def declare_state(self):
+            return []
+
+        def kernel_settings(self):
+            return {}
+
         def get_node_resources(self):
             return [KVSpec("kv", {"Thinker"}, PagedKVConfig(
                 num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=64, page_size=PAGE_SIZE,
@@ -451,7 +463,8 @@ def _conductor_configs(model, model_kwargs: dict | None = None) -> dict:
     each handed its own chain."""
     declared = {key: tuple(labels) for key, labels in model.kv_labels().items()}
     configs = Conductor._get_resource_configs(
-        SimpleNamespace(model=model, _kv_labels=declared, _node_resources=list), ["text"], ["text"], model_kwargs or {},
+        SimpleNamespace(model=model, _kv_labels=declared, _node_resources=list, _declarations=model.declare_state),
+        ["text"], ["text"], model_kwargs or {},
     )
     for key, cfg in configs.items():
         _apply_chain(cfg, key, model_kwargs)

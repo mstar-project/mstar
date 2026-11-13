@@ -239,7 +239,7 @@ def _listed(resources, steps=None):
 
     def declare_step(graph_walk, **kwargs):
         keys = resources.keys() if steps is None else steps[graph_walk]
-        return SimpleNamespace(steps=dict.fromkeys(keys, object()), segments=None)
+        return SimpleNamespace(steps=dict.fromkeys(keys, object()), segments=None, state={})
 
     submodule = SimpleNamespace(get_accelerator_graph_configs=lambda *args: configs, declare_step=declare_step,
                                 compiled_entries_per_shape=1)
@@ -248,7 +248,7 @@ def _listed(resources, steps=None):
         resource.can_capture = lambda: True
     runner = AcceleratorGraphRunner(
         submodule_name="LLM", submodule=submodule, resources=resources, step_runner=Mock(), device=CPU,
-        autocast_dtype=None, joint_comm_group=SimpleNamespace(world_size=1), num_slots=2,
+        autocast_dtype=None, joint_comm_group=SimpleNamespace(world_size=1), num_slots=2, head_shards=1,
     )
     return {(spec.bucket.graph_walk, spec.bucket.lean) for spec in runner.prepare_for_capture()}
 

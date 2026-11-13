@@ -119,15 +119,30 @@ class LocalDiT(nn.Module):
     ) -> torch.Tensor:
         """``x``/``cond``: ``[rows, feat, patch]``; ``mu``: ``[rows, 2*hidden]``;
         ``t``/``dt``: ``[rows]``. Returns the velocity ``[rows, feat, patch]``."""
-        x = self.in_proj(x.transpose(1, 2))
+        mu_tokens, cond_tokens = self.condition(mu, cond)
+        return self.velocity(x, mu_tokens, cond_tokens, self.time_tokens(t, dt))
+
+    def condition(self, mu: torch.Tensor, cond: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """The tokens that hold for a whole solve: ``mu`` as tokens of the DiT
+        width and the projected condition patch."""
         cond = self.cond_proj(cond.transpose(1, 2))
-        prefix = cond.shape[1]
-        t = self.time_mlp(self.time_embeddings(t).to(x.dtype))
-        dt = self.delta_time_mlp(self.time_embeddings(dt).to(x.dtype))
-        t = t + dt
-        mu = mu.view(x.shape[0], -1, x.shape[-1])
-        hidden = self.decoder(torch.cat([mu, t.unsqueeze(1), cond, x], dim=1))
-        hidden = hidden[:, prefix + mu.shape[1] + 1 :]
+        return mu.view(cond.shape[0], -1, cond.shape[-1]), cond
+
+    def time_tokens(self, t: torch.Tensor, dt: torch.Tensor) -> torch.Tensor:
+        """``[n, hidden]`` time tokens for ``n`` (t, dt) pairs."""
+        dtype = self.in_proj.weight.dtype
+        return self.time_mlp(self.time_embeddings(t).to(dtype)) + self.delta_time_mlp(
+            self.time_embeddings(dt).to(dtype)
+        )
+
+    def velocity(
+        self, x: torch.Tensor, mu_tokens: torch.Tensor, cond_tokens: torch.Tensor, t_tokens: torch.Tensor,
+    ) -> torch.Tensor:
+        """The velocity at ``x`` (``[rows, feat, patch]``) from the solve's
+        ``condition`` tokens and each row's time token (``[rows, hidden]``)."""
+        x = self.in_proj(x.transpose(1, 2))
+        hidden = self.decoder(torch.cat([mu_tokens, t_tokens.unsqueeze(1), cond_tokens, x], dim=1))
+        hidden = hidden[:, mu_tokens.shape[1] + 1 + cond_tokens.shape[1] :]
         return self.out_proj(hidden).transpose(1, 2)
 
 
@@ -154,19 +169,24 @@ def solve_cfm(
     """
     rows = noise.shape[0]
     x = noise
-    t, dt = t_span[0], t_span[0] - t_span[1]
     zero_init_steps = max(1, int(len(t_span) * 0.04))
-    mu_in = torch.cat([mu, torch.zeros_like(mu)], dim=0)
-    cond_in = torch.cat([cond, cond], dim=0)
+    # What holds for the whole solve, computed once: the condition tokens of
+    # both CFG halves, and every evaluated step's time token. Step k runs at
+    # t_span[k - 1] with dt = t_span[k - 1] - t_span[k].
+    mu_tokens, cond_tokens = estimator.condition(
+        torch.cat([mu, torch.zeros_like(mu)], dim=0), torch.cat([cond, cond], dim=0)
+    )
+    t_steps = t_span[zero_init_steps:-1]
+    dt_steps = t_steps - t_span[zero_init_steps + 1 :] if mean_mode else torch.zeros_like(t_steps)
+    t_tokens = estimator.time_tokens(t_steps, dt_steps)
+    t, dt = t_span[0], t_span[0] - t_span[1]
     scale = cfg_value.to(x.dtype).view(rows, 1, 1)
     for step in range(1, len(t_span)):
         if step <= zero_init_steps:
             dphi_dt = torch.zeros_like(x)
         else:
-            x_in = torch.cat([x, x], dim=0)
-            t_in = t.expand(2 * rows)
-            dt_in = dt.expand(2 * rows) if mean_mode else torch.zeros_like(t_in)
-            velocity = estimator(x_in, mu_in, t_in, cond_in, dt_in)
+            t_token = t_tokens[step - 1 - zero_init_steps].expand(2 * rows, -1)
+            velocity = estimator.velocity(torch.cat([x, x], dim=0), mu_tokens, cond_tokens, t_token)
             pos, neg = velocity[:rows], velocity[rows:]
             dot = torch.sum(pos.reshape(rows, -1) * neg.reshape(rows, -1), dim=1, keepdim=True)
             norm = torch.sum(neg.reshape(rows, -1) ** 2, dim=1, keepdim=True) + 1e-8

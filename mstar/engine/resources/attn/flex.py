@@ -238,9 +238,6 @@ class FlexAttentionManager(AttentionManager):
         ] = {}
         self._active_slot: int | None = None
 
-    def depends_on(self) -> set[str]:
-        return {self._kv_cache_name}
-
     @property
     def requires_kv_write(self) -> bool:
         """False: the layer has already written this step's K/V.

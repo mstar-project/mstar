@@ -1,0 +1,580 @@
+"""A read of another array's queries, and a read under sequence parallelism, plan what a model did by hand.
+
+LTX-2.5 wrote each attention's plan in model code, one case per attention, so a port that gets a case wrong attends the
+wrong tokens with no error. Under sequence parallelism a read plans whole segments, and its resource exchanges what the
+node's sequence shard splits on the step; a self read whose label the shard lists runs Ulysses, its heads over TP x SP.
+A DiT compares its output bytes exactly, so a break or a plan that moves is a regression. A segmented read lays a
+request's segments end to end in one row, as MiniMax-H3 pads its rows, and SDPA attends within each segment as H3's own
+split did.
+"""
+
+from __future__ import annotations
+
+import sys
+from types import SimpleNamespace
+
+sys.path.insert(0, ".")
+
+import pytest
+import torch
+
+from mstar.distributed.communication import WorkerParallelGroups
+from mstar.engine.resources.attn.config import AttentionStep
+from mstar.engine.resources.attn.ragged.config import (
+    RaggedAttentionSpec,
+    RaggedCrossAttentionSpec,
+    RaggedCrossAttentionStep,
+)
+from mstar.engine.resources.kv.transfer import TransferEngineInfo
+from mstar.engine.resources.sequence_shard import SeqShardSpec
+from mstar.engine.resources.spec import resolve_spec_dependencies
+from mstar.engine.resources.step import ResourceStep, Segment, StepContext, SubmoduleStep
+from mstar.engine.state import Array, ArrayStep, Attend, Block, Causal, KVEntry, Read, TensorType, adapters
+from mstar.engine.state.adapters import (
+    SDPA,
+    WITHIN_STEP,
+    RaggedAttend,
+    StateSetup,
+    WithinStepHandle,
+    _bindings,
+    _resolve,
+    build_specs,
+    node_handles,
+    state_setup,
+    state_steps,
+)
+from mstar.engine.state.analysis import split_read_problems
+from mstar.engine.state.calls import kernel_setting
+from mstar.engine.state.contract import Entry
+from mstar.model.components.diffusion.attention import FrameSDPA, joint_attention, sdpa_attention
+from mstar.testing_utils.model import StubModel
+from mstar.worker import engine_manager
+from mstar.worker.engine_manager import EngineManager
+
+HEADS, DIM = 4, 8
+
+
+def _entry(heads=HEADS, dtype=None) -> Entry:
+    t = TensorType((heads, DIM), dtype=dtype, shard=0)
+    return Entry({"k": t, "v": t})
+
+
+def _array(
+    name, read=None, *, queries=None, label=None, heads=HEADS, nodes=("dit",), dtype=None, packed=False,
+) -> Array:
+    return Array(
+        name, nodes=set(nodes), layers={0, 1}, entry=_entry(heads, dtype), max_len=0,
+        labels={label or name},
+        reads={read or f"{name}_read": Read(mask=Block(), op=Attend(q_heads=heads), queries=queries, packed=packed)},
+    )
+
+
+def _av() -> list[Array]:
+    """The shape of LTX-2.5's declaration: two self reads and three cross reads, over one stream its shard splits."""
+    return [
+        _array("video", "video_self"),
+        _array("audio", "audio_self", heads=2),
+        _array("text_v", "video_text", queries="video", label="text"),
+        _array("text_a", "audio_text", queries="audio", label="text", heads=2),
+        _array("audio_v", "audio_to_video", queries="video", label="audio", heads=2),
+        _array("video_a", "video_to_audio", queries="audio", label="video", heads=2),
+    ]
+
+
+class _Model(SimpleNamespace):
+    def __init__(self, *declarations):
+        super().__init__(declare_state=lambda: list(declarations))
+
+
+class _StubRagged:
+    """Records the label each read asked for and the tokens it was handed, and returns q."""
+
+    def __init__(self):
+        self.runs = []
+
+    def run(self, q, k=None, v=None, label=None, return_lse=False):
+        self.runs.append((label, q.shape, k.shape))
+        if return_lse:
+            return q, torch.zeros(q.shape[:2])
+        return q
+
+
+def _within(array, ragged, queried=None) -> WithinStepHandle:
+    resolved = _resolve([array] if queried is None else [array, queried], StateSetup())
+    return WithinStepHandle(array, {next(iter(array.reads)): ragged}, _bindings(WITHIN_STEP, array), resolved)
+
+
+def _on_sdpa(*reads) -> StateSetup:
+    return StateSetup(dict.fromkeys(reads, SDPA[WITHIN_STEP, Attend]))
+
+
+def _sdpa_config(*keys) -> dict:
+    return {"resources": {key: {"backend": "sdpa"} for key in keys}}
+
+
+def _handles(arrays, *, setup=None) -> dict[str, WithinStepHandle]:
+    specs = build_specs(arrays)
+    return node_handles(_Model(*arrays), "dit", {spec.resource_key: _StubRagged() for spec in specs}, setup=setup)
+
+
+def _av_step(rows=(1,), video=9, audio=3, text=5) -> SubmoduleStep:
+    def segments(label, span):
+        return tuple(Segment(rid, label, span) for rid in rows)
+
+    return SubmoduleStep(state={
+        "video": ArrayStep(segments=segments("video", video)),
+        "audio": ArrayStep(segments=segments("audio", audio)),
+        "text_v": ArrayStep(segments=segments("text", text)),
+        "text_a": ArrayStep(segments=segments("text", text)),
+        "audio_v": ArrayStep(segments=segments("audio", audio)),
+        "video_a": ArrayStep(segments=segments("video", video)),
+    })
+
+
+def _by_label(step) -> dict[str, tuple[Segment, ...]]:
+    labels: dict[str, list[Segment]] = {}
+    for segment in step.segments:
+        labels.setdefault(segment.label, []).append(segment)
+    return {label: tuple(segments) for label, segments in labels.items()}
+
+
+def _ctx(rows=(1,), capture=False, replay=False) -> StepContext:
+    lease = SimpleNamespace(captured=True) if replay else None
+    return StepContext(request_ids=list(rows), graph_walk="gen", slot=0, capture=capture, slot_lease=lease)
+
+
+# The specs
+
+
+def test_reads_of_one_kind_and_config_share_the_first_ones_resource():
+    specs = build_specs(_av())
+    assert [(type(s), s.resource_key) for s in specs] == [
+        (RaggedAttentionSpec, "video_self"), (RaggedAttentionSpec, "audio_self"),
+        (RaggedCrossAttentionSpec, "video_text"), (RaggedCrossAttentionSpec, "audio_text"),
+    ], "two heads' audio cross reads and the video one should make two cross resources"
+
+
+def test_a_self_read_and_a_cross_read_of_one_geometry_stay_apart():
+    specs = build_specs([_array("a", "a_self"), _array("b", "b_cross", queries="a")])
+    assert [type(s) for s in specs] == [RaggedAttentionSpec, RaggedCrossAttentionSpec]
+
+
+def test_reads_on_different_nodes_never_share_a_resource():
+    specs = build_specs([_array("a", nodes=("x",)), _array("b", nodes=("y",))])
+    assert [s.resource_key for s in specs] == ["a_read", "b_read"]
+
+
+@pytest.mark.parametrize("key, exchange", [
+    ("video_self", "ulysses"), ("audio_self", "none"), ("video_text", "none"), ("audio_text", "none"),
+])
+def test_a_self_read_runs_ulysses_only_where_the_nodes_shard_lists_its_label(key, exchange):
+    """LTX-2.5 splits its video tokens and not its audio: the audio self-attention keeps every head on each rank."""
+    shard = SeqShardSpec(resource_key="shard", nodes={"dit"}, labels=("video",), axis=1)
+    specs = resolve_spec_dependencies([*build_specs(_av()), shard])
+    assert specs[key].sp_exchange == exchange
+    assert resolve_spec_dependencies(build_specs(_av()))["video_self"].sp_exchange == "none", "a node with no shard"
+
+
+def test_a_declared_dtype_reaches_the_spec():
+    (spec,) = build_specs([_array("a", dtype=torch.bfloat16)])
+    assert spec.config.dtype is torch.bfloat16
+
+
+def test_the_new_settings_reach_the_shared_spec_from_any_of_its_reads():
+    specs = build_specs(_av(), kernel_settings={
+        "video_to_audio": {"workspace_mb": 128}, "audio_self": {"max_segments_per_request": 3},
+        "video_self": {"compile_op": True},
+    })
+    by_key = {spec.resource_key: spec for spec in specs}
+    assert by_key["audio_text"].config.workspace_mb == 128
+    assert by_key["audio_self"].config.max_segments_per_request == 3
+    assert by_key["video_self"].config.compile_op
+
+
+@pytest.mark.parametrize("array, cause", [
+    (Array("a", nodes={"dit"}, layers={0}, entry=_entry(), max_len=0, labels={"x", "y"},
+           reads={"r": Read(mask=Block(), op=Attend(q_heads=HEADS))}), "max_len 0 takes one label"),
+    (Array("a", nodes={"dit"}, layers={0}, entry=_entry(dtype=torch.bfloat16), max_len=8,
+           reads={"r": Read(mask=Causal(), op=Attend(q_heads=HEADS))}), "with no dtype"),
+])
+def test_what_todays_specs_cant_hold_is_refused_by_name(array, cause):
+    with pytest.raises(ValueError, match=f"Array 'a': no layout yet: .*{cause}"):
+        build_specs([array])
+
+
+def test_each_side_resolves_the_arrays_sharing_a_resource_once(monkeypatch):
+    read, reads = adapters._within_step_read, []
+
+    def counted(array, *rest):
+        reads.append(array.name)
+        return read(array, *rest)
+
+    monkeypatch.setattr(adapters, "_within_step_read", counted)
+    arrays = _av()
+    resources = {spec.resource_key: _StubRagged() for spec in build_specs(arrays)}
+    assert sorted(reads) == sorted(array.name for array in arrays), "the specs resolved an array once per array"
+    reads.clear()
+    node_handles(_Model(*arrays), "dit", resources)
+    assert sorted(reads) == sorted(array.name for array in arrays), "the handles resolved the arrays again per array"
+
+
+# The steps, per rank
+
+
+def test_each_read_plans_over_whole_segments():
+    """On a split step the resource narrows a split side to the rank's share itself (or exchanges it), so the plan the
+    contract hands it is the same on every rank."""
+    expanded = state_steps(_av_step(rows=(1, 2)), _handles(_av()))
+    share = 9
+
+    def segments(label, span):
+        return tuple(Segment(rid, label, span) for rid in (1, 2))
+
+    video_self = expanded.steps["video_self"]
+    assert isinstance(video_self, AttentionStep) and not video_self.causal
+    assert tuple(video_self.segments) == segments("video", 9)
+    assert tuple(expanded.steps["audio_self"].segments) == segments("audio", 3)
+    video_cross = expanded.steps["video_text"]
+    assert isinstance(video_cross, RaggedCrossAttentionStep) and video_cross.pairs == (("video", "text"),)
+    assert _by_label(video_cross) == {"video": segments("video", share), "text": segments("text", 5)}
+    audio_cross = expanded.steps["audio_text"]
+    assert audio_cross.pairs == (("audio", "text"), ("video", "audio"), ("audio", "video"))
+    assert _by_label(audio_cross) == {
+        "video": segments("video", share), "audio": segments("audio", 3), "text": segments("text", 5),
+    }
+
+
+def test_arrays_sharing_a_resource_plan_each_label_once():
+    arrays = [_array("image"), _array("caption"), _array("joint")]
+    step = SubmoduleStep(state={
+        "image": ArrayStep(segments=(Segment(1, "image", 4),)),
+        "caption": ArrayStep(segments=(Segment(1, "caption", 2),)),
+        "joint": ArrayStep(segments=(Segment(1, "joint", 6),)),
+    })
+    expanded = state_steps(step, _handles(arrays))
+    assert expanded.steps.keys() == {"image_read"}, "three arrays of one geometry are one resource"
+    assert _by_label(expanded.steps["image_read"]) == {
+        "image": (Segment(1, "image", 4),), "caption": (Segment(1, "caption", 2),), "joint": (Segment(1, "joint", 6),),
+    }
+
+
+def test_two_arrays_with_one_label_and_other_segments_on_one_resource_are_refused():
+    arrays = [_array("a", label="x"), _array("b", label="x")]
+    step = SubmoduleStep(state={
+        "a": ArrayStep(segments=(Segment(1, "x", 4),)), "b": ArrayStep(segments=(Segment(1, "x", 2),)),
+    })
+    with pytest.raises(ValueError, match="Array 'b': label 'x' on its resource already holds other segments"):
+        state_steps(step, _handles(arrays))
+
+
+def test_a_cross_read_whose_query_array_isnt_in_the_step_is_refused():
+    arrays = [_array("a"), _array("b", queries="a")]
+    step = SubmoduleStep(state={"b": ArrayStep(segments=(Segment(1, "b", 2),))})
+    with pytest.raises(ValueError, match="Array 'b': a step lists it without 'a', whose segments lay out its queries"):
+        state_steps(step, _handles(arrays))
+
+
+def test_a_cross_read_whose_query_array_lists_no_segments_is_refused_naming_it():
+    """The cross read plans first here, so the refusal for an array listed with no segments has to come from its query
+    side, not from the queried array's own turn, which comes after."""
+    arrays = [_array("a"), _array("b", queries="a")]
+    step = SubmoduleStep(state={"b": ArrayStep(segments=(Segment(1, "b", 2),)), "a": ArrayStep()})
+    with pytest.raises(ValueError, match="Array 'a': a step lists it with no segments, its own or the step's"):
+        state_steps(step, _handles(arrays))
+
+
+def test_a_cross_read_whose_query_array_lists_an_empty_tuple_is_refused_naming_it():
+    arrays = [_array("a"), _array("b", queries="a")]
+    step = SubmoduleStep(segments=[Segment(1, "a", 4)], state={
+        "b": ArrayStep(segments=(Segment(1, "b", 2),)), "a": ArrayStep(segments=()),
+    })
+    with pytest.raises(ValueError, match="Array 'a': a step lays it out over an empty list of segments"):
+        state_steps(step, _handles(arrays))
+
+
+def test_a_binding_no_paged_array_holds_is_refused_when_it_attaches():
+    with pytest.raises(ValueError, match="Array 'a': no layout yet: 'a_read' binds through RaggedAttend, which no "
+                                         "paged array holds"):
+        RaggedAttend().attach(SimpleNamespace(array=_array("a"), reads={}), "a_read", None)
+
+
+def test_resolve_lays_out_every_reads_queries_by_one_array_its_own_included():
+    a, b = _array("a"), _array("b", queries="a")
+    queries = _resolve([a, b], StateSetup()).queries
+    assert queries["a_read"].array is a and queries["b_read"].array is a, "a self read has no array to ask"
+
+
+def test_a_step_that_lays_an_array_out_under_another_label_is_refused_where_it_plans():
+    """`_check_step` refuses an undeclared label, and doesn't run on a replay. The plan runs under the declared one."""
+    step = SubmoduleStep(state={"a": ArrayStep(segments=(Segment(1, "audio", 4),))})
+    with pytest.raises(ValueError, match=r"Array 'a': a step lays it out under labels \['audio'\], and its plans run "
+                                         r"under its label 'video'"):
+        state_steps(step, _handles([_array("a", label="video")]))
+
+
+def test_two_reads_on_one_resource_that_set_a_kernel_setting_two_ways_are_refused():
+    settings = {"a_read": {"max_segments_per_request": 2}, "b_read": {"max_segments_per_request": 3}}
+    with pytest.raises(ValueError, match=r"kernel_settings\['a_read'\] and kernel_settings\['b_read'\] set "
+                                         r"max_segments_per_request to 2 and 3, and both reads run on the resource "
+                                         r"'a_read', which holds one value"):
+        build_specs([_array("a"), _array("b", label="b")], kernel_settings=settings)
+
+
+def test_a_cross_read_over_other_requests_is_refused_when_it_opens():
+    arrays = [_array("a"), _array("b", queries="a")]
+    step = SubmoduleStep(state={
+        "a": ArrayStep(segments=(Segment(1, "a", 4), Segment(2, "a", 4))),
+        "b": ArrayStep(segments=(Segment(2, "b", 2), Segment(1, "b", 2))),
+    })
+    expanded = state_steps(step, _handles(arrays))
+    expanded.set_ctx(_ctx(rows=(1, 2)))
+    with pytest.raises(ValueError, match="Array 'b': .*same requests in the same order"):
+        expanded.begin_calls()
+
+
+def test_a_replay_skips_the_cross_check():
+    arrays = [_array("a"), _array("b", queries="a")]
+    step = SubmoduleStep(state={
+        "a": ArrayStep(segments=(Segment(1, "a", 4), Segment(2, "a", 4))),
+        "b": ArrayStep(segments=(Segment(2, "b", 2), Segment(1, "b", 2))),
+    })
+    expanded = state_steps(step, _handles(arrays))
+    expanded.set_ctx(_ctx(rows=(1, 2), replay=True))
+    expanded.begin_calls()
+    expanded.end_calls()
+
+
+# The exchange
+
+
+def _q(tokens=4, heads=HEADS):
+    return torch.ones(1, tokens, heads, DIM)
+
+
+def _opened(handle, segments):
+    step = SubmoduleStep(segments=segments, state={handle.name: ArrayStep()})
+    step.set_ctx(_ctx())
+    step.set_state_handles((handle,))
+    step.begin_calls()
+    return step
+
+
+def test_a_read_with_no_exchange_packs_rows_and_unpacks_them_as_main_does():
+    ragged = _StubRagged()
+    array = _array("a", label="main")
+    h = _within(array, ragged)
+    _opened(h, [Segment(1, "main", 4)])
+    h.add(0, k=_q(), v=_q())
+    assert h.read(0, _q()).shape == (1, 4, HEADS, DIM)
+    assert ragged.runs == [("main", (4, HEADS, DIM), (4, HEADS, DIM))], "the kernel takes packed tokens"
+
+
+def test_a_read_of_packed_tokens_goes_straight_to_the_kernel():
+    ragged = _StubRagged()
+    h = _within(_array("a", label="main", packed=True), ragged)
+    _opened(h, [Segment(1, "main", 4)])
+    h.add(0, k=_q()[0], v=_q()[0])
+    assert h.read(0, _q()[0]).shape == (4, HEADS, DIM)
+
+
+def test_a_cross_read_runs_under_the_label_of_both_sides():
+    ragged = _StubRagged()
+    array = _array("b", queries="a", label="text")
+    h = _within(array, ragged, queried=_array("a", label="video"))
+    step = SubmoduleStep(state={
+        "a": ArrayStep(segments=(Segment(1, "video", 4),)), "b": ArrayStep(segments=(Segment(1, "text", 2),)),
+    })
+    step.set_ctx(_ctx())
+    h.begin_step(step)
+    h.add(0, k=_q(tokens=2), v=_q(tokens=2))
+    h.read(0, _q())
+    assert ragged.runs[0][0] == "video<-text"
+
+
+def test_a_read_declared_packed_false_refuses_packed_queries():
+    h = _within(_array("a", label="main"), _StubRagged())
+    _opened(h, [Segment(1, "main", 4)])
+    h.add(0, k=_q()[0], v=_q()[0])
+    with pytest.raises(ValueError, match="Array 'a': packed queries on a read declared packed=False"):
+        h.read(0, _q()[0])
+
+
+# backend: sdpa
+
+
+def test_a_worker_gives_its_specs_and_its_engine_one_choice_object(monkeypatch):
+    seen = []
+    serving = engine_manager.serving_resources
+    monkeypatch.setattr(engine_manager, "serving_resources",
+                        lambda model, config, setup: seen.append(setup) or serving(model, config, setup))
+    manager = EngineManager.build(
+        node_names=set(), device=torch.device("cpu"), model_config={"node_groups": []},
+        parallel_groups=WorkerParallelGroups(num_workers=1, global_rank=0),
+        transfer_engine_info=TransferEngineInfo(my_entity_id="test", my_session_id="test", transfer_engine=None),
+        model=StubModel(), graph_runtime=SimpleNamespace(),
+    )
+    assert seen == [manager.engine._state_setup] and seen[0] is manager.engine._state_setup, (
+        "the specs and the handles would bind by two choices, and the engine would open requests in another store"
+    )
+
+
+def test_a_resource_on_sdpa_builds_no_spec():
+    assert build_specs([_array("a")], setup=_on_sdpa("a_read")) == []
+
+
+def test_kernel_settings_on_a_resource_on_sdpa_set_nothing_and_still_refuse_a_bad_field():
+    assert build_specs([_array("a")], setup=_on_sdpa("a_read"), kernel_settings={"a_read": {"workspace_mb": 1}}) == []
+    with pytest.raises(ValueError, match="it may set only"):
+        build_specs([_array("a")], setup=_on_sdpa("a_read"), kernel_settings={"a_read": {"backend": "dense"}})
+
+
+def test_sdpa_on_a_resource_no_read_runs_on_is_refused_and_left_out():
+    setup, problems = state_setup(_sdpa_config("a_read", "vae"), [_array("a")])
+    assert problems == ["resources.vae: backend sdpa, and no read runs on it, of the resources ['a_read']"]
+    assert setup.by_read == {"a_read": SDPA[WITHIN_STEP, Attend]}, "the rest of the config should still bind"
+
+
+def test_sdpa_on_a_read_that_shares_another_reads_resource_names_that_resource():
+    arrays = [_array("a"), _array("b", label="b")]
+    (problem,) = state_setup(_sdpa_config("b_read"), arrays)[1]
+    assert problem.startswith("resources.b_read: backend sdpa, and the read 'b_read' runs on 'a_read'"), problem
+
+
+def test_a_kernel_setting_of_a_read_on_sdpa_is_refused_by_name():
+    handle = node_handles(_Model(_array("a")), "dit", {}, setup=_on_sdpa("a_read"))["a"]
+    with pytest.raises(ValueError, match="Array 'a': no max_segments_per_request for read 'a_read', whose binding "
+                                         "SdpaAttend reports back none"):
+        kernel_setting(handle, "a_read", "max_segments_per_request")
+
+
+def test_a_step_of_reads_on_sdpa_is_no_step_at_all():
+    handles = node_handles(_Model(_array("a")), "dit", {}, setup=_on_sdpa("a_read"))
+    step = SubmoduleStep(state={"a": ArrayStep(segments=(Segment(1, "a", 4),))})
+    assert state_steps(step, handles) is None, "a step on sdpa declares no step, and its forward still runs"
+
+
+def test_a_step_of_reads_on_sdpa_keeps_another_resources_step():
+    handles = node_handles(_Model(_array("a")), "dit", {}, setup=_on_sdpa("a_read"))
+    segments = (Segment(1, "a", 4),)
+    step = SubmoduleStep(state={"a": ArrayStep(segments=segments)}, steps={"lora": ResourceStep(segments=segments)})
+    expanded = state_steps(step, handles)
+    assert expanded is not None and set(expanded.steps) == {"lora"}, "a LoRA pool's rows would get no plan"
+
+
+def test_a_read_on_sdpa_equals_sdpa_with_no_step_open():
+    q, k, v = (torch.randn(2, 4, HEADS, DIM) for _ in range(3))
+    h = node_handles(_Model(_array("a")), "dit", {}, setup=_on_sdpa("a_read"))["a"]
+    h.add(0, k=k, v=v)
+    assert torch.equal(h.read(0, q), sdpa_attention(q, k, v))
+
+
+def test_a_read_on_sdpa_refuses_packed_tokens():
+    with pytest.raises(ValueError, match="Array 'a': no layout yet: reads\\['a_read'\\] runs SDPA, which can't tell"):
+        node_handles(_Model(_array("a", packed=True)), "dit", {}, setup=_on_sdpa("a_read"))
+
+
+def test_the_setting_is_read_per_resource_and_binds_every_read_on_it():
+    arrays = [_array("a"), _array("b", label="b"), _array("c", nodes=("x",))]
+    config = {"resources": {"a_read": {"backend": "sdpa"}, "c_read": {"backend": "dense"}, "kv": {"page_size": 8}}}
+    setup, problems = state_setup(config, arrays)
+    assert problems == [] and setup.by_read.keys() == {"a_read", "b_read"}, "b's read shares a's resource"
+
+
+@pytest.mark.parametrize("config, cause", [
+    ({"node_groups": [{"node_names": ["dit"], "attention_backend": "sdpa"}]},
+     "node_groups[0].attention_backend: the backend is a resource's setting"),
+    ({"resources": {"a_read": {"backend": "sdpa", "max_segments_per_step": 2}}},
+     "resources.a_read: backend sdpa builds no resource, so it takes no other setting"),
+])
+def test_a_bad_setting_is_refused_naming_the_cause(config, cause):
+    (problem,) = state_setup(config, [_array("a")])[1]
+    assert problem.startswith(cause), problem
+
+
+def test_sdpa_on_a_read_that_keeps_entries_is_refused_at_load():
+    array = Array("kv", nodes={"llm"}, layers={0}, entry=KVEntry(heads=HEADS, head_dim=DIM), max_len=8,
+                  reads={"r": Read(mask=Causal(), op=Attend(q_heads=HEADS))})
+    setup, problems = state_setup(_sdpa_config("r"), [array])
+    assert problems == [
+        "resources.r: backend sdpa runs only an Attend read within a step, and Array 'kv'.reads['r'] isn't one",
+    ] and setup.by_read == {}, "a paged read takes no SDPA"
+
+
+_SDPA_SPLIT = "backend sdpa over labels ['video'], which the sequence shard of ['dit'] splits over SP ranks"
+_BOTH_SPLIT = "both split over the SP ranks of ['dit'], which no exchange serves"
+
+
+@pytest.mark.parametrize("split, sdpa, problems", [
+    (("video",), "video_to_audio", [f"Array 'video_a'.reads['video_to_audio']: {_SDPA_SPLIT}"]),
+    (("video",), "video_self", [f"Array 'video'.reads['video_self']: {_SDPA_SPLIT}"]),
+    (("video",), "video_text", []),
+    ((), "video_to_audio", []),
+    (("video", "audio"), None, [
+        "Array 'audio_v'.reads['audio_to_video']: its queries (Array 'video', labels ['video']) "
+        f"and keys (labels ['audio']) {_BOTH_SPLIT}",
+        "Array 'video_a'.reads['video_to_audio']: its queries (Array 'audio', labels ['audio']) "
+        f"and keys (labels ['video']) {_BOTH_SPLIT}",
+    ]),
+], ids=["sdpa-split-keys", "sdpa-self", "sdpa-copied-keys", "one-rank", "cross-both-split"])
+def test_reads_no_exchange_serves_on_split_labels_are_refused_from_the_declarations(split, sdpa, problems):
+    """SDPA runs outside the resources, so no exchange reaches it: over split keys it would attend one rank's share.
+    Over split queries and copied keys (video to text) each rank's queries see every key, as they should. A cross read
+    with both sides split has no exchange. The engine (at load) and validate_deployment both ask this."""
+    got = split_read_problems(_av(), [sdpa] if sdpa else [], {"dit": split} if split else {})
+    assert len(got) == len(problems) and all(g.startswith(p) for g, p in zip(got, problems, strict=True)), got
+
+
+# A segmented read
+
+
+def _segmented_on_sdpa() -> WithinStepHandle:
+    """A request's rows and their padding in one row, as MiniMax-H3's DiT lays them out, on SDPA."""
+    array = Array("a", nodes={"dit"}, layers={0, 1}, entry=_entry(), max_len=0,
+                  reads={"a_read": Read(mask=Block(), op=Attend(q_heads=HEADS), packed=False, segmented=True)})
+    return node_handles(_Model(array), "dit", {}, setup=_on_sdpa("a_read"))["a"]
+
+
+@pytest.mark.parametrize("field", [{"packed": True}, {"queries": "b"}, {"mask": Causal()}])
+def test_a_segmented_read_takes_block_rows_and_no_queries(field):
+    read = {"mask": Block(), "op": Attend(q_heads=HEADS), "packed": False, "segmented": True}
+    Read(**read)
+    with pytest.raises(ValueError, match=r"Read.segmented lays a request's segments end to end in one row, which takes "
+                                         r"Block\(\), packed=False and no queries"):
+        Read(**{**read, **field})
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_a_segmented_read_on_sdpa_attends_within_each_segment_as_h3_did(dtype):
+    """H3 ran padded rows through `joint_attention` over `FrameSDPA`, and unpadded ones through `sdpa_attention`."""
+    q, k, v = (torch.randn(1, 16, HEADS, DIM, dtype=dtype) for _ in range(3))
+    h = _segmented_on_sdpa()
+    for spans, want in (((13, 3), joint_attention(q, k, v, ragged=FrameSDPA((13, 3)).run)),
+                        ((16,), sdpa_attention(q, k, v))):
+        step = _opened(h, [Segment(1, "main", span) for span in spans])
+        h.add(0, k=k, v=v)
+        got = h.read(0, q)
+        step.end_calls()
+        assert torch.equal(got, want), f"segments {spans} would attend across the padding or round apart from main"
+
+
+def test_a_segmented_read_on_sdpa_opens_its_step_with_no_exchange():
+    step = SubmoduleStep(state={"a": ArrayStep(segments=(Segment(1, "main", 13), Segment(1, "main", 3)))})
+    assert state_steps(step, {"a": _segmented_on_sdpa()}) is not None, "its split needs the step's spans"
+
+
+def test_a_segmented_read_outside_a_step_is_refused():
+    h = _segmented_on_sdpa()
+    for opened in (False, True):
+        if opened:
+            _opened(h, [Segment(1, "main", 4)]).end_calls()
+        h.add(0, k=_q(), v=_q())
+        with pytest.raises(ValueError, match="Array 'a': read in a step that doesn't list the array"):
+            h.read(0, _q())
+
+
+def test_a_segmented_read_over_two_requests_is_refused_when_it_opens():
+    step = SubmoduleStep(segments=[Segment(1, "main", 4), Segment(2, "main", 4)], state={"a": ArrayStep()})
+    step.set_ctx(_ctx(rows=(1, 2)))
+    step.set_state_handles((_segmented_on_sdpa(),))
+    with pytest.raises(ValueError, match="Array 'a': no layout yet: a segmented read in a step of several requests"):
+        step.begin_calls()

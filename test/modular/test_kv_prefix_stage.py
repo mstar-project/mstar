@@ -30,6 +30,7 @@ from mstar.model.submodule_base import (
     NodeInputs,
 )
 from mstar.testing_utils.engine import make_engine, make_mgmt
+from mstar.testing_utils.resource import StubResource
 
 RID = "r0"
 NODE = "LLM"
@@ -38,17 +39,13 @@ WALK = "prefill"
 PROMPT = 100
 
 
-class _Answering(Resource):
+class _Answering(StubResource):
     """Answers a fixed match, and records what it was applied with."""
 
     def __init__(self, matched: int | None):
         self._matched = matched
         self.resolved = 0
         self.applied: list[tuple[int, int | None]] = []
-
-    @classmethod
-    def build(cls, spec, info):
-        raise NotImplementedError
 
     def resolve_cached_prefix(self, rid, node_name, graph_walk, inputs):
         self.resolved += 1

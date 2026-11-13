@@ -10,6 +10,7 @@ from mstar.engine.resources.attn.ragged.wrappers import (
     PrefixedPrefillWrapper,
     RaggedCrossPrefillWrapper,
     RaggedPrefillWrapper,
+    _KeyPrefixMixin,
     _RaggedPrefillBase,
     zero_unplanned_rows,
 )
@@ -88,3 +89,7 @@ class DenseRaggedCrossPrefillWrapper(_DenseRaggedPrefillBase, RaggedCrossPrefill
 
 class DensePrefixedPrefillWrapper(_DenseRaggedPrefillBase, PrefixedPrefillWrapper):
     """Prefixed attention through FA3 varlen."""
+
+
+class DenseKeyPrefixPrefillWrapper(_KeyPrefixMixin, DenseRaggedCrossPrefillWrapper):
+    """Key-prefix self-attention through FA3."""

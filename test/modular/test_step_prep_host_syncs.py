@@ -171,7 +171,6 @@ def _wan22_steps(sub, walk, steps, latents, image_latent):
     from the loop counter and the solver state over the loop-back edges."""
     device = latents.device
     sub.get_device = lambda: device
-    sub.request_states.pop("r", None)
     ring, last = torch.zeros((2, *latents.shape), device=device), torch.zeros_like(latents)
     inputs = {
         "text_embeds_pos": [torch.full((1, 8, 16), 1.0, device=device, dtype=torch.bfloat16)],
@@ -339,7 +338,7 @@ def _cosmos3(monkeypatch=None, capture=False):
     config = Cosmos3Config(compile_denoise=False)
     transformer = SimpleNamespace(
         proj_in=SimpleNamespace(weight=torch.zeros(1, dtype=torch.float32)),
-        sp_group=SimpleNamespace(world_size=1), comm_group=SimpleNamespace(world_size=1),
+        comm_group=SimpleNamespace(world_size=1),
         _rotary=stand_in_rotary(config),
     )
     sub = Cosmos3DiTSubmodule(
@@ -657,6 +656,23 @@ def test_higgs_loopback_decode_prep_copies_no_pageable_index(monkeypatch):
     assert out["input_ids"].shape == (2,)
 
 
+def test_kokoro_chunk_prep_reads_no_tensor():
+    """A request's chunk lengths ride its step metadata, so selecting its chunk reads nothing on the host."""
+    from mstar.model.kokoro.config import CHUNK_LENGTHS, CHUNK_LOOP, PHONEME_IDS, REF_STYLE, SPEED
+    from mstar.model.kokoro.submodules import KokoroSynthSubmodule
+
+    sub = KokoroSynthSubmodule(torch.nn.Linear(1, 1), None)
+    inputs = {
+        PHONEME_IDS: [torch.zeros(2, 5, dtype=torch.long)], REF_STYLE: [torch.zeros(2, 16)], SPEED: [torch.ones(1)],
+    }
+    for k, length in enumerate((5, 3)):
+        with _HostReads() as prep:
+            row = sub.prepare_inputs("synth", _fwd(1, "synth", {CHUNK_LENGTHS: [5, 3]}, CHUNK_LOOP, k), inputs)
+        assert prep.reads == [], f"chunk {k}: host reads {prep.reads}"
+        assert row.input_seq_len == length and row.tensor_inputs["input_ids"].shape == (length,)
+    assert sub.prepare_inputs("synth", _fwd(1, "synth", {CHUNK_LENGTHS: [5, 3]}, CHUNK_LOOP, 2), inputs) is None
+
+
 def test_higgs_encoder_prep_reads_no_tensor():
     """The audio encoder's per-chunk embedding counts come from the clip's
     ``MEDIA_LAYOUT`` grid ``process_prompt`` filled, not off a lengths tensor."""
@@ -698,3 +714,81 @@ def test_qwen3_omni_audio_encoder_prep_reads_no_tensor():
             })
         assert reads.reads == []
         assert row.input_seq_len == int(_get_feat_extract_output_lengths(torch.tensor(frames)))
+
+
+class _ScalarWrites(TorchFunctionMode):
+    """Records every index write of a Python scalar into a tensor: on a CUDA
+    tensor it copies the scalar from the host, which waits for queued work."""
+
+    def __init__(self):
+        super().__init__()
+        self.writes: list[str] = []
+
+    def __torch_function__(self, func, types, args=(), kwargs=None):
+        if func is _T.__setitem__ and not torch.is_tensor(args[2]):
+            self.writes.append(repr(args[1]))
+        return func(*args, **(kwargs or {}))
+
+
+def _qwen3_omni_thinker(device: torch.device):
+    from mstar.model.qwen3_omni.config import Qwen3OmniModelConfig
+    from mstar.model.qwen3_omni.submodules import ThinkerSubmodule
+
+    config = Qwen3OmniModelConfig()
+    thinker = ThinkerSubmodule.__new__(ThinkerSubmodule)
+    nn.Module.__init__(thinker)
+    thinker.config = config
+    ids = (config.thinker.audio_start_token_id, config.thinker.audio_end_token_id,
+           config.thinker.audio_token_id, config.thinker.vision_start_token_id,
+           config.thinker.vision_end_token_id, config.im_start_token_id, config.assistant_token_id)
+    embed = nn.Embedding(max(config.thinker_text.vocab_size, *ids) + 1, 8, device=device)
+    thinker.model = SimpleNamespace(model=SimpleNamespace(embed_tokens=embed))
+    thinker._vision_bos_embed = thinker._vision_eos_embed = None
+    thinker.__dict__["_cached_device"] = device
+    thinker.kv = SimpleNamespace(positions=SimpleNamespace(position=lambda rid, label: 5))
+    return thinker
+
+
+def _qwen3_omni_prefill_rows(device: torch.device):
+    """An audio and an image row, each between a text span before it and one after it."""
+    texts = [torch.tensor([9, 10, 11], device=device), torch.tensor([12, 13], device=device)]
+    grid = torch.tensor([1, 4, 6], device=device)
+    return [
+        ("prefill_audio", {"audio_embeds": [torch.zeros(7, 8, device=device)], "text_inputs": texts}),
+        ("prefill_vision", {"vision_embeds": [torch.zeros(6, 8, device=device)],
+                            "deepstack": [torch.zeros(6, 8, device=device)] * 2, "image_grid_thw": [grid],
+                            "text_inputs": texts}),
+    ]
+
+
+def _qwen3_omni_fwd(walk: str):
+    from mstar.model.qwen3_omni.qwen3_omni_model import TEXT_BEFORE
+
+    return _fwd(0, walk, step_metadata={TEXT_BEFORE: 1})
+
+
+def test_qwen3_omni_thinker_prefill_prep_writes_no_scalar():
+    """The Thinker's audio and image rows set their sentinel slots with
+    device fills, not index writes of Python scalars."""
+    thinker = _qwen3_omni_thinker(torch.device("cpu"))
+    for walk, inputs in _qwen3_omni_prefill_rows(torch.device("cpu")):
+        with _ScalarWrites() as writes:
+            thinker.prepare_inputs(walk, _qwen3_omni_fwd(walk), inputs)
+        assert writes.writes == [], f"{walk} wrote scalars by index: {writes.writes}"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="sync-debug mode needs a GPU")
+def test_qwen3_omni_thinker_audio_prep_takes_no_host_sync():
+    """An audio row prepares with no host sync after a warm call. An image row
+    reads its grid on the host, so only the CPU test above covers it."""
+    device = torch.device("cuda")
+    thinker = _qwen3_omni_thinker(device)
+    walk, inputs = _qwen3_omni_prefill_rows(device)[0]
+    thinker.prepare_inputs(walk, _qwen3_omni_fwd(walk), inputs)
+    torch.cuda.synchronize()
+    previous = torch.cuda.get_sync_debug_mode()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        thinker.prepare_inputs(walk, _qwen3_omni_fwd(walk), inputs)
+    finally:
+        torch.cuda.set_sync_debug_mode(previous)

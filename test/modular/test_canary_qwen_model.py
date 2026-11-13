@@ -194,7 +194,7 @@ def _model_with_word_tokenizer() -> CanaryQwenModel:
     model.config = SimpleNamespace(audio_locator_tag="<|audio|>")
     model.tokenizer = SimpleNamespace(encode=encode)
     model.audio_token_id = encode("<|audio|>")[0]
-    model.audio_encoder = audio_encoder(model.audio_token_id)
+    model.audio_encoder = audio_encoder()
     return model
 
 
@@ -304,7 +304,7 @@ def test_llm_node_caps_captures_and_names():
                                         num_key_value_heads=1, head_dim=8, intermediate_size=32, vocab_size=20))
     llm = Qwen3DenseLM(config, attn_key="attn", kv_key="kv", pos_key="rope")
     stops = SimpleNamespace(stop_token_ids=frozenset({11, 12}))
-    node = CanaryQwenLLMSubmodule(llm, stops, (audio_encoder(19),), text_prompts=False)
+    node = CanaryQwenLLMSubmodule(llm, stops, (audio_encoder(),), text_prompts=False)
     assert node.max_batch_size(PREFILL_WALK) == 16 and node.max_batch_size("decode") is None
     (capture,) = node.get_accelerator_graph_configs(torch.device("cpu"))
     assert capture.capture_graph_walk == "decode" and capture.capture_batch_sizes == [1, 2, 4, 8, 16, 32, 64]
@@ -319,3 +319,52 @@ def test_llm_node_caps_captures_and_names():
     assert walks[node.DECODE_WALK].name == node.DECODE_LOOP and node.SAMPLER == SAMPLER
     # the walk names configs and metrics read
     assert set(walks) == {PREFILL_WALK, node.DECODE_WALK} == {"prefill", "decode"}
+
+
+def _qwen_tokenizer():
+    """A tiny byte-level BPE with Qwen3's end-of-turn tokens, as the base LLM's repo ships them."""
+    from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
+    from transformers import PreTrainedTokenizerFast
+
+    tok = Tokenizer(models.BPE())
+    tok.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    tok.decoder = decoders.ByteLevel()
+    tok.train_from_iterator(["the cat sat on the mat"], trainers.BpeTrainer(
+        vocab_size=300, special_tokens=["<|endoftext|>", "<|im_start|>", "<|im_end|>"],
+        initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
+    ))
+    return PreTrainedTokenizerFast(
+        tokenizer_object=tok, eos_token="<|im_end|>", pad_token="<|endoftext|>", clean_up_tokenization_spaces=False,
+    )
+
+
+def test_a_transcript_passes_the_data_worker_with_its_stop_ids(tmp_path, monkeypatch):
+    """The data worker drops the stop ids Canary-Qwen's ``text_output`` declares from the
+    transcript, and tags the chunk that ends it."""
+    pytest.importorskip("tokenizers")
+    transformers = pytest.importorskip("transformers")
+    import queue
+
+    from mstar.api_server.data_worker import InlineTokens, PreprocessWorkerThread, RequestOutputState
+
+    tokenizer = _qwen_tokenizer()
+    monkeypatch.setattr(transformers.AutoTokenizer, "from_pretrained", lambda *a, **kw: tokenizer)
+    monkeypatch.setattr(
+        CanaryQwenModelConfig, "from_pretrained",
+        lambda *a: SimpleNamespace(audio_locator_tag="<|audioplaceholder|>", llm=SimpleNamespace(vocab_size=1 << 20)),
+    )
+    (tmp_path / "llm").mkdir()
+    (tmp_path / "config.json").write_text(json.dumps({"pretrained_llm": str(tmp_path / "llm")}))
+    model = CanaryQwenModel(str(tmp_path))
+
+    wt = PreprocessWorkerThread.__new__(PreprocessWorkerThread)
+    wt.out_queue, wt.model, wt.request_model_kwargs = queue.Queue(), model, {}
+    wt._draining_rids, wt._reads_done_sent, wt.in_flight_requests = set(), set(), set()
+    wt.request_output_state = {"r": RequestOutputState()}
+    tokens = [*tokenizer.encode(" the cat", add_special_tokens=False), tokenizer.convert_tokens_to_ids("<|im_end|>")]
+    for token in tokens:  # one frame per decode step
+        wt._emit_inline_tokens(InlineTokens(["r"], [token], "text"))
+    chunks = [wt.out_queue.get_nowait() for _ in tokens]
+    assert [c.modality for c in chunks] == ["text"] * len(tokens)
+    assert b"".join(c.data for c in chunks) == b" the cat"
+    assert [c.stopped for c in chunks] == [False] * (len(tokens) - 1) + [True]

@@ -198,11 +198,8 @@ class KDAManager(LinearAttnManager):
         """Whether a captured prefill replays with each step's spans on these kernels."""
         return self.kernels.prefill_capturable
 
-    def depends_on(self) -> set[str]:
-        # the pool plans first; its addressing arrives via `ctx.plan_results`
-        return {self._pool_key}
-
     def bind_dependencies(self, resources: Mapping[str, Resource]) -> None:
+        super().bind_dependencies(resources)
         self._pool = resources.get(self._pool_key)
         if self._pool is not None:
             # the kernels store each snapshot themselves, through no checkpoint buffer, and only
@@ -210,7 +207,6 @@ class KDAManager(LinearAttnManager):
             self._pool.bind_snapshot_writer(
                 buffered=False, blocks=("state", "conv"), chunk=getattr(self.kernels, "chunk", 1),
             )
-
     # Step lifecycle
 
     @property

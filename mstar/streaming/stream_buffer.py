@@ -49,6 +49,17 @@ class StreamingEdge(NamedTuple):
     chunk: StreamChunkInfo
 
 
+class InlineValue(int):
+    """A stream item that came as its value rather than as a handle to a stored
+    tensor: a token the producer sent inline (``StreamBuffer.put_values``)."""
+    __slots__ = ()
+
+
+class _InlineValues(tuple):
+    """Inline items queued in arrival order behind the items registered before them."""
+    __slots__ = ()
+
+
 def collate(items: list[torch.Tensor]) -> torch.Tensor:
     """A chunk's items as its consumer takes them: one item as itself,
     several stacked. A consumer must not write into it: a single item is the
@@ -151,6 +162,18 @@ class StreamBuffer:
         self._num_tensors_registered += len(tensor_ids)
         self._tensor_ids_in_order.append((tuple(tensor_ids), walk))
 
+    def put_values(self, values: list[int], walk: str | None = None) -> None:
+        """Items that came inline, already here: they join the buffer after every
+        item registered before them, so a stream keeps its order whichever way
+        each item travelled."""
+        if not values:
+            return
+        if self.join_dim is not None:
+            raise ValueError(f"stream {self.edge_name!r} joins its items and cannot take them inline")
+        self._num_tensors_registered += len(values)
+        self._tensor_ids_in_order.append((_InlineValues(InlineValue(v) for v in values), walk))
+        self.maybe_ready = True
+
     def put(self, tensor_id: str, item) -> None:
         """Called when an item arrives via normal routing."""
         self._id_to_tensor[tensor_id] = item
@@ -167,6 +190,10 @@ class StreamBuffer:
                 self._buffer.append(self._id_to_tensor.pop(entry))
                 # producer's units: see pre_read_register_joined
                 self._num_buffer_writes += 1
+            elif type(entry) is _InlineValues:
+                self._tensor_ids_in_order.popleft()
+                self._buffer.extend(entry)
+                self._num_buffer_writes += len(entry)
             else:
                 if any(tensor_id not in self._id_to_tensor for tensor_id in entry):
                     return
@@ -176,10 +203,11 @@ class StreamBuffer:
                 ))
                 self._num_buffer_writes += len(entry)
             if self.walk_tagged:
+                added = len(entry) if type(entry) is _InlineValues else 1
                 if self._walk_runs and self._walk_runs[-1][0] == walk:
-                    self._walk_runs[-1][1] += 1
+                    self._walk_runs[-1][1] += added
                 else:
-                    self._walk_runs.append([walk, 1])
+                    self._walk_runs.append([walk, added])
 
     def _join(self, pieces: list) -> torch.Tensor:
         """One item from a chunked producer's pieces, in chunk order.

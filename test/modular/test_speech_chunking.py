@@ -345,18 +345,29 @@ def test_streaming_error_up_front_releases_only_the_pieces_ahead(client_and_stub
     assert ids[0] in stub.read_to_end and stub.released == ids[1:]
 
 
-def test_non_streaming_error_releases_only_the_pieces_ahead(client_and_stub):
+@pytest.mark.parametrize("cancelled", [False, True], ids=["http", "cancelled"])
+def test_non_streaming_error_releases_only_the_pieces_ahead(client_and_stub, cancelled):
     client, stub = client_and_stub
     from fastapi import HTTPException
 
     async def collect(request_id, raw_request=None):
         if request_id == _ids(stub)[1]:
+            if cancelled:
+                raise asyncio.CancelledError
             raise HTTPException(status_code=400, detail="piece failed")
         return stub._chunks[request_id]
 
     stub.collect_results = collect
-    r = client.post("/v1/audio/speech", json={"model": "orpheus", "input": LONG_TEXT})
-    assert r.status_code == 400
+    if cancelled:
+        from mstar.api_server.openai.protocol import SpeechRequest
+        from mstar.api_server.openai.serving_speech import create_speech
+
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(create_speech(stub, "orpheus", adapters.OrpheusAdapter(),
+                                      SpeechRequest(model="orpheus", input=LONG_TEXT)))
+    else:
+        r = client.post("/v1/audio/speech", json={"model": "orpheus", "input": LONG_TEXT})
+        assert r.status_code == 400
     assert stub.released == _ids(stub)[2:] and len(stub.submits) == 3
 
 

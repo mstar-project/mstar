@@ -9,7 +9,6 @@ import torch
 from mstar.engine.resources import (
     AdmitOutcome,
     AllocationFailed,
-    Resource,
     StepRunner,
     SubmoduleStep,
 )
@@ -22,6 +21,7 @@ from mstar.engine.resources.recurrent.config import (
 )
 from mstar.engine.resources.recurrent.pool import RecurrentStatePool
 from mstar.engine.resources.step import Segment, StepContext
+from mstar.testing_utils.resource import StubResource
 
 POOL, AFTER = "state", "after"
 
@@ -38,15 +38,11 @@ def build_pool(max_slots: int) -> RecurrentStatePool:
     return RecurrentStatePool.build(spec, EngineResourceInfo(device=torch.device("cpu")))
 
 
-class _Refuser(Resource):
+class _Refuser(StubResource):
     """Planned after the pool; refuses whenever told to."""
 
     def __init__(self):
         self.refuse = False
-
-    @classmethod
-    def build(cls, spec, info):
-        raise NotImplementedError
 
     def depends_on(self) -> set[str]:
         return {POOL}

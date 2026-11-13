@@ -124,7 +124,7 @@ def test_finished_request_re_queued_fails_alone():
         },
         per_request_input_metadata={}, final_stream_rids=set(),
         skipped_rids=set(), failed_requests={}, inputs=None, running_batched=None,
-        chunk_ranges={},
+        chunk_ranges={}, input_ready=(),
     )
     batch.register_prepare_batch = lambda inputs: setattr(batch, "inputs", inputs)
     batch.drop_rids = lambda rids: setattr(

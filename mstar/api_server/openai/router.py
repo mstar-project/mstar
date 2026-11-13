@@ -35,7 +35,7 @@ from mstar.api_server.openai.protocol import (
     UnloadLoraAdapterRequest,
     VideoGenerationRequest,
 )
-from mstar.utils.client_errors import client_error_text, scrub_paths
+from mstar.utils.client_errors import exception_status_text
 
 logger = logging.getLogger(__name__)
 
@@ -83,16 +83,7 @@ def _exception_error(e: Exception, route: str) -> JSONResponse:
     id, with the full error logged under it. An exception class that names
     its own ``status_code`` (``AudioTooLongError`` is a 413) keeps that status.
     """
-    status, detail = getattr(e, "status_code", None), getattr(e, "detail", None)
-    if isinstance(status, int) and detail is not None:
-        return _error(status, str(detail))
-    if isinstance(e, ValueError):
-        logger.info("%s request refused: %s", route, e)
-        return _error(status if isinstance(status, int) else 400, scrub_paths(str(e)))
-    text, _ = client_error_text(e, f"{route} request failed", log=logger, type_name=False)
-    if not isinstance(status, int):
-        status = 400 if isinstance(e, TypeError) else 500
-    return _error(status, text)
+    return _error(*exception_status_text(e, route, log=logger))
 
 
 def _resolve(require: str):

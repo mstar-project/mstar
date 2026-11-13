@@ -1,0 +1,113 @@
+name: Review bot cache
+
+# Fills the review bot's Eras cache volumes (ERAS_CACHE_VOLUMES) with compile caches (and, with
+# `weights`, model weights) from main, so a full review's live test on Eras starts warm. An Eras box
+# binds one volume, so the volumes are replicas, one per box: each gets a box of its own, two at a
+# time. Run by hand (it takes write access to dispatch) after models are added or main's kernels
+# change. It runs only main's code, with the volume read-write; live tests mount one read-only. See
+# .github/review/README.md.
+
+on:
+  workflow_dispatch:
+    inputs:
+      volumes:
+        description: "Volume ids to fill, space-separated (empty: every one in ERAS_CACHE_VOLUMES)"
+        default: ""
+      models:
+        description: "Models to warm, space-separated (default: the most-used ones, mostly for their compile caches), or `all` (every name in mstar serve's registry)"
+        default: qwen3_5_0.8b qwen3_5_9b qwen3_tts kokoro whisper_large_v3_turbo flux2_klein
+      skip:
+        description: Names to leave out (checkpoints too big for the box's disk, or with `weights`, for the volume)
+        default: glm52 glm5_next
+      weights:
+        description: Keep the weights on the volumes too, not only the compile caches (measured on one model, a warm start was 543 s against 704 s cold, from the compile caches; weights on the volume didn't help)
+        type: boolean
+        default: false
+      gpus:
+        description: "GPUs for the box (empty: 1, or 8 when models is `all`; the default models are 1-GPU configs)"
+        default: ""
+      hours:
+        description: The box's deadline, in hours
+        default: "10"
+
+permissions: {}
+
+concurrency:
+  group: review-cache
+  cancel-in-progress: false
+
+jobs:
+  volumes:
+    runs-on: ubuntu-latest
+    permissions: {}
+    outputs:
+      ids: ${{ steps.ids.outputs.ids }}
+    steps:
+      - id: ids
+        env:
+          VOLUMES: ${{ inputs.volumes || vars.ERAS_CACHE_VOLUMES }}
+        run: |
+          [ -n "${VOLUMES//[[:space:]]/}" ] || { echo "::error::Set ERAS_CACHE_VOLUMES, or name the volumes."; exit 1; }
+          echo "ids=$(jq -cn --arg v "$VOLUMES" '[$v | splits("\\s+")] | map(select(. != ""))')" >> "$GITHUB_OUTPUT"
+
+  refresh:
+    needs: volumes
+    # Holds ERAS_API_KEY, which a refresh spends: the environment's branch rule keeps it from branch workflows.
+    environment: review-bot
+    runs-on: ubuntu-latest
+    timeout-minutes: 720
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        volume: ${{ fromJSON(needs.volumes.outputs.ids) }}
+    env:
+      ERAS_API_KEY: ${{ secrets.ERAS_API_KEY }}
+      SSH_KEY: ${{ secrets.REVIEW_SSH_KEY }}
+      VOLUME: ${{ matrix.volume }}
+      MAX_USD: ${{ vars.REVIEW_GPU_MAX_USD_PER_HOUR || '30' }}
+      TAG: cache-${{ github.run_id }}-${{ github.run_attempt }}-${{ strategy.job-index }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          persist-credentials: false
+
+      - name: Start the refresh on an Eras box
+        env:
+          MODELS: ${{ inputs.models }}
+          SKIP: ${{ inputs.skip }}
+          WEIGHTS: ${{ inputs.weights }}
+          GPUS: ${{ inputs.gpus || (inputs.models == 'all' && '8' || '1') }}
+          HOURS: ${{ inputs.hours }}
+        run: |
+          # gpu.py's ledger, for this run only
+          echo "LIVE_PR_STATE=$RUNNER_TEMP/live-pr" >> "$GITHUB_ENV"
+          export LIVE_PR_STATE=$RUNNER_TEMP/live-pr
+          python3 .github/review/gpu_review.py configure
+          python3 .github/review/gpu_review.py refresh
+
+      - name: Wait for it
+        timeout-minutes: 700
+        run: python3 .github/review/gpu_review.py wait
+
+      - name: Check that it finished
+        run: |
+          last=$(tail -n 1 "$RUNNER_TEMP/lt/nvidia/results/refresh.log" 2> /dev/null)
+          [ "$last" = "refresh done" ] || { echo "::error::The refresh of $VOLUME didn't finish: ${last:-no log}"; exit 1; }
+
+      - name: Keep the log
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: review-cache-${{ github.run_id }}-${{ strategy.job-index }}
+          path: ${{ runner.temp }}/lt/nvidia/results/refresh.log
+          if-no-files-found: ignore
+
+      - name: Release the box
+        if: always()
+        env:
+          PR: 0
+        run: python3 .github/review/gpu_review.py cleanup

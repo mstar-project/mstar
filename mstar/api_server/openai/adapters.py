@@ -351,7 +351,7 @@ class OpenAIAdapter:
     def speech_request(self, req: SpeechRequest, upload_dir: Path) -> SubmitArgs:
         """``speech_to_request`` plus a client-sent ``speed``; the model's request_kwargs reads or logs it.
 
-        Only a sent one: ``SpeechRequest.speed`` defaults to 1.0, which would warn on every request.
+        Only a sent one: ``SpeechRequest.speed`` defaults to 1.0, which would be logged as ignored.
         """
         args = self.speech_to_request(req, upload_dir)
         if "speed" in req.model_fields_set:
@@ -521,9 +521,9 @@ class Qwen3OmniAdapter(OpenAIAdapter):
 
 
 class Qwen3_5Adapter(OpenAIAdapter):
-    """The VLM chat models (Qwen3.5, Qwen3.8 and Muse Glimmer): text, image and
-    video chat (``image_url`` / ``video_url`` parts, as the model takes them),
-    text out.
+    """The VLM chat models (Qwen3.5, Qwen3.8, Muse Glimmer and Phi-4-multimodal):
+    text, image, video and audio chat (``image_url`` / ``video_url`` /
+    ``audio_url`` / ``input_audio`` parts, as the model takes them), text out.
 
     Chat only; the other ``/v1/*`` surfaces stay 404. Sampling keys:
     ``temperature``, ``top_p``, ``max_output_tokens`` and ``seed``, plus
@@ -1785,6 +1785,8 @@ ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
     "kimi_k31": TextChatAdapter(),
     # chat with images; reasoning_effort and the sampling defaults are the model's
     "muse_glimmer": Qwen3_5Adapter(),
+    # chat with images and audio (image_url, audio_url and input_audio parts)
+    "phi4mm": Qwen3_5Adapter(),
     "ripple_65b": TextChatAdapter(),
 }
 

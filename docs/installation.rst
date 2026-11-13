@@ -54,7 +54,7 @@ To work on the code, install from source in editable mode:
 
 This pulls in the core runtime (PyTorch, FastAPI/Uvicorn, msgpack, …) and installs the two
 console scripts, ``mstar`` and ``mstar-serve``. To serve from a checkout, also build the
-extension (see `Rust extension`_).
+extension (see `Rust extension`_) and ``mstar-server`` (see `The Rust HTTP frontend`_).
 
 .. important::
 
@@ -143,6 +143,9 @@ Model families and some output formats need extra packages, exposed as pip *extr
    * - ``.[orpheus]``
      - Orpheus TTS runtime: ``transformers``, ``flashinfer-python``, ``safetensors``,
        ``einops``, ``huggingface-hub``, ``mooncake-transfer-engine``.
+   * - ``.[minicpm_o]``
+     - MiniCPM-o 4.5 runtime: ``transformers``, ``flashinfer-python``, ``safetensors``,
+       ``soundfile``, ``torchaudio`` / ``torchcodec``, ``Pillow``, ``huggingface-hub``.
    * - ``.[fish_s2_pro]``
      - Fish Audio S2-Pro runtime: ``transformers``, ``flashinfer-python``, ``safetensors``,
        ``soundfile`` (reference-clip decoding), ``huggingface-hub``, ``mooncake-transfer-engine``.
@@ -562,46 +565,60 @@ the graph runtime, whose tests need them:
    print(sysconfig.get_config_var("LIBDIR"))')"
    cargo test --release --no-default-features --features python --manifest-path rust/Cargo.toml
 
-Optional: the Rust HTTP frontend
---------------------------------
+The Rust HTTP frontend
+----------------------
 
 ``mstar-server`` (``rust/server/``) serves the HTTP surface — routes, OpenAI
 translation, SSE streaming, uploads — from Rust, with the Python process
-keeping preprocessing and the conductor protocol. It is replacing the Python
-HTTP frontend, which is being retired: new routes and adapters land in both
-(see "API surfaces land in the Rust frontend" in ``AGENTS.md``), and
-``mstar serve`` will use the Rust frontend for every model once it serves
-everything the Python one does. A Linux wheel that carries
-the extension also installs the binary next to ``mstar-serve``; otherwise build
-it. Then opt in:
+keeping preprocessing, tokenization and the conductor protocol. It is
+``mstar serve``'s default frontend. A Linux wheel that carries
+the extension also installs the binary next to ``mstar-serve``; from a checkout,
+build it:
 
 .. code-block:: bash
 
    cargo build --release --manifest-path rust/server/Cargo.toml
-   mstar serve qwen3_omni --rust-frontend
-   # or, with an explicit config: mstar-serve --config <model.yaml> --rust-frontend
+   mstar serve qwen3_omni
+   # or, with an explicit config: mstar-serve --config <model.yaml>
 
-Use it when benchmarking or tuning streaming throughput: its output path costs
-about 8 µs of API-server CPU per streamed token against 18 µs for the Python
-frontend (``benchmark/api_output_path``), so at high token rates the Python
-frontend, not the model, can be the limit.
+``--python-frontend`` serves from the uvicorn/FastAPI frontend instead. It is
+deprecated and will be removed (see "API surfaces land in the Rust frontend" in
+``AGENTS.md``); it takes no ``--rust-frontend-bin``. Its output path costs
+about 18 µs of API-server CPU per streamed token against 8 µs for
+``mstar-server`` (``benchmark/api_output_path``), so at high token rates the
+Python frontend, not the model, can be the limit.
+
+If ``mstar-server`` exits while serving (a crash, a kill, a lost race for the
+port), ``mstar serve`` exits with status 3; a port already taken is reported as
+``mstar-server: could not listen on http://…: Address already in use``.
+``mstar-server`` exits when its launcher is killed, even by ``SIGKILL``, and on
+shutdown ``mstar serve`` waits up to 5 s for it.
 
 The binary is resolved via ``--rust-frontend-bin`` / ``MSTAR_SERVER_BIN`` /
 the environment's scripts directory / ``$PATH`` / the in-repo build. Its knobs
 are listed in :doc:`environment_variables`. From a checkout, a binary built from
-other ``rust/`` or ``rust/server/`` sources is skipped, and if none is left the
-error gives the command that rebuilds it; one named by the flag or the variable
-is used with a warning. ``mstar-server --source-hash`` prints the hashes of the
-sources a build was made from.
+other ``rust/`` or ``rust/server/`` sources is skipped, and if none is left
+``mstar serve`` stops at startup with the command that rebuilds it; one named
+by the flag or the variable is used with a warning. A missing or stale binary's
+error also points at ``--python-frontend``. ``mstar-server --source-hash``
+prints the hashes of the sources a build was made from.
 
 The OpenAI routes take the model's adapter from the same registry as the Python
 frontend (``ADAPTER_REGISTRY`` in ``mstar/api_server/openai/adapters.py``):
 ``mstar-server`` ports adapter classes, not model names, so every model of a
-ported class is served. Chat, speech, images and videos are served for every
-model the Python frontend serves them for. The transcription and realtime
-routes are not ported yet (``NOT_PORTED`` in
-``test/rust/test_rust_openai_adapters.py``); there ``mstar-server`` answers 404,
-logs a warning at startup, and ``/generate`` still works.
+ported class is served. Chat, speech, images, videos and transcriptions are
+served for every model the Python frontend serves them for; a transcription's
+upload is decoded and cut into windows by the API server's ``WindowPlanner``,
+over the bridge, so both frontends read the same formats; a PCM WAV of one
+window, which the planner would pass whole, is planned from its header without
+that round trip. The WebSocket
+routes are served too: ``/generate/ws``, ``/v1/realtime`` (conversations with
+full-duplex models, and transcription, whose server turn detection runs Silero
+through the ONNX Runtime library ``onnxruntime`` ships; ``semantic_vad`` asks the
+API server's Smart Turn), and openpi's socket at
+``/`` where the config has an ``openpi:`` block. ``mstar-server`` does not
+offer per-message deflate, so ``ws_per_message_deflate`` has no effect there:
+a client that asks for it gets uncompressed frames.
 
 Troubleshooting
 ---------------

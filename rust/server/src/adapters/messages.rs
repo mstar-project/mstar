@@ -167,12 +167,14 @@ pub(super) fn text_chat(
     );
     Ok(SubmitArgs {
         tokens: None,
+        report_usage: false,
         text,
         file_paths,
         input_modalities: in_mods,
         output_modalities: vec!["text".to_string()],
         model_kwargs: mk,
         parts,
+        ..SubmitArgs::default()
     })
 }
 
@@ -236,6 +238,7 @@ pub(super) fn text_only_chat(req: &ChatCompletionRequest, upload_dir: &Path) -> 
     );
     Ok(SubmitArgs {
         tokens: None,
+        report_usage: false,
         text,
         file_paths: BTreeMap::new(),
         // one per part, all text past the refusal: a model that rebuilds its turns from the modalities keeps them all
@@ -243,6 +246,7 @@ pub(super) fn text_only_chat(req: &ChatCompletionRequest, upload_dir: &Path) -> 
         output_modalities: vec!["text".to_string()],
         model_kwargs: mk,
         parts,
+        ..SubmitArgs::default()
     })
 }
 

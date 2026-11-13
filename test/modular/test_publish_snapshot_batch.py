@@ -2,11 +2,11 @@
 and the result matches the per-request form."""
 from typing import Any
 
-from mstar.engine.resources.base import Resource
 from mstar.engine.resources.runner import StepRunner
+from mstar.testing_utils.resource import StubResource
 
 
-class _Pub:
+class _Pub(StubResource):
     """A publisher standing in for a resource: snapshots are per-rid tuples."""
 
     def __init__(self, name, skip=()):
@@ -21,7 +21,7 @@ class _Pub:
 
     def publish_snapshot_batch(self, request_ids, node_name, graph_walk):
         self.batch_calls += 1
-        return Resource.publish_snapshot_batch(self, request_ids, node_name, graph_walk)
+        return super().publish_snapshot_batch(request_ids, node_name, graph_walk)
 
 
 def _runner(pubs: dict[str, Any]) -> StepRunner:

@@ -44,6 +44,7 @@ DEFAULT_CONFIGS: dict[str, str] = {
     "qwen3_omni": "qwen3omni_2gpu.yaml",
     "qwen3_tts": "qwen3tts.yaml",
     "omnivoice": "omnivoice.yaml",
+    "minicpm_o": "minicpm_o.yaml",
     "qwen3_tts_1p7b": "qwen3tts_1p7b.yaml",
     "qwen3_tts_voicedesign": "qwen3tts_voicedesign.yaml",
     "qwen3_tts_base": "qwen3tts_base.yaml",
@@ -57,6 +58,7 @@ DEFAULT_CONFIGS: dict[str, str] = {
     "qwen3_asr": "qwen3_asr.yaml",
     "qwen3_asr_realtime": "qwen3_asr_realtime.yaml",
     "higgs_audio": "higgs_audio.yaml",
+    "phi4mm": "phi4mm.yaml",
     "omnilingual_asr_ctc_300m": "omnilingual_asr_ctc_300m.yaml",
     "omnilingual_asr_ctc_1b": "omnilingual_asr_ctc_1b.yaml",
     "omnilingual_asr_ctc_3b": "omnilingual_asr_ctc_3b.yaml",
@@ -154,7 +156,9 @@ def _next_steps(model: str, host: str, port: int, api_key_set: bool = False) -> 
         "    from mstar import MStarClient",
         f"    client = MStarClient(\"{base}\"{sdk_key})",
     ]
-    if model in ("bagel", "bagel_cfg_parallel", "qwen3_omni", "command_a_plus", "muse_glimmer", "ripple_65b"):
+    if model in (
+        "bagel", "bagel_cfg_parallel", "qwen3_omni", "command_a_plus", "minicpm_o", "muse_glimmer", "ripple_65b",
+    ):
         lines.append("    print(client.chat(\"Hello!\").text)")
     if model in ("bagel", "bagel_cfg_parallel"):
         lines.append("    open(\"out.png\",\"wb\").write(client.generate_image(\"a cat in a hat\"))")
@@ -220,11 +224,11 @@ def _next_steps(model: str, host: str, port: int, api_key_set: bool = False) -> 
     if model in ("bagel", "qwen3_omni", "orpheus", "kokoro", "cosmos3", "cosmos3_super",
                  "whisper_large", "whisper_large_v3_turbo", "higgs_audio", "qwen3_asr", "qwen3_asr_realtime",
                  "flux2_klein", "flux2_klein_9b", "z_image_turbo", "ltx2_5", "minimax_h3",
-                 "muse_glimmer", "ripple_65b"):
+                 "muse_glimmer", "ripple_65b", "phi4mm"):
         lines += ["", "  OpenAI-compatible:",
                   "    from openai import OpenAI",
                   f"    oai = OpenAI(base_url=\"{base}/v1\", api_key=\"{oai_key}\")"]
-        if model in ("bagel", "qwen3_omni", "muse_glimmer", "ripple_65b"):
+        if model in ("bagel", "qwen3_omni", "muse_glimmer", "ripple_65b", "phi4mm"):
             lines.append(f"    oai.chat.completions.create(model=\"{model}\", "
                          "messages=[{\"role\":\"user\",\"content\":\"hi\"}])")
         if model in ("orpheus", "qwen3_omni", "kokoro"):
@@ -284,10 +288,17 @@ def _serve(args: argparse.Namespace) -> None:
         argv += ["--log-stats-file", args.log_stats_file]
     if args.enable_metrics:
         argv += ["--enable-metrics"]
-    # Passing --rust-frontend-bin implies --rust-frontend: naming a binary but
-    # silently staying on uvicorn would be a footgun.
-    if args.rust_frontend or args.rust_frontend_bin:
-        argv += ["--rust-frontend"]
+    if args.enable_nvtx:
+        argv += ["--enable-nvtx"]
+    if args.timeout is not None:
+        argv += ["--timeout", str(args.timeout)]
+    if args.tcp_transfer_device:
+        argv += ["--tcp-transfer-device", args.tcp_transfer_device]
+    if args.python_frontend:
+        if args.rust_frontend or args.rust_frontend_bin:
+            raise SystemExit("mstar: --python-frontend serves without mstar-server, "
+                             "so it takes no --rust-frontend(-bin)")
+        argv += ["--python-frontend"]
     if args.rust_frontend_bin:
         argv += ["--rust-frontend-bin", args.rust_frontend_bin]
 
@@ -342,13 +353,27 @@ def build_parser() -> argparse.ArgumentParser:
     )
     serve.add_argument(
         "--enable-metrics", action="store_true",
-        help="serve Prometheus metrics at /metrics (needs mstar[metrics])",
+        help="serve Prometheus metrics at /metrics (needs mstar-ai[metrics])",
     )
     serve.add_argument(
-        "--rust-frontend", action="store_true",
-        help="serve HTTP from the Rust mstar-server binary instead of "
-             "uvicorn/FastAPI (see docs: environment variables / installation)",
+        "--enable-nvtx", action="store_true",
+        help="emit NVTX markers for CUDA profiling (disabled on XPU and CPU)",
     )
+    serve.add_argument(
+        "--timeout", type=float, default=None,
+        help="per-request timeout in seconds (the server's default: 600)",
+    )
+    serve.add_argument(
+        "--tcp-transfer-device", default=None,
+        help="network device for TCP tensor transport (default: auto)",
+    )
+    serve.add_argument(
+        "--python-frontend", action="store_true",
+        help="serve HTTP from the deprecated uvicorn/FastAPI frontend instead "
+             "of mstar-server, the default",
+    )
+    # the default since mstar-server became it; kept so existing commands run
+    serve.add_argument("--rust-frontend", action="store_true", help=argparse.SUPPRESS)
     serve.add_argument(
         "--rust-frontend-bin", default=None,
         help="path to the mstar-server binary (default: MSTAR_SERVER_BIN, "

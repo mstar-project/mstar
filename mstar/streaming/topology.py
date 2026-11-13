@@ -103,6 +103,22 @@ class Connection:
     # owns the consumer's walk, decides it, and the consumer only applies it.
     consumer_walk: Callable[[ProducerWalkCtx], str] | None = None
     audio: ClientAudio | None = None
+    # The consumer takes a window of this stream as one CPU int64 tensor of its
+    # items' values, so a producer that names the signal inline
+    # (``NodeSubmodule.inline_signals``) sends each item as its value in the
+    # step's EDGE_ITEMS frame, with nothing to stage, read or acknowledge.
+    by_value: bool = False
+
+    def __post_init__(self):
+        # a joined item or an assigned walk rides only a tensor's descriptor,
+        # and a client stream has no producer route to send values
+        if self.by_value and (
+            self.join_dim is not None or self.consumer_walk is not None or self.from_partition == CLIENT
+        ):
+            raise ValueError(
+                f"{self.edge_name!r} goes by value, so it cannot join its items, drive its "
+                "consumer's walk or come from the client"
+            )
 
 
 @dataclass

@@ -74,7 +74,7 @@ def test_an_unbatched_step_clears_rows_only(rids):
     eng._exec_single = _per_request
     batch = SimpleNamespace(
         node_name="llm", request_ids=rids, rows_only=True, running_batched=False,
-        step_context=SimpleNamespace(slot_lease=None, graph_walk="decode", rebuild_rids=frozenset()),
+        step_context=SimpleNamespace(slot_lease=None, graph_walk="decode", rebuild_rids=frozenset(), repeats=1),
         exec_timings=SimpleNamespace(start=None), admit_error=None,
         outputs_ready=threading.Event(), release_waiters=lambda: None,
         preplanned_rids=None, preplan_event=None,

@@ -25,14 +25,14 @@ MODELS = {
     "qwen3_5": (LLMSubmodule, SimpleNamespace(stop_token_ids=frozenset(EOS)),
                 ("decode", "prefill_text", "prefill_vision"),
                 LLMSubmodule(None, SimpleNamespace(stop_token_ids=frozenset(EOS)),
-                             encoders=(vision_encoder((5,)),)).token_stop),
+                             encoders=(vision_encoder(),)).token_stop),
     "orpheus": (OrpheusLLMSubmodule, SimpleNamespace(stop_token_ids=frozenset(EOS)), ("prefill", "decode"),
                 OrpheusLLMSubmodule(None, SimpleNamespace(stop_token_ids=frozenset(EOS))).token_stop),
     # the shared VLM decoder's stop, as Muse Glimmer serves it
     "muse_glimmer": (GlimmerLLMSubmodule, SimpleNamespace(stop_token_ids=frozenset(EOS)),
                      ("decode", "prefill_text", "prefill_vision"),
                      GlimmerLLMSubmodule(None, SimpleNamespace(stop_token_ids=frozenset(EOS)),
-                                         (vision_encoder((5,)),)).token_stop),
+                                         (vision_encoder(),)).token_stop),
 }
 
 

@@ -10,6 +10,7 @@ from mstar.engine.resources.attn.flashinfer import FlashInferManager
 def _manager(plan_state):
     manager = object.__new__(FlashInferManager)
     manager._current_plan_states = {"main": plan_state}
+    manager._step_qo = {}  # no split label's whole-step qo_indptr
     return manager
 
 

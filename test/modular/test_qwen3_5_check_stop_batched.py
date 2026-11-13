@@ -25,7 +25,7 @@ def _info(ignore_eos=False, done=0, max_tokens=100, walk="decode", last_prefill=
     )
 
 
-VISION = MediaEncoder("vision", "vision_encoder", ("pixel_values",), "image_embeds", (5,))
+VISION = MediaEncoder("vision", "vision_encoder", ("pixel_values",), "image_embeds")
 
 
 def _sub():

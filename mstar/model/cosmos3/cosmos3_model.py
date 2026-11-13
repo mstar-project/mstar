@@ -75,8 +75,10 @@ from mstar.engine.resources import (
     ResourceReqConfig,
     SamplerSpec,
     SamplingReqConfig,
+    SeqShardSpec,
 )
 from mstar.engine.resources.attn.ragged.config import RaggedAttentionConfig, RaggedAttentionSpec, RaggedAttnBackend
+from mstar.engine.resources.spec import CombinedSplit
 from mstar.engine.windowing import WindowSchedule
 from mstar.graph.base import (
     GraphEdge,
@@ -104,15 +106,19 @@ from mstar.model.cosmos3.config import Cosmos3Config
 from mstar.model.cosmos3.submodules import (
     ACTION_GEN_LOOP,
     ACTION_VIDEO_GEN_LOOP,
+    ACTION_WALKS,
     ATTN,
     ATTN_GEN,
     COND_LABEL,
     DENOISE_LOOP_FOR_WALK,
+    GEN_WALKS,
     IMAGE_GEN_LOOP,
     KV_CACHE,
     REASONER_DECODE_LOOP,
     REASONER_LABEL,
     SAMPLER,
+    SEQ_SHARD,
+    SOUND_WALKS,
     UNCOND_LABEL,
     VIDEO_GEN_AR_LOOP,
     VIDEO_GEN_LOOP,
@@ -128,7 +134,7 @@ from mstar.model.cosmos3.submodules import (
     latent_frames,
     sound_frames,
 )
-from mstar.model.keys import ROPE, VISION_ATTN
+from mstar.model.keys import MIXED, ROPE, VISION_ATTN
 from mstar.model.media_limits import UndecodableMediaError, VideoBudget
 from mstar.model.multimodal import (
     MEDIA_LAYOUT,
@@ -139,9 +145,8 @@ from mstar.model.multimodal import (
     media_prefill_step,
     media_walks,
     parts_from_modalities,
-    text_combined_walks,
 )
-from mstar.model.multimodal_decoder import MIXED_SPLIT
+from mstar.model.submodule_base import ChunkingPolicy
 from mstar.model.utils import load_generation_defaults
 from mstar.streaming.chunk_policy import FixedChunkPolicy
 from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
@@ -154,6 +159,10 @@ VAE_DECODER_NODE = "vae_decoder"
 AUDIO_DECODER_NODE = "audio_decoder"
 VAE_DECODER_AR_NODE = "vae_decoder_ar"
 VISION_ENCODER_NODE = "vision_encoder"
+# A mixed step's prompt rows, text or media, take the prefill kernels
+REASONER_MIXED_SPLIT = CombinedSplit(
+    MIXED, prefill_walks=(constants.REASONER_PREFILL_WALK, constants.REASONER_PREFILL_VISION_WALK),
+)
 REASONER_NODE = "reasoner"
 
 # every request key the model reads; the Cosmos3 adapters map onto these names
@@ -413,6 +422,11 @@ class Cosmos3Model(Model):
         ``attention_backend="flashinfer"`` skips the dense spec, which leaves
         every step on the paged path.
 
+        On SP ranks the sequence shard splits a generation step's tokens
+        (each guidance branch's, or the batched pack's) over them; the
+        attentions trade them for heads around the kernel, the pool storing
+        K/V by head. Prefills and the reasoner's steps run whole on each rank.
+
         The two specs share one ``PagedKVConfig`` object on purpose: a deployment
         that resizes the cache through ``apply_yaml_overrides`` has to resize
         what the wrappers are planned against too.
@@ -435,9 +449,14 @@ class Cosmos3Model(Model):
                 nodes=kv_nodes,
                 config=AttentionConfig(
                     kv_cache=KV_CACHE, backend=AttnBackend.AUTO,
-                    # only the reasoner runs mixed (text prefill + decode) steps
-                    splits=(MIXED_SPLIT,) if self._reasoner_enabled() else (),
+                    # only the reasoner runs mixed (prompt + decode) steps
+                    splits=(REASONER_MIXED_SPLIT,) if self._reasoner_enabled() else (),
                 ),
+            ),
+            # over every node of the pool: the attentions over it depend on it
+            SeqShardSpec(
+                resource_key=SEQ_SHARD, nodes=kv_nodes, labels=(COND_LABEL, UNCOND_LABEL), axis=0,
+                walks=(*GEN_WALKS, *SOUND_WALKS, *ACTION_WALKS),
             ),
         ]
         if self._reasoner_enabled():
@@ -496,8 +515,26 @@ class Cosmos3Model(Model):
         )
 
     def get_combined_graph_walks(self) -> dict[str, dict[str, set[str]]]:
-        # the reasoner's text prefill and decode rows share a step
-        return text_combined_walks(node=REASONER_NODE) if self._reasoner_enabled() else {}
+        # the reasoner's text and media prompt rows share steps with its decode rows
+        if not self._reasoner_enabled():
+            return {}
+        return {REASONER_NODE: {MIXED: set(REASONER_MIXED_SPLIT.prefill_walks) | {self.REASONER_DECODE_WALK}}}
+
+    def get_chunking_policies(self) -> dict[str, tuple[ChunkingPolicy, ...]]:
+        # the reasoner's text and media prompts split by its token budget; the
+        # mixed walk carries it for the steps a chunk shares with decode rows
+        if not self._reasoner_enabled():
+            return {}
+        from mstar.model.cosmos3.submodules import Cosmos3ReasonerSubmodule
+
+        budget = Cosmos3ReasonerSubmodule.MAX_BATCH_TOKENS
+        return {REASONER_NODE: (
+            ChunkingPolicy(
+                walks=(self.REASONER_PREFILL_WALK, self.REASONER_PREFILL_VISION_WALK),
+                chunkable=True, max_batch_tokens=budget,
+            ),
+            ChunkingPolicy(walks=(MIXED,), max_batch_tokens=budget),
+        )}
 
     def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
         return {**super().get_loop_caps(**model_kwargs), **(model_kwargs.get(self.DENOISE_CAP) or {})}
@@ -569,11 +606,7 @@ class Cosmos3Model(Model):
         """The reasoner's one medium: the vision encoder's tokens fill the
         prompt's image and video pads, in prompt order, on the scaffold's
         ``prefill_vision`` walk (beside the DiT's own ``prefill*`` walks)."""
-        r = self.config.reasoner
-        return MediaEncoder(
-            "vision", VISION_ENCODER_NODE, ("pixel_values",), "vision_embeds",
-            (r.image_token_id, r.video_token_id),
-        )
+        return MediaEncoder("vision", VISION_ENCODER_NODE, ("pixel_values",), "vision_embeds")
 
     def _reasoner_enabled(self) -> bool:
         """Whether the reasoner walks (and the vision_encoder + reasoner
@@ -604,10 +637,7 @@ class Cosmos3Model(Model):
         # full, and the row-parallel out/down projections all-reduce. Signals
         # between nodes stay replicated (empty shard_dim) — the sharding is
         # in-module, Megatron-style. The VAE decoder runs un-sharded on one rank.
-        return ShardingConfig(
-            groups=[], tp_enabled_nodes={DIT_NODE}, shard_dim={},
-            sp_enabled_nodes={DIT_NODE},
-        )
+        return ShardingConfig(groups=[], tp_enabled_nodes={DIT_NODE}, shard_dim={})
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         # prefill: the understanding tower runs over the text prompt and writes
@@ -1276,10 +1306,9 @@ class Cosmos3Model(Model):
                 for i in ids
             )
         if modality == "image":
-            import io
             import os
 
-            from PIL import Image
+            from mstar.model.components.diffusion.image_io import uint8_to_png
 
             # The decoder emits 8-bit frames [B, C, T, H, W]; take the first one.
             x = output
@@ -1287,17 +1316,12 @@ class Cosmos3Model(Model):
                 x = x[0, :, 0]
             elif x.ndim == 4:
                 x = x[0]
-            arr = x.permute(1, 2, 0).cpu().numpy()  # H, W, C uint8
-            buf = io.BytesIO()
             # PNG is lossless at every compression level, so the level only trades
-            # encode time for file size. PIL defaults to 6, which spends ~0.75 s on a
-            # 720p frame and dominates the serving latency. Level 0 (no deflate) is
-            # the fastest and matches what the OpenAI image endpoint emits at full
-            # quality; the decoded pixels are identical regardless. Override with
-            # COSMOS3_PNG_COMPRESS for A/B.
+            # encode time for file size; level 0 (stored) is the fastest. The shared
+            # writer also skips PIL's adaptive scanline filters, which cost ~110 ms
+            # at 1024^2 even at level 0. Override with COSMOS3_PNG_COMPRESS for A/B.
             compress_level = int(os.environ.get("COSMOS3_PNG_COMPRESS", "0"))
-            Image.fromarray(arr).save(buf, format="PNG", compress_level=compress_level)
-            return buf.getvalue()
+            return uint8_to_png(x, compress_level=compress_level)
         if modality == "video":
             import os
 
@@ -1895,26 +1919,24 @@ class Cosmos3Model(Model):
 
     def get_submodule(
         self, node_name: str, device: str = "cpu", tp_group=None,
-        autocast_dtype: torch.dtype | None = None, sp_group=None,
+        autocast_dtype: torch.dtype | None = None,
     ) -> torch.nn.Module | None:
         # autocast_dtype is accepted for interface parity (the engine manager
         # passes it to every model). Cosmos3 already casts the meta module to
         # bf16 before to_empty in _build_transformer, so params are allocated
         # directly in the checkpoint dtype and the hint is redundant here.
-        # sp_group is the DiT's sequence-parallel comm group (trivial unless the
-        # config sets sp_size > 1); it is orthogonal to the tp_group.
         if node_name in self._submodule_cache:
             return self._submodule_cache[node_name]
-        submodule = self._create_submodule(node_name, device, tp_group, sp_group)
+        submodule = self._create_submodule(node_name, device, tp_group)
         self._submodule_cache[node_name] = submodule
         if submodule is not None:
             logger.info("Loaded Cosmos3 submodule for %s", node_name)
         return submodule
 
-    def _create_submodule(self, node_name: str, device: str, tp_group=None, sp_group=None):
+    def _create_submodule(self, node_name: str, device: str, tp_group=None):
         if node_name == DIT_NODE:
             return Cosmos3DiTSubmodule(
-                transformer=self._build_transformer(device, tp_group=tp_group, sp_group=sp_group),
+                transformer=self._build_transformer(device, tp_group=tp_group),
                 config=self.config,
                 scheduler=self._build_scheduler(),
                 # Chained windows re-encode the frames they continue from: the
@@ -1947,7 +1969,7 @@ class Cosmos3Model(Model):
             # The same transformer instance as the DiT node (built once, cached
             # below): one copy of the text weights, shared kv/attn resources.
             return Cosmos3ReasonerSubmodule(
-                transformer=self._build_transformer(device, tp_group=tp_group, sp_group=sp_group),
+                transformer=self._build_transformer(device, tp_group=tp_group),
                 config=self.config,
                 encoders=(self._vision_encoder(),),
             )
@@ -1975,14 +1997,14 @@ class Cosmos3Model(Model):
             return diffusers.UniPCMultistepScheduler
         raise ValueError(f"Unsupported Cosmos3 scheduler class {name!r}")
 
-    def _build_transformer(self, device: str, tp_group=None, sp_group=None):
+    def _build_transformer(self, device: str, tp_group=None):
         # Built once per process: the DiT and the reasoner nodes share it.
         if self._transformer is not None:
             return self._transformer
-        self._transformer = self._build_transformer_uncached(device, tp_group=tp_group, sp_group=sp_group)
+        self._transformer = self._build_transformer_uncached(device, tp_group=tp_group)
         return self._transformer
 
-    def _build_transformer_uncached(self, device: str, tp_group=None, sp_group=None):
+    def _build_transformer_uncached(self, device: str, tp_group=None):
         from mstar.model.cosmos3.components.transformer import Cosmos3OmniTransformer
         from mstar.model.cosmos3.loader import load_transformer_weights
 
@@ -1999,7 +2021,7 @@ class Cosmos3Model(Model):
         # thrown away (seconds per billion params on the skip_weight_loading
         # path). Same shape as the orpheus / higgs_audio builders.
         with torch.device("meta"):
-            model = Cosmos3OmniTransformer(self.config, comm_group=tp_group, sp_group=sp_group)
+            model = Cosmos3OmniTransformer(self.config, comm_group=tp_group)
         model = model.to(torch.bfloat16)
         if self.skip_weight_loading:
             return model.to_empty(device=device)

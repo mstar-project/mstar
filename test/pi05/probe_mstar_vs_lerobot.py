@@ -232,8 +232,10 @@ def main():
     ref_model = ref_model.to(dtype=dtype).eval()
     vit_submodule = mstar_model.get_submodule("vit_encoder", device=str(device))
     llm_submodule = mstar_model.get_submodule("LLM", device=str(device))
+    action_submodule = mstar_model.get_submodule("action_expert", device=str(device))
     vit_submodule = vit_submodule.to(device, dtype=dtype).eval()
     llm_submodule = llm_submodule.to(device, dtype=dtype).eval()
+    action_submodule = action_submodule.to(device, dtype=dtype).eval()
 
     print("\n=== Stage 0: weight-equality sanity check ===")
     with torch.no_grad():
@@ -293,11 +295,11 @@ def main():
         # NOTE: passing already-[-1,1] images so _preprocess_one's auto-detect leaves them alone.
         from mstar.conductor.request_info import CurrentForwardPassInfo
         info = CurrentForwardPassInfo(
-            graph_walk="prefill", requires_cfg=False, fwd_index=0, random_seed=0,
+            graph_walk="action_chunk", requires_cfg=False, fwd_index=0, random_seed=0,
             sampling_config={}, request_id="r0"
         )
         prep = vit_submodule.preprocess(
-            graph_walk="prefill",
+            graph_walk="action_chunk",
             per_request_inputs=per_request_inputs,
             request_ids=["r0"],
             per_request_info={"r0": info},
@@ -418,12 +420,12 @@ def main():
                 min_period=ref_config.min_period,
                 max_period=ref_config.max_period,
             ).squeeze(0)
-            adarms_cond = llm_submodule.time_mlp(time_emb.to(dtype))
-            suffix = llm_submodule.action_in_proj(x_t[0])
-            suffix_out = llm_submodule.action_expert(
+            adarms_cond = action_submodule.time_mlp(time_emb.to(dtype))
+            suffix = action_submodule.action_in_proj(x_t[0])
+            suffix_out = action_submodule.action_expert(
                 query_sequence=suffix, cache_handle=action_handle, adarms_cond=adarms_cond
             )
-            v_t = llm_submodule.action_out_proj(suffix_out)
+            v_t = action_submodule.action_out_proj(suffix_out)
             x_t = x_t + dt * v_t.unsqueeze(0)
             time = time + dt
         ours_actions = x_t

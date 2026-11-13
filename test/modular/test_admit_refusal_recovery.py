@@ -32,7 +32,7 @@ from mstar.engine.resources.step import (  # noqa: E402
     StepContext,
 )
 from mstar.testing_utils.worker import make_worker  # noqa: E402
-from mstar.worker.micro_scheduler import ScheduledBatch  # noqa: E402
+from mstar.worker.micro_scheduler import CHAIN_LANE, ScheduledBatch  # noqa: E402
 from mstar.worker.speculation import Speculation, Speculator  # noqa: E402
 from mstar.worker.step_executor import PendingBatch  # noqa: E402
 
@@ -137,6 +137,23 @@ def test_a_submitted_speculation_fails_with_its_step():
 
     assert w._graph_runtime.pushed == []
     assert set(w.reported) == {1, 2, 3, 4}
+
+
+def test_a_followers_unsubmitted_head_gives_its_fresh_rids_back_when_the_iteration_raises():
+    """A follower's build of a head adds its rows to the chain's in flight, and rank 0's build doesn't. Rank 0 pushes
+    the head's fresh rids back, so the follower does too."""
+    w = _worker(follower=True)
+    pending = _pending([1, 2])
+    head = Speculation(
+        scheduled_batch=_scheduled([1, 3]), node_batch=_executing([1, 3]),
+        consumed_edges=set(), continuing_rids={1}, partition="p",
+        is_new_iter=False, is_same_node=True, is_yield_away=False,
+    )
+    w.pipeline._hold_rows(CHAIN_LANE, {1, 2, 3})
+
+    w.pipeline._handle_error(RuntimeError("boom"), (pending, None), None, head)
+
+    assert w._graph_runtime.pushed == [3] and set(w.reported) == {1, 2}, "the follower failed a request rank 0 keeps"
 
 
 # ── terminal refusals ───────────────────────────────────────────────────

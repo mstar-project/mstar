@@ -27,6 +27,7 @@ from mstar.engine.resources.kv.config import KVStep, PagedKVConfig
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.step import Segment, StepContext
 from mstar.model.submodule_base import ARNodeInputs
+from mstar.testing_utils.resource import StubResource
 
 
 class _StubTransferManager:
@@ -54,7 +55,7 @@ def _stub_transfer(monkeypatch):
     monkeypatch.setattr(manager_mod, "KVTransferManager", _StubTransferManager)
 
 
-class _RecordingResource:
+class _RecordingResource(StubResource):
     def __init__(self):
         self.reset_calls: list[tuple[str, bool]] = []
 

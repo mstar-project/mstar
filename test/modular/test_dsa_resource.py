@@ -12,6 +12,7 @@ from mstar.engine.resources.dsa.manager import DSAManager
 from mstar.engine.resources.kv.config import AuxPlanes, KVLayout, KVSpec, PagedKVConfig
 from mstar.engine.resources.kv.plan import PagedIndptrs, SequenceView
 from mstar.engine.resources.step import BucketKey, SlotLease, StepContext
+from mstar.testing_utils.engine import make_mgmt
 
 KV = "kv"
 PAGE, TOPK, HEADS, MAX_SEQ_LEN = 4, 4, 16, 64
@@ -252,7 +253,5 @@ def test_a_node_with_dsa_double_buffers_its_captures_without_pre_plan(monkeypatc
     from mstar.engine import engine as engine_mod
 
     monkeypatch.setattr(engine_mod.knobs, "pre_plan_enabled", lambda: False)
-    mgmt = engine_mod.SubmoduleManagement(
-        submodule=None, forward=None, forward_batched=None, joint_comm_group=None,
-        resources={"dsa": _manager()})
+    mgmt = make_mgmt(resources={"dsa": _manager()})
     assert mgmt.num_slots == 2 and mgmt.needs_slot_fence
