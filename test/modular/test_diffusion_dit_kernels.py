@@ -32,14 +32,14 @@ B, FRAMES, HW, D = 2, 3, 40, 384
 EPS = 1e-6
 
 
-def _stream(device, dtype=torch.bfloat16, seed=0):
+def _stream(device, dtype=torch.bfloat16, seed=0, dim=D):
     g = torch.Generator(device="cpu").manual_seed(seed)
-    x = (torch.randn(B, FRAMES * HW, D, generator=g) * 3).to(device, dtype)
-    y = torch.randn(B, FRAMES * HW, D, generator=g).to(device, dtype)
+    x = (torch.randn(B, FRAMES * HW, dim, generator=g) * 3).to(device, dtype)
+    y = torch.randn(B, FRAMES * HW, dim, generator=g).to(device, dtype)
     # strided per-frame views out of one [B, F, 6, D] table, as a block unbinds them
-    mod = (torch.randn(B, FRAMES, 6, D, generator=g) * 0.2).to(device)
-    w = (torch.randn(D, generator=g) * 0.1 + 1).to(device)
-    b = (torch.randn(D, generator=g) * 0.1).to(device)
+    mod = (torch.randn(B, FRAMES, 6, dim, generator=g) * 0.2).to(device)
+    w = (torch.randn(dim, generator=g) * 0.1 + 1).to(device)
+    b = (torch.randn(dim, generator=g) * 0.1).to(device)
     return x, y, mod.unbind(2), w, b
 
 
@@ -107,10 +107,15 @@ def _assert_bf16_close(got: torch.Tensor, want: torch.Tensor, min_equal: float =
     assert (got == want).float().mean().item() >= min_equal
 
 
+# the kernel's chunked passes: one partial chunk, several whole ones (Wan2.2-T2V-A14B), whole plus partial
+WIDTHS = [D, 5120, 3840]
+
+
 @needs_kernels
+@pytest.mark.parametrize("dim", WIDTHS)
 @pytest.mark.parametrize("case", ["mod", "gated_affine", "plain_mod", "per_sample"])
-def test_ada_layer_norm_kernel_matches_eager(case):
-    x, y, (shift, scale, gate, *_), w, b = _stream("cuda")
+def test_ada_layer_norm_kernel_matches_eager(case, dim):
+    x, y, (shift, scale, gate, *_), w, b = _stream("cuda", dim=dim)
     if case == "per_sample":
         shift, scale = shift[:, :1], scale[:, :1]
     kwargs = {
@@ -151,9 +156,10 @@ def test_ada_layer_norm_kernel_compiles_with_a_float_eps(monkeypatch, caplog, to
 
 
 @needs_kernels
-def test_rms_norm_rope_kernel_matches_eager():
+@pytest.mark.parametrize("heads", [6, 40, 30], ids=["768", "5120", "3840"])
+def test_rms_norm_rope_kernel_matches_eager(heads):
     g = torch.Generator(device="cpu").manual_seed(1)
-    heads, head_dim, seq = 6, 128, 90
+    head_dim, seq = 128, 90
     q = torch.randn(2, seq, heads * head_dim, generator=g).cuda().bfloat16()
     k = torch.randn(2, seq, heads * head_dim, generator=g).cuda().bfloat16()
     q_norm = nn.RMSNorm(heads * head_dim, eps=EPS, device="cuda", dtype=torch.bfloat16)
