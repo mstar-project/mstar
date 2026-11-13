@@ -345,9 +345,10 @@ class Praxis1BackboneSubmodule(_Praxis1Node):
     so nothing holds a step's hidden states past the step.
     """
 
-    def __init__(self, config: Praxis1Config, backbone: nn.Module) -> None:
+    def __init__(self, config: Praxis1Config, backbone: nn.Module, *, episode_text: bool = False) -> None:
         super().__init__(config)
         self.backbone = backbone
+        self.episode_text = episode_text
 
     def prepare_inputs(
         self,
@@ -358,28 +359,95 @@ class Praxis1BackboneSubmodule(_Praxis1Node):
     ) -> NodeInputs:
         tensors = {
             "obs_latents": inputs["obs_latents"][0],
-            "text_embeds": inputs["text_embeds"][0],
-            "text_embeds_blank": inputs["text_embeds_blank"][0],
         }
+        text = inputs.get("text_embeds")
+        blank = inputs.get("text_embeds_blank")
+        if bool(text) != bool(blank) or (not text and not self.episode_text):
+            raise ValueError("Praxis backbone needs both text embedding streams")
+        if text:
+            tensors["text_embeds"] = text[0]
+            tensors["text_embeds_blank"] = blank[0]
+        anchor = inputs.get("anchor_latents")
+        clean = inputs.get("clean_latents")
+        if bool(anchor) != bool(clean):
+            raise ValueError("Praxis backbone needs anchor and clean latents together")
+        if anchor:
+            tensors["anchor_latents"] = anchor[0]
+            tensors["clean_latents"] = clean[0]
         # First iteration: the loop has not carried anything yet, so the
         # latents are the noise this request's seed draws.
         for name in ("video_latents", "action_latents"):
             carried = inputs.get(name)
             if carried:
                 tensors[name] = carried[0]
-        return NodeInputs(tensor_inputs=tensors)
+        metadata = fwd_info.step_metadata
+        write_text = bool(self.episode_text and metadata.get("text_write") and
+                          fwd_info.dynamic_loop_iter_counts.get("praxis_denoise", 0) == 0)
+        if write_text and not text:
+            raise ValueError("cold Praxis text episode needs both encoder outputs")
+        if write_text and (int(metadata.get("text_tokens", 0)) < 1 or
+                           int(metadata.get("blank_tokens", 0)) < 1):
+            raise ValueError("cold Praxis text episode needs tokenized stream lengths")
+        return NodeInputs(
+            tensor_inputs=tensors,
+            kwargs={"write_text": write_text,
+                    "text_tokens": int(metadata.get("text_tokens", 0)),
+                    "blank_tokens": int(metadata.get("blank_tokens", 0))},
+        )
+
+    def declare_step(self, graph_walk, request_ids, inputs, **kwargs) -> SubmoduleStep | None:
+        if not self.episode_text:
+            return None
+        segments = []
+        for rid, inp in zip(request_ids, inputs, strict=True):
+            write = inp.kwargs["write_text"]
+            segments.extend((
+                Segment(rid, "cond", inp.kwargs["text_tokens"] if write else 0),
+                Segment(rid, "blank", inp.kwargs["blank_tokens"] if write else 0),
+            ))
+        return SubmoduleStep(state={"text_embeds": ArrayStep(segments=tuple(segments))})
+
+    def episode_text_embeddings(
+        self, text_embeds: torch.Tensor | None, text_embeds_blank: torch.Tensor | None,
+        *, write_text: bool, text_tokens: int, blank_tokens: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if not self.episode_text:
+            if text_embeds is None or text_embeds_blank is None:
+                raise ValueError("cold Praxis call needs text embeddings")
+            return text_embeds, text_embeds_blank
+        handle = self.state_handles["text_embeds"]
+        if write_text:
+            if text_embeds is None or text_embeds_blank is None:
+                raise ValueError("cold Praxis text episode needs both encoder outputs")
+            if (text_embeds.shape != (1, text_tokens, self.config.text_hidden_dim) or
+                    text_embeds_blank.shape != (1, blank_tokens, self.config.text_hidden_dim)):
+                raise ValueError("Praxis text embeddings do not match tokenized lengths")
+            handle.add(0, h=torch.cat((text_embeds[0], text_embeds_blank[0])))
+        reached = handle.read(0).fields["h"]
+        if reached.shape != (text_tokens + blank_tokens, self.config.text_hidden_dim):
+            raise ValueError("retained Praxis text lengths differ from this prompt")
+        return reached[:text_tokens][None], reached[text_tokens:][None]
 
     def forward(
         self,
         graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
         obs_latents: torch.Tensor,
-        text_embeds: torch.Tensor,
-        text_embeds_blank: torch.Tensor,
+        text_embeds: torch.Tensor | None = None,
+        text_embeds_blank: torch.Tensor | None = None,
         video_latents: torch.Tensor | None = None,
         action_latents: torch.Tensor | None = None,
+        anchor_latents: torch.Tensor | None = None,
+        clean_latents: torch.Tensor | None = None,
+        write_text: bool = False,
+        text_tokens: int = 0,
+        blank_tokens: int = 0,
         **kwargs,
     ) -> NameToTensorList:
+        text_embeds, text_embeds_blank = self.episode_text_embeddings(
+            text_embeds, text_embeds_blank, write_text=write_text,
+            text_tokens=text_tokens, blank_tokens=blank_tokens,
+        )
         raise NotImplementedError(
             "Praxis-1 backbone step: wires praxis.model.PraxisPolicy's encoder pass"
         )
@@ -399,14 +467,15 @@ class Praxis1ActionExpertSubmodule(_Praxis1Node):
         inputs: NameToTensorList,
         **kwargs,
     ) -> NodeInputs:
-        return NodeInputs(
-            tensor_inputs={
+        tensors = {
                 "taps": inputs["taps"][0],
                 "video_latents": inputs["video_latents"][0],
                 "action_latents": inputs["action_latents"][0],
                 "proprio": inputs["proprio"][0],
-            }
-        )
+        }
+        if proprio_all := inputs.get("proprio_all"):
+            tensors["proprio_all"] = proprio_all[0]
+        return NodeInputs(tensor_inputs=tensors)
 
     def forward(
         self,
@@ -416,6 +485,7 @@ class Praxis1ActionExpertSubmodule(_Praxis1Node):
         video_latents: torch.Tensor,
         action_latents: torch.Tensor,
         proprio: torch.Tensor,
+        proprio_all: torch.Tensor | None = None,
         **kwargs,
     ) -> NameToTensorList:
         raise NotImplementedError(

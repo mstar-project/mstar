@@ -468,7 +468,7 @@ class Praxis1Model(Model):
                 "encoder": self.text_encoder_hf, "hidden_layer": self.config.text_hidden_layer,
             }, sort_keys=True).encode()
             episode_keys = {TEXT_STATE_NAME: hashlib.sha256(key_payload).hexdigest()}
-        metadata = {"text_tokens": int(task_mask.sum())}
+        metadata = {"text_tokens": int(task_mask.sum()), "blank_tokens": int(blank_mask.sum())}
         if kwargs.get("action_format") == "positronic":
             model_pose = pose_to_model(
                 robot_state, self.config.embodiment, kwargs.get("pose_descriptor", ""),
@@ -586,6 +586,9 @@ class Praxis1Model(Model):
             "cfg_video_scale": self.sampler_defaults["cfg_video_scale"],
         }
         if self.sampler_defaults["max_context_chunks"]:
+            metadata["text_write"] = not has_episode_text
+            metadata["text_tokens"] = model_kwargs.get("text_tokens", 0)
+            metadata["blank_tokens"] = model_kwargs.get("blank_tokens", 0)
             held = 0 if episode is None else episode.held.get(STATE_NAME, 0)
             rows = model_kwargs.get("executed_rows", 0)
             metadata["history_append"] = append_count(held, rows)
