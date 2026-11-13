@@ -141,6 +141,7 @@ def test_an_eager_verify_moves_only_the_kept_rows_offsets():
     eager._row_settings = lambda cfgs, device, apply_filters: Sampler._row_settings(eager, cfgs, device, apply_filters)
     sampler._cg_sampler = sampler._cg_buffers = sampler._comm_group = None
     sampler._apply_filters_this_step = True
+    sampler._greedy_this_step = False
     sampler._keep_last_token = False
     sampler._kept_rids = frozenset({1})
     k, vocab = 3, 8

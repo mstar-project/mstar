@@ -437,13 +437,10 @@ class SamplerResource(Resource):
 
     def lean_captures(self, config_type) -> bool:
         """Batched captures only: there a row is a token, and the sampler a
-        sizeable share of the step. False on a verifying node (`bind_verify`,
-        at load, before any capture): its verify step reads no greedy flag, so
-        a twin would be a second, identical capture of the whole verify graph."""
+        sizeable share of the step. On a verifying node the twin is the verify
+        step's that reads only the target's argmax (`verify`)."""
         from mstar.engine.accelerator_graph_config import AcceleratorGraphConfigType
 
-        if self.verify_draft_tokens:
-            return False
         return config_type == AcceleratorGraphConfigType.BASIC_BATCHED
 
     def _set_greedy_flag(self, ctx: StepContext) -> None:
@@ -848,7 +845,12 @@ class SamplerResource(Resource):
         result. The bonus token goes where `sample` puts its token (the
         loop-back slot), and the offsets move by a fixed stride."""
         from mstar.engine.resources.draft.drafter import VerifyResult
-        from mstar.engine.resources.sampler.verify import chain_verify_rows, verify_probs, verify_stride
+        from mstar.engine.resources.sampler.verify import (
+            chain_verify_rows,
+            greedy_verify,
+            verify_probs,
+            verify_stride,
+        )
 
         n, block, vocab = logits.shape
         k = block - 1
@@ -881,12 +883,17 @@ class SamplerResource(Resource):
         def rows(t: torch.Tensor) -> torch.Tensor:
             return t.repeat_interleave(block)
 
-        dist = verify_probs(
-            logits.reshape(n * block, vocab), rows(temperature), rows(top_k), rows(top_p),
-            None if min_p is None else rows(min_p),
-            None if order is None else type(order)(rows(order.top_p_first), rows(order.min_keep)),
-        )
-        tokens, accepted = chain_verify_rows(dist, n, drafts, seed, offset)
+        if self._greedy_this_step:
+            # every row samples greedily (`lean_for`, from configs alike on every rank), so its
+            # distribution is a one-hot at the argmax: the same result without the vocabulary's probs
+            tokens, accepted = greedy_verify(logits.reshape(n * block, vocab), drafts)
+        else:
+            dist = verify_probs(
+                logits.reshape(n * block, vocab), rows(temperature), rows(top_k), rows(top_p),
+                None if min_p is None else rows(min_p),
+                None if order is None else type(order)(rows(order.top_p_first), rows(order.min_keep)),
+            )
+            tokens, accepted = chain_verify_rows(dist, n, drafts, seed, offset)
         # one broadcast for the whole result, as `sample` broadcasts its token
         packed = self.agree(torch.cat([tokens, accepted[:, None]], dim=1))
         tokens, accepted = packed[:, :block], packed[:, block]
