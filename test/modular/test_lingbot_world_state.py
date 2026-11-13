@@ -10,6 +10,7 @@ draws below are `main`'s, copied from the model as it stood before the port.
 from __future__ import annotations
 
 import sys
+import weakref
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -34,20 +35,25 @@ from mstar.engine.state import Bidirectional
 from mstar.engine.state.adapters import StateSetup, build_specs, kv_layouts, node_handles, state_sizes, state_steps
 from mstar.model.base import serving_resources
 from mstar.model.components import wan_vae
+from mstar.model.lingbot_world import submodules
 from mstar.model.lingbot_world.components.dit import LingBotCausalDiT
 from mstar.model.lingbot_world.config import LingBotWorldConfig
 from mstar.model.lingbot_world.lingbot_world_model import REFERENCE_MODEL_KWARGS, LingBotWorldModel
 from mstar.model.lingbot_world.submodules import (
+    DECODER,
     DIT_KV,
+    ENCODER,
     PROGRESS,
     ROLLOUT_LOOP_NAME,
     ROLLOUT_WALK,
     SELF_ATTN,
+    STEADY,
     TEXT,
     TEXT_ATTN,
     VAE_CACHES,
     EncoderStream,
     LingBotDitSubmodule,
+    vae_cache_entry,
 )
 
 # `main`'s ragged attention over both pairs, and its labels (`submodules.py` at the port's base)
@@ -471,6 +477,13 @@ def test_a_decoder_cache_comes_back_from_its_fields_slot_for_slot():
     assert back[0] is None and back[1] is slots[1] and back[2] is None
 
 
+def test_a_cache_slot_that_holds_no_tensor_is_refused():
+    """diffusers leaves ``"Rep"`` in a temporal upsample's slot after a chunk of one latent. Dropped from the write,
+    the slot would come back empty and the next decode would start the stream over."""
+    with pytest.raises(RuntimeError, match="slot 1 of the VAE's dec cache holds 'Rep'"):
+        wan_vae.cache_fields([None, "Rep"], "dec")
+
+
 def test_the_encoder_stream_comes_back_from_its_fields():
     vae = SimpleNamespace(_cached_conv_counts={"encoder": 3})
     stream = EncoderStream(vae)
@@ -480,6 +493,144 @@ def test_the_encoder_stream_comes_back_from_its_fields():
     stream.cache, stream.steady = None, torch.full((1, 4), 2.0)
     settled = EncoderStream(vae, stream.fields())
     assert settled.cache is None and settled.steady is stream.steady
+
+
+def _cached_rollout(monkeypatch):
+    """A `_Rollout` whose forward runs the tiny DiT and stands in for the VAE: an encode that fills two of three slots
+    at chunk 0 and settles at chunk 1, and a decode that replaces its three slots each call. Returns it with what each
+    call was handed."""
+    rollout = _Rollout(_tiny())
+    sub, (lat_h, lat_w) = rollout.sub, rollout.LAT
+    sub.encoder_vae = SimpleNamespace(_cached_conv_counts={"encoder": 3})
+    sub._decoder_slots = 3
+    seen = SimpleNamespace(encoder=[], written=[], decoder=[], freed=[])
+
+    def encode(vae, image, stream, first_latent, num_latents, config):
+        seen.encoder.append((stream.steady, stream.cache and list(stream.cache)))
+        if first_latent:
+            stream.steady, stream.cache, stream.settled = torch.zeros(1, 32, 1, lat_h, lat_w), None, True
+        else:
+            stream.cache = [torch.zeros(1, channels, 2, 8 * lat_h, 8 * lat_w) for channels in (3, 96)] + [None]
+            seen.written.append(list(stream.cache))
+        return torch.zeros(20, num_latents, lat_h, lat_w)
+
+    def decode(x0, feat_cache, clip_start):
+        seen.decoder.append((type(feat_cache), [slot if slot is None else slot.data_ptr() for slot in feat_cache]))
+        old = feat_cache[0] if feat_cache[0] is None else weakref.ref(feat_cache[0])
+        for i in range(3):
+            feat_cache[i] = torch.zeros(1, 384 if i else 16, 2, lat_h, lat_w, dtype=torch.bfloat16)
+        seen.freed.append(old is None or old() is None)
+        return torch.zeros(1, 3, 4 * x0.shape[1], 8 * lat_h, 8 * lat_w)
+
+    monkeypatch.setattr(submodules, "encode_condition_chunk", encode)
+    monkeypatch.setattr(submodules, "plucker_embedding", lambda *args: SimpleNamespace(
+        to=lambda dtype: torch.zeros(1, 384, rollout.cfg.chunk_size, lat_h, lat_w),
+    ))
+    sub._decode = decode
+    return rollout, seen
+
+
+def _forward(rollout: _Rollout, rid: int) -> dict:
+    """One chunk of ``rid`` through the submodule's forward, stepped as the engine steps it."""
+    inputs = rollout.inputs(rid)
+    step = rollout.admit(rid, inputs)
+    step.begin_calls()
+    out = rollout.sub.forward(ROLLOUT_WALK, None, **inputs.tensor_inputs, **inputs.kwargs)
+    step.check_calls()
+    rollout.pool.commit(step.steps[DIT_KV], step.ctx)
+    step.commit_calls()
+    step.end_calls()
+    rollout.chunks[rid] += 1
+    return out
+
+
+def test_the_vae_caches_continue_through_their_sized_value_off_the_rollout_loop(monkeypatch):
+    """`main` kept the encoder's stream and the decoder's cache with the request and handed each chunk the same
+    tensors. On the rollout loop's edges every chunk copied them to the host and back, 3.8 GB at 464x832. Through the
+    sized Value a chunk gets the tensors the last one wrote, another request starts empty, and no output carries a
+    cache."""
+    rollout, seen = _cached_rollout(monkeypatch)
+    rollout.open(1)
+    rollout.open(2)
+    out = _forward(rollout, 1)
+    wrote = sorted((key, t.data_ptr()) for key, t in rollout.caches._requests[1].tensors.items() if DECODER in key[2])
+    _forward(rollout, 2)
+    _forward(rollout, 1)
+    assert set(out) == {"clock", "video_output"}, "a cache on an output is copied to the host every chunk"
+    assert seen.decoder[0] == seen.decoder[1] == (wan_vae.FeatCache, [None] * 3), "each stream should start empty"
+    assert seen.decoder[2] == (wan_vae.FeatCache, [ptr for _, ptr in wrote]), "the decode guards on the slots it wrote"
+    steady, slots = seen.encoder[2]
+    assert steady is None and all(a is b for a, b in zip(slots, seen.written[0], strict=True))
+
+
+def test_a_slot_the_decode_replaces_is_freed_there(monkeypatch):
+    """The read hands the caches over, so nothing but the decode's own list holds a slot. A forward that kept what it
+    read would hold the whole old cache through the chunk, 3.8 GB at 464x832."""
+    rollout, seen = _cached_rollout(monkeypatch)
+    rollout.open(1)
+    _forward(rollout, 1)
+    _forward(rollout, 1)
+    assert seen.freed == [True, True], "the old slot outlived its replacement"
+
+
+def test_a_settled_encoder_gives_its_slots_back(monkeypatch):
+    """Once black frames stop changing the encoder's cache, one output stands for every later call, and the slots'
+    bytes, 359,424 a latent pixel, are free for a waiting rollout."""
+    rollout, _ = _cached_rollout(monkeypatch)
+    rollout.open(1)
+    _forward(rollout, 1)
+    held = rollout.caches._used
+    _forward(rollout, 1)
+    names = {name for _, _, name in rollout.caches._requests[1].tensors}
+    assert STEADY in names and not names & set(rollout.sub._encoder_fields)
+    assert rollout.caches._used == held - 359424 * 4 * 4, "the settled stream still holds its slots' bytes"
+
+
+def test_a_chunk_past_the_first_refuses_an_empty_decoder_cache(monkeypatch):
+    """A chunk whose forward failed after its read leaves nothing behind, which is what chunk 0 finds."""
+    rollout, _ = _cached_rollout(monkeypatch)
+    rollout.open(1)
+    rollout.chunks[1] = 1
+    with pytest.raises(RuntimeError, match="chunk 1 found no decoder cache in 'vae_caches'"):
+        _forward(rollout, 1)
+
+
+@pytest.mark.parametrize("lat_hw", [(2, 3), (3, 5)])
+def test_the_declared_caches_are_the_vae_s_at_any_latent_size(lat_hw):
+    """Every process declares the caches from the VAE's config, without loading it. Against the Wan2.1 VAE itself, at
+    random weights: each slot a stream holds between calls has its field's shape, and owns its bytes."""
+    from diffusers import AutoencoderKLWan
+
+    vae = AutoencoderKLWan().eval()
+    fields = vae_cache_entry(_tiny(reference_numerics=True)).tensors
+    encoder = [None] * sum(isinstance(m, wan_vae.WanCausalConv3d) for m in vae.encoder.modules())
+    decoder = wan_vae.new_feat_cache(vae)
+    with torch.inference_mode():
+        vae.encoder(torch.zeros(1, 3, 1, 8 * lat_hw[0], 8 * lat_hw[1]), feat_cache=encoder, feat_idx=[0])
+        steady = vae.encoder(torch.zeros(1, 3, 4, 8 * lat_hw[0], 8 * lat_hw[1]), feat_cache=encoder, feat_idx=[0])
+        wan_vae.FastDecoder(vae, channels_last=False, compile=False).decode_stream(
+            torch.zeros(1, 16, 4, *lat_hw), decoder, clip_start=True,
+        )
+    wan_vae.check_stream_cache(encoder, fields, ENCODER, lat_hw)
+    wan_vae.check_stream_cache(decoder, fields, DECODER, lat_hw)
+    assert tuple(steady.shape) == (*fields[STEADY].shape[:3], *lat_hw)
+    held = [slot for slot in (*encoder, *decoder, steady) if torch.is_tensor(slot)]
+    assert len(held) == len(fields) and all(
+        slot.untyped_storage().nbytes() == slot.numel() * slot.element_size() for slot in held
+    ), "a slot that is a view of a larger buffer would be refused at its write"
+
+
+def test_a_rollout_reserves_662208_bytes_a_latent_pixel():
+    """Every cache scales with the latent's area, so a rollout reserves its own, 4.0 GB at 464x832. A Value of fixed
+    shapes would hold each request at 720x1280."""
+    (caches,) = (spec for spec in serving_resources(_model(), {"resources": {}}) if spec.resource_key == VAE_CACHES)
+    assert caches.config.bytes_at({"lat_h": 58, "lat_w": 104}) == 662208 * 58 * 104
+    assert caches.config.budget == 662208 * 90 * 160, "the default budget should hold one rollout at 720x1280"
+
+
+def test_a_chunk_of_one_latent_is_refused_at_declaration():
+    with pytest.raises(ValueError, match="a chunk of one latent ends with diffusers' 'Rep' marker"):
+        vae_cache_entry(_tiny(chunk_size=1))
 
 
 # Compile
