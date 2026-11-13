@@ -338,3 +338,9 @@ def test_a_scalar_field_has_no_axis_to_shard():
 def test_a_scalar_field_has_no_kv_layout():
     with pytest.raises(ValueError, match="Attend needs entry fields"):
         _array(entry=_entry(TensorType((), dtype=None), TensorType((), dtype=None)), reads={"attn": _read()})
+
+
+@pytest.mark.parametrize("window", [-1, 2.0, None])
+def test_a_sampler_refuses_a_repetition_window_that_is_not_an_int_of_at_least_zero(window):
+    with pytest.raises(ValueError, match="repetition_window must be an int >= 0"):
+        Sampler("s", nodes={"n"}, vocab_size=8, repetition_window=window)

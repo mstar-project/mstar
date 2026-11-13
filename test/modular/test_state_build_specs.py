@@ -822,3 +822,8 @@ def test_decode_tensor_cores_on_a_within_step_read_is_refused():
                   reads={"r": _read(mask=Block(), op=Attend(q_heads=4))})
     with pytest.raises(ValueError, match=r"Array 'a': kernel_settings\['r'\] sets \['decode_tensor_cores'\]"):
         build_specs([array], kernel_settings={"r": {"decode_tensor_cores": False}})
+
+
+def test_a_samplers_window_and_top_p_first_reach_its_spec():
+    (spec,) = build_specs([Sampler("tts_sampler", nodes={"tts"}, vocab_size=8, repetition_window=16, top_p_first=True)])
+    assert spec.max_repetition_window == 16 and spec.enable_top_p_first, "the sampler would refuse the request's window"
