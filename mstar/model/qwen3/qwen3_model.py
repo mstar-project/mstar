@@ -18,16 +18,16 @@ from jinja2 import TemplateError
 
 from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec
 from mstar.engine.resources.draft.config import DraftConfig
-from mstar.engine.resources.draft.drafter import ModelGeometry, drafter_resources
+from mstar.engine.resources.draft.drafter import ChunkBoundary, ModelGeometry, drafter_resources
 from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
 from mstar.engine.resources.position.config import PositionConfig, PositionSpec
 from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.model.hf_config import hf_weight_dtype
-from mstar.model.keys import KV_CACHE, ROPE
+from mstar.model.keys import KV_CACHE, PREFILL_TEXT, ROPE
 from mstar.model.multimodal import TEXT, PromptPart, chat_turns
 from mstar.model.multimodal_decoder import MultimodalDecoderModel
 from mstar.model.qwen3.config import ATTN, LLM_NODE, qwen3_lm_config
-from mstar.model.submodule_base import NodeSubmodule
+from mstar.model.submodule_base import ChunkingPolicy, NodeSubmodule
 from mstar.utils.fast_tokenize import encode_ids
 from mstar.utils.hf_snapshot import resolve_snapshot_dir
 
@@ -148,6 +148,17 @@ class Qwen3Model(MultimodalDecoderModel):
             checkpoint=str(self._drafter_dir),
             prefill_steps=self.drafter_decl.prefill_steps(), verify_steps=self.drafter_decl.verify_steps(),
         )
+
+    def get_chunking_policies(self) -> dict[str, tuple[ChunkingPolicy, ...]]:
+        """A drafting node's prompts prefill in chunks of its budget where its drafter declares how its state
+        at a chunk's last row is built (`DrafterNeeds.chunk_boundary`); under one that doesn't, each prompt
+        prefills whole, as on a plain node."""
+        if self.drafter_decl is None or self.drafter_decl.needs.chunk_boundary == ChunkBoundary.UNDECLARED:
+            return {}
+        from mstar.model.qwen3.submodules import Qwen3LMSubmodule
+
+        budget = Qwen3LMSubmodule.MAX_BATCH_TOKENS
+        return {LLM_NODE: (ChunkingPolicy(walks=(PREFILL_TEXT,), chunkable=True, max_batch_tokens=budget),)}
 
     def _prompt_ids(
         self, parts: list[PromptPart], raw: dict[str, list[torch.Tensor]], **kwargs,

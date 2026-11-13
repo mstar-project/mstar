@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import collections
 import dataclasses
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -25,14 +26,17 @@ from qwen3_cpu import (
     Driver,
     decode,
     draft_block,
+    drafter_first_layer,
     engine,
     forced_drafts,
     make_model,
     patch_cpu,
+    prompt_kv,
     reference_greedy,
     write_checkpoints,
 )
 
+from mstar.engine.resources.draft.drafter import ChunkBoundary
 from mstar.engine.resources.draft.startup import check_deployment, geometry_problems
 from mstar.model.components.dspark.config import DSparkConfig
 from mstar.model.components.dspark.drafter import DSparkDrafter
@@ -229,6 +233,63 @@ def test_a_prompt_prefix_hit_reuses_the_drafters_context(ckpt, monkeypatch):
     assert driver.out[1] == reference and driver.out[2] == reference
     assert len(drafts) == len(cold)
     assert all(torch.equal(a[2], b[2]) for a, b in zip(drafts, cold, strict=True))
+
+
+def test_a_drafting_node_chunks_its_prompts_and_a_plain_one_does_not(ckpt):
+    target, dspark = ckpt
+    assert make_model(target).chunking_policy_of() == {}
+    model = make_model(target, draft_block(dspark, 3))
+    (policy,) = model.chunking_policy_of().values()
+    assert policy.chunkable and policy.max_batch_tokens == 8192
+    eng = engine(model)
+    assert eng._chunking.max_batch_tokens(NODE, "prefill_text") == 8192
+    # DSpark's state at a row is the target's there, so its prompts may be cut anywhere
+    specs = {spec.resource_key: spec for spec in model.get_node_resources()}
+    assert check_deployment(model.verify_nodes(), specs, {}, (), {}, True, chunked=[NODE]) == []
+    # under a drafter that declares no rule, prompts prefill whole rather than being refused
+    model.drafter_decl = SimpleNamespace(needs=SimpleNamespace(chunk_boundary=ChunkBoundary.UNDECLARED))
+    assert model.get_chunking_policies() == {}
+
+
+@pytest.mark.parametrize("size", [1, 3, 7])
+def test_a_chunked_prompt_drafts_and_decodes_as_the_whole_prompt_does(ckpt, monkeypatch, size):
+    """Prompts cut into chunks (one token a step, a chunk's last row mid-page, and past a page's end)
+    leave the drafter the context the whole prompt did: its layers hold the same K/V at every prompt
+    position (to float rounding, the target's attention summing over chunks), the real drafter
+    proposes the same drafts step for step, and the reply is plain greedy."""
+    target, dspark = ckpt
+    model = make_model(target, draft_block(dspark, 3))
+    first = drafter_first_layer(model)
+    proposed: dict[str, list[torch.Tensor]] = {}
+    held: dict[str, dict[int, torch.Tensor]] = {}
+    propose = DSparkDrafter.propose
+    for how in ("whole", "chunked"):
+        drafts = proposed[how] = []
+
+        def recorded(self, inputs, drafts=drafts):
+            out = propose(self, inputs)
+            drafts.append(out.clone())
+            return out
+
+        monkeypatch.setattr(DSparkDrafter, "propose", recorded)
+        driver = Driver(engine(model), model)
+        for rid, prompt in PROMPTS.items():
+            driver.add(rid, prompt, MAX)
+        if how == "whole":
+            driver.prefill(list(PROMPTS), PROMPTS)
+        else:
+            steps = driver.prefill_chunks(list(PROMPTS), PROMPTS, size)
+            assert steps == -(-max(map(len, PROMPTS.values())) // size)
+        layers = range(first, len(driver.eng._resources["kv_cache"].kv_cache.tensor))
+        held[how] = {rid: prompt_kv(driver.eng, rid, len(p), layers) for rid, p in PROMPTS.items()}
+        driver.run(list(PROMPTS))
+        proposed[how + "_out"] = driver.out
+    for rid in PROMPTS:
+        torch.testing.assert_close(held["chunked"][rid], held["whole"][rid], rtol=1e-4, atol=1e-5)
+    assert proposed["chunked_out"] == proposed["whole_out"]
+    assert proposed["whole_out"] == {rid: reference_greedy(model, p, MAX) for rid, p in PROMPTS.items()}
+    assert len(proposed["chunked"]) == len(proposed["whole"]) > 0
+    assert all(torch.equal(a, b) for a, b in zip(proposed["chunked"], proposed["whole"], strict=True))
 
 
 # ── sampling ──

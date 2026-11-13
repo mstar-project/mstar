@@ -663,7 +663,11 @@ and a cached prompt prefix carries the drafter's context too. The pool holds
 prompt plus reply.
 While drafting, a request's ``repetition_penalty`` other than 1 is refused with
 a 400, log-probs are not reported, and the node runs no mixed prefill/decode
-steps and rebuilds no dropped request. Startup refuses a drafter whose KV heads, head size, hidden size,
+steps and rebuilds no dropped request. Its prompts prefill in chunks of 8192
+tokens a step (the serving config's ``max_batch_tokens`` for ``LLM`` sets
+another budget, null none), so a wave of long prompts runs as several steps
+rather than one; a plain Qwen3 node prefills each prompt whole.
+Startup refuses a drafter whose KV heads, head size, hidden size,
 vocabulary or dtype differ from the target's, or that reads a layer the target
 lacks. ``mode: auto`` runs asynchronously where FA3's paged kernel serves the
 verify step (Hopper) and synchronously elsewhere; the startup log names the mode

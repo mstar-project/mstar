@@ -304,6 +304,8 @@ def engine(model, seed: int = 0, prefix_cache: bool = False, specs=None, weights
         {NODE: sub}, specs, WorkerParallelGroups(num_workers=1, global_rank=0), _indexed(device),
         transfer_engine_info=None, kv_cache_type=dtype, model=model,
     )
+    # as the worker binds them: the model's chunking policies, under no serving-config budgets
+    eng.set_chunking_policies(model.chunking_policy_of())
     if warmup:
         eng.warmup()
     elif slot_masters:
@@ -383,6 +385,33 @@ class Driver:
         assert batch.admit_error is None, batch.admit_error
         for rid in rids:
             self.out[rid].append(int(out.per_rid_outputs[rid]["new_token"][0].reshape(-1)[0]))
+
+    def prefill_chunks(self, rids: list[int], prompts: dict[int, list[int]], size: int) -> int:
+        """The prompt step as the scheduler cuts it under a ``size``-token budget a row: each step runs
+        every unfinished row's next chunk, cut by the engine from the whole prompt it prepared once.
+        Returns the steps run."""
+        from mstar.engine.chunking import ChunkRange
+
+        done = dict.fromkeys(rids, 0)
+        steps = 0
+        while any(done[rid] < len(prompts[rid]) for rid in rids):
+            live = [rid for rid in rids if done[rid] < len(prompts[rid])]
+            chunks = {}
+            for rid in live:
+                start, total = done[rid], len(prompts[rid])
+                end = min(start + size, total)
+                chunks[rid] = ChunkRange(start, end, total, end if start == 0 else end - start)
+            batch = self._batch(PREFILL, {rid: torch.tensor(prompts[rid], device=self.device) for rid in live})
+            batch.chunk_ranges = chunks
+            self.eng.prepare_inputs(batch)
+            out = self.eng.exec_and_postprocess(batch)
+            assert batch.admit_error is None, batch.admit_error
+            for rid, chunk in chunks.items():
+                done[rid] = chunk.end
+                if chunk.is_final:
+                    self.out[rid].append(int(out.per_rid_outputs[rid]["new_token"][0].reshape(-1)[0]))
+            steps += 1
+        return steps
 
     def _batch(self, walk, ids):
         rids = list(ids)
@@ -602,6 +631,15 @@ def bind_share(sub, k: int):
               for name in DrafterShare._fields if name not in DrafterShare._field_defaults}
     sub.bind_draft(DrafterShare(**fields))
     return sub
+
+
+def prompt_kv(eng: Engine, rid: int, length: int, layers) -> torch.Tensor:
+    """``[layers, length, ...]``: what the pool holds at a request's first ``length`` positions."""
+    kv = eng._resources["kv_cache"]
+    stream = kv._streams[rid]["main"]
+    pages = torch.tensor([stream.page_indices[p // PAGE] for p in range(length)])
+    offsets = torch.tensor([p % PAGE for p in range(length)])
+    return torch.stack([kv.kv_cache.tensor[layer][pages, :, offsets] for layer in layers])
 
 
 def drafter_first_layer(model) -> int:
