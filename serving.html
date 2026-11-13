@@ -862,6 +862,18 @@ not share sockets.</p></td>
 <td><p>Serve Prometheus metrics at <code class="docutils literal notranslate"><span class="pre">/metrics</span></code> (see <a class="reference internal" href="#serving-metrics"><span class="std std-ref">Metrics</span></a>).
 Needs <code class="docutils literal notranslate"><span class="pre">.[metrics]</span></code>.</p></td>
 </tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--enable-nvtx</span></code></p></td>
+<td><p>off</p></td>
+<td><p>Emit NVTX markers for CUDA profiling. Disabled on XPU and CPU.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">--timeout</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">600</span></code></p></td>
+<td><p>Per-request timeout (seconds).</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">--tcp-transfer-device</span></code></p></td>
+<td><p>(auto)</p></td>
+<td><p>Network device for TCP tensor transport.</p></td>
+</tr>
 </tbody>
 </table>
 </div>

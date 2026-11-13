@@ -1254,6 +1254,11 @@ window.runMermaid = runMermaid;</script>
 
 
 
+<span class="n">_REF_AUDIO_TOO_LONG</span> <span class="o">=</span> <span class="p">(</span>
+    <span class="sa">f</span><span class="s2">"ref_audio must be </span><span class="si">{</span><span class="n">MAX_REF_AUDIO_SECONDS</span><span class="si">:</span><span class="s2">g</span><span class="si">}</span><span class="s2"> s or shorter; voice cloning needs a few seconds of speech"</span>
+<span class="p">)</span>
+
+
 <span class="c1">#: The refusal of a bare-base64 ``ref_audio`` that is not audio the model decodes.</span>
 <span class="n">BARE_REF_AUDIO_REFUSAL</span> <span class="o">=</span> <span class="p">(</span>
     <span class="s2">"server file paths are refused; ref_audio must be a data URL, an http(s) URL "</span>
@@ -1334,12 +1339,16 @@ window.runMermaid = runMermaid;</script>
     <span class="k">with</span> <span class="n">_ref_audio_decodes</span><span class="p">:</span>
         <span class="c1"># Mono at a fixed rate: a small compressed upload can declare many</span>
         <span class="c1"># channels at a high rate, and decoding it natively takes gigabytes.</span>
-        <span class="n">samples</span> <span class="o">=</span> <span class="n">AudioDecoder</span><span class="p">(</span>
-            <span class="n">path</span><span class="p">,</span> <span class="n">sample_rate</span><span class="o">=</span><span class="n">_REF_AUDIO_PROBE_RATE</span><span class="p">,</span> <span class="n">num_channels</span><span class="o">=</span><span class="mi">1</span>
-        <span class="p">)</span><span class="o">.</span><span class="n">get_samples_played_in_range</span><span class="p">(</span><span class="mf">0.0</span><span class="p">,</span> <span class="n">MAX_REF_AUDIO_SECONDS</span> <span class="o">+</span> <span class="mf">1.0</span><span class="p">)</span>
+        <span class="c1"># The model's own loader caps the same decode, so the two measure the</span>
+        <span class="c1"># clip alike.</span>
+        <span class="k">try</span><span class="p">:</span>
+            <span class="n">samples</span> <span class="o">=</span> <span class="n">torchcodec_samples_capped</span><span class="p">(</span>
+                <span class="n">path</span><span class="p">,</span> <span class="n">MAX_REF_AUDIO_SECONDS</span><span class="p">,</span> <span class="n">sample_rate</span><span class="o">=</span><span class="n">_REF_AUDIO_PROBE_RATE</span><span class="p">,</span> <span class="n">num_channels</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
+            <span class="p">)</span>
+        <span class="k">except</span> <span class="n">AudioTooLongError</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="n">RefAudioTooLongError</span><span class="p">(</span><span class="n">_REF_AUDIO_TOO_LONG</span><span class="p">)</span> <span class="kn">from</span><span class="w"> </span><span class="kc">None</span>
     <span class="k">if</span> <span class="n">samples</span><span class="o">.</span><span class="n">duration_seconds</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
         <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">"reference audio has no samples in its first seconds"</span><span class="p">)</span>
-    <span class="n">_require_ref_audio_seconds</span><span class="p">(</span><span class="n">samples</span><span class="o">.</span><span class="n">pts_seconds</span> <span class="o">+</span> <span class="n">samples</span><span class="o">.</span><span class="n">duration_seconds</span><span class="p">)</span>
 
 
 <span class="k">def</span><span class="w"> </span><span class="nf">_check_ref_audio_soundfile</span><span class="p">(</span><span class="n">path</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
@@ -1366,9 +1375,7 @@ window.runMermaid = runMermaid;</script>
 
 <span class="k">def</span><span class="w"> </span><span class="nf">_require_ref_audio_seconds</span><span class="p">(</span><span class="n">seconds</span><span class="p">:</span> <span class="nb">float</span> <span class="o">|</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
     <span class="k">if</span> <span class="n">seconds</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">seconds</span> <span class="o">&gt;</span> <span class="n">MAX_REF_AUDIO_SECONDS</span><span class="p">:</span>
-        <span class="k">raise</span> <span class="n">RefAudioTooLongError</span><span class="p">(</span>
-            <span class="sa">f</span><span class="s2">"ref_audio must be </span><span class="si">{</span><span class="n">MAX_REF_AUDIO_SECONDS</span><span class="si">:</span><span class="s2">g</span><span class="si">}</span><span class="s2"> s or shorter; voice cloning needs a few seconds of speech"</span>
-        <span class="p">)</span>
+        <span class="k">raise</span> <span class="n">RefAudioTooLongError</span><span class="p">(</span><span class="n">_REF_AUDIO_TOO_LONG</span><span class="p">)</span>
 
 
 <span class="n">logger</span> <span class="o">=</span> <span class="n">logging</span><span class="o">.</span><span class="n">getLogger</span><span class="p">(</span><span class="vm">__name__</span><span class="p">)</span>
