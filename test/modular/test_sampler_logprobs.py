@@ -98,9 +98,12 @@ def _step(res, rids, logits, kept_rids=None, padded_bs=None):
     """Plan, sample and commit one step; the rows ``step_host_rows`` hands over."""
     lease = None if padded_bs is None else SlotLease(slot=0, bucket=SimpleNamespace(bs=padded_bs))
     ctx = StepContext(request_ids=tuple(rids), graph_walk="w", slot=0, capture=False, slot_lease=lease)
+    if padded_bs is not None:
+        # as the engine pads a leased step's rows (padding rows carry negative handles)
+        ctx.set_padded_rids([*rids, *range(-1, len(rids) - padded_bs - 1, -1)])
     step = SamplerStep(apply_penalty=False, kept_rids=kept_rids)
     res.plan(step, ctx)
-    res.sample(list(rids), logits)
+    res.sample(logits)
     res.commit(step, ctx)
     return res.step_host_rows()
 
@@ -214,10 +217,11 @@ def test_a_second_sample_in_one_step_raises_while_logprobs_are_on():
     res.ingest_request(0, SamplingReqConfig(return_logprobs=True))
     _step(res, [0], _logits()[:1])
     with pytest.raises(RuntimeError, match="one sample"):
-        res.sample([0], _logits()[:1])
+        res.sample(_logits()[:1])
     _step(res, [0], _logits()[:1])  # the next plan starts a new step
     # without them, a node may sample as often as it likes
     plain = _resource(enable=False)
     plain.ingest_request(0, SamplingReqConfig())
-    plain.sample([0], _logits()[:1])
-    plain.sample([0], _logits()[:1])
+    plain.plan(SamplerStep(apply_penalty=False), StepContext(request_ids=(0,), graph_walk="w", slot=0, capture=False))
+    plain.sample(_logits()[:1])
+    plain.sample(_logits()[:1])

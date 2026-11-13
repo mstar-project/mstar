@@ -201,7 +201,7 @@ class _FakeSampler:
 
     has_slot_masters = False
 
-    def sample(self, request_ids, logits):
+    def sample(self, logits):
         return logits.argmax(dim=-1)
 
 

@@ -151,7 +151,7 @@ class _Node:
             assert self.kv.admit(kv, ctx).ok
             self.kv.plan(kv, ctx)
         self.sampler.plan(smp, ctx)
-        out = self.sampler.sample(list(rids), torch.zeros(len(rids), V))
+        out = self.sampler.sample(torch.zeros(len(rids), V))
         if self.kv is not None:
             self.kv.commit(kv, ctx)
         self.sampler.commit(smp, ctx)
@@ -208,7 +208,7 @@ class _Node:
             self.kv.plan(kv, ctx)
         self.sampler.plan(smp, ctx)
         assert self.sampler._cg_sampler is graph_sampler
-        ids = self.sampler.loopback_tokens(list(padded))
+        ids = self.sampler.loopback_tokens()
         if self.planner is not None:
             self.planner.flush(ctx.resident_plan)
             # what the capture recorded: each owner's gathers (the sampler's cells), the sample

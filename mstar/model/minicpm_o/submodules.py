@@ -252,7 +252,7 @@ class LLMSubmodule(ARNodeSubmodule):
             out["tts_hidden"] = hidden
         else:
             hidden = attn.select_last_hidden(hidden)
-        out["new_token"] = sampler.sample(engine_inputs.request_ids, logits=self.model.logits(hidden))
+        out["new_token"] = sampler.sample(self.model.logits(hidden))
         return out
 
     def forward(
@@ -692,7 +692,7 @@ class TTSSubmodule(ARNodeSubmodule):
         hidden = self.model.model(input_embeds, label="main")
         if graph_walk != TTS_DECODE:
             hidden = attn.select_last_hidden(hidden)
-        return {"tts_code": sampler.sample(engine_inputs.request_ids, logits=self.model.logits(hidden))}
+        return {"tts_code": sampler.sample(self.model.logits(hidden))}
 
     def forward(self, graph_walk: str, engine_inputs: ModelInputsFromEngine, **kwargs) -> NameToTensorList:
         return {k: [v] for k, v in self._forward(graph_walk, engine_inputs, **kwargs).items()}

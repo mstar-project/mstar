@@ -448,13 +448,12 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
             # the MTP pass reads the trunk's hidden state at every prompt row
             hidden = self.language_model.model(input_ids)
             last = last.long()
-            new_tokens = sampler.sample(
-                engine_inputs.request_ids, logits=self.lm_head(hidden.index_select(0, last)))
+            new_tokens = sampler.sample(self.lm_head(hidden.index_select(0, last)))
             self._mtp_prefill(engine_inputs, input_ids, hidden, last, new_tokens, mtp_keep)
             return new_tokens
         hidden = self.language_model.model(input_ids, rows=last)
         logits = self.lm_head(hidden)  # (rows, vocab)
-        return sampler.sample(engine_inputs.request_ids, logits=logits)
+        return sampler.sample(logits)
 
     # -- MTP device side ---------------------------------------------------
 

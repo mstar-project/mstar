@@ -157,7 +157,7 @@ class _Greedy:
     """A sampler's handle, over a resource that takes each row's best token."""
 
     _open, _drawn, sampler, rows = True, 0, SimpleNamespace(draws=1 << 30), ()
-    resource = SimpleNamespace(sample=lambda request_ids, logits: logits.argmax(-1))
+    resource = SimpleNamespace(sample=lambda logits: logits.argmax(-1))
 
 
 def _decode_inputs(rows):

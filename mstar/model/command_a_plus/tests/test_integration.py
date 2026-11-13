@@ -87,7 +87,7 @@ class NodeTests(unittest.TestCase):
         return step
 
     def test_packed_prefill_selects_each_requests_last_token_and_decode_routes_rows(self):
-        sampler = SimpleNamespace(sample=Mock(side_effect=lambda rids, logits: logits.argmax(-1)))
+        sampler = SimpleNamespace(sample=Mock(side_effect=lambda logits: logits.argmax(-1)))
         attention = SimpleNamespace(select_last_hidden=Mock(side_effect=lambda x, label: x[[2, 4]]))
         self.bind(attention, sampler)
         engine = ModelInputsFromEngine(["a", "b"], {}, {})
@@ -107,7 +107,6 @@ class NodeTests(unittest.TestCase):
             self.assertEqual(set(tracked), {"a", "b"} if walk == "prefill" else set())
             output = self.node.forward_batched(walk, engine, **self.node.preprocess(walk, engine, inputs))
             self.assertEqual(output.row_outputs["new_token"].tolist(), expected)
-            self.assertEqual(sampler.sample.call_args.args[0], engine.request_ids)
         attention.select_last_hidden.assert_called_once()
 
     def test_its_eos_ends_either_prefill_and_the_decode_loop(self):
@@ -166,7 +165,7 @@ class ModelIntegrationTests(unittest.TestCase):
         node = self.model.get_submodule("LLM", autocast_dtype=torch.float32)
         kv, pos, local, global_ = bind_test_resources(node.model.model, self.model.config)
         local.select_last_hidden = lambda hidden, label: hidden[-1:]
-        sampler = SimpleNamespace(sample=lambda request_ids, logits: logits.argmax(-1))
+        sampler = SimpleNamespace(sample=lambda logits: logits.argmax(-1))
         resources = {KV_CACHE: kv, ROPE: pos, LOCAL_ATTN: local, GLOBAL_ATTN: global_, SAMPLER: sampler}
         node.bind_node_state(node_handles(self.model, "LLM", resources))
         engine = ModelInputsFromEngine(["a"], {}, resources)
@@ -340,7 +339,7 @@ class ModelIntegrationTests(unittest.TestCase):
         node.bind_node_state(node_handles(self.model, "LLM", {
             KV_CACHE: MemoryKV(), ROPE: SimpleNamespace(position=lambda rid, label: 0),
             LOCAL_ATTN: SimpleNamespace(select_last_hidden=lambda x, label: x), GLOBAL_ATTN: None,
-            SAMPLER: SimpleNamespace(sample=lambda rids, logits: logits),
+            SAMPLER: SimpleNamespace(sample=lambda logits: logits),
         }))
         ids, rows = result["text_inputs"][0], torch.randn(12, self.model.config.vocab_size)
         engine = ModelInputsFromEngine(["a"], {}, {})

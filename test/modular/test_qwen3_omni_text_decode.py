@@ -124,9 +124,9 @@ def _model():
 
 def _engine_inputs(request_ids, tokens, captured=False):
     sampler = SimpleNamespace(
-        loopback_tokens=lambda rids: torch.tensor(tokens),
+        loopback_tokens=lambda: torch.tensor(tokens),
         overwrite_rows=lambda rows, *updates: SamplerResource.overwrite_rows(sampler, rows, *updates),
-        sample=lambda request_ids, logits: logits[:, 0].long(),
+        sample=lambda logits: logits[:, 0].long(),
         _row_stager=PinnedStager(torch.long, numel=64),
     )
     _engine_inputs.sampler = sampler

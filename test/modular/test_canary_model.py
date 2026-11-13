@@ -310,7 +310,7 @@ def test_decoder_matches_hf():
         """One step as the engine runs it, with a sampler that hands back its logits."""
         engine_inputs = SimpleNamespace(request_ids=["a"], resources={
             POS: SimpleNamespace(pos_ids=lambda label: positions), ATTN: last_rows,
-            SAMPLER: SimpleNamespace(sample=lambda request_ids, logits: logits),
+            SAMPLER: SimpleNamespace(sample=lambda logits: logits),
         })
         rows = [node.prepare_inputs(walk, None, inputs)]
         return node.forward_batched(walk, engine_inputs, **node.preprocess(walk, engine_inputs, rows))
