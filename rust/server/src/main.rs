@@ -296,6 +296,7 @@ fn exit_with_launcher() {
                 every.tick().await;
                 if std::os::unix::process::parent_id() != launcher {
                     eprintln!("mstar-server: its launcher (pid {launcher}) exited; stopping");
+                    transcription::remove_local_uploads();
                     std::process::exit(1);
                 }
             }
