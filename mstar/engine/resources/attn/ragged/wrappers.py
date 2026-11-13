@@ -4,6 +4,7 @@
 FlashInfer wrappers live here; FA3 is in ``dense_wrappers.py``.
 """
 
+import functools
 import math
 from abc import ABC, abstractmethod
 
@@ -360,7 +361,15 @@ class _FlashInferRaggedPrefillBase(_RaggedPrefillBase):
             self.attn_wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
                 self._workspace.tensor, kv_layout, backend=backend
             )
+            # FlashInfer's CUTLASS plan (what `auto` runs on Blackwell) reads the layout's
+            # longest segment back off the device, a sync of the stream it plans on. On a
+            # stream of its own that waits for the layout's H2D alone, not for the step in
+            # flight: a step at concurrency replans whenever the request's layout differs
+            # from the one its slot last ran, and on the step's stream every such plan
+            # stalled the worker for a whole step
+            self._plan_stream = torch.cuda.Stream(self.device) if torch.device(self.device).type == "cuda" else None
             return
+        self._plan_stream = None
 
         self.attn_wrapper = flashinfer.BatchPrefillWithRaggedKVCacheWrapper(
             self._workspace.tensor,
@@ -399,7 +408,8 @@ class _FlashInferRaggedPrefillBase(_RaggedPrefillBase):
     def _plan_kernel(
         self, cu: torch.Tensor, kv_cu: torch.Tensor, total_tokens: int, causal: bool,
     ) -> None:
-        self._workspace.plan(
+        plan = functools.partial(
+            self._workspace.plan,
             self.attn_wrapper.plan,
             cu,
             kv_cu,
@@ -410,6 +420,14 @@ class _FlashInferRaggedPrefillBase(_RaggedPrefillBase):
             sm_scale=self.sm_scale,
             q_data_type=self.q_data_type,
         )
+        if self._plan_stream is None:
+            plan()
+            return
+        # the plan rewrites this wrapper's buffers, which the slot's previous step, the
+        # last to read them, has finished with by the time its slot is planned again
+        with torch.cuda.stream(self._plan_stream):
+            plan()
+        torch.cuda.current_stream(self.device).wait_stream(self._plan_stream)
 
     def _pad_head_dim(self, t: torch.Tensor) -> torch.Tensor:
         if t.shape[-1] == self.padded_head_dim:
