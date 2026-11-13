@@ -131,7 +131,7 @@ def drafter(request) -> Drafter:
 
 def _config(tmp: Path, name: str, drafter: Drafter, *, draft_mode: str | None, verify_backend: str | None = None,
             tp: int = 1,
-            captured: bool = True, max_num_pages: int | None = None) -> Path:
+            captured: bool = True, max_num_pages: int | None = None, max_batch_tokens: int | None = None) -> Path:
     base = drafter.config if draft_mode else "configs/qwen3_8b.yaml"
     config = yaml.safe_load((REPO / base).read_text())
     resources = config.setdefault("resources", {})
@@ -149,6 +149,8 @@ def _config(tmp: Path, name: str, drafter: Drafter, *, draft_mode: str | None, v
     if max_num_pages:
         # pages run out under load: requests are offloaded and reloaded
         kv.update(max_num_pages=max_num_pages, cpu_offload_pages=4 * max_num_pages)
+    if max_batch_tokens is not None:
+        config["max_batch_tokens"] = {"LLM": max_batch_tokens}
     if tp > 1:
         config["node_groups"] = [{"node_names": ["LLM"], "ranks": list(range(tp)), "tp_size": tp}]
     path = tmp / f"{name}.yaml"
@@ -391,6 +393,17 @@ def test_sampled_requests_at_the_checkpoint_defaults(tmp_path_factory, drafter):
     run = _run(tmp_path_factory, drafter, "async", draft_mode="asynchronous", repeat=True, sampled_too=True)
     assert all(len(ids) > 0 for ids in run["sampled"])
     assert run["tau_sampled"] > 1.5, run["tau_sampled"]
+
+
+def test_prompts_prefilled_in_chunks_reply_and_draft_as_whole_ones(tmp_path_factory, drafter, margin_of):
+    """A 16-token budget cuts every chat prompt into chunks of one page, captured and verifying
+    asynchronously: the replies hold to plain greedy and the acceptance to the whole prompts'."""
+    plain = _run(tmp_path_factory, drafter, "plain", draft_mode=None)
+    whole = _run(tmp_path_factory, drafter, "async", draft_mode="asynchronous", repeat=True, sampled_too=True)
+    chunked = _run(tmp_path_factory, drafter, "async_chunked", draft_mode="asynchronous", max_batch_tokens=PAGE)
+    _check_margins(plain["sequential"], chunked["sequential"], margin_of, "chunked sequential")
+    _check_margins(plain["sequential"], chunked["concurrent"], margin_of, "chunked concurrent")
+    assert chunked["tau"] == pytest.approx(whole["tau"], rel=0.1)
 
 
 def test_a_repeated_prompt_hits_the_prefix_cache_and_drafts_as_well(tmp_path_factory, drafter, margin_of):

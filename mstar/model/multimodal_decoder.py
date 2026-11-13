@@ -37,7 +37,7 @@ import torch
 from mstar.communication.tensors import NameToTensorList
 from mstar.distributed.base import ShardingConfig
 from mstar.engine.resources.draft.config import DraftConfig
-from mstar.engine.resources.draft.drafter import VerifyNode
+from mstar.engine.resources.draft.drafter import ChunkBoundary, VerifyNode
 from mstar.engine.resources.sampler.config import SamplerSpec, SamplingReqConfig
 from mstar.engine.resources.spec import CombinedSplit, ResourceReqConfig
 from mstar.engine.state import SampleSettings
@@ -459,6 +459,12 @@ class MultimodalDecoderModel(Model):
     # -----------------------------------------------------------------------
     # Speculative decoding
     # -----------------------------------------------------------------------
+
+    @property
+    def drafts_chunked_prompts(self) -> bool:
+        """Whether a drafting node's prompts may prefill in chunks: its drafter declares how its state at a
+        chunk's last row is built (`DrafterNeeds.chunk_boundary`)."""
+        return self.drafter_decl is not None and self.drafter_decl.needs.chunk_boundary != ChunkBoundary.UNDECLARED
 
     @staticmethod
     def draft_config(block: Mapping[str, Any] | None) -> DraftConfig | None:

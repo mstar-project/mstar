@@ -13,7 +13,13 @@ class Qwen3LMSubmodule(DeclaredTokenDecoder):
     array. ``drafter`` (a hosted drafter module) makes decode verify its drafts,
     k a step as the engine binds."""
 
-    # kept for the narrower type: the node reads its hosted drafter's declaration (``needs.tap_key``)
+    # Tokens a drafting node's prompt step runs (its chunking budget, `Qwen3Model.get_chunking_policies`): a
+    # wave of long prompts then runs as several steps rather than one that holds every row behind it. vLLM's
+    # chunked prefill budget; a deployment sets its own with the serving config's ``max_batch_tokens``. A plain
+    # node doesn't chunk: unmeasured there.
+    MAX_BATCH_TOKENS = 8192
+
+    # kept for the narrower type: the scaffold reads its hosted drafter's declaration (``needs.tap_key``)
     def __init__(self, model, config, drafter: HostedDrafter | None = None, accelerator_graph: bool = True):
         super().__init__(model, config, drafter=drafter, accelerator_graph=accelerator_graph)
 

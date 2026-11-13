@@ -20,11 +20,11 @@ from jinja2 import TemplateError
 
 from mstar.engine.state import Array, Attend, Causal, Draft, KVEntry, Positions, Read, Rope, Sampler
 from mstar.model.hf_config import hf_weight_dtype
-from mstar.model.keys import KV_CACHE, ROPE, SAMPLER
+from mstar.model.keys import KV_CACHE, PREFILL_TEXT, ROPE, SAMPLER
 from mstar.model.multimodal import TEXT, PromptPart, chat_turns
 from mstar.model.multimodal_decoder import DeclaredDecoderModel
 from mstar.model.qwen3.config import ATTN, LLM_NODE, qwen3_lm_config
-from mstar.model.submodule_base import NodeSubmodule
+from mstar.model.submodule_base import ChunkingPolicy, NodeSubmodule
 from mstar.utils.fast_tokenize import encode_ids
 from mstar.utils.hf_snapshot import resolve_snapshot_dir
 
@@ -135,6 +135,17 @@ class Qwen3Model(DeclaredDecoderModel):
         from mstar.model.qwen3.submodules import Qwen3LMSubmodule
 
         return Qwen3LMSubmodule
+
+    def get_chunking_policies(self) -> dict[str, tuple[ChunkingPolicy, ...]]:
+        """A drafting node's prompts prefill in chunks of its budget where its drafter declares how its state
+        at a chunk's last row is built (`drafts_chunked_prompts`); under one that doesn't, each prompt
+        prefills whole, as on a plain node."""
+        if not self.drafts_chunked_prompts:
+            return {}
+        from mstar.model.qwen3.submodules import Qwen3LMSubmodule
+
+        budget = Qwen3LMSubmodule.MAX_BATCH_TOKENS
+        return {LLM_NODE: (ChunkingPolicy(walks=(PREFILL_TEXT,), chunkable=True, max_batch_tokens=budget),)}
 
     def _prompt_ids(
         self, parts: list[PromptPart], raw: dict[str, list[torch.Tensor]], **kwargs,
