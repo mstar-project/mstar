@@ -564,10 +564,15 @@ class Conductor:
         for spec in self._node_resources():
             if spec.resource_key in self._episode_array_names:
                 usable = getattr(spec.config, "usable_slots", None)
-                if usable is None or usable < self._episode_slots.capacity:
+                capacity = self._episode_slots.capacity
+                shortage = spec.capacity_problem(capacity, None)
+                if usable is None or usable < capacity or shortage is not None:
+                    labels = getattr(spec.config, "labels", ())
+                    need = capacity * max(1, len(labels))
                     raise ValueError(
                         f"episode array {spec.resource_key!r} has {usable} usable slots; "
-                        f"episodes.max_episodes needs {self._episode_slots.capacity}"
+                        f"episodes.max_episodes needs {need} slots"
+                        + (f" ({len(labels)} per episode)" if len(labels) > 1 else "")
                     )
         self._episode_max_calls = episode_config.get("max_calls")
         self._episode_max_queued_calls = episode_config.get("max_queued_calls", 1)
