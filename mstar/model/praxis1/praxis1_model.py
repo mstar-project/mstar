@@ -80,7 +80,8 @@ from mstar.model.base import (
     WalkStep,
 )
 from mstar.model.media_limits import read_image
-from mstar.model.praxis1.components.commands import compose_commands, pose_to_model
+from mstar.model.praxis1.components.commands import compose_commands
+from mstar.model.praxis1.components.pose_frames import pose_to_model
 from mstar.model.praxis1.components.proprio import normalized_proprio
 from mstar.model.praxis1.config import Praxis1Config, Praxis1ConfigError
 from mstar.model.praxis1.episode_history import BOUNDARY_STATE_NAME, STATE_NAME, append_count, clean_depth, window_size
@@ -555,12 +556,11 @@ class Praxis1Model(Model):
             }, sort_keys=True).encode()
             episode_keys = {TEXT_STATE_NAME: hashlib.sha256(key_payload).hexdigest()}
         metadata = {"text_tokens": int(task_mask.sum()), "blank_tokens": int(blank_mask.sum())}
+        descriptor = kwargs.get("pose_descriptor", "")
+        model_pose = pose_to_model(robot_state, self.config.embodiment, descriptor)
         if kwargs.get("action_format") == "positronic":
-            model_pose = pose_to_model(
-                robot_state, self.config.embodiment, kwargs.get("pose_descriptor", ""),
-            )
             metadata[MODEL_POSE_KWARG] = model_pose.tolist()
-            robot_state = model_pose.tolist()
+        robot_state = model_pose.tolist()
         proprio = normalized_proprio(robot_state, self.config.embodiment, self.config.normalization)
         new_tensors = {
             "text_ids": [task_ids],
@@ -598,14 +598,11 @@ class Praxis1Model(Model):
                 if raw_pose.ndim != 2 or raw_pose.shape[1] != pose_width or raw_pose.shape[0] not in (0, n_prior):
                     raise ValueError("Praxis executed poses must be absent or align with executed camera rows")
                 poses_available = raw_pose.shape[0] == n_prior
-                if poses_available and kwargs.get("action_format") == "positronic":
-                    descriptor = kwargs.get("pose_descriptor", "")
+                if poses_available:
                     pose_history = torch.stack([
                         torch.from_numpy(pose_to_model(row.cpu().numpy(), self.config.embodiment, descriptor))
                         for row in raw_pose
                     ]) if n_prior else torch.empty((0, raw_pose.shape[1]), dtype=torch.float32)
-                elif poses_available:
-                    pose_history = raw_pose.to(torch.float32)
                 else:
                     pose_history = torch.zeros((n_prior, pose_width), dtype=torch.float32)
             else:

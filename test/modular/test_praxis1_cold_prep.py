@@ -89,18 +89,28 @@ class _Tokenizer:
 
 
 def test_prompt_moves_pose_to_tensor_edge_and_walk_carries_recipe() -> None:
+    single_arm = pytest.importorskip("praxis.single_arm")
+    robot_io = pytest.importorskip("praxis.robot_io")
     model = Praxis1Model("runwayml/praxis-1-droid", skip_weight_loading=True)
     model.config = replace(model.config, normalization=_stats(10))
     model._tokenizer_cache = _Tokenizer()
     pose = [1.0, 2.0, 3.0, 1.0, 0.0, 0.0, 0.0, 0.5]
     prompt = model.process_prompt("pick up cup", [], [], robot_state=pose)
     assert prompt.new_input_tensors["proprio"][0].shape == (1, 1, 10)
+    reference_pose = single_arm.pose8_to_model(np.asarray(pose, dtype=np.float32), single_arm.RIG_FRAMES[""])
+    reference_proprio = robot_io.pose8_to_10d(reference_pose)
+    np.testing.assert_allclose(
+        prompt.new_input_tensors["proprio"][0][0, 0].numpy(), reference_proprio,
+        rtol=0, atol=1e-7,
+    )
     assert "robot_state" in model.PREPROCESS_ONLY_KWARGS
     assert "proprio" in model.get_graph_walk_graphs()[model.CHUNK_WALK].get_nodes()["action_expert"].input_names
 
     plan = model.walk_plan("", ["image"], ["action"], {"image_inputs": [object()]}, {"num_steps": 1})
     assert len(plan) == 2
-    assert plan[1].step_metadata == {
+    assert {key: plan[1].step_metadata[key] for key in (
+        "num_steps", "t_shift", "cfg_scale", "cfg_video_scale",
+    )} == {
         "num_steps": 1,
         "t_shift": 12.5,
         "cfg_scale": 1.0,

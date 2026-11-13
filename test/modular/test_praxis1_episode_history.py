@@ -304,6 +304,7 @@ class _Vae(torch.nn.Module):
 
 def test_missing_pose_fallback_matches_reference_over_three_calls():
     reference = pytest.importorskip("praxis.robot_io", reason="reference checkout not on PYTHONPATH")
+    single_arm = pytest.importorskip("praxis.single_arm", reason="reference checkout not on PYTHONPATH")
     stream = reference.ContiguousStreamContext(action_chunk=24, max_context_chunks=3)
     model = _model()
     node = Praxis1VaeEncoderSubmodule(model.config, _Vae(), max_context_chunks=3)
@@ -328,7 +329,11 @@ def test_missing_pose_fallback_matches_reference_over_three_calls():
         if count:
             clip = prior[None].permute(0, 2, 1, 3, 4)
             stream.append_executed(clip, poses=None)
-        expected = reference.pose8_to_10d(np.asarray(boundary_poses[-(stream.depth + 1):], dtype=np.float32))
+        model_poses = [
+            single_arm.pose8_to_model(np.asarray(row, dtype=np.float32), single_arm.RIG_FRAMES[""])
+            for row in boundary_poses[-(stream.depth + 1):]
+        ]
+        expected = reference.pose8_to_10d(np.asarray(model_poses, dtype=np.float32))
         append = append_count(len(frames.prior.get("frame", [])), count)
         out = node.forward(
             "chunk", SimpleNamespace(), history_append=append,
