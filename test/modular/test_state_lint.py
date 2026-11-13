@@ -16,7 +16,7 @@ sys.path.insert(0, ".")
 
 import pytest
 
-PORTED = ("mstar/model/qwen3_5", "mstar/model/command_a_plus")
+PORTED = ("mstar/model/qwen3_5", "mstar/model/command_a_plus", "mstar/model/praxis1")
 FORBIDDEN_ATTRIBUTES = {
     "node_resources", "resources", "request_state", "per_request_states",
     # what a handle holds

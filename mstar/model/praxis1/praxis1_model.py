@@ -39,7 +39,6 @@ from pathlib import Path
 
 import torch
 
-from mstar.engine.resources import NodeResourceSpec
 from mstar.graph.base import (
     GraphEdge,
     GraphNode,
@@ -287,44 +286,6 @@ class Praxis1Model(Model):
         lands with the step that uses it rather than here, because a
         declaration the nodes do not yet read would be a shape nothing
         checks.
-        """
-        return []
-
-    def get_node_resources(self) -> list[NodeResourceSpec]:
-        """No KV cache and no sampler, and no attention resource that fits.
-
-        Nothing here decodes tokens, and the actions come from flow matching
-        rather than from sampling, so there is no sampler. The resource pass
-        on the attention is the part worth writing down, because the answer
-        is that the engine cannot express this mask today.
-
-        The encoder's rule, read off the reference's packed predicate
-        ``(k == q) | (k == 0) | ((k & 1 == 1) & (k <= hi(q)))`` with the
-        codes clean ``2c+1``, noised ``2c+2`` and global ``0``:
-
-        * every token attends the globals (registers, anchor, text), and a
-          global attends nothing else,
-        * a noised token attends the noised tokens of its own chunk, and of
-          no other chunk, bidirectionally within it,
-        * a noised token also attends the clean tokens of strictly earlier
-          chunks,
-        * a clean token attends the clean tokens of its own and earlier
-          chunks, and never a noised one.
-
-        So the clean stream is block-causal, the noised stream is block
-        *diagonal*, and both sit behind a global prefix that everything
-        reads. ``BlockCausalAttentionSpec`` carries a ``block_size`` and
-        nothing else: it expresses the clean stream alone, with no prefix
-        span and no diagonal mode, and a noised query under it would attend
-        earlier chunks' noised tokens, which the checkpoint never saw.
-        ``RaggedAttentionSpec`` drops the structure entirely.
-
-        Declaring the nearest kind and living with the difference would be a
-        different model, so this returns nothing and the trunk's attention
-        runs in the node until the gap is closed. Closing it means either a
-        prefix span and a diagonal mode on the block-causal kind, or a kind
-        of its own under ``mstar/engine/resources/attn/``; that is its own
-        change, and it is the one this series owes the engine.
         """
         return []
 
