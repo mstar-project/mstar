@@ -16,17 +16,18 @@ from test_graph_runtime import _build_on_real_manager, _complete, _ingest, _read
 
 from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential, TensorPointerInfo
 from mstar.graph.graph_io import WorkerGraphIO
+from mstar.graph.runtime.base import ColumnarEdgeSpecs
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.utils.containers import ParallelList
 
 CHUNKS = 3
 
 
-def _token2wav() -> Loop:
+def _token2wav(clip: bool = True) -> Loop:
     """The flow consumes the token stream and loops its voice back; HiFT vocodes the flow's mel and loops its own
-    stream back."""
+    stream back. With ``clip`` the flow also reads the reference clip, from outside the loop."""
     flow = GraphNode(
-        name="flow", input_names={"speech_tokens", "ref_audio", "voice"},
+        name="flow", input_names={"speech_tokens", "voice"} | ({"ref_audio"} if clip else set()),
         outputs=[GraphEdge(name="voice", next_node="flow"), GraphEdge(name="mel", next_node="hift")],
     )
     flow._register_streaming({"speech_tokens"})
@@ -63,6 +64,9 @@ class _Python:
 
     def ingest(self, name: str, node: str) -> None:
         assert self.io.ingest_input(GraphEdge(name=name, next_node=node)), f"{node} refused {name}"
+
+    def chunk(self, name: str, node: str) -> None:
+        assert self.io.ingest_input(GraphEdge(name=name, next_node=node), can_buffer=False), f"{node} refused {name}"
 
     def ready(self) -> set[str]:
         return set(self.io.ready_node_names)
@@ -111,6 +115,13 @@ class _Rust:
     def ingest(self, name: str, node: str) -> None:
         assert _ingest(self.runtime, self.rid, [GraphEdge(name=name, next_node=node)]) == [], f"{node} refused {name}"
 
+    def chunk(self, name: str, node: str) -> None:
+        """A stream chunk, as `InputIngest.poll_stream_buffers` offers one."""
+        block = ColumnarEdgeSpecs.empty()
+        block.add(self.rid, name, [], False, next_node=node)
+        refused = self.runtime.ingest_inputs_batch(block, can_buffer=False, is_streaming=True)
+        assert refused == [], f"{node} refused {name}"
+
     def ready(self) -> set[str]:
         return {node for node, _ in _ready(self.runtime)}
 
@@ -123,6 +134,8 @@ class _Rust:
         }
 
     def complete(self, node: str, outputs: dict[str, list[torch.Tensor]]) -> tuple[dict[str, list[int]], list[int]]:
+        # the step's consumed inputs are released before its outputs are routed, as `StepExecutor.postprocess` does
+        self.tm.cleanup_collectable(*self.runtime.cleanup_consumed_inputs(node, [self.rid], [0]))
         signals = list(outputs)
         stored, out = _complete(self.tm, self.runtime, self.rid, node, outputs, signals)
         uuids = iter(stored.flat_uuids)
@@ -155,7 +168,7 @@ def test_a_two_node_loop_runs_once_per_chunk(runtime, tmp_path):
     runs = []
     for chunk in range(CHUNKS):
         assert graph.ready() == set(), "the flow waits for its chunk"
-        graph.ingest("speech_tokens", "flow")
+        graph.chunk("speech_tokens", "flow")
         assert graph.ready() == {"flow"}
         graph.complete("flow", {"voice": [torch.ones(3)], "mel": [torch.ones(2)]})
         if chunk == CHUNKS - 1:
@@ -169,13 +182,26 @@ def test_a_two_node_loop_runs_once_per_chunk(runtime, tmp_path):
 
 
 @RUNTIMES
+def test_a_consumer_that_reads_nothing_from_outside_its_loop_takes_every_chunk(runtime, tmp_path):
+    graph = runtime(_token2wav(clip=False), {"flow", "hift"}, tmp_path)
+    graph.ingest("voice", "flow")
+    graph.ingest("stream", "hift")
+    for _ in range(CHUNKS):
+        # refused unless the voice the last chunk looped back counts once the loop advances
+        graph.chunk("speech_tokens", "flow")
+        assert graph.ready() == {"flow"}
+        graph.complete("flow", {"voice": [torch.ones(3)], "mel": [torch.ones(2)]})
+        graph.complete("hift", {"stream": [torch.ones(4)], "audio_chunk": [torch.ones(5)]})
+
+
+@RUNTIMES
 def test_a_loop_back_edge_carries_a_host_tensor(runtime, tmp_path):
     graph = runtime(_token2wav(), {"flow", "hift"}, tmp_path)
     _enter_token2wav(graph)
-    graph.ingest("speech_tokens", "flow")
+    graph.chunk("speech_tokens", "flow")
     written, _ = graph.complete("flow", {"voice": [torch.ones(3)], "mel": [torch.ones(2)]})
     graph.complete("hift", {"stream": [torch.ones(4)], "audio_chunk": [torch.ones(5)]})
-    graph.ingest("speech_tokens", "flow")
+    graph.chunk("speech_tokens", "flow")
     assert graph.inputs("flow")["voice"] == written["voice"], "the next chunk should read the voice the last one wrote"
 
 
@@ -185,11 +211,11 @@ def test_a_declined_last_chunk_ends_the_loop_and_emits_its_outputs(runtime, tmp_
     graph.ingest("decode_tail", "decoder")
     frames = []
     for _ in range(CHUNKS - 1):
-        graph.ingest("window_latents", "decoder")
+        graph.chunk("window_latents", "decoder")
         written, emitted = graph.complete("decoder", {"decode_tail": [torch.ones(3)], "frames": [torch.ones(6)]})
         assert emitted == [], "frames wait for the loop's end"
         frames += written["frames"]
-    graph.ingest("window_latents", "decoder")
+    graph.chunk("window_latents", "decoder")
     graph.stop("decode", "decoder")
     # declined: the node completes with nothing on its outputs
     _, emitted = graph.complete("decoder", {"decode_tail": [], "frames": []})
