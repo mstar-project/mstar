@@ -280,7 +280,7 @@ MODELS: dict[str, ModelSpec] = {m.name: m for m in [
         Case("voice_clone", "speech", speech(language="English", ref_text=speech_transcript,
                                              ref_audio=lambda: data_url(speech_wav(), "audio/wav")), SPEECH,
              requires=SPEECH_FIXTURE),
-    ), "speech", requires=("qwen_tts",), peak_vram_gb=51.7),
+    ), "speech", requires=("qwen_tts",), peak_vram_gb=59.4),
     ModelSpec("qwen3tts_voicedesign", "configs/qwen3tts_voicedesign.yaml", (
         Case("voice_design", "speech", speech(instructions="A clear, friendly adult female voice.",
                                               language="English", temperature=0, code_predictor_temperature=0), SPEECH),

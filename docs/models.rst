@@ -1342,6 +1342,22 @@ Qwen3-TTS notes
   ``mps: true`` in the YAML (see :doc:`serving`; ``qwen3tts_split.yaml`` sets
   it) the two workers' kernels also overlap, which raised c=32 throughput by
   about a fifth on an H100.
+- ``configs/qwen3tts_base.yaml`` keeps the Base model's nodes on one worker, on
+  any GPU. ``configs/qwen3tts_base_split.yaml`` runs the Talker, the Codec and
+  the RefEncoder on workers of their own, all on GPU 0, as clients of one MPS
+  daemon (``mps: true``, NVIDIA only), so the Talker's decode steps overlap codec
+  windows and reference encodes. On an H200, serving seed-tts voice clones (two
+  boots each), it served 83-87 audio seconds a second at c=8 and 189-215 at
+  c=32, against 50-81 and 113-165 on one worker and 46-61 and 76-140 for
+  sglang-omni; at c=1 it is level with one worker (16.6-17.1 against 15.0-18.7).
+  Both start streaming after one frame and ramp to steady 16-frame chunks
+  (``codec_chunk_schedule: [1, 2, 4]``, ``codec_chunk_frames: 16``), and size
+  the Talker's KV pool at 2304 pages, which admits 34 clones at once and fits an
+  80 GB GPU. Every Qwen3-TTS request reserves its whole footprint at admission,
+  its prompt plus the default length (the checkpoint's 8192 frames), about 66
+  pages: a streamed one can't pause (``unpausable_outputs``), and none can be
+  rebuilt after a drop (its prompt is rows, not ids) without a host pool. Raise
+  ``max_num_pages`` on a larger GPU (4608 admit 69).
 - The Talker's layers run ``Qwen3Attention``, so each layer's q/k norm, RoPE and
   KV write are one kernel (``qk_norm_rope_kv_write``). It reads the RoPE theta off
   the position resource, which declares the checkpoint's.

@@ -1,0 +1,38 @@
+# Qwen3-TTS-12Hz-1.7B-Base on NVIDIA: the Talker, the Codec and the RefEncoder run on
+# workers of their own, all on GPU 0 (rank_devices) as clients of one MPS daemon, so the
+# Talker's decode steps overlap codec windows and reference encodes. It serves more audio
+# a second than configs/qwen3tts_base.yaml (one worker) from c=8 up and is level
+# at c=1; see docs/models.rst. NVIDIA only: it needs nvidia-cuda-mps-control on PATH.
+# Model settings and pool sizes are configs/qwen3tts_base.yaml's.
+model: "qwen3_tts_base"
+max_seq_len: 32768
+model_kwargs:
+  codec_dtype: bfloat16
+  # First audio after one frame, then steady chunks of 16 frames (sglang-omni's schedule)
+  codec_chunk_schedule: [1, 2, 4]
+  codec_chunk_frames: 16
+# The supported deployment image cannot build FlashInfer's Hopper FA3 JIT
+# kernels yet. Keep the model default on "auto" and pin this deployment to FA2.
+resources:
+  talker_attn:
+    flashinfer_backend: fa2
+  # ~66 pages a clone (see configs/qwen3tts_base.yaml): 2304 admit 34 and fit an
+  # 80 GB GPU beside the other two workers. Raise it on a larger GPU (4608 admit 69).
+  talker_kv:
+    max_num_pages: 2304
+  codec_state:
+    max_slots: 512
+node_groups:
+  - node_names: [Talker]
+    ranks: [0]
+    graph_walks: [talker_prefill, talker_prefill_clone, talker_decode]
+  - node_names: [Codec]
+    ranks: [1]
+    graph_walks: [codec_chunk]
+  - node_names: [RefEncoder]
+    ranks: [2]
+    graph_walks: [talker_prefill_clone]
+rank_devices: {1: 0, 2: 0}
+mps: true
+knobs:
+  gc_gen0_threshold: 10000

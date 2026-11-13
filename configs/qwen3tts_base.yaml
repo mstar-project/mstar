@@ -1,15 +1,34 @@
 # Qwen3-TTS-12Hz-1.7B-Base: zero-shot voice clone from reference audio (speaker encoder + optional ICL)
-# Same Talker/Codec graph and resources as the 0.6B deployment
-# (configs/qwen3tts.yaml) plus the RefEncoder node, which turns the request's
+# Same Talker/Codec graph as the 0.6B deployment (configs/qwen3tts.yaml)
+# plus the RefEncoder node, which turns the request's
 # reference clip into the x-vector and codec frames the clone prefill needs.
+# Every node on one worker, on any GPU. On NVIDIA, configs/qwen3tts_base_split.yaml
+# (a worker per node under MPS) serves more audio a second from c=8 up; see docs/models.rst.
 # KV geometry is identical across sizes (28 layers, 8 KV heads, head_dim 128).
+# The codec dtype, codec slots and gc threshold are configs/qwen3tts_1p7b.yaml's (same codec).
 model: "qwen3_tts_base"
 max_seq_len: 32768
+model_kwargs:
+  codec_dtype: bfloat16
+  # First audio after one frame, then steady chunks of 16 frames (sglang-omni's schedule)
+  codec_chunk_schedule: [1, 2, 4]
+  codec_chunk_frames: 16
 # The supported deployment image cannot build FlashInfer's Hopper FA3 JIT
 # kernels yet. Keep the model default on "auto" and pin this deployment to FA2.
 resources:
   talker_attn:
     flashinfer_backend: fa2
+  # Every request reserves its whole KV footprint at admission: a streamed one
+  # can't pause (unpausable_outputs, see docs/serving.rst), and none can be
+  # rebuilt after a drop (its prompt is rows, not ids) with no host pool. That is
+  # its prompt plus the default length (the checkpoint's 8192 frames), about 66
+  # pages of 128 tokens. 2304 pages (~34 GB) admit 34 clones at once and fit an
+  # 80 GB GPU; past that the rest wait at admission. Raise it on a larger GPU
+  # (4608 admit 69).
+  talker_kv:
+    max_num_pages: 2304
+  codec_state:
+    max_slots: 512
 node_groups:
   - node_names: [RefEncoder, Talker]
     ranks: [0]
@@ -17,3 +36,5 @@ node_groups:
   - node_names: [Codec]
     ranks: [0]
     graph_walks: [codec_chunk]
+knobs:
+  gc_gen0_threshold: 10000
