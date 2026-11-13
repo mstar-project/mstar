@@ -55,6 +55,7 @@ from mstar.observability.recorders import EdgeTransfers
 from mstar.testing_utils.worker import make_scheduler, make_worker, preempting
 from mstar.worker.host_pool import HostPool
 from mstar.worker.micro_scheduler import MicroScheduler, ScheduledBatch
+from mstar.worker.preemption import Preemption
 from mstar.worker.rebuild import KeptIds, LayoutRow, Prefilling, Rebuilds, RowRecord, policies_run_here
 from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker_metrics import PreemptionCounts
@@ -92,7 +93,7 @@ def _worker(kv):
         drop_refusal=lambda node, rid, tokens: kv.check_drop(rid, tokens), drop_request=drop_request,
         offload_request=lambda node, rid: _offload(kv, rid),
         readmit_request=lambda node, rid: _runner(kv).readmit(rid, node),
-        newer_than=lambda rid: _runner(kv).newer_than(rid),
+        newer_than=lambda rid: _runner(kv).newer_than(rid), older_than=lambda rid: _runner(kv).older_than(rid),
         refusals=lambda: _runner(kv).refusals(),
         paged_kv_caches=lambda: [PagedKVCache("kv", frozenset({NODE}), kv)],
         admit_request=lambda node, rid, info: _runner(kv).admit_request(rid, node, info.graph_walk),
@@ -286,6 +287,32 @@ def test_a_move_in_a_pool_whose_nodes_keep_no_log_still_lets_the_next_move_again
     )
 
 
+def test_a_pool_where_no_move_can_take_back_lends_nothing():
+    """NODE rebuilds nothing and the pool isn't its only one, so the worker moves nothing for it. A guaranteed request
+    short of a page it lent then fell to offload-and-hold, and its stream waited for the borrower to finish."""
+    kv = _pool()
+    kv._cpu_pool = host._HostPool(64)
+    cross = PagedKVCache("cross", frozenset({NODE}), _pool())
+    engine = _Engine(paged_kv_caches=lambda: [PagedKVCache("kv", frozenset({NODE}), kv), cross])
+    Preemption(SimpleNamespace(engine=engine), Rebuilds({}, _graphs()), None, None, None, str)
+    _running(kv, "g", 1, arrival=0, guaranteed=True)
+    _running(kv, "o", 3, arrival=1, decodes=8 * PAGE_SIZE)
+    _request(kv, "g2", 1, arrival=2, guaranteed=True)
+
+    assert not _step(kv, "o", 5 * PAGE_SIZE).ok, "o borrowed what g lent, which no move can take back"
+    assert not _ready(kv, "g2"), "g2 was admitted against what moving o would free, which no move can"
+
+
+def test_whether_a_pool_moves_requests_cant_change_once_one_is_admitted():
+    """g's allotment lends by whether the pool moves requests. Changing that after g was admitted left the count of
+    what guaranteed requests lend at the old answer."""
+    kv = _pool()
+    _running(kv, "g", 1, arrival=0, guaranteed=True)
+
+    with pytest.raises(AssertionError, match="whether the worker moves requests changed after guaranteed"):
+        kv.moves = False
+
+
 def test_a_request_that_can_only_wait_waits_and_is_logged(caplog):
     with caplog.at_level(logging.WARNING, logger="mstar.worker.admission"):
         kv, w = _preempting("nothing to drop")
@@ -363,8 +390,7 @@ def test_a_victim_whose_rebuild_wouldnt_write_what_its_kv_holds_isnt_chosen(why)
     assert kv.residency("r") is Residency.RESIDENT and _returns(kv) == ["r"], "r didn't wait for room beside v"
 
 
-@pytest.mark.parametrize("guaranteed", [False, True])
-def test_an_older_request_that_asks_after_a_newer_one_parks_moves_it(guaranteed):
+def test_an_older_request_that_asks_after_a_newer_one_parks_moves_it():
     """z ran short with nothing newer to move and, the host too full to take it, waits holding its pages. p, older,
     asks only afterwards, as a request held in an encoder does, and doesn't fit. z runs no step that could run short
     again, so nothing moved it and both waited for good."""
@@ -376,8 +402,7 @@ def test_an_older_request_that_asks_after_a_newer_one_parks_moves_it(guaranteed)
     _running(kv, "z", 6, arrival=3)
     assert _preempt(kv, "z", _short(kv, "z"), droppable=lambda rid: False).waits
     _runner(kv).readmit("z", NODE)
-    # either way p asks for 5 pages, a guaranteed p for its prompt page and 4 of decode
-    _request(kv, "p", 1 if guaranteed else 5, arrival=2, guaranteed=guaranteed)
+    _request(kv, "p", 5, arrival=2)
     assert not _ready(kv, "p") and not _admitted(kv, "z")
     _remove(kv, "x")
     w = _worker(kv)
@@ -385,6 +410,29 @@ def test_an_older_request_that_asks_after_a_newer_one_parks_moves_it(guaranteed)
     w.preemption.make_room()
 
     assert kv.is_offloaded("z") and _ready(kv, "p"), "z, newer and waiting, kept the pages p needs"
+
+
+def test_an_older_guaranteed_request_that_asks_after_a_newer_one_parks_takes_back_its_pages():
+    """z ran short with nothing newer to move and, the host too full to take it, waits holding its pages. p, older
+    and guaranteed, asks only afterwards, as a request held in an encoder does. It is admitted against what moving
+    z frees, and its first grant moves z, so it doesn't wait for z, which runs no step that could run short."""
+    kv = _pool()
+    kv._cpu_pool = host._HostPool(8)
+    _running(kv, "x", 3, arrival=0)
+    assert kv.offload("x") == 3
+    _running(kv, "o", 4, arrival=1)
+    _running(kv, "z", 6, arrival=3)
+    assert _preempt(kv, "z", _short(kv, "z"), droppable=lambda rid: False).waits
+    _runner(kv).readmit("z", NODE)
+    _request(kv, "p", 1, arrival=2, guaranteed=True)
+    assert _ready(kv, "p") and not _admitted(kv, "z")
+    _remove(kv, "x")
+    w = _worker(kv)
+    batch = ScheduledBatch(node_name=NODE, graph_walk="decode", request_to_worker_graph={"p": 0})
+
+    w.pipeline._handle_admit_failure(batch, _refused(batch, _step(kv, "p", PAGE_SIZE).reason))
+
+    assert kv.is_offloaded("z") and _step(kv, "p", PAGE_SIZE).ok, "z, newer and waiting, kept the pages p needs"
 
 
 def test_a_request_whose_kept_ids_dont_rebuild_its_kv_waits_rather_than_dropping_itself():
@@ -829,7 +877,7 @@ def test_a_pool_whose_layout_its_rebuild_rows_cant_write_again_isnt_rebuildable(
 def test_an_older_request_waits_rather_than_moving_a_newer_guaranteed_one():
     kv = _pool()
     _running(kv, "r", 5, arrival=1)
-    _running(kv, "v", 1, arrival=2, guaranteed=True)
+    _running(kv, "v", 5, arrival=2, guaranteed=True)
     w = _worker(kv)
     batch = ScheduledBatch(node_name=NODE, graph_walk="decode", request_to_worker_graph={"r": 0})
 
@@ -838,6 +886,29 @@ def test_an_older_request_waits_rather_than_moving_a_newer_guaranteed_one():
     assert kv.residency("v") is Residency.RESIDENT and _returns(kv) == ["r"], (
         "a guaranteed request was dropped for an older page"
     )
+
+
+@pytest.mark.parametrize("r", ["moves", "can't move yet"])
+def test_a_take_back_is_counted_and_a_wait_to_take_back_is_logged_as_one(r, caplog):
+    """r, older, borrowed what g hasn't written. Nothing counted g taking it back, and when r couldn't move, g's wait
+    was logged as one for pages past its allotment, which g's pages aren't."""
+    kv = _pool()
+    _running(kv, "r", 3, arrival=1, decodes=8 * PAGE_SIZE)
+    _running(kv, "g", 1, arrival=2, guaranteed=True)
+    assert _step(kv, "r", 4 * PAGE_SIZE).ok
+    w = _worker(kv)
+    w._rebuilds._kept[NODE]["r"] = _kept(7 * PAGE_SIZE)
+    kv._streams["r"]["main"].step_in_flight = r == "can't move yet"
+    batch = ScheduledBatch(node_name=NODE, graph_walk="decode", request_to_worker_graph={"g": 0})
+
+    with caplog.at_level(logging.WARNING, logger="mstar.worker.admission"):
+        w.pipeline._handle_admit_failure(batch, _refused(batch, _step(kv, "g", 4 * PAGE_SIZE).reason))
+
+    counts = w.preemption.counts[NODE]
+    if r == "moves":
+        assert kv.residency("r") is Residency.DROPPED and (counts.take_backs, counts.take_back_waits) == (1, 0)
+    else:
+        assert (counts.take_backs, counts.take_back_waits) == (0, 1) and "g waits for 4 pages it lent" in caplog.text
 
 
 def test_a_tp_nodes_victim_drops_in_the_call_that_chose_it_and_a_pass_without_a_step_still_sends_the_drop():
