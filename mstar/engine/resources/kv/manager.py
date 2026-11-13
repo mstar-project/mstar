@@ -3805,8 +3805,6 @@ class KVManager(AttentionResource):
         whose bytes differ in rounding."""
         import hashlib
 
-        from mstar.engine.resources.base import tensor_digest
-
         out = {}
         with self._lock:
             for label, stream in (self._streams.get(rid) or {}).items():
@@ -3816,10 +3814,25 @@ class KVManager(AttentionResource):
                 private = stream.pages()[len(keys):]
                 if private:
                     pages = torch.tensor(private, dtype=torch.long, device=self.kv_cache.tensor.device)
-                    out[f"kv/{label}"] = tensor_digest(self.kv_cache.tensor.index_select(1, pages))
+                    out[f"kv/{label}"] = self._pages_digest(self.kv_cache.tensor, pages)
                 out[f"kv/{label}/keys"] = hashlib.blake2b(b"".join(keys), digest_size=16).digest()
                 out[f"kv/{label}/len"] = f"{stream.stored_len}:{stream.position}".encode()
         return out
+
+    @staticmethod
+    def _pages_digest(storage: torch.Tensor, pages: torch.Tensor) -> torch.Tensor:
+        """The digest of ``storage.index_select(1, pages)``, a layer's pages at a time, so a
+        fingerprint holds one layer's copy of them rather than every layer's: the same digest,
+        since the words go in in the same order."""
+        from mstar.engine.resources.base import TensorDigest, tensor_digest
+
+        layer_bytes = pages.numel() * storage[0, 0].numel() * storage.element_size()
+        if layer_bytes % 4:
+            return tensor_digest(storage.index_select(1, pages))
+        digest = TensorDigest(storage.device)
+        for layer in storage:
+            digest.add(layer.index_select(0, pages))
+        return digest.value()
 
     def _offload_keys(self, stream: CacheStream) -> list:
         """The prefix keys of ``stream``'s leading pages that an offload files with it, and its reload

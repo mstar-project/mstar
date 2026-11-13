@@ -803,16 +803,57 @@ def build_resource(spec: NodeResourceSpec, info: EngineResourceInfo) -> Resource
     return resource
 
 
-def tensor_digest(t: torch.Tensor) -> torch.Tensor:
+# 32-bit words a digest folds at a time: its int64 scratch (the words and their weights, the
+# product taken in place) is then about 16 MiB however large the tensor is
+DIGEST_CHUNK = 1 << 20
+
+
+class TensorDigest:
+    """`tensor_digest`'s two sums, fed the words in order a piece at a time, so a
+    digest of many pages never holds more than one piece and one chunk's int64
+    scratch. The sums wrap in int64, which makes them independent of how the words
+    are split; the weight of each word comes from its index in the whole sequence,
+    counted on the host, so every rank folds the same words to the same digest."""
+
+    def __init__(self, device: torch.device, chunk: int = DIGEST_CHUNK):
+        self._sums = torch.zeros(2, dtype=torch.int64, device=device)
+        self._chunk = chunk
+        self._at = 0
+
+    def add(self, t: torch.Tensor) -> None:
+        """The words of ``t``'s bytes, after those added before. Each piece must be
+        whole 32-bit words for its split to keep the whole sequence's digest."""
+        flat = t.detach().reshape(-1).contiguous()
+        if flat.numel() * flat.element_size() % 4:
+            raise ValueError(f"a digest piece of {flat.numel() * flat.element_size()} bytes isn't whole 32-bit words")
+        self._add_words(flat.view(torch.int32))
+
+    def _add_words(self, words: torch.Tensor) -> None:
+        for start in range(0, words.numel(), self._chunk):
+            part = words[start:start + self._chunk].to(torch.int64)
+            weights = torch.arange(self._at + 1, self._at + part.numel() + 1, device=part.device, dtype=torch.int64)
+            weights.remainder_(65521).add_(1)
+            weights.mul_(part)
+            self._sums[0] += part.sum()
+            self._sums[1] += weights.sum()
+            self._at += part.numel()
+
+    def value(self) -> torch.Tensor:
+        return self._sums.clone()
+
+
+def tensor_digest(t: torch.Tensor, chunk: int = DIGEST_CHUNK) -> torch.Tensor:
     """A digest of ``t``'s bytes (`Resource.debug_fingerprint`), computed and kept where
     ``t`` lives: its 32-bit words summed plain and position-weighted, in wrapping int64,
-    as a ``[2]`` tensor. Nothing reaches the host: the engine compares two on the device
-    (`Engine._check_reload_prints`)."""
+    as a ``[2]`` tensor, folded ``chunk`` words at a time (`TensorDigest`). Nothing
+    reaches the host: the engine compares two on the device (`Engine._check_reload_prints`)."""
     flat = t.detach().reshape(-1).contiguous()
-    words = flat.view(torch.int32) if flat.numel() * flat.element_size() % 4 == 0 else flat.view(torch.uint8)
-    words = words.to(torch.int64)
-    weights = torch.arange(1, words.numel() + 1, device=words.device, dtype=torch.int64) % 65521 + 1
-    return torch.stack([words.sum(), (words * weights).sum()])
+    digest = TensorDigest(flat.device, chunk)
+    if flat.numel() * flat.element_size() % 4:
+        digest._add_words(flat.view(torch.uint8))
+    else:
+        digest._add_words(flat.view(torch.int32))
+    return digest.value()
 
 
 def same_fingerprint(a: Mapping, b: Mapping) -> bool:
