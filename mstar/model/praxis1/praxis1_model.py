@@ -227,15 +227,59 @@ class Praxis1Model(Model):
             self.CHUNK_WALK: Sequential([vae_encoder, denoise_loop, action_head]),
         }
 
-    def get_node_resources(self) -> list[NodeResourceSpec]:
-        """No KV cache and no sampler.
+    def declare_state(self) -> list:
+        """Nothing crosses a step yet, so nothing is declared yet.
 
-        Nothing here decodes tokens: the backbone re-reads its whole window
-        every step, the expert's attention is over one chunk, and the actions
-        come from flow matching rather than from sampling. The context a
-        session keeps between calls is the executed chunks' latents, which
-        ride the request as the client's frame stack rather than living in a
-        cache the engine owns.
+        The denoise loop carries the video and action latents on its own
+        loop-back edges, as Wan2.2's UniPC state does, and those are ordinary
+        tensors rather than state the engine admits. The text embeddings
+        persist for the episode on ``persist`` edges at the conductor, which
+        is a signal's lifetime and not a resource either.
+
+        The one thing that will be declared state is the context cache: the
+        backbone's K/V held across the Euler steps of one call, which the
+        reference keeps in a per-request ``ctx`` and splices each step. It
+        lands with the step that uses it rather than here, because a
+        declaration the nodes do not yet read would be a shape nothing
+        checks.
+        """
+        return []
+
+    def get_node_resources(self) -> list[NodeResourceSpec]:
+        """No KV cache and no sampler, and no attention resource that fits.
+
+        Nothing here decodes tokens, and the actions come from flow matching
+        rather than from sampling, so there is no sampler. The resource pass
+        on the attention is the part worth writing down, because the answer
+        is that the engine cannot express this mask today.
+
+        The encoder's rule, read off the reference's packed predicate
+        ``(k == q) | (k == 0) | ((k & 1 == 1) & (k <= hi(q)))`` with the
+        codes clean ``2c+1``, noised ``2c+2`` and global ``0``:
+
+        * every token attends the globals (registers, anchor, text), and a
+          global attends nothing else,
+        * a noised token attends the noised tokens of its own chunk, and of
+          no other chunk, bidirectionally within it,
+        * a noised token also attends the clean tokens of strictly earlier
+          chunks,
+        * a clean token attends the clean tokens of its own and earlier
+          chunks, and never a noised one.
+
+        So the clean stream is block-causal, the noised stream is block
+        *diagonal*, and both sit behind a global prefix that everything
+        reads. ``BlockCausalAttentionSpec`` carries a ``block_size`` and
+        nothing else: it expresses the clean stream alone, with no prefix
+        span and no diagonal mode, and a noised query under it would attend
+        earlier chunks' noised tokens, which the checkpoint never saw.
+        ``RaggedAttentionSpec`` drops the structure entirely.
+
+        Declaring the nearest kind and living with the difference would be a
+        different model, so this returns nothing and the trunk's attention
+        runs in the node until the gap is closed. Closing it means either a
+        prefix span and a diagonal mode on the block-causal kind, or a kind
+        of its own under ``mstar/engine/resources/attn/``; that is its own
+        change, and it is the one this series owes the engine.
         """
         return []
 
