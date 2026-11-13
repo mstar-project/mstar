@@ -137,6 +137,9 @@ class FrameWindow(Mask):
     """Frames are runs of ``tokens`` entries, and q is in frame f = q // ``tokens``. Sees every entry of frame f, and of
     each earlier frame g with f - g < ``frames`` and g a multiple of ``stride``."""
 
+    uses_query_position = True
+    sees_step_whole = True
+
     tokens: int
     _: KW_ONLY
     frames: int
