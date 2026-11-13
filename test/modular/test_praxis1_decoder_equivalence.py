@@ -134,3 +134,28 @@ def test_decoder_rejects_wrong_conditioning_grid():
     cond = torch.zeros(1, 2, 4, 6, 64)
     with pytest.raises(ValueError, match="conditioning shape"):
         port.forward_chunk_causal(noised, cond, torch.zeros(1, 1))
+
+
+def test_decoder_layer_attention_callback_matches_reference_mask():
+    _, port = _pair(torch.float32)
+    gen = torch.Generator().manual_seed(37)
+    noised = torch.randn((1, 32, 4, 2, 3), generator=gen)
+    cond = torch.randn((1, 4, 2, 3, 64), generator=gen)
+    timesteps = torch.tensor([[0.2, 0.7]])
+    mask = port_dec.visible(port_dec.encoder_codes(4, 0, 0, 48, 2, 0))
+    layers = []
+
+    def for_layer(layer):
+        layers.append(layer)
+
+        def attend(q, k, v, supplied_mask):
+            assert supplied_mask is None
+            return port_dec.sdpa_attend(q, k, v, mask)
+
+        return attend
+
+    with torch.no_grad():
+        expected = port.forward_chunk_causal(noised, cond, timesteps, mask=mask)
+        actual = port.forward_chunk_causal(noised, cond, timesteps, attend_for_layer=for_layer)
+    assert layers == [0, 1, 2, 3]
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)

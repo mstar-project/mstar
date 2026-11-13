@@ -92,6 +92,7 @@ class DecoderTower(nn.Module):
         rope_shift: int = 0,
         mask: torch.Tensor | None = None,
         attend: Callable = sdpa_attend,
+        attend_for_layer: Callable[[int], Callable] | None = None,
     ) -> torch.Tensor:
         """Predict velocity for ``K`` chunks; ``cond`` is the encoder grid.
 
@@ -132,10 +133,13 @@ class DecoderTower(nn.Module):
             .unsqueeze(0)
             .to(x.device)
         )
-        if mask is None:
+        if mask is None and attend_for_layer is None:
             codes = encoder_codes(n_reg, 0, 0, chunk_tokens, kk, 0)
             mask = visible(codes).to(x.device)
-        out, _ = self.core(x, positions, mask=mask, attend=attend, x_mod=x_mod)
+        out, _ = self.core(
+            x, positions, mask=mask, attend=attend, x_mod=x_mod,
+            attend_for_layer=attend_for_layer,
+        )
         if self.positive_zero_residual_add:
             out = out + 0.0
         v = self.output_projections[VIDEO](out.narrow(1, n_reg, flat.size(1)))
