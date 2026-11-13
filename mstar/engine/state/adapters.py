@@ -1296,7 +1296,8 @@ class PagedArrayHandle(ArrayHandle):
         self._combined = bool(combined)
         if combined:
             self.label = next(iter(combined.values()))
-        if not self._windowed or not self._segments or step.ctx.replays:
+        # A capture's padding rows open with no layout, so each reaches only the span it adds.
+        if not self._windowed or not self._segments or step.ctx.replays or step.ctx.capture:
             return
         placeholders = step.state[self.name].placeholders
         for view in self._kv.views(self.label):
