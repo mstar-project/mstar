@@ -905,28 +905,21 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         windowed = md.get("window_mode") is not None
         if windowed and md.get("session_id"):
             self._begin_session(fwd_info, md)
+        if not windowed:
+            # built here, so that the request's denoise steps only look them up
+            self._memoized(md, device)
         return self._get_prefill_node_inputs(cond_ids, uncond_ids, device, windowed=windowed)
 
     def _settings(self, md: dict, step_index: int, inputs, device) -> dict:
         """A generation request's settings for one step: what its step metadata says, its statics and sampler from
         the memo, and what its inputs carry, such as the latents it pins. A windowed request's are its window's."""
-        height, width = int(md.get("height", 256)), int(md.get("width", 256))
-        fps = float(md.get("fps", 24.0))
-        steps = int(md.get("num_inference_steps", self.config.num_inference_steps))
-        cond_len, uncond_len = md[PROMPT_LENGTHS]
-        ids = ([0] * cond_len, [0] * uncond_len if _has_guidance(md) else None)
-        st = {
-            "gs": float(md.get("guidance_scale", 6.0)),
-            "guidance_interval": md.get("guidance_interval"),
-            "scheduler": self._sampler(steps, md.get("flow_shift"), md.get("use_karras_sigma"), device),
-        }
+        st = {"gs": float(md.get("guidance_scale", 6.0)), "guidance_interval": md.get("guidance_interval")}
         if md.get("window_mode") is not None:
+            height, width, fps, steps, ids = self._shape(md)
+            st["scheduler"] = self._sampler(steps, md.get("flow_shift"), md.get("use_karras_sigma"), device)
             st.update(self._window_settings(md, *ids, height, width, fps, steps, step_index, inputs, device))
             return st
-        if md.get("action_mode"):
-            st.update(self._action_settings(md, *ids, height, width, fps, device))
-        else:
-            st.update(self._clip_settings(md, *ids, height, width, fps, device))
+        st.update(self._memoized(md, device))
         self._ingest_cond_latents(st, inputs, device)
         if self.config.distilled_sigmas and st.get("cond_latents") is not None:
             # The distilled SDE step re-noises every position from the request's
@@ -937,6 +930,24 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             cond_video[:, :, 0] = st["cond_latents"][:, :, 0].to(LATENT_DTYPE)
             st["cond_video_latents"] = cond_video
         return st
+
+    def _shape(self, md: dict) -> tuple:
+        """A request's height, width, fps and step count, and stand-ins of its prompts' lengths for its statics."""
+        cond_len, uncond_len = md[PROMPT_LENGTHS]
+        return (
+            int(md.get("height", 256)), int(md.get("width", 256)), float(md.get("fps", 24.0)),
+            int(md.get("num_inference_steps", self.config.num_inference_steps)),
+            ([0] * cond_len, [0] * uncond_len if _has_guidance(md) else None),
+        )
+
+    def _memoized(self, md: dict, device) -> dict:
+        """What a request that isn't windowed takes from the memo: its sampler, and its statics and masks."""
+        height, width, fps, steps, ids = self._shape(md)
+        settings = self._action_settings if md.get("action_mode") else self._clip_settings
+        return {
+            "scheduler": self._sampler(steps, md.get("flow_shift"), md.get("use_karras_sigma"), device),
+            **settings(md, *ids, height, width, fps, device),
+        }
 
     def _clip_settings(self, md, cond_ids, uncond_ids, height, width, fps, device) -> dict:
         num_frames = int(md.get("num_frames", 1))
