@@ -15,6 +15,9 @@ model_kwargs:
   text_cache_entries: 16
   # the decoder's blocks compiled per tile batch (56-58 dB from eager; -0.13 s at 2048² on 2 H200s)
   vae_compile: true
+  # a 1024² step replays a CUDA graph (one per 256 prompt rows up to 512): eager, its ~3,400
+  # launches took longer to issue than the two GPUs took to run them
+  capture_sizes: [[1024, 1024]]
 
 node_groups:
   - node_names: [dit, vae_decoder]
