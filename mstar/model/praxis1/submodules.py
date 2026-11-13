@@ -377,6 +377,10 @@ class Praxis1BackboneSubmodule(_Praxis1Node):
     so nothing holds a step's hidden states past the step.
     """
 
+    # The reference uses the checkpoint dtype directly and widens the MoE
+    # router GEMM to float32. Autocast would narrow that GEMM again.
+    disable_autocast = True
+
     def __init__(self, config: Praxis1Config, backbone: nn.Module, *, episode_text: bool = False,
                  attention_resources: bool = True) -> None:
         super().__init__(config)
@@ -576,6 +580,8 @@ class Praxis1BackboneSubmodule(_Praxis1Node):
 
 class Praxis1ActionExpertSubmodule(_Praxis1Node):
     """One Euler step of the action expert, over the backbone's taps."""
+
+    disable_autocast = True
 
     def __init__(self, config: Praxis1Config, expert: nn.Module) -> None:
         super().__init__(config)

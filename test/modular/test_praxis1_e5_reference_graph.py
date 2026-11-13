@@ -10,6 +10,8 @@ from praxis.model import SamplerSettings
 from tests.tiny_model import tiny_policy
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.engine.accelerator_graph_runner import autocast_scope
+from mstar.engine.node_dtype import resolve_node_dtype
 from mstar.engine.resources.attn.ragged.expert_mask import cross_visibility, self_visibility
 from mstar.engine.state import ExpertCross, ExpertCrossLayout, ExpertSelf, ExpertSelfLayout
 from mstar.model.praxis1.components.chunk_mask import encoder_codes, visible
@@ -58,17 +60,20 @@ class _DenseReferenceHandle:
 
 
 @pytest.mark.parametrize("k", [1, 2])
-def test_real_tower_graph_nodes_match_reference_cold_and_warm(k: int, monkeypatch) -> None:
+@pytest.mark.parametrize("engine_autocast", [False, True])
+def test_real_tower_graph_nodes_match_reference_cold_and_warm(
+    k: int, engine_autocast: bool, monkeypatch,
+) -> None:
     monkeypatch.setattr(L, "_compiled_flex_attention", _eager_reference_flex)
     previous_threads = torch.get_num_threads()
     torch.set_num_threads(1)
     try:
-        _run_case(k)
+        _run_case(k, engine_autocast)
     finally:
         torch.set_num_threads(previous_threads)
 
 
-def _run_case(k: int) -> None:
+def _run_case(k: int, engine_autocast: bool) -> None:
     _, c = _tiny_config()
     ref = tiny_policy(seed=7, dtype=torch.float32).eval()
     portb = build_backbone(c).eval()
@@ -149,11 +154,15 @@ def _run_case(k: int) -> None:
             if clean is not None:
                 inp.update(anchor_latents=[anchor], clean_latents=[clean])
             prepared = bn.prepare_inputs("chunk", info, inp)
-            out = bn.forward("chunk", None, **prepared.tensor_inputs, **prepared.kwargs)
+            dtype = resolve_node_dtype(bn, torch.bfloat16) if engine_autocast else None
+            with autocast_scope(dtype, "cpu", "backbone"):
+                out = bn.forward("chunk", None, **prepared.tensor_inputs, **prepared.kwargs)
             ein = {**out, "proprio": [pro[:, -1:]]}
             if clean is not None:
                 ein["proprio_all"] = [pro]
             prepared = en.prepare_inputs("chunk", info, ein)
-            state = en.forward("chunk", None, **prepared.tensor_inputs, **prepared.kwargs)
+            dtype = resolve_node_dtype(en, torch.bfloat16) if engine_autocast else None
+            with autocast_scope(dtype, "cpu", "action_expert"):
+                state = en.forward("chunk", None, **prepared.tensor_inputs, **prepared.kwargs)
     assert torch.equal(state["video_latents"][0], vr)
     assert torch.equal(state["action_latents"][0], ar)
