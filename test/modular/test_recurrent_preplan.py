@@ -336,3 +336,50 @@ def test_reused_addressing_matches_a_fresh_build():
     # a zero-span row addresses the sink
     zero = RecurrentStep(segments=(Segment("d", "main", 0), Segment("b", "main", 1), Segment("c", "main", 1)))
     assert check(rids, zero)[0][0] == pool.pad_index
+
+
+def test_a_step_addressed_like_the_last_stages_nothing():
+    """An eager decode step addressed like the last one finds the buffers as that step's staging left them, so it
+    takes that addressing whole: no host arrays, no copies. A slot's state changing stages again."""
+    pool = build_pool()
+    pool.ingest_request("a")
+    rids = ["a"]
+    pool.admit(decode_step(rids), ctx(rids))
+    first = pool.plan(decode_step(rids), ctx(rids))["main"]
+
+    assert pool.plan(decode_step(rids), ctx(rids))["main"] is first, "a steady step staged its addressing again"
+
+    pool.commit(decode_step(rids), ctx(rids))  # state now held
+    after = pool.plan(decode_step(rids), ctx(rids))["main"]
+    assert after is not first and after.host_has_state == [True], "the staged addressing outlived the slot's state"
+    assert after.has_state[:1].tolist() == [True], "the buffer kept the earlier step's has_state"
+
+
+def test_a_step_stages_again_after_another_steps_staging():
+    """The buffers are one per label, so a step with other rows in between leaves them holding its own addressing."""
+    pool = build_pool()
+    for rid in "ab":
+        pool.ingest_request(rid)
+    pool.admit(decode_step(["a", "b"]), ctx(["a", "b"]))
+    slots = {rid: pool._slots[rid]["main"].index for rid in "ab"}
+
+    pool.plan(decode_step(["a"]), ctx(["a"]))
+    pool.plan(decode_step(["b"]), ctx(["b"]))
+    again = pool.plan(decode_step(["a"]), ctx(["a"]))["main"]
+
+    assert again.slot_indices[:1].tolist() == [slots["a"]], "a's step read the buffer b's step staged"
+
+
+def test_a_reused_addressing_keeps_no_captures_scatter_index():
+    """`scatter_` keeps its int64 index on the addressing, and a capture has to record its own cast of it, which
+    a replay then recomputes from that replay's plan."""
+    pool = build_pool()
+    pool.ingest_request("a")
+    rids = ["a"]
+    pool.admit(decode_step(rids), ctx(rids))
+    first = pool.plan(decode_step(rids), ctx(rids))["main"]
+    first.scatter_index[True] = first.slot_indices[:1].long()
+
+    again = pool.plan(decode_step(rids), ctx(rids))["main"]
+
+    assert again is first and True not in again.scatter_index, "a later capture would bake in this index"
