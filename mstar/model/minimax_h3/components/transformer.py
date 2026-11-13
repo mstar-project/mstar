@@ -10,6 +10,9 @@ Where it differs from the reference without changing the numbers:
   Here a step carries ``(video, audio, keyframe)`` and a row picks its own by class, so
   the table's shape is the same every step.
 * Under Ulysses SP each rank holds all the weights and ``1/P`` of the rows.
+* A sampler whose steps sit on a fixed grid can hand ``forward`` each step's AdaLN rows,
+  computed once from the grid (:meth:`H3DiT.step_modulation`): the same GEMMs on the same
+  timesteps, run once a process rather than once a step.
 """
 
 from __future__ import annotations
@@ -185,10 +188,13 @@ class H3Block(nn.Module):
         mods = linear(F.silu(temb).to(linear.weight.dtype))
         return mods.view(batch, -1, 6, self.hidden_size)
 
-    def forward(self, x: torch.Tensor, temb: torch.Tensor, row_index: torch.Tensor, rope: RopeTable) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, temb: torch.Tensor | None, row_index: torch.Tensor, rope: RopeTable,
+                table: torch.Tensor | None = None, step: torch.Tensor | None = None) -> torch.Tensor:
         """``x`` ``[B, S, hidden]``; ``row_index`` ``[S]`` selects each row's table entry
-        (``timestep * 3 + tag``)."""
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.modulation(temb, x.shape[0]).unbind(2)
+        (``timestep * 3 + tag``). With ``table`` (``[steps, n * 3, 6, hidden]``, one request)
+        the step's modulation is its row ``step`` (``[1]``) rather than computed from ``temb``."""
+        mods = self.modulation(temb, x.shape[0]) if table is None else table.index_select(0, step)
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = mods.unbind(2)
 
         def rows(term: torch.Tensor) -> torch.Tensor:
             # [B, n * 3, hidden] -> [B, S, hidden] where it is used, so a compiled block carries
@@ -265,10 +271,16 @@ class H3FinalLayer(nn.Module):
             self.video_out = StepHeads(cfg.num_output_heads, cfg.hidden_size, cfg.patch_dim)
         self.audio_out = nn.Linear(cfg.hidden_size, cfg.audio_latents_dim) if cfg.audio_enabled else None
 
-    def forward(self, x: torch.Tensor, temb: torch.Tensor, row_class: torch.Tensor) -> torch.Tensor:
-        """``[B, S, hidden]`` -> the normed, modulated rows in the heads' dtype."""
+    def modulation(self, temb: torch.Tensor, batch: int) -> torch.Tensor:
+        """``[B, n, 2, hidden]``: per timestep, the ``shift, scale`` of the output norm."""
         linear = self.adaln_proj.linear
-        mods = linear(F.silu(temb).to(linear.weight.dtype)).view(x.shape[0], -1, 2, self.hidden_size)
+        return linear(F.silu(temb).to(linear.weight.dtype)).view(batch, -1, 2, self.hidden_size)
+
+    def forward(self, x: torch.Tensor, temb: torch.Tensor | None, row_class: torch.Tensor,
+                table: torch.Tensor | None = None, step: torch.Tensor | None = None) -> torch.Tensor:
+        """``[B, S, hidden]`` -> the normed, modulated rows in the heads' dtype. ``table`` and
+        ``step`` as :meth:`H3Block.forward`'s."""
+        mods = self.modulation(temb, x.shape[0]) if table is None else table.index_select(0, step)
         shift, scale = mods.index_select(1, row_class).unbind(dim=2)
         h = self.norm(x) * (1.0 + scale) + shift
         return h.to(self.video_out.weight.dtype)
@@ -281,6 +293,14 @@ class H3Inputs(NamedTuple):
     audio: torch.Tensor      # [B, Na, audio_dim] fp32
     text: torch.Tensor       # [B, L, hidden] refined prompt rows
     timesteps: torch.Tensor  # [B, 3] fp32: (video, audio, keyframe) t in [0, 1], by T_* class
+
+
+class StepModulation(NamedTuple):
+    """Every step's AdaLN rows on a fixed grid of ``steps`` timestep tuples (``n`` timesteps
+    each), as :meth:`H3DiT.step_modulation` computes them."""
+
+    blocks: tuple[torch.Tensor, ...]  # per block, [steps, n * 3, 6, hidden]
+    final: torch.Tensor               # [steps, n, 2, hidden]
 
 
 class H3StepLayout(NamedTuple):
@@ -337,6 +357,18 @@ class H3DiT(nn.Module):
         """``[B, n]`` -> ``[B * n, time_embed_dim]`` fp32."""
         return self.time_embedder(timesteps.reshape(-1))
 
+    def step_modulation(self, timesteps: torch.Tensor) -> StepModulation:
+        """The AdaLN rows of each step of a grid, ``timesteps`` ``[steps, n]`` fp32 on the device:
+        each step's GEMMs run on its own ``n`` rows, the shapes a step computes them at."""
+        blocks: list[list[torch.Tensor]] = [[] for _ in self.blocks]
+        final = []
+        for row in timesteps.split(1):
+            temb = self.time_embedding(row)
+            for i, block in enumerate(self.blocks):
+                blocks[i].append(block.modulation(temb, 1))
+            final.append(self.final_layer.modulation(temb, 1))
+        return StepModulation(tuple(torch.cat(rows) for rows in blocks), torch.cat(final))
+
     def packed_rows(self, inputs: H3Inputs, layout: H3StepLayout, start: int, count: int) -> torch.Tensor:
         """Rows ``[start, start + count)`` of ``[text | keyframe rows | audio | generated video |
         padding]`` in the prompt's dtype, each modality projected over its rows there alone."""
@@ -369,7 +401,8 @@ class H3DiT(nn.Module):
 
     def forward(
         self, inputs: H3Inputs, layout: H3StepLayout, row_class: torch.Tensor | None = None, shard=None,
-        head: torch.Tensor | None = None,
+        head: torch.Tensor | None = None, modulation: StepModulation | None = None,
+        step: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """``inputs.timesteps`` is ``[B, n]``: one timestep per class ``layout.row_class``
         indexes (H3: video, audio, keyframe), or ``[B, 1]`` when all are one value: the
@@ -379,8 +412,10 @@ class H3DiT(nn.Module):
         sees a padding row. ``shard``: the node's sequence shard's handle, which on a step it
         splits gives this rank a contiguous range of the packed rows: only those are built and
         run, and the attention's resource exchanges them. ``head`` (``[1]``) picks the step's
-        video head when the model has one per step. The audio velocity is None for a model
-        without audio."""
+        video head when the model has one per step. ``modulation`` (one request, ``B = 1``): the
+        grid's AdaLN rows (:meth:`step_modulation`), of which the step takes row ``step``
+        (``[1]``) in place of embedding ``inputs.timesteps``. The audio velocity is None for a
+        model without audio."""
         cond, pad = layout.num_condition_rows, layout.num_pad_rows
         split = None if shard is None else split_range(shard)
         start, count = (0, layout.num_rows) if split is None else (split.start, split.count)
@@ -396,10 +431,17 @@ class H3DiT(nn.Module):
         if split is not None:
             rope = rope.rows(start, count)
             row_index, row_class = scatter(shard, row_index, row_class, dim=0)
-        temb = self.time_embedding(inputs.timesteps)
-        for block in self.blocks:
-            x = block(x, temb, row_index, rope)
-        h = self.final_layer(x, temb, row_class)
+        if modulation is None:
+            temb = self.time_embedding(inputs.timesteps)
+            for block in self.blocks:
+                x = block(x, temb, row_index, rope)
+            h = self.final_layer(x, temb, row_class)
+        else:
+            if x.shape[0] != 1:
+                raise ValueError(f"a step's modulation rows are one request's; got a batch of {x.shape[0]}")
+            for block, table in zip(self.blocks, modulation.blocks, strict=True):
+                x = block(x, None, row_index, rope, table, step)
+            h = self.final_layer(x, None, row_class, modulation.final, step)
         final = self.final_layer
         video_out = final.video_out(h) if head is None else final.video_out(h, head)
         # the heads over this rank's rows, then the rows gathered: [B, S, patch_dim (+ audio_dim)]

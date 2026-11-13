@@ -47,6 +47,7 @@ from mstar.model.minimax_h3_image.submodules import (
     H3ImageDenoiseSubmodule,
     H3ImageSchedule,
     h3_image_schedule,
+    h3_image_step,
     layout_from_metadata,
 )
 
@@ -174,6 +175,36 @@ def test_dit_without_audio_runs_the_step_head():
         heads.weight.data, heads.bias.data = swapped
         again = dit(inputs, step, head=torch.tensor([0]))[0]
     assert torch.equal(again, outs[1]) and not torch.equal(outs[0], outs[1])
+
+
+@pytest.mark.parametrize("references", [(), ((2, 4),)], ids=["t2i", "edit"])
+def test_a_denoise_step_reads_its_grids_modulation_rows(references):
+    """The served step takes its AdaLN rows from the grid's, built once: at each step, the same
+    sample as the step that embeds its own timesteps (one, or two for an edit)."""
+    torch.manual_seed(0)
+    cfg = TINY.transformer
+    dit = H3DiT(cfg).float()
+    for p in dit.parameters():
+        torch.nn.init.normal_(p, std=0.1)
+    layout = H3ImageLayout(text_len=3, latent_height=4, latent_width=4, references=references)
+    sub = H3ImageDenoiseSubmodule(dit, TINY, loop_name="denoise_loop")
+    step_layout = sub.build_layout(layout, "cpu")
+    sched = h3_image_schedule(TINY.sigmas)
+    n = layout.num_condition_rows
+    latents = torch.randn(1, n + layout.num_video_rows, cfg.patch_dim)
+    text = torch.randn(1, 3, cfg.hidden_size)
+    for k in range(cfg.num_output_heads):
+        t, ref = sched.timesteps[k:k + 1], sched.reference_timesteps[k:k + 1]
+        sigma, sigma_next = sched.sigmas[k:k + 1].view(-1, 1, 1), sched.sigmas[k + 1:k + 2].view(-1, 1, 1)
+        timesteps = torch.stack([t, ref], dim=-1) if n else t.view(-1, 1)
+        with torch.no_grad():
+            got = sub.denoise(None, layout, latents, t, sigma, sigma_next, ref, sched.heads[k:k + 1], text,
+                              torch.tensor(False))
+            velocity, _ = dit(H3Inputs(video=latents, audio=None, text=text, timesteps=timesteps), step_layout,
+                              head=torch.tensor([k]))
+        want = h3_image_step(latents[:, n:], velocity[:, n:], sigma, sigma_next)
+        assert torch.equal(got[:, n:], want)
+    assert list(sub._modulation) == [2 if n else 1]
 
 
 def test_the_dits_attention_settings():

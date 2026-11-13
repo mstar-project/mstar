@@ -27,7 +27,7 @@ from mstar.model.components.diffusion.compile_utils import compile_blocks as com
 from mstar.model.components.diffusion.denoise_loop import StepScalar
 from mstar.model.components.diffusion.flow_match import FlowMatchSchedule
 from mstar.model.minimax_h3.components.layout import patchify_video
-from mstar.model.minimax_h3.components.transformer import H3Inputs, H3StepLayout
+from mstar.model.minimax_h3.components.transformer import H3Inputs, H3StepLayout, StepModulation
 from mstar.model.minimax_h3.components.video_vae import stitch_tiles
 from mstar.model.minimax_h3.config import PIXEL_MEAN, PIXEL_STD
 from mstar.model.minimax_h3.submodules import (
@@ -143,7 +143,11 @@ class H3ImageDenoiseSubmodule(H3PackedDenoise):
     """One step of the fixed six-step grid over H3's packed DiT, with the step's head. The
     loop carries the image rows, reference rows first, fp32; only the generated rows are
     stepped. The references arrive as noise (seed_loop_back), are noised to t = 0.999 on the
-    first step and carried unchanged after."""
+    first step and carried unchanged after.
+
+    Every request walks the same grid, so each step's AdaLN rows (13B of the DiT's weights
+    read for one or two rows) are computed once a process, for text-to-image and for edits,
+    and a step reads its own by its head, which is its index on the grid."""
 
     STEP_SCALARS = {
         "sigma": StepScalar("sigmas"),
@@ -155,6 +159,19 @@ class H3ImageDenoiseSubmodule(H3PackedDenoise):
 
     def __init__(self, transformer: nn.Module, config: H3ImageConfig, **kwargs):
         super().__init__(transformer, config, **kwargs)
+        # timesteps a step embeds (1: text-to-image; 2: an edit's, with the references') -> the grid's rows
+        self._modulation: dict[int, StepModulation] = {}
+
+    def step_modulation(self, timesteps: int, device) -> StepModulation:
+        """The grid's AdaLN rows for steps that embed ``timesteps`` timesteps, built on first use."""
+        modulation = self._modulation.get(timesteps)
+        if modulation is None:
+            schedule = h3_image_schedule(self.config.sigmas)
+            grid = schedule.timesteps.view(-1, 1)
+            if timesteps == 2:
+                grid = torch.stack([schedule.timesteps, schedule.reference_timesteps], dim=-1)
+            modulation = self._modulation[timesteps] = self.transformer.step_modulation(grid.to(device))
+        return modulation
 
     def bucket_key_for(self, fwd_info: CurrentForwardPassInfo) -> H3ImageLayout:
         return layout_from_metadata(fwd_info.step_metadata)
@@ -216,7 +233,9 @@ class H3ImageDenoiseSubmodule(H3PackedDenoise):
         # text-to-image request, then the references' 0.999 for an edit
         timesteps = torch.stack([timestep, reference_timestep], dim=-1) if n else timestep.view(-1, 1)
         inputs = H3Inputs(video=latents, audio=None, text=text_embeds, timesteps=timesteps.float())
-        velocity, _ = self.transformer(inputs, layout, shard=self.shard, head=head.long())
+        head = head.long()
+        velocity, _ = self.transformer(inputs, layout, shard=self.shard, head=head,
+                                       modulation=self.step_modulation(timesteps.shape[-1], latents.device), step=head)
         generated = h3_image_step(latents[:, n:], velocity[:, n:], sigma, sigma_next)
         return torch.cat([latents[:, :n], generated], dim=1) if n else generated
 
