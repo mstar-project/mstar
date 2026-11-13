@@ -3025,6 +3025,20 @@ def deployment_cpu_plan(config: dict) -> cpus.CpuPlan:
     return cpus.CpuPlan(plan.mask, plan.usable, why=f"not pinned: {refused}")
 
 
+def install_deployment_cpus(config: dict) -> None:
+    """Install the deployment's CPU plan for this process, and take the PM QoS
+    hold ``knobs: idle_hold: qos`` asks for. Run once, by the process that
+    starts the conductor (this server, or the Dynamo worker in its place),
+    before any pool thread: the pools are sized from the CPUs it leaves
+    unpinned."""
+    try:
+        cpus.install(deployment_cpu_plan(config))
+    except cpus.CpuPlanError as e:
+        raise SystemExit(f"mstar: {e}") from None
+    if knobs.idle_hold() == "qos":
+        logger.info(cpus.hold_idle())
+
+
 def _ws_max_size(config: dict) -> int:
     """The config's ``ws_max_message_mb``, in bytes: the largest WebSocket
     message the server reads (by default what an HTTP body may be, since one
@@ -3188,13 +3202,7 @@ def main(argv: list[str] | None = None):
         cache_dir=args.cache_dir,
         **{**model_init_kwargs(model_name), **yaml_model_kwargs},
     )
-    # before any pool thread: the pools are sized from the CPUs it leaves unpinned
-    try:
-        cpus.install(deployment_cpu_plan(config))
-    except cpus.CpuPlanError as e:
-        raise SystemExit(f"mstar: {e}") from None
-    if knobs.idle_hold() == "qos":
-        logger.info(cpus.hold_idle())
+    install_deployment_cpus(config)
     _set_preprocess_threads(model, config)
 
     global api_server
