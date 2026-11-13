@@ -186,6 +186,8 @@ class RecurrentStatePool(Resource):
         self._comm_group = comm_group
         # the resource key, for errors
         self._name = name
+        # the start `set_start` gave, by block and layer, or None before it is called
+        self._start: dict[tuple[str, int | None], torch.Tensor] | None = None
 
         # One [num_layers, max_slots + prefix_slots, *shape] tensor per block. Layer-major so
         # `blocks[name][layer]` is contiguous: FlashInfer's pool paths assert
@@ -315,18 +317,26 @@ class RecurrentStatePool(Resource):
         for name, tensor in self._blocks.items():
             yield tensor[:, index] if self.config.blocks[name].per_layer else tensor[index]
 
+    def set_start(self, start: Mapping[tuple[str, int | None], torch.Tensor]) -> None:
+        """What `gather` reads for a row with no saved state, by block and layer, each in the block's layout and
+        dtype. A block or layer it doesn't name reads zeros."""
+        if self._start is None:
+            self._start = dict(start)
+        elif start.keys() != self._start.keys() or not all(torch.equal(self._start[k], v) for k, v in start.items()):
+            raise ValueError(f"recurrent pool {self._name!r}: a start that differs from the one it holds, which every "
+                             "row of the pool reads")
+
     def gather(
         self, name: str, layer_idx: int | None = 0, *, label: str = "main",
-        start: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Block ``name`` of this step's rows under ``label``, ``[rows, *shape]``
         (a copy), in the order the step declared them.
 
         It addresses rows through the step's plan, so a captured and an eager
         forward read the same slots. A row with no saved state (a request's
-        first step, or a padding row on the sink) reads ``start``, zeros when
-        none is given. A row must declare span >= 1 to reach its own slot; a
-        zero-span row addresses the sink, so it reads ``start``. A resident
+        first step, or a padding row on the sink) reads the start, zeros when
+        none is set. A row must declare span >= 1 to reach its own slot; a
+        zero-span row addresses the sink, so it reads the start. A resident
         step's graph reads every row's slot instead (`resident_gather`). A pool
         without a sink refuses (``_need_sink``). A block that is not per layer
         takes ``layer_idx=None``."""
@@ -340,6 +350,7 @@ class RecurrentStatePool(Resource):
         if rows.every_row_has_state:
             return out
         fresh = ~rows.has_state[: rows.num_rows].view(-1, *(1,) * (out.dim() - 1))
+        start = None if self._start is None else self._start.get((name, layer_idx))
         return torch.where(fresh, 0 if start is None else start, out)
 
     def scatter_(
@@ -1285,6 +1296,8 @@ class RecurrentStatePool(Resource):
     def resident_refusal(self) -> str | None:
         if self.config.disable_sink_slot:
             return "a pool with no sink slot has nowhere for a padding row"
+        if self._start:
+            return "a row with nothing written reads the pool's start, and a resident step reads each row's slot"
         return None
 
     def bind_resident(self, planner: "ResidentPlanner", key: str) -> None:

@@ -1,7 +1,8 @@
 """The host tier of the adapter pool: adapters read, sharded for this rank, and pinned.
 
 An adapter's tensors are laid out exactly like one device slot (rank padded to the pool's
-``max_rank`` with zeros), so moving it onto the device is one copy per target.
+``max_rank`` with zeros), so moving it onto the device is one copy per target. The kernels
+need that padding finite (``ops.py``).
 """
 
 from __future__ import annotations

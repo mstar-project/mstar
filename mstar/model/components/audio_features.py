@@ -334,9 +334,14 @@ class NemoLogMel:
         pad = self.n_fft // 2
         device = self.window.device
         source = waveforms[0].device
-        # host clips are padded straight into pinned memory: one copy to the device
+        # host clips are padded straight into pinned memory: one copy to the device.
+        # The width is rounded up to whole seconds: cuFFT builds a plan per
+        # (rows, frames) shape (~6 ms on an H100), and at the exact width the
+        # frames were new on almost every served batch. Frames past each clip's
+        # end are cut below
         pin = source.type == "cpu" and DeviceCapability.of(device).pin_memory
-        x = torch.zeros(len(waveforms), max(lengths), dtype=torch.float32, device=source, pin_memory=pin)
+        width = -(-max(lengths) // self.sampling_rate) * self.sampling_rate
+        x = torch.zeros(len(waveforms), width, dtype=torch.float32, device=source, pin_memory=pin)
         for row, w in enumerate(waveforms):
             x[row, :lengths[row]] = w.reshape(-1)
         x = to_device_nonblocking(x, device)
