@@ -20,7 +20,7 @@ from mstar.engine.resources import (
     SamplingReqConfig,
 )
 from mstar.engine.resources.csa.config import INDEX_PLANES, CSAConfig, CSASpec
-from mstar.engine.resources.kv.config import AuxPlanes
+from mstar.engine.resources.kv.config import AuxPlanes, SpanKind
 from mstar.engine.resources.recurrent.config import (
     RecurrentBlockConfig,
     RecurrentStateConfig,
@@ -36,7 +36,6 @@ from mstar.model.components.request_kwargs import (
 )
 from mstar.model.deepseek_v41.config import (
     CSA,
-    KV_CACHE,
     LABEL,
     NGRAM,
     POOL_KV,
@@ -45,6 +44,7 @@ from mstar.model.deepseek_v41.config import (
     STATE,
     WINDOW,
     DeepseekV41Config,
+    kv_cache_key,
 )
 from mstar.model.multimodal import DEEPSEEK_V41_TEMPLATE_KWARGS, render_chat_template
 from mstar.model.submodule_base import NodeSubmodule
@@ -125,15 +125,14 @@ class DeepseekV41Model(ByteLevelTextOutput, Model):
             shape = (cfg.max_ratio, cfg.head_dim)
             blocks[POOL_KV] = RecurrentBlockConfig(shape=shape, dtype=torch.float32)
             blocks[POOL_SCORE] = RecurrentBlockConfig(shape=shape, dtype=torch.float32)
-        return [
-            # the compressed sources' latents, a plane each, with their index keys beside
-            # them. A pooled latent sits in its group's last token's row, so the cache keeps
-            # one row per token.
+        caches = [
+            # the latents of the sources that pool ``ratio`` tokens, a plane each, with their
+            # index keys beside them: a row per group, so ``max_seq_len`` over-counts its rows
             KVSpec(
-                resource_key=KV_CACHE,
+                resource_key=kv_cache_key(ratio),
                 nodes={"LLM"},
                 config=PagedKVConfig(
-                    num_layers=cfg.num_planes,
+                    num_layers=len(cfg.sources_of(ratio)),
                     num_kv_heads=1,
                     head_dim=cfg.head_dim,
                     max_seq_len=cfg.max_seq_len,
@@ -141,15 +140,20 @@ class DeepseekV41Model(ByteLevelTextOutput, Model):
                     layout=KVLayout.MLA,
                     kv_lora_rank=cfg.head_dim,
                     qk_rope_head_dim=0,
-                    aux_planes={INDEX_PLANES: AuxPlanes(num_layers=cfg.num_planes, width=cfg.index_head_dim)},
+                    aux_planes={INDEX_PLANES: AuxPlanes(
+                        num_layers=len(cfg.sources_of(ratio)), width=cfg.index_head_dim)},
                 ),
-            ),
+            )
+            for ratio in cfg.source_ratios
+        ]
+        return [
+            *caches,
             CSASpec(
                 resource_key=CSA,
                 nodes={"LLM"},
                 config=CSAConfig(
-                    kv_cache=KV_CACHE, topk=cfg.index_topk, sm_scale=cfg.softmax_scale,
-                    index_head_dim=cfg.index_head_dim,
+                    caches={ratio: kv_cache_key(ratio) for ratio in cfg.source_ratios},
+                    topk=cfg.index_topk, sm_scale=cfg.softmax_scale, index_head_dim=cfg.index_head_dim,
                 ),
             ),
             RecurrentStateSpec(
@@ -170,7 +174,8 @@ class DeepseekV41Model(ByteLevelTextOutput, Model):
         ]
 
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
-        return {KV_CACHE: {LABEL: KVLabel(growth=(("decode", "decode_loop"),))}}
+        label = {LABEL: KVLabel(growth=(("decode", "decode_loop"),))}
+        return {kv_cache_key(ratio): dict(label) for ratio in self.config.source_ratios}
 
     def get_request_resource_configs(
         self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
@@ -270,10 +275,27 @@ class DeepseekV41Model(ByteLevelTextOutput, Model):
         n, limit = input_ids.numel(), self.config.max_prompt_tokens
         if n > limit:
             raise ValueError(f"prompt is {n} tokens; DeepSeek-V4.1 is served with at most {limit}")
-        layout = LabelLayout(spans=(Span("ids", "prefill", n, n, "text_inputs"),), growth=(("decode_loop", 1),))
         return ProcessPromptOutput(
-            {"text_inputs": [input_ids.to(torch.long)]}, {"kv_layout": {KV_CACHE: {LABEL: layout}}},
+            {"text_inputs": [input_ids.to(torch.long)]}, {"kv_layout": self._kv_layouts(n)},
         )
+
+    def _kv_layouts(self, prompt: int) -> dict[str, dict[str, LabelLayout]]:
+        """What a ``prompt``-token request writes to each cache: a row per pooled group. A
+        decode step writes a row every ``ratio`` steps, which a layout cannot say, so a pooled
+        cache declares a row a step up to the most the context holds."""
+        layouts = {}
+        for ratio in self.config.source_ratios:
+            rows = prompt // ratio
+            if ratio == 1:
+                layout = LabelLayout(
+                    spans=(Span(SpanKind.IDS, "prefill", rows, rows, "text_inputs"),), growth=(("decode_loop", 1),))
+            else:
+                layout = LabelLayout(
+                    spans=(Span(SpanKind.ROWS, "prefill", rows, rows, "text_inputs"),) if rows else (),
+                    growth=(("decode_loop", 1),),
+                    max_growth=self.config.max_seq_len // ratio - rows)
+            layouts[kv_cache_key(ratio)] = {LABEL: layout}
+        return layouts
 
     def max_decode_steps(self) -> int:
         """Decode iterations a one-token prompt can run before its context fills the window."""

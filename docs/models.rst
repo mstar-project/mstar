@@ -1007,9 +1007,10 @@ captured graphs. It is the numerics anchor that kernels are held to, not a fast 
 
 Each layer attends its last 128 tokens, and layers 2 to 39 also the 512 rows an indexer picks
 from a compressed cache (three caches pool two tokens per row, one keeps every token). The
-engine holds that state: the compressed latents and their index keys on the paged cache
-(``kv_cache``, one row per token, 5.1 KB a token per rank in bf16), and each request's
-windows in the recurrent pool (``state``, 5.6 MB a request per rank). ``model_kwargs``:
+engine holds that state: the compressed latents and their index keys on paged caches, one
+per pooling ratio and a row per pooled group (``kv_cache_x2`` and ``kv_cache_x1``, together
+3.2 KB a token per rank in bf16), and each request's windows in the recurrent pool
+(``state``, 5.6 MB a request per rank). ``model_kwargs``:
 ``max_seq_len`` (the context served, 65536), ``max_requests`` (requests holding state at
 once), ``moe_fp8_resident`` (the routed experts as an exact fp8 upcast of their fp4, on by
 default: 68 GB per GPU at TP8; off holds them in bf16, twice that). The ``-1017`` refresh has

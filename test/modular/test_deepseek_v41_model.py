@@ -21,7 +21,7 @@ from mstar.model.deepseek_v41 import _testing
 from mstar.model.deepseek_v41._testing import add_request, cpu_engine, logit_gap, random_ids, run_request, run_step
 from mstar.model.deepseek_v41.components.engram import bucket_primes, table_rows
 from mstar.model.deepseek_v41.components.layers import DeepseekV41ForCausalLM
-from mstar.model.deepseek_v41.config import KV_CACHE, STATE, DeepseekV41Config
+from mstar.model.deepseek_v41.config import CSA, STATE, DeepseekV41Config, kv_cache_key
 from mstar.model.deepseek_v41.deepseek_v41_model import DeepseekV41Model
 from mstar.model.deepseek_v41.weight_loader import load_deepseek_v41_weights, skipped, upcast_fp4_block
 from mstar.model.utils import check_loaded
@@ -64,7 +64,11 @@ class TestCheckpointConfig:
     def test_layer_sources(self):
         config = DeepseekV41Config()
         assert [config.kv_source_of(i) for i in (0, 1, 2, 7, 8, 19, 20, 39)] == [None, None, 2, 2, 8, 14, 20, 20]
-        assert config.pooled_sources == (2, 8, 14) and config.num_planes == 4
+        assert config.pooled_sources == (2, 8, 14)
+        # a cache per pooling ratio, a plane per source of that ratio
+        assert config.source_ratios == (1, 2)
+        assert config.sources_of(2) == (2, 8, 14) and config.sources_of(1) == (20,)
+        assert [config.plane_of(i) for i in (2, 7, 8, 14, 19, 20, 39)] == [0, 0, 1, 2, 2, 0, 0]
         assert [config.uses_candidates(i) for i in (20, 24)] == [False, True]
 
     def test_engram_tables_hold_their_bucket_primes_end_to_end(self):
@@ -240,15 +244,34 @@ class TestEngineCpu:
             whole = self._solo(snapshot, ids[:self.PROMPT + step], self.PROMPT + step)[0]
             assert logit_gap(stepped[step][None], whole[None]) < 1e-5
 
+    def test_a_cache_holds_a_row_per_pooled_group_however_the_tokens_arrive(self, snapshot):
+        """19 prompt tokens in steps of 1, 7 and 11, then 5 decode steps: 24 tokens, so 24 rows
+        in the ratio-1 cache and 12 in the ratio-2 one, whose odd steps write nothing."""
+        config = snapshot[1]
+        assert config.source_ratios == (1, 2)
+        engine, sampler, _ = cpu_engine(snapshot[0], torch.float32)
+        ids = random_ids(config, 24, seed=5)
+        add_request(engine, "r")
+        tokens = 0
+        for walk, n in (("prefill", 1), ("prefill", 7), ("prefill", 11), *[("decode", 1)] * 5):
+            run_step(engine, sampler, walk, {"r": ids[tokens:tokens + n]})
+            tokens += n
+            for ratio in config.source_ratios:
+                stream = engine._resources[kv_cache_key(ratio)]._streams["r"]["main"]
+                assert stream.stored_len == tokens // ratio, (walk, tokens, ratio)
+
     def test_a_finished_request_frees_its_state_and_pages(self, snapshot):
         engine, sampler, _ = cpu_engine(snapshot[0], torch.float32)
-        pool, kv = engine._resources[STATE], engine._resources[KV_CACHE]
+        pool = engine._resources[STATE]
+        caches = [engine._resources[kv_cache_key(ratio)] for ratio in snapshot[1].source_ratios]
         free = pool.num_free_slots
         add_request(engine, "r")
         run_step(engine, sampler, "prefill", {"r": random_ids(snapshot[1], 20, seed=5)})
-        assert pool.num_free_slots == free - 1 and kv._streams["r"]["main"].stored_len == 20
+        assert pool.num_free_slots == free - 1 and all(kv._streams["r"] for kv in caches)
         engine.remove_request("r")
-        assert pool.num_free_slots == free and not kv._streams
+        assert pool.num_free_slots == free and not any(kv._streams for kv in caches)
+        # and its token count: a new request under the same id starts at position 0
+        assert not engine._resources[CSA]._tokens
 
     def test_a_prompt_past_the_window_is_refused_before_and_at_the_engine(self, snapshot):
         engine, sampler, model = cpu_engine(snapshot[0], torch.float32, max_seq_len=64, tokenizer_mode="byte")

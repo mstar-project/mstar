@@ -6,8 +6,8 @@ from dataclasses import dataclass
 
 # Resource keys the model declares in get_node_resources and the layers bind by; the serving
 # YAML tunes them under ``resources:``.
-KV_CACHE = "kv_cache"    # paged latents of the compressed sources, their index keys beside them
-CSA = "csa"              # compressed sparse attention over KV_CACHE and each layer's window
+KV_CACHE = "kv_cache"    # paged latents of the compressed sources, a cache per pooling ratio (kv_cache_key)
+CSA = "csa"              # compressed sparse attention over those caches and each layer's window
 STATE = "state"          # recurrent pool: each layer's window, the compressors' open groups, the n-gram tail
 SAMPLER = "sampler"
 LABEL = "main"
@@ -16,6 +16,14 @@ WINDOW = "window"
 POOL_KV = "pool_kv"
 POOL_SCORE = "pool_score"
 NGRAM = "ngram"
+
+
+
+def kv_cache_key(ratio: int) -> str:
+    """The cache of the sources that pool ``ratio`` tokens into a latent: a row per ``ratio``
+    tokens, the sources' latents in its planes and their index keys beside them."""
+    return f"{KV_CACHE}_x{ratio}"
+
 
 _TEXT_KEYS = (
     "vocab_size", "hidden_size", "moe_intermediate_size", "num_hidden_layers",
@@ -173,13 +181,18 @@ class DeepseekV41Config:
         before = [i for i in self.kv_source_layer_ids if i <= layer]
         return before[-1] if before else None
 
-    def plane_of(self, layer: int) -> int:
-        """The cache plane (latents and index keys) of the source ``layer`` attends."""
-        return self.kv_source_layer_ids.index(self.kv_source_of(layer))
-
     @property
-    def num_planes(self) -> int:
-        return len(self.kv_source_layer_ids)
+    def source_ratios(self) -> tuple[int, ...]:
+        """The pooling ratios of the compressed sources, each one cache (``kv_cache_key``)."""
+        return tuple(sorted({self.compress_ratios[i] for i in self.kv_source_layer_ids}))
+
+    def sources_of(self, ratio: int) -> tuple[int, ...]:
+        """The sources that pool ``ratio`` tokens, in layer order: the planes of that cache."""
+        return tuple(i for i in self.kv_source_layer_ids if self.compress_ratios[i] == ratio)
+
+    def plane_of(self, layer: int) -> int:
+        """The plane (latents and index keys), in its ratio's cache, of the source ``layer`` attends."""
+        return self.sources_of(self.compress_ratios[layer]).index(self.kv_source_of(layer))
 
     @property
     def pooled_sources(self) -> tuple[int, ...]:

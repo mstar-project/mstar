@@ -925,21 +925,24 @@ The spec types are:
        ``prefix_cache: true`` is refused. It doesn't fork, serve a node on another instance
        (replicas included) or hand out
        ``write_slots`` yet either; each of these is refused.
-   * - ``CSASpec(config=CSAConfig(kv_cache=..., topk=...))``
-     - Compressed sparse attention (CSA) over the named ``KVLayout.MLA`` cache, for a layer
-       that attends a short window of its own recent rows plus a few rows of a compressed
-       cache in one softmax, with a learned sink logit per head in the denominator
-       (DeepSeek-V4.1). A compressed source that pools ``ratio`` tokens keeps a group's latent
-       and index key in the cache row of the group's last token, so the cache keeps the token
-       page table; the keys sit in the aux planes ``INDEX_PLANES`` (``csa.config``) the model
-       declares on its ``PagedKVConfig``, ``index_head_dim`` wide (checked at build). A step
-       declares ``CSAStep()``; ``plan`` reads its rows off the KV plan, and the layers write
-       keys, score, select and attend through the resource (``write_index``, ``scores``,
-       ``candidates``, ``select``, ``attend``). ``select`` takes each row's top ``topk`` groups,
-       equal scores to the earlier one, optionally inside a ``candidates`` mask of best blocks
-       (a two-level selection); ``attend`` takes the window rows from the model, which keeps
-       them wherever it likes (a recurrent pool block, for one). The torch reference: eager
-       only, no captured graphs.
+   * - ``CSASpec(config=CSAConfig(caches=..., topk=...))``
+     - Compressed sparse attention (CSA) over ``KVLayout.MLA`` caches, for a layer that
+       attends a short window of its own recent rows plus a few rows of a compressed cache in
+       one softmax, with a learned sink logit per head in the denominator (DeepSeek-V4.1).
+       ``caches`` maps a pooling ratio to the cache of the sources that pool that many tokens
+       into a latent: it keeps one row per group, a plane per source, and the index keys in
+       the aux planes ``INDEX_PLANES`` (``csa.config``) the model declares on its
+       ``PagedKVConfig``, ``index_head_dim`` wide (checked at build). The caches count rows,
+       so the resource keeps each request's token count: a step declares ``CSAStep()`` over
+       its tokens and each cache's ``KVStep`` over the rows ``kv_segments`` derives from them
+       (the groups the step's tokens complete, none on most decode steps of a pooled cache);
+       ``plan`` lays the token positions over the caches' page tables and ``commit`` advances
+       the count. The layers write latents and keys, score, select and attend through the
+       resource (``write``, ``scores``, ``candidates``, ``select``, ``attend``). ``select``
+       takes each row's top ``topk`` groups, equal scores to the earlier one, optionally
+       inside a ``candidates`` mask of best blocks (a two-level selection); ``attend`` takes
+       the window rows from the model, which keeps them wherever it likes (a recurrent pool
+       block, for one). The torch reference: eager only, no captured graphs.
    * - ``DSASpec(config=DSAConfig(kv_cache=..., topk=...))``
      - DeepSeek sparse attention (DSA) over the named ``KVLayout.MLA`` cache: past ``topk``
        keys, each query row attends only the ``topk`` tokens its indexer scores highest.

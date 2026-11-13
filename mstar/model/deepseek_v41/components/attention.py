@@ -2,9 +2,9 @@
 sliding window of the layer's own rows plus an indexer's pick of a compressed cache.
 
 The engine holds the state and runs the attention: the compressed latents and their index keys
-on the paged cache (``KV_CACHE``), each layer's window and the compressors' open groups in the
-recurrent pool (``STATE``), and scoring, selection and the softmax in the CSA resource. The
-layers here project, pool, rotate and round as the checkpoint's reference does.
+on paged caches (a row per pooled group), each layer's window and the compressors' open groups in
+the recurrent pool (``STATE``), and the caches' writes, scoring, selection and the softmax in the
+CSA resource. The layers here project, pool, rotate and round as the checkpoint's reference does.
 """
 from __future__ import annotations
 
@@ -20,7 +20,6 @@ from mstar.model.deepseek_v41.components.linear import COLUMN, ROW, RoundedLinea
 from mstar.model.deepseek_v41.components.rope import Rope, rotate_tail
 from mstar.model.deepseek_v41.config import (
     CSA,
-    KV_CACHE,
     LABEL,
     POOL_KV,
     POOL_SCORE,
@@ -160,10 +159,10 @@ class DeepseekV41Attention(nn.Module):
         self.uses_candidates = config.uses_candidates(layer)
         self.candidate_topk_blocks = config.candidate_topk_blocks
         self.candidate_block_size = config.candidate_block_size
-        self._csa = self._kv = self._state = None
+        self._csa = self._state = None
 
     def bind_resources(self, resources: dict) -> None:
-        self._csa, self._kv, self._state = resources[CSA], resources[KV_CACHE], resources[STATE]
+        self._csa, self._state = resources[CSA], resources[STATE]
 
     def _window(self, kv: torch.Tensor, rows) -> tuple[torch.Tensor, torch.Tensor]:
         """The rows each query's window holds, as ``(rows, idx)`` for the CSA resource: the
@@ -193,20 +192,19 @@ class DeepseekV41Attention(nn.Module):
         ratio = self.ratio
         if self.indexer.owns_keys:
             # a latent stands at its group's first token
-            self._csa.write_index(
-                self.plane, self.indexer.keys(latent, rope.angles(rows.pos + 1 - ratio, True), done),
-                label=LABEL)
+            keys = self.indexer.keys(latent, rope.angles(rows.pos + 1 - ratio, True), done)
+            self._csa.write(ratio, self.plane, keys=keys, label=LABEL)
         q, w = self.indexer.query(x, q_latent, angles)
-        scores = self._csa.scores(self.plane, q, w, ratio, label=LABEL)
+        scores = self._csa.scores(ratio, self.plane, q, w, label=LABEL)
         if self.comm_group.world_size > 1:
             scores = self.comm_group.all_reduce(scores)
         keep = None
         if self.is_candidate_source:
             shared.candidates = self._csa.candidates(
-                scores, ratio, self.candidate_topk_blocks, self.candidate_block_size, label=LABEL)
+                ratio, scores, self.candidate_topk_blocks, self.candidate_block_size, label=LABEL)
         elif self.uses_candidates:
             keep = shared.candidates
-        shared.slots = self._csa.select(scores, ratio, keep, label=LABEL)
+        shared.slots = self._csa.select(ratio, scores, keep, label=LABEL)
         return shared.slots
 
     def forward(self, x: torch.Tensor, rope: Rope, shared: SharedSelection) -> torch.Tensor:
@@ -228,9 +226,9 @@ class DeepseekV41Attention(nn.Module):
             if latent is not None:
                 latent = rotate_tail(latent, rope.angles(rows.pos + 1 - self.ratio, True))
                 # the compressed cache's FP4 has an E4M3 scale per 16 values
-                latent = round_fp4(latent, 16, e4m3_scale=True) * done[:, None]
-                self._kv.write_kv(latent, None, layer_idx=self.plane, label=LABEL)
-        out = self._csa.attend(q, self.attn_sink, window, window_idx, self.plane, slots)
+                self._csa.write(
+                    self.ratio, self.plane, latent=round_fp4(latent, 16, e4m3_scale=True), label=LABEL)
+        out = self._csa.attend(q, self.attn_sink, window, window_idx, self.ratio, self.plane, slots)
         # the cache holds rotated latents, so the output carries the query's rotation
         out = rotate_tail(out, angles, inverse=True)
 

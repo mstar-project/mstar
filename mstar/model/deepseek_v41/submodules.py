@@ -15,7 +15,7 @@ from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import KVStep, SamplerStep, Segment, SlotLease, SubmoduleStep
 from mstar.engine.resources.csa.config import CSAStep
 from mstar.engine.resources.recurrent.config import RecurrentStep
-from mstar.model.deepseek_v41.config import CSA, KV_CACHE, LABEL, SAMPLER, STATE, DeepseekV41Config
+from mstar.model.deepseek_v41.config import CSA, LABEL, SAMPLER, STATE, DeepseekV41Config
 from mstar.model.submodule_base import (
     END_PARTITION,
     ARNodeInputs,
@@ -100,13 +100,16 @@ class DeepseekV41LLMSubmodule(ARNodeSubmodule):
         prefill_tokens: dict[str, torch.Tensor] = {}
         if graph_walk == "prefill":
             prefill_tokens = {rid: inp.input_ids for rid, inp in zip(request_ids, inputs, strict=True)}
+        segments = [
+            Segment(request_id=rid, label=LABEL, span=inp.input_seq_len)
+            for rid, inp in zip(request_ids, inputs, strict=True)
+        ]
+        # a cache advances by the groups the step's tokens complete, which the CSA resource counts
+        caches = self.node_resources[CSA].kv_segments(segments)
         return SubmoduleStep(
-            segments=[
-                Segment(request_id=rid, label=LABEL, span=inp.input_seq_len)
-                for rid, inp in zip(request_ids, inputs, strict=True)
-            ],
+            segments=segments,
             steps={
-                KV_CACHE: KVStep(),
+                **{key: KVStep(segments=rows) for key, rows in caches.items()},
                 CSA: CSAStep(),
                 STATE: RecurrentStep(),
                 SAMPLER: SamplerStep(apply_penalty=True, prefill_tracked_tokens=prefill_tokens),

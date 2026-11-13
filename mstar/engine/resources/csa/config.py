@@ -3,6 +3,7 @@
 Kept free of the manager so a submodule can declare a step without importing it.
 """
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -12,16 +13,16 @@ from mstar.engine.resources.step import ResourceStep
 if TYPE_CHECKING:
     from mstar.engine.resources.base import Resource
 
-# the latent cache's aux planes (``PagedKVConfig.aux_planes``) that hold the index keys
+# the latent caches' aux planes (``PagedKVConfig.aux_planes``) that hold the index keys
 INDEX_PLANES = "csa_index"
 
 
 @dataclass
 class CSAConfig:
-    # the paged latent cache: a plane per compressed source, its index keys in
-    # aux_planes[INDEX_PLANES]. A source that pools ``ratio`` tokens keeps a group's latent and
-    # key in the row of the group's last token.
-    kv_cache: str
+    # the paged latent caches by pooling ratio. A cache of ratio r keeps one row per r tokens,
+    # a group's latent, written when the group's last token arrives; it has a plane per
+    # compressed source of that ratio and each plane's index keys in aux_planes[INDEX_PLANES].
+    caches: Mapping[int, str]
     # the compressed rows a query attends: its top ``topk`` by the indexer's score
     topk: int
     # the softmax scale every attention runs at
@@ -32,13 +33,20 @@ class CSAConfig:
     score_bytes: int = 256 << 20
     attend_bytes: int = 256 << 20
 
+    def __post_init__(self):
+        self.caches = dict(self.caches)
+        if not self.caches or any(isinstance(r, bool) or not isinstance(r, int) or r < 1 for r in self.caches):
+            raise ValueError(f"CSAConfig.caches maps pooling ratios (>= 1) to caches, got {self.caches!r}")
+        if len(set(self.caches.values())) != len(self.caches):
+            raise ValueError(f"CSAConfig.caches names one cache for two ratios: {self.caches!r}")
+
 
 @dataclass
 class CSASpec(NodeResourceSpec):
     config: CSAConfig
 
     def depends_on(self) -> set[str]:
-        return {self.config.kv_cache}
+        return set(self.config.caches.values())
 
     @property
     def resource_class(self) -> "type[Resource]":
@@ -58,4 +66,5 @@ class CSASpec(NodeResourceSpec):
 
 @dataclass(frozen=True)
 class CSAStep(ResourceStep):
-    pass
+    """The step's segments are its tokens (the submodule's own). The caches advance by the
+    rows ``CSAManager.kv_segments`` derives from them."""

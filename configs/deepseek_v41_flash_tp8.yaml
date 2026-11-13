@@ -14,10 +14,16 @@ model_kwargs:
   # requests that hold state at once: the pool below holds one more slot, its sink
   max_requests: 8
 resources:
-  kv_cache:
-    # pages = requests x max_seq_len / page_size + the sink: 8 x 65536 / 128 + 1.
-    # 4 latent planes of 512 and 4 index planes of 128, bf16: 5.1 KB/token, 2.7 GB/rank.
+  # A cache per pooling ratio, a row per pooled group, each a latent of 512 and an index key
+  # of 128 per source, bf16: 3.2 KB/token and 1.7 GB/rank together.
+  # pages = requests x max_seq_len / ratio / page_size + the sink.
+  kv_cache_x1:
+    # the source that keeps every token: 8 x 65536 / 128 + 1
     max_num_pages: 4097
+    page_size: 128
+  kv_cache_x2:
+    # the three sources that pool two tokens: 8 x 32768 / 128 + 1
+    max_num_pages: 2049
     page_size: 128
   state:
     # max_requests + the sink; 40 windows of 128 x 512 bf16 and the open groups: 5.6 MB/slot
