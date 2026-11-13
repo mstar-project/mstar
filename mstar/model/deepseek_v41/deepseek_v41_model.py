@@ -46,6 +46,7 @@ from mstar.model.deepseek_v41.config import (
     WINDOW,
     DeepseekV41Config,
 )
+from mstar.model.multimodal import DEEPSEEK_V41_TEMPLATE_KWARGS, render_chat_template
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.utils import (
     ByteLevelTextOutput,
@@ -235,16 +236,19 @@ class DeepseekV41Model(ByteLevelTextOutput, Model):
     # -------------------------------------------------------------------
 
     def render_prompt(self, prompt: str, kwargs: dict) -> torch.Tensor:
-        """The prompt's token ids. A chat request (``messages``) renders through the
-        checkpoint's chat format; plain text is tokenized as given after the BOS token."""
+        """The prompt's token ids, through the checkpoint's chat template: a chat request's
+        ``messages`` in their roles, plain text as one user turn."""
         if self._tokenizer_mode == "byte":
             vocab = self.config.vocab_size
             text = (prompt.encode("utf-8") or b"\0") + (kwargs.get("reply_prefix") or "").encode("utf-8")
             return torch.tensor([min(b, vocab - 1) for b in text], dtype=torch.long)
-        if kwargs.get("messages") is not None:
-            raise ValueError("DeepSeek-V4.1 chat requests need its chat adapter, which this build does not carry")
-        ids = self.tokenizer.encode(prompt, add_special_tokens=False)
-        return torch.tensor([self.config.bos_token_id, *ids], dtype=torch.long)
+        if not getattr(self.tokenizer, "chat_template", None):
+            # the renderer would tokenize the bare text, and the model answer a prompt it never saw in training
+            raise RuntimeError(
+                f"{self.model_path_hf}: the tokenizer has no chat template (chat_template.jinja beside "
+                "tokenizer.json), which every DeepSeek-V4.1 prompt renders through")
+        return render_chat_template(
+            self.tokenizer, prompt, kwargs.get("prompt_parts"), kwargs, DEEPSEEK_V41_TEMPLATE_KWARGS)
 
     def process_prompt(
         self,

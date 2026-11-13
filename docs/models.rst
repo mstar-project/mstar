@@ -1015,6 +1015,15 @@ once), ``moe_fp8_resident`` (the routed experts as an exact fp8 upcast of their 
 default: 68 GB per GPU at TP8; off holds them in bf16, twice that). The ``-1017`` refresh has
 the same layout: pass it as ``model_kwargs.checkpoint_path``.
 
+Chat renders each message in its role through the checkpoint's chat template (``developer``
+as ``system``; tool results fold into the next user turn, as the checkpoint's encoder writes
+them) and splits the reply into ``reasoning_content``, ``content`` and ``tool_calls``.
+``tools``, ``tool_choice``, ``parallel_tool_calls`` and ``stop`` are as on GLM.
+``enable_thinking``, ``reasoning_effort`` (1 to 100, or ``low`` / ``high`` / ``max``) and
+``drop_thinking`` reach the template; image parts are refused. A plain ``/generate`` prompt is
+one user turn. The checkpoint must carry its ``chat_template.jinja``: the model refuses to
+render without one.
+
 GLM-5.3-Flash and GLM-5.2
 -------------------------
 
