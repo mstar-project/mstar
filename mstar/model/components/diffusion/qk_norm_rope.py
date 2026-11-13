@@ -5,9 +5,10 @@ Wan's ``rms_norm_across_heads``).
 Eager, this is the model's own ``nn.RMSNorm`` and ``rope.apply_rotary_interleaved``.
 Compiled, Inductor lowers the pair to several passes over each row (the norm's
 reduction, then the rotated copy of the row, then the rotation), so inside a
-compiled region one kernel does both q and k: each program holds a row in
-registers, normalizes it, rounds the normalized row to the activation dtype
-where the eager norm's output does, and rotates it in fp32. Its mean square is
+compiled region one kernel does both q and k: each program takes a row in
+chunked passes (the mean square, then the output), normalizes it, rounds the
+normalized row to the activation dtype where the eager norm's output does, and
+rotates it in fp32. Its mean square is
 reduced in a different order than the eager norm's, so the two agree to fp32
 rounding rather than bitwise.
 """
@@ -32,33 +33,45 @@ if triton is not None:
     @triton.jit
     def _rms_norm_rope_kernel(
         q_ptr, k_ptr, qw_ptr, kw_ptr, cos_ptr, sin_ptr, q_out_ptr, k_out_ptr,
-        seq, width, q_eps, k_eps, HEAD_DIM: tl.constexpr, BLOCK_PAIRS: tl.constexpr,
+        seq, width, q_eps, k_eps, HEAD_DIM: tl.constexpr, CHUNK_PAIRS: tl.constexpr, NCHUNK: tl.constexpr,
     ):
+        # one row of q or k per program, in passes of CHUNK_PAIRS pairs: the mean square, then
+        # the normalized, rotated output (the second read hits cache)
         row = tl.program_id(0).to(tl.int64)
         if tl.program_id(1) == 0:
             x_ptr, w_ptr, out_ptr, eps = q_ptr, qw_ptr, q_out_ptr, q_eps
         else:
             x_ptr, w_ptr, out_ptr, eps = k_ptr, kw_ptr, k_out_ptr, k_eps
         pos = row % seq
-        pairs = tl.arange(0, BLOCK_PAIRS)
-        pmask = pairs < width // 2
-        offs = pairs[:, None] * 2 + tl.arange(0, 2)[None, :]
-        mask = pmask[:, None]
-
-        x = tl.load(x_ptr + row * width + offs, mask=mask, other=0.0).to(tl.float32)
-        mean_sq = tl.sum(tl.sum(x * x, axis=1), axis=0) / width
+        base = row * width
+        acc = tl.zeros([CHUNK_PAIRS, 2], dtype=tl.float32)
+        for c in tl.static_range(NCHUNK):
+            pairs = c * CHUNK_PAIRS + tl.arange(0, CHUNK_PAIRS)
+            pmask = pairs < width // 2
+            offs = pairs[:, None] * 2 + tl.arange(0, 2)[None, :]
+            x = tl.load(x_ptr + base + offs, mask=pmask[:, None], other=0.0).to(tl.float32)
+            acc += x * x
+        mean_sq = tl.sum(tl.sum(acc, axis=1), axis=0) / width
         # eps arrives as fp64 from a compiled caller; keep the row in fp32
         rstd = tl.math.rsqrt(mean_sq + eps.to(tl.float32))
-        w = tl.load(w_ptr + offs, mask=mask, other=0.0).to(tl.float32)
-        x = (x * rstd * w).to(out_ptr.dtype.element_ty).to(tl.float32)
+        for c in tl.static_range(NCHUNK):
+            pairs = c * CHUNK_PAIRS + tl.arange(0, CHUNK_PAIRS)
+            pmask = pairs < width // 2
+            offs = pairs[:, None] * 2 + tl.arange(0, 2)[None, :]
+            mask = pmask[:, None]
+            x = tl.load(x_ptr + base + offs, mask=mask, other=0.0).to(tl.float32)
+            w = tl.load(w_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+            x = (x * rstd * w).to(out_ptr.dtype.element_ty).to(tl.float32)
+            even, odd = tl.split(x)
+            # the tables repeat each frequency over its pair, so the even column serves both
+            col = pos * HEAD_DIM + (pairs % (HEAD_DIM // 2)) * 2
+            cos = tl.load(cos_ptr + col, mask=pmask, other=0.0)
+            sin = tl.load(sin_ptr + col, mask=pmask, other=0.0)
+            out = tl.join(even * cos - odd * sin, odd * cos + even * sin)
+            tl.store(out_ptr + base + offs, out.to(out_ptr.dtype.element_ty), mask=mask)
 
-        even, odd = tl.split(x)
-        # the tables repeat each frequency over its pair, so the even column serves both
-        col = pos * HEAD_DIM + (pairs % (HEAD_DIM // 2)) * 2
-        cos = tl.load(cos_ptr + col, mask=pmask, other=0.0)
-        sin = tl.load(sin_ptr + col, mask=pmask, other=0.0)
-        out = tl.join(even * cos - odd * sin, odd * cos + even * sin)
-        tl.store(out_ptr + row * width + offs, out.to(out_ptr.dtype.element_ty), mask=mask)
+    # pairs per pass, measured on a B300 at widths 3072 and 5120
+    _CHUNK_PAIRS = 512
 
     @triton_op("mstar::rms_norm_rope_pair", mutates_args=())
     def _rms_norm_rope_op(
@@ -69,7 +82,8 @@ if triton is not None:
         q_out, k_out = torch.empty_like(q), torch.empty_like(k)
         wrap_triton(_rms_norm_rope_kernel)[(batch * seq, 2)](
             q, k, q_weight, k_weight, cos, sin, q_out, k_out, seq, width, q_eps, k_eps,
-            HEAD_DIM=cos.shape[-1], BLOCK_PAIRS=triton.next_power_of_2(width // 2), num_warps=8,
+            HEAD_DIM=cos.shape[-1], CHUNK_PAIRS=_CHUNK_PAIRS, NCHUNK=triton.cdiv(width // 2, _CHUNK_PAIRS),
+            num_warps=8,
         )
         return q_out, k_out
 
