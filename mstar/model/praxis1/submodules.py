@@ -95,6 +95,12 @@ class Praxis1TextEncoderSubmodule(_Praxis1Node):
     walks of this request.
     """
 
+    # The pinned reference runs Qwen outside autocast and with full float32
+    # matmuls. The engine defaults to BF16 autocast and TF32, which changes
+    # hidden_states[-3] even with the same token IDs and frozen weights.
+    disable_autocast = True
+    float32_matmul_precision = "highest"
+
     def __init__(self, config: Praxis1Config, encoder: nn.Module) -> None:
         super().__init__(config)
         self.encoder = encoder
