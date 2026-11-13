@@ -403,6 +403,20 @@ def test_admit_refusal_names_the_request():
     assert not outcome.ok and outcome.reason.request_ids == frozenset({2})
 
 
+def test_a_request_keeps_the_source_it_began_from():
+    """A row's retained keys are read from the source its position names, so a step that names another would attend
+    another prefix's keys as its own."""
+    mgr = _manager(WINDOW, True, torch.float32, "cpu", heads=1, head_dim=4)
+    first, ctx = _step([1], [0], [1])
+    assert mgr.admit(first, ctx).ok
+    mgr.plan(first, ctx)
+    mgr.commit(first, ctx)
+    moved, ctx = _step([1], [1], [1])
+    moved = type(moved)(segments=moved.segments, positions={1: moved.positions[1]._replace(source=1)})
+    outcome = mgr.admit(moved, ctx)
+    assert not outcome.ok and outcome.reason.request_ids == frozenset({1}), "the row would read another source's keys"
+
+
 def test_rollback_admit_frees_only_fresh_slots():
     """A refused step gives back the slots its admit took, not one a request
     already held."""
