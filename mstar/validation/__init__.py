@@ -13,7 +13,7 @@ from typing import Any, NamedTuple
 from mstar.distributed.base import ShardingConfig
 from mstar.engine.resources.lora.serving import refuse_unresolved_lora_adapters
 from mstar.engine.resources.sequence_shard import SeqShardSpec
-from mstar.engine.state.adapters import StateSetup, spec_overrides, state_setup
+from mstar.engine.state.adapters import spec_overrides, state_setup
 from mstar.engine.state.analysis import deployment_problems, split_read_problems, state_declaration_problems
 from mstar.model.base import (
     Model,
@@ -155,10 +155,11 @@ def validate_deployment(
         if declaration_problems:
             problems.append("the `resources:` checks, which need the declarations, were skipped")
         else:
-            setup = StateSetup()
-            if not malformed and resources_readable:
-                setup, setup_problems = state_setup(config, model.declare_state())
-                problems += setup_problems
+            # a malformed config still takes the model's kernel settings, which bind its eager reads
+            setup, setup_problems = state_setup(
+                config if not malformed and resources_readable else {}, model.declare_state(), model.kernel_settings(),
+            )
+            problems += setup_problems
             # a `resources:` block check_resources refuses turns no resource on
             specs = enabled_resources(model, config if resources_readable else {**config, "resources": None}, setup)
             if resources_readable:

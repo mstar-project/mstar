@@ -174,9 +174,13 @@ def _resolve(arrays: Sequence[Array], setup: "StateSetup") -> "Resolved":
     return Resolved(specs, bound, resource_of, queries)
 
 
-def state_setup(config: Mapping[str, Any], declarations: Sequence[Array | Sampler]) -> tuple["StateSetup", list[str]]:
-    """The setup ``config`` asks for ``declarations``, and the problems with what it asks, each left out of the setup.
-    A ``backend: sdpa`` block binds every read on its resource to SDPA."""
+def state_setup(
+    config: Mapping[str, Any], declarations: Sequence[Array | Sampler],
+    kernel_settings: Mapping[str, Mapping[str, Any]] = EMPTY,
+) -> tuple["StateSetup", list[str]]:
+    """The setup ``config`` and the model's ``kernel_settings`` ask for ``declarations``, and the problems with what
+    they ask, each left out of the setup. A ``backend: sdpa`` block binds every read on its resource to SDPA, and
+    ``eager_backend: dense`` binds its read to the default's pair in `EAGER_DENSE`."""
     # a config that still asks for SDPA on a node group would otherwise run the ragged kernel
     problems = [
         f"node_groups[{i}].attention_backend: the backend is a resource's setting, as "
@@ -184,10 +188,27 @@ def state_setup(config: Mapping[str, Any], declarations: Sequence[Array | Sample
         for i, group in enumerate(config.get("node_groups") or ()) if "attention_backend" in group
     ]
     arrays = [declared for declared in declarations if isinstance(declared, Array)]
-    resolved = _resolve(arrays, StateSetup())
-    resource_of = {read: resolved.resource_of[read] for array in arrays for read in array.reads}
-    replaced = {each.key: each.binding for array in arrays for each in resolved.bound[array.name]}
+    replaced = {
+        read: _default_binding(storage_of(array), array.reads[read]) for array in arrays for read in array.reads
+    }
     by_read: dict[str, OpBinding] = {}
+    for array in arrays:
+        for read in array.reads:
+            binding = EAGER_DENSE.get(type(replaced[read]))
+            if binding is None or kernel_settings.get(read, EMPTY).get("eager_backend") != "dense":
+                continue
+            swapped = _swap_problem(array, read, binding, replaced[read])
+            if swapped is not None:
+                problems.append(f"kernel_settings[{read!r}]: eager_backend dense {swapped}")
+                continue
+            try:
+                binding.check(array, read, array.reads[read])
+                by_read[read] = binding
+            except ValueError as e:
+                problems.append(f"kernel_settings[{read!r}]: eager_backend dense: {e}")
+    # resolved with the eager choices, since a default they replace may not resolve beside its neighbours
+    resolved = _resolve(arrays, StateSetup(dict(by_read)))
+    resource_of = {read: resolved.resource_of[read] for array in arrays for read in array.reads}
     for key, block in _sdpa_blocks(config).items():
         reads = [(array, read) for array in arrays for read in array.reads if resource_of[read] == key]
         if block.keys() != {"backend"}:
@@ -206,11 +227,9 @@ def state_setup(config: Mapping[str, Any], declarations: Sequence[Array | Sample
                 refused.append(f"resources.{key}: backend sdpa runs only an Attend read within a step, and Array "
                                f"{array.name!r}.reads[{read!r}] isn't one")
                 continue
-            if binding.keeps_window != replaced[read].keeps_window:
-                refused.append(f"resources.{key}: backend sdpa binds Array {array.name!r}.reads[{read!r}] through "
-                               f"{type(binding).__name__} in place of {type(replaced[read]).__name__}, and only one "
-                               "of them keeps a window, which a request's layout sizes the read's pages by; set no "
-                               "backend on this read")
+            swapped = _swap_problem(array, read, binding, replaced[read])
+            if swapped is not None:
+                refused.append(f"resources.{key}: backend sdpa {swapped}; set no backend on this read")
                 continue
             try:
                 binding.check(array, read, array.reads[read])
@@ -222,6 +241,15 @@ def state_setup(config: Mapping[str, Any], declarations: Sequence[Array | Sample
             for _, read in reads:
                 by_read.pop(read, None)
     return StateSetup(by_read), problems
+
+
+def _swap_problem(array: Array, read: str, binding: "OpBinding", default: "OpBinding") -> str | None:
+    """Why ``binding`` can't take the place of ``default`` on ``array``'s read ``read``, or None."""
+    if binding.keeps_window == default.keeps_window:
+        return None
+    return (f"binds Array {array.name!r}.reads[{read!r}] through {type(binding).__name__} in place of "
+            f"{type(default).__name__}, and only one of them keeps a window, which a request's layout sizes the read's "
+            "pages by")
 
 
 def _sdpa_blocks(config: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
@@ -386,10 +414,11 @@ def build_handle(
 
 def state_steps(
     step: SubmoduleStep | None, handles: Mapping[str, ArrayHandle | SamplerHandle | ShardHandle], *,
-    graph_walk: str | None = None,
+    graph_walk: str | None = None, leased: bool = False,
 ) -> SubmoduleStep | None:
     """``step`` on ``graph_walk`` as a new step, with what its ``state`` declares expanded into today's step objects by
-    each storage's builder, afresh for each step, since each carries the step's segments. The handles it opens are
+    each storage's builder, afresh for each step, since each carries the step's segments. ``leased``: whether the step
+    holds a slot lease, which picks the kernel of a read with two (`OpBinding.leg`). The handles it opens are
     those of what ``state`` lists, then the node's sequence shard's, whose step is the node's segments. None when no
     array or sampler it lists needs it, nor a shard that can split, and it holds no other resource's step, so the step
     skips its resources' admit, plan and commit."""
@@ -411,7 +440,7 @@ def state_steps(
             builder = builders.get(handle.storage)
             if builder is None:
                 builder = builders[handle.storage] = handle.storage.step_builder()
-            builder.add(handle, declared, step, graph_walk)
+            builder.add(handle, declared, step, graph_walk, leased)
         elif isinstance(declared, SampleStep) and isinstance(handle, SamplerHandle):
             steps[name] = SamplerStep(
                 apply_penalty=declared.apply_penalty, apply_filters=declared.apply_filters,
@@ -486,8 +515,12 @@ class StepBuilder(ABC):
     """Today's steps of one storage's arrays in one step."""
 
     @abstractmethod
-    def add(self, handle: ArrayHandle, declared: ArrayStep, step: SubmoduleStep, walk: str | None = None) -> None:
-        """``declared`` is what ``step``, on ``walk``, lists for ``handle``'s array."""
+    def add(
+        self, handle: ArrayHandle, declared: ArrayStep, step: SubmoduleStep, walk: str | None = None,
+        leased: bool = False,
+    ) -> None:
+        """``declared`` is what ``step``, on ``walk``, lists for ``handle``'s array. ``leased``: whether the step holds
+        a slot lease."""
 
     @abstractmethod
     def steps(self) -> dict[str, Any]:
@@ -501,10 +534,14 @@ class ArraySteps(StepBuilder):
         self._storage = storage
         self._steps: dict[str, Any] = {}
 
-    def add(self, handle: ArrayHandle, declared: ArrayStep, step: SubmoduleStep, walk: str | None = None) -> None:
+    def add(
+        self, handle: ArrayHandle, declared: ArrayStep, step: SubmoduleStep, walk: str | None = None,
+        leased: bool = False,
+    ) -> None:
         segments = segments_of(declared, step)
         self._storage.steps(handle, declared, step, segments, self._steps)
         for key, bound in handle._step_ops(walk):
+            key = bound.binding.leg(bound, leased) or key
             bound.binding.steps(handle.array, key, bound.declared, declared, segments, self._steps)
 
     def steps(self) -> dict[str, Any]:
@@ -525,6 +562,7 @@ class WithinStepSteps(StepBuilder):
 
     def add(
         self, handle: "WithinStepHandle", declared: ArrayStep, step: SubmoduleStep, walk: str | None = None,
+        leased: bool = False,
     ) -> None:
         """Plan ``handle``'s read over the step's whole segments: on a step the node's sequence shard splits, the
         resource narrows a split side to this rank's share itself."""
@@ -678,6 +716,11 @@ class OpBinding:
         """The key of the resource the op under ``key`` runs on."""
         return key
 
+    def leg(self, bound: BoundOp, leased: bool) -> str | None:
+        """The key ``bound`` runs under on a step with or without a slot lease (``leased``), where the binding builds a
+        second kernel under the read's own key; None where it runs on the paged spec its read is grouped into."""
+        return None
+
     def apply(self, spec: NodeResourceSpec | None, settings: Mapping[str, Any]) -> None:
         """Set ``settings``, the op's `kernel_settings`, on ``spec``, its resource's."""
         for field, value in settings.items():
@@ -733,6 +776,31 @@ class PagedAttend(OpBinding):
 
     def attach(self, handle: "PagedArrayHandle", key: str, run: Any) -> None:
         handle.reads[key] = run
+
+
+class EagerDenseAttend(PagedAttend):
+    """`Attend` on a paged array that runs the dense kernel on a step with no slot lease and the paged one on a leased
+    step, whose graph replays. The dense kernel is a spec under the read's own key, beside the paged spec of its
+    group."""
+
+    kernel_settings = PagedAttend.kernel_settings | {"eager_backend"}
+
+    def check(self, array: Array, key: str, read: Read) -> None:
+        if not isinstance(read.mask, Bidirectional):
+            raise _no_layout(array, f"reads[{key!r}].mask must be Bidirectional to take eager_backend dense, since the "
+                                    "dense kernel has no causal plan and no window")
+
+    def specs(self, array: Array, key: str, read: Read) -> list[NodeResourceSpec]:
+        dense = AttentionSpec(
+            resource_key=key, nodes=array.nodes, config=AttentionConfig(kv_cache=array.name, backend=AttnBackend.DENSE),
+        )
+        return [*super().specs(array, key, read), dense]
+
+    def leg(self, bound: BoundOp, leased: bool) -> str | None:
+        return None if leased else bound.key
+
+    def apply(self, spec: NodeResourceSpec | None, settings: Mapping[str, Any]) -> None:
+        super().apply(spec, {field: value for field, value in settings.items() if field != "eager_backend"})
 
 
 class PagedCrossAttend(PagedAttend):
@@ -1120,6 +1188,12 @@ class PagedArrayHandle(ArrayHandle):
         for bound in bindings:
             run = bound.binding.bind(array, resolved.resource_of[bound.key], resources)
             bound.binding.attach(self, bound.key, run)
+        # each read with a second kernel: its layers, its paged run and the other, which `begin_step` points it at
+        self._legs = [
+            (bound.key, read_layers(array, bound.declared), self.reads[bound.key],
+             bound.binding.bind(array, leg, resources))
+            for bound in bindings if (leg := bound.binding.leg(bound, False)) is not None
+        ]
         self.first_read = next(iter(self.reads.values()))
         self._attn: dict[int, PagedRead] = {
             layer: self.reads[key]
@@ -1171,6 +1245,11 @@ class PagedArrayHandle(ArrayHandle):
 
     def begin_step(self, step) -> None:
         super().begin_step(step)
+        # a step plans a read's second kernel under the read's own key, which only `OpBinding.leg` gives a step
+        for key, layers, paged, leg in self._legs:
+            self.reads[key] = run = leg if key in step.steps else paged
+            for layer in layers:
+                self._attn[layer] = run
         # adds that run before the reads, outside the captured graph, which the reads find in the pages
         self._eager = step.state[self.name].eager_add
         # the one plan `PagedStorage.steps` names for a step over several labels
@@ -2077,23 +2156,29 @@ class PagedStorage(Storage):
     def _read_specs(self, array: Array, bound: Sequence[BoundOp]) -> tuple[list[NodeResourceSpec], dict[str, str]]:
         """The specs ``array``'s reads build, and the resource key each read runs on.
 
-        Raises ``ValueError`` on two specs over one layer, since a layer reads through one resource on every walk.
+        Raises ``ValueError`` on two specs over one layer, since a layer reads through one resource on every walk. A
+        read's first spec is the one it groups by, and any other is a spec of its own (`OpBinding.leg`), under its key.
         """
         specs: dict[str, NodeResourceSpec] = {}
+        legs: list[NodeResourceSpec] = []
         resource_of: dict[str, str] = {}
         for key, read, binding in bound:
             built = binding.specs(array, key, read)
             if not built:
                 resource_of[key] = binding.resource(array, key)
                 continue
-            (spec,) = built
+            spec, *own = built
             resource_of[key] = next((
                 first for first, shared in specs.items() if shared.config == spec.config and not any(
                     array.reads[member].mask != read.mask and _share_a_walk(array.reads[member], read)
                     for member, resource in resource_of.items() if resource == first
                 )
             ), key)
+            if own and resource_of[key] == key:
+                raise _no_layout(array, f"reads[{key!r}] builds a second spec under its own key, and its paged spec, "
+                                        "which no earlier read shares, would take that key too")
             specs.setdefault(resource_of[key], spec)
+            legs += own
         reader: dict[int, str] = {}
         for key, read in array.reads.items():
             for layer in sorted(read_layers(array, read)):
@@ -2101,7 +2186,7 @@ class PagedStorage(Storage):
                 if resource_of[other] != resource_of[key]:
                     raise _no_layout(array, f"reads[{other!r}] and reads[{key!r}] build different specs and both cover "
                                             f"layer {layer}, which reads through one resource on every walk")
-        return list(specs.values()), resource_of
+        return [*specs.values(), *legs], resource_of
 
     def steps(
         self, handle: ArrayHandle, declared: ArrayStep, step: SubmoduleStep, segments, steps: dict[str, Any],
@@ -2410,7 +2495,8 @@ def storage_of(array: Array) -> Storage:
 
 # `Attend` is an `AttentionSpec` on a paged array, a `CrossAttentionSpec` on one read with another array's queries and a
 # `RaggedAttentionSpec` within a step, so a binding is per storage and op type. A field of a read's mask can still swap
-# the binding, through `OpBinding.for_mask`, as a kept window does, and the `SDPA` table below is the deployment's swap.
+# the binding, through `OpBinding.for_mask`, as a kept window does. The `SDPA` table below is the deployment's swap,
+# and `EAGER_DENSE` the model's, through its kernel settings.
 BINDINGS: dict[tuple[Storage, type[Op | Positions | None]], OpBinding] = {
     (PAGED, Attend): PagedAttend(),
     (PAGED, type(None)): PagedNoOp(),
@@ -2427,6 +2513,9 @@ BINDINGS: dict[tuple[Storage, type[Op | Positions | None]], OpBinding] = {
 }
 # What `backend: sdpa` binds in place of the default, for each storage and op type SDPA can run.
 SDPA: dict[tuple[Storage, type[Op]], OpBinding] = {(WITHIN_STEP, Attend): SdpaAttend()}
+# What `eager_backend: dense` binds in place of each default, by the default's type: the paged kernel on leased steps,
+# the dense one on the rest.
+EAGER_DENSE: dict[type[OpBinding], OpBinding] = {PagedAttend: EagerDenseAttend()}
 
 
 class Walks(NamedTuple):
@@ -2438,8 +2527,8 @@ class Walks(NamedTuple):
 
 @dataclass(frozen=True)
 class StateSetup:
-    """What a deployment sets up for the declared state: the binding it picks for each read whose resource doesn't take
-    the default, the store of the Values' host fields, and the walks its nodes run."""
+    """What a deployment sets up for the declared state: the binding it or the model's kernel settings pick for each
+    read that doesn't take the default, the store of the Values' host fields, and the walks its nodes run."""
 
     by_read: Mapping[str, OpBinding] = EMPTY
     host_fields: HostFields = dataclasses.field(default_factory=HostFields)

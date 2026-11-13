@@ -610,7 +610,7 @@ def deployment_setup(model: "Model", model_config: dict) -> "StateSetup":
     ``validate_deployment``, which reports them all."""
     from mstar.engine.state.adapters import state_setup
 
-    setup, problems = state_setup(model_config, model.declare_state())
+    setup, problems = state_setup(model_config, model.declare_state(), model.kernel_settings())
     if problems:
         raise ValueError(problems[0])
     return setup

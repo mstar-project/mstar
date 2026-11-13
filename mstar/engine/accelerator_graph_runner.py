@@ -2044,7 +2044,7 @@ class PiecewiseAcceleratorGraphRunner:
             # ingesting here would run before the buffers are built
             step = self._region_step(
                 self._dummy_rows.handles(self._dummy_key(shape, 0), shape.bs),
-                list(shape.seq_lens),
+                list(shape.seq_lens), leased=True,
             )
             if step is not None and any(
                 self._resources[key].force_double_buffer for key in step.steps
@@ -2094,7 +2094,7 @@ class PiecewiseAcceleratorGraphRunner:
                 shape = shapes[0]
                 step = self._region_step(
                     self._dummy_rows.handles(self._dummy_key(shape, 0), shape.bs),
-                    list(shape.seq_lens),
+                    list(shape.seq_lens), leased=True,
                 )
                 blocked = blocked_capture_resources(step, self._resources)
                 if blocked:
@@ -2422,7 +2422,7 @@ class PiecewiseAcceleratorGraphRunner:
         ``ctx.request_ids``: counting the tail there makes it scatter padding
         rows back over real state.
         """
-        step = self._region_step(request_ids, seq_lens, label_seq_lens)
+        step = self._region_step(request_ids, seq_lens, label_seq_lens, leased=bucket is not None)
         if step is None:
             return None
         n = len(request_ids) if real_bs is None else real_bs
@@ -2441,7 +2441,7 @@ class PiecewiseAcceleratorGraphRunner:
 
     def _region_step(
         self, request_ids: list[int], seq_lens: list[int],
-        label_seq_lens: dict[str, list[int]] | None = None,
+        label_seq_lens: dict[str, list[int]] | None = None, leased: bool = False,
     ):
         """The config's step for the region, with a step of its own segments under each of
         the node's resources that takes them (``with_segment_steps``), and what it declares
@@ -2452,7 +2452,7 @@ class PiecewiseAcceleratorGraphRunner:
             self._segment_keys,
         )
         handles = {name: h for name, h in self._state_handles.items() if not isinstance(h, ShardHandle)}
-        return state_steps(step, handles)
+        return state_steps(step, handles, leased=leased)
 
     def _plan(self, step, shape: PiecewiseCaptureShape) -> None:
         if step is None:
