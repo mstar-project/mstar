@@ -28,7 +28,7 @@ class PositronicPolicy:
     prompt_key: str = "prompt"
 
     @classmethod
-    def from_config(cls, block: dict) -> PositronicPolicy:
+    def from_config(cls, block: dict, model: object) -> PositronicPolicy:
         if not isinstance(block, dict) or set(block) - {"meta", "prompt_key"}:
             raise ValueError("positronic: takes only meta and prompt_key")
         meta = block.get("meta", {})
@@ -39,6 +39,8 @@ class PositronicPolicy:
             json.dumps(meta, allow_nan=False)
         except (TypeError, ValueError):
             raise ValueError("positronic: meta must be JSON serializable") from None
+        if not getattr(model, "POSITRONIC_SESSION_READY", False):
+            raise ValueError("positronic: this model has no ready Positronic session adapter")
         return cls(meta, prompt_key)
 
 
