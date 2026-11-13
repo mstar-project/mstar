@@ -50,6 +50,8 @@ class Preemption:
             self._caches[kv.key] = kv
             for node_name in kv.nodes:
                 self._keys[node_name].append(kv.key)
+        for kv in self._caches.values():
+            kv.cache.moves = all(self._moves(kv, node_name) for node_name in kv.nodes)
         self._preempted: dict[int, Preempted] = {}
         self.counts: dict[str, PreemptionCounts] = defaultdict(PreemptionCounts)
         self._waits_logged: dict[tuple[str, str], tuple[float, int]] = {}
@@ -67,19 +69,20 @@ class Preemption:
         if kv is None or not self._moves(kv, node_name):
             return False
         reason, engine = node_batch.admit_error, self._engine_manager.get_engine(node_name)
-        newer = engine.newer_than(reason.request_id)
-        victims = kv.cache.preempt(reason.request_id, reason.pages_short, newer, self._droppable(kv, engine))
+        newer, older = engine.newer_than(reason.request_id), engine.older_than(reason.request_id)
+        victims = kv.cache.preempt(reason.request_id, reason.pages_short, newer, older, self._droppable(kv, engine))
         if victims is None:
             return False
         if victims.waits:
             for node in kv.nodes:
                 self._engine_manager.get_engine(node).readmit_request(node, reason.request_id)
+            self.counts[node_name].take_back_waits += victims.takes_back
             self._log(
                 self._waits_logged, (node_name, node_batch.step_context.graph_walk),
-                "KV short on node=%s walk=%s: %s waits for %d pages past its allotment, since moving "
+                "KV short on node=%s walk=%s: %s waits for %d pages %s, since moving "
                 "what the pool can move wouldn't cover its shortage of %d (%d earlier waits not logged)",
                 node_name, node_batch.step_context.graph_walk, self._rid_str(reason.request_id), victims.waits,
-                reason.pages_short,
+                "it lent" if victims.takes_back else "past its allotment", reason.pages_short,
             )
         self._move(kv, self.counts[node_name], victims, reason.request_id)
         return True
@@ -107,7 +110,9 @@ class Preemption:
             if kv is None or not self._moves(kv, refusal.node_name):
                 continue
             newer = engine.newer_than(refusal.rid)
-            victims = None if newer is None else kv.cache.make_room(refusal.mark, newer, self._droppable(kv, engine))
+            victims = None if newer is None else kv.cache.make_room(
+                refusal.mark, newer, engine.older_than(refusal.rid), self._droppable(kv, engine),
+            )
             if victims is not None:
                 self._move(kv, self.counts[refusal.node_name], victims, refusal.rid)
                 return
@@ -185,6 +190,7 @@ class Preemption:
             record = self._preempted.setdefault(rid, Preempted())
             record.times += 1
             counts.victims += 1
+            counts.take_backs += victims.takes_back
             counts.preempted_again += record.times == 2
             kept = next((kept for node in nodes if (kept := self._rebuilds.kept(rid, node)) is not None), None)
             if kept is not None:

@@ -6,9 +6,12 @@ High-level components
 
 ``mstar`` is organized as a set of cooperating processes:
 
-- **API server** (``mstar/api_server/``): FastAPI layer that accepts ``POST /generate``,
-  tokenizes/loads media, dispatches the request, and streams results back to the client.
-  Entry point: ``mstar.api_server.entrypoint:main`` (the ``mstar-serve`` console script).
+- **API server** (``mstar/api_server/``): accepts ``POST /generate`` and the OpenAI
+  routes, tokenizes/loads media, dispatches the request, and streams results back to the
+  client. Entry point: ``mstar.api_server.entrypoint:main`` (the ``mstar-serve`` console
+  script). HTTP is served by ``mstar-server`` (``rust/server/``), which talks to the
+  Python process over a local bridge; ``--python-frontend`` serves it from the
+  deprecated FastAPI app instead.
 - **Conductor** (``mstar/conductor/``): central coordinator. It manages the request
   lifecycle, handles graph-walk transitions, selects workers, routes inputs, and
   detects completion.
