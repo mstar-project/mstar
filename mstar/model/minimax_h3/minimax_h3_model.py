@@ -292,7 +292,12 @@ class H3Model(Model):
         return dit_state(self.config.transformer)
 
     def kernel_settings(self) -> dict[str, dict[str, Any]]:
-        return {key: dict(settings) for key, settings in DIT_KERNEL_SETTINGS.items()}
+        settings = {key: dict(value) for key, value in DIT_KERNEL_SETTINGS.items()}
+        # On SP ranks the DiT's Ulysses exchange moves on the copy engines, a head group at a time
+        # beside the previous group's attention (bit-identical; 1344x768x124 on 2 H200s 148.2 ->
+        # 143.9 s a clip; 4 groups no better). One rank never exchanges, so it costs nothing there.
+        settings[DIT_ATTN]["ulysses_head_groups"] = 2
+        return settings
 
     def get_node_resources(self) -> list[SeqShardSpec]:
         """The video decoder's sequence shard, which splits each request's clips, which nothing exchanges
