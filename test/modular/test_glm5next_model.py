@@ -415,7 +415,7 @@ def test_serve_yaml_pages_cover_the_slot_pool(name):
 
 
 def test_glm5next_refuses_a_seed_pool_short_of_the_cap():
-    """Each MTP request holds a draft seed slot beside its KDA slot, so a YAML that raises one pool and not the other
+    """Each MTP request holds a draft seed slot beside its KDA slot, so a YAML that sizes the seed pool below the cap
     is refused at load."""
     import yaml
 

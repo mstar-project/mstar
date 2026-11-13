@@ -103,7 +103,7 @@ def _reference(model: Glm5NextModel) -> list:
     if k:
         del kda.blocks["mtp_hidden"], kda.blocks["mtp_draft"]
         specs.append(RecurrentStateSpec(resource_key=MTP_SEED, nodes={"LLM"}, config=RecurrentStateConfig(
-            num_layers=1, max_slots=model.kda_max_requests + 1, blocks={
+            num_layers=1, max_slots_of=KDA_STATE, blocks={
                 "hidden": RecurrentBlockConfig(shape=(cfg.hidden_size,), dtype=model.kda_conv_dtype),
                 "draft": RecurrentBlockConfig(shape=(), dtype=torch.long),
             },

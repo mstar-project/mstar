@@ -185,11 +185,12 @@ class Glm5NextModel(ByteLevelTextOutput, Model):
         return state
 
     def kernel_settings(self) -> dict[str, dict[str, Any]]:
-        # every request holding KDA state takes a slot, and each pool keeps one more, its sink
-        slots = {"max_slots": self.kda_max_requests + 1}
+        # every request holding KDA state takes a slot, and the pool keeps one more, its sink
+        settings = {KDA_STATE: {"max_slots": self.kda_max_requests + 1}}
         if self.config.mtp_num_draft_tokens:
-            return {KDA_STATE: slots, MTP_SEED: slots}
-        return {KDA_STATE: slots}
+            # each request's draft seed sits beside its KDA state, so a YAML that sizes the KDA pool sizes both
+            settings[MTP_SEED] = {"max_slots_of": KDA_STATE}
+        return settings
 
     def validate_config_yaml(self, config: dict, config_path: str) -> None:
         check_kv_pools_fit(self, config, config_path, logger)
