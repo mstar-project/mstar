@@ -50,6 +50,17 @@ class RaggedCrossAttentionStep(ResourceStep):
     pairs: tuple[tuple[str, str], ...] = ()
 
 
+@dataclass(frozen=True)
+class KeyPrefixAttentionStep(ResourceStep):
+    """A step of ``RaggedKeyPrefixAttentionSpec``: every token of each segment is a
+    query, and attends the first ``key_lens[i]`` tokens of its own segment, where
+    ``key_lens`` runs parallel to ``segments`` (``0 < key_lens[i] <= span``, or 0
+    for an empty segment). Never causal.
+    """
+
+    key_lens: tuple[int, ...] = ()
+
+
 @dataclass
 class RaggedAttentionConfig:
     """Varlen attention over segments packed into one forward, with no KV
@@ -311,3 +322,20 @@ class RaggedBlockCausalAttentionSpec(_RaggedSpecBase):
         from mstar.engine.resources.attn.ragged.base import RaggedBlockCausalAttnManager
 
         return RaggedBlockCausalAttnManager
+
+
+@dataclass
+class RaggedKeyPrefixAttentionSpec(_RaggedSpecBase):
+    """Cacheless self-attention within each span where only a prefix of the span is
+    attendable (``KeyPrefixAttentionStep``): a key padding mask, as a batch of padded
+    clips through a Whisper-style encoder carries, whose padded frames still query.
+
+    Its own kind, not a flag on ``RaggedAttentionSpec``: its keys are a layout of their
+    own, which the resource gathers K and V into before the kernel runs.
+    """
+
+    @property
+    def resource_class(self) -> "type[Resource]":
+        from mstar.engine.resources.attn.ragged.base import RaggedKeyPrefixAttnManager
+
+        return RaggedKeyPrefixAttnManager

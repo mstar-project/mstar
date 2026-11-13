@@ -7,6 +7,7 @@ FlashInfer wrappers live here; FA3 is in ``dense_wrappers.py``.
 import math
 from abc import ABC, abstractmethod
 
+import numpy as np
 import torch
 import triton
 import triton.language as tl
@@ -267,6 +268,64 @@ class PrefixedPrefillWrapper(_RaggedPrefillBase):
         self._plan(q_cu_seqlens, kv_cu_seqlens, causal)
 
 
+def key_prefix_layout(
+    spans: list[int], key_lens: list[int], rows: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The key side of a key-prefix plan: ``kv_cu_seqlens`` over each segment's first
+    ``key_lens[i]`` tokens, and the query-layout row each packed key comes from, padded
+    with row 0 to ``rows`` (the keys' total by default). Both on the CPU, the index in a
+    fresh pinned buffer, for a non-blocking H2D."""
+    if len(spans) != len(key_lens):
+        raise ValueError(f"{len(key_lens)} key lengths for {len(spans)} segments")
+    bad = [i for i, (n, kl) in enumerate(zip(spans, key_lens, strict=True)) if not (0 < kl <= n or kl == n == 0)]
+    if bad:
+        raise ValueError(
+            f"key lengths must be in 1..span (0 for an empty segment); segment {bad[0]} has "
+            f"{key_lens[bad[0]]} of {spans[bad[0]]}"
+        )
+    lens = np.asarray(key_lens, dtype=np.int64)
+    total = int(lens.sum())
+    starts = np.zeros(len(spans), dtype=np.int64)
+    np.cumsum(spans[:-1], out=starts[1:])
+    kv_cu = torch.zeros(len(spans) + 1, dtype=torch.int32)
+    torch.cumsum(torch.from_numpy(lens), 0, out=kv_cu[1:])
+    index = torch.zeros(total if rows is None else rows, dtype=torch.int64, pin_memory=torch.cuda.is_available())
+    # segment i's keys are rows starts[i] .. starts[i] + key_lens[i] - 1
+    index[:total] = torch.from_numpy(
+        np.repeat(starts - np.concatenate(([0], np.cumsum(lens)[:-1])), lens) + np.arange(total)
+    )
+    return kv_cu, index
+
+
+class _KeyPrefixMixin:
+    """Self-attention within each segment over a prefix of its keys, run as a
+    cross-attention against K and V gathered into a key layout of their own
+    (``key_prefix_layout``). The gather index is padded to the query rows so the
+    gather has a fixed shape; its padding points at row 0, so whatever the kernel
+    reads past the keys' total under its mask is finite."""
+
+    _kv_index: torch.Tensor | None = None
+
+    @torch.compiler.disable
+    def plan_key_prefix(self, cu_seqlens: torch.Tensor, key_lens: list[int]) -> None:
+        spans = cu_seqlens.to(torch.int64).diff().tolist()
+        rows = self.max_total_tokens if self.accelerator_graph else sum(spans)
+        kv_cu, index = key_prefix_layout(spans, key_lens, rows)
+        # Staged before the kernel's plan on every plan, so the index always belongs
+        # to the schedule the wrapper holds, a plan that raises included.
+        if self.accelerator_graph:
+            if self._kv_index is None:
+                self._kv_index = torch.zeros(rows, dtype=torch.int64, device=self.device)
+            self._kv_index.copy_(index, non_blocking=True)
+        else:
+            self._kv_index = index.to(self.device, non_blocking=True)
+        self._plan(cu_seqlens, kv_cu, causal=False)
+
+    def run(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, return_lse: bool = False):
+        index = self._kv_index[: k.shape[0]]
+        return super().run(q, k.index_select(0, index), v.index_select(0, index), return_lse=return_lse)
+
+
 class _FlashInferRaggedPrefillBase(_RaggedPrefillBase):
     """FlashInfer's ragged prefill (``BatchPrefillWithRaggedKVCacheWrapper``).
 
@@ -393,6 +452,10 @@ class FlashInferRaggedPrefillWrapper(_FlashInferRaggedPrefillBase, RaggedPrefill
 
 class FlashInferRaggedCrossPrefillWrapper(_FlashInferRaggedPrefillBase, RaggedCrossPrefillWrapper):
     """Ragged cross-attention through FlashInfer."""
+
+
+class FlashInferKeyPrefixPrefillWrapper(_KeyPrefixMixin, FlashInferRaggedCrossPrefillWrapper):
+    """Key-prefix self-attention through FlashInfer."""
 
 
 class FlashInferPrefixedPrefillWrapper(_FlashInferRaggedPrefillBase, PrefixedPrefillWrapper):
