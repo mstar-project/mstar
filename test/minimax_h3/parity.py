@@ -9,6 +9,8 @@ with ``--exact``, also when any compared tensor is not bit-identical (the docs' 
 
     PYTHONPATH=<tree> python test/minimax_h3/parity.py --snapshot <MiniMax-H3> \
         --oracle /tmp/h3_oracle/oracle.pt --device cuda:1 --out /tmp/h3_parity.json
+
+``--distilled <FastH3 release>`` checks a recording made with ``oracle.py --distilled``.
 """
 
 from __future__ import annotations
@@ -92,6 +94,7 @@ def parse_args():
     p.add_argument("--min-psnr", type=float, default=40.0, help="dB, the video decode of the reference's latents")
     p.add_argument("--min-snr", type=float, default=40.0, help="dB, the audio decode of the reference's latents")
     p.add_argument("--exact", action="store_true", help="also fail on any compared tensor that is not bit-identical")
+    p.add_argument("--distilled", type=Path, default=None, help="the distilled release the oracle sampled")
     return p.parse_args()
 
 
@@ -176,7 +179,8 @@ def run(args, report: dict, failures: list[str]) -> None:
     oracle = torch.load(args.oracle, weights_only=False)
     a = oracle["args"]
     stages = set(args.stages.split(","))
-    model = H3Model(model_path_hf=str(args.snapshot))
+    model = H3Model(model_path_hf=str(args.snapshot),
+                    distilled_checkpoint=None if args.distilled is None else str(args.distilled))
     config = model.config
     # every attention through its declared read, bound as `backend: sdpa` on its resource binds it
     on_sdpa, problems = state_setup({"resources": {key: {"backend": "sdpa"} for key in (DIT_ATTN, REFINER_ATTN)}},
@@ -233,7 +237,7 @@ def run(args, report: dict, failures: list[str]) -> None:
         ]), step0["video_indices"]))
         report["audio_indices_equal"] = bool(torch.equal(
             torch.arange(layout.audio_start, layout.video_start), step0["audio_indices"]))
-        sched = h3_schedule(request["num_inference_steps"], request["video_shift"], request["audio_shift"])
+        sched = h3_schedule(*model.resolve_schedule(kwargs))
         ts = [s["timestep"] for s in oracle["steps"]]
         report["schedule_steps"] = [sched.num_steps, len(ts)]
         def distinct(k):
@@ -277,7 +281,7 @@ def run(args, report: dict, failures: list[str]) -> None:
     if "text" in stages:
         t0 = time.time()
         encoder = weight_loader.build_text_encoder(config, args.snapshot, dev)
-        conditioner = weight_loader.build_text_conditioner(config, args.snapshot, dev)
+        conditioner = weight_loader.build_text_conditioner(config, args.snapshot, dev, dit_source=config.dit_source)
         prompt_handles = node_handles(model, TEXT_ENCODER_NODE, {}, setup=on_sdpa)
         for module in conditioner.modules():
             if hasattr(module, "bind_state"):
@@ -303,12 +307,12 @@ def run(args, report: dict, failures: list[str]) -> None:
 
     loops = {}
     if stages & {"dit", "loop"}:
-        dit = weight_loader.build_transformer(config, args.snapshot, dev)
+        dit = weight_loader.build_transformer(config, args.snapshot, dev, dit_source=config.dit_source)
         sub = H3DenoiseSubmodule(dit, config, loop_name="denoise_loop")
         one_rank = SequenceShard(("main",), 0, None, 0, types.SimpleNamespace(world_size=1))
         sub.bind_node_state(node_handles(model, DIT_NODE, {DIT_SHARD: one_rank}, setup=on_sdpa))
         step_layout = sub.build_layout(layout, dev)
-        sched = h3_schedule(request["num_inference_steps"], request["video_shift"], request["audio_shift"])
+        sched = h3_schedule(*model.resolve_schedule(kwargs))
         text = text_rows.to(dev)
         plans = {entry["k"]: (entry["timestep"], entry["timestep_indices"]) for entry in oracle["steps"]}
 
