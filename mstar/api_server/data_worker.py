@@ -978,18 +978,21 @@ class PreprocessWorkerThread:
         file_states: dict[str, list[tuple[int, int, int]]] = {}
         raw_inputs = input.raw_inputs
         positronic_kwargs = {}
+        positronic_observation = None
         if input.positronic_frame is not None:
             if input.file_paths or raw_inputs:
                 raise ValueError("Positronic observations cannot also carry file or raw inputs")
             from mstar.api_server.positronic_input import decode_praxis_frame
 
             embodiment = getattr(getattr(self.model, "config", None), "embodiment", None)
-            decoded = decode_praxis_frame(input.positronic_frame, embodiment)
-            raw_inputs = {"image": decoded.images}
+            expected_rows = (input.model_kwargs or {}).get("executed_rows", 0)
+            positronic_observation = decode_praxis_frame(input.positronic_frame, embodiment, expected_rows)
+            raw_inputs = {"image": positronic_observation.images}
             positronic_kwargs = {
-                "robot_state": decoded.robot_state,
-                "pose_descriptor": decoded.pose_descriptor,
+                "robot_state": positronic_observation.robot_state,
+                "pose_descriptor": positronic_observation.pose_descriptor,
                 "action_format": "positronic",
+                "executed_rows": positronic_observation.executed_rows,
             }
 
         # First, load raw modality tensors from file_paths (images, audio, video)
@@ -1003,6 +1006,9 @@ class PreprocessWorkerThread:
             # a prefix key hashes each input's file, and these have none
             raise ValueError("this deployment keys prompts by their media files; send the media as files")
         tensors, input_metadata = self._load_media(input.file_paths, raw_inputs)
+        if positronic_observation is not None:
+            tensors["executed_frame_inputs"] = positronic_observation.executed_frames
+            tensors["executed_pose_inputs"] = [positronic_observation.executed_poses]
 
 
         # Then, tokenize the prompt and let the model augment/transform the
@@ -1027,7 +1033,7 @@ class PreprocessWorkerThread:
         open_streams = self._client_edges - input.ends
         num_prompt_tokens = 0
         episode_keys = None
-        reset_episode = False
+        reset_episode = positronic_observation.reset_episode if positronic_observation is not None else False
         if self.model is not None:
             prompt_tensors = self.model.process_prompt(
                 input.text,
@@ -1042,7 +1048,7 @@ class PreprocessWorkerThread:
             root = input.prefix_root
             if isinstance(prompt_tensors, ProcessPromptOutput):
                 episode_keys = dict(prompt_tensors.episode_keys or {})
-                reset_episode = prompt_tensors.reset_episode
+                reset_episode = reset_episode or prompt_tensors.reset_episode
                 selected = input.model_kwargs or {}
                 model_kwargs.update(prompt_tensors.metadata)
                 if prompt_tensors.lora_adapter is not KEEP_ADAPTER or any(

@@ -320,6 +320,8 @@ def test_positronic_observation_reaches_model_as_raw_pose_and_image_inputs(monke
     )
     wt._process_waiting_input(request)
     assert [tuple(t.shape) for t in model.seen["tensors"]["image_inputs"]] == [(3, 4, 6)] * 2
+    assert [tuple(t.shape) for t in model.seen["tensors"]["executed_frame_inputs"]] == [(0, 3, 4, 6)] * 2
+    assert model.seen["tensors"]["executed_pose_inputs"][0].shape == (0, 8)
     assert model.seen["robot_state"] == [0, 0, pytest.approx(0.6), 1, 0, 0, 0, 0.25]
     assert model.seen["pose_descriptor"] == "remote.robolab.droid"
     assert model.seen["control_mode"] == "droid_impedance"
@@ -328,6 +330,45 @@ def test_positronic_observation_reaches_model_as_raw_pose_and_image_inputs(monke
     sent = [m.body for m in wt.communicator.sent if m.message_type == ConductorMessageType.NEW_REQUEST]
     assert len(sent) == 1 and sent[0].episode == "episode"
     assert "robot_state" not in sent[0].model_kwargs
+
+
+@pytest.mark.parametrize(("frames", "expected_rows", "reset"), [(22, 21, False), (21, 21, True)])
+def test_positronic_warm_window_sets_conductor_reset_before_admission(monkeypatch, frames, expected_rows, reset):
+    from mstar.api_server.openpi import pack
+    from mstar.model.base import TensorAndMetadata
+
+    class WarmStub(_Serial):
+        config = SimpleNamespace(embodiment="single_arm")
+
+        def load_decoded_image(self, image, device):
+            return TensorAndMetadata(image.to(device))
+
+        def process_prompt(self, text, input_modalities, output_modalities, **kwargs):
+            self.seen = kwargs
+            return ProcessPromptOutput({"text_inputs": [torch.tensor([1])]}, {})
+
+    monkeypatch.setattr(cpus, "_plan", cpus.CpuPlan(frozenset(range(8)), usable=8))
+    model = WarmStub()
+    wt = _thread(model)
+    image = np.stack([np.full((4, 6, 3), n, np.uint8) for n in range(frames)])
+    obs = {
+        "image.exterior": image, "image.wrist": image,
+        "robot_state.ee_pose": np.array([[n, 0, 0.6, 1, 0, 0, 0] for n in range(frames)], np.float32),
+        "grip": np.zeros(frames, np.float32),
+    }
+    wt._process_waiting_input(PreprocessInput(
+        request_id="warm", text="move", file_paths=None,
+        input_modalities=["image", "text"], output_modalities=["action"],
+        model_kwargs={"executed_rows": expected_rows},
+        positronic_frame=pack({"session_id": "episode", "observation": obs}), episode="episode",
+    ))
+    window = model.seen["tensors"]
+    assert [t.shape[0] for t in window["executed_frame_inputs"]] == [0 if reset else 21] * 2
+    assert window["executed_pose_inputs"][0].shape == (0 if reset else 21, 8)
+    sent = [m.body for m in wt.communicator.sent if m.message_type == ConductorMessageType.NEW_REQUEST]
+    assert len(sent) == 1
+    assert sent[0].reset_episode is reset
+    assert sent[0].model_kwargs["executed_rows"] == (0 if reset else expected_rows)
 
 
 def test_requests_overlap_and_reach_the_conductor_in_arrival_order(worker):

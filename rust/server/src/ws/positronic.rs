@@ -75,11 +75,12 @@ fn prompt(obs: &Mp, policy: &Policy) -> Result<String, String> {
     }.ok_or_else(|| format!("the observation needs a {} string", policy.prompt_key))
 }
 
-async fn infer(st: &AppState, policy: &Policy, obs: &Mp, session_id: &str, reset: bool, frame: &[u8]) -> Result<(Mp, String), String> {
+async fn infer(st: &AppState, policy: &Policy, obs: &Mp, session_id: &str, reset: bool, frame: &[u8], prior_rows: usize) -> Result<(Mp, String), String> {
     let prompt = prompt(obs, policy)?;
     let mut model_kwargs = serde_json::Map::new();
     if policy.observation_format == "praxis1" {
         model_kwargs.insert("control_mode".into(), Value::String(policy.control_mode.clone()));
+        model_kwargs.insert("executed_rows".into(), Value::from(if reset { 0 } else { prior_rows }));
     }
     let args = SubmitArgs {
         text: Some(prompt.clone()),
@@ -131,6 +132,7 @@ async fn end(st: &AppState, id: &str) -> Result<(), String> {
 
 async fn serve(mut socket: WebSocket, st: AppState, policy: &'static Policy) {
     let id = uuid::Uuid::new_v4().simple().to_string();
+    let mut prior_rows = 0;
     let loading = pack(&json!({"status": "loading", "message": "Loading policy..."}));
     let ready = pack(&json!({
         "status": "ready", "meta": policy.meta, "protocol_version": 2,
@@ -174,12 +176,14 @@ async fn serve(mut socket: WebSocket, st: AppState, policy: &'static Policy) {
         };
         let reset = get(&obs, "reset_context") == Some(&Mp::Boolean(true))
             || get(&obs, "__reset_context__") == Some(&Mp::Boolean(true));
+        if reset { prior_rows = 0; }
         let decode_ms = started.elapsed().as_secs_f64() * 1000.0;
         let infer_started = Instant::now();
-        let (rows, effective_prompt) = match infer(&st, policy, &obs, &id, reset, &data).await {
+        let (rows, effective_prompt) = match infer(&st, policy, &obs, &id, reset, &data, prior_rows).await {
             Ok(rows) => rows,
             Err(e) => { failed(&mut socket, &e).await; break; }
         };
+        prior_rows = rows.as_array().map_or(0, Vec::len);
         let infer_ms = infer_started.elapsed().as_secs_f64() * 1000.0;
         let timing = Mp::Map(vec![
             (Mp::from("served_ms"), Mp::F64((started.elapsed().as_secs_f64() * 10000.0).round() / 10.0)),

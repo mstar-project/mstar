@@ -142,12 +142,14 @@ def _normalise(messages):
     return messages
 
 
-def python_session(stub, make_frame=frame):
+def python_session(stub, make_frame=frame, requests=3, reset_last=True):
     entrypoint.api_server = stub
     with TestClient(entrypoint.app).websocket_connect("/api/v1/session") as ws:
         messages = [msgpack.unpackb(ws.receive_bytes()) for _ in range(2)]
         id = messages[1]["session_id"]
-        for data in (make_frame(id), make_frame(id), make_frame(id, reset_context=True)):
+        for call_index in range(requests):
+            data = make_frame(id, call_index=call_index, **({"reset_context": True}
+                                                            if reset_last and call_index == requests - 1 else {}))
             ws.send_bytes(data)
             messages.append(msgpack.unpackb(ws.receive_bytes()))
         ws.send_bytes(msgpack.packb({"session_id": id, "end_session": True}))
@@ -155,11 +157,13 @@ def python_session(stub, make_frame=frame):
     return messages
 
 
-def rust_session(port, make_frame=frame):
+def rust_session(port, make_frame=frame, requests=3, reset_last=True):
     with websockets.sync.client.connect(f"ws://127.0.0.1:{port}/api/v1/session", compression=None) as ws:
         messages = [msgpack.unpackb(ws.recv()) for _ in range(2)]
         id = messages[1]["session_id"]
-        for data in (make_frame(id), make_frame(id), make_frame(id, reset_context=True)):
+        for call_index in range(requests):
+            data = make_frame(id, call_index=call_index, **({"reset_context": True}
+                                                            if reset_last and call_index == requests - 1 else {}))
             ws.send(data)
             messages.append(msgpack.unpackb(ws.recv()))
         ws.send(msgpack.packb({"session_id": id, "end_session": True}))
@@ -198,21 +202,22 @@ def test_praxis_mode_sends_same_original_observation_to_shared_data_worker():
                 "image.wrist": images + 1,
                 "robot_state.ee_pose": np.array([[0, 0, n, 1, 0, 0, 0] for n in (0.1, 0.2, 0.3, 0.4)], np.float32),
                 "grip": np.array([0.1, 0.2, 0.3, 0.4], np.float32),
-                "descriptor": "remote.robolab.droid", **extra,
+                "descriptor": "remote.robolab.droid", "executed_rows": 999, **extra,
             },
         )
 
     with rust(stub) as port:
-        python_session(stub, stacked_frame)
+        python_session(stub, stacked_frame, requests=4)
         py_submissions = list(stub.submissions)
         stub.submissions.clear()
-        rust_session(port, stacked_frame)
+        rust_session(port, stacked_frame, requests=4)
         rs_submissions = list(stub.submissions)
-    assert len(py_submissions) == len(rs_submissions) == 3
+    assert len(py_submissions) == len(rs_submissions) == 4
     for py, rs in zip(py_submissions, rs_submissions, strict=True):
         for submission in (py, rs):
             assert submission["input_modalities"] == ["image", "text"]
             assert submission["model_kwargs"]["control_mode"] == "droid_impedance"
+            assert submission["model_kwargs"]["executed_rows"] in (0, 21, 24)
             parsed = msgpack.unpackb(submission["positronic_frame"], raw=False)
             assert parsed["session_id"] == submission["episode"]
             assert parsed["observation"]["prompt"] == "go"
@@ -223,8 +228,48 @@ def test_praxis_mode_sends_same_original_observation_to_shared_data_worker():
         assert py["positronic_frame"].replace(py["episode"].encode(), b"ID") == rs["positronic_frame"].replace(
             rs["episode"].encode(), b"ID"
         )
-    assert [s["reset_episode"] for s in py_submissions] == [False, False, True]
-    assert [s["reset_episode"] for s in rs_submissions] == [False, False, True]
+    assert [s["reset_episode"] for s in py_submissions] == [False, False, False, True]
+    assert [s["reset_episode"] for s in rs_submissions] == [False, False, False, True]
+    assert [s["model_kwargs"]["executed_rows"] for s in py_submissions] == [0, 21, 24, 0]
+    assert [s["model_kwargs"]["executed_rows"] for s in rs_submissions] == [0, 21, 24, 0]
+
+
+def test_short_stack_cold_reply_resynchronizes_both_frontends():
+    class WindowStub(Stub):
+        def submit_request(self, **kw):
+            decoded = decode_praxis_frame(
+                kw["positronic_frame"], "single_arm", kw["model_kwargs"]["executed_rows"],
+            )
+            if decoded.reset_episode:
+                self.depth[kw["episode"]] = 0
+            return super().submit_request(**kw)
+
+    def window_frame(session_id, call_index, **extra):
+        count = (1, 22, 21, 22)[call_index]
+        frames = np.stack([np.full((3, 4, 3), i, np.uint8) for i in range(count)])
+        return frame(session_id, **{
+            "image.exterior": frames, "image.wrist": frames,
+            "robot_state.ee_pose": np.array([[i, 0, 0.6, 1, 0, 0, 0] for i in range(count)], np.float32),
+            "grip": np.zeros(count, np.float32), **extra,
+        })
+
+    stub = WindowStub()
+    stub.positronic_policy = PositronicPolicy({"robot": "stub"}, observation_format="praxis1")
+    with rust(stub) as port:
+        py = python_session(stub, window_frame, requests=4, reset_last=False)
+        py_submissions = list(stub.submissions)
+        stub.submissions.clear()
+        rs = rust_session(port, window_frame, requests=4, reset_last=False)
+        rs_submissions = list(stub.submissions)
+    assert _normalise(py) == _normalise(rs)
+    assert [len(m["result"]) for m in py[2:6]] == [21, 24, 21, 24]
+    for submissions in (py_submissions, rs_submissions):
+        assert [s["model_kwargs"]["executed_rows"] for s in submissions] == [0, 21, 24, 21]
+        resets = [
+            decode_praxis_frame(s["positronic_frame"], "single_arm", s["model_kwargs"]["executed_rows"]).reset_episode
+            for s in submissions
+        ]
+        assert resets == [False, False, True, False]
 
 
 def test_wrong_session_id_fails_and_ends_once():

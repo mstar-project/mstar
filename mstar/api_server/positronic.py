@@ -82,14 +82,18 @@ def _prompt(obs: dict, policy: PositronicPolicy) -> str:
     return prompt
 
 
-async def _infer(api, obs: dict, policy: PositronicPolicy, session_id: str, reset: bool, frame: bytes) -> list[dict]:
+async def _infer(
+    api, obs: dict, policy: PositronicPolicy, session_id: str, reset: bool, frame: bytes, prior_rows: int,
+) -> list[dict]:
     prompt = _prompt(obs, policy)
     request_id = api.submit_request(
         text=prompt,
         input_modalities=["image", "text"] if policy.observation_format == "praxis1" else ["text"],
         output_modalities=["action"],
         streaming=True, episode=session_id, reset_episode=reset,
-        **({"positronic_frame": frame, "model_kwargs": {"control_mode": policy.control_mode}}
+        **({"positronic_frame": frame, "model_kwargs": {
+            "control_mode": policy.control_mode, "executed_rows": 0 if reset else prior_rows,
+        }}
            if policy.observation_format == "praxis1" else {}),
     )
     data = None
@@ -118,6 +122,7 @@ async def serve_connection(websocket: WebSocket, api) -> None:
     await websocket.accept()
     session_id = secrets.token_hex(16)
     ended = False
+    prior_rows = 0
     try:
         await websocket.send_bytes(_pack({"status": "loading", "message": "Loading policy..."}))
         await websocket.send_bytes(_pack({
@@ -147,8 +152,11 @@ async def serve_connection(websocket: WebSocket, api) -> None:
                     return
                 assert obs is not None
                 reset = obs.get("reset_context") is True or obs.get("__reset_context__") is True
+                if reset:
+                    prior_rows = 0
                 infer_started = time.monotonic()
-                rows = await _infer(api, obs, policy, session_id, reset, data)
+                rows = await _infer(api, obs, policy, session_id, reset, data, prior_rows)
+                prior_rows = len(rows)
                 elapsed = (time.monotonic() - started) * 1000
                 infer_ms = (time.monotonic() - infer_started) * 1000
                 await websocket.send_bytes(_pack({

@@ -36,6 +36,10 @@ class PraxisObservation:
     images: list[torch.Tensor]
     robot_state: list[float]
     pose_descriptor: str
+    executed_frames: list[torch.Tensor]
+    executed_poses: torch.Tensor
+    executed_rows: int
+    reset_episode: bool
 
 
 class _Decoder:
@@ -141,10 +145,40 @@ def _last_grip(obs: dict, keys: tuple[str, ...]) -> float:
     return float(value[-1])
 
 
-def decode_praxis_frame(frame: bytes, embodiment: str) -> PraxisObservation:
-    """Read current RGB views and raw client pose from one v2 request frame."""
+def _pose_rows(obs: dict, pose_keys: tuple[str, ...], grip_keys: tuple[str, ...]) -> np.ndarray | None:
+    """Return aligned raw pose rows, or None when a history stack is absent."""
+    try:
+        pose = np.asarray(_pick(obs, pose_keys), dtype=np.float32)
+        grip = np.asarray(_pick(obs, grip_keys), dtype=np.float32)
+    except ValueError:
+        return None
+    if pose.ndim == 1:
+        pose = pose[None]
+    if pose.ndim != 2 or pose.shape[1] < 7:
+        return None
+    if grip.ndim == 0:
+        grip = grip.reshape(1, 1)
+    elif grip.ndim == 1:
+        grip = grip.reshape(-1, 1)
+    elif grip.ndim == 2:
+        grip = grip[:, :1]
+    else:
+        return None
+    if grip.shape[0] != pose.shape[0] or not np.isfinite(pose[:, :7]).all() or not np.isfinite(grip).all():
+        return None
+    return np.concatenate((pose[:, :7], grip), axis=1)
+
+
+def decode_praxis_frame(frame: bytes, embodiment: str, expected_prior_rows: int = 0) -> PraxisObservation:
+    """Read current inputs and the executed stack preceding the current frame.
+
+    ``expected_prior_rows`` comes from the previous served action count. A
+    missing or short stack restarts the episode before conductor admission.
+    """
     if embodiment not in VIEWS:
         raise ValueError(f"unsupported Praxis embodiment {embodiment!r}")
+    if type(expected_prior_rows) is not int or expected_prior_rows not in (0, 21, 24):
+        raise ValueError("expected_prior_rows must be 0, 21 or 24")
     if len(frame) > MAX_DECODED_BYTES:
         raise ValueError("Positronic frame exceeds the request byte limit")
     decoder = _Decoder()
@@ -156,13 +190,15 @@ def decode_praxis_frame(frame: bytes, embodiment: str) -> PraxisObservation:
     if not isinstance(obs, dict):
         raise ValueError("a v2 request carries an observation dict")
     images = []
+    stacks = []
     for candidates in VIEWS[embodiment]:
         value = np.asarray(_pick(obs, candidates))
-        if value.ndim == 4:
-            value = value[-1]
-        if value.ndim != 3 or value.shape[-1] != 3 or value.dtype != np.uint8:
+        if value.ndim == 3:
+            value = value[None]
+        if value.ndim != 4 or value.shape[-1] != 3 or value.dtype != np.uint8 or value.shape[0] < 1:
             raise ValueError(f"{candidates[0]} must be RGB uint8 HWC")
-        images.append(torch.from_numpy(np.array(value.transpose(2, 0, 1), order="C", copy=True)))
+        stacks.append(value)
+        images.append(torch.from_numpy(np.array(value[-1].transpose(2, 0, 1), order="C", copy=True)))
     if embodiment == "single_arm":
         robot_state = [
             *_last_pose(obs, ("ee_pose", "robot_state.ee_pose")),
@@ -173,9 +209,43 @@ def decode_praxis_frame(frame: bytes, embodiment: str) -> PraxisObservation:
         for side in ("left", "right"):
             robot_state.extend(_last_pose(obs, (f"robot_state.{side}.ee_pose", f"ee_pose.{side}")))
             robot_state.append(_last_grip(obs, (f"grip.{side}", f"robot_state.{side}.grip", f"gripper.{side}")))
+    if embodiment == "single_arm":
+        pose_rows = _pose_rows(
+            obs, ("ee_pose", "robot_state.ee_pose"), ("grip", "robot_state.grip", "gripper"),
+        )
+    else:
+        arms = [
+            _pose_rows(
+                obs, (f"robot_state.{side}.ee_pose", f"ee_pose.{side}"),
+                (f"grip.{side}", f"robot_state.{side}.grip", f"gripper.{side}"),
+            ) for side in ("left", "right")
+        ]
+        pose_rows = None if any(rows is None for rows in arms) else np.concatenate(
+            [rows[-min(len(rows) for rows in arms):] for rows in arms], axis=1
+        )
+    # The next chunk consumes at most 24 prior rows. Keep the common suffix,
+    # even when an uncompressed client sends a longer camera stack.
+    available = min(24, *[len(stack) - 1 for stack in stacks], len(pose_rows) - 1 if pose_rows is not None else 0)
+    reset_episode = expected_prior_rows > available
+    # A new or explicitly reset episode seeds only the current real frame.
+    if reset_episode or expected_prior_rows == 0:
+        available = 0
+    executed_frames = [
+        torch.from_numpy(np.array(stack[-(available + 1):-1].transpose(0, 3, 1, 2), order="C", copy=True))
+        if available else torch.empty((0, *image.shape), dtype=torch.uint8)
+        for stack, image in zip(stacks, images, strict=True)
+    ]
+    pose_dim = 8 if embodiment == "single_arm" else 16
+    executed_poses = (
+        torch.from_numpy(np.array(pose_rows[-(available + 1):-1], dtype=np.float32, copy=True))
+        if available and pose_rows is not None else torch.empty((0, pose_dim), dtype=torch.float32)
+    )
     descriptor = obs.get("descriptor") or ""
     if isinstance(descriptor, bytes):
         descriptor = descriptor.decode("utf-8", "replace")
     if not isinstance(descriptor, str):
         raise ValueError("descriptor must be a string")
-    return PraxisObservation(images, robot_state, descriptor)
+    return PraxisObservation(
+        images, robot_state, descriptor, executed_frames, executed_poses,
+        0 if reset_episode else expected_prior_rows, reset_episode,
+    )

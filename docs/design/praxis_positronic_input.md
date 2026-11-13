@@ -6,6 +6,8 @@ once. It sends the latest frame from each camera as `image_inputs`, and the
 latest client-frame pose as `robot_state`. The Praxis model converts that pose
 to its model frame before proprio and command composition. `pose_descriptor`,
 `control_mode`, and `action_format="positronic"` travel with the model request.
+The worker also passes prior camera and pose rows to `process_prompt` as
+`executed_frame_inputs` and `executed_pose_inputs`.
 
 ```mermaid
 flowchart LR
@@ -19,10 +21,14 @@ flowchart LR
 
 ## Executed frame window for warm calls
 
-The current adapter is a cold input handoff. It deliberately selects the last
-camera and pose row. It does not preserve an earlier stack row in episode
-state, so it must not claim warm Praxis parity or declare the model ready for
-Positronic sessions yet. The startup capability gate rejects that deployment.
+The session frontend keeps one scalar: the last reply's action row count. It
+sends that as `executed_rows` on the next request, or zero for a first or
+explicitly reset request. The data worker checks the actual camera and pose
+stacks. If they contain too few prior rows, it sends `reset_episode` and
+`executed_rows=0` to the conductor before admission, and gives the model empty
+prior tensors. A first or explicitly reset call also gets empty prior tensors,
+even if the client sent a frame stack. The startup capability gate remains
+closed until the Praxis model and episode state can consume these tensors.
 
 The pinned single-arm reference's `executed_clip(obs, need)` uses rows
 `[-(need + 1):-1]` from both camera stacks. `pose8_history` selects the same
@@ -31,13 +37,18 @@ belong to the executed window. The bimanual reference applies the same window
 to all three views and both arm poses. If the necessary stack is missing or
 short, the reference restarts context at depth zero.
 
-Warm serving needs the model to read that aligned executed window, encode the
-real frames, and retain the resulting clean state through the E2/E3 episode
-view. Reset must discard that state before using the request's current frame.
-The window belongs to the model's declared episode resources. It must not
-become a separate frontend cache or an unbounded `step_metadata` value.
+The worker passes the full available prior suffix, aligned across views and
+poses, as uint8 `(T,3,H,W)` stacks and one raw float32 `(T,8 or 16)` pose
+stack. The model uses `EpisodeView` and `executed_rows` to select its append
+span. On the first warm call, the cold seed already holds the first real row,
+so the model appends the final 20 of the 21 prior rows. Later calls append the
+final 24. The model must encode those real frames and retain clean state in
+its declared episode resources. Reset discards that state before using the
+request's current frame. No frontend cache or frame data in `step_metadata`
+is needed.
 
-The parser's current-frame and binary transport tests cover cold, subsequent,
-and reset requests. They do not establish warm model output parity. That gate
-needs an episode-aware Praxis model and a CPU reference test using executed
-camera and pose stacks before `POSITRONIC_SESSION_READY` can be set.
+The parser, data-worker and binary transport tests cover cold, subsequent,
+short-stack reset and explicit reset requests. They do not establish warm
+model output parity. That gate needs the episode-aware Praxis model and a CPU
+reference test for executed-frame encoding before
+`POSITRONIC_SESSION_READY` can be set.
