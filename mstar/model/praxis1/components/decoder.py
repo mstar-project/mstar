@@ -73,6 +73,8 @@ class DecoderTower(nn.Module):
         positive_zero_residual_add: bool = True,
     ) -> None:
         super().__init__()
+        if core.modulators is None or not core.modulators:
+            raise ValueError("the decoder core needs per-block modulators")
         self.registers = nn.Parameter(torch.zeros(1, num_registers, dim))
         self.t_embedding = TimestepEmbedding(time_dim)
         self.t_proj = nn.ModuleDict({VIDEO: nn.Linear(time_dim, 2 * dim)})
@@ -104,7 +106,8 @@ class DecoderTower(nn.Module):
         kk = int(timesteps.shape[1])
         if not kk or frames % kk:
             raise ValueError(f"{frames} noised frames do not split into {kk} chunks")
-        if cond.shape != (batch, frames, height // ph, width // pw, self.core.blocks[0].ln_in.weight.numel()):
+        mod_dim = self.core.modulators[0].in_features
+        if cond.shape != (batch, frames, height // ph, width // pw, mod_dim):
             raise ValueError(f"conditioning shape {tuple(cond.shape)} does not match noised grid")
         chunk_tokens = (frames // kk) * height * width
         shift, scale = self.t_proj[VIDEO](self.t_embedding(timesteps)).chunk(2, dim=-1)
