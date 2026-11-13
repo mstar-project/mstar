@@ -167,7 +167,7 @@ def main():
     ap.add_argument("--chunks", type=int, default=8, help="per session; eviction starts at chunk 4")
     ap.add_argument("--image")
     ap.add_argument("--resource-overrides", default="{}",
-                    help='JSON: the resources block of a YAML, as {"dit_kv": {"max_num_pages": 215}}')
+                    help='JSON: the resources block of a YAML, as {"dit_kv": {"pool_tokens": 27144}}')
     ap.add_argument("--solo-only", action="store_true", help="skip the interleaved pair (a one-slot deployment)")
     ap.add_argument("--reference-numerics", action="store_true",
                     help="REFERENCE_MODEL_KWARGS: FA2 attention and an eager DiT; needs flash-attn")

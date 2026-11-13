@@ -513,13 +513,6 @@ def test_a_config_must_run_one_rollout_at_a_time(model):
     assert "VAE caches, which go from chunk to chunk on the rollout loop's edges" in str(err.value)
 
 
-def test_a_pool_short_of_one_rollout_at_the_default_size_is_refused(model):
-    """A rollout of a 480x832 image, 464x832, at the loop's cap holds 214 pages beside the pool's sink page."""
-    model.validate_config_yaml({"max_concurrent_requests": 1, "resources": {"dit_kv": {"max_num_pages": 215}}}, "x")
-    with pytest.raises(ValueError, match="need 215 pages of resources.dit_kv"):
-        model.validate_config_yaml({"max_concurrent_requests": 1, "resources": {"dit_kv": {"max_num_pages": 214}}}, "x")
-
-
 def test_the_shipped_config_runs_one_rollout_at_a_time_over_a_pool_for_the_largest(model):
     """Concurrency is the conductor's max_concurrent_requests; the K/V memory is
     the pool's, which the model sizes to one rollout at the largest area."""
@@ -534,4 +527,4 @@ def test_the_shipped_config_runs_one_rollout_at_a_time_over_a_pool_for_the_large
     assert config["max_concurrent_requests"] == 1 and "resources" not in config
     model.validate_config_yaml(config, str(path))
     (kv, *_) = serving_resources(model, config)
-    assert kv.config.max_num_pages == 509
+    assert kv.config.pool_tokens == 64800

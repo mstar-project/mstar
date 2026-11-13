@@ -18,10 +18,10 @@ max_seq_len: 512
 # pool, so this is their only bound.
 max_concurrent_requests: 1
 
-# The DiT's K/V pool, reserved at startup, holds one rollout's sink and latest
-# window at the largest size (720x1280): 509 pages of 128 tokens, 12.0 GB. A
-# deployment that serves only the default size (464x832) can set
-# resources: {dit_kv: {max_num_pages: 215}}, 5.1 GB.
+# The DiT's K/V pool, reserved at startup, holds one rollout's sink, latest
+# window and chunk at the largest size (720x1280): 64,800 tokens a layer,
+# 11.9 GB. A deployment that serves only the default size (464x832) can set
+# resources: {dit_kv: {pool_tokens: 27144}}, 5.0 GB.
 
 # A two-chunk rollout at the default size before the server binds, so the first
 # client doesn't pay the DiT blocks' compiles (one per kind of pass) at that

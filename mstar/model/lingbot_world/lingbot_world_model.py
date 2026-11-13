@@ -32,11 +32,10 @@ import numpy as np
 import torch
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.engine.resources.kv.config import DEFAULT_PAGE_SIZE
 from mstar.engine.state import Array, Attend, Bidirectional, Block, Entry, KVEntry, Layout, Read, Value
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.base import KVLabel, Model, ProcessPromptOutput, TensorAndMetadata, WalkStep, parse_autocast_dtype
+from mstar.model.base import Model, ProcessPromptOutput, TensorAndMetadata, WalkStep, parse_autocast_dtype
 from mstar.model.lingbot_world.components.camera import latent_camera_poses, scale_intrinsics
 from mstar.model.lingbot_world.config import (
     LINGBOT_CONFIGS,
@@ -60,7 +59,6 @@ from mstar.model.lingbot_world.submodules import (
 )
 from mstar.model.media_limits import PILLOW_IMAGE_FORMATS, check_image_size, decoding_upload, open_upright_image
 from mstar.model.submodule_base import NodeSubmodule
-from mstar.model.utils import check_kv_pools_fit
 
 logger = logging.getLogger(__name__)
 
@@ -129,12 +127,9 @@ class LingBotWorldModel(Model):
         return arrays
 
     def kernel_settings(self) -> dict:
-        """A pool for one rollout's window at the largest area, beside its sink page."""
+        """A pool for one rollout at the largest area."""
         cfg = self.config
-        return {DIT_KV: {"max_num_pages": 1 + cfg.window_pages(cfg.max_frame_tokens, DEFAULT_PAGE_SIZE)}}
-
-    def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
-        return {DIT_KV: {"main": KVLabel(growth=((ROLLOUT_WALK, ROLLOUT_LOOP_NAME),))}}
+        return {DIT_KV: {"pool_tokens": cfg.window_tokens(cfg.max_frame_tokens)}}
 
     def state_layout(self, lat_h: int, lat_w: int) -> dict[str, dict[str, Layout]]:
         """What a rollout at a ``lat_h`` by ``lat_w`` latent writes: a chunk's tokens an iteration of the rollout loop,
@@ -146,7 +141,7 @@ class LingBotWorldModel(Model):
         )}}
 
     def validate_config_yaml(self, config: dict, config_path: str) -> None:
-        """Refuse to serve more than one rollout at a time, and a pool short of one rollout at the default size.
+        """Refuse to serve more than one rollout at a time.
 
         The pool admits a rollout's K/V, and at small output sizes it admits many. Each one's VAE caches go from
         chunk to chunk on the rollout loop's edges, outside admission, so the conductor's admit queue, which exists
@@ -164,11 +159,6 @@ class LingBotWorldModel(Model):
                 f"LingBot-World takes no `autocast_dtype` but bfloat16 in {config_path}; got "
                 f"{config['autocast_dtype']!r}. It is the K/V pool's dtype, and the DiT writes bf16 K/V."
             )
-        cfg = self.config
-        size = (cfg.default_height, cfg.default_width)
-        lat_h, lat_w = self.geometry(size, *size)
-        check_kv_pools_fit(self, config, config_path, logger, request_layouts=self.state_layout(lat_h, lat_w),
-                           loop_caps={ROLLOUT_LOOP_NAME: cfg.max_chunks})
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         encode_text = GraphNode(

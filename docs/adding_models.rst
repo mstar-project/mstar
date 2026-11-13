@@ -443,9 +443,9 @@ has four fields:
 - ``growth``: ``(loop, entries)`` pairs, ``entries`` per iteration of ``loop``.
 - ``scratch``: the most entries one non-committing step writes past the kept length.
 - ``kept_windows``: by read key, the ``KeptWindow(sink, window=)`` of each kept-window read,
-  in entries (``Bidirectional(kept_window=True)``, below). The pool keeps the label's first
-  ``sink`` entries and its last ``window``, and gives back the whole pages between them, so
-  the footprint is the window's.
+  in entries (``Bidirectional(kept_window=True)``, below). The storage keeps the label's first
+  ``sink`` entries and its last ``window`` and gives back what lies between them, so the
+  footprint is the window's.
 
 ``process_prompt`` may also return ``keyed_spans``, keyed by array and then label: how many
 leading spans the label's keys cover, by default every span before the first ``rows`` span.
@@ -738,7 +738,11 @@ deployment YAML tunes them under ``resources:`` (see :ref:`Step 6 <config-yaml>`
   kept before the step, the first ``sink`` entries and the last ``window`` that the request's
   layout gives (``kept_windows``), and every entry this step adds, as LingBot-World's chunks
   read their sink and latest window. It is its array's only read, with no ``walks`` and no
-  ``queries``, it takes packed queries, and a step that reads it is never captured.
+  ``queries``, it takes packed queries, and a step that reads it is never captured. On an
+  array of one label with no positions it is held in the rolling store (`Rolling (compacted)
+  caches`_), which hands the read each row's sink, window and step as one range, and a step
+  there lists one row and keeps its adds. Otherwise the pool keeps it in pages, and each read
+  gathers it.
   ``FrameWindow(tokens, frames=, stride=1)`` sees frames of ``tokens`` entries: every
   ``stride``-th of the latest ``frames``, and the step's own frame. An array whose reads are
   all frame windows is held in a ring of frames per session, which a compiled region adds to
@@ -1548,9 +1552,9 @@ Rolling (compacted) caches
 
 A causal video DiT that denoises chunk after chunk against a sink and a sliding window of
 earlier chunks (Self-Forcing's rolling cache) can declare a ``RollingKVSpec``. A model on
-the contract declares a kept-window read instead (``Bidirectional(kept_window=True)``),
-whose pool keeps the sink and the window in pages and gathers them for each read. Its
-chunks are thousands of queries over tens of thousands of keys, so
+the contract declares a kept-window read instead (``Bidirectional(kept_window=True)``): an
+array of one label and no positions whose one read it is lands in this store, sized by each
+request's layout. Its chunks are thousands of queries over tens of thousands of keys, so
 the attention kernel dominates the step, and bounded KV's Triton kernel (built for short
 streaming steps) is several times slower there than the ragged FlashInfer one. The rolling
 store therefore runs no attention: it keeps the stream's first ``sink`` tokens and its last
@@ -1566,6 +1570,8 @@ the shift, once per step even when planned twice; the model then calls ``write(l
 The K/V live in one pool reserved at startup, ``pool_tokens`` a layer. The model declares
 each request's size by returning ``RollingKVReqConfig(tokens=sink + window)`` from
 ``get_request_resource_configs``; a request it declares nothing for fails at its first step.
+On the contract the store's spec builds it from the request's layout, and the storage
+declares each step's positions.
 A request waits in the engine's admission queue, in arrival order, until the pool has its
 room, which is then set aside for it, and one larger than the whole pool is a 400 at the
 conductor. Its first step takes a contiguous region of exactly that size (first fit), given

@@ -64,6 +64,8 @@ class RollingKVReqConfig(ResourceReqConfig):
     instead of having that step refused until room frees up."""
 
     tokens: int
+    # the leading tokens of ``tokens`` never evicted
+    sink: int = 0
 
     def validate(self, spec: "NodeResourceSpec | None" = None) -> None:
         if self.tokens < 1:
@@ -80,8 +82,10 @@ class RollingKVReqConfig(ResourceReqConfig):
 class RollingKVStep(ResourceStep):
     """Each segment's ``span`` is the tokens its request writes this step.
 
-    The positions come from the model, not the store, so a plan never waits on
-    the previous step's commit; ``admit`` checks them against what was committed.
+    The positions come from the model, or from what the store committed when the
+    step is declared, which the engine does only once the previous step has
+    committed. Either way a plan never waits on that commit, and ``admit`` checks
+    them against what was committed.
     """
 
     positions: dict = field(default_factory=dict)
@@ -96,6 +100,16 @@ class RollingKVSpec(NodeResourceSpec):
         from mstar.engine.resources.kv.rolling.manager import RollingKVManager
 
         return RollingKVManager
+
+    def request_config(self, model_kwargs: dict | None) -> RollingKVReqConfig | None:
+        """The sink and window of the one label a request's ``kv_layout`` row gives this store, a kept window's
+        retention, plus one iteration of its growth, the step the window holds; None for a request with no row."""
+        rows = ((model_kwargs or {}).get("kv_layout") or {}).get(self.resource_key)
+        if not rows:
+            return None
+        ((_, growth, _, (window, sink, _), *_),) = rows.values()
+        ((_, per_iteration),) = growth
+        return RollingKVReqConfig(tokens=sink + window + per_iteration, sink=sink)
 
     def apply_yaml_overrides(self, pool_tokens: int | None = None):
         """The pool's size is the deployment's memory trade: what it reserves at

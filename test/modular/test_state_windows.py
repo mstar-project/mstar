@@ -714,8 +714,13 @@ def test_a_removed_request_leaves_the_exact_set():
 requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="gathers on a CUDA pool")
 
 
+# a kept window on a second label stays in pages, where on one label the rolling store holds it
+PAGED_LABELS = frozenset({"main", "other"})
+
+
 def _kept_array(**fields) -> Array:
-    return _array("dit_kv", reads={"self_attn": _read(Bidirectional(kept_window=True))}, max_len=4096, **fields)
+    return _array("dit_kv", reads={"self_attn": _read(Bidirectional(kept_window=True))}, max_len=4096,
+                  labels=PAGED_LABELS, **fields)
 
 
 @pytest.mark.parametrize("arrays", [
@@ -812,7 +817,8 @@ def _kept_and_rolling(device: torch.device, chunks=6, frame=3):
     the same writes, through `RollingKVManager.window`."""
     sink, window, chunk = 6 * frame, 8 * frame, 4 * frame
     array = Array("dit_kv", nodes={"dit"}, layers={0}, entry=KVEntry(heads=1, head_dim=1), max_len=4096,
-                  reads={"self_attn": Read(mask=Bidirectional(kept_window=True), op=Attend(q_heads=1))})
+                  reads={"self_attn": Read(mask=Bidirectional(kept_window=True), op=Attend(q_heads=1))},
+                  labels=PAGED_LABELS)
     kv_spec, attention_spec = build_specs([array], kernel_settings={"dit_kv": {"max_num_pages": 64}})
     pool = KVManager(
         cfg=replace(kv_spec.config, page_size=8), name="dit_kv", joint_comm_group=None,
@@ -910,7 +916,7 @@ def _reach_handle(sink=18, window=24, chunk=12, *, op=None, state_layout=None):
     ``state_layout`` where one is given, and otherwise with the window's sizes. The read has no op unless ``op``
     gives one, which runs on a kept-window resource over a stub kernel."""
     array = Array("dit_kv", nodes={"dit"}, layers={0}, entry=KVEntry(heads=1, head_dim=1), max_len=4096,
-                  reads={"self_attn": Read(mask=Bidirectional(kept_window=True), op=op)})
+                  reads={"self_attn": Read(mask=Bidirectional(kept_window=True), op=op)}, labels=PAGED_LABELS)
     kv_spec, *attention = build_specs([array], kernel_settings={"dit_kv": {"max_num_pages": 64}})
     pool = KVManager(
         cfg=replace(kv_spec.config, page_size=8), name="dit_kv", joint_comm_group=None,
@@ -991,7 +997,7 @@ def test_a_reach_only_array_keeps_the_fused_ops_it_was_given():
 def test_reference_mode_builds_its_pool():
     """With no read that runs a kernel, the pool takes its KV heads as its query heads, and no attention is built."""
     array = Array("dit_kv", nodes={"dit"}, layers={0, 1}, entry=KVEntry(heads=HEADS, head_dim=DIM), max_len=64,
-                  reads={"self_attn": Read(mask=Bidirectional(kept_window=True))})
+                  reads={"self_attn": Read(mask=Bidirectional(kept_window=True))}, labels=PAGED_LABELS)
     (kv_spec,) = build_specs([array])
     assert kv_spec.config.num_qo_heads == HEADS
 
@@ -1044,7 +1050,7 @@ def test_a_reach_is_refused_on_a_pool_placed_over_ranks():
     knows the placement, so each rank would gather other entries. The handles are built with the engine, so the
     deployment doesn't load."""
     array = Array("dit_kv", nodes={"dit"}, layers={0}, entry=KVEntry(heads=1, head_dim=1), max_len=4096,
-                  reads={"self_attn": Read(mask=Bidirectional(kept_window=True))})
+                  reads={"self_attn": Read(mask=Bidirectional(kept_window=True))}, labels=PAGED_LABELS)
     (kv_spec,) = build_specs([array], kernel_settings={"dit_kv": {"max_num_pages": 64}})
     ranks = CommGroup(my_global_rank=0, my_group_rank=0, group_members=[0, 1])
     pool = KVManager(

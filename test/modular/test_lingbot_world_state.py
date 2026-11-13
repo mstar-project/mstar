@@ -1,10 +1,10 @@
 """LingBot World declares its state, and the engine builds the pool, the reads and the draws' state from it.
 
-`main` kept LingBot's rolling K/V in a store of its own, attended both pairs through one ragged resource and held the
-text K/V, the generator, the noise and the VAE caches in the submodule's per-request state. Now the dit declares a paged
-array whose kept-window read reaches the sink and the latest window, a text array whose queries are the chunk's, and a
-Value of the draws' state, and the VAE caches ride the rollout loop's edges. The hand-written specs and draws below are
-`main`'s, copied from the model as it stood before the port.
+`main` declared LingBot's rolling store and one ragged resource for both pairs, and held the text K/V, the generator,
+the noise and the VAE caches in the submodule's per-request state. Now the dit declares an array whose kept-window read
+reaches the sink and the latest window, which the engine keeps in that rolling store, a text array whose queries are the
+chunk's, and a Value of the draws' state, and the VAE caches ride the rollout loop's edges. The hand-written specs and
+draws below are `main`'s, copied from the model as it stood before the port.
 """
 
 from __future__ import annotations
@@ -20,14 +20,12 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from mstar.communication.tensors import LocalTransferEngine
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.resources import KVReqConfig, RaggedAttentionConfig, cross_label
-from mstar.engine.resources.attn.kept_window import KeptWindowAttention
-from mstar.engine.resources.attn.ragged.config import KeptWindowAttentionSpec, RaggedCrossAttentionSpec
-from mstar.engine.resources.kv.config import DEFAULT_PAGE_SIZE, KVSpec, RetentionPolicy
-from mstar.engine.resources.kv.manager import KVManager
-from mstar.engine.resources.kv.transfer import TransferEngineInfo
+from mstar.engine.resources import RaggedAttentionConfig, cross_label
+from mstar.engine.resources.attn.ragged.config import RaggedCrossAttentionSpec
+from mstar.engine.resources.kv.config import RetentionPolicy
+from mstar.engine.resources.kv.rolling import RollingKVReqConfig, RollingKVSpec
+from mstar.engine.resources.kv.rolling.manager import RollingKVManager
 from mstar.engine.resources.step import StepContext
 from mstar.engine.state import Bidirectional
 from mstar.engine.state.adapters import StateSetup, build_specs, kv_layouts, node_handles, state_steps
@@ -92,30 +90,25 @@ class _Sdpa:
 
 
 class _Rollout:
-    """The dit node on the CPU over its declared state: a pool of 8-entry pages, the kept-window read and the text read
-    on SDPA stand-ins for the ragged kernel, and the engine's host fields. A chunk runs as the engine steps it."""
+    """The dit node on the CPU over its declared state: the rolling store, the kept-window read and the text read on
+    SDPA stand-ins for the ragged kernel, and the engine's host fields. A chunk runs as the engine steps it."""
 
     LAT = (4, 4)
 
-    def __init__(self, cfg: LingBotWorldConfig, pages: int = 64):
+    def __init__(self, cfg: LingBotWorldConfig, pool_tokens: int | None = None):
         self.cfg = cfg
         model = _model()
         model.config = cfg
         self.model = model
         self.setup = StateSetup()
-        kv_spec = next(spec for spec in build_specs(model.declare_state()) if spec.resource_key == DIT_KV)
-        self.pool = KVManager(
-            cfg=replace(kv_spec.config, page_size=8, max_num_pages=pages), name=DIT_KV, joint_comm_group=None,
-            transfer_engine_info=TransferEngineInfo("h", "h", LocalTransferEngine("h")), device=torch.device("cpu"),
-            dtype=torch.float32,
-        )
-        # as the worker sets it from the node's writes, so a rollout's footprint counts its chunks
-        self.pool.local_loops = {ROLLOUT_LOOP_NAME}
+        specs = build_specs(model.declare_state(), kernel_settings=model.kernel_settings())
+        self.spec = next(spec for spec in specs if spec.resource_key == DIT_KV)
+        if pool_tokens is not None:
+            self.spec.config.pool_tokens = pool_tokens
+        self.pool = RollingKVManager(self.spec.config, torch.device("cpu"), name=DIT_KV)
         self.window, self.text = _Sdpa(), _Sdpa()
-        self.attention = KeptWindowAttention(self.window, DIT_KV)
-        self.attention.bind_dependencies({DIT_KV: self.pool})
-        # reference numerics build the pool alone
-        self.planned = {} if cfg.reference_numerics else {SELF_ATTN: self.attention, TEXT_ATTN: self.text}
+        # reference numerics build the store alone
+        self.planned = {} if cfg.reference_numerics else {SELF_ATTN: self.window, TEXT_ATTN: self.text}
         self.handles = node_handles(model, "dit", {DIT_KV: self.pool, **self.planned}, setup=self.setup)
         torch.manual_seed(0)
         self.dit = LingBotCausalDiT(cfg).eval()
@@ -125,15 +118,10 @@ class _Rollout:
         self.chunks: dict[int, int] = {}
 
     def open(self, rid: int):
-        """Take ``rid`` in, as intake and the engine's queue do: None once the pool allots it, else the mark it waits
-        on."""
+        """Take ``rid`` in, as intake and the engine's queue do: None once the store sets its room aside, else the room
+        it waits on."""
         (row,) = kv_layouts(self.model.declare_state(), self.model.state_layout(*self.LAT), {})[DIT_KV].values()
-        request = KVReqConfig(needed_labels=["main"])
-        request.apply_conductor_config(kv_layout={"main": row.row()},
-                                       loop_caps={ROLLOUT_LOOP_NAME: self.cfg.max_chunks})
-        # the worker finds no rebuild for the dit, so the pool guarantees a rollout its footprint
-        request.rebuildable = False
-        self.pool.ingest_request(rid, overrides=request)
+        self.pool.ingest_request(rid, overrides=self.spec.request_config({"kv_layout": {DIT_KV: {"main": row.row()}}}))
         self.setup.host_fields.open(rid)
         self.chunks[rid] = 0
         self.pool.ask(rid, "dit", ROLLOUT_WALK)
@@ -162,7 +150,7 @@ class _Rollout:
         outcome = self.pool.admit(step.steps[DIT_KV], ctx)
         if not outcome.ok:
             return outcome
-        ctx.plan_results = {DIT_KV: self.pool.plan(step.steps[DIT_KV], ctx)}
+        self.pool.plan(step.steps[DIT_KV], ctx)
         for key, resource in self.planned.items():
             resource.plan(step.steps[key], ctx)
         return step
@@ -192,16 +180,16 @@ class _Rollout:
 
 
 def test_the_specs_are_main_s_resources_but_three():
-    """`main` built a rolling store and one ragged resource for both pairs. The declaration builds, in their place, a
-    paged pool under the same key, a kept-window resource over it for the chunk's pair, and a second ragged resource for
-    the text pair, each with `main`'s attention geometry. `main` set each spec's dtype to bf16. Here the specs leave it
-    unset, and the build takes the model's, which is bf16."""
+    """`main` built a rolling store and one ragged resource for both pairs. The declaration builds the same store under
+    the same key, of the same size, a ragged resource for the chunk's pair over it, and a second for the text pair, each
+    with `main`'s attention geometry. `main` set each spec's dtype to bf16. Here the specs leave it unset, and the build
+    takes the model's, which is bf16."""
     model = _model()
     kv, window, text = serving_resources(model, {"resources": {}})
-    assert isinstance(kv, KVSpec) and (kv.resource_key, kv.nodes) == (DIT_KV, {"dit"})
-    assert (kv.config.num_layers, kv.config.num_kv_heads, kv.config.head_dim) == (30, 12, 128)
-    assert kv.config.max_num_pages == 509, "the pool should hold one rollout's window at 720x1280"
-    assert isinstance(window, KeptWindowAttentionSpec) and window.kv_cache == DIT_KV
+    assert isinstance(kv, RollingKVSpec) and (kv.resource_key, kv.nodes) == (DIT_KV, {"dit"})
+    assert (kv.config.num_layers, kv.config.num_heads, kv.config.head_dim, kv.config.dtype) == (30, 12, 128, None)
+    assert kv.config.pool_tokens == 64800, "the pool should hold one rollout's window at 720x1280, as main's did"
+    assert isinstance(window, RaggedCrossAttentionSpec) and window.resource_key == SELF_ATTN
     assert isinstance(text, RaggedCrossAttentionSpec) and text.resource_key == TEXT_ATTN
     for spec in (window, text):
         assert spec.nodes == {"dit"}
@@ -265,22 +253,22 @@ def test_a_window_with_no_frame_is_refused_when_the_model_sizes_its_pool():
         model.kernel_settings()
 
 
-@pytest.mark.parametrize(("image_hw", "pages"), [((464, 832), 214), ((720, 1280), 508)])
-def test_max_num_pages_is_admission_s_count(image_hw, pages):
-    """The model restates the pool's count, which it can't import, so a rollout counted through intake's route, from
-    its layout's row at the loop's cap, holds as many pages as the model sizes for, and the pool one more, its sink."""
+@pytest.mark.parametrize(("image_hw", "tokens"), [((464, 832), 27144), ((720, 1280), 64800)])
+def test_a_rollout_keeps_main_s_rolling_extent(image_hw, tokens):
+    """The store's spec reads a request's sizes from its layout's row, as intake opens it: `main`'s 6-frame sink and 12
+    trailing frames, the chunk's own included. The model restates the count, which it can't import, and the pool holds
+    one rollout at the largest area."""
     model = _model()
     cfg = model.config
-    (layout,) = kv_layouts(model.declare_state(), model.state_layout(image_hw[0] // 8, image_hw[1] // 8), {})[
-        DIT_KV].values()
-    request = KVReqConfig(needed_labels=["main"])
-    request.apply_conductor_config(kv_layout={"main": layout.row()}, loop_caps={ROLLOUT_LOOP_NAME: cfg.max_chunks})
+    lat_h, lat_w = image_hw[0] // 8, image_hw[1] // 8
+    (layout,) = kv_layouts(model.declare_state(), model.state_layout(lat_h, lat_w), {})[DIT_KV].values()
     (kv, *_) = serving_resources(model, {"resources": {}})
-    caps = {ROLLOUT_LOOP_NAME: cfg.max_chunks}
-    assert request.pages(None, caps, kv.config) == pages
-    assert cfg.window_pages(cfg.frame_tokens(image_hw[0] // 8, image_hw[1] // 8), DEFAULT_PAGE_SIZE) == pages
+    frame = cfg.frame_tokens(lat_h, lat_w)
+    request = kv.request_config({"kv_layout": {DIT_KV: {"main": layout.row()}}})
+    assert request == RollingKVReqConfig(tokens=tokens, sink=6 * frame)
+    assert cfg.window_tokens(frame) == tokens
     if image_hw == (720, 1280):
-        assert model.kernel_settings() == {DIT_KV: {"max_num_pages": pages + 1}}
+        assert model.kernel_settings() == {DIT_KV: {"pool_tokens": tokens}}
 
 
 def test_the_largest_area_bounds_a_frame_at_any_aspect():
@@ -291,26 +279,24 @@ def test_the_largest_area_bounds_a_frame_at_any_aspect():
 
 @pytest.mark.parametrize("image_hw", [(464, 832), (720, 1280)])
 def test_a_rollout_past_the_pool_is_refused_at_intake(image_hw):
-    """A deployment that serves the default size sets 215 pages, and a larger rollout is a 400 before any step."""
+    """A deployment that serves the default size sets 27144 tokens, and a larger rollout is a 400 before any step."""
     model = _model()
     (layout,) = kv_layouts(model.declare_state(), model.state_layout(image_hw[0] // 8, image_hw[1] // 8), {})[
         DIT_KV].values()
-    request = KVReqConfig(needed_labels=["main"])
-    request.apply_conductor_config(kv_layout={"main": layout.row()},
-                                   loop_caps={ROLLOUT_LOOP_NAME: model.config.max_chunks})
-    (kv, *_) = serving_resources(model, {"resources": {DIT_KV: {"max_num_pages": 215}}})
+    (kv, *_) = serving_resources(model, {"resources": {DIT_KV: {"pool_tokens": 27144}}})
+    request = kv.request_config({"kv_layout": {DIT_KV: {"main": layout.row()}}})
     if image_hw == (464, 832):
         request.validate(kv)
     else:
-        with pytest.raises(ValueError, match="pages"):
+        with pytest.raises(ValueError, match="resources: dit_kv: pool_tokens"):
             request.validate(kv)
 
 
-def test_a_rollout_that_fits_waits_for_the_pages_another_holds():
+def test_a_rollout_that_fits_waits_for_the_room_another_holds():
     """Two rollouts on a pool of one's window: the engine's queue holds the second until the first is removed."""
-    rollout = _Rollout(_tiny(), pages=1 + _tiny().window_pages(4, 8))
+    rollout = _Rollout(_tiny(), pool_tokens=_tiny().window_tokens(4))
     assert rollout.open(1) is None
-    assert rollout.open(2) is not None, "the second rollout should wait for the first's pages"
+    assert rollout.open(2) is not None, "the second rollout should wait for the first's room"
     for _ in range(3):
         rollout.chunk(1)
     rollout.pool.remove_request(1)
@@ -367,7 +353,7 @@ def test_the_read_reaches_the_sink_and_the_latest_window(local_attn_size):
     """The frames each chunk's read reaches, in order: `main`'s store kept the sink and the latest frames up to
     ``local_attn_size``, and every frame without a window."""
     cfg = _tiny(local_attn_size=local_attn_size)
-    rollout = _Rollout(cfg, pages=256)
+    rollout = _Rollout(cfg)
     rollout.open(1)
     tags = []
     for chunk in range(6):
@@ -380,7 +366,7 @@ def test_the_read_reaches_the_sink_and_the_latest_window(local_attn_size):
         else:
             assert tags[-1] == local_attn_size
     if local_attn_size != -1:
-        assert rollout.pool._streams[1]["main"].released, "the pool should release the pages behind the window"
+        assert rollout.pool._requests[1].capacity == local_attn_size * 4, "the store should keep the window alone"
 
 
 def test_the_reference_numerics_attend_what_the_kept_window_read_attends(monkeypatch):
@@ -390,7 +376,7 @@ def test_the_reference_numerics_attend_what_the_kept_window_read_attends(monkeyp
 
     monkeypatch.setattr(dit, "_flash_attention", lambda q, k, v: F.scaled_dot_product_attention(
         q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)).transpose(1, 2))
-    fast, reference = _Rollout(_tiny(), pages=256), _Rollout(_tiny(reference_numerics=True), pages=256)
+    fast, reference = _Rollout(_tiny()), _Rollout(_tiny(reference_numerics=True))
     reference.dit.load_state_dict(fast.dit.state_dict())
     for rollout in (fast, reference):
         rollout.open(1)
@@ -473,7 +459,7 @@ def test_the_encoder_stream_comes_back_from_its_edge():
 def _compiled_rollout_graphs(num_layers: int, chunks: int) -> int:
     torch._dynamo.reset()
     torch._dynamo.utils.counters.clear()
-    rollout = _Rollout(_tiny(num_layers=num_layers), pages=256)
+    rollout = _Rollout(_tiny(num_layers=num_layers))
     rollout.dit.compile_blocks(backend="eager", fullgraph=False, dynamic=False)
     rollout.open(1)
     for _ in range(chunks):

@@ -17,8 +17,8 @@
                     chunk's I2V condition and Plucker rays, the DiT, the decode)
 
 The dit declares its state (``LingBotWorldModel.declare_state``): the
-self-attention K/V of each chunk in ``DIT_KV``, whose pages the pool releases
-past the sink and the latest window; each chunk's text K/V in ``TEXT``, which
+self-attention K/V of each chunk in ``DIT_KV``, of which the engine's rolling
+store keeps the sink and the latest window; each chunk's text K/V in ``TEXT``, which
 no step keeps; and where the request's draws stand in ``PROGRESS``. The VAE
 encoder's and decoder's causal-conv caches go from one chunk to the next on
 the rollout loop's edges, outside admission, so the model refuses a config

@@ -43,6 +43,8 @@ from mstar.engine.resources.kv.config import (
 )
 from mstar.engine.resources.kv.plan import stage_reach
 from mstar.engine.resources.kv.ring.cache import fits_block_mask
+from mstar.engine.resources.kv.rolling import RollingKVConfig, RollingKVSpec, RollingKVStep, RollingPosition
+from mstar.engine.resources.kv.rolling.manager import row_layout
 from mstar.engine.resources.linear_attn.config import (
     LinearAttnConfig,
     LinearAttnSpec,
@@ -565,8 +567,9 @@ def kv_layouts(
     state_layout: Mapping[str, Mapping[str, Layout]],
     keyed_spans: Mapping[str, Mapping[str, int]],
 ) -> "dict[str, dict[str, LabelLayout]]":
-    """Today's `LabelLayout` per paged array and label, from what a model's `process_prompt` returned. Any other
-    array's layout is dropped: a Value's pool reserves a slot per label, and an array with ``max_len`` 0 keeps nothing.
+    """Today's `LabelLayout` per paged or rolling array and label, from what a model's `process_prompt` returned. Any
+    other array's layout is dropped: a Value's pool reserves a slot per label, and an array with ``max_len`` 0 keeps
+    nothing.
 
     The model is at fault for a name it doesn't declare, so this raises ``RuntimeError``, which fails the request with a
     500, as `refuse_undeclared_labels` does.
@@ -646,7 +649,7 @@ class OpBinding:
     def for_mask(self, mask: Mask) -> "OpBinding":
         """The binding that runs the op through ``mask``: `kept_window_binding` through a kept window, and this one
         through any other mask. The one place a field of the mask picks a binding."""
-        kept = self.kept_window_binding if isinstance(mask, Bidirectional) and mask.kept_window else None
+        kept = self.kept_window_binding if _keeps_window(mask) else None
         return self if kept is None else kept
 
     def retention(self, key: str, layout: Layout) -> RetentionPolicy | None:
@@ -766,6 +769,9 @@ class FlexAttend(OpBinding):
     steps."""
 
     def check(self, array: Array, key: str, read: Read) -> None:
+        if read.mask.tokens == 1 and read.mask.stride == 1:
+            raise _no_layout(array, f"reads[{key!r}].mask is a FrameWindow of 1-entry frames, which sees what "
+                                    f"Window({read.mask.frames}) sees; declare that")
         if not fits_block_mask(read.mask.tokens):
             raise _no_layout(array, f"reads[{key!r}].mask.tokens is {read.mask.tokens}, which doesn't fill whole "
                                     "blocks of a flex block mask")
@@ -780,8 +786,8 @@ class FlexAttend(OpBinding):
 
 
 class KeptWindowBinding(OpBinding):
-    """A read through a kept window on a paged array. The pool releases what the window no longer reaches, so the read
-    is its array's only one, and each request's layout sizes it."""
+    """A read through a kept window. Its storage releases what the window no longer reaches, so the read is its array's
+    only one, and each request's layout sizes it."""
 
     keeps_window = True
 
@@ -862,6 +868,32 @@ class PagedNoOp(OpBinding):
 
 
 PAGED_REACH = PagedReach()
+
+# the labels of a rolling read's ragged plan: the step's queries, and the one range of the store they attend
+_QUERIES, _REACH = "queries", "reach"
+
+
+class RollingAttend(KeptWindowAttend):
+    """`Attend` through a kept window on the rolling store: the ragged cross kernel over the one range the store keeps
+    each row's sink, window and step in, which its storage plans with the store's step."""
+
+    def specs(self, array: Array, key: str, read: Read) -> list[NodeResourceSpec]:
+        (kept_window,) = super().specs(array, key, read)
+        return [RaggedCrossAttentionSpec(resource_key=key, nodes=array.nodes, config=kept_window.config)]
+
+    def steps(
+        self, array: Array, key: str, read: Read, declared: ArrayStep, segments, steps: dict[str, Any],
+    ) -> None:
+        """Nothing: `RollingStorage.steps` plans the read from the store's positions."""
+
+
+class RollingReach(KeptWindowBinding):
+    """A read with no op through a kept window on the rolling store, which runs on the store itself."""
+
+    takes_queries = False
+
+    def resource(self, array: Array, key: str) -> str:
+        return array.name
 
 
 class PagedRead(Protocol):
@@ -1499,6 +1531,86 @@ class RingHandle(ArrayHandle):
         q = q.transpose(1, 2)
         out = self._flex.attend(q, k, v, enable_gqa=q.size(1) != k.size(1), layer_idx=self._pool_layer[layer])
         return out.transpose(1, 2)
+
+
+class RollingHandle(ArrayHandle):
+    """Adds and reads through the rolling store, which keeps each row's sink and window in one range of its region, in
+    stream order: an add writes the row's span there, at the range's end, and the read attends the range or returns
+    it. Each add rewrites the step's span, so the step keeps its last add of each layer.
+
+    A step's position is what the store committed when the step is declared. The engine declares a step only after the
+    last one commits, on the thread that commits it, and a step declared before would be refused at admit."""
+
+    _write_refused = "write on an append-only array"
+
+    def __init__(
+        self, array: Array, resources: Mapping[str, Any], bindings: tuple[BoundOp, ...], resolved: "Resolved",
+    ):
+        super().__init__(array, resources)
+        self._bindings = bindings
+        self.reads = {}
+        for bound in bindings:
+            run = bound.binding.bind(array, resolved.resource_of[bound.key], resources)
+            bound.binding.attach(self, bound.key, run)
+        self._kv = resources[array.name]
+        (read,) = (bound for bound in bindings if bound.key in array.reads)
+        self._reader = self.reads[read.key]
+        # the ragged resource the read attends through, None for a read with no op
+        self.attend_key = resolved.resource_of[read.key] if read.binding.takes_queries else None
+
+    def rolling_position(self, rid: int) -> RollingPosition:
+        """Where ``rid``'s next step starts in the store, and what the store keeps of it."""
+        declared = self._kv.declared(rid)
+        if declared is None:
+            ((key, _),) = self.array.reads.items()
+            (label,) = self.array.labels
+            raise self._refusal(f"request {rid} opened with no window, so reads[{key!r}] has no sizes; "
+                                f"state_layout[{self.name!r}][{label!r}] must be a Layout that gives "
+                                f"kept_windows[{key!r}]")
+        return RollingPosition(self._kv.written(rid), declared.sink, declared.tokens - declared.sink)
+
+    def check_step(self, step) -> None:
+        super().check_step(step)
+        if not self._kept:
+            raise self._refusal("a step adds nothing, and the store's commit keeps each row's span")
+
+    def _check_storage(self, declared: ArrayStep, segments, ctx) -> None:
+        if not declared.keep:
+            raise self._no_layout("keep=False on the rolling store, whose commit keeps each row's span")
+        if declared.forks:
+            raise self._no_layout("a step forks the rolling store, which holds one region a request")
+        if len(segments) > 1:
+            raise self._no_layout(f"a step of {len(segments)} rows, and the read's kernel takes one range of the "
+                                  "store, which holds each row's apart")
+        super()._check_storage(declared, segments, ctx)
+
+    @torch.compiler.disable
+    def add(self, layer: int | torch.Tensor, *, keep: bool | None = None, **fields: torch.Tensor) -> None:
+        layer = self._layer_id(layer)
+        self._record_add(layer, keep)
+        self._kv.write(self._pool_layer[layer], fields["k"][None], fields["v"][None])
+
+    @torch.compiler.disable
+    def read(
+        self, layer: int | torch.Tensor, q: torch.Tensor | None = None, **mask_args: Any,
+    ) -> torch.Tensor | Reached:
+        if mask_args:
+            raise self._no_layout(f"mask arguments {sorted(mask_args)}, which no mask defines")
+        layer = self._layer_id(layer)
+        if q is None and self.attend_key is not None:
+            raise self._no_layout(f"a read with no op, on layer {layer}, whose read declares one")
+        if q is not None and self.attend_key is None:
+            raise self._refusal(f"a read of layer {layer} with q, whose read declares no op and returns Reached")
+        self._record_read(layer)
+        k, v = self._kv.window(self._pool_layer[layer])
+        if q is not None:
+            return self._reader.run(q, k[0], v[0], label=cross_label(_QUERIES, _REACH))
+        # copies, which the caller owns
+        ends = torch.tensor([0, k.shape[1]], dtype=torch.int32).to(k.device)
+        return Reached({"k": k[0].clone(), "v": v[0].clone()}, row_offsets=ends)
+
+    def _check_add_read(self, call: str) -> None:
+        """Nothing: a rolling add and read run outside the graph already."""
 
 
 class ValueHandle(ArrayHandle):
@@ -2257,6 +2369,53 @@ class RingStorage(Storage):
         steps[handle.flex_key] = AttentionStep(segments=segments)
 
 
+class RollingStorage(Storage):
+    """An append-only array whose one read is a kept window, on one label and with no positions, in the rolling store:
+    one region a request, sized when it opens, which keeps the sink and the window compacted in stream order. A step's
+    position comes from the store, and the read attends the one range the store's plan gives each row."""
+
+    handle_class = RollingHandle
+    kernel_settings = frozenset({"pool_tokens"})
+
+    def resolve(self, arrays: Sequence[Array], declared: Sequence[Array], setup: "StateSetup") -> Resolved:
+        resolved = Resolved({}, {}, {}, {})
+        for array in arrays:
+            bound = resolved.bound[array.name] = _bindings(self, array, setup.by_read)
+            heads, head_dim = _kv_shape(array)
+            resolved.specs[array.name] = [
+                RollingKVSpec(resource_key=array.name, nodes=array.nodes, config=RollingKVConfig(
+                    num_layers=len(array.layers), num_heads=heads, head_dim=head_dim, pool_tokens=array.max_len,
+                    dtype=array.entry.tensors["k"].dtype,
+                )),
+                *_op_specs(array, bound),
+            ]
+            resolved.resource_of.update(_resources_of(array, bound))
+        return resolved
+
+    def steps(
+        self, handle: RollingHandle, declared: ArrayStep, step: SubmoduleStep, segments, steps: dict[str, Any],
+    ) -> None:
+        positions = {segment.request_id: handle.rolling_position(segment.request_id) for segment in segments}
+        steps[handle.name] = RollingKVStep(segments=segments, positions=positions)
+        if handle.attend_key is not None:
+            reach = [row_layout(positions[s.request_id], s.span)[0].kept for s in segments]
+            steps[handle.attend_key] = RaggedCrossAttentionStep(segments=(
+                *(Segment(s.request_id, _QUERIES, s.span) for s in segments),
+                *(Segment(s.request_id, _REACH, kept) for s, kept in zip(segments, reach, strict=True)),
+            ), pairs=((_QUERIES, _REACH),))
+
+    def layouts(
+        self, array: Array, by_label: Mapping[str, Layout], keyed_spans: Mapping[str, int],
+    ) -> "dict[str, LabelLayout]":
+        """A paged array's layouts, whose row the store's spec reads each request's sizes from."""
+        layouts = PagedStorage.layouts(self, array, by_label, keyed_spans)
+        for label, layout in layouts.items():
+            if len(layout.growth) != 1:
+                raise RuntimeError(f"state_layout[{array.name!r}][{label!r}].growth is {list(layout.growth)}, and the "
+                                   "rolling store's window holds one step, of one loop's growth")
+        return layouts
+
+
 class ValueStorage(Storage):
     """A rewritable array of one entry, in a recurrent state pool."""
 
@@ -2374,6 +2533,7 @@ PAGED = PagedStorage()
 PAGED_BY_WALK = PagedByWalkStorage()
 PAGED_CROSS = PagedCrossStorage()
 RING = RingStorage()
+ROLLING = RollingStorage()
 VALUE = ValueStorage()
 VALUE_WITH_HOST = ValueWithHostStorage()
 HOST_VALUE = HostValueStorage()
@@ -2392,9 +2552,17 @@ def storage_of(array: Array) -> Storage:
         return WITHIN_STEP
     if array.reads and all(isinstance(read.mask, FrameWindow) for read in array.reads.values()):
         return RING
+    if len(array.reads) == 1 and len(array.labels) == 1 and array.positions is None:
+        (read,) = array.reads.values()
+        if _keeps_window(read.mask) and read.walks is None and read.queries is None:
+            return ROLLING
     if any(read.queries is not None for read in array.reads.values()):
         return PAGED_CROSS
     return PAGED_BY_WALK if reads_differ_by_walk(array) else PAGED
+
+
+def _keeps_window(mask: Mask) -> bool:
+    return isinstance(mask, Bidirectional) and mask.kept_window
 
 
 # `Attend` is an `AttentionSpec` on a paged array, a `CrossAttentionSpec` on one read with another array's queries and a
@@ -2410,6 +2578,8 @@ BINDINGS: dict[tuple[Storage, type[Op | Positions | None]], OpBinding] = {
     (PAGED_CROSS, Positions): PositionsBinding(),
     (RING, Attend): FlexAttend(),
     (RING, Positions): CounterPositions(),
+    (ROLLING, Attend): RollingAttend(),
+    (ROLLING, type(None)): RollingReach(),
     (WITHIN_STEP, Attend): RaggedAttend(),
     (VALUE, GatedDeltaNet): GDN(),
     (VALUE, CausalConv): ConvOnLinearAttn(),

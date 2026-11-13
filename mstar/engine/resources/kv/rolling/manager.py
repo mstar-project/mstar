@@ -133,10 +133,10 @@ class RollingKVManager(Resource):
         # commit touch only their own step's requests, which the worker doesn't remove
         # while a step holds them, and offsets move only in admit, on that same thread.
         self._lock = threading.RLock()
-        # `_wants` holds the tokens each request declared when it opened, `_reserved`
-        # the tokens set aside for an admitted request whose region isn't placed yet,
-        # and `_kept` their sum, which no other request may take.
-        self._wants: dict[int, int] = {}
+        # `_wants` holds what each request declared when it opened, `_reserved` the
+        # tokens set aside for an admitted request whose region isn't placed yet, and
+        # `_kept` their sum, which no other request may take.
+        self._wants: dict[int, RollingKVReqConfig] = {}
         self._reserved: dict[int, int] = {}
         self._kept = 0
         # regions the live admit placed, which ``rollback_admit`` gives back
@@ -178,12 +178,22 @@ class RollingKVManager(Resource):
         kv = self._pool[layer_idx]
         return kv[0, at:at + r.kept][None], kv[1, at:at + r.kept][None]
 
+    def written(self, rid) -> int:
+        """The tokens ``rid`` committed: 0 for a request that holds no region."""
+        req = self._requests.get(rid)
+        return 0 if req is None else req.written
+
+    def declared(self, rid) -> RollingKVReqConfig | None:
+        """What ``rid`` declared when it opened, None for a request that declared nothing."""
+        with self._lock:
+            return self._wants.get(rid)
+
     # Request lifecycle
 
     def ingest_request(self, rid, overrides: ResourceReqConfig | None = None):
         if isinstance(overrides, RollingKVReqConfig):
             with self._lock:
-                self._wants[rid] = overrides.tokens
+                self._wants[rid] = overrides
 
     def remove_request(self, rid):
         with self._lock:
@@ -203,9 +213,10 @@ class RollingKVManager(Resource):
 
     def ask(self, rid, node_name: str, graph_walk: str) -> AdmitOutcome | None:
         with self._lock:
-            tokens = self._wants.get(rid)
-            if tokens is None or rid in self._requests or rid in self._reserved:
+            wants = self._wants.get(rid)
+            if wants is None or rid in self._requests or rid in self._reserved:
                 return None
+        tokens = wants.tokens
         if tokens > self.config.pool_tokens:
             return AdmitOutcome(ok=False, ready=False, reason=AdmitRuntimeError(
                 f"the request keeps {tokens} tokens of rolling K/V a layer; the pool holds "
@@ -214,7 +225,8 @@ class RollingKVManager(Resource):
 
     def reserve(self, rid, node_name: str, graph_walk: str, published: None) -> int | None:
         with self._lock:
-            need, room = self._wants.get(rid, 0), self._room()
+            wants = self._wants.get(rid)
+            need, room = 0 if wants is None else wants.tokens, self._room()
             if need > room:
                 return room
             if not need:
