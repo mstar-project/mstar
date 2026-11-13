@@ -102,7 +102,7 @@ class Admission:
         if outcome.reason is not None and outcome.reason.terminal:
             logger.error(
                 "Request %s cannot be served on node %s by resource %s: %s",
-                rid, node_name, outcome.failed_resource, outcome.reason.message,
+                self._runtime.get_rid_string(rid), node_name, outcome.failed_resource, outcome.reason.message,
             )
             self._lifecycle.fail({
                 rid: f"resource {outcome.failed_resource} rejected the request: {outcome.reason.message}",
@@ -461,12 +461,12 @@ class Admission:
             logger.warning(
                 "Eviction victim %s on %s freed nothing — the host pool is "
                 "most likely full. Raise cpu_offload_pages for the resource "
-                "that ran out.", victim_id, node_name,
+                "that ran out.", self._runtime.get_rid_string(victim_id), node_name,
             )
             return None
         logger.info(
             "Offloaded request %s from %s (%d reclaimed, policy=%s, in_batch=%s)",
-            victim_id, node_name, freed, self.eviction_policy.value,
+            self._runtime.get_rid_string(victim_id), node_name, freed, self.eviction_policy.value,
             victim_id in batch_ids,
         )
         return victim_id
