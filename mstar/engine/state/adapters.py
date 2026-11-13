@@ -261,10 +261,11 @@ def _apply_kernel_settings(
     specs: Sequence[NodeResourceSpec], arrays: Sequence[Array], resolved: "Resolved",
     kernel_settings: Mapping[str, Mapping[str, Any]],
 ) -> None:
-    """Set the kernel choices and capture sizes the contract leaves to the engine, and refuse any other, so this hook
-    can't carry physical choices until the engine picks kernels itself."""
-    owners = {
-        bound.key: (array, bound.binding)
+    """Set the kernel choices, capture sizes and default pool sizes the contract leaves to the engine, and refuse any
+    other, so this hook can't carry other physical choices until the engine picks kernels and sizes its pools itself."""
+    # each key's owner and the resource its settings go on: an array's pool is under its name
+    owners = {array.name: (array, storage_of(array), array.name) for array in arrays} | {
+        bound.key: (array, bound.binding, resolved.resource_of[bound.key])
         for array in arrays for bound in resolved.bound[array.name] if bound.binding.kernel_settings
     }
     by_key = {spec.resource_key: spec for spec in specs}
@@ -273,19 +274,21 @@ def _apply_kernel_settings(
     for key, settings in kernel_settings.items():
         if key not in owners:
             raise ValueError(f"kernel_settings[{key!r}] names no read or update of the declarations that takes kernel "
-                             f"settings, of {sorted(owners)}")
-        array, binding = owners[key]
-        refused = settings.keys() - binding.kernel_settings
+                             f"settings, and no array, of {sorted(owners)}")
+        array, owner, resource = owners[key]
+        refused = settings.keys() - owner.kernel_settings
         if refused:
             raise ValueError(f"Array {array.name!r}: kernel_settings[{key!r}] sets {sorted(refused)}; "
-                             f"it may set only {sorted(binding.kernel_settings)}")
-        resource = resolved.resource_of[key]
+                             f"it may set only {sorted(owner.kernel_settings)}")
         for field, value in settings.items():
             other, was = set_by.setdefault((resource, field), (key, value))
             if was != value:
                 raise ValueError(f"kernel_settings[{other!r}] and kernel_settings[{key!r}] set {field} to {was!r} and "
                                  f"{value!r}, and both reads run on the resource {resource!r}, which holds one value")
-        binding.apply(by_key.get(resource), settings)
+        try:
+            owner.apply(by_key.get(resource), settings)
+        except ValueError as e:
+            raise ValueError(f"Array {array.name!r}: kernel_settings[{key!r}]: {e}") from e
 
 
 def node_handles(
@@ -1209,6 +1212,8 @@ class Storage(ABC):
     """How today's resources hold one kind of array: its specs, its own step, its layouts and its handle."""
 
     handle_class: ClassVar[type[ArrayHandle]]
+    # the pool sizes `kernel_settings` may set under the array's name, until the engine sizes its pools itself
+    kernel_settings: ClassVar[frozenset[str]] = frozenset()
     def __init__(self):
         # `state_steps` reaches a handle's storage, for its step builder, through the handle's class
         self.handle_class.storage = self
@@ -1238,11 +1243,18 @@ class Storage(ABC):
         """Today's `LabelLayout` per label, or None where the array's pool takes no layout."""
         return None
 
+    def apply(self, spec: NodeResourceSpec | None, settings: Mapping[str, Any]) -> None:
+        """Size the array's pool ``spec`` through its own YAML path, so a value here means what the same key under
+        `resources:` means."""
+        if settings:
+            spec.apply_yaml_overrides(**settings)
+
 
 class PagedStorage(Storage):
     """An append-only array that keeps entries, in a pool of KV pages."""
 
     handle_class = PagedArrayHandle
+    kernel_settings = frozenset({"max_num_pages"})
 
     def resolve(self, arrays: Sequence[Array], declared: Sequence[Array], setup: "StateSetup") -> Resolved:
         resolved = Resolved({}, {}, {}, {})
@@ -1290,6 +1302,7 @@ class ValueStorage(Storage):
     """A rewritable array of one entry, in a recurrent state pool that links to the paged array on its nodes."""
 
     handle_class = ValueHandle
+    kernel_settings = frozenset({"max_slots"})
 
     def resolve(self, arrays: Sequence[Array], declared: Sequence[Array], setup: "StateSetup") -> Resolved:
         resolved = Resolved({}, {}, {}, {})

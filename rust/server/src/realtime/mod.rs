@@ -1103,5 +1103,32 @@ mod tests {
         let long = excerpt(&json!("x".repeat(300)));
         assert_eq!(long.chars().count(), 100);
     }
+
+    #[test]
+    fn turn_detection_is_echoed_and_validated() {
+        let td = turn_detection(&json!({"type": "server_vad", "silence_duration_ms": 700})).unwrap().unwrap();
+        assert_eq!(
+            td.view(),
+            json!({"type": "server_vad", "threshold": 0.5, "prefix_padding_ms": 300, "silence_duration_ms": 700,
+                   "create_response": true, "interrupt_response": true})
+        );
+        let td = turn_detection(&json!({"type": "semantic_vad", "eagerness": "medium"})).unwrap().unwrap();
+        assert_eq!(
+            td.view(),
+            json!({"type": "semantic_vad", "eagerness": "medium", "create_response": true, "interrupt_response": true})
+        );
+        for (td, needle) in [
+            (json!({"type": "server_vad", "threshold": 1.5}), "turn_detection.threshold"),
+            (json!({"type": "server_vad", "eagerness": "low"}), "turn_detection.'eagerness' is not"),
+            (json!({"type": "server_vad", "idle_timeout_ms": 5000}), "idle_timeout_ms is not supported"),
+            (json!({"type": "server_vad", "create_response": "yes"}), "must be a boolean"),
+            (json!({"type": "semantic_vad", "eagerness": "eager"}), "eagerness must be one of"),
+            (json!({"type": "semantic_vad", "silence_duration_ms": 500}), "silence_duration_ms' is not"),
+        ] {
+            let err = turn_detection(&td).unwrap_err();
+            assert!(err.contains(needle), "{td}: {err}");
+        }
+        assert_eq!(turn_detection(&Value::Null), Ok(None));
+    }
 }
 
