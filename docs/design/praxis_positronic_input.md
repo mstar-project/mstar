@@ -23,8 +23,8 @@ flowchart LR
 
 The session frontend keeps one scalar: the last reply's action row count. It
 sends that as `executed_rows` on the next request, or zero for a first or
-explicitly reset request. The data worker checks the actual camera and pose
-stacks. If they contain too few prior rows, it sends `reset_episode` and
+explicitly reset request. The data worker checks the camera stacks. If a
+camera has too few prior rows, it sends `reset_episode` and
 `executed_rows=0` to the conductor before admission, and gives the model empty
 prior tensors. A first or explicitly reset call also gets empty prior tensors,
 even if the client sent a frame stack. The startup capability gate remains
@@ -35,11 +35,14 @@ The pinned single-arm reference's `executed_clip(obs, need)` uses rows
 rows from the pose and grip stacks. The current row is `[-1]` and does not
 belong to the executed window. The bimanual reference applies the same window
 to all three views and both arm poses. If the necessary stack is missing or
-short, the reference restarts context at depth zero.
+short, the reference restarts context at depth zero. Missing pose history is
+different: the reference keeps the camera clip and passes no pose history.
 
-The worker passes the full available prior suffix, aligned across views and
-poses, as uint8 `(T,3,H,W)` stacks and one raw float32 `(T,8 or 16)` pose
-stack. The model uses `EpisodeView` and `executed_rows` to select its append
+The worker passes exactly `executed_rows` prior camera rows, excluding the
+current row, as uint8 `(T,3,H,W)` stacks. When matching pose and grip history
+is present it passes a raw float32 `(T,8 or 16)` pose stack; otherwise that
+tensor has zero rows while the camera window stays warm. The model uses
+`EpisodeView` and `executed_rows` to select its append
 span. On the first warm call, the cold seed already holds the first real row,
 so the model appends the final 20 of the 21 prior rows. Later calls append the
 final 24. The model must encode those real frames and retain clean state in

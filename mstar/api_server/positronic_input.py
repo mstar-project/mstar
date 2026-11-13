@@ -223,22 +223,20 @@ def decode_praxis_frame(frame: bytes, embodiment: str, expected_prior_rows: int 
         pose_rows = None if any(rows is None for rows in arms) else np.concatenate(
             [rows[-min(len(rows) for rows in arms):] for rows in arms], axis=1
         )
-    # The next chunk consumes at most 24 prior rows. Keep the common suffix,
-    # even when an uncompressed client sends a longer camera stack.
-    available = min(24, *[len(stack) - 1 for stack in stacks], len(pose_rows) - 1 if pose_rows is not None else 0)
-    reset_episode = expected_prior_rows > available
-    # A new or explicitly reset episode seeds only the current real frame.
-    if reset_episode or expected_prior_rows == 0:
-        available = 0
+    # The reference uses exactly the requested suffix before the current row.
+    # Missing pose history does not invalidate a complete camera clip.
+    reset_episode = any(len(stack) < expected_prior_rows + 1 for stack in stacks)
+    selected_rows = 0 if reset_episode else expected_prior_rows
     executed_frames = [
-        torch.from_numpy(np.array(stack[-(available + 1):-1].transpose(0, 3, 1, 2), order="C", copy=True))
-        if available else torch.empty((0, *image.shape), dtype=torch.uint8)
+        torch.from_numpy(np.array(stack[-(selected_rows + 1):-1].transpose(0, 3, 1, 2), order="C", copy=True))
+        if selected_rows else torch.empty((0, *image.shape), dtype=torch.uint8)
         for stack, image in zip(stacks, images, strict=True)
     ]
     pose_dim = 8 if embodiment == "single_arm" else 16
     executed_poses = (
-        torch.from_numpy(np.array(pose_rows[-(available + 1):-1], dtype=np.float32, copy=True))
-        if available and pose_rows is not None else torch.empty((0, pose_dim), dtype=torch.float32)
+        torch.from_numpy(np.array(pose_rows[-(selected_rows + 1):-1], dtype=np.float32, copy=True))
+        if selected_rows and pose_rows is not None and len(pose_rows) >= selected_rows + 1
+        else torch.empty((0, pose_dim), dtype=torch.float32)
     )
     descriptor = obs.get("descriptor") or ""
     if isinstance(descriptor, bytes):

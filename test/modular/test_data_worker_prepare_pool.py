@@ -332,8 +332,13 @@ def test_positronic_observation_reaches_model_as_raw_pose_and_image_inputs(monke
     assert "robot_state" not in sent[0].model_kwargs
 
 
-@pytest.mark.parametrize(("frames", "expected_rows", "reset"), [(22, 21, False), (21, 21, True)])
-def test_positronic_warm_window_sets_conductor_reset_before_admission(monkeypatch, frames, expected_rows, reset):
+@pytest.mark.parametrize(
+    ("frames", "expected_rows", "reset", "pose_stack"),
+    [(22, 21, False, True), (21, 21, True, True), (22, 21, False, False)],
+)
+def test_positronic_warm_window_sets_conductor_reset_before_admission(
+    monkeypatch, frames, expected_rows, reset, pose_stack,
+):
     from mstar.api_server.openpi import pack
     from mstar.model.base import TensorAndMetadata
 
@@ -353,8 +358,9 @@ def test_positronic_warm_window_sets_conductor_reset_before_admission(monkeypatc
     image = np.stack([np.full((4, 6, 3), n, np.uint8) for n in range(frames)])
     obs = {
         "image.exterior": image, "image.wrist": image,
-        "robot_state.ee_pose": np.array([[n, 0, 0.6, 1, 0, 0, 0] for n in range(frames)], np.float32),
-        "grip": np.zeros(frames, np.float32),
+        "robot_state.ee_pose": np.array([[n, 0, 0.6, 1, 0, 0, 0] for n in range(frames)], np.float32)
+        if pose_stack else [0, 0, 0.6, 1, 0, 0, 0],
+        "grip": np.zeros(frames, np.float32) if pose_stack else 0.25,
     }
     wt._process_waiting_input(PreprocessInput(
         request_id="warm", text="move", file_paths=None,
@@ -364,7 +370,7 @@ def test_positronic_warm_window_sets_conductor_reset_before_admission(monkeypatc
     ))
     window = model.seen["tensors"]
     assert [t.shape[0] for t in window["executed_frame_inputs"]] == [0 if reset else 21] * 2
-    assert window["executed_pose_inputs"][0].shape == (0 if reset else 21, 8)
+    assert window["executed_pose_inputs"][0].shape == (0 if reset or not pose_stack else 21, 8)
     sent = [m.body for m in wt.communicator.sent if m.message_type == ConductorMessageType.NEW_REQUEST]
     assert len(sent) == 1
     assert sent[0].reset_episode is reset

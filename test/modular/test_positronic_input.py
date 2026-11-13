@@ -80,11 +80,26 @@ def test_reference_executed_window_excludes_the_current_row(prior_rows):
     result = decode_praxis_frame(pack({"session_id": "id", "observation": obs}), "single_arm", prior_rows)
     assert not result.reset_episode and result.executed_rows == prior_rows
     assert [int(image[0, 0, 0]) for image in result.images] == [24, 25]
-    span = 0 if prior_rows == 0 else 24
+    span = prior_rows
     assert [tuple(stack.shape) for stack in result.executed_frames] == [(span, 3, 3, 4)] * 2
     assert result.executed_poses.shape == (span, 8)
-    assert result.executed_frames[0][:, 0, 0, 0].tolist() == list(range(span))
-    assert result.executed_poses[:, 0].tolist() == list(range(span))
+    assert result.executed_frames[0][:, 0, 0, 0].tolist() == list(range(24 - span, 24))
+    assert result.executed_poses[:, 0].tolist() == list(range(24 - span, 24))
+
+
+def test_missing_pose_history_keeps_the_reference_camera_window_warm():
+    frames = np.stack([np.full((3, 4, 3), i, np.uint8) for i in range(22)])
+    obs = {
+        "image.exterior": frames, "image.wrist": frames + 1,
+        "robot_state.ee_pose": [0, 0, 0.6, 1, 0, 0, 0], "grip": 0.25,
+    }
+    result = decode_praxis_frame(pack({"session_id": "id", "observation": obs}), "single_arm", 21)
+    assert not result.reset_episode and result.executed_rows == 21
+    assert [stack[:, 0, 0, 0].tolist() for stack in result.executed_frames] == [
+        list(range(21)), list(range(1, 22)),
+    ]
+    assert result.executed_poses.shape == (0, 8)
+    assert result.robot_state == [0, 0, pytest.approx(0.6), 1, 0, 0, 0, 0.25]
 
 
 def test_short_executed_window_restarts_before_admission():
@@ -117,3 +132,17 @@ def test_bimanual_executed_window_keeps_three_views_and_aligned_pose16():
     assert result.executed_poses[0, [0, 8]].tolist() == [0, 100]
     assert result.executed_poses[-1, [0, 8]].tolist() == [23, 123]
     assert [int(image[0, 0, 0]) for image in result.images] == [24, 25, 26]
+
+
+def test_bimanual_missing_pose_history_keeps_three_camera_windows():
+    obs = {
+        name: np.stack([np.full((3, 4, 3), i + offset, np.uint8) for i in range(22)])
+        for offset, name in enumerate(("image.exterior", "image.wrist_left", "image.wrist_right"))
+    }
+    for side in ("left", "right"):
+        obs[f"robot_state.{side}.ee_pose"] = [0, 0, 0.6, 1, 0, 0, 0]
+        obs[f"grip.{side}"] = 0.25
+    result = decode_praxis_frame(pack({"session_id": "id", "observation": obs}), "bimanual", 21)
+    assert not result.reset_episode and result.executed_rows == 21
+    assert [stack.shape[0] for stack in result.executed_frames] == [21] * 3
+    assert result.executed_poses.shape == (0, 16)
