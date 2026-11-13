@@ -195,6 +195,15 @@ def test_glm52_refuses_an_indexer_that_rotates_its_own_way(monkeypatch):
         Glm52Model(model_path_hf="", config_variant="reduced", tokenizer_mode="byte", dsa_long_context=True)
 
 
+def test_glm52_without_long_context_loads_whatever_its_indexer_pairing(monkeypatch):
+    """Only dsa_long_context builds an indexer, so without it the indexer's pairing refuses nothing."""
+    _reduced(monkeypatch, indexer_rope_interleave=not Glm52ModelConfig.reduced().rope_interleave)
+    model = Glm52Model(model_path_hf="", config_variant="reduced", tokenizer_mode="byte")
+    assert model.config.indexer_rope_interleave != model.config.rope_interleave, (
+        "a config that builds no indexer would be refused for the pairing its indexer would rotate by"
+    )
+
+
 def test_glm52_refuses_dsa_whose_first_layer_reuses_a_pick(monkeypatch):
     """A SHARED layer attends the pick of the FULL layer before it, and a SHARED layer 0 has none."""
     from mstar.model.glm52.components.indexer import is_full_indexer_layer
