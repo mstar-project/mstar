@@ -255,6 +255,16 @@ def test_the_layout_keeps_the_sink_and_the_window(image_hw, frame):
     assert layout.retention == RetentionPolicy(context_budget=8 * frame, protected_prefix=6 * frame, exact=True)
 
 
+def test_a_window_with_no_frame_is_refused_when_the_model_sizes_its_pool():
+    """``local_attn_size`` counts the sink's frames and the chunk's too. At their sum the window holds no frame,
+    which the pool can't keep, so the model refuses where it sizes its pool, before any request."""
+    model = _model()
+    model.config.local_attn_size = model.config.sink_size + model.config.chunk_size
+    with pytest.raises(ValueError, match="LingBotWorldConfig.local_attn_size is 10, and the sink's 6 frames and a "
+                                         "chunk's 4 leave its window no frame; make it at least 11, or -1"):
+        model.kernel_settings()
+
+
 @pytest.mark.parametrize(("image_hw", "pages"), [((464, 832), 214), ((720, 1280), 508)])
 def test_max_num_pages_is_admission_s_count(image_hw, pages):
     """The model restates the pool's count, which it can't import, so a rollout counted through intake's route, from
