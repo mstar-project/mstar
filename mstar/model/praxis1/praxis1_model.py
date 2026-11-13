@@ -19,13 +19,11 @@ The graph follows that shape:
 
 The video a chunk predicts is denoised alongside the actions: the action
 expert reads the backbone's hidden states as the video settles. It does not
-condition the next call. The next call is conditioned on the real camera
-frames taken while the robot executed the rows: the reference keeps those per
-session, encodes them again on each call, and refuses to condition on its own
-predictions, because the model trained on real frames only. Carrying those
-frames across requests is the episode-state work and not part of this graph.
-The predicted video latents end at the denoise loop, and nothing predicted
-leaves the walk except the action rows.
+condition the next call. An opt-in episode array retains the real camera
+frames and aligned poses from executed rows, with no predicted frames in the
+window. The VAE node writes and reads that window; a later trunk port must
+consume its clean encoding. The predicted video latents end at the denoise
+loop, and nothing predicted leaves the walk except the action rows.
 
 Nothing here serves yet. The nodes have no computation until the compute port
 lands, so a served model is refused at construction, before it fetches
@@ -40,6 +38,7 @@ from pathlib import Path
 
 import torch
 
+from mstar.engine.state import Array, Entry, Read, TensorType, Window
 from mstar.graph.base import (
     GraphEdge,
     GraphNode,
@@ -50,6 +49,7 @@ from mstar.graph.base import (
 )
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import (
+    EpisodeView,
     Model,
     ProcessPromptOutput,
     RobotIO,
@@ -60,6 +60,7 @@ from mstar.model.media_limits import read_image
 from mstar.model.praxis1.components.commands import compose_commands, pose_to_model
 from mstar.model.praxis1.components.proprio import normalized_proprio
 from mstar.model.praxis1.config import Praxis1Config, Praxis1ConfigError
+from mstar.model.praxis1.episode_history import STATE_NAME, append_count, window_size
 from mstar.model.praxis1.submodules import (
     Praxis1ActionHeadSubmodule,
     Praxis1TextEncoderSubmodule,
@@ -134,6 +135,11 @@ class Praxis1Model(Model):
         self._submodule_cache: dict = {}
         self._tokenizer_cache = None
         self.config: Praxis1Config = self._load_config()
+        context_chunks = self.sampler_defaults["max_context_chunks"]
+        if type(context_chunks) is not int or not 0 <= context_chunks < self.config.n_chunks:
+            raise Praxis1ConfigError(
+                f"max_context_chunks must be in [0, {self.config.n_chunks - 1}]; got {context_chunks!r}"
+            )
         # A recipe past the loop's ceiling would have every request refused at
         # the conductor, so it is refused once, here.
         num_steps = self.sampler_defaults["num_steps"]
@@ -212,13 +218,12 @@ class Praxis1Model(Model):
             ],
         )
 
-        # The observation: one tile per camera view on a single canvas, taken
-        # to latents once per call. It encodes only the frames this request
-        # carries; the reference's context of executed real frames needs state
-        # held across requests, which lands with the episode-state work.
+        # One canvas per observation. When episode history is enabled, the
+        # VAE node also stores the newly executed real frames with their poses.
         vae_encoder = GraphNode(
             name="vae_encoder",
-            input_names=["image_inputs"],
+            input_names=["image_inputs", "executed_pose_inputs", "executed_pose_valid"]
+            if self.sampler_defaults["max_context_chunks"] else ["image_inputs"],
             outputs=[GraphEdge(next_node="backbone", name="obs_latents")],
         )
 
@@ -285,22 +290,32 @@ class Praxis1Model(Model):
         }
 
     def declare_state(self) -> list:
-        """Nothing crosses a step yet, so nothing is declared yet.
+        """Pair executed frames and poses in one bounded episode window.
 
-        The denoise loop carries the video and action latents on its own
-        loop-back edges, as Wan2.2's UniPC state does, and those are ordinary
-        tensors rather than state the engine admits. The text embeddings
-        persist between walks of this request on ``persist`` edges at the
-        conductor; that does not retain them across policy calls.
-
-        The one thing that will be declared state is the context cache: the
-        backbone's K/V held across the Euler steps of one call, which the
-        reference keeps in a per-request ``ctx`` and splices each step. It
-        lands with the step that uses it rather than here, because a
-        declaration the nodes do not yet read would be a shape nothing
-        checks.
+        A zero context depth keeps the existing cold-only graph. The
+        backbone's per-call Euler K/V is a separate later compute port.
         """
-        return []
+        depth = self.sampler_defaults["max_context_chunks"]
+        if depth == 0:
+            return []
+        return [Array(
+            STATE_NAME,
+            nodes={"vae_encoder"}, layers={0},
+            entry=Entry({
+                "frame": TensorType(
+                    (3, self.config.tile_height, self.config.tile_width * self.config.num_cameras),
+                    dtype=torch.uint8,
+                ),
+                "pose": TensorType((8 if self.config.embodiment == "single_arm" else 16,), dtype=torch.float32),
+                # A missing historical pose leaves the camera history valid.
+                # The dense pool's fresh-row gather promotes bool to int64,
+                # so validity is stored as uint8 0/1.
+                "pose_valid": TensorType((1,), dtype=torch.uint8),
+            }),
+            max_len=None,
+            reads={"history": Read(mask=Window(window_size(depth)))},
+            lifetime="episode",
+        )]
 
     # ------------------------------------------------------------------
     # Model ABC: I/O
@@ -419,14 +434,73 @@ class Praxis1Model(Model):
             metadata[MODEL_POSE_KWARG] = model_pose.tolist()
             robot_state = model_pose.tolist()
         proprio = normalized_proprio(robot_state, self.config.embodiment, self.config.normalization)
+        new_tensors = {
+            "text_ids": [task_ids],
+            "text_mask": [task_mask],
+            "blank_ids": [blank_ids],
+            "blank_mask": [blank_mask],
+            "proprio": [proprio],
+        }
+        if self.sampler_defaults["max_context_chunks"]:
+            tensors = kwargs.get("tensors") or {}
+            pose_width = 8 if self.config.embodiment == "single_arm" else 16
+            current = tensors.get("image_inputs") or []
+            previous = tensors.get("executed_frame_inputs") or []
+            prior_poses = tensors.get("executed_pose_inputs") or []
+            if len(current) != self.config.num_cameras:
+                raise ValueError("Praxis episode needs one current image per camera")
+            if previous and len(previous) != len(current):
+                raise ValueError("Praxis executed camera stacks must match the current views")
+            if len(prior_poses) > 1:
+                raise ValueError("Praxis executed poses need at most one stack")
+            views = []
+            n_prior = 0
+            for index, frame in enumerate(current):
+                if frame.ndim != 3 or frame.shape[0] != 3:
+                    raise ValueError("Praxis current images must have shape (3,H,W)")
+                history = previous[index] if previous else frame.new_empty((0, *frame.shape))
+                if history.ndim != 4 or tuple(history.shape[1:]) != tuple(frame.shape):
+                    raise ValueError("Praxis executed images must have shape (T,3,H,W) matching current")
+                if index and history.shape[0] != n_prior:
+                    raise ValueError("Praxis executed camera stacks have different lengths")
+                n_prior = history.shape[0]
+                views.append(torch.cat((history, frame.unsqueeze(0)), dim=0))
+            if prior_poses:
+                raw_pose = prior_poses[0]
+                if raw_pose.ndim != 2 or raw_pose.shape[1] != pose_width or raw_pose.shape[0] not in (0, n_prior):
+                    raise ValueError("Praxis executed poses must be absent or align with executed camera rows")
+                poses_available = raw_pose.shape[0] == n_prior
+                if poses_available and kwargs.get("action_format") == "positronic":
+                    descriptor = kwargs.get("pose_descriptor", "")
+                    pose_history = torch.stack([
+                        torch.from_numpy(pose_to_model(row.cpu().numpy(), self.config.embodiment, descriptor))
+                        for row in raw_pose
+                    ]) if n_prior else torch.empty((0, raw_pose.shape[1]), dtype=torch.float32)
+                elif poses_available:
+                    pose_history = raw_pose.to(torch.float32)
+                else:
+                    pose_history = torch.zeros((n_prior, pose_width), dtype=torch.float32)
+            else:
+                poses_available = n_prior == 0
+                pose_history = torch.zeros((n_prior, pose_width), dtype=torch.float32)
+            new_tensors["image_inputs"] = views
+            new_tensors["executed_pose_inputs"] = [torch.cat((
+                pose_history, torch.as_tensor(robot_state, dtype=torch.float32).reshape(1, -1)
+            ), dim=0)]
+            new_tensors["executed_pose_valid"] = [torch.cat((
+                torch.full((n_prior, 1), int(poses_available), dtype=torch.uint8),
+                torch.ones((1, 1), dtype=torch.uint8),
+            ), dim=0)]
+            # The data worker merges this output into its tensor map. The
+            # original stack has been folded into image_inputs and must not
+            # travel to the conductor as a second unused signal.
+            tensors.pop("executed_frame_inputs", None)
+        elif kwargs.get("tensors") is not None:
+            # Cold-only serving never declares an episode window.
+            kwargs["tensors"].pop("executed_frame_inputs", None)
+            kwargs["tensors"].pop("executed_pose_inputs", None)
         return ProcessPromptOutput(
-            new_input_tensors={
-                "text_ids": [task_ids],
-                "text_mask": [task_mask],
-                "blank_ids": [blank_ids],
-                "blank_mask": [blank_mask],
-                "proprio": [proprio],
-            },
+            new_input_tensors=new_tensors,
             metadata=metadata,
         )
 
@@ -453,6 +527,7 @@ class Praxis1Model(Model):
         output_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]],
         model_kwargs: dict,
+        episode: EpisodeView | None = None,
     ) -> list[WalkStep]:
         """Encode text if this request lacks embeddings, then run its chunk."""
         if not input_signals.get("image_inputs"):
@@ -460,15 +535,21 @@ class Praxis1Model(Model):
         steps: list[WalkStep] = []
         if not input_signals.get("text_embeds"):
             steps.append(WalkStep(self.ENCODE_TEXT_WALK))
+        metadata = {
+            "num_steps": self.get_loop_caps(**model_kwargs)[DENOISE_LOOP_NAME],
+            "t_shift": self.sampler_defaults["t_shift"],
+            "cfg_scale": self.sampler_defaults["cfg_scale"],
+            "cfg_video_scale": self.sampler_defaults["cfg_video_scale"],
+        }
+        if self.sampler_defaults["max_context_chunks"]:
+            held = 0 if episode is None else episode.held.get(STATE_NAME, 0)
+            rows = model_kwargs.get("executed_rows", 0)
+            metadata["history_append"] = append_count(held, rows)
+            metadata["history_held"] = held
         steps.append(
             WalkStep(
                 self.CHUNK_WALK,
-                step_metadata={
-                    "num_steps": self.get_loop_caps(**model_kwargs)[DENOISE_LOOP_NAME],
-                    "t_shift": self.sampler_defaults["t_shift"],
-                    "cfg_scale": self.sampler_defaults["cfg_scale"],
-                    "cfg_video_scale": self.sampler_defaults["cfg_video_scale"],
-                },
+                step_metadata=metadata,
             )
         )
         return steps
@@ -525,7 +606,9 @@ class Praxis1Model(Model):
                 .eval()
                 .requires_grad_(False)
             )
-            return Praxis1VaeEncoderSubmodule(self.config, vae)
+            return Praxis1VaeEncoderSubmodule(
+                self.config, vae, episode_history=bool(self.sampler_defaults["max_context_chunks"])
+            )
         if node_name == "action_head":
             return Praxis1ActionHeadSubmodule(self.config)
         if node_name in ("backbone", "action_expert"):

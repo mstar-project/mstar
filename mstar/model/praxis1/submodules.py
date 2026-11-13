@@ -22,6 +22,7 @@ from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.engine.state import ArrayStep, Segment, SubmoduleStep
 from mstar.model.components.diffusion.decode_utils import latent_affine
 from mstar.model.praxis1.components.action_rows import (
     GRIP_DIMS,
@@ -36,6 +37,7 @@ from mstar.model.praxis1.components.canvas import (
     tile_views_bimanual,
 )
 from mstar.model.praxis1.config import Praxis1Config
+from mstar.model.praxis1.episode_history import STATE_NAME
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
 
 logger = logging.getLogger(__name__)
@@ -163,9 +165,10 @@ class Praxis1VaeEncoderSubmodule(_Praxis1Node):
     happen here so the API server stages uint8 rather than floats.
     """
 
-    def __init__(self, config: Praxis1Config, vae: nn.Module) -> None:
+    def __init__(self, config: Praxis1Config, vae: nn.Module, *, episode_history: bool = False) -> None:
         super().__init__(config)
         self.vae = vae
+        self.episode_history = episode_history
         latent = getattr(vae.config, "z_dim", None)
         if latent is not None and latent != self.config.latent_channels:
             raise ValueError(
@@ -212,19 +215,64 @@ class Praxis1VaeEncoderSubmodule(_Praxis1Node):
                 f"the {self.config.embodiment} rig has {self.config.num_cameras} views "
                 f"({', '.join(self.config.views)}); got {len(frames)} images"
             )
-        return NodeInputs(tensor_inputs={f"view_{i}": f for i, f in enumerate(frames)})
+        tensors = {f"view_{i}": f for i, f in enumerate(frames)}
+        append = 0
+        if self.episode_history:
+            pose = inputs["executed_pose_inputs"][0]
+            pose_valid = inputs["executed_pose_valid"][0]
+            append = int(fwd_info.step_metadata["history_append"])
+            if (pose.ndim != 2 or pose.shape[0] != frames[0].shape[0]
+                    or pose_valid.shape != (pose.shape[0], 1)):
+                raise ValueError("executed poses and camera frames must have matching rows")
+            if frames[0].shape[0] < append:
+                raise ValueError("executed camera stack is shorter than the planned append")
+            tensors["history_pose"] = pose
+            tensors["history_pose_valid"] = pose_valid
+        return NodeInputs(tensor_inputs=tensors, resource_step_info=append,
+                          kwargs={"history_append": append})
+
+    def declare_step(
+        self, graph_walk: str, request_ids: list[str], inputs: list[NodeInputs], **kwargs,
+    ) -> SubmoduleStep | None:
+        if not self.episode_history:
+            return None
+        return SubmoduleStep(
+            segments=[Segment(rid, "main", int(inp.resource_step_info))
+                      for rid, inp in zip(request_ids, inputs, strict=True)],
+            state={STATE_NAME: ArrayStep()},
+        )
 
     def forward(
         self,
         graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
+        history_append: int = 0,
+        history_pose: torch.Tensor | None = None,
+        history_pose_valid: torch.Tensor | None = None,
         **views: torch.Tensor,
     ) -> NameToTensorList:
         device = self.get_device()
         with torch.inference_mode():
-            tiles = [
-                views[f"view_{i}"].to(device) for i in range(self.config.num_cameras)
-            ]
+            tiles = [views[f"view_{i}"].to(device) for i in range(self.config.num_cameras)]
+            if self.episode_history:
+                assert history_pose is not None and history_pose_valid is not None
+                if any(view.shape[0] != tiles[0].shape[0] for view in tiles):
+                    raise ValueError("executed camera stacks have different lengths")
+                # Select only rows new to the episode. On first warm the
+                # seed already contains the overlap's first frame.
+                selected = [view[-(history_append + 1):-1] if history_append > 1
+                            else view[-1:] for view in tiles]
+                added = build_canvas(self._tiles(selected)).squeeze(0).permute(1, 0, 2, 3).to(torch.uint8)
+                poses = history_pose[-(history_append + 1):-1] if history_append > 1 else history_pose[-1:]
+                pose_valid = (history_pose_valid[-(history_append + 1):-1]
+                              if history_append > 1 else history_pose_valid[-1:])
+                handle = self.state_handles[STATE_NAME]
+                handle.add(0, frame=added, pose=poses.to(device=device, dtype=torch.float32),
+                           pose_valid=pose_valid.to(device=device, dtype=torch.uint8))
+                # The clean window is read through the engine's retained
+                # state. A later trunk port consumes its frames and poses.
+                handle.read(0)
+                tiles = [view[-1:] for view in tiles]
             canvas = build_canvas(self._tiles(tiles))
             latent = self.vae_encode(canvas)
         return {"obs_latents": [latent]}
