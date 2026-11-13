@@ -59,6 +59,12 @@ class NewRequest(MessageBody):
     initial_inputs: list[GraphEdge]
     request_info: CurrentForwardPassInfo
     loop_caps: dict[str, int]
+    # Assigned by the conductor. A missing id with a slot borrows it for one
+    # request; a named episode keeps its rows until END_EPISODE.
+    episode_id: str | None = None
+    episode_slot: int | None = None
+    reset_episode: bool = False
+    episode_clear: list[str] = field(default_factory=list)
 
 
 class MessageSource(IntEnum):
@@ -396,6 +402,7 @@ class WorkerGraphsDone(MessageBody):
     is_first_tp_rank: bool
     persist_signals: dict[str, list[TensorPointerInfo]] = field(default_factory=dict)
     new_token_counts: dict[str, int] = field(default_factory=dict) # name to token counts
+    episode_held: dict[str, int] = field(default_factory=dict)
     # one name per chunk this worker emitted to the client since its last report
     output_signal_names: list[str] = field(default_factory=list)
     resource_publish_info: dict[str, PublishedInfo] = field(default_factory=dict)

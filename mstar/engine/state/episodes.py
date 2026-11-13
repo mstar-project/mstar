@@ -72,6 +72,11 @@ class EpisodeRowBindings:
         with self._lock:
             return self._by_request[request_handle].slot
 
+    def slot_busy(self, slot: int) -> bool:
+        """Whether a request still owns the slot on this worker."""
+        with self._lock:
+            return slot in self._active_by_slot
+
     def unbind(self, request_handle: int) -> EpisodeBinding:
         """Detach a request, releasing its slot only if it was temporary."""
         with self._lock:
@@ -89,4 +94,12 @@ class EpisodeRowBindings:
                 raise ValueError(f"episode {episode_id!r} still runs request {self._active_by_slot[slot]}")
             del self._slot_by_episode[episode_id]
             del self._owner_by_slot[slot]
+            return slot
+
+    def idle_slot(self, episode_id: str) -> int | None:
+        """Return an idle owner's slot, or None when this replica never held it."""
+        with self._lock:
+            slot = self._slot_by_episode.get(episode_id)
+            if slot is not None and slot in self._active_by_slot:
+                raise ValueError(f"episode {episode_id!r} still runs request {self._active_by_slot[slot]}")
             return slot

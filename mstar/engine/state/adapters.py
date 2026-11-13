@@ -160,7 +160,7 @@ def _resolve(arrays: Sequence[Array], setup: "StateSetup") -> "Resolved":
     """``arrays`` resolved by their storages, all of one storage's arrays in one call."""
     by_storage: dict[Storage, list[Array]] = {}
     for array in arrays:
-        if array.lifetime == "episode":
+        if array.lifetime == "episode" and storage_of(array) is not DENSE_WINDOW:
             raise _no_layout(array, "episode lifetime needs row binding and storage teardown, which this E1 slice "
                                     "does not yet wire into the engine")
         storage = storage_of(array)
@@ -2366,6 +2366,8 @@ class DenseWindowStorage(Storage):
         for array in arrays:
             if len(array.reads) != 1:
                 raise _no_layout(array, "dense window storage needs exactly one read per array")
+            if len(array.labels) != 1:
+                raise _no_layout(array, "dense window storage currently holds one label per array")
             key, read = next(iter(array.reads.items()))
             if read.layers is not None and read.layers != array.layers:
                 raise _no_layout(array, "dense window read must cover all layers")
@@ -2378,8 +2380,9 @@ class DenseWindowStorage(Storage):
             }
             resolved.specs[array.name] = [DenseWindowSpec(
                 resource_key=array.name, nodes=array.nodes,
+                episode_lifetime=array.lifetime == "episode",
                 config=RecurrentStateConfig(num_layers=len(array.layers), blocks=blocks,
-                                            max_slots=len(array.labels) + 1, labels=tuple(sorted(array.labels))),
+                                            max_slots=2, labels=tuple(sorted(array.labels))),
             )]
             resolved.bound[array.name] = ()
             resolved.resource_of[key] = array.name

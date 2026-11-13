@@ -929,6 +929,14 @@ class StepPipeline:
         ``in_flight`` holds back."""
         self._apply_removes(in_flight)
         self._apply_drains(in_flight)
+        self._apply_episode_ends()
+        self.ingest.retry_episode_requests()
+
+    def _apply_episode_ends(self) -> None:
+        pending = self.lifecycle.pending_episode_ends
+        for body in pending[:]:
+            if self.engine_manager.end_episode(body.episode_id, body.episode_slot):
+                pending.remove(body)
 
     def _apply_removes(self, in_flight: Collection[int]) -> None:
         # Rank 0 tears down nothing while its journal holds moves: each follower replays them with the next step and
@@ -984,7 +992,8 @@ class StepPipeline:
         # it, runs the server at DEBUG)
         logger.debug("Request cleanup complete: %s", wire_rid)
         laps.lap("log")
-        # Last: frees the handle for reuse, so nothing above may run after it.
+        # Free the handle before the teardown loop admits a call queued behind
+        # this episode. Its new request may reuse the integer handle.
         self._graph_runtime.remove_request(rid)
         laps.lap("runtime")
 

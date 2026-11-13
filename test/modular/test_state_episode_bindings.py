@@ -5,12 +5,16 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from mstar.engine.engine import Engine, ExecutingBatch
 from mstar.engine.resources.base import EngineResourceInfo
 from mstar.engine.resources.recurrent.dense_window import DenseWindowPool, DenseWindowSpec
 from mstar.engine.resources.step import Segment, StepContext, SubmoduleStep
 from mstar.engine.state import Array, ArrayStep, Block, Entry, KVEntry, Read, TensorType, Window
 from mstar.engine.state.adapters import DENSE_WINDOW, PAGED, build_specs, node_handles, state_steps, storage_of
 from mstar.engine.state.episodes import EpisodeRowBindings
+from mstar.utils.ipc_format import EndEpisode, RemoveRequest
+from mstar.worker.input_ingest import InputIngest
+from mstar.worker.step_pipeline import StepPipeline
 
 
 def _kv(**overrides):
@@ -181,6 +185,247 @@ def test_dense_window_packs_different_row_lengths_and_refuses_capture():
     step.check_calls()
     pool.commit(step.steps["frames"], step.ctx)
     step.end_calls()
+
+
+def test_episode_owner_survives_request_teardown_then_reset_and_end_clear_it():
+    frames = _frames(reads={"context": Read(mask=Window(4))}, lifetime="episode")
+    (spec,) = build_specs([frames])
+    assert spec.episode_lifetime
+    pool = DenseWindowPool.build(spec, EngineResourceInfo(device=torch.device("cpu")))
+    owners = EpisodeRowBindings()
+
+    def open_request(rid, episode, *, reset=False):
+        pool.ingest_request(rid)
+        bound = owners.bind(rid, 0, episode)
+        pool.bind_episode(rid, 0, episode, cold=bound.cold, reset=reset)
+
+    def call(rid, chunk=None):
+        span = 0 if chunk is None else len(chunk)
+        step = state_steps(SubmoduleStep(
+            segments=[Segment(rid, "main", span)], state={"frames": ArrayStep()},
+        ), {"frames": handle}, graph_walk="decode")
+        step.set_ctx(StepContext(request_ids=[rid], graph_walk="decode", slot=0, capture=False))
+        assert pool.admit(step.steps["frames"], step.ctx).ok
+        pool.plan(step.steps["frames"], step.ctx)
+        step.begin_calls()
+        if chunk is not None:
+            handle.add(0, rgb=chunk)
+        reached = handle.read(0).fields["rgb"].clone()
+        step.check_calls()
+        pool.commit(step.steps["frames"], step.ctx)
+        step.end_calls()
+        return reached
+
+    (handle,) = node_handles(SimpleNamespace(declare_state=lambda: [frames]), "decoder", {"frames": pool}).values()
+    chunk = torch.arange(3, dtype=torch.uint8)[:, None, None, None].expand(-1, 3, 8, 8).clone()
+    open_request(11, "episode-a")
+    assert torch.equal(call(11, chunk), chunk)
+    pool.remove_request(11)
+    owners.unbind(11)
+
+    open_request(12, "episode-a")
+    assert torch.equal(call(12), chunk)
+    pool.remove_request(12)
+    owners.unbind(12)
+
+    open_request(13, "episode-a", reset=True)
+    assert call(13).shape[0] == 0
+    pool.remove_request(13)
+    owners.unbind(13)
+    pool.end_episode(owners.idle_slot("episode-a"))
+    owners.end("episode-a")
+
+    open_request(14, "episode-b")
+    assert call(14).shape[0] == 0
+    pool.remove_request(14)
+    owners.unbind(14)
+    pool.end_episode(owners.idle_slot("episode-b"))
+    owners.end("episode-b")
+
+    # Idless calls are temporary even when the conductor uses the same logical
+    # slot. Their resource rows leave on ordinary request teardown.
+    open_request(15, None)
+    assert torch.equal(call(15, chunk), chunk)
+    pool.remove_request(15)
+    owners.unbind(15)
+    open_request(16, None)
+    assert call(16).shape[0] == 0
+
+
+def test_dense_window_pool_refuses_a_second_identity_without_capacity():
+    frames = _frames(reads={"context": Read(mask=Window(4))}, lifetime="episode")
+    (spec,) = build_specs([frames])
+    assert spec.config.usable_slots == 1
+    pool = DenseWindowPool.build(spec, EngineResourceInfo(device=torch.device("cpu")))
+    for rid in (1, 2):
+        pool.ingest_request(rid)
+    ctx = StepContext(request_ids=[1], graph_walk="decode", slot=0, capture=False)
+    first = state_steps(SubmoduleStep(
+        segments=[Segment(1, "main", 1)], state={"frames": ArrayStep()},
+    ), {"frames": node_handles(SimpleNamespace(declare_state=lambda: [frames]), "decoder",
+                                {"frames": pool})["frames"]}, graph_walk="decode")
+    assert pool.admit(first.steps["frames"], ctx).ok
+    pool.plan(first.steps["frames"], ctx)
+    pool.commit(first.steps["frames"], ctx)
+    ctx.request_ids = [2]
+    second = state_steps(SubmoduleStep(
+        segments=[Segment(2, "main", 1)], state={"frames": ArrayStep()},
+    ), {"frames": node_handles(SimpleNamespace(declare_state=lambda: [frames]), "decoder",
+                                {"frames": pool})["frames"]}, graph_walk="decode")
+    assert not pool.admit(second.steps["frames"], ctx).ok
+
+
+def test_dense_window_requires_every_layer_before_committing_one_logical_length():
+    frames = _frames(layers={0, 1}, reads={"context": Read(mask=Window(4))})
+    (spec,) = build_specs([frames])
+    pool = DenseWindowPool.build(spec, EngineResourceInfo(device=torch.device("cpu")))
+    pool.ingest_request(1)
+    (handle,) = node_handles(SimpleNamespace(declare_state=lambda: [frames]), "decoder", {"frames": pool}).values()
+    step = state_steps(SubmoduleStep(
+        segments=[Segment(1, "main", 3)], state={"frames": ArrayStep()},
+    ), {"frames": handle}, graph_walk="decode")
+    step.set_ctx(StepContext(request_ids=[1], graph_walk="decode", slot=0, capture=False))
+    assert pool.admit(step.steps["frames"], step.ctx).ok
+    pool.plan(step.steps["frames"], step.ctx)
+    step.begin_calls()
+    chunk = torch.full((3, 3, 8, 8), 5, dtype=torch.uint8)
+    handle.add(0, rgb=chunk)
+    with pytest.raises(ValueError, match="layer.*no add"):
+        step.check_calls()
+    handle.add(1, rgb=chunk + 1)
+    assert torch.equal(handle.read(0).fields["rgb"], chunk)
+    assert torch.equal(handle.read(1).fields["rgb"], chunk + 1)
+    step.check_calls()
+    pool.commit(step.steps["frames"], step.ctx)
+    step.end_calls()
+    assert pool.logical_length(1, "main") == 3
+
+
+def test_engine_binds_warm_episode_and_releases_it_only_on_explicit_end():
+    frames = _frames(reads={"context": Read(mask=Window(4))}, lifetime="episode")
+    (spec,) = build_specs([frames])
+    pool = DenseWindowPool.build(spec, EngineResourceInfo(device=torch.device("cpu")))
+    engine = Engine(None)
+    engine._resources = {"frames": pool}
+    engine._episode_pools = {"frames": pool}
+    engine._resource_nodes = {"frames": frozenset({"decoder"})}
+    engine._loopback_steps = {}
+
+    class Runner:
+        def ingest_request(self, rid, overrides, arrival):
+            pool.ingest_request(rid)
+
+        def remove_request(self, rid):
+            pool.remove_request(rid)
+
+        def publish_snapshot(self, *args, **kwargs):
+            return {}
+
+        def publish(self, *args, **kwargs):
+            return {}
+
+    engine._runner = Runner()
+    (handle,) = node_handles(SimpleNamespace(declare_state=lambda: [frames]), "decoder", {"frames": pool}).values()
+
+    def read(rid, span=0):
+        step = state_steps(SubmoduleStep(
+            segments=[Segment(rid, "main", span)], state={"frames": ArrayStep()},
+        ), {"frames": handle}, graph_walk="decode")
+        step.set_ctx(StepContext(request_ids=[rid], graph_walk="decode", slot=0, capture=False))
+        assert pool.admit(step.steps["frames"], step.ctx).ok
+        pool.plan(step.steps["frames"], step.ctx)
+        step.begin_calls()
+        if span:
+            data = torch.full((span, 3, 8, 8), 7, dtype=torch.uint8)
+            handle.add(0, rgb=data)
+        reached = handle.read(0).fields["rgb"].clone()
+        step.check_calls()
+        pool.commit(step.steps["frames"], step.ctx)
+        step.end_calls()
+        return reached
+
+    with pytest.raises(ValueError, match="conductor-assigned episode_slot"):
+        engine.add_request(10, episode_id="a")
+    engine.add_request(11, episode_id="a", episode_slot=0)
+    assert read(11, 3).shape[0] == 3
+    first_batch = ExecutingBatch("decoder", {}, StepContext([11], "decode", 0, False))
+    engine.finalize_batch(first_batch)
+    assert first_batch.episode_held[11] == {"frames": 3}
+    assert read(11, 2).shape[0] == 4
+    second_batch = ExecutingBatch("decoder", {}, StepContext([11], "decode", 0, False))
+    engine.finalize_batch(second_batch)
+    assert second_batch.episode_held[11] == {"frames": 4}
+    assert first_batch.episode_held[11] == {"frames": 3}, "postprocess must not see the next commit"
+    assert not engine.end_episode("a", 0)
+    engine.remove_request(11)
+    engine.add_request(12, episode_id="a", episode_slot=0)
+    assert torch.all(read(12) == 7)
+    engine.remove_request(12)
+    engine.add_request(14, episode_id="a", episode_slot=0, episode_clear=["frames"])
+    assert read(14).shape[0] == 0
+    engine.remove_request(14)
+    assert engine.end_episode("a", 0)
+    engine.add_request(13, episode_id="b", episode_slot=0)
+    assert read(13).shape[0] == 0
+    engine.remove_request(13)
+    assert engine.end_episode("b", 0)
+
+
+def test_worker_defers_idle_episode_close_until_request_teardown():
+    end = EndEpisode("a", 2)
+    pending = [end]
+    active = True
+
+    class Manager:
+        def end_episode(self, episode_id, episode_slot):
+            assert (episode_id, episode_slot) == ("a", 2)
+            return not active
+
+    pipeline = object.__new__(StepPipeline)
+    pipeline.lifecycle = SimpleNamespace(pending_episode_ends=pending)
+    pipeline.engine_manager = Manager()
+    pipeline._apply_episode_ends()
+    assert pending == [end]
+    active = False
+    pipeline._apply_episode_ends()
+    assert pending == []
+
+
+def test_deferred_episode_new_request_replays_all_partitions_then_next_call():
+    ingest = object.__new__(InputIngest)
+    first = SimpleNamespace(request_id="call-a")
+    second_partition = SimpleNamespace(request_id="call-a")
+    next_call = SimpleNamespace(request_id="call-b")
+    ingest._pending_episode_requests = {2: [first, second_partition, next_call]}
+    ingest._engines = SimpleNamespace(episode_slot_busy=lambda slot: False)
+    replayed = []
+    ingest._add_new_request = replayed.append
+    ingest.retry_episode_requests()
+    assert replayed == [first, second_partition]
+    assert ingest._pending_episode_requests == {2: [next_call]}
+    ingest._drop_pending_episode_request("call-b")
+    assert ingest._pending_episode_requests == {}
+
+
+def test_remove_then_new_in_one_worker_batch_waits_for_drained_release():
+    ingest = object.__new__(InputIngest)
+    ingest._pending_episode_requests = {}
+    ingest._runtime = SimpleNamespace(get_rid_handle=lambda wire: 11 if wire == "old" else None)
+    busy = True
+    ingest._engines = SimpleNamespace(episode_slot_busy=lambda slot: busy)
+    removed = []
+    ingest._lifecycle = SimpleNamespace(remove=lambda rid, body, seq: removed.append((rid, seq)))
+    ingest._lockstep = SimpleNamespace(last_consumed_seq=3)
+    ingest._remove_request(RemoveRequest("old"))
+    assert removed == [(11, 3)]
+    next_call = SimpleNamespace(request_id="new", episode_slot=2)
+    ingest._add_new_request(next_call)
+    assert ingest._pending_episode_requests == {2: [next_call]}
+    busy = False  # `_release_request` has finished on this worker.
+    replayed = []
+    ingest._add_new_request = replayed.append
+    ingest.retry_episode_requests()
+    assert replayed == [next_call]
 
 
 @pytest.mark.parametrize("override,match", [

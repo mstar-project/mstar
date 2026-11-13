@@ -729,7 +729,10 @@ deployment YAML tunes them under ``resources:`` (see :ref:`Step 6 <config-yaml>`
   ``size`` entries per row in a dense ring, and ``read`` returns those entries packed
   with row offsets. This path runs eagerly because packed lengths change between calls.
   Set ``resources: {<array name>: {max_slots: N}}`` to hold more concurrent rows; one
-  slot is reserved for padding. A request's row is freed at request teardown.
+  slot is reserved for padding. The conservative default is two slots, so a
+  deployment must size this resource for its request or episode capacity. A
+  request-lifetime row is freed at request teardown; an episode-lifetime row
+  stays until its episode ends.
 - ``Entry({field: TensorType(shape, dtype=, shard=)})``: what one entry holds. Shapes are
   global, before sharding. ``dtype=None`` is the engine's compute dtype, and ``shard`` is
   the axis split across TP ranks, ``None`` when every GPU holds all of it.

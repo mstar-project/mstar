@@ -138,12 +138,14 @@ def _send(rt, completion_id, **aos):
     ntc_rids, ntc = split("new_token_counts")
     prof_rids, prof = split("profiling")
     publish_rids, publications = split("publications")
+    held_rids, held_counts = split("episode_held")
     rt.send_outputs(
         completion_id=completion_id,
         info_rids=info_rids, request_infos=infos,
         ntc_rids=ntc_rids, new_token_counts=[dict(c) for c in ntc],
         prof_rids=prof_rids, profiling=prof,
         publish_rids=publish_rids, publications=publications,
+        held_rids=held_rids, held_counts=held_counts,
         skip_rids=aos.get("skip_rids", []),
     )
 
@@ -201,6 +203,20 @@ def test_a_completion_sends_the_conductor_a_worker_graphs_done(tmp_path):
         ),
     ))]
     assert got["api_server"] == [] and got[PEER] == []
+
+
+def test_episode_held_count_reaches_conductor_in_rust_frame(tmp_path):
+    mesh = _Mesh(tmp_path, outs=[("out", "", False)])
+    rid = mesh.admit()
+    got = mesh.run(rid, uuids=[], episode_held=[(rid, {"executed_frames": 45})])
+    assert got["conductor"] == [_sent(ConductorMessage(
+        message_type=ConductorMessageType.WORKER_GRAPHS_DONE,
+        body=WorkerGraphsDone(
+            request_id="r1", worker_graph_ids=[WG_ID], is_first_tp_rank=True,
+            partition_name="default", graph_walk=WALK,
+            episode_held={"executed_frames": 45},
+        ),
+    ))]
 
 
 def test_an_emitted_signal_reaches_the_api_server(tmp_path):
