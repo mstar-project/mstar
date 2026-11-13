@@ -879,6 +879,29 @@ def test_the_reach_equals_the_store_s_view_on_cuda():
         assert torch.equal(got, want), f"pass {i % 5} of chunk {i // 5} gathered other keys than the rolling view"
 
 
+@requires_cuda
+def test_staging_the_reach_does_not_wait_for_the_last_step():
+    """A copy from pageable memory waits for the stream to drain, so each LingBot chunk's plan waited out the last
+    chunk's forward, 188 ms where main's plan took 1.1 ms."""
+    from mstar.engine.resources.kv.plan import stage_reach
+
+    pool = _pool()
+    _open_exact(pool, "a", sink=3, window=8)
+    step = KVStep(segments=(Segment("a", "main", 4),))
+    ctx = StepContext(request_ids=("a",), graph_walk="rollout", slot=0, capture=False)
+    assert pool.admit(step, ctx).ok
+    views = pool.plan(step, ctx)["main"].views
+    # as at a rollout's later chunks, the pinned buffer comes from the host allocator's cache
+    stage_reach(views, 8, torch.device("cuda"))
+    torch.cuda.synchronize()
+
+    torch.cuda._sleep(1 << 30)  # the last step's forward, still running
+    stage_reach(views, 8, torch.device("cuda"))
+    drained = torch.cuda.current_stream().query()
+    torch.cuda.synchronize()
+    assert not drained, "staging the reach waited for the last step's forward"
+
+
 # A read with no op
 
 
