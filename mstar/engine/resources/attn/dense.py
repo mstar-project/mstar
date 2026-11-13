@@ -13,7 +13,7 @@ from mstar.engine.resources.attn.ragged.wrappers import PrefixedPrefillWrapper, 
 from mstar.engine.resources.attn.workspace import Workspace, workspace_bytes
 from mstar.engine.resources.kv.config import PagedKVConfig
 from mstar.engine.resources.kv.keys import fingerprint
-from mstar.engine.resources.kv.plan import KVPlanOutput, KVPlanOutputs
+from mstar.engine.resources.kv.plan import KVPlanOutput, KVPlanOutputs, ReachSlots, kept_reach
 from mstar.engine.resources.step import StepContext
 from mstar.platforms import current_platform
 
@@ -111,6 +111,8 @@ class DenseSegment:
     prefix_len: int
     q_len: int
     generation: int  # of the stream, at plan time; see CacheStream.generation
+    # the prefix entry by entry where the stream keeps a window, which ``pages`` would overrun; None otherwise
+    reach: ReachSlots | None = None
 
 
 @dataclass(frozen=True)
@@ -135,6 +137,8 @@ class _GatheredPrefix:
     layers: dict[int, tuple[torch.Tensor, torch.Tensor]] = field(default_factory=dict)
     # the prefix's page index on the device: one H2D per gather, not per layer
     pages: torch.Tensor | None = None
+    # each entry's offset in its page, for a prefix gathered entry by entry
+    offsets: torch.Tensor | None = None
 
 
 class DenseAttentionManager(AttentionManager):
@@ -320,20 +324,28 @@ class DenseAttentionManager(AttentionManager):
                 f"dense attention reads a stream from its first page; "
                 f"{view.label!r} of {view.request_id!r} starts at {view.start}"
             )
-            prefix_len = view.length - view.to_compute
-            n_pages = (prefix_len + page_size - 1) // page_size
+            reach = None
+            if view.retention is None:
+                prefix_len = view.length - view.to_compute
+                pages = tuple(view.page_idxs[:(prefix_len + page_size - 1) // page_size])
+            else:
+                # the kept entries the window reaches, which end where this step's start
+                slots = kept_reach(view, page_size)
+                prefix_len = len(slots.pages) - view.to_compute
+                pages, reach = (), ReachSlots(slots.pages[:prefix_len], slots.offsets[:prefix_len])
             segments.append(DenseSegment(
                 request_id=view.request_id,
                 label=view.label,
-                pages=tuple(view.page_idxs[:n_pages]),
+                pages=pages,
                 prefix_len=prefix_len,
                 q_len=view.to_compute,
                 generation=view.generation,
+                reach=reach,
             ))
             cu_q.append(cu_q[-1] + view.to_compute)
-            cu_k.append(cu_k[-1] + view.length)
+            cu_k.append(cu_k[-1] + prefix_len + view.to_compute)
             max_q = max(max_q, view.to_compute)
-            max_k = max(max_k, view.length)
+            max_k = max(max_k, prefix_len + view.to_compute)
 
         # Fresh pinned host layouts per step: the FA3 wrapper H2Ds them non-blocking
         # (from pageable memory that copy would sync the stream), FlashInfer's plan
@@ -376,6 +388,14 @@ class DenseAttentionManager(AttentionManager):
         if cached is not None:
             return cached
 
+        if segment.reach is not None:
+            if entry.pages is None:
+                entry.pages = torch.from_numpy(segment.reach.pages).to(kv_cache_layer.device)
+                entry.offsets = torch.from_numpy(segment.reach.offsets).to(kv_cache_layer.device)
+            # [n_pages, 2, page_size, num_kv_heads, head_dim] -> [prefix_len, 2, num_kv_heads, head_dim]
+            reached = kv_cache_layer[entry.pages, :, entry.offsets]
+            cached = entry.layers[layer_idx] = (reached[:, 0], reached[:, 1])
+            return cached
         cfg = self._kv_config
         if entry.pages is None:
             entry.pages = torch.tensor(segment.pages, dtype=torch.long, device=kv_cache_layer.device)

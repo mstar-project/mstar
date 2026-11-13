@@ -901,6 +901,14 @@ class KeptWindowAttend(KeptWindowBinding):
 KEPT_WINDOW_ATTEND = KeptWindowAttend()
 
 
+class KeptWindowEagerDense(KeptWindowBinding, EagerDenseAttend):
+    """`EagerDenseAttend` through a kept window: the dense kernel's prefix is each row's reach."""
+
+    def check(self, array: Array, key: str, read: Read) -> None:
+        KeptWindowBinding.check(self, array, key, read)
+        EagerDenseAttend.check(self, array, key, read)
+
+
 class PagedReach(KeptWindowBinding):
     """A read with no op through a kept window: the entries it reaches, gathered from the pages. It runs on the pool
     itself, whose plan holds the views, so it builds no spec and no step."""
@@ -2517,7 +2525,9 @@ BINDINGS: dict[tuple[Storage, type[Op | Positions | None]], OpBinding] = {
 SDPA: dict[tuple[Storage, type[Op]], OpBinding] = {(WITHIN_STEP, Attend): SdpaAttend()}
 # What `eager_backend: dense` binds in place of each default, by the default's type: the paged kernel on leased steps,
 # the dense one on the rest.
-EAGER_DENSE: dict[type[OpBinding], OpBinding] = {PagedAttend: EagerDenseAttend()}
+EAGER_DENSE: dict[type[OpBinding], OpBinding] = {
+    PagedAttend: EagerDenseAttend(), KeptWindowAttend: KeptWindowEagerDense(),
+}
 
 
 class Walks(NamedTuple):
