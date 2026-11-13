@@ -4,6 +4,9 @@ The contract freezes that one surface, so a ported model that also imports a res
 engine's inputs, can break with no contract change, and later PRs can't move what it reached for. Nothing at run time
 would notice, so this reads each package's source. The base classes are the bridge, so they aren't read. Each exception
 says why it stands or which PR deletes it, and an exception nothing uses any more fails too, so the list only shrinks.
+
+A package that isn't ported has to be on the frozen list of those that predate this rule, so a new model arrives on
+the contract.
 """
 
 from __future__ import annotations
@@ -20,6 +23,18 @@ PORTED = (
     "mstar/model/qwen3_5", "mstar/model/command_a_plus", "mstar/model/wan22", "mstar/model/flux2_klein",
     "mstar/model/z_image", "mstar/model/ltx2_5", "mstar/model/qwen3_omni", "mstar/model/minimax_h3",
 )
+# The list only shrinks: a package leaves it when its port lands, and nothing is added to it.
+UNPORTED = (
+    "mstar/model/bagel", "mstar/model/canary", "mstar/model/canary_qwen", "mstar/model/chatterbox",
+    "mstar/model/cosmos3", "mstar/model/cosyvoice3", "mstar/model/fish_s2_pro", "mstar/model/glm52",
+    "mstar/model/glm5_next", "mstar/model/higgs_audio", "mstar/model/kokoro", "mstar/model/lingbot_world",
+    "mstar/model/minicpm_o", "mstar/model/muse", "mstar/model/nemotron_duplex", "mstar/model/omnilingual_asr",
+    "mstar/model/omnivoice", "mstar/model/orpheus", "mstar/model/parakeet", "mstar/model/phi4mm", "mstar/model/pi05",
+    "mstar/model/qwen3_asr", "mstar/model/qwen3_tts", "mstar/model/ripple", "mstar/model/vjepa2",
+    "mstar/model/voxcpm2", "mstar/model/waypoint", "mstar/model/whisper",
+)
+# shared code under mstar/model/ that holds no model
+SHARED = ("mstar/model/components", "mstar/model/loader")
 FORBIDDEN_ATTRIBUTES = {
     "node_resources", "resources", "request_state", "per_request_states", "sequence_shard",
     # what a handle holds
@@ -112,6 +127,15 @@ def _sources() -> list[Path]:
     ]
 
 
+def _model_packages() -> list[str]:
+    """The directories under mstar/model/ that hold Python source, apart from the shared ones. A `__pycache__`, or a
+    package another branch left behind, holds none."""
+    return sorted(
+        str(path) for path in Path("mstar/model").iterdir()
+        if path.is_dir() and str(path) not in SHARED and any(path.rglob("*.py"))
+    )
+
+
 @pytest.mark.parametrize("path", _sources(), ids=str)
 def test_a_ported_package_reaches_the_engine_only_through_the_contract(path):
     found, _ = _violations(path.read_text(), str(path))
@@ -167,3 +191,22 @@ def test_the_lint_lets_a_named_function_keep_its_break_and_no_other():
 
 def test_the_lint_reads_all_five_reference_packages():
     assert {path.parts[2] for path in _sources()} >= {"wan22", "flux2_klein", "z_image", "ltx2_5", "qwen3_omni"}
+
+
+@pytest.mark.parametrize("package", _model_packages())
+def test_a_model_package_is_ported_or_on_the_frozen_list(package):
+    assert package in PORTED + UNPORTED, (
+        f"{package} is a new model package that is not on the state contract. Declare its state in `declare_state`, "
+        "reach the engine only through `mstar.engine.state`, and add it to PORTED. Step 2a of docs/adding_models.rst "
+        "shows how."
+    )
+
+
+def test_no_package_is_on_both_lists():
+    both = sorted(set(PORTED) & set(UNPORTED))
+    assert not both, f"take {both} off UNPORTED, since PORTED lists them"
+
+
+def test_both_lists_name_only_packages_that_exist():
+    gone = sorted(set(PORTED + UNPORTED) - set(_model_packages()))
+    assert not gone, f"take {gone} off PORTED and UNPORTED, since mstar/model/ holds no such package"
