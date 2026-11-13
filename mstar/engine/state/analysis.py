@@ -14,7 +14,6 @@ from mstar.engine.state.contract import (
     Array,
     Bidirectional,
     Block,
-    FrameWindow,
     Read,
     Sampler,
     SeqShard,
@@ -214,7 +213,7 @@ def _regrouping_problems(model: "Model", arrays: Sequence[Array], graphs: Mappin
     # once per array, which several of its nodes may report
     return list(dict.fromkeys(
         f"Array {array.name!r}.reads[{key!r}]: {type(read.mask).__name__} on walk {walk!r}, which {cause}. "
-        + (why or _regrouped_cause(read)) + f", so {fix}"
+        + (why or read.mask.split_step_change()) + f", so {fix}"
         for sources, reads, why in (
             (regrouped, whole, None),
             (replaced, kept, "A kept window cuts other entries from a prefill row than from the steps it replaces"),
@@ -222,13 +221,6 @@ def _regrouping_problems(model: "Model", arrays: Sequence[Array], graphs: Mappin
         for node, walk, cause, fix in sources
         for array, key, read in reads if node in array.nodes and runs_on_walk(read, walk)
     ))
-
-
-def _regrouped_cause(read: Read) -> str:
-    """Why regrouping a row's adds across steps changes what ``read`` sees."""
-    if isinstance(read.mask, FrameWindow):
-        return "A step boundary inside a frame cuts what the frame's queries see"
-    return f"{type(read.mask).__name__} sees each step's adds as a whole"
 
 
 def _reads_input(graphs: Mapping[str, object], walk: str, node: str, tensor: str) -> bool:

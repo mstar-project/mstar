@@ -84,6 +84,10 @@ class Mask:
     # whether a read sees a row's adds of each step as a whole, so splitting them across steps changes what it sees
     sees_step_whole: ClassVar[bool]
 
+    def split_step_change(self) -> str:
+        """What splitting a row's adds across steps changes for a read through a mask that `sees_step_whole`."""
+        return f"{type(self).__name__} sees each step's adds as a whole"
+
 
 @dataclass(frozen=True)
 class Causal(Mask):
@@ -151,6 +155,9 @@ class FrameWindow(Mask):
                 raise ValueError(f"FrameWindow.{name} must be a positive int, got {getattr(self, name)!r}")
         if self.frames % self.stride:
             raise ValueError(f"FrameWindow.frames must be a multiple of stride {self.stride}, got {self.frames}")
+
+    def split_step_change(self) -> str:
+        return "A step boundary inside a frame cuts what the frame's queries see"
 
 
 class Op:
