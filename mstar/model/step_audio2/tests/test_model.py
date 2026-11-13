@@ -25,6 +25,7 @@ from mstar.model.step_audio2.config import (
     AUDIO_MELS,
     AUDIO_PATCH,
     AUDIO_START,
+    AUDIO_TOKENS,
     BOT,
     DECODE,
     DECODE_LOOP,
@@ -289,10 +290,10 @@ def test_the_tower_steps_each_clip_as_a_key_prefix_segment_laid_out_against_its_
                              {AUDIO_MELS: [torch.zeros(128, sum(frames))]})
         for rid, frames in requests.items()
     ]
-    step = tower.declare_step(PREFILL_AUDIO, list(requests), inputs).steps[AUDIO_ATTN]
+    step = tower.declare_step(PREFILL_AUDIO, list(requests), inputs)
     want = [(rid, c) for rid, frames in requests.items() for c in request_layout(frames)]
     assert [(s.request_id, s.span) for s in step.segments] == [(rid, c.frames) for rid, c in want]
-    assert step.key_lens == tuple(c.key_len for _, c in want)
+    assert step.state[AUDIO_TOKENS].prefix_lens == tuple(c.key_len for _, c in want)
     # the short clip is laid out against its own request's longest, not the other request's
     assert want[1][1] != request_layout([225])[0] and want[2][1] == request_layout([380])[0]
 
@@ -311,12 +312,25 @@ def test_a_leased_tower_step_leaves_attention_to_the_block_loop_which_reads_the_
     assert tower.declare_step(PREFILL_AUDIO, [7], [inp], piecewise_leases={AUDIO_BLOCK_LOOP: object()}) is None
     region = tower.get_piecewise_accelerator_graph_configs(torch.device("cpu"), torch.float32)[AUDIO_BLOCK_LOOP]
     layout = request_layout(frames)
-    step = region.region_step([7], [c.frames for c in layout]).steps[AUDIO_ATTN]
-    eager = tower.declare_step(PREFILL_AUDIO, [7], [inp]).steps[AUDIO_ATTN]
-    assert step.segments == eager.segments and step.key_lens == eager.key_lens
-    assert step.key_lens == tuple(c.key_len for c in layout) != tuple(c.frames for c in layout)
-    pad = region.region_step([-1], [512]).steps[AUDIO_ATTN]
-    assert pad.key_lens == (512,)
+    declared = []
+
+    class Runner:
+        # the replay declares the region's step inside its run, as the engine's runner does
+        def run(self, static_inputs, request_ids, seq_lens, real_bs):
+            declared.append(region.region_step(request_ids, seq_lens))
+            return SimpleNamespace(get_view=lambda name: static_inputs[name])
+
+    leased = SimpleNamespace(
+        piecewise_leases={AUDIO_BLOCK_LOOP: object()}, piecewise_runners={AUDIO_BLOCK_LOOP: Runner()}, request_ids=[7],
+    )
+    tower._replay_block_loop(leased, torch.zeros(3), layout)
+    (step,) = declared
+    eager = tower.declare_step(PREFILL_AUDIO, [7], [inp])
+    assert step.segments == eager.segments and step.state[AUDIO_TOKENS] == eager.state[AUDIO_TOKENS]
+    assert step.state[AUDIO_TOKENS].prefix_lens == tuple(c.key_len for c in layout) != tuple(c.frames for c in layout)
+    # the scratch lasts only the replay: the capture's padding row attends all of its frames
+    pad = region.region_step([-1], [512])
+    assert pad.state[AUDIO_TOKENS].prefix_lens == (512,)
 
 
 def test_the_towers_block_loop_leases_within_the_resources_segment_limit():
@@ -326,7 +340,9 @@ def test_the_towers_block_loop_leases_within_the_resources_segment_limit():
     from mstar.model.submodule_base import NodeInputs
 
     tower = AudioEncoderSubmodule(torch.nn.Identity(), a_config())
-    tower.bind_node_resources({AUDIO_ATTN: SimpleNamespace(max_segments_per_request=2)})
+    # the read's setting in effect, YAML included, which `kernel_setting` reads off its handle
+    tower.bind_node_state({AUDIO_TOKENS: SimpleNamespace(_kernel_setting=lambda read, field: {
+        (AUDIO_ATTN, "max_segments_per_request"): 2}[read, field])})
     region = tower.get_piecewise_accelerator_graph_configs(torch.device("cpu"), torch.float32)[AUDIO_BLOCK_LOOP]
 
     def request(clips):

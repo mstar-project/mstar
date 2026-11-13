@@ -7,6 +7,7 @@ adapter can't pass by agreeing with itself.
 from __future__ import annotations
 
 import sys
+from types import SimpleNamespace
 
 sys.path.insert(0, ".")
 sys.path.insert(0, "test/modular")
@@ -17,7 +18,7 @@ import yaml
 from test_startup_graph_validation import _step_audio2
 from test_state_ports import _assert_equal_per_key, _assert_steps_equal, _bind, _published
 
-from mstar.engine.resources import RaggedAttentionConfig, RaggedKeyPrefixAttentionSpec
+from mstar.engine.resources import KeyPrefixAttentionStep, RaggedAttentionConfig, RaggedKeyPrefixAttentionSpec
 from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec, AttentionStep
 from mstar.engine.resources.kv.bounded import BoundedKVSpec
 from mstar.engine.resources.kv.config import KVSpec, KVStep, PagedKVConfig
@@ -26,10 +27,11 @@ from mstar.engine.resources.sampler.config import SamplerSpec, SamplerStep, Samp
 from mstar.engine.resources.spec import apply_yaml_overrides
 from mstar.engine.resources.step import Segment, SubmoduleStep
 from mstar.engine.state import Layout, Span
-from mstar.engine.state.adapters import StateSetup, kv_layouts, sampling_configs
+from mstar.engine.state.adapters import StateSetup, kv_layouts, sampling_configs, state_steps
 from mstar.engine.state.analysis import state_declaration_problems
 from mstar.model.base import LabelLayout, enabled_resources, serving_resources
 from mstar.model.components.token2wav.resources import token2wav_resources
+from mstar.model.step_audio2.components.audio import request_layout
 from mstar.model.step_audio2.config import (
     AUDIO_ATTN,
     DECODE,
@@ -45,9 +47,9 @@ from mstar.model.step_audio2.config import (
     PREFILL_TEXT,
 )
 from mstar.model.step_audio2.step_audio2_model import AUDIO, LLM, T2W_DEFAULT_SLOTS, T2W_KEYS, TOKEN2WAV
-from mstar.model.step_audio2.submodules import LLMSubmodule
+from mstar.model.step_audio2.submodules import AUDIO_BLOCK_LOOP, AudioEncoderSubmodule, LLMSubmodule
 from mstar.model.step_audio2.token2wav import T2W_STREAMING
-from mstar.model.submodule_base import ARNodeInputs, engine_step
+from mstar.model.submodule_base import ARNodeInputs, NodeInputs, engine_step
 
 
 def _model():
@@ -158,6 +160,54 @@ def test_request_settings_equal_the_hand_written_config(kwargs):
     model = _model()
     configs = sampling_configs(model.get_request_resource_configs([], [], kwargs), model.declare_state())
     assert configs == {LLM_SAMPLER: SamplingReqConfig(**{**DEFAULT_SAMPLING, **kwargs})}
+
+
+def _tower() -> AudioEncoderSubmodule:
+    model = _model()
+    return _bind(AudioEncoderSubmodule(SimpleNamespace(), model.config), model, node_name=AUDIO)
+
+
+def _key_prefix_reference(rid, clips) -> SubmoduleStep:
+    return SubmoduleStep(steps={AUDIO_ATTN: KeyPrefixAttentionStep(
+        segments=tuple(Segment(request_id=rid, label="main", span=c.frames) for c in clips),
+        key_lens=tuple(c.key_len for c in clips),
+    )})
+
+
+def _tower_inputs(mel_frames: list[int]) -> NodeInputs:
+    layout = request_layout(mel_frames)
+    return NodeInputs(input_seq_len=sum(c.frames for c in layout), kwargs={"mel_frames": mel_frames, "layout": layout})
+
+
+def _assert_within_step_equal(step: SubmoduleStep, reference: SubmoduleStep) -> None:
+    assert step.state, "a ported walk should declare its state, not write today's step classes"
+    assert step.steps.keys() == reference.steps.keys()
+    for key, expected in reference.steps.items():
+        assert step.steps[key] == expected, f"{key} differs from the hand-written step"
+
+
+@pytest.mark.parametrize("mel_frames", [[3000], [3000, 1201], [57]])
+def test_tower_eager_step_equals_the_hand_written_one(mel_frames):
+    inputs = _tower_inputs(mel_frames)
+    step = engine_step(_tower(), graph_walk=PREFILL_AUDIO, request_ids=[7], inputs=[inputs])
+    _assert_within_step_equal(step, _key_prefix_reference(7, inputs.kwargs["layout"]))
+
+
+def test_tower_leased_step_declares_none_as_it_did():
+    tower = _tower()
+    lease = {AUDIO_BLOCK_LOOP: SimpleNamespace()}
+    assert tower.declare_step(PREFILL_AUDIO, [7], [_tower_inputs([3000])], piecewise_leases=lease) is None
+
+
+@pytest.mark.parametrize("replayed", [True, False], ids=["replay", "capture"])
+def test_tower_region_step_equals_the_hand_written_one(replayed):
+    tower, layout = _tower(), request_layout([3000, 1201])
+    frames = [c.frames for c in layout]
+    tower._replay_key_lens = tuple(c.key_len for c in layout) if replayed else None
+    step = state_steps(tower._block_loop_step([7], frames), tower.state_handles)
+    # at capture the runner's padding row attends all of its frames
+    clips = layout if replayed else [c._replace(key_len=c.frames) for c in layout]
+    _assert_within_step_equal(step, _key_prefix_reference(7, clips))
 
 
 def test_the_spoken_decode_walks_are_held_to_one_loop():
