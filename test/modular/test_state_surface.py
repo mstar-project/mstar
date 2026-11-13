@@ -162,6 +162,8 @@ SNAPSHOT = {
         ["min_p", "KEYWORD_ONLY", 'False'],
         ["eos_ids", "KEYWORD_ONLY", '()'],
         ["draws", "KEYWORD_ONLY", '1'],
+        ["repetition_window", "KEYWORD_ONLY", '0'],
+        ["top_p_first", "KEYWORD_ONLY", 'False'],
     ],
     "Segment": [
         ["request_id", "POSITIONAL_OR_KEYWORD", None],

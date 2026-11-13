@@ -329,9 +329,9 @@ that no sampler declares fails the request.
   greedy token scores 0 there, so a trainer sampling greedily wants ``"raw"``. It renorms
   every step's distribution again, about 0.15 ms at batch 1 and 0.5 ms at batch 128 on a
   GB200 with a 248k vocabulary, so it is a separate switch.
-- ``repetition_window``, ``top_p_first`` and ``top_p_min_keep`` stay at their defaults
-  until a port needs them: they ask the node's sampler for a capability a ``Sampler``
-  declaration doesn't name yet.
+- ``repetition_window`` needs the node's ``Sampler`` to declare at least that window
+  (``repetition_window=``), and ``top_p_first`` or a ``top_p_min_keep`` above 1 needs
+  ``top_p_first=True``.
 
 A step whose every row samples greedily (temperature 0, no repetition penalty, no
 ``min_tokens`` and no log-probs) takes each row's argmax instead of the full sampler's draw,
@@ -778,9 +778,11 @@ deployment YAML tunes them under ``resources:`` (see :ref:`Step 6 <config-yaml>`
   declares what its layer passed before. The counter is
   separate from log positions: a kept step advances it by each row's advance, a fork copies
   it, and a prefix hit advances it over the skipped spans.
-- ``Sampler(name, nodes=, vocab_size=, penalty=, min_p=, eos_ids=, draws=)``. ``penalty`` and
-  ``min_p`` declare capabilities, not intentions: each selects which kernel variant is
-  recorded into the captured graph. ``draws`` is how many draws each step that lists the
+- ``Sampler(name, nodes=, vocab_size=, penalty=, min_p=, eos_ids=, draws=, repetition_window=,
+  top_p_first=)``. ``penalty`` and ``min_p`` declare capabilities, not intentions: each selects
+  which kernel variant is recorded into the captured graph. So do ``repetition_window``, the
+  longest window a request's ``repetition_window`` may count, and ``top_p_first``, which lets a
+  request set ``top_p_first`` and ``top_p_min_keep``. ``draws`` is how many draws each step that lists the
   sampler makes, by ``sample`` or ``drew``. Each is a fresh draw that advances each kept row's
   sampling state. Log-probs and a device loop-back take one token per step, so loading refuses both
   above one draw.

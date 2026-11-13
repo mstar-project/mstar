@@ -290,6 +290,7 @@ def _sampler_spec(sampler: Sampler) -> SamplerSpec:
     return SamplerSpec(
         resource_key=sampler.name, nodes=sampler.nodes, vocab_size=sampler.vocab_size,
         enable_repetition_penalty=sampler.penalty, enable_min_p=sampler.min_p, min_tokens_stop_ids=sampler.eos_ids,
+        max_repetition_window=sampler.repetition_window, enable_top_p_first=sampler.top_p_first,
     )
 
 

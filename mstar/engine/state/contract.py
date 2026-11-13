@@ -403,12 +403,17 @@ class Sampler:
     min_p: bool = False
     eos_ids: tuple[int, ...] = ()    # the ids min_tokens bars
     draws: int = 1                   # draws in each step that lists it
+    repetition_window: int = 0       # the longest repetition_window a request may set
+    top_p_first: bool = False        # whether a request may set top_p_first or top_p_min_keep
 
     def __post_init__(self):
         object.__setattr__(self, "nodes", frozenset(self.nodes))
         object.__setattr__(self, "eos_ids", tuple(self.eos_ids))
         if not self.nodes:
             raise ValueError(f"Sampler {self.name!r}.nodes must be non-empty")
+        if not (type(self.repetition_window) is int and self.repetition_window >= 0):
+            raise ValueError(f"Sampler {self.name!r}.repetition_window must be an int >= 0, got "
+                             f"{self.repetition_window!r}")
 
 
 @dataclass(frozen=True)
