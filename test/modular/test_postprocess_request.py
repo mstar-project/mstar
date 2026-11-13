@@ -27,7 +27,7 @@ def _pending(request_walks: dict[int, str]):
     )
     return SimpleNamespace(
         batch=batch, node_name=NODE, graph_walk=MIXED, partition="p",
-        node_batch=SimpleNamespace(final_stream_rids=set(), partition_done_rids=set()),
+        node_batch=SimpleNamespace(final_stream_rids=set(), partition_done_rids=set(), withheld_outputs={}),
     )
 
 

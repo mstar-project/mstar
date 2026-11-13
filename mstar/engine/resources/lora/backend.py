@@ -45,7 +45,9 @@ class LoraBackend(ABC):
         ranks: torch.Tensor, scalings: torch.Tensor, y: torch.Tensor,
         out_slices: tuple[int, ...],
     ) -> None:
-        """``y[t, slice i] += scalings[slot(t)] * h[t, slice i] @ b[slot(t), slice i]^T``."""
+        """``y[t, slice i] += scalings[slot(t)] * h[t, slice i] @ b[slot(t), slice i]^T``.
+        ``b`` must be finite everywhere, past a slot's rank included: a backend may read it up
+        to the max rank against zeros in ``h`` (the pool keeps it zero there)."""
 
     def gather_shrink(
         self, ids: torch.Tensor, a: torch.Tensor, addressing: "LoraAddressing",
@@ -85,7 +87,8 @@ class LoraBackend(ABC):
         addressing: "LoraAddressing", ranks: torch.Tensor, scalings: torch.Tensor,
         out_slices: tuple[int, ...],
     ) -> None:
-        """Shrink then expand into ``y``, for a linear target; a backend may fuse them."""
+        """Shrink then expand into ``y``, for a linear target; a backend may fuse them. ``b`` as
+        for ``expand_fused``."""
         h = self.shrink(x, a, addressing, ranks, len(out_slices))
         self.expand_fused(h, b, addressing, ranks, scalings, y, out_slices)
 

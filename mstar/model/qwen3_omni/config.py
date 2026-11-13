@@ -32,11 +32,16 @@ TALKER_ATTN = "talker_attn"
 AUDIO_ATTN = "audio_attn"
 # the shared ViT node (`PackedBlockLoopEncoder`) reads `keys`' one
 VISION_ATTN = keys.VISION_ATTN
+# What each encoder's attention reads, and what the Talker keeps per request.
+AUDIO_TOKENS, VISION_TOKENS = "audio_tokens", "vision_tokens"
+TALKER_TEXT = "talker_text"
 
 THINKER_POS = "thinker_pos"
 TALKER_POS = "talker_pos"
 
 THINKER_SAMPLER = "thinker_sampler"
+# whether a Thinker step's tokens split over its SP ranks
+THINKER_SHARD = "thinker_shard"
 # combined walk of the Thinker's text/audio prefill and decode
 THINKER_MIXED = "thinker_mixed"
 # the decode walk of a request with no audio output: no states for the Talker

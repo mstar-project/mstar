@@ -181,7 +181,7 @@ def test_forward_in_graph_rope_reads_planned_positions_at_capture():
             calls["ids"] = ids.tolist()
             return ids.float()
 
-        def __call__(self, embeds, label, cos_sin):
+        def __call__(self, embeds, label, cos_sin, walk=None):
             calls["cos"] = cos_sin[0]
             return embeds
 

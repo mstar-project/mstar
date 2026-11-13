@@ -1,17 +1,32 @@
-"""What layers and submodules hold for declared state: a handle per array or sampler, over today's resources.
+"""What layers and submodules hold for declared state: a handle per array, sampler or sequence shard, over today's
+resources.
 
-A call that touches state runs behind a graph break, so it is plain Python in eager steps and at capture, it never runs
-on a replay, and its checks live in it.
+A call that touches an array or a sampler runs behind a graph break, so it is plain Python in eager steps and at
+capture, it never runs on a replay, and its checks live in it. A shard's `scatter` and `gather` deliberately don't break
+the graph: a compiled frame of a walk the shard never splits traces them straight through.
 """
 
 from abc import abstractmethod
-from collections.abc import Mapping
-from typing import Any
+from collections.abc import Mapping, Sequence
+from typing import TYPE_CHECKING, Any
 
 import torch
 
-from mstar.engine.resources.step import StepHandle
-from mstar.engine.state.contract import Array, ArrayStep, CausalConv, GatedDeltaNet, Op, Sampler
+from mstar.engine.resources.step import Segment, StepHandle
+from mstar.engine.state.contract import EMPTY, Array, ArrayStep, CausalConv, GatedDeltaNet, Op, Sampler, SeqShard
+
+if TYPE_CHECKING:
+    from mstar.engine.state.state_op import StateOp
+
+
+def segments_of(declared: ArrayStep, step) -> Sequence[Segment]:
+    """The segments ``declared`` lays out in ``step``: its own, or the step's where it lists None."""
+    return step.segments if declared.segments is None else declared.segments
+
+
+def pool_layers(array: Array) -> dict[int, int]:
+    """Each of ``array``'s layers to its index in the array's pool, which holds only those layers, in order."""
+    return {layer: i for i, layer in enumerate(sorted(array.layers))}
 
 
 class ArrayHandle(StepHandle):
@@ -24,16 +39,23 @@ class ArrayHandle(StepHandle):
     resources hold the step's plan.
     """
 
-    def __init__(self, array: Array, resources: Mapping[str, Any], positions_key: str | None):
+    # whether a step that lists the array has anything to do for it
+    needs_step = True
+    # each read's runner, and the ops bound with their keys, where the storage binds them
+    reads: Mapping[str, Any] = EMPTY
+    _bindings: tuple = ()
+    # the position resource and the dtype its `Rope` rotates in, where the array declares positions
+    positions: Any = None
+    rope_dtype: torch.dtype | None = None
+
+    def __init__(self, array: Array, resources: Mapping[str, Any]):
         self.array = array
+        # the state ops whose fused kernel can write this array's pages (`bind_state_ops`)
+        self.fused_ops: frozenset[str] = frozenset()
         self.name = array.name
         self.label = "main"
-        self.positions_key = positions_key
-        self.positions = None if positions_key is None else resources[positions_key]
-        rope = None if array.positions is None else array.positions.rope
-        self.rope_dtype = None if rope is None else rope.dtype
 
-        self._pool_layer = {layer: i for i, layer in enumerate(sorted(array.layers))}
+        self._pool_layer = pool_layers(array)
 
         # This step's calls, checked in eager steps and at capture.
         # `_held` is the k and v an add left for `_held_layer`'s read, on a kernel that takes them there.
@@ -41,6 +63,7 @@ class ArrayHandle(StepHandle):
         # and `_updated` the update calls run.
         self._open = False
         self._keep = True
+        self._capturing = False
         self._held: tuple[torch.Tensor, torch.Tensor] | None = None
         self._held_layer: int | None = None
         self._kept: set[int] = set()
@@ -71,13 +94,17 @@ class ArrayHandle(StepHandle):
             raise self._refusal("a step began while another is open")
         self._open = True
         declared: ArrayStep = step.state[self.name]
-        segments = declared.segments or step.segments
+        segments = segments_of(declared, step)
         if segments:
             self.label = segments[0].label
         # on a replay too, whose `eager_add` adds still run
         self._keep = declared.keep
+        self._capturing = step.ctx.capture
         for calls in (self._kept, self._scratch, self._read, self._updated):
             calls.clear()
+        # before the replay's return, since a captured step's writes reach this on a replay
+        if declared.host:
+            self._check_host_writes(declared, step.ctx)
         if step.ctx.replays:
             return
         self._check_step(declared, segments or (), step.ctx)
@@ -93,9 +120,15 @@ class ArrayHandle(StepHandle):
             raise self._refusal(f"layers {sorted(self.array.layers - self._kept)} have no add in a step that keeps "
                                 "adds on others, and every layer stays the same length")
 
+    def commit_step(self, step) -> None:
+        """Nothing: the resources hold what a step keeps of the array."""
+
     def end_step(self, step) -> None:
         self._open = False
         self._held = self._held_layer = None
+
+    def _check_host_writes(self, declared: ArrayStep, ctx) -> None:
+        raise self._refusal("a host write, and the array declares no host fields")
 
     def _check_step(self, declared: ArrayStep, segments, ctx) -> None:
         declared_labels = self.array.labels
@@ -109,8 +142,8 @@ class ArrayHandle(StepHandle):
         if forked - declared_labels:
             raise self._refusal(f"a fork names labels {sorted(forked - declared_labels)}, and the array declares "
                                 f"{sorted(declared_labels)}")
-        if self.positions is None and (declared.advance is not None or declared.position_ids is not None):
-            raise self._refusal("a step sets advance or position_ids, and the array declares no positions")
+        if declared.advance is not None or declared.position_ids is not None:
+            _positions(self, "a step sets advance or position_ids, and the array declares no positions")
         self._check_storage(declared, segments, ctx)
 
     @abstractmethod
@@ -155,7 +188,7 @@ class ArrayHandle(StepHandle):
         held = self._held
         if held is None:
             raise self._refusal(f"a read on layer {layer} with no add before it")
-        self._held = None
+        self._held = self._held_layer = None
         return held
 
     def add(self, layer: int | torch.Tensor, *, keep: bool | None = None, **fields: torch.Tensor) -> None:
@@ -184,13 +217,29 @@ class ArrayHandle(StepHandle):
     def at_last_token(self, x: torch.Tensor) -> torch.Tensor:
         raise self._unsupported("at_last_token")
 
+    def takes_fused(self, op: "StateOp") -> bool:
+        """Whether ``op``'s fused kernel writes this array itself, in place of its reference running the calls."""
+        return False
+
     def _kernel_setting(self, read: str, field: str) -> Any:
-        raise self._unsupported(f"kernel_setting of {read!r}")
+        if read not in self.reads:
+            raise self._unsupported(f"kernel_setting of {read!r}")
+        (binding,) = (bound.binding for bound in self._bindings if bound.key == read)
+        if not binding.kernel_settings:
+            raise self._refusal(f"no {field} for read {read!r}, whose binding {type(binding).__name__} takes no "
+                                "kernel settings")
+        if field not in binding.read_back:
+            raise self._refusal(f"no {field} for read {read!r}, whose binding {type(binding).__name__} reports back "
+                                f"{sorted(binding.read_back) or 'none'}")
+        return getattr(self.reads[read], field)
 
     def _update(self, kind: type[Op], field: str, layer: int) -> tuple[Any, torch.Tensor]:
         """Record the update of type ``kind`` on ``layer``'s ``field``, and return the resource that runs it and the
         field's view."""
         raise self._unsupported(f"an update of type {kind.__name__}")
+
+    def _host(self, request: int, label: str, layer: int) -> Mapping[str, object]:
+        raise self._unsupported("host")
 
 
 class SamplerHandle(StepHandle):
@@ -215,11 +264,57 @@ class SamplerHandle(StepHandle):
         self._drawn = 0
 
     def check_step(self, step) -> None:
-        if not step.ctx.replays and self._drawn != self.sampler.draws:
+        # a step that keeps no row's sample may skip the kernel: an eager prefill short of its last chunk
+        if step.ctx.replays or (not self._drawn and step.state[self.name].kept_rows == frozenset()):
+            return
+        if self._drawn != self.sampler.draws:
             raise self._refusal(f"a step listing it sampled {self._drawn} times, and draws is {self.sampler.draws}")
+
+    def commit_step(self, step) -> None:
+        """Nothing: the resource holds a sampler's state."""
 
     def end_step(self, step) -> None:
         self._open = False
+
+
+class ShardHandle(StepHandle):
+    """A node's calls on its declared `SeqShard`. Its step is the node's segments, so the engine opens it on every
+    step of the node, with no entry in ``state``. It takes the label it brackets from the step's segments, as the
+    array handles do, and the walk from the step, so a compiled frame of a walk the shard never splits traces the
+    bracket straight through. Closed, it holds neither, and the bracket is the resource's outside a step: the
+    identity."""
+
+    def __init__(self, shard: SeqShard, resource: Any):
+        self.shard = shard
+        self.name = shard.name
+        self.resource = resource
+        self.label: str | None = None
+        self.walk: str | None = None
+
+    @property
+    def ranks(self) -> int:
+        """The sequence-parallel ranks the node's tokens split over: what a layout that must tile evenly rounds to."""
+        return self.resource.group.world_size
+
+    @property
+    def needs_step(self) -> bool:
+        """Whether a step must plan the shard: where it can split. Elsewhere its plan is copied, and a step nothing
+        else needs skips it, the bracket then the identity."""
+        return self.resource.can_split
+
+    def begin_step(self, step) -> None:
+        (label,) = self.shard.labels  # analysis refuses a shard of several
+        self.label = label if any(segment.label == label for segment in step.segments or ()) else None
+        self.walk = step.ctx.graph_walk
+
+    def check_step(self, step) -> None:
+        return
+
+    def commit_step(self, step) -> None:
+        """Nothing: a shard holds no state across steps."""
+
+    def end_step(self, step) -> None:
+        self.label = self.walk = None
 
 
 @torch.compiler.disable
@@ -242,22 +337,51 @@ def gated_delta_net(
     return run.run(q, k, v, a, b, state_layer=state, a_log=a_log, dt_bias=dt_bias, label=h.label)
 
 
+def scatter(h: ShardHandle, *xs: torch.Tensor | None, dim: int | None = None):
+    """This rank's share of each of ``xs``, whole on every rank, along ``dim`` (the shard's axis by default), where
+    this step splits the label; ``xs`` as they are otherwise. One tensor in, one out; several in, a tuple out. None
+    passes through."""
+    return h.resource.scatter(h.label, *xs, dim=dim, walk=h.walk)
+
+
+def gather(h: ShardHandle, *xs: torch.Tensor | None, dim: int | None = None):
+    """`scatter`'s inverse: every rank's share of each of ``xs``, back whole."""
+    return h.resource.gather(h.label, *xs, dim=dim, walk=h.walk)
+
+
+def split_range(h: ShardHandle):
+    """This rank's range of the label (``start``, ``count``, and every rank's ``counts``) where this step splits it;
+    None where it is copied or the step doesn't open the label."""
+    return h.resource.split_range(h.label)
+
+
+def host(h: ArrayHandle, request: int, label: str, layer: int | torch.Tensor) -> Mapping[str, object]:
+    """One entry's host fields on the host, as the last committed step left them."""
+    return h._host(request, label, h._layer_id(layer))
+
+
+def _positions(h: ArrayHandle, cause: str = "the array declares no positions") -> Any:
+    if h.positions is None:
+        raise h._refusal(cause)
+    return h.positions
+
+
 def position(h: ArrayHandle, rid_handle: int, label: str) -> int:
     """The next position on ``label`` of the request at worker handle ``rid_handle``, on the host."""
-    return h.positions.position(rid_handle, label)
+    return _positions(h).position(rid_handle, label)
 
 
 def positions(h: ArrayHandle) -> torch.Tensor:
     """This step's position ids in segment order, on the device. Under a graph lease the buffer runs to the bucket's
     length, past the step's tokens."""
     h._check_open("positions")
-    return h.positions.pos_ids(h.label)
+    return _positions(h).pos_ids(h.label)
 
 
 def rope(h: ArrayHandle, q: torch.Tensor, k: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """``q`` and ``k`` rotated at this step's positions with the declared `Rope`."""
     h._check_open("rope")
-    return h.positions.apply_qk(q, k, label=h.label, rope_dtype=h.rope_dtype or q.dtype)
+    return _positions(h).apply_qk(q, k, label=h.label, rope_dtype=h.rope_dtype or q.dtype)
 
 
 @torch.compiler.disable

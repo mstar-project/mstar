@@ -8,7 +8,7 @@ import pytest
 import torch
 from torch import nn
 
-from mstar.model.qwen3_omni.config import THINKER_POS, Qwen3OmniModelConfig
+from mstar.model.qwen3_omni.config import Qwen3OmniModelConfig
 from mstar.model.qwen3_omni.qwen3_omni_model import TEXT_BEFORE
 from mstar.model.qwen3_omni.submodules import ThinkerSubmodule, talker_text_mask
 
@@ -40,7 +40,7 @@ def thinker(config):
         embed_tokens=_CountingEmbedding(max(config.thinker_text.vocab_size, *ids) + 1, HIDDEN),
     ))
     thinker.__dict__["_cached_device"] = torch.device("cpu")
-    thinker.node_resources = {THINKER_POS: SimpleNamespace(position=lambda rid, label: START)}
+    thinker.kv = SimpleNamespace(positions=SimpleNamespace(position=lambda rid, label: START))
     return thinker
 
 

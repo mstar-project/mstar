@@ -15,29 +15,23 @@ Where it differs from the reference without changing the numbers:
 from __future__ import annotations
 
 import math
-from collections.abc import Callable
-from typing import NamedTuple
+from collections.abc import Mapping
+from typing import Any, NamedTuple
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
+from mstar.engine.state import gather, scatter, split_range
+from mstar.model.components.diffusion.attention import attend
 from mstar.model.components.distributed.linear import (
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
 )
-from mstar.model.components.distributed.sequence_parallel import (
-    gather_sequence,
-    sp_seq_split,
-    ulysses_attention,
-)
 from mstar.model.minimax_h3.components.qk_norm_rope import qk_norm_rope
-from mstar.model.minimax_h3.config import NUM_MODALITIES, H3TransformerConfig
-
-# (q, k, v) -> out over [B, S, H, D]
-Attend = Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor]
+from mstar.model.minimax_h3.config import DIT_ROWS, NUM_MODALITIES, PROMPT_ROWS, H3TransformerConfig
 
 
 class RopeTable(NamedTuple):
@@ -115,11 +109,14 @@ class H3TimeEmbedder(nn.Module):
 
 class H3Attention(nn.Module):
     """Self-attention: one fused q/k/v GEMM (heads sharded over ``comm_group``), per-head
-    q/k RMSNorm, partial 3-axis rope, attention, output GEMM."""
+    q/k RMSNorm, partial 3-axis rope, attention through ``array``'s read, output GEMM."""
 
-    def __init__(self, cfg: H3TransformerConfig, comm_group: CommGroup):
+    def __init__(self, cfg: H3TransformerConfig, comm_group: CommGroup, array: str, layer: int):
         super().__init__()
         heads, head_dim = cfg.num_attention_heads, cfg.attention_head_dim
+        self.array = array
+        self.layer = torch.tensor(layer, device="cpu")
+        self.state = None
         self.head_dim = head_dim
         self.local_heads = heads // comm_group.world_size
         self.qkv_proj = QKVParallelLinear(comm_group, cfg.hidden_size, head_dim, heads, heads, bias=False)
@@ -127,7 +124,10 @@ class H3Attention(nn.Module):
         self.k_norm = nn.RMSNorm(head_dim, eps=cfg.qk_norm_eps)
         self.out_proj = RowParallelLinear(comm_group, heads * head_dim, cfg.hidden_size, bias=False)
 
-    def forward(self, x: torch.Tensor, attend: Attend, rope: RopeTable | None = None, sp=None) -> torch.Tensor:
+    def bind_state(self, handles: Mapping[str, Any]) -> None:
+        self.state = handles.get(self.array)
+
+    def forward(self, x: torch.Tensor, rope: RopeTable | None = None) -> torch.Tensor:
         local = self.local_heads * self.head_dim
         qkv = self.qkv_proj(x)
         q, k, v = qkv.split([local, local, local], dim=-1)
@@ -142,7 +142,7 @@ class H3Attention(nn.Module):
             k = self.k_norm(k.unflatten(-1, (self.local_heads, self.head_dim)))
             if rope is not None:
                 q, k = apply_rope(q, rope), apply_rope(k, rope)
-        out = attend(q, k, v) if sp is None else sp.attend(q, k, v, attend)
+        out = attend(self.state, self.layer, q, k, v)
         return self.out_proj(out.flatten(2, 3).type_as(q))
 
 
@@ -168,11 +168,11 @@ class H3Block(nn.Module):
     timesteps of each row of the batch) to ``[B, n * 3, 6, hidden]``: per (timestep,
     modality), the ``shift, scale, gate`` of the attention and of the feed-forward."""
 
-    def __init__(self, cfg: H3TransformerConfig, comm_group: CommGroup):
+    def __init__(self, cfg: H3TransformerConfig, comm_group: CommGroup, layer: int):
         super().__init__()
         self.hidden_size = cfg.hidden_size
         self.norm1 = nn.RMSNorm(cfg.hidden_size, eps=cfg.norm_eps)
-        self.attn = H3Attention(cfg, comm_group)
+        self.attn = H3Attention(cfg, comm_group, DIT_ROWS, layer)
         self.norm2 = nn.RMSNorm(cfg.hidden_size, eps=cfg.norm_eps)
         self.mlp = H3FeedForward(cfg, comm_group)
         self.adaln_proj = nn.Module()
@@ -185,9 +185,7 @@ class H3Block(nn.Module):
         mods = linear(F.silu(temb).to(linear.weight.dtype))
         return mods.view(batch, -1, 6, self.hidden_size)
 
-    def forward(
-        self, x: torch.Tensor, temb: torch.Tensor, row_index: torch.Tensor, rope: RopeTable, attend: Attend, sp=None,
-    ) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, temb: torch.Tensor, row_index: torch.Tensor, rope: RopeTable) -> torch.Tensor:
         """``x`` ``[B, S, hidden]``; ``row_index`` ``[S]`` selects each row's table entry
         (``timestep * 3 + tag``)."""
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.modulation(temb, x.shape[0]).unbind(2)
@@ -198,7 +196,7 @@ class H3Block(nn.Module):
             return term.index_select(1, row_index)
 
         h = self.norm1(x) * (1.0 + rows(scale_msa)) + rows(shift_msa)
-        x = x + rows(gate_msa) * self.attn(h, attend, rope, sp)
+        x = x + rows(gate_msa) * self.attn(h, rope)
         h = self.norm2(x) * (1.0 + rows(scale_mlp)) + rows(shift_mlp)
         return x + rows(gate_mlp) * self.mlp(h)
 
@@ -206,16 +204,16 @@ class H3Block(nn.Module):
 class H3RefinerBlock(nn.Module):
     """``MiniMaxH3TokenRefinerBlock``: a plain pre-norm block, no AdaLN, no rope."""
 
-    def __init__(self, cfg: H3TransformerConfig):
+    def __init__(self, cfg: H3TransformerConfig, layer: int):
         super().__init__()
         trivial = CommGroup.trivial()
         self.norm1 = nn.RMSNorm(cfg.hidden_size, eps=cfg.norm_eps)
-        self.attn = H3Attention(cfg, trivial)
+        self.attn = H3Attention(cfg, trivial, PROMPT_ROWS, layer)
         self.norm2 = nn.RMSNorm(cfg.hidden_size, eps=cfg.norm_eps)
         self.mlp = H3FeedForward(cfg, trivial)
 
-    def forward(self, x: torch.Tensor, attend: Attend) -> torch.Tensor:
-        x = x + self.attn(self.norm1(x), attend)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x + self.attn(self.norm1(x))
         return x + self.mlp(self.norm2(x))
 
 
@@ -226,14 +224,14 @@ class H3TextConditioner(nn.Module):
         super().__init__()
         self.condition_proj = nn.Linear(cfg.text_dim, cfg.hidden_size)
         self.token_refiner = nn.Module()
-        self.token_refiner.blocks = nn.ModuleList(H3RefinerBlock(cfg) for _ in range(cfg.token_refiner_num_layers))
+        self.token_refiner.blocks = nn.ModuleList(H3RefinerBlock(cfg, i) for i in range(cfg.token_refiner_num_layers))
         self.token_refiner.final_norm = nn.RMSNorm(cfg.hidden_size, eps=cfg.final_norm_eps)
 
-    def forward(self, hidden: torch.Tensor, attend: Attend) -> torch.Tensor:
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
         """``[B, L, text_dim]`` -> ``[B, L, hidden]`` in the projection's dtype."""
         x = self.condition_proj(hidden.to(self.condition_proj.weight.dtype))
         for block in self.token_refiner.blocks:
-            x = block(x, attend)
+            x = block(x)
         return self.token_refiner.final_norm(x)
 
 
@@ -256,24 +254,6 @@ class H3FinalLayer(nn.Module):
         shift, scale = mods.index_select(1, row_class).unbind(dim=2)
         h = self.norm(x) * (1.0 + scale) + shift
         return h.to(self.video_out.weight.dtype)
-
-
-class SeqParallel(NamedTuple):
-    """Ulysses over the packed rows: ``sizes`` is each rank's share of them."""
-
-    group: CommGroup
-    sizes: list[int]
-
-    @property
-    def start(self) -> int:
-        return sum(self.sizes[: self.group.rank])
-
-    @property
-    def count(self) -> int:
-        return self.sizes[self.group.rank]
-
-    def attend(self, q, k, v, run: Attend) -> torch.Tensor:
-        return ulysses_attention(self.group, q, k, v, run, self.sizes, seq_dim=1, head_dim=2)
 
 
 class H3Inputs(NamedTuple):
@@ -305,32 +285,19 @@ class H3StepLayout(NamedTuple):
         """``S``: the packed rows, padding included."""
         return self.row_index.shape[0]
 
-    @property
-    def segments(self) -> tuple[int, ...]:
-        """The rows of each attention segment: the request's, then the padding's."""
-        pad = self.num_pad_rows
-        return (self.num_rows - pad, pad) if pad else (self.num_rows,)
-
 
 class H3DiT(nn.Module):
     """The block stack and its ends. ``forward`` returns the velocity of every video row
     (keyframe rows included, which the caller masks) and every audio row, fp32."""
 
-    def __init__(self, cfg: H3TransformerConfig, comm_group: CommGroup | None = None,
-                 sp_group: CommGroup | None = None):
+    def __init__(self, cfg: H3TransformerConfig, comm_group: CommGroup | None = None):
         super().__init__()
         comm_group = comm_group or CommGroup.trivial()
         self.cfg = cfg
-        self.sp_group = sp_group or CommGroup.trivial()
-        heads = cfg.num_attention_heads // comm_group.world_size
-        if heads % self.sp_group.world_size:
-            # Ulysses gives each rank whole heads; under SDPA nothing else would refuse this
-            # before the first request
-            raise ValueError(f"MiniMax-H3's {heads} heads don't split over sp_size {self.sp_group.world_size}")
         self.video_patch_proj = nn.Linear(cfg.patch_dim, cfg.hidden_size)
         self.audio_patch_proj = nn.Linear(cfg.audio_latents_dim, cfg.hidden_size)
         self.time_embedder = H3TimeEmbedder(cfg)
-        self.blocks = nn.ModuleList(H3Block(cfg, comm_group) for _ in range(cfg.num_layers))
+        self.blocks = nn.ModuleList(H3Block(cfg, comm_group, i) for i in range(cfg.num_layers))
         self.final_layer = H3FinalLayer(cfg)
 
     # the modules the reference keeps in fp32 (``_keep_in_fp32_modules``)
@@ -380,18 +347,19 @@ class H3DiT(nn.Module):
         return torch.cat(pieces, dim=1)
 
     def forward(
-        self, inputs: H3Inputs, layout: H3StepLayout, attend: Attend, row_class: torch.Tensor | None = None,
+        self, inputs: H3Inputs, layout: H3StepLayout, row_class: torch.Tensor | None = None, shard=None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """``inputs.timesteps`` is ``[B, 3]`` (video, audio, keyframe), or ``[B, 1]`` when all
         are one value: the reference then runs its AdaLN GEMMs on one row, which rounds
         differently from three. ``row_class`` (tests) indexes timesteps laid out as the
-        reference's distinct values. ``attend`` attends within ``layout.segments``, so no
-        request row sees a padding row."""
+        reference's distinct values. `attend` attends within the step's segments
+        (`attention_segments`), so no request row sees a padding row. ``shard``: the node's sequence shard's
+        handle, which on a step it splits
+        gives this rank a contiguous range of the packed rows: only those are built and run, and the attention's
+        resource exchanges them."""
         cond, pad = layout.num_condition_rows, layout.num_pad_rows
-        sp, start, count = None, 0, layout.num_rows
-        if self.sp_group.world_size > 1:
-            sp = SeqParallel(self.sp_group, sp_seq_split(layout.num_rows, self.sp_group.world_size))
-            start, count = sp.start, sp.count
+        split = None if shard is None else split_range(shard)
+        start, count = (0, layout.num_rows) if split is None else (split.start, split.count)
         x = self.packed_rows(inputs, layout, start, count)
         rope, row_index = layout.rope, layout.row_index
         if row_class is not None:
@@ -401,18 +369,17 @@ class H3DiT(nn.Module):
             row_class, row_index = layout.no_class, layout.tags
         else:
             row_class = layout.row_class
-        if sp is not None:
+        if split is not None:
             rope = rope.rows(start, count)
-            row_index = row_index.narrow(0, start, count)
-            row_class = row_class.narrow(0, start, count)
+            row_index, row_class = scatter(shard, row_index, row_class, dim=0)
         temb = self.time_embedding(inputs.timesteps)
         for block in self.blocks:
-            x = block(x, temb, row_index, rope, attend, sp)
+            x = block(x, temb, row_index, rope)
         h = self.final_layer(x, temb, row_class)
         # both heads over this rank's rows, then the rows gathered: [B, S, patch_dim + audio_dim]
         out = torch.cat([self.final_layer.video_out(h), self.final_layer.audio_out(h)], dim=-1)
-        if sp is not None:
-            out = gather_sequence(sp.group, out, sp.sizes, dim=1)
+        if split is not None:
+            out = gather(shard, out, dim=1)
         text, audio_rows, end = layout.text_len, layout.num_audio_rows, layout.num_rows - pad
         patch_dim = self.cfg.patch_dim
         video_v = torch.cat(

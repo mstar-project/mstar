@@ -14,7 +14,6 @@ max_seq_len: 8192
 # in use once loaded); the SP2 and SP8 configs place them the same way. Measured settings and
 # times: docs/models.rst.
 model_kwargs:
-  attention_backend: flashinfer
   compile: true
   vae_tile_batch: 28
   vae_compile: true

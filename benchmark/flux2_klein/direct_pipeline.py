@@ -138,7 +138,7 @@ def main():
     torch.set_float32_matmul_precision("high")
     device = torch.device("cuda")
     model = Flux2KleinModel(
-        model_path_hf=args.repo, attention_backend="sdpa", compile=args.compile,
+        model_path_hf=args.repo, compile=args.compile,
         compile_exact_ops=["norms"] if args.exact_ops else False, vae_compile=args.vae_compile, accelerator_graph=False,
         capture_sizes=[[args.height, args.width]],
     )

@@ -20,6 +20,8 @@ ATTN = "attn"
 GDN_STATE = "gdn_state"
 LINEAR_ATTN = "linear_attn"
 SAMPLER = keys.SAMPLER
+# whether a step's tokens split over the LLM's SP ranks
+LLM_SHARD = "llm_shard"
 # the ViT tower's tokens and its cacheless attention over them, on the `vision_encoder` node
 VISION_TOKENS = "vision_tokens"
 VISION_ATTN = keys.VISION_ATTN

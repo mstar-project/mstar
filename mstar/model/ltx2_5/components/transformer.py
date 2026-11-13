@@ -7,9 +7,8 @@ every sub-layer is AdaLN-modulated by the timestep. Ported from diffusers'
 
 Inputs are already patchified tokens (patch size 1): video ``[B, Lv, 128]`` and
 audio ``[B, La, 128]``. Rotary tables are per request shape, so the caller builds
-them once (``build_rope``) and passes them in. The six attentions run through
-``Attend`` callables the caller supplies (``LTX2Attends``), which is where the
-engine's ragged attention resource plugs in.
+them once (``build_rope``) and passes them in. Each of the six attentions reads
+the array it binds, which holds its kernel and its sequence-parallel exchange.
 
 Only the configuration LTX-2.5 ships is implemented: cross-attention AdaLN on both
 streams with a timestep-dependent prompt modulation (``use_prompt_adaln_single``),
@@ -20,15 +19,12 @@ not ported yet.
 
 from __future__ import annotations
 
-import functools
 from typing import NamedTuple
 
 import torch
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
-from mstar.model.components.diffusion.attention import Attend
-from mstar.model.components.distributed.sequence_parallel import SeqParallel, sp_seq_split
 from mstar.model.components.norm import rms_norm_no_weight
 from mstar.model.ltx2_5.components.layers import (
     GatedAttention,
@@ -36,7 +32,15 @@ from mstar.model.ltx2_5.components.layers import (
     RotaryTable,
     split_rope_table,
 )
-from mstar.model.ltx2_5.config import LTX2TransformerConfig
+from mstar.model.ltx2_5.config import (
+    AUDIO,
+    AUDIO_FOR_VIDEO,
+    TEXT_FOR_AUDIO,
+    TEXT_FOR_VIDEO,
+    VIDEO,
+    VIDEO_FOR_AUDIO,
+    LTX2TransformerConfig,
+)
 
 
 def timestep_sinusoid(timesteps: torch.Tensor) -> torch.Tensor:
@@ -98,17 +102,6 @@ class LTX2Rope(NamedTuple):
     cross_audio: RotaryTable     # audio side of a2v / v2a
 
 
-class LTX2Attends(NamedTuple):
-    """The attention each of a block's six attentions runs through."""
-
-    video_self: Attend
-    audio_self: Attend
-    video_text: Attend
-    audio_text: Attend
-    audio_to_video: Attend      # q: video, kv: audio
-    video_to_audio: Attend      # q: audio, kv: video; also takes return_lse (see SeqParallel)
-
-
 class TemporalEmbeddings(NamedTuple):
     """The step's global modulation rows, shared by every block."""
 
@@ -123,33 +116,37 @@ class TemporalEmbeddings(NamedTuple):
 
 
 class LTX2Block(nn.Module):
-    def __init__(self, cfg: LTX2TransformerConfig, comm_group: CommGroup):
+    def __init__(self, cfg: LTX2TransformerConfig, comm_group: CommGroup, layer: int):
         super().__init__()
         dim, adim = cfg.inner_dim, cfg.audio_inner_dim
         self.eps = cfg.norm_eps
-        common = dict(comm_group=comm_group, bias=cfg.attention_bias, out_bias=cfg.attention_out_bias, eps=cfg.norm_eps)
+        common = dict(
+            comm_group=comm_group, bias=cfg.attention_bias, out_bias=cfg.attention_out_bias, eps=cfg.norm_eps,
+            layer=layer,
+        )
         self.attn1 = GatedAttention(
-            dim, cfg.num_attention_heads, cfg.attention_head_dim, gated=cfg.gated_attn, **common,
+            dim, cfg.num_attention_heads, cfg.attention_head_dim, gated=cfg.gated_attn, array=VIDEO, **common,
         )
         self.audio_attn1 = GatedAttention(
-            adim, cfg.audio_num_attention_heads, cfg.audio_attention_head_dim, gated=cfg.audio_gated_attn, **common,
+            adim, cfg.audio_num_attention_heads, cfg.audio_attention_head_dim, gated=cfg.audio_gated_attn,
+            array=AUDIO, **common,
         )
         self.attn2 = GatedAttention(
             dim, cfg.num_attention_heads, cfg.attention_head_dim, kv_dim=cfg.cross_attention_dim,
-            gated=cfg.gated_attn, **common,
+            gated=cfg.gated_attn, array=TEXT_FOR_VIDEO, **common,
         )
         self.audio_attn2 = GatedAttention(
             adim, cfg.audio_num_attention_heads, cfg.audio_attention_head_dim, kv_dim=cfg.audio_cross_attention_dim,
-            gated=cfg.audio_gated_attn, **common,
+            gated=cfg.audio_gated_attn, array=TEXT_FOR_AUDIO, **common,
         )
         # both cross-modal attentions use the audio stream's head layout
         self.audio_to_video_attn = GatedAttention(
             dim, cfg.audio_num_attention_heads, cfg.audio_attention_head_dim, kv_dim=adim,
-            gated=cfg.gated_attn, **common,
+            gated=cfg.gated_attn, array=AUDIO_FOR_VIDEO, **common,
         )
         self.video_to_audio_attn = GatedAttention(
             adim, cfg.audio_num_attention_heads, cfg.audio_attention_head_dim, kv_dim=dim,
-            gated=cfg.audio_gated_attn, **common,
+            gated=cfg.audio_gated_attn, array=VIDEO_FOR_AUDIO, **common,
         )
         self.ff = GeluFeedForward(dim, comm_group, bias=cfg.ff_bias)
         self.audio_ff = GeluFeedForward(adim, comm_group, bias=cfg.audio_ff_bias)
@@ -171,11 +168,9 @@ class LTX2Block(nn.Module):
         audio_text: torch.Tensor,
         temb: TemporalEmbeddings,
         rope: LTX2Rope,
-        attends: LTX2Attends,
-        sp: SeqParallel | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """``sp``: ``x`` holds this rank's share of the video tokens; audio and text are
-        replicated. Only the video self-attention exchanges tokens (see ``SeqParallel``)."""
+        """Under sequence parallelism ``x`` holds this rank's share of the video tokens, and
+        audio and text are replicated."""
         eps = self.eps
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp, shift_tq, scale_tq, gate_tq = (
             modulation(self.scale_shift_table, temb.video)
@@ -185,19 +180,19 @@ class LTX2Block(nn.Module):
 
         # 1. self-attention
         h = rms_norm_no_weight(x, eps) * (1 + scale_msa) + shift_msa
-        x = x + self.attn1(h, attends.video_self, q_rope=rope.video, exchange=sp) * gate_msa
+        x = x + self.attn1(h, q_rope=rope.video) * gate_msa
         h = rms_norm_no_weight(a, eps) * (1 + a_scale_msa) + a_shift_msa
-        a = a + self.audio_attn1(h, attends.audio_self, q_rope=rope.audio) * a_gate_msa
+        a = a + self.audio_attn1(h, q_rope=rope.audio) * a_gate_msa
 
         # 2. text cross-attention; the text keys/values are modulated too
         shift_tkv, scale_tkv = modulation(self.prompt_scale_shift_table, temb.video_prompt)
         a_shift_tkv, a_scale_tkv = modulation(self.audio_prompt_scale_shift_table, temb.audio_prompt)
         h = rms_norm_no_weight(x, eps) * (1 + scale_tq) + shift_tq
         context = text * (1 + scale_tkv) + shift_tkv
-        x = x + self.attn2(h, attends.video_text, context=context) * gate_tq
+        x = x + self.attn2(h, context=context) * gate_tq
         h = rms_norm_no_weight(a, eps) * (1 + a_scale_tq) + a_shift_tq
         context = audio_text * (1 + a_scale_tkv) + a_shift_tkv
-        a = a + self.audio_attn2(h, attends.audio_text, context=context) * a_gate_tq
+        a = a + self.audio_attn2(h, context=context) * a_gate_tq
 
         # 3. audio <-> video; both directions read the streams as they are here
         norm_x, norm_a = rms_norm_no_weight(x, eps), rms_norm_no_weight(a, eps)
@@ -211,15 +206,12 @@ class LTX2Block(nn.Module):
         q_in = norm_x * (1 + v_a2v_scale) + v_a2v_shift
         kv_in = norm_a * (1 + a_a2v_scale) + a_a2v_shift
         x = x + a2v_gate * self.audio_to_video_attn(
-            q_in, attends.audio_to_video, context=kv_in, q_rope=rope.cross_video, k_rope=rope.cross_audio,
+            q_in, context=kv_in, q_rope=rope.cross_video, k_rope=rope.cross_audio,
         )
         q_in = norm_a * (1 + a_v2a_scale) + a_v2a_shift
         kv_in = norm_x * (1 + v_v2a_scale) + v_v2a_shift
-        v2a = attends.video_to_audio
-        if sp is not None:
-            v2a = functools.partial(sp.attend_shards, run=v2a)
         a = a + v2a_gate * self.video_to_audio_attn(
-            q_in, v2a, context=kv_in, q_rope=rope.cross_audio, k_rope=rope.cross_video,
+            q_in, context=kv_in, q_rope=rope.cross_audio, k_rope=rope.cross_video,
         )
 
         # 4. feed-forward
@@ -229,14 +221,9 @@ class LTX2Block(nn.Module):
 
 
 class LTX2DiT(nn.Module):
-    def __init__(
-        self, cfg: LTX2TransformerConfig, comm_group: CommGroup | None = None, sp_group: CommGroup | None = None,
-    ):
+    def __init__(self, cfg: LTX2TransformerConfig, comm_group: CommGroup | None = None):
         super().__init__()
         comm_group = comm_group or CommGroup.trivial()
-        # Sequence parallelism shards the video tokens (nearly all the compute) and
-        # replicates the weights, the ~100 audio tokens and the text.
-        self.sp_group = sp_group or CommGroup.trivial()
         self.cfg = cfg
         dim, adim = cfg.inner_dim, cfg.audio_inner_dim
         self.proj_in = nn.Linear(cfg.in_channels, dim)
@@ -252,7 +239,7 @@ class LTX2DiT(nn.Module):
         self.av_cross_attn_audio_scale_shift = AdaLNSingle(adim, 4)
         self.av_cross_attn_video_a2v_gate = AdaLNSingle(dim, 1)
         self.av_cross_attn_audio_v2a_gate = AdaLNSingle(adim, 1)
-        self.transformer_blocks = nn.ModuleList([LTX2Block(cfg, comm_group) for _ in range(cfg.num_layers)])
+        self.transformer_blocks = nn.ModuleList([LTX2Block(cfg, comm_group, i) for i in range(cfg.num_layers)])
         self.scale_shift_table = nn.Parameter(torch.empty(2, dim))
         self.audio_scale_shift_table = nn.Parameter(torch.empty(2, adim))
         self.proj_out = nn.Linear(dim, cfg.out_channels)
@@ -293,35 +280,23 @@ class LTX2DiT(nn.Module):
         audio_text: torch.Tensor,
         timestep: torch.Tensor,
         rope: LTX2Rope,
-        attends: LTX2Attends,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """One velocity prediction. ``latents`` / ``audio_latents`` in the model dtype;
         ``timestep`` is ``sigma * 1000``, ``[B]`` fp32. Returns ``(video, audio)``
-        velocities in the model dtype."""
-        sp = None
-        if self.sp_group.world_size > 1:
-            sp = SeqParallel(self.sp_group, sp_seq_split(latents.shape[1], self.sp_group.world_size))
-            latents = sp.scatter(latents)
-            rope = rope._replace(video=_shard_rows(sp, rope.video), cross_video=_shard_rows(sp, rope.cross_video))
+        velocities in the model dtype. Every op but attention is token-local, so the
+        video tokens may be any contiguous share of each row's (sequence parallelism),
+        ``rope``'s video tables cut alike."""
         x = self.proj_in(latents)
         a = self.audio_proj_in(audio_latents)
         temb, video_embedded, audio_embedded = self.temporal_embeddings(timestep)
         for block in self.transformer_blocks:
-            x, a = block(x, a, text, audio_text, temb, rope, attends, sp)
+            x, a = block(x, a, text, audio_text, temb, rope)
 
         shift, scale = (self.scale_shift_table[None, None] + video_embedded[:, :, None]).unbind(dim=2)
         x = nn.functional.layer_norm(x, (x.shape[-1],), eps=1e-6) * (1 + scale) + shift
         a_shift, a_scale = (self.audio_scale_shift_table[None, None] + audio_embedded[:, :, None]).unbind(dim=2)
         a = nn.functional.layer_norm(a, (a.shape[-1],), eps=1e-6) * (1 + a_scale) + a_shift
-        video = self.proj_out(x)
-        if sp is not None:
-            video = sp.gather(video)
-        return video, self.audio_proj_out(a)
-
-
-def _shard_rows(sp: SeqParallel, table: RotaryTable) -> RotaryTable:
-    start, count = sum(sp.sizes[: sp.group.rank]), sp.sizes[sp.group.rank]
-    return RotaryTable(table.cos.narrow(1, start, count), table.sin.narrow(1, start, count))
+        return self.proj_out(x), self.audio_proj_out(a)
 
 
 def video_positions(

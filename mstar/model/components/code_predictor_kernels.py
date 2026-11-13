@@ -403,9 +403,9 @@ class DepthKV:
 
     The cache, ``[layers, max_batch_size, 2, max_depth, kv_heads, head_dim]``,
     and ``cp_linear``'s row partials are small model-held scratch rather than
-    engine resources. They are made at the first step, the cache in the
-    activations' dtype, and sliced to each batch, so every captured step reads
-    the same buffers. Nothing clears them: every position a step reads was
+    engine resources. They are made at load, or else at the first step, the cache
+    in the activations' dtype, and sliced to each batch, so every captured step
+    reads the same buffers. Nothing clears them: every position a step reads was
     written earlier in the same frame.
     """
 
@@ -415,12 +415,15 @@ class DepthKV:
         self.partials: torch.Tensor | None = None
         self._fresh = False
 
+    def make(self, dtype: torch.dtype, device: torch.device | str) -> None:
+        self.kv_cache = torch.zeros(self.shape, dtype=dtype, device=device)
+        self.partials = torch.zeros(_MAX_PARTIALS, _MAX_ROWS, dtype=torch.float32, device=device)
+
     @torch.compiler.disable
     def scratch(self, like: torch.Tensor) -> torch.Tensor:
-        """Make the buffers on ``like``'s device on first use; returns the partials."""
+        """The partials, after making the buffers on ``like``'s device if nothing made them at load."""
         if self.kv_cache is None:
-            self.kv_cache = torch.zeros(self.shape, dtype=like.dtype, device=like.device)
-            self.partials = torch.zeros(_MAX_PARTIALS, _MAX_ROWS, dtype=torch.float32, device=like.device)
+            self.make(like.dtype, like.device)
         return self.partials
 
     @torch.compiler.disable

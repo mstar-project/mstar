@@ -9,6 +9,7 @@ windows, frames and deepstack outputs, with no flash_attn anywhere.
 from __future__ import annotations
 
 import sys
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -28,6 +29,15 @@ from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import (  # noqa
 
 from mstar.engine.resources import RaggedAttentionSpec  # noqa: E402
 from mstar.engine.resources.base import EngineResourceInfo, build_resource  # noqa: E402
+from mstar.engine.resources.step import StepContext  # noqa: E402
+from mstar.engine.state import Array, Attend, Block, KVEntry, Read  # noqa: E402
+from mstar.engine.state.adapters import (  # noqa: E402
+    StateSetup,
+    _resolve,
+    build_handle,
+    node_resources,
+    state_steps,
+)
 from mstar.model.components.aut_encoder import AuTEncoder, AuTEncoderConfig  # noqa: E402
 from mstar.model.components.aut_submodule import AuTEncoderSubmodule  # noqa: E402
 from mstar.model.components.block_loop_encoder import VISION_BLOCK_LOOP  # noqa: E402
@@ -35,7 +45,9 @@ from mstar.model.loader import load_hf_weights  # noqa: E402
 from mstar.model.qwen3_omni.components.vision import Qwen3OmniVisionTower  # noqa: E402
 from mstar.model.qwen3_omni.config import (  # noqa: E402
     AUDIO_ATTN,
+    AUDIO_TOKENS,
     VISION_ATTN,
+    VISION_TOKENS,
     Qwen3OmniModelConfig,
     VisionEncoderConfig,
 )
@@ -80,6 +92,25 @@ class StandInRagged:
         return out
 
 
+def _bind(sub, name, read, ragged, heads, head_dim, layers) -> None:
+    """``sub`` on a real handle over ``ragged``, as the engine binds a node on the contract."""
+    array = Array(name, nodes={"encoder"}, layers=frozenset(range(layers)), max_len=0,
+                  entry=KVEntry(heads=heads, head_dim=head_dim),
+                  reads={read: Read(mask=Block(), op=Attend(q_heads=heads))})
+    sub.bind_node_state({name: build_handle(array, {read: ragged}, _resolve([array], StateSetup()))})
+
+
+@contextmanager
+def _opened(sub, step, rows):
+    """``step``'s handles open around a forward, as the engine opens them."""
+    expanded = state_steps(step, sub.state_handles)
+    expanded.set_ctx(StepContext(request_ids=list(rows), graph_walk="encode", slot=0, capture=False))
+    expanded.begin_calls()
+    yield
+    expanded.check_calls()
+    expanded.end_calls()
+
+
 def _engine_inputs(rids):
     # no capture runners and no lease: the eager path
     return SimpleNamespace(request_ids=list(rids), piecewise_runners={}, piecewise_leases={}, step=object())
@@ -95,11 +126,12 @@ def audio_pair():
     hf = Qwen3OmniMoeAudioEncoder._from_config(
         Qwen3OmniMoeAudioEncoderConfig(**AUDIO), attn_implementation="sdpa",
     ).eval()
-    encoder = AuTEncoder(AuTEncoderConfig.from_hf(AUDIO), attn_key=AUDIO_ATTN)
+    encoder = AuTEncoder(AuTEncoderConfig.from_hf(AUDIO), array=AUDIO_TOKENS)
     encoder.load_weights(list(hf.state_dict().items()))
     sub = AudioEncoderSubmodule(encoder.eval(), Qwen3OmniModelConfig(audio_encoder=encoder.config))
     ragged = StandInRagged()
-    sub.bind_node_resources({AUDIO_ATTN: ragged})
+    config = encoder.config
+    _bind(sub, AUDIO_TOKENS, AUDIO_ATTN, ragged, config.encoder_attention_heads, config.head_dim, config.encoder_layers)
     return hf, sub, ragged
 
 
@@ -113,11 +145,11 @@ def vision_pair():
         for p in hf.parameters():
             p.copy_(torch.randn_like(p) * 0.1)
     config = VisionEncoderConfig.from_dict(VISION)
-    tower = Qwen3OmniVisionTower(config, attn_key=VISION_ATTN)
+    tower = Qwen3OmniVisionTower(config, attn_key=VISION_ATTN, array=VISION_TOKENS)
     check_loaded(tower, load_hf_weights(tower, hf.state_dict().items()), "tower")
     sub = VisionEncoderSubmodule(tower.eval(), Qwen3OmniModelConfig(vision=config))
     ragged = StandInRagged()
-    sub.bind_node_resources({VISION_ATTN: ragged})
+    _bind(sub, VISION_TOKENS, VISION_ATTN, ragged, config.num_heads, config.head_dim, config.depth)
     return hf, sub, ragged
 
 
@@ -128,7 +160,7 @@ def test_encoders_declare_ragged_attention():
     model.config = Qwen3OmniModelConfig(
         audio_encoder=AuTEncoderConfig.from_hf(AUDIO), vision=VisionEncoderConfig.from_dict(VISION),
     )
-    specs = {s.resource_key: s for s in model.get_node_resources()}
+    specs = {s.resource_key: s for s in node_resources(model)}
 
     audio, vision = specs[AUDIO_ATTN], specs[VISION_ATTN]
     assert isinstance(audio, RaggedAttentionSpec) and isinstance(vision, RaggedAttentionSpec)
@@ -156,7 +188,7 @@ def test_ragged_spec_builds_its_backend_without_flash_attn(monkeypatch):
     monkeypatch.setitem(sys.modules, "mstar.engine.resources.attn.ragged.flashinfer", fake)
     model = object.__new__(Qwen3OmniModel)
     model.config = Qwen3OmniModelConfig(vision=VisionEncoderConfig.from_dict(VISION))
-    spec = next(s for s in model.get_node_resources() if s.resource_key == VISION_ATTN)
+    spec = next(s for s in node_resources(model) if s.resource_key == VISION_ATTN)
 
     res = build_resource(spec, EngineResourceInfo(device=torch.device("cpu"), kv_dtype=torch.bfloat16))
 
@@ -174,12 +206,13 @@ def test_audio_windows_match_hf(audio_pair):
     rows = [sub.prepare_inputs("prefill_audio", _fwd(), {"audio_features": [f]}) for f in feats]
     step = sub.declare_step("prefill_audio", ["a", "b", "c"], rows)
     window = sub.encoder.config
-    assert step.steps[AUDIO_ATTN].causal is False
+    assert set(step.state) == {AUDIO_TOKENS}
     assert [(s.request_id, s.span) for s in step.segments] == [
         (rid, w) for rid, r in zip("abc", rows, strict=True) for w in window.window_lengths(r.input_seq_len)
     ]
     ragged.plan(step)
-    with torch.no_grad():
+    ragged.calls = 0
+    with torch.no_grad(), _opened(sub, step, "abc"):
         out = sub.forward_batched("prefill_audio", _engine_inputs("abc"), **sub.preprocess("prefill_audio", None, rows))
         for rid, f in zip("abc", feats, strict=True):
             want = hf(f, feature_lens=torch.tensor([f.shape[1]])).last_hidden_state
@@ -219,9 +252,9 @@ def test_vision_frames_and_deepstack_match_hf(vision_pair, grid, replayed):
     assert row.input_seq_len == pixels.shape[0]
     step = sub.declare_step("prefill_vision", ["v"], [row])
     assert [s.span for s in step.segments] == [h * w for t, h, w in grid for _ in range(t)]
-    assert step.steps[VISION_ATTN].causal is False
+    assert set(step.state) == {VISION_TOKENS}
     ragged.plan(step)
-    with torch.no_grad():
+    with torch.no_grad(), _opened(sub, step, "v"):
         engine_inputs, runner = _engine_inputs("v"), RegionRunner(sub)
         engine_inputs.piecewise_runners = {VISION_BLOCK_LOOP: runner}
         if replayed:
@@ -251,8 +284,9 @@ def test_two_requests_in_one_vision_step_each_get_their_rows(vision_pair):
         sub.prepare_inputs("prefill_vision", _fwd(), {"pixel_values": [p], "image_grid_thw": [g]})
         for p, g in zip(pixels, grids, strict=True)
     ]
-    ragged.plan(sub.declare_step("prefill_vision", ["a", "b"], rows))
-    with torch.no_grad():
+    step = sub.declare_step("prefill_vision", ["a", "b"], rows)
+    ragged.plan(step)
+    with torch.no_grad(), _opened(sub, step, "ab"):
         packed = sub.preprocess("prefill_vision", None, rows)
         out = sub.forward_batched("prefill_vision", _engine_inputs("ab"), **packed)
         for rid, p, g in zip("ab", pixels, grids, strict=True):
@@ -275,7 +309,7 @@ def test_vision_capture_refuses_more_frames_than_a_replay_plans(vision_pair):
 
 
 def test_rotary_table_stays_fp32_through_a_cast():
-    tower = Qwen3OmniVisionTower(VisionEncoderConfig.from_dict(VISION), attn_key=VISION_ATTN)
+    tower = Qwen3OmniVisionTower(VisionEncoderConfig.from_dict(VISION), attn_key=VISION_ATTN, array=VISION_TOKENS)
     want = tower.rotary_pos_emb.inv_freq.clone()
     tower = tower.to(torch.bfloat16)
     assert tower.patch_embed.proj.weight.dtype == torch.bfloat16
@@ -286,5 +320,5 @@ def test_rotary_table_stays_fp32_through_a_cast():
 def test_tower_parameters_are_the_checkpoints():
     """Names line up with ``thinker.visual.*``, so the checkpoint loads by name."""
     hf = Qwen3OmniMoeVisionEncoder._from_config(Qwen3OmniMoeVisionEncoderConfig(**VISION), attn_implementation="sdpa")
-    tower = Qwen3OmniVisionTower(VisionEncoderConfig.from_dict(VISION), attn_key=VISION_ATTN)
+    tower = Qwen3OmniVisionTower(VisionEncoderConfig.from_dict(VISION), attn_key=VISION_ATTN, array=VISION_TOKENS)
     assert dict(tower.named_parameters()).keys() == dict(hf.named_parameters()).keys()

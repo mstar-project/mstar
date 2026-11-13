@@ -89,6 +89,17 @@ def _packed_runner(one_row):
     return runner
 
 
+def test_a_replay_applies_its_steps_host_writes_after_its_resources_commit():
+    runner = _packed_runner(True)
+    order = []
+    runner._step_runner = SimpleNamespace(commit=lambda step: order.append("resources"))
+    runner._declare = lambda *a, **k: SimpleNamespace(commit_calls=lambda: order.append("host fields"))
+    inputs = [SimpleNamespace(input_seq_len=100)]
+    _lease({"packed": runner}, inputs)
+    runner.run({}, request_ids=[7], seq_lens=[100])
+    assert order == ["resources", "host fields"]
+
+
 def test_a_one_row_per_step_region_leases_and_replays_the_whole_step_as_one_row():
     """A region that replays the whole step as one row (a packed encoder) is
     leased and replayed at batch size 1 for every token of the step, without

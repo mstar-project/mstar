@@ -141,9 +141,10 @@ class ResidentWrites:
     ride the graph's own scatter. ``streams`` is each resource's stream, by
     resource key."""
 
-    __slots__ = ("streams", "rows", "cells", "values", "kv_len")
+    __slots__ = ("streams", "rows", "cells", "values", "kv_len", "repeats")
 
-    def __init__(self, streams: Mapping[str, ResidentStream]):
+    def __init__(self, streams: Mapping[str, ResidentStream], repeats: int = 1):
+        self.repeats = repeats
         self.streams = streams
         self.rows: list[tuple[int, int, list[int]]] = []
         self.cells: list[int] = []
@@ -198,6 +199,8 @@ class ResidentPlan:
     moved: set[int]
     # each KV pool's (rows, pages after the step) of its crossings, for `resident_advance`
     crossed: dict[str, tuple[np.ndarray, np.ndarray]] = field(default_factory=dict)
+    # how many replays the step runs (`StepContext.repeats`)
+    repeats: int = 1
 
 
 @dataclass(slots=True)
@@ -261,6 +264,8 @@ class ResidentPlanner:
         self._streams: dict[BucketKey, dict[str, ResidentStream]] = {}
         # buckets whose steps need no host plan at all
         self.host_plan_free: set[BucketKey] = set()
+        # walk -> the step its captures declare, for the load-time repeat check
+        self.captured_steps: dict[str, SubmoduleStep] = {}
         # (bucket, pool) whose attention reads its pages off the tables: the
         # pool's KV plan hands it host lengths and no page indices
         self.lengths_only: set[tuple[BucketKey, str]] = set()
@@ -497,7 +502,10 @@ class ResidentPlanner:
             refreshed -= taken
             self._last_read[slots] = seq
             rows = [(rid, self._slot_of[rid]) for rid in taken]
-        plan = ResidentPlan(key, rids, slots, seq, self._commits, ResidentWrites(streams), taken, refreshed)
+        plan = ResidentPlan(
+            key, rids, slots, seq, self._commits, ResidentWrites(streams, ctx.repeats), taken, refreshed,
+            repeats=ctx.repeats,
+        )
         laps.lap("rows")
         try:
             for rid, slot in rows:
@@ -612,7 +620,10 @@ class ResidentPlanner:
                 )
         self._streams[bucket] = streams
         buffers = self.buffers(bucket, slot)
-        return CapturedResidentStep(bucket, slot, buffers.slots, buffers, self._store, streams)
+        self.captured_steps[bucket.graph_walk] = step
+        return CapturedResidentStep(
+            bucket, slot, buffers.slots, buffers, self._store, streams,
+        )
 
     def _declared_streams(self, bucket: BucketKey, step: SubmoduleStep) -> dict[str, ResidentStream]:
         """Each resource's stream on ``bucket``'s steps: the label of its own

@@ -42,6 +42,7 @@ from mstar.engine.resources.recurrent.pool import RecurrentStatePool
 from mstar.engine.resources.runner import StepRunner
 from mstar.engine.resources.sampler.config import SamplingReqConfig
 from mstar.engine.resources.sampler.resource import SamplerResource
+from mstar.engine.resources.sequence_shard import SequenceShard
 from mstar.engine.resources.step import FULL_ADMIT_NOT_READY, FULL_ADMIT_REBUILD, Segment, StepContext
 from mstar.model.base import LabelLayout, Span
 from mstar.testing_utils.engine import make_engine, make_mgmt
@@ -377,7 +378,7 @@ def _model(combined: dict | None = None) -> StubModel:
 
 
 def test_a_resource_supports_no_drop_unless_it_opts_in():
-    supported = (KVManager, RecurrentStatePool, SamplerResource, RopeManager, LoraAdapterPool)
+    supported = (KVManager, RecurrentStatePool, SamplerResource, RopeManager, LoraAdapterPool, SequenceShard)
 
     assert not Resource.supports_drop and not RingKVManager.supports_drop and not BoundedKVManager.supports_drop
     assert all(cls.supports_drop for cls in supported), "a resource that discards what a rebuild writes refused"

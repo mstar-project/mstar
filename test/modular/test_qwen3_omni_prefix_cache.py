@@ -16,6 +16,7 @@ from mstar.engine.resources.kv.manager import SpanCursor
 from mstar.engine.resources.kv.plan import KVPlanOutputs
 from mstar.engine.resources.position.config import PositionConfig
 from mstar.engine.resources.position.manager import RopeManager
+from mstar.engine.state.adapters import kv_layouts
 from mstar.model.qwen3_omni.components.rope import get_rope_index_vision
 from mstar.model.qwen3_omni.config import (
     TALKER_KV,
@@ -64,9 +65,9 @@ def thinker():
         vision=SimpleNamespace(spatial_merge_size=2, deepstack_visual_indexes=[1, 2]),
     )
     thinker = ThinkerSubmodule(thinker_model=_StubThinker(), config=config)
-    thinker.node_resources = {THINKER_POS: RopeManager(
+    thinker.kv = SimpleNamespace(_check_open=lambda call: None, label="main", positions=RopeManager(
         config=PositionConfig(kv_cache=THINKER_KV), device=torch.device("cpu"), dtype=torch.float32,
-    )}
+    ))
     return thinker
 
 
@@ -77,7 +78,7 @@ def _prepare(thinker, walk: str, inputs: dict, held: CachedPrefix | None = None,
         return prepared
     engine = make_engine(
         _runner=StepRunner(
-            {THINKER_KV: _Holding(held.tokens, held.position), THINKER_POS: thinker.node_resources[THINKER_POS]},
+            {THINKER_KV: _Holding(held.tokens, held.position), THINKER_POS: thinker.kv.positions},
             node_resources={NODE: [THINKER_KV, THINKER_POS]},
         ),
         _submodules={NODE: make_mgmt(submodule=thinker)},
@@ -91,7 +92,7 @@ def _prepare(thinker, walk: str, inputs: dict, held: CachedPrefix | None = None,
 
 
 def test_a_cut_text_walk_prepared_again_is_planned_where_the_cache_keyed_it(thinker):
-    rope = thinker.node_resources[THINKER_POS]
+    rope = thinker.kv.positions
     rope._counters[RID] = {"main": 10}
     text = {"text_inputs": [torch.arange(8, 14).repeat(2)]}
 
@@ -111,7 +112,7 @@ def test_a_cut_vision_walk_cuts_its_masks_and_deepstack_with_the_embeds(thinker)
         "vision_embeds": [torch.randn(6, HIDDEN)], "deepstack": [torch.randn(6, HIDDEN)] * 2,
         "image_grid_thw": [torch.tensor([1, 4, 6])],
     }
-    thinker.node_resources[THINKER_POS].ingest_request(RID)
+    thinker.kv.positions.ingest_request(RID)
     whole = _prepare(thinker, "prefill_vision", image)
 
     cut = thinker.split_inputs("prefill_vision", SimpleNamespace(rid_handle=RID), whole, 3, whole.input_seq_len)
@@ -124,7 +125,7 @@ def test_a_cut_vision_walk_cuts_its_masks_and_deepstack_with_the_embeds(thinker)
 
 
 def test_an_images_deepstack_lands_on_its_vision_rows_between_the_text_around_it(thinker):
-    thinker.node_resources[THINKER_POS]._counters[RID] = {"main": 10}
+    thinker.kv.positions._counters[RID] = {"main": 10}
     deepstack = [torch.arange(1, 7, dtype=torch.float)[:, None].expand(6, HIDDEN) * (i + 1) for i in range(2)]
     image = {
         "vision_embeds": [torch.randn(6, HIDDEN)], "deepstack": deepstack,
@@ -142,7 +143,7 @@ def test_an_images_deepstack_lands_on_its_vision_rows_between_the_text_around_it
 
 
 def test_a_cut_row_of_text_around_a_clip_is_the_tail_of_the_whole_row(thinker):
-    rope = thinker.node_resources[THINKER_POS]
+    rope = thinker.kv.positions
     rope._counters[RID] = {"main": 10}
     before, after = torch.arange(8, 12), torch.arange(12, 15)
     clip = {"audio_embeds": [torch.randn(28, HIDDEN)], "text_inputs": [before, after]}
@@ -160,7 +161,8 @@ def test_a_cut_row_of_text_around_a_clip_is_the_tail_of_the_whole_row(thinker):
     assert torch.equal(cut.tensor_inputs["text_token_ids"], torch.cat([before, after]))
 
     step = thinker.declare_step("prefill_audio", [RID], [cut])
-    rope.commit(step.steps[THINKER_POS], StepContext((RID,), "prefill_audio", slot=0, capture=False))
+    position = PositionStep(segments=step.segments, advance=step.state[THINKER_KV].advance)
+    rope.commit(position, StepContext((RID,), "prefill_audio", slot=0, capture=False))
     assert rope.position(RID, "main") == 10 + whole.tensor_inputs["mrope_pos_advance"], (
         "decode would start at another position than it does after the whole row"
     )
@@ -169,7 +171,7 @@ def test_a_cut_row_of_text_around_a_clip_is_the_tail_of_the_whole_row(thinker):
 def test_each_cut_row_of_a_mixed_step_moves_its_own_counter_past_its_whole_walk(thinker):
     # The cache holds 6 of 12 text tokens, 28 of a clip's 30 slots, and 3 of an image's 8 slots,
     # which advance the counter by 5. A partly held item leaves the counter at its start.
-    rope = thinker.node_resources[THINKER_POS]
+    rope = thinker.kv.positions
     rows = {
         "text": ("prefill_text", {"text_inputs": [torch.arange(8, 14).repeat(2)]}, 10, CachedPrefix("main", 6, 16)),
         "clip": ("prefill_audio", {"audio_embeds": [torch.zeros(28, HIDDEN)]}, 20, CachedPrefix("main", 28, 20)),
@@ -186,7 +188,8 @@ def test_each_cut_row_of_a_mixed_step_moves_its_own_counter_past_its_whole_walk(
         inputs.append(cut)
 
     step = thinker.declare_step(THINKER_MIXED, list(rows), inputs)
-    rope.commit(step.steps[THINKER_POS], StepContext(tuple(rows), THINKER_MIXED, slot=0, capture=False))
+    position = PositionStep(segments=step.segments, advance=step.state[THINKER_KV].advance)
+    rope.commit(position, StepContext(tuple(rows), THINKER_MIXED, slot=0, capture=False))
 
     assert [cut.input_seq_len for cut in inputs] == [6, 2, 5], "a row ran slots the cache already holds"
     assert [rope.position(rid, "main") for rid in rows] == [22, 50, 35], (
@@ -286,6 +289,11 @@ def model():
     return model
 
 
+def _converted(model, out) -> dict:
+    """The layouts a data worker builds from what ``process_prompt`` returned."""
+    return kv_layouts(model.declare_state(), out.metadata["state_layout"], out.metadata.get("keyed_spans", {}))
+
+
 def _prompt(model, modalities: list[str], tensors: dict | None, **kwargs):
     texts = ["Say what you see."] * modalities.count("text")
     return model.process_prompt(texts, modalities, ["text"], tensors=tensors, **kwargs)
@@ -304,7 +312,7 @@ _PROMPTS = {
 @pytest.mark.parametrize(("modalities", "tensors", "items"), _PROMPTS.values(), ids=_PROMPTS.keys())
 def test_the_layout_lists_each_walk_the_schedule_runs_with_the_slots_it_writes(model, modalities, tensors, items):
     out = _prompt(model, modalities, tensors)
-    layout = out.metadata["kv_layout"][THINKER_KV]["main"].spans
+    layout = out.metadata["state_layout"][THINKER_KV]["main"].spans
 
     ((walk, bind, lead),) = model._build_thinker_prefill_schedule(modalities)
     segments = out.new_input_tensors[bind["text_inputs"]]
@@ -404,7 +412,7 @@ def _row_slots(model, walk: str, bind: dict, lead: int, signals: dict) -> list[i
 @pytest.mark.parametrize(("modalities", "tensors", "kwargs", "steps"), _STEPS.values(), ids=_STEPS.keys())
 def test_the_layout_says_where_each_step_the_schedule_runs_ends(model, modalities, tensors, kwargs, steps):
     out = _prompt(model, modalities, tensors, **kwargs)
-    layout = out.metadata["kv_layout"][THINKER_KV]["main"]
+    layout = _converted(model, out)[THINKER_KV]["main"]
     schedule = model._build_thinker_prefill_schedule(modalities)
     cursor = SpanCursor(tuple(PrefixSpan(*row) for row in layout.row()[0]))
 
@@ -422,8 +430,8 @@ def test_the_layout_says_where_each_step_the_schedule_runs_ends(model, modalitie
 def test_a_step_writes_its_talker_rows_as_one_span(model):
     tensors = {"audio_inputs": [torch.zeros(16000)]}
     out = model.process_prompt(["Say it."], ["audio", "text"], ["audio"], tensors=tensors)
-    thinker = out.metadata["kv_layout"][THINKER_KV]["main"].spans
-    talker = out.metadata["kv_layout"][TALKER_KV]["main"].spans
+    thinker = out.metadata["state_layout"][THINKER_KV]["main"].spans
+    talker = out.metadata["state_layout"][TALKER_KV]["main"].spans
     assert {span.walk for span in thinker} == {"prefill_audio"}
     assert [span.walk for span in talker] == ["talker_prefill", "talker_last_prefill"], (
         "the Talker gets one item a Thinker step, so its layout has one span a step"
@@ -435,7 +443,7 @@ def test_a_prompt_with_a_video_keys_only_its_leading_text(model):
         model, ["text", "video", "text"], {"video_inputs": [torch.zeros(4, 3, 64, 96)]},
         input_metadata={"video_inputs": [{"video_sample_fps": 2.0}]},
     )
-    layout = out.metadata["kv_layout"][THINKER_KV]["main"]
+    layout = _converted(model, out)[THINKER_KV]["main"]
 
     assert [span.kind for span in layout.spans[:layout.keyed_count()]] == ["ids"], (
         "a prompt with a video keyed other than its leading text"
@@ -472,7 +480,7 @@ def test_a_request_with_no_audio_output_builds_no_talker_masks(thinker, walk):
             "image_grid_thw": [torch.tensor([1, 4, 6])], "text_inputs": [torch.arange(8, 12)],
         },
     }[walk]
-    thinker.node_resources[THINKER_POS]._counters[RID] = {"main": 0}
+    thinker.kv.positions._counters[RID] = {"main": 0}
     info = SimpleNamespace(rid_handle=RID, step_metadata={"text_before": 1, "audio_output": False})
 
     row = thinker.prepare_inputs(walk, info, inputs)

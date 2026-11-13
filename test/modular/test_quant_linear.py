@@ -475,11 +475,11 @@ class _Loop(DenoiseLoopSubmodule):
     def bucket_key_for(self, fwd_info):
         return int(fwd_info.step_metadata["h"])
 
-    def schedule_for(self, fwd_info, bucket_key):
-        n = int(fwd_info.step_metadata["steps"])
+    def schedule_for(self, walk, num_steps, bucket_key):
+        n = num_steps
         return SimpleNamespace(num_steps=n, sigmas=torch.linspace(1, 0, n + 1), timesteps=torch.linspace(1000, 0, n))
 
-    def seed_latents(self, fwd_info, bucket_key, generator):
+    def seed_latents(self, bucket_key, generator):
         return torch.zeros(bucket_key, 2)
 
     def request_inputs(self, fwd_info, inputs, bucket_key):
@@ -499,7 +499,7 @@ class _Loop(DenoiseLoopSubmodule):
 def _info(k, h=4, rid=0, metadata=True):
     return CurrentForwardPassInfo(
         request_id=f"r{rid}", graph_walk="gen", fwd_index=k, random_seed=0, max_tokens=0,
-        step_metadata={"h": h, "steps": 4} if metadata else {},
+        step_metadata={"h": h, "num_inference_steps": 4} if metadata else {},
         dynamic_loop_iter_counts={"denoise_loop": k}, rid_handle=rid,
     )
 
@@ -567,13 +567,19 @@ def _tiny_klein(monkeypatch, available: bool, **kwargs):
     monkeypatch.setattr(weight_loader, "build_transformer", build)
     reason = None if available else "no block-scaled GEMM here"
     monkeypatch.setattr(Mxfp8Format, "unavailable_reason", lambda self, device: reason)
-    model = Flux2KleinModel(attention_backend="sdpa", compile=False, accelerator_graph=False, **kwargs)
+    model = Flux2KleinModel(compile=False, accelerator_graph=False, **kwargs)
     model.set_config(Flux2KleinConfig(transformer=tiny))
     model._snapshot = Path("/nonexistent")
     copies = []
     real_deepcopy = __import__("copy").deepcopy
-    monkeypatch.setattr("mstar.model.flux2_klein.flux2_klein_model.copy.deepcopy",
-                        lambda module: copies.append(module) or real_deepcopy(module))
+
+    def spy(x, memo=None):
+        # a tensor attribute's own deepcopy comes through here too, with a memo
+        if memo is None:
+            copies.append(x)
+        return real_deepcopy(x, memo)
+
+    monkeypatch.setattr("mstar.model.flux2_klein.flux2_klein_model.copy.deepcopy", spy)
     return model._create_submodule("dit", torch.device("cpu")), copies
 
 

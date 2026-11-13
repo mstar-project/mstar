@@ -82,6 +82,15 @@ mstar serve
      - off
      - Serve Prometheus metrics at ``/metrics`` (see :ref:`serving-metrics`).
        Needs ``.[metrics]``.
+   * - ``--enable-nvtx``
+     - off
+     - Emit NVTX markers for CUDA profiling. Disabled on XPU and CPU.
+   * - ``--timeout``
+     - ``600``
+     - Per-request timeout (seconds).
+   * - ``--tcp-transfer-device``
+     - (auto)
+     - Network device for TCP tensor transport.
 
 Each model maps to a default config (override with ``--config``):
 
@@ -199,13 +208,13 @@ set.
 .. code-block:: bash
 
    export MSTAR_API_KEY="$(openssl rand -hex 32)"
-   mstar serve qwen3_omni            # or: mstar-serve --config ... [--rust-frontend]
+   mstar serve qwen3_omni            # or: mstar-serve --config ... [--python-frontend]
 
 With a key set, every HTTP route except ``/health`` and ``/metrics`` (see
 :ref:`serving-metrics`) answers ``401`` unless the request carries
 ``Authorization: Bearer <key>``, and WebSocket routes (``/v1/realtime``,
 ``/generate/ws``) refuse the handshake without it. The check is one middleware over the
-whole app (FastAPI and the Rust frontend alike), and the comparison takes the same time
+whole app (``mstar-server`` and the Python frontend alike), and the comparison takes the same time
 however much of the key matches. CORS preflights still get their answer, since browsers
 send them without credentials. ``--api-key`` overrides the environment variable, but
 prefer the variable: a command-line flag is visible to every local user in the process
@@ -280,7 +289,7 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
      - *(optional)* ``true`` runs the workers as clients of a CUDA MPS control daemon the
        conductor starts in a private directory, so workers that share a GPU overlap their
        kernels instead of time-slicing (the ASR ``*_split`` configs, and the speech ones:
-       ``chatterbox*_split``, ``omnivoice_split``, ``cosyvoice3_split``, ``qwen3tts_split``). NVIDIA only, and it
+       ``chatterbox*_split``, ``omnivoice_split``, ``cosyvoice3_split``, ``qwen3tts_split``, ``qwen3tts_base_split``). NVIDIA only, and it
        needs ``nvidia-cuda-mps-control`` on ``PATH``. The conductor stops the daemon on
        shutdown; on Linux the daemon also gets SIGTERM if the conductor is killed. Default
        ``false``.
@@ -324,8 +333,9 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        55-90% as binary PCM, and digital silence to 1-2%, but compressing every frame
        costs the event loop: about 8% of it at 32 live Nemotron VoiceChat calls on
        ``/generate/ws``, whose configs turn it off. Turn it off where the server's
-       event loop, not the network, is the bottleneck. The Rust frontend
-       (``--rust-frontend``) offers no deflate, whatever this says.
+       event loop, not the network, is the bottleneck. ``mstar-server``, the default
+       frontend, offers no deflate whatever this says, so this applies only under
+       ``--python-frontend``.
    * - ``ws_max_message_mb``
      - *(optional)* The largest WebSocket message the server reads, in MiB, on every
        WebSocket route; by default the HTTP body limit, ``MSTAR_MAX_BODY_MB``. A larger one
@@ -525,12 +535,17 @@ them by that name:
    resources:
      kv_cache:
        max_num_pages: 1024      # also: page_size, max_seq_len, cpu_offload_pages,
-                                # prefix_cache, prefix_cache_salt, prefix_cache_tp
+                                # prefix_cache, prefix_cache_salt, prefix_cache_tp,
+                                # context_parallel
      talker_attn:
        flashinfer_backend: fa2  # also: backend (flashinfer / dense), decode_tensor_cores, decode_fmha
      vit_attn:                  # a cacheless (ragged) attention resource
        max_segments_per_request: 2  # also: max_segments_per_step, max_tokens_per_request,
                                     # flashinfer_backend
+     seq_shard:                 # a node's sequence shard (SP ranks)
+       min_tokens: 2048         # steps below this run copied on every SP rank; also: exchange
+     linear_attn:               # a recurrent layer's resource (GDN, Mamba-2)
+       backend: flashinfer
      sampler:
        greedy_capture: false    # also: enable_logprobs, enable_processed_logprobs
 
@@ -539,6 +554,10 @@ its encoder context, can therefore size each one separately. If a block names a 
 that the model does not declare, or sets a key that the resource does not accept, loading
 fails. A misspelled setting is never silently ignored. A top-level ``kv_cache:`` block is
 no longer read. It raises an error with a message describing the migration.
+
+``backend: sdpa`` on the resource of a declared read within a step runs each read on it
+through torch's SDPA, as a DiT's reference pipeline does, and builds no resource, so its block
+takes no other key. A read whose queries come packed can't run on SDPA, and loading refuses it.
 
 ``greedy_capture: false`` on a sampler stops all-greedy steps from taking each row's
 argmax, and the engine from capturing a twin of each batched bucket for them. A sampler
@@ -557,6 +576,57 @@ ranks. Loading fails otherwise. A cache that keeps
 a sliding window (``AttentionConfig.sliding_window``) has no prefix cache yet: its
 ``prefix_cache`` goes off (logged at info), and a serving config that sets
 ``prefix_cache: true`` on it is refused.
+
+A node on ``sp_size`` above 1 shares each step over its SP ranks along two axes. A model that
+declares a sequence shard (a ``SeqShard``: Qwen3.5's LLM, Qwen3-Omni's Thinker and the DiTs of
+LTX-2.5, Wan2.2 and MiniMax-H3; a ``SeqShardSpec``: Cosmos3's DiT and MiniMax-H3's video
+decoder) splits a step's tokens over them; its ``min_tokens`` runs smaller steps copied on every
+rank instead (default 0: every step that can split does). A captured step decides from its
+bucket's size, not its prompt's. A node with a resource whose split steps run eagerly only (a
+ring, ``kv_gather``, a recurrent layer such as Qwen3.5's) never splits a captured step: the
+shard sets its own floor at load, for each walk it splits, one past that walk's largest captured
+bucket (from the node's capture configs, so the same on every rank). A step that fits a bucket
+runs copied in its graph, and a bigger one runs eagerly and splits; ``min_tokens`` only raises that
+floor, as a measured crossover does (Qwen3-Omni's Thinker, whose all_gather split replays in a graph).
+Separately, ``context_parallel: true`` stores a paged pool's K/V by position rather than by
+head: each request's positions split over the ranks that would otherwise hold the same KV
+heads, the TP ranks that share a KV head or the node's SP ranks, which is how a model whose
+attention takes no split steps runs on ``sp_size`` above 1. Raise ``max_num_pages`` by that
+factor to turn the freed memory into context. A node on SP ranks needs at least one of the two.
+
+The sequence shard's ``exchange`` picks how a split step reaches the node's paged attentions,
+from where their KV is stored. ``auto`` (the default; Qwen3-Omni's Thinker and Qwen3.5 default to ``none``) splits by Ulysses over KV stored by head,
+and over KV stored by position runs the node's steps copied (KV capacity alone). Over KV stored by
+position, ``all_gather`` splits them, and ``ring`` also bounds the attention phase's memory to
+this rank's tokens and runs eager only. ``ulysses`` (by head) states the default, and ``none``
+never splits. What every SP rank stores whole takes its own exchange wherever the node splits:
+a sliding-window attention over KV stored by position (whose window layers stay whole on each
+rank, so its decode needs no collective; CPU-tested only) gathers the
+step's keys (``kv_gather``); a recurrent layer's resource (``linear_attn``) takes ``ulysses`` where each TP rank's
+heads split ``sp_size`` ways, and ``state_passing`` where they don't (CPU-tested only, as
+Mamba-2's split is), picked from the model's head counts. A value the node's
+storage can't take fails at load, at any SP size, and so does ``ring`` over an attention backend
+other than ``flashinfer`` (when the engine builds it); ``ring`` beside a ``kv_gather`` attention or
+a recurrent layer fails at load on SP ranks:
+
+.. code-block:: yaml
+
+   resources:
+     kv_cache:
+       context_parallel: true   # store K/V by position over the SP ranks
+     seq_shard:
+       min_tokens: 8192
+       exchange: all_gather     # auto / none / ulysses (by head) / all_gather / ring (by position)
+
+Ragged (cacheless) attentions run Ulysses over the labels the shard lists, whatever ``exchange`` says;
+a shard that never splits (``none``, or ``auto`` over KV stored by position) stops them splitting too.
+
+A step's peak memory is its residents plus the larger of its attention and its MLP or MoE phase,
+so ring lowers it only where attention is the larger, which comes with more SP ranks (about four
+for Qwen3-Omni's Thinker, estimated from its geometry; the measured peaks are in
+:doc:`adding_models`). Chunked prefill stays off on SP ranks.
+**Sequence and context parallelism** in :doc:`adding_models` covers what each combination does,
+how to pick, and what is refused.
 
 A request waits at the head of its pool's queue until its reservation fits beside the
 reservations already admitted. A request behind it starts first when its own pages fit, output
@@ -761,7 +831,7 @@ before it spawns the workers, run every worker as its client so their kernels ov
 and quit the daemon at shutdown. The daemon uses a private pipe directory, so other
 processes on the GPU are unaffected. ``nvidia-cuda-mps-control`` (part of the NVIDIA
 driver) must be on ``PATH``. The ``*_split.yaml`` configs for Whisper, Qwen3-ASR, the three
-Chatterbox models, OmniVoice and CosyVoice3 set it, and so does ``qwen3tts_split.yaml`` (the 0.6B).
+Chatterbox models, OmniVoice and CosyVoice3 set it, and so do ``qwen3tts_split.yaml`` (the 0.6B) and ``qwen3tts_base_split.yaml``.
 
 **A light node beside a heavy one, on one worker.** ``side_stream: true`` on a node
 group runs that node's steps on a lane of their own instead of the worker's main chain:
@@ -814,8 +884,10 @@ details.
 **Sequence and guidance parallelism.** ``sp_size`` splits a node's token sequence over
 that many ranks (Ulysses: an all-to-all around attention), and ``cfg_size`` splits its
 classifier-free-guidance branches, each rank running its share of them and the noise
-predictions gathered every step. Each needs the model to declare the node SP- or
-CFG-enabled, and ``cfg_size`` must divide the node's guidance branches (two for Wan2.2).
+predictions gathered every step. ``sp_size`` needs the node to declare a sequence shard
+(``SeqShardSpec``) or place its KV positions over the SP ranks, ``cfg_size`` needs the model to
+declare the node CFG-enabled, and ``cfg_size`` must divide the node's guidance branches (two for
+Wan2.2).
 The axes compose: a group's ``ranks`` form lockstep instances of
 ``cfg_size * sp_size * tp_size`` ranks, laid out ``[cfg][sp][tp]`` (TP on adjacent ranks),
 each instance's ranks listed in ascending order, and the conductor routes each request to
@@ -1157,8 +1229,8 @@ Prometheus metrics at ``GET /metrics``. It needs the ``metrics`` extra
 hint. Off by default, and ``/metrics`` answers 404 then. Like ``/health``, it needs no
 API key even when one is set, the usual convention for scrape endpoints. It exposes
 request counts, latencies and the model name (never prompts or outputs); if that
-matters for a deployment, keep the port on an internal network. With
-``--rust-frontend``, ``mstar-server`` serves the same text: it asks the API server for
+matters for a deployment, keep the port on an internal network.
+``mstar-server`` serves the same text as the Python frontend: it asks the API server for
 it over the bridge, so both frontends show the same names, and it answers ``503`` if the
 bridge does not reply within two seconds, as ``/health`` does.
 
@@ -1194,8 +1266,8 @@ warmup requests. Every family has a ``model_name`` label (the config's ``model``
   ``MSTAR_MAX_CONCURRENT_REQUESTS`` cap turns a request away. ``route`` is the route's
   path as declared (``/v1/chat/completions``), ``unmatched`` when no route matches.
   A request that was submitted and then failed counts once, as an ``error`` in
-  ``mstar_requests_total``, never here. WebSocket handshakes are not counted. With
-  ``--rust-frontend``, ``mstar-server`` keeps these counts and sends them with each
+  ``mstar_requests_total``, never here. WebSocket handshakes are not counted.
+  ``mstar-server`` keeps these counts and sends them with each
   ``/metrics`` request, so the API server exports them under the same name.
 - ``mstar_request_queue_seconds{model_name, output_modalities}``: histogram over
   successful requests, from the conductor taking the request in to admitting it for

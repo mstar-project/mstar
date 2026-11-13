@@ -31,7 +31,7 @@ def test_newer_models_are_optional_entries_picked_by_their_own_tag():
     assert {x.name: x.serve for x in picked} == NEW
     assert all(x.optional for x in picked)
     in_all = {x.name for x in m.select("all")}
-    assert not in_all & set(NEW) and len(in_all) == 16
+    assert not in_all & set(NEW) and len(in_all) == 15
     # a shared tag does not pull them in; a name does
     assert not {x.name for x in m.select("tag:tts")} & set(NEW)
     assert [x.name for x in m.select("voxcpm2")] == ["voxcpm2"]

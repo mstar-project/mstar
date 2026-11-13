@@ -227,9 +227,14 @@ def test_a_request_with_images_that_samples_a_pad_id_never_leaves_an_older_one_w
 
     for _ in range(2):
         _kv_step(kv, R, PAGE_SIZE)
-    assert all(_kv_step(kv, A, PAGE_SIZE).ok for _ in range(4)), (
-        "A ran short beside an older request that can't move it, and each waits for the other"
-    )
+    for _ in range(4):
+        outcome = _kv_step(kv, A, PAGE_SIZE)
+        if not outcome.ok:
+            # R borrowed what A lends, and A takes it back
+            assert kv.preempt(A, outcome.reason.pages_short, [], [R], lambda rid: True).to_drop == [R]
+            kv.drop(R, kv._laid_out_tokens(R))
+            outcome = _kv_step(kv, A, PAGE_SIZE)
+        assert outcome.ok, "A ran short beside an older request that can't move it, and each waits for the other"
 
 
 @pytest.mark.parametrize("build", ["executing", "speculative"])
@@ -717,7 +722,7 @@ def test_a_follower_worker_takes_room_past_twice_the_rebuild_pool(monkeypatch):
     monkeypatch.setattr(worker_mod, "EngineManager", SimpleNamespace(
         build=lambda *a, **kw: SimpleNamespace(
             engine=engine, get_engine=lambda node: engine, side_keys=(),
-            inline_streams=InlineStreams(frozenset(), {}),
+            inline_streams=InlineStreams(frozenset(), {}, {}),
         )))
     # the worker runs with no model, so its rebuilds come from one that declares ``NODE``'s policy
     model, make = make_model(rebuild_policies=lambda: {NODE: POLICY}, get_graph_walk_graphs=_graphs), _make_rebuilds

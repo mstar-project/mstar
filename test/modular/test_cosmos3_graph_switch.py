@@ -26,7 +26,6 @@ class _FakeTransformer(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.proj_in = nn.Linear(1, 1, bias=False)
-        self.sp_group = SimpleNamespace(world_size=1)
         self.comm_group = SimpleNamespace(world_size=1)
         self.rotary_emb = Cosmos3RotaryEmbedding(config.head_dim, config.rope_theta, config.rope_axes_dim)
 

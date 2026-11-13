@@ -207,7 +207,7 @@ class CanaryModel(Model):
                 name="decoder",
                 input_names=["text_inputs"],
                 outputs=[
-                    GraphEdge(next_node=EMIT_TO_CLIENT, name="new_token", output_modality="text"),
+                    GraphEdge(next_node=EMIT_TO_CLIENT, name="text_inputs", output_modality="text"),
                     GraphEdge(next_node="decoder", name="text_inputs"),
                 ],
             ),
@@ -329,7 +329,7 @@ class CanaryModel(Model):
                 name_remapper=CanaryDecoderModel.remap,
             )
             check_loaded(decoder, loaded, "Canary decoder")
-            return CanaryDecoderSubmodule(decoder.eval(), self.config)
+            return CanaryDecoderSubmodule(decoder.eval(), self.config, max_context=self._max_encoder_frames())
         return None
 
 

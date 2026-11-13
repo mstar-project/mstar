@@ -116,6 +116,9 @@ def test_select_last_hidden_compiles_no_frame_per_prefill_bucket(manager_cls, pl
     bucket's token count and its row count takes one cache entry per pair.
     Three token counts by three row counts must fit in three entries per frame."""
     manager = manager_cls.__new__(manager_cls)
+    # and what __init__ sets that FlashInfer's qo_indptr_buf reads first: no split label's whole-step
+    # layout (`kv_gather`)
+    manager._step_qo = {}
     head = torch.nn.Linear(8, 4)
 
     def forward(hidden):

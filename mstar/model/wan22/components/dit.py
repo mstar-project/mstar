@@ -33,21 +33,21 @@ bidirectional video DiT with 3D RoPE would have to override all of it. The
 two-linear MLPs ARE the shared ``components.mlp.MLP``.
 """
 
-import functools
 import math
+from collections.abc import Mapping
+from typing import Any
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
-from mstar.distributed.communication import CommGroup
-from mstar.model.components.diffusion.attention import Attend, RaggedAttentionFn, joint_attention
+from mstar.engine.state import gather, scatter, split_range
+from mstar.model.components.diffusion.attention import attend
 from mstar.model.components.diffusion.ffn import gelu_tanh_ffn
 from mstar.model.components.diffusion.modulation import ada_layer_norm
 from mstar.model.components.diffusion.qk_norm_rope import rms_norm_rope
-from mstar.model.components.distributed.sequence_parallel import SeqParallel, sp_seq_split
 from mstar.model.components.mlp import MLP
-from mstar.model.wan22.config import Wan22Config
+from mstar.model.wan22.config import DIT_TOKENS, Wan22Config
 
 # 3D RoPE base frequency (reference WanRotaryPosEmbed default `theta`).
 ROPE_THETA = 10000.0
@@ -151,9 +151,12 @@ class Wan22DiTAttention(nn.Module):
     cross-attention reads k/v from the 512-token text stream and skips RoPE.
     All four projections carry bias (reference ``WanAttention``)."""
 
-    def __init__(self, dim: int, num_heads: int, eps: float):
+    def __init__(self, dim: int, num_heads: int, eps: float, array: str | None = None, layer: int | None = None):
         super().__init__()
         self.num_heads = num_heads
+        self.array = array
+        self.layer = None if layer is None else torch.tensor(layer, device="cpu")
+        self.state = None
         self.q_proj = nn.Linear(dim, dim, bias=True)
         self.k_proj = nn.Linear(dim, dim, bias=True)
         self.v_proj = nn.Linear(dim, dim, bias=True)
@@ -161,12 +164,15 @@ class Wan22DiTAttention(nn.Module):
         self.q_norm = nn.RMSNorm(dim, eps=eps, elementwise_affine=True)
         self.k_norm = nn.RMSNorm(dim, eps=eps, elementwise_affine=True)
 
+    def bind_state(self, handles: Mapping[str, Any]) -> None:
+        # the cross-attention declares no array and stays on SDPA, which is faster at the text's shape
+        self.state = handles.get(self.array)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         encoder_hidden_states: torch.Tensor | None = None,
         rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
-        attend: Attend = joint_attention,
     ) -> torch.Tensor:
         kv_source = hidden_states if encoder_hidden_states is None else encoder_hidden_states
         query = self.q_proj(hidden_states)
@@ -181,9 +187,8 @@ class Wan22DiTAttention(nn.Module):
             key = self.k_norm(key).unflatten(2, (self.num_heads, -1))
 
         # Bidirectional, no mask: SDPA (the reference's dispatch_attention_fn
-        # native path) by default; the DiT passes self-attention its ragged and
-        # Ulysses ``attend``.
-        out = attend(query, key, value)
+        # native path) with no array, one segment per guidance branch with one.
+        out = attend(self.state, self.layer, query, key, value)
         return self.o_proj(out.flatten(2, 3))
 
 
@@ -229,10 +234,10 @@ class Wan22DiTBlock(nn.Module):
     residual stays bf16. All three follow the reference exactly.
     """
 
-    def __init__(self, dim: int, ffn_dim: int, num_heads: int, eps: float):
+    def __init__(self, dim: int, ffn_dim: int, num_heads: int, eps: float, layer: int):
         super().__init__()
         self.norm1 = WanFP32LayerNorm(dim, eps, elementwise_affine=False)
-        self.self_attn = Wan22DiTAttention(dim, num_heads, eps)
+        self.self_attn = Wan22DiTAttention(dim, num_heads, eps, DIT_TOKENS, layer)
         self.cross_attn = Wan22DiTAttention(dim, num_heads, eps)
         self.norm2 = WanFP32LayerNorm(dim, eps, elementwise_affine=True)
         self.ffn = MLP(dim, ffn_dim, dim, activation="gelu_tanh", bias=True)
@@ -245,7 +250,6 @@ class Wan22DiTBlock(nn.Module):
         encoder_hidden_states: torch.Tensor,
         timestep_proj: torch.Tensor,
         rotary_emb: tuple[torch.Tensor, torch.Tensor],
-        self_attend: Attend = joint_attention,
     ) -> torch.Tensor:
         # [1, 1, 6, dim] + [B, G, 6, dim] -> six [B, G, dim] fp32 tensors, each
         # applied to one of G equal groups of tokens: a frame, or under SP a run
@@ -255,7 +259,7 @@ class Wan22DiTBlock(nn.Module):
         ).unbind(2)
 
         _, norm_hidden = ada_layer_norm(hidden_states, shift_msa, scale_msa, eps=self.norm1.eps)
-        attn_output = self.self_attn(norm_hidden, rotary_emb=rotary_emb, attend=self_attend)
+        attn_output = self.self_attn(norm_hidden, rotary_emb=rotary_emb)
         hidden_states, norm_hidden = ada_layer_norm(
             hidden_states, None, None, eps=self.norm2.eps, weight=self.norm2.weight, bias=self.norm2.bias,
             residual=attn_output, gate=gate_msa,
@@ -273,25 +277,33 @@ class Wan22DiTBlock(nn.Module):
         ).type_as(hidden_states).flatten(1, 2)
 
 
+@torch.compiler.disable
+def _token_runs(shard, timestep: torch.Tensor, per_frame: int) -> torch.Tensor:
+    """``timestep`` ``[B, frames]`` as this rank's share of its tokens takes it: whole frames
+    unless the shard splits the step's tokens. A rank's share need not be whole frames, so it
+    then modulates per run of tokens, the longest run that tiles a frame and every rank's share:
+    ``[B, count / run]``. Eager, so a compiled forward doesn't guard on the step's plan."""
+    r = split_range(shard)
+    if r is None:
+        return timestep
+    run = math.gcd(per_frame, *r.counts)
+    return timestep.repeat_interleave(per_frame // run, dim=1).narrow(1, r.start // run, r.count // run)
+
+
 class Wan22DiT(nn.Module):
     """The dense 5B TI2V video DiT: Conv3d patchify -> 30 blocks -> adaLN
     output head + unpatchify. Built on the meta device and materialized by
     ``weight_loader.build_wan22_dit`` (meta -> ``cast_serving_dtypes`` ->
     ``to_empty(device)`` -> checkpoint load).
 
-    ``sp_group`` runs it under Ulysses sequence parallelism: each rank keeps a
-    contiguous slice of the post-patchify tokens, self-attention all-to-alls
-    them around the kernel, and the slices are gathered before unpatchify."""
+    Under sequence parallelism the node's sequence shard (``forward``'s
+    ``shard``) splits each row's post-patchify tokens: this rank's blocks run
+    on its contiguous share, the self-attention's resource trades them for
+    heads around the kernel (Ulysses), and the shares are gathered before
+    unpatchify."""
 
-    def __init__(self, config: Wan22Config, sp_group: CommGroup | None = None):
+    def __init__(self, config: Wan22Config):
         super().__init__()
-        self.sp_group = sp_group or CommGroup.trivial()
-        if config.num_attention_heads % self.sp_group.world_size:
-            # Ulysses gives each rank an equal share of the heads
-            raise ValueError(
-                f"sp_size {self.sp_group.world_size} must divide the dit's "
-                f"{config.num_attention_heads} attention heads"
-            )
         if config.qk_norm != "rms_norm_across_heads" or not config.cross_attn_norm:
             # These two config facts are baked into Wan22DiTAttention /
             # Wan22DiTBlock (across-heads q/k RMSNorm, affine norm2 before
@@ -309,8 +321,8 @@ class Wan22DiT(nn.Module):
         )
         self.condition_embedder = Wan22TimeTextEmbedding(dim, config.freq_dim, config.text_dim)
         self.blocks = nn.ModuleList(
-            Wan22DiTBlock(dim, config.ffn_dim, config.num_attention_heads, config.eps)
-            for _ in range(config.num_layers)
+            Wan22DiTBlock(dim, config.ffn_dim, config.num_attention_heads, config.eps, i)
+            for i in range(config.num_layers)
         )
         self.norm_out = WanFP32LayerNorm(dim, config.eps, elementwise_affine=False)
         self.proj_out = nn.Linear(dim, config.out_channels * math.prod(config.patch_size))
@@ -340,14 +352,16 @@ class Wan22DiT(nn.Module):
         hidden_states: torch.Tensor,
         timestep: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
-        self_attn_fn: RaggedAttentionFn | None = None,
+        shard=None,
     ) -> torch.Tensor:
         """``hidden_states`` ``[B, C, F, H, W]`` (bf16 latents), ``timestep``
         ``[B, F // p_t]`` per post-patch frame (``expand_timesteps``: each
         token takes its frame's value), text embeds ``[B, 512, text_dim]``
-        bf16. Returns ``[B, C_out, F, H, W]`` bf16.
-        ``self_attn_fn`` runs the self-attention on the engine's ragged
-        resource; without it, and always for the cross-attention, SDPA."""
+        bf16. Returns ``[B, C_out, F, H, W]`` bf16. The self-attention reads the
+        array bound to it, and the cross-attention always runs SDPA.
+        ``shard``: the node's sequence shard's handle, which on a
+        step it splits cuts each row's tokens to this
+        rank's share; the self-attention's resource then exchanges them."""
         batch_size, _, num_frames, height, width = hidden_states.shape
         p_t, p_h, p_w = self.config.patch_size
         grid = (num_frames // p_t, height // p_h, width // p_w)
@@ -360,32 +374,27 @@ class Wan22DiT(nn.Module):
         hidden_states = self.patch_embedding(hidden_states)
         hidden_states = hidden_states.flatten(2).transpose(1, 2)
 
-        # every per-token tensor is cut to this rank's tokens (a no-op on one rank)
-        sizes = sp_seq_split(hidden_states.shape[1], self.sp_group.world_size)
-        sp = SeqParallel(self.sp_group, sizes)
-        if self.sp_group.world_size > 1:
-            # a rank's tokens need not be whole frames, so it modulates per run of
-            # tokens: the longest run that tiles a frame and every rank's share
-            per_frame = hidden_states.shape[1] // grid[0]
-            run = math.gcd(per_frame, *sizes)
-            runs = SeqParallel(self.sp_group, [n // run for n in sizes])
-            timestep = runs.scatter(timestep.repeat_interleave(per_frame // run, dim=1))
-        hidden_states = sp.scatter(hidden_states)
-        rotary_emb = tuple(sp.scatter(t, dim=0) for t in rotary_emb)  # [S, D] tables
-        self_attend = functools.partial(sp.attend, run=functools.partial(joint_attention, ragged=self_attn_fn))
+        # every per-token tensor is cut to this rank's tokens on a step the shard splits
+        # `can_split` is fixed at bind: at one SP rank a compiled forward traces straight through
+        if shard is not None and shard.needs_step:
+            timestep = _token_runs(shard, timestep, hidden_states.shape[1] // grid[0])
+            hidden_states = scatter(shard, hidden_states)
+            rotary_emb = scatter(shard, *rotary_emb, dim=0)  # [S, D] tables
 
         temb, timestep_proj, encoder_hidden_states = self.condition_embedder(
             timestep, encoder_hidden_states
         )
 
         for block in self.blocks:
-            hidden_states = block(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb, self_attend)
+            hidden_states = block(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb)
 
         # Output head: 2-chunk adaLN in fp32 ([1, 1, 2, dim] island table +
         # bf16 temb promotes, per group of tokens), then project and unpatchify.
         shift, scale = (self.scale_shift_table.unsqueeze(0) + temb.unsqueeze(2)).unbind(2)
         _, hidden_states = ada_layer_norm(hidden_states, shift, scale, eps=self.norm_out.eps)
-        hidden_states = sp.gather(self.proj_out(hidden_states))
+        hidden_states = self.proj_out(hidden_states)
+        if shard is not None:
+            hidden_states = gather(shard, hidden_states)
 
         hidden_states = hidden_states.reshape(batch_size, *grid, p_t, p_h, p_w, -1)
         hidden_states = hidden_states.permute(0, 7, 1, 4, 2, 5, 3, 6)

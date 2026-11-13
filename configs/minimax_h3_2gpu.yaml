@@ -6,9 +6,6 @@ max_seq_len: 8192
 # MiniMax-H3 on 2 GPUs, no sequence parallelism: the DiT alone on rank 0, the conditioner
 # and both decoders on rank 1. Slow at 768p (one GPU runs every step); for parity runs and
 # short clips at reduced resolution.
-model_kwargs:
-  attention_backend: flashinfer
-
 node_groups:
   - node_names: [dit]
     ranks: [0]

@@ -29,6 +29,7 @@ import torch
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
+from mstar.engine.state import gather, scatter
 from mstar.model.components import (
     MoeParallelConfig,
     MoeParallelMixin,
@@ -36,10 +37,11 @@ from mstar.model.components import (
     TopKRouter,
     instantiate_moe_block,
 )
+from mstar.model.components.decoder_layer import no_cursor
 from mstar.model.components.distributed import ParallelGatedMLP
 from mstar.model.loader.base import CheckpointRules, StackedParamRule
 from mstar.model.qwen3_omni.components.attention import Qwen3OmniAttention
-from mstar.model.qwen3_omni.config import THINKER_ATTN, THINKER_KV, THINKER_POS, Qwen3OmniModelConfig
+from mstar.model.qwen3_omni.config import THINKER_ATTN, THINKER_KV, THINKER_POS, THINKER_SHARD, Qwen3OmniModelConfig
 
 
 def thinker_remap(name: str) -> str | None:
@@ -121,6 +123,7 @@ class Qwen3OmniThinkerLayer(nn.Module):
             comm_group=comm_group,
             attn_key=THINKER_ATTN,
             kv_key=THINKER_KV,
+            layer=layer_idx,
             pos_key=THINKER_POS
         )
 
@@ -242,6 +245,12 @@ class Qwen3OmniThinkerModel(MoeParallelMixin, nn.Module):
         self.lm_head = nn.Linear(tc.hidden_size, tc.vocab_size, bias=False)
 
         self.init_moe_parallel(moe_parallel)
+        # the node's sequence shard, which brackets the layer stack (`bind_state`)
+        self.shard = None
+
+    def bind_state(self, handles) -> None:
+        """The node's sequence shard, where the model declares one. See ``NodeSubmodule.bind_node_state``."""
+        self.shard = handles.get(THINKER_SHARD)
 
     def checkpoint_rules(self) -> CheckpointRules:
         """How the full model's checkpoint (``thinker.*``) lands here, and where LoRA
@@ -265,7 +274,6 @@ class Qwen3OmniThinkerModel(MoeParallelMixin, nn.Module):
         cos_sin_3d: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         mrope_section: Optional[list[int]] = None,
         deepstack_visual_embeds: list[torch.Tensor] | None = None,
-        label: str = "main",
         num_valid_tokens: torch.Tensor | None = None,
         keep_states: bool = True,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
@@ -278,10 +286,6 @@ class Qwen3OmniThinkerModel(MoeParallelMixin, nn.Module):
                 e.g. [24, 20, 20].
             num_valid_tokens: ``(1,)`` real token count; rows past it are
                 CUDA-graph padding. Used only under ``mask_padding``.
-            label: the plan key every layer runs against. The stream's
-                stored length and position counter advance when the runner
-                commits the declared step (vision prefill declares its
-                MRoPE 3D-grid span there).
             keep_states: False skips the two states below, which only the
                 Talker reads.
 
@@ -297,15 +301,22 @@ class Qwen3OmniThinkerModel(MoeParallelMixin, nn.Module):
         hidden_states = input_embeds.clone()
         layer_0_embed = input_embeds if keep_states else None
         layer_n_hidden = None
+        # over the whole step: its padding rows are its last
         token_valid = self.moe_token_valid(hidden_states, num_valid_tokens)
+        shard = self.shard
+        if shard is not None:
+            # A step split over the SP ranks runs the stack on this rank's range of its
+            # tokens; attention exchanges what it needs. Identity on a copied step.
+            cos, sin = cos_sin_3d if cos_sin_3d is not None else (None, None)
+            hidden_states, cos, sin, token_valid, *deepstack = scatter(
+                shard, hidden_states, cos, sin, token_valid, *(deepstack_visual_embeds or ()),
+            )
+            cos_sin_3d = None if cos is None else (cos, sin)
+            deepstack_visual_embeds = deepstack or None
 
-        # The label and layer index are cursors on the shared resources: bind
-        # the label once, advance the index per layer. Passing them as
-        # arguments instead would make inductor specialize on the int.
-        self.model.layers[0].self_attn.attend.bind_step(label)
         residual = None
         for layer_idx, decoder_layer in enumerate(self.model.layers):
-            decoder_layer.self_attn.attend.set_layer_idx(layer_idx)
+            no_cursor(layer_idx, decoder_layer.self_attn)
             # a layer's output is ``residual + hidden_states``
             hidden_states, residual = decoder_layer(
                 hidden_states,
@@ -329,5 +340,8 @@ class Qwen3OmniThinkerModel(MoeParallelMixin, nn.Module):
 
         # Final layer norm
         hidden_states, _ = self.model.norm.forward_residual(hidden_states, residual)
+        if shard is not None:
+            # the head, sampling and the Talker's states read every token
+            hidden_states, layer_n_hidden = gather(shard, hidden_states, layer_n_hidden)
 
         return hidden_states, layer_0_embed, layer_n_hidden

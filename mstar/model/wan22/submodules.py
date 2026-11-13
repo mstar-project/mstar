@@ -1,4 +1,4 @@
-"""Wan2.2-TI2V-5B node submodules (nothing is cached; the dit declares a ragged attention resource).
+"""Wan2.2-TI2V-5B node submodules (nothing is cached; the dit declares the array its self-attention reads).
 
     text_encoder -> Wan22TextEncoderSubmodule (UMT5-XXL, thin HF wrapper)
     vae_encoder  -> Wan22VaeEncoderSubmodule  (Wan2.2-VAE encode, I2V only)
@@ -28,15 +28,14 @@ from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.distributed.communication import CommGroup
+from mstar.distributed.communication import CommGroup, my_rows
 from mstar.model.components.diffusion.decode_utils import latent_affine, wan_vae_decode_dtype
 from mstar.model.components.diffusion.denoise_loop import UniPCDenoiseLoopSubmodule
 from mstar.model.components.diffusion.flow_match import FlowMatchSchedule
 from mstar.model.components.diffusion.image_io import truncate_to_uint8
 from mstar.model.components.diffusion.unipc import make_unipc_tables
-from mstar.model.components.distributed.sequence_parallel import my_rows
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
-from mstar.model.wan22.config import Wan22Config
+from mstar.model.wan22.config import DIT_SHARD, DIT_TOKENS, Wan22Config
 
 logger = logging.getLogger(__name__)
 
@@ -314,16 +313,11 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
     # circular import.
     _I2V_WALK = "video_gen_i2v"
 
-    # The ragged self-attention resource (Wan22Model.get_node_resources).
-    SELF_ATTN = "dit_self_attn"
     # the [cond, uncond] stack a guided step forwards (the CFG axis splits it)
     CFG_BRANCHES = 2
 
     def __init__(self, transformer: nn.Module, config: Wan22Config, cfg_group=None):
-        super().__init__(
-            loop_name=DENOISE_LOOP_NAME, max_batch_size=config.dit_max_batch_size,
-            attn_resource_key=self.SELF_ATTN if config.attention_backend == "flashinfer" else None,
-        )
+        super().__init__(loop_name=DENOISE_LOOP_NAME, max_batch_size=config.dit_max_batch_size)
         self.transformer = transformer
         self.config = config
         # CFG parallelism (cfg_size: 2; not passed on one GPU, so trivial here):
@@ -334,6 +328,8 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
         # both ranks compute the whole step, correct but no faster.
         self.cfg_group = cfg_group or CommGroup.trivial()
         self._record_fp32_islands()
+        # the node's sequence shard, which brackets the DiT (`bind_state`)
+        self.shard = None
         # The WHOLE forward cannot be one compiled region: Inductor would fuse the
         # UniPC step's `sample - sigma * output` and pass the 0-dim CPU-resident sigma
         # as a device pointer, which fails on the first call. Moving sigma to CUDA
@@ -363,6 +359,10 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
                 sorted(self._compile_grids),
             )
 
+    def bind_state(self, handles) -> None:
+        """The node's sequence shard. See ``NodeSubmodule.bind_node_state``."""
+        self.shard = handles.get(DIT_SHARD)
+
     def bucket_key_for(self, fwd_info: CurrentForwardPassInfo) -> WanStepKey:
         meta = fwd_info.step_metadata
         return WanStepKey(
@@ -370,10 +370,8 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
             i2v=fwd_info.graph_walk == self._I2V_WALK,
         )
 
-    def schedule_for(self, fwd_info: CurrentForwardPassInfo, bucket_key: WanStepKey) -> FlowMatchSchedule:
-        sigmas, timesteps = make_unipc_tables(
-            int(fwd_info.step_metadata["num_inference_steps"]), self.config.flow_shift,
-        )
+    def schedule_for(self, walk: str, num_steps: int, bucket_key: WanStepKey) -> FlowMatchSchedule:
+        sigmas, timesteps = make_unipc_tables(int(num_steps), self.config.flow_shift)
         return FlowMatchSchedule(sigmas=sigmas, timesteps=timesteps, mu=None)
 
     def _branch_rows(self, guidance_scale: float) -> slice:
@@ -387,11 +385,9 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
     def attention_segments(self, bucket_key: WanStepKey):
         # one segment per guidance branch this rank computes, all the same span
         rows = self._branch_rows(bucket_key.guidance)
-        return ((self.MAIN_SPAN, self.num_tokens(bucket_key)),) * (rows.stop - rows.start)
+        return {DIT_TOKENS: ((self.MAIN_SPAN, self.num_tokens(bucket_key)),) * (rows.stop - rows.start)}
 
-    def seed_latents(
-        self, fwd_info: CurrentForwardPassInfo, bucket_key: WanStepKey, generator: torch.Generator,
-    ) -> torch.Tensor:
+    def seed_latents(self, bucket_key: WanStepKey, generator: torch.Generator) -> torch.Tensor:
         shape = (1, self.config.in_channels, bucket_key.frames, bucket_key.height, bucket_key.width)
         # randn_tensor parity: CPU generator, CPU randn, then move.
         return torch.randn(shape, generator=generator, dtype=torch.float32)
@@ -429,8 +425,7 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
                 infos = (engine_inputs.per_request_info[rid] for rid in engine_inputs.request_ids)
                 out[self.LATENTS] = torch.stack([
                     (1 - mask) * image_latent + mask * sample
-                    if self.step_index(info) + 1 >= self.request_state(info.rid_handle)["schedule"].num_steps
-                    else sample
+                    if self.step_index(info) + 1 >= self.schedule_of(info, bucket_key).num_steps else sample
                     for info, image_latent, sample in zip(infos, kwargs["image_latent"], out[self.LATENTS], strict=True)
                 ])
         return out
@@ -507,7 +502,7 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
             hidden_states=hidden_states,
             timestep=timestep,
             encoder_hidden_states=encoder_hidden_states.to(self.transformer.dtype),
-            self_attn_fn=self._ragged(),
+            shard=self.shard,
         )
         if not do_cfg:
             return out

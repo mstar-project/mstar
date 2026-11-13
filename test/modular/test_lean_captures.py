@@ -223,7 +223,7 @@ def _capture_runner(resources, steps=None, blocked=()):
     return AcceleratorGraphRunner(
         submodule_name="N", submodule=submodule, resources=resources, step_runner=Mock(),
         device=torch.device("cpu"), autocast_dtype=None, joint_comm_group=SimpleNamespace(world_size=1),
-        num_slots=2,
+        num_slots=2, head_shards=1,
     )
 
 

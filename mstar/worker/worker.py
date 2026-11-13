@@ -346,6 +346,7 @@ class Worker:
         layout = replace(
             layout, side_keys=frozenset(self.engine_manager.side_keys),
             tensor_streams=self.engine_manager.inline_streams.tensor_streams,
+            inline_carried=self.engine_manager.inline_streams.carried,
         )
         self.layout = layout
         self._rebuilds = _make_rebuilds(

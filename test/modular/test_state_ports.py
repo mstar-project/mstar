@@ -47,6 +47,7 @@ from mstar.engine.resources.recurrent.config import (
     RecurrentStep,
 )
 from mstar.engine.resources.sampler.config import SamplerSpec, SamplerStep, SamplingReqConfig
+from mstar.engine.resources.sequence_shard import SeqShardSpec
 from mstar.engine.resources.spec import CombinedSplit, apply_yaml_overrides
 from mstar.engine.resources.step import ResourceStep, Segment, StepContext, SubmoduleStep
 from mstar.engine.state import Array, ArrayStep, Layout, Span
@@ -54,6 +55,8 @@ from mstar.engine.state.adapters import (
     PAGED,
     VALUE,
     WITHIN_STEP,
+    StateSetup,
+    _resolve,
     build_handle,
     kv_layouts,
     node_handles,
@@ -75,8 +78,8 @@ from mstar.model.command_a_plus.command_a_plus_model import CommandAPlusModel
 from mstar.model.command_a_plus.submodules import CommandAPlusLLMSubmodule
 from mstar.model.components.block_loop_encoder import VISION_BLOCK_LOOP
 from mstar.model.components.request_kwargs import sampler_capabilities
-from mstar.model.keys import MIXED, ROPE
-from mstar.model.multimodal import vision_encoder
+from mstar.model.keys import MIXED, PREFILL_TEXT, ROPE
+from mstar.model.multimodal import media_walk_names, vision_encoder
 from mstar.model.multimodal_decoder import MultimodalDecoderModel
 from mstar.model.qwen3_5.components.language_model import Qwen3_5ForCausalLM, Qwen3_5LanguageModel
 from mstar.model.qwen3_5.config import (
@@ -87,6 +90,7 @@ from mstar.model.qwen3_5.config import (
     KV_CACHE,
     LINEAR_ATTENTION,
     LINEAR_ATTN,
+    LLM_SHARD,
     SAMPLER,
     VISION_ATTN,
     VISION_TOKENS,
@@ -145,7 +149,7 @@ def _qwen3_5_state_dtype(config) -> torch.dtype:
 
 # Less the opt-in LoRA spec, which `enabled_resources` builds only when a deployment names it. It holds callables, so
 # a second build wouldn't equal it.
-def _qwen3_5_reference(config) -> list:
+def _qwen3_5_reference(config, encoders=()) -> list:
     return [
         KVSpec(
             resource_key=KV_CACHE, nodes={"LLM"},
@@ -185,6 +189,10 @@ def _qwen3_5_reference(config) -> list:
         SamplerSpec(
             resource_key=SAMPLER, nodes={"LLM"}, vocab_size=config.vocab_size, enable_repetition_penalty=True,
         ),
+        SeqShardSpec(
+            LLM_SHARD, {"LLM"}, labels=("main",), axis=0, walks=(PREFILL_TEXT, *media_walk_names(encoders), MIXED),
+            exchange="none",
+        ),
     ]
 
 
@@ -196,6 +204,9 @@ class _StubResource:
 
     def block(self, name, i):
         return torch.empty(0)
+
+    def run(self, q, k=None, v=None, label=None):
+        return q
 
 
 def _bind(node, model, node_name="LLM"):
@@ -251,7 +262,7 @@ def test_the_published_configs_are_found():
 @pytest.mark.parametrize("size", QWEN3_5)
 def test_qwen3_5_specs_equal_the_hand_written_ones(size):
     model = _qwen3_5(**QWEN3_5[size])
-    _assert_equal_per_key(enabled_resources(model, {}), _qwen3_5_reference(model.config))
+    _assert_equal_per_key(enabled_resources(model, {}, StateSetup()), _qwen3_5_reference(model.config))
 
 
 # The `resources:` blocks of configs/qwen3_5_9b.yaml, with its commented-out state_dtype on.
@@ -291,7 +302,7 @@ def test_qwen3_5_stored_dtype_equals_the_hand_written_rule(ssm_dtype, head_k_dim
         **QWEN3_5["9B"], "mamba_ssm_dtype": ssm_dtype, "linear_key_head_dim": head_k_dim,
         "linear_value_head_dim": head_v_dim,
     })
-    _assert_equal_per_key(enabled_resources(model, {}), _qwen3_5_reference(model.config))
+    _assert_equal_per_key(enabled_resources(model, {}, StateSetup()), _qwen3_5_reference(model.config))
 
 
 def test_qwen3_5_conv_follows_the_engine_dtype_and_its_state_does_not():
@@ -311,7 +322,7 @@ _ALL_FULL_SHAPES = pytest.mark.parametrize(
 @_ALL_FULL_SHAPES
 def test_qwen3_5_all_full_specs_equal_the_hand_written_ones(overrides):
     model = _qwen3_5(**{**_ALL_FULL, **overrides})
-    specs = enabled_resources(model, {})
+    specs = enabled_resources(model, {}, StateSetup())
     _assert_equal_per_key(specs, _qwen3_5_reference(model.config))
     assert {spec.resource_key: spec for spec in specs}[GDN_STATE].config.num_layers == 0, "not the all-full shape"
 
@@ -361,7 +372,7 @@ def _qwen3_5_vision_reference(model) -> RaggedAttentionSpec:
     vision, processor = model.vision_config, model.image_processor
     min_patches = processor.size["shortest_edge"] // processor.patch_size ** 2
     return RaggedAttentionSpec(
-        resource_key=VISION_ATTN, nodes={"vision_encoder"},
+        resource_key=VISION_ATTN, nodes={"vision_encoder"}, labels={"main"},
         config=RaggedAttentionConfig(
             num_qo_heads=vision.num_heads,
             num_kv_heads=vision.num_heads,
@@ -373,15 +384,15 @@ def _qwen3_5_vision_reference(model) -> RaggedAttentionSpec:
 
 def test_qwen3_5_vision_spec_equals_the_hand_written_one(monkeypatch):
     model = _qwen3_5_vision(monkeypatch)
-    reference = [*_qwen3_5_reference(model.config), _qwen3_5_vision_reference(model)]
-    _assert_equal_per_key(enabled_resources(model, {}), reference)
+    reference = [*_qwen3_5_reference(model.config, model.encoders), _qwen3_5_vision_reference(model)]
+    _assert_equal_per_key(enabled_resources(model, {}, StateSetup()), reference)
     assert state_declaration_problems(model) == []
 
 
 def test_a_yaml_override_of_the_vision_ceiling_still_holds(monkeypatch):
     model = _qwen3_5_vision(monkeypatch)
     overrides = {"resources": {VISION_ATTN: {"max_segments_per_step": 3}}}
-    reference = [*_qwen3_5_reference(model.config), _qwen3_5_vision_reference(model)]
+    reference = [*_qwen3_5_reference(model.config, model.encoders), _qwen3_5_vision_reference(model)]
     apply_yaml_overrides(reference, overrides)
     specs = serving_resources(model, overrides)
     _assert_equal_per_key(specs, reference)
@@ -684,8 +695,9 @@ def _qwen3_5_stack(blocks: int = 2):
     stack.config, stack.vision_config = config, None
     declared = {d.name: d for d in stack.declare_state()}
     kv_array, gdn_array = declared[KV_CACHE], declared[GDN_STATE]
-    kv = build_handle(kv_array, {KV_CACHE: _QwenKV(kv_array), ATTN: _QwenAttn(), ROPE: None})
-    gdn = build_handle(gdn_array, {GDN_STATE: _QwenPool(gdn_array), CONV: None, LINEAR_ATTN: _QwenLinear()})
+    resolved = _resolve([kv_array, gdn_array], StateSetup())
+    kv = build_handle(kv_array, {KV_CACHE: _QwenKV(kv_array), ATTN: _QwenAttn(), ROPE: None}, resolved)
+    gdn = build_handle(gdn_array, {GDN_STATE: _QwenPool(gdn_array), LINEAR_ATTN: _QwenLinear()}, resolved)
     for module in model.modules():
         if hasattr(module, "bind_state"):
             module.bind_state({KV_CACHE: kv, GDN_STATE: gdn})

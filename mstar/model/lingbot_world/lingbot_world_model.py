@@ -369,7 +369,7 @@ class LingBotWorldModel(Model):
 
     def get_submodule(
         self, node_name: str, device: str = "cpu", tp_group=None,
-        autocast_dtype: torch.dtype | None = None, sp_group=None,
+        autocast_dtype: torch.dtype | None = None,
     ) -> torch.nn.Module | None:
         if node_name not in self._submodule_cache:
             self._submodule_cache[node_name] = self._create_submodule(node_name, device)

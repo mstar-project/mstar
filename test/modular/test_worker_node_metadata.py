@@ -75,7 +75,7 @@ def _init_worker(monkeypatch, runtime: RustGraphRuntime, parallel: set[str]) -> 
     monkeypatch.setattr(worker_mod, "EngineManager", SimpleNamespace(
         build=lambda *a, **kw: SimpleNamespace(
             engine=engine, get_engine=lambda node: engine, side_keys=(),
-            inline_streams=InlineStreams(frozenset(), {}),
+            inline_streams=InlineStreams(frozenset(), {}, {}),
         )))
     groups = SimpleNamespace(
         init_dist=lambda **kw: None,
