@@ -151,9 +151,10 @@ class StreamPosition(NamedTuple):
 class BoundedKVStep(ResourceStep):
     """Each segment's ``span`` is what its request writes this step (0 reads only).
 
-    ``positions`` holds each request's count committed before the step, read when
-    the step is built. Fixed in the step, it makes planning the step twice (a
-    piecewise region inside a forward that declared it too) harmless.
+    ``positions`` holds each request's stream position before the step, and its
+    ``written`` must equal the count committed for the request. Fixed in the step,
+    it makes planning the step twice (a piecewise region inside a forward that
+    declared it too) harmless.
     """
 
     positions: Mapping[str, StreamPosition] = field(default_factory=dict)
