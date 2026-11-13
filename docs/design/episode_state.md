@@ -35,7 +35,7 @@ M* has content-keyed caches across requests (the prefix cache, Chatterbox's voic
 - **The only cross-request reuse is content-keyed.** The prefix cache keeps a finished request's KV pages under a hash of what they depend on (`Model.kv_labels`, `base.py` lines 885-895, and `.claude/skills/prefix-caching/SKILL.md`), and Chatterbox keeps an LRU of voice conditioning by the clip's hash ([chatterbox/submodules.py](../../mstar/model/chatterbox/submodules.py) lines 88-108). The replica router places each request on its own (`ReplicaRouter.pick`, [routing.py](../../mstar/conductor/routing.py) line 177). Nothing is keyed by a client.
 - **The one long-lived call is a request with open client input** (client streams, [topology.py](../../mstar/streaming/topology.py) lines 30-35; the realtime conversation, [realtime/conversation.rs](../../rust/server/src/realtime/conversation.rs) lines 6-8). At capacity the conductor refuses such a call rather than queueing it (`conductor.py` lines 1291-1298).
 
-So for #1460 as written: `walk_plan` never finds `text_embeds`, `encode_text` runs on every call, and `chunk_latents` is unpersisted when the call ends.
+So for #1460 as written: `walk_plan` never finds `text_embeds` from a prior call, and `encode_text` runs on every call. Predicted video latents end at the denoise loop; they do not become context for a later call.
 
 ---
 
@@ -307,7 +307,7 @@ Rejected:
 - `walk_plan` runs `encode_text` only when `episode.held["text_embeds"] == 0` (a new episode, a restart, an eviction or a new prompt), then the chunk walk. On a cold call the text embeddings reach the backbone as today, persisted within the request, and its first step adds them to `text_embeds`. On a warm call the walk's `text_embeds` input is an empty edge (`request_info.py` lines 105-106), and every step reads the array.
 - The VAE encoder appends the newly executed rows of the observation's frame stack to `executed` (the whole chunk on the chunk grid, `executed_rows` in real time) and reads the window, which it encodes into the clean context as the reference does each call.
 - The seed of call k is the episode's seed plus `episode_calls`, the reference's `base + k`.
-- **A correction to #1460.** Its docstring says the predicted video conditions the next call, and it persists `chunk_latents`. The reference conditions on the executed real frames and refuses its own predictions as context (`policy.py` lines 271-276; `robot_io.py` lines 298-317). The array to retain is the executed frame window, not the predicted latents.
+- **Executed frames, not predicted video.** #1460 now leaves predicted video latents inside the denoise loop. The reference conditions on executed real frames and refuses its own predictions as context (`policy.py` lines 271-276; `robot_io.py` lines 298-317). The proposed episode array retains the executed frame window.
 
 Until this lands, Praxis-1 (once its preprocessing and submodules are in) can serve every call cold, which is correct and is the reference's stateless mode, and moves to episodes by changing its declarations and `walk_plan`.
 
