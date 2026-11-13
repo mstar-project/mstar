@@ -745,16 +745,22 @@ def _fused_sample_kernel(
 # Vocabularies up to this size draw in one ``_fused_sample_kernel`` launch, one
 # program per row holding the whole row; larger ones through FlashInfer.
 FUSED_SAMPLE_MAX_VOCAB = 4096
+# The widest row `draw_row` draws as `sample` does, and the warps `fused_sample`
+# launches up to it, which `draw_row`'s layout takes too.
+FUSED_DRAW_MAX_VOCAB = 2048
+FUSED_DRAW_WARPS = 4
 
 
 class FusedDrawArgs(NamedTuple):
-    """A step's per-row ``fused_sample`` parameters, for a kernel that draws as it does."""
+    """Not frozen yet, like the rest of the fused draw. Each row's sampling parameters, for a kernel in the forward
+    that draws its own tokens. Row r's i-th draw is ``draw_row(..., seed[r], offset[r] + i, ...)``, which consumes one
+    draw from the row's random stream, exactly as one `sample` call does."""
 
-    temperature: torch.Tensor
-    top_k: torch.Tensor
-    top_p: torch.Tensor
-    seed: torch.Tensor
-    offset: torch.Tensor
+    temperature: torch.Tensor    # [rows] float32
+    top_k: torch.Tensor          # [rows] int32, 0 is off
+    top_p: torch.Tensor          # [rows] float32
+    seed: torch.Tensor           # [rows] int64
+    offset: torch.Tensor         # [rows] int64, this kernel's first draw
 
 
 def fused_sample(
@@ -775,7 +781,8 @@ def fused_sample(
         rep_penalty if penalty else temperature, seen_tokens if penalty else logits, out,
         V, logits.stride(0), logits.stride(1),
         seen_tokens.stride(0) if penalty else 0, seen_tokens.stride(1) if penalty else 0,
-        APPLY_PENALTY=penalty, BLOCK=triton.next_power_of_2(V), num_warps=4 if V <= 2048 else 8,
+        APPLY_PENALTY=penalty, BLOCK=triton.next_power_of_2(V),
+        num_warps=FUSED_DRAW_WARPS if V <= FUSED_DRAW_MAX_VOCAB else 8,
     )
     return out
 

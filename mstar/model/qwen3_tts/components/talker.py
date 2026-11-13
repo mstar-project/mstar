@@ -23,16 +23,10 @@ from torch import nn
 
 from mstar.distributed.communication import CommGroup
 from mstar.model.components import RMSNorm
-from mstar.model.components.decoder_layer import DecoderLayer, run_layers
+from mstar.model.components.decoder_layer import DecoderLayer, no_cursor, run_layers
 from mstar.model.components.distributed import ParallelGatedMLP
 from mstar.model.components.qwen3_lm import Qwen3Attention
-from mstar.model.qwen3_tts.config import (
-    TALKER_ATTN,
-    TALKER_KV,
-    TALKER_POS,
-    Qwen3TTSModelConfig,
-    Qwen3TTSTalkerConfig,
-)
+from mstar.model.qwen3_tts.config import TALKER_KV, Qwen3TTSModelConfig, Qwen3TTSTalkerConfig
 
 # ---------------------------------------------------------------------------
 # Talker backbone: autoregression across audio frames
@@ -57,6 +51,7 @@ class Qwen3TTSTalkerLayer(DecoderLayer):
     def __init__(
         self,
         config: Qwen3TTSTalkerConfig,
+        layer: int,
         comm_group: CommGroup | None = None,
     ) -> None:
         super().__init__(
@@ -65,13 +60,11 @@ class Qwen3TTSTalkerLayer(DecoderLayer):
                 num_heads=config.num_attention_heads,
                 num_kv_heads=config.num_key_value_heads,
                 head_dim=config.head_dim,
-                rope_theta=config.rope_theta,
                 qk_norm=True,
                 rms_norm_eps=config.rms_norm_eps,
                 comm_group=comm_group,
-                attn_key=TALKER_ATTN,
                 kv_key=TALKER_KV,
-                pos_key=TALKER_POS,
+                layer=layer,
             ),
             mlp=ParallelGatedMLP(
                 hidden_size=config.hidden_size,
@@ -94,8 +87,8 @@ class Qwen3TTSTalkerLanguageModel(nn.Module):
     ) -> None:
         super().__init__()
         self.layers = nn.ModuleList([
-            Qwen3TTSTalkerLayer(config, comm_group=comm_group)
-            for _ in range(config.num_hidden_layers)
+            Qwen3TTSTalkerLayer(config, layer, comm_group=comm_group)
+            for layer in range(config.num_hidden_layers)
         ])
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.codec_embedding = nn.Embedding(config.vocab_size, config.hidden_size)
@@ -103,19 +96,8 @@ class Qwen3TTSTalkerLanguageModel(nn.Module):
             config.text_vocab_size, config.text_hidden_size
         )
 
-    def forward(
-        self,
-        input_embeds: torch.Tensor,
-        *,
-        label: str,
-    ) -> torch.Tensor:
-        # Which of the node's KV streams the layers write (`label`) and which
-        # layer of it are cursors on the shared resources: bind the label once,
-        # advance the index per layer. Passing them as arguments instead would
-        # make inductor specialize on the int. The resources own the pages, so
-        # module code stays clear of the allocator.
-        self.layers[0].self_attn.attend.bind_step(label)
-        return run_layers(self.layers, input_embeds, self.norm)
+    def forward(self, input_embeds: torch.Tensor) -> torch.Tensor:
+        return run_layers(self.layers, input_embeds, self.norm, no_cursor)
 
 
 def _not_code_predictor(name: str) -> str | None:
@@ -152,10 +134,5 @@ class Qwen3TTSTalkerModel(nn.Module):
             stacked_params=tuple(LLAMA_STACKED_PARAMS), remap=_not_code_predictor, prefix="talker.",
         )
 
-    def forward(
-        self,
-        input_embeds: torch.Tensor,
-        *,
-        label: str,
-    ) -> torch.Tensor:
-        return self.model(input_embeds, label=label)
+    def forward(self, input_embeds: torch.Tensor) -> torch.Tensor:
+        return self.model(input_embeds)

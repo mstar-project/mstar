@@ -58,7 +58,7 @@ def test_qwen3_tts_reports_only_keys_the_data_worker_strips():
     model = _qwen3_tts("base")
     clip = {"tensors": {"audio_inputs": [torch.zeros(24000 + 1)]}, "ref_text": "the reference says"}
     result = model.process_prompt("hello", ["audio", "text"], ["audio"], **clip)
-    assert set(result.metadata) - {"kv_layout", "stream_lead_items"} <= set(model.INTERNAL_KWARGS)
+    assert set(result.metadata) - {"state_layout", "stream_lead_items"} <= set(model.INTERNAL_KWARGS)
 
 
 class _RecordingCommunicator:

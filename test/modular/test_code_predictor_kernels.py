@@ -199,6 +199,7 @@ def test_code_predictor_depth_loop_matches_its_layers_unfused(embed_sum_dtype, w
         else:
             param.data.normal_(std=0.02)
     predictor.consolidate_stacked_weights()
+    predictor.depth.make(torch.bfloat16, "cuda")
     hq, hkv, d = cp.num_attention_heads, cp.num_key_value_heads, cp.head_dim
     last_hidden = torch.randn(bs, width, device="cuda", dtype=torch.bfloat16)
     layer0_embed = torch.randn(bs, width, device="cuda", dtype=torch.bfloat16)
@@ -260,6 +261,7 @@ def test_the_depth_scratch_holds_nothing_between_steps():
     for param in predictor.parameters():
         param.data.normal_(std=0.02)
     predictor.consolidate_stacked_weights()
+    predictor.depth.make(torch.bfloat16, "cuda")
     last_hidden = torch.randn(bs, width, device="cuda", dtype=torch.bfloat16)
     layer0_embed = torch.randn(bs, width, device="cuda", dtype=torch.bfloat16)
     layer0_codes = torch.randint(0, cp.vocab_size, (bs,), device="cuda")

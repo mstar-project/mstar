@@ -17,7 +17,6 @@ from mstar.model.components.qwen3_lm import Qwen3LMConfig
 
 KV_CACHE = "kv_cache"
 ATTN = "attn"
-ROPE = "rope"
 SAMPLER = "sampler"
 DECODE_WALK = "decode"
 DECODE_LOOP = "decode_loop"

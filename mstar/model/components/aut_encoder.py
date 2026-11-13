@@ -11,10 +11,12 @@ LayerNorm and a two-layer GELU projector map the tokens into the LLM's width.
 
 Windows are the attention's only structure, so the stack is packed varlen
 attention: every window is a segment, and any number of requests can be
-packed into one forward. On the engine it runs through the cacheless
-``RaggedAttentionSpec`` resource, whose plan the runner builds outside the
-graph — which is what lets the block loop replay as a CUDA graph. Without a
-bound resource (CPU tests, standalone use) it falls back to SDPA per window.
+packed into one forward. On the engine it runs through the node's array
+with ``max_len`` 0, or, on a model not yet on the state contract (MiniCPM-o),
+the cacheless ``RaggedAttentionSpec`` resource; either way the runner builds
+the plan outside the graph — which is what lets the block loop replay as a
+CUDA graph. Unbound (CPU tests, standalone use) it falls back to SDPA per
+window.
 
 Parameter paths mirror HF's ``audio_tower.*`` (``Qwen3OmniMoeAudioEncoder``,
 which Qwen3-ASR reuses unchanged), with ``q/k/v_proj`` fused into
@@ -110,9 +112,10 @@ def _activation(name: str):
 class AuTAttention(nn.Module):
     """Bidirectional attention within the packed windows of one forward.
 
-    ``attn_key`` names the node's ``RaggedAttentionSpec`` resource; bound at
-    load, it attends through the runner's plan. Unbound, SDPA runs per window
-    from ``cu_seqlens``.
+    ``array`` names the node's array with ``max_len`` 0, and ``attn_key`` the
+    ``RaggedAttentionSpec`` resource of a node still on resources; bound at
+    load, either attends through the runner's plan. Unbound, SDPA runs per
+    window from ``cu_seqlens``.
     """
 
     def __init__(
@@ -125,7 +128,6 @@ class AuTAttention(nn.Module):
         self.head_dim = d_model // num_heads
         self._attn_key = attn_key
         self.ragged = None
-        # the array a node on the state contract reads through, in place of the resource
         self.array, self.layer = array, layer
         self.state = None
         self.qkv_proj = FusedColumnLinear(d_model, {"q": d_model, "k": d_model, "v": d_model}, bias=True)
@@ -322,7 +324,7 @@ class AuTEncoder(nn.Module):
         """The transformer stack and projector over a packed sequence:
         ``(total_tokens, d_model)`` -> ``(total_tokens, output_dim)``. This is
         the region a submodule captures. ``cu_seqlens`` (the layout's host
-        list) is read only without a bound resource."""
+        list) is read only when nothing is bound."""
         for layer in self.layers:
             hidden_states = layer(hidden_states, cu_seqlens)
         hidden_states = self.ln_post(hidden_states)
