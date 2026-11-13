@@ -111,15 +111,21 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
        refuses to start, before it downloads anything. The rest of this row describes
        the model as it will be served once the compute lands.
        Praxis-1 video-action policy: one call answers one chunk of the future, 6 video
-       latents and 6 action tokens, which is 24 command rows at 15 Hz. The backbone
-       denoises the video over a few Euler steps and the action expert denoises the
+       latents and 6 action tokens. The cold-only openpi bring-up mode returns 21
+       denormalized relative Cartesian action rows at 15 Hz; a later context-aware
+       chunk in the reference returns 24. Parity for this bring-up mode targets
+       the reference's ``context_mode=stateless``, which it documents for debugging.
+       The backbone denoises the video over a few Euler steps and the action expert denoises the
        actions from its hidden states each step.
        ``praxis1_droid`` is the single-arm DROID rig (exterior and wrist views, rows of
        10), ``praxis1_yam`` the bimanual YAM rig (top and two wrists, rows of 20). The
        rig, the canvas and every width come from the checkpoint's ``config.json``; a
        variant this build has not ported is refused at load rather than served.
        Both need the public Wan2.2 VAE and Qwen3.5-2B beside the checkpoint, which it
-       does not ship. Both will serve openpi's policy WebSocket (see :doc:`clients`).
+       does not ship. Both will use a Praxis-specific schema over openpi's policy
+       WebSocket (see :doc:`clients`). The stock openpi DROID client expects 10x8
+       joint-velocity actions and cannot connect unchanged. This mode does not
+       reproduce the reference's Positronic command-dict wire.
        ``backbone``, ``action_expert`` and ``action_head`` run in one ``node_groups``
        entry: the expert reads the backbone's hidden states inside each Euler step.
    * - ``qwen3_5_{0.8,2,4,9,27}b``

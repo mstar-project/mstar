@@ -11,16 +11,20 @@ model: "praxis1_yam"
 max_seq_len: 32768
 
 
-# Praxis-1 on the bimanual YAM rig (runwayml/praxis-1-yam), served the way
-# Runway's own serve_yam recipe runs it.
+# Praxis-1 on the bimanual YAM rig (runwayml/praxis-1-yam). This is a
+# cold-only openpi bring-up mode, not Runway's stateful Positronic session wire.
+# Compare it with reference context_mode=stateless, which is for debugging.
 #
 # A request carries three camera frames, the top view then the two wrist views, the
 # task text, and robot_state = both arm poses, each [xyz(3) quat_wxyz(4) grip(1)]. The
-# reply is [24, 20]: 24 command rows at 15 Hz, two arms of [xyz(3) rot6d(6) grip(1)].
+# reply is [21, 20] denormalized relative Cartesian action rows at 15 Hz,
+# two arms of [xyz(3) rot6d(6) grip(1)]. Grippers are clipped to [0, 1].
+# Every request starts at depth 0, with no executed-frame history.
 #
 # The canvas, the pose frame and the rig all come from the checkpoint's config.json,
 # so none of them is a knob here. num_cameras follows the rig's views and is baked
-# into the CUDA-graph captures, as is the action horizon.
+# into the CUDA-graph captures. The 21-row cold reply horizon is separate from
+# the checkpoint's 24-row action chunk.
 model_kwargs:
   model_path_hf: "runwayml/praxis-1-yam"
   # Public components the checkpoint expects beside it. Neither ships with it.
@@ -33,11 +37,11 @@ model_kwargs:
   t_shift: 1.0
   cfg_scale: 1.0
   cfg_video_scale: 1.0
-  max_context_chunks: 1
+  max_context_chunks: 0
 
-# The openpi WebSocket at ws://<host>:<port>/ for a bimanual YAM client: the three
-# cameras in view order (top, left wrist, right wrist), both arms' poses and
-# grippers as the state, all 20 action dims (two arms of 10).
+# A Praxis-specific openpi schema at ws://<host>:<port>/: the three cameras in
+# view order (top, left wrist, right wrist), both arm poses as state, and 21x20
+# relative action rows. It is not the reference Positronic command-dict wire.
 openpi:
   images: [observation/top_image, observation/wrist_image_left, observation/wrist_image_right]
   state: [observation/cartesian_position_left, observation/gripper_position_left,
