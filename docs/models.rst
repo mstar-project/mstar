@@ -664,8 +664,12 @@ decoding* in :doc:`adding_models`). The pool holds
 ``2(k + 1)`` tokens a request past the checkpoint's context, which still bounds
 prompt plus reply.
 While drafting, a request's ``repetition_penalty`` other than 1 is refused with
-a 400, log-probs are not reported, and the node runs no mixed prefill/decode
-steps and rebuilds no dropped request. Its prompts prefill in chunks of 8192
+a 400, log-probs are not reported, and the node rebuilds no dropped request.
+In either mode its arrivals run inside its verify steps (mixed
+prompt-plus-verify steps, up to four prompts and a captured ladder of up to
+512 prompt tokens past the verify rows a step; ``max_batch_tokens`` for
+``LLM``/``mixed`` bounds them), so an arrival holds no decode row.
+Its prompts prefill in chunks of 8192
 tokens a step (the serving config's ``max_batch_tokens`` for ``LLM`` sets
 another budget, null none), so a wave of long prompts runs as several steps
 rather than one; a plain Qwen3 node prefills each prompt whole.

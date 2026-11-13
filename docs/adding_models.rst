@@ -2034,9 +2034,10 @@ the target's ``ModelGeometry``, and a hosted drafter's checkpoint and steps), de
 attention resources with ``splits=self.mixed_splits()``, and passes its specs through
 ``drafter_resources(specs, self.drafter_decl, nodes, self.draft)`` itself.
 
-The base then turns off what a verifying node doesn't run yet (combined walks and the mixed
-split; the engine turns rebuild off; ``drafter_resources`` makes the sampler a verifying one with
-no repetition penalty), and refuses at startup a checkpoint whose ``generation_config.json`` defaults a
+The base then turns off what a verifying node doesn't run yet (combined walks, unless its prompts
+run inside its verify steps (``mixes_verify``), and the mixed split; the engine turns rebuild off;
+``drafter_resources`` makes the sampler a verifying one with no repetition penalty), and refuses at
+startup a checkpoint whose ``generation_config.json`` defaults a
 ``repetition_penalty`` other than 1, since every request would inherit it. A model that
 declares a chunking budget for the mixed step drops it itself while drafting:
 ``chunking_policy_of`` refuses a policy for a combined walk the model no longer has.

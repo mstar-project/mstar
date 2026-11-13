@@ -20,7 +20,7 @@ from jinja2 import TemplateError
 
 from mstar.engine.state import Array, Attend, Causal, Draft, KVEntry, Positions, Read, Rope, Sampler
 from mstar.model.hf_config import hf_weight_dtype
-from mstar.model.keys import KV_CACHE, PREFILL_TEXT, ROPE, SAMPLER
+from mstar.model.keys import KV_CACHE, MIXED, PREFILL_TEXT, ROPE, SAMPLER
 from mstar.model.multimodal import TEXT, PromptPart, chat_turns
 from mstar.model.multimodal_decoder import DeclaredDecoderModel
 from mstar.model.qwen3.config import ATTN, LLM_NODE, qwen3_lm_config
@@ -124,7 +124,8 @@ class Qwen3Model(DeclaredDecoderModel):
                 method=self.draft.method, model=self.draft.model, checkpoint=str(self._drafter_dir),
                 num_draft_tokens=self.draft.num_draft_tokens, mode=self.draft.mode.value,
                 num_layers=cfg.num_hidden_layers, hidden_size=cfg.hidden_size,
-                dtype=hf_weight_dtype(self.hf_config), input_kinds={TEXT},
+                dtype=hf_weight_dtype(self.hf_config), mixed_walk=MIXED if self.mixes_verify else None,
+                input_kinds={TEXT},
             ))
         return state
 
@@ -145,7 +146,13 @@ class Qwen3Model(DeclaredDecoderModel):
         from mstar.model.qwen3.submodules import Qwen3LMSubmodule
 
         budget = Qwen3LMSubmodule.MAX_BATCH_TOKENS
-        return {LLM_NODE: (ChunkingPolicy(walks=(PREFILL_TEXT,), chunkable=True, max_batch_tokens=budget),)}
+        policies = (ChunkingPolicy(walks=(PREFILL_TEXT,), chunkable=True, max_batch_tokens=budget),)
+        if self.mixes_verify:
+            # a mixed step's tokens, up to its captures' top rung: the verify rows' blocks, then a prompt chunk
+            block, node = self.draft.num_draft_tokens + 1, Qwen3LMSubmodule
+            mixed = node.MIXED_VERIFY_BATCH_SIZES[-1] * block + node.MIXED_VERIFY_PROMPT_TOKENS[-1]
+            policies += (ChunkingPolicy(walks=(MIXED,), max_batch_tokens=mixed),)
+        return {LLM_NODE: policies}
 
     def _prompt_ids(
         self, parts: list[PromptPart], raw: dict[str, list[torch.Tensor]], **kwargs,

@@ -16,10 +16,10 @@ subclasses `DeclaredDecoderModel` instead.
 
 A subclass that drafts (speculative decoding) sets ``draft`` and
 ``drafter_decl`` in its ``__init__`` from its ``draft`` block, and supplies
-`verify_node_fields`; the base then declares the verify node and turns off
-what a verifying node doesn't run yet (mixed steps; the engine turns rebuild
-off, `Engine.rebuild_policies`). Without a draft
-block none of it applies.
+`verify_node_fields`; the base then declares the verify node, and its mixed
+step as a mixed prompt-plus-verify step where it can (`mixes_verify`;
+otherwise none), and the engine turns rebuild off (`Engine.rebuild_policies`).
+Without a draft block none of it applies.
 
 Not in ``multimodal.py``: ``mstar.model.base`` imports that module, so a
 `Model` subclass there would be a circular import.
@@ -212,10 +212,17 @@ class MultimodalDecoderModel(Model):
     # -----------------------------------------------------------------------
 
     def get_combined_graph_walks(self) -> dict[str, dict[str, set[str]]]:
-        if self.draft is not None:
-            # the engine refuses a verifying node in a combined walk for now
+        if self.draft is not None and not self.mixes_verify:
             return {}
         return text_combined_walks() if self.TEXT_PROMPTS else {}
+
+    @property
+    def mixes_verify(self) -> bool:
+        """Whether a drafting LLM node runs its text prompts inside its verify steps (`VerifyNode.mixed_walk`):
+        a text-only model whose drafter's passes run over a mixed step (`DrafterNeeds.mixed`), in either mode."""
+        return (
+            self.draft is not None and self.TEXT_PROMPTS and not self.encoders and self.drafter_decl.needs.mixed
+        )
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         # a safety bound on decode, not the per-request budget
@@ -282,7 +289,7 @@ class MultimodalDecoderModel(Model):
 
     def mixed_splits(self) -> tuple[CombinedSplit, ...]:
         """The LLM's attention resources' ``splits``: the mixed step's, unless
-        the node verifies, which runs no mixed steps."""
+        the node verifies, whose mixed steps (if any) plan as verify steps."""
         return () if self.draft is not None else (MIXED_SPLIT,)
 
     # -----------------------------------------------------------------------
@@ -478,6 +485,7 @@ class MultimodalDecoderModel(Model):
         node = self.llm_node_class()
         return [VerifyNode(
             "LLM", node.DECODE_WALK, self.draft, self.drafter_decl.needs,
+            mixed_walk=MIXED if self.mixes_verify else None,
             **self.draft_node_fields(None), **self.verify_node_fields(),
         )]
 

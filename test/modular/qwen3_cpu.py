@@ -423,6 +423,42 @@ class Driver:
             per_request_input_tensors={rid: {"text_inputs": [row]} for rid, row in ids.items()},
         )
 
+    def mixed_step(
+        self, rids: list[int], prompts: dict[int, list[int]], chunks: dict | None = None,
+    ) -> dict[int, bool]:
+        """One mixed prompt-plus-verify step: ``rids``' verify rows and ``prompts``' rows (each its whole
+        prompt, cut to ``chunks[rid]`` (a `ChunkRange`) when given), ordered by the engine. The rows that
+        stopped; a prompt row's first token joins its reply on its last chunk."""
+        from mstar.model.keys import MIXED
+
+        ids = {rid: torch.tensor([self.out[rid][-1]], device=self.device) for rid in rids}
+        ids.update({rid: torch.tensor(prompt, device=self.device) for rid, prompt in prompts.items()})
+        walks = {**dict.fromkeys(rids, "decode"), **dict.fromkeys(prompts, PREFILL)}
+        order = self.eng.order_split_rows(NODE, MIXED, list(prompts) + list(rids), walks)
+        batch = ExecutingBatch(
+            node_name=NODE,
+            per_request_info={rid: _info(rid, walks[rid], self.max[rid], self.sampling[rid]) for rid in order},
+            step_context=StepContext(
+                request_ids=tuple(order), graph_walk=MIXED, slot=0, capture=False, request_walks=walks,
+            ),
+            per_request_input_tensors={rid: {"text_inputs": [ids[rid]]} for rid in order},
+        )
+        if chunks:
+            batch.chunk_ranges = dict(chunks)
+        self.eng.prepare_inputs(batch)
+        outputs = self.eng.exec_and_postprocess(batch)
+        assert batch.admit_error is None, batch.admit_error
+        host = HostRows(tuple(outputs.row_request_ids or order), {
+            name: t.cpu() for name, t in (outputs.check_stop_buffers or {}).items()
+        })
+        self.eng.cut_verify_step(batch, outputs, host)
+        stopped = {}
+        stop_col = host.buffers["verify_stopped"].tolist()
+        for i, rid in enumerate(host.request_ids):
+            self.out[rid] += outputs.per_rid_outputs[rid]["new_token"][0].reshape(-1).cpu().tolist()
+            stopped[rid] = bool(stop_col[i])
+        return stopped
+
     def step(self, rids: list[int]) -> dict[int, bool]:
         """One decode step over ``rids``; which rows stopped."""
         batch = self._batch("decode", {rid: torch.tensor([self.out[rid][-1]], device=self.device) for rid in rids})
@@ -643,8 +679,10 @@ def prompt_kv(eng: Engine, rid: int, length: int, layers) -> torch.Tensor:
     """``[layers, length, ...]``: what the pool holds at a request's first ``length`` positions."""
     kv = eng._resources["kv_cache"]
     stream = kv._streams[rid]["main"]
-    pages = torch.tensor([stream.page_indices[p // PAGE] for p in range(length)])
-    offsets = torch.tensor([p % PAGE for p in range(length)])
+    # the pool's own page size: the device configs' differs from the CPU ones' (`device_specs`)
+    page = kv.config.page_size
+    pages = torch.tensor([stream.page_indices[p // page] for p in range(length)])
+    offsets = torch.tensor([p % page for p in range(length)])
     return torch.stack([kv.kv_cache.tensor[layer][pages, :, offsets] for layer in layers])
 
 

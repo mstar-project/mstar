@@ -240,7 +240,7 @@ def test_a_drafting_node_chunks_its_prompts_and_a_plain_one_does_not(ckpt):
     target, dspark = ckpt
     assert make_model(target).chunking_policy_of() == {}
     model = make_model(target, draft_block(dspark, 3))
-    (policy,) = model.chunking_policy_of().values()
+    policy = model.chunking_policy_of()[(NODE, "prefill_text")]
     assert policy.chunkable and policy.max_batch_tokens == 8192
     eng = engine(model)
     assert eng._chunking.max_batch_tokens(NODE, "prefill_text") == 8192
@@ -867,15 +867,18 @@ def _attention_splits(model):
     return attn.config.splits
 
 
-def test_drafting_turns_off_combined_walks_and_the_mixed_split_and_the_engine_turns_off_rebuild(ckpt):
-    """The model turns off combined walks and the mixed split; it keeps its
-    rebuild policy, which the engine leaves out for a verifying node."""
+def test_drafting_turns_off_the_mixed_split_and_the_engine_turns_off_rebuild(ckpt):
+    """A drafting model declares no mixed split, and keeps its mixed walk for its mixed prompt-plus-verify steps
+    (`mixes_verify`), in either mode; it keeps its rebuild policy, which the engine leaves out for a verifying
+    node."""
     from mstar.engine.engine import Engine
 
     target, dspark = ckpt
     plain, drafting = make_model(target), make_model(target, draft_block(dspark, 3))
     assert plain.get_combined_graph_walks() and plain.rebuild_policies() and _attention_splits(plain)
-    assert drafting.get_combined_graph_walks() == {}
+    assert drafting.get_combined_graph_walks() == plain.get_combined_graph_walks()
+    auto = make_model(target, draft_block(dspark, 3, "auto"))
+    assert auto.get_combined_graph_walks() == plain.get_combined_graph_walks()
     assert drafting.rebuild_policies() == plain.rebuild_policies()
     eng = Engine.__new__(Engine)
     eng._submodules, eng._rebuild_off_logged = {}, set()

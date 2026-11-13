@@ -14,9 +14,12 @@ positions.
 
 Given a drafter (speculative decoding), every decode step is a verify step:
 each row runs its last token and the drafter's ``k`` drafts, ``k + 1`` rows, on
-the verify attention kernel, through the engine's `draft_verify_step`; no mixed
-step is captured, and the drafter's ``prefill`` runs over each prompt.
-Without one, nothing of this runs.
+the verify attention kernel, through the engine's `draft_verify_step`, and the
+drafter's ``prefill`` runs over a prompt step's rows. A node whose drafter's
+passes also run over mixed steps (its share's ``mixed_walk``) runs its text
+prompts inside its verify steps, in either mode (`draft_mixed_step`), and
+captures them (`_mixed_verify_capture`); any other drafting node captures no
+mixed step. Without one, nothing of this runs.
 
 A media walk's row is the whole prompt's ids, each attachment expanded to
 one pad per token at intake (`expand_media_pads`). Its encoders' outputs
@@ -71,9 +74,10 @@ from mstar.engine.accelerator_graph_config import (
     BatchedAcceleratorGraphConfig,
     PackedAcceleratorGraphConfig,
     decode_rows_then_prompt,
+    distribute_tokens,
 )
 from mstar.engine.resources.attn.config import AttentionStep
-from mstar.engine.resources.draft.drafter import Drafter, PrefillInputs
+from mstar.engine.resources.draft.drafter import MIXED_KIND, Drafter, PrefillInputs, mixed_rows
 from mstar.engine.resources.position.config import PositionStep
 from mstar.engine.resources.sampler.config import SamplerStep
 from mstar.engine.resources.step import ResourceStep, Segment, SubmoduleStep
@@ -128,6 +132,14 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
     # attention's prefill kernels are captured for this many, and a recurrent
     # state's prefill kernel gathers and scatters each such row's whole state.
     MIXED_MAX_PREFILL_ROWS = 4
+    # A verifying node's mixed prompt-plus-verify steps (`VerifyNode.mixed_walk`): captured at these rows, the
+    # verify rows' blocks and a prompt row's tokens past them each. Arrivals are mostly cached, so a step's
+    # prompt tokens are a page or so, hence the short first rung. The rows reach the verify walk's widest
+    # capture, since below it the mixed walk's cap would split a step's verify rows. Synchronously, a step past
+    # the top rung runs eagerly. Asynchronously, the walk's rows and token budget are capped at the widest kept
+    # bucket that holds its worst step (`Engine._fit_mixed_steps_to_captures`), which may sit below the top.
+    MIXED_VERIFY_BATCH_SIZES = [4, 8, 16, 32, 48, 64, 96, 128]
+    MIXED_VERIFY_PROMPT_TOKENS = [32, 128, 512]
     # Requests per media-walk step, of any medium: the largest caps every
     # media walk, captured or not (`max_batch_size`), so a packed step stays
     # near the top bucket (4 fit ~1000 tokens a request: a ~1000 px square
@@ -375,8 +387,10 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
                 capture_batch_sizes=self.PREFILL_CAPTURE_BATCH_SIZES,
                 compile_mode=self.capture_compile_mode(self.PREFILL_WALK),
             )]
+        if self._text_prompts and self.CAPTURE_PREFILL and self._mixes_verify:
+            configs.append(self._mixed_verify_capture(device))
         if self._text_prompts and self.CAPTURE_PREFILL and not self._drafting:
-            # a verifying node runs no mixed steps: they aren't supported yet
+            # a verifying node's mixed steps capture above
             configs += [PackedAcceleratorGraphConfig(
                 capture_graph_walk=MIXED,
                 capture_token_lengths=(
@@ -403,6 +417,46 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
                 input_seq_dims={MEDIA_EMBEDS: 0, MEDIA_MASK: 0},
             ))
         return configs
+
+    def _mixed_verify_capture(self, device: torch.device) -> PackedAcceleratorGraphConfig:
+        """A mixed prompt-plus-verify step's capture: ``bs - 1`` verify rows and a prompt row, at each of
+        ``MIXED_VERIFY_PROMPT_TOKENS`` past the verify rows' blocks. A replay plans its own rows on the host
+        and reads them off the attention's query offsets (`MixedRows`), so any mix of rows fits a bucket.
+        Lean twins as a verify bucket's (`MixedVerifyGraphConfig`)."""
+        from mstar.engine.resources.draft.capture import MixedVerifyGraphConfig
+
+        block = self._block
+
+        def row(n: int) -> ARNodeInputs:
+            verify = n == block
+            return ARNodeInputs(
+                input_ids=torch.zeros(1 if verify else n, dtype=torch.long, device=device), input_seq_len=n,
+                graph_walk=self.DECODE_WALK if verify else self.PREFILL_WALK,
+            )
+
+        def layout(total_tokens: int, bs: int) -> list[int]:
+            if total_tokens <= block * (bs - 1):
+                # a replay's padding rows (`pad_inputs` lays out none of the step's tokens): empty rows, which
+                # `MixedRows` reads as prompt rows that sample nothing kept
+                return distribute_tokens(total_tokens, bs)
+            return [block] * (bs - 1) + [total_tokens - block * (bs - 1)]
+
+        sizes = self.MIXED_VERIFY_BATCH_SIZES
+        return MixedVerifyGraphConfig(
+            capture_graph_walk=MIXED,
+            capture_token_lengths={bs: [bs * block + more for more in self.MIXED_VERIFY_PROMPT_TOKENS] for bs in sizes},
+            make_node_input=row,
+            capture_batch_sizes=sizes,
+            compile_mode=self.capture_compile_mode(MIXED),
+            token_layout=layout,
+            input_seq_dims={MIXED_KIND: 0},
+        )
+
+    @property
+    def _mixes_verify(self) -> bool:
+        """Whether the node runs mixed prompt-plus-verify steps (`VerifyNode.mixed_walk`), bound at load."""
+        share = self.drafter_share if self._drafting else None
+        return share is not None and share.mixed_walk is not None
 
     def capture_compile_mode(self, graph_walk: str) -> str | None:
         """The torch.compile mode of the capture ``graph_walk`` names; None
@@ -577,6 +631,8 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
         engine_inputs: ModelInputsFromEngine,
         inputs: list[ARNodeInputs],
     ) -> dict[str, torch.Tensor | Any]:
+        if graph_walk == MIXED and self._mixes_verify:
+            return self._mixed_verify_inputs(engine_inputs, inputs)
         if self._has_loopback_rows(inputs):
             # every row's last sampled token, read by slot (padding rows read
             # slot 0); a row whose last step ran elsewhere brought its own
@@ -598,6 +654,26 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
         out = {"input_ids": torch.cat([inp.input_ids for inp in inputs], dim=0)}
         self._pack_media(out, graph_walk, inputs)
         return out
+
+    def _mixed_verify_inputs(self, engine_inputs: ModelInputsFromEngine, inputs: list[ARNodeInputs]) -> dict:
+        """A mixed step's ``[tokens]`` ids, each verify row's last token at its block's first place (off its
+        loop-back slot, or routed on its first verify step), then the prompt rows' ids; and `MIXED_KIND`.
+        The verify rows lead (`Engine.order_split_rows`)."""
+        block = self._block
+        verify = sum(1 for inp in inputs if inp.graph_walk == self.DECODE_WALK)
+        sampler = engine_inputs.resources[self.device_loopback.sampler]
+        anchors = sampler.loopback_tokens(engine_inputs.request_ids)
+        routed = [i for i in range(verify) if inputs[i].input_ids is not None and inputs[i].input_ids.numel()]
+        if routed:
+            sampler.overwrite_rows(routed, (anchors, torch.cat([inputs[i].input_ids.reshape(-1)[-1:] for i in routed])))
+        device = anchors.device
+        blocks = torch.zeros(verify, block, dtype=torch.long, device=device)
+        blocks[:, 0] = anchors[:verify].long()
+        prompt = [inp.input_ids.reshape(-1) for inp in inputs[verify:] if inp.input_seq_len]
+        ids = torch.cat([blocks.reshape(-1), *(to_device_nonblocking(p.long(), device) for p in prompt)])
+        tokens = sum(p.numel() for p in prompt)
+        kind = torch.cat([torch.arange(block).repeat(verify), torch.full((tokens,), -1)])
+        return {"input_ids": ids, MIXED_KIND: to_device_nonblocking(kind, device)}
 
     def _pack_media(self, out: dict, graph_walk: str, inputs: list[ARNodeInputs]) -> None:
         """A media step's ``MEDIA_EMBEDS``, its rows' in row order as the
@@ -659,7 +735,7 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
                 int(inp.resource_step_info) if places_own(inp) else int(inp.input_seq_len) for inp in inputs
             )
 
-        return self.node_step(
+        step = self.node_step(
             [
                 Segment(request_id=rid, label="main", span=inp.input_seq_len)
                 for rid, inp in zip(request_ids, inputs, strict=True)
@@ -667,6 +743,11 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
             prefill_tokens,
             advance,
         )
+        if self._drafting and graph_walk == MIXED:
+            # a mixed step's attention plans as the verify walk's does: on FA3 where the verify walk runs it,
+            # every row through its ragged wrapper (`FA3RaggedWrapper`), else on FlashInfer as before
+            step.steps.update(self.verify_layer_steps())
+        return step
 
     def verify_layer_steps(self) -> dict[str, ResourceStep]:
         """A verify step's work on the layers' resources: `layer_steps`, each
@@ -748,6 +829,26 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
         result = self.draft_verify_step(engine_inputs, input_ids.view(n), target)
         return self.verify_output(result)
 
+    def _mixed_verify(
+        self, engine_inputs: ModelInputsFromEngine, input_ids: torch.Tensor, **tensors: torch.Tensor,
+    ) -> BatchedModelOutput:
+        """A mixed prompt-plus-verify step (`draft_mixed_step`): the target runs every row's tokens, and the
+        head only at each row's verify positions (a prompt row's last token)."""
+        kind = tensors.pop(MIXED_KIND)
+        qo = engine_inputs.resources[self.ATTN_KEY].qo_indptr_buf()
+        rows = mixed_rows(qo.to(kind.device), kind, self._block)
+        decoder_kwargs = self.decoder_kwargs(MIXED, engine_inputs, input_ids.shape[0], **tensors)
+        model = self.model
+
+        def target(ids: torch.Tensor, at: torch.Tensor) -> torch.Tensor:
+            return model.logits(model(model.embed(ids), label="main", **decoder_kwargs).index_select(0, at))
+
+        result = self.draft_mixed_step(engine_inputs, input_ids, rows, target)
+        out = self.verify_output(result)
+        # a prompt row's first token extends its prompt's keys, as a prompt step's host copy does
+        out.check_stop_buffers["text_inputs"] = result.tokens[:, 0]
+        return out
+
     def forward(
         self,
         graph_walk: str,
@@ -755,6 +856,8 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
         input_ids: torch.Tensor | None = None,
         **tensors: torch.Tensor,
     ) -> NameToTensorList:
+        if self._drafting and graph_walk == MIXED:
+            return self._mixed_verify(engine_inputs, input_ids, **tensors)
         if self._drafting and graph_walk == self.DECODE_WALK:
             return self._verify(engine_inputs, input_ids, **tensors)
         return {"new_token": self._forward(graph_walk, engine_inputs, input_ids, **tensors)}
@@ -766,6 +869,8 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
         input_ids: torch.Tensor | None = None,
         **tensors: torch.Tensor,
     ) -> BatchedModelOutput:
+        if self._drafting and graph_walk == MIXED:
+            return self._mixed_verify(engine_inputs, input_ids, **tensors)
         if self._drafting and graph_walk == self.DECODE_WALK:
             return self._verify(engine_inputs, input_ids, **tensors)
         new_tokens = self._forward(graph_walk, engine_inputs, input_ids, **tensors)
@@ -797,6 +902,13 @@ class DeclaredTokenDecoder(SampledTokenDecoder):
     def bind_state(self, handles: Mapping[str, Any]) -> None:
         self.kv = handles[self.KV_CACHE]
         self.sampler = handles[self.SAMPLER]
+
+    @property
+    def ATTN_KEY(self) -> str:
+        """The attention resource of the KV array's one read, which the adapter builds under the read's name: a mixed
+        verify step reads its query offsets off it."""
+        (read,) = self.kv.array.reads
+        return read
 
     def node_step(
         self, segments: list[Segment], prefill_tokens: Mapping[int, torch.Tensor], advance: tuple[int, ...] | None,

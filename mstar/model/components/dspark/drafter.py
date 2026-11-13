@@ -90,6 +90,8 @@ class DSpark(HostedDrafterDecl):
             # its context K/V at p is a function of the taps at p alone
             chunk_boundary=ChunkBoundary.NONE,
             geometry=geometry,
+            # a mixed step's verify rows draft as in a verify step, and its one context write covers them all
+            mixed=True,
         )
 
     def node_resources(self, nodes: set[str]) -> list[NodeResourceSpec]:
@@ -248,9 +250,16 @@ class DSparkDrafter(nn.Module, HostedDrafter):
         k = inputs.num_draft_tokens
         anchor = inputs.input_ids.reshape(-1).long()
         n = anchor.shape[0]
-        block = torch.cat([anchor[:, None], self._mask.expand(n, k)], dim=1)
+        mixed = inputs.mixed
         lm = self.backbone
-        hidden = lm(lm.embed(block.reshape(-1)), label=LABEL).view(n, k + 1, -1)[:, :k]
+        if mixed is None:
+            block = torch.cat([anchor[:, None], self._mask.expand(n, k)], dim=1)
+            hidden = lm(lm.embed(block.reshape(-1)), label=LABEL).view(n, k + 1, -1)[:, :k]
+        else:
+            # every token of the mixed step: the blocks in their places, the mask elsewhere; a prompt row's
+            # passes are unread, and the context write after the target rewrites them (`observe`)
+            ids = self._mask.reshape(1).expand(mixed.tokens).scatter(0, mixed.at[:, 0], anchor)
+            hidden = lm(lm.embed(ids), label=LABEL)[mixed.at[:, :k]]
         base = lm.logits(hidden.reshape(n * k, -1)).float().view(n, k, -1)
         prev, drafts = anchor, []
         for i in range(k):

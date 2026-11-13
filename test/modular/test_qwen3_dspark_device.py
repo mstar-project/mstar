@@ -111,8 +111,13 @@ def _env(monkeypatch):
     monkeypatch.setattr(Qwen3LMSubmodule, "DECODE_CAPTURE_BATCH_SIZES", [1, 2, 4, 8])
     monkeypatch.setattr(Qwen3LMSubmodule, "PREFILL_CAPTURE_BATCH_SIZES", [1, 2, 4, 8])
     monkeypatch.setattr(Qwen3LMSubmodule, "PREFILL_TOKEN_BUCKETS", [64, 128])
-    # the plain node's mixed step (a drafting one captures none)
+    # the plain node's mixed step, and a drafting node's mixed prompt-plus-verify step, within the probe's
+    # rows. No step here reaches the 128 rung: it is min_chunk_tokens' default, as the production ladder's top
+    # (512) is above it, so an asynchronous node's startup fit finds a bucket that holds a verify block on every
+    # row but one beside a chunk at that floor (`Engine._fit_mixed_steps_to_captures`)
     monkeypatch.setattr(Qwen3LMSubmodule, "MIXED_CAPTURE_BATCH_SIZES", [4, 8])
+    monkeypatch.setattr(Qwen3LMSubmodule, "MIXED_VERIFY_BATCH_SIZES", [4, 8])
+    monkeypatch.setattr(Qwen3LMSubmodule, "MIXED_VERIFY_PROMPT_TOKENS", [16, 128])
 
 
 def _checkpoints(tmp_path, setup: Setup, **dspark):
@@ -338,3 +343,125 @@ def test_synchronous_and_asynchronous_agree_exactly_one_request_at_a_time(tmp_pa
 def test_the_cpu_cases_run_here():
     """The harness itself is checked wherever the suite runs."""
     assert CPU[0].device == "cpu" and NODE == "LLM"
+
+
+MIXED_SETUPS = [
+    Setup("cpu"), Setup("cuda"), Setup("cuda", captured=True), Setup("cuda", captured=True, compiled=False),
+    # its verify rows on the resident tables, its prompt rows on the host plan (`ResidentPlanner.mixed_walks`)
+    Setup("cuda", "asynchronous", captured=True),
+]
+
+
+@pytest.mark.parametrize("setup", MIXED_SETUPS, ids=repr)
+def test_a_mixed_prompt_plus_verify_step_replies_plain_greedy(tmp_path, monkeypatch, setup):
+    """Late prompts ride in one mixed step (`VerifyNode.mixed_walk`) with the running rows' verify rows, then
+    decode beside them: every reply is plain greedy (to a bf16 near-tie on the device). Captured, the mixed
+    step replays a capture of its walk (`_mixed_verify_capture`, its trimmed ladder patched small here)."""
+    _skip(setup)
+    from mstar.model.keys import MIXED
+
+    if not setup.compiled:
+        monkeypatch.setattr(Qwen3LMSubmodule, "disable_torch_compile", True)
+    target, dspark = _checkpoints(tmp_path, setup)
+    model = _model(target, dspark, setup)
+    assert model.verify_nodes()[0].mixed_walk == MIXED
+    eng = engine(model, device=setup.device, dtype=setup.dtype, warmup=setup.device != "cpu",
+                 slot_masters=setup.device == "cpu")
+    leased, resident = [], []
+    reserve = eng.reserve_replay_slot
+
+    def recording(batch, reserve=reserve):
+        lease = reserve(batch)
+        if batch.step_context.graph_walk == MIXED:
+            leased.append(lease is not None)
+            resident.append(batch.step_context.resident is not None)
+        return lease
+
+    eng.reserve_replay_slot = recording
+    # each mixed step's plans, by attention resource: FA3's ragged wrapper wherever FA3 runs the verify walk
+    from mstar.engine.resources.attn.flashinfer import FlashInferManager
+
+    plans, plan = [], FlashInferManager.plan
+
+    def recording_plan(self, step, ctx, plan=plan):
+        out = plan(self, step, ctx)
+        if ctx.graph_walk == MIXED and not ctx.capture:
+            plans.append((self.resource_key, self._verify_fa3, type(self._current_plan_states.get("main")).__name__))
+        return out
+
+    monkeypatch.setattr(FlashInferManager, "plan", recording_plan)
+    driver = Driver(eng, model)
+    running = {rid: PROMPTS[rid] for rid in (1, 2)}
+    late = {rid: PROMPTS[rid] for rid in (3, 4)}
+    for rid, prompt in PROMPTS.items():
+        driver.add(rid, prompt, MAX)
+    driver.prefill(list(running), running)
+    driver.step(list(running))
+    # three rows each, padded to a bucket of four: 18 and 10 tokens, both on its 16-token prompt rung
+    for rid, prompt in late.items():
+        driver.mixed_step(list(running), {rid: prompt})
+    driver.run(list(PROMPTS))
+    _check_tokens(model, eng._submodules[NODE].submodule, PROMPTS, driver.out, setup)
+    assert leased == [setup.captured] * len(late)
+    assert resident == [setup.mode == "asynchronous"] * len(late)
+    if setup.device != "cpu":
+        # FlashInfer's manager serves the device (the CPU runs a torch attention): the target's attention and
+        # the drafter's planned every mixed step, each on FA3's ragged wrapper where FA3 runs the verify walk
+        assert {key for key, _, _ in plans} >= {"attn"} and len(plans) >= 2 * len(late), plans
+        assert all(kind == ("FA3RaggedWrapper" if fa3 else kind) for _, fa3, kind in plans), plans
+        if _fa3_reason() is None:
+            assert all(fa3 for _, fa3, _ in plans), plans
+
+
+@pytest.mark.parametrize("setup", [Setup("cpu"), *[s for s in MIXED_SETUPS if s.device == "cuda" and s.captured]],
+                         ids=repr)
+def test_an_arrivals_drafter_context_after_a_mixed_step_is_its_prompt_steps(tmp_path, monkeypatch, setup):
+    """One arrival in a mixed step against the same arrival in a prompt step of its own, after the same running
+    rows: the drafter's context K/V at each prompt position, against the target's own K/V there as the yardstick
+    of what the two step kinds' kernels round apart. Printed per position (``-s``). Exact on the CPU in float64,
+    where only a difference in what is written would show. On the device the drafter's may differ by no more than
+    the target's do by a margin, and the prompt's last position by no more than its others."""
+    _skip(setup)
+    from qwen3_cpu import drafter_first_layer, prompt_kv
+
+    if not setup.compiled:
+        monkeypatch.setattr(Qwen3LMSubmodule, "disable_torch_compile", True)
+    target, dspark = _checkpoints(tmp_path, setup)
+    model = _model(target, dspark, setup)
+    running = {rid: PROMPTS[rid] for rid in (1, 2)}
+    arrival = {3: PROMPTS[3]}
+    held = {}
+    for how in ("prompt_step", "mixed_step"):
+        eng = engine(model, device=setup.device, dtype=setup.dtype, warmup=setup.device != "cpu",
+                     slot_masters=setup.device == "cpu")
+        driver = Driver(eng, model)
+        for rid, prompt in {**running, **arrival}.items():
+            driver.add(rid, prompt, MAX)
+        driver.prefill(list(running), running)
+        driver.step(list(running))
+        if how == "prompt_step":
+            driver.prefill(list(arrival), arrival)
+        else:
+            driver.mixed_step(list(running), arrival)
+        pool = eng._resources["kv_cache"].kv_cache.tensor
+        first = drafter_first_layer(model)
+        n = len(arrival[3])
+        held[how] = (prompt_kv(eng, 3, n, range(first)).float(), prompt_kv(eng, 3, n, range(first, len(pool))).float())
+        del driver, eng
+        torch.cuda.empty_cache() if setup.device == "cuda" else None
+    (t_a, d_a), (t_b, d_b) = held["prompt_step"], held["mixed_step"]
+    # [layers, positions, 2, heads, dim] -> per position
+    target_diff = (t_a - t_b).abs().amax(dim=(0, 2, 3, 4))
+    drafter_diff = (d_a - d_b).abs().amax(dim=(0, 2, 3, 4))
+    drafter_scale = d_a.abs().amax(dim=(0, 2, 3, 4))
+    print(f"\n{setup!r}: per prompt position, max |diff| prompt step vs mixed step")
+    for p in range(target_diff.shape[0]):
+        print(f"  pos {p:2d}: target {target_diff[p].item():.3e}  drafter {drafter_diff[p].item():.3e}  "
+              f"(drafter max |K/V| {drafter_scale[p].item():.3e})")
+    if setup.device == "cpu":
+        assert drafter_diff.max().item() <= 1e-9 and target_diff.max().item() <= 1e-9
+        return
+    # the drafter's context comes from the target's taps, so it inherits their rounding, and no more than it
+    assert drafter_diff.max().item() <= 4 * max(target_diff.max().item(), 2**-7 * drafter_scale.max().item())
+    others = drafter_diff[:-1].max().item() if drafter_diff.shape[0] > 1 else 0.0
+    assert drafter_diff[-1].item() <= max(4 * others, 2**-7 * drafter_scale[-1].item()), "the last position stands out"

@@ -3,7 +3,7 @@ and verify steps the engine runs, field for field.
 
 The hand-written specs, verify node and steps below are the reference, copied from the model and the scaffold's
 resource path as they stood before the port, so the adapter can't pass by agreeing with itself. A step is compared
-as the engine runs it: the node's declaration expanded, then the drafter's share added (`drafter_step`).
+as the engine runs it (`engine_step`): the node's declaration expanded, then the drafter's share added.
 """
 from __future__ import annotations
 
@@ -19,11 +19,11 @@ import yaml
 
 pytest.importorskip("triton")
 
-from qwen3_cpu import bind_share, build_submodule, draft_block, make_model, write_checkpoints  # noqa: E402
+from qwen3_cpu import build_submodule, draft_block, make_model, write_checkpoints  # noqa: E402
 
 from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec, AttentionStep  # noqa: E402
 from mstar.engine.resources.draft.drafter import ModelGeometry, VerifyNode, drafter_resources  # noqa: E402
-from mstar.engine.resources.draft.node import drafter_step  # noqa: E402
+from mstar.engine.resources.draft.node import DrafterShare  # noqa: E402
 from mstar.engine.resources.kv.config import KVSpec, KVStep, LayerSetSlot, PagedKVConfig  # noqa: E402
 from mstar.engine.resources.position.config import PositionConfig, PositionSpec, PositionStep  # noqa: E402
 from mstar.engine.resources.sampler.config import SamplerStep  # noqa: E402
@@ -33,7 +33,7 @@ from mstar.engine.state.adapters import StateSetup, draft_config, node_handles, 
 from mstar.engine.state.analysis import declaration_digests  # noqa: E402
 from mstar.model.base import enabled_resources, serving_resources  # noqa: E402
 from mstar.model.hf_config import hf_weight_dtype  # noqa: E402
-from mstar.model.keys import KV_CACHE, PREFILL_TEXT, ROPE, SAMPLER  # noqa: E402
+from mstar.model.keys import KV_CACHE, MIXED, PREFILL_TEXT, ROPE, SAMPLER  # noqa: E402
 from mstar.model.multimodal import TEXT  # noqa: E402
 from mstar.model.qwen3.config import ATTN, LLM_NODE  # noqa: E402
 from mstar.model.submodule_base import ARNodeInputs, engine_step  # noqa: E402
@@ -98,6 +98,7 @@ def test_the_verify_node_equals_the_hand_written_one(model):
         ),
         checkpoint=str(model._drafter_dir),
         prefill_steps=decl.prefill_steps(), verify_steps=decl.verify_steps(),
+        mixed_walk=MIXED if model.mixes_verify else None,
     )
     assert model.verify_nodes() == [reference]
 
@@ -113,13 +114,20 @@ class _Stub:
 
 
 def _node(model):
+    """The node with its handles over stand-in resources and the share the engine binds, its drafter's steps too."""
     sub = build_submodule(model)
     resources = {spec.resource_key: _Stub() for spec in node_resources(model)}
     sub.bind_node_state(node_handles(model, LLM_NODE, resources))
-    share = bind_share(sub, K).drafter_share
-    return sub, share._replace(
+    given = dict(
+        verify_walk=sub.DECODE_WALK, sampler_key=SAMPLER, num_draft_tokens=K, prompt_walks=sub.token_stop.prefill_walks,
         prompt_steps=model.drafter_decl.prefill_steps(), verify_steps=model.drafter_decl.verify_steps(),
     )
+    share = DrafterShare(**{
+        name: given.get(name, frozenset() if name.endswith("writes") else {})
+        for name in DrafterShare._fields if name not in DrafterShare._field_defaults
+    })._replace(mixed_walk=MIXED if model.mixes_verify else None)
+    sub.bind_draft(share)
+    return sub, share
 
 
 def _assert_steps_equal(step: SubmoduleStep, reference: SubmoduleStep) -> None:
@@ -136,7 +144,7 @@ def test_a_prompt_step_equals_the_hand_written_one(model):
     sub, share = _node(model)
     rids, lengths = [1, 2], [5, 3]
     inputs = [ARNodeInputs(input_ids=torch.arange(n), input_seq_len=n) for n in lengths]
-    step = drafter_step(engine_step(sub, graph_walk=PREFILL_TEXT, request_ids=rids, inputs=inputs), PREFILL_TEXT, share)
+    step = engine_step(sub, graph_walk=PREFILL_TEXT, request_ids=rids, inputs=inputs)
     segments = [Segment(rid, "main", n) for rid, n in zip(rids, lengths, strict=True)]
     # a verifying node applies no repetition penalty, so tracks no prompt
     reference = SubmoduleStep(segments=segments, steps={
@@ -150,7 +158,7 @@ def test_a_verify_step_equals_the_hand_written_one(model):
     sub, share = _node(model)
     rids = [1, 2]
     inputs = [ARNodeInputs(input_seq_len=K + 1), ARNodeInputs(input_seq_len=K + 1)]
-    step = drafter_step(engine_step(sub, graph_walk="decode", request_ids=rids, inputs=inputs), "decode", share)
+    step = engine_step(sub, graph_walk="decode", request_ids=rids, inputs=inputs)
     reference = SubmoduleStep(segments=[Segment(rid, "main", K + 1) for rid in rids], steps={
         KV_CACHE: KVStep(), ATTN: AttentionStep(causal=True, verify=True),
         SAMPLER: SamplerStep(segments=[Segment(rid, "main", 1) for rid in rids], apply_penalty=False),
@@ -180,3 +188,50 @@ def test_a_drafting_deployment_builds_its_specs_handles_and_digests(model):
     digests = declaration_digests(model.declare_state(), model.kernel_settings())
     assert digests.keys() == {KV_CACHE, SAMPLER, "draft", "kernel_settings()"}
     assert digests == declaration_digests(model.declare_state(), model.kernel_settings())
+
+
+def test_a_mixed_step_equals_the_hand_written_one(model):
+    """A verify row and a prompt row in one step: the target's attention on its verify kernel, the sampler as a
+    prompt step's, and both of the drafter's shares."""
+    if not model.mixes_verify:
+        pytest.skip("the drafter runs no mixed steps")
+    sub, share = _node(model)
+    rids = [1, 2]
+    inputs = [
+        ARNodeInputs(input_ids=torch.zeros(1, dtype=torch.long), input_seq_len=K + 1, graph_walk="decode"),
+        ARNodeInputs(input_ids=torch.arange(5), input_seq_len=5, graph_walk=PREFILL_TEXT),
+    ]
+    step = engine_step(sub, graph_walk=MIXED, request_ids=rids, inputs=inputs)
+    segments = [Segment(1, "main", K + 1), Segment(2, "main", 5)]
+    reference = SubmoduleStep(segments=segments, steps={
+        KV_CACHE: KVStep(), ATTN: AttentionStep(causal=True, verify=True), SAMPLER: SamplerStep(apply_penalty=False),
+        ROPE: PositionStep(), **share.prompt_steps, **share.verify_steps,
+    })
+    _assert_steps_equal(step, reference)
+
+
+def _walk_inputs(model, walk: str) -> list:
+    if walk == "decode":
+        return [ARNodeInputs(input_seq_len=K + 1), ARNodeInputs(input_seq_len=K + 1)]
+    if walk == MIXED:
+        return [ARNodeInputs(input_ids=torch.zeros(1, dtype=torch.long), input_seq_len=K + 1, graph_walk="decode"),
+                ARNodeInputs(input_ids=torch.arange(5), input_seq_len=5, graph_walk=PREFILL_TEXT)]
+    return [ARNodeInputs(input_ids=torch.arange(n), input_seq_len=n) for n in (5, 3)]
+
+
+@pytest.mark.parametrize("walk", [PREFILL_TEXT, "decode", MIXED])
+def test_the_share_keeps_the_handles_and_labels_and_adds_only_its_own_steps(model, walk, monkeypatch):
+    """The drafter's share is applied after the state is expanded: the step keeps the handles and the combined
+    labels the same step has with drafting off, and gains only the drafter's own steps."""
+    if walk == MIXED and not model.mixes_verify:
+        pytest.skip("the drafter runs no mixed steps")
+    sub, share = _node(model)
+    kwargs = dict(graph_walk=walk, request_ids=[1, 2], inputs=_walk_inputs(model, walk))
+    drafted = engine_step(sub, **kwargs)
+    monkeypatch.setattr(sub, "drafter_share", None)
+    plain = engine_step(sub, **kwargs)
+    own = {PREFILL_TEXT: share.prompt_steps, "decode": share.verify_steps,
+           MIXED: {**share.prompt_steps, **share.verify_steps}}[walk]
+    assert drafted.state_handles and drafted.state_handles == plain.state_handles
+    assert drafted.combined_labels == plain.combined_labels and drafted.state == plain.state
+    assert drafted.steps.keys() == plain.steps.keys() | own.keys() and not plain.steps.keys() & own.keys()
