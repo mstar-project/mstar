@@ -604,10 +604,10 @@ def _model(name: str):
 
 
 def _lora_spec(model):
-    """The model's LoRA spec, declared beside its other resources."""
-    from mstar.engine.resources.lora.serving import lora_spec
+    """The model's LoRA spec, as the bridge builds it from its roots."""
+    from mstar.model.components.lora.modules import declared_lora_spec
 
-    return lora_spec(model.get_node_resources())
+    return declared_lora_spec(model.lora_roots())
 
 
 def _submodule(model, node: str):

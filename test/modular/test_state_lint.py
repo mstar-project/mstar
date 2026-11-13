@@ -45,7 +45,6 @@ ALLOWED = {
 } | {
     ("mstar.engine.engine", "ExecutingBatch"): "the annotation of `NodeSubmodule.can_batch`, a base class's hook",
     ("mstar.engine.resources.lora.checkpoint", "LoraFile"): "a model's static LoRA merge at load, which holds no state",
-    ("mstar.engine.resources.lora", "LoraSpec"): "the opt-in LoRA spec, written by hand: the contract declares no LoRA",
     ("mstar.engine.resources", "SeqShardSpec"): (
         "MiniMax-H3's video decoder's sequence shard, written by hand: a contract SeqShard brackets a label an array "
         "opens, and the decoder has no arrays"

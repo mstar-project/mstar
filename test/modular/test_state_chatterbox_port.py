@@ -24,7 +24,6 @@ from mstar.conductor.conductor import Conductor
 from mstar.engine.node_dtype import resolve_model_dtype
 from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec, AttentionStep
 from mstar.engine.resources.kv.config import KVReqConfig, KVSpec, KVStep, PagedKVConfig
-from mstar.engine.resources.lora.config import LORA_RESOURCE_KEY
 from mstar.engine.resources.position.config import PositionConfig, PositionSpec, PositionStep
 from mstar.engine.resources.recurrent.config import (
     RecurrentBlockConfig,
@@ -152,9 +151,8 @@ def test_specs_equal_the_hand_written_ones_under_a_resources_block(variant):
 
 
 @pytest.mark.parametrize("variant", VARIANTS)
-def test_the_port_writes_only_lora_by_hand(variant):
-    hand_written = {spec.resource_key for spec in _make_model(variant).get_node_resources()}
-    assert hand_written == (set() if variant == "turbo" else {LORA_RESOURCE_KEY})
+def test_the_port_writes_no_spec_by_hand(variant):
+    assert _make_model(variant).get_node_resources() == []
 
 
 def test_every_published_config_is_covered():

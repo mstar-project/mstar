@@ -28,6 +28,7 @@ from mstar.engine.resources.lora.pool import LoraAdapterPool
 from mstar.engine.resources.lora.store import classify_adapter
 from mstar.engine.resources.step import ResourceStep, Segment, StepContext, SubmoduleStep
 from mstar.engine.state import ArrayStep
+from mstar.model.components.lora.modules import declared_lora_spec
 from mstar.model.qwen3_5.config import FULL_ATTENTION, LINEAR_ATTENTION, Qwen3_5Config
 from mstar.model.submodule_base import ARNodeInputs, engine_step, with_segment_steps
 
@@ -482,14 +483,14 @@ def write_peft_adapter(directory, rank, projs, alpha=None, text_only=False, seed
 
 
 def _declared(model) -> LoraSpec:
-    """The model's LoRA spec, as it declares it beside its other resources."""
-    return next(s for s in model.get_node_resources() if isinstance(s, LoraSpec))
+    """The model's LoRA spec, as the bridge builds it from its roots."""
+    return declared_lora_spec(model.lora_roots())
 
 
 def lora_spec(paths, **kw) -> LoraSpec:
-    from mstar.model.qwen3_5.lora import qwen3_5_lora_spec
+    from mstar.model.qwen3_5.lora import qwen3_5_lora_roots
 
-    return serve(qwen3_5_lora_spec(tiny_config()), paths, **kw)
+    return serve(declared_lora_spec(qwen3_5_lora_roots(tiny_config())), paths, **kw)
 
 
 class _GatedNorm(nn.Module):
@@ -1031,7 +1032,7 @@ def _qwen3_5():
     ``[q|k|v|z|a|pad|b]`` in-projection (``a`` padded per rank), the LM head (one row
     per request) and the token embedding. Its
     released sizes, with the vision tower's spec, are the models test's own."""
-    from mstar.model.qwen3_5.lora import qwen3_5_lora_spec
+    from mstar.model.qwen3_5.lora import qwen3_5_lora_roots
     from mstar.model.qwen3_5.submodules import LLMSubmodule
 
     def a1(c):
@@ -1047,7 +1048,7 @@ def _qwen3_5():
         return _per_row(hidden, lm.lm_head(_last(hidden, lengths.lengths)), lengths.lengths)
 
     return Stack(
-        config=tiny_config, lora_spec=qwen3_5_lora_spec,
+        config=tiny_config, lora_spec=lambda c: declared_lora_spec(qwen3_5_lora_roots(c)),
         build=lambda c, group, w: _stub_cores(LLMSubmodule(build_stack(w, group, c), c), _Rows()),
         weights=lambda c: hf_text_weights(), a1=a1,
         # leaves `in_proj_qkv` and `in_proj_a` out: slices of one fused target on and off it

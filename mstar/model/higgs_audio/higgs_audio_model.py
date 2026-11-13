@@ -38,7 +38,7 @@ from mstar.engine.resources import (
     PositionConfig,
     PositionSpec,
 )
-from mstar.engine.resources.lora import LoraSpec
+from mstar.model.components.lora.modules import PER_SEGMENT, LoraRoot
 from mstar.model.components.request_kwargs import GREEDY_SAMPLING, sampler_capabilities, sampling_defaults
 from mstar.model.higgs_audio.config import ATTN, HiggsAudioModelConfig
 from mstar.model.keys import KV_CACHE, ROPE
@@ -102,22 +102,21 @@ class HiggsAudioModel(MultimodalDecoderModel):
     # Resources
     # -------------------------------------------------------------------
 
-    def _lora_spec(self) -> LoraSpec:
+    def lora_roots(self) -> tuple[LoraRoot, ...]:
         """Per-request adapters on the LLM: every linear of the Qwen3 stack and the text
         head (one row per request: the last token's), placed as the weight loader places
         the checkpoint's own tensors. The embedding takes none (an adapter touching it is
         refused). Adapters saved on a ``Qwen3ForCausalLM`` layout (``model.layers.*``) are
         read as the flat checkpoint's."""
-        from mstar.model.components.lora.modules import PER_SEGMENT, module_lora_spec
         from mstar.model.loader import LLAMA_STACKED_PARAMS, CheckpointRules
 
-        return module_lora_spec(
-            self.build_llm, nodes={"LLM"}, root_path="model",
+        return (LoraRoot(
+            node="LLM", build=self.build_llm,
             # Qwen3DenseLM.load_weights' rules, over the names _llm_remap gives it
             rules=CheckpointRules(stacked_params=tuple(LLAMA_STACKED_PARAMS), remap=self._llm_remap),
             adapter_roots=[("model.", "")],
             rows={"lm_head": PER_SEGMENT},
-        )
+        ),)
 
     def get_node_resources(self) -> list[NodeResourceSpec]:
         """LLM paged KV + attention/positions/sampler. audio_encoder is
@@ -151,7 +150,6 @@ class HiggsAudioModel(MultimodalDecoderModel):
             # defaults one; without the capability a request penalty or min_p
             # is refused.
             replace(self._sampler_spec(self.config.vocab_size), **sampler_capabilities(self.sampling_defaults)),
-            self._lora_spec(),
         ]
 
     def get_max_output_tokens(self, **model_kwargs):
