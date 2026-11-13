@@ -341,6 +341,15 @@ def test_startup_takes_a_combined_walk_with_the_verify_walk_only_as_the_named_mi
     assert "DrafterNeeds.mixed" in combined_problem(decl, combined)
 
 
+def test_a_lagged_drafter_refuses_a_mixed_walk():
+    """Its passes trail each row's verify block (`Lag`), planned over every row as one."""
+    from mstar.engine.resources.step import Lag
+
+    model = ToyModel(K, needs=DrafterNeeds(chunk_boundary=ChunkBoundary.NONE, mixed=True, lag=Lag(1, (2, 1, 1))),
+                     mixed=True)
+    assert "lags the target" in combined_problem(model.verify_nodes()[0], model.combined_walk_of())
+
+
 def test_a_mixed_node_verifies_asynchronously_as_a_verify_node_does():
     """Its mixed steps are resident in their verify rows (`ResidentPlanner.mixed_walks`), so the mixed walk holds
     nothing back: the mode follows the node's resources and scheduling alone."""

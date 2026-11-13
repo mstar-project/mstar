@@ -324,6 +324,9 @@ def combined_problem(decl: VerifyNode, combined_walk_of: Mapping[tuple[str, str]
         return f"{where}, which the model doesn't run as mixed prompt-plus-verify steps (VerifyNode.mixed_walk)"
     if not decl.needs.mixed:
         return f"{where}; its drafter's passes don't run over a mixed step's tokens (DrafterNeeds.mixed)"
+    if decl.needs.lag is not None:
+        # its passes trail the verify block by its lag (`Lag`), each planned over every row as a block
+        return f"{where}; its drafter lags the target (DrafterNeeds.lag), which a mixed step's prompt rows can't"
     return None
 
 
