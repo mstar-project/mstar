@@ -329,8 +329,6 @@ def _stop_after(prompt_len, max_tokens, per_step, k=3, context_limit=2048):
                                      step_metadata={PROMPT_LEN: prompt_len} if walk == "decode" else {})
         return Glm5NextLLMSubmodule._mtp_check_stop(sub, info, torch.tensor(tokens), count)
 
-    if stops("prefill", [7], 1):
-        return 0, 1
     generated = 1
     for step in range(1, 100_000):
         generated += per_step

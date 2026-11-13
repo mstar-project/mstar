@@ -623,7 +623,9 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
     ) -> set[str]:
         if "new_token" not in outputs:
             return set()
-        if self.mtp_k > 0:
+        # A prefill's stop check gets the step's stop buffers, its sampled tokens alone, and not the count it persists
+        # for the decode loop. Its one token stops as a plain step's does.
+        if self.mtp_k > 0 and request_info.graph_walk != "prefill":
             return self._mtp_check_stop(request_info, outputs["new_token"][0], int(outputs[COUNT][0]))
         # check_stop gets host tensors, so .item() here does not sync
         return self._stops(request_info, outputs["new_token"][0].item())
@@ -681,9 +683,6 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         ignore_eos = request_info.resource_configs[SAMPLER].ignore_eos
         is_eos = not ignore_eos and any(
             t in self.config.eos_token_ids for t in new_token.tolist())
-        if request_info.graph_walk == "prefill":
-            # as in _stops: the prefill walk has no decode_loop to stop
-            return {END_PARTITION} if is_eos else set()
         full = request_info.step_metadata[PROMPT_LEN] + count + 2 * self.mtp_block > self.config.context_limit
         if is_eos or count >= request_info.max_tokens or full:
             return {"decode_loop"}
