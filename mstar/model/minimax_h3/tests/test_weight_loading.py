@@ -87,3 +87,25 @@ def test_the_restated_conversion_is_diffusers_own():
     assert theirs.keys() == ours.keys()
     for name, tensor in theirs.items():
         assert torch.equal(tensor, ours[name]), name
+
+
+def test_a_vsa_distilled_transformer_loads_its_gates(tmp_path):
+    """With ``vsa_gate`` (a release distilled with VSA) each block's ``to_gate_compress`` loads as
+    ``attn.gate_compress``, and a missing one is refused."""
+    import dataclasses
+
+    state = random_checkpoint(CFG)
+    diffusers = to_diffusers(state, CFG)
+    gates = {k: torch.randn_like(v, dtype=torch.float32) for k, v in diffusers.items() if "to_gate_compress" in k}
+    assert len(gates) == CFG.num_layers
+    _write({**diffusers, **gates}, tmp_path / "transformer")
+    config = H3Config(transformer=dataclasses.replace(CFG, vsa_gate=True))
+    dit = weight_loader.build_transformer(config, tmp_path, "cpu", dtype=torch.float32,
+                                          dit_source=tmp_path / "transformer")
+    for i, block in enumerate(dit.blocks):
+        gate = gates[f"transformer_blocks.{i}.attn.to_gate_compress.weight"]
+        assert torch.equal(block.attn.gate_compress.weight, gate)
+    _write(state, tmp_path / "stripped" / "transformer")
+    with pytest.raises(RuntimeError):
+        weight_loader.build_transformer(config, tmp_path, "cpu", dtype=torch.float32,
+                                        dit_source=tmp_path / "stripped" / "transformer")

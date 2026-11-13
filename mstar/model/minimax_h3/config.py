@@ -88,6 +88,9 @@ class H3TransformerConfig:
     norm_eps: float = 1e-5
     qk_norm_eps: float = 1e-5
     final_norm_eps: float = 1e-5
+    # each block's VSA compression gate (``attn.to_gate_compress``): a DiT distilled with video sparse
+    # attention ships one (FastH3), which the ``vsa`` ragged backend reads
+    vsa_gate: bool = False
     # not in the config: diffusers' MiniMaxH3RotaryPosEmbed default, and the stored
     # ``rope.inv_freq`` agrees with it
     rope_theta: float = 10000.0
@@ -258,6 +261,8 @@ class H3Distilled:
     rungs: tuple[int, ...]       # dmd_denoising_steps
     video_shift: float
     audio_shift: float
+    # the video sparse attention it was distilled with (``vsa_sparsity``), None for dense; its DiT then ships a VSA gate
+    vsa_sparsity: float | None = None
 
     @classmethod
     def from_dir(cls, root: Path, base: H3TransformerConfig) -> "H3Distilled":
@@ -287,7 +292,12 @@ class H3Distilled:
                   if k in base.__dataclass_fields__ and v != getattr(base, k)}
         if differ:
             raise ValueError(f"{root}: the distilled transformer is not the base DiT's architecture: {differ}")
-        return cls(root / "transformer", tuple(int(r) for r in rungs), shifts[0], shifts[1])
+        vsa = None
+        if contract.get("attention_backend") == "VIDEO_SPARSE_ATTN_H3":
+            if int(contract.get("vsa_tile_size", 64)) != 64:
+                raise ValueError(f"{root}: VSA tile size {contract['vsa_tile_size']}; only 64-token tiles run")
+            vsa = float(contract["vsa_sparsity"])
+        return cls(root / "transformer", tuple(int(r) for r in rungs), shifts[0], shifts[1], vsa)
 
 
 @dataclass
@@ -317,8 +327,9 @@ class H3Config:
     def with_distilled(self, root: Path) -> "H3Config":
         """This config with the distilled release at ``root``'s DiT and its recipe's shifts."""
         distilled = H3Distilled.from_dir(root, self.transformer)
-        return dataclasses.replace(self, distilled=distilled, video_shift=distilled.video_shift,
-                                   audio_shift=distilled.audio_shift)
+        transformer = dataclasses.replace(self.transformer, vsa_gate=distilled.vsa_sparsity is not None)
+        return dataclasses.replace(self, transformer=transformer, distilled=distilled,
+                                   video_shift=distilled.video_shift, audio_shift=distilled.audio_shift)
 
     @property
     def dit_source(self) -> Path | None:

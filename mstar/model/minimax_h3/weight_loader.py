@@ -70,14 +70,14 @@ _DIFFUSERS_PREFIXES = (
     ("proj_out.", "final_layer.video_out."),
     ("audio_proj_out.", "final_layer.audio_out."),
 )
+# VSA's learned gate on its compression branch (FastH3 was distilled with VSA), read by the ``vsa`` ragged backend
+_VSA_GATE = ".attn.to_gate_compress."
 _DIFFUSERS_BLOCK_PARTS = (
     (".attn.to_q.", ".attn.q_proj."), (".attn.to_k.", ".attn.k_proj."), (".attn.to_v.", ".attn.v_proj."),
     (".attn.norm_q.", ".attn.q_norm."), (".attn.norm_k.", ".attn.k_norm."), (".attn.to_out.0.", ".attn.out_proj."),
-    (".ff.net.0.proj.", ".mlp.fc1."), (".ff.net.2.", ".mlp.fc2."),
+    (".ff.net.0.proj.", ".mlp.fc1."), (".ff.net.2.", ".mlp.fc2."), (_VSA_GATE, ".attn.gate_compress."),
 )
 _DIFFUSERS_TEXT_PREFIXES = ("token_refiner.", "context_embedder.")
-# VSA's learned gate on its compression branch (FastH3 was distilled with VSA): dense attention reads none
-_VSA_GATE = ".attn.to_gate_compress."
 
 
 def split_fused(weights: Iterator[tuple[str, torch.Tensor]], heads: int, head_dim: int):
@@ -137,8 +137,10 @@ def _transformer_weights(
     ``condition_proj`` (``text``) or the rest, the other part left on disk. FL2VA's, or the
     diffusers-layout directory ``dit_source``'s."""
     if dit_source is not None:
+        gate = config.transformer.vsa_gate
+
         def unread(name: str) -> bool:
-            return _VSA_GATE in name or name.startswith(_DIFFUSERS_TEXT_PREFIXES) != text
+            return (_VSA_GATE in name and not gate) or name.startswith(_DIFFUSERS_TEXT_PREFIXES) != text
 
         return from_diffusers(iter_diffusers_component(Path(dit_source), device, skip=unread))
 
