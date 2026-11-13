@@ -4,6 +4,7 @@ import hashlib
 import json
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import fields, is_dataclass
+from enum import Enum
 from itertools import product
 from typing import TYPE_CHECKING, get_origin
 
@@ -438,7 +439,7 @@ def declaration_digests(
     ``kernel_settings()``, since a pool size can follow the deployment too. A SHA-256 matches across processes, as
     Python's `hash` doesn't, since it randomizes strings per process.
 
-    Every field goes in, with keys sorted and dtypes and classes by name.
+    Every field goes in, with keys sorted and dtypes, enums and classes by name.
     """
     digests = {declared.name: _sha256(declared) for declared in declarations}
     if kernel_settings:
@@ -471,7 +472,7 @@ def _canonical(value):
         return sorted(value)
     if isinstance(value, list | tuple):
         return [_canonical(item) for item in value]
-    if isinstance(value, torch.dtype) or get_origin(value) is tuple:
+    if isinstance(value, torch.dtype | Enum) or get_origin(value) is tuple:
         return str(value)
     if isinstance(value, type):
         return value.__name__
