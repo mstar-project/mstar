@@ -415,6 +415,7 @@ class TestCudaGraphs:
         def engine_cap(walk: str) -> int | None:
             runner = AcceleratorGraphRunner.__new__(AcceleratorGraphRunner)
             runner._capture_configs = sub.get_accelerator_graph_configs(DEVICE)
+            runner._blocked_configs = frozenset()
             engine = make_engine(_submodules={"LLM": make_mgmt(submodule=sub, capture_runner=runner)})
             return engine.get_max_batch_size("LLM", walk)
 
