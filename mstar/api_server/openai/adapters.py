@@ -34,9 +34,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from mstar.api_server import media_io
-from mstar.api_server.openai import glm_chat
+from mstar.api_server.openai import glm_chat, tool_calls
 from mstar.api_server.openai.speech_chunking import _cut_evenly, split_sentences
-from mstar.model.multimodal import GLM_TEMPLATE_KWARGS, PromptPart
+from mstar.model.multimodal import DEEPSEEK_V41_TEMPLATE_KWARGS, GLM_TEMPLATE_KWARGS, PromptPart
 from mstar.model.qwen3_asr.constants import ASR_TEXT_TAG
 from mstar.model.registry import qwen_3_5_dense_sizes as QWEN_3_5_DENSE_SIZES
 from mstar.model.whisper.config import WORDS_MARKER
@@ -1861,6 +1861,144 @@ class GlmChatAdapter(TextChatAdapter):
             raise ValueError(f"tool_choice takes 'auto', 'none', 'required' or "
                              f"{{'type': 'function', 'function': {{'name': ...}}}}; got {choice!r}")
         return tools, template_kwargs, forced
+
+
+class DeepseekV41ChatAdapter(TextChatAdapter):
+    """DeepSeek-V4.1: the messages with their roles, and ``tools``, go to the
+    checkpoint's chat template, which writes the prompt its reference encoder
+    does; the reply comes back with ``reasoning_content`` and ``tool_calls``
+    split out of its DSML (``tool_calls.DEEPSEEK_V41``). ``/v1/messages`` and
+    ``/v1/responses`` are translated onto this chat, as for GLM.
+
+    ``tool_choice`` and ``parallel_tool_calls`` are as ``GlmChatAdapter``'s. A
+    forced call is the prompt's: it ends inside the ``<｜DSML｜ calls>`` block,
+    past a named function's name, or at the name for ``"required"`` over
+    several tools (a name the model makes up stays text). That reply does not
+    reason, so its prompt is the template's chat mode, and asking for thinking
+    with it is a 400.
+
+    The template's switches, flat in ``extra_body`` or under
+    ``chat_template_kwargs`` (which wins): ``enable_thinking`` (on unless
+    false; ``thinking`` and ``thinking_mode`` are the template's other names for it),
+    ``reasoning_effort`` (1 to 100, or ``low``, ``high``, ``max`` for 50, 75,
+    100; OpenAI's other levels map as DeepSeek's API maps them, and ``none``
+    turns thinking off) and ``drop_thinking`` (GLM's ``clear_thinking``). A
+    null is unset. Other template keys are dropped.
+    """
+
+    supports_messages = True
+    supports_responses = True
+    serves_tool_calls = True
+    serves_stop_strings = True
+    # the encoder's named levels, least first
+    reasoning_efforts = ("low", "high", "max")
+    # OpenAI's levels the encoder has no name for, as the -1017 checkpoint's template maps them
+    _EFFORTS = {"minimal": "low", "medium": "high", "xhigh": "high"}
+    # what a request may say; the template gets DEEPSEEK_V41_TEMPLATE_KWARGS only
+    _SWITCHES = (*DEEPSEEK_V41_TEMPLATE_KWARGS, "thinking", "thinking_mode", "clear_thinking")
+
+    def chat_to_request(self, req: ChatCompletionRequest, upload_dir: Path) -> SubmitArgs:
+        # as GlmChatAdapter: the base checks read a tool result as user text, and an image
+        # part is refused there (vision is not served)
+        checked = req.model_copy(update={"messages": [
+            m.model_copy(update={"role": "user"}) if m.role == "tool" else m for m in req.messages
+        ]})
+        args = super().chat_to_request(checked, upload_dir)
+        mk = args.model_kwargs
+        tools, template_kwargs, prefix = self._options(mk)
+        # a call's arguments as an object: the template refuses, or misreads, a JSON string
+        mk["messages"] = glm_chat.template_messages(req.messages)
+        if tools:
+            mk["tools"] = tools
+        if prefix:
+            mk["reply_prefix"] = prefix
+        mk["chat_template_kwargs"] = template_kwargs
+        return args
+
+    def make_output_parser(self, req: ChatCompletionRequest):
+        # normalized as chat_to_request's are, so the parser and the prompt agree
+        mk = normalize_generation_kwargs(_passthrough(req))
+        single_call = mk.get("parallel_tool_calls") is False
+        tools, template_kwargs, prefix = self._options(mk)
+        return tool_calls.ReplyParser(
+            tool_calls.DEEPSEEK_V41, thinking=template_kwargs.get("enable_thinking", True),
+            tools=glm_chat.tool_parameters(tools) if tools else None, reply_prefix=prefix, single_call=single_call,
+        )
+
+    def _options(self, mk: dict) -> tuple[list | None, dict, str]:
+        """Takes ``tools``, ``tool_choice`` and the template's switches out of
+        ``mk``. The third is what a forced ``tool_choice`` opens the reply
+        with, ``""`` when the model is free."""
+        if "reply_prefix" in mk:
+            raise ValueError("reply_prefix is not a request field; tool_choice sets it")
+        # the old names: refused where they ask for a call, rather than answered with text
+        functions, function_call = mk.pop("functions", None), mk.pop("function_call", None)
+        if (functions not in (None, []) and function_call != "none") or function_call not in (None, "none", "auto"):
+            raise ValueError("functions and function_call are not served; send tools and tool_choice")
+        # false ends the reply at its first call (the parser's single_call); read, not sent on
+        parallel = mk.pop("parallel_tool_calls", None)
+        if parallel is not None and not isinstance(parallel, bool):
+            raise ValueError(f"parallel_tool_calls must be a boolean, got {parallel!r}")
+        tools = mk.pop("tools", None) or None
+        choice = mk.pop("tool_choice", None)
+        params = glm_chat.tool_parameters(tools) if tools is not None else {}
+        sent = mk.pop("chat_template_kwargs", None) or {}
+        if not isinstance(sent, dict):
+            raise ValueError("chat_template_kwargs must be an object")
+        switches = {}
+        for key in self._SWITCHES:
+            flat = mk.pop(key, None)
+            value = flat if sent.get(key) is None else sent[key]
+            if value is not None:
+                switches[key] = value
+        thinking = self._thinking(switches)
+        effort = switches.get("reasoning_effort")
+        if effort == "none":
+            del switches["reasoning_effort"]
+            thinking = False if thinking is None else thinking
+        elif isinstance(effort, str):
+            switches["reasoning_effort"] = self._EFFORTS.get(effort, effort)
+        if (clear := switches.pop("clear_thinking", None)) is not None:
+            switches.setdefault("drop_thinking", clear)
+        prefix = ""
+        if choice == "none":
+            tools = None
+        elif choice == "required" or isinstance(choice, dict):
+            if not params:
+                raise ValueError(f"tool_choice {choice!r} needs tools")
+            if choice == "required":
+                forced = next(iter(params)) if len(params) == 1 else ""
+            else:
+                fn = choice.get("function")
+                forced = fn.get("name") if choice.get("type") == "function" and isinstance(fn, dict) else None
+                if forced not in params:
+                    raise ValueError(f"tool_choice {choice!r} names no function in tools {list(params)}")
+            if thinking:
+                raise ValueError("a forced tool call opens the reply, which leaves no room to reason; "
+                                 "leave enable_thinking unset, or use tool_choice 'auto'")
+            thinking = False
+            prefix = tool_calls.DEEPSEEK_V41.forced_prefix(forced, takes_arguments=bool(forced and params[forced]))
+        elif choice not in (None, "auto"):
+            raise ValueError(f"tool_choice takes 'auto', 'none', 'required' or "
+                             f"{{'type': 'function', 'function': {{'name': ...}}}}; got {choice!r}")
+        if thinking is not None:
+            switches["enable_thinking"] = thinking
+        return tools, switches, prefix
+
+    @staticmethod
+    def _thinking(switches: dict) -> bool | None:
+        """Takes the template's three names for its thinking mode out of
+        ``switches``, in its order of precedence; None when none is set."""
+        thinking = None
+        for key in ("enable_thinking", "thinking"):
+            if key in switches:
+                thinking = switches.pop(key)
+                if not isinstance(thinking, bool):
+                    raise ValueError(f"{key} must be true or false, got {thinking!r}")
+        mode = switches.pop("thinking_mode", None)
+        if mode not in (None, "thinking", "chat"):
+            raise ValueError(f"thinking_mode takes 'thinking' or 'chat', got {mode!r}")
+        return thinking if mode is None else mode == "thinking"
 
 
 class OmnilingualASRAdapter(OpenAIAdapter):

@@ -122,6 +122,12 @@ See [Step 4 — Implement the submodules](/adding_models#step-4-implement-the-su
 
 <Note>
 
+A chat model whose template writes reasoning and tool calls renders the request's own `messages` and `tools` in `process_prompt`, with `render_chat_template` (`mstar/model/multimodal.py`) and the switches its template reads (`GLM_TEMPLATE_KWARGS`, `DEEPSEEK_V41_TEMPLATE_KWARGS`); it lists `messages`, `tools`, `chat_template_kwargs` and `reply_prefix` in `PREPROCESS_ONLY_KWARGS`. Its adapter sends those four and parses the reply. The calls' markup belongs to the template family, not the model: a `CallFormat` in `mstar/api_server/openai/tool_calls.py` (`deepseek_v41`, DeepSeek-V4.1's DSML; `glm47`, which GLM still reads with its own `glm_chat.GlmReplyParser`), read by the one `ReplyParser` into `reasoning_content`, `content` and `tool_calls`, streamed or whole. A new family is a `CallFormat` and its replies in `test/modular/chat_formats/replies.json`, which `test_chat_reply_corpus.py` feeds whole and split at every byte. Where the checkpoint ships a reference encoder, pin the template to the encoder's prompts, as `test_deepseek_v41_chat_template.py` does.
+
+</Note>
+
+<Note>
+
 The metadata `process_prompt` returns is laid over the request's own `model_kwargs`, so a key the model reads back there (a prompt layout) must be set in every mode and listed in `INTERNAL_KWARGS`: the data worker drops a client's value for it before `process_prompt`. Qwen3-TTS lists its prompt layout, speaker, language and clip digest.
 
 </Note>
