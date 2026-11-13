@@ -89,6 +89,31 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# The sets of ignored keys already reported, as digests: a client that sends a
+# key every request (a benchmark's ``temperature`` to a greedy model) is
+# reported once, not once per request. A digest rather than the names, and a
+# fixed number of them, so what a client sends never stays in memory; a
+# collision only skips one warning. Least recently seen go first.
+_REPORTED_IGNORED: collections.OrderedDict[int, None] = collections.OrderedDict()
+_REPORTED_IGNORED_MAX = 256
+_REPORTED_IGNORED_LOCK = threading.Lock()
+# what the warning names of a set: a client's keys can be as large as its body
+_REPORTED_NAMES_MAX = 20
+_REPORTED_NAME_CHARS = 64
+
+
+def _first_report(keys: tuple[str, ...]) -> bool:
+    """Whether ``keys`` is not among the recently reported sets; remembers it."""
+    digest = hash(keys)
+    with _REPORTED_IGNORED_LOCK:
+        if digest in _REPORTED_IGNORED:
+            _REPORTED_IGNORED.move_to_end(digest)
+            return False
+        _REPORTED_IGNORED[digest] = None
+        if len(_REPORTED_IGNORED) > _REPORTED_IGNORED_MAX:
+            _REPORTED_IGNORED.popitem(last=False)
+        return True
+
 STREAMING_ONLY_MODALITIES = frozenset({"video_frame"})
 
 NDJSON_STREAM_MEDIA_TYPE = "application/x-ndjson"
@@ -787,14 +812,17 @@ class APIServer:
     # ----------------------------------------------------------
 
     def _report_ignored_params(self, model_kwargs: dict) -> None:
-        """Log the keys the model does not read; the request is served regardless."""
+        """Log the keys the model does not read, once per set of keys; the
+        request is served regardless."""
         model = getattr(self, "model", None)
         declared = model.request_kwargs() if model is not None else None
         if declared is None:
             return
         ignored = sorted(set(model_kwargs) - declared - set(model.ENGINE_KWARGS) - set(model.LENGTH_KWARGS))
-        if ignored:
-            logger.warning("Ignoring model_kwargs this model does not read: %s", ignored)
+        if ignored and _first_report(tuple(ignored)):
+            names = [name[:_REPORTED_NAME_CHARS] for name in ignored[:_REPORTED_NAMES_MAX]]
+            more = f" and {len(ignored) - len(names)} more" if len(ignored) > len(names) else ""
+            logger.warning("Ignoring model_kwargs this model does not read: %s%s", names, more)
 
     def submit_request(
         self,
@@ -930,7 +958,7 @@ class APIServer:
             raw_inputs=raw_inputs,
         ))
 
-        logger.info(
+        logger.debug(
             "Request %s submitted as %s  in=%s  out=%s",
             request_id, key, input_modalities, output_modalities,
         )
@@ -1295,7 +1323,7 @@ class APIServer:
                                 # release it once the client lets go.
                                 self.recently_completed[rid] = time.time()
                             elif message.message_type == "request_complete":
-                                logger.info("API server received %s done", rid)
+                                logger.debug("API server received %s done", rid)
                                 self.recently_completed[rid] = time.time()
 
                                 if not message.body.output_chunk_counts:
@@ -1631,7 +1659,7 @@ class APIServer:
                     yield new_chunks
 
                 if done:
-                    logger.info("Async stream results received finish for %s", request_id)
+                    logger.debug("Async stream results received finish for %s", request_id)
                     # flush remaining
                     remaining: list[ResultChunk] = []
                     finished_req: PendingRequest | None = None

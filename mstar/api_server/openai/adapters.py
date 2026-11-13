@@ -351,7 +351,7 @@ class OpenAIAdapter:
     def speech_request(self, req: SpeechRequest, upload_dir: Path) -> SubmitArgs:
         """``speech_to_request`` plus a client-sent ``speed``; the model's request_kwargs reads or logs it.
 
-        Only a sent one: ``SpeechRequest.speed`` defaults to 1.0, which would warn on every request.
+        Only a sent one: ``SpeechRequest.speed`` defaults to 1.0, which would be logged as ignored.
         """
         args = self.speech_to_request(req, upload_dir)
         if "speed" in req.model_fields_set:

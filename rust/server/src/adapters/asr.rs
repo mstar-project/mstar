@@ -74,8 +74,8 @@ fn transcription_kwargs(req: &TranscriptionRequest) -> Result<Kwargs, String> {
     if let Some(prompt) = req.prompt.as_deref().filter(|p| !p.is_empty()) {
         gk::set_default(&mut mk, "initial_prompt", s(prompt));
     }
-    // only when sent: its 0.0 default would be logged as ignored on every
-    // request to a model without a sampler
+    // only when sent: its 0.0 default would be logged as ignored by a model
+    // without a sampler
     if let (true, Some(t)) = (req.temperature_sent, req.temperature) {
         let value = serde_json::Number::from_f64(t).map_or(Kwarg::Float(t), |n| Kwarg::Json(Value::Number(n)));
         gk::set_default(&mut mk, "temperature", value);

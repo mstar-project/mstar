@@ -372,7 +372,8 @@ rules; an unprefixed knob sets the primary stage (the thinker of Qwen3-Omni, the
 of Qwen3-TTS), and a prefixed one wins over it for its stage.
 
 A knob the model does not read is not an error: the request is served, and the server
-logs its name as ignored (check the server log for typos such as ``temprature``).
+logs its name as ignored, on the first request that sends that set of names (check the server log
+for typos such as ``temprature``).
 
 Python SDK
 ----------
@@ -610,7 +611,7 @@ Per-model notes:
   Whisper also reads ``task`` (``transcribe``, the default, or ``translate`` into
   English). Its ``max_output_tokens`` is at most 444, the 448-position table less the
   forced prompt; more is a 400. Higgs-Audio's default is 1024. A key the model does not
-  read is logged as ignored on each request that sends it.
+  read is logged as ignored, on the first request that sends that set of keys.
 - **Omnilingual ASR** (``omnilingual_asr_ctc_*``): no language code is needed for any of
   its 1,600+ languages, and ``language`` / ``prompt`` / ``temperature`` have no effect. A
   clip of up to 20 s is one request; a longer upload is cut into windows of about equal
