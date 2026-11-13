@@ -324,8 +324,10 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         return None
 
     def attention_segments(self, bucket_key: Hashable) -> Mapping[str, Sequence[tuple[str, int]]]:
-        """``(label, span)`` for each segment one request brings to each array its layers attend through. Whole on every
-        rank, since the engine cuts each read's share. Default: none, for a loop with no declared arrays."""
+        """``(label, span)`` for each segment one request brings to each array its layers attend through, or
+        ``(label, span, layout)`` for a segment whose attention reads how its tokens are arranged (``Segment.layout``).
+        Whole on every rank, since the engine cuts each read's share. Default: none, for a loop with no declared
+        arrays."""
         return {}
 
     # --------------------------------------------------------------- helpers
@@ -576,8 +578,7 @@ class DenoiseLoopSubmodule(NodeSubmodule):
             ],
             state={
                 name: ArrayStep(segments=tuple(
-                    Segment(request_id=rid, label=label, span=span)
-                    for rid, arrays in rows for label, span in arrays[name]
+                    Segment(rid, *entry) for rid, arrays in rows for entry in arrays[name]
                 ), fixed_layout=True)
                 for name in rows[0][1]
             },
@@ -695,7 +696,7 @@ def _by_label(arrays: Mapping[str, Sequence[tuple[str, int]]]) -> dict[str, list
     by_label: dict[str, list[tuple[str, int]]] = {}
     for name, spans in arrays.items():
         mine: dict[str, list[tuple[str, int]]] = {}
-        for label, span in spans:
+        for label, span, *_ in spans:
             mine.setdefault(label, []).append((label, span))
         for label, segments in mine.items():
             if by_label.setdefault(label, segments) != segments:
