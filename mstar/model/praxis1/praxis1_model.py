@@ -57,6 +57,7 @@ from mstar.model.base import (
     WalkStep,
 )
 from mstar.model.media_limits import read_image
+from mstar.model.praxis1.components.pose_frames import pose_to_model
 from mstar.model.praxis1.components.proprio import normalized_proprio
 from mstar.model.praxis1.config import Praxis1Config, Praxis1ConfigError
 from mstar.model.praxis1.submodules import (
@@ -91,7 +92,7 @@ class Praxis1Model(Model):
 
     ENCODE_TEXT_WALK = "encode_text"
     CHUNK_WALK = "chunk"
-    PREPROCESS_ONLY_KWARGS = (STATE_KWARG,)
+    PREPROCESS_ONLY_KWARGS = (STATE_KWARG, "pose_descriptor")
 
     def __init__(
         self,
@@ -389,7 +390,8 @@ class Praxis1Model(Model):
 
         task_ids, task_mask = encode(task)
         blank_ids, blank_mask = encode(blank)
-        proprio = normalized_proprio(robot_state, self.config.embodiment, self.config.normalization)
+        model_pose = pose_to_model(robot_state, self.config.embodiment, kwargs.get("pose_descriptor", ""))
+        proprio = normalized_proprio(model_pose, self.config.embodiment, self.config.normalization)
         return ProcessPromptOutput(
             new_input_tensors={
                 "text_ids": [task_ids],

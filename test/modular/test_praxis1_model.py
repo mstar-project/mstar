@@ -158,6 +158,7 @@ def test_the_rig_decides_the_wire():
     """The cold reply trims the anchor token while keeping checkpoint widths."""
     droid = Praxis1Config.from_dict(DROID_CONFIG)
     assert droid.views == ("exterior", "wrist")
+    assert droid.pose_frame == "flange"
     assert (droid.action_dim, droid.action_horizon) == (10, 21)
     # Six tokens carry 24 subframes, but the depth-0 anchor contributes one row.
     assert droid.action_tokens == 6
@@ -165,8 +166,12 @@ def test_the_rig_decides_the_wire():
 
     yam = Praxis1Config.from_dict(_yam_config())
     assert yam.views == ("top_left", "wrist_left", "wrist_right")
+    assert yam.pose_frame == "rig"
     assert (yam.action_dim, yam.action_horizon) == (20, 21)
     assert yam.action_patch_dim == 80
+
+    with pytest.raises(Praxis1ConfigError, match="pose_frame"):
+        Praxis1Config.from_dict({**DROID_CONFIG, "pose_frame": "rig"})
 
 
 @pytest.mark.parametrize(
