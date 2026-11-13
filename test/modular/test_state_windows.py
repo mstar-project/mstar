@@ -90,7 +90,7 @@ def _read(mask, **fields) -> Read:
 @pytest.mark.parametrize(("make", "message"), [
     (lambda: Bidirectional(kept_window=1), "Bidirectional.kept_window must be a bool, got 1"),
     (lambda: KeptWindow(-1, window=4), "KeptWindow.sink must be an int >= 0, got -1"),
-    (lambda: KeptWindow(2, window=-1), "KeptWindow.window must be an int >= 0, got -1"),
+    (lambda: KeptWindow(2, window=-1), "KeptWindow.window must be an int >= 1, got -1"),
     (lambda: KeptWindow(2.0, window=4), "KeptWindow.sink must be an int >= 0, got 2.0"),
     (lambda: KeptWindow(True, window=4), "KeptWindow.sink must be an int >= 0, got True"),
     (lambda: FrameWindow(0, frames=16), "FrameWindow.tokens must be a positive int, got 0"),

@@ -509,10 +509,10 @@ class KeptWindow:
     window: int
 
     def __post_init__(self):
-        for name in ("sink", "window"):
+        for name, least in (("sink", 0), ("window", 1)):
             value = getattr(self, name)
-            if not (type(value) is int and value >= 0):
-                raise ValueError(f"KeptWindow.{name} must be an int >= 0, got {value!r}")
+            if not (type(value) is int and value >= least):
+                raise ValueError(f"KeptWindow.{name} must be an int >= {least}, got {value!r}")
 
 
 @dataclass(frozen=True, kw_only=True)
