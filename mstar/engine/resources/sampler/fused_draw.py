@@ -1,10 +1,10 @@
 """`_fused_sample_kernel`'s draw of one row as a Gluon device function, for a kernel that draws in place
 (`SamplerResource.fused_draw_args`).
 
-Same code and the same 4-warp layout of a 2048-wide row as that kernel's ([8] per thread, 32 lanes, 4 warps), so
-every reduction and the scan run in the same order and the drawn token is the same, bit for bit: the cuts compare
-the probabilities' full float32 bits, as that kernel's do. No repetition penalty: a step with one gets no fused draw
-arguments.
+Same code and the same layout of a row up to `FUSED_DRAW_MAX_VOCAB` wide as that kernel's ([8] per thread, 32 lanes,
+`FUSED_DRAW_WARPS` warps), so every reduction and the scan run in the same order and the drawn token is the same, bit
+for bit: the cuts compare the probabilities' full float32 bits, as that kernel's do. No repetition penalty: a step
+with one gets no fused draw arguments.
 """
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ import triton.language as tl
 from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 
-from mstar.engine.resources.sampler.utils import _kth_largest_bits
+from mstar.engine.resources.sampler.utils import FUSED_DRAW_WARPS, _kth_largest_bits
 
 
 @gluon.jit
@@ -30,7 +30,7 @@ def _argmax_tie_break_left(value1, index1, value2, index2):
 
 def layout():
     """Not frozen yet, like the rest of the fused draw. The layout `draw_row` takes as ``LAY``."""
-    return gl.BlockedLayout([8], [32], [4], [0])
+    return gl.BlockedLayout([8], [32], [FUSED_DRAW_WARPS], [0])
 
 
 @gluon.jit

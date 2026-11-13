@@ -35,6 +35,7 @@ mod protocol;
 mod realtime;
 mod refusals;
 mod served_models;
+mod lora_admin;
 mod serving;
 mod sndfile;
 mod speech_chunking;
@@ -155,6 +156,9 @@ async fn main() {
         realtime::report_availability();
     }
     let served = Arc::new(served_models::ServedModels::from_env(&model_name));
+    if let Some(bridge) = &bridge {
+        bridge.serve_models(served.clone());
+    }
 
     let refusals = Arc::new(refusals::Refusals::default());
     let state = AppState {
@@ -216,6 +220,9 @@ async fn main() {
         .route("/health", get(health))
         .route("/metrics", get(metrics))
         .route("/v1/models", get(list_models))
+        // LoRA's runtime updates: no generation, outside the admission cap
+        .route("/v1/load_lora_adapter", post(lora_admin::load_lora_adapter))
+        .route("/v1/unload_lora_adapter", post(lora_admin::unload_lora_adapter))
         .route("/v1/audio/voices", get(audio_voices))
         // long-lived sockets: outside the admission cap, as on the Python frontend
         .route("/", any(ws::openpi::openpi_ws))
@@ -260,6 +267,7 @@ async fn main() {
         .with_graceful_shutdown(shutdown_signal())
         .await
         .unwrap();
+    transcription::remove_local_uploads();
 }
 
 /// SIGTERM/SIGINT: stop accepting, drain in-flight requests, exit — with a
@@ -282,6 +290,7 @@ async fn shutdown_signal() {
     tokio::spawn(async {
         tokio::time::sleep(std::time::Duration::from_secs(30)).await;
         eprintln!("mstar-server: drain deadline reached, exiting");
+        transcription::remove_local_uploads();
         std::process::exit(0);
     });
 }

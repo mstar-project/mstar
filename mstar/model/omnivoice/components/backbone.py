@@ -34,8 +34,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from mstar.engine.resources.rms_norm import run_rms_norm
-from mstar.model.components.norm import add_rms_norm
+from mstar.model.components.norm import add_rms_norm, run_rms_norm
 from mstar.utils.h2d import to_device_nonblocking
 
 logger = logging.getLogger(__name__)
@@ -244,7 +243,7 @@ class OmniVoiceBackbone(nn.Module):
     Holding the reference instance keeps the embedding merge, the audio head
     reshape and the fused weights the upstream ones. ``encode`` runs the layer
     stack over them itself (see the module docstring), with attention through
-    the engine's ragged attention resource.
+    the ``attend`` it is given.
     """
 
     def __init__(self, model: nn.Module):
@@ -265,14 +264,13 @@ class OmniVoiceBackbone(nn.Module):
         input_ids: torch.Tensor,
         audio_mask: torch.Tensor,
         pos_ids: torch.Tensor,
-        attn,
+        attend,
     ) -> torch.Tensor:
         """Embeddings and the Qwen3 body over one packed row: ``[N, hidden]``.
 
         Token-major inputs (``input_ids`` ``[N, C]``, the rest ``[N]``, ``pos_ids``
         int32) so a captured replay can copy a shorter row into its bucket.
-        ``attn`` is the engine's ragged attention resource, planned for this
-        row's documents.
+        ``attend(layer, q, k, v)`` attends within this row's documents.
         """
         import flashinfer
 
@@ -281,7 +279,7 @@ class OmniVoiceBackbone(nn.Module):
         )[0]
         llm = self.model.llm
         residual = None
-        for layer in llm.layers:
+        for i, layer in enumerate(llm.layers):
             sa, mlp = layer.self_attn, layer.mlp
             norm = layer.input_layernorm
             if residual is None:
@@ -301,7 +299,7 @@ class OmniVoiceBackbone(nn.Module):
             flashinfer.rope.apply_rope_pos_ids_inplace(
                 q, k, pos_ids, rope_theta=sa._fi_rope_theta, interleave=False,
             )
-            hidden = sa.o_proj(attn.run(q, k, qkv[:, heads_q + heads_k:]).reshape(n, -1))
+            hidden = sa.o_proj(attend(i, q, k, qkv[:, heads_q + heads_k:]).reshape(n, -1))
             norm = layer.post_attention_layernorm
             x, residual = add_rms_norm(hidden, residual, norm.weight, norm.variance_epsilon)
             hidden = mlp.down_proj(flashinfer.activation.silu_and_mul(F.linear(x, mlp._fi_w_gate_up)))

@@ -51,6 +51,14 @@ def test_warmup_requests_run_as_generate_requests(caplog) -> None:
     assert caplog.text.count("done in") == 3
 
 
+def test_a_warmup_whose_output_only_streams_is_submitted_streaming() -> None:
+    """The server refuses raw frames on a request that doesn't stream, and the warmup still waits for the end."""
+    fake = _FakeServer()
+    entrypoint._run_warmup_requests(fake, [{"text": "a street", "output_modalities": ["video_frame"]}])
+    (req,) = fake.submitted
+    assert req["streaming"] is True and fake.collected == [req["request_id"]]
+
+
 def test_warmup_files_of_any_modality_keep_prompt_order() -> None:
     fake = _FakeServer()
     spec = {

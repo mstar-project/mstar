@@ -2,7 +2,7 @@
 
 Hardcodes the published 720P/360P checkpoint manifests so constructing the
 model never touches the network. Attention geometry is per-layer heterogeneous
-(local vs. global window; see ``global_layers`` / ``ring_frames``), and each
+(local vs. global window; see ``global_layers``), and each
 frame costs 4 non-committing Euler passes plus 1 committing pass that writes
 the settled K/V into the ring.
 """
@@ -154,12 +154,6 @@ class WaypointConfig:
     auto_aspect_ratio: bool = True
 
     # Port-local knobs (not checkpoint facts)
-    # Reference over-allocates global-layer ring storage 8x (only
-    # global_window // global_pinned_dilation frame slots are ever addressed);
-    # compacting it is bit-exact. True restores the reference's allocation for
-    # an A/B parity run.
-    full_global_ring: bool = False
-
     # Reference's NoCastModule casts held tensors to dtype and back, so derived
     # fp32 tables (rope angles, sigma LUT) are served bf16-quantized. True
     # reproduces that rounding (what the parity gate compares against); False
@@ -183,7 +177,7 @@ class WaypointConfig:
     capture_dit_prime: bool = True
 
     # Rows carried per rollout step, one per resident world sharing the DiT
-    # forward. Must be <= resources.kv.num_sessions (checked at YAML-load time).
+    # forward. Must be <= max_concurrent_requests (checked at YAML-load time).
     step_batch_size: int = 1
 
     # Guard rails: a drifting checkpoint fails loudly here instead of silently
@@ -381,39 +375,6 @@ class WaypointConfig:
 
     def is_global_layer(self, layer_idx: int) -> bool:
         return layer_idx in self.global_layers
-
-    def pinned_dilation(self, layer_idx: int) -> int:
-        """Frame stride this layer retains history at (8 global, 1 local)."""
-        return self.global_pinned_dilation if self.is_global_layer(layer_idx) else 1
-
-    def ring_frames(self, layer_idx: int) -> int:
-        """Number of frame slots in this layer's ring.
-
-        Local: 16 consecutive frames. Global: 16 slots holding frames 8 apart,
-        spanning 128 frames. ``full_global_ring`` restores the reference's
-        8x-oversized global allocation, whose extra slots are unreachable.
-        """
-        if not self.is_global_layer(layer_idx):
-            return self.local_window
-        if self.full_global_ring:
-            return self.global_window
-        return self.global_window // self.global_pinned_dilation
-
-    def ring_buckets(self, layer_idx: int) -> int:
-        """Addressable ring slots. Equals ``ring_frames`` unless
-        ``full_global_ring`` is set, in which case it is 8x smaller."""
-        if not self.is_global_layer(layer_idx):
-            return self.local_window
-        return self.global_window // self.global_pinned_dilation
-
-    def kv_capacity(self, layer_idx: int) -> int:
-        """Total KV slots for this layer, in tokens.
-
-        ``ring + one scratch frame``. The scratch frame at the tail is where a
-        frozen denoise pass parks its K/V so the current frame can attend to
-        itself; permanently visible, overwritten every forward.
-        """
-        return (self.ring_frames(layer_idx) + 1) * self.tokens_per_frame
 
 
 def waypoint_1_5_1b_720p() -> WaypointConfig:

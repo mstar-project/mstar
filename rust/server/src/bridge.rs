@@ -187,6 +187,9 @@ struct Inbound {
     payloads: Vec<serde_bytes::ByteBuf>,
     #[serde(default)]
     metadatas: Vec<Value>,
+    // t == "served": the API server's served LoRA adapters, after a change
+    #[serde(default)]
+    adapters: Option<Vec<String>>,
 }
 
 struct Route {
@@ -270,6 +273,8 @@ pub struct Bridge {
     mbox: Arc<RawZmqCommunicator>,
     routes: Arc<Routes>,
     next_sub: AtomicU64,
+    /// Where the API server's `served` pushes land (`Bridge::serve_models`).
+    served: Arc<std::sync::OnceLock<Arc<crate::served_models::ServedModels>>>,
 }
 
 impl Bridge {
@@ -283,12 +288,25 @@ impl Bridge {
 
         let mbox_r = mbox.clone();
         let routes_r = routes.clone();
-        std::thread::spawn(move || Self::demux_loop(mbox_r, routes_r));
+        let served = Arc::new(std::sync::OnceLock::new());
+        let served_r = served.clone();
+        std::thread::spawn(move || Self::demux_loop(mbox_r, routes_r, served_r));
 
-        Ok(Self { mbox, routes, next_sub: AtomicU64::new(1) })
+        Ok(Self { mbox, routes, next_sub: AtomicU64::new(1), served })
     }
 
-    fn demux_loop(mbox: Arc<RawZmqCommunicator>, routes: Arc<Routes>) {
+    /// Keep `served` up to date with the API server's served LoRA adapters, which
+    /// it pushes after every change: a runtime load or unload, and a conductor's
+    /// answer that arrived after its request timed out.
+    pub fn serve_models(&self, served: Arc<crate::served_models::ServedModels>) {
+        let _ = self.served.set(served);
+    }
+
+    fn demux_loop(
+        mbox: Arc<RawZmqCommunicator>,
+        routes: Arc<Routes>,
+        served: Arc<std::sync::OnceLock<Arc<crate::served_models::ServedModels>>>,
+    ) {
         loop {
             let Some(payload) = mbox.recv_timeout(Duration::from_millis(500)) else {
                 continue;
@@ -306,6 +324,12 @@ impl Bridge {
                     continue;
                 }
             };
+            if msg.t == "served" {
+                if let (Some(adapters), Some(served)) = (msg.adapters, served.get()) {
+                    served.set_adapters(adapters);
+                }
+                continue;
+            }
             deliver(&routes, msg);
         }
     }
@@ -427,6 +451,30 @@ impl Bridge {
     pub async fn voices(&self, timeout: Duration) -> Result<Option<Value>, (u16, String)> {
         match self.round_trip("voices", Extras::default(), timeout).await {
             Some(StreamItem::Chunk(mut chunk)) => Ok(chunk.metadata.get_mut("voices").map(Value::take)),
+            Some(StreamItem::Error { status, message, .. }) => Err((status, message)),
+            _ => Err((503, "backend bridge unreachable".to_string())),
+        }
+    }
+
+    /// `/v1/load_lora_adapter` (`op` "load", with `lora_path`) or
+    /// `/v1/unload_lora_adapter` ("unload"): the API server's `LoraAdmin` call,
+    /// its text or the `(status, message)` the Python route answers with.
+    pub async fn lora(&self, op: &str, name: &Value, path: Option<&Value>, timeout: Duration) -> Result<String, (u16, String)> {
+        let mut args = serde_json::Map::new();
+        args.insert("op".into(), Value::from(op));
+        args.insert("lora_name".into(), name.clone());
+        if let Some(path) = path {
+            args.insert("lora_path".into(), path.clone());
+        }
+        match self.round_trip("lora", Extras { op: Some(&args), ..Extras::default() }, timeout).await {
+            Some(StreamItem::Chunk(chunk)) => match (chunk.metadata.get("text"), chunk.metadata.get("error")) {
+                (Some(Value::String(text)), _) => Ok(text.clone()),
+                (_, Some(error)) => Err((
+                    error.get("status").and_then(Value::as_u64).unwrap_or(500) as u16,
+                    error.get("message").and_then(Value::as_str).unwrap_or_default().to_string(),
+                )),
+                _ => Err((500, "the API server's LoRA admin gave no answer".to_string())),
+            },
             Some(StreamItem::Error { status, message, .. }) => Err((status, message)),
             _ => Err((503, "backend bridge unreachable".to_string())),
         }
@@ -582,7 +630,7 @@ fn deliver(routes: &Routes, msg: Inbound) {
             Some(message) => (Some(StreamItem::Error { status: msg.status.unwrap_or(400), message, refused: false }), true),
             None => (Some(StreamItem::Done), true),
         },
-        "metrics" | "voices" | "windows" | "live" | "end_of_turn" => (
+        "metrics" | "voices" | "windows" | "live" | "end_of_turn" | "lora" => (
             Some(StreamItem::Chunk(ResultChunk {
                 modality: msg.t,
                 data: msg.data.into_vec(),

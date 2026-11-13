@@ -74,9 +74,14 @@ def _opened_step(kv: KVManager, lengths: dict[int, int]) -> ArrayHandle:
     step = KVStep(segments=segments)
     assert kv.admit(step, ctx).ok
     kv.plan(step, ctx)
-    array = _array()
     # the read hands back its q, so conformance compares what an op that reads passes to its read
-    resources = {"kv": kv, "attn": SimpleNamespace(requires_kv_write=True, run=lambda q, **kwargs: q.clone())}
+    array = _array()
+    resources = {
+        "kv": kv,
+        "attn": SimpleNamespace(
+            requires_kv_write=True, reads_step_kv=lambda label=None: False, run=lambda q, **kwargs: q.clone()
+        ),
+    }
     handle = build_handle(array, resources, _resolve([array], StateSetup()))
     bind_state_ops({"kv": handle})
     contract_step = SubmoduleStep(segments=segments, state={"kv": ArrayStep()})

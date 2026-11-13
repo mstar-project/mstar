@@ -71,7 +71,6 @@ from typing import TYPE_CHECKING, NamedTuple
 import numpy as np
 import torch
 
-from mstar.distributed.base import PARALLEL_AXES
 from mstar.engine.resources.base import CGSlotKey, EngineResourceInfo, Resource
 from mstar.engine.resources.lora.backend import LoraBackend, make_backend
 from mstar.engine.resources.lora.config import (
@@ -360,16 +359,16 @@ class LoraAdapterPool(Resource):
         rank, world_size, agree, decides = 0, 1, None, True
         joint = info.joint_comm_group
         if joint is not None:
-            # its rows are laid out per request over the whole batch; every axis but TP
-            # (cfg branches, sp token shards) hands each rank only part of it
-            for axis in PARALLEL_AXES:
-                if axis != "tp" and (size := getattr(joint, f"{axis}_group").world_size) > 1:
-                    raise ValueError(
-                        f"LoRA resource {spec.resource_key!r} serves a node at {axis}_size {size}, "
-                        "which LoRA does not support: its rows are laid out per request over the "
-                        f"whole batch, while each {axis.upper()} rank runs only part of it. Serve "
-                        f"this node at {axis}_size 1, or drop the 'lora:' block"
-                    )
+            # its rows are laid out per request over the whole batch, which each CFG rank runs only
+            # part of; every SP rank runs every row, as a node splitting its steps over them is
+            # refused (`LoraSpec.split_step_refusals`)
+            if (size := joint.cfg_group.world_size) > 1:
+                raise ValueError(
+                    f"LoRA resource {spec.resource_key!r} serves a node at cfg_size {size}, "
+                    "which LoRA does not support: its rows are laid out per request over the "
+                    "whole batch, while each CFG rank runs only part of it. Serve "
+                    "this node at cfg_size 1, or drop the 'lora:' block"
+                )
             # the base linears split over the TP group
             rank, world_size = joint.tp_group.rank, joint.tp_group.world_size
             if joint.world_size > 1:
@@ -1187,6 +1186,12 @@ class LoraAdapterPool(Resource):
     def force_double_buffer(self):
         # each plan stages its addressing into a buffer a replay reads
         return True
+
+    def resident_refusal(self) -> str | None:
+        # never holds a node back: its addressing comes from the step's segments and
+        # this pool's own slots, not from a plan a resident step skips, so a resident
+        # step plans it on the host as any other (memoized for a steady batch)
+        return None
 
     # Engine lifecycle
 

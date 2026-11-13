@@ -121,7 +121,7 @@ def _asr_reference(model) -> list:
     text, audio = model.config.text, model.config.audio
     return [
         RaggedAttentionSpec(
-            resource_key="aut_attn", nodes={"audio_encoder"},
+            resource_key="aut_attn", nodes={"audio_encoder"}, labels={"main"},
             config=RaggedAttentionConfig(
                 num_qo_heads=audio.encoder_attention_heads, num_kv_heads=audio.encoder_attention_heads,
                 head_dim=audio.head_dim, max_segments_per_request=model.max_windows_per_request,
@@ -325,7 +325,7 @@ def test_every_published_config_of_the_five_is_covered():
     assert stems == {
         "canary_qwen", "qwen3_asr", "qwen3_asr_split", "qwen3_asr_realtime", "qwen3_asr_realtime_split", "parakeet",
         "nemotron_asr", "fish_s2_pro", "qwen3tts", "qwen3tts_split", "qwen3tts_1p7b", "qwen3tts_1p7b_split",
-        "qwen3tts_base", "qwen3tts_voicedesign",
+        "qwen3tts_base", "qwen3tts_base_split", "qwen3tts_voicedesign",
     }, "a config here that the port never compares would change with no test noticing"
 
 

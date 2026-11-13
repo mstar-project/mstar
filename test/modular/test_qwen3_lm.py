@@ -7,6 +7,8 @@ accumulated K/V with GQA, and textbook RoPE), so one prefill plus a few decode
 steps are compared logit for logit, on either path.
 """
 
+import sys
+import types
 from types import SimpleNamespace
 
 import pytest
@@ -18,6 +20,7 @@ pytest.importorskip("transformers")
 from transformers import Qwen3Config, Qwen3ForCausalLM  # noqa: E402
 
 from mstar.distributed.communication import CommGroup  # noqa: E402
+from mstar.engine.resources.convenience import AttentionCallable  # noqa: E402
 from mstar.engine.resources.step import Segment, StepContext, SubmoduleStep  # noqa: E402
 from mstar.engine.state import (  # noqa: E402
     Array,
@@ -229,6 +232,31 @@ def test_layer_stack_runs_one_compiled_frame_per_layer_besides_attention(dynamo_
     assert extra <= 2 * (dynamo_counts(one_layer, x).graph_calls + 1)
 
 
+def test_an_attention_on_its_array_compiles_only_the_frames_around_its_state_op(dynamo_counts):
+    """``one_layer`` compiles as two frames around `_next_step`, and the attention's forward as two around its state
+    op. Its graph and resume counts stay the same with a helper method between the two, so only the frames show it."""
+    _, one_layer = _frames_on_its_array(2)
+    compiles = dynamo_counts(one_layer, torch.randn(3, TINY["hidden_size"])).compiles
+    assert compiles <= 4, f"{compiles} frames compiled for one layer, against 4"
+
+
+def test_an_attention_that_stays_out_of_the_op_compiles_only_the_frames_around_add_read(dynamo_counts):
+    """A rope the kernel doesn't compute leaves the layer on ``ParallelAttention.forward``. ``one_layer`` compiles as
+    two frames around `_next_step`, the layer's forward as one that hands over to the stock forward, and the stock
+    forward as two around `add_read`. An `add` and a `read` there would break once each, and compile a sixth frame."""
+    rope = Rope(theta=1e4, rotary_dim=TINY["head_dim"], interleave=True, table_dtype=torch.bfloat16)
+    _, ours, handle, pos = _on_state(rope)
+    # the stand-in counts its rotations on itself, which a compiled frame would guard on and recompile for
+    pos.apply_qk = lambda q, k, label, rope_dtype: (q, k)
+
+    def one_layer(h):
+        _next_step(handle, 3)
+        return ours.layers[0].self_attn(h)
+
+    compiles = dynamo_counts(one_layer, torch.randn(3, TINY["hidden_size"])).compiles
+    assert compiles <= 5, f"{compiles} frames compiled for one layer, against 5"
+
+
 def test_an_empty_layer_stack_is_the_final_norm():
     from mstar.model.components import RMSNorm
     from mstar.model.components.decoder_layer import run_layers
@@ -311,6 +339,9 @@ class _FakePages(_FakeKVAttention):
 
     def opens_label(self, rid, label):
         return True
+
+    def reads_step_kv(self, label=None):
+        return False
 
     def write_kv(self, k, v, layer_idx=None, label=None):
         self._pending = (k, v)
@@ -513,3 +544,32 @@ def test_a_second_compiled_step_compiles_nothing_new():
     with torch.compiler.set_stance("fail_on_recompile"):
         compiled(embeds)
     assert len(frames) == first_call, "a capture's stance raises on any new compile"
+
+
+@pytest.mark.parametrize("splits", [False, True])
+def test_a_layer_whose_steps_may_split_writes_its_kv_through_the_exchange(monkeypatch, splits):
+    """The fused norm/RoPE/KV-write kernel writes where ``write_target`` says, outside the
+    exchange a node whose steps may split over SP ranks attends through (which hands the write
+    this rank's tokens and heads), so such a layer rotates in place and calls ``attend``."""
+    calls = []
+    monkeypatch.setitem(sys.modules, "mstar.utils.attention", types.SimpleNamespace(
+        qk_norm_rope_inplace=lambda *args: calls.append("rotate"),
+        qk_norm_rope_kv_write=lambda *args: calls.append("fused_write"),
+    ))
+
+    class Attend:
+        # Ulysses' plan states attend only the pages: reads_step_kv is False
+        attn = types.SimpleNamespace(reads_step_kv=lambda: False, run=lambda q, kv_cache_layer: q)
+        kv = types.SimpleNamespace(write_target=lambda: (None, None, None, 4), layer_view=lambda: None)
+
+        def _exchanges(self):
+            return splits
+
+        def __call__(self, q, k, v):
+            calls.append("attend")
+            return q
+
+    norm = types.SimpleNamespace(variance_epsilon=1e-6, weight=None)
+    x = torch.zeros(4, 2, 8)
+    AttentionCallable.norm_rope_attend(Attend(), x, x, x, norm, norm, None, 1e6)
+    assert calls == (["rotate", "attend"] if splits else ["fused_write"])

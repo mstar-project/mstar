@@ -1011,8 +1011,9 @@ class FlowSubmodule(NodeSubmodule):
             for rid, span in zip(request_ids, spans, strict=True)
         )
         return SubmoduleStep(
+            combined_labels={labels: FLOW_CFG_LABEL},
             steps={
-                FLOW_KV: KVStep(segments=kv_segments, commit=True, combined_labels={labels: FLOW_CFG_LABEL}),
+                FLOW_KV: KVStep(segments=kv_segments, commit=True),
                 FLOW_ATTN: AttentionStep(segments=kv_segments, causal=False),
                 FLOW_TAILS: RecurrentStep(
                     segments=tuple(

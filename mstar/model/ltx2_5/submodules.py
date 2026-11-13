@@ -25,10 +25,12 @@ from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.engine.state import gather, scatter
 from mstar.model.components.batched_rows import BatchedRows
 from mstar.model.components.diffusion.compile_utils import compile_transformer_forward, with_inductor_rounding
 from mstar.model.components.diffusion.denoise_loop import DenoiseLoopSubmodule
 from mstar.model.components.diffusion.flow_match import FlowMatchSchedule, euler_step
+from mstar.model.ltx2_5.components.layers import RotaryTable
 from mstar.model.ltx2_5.components.transformer import build_rope
 from mstar.model.ltx2_5.config import (
     AUDIO,
@@ -41,6 +43,7 @@ from mstar.model.ltx2_5.config import (
     TEXT_SPAN,
     VIDEO,
     VIDEO_FOR_AUDIO,
+    VIDEO_SHARD,
     VIDEO_SPAN,
     LTX25Config,
 )
@@ -232,6 +235,12 @@ class LTXDenoiseSubmodule(DenoiseLoopSubmodule):
             # step's kernel time at 544x960x121) around the GEMMs and attention; one static
             # graph per shape, which the captured graphs then record.
             compile_transformer_forward(transformer, eager_rounding=compile_eager_rounding)
+        # the node's sequence shard, which brackets the DiT (`bind_state`)
+        self.shard = None
+
+    def bind_state(self, handles) -> None:
+        """The node's sequence shard. See ``NodeSubmodule.bind_node_state``."""
+        self.shard = handles.get(VIDEO_SHARD)
 
     # hooks -----------------------------------------------------------------
     def bucket_key_for(self, fwd_info: CurrentForwardPassInfo) -> LTXShape:
@@ -305,10 +314,19 @@ class LTXDenoiseSubmodule(DenoiseLoopSubmodule):
         audio_latents, text_video, text_audio, **cond,
     ):
         dtype = self.transformer.dtype
+        rope = self.layout(bucket_key, latents.device)
+        # on a step the sequence shard splits, the DiT runs on this rank's share of each
+        # row's video tokens (the scatter is the identity otherwise)
+        shard = self.shard
+        video = latents
+        if shard is not None:
+            video, *tables = scatter(shard, latents, *rope.video, *rope.cross_video)
+            rope = rope._replace(video=RotaryTable(*tables[:2]), cross_video=RotaryTable(*tables[2:]))
         velocity, audio_velocity = self.transformer(
-            latents.to(dtype), audio_latents.to(dtype), text_video, text_audio, timestep,
-            self.layout(bucket_key, latents.device),
+            video.to(dtype), audio_latents.to(dtype), text_video, text_audio, timestep, rope,
         )
+        if shard is not None:
+            velocity = gather(shard, velocity)
         return {
             LATENTS: ltx_step(latents, velocity, sigma, sigma_next),
             AUDIO_LATENTS: ltx_step(audio_latents, audio_velocity, sigma, sigma_next),

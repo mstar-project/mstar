@@ -186,6 +186,17 @@ def librosa_mel_filters(
     return weights
 
 
+def reflect_pad_index(lengths: torch.Tensor, width: int, pad: int) -> torch.Tensor:
+    """Gather index ``[B, width + 2 * pad]`` that reflect-pads each row's first
+    ``lengths`` positions of a ``width``-wide buffer by ``pad`` on both sides,
+    as ``F.pad(mode="reflect")`` pads the unpadded row. Past a row's padding
+    it reads clamped positions, so it stays finite whatever fills them."""
+    position = torch.arange(-pad, width + pad, device=lengths.device).abs()
+    last = (lengths - 1).unsqueeze(1)
+    index = torch.where(position > last, 2 * last - position, position)
+    return index.clamp(0, width - 1)
+
+
 class MatchaLogMel(nn.Module):
     """The Matcha/CosyVoice log-mel, ``[B, T] -> [B, num_mels, F]``.
 
@@ -208,10 +219,17 @@ class MatchaLogMel(nn.Module):
         self.register_buffer("window", torch.hann_window(win_size), persistent=False)
         self.pad = (n_fft - hop_size) // 2
 
-    def forward(self, wav: torch.Tensor) -> torch.Tensor:
+    def forward(self, wav: torch.Tensor, lengths: torch.Tensor | None = None) -> torch.Tensor:
+        """``lengths`` ([B] samples): rows zero-padded to one width, each
+        reflect-padded about its own end rather than the batch's, so a row's
+        first ``num_frames(length)`` frames are its unpadded mel and the
+        frames past them are padding."""
         if wav.dim() == 1:
             wav = wav[None]
-        wav = F.pad(wav.unsqueeze(1), (self.pad, self.pad), mode="reflect").squeeze(1)
+        if lengths is None:
+            wav = F.pad(wav.unsqueeze(1), (self.pad, self.pad), mode="reflect").squeeze(1)
+        else:
+            wav = wav.gather(1, reflect_pad_index(lengths, wav.shape[-1], self.pad))
         spec = torch.stft(
             wav, self.n_fft, hop_length=self.hop_size, win_length=self.win_size, window=self.window,
             center=False, pad_mode="reflect", normalized=False, onesided=True, return_complex=True,
@@ -334,9 +352,14 @@ class NemoLogMel:
         pad = self.n_fft // 2
         device = self.window.device
         source = waveforms[0].device
-        # host clips are padded straight into pinned memory: one copy to the device
+        # host clips are padded straight into pinned memory: one copy to the device.
+        # The width is rounded up to whole seconds: cuFFT builds a plan per
+        # (rows, frames) shape (~6 ms on an H100), and at the exact width the
+        # frames were new on almost every served batch. Frames past each clip's
+        # end are cut below
         pin = source.type == "cpu" and DeviceCapability.of(device).pin_memory
-        x = torch.zeros(len(waveforms), max(lengths), dtype=torch.float32, device=source, pin_memory=pin)
+        width = -(-max(lengths) // self.sampling_rate) * self.sampling_rate
+        x = torch.zeros(len(waveforms), width, dtype=torch.float32, device=source, pin_memory=pin)
         for row, w in enumerate(waveforms):
             x[row, :lengths[row]] = w.reshape(-1)
         x = to_device_nonblocking(x, device)
@@ -461,6 +484,25 @@ def load_speech_file(path: str, sample_rate: int, max_seconds: float) -> torch.T
     with decoding_upload(path, "the audio", ffmpeg=True):
         waveform, rate = _decode(path, sample_rate, max_seconds)
     return _resample(waveform, rate, sample_rate)
+
+
+def speech_file_rate(path: str) -> int | None:
+    """The upload's own sample rate, from its header (libsndfile's, else FFmpeg's
+    through torchcodec), before anything decodes; None where neither reads it, which
+    `load_speech_file` then refuses. For a model whose front end depends on it."""
+    try:
+        import soundfile
+
+        return int(soundfile.info(path).samplerate)
+    except Exception:  # noqa: BLE001 — not a libsndfile container; ask FFmpeg
+        pass
+    try:
+        from torchcodec.decoders import AudioDecoder
+
+        rate = AudioDecoder(path).metadata.sample_rate
+    except Exception:  # noqa: BLE001 — undecodable: the decode reports it
+        return None
+    return None if rate is None else int(rate)
 
 
 def load_reference_clip(

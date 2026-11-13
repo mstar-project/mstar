@@ -19,6 +19,7 @@ import json
 import math
 import sys
 import time
+import types
 from pathlib import Path
 
 import numpy as np
@@ -136,6 +137,7 @@ def _inexact(entry, key: str = "") -> list[str]:
 def run(args, report: dict, failures: list[str]) -> None:
 
     import mstar
+    from mstar.engine.resources.sequence_shard import SequenceShard
     from mstar.engine.resources.step import StepContext
     from mstar.engine.state.adapters import node_handles, state_setup
     from mstar.model.minimax_h3 import weight_loader
@@ -146,7 +148,14 @@ def run(args, report: dict, failures: list[str]) -> None:
         unpatchify_video,
     )
     from mstar.model.minimax_h3.components.transformer import H3Inputs
-    from mstar.model.minimax_h3.config import DIT_ATTN, DIT_NODE, KEYFRAME_NOISE_AUG, REFINER_ATTN, TEXT_ENCODER_NODE
+    from mstar.model.minimax_h3.config import (
+        DIT_ATTN,
+        DIT_NODE,
+        DIT_SHARD,
+        KEYFRAME_NOISE_AUG,
+        REFINER_ATTN,
+        TEXT_ENCODER_NODE,
+    )
     from mstar.model.minimax_h3.keyframes import ANCHORS, vision_spans
     from mstar.model.minimax_h3.minimax_h3_model import H3Model
     from mstar.model.minimax_h3.schedule import h3_schedule, h3_step
@@ -296,7 +305,8 @@ def run(args, report: dict, failures: list[str]) -> None:
     if stages & {"dit", "loop"}:
         dit = weight_loader.build_transformer(config, args.snapshot, dev)
         sub = H3DenoiseSubmodule(dit, config, loop_name="denoise_loop")
-        sub.bind_node_state(node_handles(model, DIT_NODE, {}, setup=on_sdpa))
+        one_rank = SequenceShard(("main",), 0, None, 0, types.SimpleNamespace(world_size=1))
+        sub.bind_node_state(node_handles(model, DIT_NODE, {DIT_SHARD: one_rank}, setup=on_sdpa))
         step_layout = sub.build_layout(layout, dev)
         sched = h3_schedule(request["num_inference_steps"], request["video_shift"], request["audio_shift"])
         text = text_rows.to(dev)

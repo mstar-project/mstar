@@ -45,6 +45,15 @@ def test_a_non_contiguous_input_is_copied_correctly(accelerator_device):
     assert torch.equal(got.cpu(), tensor)
 
 
+def test_a_numpy_array_is_staged_through_pinned_memory(accelerator_device):
+    """torch.tensor(ndarray, pin_memory=True) raises, so an array (a plan's token indices)
+    goes through the tensor path; the CPU device never pins, so only this case catches it."""
+    array = np.arange(12, dtype=np.int32).reshape(3, 4)[:, ::2]
+    got = to_device_nonblocking(array, accelerator_device, torch.int64)
+    torch.accelerator.synchronize(accelerator_device)
+    assert got.dtype == torch.int64 and torch.equal(got.cpu(), torch.from_numpy(array.copy()).long())
+
+
 def test_an_empty_tensor_arrives_with_its_shape(accelerator_device):
     got = to_device_nonblocking(torch.empty(0, 3), accelerator_device)
     assert got.shape == (0, 3) and got.device == accelerator_device

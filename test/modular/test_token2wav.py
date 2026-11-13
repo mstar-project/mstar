@@ -17,7 +17,8 @@ import os
 import pytest
 import torch
 
-from mstar.model.minicpm_o.components.token2wav import (
+from mstar.model.components.token2wav.keys import Token2WavKeys
+from mstar.model.components.token2wav.model import (
     HIFT_MEL_CACHE,
     HIFT_TAIL,
     KEEP_RECENT,
@@ -34,7 +35,11 @@ from mstar.model.minicpm_o.components.token2wav import (
     window_frames,
     window_tokens,
 )
-from mstar.model.minicpm_o.components.voice_prompt import VoicePrompt
+from mstar.model.components.token2wav.voice_prompt import VoicePrompt
+
+T2W_STATE = "t2w_state"
+T2W_KV = {"enc1": "t2w_enc1_kv", "enc2": "t2w_enc2_kv", "dit": "t2w_dit_kv"}
+T2W_KEYS = Token2WavKeys(codes="tts_code", state=T2W_STATE, kv=T2W_KV)
 
 # ---------------------------------------------------------------------------
 # The reference's one-request driver (upstream's ``Token2wav.stream``) over the served
@@ -150,7 +155,7 @@ class _CacheSteps:
         from mstar.engine.resources.kv.bounded.manager import BoundedKVManager
         from mstar.engine.resources.recurrent.config import RecurrentBlockConfig, RecurrentStateConfig
         from mstar.engine.resources.recurrent.pool import RecurrentStatePool
-        from mstar.model.minicpm_o.components.token2wav import CACHE_FAMILIES, CacheCapacity
+        from mstar.model.components.token2wav.model import CACHE_FAMILIES, CacheCapacity
 
         self.bank = bank
         self.families = CACHE_FAMILIES
@@ -187,7 +192,7 @@ class _CacheSteps:
         from mstar.engine.resources.kv.bounded import BoundedKVStep, StreamPosition
         from mstar.engine.resources.recurrent.config import RecurrentStep
         from mstar.engine.resources.step import Segment, StepContext
-        from mstar.model.minicpm_o.components.token2wav import AttentionCache, SlotRows, WindowCaches, window_tokens
+        from mstar.model.components.token2wav.model import AttentionCache, SlotRows, WindowCaches, window_tokens
 
         for r, v in zip(rids, voices or [0] * len(rids), strict=True):
             self.voice.setdefault(r, v)
@@ -323,7 +328,7 @@ def test_the_dit_refuses_voice_sources_in_another_dtype_than_its_caches():
     from types import SimpleNamespace
 
     pytest.importorskip("triton")
-    from mstar.model.minicpm_o.components.token2wav_kernels import dit_forward
+    from mstar.model.components.token2wav.kernels import dit_forward
 
     cnn_cache = torch.zeros(1, 1, 4, 2, dtype=torch.float16)
     kv = [SimpleNamespace(source=torch.zeros(1, 1, dtype=torch.float32))]
@@ -419,8 +424,9 @@ def test_batched_windows_on_pool(random_token2wav, device):
     from mstar.model.chatterbox.components.s3gen_hift import HiFTNoise
 
     model = copy.deepcopy(random_token2wav).to(device)
-    # the CUDA path's attention kernel multiplies in TF32, as served
-    tol = dict(rtol=1e-4, atol=1e-4) if device == "cpu" else dict(rtol=1e-3, atol=1e-3)
+    # The CUDA path's attention kernel multiplies in TF32, as served: the DiT's conv caches
+    # drift from the reference state by up to ~1.1e-3 absolute, near-zero entries included.
+    tol = dict(rtol=1e-4, atol=1e-4) if device == "cpu" else dict(rtol=1e-3, atol=2e-3)
     p = 50
     torch.manual_seed(1)
     voice = model.prepare_voice(VoicePrompt(
@@ -439,7 +445,7 @@ def test_batched_windows_on_pool(random_token2wav, device):
         return HiFTNoise(phase=nz.phase.to(device), harmonic=nz.harmonic.to(device))
 
     def check_slot(rid, st):
-        from mstar.model.minicpm_o.components.token2wav_flow import DIT_DEPTH, N_TIMESTEPS
+        from mstar.model.components.token2wav.flow import DIT_DEPTH, N_TIMESTEPS
 
         # the conformer attends its caches in order; the DiT's only as a set
         torch.testing.assert_close(kv_steps.retained("enc1", "r0"), st.enc_kv1[..., :st.enc_len1, :], **tol)
@@ -474,7 +480,7 @@ def test_batched_windows_on_pool(random_token2wav, device):
     if device == "cuda":
         # as served: the DiT computes in DIT_COMPUTE_DTYPE (its caches' dtype) on its
         # fused kernels; its mel tracks the fp32 run above
-        from mstar.model.minicpm_o.components.token2wav import DIT_COMPUTE_DTYPE
+        from mstar.model.components.token2wav.model import DIT_COMPUTE_DTYPE
 
         bank16 = VoiceBank.build({"v": voice}, dit_dtype=DIT_COMPUTE_DTYPE)
         kv16 = _CacheSteps(bank16, 3, device, dit_dtype=DIT_COMPUTE_DTYPE)
@@ -503,9 +509,49 @@ def test_batched_windows_on_pool(random_token2wav, device):
             torch.testing.assert_close(mel[i:i + 1], mels[w], **tol)
 
 
+def test_batched_relative_positions_match_the_dense_path(random_token2wav):
+    """The conformer's relative-position term on the bounded caches, at a magnitude that
+    matters: ``random_token2wav``'s small weights leave it near zero, where a band read
+    backwards (relative position ``-k`` for ``k``) still passes the test above."""
+    import copy
+
+    from mstar.model.components.token2wav.flow import RelPositionAttention
+
+    model = copy.deepcopy(random_token2wav)
+    gen = torch.Generator().manual_seed(5)
+    with torch.no_grad():
+        for mod in model.flow.encoder.modules():
+            if isinstance(mod, RelPositionAttention):
+                mod._bands.clear()
+                for t in (mod.linear_pos.weight, mod.pos_bias_u, mod.pos_bias_v):
+                    t.copy_(torch.randn(t.shape, generator=gen))
+    p = 12
+    voice = model.prepare_voice(VoicePrompt(
+        tokens=torch.randint(0, 6561, (1, p), dtype=torch.int32, generator=gen),
+        spk_emb=torch.randn(1, 192, generator=gen), mel=torch.randn(1, 2 * p, 80, generator=gen),
+    ))
+    bank = VoiceBank.build({"v": voice})
+    kv_steps = _CacheSteps(bank, 2, "cpu")
+    ref = new_state(model, voice)
+    # the token encoder's output: the DiT's small weights would hide it in the mel
+    encoded = []
+    hook = model.flow.encoder.register_forward_hook(lambda _m, _i, out: encoded.append(out.clone()))
+    try:
+        for win, last in reference_windows(torch.randint(0, 6561, (60,), generator=gen).tolist()):
+            tokens = torch.tensor([win], dtype=torch.int32)
+            flow_chunk(model, ref, voice, tokens, last)
+            state, kv, ids, commit = kv_steps.window(["r0"], len(win), last)
+            model.window_flow(state, bank, ids, tokens, kv, last)
+            commit()
+            want, got = encoded[-2:]
+            torch.testing.assert_close(got, want, rtol=1e-4, atol=1e-4)
+    finally:
+        hook.remove()
+
+
 @needs_ckpt
 def test_assets_load_completely():
-    from mstar.model.minicpm_o.components.token2wav import load_token2wav
+    from mstar.model.components.token2wav.model import load_token2wav
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = load_token2wav(f"{CKPT}/assets/token2wav", device)
@@ -531,7 +577,7 @@ def test_the_served_float16_dit_tracks_float32_on_the_checkpoint():
     perturbation of the fp32 mel gives 0.1%)."""
     import soundfile as sf
 
-    from mstar.model.minicpm_o.components.token2wav import DIT_COMPUTE_DTYPE, load_token2wav
+    from mstar.model.components.token2wav.model import DIT_COMPUTE_DTYPE, load_token2wav
 
     torch.backends.cuda.matmul.allow_tf32 = True
     model = load_token2wav(f"{CKPT}/assets/token2wav", "cuda").requires_grad_(False)
@@ -558,6 +604,34 @@ def test_the_served_float16_dit_tracks_float32_on_the_checkpoint():
         assert rel < 2e-3, (w, rel)
 
 
+@needs_ckpt
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_batched_flow_matches_the_driver_on_the_real_weights():
+    """The served (bounded-cache) flow against the one-request driver on MiniCPM-o's own
+    weights and voice, where the conformer's relative-position term is large enough to
+    show in the mel."""
+    import soundfile as sf
+
+    from mstar.model.components.token2wav.model import load_token2wav
+
+    model = load_token2wav(f"{CKPT}/assets/token2wav", "cuda")
+    wav, _ = sf.read(f"{CKPT}/assets/HT_ref_audio.wav", dtype="float32")
+    voice = model.prepare_voice(model.voice_encoder(torch.from_numpy(wav)))
+    bank = VoiceBank.build({"v": voice})
+    kv_steps = _CacheSteps(bank, 2, "cuda")
+    ref = new_state(model, voice)
+    gen = torch.Generator().manual_seed(0)
+    with torch.inference_mode():
+        for win, last in reference_windows(torch.randint(0, 6561, (160,), generator=gen).tolist()):
+            tokens = torch.tensor([win], dtype=torch.int32, device="cuda")
+            want = flow_chunk(model, ref, voice, tokens, last)
+            state, kv, ids, commit = kv_steps.window(["r0"], len(win), last)
+            got = model.window_flow(state, bank, ids, tokens, kv, last)
+            commit()
+            # TF32 in the served attention kernel; a misplaced position term moves mels by > 1
+            assert (got.float() - want.float()).abs().max().item() < 0.15
+
+
 @pytest.mark.parametrize(("n", "stop"), [
     *((n, True) for n in [1, 21, 22, 23, 24, 25, 49, 99, 100, 230]), (0, False), (25, False), (50, False),
 ])
@@ -572,8 +646,8 @@ def test_served_windows_are_upstreams(n, stop):
     declares no row (so leases no slot)."""
     from types import SimpleNamespace
 
-    from mstar.model.minicpm_o.components.token2wav import HOP, LEAD_SILENCE, SILENCE_CODE
-    from mstar.model.minicpm_o.submodules import Token2WavSubmodule
+    from mstar.model.components.token2wav.model import HOP, LEAD_SILENCE, SILENCE_CODE
+    from mstar.model.components.token2wav.submodule import Token2WavSubmodule
     from mstar.model.submodule_base import InputMetadata
     from mstar.streaming.chunk_policy import LeftContextChunkPolicy
     from mstar.streaming.stream_buffer import StreamBuffer
@@ -582,6 +656,7 @@ def test_served_windows_are_upstreams(n, stop):
     node = Token2WavSubmodule.__new__(Token2WavSubmodule)
     torch.nn.Module.__init__(node)
     node.request_states, node.eos_code = {}, eos
+    node.keys = T2W_KEYS
     node._lead_silence = torch.full((LEAD_SILENCE,), SILENCE_CODE, dtype=torch.int32)
     node.model = torch.nn.Linear(1, 1)  # its device
     info = SimpleNamespace(rid_handle=0, step_metadata={"voice": "v"}, random_seed=0)
@@ -662,8 +737,7 @@ def test_hift_noise_is_the_requests_own(random_token2wav):
     from types import SimpleNamespace
 
     from mstar.engine.accelerator_graph_config import PiecewiseCallInputs
-    from mstar.model.minicpm_o.config import T2W_KV, T2W_STATE
-    from mstar.model.minicpm_o.submodules import Token2WavSubmodule
+    from mstar.model.components.token2wav.submodule import Token2WavSubmodule
     from mstar.model.submodule_base import InputMetadata, ModelInputsFromEngine
 
     model = random_token2wav
@@ -672,7 +746,7 @@ def test_hift_noise_is_the_requests_own(random_token2wav):
         tokens=torch.randint(0, 6561, (1, 6), dtype=torch.int32), spk_emb=torch.randn(1, 192),
         mel=torch.randn(1, 12, 80),
     ))
-    node = Token2WavSubmodule(model, {"v": voice}, eos_code=6561, dit_dtype=torch.float32)
+    node = Token2WavSubmodule(model, T2W_KEYS, {"v": voice}, eos_code=6561, dit_dtype=torch.float32)
     frames = window_frames(28, False)
     region = node.get_piecewise_accelerator_graph_configs(torch.device("cpu"), torch.float32)[
         node.hift_region(True, frames, False)]
@@ -706,3 +780,37 @@ def test_hift_noise_is_the_requests_own(random_token2wav):
     scale = alone.abs().max()
     assert (batched[1:] - alone).abs().max() < 1e-4 * scale
     assert (batched[:1] - alone).abs().max() > 0.1 * scale
+
+
+def test_resources_declare_one_state_pool_and_a_cache_per_family():
+    """Every cache family gets its bounded KV under the model's key, one slot short of
+    the state pool, which also keeps its sink slot."""
+    from mstar.engine.resources.kv.bounded import BoundedKVSpec
+    from mstar.engine.resources.recurrent.config import RecurrentStateSpec
+    from mstar.model.components.token2wav.model import CACHE_FAMILIES
+    from mstar.model.components.token2wav.resources import token2wav_resources
+
+    specs = token2wav_resources(T2W_KEYS, "Token2Wav", (3.0, 10.0), max_slots=9)
+    state = [s for s in specs if isinstance(s, RecurrentStateSpec)]
+    kv = {s.resource_key: s for s in specs if isinstance(s, BoundedKVSpec)}
+    assert [s.resource_key for s in state] == [T2W_STATE] and state[0].config.max_slots == 9
+    assert set(kv) == {T2W_KV[name] for name in CACHE_FAMILIES}
+    assert all(s.config.max_slots == 8 and s.nodes == {"Token2Wav"} for s in kv.values())
+
+
+@pytest.mark.parametrize(
+    ("state", "kv", "ok"), [(None, None, True), (17, 16, True), (16, 16, False), (17, None, False)],
+)
+def test_slot_check_wants_one_more_state_slot_than_each_cache(state, kv, ok):
+    from mstar.model.components.token2wav.resources import check_token2wav_slots
+
+    resources = {}
+    if state is not None:
+        resources[T2W_STATE] = {"max_slots": state}
+    if kv is not None:
+        resources.update({key: {"max_slots": kv} for key in T2W_KV.values()})
+    if ok:
+        check_token2wav_slots(T2W_KEYS, resources, 9, "cfg.yaml")
+    else:
+        with pytest.raises(ValueError, match="must be one more than"):
+            check_token2wav_slots(T2W_KEYS, resources, 9, "cfg.yaml")

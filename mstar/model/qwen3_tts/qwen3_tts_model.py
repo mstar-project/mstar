@@ -33,6 +33,7 @@ import importlib.metadata
 import importlib.util
 import inspect
 import logging
+import math
 import sys
 from functools import lru_cache
 from pathlib import Path
@@ -80,11 +81,16 @@ from mstar.model.base import (
 from mstar.model.qwen3_tts.config import (
     CHATML_ASSISTANT_PREFIX_TOKEN_IDS,
     CHATML_ASSISTANT_SUFFIX_TOKEN_IDS,
+    CLONE_BUDGET_MARGIN,
+    CLONE_BUDGET_S,
+    CLONE_BUDGET_S_PER_TOKEN,
     CODE_PRED_SAMPLER,
     CODEC_STATE,
     LANGUAGE_ID_KEY,
+    LENGTH_BUDGET_KEY,
     PROMPT_LAYOUT_KEY,
     REF_CLIP_KEY,
+    REF_SAMPLES_KEY,
     SPEAKER_ID_KEY,
     TALKER_ATTN,
     TALKER_KV,
@@ -92,6 +98,7 @@ from mstar.model.qwen3_tts.config import (
     TALKER_SAMPLER,
     TALKER_TEXT,
     Qwen3TTSModelConfig,
+    mono_samples,
 )
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.utils import load_generation_defaults
@@ -873,7 +880,7 @@ class Qwen3TTSModel(Model):
                 f"(got {len(clips)}); pass it as the request's audio input"
             )
         # Both modes run the speaker encoder over the whole clip.
-        num_samples = int(clips[0].reshape(-1).shape[0])
+        num_samples = mono_samples(clips[0])
         self._check_reference_duration(num_samples / self.config.codec.input_sample_rate)
         ref_text = _text(kwargs, "ref_text", "").strip()
         if _flag(kwargs, "x_vector_only_mode", False):
@@ -888,7 +895,9 @@ class Qwen3TTSModel(Model):
             raise ValueError("Qwen3-TTS reference clip is empty")
         return ref_text, frames
 
-    INTERNAL_KWARGS = (PROMPT_LAYOUT_KEY, SPEAKER_ID_KEY, LANGUAGE_ID_KEY, REF_CLIP_KEY)
+    INTERNAL_KWARGS = (
+        PROMPT_LAYOUT_KEY, SPEAKER_ID_KEY, LANGUAGE_ID_KEY, REF_CLIP_KEY, REF_SAMPLES_KEY, LENGTH_BUDGET_KEY,
+    )
     LENGTH_KWARGS = ("max_output_tokens", "max_new_tokens")
 
     def process_prompt(
@@ -907,7 +916,8 @@ class Qwen3TTSModel(Model):
         The metadata carries, as host values for the prefill's step metadata,
         ``PROMPT_LAYOUT_KEY`` ``[instruct_len, text_len, stream_text,
         ref_text_len, ref_frames]``, the codec speaker and language tags, and
-        a clone's ``REF_CLIP_KEY`` digest. ``stream_text`` follows the
+        a clone's ``REF_CLIP_KEY`` digest, ``REF_SAMPLES_KEY`` sample count and
+        ``LENGTH_BUDGET_KEY`` frame budget (none for live text). ``stream_text`` follows the
         reference default per variant (whole text in the prefill for
         CustomVoice and VoiceDesign, one token per frame for Base) unless the
         request sets ``non_streaming_mode``. An in-context clone's
@@ -980,10 +990,14 @@ class Qwen3TTSModel(Model):
         clips = (tensors or {}).get("audio_inputs", [])
         if clips:
             metadata[REF_CLIP_KEY] = clip_digest(clips[0])
+            metadata[REF_SAMPLES_KEY] = mono_samples(clips[0])
         from mstar.model.qwen3_tts.submodules import prefill_rows, text_stream_start
 
         # a clone's x-vector takes the speaker row
         clone = "audio" in input_modalities
+        # live text arrives after the prompt, so its length isn't known here
+        if clone and "text_in" not in kwargs.get("open_streams", ()):
+            metadata[LENGTH_BUDGET_KEY] = self.clone_length_budget(text_len)
         rows = prefill_rows(metadata[PROMPT_LAYOUT_KEY], language_id, speaker_id >= 0 or clone)
         metadata["state_layout"] = {TALKER_KV: {"main": Layout(
             spans=(Span("rows", "talker_prefill_clone" if clone else "talker_prefill", rows, rows, "text_inputs"),),
@@ -1053,6 +1067,7 @@ class Qwen3TTSModel(Model):
             prompt = {key: model_kwargs[key] for key in (PROMPT_LAYOUT_KEY, SPEAKER_ID_KEY, LANGUAGE_ID_KEY)}
             if clone:
                 prompt[REF_CLIP_KEY] = model_kwargs[REF_CLIP_KEY]
+                prompt[REF_SAMPLES_KEY] = model_kwargs[REF_SAMPLES_KEY]
             if "audio" not in output_modalities:
                 return []
             prefill = WalkStep("talker_prefill_clone" if clone else "talker_prefill", step_metadata=prompt)
@@ -1133,8 +1148,21 @@ class Qwen3TTSModel(Model):
             self._generation_defaults_cache = cached
         return cached
 
+    def clone_length_budget(self, text_tokens: int) -> int:
+        """The frames a clone of ``text_tokens`` target-text tokens may run without an explicit
+        ``max_output_tokens`` (see ``CLONE_BUDGET_S``)."""
+        codec = self.config.codec
+        frames_per_s = codec.output_sample_rate / codec.decode_upsample_rate
+        return math.ceil(CLONE_BUDGET_MARGIN * (CLONE_BUDGET_S + CLONE_BUDGET_S_PER_TOKEN * text_tokens) * frames_per_s)
+
     def get_max_output_tokens(self, **model_kwargs: Any) -> int:
-        return model_kwargs.get("max_output_tokens", self._generation_defaults()["max_output_tokens"])
+        """The request's ``max_output_tokens``, else the checkpoint's default, capped for a clone
+        by its text's budget."""
+        requested = model_kwargs.get("max_output_tokens")
+        if requested is not None:
+            return requested
+        default = self._generation_defaults()["max_output_tokens"]
+        return min(default, model_kwargs.get(LENGTH_BUDGET_KEY, default))
 
     def request_kwargs(self) -> frozenset[str]:
         prefixes = ("", "talker_", "code_predictor_", _DEPRECATED_CODE_PRED_PREFIX)
@@ -1163,10 +1191,8 @@ class Qwen3TTSModel(Model):
         device: str = "cpu",
         tp_group=None,
         autocast_dtype: torch.dtype | None = None,
-        sp_group=None,
     ) -> NodeSubmodule | None:
         """Build only the node assigned to this worker and cache the wrapper."""
-        del sp_group
         if node_name not in ("Talker", "Codec", "RefEncoder"):
             raise ValueError(f"Unknown Qwen3-TTS node: {node_name!r}")
         if node_name in self._submodule_cache:

@@ -84,7 +84,8 @@ def test_prompts_match_the_reference_layout(model, prompts):
             clip = torch.zeros(case["ref_patches"] * model.config.ref_patch_samples)
             tensors, modalities = {"audio_inputs": [clip]}, ["text", "audio"]
             kwargs["ref_text"] = case["ref_text"]
-        out, metadata = model.process_prompt(case["text"], modalities, ["audio"], tensors=tensors, **kwargs)
+        prompt = model.process_prompt(case["text"], modalities, ["audio"], tensors=tensors, **kwargs)
+        out, metadata = prompt.new_input_tensors, prompt.metadata
         mode = metadata[PROMPT_MODE_KEY]
         ref = torch.zeros(2, case["ref_patches"], model.config.patch_size, model.config.feat_dim)
         tokens, text_mask, _, _ = build_prompt(out["text_inputs"][0], mode, ref if case["ref_patches"] else None)

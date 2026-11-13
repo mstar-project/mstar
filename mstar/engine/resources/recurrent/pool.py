@@ -32,6 +32,7 @@ from mstar.engine.resources.recurrent.config import (
     RecurrentStep,
 )
 from mstar.engine.resources.resident import gather_column
+from mstar.engine.resources.resident_hooks import ANY_REPEATS
 from mstar.engine.resources.spec import ResourceReqConfig
 from mstar.engine.resources.step import (
     ADMIT_OK,
@@ -144,6 +145,11 @@ class RecurrentAddressing:
 
 
 class RecurrentStatePool(Resource):
+    # it reads the KV pool only to key prefix snapshots, which are off above one rank. Its heads
+    # shard over TP alone, so every SP replica of a slot holds the same state, which a split step
+    # leaves alike on every one (`linear_attn.base`)
+    supports_context_parallel = True
+    supports_split_steps = True
     # the node's planner and this pool's table of slots, once bound
     _resident: "ResidentPlanner | None" = None
     _resident_table: "ResidentTable | None" = None
@@ -180,6 +186,8 @@ class RecurrentStatePool(Resource):
         self._comm_group = comm_group
         # the resource key, for errors
         self._name = name
+        # the start `set_start` gave, by block and layer, or None before it is called
+        self._start: dict[tuple[str, int | None], torch.Tensor] | None = None
 
         # One [num_layers, max_slots + prefix_slots, *shape] tensor per block. Layer-major so
         # `blocks[name][layer]` is contiguous: FlashInfer's pool paths assert
@@ -309,18 +317,26 @@ class RecurrentStatePool(Resource):
         for name, tensor in self._blocks.items():
             yield tensor[:, index] if self.config.blocks[name].per_layer else tensor[index]
 
+    def set_start(self, start: Mapping[tuple[str, int | None], torch.Tensor]) -> None:
+        """What `gather` reads for a row with no saved state, by block and layer, each in the block's layout and
+        dtype. A block or layer it doesn't name reads zeros."""
+        if self._start is None:
+            self._start = dict(start)
+        elif start.keys() != self._start.keys() or not all(torch.equal(self._start[k], v) for k, v in start.items()):
+            raise ValueError(f"recurrent pool {self._name!r}: a start that differs from the one it holds, which every "
+                             "row of the pool reads")
+
     def gather(
         self, name: str, layer_idx: int | None = 0, *, label: str = "main",
-        start: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Block ``name`` of this step's rows under ``label``, ``[rows, *shape]``
         (a copy), in the order the step declared them.
 
         It addresses rows through the step's plan, so a captured and an eager
         forward read the same slots. A row with no saved state (a request's
-        first step, or a padding row on the sink) reads ``start``, zeros when
-        none is given. A row must declare span >= 1 to reach its own slot; a
-        zero-span row addresses the sink, so it reads ``start``. A resident
+        first step, or a padding row on the sink) reads the start, zeros when
+        none is set. A row must declare span >= 1 to reach its own slot; a
+        zero-span row addresses the sink, so it reads the start. A resident
         step's graph reads every row's slot instead (`resident_gather`). A pool
         without a sink refuses (``_need_sink``). A block that is not per layer
         takes ``layer_idx=None``."""
@@ -334,6 +350,7 @@ class RecurrentStatePool(Resource):
         if rows.every_row_has_state:
             return out
         fresh = ~rows.has_state[: rows.num_rows].view(-1, *(1,) * (out.dim() - 1))
+        start = None if self._start is None else self._start.get((name, layer_idx))
         return torch.where(fresh, 0 if start is None else start, out)
 
     def scatter_(
@@ -729,7 +746,7 @@ class RecurrentStatePool(Resource):
             if self._admit_restores or self._admit_snaps:
                 self._forget_prefix_admit(lambda key: ctx.is_real_row(key[0]))
             page = self._kv.config.tokens_per_page if self._kv is not None else 0
-            slots, is_pad = self._slots, ctx.is_padding_row
+            slots, is_pad, repeats = self._slots, ctx.is_padding_row, ctx.repeats
             for segment in step.segments or ():
                 if segment.span <= 0 or is_pad(segment.request_id):
                     continue
@@ -740,7 +757,8 @@ class RecurrentStatePool(Resource):
                         # the backend already wrote the pool; a later step resumes
                         slot.has_state = True
                         self._version += 1
-                    slot.tokens += segment.span
+                    # a step that repeats ran its span once a replay
+                    slot.tokens += segment.span * repeats
                     # a row too short to checkpoint that ends on a page (a decode step) is saved here, after its forward
                     if page and segment.span < page and not slot.tokens % page:
                         self._save_decode(segment.request_id, segment.label, slot)
@@ -1259,9 +1277,27 @@ class RecurrentStatePool(Resource):
 
     # Resident planning
 
+    def max_repeats(self, step, ctx) -> int:
+        """A row's state is updated in place, at its slot. While prefix snapshots
+        are on, a run ends on each keyed row's next page boundary, where commit
+        snapshots it: a replay can't stop to copy the state mid-run."""
+        if self._kv is None:
+            return ANY_REPEATS
+        page = self._kv.config.tokens_per_page
+        room = ANY_REPEATS
+        with self._lock:
+            for segment in step.segments or ():
+                labels = self._slots.get(segment.request_id)
+                slot = labels.get(segment.label) if labels else None
+                if slot is not None and (segment.request_id, segment.label) in self._keyed:
+                    room = min(room, page - slot.tokens % page)
+        return room
+
     def resident_refusal(self) -> str | None:
         if self.config.disable_sink_slot:
             return "a pool with no sink slot has nowhere for a padding row"
+        if self._start:
+            return "a row with nothing written reads the pool's start, and a resident step reads each row's slot"
         return None
 
     def bind_resident(self, planner: "ResidentPlanner", key: str) -> None:

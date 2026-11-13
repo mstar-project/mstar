@@ -1,18 +1,30 @@
-"""What layers and submodules hold for declared state: a handle per array or sampler, over today's resources.
+"""What layers and submodules hold for declared state: a handle per array, sampler or sequence shard, over today's
+resources.
 
-A call that touches state runs behind a graph break, so it is plain Python in eager steps and at capture, it never runs
-on a replay, and its checks live in it.
+A call that touches an array or a sampler runs behind a graph break, so it is plain Python in eager steps and at
+capture, it never runs on a replay, and its checks live in it. A shard's `scatter` and `gather` deliberately don't break
+the graph: a compiled frame of a walk the shard never splits traces them straight through.
 """
 
 from abc import abstractmethod
 from collections.abc import Collection, Iterable, Mapping, Sequence
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, overload
 
 import torch
 
 from mstar.engine.resources.sampler.utils import FUSED_DRAW_MAX_VOCAB, FusedDrawArgs
 from mstar.engine.resources.step import Segment, StepHandle
-from mstar.engine.state.contract import EMPTY, Array, ArrayStep, CausalConv, GatedDeltaNet, Op, Sampler
+from mstar.engine.state.contract import (
+    EMPTY,
+    Array,
+    ArrayStep,
+    CausalConv,
+    GatedDeltaNet,
+    Op,
+    Reached,
+    Sampler,
+    SeqShard,
+)
 
 if TYPE_CHECKING:
     from mstar.engine.state.state_op import StateOp
@@ -46,6 +58,8 @@ class ArrayHandle(StepHandle):
     # the position resource and the dtype its `Rope` rotates in, where the array declares positions
     positions: Any = None
     rope_dtype: torch.dtype | None = None
+    # the cause `write` is refused with on an append-only array's handle; None leaves it "no layout yet"
+    _write_refused: str | None = None
 
     def __init__(self, array: Array, resources: Mapping[str, Any]):
         self.array = array
@@ -165,8 +179,6 @@ class ArrayHandle(StepHandle):
         if layer not in self.array.layers:
             raise self._refusal(f"add on layer {layer}, which the array doesn't declare")
         kept = self._keep and keep is not False
-        if kept and layer in self._read:
-            raise self._refusal(f"a kept add on layer {layer} after a read in the same layer")
         if layer in self._kept:
             raise self._refusal(f"an add on layer {layer} after its kept add")
         if keep and not self._keep:
@@ -193,24 +205,34 @@ class ArrayHandle(StepHandle):
         held = self._held
         if held is None:
             raise self._refusal(f"a read on layer {layer} with no add before it")
-        self._held = None
+        self._held = self._held_layer = None
         return held
 
     def add(self, layer: int | torch.Tensor, *, keep: bool | None = None, **fields: torch.Tensor) -> None:
-        """Append each row's span at its next log positions. A kept add happens once per layer per step, as the
-        layer's last add. ``keep`` False is scratch: it can repeat, after a read too, and lasts until the next add or
-        the end of the step. None takes the step's ``keep``. The resources keep or drop a step's adds as a whole, so a
-        step that keeps needs each layer to end on a kept add, and a step with ``keep`` False refuses ``keep=True``."""
+        """Append each row's span at its next log positions, before or after a read of the layer. A kept add happens
+        once per layer per step, as the layer's last add. ``keep`` False is scratch: it can repeat, and lasts until the
+        next add or the end of the step. None takes the step's ``keep``. The resources keep or drop a step's adds as a
+        whole, so a step that keeps needs each layer to end on a kept add, and a step with ``keep`` False refuses
+        ``keep=True``."""
         raise self._unsupported("add")
 
-    def read(self, layer: int | torch.Tensor, q: torch.Tensor | None = None, **mask_args: Any) -> torch.Tensor:
+    @overload
+    def read(self, layer: int | torch.Tensor, q: torch.Tensor, **mask_args: Any) -> torch.Tensor: ...
+
+    @overload
+    def read(self, layer: int | torch.Tensor, q: None = None, **mask_args: Any) -> Reached: ...
+
+    def read(
+        self, layer: int | torch.Tensor, q: torch.Tensor | None = None, **mask_args: Any,
+    ) -> torch.Tensor | Reached:
         """Attend ``q`` through the read declared for ``layer``: kept entries from earlier steps, plus this layer's
-        latest add, at the positions its mask reaches."""
+        latest add, at the positions its mask reaches. A read that declares no op takes no ``q`` and returns the
+        entries it reaches."""
         raise self._unsupported("read")
 
     def _add_read(
         self, layer: int | torch.Tensor, q: torch.Tensor | None, *, keep: bool | None, **keywords: Any,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | Reached:
         self._check_add_read("add_read")
         fields = self.array.entry.tensors
         self.add(layer, keep=keep, **{name: keywords.pop(name) for name in fields if name in keywords})
@@ -224,15 +246,16 @@ class ArrayHandle(StepHandle):
     def write(self, layer: int | torch.Tensor, *, at: torch.Tensor | None = None, **fields: torch.Tensor) -> None:
         """Overwrite entries in place, on a rewritable array. ``at`` gives each token's log position, and is omitted
         for a Value."""
-        if not self.array.rewritable:
-            raise self._refusal("write on an append-only array")
+        if self._write_refused is not None:
+            raise self._refusal(self._write_refused)
         raise self._unsupported("write")
 
     def set_start(self, start: Mapping[str, torch.Tensor]) -> None:
         """What a row of this Value reads while it has nothing written, has span 0 or pads a step: ``start``'s tensor
-        for each field it names, of one entry's shape on this rank, and zeros for the rest. A step of a resident walk
-        (`NodeSubmodule.resident_walks`) reads each row's slot instead, which holds zeros until the row's first write.
-        The tensors are made at load and never written, since a captured read keeps their address."""
+        for each field it names, of one entry's shape on this rank, and zeros for the rest. A resident step reads each
+        row's slot and not the start, so the node of a Value with a start stays host-planned
+        (`NodeSubmodule.resident_walks`). The tensors are made at load and never written, since a captured read keeps
+        their address."""
         raise self._unsupported("set_start")
 
     def block(self, field: str, layer: int) -> torch.Tensor:
@@ -265,9 +288,9 @@ class ArrayHandle(StepHandle):
                                 f"{sorted(binding.read_back) or 'none'}")
         return getattr(self.reads[read], field)
 
-    def _update(self, kind: type[Op], field: str, layer: int) -> tuple[Any, torch.Tensor]:
-        """Record the update of type ``kind`` on ``layer``'s ``field``, and return the resource that runs it and the
-        field's view."""
+    def _update(self, kind: type[Op], layer: int) -> tuple[Any, torch.Tensor]:
+        """Record the update of type ``kind`` on ``layer``'s field that ``kind`` writes, and return the resource that
+        runs it and the field's view."""
         raise self._unsupported(f"an update of type {kind.__name__}")
 
     def _host(self, request: int, label: str, layer: int) -> Mapping[str, object]:
@@ -314,13 +337,66 @@ class SamplerHandle(StepHandle):
         self._fused = False
 
 
+class ShardHandle(StepHandle):
+    """A node's calls on its declared `SeqShard`. Its step is the node's segments, so the engine opens it on every
+    step of the node, with no entry in ``state``. It takes the label it brackets from the step's segments, as the
+    array handles do, and the walk from the step, so a compiled frame of a walk the shard never splits traces the
+    bracket straight through. Closed, it holds neither, and the bracket is the resource's outside a step: the
+    identity."""
+
+    def __init__(self, shard: SeqShard, resource: Any):
+        self.shard = shard
+        self.name = shard.name
+        self.resource = resource
+        self.label: str | None = None
+        self.walk: str | None = None
+
+    @property
+    def ranks(self) -> int:
+        """The sequence-parallel ranks the node's tokens split over: what a layout that must tile evenly rounds to."""
+        return self.resource.group.world_size
+
+    @property
+    def needs_step(self) -> bool:
+        """Whether a step must plan the shard: where it can split. Elsewhere its plan is copied, and a step nothing
+        else needs skips it, the bracket then the identity."""
+        return self.resource.can_split
+
+    def begin_step(self, step) -> None:
+        (label,) = self.shard.labels  # analysis refuses a shard of several
+        self.label = label if any(segment.label == label for segment in step.segments or ()) else None
+        self.walk = step.ctx.graph_walk
+
+    def check_step(self, step) -> None:
+        return
+
+    def commit_step(self, step) -> None:
+        """Nothing: a shard holds no state across steps."""
+
+    def end_step(self, step) -> None:
+        self.label = self.walk = None
+
+
+@overload
+def add_read(
+    h: ArrayHandle, layer: int | torch.Tensor, q: torch.Tensor, *, keep: bool | None = None, **keywords: Any,
+) -> torch.Tensor: ...
+
+
+@overload
+def add_read(
+    h: ArrayHandle, layer: int | torch.Tensor, q: None = None, *, keep: bool | None = None, **keywords: Any,
+) -> Reached: ...
+
+
 @torch.compiler.disable
 def add_read(
     h: ArrayHandle, layer: int | torch.Tensor, q: torch.Tensor | None = None, *, keep: bool | None = None,
     **keywords: Any,
-) -> torch.Tensor:
+) -> torch.Tensor | Reached:
     """`add` then `read` on ``layer`` behind one graph break, for a layer with nothing traced between them, so it
-    compiles no frame for the gap. A keyword that names an entry field goes to `add`, and any other to `read`."""
+    compiles no frame for the gap. A keyword that names an entry field goes to `add`, and any other to `read`. As
+    `read`, a read with no op takes no ``q`` and returns the entries it reaches."""
     return h._add_read(layer, q, keep=keep, **keywords)
 
 
@@ -330,7 +406,7 @@ def causal_conv(
     bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """The declared `CausalConv` over ``x``, which reads and writes ``layer``'s ``conv`` field in place."""
-    run, conv = h._update(CausalConv, "conv", h._layer_id(layer))
+    run, conv = h._update(CausalConv, h._layer_id(layer))
     return run.run_conv(x, conv_layer=conv, weight=weight, bias=bias, label=h.label)
 
 
@@ -340,8 +416,26 @@ def gated_delta_net(
     b: torch.Tensor, a_log: torch.Tensor, dt_bias: torch.Tensor,
 ) -> torch.Tensor:
     """The declared `GatedDeltaNet`, which reads and writes ``layer``'s ``state`` field in place."""
-    run, state = h._update(GatedDeltaNet, "state", h._layer_id(layer))
+    run, state = h._update(GatedDeltaNet, h._layer_id(layer))
     return run.run(q, k, v, a, b, state_layer=state, a_log=a_log, dt_bias=dt_bias, label=h.label)
+
+
+def scatter(h: ShardHandle, *xs: torch.Tensor | None, dim: int | None = None):
+    """This rank's share of each of ``xs``, whole on every rank, along ``dim`` (the shard's axis by default), where
+    this step splits the label; ``xs`` as they are otherwise. One tensor in, one out; several in, a tuple out. None
+    passes through."""
+    return h.resource.scatter(h.label, *xs, dim=dim, walk=h.walk)
+
+
+def gather(h: ShardHandle, *xs: torch.Tensor | None, dim: int | None = None):
+    """`scatter`'s inverse: every rank's share of each of ``xs``, back whole."""
+    return h.resource.gather(h.label, *xs, dim=dim, walk=h.walk)
+
+
+def split_range(h: ShardHandle):
+    """This rank's range of the label (``start``, ``count``, and every rank's ``counts``) where this step splits it;
+    None where it is copied or the step doesn't open the label."""
+    return h.resource.split_range(h.label)
 
 
 def host(h: ArrayHandle, request: int, label: str, layer: int | torch.Tensor) -> Mapping[str, object]:

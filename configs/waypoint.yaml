@@ -7,8 +7,7 @@ model_kwargs:
   accelerator_graph: true
   # Extra (H, W) seed shapes with their own vae_encoder graph; ~15 s startup each.
   seed_capture_sizes: [[360, 640], [540, 960], [1080, 1920]]
-  full_global_ring: false
-  # Rows per rollout step; must be <= resources.kv.num_sessions below.
+  # Rows per rollout step; must be <= max_concurrent_requests below.
   step_batch_size: 2
 
 # The world state is a ring (not a paged KV cache); max_seq_len only satisfies the
@@ -23,6 +22,9 @@ resources:
     # ~816 MiB of ring per world at 720P. Raise together with
     # max_concurrent_requests; the two are checked against each other.
     num_sessions: 2
+  decoder:
+    # The decoder's histories: a slot per world and the pool's sink slot.
+    max_slots: 3
 
 # Single-GPU colocated: vae_encoder + dit on rank 0 (TAEHV decode is fused into the dit forward).
 node_groups:

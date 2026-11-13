@@ -1,19 +1,21 @@
 #!/usr/bin/env python3
-"""Provision Hopper-or-newer GPUs for live PR tests: Eras Cloud, RunPod or Lambda.
+"""Provision GPUs for live PR tests (NVIDIA Hopper or newer, AMD MI300X or newer): Eras Cloud, RunPod, Lambda
+or DigitalOcean.
 
 usage:
   gpu.py check                                   keys, persistent storage, budget
-  gpu.py offers --gpus N [--min-vram GB] [--all-regions] [--allow-arm] [--json]
-  gpu.py launch <offer-id> --pr N [--hours H] [--tag T] [--run SCRIPT [--input FILE ...]]
+  gpu.py offers --gpus N [--vendor nvidia|amd] [--min-vram GB] [--all-regions] [--allow-arm] [--json]
+  gpu.py launch <offer-id> --pr N [--hours H] [--tag T] [--run SCRIPT [--input FILE ...]] [--boxes N]
                [--cache ro|none | --cache-write ID] [--allow-over-budget] [--dry-run]
   gpu.py wait <instance>                         until ssh answers; prints how to reach it
   gpu.py ssh <instance> [command ...]            run a command (or a shell) on it
   gpu.py push <instance> <local> <remote>        scp -r to the box
   gpu.py pull <instance> <remote> <local>        scp -r from the box
-  gpu.py list [--all]                            instances launched here (--all: by any session; all RunPod, Lambda)
+  gpu.py list [--all]                            instances launched here (--all: this tool's, by any session)
   gpu.py extend <instance> --hours H [--allow-over-budget]
                                                  move the watchdog deadline to now + H (Eras: earlier only)
   gpu.py terminate <instance>
+  gpu.py reap                                    release this tool's runaway boxes (below), from any session
 
 Offers only cover regions where the team has persistent storage (a RunPod global volume
 mounts anywhere; a RunPod network volume or a Lambda filesystem pins one region), since the
@@ -23,17 +25,26 @@ a "no availability" report. Prices are USD/hr for the whole box.
 An Eras instance runs sshd as root in a Pod that Kubernetes stops at the deadline
 (`activeDeadlineSeconds`, `restartPolicy: Never`); a run that ends releases it.
 
-`launch --run SCRIPT` (Eras) makes the script the work itself rather than holding the GPUs for
-ssh: it is the Pod's command, with the --input files in /run/live-pr and sshd up beside it for
-copying results back, and the instance is released 15 minutes after it exits. The GPUs go when
-the script ends, whether or not whoever launched it is still there.
+A DigitalOcean GPU Droplet is a VM, root over ssh, NVIDIA or AMD by size, billed until deleted:
+nothing on DigitalOcean's side ends it.
+
+`launch --run SCRIPT` makes the script the work itself rather than holding the GPUs for ssh, with
+the --input files in /run/live-pr. On Eras it is the Pod's command, with sshd up beside it for
+copying results back, and the instance is released 15 minutes after it exits, so the GPUs go when
+the script ends, whether or not whoever launched it is still there. On DigitalOcean cloud-init
+writes the files and starts the script at boot (in the droplet's user_data, 64 KiB at most); the
+droplet stays up until terminated.
 
 Every launch is recorded in a ledger and gets a detached watchdog that terminates it at
 its deadline (budget.max_hours by default), even if the session that launched it is gone.
+`reap`, which every launch under budget.max_running runs first, is the backstop for a box whose
+watchdog's machine is gone too: on a provider whose instances have no deadline of their own, it
+releases this tool's instances past their ledger deadline, or past budget.max_hours plus an hour
+from their creation when this machine's ledger doesn't have them.
 
 `launch` exits 4 when budget.max_running refuses it, 1 on any other error.
 
-Keys come from RUNPOD_API_KEY / LAMBDA_API_KEY / ERAS_API_KEY. Settings from config.local.json
+Keys come from RUNPOD_API_KEY / LAMBDA_API_KEY / ERAS_API_KEY / DIGITALOCEAN_TOKEN. Settings from config.local.json
 next to the skill (see config.example.json). Stdlib only, so it runs from any python3.
 """
 from __future__ import annotations
@@ -41,8 +52,11 @@ from __future__ import annotations
 import argparse
 import base64
 import contextlib
+import datetime
 import fcntl
 import functools
+import gzip
+import hashlib
 import json
 import os
 import re
@@ -55,6 +69,7 @@ import urllib.parse
 import urllib.request
 from http.client import HTTPException  # the module name is taken by http() below
 from pathlib import Path
+from typing import NamedTuple
 
 SKILL_DIR = Path(__file__).resolve().parent.parent
 STATE = Path(os.environ.get("LIVE_PR_STATE", "~/.local/state/mstar-live-pr-test")).expanduser()
@@ -63,9 +78,17 @@ RUNPOD = "https://api.runpod.io/v2"
 RUNPOD_GRAPHQL = "https://api.runpod.io/graphql"
 LAMBDA = "https://cloud.lambda.ai/api/v1"
 ERAS = "https://api.erascloud.ai"
-# Hopper or newer. \b keeps out the H20 (Hopper silicon, a fraction of the compute).
-HOPPER_PLUS = re.compile(r"\b(H100|H200|GH200|B200|B300)\b", re.I)
+DIGITALOCEAN = "https://api.digitalocean.com/v2"
+# The GPUs this tool rents, by vendor: NVIDIA Hopper or newer (\b keeps out the H20, Hopper silicon with a
+# fraction of the compute), and AMD MI300X or newer.
+SUPPORTED = {"nvidia": re.compile(r"\b(H100|H200|GH200|B200|B300)\b", re.I),
+             "amd": re.compile(r"\bMI3[0-5]\d?X\b", re.I)}
 JOB_PREFIX = "live-pr-"  # what the names of this tool's instances start with
+
+
+def vendor_of(gpu: str) -> str | None:
+    """The vendor of a GPU this tool rents, by the GPU's name; None for any other GPU."""
+    return next((vendor for vendor, names in SUPPORTED.items() if names.search(gpu)), None)
 
 
 def die(msg: str, code: int = 1) -> None:
@@ -176,6 +199,21 @@ def eras(method, path, body=None, params=None, retry=True):
     return call(method, f"/v1/org/{_eras_org}{path}", body, params, retry)
 
 
+def digitalocean(method, path, body=None, params=None, retry=True):
+    return http(method, DIGITALOCEAN + path, "DIGITALOCEAN_TOKEN", body, params, retry)
+
+
+def digitalocean_list(path: str, field: str, params: dict | None = None) -> list:
+    """Every item of a DigitalOcean list, across all pages."""
+    items, page = [], 1
+    while True:
+        reply = digitalocean("GET", path, params={**(params or {}), "per_page": 200, "page": page})
+        items += reply.get(field) or []
+        if not ((reply.get("links") or {}).get("pages") or {}).get("next"):
+            return items
+        page += 1
+
+
 def tail_lines(text: str, limit: int) -> str:
     """The last whole lines of `text` that fit in `limit` characters; one longer line is clipped."""
     text = text.strip()
@@ -248,6 +286,15 @@ GIB = re.compile(r"(\d+(?:\.\d+)?)\s*([GT])i?", re.I)
 
 # ---------------------------------------------------------------- providers
 
+class Instance(NamedTuple):
+    """One of a provider's instances, as its listing shows it; `created` in epoch seconds, None where it doesn't
+    say."""
+    id: str
+    name: str
+    status: str
+    created: float | None = None
+
+
 class Provider:
     """One source of GPUs: what the CLI and the ledger below do differently per provider.
 
@@ -257,6 +304,8 @@ class Provider:
     key_env = ""  # the API key this provider needs
     user = "root"  # who ssh logs in as
     fixed_deadline = False  # its deadline was fixed at launch, so a later one wouldn't move it
+    vendors = ("nvidia",)  # the GPU vendors its images run
+    takes_run = False  # whether `launch --run` works here
 
     def __init__(self, cfg: dict, region: str | None = None):
         self.cfg, self.region = cfg, region
@@ -290,9 +339,17 @@ class Provider:
         nothing on a dry run."""
         raise NotImplementedError
 
+    def instances(self) -> list[Instance]:
+        """Every instance on the account, but those ended or being released."""
+        raise NotImplementedError
+
+    def storage(self) -> dict | None:
+        """Region -> the team's persistent storage there, or None for a provider that needs none."""
+        return None
+
     def named(self, name: str) -> list[str]:
         """The ids of the account's instances with this name (one create makes one, the name is unique)."""
-        raise NotImplementedError
+        return [i.id for i in self.instances() if i.name == name]
 
     def adopt(self, name: str) -> str | None:
         """The instance a create whose answer was lost made, found by its name, or None after 2 min."""
@@ -327,7 +384,7 @@ class RunPod(Provider):
             "include": "AVAILABILITY", "product": "POD", "count": gpus, "cloud": "SECURE"})
         offers = []
         for g in cat.get("gpus") or []:
-            if not HOPPER_PLUS.search(g["id"]) or (g.get("memory") or 0) < min_vram:
+            if vendor_of(g["id"]) not in self.vendors or (g.get("memory") or 0) < min_vram:
                 continue
             per_gpu = (g.get("price") or {}).get("secure")
             if not per_gpu:
@@ -370,8 +427,8 @@ class RunPod(Provider):
         direct = (p.get("ssh") or {}).get("direct") or {}
         return p.get("status", "?"), direct.get("host"), int(direct.get("port") or 22)
 
-    def named(self, name):
-        return [p["id"] for p in runpod_list("/pods", "pods") if p.get("name") == name]
+    def instances(self):
+        return [Instance(p["id"], p.get("name"), p.get("status")) for p in runpod_list("/pods", "pods")]
 
     def release(self, iid, e):
         runpod("DELETE", f"/pods/{iid}")
@@ -395,12 +452,6 @@ class RunPod(Provider):
         except ApiError as e:
             print(f"  key's account: unknown ({e})")
 
-    def listing(self):
-        """All of RunPod's pods, for `list --all`."""
-        if self.enabled():
-            for p in runpod_list("/pods", "pods"):
-                yield f"runpod:{p['id']}  {p.get('name')}  {p.get('status')}  ${p.get('cost', '?')}/hr"
-
 
 class Lambda(Provider):
     name, key_env, user = "lambda", "LAMBDA_API_KEY", "ubuntu"
@@ -417,7 +468,7 @@ class Lambda(Provider):
             desc = it.get("gpu_description", "")
             n = it.get("specs", {}).get("gpus", 0)
             vram = lambda_vram(desc)
-            if not HOPPER_PLUS.search(desc) or n < gpus or (vram is not None and vram < min_vram):
+            if vendor_of(desc) not in self.vendors or n < gpus or (vram is not None and vram < min_vram):
                 continue
             # GH200 is arm64; the torch/flashinfer wheels this repo installs are x86_64-first.
             if it.get("architecture", "x86_64") != "x86_64" and not allow_arm:
@@ -453,8 +504,9 @@ class Lambda(Provider):
         i = lambda_("GET", f"/instances/{e['instance_id']}") or {}
         return i.get("status", "?"), i.get("ip"), 22
 
-    def named(self, name):
-        return [i["id"] for i in lambda_("GET", "/instances") or [] if i.get("name") == name]
+    def instances(self):
+        return [Instance(i["id"], i.get("name"), i.get("status")) for i in lambda_("GET", "/instances") or []
+                if i.get("status") not in ("terminating", "terminated")]
 
     def release(self, iid, e):
         lambda_("POST", "/instance-operations/terminate", {"instance_ids": [iid]})
@@ -465,30 +517,24 @@ class Lambda(Provider):
     def explain_no_storage(self):
         pass
 
-    def listing(self):
-        """All of Lambda's instances, for `list --all`."""
-        if self.enabled():
-            for i in lambda_("GET", "/instances") or []:
-                yield f"lambda:{i['id']}  {i.get('name')}  {i.get('status')}  {i['instance_type']['name']}"
-
 
 class Eras(Provider):
     name, key_env = "eras", "ERAS_API_KEY"
-    fixed_deadline = True
+    fixed_deadline = takes_run = True
 
     @classmethod
     def pool(cls, cfg, offer_id):
         return cls(cfg).offers(1, 0, False)
 
     def offers(self, gpus, min_vram, all_regions, allow_arm=False):
-        # Hopper+ is checked here rather than in the filter: Eras names models "H200", "B300", ...
+        # The model is checked here rather than in the filter: Eras names models "H200", "B300", ...
         flt = json.dumps({"field": "hardware.gpu.count", "op": ">=", "value": gpus})
         page, offers = eras("GET", "/compute-listings", params={"page_size": 100, "filter": flt}), []
         for x in page.get("items") or []:
             g = (x.get("hardware") or {}).get("gpu") or {}
             m = GIB.match(str(g.get("memory_per_device") or ""))
             vram = int(float(m.group(1)) * (1024 if m.group(2).upper() == "T" else 1)) if m else None
-            if not HOPPER_PLUS.search(str(g.get("model") or "")) or (vram is not None and vram < min_vram):
+            if vendor_of(str(g.get("model") or "")) not in self.vendors or (vram is not None and vram < min_vram):
                 continue
             if x.get("hourly_price") is None:
                 continue
@@ -540,15 +586,119 @@ class Eras(Provider):
                                            if failure else "")
         return st, ssh and ssh.get("host"), int((ssh or {}).get("port") or 22)
 
-    def named(self, name):
-        return [i["id"] for i in eras_items("/instances", 200)
-                if i.get("name") == name and i.get("status") not in ("ended", "releasing")]
+    def instances(self):
+        return [Instance(i["id"], i.get("name"), i.get("status")) for i in eras_items("/instances", 200)
+                if i.get("status") not in ("ended", "releasing")]
 
     def release(self, iid, e):
         eras("POST", f"/instances/{iid}/release", {})
 
 
-PROVIDERS = {cls.name: cls for cls in (Eras, RunPod, Lambda)}
+class DigitalOcean(Provider):
+    """GPU Droplets: one offer per size, created in the first region its listing names. /v2/sizes marks every GPU
+    size available, but only a size's `regions` are where it can launch now, and a create elsewhere is refused
+    ("Size is not available in this region"); a size with none can't start, and only --all-regions lists it."""
+    name, key_env = "digitalocean", "DIGITALOCEAN_TOKEN"
+    vendors = ("nvidia", "amd")
+    takes_run = True
+
+    @classmethod
+    def pool(cls, cfg, offer_id):  # read again at launch: a size whose regions emptied since is "no longer available"
+        return cls(cfg).offers(1, 0, False)
+
+    def offers(self, gpus, min_vram, all_regions, allow_arm=False):
+        offers = []
+        for s in digitalocean_list("/sizes", "sizes"):
+            g = s.get("gpu_info") or {}
+            gpu = str(g.get("model") or "").replace("_", " ").upper()  # nvidia_h100 -> NVIDIA H100
+            vram = (g.get("vram") or {}).get("amount") or 0
+            # Contracted sizes are sold under a contract, never created self-serve; a spot size can be taken
+            # back mid-run, which would lose the test.
+            regions = s.get("regions") or []
+            if vendor_of(gpu) not in self.vendors or (g.get("count") or 0) < gpus or vram < min_vram \
+                    or s["slug"].endswith(("-contracted", "-spot")) or not (regions or all_regions):
+                continue
+            offers.append({
+                "id": f"digitalocean:{s['slug']}", "provider": "digitalocean", "gpu": gpu, "count": g["count"],
+                "vram_gb": vram, "region": regions[0] if regions else "none",
+                "usd_per_hour": round(s["price_hourly"], 2),
+                "availability": "available" if regions else "none", "storage": True,
+            })
+        return offers
+
+    def plan(self, o, name, pubkey, hours, args):
+        # DigitalOcean's AI/ML-ready images: ROCm for AMD; for NVIDIA one for every 1-GPU size, one for 8.
+        image = ("gpu-amd-base" if vendor_of(o["gpu"]) == "amd" else
+                 "gpu-h100x8-base" if o["count"] > 1 else "gpu-h100x1-base")
+        key = "<registered at launch>" if args.dry_run else digitalocean_ssh_key(pubkey, name)
+        body = {"name": name, "size": o["id"].split(":", 1)[1], "region": o["region"], "image": image,
+                "ssh_keys": [key]}
+        if args.run:
+            secret = self.cfg.get("digitalocean", {}).get("run_secret_env")
+            if secret and not args.dry_run and not os.environ.get(secret):
+                die(f"digitalocean.run_secret_env names {secret}, which is not set; the box would have no key")
+            body["user_data"] = cloud_config(args.run, args.input, secret and (
+                "<the value of $" + secret + ">" if args.dry_run else os.environ[secret]))
+            if len(body["user_data"].encode()) > USER_DATA_MAX:
+                die(f"the --run script and inputs take {len(body['user_data'].encode())} bytes of user_data, over "
+                    f"DigitalOcean's {USER_DATA_MAX}; send smaller inputs")
+        return body, lambda: str(digitalocean("POST", "/droplets", body, retry=False)["droplet"]["id"])
+
+    def hf_home(self):
+        return self.cfg.get("digitalocean", {}).get("hf_home", "/workspace/hf")
+
+    def status(self, e):
+        try:
+            d = digitalocean("GET", f"/droplets/{e['instance_id']}")["droplet"]
+        except ApiError as err:
+            if err.status == 404:  # deleted, by terminate or by hand
+                return "ended", None, 22
+            raise
+        host = next((n.get("ip_address") for n in (d.get("networks") or {}).get("v4") or []
+                     if n.get("type") == "public"), None)
+        return "ended" if d.get("status") == "archive" else d.get("status", "?"), host, 22
+
+    def instances(self):
+        # GPU droplets are listed only with type=gpus.
+        return [Instance(str(d["id"]), d.get("name"), d.get("status"),
+                         datetime.datetime.fromisoformat(d["created_at"].replace("Z", "+00:00")).timestamp())
+                for d in digitalocean_list("/droplets", "droplets", {"type": "gpus"}) if d.get("status") != "archive"]
+
+    def release(self, iid, e):
+        digitalocean("DELETE", f"/droplets/{iid}")
+
+
+USER_DATA_MAX = 64 * 1024  # what DigitalOcean takes in a droplet's user_data
+
+
+def cloud_config(run: str, inputs: list[str], secret: str | None) -> str:
+    """The user_data that runs `run` at boot as `launch --run` does on Eras: the script and its inputs in
+    /run/live-pr, a secret at /run/live-pr-key/value as Eras mounts run_secret_id, and the script started
+    as a unit of its own so cloud-init isn't left waiting on it. JSON is YAML, which cloud-init reads."""
+    def entry(path, data):
+        return {"path": path, "encoding": "gz+b64", "permissions": "0600",
+                "content": base64.b64encode(gzip.compress(data, mtime=0)).decode()}
+    files = [entry(f"/run/live-pr/{Path(f).name}", Path(f).read_bytes()) for f in [run, *inputs]]
+    if secret:
+        files.append(entry("/run/live-pr-key/value", secret.encode()))
+    return "#cloud-config\n" + json.dumps({"write_files": files, "runcmd": [
+        ["systemd-run", "--unit", "live-pr", "bash", f"/run/live-pr/{Path(run).name}"]]})
+
+
+def digitalocean_ssh_key(pubkey: str, name: str) -> str:
+    """The team's fingerprint for this public key, registering it the first time, under the launch's name.
+    A droplet created with no key gets a root password instead."""
+    blob = base64.b64decode(pubkey.split()[1])
+    fingerprint = ":".join(f"{b:02x}" for b in hashlib.md5(blob, usedforsecurity=False).digest())
+    try:
+        return digitalocean("GET", f"/account/keys/{fingerprint}")["ssh_key"]["fingerprint"]
+    except ApiError as err:
+        if err.status != 404:
+            raise
+    return digitalocean("POST", "/account/keys", {"name": name, "public_key": pubkey})["ssh_key"]["fingerprint"]
+
+
+PROVIDERS = {cls.name: cls for cls in (Eras, RunPod, Lambda, DigitalOcean)}
 
 
 def provider_of(cfg: dict, record: dict) -> Provider:
@@ -568,7 +718,7 @@ def job_name(pr: int, tag: str) -> str:
 
 def cmd_offers(args, cfg):
     offers, errors, answered, failed = [], [], 0, []
-    for p in (Eras(cfg), RunPod(cfg), Lambda(cfg)):  # one that can't be reached is skipped, with its reason
+    for p in (cls(cfg) for cls in PROVIDERS.values()):  # one that can't be reached is skipped, with its reason
         if not p.enabled():
             errors.append(f"{p.name}: skipped (disabled, or no API key)")
             continue
@@ -578,6 +728,8 @@ def cmd_offers(args, cfg):
         except ApiError as e:
             errors.append(f"{p.name}: {e}")
             failed.append(p.name)
+    offers = [{**o, "vendor": vendor_of(o["gpu"])} for o in offers]
+    offers = [o for o in offers if o["vendor"] == args.vendor]
     offers.sort(key=lambda o: (o["availability"] == "none", o["usd_per_hour"], o["count"]))  # what can start now first
     cap = cfg["budget"]["max_usd_per_hour"]
     # No offers with a provider that errored, or none answering, says nothing about capacity there:
@@ -594,7 +746,7 @@ def cmd_offers(args, cfg):
         die(f"availability unknown: {', '.join(failed) or 'no provider'} didn't answer (see above), "
             "and no provider that did has an offer; fix the keys or the errors")
     if all(o["availability"] == "none" for o in offers):
-        print(f"no availability: no Hopper+ box with >= {args.gpus} GPUs"
+        print(f"no availability: no {args.vendor} box with >= {args.gpus} GPUs"
               + ("" if args.all_regions else " in a region with team storage (try --all-regions)"))
         if not offers:
             return
@@ -672,6 +824,8 @@ def check_total(cfg, committed: float, allow: bool) -> None:
 
 
 def cmd_launch(args, cfg):
+    if args.boxes < 1:  # fewer would let budget.max_running pass a launch past it
+        die(f"--boxes is {args.boxes}; it counts this launch, so it is at least 1")
     o = find_offer(cfg, args.offer)
     if not o["storage"]:
         die(f"{o['region']} has no team storage; the HF cache would be cold. Pick a region with storage.")
@@ -681,6 +835,8 @@ def cmd_launch(args, cfg):
     check_hours(cfg, hours, args.allow_over_budget)
     pubkey = Path(cfg["ssh_public_key"]).expanduser().read_text().strip()
     p = provider_of(cfg, o)
+    if args.run and not p.takes_run:
+        die(f"{p.name} can't take --run; launch without it and start the work over ssh")
     # unique per launch, so a create whose answer was lost is found again by this name. A --tag is the
     # caller's own unique name: what it looks the instance up by, and what makes an Eras launch idempotent.
     name = job_name(args.pr, args.tag or f"{time.strftime('%m%d-%H%M%S')}-{secrets.token_hex(2)}")
@@ -699,14 +855,15 @@ def cmd_launch(args, cfg):
                     f"{max_instances}. Wait for one to finish, or ask before passing --allow-over-budget")
             if max_running is not None and not args.allow_over_budget:
                 try:
+                    for line in reap(cfg):
+                        print(f"gpu.py: {line}", file=sys.stderr)
                     up = running(cfg)
                 except ApiError as err:
-                    if isinstance(p, Eras):
-                        die(f"can't count this tool's Eras instances for budget.max_running: {err}")
-                    up = []  # an Eras outage doesn't stop a launch elsewhere
-                if len(up) >= max_running:
-                    die(f"{len(up)} of this tool's instances are up, from every session; budget.max_running is "
-                        f"{max_running}. Wait for one to end, or ask before passing --allow-over-budget", code=4)
+                    die(f"can't count this tool's instances for budget.max_running: {err}")
+                if len(up) + args.boxes > max_running:
+                    die(f"{len(up)} of this tool's instances are up, from every session, and this launch needs room "
+                        f"for {args.boxes}; budget.max_running is {max_running}. Wait for one to end, or ask before "
+                        "passing --allow-over-budget", code=4)
             check_total(cfg, sum(committed_usd(e) for e in live.values()) + o["usd_per_hour"] * hours,
                         args.allow_over_budget)
         body, create = p.plan(o, name, pubkey, hours, args)
@@ -769,7 +926,6 @@ ERAS_GPU_NOTEBOOK = "ed6d2a30-36aa-5d50-b911-1f6b551f2081"  # Eras Cloud Noteboo
 def eras_ssh_key_id(pubkey: str, name: str) -> str:
     """The organization's id for this public key, registering it the first time, under the launch's
     name. It stays registered for later launches."""
-    import hashlib
     blob = base64.b64decode(pubkey.split()[1])
     fingerprint = "SHA256:" + base64.b64encode(hashlib.sha256(blob).digest()).decode().rstrip("=")
     for k in eras_items("/ssh-keys", 100):
@@ -871,7 +1027,6 @@ def eras_create(body: dict) -> str:
     reused with another request, so each attempt (listing, cache volume) has its own. The create is
     sent again only after a 429, with the same key; any other failure may have come after Eras acted,
     so it goes to launch, which finds the instance by name."""
-    import hashlib
     preview = eras("POST", "/instances/preview", body)
     problems = (preview.get("run") or {}).get("problems") or []
     if problems:
@@ -929,7 +1084,7 @@ def cmd_wait(args, cfg):
             die(f"{args.instance} is {st}")
         if host:
             e["host"], e["port"] = host, port
-            probe = remote(e, cfg, "nvidia-smi -L")
+            probe = remote(e, cfg, "nvidia-smi -L || amd-smi list")
             probe[1:1] = ["-o", "BatchMode=yes"]
             r = subprocess.run(probe, capture_output=True, text=True, check=False)
             if r.returncode == 0:
@@ -1018,24 +1173,50 @@ def cmd_extend(args, cfg):
     print(f"{args.instance} deadline now {time.strftime('%H:%M', time.localtime(e['deadline']))}")
 
 
+def enabled_providers(cfg: dict) -> list[Provider]:
+    return [p for p in (cls(cfg) for cls in PROVIDERS.values()) if p.enabled()]
+
+
 def running(cfg: dict) -> list[str]:
-    """This tool's Eras instances up now, from every session and machine (the ledger has only this
-    machine's), one line each; none without an Eras key. "This tool's" goes by name, so every
-    live-pr-* instance in the Eras organization counts. budget.max_running reads this list, then
-    launches: a soft cap, since two machines can both see the last free slot."""
-    if not Eras(cfg).enabled():
-        return []
-    return [f"eras:{i['id']}  {i.get('name')}  {i.get('status')}" for i in eras_items("/instances", 200)
-            if str(i.get("name")).startswith(JOB_PREFIX) and i.get("status") not in ("ended", "releasing")]
+    """This tool's instances up now on every enabled provider, from every session and machine (the
+    ledger has only this machine's), one line each. "This tool's" goes by name, so every live-pr-*
+    instance on those accounts counts. budget.max_running reads this list, then launches: a soft cap,
+    since two machines can both see the last free slot. A provider that can't be listed raises, so the
+    cap fails closed."""
+    return [f"{p.name}:{i.id}  {i.name}  {i.status}" for p in enabled_providers(cfg) for i in p.instances()
+            if str(i.name).startswith(JOB_PREFIX)]
 
 
-def release_by_name(cfg: dict, pr: int, tag: str) -> None:
-    """End whatever this tool launched on Eras for `pr` and `tag`, by its name, for a launch cancelled
-    before its instance was recorded."""
-    eras_cloud = Eras(cfg)
-    if eras_cloud.enabled():
-        for iid in eras_cloud.named(job_name(pr, tag)):
-            eras_cloud.release(iid, {})
+def reap(cfg: dict) -> list[str]:
+    """Release this tool's instances, from every session and machine, that outlived their deadline: their
+    ledger entry's, else budget.max_hours plus an hour from their creation. Only on enabled providers whose
+    instances have no deadline of their own and whose listing dates them. What it released, one line each."""
+    d, grace, released = ledger(), (cfg["budget"]["max_hours"] + 1) * 3600, []
+    for p in enabled_providers(cfg):
+        if p.fixed_deadline:
+            continue
+        for i in p.instances():
+            e = d.get(f"{p.name}:{i.id}")
+            deadline = e["deadline"] if e else i.created and i.created + grace
+            if str(i.name).startswith(JOB_PREFIX) and deadline and time.time() > deadline:
+                p.release(i.id, e or {})
+                released.append(f"released {p.name}:{i.id}  {i.name}, past its deadline")
+    return released
+
+
+def release_by_name(cfg: dict, names: list[str]) -> None:
+    """End whatever this tool launched with these names (job_name) on any enabled provider, for a launch
+    cancelled before its instance was recorded. Every provider is tried; the first error is raised after."""
+    failed = None
+    for p in enabled_providers(cfg):
+        try:
+            for iid in [i.id for i in p.instances() if i.name in names]:
+                p.release(iid, {})
+        except ApiError as err:
+            print(f"{p.name}: {err}", file=sys.stderr)
+            failed = failed or err
+    if failed:
+        raise failed
 
 
 def cmd_list(args, cfg):
@@ -1052,17 +1233,18 @@ def cmd_list(args, cfg):
         print(f"{key}  pr {e['pr']}  {e['count']}x {e['gpu']} {e['region']}  {st}  "
               f"{hrs:.2f} h, ~${hrs * e['usd_per_hour']:.2f}  deadline in {left:.0f} min")
     if args.all:
-        print("--- this tool's on Eras, from every session; all of RunPod and Lambda ---")
-        for line in RunPod(cfg).listing():
-            print(line)
+        print("--- this tool's on every provider, from every session ---")
         try:
             up = running(cfg)
         except ApiError as err:
-            up = [f"eras: {err}"]
+            up = [f"? {err}"]
         for line in up:
             print(line)
-        for line in Lambda(cfg).listing():
-            print(line)
+
+
+def cmd_reap(args, cfg):
+    for line in reap(cfg) or ["nothing past its deadline"]:
+        print(line)
 
 
 def cmd_watchdog(args, cfg):
@@ -1088,7 +1270,7 @@ def cmd_check(args, cfg):
     print(f"budget: ${cfg['budget']['max_usd_per_hour']}/hr, {cfg['budget']['max_hours']} h")
     key_ok = Path(cfg["ssh_public_key"]).expanduser().exists()
     print(f"ssh key: {cfg['ssh_public_key']} ({'ok' if key_ok else 'MISSING'})")
-    for p in (RunPod(cfg), Lambda(cfg)):
+    for p in (cls(cfg) for cls in PROVIDERS.values()):
         if not p.enabled():
             print(f"{p.name}: skipped (disabled or no API key)")
             continue
@@ -1096,6 +1278,8 @@ def cmd_check(args, cfg):
             stores = p.storage()
         except ApiError as e:
             print(f"{p.name}: {e}")
+            continue
+        if stores is None:  # no team storage to check
             continue
         where = ", ".join(
             f"any data center (global volume {s['name']!r}, {s['id']})" if r == GLOBAL
@@ -1111,6 +1295,7 @@ def main():
     sub.add_parser("check")
     p = sub.add_parser("offers")
     p.add_argument("--gpus", type=int, required=True)
+    p.add_argument("--vendor", choices=sorted(SUPPORTED), default="nvidia")
     p.add_argument("--min-vram", type=int, default=80)
     p.add_argument("--all-regions", action="store_true")
     p.add_argument("--json", action="store_true")
@@ -1121,15 +1306,19 @@ def main():
     p.add_argument("--hours", type=float)
     p.add_argument("--tag", help="names the instance live-pr-<pr>-<tag> (and makes an Eras launch idempotent); "
                                 "by default the time and 4 hex digits")
-    p.add_argument("--run", help="Eras: a script that is the work itself; the GPUs go when it ends")
+    p.add_argument("--run", help="Eras, DigitalOcean: a script that is the work itself (on Eras the GPUs go when it "
+                                "ends)")
     p.add_argument("--input", action="append", default=[],
                    help="a file for the --run script, in /run/live-pr. No secrets here: the files stay in the "
-                        "run's record; use eras.run_secret_id")
+                        "run's record; use eras.run_secret_id or digitalocean.run_secret_env")
     cache = p.add_mutually_exclusive_group()
     cache.add_argument("--cache", choices=("ro", "none"), default="ro",
                        help="Eras: mount a free one of eras.cache_volume_ids read-only at /cache (default), or none")
     cache.add_argument("--cache-write", metavar="ID",
                        help="Eras: mount this cache volume read-write at /cache instead, to fill it; dies if held")
+    p.add_argument("--boxes", type=int, default=1,
+                   help="budget.max_running must leave room for this many, this one and those launched after it "
+                        "for the same job")
     p.add_argument("--allow-over-budget", action="store_true")
     p.add_argument("--dry-run", action="store_true")
     p = sub.add_parser("wait")
@@ -1151,13 +1340,14 @@ def main():
     p.add_argument("--allow-over-budget", action="store_true")
     p = sub.add_parser("terminate")
     p.add_argument("instance")
+    sub.add_parser("reap")
     p = sub.add_parser("watchdog")
     p.add_argument("instance")
     args = ap.parse_args()
     cfg = load_config()
     handler = {"check": cmd_check, "offers": cmd_offers, "launch": cmd_launch, "wait": cmd_wait,
                "ssh": cmd_ssh, "push": cmd_copy, "pull": cmd_copy, "list": cmd_list, "extend": cmd_extend,
-               "terminate": cmd_terminate, "watchdog": cmd_watchdog}[args.cmd]
+               "terminate": cmd_terminate, "reap": cmd_reap, "watchdog": cmd_watchdog}[args.cmd]
     try:
         handler(args, cfg)
     except ApiError as e:

@@ -136,7 +136,7 @@ class _Node:
             self.cg = AcceleratorGraphRunner(
                 submodule_name=NODE, submodule=submodule, resources=self.resources,
                 step_runner=self.runner, device=DEVICE, autocast_dtype=DTYPE,
-                joint_comm_group=self.groups, num_slots=1,
+                joint_comm_group=self.groups, num_slots=1, head_shards=self.groups.world_size,
                 # the serving config's prefill_token_buckets, as the engine hands it over
                 token_ladders={"prefill": [PREFILL_BUCKET]},
             )

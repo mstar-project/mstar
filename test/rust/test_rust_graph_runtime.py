@@ -972,7 +972,7 @@ def _run_dec_step(rt, rid, uuid, inline_value=None):
     bk.increment_ref(uuid, 1)  # the worker's safety hold
     kwargs = {}
     if inline_value is not None:
-        kwargs = dict(inline_signal="token", inline_values=[inline_value])
+        kwargs = dict(inline_signals=["token"], inline_values=[inline_value])
     return rt.complete_and_route_batch(RouteInput(
         partition="default", graph_walk=WALK, node_name="dec",
         output_signals=["token"],
@@ -1030,7 +1030,7 @@ def test_a_row_with_no_inline_value_takes_the_tensor_path(inline_values):
     out = rt.complete_and_route_batch(RouteInput(
         partition="default", graph_walk=WALK, node_name="dec",
         output_signals=["token"], wg_ids=ParallelList([rid], [WG_ID]),
-        tensors=[201], num_tensors=[1], inline_signal="token", inline_values=inline_values,
+        tensors=[201], num_tensors=[1], inline_signals=["token"], inline_values=inline_values,
     ))
     assert 201 in out.register_uuids, "no value, so the tensor path"
     rt.send_outputs(_send_input(rid, out.completion_id))
@@ -1051,7 +1051,7 @@ def test_inline_values_route_per_row():
     out = rt.complete_and_route_batch(RouteInput(
         partition="default", graph_walk=WALK, node_name="dec",
         output_signals=["token"], wg_ids=ParallelList(rids, [WG_ID, WG_ID]),
-        tensors=[212, 213], num_tensors=[1, 1], inline_signal="token", inline_values=[7, None],
+        tensors=[212, 213], num_tensors=[1, 1], inline_signals=["token"], inline_values=[7, None],
     ))
     assert 212 not in out.register_uuids, "r1's value rides inline"
     assert 213 in out.register_uuids, "r2 has none, so the tensor path"
@@ -1069,7 +1069,7 @@ def test_a_loop_back_routed_with_no_tensor_keeps_the_loop_going():
     out = rt.complete_and_route_batch(RouteInput(
         partition="default", graph_walk=WALK, node_name="dec",
         output_signals=["token"], wg_ids=ParallelList([rid], [WG_ID]),
-        tensors=[], num_tensors=[0], inline_signal="token", inline_values=[7],
+        tensors=[], num_tensors=[0], inline_signals=["token"], inline_values=[7],
     ))
     assert out.register_uuids == [], "nothing to stage for the client"
     rt.send_outputs(_send_input(rid, out.completion_id))
@@ -1083,7 +1083,7 @@ def test_a_loop_back_routed_with_no_tensor_keeps_the_loop_going():
     out = rt.complete_and_route_batch(RouteInput(
         partition="default", graph_walk=WALK, node_name="dec",
         output_signals=["token"], wg_ids=ParallelList([rid], [WG_ID]),
-        tensors=[], num_tensors=[0], inline_signal="token", inline_values=[8],
+        tensors=[], num_tensors=[0], inline_signals=["token"], inline_values=[8],
     ))
     assert out.freed_inputs.uuids == []
     rt.send_outputs(_send_input(rid, out.completion_id))

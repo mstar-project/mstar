@@ -77,14 +77,16 @@ def encode_ids(
     tokenizer, text: str, chunk_chars: int = DEFAULT_CHUNK_CHARS,
     max_chunks: int = DEFAULT_MAX_CHUNKS,
 ) -> list[int]:
-    """Token ids of ``text`` with the tokenizer's defaults for special
-    tokens: a long text goes through the Rust backend as a batch of chunks,
-    a short one (or a tokenizer without a Rust backend) through ``tokenizer``
-    itself."""
+    """Token ids of ``text`` as written: special tokens only where the text
+    spells them, never the post-processor's (a rendered chat template already
+    opens with its BOS), as ``apply_chat_template(tokenize=True)`` encodes.
+    A long text goes through the Rust backend as a batch of chunks, a short
+    one (or a tokenizer without a Rust backend) through ``tokenizer`` itself;
+    both give the same ids."""
     backend = getattr(tokenizer, "backend_tokenizer", None)
     cuts = cut_points(text, chunk_chars, max_chunks) if backend is not None else []
     if not cuts:
-        return list(tokenizer(text).input_ids)
+        return list(tokenizer(text, add_special_tokens=False).input_ids)
     _parallelism_on()
     encodings = backend.encode_batch(split_at(text, cuts), add_special_tokens=False)
     ids: list[int] = []

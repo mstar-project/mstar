@@ -7,11 +7,13 @@ consumer depends on the contract rather than on the cache.
 """
 
 import itertools
+from collections.abc import Sequence
 from typing import NamedTuple
 
 import numpy as np
 import torch
 
+from mstar.engine.resources.kv.config import RetentionPolicy
 from mstar.engine.resources.step import Segment
 
 
@@ -59,9 +61,57 @@ class SequenceView(NamedTuple):
     to_compute: int # new for this step
     start: int = 0
     generation: int = 0
+    # the stream's exact retention, which a kept-window read reaches through; None for every other stream
+    retention: RetentionPolicy | None = None
 
     def last_page_len(self, page_size: int) -> int:
         return (self.start + self.length)  % page_size
+
+
+class ReachSlots(NamedTuple):
+    """Each entry a kept-window read reaches on one row, in the order it attends them: the entry's page, and its
+    offset in the page."""
+
+    pages: np.ndarray
+    offsets: np.ndarray
+
+
+def kept_reach(view: SequenceView, page_size: int) -> ReachSlots:
+    """The entries ``view``'s row reaches: the first ``protected_prefix`` the stream kept before this step, the last
+    ``context_budget`` of them, then this step's, in log order; every entry where the stream has no retention. An exact
+    retention releases only whole pages between the two, so the window stays whole at the end of what the stream
+    kept, in the view's compacted page list."""
+    policy = view.retention
+    if policy is None:
+        ranges = ((0, view.length),)
+    else:
+        kept = view.length - view.to_compute
+        window = min(kept, max(policy.protected_prefix, kept - policy.context_budget))
+        ranges = ((0, min(policy.protected_prefix, kept)), (window, view.length))
+    # every slot's page and offset, then the ranges cut from them, with no division per entry
+    pages = np.repeat(np.asarray(view.page_idxs, dtype=np.int64), page_size)
+    offsets = np.tile(np.arange(page_size, dtype=np.int64), len(view.page_idxs))
+    cuts = [slice(view.start + a, view.start + b) for a, b in ranges]
+    return ReachSlots(np.concatenate([pages[cut] for cut in cuts]), np.concatenate([offsets[cut] for cut in cuts]))
+
+
+class StagedReach(NamedTuple):
+    """The reach of a step's rows on the device, rows end to end, for `KVCache.read_tokens`: each entry's page and
+    its offset in the page, and each row's count of entries."""
+
+    pages: torch.Tensor
+    offsets: torch.Tensor
+    lengths: tuple[int, ...]
+
+
+def stage_reach(views: Sequence[SequenceView], page_size: int, device: torch.device) -> StagedReach:
+    """`kept_reach` of each of ``views``, staged on ``device``."""
+    slots = [kept_reach(view, page_size) for view in views]
+    return StagedReach(
+        torch.from_numpy(np.concatenate([each.pages for each in slots])).to(device),
+        torch.from_numpy(np.concatenate([each.offsets for each in slots])).to(device),
+        tuple(len(each.pages) for each in slots),
+    )
 
 
 class PagedIndptrs(NamedTuple):
@@ -79,6 +129,29 @@ class PagedIndptrs(NamedTuple):
     # rebuild it with torch ops.
     kv_lens: torch.Tensor | None = None
 
+    def context_only(self, page_size: int, qo_indptr: torch.Tensor | None = None) -> "PagedIndptrs":
+        """Each row's KV cut to its stored context (its KV before the tokens the step appends at the
+        row's end), the pages past it dropped, for attention over the stored context alone
+        (``AttentionStep.context_only``). ``qo_indptr``: the rows' query counts, by default the
+        step's own."""
+        kvp = self.paged_kv_indptr.numpy().astype(np.int64)
+        if qo_indptr is not None and len(qo_indptr) != len(kvp):
+            raise ValueError(f"{len(qo_indptr) - 1} rows of query counts for a plan of {len(kvp) - 1}")
+        npages = np.diff(kvp)
+        lens = np.where(npages > 0, (npages - 1) * page_size + self.paged_kv_last_page_len.numpy(), 0)
+        stored = np.maximum(lens - np.diff(self.qo_indptr.numpy()), 0)
+        pages = -(-stored // page_size)
+        new_kvp, indices = first_pages(kvp, self.paged_kv_indices.numpy(), pages)
+        # as `build_paged_indptrs` gives a row with no pages
+        last = np.where(pages > 0, stored - (pages - 1) * page_size, page_size)
+        return PagedIndptrs(
+            qo_indptr=self.qo_indptr if qo_indptr is None else qo_indptr,
+            paged_kv_indptr=torch.from_numpy(new_kvp.astype(np.int32)),
+            paged_kv_indices=torch.from_numpy(indices.astype(np.int32)),
+            paged_kv_last_page_len=torch.from_numpy(last.astype(np.int32)),
+            kv_lens=torch.from_numpy(np.where(pages > 0, stored, page_size).astype(np.int32)).as_subclass(HostLens),
+        )
+
     def to_kwargs_dict(self):
         return dict(
             qo_indptr=self.qo_indptr,
@@ -89,18 +162,28 @@ class PagedIndptrs(NamedTuple):
         )
 
 
-def context_only_views(
-    views: list[SequenceView], query_spans: list[int], page_size: int,
-) -> list[SequenceView]:
-    """The views of a step's streams without the tokens the step appends: ``length`` shrinks by
-    ``to_compute`` (the pages beyond it dropped) and ``to_compute`` becomes the row's query count.
-    For attention over the stored context alone (``AttentionStep.context_only``)."""
-    out = []
-    for view, queries in zip(views, query_spans, strict=True):
-        length = view.length - view.to_compute
-        pages = -(-(view.start + length) // page_size) if length > 0 else 0
-        out.append(view._replace(page_idxs=view.page_idxs[:pages], length=length, to_compute=queries))
-    return out
+def first_pages(
+    paged_kv_indptr: np.ndarray, paged_kv_indices: np.ndarray, keep: np.ndarray, fill: int | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Each row's first ``keep`` pages of a plan's paged ``(indptr, indices)``, as a new pair
+    (int64 indptr, int32 indices). With ``fill``, a row that keeps none holds one page ``fill``."""
+    pages = keep if fill is None else np.where(keep > 0, keep, 1)
+    indptr = np.zeros(len(pages) + 1, dtype=np.int64)
+    np.cumsum(pages, out=indptr[1:])
+    row = np.repeat(np.arange(len(pages)), pages)
+    kept = np.repeat(keep > 0, pages)
+    indices = np.full(len(row), 0 if fill is None else fill, dtype=np.int32)
+    indices[kept] = paged_kv_indices[(paged_kv_indptr[row] + np.arange(len(row)) - indptr[row])[kept]]
+    return indptr, indices
+
+
+def token_runs(starts: np.ndarray, lens: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """``(indptr, ids)`` for runs of consecutive token ids, ``arange(start, start + len)`` each,
+    end to end: a query block's keys as pages of one token each, the page lists the paged kernel
+    takes."""
+    indptr = np.zeros(len(lens) + 1, dtype=np.int64)
+    np.cumsum(lens, out=indptr[1:])
+    return indptr, np.repeat(starts - indptr[:-1], lens) + np.arange(indptr[-1])
 
 
 def build_paged_indptrs(

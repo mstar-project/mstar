@@ -565,6 +565,7 @@ class APIServer:
         self.served_models = ServedModels.of(
             model_name, model_config, lora.adapter_digests if lora is not None else None,
         )
+        self.served_models.refuse_unserved(model)
         # Requests to a model with client streams keep their input open until
         # the client ends it (see ``stream_input``).
         connections = model.get_partition_topology().client_connections() if model is not None else []
@@ -596,6 +597,7 @@ class APIServer:
             enable_nvtx=self.enable_nvtx,
             is_pending=self.is_pending,
             upload_dir=self.upload_dir,
+            served_models=self.served_models,
         )
 
         # /v1/load_lora_adapter and /v1/unload_lora_adapter; sent from the data worker
@@ -2070,7 +2072,8 @@ class WarmupRequest:
             output_modalities=self.output_modalities,
             model_kwargs=self.model_kwargs,
             prompt_parts=parts or None,
-            streaming=False,
+            # collect_results waits for the end either way
+            streaming=bool(STREAMING_ONLY_MODALITIES.intersection(self.output_modalities)),
             request_id=request_id,
         )
 
@@ -3026,6 +3029,20 @@ def deployment_cpu_plan(config: dict) -> cpus.CpuPlan:
     return cpus.CpuPlan(plan.mask, plan.usable, why=f"not pinned: {refused}")
 
 
+def install_deployment_cpus(config: dict) -> None:
+    """Install the deployment's CPU plan for this process, and take the PM QoS
+    hold ``knobs: idle_hold: qos`` asks for. Run once, by the process that
+    starts the conductor (this server, or the Dynamo worker in its place),
+    before any pool thread: the pools are sized from the CPUs it leaves
+    unpinned."""
+    try:
+        cpus.install(deployment_cpu_plan(config))
+    except cpus.CpuPlanError as e:
+        raise SystemExit(f"mstar: {e}") from None
+    if knobs.idle_hold() == "qos":
+        logger.info(cpus.hold_idle())
+
+
 def _ws_max_size(config: dict) -> int:
     """The config's ``ws_max_message_mb``, in bytes: the largest WebSocket
     message the server reads (by default what an HTTP body may be, since one
@@ -3166,14 +3183,6 @@ def main(argv: list[str] | None = None):
     with open(args.config) as f:
         config = yaml.safe_load(f)
 
-    lora_block = (config.get("resources") or {}).get("lora") if lora_enabled(config) else None
-    if args.rust_frontend and isinstance(lora_block, dict) and lora_block.get("runtime_updates"):
-        # mstar-server reads the served adapters once at launch and has no
-        # /v1/load_lora_adapter or /v1/unload_lora_adapter
-        raise SystemExit(
-            "LoRA runtime updates (`runtime_updates: true` in the serving config's `lora:` block) "
-            "are served by the Python frontend only; drop --rust-frontend or the setting"
-        )
     try:
         _ws_max_size(config)  # here, not at the bind after the workers' compile
     except ValueError as e:
@@ -3197,13 +3206,7 @@ def main(argv: list[str] | None = None):
         cache_dir=args.cache_dir,
         **{**model_init_kwargs(model_name), **yaml_model_kwargs},
     )
-    # before any pool thread: the pools are sized from the CPUs it leaves unpinned
-    try:
-        cpus.install(deployment_cpu_plan(config))
-    except cpus.CpuPlanError as e:
-        raise SystemExit(f"mstar: {e}") from None
-    if knobs.idle_hold() == "qos":
-        logger.info(cpus.hold_idle())
+    install_deployment_cpus(config)
     _set_preprocess_threads(model, config)
 
     global api_server

@@ -13,7 +13,6 @@ from safetensors.torch import save_file
 from torch import nn
 
 from mstar.conductor.request_info import DEFAULT_PARTITION, FINAL_PREFILL, CurrentForwardPassInfo
-from mstar.distributed.communication import CommGroup
 from mstar.engine.resources import AttentionStep, SamplingReqConfig, StepContext
 from mstar.engine.state.adapters import node_handles, node_resources
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
@@ -234,13 +233,11 @@ class ModelIntegrationTests(unittest.TestCase):
             self.assertEqual(len(batched[rid]["image_embeds"][0]), len(tiles[rid]) * 4)
             torch.testing.assert_close(batched[rid]["image_embeds"][0], single["image_embeds"][0])
 
-    def test_load_dtype_and_reject_sequence_parallelism(self):
+    def test_load_dtype_and_reject_a_missing_checkpoint(self):
         save_file(checkpoint(self.model.config), Path(self.directory) / "model.safetensors")
         node = self.model.get_submodule("LLM", autocast_dtype=torch.bfloat16)
         self.assertTrue(all(p.dtype == torch.bfloat16 and not p.is_meta for p in node.parameters()))
         self.assertFalse(node.training)
-        with self.assertRaisesRegex(ValueError, "sequence parallelism"):
-            self.model.get_submodule("LLM", sp_group=CommGroup(0, 0, [0, 1]))
         with self.assertRaisesRegex(ValueError, "local checkpoint"):
             CommandAPlusModel("unavailable/repository")
 
@@ -274,7 +271,8 @@ class ModelIntegrationTests(unittest.TestCase):
         self.model._tokenizer = tokenizer
         # Room for the default output cap, which counts toward max_seq_len.
         self.model.max_seq_len = MAX_OUTPUT_TOKENS + 8
-        tensors, metadata = self.model.process_prompt("hello", ["text"], ["text"])
+        prompt = self.model.process_prompt("hello", ["text"], ["text"])
+        tensors, metadata = prompt.new_input_tensors, prompt.metadata
         self.assertEqual(tensors["text_inputs"][0].tolist(), [2, 10, 11])
         layout = metadata["state_layout"]["kv_cache"]["main"]
         self.assertEqual([span.length for span in layout.spans], [3])
@@ -322,9 +320,10 @@ class ModelIntegrationTests(unittest.TestCase):
         photos = [torch.rand(3, 40, 60), torch.rand(3, 20, 20)]
         parts = [PromptPart(modality="image", index=0), PromptPart(modality="text", text="hi"),
                  PromptPart(modality="image", index=1)]
-        result, metadata = self.model.process_prompt(
+        prompt = self.model.process_prompt(
             None, ["image", "text", "image"], ["text"], tensors={"image_inputs": photos}, prompt_parts=parts,
         )
+        result, metadata = prompt.new_input_tensors, prompt.metadata
         self.assertEqual(tokenizer.apply_chat_template.call_args.args[0], [{"role": "user", "content": [
             {"type": "image", "image": ""}, {"type": "text", "text": "hi"}, {"type": "image", "image": ""},
         ]}])

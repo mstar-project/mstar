@@ -780,9 +780,7 @@ class ChatterboxModel(Model):
         device: str = "cpu",
         tp_group=None,
         autocast_dtype: torch.dtype | None = None,
-        sp_group=None,
     ) -> NodeSubmodule | None:
-        del sp_group
         if node_name in self._submodule_cache:
             return self._submodule_cache[node_name]
         if node_name == VOICE_ENCODER_NODE:

@@ -17,6 +17,7 @@ from typing import NamedTuple
 import torch
 
 from mstar.api_server.media_io import remove_uploads
+from mstar.api_server.served_models import Selected, ServedModels
 from mstar.graph.base import GraphEdge, TensorPointerInfo
 from mstar.graph.loop_indices import NestedLoopIndices
 
@@ -47,11 +48,14 @@ from mstar.communication.tensors import (
 )
 from mstar.distributed.base import node_group_axis_sizes
 from mstar.engine.resources.kv.config import KVSpec, prefix_caches_by_rank
-from mstar.engine.resources.kv.keys import PageItem, chain, end_key, fingerprint, page_items
-from mstar.engine.resources.lora.config import LORA_ADAPTER_KWARG
+from mstar.engine.resources.kv.keys import PageItem, chain, end_key, fingerprint, page_items, variant_root
+from mstar.engine.resources.lora.config import LORA_ADAPTER_KWARG, LORA_DIGEST_KWARG
+from mstar.engine.resources.position.config import MAX_POSITION_KWARG
+from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.engine.state.adapters import kv_layouts
-from mstar.engine.state.contract import Array, Bidirectional, Block
+from mstar.engine.state.contract import Array
 from mstar.model.base import (
+    KEEP_ADAPTER,
     ClientChunk,
     Model,
     PrefixKeys,
@@ -136,6 +140,10 @@ def _sha256(path: str) -> bytes:
 def _file_state(path: str) -> tuple[int, int, int]:
     stat = os.stat(path)
     return stat.st_ino, stat.st_size, stat.st_mtime_ns
+
+
+# what the API server selects a request's adapter under; process_prompt's metadata keeps them
+_LORA_KWARGS = (LORA_ADAPTER_KWARG, LORA_DIGEST_KWARG)
 
 
 def _prefix_cache(model_kwargs: dict) -> bool:
@@ -225,10 +233,13 @@ def _preprocess_loop(**kwargs):
     worker.run()
 
 
-def _kv_page_sizes(model: Model, model_config: dict) -> dict[str, int]:
+def _kv_page_sizes(
+    model: Model, model_config: dict, specs: list[NodeResourceSpec] | None = None,
+) -> dict[str, int]:
     """Page size per KV resource whose prefix cache some rank's engine opens, after this deployment's
-    YAML has been applied."""
-    specs = serving_resources(model, model_config)
+    YAML has been applied. ``specs`` are its ``serving_resources``, when the caller has them."""
+    if specs is None:
+        specs = serving_resources(model, model_config)
     groups = [
         (group["ranks"], math.prod(node_group_axis_sizes(group).values()), group["node_names"])
         for group in model_config.get("node_groups") or []
@@ -280,9 +291,11 @@ class PreprocessWorker:
         enable_nvtx: bool=False,
         is_pending: Callable[[str], bool] | None = None,
         upload_dir: str | os.PathLike | None = None,
+        served_models: ServedModels | None = None,
     ):
         """``upload_dir`` is where the API server saves uploads: a request refused in
-        preprocessing has its files there removed at once."""
+        preprocessing has its files there removed at once. ``served_models`` is the API
+        server's, which checks an adapter ``process_prompt`` sets."""
         check_media_limits()
         self.request_input_queue = queue.Queue()
         self.result_tensor_input_queue = queue.Queue()
@@ -358,6 +371,7 @@ class PreprocessWorker:
                 conductor_outbox=self.conductor_outbox,
                 is_pending=is_pending,
                 upload_dir=upload_dir,
+                served_models=served_models,
             )
         )
         self.thread.start()
@@ -701,6 +715,8 @@ class PreprocessWorkerThread:
     # None (a thread built without __init__) leaves a refused request's uploads to the
     # HTTP layer's deferred cleanup
     upload_dir: str | os.PathLike | None = None
+    # resources naming a per-request KV variant; none for a thread built without __init__
+    _variant_specs: tuple[NodeResourceSpec, ...] = ()
     # the model's client streams by edge name; none for a thread built without __init__
     _client_edges: frozenset[str] = frozenset()
 
@@ -728,14 +744,24 @@ class PreprocessWorkerThread:
         conductor_outbox: queue.Queue | None = None,
         is_pending: Callable[[str], bool] | None = None,
         upload_dir: str | os.PathLike | None = None,
+        served_models: ServedModels | None = None,
     ):
         self.conductor_outbox = conductor_outbox
         self.upload_dir = upload_dir
+        # what an adapter process_prompt sets is checked against; none without the API server's
+        self._served_models = served_models or ServedModels(base=())
+        self._prompt_adapters = model.prompt_lora_adapters() if model is not None else frozenset()
         # keying a label needs the deployment's page size as well as the
         # model's declaration, so a worker built without a config keys no label
         declared = keyed_labels(model) if model is not None and model_config else {}
+        # the specs the conductor builds requests' configs from (``serving_resources``)
+        specs = serving_resources(model, model_config) if declared else []
         # resolved as the worker does at load, so both split a prompt into the same pages
-        self._prefix_page_sizes = _kv_page_sizes(model, model_config) if declared else {}
+        self._prefix_page_sizes = _kv_page_sizes(model, model_config, specs) if declared else {}
+        # those that name a per-request KV variant, in declaration order
+        self._variant_specs = tuple(
+            spec for spec in specs if type(spec).prefix_variant is not NodeResourceSpec.prefix_variant
+        )
         self._keyed_labels = {
             key: by_label for key, by_label in declared.items() if key in self._prefix_page_sizes
         }
@@ -971,12 +997,13 @@ class PreprocessWorkerThread:
         # only this worker keys a prompt: a client that sent its own could name
         # another request's pages and be served that request's KV, and a stream
         # lead past the edge's context would raise in the worker's ingest.
-        # Likewise only process_prompt sets the model's INTERNAL_KWARGS, and
-        # only this worker knows which client streams the opening leaves open.
+        # Likewise only process_prompt sets the model's INTERNAL_KWARGS and the
+        # LongRoPE ceiling (which picks the request's table and prefix variant),
+        # and only this worker knows which client streams the opening leaves open.
         internal = getattr(self.model, "INTERNAL_KWARGS", ())
         for name in (
             "prefix_keys", "prefix_tail", "prefix_decode", "kv_layout", "state_layout", "keyed_spans", "prefix_root",
-            "stream_lead_items", "open_streams", *internal,
+            "stream_lead_items", "open_streams", MAX_POSITION_KWARG, *internal,
         ):
             model_kwargs.pop(name, None)
         open_streams = self._client_edges - input.ends
@@ -992,8 +1019,14 @@ class PreprocessWorkerThread:
                 open_streams=open_streams,
                 **model_kwargs,
             )
+            root = input.prefix_root
             if isinstance(prompt_tensors, ProcessPromptOutput):
+                selected = input.model_kwargs or {}
                 model_kwargs.update(prompt_tensors.metadata)
+                if prompt_tensors.lora_adapter is not KEEP_ADAPTER or any(
+                    prompt_tensors.metadata.get(key, selected.get(key)) != selected.get(key) for key in _LORA_KWARGS
+                ):
+                    model_kwargs, root = self._model_chose(prompt_tensors, model_kwargs, selected, root)
                 prompt_tensors = prompt_tensors.new_input_tensors
             if prompt_tensors:
                 tensors.update(prompt_tensors)
@@ -1012,15 +1045,16 @@ class PreprocessWorkerThread:
                 model_kwargs["kv_layout"] = rows
             # after the update: the chain keys the tensors the request will
             # actually be prefilled with
-            if model_kwargs.get(LORA_ADAPTER_KWARG) is not None and not input.prefix_root:
+            if model_kwargs.get(LORA_ADAPTER_KWARG) is not None and not root:
                 # under the base model's empty root its pages would serve base requests
                 model_kwargs["prefix_cache"] = False
             if _prefix_cache(model_kwargs):
                 if self._whole_reads:
                     self._check_whole_steps(layouts)
+                for spec in self._variant_specs:
+                    root = self._fold_variant(spec, model_kwargs, root)
                 model_kwargs.update(self._prefix_keys(
-                    tensors, layouts, rows, input.file_paths, file_states,
-                    root=input.prefix_root,
+                    tensors, layouts, rows, input.file_paths, file_states, root=root,
                 ))
         elif input.text is not None:
             # Fallback: encode as UTF-8 bytes -> uint8 tensor
@@ -1029,6 +1063,37 @@ class PreprocessWorkerThread:
                 list(byte_data), dtype=torch.uint8, device=self.device
             )]
         return PreparedInput(tensors, input_metadata, model_kwargs, num_prompt_tokens)
+
+    def _model_chose(
+        self, output: ProcessPromptOutput, model_kwargs: dict, selected: dict, root: bytes,
+    ) -> Selected:
+        """The kwargs and prefix root of a request whose ``process_prompt`` set its adapter;
+        ``selected`` and ``root`` are as the API server selected them. A value the model's
+        contract rules out is a ``RuntimeError``: a 500, not the client's refusal."""
+        model = type(self.model).__name__
+        if any(model_kwargs.get(key) != selected.get(key) for key in _LORA_KWARGS):
+            raise RuntimeError(
+                f"{model}.process_prompt changes the adapter in its metadata, "
+                "not in ProcessPromptOutput.lora_adapter"
+            )
+        chosen = output.lora_adapter
+        if chosen is not None and (not isinstance(chosen, str) or chosen not in self._prompt_adapters):
+            raise RuntimeError(
+                f"{model}.process_prompt chose LoRA adapter {chosen!r}, which is not one of "
+                f"its prompt_lora_adapters {sorted(self._prompt_adapters)}"
+            )
+        return self._served_models.model_chose(chosen, model_kwargs, root)
+
+    def _fold_variant(self, spec: NodeResourceSpec, model_kwargs: dict, root: bytes) -> bytes:
+        """``root`` with ``spec``'s variant for the request folded in, if it names one."""
+        variant = spec.prefix_variant(model_kwargs)
+        if variant is None:
+            return root
+        if not isinstance(variant, bytes):
+            raise RuntimeError(
+                f"{type(spec).__name__}.prefix_variant returned {type(variant).__name__}, not bytes or None"
+            )
+        return variant_root(root, spec.resource_key, variant)
 
     def _finish_input(
         self, input: PreprocessInput, prepared: PreparedInput, profile: DataWorkerProfile | None,
@@ -1414,8 +1479,8 @@ class PreprocessWorkerThread:
         page, and the output tensor each label's sampled ids arrive in. The keys
         are not rooted in the process (the engine does that). Each keyed span's row
         in ``rows`` gains its digest and end key. The chains hang from ``root``
-        (``PreprocessInput.prefix_root``: a LoRA adapter's), which is also sent as
-        ``prefix_root``; a base request's hang from the empty root.
+        (a LoRA adapter's, with each resource's ``prefix_variant`` folded in), which is
+        also sent as ``prefix_root``; a base request's hang from the empty root.
         """
         if not self._keyed_labels:
             return {}
@@ -1492,7 +1557,7 @@ class PreprocessWorkerThread:
         return {
             array.name: whole for array in self._declarations
             if isinstance(array, Array) and array.name in self._keyed_labels and (whole := {
-                walk: key for key, read in array.reads.items() if isinstance(read.mask, Block | Bidirectional)
+                walk: key for key, read in array.reads.items() if read.mask.sees_step_whole
                 for walk in read.walks or (None,)
             })
         }

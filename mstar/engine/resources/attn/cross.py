@@ -37,6 +37,7 @@ from mstar.engine.resources.kv.plan import (
     PagedIndptrs,
     SequenceView,
 )
+from mstar.engine.resources.resident_hooks import ANY_REPEATS
 from mstar.engine.resources.step import SlotLease, StepContext
 from mstar.utils.profiler import PhaseLaps
 
@@ -153,6 +154,10 @@ class FlashInferCrossManager(CrossAttentionManager):
         if self._query_kv_cache_name == self._kv_cache_name:
             return "a context in the query's own pool would be a second stream on one resident row"
         return None
+
+    def max_repeats(self, step, ctx) -> int:
+        # the context doesn't grow and a replay's queries pack as its step's, so one plan serves every replay
+        return ANY_REPEATS
 
     def resident_gather(self, step: "CapturedResidentStep") -> None:
         # the host still plans FlashInfer's schedule
@@ -358,8 +363,8 @@ class FlashInferCrossManager(CrossAttentionManager):
         """Query packing off this step's own segments, for a query side with no
         KV cache: one entry per segment, in declared order.
 
-        No ``combined_labels`` here — that grouping lives on ``KVStep``, so a
-        cacheless query side plans one label per segment label.
+        ``combined_labels`` is read off the KV plan, not here, so a cacheless
+        query side plans one label per segment label.
         """
         rids: dict[str, list[str]] = {}
         qo_indptrs: dict[str, list[int]] = {}

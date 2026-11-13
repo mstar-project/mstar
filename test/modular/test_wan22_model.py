@@ -19,10 +19,12 @@ import pytest
 import torch
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.engine.resources.sequence_shard import sequence_parallel_refusals
+from mstar.engine.resources.spec import resolve_spec_dependencies
 from mstar.engine.state.adapters import node_resources, state_setup
 from mstar.graph.base import GraphNode, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.wan22.config import DIT_TOKENS, SELF_ATTN, WAN22_VARIANT_TI2V_5B, Wan22Config
+from mstar.model.wan22.config import DIT_SHARD, DIT_TOKENS, SELF_ATTN, WAN22_VARIANT_TI2V_5B, Wan22Config
 from mstar.model.wan22.submodules import (
     _DECODE_TILING_ENV,
     _DECODE_UNTILED_SAFETY_MARGIN,
@@ -108,14 +110,18 @@ def test_wan22_declares_expected_nodes():
 
 
 def test_wan22_declares_only_dit_attention_resources():
-    """Nothing here is cached across steps: the only resource is the dit's
-    cacheless self-attention, and the sdpa backend builds none."""
+    """Nothing here is cached across steps: the only resources are the dit's
+    cacheless self-attention and its sequence shard, and the sdpa backend builds
+    no attention, so the shard can't split its steps on SP ranks."""
     model = _make_model()
     specs = node_resources(model)
-    assert [spec.resource_key for spec in specs] == [SELF_ATTN]
+    assert [spec.resource_key for spec in specs] == [SELF_ATTN, DIT_SHARD]
     assert all(spec.nodes == {"dit"} for spec in specs)
     setup, _ = state_setup({"resources": {SELF_ATTN: {"backend": "sdpa"}}}, model.declare_state())
-    assert node_resources(model, setup=setup) == []
+    on_sdpa = node_resources(model, setup=setup)
+    assert [spec.resource_key for spec in on_sdpa] == [DIT_SHARD]
+    (refusal,) = sequence_parallel_refusals(resolve_spec_dependencies(on_sdpa).values(), "dit", 1, 2)
+    assert "its steps never split" in refusal
     assert model.get_request_resource_configs([], [], {}) == {}
 
 
@@ -855,7 +861,7 @@ class _BranchEcho(torch.nn.Module):
     """A dit stand-in whose prediction is each row's text embedding, broadcast."""
     dtype = torch.float32
 
-    def forward(self, hidden_states, timestep, encoder_hidden_states):
+    def forward(self, hidden_states, timestep, encoder_hidden_states, shard=None):
         return encoder_hidden_states[:, :1, :1, None, None].expand_as(hidden_states).clone()
 
 

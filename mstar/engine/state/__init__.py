@@ -14,6 +14,7 @@ from mstar.engine.state.calls import (
     drew,  # noqa: F401
     fused_draw_args,  # noqa: F401
     gated_delta_net,
+    gather,
     host,
     kernel_setting,  # noqa: F401
     last_sampled,
@@ -21,6 +22,8 @@ from mstar.engine.state.calls import (
     positions,
     rope,
     sample,
+    scatter,
+    split_range,
 )
 from mstar.engine.state.contract import (
     Array,
@@ -35,7 +38,9 @@ from mstar.engine.state.contract import (
     ChunkCausalStep,
     Entry,
     Fork,
+    FrameWindow,
     GatedDeltaNet,
+    KeptWindow,
     KVEntry,
     Layout,
     PagedNHD,
@@ -47,6 +52,7 @@ from mstar.engine.state.contract import (
     Sampler,
     SampleSettings,
     SampleStep,
+    SeqShard,
     TensorType,
     Value,
     Window,
@@ -71,8 +77,10 @@ __all__ = [
     "ChunkCausalStep",
     "Entry",
     "Fork",
+    "FrameWindow",
     "GatedDeltaNet",
     "KVEntry",
+    "KeptWindow",
     "Layout",
     "PagedNHD",
     "PagedNHDTarget",
@@ -84,6 +92,7 @@ __all__ = [
     "SampleStep",
     "Sampler",
     "Segment",
+    "SeqShard",
     "SlotLease",
     "Span",
     "TensorType",
@@ -93,12 +102,15 @@ __all__ = [
     "at_last_token",
     "causal_conv",
     "gated_delta_net",
+    "gather",
     "host",
     "last_sampled",
     "position",
     "positions",
     "rope",
     "sample",
+    "scatter",
+    "split_range",
     "state_op",
 ]
 

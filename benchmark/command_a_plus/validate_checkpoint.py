@@ -46,8 +46,9 @@ def encode(adapter, case):
     from mstar.model.multimodal import MEDIA_LAYOUT
 
     images = [adapter.load_image(path, "cpu").data for path in case["images"]]
-    inputs, metadata = adapter.process_prompt(None, ["image"] * len(images), ["text"],
-                                              tensors={"image_inputs": images}, messages=image_messages(case))
+    prompt = adapter.process_prompt(None, ["image"] * len(images), ["text"],
+                                    tensors={"image_inputs": images}, messages=image_messages(case))
+    inputs, metadata = prompt.new_input_tensors, prompt.metadata
     return inputs["text_inputs"][0], (torch.cat(inputs["pixel_values"]), metadata[MEDIA_LAYOUT])
 
 

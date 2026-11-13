@@ -13,10 +13,12 @@ keys are viewed as pages of one token, and each query block is one paged
 host-side index arithmetic done at plan time.
 """
 
+import numpy as np
 import torch
 
 from mstar.engine.resources.attn.ragged.wrappers import padded_head_dim, zero_unplanned_rows
 from mstar.engine.resources.attn.workspace import Workspace
+from mstar.engine.resources.kv.plan import token_runs
 
 
 def block_causal_layout(
@@ -28,7 +30,7 @@ def block_causal_layout(
     queries ``[off + i*B, off + min((i+1)*B, L))`` and keys
     ``[off, off + min((i+1)*B, L))``.
     """
-    qo, kv = [0], [0]
+    qo = [0]
     starts: list[int] = []
     lens: list[int] = []
     off = 0
@@ -36,17 +38,11 @@ def block_causal_layout(
         for s in range(0, n, block_size):
             e = min(s + block_size, n)
             qo.append(qo[-1] + e - s)
-            kv.append(kv[-1] + e)
             starts.append(off)
             lens.append(e)
         off += n
-    if not lens:
-        return qo, kv, torch.zeros(0, dtype=torch.int32)
-    lens_t = torch.tensor(lens, dtype=torch.int64)
-    # each block's prefix as a run of consecutive token ids, all runs end to end
-    run_start = torch.tensor(starts, dtype=torch.int64) - torch.tensor(kv[:-1], dtype=torch.int64)
-    indices = torch.arange(kv[-1], dtype=torch.int64) + run_start.repeat_interleave(lens_t)
-    return qo, kv, indices.to(torch.int32)
+    kv, indices = token_runs(np.array(starts, dtype=np.int64), np.array(lens, dtype=np.int64))
+    return qo, kv.tolist(), torch.from_numpy(indices.astype(np.int32))
 
 
 def max_blocks(max_segments: int, max_tokens: int, block_size: int) -> int:

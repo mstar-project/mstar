@@ -177,6 +177,9 @@ class _RecordingRuntime(PhasedPostprocess):
     def send_outputs(self, send_input):
         return []
 
+    def check_stops(self, *args):
+        return None  # undecided: the model's check_stop runs (STOPS)
+
     def complete_and_route_batch(self, route_input):
         self.routes.append(route_input)
         return RouteOutput(
@@ -185,7 +188,8 @@ class _RecordingRuntime(PhasedPostprocess):
         )
 
 
-def test_the_worker_routes_no_tensor_for_a_withheld_output(tmp_path):
+def _postprocess(tmp_path, runtime_checks=False):
+    """One step of ``_Producer`` through the worker's postprocess; the runtime."""
     engine = _engine(_Producer())
     runtime = _RecordingRuntime()
     tensor_manager = SharedMemoryCommunicationManager(
@@ -220,12 +224,29 @@ def test_the_worker_routes_no_tensor_for_a_withheld_output(tmp_path):
         node_name=NODE, partition="default", graph_walk=WALK, loop_name=None,
         speculative_new_iter=False,
     )
-
+    if runtime_checks:
+        # the runtime checks the walk's stops, and cannot decide: STOPS
+        w.executor._stop_token_signal[(NODE, WALK)] = None
     w.executor.postprocess(pending, BatchedModelOutput(per_rid_outputs=_outputs()))
+    return runtime
 
+
+def test_the_worker_routes_no_tensor_for_a_withheld_output(tmp_path):
+    runtime = _postprocess(tmp_path)
     assert runtime.stops == [{DROP: [LOOP]}]
     (route,) = runtime.routes
     assert list(route.wg_ids.keys) == [KEEP, DROP]
     # (KEEP: token, frame), (DROP: token, frame): the stop step's frame carries nothing
     assert route.num_tensors == [1, 1, 1, 0]
     assert len(route.tensors) == 3
+    assert route.withheld == {"frame": [DROP]}
+
+
+def test_the_stops_resume_names_what_the_check_withheld(tmp_path):
+    """When the runtime's own stop check cannot decide, the model's runs on
+    STOPS, after the request was built: the resume names its withheld rows,
+    so a signal riding the inline column sends them nothing too."""
+    runtime = _postprocess(tmp_path, runtime_checks=True)
+    assert runtime.stops == [{DROP: [LOOP]}]
+    (route,) = runtime.routes
+    assert route.withheld == {"frame": [DROP]}

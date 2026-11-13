@@ -55,6 +55,16 @@ def fingerprint(*fields: object) -> bytes:
     return hasher.digest()
 
 
+# folded into every variant's root, so no variant can coincide with an adapter's root
+_VARIANT_NAMESPACE = "prefix-variant"
+
+
+def variant_root(root: bytes, resource_key: str, variant: bytes) -> bytes:
+    """``root`` (an adapter's, or the base model's empty one) with the variant a resource
+    names for a request folded in (``NodeResourceSpec.prefix_variant``)."""
+    return fingerprint(_VARIANT_NAMESPACE, root, resource_key, variant)
+
+
 def page_key(
     prev: bytes, tokens: Sequence[int], items: Sequence[PageItem] = (),
 ) -> bytes:

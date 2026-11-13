@@ -71,6 +71,7 @@ class _Model:
 
     declare_state = Model.declare_state
     prompt_tokens = Model.prompt_tokens
+    prompt_lora_adapters = Model.prompt_lora_adapters
     postprocess_inline = Model.postprocess_inline
     text_output = Model.text_output
 

@@ -7,9 +7,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from mstar.model.qwen3_omni.config import THINKER_KV, THINKER_MIXED
+from mstar.model.qwen3_omni.config import THINKER_KV, THINKER_MIXED, THINKER_SHARD
 from mstar.model.qwen3_omni.submodules import ThinkerSubmodule
-from mstar.model.submodule_base import ARNodeInputs
+from mstar.model.submodule_base import ARNodeInputs, with_segment_steps
 
 HIDDEN = 4
 
@@ -123,6 +123,22 @@ def test_declare_step_stamps_the_key_cg_key_info_leased(thinker, step_walk, walk
     step = thinker.declare_step(step_walk, list(range(len(rows))), rows)
 
     assert step.cg_key_info == thinker.cg_key_info(step_walk, info)
+
+
+@pytest.mark.parametrize("step_walk,walks", [
+    ("thinker_decode", ["thinker_decode", "thinker_decode"]),
+    ("prefill_text", ["prefill_text"]),
+    ("prefill_vision", ["prefill_vision"]),
+    (THINKER_MIXED, ["thinker_decode", "prefill_audio"]),
+])
+def test_every_step_plans_the_sequence_shard_over_its_tokens(thinker, step_walk, walks):
+    """The Thinker's attention and positions depend on its sequence shard, whose step the engine
+    adds from the node's segments (the Thinker declares none), at any SP size."""
+    rows = [_row(1 if w == "thinker_decode" else 3, w) for w in walks]
+
+    step = with_segment_steps(thinker.declare_step(step_walk, list(range(len(rows))), rows), (THINKER_SHARD,))
+
+    assert step.steps[THINKER_SHARD].segments == tuple(step.segments) and len(step.segments) == len(rows)
 
 
 class _DecodeModel:

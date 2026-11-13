@@ -763,3 +763,16 @@ def test_a_runtime_load_whose_file_changes_before_the_workers_read_it_is_refused
     assert _status(err.value) == 400 and "changed on disk" in _message(err.value)
     assert not any(pool.serves("a1") for pool in d.pools.values())
     assert d.served.adapters == ()
+
+
+def test_a_served_set_change_is_told_to_each_listener_in_order():
+    """How the Rust frontend's bridge follows the served adapters: every change,
+    and only a change, in the order the changes were made."""
+    served = ServedModels(base=(BASE,), digests={"a": b"\x01" * 32}, lora=True)
+    seen = []
+    served.subscribe(seen.append)
+    served.add("b", b"\x02" * 32)
+    assert served.remove("nope") is None
+    served.remove("a")
+    served.add("a", b"\x01" * 32)
+    assert seen == [("a", "b"), ("b",), ("b", "a")]

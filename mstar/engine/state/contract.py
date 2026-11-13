@@ -9,6 +9,7 @@ from typing import ClassVar, Literal, NamedTuple, get_args, get_origin
 
 import torch
 
+from mstar.engine.resources.attn.config import SP_EXCHANGES
 from mstar.engine.resources.kv.config import Span
 from mstar.engine.resources.step import Segment
 
@@ -78,15 +79,30 @@ def KVEntry(*, heads: int, head_dim: int) -> Entry:
 class Mask:
     """Which entries a read at log position q sees. An entry's index is its log position."""
 
+    # whether what a read sees depends on its query's log position, which another array's queries don't carry here
+    uses_query_position: ClassVar[bool]
+    # whether a read sees a row's adds of each step as a whole, so splitting them across steps changes what it sees
+    sees_step_whole: ClassVar[bool]
+
+    def split_step_change(self) -> str:
+        """What splitting a row's adds across steps changes for a read through a mask that `sees_step_whole`."""
+        return f"{type(self).__name__} sees each step's adds as a whole"
+
 
 @dataclass(frozen=True)
 class Causal(Mask):
     """Sees {k : k <= q}."""
 
+    uses_query_position = True
+    sees_step_whole = False
+
 
 @dataclass(frozen=True)
 class Window(Mask):
     """Sees {k : q - size < k <= q}."""
+
+    uses_query_position = True
+    sees_step_whole = False
 
     size: int
 
@@ -94,6 +110,9 @@ class Window(Mask):
 @dataclass(frozen=True)
 class Block(Mask):
     """Sees the entries of q's own segment in this step, on an array with ``max_len`` 0."""
+
+    uses_query_position = False
+    sees_step_whole = True
 
 
 @dataclass(frozen=True)
@@ -144,7 +163,44 @@ class Bidirectional(Mask):
     """Sees {k : k < n}, where n is the length of q's row on this array after this layer's latest add: every entry the
     row keeps and every entry this step adds for it. For a read with ``queries``, q's row is the row paired with q's
     segment, on this array's label. It uses no query position. On an array that keeps entries; ``Block`` is the
-    within-step form."""
+    within-step form.
+
+    With ``kept_window``, the entries the row kept before this step are cut to the first ``sink`` and the last
+    ``window`` of them, sizes the request's layout gives per read in ``Layout.kept_windows``."""
+
+    uses_query_position = False
+    sees_step_whole = True
+
+    _: KW_ONLY
+    kept_window: bool = False
+
+    def __post_init__(self):
+        if type(self.kept_window) is not bool:
+            raise ValueError(f"Bidirectional.kept_window must be a bool, got {self.kept_window!r}")
+
+
+@dataclass(frozen=True)
+class FrameWindow(Mask):
+    """Frames are runs of ``tokens`` entries, and q is in frame f = q // ``tokens``. Sees every entry of frame f, and of
+    each earlier frame g with f - g < ``frames`` and g a multiple of ``stride``."""
+
+    uses_query_position = True
+    sees_step_whole = True
+
+    tokens: int
+    _: KW_ONLY
+    frames: int
+    stride: int = 1
+
+    def __post_init__(self):
+        for name in ("tokens", "frames", "stride"):
+            if not _is_positive(getattr(self, name)):
+                raise ValueError(f"FrameWindow.{name} must be a positive int, got {getattr(self, name)!r}")
+        if self.frames % self.stride:
+            raise ValueError(f"FrameWindow.frames must be a multiple of stride {self.stride}, got {self.frames}")
+
+    def split_step_change(self) -> str:
+        return "A step boundary inside a frame cuts what the frame's queries see"
 
 
 class Op:
@@ -221,6 +277,9 @@ class Read:
     def __post_init__(self):
         if not isinstance(self.mask, Mask):
             raise ValueError(f"Read.mask must be a Mask, got {self.mask!r}")
+        unset = [name for name in Mask.__annotations__ if not hasattr(type(self.mask), name)]
+        if unset:
+            raise ValueError(f"Read.mask: {type(self.mask).__name__} leaves {unset} unset, which every mask declares")
         if not (self.op is None or isinstance(self.op, Op)):
             raise ValueError(f"Read.op must be None or an Op, got {self.op!r}")
         if self.op is not None and (self.op.writes or self.op.adds):
@@ -280,9 +339,6 @@ class Array:
     rewritable: bool = False
     labels: frozenset[str] = frozenset({"main"})
     positions: Positions | None = None
-    # under sequence parallelism, each rank's calls carry its share of every segment, or of each request's row for a
-    # segmented read
-    seq_sharded: bool = False
 
     def __post_init__(self):
         object.__setattr__(self, "nodes", frozenset(self.nodes))
@@ -336,9 +392,9 @@ class Array:
             raise ValueError(f"{where}.layers has {sorted(read.layers - self.layers)}, outside the array's layers")
         if isinstance(read.mask, Window) and not _is_positive(read.mask.size):
             raise ValueError(f"{where}.mask.size must be a positive int, got {read.mask.size!r}")
-        if read.queries is not None and not isinstance(read.mask, Block | Bidirectional):
+        if read.queries is not None and read.mask.uses_query_position:
             raise ValueError(f"{where}.queries: a read of another array's queries takes a mask that uses no query "
-                             f"position, Block or Bidirectional, and {type(read.mask).__name__} does")
+                             f"position, and {type(read.mask).__name__} does")
         if read.queries is not None and read.op is None:
             raise ValueError(f"{where}.queries: a read with no op lays out no queries")
         if read.queries == self.name:
@@ -395,6 +451,47 @@ class Sampler:
         object.__setattr__(self, "eos_ids", tuple(self.eos_ids))
         if not self.nodes:
             raise ValueError(f"Sampler {self.name!r}.nodes must be non-empty")
+
+
+@dataclass(frozen=True)
+class SeqShard:
+    """A node's steps may split over its SP ranks: per step, the engine decides from the step whether ``labels``'
+    tokens split, each rank running the token-local layers on its share, or are copied. A layer stack calls
+    `scatter` before and `gather` after; at one SP rank, and on a copied step, both pass their inputs through. Reads
+    and updates of the node's arrays exchange what a split step needs by themselves.
+
+    ``labels`` lists one label, which an array on ``nodes`` opens, since the shard's handle brackets one; a node with
+    no arrays declares a `SeqShardSpec` itself. The shard cuts the label's tensors as the node's reads take queries on
+    it: rows of one span (``Read.packed`` False, not ``segmented``) each row alike, packed tokens or a request's
+    segments in one row contiguously; the reads take one of the two. ``walks`` are the walks whose steps may split,
+    as a row's walk (a combined walk splits where a walk it combines is listed); None: every walk. ``exchange`` is the
+    author's default for how a split step reaches the node's paged attentions, which the deployment's ``resources:``
+    block overrides under the shard's name: ``auto`` (Ulysses over KV stored by head, copied over KV stored by
+    position), ``none`` (never split), ``ulysses``, ``all_gather`` or ``ring``.
+    """
+
+    name: str
+    _: KW_ONLY
+    nodes: frozenset[str]
+    labels: frozenset[str] = frozenset({"main"})
+    walks: frozenset[str] | None = None
+    exchange: Literal["auto", "none", "ulysses", "all_gather", "ring"] = "auto"
+
+    def __post_init__(self):
+        where = f"SeqShard {self.name!r}"
+        # a string would split into characters, which name no label or walk
+        for name in ("nodes", "labels", "walks"):
+            if isinstance(getattr(self, name), str):
+                raise ValueError(f"{where}.{name} must be a collection of names, not a string")
+        object.__setattr__(self, "nodes", frozenset(self.nodes))
+        object.__setattr__(self, "labels", frozenset(self.labels))
+        if self.walks is not None:
+            object.__setattr__(self, "walks", frozenset(self.walks))
+        for name in ("nodes", "labels", "walks"):
+            if getattr(self, name) is not None and not getattr(self, name):
+                raise ValueError(f"{where}.{name} must be non-empty")
+        if self.exchange not in ("auto", *SP_EXCHANGES):
+            raise ValueError(f"{where}.exchange must be one of auto, {', '.join(SP_EXCHANGES)}; got {self.exchange!r}")
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -468,6 +565,21 @@ class SampleStep:
     kept_rows: frozenset[int] | None = None              # None: every row's sample is kept
 
 
+@dataclass(frozen=True)
+class KeptWindow:
+    """A kept-window read's sizes for one request and label, in entries."""
+
+    sink: int
+    _: KW_ONLY
+    window: int
+
+    def __post_init__(self):
+        for name, least in (("sink", 0), ("window", 1)):
+            value = getattr(self, name)
+            if not (type(value) is int and value >= least):
+                raise ValueError(f"KeptWindow.{name} must be an int >= {least}, got {value!r}")
+
+
 @dataclass(frozen=True, kw_only=True)
 class Layout:
     """What a request writes to one label of one array, from `process_prompt`'s ``state_layout``."""
@@ -475,6 +587,7 @@ class Layout:
     spans: tuple[Span, ...] = ()
     growth: tuple[tuple[str, int], ...] = ()    # (loop, entries per iteration)
     scratch: int = 0                            # most one scratch step writes past the kept length
+    kept_windows: Mapping[str, KeptWindow] = EMPTY    # by read key, each kept-window read's sizes
 
 
 @dataclass(frozen=True, kw_only=True)

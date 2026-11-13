@@ -95,7 +95,7 @@ jobs:
 
       - name: Check that it finished
         run: |
-          last=$(tail -n 1 "$RUNNER_TEMP/lt/results/refresh.log" 2> /dev/null)
+          last=$(tail -n 1 "$RUNNER_TEMP/lt/nvidia/results/refresh.log" 2> /dev/null)
           [ "$last" = "refresh done" ] || { echo "::error::The refresh of $VOLUME didn't finish: ${last:-no log}"; exit 1; }
 
       - name: Keep the log
@@ -103,7 +103,7 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: review-cache-${{ github.run_id }}-${{ strategy.job-index }}
-          path: ${{ runner.temp }}/lt/results/refresh.log
+          path: ${{ runner.temp }}/lt/nvidia/results/refresh.log
           if-no-files-found: ignore
 
       - name: Release the box

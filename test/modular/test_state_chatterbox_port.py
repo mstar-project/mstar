@@ -203,8 +203,9 @@ def _reference_t3_step(walk: str, rids: list[int], spans: tuple[int, ...], guide
         tracked = {rid: bos for rid in rids}
     return SubmoduleStep(
         segments=segments,
+        combined_labels={labels: GUIDED_PLAN} if guided else {},
         steps={
-            T3_KV: KVStep(combined_labels={labels: GUIDED_PLAN}) if guided else KVStep(),
+            T3_KV: KVStep(),
             T3_ATTN: AttentionStep(causal=True),
             T3_POS: PositionStep(),
             T3_SAMPLER: SamplerStep(apply_penalty=True, prefill_tracked_tokens=tracked),

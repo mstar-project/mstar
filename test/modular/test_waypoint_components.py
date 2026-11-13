@@ -1,24 +1,21 @@
-"""Component-level contract tests for the Waypoint-1.5 port: the ring geometry
-its config implies, OrthoRoPE and the small layers.
+"""Component-level contract tests for the Waypoint-1.5 port: the ring
+arithmetic, OrthoRoPE and the small layers.
 
 Reference is ``world_engine/src/``. Failure modes here are silent (wrong ring
 slot, re-derived bucket count, permuted controller concat all produce plausible
 video and raise nothing), so assertions are exact wherever the reference is
-exact (bitwise for the compaction A/B, the RoPE angle tables, the ring bytes
-after a frozen pass).
+exact (bitwise for the RoPE angle tables and the ring bytes after a frozen
+pass).
 
 The ring and kernel are engine resources (``mstar.engine.resources``); their own
-contracts -- ownership, capture lifecycle, the ``visible`` aliasing hazard, the
-eager-``flex_attention`` trap -- are pinned in ``test_ring_kv_resource.py`` and
-``test_flex_attention_resource.py``. This file covers that *Waypoint's config*
-produces the geometry the checkpoint was trained against, and that the ring
-arithmetic matches the reference's tables.
+contracts -- ownership, capture lifecycle, the eager-``flex_attention`` trap --
+are pinned in ``test_ring_kv_resource.py`` and ``test_flex_attention_resource.py``.
+This file covers that the ring arithmetic matches the reference's tables.
 
 CPU-only and checkpoint-free. Numeric work runs on a reduced but structurally
 identical config (4 layers / 128 tokens per frame / d_head 32, one global layer
-at stride 8); the real 720P config is used only for geometry assertions.
-``torch.compile(flex_attention)`` works on CPU in torch 2.9, which is what makes
-the compaction A/B runnable without a GPU.
+at stride 8). ``torch.compile(flex_attention)`` works on CPU in torch 2.9, which
+is what makes the eager/compiled control runnable without a GPU.
 """
 
 import dataclasses
@@ -37,18 +34,9 @@ from torch.nn.attention.flex_attention import (
     noop_mask,
 )
 
-from mstar.engine.resources.attn.base import AttentionManager
-from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec, AttnBackend
 from mstar.engine.resources.attn.flex import _MASK_MOD, flex_attention_masked, make_block_mask
-from mstar.engine.resources.base import EngineResourceInfo
-from mstar.engine.resources.kv.config import (
-    KVSpec,
-    RingKVConfig,
-    RingKVLayerConfig,
-    RingKVStep,
-)
-from mstar.engine.resources.kv.ring import LayerRingCache, RingKVManager
-from mstar.engine.resources.step import StepContext
+from mstar.engine.resources.kv.ring import LayerRingCache
+from mstar.engine.state.adapters import build_specs
 from mstar.model.waypoint.components.layers import (
     MLP,
     AdaLN,
@@ -61,7 +49,7 @@ from mstar.model.waypoint.components.layers import (
 )
 from mstar.model.waypoint.components.rope import OrthoRoPEAngles, apply_ortho_rope
 from mstar.model.waypoint.config import WaypointConfig, waypoint_1_5_1b_720p
-from mstar.model.waypoint.ring_geometry import ring_memory_bytes
+from mstar.model.waypoint.waypoint_model import WaypointModel
 
 BLOCK = _DEFAULT_SPARSE_BLOCK_SIZE  # 128
 TPF = 128  # tokens per frame in the reduced config == one sparse block
@@ -71,11 +59,6 @@ def reduced_config(**overrides) -> WaypointConfig:
     """A 4-layer / 128-token-per-frame Waypoint whose *structure* matches 720P:
     one global layer (index 3) at stride 8, GQA at 2 query heads over 1 KV head,
     controller fusion on ``i % 3 == 0``.
-
-    Only the sizes shrink. ``global_window // global_pinned_dilation == 4``
-    addressable slots against a 32-frame reference allocation keeps the 8x
-    over-allocation the compaction deviation is about, while letting a test wrap
-    the global ring in 32 frames instead of 128.
     """
     base = {
         "n_layers": 4,
@@ -117,66 +100,6 @@ def visible_blocks(block_mask) -> set[int]:
     return set(block_mask.full_kv_indices[0, 0, 0, :n].tolist())
 
 
-def ring_kv_spec(config: WaypointConfig, *, num_sessions: int = 1) -> KVSpec:
-    """The ``RingKVConfig`` a ``WaypointConfig``'s geometry implies.
-
-    Hand-rolled because the model does not declare its specs yet. Every field is
-    read off the config rather than restated, so a geometry change cannot leave
-    these tests measuring a ring the model no longer asks for.
-    """
-    return KVSpec(
-        resource_key="kv",
-        nodes={"dit"},
-        config=RingKVConfig(
-            num_layers=config.n_layers,
-            num_kv_heads=config.n_kv_heads,
-            head_dim=config.d_head,
-            num_qo_heads=config.n_heads,
-            tokens_per_frame=config.tokens_per_frame,
-            num_sessions=num_sessions,
-            layers=tuple(
-                RingKVLayerConfig(
-                    ring_frames=config.ring_frames(i),
-                    ring_buckets=config.ring_buckets(i),
-                    pinned_dilation=config.pinned_dilation(i),
-                )
-                for i in range(config.n_layers)
-            ),
-        ),
-    )
-
-
-def ring_manager(config: WaypointConfig, *, num_sessions: int = 1) -> RingKVManager:
-    """``config``'s rings, allocated. Through ``build(spec, info)`` and not the
-    constructor: the spec is what picks ``RingKVManager`` over the paged one."""
-    return RingKVManager.build(
-        ring_kv_spec(config, num_sessions=num_sessions),
-        EngineResourceInfo(device=torch.device("cpu"), kv_dtype=torch.float32),
-    )
-
-
-def _dit_ctx(*rids: str) -> StepContext:
-    return StepContext(request_ids=tuple(rids), graph_walk="rollout", slot=0, capture=False)
-
-
-def waypoint_resources(config: WaypointConfig):
-    """The ring and the kernel a Waypoint deployment would get, built through
-    the real spec-time factories rather than the constructors: the spec is also
-    what cross-checks the flex backend against a ring config."""
-    kv_spec = ring_kv_spec(config)
-    cpu = torch.device("cpu")
-    kv = ring_manager(config)
-    attn = AttentionManager.build(
-        AttentionSpec(
-            resource_key="attn",
-            nodes={"dit"},
-            config=AttentionConfig(kv_cache="kv", backend=AttnBackend.FLEX),
-        ),
-        EngineResourceInfo(device=cpu, kv_dtype=torch.float32, dependencies={"kv": kv_spec}),
-    )
-    return kv, attn
-
-
 # ---------------------------------------------------------------------------
 # 1. The BlockMask's shape
 # ---------------------------------------------------------------------------
@@ -214,10 +137,13 @@ def test_a_fully_visible_ring_makes_eager_and_compiled_agree():
 
     The all-visible row has to be built by hand: a live Waypoint ring never
     emits one. The slot the current frame is about to overwrite is always
-    hidden (see ``test_mask_hides_the_slot_this_frame_is_about_to_overwrite``).
+    hidden.
     """
     config = reduced_config()
-    capacity = config.kv_capacity(0)
+    model = WaypointModel(skip_weight_loading=True)
+    model.config = config
+    ring = build_specs(model.declare_state())[0].config
+    capacity = (ring.layers[0].ring_frames + 1) * ring.tokens_per_frame
     visible = torch.ones(capacity, dtype=torch.bool)
     bm = make_block_mask(TPF, capacity, visible)
 
@@ -246,14 +172,14 @@ def test_a_fully_visible_ring_makes_eager_and_compiled_agree():
 
 
 # ---------------------------------------------------------------------------
-# 2. Ring rotation and the upsert algorithm
+# 2. Ring rotation and the write algorithm
 # ---------------------------------------------------------------------------
 
 
 def make_cache(*, ring_frames: int, ring_buckets: int, dilation: int) -> LayerRingCache:
     """One world: this section is about the ring *algorithm* -- which slot a
-    frame lands in, which slot it hides -- which is per world and identical at
-    any ``num_sessions``. The folded layout and its isolation are pinned in
+    frame lands in -- which is per world and identical at any
+    ``num_sessions``. The folded layout and its isolation are pinned in
     ``test_ring_kv_resource.py``."""
     return LayerRingCache(
         num_sessions=1,
@@ -268,15 +194,15 @@ def make_cache(*, ring_frames: int, ring_buckets: int, dilation: int) -> LayerRi
     )
 
 
-def upsert(cache: LayerRingCache, kv, frame_pos, *, commit: bool, world: int = 0):
-    """``LayerRingCache.upsert`` with the world index spelled out.
+def write(cache: LayerRingCache, kv, frame_pos, *, keep: bool, world: int = 0) -> None:
+    """``LayerRingCache.write`` with the world index spelled out.
 
-    Not a default on ``upsert`` itself: ``session_idx`` is a ``[1]`` int64
+    Not a default on ``write`` itself: ``session_idx`` is a ``[1]`` int64
     *device* tensor on the forward path, never a Python int -- a host int gets
     folded into the graph at capture and every replay then silently serves the
     capture-time world. This helper is the only place the zero is written down.
     """
-    return cache.upsert(kv, frame_pos, commit, torch.tensor([world], dtype=torch.int64))
+    cache.write(kv, frame_pos, keep, torch.tensor([world], dtype=torch.int64))
 
 
 @pytest.mark.parametrize(
@@ -293,7 +219,7 @@ def test_ring_slot_rotation(kind, dilation, frames, expected_slots):
     doubles as the whole write history."""
     cache = make_cache(ring_frames=16, ring_buckets=16, dilation=dilation)
     for f in frames:
-        upsert(cache, frame_kv(f), torch.tensor([f], dtype=torch.int64), commit=True)
+        write(cache, frame_kv(f), torch.tensor([f], dtype=torch.int64), keep=True)
     assert ring_slot_values(cache) == [float(v) for v in expected_slots], kind
     assert bool(cache.written[: cache.ring_len].all())
 
@@ -303,14 +229,14 @@ def test_frozen_passes_leave_the_ring_byte_identical():
     would corrupt the world state permanently, and nothing would raise."""
     cache = make_cache(ring_frames=4, ring_buckets=4, dilation=1)
     for f in range(4):
-        upsert(cache, frame_kv(f), torch.tensor([f], dtype=torch.int64), commit=True)
+        write(cache, frame_kv(f), torch.tensor([f], dtype=torch.int64), keep=True)
 
     ring_before = cache.kv[:, :, :, : cache.ring_len].clone()
     written_before = cache.written.clone()
     scratch_before = cache.kv[:, :, :, cache.ring_len :].clone()
 
     for pass_idx in range(4):  # the four Euler steps, each a different noisy x
-        upsert(cache, frame_kv(100 + pass_idx), torch.tensor([4], dtype=torch.int64), commit=False)
+        write(cache, frame_kv(100 + pass_idx), torch.tensor([4], dtype=torch.int64), keep=False)
 
     assert torch.equal(cache.kv[:, :, :, : cache.ring_len], ring_before), (
         "a frozen pass wrote the ring; that is amnesia, not a cache miss"
@@ -322,30 +248,8 @@ def test_frozen_passes_leave_the_ring_byte_identical():
     assert cache.kv[0, 0, 0, cache.ring_len, 0].item() == 103.0
 
 
-def test_mask_hides_the_slot_this_frame_is_about_to_overwrite():
-    """Applies on frozen passes too, so all five passes of a frame see
-    byte-identical KV.
-
-    Asserted through ``make_block_mask``, not the raw ``visible`` row: the
-    kernel reads the block list built from it, and this is where the two are
-    checked to agree over a whole 4+1 frame."""
-    cache = make_cache(ring_frames=4, ring_buckets=4, dilation=1)
-    for f in range(4):
-        upsert(cache, frame_kv(f), torch.tensor([f], dtype=torch.int64), commit=True)
-    assert set(range(5)) == visible_blocks(
-        make_block_mask(TPF, cache.capacity, cache.written)
-    ), "precondition: the whole ring plus scratch is written"
-
-    fp = torch.tensor([4], dtype=torch.int64)  # slot 0 is about to be reused
-    for commit in (False, False, False, False, True):
-        _, _, visible = upsert(cache, frame_kv(4), fp, commit=commit)
-        assert visible_blocks(make_block_mask(TPF, cache.capacity, visible)) == {1, 2, 3, 4}, (
-            "frame 4 can see the stale frame 0 sitting in the slot it is replacing"
-        )
-
-
-def test_upsert_batches_two_worlds_like_two_sequential_calls():
-    """``upsert`` at B=2 (one row each for worlds 0 and 1) is bit-exact to two
+def test_write_batches_two_worlds_like_two_sequential_calls():
+    """``write`` at B=2 (one row each for worlds 0 and 1) is bit-exact to two
     sequential single-world calls: ``session_base`` folds the row dim into the
     token dim, so a batched call must not touch a row that isn't its own."""
     def new_cache() -> LayerRingCache:
@@ -356,17 +260,16 @@ def test_upsert_batches_two_worlds_like_two_sequential_calls():
         )
 
     solo = new_cache()
-    upsert(solo, frame_kv(10.0), torch.tensor([2], dtype=torch.int64), commit=True, world=0)
-    upsert(solo, frame_kv(20.0), torch.tensor([3], dtype=torch.int64), commit=True, world=1)
+    write(solo, frame_kv(10.0), torch.tensor([2], dtype=torch.int64), keep=True, world=0)
+    write(solo, frame_kv(20.0), torch.tensor([3], dtype=torch.int64), keep=True, world=1)
 
     batched = new_cache()
     kv = torch.cat([frame_kv(10.0), frame_kv(20.0)], dim=3)
-    batched.upsert(
+    batched.write(
         kv,
         torch.tensor([2, 3], dtype=torch.int64),
         True,
         torch.tensor([0, 1], dtype=torch.int64),
-        build_visibility=False,
     )
 
     assert torch.equal(batched.kv, solo.kv)
@@ -374,95 +277,39 @@ def test_upsert_batches_two_worlds_like_two_sequential_calls():
 
 
 def test_global_layer_commits_nothing_on_non_dilation_frames():
-    """``torch.where(write_step, ring_idx, current_idx)``
+    """``torch.where(on_grid, ring_idx, current_idx)``
     redirects the commit onto the scratch slot it just wrote."""
     cache = make_cache(ring_frames=4, ring_buckets=4, dilation=8)
-    upsert(cache, frame_kv(0), torch.tensor([0], dtype=torch.int64), commit=True)
+    write(cache, frame_kv(0), torch.tensor([0], dtype=torch.int64), keep=True)
     ring_before = cache.kv[:, :, :, : cache.ring_len].clone()
     written_before = cache.written.clone()
 
     for f in range(1, 8):  # the 7 non-committing frames of every 8
-        upsert(cache, frame_kv(f), torch.tensor([f], dtype=torch.int64), commit=True)
+        write(cache, frame_kv(f), torch.tensor([f], dtype=torch.int64), keep=True)
 
     assert torch.equal(cache.kv[:, :, :, : cache.ring_len], ring_before)
     assert torch.equal(cache.written, written_before)
     assert cache.kv[0, 0, 0, cache.ring_len, 0].item() == 7.0  # scratch has the latest
 
-    upsert(cache, frame_kv(8), torch.tensor([8], dtype=torch.int64), commit=True)
+    write(cache, frame_kv(8), torch.tensor([8], dtype=torch.int64), keep=True)
     assert ring_slot_values(cache)[:2] == [0.0, 8.0]
 
 
-def floor_bucket_upsert(cache: LayerRingCache, kv, frame_pos, commit: bool):
-    """``LayerRingCache.upsert`` with the round-up dropped: ``bucket = f // d``
-    instead of ``(f + d - 1) // d``. Everything else is statement-for-statement
-    the same. Used only to A/B the round-up."""
-    tokens = cache.tokens_per_frame
-    session_idx = torch.tensor([0], dtype=torch.int64)
-    session_base = session_idx * cache.capacity
-    slot = (frame_pos // cache.pinned_dilation) % cache.ring_buckets
-    ring_idx = cache.frame_offsets + slot * tokens + session_base
-    current_idx = cache._current_base + session_base
-
-    cache.kv.index_copy_(3, current_idx, kv)
-
-    write_step = frame_pos.remainder(cache.pinned_dilation) == 0
-    mask_written = torch.empty_like(cache.written)
-    mask_written.copy_(cache.written)
-    mask_written &= cache._session_of_slot == session_idx
-    mask_written[ring_idx] = mask_written[ring_idx] & ~write_step
-
-    if commit:
-        dst = torch.where(write_step, ring_idx, current_idx)
-        cache.kv.index_copy_(3, dst, kv)
-        cache.written.index_fill_(0, dst, True)
-    return mask_written
-
-
-@pytest.mark.parametrize("dilation", [1, 8])
-def test_bucket_round_up_is_faithful_but_currently_unobservable(dilation):
-    """Flooring instead of rounding up is claimed to "rotate the entire history
-    by one slot"; that does not hold for any geometry this checkpoint uses, and
-    this test pins the real behaviour over the claim.
-
-    ``ceil`` and ``floor`` agree on every committing frame
-    (``(8j + 7) // 8 == 8j // 8 == j``), and outright at ``dilation == 1``. They
-    differ only where ``write_step`` is False, where ``ring_idx`` feeds only the
-    identity op ``mask_written[ring_idx] &= ~write_step`` -- so ``+ dilation - 1``
-    is faithfully ported but not load-bearing.
-    """
-    ceil_cache = make_cache(ring_frames=4, ring_buckets=4, dilation=dilation)
-    floor_cache = make_cache(ring_frames=4, ring_buckets=4, dilation=dilation)
-
-    for f in range(24):
-        fp = torch.tensor([f], dtype=torch.int64)
-        for pass_idx in range(5):
-            commit = pass_idx == 4
-            kv = frame_kv(f * 10 + pass_idx)
-            _, _, ceil_visible = upsert(ceil_cache, kv, fp, commit=commit)
-            floor_visible = floor_bucket_upsert(floor_cache, kv, fp, commit)
-            # Per token, not per block: the rows are what the mask is built
-            # from, so equal rows is the stronger statement of the two.
-            assert torch.equal(ceil_visible, floor_visible), f"visibility differs at frame {f}"
-
-    assert torch.equal(ceil_cache.kv, floor_cache.kv)
-    assert torch.equal(ceil_cache.written, floor_cache.written)
-
-
-def test_upsert_rejects_a_wrong_shaped_frame_or_clock():
+def test_write_rejects_a_wrong_shaped_frame_or_clock():
     cache = make_cache(ring_frames=4, ring_buckets=4, dilation=1)
     fp = torch.tensor([0], dtype=torch.int64)
     with pytest.raises(RuntimeError, match="exactly one frame per session"):
-        upsert(cache, frame_kv(0, tokens=TPF // 2), fp, commit=True)
+        write(cache, frame_kv(0, tokens=TPF // 2), fp, keep=True)
     with pytest.raises(RuntimeError, match=r"frame_pos must be a \[B\] int64 tensor"):
-        upsert(cache, frame_kv(0), torch.tensor(0, dtype=torch.int64), commit=True)
+        write(cache, frame_kv(0), torch.tensor(0, dtype=torch.int64), keep=True)
     with pytest.raises(RuntimeError, match=r"frame_pos must be a \[B\] int64 tensor"):
-        upsert(cache, frame_kv(0), torch.tensor([0], dtype=torch.int32), commit=True)
+        write(cache, frame_kv(0), torch.tensor([0], dtype=torch.int32), keep=True)
 
 
 def test_reset_restores_a_fresh_ring():
     cache = make_cache(ring_frames=4, ring_buckets=4, dilation=1)
     for f in range(4):
-        upsert(cache, frame_kv(f + 1), torch.tensor([f], dtype=torch.int64), commit=True)
+        write(cache, frame_kv(f + 1), torch.tensor([f], dtype=torch.int64), keep=True)
     cache.reset(0)
     assert not bool(cache.kv.any())
     # The scratch tail stays permanently visible -- masking it removes
@@ -471,160 +318,28 @@ def test_reset_restores_a_fresh_ring():
     assert bool(cache.written[cache.ring_len :].all())
 
 
-def test_ring_state_is_a_deep_copy_and_is_specific_to_the_compaction_setting():
-    """A state saved from a compacted deployment must not load into a
-    ``full_global_ring`` one -- the compaction flag is part of a state's
-    identity.
-
-    Geometries differ only on the global layers (5 vs 33 frames here), so only
-    layer 3 would fail; a bare ``copy_`` instead of a shape check would let dims
-    broadcast and silently restore a replicated frame. Generic
-    clone/copy_/layer-count guarantees are pinned in
-    ``test_ring_kv_resource.py``.
-    """
-    config = reduced_config()
-    kv = ring_manager(config)
-    kv.ingest_request("a")
-    assert kv.admit(RingKVStep(frames=(("a", 0),)), _dit_ctx("a")).ok
-    gen = torch.Generator().manual_seed(3)
-    for layer in range(config.n_layers):
-        frame = torch.randn(1, 1, TPF, config.d_head, generator=gen)
-        kv.upsert(frame, frame, layer, torch.tensor([0], dtype=torch.int64), commit=True)
-
-    state = kv.get_state("a")
-    snapshot = [t.clone() for t, _ in state["layers"]]
-    for layer in kv.layers:
-        layer.reset(kv.session_of("a"))
-    assert not any(layer.kv.any() for layer in kv.layers)
-    # get_state must clone: the reset above must not have reached the snapshot.
-    assert all(torch.equal(a, b) for a, b in zip((t for t, _ in state["layers"]), snapshot, strict=True))
-
-    kv.load_state("a", state)
-    # Compare the request's world span, not the whole buffer: the ring now holds
-    # a padding world past the resident pool that get_state never captured.
-    world = kv.session_of("a")
-    assert all(
-        torch.equal(layer.kv[:, :, :, slice(*layer.session_span(world))], t)
-        for layer, (t, _) in zip(kv.layers, state["layers"], strict=True)
-    )
-
-    other = ring_manager(dataclasses.replace(config, full_global_ring=True))
-    other.ingest_request("a")
-    assert other.admit(RingKVStep(frames=(("a", 0),)), _dit_ctx("a")).ok
-    with pytest.raises(ValueError, match="state shape"):
-        other.load_state("a", state)
-
-
 # ---------------------------------------------------------------------------
 # 3. The compaction deviation and the num_buckets trap
 # ---------------------------------------------------------------------------
 
 
-def test_720p_ring_geometry_matches_the_contract_table():
-    """The "addressable slots" and "ring frames allocated" columns are
-    independent, and the compaction deviation turns on keeping them so."""
-    config = waypoint_1_5_1b_720p()
-    assert sorted(config.global_layers) == [3, 7, 11, 15, 19, 23]
-
-    for i in range(config.n_layers):
-        assert config.ring_buckets(i) == 16  # every row of the table
-        if config.is_global_layer(i):
-            assert (config.ring_frames(i), config.pinned_dilation(i)) == (16, 8)
-        else:
-            assert (config.ring_frames(i), config.pinned_dilation(i)) == (16, 1)
-        assert config.kv_capacity(i) == 17 * 512
-        assert config.kv_capacity(i) % BLOCK == 0
-
-    full = dataclasses.replace(config, full_global_ring=True)
-    assert full.ring_frames(3) == 128 and full.ring_buckets(3) == 16
-    assert full.ring_frames(0) == 16  # local layers are untouched by the flag
-
-    compacted_bytes = sum(ring_memory_bytes(config))
-    full_bytes = sum(ring_memory_bytes(full))
-    assert compacted_bytes == 816 * 2**20  # 816 MiB
-    assert full_bytes - compacted_bytes == 1_409_286_144  # ...saving 1.3125 GiB
-
-
-def test_ring_buckets_is_an_input_not_a_derivation():
-    """The trap: the reference derives ``num_buckets = (L // tpf) // dilation``,
-    which against the compacted ring yields 2, not 16 -- a global layer would
-    silently retain 2 frames instead of 16."""
-    config = waypoint_1_5_1b_720p()
-    global_layer = 3
-    reference_derivation = config.ring_frames(global_layer) // config.pinned_dilation(global_layer)
-    assert reference_derivation == 2, "the compacted buffer no longer encodes the bucket count"
-    assert config.ring_buckets(global_layer) == 16, (
-        "ring_buckets must come from global_window // global_pinned_dilation, "
-        "never from ring_frames"
-    )
-    # And it is genuinely independent of the allocation knob.
-    full = dataclasses.replace(config, full_global_ring=True)
-    assert full.ring_buckets(global_layer) == config.ring_buckets(global_layer) == 16
-
-
 def test_compacted_global_ring_addresses_all_sixteen_slots():
-    """The behavioural half of the trap: a cache that re-derived its bucket
-    count from ``ring_len`` would collide frames 0 and 16 into slot 0 and leave
-    14 slots forever empty. Sixteen distinct frames, sixteen distinct slots."""
+    """The trap: a cache that re-derived its bucket count from ``ring_len``
+    would collide frames 0 and 16 into slot 0 and leave 14 slots forever empty.
+    Sixteen distinct frames, sixteen distinct slots."""
     cache = make_cache(ring_frames=16, ring_buckets=16, dilation=8)
     assert (cache.ring_len // cache.tokens_per_frame) // cache.pinned_dilation == 2  # the wrong answer
     assert cache.ring_buckets == 16
 
     for j in range(16):
         f = 8 * j
-        upsert(cache, frame_kv(f), torch.tensor([f], dtype=torch.int64), commit=True)
+        write(cache, frame_kv(f), torch.tensor([f], dtype=torch.int64), keep=True)
 
     assert ring_slot_values(cache) == [float(8 * j) for j in range(16)]
     assert bool(cache.written[: cache.ring_len].all()), "a 2-bucket ring would leave 14 slots unwritten"
 
     with pytest.raises(ValueError, match="ring_buckets"):
         make_cache(ring_frames=4, ring_buckets=8, dilation=8)
-
-
-def drive_ring(config: WaypointConfig, n_frames: int, seed: int = 7) -> list[torch.Tensor]:
-    """Run ``n_frames`` of the real 4+1 pass structure through ``config``'s
-    resources and collect every attention output. The K/V/Q streams are drawn
-    from a seeded generator so two geometries see byte-identical inputs."""
-    kv, attn = waypoint_resources(config)
-    gen = torch.Generator().manual_seed(seed)
-    outputs = []
-    for f in range(n_frames):
-        fp = torch.tensor([f], dtype=torch.int64)
-        for pass_idx in range(5):
-            for layer in range(config.n_layers):
-                k = torch.randn(1, 1, TPF, config.d_head, generator=gen)
-                v = torch.randn(1, 1, TPF, config.d_head, generator=gen)
-                q = torch.randn(1, 2, TPF, config.d_head, generator=gen)
-                k_all, v_all, visible = kv.upsert(
-                    k, v, layer, fp, commit=pass_idx == 4
-                )
-                outputs.append(attn.attend(q, k_all, v_all, visible, enable_gqa=True))
-    return outputs
-
-
-def test_compacted_and_full_global_rings_are_bitwise_identical():
-    """``from_kv_blocks`` derives the visited list from a *stable* descending
-    argsort truncated to the visited count, so dropping never-written blocks
-    changes neither which blocks are attended nor their accumulation order --
-    bit-equality is the correct bar here, not ``allclose``.
-
-    36 frames wraps the global ring's 4 addressable slots (stride 8) more than
-    once, and the local rings nine times over.
-    """
-    compacted = reduced_config()
-    full = dataclasses.replace(compacted, full_global_ring=True)
-    assert compacted.ring_frames(3) == 4 and full.ring_frames(3) == 32
-    assert compacted.kv_capacity(3) == 5 * TPF and full.kv_capacity(3) == 33 * TPF
-
-    a = drive_ring(compacted, 36)
-    b = drive_ring(full, 36)
-    assert len(a) == len(b) == 36 * 5 * compacted.n_layers
-
-    mismatched = [i for i, (x, y) in enumerate(zip(a, b, strict=True)) if not torch.equal(x, y)]
-    assert not mismatched, (
-        f"{len(mismatched)}/{len(a)} attention outputs differ between the compacted and the "
-        f"reference global ring; first at call {mismatched[0]}"
-    )
 
 
 # ---------------------------------------------------------------------------

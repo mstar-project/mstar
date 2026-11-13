@@ -720,15 +720,17 @@ def check_kv_pools_fit(
     spec's `capacity_problem` answers: the first problem raises.
 
     A request keeps its pages from prefill to its last token. Past a pool, a
-    step is refused and waits for pages, or, where the pool has host pages
-    (``cpu_offload_pages``), the worker offloads decoding requests to admit it,
-    which costs far more than queueing would. So the cap's requests
+    prefill batch is refused. With host pages (``cpu_offload_pages``) the worker
+    offloads decoding requests to admit it, which costs far more than queueing
+    would. Without them it retries until requests time out. So the cap's requests
     at full length must fit each cache next to its sink page; the conductor
-    queues the rest. Warnings go to the model's ``log``. ``request_layouts``
+    queues the rest. The helper's warnings go to the model's ``log``, and a
+    pool's own to its module's logger. ``request_layouts``
     gives the `Layout` per array and label of the request the deployment is
     sized for, with its loops at ``loop_caps``, and a pool it doesn't name
     holds one stream of its ``max_seq_len``.
     """
+    from mstar.distributed.base import node_group_axis_sizes
     from mstar.engine.resources import KVReqConfig
     from mstar.engine.state.adapters import kv_layouts
     from mstar.model.base import serving_resources
@@ -737,8 +739,9 @@ def check_kv_pools_fit(
     if cap is None:
         log.warning(
             "%s sets no max_concurrent_requests: past the requests the KV caches "
-            "hold, requests wait in the worker for pages, or are offloaded where a "
-            "cache has cpu_offload_pages, instead of queueing in the conductor", config_path,
+            "hold, new ones aren't queued. A cache with cpu_offload_pages offloads "
+            "decoding requests to admit them, and one without stalls until requests "
+            "time out", config_path,
         )
         return
     if not isinstance(cap, int) or isinstance(cap, bool) or cap < 1:
@@ -758,7 +761,11 @@ def check_kv_pools_fit(
         rows = {label: layout.row() for label, layout in by_label.items()}
         requests[key] = KVReqConfig(needed_labels=list(rows))
         requests[key].apply_conductor_config(kv_layout=rows, loop_caps=loop_caps)
+    node_groups = config.get("node_groups") or ()
     for spec in specs:
-        problem = spec.capacity_problem(cap, requests.get(spec.resource_key))
+        axis_sizes = [
+            node_group_axis_sizes(group) for group in node_groups if spec.nodes & set(group.get("node_names", ()))
+        ]
+        problem = spec.capacity_problem(cap, requests.get(spec.resource_key), axis_sizes)
         if problem is not None:
             raise ValueError(f"{config_path}: {problem}")

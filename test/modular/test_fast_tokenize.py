@@ -22,12 +22,35 @@ def test_cuts_start_whitespace_runs_and_chunks_rebuild_the_text():
 
 def test_a_short_text_or_a_slow_tokenizer_takes_the_plain_path():
     class _Slow:
-        def __call__(self, text):
+        def __call__(self, text, add_special_tokens=True):
+            assert add_special_tokens is False
+
             class _R:
                 input_ids = [len(text)]
             return _R()
 
     assert encode_ids(_Slow(), "x" * 10000) == [10000]
+
+
+def test_a_bos_adding_tokenizer_gets_one_bos_short_or_long():
+    """A rendered chat template already opens with BOS. A tokenizer whose
+    post-processor prepends one too (Llama 3, Muse Glimmer) must not add it
+    on the short path when the chunked path does not."""
+    from tokenizers import Tokenizer, models, pre_tokenizers, processors
+    from transformers import PreTrainedTokenizerFast
+
+    tok = Tokenizer(models.WordLevel({"<bos>": 0, "hello": 1, "world": 2, "[UNK]": 3}, unk_token="[UNK]"))
+    tok.pre_tokenizer = pre_tokenizers.WhitespaceSplit()
+    tok.add_special_tokens(["<bos>"])
+    tok.post_processor = processors.TemplateProcessing(single="<bos> $A", special_tokens=[("<bos>", 0)])
+    hf = PreTrainedTokenizerFast(tokenizer_object=tok, bos_token="<bos>")
+
+    short, long = "<bos>hello world", "<bos>hello" + " world" * 200
+    assert cut_points(short, chunk_chars=64) == [] and cut_points(long, chunk_chars=64)
+    for text in (short, long):
+        ids = encode_ids(hf, text, chunk_chars=64)
+        assert ids[:2] == [0, 1], ids[:3]
+        assert ids == hf(text, add_special_tokens=False).input_ids
 
 
 def _tokenizer():
@@ -52,7 +75,7 @@ def test_chunked_ids_are_identical_to_one_encode_on_the_benchmark_prompts():
         "x,y;z!! \n\nq" * 1500, "tab\tsep  arated\r\nlines " * 1200, "数字 123 456  文本 " * 1000,
     ]
     for t in texts:
-        whole = tok(t).input_ids
+        whole = tok(t, add_special_tokens=False).input_ids
         assert encode_ids(tok, t, chunk_chars=2048, max_chunks=8) == whole
         assert encode_ids(tok, t, chunk_chars=512, max_chunks=16) == whole
 
