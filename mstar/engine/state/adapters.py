@@ -2276,6 +2276,18 @@ class DenseWindowHandle(ArrayHandle):
         self._added.clear()
         super().begin_step(step)
 
+    def commit_step(self, step) -> None:
+        # The forward may fail after add. Keep its writes private until the
+        # engine has committed the step, so rollback leaves an episode intact.
+        for layer, fields in self._pending.items():
+            for field, rows in fields.items():
+                self._pool.scatter_(field, rows, self._pool_layer[layer], label=self.label)
+
+    def end_step(self, step) -> None:
+        self._pending.clear()
+        self._added.clear()
+        super().end_step(step)
+
     def check_step(self, step) -> None:
         super().check_step(step)
         if any(seg.span > 0 for seg in self._segments) and self._kept != self.array.layers:
@@ -2322,7 +2334,6 @@ class DenseWindowHandle(ArrayHandle):
                     positions = torch.arange(old + first - offset, old + segment.span, device=value.device) % cap
                     rows[row].index_copy_(0, positions, value[first:end])
                 offset = end
-            self._pool.scatter_(field, rows, self._pool_layer[layer], label=self.label)
             updated[field] = rows
         self._pending[layer] = updated
         self._added[layer] = 1

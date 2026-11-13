@@ -130,6 +130,7 @@ def test_dense_window_keeps_only_latest_executed_frames_across_calls():
         assert reached.row_offsets.tolist() == [0, min(48, executed.shape[0])]
         step.check_calls()
         pool.commit(step.steps["frames"], step.ctx)
+        step.commit_calls()
         step.end_calls()
         assert pool.logical_length("a", "main") == executed.shape[0]
 
@@ -145,6 +146,7 @@ def test_dense_window_keeps_only_latest_executed_frames_across_calls():
     assert torch.equal(handle.read(0).fields["rgb"], executed[-48:])
     step.check_calls()
     pool.commit(step.steps["frames"], step.ctx)
+    step.commit_calls()
     step.end_calls()
     pool.remove_request("a")
     pool.ingest_request("a")
@@ -159,7 +161,94 @@ def test_dense_window_keeps_only_latest_executed_frames_across_calls():
     assert handle.read(0).fields["rgb"].shape == (0, 3, 8, 8)
     step.check_calls()
     pool.commit(step.steps["frames"], step.ctx)
+    step.commit_calls()
     step.end_calls()
+
+
+def test_failed_warm_step_keeps_the_previous_episode_window():
+    frames = _frames(reads={"context": Read(mask=Window(4))}, lifetime="episode")
+    (spec,) = build_specs([frames])
+    pool = DenseWindowPool.build(spec, EngineResourceInfo(device=torch.device("cpu")))
+    owners = EpisodeRowBindings()
+    (handle,) = node_handles(SimpleNamespace(declare_state=lambda: [frames]), "decoder", {"frames": pool}).values()
+
+    def open_request(rid):
+        pool.ingest_request(rid)
+        binding = owners.bind(rid, 0, "episode-a")
+        pool.bind_episode(rid, 0, "episode-a", cold=binding.cold, reset=False)
+
+    def start_step(rid, span):
+        step = state_steps(SubmoduleStep(
+            segments=[Segment(rid, "main", span)], state={"frames": ArrayStep()},
+        ), {"frames": handle}, graph_walk="decode")
+        step.set_ctx(StepContext(request_ids=[rid], graph_walk="decode", slot=0, capture=False))
+        assert pool.admit(step.steps["frames"], step.ctx).ok
+        pool.plan(step.steps["frames"], step.ctx)
+        step.begin_calls()
+        return step
+
+    open_request(1)
+    first = start_step(1, 4)
+    original = torch.arange(1, 5, dtype=torch.uint8)[:, None, None, None].expand(-1, 3, 8, 8).clone()
+    handle.add(0, rgb=original)
+    first.check_calls()
+    pool.commit(first.steps["frames"], first.ctx)
+    first.commit_calls()
+    first.end_calls()
+    pool.remove_request(1)
+    owners.unbind(1)
+
+    open_request(2)
+    failed = start_step(2, 1)
+    handle.add(0, rgb=torch.full((1, 3, 8, 8), 99, dtype=torch.uint8))
+    assert handle.read(0).fields["rgb"][-1, 0, 0, 0].item() == 99
+    pool.rollback_admit(failed.steps["frames"], failed.ctx)
+    failed.end_calls()
+    pool.remove_request(2)
+    owners.unbind(2)
+
+    open_request(3)
+    resumed = start_step(3, 0)
+    assert torch.equal(handle.read(0).fields["rgb"], original)
+    resumed.check_calls()
+    pool.commit(resumed.steps["frames"], resumed.ctx)
+    resumed.commit_calls()
+    resumed.end_calls()
+
+
+def test_dense_window_refuses_rebuild_drop_without_mutating_history():
+    frames = _frames(reads={"context": Read(mask=Window(4))})
+    (spec,) = build_specs([frames])
+    pool = DenseWindowPool.build(spec, EngineResourceInfo(device=torch.device("cpu")))
+    assert not pool.supports_drop
+    pool.ingest_request(1)
+    (handle,) = node_handles(SimpleNamespace(declare_state=lambda: [frames]), "decoder", {"frames": pool}).values()
+    step = state_steps(SubmoduleStep(
+        segments=[Segment(1, "main", 4)], state={"frames": ArrayStep()},
+    ), {"frames": handle}, graph_walk="decode")
+    step.set_ctx(StepContext(request_ids=[1], graph_walk="decode", slot=0, capture=False))
+    assert pool.admit(step.steps["frames"], step.ctx).ok
+    pool.plan(step.steps["frames"], step.ctx)
+    step.begin_calls()
+    data = torch.arange(1, 5, dtype=torch.uint8)[:, None, None, None].expand(-1, 3, 8, 8).clone()
+    handle.add(0, rgb=data)
+    step.check_calls()
+    pool.commit(step.steps["frames"], step.ctx)
+    step.commit_calls()
+    step.end_calls()
+    assert pool.check_drop(1, 4) is not None
+    with pytest.raises(RuntimeError, match="cannot be rebuilt"):
+        pool.drop(1, 4)
+    assert pool.logical_length(1, "main") == 4
+    resumed = state_steps(SubmoduleStep(
+        segments=[Segment(1, "main", 0)], state={"frames": ArrayStep()},
+    ), {"frames": handle}, graph_walk="decode")
+    resumed.set_ctx(StepContext(request_ids=[1], graph_walk="decode", slot=0, capture=False))
+    assert pool.admit(resumed.steps["frames"], resumed.ctx).ok
+    pool.plan(resumed.steps["frames"], resumed.ctx)
+    resumed.begin_calls()
+    assert torch.equal(handle.read(0).fields["rgb"], data)
+    resumed.end_calls()
 
 
 def test_dense_window_packs_different_row_lengths_and_refuses_capture():
@@ -184,6 +273,7 @@ def test_dense_window_packs_different_row_lengths_and_refuses_capture():
     assert torch.equal(reached.fields["rgb"], torch.cat((values[:2], values[-4:])))
     step.check_calls()
     pool.commit(step.steps["frames"], step.ctx)
+    step.commit_calls()
     step.end_calls()
 
 
@@ -213,6 +303,7 @@ def test_episode_owner_survives_request_teardown_then_reset_and_end_clear_it():
         reached = handle.read(0).fields["rgb"].clone()
         step.check_calls()
         pool.commit(step.steps["frames"], step.ctx)
+        step.commit_calls()
         step.end_calls()
         return reached
 
@@ -297,6 +388,7 @@ def test_dense_window_requires_every_layer_before_committing_one_logical_length(
     assert torch.equal(handle.read(1).fields["rgb"], chunk + 1)
     step.check_calls()
     pool.commit(step.steps["frames"], step.ctx)
+    step.commit_calls()
     step.end_calls()
     assert pool.logical_length(1, "main") == 3
 
@@ -341,6 +433,7 @@ def test_engine_binds_warm_episode_and_releases_it_only_on_explicit_end():
         reached = handle.read(0).fields["rgb"].clone()
         step.check_calls()
         pool.commit(step.steps["frames"], step.ctx)
+        step.commit_calls()
         step.end_calls()
         return reached
 
@@ -384,11 +477,53 @@ def test_worker_defers_idle_episode_close_until_request_teardown():
     pipeline = object.__new__(StepPipeline)
     pipeline.lifecycle = SimpleNamespace(pending_episode_ends=pending)
     pipeline.engine_manager = Manager()
+    pipeline.ingest = SimpleNamespace(has_pending_episode=lambda episode_id, slot: False)
     pipeline._apply_episode_ends()
     assert pending == [end]
     active = False
     pipeline._apply_episode_ends()
     assert pending == []
+
+
+def test_end_waits_for_an_unadmitted_episode_queued_behind_a_busy_slot():
+    end = EndEpisode("b", 0)
+    queued = SimpleNamespace(request_id="call-b", episode_id="b", episode_slot=0)
+    ingest = object.__new__(InputIngest)
+    ingest._pending_episode_requests = {0: [queued]}
+    busy = True
+    ingest._engines = SimpleNamespace(episode_slot_busy=lambda slot: busy)
+    admitted = []
+    ingest._add_new_request = admitted.append
+
+    closed = False
+
+    def end_episode(episode_id, slot):
+        nonlocal closed
+        assert (episode_id, slot) == ("b", 0)
+        if not admitted:
+            closed = True  # This would lose END before B owns its row.
+            return True
+        if busy:
+            return False
+        closed = True
+        return True
+
+    pipeline = object.__new__(StepPipeline)
+    pipeline.ingest = ingest
+    pipeline.lifecycle = SimpleNamespace(pending_episode_ends=[end])
+    pipeline.engine_manager = SimpleNamespace(end_episode=end_episode)
+    pipeline._apply_episode_ends()
+    assert not closed and pipeline.lifecycle.pending_episode_ends == [end]
+
+    busy = False  # The previous owner has drained; B can be admitted.
+    ingest.retry_episode_requests()
+    assert admitted == [queued]
+    busy = True  # B now runs on this slot.
+    pipeline._apply_episode_ends()
+    assert not closed and pipeline.lifecycle.pending_episode_ends == [end]
+    busy = False  # B has drained after its REMOVE.
+    pipeline._apply_episode_ends()
+    assert closed and pipeline.lifecycle.pending_episode_ends == []
 
 
 def test_deferred_episode_new_request_replays_all_partitions_then_next_call():

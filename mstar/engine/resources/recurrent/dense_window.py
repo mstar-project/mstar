@@ -36,6 +36,13 @@ class DenseWindowPool(RecurrentStatePool):
 
     supports_context_parallel = False
     supports_split_steps = False
+    supports_drop = False
+
+    def check_drop(self, rid: str, tokens: int) -> str:
+        return "dense window entries cannot be rebuilt from token ids"
+
+    def drop(self, rid: str, tokens: int) -> int:
+        raise RuntimeError(self.check_drop(rid, tokens))
 
     @classmethod
     def build(cls, spec, info):

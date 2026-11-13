@@ -306,6 +306,10 @@ class InputIngest:
             for partition in same:
                 self._add_new_request(partition)
 
+    def has_pending_episode(self, episode_id: str, slot: int) -> bool:
+        """An END must wait until a queued NEW has run or been removed."""
+        return any(body.episode_id == episode_id for body in self._pending_episode_requests.get(slot, ()))
+
     def _drop_pending_episode_request(self, wire_rid: str) -> None:
         for slot, pending in list(self._pending_episode_requests.items()):
             pending[:] = [body for body in pending if body.request_id != wire_rid]

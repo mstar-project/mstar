@@ -935,6 +935,8 @@ class StepPipeline:
     def _apply_episode_ends(self) -> None:
         pending = self.lifecycle.pending_episode_ends
         for body in pending[:]:
+            if self.ingest.has_pending_episode(body.episode_id, body.episode_slot):
+                continue
             if self.engine_manager.end_episode(body.episode_id, body.episode_slot):
                 pending.remove(body)
 
