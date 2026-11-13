@@ -1368,7 +1368,9 @@ def _refused_worker(engine, line):
     ``line`` the requests in the order a step reaches them."""
     pushed = []
     worker = make_worker(
-        graph_runtime=SimpleNamespace(push_back_node=lambda node, rids, graphs: pushed.append(rids)),
+        graph_runtime=SimpleNamespace(
+            push_back_node=lambda node, rids, graphs: pushed.append(rids), get_rid_string=str,
+        ),
         engine_manager=SimpleNamespace(get_engine=lambda node: engine),
         scheduler=SimpleNamespace(
             could_refill=lambda *a: False,

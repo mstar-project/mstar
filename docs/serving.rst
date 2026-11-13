@@ -82,6 +82,15 @@ mstar serve
      - off
      - Serve Prometheus metrics at ``/metrics`` (see :ref:`serving-metrics`).
        Needs ``.[metrics]``.
+   * - ``--enable-nvtx``
+     - off
+     - Emit NVTX markers for CUDA profiling. Disabled on XPU and CPU.
+   * - ``--timeout``
+     - ``600``
+     - Per-request timeout (seconds).
+   * - ``--tcp-transfer-device``
+     - (auto)
+     - Network device for TCP tensor transport.
 
 Each model maps to a default config (override with ``--config``):
 
@@ -199,13 +208,13 @@ set.
 .. code-block:: bash
 
    export MSTAR_API_KEY="$(openssl rand -hex 32)"
-   mstar serve qwen3_omni            # or: mstar-serve --config ... [--rust-frontend]
+   mstar serve qwen3_omni            # or: mstar-serve --config ... [--python-frontend]
 
 With a key set, every HTTP route except ``/health`` and ``/metrics`` (see
 :ref:`serving-metrics`) answers ``401`` unless the request carries
 ``Authorization: Bearer <key>``, and WebSocket routes (``/v1/realtime``,
 ``/generate/ws``) refuse the handshake without it. The check is one middleware over the
-whole app (FastAPI and the Rust frontend alike), and the comparison takes the same time
+whole app (``mstar-server`` and the Python frontend alike), and the comparison takes the same time
 however much of the key matches. CORS preflights still get their answer, since browsers
 send them without credentials. ``--api-key`` overrides the environment variable, but
 prefer the variable: a command-line flag is visible to every local user in the process
@@ -280,7 +289,7 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
      - *(optional)* ``true`` runs the workers as clients of a CUDA MPS control daemon the
        conductor starts in a private directory, so workers that share a GPU overlap their
        kernels instead of time-slicing (the ASR ``*_split`` configs, and the speech ones:
-       ``chatterbox*_split``, ``omnivoice_split``, ``cosyvoice3_split``, ``qwen3tts_split``). NVIDIA only, and it
+       ``chatterbox*_split``, ``omnivoice_split``, ``cosyvoice3_split``, ``qwen3tts_split``, ``qwen3tts_base_split``). NVIDIA only, and it
        needs ``nvidia-cuda-mps-control`` on ``PATH``. The conductor stops the daemon on
        shutdown; on Linux the daemon also gets SIGTERM if the conductor is killed. Default
        ``false``.
@@ -324,8 +333,9 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        55-90% as binary PCM, and digital silence to 1-2%, but compressing every frame
        costs the event loop: about 8% of it at 32 live Nemotron VoiceChat calls on
        ``/generate/ws``, whose configs turn it off. Turn it off where the server's
-       event loop, not the network, is the bottleneck. The Rust frontend
-       (``--rust-frontend``) offers no deflate, whatever this says.
+       event loop, not the network, is the bottleneck. ``mstar-server``, the default
+       frontend, offers no deflate whatever this says, so this applies only under
+       ``--python-frontend``.
    * - ``ws_max_message_mb``
      - *(optional)* The largest WebSocket message the server reads, in MiB, on every
        WebSocket route; by default the HTTP body limit, ``MSTAR_MAX_BODY_MB``. A larger one
@@ -821,7 +831,7 @@ before it spawns the workers, run every worker as its client so their kernels ov
 and quit the daemon at shutdown. The daemon uses a private pipe directory, so other
 processes on the GPU are unaffected. ``nvidia-cuda-mps-control`` (part of the NVIDIA
 driver) must be on ``PATH``. The ``*_split.yaml`` configs for Whisper, Qwen3-ASR, the three
-Chatterbox models, OmniVoice and CosyVoice3 set it, and so does ``qwen3tts_split.yaml`` (the 0.6B).
+Chatterbox models, OmniVoice and CosyVoice3 set it, and so do ``qwen3tts_split.yaml`` (the 0.6B) and ``qwen3tts_base_split.yaml``.
 
 **A light node beside a heavy one, on one worker.** ``side_stream: true`` on a node
 group runs that node's steps on a lane of their own instead of the worker's main chain:
@@ -1219,8 +1229,8 @@ Prometheus metrics at ``GET /metrics``. It needs the ``metrics`` extra
 hint. Off by default, and ``/metrics`` answers 404 then. Like ``/health``, it needs no
 API key even when one is set, the usual convention for scrape endpoints. It exposes
 request counts, latencies and the model name (never prompts or outputs); if that
-matters for a deployment, keep the port on an internal network. With
-``--rust-frontend``, ``mstar-server`` serves the same text: it asks the API server for
+matters for a deployment, keep the port on an internal network.
+``mstar-server`` serves the same text as the Python frontend: it asks the API server for
 it over the bridge, so both frontends show the same names, and it answers ``503`` if the
 bridge does not reply within two seconds, as ``/health`` does.
 
@@ -1256,8 +1266,8 @@ warmup requests. Every family has a ``model_name`` label (the config's ``model``
   ``MSTAR_MAX_CONCURRENT_REQUESTS`` cap turns a request away. ``route`` is the route's
   path as declared (``/v1/chat/completions``), ``unmatched`` when no route matches.
   A request that was submitted and then failed counts once, as an ``error`` in
-  ``mstar_requests_total``, never here. WebSocket handshakes are not counted. With
-  ``--rust-frontend``, ``mstar-server`` keeps these counts and sends them with each
+  ``mstar_requests_total``, never here. WebSocket handshakes are not counted.
+  ``mstar-server`` keeps these counts and sends them with each
   ``/metrics`` request, so the API server exports them under the same name.
 - ``mstar_request_queue_seconds{model_name, output_modalities}``: histogram over
   successful requests, from the conductor taking the request in to admitting it for

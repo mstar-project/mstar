@@ -2,7 +2,7 @@
 
 import hashlib
 import json
-from collections.abc import Collection, Mapping, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import fields, is_dataclass
 from itertools import product
 from typing import TYPE_CHECKING, get_origin
@@ -51,6 +51,11 @@ def state_declaration_problems(model: "Model") -> list[str]:
 def position_key(array: Array) -> str:
     """The resource key of ``array``'s positions: ``thinker_pos`` for ``thinker_kv``, ``rope`` for any other name."""
     return f"{array.name.removesuffix('_kv')}_pos" if array.name.endswith("_kv") else "rope"
+
+
+def host_field_holders(arrays: Iterable[Array]) -> list[Array]:
+    """The arrays of ``arrays`` that hold host fields."""
+    return [array for array in arrays if array.entry.host]
 
 
 def written_by_step(array: Array) -> frozenset[str]:
@@ -149,7 +154,8 @@ def _value_problems(arrays: Sequence[Array], kv_labels: Mapping[str, Mapping[str
     """What a Value's entry can't hold yet. A prefix hit restores a Value's snapshot, and a snapshot carries neither its
     host fields nor a field its step writes itself, which no kernel writes mid-prefill."""
     plain = [array for array in arrays if written_by_step(array)]
-    if not plain and not any(array.entry.host for array in arrays):
+    holders = host_field_holders(arrays)
+    if not plain and not holders:
         return []
     keyed = {
         node for array in arrays if any(label.keys is not None for label in kv_labels.get(array.name, {}).values())
@@ -162,7 +168,7 @@ def _value_problems(arrays: Sequence[Array], kv_labels: Mapping[str, Mapping[str
     problems += [
         f"Array {array.name!r}.entry.host: nodes {sorted(array.nodes & keyed)} have prefix keys, and a prefix hit "
         "wouldn't restore host fields"
-        for array in arrays if array.entry.host and array.nodes & keyed
+        for array in holders if array.nodes & keyed
     ]
     problems += [
         f"Array {array.name!r}: nodes {sorted(array.nodes & keyed)} have prefix keys, and a prefix hit wouldn't "

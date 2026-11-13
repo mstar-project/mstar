@@ -29,24 +29,25 @@ from transformers import AutoTokenizer
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import FINAL_PREFILL, PartitionDefinition
-from mstar.engine.resources import (
-    AttentionConfig,
-    AttentionSpec,
-    KVSpec,
-    NodeResourceSpec,
-    PagedKVConfig,
-    PositionConfig,
-    PositionSpec,
-    ResourceReqConfig,
-    SamplerSpec,
-    SamplingReqConfig,
-)
 from mstar.engine.resources.lora import LoraSpec
+from mstar.engine.state import (
+    Array,
+    Attend,
+    Causal,
+    KVEntry,
+    Layout,
+    Positions,
+    Read,
+    Rope,
+    Sampler,
+    SampleSettings,
+    Span,
+)
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.base import KVLabel, LabelLayout, Model, PrefixKeys, ProcessPromptOutput, Span, WalkStep
+from mstar.model.base import KVLabel, Model, PrefixKeys, ProcessPromptOutput, WalkStep
 from mstar.model.keys import MIXED
-from mstar.model.orpheus.config import ATTN, KV_CACHE, ROPE, SAMPLER, OrpheusModelConfig
+from mstar.model.orpheus.config import ATTN, KV_CACHE, SAMPLER, OrpheusModelConfig
 from mstar.model.rebuild import RebuildPolicy
 from mstar.model.submodule_base import ChunkingPolicy, NodeSubmodule
 from mstar.model.utils import load_generation_defaults
@@ -315,10 +316,10 @@ class OrpheusModel(Model):
         all_input_ids = torch.cat([start_token, prompt_tokens.input_ids[0], end_tokens])
 
         length = all_input_ids.numel()
-        layout = LabelLayout(
+        layout = Layout(
             spans=(Span("ids", "prefill", length, length, "text_inputs"),), growth=(("decode_loop", 1),),
         )
-        return ProcessPromptOutput({"text_inputs": [all_input_ids]}, {"kv_layout": {KV_CACHE: {"main": layout}}})
+        return ProcessPromptOutput({"text_inputs": [all_input_ids]}, {"state_layout": {KV_CACHE: {"main": layout}}})
 
     # -------------------------------------------------------------------
     # Model ABC: resources
@@ -352,58 +353,34 @@ class OrpheusModel(Model):
             embeddings=True,
         )
 
-    def get_node_resources(self) -> list[NodeResourceSpec]:
-        kv_config = PagedKVConfig(
-            num_layers=self.config.num_hidden_layers,
-            num_kv_heads=self.config.num_key_value_heads,
-            head_dim=self.config.head_dim,
-            max_seq_len=self.config.max_position_embeddings,
-            num_qo_heads=self.config.num_attention_heads,
-        )
+    def get_node_resources(self):
+        return [self._lora_spec()]
+
+    def declare_state(self) -> list[Array | Sampler]:
+        c, scaling = self.config, self.config.rope_scaling
         return [
-            KVSpec(
-                resource_key=KV_CACHE,
-                nodes={"LLM"},
-                config=kv_config
+            Array(
+                KV_CACHE, nodes={"LLM"}, layers=frozenset(range(c.num_hidden_layers)),
+                entry=KVEntry(heads=c.num_key_value_heads, head_dim=c.head_dim), max_len=c.max_position_embeddings,
+                positions=Positions(rope=Rope(
+                    theta=c.rope_theta, scale=scaling["factor"], low_freq_factor=scaling["low_freq_factor"],
+                    high_freq_factor=scaling["high_freq_factor"],
+                    old_context_len=scaling["original_max_position_embeddings"],
+                )),
+                reads={ATTN: Read(mask=Causal(), op=Attend(q_heads=c.num_attention_heads))},
             ),
-            AttentionSpec(
-                resource_key=ATTN,
-                nodes={"LLM"},
-                config=AttentionConfig(
-                    kv_cache=KV_CACHE,
-                ),
-            ),
-            SamplerSpec(
-                resource_key=SAMPLER,
-                nodes={"LLM"},
-                vocab_size=self.config.vocab_size,
-                enable_repetition_penalty=True,
-                # on only when the recipe sets min_p (the checkpoint's file can't: it is read
-                # switch_only); otherwise a request min_p > 0 is refused
-                enable_min_p=self.config.min_p > 0,
-            ),
-            PositionSpec(
-                resource_key=ROPE,
-                nodes={"LLM"},
-                config=PositionConfig(
-                    kv_cache=KV_CACHE,
-                    rope_theta=self.config.rope_theta,
-                    rope_scale=self.config.rope_scaling["factor"],
-                    low_freq_factor=self.config.rope_scaling["low_freq_factor"],
-                    high_freq_factor=self.config.rope_scaling["high_freq_factor"],
-                    old_context_len=self.config.rope_scaling["original_max_position_embeddings"],
-                )
-            ),
-            self._lora_spec(),
+            # min_p on only when the recipe sets it (the checkpoint's file can't: it is read
+            # switch_only); otherwise a request min_p > 0 is refused
+            Sampler(SAMPLER, nodes={"LLM"}, vocab_size=c.vocab_size, penalty=True, min_p=c.min_p > 0),
         ]
 
     def get_request_resource_configs(
         self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
-    ) -> dict[str, ResourceReqConfig]:
+    ) -> dict[str, SampleSettings]:
         del input_modalities, output_modalities
         model_kwargs = model_kwargs or {}
         return {
-            SAMPLER: SamplingReqConfig(
+            SAMPLER: SampleSettings(
                 **{
                     k: model_kwargs.get(k, getattr(self.config, k))
                     for k in SAMPLING_KEYS
