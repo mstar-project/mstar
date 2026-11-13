@@ -175,6 +175,9 @@ class _Unread:
     def opens_label(self, rid, label):
         return True
 
+    def write_kv(self, k, v, layer_idx=None, label=None, tokens=None):
+        """Nothing: a kept add reaches the pages whatever kernel reads it, and the stubbed read never reads them."""
+
 
 @contextmanager
 def _step_over(sub, lengths, array: str):

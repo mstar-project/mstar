@@ -1138,6 +1138,8 @@ class PagedArrayHandle(ArrayHandle):
         self._ops = [(resolved.resource_of[bound.key], bound) for bound in bindings]
         # whether `check_step` needs an add, for a step that lists a row on the pages at span above 0
         self._grows = False
+        # whether the add in `_held` is kept
+        self._held_kept = False
 
     def _check_labels(self, labels: set[str], segments) -> None:
         runs = [label for label, _ in groupby(segment.label for segment in segments)]
@@ -1193,9 +1195,6 @@ class PagedArrayHandle(ArrayHandle):
         super().check_step(step)
         if not self._keep or step.ctx.replays:
             return
-        if self._unwritten():
-            raise self._refusal(f"the step ends with layer {self._held_layer}'s add unread, on a kernel that takes k "
-                                "and v at the read, so no page holds it")
         if self._grows and not self._kept:
             raise self._refusal("a step that keeps lists rows at span above 0 and adds nothing, so the pages "
                                 "would keep entries no add wrote; list those rows at span 0")
@@ -1205,10 +1204,11 @@ class PagedArrayHandle(ArrayHandle):
         layer = self._layer_id(layer)
         self._record_add(layer, keep)
         if self._held_layer != layer and self._unwritten():
-            raise self._refusal(f"an add on layer {layer} while layer {self._held_layer}'s add waits for its read, on "
-                                "a kernel that takes k and v at the read")
+            raise self._refusal(f"an add on layer {layer} while layer {self._held_layer}'s scratch add waits for its "
+                                "read, on a kernel that takes k and v at the read")
         self._write_unread()
         k, v = fields["k"], fields["v"]
+        kept = layer in self._kept
         attn = self._attn.get(layer)
         if self._eager and attn is not None and self._needs_step_kv(attn):
             raise self._refusal(
@@ -1216,35 +1216,43 @@ class PagedArrayHandle(ArrayHandle):
                 "needs the step's own k and v (an exchange, a context-parallel pool on a multi-token step, or the "
                 "dense backend)")
         if attn is None or self._eager:
-            self._write(layer, k, v)
+            self._write(layer, k, v, kept)
             return
         # held for the read, which passes them on as a layer calls attention (`requires_kv_write`): a kernel may
         # attend the step's own k and v rather than the pages (`reads_step_kv`), and an exchange writes them
-        self._held, self._held_layer = (k, v), layer
+        self._held, self._held_layer, self._held_kept = (k, v), layer, kept
         if not _exchanges(attn, self.label):
-            self._write(layer, k, v)
+            self._write(layer, k, v, kept)
 
-    def _write(self, layer: int, k: torch.Tensor, v: torch.Tensor) -> None:
-        """``layer``'s write alone, where its kernel reads the pages: through the exchange where the attention
+    @staticmethod
+    def _reaches_pages(attn: PagedRead, kept: bool) -> bool:
+        """Whether an add read through ``attn`` is written to the pages: a kept add always is, since later steps read
+        it there whatever kernel this step runs, and a scratch add where ``attn``'s kernel reads the pages."""
+        return kept or attn.requires_kv_write
+
+    def _write(self, layer: int, k: torch.Tensor, v: torch.Tensor, kept: bool) -> None:
+        """``layer``'s write alone, where the add reaches the pages: through the exchange where the attention
         exchanges, as `AttentionCallable.write` makes it."""
         attn = self._attn.get(layer)
         if attn is not None and _exchanges(attn, self.label):
-            attn.exchange(partial(self._attend, layer), None, k, v, label=self.label)
-        elif attn is None or attn.requires_kv_write:
+            attn.exchange(partial(self._attend, layer, kept), None, k, v, label=self.label)
+        elif attn is None or self._reaches_pages(attn, kept):
             self._kv.write_kv(k, v, layer_idx=self._pool_layer[layer], label=self.label)
 
     def _write_unread(self) -> None:
         """Write the held add of a layer the step didn't read where its write waits for the read's exchange, so
-        each add is written once: when the next add or the step's check finds it still held. A kernel that takes k
-        and v at the read has no write to make, so its add stays held."""
-        layer = self._held_layer
-        if layer is not None and _exchanges(self._attn[layer], self.label) and self._attn[layer].requires_kv_write:
-            self._write(layer, *self._take_hold(layer))
+        each add is written once: when the next add or the step's check finds it still held. A scratch add on a
+        kernel that takes k and v at the read has no write to make, so it stays held."""
+        layer, kept = self._held_layer, self._held_kept
+        if layer is not None and _exchanges(self._attn[layer], self.label) and self._reaches_pages(
+            self._attn[layer], kept,
+        ):
+            self._write(layer, *self._take_hold(layer), kept)
 
     def _unwritten(self) -> bool:
-        """Whether no page holds the held add: its kernel takes k and v at the read."""
+        """Whether no page holds the held add: a scratch add whose kernel takes k and v at the read."""
         attn = self._attn.get(self._held_layer)
-        return attn is not None and not attn.requires_kv_write
+        return attn is not None and not self._reaches_pages(attn, self._held_kept)
 
     def _needs_step_kv(self, attn: Any) -> bool:
         """Whether a read through ``attn`` attends the step's own k and v rather than only the pages, or goes through
@@ -1272,7 +1280,9 @@ class PagedArrayHandle(ArrayHandle):
         attn = self._attn[layer]
         if _exchanges(attn, self.label):
             # the add's write and the attention as one call, on the tokens and heads this rank stores
-            return attn.exchange(partial(self._attend, layer), q, *self._take_hold(layer), label=self.label)
+            return attn.exchange(
+                partial(self._attend, layer, self._held_kept), q, *self._take_hold(layer), label=self.label,
+            )
         # a read with no add before it attends the pages alone, which a kernel that takes no writes can't
         k, v = self._take_hold(layer) if self._held is not None or not attn.requires_kv_write else (None, None)
         return attn.run(
@@ -1280,13 +1290,14 @@ class PagedArrayHandle(ArrayHandle):
         )
 
     def _attend(
-        self, layer: int, q: torch.Tensor | None, k: torch.Tensor, v: torch.Tensor, tokens: torch.Tensor | None = None,
+        self, layer: int, kept: bool, q: torch.Tensor | None, k: torch.Tensor, v: torch.Tensor,
+        tokens: torch.Tensor | None = None,
     ) -> torch.Tensor | None:
-        """An exchange's ``run``: this layer's write where the kernel reads the pages, then its attention (``q``
+        """An exchange's ``run``: this layer's write where the add reaches the pages, then its attention (``q``
         None: the write alone), as `AttentionCallable` makes the call. ``tokens``: which of the step's tokens k and v
         are, named by the ring's exchange alone (`sequence_shard.ring`)."""
         attn, i = self._attn[layer], self._pool_layer[layer]
-        if attn.requires_kv_write:
+        if self._reaches_pages(attn, kept):
             self._kv.write_kv(k, v, layer_idx=i, label=self.label, tokens=tokens)
         if q is None:
             return None

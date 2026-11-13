@@ -303,7 +303,7 @@ def test_a_kernel_that_takes_no_writes_gets_k_and_v_at_the_read():
     q, k, v = _tensors()
     h.add(1, k=k, v=v)
     h.read(1, q)
-    assert kv.writes == [], "a dense read writes its own KV"
+    assert kv.writes == [(1, "main")], "a kept add reaches the pages whatever kernel reads it"
     assert attn.runs == [(1, "main", True)]
 
 
@@ -606,7 +606,8 @@ def test_a_kept_add_after_a_read_leaves_its_own_entries_on_the_pages():
 
 
 def test_a_kernel_that_takes_k_and_v_at_the_read_gets_the_kept_add_after_a_read():
-    """The dense kernel writes no add to the pages, kept or not, so its read after the kept add takes the kept add."""
+    """The dense kernel takes each add at its read, so its read after the kept add takes the kept add, and only the kept
+    add reaches the pages."""
     kv, attn, taken = _StubKV(), _StubDense(), []
     attn.run = lambda q, label=None, kv_cache_layer=None, k=None, v=None, layer_idx=None: taken.append((k, v)) or q
     h = _kv_handle(kv=kv, attn=attn)
@@ -620,7 +621,7 @@ def test_a_kernel_that_takes_k_and_v_at_the_read_gets_the_kept_add_after_a_read(
     assert [(a is k, b is v) for a, b in taken] == [(False, False), (True, True)], (
         "each read should take the add just before it"
     )
-    assert kv.writes == [] and h._held is None, "the handle writes nothing to the pages here, as for a kept add alone"
+    assert kv.writes == [(0, "main")] and h._held is None, "the pages should hold the kept add, not the scratch pass"
 
 
 def test_a_scratch_add_after_a_read_starts_another_pass():

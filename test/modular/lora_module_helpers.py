@@ -329,6 +329,9 @@ class _Unread:
     def opens_label(self, rid, label):
         return True
 
+    def write_kv(self, k, v, layer_idx=None, label=None, tokens=None):
+        """Nothing: a kept add reaches the pages whatever core reads it, and no stubbed core reads them."""
+
 
 # -- Llama-shaped checkpoints -------------------------------------------------------------------
 
