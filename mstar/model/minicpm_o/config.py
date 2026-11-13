@@ -13,17 +13,19 @@ from pathlib import Path
 
 from mstar.model.components.qwen3_lm import Qwen3LMConfig
 
-# resource keys
+# state and resource keys
 LLM_KV = "llm_kv"
 LLM_ATTN = "llm_attn"
-LLM_POS = "llm_pos"
 LLM_SAMPLER = "llm_sampler"
+VISION_TOKENS = "vision_tokens"
 VISION_ATTN = "vision_attn"
+RESAMPLER_KV = "resampler_kv"
+RESAMPLER_QUERIES = "resampler_queries"
 RESAMPLER_ATTN = "resampler_attn"
+AUDIO_TOKENS = "audio_tokens"
 AUDIO_ATTN = "audio_attn"
 TTS_KV = "tts_kv"
 TTS_ATTN = "tts_attn"
-TTS_POS = "tts_pos"
 TTS_SAMPLER = "tts_sampler"
 T2W_STATE = "t2w_state"
 # token2wav attention caches, one resource per ``token2wav.CACHE_FAMILIES`` entry

@@ -6,7 +6,7 @@ the checkpoint's ``modeling_minicpmo.py`` (Apache-2.0).
 
 The encoder attends block-causally in 1 s chunks (50 post-conv frames) even
 for a whole clip: a frame sees its own chunk and every earlier one. That is
-the ``RaggedBlockCausalAttentionSpec`` resource, with one segment per piece
+a ``BlockCausal`` read on the node's array, with one segment per piece
 (audio longer than 30 s arrives as 30 s pieces, each encoded from position 0).
 The layers are Whisper's, which is what ``AuTEncoderLayer`` is.
 """
@@ -17,7 +17,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from mstar.model.components.aut_encoder import AuTEncoderConfig, AuTEncoderLayer
-from mstar.model.minicpm_o.config import AUDIO_ATTN, AudioConfig
+from mstar.model.minicpm_o.config import AUDIO_TOKENS, AudioConfig
 
 
 class WhisperEncoder(nn.Module):
@@ -38,7 +38,8 @@ class WhisperEncoder(nn.Module):
             activation_function=config.activation_function,
         )
         self.layers = nn.ModuleList(
-            AuTEncoderLayer(layer_config, attn_key=AUDIO_ATTN) for _ in range(config.encoder_layers)
+            AuTEncoderLayer(layer_config, attn_key=None, array=AUDIO_TOKENS, layer=layer)
+            for layer in range(config.encoder_layers)
         )
         self.layer_norm = nn.LayerNorm(d)
 
@@ -54,13 +55,8 @@ class WhisperEncoder(nn.Module):
         return torch.cat(out)
 
     def encode(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if self.layers[0].self_attn.ragged is None:
-            raise RuntimeError(
-                f"MiniCPM-o's audio tower has no {AUDIO_ATTN!r} resource; declare a "
-                "RaggedBlockCausalAttentionSpec for the audio_encoder node"
-            )
         for layer in self.layers:
-            # cu_seqlens is only read without a bound resource
+            # cu_seqlens is only read without a bound array
             hidden_states = layer(hidden_states, cu_seqlens=None)
         return self.layer_norm(hidden_states)
 

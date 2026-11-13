@@ -36,26 +36,25 @@ from transformers import Qwen2Tokenizer
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import FINAL_PREFILL, PartitionDefinition
 from mstar.distributed.base import ShardingConfig
-from mstar.engine.resources import (
-    AttentionConfig,
-    AttentionSpec,
-    KVSpec,
-    NodeResourceSpec,
-    PagedKVConfig,
-    PositionConfig,
-    PositionSpec,
-    RaggedAttentionConfig,
-    RaggedAttentionSpec,
-    RaggedBlockCausalAttentionSpec,
-    RaggedCrossAttentionSpec,
-    ResourceReqConfig,
-    SamplerSpec,
-    SamplingReqConfig,
-)
 from mstar.engine.resources.kv.config import DEFAULT_PAGE_SIZE
+from mstar.engine.state import (
+    Array,
+    Attend,
+    Block,
+    BlockCausal,
+    Causal,
+    Entry,
+    KVEntry,
+    Layout,
+    Positions,
+    Read,
+    Rope,
+    Sampler,
+    SampleSettings,
+)
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Parallel, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.base import KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, WalkStep
+from mstar.model.base import KVLabel, Model, ProcessPromptOutput, Span, WalkStep
 from mstar.model.components.audio_features import HOP_LENGTH, LogMelSpectrogram
 from mstar.model.components.token2wav.keys import Token2WavKeys
 from mstar.model.components.token2wav.model import (
@@ -73,6 +72,7 @@ from mstar.model.minicpm_o.components.vision import MiniCPMOVision
 from mstar.model.minicpm_o.config import (
     AUDIO_ATTN,
     AUDIO_FEATURE_LENS,
+    AUDIO_TOKENS,
     DECODE,
     DECODE_LOOP,
     DECODE_MIXED,
@@ -80,9 +80,12 @@ from mstar.model.minicpm_o.config import (
     IMAGE_TGT_SIZES,
     LLM_ATTN,
     LLM_KV,
-    LLM_POS,
     LLM_SAMPLER,
+    PATCHES,
+    QUERIES,
     RESAMPLER_ATTN,
+    RESAMPLER_KV,
+    RESAMPLER_QUERIES,
     SPEECH_TEXT_TOKENS,
     T2W_KV,
     T2W_STATE,
@@ -90,10 +93,10 @@ from mstar.model.minicpm_o.config import (
     TTS_DECODE,
     TTS_DECODE_LOOP,
     TTS_KV,
-    TTS_POS,
     TTS_PREFILL,
     TTS_SAMPLER,
     VISION_ATTN,
+    VISION_TOKENS,
     MiniCPMOConfig,
     TTSSampling,
 )
@@ -132,6 +135,9 @@ VOICES = {"default": "HT_ref_audio.wav"}
 DEFAULT_VOICE = "default"
 T2W_DEFAULT_SLOTS = 9
 T2W_KEYS = Token2WavKeys(codes="tts_code", state=T2W_STATE, kv=T2W_KV)
+# PagedKVConfig's default, which `kernel_settings` sets on the TTS's pool so that `validate_config_yaml` checks the
+# pool the engine builds
+TTS_KV_PAGES = 2048
 
 # Upstream's `get_sys_prompt(mode="audio_assistant", language="en")`, around
 # the voice's reference audio.
@@ -227,7 +233,7 @@ class MiniCPMOModel(Model):
 
         tts = resources.get(TTS_KV) or {}
         reply = -(-self.tts_config.max_position_embeddings // int(tts.get("page_size") or DEFAULT_PAGE_SIZE))
-        pages = int(tts.get("max_num_pages", PagedKVConfig.max_num_pages))
+        pages = int(tts.get("max_num_pages", TTS_KV_PAGES))
         cap = config.get("max_concurrent_requests")
         # and the pool's sink page
         if cap is None or pages < int(cap) * reply + 1:
@@ -241,69 +247,59 @@ class MiniCPMOModel(Model):
         return self.local_dir
 
     # ------------------------------------------------------------------
-    # Resources
+    # State
     # ------------------------------------------------------------------
 
-    def get_node_resources(self) -> list[NodeResourceSpec]:
-        llm, vision, resampler, audio = (
-            self.config.llm, self.config.vision, self.config.resampler, self.config.audio,
+    def declare_state(self) -> list[Array | Sampler]:
+        llm, vision, resampler, audio, tts = (
+            self.config.llm, self.config.vision, self.config.resampler, self.config.audio, self.tts_config,
         )
         return [
-            KVSpec(
-                resource_key=LLM_KV, nodes={LLM},
-                config=PagedKVConfig(
-                    num_layers=llm.num_hidden_layers,
-                    num_kv_heads=llm.num_key_value_heads,
-                    head_dim=llm.head_dim,
-                    max_seq_len=self.max_seq_len,
-                    num_qo_heads=llm.num_attention_heads,
-                ),
-            ),
-            AttentionSpec(resource_key=LLM_ATTN, nodes={LLM}, config=AttentionConfig(kv_cache=LLM_KV)),
-            PositionSpec(
-                resource_key=LLM_POS, nodes={LLM},
-                config=PositionConfig(kv_cache=LLM_KV, rope_theta=llm.rope_theta),
-            ),
-            SamplerSpec(
-                resource_key=LLM_SAMPLER, nodes={LLM},
-                vocab_size=llm.vocab_size, enable_repetition_penalty=True,
-                # upstream's `chat` hands min_p to HF `generate`, which honours it
-                enable_min_p=True,
-            ),
-            RaggedAttentionSpec(
-                resource_key=VISION_ATTN, nodes={VISION},
-                config=RaggedAttentionConfig(
-                    num_qo_heads=vision.num_attention_heads,
-                    num_kv_heads=vision.num_attention_heads,
-                    head_dim=vision.head_dim,
-                ),
-            ),
-            RaggedCrossAttentionSpec(
-                resource_key=RESAMPLER_ATTN, nodes={VISION},
-                config=RaggedAttentionConfig(
-                    num_qo_heads=resampler.num_heads,
-                    num_kv_heads=resampler.num_heads,
-                    head_dim=resampler.head_dim,
-                ),
-            ),
-            RaggedBlockCausalAttentionSpec(
-                resource_key=AUDIO_ATTN, nodes={AUDIO},
-                block_size=audio.chunk_frames,
-                config=RaggedAttentionConfig(
-                    num_qo_heads=audio.encoder_attention_heads,
-                    num_kv_heads=audio.encoder_attention_heads,
-                    head_dim=audio.head_dim,
-                    # the pieces a captured block loop's plan holds (a spoken reply's
-                    # voice clip and two 30 s pieces, say); a request with more
-                    # runs eagerly
-                    max_segments_per_request=4,
-                ),
-            ),
-            *self._tts_resources(),
-            # ~0.4 GB a slot (one speaking request) for the bundled voices;
-            # `t2w_state.max_slots` in the yaml sizes it
-            *token2wav_resources(T2W_KEYS, TOKEN2WAV, self._voice_seconds(), T2W_DEFAULT_SLOTS),
+            Array(LLM_KV, nodes={LLM}, layers=frozenset(range(llm.num_hidden_layers)), max_len=self.max_seq_len,
+                  entry=KVEntry(heads=llm.num_key_value_heads, head_dim=llm.head_dim),
+                  positions=Positions(rope=Rope(theta=llm.rope_theta)),
+                  reads={LLM_ATTN: Read(mask=Causal(), op=Attend(q_heads=llm.num_attention_heads))}),
+            # upstream's `chat` hands min_p to HF `generate`, which honours it
+            Sampler(LLM_SAMPLER, nodes={LLM}, vocab_size=llm.vocab_size, penalty=True, min_p=True),
+            Array(VISION_TOKENS, nodes={VISION}, labels={PATCHES}, layers=frozenset(range(vision.num_hidden_layers)),
+                  max_len=0, entry=KVEntry(heads=vision.num_attention_heads, head_dim=vision.head_dim),
+                  reads={VISION_ATTN: Read(mask=Block(), op=Attend(q_heads=vision.num_attention_heads))}),
+            # each slice's patches, which the resampler's learned queries cross-attend
+            Array(RESAMPLER_KV, nodes={VISION}, labels={PATCHES}, layers=frozenset({0}), max_len=0,
+                  entry=KVEntry(heads=resampler.num_heads, head_dim=resampler.head_dim),
+                  reads={RESAMPLER_ATTN: Read(mask=Block(), op=Attend(q_heads=resampler.num_heads),
+                                              queries=RESAMPLER_QUERIES)}),
+            Array(RESAMPLER_QUERIES, nodes={VISION}, labels={QUERIES}, layers=frozenset({0}), max_len=0,
+                  entry=Entry({})),
+            Array(AUDIO_TOKENS, nodes={AUDIO}, layers=frozenset(range(audio.encoder_layers)), max_len=0,
+                  entry=KVEntry(heads=audio.encoder_attention_heads, head_dim=audio.head_dim),
+                  reads={AUDIO_ATTN: Read(mask=BlockCausal(audio.chunk_frames),
+                                          op=Attend(q_heads=audio.encoder_attention_heads))}),
+            # Llama 3.1's factors, which the TTS's layers passed per call and so ran FlashInfer's llama31 kernel
+            Array(TTS_KV, nodes={TTS}, layers=frozenset(range(tts.num_hidden_layers)),
+                  max_len=tts.max_position_embeddings,
+                  entry=KVEntry(heads=tts.num_key_value_heads, head_dim=tts.head_dim),
+                  positions=Positions(rope=Rope(
+                      theta=tts.rope_theta, low_freq_factor=1.0, high_freq_factor=1.0, old_context_len=8192,
+                  )),
+                  reads={TTS_ATTN: Read(mask=Causal(), op=Attend(q_heads=tts.num_attention_heads))}),
+            # upstream's TTS sampling (see TTSSubmodule)
+            Sampler(TTS_SAMPLER, nodes={TTS}, vocab_size=tts.num_audio_tokens, penalty=False, eos_ids=(tts.eos_code,),
+                    repetition_window=TTS_SAMPLING.penalty_window, top_p_first=True),
         ]
+
+    def get_node_resources(self):
+        # Token2Wav's specs stay hand-written (see docs/adding_models.rst). ~0.4 GB a slot (one speaking request)
+        # for the bundled voices; `t2w_state.max_slots` in the yaml sizes it.
+        return token2wav_resources(T2W_KEYS, TOKEN2WAV, self._voice_seconds(), T2W_DEFAULT_SLOTS)
+
+    def kernel_settings(self) -> dict[str, dict[str, Any]]:
+        return {
+            # the pieces a captured block loop's plan holds (a spoken reply's voice clip and two 30 s pieces, say); a
+            # request with more runs eagerly
+            AUDIO_ATTN: {"max_segments_per_request": 4},
+            TTS_KV: {"max_num_pages": TTS_KV_PAGES},
+        }
 
     def _voice_seconds(self) -> tuple[float, float]:
         """The shortest and longest bundled voice."""
@@ -312,43 +308,15 @@ class MiniCPMOModel(Model):
         seconds = [sf.info(str(Path(self.local_dir) / "assets" / f)).duration for f in VOICES.values()]
         return min(seconds), max(seconds)
 
-    def _tts_resources(self) -> list[NodeResourceSpec]:
-        tts = self.tts_config
-        return [
-            KVSpec(
-                resource_key=TTS_KV, nodes={TTS},
-                config=PagedKVConfig(
-                    num_layers=tts.num_hidden_layers,
-                    num_kv_heads=tts.num_key_value_heads,
-                    head_dim=tts.head_dim,
-                    max_seq_len=tts.max_position_embeddings,
-                    num_qo_heads=tts.num_attention_heads,
-                ),
-            ),
-            AttentionSpec(resource_key=TTS_ATTN, nodes={TTS}, config=AttentionConfig(kv_cache=TTS_KV)),
-            PositionSpec(
-                resource_key=TTS_POS, nodes={TTS},
-                config=PositionConfig(kv_cache=TTS_KV, rope_theta=tts.rope_theta),
-            ),
-            # upstream's TTS sampling (see TTSSubmodule)
-            SamplerSpec(
-                resource_key=TTS_SAMPLER, nodes={TTS},
-                vocab_size=tts.num_audio_tokens, enable_repetition_penalty=False,
-                max_repetition_window=TTS_SAMPLING.penalty_window,
-                min_tokens_stop_ids=(tts.eos_code,),
-                enable_top_p_first=True,
-            ),
-        ]
-
     def get_request_resource_configs(
         self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
-    ) -> dict[str, ResourceReqConfig]:
+    ) -> dict[str, SampleSettings]:
         knobs = {**DEFAULT_SAMPLING, **{k: model_kwargs[k] for k in SAMPLING_KEYS if k in model_kwargs}}
         tts = TTS_SAMPLING
         return {
             # upstream generates from embeddings, so its penalty sees only generated tokens
-            LLM_SAMPLER: SamplingReqConfig(**knobs, penalize_prompt=False),
-            TTS_SAMPLER: SamplingReqConfig(
+            LLM_SAMPLER: SampleSettings(**knobs, penalize_prompt=False),
+            TTS_SAMPLER: SampleSettings(
                 temperature=tts.temperature, top_p=tts.top_p, top_k=tts.top_k,
                 repetition_penalty=tts.repetition_penalty, repetition_window=tts.penalty_window,
                 min_tokens=tts.min_new_tokens, top_p_first=True, top_p_min_keep=tts.top_p_min_keep,
@@ -631,18 +599,18 @@ class MiniCPMOModel(Model):
             metadata[SPEECH_TEXT_TOKENS] = limit
         # the LLM's prefill writes every prompt row, placeholders included, then a row per decode step
         rows = int(input_ids.numel())
-        llm = LabelLayout(
+        llm = Layout(
             spans=(Span("rows", self._prefill_walk(result), rows, rows, "text_inputs"),),
             growth=((DECODE_LOOP, 1),),
         )
         # A spoken reply's TTS prefills its condition in one step: the reply, at most a token
         # per LLM decode step, then two more. That is a bound, laid out as two rows plus a row
         # per LLM step; then a row per code.
-        tts = LabelLayout(
+        tts = Layout(
             spans=(Span("rows", TTS_PREFILL, 2, 2, "tts_hidden"),),
             growth=((DECODE_LOOP, 1), (TTS_DECODE_LOOP, 1)),
-        ) if speech else LabelLayout()
-        metadata["kv_layout"] = {LLM_KV: {"main": llm}, TTS_KV: {"main": tts}}
+        ) if speech else Layout()
+        metadata["state_layout"] = {LLM_KV: {"main": llm}, TTS_KV: {"main": tts}}
         return ProcessPromptOutput(result, metadata)
 
     def get_max_output_tokens(self, **model_kwargs) -> int:
@@ -811,7 +779,7 @@ class MiniCPMOModel(Model):
             from mstar.model.loader.iterators import iter_safetensors_shards
 
             tts = self._build(
-                lambda: MiniCPMTTS(self.tts_config, attn_key=TTS_ATTN, kv_key=TTS_KV, pos_key=TTS_POS),
+                lambda: MiniCPMTTS(self.tts_config, array=TTS_KV),
                 dtype, device,
             )
             tts.load_weights(
@@ -823,9 +791,7 @@ class MiniCPMOModel(Model):
         from mstar.model.components.qwen3_lm import Qwen3DenseLM
 
         lm = self._build(
-            lambda: Qwen3DenseLM(
-                self.config.llm, attn_key=LLM_ATTN, kv_key=LLM_KV, pos_key=LLM_POS, comm_group=tp_group,
-            ),
+            lambda: Qwen3DenseLM(self.config.llm, array=LLM_KV, comm_group=tp_group),
             dtype, device,
         )
         weight_loader.load_llm_weights(lm, weights, device)

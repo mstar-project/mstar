@@ -25,7 +25,7 @@ PORTED = (
     "mstar/model/qwen3_tts",
     "mstar/model/pi05", "mstar/model/vjepa2", "mstar/model/canary", "mstar/model/components/encoder_decoder.py",
     "mstar/model/bagel", "mstar/model/chatterbox", "mstar/model/whisper",
-    "mstar/model/waypoint", "mstar/model/lingbot_world",
+    "mstar/model/waypoint", "mstar/model/lingbot_world", "mstar/model/minicpm_o",
 )
 FORBIDDEN_ATTRIBUTES = {
     "node_resources", "resources", "request_state", "request_states", "per_request_states", "sequence_shard",
@@ -88,6 +88,8 @@ ALLOWED_IN_FUNCTION = {
         "the ViT's eager varlen attention, flash-attn or a masked SDPA, which keeps no state",
     ("mstar/model/bagel/submodules.py", "ViTEncoderSubmodule._replay_block_loop", "disable"):
         "the ViT region's replay, which runs its captured graph; no state call sits behind it",
+    ("mstar/model/minicpm_o/submodules.py", "AudioEncoderSubmodule._replay_block_loop", "disable"):
+        "the audio block loop's replay, which runs its captured graph; no state call sits behind it",
 }
 # what a module defines to be handed the node's built resources, rather than its handles (`bind_state`)
 RESOURCE_BINDS = {"bind_resources", "bind_node_resources"}

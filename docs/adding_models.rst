@@ -2489,6 +2489,12 @@ holds each ported package to that.
 Qwen3-TTS's ``batch_postprocess`` keeps the opt-in watermark's per-stream state in
 ``request_state`` under one named lint exception, until it moves to a watermark node's plain
 Value (issue #1447).
+MiniCPM-o's Token2Wav node, in ``mstar/model/components/token2wav``, which the lint doesn't
+read, isn't on the contract yet: it reads ``request_state`` and its resources directly, and
+``get_node_resources`` returns its hand-written slot pool and three bounded caches. Each cache
+keeps a sink and a window and starts from a voice prompt that every request in the voice
+shares, and the DiT's holds two rows a request, which no contract array declares yet. A
+follow-up issue moves the node onto the contract.
 
 ``ModelInputsFromEngine`` carries six other useful fields:
 
