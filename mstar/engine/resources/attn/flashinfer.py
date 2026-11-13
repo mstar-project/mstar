@@ -431,6 +431,12 @@ class FlashInferManager(PlacedAttention):
             self._step_qo.clear()
         laps = PhaseLaps(f"{ctx.plan_phase}.attn.")
         for label, kv_out in plan_outputs.items():
+            if lease is not None and kv_out.beyond_reach:
+                raise RuntimeError(
+                    f"attention over KV {self._kv_cache_name!r}: a leased step plans label {label!r} with a row that "
+                    "holds entries its kept window no longer reaches, which this kernel would attend; the dense kernel "
+                    "gathers the reach on an eager step"
+                )
             indptrs = kv_out.cpu_indptrs
             r = None if shard_plan is None else shard_plan.ranges.get(label)
             if r is not None and self._split_exchange == "kv_gather":

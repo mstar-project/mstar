@@ -316,15 +316,18 @@ class KVPlanOutput:
 
     __slots__ = (
         "cpu_indptrs", "_views", "_view_builder", "decode_pages", "decode_offsets",
-        "rows", "_decode", "columns",
+        "rows", "_decode", "columns", "beyond_reach",
     )
 
     def __init__(
         self, cpu_indptrs: PagedIndptrs, views: "list[SequenceView] | None" = None,
         decode_pages=None, decode_offsets=None,
-        rows=None, view_builder=None, decode: bool | None = None, columns=None,
+        rows=None, view_builder=None, decode: bool | None = None, columns=None, beyond_reach: bool = False,
     ):
         self.cpu_indptrs = cpu_indptrs
+        # whether a row holds entries its exact retention no longer reaches, which a kernel that reads every page of
+        # the row would attend
+        self.beyond_reach = beyond_reach
         # packing in plan order w/h 1 view per segment covered by plan; a plan
         # built from columns hands a builder instead and the views are made on
         # first use (the FlashInfer path never asks for them)
