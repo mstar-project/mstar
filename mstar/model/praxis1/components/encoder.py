@@ -233,9 +233,7 @@ def dense_chunk_causal_mask(
     wants the kernel's block mask, which is the resource M* does not have
     yet.
     """
-    codes = encoder_codes(
-        num_registers, num_anchor, num_text, tokens_per_chunk, n_chunks, n_clean_chunks
-    )
+    codes = encoder_codes(num_registers, num_anchor, num_text, tokens_per_chunk, n_chunks, n_clean_chunks)
     return visible(codes)
 
 
@@ -319,8 +317,7 @@ class TrunkBlock(nn.Module):
             if dtype in ("mixed", "float32"):
                 x = modulate(x, shift, 1 + scale)
             elif dtype == "bfloat16":
-                x = (x.to(torch.bfloat16) * (1 + scale).to(torch.bfloat16)
-                     + shift.to(torch.bfloat16)).to(x.dtype)
+                x = (x.to(torch.bfloat16) * (1 + scale).to(torch.bfloat16) + shift.to(torch.bfloat16)).to(x.dtype)
             elif dtype is None:
                 x = x * (1 + scale) + shift
             else:
@@ -396,8 +393,7 @@ class TrunkStack(nn.Module):
             blocks.append(TrunkBlock(ffn, dim, head_dim, num_kv_heads, layer_index=i + 1))
         self.blocks = nn.ModuleList(blocks)
         self.modulators = (
-            nn.ModuleList([nn.Linear(mod_dim, 2 * dim) for _ in range(depth)])
-            if mod_dim is not None else None
+            nn.ModuleList([nn.Linear(mod_dim, 2 * dim) for _ in range(depth)]) if mod_dim is not None else None
         )
         self.modulation_dtype = modulation_dtype
 
@@ -432,10 +428,7 @@ class TrunkStack(nn.Module):
             defer = fuse_residual and may_defer(i, last, tap_blocks)
             if self.modulators is not None and x_mod is None:
                 raise ValueError("a modulated stack needs x_mod")
-            modulation = (
-                (self.modulators[i], x_mod, self.modulation_dtype)
-                if self.modulators is not None else None
-            )
+            modulation = (self.modulators[i], x_mod, self.modulation_dtype) if self.modulators is not None else None
             result = block(x, rope, mask, attend, pending, defer, modulation)
             x, pending = result if defer else (result, None)
             if i in tap_blocks:
@@ -540,9 +533,7 @@ class EncoderTower(nn.Module):
         self.tap_blocks = tuple(tap_blocks)
         self.positive_zero_residual_add = positive_zero_residual_add
 
-    def chunk_modulate(
-        self, flat: torch.Tensor, t_emb: torch.Tensor, chunk_tokens: Sequence[int]
-    ) -> torch.Tensor:
+    def chunk_modulate(self, flat: torch.Tensor, t_emb: torch.Tensor, chunk_tokens: Sequence[int]) -> torch.Tensor:
         """AdaLN-style modulation of each chunk's tokens by its timestep row.
 
         ``1 + scale`` is formed in the projection's own dtype, before the
@@ -595,9 +586,7 @@ class EncoderTower(nn.Module):
         text_tok = self.input_projections[TEXT](text)
         noised_tok = self.input_projections[VIDEO](noised)
         noised_shape = noised_tok.shape
-        noised_tok = self.chunk_modulate(
-            noised_tok.flatten(1, -2), self.t_embedding(timesteps), [chunk * tpf] * kk
-        )
+        noised_tok = self.chunk_modulate(noised_tok.flatten(1, -2), self.t_embedding(timesteps), [chunk * tpf] * kk)
         parts = [self.registers, anchor_tok, text_tok, noised_tok]
         if clean is not None:
             clean_tok = self.input_projections[VIDEO](clean).flatten(1, -2)
@@ -627,9 +616,9 @@ class EncoderTower(nn.Module):
         )
         positions = positions.unsqueeze(0).to(x.device)
         if mask is None:
-            mask = dense_chunk_causal_mask(
-                n_reg, n_anchor, n_text, chunk * tpf, kk, kk - 1 if n_clean else 0
-            ).to(x.device)
+            mask = dense_chunk_causal_mask(n_reg, n_anchor, n_text, chunk * tpf, kk, kk - 1 if n_clean else 0).to(
+                x.device
+            )
 
         out, taps = self.core(x, positions, mask, self.tap_blocks, attend, fuse_residual)
         if self.positive_zero_residual_add:

@@ -16,7 +16,11 @@ from torch import nn
 from mstar.model.praxis1.components.attention import sdpa_attend
 from mstar.model.praxis1.components.chunk_mask import encoder_codes, visible
 from mstar.model.praxis1.components.encoder import (
-    VIDEO, TrunkStack, VideoInputProjection, chunk_rows, modulate,
+    VIDEO,
+    TrunkStack,
+    VideoInputProjection,
+    chunk_rows,
+    modulate,
 )
 from mstar.model.praxis1.components.norm_time import TimestepEmbedding, ZeroCenteredRMSNorm
 from mstar.model.praxis1.components.rope import video_positions
@@ -104,9 +108,9 @@ class DecoderTower(nn.Module):
             raise ValueError(f"conditioning shape {tuple(cond.shape)} does not match noised grid")
         chunk_tokens = (frames // kk) * height * width
         shift, scale = self.t_proj[VIDEO](self.t_embedding(timesteps)).chunk(2, dim=-1)
-        flat = modulate(tok.flatten(1, -2),
-                        chunk_rows(shift, [chunk_tokens] * kk),
-                        chunk_rows(1 + scale, [chunk_tokens] * kk))
+        flat = modulate(
+            tok.flatten(1, -2), chunk_rows(shift, [chunk_tokens] * kk), chunk_rows(1 + scale, [chunk_tokens] * kk)
+        )
         x = torch.cat([self.registers, flat], dim=1)
 
         b, cf, h, w, c = cond.shape
@@ -115,10 +119,16 @@ class DecoderTower(nn.Module):
         n_reg = self.registers.size(1)
         pad = torch.zeros(b, n_reg, c, device=up.device, dtype=up.dtype)
         x_mod = torch.cat([pad, up], dim=1)
-        positions = torch.cat([
-            torch.zeros(n_reg, dtype=torch.int64),
-            video_positions(frames, height, width, start=rope_shift),
-        ]).unsqueeze(0).to(x.device)
+        positions = (
+            torch.cat(
+                [
+                    torch.zeros(n_reg, dtype=torch.int64),
+                    video_positions(frames, height, width, start=rope_shift),
+                ]
+            )
+            .unsqueeze(0)
+            .to(x.device)
+        )
         if mask is None:
             codes = encoder_codes(n_reg, 0, 0, chunk_tokens, kk, 0)
             mask = visible(codes).to(x.device)
