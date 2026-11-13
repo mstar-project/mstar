@@ -195,3 +195,11 @@ def _fused_add_rms_norm_fake(
 ) -> None:
     return None
 
+
+def _fused_add_rms_norm_op():
+    return torch.ops.mstar.fused_add_rms_norm
+
+
+# ``(hidden_states, residual, weight, eps, gemma)``, both 2-D, updated in place,
+# through the op on every platform
+run_fused_add_rms_norm = PlatformDispatch("fused_add_rms_norm", default=_fused_add_rms_norm_op)
