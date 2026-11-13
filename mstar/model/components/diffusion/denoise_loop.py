@@ -68,7 +68,7 @@ from __future__ import annotations
 import functools
 from collections import OrderedDict
 from collections.abc import Hashable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 import torch
@@ -403,7 +403,7 @@ class DenoiseLoopSubmodule(NodeSubmodule):
     def _graph_step_key(self, step_key: Hashable) -> Hashable:
         """``step_key`` with its bucket replaced by that bucket's :meth:`graph_key`."""
         if isinstance(step_key, StepBucket):
-            return StepBucket(self.graph_key(step_key.bucket), step_key.dtype)
+            return replace(step_key, bucket=self.graph_key(step_key.bucket))
         return self.graph_key(step_key)
 
     # --------------------------------------------------------- engine contract
