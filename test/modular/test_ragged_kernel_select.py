@@ -28,6 +28,7 @@ from mstar.engine.resources.attn.ragged import kernels as kernels_module
 from mstar.engine.resources.attn.ragged.cudnn_wrappers import (
     CudnnRaggedPrefillWrapper,
     Fa4UniformPrefillWrapper,
+    segment_runs,
     uniform_segments,
 )
 from mstar.engine.resources.attn.ragged.flashinfer import FlashInferRaggedCrossManager, FlashInferRaggedManager
@@ -123,6 +124,19 @@ def test_sm_103_runs_fa4_for_wan_a14b_sizes(gpu, seq_len, impl):
     gpu(B300)
     manager = build(spec(40, 128))
     assert kernels_module.RAGGED_ATTENTION.row_for(manager._kernel_rows, seq_len) == Choice(impl)
+
+
+RUNS = Choice("cudnn", {"segments": "runs"})
+
+
+def test_sm_103_runs_minimax_h3_on_cudnn_in_runs(gpu):
+    """MiniMax-H3's 56 heads: cuDNN at every size, taking its request rows then its padding rows eagerly."""
+    shape = (("head_dim", 128), ("num_kv_heads", 56), ("num_qo_heads", 56))
+    entry = next(find_entries("ragged_attention", B300, "bfloat16", shape))
+    assert entry.rows == ((None, RUNS),)
+    gpu(B300)
+    manager = build(spec(56))
+    assert kernels_module.RAGGED_ATTENTION.row_for(manager._kernel_rows, 37985) == RUNS
 
 
 @pytest.mark.parametrize("key", [H100, DeviceKey("NVIDIA B200", "sm_100")], ids=["sm_90", "sm_100"])
@@ -318,6 +332,23 @@ def test_a_row_per_size_class(stub_flashinfer):
     assert type(planned(m, 4192, 4192)) is CudnnRaggedPrefillWrapper
 
 
+def test_a_runs_row_takes_unequal_segments_eagerly(stub_flashinfer):
+    """MiniMax-H3's layout (request rows, then padding rows to the compile bucket) runs cuDNN in two calls;
+    an equal layout on the same slot runs as one batch."""
+    m = manager_with(((None, RUNS),))
+    w = planned(m, 37985, 159)
+    assert type(w) is CudnnRaggedPrefillWrapper and w._runs == [(1, 37985), (1, 159)]
+    assert planned(m, 4608, 4608) is w and w._runs == [(2, 4608)]
+
+
+def test_a_runs_row_keeps_unequal_segments_off_a_captured_bucket(stub_flashinfer):
+    """A captured graph bakes one layout of equal segments in: an unequal one stays on FlashInfer there."""
+    m = manager_with(((None, RUNS),))
+    assert type(planned(m, 4608, 1024, lease=lease(2, 5632))) is _StubFlashInfer
+    w = planned(m, 4608, 4608, lease=lease(2, 2 * 4608, slot=2))
+    assert type(w) is CudnnRaggedPrefillWrapper and w.accelerator_graph and not w._runs_ok
+
+
 BOUNDED_ROWS = ((256, Choice("flashinfer", {"backend": "fa2"})), (4608, Choice("cudnn")), (None, Choice("flashinfer")))
 
 
@@ -448,6 +479,17 @@ def test_uniform_segments(lens, want):
     assert uniform_segments(cu(*lens)) == want
 
 
+@pytest.mark.parametrize(("lens", "want"), [
+    ((4608,), [(1, 4608)]),
+    ((37985, 159), [(1, 37985), (1, 159)]),
+    ((512, 512, 96, 96, 512), [(2, 512), (2, 96), (1, 512)]),
+    ((4096, 4096, 0, 0), [(2, 4096)]),  # a graph wrapper's padding
+    ((0,), []),
+])
+def test_segment_runs(lens, want):
+    assert segment_runs(cu(*lens)) == want
+
+
 def graph_cudnn(max_segments=2, max_tokens=2 * 4608):
     return CudnnRaggedPrefillWrapper(num_qo_heads=24, num_kv_heads=24, head_dim=128, device=torch.device("cpu"),
                                      accelerator_graph=True, max_num_segments=max_segments,
@@ -475,3 +517,9 @@ def test_the_cudnn_wrapper_needs_equal_segments(graph):
 def test_the_cudnn_wrapper_runs_mha_only():
     with pytest.raises(ValueError, match="MHA only"):
         CudnnRaggedPrefillWrapper(num_qo_heads=24, num_kv_heads=8, head_dim=128, device=torch.device("cpu"))
+
+
+def test_a_captured_cudnn_wrapper_takes_no_runs():
+    with pytest.raises(ValueError, match="one layout of equal-length segments"):
+        CudnnRaggedPrefillWrapper(num_qo_heads=24, num_kv_heads=24, head_dim=128, device=torch.device("cpu"),
+                                  accelerator_graph=True, max_num_segments=2, max_total_tokens=4608, runs=True)

@@ -197,3 +197,50 @@ def test_the_resource_runs_the_tables_kernel(heads, seq, captured):
     q, k, v = qkv(2 * seq, heads)
     out = replay(lambda: manager.run(q, k, v, label="main")) if captured else manager.run(q, k, v, label="main")
     assert rel_l2(out, reference(q, k, v, cu(2, seq))) < REL_L2
+
+
+def bounds(*lens) -> torch.Tensor:
+    return torch.tensor([0, *torch.tensor(lens).cumsum(0).tolist()], dtype=torch.int32)
+
+
+@pytest.mark.parametrize("lens", [(4608, 159), (512, 512, 96, 512)], ids=["rows+padding", "three_runs"])
+def test_cudnn_runs_unequal_segments_eagerly(lens):
+    """A ``segments: runs`` wrapper: each run of equal segments is the cuDNN call over that run alone, bit for bit,
+    with its log-sum-exp, and the whole matches the reference."""
+    heads = 24
+    q, k, v = qkv(sum(lens), heads)
+    w = CudnnRaggedPrefillWrapper(num_qo_heads=heads, num_kv_heads=heads, head_dim=D, device=DEVICE, q_data_type=DTYPE,
+                                  runs=True)
+    w.plan(bounds(*lens))
+    out, lse = w.run(q, k, v, return_lse=True)
+    want, want_lse = reference(q, k, v, bounds(*lens), lse=True)
+    assert rel_l2(out, want) < REL_L2
+    torch.testing.assert_close(lse, want_lse, atol=2e-2, rtol=0)
+    start = 0
+    for n, seq in w._runs:
+        alone = make("cudnn", heads, n, seq, graph=False)
+        alone.plan(cu(n, seq))
+        rows = slice(start, start + n * seq)
+        got, got_lse = alone.run(q[rows], k[rows], v[rows], return_lse=True)
+        assert torch.equal(out[rows], got) and torch.equal(lse[rows], got_lse)
+        start += n * seq
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or current_platform.arch() != "sm_103",
+                    reason="the shipped table covers sm_103")
+def test_minimax_h3_runs_the_bits_flashinfer_did():
+    """MiniMax-H3's geometry and layout (request rows, then padding rows) at a shorter length: the table's cuDNN
+    runs give FlashInfer's cuDNN output on the request rows bit for bit, so the change of kernel is lossless."""
+    heads, rows, pad = 56, 8193, 63
+    spec = RaggedAttentionSpec(resource_key="dit_attn", nodes={"dit"}, config=RaggedAttentionConfig(
+        num_qo_heads=heads, num_kv_heads=heads, head_dim=D, dtype=DTYPE))
+    manager = build_resource(spec, EngineResourceInfo(device=DEVICE, kv_dtype=DTYPE))
+    step = AttentionStep(segments=(Segment(request_id="r0", label="main", span=rows),
+                                   Segment(request_id="r0", label="main", span=pad)), causal=False)
+    manager.plan(step, StepContext(request_ids=["r0"], graph_walk="video_gen", slot=0, capture=False))
+    assert type(manager._current_plan_states["main"]) is CudnnRaggedPrefillWrapper
+    q, k, v = qkv(rows + pad, heads)
+    out = manager.run(q, k, v, label="main")
+    flashinfer = make("flashinfer_auto", heads, 1, rows, graph=False)
+    flashinfer.plan(bounds(rows, pad))
+    assert torch.equal(out[:rows], flashinfer.run(q, k, v)[:rows])
