@@ -106,10 +106,10 @@ class _Expert(nn.Module):
         return noised_action_latents * 0.1 + action_timesteps[:, :, None] * 0.3 + proprio_latents.mean() * 0.2
 
 
-def _info(step: int, num_steps: int = 2):
+def _info(step: int, num_steps: int = 2, video_scale: float = 4.0):
     return CurrentForwardPassInfo(
         request_id="r", graph_walk="chunk", fwd_index=step, random_seed=17, max_tokens=1,
-        step_metadata={"num_steps": num_steps, "t_shift": 1.0, "cfg_video_scale": 4.0, "cfg_scale": 1.0,
+        step_metadata={"num_steps": num_steps, "t_shift": 1.0, "cfg_video_scale": video_scale, "cfg_scale": 1.0,
                        "text_tokens": 3, "blank_tokens": 2},
         dynamic_loop_iter_counts={"praxis_denoise": step},
     )
@@ -117,8 +117,11 @@ def _info(step: int, num_steps: int = 2):
 
 @pytest.mark.parametrize("depth", [0, 1])
 @pytest.mark.parametrize("num_steps", [1, 2])
-def test_cold_and_warm_node_flow_matches_reference_sampler(depth: int, num_steps: int) -> None:
-    config = replace(Praxis1Config.for_rig("single_arm"), latent_channels=1, latents_per_chunk=6)
+@pytest.mark.parametrize("rig,video_scale", [("single_arm", 4.0), ("bimanual", 1.0)])
+def test_cold_and_warm_node_flow_matches_reference_sampler(
+    depth: int, num_steps: int, rig: str, video_scale: float,
+) -> None:
+    config = replace(Praxis1Config.for_rig(rig), latent_channels=1, latents_per_chunk=6)
     encoder, decoder = _Encoder(), _Decoder()
     backbone = Praxis1BackboneSubmodule(
         config, SimpleNamespace(encoder=encoder, decoder=decoder),
@@ -149,22 +152,26 @@ def test_cold_and_warm_node_flow_matches_reference_sampler(depth: int, num_steps
                                  clean_latents=[torch.zeros(1, 4, depth * 6, 1, 1)],
                                  proprio_all=[proprio])
         input_tensors.update({name: [value] for name, value in carried.items()})
-        prepared = backbone.prepare_inputs("chunk", _info(step, num_steps), input_tensors)
+        prepared = backbone.prepare_inputs("chunk", _info(step, num_steps, video_scale), input_tensors)
         final_step = step == num_steps - 1
         expected_resources = ({ENCODER_COND_KV} if final_step else {
-            ENCODER_COND_KV, ENCODER_BLANK_KV, DECODER_COND_KV, DECODER_BLANK_KV,
+            ENCODER_COND_KV, DECODER_COND_KV,
+            *((ENCODER_BLANK_KV, DECODER_BLANK_KV) if video_scale != 1.0 else ()),
         })
         assert set(backbone.declare_step("chunk", ["r"], [prepared]).state) == expected_resources
         if final_step:
             # The final forward must not even look up a decoder handle that
             # its resource declaration omitted.
             backbone.state_handles = {ENCODER_COND_KV: states[ENCODER_COND_KV]}
+        video_before = carried["video_latents"].clone()
         out = backbone.forward("chunk", None, **prepared.tensor_inputs, **prepared.kwargs)
+        if final_step:
+            torch.testing.assert_close(out["expert_video_latents"][0], video_before, rtol=0, atol=0)
         expert_inputs = {name: value for name, value in out.items()}
         expert_inputs["proprio"] = [proprio[:, -1:]]
         if depth:
             expert_inputs["proprio_all"] = [proprio]
-        prepared_expert = expert.prepare_inputs("chunk", _info(step, num_steps), expert_inputs)
+        prepared_expert = expert.prepare_inputs("chunk", _info(step, num_steps, video_scale), expert_inputs)
         assert set(expert.declare_step("chunk", ["r"], [prepared_expert]).state) == {
             EXPERT_QUERIES, EXPERT_TRUNK_KEYS,
         }
@@ -180,19 +187,66 @@ def test_cold_and_warm_node_flow_matches_reference_sampler(depth: int, num_steps
         blank_velocity = expected_video * 0.25 + blank.mean() * 0.5
         if step != num_steps - 1:
             expected_video = expected_video + (ts[step + 1] - ts[step]) * guidance_combine(
-                cond_velocity, blank_velocity, 4.0,
+                cond_velocity, blank_velocity, video_scale,
             )
         action_velocity = expected_action * 0.1 + ts[step] * 0.3 + proprio.mean() * 0.2
         expected_action = expected_action + (ts[step + 1] - ts[step]) * action_velocity
     torch.testing.assert_close(carried["video_latents"], expected_video, rtol=0, atol=0)
     torch.testing.assert_close(carried["action_latents"], expected_action, rtol=0, atol=0)
-    assert encoder.calls == 2 * (num_steps - 1) + 1
-    assert decoder.calls == 2 * (num_steps - 1)
+    branches = 2 if video_scale != 1.0 else 1
+    assert encoder.calls == branches * (num_steps - 1) + 1
+    assert decoder.calls == branches * (num_steps - 1)
     for name, state in states.items():
-        if num_steps == 1 and name in {ENCODER_BLANK_KV, DECODER_COND_KV, DECODER_BLANK_KV}:
+        if (name in {ENCODER_BLANK_KV, DECODER_BLANK_KV} and
+                (num_steps == 1 or video_scale == 1.0)) or (num_steps == 1 and name == DECODER_COND_KV):
             assert not state.calls
         else:
             assert state.calls
+
+
+def test_warm_episode_text_final_step_reads_only_conditional_state() -> None:
+    config = replace(
+        Praxis1Config.for_rig("bimanual"), latent_channels=1,
+        latents_per_chunk=6, text_hidden_dim=2,
+    )
+    encoder, decoder = _Encoder(), _Decoder()
+    node = Praxis1BackboneSubmodule(
+        config, SimpleNamespace(encoder=encoder, decoder=decoder), episode_text=True,
+    )
+
+    class _HeldText:
+        def __init__(self):
+            self.reads = 0
+
+        def read(self, layer):
+            self.reads += 1
+            return SimpleNamespace(fields={"h": torch.tensor(
+                [[0.5, 0.5]] * 3 + [[-0.25, -0.25]] * 2,
+            )})
+
+    held_text = _HeldText()
+    node.state_handles = {ENCODER_COND_KV: _State(), "text_embeds": held_text}
+    video = seeded_normal((1, 4, 6, 1, 1), 17, VIDEO_SALT)
+    action = seeded_normal((1, 6, config.action_patch_dim), 17, ACTION_SALT)
+    info = CurrentForwardPassInfo(
+        request_id="r", graph_walk="chunk", fwd_index=0, random_seed=17, max_tokens=1,
+        step_metadata={"num_steps": 1, "t_shift": 1.0, "cfg_video_scale": 1.0,
+                       "cfg_scale": 1.0, "text_tokens": 3, "blank_tokens": 2,
+                       "text_write": False},
+        dynamic_loop_iter_counts={"praxis_denoise": 0},
+    )
+    prepared = node.prepare_inputs("chunk", info, {
+        "obs_latents": [torch.zeros(1, 4, 1, 1, 1)],
+        "video_latents": [video], "action_latents": [action],
+    })
+    assert set(node.declare_step("chunk", ["r"], [prepared]).state) == {
+        ENCODER_COND_KV, "text_embeds",
+    }
+    out = node.forward("chunk", None, **prepared.tensor_inputs, **prepared.kwargs)
+    torch.testing.assert_close(out["expert_video_latents"][0], video, rtol=0, atol=0)
+    torch.testing.assert_close(out["expert_action_latents"][0], action, rtol=0, atol=0)
+    assert held_text.reads == 1
+    assert encoder.calls == 1 and decoder.calls == 0
 
 
 @pytest.mark.parametrize("held,rows,clean_frames", [(0, 0, 0), (1, 21, 6)])
