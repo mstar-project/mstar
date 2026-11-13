@@ -94,6 +94,15 @@ class Glm5NextHyperConnection(nn.Module):
     def forward(
         self, hidden_streams: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        pre, post, comb = self.weights(hidden_streams)
+        collapsed = (pre.unsqueeze(-1) * hidden_streams).sum(dim=2).to(hidden_streams.dtype)
+        return post, comb, collapsed
+
+    def weights(
+        self, hidden_streams: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """The site's collapse, placement and mixing weights ``(pre, post, comb)`` from the
+        live streams, for a model that collapses with another site's ``pre`` (DeepSeek-V4.1)."""
         hc = self.hc_mult
         flat = self.input_norm(hidden_streams.flatten(start_dim=2).float())
         w = self._fn_fp32
@@ -108,9 +117,7 @@ class Glm5NextHyperConnection(nn.Module):
         post = 2 * torch.sigmoid(post_w * post_scale + post_b)
         comb_logits = comb_w.view(*comb_w.shape[:-1], hc, hc) * comb_scale + comb_b.view(hc, hc)
         comb = torch.softmax(comb_logits, dim=-1) + self.hc_eps
-        comb = _dispatch_sinkhorn(comb, self.hc_sinkhorn_iters, self.hc_eps)
-        collapsed = (pre.unsqueeze(-1) * hidden_streams).sum(dim=2).to(hidden_streams.dtype)
-        return post, comb, collapsed
+        return pre, post, _dispatch_sinkhorn(comb, self.hc_sinkhorn_iters, self.hc_eps)
 
     def forward_fused(self, hidden_streams, norm, update=None):
         """``forward`` + ``norm`` (+ the previous ``update_streams``) in two kernels; see
