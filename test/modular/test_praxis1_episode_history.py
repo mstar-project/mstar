@@ -92,7 +92,8 @@ def test_episode_text_key_and_walk_follow_cold_warm_changed_prompt_and_reset():
     def walks(held):
         episode = EpisodeView("session", 1, {TEXT_STATE_NAME: held} if held else {}, None)
         return [step.walk for step in model.walk_plan(
-            "", ["image"], ["action"], {"image_inputs": [object()]}, {}, episode,
+            "", ["image"], ["action"], {"image_inputs": [object()]},
+            {"action_format": "positronic"}, episode,
         )]
 
     assert walks(0) == ["encode_text", "chunk"]  # first, changed key, reset, or eviction
@@ -115,7 +116,8 @@ def test_append_plan_tracks_cold_warm_reset_and_eviction():
     def plan(held, rows, cold=None):
         episode = EpisodeView("session", 0, {STATE_NAME: held} if held else {}, cold)
         steps = model.walk_plan(
-            "", ["image"], ["action"], {"image_inputs": [object()]}, {"executed_rows": rows}, episode
+            "", ["image"], ["action"], {"image_inputs": [object()]},
+            {"executed_rows": rows, "action_format": "positronic"}, episode
         )
         return steps[-1].step_metadata["history_append"]
 
@@ -132,6 +134,21 @@ def test_append_plan_tracks_cold_warm_reset_and_eviction():
         plan(21, FIRST_ROWS)
 
 
+def test_warm_openpi_is_refused_before_any_graph_walk() -> None:
+    model = _model()
+    episode = EpisodeView("session", 1, {STATE_NAME: 1})
+    with pytest.raises(ValueError, match="warm Praxis episodes require Positronic"):
+        model.walk_plan(
+            "", ["image"], ["action"], {"image_inputs": [object()]},
+            {"executed_rows": FIRST_ROWS, "action_format": "openpi"}, episode,
+        )
+    warm = model.walk_plan(
+        "", ["image"], ["action"], {"image_inputs": [object()]},
+        {"executed_rows": FIRST_ROWS, "action_format": "positronic"}, episode,
+    )
+    assert warm[-1].step_metadata["action_format"] == "positronic"
+
+
 def test_attention_layout_uses_episode_depth_after_append() -> None:
     from mstar.engine.state.adapters import CHUNK_CAUSAL_LAYOUT_KWARG, EXPERT_LAYOUT_KWARG
     from mstar.model.praxis1.submodules import ATTN_READS, ENCODER_COND_KV, EXPERT_TRUNK_KEYS
@@ -146,7 +163,8 @@ def test_attention_layout_uses_episode_depth_after_append() -> None:
         episode = EpisodeView("session", 0, {STATE_NAME: held} if held else {})
         walk = model.walk_plan(
             "", ["image"], ["action"], {"image_inputs": [object()]},
-            {"executed_rows": rows, "text_tokens": 3, "blank_tokens": 2}, episode,
+            {"executed_rows": rows, "text_tokens": 3, "blank_tokens": 2,
+             "action_format": "positronic"}, episode,
         )[-1]
         return walk.step_metadata
 
@@ -235,7 +253,7 @@ def test_first_warm_25_row_client_stack_keeps_exact_reference_suffix(pose_histor
         ["image"],
         ["action"],
         {"image_inputs": [object()]},
-        {"executed_rows": decoded.executed_rows},
+        {"executed_rows": decoded.executed_rows, "action_format": "positronic"},
         EpisodeView("id", 1, {STATE_NAME: 1}),
     )
     assert plan[-1].step_metadata["history_append"] == 20
@@ -300,6 +318,50 @@ class _Vae(torch.nn.Module):
         super().__init__()
         self.weight = torch.nn.Parameter(torch.zeros(1))
         self.config = SimpleNamespace(z_dim=None)
+
+
+def test_cold_seed_ignores_unretained_missing_pose_rows():
+    model = _model()
+    node = Praxis1VaeEncoderSubmodule(model.config, _Vae(), max_context_chunks=3)
+    node._tiles = lambda views: views
+    node.vae_encode = lambda canvas: canvas[:, :, ::4]
+    frames, boundaries = _Handle(), _Handle()
+    node.state_handles = {STATE_NAME: frames, BOUNDARY_STATE_NAME: boundaries}
+    images = torch.zeros((22, 3, 2, 2), dtype=torch.uint8)
+    poses = torch.zeros((22, 8), dtype=torch.float32)
+    poses[-1] = torch.tensor(_pose())
+    valid = torch.zeros((22, 1), dtype=torch.uint8)
+    valid[-1] = 1
+
+    node.forward(
+        "chunk", SimpleNamespace(), history_append=1,
+        history_pose=poses, history_pose_valid=valid,
+        **{f"view_{i}": images for i in range(model.config.num_cameras)},
+    )
+    assert frames.added[-1][1]["pose_valid"].tolist() == [[1]]
+    assert boundaries.added[-1][1]["history_valid"].tolist() == [[1]]
+
+    frames.commit()
+    boundaries.commit()
+    missing = torch.zeros((22, 1), dtype=torch.uint8)
+    missing[-1] = 1
+    node.forward(
+        "chunk", SimpleNamespace(), history_append=20,
+        history_pose=torch.tensor(_pose()).repeat(22, 1), history_pose_valid=missing,
+        **{f"view_{i}": images for i in range(model.config.num_cameras)},
+    )
+    assert boundaries.added[-1][1]["history_valid"].tolist() == [[0]]
+
+    frames.commit()
+    boundaries.commit()
+    full = torch.ones((25, 1), dtype=torch.uint8)
+    node.forward(
+        "chunk", SimpleNamespace(), history_append=24,
+        history_pose=torch.tensor(_pose()).repeat(25, 1), history_pose_valid=full,
+        **{f"view_{i}": torch.zeros((25, 3, 2, 2), dtype=torch.uint8)
+           for i in range(model.config.num_cameras)},
+    )
+    assert boundaries.added[-1][1]["history_valid"].tolist() == [[0]]
 
 
 def test_missing_pose_fallback_matches_reference_over_three_calls():

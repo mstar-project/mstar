@@ -128,7 +128,8 @@ def test_model_postprocess_keeps_openpi_relative_rows_and_packs_positronic_comma
     )
     assert commands[0]["robot_command"]["mode"]["type"] == "impedance"
     assert {"action_format", "pose_descriptor", "robot_state", "control_mode"} <= model.request_kwargs()
-    assert {"action_format", "pose_descriptor", "robot_state", "control_mode"} <= set(model.PREPROCESS_ONLY_KWARGS)
+    assert {"pose_descriptor", "robot_state", "control_mode"} <= set(model.PREPROCESS_ONLY_KWARGS)
+    assert "action_format" not in model.PREPROCESS_ONLY_KWARGS
     assert MODEL_POSE_KWARG in model.INTERNAL_KWARGS
 
 

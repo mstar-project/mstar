@@ -290,10 +290,11 @@ def test_frontend_close_sends_end_episode_to_the_conductor():
 def test_positronic_observation_reaches_model_as_raw_pose_and_image_inputs(monkeypatch):
     from mstar.api_server.openpi import pack
     from mstar.model.base import TensorAndMetadata
+    from mstar.model.praxis1.praxis1_model import Praxis1Model
 
     class PraxisStub(_Serial):
         config = SimpleNamespace(embodiment="single_arm")
-        PREPROCESS_ONLY_KWARGS = ("robot_state", "pose_descriptor", "action_format")
+        PREPROCESS_ONLY_KWARGS = Praxis1Model.PREPROCESS_ONLY_KWARGS
 
         def load_decoded_image(self, image, device):
             return TensorAndMetadata(image.to(device))
@@ -330,6 +331,7 @@ def test_positronic_observation_reaches_model_as_raw_pose_and_image_inputs(monke
     sent = [m.body for m in wt.communicator.sent if m.message_type == ConductorMessageType.NEW_REQUEST]
     assert len(sent) == 1 and sent[0].episode == "episode"
     assert "robot_state" not in sent[0].model_kwargs
+    assert sent[0].model_kwargs["action_format"] == "positronic"
 
 
 @pytest.mark.parametrize(
@@ -340,10 +342,13 @@ def test_positronic_warm_window_sets_conductor_reset_before_admission(
     monkeypatch, frames, expected_rows, reset, pose_stack,
 ):
     from mstar.api_server.openpi import pack
-    from mstar.model.base import TensorAndMetadata
+    from mstar.model.base import EpisodeView, TensorAndMetadata
+    from mstar.model.praxis1.episode_history import STATE_NAME
+    from mstar.model.praxis1.praxis1_model import Praxis1Model
 
     class WarmStub(_Serial):
         config = SimpleNamespace(embodiment="single_arm")
+        PREPROCESS_ONLY_KWARGS = Praxis1Model.PREPROCESS_ONLY_KWARGS
 
         def load_decoded_image(self, image, device):
             return TensorAndMetadata(image.to(device))
@@ -375,6 +380,17 @@ def test_positronic_warm_window_sets_conductor_reset_before_admission(
     assert len(sent) == 1
     assert sent[0].reset_episode is reset
     assert sent[0].model_kwargs["executed_rows"] == (0 if reset else expected_rows)
+    assert sent[0].model_kwargs["action_format"] == "positronic"
+    if not reset:
+        planner = Praxis1Model(
+            "runwayml/praxis-1-droid", skip_weight_loading=True,
+            max_context_chunks=3, max_text_tokens=256,
+        )
+        plan = planner.walk_plan(
+            "", ["image"], ["action"], {"image_inputs": [object()]},
+            sent[0].model_kwargs, EpisodeView("episode", 1, {STATE_NAME: 1}),
+        )
+        assert plan[-1].step_metadata["action_format"] == "positronic"
 
 
 def test_requests_overlap_and_reach_the_conductor_in_arrival_order(worker):

@@ -301,7 +301,10 @@ class Praxis1VaeEncoderSubmodule(_Praxis1Node):
                 boundary = self.state_handles[BOUNDARY_STATE_NAME]
                 previous = boundary.read(0).fields
                 previously_valid = bool(previous["history_valid"][-1, 0]) if len(previous["pose"]) else True
-                history_valid = previously_valid and bool(history_pose_valid[:-1].all())
+                # Only rows appended to the retained window can invalidate it.
+                # Older client stack rows are ignored. Once an appended pose
+                # is missing, the reference keeps using boundary fallback.
+                history_valid = previously_valid and bool(pose_valid.all())
                 boundary.add(
                     0, pose=history_pose[-1:].to(device=device, dtype=torch.float32),
                     history_valid=torch.tensor([[int(history_valid)]], dtype=torch.uint8, device=device),

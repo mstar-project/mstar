@@ -193,7 +193,8 @@ def test_episode_layout_plans_both_guidance_branches_on_shared_resource(
     episode = EpisodeView("session", 0, {STATE_NAME: held} if held else {})
     walk = model.walk_plan(
         "", ["image"], ["action"], {"image_inputs": [object()]},
-        {"executed_rows": rows, "text_tokens": 3, "blank_tokens": 2}, episode,
+        {"executed_rows": rows, "text_tokens": 3, "blank_tokens": 2,
+         "action_format": "positronic"}, episode,
     )[-1]
     info = CurrentForwardPassInfo(
         request_id="r", graph_walk="chunk", fwd_index=0, random_seed=1, max_tokens=1,
@@ -223,7 +224,8 @@ def test_graph_backbone_is_ready_after_actual_producers(held: int, rows: int, wa
     episode = EpisodeView("session", 1, {STATE_NAME: held, **({"text_embeds": 5} if warm else {})})
     walk = model.walk_plan(
         "", ["image"], ["action"], {"image_inputs": [object()]},
-        {"executed_rows": rows, "text_tokens": 3, "blank_tokens": 2}, episode,
+        {"executed_rows": rows, "text_tokens": 3, "blank_tokens": 2,
+         "action_format": "positronic"}, episode,
     )[-1]
     graph = model.get_graph_walk_graphs()[walk.walk]
     backbone = graph.get_nodes()["backbone"]

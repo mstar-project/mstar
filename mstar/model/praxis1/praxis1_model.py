@@ -131,7 +131,7 @@ class Praxis1Model(Model):
     CHUNK_WALK = "chunk"
     CHUNK_WARM_WALK = "chunk_warm"
     INTERNAL_KWARGS = (MODEL_POSE_KWARG,)
-    PREPROCESS_ONLY_KWARGS = (STATE_KWARG, MODEL_POSE_KWARG, "action_format", "pose_descriptor", "control_mode")
+    PREPROCESS_ONLY_KWARGS = (STATE_KWARG, MODEL_POSE_KWARG, "pose_descriptor", "control_mode")
 
     def __init__(
         self,
@@ -676,6 +676,8 @@ class Praxis1Model(Model):
         if self.sampler_defaults["max_context_chunks"]:
             metadata["text_write"] = not has_episode_text
             held = 0 if episode is None else episode.held.get(STATE_NAME, 0)
+            if held and metadata["action_format"] != "positronic":
+                raise ValueError("warm Praxis episodes require Positronic action_format")
             rows = model_kwargs.get("executed_rows", 0)
             metadata["history_append"] = append_count(held, rows)
             metadata["history_held"] = held
