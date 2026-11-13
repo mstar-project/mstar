@@ -23,6 +23,8 @@ from torch._dynamo.utils import counters
 
 from mstar.engine import state
 from mstar.engine.resources.attn.base import AttentionManager
+from mstar.engine.resources.position.config import PositionConfig
+from mstar.engine.resources.position.manager import RopeManager
 from mstar.engine.resources.recurrent.config import RecurrentStep
 from mstar.engine.resources.recurrent.pool import RecurrentStatePool
 from mstar.engine.resources.resident import build_planner
@@ -411,6 +413,22 @@ def test_rope_with_no_declared_dtype_rotates_in_qs():
     q, k, _ = _tensors()
     rope(h, q.double(), k)
     assert pos.seen == [("main", torch.float64)]
+
+
+def test_rope_at_explicit_positions_rotates_there_and_without_k_rotates_q_alone(monkeypatch):
+    seen = []
+    monkeypatch.setattr(torch.ops.mstar, "rope_apply_qk_inplace",
+                        lambda q, k, pos_ids, *args, **kwargs: seen.append((tuple(k.shape), pos_ids.tolist())))
+    array = _array(positions=Positions(rope=Rope()))
+    rotary = RopeManager(PositionConfig(kv_cache="kv"), torch.device("cpu"))
+    h = build_handle(array, {"kv": _StubKV(), "attn": _StubAttn(), "rope": rotary}, _resolve([array], StateSetup()))
+    _begin(h)
+    q, _, _ = _tensors()
+    at = torch.arange(TOKENS) + 1
+    assert rope(h, q, None, at=at)[1] is None, "a rotation of q alone hands back no key"
+    assert seen == [((TOKENS, 1, DIM), at.tolist())], (
+        "the kernel would rotate at the step's planned positions, or a key the caller never passed"
+    )
 
 
 def test_at_last_token_reads_the_reads_resource_and_a_paged_read_reports_no_setting_back():
