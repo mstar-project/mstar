@@ -617,6 +617,25 @@ def test_engine_binds_warm_episode_and_releases_it_only_on_explicit_end():
     assert engine.end_episode("b", 0)
 
 
+def test_unwritten_episode_replica_does_not_report_zero_held_rows():
+    frames = _frames(lifetime="episode")
+    (spec,) = build_specs([frames])
+    pool = DenseWindowPool.build(spec, EngineResourceInfo(device=torch.device("cpu")))
+    pool.ingest_request(11)
+    pool.bind_episode(11, 0, "a", cold=True, reset=False)
+    assert pool.held(11) == 0
+
+    engine = Engine(None)
+    engine._episode_pools = {"frames": pool}
+    engine._runner = SimpleNamespace(
+        publish=lambda *args, **kwargs: {},
+        publish_snapshot=lambda *args, **kwargs: {},
+    )
+    batch = ExecutingBatch("action_head", {}, StepContext([11], "decode", 0, False))
+    engine.finalize_batch(batch)
+    assert batch.episode_held[11] == {}
+
+
 def test_worker_defers_idle_episode_close_until_request_teardown():
     end = EndEpisode("a", 2)
     pending = [end]

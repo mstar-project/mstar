@@ -2726,10 +2726,14 @@ class Engine:
             )
             if self._episode_pools:
                 # WORKER_GRAPHS_DONE may leave from a later node that owns no
-                # episode arrays. Report the latest absolute count of every
-                # local pool so that completion carries what earlier nodes kept.
+                # episode arrays. Keep earlier nodes' counts, but omit an
+                # unwritten local replica so it cannot replace another worker's count.
                 batch.episode_held = {
-                    rid: {key: pool.held(rid) for key, pool in self._episode_pools.items()} for rid in rids
+                    rid: {
+                        key: count for key, pool in self._episode_pools.items()
+                        if (count := pool.held(rid)) > 0
+                    }
+                    for rid in rids
                 }
             if _LAZY_PUBLISH:
                 # Snapshot now, on the gpu thread, so the lengths are this
