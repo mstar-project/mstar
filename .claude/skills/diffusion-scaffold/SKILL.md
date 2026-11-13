@@ -54,11 +54,20 @@ Every attention in the DiT should go through the read of an array with `max_len=
 
 ## Step caching
 
-`DenoiseLoopSubmodule(step_cache=...)` takes a `StepCachePolicy` (`components/diffusion/step_cache.py`; today MagCache) that says which steps skip the block stack and add back the residual of the last step that ran it. The decision joins the step key, so rows batch per decision, and the residuals are `request_state`, one per rank.
+`DenoiseLoopSubmodule(step_cache=...)` takes a `StepCachePolicy` (`components/diffusion/step_cache.py`). It is one object with four parts, each decided from host values alone (the step index, the step count and schedule, a calibrated table), so none costs a sync and every CFG/SP rank agrees:
 
-- A model opts in by giving its transformer `cached_residual=` / `return_residual=` around the block loop (embed and head still run) and calling `self.block_cache(engine_inputs)` in `denoise`; `wan22` and `minimax_h3` are the references. Keep the residual row-leading and fp32.
-- The policy decides from host values only (the step index, the step count, a calibrated table), so it needs no sync and every CFG/SP rank agrees. A rule that reads a device value (TeaCache, DBCache) would need a reduce and a host read per step.
-- Calibrate per model (`{method: magcache_calibrate}` logs the table) and ship a quality table against dense: it is lossy. Captured buckets are refused for now (the residual has no fixed address).
+- **which steps skip**: the policy's class (`MagCache`, `Interval`, `ExplicitPlan` for a searched list);
+- **which blocks** a skipping step leaves out (`blocks`: all, or all but the first `front` and last `back`);
+- **what stands in for them** (`forecast`: the last kept residual, or its order-1/2 extrapolation);
+- **which guidance branches run** (`guidance`: some steps forward the conditional branch alone and predict `uncond - cond`).
+
+What a step does (`StepAction`: the range it skips or keeps, whether the unconditional branch runs) joins the step key, so rows batch per action and never per forecast weight; everything cached is `request_state`, one per rank.
+
+- A model opts in by running its block loop through `run_blocks(blocks, hidden, call, skip=, cached_residual=, keep=)` (embed and head still run) and calling `self.block_cache(engine_inputs)` in `denoise`: on a skipping step it passes `action.skip` and `block_cache.residual`, on a computing step `action.keep` and hands the residual to `block_cache.keep`. Keep the residual row-leading and fp32. `wan22` is the reference; `minimax_h3` takes whole-stack skips only.
+- A model's forward that honours a block range sets `STEP_CACHE_BLOCK_RANGES`; one that can forward the conditional branch alone sets `STEP_CACHE_GUIDANCE`, overrides `cond_attention_segments` and uses `block_cache.guidance_delta` / `keep_guidance`. A policy asking for a part the model lacks is refused at construction.
+- A model that changes weights over the schedule returns those steps from `step_cache_segments`: they compute, and nothing kept before them is read after.
+- A rule that reads a device value each step (TeaCache, DBCache's probe) would need a reduce and a host read per step; none is implemented.
+- Calibrate per model (`{method: magcache_calibrate}` logs MagCache's table; `benchmark/step_cache` measures a setting against dense and searches plans) and ship a quality table against dense: every part is lossy. Captured buckets are refused for now (what is cached has no fixed address).
 
 ## Ending the loop
 

@@ -47,6 +47,7 @@ from mstar.model.components.diffusion.attention import attend
 from mstar.model.components.diffusion.ffn import gelu_tanh_ffn
 from mstar.model.components.diffusion.modulation import ada_layer_norm
 from mstar.model.components.diffusion.qk_norm_rope import rms_norm_rope
+from mstar.model.components.diffusion.step_cache import BlockRange, run_blocks
 from mstar.model.components.mlp import MLP
 from mstar.model.wan22.config import DIT_TOKENS, Wan22Config
 
@@ -355,8 +356,9 @@ class Wan22DiT(nn.Module):
         timestep: torch.Tensor,
         encoder_hidden_states: torch.Tensor,
         shard=None,
+        skip: BlockRange | None = None,
         cached_residual: torch.Tensor | None = None,
-        return_residual: bool = False,
+        keep: BlockRange | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """``hidden_states`` ``[B, C, F, H, W]`` (bf16 latents), ``timestep``
         ``[B, F // p_t]`` per post-patch frame (``expand_timesteps``: each
@@ -368,9 +370,9 @@ class Wan22DiT(nn.Module):
         step it splits cuts each row's tokens to this
         rank's share; the self-attention's resource then exchanges them.
 
-        Step caching (``step_cache.py``): with ``cached_residual`` (fp32, ``[B, S, dim]`` over this rank's tokens) the
-        blocks are skipped and their output is the stream plus it; ``return_residual`` also returns what the blocks
-        added, in that layout."""
+        Step caching (``step_cache.py``): ``skip``'s blocks are left out and ``cached_residual`` (fp32, ``[B, S, dim]``
+        over this rank's tokens) is added to the stream in their place; ``keep`` also returns what its blocks added,
+        in that layout."""
         batch_size, _, num_frames, height, width = hidden_states.shape
         p_t, p_h, p_w = self.config.patch_size
         grid = (num_frames // p_t, height // p_h, width // p_w)
@@ -397,13 +399,11 @@ class Wan22DiT(nn.Module):
             timestep, encoder_hidden_states
         )
 
-        before = hidden_states
-        if cached_residual is not None:
-            hidden_states = (hidden_states.float() + cached_residual).type_as(hidden_states)
-        else:
-            for block in self.blocks:
-                hidden_states = block(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb)
-        residual = hidden_states.float() - before.float() if return_residual else None
+        hidden_states, residual = run_blocks(
+            self.blocks, hidden_states,
+            lambda block, hidden: block(hidden, encoder_hidden_states, timestep_proj, rotary_emb),
+            skip=skip, cached_residual=cached_residual, keep=keep,
+        )
 
         # Output head: 2-chunk adaLN in fp32 ([1, 1, 2, dim] island table +
         # bf16 temb promotes, per group of tokens), then project and unpatchify.
@@ -416,4 +416,4 @@ class Wan22DiT(nn.Module):
         hidden_states = hidden_states.reshape(batch_size, *grid, p_t, p_h, p_w, -1)
         hidden_states = hidden_states.permute(0, 7, 1, 4, 2, 5, 3, 6)
         out = hidden_states.flatten(6, 7).flatten(4, 5).flatten(2, 3)
-        return (out, residual) if return_residual else out
+        return out if keep is None else (out, residual)

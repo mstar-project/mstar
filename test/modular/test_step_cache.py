@@ -1,5 +1,6 @@
-"""Opt-in step caching in the DiT scaffold (``components/diffusion/step_cache.py``): MagCache's skip schedule, the
-step key that carries the decision, and Wan2.2's block stack routed through it. CPU only, tiny random weights."""
+"""Opt-in step caching in the DiT scaffold (``components/diffusion/step_cache.py``): which steps skip (MagCache, an
+interval, a listed plan), which blocks, what stands in for them (reuse or a forecast), which guidance branches run,
+the step key that carries the action, and Wan2.2's block stack routed through it. CPU only, tiny random weights."""
 
 from __future__ import annotations
 
@@ -9,12 +10,22 @@ import torch
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.model.components.diffusion.denoise_loop import DenoiseLoopSubmodule, StepBucket
 from mstar.model.components.diffusion.step_cache import (
+    GUIDANCE,
     RESIDUAL,
+    BlockCache,
+    BlockRange,
+    CacheRow,
+    ExplicitPlan,
+    Forecast,
+    GuidanceCache,
+    Interval,
     MagCache,
     MagCacheCalibration,
+    StepAction,
+    run_blocks,
     step_cache_policy,
 )
-from mstar.model.submodule_base import InputMetadata, ModelInputsFromEngine
+from mstar.model.submodule_base import InputMetadata, ModelInputsFromEngine, PerRequestState
 from mstar.model.wan22.components.dit import Wan22DiT
 from mstar.model.wan22.config import MAG_RATIOS, WAN22_VARIANT_T2V_A14B, WAN22_VARIANT_TI2V_5B, Wan22Config
 from mstar.model.wan22.submodules import DENOISE_LOOP_NAME, Wan22DitSubmodule
@@ -66,6 +77,17 @@ def test_the_calibration_policy_computes_every_step():
     ({"method": "magcache", "threshold": 0.1}, MagCache(mag_ratios=(1.0, 0.9), threshold=0.1)),
     ({"mag_ratios": "other", "max_skip_steps": 3}, MagCache(mag_ratios=(1.0, 0.8), max_skip_steps=3)),
     ({"mag_ratios": [1.0, 0.7, 0.6]}, MagCache(mag_ratios=(1.0, 0.7, 0.6))),
+    ({"method": "interval", "every": 3, "forecast": 1}, Interval(every=3, forecast=Forecast(order=1))),
+    ({"method": "plan", "computed": [3, 0, 1], "num_steps": 6, "blocks": {"front": 1}},
+     ExplicitPlan(computed=(0, 1, 3), num_steps=6, blocks=BlockRange(front=1))),
+    ({"mag_ratios": [1.0, 0.9], "forecast": {"order": 2, "damping": 0.5, "time": "sigma"},
+      "blocks": [{"until": 0.5, "front": 2}, {"back": 2}],
+      "guidance": {"every": 3, "start": 0.4, "forecast": 1}},
+     MagCache(
+         mag_ratios=(1.0, 0.9), forecast=Forecast(order=2, damping=0.5, time="sigma"),
+         blocks=((0.5, BlockRange(front=2)), (1.0, BlockRange(back=2))),
+         guidance=GuidanceCache(every=3, start=0.4, forecast=Forecast(order=1)),
+     )),
 ])
 def test_a_serving_config_names_its_policy(spec, expected):
     assert step_cache_policy(spec, {"default": (1.0, 0.9), "other": (1.0, 0.8)}) == expected
@@ -77,6 +99,16 @@ def test_a_serving_config_names_its_policy(spec, expected):
     ({"method": "magcache"}, "no calibrated"),
     ({"method": "magcache_calibrate", "threshold": 0.1}, "takes no options"),
     ({"mag_ratios": [1.0, 0.9], "threshold": -1}, "threshold"),
+    ({"method": "interval", "every": 0}, "every"),
+    ({"method": "interval", "threshold": 0.1}, "unknown interval options"),
+    ({"method": "plan", "computed": [0, 2]}, "num_steps"),
+    ({"method": "plan", "computed": [0, 9], "num_steps": 6}, "computed steps"),
+    ({"method": "interval", "forecast": 3}, "order"),
+    ({"method": "interval", "forecast": {"order": 1, "kind": "hermite"}}, "unknown forecast options"),
+    ({"method": "interval", "blocks": {"first": 1}}, "unknown blocks options"),
+    ({"method": "interval", "blocks": [{"until": 0.5}, {"until": 0.5}]}, "increasing"),
+    ({"method": "interval", "guidance": {"every": 0}}, "every"),
+    ({"method": "interval", "guidance": {"interval": 2}}, "unknown guidance options"),
 ])
 def test_a_bad_serving_config_is_refused(spec, fragment):
     with pytest.raises(ValueError, match=fragment):
@@ -157,11 +189,11 @@ def _run_loop(sub: Wan22DitSubmodule, rids=("r0",)) -> list[dict[str, torch.Tens
 
 
 class _BlockCounter:
-    """Counts the block stack's runs (the first block's forward calls)."""
+    """Counts a block's forward calls: the first block's by default, i.e. the whole stack's runs."""
 
-    def __init__(self, dit: Wan22DiT):
+    def __init__(self, dit: Wan22DiT, block: int = 0):
         self.calls = 0
-        dit.blocks[0].register_forward_hook(lambda *_: setattr(self, "calls", self.calls + 1))
+        dit.blocks[block].register_forward_hook(lambda *_: setattr(self, "calls", self.calls + 1))
 
 
 def test_without_a_step_cache_the_step_key_is_the_bucket_key():
@@ -179,7 +211,8 @@ def test_the_step_key_carries_the_plan_from_prepare_inputs_and_cg_key_info_alike
     key = sub.bucket_key_for(_info(0))
     assert sub.split_batches_by_capture_key("w")
     for k, reuse in enumerate(_FLAT_PLAN):
-        expected = StepBucket(key, None, reuse)
+        expected = StepBucket(key, None, StepAction(skip=BlockRange()) if reuse else StepAction(keep=BlockRange()))
+        assert expected.reuse == reuse
         assert sub.step_key(_info(k), key) == expected
         assert sub.cg_key_info("w", {"r0": _info(k)}) == expected
         # a speculated step's rows still carry the step in flight's info; its input metadata has the step it runs
@@ -241,8 +274,8 @@ def test_the_dit_returns_the_residual_its_blocks_added_and_reuses_it():
         2, 5, 8, generator=gen)
     with torch.no_grad():
         plain = dit(x, t, text)
-        out, residual = dit(x, t, text, return_residual=True)
-        reused = dit(x, t, text, cached_residual=residual)
+        out, residual = dit(x, t, text, keep=BlockRange())
+        reused = dit(x, t, text, skip=BlockRange(), cached_residual=residual)
     assert torch.equal(out, plain) and residual.dtype == torch.float32 and residual.shape == (2, 32, 24)
     # the same inputs with their own residual give the same output, up to the fp32 round trip of the add
     torch.testing.assert_close(reused, plain)
@@ -322,7 +355,7 @@ def test_a14b_segments_at_the_low_noise_experts_first_step():
     first_low = next(k for k, t in enumerate(timesteps) if t < 875)
     assert 1 < first_low < _A14B_STEPS - 1
     assert sub.step_cache_segments(_a14b_info(0), key) == (first_low,)
-    assert sub.step_key(_a14b_info(first_low), key) == StepBucket(key, None, False)
+    assert sub.step_key(_a14b_info(first_low), key) == StepBucket(key, None, StepAction(keep=BlockRange()))
     # TI2V-5B has one DiT, so no segments
     assert _submodule(_FLAT).step_cache_segments(_info(0), key) == ()
 
@@ -386,3 +419,321 @@ def test_a_step_cache_with_a_distilled_sampler_is_refused():
     assert step_cache_policy({"method": "magcache"}, table).reuse_plan(3) == (False, True, False)
     with pytest.raises(ValueError, match="unipc sampler only"):
         Wan22Config(sampler="dmd", step_cache=_FLAT)
+
+
+# --------------------------------------------------------------------- which steps skip: an interval, a listed plan
+
+
+def test_an_interval_computes_one_step_in_every_past_the_retained_ones():
+    assert Interval(every=3, retention_ratio=0.2).reuse_plan(10) == (
+        False, False, True, True, False, True, True, False, True, False,
+    )
+    # a segment start computes and the count restarts there; every 1 computes all
+    assert Interval(every=3, retention_ratio=0.0).reuse_plan(8, (4,)) == (
+        False, True, True, False, False, True, True, False,
+    )
+    assert not any(Interval(every=1).reuse_plan(12))
+
+
+def test_a_listed_plan_computes_its_steps_and_always_the_ends_and_segment_starts():
+    plan = ExplicitPlan(computed=(0, 1, 4, 5), num_steps=8)
+    assert plan.reuse_plan(8) == (False, False, True, True, False, False, True, False)
+    assert plan.reuse_plan(8, (3,)) == (False, False, True, False, False, False, True, False)
+    # another step count takes the nearest listed step's decision
+    assert plan.reuse_plan(4) == (False, True, False, False)
+    assert ExplicitPlan(computed=(), num_steps=5).reuse_plan(5) == (False, True, True, True, False)
+
+
+# --------------------------------------------------------------------- what stands in for the blocks: a forecast
+
+
+def test_a_forecast_of_order_one_or_two_is_exact_on_a_line_at_any_spacing():
+    line = lambda t: 3.0 - 2.0 * t  # noqa: E731
+    for kept, now in [((5.0, 3.0), 6.0), ((5.0, 3.0), 8.0), ((0.4, 0.7, 0.9), 0.1), ((7.0, 6.0, 2.0), 9.0)]:
+        for order in (1, 2):
+            weights = Forecast(order=order).weights(kept, now)
+            assert len(weights) == min(order, len(kept) - 1) + 1
+            assert sum(w * line(t) for w, t in zip(weights, kept, strict=False)) == pytest.approx(line(now))
+
+
+def test_a_forecast_at_equal_spacing_is_taylorseers():
+    """Kept every N steps, d steps past the newest: F0 + (F0 - F1) d/N + (F0 - 2 F1 + F2) d^2 / (2 N^2)."""
+    n, d = 3.0, 2.0
+    assert Forecast(order=1).weights((6.0, 3.0), 8.0) == pytest.approx((1 + d / n, -d / n))
+    assert Forecast(order=2).weights((6.0, 3.0, 0.0), 8.0) == pytest.approx(
+        (1 + d / n + d * d / (2 * n * n), -d / n - d * d / (n * n), d * d / (2 * n * n))
+    )
+
+
+def test_a_forecast_uses_the_order_it_has_values_for_and_damping_scales_the_step():
+    assert Forecast(order=2).weights((4.0,), 6.0) == (1.0,)
+    assert Forecast(order=2).weights((4.0, 2.0), 6.0) == Forecast(order=1).weights((4.0, 2.0), 6.0)
+    assert Forecast(order=0).weights((4.0, 2.0), 6.0) == (1.0,)
+    assert Forecast(order=1, damping=0.0).weights((4.0, 2.0), 6.0) == pytest.approx((1.0, 0.0))
+    assert Forecast(order=1, damping=0.5).weights((4.0, 2.0), 6.0) == pytest.approx((1.5, -0.5))
+
+
+def _cache(action, rows, forecast=Forecast(), guidance=Forecast(), caches_guidance=False) -> BlockCache:
+    return BlockCache(
+        action=action, _rows=rows, _forecast=forecast, _guidance=guidance, caches_guidance=caches_guidance,
+    )
+
+
+def test_a_block_cache_predicts_each_row_from_its_own_kept_steps():
+    """Two rows at different steps of different histories share a skipping step; each gets its own extrapolation."""
+    forecast = Forecast(order=1)
+    a, b = PerRequestState(), PerRequestState()
+    keep = StepAction(keep=BlockRange())
+    for step, value in [(0, 1.0), (2, 2.0)]:
+        _cache(keep, [CacheRow(a, step)], forecast).keep(torch.full((1, 3), value))
+    for step, value in [(4, 10.0), (5, 20.0)]:
+        _cache(keep, [CacheRow(b, step)], forecast).keep(torch.full((1, 3), value))
+    cache = _cache(StepAction(skip=BlockRange()), [CacheRow(a, 3), CacheRow(b, 7)], forecast)
+    assert cache.reuse and cache.residual.shape == (2, 3)
+    # a: 2 + (2 - 1) / 2 * 1; b: 20 + (20 - 10) / 1 * 2
+    assert torch.equal(cache.residual, torch.tensor([[2.5] * 3, [40.0] * 3]))
+    # order 0 hands back the kept tensor itself, and predicting changes nothing kept
+    assert torch.equal(_cache(StepAction(skip=BlockRange()), [CacheRow(a, 3)]).residual[0], torch.full((3,), 2.0))
+    assert torch.equal(a.tensors[RESIDUAL], torch.full((3,), 2.0)) and a.kwargs[RESIDUAL + "_steps"] == [2, 0]
+
+
+def test_a_forecast_spaced_by_sigma_reads_the_rows_schedule():
+    forecast = Forecast(order=1, time="sigma")
+    state, sigmas = PerRequestState(), (1.0, 0.9, 0.5, 0.4)
+    keep = StepAction(keep=BlockRange())
+    for step, value in [(0, 0.0), (1, 1.0)]:
+        _cache(keep, [CacheRow(state, step, sigmas)], forecast).keep(torch.full((1, 2), value))
+    predicted = _cache(StepAction(skip=BlockRange()), [CacheRow(state, 2, sigmas)], forecast).residual
+    # 1 + (1 - 0) / (0.9 - 1.0) * (0.5 - 0.9) = 5; by step index it would be 2
+    torch.testing.assert_close(predicted, torch.full((1, 2), 5.0))
+
+
+def test_nothing_kept_before_a_restart_is_read_or_left_allocated():
+    forecast = Forecast(order=2)
+    state = PerRequestState()
+    keep, skip = StepAction(keep=BlockRange()), StepAction(skip=BlockRange())
+    for step in (0, 1, 2):
+        _cache(keep, [CacheRow(state, step)], forecast).keep(torch.full((1, 2), float(step)))
+    assert sorted(state.tensors) == [RESIDUAL, RESIDUAL + "_1", RESIDUAL + "_2"]
+    # step 5 restarts (another expert's first step): its residual is the only one a later step reads
+    _cache(keep, [CacheRow(state, 5, floor=5)], forecast).keep(torch.full((1, 2), 9.0))
+    assert sorted(state.tensors) == [RESIDUAL] and state.kwargs[RESIDUAL + "_steps"] == [5]
+    assert torch.equal(_cache(skip, [CacheRow(state, 6, floor=5)], forecast).residual, torch.full((1, 2), 9.0))
+    with pytest.raises(RuntimeError, match="must compute"):
+        _ = _cache(skip, [CacheRow(state, 9, floor=8)], forecast).residual
+
+
+# --------------------------------------------------------------------- which blocks: a range of the stack
+
+
+class _AddBlock(torch.nn.Module):
+    def __init__(self, value: float):
+        super().__init__()
+        self.value, self.calls = value, 0
+
+    def forward(self, hidden):
+        self.calls += 1
+        return hidden * 2 + self.value
+
+
+def test_run_blocks_skips_a_range_and_keeps_what_it_added():
+    blocks = [_AddBlock(float(i)) for i in range(4)]
+    call = lambda block, hidden: block(hidden)  # noqa: E731
+    x = torch.ones(1, 2, dtype=torch.float64)
+    dense, nothing = run_blocks(blocks, x, call)
+    assert nothing is None and [b.calls for b in blocks] == [1, 1, 1, 1]
+    for keep in (BlockRange(), BlockRange(front=1), BlockRange(back=1), BlockRange(front=1, back=2)):
+        for block in blocks:
+            block.calls = 0
+        out, residual = run_blocks(blocks, x, call, keep=keep)
+        assert torch.equal(out, dense) and residual.dtype == torch.float32
+        skipped, _ = run_blocks(blocks, x, call, skip=keep, cached_residual=residual)
+        torch.testing.assert_close(skipped, dense)
+        lo, hi = keep.bounds(4)
+        # one dense run, then only the blocks outside the range
+        assert [b.calls for b in blocks] == [1 if lo <= i < hi else 2 for i in range(4)]
+    with pytest.raises(ValueError, match="blocks"):
+        run_blocks(blocks, x, call, skip=BlockRange(front=2, back=2), cached_residual=x)
+
+
+def test_a_plan_names_each_steps_blocks_and_restarts_where_the_range_changes():
+    """Delta-DiT's shape: the rear blocks skip early and the front ones late; the first late step computes."""
+    early, late = BlockRange(front=2), BlockRange(back=2)
+    policy = Interval(every=2, retention_ratio=0.0, blocks=((0.5, early), (1.0, late)))
+    assert policy.partial and policy.restarts(8) == (4,)
+    assert policy.plan(8) == (
+        StepAction(keep=early), StepAction(skip=early), StepAction(keep=early), StepAction(skip=early),
+        StepAction(keep=late), StepAction(skip=late), StepAction(keep=late), StepAction(keep=late),
+    )
+    # the model's own segment starts restart too
+    assert Interval(every=2, blocks=early).restarts(8, (3, 0, 8)) == (3,)
+    assert not Interval().partial
+
+
+def test_a_model_without_block_ranges_or_a_guidance_cache_refuses_a_policy_that_needs_one():
+    with pytest.raises(ValueError, match="whole block stack"):
+        DenoiseLoopSubmodule(loop_name="l", step_cache=Interval(blocks=BlockRange(front=1)))
+    with pytest.raises(ValueError, match="guidance"):
+        DenoiseLoopSubmodule(loop_name="l", step_cache=Interval(guidance=GuidanceCache()))
+    assert DenoiseLoopSubmodule(loop_name="l", step_cache=Interval(forecast=Forecast(order=2))).step_cache
+
+
+_FRONT = {"method": "interval", "every": 2, "retention_ratio": 0.0, "blocks": {"front": 1}}
+# every 2 at 6 steps: 0, 2, 4 and the last compute
+_EVERY2_PLAN = (False, True, False, True, False, False)
+
+
+def test_wan_runs_the_front_block_on_a_skipping_step_and_keeps_the_rest():
+    dit = _tiny_dit()
+    front, rear = _BlockCounter(dit), _BlockCounter(dit, block=1)
+    sub = _submodule(_FRONT, transformer=dit)
+    assert tuple(a.reuse for a in sub.step_cache.plan(_STEPS)) == _EVERY2_PLAN
+    cached, dense = _run_loop(sub), _run_loop(_submodule())
+    assert (front.calls, rear.calls) == (_STEPS, _EVERY2_PLAN.count(False))
+    assert torch.equal(cached[0]["r0"], dense[0]["r0"]) and not torch.equal(cached[1]["r0"], dense[1]["r0"])
+    gen = torch.Generator().manual_seed(3)
+    x, t, text = torch.randn(2, 4, 2, 8, 8, generator=gen), torch.rand(2, 2, generator=gen) * 999, torch.randn(
+        2, 5, 8, generator=gen)
+    with torch.no_grad():
+        plain = dit(x, t, text)
+        out, residual = dit(x, t, text, keep=BlockRange(front=1))
+        torch.testing.assert_close(dit(x, t, text, skip=BlockRange(front=1), cached_residual=residual), plain)
+    assert torch.equal(out, plain)
+
+
+# --------------------------------------------------------------------- which guidance branches run
+
+
+def test_a_guidance_plan_runs_both_branches_first_last_and_every_nth_computing_step():
+    policy = Interval(every=1, guidance=GuidanceCache(every=2, start=0.25))
+    assert tuple(a.uncond for a in policy.plan(8)) == (True, True, False, True, False, True, False, True)
+    # a skipping step never runs the unconditional branch; a restart does
+    policy = Interval(every=2, retention_ratio=0.0, guidance=GuidanceCache(every=1, start=0.0))
+    assert [(a.reuse, a.uncond) for a in policy.plan(6, (3,))] == [
+        (False, True), (True, False), (False, True), (False, True), (True, False), (False, True),
+    ]
+    # without a guidance cache every step runs both
+    assert all(a.uncond for a in Interval(every=2).plan(6))
+
+
+_GUIDED = {"method": "interval", "every": 1, "guidance": {"every": 2, "start": 0.0}}
+
+
+class _BatchSizes:
+    """The batch each block-stack run forwards (branches x rows)."""
+
+    def __init__(self, dit: Wan22DiT):
+        self.seen = []
+        dit.blocks[0].register_forward_hook(lambda _m, args, _o: self.seen.append(args[0].shape[0]))
+
+
+def test_wan_forwards_the_conditional_branch_alone_on_a_cached_guidance_step():
+    dit = _tiny_dit()
+    batches = _BatchSizes(dit)
+    sub = _submodule(_GUIDED, transformer=dit)
+    plan = sub.step_cache.plan(_STEPS)
+    assert tuple(a.uncond for a in plan) == (True, False, True, False, True, True)
+    cached = _run_loop(sub)
+    assert batches.seen == [2 if a.uncond else 1 for a in plan]
+    dense = _run_loop(_submodule())
+    assert torch.equal(cached[0]["r0"], dense[0]["r0"]) and not torch.equal(cached[1]["r0"], dense[1]["r0"])
+    assert torch.allclose(cached[-1]["r0"], dense[-1]["r0"], atol=0.5)
+    state = sub.request_state("r0")
+    # the conditional branch's residual alone, and uncond - cond of the output
+    assert state.tensors[RESIDUAL].shape == (1, 8, 24) and state.tensors[GUIDANCE].shape == (4, 2, 4, 4)
+    # one attention segment on a step that runs one branch
+    key = sub.bucket_key_for(_info(0))
+    spans = [len(sub._segments_of(sub.step_key(_info(k), key))["dit_tokens"]) for k in range(_STEPS)]
+    assert spans == [2 if a.uncond else 1 for a in plan]
+
+
+def test_the_cached_guidance_delta_gives_back_the_guided_output_at_the_same_input():
+    sub = _submodule(_GUIDED)
+    gen = torch.Generator().manual_seed(5)
+    x, t = torch.randn(1, 4, 2, 8, 8, generator=gen), torch.full((2,), 500.0)
+    pos, neg = torch.randn(1, 5, 8, generator=gen), torch.randn(1, 5, 8, generator=gen)
+    state = sub.request_state("r0")
+    with torch.no_grad():
+        both = sub._noise_prediction(
+            x, t, pos, neg, 5.0,
+            block_cache=_cache(StepAction(keep=BlockRange()), [CacheRow(state, 0)], caches_guidance=True))
+        alone = sub._noise_prediction(
+            x, t, pos, neg, 5.0, block_cache=_cache(
+                StepAction(keep=BlockRange(), uncond=False), [CacheRow(state, 1)], caches_guidance=True))
+        unguided = sub._noise_prediction(x, t, pos, neg, 1.0)
+    torch.testing.assert_close(alone, both, rtol=1e-5, atol=1e-5)
+    assert not torch.allclose(alone, unguided, atol=1e-3)
+
+
+def test_a_guidance_cache_on_cfg_ranks_is_refused():
+    with pytest.raises(ValueError, match="cfg_size"):
+        _submodule(_GUIDED, cfg_group=_FakeCfgGroup(0))
+
+
+# --------------------------------------------------------------------- every part, idle and combined
+
+_ALL_PARTS = {"forecast": {"order": 2, "time": "sigma"}, "blocks": {"front": 1}, "guidance": {"every": 1}}
+
+
+@pytest.mark.parametrize("spec", [
+    {"method": "interval", "every": 1, "forecast": 2},
+    {"method": "interval", "every": 1, "blocks": {"front": 1}},
+    {"method": "interval", "every": 1, "guidance": {"every": 1}},
+    {"method": "plan", "computed": list(range(_STEPS)), "num_steps": _STEPS, **_ALL_PARTS},
+])
+def test_a_policy_with_nothing_to_skip_is_bit_identical_to_no_cache(spec):
+    """Each part is idle until a step skips: the compute path keeps what later steps would read and changes no
+    output."""
+    sub = _submodule(spec)
+    assert all(a.skip is None and a.uncond for a in sub.step_cache.plan(_STEPS))
+    for a, b in zip(_run_loop(_submodule()), _run_loop(sub), strict=True):
+        assert torch.equal(a["r0"], b["r0"])
+
+
+_COMBINED = {"method": "interval", "every": 3, "retention_ratio": 0.0, "forecast": {"order": 1, "time": "sigma"},
+             "blocks": {"front": 1}, "guidance": {"every": 2, "start": 0.0}}
+
+
+@pytest.mark.parametrize("spec", [
+    {"method": "interval", "every": 3, "retention_ratio": 0.0, "forecast": 2},
+    _COMBINED,
+])
+def test_rows_of_a_batch_are_independent_under_every_part(spec):
+    """Two requests in one forward each get back what they get alone: a forecast, a block range and a cached
+    guidance branch all read the row's own state."""
+    batched = _run_loop(_submodule(spec), rids=("a", "b"))
+    for rid in ("a", "b"):
+        alone = _run_loop(_submodule(spec), rids=(rid,))
+        for x, y in zip(batched, alone, strict=True):
+            torch.testing.assert_close(x[rid], y[rid], rtol=1e-4, atol=1e-4)
+
+
+def test_a_forecast_changes_what_a_skipping_step_adds_once_two_steps_are_kept():
+    every3 = {"method": "interval", "every": 3, "retention_ratio": 0.0}
+    reuse, forecast = _run_loop(_submodule(every3)), _run_loop(_submodule({**every3, "forecast": 1}))
+    # steps 1 and 2 skip on one kept residual, so both add it; step 3 computes; step 4 extrapolates steps 0 and 3
+    for k in range(4):
+        assert torch.equal(reuse[k]["r0"], forecast[k]["r0"])
+    assert not torch.equal(reuse[4]["r0"], forecast[4]["r0"])
+
+
+def test_a14b_restarts_every_part_at_the_low_noise_experts_first_step():
+    """The low-noise expert's first step computes with both branches, and its skipping steps read nothing the
+    high-noise expert kept."""
+    spec = {"method": "interval", "every": 2, "retention_ratio": 0.0, "forecast": 2, "guidance": {"start": 0.0}}
+    sub, high, low = _a14b(spec)
+    key = sub.bucket_key_for(_a14b_info(0))
+    first_low = sub.step_cache_segments(_a14b_info(0), key)[0]
+    plan = sub.step_cache.plan(_A14B_STEPS, (first_low,))
+    assert plan[first_low] == StepAction(keep=BlockRange()) and any(a.reuse for a in plan[first_low:])
+    carried, state = {}, sub.request_state("r0")
+    for k in range(_A14B_STEPS):
+        out = _a14b_step(sub, {"r0": k}, {"r0": carried})["r0"]
+        carried = {name: out[name] for name in sub.loop_back_names}
+        if k >= first_low:
+            assert min(state.kwargs[RESIDUAL + "_steps"]) >= first_low
+            assert min(state.kwargs[GUIDANCE + "_steps"]) >= first_low
+        if k == first_low:
+            assert sorted(state.tensors) == [GUIDANCE, RESIDUAL]
+    assert high.calls == sum(not a.reuse for a in plan[:first_low])
+    assert low.calls == sum(not a.reuse for a in plan[first_low:])

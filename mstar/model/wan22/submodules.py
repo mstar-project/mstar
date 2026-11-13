@@ -333,6 +333,9 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
     # the [cond, uncond] stack a guided step forwards (the CFG axis splits it)
     CFG_BRANCHES = 2
 
+    STEP_CACHE_BLOCK_RANGES = True
+    STEP_CACHE_GUIDANCE = True
+
     def __init__(
         self, transformer: nn.Module, config: Wan22Config, cfg_group=None, transformer_2: nn.Module | None = None,
     ):
@@ -356,6 +359,7 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
         # same combine and UniPC step on replicated latents. Without guidance
         # both ranks compute the whole step, correct but no faster.
         self.cfg_group = cfg_group or CommGroup.trivial()
+        self.check_step_cache(self.step_cache)
         self._record_fp32_islands()
         # the node's sequence shard, which brackets the DiT (`bind_state`)
         self.shard = None
@@ -393,6 +397,13 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
         """The node's sequence shard. See ``NodeSubmodule.bind_node_state``."""
         self.shard = handles.get(DIT_SHARD)
 
+    def check_step_cache(self, policy) -> None:
+        super().check_step_cache(policy)
+        cfg_group = getattr(self, "cfg_group", None)  # unset while the base's constructor checks
+        if policy is not None and policy.guidance is not None and cfg_group is not None and cfg_group.world_size > 1:
+            # a rank whose branch is left out of a step would idle through it: no faster, and nothing to cache
+            raise ValueError("Wan2.2 step_cache 'guidance' caches a branch of a batched CFG stack: not at cfg_size 2.")
+
     def bucket_key_for(self, fwd_info: CurrentForwardPassInfo) -> WanStepKey:
         meta = fwd_info.step_metadata
         guidance_2 = meta.get("guidance_scale_2")
@@ -426,6 +437,9 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
         # one segment per guidance branch this rank computes, all the same span
         rows = self._branch_rows(bucket_key.guidance)
         return {DIT_TOKENS: ((self.MAIN_SPAN, self.num_tokens(bucket_key)),) * (rows.stop - rows.start)}
+
+    def cond_attention_segments(self, bucket_key: WanStepKey):
+        return {DIT_TOKENS: ((self.MAIN_SPAN, self.num_tokens(bucket_key)),)}
 
     def seed_latents(self, bucket_key: WanStepKey, generator: torch.Generator) -> torch.Tensor:
         shape = (1, self.config.in_channels, bucket_key.frames, bucket_key.height, bucket_key.width)
@@ -564,7 +578,9 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
         row, ``[B, groups]``, or one row's ``[groups]``, a group being a latent
         frame or (A14B) the whole sample. ``transformer`` is the expert to run, by
         default ``self.transformer``. Under a step cache a row keeps its residual
-        as ``[branches, tokens, dim]`` over this rank's branches.
+        as ``[branches, tokens, dim]`` over this rank's branches, or the conditional
+        branch's alone when the cache's ``guidance`` leaves the other out of some
+        steps: those forward one branch and predict ``uncond - cond`` of the output.
 
         ``guidance_scale`` above 1.0 runs the negative branch and is the combine's
         scale unless ``combine_scale`` is given: A14B's low-noise steps combine with
@@ -573,7 +589,10 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
         the attention segments, keyed on it, stay the same for every step)."""
         do_cfg = guidance_scale > 1.0
         rows = model_input.shape[0]
-        branch_rows = self._branch_rows(guidance_scale)
+        action = None if block_cache is None else block_cache.action
+        caches_guidance = block_cache is not None and block_cache.caches_guidance
+        cond_only = do_cfg and action is not None and not action.uncond
+        branch_rows = slice(0, 1) if cond_only else self._branch_rows(guidance_scale)
         branches = branch_rows.stop - branch_rows.start
         hidden_states = model_input.repeat(branches, 1, 1, 1, 1)
         timestep = temp_ts.repeat(branches, 1)
@@ -602,12 +621,11 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
         if not compiled:
             forward = next((eager for owner, eager in self._eager_forwards if owner is module), module)
         cache = {}
-        if block_cache is not None:
+        if action is not None and action.skip is not None:
             # the forward's batch is branch-major, [branches * rows]; the cache is row-leading
-            if block_cache.reuse:
-                cache["cached_residual"] = block_cache.residual.transpose(0, 1).flatten(0, 1)
-            else:
-                cache["return_residual"] = True
+            cache.update(skip=action.skip, cached_residual=block_cache.residual.transpose(0, 1).flatten(0, 1))
+        if action is not None and action.keep is not None:
+            cache["keep"] = action.keep
         out = forward(
             hidden_states=hidden_states,
             timestep=timestep,
@@ -615,13 +633,21 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
             shard=self.shard,
             **cache,
         )
-        if cache.get("return_residual"):
+        if "keep" in cache:
             out, residual = out
-            block_cache.keep(residual.unflatten(0, (branches, rows)).transpose(0, 1))
+            residual = residual.unflatten(0, (branches, rows)).transpose(0, 1)
+            # a cached guidance branch never reads its own residual: skipping steps run the conditional one alone
+            block_cache.keep(residual[:, :1] if caches_guidance else residual)
         if not do_cfg:
             return out
-        out = self.cfg_group.all_gather(out.contiguous(), dim=0)
-        noise_cond, noise_uncond = out[:rows], out[rows:]
+        if cond_only:
+            noise_cond = out
+            noise_uncond = (out.float() + block_cache.guidance_delta).type_as(out)
+        else:
+            out = self.cfg_group.all_gather(out.contiguous(), dim=0)
+            noise_cond, noise_uncond = out[:rows], out[rows:]
+            if caches_guidance:
+                block_cache.keep_guidance(noise_uncond.float() - noise_cond.float())
         scale = guidance_scale if combine_scale is None else combine_scale
         return noise_uncond + scale * (noise_cond - noise_uncond)
 
