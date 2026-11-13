@@ -126,6 +126,7 @@ class Praxis1Model(Model):
 
     ENCODE_TEXT_WALK = "encode_text"
     CHUNK_WALK = "chunk"
+    CHUNK_WARM_WALK = "chunk_warm"
     INTERNAL_KWARGS = (MODEL_POSE_KWARG,)
     PREPROCESS_ONLY_KWARGS = (STATE_KWARG, MODEL_POSE_KWARG, "action_format", "pose_descriptor", "control_mode")
 
@@ -252,89 +253,93 @@ class Praxis1Model(Model):
             ],
         )
 
-        # One canvas per observation. When episode history is enabled, the
-        # VAE node also stores the newly executed real frames with their poses.
-        vae_encoder = GraphNode(
-            name="vae_encoder",
-            input_names=["image_inputs", "executed_pose_inputs", "executed_pose_valid"]
-            if self.sampler_defaults["max_context_chunks"] else ["image_inputs"],
-            outputs=[GraphEdge(next_node="backbone", name="obs_latents"), *(
-                [GraphEdge(next_node="backbone", name="anchor_latents"),
-                 GraphEdge(next_node="backbone", name="clean_latents"),
-                 GraphEdge(next_node="action_expert", name="proprio_all")]
-                if self.sampler_defaults["max_context_chunks"] else []
-            )],
-        )
+        def chunk_graph(needs_text: bool) -> Sequential:
+            # One canvas per observation. When episode history is enabled, the
+            # VAE node also stores the newly executed real frames with their poses.
+            vae_encoder = GraphNode(
+                name="vae_encoder",
+                input_names=["image_inputs", "executed_pose_inputs", "executed_pose_valid"]
+                if self.sampler_defaults["max_context_chunks"] else ["image_inputs"],
+                outputs=[GraphEdge(next_node="backbone", name="obs_latents"),
+                         GraphEdge(next_node="backbone", name="video_latents"),
+                         GraphEdge(next_node="backbone", name="action_latents"), *(
+                    [GraphEdge(next_node="backbone", name="anchor_latents"),
+                     GraphEdge(next_node="backbone", name="clean_latents"),
+                     GraphEdge(next_node="action_expert", name="proprio_all")]
+                    if self.sampler_defaults["max_context_chunks"] else []
+                )],
+            )
 
-        # One Euler step: the backbone denoises the video window and leaves
-        # its taps; the expert denoises the actions from them. The two carry
-        # their own latents round the loop.
-        backbone = GraphNode(
-            name="backbone",
-            input_names=[
-                "obs_latents",
-                *(["anchor_latents", "clean_latents"] if self.sampler_defaults["max_context_chunks"] else []),
-                "text_embeds",
-                "text_embeds_blank",
-                "video_latents",
-                "action_latents",
-            ],
-            outputs=[
-                GraphEdge(next_node="action_expert", name="taps"),
-                GraphEdge(next_node="action_expert", name="tap_embeddings"),
-                GraphEdge(next_node="action_expert", name="tap_rope_ids"),
-                GraphEdge(next_node="action_expert", name="tap_geometry"),
-                GraphEdge(next_node="action_expert", name="video_latents"),
-                GraphEdge(next_node="action_expert", name="action_latents"),
-            ],
-        )
-        action_expert = GraphNode(
-            name="action_expert",
-            input_names=["taps", "tap_embeddings", "tap_rope_ids", "tap_geometry",
-                         "video_latents", "action_latents", "proprio", *(
-                ["proprio_all"] if self.sampler_defaults["max_context_chunks"] else []
-            )],
-            outputs=[
-                GraphEdge(next_node="backbone", name="video_latents"),
-                GraphEdge(next_node="backbone", name="action_latents"),
-            ],
-            # get_loop_caps ends the loop on a request's last step, so nothing
-            # speculates past it
-            enable_async_scheduling=True,
-        )
+            # One Euler step: the backbone denoises the video window and leaves
+            # its taps; the expert denoises the actions from them. The two carry
+            # their own latents round the loop.
+            backbone = GraphNode(
+                name="backbone",
+                input_names=[
+                    "obs_latents",
+                    *(["anchor_latents", "clean_latents"] if self.sampler_defaults["max_context_chunks"] else []),
+                    *(["text_embeds", "text_embeds_blank"] if needs_text else []),
+                    "video_latents",
+                    "action_latents",
+                ],
+                outputs=[
+                    GraphEdge(next_node="action_expert", name="taps"),
+                    GraphEdge(next_node="action_expert", name="tap_embeddings"),
+                    GraphEdge(next_node="action_expert", name="tap_rope_ids"),
+                    GraphEdge(next_node="action_expert", name="tap_geometry"),
+                    GraphEdge(next_node="action_expert", name="video_latents"),
+                    GraphEdge(next_node="action_expert", name="action_latents"),
+                ],
+            )
+            action_expert = GraphNode(
+                name="action_expert",
+                input_names=["taps", "tap_embeddings", "tap_rope_ids", "tap_geometry",
+                             "video_latents", "action_latents", "proprio", *(
+                    ["proprio_all"] if self.sampler_defaults["max_context_chunks"] else []
+                )],
+                outputs=[
+                    GraphEdge(next_node="backbone", name="video_latents"),
+                    GraphEdge(next_node="backbone", name="action_latents"),
+                ],
+                # get_loop_caps ends the loop on a request's last step, so nothing
+                # speculates past it
+                enable_async_scheduling=True,
+            )
 
-        denoise_loop = Loop(
-            name=DENOISE_LOOP_NAME,
-            section=Sequential([backbone, action_expert]),
-            # Ceiling only; get_loop_caps gives each request its step count.
-            max_iters=self.max_denoise_steps,
-            # Only the actions leave the loop. The predicted video has no
-            # reader after the last step: the reply is command rows, and the
-            # next call is conditioned on real frames, not on this video.
-            outputs=[
-                GraphEdge(next_node="action_head", name="action_latents"),
-            ],
-        )
+            denoise_loop = Loop(
+                name=DENOISE_LOOP_NAME,
+                section=Sequential([backbone, action_expert]),
+                # Ceiling only; get_loop_caps gives each request its step count.
+                max_iters=self.max_denoise_steps,
+                # Only the actions leave the loop. The predicted video has no
+                # reader after the last step: the reply is command rows, and the
+                # next call is conditioned on real frames, not on this video.
+                outputs=[
+                    GraphEdge(next_node="action_head", name="action_latents"),
+                ],
+            )
 
-        # The head turns the settled action latents into command rows. That
-        # happens once per call, after the last Euler step, so it sits after
-        # the loop rather than in its body.
-        action_head = GraphNode(
-            name="action_head",
-            input_names=["action_latents"],
-            outputs=[
-                GraphEdge(
-                    next_node=EMIT_TO_CLIENT,
-                    name="actions",
-                    output_modality="action",
-                ),
-            ],
-        )
+            # The head turns the settled action latents into command rows. That
+            # happens once per call, after the last Euler step, so it sits after
+            # the loop rather than in its body.
+            action_head = GraphNode(
+                name="action_head",
+                input_names=["action_latents"],
+                outputs=[
+                    GraphEdge(
+                        next_node=EMIT_TO_CLIENT,
+                        name="actions",
+                        output_modality="action",
+                    ),
+                ],
+            )
 
-        return {
-            self.ENCODE_TEXT_WALK: encode_text,
-            self.CHUNK_WALK: Sequential([vae_encoder, denoise_loop, action_head]),
-        }
+            return Sequential([vae_encoder, denoise_loop, action_head])
+
+        graphs = {self.ENCODE_TEXT_WALK: encode_text, self.CHUNK_WALK: chunk_graph(True)}
+        if self.sampler_defaults["max_context_chunks"]:
+            graphs[self.CHUNK_WARM_WALK] = chunk_graph(False)
+        return graphs
 
     def declare_state(self) -> list:
         """Declare within-step attention and optional executed-frame episode state."""
@@ -695,7 +700,7 @@ class Praxis1Model(Model):
         metadata[EXPERT_LAYOUT_KWARG] = expert_layouts(declared, layout)
         steps.append(
             WalkStep(
-                self.CHUNK_WALK,
+                self.CHUNK_WARM_WALK if has_episode_text else self.CHUNK_WALK,
                 step_metadata=metadata,
             )
         )

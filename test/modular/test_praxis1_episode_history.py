@@ -96,7 +96,7 @@ def test_episode_text_key_and_walk_follow_cold_warm_changed_prompt_and_reset():
         )]
 
     assert walks(0) == ["encode_text", "chunk"]  # first, changed key, reset, or eviction
-    assert walks(2) == ["chunk"]
+    assert walks(2) == ["chunk_warm"]
 
 
 def test_episode_text_reuse_requires_a_deployment_token_cap():

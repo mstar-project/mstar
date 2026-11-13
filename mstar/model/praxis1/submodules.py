@@ -254,7 +254,7 @@ class Praxis1VaeEncoderSubmodule(_Praxis1Node):
             tensors["history_pose"] = pose
             tensors["history_pose_valid"] = pose_valid
         return NodeInputs(tensor_inputs=tensors, resource_step_info=append,
-                          kwargs={"history_append": append})
+                          kwargs={"history_append": append, "seed": fwd_info.random_seed})
 
     def declare_step(
         self, graph_walk: str, request_ids: list[str], inputs: list[NodeInputs], **kwargs,
@@ -277,6 +277,7 @@ class Praxis1VaeEncoderSubmodule(_Praxis1Node):
         graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
         history_append: int = 0,
+        seed: int = 0,
         history_pose: torch.Tensor | None = None,
         history_pose_valid: torch.Tensor | None = None,
         **views: torch.Tensor,
@@ -313,7 +314,8 @@ class Praxis1VaeEncoderSubmodule(_Praxis1Node):
             canvas = build_canvas(self._tiles(tiles))
             latent = self.vae_encode(canvas)
             if not self.episode_history:
-                return {"obs_latents": [latent]}
+                seeded = self._seed_window(latent, 1, seed)
+                return {"obs_latents": [latent], **seeded}
             depth = clean_depth(len(observed["frame"]), self.max_context_chunks)
             if depth:
                 clean_canvas = observed["frame"].permute(1, 0, 2, 3).unsqueeze(0).float()
@@ -336,8 +338,17 @@ class Praxis1VaeEncoderSubmodule(_Praxis1Node):
                 normalized_proprio(row.cpu().tolist(), self.config.embodiment, self.config.normalization)
                 for row in poses_all
             ], dim=1).to(device=device)
+        seeded = self._seed_window(latent, depth + 1, seed)
         return {"obs_latents": [latent], "anchor_latents": [anchor],
-                "clean_latents": [clean], "proprio_all": [proprio_all]}
+                "clean_latents": [clean], "proprio_all": [proprio_all], **seeded}
+
+    def _seed_window(self, latent: torch.Tensor, chunks: int, seed: int) -> NameToTensorList:
+        """Seed both loopback edges before the first backbone step."""
+        frames = chunks * self.config.latents_per_chunk
+        video = seeded_normal((1, latent.shape[1], frames, *latent.shape[-2:]), seed, VIDEO_SALT)
+        actions = seeded_normal((1, frames, self.config.action_patch_dim), seed, ACTION_SALT)
+        return {"video_latents": [video.to(latent.device)],
+                "action_latents": [actions.to(latent.device)]}
 
     def _tiles(self, views: list[torch.Tensor]) -> list[torch.Tensor]:
         """Each view at the checkpoint's tile size, by that rig's own rule.
@@ -394,8 +405,8 @@ class Praxis1BackboneSubmodule(_Praxis1Node):
         if anchor:
             tensors["anchor_latents"] = anchor[0]
             tensors["clean_latents"] = clean[0]
-        # First iteration: the loop has not carried anything yet, so the
-        # latents are the noise this request's seed draws.
+        # First iteration reads the VAE node's seed; later iterations read
+        # the expert's loopback edges.
         for name in ("video_latents", "action_latents"):
             carried = inputs.get(name)
             if carried:
@@ -430,7 +441,6 @@ class Praxis1BackboneSubmodule(_Praxis1Node):
             kwargs={"write_text": write_text,
                     "text_tokens": int(metadata.get("text_tokens", 0)),
                     "blank_tokens": int(metadata.get("blank_tokens", 0)),
-                    "seed": fwd_info.random_seed,
                     "step_index": fwd_info.dynamic_loop_iter_counts.get("praxis_denoise", 0),
                     "num_steps": int(metadata.get("num_steps", 1)),
                     "t_shift": float(metadata.get("t_shift", 1.0)),
@@ -495,7 +505,6 @@ class Praxis1BackboneSubmodule(_Praxis1Node):
         write_text: bool = False,
         text_tokens: int = 0,
         blank_tokens: int = 0,
-        seed: int = 0,
         step_index: int = 0,
         num_steps: int = 1,
         t_shift: float = 1.0,
@@ -519,18 +528,8 @@ class Praxis1BackboneSubmodule(_Praxis1Node):
         anchor = obs_latents if anchor_latents is None else anchor_latents
         if anchor.shape[2] != 1 or anchor.shape[0] != 1:
             raise ValueError("Praxis anchor must contain one latent frame")
-        if video_latents is None:
-            if step_index:
-                raise ValueError("a later Praxis Euler step needs carried video latents")
-            video_latents = seeded_normal(
-                (1, obs_latents.shape[1], k * f, *obs_latents.shape[-2:]), seed, VIDEO_SALT,
-            ).to(obs_latents.device)
-        if action_latents is None:
-            if step_index:
-                raise ValueError("a later Praxis Euler step needs carried action latents")
-            action_latents = seeded_normal(
-                (1, k * f, self.config.action_patch_dim), seed, ACTION_SALT,
-            ).to(obs_latents.device)
+        if video_latents is None or action_latents is None:
+            raise ValueError("Praxis backbone needs both VAE-seeded or loop-carried latents")
         if video_latents.shape != (1, obs_latents.shape[1], k * f, *obs_latents.shape[-2:]):
             raise ValueError("Praxis carried video does not match the clean window")
         if action_latents.shape != (1, k * f, self.config.action_patch_dim):

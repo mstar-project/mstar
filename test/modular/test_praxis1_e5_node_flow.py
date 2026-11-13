@@ -12,6 +12,7 @@ from praxis.sampler import ACTION_SALT, VIDEO_SALT, guidance_combine, seeded_nor
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.state.adapters import build_specs, node_handles, state_steps
+from mstar.graph.base import GraphEdge
 from mstar.model.base import EpisodeView
 from mstar.model.praxis1.components.action_expert import _RESOURCE_MASK
 from mstar.model.praxis1.components.encoder import TapFeatures
@@ -27,6 +28,7 @@ from mstar.model.praxis1.submodules import (
     EXPERT_TRUNK_KEYS,
     Praxis1ActionExpertSubmodule,
     Praxis1BackboneSubmodule,
+    Praxis1VaeEncoderSubmodule,
 )
 
 
@@ -123,7 +125,10 @@ def test_cold_and_warm_node_flow_matches_reference_sampler(depth: int) -> None:
     text = torch.full((1, 3, 2), 0.5)
     blank = torch.full((1, 2, 2), -0.25)
     proprio = torch.full((1, k, config.proprio_patch_dim), 0.4)
-    carried = {}
+    carried = {
+        "video_latents": seeded_normal((1, 4, k * 6, 1, 1), 17, VIDEO_SALT),
+        "action_latents": seeded_normal((1, k * 6, config.action_patch_dim), 17, ACTION_SALT),
+    }
     for step in range(2):
         input_tensors = {
             "obs_latents": [torch.zeros(1, 4, 1, 1, 1)],
@@ -207,3 +212,38 @@ def test_episode_layout_plans_both_guidance_branches_on_shared_resource(
     )
     assert len(expanded.steps["praxis_encoder_cond_attn"].segments) == 2
     assert len(expanded.steps["praxis_decoder_cond_attn"].segments) == 2
+
+
+@pytest.mark.parametrize("held,rows,warm", [(0, 0, False), (1, 21, True)])
+def test_graph_backbone_is_ready_after_actual_producers(held: int, rows: int, warm: bool) -> None:
+    model = Praxis1Model(
+        "runwayml/praxis-1-droid", skip_weight_loading=True,
+        max_context_chunks=1, max_text_tokens=8,
+    )
+    episode = EpisodeView("session", 1, {STATE_NAME: held, **({"text_embeds": 5} if warm else {})})
+    walk = model.walk_plan(
+        "", ["image"], ["action"], {"image_inputs": [object()]},
+        {"executed_rows": rows, "text_tokens": 3, "blank_tokens": 2}, episode,
+    )[-1]
+    graph = model.get_graph_walk_graphs()[walk.walk]
+    backbone = graph.get_nodes()["backbone"]
+    names = {edge.name for edge in graph.get_nodes()["vae_encoder"].outputs if edge.next_node == "backbone"}
+    if not warm:
+        names |= {"text_embeds", "text_embeds_blank"}
+    for name in names:
+        backbone.ready_signals.update(GraphEdge(name=name, next_node="backbone"))
+    assert backbone.ready_signals.is_ready
+    external = {name for name, _ in graph.get_inputs_outputs().ext_inputs}
+    assert not {"video_latents", "action_latents"} & external
+    assert ({"text_embeds", "text_embeds_blank"} <= external) is not warm
+
+
+@pytest.mark.parametrize("chunks", [1, 2])
+def test_vae_seeds_both_loopback_edges_from_reference_streams(chunks: int) -> None:
+    config = Praxis1Config.for_rig("single_arm")
+    vae = SimpleNamespace(config=SimpleNamespace(z_dim=config.latent_channels))
+    node = Praxis1VaeEncoderSubmodule(config, vae)
+    latent = torch.zeros(1, 192, 1, 2, 3)
+    seeded = node._seed_window(latent, chunks, 17)
+    assert torch.equal(seeded["video_latents"][0], seeded_normal((1, 192, chunks * 6, 2, 3), 17, VIDEO_SALT))
+    assert torch.equal(seeded["action_latents"][0], seeded_normal((1, chunks * 6, 40), 17, ACTION_SALT))
