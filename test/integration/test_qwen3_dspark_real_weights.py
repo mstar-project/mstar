@@ -42,6 +42,7 @@ from __future__ import annotations
 import base64
 import importlib.util
 import json
+import math
 import re
 import sys
 import time
@@ -157,7 +158,8 @@ def drafter(request) -> Drafter:
 
 def _config(tmp: Path, name: str, drafter: Drafter, *, draft_mode: str | None, verify_backend: str | None = None,
             tp: int = 1,
-            captured: bool = True, max_num_pages: int | None = None, max_batch_tokens: int | None = None) -> Path:
+            captured: bool = True, max_num_pages: int | None = None,
+            max_batch_tokens: int | dict | None = None) -> Path:
     base = drafter.config if draft_mode else "configs/qwen3_8b.yaml"
     config = yaml.safe_load((REPO / base).read_text())
     resources = config.setdefault("resources", {})
@@ -239,11 +241,43 @@ def _all_at_once(url: str, prompts: list[str], sampled: bool = False) -> list[li
         return list(pool.map(lambda p: _ids(url, p, sampled), prompts))
 
 
+# seconds between staggered arrivals: a few verify steps, so each prompt lands while earlier replies decode
+STAGGER = 0.15
+
+
+def _staggered(url: str, prompts: list[str]) -> list[list[int]]:
+    """The prompts sent one every ``STAGGER`` seconds, each while the earlier ones still decode: a
+    synchronous node that runs mixed prompt-plus-verify steps takes them inside its verify steps."""
+    with ThreadPoolExecutor(len(prompts)) as pool:
+        futures = []
+        for prompt in prompts:
+            futures.append(pool.submit(_ids, url, prompt))
+            time.sleep(STAGGER)
+        return [future.result() for future in futures]
+
+
+def _walk_steps(url: str) -> dict[str, float]:
+    """The LLM node's steps by walk so far (`mstar_step_seconds`' counts), once the reports settle."""
+    pattern = re.compile(r'^mstar_step_seconds_count{([^}]*)} ([0-9.e+]+)$', re.M)
+    last = None
+    for _ in range(20):
+        steps: dict[str, float] = {}
+        for labels, value in pattern.findall(requests.get(url + "/metrics", timeout=30).text):
+            fields = dict(re.findall(r'(\w+)="([^"]*)"', labels))
+            if fields.get("component") == "LLM":
+                steps[fields["graph_walk"]] = steps.get(fields["graph_walk"], 0.0) + float(value)
+        if steps == last:
+            return steps
+        last = steps
+        time.sleep(1.5)
+    return last
+
+
 RUNS: dict[str, dict] = {}
 
 
 def _run(tmp_path_factory, drafter: Drafter, name: str, *, sampled_too: bool = False, repeat: bool = False,
-         pressure: bool = False, crowd: int = 0, **kw) -> dict:
+         pressure: bool = False, crowd: int = 0, staggered: bool = False, **kw) -> dict:
     """Serve ``name`` once and keep what every test reads of it."""
     # a plain run is every drafter's baseline; a speculative one is its drafter's
     name = f"{drafter.id}_{name}" if kw.get("draft_mode") else name
@@ -253,7 +287,21 @@ def _run(tmp_path_factory, drafter: Drafter, name: str, *, sampled_too: bool = F
     server = _serve(tmp_path_factory, name, drafter, **kw)
     with server as url:
         speculative = bool(kw.get("draft_mode"))
-        if crowd:
+        if staggered:
+            # staggered arrivals, then the same again, each now a prefix-cache hit; the steps each walk ran, and
+            # the prompt tokens computed (looked up less held)
+            before, start = _walk_steps(url), _counters(url, wait=False)
+            looked = _totals(url, "mstar_prefix_cache_query_tokens_total", "mstar_prefix_cache_hit_tokens_total")
+            run["staggered"] = _staggered(url, PROMPTS)
+            run["tau"] = _tau(start, _counters(url))
+            (hits,) = _totals(url, "mstar_prefix_cache_hit_tokens_total")
+            run["cached"] = _staggered(url, PROMPTS)
+            run["hit_tokens"] = _totals(url, "mstar_prefix_cache_hit_tokens_total")[0] - hits
+            after = _walk_steps(url)
+            run["steps"] = {walk: after[walk] - before.get(walk, 0.0) for walk in after}
+            queried, held = _totals(url, "mstar_prefix_cache_query_tokens_total", "mstar_prefix_cache_hit_tokens_total")
+            run["computed_tokens"] = (queried - looked[0]) - (held - looked[1])
+        elif crowd:
             # ``crowd`` copies of PROMPTS at once, and whether the sampler's loop-back masters grew meanwhile
             start = _counters(url, wait=False)
             run["concurrent"] = _all_at_once(url, PROMPTS * crowd)
@@ -441,6 +489,83 @@ def test_prompts_prefilled_in_chunks_reply_and_draft_as_whole_ones(tmp_path_fact
     _check_margins(plain["sequential"], chunked["concurrent"], margin_of, "chunked concurrent")
     assert chunked["tau"] == pytest.approx(whole["tau"], rel=0.1)
 
+
+def _block(drafter: Drafter) -> int:
+    if drafter.k is not None:
+        return drafter.k + 1
+    config = yaml.safe_load((REPO / drafter.config).read_text())
+    return config["model_kwargs"]["draft"]["num_draft_tokens"] + 1
+
+
+def test_synchronous_arrivals_ride_in_mixed_steps_and_reply_plain_greedy(tmp_path_factory, drafter, margin_of):
+    """A synchronous node runs staggered arrivals inside its verify steps (mixed prompt-plus-verify steps,
+    `VerifyNode.mixed_walk`), cold and as prefix-cache hits: the replies hold to plain greedy and the
+    acceptance to the asynchronous node's. Under a mixed-step budget that leaves a prompt a page a step past
+    the verify rows' blocks (the combined walk's budget, which its prompt walk's steps run under too), each
+    prompt is chunked across steps, mixed ones among them. A draft model lags its target and declares no
+    mixed walk (`test_qwen3_mixed`), so it has no case here."""
+    from mstar.model.keys import MIXED, PREFILL_TEXT
+
+    if drafter.method not in ("dspark", "eagle3"):
+        pytest.skip(f"a {drafter.method} node declares no mixed walk")
+    plain = _run(tmp_path_factory, drafter, "plain", draft_mode=None)
+    async_ = _run(tmp_path_factory, drafter, "async", draft_mode="asynchronous", repeat=True, sampled_too=True)
+    chunks = {MIXED: _block(drafter) * len(PROMPTS) + PAGE}
+    for name, budget in (("sync_staggered", None), ("sync_staggered_chunked", chunks)):
+        run = _run(tmp_path_factory, drafter, name, draft_mode="synchronous", staggered=True, max_batch_tokens=budget)
+        _check_margins(plain["sequential"], run["staggered"], margin_of, f"{name} staggered")
+        _check_margins(plain["sequential"], run["cached"], margin_of, f"{name} cached")
+        assert run["hit_tokens"] > 0, "the cached round hit no page"
+        assert run["steps"].get(MIXED, 0) > 0, run["steps"]
+        assert run["tau"] == pytest.approx(async_["tau_concurrent"], rel=0.1)
+        if budget is not None:
+            # no step carries more prompt tokens than the budget, however the arrivals share steps; how many a
+            # prompt gets past the verify rows' blocks depends on how many rows decode when it arrives
+            prompt_steps = run["steps"].get(MIXED, 0) + run["steps"].get(PREFILL_TEXT, 0)
+            least = math.ceil(run["computed_tokens"] / budget[MIXED])
+            assert run["computed_tokens"] > 0 and prompt_steps >= least, (run["steps"], run["computed_tokens"])
+
+
+def test_asynchronous_arrivals_ride_in_mixed_steps_and_reply_plain_greedy(tmp_path_factory, drafter, margin_of):
+    """An asynchronous node runs staggered arrivals inside its verify steps too: the mixed step's verify rows on
+    the resident tables, its prompt rows on the host plan (`ResidentPlanner.mixed_walks`), the worker
+    speculating prompt rows into a verify chain. Cold and as prefix-cache hits the replies hold to plain
+    greedy, mixed steps ran, and acceptance holds to the node's at once."""
+    from mstar.model.keys import MIXED
+
+    if drafter.method not in ("dspark", "eagle3"):
+        pytest.skip(f"a {drafter.method} node declares no mixed walk")
+    plain = _run(tmp_path_factory, drafter, "plain", draft_mode=None)
+    async_ = _run(tmp_path_factory, drafter, "async", draft_mode="asynchronous", repeat=True, sampled_too=True)
+    run = _run(tmp_path_factory, drafter, "async_staggered", draft_mode="asynchronous", staggered=True)
+    _check_margins(plain["sequential"], run["staggered"], margin_of, "async staggered")
+    _check_margins(plain["sequential"], run["cached"], margin_of, "async cached")
+    assert run["hit_tokens"] > 0, "the cached round hit no page"
+    assert run["steps"].get(MIXED, 0) > 0, run["steps"]
+    assert run["tau"] == pytest.approx(async_["tau_concurrent"], rel=0.1)
+
+
+@needs_two
+def test_tp2_asynchronous_arrivals_ride_in_mixed_steps(tmp_path_factory, drafter, fp32):
+    """The same on a TP2 node: every rank takes the mixed step the scheduler broadcast, its verify rows on each
+    rank's own tables, and the replies pass the fp32 screen against plain, with mixed steps run and acceptance
+    within 10% of one GPU's."""
+    from mstar.model.keys import MIXED
+
+    if drafter.id not in TP2_PRESSURE:
+        pytest.skip(f"the TP2 mixed rounds run for {', '.join(TP2_PRESSURE)}")
+    plain = _run(tmp_path_factory, drafter, "plain", draft_mode=None)
+    one = _run(tmp_path_factory, drafter, "async_staggered", draft_mode="asynchronous", staggered=True)
+    tp = _run(tmp_path_factory, drafter, "tp2_async_staggered", draft_mode="asynchronous", tp=2, staggered=True)
+    assert tp["steps"].get(MIXED, 0) > 0, tp["steps"]
+    try:
+        failed = fp32_screen.screen(f"{drafter.id} tp2 async staggered", [
+            (_pairs(plain["sequential"], tp["staggered"], "staggered"), None, None),
+            (_pairs(plain["sequential"], tp["cached"], "cached"), None, None)], fp32, GATES)
+    finally:
+        fp32.release()
+    assert not failed, "\n".join(failed)
+    assert tp["tau"] == pytest.approx(one["tau"], rel=0.1), (tp["tau"], one["tau"])
 
 def test_a_repeated_prompt_hits_the_prefix_cache_and_drafts_as_well(tmp_path_factory, drafter, margin_of):
     """The repeat's prompt pages come from the cache, the drafter's KV layers with
