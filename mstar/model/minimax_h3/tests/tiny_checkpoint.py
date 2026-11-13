@@ -141,3 +141,33 @@ def write_snapshot_configs(root: Path, cfg: H3TransformerConfig) -> None:
     write("audio_vae/metadata.json", {"metadata": {"kwargs": {
         "latent_dim": 2048, "decoder_dim": 1024, "decoder_type": "bigvgan", "decoder_rates": [5, 5, 2, 2, 2, 2, 2],
     }}})
+
+
+FASTH3_CONTRACT = {  # FastVideo-FastH3-8-Step-V2's fastvideo_inference.json, the fields read
+    "dmd_denoising_steps": [999, 874, 749, 624, 500, 375, 250, 125], "video_scheduler_shift": 10.0,
+    "audio_scheduler_shift": 3.0, "guidance_scale": 1.0, "task": "t2av", "transformer_forwards": 8,
+}
+
+
+def write_distilled_release(root: Path, cfg: H3TransformerConfig, **contract) -> None:
+    """The json files of a FastH3-style release around a ``cfg`` transformer, ``contract``
+    overriding its ``fastvideo_inference.json``."""
+    root = Path(root)
+    for rel, data in (
+        ("fastvideo_inference.json", {**FASTH3_CONTRACT, **contract}),
+        ("scheduler/scheduler_config.json", {"_class_name": "MiniMaxH3Scheduler", "shift": 10.0}),
+        ("audio_scheduler/scheduler_config.json", {"_class_name": "MiniMaxH3Scheduler", "shift": 3.0}),
+        ("transformer/config.json", {
+            "_class_name": "MiniMaxH3Transformer3DModel", "num_attention_heads": cfg.num_attention_heads,
+            "attention_head_dim": cfg.attention_head_dim, "hidden_size": cfg.hidden_size, "num_layers": cfg.num_layers,
+            "num_refiner_layers": cfg.token_refiner_num_layers, "ffn_dim": cfg.ffn_hidden_size,
+            "in_channels": cfg.latents_dim, "audio_in_channels": cfg.audio_latents_dim,
+            "patch_size": list(cfg.patch_size), "text_dim": cfg.text_dim, "freq_dim": cfg.timestep_input_dim,
+            "time_embed_hidden_dim": cfg.time_embed_hidden_size, "time_embed_dim": cfg.time_embed_dim,
+            "rope_freq_dim": cfg.rope_inv_freq_len, "rope_theta": cfg.rope_theta, "norm_eps": cfg.norm_eps,
+            "qk_norm_eps": cfg.qk_norm_eps, "final_norm_eps": cfg.final_norm_eps,
+        }),
+    ):
+        path = root / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data))
