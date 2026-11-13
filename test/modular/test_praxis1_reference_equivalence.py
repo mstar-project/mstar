@@ -469,3 +469,97 @@ def test_apply_rope_control_only_half_the_pairs_rotate():
     assert torch.allclose(out[..., half + 32 :], q[..., half + 32 :], atol=0, rtol=0)
     # while the rotating channels really did move
     assert not torch.equal(out[..., :32], q[..., :32])
+
+
+# ---------------------------------------------------------------------------
+# Attention
+# ---------------------------------------------------------------------------
+
+from mstar.model.praxis1.components import attention as port_attn  # noqa: E402
+
+
+def _copy_attention_weights(src, dst):
+    with torch.no_grad():
+        dst.in_proj.q_weight.copy_(src.in_proj.q_weight)
+        dst.in_proj.k_weight.copy_(src.in_proj.k_weight)
+        dst.in_proj.v_weight.copy_(src.in_proj.v_weight)
+        dst.gate_proj.weight.copy_(src.gate_proj.weight)
+        dst.q_norm.weight.copy_(src.q_norm.weight)
+        dst.k_norm.weight.copy_(src.k_norm.weight)
+        dst.out_proj.weight.copy_(src.out_proj.weight)
+        dst.out_proj.bias.copy_(src.out_proj.bias)
+
+
+def test_qkv_projection_matches():
+    torch.manual_seed(0)
+    dim, head_dim, nh, nkv = 256, 64, 4, 2
+    ref = ref_layers.QKVProjection(dim, head_dim, nh, nkv)
+    got = port_attn.QKVProjection(dim, head_dim, nh, nkv)
+    with torch.no_grad():
+        for name in ("q_weight", "k_weight", "v_weight"):
+            w = torch.randn_like(getattr(ref, name))
+            getattr(ref, name).copy_(w)
+            getattr(got, name).copy_(w)
+    x = torch.randn(1, 9, dim)
+    for a, b in zip(got(x), ref(x), strict=True):
+        assert torch.equal(a, b)
+
+
+def test_rope_then_norm_matches_reference_order():
+    """The reference's own rope+norm helper, against ours done in order."""
+    torch.manual_seed(0)
+    head_dim = 64
+    q_norm = ref_layers.RMSNorm(head_dim)
+    k_norm = ref_layers.RMSNorm(head_dim)
+    with torch.no_grad():
+        q_norm.weight.copy_(torch.randn(head_dim) * 0.1)
+        k_norm.weight.copy_(torch.randn(head_dim) * 0.1)
+    q = torch.randn(1, 4, 12, head_dim)
+    k = torch.randn(1, 2, 12, head_dim)
+    table = port_rope.RotaryEmbedding(dim=head_dim)(
+        port_rope.video_positions(2, 2, 3, 0)[None]
+    )
+    wq, wk = ref_layers.apply_rope_norm(q, k, table, q_norm, k_norm)
+    gq, gk = port_rope.apply_rope(q, k, table)
+    gq, gk = q_norm(gq), k_norm(gk)
+    assert torch.equal(gq, wq) and torch.equal(gk, wk)
+
+
+def test_attention_control_norm_before_rope_differs():
+    """Control: the rotate/norm order has to matter.
+
+    The port does rope then norm. If the two commuted, getting the order
+    wrong would be harmless and the test above would be vacuous.
+    """
+    torch.manual_seed(0)
+    head_dim = 64
+    norm = ref_layers.RMSNorm(head_dim)
+    with torch.no_grad():
+        norm.weight.copy_(torch.randn(head_dim) * 0.3)
+    q = torch.randn(1, 2, 8, head_dim)
+    table = port_rope.RotaryEmbedding(dim=head_dim)(
+        port_rope.video_positions(1, 2, 4, 0)[None]
+    )
+    rope_then_norm = norm(port_rope.apply_rope(q, q.clone(), table)[0])
+    norm_then_rope = port_rope.apply_rope(norm(q), norm(q).clone(), table)[0]
+    assert not torch.equal(rope_then_norm, norm_then_rope)
+
+
+def test_attention_gate_is_applied_per_head():
+    """The sigmoid gate scales each head's output, before the out projection."""
+    torch.manual_seed(0)
+    dim, head_dim, nkv = 256, 64, 2
+    attn = port_attn.Attention(dim=dim, head_dim=head_dim, num_kv_heads=nkv)
+    with torch.no_grad():
+        attn.out_proj.weight.copy_(torch.eye(dim))
+        attn.out_proj.bias.zero_()
+        # Drive one head's gate to ~0 and another's to ~1.
+        attn.gate_proj.weight.zero_()
+        attn.gate_proj.weight[0] = -50.0
+        attn.gate_proj.weight[1] = 50.0
+    x = torch.randn(1, 6, dim).abs() + 0.1
+    out = attn(x, rope=None)
+    head0 = out[..., :head_dim]
+    head1 = out[..., head_dim : 2 * head_dim]
+    assert head0.abs().max() < 1e-3
+    assert head1.abs().max() > head0.abs().max()
