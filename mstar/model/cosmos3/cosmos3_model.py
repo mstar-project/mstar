@@ -373,6 +373,12 @@ class Cosmos3Model(Model):
                     if k in ("image_size_default", "video_size_default") and v is not None:
                         v = tuple(int(x) for x in v)
                     setattr(cfg, k, v)
+                elif k == "windowed_decode_max_warm_streams":
+                    raise ValueError(
+                        "Cosmos3 windowed_decode_max_warm_streams is no longer read: every live stream keeps its "
+                        "decoder cache on the decode loop. Remove it, or set windowed_decode_warm_cache: false to "
+                        "decode every window without one."
+                    )
                 else:
                     logger.warning(
                         "Cosmos3Model: yaml model_kwargs key %r is not a Cosmos3Config "
