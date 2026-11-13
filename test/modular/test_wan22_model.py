@@ -861,7 +861,7 @@ class _BranchEcho(torch.nn.Module):
     """A dit stand-in whose prediction is each row's text embedding, broadcast."""
     dtype = torch.float32
 
-    def forward(self, hidden_states, timestep, encoder_hidden_states, shard=None):
+    def forward(self, hidden_states, timestep, encoder_hidden_states, shard=None, requests=1):
         return encoder_hidden_states[:, :1, :1, None, None].expand_as(hidden_states).clone()
 
 

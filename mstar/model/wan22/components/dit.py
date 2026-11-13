@@ -279,6 +279,18 @@ class Wan22DiTBlock(nn.Module):
         ).type_as(hidden_states).flatten(1, 2)
 
 
+def _per_request(fn, requests: int, *tensors: torch.Tensor):
+    """``fn`` over each request's rows of a ``[branches * requests, ...]`` batch (request ``r`` holds rows
+    ``r::requests``), restacked in that order. These are the calls a request makes alone, so what it gets back does
+    not depend on the requests it shares the forward with. One call when the batch is one request's."""
+    if requests == 1:
+        return fn(*tensors)
+    outs = [fn(*(t[r::requests] for t in tensors)) for r in range(requests)]
+    if isinstance(outs[0], torch.Tensor):
+        return torch.stack(outs, dim=1).flatten(0, 1)
+    return tuple(torch.stack(parts, dim=1).flatten(0, 1) for parts in zip(*outs, strict=True))
+
+
 @torch.compiler.disable
 def _token_runs(shard, timestep: torch.Tensor, per_frame: int) -> torch.Tensor:
     """``timestep`` ``[B, frames]`` as this rank's share of its tokens takes it: whole frames
@@ -357,6 +369,7 @@ class Wan22DiT(nn.Module):
         shard=None,
         cached_residual: torch.Tensor | None = None,
         return_residual: bool = False,
+        requests: int = 1,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """``hidden_states`` ``[B, C, F, H, W]`` (bf16 latents), ``timestep``
         ``[B, F // p_t]`` per post-patch frame (``expand_timesteps``: each
@@ -370,7 +383,11 @@ class Wan22DiT(nn.Module):
 
         Step caching (``step_cache.py``): with ``cached_residual`` (fp32, ``[B, S, dim]`` over this rank's tokens) the
         blocks are skipped and their output is the stream plus it; ``return_residual`` also returns what the blocks
-        added, in that layout."""
+        added, in that layout.
+
+        ``requests``: how many requests' rows the batch holds, ``[branches * requests]`` with a request's branches
+        ``requests`` rows apart. Above 1 the patchify and the condition embedder run once per request: their kernels
+        are picked by row count, so a row would otherwise take different bits with each batch it rides in."""
         batch_size, _, num_frames, height, width = hidden_states.shape
         p_t, p_h, p_w = self.config.patch_size
         grid = (num_frames // p_t, height // p_h, width // p_w)
@@ -381,7 +398,7 @@ class Wan22DiT(nn.Module):
             )
 
         rotary_emb = tuple(t.contiguous() for t in self.rope(grid, hidden_states.device))
-        hidden_states = self.patch_embedding(hidden_states)
+        hidden_states = _per_request(self.patch_embedding, requests, hidden_states)
         hidden_states = hidden_states.flatten(2).transpose(1, 2)
 
         # every per-token tensor is cut to this rank's tokens on a step the shard splits
@@ -393,8 +410,8 @@ class Wan22DiT(nn.Module):
             hidden_states = scatter(shard, hidden_states)
             rotary_emb = scatter(shard, *rotary_emb, dim=0)  # [S, D] tables
 
-        temb, timestep_proj, encoder_hidden_states = self.condition_embedder(
-            timestep, encoder_hidden_states
+        temb, timestep_proj, encoder_hidden_states = _per_request(
+            self.condition_embedder, requests, timestep, encoder_hidden_states
         )
 
         before = hidden_states

@@ -597,12 +597,16 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
                 cache["cached_residual"] = block_cache.residual.transpose(0, 1).flatten(0, 1)
             else:
                 cache["return_residual"] = True
+        # Told of several requests, the dit runs its row-count-picked kernels once per request. One request's call,
+        # and so its compiled trace, stays as it was.
+        shared = {"requests": rows} if rows > 1 else {}
         out = forward(
             hidden_states=hidden_states,
             timestep=timestep,
             encoder_hidden_states=encoder_hidden_states.to(module.dtype),
             shard=self.shard,
             **cache,
+            **shared,
         )
         if cache.get("return_residual"):
             out, residual = out

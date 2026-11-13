@@ -2239,7 +2239,12 @@ stage: the solver state (the order-2 history buffer and the corrector's
 the request rather than living in a scheduler object on one rank. Requests are
 therefore independent and the loop is resumable across ranks. ``dit_max_batch_size``
 (default 1) lets requests at one latent grid and guidance scale share a forward,
-each row count compiling its own graph.
+each at its own denoise step: a request joins at the loop's next step and leaves
+after its last. Each row count compiles its own graph, and the patchify and the
+condition embedder still run once per request, so their kernels are the ones the
+request gets alone. One 1280x704x81 row already fills the GPU (on a B300 a second
+row costs a second forward's time), and every row of a batch waits for all of
+it, so leave it at 1 unless a deployment's grid is small enough to measure a gain.
 
 **What is accelerated by default.** The DiT runs under ``torch.compile``
 (``compile_dit``); its self-attention runs on the engine's ragged attention

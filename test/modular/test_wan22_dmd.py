@@ -64,7 +64,7 @@ class _StandIn(torch.nn.Module):
 
     dtype = torch.bfloat16
 
-    def forward(self, hidden_states, timestep, encoder_hidden_states, shard=None):
+    def forward(self, hidden_states, timestep, encoder_hidden_states, shard=None, requests=1):
         per_row = timestep.float().reshape(hidden_states.shape[0], -1).mean(dim=1).view(-1, 1, 1, 1, 1)
         return (hidden_states.float() * 0.3 - 0.1 + per_row / 1000).to(torch.bfloat16)
 
