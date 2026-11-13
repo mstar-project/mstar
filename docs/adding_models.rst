@@ -1211,8 +1211,8 @@ The spec types are:
        resource runs the torch reference. Where the fused
        kernels run, activations other than bf16 or a forget-gate bound below -5 are a
        ValueError at load. The torch reference's prefill can't be captured
-       (``KDAManager.prefill_capturable`` is False), so the resource refuses a prefill
-       bucket on it and the model leaves those buckets out.
+       (``KDAManager.prefill_capturable`` is False), so ``KDAManager.can_capture``
+       refuses a prefill step on it and the runner drops that capture config, logging it.
    * - ``LoraSpec`` (built by ``module_lora_spec``)
      - Per-request LoRA adapters on the node's LoRA-capable linears: a pool of device
        slots, a pinned host tier, and the per-step addressing a LoRA kernel reads.
