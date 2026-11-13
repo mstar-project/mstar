@@ -747,6 +747,8 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.worker_metrics.PreemptionCounts.preempted_again"><code class="docutils literal notranslate"><span class="pre">PreemptionCounts.preempted_again</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.worker_metrics.PreemptionCounts.rebuild_tokens"><code class="docutils literal notranslate"><span class="pre">PreemptionCounts.rebuild_tokens</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.worker_metrics.PreemptionCounts.returns_preempted"><code class="docutils literal notranslate"><span class="pre">PreemptionCounts.returns_preempted</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.worker_metrics.PreemptionCounts.take_back_waits"><code class="docutils literal notranslate"><span class="pre">PreemptionCounts.take_back_waits</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.worker_metrics.PreemptionCounts.take_backs"><code class="docutils literal notranslate"><span class="pre">PreemptionCounts.take_backs</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.worker_metrics.PreemptionCounts.victims"><code class="docutils literal notranslate"><span class="pre">PreemptionCounts.victims</span></code></a></li>
 </ul>
 </li>
@@ -797,7 +799,7 @@ Recording never changes what any rank runs.</p>
 </div>
 <dl class="py class">
 <dt class="sig sig-object py" id="mstar.worker.worker_metrics.PreemptionCounts">
-<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.worker.worker_metrics.</span></span><span class="sig-name descname"><span class="pre">PreemptionCounts</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">victims</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">drops</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rebuild_tokens</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">preempted_again</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">returns_preempted</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/worker/worker_metrics.html#PreemptionCounts"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.worker.worker_metrics.PreemptionCounts" title="Link to this definition">#</a></dt>
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.worker.worker_metrics.</span></span><span class="sig-name descname"><span class="pre">PreemptionCounts</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">victims</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">drops</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">rebuild_tokens</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">preempted_again</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">returns_preempted</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">take_backs</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">take_back_waits</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">0</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/worker/worker_metrics.html#PreemptionCounts"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.worker.worker_metrics.PreemptionCounts" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
 <p>A node’s preemptions since its worker started.</p>
 <dl class="field-list simple">
@@ -808,6 +810,8 @@ Recording never changes what any rank runs.</p>
 <li><p><strong>rebuild_tokens</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
 <li><p><strong>preempted_again</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
 <li><p><strong>returns_preempted</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>take_backs</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>take_back_waits</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
 </ul>
 </dd>
 </dl>
@@ -829,6 +833,16 @@ Recording never changes what any rank runs.</p>
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.worker.worker_metrics.PreemptionCounts.returns_preempted">
 <span class="sig-name descname"><span class="pre">returns_preempted</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.worker.worker_metrics.PreemptionCounts.returns_preempted" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.worker.worker_metrics.PreemptionCounts.take_back_waits">
+<span class="sig-name descname"><span class="pre">take_back_waits</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.worker.worker_metrics.PreemptionCounts.take_back_waits" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.worker.worker_metrics.PreemptionCounts.take_backs">
+<span class="sig-name descname"><span class="pre">take_backs</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.worker.worker_metrics.PreemptionCounts.take_backs" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
@@ -970,6 +984,8 @@ not counted twice.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.worker_metrics.PreemptionCounts.preempted_again"><code class="docutils literal notranslate"><span class="pre">PreemptionCounts.preempted_again</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.worker_metrics.PreemptionCounts.rebuild_tokens"><code class="docutils literal notranslate"><span class="pre">PreemptionCounts.rebuild_tokens</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.worker_metrics.PreemptionCounts.returns_preempted"><code class="docutils literal notranslate"><span class="pre">PreemptionCounts.returns_preempted</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.worker_metrics.PreemptionCounts.take_back_waits"><code class="docutils literal notranslate"><span class="pre">PreemptionCounts.take_back_waits</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.worker_metrics.PreemptionCounts.take_backs"><code class="docutils literal notranslate"><span class="pre">PreemptionCounts.take_backs</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.worker.worker_metrics.PreemptionCounts.victims"><code class="docutils literal notranslate"><span class="pre">PreemptionCounts.victims</span></code></a></li>
 </ul>
 </li>

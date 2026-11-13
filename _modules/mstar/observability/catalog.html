@@ -1117,6 +1117,11 @@ window.runMermaid = runMermaid;</script>
     <span class="s2">"running requests also hold; the cache frees the others on demand."</span><span class="p">,</span>
     <span class="p">(</span><span class="s2">"component"</span><span class="p">,</span> <span class="s2">"resource"</span><span class="p">),</span>
 <span class="p">)</span>
+<span class="n">KV_PAGES_LENT</span> <span class="o">=</span> <span class="n">Family</span><span class="p">(</span>
+    <span class="s2">"mstar_kv_pages_lent"</span><span class="p">,</span> <span class="n">GAUGE</span><span class="p">,</span>
+    <span class="s2">"Pages of a paged KV cache that guaranteed requests lent that aren't free."</span><span class="p">,</span>
+    <span class="p">(</span><span class="s2">"component"</span><span class="p">,</span> <span class="s2">"resource"</span><span class="p">),</span>
+<span class="p">)</span>
 <span class="n">STEP_SECONDS</span> <span class="o">=</span> <span class="n">Family</span><span class="p">(</span>
     <span class="s2">"mstar_step_seconds"</span><span class="p">,</span> <span class="n">HISTOGRAM</span><span class="p">,</span>
     <span class="s2">"Engine steps: from the later of the step's hand-off to the GPU thread and "</span>
@@ -1146,7 +1151,7 @@ window.runMermaid = runMermaid;</script>
 <span class="p">)</span>
 <span class="n">KV_PREEMPTIONS</span> <span class="o">=</span> <span class="n">Family</span><span class="p">(</span>
     <span class="s2">"mstar_kv_preemptions_total"</span><span class="p">,</span> <span class="n">COUNTER</span><span class="p">,</span>
-    <span class="s2">"Requests chosen to move to the host or drop when an older request's grant, or their own, ran short of KV pages."</span><span class="p">,</span>
+    <span class="s2">"Requests chosen to move to the host or drop when another request's grant, or their own, ran short of KV pages."</span><span class="p">,</span>
     <span class="p">(</span><span class="s2">"component"</span><span class="p">,),</span>
 <span class="p">)</span>
 <span class="n">KV_DROPS</span> <span class="o">=</span> <span class="n">Family</span><span class="p">(</span>
@@ -1173,6 +1178,16 @@ window.runMermaid = runMermaid;</script>
     <span class="s2">"mstar_kv_returns_preempted_total"</span><span class="p">,</span> <span class="n">COUNTER</span><span class="p">,</span>
     <span class="s2">"Requests preempted again before they sampled a token since they were last preempted. Only requests that "</span>
     <span class="s2">"keep a rebuild log are counted."</span><span class="p">,</span>
+    <span class="p">(</span><span class="s2">"component"</span><span class="p">,),</span>
+<span class="p">)</span>
+<span class="n">KV_TAKE_BACKS</span> <span class="o">=</span> <span class="n">Family</span><span class="p">(</span>
+    <span class="s2">"mstar_kv_take_backs_total"</span><span class="p">,</span> <span class="n">COUNTER</span><span class="p">,</span>
+    <span class="s2">"Preempted requests that moved so a guaranteed request could take back pages it lent."</span><span class="p">,</span>
+    <span class="p">(</span><span class="s2">"component"</span><span class="p">,),</span>
+<span class="p">)</span>
+<span class="n">KV_TAKE_BACK_WAITS</span> <span class="o">=</span> <span class="n">Family</span><span class="p">(</span>
+    <span class="s2">"mstar_kv_take_back_waits_total"</span><span class="p">,</span> <span class="n">COUNTER</span><span class="p">,</span>
+    <span class="s2">"Waits by guaranteed requests to take back pages they lent, since no request holding them could move."</span><span class="p">,</span>
     <span class="p">(</span><span class="s2">"component"</span><span class="p">,),</span>
 <span class="p">)</span>
 <span class="n">COMPONENT_PENDING_STEPS</span> <span class="o">=</span> <span class="n">Family</span><span class="p">(</span>
@@ -1230,9 +1245,10 @@ window.runMermaid = runMermaid;</script>
 <span class="c1">#: conductor sums the workers' series and forwards them in its status message.</span>
 <span class="n">WORKER_FAMILIES</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Family</span><span class="p">]</span> <span class="o">=</span> <span class="p">{</span>
     <span class="n">f</span><span class="o">.</span><span class="n">name</span><span class="p">:</span> <span class="n">f</span> <span class="k">for</span> <span class="n">f</span> <span class="ow">in</span> <span class="p">(</span>
-        <span class="n">KV_PAGES_USED</span><span class="p">,</span> <span class="n">KV_PAGES_TOTAL</span><span class="p">,</span> <span class="n">KV_PAGES_CACHED</span><span class="p">,</span> <span class="n">STEP_SECONDS</span><span class="p">,</span> <span class="n">BATCH_SIZE</span><span class="p">,</span>
+        <span class="n">KV_PAGES_USED</span><span class="p">,</span> <span class="n">KV_PAGES_TOTAL</span><span class="p">,</span> <span class="n">KV_PAGES_CACHED</span><span class="p">,</span> <span class="n">KV_PAGES_LENT</span><span class="p">,</span> <span class="n">STEP_SECONDS</span><span class="p">,</span> <span class="n">BATCH_SIZE</span><span class="p">,</span>
         <span class="n">PREFIX_CACHE_QUERY_TOKENS</span><span class="p">,</span> <span class="n">PREFIX_CACHE_HIT_TOKENS</span><span class="p">,</span> <span class="n">KV_PREEMPTIONS</span><span class="p">,</span> <span class="n">KV_DROPS</span><span class="p">,</span> <span class="n">KV_REBUILD_TOKENS</span><span class="p">,</span>
-        <span class="n">KV_PREEMPTED_AGAIN</span><span class="p">,</span> <span class="n">KV_RETURNS_PREEMPTED</span><span class="p">,</span> <span class="n">KV_REBUILD_CACHED_PAGES</span><span class="p">,</span> <span class="n">COMPONENT_PENDING_STEPS</span><span class="p">,</span>
+        <span class="n">KV_PREEMPTED_AGAIN</span><span class="p">,</span> <span class="n">KV_RETURNS_PREEMPTED</span><span class="p">,</span> <span class="n">KV_TAKE_BACKS</span><span class="p">,</span> <span class="n">KV_TAKE_BACK_WAITS</span><span class="p">,</span> <span class="n">KV_REBUILD_CACHED_PAGES</span><span class="p">,</span>
+        <span class="n">COMPONENT_PENDING_STEPS</span><span class="p">,</span>
         <span class="n">REBUILD_HOST_BYTES_USED</span><span class="p">,</span> <span class="n">REBUILD_HOST_BYTES_TOTAL</span><span class="p">,</span>
         <span class="n">TRANSFER_BYTES</span><span class="p">,</span> <span class="n">TRANSFERS</span><span class="p">,</span> <span class="n">TRANSFER_SECONDS</span><span class="p">,</span>
     <span class="p">)</span>

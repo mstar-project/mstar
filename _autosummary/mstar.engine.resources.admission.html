@@ -747,6 +747,7 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.admission.Admission.admit_waiting"><code class="docutils literal notranslate"><span class="pre">Admission.admit_waiting()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.admission.Admission.admitted"><code class="docutils literal notranslate"><span class="pre">Admission.admitted()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.admission.Admission.newer_than"><code class="docutils literal notranslate"><span class="pre">Admission.newer_than()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.admission.Admission.older_than"><code class="docutils literal notranslate"><span class="pre">Admission.older_than()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.admission.Admission.readmit"><code class="docutils literal notranslate"><span class="pre">Admission.readmit()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.admission.Admission.refusals"><code class="docutils literal notranslate"><span class="pre">Admission.refusals()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.admission.Admission.remove_request"><code class="docutils literal notranslate"><span class="pre">Admission.remove_request()</span></code></a></li>
@@ -875,6 +876,20 @@ these costs one <cite>Resource.grew_since</cite> for each such resource, mark an
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)">list</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>] | None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.admission.Admission.older_than">
+<span class="sig-name descname"><span class="pre">older_than</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">rid</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/admission.html#Admission.older_than"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.admission.Admission.older_than" title="Link to this definition">#</a></dt>
+<dd><p>The requests numbered before <code class="docutils literal notranslate"><span class="pre">rid</span></code>, newest first, or none when the conductor gave <code class="docutils literal notranslate"><span class="pre">rid</span></code> no number.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>rid</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)">list</a>[<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a>]</p>
 </dd>
 </dl>
 </dd></dl>
@@ -1039,6 +1054,7 @@ mark that resource returned.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.admission.Admission.admit_waiting"><code class="docutils literal notranslate"><span class="pre">Admission.admit_waiting()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.admission.Admission.admitted"><code class="docutils literal notranslate"><span class="pre">Admission.admitted()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.admission.Admission.newer_than"><code class="docutils literal notranslate"><span class="pre">Admission.newer_than()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.admission.Admission.older_than"><code class="docutils literal notranslate"><span class="pre">Admission.older_than()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.admission.Admission.readmit"><code class="docutils literal notranslate"><span class="pre">Admission.readmit()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.admission.Admission.refusals"><code class="docutils literal notranslate"><span class="pre">Admission.refusals()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.admission.Admission.remove_request"><code class="docutils literal notranslate"><span class="pre">Admission.remove_request()</span></code></a></li>
