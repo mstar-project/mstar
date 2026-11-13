@@ -16,8 +16,7 @@ model_kwargs:
 resources:
   talker_attn:
     flashinfer_backend: fa2
-  # ~66 pages a clone (see configs/qwen3tts_base.yaml): 2304 admit 34 and fit an
-  # 80 GB GPU beside the other two workers. Raise it on a larger GPU (4608 admit 69).
+  # Sized as in configs/qwen3tts_base.yaml; fits an 80 GB GPU beside the other two workers.
   talker_kv:
     max_num_pages: 2304
   codec_state:
