@@ -822,6 +822,8 @@ class KeptWindowBinding(OpBinding):
         if read.queries is not None:
             raise _no_layout(array, f"reads[{key!r}].queries must be None, since the window is cut per row of its "
                                     "own array")
+        if read.mask.last_first:
+            raise _no_layout(array, f"reads[{key!r}].mask.last_first, and the paged pool keeps a step's adds in order")
 
     def retention(self, key: str, layout: Layout) -> RetentionPolicy:
         kept = layout.kept_windows.get(key)
@@ -2687,7 +2689,8 @@ class BoundedStorage(Storage):
             else:
                 lengths = array.start_lengths
                 window = {"min_source_len": lengths[0], "max_source_len": lengths[-1],
-                          "retention": functools.partial(_kept_at, array.kept_windows[key])}
+                          "retention": functools.partial(_kept_at, array.kept_windows[key]),
+                          "reverse_step_order": read.mask.last_first}
             resolved.specs[array.name] = [BoundedKVSpec(
                 resource_key=array.name, nodes=array.nodes,
                 config=BoundedKVConfig(

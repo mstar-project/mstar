@@ -60,6 +60,7 @@ SNAPSHOT = {
     ],
     "Bidirectional": [
         ["kept_window", "KEYWORD_ONLY", 'False'],
+        ["last_first", "KEYWORD_ONLY", 'False'],
     ],
     "Block": [],
     "BlockCausal": [

@@ -127,17 +127,22 @@ class Bidirectional(Mask):
     ``window`` of them, sizes the request's layout gives per read in ``Layout.kept_windows``, or on an unbounded array
     ``Array.kept_windows`` grown by the length of the row's start. There the read takes ``distance_bias``, (rows,
     q_heads, T, R), whose entry d + T - 1 adds to the score of the key at distance d, negative for the step's later
-    entries."""
+    entries. With ``last_first`` each step's adds join the kept entries last-first, so a cut keeps the entries a step
+    adds first the longest; the mask ignores their order, which shows only in what the window keeps."""
 
     uses_query_position = False
     sees_step_whole = True
 
     _: KW_ONLY
     kept_window: bool = False
+    last_first: bool = False
 
     def __post_init__(self):
-        if type(self.kept_window) is not bool:
-            raise ValueError(f"Bidirectional.kept_window must be a bool, got {self.kept_window!r}")
+        for name in ("kept_window", "last_first"):
+            if type(getattr(self, name)) is not bool:
+                raise ValueError(f"Bidirectional.{name} must be a bool, got {getattr(self, name)!r}")
+        if self.last_first and not self.kept_window:
+            raise ValueError("Bidirectional.last_first orders what a kept window cuts, and kept_window is False")
 
 
 @dataclass(frozen=True)

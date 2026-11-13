@@ -784,7 +784,9 @@ deployment YAML tunes them under ``resources:`` (see :ref:`Step 6 <config-yaml>`
   where they live, as a voice prompt every request in the voice reads. ``start_lengths`` is the
   range of lengths a start may have, and ``kept_windows`` gives the read's base
   ``KeptWindow(sink, window=, grows=)``, whose ``grows`` side, ``"sink"`` or ``"window"``, adds
-  the start's length; either side may be 0. The handle takes the starts once at bind
+  the start's length; either side may be 0. ``Bidirectional(kept_window=True, last_first=True)``
+  joins each step's adds to the kept entries last-first, for attention that ignores key order, so
+  a cut keeps the entries a step adds first the longest. The handle takes the starts once at bind
   (``set_starts``, each field ``(layers, n, *shape)``), and each step names each row's by index
   (``ArrayStep.starts``), which a region's step takes from the open step. Its ``distance_bias``
   is ``(rows, q_heads, T, R)``, whose entry ``d + T - 1`` adds to the key at distance ``d``.
