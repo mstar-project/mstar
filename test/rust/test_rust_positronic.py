@@ -8,6 +8,7 @@ import re
 import subprocess
 import tempfile
 import threading
+import time
 
 import msgpack
 import numpy as np
@@ -222,4 +223,20 @@ def test_malformed_binary_frame_fails_in_both_frontends():
                 ws.recv()
             assert close.value.rcvd.code == 1011
     assert py == rs == {"status": "error", "error": "invalid msgpack request"}
+    assert stub.ended == [py_id, rust_id]
+
+
+def test_closing_without_end_session_releases_each_connection_once():
+    stub = Stub()
+    with rust(stub) as port:
+        entrypoint.api_server = stub
+        with TestClient(entrypoint.app).websocket_connect("/api/v1/session") as ws:
+            ws.receive_bytes()
+            py_id = msgpack.unpackb(ws.receive_bytes())["session_id"]
+        with websockets.sync.client.connect(f"ws://127.0.0.1:{port}/api/v1/session", compression=None) as ws:
+            ws.recv()
+            rust_id = msgpack.unpackb(ws.recv())["session_id"]
+        deadline = time.monotonic() + 2
+        while len(stub.ended) < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
     assert stub.ended == [py_id, rust_id]
