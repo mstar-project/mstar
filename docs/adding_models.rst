@@ -908,6 +908,21 @@ The spec types are:
        ``prefix_cache: true`` is refused. It doesn't fork, serve a node on another instance
        (replicas included) or hand out
        ``write_slots`` yet either; each of these is refused.
+   * - ``CSASpec(config=CSAConfig(kv_cache=..., topk=...))``
+     - Compressed sparse attention (CSA) over the named ``KVLayout.MLA`` cache, for a layer
+       that attends a short window of its own recent rows plus a few rows of a compressed
+       cache in one softmax, with a learned sink logit per head in the denominator
+       (DeepSeek-V4.1). A compressed source that pools ``ratio`` tokens keeps a group's latent
+       and index key in the cache row of the group's last token, so the cache keeps the token
+       page table; the keys sit in the aux planes ``INDEX_PLANES`` (``csa.config``) the model
+       declares on its ``PagedKVConfig``, ``index_head_dim`` wide (checked at build). A step
+       declares ``CSAStep()``; ``plan`` reads its rows off the KV plan, and the layers write
+       keys, score, select and attend through the resource (``write_index``, ``scores``,
+       ``candidates``, ``select``, ``attend``). ``select`` takes each row's top ``topk`` groups,
+       equal scores to the earlier one, optionally inside a ``candidates`` mask of best blocks
+       (a two-level selection); ``attend`` takes the window rows from the model, which keeps
+       them wherever it likes (a recurrent pool block, for one). The torch reference: eager
+       only, no captured graphs.
    * - ``DSASpec(config=DSAConfig(kv_cache=..., topk=...))``
      - DeepSeek sparse attention (DSA) over the named ``KVLayout.MLA`` cache: past ``topk``
        keys, each query row attends only the ``topk`` tokens its indexer scores highest.
@@ -2994,6 +3009,10 @@ that a misspelled setting is never silently ignored:
        ``max_segments_per_step``, ``max_tokens_per_request``. The ceilings size CUDA-graph
        buckets, which is a memory-against-coverage trade the deployment makes, not the model.
        A resource sized per step refuses ``max_segments_per_request``, which it would ignore.
+   * - ``CSASpec``
+     - ``score_bytes`` (bytes of fp32 scores one selection launch holds), ``attend_bytes``
+       (bytes of gathered rows one attention launch holds); each a positive integer, 256 MiB
+       by default.
    * - ``DSASpec``
      - ``workspace_mb`` (MiB each FlashInfer workspace of its sparse plans starts at; one per
        walk and capture slot, one for eager steps), ``prefill_score_bytes`` (bytes of fp32
