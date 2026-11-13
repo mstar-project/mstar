@@ -673,6 +673,8 @@ class OpBinding:
     takes_queries: ClassVar[bool] = True
     # whether `retention` gives a policy, so a request's layout sizes the pages under the read
     keeps_window: ClassVar[bool] = False
+    # whether the read runs a plan its step builds, so its resource has a spec and its calls need the step open
+    plans: ClassVar[bool] = True
 
     @property
     def kept_window_binding(self) -> "OpBinding | None":
@@ -1081,8 +1083,6 @@ class WithinStepAttend(OpBinding, ABC):
     kernel_settings = frozenset({
         "max_segments_per_request", "max_segments_per_step", "compile_op", "workspace_mb", "backend",
     })
-    # whether the read runs a plan its step builds, so its resource has a spec and its calls need the step open
-    plans: ClassVar[bool]
 
     def check(self, array: Array, key: str, read: Read) -> None:
         if not isinstance(read.mask, Block):
@@ -1099,7 +1099,6 @@ class RaggedAttend(WithinStepAttend):
     """`Attend` within a step, on a ragged resource that the reads of one kind, nodes and config share."""
 
     read_back = frozenset({"max_segments_per_request", "max_segments_per_step"})
-    plans = True
 
     def attend(self, run: Any, label: str, rows: "RowLayout") -> Callable[..., torch.Tensor]:
         return functools.partial(joint_attention, ragged=functools.partial(run.run, label=label))
