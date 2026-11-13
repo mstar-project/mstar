@@ -142,6 +142,10 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
             state=state,
         )
 
+    def step_is_input_free(self, graph_walk: str) -> bool:
+        # every decode row spans one block, as the capture's template row does, and declares nothing else
+        return graph_walk == "decode"
+
     # ── capture configs ──
 
     def _moe_resolved_fused(self) -> bool:
