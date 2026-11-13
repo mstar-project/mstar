@@ -232,7 +232,11 @@ def _resource_imports(source: str) -> set[tuple[str, str]]:
 @pytest.mark.parametrize("path", _sources(), ids=str)
 def test_a_ported_package_reaches_the_engine_only_through_the_contract(path):
     found, _ = _violations(path.read_text(), str(path))
-    assert not found, f"{path} reaches past the contract: {found}"
+    assert not found, (
+        f"{path} reaches past the contract: {found}. Reach the engine through `mstar.engine.state`. An import a model "
+        "can't avoid goes in ALLOWED with its reason, and state the contract can't declare yet needs its mask or op "
+        "and binding in adapters.py first."
+    )
 
 
 def test_every_exception_is_still_used():
