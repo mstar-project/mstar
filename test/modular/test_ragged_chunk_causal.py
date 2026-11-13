@@ -207,6 +207,33 @@ def test_graph_mode_padding_is_isolated():
     assert dense[n:, n:].all(), "padding rows must attend something, or they divide by zero"
 
 
+def test_failed_graph_stage_retries_the_same_layout(monkeypatch):
+    first = KERNEL_LAYOUT
+    second = layout_of(24, 8, 2, 8, 6)
+    w = planned_mask([first], 128, False, length=first.span,
+                     accelerator_graph=True, max_num_segments=1)
+    stage = w._stage
+    calls = 0
+
+    def fail_after_tags(buffer, array):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("stage failed")
+        stage(buffer, array)
+
+    monkeypatch.setattr(w, "_stage", fail_after_tags)
+    with pytest.raises(RuntimeError, match="stage failed"):
+        w.plan([second])
+    monkeypatch.setattr(w, "_stage", stage)
+    w.plan([second])
+
+    dense = dense_from_block_mask(w.block_mask, first.span)
+    assert torch.equal(dense[:second.span, :second.span], dense_visibility([second]))
+    assert not dense[:second.span, second.span:].any()
+    assert not dense[second.span:, :second.span].any()
+
+
 # --- negative controls: wrong masks the checks must reject --------------------
 
 def test_plain_block_causal_is_rejected():

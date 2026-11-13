@@ -15,9 +15,7 @@ for a clean token of chunk ``c`` and ``2c + 2`` for a noised one. The whole
 rule is then four integer tests on two tags (``chunk_causal_visible``), the
 same function the host evaluates per run to list tiles and the kernel
 evaluates per pair inside one. One tag per token rather than a table per
-property: inside a partial tile the kernel gathers each table per score, and
-the Praxis-1 reference packed its mask into one code per token the same way
-after comparing the two on B200.
+property lets the same predicate serve both tile planning and kernel masking.
 
 Unlike ``attn.flex``'s ring mask, this ``mask_mod`` is the exact predicate, so
 eager and compiled ``flex_attention`` agree; the compile is for speed and for
@@ -294,28 +292,37 @@ class FlexChunkCausalWrapper:
         else:
             length = total
         starts, ends, tags = chunk_causal_runs(layouts, length)
-        self._num_segments = len(layouts)
-        self._planned = layouts
         if length == 0:
             self._length, self.block_mask, self._tags = 0, None, None
+            self._num_segments = len(layouts)
+            self._planned = layouts
             return
         _, partial, full = chunk_causal_blocks(starts, ends, tags, length, self.block_size, self.full_blocks)
         kv_num, kv_idx = _packed(partial)
         full_num, full_idx = _packed(full) if full is not None else (None, None)
         token_tags = np.repeat(tags, ends - starts)
         if not self.accelerator_graph:
-            self._length = length
-            self._tags = self._to_device(token_tags)
-            self.block_mask = self._mask_over(
-                self._tags, length, *(self._to_device(a) for a in (kv_num, kv_idx, full_num, full_idx)),
+            device_tags = self._to_device(token_tags)
+            block_mask = self._mask_over(
+                device_tags, length, *(self._to_device(a) for a in (kv_num, kv_idx, full_num, full_idx)),
             )
+            self._length = length
+            self._tags = device_tags
+            self.block_mask = block_mask
+            self._num_segments = len(layouts)
+            self._planned = layouts
             return
         mask = self.block_mask
+        # A partial stage invalidates the old mask, even if the failed plan is
+        # retried with the old layout.
+        self._planned = None
         self._stage(self._tags, token_tags)
         self._stage(mask.kv_num_blocks, kv_num)
         self._stage(mask.kv_indices, kv_idx)
         self._stage(mask.full_kv_num_blocks, full_num)
         self._stage(mask.full_kv_indices, full_idx)
+        self._num_segments = len(layouts)
+        self._planned = layouts
 
     @torch.compiler.disable
     def run(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, return_lse: bool = False) -> torch.Tensor:
@@ -406,4 +413,3 @@ def dense_visibility(layouts: Sequence[ChunkCausalLayout]) -> torch.Tensor:
     starts, ends, tags = chunk_causal_runs(layouts, sum(lay.span for lay in layouts))
     t = torch.from_numpy(np.repeat(tags, ends - starts))
     return chunk_causal_visible(t[:, None], t[None, :])
-
