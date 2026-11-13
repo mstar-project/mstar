@@ -290,6 +290,33 @@ def test_kv_labels_may_name_only_declared_arrays():
     assert problem.startswith("kv_labels()['other']") and "no declared array" in problem
 
 
+def _kept(**overrides) -> Array:
+    return _array(reads={"gen": _read(mask=Bidirectional(kept_window=True))}, **overrides)
+
+
+@pytest.mark.parametrize("labels, kv_labels, missing", [
+    ({"main"}, {}, "['main']"),
+    ({"main", "cfg"}, {"kv": {"main": KVLabel()}}, "['cfg']"),
+], ids=["no pool", "a label left out"])
+def test_every_label_of_a_kept_window_array_must_be_in_kv_labels(labels, kv_labels, missing):
+    """Only a request's layout sizes a kept window, and the conductor refuses a request that opens a label with no
+    layout only on the pools ``kv_labels`` names. A label left out could open with no window, and the read would
+    reach every entry the request ever wrote, with no error."""
+    problem = _one_problem(_kept(labels=labels), kv_labels=kv_labels)
+    assert problem == (
+        f"Array 'kv'.reads['gen'] keeps a window, and labels {missing} aren't in kv_labels()['kv'], so a request "
+        "could open them with no layout and reads['gen'] would reach every entry; add them to kv_labels()['kv']"
+    )
+
+
+def test_a_kept_window_array_with_every_label_in_kv_labels_has_no_problem():
+    assert state_declaration_problems(_StubModel(_kept(), kv_labels={"kv": {"main": KVLabel()}})) == []
+
+
+def test_an_array_that_keeps_no_window_may_stay_out_of_kv_labels():
+    assert state_declaration_problems(_StubModel(_array(reads={"gen": _read(mask=Bidirectional())}))) == []
+
+
 def test_a_sampler_node_must_be_in_the_model():
     problem = _one_problem(Sampler("s", nodes={"talker"}, vocab_size=8))
     assert problem.startswith("Sampler 's'.nodes") and "'talker' is not a node" in problem

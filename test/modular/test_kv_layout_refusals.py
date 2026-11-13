@@ -15,6 +15,8 @@ from test_kv_layout_intake import LAYOUT, _conduct, _Model, _preprocess
 
 from mstar.conductor.conductor import Conductor
 from mstar.engine.resources.kv.config import KVReqConfig, KVSpec, PagedKVConfig
+from mstar.engine.state import Array, Bidirectional, KVEntry, Read
+from mstar.engine.state.analysis import state_declaration_problems
 from mstar.graph.base import GraphNode, Loop
 from mstar.model.base import KVLabel, LabelLayout, Span
 from mstar.testing_utils.model import StubModel, make_model
@@ -92,6 +94,39 @@ def test_a_request_laid_out_wrong_fails_with_a_500(tmp_path, monkeypatch, caplog
     assert message in logged
     assert not [msg for msg in sent if getattr(msg.message_type, "name", "") == "NEW_REQUEST"], (
         "a worker heard of a request the conductor refused"
+    )
+
+
+class _Windowed(_Model):
+    """Reads ``kv`` through a kept window, which only a request's layout sizes."""
+
+    def declare_state(self):
+        return [Array("kv", nodes={"llm"}, layers={0}, entry=KVEntry(heads=1, head_dim=8), max_len=4096,
+                      labels={"main", "uncond"}, reads={"attn": Read(mask=Bidirectional(kept_window=True))})]
+
+    def get_node_resources(self):
+        return []
+
+    def kv_labels(self):
+        return {"kv": {"main": KVLabel(), "uncond": KVLabel()}}
+
+
+def test_a_windowed_label_opened_with_no_layout_fails_with_a_500(tmp_path, monkeypatch, caplog):
+    """A request that keeps no window would have its kept-window read reach every entry it wrote, and a request
+    served from a captured graph runs no step that could notice. So it is refused once, before a worker opens it."""
+    model = _Windowed(layout=None)
+    assert state_declaration_problems(model) == [], "the model was refused at load, before any request"
+    kwargs = _preprocess(model, {"max_output_tokens": 30})
+
+    sent = _conduct(model, kwargs, tmp_path, monkeypatch).sent
+
+    [failure] = [msg.body for msg in sent if getattr(msg, "message_type", None) == "request_failed"]
+    match = re.fullmatch(r"Ingest failed: internal error \(error id ([0-9a-f]{12})\)", failure.error_message)
+    assert failure.status == 500 and match, f"the request failed with {failure.status}: {failure.error_message}"
+    [logged] = [r.getMessage() for r in caplog.records if f"[error id {match.group(1)}]" in r.getMessage()]
+    assert "returned no kv_layout for 'kv'/'main', which the request opens" in logged
+    assert not [msg for msg in sent if getattr(msg.message_type, "name", "") == "NEW_REQUEST"], (
+        "a worker heard of a request that keeps no window"
     )
 
 
