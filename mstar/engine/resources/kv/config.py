@@ -461,7 +461,10 @@ class RingKVConfig(KVConfig):
         if self.max_frames is not None and not (type(self.max_frames) is int and self.max_frames >= 1):
             raise ValueError(f"max_frames must be None or a positive int; got {self.max_frames!r}")
 
-    def capacity_problem(self, spec: "KVSpec", requests: int, request: "KVReqConfig | None") -> str | None:
+    def capacity_problem(
+        self, spec: "KVSpec", requests: int, request: "KVReqConfig | None",
+        axis_sizes: Sequence[Mapping[str, int]] = (),
+    ) -> str | None:
         """A request holds a session from its first step until it is torn down. Sessions past the cap are allocated
         and never filled, which is only a warning."""
         if requests > self.num_sessions:
