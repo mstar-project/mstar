@@ -251,7 +251,6 @@
 </details></li>
 <li class="toctree-l2 has-children"><a class="reference internal" href="_autosummary/mstar.engine.html">mstar.engine</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.engine.accelerator_graph_backend.html">mstar.engine.accelerator_graph_backend</a></li>
-<li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.engine.accelerator_graph_config.html">mstar.engine.accelerator_graph_config</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.engine.chunking.html">mstar.engine.chunking</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.engine.fp32_precision.html">mstar.engine.fp32_precision</a></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.engine.node_dtype.html">mstar.engine.node_dtype</a></li>
@@ -271,14 +270,6 @@
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.sequence_shard.html">mstar.engine.resources.sequence_shard</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.spec.html">mstar.engine.resources.spec</a></li>
 <li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.resources.step.html">mstar.engine.resources.step</a></li>
-</ul>
-</details></li>
-<li class="toctree-l3 has-children"><a class="reference internal" href="_autosummary/mstar.engine.state.html">mstar.engine.state</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
-<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.state.analysis.html">mstar.engine.state.analysis</a></li>
-<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.state.calls.html">mstar.engine.state.calls</a></li>
-<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.state.contract.html">mstar.engine.state.contract</a></li>
-<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.state.host_fields.html">mstar.engine.state.host_fields</a></li>
-<li class="toctree-l4"><a class="reference internal" href="_autosummary/mstar.engine.state.state_op.html">mstar.engine.state.state_op</a></li>
 </ul>
 </details></li>
 <li class="toctree-l3"><a class="reference internal" href="_autosummary/mstar.engine.windowing.html">mstar.engine.windowing</a></li>
@@ -1499,9 +1490,9 @@ separate from log positions: a kept step advances it by each row’s advance, a 
 it, and a prefix hit advances it over the skipped spans.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">Sampler(name,</span> <span class="pre">nodes=,</span> <span class="pre">vocab_size=,</span> <span class="pre">penalty=,</span> <span class="pre">min_p=,</span> <span class="pre">eos_ids=,</span> <span class="pre">draws=)</span></code>. <code class="docutils literal notranslate"><span class="pre">penalty</span></code> and
 <code class="docutils literal notranslate"><span class="pre">min_p</span></code> declare capabilities, not intentions: each selects which kernel variant is
-recorded into the captured graph. <code class="docutils literal notranslate"><span class="pre">draws</span></code> is how many times each step that lists the
-sampler calls <code class="docutils literal notranslate"><span class="pre">sample</span></code>. Each call is a fresh draw that advances each kept row’s sampling
-state. Log-probs and a device loop-back take one token per step, so loading refuses both
+recorded into the captured graph. <code class="docutils literal notranslate"><span class="pre">draws</span></code> is how many draws each step that lists the
+sampler makes, by <code class="docutils literal notranslate"><span class="pre">sample</span></code> or <code class="docutils literal notranslate"><span class="pre">drew</span></code>. Each is a fresh draw that advances each kept row’s
+sampling state. Log-probs and a device loop-back take one token per step, so loading refuses both
 above one draw.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">SeqShard(name,</span> <span class="pre">nodes=,</span> <span class="pre">labels=,</span> <span class="pre">walks=,</span> <span class="pre">exchange=)</span></code>: the node’s steps may split over its
 SP ranks. It extends the state contract of #1232 to sequence parallelism, and the engine
@@ -1575,10 +1566,22 @@ not each segment.</p>
 <span class="pre">label,</span> <span class="pre">layer)</span></code> reads them, and <code class="docutils literal notranslate"><span class="pre">ArrayStep(host={(row,</span> <span class="pre">label,</span> <span class="pre">layer):</span> <span class="pre">{field:</span> <span class="pre">value}})</span></code> writes
 them when the step commits, so the next step’s <code class="docutils literal notranslate"><span class="pre">prepare_inputs</span></code> sees the write and a step that
 never ran changes nothing.</p>
+<p>A <code class="docutils literal notranslate"><span class="pre">Value</span></code> with tensor fields and no <code class="docutils literal notranslate"><span class="pre">updates</span></code> holds state the model reads and writes whole
+per row, <code class="docutils literal notranslate"><span class="pre">Value(name,</span> <span class="pre">nodes=,</span> <span class="pre">layers={0},</span> <span class="pre">entry=Entry({&quot;tail&quot;:</span> <span class="pre">TensorType((8,</span> <span class="pre">3),</span> <span class="pre">dtype=torch.float32),</span>
+<span class="pre">&quot;count&quot;:</span> <span class="pre">TensorType((),</span> <span class="pre">dtype=torch.int64)}))</span></code>, where a shape of <code class="docutils literal notranslate"><span class="pre">()</span></code> is one scalar per entry.
+<code class="docutils literal notranslate"><span class="pre">h.read(layer).fields[f]</span></code> is <code class="docutils literal notranslate"><span class="pre">[rows,</span> <span class="pre">*shape]</span></code> in the step’s row order, padding rows included, in
+tensors the caller owns, so a captured forward may write them in place. A row with nothing written
+yet, at span 0 or that pads the step reads its start: <code class="docutils literal notranslate"><span class="pre">h.set_start({f:</span> <span class="pre">tensor})</span></code> in <code class="docutils literal notranslate"><span class="pre">bind_state</span></code>
+takes tensors of one entry’s shape, made at load, and zeros stand in for a field it doesn’t name.
+<code class="docutils literal notranslate"><span class="pre">h.write(layer,</span> <span class="pre">**fields)</span></code> writes the rows’ entries in place where the forward runs it, in an eager
+step or a replay, so a step refused after a write keeps it in the slots its rows already held. In a
+step, a layer’s reads come before its write, a field takes one write, and each row at span 1 or more
+gets every field from the step’s own write. Such a <code class="docutils literal notranslate"><span class="pre">Value</span></code> takes no <code class="docutils literal notranslate"><span class="pre">keep=False</span></code> and sits on no
+node with prefix keys. Parakeet’s transducer state and both speech codecs are the examples.</p>
 <p><code class="docutils literal notranslate"><span class="pre">kernel_settings(self)</span></code> is a temporary hook for what the engine doesn’t pick itself yet:
-<code class="docutils literal notranslate"><span class="pre">splits</span></code> and <code class="docutils literal notranslate"><span class="pre">decode_fmha</span></code> on a read, <code class="docutils literal notranslate"><span class="pre">splits</span></code> on a <code class="docutils literal notranslate"><span class="pre">GatedDeltaNet</span></code>, and
-<code class="docutils literal notranslate"><span class="pre">max_segments_per_request</span></code>, <code class="docutils literal notranslate"><span class="pre">max_segments_per_step</span></code>, <code class="docutils literal notranslate"><span class="pre">compile_op</span></code> and <code class="docutils literal notranslate"><span class="pre">workspace_mb</span></code> on a
-<code class="docutils literal notranslate"><span class="pre">Block</span></code> read. Under an array’s name it sets the default size of the array’s pool, <code class="docutils literal notranslate"><span class="pre">max_num_pages</span></code>
+<code class="docutils literal notranslate"><span class="pre">splits</span></code>, <code class="docutils literal notranslate"><span class="pre">decode_fmha</span></code> and <code class="docutils literal notranslate"><span class="pre">decode_tensor_cores</span></code> on a read of an array that keeps entries,
+<code class="docutils literal notranslate"><span class="pre">splits</span></code> on a <code class="docutils literal notranslate"><span class="pre">GatedDeltaNet</span></code>, and <code class="docutils literal notranslate"><span class="pre">max_segments_per_request</span></code>, <code class="docutils literal notranslate"><span class="pre">max_segments_per_step</span></code>,
+<code class="docutils literal notranslate"><span class="pre">compile_op</span></code> and <code class="docutils literal notranslate"><span class="pre">workspace_mb</span></code> on a <code class="docutils literal notranslate"><span class="pre">Block</span></code> read. Under an array’s name it sets the default size of the array’s pool, <code class="docutils literal notranslate"><span class="pre">max_num_pages</span></code>
 on a paged array and <code class="docutils literal notranslate"><span class="pre">max_slots</span></code> on a <code class="docutils literal notranslate"><span class="pre">Value</span></code> with tensor fields, which a deployment’s
 <code class="docutils literal notranslate"><span class="pre">resources:</span></code> block overrides. It refuses anything else.</p>
 <section id="resource-specs">
@@ -1692,7 +1695,7 @@ workspace, taken at build.
 (default <code class="docutils literal notranslate"><span class="pre">True</span></code>) runs one-token decode rows on FlashInfer’s tensor-core
 kernel; <code class="docutils literal notranslate"><span class="pre">False</span></code> picks the CUDA-core decode kernel, which can be faster for
 MHA and narrow GQA (few query heads per KV head). Measure before changing it:
-Whisper, Qwen3-ASR and Qwen3-TTS declare <code class="docutils literal notranslate"><span class="pre">False</span></code>. <code class="docutils literal notranslate"><span class="pre">decode_fmha</span></code> (default <code class="docutils literal notranslate"><span class="pre">False</span></code>) runs
+Whisper declares <code class="docutils literal notranslate"><span class="pre">False</span></code>, and Qwen3-ASR and Qwen3-TTS set it in <code class="docutils literal notranslate"><span class="pre">kernel_settings</span></code>. <code class="docutils literal notranslate"><span class="pre">decode_fmha</span></code> (default <code class="docutils literal notranslate"><span class="pre">False</span></code>) runs
 captured one-token decode rows on FlashInfer’s trtllm-gen fmha kernel on Blackwell,
 with no FlashInfer plan per step; a geometry trtllm-gen has no kernel for keeps
 the paged kernel, with a warning. Eager steps and prompt rows stay on the paged
@@ -1862,7 +1865,7 @@ kernel reads the step’s <code class="docutils literal notranslate"><span class
 addressing to fetch, and eager and captured steps reach the same slots. A row with
 no saved state (a request’s first step, or a padding row) reads <code class="docutils literal notranslate"><span class="pre">start</span></code>, zeros
 when none is given. <code class="docutils literal notranslate"><span class="pre">gather</span></code> / <code class="docutils literal notranslate"><span class="pre">scatter_</span></code> need the sink, so leave
-<code class="docutils literal notranslate"><span class="pre">disable_sink_slot</span></code> unset. Parakeet’s transducer decode is the example.</p></td>
+<code class="docutils literal notranslate"><span class="pre">disable_sink_slot</span></code> unset. A model on the contract declares a <code class="docutils literal notranslate"><span class="pre">Value</span></code> instead.</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">SeqShardSpec(labels=...,</span> <span class="pre">axis=...,</span> <span class="pre">walks=None)</span></code></p></td>
 <td><p>Whether a step’s tokens split over the node’s sequence-parallel ranks, and each
@@ -1970,8 +1973,8 @@ plus a <code class="docutils literal notranslate"><span class="pre">DSASpec</spa
 </tr>
 <tr class="row-odd"><td><p>A node that carries per-request state between steps of a loop (an RNN-T
 decoder, recurrent attention)</p></td>
-<td><p>A <code class="docutils literal notranslate"><span class="pre">RecurrentStateSpec</span></code>, read and written with <code class="docutils literal notranslate"><span class="pre">gather</span></code> / <code class="docutils literal notranslate"><span class="pre">scatter_</span></code>, and for
-a linear-attention layer stack a <code class="docutils literal notranslate"><span class="pre">LinearAttnSpec</span></code> over it.</p></td>
+<td><p>A <code class="docutils literal notranslate"><span class="pre">Value</span></code> with tensor fields, read and written whole, and for a linear-attention
+layer stack a <code class="docutils literal notranslate"><span class="pre">Value</span></code> with a <code class="docutils literal notranslate"><span class="pre">GatedDeltaNet</span></code>.</p></td>
 </tr>
 <tr class="row-even"><td><p>A node that samples with two different sets of parameters</p></td>
 <td><p>Two <code class="docutils literal notranslate"><span class="pre">SamplerSpec</span></code> objects that both name the node, under different keys.</p></td>
@@ -3009,9 +3012,9 @@ combine labels today: an array’s handle refuses a step that touches more than 
 of its own, rather than through <code class="docutils literal notranslate"><span class="pre">write_kv</span></code>, asks the KV resource where the step’s tokens go:
 <code class="docutils literal notranslate"><span class="pre">kv.write_target(layer_idx,</span> <span class="pre">label)</span></code> returns <code class="docutils literal notranslate"><span class="pre">(layer</span> <span class="pre">cache,</span> <span class="pre">page</span> <span class="pre">of</span> <span class="pre">each</span> <span class="pre">token,</span> <span class="pre">slot</span> <span class="pre">in</span>
 <span class="pre">page</span> <span class="pre">of</span> <span class="pre">each</span> <span class="pre">token,</span> <span class="pre">number</span> <span class="pre">of</span> <span class="pre">tokens</span> <span class="pre">to</span> <span class="pre">write)</span></code> for the current plan (NHD layout only).
-Tokens past that number are the plan’s padding and must not be written. The fused q/k
-norm, RoPE and KV-write kernel that Qwen3-ASR calls through
-<code class="docutils literal notranslate"><span class="pre">AttentionCallable.norm_rope_attend</span></code> is the example.</p>
+Tokens past that number are the plan’s padding and must not be written. A layer on the
+contract gets the same through a <code class="docutils literal notranslate"><span class="pre">&#64;state_op</span></code>’s <code class="docutils literal notranslate"><span class="pre">target</span></code>, as <code class="docutils literal notranslate"><span class="pre">qk_norm_rope_attend</span></code> in
+<code class="docutils literal notranslate"><span class="pre">mstar/model/components/qwen3_lm.py</span></code> does.</p>
 <p><strong>Testing.</strong> <code class="docutils literal notranslate"><span class="pre">declare_step</span></code> performs only host-side bookkeeping, so you can unit-test it
 on CPU without model weights. <code class="docutils literal notranslate"><span class="pre">test/modular/test_state_ports.py</span></code> compares both ports’ steps
 against hand-written ones, and <code class="docutils literal notranslate"><span class="pre">test/modular/test_resource_runner.py</span></code> tests the runner’s
@@ -3044,7 +3047,7 @@ or drop a step’s adds as a whole, so a step that keeps needs each layer to end
 and a step with <code class="docutils literal notranslate"><span class="pre">keep=False</span></code> refuses <code class="docutils literal notranslate"><span class="pre">keep=True</span></code>.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">read</span></code> sees kept entries from earlier steps, plus this layer’s latest add, at the
 positions its mask reaches. It runs the op the declaration names for the layer.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">write</span></code> overwrites entries in place.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">write</span></code> sets the step’s rows’ entries in place where the forward runs it, not at the step’s commit.</p></li>
 </ul>
 <p>These raise, naming the array and the cause: a call on an array the step doesn’t list or on
 a layer it doesn’t declare, an add after a kept add, an add after a read in the same layer,
@@ -3100,7 +3103,10 @@ predictor’s frame-local KV is scratch.</p>
 <p>A model on the contract reads no <code class="docutils literal notranslate"><span class="pre">node_resources</span></code>, <code class="docutils literal notranslate"><span class="pre">engine_inputs.resources</span></code>,
 <code class="docutils literal notranslate"><span class="pre">request_state</span></code> or <code class="docutils literal notranslate"><span class="pre">per_request_states</span></code>, imports the engine only through
 <code class="docutils literal notranslate"><span class="pre">mstar.engine.state</span></code> and defines no <code class="docutils literal notranslate"><span class="pre">bind_resources</span></code>; <code class="docutils literal notranslate"><span class="pre">test/modular/test_state_lint.py</span></code>
-holds each ported package to that.</p>
+holds each ported package to that.
+Qwen3-TTS’s <code class="docutils literal notranslate"><span class="pre">batch_postprocess</span></code> keeps the opt-in watermark’s per-stream state in
+<code class="docutils literal notranslate"><span class="pre">request_state</span></code> under one named lint exception, until it moves to a watermark node’s plain
+Value (issue #1447).</p>
 <p><code class="docutils literal notranslate"><span class="pre">ModelInputsFromEngine</span></code> carries six other useful fields:</p>
 <ul class="simple">
 <li><p><code class="docutils literal notranslate"><span class="pre">step</span></code> is this step’s <code class="docutils literal notranslate"><span class="pre">SubmoduleStep</span></code>. A forward that must match its own declaration
@@ -3155,7 +3161,7 @@ row whose last step did not keep its value on the device (its first decode step,
 the prefill) still brings it routed, and that read puts it over the slot’s.
 <code class="docutils literal notranslate"><span class="pre">SampledTokenDecoder</span></code> declares it for Qwen3.5, Muse Glimmer, Higgs Audio, Qwen3-ASR and the Cosmos3 reasoner,
 and a node on it that reads the routed token sets <code class="docutils literal notranslate"><span class="pre">device_loopback</span> <span class="pre">=</span> <span class="pre">None</span></code>; Whisper and
-Qwen3-Omni’s Thinker declare their own. Qwen3.5 reads the tokens with <code class="docutils literal notranslate"><span class="pre">last_sampled</span></code>.
+Qwen3-Omni’s Thinker declare their own. Qwen3.5 and Qwen3-ASR read the tokens with <code class="docutils literal notranslate"><span class="pre">last_sampled</span></code>.
 Its <code class="docutils literal notranslate"><span class="pre">walk</span></code> may be a <code class="docutils literal notranslate"><span class="pre">frozenset</span></code> of walks when several decode walks read the token back; a
 combined step’s rows each follow their own walk, and naming a combined walk is refused at
 startup.</p>
@@ -3202,13 +3208,17 @@ buffer and commit persists it, so the step must list the name in
 <code class="docutils literal notranslate"><span class="pre">SamplerStep(loopback_writes=...)</span></code>. An eager step writes the rows by request. Both paths
 address rows the same way, and the model never sees a slot index.</p>
 <p>A kernel in the forward can draw its rows’ tokens itself, as Qwen3-TTS’s depth-loop kernel
-does for fifteen draws a step. <code class="docutils literal notranslate"><span class="pre">sampler.fused_draw_args()</span></code> returns the step’s per-row
-temperature, top-k, top-p, seed and offset, in the forward’s row order, and the kernel draws
-each row with <code class="docutils literal notranslate"><span class="pre">mstar.engine.resources.sampler.fused_draw.draw_row</span></code>, which picks the token
-<code class="docutils literal notranslate"><span class="pre">fused_sample</span></code> would. After the launch, <code class="docutils literal notranslate"><span class="pre">sampler.advance_offsets(draws)</span></code> moves the offsets
-as that many <code class="docutils literal notranslate"><span class="pre">sample</span></code> calls would. <code class="docutils literal notranslate"><span class="pre">fused_draw_args()</span></code> returns None when <code class="docutils literal notranslate"><span class="pre">sample</span></code> would
-do more than that draw (an eager step, the penalty, min-p, logprobs, a kept last token,
-a TP, SP or CFG node); the model then calls <code class="docutils literal notranslate"><span class="pre">sample</span></code>.</p>
+does for fifteen draws a step. <code class="docutils literal notranslate"><span class="pre">fused_draw_args(s)</span></code> returns the step’s per-row temperature,
+top-k, top-p, seed and offset, in the step’s row order, padding rows included. The kernel draws
+row <code class="docutils literal notranslate"><span class="pre">r</span></code>’s <code class="docutils literal notranslate"><span class="pre">i</span></code>-th token with <code class="docutils literal notranslate"><span class="pre">draw_row(...,</span> <span class="pre">seed[r],</span> <span class="pre">offset[r]</span> <span class="pre">+</span> <span class="pre">i,</span> <span class="pre">...,</span> <span class="pre">LAY=draw_row_layout())</span></code>,
+imported from <code class="docutils literal notranslate"><span class="pre">mstar.engine.state</span></code>, which picks the token <code class="docutils literal notranslate"><span class="pre">sample</span></code> would and consumes one draw
+from the row’s random stream, as one <code class="docutils literal notranslate"><span class="pre">sample</span></code> call does. After the launch, <code class="docutils literal notranslate"><span class="pre">drew(s,</span> <span class="pre">n)</span></code> counts
+<code class="docutils literal notranslate"><span class="pre">n</span></code> draws toward the sampler’s <code class="docutils literal notranslate"><span class="pre">draws</span></code> and moves the offsets. <code class="docutils literal notranslate"><span class="pre">fused_draw_args</span></code> returns None
+when <code class="docutils literal notranslate"><span class="pre">sample</span></code> would do more than that draw (an eager step, the penalty, min-p, logprobs, a kept
+last token, a TP, SP or CFG node) or the declared vocabulary is above 2048, where <code class="docutils literal notranslate"><span class="pre">fused_sample</span></code>
+leaves the layout <code class="docutils literal notranslate"><span class="pre">draw_row</span></code> assumes; the model then calls <code class="docutils literal notranslate"><span class="pre">sample</span></code>. These calls and
+<code class="docutils literal notranslate"><span class="pre">FusedDrawArgs</span></code>, the tuple <code class="docutils literal notranslate"><span class="pre">fused_draw_args</span></code> returns, stay out of <code class="docutils literal notranslate"><span class="pre">mstar.engine.state.__all__</span></code>,
+so they can change until a second model draws in place.</p>
 </section>
 <section id="loading-weights">
 <h3>Loading weights<a class="headerlink" href="#loading-weights" title="Link to this heading">#</a></h3>
@@ -3762,7 +3772,8 @@ draw takes each row’s argmax in a step whose rows all sample greedily, in a tw
 each batched capture)</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">RecurrentStateSpec</span></code></p></td>
-<td><p><code class="docutils literal notranslate"><span class="pre">max_slots</span></code>, <code class="docutils literal notranslate"><span class="pre">state_dtype</span></code>, <code class="docutils literal notranslate"><span class="pre">prefix_slots</span></code> (see <strong>Cross-request prefix reuse</strong>).
+<td><p><code class="docutils literal notranslate"><span class="pre">max_slots</span></code>, <code class="docutils literal notranslate"><span class="pre">state_dtype</span></code> (on a <code class="docutils literal notranslate"><span class="pre">Value</span></code>, only with a <code class="docutils literal notranslate"><span class="pre">GatedDeltaNet</span></code>),
+<code class="docutils literal notranslate"><span class="pre">prefix_slots</span></code> (see <strong>Cross-request prefix reuse</strong>).
 <code class="docutils literal notranslate"><span class="pre">max_slots</span></code> counts the sink unless <code class="docutils literal notranslate"><span class="pre">disable_sink_slot</span></code>; a value that leaves no
 slot for a request is refused at startup.</p></td>
 </tr>
