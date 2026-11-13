@@ -10,7 +10,6 @@ from __future__ import annotations
 import dataclasses
 import sys
 import threading
-from collections import deque
 
 import pytest
 import torch
@@ -483,12 +482,26 @@ def test_requests_with_one_seed_each_take_a_draw_of_their_own():
 
 def test_a_draw_nothing_takes_is_evicted_and_only_costs_a_redraw():
     sub = PrefetchingToy()
-    sub._seed_draws = deque(maxlen=1)
+    sub.max_seed_draws = 1
     _added(sub, "p0", seed=1).result()
     _added(sub, "p1", seed=2).result()
-    assert [key for key, _ in sub._seed_draws] == [((8, 3), 2)]
+    assert [key for key, _ in sub._seed_draws.values()] == [((8, 3), 2)]
     sub.prepare_inputs(WALK, _info("p0", 0, seed=1), _inputs())
     assert sub.drawn_on[-1] == threading.current_thread().name, "the evicted draw redraws inline"
+
+
+def test_a_request_removed_before_iteration_zero_drops_its_draw():
+    """A client cancel removes the request before iteration 0 takes its draw: the noise goes with it, rather than
+    staying until max_seed_draws newer draws push it out (MiniMax-H3-Image's workers grew by ~550 MB that way)."""
+    sub = PrefetchingToy()
+    _added(sub, "p0", seed=1).result()
+    kept = _added(sub, "p1", seed=2)
+    sub.cleanup_request(_handle("p0"))
+    assert [key for key, _ in sub._seed_draws.values()] == [((8, 3), 2)]
+    sub.cleanup_request(_handle("p1"))
+    assert not sub._seed_draws and (kept.cancelled() or kept.done())
+    sub.prepare_inputs(WALK, _info("p0", 0, seed=1), _inputs())
+    assert sub.drawn_on[-1] == threading.current_thread().name, "a removed request's draw is not handed out"
 
 
 class ToyRefine(ToyDenoise):
@@ -548,7 +561,7 @@ def _added(sub, rid, **info):
     """``on_request_added`` as the engine calls it at ingest, with the first walk's info."""
     ingest = dataclasses.replace(_info(rid, 0, **info), graph_walk="encode_text")
     sub.on_request_added(_handle(rid), ingest)
-    return sub._seed_draws[-1][1]
+    return sub._seed_draws[_handle(rid)][1]
 
 
 def test_prefetched_seeds_are_drawn_off_the_calling_thread_and_match_an_inline_draw():
