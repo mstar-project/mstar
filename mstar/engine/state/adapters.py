@@ -1769,9 +1769,8 @@ class PagedStorage(Storage):
         self, handle: ArrayHandle, declared: ArrayStep, step: SubmoduleStep, segments, steps: dict[str, Any],
     ) -> None:
         pre, post, rows = _forks(handle.array, declared)
-        ordered = segments_of(declared, step)
         # label-major, so a step over several labels starts and ends on different ones
-        labels = step_labels(ordered) if ordered and ordered[0].label != ordered[-1].label else ()
+        labels = step_labels(segments) if segments and segments[0].label != segments[-1].label else ()
         steps[handle.name] = KVStep(
             segments=segments, commit=declared.keep, pre_forks=pre, post_forks=post, fork_rids=rows,
             sink=declared.placeholders, eager_write=declared.eager_add,
