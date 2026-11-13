@@ -38,7 +38,7 @@ import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.distributed.base import ShardingConfig
-from mstar.engine.state import Array, Attend, Block, Read
+from mstar.engine.state import Array, Attend, Block, Read, SeqShard
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Parallel, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import Model, WalkStep
@@ -67,6 +67,7 @@ from mstar.model.ltx2_5.config import (
     VIDEO,
     VIDEO_FOR_AUDIO,
     VIDEO_SELF,
+    VIDEO_SHARD,
     VIDEO_SPAN,
     VIDEO_TEXT,
     VIDEO_TO_AUDIO,
@@ -197,28 +198,31 @@ class LTX25Model(Model):
         return str(self.snapshot)
 
     # ------------------------------------------------------------ structure
-    def declare_state(self) -> list[Array]:
-        """The dit's six attentions, each an array of the tokens it attends over. Under sequence parallelism a rank's
-        calls carry its share of the video tokens, so the video self-attention exchanges them, the video-to-audio
-        attention merges the ranks' attentions, and an attention from the video tokens runs on the rank's share."""
+    def declare_state(self) -> list[Array | SeqShard]:
+        """The dit's six attentions, each an array of the tokens it attends over, and its sequence shard. On a step
+        the shard splits, a rank holds its share of each row's video tokens, never the audio or text (every row of a
+        step is one shape, read as rows, so each splits alike): the video self-attention exchanges them, the
+        video-to-audio attention merges the ranks' attentions, and an attention from the video tokens runs on the
+        rank's share."""
         t = self.config.transformer
 
-        def within(name, heads, head_dim, read, label, queries=None, sharded=False):
+        def within(name, heads, head_dim, read, label, queries=None):
             return Array(
                 name, nodes={DIT_NODE}, layers=frozenset(range(t.num_layers)), entry=dit_entry(heads, head_dim),
-                labels={label}, max_len=0, seq_sharded=sharded,
+                labels={label}, max_len=0,
                 reads={read: Read(mask=Block(), op=Attend(q_heads=heads), queries=queries, packed=False)},
             )
 
         video = (t.num_attention_heads, t.attention_head_dim)
         audio = (t.audio_num_attention_heads, t.audio_attention_head_dim)
         return [
-            within(VIDEO, *video, VIDEO_SELF, VIDEO_SPAN, sharded=True),
+            within(VIDEO, *video, VIDEO_SELF, VIDEO_SPAN),
             within(AUDIO, *audio, AUDIO_SELF, AUDIO_SPAN),
             within(TEXT_FOR_VIDEO, *video, VIDEO_TEXT, TEXT_SPAN, queries=VIDEO),
             within(TEXT_FOR_AUDIO, *audio, AUDIO_TEXT, TEXT_SPAN, queries=AUDIO),
             within(AUDIO_FOR_VIDEO, *audio, AUDIO_TO_VIDEO, AUDIO_SPAN, queries=VIDEO),
-            within(VIDEO_FOR_AUDIO, *audio, VIDEO_TO_AUDIO, VIDEO_SPAN, queries=AUDIO, sharded=True),
+            within(VIDEO_FOR_AUDIO, *audio, VIDEO_TO_AUDIO, VIDEO_SPAN, queries=AUDIO),
+            SeqShard(VIDEO_SHARD, nodes={DIT_NODE}, labels={VIDEO_SPAN}),
         ]
 
     def kernel_settings(self) -> dict[str, dict[str, Any]]:
@@ -489,20 +493,20 @@ class LTX25Model(Model):
 
     def get_default_sharding_config(self) -> ShardingConfig:
         # The dit's linears and qk-norms shard by head (tensor parallelism), and its video
-        # tokens by rank (Ulysses sequence parallelism); what crosses node edges stays
-        # replicated, so nothing needs a shard_dim.
-        return ShardingConfig(groups=[], tp_enabled_nodes={DIT_NODE}, shard_dim={}, sp_enabled_nodes={DIT_NODE})
+        # tokens by rank (the sequence shard); what crosses node edges stays replicated, so
+        # nothing needs a shard_dim.
+        return ShardingConfig(groups=[], tp_enabled_nodes={DIT_NODE}, shard_dim={})
 
-    def get_submodule(self, node_name: str, device="cpu", tp_group=None, autocast_dtype=None, sp_group=None):
+    def get_submodule(self, node_name: str, device="cpu", tp_group=None, autocast_dtype=None):
         if node_name in self._submodule_cache:
             return self._submodule_cache[node_name]
-        submodule = self._create_submodule(node_name, device, tp_group, sp_group)
+        submodule = self._create_submodule(node_name, device, tp_group)
         self._submodule_cache[node_name] = submodule
         if submodule is not None:
             logger.info("loaded LTX-2.5 submodule for node %s", node_name)
         return submodule
 
-    def _create_submodule(self, node_name: str, device, tp_group=None, sp_group=None) -> NodeSubmodule | None:
+    def _create_submodule(self, node_name: str, device, tp_group=None) -> NodeSubmodule | None:
         if self.skip_weight_loading:
             return None
         from mstar.model.ltx2_5 import weight_loader
@@ -516,7 +520,7 @@ class LTX25Model(Model):
             )
         if node_name == DIT_NODE:
             return LTXDenoiseSubmodule(
-                weight_loader.build_transformer(self.config, snapshot, device, comm_group=tp_group, sp_group=sp_group),
+                weight_loader.build_transformer(self.config, snapshot, device, comm_group=tp_group),
                 self.config,
                 loop_name=DENOISE_LOOP,
                 refine_walks=frozenset(REFINE_WALKS.values()),

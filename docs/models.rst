@@ -717,6 +717,29 @@ since the LLM's 2048-token step budget (``MAX_BATCH_TOKENS``) caps both and at
 the default ``min_chunk_tokens`` no step passes it. Each bucket adds captures
 and startup time.
 
+On ``sp_size`` above 1 the LLM declares a sequence shard (``llm_shard``, its
+prefill and mixed walks; decode never splits, and its compiled frame keeps the
+bracket out). With its KV pool stored by position (``kv_cache:
+{context_parallel: true}``) and the shard's default ``exchange`` (``none``), every step
+runs copied, each rank attending its share of the stored context (more KV
+capacity, no faster prefill). Over KV stored by head the LLM on SP ranks is
+refused unless the deployment sets ``llm_shard: {exchange: ulysses}``, which
+has run on CPU only. With ``llm_shard: {exchange: all_gather}`` a
+step of at least ``llm_shard.min_tokens`` tokens splits over
+the SP ranks: each runs the layers on its part of the prompt, attention gathers
+the step's queries, keys and values, and the gated DeltaNet layers trade tokens
+for heads (``ulysses``, or ``state_passing`` where
+their heads per TP rank don't divide by ``sp_size``). The DeltaNet split runs
+eagerly only, so the LLM never splits a captured step: the shard sets its own floor for
+each of its text prefill, vision prefill and mixed walks, one past that walk's largest
+captured bucket (:doc:`serving`). A prompt that fits a bucket runs copied in its graph, a longer
+one runs eagerly and splits, and decode keeps its graphs; ``llm_shard.min_tokens``
+only raises the floor. Chunked prefill is off
+on SP ranks, so a long prompt splits whole.
+The recurrent state is held whole on every SP rank, so decode is unchanged. No
+shipped config splits yet: a TP2 x SP2 9B config lands with its GPU parity run.
+Prefix caching stays on at one rank as before; above one rank it is off.
+
 A captured decode step builds its rotary tables inside the graph from the
 planned positions, rather than staging tables built eagerly before the replay
 (that build sat on the per-step critical path: +13% output tok/s at c=32 on
@@ -1099,10 +1122,26 @@ Qwen3-Omni notes
   ``codec_chunk_schedule: []`` under the deployment YAML's ``model_kwargs`` to
   start with a 25-frame chunk instead: first audio comes later, and the
   Talker needs only about 1.0 to 1.3x real time.
+- ``configs/qwen3omni_thinker_tp4_sp2.yaml`` (GPU-tested before its last merge of main; a rerun is pending) runs the
+  Thinker on 8 GPUs as 4 TP ranks by 2 SP ranks, for long prompts. Its KV pool
+  is stored by position over each SP pair (``context_parallel``). A prefill of
+  at least ``min_tokens`` tokens (on the ``thinker_shard`` resource) splits over
+  the pair: each rank runs the layers on its half of the tokens, and attention
+  gathers the step's queries, keys and values (``exchange: all_gather`` on
+  ``thinker_shard``; with the Thinker's default, ``none``, it runs every step copied, and over KV
+  stored by head a Thinker on SP ranks is refused unless the deployment sets ``exchange: ulysses``,
+  which has run on CPU only). Decode and
+  shorter prefills run copied on both ranks, each attending its half of the
+  stored context, and the two partials are merged. A captured prefill decides on its bucket's size.
+  ``min_tokens`` is 16384: on 8 H100s all-gather prefilled faster than
+  the copied path from 16K-token prompts and slower at 4K to 8K. The config serves prompts up to the
+  model's own 65536 positions (greedy outputs were checked to 60K; the 64K and 128K rows measured time and
+  memory only). Chunked prefill is off on SP ranks, so a prompt prefills in one step.
 - Numerics: the Thinker's q/k RMSNorm and multimodal RoPE run in one kernel
   with the KV write, in fp32 throughout and rounded once, where the unfused ops
   (and Hugging Face) round to bf16 after the norm and after each step of the
-  rotation: no less accurate, but not bit-exact. The code predictor (shared
+  rotation: no less accurate, but not bit-exact. (A Thinker step that splits
+  over SP ranks runs unfused, through the exchange, and so does a copied prefill; a decode step keeps the fused kernel.) The code predictor (shared
   with Qwen3-TTS, see its notes) runs each projection with its RMSNorm folded
   in and its residual add in the same Triton kernel (``cp_linear``), and its
   attention as another (``cp_attend``), neither bit-exact with the unfused
@@ -2215,7 +2254,9 @@ tokens over a pair of ranks (``cfg_size: 2, sp_size: 2``, Ulysses on the dit's
 self-attention) to cut one request's latency. Split the guidance branches
 first (``cfg_size: 2``), then add ``sp_size`` on top: on two GPUs,
 ``sp_size: 2`` alone is slower than ``cfg_size: 2``.
-``sp_size`` must divide the dit's 24 attention heads. Under concurrency, data
+``sp_size`` must divide the dit's 24 attention heads, and SP needs the
+ragged resource (``backend: sdpa`` on ``dit_self_attn`` runs outside the engine's resources, so
+it is refused on SP ranks). Under concurrency, data
 parallelism stays the throughput layout: at 1280x704x81 and 4 concurrent, four
 replicas (``wan22_dp2.yaml``'s layout over four ranks) serve 8.6 videos/min
 against 7.2 for this layout on H200s, and 11.0 against 7.4 in a separate run on
@@ -2255,13 +2296,17 @@ Outputs are an H.264 ``video`` and a 48 kHz stereo ``audio`` chunk (16-bit PCM).
 (``"audio": false`` in the body for video alone); the mux needs the ``ffmpeg`` binary
 on the server's ``PATH`` and falls back to video only without it.
 
-``ltx2_5_sp2`` shards the video tokens (Ulysses): each rank holds the whole DiT and
-half the tokens, and only the video self-attention exchanges them (one all-to-all
-each way); the cross-attentions run on each rank's own tokens, and the audio queries
-over the video merge the ranks' partial attentions. ``ltx2_5_tp2`` shards the
-weights instead and all-reduces after every block's attentions and feed-forwards.
+``ltx2_5_sp2`` splits each step's video tokens over the two ranks (the DiT's sequence
+shard): each rank holds the whole DiT and half the tokens, and only the video
+self-attention exchanges them (Ulysses, one all-to-all each way); the cross-attentions
+run on each rank's own tokens, and the audio queries over the video merge the ranks'
+partial attentions. The attention resources do the exchanges, so it needs
+the ragged resources (``backend: sdpa`` on one is refused on SP ranks where it reads split
+keys). ``ltx2_5_tp2`` shards
+the weights instead and all-reduces after every block's attentions and feed-forwards.
 
-Performance (2x H100, warm; diffusers with the same recipe and seeds):
+Performance (2x H100, warm; diffusers with the same recipe and seeds; the ``ltx2_5_sp2`` column
+was measured before the exchanges moved into the attention resources):
 
 ======================================  ================  ================  ================
                                         diffusers         ``ltx2_5_tp2``    ``ltx2_5_sp2``
@@ -2331,7 +2376,8 @@ Deployment knobs (``model_kwargs``; the SP configs set ``compile``, ``vae_tile_b
   on one H200, within 62.9 dB of eager.
 
 The attention kernel is a resource's setting: ``backend: sdpa`` on the ``dit_attn`` and
-``refiner_attn`` resources runs the reference's kernel, and FlashInfer runs without it.
+``refiner_attn`` resources runs the reference's kernel, and FlashInfer runs without it. SDPA on
+``dit_attn`` is refused on SP ranks, which every shipped config but ``minimax_h3_2gpu.yaml`` is.
 
 Async scheduling is on for the DiT and the decoder, the default for parallel nodes
 (``tp_async_sched: false`` turns it off); on and off measured within noise. Runtime needs:
@@ -2344,11 +2390,13 @@ On SDPA the nodes' modules, driven by ``test/minimax_h3/parity.py`` (fp32 matmul
 "highest"), were bit-identical to diffusers' MiniMax-H3 pipeline end to end (latents, frames,
 waveform), measured at ``f6260f2677``; with ``--exact`` the script exits nonzero when one isn't.
 FA3 and the compiled DiT are not bit-exact. Served at 768p (50 steps, SP2 on H200, three
-seeds), clips are 23.7-32.8 dB (video) and 17.8-22.3 dB (audio) from diffusers', where the
+seeds), measured on main's earlier SP path, before the DiT and the decoder moved onto the sequence
+shard, clips are 23.7-32.8 dB (video) and 17.8-22.3 dB (audio) from diffusers', where the
 reference on another SDPA kernel is 23.5-33.1 and 21.6-22.3 dB from itself; per seed, the
 served clip is below that spread on one seed's video and another's audio.
 
-Seconds per clip, one request at a time, each engine on the same H200s (M* on torch
+Seconds per clip, one request at a time, each engine on the same H200s, M* measured before the
+DiT and the decoder moved onto the sequence shard (M* on torch
 2.12.1+cu132 and FlashInfer 0.7.2; text only, 1344x768, 124 frames, 49 DiT forwards, seed 0,
 median of 3 after a warmup; ``benchmark/minimax_h3/bench_video.py --seed 0`` sends these
 requests):

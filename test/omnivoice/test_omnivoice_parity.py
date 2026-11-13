@@ -505,7 +505,8 @@ def test_encode_head_matches_the_packed_reference():
         want = _packed_logits(backbone, canvas)
         hidden = backbone.encode(
             canvas.packed_ids[0].t(), canvas.audio_mask[0], canvas.position_ids[0].to(torch.int32),
-            attn=model._fi_runner.wrapper,  # planned for this canvas by _packed_logits
+            # planned for this canvas by _packed_logits
+            attend=lambda _, q, k, v: model._fi_runner.wrapper.run(q, k, v),
         )
         got = backbone.head(hidden, canvas.tgt_index)
     # the residual adds fold into the next RMSNorm (a float sum, not a rounded

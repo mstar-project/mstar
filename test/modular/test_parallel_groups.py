@@ -211,6 +211,8 @@ def test_a_lockstep_instance_refuses_a_device_collective():
     instance = config.per_worker_config["worker-0"].get_joint_group_for_node("dit").instance
     with pytest.raises(ValueError, match="host-only"):
         instance.all_gather(torch.zeros(2))
+    with pytest.raises(ValueError, match="host-only"):
+        instance.all_to_all_rows(torch.zeros(4, 1), [1, 1, 1, 1], [1, 1, 1, 1])
 
 
 def test_a_group_init_dist_has_not_set_up_refuses_a_barrier():

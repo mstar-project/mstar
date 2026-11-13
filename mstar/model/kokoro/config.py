@@ -22,10 +22,12 @@ CHUNK_LOOP = "chunk_loop"
 
 # Names of the tensors ``process_prompt`` produces for one request.
 PHONEME_IDS = "phoneme_ids"
-PHONEME_LENS = "phoneme_lens"
 REF_STYLE = "ref_style"
 SPEED = "speed"
 AUDIO_CHUNK = "audio_chunk"
+# Each chunk's length as host ints, from the request's kwargs to the synth walk's ``step_metadata``. The kwargs share a
+# namespace with the client's, hence the model-prefixed name.
+CHUNK_LENGTHS = "kokoro_chunk_lengths"
 
 # Token id used for both the <bos> and the <eos> the model expects around a
 # phoneme sequence, and for padding (masked out by the lengths).

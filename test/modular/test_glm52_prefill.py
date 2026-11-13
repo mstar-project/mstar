@@ -222,7 +222,7 @@ def test_a_shipped_config_s_ladders_reach_their_batch_sizes(name):
     runner = AcceleratorGraphRunner(
         submodule_name="LLM", submodule=_submodule(model.config), resources={}, step_runner=None,
         device=torch.device("cpu"), autocast_dtype=None, joint_comm_group=SimpleNamespace(world_size=1),
-        num_slots=1, token_ladders=config["prefill_token_buckets"]["LLM"],
+        num_slots=1, head_shards=1, token_ladders=config["prefill_token_buckets"]["LLM"],
     )
     ladders = config["prefill_token_buckets"]["LLM"]["prefill"]
     captured = {}
@@ -323,7 +323,7 @@ def _recompile_limit(ladders):
     return AcceleratorGraphRunner(
         submodule_name="LLM", submodule=_submodule(Glm52ModelConfig(prefill_capture_batch_sizes=[1, 4, 16])),
         resources={}, step_runner=None, device=torch.device("cpu"), autocast_dtype=None,
-        joint_comm_group=SimpleNamespace(world_size=1), num_slots=1, token_ladders=ladders,
+        joint_comm_group=SimpleNamespace(world_size=1), num_slots=1, head_shards=1, token_ladders=ladders,
     ).recompile_limit
 
 

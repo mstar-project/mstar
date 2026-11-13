@@ -42,8 +42,8 @@ class EncoderDecoderNode(SampledTokenDecoder):
     context's label, and ``MAX_PREFILL_BATCH_SIZE``, which bounds a prefill
     step's context reservation since no capture does. The decoder module
     provides ``embed(ids)``, ``logits(hidden)`` and
-    ``forward(input_embeds, *, position_ids, encoder_states=None)``, which adds
-    ``encoder_states`` to the context array before its layers read it.
+    ``forward(input_embeds, *, label, position_ids, encoder_states=None)``, which
+    adds ``encoder_states`` to the context array before its layers read it.
     """
 
     KV_CACHE: str

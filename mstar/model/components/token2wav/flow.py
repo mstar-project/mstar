@@ -166,13 +166,14 @@ class RelPositionAttention(nn.Module):
         return x_padded[:, :, 1:].view_as(x)[:, :, :, : x.size(-1) // 2 + 1]
 
     def _band(self, pe: torch.Tensor, t: int, width: int) -> torch.Tensor:
-        """``linear_pos`` of the relative positions ``t - 1 - r`` for ``r < width``,
+        """``linear_pos`` of the relative positions ``r - (t - 1)`` for ``r < width``,
         ``[H, d_k, width]``: entry ``(n + i) - j + t - 1`` is query ``i``'s term for key
-        ``j`` of a row retaining ``n``, as ``rel_shift`` lines them up."""
+        ``j`` of a row retaining ``n``, as ``rel_shift`` lines them up. The table holds
+        relative position ``k`` (query ``k`` frames after the key) at ``center - k``."""
         band = self._bands.get((t, width))
         if band is None:
             center = pe.size(1) // 2  # relative position 0
-            index = center - (t - 1) + torch.arange(width, device=pe.device)
+            index = center + (t - 1) - torch.arange(width, device=pe.device)
             band = self.linear_pos(pe[0, index]).view(width, self.h, self.d_k).permute(1, 2, 0).contiguous()
             self._bands[(t, width)] = band
         return band
@@ -500,7 +501,7 @@ class DiT(nn.Module):
         ``final_mod [2, r, 1, 512]`` the step's time modulations (``ChunkCFM.constants``),
         ``cnn_cache [depth, N, 1024, 2]`` and ``kv`` (one per block) its caches."""
         if x.is_cuda and kv and isinstance(kv[0], BoundedLayerKV):
-            from mstar.model.minicpm_o.components.token2wav_kernels import dit_forward
+            from mstar.model.components.token2wav.kernels import dit_forward
 
             return dit_forward(self, x, mu, mods, final_mod, spks, cond, cnn_cache, kv)
         x = torch.cat([x, mu, spks.unsqueeze(-1).expand(-1, -1, x.shape[-1]), cond], dim=1)

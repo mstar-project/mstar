@@ -23,10 +23,10 @@ from mstar.model.components.distributed import (
     ParallelGatedMLP,
     VocabParallelEmbedding,
 )
-from mstar.model.orpheus.config import ATTN, KV_CACHE, ROPE, OrpheusModelConfig
+from mstar.model.orpheus.config import KV_CACHE, ROPE, OrpheusModelConfig
 
 
-def _build_decoder_layer(config: OrpheusModelConfig, comm_group: CommGroup | None = None) -> DecoderLayer:
+def _build_decoder_layer(config: OrpheusModelConfig, layer: int, comm_group: CommGroup | None = None) -> DecoderLayer:
     return DecoderLayer(
         self_attn=ParallelAttention(
             comm_group=comm_group,
@@ -34,14 +34,9 @@ def _build_decoder_layer(config: OrpheusModelConfig, comm_group: CommGroup | Non
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
             head_dim=config.head_dim,
-            rope_theta=config.rope_theta,
-            rope_scale=config.rope_scaling["factor"],
-            rope_low_freq_factor=config.rope_scaling["low_freq_factor"],
-            rope_high_freq_factor=config.rope_scaling["high_freq_factor"],
-            rope_old_context_len=config.rope_scaling["original_max_position_embeddings"],
-            attn_key=ATTN,
             kv_key=KV_CACHE,
-            pos_key=ROPE
+            pos_key=ROPE,
+            layer=layer,
         ),
         mlp=ParallelGatedMLP(
             comm_group=comm_group,
@@ -67,24 +62,13 @@ class OrpheusLanguageModel(nn.Module):
             padding_idx=config.pad_token_id,
         )
         self.layers = nn.ModuleList(
-            [_build_decoder_layer(config, comm_group=comm_group) for _ in range(config.num_hidden_layers)]
+            [_build_decoder_layer(config, layer, comm_group=comm_group) for layer in range(config.num_hidden_layers)]
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-    def forward(
-        self,
-        query_sequence: torch.Tensor,
-        *,
-        label: str,
-    ) -> torch.Tensor:
-        # The label and layer index are cursors on the shared resources: bind
-        # the label once, advance the index per layer. Passing them as
-        # arguments instead would make inductor specialize on the int.
-        self.layers[0].self_attn.attend.bind_step(label)
-        for layer_idx, decoder_layer in enumerate(self.layers):
-            decoder_layer.self_attn.attend.set_layer_idx(layer_idx)
+    def forward(self, query_sequence: torch.Tensor) -> torch.Tensor:
+        for decoder_layer in self.layers:
             query_sequence = decoder_layer(hidden_states=query_sequence)
-        # the advance is the runner's now, off the step declaration
         return self.norm(query_sequence)
 
 
@@ -114,14 +98,10 @@ class OrpheusForCausalLM(nn.Module):
     def embed(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_tokens(input_ids)
 
-    def forward(
-        self,
-        query_sequence: torch.Tensor,
-        *,
-        label: str,
-        **kwargs,
-    ) -> torch.Tensor:
-        return self.model(query_sequence=query_sequence, label=label)
+    def forward(self, query_sequence: torch.Tensor, *, label: str) -> torch.Tensor:
+        """``label`` is the scaffold's to pass and goes unread, since each row's label comes from the step's
+        segments."""
+        return self.model(query_sequence=query_sequence)
 
     def logits(self, hidden: torch.Tensor) -> torch.Tensor:
         return self.lm_head(hidden)

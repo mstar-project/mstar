@@ -4,6 +4,7 @@ Kept free of the manager and its kernels so a submodule can declare a step
 without pulling FlashInfer in behind it.
 """
 
+import copy
 import math
 from abc import ABC, abstractmethod
 from collections.abc import Collection, Iterable, Mapping, Sequence
@@ -15,7 +16,11 @@ from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig, Rou
 from mstar.engine.resources.step import ResourceStep
 
 if TYPE_CHECKING:
+    from mstar.distributed.communication import JointGroups
     from mstar.engine.resources.base import Resource
+    from mstar.engine.resources.context_parallel import ContextParallel
+    from mstar.engine.resources.sequence_shard import SeqShardSpec
+    from mstar.engine.resources.spec import Storage
 
 
 class KVLayout(Enum):
@@ -55,22 +60,30 @@ class KVConfig(ABC):
             )
         self._unsharded_kv_heads = self.num_kv_heads
         self._unsharded_qo_heads = self.num_qo_heads
+        self._head_shards: int | None = None
 
     def shard(self, num_shards: int) -> None:
-        """Narrow the head counts to one rank's slice.
+        """Narrow the head counts to one rank's slice of ``num_shards`` (``EngineResourceInfo.head_shards``).
 
         Idempotent because one KVConfig is shared by the KV resource and the
-        attention resources planned against it, and each shards on construction.
-        ``num_shards`` is the instance session size (tp * sp): Ulysses SP
-        all-to-alls heads, so attention runs at head-degree tp*sp.
+        attention resources planned against it, and each shards on construction;
+        a second count is an error, since the cache was sized by the first.
         """
-        from mstar.distributed.utils import divide
+        from mstar.distributed.utils import divide, kv_head_replicas
 
-        if num_shards >= self._unsharded_kv_heads:
-            # fewer KV heads than ranks — every rank holds a replicated head
-            self.num_kv_heads = 1
-        else:
-            self.num_kv_heads = divide(self._unsharded_kv_heads, num_shards)
+        if self._head_shards not in (None, num_shards):
+            raise ValueError(
+                f"KV heads already sharded {self._head_shards} ways, and a resource over the pool "
+                f"shards them {num_shards} ways: its builders disagree on the node's head shards"
+            )
+        kv, qo = self._unsharded_kv_heads, self._unsharded_qo_heads
+        if (num_shards % kv if num_shards >= kv else kv % num_shards) or qo % num_shards:
+            raise ValueError(
+                f"{kv} KV and {qo} query heads don't split {num_shards} ways: the node's head shards "
+                "must divide the query heads, and divide or be a multiple of the KV heads"
+            )
+        self._head_shards = num_shards
+        self.num_kv_heads = kv_head_replicas(kv, num_shards)[0]
         self.num_qo_heads = divide(self._unsharded_qo_heads, num_shards)
 
     @abstractmethod
@@ -82,9 +95,11 @@ class KVConfig(ABC):
         spec's contract is that a typo is loud.
         """
 
-    def capacity_problem(self, spec: "KVSpec", requests: int, request: "KVReqConfig | None") -> str | None:
-        """Why ``spec``'s pool can't hold ``requests`` requests at once, each opened with ``request``, or None. None by
-        default, for a pool its window sizes rather than its requests."""
+    def capacity_problem(
+        self, spec: "KVSpec", requests: int, request: "KVReqConfig | None", node_groups: Sequence[Mapping] = (),
+    ) -> str | None:
+        """Why ``spec``'s pool can't hold ``requests`` requests at once, each opened with ``request``, on the
+        deployment's ``node_groups``, or None. None by default, for a pool its window sizes rather than its requests."""
         return None
 
 
@@ -112,6 +127,8 @@ class PagedKVConfig(KVConfig):
     prefix_cache_salt: str = ""
     prefix_cache: bool = True
     prefix_cache_tp: bool = False
+    # place token positions over the ranks that would otherwise hold the same KV heads; see `place`
+    context_parallel: bool = False
     # MLA only: the latent is ``[ckv (kv_lora_rank) | kpe (qk_rope_head_dim)]``
     kv_lora_rank: int | None = None
     qk_rope_head_dim: int | None = None
@@ -124,6 +141,8 @@ class PagedKVConfig(KVConfig):
     # is kept for first (`keep_window`, which `derive_kv_groups` calls as the specs resolve,
     # before anything builds or sizes from the pool). One group of every layer until then.
     groups: tuple["KVGroup", ...] = field(default=(), init=False, repr=False, compare=False)
+    # the groups as `keep_window` derived them, which a placement re-pages (`placed_groups`)
+    _kept_groups: tuple["KVGroup", ...] = field(default=(), init=False, repr=False, compare=False)
 
     def __post_init__(self):
         self._check_sizes()
@@ -174,7 +193,7 @@ class PagedKVConfig(KVConfig):
             page = tokens * len(full) // len(layers)
             # the window in whole pages: a stream releases its front pages past it at commit
             groups += (KVGroup(tuple(layers), page, RetentionPolicy(context_budget=-(-window // page) * page)),)
-        self.groups = groups
+        self.groups = self._kept_groups = groups
 
     @property
     def tokens_per_page(self) -> int:
@@ -220,6 +239,82 @@ class PagedKVConfig(KVConfig):
             and (checkpoint_named or bool(self.prefix_cache_salt))
         )
 
+    def place(self, joint: "JointGroups | None", pool: str) -> "ContextParallel | None":
+        """This rank's placement of the pool, resolved from ``context_parallel``; None when it is off.
+
+        The KV cache holds it (``KVCache.placement``), not this config, which every rank's
+        resources share. The partners are the node's SP ranks when it has more than one, and
+        otherwise the block of TP ranks holding this rank's KV head (`kv_head_replicas`).
+        """
+        from mstar.engine.resources.context_parallel import SPPlacement, TPPlacement
+
+        if not self.context_parallel:
+            return None
+        tp_size, sp_size = (1, 1) if joint is None else (joint.tp_group.world_size, joint.sp_group.world_size)
+        # raises on one rank alone, so past here there is a joint group
+        size = self.context_parallel_size(pool, tp_size, sp_size)
+        self.groups = self.placed_groups(pool, size)
+        if sp_size > 1:
+            sp = joint.sp_group
+            return SPPlacement(size=size, index=sp.rank, group=sp)
+        tp = joint.tp_group
+        first = tp.rank // size * size
+        return TPPlacement(size=size, index=tp.rank % size, group=tp, partners=tuple(range(first, first + size)))
+
+    def paged_for(self, pool: str, tp: int, sp: int) -> "PagedKVConfig":
+        """This config as a rank of a node of ``tp`` x ``sp`` ranks pages it (`place`): a copy with
+        the groups placed when ``context_parallel`` is on, else this config. What the conductor
+        counts a request's pages with, so its count is the worker's."""
+        if not self.context_parallel:
+            return self
+        placed = copy.copy(self)
+        placed.groups = self.placed_groups(pool, self.context_parallel_size(pool, tp, sp))
+        return placed
+
+    def placed_groups(self, pool: str, size: int) -> "tuple[KVGroup, ...]":
+        """The pool's groups (`keep_window`) with its positions placed over ``size`` partners: the
+        first group's slots stripe over them, and each window group stays whole on every partner,
+        so a decode step attends it with no collective. An arena page then holds ``1/size`` of a
+        first-group page's slots a rank, so a window group's page is ``1/size`` of its unplaced
+        tokens; its retention (whole unplaced pages) still keeps the window. From the groups
+        ``keep_window`` derived, so it can run again."""
+        kept = self._kept_groups
+        for group in kept[1:]:
+            if group.page_size % size:
+                raise ValueError(
+                    f"KV {pool!r}: context_parallel keeps its sliding-window layers whole on each of its {size} "
+                    f"partners in {group.page_size}-token pages, which a partner's 1/{size} of an arena page "
+                    f"doesn't hold whole: use a page_size giving them pages of a multiple of {size} tokens"
+                )
+        return (kept[0], *(replace(group, page_size=group.page_size // size) for group in kept[1:]))
+
+    def context_parallel_size(self, pool: str, tp: int, sp: int) -> int:
+        """How many ranks ``context_parallel`` stripes each page over on a node of ``tp`` x ``sp``
+        ranks: its SP ranks when it has more than one, else the TP ranks sharing a KV head.
+        Raises ``ValueError`` when they can't; ``validate_deployment`` checks it from
+        ``node_groups`` before any worker starts."""
+        from mstar.distributed.utils import kv_head_replicas
+
+        if sp > 1:
+            size = sp
+        else:
+            heads = self._unsharded_kv_heads
+            if heads >= tp or tp % heads:
+                raise ValueError(
+                    f"KV {pool!r}: context_parallel places positions over the TP ranks that share a "
+                    f"KV head, and {heads} KV head(s) over {tp} TP rank(s) "
+                    f"{'leave none sharing one' if heads >= tp else 'do not divide evenly'}. Make TP a "
+                    "larger multiple of the KV heads, give the node SP ranks, or turn "
+                    "context_parallel off."
+                )
+            size = kv_head_replicas(heads, tp)[1]
+        if self.tokens_per_page % size:
+            raise ValueError(
+                f"KV {pool!r}: context_parallel stripes each page over {size} ranks, "
+                f"which doesn't divide page_size {self.tokens_per_page}"
+            )
+        return size
+
     @property
     def request_pages(self) -> int:
         """Arena pages requests can hold: all but the sink page the KV manager takes at build."""
@@ -233,13 +328,18 @@ class PagedKVConfig(KVConfig):
             layout.pages(caps, group.page_size, group.retention) for group in later
         )
 
-    def capacity_problem(self, spec: "KVSpec", requests: int, request: "KVReqConfig | None") -> str | None:
+    def capacity_problem(
+        self, spec: "KVSpec", requests: int, request: "KVReqConfig | None", node_groups: Sequence[Mapping] = (),
+    ) -> str | None:
         """Each request holds the pages ``request`` lays out at its caps, or one stream of ``max_seq_len`` where it
         lays out none, next to the sink page."""
         # In arena pages. A stream of max_seq_len holds every token of every group, a window's too, since a one-step
-        # prefill keeps its whole prompt until it commits.
-        per_request = request.pages(spec.nodes, request.loop_caps or {}, self) if request is not None else sum(
-            -(-self.max_seq_len // group.page_size) for group in self.groups
+        # prefill keeps its whole prompt until it commits. A pool placed by position over a node group's ranks pages
+        # its window groups as `placed_groups` does.
+        per_request = max(
+            request.pages(spec.nodes, request.loop_caps or {}, pool) if request is not None
+            else sum(-(-self.max_seq_len // group.page_size) for group in pool.groups)
+            for pool in (self, *self._placed(spec, node_groups))
         )
         need = 1 + requests * per_request
         if need <= self.num_units:
@@ -250,6 +350,19 @@ class PagedKVConfig(KVConfig):
             f"page), which has {self.max_num_pages}; raise max_num_pages, or lower max_concurrent_requests or the "
             "tokens a request may hold"
         )
+
+    def _placed(self, spec: "KVSpec", node_groups: Sequence[Mapping]) -> "list[PagedKVConfig]":
+        """This config as each of ``node_groups`` that ``spec`` runs on pages it, where it sets ``context_parallel``.
+        A group it can't place on is validation's to report."""
+        placed = []
+        for group in node_groups if self.context_parallel else ():
+            if not spec.nodes & set(group.get("node_names", ())):
+                continue
+            try:
+                placed.append(self.paged_for(spec.resource_key, group.get("tp_size", 1), group.get("sp_size", 1)))
+            except ValueError:
+                pass
+        return placed
 
     @property
     def latent_dim(self) -> int:
@@ -266,6 +379,7 @@ class PagedKVConfig(KVConfig):
         prefix_cache_salt: str | None = None,
         prefix_cache: bool | None = None,
         prefix_cache_tp: bool | None = None,
+        context_parallel: bool | None = None,
     ) -> None:
         """How much cache this deployment gets, and how it is cut up."""
         for name, value in (
@@ -276,6 +390,7 @@ class PagedKVConfig(KVConfig):
             ("prefix_cache_salt", prefix_cache_salt),
             ("prefix_cache", prefix_cache),
             ("prefix_cache_tp", prefix_cache_tp),
+            ("context_parallel", context_parallel),
         ):
             if value is not None:
                 setattr(self, name, value)
@@ -673,11 +788,15 @@ def unrestorable(specs: Mapping[str, NodeResourceSpec], opened: Collection[str])
     """The resources that can't restore what a hit skips while ``opened`` open:
     those that set `NodeResourceSpec.restores_prefix` and keep no open cache of
     their own, unless they are over open caches that restore. Each keeps every
-    cache on its nodes shut."""
+    cache on its nodes shut. A dependency that plans from the step a hit trimmed
+    (``prefix_skip_safe``, a sequence shard's say) holds nothing to restore."""
+    def held(spec: NodeResourceSpec) -> set[str]:
+        return {dep for dep in spec.depends_on() if not specs[dep].resource_class.prefix_skip_safe}
+
     return [
         spec for spec in specs.values()
         if spec.restores_prefix and spec.resource_key not in opened and not (
-            spec.depends_on() and all(dep in opened and specs[dep].restores_prefix for dep in spec.depends_on())
+            (deps := held(spec)) and all(dep in opened and specs[dep].restores_prefix for dep in deps)
         )
     ]
 
@@ -754,14 +873,48 @@ class KVSpec(NodeResourceSpec):
 
         return KVManager
 
+    @property
+    def storage(self) -> "Storage | None":
+        # a paged pool's (`PagedKVConfig.context_parallel`); a ring keeps every position on each rank
+        cfg = self.config
+        if not isinstance(cfg, PagedKVConfig):
+            return None
+        return "by_position" if cfg.context_parallel else "by_head"
+
+    def split_step_refusals(
+        self, node: str, shard: "SeqShardSpec", tp: int, sp: int, specs: Mapping[str, "NodeResourceSpec"],
+    ) -> list[str]:
+        # stored by position, a split step's packed tokens are gathered or passed round; stored by
+        # head, they trade for heads over every TP and SP rank (Ulysses)
+        cfg = self.config
+        if not isinstance(cfg, PagedKVConfig):
+            return []
+        if cfg.context_parallel:
+            if shard.axis == 1:
+                return [
+                    f"node {node!r} splits each row of its steps (axis 1) over {sp} SP ranks, and KV "
+                    f"{self.resource_key!r} stores them by position (context_parallel), which takes a packed "
+                    "split (axis 0) only"
+                ]
+            return []
+        q, kv = cfg._unsharded_qo_heads, cfg._unsharded_kv_heads
+        if q % tp or kv % tp or (q // tp) % sp or (kv // tp) % sp:
+            return [
+                f"node {node!r} splits tokens over {sp} SP ranks, and KV {self.resource_key!r} stores "
+                f"{q} query and {kv} KV heads by head, which don't split {sp} ways per TP rank"
+            ]
+        return []
+
     def apply_yaml_overrides(self, **kwargs):
         """Forwarded to the config: which keys are legal is a property of the
         storage strategy, so the config answers for them."""
         self.config.apply_yaml_overrides(**kwargs)
 
-    def capacity_problem(self, requests: int, request: ResourceReqConfig | None) -> str | None:
+    def capacity_problem(
+        self, requests: int, request: ResourceReqConfig | None, node_groups: Sequence[Mapping] = (),
+    ) -> str | None:
         """Forwarded to the config, as `apply_yaml_overrides` is: how requests fill a pool is the storage strategy's."""
-        return self.config.capacity_problem(self, requests, request)
+        return self.config.capacity_problem(self, requests, request, node_groups)
 
     def keeps_prefix_cache(self, world_size: int, checkpoint_named: bool) -> bool:
         return isinstance(self.config, PagedKVConfig) and self.config.keeps_prefix_cache(world_size, checkpoint_named)
@@ -902,8 +1055,6 @@ class KVStep(ResourceStep):
     # is far longer than its prompt can then replay a graph sized by the prompt.
     eager_write: bool = False
 
-    # e.g., for batched CFG
-    combined_labels: dict[tuple[str, ...], str] = field(default_factory=dict)
     pre_forks: tuple[tuple[str, str], ...] = ()
     post_forks: tuple[tuple[str, str], ...] = ()
     # the rows the forks apply to; None is every row. A chunked prompt forks
