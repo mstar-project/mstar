@@ -8,6 +8,9 @@ over the replay addressing and replays it for different batches.
 
 from __future__ import annotations
 
+from dataclasses import replace
+from unittest.mock import Mock
+
 import pytest
 import torch
 
@@ -19,7 +22,9 @@ from mstar.engine.resources.recurrent.config import (
     RecurrentStep,
 )
 from mstar.engine.resources.recurrent.pool import NO_SLOT, SINK_SLOT, RecurrentStatePool
-from mstar.engine.resources.step import BucketKey, Segment, SlotLease, StepContext
+from mstar.engine.resources.step import BucketKey, Segment, SlotLease, StepContext, SubmoduleStep
+from mstar.engine.state import ArrayStep, Entry, TensorType, Value
+from mstar.engine.state.adapters import StateSetup, _resolve, build_handle, build_specs
 
 MAX_SLOTS = 6  # 5 usable, slot 0 is the sink
 SHAPE = (2, 8)
@@ -200,6 +205,33 @@ def test_padding_rows_read_and_write_only_the_sink():
     assert pool.num_free_slots == MAX_SLOTS - 2, "only a holds a slot"
 
 
+def test_a_step_whose_rows_all_have_state_reads_them_with_no_select(monkeypatch):
+    """The select of a fresh row's start is three ops per field, and a step whose rows all have saved state skips it:
+    it reads the rows the select would, and a step with a fresh row still reads its start."""
+    pool = build_pool()
+    step, ctx = eager(["a", "b"])
+    plan(pool, step, ctx)
+    pool.scatter_("h", rows_of(2, 1.0), layer_idx=1)
+    pool.commit(step, ctx)
+    start = torch.full(SHAPE, 9.0)
+
+    step, ctx = eager(["b", "a"])
+    rows = plan(pool, step, ctx)
+    with monkeypatch.context() as patched:
+        patched.setattr(torch, "where", Mock(side_effect=AssertionError("the read ran the select")))
+        skipped = pool.gather("h", layer_idx=1, start=start)
+    pool._current["main"] = replace(rows, every_row_has_state=False)
+    assert torch.equal(skipped, pool.gather("h", layer_idx=1, start=start)), "the skip reads other rows than the select"
+    torch.testing.assert_close(skipped, rows_of(2, 1.0)[[1, 0]])
+    pool.commit(step, ctx)
+
+    step, ctx = eager(["c", "a"])
+    plan(pool, step, ctx)
+    read = pool.gather("h", layer_idx=1, start=start)
+    assert torch.equal(read[0], start), "a fresh row reads its start"
+    torch.testing.assert_close(read[1], rows_of(2, 1.0)[0])
+
+
 def test_a_freed_slot_reads_as_zeros():
     pool = build_pool()
     step, ctx = eager(["a"])
@@ -305,3 +337,59 @@ def test_a_captured_graph_addresses_the_rows_each_replay_plans():
             torch.testing.assert_close(pool.block("h", 1)[j], ref.block("h", 1)[i])
             assert pool.block("cursor", 0)[j].item() == ref.block("cursor", 0)[i].item()
     torch.cuda.synchronize()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="captures a CUDA graph")
+def test_a_values_read_and_write_captured_address_the_rows_each_replay_plans():
+    """A Value's handle calls the pool behind a graph break, so a capture records the gather, the fresh-row select and
+    the scatter: a replay reads its own rows, a padding or fresh row reads the start, and a written row its entry."""
+    array = Value("state", nodes={"node"}, layers={0}, entry=Entry({
+        "h": TensorType(SHAPE, dtype=torch.float32), "n": TensorType((), dtype=torch.int64),
+    }))
+    (spec,) = build_specs([array], kernel_settings={"state": {"max_slots": MAX_SLOTS}})
+    pool = RecurrentStatePool.build(spec, EngineResourceInfo(device=torch.device("cuda")))
+    for rid in "abcd":
+        pool.ingest_request(rid)
+    handle = build_handle(array, {"state": pool}, _resolve([array], StateSetup()))
+    handle.set_start({"h": torch.full(SHAPE, 100.0, device="cuda")})
+    inc = torch.zeros(4, *SHAPE, device="cuda")
+
+    def forward():
+        fields = handle.read(0).fields
+        handle.write(0, h=fields["h"] + inc, n=fields["n"] + 1)
+
+    def declared(step, ctx) -> SubmoduleStep:
+        contract_step = SubmoduleStep(segments=list(step.segments), state={"state": ArrayStep()})
+        contract_step.set_ctx(ctx)
+        return contract_step
+
+    def one_forward(contract_step) -> None:
+        handle.begin_step(contract_step)
+        forward()
+        handle.check_step(contract_step)
+        handle.end_step(contract_step)
+
+    step, ctx = replay([], bs=4, capture=True)
+    plan(pool, step, ctx)
+    contract_step = declared(step, ctx)
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        one_forward(contract_step)
+    torch.cuda.current_stream().wait_stream(side)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        one_forward(contract_step)
+
+    for real in (["a", "b"], ["b", "c", "a"]):
+        step, ctx = replay(real, bs=4)
+        plan(pool, step, ctx)
+        inc.zero_()
+        inc[: len(real)] = 1.0
+        graph.replay()
+        pool.commit(step, ctx)
+    torch.cuda.synchronize()
+    h, n = pool.block("h", 0), pool.block("n", 0)
+    assert h[slot_of(pool, "a")].eq(102.0).all() and n[slot_of(pool, "a")] == 2, "a fresh row started from the start"
+    assert h[slot_of(pool, "b")].eq(102.0).all() and n[slot_of(pool, "b")] == 2, "a written row read its own entry"
+    assert h[slot_of(pool, "c")].eq(101.0).all() and n[slot_of(pool, "c")] == 1, "a row's first replay read the start"

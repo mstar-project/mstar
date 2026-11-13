@@ -216,6 +216,22 @@ def test_rotary_table_variant_applies_the_multimodal_rotation(num_tokens, n_writ
         assert err_fused <= err_unfused * 1.1, (err_fused, err_unfused)
 
 
+@needs_cuda
+def test_the_kv_write_op_passes_opcheck():
+    from mstar.utils.attention import qk_norm_rope_kv_write
+
+    def randn(*shape):
+        return torch.randn(*shape, device="cuda", dtype=torch.bfloat16)
+
+    pages = torch.zeros(4, 2, 16, HKV, D, device="cuda", dtype=torch.bfloat16)
+    torch.library.opcheck(qk_norm_rope_kv_write, (
+        randn(3, HQ, D), randn(3, HKV, D), randn(3, HKV, D), randn(D), randn(D),
+        torch.arange(3, device="cuda", dtype=torch.int32), pages,
+        torch.zeros(3, device="cuda", dtype=torch.int32), torch.arange(3, device="cuda", dtype=torch.int32),
+        3, 1e-6, 1e-6, THETA,
+    ))
+
+
 def test_fused_norm_helpers_refuse_a_gemma_norm():
     """The fused kernels scale by ``weight``; a Gemma-style norm scales by ``1 + weight``."""
     from types import SimpleNamespace

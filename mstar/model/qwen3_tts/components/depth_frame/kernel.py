@@ -9,7 +9,7 @@ while the CTA waits on earlier phases.
 
 Task types: projections (`linear.lin_task`), attention for one q head and 8
 rows (`attend.attend4`, 4 rows a call), and the per-row draw
-(`fused_draw.draw_row`) and embedding step. The kernel runs in clusters of two
+(`mstar.engine.state.draw_row`) and embedding step. The kernel runs in clusters of two
 CTAs, and an O or DOWN tile's K loop is split across a cluster
 (`linear.split_task`), so the frame's outputs differ from `_depth_loop`'s in
 the last bits.
@@ -23,7 +23,7 @@ from triton.experimental import gluon
 from triton.experimental.gluon import language as gl
 from triton.experimental.gluon.language.nvidia.hopper import mbarrier, tma
 
-from mstar.engine.resources.sampler.fused_draw import draw_row
+from mstar.engine.state import draw_row
 from mstar.model.qwen3_tts.components.depth_frame import cluster as C
 from mstar.model.qwen3_tts.components.depth_frame import schedule
 from mstar.model.qwen3_tts.components.depth_frame.attend import attend4

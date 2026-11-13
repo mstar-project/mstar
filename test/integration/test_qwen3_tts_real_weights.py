@@ -157,7 +157,7 @@ def test_real_codec_streams_like_one_whole_decode(codec, model):
     )
     state = {
         name: torch.zeros((1, *block.shape), dtype=block.dtype, device="cuda:0")
-        for name, block in codec.incremental.state_blocks().items()
+        for name, block in codec.incremental.state_entry().tensors.items()
     }
     tf32 = torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32
     torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = False

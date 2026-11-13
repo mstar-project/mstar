@@ -585,6 +585,21 @@ def test_audio_block_loop_leases_within_the_resources_segment_limit():
     assert not region.can_lease(request(3))
 
 
+def test_the_audio_tower_attends_through_its_nodes_ragged_resource():
+    """The tower's layers are the AuT's, bound to the audio node's resource rather than to an array."""
+    from mstar.model.minicpm_o.components.audio import WhisperEncoder
+    from mstar.model.minicpm_o.config import AUDIO_ATTN, AudioConfig
+
+    tower = WhisperEncoder(AudioConfig(d_model=16, encoder_layers=2, encoder_attention_heads=2, encoder_ffn_dim=32))
+    calls = []
+    ragged = SimpleNamespace(run=lambda q, k, v: calls.append(q.shape) or q)
+    for layer in tower.layers:
+        layer.self_attn.bind_resources({AUDIO_ATTN: ragged})
+    with torch.no_grad():
+        out = tower.encode(torch.randn(5, 16))
+    assert out.shape == (5, 16) and calls == [(5, 2, 8)] * 2
+
+
 def a_deployment(cap: int | None = 32, tts_pages: int = 32 * 32 + 1, **resources) -> dict:
     """A YAML whose tts_kv holds ``cap`` full spoken replies (32 pages each) and its sink page."""
     from mstar.model.minicpm_o.config import TTS_KV
