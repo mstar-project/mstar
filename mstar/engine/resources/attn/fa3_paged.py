@@ -177,3 +177,111 @@ class FA3PagedWrapper:
             q.to(self.dtype), k, v, cache_seqlens=self._seqused, page_table=self._page_table,
             cu_seqlens_q=self._qo_indptr_buf, max_seqlen_q=self.span, causal=self.causal,
         )
+
+
+class FA3RaggedWrapper:
+    """Paged FA3 over rows of any span, each bottom-right causal or, with ``causal`` False, attending all its
+    keys: a mixed step's verify rows of ``k + 1`` queries and its prompt rows (`MixedRows`), from the KV plan's
+    arrays as FlashInfer's prefill wrapper takes them. The caller hides each verify row's last keys in those
+    arrays (`hide_tail_views`), so a row attends to exactly its arrays' length. Planned on the host. Under a
+    captured graph its buffers are static: ``batch_size`` rows of a ``table_width`` page table, query offsets,
+    and up to ``max_tokens`` queries, of which those past the rows' (a replay's padding) come out zero."""
+
+    plans_in_graph = False
+    supports_gather_resident = False
+    supports_repeats = False
+    # Pinned, not FA3's heuristics: those read max_seqlen_q, which a capture fixes at its bucket's tokens and an
+    # eager step takes from its rows, so the two would split the keys and pack the heads differently and reduce
+    # in a different order. One split, query heads packed per KV head (the verify rows' shape: few queries a row).
+    NUM_SPLITS = 1
+    PACK_GQA = True
+
+    def __init__(
+        self, *, page_size: int, table_width: int, device: torch.device, batch_size: int | None = None,
+        max_tokens: int | None = None, accelerator_graph: bool = False, dtype: torch.dtype = torch.bfloat16,
+        causal: bool = True,
+    ):
+        from mstar.utils.h2d import PinnedStager
+
+        self.causal = causal
+        self.device = device
+        self.page_size = page_size
+        self.width = table_width
+        self.accelerator_graph = accelerator_graph
+        self.batch_size = batch_size
+        self.dtype = dtype
+        self._kernel = None
+        self._stager = PinnedStager(torch.int32)
+        self._rows = 0
+        self._max_q = 0
+        self._page_table = self._seqused = self._qo_indptr_buf = self._token_ids = None
+        if accelerator_graph:
+            assert batch_size is not None and max_tokens is not None, "batch_size and max_tokens for a capture"
+            self._rows, self._max_q = batch_size, max_tokens
+            self._page_table = torch.zeros(batch_size, self.width, dtype=torch.int32, device=device)
+            self._seqused = torch.zeros(batch_size, dtype=torch.int32, device=device)
+            self._qo_indptr_buf = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
+            self._token_ids = torch.arange(max_tokens, dtype=torch.int32, device=device)
+
+    @torch.compiler.disable
+    def plan(
+        self, qo_indptr: torch.Tensor, paged_kv_indptr: torch.Tensor, paged_kv_indices: torch.Tensor,
+        paged_kv_last_page_len: torch.Tensor, causal: bool = True, dtype: torch.dtype = torch.bfloat16,
+        window_left: int = -1, **kwargs,
+    ) -> None:
+        """A host plan: H2D copies only, so it may run beside a live graph."""
+        del kwargs, causal  # the mask is fixed by the wrapper
+        if window_left >= 0:
+            raise ValueError("FA3RaggedWrapper plans no sliding window")
+        qo = qo_indptr.numpy().astype(np.int32)
+        rows = len(qo) - 1
+        kvp = paged_kv_indptr.numpy().astype(np.int64)
+        npages = np.diff(kvp)
+        if rows and int(npages.max()) > self.width:
+            raise ValueError(f"a row of {int(npages.max())} pages, past the page table's {self.width}")
+        # a row of no pages (a replay's padding) attends to nothing
+        lens = np.where(npages > 0, np.maximum(npages - 1, 0) * self.page_size + paged_kv_last_page_len.numpy(), 0)
+        host = np.zeros((rows, self.width), dtype=np.int32)
+        row_of = np.repeat(np.arange(rows), npages)
+        host[row_of, np.arange(row_of.shape[0]) - kvp[row_of]] = paged_kv_indices.numpy()
+        self.dtype = dtype
+        if self.accelerator_graph:
+            if rows != self.batch_size:
+                raise ValueError(f"FA3RaggedWrapper captured for {self.batch_size} rows, planned {rows}")
+            if int(qo[-1]) > self._max_q:
+                raise ValueError(f"FA3RaggedWrapper captured for {self._max_q} queries, planned {int(qo[-1])}")
+            self._stager.copy_(self._page_table, host.reshape(-1))
+            self._stager.copy_(self._seqused, lens.astype(np.int32))
+            self._stager.copy_(self._qo_indptr_buf, qo)
+            return
+        from mstar.utils.h2d import to_device_nonblocking
+
+        self._rows = rows
+        self._max_q = int(np.diff(qo).max()) if rows else 0
+        self._page_table = to_device_nonblocking(torch.from_numpy(host), self.device)
+        self._seqused = to_device_nonblocking(torch.from_numpy(lens.astype(np.int32)), self.device)
+        self._qo_indptr_buf = to_device_nonblocking(torch.from_numpy(qo), self.device)
+
+    @torch.compiler.disable
+    def run(self, q: torch.Tensor, kv_cache_layer) -> torch.Tensor:
+        """``q`` [tokens, qo heads, head dim] over a layer's pages."""
+        if isinstance(kv_cache_layer, (tuple, list)):
+            k, v = kv_cache_layer
+        else:
+            k, v = kv_cache_layer[:, 0], kv_cache_layer[:, 1]
+        kernel = self._kernel
+        if kernel is None:
+            if flash_attn_with_kvcache is None:
+                raise RuntimeError(f"paged FA3 can't run: flash_attn_3 doesn't import ({_IMPORT_ERROR})")
+            kernel = self._kernel = flash_attn_with_kvcache
+        # a captured graph's max_seqlen_q stays the bucket's: the kernel's grid is fixed at capture
+        out = kernel(
+            q.to(self.dtype), k, v, cache_seqlens=self._seqused, page_table=self._page_table,
+            cu_seqlens_q=self._qo_indptr_buf, max_seqlen_q=max(self._max_q, 1), causal=self.causal,
+            num_splits=self.NUM_SPLITS, pack_gqa=self.PACK_GQA,
+        )
+        if self._token_ids is not None:
+            # the queries past every row's (a replay's padding) are never written by the kernel
+            tail = self._token_ids[: out.shape[0]] >= self._qo_indptr_buf[-1]
+            out = out.masked_fill(tail[:, None, None], 0)
+        return out
