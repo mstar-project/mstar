@@ -1031,6 +1031,7 @@ class Cosmos3OmniTransformer(nn.Module):
         sound_noisy_frame_indexes: list[torch.Tensor] | None = None,
         sound_mse_gen_indexes: torch.Tensor | None = None,
         sound_timesteps: torch.Tensor | None = None,
+        noisy_token_mask: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """One generation-tower evaluation against the frozen understanding K/V.
 
@@ -1044,7 +1045,8 @@ class Cosmos3OmniTransformer(nn.Module):
         generation token block. With an extra band the generation sequence is
         ``[vision tokens | action or sound tokens]`` and the call returns
         ``(video_velocity, action_velocity)`` / ``(video_velocity,
-        sound_velocity)``."""
+        sound_velocity)``. ``noisy_token_mask`` is a captured graph's clean/noisy
+        layout as data (see ``denoise_step_batched_cfg``)."""
         has_action = action_latents is not None
         has_sound = sound_latents is not None
         packed, original_latent_shapes = self._patchify_and_pack_latents([latents])
@@ -1052,6 +1054,8 @@ class Cosmos3OmniTransformer(nn.Module):
         target_dtype = packed.dtype
         timesteps = vision_timesteps * self.config.timestep_scale
         ts_embeds = self.time_embedder(self.time_proj(timesteps)).to(target_dtype)
+        if noisy_token_mask is not None:
+            ts_embeds = ts_embeds * noisy_token_mask.to(target_dtype)[:, None]
         gen_seq = self._apply_timestep_embeds_to_noisy_tokens(
             packed_tokens=packed,
             packed_timestep_embeds=ts_embeds,

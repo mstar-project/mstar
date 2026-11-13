@@ -183,6 +183,8 @@ UNCOND_LABEL = "uncond"
 CAPTURED_GEN_INPUTS = (
     "latents", "vision_timesteps", "cos_cond", "sin_cond", "cos_uncond", "sin_uncond", "noisy_token_mask",
 )
+# ...and of a conditional-only capture (guidance off: one branch, one rotary table).
+CAPTURED_COND_GEN_INPUTS = ("latents", "vision_timesteps", "cos_cond", "sin_cond", "noisy_token_mask")
 
 # The ``kv`` array's reads (Cosmos3Model.declare_state): ATTN, causal, for the
 # prefills and the reasoner, and ATTN_GEN, bidirectional, for the generation
@@ -195,6 +197,39 @@ PROGRESS = "progress"
 # A windowed request's loop-back edges beside its latents: the frames its
 # window pins, and the decode context its session keeps.
 WINDOW_COND, SESSION_TAIL = "window_cond", "session_tail"
+
+
+@dataclass(frozen=True)
+class GuidanceRegime:
+    """A request's guidance regime, fixed at prefill: both classifier-free
+    guidance branches, or the conditional one alone. It selects the request's
+    capture buckets, and says what a capture in it holds."""
+    name: str
+    labels: tuple[str, ...]          # the cache labels a step plans
+    captured_inputs: tuple[str, ...]  # a captured denoise step's static inputs
+    forward_method: str              # the captured denoise forward
+    # a captured denoise step's KV plan covers this many copies of the span
+    tokens_multiplier: int
+    # whether denoise steps batch across requests (see `can_batch`); a regime
+    # that never batches captures bs=1 only
+    batches: bool
+
+
+CFG_REGIME = GuidanceRegime(
+    "cfg", (COND_LABEL, UNCOND_LABEL), CAPTURED_GEN_INPUTS, "forward_captured",
+    tokens_multiplier=2, batches=True,
+)
+COND_REGIME = GuidanceRegime(
+    "cond", (COND_LABEL,), CAPTURED_COND_GEN_INPUTS, "forward_captured_cond",
+    tokens_multiplier=1, batches=False,
+)
+REGIMES = {r.name: r for r in (CFG_REGIME, COND_REGIME)}
+
+
+class GenCaptureKey(NamedTuple):
+    """A denoise capture bucket's key: its baked token layout and its regime."""
+    latent_shape: tuple[int, ...]
+    regime: str
 
 # Denoise state (initial noise, latents between steps, the guidance combine and
 # the scheduler step) is fp32 for image, video, sound and action requests, as
@@ -487,6 +522,8 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         warn_retired_ladder_env("COSMOS3_PREFILL_CAPTURE_TOKENS", "prefill_token_buckets: {dit: {prefill: [...]}}")
         self.transformer = transformer
         self.config = config
+        # walks a declared accelerator graph replays on (get_accelerator_graph_configs)
+        self._captured_walks: frozenset[str] = frozenset()
         # The loop-back edges of this deployment's scheduler, beside the latents.
         self._solver_state = () if config.distilled_sigmas else SOLVER_STATE
         # Re-encodes the frames a chained window (or a resumed session)
@@ -600,10 +637,12 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         the sole gate on capture — the v1 engine has no ``can_use_cuda_graphs``
         — so every condition the old gate checked lives here:
 
-        * only the two-branch guidance regime is captured (both the prefill's
-          combined cond+uncond pack and the denoise step's batched CFG);
-        * of the denoise walks only ``image_gen``, and only at a resolution a
-          graph was captured for (``_capture_layout``);
+        * a request's guidance regime (``_regime``: both branches, or the
+          conditional one alone) is part of every key, and only the regime the
+          deployment's default guidance runs is captured (``_capture_regime``);
+        * of the denoise walks only ``image_gen`` and the plain and chained
+          video walks, and only at a latent shape a graph was captured for
+          (``_capture_keys``);
         * a batch shares one captured (batch size, token count) bucket, so a
           mixed-resolution batch falls back to the eager cross-request denoise.
 
@@ -617,17 +656,18 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         contradicts. ``Engine.exec`` checks the two against each other.
 
         The guidance interval is the fact this deliberately does not consult:
-        a captured step always runs both branches, and ``postprocess`` keeps
+        a captured two-branch step always runs both, and ``postprocess`` keeps
         the conditional one outside the interval, as the eager path does.
         Honoring the interval here instead would make the key step-dependent,
         which is exactly what the pre-plan path cannot support.
         """
         del per_request_input_metadata, kwargs
         mds = [info.step_metadata for info in per_request_info.values()]
-        if not mds or not all(_has_guidance(md) for md in mds):
+        if not mds:
             return None
         if graph_walk in PREFILL_WALKS:
-            return True
+            regimes = {self._regime(md).name for md in mds}
+            return regimes.pop() if len(regimes) == 1 else None
         if graph_walk not in GEN_WALKS:
             return None
         keys = {self._capture_key(graph_walk, md) for md in mds}
@@ -645,10 +685,15 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             vision_tokens=st["cond"]["num_vision_tokens"],
         )
 
+    @staticmethod
+    def _regime(md: dict) -> GuidanceRegime:
+        """The request's guidance regime, which its step metadata fixes."""
+        return CFG_REGIME if _has_guidance(md) else COND_REGIME
+
     def _capture_key(self, graph_walk: str, md: dict) -> object | None:
         """This one request's half of ``cg_key_info``: everything that does
         not depend on the rest of the batch. See ``GenStepInfo.capture_key``."""
-        if graph_walk not in GEN_WALKS or not _has_guidance(md):
+        if graph_walk not in GEN_WALKS:
             return None
         if graph_walk == VIDEO_GEN_AR_WALK and md.get("window_mode") == "kv":
             # kv windows interleave commit iterations — a different step
@@ -663,8 +708,8 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             shape = self._window_latent_shape(height, width, _schedule(md).window(0).units)
         else:
             shape = self._latent_shape(height, width, int(md.get("num_frames", 1)))
-        layout = getattr(self, "_capture_layout", None) or {}
-        return shape if shape in layout else None
+        key = GenCaptureKey(tuple(shape), self._regime(md).name)
+        return key if key in (getattr(self, "_capture_keys", None) or ()) else None
 
     # ------------------------------------------------------------------
     # Static packing + scheduler helpers
@@ -1464,16 +1509,17 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         # clean/noisy token mask as static buffers (it can't reach the
         # request's sampler at replay), so materialize them here. The eager
         # path ignores these and recomputes from the request's settings. Only
-        # built for a request that could land on a captured graph (two-branch
-        # guidance at a captured shape; see ``_capture_key``).
-        if st["uncond"] is not None and self._capture_key(graph_walk, md) is not None:
+        # built for a request that could land on a captured graph (its guidance
+        # regime at a captured shape; see ``_capture_key``).
+        if self._capture_key(graph_walk, md) is not None:
             # ``step_index`` is the within-window step for a windowed request
             t = st["scheduler"].timesteps[step_index].to(torch.float32)
             # Every graph is built with all frames declared noisy, so the
             # timestep buffer spans every generation token.
             tensors["vision_timesteps"] = t.reshape(1).expand(st["cond"]["num_vision_tokens"]).contiguous()
             tensors["cos_cond"], tensors["sin_cond"] = st["cond"]["rotary"]
-            tensors["cos_uncond"], tensors["sin_uncond"] = st["uncond"]["rotary"]
+            if st["uncond"] is not None:
+                tensors["cos_uncond"], tensors["sin_uncond"] = st["uncond"]["rotary"]
             tensors["noisy_token_mask"] = st["cond"]["noisy_token_mask"]
         return ARNodeInputs(
             input_seq_len=st["cond"]["num_vision_tokens"],
@@ -1580,7 +1626,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             cfg = bool(inputs[0].kwargs.get("cfg"))
             labels = (COND_LABEL, UNCOND_LABEL) if cfg else (COND_LABEL,)
             return SubmoduleStep(
-                cg_key_info=cfg or None,
+                cg_key_info=(CFG_REGIME if cfg else COND_REGIME).name,
                 segments=self._segments(
                     request_ids, labels,
                     [
@@ -1617,10 +1663,12 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         keys = {info.capture_key for info in infos}
         capture_key = keys.pop() if len(keys) == 1 else None
         if slot_lease is not None and capture_key is not None:
-            # The captured denoise graph has a fixed shape and always runs both
-            # guidance branches — including outside a request's guidance
-            # interval, where postprocess keeps the conditional one. See `cg_key_info`.
-            return self._gen_step(request_ids, inputs, spans, (COND_LABEL, UNCOND_LABEL), cg_key_info=capture_key)
+            # The captured denoise graph has a fixed shape and runs every branch
+            # of its regime — a two-branch one including outside a request's
+            # guidance interval, where postprocess keeps the conditional one.
+            # See `cg_key_info`.
+            labels = REGIMES[capture_key.regime].labels
+            return self._gen_step(request_ids, inputs, spans, labels, cg_key_info=capture_key)
         if len(infos) > 1:
             # Cross-request batch: one step over every request's guidance
             # branches (a single branch when guidance is off). The image and
@@ -1687,18 +1735,21 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         """Pack a denoise step's inputs for the CUDA-graph path.
 
         Runs with synthetic request ids (no per-request state). The
-        static-input tensors (``CAPTURED_GEN_INPUTS``) are stacked on a
-        leading batch dim, so one captured graph spans a whole
+        static-input tensors (``CAPTURED_GEN_INPUTS``, or
+        ``CAPTURED_COND_GEN_INPUTS`` for a conditional-only bucket) are stacked
+        on a leading batch dim, so one captured graph spans a whole
         concurrent batch (a batch of one for the single-request latency
         path); the replay side copies each request's tensors into these
         fixed buffers. The attention plan comes from the step declaration,
-        which always covers both guidance branches here (the graph shape is
+        which covers every branch of the bucket's regime (the graph shape is
         fixed), while the eager declaration skips the uncond plan on
         guidance-interval steps.
         """
+        # every row, padding included, carries the leased bucket's key
+        regime = REGIMES[inputs[0].resource_step_info.capture_key.regime]
         return {
             key: torch.stack([inp.tensor_inputs[key] for inp in inputs])
-            for key in CAPTURED_GEN_INPUTS
+            for key in regime.captured_inputs
         }
 
     def preprocess(
@@ -1786,7 +1837,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         ``_forward_action_gen`` call this for the same step, so the declared
         attention (batched vs cond-only) matches the forward that runs.
 
-        The captured path and the cross-request batch always run both
+        A captured two-branch step and the cross-request batch always run both
         branches; ``postprocess`` and ``forward_batched`` call this to keep
         the conditional one outside the interval. See ``cg_key_info`` for why
         the interval is not folded into the capture key."""
@@ -2027,6 +2078,13 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         return not any(info.commit for info in infos)
 
     def max_batch_size(self, graph_walk: str):
+        if graph_walk in self._captured_walks and self.config.distilled_sigmas:
+            # A distilled checkpoint's rows are all conditional-only (it refuses
+            # any other guidance scale), which never batch (`can_batch`); a step
+            # of several unbatched rows runs each eager, without a capture lease,
+            # while one row per step can replay its bs=1 graphs. A walk with no
+            # capture keeps its rows together.
+            return 1
         if graph_walk in GEN_WALKS or graph_walk in SOUND_WALKS or graph_walk in ACTION_WALKS:
             return self.max_gen_batch_size
         return None
@@ -2220,8 +2278,9 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
 
     def get_accelerator_graph_configs(self, device, tp_world_size: int = 1):
         """Declare one fixed-shape capture of the image denoise step per
-        resolution. Requests at other resolutions, or without guidance, fall back
-        to the eager path. The per-resolution token layout is prompt-independent,
+        resolution, in the guidance regime the deployment's default guidance
+        runs (``_capture_regime``). Requests at other resolutions, or in the
+        other regime, fall back to the eager path. The per-resolution token layout is prompt-independent,
         so bake it once here and key it by latent shape; the per-prompt rotary
         tables, the latents and the timestep flow in as static-buffer inputs.
 
@@ -2242,6 +2301,8 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             resolutions = tuple(
                 tuple(int(x) for x in pair.split("x")) for pair in res_env.split(",")
             )
+        elif self.config.gen_capture_image is not None:
+            resolutions = tuple(tuple(int(x) for x in pair) for pair in self.config.gen_capture_image)
         else:
             resolutions = self.gen_capture_resolutions
         bs_env = os.environ.get("COSMOS3_GEN_CAPTURE_BS")
@@ -2252,7 +2313,11 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         # the static latents buffer holds the fp32 loop state; windowed bf16
         # latents copy into it exactly
         dtype = LATENT_DTYPE
+        regime = self._capture_regime()
+        if not regime.batches:
+            capture_batch_sizes = [1]
         self._capture_layout: dict[tuple, dict] = {}
+        self._capture_keys: set[tuple] = set()
         configs = []
         # The capture is bit-faithful at every resolution (the rotary tables
         # are inputs, built outside the graph), but only HELPS
@@ -2288,15 +2353,24 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                 continue
             configs.append(self._gen_capture_config(
                 latent_shape, height, width, frames, device, dtype, capture_batch_sizes,
-                walk, replay_walks,
+                walk, replay_walks, regime,
             ))
 
-        configs.extend(self._prefill_capture_configs(device))
+        configs.extend(self._prefill_capture_configs(device, regime))
+        self._captured_walks = frozenset(w for c in configs for w in c.replay_graph_walks)
         return configs
+
+    def _capture_regime(self) -> GuidanceRegime:
+        """The guidance regime the captures are built for: the one a request
+        that leaves ``guidance_scale`` unset runs. A distilled checkpoint
+        refuses any other scale, so its captures are conditional-only."""
+        if self.config.distilled_sigmas or float(self.config.guidance_scale) == 1.0:
+            return COND_REGIME
+        return CFG_REGIME
 
     def _gen_capture_config(
         self, latent_shape, height, width, frames, device, dtype, capture_batch_sizes,
-        walk, replay_walks,
+        walk, replay_walks, regime,
     ) -> BatchedAcceleratorGraphConfig:
         """One denoise-step capture bucket per latent shape. The graph is
         built with every frame declared noisy (its token layout is baked); the
@@ -2315,35 +2389,38 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             "vision_noisy_frame_indexes": static["vision_noisy_frame_indexes"],
             "mse_gen_indexes": static["mse_gen_indexes"],
         }
+        key = GenCaptureKey(tuple(latent_shape), regime.name)
+        self._capture_keys.add(key)
+        cfg = regime is CFG_REGIME
+        tensors = {
+            "latents": torch.zeros(latent_shape, device=device, dtype=dtype),
+            "vision_timesteps": torch.zeros(num_vision, device=device, dtype=torch.float32),
+            "cos_cond": static["rotary"][0].clone(),
+            "sin_cond": static["rotary"][1].clone(),
+            "noisy_token_mask": torch.ones(num_vision, device=device, dtype=torch.float32),
+        }
+        if cfg:
+            tensors["cos_uncond"] = static["rotary"][0].clone()
+            tensors["sin_uncond"] = static["rotary"][1].clone()
         single = ARNodeInputs(
             input_seq_len=num_vision,
-            tensor_inputs={
-                "latents": torch.zeros(latent_shape, device=device, dtype=dtype),
-                "vision_timesteps": torch.zeros(num_vision, device=device, dtype=torch.float32),
-                "cos_cond": static["rotary"][0].clone(),
-                "sin_cond": static["rotary"][1].clone(),
-                "cos_uncond": static["rotary"][0].clone(),
-                "sin_uncond": static["rotary"][1].clone(),
-                "noisy_token_mask": torch.ones(num_vision, device=device, dtype=torch.float32),
-            },
+            tensor_inputs=tensors,
             # What the capture's own `declare_step` reads: this bucket's
-            # step is the two-branch one, over the paged backend. Padding
-            # rows carry it too, so a partly-filled replay declares the
-            # same segments the capture did.
-            resource_step_info=GenStepInfo(
-                cfg=True, cfg_active=True, capture_key=tuple(latent_shape),
-            ),
+            # step in its regime, over the paged backend. Padding rows carry
+            # it too, so a partly-filled replay declares the same segments
+            # the capture did.
+            resource_step_info=GenStepInfo(cfg=cfg, cfg_active=cfg, capture_key=key),
         )
         return BatchedAcceleratorGraphConfig(
             capture_graph_walk=walk,
             replay_graph_walks=replay_walks,
             single_request_inputs=single,
-            # One bucket per latent shape: the token layout is baked into the
-            # capture, so a request at another latent shape must not land
-            # here. `cg_key_info` returns this same latent shape, and
+            # One bucket per (latent shape, regime): the token layout and the
+            # branch count are baked into the capture, so no other request
+            # may land here. `cg_key_info` returns this same key, and
             # `declare_step` stamps it on the step.
-            additional_key_info=tuple(latent_shape),
-            capture_forward_method="forward_captured",
+            additional_key_info=key,
+            capture_forward_method=regime.forward_method,
             compile=False,
             capture_batch_sizes=capture_batch_sizes,
             # The captured sizes (default bs=1; COSMOS3_GEN_CAPTURE_BS adds
@@ -2351,20 +2428,20 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             # uncaptured sizes / mixed resolutions run the eager batched
             # denoise, so don't cap max_batch_size to them.
             caps_eager_batch_size=False,
-            # This bucket's step always runs both guidance branches combined
-            # into one KV plan (``resource_step_info`` above is
-            # cfg=True/cfg_active=True unconditionally) — `single.input_seq_len`
-            # is one branch's span (declare_step replicates it per label), but
-            # the combined plan commits both branches' tokens, so the static
-            # buffer needs double the capacity or the real replay's KV plan
-            # overruns it (KVPlanState.copy_ shape mismatch).
-            total_tokens_multiplier=2,
+            # A two-branch bucket's step runs both guidance branches combined
+            # into one KV plan — `single.input_seq_len` is one branch's span
+            # (declare_step replicates it per label), but the combined plan
+            # commits both branches' tokens, so the static buffer needs double
+            # the capacity or the real replay's KV plan overruns it
+            # (KVPlanState.copy_ shape mismatch).
+            total_tokens_multiplier=regime.tokens_multiplier,
         )
 
-    def _prefill_capture_configs(self, device) -> list:
+    def _prefill_capture_configs(self, device, regime: GuidanceRegime) -> list:
         configs = []
-        # Understanding-tower text prefill: cond+uncond packed into one combined
-        # sequence (batched CFG). The dummy zeros are placeholders — the real
+        # Understanding-tower text prefill in the captured regime: cond+uncond
+        # packed into one combined sequence (batched CFG), or the conditional
+        # prompt alone. The dummy zeros are placeholders — the real
         # input_ids / mrope ids are copied into the static buffers at replay.
         if not os.environ.get("COSMOS3_DISABLE_PREFILL_ACCELERATOR_GRAPH"):
             bs_env = os.environ.get("COSMOS3_PREFILL_CAPTURE_BS")
@@ -2379,13 +2456,11 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                 replay_graph_walks=list(PREFILL_WALKS),
                 capture_token_lengths=list(self.prefill_capture_token_buckets),
                 make_node_input=lambda n: self._prefill_capture_input(
-                    n, device, mrope_dtype,
+                    n, device, mrope_dtype, regime,
                 ),
-                # Only the two-branch prefill is captured; `cg_key_info`
-                # answers True for exactly that case. A guidance-off prefill
-                # declares one label over a different token count and runs
-                # eager.
-                additional_key_info=True,
+                # A prefill in the other regime declares a different set of
+                # labels, so it keys elsewhere (`cg_key_info`) and runs eager.
+                additional_key_info=regime.name,
                 compile=False,
                 capture_batch_sizes=prefill_bs,
                 caps_eager_batch_size=False,
@@ -2393,20 +2468,23 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         return configs
 
     def _prefill_capture_input(
-        self, num_tokens: int, device, mrope_dtype,
+        self, num_tokens: int, device, mrope_dtype, regime: GuidanceRegime = CFG_REGIME,
     ) -> ARNodeInputs:
-        """One row of the combined cond+uncond prefill pack, at capture shape.
+        """One row of the prefill pack, at capture shape: the combined
+        cond+uncond pack, or the conditional prompt alone.
 
-        ``num_tokens`` is the row's whole contribution — both branches — since
-        that is what the runner buckets on. How it splits between them is
+        ``num_tokens`` is the row's whole contribution — every branch of the
+        regime — since that is what the runner buckets on. How it splits between them is
         arbitrary here: the capture only fixes the packed token count, and the
         per-label spans a replay attends over come from the real request's
         declaration, which is re-planned into the same buffers before the
         replay. ``num_tokens == 0`` is the padding row.
         """
+        # an arbitrary split of the bucket's tokens over the regime's branches
+        branches = len(regime.labels)
         lens = {
-            COND_LABEL: num_tokens - num_tokens // 2,
-            UNCOND_LABEL: num_tokens // 2,
+            label: num_tokens // branches + (i < num_tokens % branches)
+            for i, label in enumerate(regime.labels)
         }
         tensors = {}
         for label, n in lens.items():
@@ -2419,7 +2497,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         return ARNodeInputs(
             input_seq_len=num_tokens,
             tensor_inputs=tensors,
-            kwargs=dict(cfg=True, seq_lens=lens),
+            kwargs=dict(cfg=branches > 1, seq_lens=lens),
         )
 
     # Native bf16, not the engine autocast — as forward()/forward_batched():
@@ -2467,6 +2545,22 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             for rid, (cond_v, uncond_v) in zip(rids, results, strict=True)
         }
 
+    @torch.autocast(device_type="cuda", enabled=False)
+    def forward_captured_cond(
+        self, graph_walk, engine_inputs: ModelInputsFromEngine,
+        latents, vision_timesteps, cos_cond, sin_cond, noisy_token_mask,
+        **kwargs,
+    ) -> dict:
+        """``forward_captured`` for the conditional-only regime: one branch,
+        one request (the regime's only captured batch size)."""
+        layout = self._capture_layout[tuple(latents.shape[1:])]
+        cond_v = self.transformer.denoise_step(
+            latents[0], vision_timesteps[0], (cos_cond[0], sin_cond[0]),
+            layout["vision_token_shapes"], layout["vision_noisy_frame_indexes"],
+            layout["mse_gen_indexes"], noisy_token_mask=noisy_token_mask[0],
+        )
+        return {engine_inputs.request_ids[0]: {"cond_v": [cond_v]}}
+
     def postprocess(self, request_id, request_info, outputs, inputs=None, **kwargs):
         """Captured-path tail: the classifier-free-guidance combine and the
         (Python, multistep) scheduler step the graph can't hold, finished from
@@ -2492,7 +2586,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             # Chained windows only (kv requests never take a lease); the loop
             # counter is global, the schedule index is the within-window step.
             step_index = self._window_step(st, step_index)[1]
-        # the graph runs both branches; a step outside the guidance_interval keeps the conditional one
+        # a two-branch graph runs both; a step outside the guidance_interval keeps the conditional one
         if self._cfg_active(st, step_index):
             velocity = _guided(outputs["cond_v"][0], outputs["uncond_v"][0], st["gs"], latents.dtype)
         else:
@@ -2763,7 +2857,7 @@ class Cosmos3VAEDecoderSubmodule(NodeSubmodule):
     # One-shot decode per request; CUDA-graph capture (not torch.compile) is the
     # speedup path.
     disable_torch_compile = True
-    def __init__(self, vae, config, channels_last: bool = False, fast: bool = False):
+    def __init__(self, vae, config, channels_last: bool = False, fast: bool = False, tp_group=None):
         super().__init__()
         self.vae = vae
         self.config = config
@@ -2771,6 +2865,11 @@ class Cosmos3VAEDecoderSubmodule(NodeSubmodule):
         # ``fast`` (config.vae_decode_fast, whole-clip node only): clips decode
         # through the shared Wan VAE decoder, always channels-last.
         fast = vae is not None and fast
+        # Placed on several ranks with ``tp_size``, the node splits every decode
+        # by rows over them (``HeightShardedDecoder``), images included.
+        sharded = vae is not None and tp_group is not None and tp_group.world_size > 1
+        if sharded and not fast:
+            raise ValueError("A Cosmos3 vae_decoder on several ranks needs vae_decode_fast")
         if fast:
             # Cast before the layout switch and the compile trace, so both see
             # the weights the decode runs with.
@@ -2787,21 +2886,27 @@ class Cosmos3VAEDecoderSubmodule(NodeSubmodule):
         # images) at the cost of one trace per new shape. fullgraph=False
         # breaks around the VAE's causal-conv feature cache.
         # COSMOS3_COMPILE_VAE=0 disables.
-        self._decode = vae.decode if vae is not None else None
-        self._decode_compiled = False
-        self._warmed_decode_shapes: set[tuple[int, ...]] = set()
-        if vae is not None and os.environ.get("COSMOS3_COMPILE_VAE", "1").lower() not in (
+        compile_vae = vae is not None and os.environ.get("COSMOS3_COMPILE_VAE", "1").lower() not in (
             "0", "false", "no", "off",
-        ):
+        )
+        self._decode_compiled = compile_vae
+        self._warmed_decode_shapes: set[tuple[int, ...]] = set()
+        # Sharded, the VAE's layers take row bands: there is no stock decode of it.
+        self._decode = None
+        if vae is not None and not sharded:
             # with ``fast``, only images (one latent) decode through this
-            self._decode = _wan_vae().compile_decode(vae.decode)
-            self._decode_compiled = True
+            self._decode = _wan_vae().compile_decode(vae.decode) if compile_vae else vae.decode
+        if compile_vae:
             logger.info("Cosmos3 VAE decode torch.compile enabled")
         # Resolve + log the decode dtype now (a cheap cuDNN-version read) so the
         # choice is fixed at startup, not on the first request.
         self._decode_dtype()
         self._fast = None
-        if fast:
+        self._sharded = sharded
+        if sharded:
+            self._fast = _wan_vae().HeightShardedDecoder(vae, tp_group, compile=self._decode_compiled)
+            logger.info("Cosmos3 VAE decode: every clip split by rows over %d ranks", tp_group.world_size)
+        elif fast:
             self._fast = _wan_vae().FastDecoder(vae, compile=self._decode_compiled)
             logger.info("Cosmos3 VAE decode: video clips on the shared Wan VAE decoder (channels-last), "
                         "images through the stock decode")
@@ -2847,9 +2952,11 @@ class Cosmos3VAEDecoderSubmodule(NodeSubmodule):
         """Latents -> uint8 pixel frames ``[1, 3, T, H, W]``."""
         vae_dtype = self._decode_dtype()
         z = self._vae_input(latents)
-        # one latent (an image) is faster through the stock decode (24 vs 36 ms on an H200)
-        if self._fast is not None and z.shape[2] > 1:
-            return self._to_uint8(self._fast.decode(z))
+        # One latent (an image) is faster through the stock decode (24 vs 36 ms on
+        # an H200), which a sharded decoder doesn't have. The gather (a no-op on
+        # one rank) takes uint8, a quarter of fp32's bytes.
+        if self._sharded or (self._fast is not None and z.shape[2] > 1):
+            return self._fast.gather(self._to_uint8(self._fast.decode(z)))
         with torch.autocast(device_type="cuda", enabled=False):
             if (
                 self._decode_compiled
