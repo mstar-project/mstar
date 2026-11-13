@@ -24,6 +24,8 @@ def main() -> None:
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--vae-pth", type=Path, required=True)
     parser.add_argument("--qwen", type=Path, required=True)
+    parser.add_argument("--native-vae-root", type=Path,
+                        help="also run the reference policy using M*'s Diffusers VAE encode")
     parser.add_argument("--mstar-revision", required=True)
     parser.add_argument("--rtol", type=float, default=0.03)
     parser.add_argument("--atol", type=float, default=0.03)
@@ -49,29 +51,53 @@ def main() -> None:
         encoder_attention_backend="triton", decoder_attention_backend="triton",
         action_cuda_graphs=False, nvfp4_moe_cuda_graphs=False,
     )
-    session = pipeline.session(
-        "pick up the marker", seed=17, max_context_chunks=0,
-        control_mode="none", exec_horizon=None, sampler=settings, skip_last_video=True,
-    )
+
+    def session():
+        return pipeline.session(
+            "pick up the marker", seed=17, max_context_chunks=0,
+            control_mode="none", exec_horizon=None, sampler=settings, skip_last_video=True,
+        )
+
+    def report(label: str, expected: np.ndarray) -> None:
+        assert expected.shape == actual.shape, (expected.shape, actual.shape)
+        assert np.isfinite(expected).all() and np.isfinite(actual).all()
+        diff = np.abs(actual - expected)
+        close = np.isclose(actual, expected, rtol=args.rtol, atol=args.atol)
+        print(json.dumps({
+            "phase": label, "mstar_revision": args.mstar_revision,
+            "reference_revision": "68f4d7a254b4bf41951d2e97f44b07f6cac2bf69",
+            "checkpoint": str(args.checkpoint), "shape": list(actual.shape),
+            "max_abs": float(diff.max()), "mean_abs": float(diff.mean()),
+            "relative_l2": float(np.linalg.norm(diff) / max(np.linalg.norm(expected), 1e-12)),
+            "fraction_close": float(close.mean()), "all_close": bool(close.all()),
+            "per_dim_max_abs": [float(x) for x in diff.max(axis=0)],
+            "reference_seconds_including_load": round(time.perf_counter() - started, 2),
+            "peak_gpu_gib": round(torch.cuda.max_memory_allocated() / (1024**3), 2),
+        }), flush=True)
+
     with torch.inference_mode():
-        result = session.step(observation)
+        reference = session().step(observation)
     torch.cuda.synchronize()
-    expected = np.asarray(result.action_rel, dtype=np.float32)
-    assert expected.shape == actual.shape, (expected.shape, actual.shape)
-    assert np.isfinite(expected).all() and np.isfinite(actual).all()
-    diff = np.abs(actual - expected)
-    close = np.isclose(actual, expected, rtol=args.rtol, atol=args.atol)
-    print(json.dumps({
-        "mstar_revision": args.mstar_revision,
-        "reference_revision": "68f4d7a254b4bf41951d2e97f44b07f6cac2bf69",
-        "checkpoint": str(args.checkpoint), "shape": list(actual.shape),
-        "max_abs": float(diff.max()), "mean_abs": float(diff.mean()),
-        "relative_l2": float(np.linalg.norm(diff) / max(np.linalg.norm(expected), 1e-12)),
-        "fraction_close": float(close.mean()), "all_close": bool(close.all()),
-        "per_dim_max_abs": [float(x) for x in diff.max(axis=0)],
-        "reference_seconds_including_load": round(time.perf_counter() - started, 2),
-        "peak_gpu_gib": round(torch.cuda.max_memory_allocated() / (1024**3), 2),
-    }), flush=True)
+    report("reference_pth", np.asarray(reference.action_rel, dtype=np.float32))
+    del reference
+
+    if args.native_vae_root is not None:
+        from diffusers import AutoencoderKLWan
+
+        from mstar.model.praxis1.config import Praxis1Config
+        from mstar.model.praxis1.submodules import Praxis1VaeEncoderSubmodule
+
+        assert (args.native_vae_root / "vae" / "config.json").is_file()
+        native_vae = AutoencoderKLWan.from_pretrained(
+            str(args.native_vae_root), subfolder="vae", torch_dtype=torch.bfloat16,
+        ).to("cuda").eval().requires_grad_(False)
+        native = Praxis1VaeEncoderSubmodule(Praxis1Config.from_checkpoint(args.checkpoint), native_vae)
+        matched = session()
+        matched.state.encode = native.vae_encode
+        with torch.inference_mode():
+            result = matched.step(observation)
+        torch.cuda.synchronize()
+        report("reference_with_native_vae", np.asarray(result.action_rel, dtype=np.float32))
 
 
 if __name__ == "__main__":
