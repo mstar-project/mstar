@@ -13,8 +13,8 @@ from safetensors.torch import save_file
 from torch import nn
 
 from mstar.conductor.request_info import DEFAULT_PARTITION, FINAL_PREFILL, CurrentForwardPassInfo
-from mstar.distributed.communication import CommGroup
-from mstar.engine.resources import AttentionStep, SamplingReqConfig
+from mstar.engine.resources import AttentionStep, SamplingReqConfig, StepContext
+from mstar.engine.state.adapters import node_handles, node_resources
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import MAX_OUTPUT_TOKENS
 from mstar.model.command_a_plus.command_a_plus_model import CommandAPlusModel
@@ -26,10 +26,10 @@ from mstar.model.command_a_plus.config import (
     SAMPLER,
 )
 from mstar.model.command_a_plus.submodules import CommandAPlusLLMSubmodule, CommandAPlusVisionSubmodule
-from mstar.model.command_a_plus.tests.test_backbone import bind_test_resources
+from mstar.model.command_a_plus.tests.test_backbone import MemoryKV, bind_test_resources
 from mstar.model.command_a_plus.tests.test_weight_loading import checkpoint
 from mstar.model.multimodal import MEDIA_LAYOUT, PromptPart
-from mstar.model.submodule_base import END_PARTITION, ModelInputsFromEngine
+from mstar.model.submodule_base import END_PARTITION, ModelInputsFromEngine, engine_step
 
 FIXTURE = Path(__file__).parent / "fixtures" / "tiny_config.json"
 
@@ -73,17 +73,31 @@ class NodeTests(unittest.TestCase):
         self.config = self.model.config
         self.node = toy_node(self.model)
 
+    def bind(self, attention, sampler):
+        """The node's handles over doubles, as the engine binds them at load."""
+        resources = {KV_CACHE: MemoryKV(), ROPE: None, LOCAL_ATTN: attention, GLOBAL_ATTN: attention, SAMPLER: sampler}
+        self.node.bind_node_state(node_handles(self.model, "LLM", resources))
+
+    def begin_step(self, walk, rids, inputs):
+        """What the engine does ahead of a forward."""
+        step = engine_step(self.node, graph_walk=walk, request_ids=rids, inputs=inputs)
+        step.set_ctx(StepContext(tuple(rids), walk, 0, False))
+        step.end_calls()
+        step.begin_calls()
+        return step
+
     def test_packed_prefill_selects_each_requests_last_token_and_decode_routes_rows(self):
-        sampler = SimpleNamespace(sample=Mock(side_effect=lambda logits: logits.argmax(-1)))
-        attention = SimpleNamespace(select_last_hidden=Mock(side_effect=lambda x: x[[2, 4]]))
-        engine = ModelInputsFromEngine(["a", "b"], {}, {LOCAL_ATTN: attention, SAMPLER: sampler})
+        sampler = SimpleNamespace(sample=Mock(side_effect=lambda rids, logits: logits.argmax(-1)))
+        attention = SimpleNamespace(select_last_hidden=Mock(side_effect=lambda x, label: x[[2, 4]]))
+        self.bind(attention, sampler)
+        engine = ModelInputsFromEngine(["a", "b"], {}, {})
         for walk, rows, expected in (
             ("prefill", [[2, 5, 7], [11, 13]], [7, 13]),
             ("decode", [[17], [19]], [17, 19]),
         ):
             inputs = [self.node.prepare_inputs(walk, info(walk), {"text_inputs": [torch.tensor(row)]})
                       for row in rows]
-            step = self.node.declare_step(walk, engine.request_ids, inputs)
+            step = self.begin_step(walk, engine.request_ids, inputs)
             self.assertEqual([s.span for s in step.segments], [len(row) for row in rows])
             self.assertEqual(set(step.steps), {KV_CACHE, LOCAL_ATTN, GLOBAL_ATTN, ROPE, SAMPLER})
             for key in (LOCAL_ATTN, GLOBAL_ATTN):
@@ -93,8 +107,7 @@ class NodeTests(unittest.TestCase):
             self.assertEqual(set(tracked), {"a", "b"} if walk == "prefill" else set())
             output = self.node.forward_batched(walk, engine, **self.node.preprocess(walk, engine, inputs))
             self.assertEqual(output.row_outputs["new_token"].tolist(), expected)
-            # one row of logits per request; the sampler takes the rows from its planned step
-            self.assertEqual(sampler.sample.call_args.args[0].shape[0], len(engine.request_ids))
+            self.assertEqual(sampler.sample.call_args.args[0], engine.request_ids)
         attention.select_last_hidden.assert_called_once()
 
     def test_its_eos_ends_either_prefill_and_the_decode_loop(self):
@@ -126,7 +139,7 @@ class ModelIntegrationTests(unittest.TestCase):
 
     def test_graph_and_resources(self):
         model = self.model
-        resources = {r.resource_key: r for r in model.get_node_resources()}
+        resources = {r.resource_key: r for r in node_resources(model)}
         self.assertEqual(resources[LOCAL_ATTN].config.sliding_window, 4)
         self.assertIsNone(resources[GLOBAL_ATTN].config.sliding_window)
         for key in (LOCAL_ATTN, GLOBAL_ATTN, ROPE):
@@ -152,10 +165,10 @@ class ModelIntegrationTests(unittest.TestCase):
         save_file(checkpoint(self.model.config), Path(self.directory) / "model.safetensors")
         node = self.model.get_submodule("LLM", autocast_dtype=torch.float32)
         kv, pos, local, global_ = bind_test_resources(node.model.model, self.model.config)
-        local.select_last_hidden = lambda hidden: hidden[-1:]
-        sampler = SimpleNamespace(sample=lambda logits: logits.argmax(-1))
+        local.select_last_hidden = lambda hidden, label: hidden[-1:]
+        sampler = SimpleNamespace(sample=lambda request_ids, logits: logits.argmax(-1))
         resources = {KV_CACHE: kv, ROPE: pos, LOCAL_ATTN: local, GLOBAL_ATTN: global_, SAMPLER: sampler}
-        node.bind_node_resources(resources)
+        node.bind_node_state(node_handles(self.model, "LLM", resources))
         engine = ModelInputsFromEngine(["a"], {}, resources)
         tokens = torch.tensor([2, 9, 4, 7, 11])
         offset = 0
@@ -164,7 +177,10 @@ class ModelIntegrationTests(unittest.TestCase):
                 walk = "prefill" if step == 0 else "decode"
                 request = info(walk, max_tokens=20, ignore_eos=True, index=max(0, step - 1))
                 inputs = [node.prepare_inputs(walk, request, {"text_inputs": [tokens]})]
-                declaration = node.declare_step(walk, ["a"], inputs)
+                declaration = engine_step(node, graph_walk=walk, request_ids=["a"], inputs=inputs)
+                declaration.set_ctx(StepContext(("a",), walk, 0, False))
+                declaration.end_calls()
+                declaration.begin_calls()
                 self.assertEqual(declaration.segments[0].span, len(tokens))
                 pos.positions["main"] = torch.arange(offset, offset + len(tokens))
                 offset += len(tokens)
@@ -217,13 +233,11 @@ class ModelIntegrationTests(unittest.TestCase):
             self.assertEqual(len(batched[rid]["image_embeds"][0]), len(tiles[rid]) * 4)
             torch.testing.assert_close(batched[rid]["image_embeds"][0], single["image_embeds"][0])
 
-    def test_load_dtype_and_reject_sequence_parallelism(self):
+    def test_load_dtype_and_reject_a_missing_checkpoint(self):
         save_file(checkpoint(self.model.config), Path(self.directory) / "model.safetensors")
         node = self.model.get_submodule("LLM", autocast_dtype=torch.bfloat16)
         self.assertTrue(all(p.dtype == torch.bfloat16 and not p.is_meta for p in node.parameters()))
         self.assertFalse(node.training)
-        with self.assertRaisesRegex(ValueError, "sequence parallelism"):
-            self.model.get_submodule("LLM", sp_group=CommGroup(0, 0, [0, 1]))
         with self.assertRaisesRegex(ValueError, "local checkpoint"):
             CommandAPlusModel("unavailable/repository")
 
@@ -257,9 +271,10 @@ class ModelIntegrationTests(unittest.TestCase):
         self.model._tokenizer = tokenizer
         # Room for the default output cap, which counts toward max_seq_len.
         self.model.max_seq_len = MAX_OUTPUT_TOKENS + 8
-        tensors, metadata = self.model.process_prompt("hello", ["text"], ["text"])
+        prompt = self.model.process_prompt("hello", ["text"], ["text"])
+        tensors, metadata = prompt.new_input_tensors, prompt.metadata
         self.assertEqual(tensors["text_inputs"][0].tolist(), [2, 10, 11])
-        layout = metadata["kv_layout"]["kv_cache"]["main"]
+        layout = metadata["state_layout"]["kv_cache"]["main"]
         self.assertEqual([span.length for span in layout.spans], [3])
         self.assertEqual(layout.growth, (("decode_loop", 1),))
         tokenizer.apply_chat_template.assert_called_once_with(
@@ -305,34 +320,40 @@ class ModelIntegrationTests(unittest.TestCase):
         photos = [torch.rand(3, 40, 60), torch.rand(3, 20, 20)]
         parts = [PromptPart(modality="image", index=0), PromptPart(modality="text", text="hi"),
                  PromptPart(modality="image", index=1)]
-        result, metadata = self.model.process_prompt(
+        prompt = self.model.process_prompt(
             None, ["image", "text", "image"], ["text"], tensors={"image_inputs": photos}, prompt_parts=parts,
         )
+        result, metadata = prompt.new_input_tensors, prompt.metadata
         self.assertEqual(tokenizer.apply_chat_template.call_args.args[0], [{"role": "user", "content": [
             {"type": "image", "image": ""}, {"type": "text", "text": "hi"}, {"type": "image", "image": ""},
         ]}])
         tile = [image] * 4 + [line_break]
         self.assertEqual(result["text_inputs"][0].tolist(), [2, start, *tile * 2, end, 11, start, *tile, end])
         torch.testing.assert_close(result["pixel_values"], [t.to(torch.bfloat16) for t in tiles])
-        (span,) = metadata["kv_layout"]["kv_cache"]["main"].spans
+        (span,) = metadata["state_layout"]["kv_cache"]["main"].spans
         self.assertEqual((span.kind, span.walk, span.length), ("rows", "prefill_image", len(result["text_inputs"][0])))
         # one run of pads a tile, and the node splices the tower's rows into exactly those
         layout = metadata[MEDIA_LAYOUT]
         self.assertEqual((layout["offset"], layout["tokens"]), ([2, 7, 15], [4, 4, 4]))
         node = toy_node(self.model)
         # the media prompt reads where its stream's positions start
-        node.node_resources = {ROPE: SimpleNamespace(position=lambda rid, label: 0)}
+        node.bind_node_state(node_handles(self.model, "LLM", {
+            KV_CACHE: MemoryKV(), ROPE: SimpleNamespace(position=lambda rid, label: 0),
+            LOCAL_ATTN: SimpleNamespace(select_last_hidden=lambda x, label: x), GLOBAL_ATTN: None,
+            SAMPLER: SimpleNamespace(sample=lambda rids, logits: logits),
+        }))
         ids, rows = result["text_inputs"][0], torch.randn(12, self.model.config.vocab_size)
-        engine = ModelInputsFromEngine(["a"], {}, {
-            LOCAL_ATTN: SimpleNamespace(select_last_hidden=lambda x: x),
-            SAMPLER: SimpleNamespace(sample=lambda logits: logits),
-        })
+        engine = ModelInputsFromEngine(["a"], {}, {})
         inputs = node.prepare_inputs(
             "prefill_image", info("prefill_image", layout=layout), {"text_inputs": [ids], "image_embeds": [rows]},
         )
+        step = engine_step(node, graph_walk="prefill_image", request_ids=["a"], inputs=[inputs])
+        step.set_ctx(StepContext(("a",), "prefill_image", 0, False))
+        step.begin_calls()
         hidden = node.forward_batched(
             "prefill_image", engine, **node.preprocess("prefill_image", engine, [inputs]),
         ).row_outputs["new_token"]
+        step.end_calls()
         pads = ids == image
         torch.testing.assert_close(hidden[pads], rows)
         torch.testing.assert_close(hidden[~pads], torch.eye(self.model.config.vocab_size)[ids[~pads]])

@@ -1,8 +1,9 @@
 import logging
 from abc import ABC, abstractmethod
-from collections.abc import Iterable, Mapping
+from collections.abc import Collection, Iterable, Mapping
 from dataclasses import dataclass, field
 from enum import IntEnum
+from types import MappingProxyType
 from typing import TYPE_CHECKING, NamedTuple
 
 from mstar.communication.tensors import NameToTensorList, TensorStore
@@ -482,13 +483,14 @@ class RouteInput(NamedTuple):
     # rid i's signal s. The runtime looks the metadata up in the store.
     tensors: list[int]
     num_tensors: list[int]
-    # One output signal whose per-rid value is a host scalar the worker
-    # already has (the sampled token): its EMIT_TO_CLIENT edge then rides
+    # Output signals whose per-rid value is one host scalar the worker already
+    # has (the sampled token), the same for each of them (``inline_column``):
+    # their EMIT_TO_CLIENT edges, and their streams that go by value, then ride
     # inline in one frame per step instead of as a tensor per request. The
     # values are in wg_ids.keys() order; empty means none, and a row whose
     # value is None takes the tensor path. A runtime without
     # `supports_inline_emit` ignores both.
-    inline_signal: str | None = None
+    inline_signals: tuple[str, ...] | list[str] = ()
     inline_values: tuple[int | None, ...] | list[int | None] = ()
     # The log-prob of the token row i sampled (None without one): it rides
     # with the row's client emits of this step, inline or in a tensor emit's
@@ -502,6 +504,11 @@ class RouteInput(NamedTuple):
     # its iteration, in wg_ids.keys() order; None, one each. A chunk loop
     # counts tokens, so its row's stride is the chunk's.
     loop_strides: list[int] | None = None
+    # signal -> the rids whose stop check withheld it (``StopCheck.withheld``).
+    # For a signal in ``inline_signals``, the route sends those rows nothing:
+    # no value, no frame and no stream item. Any other signal's withheld
+    # tensors the worker has already left out.
+    withheld: Mapping[str, list[int]] | None = None
 
 
 class RouteOutput(NamedTuple):
@@ -535,6 +542,10 @@ class RouteOutput(NamedTuple):
     # tear down -- see ``cleanup_consumed_inputs``. Empty in the normal order,
     # where that call has already taken them.
     freed_inputs: FreedTensors = FreedTensors.none()
+    # Inline items of a local stream whose edge carried no tensor (the step
+    # kept its rows on the device): edge name -> (rid, value) per item, for
+    # the request's stream buffer.
+    local_stream_values_by_signal: Mapping[str, ParallelList[int, int]] = MappingProxyType({})
 
 
 
@@ -578,11 +589,31 @@ class PostprocessNeed(IntEnum):
 
 
 class InlineColumn(NamedTuple):
-    """A device-loopback step's client signal, one host scalar per row: its
-    emit edge rides inline, and nothing is stored."""
-    signal: str
+    """A rows-only step's inline signals, which read one host scalar per row
+    off the same stop buffer (``inline_column``): their client emits and
+    by-value streams ride inline, and nothing is stored."""
+    signals: tuple[str, ...]
     # 1-D host view, row i for ``PostprocessRequest.row_rids[i]``
     column: "torch.Tensor"
+
+
+class StepColumn(NamedTuple):
+    """The signals a step carries inline (``inline_column``), and the stop
+    buffer they read; ``((), None)`` for none."""
+    signals: tuple[str, ...]
+    buffer: str | None
+
+
+def inline_column(candidates: Mapping[str, str], outputs: Collection[str]) -> StepColumn:
+    """Of ``candidates`` (signal -> buffer, ``NodeSubmodule.inline_signals``),
+    the first the step outputs and every other output read off the same
+    buffer. One column a step: signals reading another buffer keep their
+    tensors."""
+    first = next((signal for signal in candidates if signal in outputs), None)
+    if first is None:
+        return StepColumn((), None)
+    buffer = candidates[first]
+    return StepColumn(tuple(s for s, b in candidates.items() if b == buffer and s in outputs), buffer)
 
 
 class PostprocessRequest(NamedTuple):
@@ -606,8 +637,10 @@ class PostprocessRequest(NamedTuple):
     # row of the step's host rows; the caller keeps them alive for the step
     tokens: "torch.Tensor | None" = None
     row_rids: tuple[int, ...] | list[int] = ()
-    # a device-loopback step: routed without storing anything
+    # a rows-only step: routed without storing anything
     inline: InlineColumn | None = None
+    # what the stop check withheld, as ``RouteInput.withheld``
+    withheld: Mapping[str, list[int]] | None = None
     # rids whose partition this pass ends, reported on its WORKER_GRAPHS_DONE: the
     # pass consumed its stream's final chunk, or check_stop returned END_PARTITION
     partition_done: tuple[int, ...] | list[int] = ()
@@ -615,6 +648,9 @@ class PostprocessRequest(NamedTuple):
     python_send: bool = False
     # wg_ids.keys[i]'s ``RouteInput.loop_strides``; None, 1 each
     loop_strides: list[int] | None = None
+    # values per row of ``tokens`` and ``inline``: one per iteration of a
+    # repeated step, side by side
+    token_width: int = 1
 
 
 class RouteTensors(NamedTuple):
@@ -622,7 +658,7 @@ class RouteTensors(NamedTuple):
     stored outputs."""
     tensors: list[int]
     num_tensors: list[int]
-    inline_signal: str | None = None
+    inline_signals: tuple[str, ...] | list[str] = ()
     inline_values: tuple[int | None, ...] | list[int | None] = ()
     logprobs: tuple[float | None, ...] | list[float | None] = ()
 
@@ -659,6 +695,8 @@ class _Postprocess:
     # the request's partition_done, less the dropped rows
     partition_done: list[int] = field(default_factory=list)
     stored: RouteTensors | None = None
+    # the request's withheld outputs, or the stop check's when it ran on STOPS
+    withheld: Mapping[str, list[int]] | None = None
     route: RouteOutput | None = None
     send: SendInput | None = None
 
@@ -681,7 +719,8 @@ def _route_needs_python(route: RouteOutput) -> bool:
     return bool(
         route.rids_needing_request_info is None or route.rids_needing_request_info
         or route.register_uuids or route.new_token_output_idxs
-        or route.local_streaming_by_signal or route.freed_inputs.uuids
+        or route.local_streaming_by_signal or route.local_stream_values_by_signal
+        or route.freed_inputs.uuids
     )
 
 
@@ -696,20 +735,26 @@ class PhasedPostprocess:
     _postprocess: _Postprocess | None = None
 
     def begin_postprocess(self, request: PostprocessRequest) -> PostprocessStep:
-        self._postprocess = _Postprocess(request, partition_done=list(request.partition_done))
+        self._postprocess = _Postprocess(
+            request, partition_done=list(request.partition_done), withheld=request.withheld,
+        )
         return self._run_postprocess()
 
     def resume_postprocess(
         self, stops: Mapping[int, set[str]] | None = None, dropped: Iterable[int] = (),
         stored: RouteTensors | None = None, send: SendInput | None = None,
+        withheld: Mapping[str, list[int]] | None = None,
     ) -> PostprocessStep:
-        """Continue the waiting step with what it asked for: ``stops`` and the
-        rows ``dropped`` (STOPS), ``stored`` (STORE) or ``send`` (SEND)."""
+        """Continue the waiting step with what it asked for: ``stops``, the
+        rows ``dropped`` and what the check ``withheld`` (STOPS), ``stored``
+        (STORE) or ``send`` (SEND)."""
         pp = self._postprocess
         if pp is None:
             raise RuntimeError("resume_postprocess: no step is waiting")
         if stops is not None:
             pp.stops = _merged_stops(pp.request.stops, stops)
+            if withheld:
+                pp.withheld = withheld
             self._keep_rows(pp, set(dropped))
         if stored is not None:
             pp.stored = stored
@@ -752,7 +797,7 @@ class PhasedPostprocess:
             if inline_values is None and pp.stored is None:
                 return pp.step(PostprocessNeed.STORE)
             n = len(pp.wg_ids.keys) * len(req.output_signals)
-            stored = pp.stored or RouteTensors([], [0] * n, req.inline.signal, inline_values)
+            stored = pp.stored or RouteTensors([], [0] * n, req.inline.signals, inline_values)
             loop_strides = req.loop_strides
             if loop_strides is not None and len(pp.wg_ids.keys) != len(loop_strides):
                 stride_of = dict(zip(req.wg_ids.keys, loop_strides, strict=True))
@@ -761,10 +806,10 @@ class PhasedPostprocess:
                 partition=req.partition, graph_walk=req.graph_walk, node_name=req.node_name,
                 output_signals=req.output_signals, wg_ids=pp.wg_ids,
                 tensors=stored.tensors, num_tensors=stored.num_tensors,
-                inline_signal=stored.inline_signal, inline_values=stored.inline_values,
+                inline_signals=stored.inline_signals, inline_values=stored.inline_values,
                 logprobs=stored.logprobs,
                 walks=req.walks if pp.rid_walk_idx is not None else None,
-                rid_walk_idx=pp.rid_walk_idx, loop_strides=loop_strides,
+                rid_walk_idx=pp.rid_walk_idx, loop_strides=loop_strides, withheld=pp.withheld,
             ))
             pp.phase = _PostprocessPhase.SEND
         if pp.send is None:
@@ -839,10 +884,16 @@ class GraphRuntime(PhasedPostprocess, ABC):
     forwards opaquely) and stream buffers (which hold tensors).
     """
 
-    # Whether `RouteInput.inline_signal` is honoured: an emit edge sent as one
+    # Whether `RouteInput.inline_signals` is honoured: an emit edge sent as one
     # RESULT_TOKENS frame per step. A runtime that does not keeps the
     # per-request tensor path, which stays correct.
     supports_inline_emit: bool = False
+
+    def set_inline_streams(self, keys: "frozenset[tuple[str, str]]") -> None:
+        """The (node, signal) pairs whose streamed items go as values when the
+        route carries the signal inline (``EngineManager.inline_streams.keys``).
+        A runtime without inline emit sends every item as a tensor."""
+        del keys
 
     # --------- Bookkeeping ----------
     @abstractmethod
@@ -1345,6 +1396,13 @@ class GraphRuntime(PhasedPostprocess, ABC):
         """``(counts, caps)``: row i's ``loop_names[i]`` (as ``set_loop_caps``),
         its count so far and the count it ends at; -1 for both for a row this
         worker does not hold."""
+        pass
+
+    @abstractmethod
+    def loop_room(self, node_name: str, graph_walk: str, loop_name: str, rids: list[int], stride: int) -> int:
+        """How many more iterations of ``loop_name`` every one of ``rids`` can
+        take, after the ``stride`` each has in flight; 0 for a row this worker
+        does not hold."""
         pass
 
     @abstractmethod

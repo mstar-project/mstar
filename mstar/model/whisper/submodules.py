@@ -11,7 +11,7 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Any
 
 import torch
@@ -34,6 +34,7 @@ from mstar.model.submodule_base import (
     ARNodeSubmodule,
     BatchedModelOutput,
     DeviceLoopback,
+    HostRows,
     ModelInputsFromEngine,
     NodeInputs,
     NodeSubmodule,
@@ -753,16 +754,41 @@ class WhisperDecoderSubmodule(TokenStepNode, ARNodeSubmodule):
                 walk in FIRST_TOKEN_WALKS and token in self.token_stop.stop_ids
                 and not info.resource_configs[SAMPLER].ignore_eos
             )
-        self._record(info, token)
+        decoded = self._transcript(info.rid_handle, info)
+        if decoded is not None:
+            decoded.append(token)
         if not super()._token_stops(request_id, token, info):
             return False
         self.request_state(info.rid_handle).add("stopped", True)
         return True
 
+    def record_tokens(
+        self, graph_walk: str, host_rows: HostRows, info_of: Callable[[int], CurrentForwardPassInfo],
+    ) -> None:
+        """Keep a word-timestamp row's tokens for the align walk on a walk
+        asked to repeat: the runtime checks its stop, which leaves
+        ``_token_stops`` nothing to read them from."""
+        if graph_walk not in self._repeat_walks:
+            return
+        tokens = host_rows.buffers[self.token_stop.buffer]
+        for row, rid in enumerate(host_rows.request_ids):
+            if rid not in self.request_states:
+                continue
+            info = info_of(rid)
+            decoded = self._transcript(rid, info)
+            if decoded is None:
+                continue
+            # nothing past the token that stops the loop: the later iterations ran past its end
+            for token in tokens[row].reshape(-1).tolist():
+                decoded.append(token)
+                if super()._token_stops(rid, token, info):
+                    self.request_state(rid).add("stopped", True)
+                    break
+
     def _record_prompt_token(self, info: CurrentForwardPassInfo, token: int) -> None:
         """For a word-timestamp request, keep what the align walk needs off a
         prompt walk's host token: the detected language, or the first
-        transcript token, which starts the transcript ``_record`` extends."""
+        transcript token, which starts the transcript ``_transcript`` hands on."""
         # Interim: the transcript lives in request state until the decode
         # loop's outputs reach the align walk directly.
         if not info.step_metadata.get("word_timestamps"):
@@ -773,19 +799,19 @@ class WhisperDecoderSubmodule(TokenStepNode, ARNodeSubmodule):
         else:
             state.add("decoded", [token])
 
-    def _record(self, info: CurrentForwardPassInfo, token: int) -> None:
-        """Keep a decode step's token for the align walk (the loop no longer
-        persists them), if the request has a transcript started. Nothing after
-        the step that stopped the loop: a speculative step past it must not
-        extend the transcript. Once per step: when the batched stop check
-        raises partway, the engine re-runs it per request, and a step whose
-        token is already in (after the prompt's, one per earlier iteration) is
-        not appended again."""
-        state = self.request_state(info.rid_handle)
+    def _transcript(self, rid: int, info: CurrentForwardPassInfo) -> list[int] | None:
+        """The transcript a decode step's tokens extend for the align walk (the
+        loop no longer persists them), or None: the request has none started,
+        or it already stopped, so a speculative step past the stop must not
+        extend it. Once per step: when the batched stop check raises partway,
+        the engine re-runs it per request, and a step whose tokens are already
+        in (after the prompt's, one per earlier iteration) gets None."""
+        state = self.request_state(rid)
         decoded = state.get("decoded", None)
         if (
-            decoded is not None and not state.get("stopped", False)
-            and len(decoded) == 1 + info.dynamic_loop_iter_counts.get(DECODE_LOOP, 0)
+            decoded is None or state.get("stopped", False)
+            or len(decoded) != 1 + info.dynamic_loop_iter_counts.get(DECODE_LOOP, 0)
         ):
-            decoded.append(token)
+            return None
+        return decoded
 

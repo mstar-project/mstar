@@ -1,6 +1,7 @@
 import logging
 from collections.abc import Collection, Mapping
 from dataclasses import dataclass, field
+from typing import NamedTuple
 
 import torch
 
@@ -14,8 +15,15 @@ from mstar.engine.node_dtype import resolve_model_dtype, resolve_node_dtype
 from mstar.engine.resources import ResourceReqConfig
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.graph.base import GraphNode
-from mstar.graph.runtime.base import GraphRuntime
-from mstar.model.base import Model, node_moe_parallel_configs, parse_autocast_dtype, serving_resources
+from mstar.graph.runtime.base import GraphRuntime, inline_column
+from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
+from mstar.model.base import (
+    Model,
+    deployment_setup,
+    node_moe_parallel_configs,
+    parse_autocast_dtype,
+    serving_resources,
+)
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.utils.device import DeviceCapability
 from mstar.utils.streams import reset_device_scheduling
@@ -156,11 +164,11 @@ def _refuse_speculated_spans(submodules: dict, model: Model) -> None:
 
 def _refuse_unroutable_withholds(submodules: dict, model: Model) -> None:
     """A withheld output (``TokenStop.withhold``) is left out of the route
-    after the stop check, so it must be one the worker routes as a tensor on
-    a streaming edge (which then gets no item; any other consumer would wait
-    for one), and that no speculated step reads first. The loop-back signal
-    (``ARNodeSubmodule.device_loopback``) is sent inline or kept on the
-    device, so withholding it does nothing."""
+    after the stop check, so it must be a streaming edge's (which then gets no
+    item, as a tensor or by value; any other consumer would wait for one), and
+    one that no speculated step reads first. The loop-back signal
+    (``ARNodeSubmodule.device_loopback``) is kept on the device, so
+    withholding it does nothing."""
     for walk, section in model.get_graph_walk_graphs().items():
         nodes = section.get_nodes()
         for name, node in nodes.items():
@@ -169,7 +177,7 @@ def _refuse_unroutable_withholds(submodules: dict, model: Model) -> None:
             if stop is None:
                 continue
             loopback = getattr(submodule, "device_loopback", None)
-            loopback_signal = loopback.signal if loopback is not None and loopback.walk == walk else None
+            loopback_signal = loopback.signal if loopback is not None and loopback.covers(walk) else None
             for edge in node.outputs:
                 if edge.name in stop.withhold and (
                     not edge.is_streaming or edge.name == loopback_signal
@@ -180,6 +188,95 @@ def _refuse_unroutable_withholds(submodules: dict, model: Model) -> None:
                         "only a streaming edge's output that no speculated node on this worker reads, "
                         "and not the loop-back signal, can be withheld"
                     )
+
+
+def _refuse_combined_loopbacks(submodules: dict, model: Model) -> None:
+    """A ``DeviceLoopback`` names real walks: a combined step's rows loop back
+    per their own walk (``GpuStepBody._loopback_rids``), and a combined walk
+    named here would take the whole step rows-only past that check."""
+    for node, combined in model.get_combined_graph_walks().items():
+        loopback = getattr(submodules.get(node), "device_loopback", None)
+        named = sorted(walk for walk in combined if loopback is not None and loopback.covers(walk))
+        if named:
+            raise ValueError(
+                f"{type(model).__name__}: {node!r}'s DeviceLoopback names combined walk(s) {named}; "
+                "name their real walks instead"
+            )
+
+
+class InlineStreams(NamedTuple):
+    """Which streamed signals go as values (``_inline_streams``)."""
+    # (node, signal) pairs whose streamed items the route sends as values
+    keys: frozenset[tuple[str, str]]
+    # (node, walk) -> its streamed signals that go as tensors there: a step keeps
+    # such a signal's rows on the device only if nothing streams it
+    tensor_streams: dict[tuple[str, str], frozenset[str]]
+    # (node, walk) -> the signals its inline column carries on every edge, so
+    # a step needs no tensor for them (``GpuStepBody.all_on_device``)
+    carried: dict[tuple[str, str], frozenset[str]]
+
+
+def _inline_streams(
+    submodules: dict, model: Model, parallel_groups: WorkerParallelGroups | None = None,
+) -> InlineStreams:
+    """The streams whose items the route sends as values: a ``by_value``
+    connection's, for the graph runtime. On a walk, such a stream goes by value
+    only when its signal rides the step's inline column (``inline_column``);
+    every other stream, and a lockstep node's (whose replicated stream's
+    consumer counts items from every rank, which a value cannot say), keeps
+    its tensors.
+
+    A signal of the column is carried when every edge of it rides too: a
+    client emit or a by-value stream, neither persisted, or an empty
+    destination; none of them counted toward the conductor's output tokens,
+    which it counts off tensors; and no enclosing loop collects it as an
+    output.
+
+    These are ``node.outputs``, and the step's ``output_signals`` are the
+    same edges' names: the worker graphs keep the model's ``GraphNode``
+    objects, and the runtime lists a node's outputs from them."""
+    topology = model.get_partition_topology()
+    by_value = {c.edge_name for c in (topology.connections if topology else []) if c.by_value}
+    keys = set()
+    tensor_streams: dict[tuple[str, str], set[str]] = {}
+    carried: dict[tuple[str, str], frozenset[str]] = {}
+    for walk, section in model.get_graph_walk_graphs().items():
+        loops = section.get_loops().values()
+        for name, node in section.get_nodes().items():
+            submodule = submodules.get(name)
+            lockstep = parallel_groups is not None and parallel_groups.get_instance_world_size_for_node(name) > 1
+            outputs = {edge.name for edge in node.outputs}
+            inline = submodule.inline_signals(walk) if submodule is not None else {}
+            riding = inline_column(inline, outputs).signals
+            for edge in node.outputs:
+                if not edge.is_streaming:
+                    continue
+                if edge.name in by_value and not lockstep:
+                    keys.add((name, edge.name))
+                    if edge.name in riding:
+                        continue
+                tensor_streams.setdefault((name, walk), set()).add(edge.name)
+            if riding:
+                collected = {
+                    edge.name for loop in loops if name in loop.get_nodes()
+                    for edge in (*loop.outputs, *loop.accumulated_outputs)
+                }
+
+                def rides(edge, lockstep=lockstep):
+                    # the route counts a step's new tokens off its tensors
+                    if edge.persist or (edge.conductor_new_token and not edge.is_streaming):
+                        return False
+                    if edge.is_streaming:
+                        return edge.name in by_value and not lockstep
+                    return edge.next_node in (EMIT_TO_CLIENT, EMPTY_DESTINATION)
+
+                kept = frozenset(
+                    signal for signal in riding if signal not in collected
+                    and all(rides(edge) for edge in node.outputs if edge.name == signal)
+                )
+                if kept:
+                    carried[(name, walk)] = kept
+    return InlineStreams(frozenset(keys), {k: frozenset(v) for k, v in tensor_streams.items()}, carried)
 
 
 def side_stream_nodes(node_groups: list[dict]) -> frozenset[str]:
@@ -258,8 +355,8 @@ def _stops_on_a_token(submodule: NodeSubmodule, walk: str) -> bool:
     stop = getattr(submodule, "token_stop", None)
     loopback = getattr(submodule, "device_loopback", None)
     return (
-        stop is not None and (stop.walk in (None, walk) or walk in stop.prefill_walks)
-    ) or (loopback is not None and loopback.walk == walk)
+        stop is not None and (stop.stops_on(walk) or walk in stop.prefill_walks)
+    ) or (loopback is not None and loopback.covers(walk))
 
 
 def _tp_group_of(sharding: ShardingConfig, node: str, walk: str) -> ShardingGroup | None:
@@ -307,6 +404,8 @@ class EngineManager:
     # (node, walk) keys that run beside the chain, as ``build`` decided from
     # the config's ``side_stream`` (see ``_side_lane_keys``)
     side_keys: tuple[tuple[str, str], ...] = ()
+    # which streamed signals go as values (``_inline_streams``)
+    inline_streams: InlineStreams = InlineStreams(frozenset(), {}, {})
 
     @classmethod
     def build(
@@ -325,8 +424,8 @@ class EngineManager:
         """Build the engine and load this worker's nodes into it.
 
         The model supplies each node's submodule via ``get_submodule`` and its
-        resources via ``get_node_resources``; the KV cache's shape rides on
-        the latter, so there is no separate cache config. The conductor's
+        resources via ``declare_state`` and ``get_node_resources``; the KV cache's
+        shape rides on those, so there is no separate cache config. The conductor's
         ``validate_deployment`` has already checked the specs and overrides.
         """
         # the per-node settings read only the config: refuse a bad one before any weights load
@@ -342,7 +441,8 @@ class EngineManager:
             if unknown:
                 raise ValueError(f"{key} names nodes {unknown} that no node group serves")
         walk_ladders, region_ladders = _split_token_ladders(ladders, model)
-        specs = serving_resources(model, model_config)
+        setup = deployment_setup(model, model_config)
+        specs = serving_resources(model, model_config, setup)
 
         # YAML autocast_dtype over the model's own, but never re-enabling
         # autocast for a model that pinned its numerics (see node_dtype)
@@ -357,16 +457,12 @@ class EngineManager:
         # Checked by the conductor's get_sharding_config before spawn.
         moe_parallel = node_moe_parallel_configs(model_config["node_groups"])
         for name in sorted(node_names):
-            # Sequence and CFG parallelism are opt-in per node; only forward
-            # their groups when this node actually participates in one, so
-            # models that support neither keep their existing get_submodule
-            # call. Likewise ``moe_parallel``, only for a node group's
-            # ``ep_config``.
+            # CFG parallelism is opt-in per node (``cfg_group``), and ``moe_parallel`` only for a
+            # node group's ``ep_config``, so every other node keeps its existing get_submodule call
             extra = {}
             joint = parallel_groups.get_joint_group_for_node(name)
-            for key, group in (("sp_group", joint.sp_group), ("cfg_group", joint.cfg_group)):
-                if group.world_size > 1:
-                    extra[key] = group
+            if joint.cfg_group.world_size > 1:
+                extra["cfg_group"] = joint.cfg_group
             if name in moe_parallel:
                 extra["moe_parallel"] = moe_parallel[name]
             submodule = model.get_submodule(
@@ -382,6 +478,8 @@ class EngineManager:
         _refuse_split_combined_walks(submodules, model)
         _refuse_speculated_spans(submodules, model)
         _refuse_unroutable_withholds(submodules, model)
+        _refuse_combined_loopbacks(submodules, model)
+        inline_streams = _inline_streams(submodules, model, parallel_groups)
         side_keys = _side_lane_keys(
             submodules, specs, model, node_names, side_stream_nodes(model_config["node_groups"]),
             parallel_groups, (device_capability or DeviceCapability.of(device)).is_accelerator,
@@ -396,6 +494,7 @@ class EngineManager:
             gpu_memory_fraction=model_config.get("gpu_memory_fraction"),
             device_capability=device_capability,
             side_stream_nodes={name for name, _ in side_keys},
+            state_setup=setup,
         )
         engine.load_model(
             submodules,
@@ -405,6 +504,7 @@ class EngineManager:
             transfer_engine_info=transfer_engine_info,
             kv_cache_type=autocast_dtype,
             model=model,
+            moe_parallel=moe_parallel,
             token_ladders=walk_ladders,
             region_ladders=region_ladders,
         )
@@ -420,7 +520,10 @@ class EngineManager:
         )
         logger.info("Engine loaded on device %s for nodes %s", device, sorted(node_names))
 
-        return cls(engine=engine, node_names=set(node_names), side_keys=side_keys)
+        return cls(
+            engine=engine, node_names=set(node_names), side_keys=side_keys,
+            inline_streams=inline_streams,
+        )
 
     def warmup_all(self) -> None:
         """CUDA graph capture, for the whole forward and any piecewise region."""

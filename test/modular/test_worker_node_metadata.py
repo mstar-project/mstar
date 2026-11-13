@@ -21,6 +21,7 @@ from mstar.graph.runtime.rust import RustGraphRuntime  # noqa: E402
 from mstar.model.base import WorkerGraph  # noqa: E402
 from mstar.utils.containers import ParallelList  # noqa: E402
 from mstar.worker import worker as worker_mod  # noqa: E402
+from mstar.worker.engine_manager import InlineStreams  # noqa: E402
 
 WALK = "decode"
 NODES = {"prefill", "ar_decode"}
@@ -72,7 +73,10 @@ def _init_worker(monkeypatch, runtime: RustGraphRuntime, parallel: set[str]) -> 
         host_allowance=None, node_dtype=lambda node: None,
     )
     monkeypatch.setattr(worker_mod, "EngineManager", SimpleNamespace(
-        build=lambda *a, **kw: SimpleNamespace(engine=engine, get_engine=lambda node: engine, side_keys=())))
+        build=lambda *a, **kw: SimpleNamespace(
+            engine=engine, get_engine=lambda node: engine, side_keys=(),
+            inline_streams=InlineStreams(frozenset(), {}, {}),
+        )))
     groups = SimpleNamespace(
         init_dist=lambda **kw: None,
         get_instance_rank_for_node=lambda node: 0,

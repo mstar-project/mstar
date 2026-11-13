@@ -1062,6 +1062,25 @@ def test_decode_tokens_are_recorded_for_the_align_walk_until_the_stop():
     assert row.input_ids.tolist() == [SOT, EN, TRANSCRIBE, NOTS, 10, 11, 12, EOT]
 
 
+def test_a_repeated_step_records_each_word_timestamp_token_up_to_its_stop():
+    """Under repeats the runtime checks the stop, so the transcript comes off
+    the landed tokens: only word-timestamp rows, every iteration, up to the
+    token that stops the loop and not past it."""
+    sub = _decoder_submodule(_tiny_config())
+    sub.register_parameter("anchor", torch.nn.Parameter(torch.zeros(1)))
+    sub.enable_repeats({DECODE_WALK})
+    assert sub.get_stop_policies(DECODE_WALK), "the runtime checks decode's stop"
+    info = _stop_info(PREFILL_WALK, 9)
+    sub.check_stop_batched(["r"], {"r": info}, HostRows(("r",), {"new_token": torch.tensor([10])}))
+    info.graph_walk = DECODE_WALK
+
+    sub.record_tokens(DECODE_WALK, HostRows((9,), {"new_token": torch.tensor([[11, EOT, 13]])}), lambda rid: info)
+
+    assert sub.request_state(9).get("decoded") == [10, 11, EOT]
+    sub.record_tokens(DECODE_WALK, HostRows((9,), {"new_token": torch.tensor([[14]])}), lambda rid: info)
+    assert sub.request_state(9).get("decoded") == [10, 11, EOT]
+
+
 def test_decode_loopback_contract(monkeypatch):
     from mstar.model.whisper.config import SAMPLER
 
@@ -1071,7 +1090,7 @@ def test_decode_loopback_contract(monkeypatch):
     sub.node_resources = {SAMPLER: type("S", (), {"has_slot_masters": True})()}
     assert sub.device_loopback_signals(DECODE_WALK) == frozenset({"text_inputs", "ts_rules"})
     assert sub.device_loopback_signals(PREFILL_WALK) == frozenset()
-    assert sub.inline_client_signals(DECODE_WALK) == {"text_inputs": "new_token"}
+    assert sub.inline_signals(DECODE_WALK) == {"text_inputs": "new_token"}
     row = sub.prepare_inputs(DECODE_WALK, _fwd(1), {}, has_loopback=True)
     assert row.input_ids is None and row.input_seq_len == 1
     monkeypatch.setenv("MSTAR_DEVICE_LOOPBACK", "0")

@@ -89,7 +89,7 @@ def _stepper(runtime, put):
                     put(uuid)
                     tensors.append(uuid)
                 counts.append(count)
-        inline = {} if values is None else dict(inline_signal="new_token", inline_values=values)
+        inline = {} if values is None else dict(inline_signals=["new_token"], inline_values=values)
         mixed = len(walks) > 1
         out = runtime.complete_and_route_batch(RouteInput(
             partition="default", graph_walk=walks[0], node_name=NODE, output_signals=signals,

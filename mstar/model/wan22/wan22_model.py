@@ -1,6 +1,6 @@
 """Wan22Model: Wan2.2-TI2V-5B text/image-to-video generation.
 
-Architecture (4 nodes; nothing here is cached, the dit's self-attention is a ragged resource):
+Architecture (4 nodes; nothing here is cached, the dit's self-attention reads an array with max_len 0):
     text_encoder - UMT5-XXL prompt encoder (thin HF wrapper)
     vae_encoder  - Wan2.2-VAE encode of the conditioning frame (I2V)
     dit          - dense 5B video DiT; CFG as one batch-2 forward,
@@ -29,13 +29,13 @@ import logging
 import math
 import os
 import re
+from typing import Any
 
 import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.distributed.base import ShardingConfig
-from mstar.engine.resources import NodeResourceSpec
-from mstar.engine.resources.attn.ragged.config import RaggedAttentionConfig, RaggedAttentionSpec
+from mstar.engine.state import Array, Attend, Block, Read, SeqShard
 from mstar.graph.base import (
     GraphEdge,
     GraphNode,
@@ -46,9 +46,10 @@ from mstar.graph.base import (
 )
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import Model, WalkStep
+from mstar.model.components.diffusion.attention import dit_entry, refuse_attention_backend_kwarg
 from mstar.model.components.video_encode import encode_mp4
 from mstar.model.submodule_base import NodeSubmodule
-from mstar.model.wan22.config import WAN22_VARIANT_TI2V_5B, Wan22Config
+from mstar.model.wan22.config import DIT_SHARD, DIT_TOKENS, SELF_ATTN, WAN22_VARIANT_TI2V_5B, Wan22Config
 from mstar.model.wan22.submodules import (
     DENOISE_LOOP_NAME,
     Wan22DitSubmodule,
@@ -95,9 +96,9 @@ class Wan22Model(Model):
         skip_weight_loading: bool = False,
         vae_decode_fast: bool = True,
         vae_decode_fast_sizes: tuple[str, ...] | None = None,
-        attention_backend: str = "flashinfer",
         **kwargs,
     ):
+        refuse_attention_backend_kwarg(kwargs)
         if variant != WAN22_VARIANT_TI2V_5B:
             raise NotImplementedError(
                 f"Wan2.2 variant {variant!r} is not implemented; only "
@@ -110,7 +111,6 @@ class Wan22Model(Model):
             dit_max_batch_size=self._require_positive_int("dit_max_batch_size", dit_max_batch_size),
             max_video_pixels=self._require_positive_int("max_video_pixels", max_video_pixels),
             vae_decode_fast=vae_decode_fast, vae_decode_fast_sizes=vae_decode_fast_sizes,
-            attention_backend=attention_backend,
         )
         self.config.compile_dit_grids()  # a malformed list fails at startup
         # Dummy mode: get_submodule returns None for every node, so engines run
@@ -131,47 +131,46 @@ class Wan22Model(Model):
     # Model ABC: structure
     # ------------------------------------------------------------------
 
-    def get_node_resources(self) -> list[NodeResourceSpec]:
-        """The DiT's self-attention as a cacheless ragged resource (with
-        ``attention_backend: flashinfer``); nothing here keeps state.
+    def declare_state(self) -> list[Array | SeqShard]:
+        """The DiT's self-attention over its tokens, and its sequence shard; nothing here keeps state.
 
         Nothing in this model reads K/V back across steps. The text encoder
         and both VAE passes are one-shot forwards, and the DiT recomputes
         its self-attention over the whole latent grid every denoise step —
         the only state that crosses a step is the UniPC solver's, which
         rides the loop-back edges as ordinary tensors rather than a cache.
+
+        Self-attention only: the cross-attention over the 512 text tokens runs
+        SDPA (cuDNN), which measured faster than FlashInfer's ragged kernel at
+        that shape (0.46 vs 0.59 ms per layer at 1280x704x81 on an H200), while
+        FA3 beats it on the self-attention (12.4 vs 14.8 ms).
+
+        On SP ranks the shard splits each row's tokens: the self-attention exchanges them for heads (Ulysses), and
+        the cross-attention over the text attends a rank's share of them. Every row of a step is one length (a
+        bucket's), read as rows, so each row splits alike. On SDPA the self-attention can't run on SP ranks.
         """
-        if self.config.attention_backend != "flashinfer":
-            return []
-        cfg = self.config
-        # Self-attention only: the cross-attention over the 512 text tokens runs
-        # SDPA (cuDNN), which measured faster than FlashInfer's ragged kernel at
-        # that shape (0.46 vs 0.59 ms per layer at 1280x704x81 on an H200), while
-        # FA3 beats it on the self-attention (12.4 vs 14.8 ms).
+        c = self.config
         return [
-            RaggedAttentionSpec(
-                resource_key=Wan22DitSubmodule.SELF_ATTN, nodes={"dit"},
-                config=RaggedAttentionConfig(
-                    num_qo_heads=cfg.num_attention_heads,
-                    num_kv_heads=cfg.num_attention_heads,
-                    head_dim=cfg.attention_head_dim,
-                    # one segment per guidance branch
-                    max_segments_per_request=Wan22DitSubmodule.CFG_BRANCHES,
-                    # the DiT is compiled, not captured: keep attention in its graph
-                    # (under SP, the fragment between the all-to-all breaks)
-                    compile_op=True,
-                    dtype=torch.bfloat16,
-                ),
+            Array(
+                DIT_TOKENS, nodes={"dit"}, layers=frozenset(range(c.num_layers)), max_len=0,
+                entry=dit_entry(c.num_attention_heads, c.attention_head_dim),
+                reads={SELF_ATTN: Read(mask=Block(), op=Attend(q_heads=c.num_attention_heads), packed=False)},
             ),
+            SeqShard(DIT_SHARD, nodes={"dit"}, labels={Wan22DitSubmodule.MAIN_SPAN}),
         ]
+
+    def kernel_settings(self) -> dict[str, dict[str, Any]]:
+        # one segment per guidance branch; the DiT is compiled, not captured, so attention stays in its graph (under
+        # SP the op runs the exchange inside it)
+        return {SELF_ATTN: {"max_segments_per_request": Wan22DitSubmodule.CFG_BRANCHES, "compile_op": True}}
 
     def get_default_sharding_config(self) -> ShardingConfig:
         # The dit's two guidance branches split over cfg_size ranks, which
         # all-gather the noise predictions (see Wan22DitSubmodule), and its
-        # tokens over sp_size (Ulysses, see Wan22DiT). Signals stay replicated:
-        # no shard_dim entries.
+        # tokens over sp_size (its sequence shard, see declare_state).
+        # Signals stay replicated: no shard_dim entries.
         return ShardingConfig(
-            groups=[], tp_enabled_nodes=set(), shard_dim={}, sp_enabled_nodes={"dit"},
+            groups=[], tp_enabled_nodes=set(), shard_dim={},
             cfg_enabled_nodes={"dit": Wan22DitSubmodule.CFG_BRANCHES},
         )
 
@@ -620,20 +619,20 @@ class Wan22Model(Model):
 
     def get_submodule(
         self, node_name: str, device: str = "cpu", tp_group=None,
-        autocast_dtype: torch.dtype | None = None, sp_group=None, cfg_group=None,
+        autocast_dtype: torch.dtype | None = None, cfg_group=None,
     ) -> torch.nn.Module | None:
         # ``autocast_dtype`` exists for interface parity only: weights load in the
-        # checkpoint's own dtypes. ``sp_group`` and ``cfg_group`` reach the dit only.
+        # checkpoint's own dtypes. ``cfg_group`` reaches the dit only.
         if node_name in self._submodule_cache:
             return self._submodule_cache[node_name]
-        submodule = self._create_submodule(node_name, device, sp_group=sp_group, cfg_group=cfg_group)
+        submodule = self._create_submodule(node_name, device, cfg_group=cfg_group)
         self._submodule_cache[node_name] = submodule
         if submodule is not None:
             logger.info("Loaded Wan2.2 submodule for node %s", node_name)
         return submodule
 
     def _create_submodule(
-        self, node_name: str, device: str = "cpu", sp_group=None, cfg_group=None,
+        self, node_name: str, device: str = "cpu", cfg_group=None,
     ) -> NodeSubmodule | None:
         """Construct one node's submodule from the checkpoint.
 
@@ -670,7 +669,6 @@ class Wan22Model(Model):
             self._refresh_checkpoint_defaults()
             transformer = build_wan22_dit(
                 self.config, self.model_path_hf, device=device, cache_dir=self.cache_dir,
-                sp_group=sp_group,
             )
             return Wan22DitSubmodule(transformer, self.config, cfg_group=cfg_group)
         logger.warning("Wan2.2 has no submodule for node %r; running it dummy.", node_name)

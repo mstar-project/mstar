@@ -219,3 +219,22 @@ def test_commit_keeps_only_selected_rows_and_ignores_padding(buffer_device, kept
         mask = res._sampler.get_token_mask(rid)._seen_token_mask
         assert bool(mask[token]) == kept
     assert res._cg_buffers.offset.master[0].item() == 0
+
+
+def test_a_request_asking_for_logprobs_mid_step_gives_that_step_no_log_prob_rows():
+    """A request ingested after a step settled its repeats is no row of it: a step of several
+    iterations keeps no log-prob rows, which its postprocess can't take."""
+    res = SamplerResource(
+        vocab_size=V, enable_repetition_penalty=False, enable_logprobs=True, device=torch.device("cpu"),
+    )
+    res._cg_buffers = SimpleNamespace(ingraph_scatter=True)
+    res.ingest_request(KEPT, SamplingReqConfig(temperature=1.0))
+    ctx = StepContext(request_ids=(KEPT,), graph_walk="decode", slot=0, capture=False)
+    assert res.max_repeats(SamplerStep(), ctx) > 1
+
+    res.ingest_request(DROPPED, SamplingReqConfig(temperature=1.0, return_logprobs=True))
+    ctx.repeats = 8
+    res.plan(SamplerStep(), ctx)
+    assert res.step_host_rows() == {}
+    own = StepContext(request_ids=(DROPPED,), graph_walk="decode", slot=0, capture=False)
+    assert res.max_repeats(SamplerStep(), own) == 1

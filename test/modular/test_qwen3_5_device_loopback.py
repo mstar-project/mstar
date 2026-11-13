@@ -7,6 +7,8 @@ import pytest
 import torch
 
 from mstar.engine.resources.sampler.resource import SamplerResource
+from mstar.engine.state import Sampler
+from mstar.engine.state.calls import SamplerHandle
 from mstar.model.qwen3_5.config import SAMPLER
 from mstar.model.qwen3_5.submodules import LLMSubmodule
 
@@ -18,17 +20,21 @@ class _Sampler:
     def __init__(self, masters=True, tokens=None):
         self.has_slot_masters = masters
         self.tokens = tokens
-        self.asked = 0
+        self.asked = None
         self._row_stager = None
 
-    def loopback_tokens(self):
-        self.asked += 1
+    def loopback_tokens(self, request_ids):
+        self.asked = list(request_ids)
         return self.tokens
 
 
-def _sub(sampler):
+def _sub(sampler, rows=("r1", "r2")):
     sub = LLMSubmodule(None, SimpleNamespace(stop_token_ids=frozenset()))
     sub.node_resources = {SAMPLER: sampler}
+    handle = SamplerHandle(Sampler(SAMPLER, nodes={"LLM"}, vocab_size=8), sampler)
+    handle.rows = rows
+    handle._open = True
+    sub.sampler = handle
     return sub
 
 
@@ -94,6 +100,7 @@ def test_preprocess_mixes_routed_rows_into_the_sampler_tokens():
     engine_inputs = SimpleNamespace(
         resources={SAMPLER: sampler}, request_ids=["r1", "r2", "r3", "pad1"], captured=False,
     )
+    sub.sampler.rows = engine_inputs.request_ids
     _stub_model(sub, {})
     out = LLMSubmodule.preprocess(sub, "decode", engine_inputs, rows)
     assert out["input_ids"].tolist() == [9, 4, 8, 0]
@@ -106,11 +113,12 @@ def test_preprocess_reads_the_step_tokens_off_the_sampler():
     engine_inputs = SimpleNamespace(
         resources={SAMPLER: sampler}, request_ids=["r1", "r2", "pad1", "pad2"], captured=False,
     )
+    sub.sampler.rows = engine_inputs.request_ids
     seen = {}
     _stub_model(sub, seen)
     out = LLMSubmodule.preprocess(sub, "decode", engine_inputs, rows)
     assert out["input_ids"].tolist() == [3, 4, 0, 0]
-    assert sampler.asked == 1
+    assert sampler.asked == ["r1", "r2", "pad1", "pad2"]
     assert "input_embeds" not in out and seen["n"] == 4
 
 
@@ -156,7 +164,6 @@ def test_forward_in_graph_rope_reads_planned_positions_at_capture():
     """A capture hands the forward the slot's static input_ids and rotary
     tables. The ids are always the static ones; the forward builds the tables
     from the planned positions instead."""
-    from mstar.model.qwen3_5.config import ATTN, ROPE
 
     calls = {}
 
@@ -174,7 +181,7 @@ def test_forward_in_graph_rope_reads_planned_positions_at_capture():
             calls["ids"] = ids.tolist()
             return ids.float()
 
-        def __call__(self, embeds, label, cos_sin):
+        def __call__(self, embeds, label, cos_sin, walk=None):
             calls["cos"] = cos_sin[0]
             return embeds
 
@@ -182,21 +189,23 @@ def test_forward_in_graph_rope_reads_planned_positions_at_capture():
             return hidden
 
     sampler = _Sampler(masters=True, tokens=torch.tensor([3, 4]))
-    sampler.sample = lambda logits: "sampled"
-    sub = _sub(sampler)
-    sub.node_resources[ROPE] = SimpleNamespace(pos_ids=lambda label: torch.tensor([10, 20]))
+    sampler.sample = lambda rids, logits: ("sampled", list(rids))
+    sub = _sub(sampler, rows=("r1", "r2"))
+    sub.kv = SimpleNamespace(
+        _check_open=lambda call: None, label="main",
+        positions=SimpleNamespace(pos_ids=lambda label: torch.tensor([10, 20])),
+    )
     sub.model = _Decoder()
     static_ids, static_cos = torch.tensor([9, 9]), torch.full((3, 2), 7.0)
 
     def run(captured):
         calls.clear()
-        engine_inputs = SimpleNamespace(
-            resources={SAMPLER: sampler, ATTN: object()}, request_ids=["r1", "r2"], captured=captured,
-        )
+        sub.sampler._drawn = 0
+        engine_inputs = SimpleNamespace(captured=captured)
         out = LLMSubmodule._forward(
             sub, "decode", engine_inputs, cos_3d=static_cos, sin_3d=static_cos, input_ids=static_ids,
         )
-        assert out == "sampled"
+        assert out == ("sampled", ["r1", "r2"])
         return dict(calls)
 
     c = run(True)

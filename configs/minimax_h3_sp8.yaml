@@ -9,7 +9,6 @@ max_seq_len: 8192
 # it between denoise steps on all eight. Both compiled. The Qwen3-VL-32B conditioner and the
 # audio decoder on rank 0, the keyframe encoder on rank 1.
 model_kwargs:
-  attention_backend: flashinfer
   compile: true
   vae_tile_batch: 28
   vae_compile: true

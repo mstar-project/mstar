@@ -30,17 +30,20 @@ from mstar.engine.accelerator_graph_config import (
     PiecewiseCallInputs,
 )
 from mstar.engine.engine import ExecutingBatch
-from mstar.engine.resources import (
-    AttentionStep,
-    KVStep,
-    PositionStep,
-    SamplerStep,
+from mstar.engine.state import (
+    ArrayStep,
+    SampleStep,
     Segment,
     SlotLease,
     SubmoduleStep,
+    at_last_token,
+    host,
+    kernel_setting,
+    last_sampled,
+    position,
+    positions,
+    sample,
 )
-from mstar.engine.resources.attn.flashinfer import FlashInferManager
-from mstar.engine.resources.sampler.resource import SamplerResource
 from mstar.model.components.aut_encoder import AuTEncoder
 from mstar.model.components.aut_submodule import AuTEncoderSubmodule
 from mstar.model.components.block_loop_encoder import PackedBlockLoopEncoder
@@ -62,17 +65,17 @@ from mstar.model.qwen3_omni.components.talker import Qwen3OmniTalkerModel
 from mstar.model.qwen3_omni.components.vision import Qwen3OmniVisionTower
 from mstar.model.qwen3_omni.config import (
     AUDIO_ATTN,
+    AUDIO_TOKENS,
     CODE_PRED_SAMPLER,
-    TALKER_ATTN,
     TALKER_KV,
-    TALKER_POS,
     TALKER_SAMPLER,
-    THINKER_ATTN,
+    TALKER_TEXT,
     THINKER_KV,
     THINKER_MIXED,
-    THINKER_POS,
     THINKER_SAMPLER,
     THINKER_TEXT_DECODE,
+    VISION_ATTN,
+    VISION_TOKENS,
     Qwen3OmniModelConfig,
 )
 from mstar.model.qwen3_omni.qwen3_omni_model import TEXT_BEFORE, image_span
@@ -132,8 +135,14 @@ class AudioEncoderSubmodule(AuTEncoderSubmodule):
     ENCODE_CAPTURE_BATCH_SIZES = [8]
 
     def __init__(self, audio_encoder: AuTEncoder, config: Qwen3OmniModelConfig):
-        super().__init__(audio_encoder, attn_key=AUDIO_ATTN)
+        super().__init__(audio_encoder, array=AUDIO_TOKENS)
         self.config = config
+
+    def bind_state(self, handles: Mapping[str, Any]) -> None:
+        self.audio = handles[AUDIO_TOKENS]
+
+    def max_segments_per_request(self) -> int:
+        return kernel_setting(self.audio, AUDIO_ATTN, "max_segments_per_request")
 
     def prepare_inputs(
         self,
@@ -175,6 +184,18 @@ class VisionEncoderSubmodule(PackedBlockLoopEncoder):
 
     def __init__(self, vision_encoder: Qwen3OmniVisionTower, config: Qwen3OmniModelConfig):
         super().__init__(vision_encoder, config.vision, "vision_embeds")
+
+    def bind_state(self, handles: Mapping[str, Any]) -> None:
+        self.vision = handles[VISION_TOKENS]
+
+    def _declare(
+        self, rows: Sequence[tuple[Any, Mapping[str, Sequence[int]]]], attention: bool = True,
+    ) -> SubmoduleStep:
+        state = {VISION_TOKENS: ArrayStep()} if attention else {}
+        return SubmoduleStep(segments=super()._declare(rows).segments, state=state)
+
+    def max_segments_per_step(self) -> int:
+        return kernel_setting(self.vision, VISION_ATTN, "max_segments_per_step")
 
     def prepare_inputs(
         self,
@@ -294,6 +315,10 @@ class ThinkerSubmodule(ARNodeSubmodule):
         self._vision_bos_embed: torch.Tensor | None = None
         self._vision_eos_embed: torch.Tensor | None = None
 
+    def bind_state(self, handles: Mapping[str, Any]) -> None:
+        self.kv = handles[THINKER_KV]
+        self.sampler = handles[THINKER_SAMPLER]
+
     def _get_inv_freq(self, device: torch.device) -> torch.Tensor:
         """Lazy-initialize and cache inverse frequencies."""
         if self._inv_freq is None or self._inv_freq.device != device:
@@ -386,9 +411,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
             )
 
         # an audio or vision row's own positions start from the stream's counter
-        start_pos = self.node_resources[THINKER_POS].position(
-            rid=fwd_info.rid_handle, label="main"
-        )
+        start_pos = position(self.kv, fwd_info.rid_handle, "main")
         if graph_walk == "prefill_audio":
             return self._audio_row(fwd_info, inputs, start_pos)
 
@@ -625,19 +648,10 @@ class ThinkerSubmodule(ARNodeSubmodule):
                     span=inp.input_seq_len,
                 ) for rid, inp in zip(request_ids, inputs, strict=True)
             ],
-            steps={
-                THINKER_KV: KVStep(),
-                THINKER_ATTN: AttentionStep(causal=True),
-                THINKER_SAMPLER: SamplerStep(
-                    apply_penalty=True,
-                    prefill_tracked_tokens=prefill_tokens,
-                    kept_rids=kept_rids,
-                ),
-                THINKER_POS: PositionStep(
-                    advance=pos_advance
-                )
+            state={
+                THINKER_KV: ArrayStep(advance=pos_advance),
+                THINKER_SAMPLER: SampleStep(prompt_tokens=prefill_tokens, kept_rows=kept_rids),
             },
-
         )
 
     def preprocess(
@@ -717,7 +731,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
         )}
 
     def _position_ids_3d(self, inputs: list[ARNodeInputs]) -> torch.Tensor:
-        return mrope_position_ids(self.node_resources[THINKER_POS].pos_ids("main"), inputs)
+        return mrope_position_ids(positions(self.kv), inputs)
 
     def _decode_tokens(
         self, engine_inputs: ModelInputsFromEngine, inputs: list[ARNodeInputs], decode: list[int],
@@ -726,8 +740,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
         slot master."""
         masters = None
         if any(inputs[i].input_ids is None for i in decode):
-            sampler: SamplerResource = engine_inputs.resources[THINKER_SAMPLER]
-            masters = sampler.loopback_tokens()
+            masters = last_sampled(self.sampler)
         return torch.cat([
             masters[i:i + 1] if inputs[i].input_ids is None else inputs[i].input_ids for i in decode
         ])
@@ -763,7 +776,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
         embeds = self.model.model.embed_tokens(input_ids)
         if cos_3d is None:
             # one token per row, at the position resource's planned positions
-            pos = self.node_resources[THINKER_POS].pos_ids("main")[:input_ids.shape[0]]
+            pos = positions(self.kv)[:input_ids.shape[0]]
             cos_3d, sin_3d = compute_3d_cos_sin(
                 pos.unsqueeze(0).expand(3, -1), self._get_inv_freq(embeds.device),
                 mrope_section=self.MROPE_SECTION, target_dtype=embeds.dtype,
@@ -772,11 +785,10 @@ class ThinkerSubmodule(ARNodeSubmodule):
             input_embeds=embeds,
             cos_sin_3d=(cos_3d, sin_3d),
             mrope_section=self.MROPE_SECTION,
-            label="main",
             num_valid_tokens=num_valid_tokens,
             keep_states=keep_states,
         )
-        return engine_inputs.resources[THINKER_SAMPLER].sample(self.model.lm_head(hidden)), layer_0_embed
+        return sample(self.sampler, self.model.lm_head(hidden)), layer_0_embed
 
     def _deepstack_inputs(
         self, inputs: list[ARNodeInputs], dtype: torch.dtype, device: torch.device,
@@ -881,7 +893,6 @@ class ThinkerSubmodule(ARNodeSubmodule):
             cos_sin_3d=cos_sin_3d,
             mrope_section=mrope_section,
             deepstack_visual_embeds=deepstack,
-            label="main",
             num_valid_tokens=kwargs.get("num_valid_tokens"),
         )
 
@@ -889,8 +900,7 @@ class ThinkerSubmodule(ARNodeSubmodule):
 
         # The last prefill samples the first token
         if request_info.step_metadata.get(FINAL_PREFILL, False):
-            logits = self.model.lm_head(hidden[-1:, :])
-            result["new_token"] = [engine_inputs.resources[THINKER_SAMPLER].sample(logits)]
+            result["new_token"] = [sample(self.sampler, self.model.lm_head(hidden[-1:, :]))]
 
         # Pack thinker_states for Talker conditioning ONLY when audio output
         # is requested.  For text-only requests we skip this entirely to
@@ -1073,22 +1083,16 @@ class ThinkerSubmodule(ARNodeSubmodule):
         deepstack = self._collect_deepstack_kwargs(kwargs)
 
         cos_sin_3d = (cos_3d, sin_3d) if cos_3d is not None else None
-        attn_manager: FlashInferManager = engine_inputs.resources[THINKER_ATTN]
         hidden, layer_0_embed, layer_n_hidden = self.model(
             input_embeds=input_embeds,
             cos_sin_3d=cos_sin_3d,
             mrope_section=mrope_section,
             deepstack_visual_embeds=deepstack,
-            label="main",
             num_valid_tokens=kwargs.get("num_valid_tokens"),
         )
 
-        request_ids = engine_inputs.request_ids
-        sampler: SamplerResource = engine_inputs.resources[THINKER_SAMPLER]
-
-        last_hidden = attn_manager.select_last_hidden(hidden)
-        logits = self.model.lm_head(last_hidden)  # (padded_bs, vocab)
-        new_tokens = sampler.sample(logits)
+        logits = self.model.lm_head(at_last_token(self.kv, hidden))  # (padded_bs, vocab)
+        new_tokens = sample(self.sampler, logits)
         if layer_n_hidden is not None:
             thinker_states = torch.cat(
                 [layer_0_embed, layer_n_hidden], dim=-1,
@@ -1220,10 +1224,6 @@ class ThinkerSubmodule(ARNodeSubmodule):
 # 4. TalkerSubmodule (ar engine) -- SECOND MOST COMPLEX
 # ===================================================================
 
-# Talker request state: tts_eos has conditioned one decode step (pad from then on)
-TTS_EOS_FED = "tts_eos_fed"
-
-
 class TalkerSubmodule(ARNodeSubmodule):
     MAX_BATCH_SIZE = 32
 
@@ -1251,6 +1251,11 @@ class TalkerSubmodule(ARNodeSubmodule):
         # Lazy-built suppress mask for layer-0 logits.  Shape (vocab_size,)
         # with True at positions to suppress.  Cached on first forward.
         self._suppress_mask: torch.Tensor | None = None
+
+    def bind_state(self, handles: Mapping[str, Any]) -> None:
+        self.text = handles[TALKER_TEXT]
+        self.sampler = handles[TALKER_SAMPLER]
+        self.cp_sampler = handles[CODE_PRED_SAMPLER]
 
     def init_tts_embeds(self, thinker_embed_tokens: nn.Embedding) -> None:
         """Pre-compute TTS pad/bos/eos hidden states using the Thinker's
@@ -1388,7 +1393,6 @@ class TalkerSubmodule(ARNodeSubmodule):
             seq_len = input_embeds.shape[0]
 
         if graph_walk == "talker_last_prefill":
-            rid = fwd_info.rid_handle
             # Last-prefill is the assistant's first token, which is
             # text-only — Thinker postprocess pre-selected layer-0 for it.
             last_hidden = inputs["thinker_states"][0].to(device)
@@ -1404,12 +1408,9 @@ class TalkerSubmodule(ARNodeSubmodule):
             # the Thinker's next token state (decode is always text), then
             # tts_eos for one step, then tts_pad.
             thinker_states = inputs.get("thinker_states", [])
-            rid = fwd_info.rid_handle
-            # Read, never set, here: a refused admit prepares the step again,
-            # and postprocess marks tts_eos fed once its step has run.
             if thinker_states:
                 text_raw = thinker_states[0]
-            elif not self.request_state(rid).get(TTS_EOS_FED, False):
+            elif not host(self.text, fwd_info.rid_handle, "main", 0)["eos_sent"]:
                 text_raw = self._tts_eos_raw
             else:
                 text_raw = self._tts_pad_raw
@@ -1432,22 +1433,17 @@ class TalkerSubmodule(ARNodeSubmodule):
         piecewise_leases: Mapping[str, SlotLease] | None = None,
         **kwargs,
     ) ->SubmoduleStep:
-        steps = {
-            TALKER_KV: KVStep(),
-            TALKER_ATTN: AttentionStep(causal=True),
-            TALKER_POS: PositionStep()
-        }
+        state: dict[str, ArrayStep | SampleStep] = {TALKER_KV: ArrayStep()}
         if graph_walk in ("talker_last_prefill", "talker_decode"):
-            steps.update(
-                **{
-                    TALKER_SAMPLER: SamplerStep(
-                        apply_penalty=True,
-                    ),
-                    CODE_PRED_SAMPLER: SamplerStep(
-                        apply_penalty=False
-                    )
-                }
-            )
+            state[TALKER_SAMPLER] = SampleStep()
+            state[CODE_PRED_SAMPLER] = SampleStep(apply_penalty=False)
+        # the rows that condition on tts_eos in this step, so `prepare_inputs` doesn't send it to them again
+        eos_rows = {
+            (rid, "main", 0): {"eos_sent": True} for rid, inp in zip(request_ids, inputs, strict=True)
+            if inp.tensor_inputs.get("text_raw") is self._tts_eos_raw
+        }
+        if eos_rows:
+            state[TALKER_TEXT] = ArrayStep(host=eos_rows)
         return SubmoduleStep(
             segments=[
                 Segment(
@@ -1456,7 +1452,7 @@ class TalkerSubmodule(ARNodeSubmodule):
                     span=inp.input_seq_len,
                 ) for rid, inp in zip(request_ids, inputs, strict=True)
             ],
-            steps=steps
+            state=state,
         )
 
     def preprocess(
@@ -1501,15 +1497,11 @@ class TalkerSubmodule(ARNodeSubmodule):
     def _forward_prefill(
         self, input_embeds: torch.Tensor,
     ):
-        self.model(
-            input_embeds=input_embeds, label="main",
-        )
+        self.model(input_embeds=input_embeds)
         return {}
 
     def _forward_decode_like(
         self,
-        talker_sampler: SamplerResource,
-        code_pred_sampler: SamplerResource,
         is_batched_decode: bool,
         input_embeds: torch.Tensor,
         last_token_indices: torch.Tensor | None = None,
@@ -1527,9 +1519,7 @@ class TalkerSubmodule(ARNodeSubmodule):
         the batched-decode (``hidden`` is already ``(bs, hidden)``) and
         non-batched (``hidden[-1:, :]``) branches.
         """
-        hidden = self.model(
-            input_embeds=input_embeds, label="main",
-        )
+        hidden = self.model(input_embeds=input_embeds)
         if last_token_indices is not None:
             last_hidden = hidden.index_select(0, last_token_indices)
         elif not is_batched_decode:
@@ -1541,13 +1531,13 @@ class TalkerSubmodule(ARNodeSubmodule):
         # Apply the repetition penalty to the Talker's layer-0 codes (the code
         # predictor depth loop below samples through its own aux config and
         # stays penalty-free). The penalty is baked into the captured graph.
-        layer0_codes = talker_sampler.sample(logits)
+        layer0_codes = sample(self.sampler, logits)
 
         # Groups 1..15 sample from the "code_predictor" aux sampler's static
         # buffers, so per-request values survive graph replay.
         all_codes, codec_emb_sum = self.code_predictor.depth_loop(
             last_hidden, layer0_codes, self.talker_code_emb(layer0_codes),
-            code_pred_sampler.sample,
+            lambda cp_logits: sample(self.cp_sampler, cp_logits),
         )
 
         return {
@@ -1569,8 +1559,6 @@ class TalkerSubmodule(ARNodeSubmodule):
             )
         input_embeds = self._add_text_conditioning(input_embeds, kwargs.pop("text_raw", None))
         return self._forward_decode_like(
-            talker_sampler=engine_inputs.resources[TALKER_SAMPLER],
-            code_pred_sampler=engine_inputs.resources[CODE_PRED_SAMPLER],
             input_embeds=input_embeds,
             is_batched_decode=(graph_walk == "talker_decode"),
             **kwargs
@@ -1603,10 +1591,7 @@ class TalkerSubmodule(ARNodeSubmodule):
         )
 
         if graph_walk == "talker_prefill":
-            hidden = self.model(
-                input_embeds=input_embeds,
-                label="main",
-            )
+            hidden = self.model(input_embeds=input_embeds)
             return {
                 "__batched_talker_prefill_hidden__": hidden,
             }
@@ -1620,8 +1605,6 @@ class TalkerSubmodule(ARNodeSubmodule):
             )
 
         fwd_out = self._forward_decode_like(
-            talker_sampler=engine_inputs.resources[TALKER_SAMPLER],
-            code_pred_sampler=engine_inputs.resources[CODE_PRED_SAMPLER],
             is_batched_decode=True,
             last_token_indices=last_token_indices,
             input_embeds=input_embeds,
@@ -1645,11 +1628,8 @@ class TalkerSubmodule(ARNodeSubmodule):
         self, request_id: str,
         request_info: CurrentForwardPassInfo,
         outputs: dict[str, list[torch.Tensor]],
-        inputs: NodeInputs | None = None,
         **kwargs
     ):
-        if inputs is not None and inputs.tensor_inputs.get("text_raw") is self._tts_eos_raw:
-            self.request_state(request_id).add(TTS_EOS_FED, True)
         if "new_token" not in outputs:
             return
         # Rename new_token → layer0_codes for downstream graph routing.

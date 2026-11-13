@@ -32,6 +32,7 @@ from mstar.engine.resources.lora.checkpoint import normalize_lora_key, parse_lor
 from mstar.engine.resources.lora.serving import lora_spec  # noqa: E402
 from mstar.engine.resources.spec import instance_key  # noqa: E402
 from mstar.engine.resources.step import PIECEWISE_WALK, BucketKey, SlotLease, StepContext  # noqa: E402
+from mstar.engine.state.adapters import node_handles, state_steps  # noqa: E402
 from mstar.model.components.block_loop_encoder import VISION_BLOCK_LOOP  # noqa: E402
 from mstar.model.components.lora.capable import make_lora_capable  # noqa: E402
 from mstar.model.components.lora.modules import _check  # noqa: E402
@@ -43,6 +44,7 @@ from mstar.model.qwen3_5.lora import qwen3_5_lora_spec  # noqa: E402
 from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel  # noqa: E402
 from mstar.model.qwen3_5.submodules import VisionEncoderSubmodule  # noqa: E402
 from mstar.model.submodule_base import engine_step, with_segment_steps  # noqa: E402
+from mstar.testing_utils.model import make_model  # noqa: E402
 
 FIXTURES = Path(__file__).parent / "fixtures"
 # the vision node's pool, as the engine keys it (`LoraSpec.for_node`)
@@ -216,7 +218,7 @@ def test_the_api_server_keeps_the_experts_targets_the_yaml_names_and_refuses_the
     c = stack.config()
     path, _ = H.make_adapter(tmp_path / "a1.safetensors", stack.a1(c), 4, 8.0, 100, stack.embedding,
                              stack.a1_rename)
-    model = SimpleNamespace(get_node_resources=lambda: [stack.lora_spec(c)])
+    model = make_model(get_node_resources=lambda: [stack.lora_spec(c)])
     declared = stack.lora_spec(c)
     assert {"experts_gate_up_proj", "experts_down_proj"} == set(declared.dropped_targets)
     named = _declared(declared)
@@ -392,6 +394,8 @@ def _vision_node(model, resources=None) -> VisionEncoderSubmodule:
     sub = VisionEncoderSubmodule(model, vision_config(), "vision_embeds", (half, half))
     sub._frames = _FrameAttend()
     sub.bind_node_resources({VISION_ATTN: sub._frames, **(resources or {})})
+    declaring = H.model_object(Qwen3_5DenseModel, H.tiny_config(), vision_config=vision_config(), sampling_defaults={})
+    sub.bind_node_state(node_handles(declaring, "vision_encoder", {VISION_ATTN: sub._frames}))
     return sub
 
 
@@ -412,8 +416,15 @@ def _encode(sub, rid="r"):
     inp = _prompt(sub)
     sub._frames.lengths = list(inp.resource_step_info["main"])
     kwargs = sub.preprocess("encode", _engine(rid), [inp])
-    with torch.no_grad():
-        return sub.forward_batched("encode", _engine(rid), **kwargs)[rid]["vision_embeds"][0]
+    # its handle open, as the engine opens it around the forward
+    step = engine_step(sub, "encode", [rid], [inp])
+    step.set_ctx(StepContext(request_ids=(rid,), graph_walk="encode", slot=0, capture=False))
+    step.begin_calls()
+    try:
+        with torch.no_grad():
+            return sub.forward_batched("encode", _engine(rid), **kwargs)[rid]["vision_embeds"][0]
+    finally:
+        step.end_calls()
 
 
 def _vision_pool(paths, max_slots=2):
@@ -455,13 +466,20 @@ def _encode_leased(sub, lora_pool):
             kwargs["pixel_values"], kwargs["indices"], kwargs["weights"], kwargs["position_ids"],
         )
         seq_lens = list(kwargs["segment_lengths"]["main"])
-        # the runner's step for the region (`with_segment_steps` over `region_step`)
-        region = with_segment_steps(region_cfg.region_step(["r"], seq_lens), sub.segment_keys)
+        # the runner's step for the region (`with_segment_steps` and `state_steps` over `region_step`)
+        region = state_steps(
+            with_segment_steps(region_cfg.region_step(["r"], seq_lens), sub.segment_keys), sub.state_handles,
+        )
         assert sum(seg.span for seg in region.steps[VISION_POOL].segments) == PATCHES
         lora, ctx = _admit(lora_pool, region, "r", None, walk=PIECEWISE_WALK, lease=lease)
         sub._frames.lengths = seq_lens
         pad = (0, 0, 0, bucket - PATCHES)
-        encoded = sub.model.encode(F.pad(hidden, pad), F.pad(cos, pad), F.pad(sin, pad))[:PATCHES]
+        region.set_ctx(ctx)
+        region.begin_calls()
+        try:
+            encoded = sub.model.encode(F.pad(hidden, pad), F.pad(cos, pad), F.pad(sin, pad))[:PATCHES]
+        finally:
+            region.end_calls()
         lora_pool.commit(lora, ctx)
         return sub.model.merger(encoded)
 
@@ -560,8 +578,9 @@ def test_qwen3_5_vision_prompt_text_takes_its_embedding_delta_in_a_padded_step(t
     step's forward, also when a capture bucket pads the step with a dummy row: three image
     prompts on the bs-4 bucket, against merged weights. The image rows are spliced in at
     their pads as they are."""
+    from mstar.model.keys import ROPE
     from mstar.model.multimodal import vision_encoder
-    from mstar.model.qwen3_5.config import ATTN, ROPE, SAMPLER
+    from mstar.model.qwen3_5.config import ATTN, SAMPLER
     from mstar.model.qwen3_5.submodules import LLMSubmodule
 
     embed = f"{H.TEXT}embed_tokens"
@@ -574,7 +593,13 @@ def test_qwen3_5_vision_prompt_text_takes_its_embedding_delta_in_a_padded_step(t
     encoder = vision_encoder()
     llm = LLMSubmodule(H.build_stack(base, config=config), config, vision_config(), (encoder,))
     llm.bind_node_resources({LORA_RESOURCE_KEY: lora_pool})
-    llm.node_resources[ROPE] = SimpleNamespace(position=lambda rid, label: 0, pos_ids=lambda label: torch.zeros(64))
+    # the decoder stack, head, last-token select and sampler stubbed: the forward's
+    # embedded and spliced step is what reaches the stack
+    H._stub_cores(llm, H._Rows(), {
+        ROPE: SimpleNamespace(position=lambda rid, label: 0, pos_ids=lambda label: torch.zeros(64)),
+        ATTN: SimpleNamespace(select_last_hidden=lambda hidden, label: hidden),
+        SAMPLER: SimpleNamespace(sample=lambda rids, logits: logits),
+    })
 
     table = H.merged(base, {embed: ref[embed]}, (embed,))[embed + ".weight"]
     rows, want = [], []
@@ -593,16 +618,16 @@ def test_qwen3_5_vision_prompt_text_takes_its_embedding_delta_in_a_padded_step(t
     padded = [*rows, *config_v.get_node_inputs(1, 0)]
     assert len(padded) == 4 and padded[-1].input_seq_len == 0
 
-    # the decoder stack, head, last-token select and sampler stubbed: the forward's
-    # embedded and spliced step is what reaches the stack
     seen = []
     llm.model.forward = lambda embeds, **_: seen.append(embeds) or embeds
     llm.model.logits = lambda hidden: hidden
-    engine = SimpleNamespace(captured=False, request_ids=[f"r{i}" for i in range(4)], resources={
-        SAMPLER: SimpleNamespace(sample=lambda logits: logits),
-        ATTN: SimpleNamespace(select_last_hidden=lambda hidden: hidden),
-    })
+    rids = [f"r{i}" for i in range(4)]
+    engine = SimpleNamespace(captured=False, request_ids=rids, resources={})
     H.plan([lora_pool], [(f"r{i}", "e", row.input_seq_len) for i, row in enumerate(rows)])
+    step = engine_step(llm, "prefill_vision", rids, padded)
+    step.set_ctx(StepContext(request_ids=tuple(rids), graph_walk="prefill_vision", slot=0, capture=False))
+    step.begin_calls()
     with torch.no_grad():
         llm._forward("prefill_vision", engine, **llm.preprocess("prefill_vision", engine, padded))
+    step.end_calls()
     torch.testing.assert_close(seen[0], torch.cat(want))
