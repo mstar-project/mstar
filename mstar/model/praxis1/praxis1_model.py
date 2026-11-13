@@ -16,10 +16,15 @@ The graph follows that shape:
   the expert reads the backbone's taps inside the same iteration, so the two
   nodes sit in one loop body rather than in separate walks.
 
-The video of a chunk is predicted whether or not anyone wants to look at it:
-it is what conditions the next call. Decoding that video back to pixels is not
-part of this graph yet: there is no VAE decoder node, and the predicted latents
-end the walk at ``action_head``.
+The video a chunk predicts is denoised alongside the actions: the action
+expert reads the backbone's hidden states as the video settles. It does not
+condition the next call. The next call is conditioned on the real camera
+frames taken while the robot executed the rows: the reference keeps those per
+session, encodes them again on each call, and refuses to condition on its own
+predictions, because the model trained on real frames only. Carrying those
+frames across requests is the episode-state work and not part of this graph.
+The predicted video latents end at the denoise loop, and nothing predicted
+leaves the walk except the action rows.
 
 Nothing here serves yet. The nodes have no computation until the compute port
 lands, so a served model is refused at construction, before it fetches
@@ -197,8 +202,9 @@ class Praxis1Model(Model):
         )
 
         # The observation: one tile per camera view on a single canvas, taken
-        # to latents once per call. The executed past arrives as clean latents
-        # the client already has, so only the new frames are encoded here.
+        # to latents once per call. It encodes only the frames this request
+        # carries; the reference's context of executed real frames needs state
+        # held across requests, which lands with the episode-state work.
         vae_encoder = GraphNode(
             name="vae_encoder",
             input_names=["image_inputs"],
@@ -239,26 +245,26 @@ class Praxis1Model(Model):
             section=Sequential([backbone, action_expert]),
             # Ceiling only; get_loop_caps gives each request its step count.
             max_iters=self.max_denoise_steps,
+            # Only the actions leave the loop. The predicted video has no
+            # reader after the last step: the reply is command rows, and the
+            # next call is conditioned on real frames, not on this video.
             outputs=[
                 GraphEdge(next_node="action_head", name="action_latents"),
-                GraphEdge(next_node="action_head", name="video_latents"),
             ],
         )
 
-        # The head turns the settled action latents into command rows. It is
-        # its own node because the video latents leave the walk here too, as
-        # the chunk's persisted latents. Nothing decodes them to pixels yet;
-        # a decoder node would read them here when that lands.
+        # The head turns the settled action latents into command rows. That
+        # happens once per call, after the last Euler step, so it sits after
+        # the loop rather than in its body.
         action_head = GraphNode(
             name="action_head",
-            input_names=["action_latents", "video_latents"],
+            input_names=["action_latents"],
             outputs=[
                 GraphEdge(
                     next_node=EMIT_TO_CLIENT,
                     name="actions",
                     output_modality="action",
                 ),
-                GraphEdge(next_node=EMPTY_DESTINATION, name="chunk_latents", persist=True),
             ],
         )
 

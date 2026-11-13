@@ -17,6 +17,7 @@ import yaml
 
 from mstar.conductor.conductor import Conductor
 from mstar.graph.base import GraphNode, Loop, Sequential
+from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.praxis1 import praxis1_model
 from mstar.model.praxis1.config import Praxis1Config, Praxis1ConfigError
 from mstar.model.praxis1.praxis1_model import DENOISE_LOOP_NAME, Praxis1Model
@@ -226,15 +227,24 @@ def test_the_denoise_loop_carries_both_latents(tmp_path, monkeypatch):
     # Both latents loop back for the next step.
     assert {edge.name for edge in expert.outputs} == {"video_latents", "action_latents"}
     assert all(edge.next_node == "backbone" for edge in expert.outputs)
-    # and leave the loop once it settles.
-    assert {edge.name for edge in loop.outputs} == {"video_latents", "action_latents"}
+    # Only the actions leave once it settles: the predicted video has no reader.
+    assert {edge.name for edge in loop.outputs} == {"action_latents"}
 
 
-def test_the_actions_are_what_reaches_the_client(tmp_path, monkeypatch):
+def test_the_actions_are_all_that_leaves_the_chunk_walk(tmp_path, monkeypatch):
+    """The next call is conditioned on real frames, never on the predicted
+    video, so a chunk walk persists nothing and hands the client only rows."""
     model = _model(tmp_path, DROID_CONFIG, monkeypatch)
-    head = _node(model.get_graph_walk_graphs()[model.CHUNK_WALK], "action_head")
-    emitted = [edge for edge in head.outputs if edge.output_modality]
-    assert [(edge.name, edge.output_modality) for edge in emitted] == [("actions", "action")]
+    chunk = model.get_graph_walk_graphs()[model.CHUNK_WALK]
+    edges = [edge for node in chunk.get_nodes().values() for edge in node.outputs]
+    edges += [edge for loop in chunk.get_loops().values() for edge in loop.outputs]
+
+    to_client = [edge for edge in edges if edge.next_node == EMIT_TO_CLIENT]
+    assert [(edge.name, edge.output_modality) for edge in to_client] == [("actions", "action")]
+    assert [edge.name for edge in edges if edge.persist] == []
+    # No edge carries the predicted video past the loop.
+    head = _node(chunk, "action_head")
+    assert "video_latents" not in head.input_names
 
 
 def test_the_served_model_reads_the_checkpoint_config(tmp_path, monkeypatch, no_download):
