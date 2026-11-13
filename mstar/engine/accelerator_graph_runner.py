@@ -896,8 +896,10 @@ class AcceleratorGraphRunner:
             # of their kernels; `prepare_for_capture` keeps those whose step drives them.
             # A twin shares its bucket's compiled forward, static buffers and padding rows.
             config_type = config.get_config_type()
+            # a verifying node's mixed capture twins as a batched one (`MixedVerifyGraphConfig`)
+            verify_twins = getattr(config, "verify_lean_twins", False)
             leans = (frozenset(), *lean_subsets(
-                [key for key in lean_keys if self._resources[key].lean_captures(config_type)]
+                [key for key in lean_keys if verify_twins or self._resources[key].lean_captures(config_type)]
             ))
             for bs in self._batch_sizes(config):
                 for num_tokens in config.get_total_tokens(bs):

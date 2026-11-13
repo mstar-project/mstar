@@ -283,3 +283,31 @@ def test_a_lean_verify_step_reads_the_argmax_and_a_full_one_the_probs(monkeypatc
         outs[lean] = driver.out
         assert (calls["greedy"] > 0, calls["probs"] > 0) == (lean, not lean), calls
     assert outs[True] == outs[False]
+
+
+def test_a_mixed_verify_capture_twins_its_lean_resources_and_a_prompt_capture_doesnt(monkeypatch):
+    """`MixedVerifyGraphConfig`: a verifying node's mixed capture gets the twins a batched capture gets, though
+    its lean resource takes no packed capture's twin (a prompt step's, one sampled token a row)."""
+    import test_lean_captures as lc
+
+    from mstar.engine.accelerator_graph_config import BatchedAcceleratorGraphConfig, PackedAcceleratorGraphConfig
+    from mstar.engine.resources.draft.capture import MixedVerifyGraphConfig
+    from mstar.model.submodule_base import ARNodeInputs
+
+    def row(n):
+        return ARNodeInputs(input_seq_len=n)
+
+    monkeypatch.setattr(lc, "_configs", lambda: [
+        BatchedAcceleratorGraphConfig(capture_graph_walk="decode", capture_batch_sizes=[4],
+                                      single_request_inputs=row(4)),
+        PackedAcceleratorGraphConfig(capture_graph_walk="prefill", capture_token_lengths=[16],
+                                     capture_batch_sizes=[1], make_node_input=row),
+        MixedVerifyGraphConfig(capture_graph_walk="mixed", capture_token_lengths={4: [32]},
+                               capture_batch_sizes=[4], make_node_input=row),
+    ])
+    lean = frozenset({"sampler"})
+    listed = lc._listed(lc._capture_runner({"sampler": lc._BatchedOnly(), "plain": lc._Plain()})._get_slot_specs())
+    assert listed == {
+        ("decode", 4, frozenset()), ("decode", 4, lean), ("prefill", 1, frozenset()),
+        ("mixed", 4, frozenset()), ("mixed", 4, lean),
+    }

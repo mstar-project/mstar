@@ -249,3 +249,30 @@ def test_verify_rows_in_a_combined_step_the_node_doesnt_run_mixed_are_refused():
     driver.eng._split_prompt_walks[(NODE, "mixed")] = frozenset({"prefill"})
     with pytest.raises(RuntimeError, match="rows inside a combined step"):
         driver.mixed_step([1], {4: LATE[4]})
+
+
+# ── lean mixed steps ──
+
+
+def test_a_lean_mixed_step_verifies_by_the_argmax_and_replies_as_a_full_one(monkeypatch):
+    """An all-greedy mixed step runs its sampler lean (`lean_for` over every row, its prompt rows' too): its verify
+    rows take `greedy_verify`, a refused prompt row the argmax at its first position, and it builds no
+    vocabulary's probs. A full mixed step builds them. The replies agree."""
+    from test_spec_greedy_verify import _counting
+
+    calls = _counting(monkeypatch)
+    outs = {}
+    for lean in (False, True):
+        driver = Driver(engine(K, oracle, mixed=True, greedy_capture=lean))
+        for rid, prompt in PROMPTS.items():
+            driver.add(rid, prompt, MAX)
+        for _ in range(2):
+            driver.step(list(PROMPTS))
+        for rid in LATE:
+            driver.add(rid, None, MAX)
+        calls.update(greedy=0, probs=0)
+        stopped = driver.mixed_step(list(PROMPTS), LATE)
+        assert (calls["greedy"] > 0, calls["probs"] > 0) == (lean, not lean), calls
+        driver.run([rid for rid in [*PROMPTS, *LATE] if not stopped[rid]])
+        outs[lean] = driver.out
+    assert outs[True] == outs[False]
