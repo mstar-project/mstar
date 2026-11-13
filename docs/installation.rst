@@ -603,7 +603,9 @@ frontend (``ADAPTER_REGISTRY`` in ``mstar/api_server/openai/adapters.py``):
 ported class is served. Chat, speech, images, videos and transcriptions are
 served for every model the Python frontend serves them for; a transcription's
 upload is decoded and cut into windows by the API server's ``WindowPlanner``,
-over the bridge, so both frontends read the same formats. The WebSocket
+over the bridge, so both frontends read the same formats; a PCM WAV of one
+window, which the planner would pass whole, is planned from its header without
+that round trip. The WebSocket
 routes are served too: ``/generate/ws``, ``/v1/realtime`` (conversations with
 full-duplex models, and transcription, whose server turn detection runs Silero
 through the ONNX Runtime library ``onnxruntime`` ships; ``semantic_vad`` asks the

@@ -742,8 +742,12 @@ def check_kv_pools_fit(model, config: dict, config_path: str, log: logging.Logge
             continue
         kv = spec.config
         # in arena pages: a request at full length holds every token of every group, a window's
-        # too, since a one-step prefill keeps its whole prompt until it commits
-        per_request = sum(-(-kv.max_seq_len // group.page_size) for group in kv.groups)
+        # too, since a one-step prefill keeps its whole prompt until it commits. A pool placed by
+        # position over a node group's ranks pages its window groups as `placed_groups` does
+        per_request = max(
+            sum(-(-kv.max_seq_len // group.page_size) for group in groups)
+            for groups in (kv.groups, *_placed_groups(spec, config.get("node_groups") or ()))
+        )
         need = 1 + cap * per_request
         if need > kv.num_units:
             raise ValueError(
@@ -753,3 +757,18 @@ def check_kv_pools_fit(model, config: dict, config_path: str, log: logging.Logge
                 f"which has {kv.max_num_pages}; raise max_num_pages or lower "
                 "max_concurrent_requests"
             )
+
+
+def _placed_groups(spec, node_groups) -> list:
+    """The groups of ``spec``'s pool placed over each node group of ``node_groups`` it runs on,
+    where it sets ``context_parallel``; a group it can't place on is validation's to report."""
+    kv, placed = spec.config, []
+    for group in node_groups if kv.context_parallel else ():
+        if not spec.nodes & set(group.get("node_names", ())):
+            continue
+        try:
+            placed.append(kv.paged_for(spec.resource_key, group.get("tp_size", 1), group.get("sp_size", 1)).groups)
+        except ValueError:
+            pass
+    return placed
+

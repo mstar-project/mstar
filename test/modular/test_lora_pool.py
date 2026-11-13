@@ -34,6 +34,7 @@ from mstar.engine.resources.step import (  # noqa: E402
     Segment,
     SlotLease,
     StepContext,
+    SubmoduleStep,
 )
 from mstar.model.components.lora.modules import ModuleLoraMap  # noqa: E402
 from mstar.model.loader.base import CheckpointRules, StackedParamRule  # noqa: E402
@@ -544,19 +545,39 @@ def test_a_lora_refusal_does_not_look_for_an_eviction_victim(caplog):
 @pytest.mark.parametrize("axis", [axis for axis in PARALLEL_AXES if axis != "tp"])
 def test_a_node_running_sequence_or_cfg_parallelism_refuses_lora(adapters, axis):
     """LoRA rows are per request over the whole batch, not per SP shard or CFG branch: the
-    build refuses either axis above 1 at startup, and takes TP with both at 1."""
+    build refuses CFG above 1, a node splitting its steps over SP ranks is refused before the
+    build, and it takes TP with both at 1, and a node whose steps run copied over KV placed over
+    its SP ranks (heads split over TP alone), which runs every row on every SP rank."""
     from mstar.distributed.communication import CommGroup, JointGroups
+    from mstar.engine.resources.sequence_shard import SeqShardSpec, sequence_parallel_refusals
 
     _, paths = adapters
+    sp2 = CommGroup(my_global_rank=0, my_group_rank=0, group_members=[0, 1])
 
-    def build(group):
+    def build(group, replicated_over_sp=False):
         groups = JointGroups(tp_group=CommGroup.trivial(), sp_group=CommGroup.trivial(), instance=group)
         setattr(groups, f"{axis}_group", group)
-        return LoraAdapterPool.build(make_spec(paths), EngineResourceInfo(device=CPU, joint_comm_group=groups))
+        info = EngineResourceInfo(device=CPU, joint_comm_group=groups, replicated_over_sp=replicated_over_sp)
+        return LoraAdapterPool.build(make_spec(paths), info)
 
-    with pytest.raises(ValueError, match=rf"at {axis}_size 2, which LoRA does not support"):
-        build(CommGroup(my_global_rank=0, my_group_rank=0, group_members=[0, 1]))
     assert build(CommGroup.trivial()).targets
+    if axis == "cfg":
+        with pytest.raises(ValueError, match=r"at cfg_size 2, which LoRA does not support"):
+            build(sp2)
+    else:
+        assert build(sp2, replicated_over_sp=True).targets
+        shard = SeqShardSpec("shard", {"LLM"}, ("main",), 0)
+        assert any(
+            "LoRA resource 'lora' serves node 'LLM', which splits tokens over 2 SP ranks" in refusal
+            for refusal in sequence_parallel_refusals([make_spec(paths), shard], "LLM", 1, 2)
+        )
+
+
+def test_a_replicated_slice_that_does_not_split_evenly_is_refused():
+    """A column slice of fewer units (KV heads) than ranks is a config error unless they divide
+    the ranks, as for the base K/V projection."""
+    with pytest.raises(ValueError, match="do not split evenly"):
+        LoraTarget(in_features=HIDDEN, out_slices=(12,), parallel="column", slice_units=(3,)).shard(4)
 
 
 def test_the_api_server_pins_digests_and_narrows_targets_in_the_config_it_hands_on(adapters):
@@ -909,3 +930,10 @@ def test_a_pool_does_not_hold_its_node_off_resident_planning(adapters):
 
     planner, why = build_planner("LLM", ("decode",), {"lora": make_pool(adapters[1])}, {}, torch.device("cpu"), 4)
     assert planner is not None and why == ""
+
+
+def test_a_step_on_a_lora_pool_is_refused_a_repeat_naming_the_pool(adapters):
+    """It plans on the host each step, so a replay with no host between would reuse stale addressing."""
+    runner = lora_runner(make_pool(adapters[1]))
+    refusal = runner.repeat_refusal(SubmoduleStep(steps={"lora": step(["r1"])}, _ctx=ctx(["r1"])))
+    assert refusal is not None and "'lora'" in refusal

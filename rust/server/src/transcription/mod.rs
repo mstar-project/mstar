@@ -6,12 +6,14 @@
 //! hands it to the API server's `WindowPlanner` over the bridge
 //! ([`Planner`]): the planner decodes it with the model's own loader, which
 //! reads formats no Rust decoder does (WebM, Opus, m4a), and cuts the windows a
-//! model with a clip bound hears. Everything else runs here, as the Python
+//! model with a clip bound hears. A PCM WAV of one window is planned here
+//! from its header, with no message to the planner. Everything else runs here, as the Python
 //! module runs it: the parallel and sequential long-form drivers, the
 //! temperature fallback, the merge, and the response formats (see that
 //! module's docstring).
 
 mod drive;
+pub use drive::remove_local_uploads;
 mod format;
 mod request;
 mod zlib;
@@ -366,6 +368,7 @@ async fn create_transcription(
         Ok(checked) => checked,
         Err(e) => return error(400, &e),
     };
+    let wav_seconds = drive::wav_header_seconds(&audio);
     let dir = st.upload_dir.clone();
     let path = match crate::blocking(move || save_upload(&audio, filename.as_deref(), &dir)).await {
         Ok(path) => path,
@@ -373,7 +376,7 @@ async fn create_transcription(
     };
     let policy = adapter.transcription_policy();
     let shape = drive::PlanShape::of(&policy, window);
-    let planner = match drive::Planner::open(&st, path.to_string_lossy().into_owned(), shape).await {
+    let planner = match drive::Planner::open(&st, path.to_string_lossy().into_owned(), shape, wav_seconds).await {
         Ok(planner) => planner,
         Err(e) => return error(e.status, &e.message),
     };

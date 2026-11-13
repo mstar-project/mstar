@@ -274,6 +274,7 @@ def test_fresh_rows_of_another_walk_and_the_gpu_thread_setup(monkeypatch):
     # only the decode walk keeps its output on the device
     engine = SimpleNamespace(
         device_loopback_signals=lambda node, walk: [T.SIG] if walk == T.WALK else [],
+        inline_signals=lambda node, walk: {T.SIG: T.SIG} if walk == T.WALK else {},
     )
     body = w.executor._body
     body._device_loopback = {}

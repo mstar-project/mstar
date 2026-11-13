@@ -51,8 +51,11 @@ def _manager(
         max_num_pages=max_num_pages, page_size=PAGE_SIZE, prefix_cache_tp=opt_in,
     )
     cfg.update(overrides)
+    cfg = PagedKVConfig(**cfg)
+    # what `KVManager.build` does first
+    cfg.shard(world_size)
     kv = KVManager(
-        cfg=PagedKVConfig(**cfg),
+        cfg=cfg,
         name="kv", joint_comm_group=SimpleNamespace(rank=rank, world_size=world_size),
         transfer_engine_info=None, device=torch.device("cpu"), dtype=torch.float32,
         needs_remote_transfer=shared,
@@ -346,6 +349,31 @@ def test_above_one_rank_the_cache_opens_only_where_the_serving_config_opts_in():
     assert "kv" in opening_prefix_caches([spec], {NODE: 2}, checkpoint_named=True), (
         "the serving config's prefix_cache_tp never reached the rule"
     )
+
+
+@pytest.mark.parametrize("exchange", ["all_gather", "ring"])
+@pytest.mark.parametrize("size", [1, 8])
+def test_the_thinkers_cache_stays_open_under_a_sequence_shard(size, exchange):
+    """Qwen3-Omni's Thinker with its pool stored by position and a sequence shard over the node. A
+    ring makes the shard depend on the pool, whose stored positions stripe each step: an edge from
+    the shard, not the pool, so the pool's prefix cache opens on one rank and on the 8-rank
+    instance alike."""
+    from mstar.engine.resources.sequence_shard import SeqShardSpec
+    from mstar.engine.resources.spec import resolve_spec_dependencies
+    from mstar.engine.state.adapters import node_resources
+    from mstar.model.qwen3_omni.config import THINKER_KV, THINKER_SHARD, Qwen3OmniModelConfig
+    from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
+
+    model = Qwen3OmniModel.__new__(Qwen3OmniModel)
+    model.config = Qwen3OmniModelConfig()
+    specs = node_resources(model)
+    apply_yaml_overrides(specs, {"resources": {
+        THINKER_KV: {"context_parallel": True, "prefix_cache_tp": True}, THINKER_SHARD: {"exchange": exchange},
+    }})
+    resolve_spec_dependencies(specs)
+    shard, = (spec for spec in specs if isinstance(spec, SeqShardSpec))
+    assert shard.depends_on() == ({THINKER_KV} if exchange == "ring" else set())
+    assert THINKER_KV in opening_prefix_caches(specs, {"Thinker": size}, checkpoint_named=True)
 
 
 def test_host_offload_or_a_pool_on_more_than_one_tp_group_is_refused_at_load(monkeypatch):
