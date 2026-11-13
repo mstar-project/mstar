@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 class _Praxis1Node(NodeSubmodule):
     """Shared plumbing: every node here is per-request and uncompiled.
 
-    One policy call is one request's chunk. Rows of different episodes share
+    One policy call is one request's chunk. Rows of different requests share
     neither a window nor a canvas, so nothing batches across them, and the
     data-dependent denoise loop is the case ``disable_torch_compile`` exists
     for.
@@ -58,8 +58,8 @@ class Praxis1TextEncoderSubmodule(_Praxis1Node):
 
     Emits the task embedding and the blank-caption embedding beside it: the
     video guidance pass needs the unconditional branch, and the caption is
-    fixed for the checkpoint, so both are encoded once and persist for the
-    episode.
+    fixed for the checkpoint, so both are encoded once and persist between
+    walks of this request.
     """
 
     def __init__(self, config: Praxis1Config, encoder: nn.Module) -> None:
@@ -325,10 +325,9 @@ class Praxis1ActionExpertSubmodule(_Praxis1Node):
 class Praxis1ActionHeadSubmodule(_Praxis1Node):
     """The settled action latents as command rows.
 
-    Emits ``[action_chunk, action_dim]`` float32 in the rig's own units, which
-    is what the openpi wire sends back. The video latents of the chunk leave
-    here too: they are what conditions the next call, so the session keeps
-    them whether or not anyone decodes them to pixels.
+    It will emit float32 commands in the rig's own units. Predicted video
+    latents end at the denoise loop; a later call uses the executed camera
+    frames as context.
     """
 
     def forward(
@@ -336,7 +335,6 @@ class Praxis1ActionHeadSubmodule(_Praxis1Node):
         graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
         action_latents: torch.Tensor,
-        video_latents: torch.Tensor,
         **kwargs,
     ) -> NameToTensorList:
         raise NotImplementedError(
