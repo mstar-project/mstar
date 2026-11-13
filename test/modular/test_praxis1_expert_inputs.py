@@ -8,7 +8,11 @@ import pytest
 import torch
 
 from mstar.model.praxis1.components.encoder import TapFeatures
-from mstar.model.praxis1.components.expert_inputs import assemble_expert_inputs
+from mstar.model.praxis1.components.expert_inputs import (
+    assemble_expert_inputs,
+    pack_tap_features,
+    unpack_tap_features,
+)
 
 
 def _case(n_chunks: int) -> tuple[TapFeatures, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -51,6 +55,41 @@ def test_expert_reads_globals_then_clean_then_noised(n_chunks: int) -> None:
     assert torch.equal(got.proprio_latents, proprio.float().repeat_interleave(2, dim=1))
     assert torch.equal(got.noised_action_latents, actions.float())
     assert got.window_size == 2 * (2 * n_chunks - 1)
+
+
+@pytest.mark.parametrize("n_chunks", [1, 2, 3])
+def test_graph_tensor_handoff_preserves_expert_inputs(n_chunks: int) -> None:
+    features, actions, times, proprio = _case(n_chunks)
+    packed = pack_tap_features(features)
+    restored = unpack_tap_features(*packed)
+    got = asdict(assemble_expert_inputs(restored, actions, times, proprio))
+    expected = asdict(assemble_expert_inputs(features, actions, times, proprio))
+    assert got.keys() == expected.keys()
+    for key, value in got.items():
+        want = expected[key]
+        if isinstance(value, list):
+            assert all(torch.equal(a, b) for a, b in zip(value, want, strict=True))
+        elif isinstance(value, torch.Tensor):
+            assert torch.equal(value, want)
+        else:
+            assert value == want
+
+
+@pytest.mark.parametrize("mutate", ["chunks", "noised", "clean", "dtype"])
+def test_graph_tensor_handoff_rejects_bad_geometry(mutate: str) -> None:
+    features, *_ = _case(2)
+    taps, embeddings, rope_ids, geometry = pack_tap_features(features)
+    geometry = geometry.clone()
+    if mutate == "chunks":
+        geometry[0] = 0
+    elif mutate == "noised":
+        geometry[10] -= 1
+    elif mutate == "clean":
+        geometry[11] += 1
+    else:
+        geometry = geometry.float()
+    with pytest.raises(ValueError, match="tap"):
+        unpack_tap_features(taps, embeddings, rope_ids, geometry)
 
 
 def test_global_order_is_configurable() -> None:
