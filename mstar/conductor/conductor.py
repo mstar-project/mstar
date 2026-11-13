@@ -47,7 +47,7 @@ from mstar.engine.resources.kv.config import (
 )
 from mstar.engine.resources.lora.config import LoraSpec
 from mstar.engine.state import SampleSettings
-from mstar.engine.state.adapters import CHUNK_CAUSAL_LAYOUT_KWARG, sampling_configs
+from mstar.engine.state.adapters import CHUNK_CAUSAL_LAYOUT_KWARG, EXPERT_LAYOUT_KWARG, sampling_configs
 from mstar.engine.state.analysis import declaration_digests
 from mstar.graph.base import GraphEdge, NodeAndGraphWalk, TensorPointerInfo
 from mstar.model.base import Model, WorkerGraph, serving_resources, streamed_inputs
@@ -94,6 +94,16 @@ def _with_chunk_causal_layout(plan: list[WalkStep], layout: dict | None) -> list
         return plan
     return [
         replace(step, step_metadata={**step.step_metadata, CHUNK_CAUSAL_LAYOUT_KWARG: layout})
+        for step in plan
+    ]
+
+
+def _with_expert_layout(plan: list[WalkStep], layout: dict | None) -> list[WalkStep]:
+    """Carry small expert row geometry on every walk of the request."""
+    if not layout:
+        return plan
+    return [
+        replace(step, step_metadata={**step.step_metadata, EXPERT_LAYOUT_KWARG: layout})
         for step in plan
     ]
 
@@ -1420,6 +1430,7 @@ class Conductor:
                 body.initial_signals, model_kwargs,
             )
             pstate.plan = _with_chunk_causal_layout(pstate.plan, model_kwargs.get(CHUNK_CAUSAL_LAYOUT_KWARG))
+            pstate.plan = _with_expert_layout(pstate.plan, model_kwargs.get(EXPERT_LAYOUT_KWARG))
             stream_moved = p.name in self.producer_triggered_partitions
             # refuse a plan the conductor can't run: a step whose walk isn't one of the
             # partition's (which startup checked are the model's), or a ``bind`` key

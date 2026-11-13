@@ -7,19 +7,11 @@ lets a resource implementation test its BlockMask against the exact policy.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-
 import torch
 
-
-def _positive(name: str, value: int) -> None:
-    if type(value) is not int or value <= 0:
-        raise ValueError(f"{name} must be a positive integer, got {value!r}")
-
-
-def _nonnegative(name: str, value: int) -> None:
-    if type(value) is not int or value < 0:
-        raise ValueError(f"{name} must be a nonnegative integer, got {value!r}")
+from mstar.engine.state.contract import ExpertCross as ExpertCrossMask
+from mstar.engine.state.contract import ExpertCrossLayout, ExpertSelfLayout
+from mstar.engine.state.contract import ExpertSelf as ExpertSelfMask
 
 
 def noised_frame_offset(noised_frames: int, clean_frames: int, chunk_len: int) -> int:
@@ -38,52 +30,6 @@ def noised_frame_offset(noised_frames: int, clean_frames: int, chunk_len: int) -
         f"unsupported expert frame layout: noised={noised_frames}, "
         f"clean={clean_frames}, chunk={chunk_len}"
     )
-
-
-@dataclass(frozen=True)
-class ExpertCrossMask:
-    chunk_len: int
-    future_per_chunk: int
-    tokens_per_frame: int
-    window_frames: int
-    include_noised: bool = True
-
-    def __post_init__(self) -> None:
-        for name in ("chunk_len", "future_per_chunk", "tokens_per_frame", "window_frames"):
-            _positive(name, getattr(self, name))
-        if type(self.include_noised) is not bool:
-            raise ValueError("include_noised must be bool")
-
-
-@dataclass(frozen=True)
-class ExpertSelfMask:
-    chunk_len: int
-    future_per_chunk: int
-
-    def __post_init__(self) -> None:
-        _positive("chunk_len", self.chunk_len)
-        _positive("future_per_chunk", self.future_per_chunk)
-
-
-@dataclass(frozen=True)
-class ExpertCrossLayout:
-    num_chunks: int
-    global_len: int
-    clean_frames: int
-    noised_frames: int
-
-    def __post_init__(self) -> None:
-        _positive("num_chunks", self.num_chunks)
-        for name in ("global_len", "clean_frames", "noised_frames"):
-            _nonnegative(name, getattr(self, name))
-
-
-@dataclass(frozen=True)
-class ExpertSelfLayout:
-    num_chunks: int
-
-    def __post_init__(self) -> None:
-        _positive("num_chunks", self.num_chunks)
 
 
 def query_chunks(num_chunks: int, chunk_len: int, future_per_chunk: int) -> torch.Tensor:

@@ -88,6 +88,10 @@ from mstar.engine.state.contract import (
     ChunkCausal,
     ChunkCausalLayout,
     Entry,
+    ExpertCross,
+    ExpertCrossLayout,
+    ExpertSelf,
+    ExpertSelfLayout,
     FrameWindow,
     GatedDeltaNet,
     KVEntry,
@@ -621,6 +625,7 @@ class WithinStepSteps(StepBuilder):
 
 
 CHUNK_CAUSAL_LAYOUT_KWARG = "__state_chunk_causal_layout__"
+EXPERT_LAYOUT_KWARG = "__state_expert_layout__"
 
 
 def chunk_causal_layouts(
@@ -641,6 +646,54 @@ def chunk_causal_layouts(
                     for key, lengths in layout.chunk_causal.items()
                 }
     return rows
+
+
+def expert_layouts(
+    declarations: Sequence[Array | Sampler | SeqShard], state_layout: Mapping[str, Mapping[str, Layout]],
+) -> dict[str, dict[str, dict[str, list[int]]]]:
+    """Read-keyed expert geometry as small wire-safe integers, never tensors."""
+    arrays = {declared.name: declared for declared in declarations if isinstance(declared, Array)}
+    rows = {}
+    for name, by_label in state_layout.items():
+        array = arrays.get(name)
+        if array is None:
+            raise RuntimeError(f"state_layout[{name!r}]: it names no declared array, of {sorted(arrays)}")
+        for label, layout in by_label.items():
+            _check_expert_layout(array, label, layout)
+            if layout.expert_cross or layout.expert_self:
+                by_read = {
+                    key: [value.num_chunks, value.global_len, value.clean_frames, value.noised_frames]
+                    for key, value in layout.expert_cross.items()
+                }
+                by_read.update({key: [value.num_chunks] for key, value in layout.expert_self.items()})
+                rows.setdefault(name, {})[label] = by_read
+    return rows
+
+
+def _check_expert_layout(array: Array, label: str, layout: Layout) -> None:
+    from mstar.engine.resources.attn.ragged.expert_mask import noised_frame_offset
+
+    if not isinstance(layout, Layout):
+        raise RuntimeError(f"state_layout[{array.name!r}][{label!r}] must be a Layout")
+    for field, kind, shape in (
+        ("expert_cross", ExpertCross, ExpertCrossLayout),
+        ("expert_self", ExpertSelf, ExpertSelfLayout),
+    ):
+        for key, lengths in getattr(layout, field).items():
+            read = array.reads.get(key)
+            where = f"state_layout[{array.name!r}][{label!r}].{field}[{key!r}]"
+            if read is None or not isinstance(read.mask, kind):
+                raise RuntimeError(f"{where} names no {kind.__name__} read")
+            if not isinstance(lengths, shape):
+                raise RuntimeError(f"{where} must be a {shape.__name__}")
+            if field == "expert_cross":
+                mask = read.mask
+                if lengths.noised_frames != lengths.num_chunks * mask.chunk_len:
+                    raise RuntimeError(f"{where}: noised frames do not match the declared chunks")
+                try:
+                    noised_frame_offset(lengths.noised_frames, lengths.clean_frames, mask.chunk_len)
+                except ValueError as exc:
+                    raise RuntimeError(f"{where}: {exc}") from exc
 
 
 def kv_layouts(
@@ -664,6 +717,7 @@ def kv_layouts(
                 raise RuntimeError(f"{where}[{name!r}]: labels {sorted(undeclared)} aren't in Array {name!r}.labels")
     converted = {}
     chunk_causal_layouts(declarations, state_layout)
+    expert_layouts(declarations, state_layout)
     for name, by_label in state_layout.items():
         layouts = storage_of(arrays[name]).layouts(arrays[name], by_label, keyed_spans.get(name, EMPTY))
         if layouts is not None:
