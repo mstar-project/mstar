@@ -122,8 +122,8 @@ if TYPE_CHECKING:
     from mstar.model.base import LabelLayout, Model
 
 
-# A holed array marks a rejected entry's rope slot, the 64-wide slot FlashInfer's MLA kernel runs beside rank 512,
-# with HOLE, and its reads pass a rope query of ones, so the entry scores 64 * HOLE and softmax takes it to zero.
+# A holed array writes HOLE into a rejected entry's 64-wide rope slot, the slot FlashInfer's MLA kernel takes beside
+# rank 512. Its reads pass a rope query of ones, so the entry scores 64 * HOLE and softmax takes it to zero.
 HOLE, HOLE_SLOT = -1.0e4, 64
 
 
