@@ -1988,6 +1988,14 @@ What the model writes, and nothing more:
 - A node that prefills prompts in chunks needs a drafter that declares its rule at a chunk
   boundary (``DrafterNeeds.chunk_boundary``): ``NONE`` when its state at a row depends on that
   row alone (DSpark).
+- A node may run its prompts inside its verify steps (mixed prompt-plus-verify steps): the model
+  names the combined walk (``VerifyNode.mixed_walk``), and the drafter's passes run over such a
+  step's tokens (``DrafterNeeds.mixed``). The verify rows lead, ``k + 1`` tokens each, then the
+  prompt rows (``MixedRows``), and the step's plans cover every token, so a drafter's pass does
+  too: a prompt row's drafts go unread, and what the drafter writes there before the target is
+  rewritten after it (``draft_mixed_step``). A prompt row tests no draft and samples its first
+  token from its last position's logits, leaving with accepted 0; the verify rows alone enter the
+  ledger. Such a node verifies synchronously.
 
 **Drafter resources.** A drafter is declared from config alone (``DrafterDecl``): its
 ``needs`` and ``node_resources(nodes)``, the resources it adds to the node (DSpark's attention

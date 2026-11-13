@@ -26,6 +26,7 @@ from mstar.engine.resources.draft.drafter import (
     DraftInputs,
     VerifyNode,
     drafter_resources,
+    mixed_rows,
 )
 from mstar.engine.resources.kv.config import KVReqConfig, KVSpec, KVStep, PagedKVConfig
 from mstar.engine.resources.position.config import PositionConfig, PositionSpec, PositionStep
@@ -72,12 +73,14 @@ class _Drafter(Drafter):
     def __init__(self, k: int, spoil=lambda j: False):
         self.k = k
         self.spoil = spoil
-        self.needs = DrafterNeeds(chunk_boundary=ChunkBoundary.NONE)
+        self.needs = DrafterNeeds(chunk_boundary=ChunkBoundary.NONE, mixed=True)
 
     def propose(self, inputs: DraftInputs) -> torch.Tensor:
         n, k = inputs.input_ids.shape[0], self.k
         rope, kv = inputs.resources["rope"], inputs.resources["kv"]
-        position = rope.pos_ids("main").view(n, k + 1)[:, 0]
+        positions = rope.pos_ids("main")
+        # a mixed step's verify rows' first places (`MixedRows.at`); a prompt row's drafts go unread
+        position = positions.view(n, k + 1)[:, 0] if inputs.mixed is None else positions[inputs.mixed.at[:, 0]]
         kv_sum = _context_sums(kv, n) + inputs.input_ids
         token = inputs.input_ids
         drafts = []
@@ -126,6 +129,8 @@ class ToyLM(ARNodeSubmodule):
     def __init__(self, k: int, drafter_factory=oracle):
         super().__init__()
         self.k = k
+        # the combined walk of mixed prompt-plus-verify steps
+        self.mixed = "mixed"
         self.dummy = torch.nn.Parameter(torch.zeros(1))
         self.token_stop = TokenStop(
             loop="decode_loop", buffer="new_token", stop_ids=frozenset({STOP}), sampler="sampler",
@@ -166,7 +171,26 @@ class ToyLM(ARNodeSubmodule):
     def preprocess(self, graph_walk, engine_inputs, inputs):
         if graph_walk == "prefill":
             return {"ids": torch.cat([inp.input_ids.reshape(-1) for inp in inputs])}
+        if graph_walk == self.mixed:
+            return self._mixed_inputs(engine_inputs, inputs)
         return {"ids": self.loopback_inputs(engine_inputs, inputs)["input_ids"]}
+
+    def _mixed_inputs(self, engine_inputs, inputs):
+        """A mixed step's ids, a verify row's last token at its block's first place, and `MIXED_KIND`."""
+        from mstar.engine.resources.draft.drafter import MIXED_KIND
+
+        anchors = engine_inputs.resources["sampler"].loopback_tokens(engine_inputs.request_ids)
+        ids, kind = [], []
+        for i, inp in enumerate(inputs):
+            if inp.graph_walk == "decode":
+                routed = inp.input_ids is not None and inp.input_ids.numel()
+                anchor = inp.input_ids.reshape(-1)[-1:] if routed else anchors[i: i + 1]
+                ids += [anchor.long(), torch.zeros(self.k, dtype=torch.long)]
+                kind.append(torch.arange(self.k + 1))
+            else:
+                ids.append(inp.input_ids.reshape(-1).long())
+                kind.append(torch.full((inp.input_seq_len,), -1))
+        return {"ids": torch.cat(ids), MIXED_KIND: torch.cat(kind)}
 
     def _target(self, engine_inputs, ids: torch.Tensor) -> torch.Tensor:
         """Write ``ids`` to the KV cache, then each row's logits: a one-hot at
@@ -198,6 +222,14 @@ class ToyLM(ARNodeSubmodule):
             return BatchedModelOutput(
                 per_rid_outputs={rid: {"new_token": [tokens[i: i + 1]]} for i, rid in enumerate(rids)},
             )
+        if graph_walk == self.mixed:
+            counts = torch.tensor([v.to_compute for v in _views(kv)])
+            qo = torch.nn.functional.pad(counts.cumsum(0), (1, 0))
+            rows = mixed_rows(qo, kwargs["mixed_kind"], self.k + 1)
+            result = self.draft_mixed_step(
+                engine_inputs, ids, rows, lambda block_ids, at: self._target(engine_inputs, block_ids)[at],
+            )
+            return self.verify_output(result)
         n = len(rids)
         result = self.draft_verify_step(engine_inputs, ids.view(n), lambda block: self._target(engine_inputs, block))
         return self.verify_output(result)
@@ -206,15 +238,24 @@ class ToyLM(ARNodeSubmodule):
 class ToyModel:
     """What `Engine.load_model` and validation read of a model."""
 
-    def __init__(self, k: int, mode: str = "synchronous", stop=None, needs: DrafterNeeds | None = None):
+    def __init__(
+        self, k: int, mode: str = "synchronous", stop=None, needs: DrafterNeeds | None = None, mixed: bool = False,
+    ):
         self.k = k
         self.needs = needs or DrafterNeeds(chunk_boundary=ChunkBoundary.NONE)
         self.config = DraftConfig.parse({"method": "dspark", "model": "toy", "num_draft_tokens": k, "mode": mode})
         self._stop = stop
+        self._mixed = "mixed" if mixed else None
 
     def verify_nodes(self):
         loopback = DeviceLoopback(walk="decode", signal="ids", sampler="sampler", buffer="new_token")
-        return [VerifyNode(NODE, "decode", self.config, self.needs, token_stop=self._stop, device_loopback=loopback)]
+        return [VerifyNode(
+            NODE, "decode", self.config, self.needs, token_stop=self._stop, device_loopback=loopback,
+            mixed_walk=self._mixed,
+        )]
+
+    def combined_walk_of(self):
+        return {} if self._mixed is None else {(NODE, "prefill"): self._mixed, (NODE, "decode"): self._mixed}
 
     def checkpoint_path(self):
         return None
@@ -275,15 +316,16 @@ def specs(k: int, max_num_pages: int = 256, greedy_capture: bool | None = None):
 
 def engine(
     k: int, drafter_factory=oracle, mode: str = "synchronous", greedy_capture: bool | None = None,
-    max_num_pages: int = 256,
+    max_num_pages: int = 256, mixed: bool = False,
 ) -> Engine:
-    """``greedy_capture``: the sampler's lean switch, which its narrow vocabulary leaves off."""
+    """``greedy_capture``: the sampler's lean switch, which its narrow vocabulary leaves off. ``mixed``: the
+    node runs mixed prompt-plus-verify steps (`Driver.mixed_step`)."""
     sub = ToyLM(k, drafter_factory)
     eng = Engine(graph_runtime=None)
     eng.load_model(
         {NODE: sub}, specs(k, max_num_pages, greedy_capture), WorkerParallelGroups(num_workers=1, global_rank=0),
         torch.device("cpu"), transfer_engine_info=None, kv_cache_type=torch.float32,
-        model=ToyModel(k, mode, sub.token_stop, sub.drafter.needs),
+        model=ToyModel(k, mode, sub.token_stop, sub.drafter.needs, mixed=mixed),
     )
     # what a capture's buffers would build: the sampler's slot masters, the loop-back slots
     eng._resources["sampler"].build_accelerator_graph_buffers([], 8, 256)
@@ -334,6 +376,8 @@ class Driver:
         self.out[rid] = []
         self._max = getattr(self, "_max", {})
         self._max[rid] = max_tokens
+        if prompt is None:
+            return None  # its prompt runs in a mixed step (`mixed_step`)
         batch = _batch("prefill", {rid: torch.tensor(prompt)}, self._max)
         self.eng.prepare_inputs(batch)
         outputs = self.eng.exec_and_postprocess(batch)
@@ -360,6 +404,36 @@ class Driver:
         for i, rid in enumerate(host.request_ids):
             run = outputs.per_rid_outputs[rid]["new_token"][0].reshape(-1).tolist()
             self.out[rid] += run
+            stopped[rid] = bool(stop_col[i])
+        return stopped
+
+    def mixed_step(self, rids: list[int], prompts: dict[int, list[int]]) -> dict[int, bool]:
+        """One mixed step: ``rids``' verify rows, then ``prompts``' rows (added with no prompt), as the engine
+        orders them; the rows that stopped."""
+        # the prompts first: the engine puts them last (`order_split_rows`)
+        ids = {rid: torch.tensor(prompt) for rid, prompt in prompts.items()}
+        ids.update({rid: torch.tensor([self.out[rid][-1]]) for rid in rids})
+        walks = {**dict.fromkeys(rids, "decode"), **dict.fromkeys(prompts, "prefill")}
+        order = self.eng.order_split_rows(NODE, "mixed", list(ids), walks)
+        batch = ExecutingBatch(
+            node_name=NODE,
+            per_request_info={rid: _info(rid, walks[rid], self._max[rid]) for rid in order},
+            step_context=StepContext(
+                request_ids=tuple(order), graph_walk="mixed", slot=0, capture=False, request_walks=walks,
+            ),
+            per_request_input_tensors={rid: {"ids": [ids[rid]]} for rid in order},
+        )
+        self.eng.prepare_inputs(batch)
+        outputs = self.eng.exec_and_postprocess(batch)
+        assert batch.admit_error is None, batch.admit_error
+        host = HostRows(tuple(outputs.row_request_ids or order), {
+            name: t.cpu() for name, t in (outputs.check_stop_buffers or {}).items()
+        })
+        self.eng.cut_verify_step(batch, outputs, host)
+        stopped = {}
+        stop_col = host.buffers["verify_stopped"].tolist()
+        for i, rid in enumerate(host.request_ids):
+            self.out[rid] += outputs.per_rid_outputs[rid]["new_token"][0].reshape(-1).tolist()
             stopped[rid] = bool(stop_col[i])
         return stopped
 

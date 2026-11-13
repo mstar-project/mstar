@@ -30,6 +30,9 @@ VERIFY_TOKENS = "verify_tokens"
 VERIFY_ACCEPTED = "verify_accepted"
 # the host column the token cut adds to them: whether a row's emitted run ended the reply
 VERIFY_STOPPED = "verify_stopped"
+# A mixed prompt-plus-verify step's ``[tokens]`` input: each verify row's token's place in its block,
+# -1 for a prompt row's (`mixed_rows`)
+MIXED_KIND = "mixed_kind"
 
 class ChunkBoundary(Enum):
     """How a drafter's state at a prompt chunk's last row is built."""
@@ -84,6 +87,9 @@ class DrafterNeeds(NamedTuple):
     # its shapes, which must match the target's (`VerifyNode.target`); None for
     # a drafter that reads nothing of the target's but the tokens
     geometry: ModelGeometry | None = None
+    # its passes run over a mixed prompt-plus-verify step's tokens (`DraftInputs.mixed`), so a node may run
+    # them; startup refuses the node's combined walk otherwise
+    mixed: bool = False
 
 
 class VerifyResult(NamedTuple):
@@ -94,6 +100,39 @@ class VerifyResult(NamedTuple):
     accepted: torch.Tensor  # [n] int64, 0..k
 
 
+class MixedRows(NamedTuple):
+    """Where a mixed prompt-plus-verify step's rows sit among its tokens, on the device. The verify rows come
+    first, ``k + 1`` tokens each, then the prompt rows (`Engine.order_split_rows`); the step's plans cover
+    every token, so a drafter's pass over the step runs over all of them (`DraftInputs.mixed`)."""
+    # [n] each row's first token, and one past its last (the attention's query offsets)
+    start: torch.Tensor
+    end: torch.Tensor
+    # [n] a prompt row (or an empty padding row): it verifies nothing and samples its one token
+    prompt: torch.Tensor
+    # [n, k + 1] the token each row's verify position reads its logits at: its block, or a prompt
+    # row's last token at every position. A read index only: an empty row's is another row's token, so a
+    # write by it goes to the sink at ``tokens`` unless the row is a verify row (``prompt``), or a prompt
+    # row with tokens of its own (``empty``)
+    at: torch.Tensor
+    # the step's token count
+    tokens: int
+    # [n] a row with no tokens: a replay's padding row
+    empty: torch.Tensor
+
+
+def mixed_rows(qo_indptr: torch.Tensor, kind: torch.Tensor, block: int) -> MixedRows:
+    """`MixedRows` from the attention's query offsets ``[n + 1]`` and ``kind`` ``[tokens]`` (`MIXED_KIND`: a
+    verify row's token's place in its block, -1 a prompt token's). Device ops only, so capturable."""
+    tokens = kind.shape[0]
+    start, end = qo_indptr[:-1].long(), qo_indptr[1:].long()
+    first = kind[start.clamp(max=tokens - 1)]
+    prompt = (first < 0) | (end <= start)
+    block_at = start[:, None] + torch.arange(block, device=kind.device)[None, :]
+    last = (end - 1).clamp(min=0)[:, None].expand(-1, block)
+    at = torch.where(prompt[:, None], last, block_at).clamp(max=tokens - 1)
+    return MixedRows(start, end, prompt, at, tokens, end <= start)
+
+
 class DraftInputs(NamedTuple):
     """What a drafter's ``propose`` reads."""
     request_ids: Sequence[int]
@@ -102,6 +141,11 @@ class DraftInputs(NamedTuple):
     # the engine resources of the node, for taps and the drafter's own attention
     resources: dict[str, Any]
     num_draft_tokens: int
+    # a mixed prompt-plus-verify step's layout (a drafter declaring ``DrafterNeeds.mixed``): the step's
+    # plans cover every token, so the drafter's passes run over all ``mixed.tokens`` of them, its verify
+    # rows' blocks at ``mixed.at``; a prompt row's drafts are unread, and its writes are rewritten after
+    # the target (`ObserveInputs.mixed`)
+    mixed: MixedRows | None = None
 
 
 class DrafterDecl(Protocol):
@@ -152,6 +196,10 @@ class ObserveInputs(NamedTuple):
     # [n, k + 1]: each row's last emitted token and its drafts
     block: torch.Tensor
     result: VerifyResult
+    # a mixed step's layout and its target's input ids ``[tokens]`` (`DraftInputs.mixed`): what the drafter
+    # writes over the step's tokens here is what a prompt step would write for its prompt rows
+    mixed: MixedRows | None = None
+    ids: torch.Tensor | None = None
 
 
 @runtime_checkable
@@ -202,6 +250,38 @@ def draft_verify_step(
     return result
 
 
+def draft_mixed_step(
+    sampler,
+    request_ids: Sequence[int],
+    ids: torch.Tensor,
+    rows: MixedRows,
+    target: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+    drafter: Drafter,
+    resources: dict[str, Any],
+) -> VerifyResult:
+    """`draft_verify_step` for a mixed prompt-plus-verify step: ``ids`` ``[tokens]`` the step's ids (a verify
+    row's last emitted token at its block's first place), ``rows`` its layout, and ``target`` maps the ids
+    with the drafts in place and ``rows.at`` to the logits there ``[n * (k + 1), V]``. A verify row runs as in
+    a verify step; a prompt row tests no draft and samples its one token from its last position's logits
+    (`SamplerResource.verify`'s ``refuse``), so it leaves with accepted 0. Capturable."""
+    k = sampler.verify_draft_tokens
+    n = rows.start.shape[0]
+    anchors = ids[rows.at[:, 0]]
+    drafts = drafter.propose(DraftInputs(request_ids, anchors, resources, k, mixed=rows))
+    if drafts.shape != (n, k):
+        raise ValueError(f"drafter proposed {tuple(drafts.shape)} drafts for {n} rows of {k}")
+    drafts = sampler.agree(drafts.long())
+    # the drafts into their blocks' places; a prompt row's go to a sink past the step's tokens
+    places = torch.where(rows.prompt[:, None], rows.tokens, rows.at[:, 1:])
+    block_ids = torch.cat([ids.long(), ids.new_zeros(1, dtype=torch.long)])
+    block_ids = block_ids.scatter(0, places.reshape(-1), drafts.reshape(-1))[: rows.tokens]
+    logits = target(block_ids, rows.at.reshape(-1))
+    result = sampler.verify(request_ids, logits.view(n, k + 1, -1), drafts, refuse=rows.prompt)
+    block = torch.cat([anchors.reshape(n, 1).long(), drafts], dim=1)
+    drafter.observe(ObserveInputs(block, result, mixed=rows, ids=block_ids))
+    return result
+
+
 class VerifyNode(NamedTuple):
     """A model's declaration that ``node`` drafts and verifies on ``walk`` (its
     decode loop's walk), from the deployment's ``model_kwargs.draft``. Read by
@@ -226,3 +306,6 @@ class VerifyNode(NamedTuple):
     # to the model's (`drafter_step`)
     prefill_steps: Mapping[str, ResourceStep] = MappingProxyType({})
     verify_steps: Mapping[str, ResourceStep] = MappingProxyType({})
+    # the combined walk the model runs mixed prompt-plus-verify steps under, its verify rows and prompt
+    # rows in one forward (`draft_mixed_step`); None runs every prompt in a step of its own
+    mixed_walk: str | None = None

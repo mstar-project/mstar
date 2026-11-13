@@ -115,6 +115,7 @@ class FlashInferManager(PlacedAttention):
         # `bind_verify_walk`, so a node that never verifies never loads flash_attn_3
         self._verify_backend = VerifyBackend.parse(verify_backend)
         self._verify_fa3 = False
+        self._verify_walk: str | None = None
         self._verify_wrappers: dict = {}
 
     def bind_dependencies(self, resources) -> None:
@@ -216,7 +217,8 @@ class FlashInferManager(PlacedAttention):
         )
 
     def bind_verify_walk(self, walk: str, block: int, slack: int) -> None:
-        del walk, block, slack
+        del block, slack
+        self._verify_walk = walk
         self._verify_fa3 = self._verify_backend is not VerifyBackend.FLASHINFER and self._fa3_reason is None
 
     def resident_refusal(self) -> str | None:
@@ -488,7 +490,10 @@ class FlashInferManager(PlacedAttention):
             # not on a pre-plan: the step in flight may still read its own
             self._step_qo.clear()
         laps = PhaseLaps(f"{ctx.plan_phase}.attn.")
-        if step.verify and self._verify_fa3 and len(plan_outputs) > 1:
+        # FA3's paged verify kernel runs k + 1 query rows a row: a mixed step (its captures' too) plans its
+        # prompt rows with its verify rows on FlashInfer's own, which takes rows of any length
+        fa3 = step.verify and self._verify_fa3 and ctx.graph_walk == self._verify_walk
+        if fa3 and len(plan_outputs) > 1:
             # one FA3 wrapper per (bucket, slot), whichever label: a second label's plan would overwrite the first's
             raise RuntimeError(f"a verify step plans one KV label on FA3, not {sorted(plan_outputs)}")
         for label, kv_out in plan_outputs.items():
@@ -511,7 +516,7 @@ class FlashInferManager(PlacedAttention):
                 wrapper.plan(kv_out, r.counts, causal=step.causal)
                 plan_states[label] = wrapper
                 continue
-            if step.verify and self._verify_fa3:
+            if fa3:
                 num_rows = indptrs.qo_indptr.shape[0] - 1
                 wrapper = self._verify_wrapper(step, num_rows, int(indptrs.qo_indptr[-1]), lease)
                 if lease is not None:
@@ -521,9 +526,12 @@ class FlashInferManager(PlacedAttention):
                 plan_states[label] = wrapper
                 continue
             if step.hide_last:
-                # the block's last rows out of the keys, on FlashInfer's host plan
+                # the block's last rows out of the keys, on FlashInfer's host plan; a mixed step's verify rows'
+                # alone, its prompt and padding rows (which a step's drafter reads nothing of) kept whole
+                rows = None if ctx.graph_walk == self._verify_walk else [
+                    ctx.walk_of(rid) == self._verify_walk for rid in ctx.request_ids]
                 indptrs = build_paged_indptrs(
-                    hide_tail_views(kv_out.views, step.hide_last, self._group.page_size), self._group.page_size,
+                    hide_tail_views(kv_out.views, step.hide_last, self._group.page_size, rows), self._group.page_size,
                 )
             if lease is not None:
                 num_rows = indptrs.qo_indptr.shape[0] - 1

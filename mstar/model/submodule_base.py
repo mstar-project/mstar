@@ -1726,6 +1726,22 @@ class ARNodeSubmodule(NodeSubmodule):
             self.drafter, engine_inputs.resources, engine_inputs.resident,
         )
 
+    def draft_mixed_step(
+        self, engine_inputs: ModelInputsFromEngine, ids: torch.Tensor, rows, target,
+    ) -> "VerifyResult":
+        """A mixed prompt-plus-verify step (`draft_mixed_step`): ``ids`` the step's ``[tokens]`` ids, ``rows``
+        its `MixedRows`, and ``target`` maps the ids with the drafts in place and the rows' logit positions
+        to the logits there."""
+        from mstar.engine.resources.draft.drafter import draft_mixed_step
+
+        share = self.drafter_share
+        if share is None or share.mixed_walk is None:
+            raise RuntimeError(f"{type(self).__name__}: a mixed step on a node bound no mixed walk (bind_draft)")
+        return draft_mixed_step(
+            engine_inputs.resources[share.sampler_key], engine_inputs.request_ids, ids, rows, target,
+            self.drafter, engine_inputs.resources,
+        )
+
     def verify_output(self, result: "VerifyResult", **row_outputs: torch.Tensor) -> "BatchedModelOutput":
         """What a verify step's forward returns: each row's block under the
         node's ``TokenStop.buffer``, which the engine's token cut trims to the

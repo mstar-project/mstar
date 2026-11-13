@@ -34,6 +34,8 @@ class DrafterShare(NamedTuple):
     # the drafter's own resources' steps (`VerifyNode.prefill_steps`, `VerifyNode.verify_steps`)
     prompt_steps: Mapping[str, ResourceStep]
     verify_steps: Mapping[str, ResourceStep]
+    # the combined walk of mixed prompt-plus-verify steps (`VerifyNode.mixed_walk`), whose steps take both sets
+    mixed_walk: str | None = None
 
     @property
     def block(self) -> int:
@@ -49,6 +51,8 @@ def drafter_step(step, graph_walk: str, share: DrafterShare | None):
         return step
     if graph_walk == share.verify_walk:
         own = share.verify_steps
+    elif graph_walk == share.mixed_walk:
+        own = {**share.prompt_steps, **share.verify_steps}
     elif graph_walk in share.prompt_walks:
         own = share.prompt_steps
     else:
@@ -84,6 +88,7 @@ class NodeDraft:
         self.decl = decl
         self.node = decl.node
         self.walk = decl.walk
+        self.mixed_walk = decl.mixed_walk
         self.mode = mode
         self.reason = reason
         self.sampler_key = sampler_key
@@ -114,11 +119,21 @@ class NodeDraft:
     def asynchronous(self) -> bool:
         return self.mode == DraftMode.ASYNCHRONOUS
 
+    def verifies(self, graph_walk: str) -> bool:
+        """Whether a step of ``graph_walk`` holds verify rows: the verify walk's, or a mixed step's."""
+        return graph_walk == self.walk or (self.mixed_walk is not None and graph_walk == self.mixed_walk)
+
+    def verify_rids(self, ctx) -> list[int]:
+        """The step's verify rows: every row of a verify step, a mixed step's rows of the verify walk."""
+        if ctx.graph_walk == self.walk:
+            return list(ctx.request_ids)
+        return [rid for rid in ctx.request_ids if ctx.walk_of(rid) == self.walk]
+
     def committed(self, graph_walk: str, rids: Sequence[int], step, resources: Mapping) -> int:
         """Right after the runner's commit of any step of the node, on the GPU
-        thread: number it, and for a verify step what each corrected resource
-        counted."""
-        if graph_walk != self.walk or not rids or not self.take_back_keys:
+        thread: number it, and for a verify step (a mixed step's verify rows,
+        ``rids``) what each corrected resource counted."""
+        if not self.verifies(graph_walk) or not rids or not self.take_back_keys:
             # a node no resource of which takes back records no rows: the step only counts
             return self.ledger.committed(None)
         labels: dict[str, str] = {}
@@ -126,9 +141,10 @@ class NodeDraft:
         for key in self.take_back_keys:
             resource_step = step.get(key)
             segments = (resource_step.segments if resource_step is not None else None) or step.segments
+            # a verify row's (a mixed step's leads it)
             seg = segments[0]
             labels[key] = seg.label
-            spans = resources[key].committed_spans(resource_step, rids, seg.label, seg.span)
+            spans = resources[key].committed_spans(resource_step, rids, seg.label, self.decl.config.block)
             if counted is None:
                 counted = list(spans)
                 continue
@@ -142,13 +158,14 @@ class NodeDraft:
                     counted[i] = 0
         return self.ledger.committed(rids, labels, counted)
 
-    def refuse_step(self, step) -> None:
+    def refuse_step(self, step, verify_rids=None) -> None:
         """A verify step's resources take back a length: a fork, a retention
         policy or a sink would copy or move the reserved one. Forks are declared
         per step, so this is checked per step, not only at startup. And every
         row of a stream that takes back counts the block, ``k + 1``: whatever
         path prepared the rows (a model's own, the engine's uniform rows, a
-        pre-plan's template), a shorter span would reserve too few slots."""
+        pre-plan's template), a shorter span would reserve too few slots. A mixed step's
+        rows of ``verify_rids`` alone are its verify rows."""
         for key, resource_step in step.steps.items():
             for name in ("pre_forks", "post_forks", "retention", "sink", "advance"):
                 if getattr(resource_step, name, None):
@@ -160,8 +177,9 @@ class NodeDraft:
             if any(segments is other for other in seen):
                 continue  # the step's default segments, already checked
             seen.append(segments)
-            if any(segment.span != block for segment in segments):
-                spans = sorted({segment.span for segment in segments})
+            rows = segments if verify_rids is None else [s for s in segments if s.request_id in verify_rids]
+            if any(segment.span != block for segment in rows):
+                spans = sorted({segment.span for segment in rows})
                 raise RuntimeError(f"a verify step's {key!r} rows span {spans}; each runs k + 1 = {block}")
 
     def check_offsets(self, resources: Mapping, rids, step=None) -> None:
@@ -214,11 +232,15 @@ class NodeDraft:
 
     def cut(
         self, seq: int, host_rows, request_infos: Mapping[int, object],
+        prompt_rows: frozenset = frozenset(), mid_prefill: frozenset = frozenset(),
     ) -> TokenCut:
         """Record step ``seq``'s result and cut each row's run of ``accepted + 1``
         tokens at its first stop id (unless ``ignore_eos``) and at the budget
         left (``max_tokens``). Adds the stopped column to ``host_rows``, which
-        the stop check reads. The take-back reads ``accepted``, never the cut."""
+        the stop check reads. The take-back reads ``accepted``, never the cut.
+        A mixed step's ``prompt_rows`` emit their first token (none on a chunk
+        before a prompt's last, ``mid_prefill``), which the budget's prefill
+        token already counts."""
         request_ids = host_rows.request_ids
         tokens = host_rows.buffers[VERIFY_TOKENS].numpy()
         accepted = host_rows.buffers[VERIFY_ACCEPTED].reshape(-1).numpy()
@@ -228,6 +250,8 @@ class NodeDraft:
         counts = accepted + 1
         sampler = self.token_stop.sampler
         live = [i for i, rid in enumerate(request_ids) if rid in request_infos]
+        if prompt_rows:
+            return self._cut_mixed(host_rows, request_infos, tokens, accepted, counts, live, prompt_rows, mid_prefill)
         budget = np.full(n, np.iinfo(np.int64).max, dtype=np.int64)
         ignore = np.zeros(n, dtype=bool)
         emitted = self._emitted
@@ -250,6 +274,41 @@ class NodeDraft:
             emitted[rid] = emitted.get(rid, 0) + int(counts[i])
         host_rows.buffers[VERIFY_STOPPED] = torch.from_numpy(stopped)
         self._count(accepted[live] if len(live) < n else accepted)
+        return TokenCut(request_ids, counts, stopped)
+
+    def _cut_mixed(self, host_rows, request_infos, tokens, accepted, counts, live, prompt_rows, mid_prefill):
+        """`cut` of a mixed step: its verify rows as a verify step's; a prompt row's one token stops the reply
+        at a stop id (unless ``ignore_eos``) or a budget of one token, as a prompt step's would."""
+        request_ids = host_rows.request_ids
+        n = len(request_ids)
+        prompt = np.array([rid in prompt_rows for rid in request_ids], dtype=bool)
+        verify = [i for i in live if not prompt[i]]
+        sampler, emitted = self.token_stop.sampler, self._emitted
+        stopped = np.zeros(n, dtype=bool)
+        for i in live:
+            rid = request_ids[i]
+            info = request_infos[rid]
+            ignore = info.resource_configs[sampler].ignore_eos
+            if prompt[i]:
+                if rid in mid_prefill:
+                    counts[i] = 0
+                    continue
+                counts[i] = 1
+                stopped[i] = info.max_tokens <= self._prefill_tokens or (
+                    not ignore and int(tokens[i, 0]) in self.token_stop.stop_ids)
+                continue
+            budget = info.max_tokens - self._prefill_tokens - emitted.get(rid, 0)
+            counts[i] = min(counts[i], max(budget, 1))
+            stopped[i] = counts[i] >= budget
+            if self._stop_ids.size and not ignore:
+                hit = np.isin(tokens[i, : counts[i]], self._stop_ids)
+                if hit.any():
+                    counts[i] = int(hit.argmax()) + 1
+                    stopped[i] = True
+            emitted[rid] = emitted.get(rid, 0) + int(counts[i])
+        host_rows.buffers[VERIFY_STOPPED] = torch.from_numpy(stopped)
+        if verify:
+            self._count(accepted[verify])
         return TokenCut(request_ids, counts, stopped)
 
     def _count(self, accepted: np.ndarray) -> None:

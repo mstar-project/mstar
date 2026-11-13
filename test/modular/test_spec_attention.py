@@ -280,10 +280,10 @@ def test_a_verify_step_on_fa3_that_plans_two_labels_is_refused():
 
     manager = FlashInferManager.__new__(FlashInferManager)
     manager._window_left, manager._preplanned, manager._group_idx = -1, False, 0
-    manager._kv_cache_name, manager._verify_fa3 = "kv", True
+    manager._kv_cache_name, manager._verify_fa3, manager._verify_walk = "kv", True, "decode"
     manager._current_plan_states, manager._preplan_states, manager._step_qo = {}, {}, {}
     ctx = SimpleNamespace(
-        resident=None, slot_lease=None, is_preplan=False, plan_phase="plan",
+        resident=None, slot_lease=None, is_preplan=False, plan_phase="plan", graph_walk="decode",
         plan_results={"kv": KVPlanOutputs({"main": object(), "uncond": object()})},
     )
 

@@ -1123,8 +1123,13 @@ class Engine:
         # every step the engine declares for the node, capture's and each replay's, carries its drafter's share
         submodule.bind_draft(DrafterShare(
             decl.walk, stop.sampler, decl.config.num_draft_tokens, stop.prefill_walks,
-            decl.prefill_steps, decl.verify_steps,
+            decl.prefill_steps, decl.verify_steps, decl.mixed_walk,
         ))
+        if decl.mixed_walk is not None:
+            # a mixed step's verify rows lead, its prompt rows after them (`MixedRows`)
+            key = (decl.node, decl.mixed_walk)
+            if self._split_prompt_walks.setdefault(key, frozenset(stop.prefill_walks)) != stop.prefill_walks:
+                raise ValueError(f"{decl.node}: a split of {decl.mixed_walk!r} orders other prompt walks last")
         return draft
 
     def _refuse_uncaptured_verify(self, ag_runners: Mapping[str, AcceleratorGraphRunner]) -> None:
@@ -1844,9 +1849,11 @@ class Engine:
         # a verify row runs its last token and k drafts: a row whose own prepare (its first verify
         # step, before it loops back) declares another span would reserve and commit too few slots
         draft = self._drafts.get(batch.node_name) if self._drafts else None
-        block = draft.decl.config.block if draft is not None and walk == draft.walk and not mixed else None
+        verify_walk = None if draft is None else draft.walk
         for i, rid in enumerate(batch.request_ids):
             row_walk = walk_of(rid) if mixed else walk
+            # a mixed step's verify rows run their blocks too
+            block = draft.decl.config.block if row_walk == verify_walk else None
             probe_prefix = (row_walk in keyed_walks) if mixed else step_probes
             chunk = batch.chunk_ranges.get(rid)
             try:
@@ -1917,8 +1924,9 @@ class Engine:
         rebuild = batch.step_context.rebuild_rids
         rids = [rid for rid in batch.request_ids if rid not in rebuild] if rebuild else batch.request_ids
         draft = self._drafts.get(batch.node_name) if self._drafts else None
-        if draft is not None and batch.step_context.graph_walk == draft.walk:
-            # the verify wrote each row's bonus token to its loop-back slot in the graph
+        if draft is not None and draft.verifies(batch.step_context.graph_walk):
+            # the verify wrote each row's bonus token to its loop-back slot in the graph (a mixed step's
+            # prompt rows their first token, which their first verify step reads)
             steps.update(dict.fromkeys(rids, (batch.node_name, draft.walk)))
         elif batch.rows_only:
             steps.update(dict.fromkeys(
@@ -2574,9 +2582,9 @@ class Engine:
         try:
             draft = self._drafts.get(batch.node_name)
             admit_outcome = self._runner.admit(step) if draft is None else self._runner.admit(step, draft.ledger)
-            if draft is not None and kv_manager._DEBUG_ASSERTS and ctx.graph_walk == draft.walk:
+            if draft is not None and kv_manager._DEBUG_ASSERTS and draft.verifies(ctx.graph_walk):
                 # the step's own rows: another row may be offloaded mid-flight
-                draft.check_offsets(self._submodules[batch.node_name].resources, batch.request_ids, step)
+                draft.check_offsets(self._submodules[batch.node_name].resources, draft.verify_rids(ctx), step)
         finally:
             phase_end("engine.admit", t0)
             if nvtx:
@@ -2681,12 +2689,17 @@ class Engine:
                 )
             step.set_ctx(ctx)
             draft = self._drafts.get(batch.node_name)
-            if draft is not None and ctx.request_walks and ctx.graph_walk != draft.walk and any(
+            if draft is not None and ctx.request_walks and not draft.verifies(ctx.graph_walk) and any(
                 walk == draft.walk for walk in ctx.request_walks.values()
             ):
                 # its rows would commit k + 1 tokens no ledger entry ever takes back
                 raise RuntimeError(f"{batch.node_name}: verify walk {draft.walk!r} rows inside a combined step")
-            if draft is not None and ctx.graph_walk == draft.walk:
+            if draft is not None and draft.verifies(ctx.graph_walk) and ctx.graph_walk != draft.walk:
+                if draft.asynchronous:
+                    # its verify rows' lengths are on the device until their results are recorded
+                    raise RuntimeError(f"{batch.node_name}: a mixed prompt-plus-verify step in asynchronous mode")
+                draft.refuse_step(step, frozenset(draft.verify_rids(ctx)))
+            elif draft is not None and ctx.graph_walk == draft.walk:
                 if draft.asynchronous and ctx.resident is None:
                     # a host plan reads the reserved length as the attention length and write slot
                     raise RuntimeError(
@@ -2821,17 +2834,18 @@ class Engine:
                         planner.note_foreign_step(step, ctx)
                 draft = self._drafts.get(batch.node_name)
                 if draft is not None:
-                    if batch.verify_seq is not None and ctx.graph_walk == draft.walk:
+                    if batch.verify_seq is not None and draft.verifies(ctx.graph_walk):
                         # one result a step: a batch run row by row would commit several
                         raise RuntimeError(f"{batch.node_name}: a verify step runs batched, not row by row")
                     # numbered before the commit event the next pre-plan waits on; nested in engine.commit
                     t1 = phase_start()
+                    verify_rids = request_ids if ctx.graph_walk == draft.walk else draft.verify_rids(ctx)
                     batch.verify_seq = draft.committed(
-                        ctx.graph_walk, request_ids, step, submodule_mgmt.resources,
+                        ctx.graph_walk, verify_rids, step, submodule_mgmt.resources,
                     )
                     phase_end("engine.verify.commit", t1)
-                    if kv_manager._DEBUG_ASSERTS and ctx.graph_walk == draft.walk:
-                        draft.check_offsets(submodule_mgmt.resources, request_ids, step)
+                    if kv_manager._DEBUG_ASSERTS and draft.verifies(ctx.graph_walk):
+                        draft.check_offsets(submodule_mgmt.resources, verify_rids, step)
             finally:
                 phase_end("engine.commit", t0)
                 if nvtx:
@@ -3493,7 +3507,7 @@ class Engine:
         None. After capture: its node must run the walk on resident tables,
         carry every loop-back signal, and every resource must allow it."""
         draft = self._drafts.get(node_name)
-        if draft is not None and graph_walk == draft.walk:
+        if draft is not None and draft.verifies(graph_walk):
             # the ledger numbers a verify step by the node's commit and records one accepted count a
             # row (`VerifyLedger.record`): a launch of several replays commits once, so its take-back
             # would undo one block's rejected tokens of every replay's. From config, alike on every rank.
@@ -4465,7 +4479,7 @@ class Engine:
 
     def _verify_step(self, batch: ExecutingBatch) -> "NodeDraft | None":
         draft = self._drafts.get(batch.node_name)
-        if draft is None or batch.verify_seq is None or batch.step_context.graph_walk != draft.walk:
+        if draft is None or batch.verify_seq is None or not draft.verifies(batch.step_context.graph_walk):
             return None
         return draft
 
@@ -4509,7 +4523,14 @@ class Engine:
             )
         # nested in the worker's prematerialize stage, whose stopwatch it doesn't move
         t0 = phase_start()
-        cut = draft.cut(batch.verify_seq, host_rows, batch.per_request_info)
+        ctx = batch.step_context
+        prompt_rows = frozenset()
+        if ctx.graph_walk != draft.walk:
+            # a mixed step's prompt rows
+            prompt_rows = frozenset(rid for rid in host_rows.request_ids if ctx.walk_of(rid) != draft.walk)
+        cut = draft.cut(
+            batch.verify_seq, host_rows, batch.per_request_info, prompt_rows, frozenset(ctx.chunk_tokens_after),
+        )
         name = draft.token_stop.buffer
         per_rid = outputs.per_rid_outputs
         for rid, count in zip(cut.request_ids, cut.counts.tolist(), strict=True):

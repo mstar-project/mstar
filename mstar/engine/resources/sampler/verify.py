@@ -115,18 +115,22 @@ def renorm_top_p(top_p: torch.Tensor) -> torch.Tensor:
     return torch.where(top_p < 1.0, top_p, _UNREAD_TOP_P)
 
 
-def greedy_verify(logits: torch.Tensor, drafts: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def greedy_verify(
+    logits: torch.Tensor, drafts: torch.Tensor, refuse: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """`chain_verify_rows` over `verify_probs` for rows that all sample greedily, from the
     target's argmax alone: ``logits`` ``[n * (k + 1), V]``, ``drafts`` ``[n, k]``. A greedy
     row's filtered distribution is a one-hot at its argmax (`greedy_tokens`: the lowest index
     among equal maxima, where the fused softmax puts it), so a draft is accepted while it is
     the argmax, and every token from the first refusal on is the argmax there, as the full
     path's residual draw gives. The same tokens and counts, without the vocabulary-wide
-    probabilities. Capturable."""
+    probabilities. ``refuse`` as `chain_verify_rows`. Capturable."""
     n, k = drafts.shape
     targets = greedy_tokens(logits).view(n, k + 1)
     drafts = drafts.long()
     accepted = (drafts == targets[:, :k]).long().cumprod(1).sum(1)
+    if refuse is not None:
+        accepted = torch.where(refuse, 0, accepted)
     last = targets.gather(1, accepted[:, None])
     keep = torch.arange(k + 1, device=logits.device)[None, :] < accepted[:, None]
     return torch.where(keep, F.pad(drafts, (0, 1)), last), accepted
@@ -145,18 +149,21 @@ def chain_verify(
 
 def chain_verify_rows(
     dist: "torch.Tensor | _TwoFilters", n: int, drafts: torch.Tensor, seed: torch.Tensor, offset: torch.Tensor,
+    refuse: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """`chain_verify` over `verify_probs`' ``[n * (k + 1), ...]`` rows."""
+    """`chain_verify` over `verify_probs`' ``[n * (k + 1), ...]`` rows. ``refuse`` ``[n]``: rows that accept no
+    draft and draw their one token from their first position's distribution as plain sampling does (a mixed
+    step's prompt rows, `MixedRows`), at the bonus draw's number."""
     if isinstance(dist, torch.Tensor):
-        return _chain_verify(dist.view(n, -1, dist.shape[-1]), drafts, seed, offset)
+        return _chain_verify(dist.view(n, -1, dist.shape[-1]), drafts, seed, offset, refuse)
     vocab = dist.first.shape[-1]
     return _chain_verify(
         _TwoFilters(dist.first.view(n, -1, vocab), dist.then.view(n, -1, vocab), dist.use_then.view(n, -1)),
-        drafts, seed, offset,
+        drafts, seed, offset, refuse,
     )
 
 
-def _chain_verify(dist, drafts, seed, offset):
+def _chain_verify(dist, drafts, seed, offset, refuse=None):
     two = isinstance(dist, _TwoFilters)
     probs = dist.first if two else dist
     n, block, _ = probs.shape
@@ -169,16 +176,20 @@ def _chain_verify(dist, drafts, seed, offset):
         p_d = torch.where(dist.use_then[:, :k], dist.then[:, :k].gather(2, drafts[..., None]).squeeze(-1), p_d)
     # FlashInfer's test, u < p, on numbers in [0, 1): a draft with p = 1 always stays
     accepted = (uniforms[:, :k] < p_d).long().cumprod(1).sum(1)
+    if refuse is not None:
+        accepted = torch.where(refuse, 0, accepted)
     p_at = probs[rows, accepted]
     if two:
         p_at = torch.where(dist.use_then[rows, accepted][:, None], dist.then[rows, accepted], p_at)
     refused = accepted < k
+    # a refused row's draw is from p itself: no draft was tested, so none is taken out
+    tested = refused if refuse is None else refused & ~refuse
     at = accepted.clamp(max=k - 1)
     q_at = torch.zeros_like(p_at).scatter_(1, drafts[rows, at][:, None], 1.0)
-    residual = (p_at - torch.where(refused[:, None], q_at, 0.0)).clamp_min(0.0)
+    residual = (p_at - torch.where(tested[:, None], q_at, 0.0)).clamp_min(0.0)
     last = _inverse_cdf(residual, uniforms[:, k])
     # an empty residual: the refused draft held all of p (rounding), or the bonus row's p is empty
-    fallback = torch.where(refused, drafts[rows, at], p_at.argmax(-1))
+    fallback = torch.where(tested, drafts[rows, at], p_at.argmax(-1))
     last = torch.where(residual.sum(-1) > 0, last, fallback)
     keep = torch.arange(block, device=probs.device)[None, :] < accepted[:, None]
     tokens = torch.where(keep, F.pad(drafts, (0, 1)), last[:, None])

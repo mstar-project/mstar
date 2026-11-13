@@ -199,6 +199,10 @@ def resolve_mode(
     if wanted == DraftMode.SYNCHRONOUS:
         return DraftMode.SYNCHRONOUS, "configured"
     blockers = list(blockers)
+    if decl.mixed_walk is not None:
+        # a verify row's length is on the device until its result is recorded, and a mixed step's
+        # prompt rows plan on the host
+        blockers.append(f"it runs mixed prompt-plus-verify steps ({decl.mixed_walk!r}), which verify synchronously")
     if not async_scheduling:
         blockers.append(why_not_async or "async scheduling is off for the node")
     if not resident_planning:
@@ -223,15 +227,19 @@ def node_chunks_prompts(model, node: str) -> bool:
 
 
 def combined_problem(decl: VerifyNode, combined_walk_of: Mapping[tuple[str, str], str]) -> str | None:
-    """Mixed prompt-plus-verify steps are not supported yet: a combined walk
-    holding the verify walk would commit its rows' blocks with no take-back."""
+    """A combined walk holding the verify walk runs mixed prompt-plus-verify steps, whose verify rows the
+    engine takes back from (`draft_mixed_step`): the model names it (`VerifyNode.mixed_walk`) and the
+    drafter's passes run over such a step (`DrafterNeeds.mixed`). Any other would commit its rows' blocks
+    with no take-back."""
     combined = combined_walk_of.get((decl.node, decl.walk))
     if combined is None:
         return None
-    return (
-        f"node {decl.node!r}: walk {decl.walk!r} verifies drafts and is a member of combined walk "
-        f"{combined!r}; mixed prompt-plus-verify steps are not supported yet, so declare none on a verifying node"
-    )
+    where = f"node {decl.node!r}: walk {decl.walk!r} verifies drafts and is a member of combined walk {combined!r}"
+    if combined != decl.mixed_walk:
+        return f"{where}, which the model doesn't run as mixed prompt-plus-verify steps (VerifyNode.mixed_walk)"
+    if not decl.needs.mixed:
+        return f"{where}; its drafter's passes don't run over a mixed step's tokens (DrafterNeeds.mixed)"
+    return None
 
 
 def model_combined_walks(model) -> Mapping[tuple[str, str], str]:

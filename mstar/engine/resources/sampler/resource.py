@@ -838,12 +838,15 @@ class SamplerResource(Resource):
         return out
 
     @torch.compiler.disable
-    def verify(self, request_ids: list[str], logits: torch.Tensor, drafts: torch.Tensor) -> "VerifyResult":
+    def verify(
+        self, request_ids: list[str], logits: torch.Tensor, drafts: torch.Tensor, refuse: torch.Tensor | None = None,
+    ) -> "VerifyResult":
         """Verify ``drafts`` ``[n, k]`` against the target's ``logits``
         ``[n, k + 1, V]`` with each request's own settings, as `sample` would
         draw from them (`sampler.verify`). Every rank returns rank 0's
         result. The bonus token goes where `sample` puts its token (the
-        loop-back slot), and the offsets move by a fixed stride."""
+        loop-back slot), and the offsets move by a fixed stride. ``refuse`` ``[n]``: rows that test no draft and
+        sample their one token from their first position (`chain_verify_rows`)."""
         from mstar.engine.resources.draft.drafter import VerifyResult
         from mstar.engine.resources.sampler.verify import (
             chain_verify_rows,
@@ -886,14 +889,14 @@ class SamplerResource(Resource):
         if self._greedy_this_step:
             # every row samples greedily (`lean_for`, from configs alike on every rank), so its
             # distribution is a one-hot at the argmax: the same result without the vocabulary's probs
-            tokens, accepted = greedy_verify(logits.reshape(n * block, vocab), drafts)
+            tokens, accepted = greedy_verify(logits.reshape(n * block, vocab), drafts, refuse)
         else:
             dist = verify_probs(
                 logits.reshape(n * block, vocab), rows(temperature), rows(top_k), rows(top_p),
                 None if min_p is None else rows(min_p),
                 None if order is None else type(order)(rows(order.top_p_first), rows(order.min_keep)),
             )
-            tokens, accepted = chain_verify_rows(dist, n, drafts, seed, offset)
+            tokens, accepted = chain_verify_rows(dist, n, drafts, seed, offset, refuse)
         # one broadcast for the whole result, as `sample` broadcasts its token
         packed = self.agree(torch.cat([tokens, accepted[:, None]], dim=1))
         tokens, accepted = packed[:, :block], packed[:, block]
