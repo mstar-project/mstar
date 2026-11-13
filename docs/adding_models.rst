@@ -763,10 +763,15 @@ deployment YAML tunes them under ``resources:`` (see :ref:`Step 6 <config-yaml>`
   step, on such a walk fails the request.
   ``Attend(q_heads=)`` is attention with the model's query heads, a multiple of
   the entry's heads.
-- ``Value(name, nodes=, layers=, entry=, updates=)``: a rewritable array of one entry, such
-  as a recurrent state. ``updates`` names the kernels that read and write one of its fields
-  in place: ``CausalConv()`` needs a field ``conv`` of shape ``(channels, kernel - 1)``, and
-  ``GatedDeltaNet()`` a field ``state`` of shape ``(h_v, d_k, d_v)``.
+- ``Value(name, nodes=, layers=, entry=, updates=, verify_span=1)``: a rewritable array of one
+  entry, such as a recurrent state. ``updates`` names the kernels that read and write one of its
+  fields in place: ``CausalConv()`` needs a field ``conv`` of shape ``(channels, kernel - 1)``,
+  ``GatedDeltaNet()`` a field ``state`` of shape ``(h_v, d_k, d_v)``, and
+  ``KimiDelta(lower_bound=)`` both, ``conv`` of shape ``(3 * h * d, kernel - 1)`` and a float32
+  ``state`` of shape ``(h, d, d)``, as one update a layer runs through ``kimi_delta``. A
+  ``verify_span`` above 1 lets the ``Value`` take verify steps through the one update that keeps
+  verify blocks, ``KimiDelta`` so far. The step's ``settle`` comes after that update, and the
+  ``Value`` can't be read whole, since part of its entry lives in those blocks between steps.
 - ``max_len=0``: the array keeps nothing between steps, for attention within this step only.
   Its one read uses ``Block()``, which sees only the entries of the token's own segment. See
   `Cacheless attention (encoder towers)`_.
@@ -1172,17 +1177,17 @@ The spec types are:
      - Linear attention planned against a ``RecurrentStateSpec`` pool that holds its
        state: gated DeltaNet (``LinearAttnVariant.GDN``), Kimi delta attention (``KDA``:
        fused Triton kernels on CUDA, a torch reference elsewhere) or Mamba-2. A layer
-       calls gated DeltaNet through ``causal_conv`` and ``gated_delta_net``, and the
-       others through ``KDACallable`` or ``Mamba2Callable``
-       (``mstar/engine/resources/convenience.py``), which hand the kernels the layer's
-       blocks of the pool, so the layer never names one. A KDA pool built with
-       ``DeltaNetGeometry.to_blocks(speculative_tokens=k)`` also runs verify steps
-       (``LinearAttnStep(speculative=True)``), and ``KDACallable.set_prefix_len``
-       settles each one's accepted drafts. The layers are shared:
-       ``ParallelGatedDeltaNet`` and ``ParallelKimiDeltaAttention``
-       (``mstar/model/components/distributed/``, over ``KDAConfig``). A KDA layer tells
-       the resource its gates as it binds: with Kimi K3's full-rank output gate
-       (``full_rank_output_gate``) the resource runs the torch reference. Where the fused
+       calls gated DeltaNet through ``causal_conv`` and ``gated_delta_net``, Kimi delta
+       attention through ``kimi_delta`` on a ``Value`` with a ``KimiDelta``, and Mamba-2
+       through ``Mamba2Callable`` (``mstar/engine/resources/convenience.py``), which hands
+       the kernels the layer's blocks of the pool, so the layer never names one. A KDA pool
+       built with ``DeltaNetGeometry.to_blocks(speculative_tokens=k)`` also runs verify steps
+       (``LinearAttnStep(speculative=True)``), which a ``Value`` declares with
+       ``verify_span=k + 1``, and ``settle`` keeps each one's accepted drafts. The layers are
+       shared: ``ParallelGatedDeltaNet`` and ``ParallelKimiDeltaAttention``
+       (``mstar/model/components/distributed/``, over ``KDAConfig``). A ``KimiDelta``
+       declares its gates: with Kimi K3's full-rank output gate (``full_rank_gate``) the
+       resource runs the torch reference. Where the fused
        kernels run, activations other than bf16 or a forget-gate bound below -5 are a
        ValueError at load. The torch reference's prefill can't be captured
        (``KDAManager.prefill_capturable`` is False), so the resource refuses a prefill
@@ -2500,9 +2505,10 @@ Value (issue #1447).
 - ``per_request_states`` is a ``Mapping`` that is resolved on first read.
 - ``piecewise_runners`` holds the piecewise CUDA-graph runners, keyed by region name.
 
-The shared layers take their layer id in the constructor. ``ParallelGatedDeltaNet`` takes a
-handle, and ``Attention``, ``ParallelAttention`` and ``VisionAttention`` pick their path at
-bind from what they receive: a handle under their key, or the resources.
+The shared layers take their layer id in the constructor. ``ParallelGatedDeltaNet`` and
+``ParallelKimiDeltaAttention`` take a handle, and ``Attention``, ``ParallelAttention`` and
+``VisionAttention`` pick their path at bind from what they receive: a handle under their key,
+or the resources.
 
 A model that hasn't moved reads ``engine_inputs.resources`` in the forward, keyed by
 ``resource_key``. In a layer, resources are resolved once at load time. The engine calls
