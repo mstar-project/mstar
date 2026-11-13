@@ -37,3 +37,10 @@ A worker that dies (an exception during setup, an OOM kill, a segfault) sends no
 
 Workers service unrelated teardown during completion waits when admission and
 active batches permit it.
+
+GPU completion waits shorter than the 10 ms teardown cadence use the direct
+`event.synchronize()` path, based on the preceding incomplete-event wait for
+that node and walk. Unknown or previously longer waits use a helper thread so
+the main thread can service teardown. A step that becomes slow can delay cleanup
+once; its measured wait restores the helper path for the next step. This history
+is per node/walk, so a long prefill does not add thread switches to short decodes.

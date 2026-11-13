@@ -6,7 +6,7 @@ is in flight; no read may start after that. The hard cleanup
 """
 
 from concurrent.futures import Future
-from threading import Event
+from threading import Event, get_ident
 from types import SimpleNamespace
 
 import pytest
@@ -194,6 +194,64 @@ def test_gpu_wait_ready_event_does_not_start_a_waiter():
     assert w.executor._wait_pool is None
 
 
+def test_short_gpu_waits_stay_on_main_thread_and_relearn_long_waits(monkeypatch):
+    """Each walk learns independently, and a slower step restores callbacks."""
+    w = _worker(device=torch.device("cuda"))
+    clock = iter([0.0, 0.001, 1.0, 1.001, 2.0, 2.02, 3.0, 3.02, 4.0, 4.001])
+    monkeypatch.setattr("mstar.worker.step_executor._time.perf_counter", lambda: next(clock))
+    threads = []
+    step = SimpleNamespace(
+        node_name="LLM", graph_walk="decode",
+        node_batch=SimpleNamespace(completion_event=SimpleNamespace(
+            query=lambda: False, synchronize=lambda: threads.append(get_ident()),
+        )),
+    )
+    main = get_ident()
+    try:
+        for _ in range(4):
+            w.executor.wait_for_step(step, while_waiting=lambda: None)
+        step.graph_walk = "prefill"
+        w.executor.wait_for_step(step, while_waiting=lambda: None)
+    finally:
+        w.executor._wait_pool.shutdown()
+    assert threads[0] != main  # unknown: cooperative
+    assert threads[1:3] == [main, main]  # short, then the first newly long wait
+    assert threads[3] != main  # long: cooperative again
+    assert threads[4] != main  # a different walk has no short-wait history
+
+
+@pytest.mark.parametrize("callback_raises", [False, True])
+def test_long_gpu_wait_services_cleanup_and_keeps_completion_fence(callback_raises):
+    w = _worker(device=torch.device("cuda"))
+    release, finished = Event(), Event()
+    callbacks = []
+
+    def synchronize():
+        assert release.wait(5), "cleanup was not serviced during the GPU wait"
+        finished.set()
+
+    def service():
+        callbacks.append(True)
+        release.set()
+        if callback_raises:
+            raise ValueError("cleanup failed")
+
+    step = SimpleNamespace(
+        node_name="Encoder", graph_walk="encode",
+        node_batch=SimpleNamespace(completion_event=SimpleNamespace(query=lambda: False, synchronize=synchronize)),
+    )
+    try:
+        if callback_raises:
+            with pytest.raises(ValueError, match="cleanup failed"):
+                w.executor.wait_for_step(step, while_waiting=service)
+        else:
+            w.executor.wait_for_step(step, while_waiting=service)
+        assert callbacks and finished.is_set()
+    finally:
+        release.set()
+        w.executor._wait_pool.shutdown()
+
+
 @pytest.mark.parametrize("enable_nvtx", [False, True])
 def test_stopped_speculative_batch_cleans_inputs_without_unmatched_nvtx(
     monkeypatch, enable_nvtx,
@@ -214,7 +272,7 @@ def test_stopped_speculative_batch_cleans_inputs_without_unmatched_nvtx(
             node_name="LLM", request_ids=[7], per_request_info={7: object()}, no_forward_rids=set(),
             final_stream_rids={7}, partition_done_rids={7},
         ),
-        speculative_new_iter=True, graph_walk="decode", loop_name="decode",
+        speculative_new_iter=True, node_name="LLM", graph_walk="decode", loop_name="decode",
     )
     outputs = BatchedModelOutput(per_rid_outputs={7: {}})
     ranges, markers = [], []
@@ -265,7 +323,7 @@ def test_stopped_speculative_batch_still_waits_for_its_gpu_work(monkeypatch, has
             final_stream_rids=set(), partition_done_rids=set(),
             completion_event=event,
         ),
-        speculative_new_iter=True, graph_walk="decode", loop_name="decode",
+        speculative_new_iter=True, node_name="LLM", graph_walk="decode", loop_name="decode",
     )
     monkeypatch.setattr(torch.accelerator, "synchronize", lambda device=None: waits.append("device"))
 

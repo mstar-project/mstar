@@ -152,3 +152,50 @@ than the client could fill, which can be a performance finding in itself.
 `pytest benchmark/worker_phases/test_phases.py` -- parsing and segmentation
 are pure functions over a string, so the part that decides which numbers get
 averaged together is checked without a GPU.
+
+## Completion-wait overhead
+
+`python -m benchmark.worker_phases.completion_wait --backend cuda --out /tmp/completion-wait.json`
+compares direct event synchronization, the always-threaded wait, and the worker's
+adaptive wait using real CUDA events around `torch.cuda._sleep`. It requires the
+worker's Python dependencies but no weights or server. The arms alternate order
+across five rounds, warming each arm before timing. `--backend host` replaces the
+GPU event with an immediately completing event to isolate the Python thread handoff.
+`--pin-cpu N` pins main and helper threads together using the worker's pinning
+code, for comparison with deployments that set `step_thread_core`.
+
+`wall_minus_gpu_us` is total host wall time (launch through fence) minus the CUDA
+event interval; `cpu_us` includes CPU time from both main and helper threads.
+These measure the wait mechanism, not serving throughput. The callback count
+checks that long waits still service teardown. End-to-end claims still need the
+server and representative workloads above. During serving, `event_sync` also
+includes any teardown callback work performed inside a long wait.
+
+Measured on 2026-11-13: RTX 2070, Xeon E5-2680 v4, Python 3.12.15,
+PyTorch 2.14.1+cu130 (the host's preinstalled image), main/helper pinned to CPU 0,
+`OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 CUDA_VISIBLE_DEVICES=0`. Commands:
+
+```bash
+python -m benchmark.worker_phases.completion_wait --backend cuda --pin-cpu 0 --out /tmp/wait-gpu.json
+python -m benchmark.worker_phases.completion_wait --backend host --pin-cpu 0 \
+    --iterations 3000 --warmup 100 --rounds 5 --out /tmp/wait-host.json
+```
+
+Median of five round means, in microseconds (200 measured steps and 20 warmups
+per CUDA arm/round). The GPU clock changes, so the first column reports measured
+event intervals, not the requested sleep duration. Overhead is wall minus GPU time:
+
+| GPU interval, approximately | Direct overhead | Always-threaded overhead | Adaptive overhead |
+| --- | ---: | ---: | ---: |
+| 59 µs | 19.5 | 53.0 | 20.4 |
+| 191 µs | 19.4 | 44.9 | 20.2 |
+| 1.47 ms | 28.1 | 66.9 | 27.3 |
+| 14.66 ms | 24.8 | 58.7 | 60.9 |
+
+Adaptive short-wait overhead stayed near direct synchronization: 19.9–20.7 µs,
+19.2–20.8 µs and 21.4–32.4 µs across the three short-step cases, versus
+50.3–64.9 µs, 44.5–45.2 µs and 65.0–71.0 µs always-threaded. Both cooperative
+arms called cleanup once per measured long step; direct synchronization did not.
+The host-only probe measured 44.2 → 3.0 µs wall time and 45.6 → 4.0 µs process
+CPU time for always-threaded → adaptive, with direct wall time 2.3 µs. This
+isolates thread-switch overhead; no model throughput claim is made from it.

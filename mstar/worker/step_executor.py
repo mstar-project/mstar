@@ -50,6 +50,9 @@ from mstar.worker.worker_metrics import WorkerMetrics
 
 logger = logging.getLogger(__name__)
 
+# Waits shorter than the teardown cadence cannot usefully service a callback.
+_TEARDOWN_POLL_S = 0.01
+
 
 @dataclass
 class PendingBatch:
@@ -369,6 +372,9 @@ class StepExecutor:
         self._gpu_pool: ThreadPool | InlineExecutor | None = None
         self._plan_pool: ThreadPool | InlineExecutor | None = None
         self._wait_pool: ThreadPool | None = None
+        # Last incomplete-event wait, per node/walk: a prefill must not make
+        # every decode pay for a helper-thread handoff. No per-request state.
+        self._gpu_wait_s: dict[tuple[str, str], float] = {}
         # ``knobs: step_threads: serial``: the GPU and plan threads' work runs on the main thread
         self._serial_steps = False
         # lane -> its stream, made on the lane's first step
@@ -701,20 +707,29 @@ class StepExecutor:
                 if while_waiting is None:
                     event.synchronize()
                 elif not event.query():
-                    # Wake at GPU completion, including short steps; a polling
-                    # sleep on the main thread would add its timeout to them.
-                    if self._wait_pool is None:
-                        self._wait_pool = ThreadPool(
-                            max_workers=1, thread_name_prefix=f"mstar-wait-{self.worker_id}",
-                            initializer=self.pin_this_thread,
-                        )
-                    future = self._wait_pool.submit(event.synchronize)
-                    try:
-                        while not wait((future,), timeout=0.01).done:
-                            while_waiting()
-                    finally:
-                        # A callback failure must not abandon the GPU fence.
-                        future.result()
+                    key = (batch_N.node_name, batch_N.graph_walk)
+                    started = _time.perf_counter()
+                    if self._gpu_wait_s.get(key, _TEARDOWN_POLL_S) < _TEARDOWN_POLL_S:
+                        # The preceding wait was short: keep the usual fence
+                        # on this thread. A newly slow step can defer cleanup
+                        # once; its measured wait restores cooperative waiting.
+                        event.synchronize()
+                    else:
+                        # Unknown/long waits wake at GPU completion, rather
+                        # than adding a polling sleep to the end of the step.
+                        if self._wait_pool is None:
+                            self._wait_pool = ThreadPool(
+                                max_workers=1, thread_name_prefix=f"mstar-wait-{self.worker_id}",
+                                initializer=self.pin_this_thread,
+                            )
+                        future = self._wait_pool.submit(event.synchronize)
+                        try:
+                            while not wait((future,), timeout=_TEARDOWN_POLL_S).done:
+                                while_waiting()
+                        finally:
+                            # A callback failure must not abandon the GPU fence.
+                            future.result()
+                    self._gpu_wait_s[key] = _time.perf_counter() - started
         else:
             with self.timer.span("worker.postprocess.device_sync"):
                 torch.accelerator.synchronize(self.device)
