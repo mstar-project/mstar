@@ -380,7 +380,9 @@ class Praxis1BackboneSubmodule(_Praxis1Node):
 
     The taps are the encoder features the action expert reads. They stay
     inside the iteration that made them: the loop carries latents, not taps,
-    so nothing holds a step's hidden states past the step.
+    so nothing holds a step's hidden states past the step. The last iteration
+    still builds taps, but skips the video decoder: only actions leave the
+    loop, and the video latent has no later reader.
     """
 
     # The reference uses the checkpoint dtype directly and widens the MoE

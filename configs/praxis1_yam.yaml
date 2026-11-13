@@ -38,6 +38,10 @@ model_kwargs:
   cfg_video_scale: 1.0
   max_context_chunks: 0
 
+# The last Euler step still computes encoder taps for actions. It skips the
+# video decoder because the reply contains no predicted video and no next
+# step reads it.
+
 # A Praxis-specific openpi schema at ws://<host>:<port>/: the three cameras in
 # view order (top, left wrist, right wrist), both arm poses as state, and 21x20
 # relative action rows. It is not the reference Positronic command-dict wire.

@@ -33,8 +33,10 @@ def main() -> None:
     parser.add_argument("--mstar-stage-dir", type=Path,
                         help="ablate M*'s saved text and VAE stage tensors into the reference cold call")
     parser.add_argument("--mstar-revision", required=True)
-    parser.add_argument("--skip-last-video", action="store_true",
-                        help="use the reference serving optimization; M* E5 currently decodes both steps")
+    parser.add_argument("--skip-last-video", action="store_true", default=True,
+                        help="match M* E5's final-step video skip (the default)")
+    parser.add_argument("--decode-final-video", action="store_false", dest="skip_last_video",
+                        help="compare with the earlier full-decoder diagnostic recipe")
     parser.add_argument("--reference-simple", action="store_true",
                         help="disable reference context caching, expert overlap and paired guidance")
     parser.add_argument("--rtol", type=float, default=0.03)

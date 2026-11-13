@@ -40,6 +40,10 @@ model_kwargs:
   cfg_video_scale: 4.0
   max_context_chunks: 0
 
+# The last Euler step still computes conditional encoder taps for actions. It
+# skips the video decoder and video-only blank-caption guidance, since the
+# reply contains no predicted video and no next step reads it.
+
 # A Praxis-specific openpi schema at ws://<host>:<port>/: cameras in view order,
 # Cartesian pose as state, and 21x10 relative action rows. The stock openpi
 # DROID client expects 10x8 joint-velocity actions and cannot use this unchanged.
