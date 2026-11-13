@@ -763,9 +763,12 @@
 <h2>High-level components<a class="headerlink" href="#high-level-components" title="Link to this heading">#</a></h2>
 <p><code class="docutils literal notranslate"><span class="pre">mstar</span></code> is organized as a set of cooperating processes:</p>
 <ul class="simple">
-<li><p><strong>API server</strong> (<code class="docutils literal notranslate"><span class="pre">mstar/api_server/</span></code>): FastAPI layer that accepts <code class="docutils literal notranslate"><span class="pre">POST</span> <span class="pre">/generate</span></code>,
-tokenizes/loads media, dispatches the request, and streams results back to the client.
-Entry point: <code class="docutils literal notranslate"><span class="pre">mstar.api_server.entrypoint:main</span></code> (the <code class="docutils literal notranslate"><span class="pre">mstar-serve</span></code> console script).</p></li>
+<li><p><strong>API server</strong> (<code class="docutils literal notranslate"><span class="pre">mstar/api_server/</span></code>): accepts <code class="docutils literal notranslate"><span class="pre">POST</span> <span class="pre">/generate</span></code> and the OpenAI
+routes, tokenizes/loads media, dispatches the request, and streams results back to the
+client. Entry point: <code class="docutils literal notranslate"><span class="pre">mstar.api_server.entrypoint:main</span></code> (the <code class="docutils literal notranslate"><span class="pre">mstar-serve</span></code> console
+script). HTTP is served by <code class="docutils literal notranslate"><span class="pre">mstar-server</span></code> (<code class="docutils literal notranslate"><span class="pre">rust/server/</span></code>), which talks to the
+Python process over a local bridge; <code class="docutils literal notranslate"><span class="pre">--python-frontend</span></code> serves it from the
+deprecated FastAPI app instead.</p></li>
 <li><p><strong>Conductor</strong> (<code class="docutils literal notranslate"><span class="pre">mstar/conductor/</span></code>): central coordinator. It manages the request
 lifecycle, handles graph-walk transitions, selects workers, routes inputs, and
 detects completion.</p></li>

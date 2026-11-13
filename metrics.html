@@ -797,7 +797,7 @@ second old; <code class="docutils literal notranslate"><span class="pre">mstar_c
 second, and the conductor adds them to its next status message, so worker families
 can be up to two seconds old. A lost or reordered message cannot corrupt a counter:
 every message carries totals, not increments, and the API server keeps the latest.</p></li>
-<li><p><strong>Rust frontend.</strong> With <code class="docutils literal notranslate"><span class="pre">--rust-frontend</span></code>, <code class="docutils literal notranslate"><span class="pre">mstar-server</span></code> serves <code class="docutils literal notranslate"><span class="pre">/metrics</span></code> by
+<li><p><strong>Rust frontend.</strong> <code class="docutils literal notranslate"><span class="pre">mstar-server</span></code>, the default frontend, serves <code class="docutils literal notranslate"><span class="pre">/metrics</span></code> by
 asking the API server for the rendered text over the bridge, so both frontends show
 the same families. It answers <code class="docutils literal notranslate"><span class="pre">503</span></code> if the bridge does not reply within two
 seconds. <code class="docutils literal notranslate"><span class="pre">mstar-server</span></code> counts its own HTTP refusals and sends the totals with each
@@ -963,8 +963,8 @@ to the API server: <code class="docutils literal notranslate"><span class="pre">
 field or request), <code class="docutils literal notranslate"><span class="pre">409</span></code> (a <code class="docutils literal notranslate"><span class="pre">request_id</span></code> in flight), <code class="docutils literal notranslate"><span class="pre">404</span></code> (unknown route, or
 a model without the endpoint), <code class="docutils literal notranslate"><span class="pre">405</span></code> (wrong method), and <code class="docutils literal notranslate"><span class="pre">503</span></code> when the Rust
 frontend’s <code class="docutils literal notranslate"><span class="pre">MSTAR_MAX_CONCURRENT_REQUESTS</span></code> cap turns a request away. WebSocket
-handshakes are not counted. With <code class="docutils literal notranslate"><span class="pre">--rust-frontend</span></code>, the values are the totals
-<code class="docutils literal notranslate"><span class="pre">mstar-server</span></code> sent with the latest <code class="docutils literal notranslate"><span class="pre">/metrics</span></code> request.</p>
+handshakes are not counted. Unless <code class="docutils literal notranslate"><span class="pre">--python-frontend</span></code> is set, the values are the
+totals <code class="docutils literal notranslate"><span class="pre">mstar-server</span></code> sent with the latest <code class="docutils literal notranslate"><span class="pre">/metrics</span></code> request.</p>
 </dd>
 </dl>
 </section>
@@ -1171,8 +1171,8 @@ picks the <code class="docutils literal notranslate"><span class="pre">model_nam
 </pre></div>
 </div>
 <p>The conductor and workers report once a second, so a scrape interval under a second
-only repeats values. Keep the scrape timeout above two seconds with
-<code class="docutils literal notranslate"><span class="pre">--rust-frontend</span></code>, which waits that long for the bridge before answering <code class="docutils literal notranslate"><span class="pre">503</span></code>.</p>
+only repeats values. Keep the scrape timeout above two seconds: <code class="docutils literal notranslate"><span class="pre">mstar-server</span></code>
+waits that long for the bridge before answering <code class="docutils literal notranslate"><span class="pre">503</span></code>.</p>
 </section>
 </section>
 

@@ -1024,14 +1024,14 @@ can reach the port. If no gateway in front of the server authenticates clients, 
 key or bind <code class="docutils literal notranslate"><span class="pre">--host</span> <span class="pre">127.0.0.1</span></code>; the server logs a warning at startup while no key is
 set.</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">export</span><span class="w"> </span><span class="nv">MSTAR_API_KEY</span><span class="o">=</span><span class="s2">"</span><span class="k">$(</span>openssl<span class="w"> </span>rand<span class="w"> </span>-hex<span class="w"> </span><span class="m">32</span><span class="k">)</span><span class="s2">"</span>
-mstar<span class="w"> </span>serve<span class="w"> </span>qwen3_omni<span class="w">            </span><span class="c1"># or: mstar-serve --config ... [--rust-frontend]</span>
+mstar<span class="w"> </span>serve<span class="w"> </span>qwen3_omni<span class="w">            </span><span class="c1"># or: mstar-serve --config ... [--python-frontend]</span>
 </pre></div>
 </div>
 <p>With a key set, every HTTP route except <code class="docutils literal notranslate"><span class="pre">/health</span></code> and <code class="docutils literal notranslate"><span class="pre">/metrics</span></code> (see
 <a class="reference internal" href="#serving-metrics"><span class="std std-ref">Metrics</span></a>) answers <code class="docutils literal notranslate"><span class="pre">401</span></code> unless the request carries
 <code class="docutils literal notranslate"><span class="pre">Authorization:</span> <span class="pre">Bearer</span> <span class="pre">&lt;key&gt;</span></code>, and WebSocket routes (<code class="docutils literal notranslate"><span class="pre">/v1/realtime</span></code>,
 <code class="docutils literal notranslate"><span class="pre">/generate/ws</span></code>) refuse the handshake without it. The check is one middleware over the
-whole app (FastAPI and the Rust frontend alike), and the comparison takes the same time
+whole app (<code class="docutils literal notranslate"><span class="pre">mstar-server</span></code> and the Python frontend alike), and the comparison takes the same time
 however much of the key matches. CORS preflights still get their answer, since browsers
 send them without credentials. <code class="docutils literal notranslate"><span class="pre">--api-key</span></code> overrides the environment variable, but
 prefer the variable: a command-line flag is visible to every local user in the process
@@ -1163,8 +1163,9 @@ Deflate shrinks 80 ms speech frames to 49-73% of their size as base64 JSON and t
 55-90% as binary PCM, and digital silence to 1-2%, but compressing every frame
 costs the event loop: about 8% of it at 32 live Nemotron VoiceChat calls on
 <code class="docutils literal notranslate"><span class="pre">/generate/ws</span></code>, whose configs turn it off. Turn it off where the server’s
-event loop, not the network, is the bottleneck. The Rust frontend
-(<code class="docutils literal notranslate"><span class="pre">--rust-frontend</span></code>) offers no deflate, whatever this says.</p></td>
+event loop, not the network, is the bottleneck. <code class="docutils literal notranslate"><span class="pre">mstar-server</span></code>, the default
+frontend, offers no deflate whatever this says, so this applies only under
+<code class="docutils literal notranslate"><span class="pre">--python-frontend</span></code>.</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">ws_max_message_mb</span></code></p></td>
 <td><p><em>(optional)</em> The largest WebSocket message the server reads, in MiB, on every
@@ -2029,8 +2030,8 @@ Prometheus metrics at <code class="docutils literal notranslate"><span class="pr
 hint. Off by default, and <code class="docutils literal notranslate"><span class="pre">/metrics</span></code> answers 404 then. Like <code class="docutils literal notranslate"><span class="pre">/health</span></code>, it needs no
 API key even when one is set, the usual convention for scrape endpoints. It exposes
 request counts, latencies and the model name (never prompts or outputs); if that
-matters for a deployment, keep the port on an internal network. With
-<code class="docutils literal notranslate"><span class="pre">--rust-frontend</span></code>, <code class="docutils literal notranslate"><span class="pre">mstar-server</span></code> serves the same text: it asks the API server for
+matters for a deployment, keep the port on an internal network.
+<code class="docutils literal notranslate"><span class="pre">mstar-server</span></code> serves the same text as the Python frontend: it asks the API server for
 it over the bridge, so both frontends show the same names, and it answers <code class="docutils literal notranslate"><span class="pre">503</span></code> if the
 bridge does not reply within two seconds, as <code class="docutils literal notranslate"><span class="pre">/health</span></code> does.</p>
 <p><a class="reference internal" href="metrics.html"><span class="doc">Metrics reference</span></a> documents every family in one place, with a Prometheus and Grafana setup.</p>
@@ -2064,8 +2065,8 @@ that fails validation), <code class="docutils literal notranslate"><span class="
 <code class="docutils literal notranslate"><span class="pre">MSTAR_MAX_CONCURRENT_REQUESTS</span></code> cap turns a request away. <code class="docutils literal notranslate"><span class="pre">route</span></code> is the route’s
 path as declared (<code class="docutils literal notranslate"><span class="pre">/v1/chat/completions</span></code>), <code class="docutils literal notranslate"><span class="pre">unmatched</span></code> when no route matches.
 A request that was submitted and then failed counts once, as an <code class="docutils literal notranslate"><span class="pre">error</span></code> in
-<code class="docutils literal notranslate"><span class="pre">mstar_requests_total</span></code>, never here. WebSocket handshakes are not counted. With
-<code class="docutils literal notranslate"><span class="pre">--rust-frontend</span></code>, <code class="docutils literal notranslate"><span class="pre">mstar-server</span></code> keeps these counts and sends them with each
+<code class="docutils literal notranslate"><span class="pre">mstar_requests_total</span></code>, never here. WebSocket handshakes are not counted.
+<code class="docutils literal notranslate"><span class="pre">mstar-server</span></code> keeps these counts and sends them with each
 <code class="docutils literal notranslate"><span class="pre">/metrics</span></code> request, so the API server exports them under the same name.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">mstar_request_queue_seconds{model_name,</span> <span class="pre">output_modalities}</span></code>: histogram over
 successful requests, from the conductor taking the request in to admitting it for

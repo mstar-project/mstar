@@ -758,7 +758,7 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#matching-your-cuda-toolkit">Matching your CUDA toolkit</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#verify-the-install">Verify the install</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#rust-extension">Rust extension</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#optional-the-rust-http-frontend">Optional: the Rust HTTP frontend</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#the-rust-http-frontend">The Rust HTTP frontend</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#troubleshooting">Troubleshooting</a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#cudnn-status-sublibrary-version-mismatch"><code class="docutils literal notranslate"><span class="pre">CUDNN_STATUS_SUBLIBRARY_VERSION_MISMATCH</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#libcudart-so-12-cannot-open-shared-object-file"><code class="docutils literal notranslate"><span class="pre">libcudart.so.12:</span> <span class="pre">cannot</span> <span class="pre">open</span> <span class="pre">shared</span> <span class="pre">object</span> <span class="pre">file</span></code></a></li>
@@ -825,7 +825,7 @@ uv<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </s
 </div>
 <p>This pulls in the core runtime (PyTorch, FastAPI/Uvicorn, msgpack, …) and installs the two
 console scripts, <code class="docutils literal notranslate"><span class="pre">mstar</span></code> and <code class="docutils literal notranslate"><span class="pre">mstar-serve</span></code>. To serve from a checkout, also build the
-extension (see <a class="reference internal" href="#rust-extension">Rust extension</a>).</p>
+extension (see <a class="reference internal" href="#rust-extension">Rust extension</a>) and <code class="docutils literal notranslate"><span class="pre">mstar-server</span></code> (see <a class="reference internal" href="#the-rust-http-frontend">The Rust HTTP frontend</a>).</p>
 <div class="admonition important">
 <p class="admonition-title">Important</p>
 <p><strong>For CUDA installs, always pass</strong> <code class="docutils literal notranslate"><span class="pre">--torch-backend=auto</span></code>. <code class="docutils literal notranslate"><span class="pre">mstar</span></code> floors
@@ -1304,33 +1304,38 @@ cargo<span class="w"> </span><span class="nb">test</span><span class="w"> </span
 </pre></div>
 </div>
 </section>
-<section id="optional-the-rust-http-frontend">
-<h2>Optional: the Rust HTTP frontend<a class="headerlink" href="#optional-the-rust-http-frontend" title="Link to this heading">#</a></h2>
+<section id="the-rust-http-frontend">
+<h2>The Rust HTTP frontend<a class="headerlink" href="#the-rust-http-frontend" title="Link to this heading">#</a></h2>
 <p><code class="docutils literal notranslate"><span class="pre">mstar-server</span></code> (<code class="docutils literal notranslate"><span class="pre">rust/server/</span></code>) serves the HTTP surface — routes, OpenAI
 translation, SSE streaming, uploads — from Rust, with the Python process
-keeping preprocessing and the conductor protocol. It is replacing the Python
-HTTP frontend, which is being retired: new routes and adapters land in both
-(see “API surfaces land in the Rust frontend” in <code class="docutils literal notranslate"><span class="pre">AGENTS.md</span></code>), and
-<code class="docutils literal notranslate"><span class="pre">mstar</span> <span class="pre">serve</span></code> will use the Rust frontend for every model once it serves
-everything the Python one does. A Linux wheel that carries
-the extension also installs the binary next to <code class="docutils literal notranslate"><span class="pre">mstar-serve</span></code>; otherwise build
-it. Then opt in:</p>
+keeping preprocessing, tokenization and the conductor protocol. It is
+<code class="docutils literal notranslate"><span class="pre">mstar</span> <span class="pre">serve</span></code>’s default frontend. A Linux wheel that carries
+the extension also installs the binary next to <code class="docutils literal notranslate"><span class="pre">mstar-serve</span></code>; from a checkout,
+build it:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>cargo<span class="w"> </span>build<span class="w"> </span>--release<span class="w"> </span>--manifest-path<span class="w"> </span>rust/server/Cargo.toml
-mstar<span class="w"> </span>serve<span class="w"> </span>qwen3_omni<span class="w"> </span>--rust-frontend
-<span class="c1"># or, with an explicit config: mstar-serve --config &lt;model.yaml&gt; --rust-frontend</span>
+mstar<span class="w"> </span>serve<span class="w"> </span>qwen3_omni
+<span class="c1"># or, with an explicit config: mstar-serve --config &lt;model.yaml&gt;</span>
 </pre></div>
 </div>
-<p>Use it when benchmarking or tuning streaming throughput: its output path costs
-about 8 µs of API-server CPU per streamed token against 18 µs for the Python
-frontend (<code class="docutils literal notranslate"><span class="pre">benchmark/api_output_path</span></code>), so at high token rates the Python
-frontend, not the model, can be the limit.</p>
+<p><code class="docutils literal notranslate"><span class="pre">--python-frontend</span></code> serves from the uvicorn/FastAPI frontend instead. It is
+deprecated and will be removed (see “API surfaces land in the Rust frontend” in
+<code class="docutils literal notranslate"><span class="pre">AGENTS.md</span></code>); it takes no <code class="docutils literal notranslate"><span class="pre">--rust-frontend-bin</span></code>. Its output path costs
+about 18 µs of API-server CPU per streamed token against 8 µs for
+<code class="docutils literal notranslate"><span class="pre">mstar-server</span></code> (<code class="docutils literal notranslate"><span class="pre">benchmark/api_output_path</span></code>), so at high token rates the
+Python frontend, not the model, can be the limit.</p>
+<p>If <code class="docutils literal notranslate"><span class="pre">mstar-server</span></code> exits while serving (a crash, a kill, a lost race for the
+port), <code class="docutils literal notranslate"><span class="pre">mstar</span> <span class="pre">serve</span></code> exits with status 3; a port already taken is reported as
+<code class="docutils literal notranslate"><span class="pre">mstar-server:</span> <span class="pre">could</span> <span class="pre">not</span> <span class="pre">listen</span> <span class="pre">on</span> <span class="pre">http://…:</span> <span class="pre">Address</span> <span class="pre">already</span> <span class="pre">in</span> <span class="pre">use</span></code>.
+<code class="docutils literal notranslate"><span class="pre">mstar-server</span></code> exits when its launcher is killed, even by <code class="docutils literal notranslate"><span class="pre">SIGKILL</span></code>, and on
+shutdown <code class="docutils literal notranslate"><span class="pre">mstar</span> <span class="pre">serve</span></code> waits up to 5 s for it.</p>
 <p>The binary is resolved via <code class="docutils literal notranslate"><span class="pre">--rust-frontend-bin</span></code> / <code class="docutils literal notranslate"><span class="pre">MSTAR_SERVER_BIN</span></code> /
 the environment’s scripts directory / <code class="docutils literal notranslate"><span class="pre">$PATH</span></code> / the in-repo build. Its knobs
 are listed in <a class="reference internal" href="environment_variables.html"><span class="doc">Environment variables</span></a>. From a checkout, a binary built from
-other <code class="docutils literal notranslate"><span class="pre">rust/</span></code> or <code class="docutils literal notranslate"><span class="pre">rust/server/</span></code> sources is skipped, and if none is left the
-error gives the command that rebuilds it; one named by the flag or the variable
-is used with a warning. <code class="docutils literal notranslate"><span class="pre">mstar-server</span> <span class="pre">--source-hash</span></code> prints the hashes of the
-sources a build was made from.</p>
+other <code class="docutils literal notranslate"><span class="pre">rust/</span></code> or <code class="docutils literal notranslate"><span class="pre">rust/server/</span></code> sources is skipped, and if none is left
+<code class="docutils literal notranslate"><span class="pre">mstar</span> <span class="pre">serve</span></code> stops at startup with the command that rebuilds it; one named
+by the flag or the variable is used with a warning. A missing or stale binary’s
+error also points at <code class="docutils literal notranslate"><span class="pre">--python-frontend</span></code>. <code class="docutils literal notranslate"><span class="pre">mstar-server</span> <span class="pre">--source-hash</span></code>
+prints the hashes of the sources a build was made from.</p>
 <p>The OpenAI routes take the model’s adapter from the same registry as the Python
 frontend (<code class="docutils literal notranslate"><span class="pre">ADAPTER_REGISTRY</span></code> in <code class="docutils literal notranslate"><span class="pre">mstar/api_server/openai/adapters.py</span></code>):
 <code class="docutils literal notranslate"><span class="pre">mstar-server</span></code> ports adapter classes, not model names, so every model of a
@@ -1456,7 +1461,7 @@ Repeat the swap afterwards.</p>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#matching-your-cuda-toolkit">Matching your CUDA toolkit</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#verify-the-install">Verify the install</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#rust-extension">Rust extension</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#optional-the-rust-http-frontend">Optional: the Rust HTTP frontend</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#the-rust-http-frontend">The Rust HTTP frontend</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#troubleshooting">Troubleshooting</a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#cudnn-status-sublibrary-version-mismatch"><code class="docutils literal notranslate"><span class="pre">CUDNN_STATUS_SUBLIBRARY_VERSION_MISMATCH</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#libcudart-so-12-cannot-open-shared-object-file"><code class="docutils literal notranslate"><span class="pre">libcudart.so.12:</span> <span class="pre">cannot</span> <span class="pre">open</span> <span class="pre">shared</span> <span class="pre">object</span> <span class="pre">file</span></code></a></li>

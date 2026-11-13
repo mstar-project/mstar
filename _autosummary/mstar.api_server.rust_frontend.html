@@ -875,8 +875,8 @@ protocol was designed by flattening it. <code class="docutils literal notranslat
 only, one map of <code class="docutils literal notranslate"><span class="pre">PromptPart</span></code>’s fields per part. The bridge mesh lives in
 its own socket dir (private to the frontend/bridge pair), so entity names
 never collide with the conductor/worker mesh.</p>
-<p>Opt-in: <code class="docutils literal notranslate"><span class="pre">mstar-serve</span> <span class="pre">--rust-frontend</span></code> replaces <code class="docutils literal notranslate"><span class="pre">uvicorn.run</span></code> with the
-<code class="docutils literal notranslate"><span class="pre">mstar-server</span></code> binary + this loop. Everything else in the process
+<p><code class="docutils literal notranslate"><span class="pre">mstar-serve</span></code> runs the <code class="docutils literal notranslate"><span class="pre">mstar-server</span></code> binary + this loop in place of
+<code class="docutils literal notranslate"><span class="pre">uvicorn.run</span></code> (unless <code class="docutils literal notranslate"><span class="pre">--python-frontend</span></code>). Everything else in the process
 (preprocess worker, conductor spawn, tensor transport) is identical. The
 frontend enforces the API key (<code class="docutils literal notranslate"><span class="pre">--api-key</span></code> / <code class="docutils literal notranslate"><span class="pre">MSTAR_API_KEY</span></code>) itself; the
 bridge socket is private to the pair.</p>
@@ -1074,11 +1074,19 @@ launcher’s resolved values win over inherited ones, as the API key’s does.</
 
 <dl class="py method">
 <dt class="sig sig-object py" id="mstar.api_server.rust_frontend.RustFrontendBridge.run">
-<span class="sig-name descname"><span class="pre">run</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/rust_frontend.html#RustFrontendBridge.run"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.rust_frontend.RustFrontendBridge.run" title="Link to this definition">#</a></dt>
-<dd><p>Blocking serve loop (the <code class="docutils literal notranslate"><span class="pre">uvicorn.run</span></code> replacement).</p>
+<span class="sig-name descname"><span class="pre">run</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">frontend</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/rust_frontend.html#RustFrontendBridge.run"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.rust_frontend.RustFrontendBridge.run" title="Link to this definition">#</a></dt>
+<dd><p>Blocking serve loop (the <code class="docutils literal notranslate"><span class="pre">uvicorn.run</span></code> replacement). The first
+SIGINT or SIGTERM goes on to <code class="docutils literal notranslate"><span class="pre">frontend</span></code> (mstar-server), and the loop
+keeps relaying tokens while it drains its in-flight requests, as
+uvicorn does on a graceful shutdown; its exit then stops the loop
+(<code class="docutils literal notranslate"><span class="pre">_stop_with</span></code> in <code class="docutils literal notranslate"><span class="pre">entrypoint.py</span></code>). A second signal, or one with no
+frontend running, stops the loop at once.</p>
 <dl class="field-list simple">
-<dt class="field-odd">Return type<span class="colon">:</span></dt>
-<dd class="field-odd"><p>None</p>
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>frontend</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/subprocess.html#subprocess.Popen" title="(in Python v3.12)"><em>Popen</em></a><em> | </em><em>None</em>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p>None</p>
 </dd>
 </dl>
 </dd></dl>

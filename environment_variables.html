@@ -744,7 +744,7 @@
                 <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#communication">Communication</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#models">Models</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#serving-python-frontend">Serving (Python frontend)</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#serving-api-server">Serving (API server)</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#serving-rust-frontend">Serving (Rust frontend)</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#request-media">Request media</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#worker-scheduling">Worker scheduling</a></li>
@@ -1066,9 +1066,12 @@ the SDK comparison skips.</p></td>
 </table>
 </div>
 </section>
-<section id="serving-python-frontend">
-<h2>Serving (Python frontend)<a class="headerlink" href="#serving-python-frontend" title="Link to this heading">#</a></h2>
-<p>Read by <code class="docutils literal notranslate"><span class="pre">mstar-serve</span></code> / <code class="docutils literal notranslate"><span class="pre">mstar.api_server.entrypoint</span></code>.</p>
+<section id="serving-api-server">
+<h2>Serving (API server)<a class="headerlink" href="#serving-api-server" title="Link to this heading">#</a></h2>
+<p>Read by <code class="docutils literal notranslate"><span class="pre">mstar-serve</span></code> / <code class="docutils literal notranslate"><span class="pre">mstar.api_server.entrypoint</span></code>, whichever frontend
+serves HTTP. Where a row describes how a route answers, it is the Python
+frontend’s (<code class="docutils literal notranslate"><span class="pre">--python-frontend</span></code>); <code class="docutils literal notranslate"><span class="pre">mstar-server</span></code>’s rows are under
+<a class="reference internal" href="#serving-rust-frontend">Serving (Rust frontend)</a>.</p>
 <div class="pst-scrollable-table-container"><table class="table">
 <colgroup>
 <col style="width: 28.0%" />
@@ -1149,8 +1152,8 @@ refused. Never downloaded.</p></td>
 </section>
 <section id="serving-rust-frontend">
 <h2>Serving (Rust frontend)<a class="headerlink" href="#serving-rust-frontend" title="Link to this heading">#</a></h2>
-<p>Read by the <code class="docutils literal notranslate"><span class="pre">mstar-server</span></code> binary and its bridge
-(<code class="docutils literal notranslate"><span class="pre">mstar-serve</span> <span class="pre">--rust-frontend</span></code>; see <a class="reference internal" href="installation.html"><span class="doc">Installation</span></a>).</p>
+<p>Read by the <code class="docutils literal notranslate"><span class="pre">mstar-server</span></code> binary, <code class="docutils literal notranslate"><span class="pre">mstar</span> <span class="pre">serve</span></code>’s default HTTP frontend,
+and its bridge (see <a class="reference internal" href="installation.html"><span class="doc">Installation</span></a>).</p>
 <div class="pst-scrollable-table-container"><table class="table">
 <colgroup>
 <col style="width: 28.0%" />
@@ -1177,7 +1180,7 @@ used with a warning (<code class="docutils literal notranslate"><span class="pre
 <td><p>unset</p></td>
 <td><p>Same rule as the Python server (<code class="docutils literal notranslate"><span class="pre">rust/server/src/auth.rs</span></code>, read
 once at startup): every route except <code class="docutils literal notranslate"><span class="pre">/health</span></code> and <code class="docutils literal notranslate"><span class="pre">/metrics</span></code> needs
-<code class="docutils literal notranslate"><span class="pre">Authorization:</span> <span class="pre">Bearer</span> <span class="pre">&lt;key&gt;</span></code>. <code class="docutils literal notranslate"><span class="pre">mstar-serve</span> <span class="pre">--rust-frontend</span></code>
+<code class="docutils literal notranslate"><span class="pre">Authorization:</span> <span class="pre">Bearer</span> <span class="pre">&lt;key&gt;</span></code>. <code class="docutils literal notranslate"><span class="pre">mstar-serve</span></code>
 sets it from <code class="docutils literal notranslate"><span class="pre">--api-key</span></code> / its own environment.</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_REQUEST_TIMEOUT_S</span></code></p></td>
@@ -1185,13 +1188,13 @@ sets it from <code class="docutils literal notranslate"><span class="pre">--api-
 <td><p>Per-request budget in the Rust frontend, in seconds; on expiry the
 client gets an error and the request is aborted in the backend. <code class="docutils literal notranslate"><span class="pre">0</span></code>
 times every request out; a negative, non-finite or unreadable value is
-the default. <code class="docutils literal notranslate"><span class="pre">mstar</span> <span class="pre">serve</span> <span class="pre">--rust-frontend</span></code> sets it from <code class="docutils literal notranslate"><span class="pre">--timeout</span></code>
+the default. <code class="docutils literal notranslate"><span class="pre">mstar</span> <span class="pre">serve</span></code> sets it from <code class="docutils literal notranslate"><span class="pre">--timeout</span></code>
 (<code class="docutils literal notranslate"><span class="pre">launch_rust_server</span></code>).</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SAMPLE_RATE</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">24000</span></code></p></td>
 <td><p>Sample rate stamped on the Rust frontend’s WAV output.
-<code class="docutils literal notranslate"><span class="pre">mstar</span> <span class="pre">serve</span> <span class="pre">--rust-frontend</span></code> sets it to the model’s
+<code class="docutils literal notranslate"><span class="pre">mstar</span> <span class="pre">serve</span></code> sets it to the model’s
 <code class="docutils literal notranslate"><span class="pre">get_output_sample_rate(&quot;audio&quot;)</span></code>, as the Python frontend reads it.</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_LIBSNDFILE</span></code></p></td>
@@ -1310,7 +1313,7 @@ variable as it is (the chunked encode then runs serially).</p></td>
 <td><p>The class name of the model’s adapter in <code class="docutils literal notranslate"><span class="pre">ADAPTER_REGISTRY</span></code>
 (<code class="docutils literal notranslate"><span class="pre">openai_adapter_class</span></code> in <code class="docutils literal notranslate"><span class="pre">mstar/api_server/rust_frontend.py</span></code>), which
 picks the OpenAI translation <code class="docutils literal notranslate"><span class="pre">mstar-server</span></code> uses
-(<code class="docutils literal notranslate"><span class="pre">adapters::from_python</span></code>, which looks it up in <code class="docutils literal notranslate"><span class="pre">ADAPTERS</span></code>). <code class="docutils literal notranslate"><span class="pre">mstar-serve</span> <span class="pre">--rust-frontend</span></code> always sets it;
+(<code class="docutils literal notranslate"><span class="pre">adapters::from_python</span></code>, which looks it up in <code class="docutils literal notranslate"><span class="pre">ADAPTERS</span></code>). <code class="docutils literal notranslate"><span class="pre">mstar-serve</span></code> always sets it;
 a <code class="docutils literal notranslate"><span class="pre">mstar-server</span></code> started by hand without it answers 404 on <code class="docutils literal notranslate"><span class="pre">/v1/*</span></code>.</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_TOKENIZER</span></code></p></td>
@@ -1850,7 +1853,7 @@ lands depends on whether Inductor compiled first.</p></td>
     <ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#communication">Communication</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#models">Models</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#serving-python-frontend">Serving (Python frontend)</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#serving-api-server">Serving (API server)</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#serving-rust-frontend">Serving (Rust frontend)</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#request-media">Request media</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#worker-scheduling">Worker scheduling</a></li>
