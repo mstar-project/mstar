@@ -24,14 +24,17 @@ from mstar.engine.resources.attn.config import (
     CrossAttentionSpec,
 )
 from mstar.engine.resources.attn.ragged.config import (
-    ChunkCausalLayout as ResourceChunkCausalLayout,
+    ChunkCausalAttentionStep,
     KeptWindowAttentionSpec,
     RaggedAttentionConfig,
     RaggedAttentionSpec,
+    RaggedChunkCausalAttentionSpec,
     RaggedCrossAttentionSpec,
     RaggedCrossAttentionStep,
-    RaggedChunkCausalAttentionSpec,
     cross_label,
+)
+from mstar.engine.resources.attn.ragged.config import (
+    ChunkCausalLayout as ResourceChunkCausalLayout,
 )
 from mstar.engine.resources.kv.config import (
     KVLayout,
@@ -390,7 +393,7 @@ def build_handle(
 
 def state_steps(
     step: SubmoduleStep | None, handles: Mapping[str, ArrayHandle | SamplerHandle | ShardHandle], *,
-    graph_walk: str | None = None,
+    graph_walk: str | None = None, per_request_info: Mapping | None = None,
 ) -> SubmoduleStep | None:
     """``step`` on ``graph_walk`` as a new step, with what its ``state`` declares expanded into today's step objects by
     each storage's builder, afresh for each step, since each carries the step's segments. The handles it opens are
@@ -414,7 +417,10 @@ def state_steps(
                 raise ValueError(f"Array {name!r}: a step lists it with no segments, its own or the step's")
             builder = builders.get(handle.storage)
             if builder is None:
-                builder = builders[handle.storage] = handle.storage.step_builder()
+                builder = builders[handle.storage] = (
+                    WithinStepSteps(per_request_info) if handle.storage is WITHIN_STEP
+                    else handle.storage.step_builder()
+                )
             builder.add(handle, declared, step, graph_walk)
         elif isinstance(declared, SampleStep) and isinstance(handle, SamplerHandle):
             steps[name] = SamplerStep(
@@ -519,13 +525,16 @@ class WithinStepSteps(StepBuilder):
     """The step of each ragged resource, from the reads that share it: each label's segments, and the cross reads'
     pairs. A label is one layout on the resource, so two arrays with one label have to mean the same tokens."""
 
-    def __init__(self):
+    def __init__(self, per_request_info: Mapping | None = None):
         self._labels: dict[str, dict[str, Sequence[Segment]]] = {}
         self._pairs: dict[str, list[tuple[str, str]]] = {}
         # how the reads on each resource lay out their queries, which is one way per resource
         self._queries: dict[str, Queries] = {}
         # a resource's layout is fixed only if every read on it declares it so
         self._fixed: dict[str, bool] = {}
+        self._chunk_layouts: dict[str, tuple[ResourceChunkCausalLayout, ...]] = {}
+        self._per_request_info = per_request_info or {}
+        self._info: dict[str | int, Any] | None = None
 
     def add(
         self, handle: "WithinStepHandle", declared: ArrayStep, step: SubmoduleStep, walk: str | None = None,
@@ -537,7 +546,44 @@ class WithinStepSteps(StepBuilder):
         key = handle.resource_key
         self._fixed[key] = self._fixed.get(key, True) and declared.fixed_layout
         self._queries[key] = handle.queries
-        handle.queries.plan(self, handle, segments_of(declared, step), step)
+        segments = segments_of(declared, step)
+        handle.queries.plan(self, handle, segments, step)
+        if isinstance(handle.queries, ChunkCausalQueries):
+            read = handle._bindings[0].declared
+            layouts = tuple(self._chunk_layout(handle.array, read, segment) for segment in segments)
+            prior = self._chunk_layouts.setdefault(key, layouts)
+            if prior != layouts:
+                raise ValueError(f"Array {handle.array.name!r}: reads sharing {key!r} use different chunk layouts")
+
+    def _chunk_layout(self, array: Array, read: Read, segment: Segment) -> ResourceChunkCausalLayout:
+        if self._info is None:
+            self._info = {}
+            for rid, info in self._per_request_info.items():
+                self._info[rid] = info
+                self._info[info.request_id] = info
+        info = self._info.get(segment.request_id)
+        if info is None:
+            raise ValueError(f"Array {array.name!r}: no request info for chunk layout of {segment.request_id!r}")
+        raw = info.step_metadata.get(CHUNK_CAUSAL_LAYOUT_KWARG, {})
+        lengths = raw.get(array.name, {}).get(segment.label, {}).get(next(iter(array.reads)))
+        if lengths is None:
+            if type(segment.request_id) is int and segment.request_id < -1:
+                # Capture padding has no request layout; a full global span is a safe well-formed mask.
+                lengths = [segment.span, 0, 0]
+            else:
+                raise ValueError(
+                    f"Array {array.name!r}: request {segment.request_id!r} has no "
+                    f"state_layout chunk lengths for read {next(iter(array.reads))!r}"
+                )
+        if not isinstance(lengths, (list, tuple)) or len(lengths) != 3:
+            raise ValueError(f"Array {array.name!r}: request {segment.request_id!r} has invalid chunk lengths")
+        layout = ChunkCausalLayout(global_len=lengths[0], noised_len=lengths[1], clean_len=lengths[2])
+        if layout.span != segment.span:
+            raise ValueError(
+                f"Array {array.name!r}: request {segment.request_id!r}'s chunk layout spans {layout.span}, "
+                f"but its segment spans {segment.span}"
+            )
+        return chunk_causal_resource_layout(read.mask, layout)
 
     def _label(self, key: str, array: Array, segments: Sequence[Segment]) -> str:
         """Hold ``segments``, ``array``'s in this step, under its label on the resource ``key``, and give the label."""
@@ -560,8 +606,37 @@ class WithinStepSteps(StepBuilder):
             segments = tuple(s for each in by_label.values() for s in each) if len(by_label) > 1 else (
                 next(iter(by_label.values()))
             )
-            steps[key] = self._queries[key].step(segments, self._pairs.get(key, ()), self._fixed[key])
+            if isinstance(self._queries[key], ChunkCausalQueries):
+                layouts = self._chunk_layouts[key]
+                if len(layouts) != len(segments):
+                    raise ValueError(f"chunk resource {key!r} has {len(layouts)} layouts for {len(segments)} segments")
+                steps[key] = ChunkCausalAttentionStep(segments=tuple(segments), layouts=layouts)
+            else:
+                steps[key] = self._queries[key].step(segments, self._pairs.get(key, ()), self._fixed[key])
         return steps
+
+
+CHUNK_CAUSAL_LAYOUT_KWARG = "__state_chunk_causal_layout__"
+
+
+def chunk_causal_layouts(
+    declarations: Sequence[Array | Sampler | SeqShard], state_layout: Mapping[str, Mapping[str, Layout]],
+) -> dict[str, dict[str, dict[str, list[int]]]]:
+    """The read-keyed lengths of within-step arrays, as wire-safe request data."""
+    arrays = {declared.name: declared for declared in declarations if isinstance(declared, Array)}
+    rows = {}
+    for name, by_label in state_layout.items():
+        array = arrays.get(name)
+        if array is None:
+            raise RuntimeError(f"state_layout[{name!r}]: it names no declared array, of {sorted(arrays)}")
+        for label, layout in by_label.items():
+            _check_chunk_causal_layout(array, label, layout)
+            if layout.chunk_causal:
+                rows.setdefault(name, {})[label] = {
+                    key: [lengths.global_len, lengths.noised_len, lengths.clean_len]
+                    for key, lengths in layout.chunk_causal.items()
+                }
+    return rows
 
 
 def kv_layouts(
@@ -584,9 +659,8 @@ def kv_layouts(
             if undeclared:
                 raise RuntimeError(f"{where}[{name!r}]: labels {sorted(undeclared)} aren't in Array {name!r}.labels")
     converted = {}
+    chunk_causal_layouts(declarations, state_layout)
     for name, by_label in state_layout.items():
-        for label, layout in by_label.items():
-            _check_chunk_causal_layout(arrays[name], label, layout)
         layouts = storage_of(arrays[name]).layouts(arrays[name], by_label, keyed_spans.get(name, EMPTY))
         if layouts is not None:
             converted[name] = layouts
@@ -1892,8 +1966,7 @@ class ChunkCausalQueries(OwnQueries):
 
     def step(self, segments, pairs: Sequence[tuple[str, str]], fixed: bool) -> Any:
         raise RuntimeError(
-            "chunk-causal step planning needs each request's read-keyed state_layout; "
-            "the within-step request-layout transport is not bound yet"
+            "chunk-causal step planning needs request layouts; use WithinStepSteps to resolve them"
         )
 
 
@@ -2417,7 +2490,8 @@ class WithinStepStorage(Storage):
                 num_qo_heads=read.op.q_heads, num_kv_heads=heads, head_dim=head_dim, dtype=dtype,
             )
             spec = queries.spec_class(resource_key=key, nodes=array.nodes, config=config)
-            spec = shared.setdefault((queries.spec_class, array.nodes, astuple(config)), spec)
+            mask_size = read.mask.chunk_len if isinstance(read.mask, ChunkCausal) else None
+            spec = shared.setdefault((queries.spec_class, array.nodes, astuple(config), mask_size), spec)
             resolved.resource_of[key] = spec.resource_key
             if bound.binding.plans and isinstance(spec, RaggedAttentionSpec):
                 # the labels the node's sequence shard may split (`RaggedAttentionSpec.derive`)
