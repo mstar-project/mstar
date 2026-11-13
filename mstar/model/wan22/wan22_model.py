@@ -4,7 +4,8 @@ Architecture (4 nodes; nothing here is cached, the dit's self-attention reads an
     text_encoder - UMT5-XXL prompt encoder (thin HF wrapper)
     vae_encoder  - Wan2.2-VAE encode of the conditioning frame (I2V)
     dit          - dense 5B video DiT; CFG as one batch-2 forward,
-                   UniPC (bh2, order 2, flow prediction) run inline
+                   UniPC (bh2, order 2, flow prediction) run inline, or a
+                   DMD-distilled checkpoint's few unguided steps (sampler: dmd)
     vae_decoder  - Wan2.2-VAE latent -> pixel decode
 
 Graph walks (4):
@@ -50,10 +51,20 @@ from mstar.model.components.diffusion.attention import dit_entry, refuse_attenti
 from mstar.model.components.diffusion.step_cache import step_cache_policy
 from mstar.model.components.video_encode import encode_mp4
 from mstar.model.submodule_base import NodeSubmodule
-from mstar.model.wan22.config import DIT_SHARD, DIT_TOKENS, MAG_RATIOS, SELF_ATTN, WAN22_VARIANT_TI2V_5B, Wan22Config
+from mstar.model.wan22.config import (
+    DIT_SHARD,
+    DIT_TOKENS,
+    MAG_RATIOS,
+    SAMPLER_DMD,
+    SAMPLER_UNIPC,
+    SELF_ATTN,
+    WAN22_VARIANT_TI2V_5B,
+    Wan22Config,
+)
 from mstar.model.wan22.submodules import (
     DENOISE_LOOP_NAME,
     Wan22DitSubmodule,
+    Wan22DmdDitSubmodule,
     Wan22TextEncoderSubmodule,
     Wan22VaeDecoderSubmodule,
     Wan22VaeEncoderSubmodule,
@@ -98,6 +109,9 @@ class Wan22Model(Model):
         vae_decode_fast: bool = True,
         vae_decode_fast_sizes: tuple[str, ...] | None = None,
         step_cache: dict | None = None,
+        sampler: str = SAMPLER_UNIPC,
+        dmd_timesteps: tuple[int, ...] | None = None,
+        dmd_shift: float | None = None,
         **kwargs,
     ):
         refuse_attention_backend_kwarg(kwargs)
@@ -113,6 +127,7 @@ class Wan22Model(Model):
             dit_max_batch_size=self._require_positive_int("dit_max_batch_size", dit_max_batch_size),
             max_video_pixels=self._require_positive_int("max_video_pixels", max_video_pixels),
             vae_decode_fast=vae_decode_fast, vae_decode_fast_sizes=vae_decode_fast_sizes, step_cache=step_cache,
+            sampler=sampler, dmd_timesteps=dmd_timesteps, dmd_shift=dmd_shift,
         )
         self.config.compile_dit_grids()  # a malformed list fails at startup
         step_cache_policy(step_cache, MAG_RATIOS)  # and so does a malformed step cache
@@ -218,25 +233,19 @@ class Wan22Model(Model):
         dit_inputs = ["text_embeds_pos", "text_embeds_neg"]
         if i2v:
             dit_inputs.append("image_latent")
-        # Loop-carried state: see Wan22DitSubmodule's docstring for the
-        # definitive shape/dtype inventory (latents, the order-2 UniPC ring
-        # buffer, and the corrector's last_sample).
-        dit_inputs += [
-            "latents",
-            "unipc_model_outputs",
-            "unipc_last_sample",
-        ]
+        # Loop-carried state: see the dit submodule's docstring for the definitive
+        # shape/dtype inventory (UniPC: latents, the order-2 ring buffer and the
+        # corrector's last_sample; DMD: latents and the drawn re-noise).
+        dit = self._dit_class()
+        loop_back = [dit.LATENTS, *dit.SOLVER_STATE]
+        dit_inputs += loop_back
 
         denoise_loop = Loop(
             name=DENOISE_LOOP_NAME,
             section=GraphNode(
                 name="dit",
                 input_names=dit_inputs,
-                outputs=[
-                    GraphEdge(next_node="dit", name="latents"),
-                    GraphEdge(next_node="dit", name="unipc_model_outputs"),
-                    GraphEdge(next_node="dit", name="unipc_last_sample"),
-                ],
+                outputs=[GraphEdge(next_node="dit", name=name) for name in loop_back],
                 # the loop's cap keeps speculation off a request's last step
                 enable_async_scheduling=True,
             ),
@@ -410,6 +419,18 @@ class Wan22Model(Model):
         guidance = self._get(model_kwargs, "guidance_scale", cfg.guidance_scale)
         if not _is_number(guidance):
             raise ValueError(f"Wan2.2 guidance_scale must be a finite number; got {guidance!r}.")
+        if cfg.sampler == SAMPLER_DMD:
+            # the distilled checkpoint was trained for exactly these steps, unguided
+            if steps != cfg.default_num_inference_steps:
+                raise ValueError(
+                    f"This Wan2.2 server samples a DMD-distilled checkpoint in {cfg.default_num_inference_steps} "
+                    f"steps (timesteps {list(cfg.dmd_timesteps)}); got num_inference_steps={steps}."
+                )
+            if guidance > 1.0:
+                raise ValueError(
+                    f"This Wan2.2 server samples a DMD-distilled checkpoint, which runs without CFG; "
+                    f"got guidance_scale={guidance}."
+                )
         negative = self._get(model_kwargs, "negative_prompt", cfg.default_negative_prompt)
         if not isinstance(negative, str):
             raise ValueError(f"Wan2.2 negative_prompt must be a string; got {negative!r}.")
@@ -466,6 +487,8 @@ class Wan22Model(Model):
                 "Wan2.2 requires a text prompt for both text-to-video and "
                 "image-to-video requests."
             )
+        if "image" in input_modalities and self.config.sampler == SAMPLER_DMD:
+            raise ValueError("This Wan2.2 server's DMD sampler is text-to-video only; got an image input.")
         if "image" in input_modalities and not (tensors or {}).get("image_inputs"):
             # A declared-but-missing input is a malformed request, not a mode
             # preference — do not silently downgrade an I2V request to T2V.
@@ -560,9 +583,9 @@ class Wan22Model(Model):
             os.environ.get("WAN22_VAE_DECODE_TILING", self.config.vae_decode_tiling)
         )
         logger.info(
-            "Wan2.2 request: height=%d width=%d frames=%d steps=%d guidance=%s seed=%s "
+            "Wan2.2 request: sampler=%s height=%d width=%d frames=%d steps=%d guidance=%s seed=%s "
             "negative_prompt=%s fps=%s decode=%s compile=%s",
-            resolved["height"], resolved["width"], resolved["num_frames"],
+            self.config.sampler, resolved["height"], resolved["width"], resolved["num_frames"],
             resolved["num_inference_steps"], resolved["guidance_scale"],
             seed if seed is not None else "auto",
             "present" if negative.strip() else "absent", fps, decode_policy,
@@ -595,6 +618,8 @@ class Wan22Model(Model):
                 "Request declared an image input but no image_inputs tensor "
                 "arrived; image-to-video requires the conditioning image."
             )
+        if is_i2v and self.config.sampler == SAMPLER_DMD:
+            raise ValueError("This Wan2.2 server's DMD sampler is text-to-video only; got an image input.")
         walks = [self.ENCODE_TEXT_WALK]
         if is_i2v:
             walks.append(self.ENCODE_IMAGE_WALK)
@@ -676,9 +701,12 @@ class Wan22Model(Model):
             transformer = build_wan22_dit(
                 self.config, self.model_path_hf, device=device, cache_dir=self.cache_dir,
             )
-            return Wan22DitSubmodule(transformer, self.config, cfg_group=cfg_group)
+            return self._dit_class()(transformer, self.config, cfg_group=cfg_group)
         logger.warning("Wan2.2 has no submodule for node %r; running it dummy.", node_name)
         return None
+
+    def _dit_class(self) -> type[Wan22DitSubmodule]:
+        return Wan22DmdDitSubmodule if self.config.sampler == SAMPLER_DMD else Wan22DitSubmodule
 
     def _get_encode_vae(self) -> torch.nn.Module:
         """The vae_encoder's bf16 Wan2.2-VAE instance — the exact loading the
@@ -692,6 +720,21 @@ class Wan22Model(Model):
                 torch_dtype=torch.bfloat16, cache_dir=self.cache_dir,
             ).eval()
         return self._encode_vae
+
+    def _check_sampler_fits_checkpoint(self) -> None:
+        """A DMD-distilled checkpoint (model_index ``WanDMDPipeline``) would serve under
+        UniPC without an error, off the schedule it was trained for; refuse it at load."""
+        from diffusers import DiffusionPipeline
+
+        try:
+            pipeline = DiffusionPipeline.load_config(self.model_path_hf, cache_dir=self.cache_dir).get("_class_name")
+        except OSError:  # a checkpoint without a model_index: nothing to check
+            return
+        if pipeline == "WanDMDPipeline" and self.config.sampler != SAMPLER_DMD:
+            raise ValueError(
+                f"{self.model_path_hf} is a DMD-distilled checkpoint ({pipeline}); serve it with "
+                f"model_kwargs sampler: {SAMPLER_DMD} (configs/wan22_fastwan.yaml)."
+            )
 
     def _refresh_checkpoint_defaults(self):
         """Re-read the scheduler defaults from the checkpoint at weight-load time.
@@ -717,6 +760,7 @@ class Wan22Model(Model):
                     f"UniPC port is built for {ported}; refusing to serve with "
                     "silently wrong solver math."
                 )
+        self._check_sampler_fits_checkpoint()
         checkpoint_shift = scheduler_config.get("flow_shift")
         if checkpoint_shift is not None and checkpoint_shift != self.config.flow_shift:
             logger.warning(
