@@ -797,6 +797,10 @@ class _Queue:
         del node_name, wg_ids
         self.pushed_back.extend(rids)
 
+    @staticmethod
+    def get_rid_string(handle):
+        return handle
+
 
 def _rank(*, leader: bool, parallel: bool = True) -> Worker:
     """One rank of ``"node"``, the real refusal path over a page-holding "victim"
@@ -1383,13 +1387,14 @@ def _pool_rank(monkeypatch, rank: int, cfg: PagedKVConfig | None = None) -> tupl
     return kv, engine
 
 
-def _ingest(kvs, rid: str, pages: int, arrival: int, rebuildable: bool = True) -> None:
+def _ingest(kvs, rid: str, pages: int, arrival: int, rebuildable: bool = True, guaranteed: bool = False) -> None:
     """``rid``'s prompt fills ``pages`` pages, and it decodes one token per iteration."""
     tokens = pages * PAGE_SIZE
     layout = StreamLayout(spans=(PrefixSpan(tokens, tokens, "prefill"),), growth=(("decode", 1),))
     for kv in kvs:
         _ENGINES[id(kv)]._runner.ingest_request(rid, {"kv": KVReqConfig(
             kv_layout={"main": layout}, loop_caps={"decode": 4 * PAGE_SIZE}, rebuildable=rebuildable,
+            unpausable=guaranteed,
         )}, arrival)
 
 
@@ -1397,7 +1402,10 @@ def _counts(kv) -> tuple:
     """What the next admit reads, and the order the next grant takes free pages in."""
     return (
         kv._unused,
-        {rid: (a.pages, a.remaining, a.asks_again, a.grown, a.grown_from) for rid, a in kv._allotments.items()},
+        {
+            rid: (a.pages, a.remaining, a.asks_again, a.grown, a.grown_from, a.taken_back)
+            for rid, a in kv._allotments.items()
+        },
         # a request the moves set aside waits holding only on rank 0, which alone moves it
         sorted(kv._stalled & kv._asks.keys()),
         {rid: (e.pages, sorted(e.victims), e.granted) for rid, e in kv._earmarks.items()},
@@ -1408,7 +1416,8 @@ def _counts(kv) -> tuple:
 
 def _preempt(kv, rid: str, droppable: bool):
     """Rank 0's choice of victims for ``rid``'s shortage of one page, newest first."""
-    return kv.preempt(rid, 1, _ENGINES[id(kv)]._runner.newer_than(rid), lambda other: droppable)
+    runner = _ENGINES[id(kv)]._runner
+    return kv.preempt(rid, 1, runner.newer_than(rid), runner.older_than(rid), lambda other: droppable)
 
 
 def _waits(kv, rid: str) -> None:
@@ -1749,9 +1758,9 @@ def test_only_rank_0_moves_requests_for_the_ones_that_wait(monkeypatch):
     _ingest((leader, follower), "o", 2, arrival=2)
     assert not _admits(leader, "o")
     (refusal,) = lead._runner.refusals()
-    newer = lead._runner.newer_than("o")
-    assert follower.make_room(refusal.mark, newer, bool) is None, "a follower chose v to move for o"
-    assert leader.make_room(refusal.mark, newer, bool).to_drop == ["v"]
+    newer, older = lead._runner.newer_than("o"), lead._runner.older_than("o")
+    assert follower.make_room(refusal.mark, newer, older, bool) is None, "a follower chose v to move for o"
+    assert leader.make_room(refusal.mark, newer, older, bool).to_drop == ["v"]
 
 
 def test_a_follower_takes_the_host_room_rank_0_set_aside_and_so_each_requests_class(monkeypatch):
@@ -1859,13 +1868,68 @@ def test_a_follower_allots_the_room_rank_0_counted_for_a_short_grant(monkeypatch
         assert _step(leader, rid, tokens).ok and _step(follower, rid, tokens).ok
     outcome = _step(leader, "r", 3 * PAGE_SIZE)
     assert not outcome.ok and not _step(follower, "r", 3 * PAGE_SIZE).ok
-    victims = leader.preempt("r", outcome.reason.pages_short, _ENGINES[id(leader)]._runner.newer_than("r"), bool)
+    runner = _ENGINES[id(leader)]._runner
+    victims = leader.preempt("r", outcome.reason.pages_short, runner.newer_than("r"), runner.older_than("r"), bool)
     assert victims.to_drop == ["v"]
     lead.drop_request(NODE, "v", 5 * PAGE_SIZE)
 
     assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
 
     assert _counts(follower) == _counts(leader), "r's allotment here lacks the room rank 0 counted for its grant"
+
+
+def test_a_follower_holds_back_what_rank_0_took_back_from_an_older_borrower(monkeypatch):
+    """o borrowed what g hasn't written, and rank 0 drops o, older, for g's grant. A follower that grew g's allotment
+    by the pages o freed, instead of holding them back from borrowers, would let o's return borrow them there."""
+    (leader, lead), (follower, follow) = _pool_rank(monkeypatch, 0), _pool_rank(monkeypatch, 1)
+    _ingest((leader, follower), "o", 3, arrival=1)
+    _ingest((leader, follower), "g", 1, arrival=2, guaranteed=True)
+    assert _admits(leader, "o") and _admits(leader, "g")
+    assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
+    for rid, tokens in (("o", 3 * PAGE_SIZE), ("g", PAGE_SIZE), ("o", 3 * PAGE_SIZE)):
+        assert _step(leader, rid, tokens).ok and _step(follower, rid, tokens).ok
+    outcome = _step(leader, "g", 4 * PAGE_SIZE)
+    assert not outcome.ok and not _step(follower, "g", 4 * PAGE_SIZE).ok
+    runner = _ENGINES[id(leader)]._runner
+    victims = leader.preempt("g", outcome.reason.pages_short, runner.newer_than("g"), runner.older_than("g"), bool)
+    assert victims.to_drop == ["o"]
+    lead.drop_request(NODE, "o", 6 * PAGE_SIZE)
+
+    assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
+
+    assert _counts(follower) == _counts(leader), "g holds back other pages here than on rank 0"
+    assert _step(leader, "g", 4 * PAGE_SIZE).ok and _step(follower, "g", 4 * PAGE_SIZE).ok
+
+
+def test_a_borrower_rank_0_lets_grow_after_it_throws_a_pre_plan_away_grows_on_every_rank(monkeypatch):
+    """g took back what o freed. Rank 0 then pre-plans g's next page, one of those, and throws the stage away, and a
+    follower never planned the step. Undone on rank 0, the grant left g lending the page there alone, so rank 0 let
+    r, growing past its allotment, borrow it, and the follower refused r's step while rank 0 ran it."""
+    (leader, lead), (follower, follow) = _pool_rank(monkeypatch, 0), _pool_rank(monkeypatch, 1)
+    _ingest((leader, follower), "r", 2, arrival=0)
+    _ingest((leader, follower), "o", 3, arrival=1)
+    _ingest((leader, follower), "g", 1, arrival=2, guaranteed=True)
+    assert _admits(leader, "r") and _admits(leader, "o") and _admits(leader, "g")
+    assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
+    for rid, tokens in (("r", 2 * PAGE_SIZE), ("o", 3 * PAGE_SIZE), ("g", PAGE_SIZE), ("o", 3 * PAGE_SIZE)):
+        assert _step(leader, rid, tokens).ok and _step(follower, rid, tokens).ok
+    outcome = _step(leader, "g", 4 * PAGE_SIZE)
+    assert not outcome.ok and not _step(follower, "g", 4 * PAGE_SIZE).ok
+    runner = _ENGINES[id(leader)]._runner
+    victims = leader.preempt("g", outcome.reason.pages_short, runner.newer_than("g"), runner.older_than("g"), bool)
+    assert victims.takes_back
+    lead.drop_request(NODE, "o", 6 * PAGE_SIZE)
+    assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
+    step = SubmoduleStep({"kv": KVStep()}, segments=[Segment("g", "main", PAGE_SIZE)])
+    step.set_ctx(StepContext(["g"], "decode", 0, False, is_preplan=True))
+    assert lead._runner.pre_admit(step).ok
+    step.ctx.is_preplan = False
+    lead._runner.clear_preplan()
+
+    while (granted := _step(leader, "r", PAGE_SIZE).ok) and _step(follower, "r", PAGE_SIZE).ok:
+        pass
+    assert not granted, "rank 0 ran r's step, which the follower refused"
+    assert _counts(leader) == _counts(follower)
 
 
 def test_a_short_grant_with_no_room_to_claim_leaves_the_allotment_alike_on_every_rank(monkeypatch):
@@ -1913,7 +1977,9 @@ def _make_room(kv, droppable: bool = False):
     droppable only if ``droppable``."""
     runner = _ENGINES[id(kv)]._runner
     for refusal in runner.refusals():
-        victims = kv.make_room(refusal.mark, runner.newer_than(refusal.rid), lambda other: droppable)
+        victims = kv.make_room(
+            refusal.mark, runner.newer_than(refusal.rid), runner.older_than(refusal.rid), lambda other: droppable,
+        )
         if victims is not None:
             return victims
     return None
@@ -2149,15 +2215,15 @@ def test_a_waiting_request_admitted_before_its_last_victim_lands_takes_no_more_r
     assert _counts(follower) == _counts(leader), "o's allotment here isn't the one rank 0 left it with"
 
 
-def test_a_waiting_request_that_turns_guaranteed_as_one_victim_lands_waits_for_its_footprint_on_every_rank(
+def test_a_waiting_request_that_turns_guaranteed_as_one_victim_lands_takes_its_footprint_on_every_rank(
     monkeypatch,
 ):
     """v1's move covers o's prompt, but the host v1 filled has no room for it, so o, which no drop can free, turns
-    guaranteed and asks for its 6-page footprint on every rank. v2's drop then covered the prompt again, and every
-    rank admitted o, guaranteed, with 2 pages."""
+    guaranteed and is admitted with its 6-page footprint on every rank. v2's drop then covered the prompt again, and
+    every rank admitted o, guaranteed, with 2 pages."""
     (leader, lead), (follower, follow) = _v1_hosted_and_v2_dropped_for_o(monkeypatch, rebuildable=False)
     lead.offload_request(NODE, "v1")
-    assert "o" in leader._guaranteed and "o" not in leader._allotments
+    assert "o" in leader._guaranteed and leader._allotments["o"].pages == 6
     assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
     assert follower._guaranteed == leader._guaranteed, "o is preemptible here and guaranteed on rank 0"
     assert _counts(follower) == _counts(leader), "o's earmark here waits for other than its footprint"
@@ -2166,7 +2232,7 @@ def test_a_waiting_request_that_turns_guaranteed_as_one_victim_lands_waits_for_i
     assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
 
     for kv in (leader, follower):
-        assert "o" not in kv._allotments, "o was admitted guaranteed with less than its footprint"
+        assert kv._allotments["o"].pages == 6, "o was admitted guaranteed with other than its footprint"
     assert _counts(follower) == _counts(leader), "the follower holds other room for o than rank 0"
 
 
