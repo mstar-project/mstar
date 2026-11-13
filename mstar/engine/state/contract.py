@@ -276,7 +276,7 @@ class Positions:
 
 @dataclass(frozen=True)
 class Array:
-    """Per request, per label and per declared layer, entries at log positions 0 to n - 1, with n <= ``max_len``.
+    """Per owner, per label and per declared layer, entries at log positions 0 to n - 1, with n <= ``max_len``.
 
     An append-only array only grows, and a rewritable one also takes writes in place. All layers of an array have
     the same length at the end of every step. ``nodes`` lists who may touch the array, and the engine places it.
@@ -296,6 +296,7 @@ class Array:
     rewritable: bool = False
     labels: frozenset[str] = frozenset({"main"})
     positions: Positions | None = None
+    lifetime: Literal["request", "episode"] = "request"
 
     def __post_init__(self):
         object.__setattr__(self, "nodes", frozenset(self.nodes))
@@ -314,6 +315,8 @@ class Array:
             raise ValueError(f"{where}.labels must be non-empty")
         if not (type(self.max_len) is int and self.max_len >= 0):
             raise ValueError(f"{where}.max_len must be an int >= 0, got {self.max_len!r}")
+        if self.lifetime not in ("request", "episode") or type(self.lifetime) is not str:
+            raise ValueError(f"{where}.lifetime must be 'request' or 'episode', got {self.lifetime!r}")
         self._check_entry()
         for key, read in self.reads.items():
             self._check_read(key, read)

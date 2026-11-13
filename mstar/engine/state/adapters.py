@@ -159,6 +159,9 @@ def _resolve(arrays: Sequence[Array], setup: "StateSetup") -> "Resolved":
     """``arrays`` resolved by their storages, all of one storage's arrays in one call."""
     by_storage: dict[Storage, list[Array]] = {}
     for array in arrays:
+        if array.lifetime == "episode":
+            raise _no_layout(array, "episode lifetime needs row binding and storage teardown, which this E1 slice "
+                                    "does not yet wire into the engine")
         storage = storage_of(array)
         by_storage.setdefault(storage, []).append(array)
     specs: dict[str, list[NodeResourceSpec]] = {}
