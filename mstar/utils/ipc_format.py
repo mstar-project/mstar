@@ -59,6 +59,11 @@ class NewRequest(MessageBody):
     initial_inputs: list[GraphEdge]
     request_info: CurrentForwardPassInfo
     loop_caps: dict[str, int]
+    # The conductor owns assignment; a missing id borrows the slot for one call.
+    episode_id: str | None = None
+    episode_slot: int | None = None
+    reset_episode: bool = False
+    episode_clear: list[str] = field(default_factory=list)
 
 
 class MessageSource(IntEnum):
@@ -390,6 +395,8 @@ class NewRequestConductor(MessageBody):
     # Set only by an episode-capable frontend, after it binds the connection.
     # A model without episode arrays ignores it and keeps the request path.
     episode: str | None = None
+    episode_keys: dict[str, str] | None = None
+    reset_episode: bool = False
 
 
 @dataclass
@@ -402,6 +409,9 @@ class WorkerGraphsDone(MessageBody):
     # one name per chunk this worker emitted to the client since its last report
     output_signal_names: list[str] = field(default_factory=list)
     resource_publish_info: dict[str, PublishedInfo] = field(default_factory=dict)
+    # Resident entries for episode arrays owned by this worker graph. Only
+    # rank 0 reports counts; other ranks hold the same logical row lengths.
+    episode_held: dict[str, int] = field(default_factory=dict)
     partition_name: str = field(default="default")
     partition_done: bool = field(default=False)
     # The walk the completed pass ran under. The conductor follows it for a

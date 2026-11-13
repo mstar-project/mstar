@@ -203,6 +203,8 @@ class ProcessPromptOutput(NamedTuple):
     new_input_tensors: NameToTensorList
     metadata: dict
     lora_adapter: str | None | KeepAdapter = KEEP_ADAPTER
+    episode_keys: Mapping[str, str] | None = None
+    reset_episode: bool = False
 
 
 class ClientChunk(NamedTuple):
