@@ -235,13 +235,19 @@ REASONER_DECODE_LOOP = "decode_loop"
 REASONER_LABEL = "main"
 
 
+def engine_compile_mode(mode: str) -> str | None:
+    """The engine compile mode for a ``Cosmos3Config.denoise_compile_mode``:
+    "deterministic" and "default" are the engine's modes of those names,
+    "level" (None) its -O level."""
+    return None if mode == "level" else mode
+
+
 def denoise_compile_kwargs(mode: str) -> dict:
     """``torch.compile`` arguments for the denoise step; see
-    ``Cosmos3Config.denoise_compile_mode``. "deterministic" and "default" are
-    the engine's compile modes of those names, "level" its -O level."""
+    ``Cosmos3Config.denoise_compile_mode``."""
     from mstar.engine.accelerator_graph_runner import compile_kwargs
 
-    return compile_kwargs(None if mode == "level" else mode)
+    return compile_kwargs(engine_compile_mode(mode))
 
 
 def latent_frames(num_frames: int, config) -> int:
@@ -2507,9 +2513,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                 # labels, so it keys elsewhere (`cg_key_info`) and runs eager.
                 additional_key_info=regime.name,
                 compile=self.config.compile_prefill,
-                compile_mode=(
-                    None if self.config.denoise_compile_mode == "level" else self.config.denoise_compile_mode
-                ),
+                compile_mode=engine_compile_mode(self.config.denoise_compile_mode),
                 capture_batch_sizes=prefill_bs,
                 caps_eager_batch_size=False,
             ))
