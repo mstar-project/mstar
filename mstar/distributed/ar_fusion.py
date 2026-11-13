@@ -482,8 +482,9 @@ class AiterARFusion(ARFusion):
 
         Every rank runs every case even after one fails: each call is a
         collective, and a rank that stops early leaves its peers spinning in
-        the kernel. That holds for a case that raises here too (say an OOM on
-        this GPU): it counts as a failure and the next case still runs."""
+        the kernel. That holds for a kernel call that raises too: it counts as a
+        failure and the next case still runs. A raise before the launch (say an
+        OOM allocating a case's buffers) still skips that rank's call."""
         gen = torch.Generator().manual_seed(1234)
         bad = None
         for tokens in sorted({1, max_tokens}):

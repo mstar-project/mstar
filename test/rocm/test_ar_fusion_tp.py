@@ -188,6 +188,12 @@ def _memory(ranks: _Ranks, fn):
     return out, (free0 - free1) / 2**20
 
 
+def _fusion(group, hidden, dtype):
+    """The group's fused strategy for ``hidden`` x ``dtype``, or None."""
+    ws = group._ar_fusion.get((dtype, hidden))
+    return None if ws is None else ws.fusion
+
+
 def _parity(ranks: _Ranks) -> list[Row]:
     rows = []
     for hidden in ranks.opts.hiddens:
@@ -195,7 +201,7 @@ def _parity(ranks: _Ranks) -> list[Row]:
         fused, mem = _memory(ranks, lambda group=group, hidden=hidden: (
             group.init_allreduce_fusion(hidden, ranks.dtype, ranks.opts.max_tokens)
         ))
-        fusion = group._ar_fusion
+        fusion = _fusion(group, hidden, ranks.dtype)
         rows.append(Row("memory", ranks.rank, ranks.world, hidden, 0,
                         path="fused" if fused else "none", mem_mib=mem,
                         note=f"fused up to {getattr(fusion, 'max_tokens', 0)} tokens"))
@@ -234,7 +240,7 @@ def _capture(ranks: _Ranks) -> list[Row]:
     for hidden in ranks.opts.hiddens:
         group = ranks.comm_group()
         group.init_allreduce_fusion(hidden, ranks.dtype, ranks.opts.max_tokens)
-        fusion = group._ar_fusion
+        fusion = _fusion(group, hidden, ranks.dtype)
         if fusion is None:
             rows.append(Row("capture", ranks.rank, ranks.world, hidden, 0,
                             path="none", note="no fusion here"))
@@ -320,7 +326,7 @@ def _timing(ranks: _Ranks) -> list[Row]:
     for hidden in ranks.opts.hiddens:
         group = ranks.comm_group()
         group.init_allreduce_fusion(hidden, ranks.dtype, ranks.opts.max_tokens)
-        fusion = group._ar_fusion
+        fusion = _fusion(group, hidden, ranks.dtype)
         for tokens in ranks.opts.tokens:
             x, res, w = ranks.inputs(tokens, hidden, False, seed=hidden + tokens)
 
