@@ -31,6 +31,7 @@ from test_state_calls import (
     _step,
     _StubAttn,
     _StubDense,
+    _StubExchange,
     _StubKV,
     _tensors,
     _value_handle,
@@ -416,15 +417,24 @@ def test_kernel_settings_reach_the_shared_spec_and_two_values_for_one_field_are_
 # An add a read takes k and v from
 
 
-def test_an_add_while_another_layers_add_waits_for_its_read_is_refused():
-    h = _kv_handle(attn=_StubDense())
+class _DenseExchange(_StubExchange):
+    """Takes k and v at the read, through its exchange, as the dense backend does on a node whose shard splits. Its
+    exchange writes nothing, so an add it never reads reaches no page."""
+
+    requires_kv_write = False
+
+
+@pytest.mark.parametrize("attn", [_StubDense, _DenseExchange], ids=["direct", "exchange"])
+def test_an_add_while_another_layers_add_waits_for_its_read_is_refused(attn):
+    h = _kv_handle(attn=attn())
     _begin(h)
     _add(h, 0)
     _refused(r"Array 'kv': an add on layer 1 while layer 0's add waits for its read", lambda: _add(h, 1))
 
 
-def test_a_kept_step_that_ends_with_an_add_unread_is_refused():
-    h = _kv_handle(attn=_StubDense())
+@pytest.mark.parametrize("attn", [_StubDense, _DenseExchange], ids=["direct", "exchange"])
+def test_a_kept_step_that_ends_with_an_add_unread_is_refused(attn):
+    h = _kv_handle(attn=attn())
     step = _begin(h)
     q, _, _ = _tensors()
     for layer in range(4):
