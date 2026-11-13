@@ -18,6 +18,7 @@ import torch
 from torch._dynamo.testing import CompileCounter
 
 from mstar.communication.tensors import LocalTransferEngine
+from mstar.distributed.communication import CommGroup, JointGroups
 from mstar.engine.resources.attn.config import AttentionConfig, AttentionStep, AttnBackend
 from mstar.engine.resources.attn.kept_window import KeptWindowAttention
 from mstar.engine.resources.base import EngineResourceInfo
@@ -939,6 +940,26 @@ def test_a_reach_is_refused_under_capture():
     step = _reach_step(handle, pool, 12, capture=True)
     with pytest.raises(ValueError, match="Array 'dit_kv': no layout yet: a read with no op in a captured step"):
         step.begin_calls()
+
+
+def test_a_reach_is_refused_on_a_pool_placed_over_ranks():
+    """A placed pool keeps part of each page on every rank, and a reach is gathered by slot with no kernel that
+    knows the placement, so each rank would gather other entries. The handles are built with the engine, so the
+    deployment doesn't load."""
+    array = Array("dit_kv", nodes={"dit"}, layers={0}, entry=KVEntry(heads=1, head_dim=1), max_len=4096,
+                  reads={"self_attn": Read(mask=Bidirectional(kept_window=True))})
+    (kv_spec,) = build_specs([array], kernel_settings={"dit_kv": {"max_num_pages": 64}})
+    ranks = CommGroup(my_global_rank=0, my_group_rank=0, group_members=[0, 1])
+    pool = KVManager(
+        cfg=replace(kv_spec.config, page_size=8, context_parallel=True), name="dit_kv",
+        joint_comm_group=JointGroups(tp_group=CommGroup.trivial(), sp_group=ranks, instance=ranks),
+        transfer_engine_info=TransferEngineInfo("h", "h", LocalTransferEngine("h")), device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    assert pool.placement is not None
+    with pytest.raises(ValueError, match="Array 'dit_kv': no layout yet: a read with no op gathers its reach from "
+                                         "this rank's pages, and resources.dit_kv sets context_parallel"):
+        node_handles(SimpleNamespace(declare_state=lambda: [array]), "dit", {"dit_kv": pool})
 
 
 def test_a_reach_only_array_has_no_last_token_yet():
