@@ -225,8 +225,10 @@ class CpuPlan:
 
     @property
     def video_chunks(self) -> int:
-        """Pieces one H.264 clip encodes in parallel (``video_encode.encode_mp4_chunked``)."""
-        return min(8, self.left)
+        """Pieces one H.264 clip encodes in parallel (``video_encode.encode_mp4_chunked``).
+        Each piece restarts x264's reference chain, which lowers quality for a
+        few frames after it; 8 pieces were about 20 ms faster on a 121-frame clip."""
+        return min(4, self.left)
 
     @property
     def video_encode_threads(self) -> int:

@@ -100,7 +100,7 @@ def encode_mp4_chunked(
     process shares, sized for ``encode_workers`` clips at once, and x264's threads
     are split over it from the CPU plan rather than left to x264, which sizes
     itself from the affinity mask. 121 frames at 832x480, ultrafast, crf 18, on an
-    H200 host: about 105 ms in 8 pieces against 150-235 ms in one.
+    H200 host: about 100-115 ms in 4 pieces against 150-300 ms in one.
     """
     from torchcodec.encoders import VideoEncoder
 

@@ -1884,9 +1884,9 @@ Cosmos3 environment requirements
   when available (torchcodec >= 0.9), otherwise directly with PyAV (``av``,
   ``video_encode.encode_mp4``), whose wheel bundles FFmpeg with libx264; that also
   covers a torchcodec that cannot load FFmpeg. With torchcodec a clip of 48 frames or
-  more encodes in parallel pieces (``video_encode.encode_mp4_chunked``, up to 8, without
-  B-frames), joined into one stream: a keyframe starts each piece, and the file is about
-  5-8% larger. A 121-frame 832x480 clip encodes in about half the time of one encode.
+  more encodes in parallel pieces (``video_encode.encode_mp4_chunked``, up to 4, without
+  B-frames), joined into one stream: a keyframe starts each piece, and the file is a few
+  percent larger. A 121-frame 832x480 clip encodes in about half the time of one encode.
 - Sound-enabled video responses mux the AAC track with the ``ffmpeg`` and
   ``ffprobe`` binaries, which must be on ``PATH`` (system packages, not
   pip-installable).
