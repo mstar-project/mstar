@@ -61,6 +61,8 @@ The converse matters just as much: **model-level concerns shouldn't leak into en
 
 `declare_state()` declares the state a model keeps, and `get_node_resources()` returns a `NodeResourceSpec` list for anything else; the engine builds one object per declaration and binds it into the submodule and its layers. Layers name their resources (`attn_key` / `kv_key` / `pos_key`). A node that declares nothing receives nothing (e.g., encoders and decoders with no persistent state or attention wrappers).
 
+**A new model package declares its state in `declare_state` and is listed in `PORTED` in `test/modular/test_state_lint.py`, and `UNPORTED` there only shrinks.** Adding a package to it is a regression of the port to the state contract, not a follow-up.
+
 Per-deployment sizing goes in the config YAML under `resources:` overrides, not into Python constants. See "Tuning resources per deployment" in [docs/adding_models.rst](docs/adding_models.rst).
 
 ### 3. Submodule forwards are mostly tensor-in, tensor-out
