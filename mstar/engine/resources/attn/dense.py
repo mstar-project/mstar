@@ -29,28 +29,32 @@ else:
     _VARLEN_IMPORT_ERROR = None
 
 
+# The fa3-fwd extension op's arguments a fixed-length forward into a given output names
+_FA3_FWD_ARGS = ("q", "k", "v", "out", "softmax_scale", "is_causal", "window_size_left", "window_size_right",
+                 "softcap", "is_rotary_interleaved", "num_splits", "pack_gqa", "sm_margin")
+
+
 def _fa3_fixed_into():
     """FA3's fixed-length forward writing into a given output, or None. The
     interface's own entry point allocates its output and refuses one passed in
-    (a custom op may not return an input), so this calls the extension behind
-    it, whose positional signature is fa3-fwd 0.0.2's: another version gets
-    None, and its callers keep to the varlen kernel."""
+    (a custom op may not return an input), so this calls the extension op behind
+    it by its arguments' names; a build whose op names them otherwise gets None,
+    and its callers keep to the varlen kernel."""
     try:
-        from importlib.metadata import version
-
-        from fa3_fwd_interface import fa3_fwd_cuda
+        op = torch.ops.fa3_fwd.fwd
+        names = {a.name for a in op.default._schema.arguments}
     except Exception:  # noqa: BLE001
         return None
-    if version("fa3-fwd") != "0.0.2":
+    if not names.issuperset(_FA3_FWD_ARGS):
+        logger.info("fa3-fwd's forward op lacks %s; long segments run on the varlen kernel",
+                    sorted(set(_FA3_FWD_ARGS) - names))
         return None
 
     def run(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, out: torch.Tensor, softmax_scale: float) -> None:
-        # q [1, Sq, H, D], k / v [1, Sk, Hkv, D], out [1, Sq, H, Dv]: non-causal, with no window,
-        # softcap, paging, rotary or splits
-        fa3_fwd_cuda.fwd(
-            q, k, v, None, None, None, out, *(None,) * 16,
-            softmax_scale, False, -1, -1, 0, 0.0, True, None, 1, None, 0,
-        )
+        # q [1, Sq, H, D], k / v [1, Sk, Hkv, D], out [1, Sq, H, Dv]; the rest as flash_attn_func passes
+        # it for a non-causal call (the op's own defaults differ for num_splits and is_rotary_interleaved)
+        op(q, k, v, out=out, softmax_scale=softmax_scale, is_causal=False, window_size_left=-1,
+           window_size_right=-1, softcap=0.0, is_rotary_interleaved=True, num_splits=1, pack_gqa=None, sm_margin=0)
 
     return run
 
