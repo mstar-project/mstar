@@ -3090,7 +3090,7 @@ class ValueStorage(Storage):
     """A rewritable array of one entry, in a recurrent state pool."""
 
     handle_class = ValueHandle
-    kernel_settings = frozenset({"max_slots"})
+    kernel_settings = frozenset({"max_slots", "max_slots_of"})
 
     def resolve(self, arrays: Sequence[Array], declared: Sequence[Array], setup: "StateSetup") -> Resolved:
         resolved = Resolved({}, {}, {}, {})

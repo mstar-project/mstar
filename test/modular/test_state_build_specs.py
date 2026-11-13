@@ -513,8 +513,8 @@ def test_a_yaml_page_count_overrides_the_hook_as_a_server_builds_the_specs():
 @pytest.mark.parametrize("arrays, key, settings, allowed", [
     (lambda: [_kv()], "kv", {"max_slots": 8}, "['max_num_pages']"),
     (lambda: [_kv()], "kv", {"page_size": 64}, "['max_num_pages']"),
-    (lambda: [_kv(), _gdn()], "gdn", {"max_num_pages": 8}, "['max_slots']"),
-    (lambda: [_kv(), _gdn()], "gdn", {"prefix_slots": 8}, "['max_slots']"),
+    (lambda: [_kv(), _gdn()], "gdn", {"max_num_pages": 8}, "['max_slots', 'max_slots_of']"),
+    (lambda: [_kv(), _gdn()], "gdn", {"prefix_slots": 8}, "['max_slots', 'max_slots_of']"),
     (lambda: [_FLAG], "flag", {"max_slots": 8}, "[]"),
     (lambda: [_FLAG], "flag", {"max_num_pages": 8}, "[]"),
     (lambda: [_within()], "vision", {"max_slots": 8}, "[]"),

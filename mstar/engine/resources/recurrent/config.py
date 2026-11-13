@@ -305,6 +305,10 @@ class RecurrentStateConfig:
     prefix_slots: int = 0
     kv_cache: str | None = None
 
+    # Another recurrent pool, whose max_slots this one takes unless the deployment sizes this one: for state every
+    # request holds beside its state there, so one key sizes both.
+    max_slots_of: str | None = None
+
     def __post_init__(self):
         if not self.blocks:
             raise ValueError("a recurrent state pool must declare a block")
@@ -360,6 +364,16 @@ class RecurrentStateSpec(NodeResourceSpec):
     def depends_on(self) -> set[str]:
         return {self.config.kv_cache} if self.config.kv_cache else set()
 
+    def derive(self, specs: Mapping[str, NodeResourceSpec]) -> list[str]:
+        key = self.config.max_slots_of
+        if key is None:
+            return []
+        other = specs.get(key)
+        if not isinstance(other, RecurrentStateSpec):
+            return [f"max_slots_of names {key!r}, which is no recurrent state pool"]
+        self.config.max_slots = other.config.max_slots
+        return []
+
     def keeps_prefix_cache(self, world_size: int, checkpoint_named: bool) -> bool:
         # snapshots are keyed by `kv_cache`'s pages, and kept at one rank only
         return bool(self.config.prefix_slots) and self.config.kv_cache is not None and world_size == 1
@@ -384,17 +398,20 @@ class RecurrentStateSpec(NodeResourceSpec):
 
     def apply_yaml_overrides(
         self, max_slots: int | None = None, state_dtype: str | None = None,
-        prefix_slots: int | None = None,
+        prefix_slots: int | None = None, max_slots_of: str | None = None,
     ):
-        """How many slots this deployment gets, the state's dtype, and how
-        many snapshots it keeps for prefix reuse.
+        """How many slots this deployment gets, or the pool it takes them
+        from, the state's dtype, and how many snapshots it keeps for prefix
+        reuse. A ``max_slots`` here wins over ``max_slots_of``.
 
         Block shapes are the model's and not tunable. The dtype trades
         accumulated precision against bandwidth and decides which kernels the
         backend can reach.
         """
+        if max_slots_of is not None:
+            self.config.max_slots_of = max_slots_of
         if max_slots is not None:
-            self.config.max_slots = max_slots
+            self.config.max_slots, self.config.max_slots_of = max_slots, None
         if prefix_slots is not None:
             self.config.prefix_slots = prefix_slots
         self.config.check_slots()
