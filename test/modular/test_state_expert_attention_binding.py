@@ -24,6 +24,7 @@ from mstar.engine.state import (
     Read,
 )
 from mstar.engine.state.adapters import EXPERT_LAYOUT_KWARG, build_specs, node_handles, state_steps
+from mstar.engine.state.analysis import _array_problems
 
 
 @pytest.mark.parametrize("chunks,clean", [(1, 0), (1, 2), (2, 2)])
@@ -45,6 +46,7 @@ def test_declared_expert_reads_match_reference(chunks: int, clean: int) -> None:
             reads={"cross_attn": Read(mask=kv_mask, op=Attend(q_heads=2), queries="expert_q")},
         ),
     ]
+    assert all(_array_problems(array) == [] for array in arrays)
     specs = build_specs(arrays)
     assert len(specs) == 2
     resources = {
