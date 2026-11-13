@@ -53,6 +53,14 @@ Every attention in the DiT should go through the read of an array with `max_len=
 - A key that holds a per-prompt length (H3-Image's unpadded prompt) would need a graph per length. Set `LAYOUT_FROM_INPUTS`, pass the layout (rope tables, row indices, the prompt padded to its bucket) as step inputs the engine stages, and map keys to a coarser `graph_key`; `capture_buckets` then lists graph keys, and the step's attention plans each replay's spans (`fixed_layout` off).
 - The captured graph removes the launch gaps of a compiled-but-eager step. Ragged attention breaks that compiled graph per layer unless the resource sets `compile_op=True` (then `run` traces as the `mstar::ragged_attention` custom op), so measure both before deciding a model needs capture.
 
+## Step caching
+
+`DenoiseLoopSubmodule(step_cache=...)` takes a `StepCachePolicy` (`components/diffusion/step_cache.py`; today MagCache) that says which steps skip the block stack and add back the residual of the last step that ran it. The decision joins the step key, so rows batch per decision, and the residuals are `request_state`, one per rank.
+
+- A model opts in by giving its transformer `cached_residual=` / `return_residual=` around the block loop (embed and head still run) and calling `self.block_cache(engine_inputs)` in `denoise`; `wan22` and `minimax_h3` are the references. Keep the residual row-leading and fp32.
+- The policy decides from host values only (the step index, the step count, a calibrated table), so it needs no sync and every CFG/SP rank agrees. A rule that reads a device value (TeaCache, DBCache) would need a reduce and a host read per step.
+- Calibrate per model (`{method: magcache_calibrate}` logs the table) and ship a quality table against dense: it is lossy. Captured buckets are refused for now (the residual has no fixed address).
+
 ## Ending the loop
 
 The loop ends on its iteration count. A model whose request picks its step count declares it as the loop's cap in `get_loop_caps` (z_image, flux2_klein); the loop then completes after that iteration and neither graph runtime speculates past it. A model whose stage always runs its graph `max_iters` declares no cap (ltx2_5: caps are keyed by loop name, and its two stages share one). The conductor refuses a cap below 1 or above the loop's `max_iters`.

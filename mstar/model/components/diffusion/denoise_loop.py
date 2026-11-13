@@ -54,6 +54,11 @@ Conventions the base fixes:
   so rows batch and capture per dtype, the scheduler batches each dtype apart,
   and ``denoise`` reads the step's dtype off :attr:`step_dtype` while the hooks
   keep seeing the model's own key.
+* Step caching (``step_cache``, off by default) is the base's too: a step's key
+  then also says whether it reuses the cached residual (:class:`StepBucket`), so
+  rows batch only with rows making the same decision, and ``denoise`` gets the
+  step's :meth:`block_cache` to route its block stack through
+  (``components/diffusion/step_cache.py``).
 """
 
 from __future__ import annotations
@@ -85,6 +90,7 @@ from mstar.utils.h2d import to_device_nonblocking
 from mstar.utils.threads import ThreadPool
 
 if TYPE_CHECKING:
+    from mstar.model.components.diffusion.step_cache import BlockCache, StepCachePolicy
     from mstar.model.components.quant_linear import StepDtypes
 
 # Entries in each memo. A schedule is a few floats per step and a seed entry a latent, and a miss only rebuilds it.
@@ -111,11 +117,13 @@ class StepScalar(NamedTuple):
 
 @dataclass(frozen=True)
 class StepBucket:
-    """A step's key under a step schedule: the request's bucket and the dtype the step's linears run in. Two dtypes
-    share neither a forward nor a graph."""
+    """A step's key under a step schedule: the request's bucket, the dtype the step's linears run in (None without a
+    dtype schedule) and whether it reuses the step cache's residual. Two steps differing in either share neither a
+    forward nor a graph."""
 
     bucket: Hashable
-    dtype: str
+    dtype: str | None
+    reuse: bool = False
 
 
 class DenoiseLoopSubmodule(NodeSubmodule):
@@ -171,6 +179,7 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         replay_walks: Mapping[str, Sequence[str]] | None = None,
         max_uncaptured_layouts: int = 4,
         step_dtypes: StepDtypes | None = None,
+        step_cache: StepCachePolicy | None = None,
     ):
         super().__init__()
         self.loop_name = loop_name
@@ -201,6 +210,12 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         # The dtype each step runs (``step_key``), and the one the step in ``denoise`` runs: None without a schedule.
         self.step_dtypes = step_dtypes
         self.step_dtype: str | None = None
+        # Which steps reuse the last computed block residual (off: None). Cached residuals are per-request state the
+        # engine owns, at no fixed address, so no captured graph could read them.
+        if step_cache is not None and self.capture_buckets:
+            raise ValueError(f"{type(self).__name__}: step_cache does not support captured buckets yet")
+        self.step_cache = step_cache
+        self._step_reuse = False
 
     @property
     def loop_back_names(self) -> tuple[str, ...]:
@@ -358,11 +373,16 @@ class DenoiseLoopSubmodule(NodeSubmodule):
 
     def step_key(self, fwd_info: CurrentForwardPassInfo, bucket_key: Hashable, step: int | None = None) -> Hashable:
         """What step ``step`` (default: ``fwd_info``'s) batches and captures on: ``bucket_key``, with the step's dtype
-        under a step schedule. ``prepare_inputs`` and ``cg_key_info`` both take it from here, so a step's rows and its
-        graph agree."""
-        if self.step_dtypes is None:
+        under a step schedule and its reuse decision under a step cache. ``prepare_inputs`` and ``cg_key_info`` both
+        take it from here, so a step's rows and its graph agree."""
+        if self.step_dtypes is None and self.step_cache is None:
             return bucket_key
-        return StepBucket(bucket_key, self.step_dtypes.at(self.step_index(fwd_info) if step is None else step))
+        k = self.step_index(fwd_info) if step is None else step
+        dtype = None if self.step_dtypes is None else self.step_dtypes.at(k)
+        reuse = self.step_cache is not None and self.step_cache.reuses(
+            k, self.schedule_of(fwd_info, bucket_key).num_steps,
+        )
+        return StepBucket(bucket_key, dtype, reuse)
 
     def _bucket_of(self, step_key: Hashable) -> Hashable:
         return step_key.bucket if isinstance(step_key, StepBucket) else step_key
@@ -488,7 +508,7 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         """One stacked step, as ``{loop-back edge: [B, ...]}``."""
         bucket_key = kwargs.pop("bucket_key")
         if isinstance(bucket_key, StepBucket):
-            self.step_dtype, bucket_key = bucket_key.dtype, bucket_key.bucket
+            self.step_dtype, self._step_reuse, bucket_key = bucket_key.dtype, bucket_key.reuse, bucket_key.bucket
         carried = {name: kwargs.pop(name) for name in self.loop_back_names}
         scalars = {name: kwargs.pop(name) for name in self.STEP_SCALARS}
         out = self.denoise(engine_inputs, bucket_key, **carried, **scalars, **kwargs)
@@ -530,16 +550,34 @@ class DenoiseLoopSubmodule(NodeSubmodule):
     def _step_of(self, rid, per_request_input_metadata) -> int | None:
         """The row's step from its input metadata, which the scheduler advances for a speculated step whose request
         info still holds the step in flight's; None when it has none."""
-        if self.step_dtypes is None or not per_request_input_metadata:
+        if (self.step_dtypes is None and self.step_cache is None) or not per_request_input_metadata:
             return None
         metadata = per_request_input_metadata.get(rid)
         loops = metadata.dynamic_loop_iter_counts if metadata is not None else {}
         return int(loops[self.loop_name]) if self.loop_name in loops else None
 
     def split_batches_by_capture_key(self, graph_walk: str) -> bool:
-        # a step mixing dtypes matches no capture and would run a row at a time
+        # a step mixing dtypes matches no capture and would run a row at a time; one mixing reuse decisions cannot run
         del graph_walk
-        return self.step_dtypes is not None
+        return self.step_dtypes is not None or self.step_cache is not None
+
+    def block_cache(self, engine_inputs: ModelInputsFromEngine) -> BlockCache | None:
+        """The step's view of its rows' cached block residuals, for ``denoise`` to route its block stack through; None
+        without a step cache. Call it from ``denoise``, where the step's decision is set."""
+        if self.step_cache is None:
+            return None
+        from mstar.model.components.diffusion.step_cache import BlockCache
+
+        infos = [engine_inputs.per_request_info[rid] for rid in engine_inputs.request_ids]
+        final = [
+            self.step_index(info) + 1 >= self.schedule_of(info, self.bucket_key_for(info)).num_steps
+            for info in infos
+        ] if self.step_cache.records else [False] * len(infos)
+        return BlockCache(
+            reuse=self._step_reuse,
+            _states=[self.request_state(rid) for rid in engine_inputs.request_ids],
+            _final=final, _records=self.step_cache.records,
+        )
 
     def declare_step(
         self, graph_walk: str, request_ids: list[str], inputs: list[NodeInputs],
