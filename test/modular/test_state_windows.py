@@ -1155,3 +1155,12 @@ def test_a_paged_kept_window_refuses_a_growing_base():
         kv_layouts([_kept_array()], {"dit_kv": {"main": Layout(kept_windows={
             "self_attn": KeptWindow(18, window=24, grows="sink"),
         })}}, {})
+
+
+def test_a_paged_kept_window_refuses_last_first():
+    """The paged pool keeps a step's adds in order, so it can't cut them last-first."""
+    with pytest.raises(ValueError, match=r"reads\['self_attn'\]\.mask\.last_first, and the paged pool keeps a step's "
+                                         r"adds in order"):
+        build_specs([_array("dit_kv", reads={
+            "self_attn": _read(Bidirectional(kept_window=True, last_first=True)),
+        }, max_len=4096)])

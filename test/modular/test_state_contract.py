@@ -420,3 +420,11 @@ def test_a_kept_window_may_be_a_sink_alone():
 def test_a_kept_window_grows_on_its_sink_or_its_window():
     with pytest.raises(ValueError, match=re.escape("KeptWindow.grows must be None, 'sink' or 'window', got 'both'")):
         KeptWindow(1, window=1, grows="both")
+
+
+def test_last_first_needs_a_kept_window():
+    """The mask ignores order, so last-first means something only where a kept window cuts the adds."""
+    with pytest.raises(ValueError, match=re.escape(
+        "Bidirectional.last_first orders what a kept window cuts, and kept_window is False",
+    )):
+        Bidirectional(last_first=True)

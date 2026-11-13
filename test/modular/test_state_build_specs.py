@@ -1129,3 +1129,8 @@ def test_start_lengths_beside_a_window_read_are_refused():
 def test_a_base_for_no_kept_window_read_is_refused():
     _no_layout("kept_windows names ['other'], which aren't kept-window reads of the array",
                _kept(kept_windows={"enc_attn": KeptWindow(3, window=1), "other": KeptWindow(1, window=1)}))
+
+
+def test_last_first_reaches_the_bounded_kvs_reverse_order():
+    (spec,) = build_specs([_kept(reads={"enc_attn": _window(mask=Bidirectional(kept_window=True, last_first=True))})])
+    assert spec.config.reverse_step_order, "the window would cut each step's adds in order, keeping the last longest"
