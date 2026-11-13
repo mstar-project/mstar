@@ -32,6 +32,7 @@ from mstar.engine.resources.attn.config import (
 )
 from mstar.engine.resources.attn.dense import DenseAttentionManager
 from mstar.engine.resources.base import EngineResourceInfo
+from mstar.engine.resources.kv.bounded.config import BoundedKVConfig, BoundedKVSpec, SinkWindow
 from mstar.engine.resources.kv.config import KVSpec, KVStep, PagedKVConfig
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
@@ -98,7 +99,10 @@ def test_a_read_with_no_op_stays_off_a_node_that_splits_it():
     (lambda: build_specs([_ring_array()])[0], "KV 'kv' is a ring, which takes"),
     (lambda: CrossAttentionSpec(resource_key="cross", nodes={"dit"}, config=CrossAttentionConfig(
         kv_cache="ctx", query_kv_cache="kv", context_label="main")), "cross attention 'cross' takes"),
-], ids=["ring", "cross"])
+    (lambda: BoundedKVSpec(resource_key="bounded", nodes={"dit"}, config=BoundedKVConfig(
+        num_layers=1, num_heads=1, head_dim=8, rows_per_request=1, max_source_len=0, retention=SinkWindow(0, 4),
+    )), "bounded KV 'bounded' takes"),
+], ids=["ring", "cross", "bounded"])
 def test_a_pool_that_takes_no_split_steps_stays_off_a_splitting_node(spec, refusal):
     shard = SeqShardSpec("shard", {"dit"}, ("main",), 0)
     assert spec().split_step_refusals("dit", shard, 1, 2, {}) == [
