@@ -245,7 +245,7 @@ def _listed(resources, steps=None):
                                 compiled_entries_per_shape=1)
     for resource in resources.values():
         # a CPU sampler can't capture; what is listed is the question here
-        resource.can_capture = lambda spec: True
+        resource.can_capture = lambda: True
     runner = AcceleratorGraphRunner(
         submodule_name="LLM", submodule=submodule, resources=resources, step_runner=Mock(), device=CPU,
         autocast_dtype=None, joint_comm_group=SimpleNamespace(world_size=1), num_slots=2,

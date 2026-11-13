@@ -14,7 +14,7 @@ from collections.abc import Mapping
 
 import torch
 
-from mstar.engine.resources.base import BucketKey, CGSlotKey, CGSlotSpec, Resource
+from mstar.engine.resources.base import CGSlotKey, CGSlotSpec, Resource
 from mstar.engine.resources.linear_attn.base import LinearAttnManager
 from mstar.engine.resources.linear_attn.config import LinearAttnConfig, LinearAttnStep
 from mstar.engine.resources.linear_attn.gdn_kernels import GDNKernels
@@ -81,8 +81,6 @@ class GDNManager(LinearAttnManager):
         self._cg_max_bs = 0
         self._cg_max_tokens = 0
         self._cg_wrappers: dict[CGSlotKey, GDNWrapper] = {}
-        # buckets `can_capture` refuses: warmed on the eager wrappers, which run them when serving
-        self._eager_buckets: set[BucketKey] = set()
         # The prefills' state checkpoints, sized once to the largest bucket and
         # shared: one forward runs at a time, and each graph holds the address.
         # An eager step fits it (`RecurrentStatePool._checkpoint_every`), and
@@ -110,6 +108,10 @@ class GDNManager(LinearAttnManager):
 
     def bind_dependencies(self, resources: Mapping[str, Resource]) -> None:
         self._pool = resources.get(self._pool_key)
+        if self._pool is not None and not self._kernels.writes_snapshots:
+            self._pool.refuse_snapshots(
+                f"{self._pool_key!r}'s GDN kernels ({type(self._kernels).__name__}) keep no state checkpoints"
+            )
 
     # Step lifecycle
 
@@ -163,11 +165,8 @@ class GDNManager(LinearAttnManager):
         """The wrapper this (label, walk) plans into, built once and reused.
 
         Under capture it is keyed per (bucket, slot, label) and sized to the
-        bucket, since the graph holds its buffers' addresses. A bucket that is not
-        captured runs on the eager wrappers, warm-up included.
+        bucket, since the graph holds its buffers' addresses.
         """
-        if lease is not None and lease.bucket in self._eager_buckets:
-            lease = None
         if lease is None:
             # both walks can run eagerly under one label
             key, store = (label, "split" if split is not None else is_decode), self._eager_wrappers
@@ -355,21 +354,22 @@ class GDNManager(LinearAttnManager):
     def build_accelerator_graph_buffers(
         self, slots: list[CGSlotSpec], max_bs: int, max_seq_len: int,
     ) -> None:
-        self._eager_buckets.update(spec.bucket for spec in slots if not self.can_capture(spec))
+        del slots
         # A floor under every capture wrapper's row count, so none reallocates
         # if a wider layout reaches it; announced before any bucket plans.
         self._cg_max_bs = max(self._cg_max_bs, max_bs)
         self._cg_max_tokens = max(self._cg_max_tokens, max_seq_len)
 
-    def can_capture(self, spec: CGSlotSpec) -> bool:
+    def capture_refusal(self, spec: CGSlotSpec) -> str | None:
         # one-token rows take the decode kernel, which every backend captures;
         # a longer row takes the prefill kernel the backend can capture, whose
         # cost may grow with that row
-        return spec.max_row_tokens <= 1 or self._kernels.uncapturable_prefill(spec.max_row_tokens) is None
+        if spec.max_row_tokens <= 1:
+            return None
+        return self._kernels.uncapturable_prefill(spec.max_row_tokens)
 
     def cleanup(self):
         self._cg_wrappers.clear()
-        self._eager_buckets.clear()
         self._eager_wrappers.clear()
         self._current.clear()
         self._checkpoints = None

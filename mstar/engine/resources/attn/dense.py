@@ -11,7 +11,6 @@ from mstar.engine.resources.attn.base import AttentionManager, EagerSlotKey
 from mstar.engine.resources.attn.config import AttentionStep, AttnBackend, refuse_context_only
 from mstar.engine.resources.attn.ragged.wrappers import PrefixedPrefillWrapper, _FlashInferRaggedPrefillBase
 from mstar.engine.resources.attn.workspace import Workspace, workspace_bytes
-from mstar.engine.resources.base import CGSlotSpec
 from mstar.engine.resources.kv.config import PagedKVConfig
 from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.kv.plan import KVPlanOutput, KVPlanOutputs
@@ -230,7 +229,7 @@ class DenseAttentionManager(AttentionManager):
     def depends_on(self):
         return {self._kv_cache_name}
 
-    def can_capture(self, spec: CGSlotSpec) -> bool:
+    def can_capture(self) -> bool:
         return False
 
     @property

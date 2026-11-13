@@ -152,7 +152,7 @@ class GDNKernels(ABC):
     stages_prefill_inputs: bool = False
     # Whether the prefill kernels save the state checkpoints a recurrent pool's
     # prefix snapshots are copied from. Without them the pool's prefix cache
-    # stays shut (`snapshot_refusal`).
+    # stays shut (`snapshot_refusal`, `GDNManager.bind_dependencies`).
     writes_snapshots: bool = False
 
     def without_qk_l2norm(self) -> GDNKernels:

@@ -496,7 +496,7 @@ def test_the_recompile_limit_counts_each_lean_twin(monkeypatch):
         single_request_inputs=NodeInputs(tensor_inputs={}, input_seq_len=1),
     )]
     resource = SimpleNamespace(
-        can_capture=lambda spec: True, force_double_buffer=False, lean_capture=True, lean_captures=lambda kind: True,
+        can_capture=lambda: True, force_double_buffer=False, lean_capture=True, lean_captures=lambda kind: True,
     )
     monkeypatch.setattr(agr, "recompile_limit", lambda: 0)
     runner = agr.AcceleratorGraphRunner(

@@ -338,14 +338,14 @@ def test_sequential_prefill_agrees_with_chunked_and_the_reference():
     torch.testing.assert_close(states[0], states[1], **STATE_TOL[torch.float32])
 
 
-def test_a_prefill_bucket_past_the_bound_is_not_captured():
+def test_a_prefill_bucket_past_the_bound_is_refused():
     pool, manager = build(max_captured_prefill_tokens=64)
     config = PackedAcceleratorGraphConfig(
         capture_graph_walk="prefill", capture_token_lengths=[64, 128], make_node_input=None,
     )
-    for tokens, captured in ((64, True), (128, False)):
+    for tokens, refused in ((64, False), (128, True)):
         spec = CGSlotSpec(BucketKey("prefill", bs=1, num_tokens=tokens), 0, config)
-        assert manager.can_capture(spec) is captured
+        assert (manager.capture_refusal(spec) is not None) is refused
 
 
 # --- capture and replay -------------------------------------------------------------

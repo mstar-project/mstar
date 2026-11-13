@@ -215,12 +215,7 @@ class Resource(ResidentHooks, ABC):
     def depends_on(self) -> set[str]:
         return set()
 
-    def can_capture(self, spec: CGSlotSpec) -> bool:
-        """Whether this resource can run ``spec``'s bucket inside a graph. A bucket it
-        cannot run is still warmed, so its peak counts toward the floor, but never
-        captured: it runs eagerly. Answer from the spec and this resource's
-        configuration alone, never from per-rank state, so every rank blocks the same
-        buckets."""
+    def can_capture(self) -> bool:
         return True
 
     # this resource's key among the engine's resources, set by `build_resource`
@@ -676,6 +671,17 @@ class Resource(ResidentHooks, ABC):
         # `AttentionResource` seals the pools they come from, and the dense backend's own,
         # outside a pool, is never captured.
         return
+
+    def capture_refusal(self, spec: CGSlotSpec) -> str | None:
+        """Why this resource cannot run ``spec``'s bucket inside a graph, or
+        None if it can.
+
+        Asked before a capture starts, by every runner that captures against
+        this resource's node; a refused bucket runs eagerly. Answer from the
+        spec and this resource's configuration alone, never from per-rank
+        state, so every rank refuses the same buckets.
+        """
+        return None
 
     def post_warmup_validate(self):
         """
