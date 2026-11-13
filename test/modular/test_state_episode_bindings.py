@@ -12,7 +12,7 @@ from mstar.engine.resources.step import Segment, StepContext, SubmoduleStep
 from mstar.engine.state import Array, ArrayStep, Block, Entry, KVEntry, Read, TensorType, Window
 from mstar.engine.state.adapters import DENSE_WINDOW, PAGED, build_specs, node_handles, state_steps, storage_of
 from mstar.engine.state.episodes import EpisodeRowBindings
-from mstar.utils.ipc_format import EndEpisode, RemoveRequest
+from mstar.utils.ipc_format import EndEpisode, RemoveRequest, WorkerMessage, WorkerMessageType
 from mstar.worker.input_ingest import InputIngest
 from mstar.worker.step_pipeline import StepPipeline
 
@@ -78,6 +78,20 @@ def test_a_live_request_or_another_episode_cannot_take_an_owned_slot():
         rows.bind(32, 5, "robot-b")
     with pytest.raises(ValueError, match="owns slot 5, not 6"):
         rows.bind(32, 6, "robot-a")
+
+
+def test_idle_slot_is_available_only_to_its_current_episode():
+    rows = EpisodeRowBindings()
+    assert rows.slot_available(2, "a")
+    rows.bind(11, 2, "a")
+    assert not rows.slot_available(2, "a")
+    rows.unbind(11)
+    assert rows.slot_available(2, "a")
+    assert not rows.slot_available(2, "b")
+    assert not rows.slot_available(2, None)
+    rows.end("a")
+    assert rows.slot_available(2, "b")
+    assert rows.slot_available(2, None)
 
 
 @pytest.mark.parametrize("handle,slot,episode", [
@@ -635,7 +649,7 @@ def test_end_waits_for_an_unadmitted_episode_queued_behind_a_busy_slot():
     ingest = object.__new__(InputIngest)
     ingest._pending_episode_requests = {0: [queued]}
     busy = True
-    ingest._engines = SimpleNamespace(episode_slot_busy=lambda slot: busy)
+    ingest._engines = SimpleNamespace(episode_slot_available=lambda slot, episode: not busy)
     admitted = []
     ingest._add_new_request = admitted.append
 
@@ -676,7 +690,7 @@ def test_deferred_episode_new_request_replays_all_partitions_then_next_call():
     second_partition = SimpleNamespace(request_id="call-a")
     next_call = SimpleNamespace(request_id="call-b")
     ingest._pending_episode_requests = {2: [first, second_partition, next_call]}
-    ingest._engines = SimpleNamespace(episode_slot_busy=lambda slot: False)
+    ingest._engines = SimpleNamespace(episode_slot_available=lambda slot, episode: True)
     replayed = []
     ingest._add_new_request = replayed.append
     ingest.retry_episode_requests()
@@ -691,7 +705,7 @@ def test_remove_then_new_in_one_worker_batch_waits_for_drained_release():
     ingest._pending_episode_requests = {}
     ingest._runtime = SimpleNamespace(get_rid_handle=lambda wire: 11 if wire == "old" else None)
     busy = True
-    ingest._engines = SimpleNamespace(episode_slot_busy=lambda slot: busy)
+    ingest._engines = SimpleNamespace(episode_slot_available=lambda slot, episode: not busy)
     removed = []
     ingest._lifecycle = SimpleNamespace(remove=lambda rid, body, seq: removed.append((rid, seq)))
     ingest._lockstep = SimpleNamespace(last_consumed_seq=3)
@@ -701,6 +715,43 @@ def test_remove_then_new_in_one_worker_batch_waits_for_drained_release():
     ingest._add_new_request(next_call)
     assert ingest._pending_episode_requests == {2: [next_call]}
     busy = False  # `_release_request` has finished on this worker.
+    replayed = []
+    ingest._add_new_request = replayed.append
+    ingest.retry_episode_requests()
+    assert replayed == [next_call]
+
+
+def test_idle_end_then_new_in_one_worker_batch_waits_for_slot_release():
+    rows = EpisodeRowBindings()
+    rows.bind(11, 2, "old")
+    rows.unbind(11)
+    ingest = object.__new__(InputIngest)
+    ingest._pending_episode_requests = {}
+    ingest._runtime = SimpleNamespace(get_rid_handle=lambda wire: None)
+
+    ingest._engines = SimpleNamespace(
+        episode_slot_busy=rows.slot_busy,
+        episode_slot_available=lambda slot, episode_id: rows.idle_slot("old") is None,
+    )
+    ends = []
+    ingest._lifecycle = SimpleNamespace(
+        end_episode=ends.append,
+        takes_input=lambda wire: pytest.fail("new call admitted before old episode ended"),
+    )
+    ingest._handlers = {
+        WorkerMessageType.END_EPISODE: ingest._end_episode,
+        WorkerMessageType.NEW_REQUEST: ingest._add_new_request,
+    }
+    old_end = EndEpisode("old", 2)
+    next_call = SimpleNamespace(request_id="new", episode_id="new", episode_slot=2)
+    ingest._dispatch([
+        WorkerMessage(WorkerMessageType.END_EPISODE, old_end),
+        WorkerMessage(WorkerMessageType.NEW_REQUEST, next_call),
+    ])
+    assert ends == [old_end]
+    assert ingest._pending_episode_requests == {2: [next_call]}
+
+    rows.end("old")
     replayed = []
     ingest._add_new_request = replayed.append
     ingest.retry_episode_requests()

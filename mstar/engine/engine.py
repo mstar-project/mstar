@@ -4040,6 +4040,9 @@ class Engine:
     def episode_slot_busy(self, slot: int) -> bool:
         return self._episode_rows.slot_busy(slot) if self._episode_pools else False
 
+    def episode_slot_available(self, slot: int, episode_id: str | None) -> bool:
+        return self._episode_rows.slot_available(slot, episode_id) if self._episode_pools else True
+
     def shutdown(self):
         for resource in self._resources.values():
             resource.cleanup()
