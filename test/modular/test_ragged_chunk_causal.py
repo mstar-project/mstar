@@ -207,7 +207,8 @@ def test_graph_mode_padding_is_isolated():
     assert dense[n:, n:].all(), "padding rows must attend something, or they divide by zero"
 
 
-def test_failed_graph_stage_retries_the_same_layout(monkeypatch):
+@pytest.mark.parametrize("fail_on", [1, 2], ids=["before_tags", "after_tags"])
+def test_failed_graph_stage_retries_the_same_layout(monkeypatch, fail_on):
     first = KERNEL_LAYOUT
     second = layout_of(24, 8, 2, 8, 6)
     w = planned_mask([first], 128, False, length=first.span,
@@ -215,14 +216,14 @@ def test_failed_graph_stage_retries_the_same_layout(monkeypatch):
     stage = w._stage
     calls = 0
 
-    def fail_after_tags(buffer, array):
+    def fail_stage_once(buffer, array):
         nonlocal calls
         calls += 1
-        if calls == 2:
+        if calls == fail_on:
             raise RuntimeError("stage failed")
         stage(buffer, array)
 
-    monkeypatch.setattr(w, "_stage", fail_after_tags)
+    monkeypatch.setattr(w, "_stage", fail_stage_once)
     with pytest.raises(RuntimeError, match="stage failed"):
         w.plan([second])
     monkeypatch.setattr(w, "_stage", stage)
