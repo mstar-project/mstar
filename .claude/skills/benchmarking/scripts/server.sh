@@ -88,9 +88,9 @@ cmd_start() {
       tail -30 "$log" >&2
       exit 1
     fi
-    if grep -q "address already in use" "$log" 2>/dev/null; then
+    if grep -qi "address already in use" "$log" 2>/dev/null; then
       echo "server.sh: '$name' could not bind port $port:" >&2
-      grep -m3 "address already in use" "$log" >&2
+      grep -m3 -i "address already in use" "$log" >&2
       cmd_stop "$name" >/dev/null
       exit 1
     fi

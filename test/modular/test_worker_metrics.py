@@ -193,6 +193,22 @@ def test_pages_the_prefix_cache_keeps_stay_used_and_show_as_cached():
     assert _kv_view(m) == (6, 31, 6), "the index still holds its 6 pages"
 
 
+def test_take_backs_and_waits_to_take_back_are_reported_from_when_counting_starts():
+    counts = worker_metrics.PreemptionCounts(take_backs=1)
+    m = WorkerMetrics(
+        "worker_0", 3600.0, frozenset({NODE}), _engine(), SimpleNamespace(pending_rows=lambda: {}), Rebuilds({}, {}),
+        send=[].append, enable_transfers=lambda: EdgeTransfers("SHM"), preemptions={NODE: counts},
+    )
+    m.start_counting()
+    counts.take_backs += 2
+    counts.take_back_waits += 1
+
+    snaps = m.snapshot()
+
+    assert _values(snaps, "mstar_kv_take_backs_total") == {(NODE,): 2}
+    assert _values(snaps, "mstar_kv_take_back_waits_total") == {(NODE,): 1}
+
+
 def test_a_cache_only_follower_nodes_use_is_not_reported():
     """A lockstep instance's other ranks hold the same pages; its lead rank reports them."""
     kv = _kv()

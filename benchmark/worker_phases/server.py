@@ -9,9 +9,9 @@ The command is taken verbatim as a bare string; this only adds the phase
 instrumentation to its environment. The server's own stdout/stderr goes to
 ``--server-log`` so the terminal carries just readiness and the tables.
 
-Readiness is reported from the HEALTH ENDPOINT, never the log: when another
-process still holds the port, uvicorn logs "startup complete" and only then
-fails with "address already in use", so a log grep sails straight past it.
+Readiness is reported from the HEALTH ENDPOINT, never the log: mstar-server
+binds only once the workers are up, so while another process still holds the
+port a log grep finds no failure yet, and a health check would reach the other.
 """
 from __future__ import annotations
 
