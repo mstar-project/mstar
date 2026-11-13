@@ -186,6 +186,7 @@ def state_setup(config: Mapping[str, Any], declarations: Sequence[Array | Sample
     arrays = [declared for declared in declarations if isinstance(declared, Array)]
     resolved = _resolve(arrays, StateSetup())
     resource_of = {read: resolved.resource_of[read] for array in arrays for read in array.reads}
+    replaced = {each.key: each.binding for array in arrays for each in resolved.bound[array.name]}
     by_read: dict[str, OpBinding] = {}
     for key, block in _sdpa_blocks(config).items():
         reads = [(array, read) for array in arrays for read in array.reads if resource_of[read] == key]
@@ -204,6 +205,12 @@ def state_setup(config: Mapping[str, Any], declarations: Sequence[Array | Sample
             if binding is None:
                 refused.append(f"resources.{key}: backend sdpa runs only an Attend read within a step, and Array "
                                f"{array.name!r}.reads[{read!r}] isn't one")
+                continue
+            if binding.keeps_window != replaced[read].keeps_window:
+                refused.append(f"resources.{key}: backend sdpa binds Array {array.name!r}.reads[{read!r}] through "
+                               f"{type(binding).__name__} in place of {type(replaced[read]).__name__}, and only one "
+                               "of them keeps a window, which a request's layout sizes the read's pages by; set no "
+                               "backend on this read")
                 continue
             try:
                 binding.check(array, read, array.reads[read])
@@ -2083,13 +2090,14 @@ class PagedStorage(Storage):
     def layouts(
         self, array: Array, by_label: Mapping[str, Layout], keyed_spans: Mapping[str, int],
     ) -> "dict[str, LabelLayout]":
-        """Each read's binding gives the retention its pages keep. The bindings' checks ran when the specs were built,
-        so each read's binding is looked up, not checked again, on every request."""
+        """Each read's default binding gives the retention its pages keep, and a binding a deployment picks keeps a
+        window where the default does. The bindings' checks ran when the specs were built, so none runs again on a
+        request."""
         from mstar.model.base import LabelLayout
 
         kept = [
             (key, binding) for key, read in array.reads.items()
-            if (binding := BINDINGS[self, type(read.op)].for_mask(read.mask)).keeps_window
+            if (binding := _default_binding(self, read)).keeps_window
         ]
         layouts = {}
         for label, layout in by_label.items():
@@ -2411,6 +2419,12 @@ class StateSetup:
     walks: Walks = Walks()
 
 
+def _default_binding(storage: Storage, read: Read) -> OpBinding | None:
+    """The binding `BINDINGS` gives ``read`` on ``storage``, as its mask swaps it, or None for a pair with no entry."""
+    binding = BINDINGS.get((storage, type(read.op)))
+    return None if binding is None else binding.for_mask(read.mask)
+
+
 def _bindings(
     storage: Storage, array: Array, chosen: Mapping[str, OpBinding] = EMPTY,
 ) -> tuple[BoundOp, ...]:
@@ -2419,10 +2433,10 @@ def _bindings(
     `BINDINGS` has no entry for, and a second update of one type."""
     bound = []
     for key, read in array.reads.items():
-        binding = BINDINGS.get((storage, type(read.op)))
+        binding = _default_binding(storage, read)
         if binding is None:
             raise _no_binding(storage, array, f"reads[{key!r}].op", update=False)
-        bound.append(BoundOp(key, read, chosen.get(key, binding.for_mask(read.mask))))
+        bound.append(BoundOp(key, read, chosen.get(key, binding)))
     unbound = sorted(key for key, op in array.updates.items() if (storage, type(op)) not in BINDINGS)
     if unbound:
         raise _no_binding(storage, array, f"updates {unbound}", update=True)
