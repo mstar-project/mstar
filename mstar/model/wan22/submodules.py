@@ -636,8 +636,11 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
         if "keep" in cache:
             out, residual = out
             residual = residual.unflatten(0, (branches, rows)).transpose(0, 1)
-            # a cached guidance branch never reads its own residual: skipping steps run the conditional one alone
-            block_cache.keep(residual[:, :1] if caches_guidance else residual)
+            if caches_guidance and branches > 1:
+                # a cached guidance branch never reads its own residual (skipping steps run the conditional one
+                # alone); a copy, so the other branch's half is freed
+                residual = residual[:, :1].clone()
+            block_cache.keep(residual)
         if not do_cfg:
             return out
         if cond_only:

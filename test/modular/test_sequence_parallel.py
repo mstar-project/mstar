@@ -1107,12 +1107,14 @@ def _wan_step(rank, world, grid, reuse=False):
     """Wan2.2's guided noise prediction (both CFG rows) over the model's own resources (its
     sequence shard and Ulysses self-attention, FlashInfer as CPU math), split over the ranks,
     against the same DiT on one rank attending through SDPA. ``reuse``: a step-cache pair, a computing
-    step then one reusing its residual, each rank keeping its own share."""
+    step then one reusing its residual, each rank keeping its own share; ``"guidance"``: a computing step
+    of both branches, then one that forwards the conditional branch alone."""
     import sys
 
     from mstar.engine.resources import RaggedAttentionConfig, StepRunner
     from mstar.engine.resources.base import build_resource
     from mstar.engine.state.adapters import node_handles, node_resources
+    from mstar.model.components.diffusion.denoise_loop import StepBucket
     from mstar.model.components.diffusion.step_cache import RESIDUAL, BlockCache, BlockRange, CacheRow, StepAction
     from mstar.model.submodule_base import NodeInputs, engine_step
     from mstar.model.wan22.components.dit import Wan22DiT
@@ -1157,14 +1159,15 @@ def _wan_step(rank, world, grid, reuse=False):
     )
     # under the step cache, a computing step keeps each row's residual, then a reusing one on new latents adds it
     later = (torch.randn(1, 4, frames, height, width, generator=gen), args[1] * 0.9, *args[2:])
-    steps = [(False, args), (True, later)] if reuse else [(None, args)]
+    keep = StepAction(keep=BlockRange())
+    second = StepAction(keep=BlockRange(), uncond=False) if reuse == "guidance" else StepAction(skip=BlockRange())
+    steps = [(keep, args), (second, later)] if reuse else [(None, args)]
 
-    def predict(sub, step_args, decision, state, plan=lambda: None):
+    def predict(sub, step_args, k, action, state, plan=lambda action: None):
         cache = None
-        if decision is not None:
-            action = StepAction(skip=BlockRange()) if decision else StepAction(keep=BlockRange())
-            cache = BlockCache(action, [CacheRow(state, step=int(decision))])
-        step = plan()
+        if action is not None:
+            cache = BlockCache(action, [CacheRow(state, step=k)], caches_guidance=reuse == "guidance")
+        step = plan(action)
         with torch.no_grad():
             out = sub._noise_prediction(*step_args, cache)
         if step is not None:
@@ -1174,27 +1177,30 @@ def _wan_step(rank, world, grid, reuse=False):
     with torch.no_grad():
         # one rank: no resources and no handles bound, so the self-attention runs SDPA
         one, state = Wan22DitSubmodule(dit, config), types.SimpleNamespace(tensors={}, kwargs={})
-        want = [predict(one, step_args, decision, state) for decision, step_args in steps][-1]
+        want = [predict(one, step_args, k, action, state) for k, (action, step_args) in enumerate(steps)][-1]
     split = Wan22DitSubmodule(dit, config)
     split.bind_node_resources(res)
     split.bind_node_state(node_handles(model, "dit", res))
     tokens = split.num_tokens(key)
 
-    def plan():
-        step = engine_step(split, "video_gen", ["r0"], [NodeInputs(resource_step_info=key)])
+    def plan(action):
+        step_key = key if action is None else StepBucket(key, None, action)
+        step = engine_step(split, "video_gen", ["r0"], [NodeInputs(resource_step_info=step_key)])
         step.set_ctx(StepContext(request_ids=["r0"], graph_walk="video_gen", slot=0, capture=False))
         StepRunner(res).plan(step)
-        # each of the two CFG rows splits alike
-        assert res[DIT_SHARD].split_range("main")[1:3] == (tuple(sp_seq_split(tokens, world)), 2)
+        # each CFG row the step forwards splits alike: both, or the conditional one alone
+        branches = 2 if action is None or action.uncond else 1
+        assert res[DIT_SHARD].split_range("main")[1:3] == (tuple(sp_seq_split(tokens, world)), branches)
         step.begin_calls()
         return step
 
     state = types.SimpleNamespace(tensors={}, kwargs={})
-    for decision, step_args in steps:
-        got = predict(split, step_args, decision, state, plan)
-        if decision is False:
-            # each rank keeps [its branches, its share of the tokens, dim]
-            assert state.tensors[RESIDUAL].shape[:2] == (2, sp_seq_split(tokens, world)[rank])
+    for k, (action, step_args) in enumerate(steps):
+        got = predict(split, step_args, k, action, state, plan)
+        if action is keep:
+            # each rank keeps [the branches it caches, its share of the tokens, dim]
+            kept = 1 if reuse == "guidance" else 2
+            assert state.tensors[RESIDUAL].shape[:2] == (kept, sp_seq_split(tokens, world)[rank])
     torch.testing.assert_close(got, want, rtol=1e-4, atol=1e-4)
 
 
@@ -1210,3 +1216,9 @@ def test_wan_dit_step_cache_over_its_sequence_shard_keeps_each_ranks_share(tmp_p
     """Step caching under SP: one step keeps each rank's residual of its own token share, the next reuses it there
     on new inputs, and the reusing step's prediction is the one-rank one."""
     _run(_wan_step, 2, tmp_path / "store", (3, 4, 6), True)
+
+
+def test_wan_dit_guidance_cache_over_its_sequence_shard_forwards_one_branch(tmp_path):
+    """The guidance cache under SP: after a step of both branches, a step forwards the conditional branch alone,
+    one attention segment per rank's share, and its guided prediction is the one-rank one."""
+    _run(_wan_step, 2, tmp_path / "store", (3, 4, 6), "guidance")
