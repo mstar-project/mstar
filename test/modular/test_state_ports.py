@@ -815,7 +815,7 @@ def test_a_qwen3_5_step_that_never_samples_through_its_handle_is_refused():
 
 def test_a_qwen3_5_step_counts_the_scaffolds_draw_through_its_handle():
     llm = _qwen3_5_llm(_qwen3_5(**QWEN3_5["9B"]))
-    llm.sampler.resource = SimpleNamespace(sample=lambda rows, logits: logits)
+    llm.sampler.resource = SimpleNamespace(sample=lambda logits: logits)
     step = _qwen3_5_open_step(llm)
     llm.sample_tokens(None, torch.zeros(1, 4))
     step.check_calls()

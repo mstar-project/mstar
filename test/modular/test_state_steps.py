@@ -361,7 +361,7 @@ def _drive(step, forward, committed: list) -> None:
 
 
 def _sampler() -> SamplerHandle:
-    resource = SimpleNamespace(sample=lambda rows, logits: logits.argmax(-1))
+    resource = SimpleNamespace(sample=lambda logits: logits.argmax(-1))
     return SamplerHandle(Sampler("sampler", nodes={"LLM"}, vocab_size=8), resource)
 
 

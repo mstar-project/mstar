@@ -392,7 +392,7 @@ def sample(s: SamplerHandle, logits: torch.Tensor) -> torch.Tensor:
     s._drawn += 1
     if s._drawn > s.sampler.draws:
         raise s._refusal(f"sample number {s._drawn} in one step, and draws is {s.sampler.draws}")
-    return s.resource.sample(list(s.rows), logits=logits)
+    return s.resource.sample(logits)
 
 
 # Eager as a whole, as `AttentionManager.select_last_hidden` explains.
@@ -406,7 +406,7 @@ def last_sampled(s: SamplerHandle) -> torch.Tensor:
     """Each row's last sampled token, on the device, for a sampler the node names in its `DeviceLoopback`."""
     if not s._open:
         raise s._refusal("last_sampled in a step that doesn't list the sampler")
-    return s.resource.loopback_tokens(s.rows)
+    return s.resource.loopback_tokens()
 
 
 def kernel_setting(h: ArrayHandle, read: str, field: str) -> Any:

@@ -598,7 +598,7 @@ def test_qwen3_5_vision_prompt_text_takes_its_embedding_delta_in_a_padded_step(t
     H._stub_cores(llm, H._Rows(), {
         ROPE: SimpleNamespace(position=lambda rid, label: 0, pos_ids=lambda label: torch.zeros(64)),
         ATTN: SimpleNamespace(select_last_hidden=lambda hidden, label: hidden),
-        SAMPLER: SimpleNamespace(sample=lambda rids, logits: logits),
+        SAMPLER: SimpleNamespace(sample=lambda logits: logits),
     })
 
     table = H.merged(base, {embed: ref[embed]}, (embed,))[embed + ".weight"]

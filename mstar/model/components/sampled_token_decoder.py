@@ -243,7 +243,7 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
 
     def loopback_tokens(self, engine_inputs: ModelInputsFromEngine) -> torch.Tensor:
         """Each row's last sampled token, read off the sampler resource's slots."""
-        return engine_inputs.resources[SAMPLER].loopback_tokens(engine_inputs.request_ids)
+        return engine_inputs.resources[SAMPLER].loopback_tokens()
 
     def last_token_hidden(self, engine_inputs: ModelInputsFromEngine, hidden: torch.Tensor) -> torch.Tensor:
         """``hidden`` at each row's last token, picked by the plan of the attention resource under ``ATTN_KEY``."""
@@ -251,7 +251,7 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
 
     def sample_tokens(self, engine_inputs: ModelInputsFromEngine, logits: torch.Tensor) -> torch.Tensor:
         """One token per row of ``logits``, drawn by the sampler resource."""
-        return engine_inputs.resources[SAMPLER].sample(engine_inputs.request_ids, logits=logits)
+        return engine_inputs.resources[SAMPLER].sample(logits)
 
     def decoder_kwargs(
         self, graph_walk: str, engine_inputs: ModelInputsFromEngine,
