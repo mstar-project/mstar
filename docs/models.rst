@@ -2478,9 +2478,9 @@ torch 2.12; build it from FastVideo's repository for the GPU and the installed t
 ``TORCH_CUDA_ARCH_LIST=10.3a CMAKE_ARGS=-DFASTVIDEO_KERNEL_BUILD_ULYSSES_A2A=OFF pip install
 --no-build-isolation "git+https://github.com/hao-ai-lab/FastVideo@ec9145ab3d86b2255b6fa3bbbb2845859c72cafd#subdirectory=fastvideo-kernel"``
 (``10.0a`` for B200; needs scikit-build-core and the CUTLASS submodule). On one B300 (1344x768,
-124 frames, compiled, warm) a clip takes 19.2-19.5 s with VSA and 23.0-23.5 s dense, against
-18.2 s for SGLang's FastH3 with VSA on the same GPU. Each VSA attention call is 12 ms where dense
-cuDNN is 26 ms; dense queries (text, audio) attend everything, and each video query tile its 132
+124 frames, compiled, warm) a clip takes 18.5-18.7 s with VSA and 23.0-23.5 s dense, against
+18.2 s for SGLang's FastH3 with VSA on the same GPU, whose DiT forward M*'s matches. Each VSA
+attention call is 12 ms where dense cuDNN is 26 ms; dense queries (text, audio) attend everything, and each video query tile its 132
 best of 660 video key tiles. VSA's output against dense's on 8 prompts is 10.8 dB / SSIM 0.37 (a
 different clip, not a degraded one), the same as SGLang's VSA against its own dense; against an
 independent fp32 reference of FastVideo's recipe on the port's own activations each call is 0.25%

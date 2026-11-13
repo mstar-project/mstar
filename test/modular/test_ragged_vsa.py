@@ -171,3 +171,23 @@ def test_kernel_matches_the_recipe_on_gpu():
     out = video_sparse_attention(q, k, v, g, geo, VsaWorkspace(geo, 4, keep, torch.bfloat16, dev), keep)
     ref = _reference(q.cpu(), k.cpu(), v.cpu(), g.cpu(), layout, keep)
     assert float((out.float().cpu() - ref).norm() / ref.norm()) < 1e-2
+
+
+@pytest.mark.skipif(not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)),
+                    reason="FastVideo's block-sparse kernel runs on data-center Blackwell")
+def test_strided_views_of_a_fused_projection_read_as_copies():
+    """q / k / v arrive as views of one fused projection: read strided, they give the copies' output."""
+    pytest.importorskip("fastvideo_kernel")
+    torch.manual_seed(0)
+    dev = torch.device("cuda")
+    layout = VideoSparseLayout((70, 0, 45, (5, 6, 10)))
+    geo = vsa_geometry(layout, dev)
+    keep = vsa_keep(0.8, geo.num_video_tiles)
+    qkv = torch.randn(layout.rows, 3 * 4 * 128, device=dev, dtype=torch.bfloat16)
+    q, k, v = (t.unflatten(-1, (4, 128)) for t in qkv.split(4 * 128, dim=-1))
+    g = torch.randn(layout.rows, 4, 128, device=dev, dtype=torch.bfloat16)
+    assert not q.is_contiguous()
+    strided = video_sparse_attention(q, k, v, g, geo, VsaWorkspace(geo, 4, keep, torch.bfloat16, dev), keep)
+    copied = video_sparse_attention(*(t.contiguous() for t in (q, k, v)), g, geo,
+                                    VsaWorkspace(geo, 4, keep, torch.bfloat16, dev), keep)
+    assert torch.equal(strided, copied)
