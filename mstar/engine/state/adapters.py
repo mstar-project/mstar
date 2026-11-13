@@ -865,6 +865,9 @@ class ReachRead:
         # the views the staged reach was computed for, once per step
         self._views: list | None = None
 
+    def reads_step_kv(self, label: str | None = None) -> bool:
+        return False
+
     def run(self, q: None, label: str, kv_cache_layer: torch.Tensor, k=None, v=None, layer_idx: int = 0) -> Reached:
         views = self._kv.views(label)
         if views is not self._views:
