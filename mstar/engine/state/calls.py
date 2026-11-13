@@ -451,7 +451,7 @@ def mamba2(
 ) -> torch.Tensor:
     """The declared `Mamba2`, which reads and writes ``layer``'s ``ssm`` field in place. ``x`` is (tokens, heads,
     head_dim), ``dt`` (tokens, heads) before its bias and softplus, and ``b`` and ``c`` (tokens, groups, state_size)."""
-    run, ssm = h._update(Mamba2, "ssm", h._layer_id(layer))
+    run, ssm = h._update(Mamba2, h._layer_id(layer))
     return run.run(x, dt, b, c, ssm_layer=ssm, a_log=a_log, d=d, dt_bias=dt_bias, label=h.label)
 
 
