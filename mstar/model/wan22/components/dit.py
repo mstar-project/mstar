@@ -166,6 +166,23 @@ class Wan22DiTAttention(nn.Module):
         self.k_norm = nn.RMSNorm(dim, eps=eps, elementwise_affine=True)
         # the cross-attention's kernel inside a compiled forward (`bind_state`); eager runs SDPA
         self.text_attention = sdpa_attention
+        # the self-attention's q / k / v weights and biases stacked, which the three Linears view (`fuse_qkv`);
+        # buffers, so a later `.to` casts them with the Linears, and outside the state dict
+        self.register_buffer("qkv_weight", None, persistent=False)
+        self.register_buffer("qkv_bias", None, persistent=False)
+
+    def fuse_qkv(self) -> None:
+        """Stack q / k / v into one ``[3 * dim, dim]`` weight and make the three Linears views of it, so a compiled
+        self-attention runs one projection GEMM (SGLang's fused QKV) at no extra memory. Eager keeps the three
+        GEMMs, the reference's, which the parity tests hold bit-exact. Call once the weights are loaded."""
+        projs = (self.q_proj, self.k_proj, self.v_proj)
+        with torch.no_grad():
+            weight = torch.cat([p.weight for p in projs])
+            bias = torch.cat([p.bias for p in projs])
+        for proj, w, b in zip(projs, weight.chunk(3), bias.chunk(3), strict=True):
+            proj.weight = nn.Parameter(w, requires_grad=False)
+            proj.bias = nn.Parameter(b, requires_grad=False)
+        self.qkv_weight, self.qkv_bias = weight, bias
 
     def bind_state(self, handles: Mapping[str, Any]) -> None:
         # the cross-attention declares no array: a ragged schedule over the text's 512 keys is slower than a dense
@@ -182,10 +199,14 @@ class Wan22DiTAttention(nn.Module):
         encoder_hidden_states: torch.Tensor | None = None,
         rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
-        kv_source = hidden_states if encoder_hidden_states is None else encoder_hidden_states
-        query = self.q_proj(hidden_states)
-        key = self.k_proj(kv_source)
-        value = self.v_proj(kv_source).unflatten(2, (self.num_heads, -1))
+        if encoder_hidden_states is None and self.qkv_weight is not None and torch.compiler.is_compiling():
+            # one GEMM; q / k / v are column slices of its output, which the norm kernel and the attention read
+            # at their row stride
+            query, key, value = F.linear(hidden_states, self.qkv_weight, self.qkv_bias).chunk(3, dim=-1)
+        else:
+            kv_source = hidden_states if encoder_hidden_states is None else encoder_hidden_states
+            query, key, value = self.q_proj(hidden_states), self.k_proj(kv_source), self.v_proj(kv_source)
+        value = value.unflatten(2, (self.num_heads, -1))
 
         if rotary_emb is not None:
             # across-heads RMSNorm, then the interleaved-pair rotation
@@ -358,6 +379,12 @@ class Wan22DiT(nn.Module):
         self.norm_out = WanFP32LayerNorm(dim, config.eps, elementwise_affine=False)
         self.proj_out = nn.Linear(dim, config.out_channels * math.prod(config.patch_size))
         self.scale_shift_table = nn.Parameter(torch.empty(1, 2, dim))
+
+    def fuse_qkv(self) -> "Wan22DiT":
+        """Every block's self-attention projections as one GEMM (``Wan22DiTAttention.fuse_qkv``)."""
+        for block in self.blocks:
+            block.self_attn.fuse_qkv()
+        return self
 
     @property
     def dtype(self) -> torch.dtype:

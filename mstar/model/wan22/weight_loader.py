@@ -179,4 +179,4 @@ def build_wan22_dit(
             f"{len(missing)} unloaded parameters {missing[:5]} — refusing to "
             "serve a partially loaded transformer."
         )
-    return dit.eval()
+    return dit.fuse_qkv().eval()
