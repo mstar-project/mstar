@@ -33,6 +33,8 @@ checks and the tests.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 from pathlib import Path
 
@@ -70,6 +72,7 @@ from mstar.model.praxis1.submodules import (
 logger = logging.getLogger(__name__)
 
 DENOISE_LOOP_NAME = "praxis_denoise"
+TEXT_STATE_NAME = "text_embeds"
 
 # The state kwarg the openpi WebSocket protocol fills from a client's request.
 STATE_KWARG = "robot_state"
@@ -122,6 +125,7 @@ class Praxis1Model(Model):
             # A cold-only call has no earlier executed-frame context.
             "max_context_chunks": kwargs.pop("max_context_chunks", 0),
         }
+        self.max_text_tokens = kwargs.pop("max_text_tokens", None)
         self._yaml_config_overrides: dict = dict(kwargs)
 
         if not skip_weight_loading and not _SERVABLE:
@@ -140,6 +144,8 @@ class Praxis1Model(Model):
             raise Praxis1ConfigError(
                 f"max_context_chunks must be in [0, {self.config.n_chunks - 1}]; got {context_chunks!r}"
             )
+        if context_chunks and (type(self.max_text_tokens) is not int or self.max_text_tokens < 1):
+            raise Praxis1ConfigError("episode text reuse needs a positive max_text_tokens deployment cap")
         # A recipe past the loop's ceiling would have every request refused at
         # the conductor, so it is refused once, here.
         num_steps = self.sampler_defaults["num_steps"]
@@ -334,6 +340,13 @@ class Praxis1Model(Model):
             max_len=None,
             reads={"recent": Read(mask=Window(depth + 1))},
             lifetime="episode",
+        ), Array(
+            TEXT_STATE_NAME,
+            nodes={"backbone"}, labels={"cond", "blank"}, layers={0},
+            entry=Entry({"h": TensorType((self.config.text_hidden_dim,), dtype=torch.bfloat16)}),
+            max_len=None,
+            reads={"history": Read(mask=Window(self.max_text_tokens))},
+            lifetime="episode",
         )]
 
     # ------------------------------------------------------------------
@@ -445,6 +458,16 @@ class Praxis1Model(Model):
 
         task_ids, task_mask = encode(task)
         blank_ids, blank_mask = encode(blank)
+        episode_keys = None
+        if self.sampler_defaults["max_context_chunks"]:
+            if max(int(task_mask.sum()), int(blank_mask.sum())) > self.max_text_tokens:
+                raise ValueError(f"Praxis prompt exceeds max_text_tokens={self.max_text_tokens}")
+            key_payload = json.dumps({
+                "task_ids": task_ids.tolist(), "task_mask": task_mask.tolist(),
+                "blank_ids": blank_ids.tolist(), "blank_mask": blank_mask.tolist(),
+                "encoder": self.text_encoder_hf, "hidden_layer": self.config.text_hidden_layer,
+            }, sort_keys=True).encode()
+            episode_keys = {TEXT_STATE_NAME: hashlib.sha256(key_payload).hexdigest()}
         metadata = {"text_tokens": int(task_mask.sum())}
         if kwargs.get("action_format") == "positronic":
             model_pose = pose_to_model(
@@ -521,6 +544,7 @@ class Praxis1Model(Model):
         return ProcessPromptOutput(
             new_input_tensors=new_tensors,
             metadata=metadata,
+            episode_keys=episode_keys,
         )
 
     def _blank_caption(self) -> str:
@@ -552,7 +576,8 @@ class Praxis1Model(Model):
         if not input_signals.get("image_inputs"):
             raise ValueError("Praxis-1 requires camera images (image_inputs)")
         steps: list[WalkStep] = []
-        if not input_signals.get("text_embeds"):
+        has_episode_text = episode is not None and episode.held.get(TEXT_STATE_NAME, 0) > 0
+        if not has_episode_text and not input_signals.get("text_embeds"):
             steps.append(WalkStep(self.ENCODE_TEXT_WALK))
         metadata = {
             "num_steps": self.get_loop_caps(**model_kwargs)[DENOISE_LOOP_NAME],

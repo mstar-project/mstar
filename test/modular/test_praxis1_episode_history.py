@@ -24,7 +24,7 @@ from mstar.model.praxis1.episode_history import (
     append_count,
     window_size,
 )
-from mstar.model.praxis1.praxis1_model import Praxis1Model
+from mstar.model.praxis1.praxis1_model import TEXT_STATE_NAME, Praxis1Model
 from mstar.model.praxis1.submodules import Praxis1VaeEncoderSubmodule
 
 
@@ -34,7 +34,10 @@ class _Tokenizer:
 
 
 def _model(depth=3):
-    model = Praxis1Model("runwayml/praxis-1-droid", skip_weight_loading=True, max_context_chunks=depth)
+    model = Praxis1Model(
+        "runwayml/praxis-1-droid", skip_weight_loading=True,
+        max_context_chunks=depth, max_text_tokens=256,
+    )
     model.config = replace(
         model.config,
         normalization={
@@ -52,7 +55,7 @@ def _pose():
 
 def test_declared_window_is_paired_and_bounded_by_reference_geometry():
     model = _model()
-    array, boundaries = model.declare_state()
+    array, boundaries, text = model.declare_state()
     assert array.name == STATE_NAME
     assert array.lifetime == "episode" and array.max_len is None
     assert array.reads["history"].mask.size == window_size(3) == 69
@@ -61,6 +64,46 @@ def test_declared_window_is_paired_and_bounded_by_reference_geometry():
     assert array.entry.tensors["pose_valid"].dtype == torch.uint8
     assert boundaries.name == BOUNDARY_STATE_NAME
     assert boundaries.reads["recent"].mask.size == 4
+    assert text.name == TEXT_STATE_NAME and text.labels == frozenset({"cond", "blank"})
+    assert text.reads["history"].mask.size == 256
+
+
+def test_episode_text_key_and_walk_follow_cold_warm_changed_prompt_and_reset():
+    model = _model()
+
+    class VaryingTokenizer:
+        def __call__(self, *, text, **kwargs):
+            ids = [1, 2] if text[0] == "pick" else [1, 3]
+            return {"input_ids": torch.tensor([ids]), "attention_mask": torch.ones(1, 2, dtype=torch.long)}
+
+    model._tokenizer_cache = VaryingTokenizer()
+    tensors = {"image_inputs": [torch.zeros(3, 2, 2, dtype=torch.uint8)] * model.config.num_cameras}
+
+    def prepared(prompt):
+        return model.process_prompt(prompt, [], [], robot_state=_pose(), tensors=dict(tensors))
+
+    first, same, changed = prepared("pick"), prepared("pick"), prepared("place")
+    assert first.episode_keys == same.episode_keys
+    assert first.episode_keys[TEXT_STATE_NAME] != changed.episode_keys[TEXT_STATE_NAME]
+
+    def walks(held):
+        episode = EpisodeView("session", 1, {TEXT_STATE_NAME: held} if held else {}, None)
+        return [step.walk for step in model.walk_plan(
+            "", ["image"], ["action"], {"image_inputs": [object()]}, {}, episode,
+        )]
+
+    assert walks(0) == ["encode_text", "chunk"]  # first, changed key, reset, or eviction
+    assert walks(2) == ["chunk"]
+
+
+def test_episode_text_reuse_requires_a_deployment_token_cap():
+    with pytest.raises(ValueError, match="max_text_tokens"):
+        Praxis1Model("runwayml/praxis-1-droid", skip_weight_loading=True, max_context_chunks=1)
+    model = _model()
+    model.max_text_tokens = 1
+    tensors = {"image_inputs": [torch.zeros(3, 2, 2, dtype=torch.uint8)] * model.config.num_cameras}
+    with pytest.raises(ValueError, match="exceeds max_text_tokens"):
+        model.process_prompt("pick", [], [], robot_state=_pose(), tensors=tensors)
 
 
 def test_append_plan_tracks_cold_warm_reset_and_eviction():
@@ -339,11 +382,11 @@ def test_executed_window_matches_pinned_reference_after_slide_and_reset():
 def test_engine_keeps_paired_history_across_request_ids_then_clears_on_reset():
     model = _model()
     model.config = replace(model.config, tile_height=1, tile_width=1)
-    arrays = model.declare_state()
+    arrays = [array for array in model.declare_state() if "vae_encoder" in array.nodes]
     pools = {spec.resource_key: DenseWindowPool.build(
         spec, EngineResourceInfo(device=torch.device("cpu"))
     ) for spec in build_specs(arrays)}
-    handles = node_handles(model, "vae_encoder", pools)
+    handles = node_handles(SimpleNamespace(declare_state=lambda: arrays), "vae_encoder", pools)
     handle = handles[STATE_NAME]
     boundary = handles[BOUNDARY_STATE_NAME]
     owners = EpisodeRowBindings()
