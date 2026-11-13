@@ -156,7 +156,8 @@ def test_ada_layer_norm_kernel_compiles_with_a_float_eps(monkeypatch, caplog, to
 
 
 @needs_kernels
-@pytest.mark.parametrize("heads", [6, 40, 30], ids=["768", "5120", "3840"])
+# rows of two power-of-two tiles of pairs (TI2V-5B is 3072 wide, T2V-A14B 5120), four, and five (the chunked passes)
+@pytest.mark.parametrize("heads", [6, 40, 30, 31], ids=["768", "5120", "3840", "3968"])
 def test_rms_norm_rope_kernel_matches_eager(heads):
     g = torch.Generator(device="cpu").manual_seed(1)
     head_dim, seq = 128, 90
