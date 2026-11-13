@@ -51,7 +51,7 @@ ROUTES = {
     "transcriptions": ("/v1/audio/transcriptions", {"model": "m"}),
 }
 # Surfaces the Python adapter serves and mstar-server does not yet (#742).
-NOT_PORTED: set[tuple[str, str]] = {("GlmChatAdapter", "chat")}
+NOT_PORTED: set[tuple[str, str]] = {("GlmChatAdapter", "chat"), ("DeepseekV41ChatAdapter", "chat")}
 
 
 def _classes() -> dict[str, object]:

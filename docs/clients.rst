@@ -481,23 +481,23 @@ Endpoints and model coverage:
      - Lists the served model, and any LoRA adapters it serves (each with ``parent``
        naming the base model; see the Qwen3.5 notes in :doc:`models`).
    * - ``POST /v1/chat/completions``
-     - ``bagel``, ``qwen3_omni``, ``glm52``, ``glm5_next``
+     - ``bagel``, ``qwen3_omni``, ``glm52``, ``glm5_next``, ``deepseek_v41``
      - Text chat (streaming + non-streaming). Qwen3-Omni can also emit speech, in
        ``audio.format`` ``wav`` (default), ``pcm16``, or ``mp3`` / ``flac`` / ``opus`` with
-       the ``audio`` extra; streamed audio is ``pcm16``. The GLMs take ``tools`` and return
+       the ``audio`` extra; streamed audio is ``pcm16``. The GLMs and DeepSeek-V4.1 take ``tools`` and return
        ``reasoning_content`` and ``tool_calls`` (not on ``--rust-frontend``). ``n`` or
-       ``best_of`` above 1, ``stop`` (the GLMs serve it, see :ref:`coding-agents`), ``stop_token_ids``, ``logprobs``,
+       ``best_of`` above 1, ``stop`` (the GLMs and DeepSeek-V4.1 serve it, see :ref:`coding-agents`), ``stop_token_ids``, ``logprobs``,
        ``top_logprobs``, ``logit_bias``, ``presence_penalty`` / ``frequency_penalty`` and a
        ``response_format`` other than text are refused. ``user``, ``store``, ``metadata`` and
        ``service_tier`` are accepted and have no effect, and so is ``parallel_tool_calls``
-       except on the GLMs, where ``false`` ends the reply at its first call; a stream ends
+       except on those three, where ``false`` ends the reply at its first call; a stream ends
        with a usage chunk when ``stream_options`` sets ``include_usage``.
    * - ``POST /v1/messages``, ``POST /v1/messages/count_tokens``
-     - ``glm52``, ``glm5_next``
+     - ``glm52``, ``glm5_next``, ``deepseek_v41``
      - Anthropic's Messages API, for Claude Code: streamed or whole, tools, thinking blocks
        (not on ``--rust-frontend``; see :ref:`coding-agents`).
    * - ``POST /v1/responses``
-     - ``glm52``, ``glm5_next``
+     - ``glm52``, ``glm5_next``, ``deepseek_v41``
      - OpenAI's Responses API, stateless, for Codex: streamed or whole, function tools,
        reasoning items (not on ``--rust-frontend``; see :ref:`coding-agents`).
    * - ``POST /v1/load_lora_adapter``, ``POST /v1/unload_lora_adapter``
@@ -798,6 +798,18 @@ stateless.
 An agent's system prompt and tools alone outgrow the 2,048-token window of the GLM
 configs: serve them with the long-context override in :doc:`models` (1M tokens on
 GLM-5.3-Flash, 256k on GLM-5.2).
+
+DeepSeek-V4.1 (``deepseek_v41``) serves the same three routes through the same chat path,
+on the Python frontend only as well, with its own tool-call markup (DSML) and switches.
+Thinking is on unless
+``enable_thinking`` is false (``thinking`` and ``thinking_mode: "chat"`` are the
+template's other names; ``reasoning_effort: "none"``, ``thinking: {"type": "disabled"}``
+on Messages and ``reasoning.effort: "none"`` on Responses turn it off too).
+``reasoning_effort`` is a budget of 1 to 100, or ``low``, ``high`` or ``max`` (50, 75,
+100); ``minimal`` is ``low``, and ``medium`` and ``xhigh`` are ``high``, as DeepSeek's own
+template maps them. Earlier turns' reasoning leaves the prompt of a chat that lists no
+tools unless ``drop_thinking`` is false. A forced ``tool_choice`` renders the prompt in
+the template's chat mode, and image parts are refused: vision is not served yet.
 
 **Claude Code** sends the key as ``x-api-key``, which the Anthropic routes take
 (:ref:`api-key`):

@@ -6,6 +6,8 @@ The prompts are the encoder's (``chat_templates/deepseek_v41_encoding``, see
 """
 
 import json
+import sys
+import types
 
 import pytest
 
@@ -282,3 +284,132 @@ def test_a_parsed_turn_sent_back_renders_as_the_model_wrote_it(tokenizer, case_i
     req = _chat(messages=[system, user, message, {**result, "tool_call_id": call["id"]}], tools=tools,
                 enable_thinking=thinking)
     assert _prompt(tokenizer, req, tmp_path) == case["prompt"]
+
+
+# ── the routes ──────────────────────────────────────────────────────────────
+
+REPLY = [b"Need the ", b"weather.</th", b"ink>Checking.\n\n<\xef\xbd\x9cDSML", b"\xef\xbd\x9c calls>\n<",
+         "｜DSML｜ invoke name=\"get_weather\">\n<｜DSML｜ parameter name=\"city\" string=\"true\">Par".encode(),
+         "is</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"days\" string=\"false\">3</｜DSML｜ param".encode(),
+         "eter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>".encode()]
+
+
+@pytest.fixture
+def client_and_stub(monkeypatch):
+    pytest.importorskip("fastapi")
+    pytest.importorskip("httpx")
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from test_anthropic_messages import _StubAPI
+
+    import mstar.api_server
+
+    class _Stub(_StubAPI):
+        """And as the chat route uses it."""
+
+        def release_request(self, request_id):
+            pass
+
+    fake_ep = types.ModuleType("mstar.api_server.entrypoint")
+    stub = _Stub("deepseek_v41")
+    stub.model = types.SimpleNamespace(get_output_sample_rate=lambda modality="audio": 24000)
+    fake_ep.api_server = stub
+    monkeypatch.setitem(sys.modules, "mstar.api_server.entrypoint", fake_ep)
+    monkeypatch.setattr(mstar.api_server, "entrypoint", fake_ep, raising=False)
+
+    from mstar.api_server.openai.router import router
+
+    app = FastAPI()
+    app.include_router(router)
+    return TestClient(app), stub
+
+
+def _reply_chunks(pieces, finish="stop"):
+    from test_anthropic_messages import _usage_chunks
+
+    # each piece is one token; the prompt has 11
+    return _usage_chunks(*((piece, 1) for piece in pieces), finish=finish)
+
+
+def _streamed(text) -> dict:
+    """A chat completion stream put back together: the message, why it ended and its usage."""
+    events = [json.loads(line[6:]) for line in text.splitlines() if line.startswith("data: ") and "[DONE]" not in line]
+    message: dict = {"role": "assistant", "content": None}
+    finish, usage = None, None
+    for e in events:
+        usage = e.get("usage") or usage
+        for choice in e["choices"]:
+            finish = choice.get("finish_reason") or finish
+            delta = choice["delta"]
+            for key in ("content", "reasoning_content"):
+                if delta.get(key):
+                    message[key] = (message.get(key) or "") + delta[key]
+            for call in delta.get("tool_calls", []):
+                calls = message.setdefault("tool_calls", [])
+                if "id" in call:
+                    assert call.pop("index") == len(calls)
+                    calls.append(call)
+                else:
+                    assert call["index"] == len(calls) - 1
+                    calls[-1]["function"]["arguments"] += call["function"]["arguments"]
+    return {"message": message, "finish_reason": finish, "usage": usage}
+
+
+def test_a_streamed_chat_adds_up_to_the_whole_one(client_and_stub):
+    client, stub = client_and_stub
+    body = {"model": "deepseek_v41", "messages": [{"role": "user", "content": "weather?"}], "tools": [WEATHER]}
+    stub.next_chunks = _reply_chunks(REPLY)
+    whole = client.post("/v1/chat/completions", json=body).json()
+    stub.next_chunks = _reply_chunks(REPLY)
+    stream = _streamed(client.post("/v1/chat/completions", json={
+        **body, "stream": True, "stream_options": {"include_usage": True}}).text)
+
+    choice = whole["choices"][0]
+    assert choice["finish_reason"] == "tool_calls"
+    assert choice["message"]["reasoning_content"] == "Need the weather." and choice["message"]["content"] == "Checking."
+    assert choice["message"]["tool_calls"][0]["function"] == {
+        "name": "get_weather", "arguments": '{"city": "Paris", "days": 3}'}
+    # the reasoning's tokens are the chunks up to the one that closes it
+    assert whole["usage"] == {"prompt_tokens": 11, "completion_tokens": 7, "total_tokens": 18,
+                              "completion_tokens_details": {"reasoning_tokens": 3}}
+    for message in (choice["message"], stream["message"]):
+        for call in message["tool_calls"]:
+            assert call.pop("id").startswith("call_")
+    assert stream == {"message": choice["message"], "finish_reason": "tool_calls", "usage": whole["usage"]}
+    assert stub.last_submit["model_kwargs"]["tools"] == [WEATHER]
+    assert stub.last_submit["model_kwargs"]["messages"] == [{"role": "user", "content": "weather?"}]
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_a_stop_string_ends_the_answer_and_the_request(client_and_stub, stream):
+    client, stub = client_and_stub
+    stub.next_chunks = _reply_chunks([b"Plan.</think>oneST", b"OP two", b" three"])
+    r = client.post("/v1/chat/completions", json={
+        "model": "deepseek_v41", "messages": [{"role": "user", "content": "hi"}], "stop": ["STOP"], "stream": stream})
+    got = _streamed(r.text) if stream else r.json()["choices"][0]
+    assert got["message"]["content"] == "one" and got["message"]["reasoning_content"] == "Plan."
+    assert got["finish_reason"] == "stop" and list(stub.ended.values()) == ["success"]
+
+
+def test_messages_and_responses_run_the_same_chat(client_and_stub):
+    client, stub = client_and_stub
+    stub.next_chunks = _reply_chunks(REPLY)
+    message = client.post("/v1/messages", json={
+        "model": "deepseek_v41", "max_tokens": 64, "messages": [{"role": "user", "content": "weather?"}],
+        "tools": [{"name": "get_weather", "input_schema": WEATHER["function"]["parameters"]}],
+        "output_config": {"effort": "medium"},
+    }).json()
+    assert [b["type"] for b in message["content"]] == ["thinking", "text", "tool_use"]
+    assert message["content"][2]["input"] == {"city": "Paris", "days": 3} and message["stop_reason"] == "tool_use"
+    assert stub.last_submit["model_kwargs"]["chat_template_kwargs"] == {"reasoning_effort": "high"}
+
+    stub.next_chunks = _reply_chunks(REPLY)
+    response = client.post("/v1/responses", json={
+        "model": "deepseek_v41", "input": "weather?", "reasoning": {"effort": "none"},
+        "tools": [{"type": "function", "name": "get_weather", "strict": False,
+                   "parameters": WEATHER["function"]["parameters"]}],
+    }).json()
+    # thinking off: the reply is all answer, and the call
+    assert stub.last_submit["model_kwargs"]["chat_template_kwargs"] == {"enable_thinking": False}
+    assert [item["type"] for item in response["output"]] == ["message", "function_call"]
+    assert json.loads(response["output"][1]["arguments"]) == {"city": "Paris", "days": 3}

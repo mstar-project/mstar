@@ -2087,6 +2087,7 @@ ADAPTER_REGISTRY: dict[str, OpenAIAdapter] = {
     "z_image_turbo": DiffusionImageAdapter(),
     "glm52": GlmChatAdapter(always_thinks=False, reasoning_efforts=("high", "max")),
     "glm5_next": GlmChatAdapter(always_thinks=True, reasoning_efforts=("low", "high", "max")),
+    "deepseek_v41": DeepseekV41ChatAdapter(),
     # chat with images; reasoning_effort and the sampling defaults are the model's
     "muse_glimmer": Qwen3_5Adapter(),
     "ripple_65b": TextChatAdapter(),
