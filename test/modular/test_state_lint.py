@@ -26,6 +26,7 @@ PORTED = (
     "mstar/model/pi05", "mstar/model/vjepa2", "mstar/model/canary", "mstar/model/components/encoder_decoder.py",
     "mstar/model/bagel", "mstar/model/chatterbox", "mstar/model/whisper",
     "mstar/model/waypoint", "mstar/model/lingbot_world",
+    "mstar/model/glm52",
     "mstar/model/glm5_next", "mstar/model/components/kda.py", "mstar/model/components/distributed/kda.py",
 )
 FORBIDDEN_ATTRIBUTES = {
@@ -42,7 +43,7 @@ ALLOWED = {
         "AcceleratorGraphConfig", "BatchedAcceleratorGraphConfig", "DEFAULT_CAPTURE_BATCH_SIZES",
         "DETERMINISTIC_COMPILE_MODE", "PackedAcceleratorGraphConfig", "PiecewiseAcceleratorGraphConfig",
         "PiecewiseBatchedConfig", "PiecewiseCallInputs", "PiecewiseCaptureShape", "PiecewisePackedConfig",
-        "decode_rows_then_prompt", "geometric_batch_sizes",
+        "decode_rows_then_prompt", "distribute_tokens", "geometric_batch_sizes",
     )
 } | {
     ("mstar.engine.accelerator_graph_runner", "compile_kwargs"): _CAPTURE,
@@ -96,6 +97,17 @@ ALLOWED_IN_FUNCTION = {
         "the ViT's eager varlen attention, flash-attn or a masked SDPA, which keeps no state",
     ("mstar/model/bagel/submodules.py", "ViTEncoderSubmodule._replay_block_loop", "disable"):
         "the ViT region's replay, which runs its captured graph; no state call sits behind it",
+    ("mstar/model/glm52/submodules.py", "Glm52LLMSubmodule._broadcast", "disable"):
+        "the TP broadcast of the verdict, which dynamo can't trace in place; no state call sits behind it",
+    ("mstar/model/glm52/submodules.py", "Glm52LLMSubmodule._stage_verdict", "disable"):
+        "the model's own verdict mailbox, whose pinned table a captured replay keeps; no state call sits behind it",
+    ("mstar/model/glm52/components/moe.py", "Glm52SparseMoeBlock._forward_decode", "disable"):
+        "the fused fp8 MoE decode's Triton launches with PDL, which keep no state",
+    ("mstar/model/glm52/components/moe.py", "Glm52SparseMoeBlock._dispatch_prefill", "disable"):
+        "the fused fp8 MoE prefill's Triton launches, which keep no state",
+    ("mstar/model/glm52/components/attention.py", "Glm52MLAAttention._index_pass", "disable"):
+        "the key array's add and top-k read, with the branch on `selects` and the indexer's query between them, "
+        "which stay out of the compiled frame as DSA steps run eager",
 }
 # what a module defines to be handed the node's built resources, rather than its handles (`bind_state`)
 RESOURCE_BINDS = {"bind_resources", "bind_node_resources"}

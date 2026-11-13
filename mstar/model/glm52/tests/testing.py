@@ -1,14 +1,23 @@
-"""Test-support helpers for the GLM-5.2 fp8-block path and its CPU resources."""
+"""Test-support helpers for the GLM-5.2 fp8-block path and its CPU resources and handles."""
 from __future__ import annotations
 
 import dataclasses
+import itertools
 
 import torch
 
+from mstar.engine.resources import SubmoduleStep
 from mstar.engine.resources.base import AttentionResource, Resource
 from mstar.engine.resources.runner import StepRunner
+from mstar.engine.state import ArrayStep
+from mstar.engine.state.adapters import node_handles, node_resources, state_steps
+from mstar.engine.state.state_op import bind_state_ops
+from mstar.model.glm52.config import ATTN, INDEX_KEYS, KV, MTP_SEED, SAMPLER
 from mstar.model.submodule_base import BatchedModelOutput
 from mstar.utils.fp8_block import FP8_DTYPE, dequantize_fp8_block_weight
+
+# the key of the latent array's positions, which the declarations build
+POSITIONS = "rope"
 
 
 def per_request_outputs(raw, request_ids) -> dict[str, dict[str, list[torch.Tensor]]]:
@@ -54,7 +63,7 @@ def cpu_rope_apply_qk_inplace(
     rotates the first ``rotary_dim`` dims of each head of ``q`` and ``k`` in place from the
     position resource's fp32 table, in fp32, as FlashInfer's cos/sin-cache kernel does."""
     del rotary_dim, rope_scale, rope_theta, llama31  # all encoded in the table
-    assert cos_sin_cache is not None, "GLM-5.2 rotates from its fp32 table (position_config)"
+    assert cos_sin_cache is not None, "GLM-5.2 rotates from its fp32 table (its Rope's table_dtype)"
     half = cos_sin_cache.shape[-1] // 2
     rows = cos_sin_cache[pos_ids.long()]
     cos, sin = rows[:, None, :half], rows[:, None, half:]
@@ -76,15 +85,74 @@ def install_cpu_rope(monkeypatch) -> None:
     monkeypatch.setattr(torch.ops.mstar, "rope_apply_qk_inplace", cpu_rope_apply_qk_inplace)
 
 
+def cpu_model(config):
+    """A byte-tokenized `Glm52Model` around ``config``, whose declarations the CPU resources and handles take."""
+    from mstar.model.glm52.glm52_model import Glm52Model
+
+    model = Glm52Model(model_path_hf="", tokenizer_mode="byte", config_variant="reduced")
+    model.config = config
+    return model
+
+
+def _spec(config, key: str):
+    (spec,) = [spec for spec in node_resources(cpu_model(config)) if spec.resource_key == key]
+    return spec
+
+
+def positions_config(config):
+    """The latent array's position config, as the declarations build it."""
+    return _spec(config, POSITIONS).config
+
+
 def cpu_positions(config, max_seq_len: int | None = None) -> Resource:
-    """The model's position resource on CPU. ``rope_dtype=float32``: the tests run fp32, and
+    """The latent array's position resource on CPU. ``rope_dtype=float32``: the tests run fp32, and
     ``apply_qk`` would otherwise round an fp32 q / k to bf16 before rotating."""
     from mstar.engine.resources.position.manager import RopeManager
 
     return RopeManager(
-        config=dataclasses.replace(config.position_config(), rope_dtype=torch.float32),
+        config=dataclasses.replace(positions_config(config), rope_dtype=torch.float32),
         device=torch.device("cpu"), max_seq_len=max_seq_len or config.max_seq_len,
     )
+
+
+def bind_cpu_state(module, config, resources: dict[str, Resource]) -> dict:
+    """``module``'s handles over ``resources``, as the engine binds a node's: to a submodule, or to each layer of a
+    bare module that takes them."""
+    handles = node_handles(cpu_model(config), "LLM", resources)
+    bind_state_ops(handles)
+    if hasattr(module, "bind_node_state"):
+        module.bind_node_state(handles)
+    else:
+        for each in module.modules():
+            if hasattr(each, "bind_state"):
+                each.bind_state(handles)
+    return handles
+
+
+def kv_step(handles: dict, segments, walk: str = "prefill") -> SubmoduleStep:
+    """A step of ``segments`` that lists the latent array and, where ``handles`` hold them, the index keys, expanded
+    as `engine_step` expands a submodule's: what a test driving bare layers opens around their forward."""
+    state = {name: ArrayStep() for name in (KV, INDEX_KEYS) if name in handles}
+    return state_steps(SubmoduleStep(segments=list(segments), state=state), handles, graph_walk=walk)
+
+
+def open_step(runner: StepRunner, step, ctx) -> object:
+    """Admit and plan ``step``, which `engine_step` expanded, and open its handles, as the engine does before the
+    forward. Returns the admit's outcome, and opens nothing on a refusal."""
+    step.set_ctx(ctx)
+    outcome = runner.admit(step)
+    if outcome.ok:
+        runner.plan(step)
+        step.begin_calls()
+    return outcome
+
+
+def close_step(runner: StepRunner, step) -> None:
+    """Check, commit and close ``step`` after its forward, as the engine does."""
+    step.check_calls()
+    runner.commit(step)
+    step.commit_calls()
+    step.end_calls()
 
 
 class ReferenceAttentionResource(AttentionResource):
@@ -93,9 +161,14 @@ class ReferenceAttentionResource(AttentionResource):
     that manager's plan output.
     """
 
+    requires_kv_write = True
+
     def __init__(self, kv_cache: str = "kv"):
         self._kv_name = kv_cache
         self._views = None
+
+    def reads_step_kv(self, label: str | None = None) -> bool:
+        return False
 
     @classmethod
     def build(cls, spec, info):
@@ -110,6 +183,10 @@ class ReferenceAttentionResource(AttentionResource):
 
     def qo_indptr_buf(self, label: str = "main"):
         return None
+
+    def select_last_hidden(self, x, label="main"):
+        ends = itertools.accumulate(view.to_compute for view in self._views)
+        return x[torch.tensor([end - 1 for end in ends], device=x.device)]
 
     @torch.compiler.disable
     def run(self, q, label=None, kv_cache_layer=None, k=None, v=None, layer_idx=None):
@@ -172,12 +249,12 @@ def build_cpu_resources(
     config, request_ids: list[str] = (), max_num_pages: int = 64,
     page_size: int = 8,
 ) -> tuple[dict[str, Resource], StepRunner]:
-    """The node's resources on CPU: a real ``KVManager`` (MLA latent or
-    NHD, per ``config.mla_absorb``), the matching attention resource (the
-    real MLA one on its torch fallback, or the reference K/V one), the
-    positions over the cache, a greedy sampler and, under
-    ``config.dsa_long_context``, the DSA resource, plus a ``StepRunner`` over
-    them. Requests in ``request_ids`` are ingested.
+    """The node's resources on CPU, under the keys the declarations build: a real ``KVManager``
+    (MLA latent or NHD, per ``config.mla_absorb``), the matching attention resource (the
+    real MLA one on its torch fallback, or the reference K/V one), the positions over the
+    cache, a greedy sampler, under ``config.dsa_long_context`` the DSA resource that holds
+    the index keys and, under MTP, the seed's pool, plus a ``StepRunner`` over them. Requests
+    in ``request_ids`` are ingested.
     """
     from mstar.engine.resources.attn.flashinfer_mla import FlashInferMLAManager
     from mstar.engine.resources.dsa.config import DSAConfig
@@ -185,13 +262,7 @@ def build_cpu_resources(
     from mstar.engine.resources.kv import manager as manager_mod
     from mstar.engine.resources.kv.config import KVLayout, PagedKVConfig
     from mstar.engine.resources.kv.manager import KVManager
-    from mstar.model.glm52.config import (
-        ATTN_RESOURCE,
-        DSA_RESOURCE,
-        KV_RESOURCE,
-        POS_RESOURCE,
-        SAMPLER_RESOURCE,
-    )
+    from mstar.engine.resources.recurrent.pool import RecurrentStatePool
 
     num_layers = config.num_hidden_layers + (1 if config.mtp_num_draft_tokens > 0 else 0)
     device = torch.device("cpu")
@@ -207,7 +278,7 @@ def build_cpu_resources(
                 qk_rope_head_dim=config.qk_rope_head_dim,
             )
             kv = KVManager(
-                cfg=kv_cfg, name=KV_RESOURCE, joint_comm_group=None,
+                cfg=kv_cfg, name=KV, joint_comm_group=None,
                 transfer_engine_info=None, device=device, dtype=torch.float32,
             )
             class _ReplannedMLA(FlashInferMLAManager):
@@ -218,7 +289,7 @@ def build_cpu_resources(
                     return True
 
             attn = _ReplannedMLA(
-                kv_cache=KV_RESOURCE, device=device, dtype=torch.float32,
+                kv_cache=KV, device=device, dtype=torch.float32,
                 kv_config=kv_cfg, sm_scale=config.softmax_scale,
             )
         else:
@@ -229,20 +300,24 @@ def build_cpu_resources(
                 num_qo_heads=config.num_attention_heads,
             )
             kv = KVManager(
-                cfg=kv_cfg, name=KV_RESOURCE, joint_comm_group=None,
+                cfg=kv_cfg, name=KV, joint_comm_group=None,
                 transfer_engine_info=None, device=device, dtype=torch.float32,
             )
-            attn = ReferenceAttentionResource(KV_RESOURCE)
+            attn = ReferenceAttentionResource(KV)
     finally:
         manager_mod.KVTransferManager = stub
     pos = cpu_positions(config)
     resources = {
-        KV_RESOURCE: kv, ATTN_RESOURCE: attn, POS_RESOURCE: pos, SAMPLER_RESOURCE: GreedySampler(),
+        KV: kv, ATTN: attn, POSITIONS: pos, SAMPLER: GreedySampler(),
     }
     if config.dsa_long_context:
-        resources[DSA_RESOURCE] = DSAManager(
-            DSAConfig(kv_cache=KV_RESOURCE, topk=config.index_topk),
+        resources[INDEX_KEYS] = DSAManager(
+            DSAConfig(kv_cache=KV, topk=config.index_topk),
             page_size=page_size, device=device,
+        )
+    if config.mtp_num_draft_tokens > 0:
+        resources[MTP_SEED] = RecurrentStatePool(
+            device=device, config=_spec(config, MTP_SEED).config, name=MTP_SEED, kv_dtype=torch.float32,
         )
     runner = StepRunner(resources, node_resources={"LLM": list(resources)})
     for rid in request_ids:

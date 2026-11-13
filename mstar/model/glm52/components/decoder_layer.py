@@ -5,7 +5,7 @@ import torch
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
-from mstar.model.glm52.components.attention import Glm52MLAAttention
+from mstar.model.glm52.components.attention import CarriedPick, Glm52MLAAttention
 from mstar.model.glm52.components.language_model import (
     build_mlp_for_layer,
     build_rmsnorm,
@@ -20,17 +20,19 @@ class Glm52DecoderLayer(nn.Module):
         layer_idx: int,
         comm_group: CommGroup | None = None,
         fused_add_rmsnorm: bool | None = None,
+        carried: CarriedPick | None = None,
     ) -> None:
         """``fused_add_rmsnorm`` (default: ``kernels: auto``): each all-reduce runs fused into
         the next residual add + RMSNorm; o_proj and the FFN return partials, and the next norm
-        reduces them. The fused norm rounds differently from an add then a norm."""
+        reduces them. The fused norm rounds differently from an add then a norm. ``carried``
+        holds the DSA pick the stack's layers share."""
         super().__init__()
         self.layer_idx = layer_idx
         self.comm_group = comm_group or CommGroup.trivial()
         self.fused_add_rmsnorm = (
             config.tuned_kernels if fused_add_rmsnorm is None else fused_add_rmsnorm)
         self.self_attn = Glm52MLAAttention(
-            config, comm_group=comm_group, layer_idx=layer_idx)
+            config, comm_group=comm_group, layer_idx=layer_idx, carried=carried)
         if self.fused_add_rmsnorm:
             self.self_attn.o_proj.reduce_results = False
         self.mlp = build_mlp_for_layer(

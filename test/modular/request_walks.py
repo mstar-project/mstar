@@ -25,8 +25,8 @@ def _edges(section) -> list[GraphEdge]:
 
 def run_walks(model: Model, step: Step, prompt: torch.Tensor, max_tokens: int,
               max_steps: int = 64, model_kwargs: dict | None = None) -> list[int]:
-    """Run the request to completion; returns the token ids it sent to the client.
-    ``model_kwargs`` is what the model's `process_prompt` set for the request."""
+    """Run the request to completion; returns the token ids it sent to the client. ``model_kwargs`` are what
+    `process_prompt`'s metadata folds into the request's, which `walk_plan` reads."""
     # a stop counts only if the runtime accepts it for the walk; the conductor also ends
     # the request once its counted tokens reach max_tokens
     walks = model.get_graph_walk_graphs()

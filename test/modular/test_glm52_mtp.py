@@ -31,20 +31,15 @@ def _force_cpu_flashinfer(monkeypatch):
     monkeypatch.setitem(sys.modules, "flashinfer", _cpu_flashinfer())
     install_cpu_rope(monkeypatch)
 
-from mstar.engine.resources import (  # noqa: E402
-    AttentionStep,
-    DSAStep,
-    KVStep,
-    Segment,
-    StepContext,
-    SubmoduleStep,
-)
-from mstar.model.glm52._testing import build_cpu_resources, install_cpu_rope  # noqa: E402
+from mstar.engine.resources import Segment, StepContext  # noqa: E402
 from mstar.model.glm52.components.mtp import Glm52MTPModule  # noqa: E402
-from mstar.model.glm52.config import (  # noqa: E402
-    ATTN_RESOURCE,
-    DSA_RESOURCE,
-    KV_RESOURCE,
+from mstar.model.glm52.config import KV  # noqa: E402
+from mstar.model.glm52.tests.testing import (  # noqa: E402
+    bind_cpu_state,
+    build_cpu_resources,
+    install_cpu_rope,
+    kv_step,
+    open_step,
 )
 from mstar.model.utils import process_weights_after_loading  # noqa: E402
 
@@ -66,14 +61,9 @@ def test_mtp_module_refuses_shared_position():
 # --- the module forward over the bound resources ---------------------------
 
 
-def _plane_step(runner, rid, span):
-    steps = {KV_RESOURCE: KVStep(), ATTN_RESOURCE: AttentionStep(causal=True)}
-    if DSA_RESOURCE in runner.resources:  # dsa_long_context: the layers select through it
-        steps[DSA_RESOURCE] = DSAStep()
-    step = SubmoduleStep(segments=[Segment(rid, "main", span)], steps=steps)
-    step.set_ctx(StepContext(request_ids=(rid,), graph_walk="decode", slot=0, capture=False))
-    assert runner.admit(step).ok
-    runner.plan(step)
+def _plane_step(runner, handles, rid, span):
+    step = kv_step(handles, [Segment(rid, "main", span)], walk="decode")
+    assert open_step(runner, step, StepContext(request_ids=(rid,), graph_walk="decode", slot=0, capture=False)).ok
     return step
 
 
@@ -82,6 +72,7 @@ def test_mtp_forward_writes_the_plane_layer():
     cfg = _reduced_mtp_config()
     cfg.mla_absorb = True
     cfg.mtp_num_draft_tokens = 2
+    cfg.dsa_long_context = False  # the verify step would leave the index keys a block ahead (test_glm52_dsa_engine)
     torch.manual_seed(1)
     module = Glm52MTPModule(cfg)
     # every parameter is torch.empty at construction (the loader fills them)
@@ -89,19 +80,18 @@ def test_mtp_forward_writes_the_plane_layer():
         p.data.normal_(0, 0.05)
     process_weights_after_loading(module, torch.device("cpu"))  # w_kc / w_vc
     resources, runner = build_cpu_resources(cfg, ["r0"])
-    for m in module.modules():
-        if hasattr(m, "bind_resources"):
-            m.bind_resources(resources)
-    kv = resources[KV_RESOURCE]
+    handles = bind_cpu_state(module, cfg, resources)
+    kv = resources[KV]
     assert kv.config.num_layers == cfg.num_hidden_layers + 1
     assert module.transformer_layer.self_attn.cache_layer_idx == cfg.num_hidden_layers
 
     n = 3
-    step = _plane_step(runner, "r0", n)
+    step = _plane_step(runner, handles, "r0", n)
     e = torch.randn(n, cfg.hidden_size)
     h = torch.randn(n, cfg.hidden_size)
     with torch.no_grad():
         head_in, raw = module(e, h, torch.arange(n))
+    # no check: the trunk's layers add nothing in this step, which the handle's check refuses
     runner.commit(step)
     assert head_in.shape == raw.shape == (n, cfg.hidden_size)
     assert torch.isfinite(head_in).all() and torch.isfinite(raw).all()

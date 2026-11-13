@@ -6,6 +6,7 @@ import torch
 from test_glm52_capture_gpu import PROMPTS, _load, _Node
 
 from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner
+from mstar.model.glm52.config import MTP_SEED, PROMPT_LEN
 from mstar.model.glm52.submodules import Glm52LLMSubmodule
 
 pytestmark = pytest.mark.skipif(
@@ -27,14 +28,15 @@ class _MtpNode(_Node):
 
     def info(self, rid):
         info = super().info(rid)
-        info.rid_handle = rid  # the worker stamps it; MTP state is keyed by it
+        info.rid_handle = rid  # the worker stamps it
+        info.step_metadata = {**info.step_metadata, PROMPT_LEN: len(self.prompts[rid])}
         return info
 
     def step(self, walk, batch):
         outs = super().step(walk, batch)
         unpacked = self.sub.unpack_packed_outputs(
-            static_output={}, request_ids=list(batch), real_seq_lens=[], inputs=[],
-            per_request_info={rid: info for rid, (info, _) in batch.items()},
+            static_output={}, request_ids=list(batch), real_seq_lens=[inp.input_seq_len for inp in self.inputs],
+            inputs=self.inputs, per_request_info={rid: info for rid, (info, _) in batch.items()},
         )
         for rid, rid_out in unpacked.items():
             outs[rid].update(rid_out)
@@ -48,10 +50,10 @@ class _MtpNode(_Node):
         texts = {}
         for rid, prompt in self.prompts.items():
             ids = torch.tensor(prompt, dtype=torch.long, device="cuda:0")
-            out = self.step("prefill", {rid: (infos[rid], ids)})[rid]
+            out = self.step("prefill", {rid: (infos[rid], {"text_inputs": [ids]})})[rid]
             self.sub.postprocess(rid, infos[rid], out)
             streams[rid] += out["new_token"][0].tolist()
-            texts[rid] = out["text_inputs"][0].clone()
+            texts[rid] = {"text_inputs": [out["text_inputs"][0].clone()], "count": out["count"]}
             assert not self.sub.check_stop(rid, infos[rid], out)
         live = list(self.prompts)
         for _ in range(MAX_TOKENS + 2):
@@ -62,16 +64,23 @@ class _MtpNode(_Node):
                 if self.seed_oracle is not None:
                     ref = self.seed_oracle[rid]
                     nxt = len(streams[rid])
-                    self.sub._mtp_seed_draft[self.sub._mtp_slot[rid]] = ref[nxt] if nxt < len(ref) else 0
+                    self._seed_draft(rid, ref[nxt] if nxt < len(ref) else 0)
             outs = self.step("decode", {rid: (infos[rid], texts[rid]) for rid in live})
             for rid in list(live):
                 out = outs[rid]
                 self.sub.postprocess(rid, infos[rid], out)
                 streams[rid] += out["new_token"][0].tolist()
-                texts[rid] = out["text_inputs"][0].clone()
+                texts[rid] = {"text_inputs": [out["text_inputs"][0].clone()], "count": out["count"]}
                 if self.sub.check_stop(rid, infos[rid], out):
                     live.remove(rid)
         return streams
+
+    def _seed_draft(self, rid, token):
+        """``token`` as ``rid``'s next d1, written into the seed Value's pool, which the captured graph reads."""
+        pool = self.resources[MTP_SEED]
+        (slot,) = pool._slots[rid].values()
+        draft = pool.block("draft", 0) if pool.config.blocks["draft"].per_layer else pool.block("draft")
+        draft[slot.index] = token
 
 
 @pytest.fixture

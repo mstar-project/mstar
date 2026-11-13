@@ -13,7 +13,8 @@ from test_kv_layout_intake import _Comm, _preprocess, _ScriptDoneError
 
 import mstar.conductor.conductor as conductor_mod
 from mstar.conductor.conductor import Conductor
-from mstar.model.glm52.config import KV_RESOURCE
+from mstar.engine.state.adapters import node_resources
+from mstar.model.glm52.config import KV
 from mstar.model.glm52.glm52_model import Glm52Model
 from mstar.utils.ipc_format import ConductorMessage, ConductorMessageType, NewRequestConductor, SetupDone
 from mstar.validation.resources import _undeclared_pools, _unknown_prefix_walks
@@ -62,7 +63,7 @@ def _dispatched(sent: list):
 def test_every_paged_label_is_declared_at_load(kwargs):
     model = _model(**kwargs)
 
-    assert list(_undeclared_pools(model.get_node_resources(), model)) == []
+    assert list(_undeclared_pools(node_resources(model), model)) == []
     assert list(_unknown_prefix_walks(model)) == []
 
 
@@ -87,7 +88,7 @@ def test_the_kv_pool_holds_exactly_the_window(kwargs):
     # the conductor sizes requests by the pool's max_seq_len, so it must be the window the
     # submodule's preprocess guard holds contexts to
     model = _model(**kwargs)
-    [kv] = [spec for spec in model.get_node_resources() if spec.resource_key == KV_RESOURCE]
+    [kv] = [spec for spec in node_resources(model) if spec.resource_key == KV]
     assert kv.config.max_seq_len == model.context_limit()
 
 

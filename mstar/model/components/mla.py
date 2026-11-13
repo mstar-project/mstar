@@ -19,8 +19,8 @@ need), is zeros, and its query part ``kpe_query_fill``.
 
 ``kv_label`` names the cache stream this layer writes and attends under, and ``cache_layer`` its
 KV layer, where a model packs its attention planes. A model's sparse
-attention plugs in by overriding ``_select`` and ``_attend_selected`` (absorbed) or ``_attend_naive``
-(naive); the keyword arguments ``forward`` takes beyond its own reach them unchanged.
+attention plugs in by overriding ``_select`` (absorbed) or ``_attend_naive`` (naive); the keyword
+arguments ``forward`` takes beyond its own reach them unchanged.
 
 A model that declares its state hands the layer the handle on its latent or KV array (``bind_state``),
 and the layer then adds, reads and rotates through that handle at its own layer id, with ``attn_key``
@@ -323,8 +323,7 @@ class MLAAttention(nn.Module):
                                      use_reference=self.fp8_reference)
         if self.state is not None:
             attn_latent = self._attend_state(fused, hidden_states, position_ids, **sparse)
-        elif (self.mla_fused_prep and (self._attends_written or not self._selects(**sparse))
-                and fused.is_cuda and fused.dtype == torch.bfloat16):
+        elif self.mla_fused_prep and fused.is_cuda and fused.dtype == torch.bfloat16:
             attn_latent = self._fused_prep_and_attend(fused, hidden_states, position_ids, **sparse)
         else:
             attn_latent = self._prep_and_attend(fused, hidden_states, position_ids, **sparse)
@@ -461,10 +460,7 @@ class MLAAttention(nn.Module):
 
         if latent is None:
             latent = torch.cat([kv_c, k_pe], dim=-1).squeeze(1)  # the cache rows (T, L + Drope)
-        if selection is None or self.state is not None:
-            # dense, where nothing is picked: the paged kernel path over every cached row
-            return self._write_and_attend(q_nope, latent, None, q_pe=q_pe, selected=selection)
-        return self._attend_selected(selection, q_nope, q_pe, latent, **sparse)
+        return self._write_and_attend(q_nope, latent, None, q_pe=q_pe, selected=selection)
 
     def _latent_rows(self, fused: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """No decoupled dims: ``fused (T, q_lora + L)`` -> ``q_a_layernorm`` of the q half
@@ -490,50 +486,34 @@ class MLAAttention(nn.Module):
     ) -> torch.Tensor:
         """``_prep_and_attend`` in two kernels: q_a's norm before q_b, then kv_a's norm, both
         RoPEs (from the position resource's cos/sin table) and the latent's cache write inside
-        the attention call. A selecting subclass selects from the normed ``q_c`` in between."""
+        the attention call."""
         q_c = mla_prep.q_norm(
             fused, self.q_a_layernorm.weight, self.q_a_layernorm.variance_epsilon)
-        selection = (self._select(hidden_states, q_c, position_ids, **sparse)
-                     if self._attends_written else None)
         q = self.q_b_proj(q_c).view(fused.shape[0], self.num_heads, self.qk_head_dim)
         q_nope = torch.einsum("thd,hdl->thl", q[..., : self.qk_nope_head_dim], self.w_kc)
-        return self._write_fused_and_attend(q_nope, q, fused, position_ids, selection, **sparse)
+        return self._write_fused_and_attend(q_nope, q, fused, position_ids)
 
     # outside dynamo for the layer index, as _write_and_attend
     @torch.compiler.disable
-    def _write_fused_and_attend(self, q_nope, q, fused, position_ids, selection=None, **sparse):
+    def _write_fused_and_attend(self, q_nope, q, fused, position_ids):
         layer = self._kv.layer_view(self.cache_layer_idx)
         label = self._label
         pages, offsets = self._kv.write_slots(**label)
         q_pe = mla_prep.kv_write_q_rope(
             fused, self.kv_a_layernorm.weight, self.kv_a_layernorm.variance_epsilon,
             self._pos.cos_sin_table, position_ids, q, layer, pages, offsets)
-        if selection is None:
-            return self._attn.run(q_nope, kv_cache_layer=layer, q_pe=q_pe, **label)
-        return self._attend_written(selection, q_nope, q_pe, **sparse)
-
-    # A selecting subclass that implements ``_attend_written`` takes the fused prep too.
-    _attends_written = False
+        return self._attn.run(q_nope, kv_cache_layer=layer, q_pe=q_pe, **label)
 
     def _selects(self, **sparse) -> bool:
-        """Whether this forward may select rows: the fused prep serves only one that doesn't,
-        unless the class sets ``_attends_written``."""
+        """Whether this forward may pick rows, which the fused prep doesn't serve."""
         del sparse
         return False
 
     def _select(self, hidden_states, q_c, position_ids, **sparse) -> torch.Tensor | None:
-        """The rows each query attends, or None for every cached row (the default)."""
+        """The rows each query attends, which the handle's read takes as ``selected``, or None
+        for every cached row (the default)."""
         del hidden_states, q_c, position_ids, sparse
         return None
-
-    def _attend_selected(self, selection, q_nope, q_pe, latent, **sparse) -> torch.Tensor:
-        """Write the step's cache rows ``latent (T, L + kpe)``, then absorbed attention over
-        ``_select``'s rows: ``(T, H_local, kv_lora_rank)``."""
-        raise NotImplementedError(f"{type(self).__name__} selects rows but attends none")
-
-    def _attend_written(self, selection, q_nope, q_pe, **sparse) -> torch.Tensor:
-        """``_attend_selected`` over cache rows the fused prep already wrote."""
-        raise NotImplementedError(f"{type(self).__name__} selects rows but attends none")
 
     # The absorbed forward reads only w_kc / w_vc / fused_qkv_a_proj_weight;
     # these source projections would otherwise stay resident for the process

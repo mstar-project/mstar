@@ -124,10 +124,10 @@ def test_postprocess_emits_raw_token_bytes():
 
 
 def test_sampling_knobs_without_a_config_default_reach_the_sampler():
-    from mstar.model.glm52.config import SAMPLER_RESOURCE
+    from mstar.model.glm52.config import SAMPLER
 
     cfg = _model().get_request_resource_configs([], [], {"top_k": 20, "min_p": 0.05})
-    assert cfg[SAMPLER_RESOURCE].top_k == 20 and cfg[SAMPLER_RESOURCE].min_p == 0.05
+    assert cfg[SAMPLER].top_k == 20 and cfg[SAMPLER].min_p == 0.05
 
 
 def test_graph_compile_is_a_model_kwarg_that_covers_uncaptured_steps():
