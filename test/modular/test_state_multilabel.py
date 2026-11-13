@@ -135,6 +135,18 @@ def test_a_step_that_packs_two_labels_on_one_array_refuses_another_array_listed_
     )
 
 
+def test_a_step_that_combines_labels_itself_refuses_a_paged_array_it_lists_on_one():
+    """A model that hasn't moved declares ``combined_labels`` on its step, where no array packs them, and an array on
+    KV pages plans them all the same."""
+    step = SubmoduleStep(segments=_label_major(), combined_labels={LABELS: "cfg"}, state={
+        "kv": ArrayStep(segments=[Segment(row, "main", TOKENS) for row in (1, 2)]),
+    })
+    _refused(
+        r"Array 'kv': no layout yet: a step lists it on labels \['main'\] and combines \['main', 'uncond'\]",
+        lambda: state_steps(step, {"kv": _two_label_handle()}, graph_walk="decode"),
+    )
+
+
 def test_a_step_over_one_label_plans_as_before():
     h = _two_label_handle()
     step = _begin(h, segments=[Segment(1, "uncond", TOKENS)])
