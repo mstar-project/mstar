@@ -469,6 +469,9 @@ class Praxis1ActionExpertSubmodule(_Praxis1Node):
     ) -> NodeInputs:
         tensors = {
                 "taps": inputs["taps"][0],
+                "tap_embeddings": inputs["tap_embeddings"][0],
+                "tap_rope_ids": inputs["tap_rope_ids"][0],
+                "tap_geometry": inputs["tap_geometry"][0],
                 "video_latents": inputs["video_latents"][0],
                 "action_latents": inputs["action_latents"][0],
                 "proprio": inputs["proprio"][0],
@@ -482,6 +485,9 @@ class Praxis1ActionExpertSubmodule(_Praxis1Node):
         graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
         taps: torch.Tensor,
+        tap_embeddings: torch.Tensor,
+        tap_rope_ids: torch.Tensor,
+        tap_geometry: torch.Tensor,
         video_latents: torch.Tensor,
         action_latents: torch.Tensor,
         proprio: torch.Tensor,

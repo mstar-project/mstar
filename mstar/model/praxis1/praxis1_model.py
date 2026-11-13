@@ -253,12 +253,17 @@ class Praxis1Model(Model):
             ],
             outputs=[
                 GraphEdge(next_node="action_expert", name="taps"),
+                GraphEdge(next_node="action_expert", name="tap_embeddings"),
+                GraphEdge(next_node="action_expert", name="tap_rope_ids"),
+                GraphEdge(next_node="action_expert", name="tap_geometry"),
                 GraphEdge(next_node="action_expert", name="video_latents"),
+                GraphEdge(next_node="action_expert", name="action_latents"),
             ],
         )
         action_expert = GraphNode(
             name="action_expert",
-            input_names=["taps", "video_latents", "action_latents", "proprio", *(
+            input_names=["taps", "tap_embeddings", "tap_rope_ids", "tap_geometry",
+                         "video_latents", "action_latents", "proprio", *(
                 ["proprio_all"] if self.sampler_defaults["max_context_chunks"] else []
             )],
             outputs=[
