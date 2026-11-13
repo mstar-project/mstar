@@ -257,6 +257,11 @@ model, so they are named for it.
        4.57, put first on the path of the subprocess that runs the SDK (whose
        model code does not run on transformers 5). Unset under transformers 5,
        the SDK comparison skips.
+   * - ``MSTAR_INTERPRET_FULL_SHAPES``
+     - unset
+     - ``mstar/model/kimi_k3/tests``: any value runs the attention-residual and SiTU
+       expert kernels at Kimi K3.1's full shapes in Triton's CPU interpreter, which
+       takes minutes. Unset, those cases skip and the small-shape ones run.
 
 Serving (API server)
 --------------------
@@ -860,6 +865,20 @@ Compilation
        ... --out DIR`` writes one, so a sweep can be served and measured before it
        is committed. Set it the same way on every node, so every rank of a lockstep
        instance picks the same configs.
+   * - ``MSTAR_FLASHINFER_TUNE_DIR``
+     - ``$XDG_CACHE_HOME/mstar/flashinfer_moe_tune``
+     - Where the load-time autotune of FlashInfer's FP4 MoE (4-bit routed experts on
+       Blackwell) keeps its tactics, one file per GPU, FlashInfer version and kernel
+       shape (read by ``mstar.utils.fused_moe.fp4_flashinfer._tune_cache_path``). A later
+       boot on the same GPU loads them instead of profiling again. Point it at a
+       volume that outlives the container to keep them across restarts.
+   * - ``MSTAR_MOE_MARLIN``
+     - ``1``
+     - ``0``, ``false`` or ``off``: 4-bit routed experts (``w4a16``, ``mxfp4``) that
+       FlashInfer's FP4 MoE doesn't serve stay on the Triton grouped GEMM rather than
+       the Marlin MoE kernel (read by ``mstar.utils.marlin_moe.disabled``). The Marlin
+       kernel is built at load and checked against the Triton one before it serves,
+       so this is for a host with no ``nvcc``, or to compare the two.
    * - ``MSTAR_COMPILE_LEVEL``
      - ``1``
      - How much a captured forward's compile tunes; ``mstar serve -O`` sets it

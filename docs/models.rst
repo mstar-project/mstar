@@ -70,8 +70,8 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
        MLA layers carry a DSA indexer: served within 2048 tokens (dense MLA is exact DSA there),
        or past it with ``model_kwargs.dsa_long_context`` (the DSA resource, decode captured;
        ``configs/kimi_k31_tp8_32k.yaml``, ``kimi_k31_tp8_longctx.yaml``). The
-       release's MXFP4 experts need the quantization API's ``mxfp4`` experts format. TP8 or EP8
-       experts on 8x B300.
+       release's MXFP4 experts load as stored, through the quantization API's ``mxfp4`` experts
+       format. TP8 or EP8 experts on 8x B300.
    * - ``kokoro``
      - ``hexgrad/Kokoro-82M``
      - TTS (82M, not autoregressive): misaki G2P + PL-BERT prosody + iSTFTNet
