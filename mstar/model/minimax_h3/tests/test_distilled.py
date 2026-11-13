@@ -128,3 +128,27 @@ def test_step_0_is_one_timestep_on_the_linspace_grid_and_two_on_the_rungs(distil
         info = SimpleNamespace(graph_walk=GENERATE_AV_WALK, step_metadata=meta,
                                dynamic_loop_iter_counts={DENOISE_LOOP: k})
         assert bool(node.request_inputs(info, inputs, node.bucket_key_for(info))[ONE_TIMESTEP]) is want
+
+
+def test_a_release_distilled_with_vsa_ships_its_gates_and_declares_its_layout(tmp_path):
+    """FastH3's contract names VSA (``attention_backend``, ``vsa_sparsity``): the DiT then holds its compression gates,
+    which the ``vsa`` ragged backend reads; and every DiT step lays the request's rows out for VSA (text, keyframe and
+    audio rows dense, then the video's token grid), which other backends ignore."""
+    from mstar.engine.resources.attn.ragged.config import VideoSparseLayout
+    from mstar.model.minimax_h3.config import DIT_ROWS
+
+    write_distilled_release(tmp_path, CFG, attention_backend="VIDEO_SPARSE_ATTN_H3", vsa_sparsity=0.8,
+                            vsa_tile_size=64)
+    config = H3Config(transformer=CFG).with_distilled(tmp_path)
+    assert config.distilled.vsa_sparsity == 0.8 and config.transformer.vsa_gate
+    assert not H3Config(transformer=CFG).transformer.vsa_gate
+    write_distilled_release(tmp_path, CFG, attention_backend="VIDEO_SPARSE_ATTN_H3", vsa_sparsity=0.9,
+                            vsa_tile_size=128)
+    with pytest.raises(ValueError, match="64-token"):
+        H3Distilled.from_dir(tmp_path, CFG)
+
+    sub = H3DenoiseSubmodule(None, H3Config(transformer=CFG), loop_name=DENOISE_LOOP)
+    layout = H3Layout(text_len=275, latent_frames=37, latent_height=48, latent_width=84, audio_latents=207)
+    (main, *_) = sub.attention_segments(layout)[DIT_ROWS]
+    assert main[1] == layout.total_rows
+    assert main[2] == VideoSparseLayout((275, 0, 414, (37, 24, 42))) and main[2].rows == layout.total_rows

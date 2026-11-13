@@ -29,6 +29,7 @@ from mstar.distributed.communication import CommGroup
 from mstar.engine.state import gather, scatter, split_range
 from mstar.model.components.diffusion.attention import attend
 from mstar.model.components.distributed.linear import (
+    ColumnParallelLinear,
     MergedColumnParallelLinear,
     QKVParallelLinear,
     RowParallelLinear,
@@ -126,9 +127,18 @@ class H3Attention(nn.Module):
         self.q_norm = nn.RMSNorm(head_dim, eps=cfg.qk_norm_eps)
         self.k_norm = nn.RMSNorm(head_dim, eps=cfg.qk_norm_eps)
         self.out_proj = RowParallelLinear(comm_group, heads * head_dim, cfg.hidden_size, bias=False)
+        # VSA's compression gate, on the DiT's blocks of a checkpoint that ships one; computed only where the
+        # bound resource runs VSA (``bind_state``)
+        self.gate_compress = (
+            ColumnParallelLinear(comm_group, cfg.hidden_size, heads * head_dim, bias=False)
+            if cfg.vsa_gate and array == DIT_ROWS else None
+        )
+        self.gated = False
 
     def bind_state(self, handles: Mapping[str, Any]) -> None:
         self.state = handles.get(self.array)
+        read = getattr(self.state, "first_read", None)
+        self.gated = self.gate_compress is not None and bool(getattr(read, "takes_gate", False))
 
     def forward(self, x: torch.Tensor, rope: RopeTable | None = None) -> torch.Tensor:
         local = self.local_heads * self.head_dim
@@ -145,7 +155,11 @@ class H3Attention(nn.Module):
             k = self.k_norm(k.unflatten(-1, (self.local_heads, self.head_dim)))
             if rope is not None:
                 q, k = apply_rope(q, rope), apply_rope(k, rope)
-        out = attend(self.state, self.layer, q, k, v)
+        if self.gated:
+            gate = self.gate_compress(x).unflatten(-1, (self.local_heads, self.head_dim))
+            out = attend(self.state, self.layer, q, k, v, gate=gate)
+        else:
+            out = attend(self.state, self.layer, q, k, v)
         return self.out_proj(out.flatten(2, 3).type_as(q))
 
 

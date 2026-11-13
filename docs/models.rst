@@ -2504,8 +2504,22 @@ Deployment knobs (``model_kwargs``; the SP configs set ``compile``, ``vae_tile_b
 **FastH3** (``distilled_checkpoint``; ``configs/minimax_h3_fasth3.yaml``, one B300):
 FastVideo's ``FastVideo/FastVideo-FastH3-8-Step-V2`` is the DiT distilled with DMD2 to 8
 unguided forwards, text to audio+video only. Its transformer (diffusers' layout) replaces
-FL2VA's DiT and token refiner; the conditioner and the VAEs stay FL2VA's. It was trained with
-VSA (0.8 sparsity); M* runs it with dense attention and never reads the VSA compression gates.
+FL2VA's DiT and token refiner; the conditioner and the VAEs stay FL2VA's. It was distilled with
+video sparse attention (VSA: 0.8 sparsity, 4x4x4 tiles, trained compression gates), which the
+config runs through the ragged attention resource's ``vsa`` backend (``resources: {dit_attn:
+{backend: vsa}}``; ``auto`` runs it dense, without the gates). VSA runs FastVideo's block-sparse
+kernel from ``fastvideo-kernel``, whose PyPI wheels (0.3.5) carry no sm_103 (B300) image and pin
+torch 2.12; build it from FastVideo's repository for the GPU and the installed torch:
+``TORCH_CUDA_ARCH_LIST=10.3a CMAKE_ARGS=-DFASTVIDEO_KERNEL_BUILD_ULYSSES_A2A=OFF pip install
+--no-build-isolation "git+https://github.com/hao-ai-lab/FastVideo@ec9145ab3d86b2255b6fa3bbbb2845859c72cafd#subdirectory=fastvideo-kernel"``
+(``10.0a`` for B200; needs scikit-build-core and the CUTLASS submodule). On one B300 (1344x768,
+124 frames, compiled, warm) a clip takes 19.2-19.5 s with VSA and 23.0-23.5 s dense, against
+18.2 s for SGLang's FastH3 with VSA on the same GPU. Each VSA attention call is 12 ms where dense
+cuDNN is 26 ms; dense queries (text, audio) attend everything, and each video query tile its 132
+best of 660 video key tiles. VSA's output against dense's on 8 prompts is 10.8 dB / SSIM 0.37 (a
+different clip, not a degraded one), the same as SGLang's VSA against its own dense; against an
+independent fp32 reference of FastVideo's recipe on the port's own activations each call is 0.25%
+off.
 It is sampled as FastVideo samples it: H3's Euler step on the release's rungs
 (``fastvideo_inference.json``: 999, 874, ..., 125) over 1000 plus a terminal 0, shifted in fp32
 by 10 (video) and 3 (audio). ``num_inference_steps`` is 9 sigma points (the default) and the
