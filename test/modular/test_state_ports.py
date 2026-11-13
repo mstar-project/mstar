@@ -1007,6 +1007,40 @@ def test_command_a_plus_steps_equal_the_hand_written_ones(tmp_path, walk, length
     _assert_steps_equal(step, _command_a_plus_reference_step(walk, rids, inputs))
 
 
+class _StubMasters:
+    """Each request's last sampled token, as a sampler's slot masters hold it."""
+
+    has_slot_masters = True
+
+    def __init__(self, tokens: dict[int, int]):
+        self.tokens = tokens
+
+    def loopback_tokens(self, rids):
+        return torch.tensor([self.tokens[rid] for rid in rids])
+
+
+def test_a_node_given_a_loop_back_by_step_repeats_reads_its_token_through_the_samplers_handle(tmp_path):
+    """Command A+ reads the routed token until a deployment's ``step_repeats:`` gives its decode walk a loop-back.
+    Its decode step then reads each row's token through the sampler's handle, where `SampledTokenDecoder` reads it
+    off the engine's inputs."""
+    model = _command_a_plus(tmp_path)
+    node = _bind(CommandAPlusLLMSubmodule(torch.nn.Module(), model.config, (model.image_encoder,)), model)
+    masters = _StubMasters({3: 41, 5: 43})
+    node.sampler.resource = masters
+    node.node_resources = {SAMPLER: masters}
+    assert node.uniform_row_inputs(node.DECODE_WALK, has_loopback=True) is None, "the node would loop back unasked"
+    node.enable_repeats({node.DECODE_WALK})
+    rids, inputs = [5, 3], [node.uniform_row_inputs(node.DECODE_WALK, has_loopback=True)] * 2
+    step = engine_step(node, graph_walk=node.DECODE_WALK, request_ids=rids, inputs=inputs)
+    step.set_ctx(StepContext(tuple(rids), node.DECODE_WALK, 0, True))
+    step.begin_calls()
+    # The engine's inputs carry another sampler, so a read past the handle returns that sampler's tokens.
+    engine_inputs = SimpleNamespace(request_ids=rids, resources={SAMPLER: _StubMasters({3: 7, 5: 9})})
+    ids = node.preprocess(node.DECODE_WALK, engine_inputs, inputs)["input_ids"]
+    step.end_calls()
+    assert ids.tolist() == [43, 41], "a repeated decode step would read its token past the sampler's handle"
+
+
 def test_command_a_plus_layout_converts_to_the_hand_written_one(tmp_path):
     model = _command_a_plus(tmp_path)
     span = Span("ids", "prefill", 7, 7, "text_inputs")
