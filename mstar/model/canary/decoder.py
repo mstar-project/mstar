@@ -101,17 +101,12 @@ class CanaryDecoderModel(nn.Module):
     def logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.proj_out(hidden_states)
 
-    def forward(
-        self, input_embeds: torch.Tensor, *, label: str, position_ids: torch.Tensor,
-        encoder_states: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    def forward(self, input_embeds: torch.Tensor, *, label: str, position_ids: torch.Tensor) -> torch.Tensor:
         """The token embeddings plus sinusoids at ``position_ids`` (one per
-        token), through the stack and its final norm. ``encoder_states``, on
-        the prefill only, is added to the context array before the layers read it.
-        ``label`` is the scaffold's to pass and goes unread, since each row's
-        label comes from the step's segments."""
-        if encoder_states is not None:
-            self.add_context(encoder_states)
+        token), through the stack and its final norm. The prefill adds the
+        context (`add_context`) before this runs. ``label`` is the scaffold's
+        to pass and goes unread, since each row's label comes from the step's
+        segments."""
         pos = sinusoid_positions(position_ids, self.config.hidden_size).to(input_embeds.dtype)
         hidden_states = self.embedding_layernorm(input_embeds + pos)
         for layer in self.layers:
