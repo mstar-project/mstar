@@ -397,7 +397,8 @@ class Praxis1Model(Model):
 
     def _blank_caption(self) -> str:
         """The unconditional caption the checkpoint names, or a dummy-mode space."""
-        return self.config.raw.get("text_encoder", {}).get("blank_caption", " ")
+        caption = self.config.raw.get("text_encoder", {}).get("blank_caption", " ")
+        return caption if caption.strip() else " "
 
     def _tokenizer(self):
         if self._tokenizer_cache is None:

@@ -330,9 +330,10 @@ def test_dummy_prompt_has_the_declared_text_padding(monkeypatch, no_download):
     assert no_download == []
 
 
-def test_served_prompt_strips_text_and_keeps_the_checkpoint_blank(tmp_path, monkeypatch, no_download):
+@pytest.mark.parametrize("caption", ["", "  "])
+def test_served_prompt_strips_text_and_normalizes_blank(tmp_path, monkeypatch, no_download, caption):
     config = json.loads(json.dumps(DROID_CONFIG))
-    config["text_encoder"]["blank_caption"] = "  "
+    config["text_encoder"]["blank_caption"] = caption
     model = _model(tmp_path, config, monkeypatch)
     model.config = replace(model.config, normalization={
         "proprio_mean": [0.0] * 10, "proprio_std": [1.0] * 10,
@@ -351,7 +352,7 @@ def test_served_prompt_strips_text_and_keeps_the_checkpoint_blank(tmp_path, monk
 
     monkeypatch.setattr(model, "_tokenizer", fake_tokenizer)
     model.process_prompt("  pick up cup\n", robot_state=[0, 0, 0, 1, 0, 0, 0, 0])
-    assert seen == ["pick up cup", "  "]
+    assert seen == ["pick up cup", " "]
     assert no_download == []
 
 
