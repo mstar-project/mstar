@@ -364,6 +364,9 @@ class _FlashInferRaggedPrefillBase(_RaggedPrefillBase):
             # from the one its slot last ran, and on the step's stream every such plan
             # stalled the worker for a whole step
             self._plan_stream = torch.cuda.Stream(self.device) if torch.device(self.device).type == "cuda" else None
+            # recorded after every run: the plan stream waits for it before it rewrites the buffers
+            # that run read, or frees them to its own pool (see `_plan_kernel`)
+            self._last_run: torch.cuda.Event | None = None
             return
         self._plan_stream = None
 
@@ -419,8 +422,13 @@ class _FlashInferRaggedPrefillBase(_RaggedPrefillBase):
         if self._plan_stream is None:
             plan()
             return
-        # the plan rewrites this wrapper's buffers, which the slot's previous step, the
-        # last to read them, has finished with by the time its slot is planned again
+        # The plan rewrites this wrapper's buffers, and frees the ones it replaces to the plan
+        # stream's pool, where its next allocation can take them at once: nothing on the running
+        # stream orders either against the last run that read them, so the plan stream waits for
+        # that run. When the slot's previous step has already finished, as it normally has, the
+        # wait costs nothing; a step that hadn't ran on another request's schedule.
+        if self._last_run is not None:
+            self._plan_stream.wait_event(self._last_run)
         with torch.cuda.stream(self._plan_stream):
             plan()
         torch.cuda.current_stream(self.device).wait_stream(self._plan_stream)
@@ -443,6 +451,10 @@ class _FlashInferRaggedPrefillBase(_RaggedPrefillBase):
         lse_kwargs = dict(return_lse=True, lse_base="ln") if return_lse else {}
         if not self.accelerator_graph:
             out = self.attn_wrapper.run(qp, kp, vp, **lse_kwargs)
+            if self._plan_stream is not None:
+                if self._last_run is None:
+                    self._last_run = torch.cuda.Event()
+                self._last_run.record(torch.cuda.current_stream(self.device))
         else:
             n = qp.shape[0]
             self._check_rows(n)

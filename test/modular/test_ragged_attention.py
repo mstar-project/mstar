@@ -176,6 +176,24 @@ def test_eager_replan_from_a_host_layout_leaves_the_stream_running():
     close(w.run(q, k, v), ref(q, k, v, layout))
 
 
+def test_eager_replan_waits_for_a_queued_run_of_the_old_plan():
+    """A run still queued on the stream reads the buffers of the plan it was launched with. The
+    replan rewrites them on its own stream, and frees the ones it replaces to that stream's pool,
+    where its next allocations take them, so it waits for the wrapper's last run. Without the
+    wait, MiniMax-H3-Image under client cancels served an image whose step had run on another
+    request's schedule: its last partial tile unwritten, or all black."""
+    w, before, after = wrapper(), cu([300, 7, 1]), cu([40, 24])
+    q, k, v = qkv(308)
+    w.plan(before)
+    torch.cuda.synchronize()
+    torch.cuda._sleep(1_000_000_000)  # the run below is still queued while the replan runs
+    out = w.run(q, k, v)
+    w.plan(after)
+    close(out, ref(q, k, v, before))
+    q, k, v = qkv(64, seed=1)
+    close(w.run(q, k, v), ref(q, k, v, after))
+
+
 # --- the wrapper, under CUDA graph -----------------------------------------
 
 def capture_wrapper(w):
