@@ -20,10 +20,11 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from mstar.conductor.conductor import Conductor
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources import RaggedAttentionConfig, cross_label
 from mstar.engine.resources.attn.ragged.config import RaggedCrossAttentionSpec
-from mstar.engine.resources.kv.config import RetentionPolicy
+from mstar.engine.resources.kv.config import RetentionPolicy, refuse_undeclared_labels
 from mstar.engine.resources.kv.rolling import RollingKVReqConfig, RollingKVSpec
 from mstar.engine.resources.kv.rolling.manager import RollingKVManager
 from mstar.engine.resources.step import StepContext
@@ -269,6 +270,23 @@ def test_a_rollout_keeps_main_s_rolling_extent(image_hw, tokens):
     assert cfg.window_tokens(frame) == tokens
     if image_hw == (720, 1280):
         assert model.kernel_settings() == {DIT_KV: {"pool_tokens": tokens}}
+
+
+def test_a_request_s_configs_pass_the_conductor_s_label_check():
+    """The dit's array lays out a row and declares no paged label. The conductor's check read every row as a paged
+    label's, which would fail each request with a 500, and a paged config under the store's key would open it with no
+    tokens."""
+    model = _model()
+    rows = kv_layouts(model.declare_state(), model.state_layout(58, 104), {})
+    layout = {key: {label: row.row() for label, row in labels.items()} for key, labels in rows.items()}
+    conductor = SimpleNamespace(
+        model=model, _declarations=model.declare_state,
+        _node_resources=lambda: serving_resources(model, {"resources": {}}),
+        _kv_labels={key: tuple(labels) for key, labels in model.kv_labels().items()},
+    )
+    configs = Conductor._get_resource_configs(conductor, ["image", "text"], ["video"], {"kv_layout": layout})
+    refuse_undeclared_labels("LingBotWorldModel", conductor._kv_labels, layout, configs)
+    assert configs[DIT_KV] == RollingKVReqConfig(tokens=27144, sink=9048), "a 464x832 rollout's sink, window and chunk"
 
 
 def test_the_largest_area_bounds_a_frame_at_any_aspect():

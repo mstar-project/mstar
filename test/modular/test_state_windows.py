@@ -66,7 +66,16 @@ from mstar.engine.state import (
     positions,
     rope,
 )
-from mstar.engine.state.adapters import RingHandle, build_specs, kv_layouts, node_handles, state_steps
+from mstar.engine.state.adapters import (
+    ROLLING,
+    PagedStorage,
+    RingHandle,
+    build_specs,
+    kv_layouts,
+    node_handles,
+    state_steps,
+    storage_of,
+)
 from mstar.engine.state.analysis import state_declaration_problems
 from mstar.engine.state.calls import kernel_setting
 from mstar.graph.base import GraphNode, Loop
@@ -407,9 +416,10 @@ def test_a_ring_beside_a_placed_pool_is_whole_on_each_rank():
 
 @pytest.mark.parametrize(("read", "message"), [
     (_read(FrameWindow(64, frames=2), packed=False), "mask.tokens is 64, which doesn.t fill whole blocks"),
+    (_read(FrameWindow(1, frames=2), packed=False), r"1-entry frames, which sees what Window\(2\) sees; declare that"),
     (_read(FrameWindow(TPF, frames=2)), "takes packed queries, and flex attends rows of one frame"),
     (_read(FrameWindow(TPF, frames=2), packed=False, walks={"rollout"}), "walks must be None"),
-], ids=["partial_block", "packed", "walks"])
+], ids=["partial_block", "one_entry_frames", "packed", "walks"])
 def test_flex_refuses_partial_blocks_and_packed_queries(read, message):
     with pytest.raises(ValueError, match=rf"Array 'kv': no layout yet: reads\['local'\].*{message}"):
         build_specs([_ring_array(reads={"local": read}, max_len=4 * 64)])
@@ -906,6 +916,230 @@ def test_staging_the_reach_does_not_wait_for_the_last_step():
     drained = torch.cuda.current_stream().query()
     torch.cuda.synchronize()
     assert not drained, "staging the reach waited for the last step's forward"
+
+
+# A kept-window read on the rolling store
+
+SINK, WINDOW, CHUNK = 18, 24, 12
+
+
+def _rolling_array(op=Attend(q_heads=HEADS), **fields) -> Array:
+    return _array("dit_kv", reads={"self_attn": Read(mask=Bidirectional(kept_window=True), op=op)}, max_len=4096,
+                  **fields)
+
+
+class _StubRagged:
+    """The ragged cross kernel under a rolling read: records the k and v each call is handed, returns q."""
+
+    def __init__(self):
+        self.calls, self.plans = [], []
+
+    def plan(self, step, ctx):
+        self.plans.append(step)
+
+    def run(self, q, k, v, label=None):
+        self.calls.append((k, v))
+        return q
+
+
+def _rolling(op=Attend(q_heads=HEADS), rids=("a",)):
+    """The rolling store on the CPU, its handle through `node_handles` and the read's kernel, with each of ``rids``
+    opened as intake opens it, from its layout's row."""
+    array = _rolling_array(op)
+    kv_spec, *attention = build_specs([array], kernel_settings={"dit_kv": {"pool_tokens": 2 * (SINK + WINDOW + CHUNK)}})
+    store = RollingKVManager(kv_spec.config, torch.device("cpu"), torch.float32, name="dit_kv")
+    kernel = _StubRagged()
+    handle = node_handles(SimpleNamespace(declare_state=lambda: [array]), "dit",
+                          {"dit_kv": store, **{spec.resource_key: kernel for spec in attention}})["dit_kv"]
+    (row,) = kv_layouts([array], {"dit_kv": {"main": Layout(
+        growth=(("rollout", CHUNK),), kept_windows={"self_attn": KeptWindow(SINK, window=WINDOW)},
+    )}}, {})["dit_kv"].values()
+    for rid in rids:
+        store.ingest_request(rid, kv_spec.request_config({"kv_layout": {"dit_kv": {"main": row.row()}}}))
+        assert store.reserve(rid, "dit", "rollout", None) is None
+    return handle, store, kernel
+
+
+def _rolling_step(handle, rids=("a",), **declared) -> SubmoduleStep:
+    step = state_steps(SubmoduleStep(segments=[Segment(rid, "main", CHUNK) for rid in rids],
+                                     state={"dit_kv": ArrayStep(**declared)}), {"dit_kv": handle}, graph_walk="rollout")
+    step.set_ctx(StepContext(request_ids=list(rids), graph_walk="rollout", slot=0, capture=False))
+    return step
+
+
+def _rolling_plan(step, store, kernel):
+    """Admit and plan ``step`` as the engine does; the store's outcome, with nothing planned where it refused."""
+    outcome = store.admit(step.steps["dit_kv"], step.ctx)
+    if outcome.ok:
+        store.plan(step.steps["dit_kv"], step.ctx)
+        if "self_attn" in step.steps:
+            kernel.plan(step.steps["self_attn"], step.ctx)
+    return outcome
+
+
+def _rolling_chunk(step, handle, store, start=0) -> None:
+    """The step's calls and its commit: every layer's kept add, of keys that count from ``start``."""
+    step.begin_calls()
+    k = (start + torch.arange(CHUNK, dtype=torch.float32))[:, None, None].expand(CHUNK, HEADS, DIM)
+    for layer in (0, 1):
+        handle.add(layer, k=k, v=-k)
+    step.check_calls()
+    store.commit(step.steps["dit_kv"], step.ctx)
+    step.end_calls()
+
+
+def test_an_array_whose_one_read_is_a_kept_window_lands_in_the_rolling_store():
+    assert storage_of(_rolling_array()) is ROLLING
+    assert storage_of(_rolling_array(op=None)) is ROLLING, "the reference numerics would gather from pages"
+
+
+@pytest.mark.parametrize("array", [
+    _rolling_array(labels=PAGED_LABELS),
+    _rolling_array(positions=Positions()),
+    _array("dit_kv", reads={"self_attn": _read(Bidirectional(kept_window=True), walks={"rollout"})}, max_len=4096),
+    _array("dit_kv", reads={"self_attn": _read(Bidirectional(kept_window=True), queries="q")}, max_len=4096),
+    _array("dit_kv", reads={"self_attn": _read(Bidirectional(kept_window=True), layers={0}),
+                            "attn": _read(Causal(), layers={1})}, max_len=4096),
+], ids=["two_labels", "positions", "walks", "queries", "a_second_read"])
+def test_a_kept_window_the_rolling_store_cannot_hold_stays_in_pages(array):
+    """The store holds one region a request, in stream order, and counts no positions. Any other kept window keeps the
+    paged storage's checks and messages, as Cosmos3's read on its own walks needs."""
+    assert isinstance(storage_of(array), PagedStorage), "the rolling store would refuse a declaration the pages take"
+
+
+def test_a_rolling_read_hands_the_kernel_the_store_s_own_range():
+    """`main`'s LingBot attends the store's slice in place. A gathered copy holds the same keys, and cost the port 150
+    copies of the reach a chunk, so over 6 chunks of 5 passes the kernel must get views of the pool, with the values
+    and the strides a store driven by hand gives."""
+    handle, store, kernel = _rolling()
+    by_hand = RollingKVManager(store.config, torch.device("cpu"), torch.float32)
+    by_hand.ingest_request("a", RollingKVReqConfig(tokens=SINK + WINDOW + CHUNK))
+    assert by_hand.reserve("a", "dit", "rollout", None) is None
+    pool = store._pool.untyped_storage().data_ptr()
+    torch.manual_seed(0)
+    for index in range(6):
+        step = _rolling_step(handle)
+        assert _rolling_plan(step, store, kernel).ok
+        rolled = RollingKVStep(segments=(Segment("a", "chunk", CHUNK),),
+                               positions={"a": RollingPosition(index * CHUNK, SINK, WINDOW + CHUNK)})
+        assert by_hand.admit(rolled, step.ctx).ok
+        by_hand.plan(rolled, step.ctx)
+        queries, reach = kernel.plans[-1].segments
+        assert (queries.span, reach.span) == (CHUNK, by_hand.current.rows[0].kept), f"chunk {index}'s ragged plan"
+        step.begin_calls()
+        for keep in (False, False, False, False, True):
+            for layer in (0, 1):
+                k, v = torch.randn(CHUNK, HEADS, DIM), torch.randn(CHUNK, HEADS, DIM)
+                handle.add(layer, keep=keep, k=k, v=v)
+                handle.read(layer, torch.zeros(CHUNK, HEADS, DIM))
+                by_hand.write(layer, k[None], v[None])
+                (got_k, got_v), (want_k, want_v) = kernel.calls[-1], by_hand.window(layer)
+                assert torch.equal(got_k, want_k[0]) and torch.equal(got_v, want_v[0]), f"chunk {index}, layer {layer}"
+                assert got_k.stride() == got_v.stride() == (HEADS * DIM, DIM, 1)
+                assert got_k.untyped_storage().data_ptr() == got_v.untyped_storage().data_ptr() == pool, \
+                    "the read copied the range the store keeps"
+        step.check_calls()
+        store.commit(step.steps["dit_kv"], step.ctx)
+        by_hand.commit(rolled, step.ctx)
+        step.end_calls()
+
+
+def test_a_rolling_read_with_no_op_returns_the_range_as_the_caller_s_own():
+    handle, store, kernel = _rolling(op=None)
+    for index in range(6):
+        start = index * CHUNK
+        step = _rolling_step(handle)
+        assert _rolling_plan(step, store, kernel).ok
+        step.begin_calls()
+        k = (start + torch.arange(CHUNK, dtype=torch.float32))[:, None, None].expand(CHUNK, HEADS, DIM)
+        for layer in (0, 1):
+            handle.add(layer, k=k, v=-k)
+        reached = handle.read(0)
+        stop = start + CHUNK
+        expected = sorted({*range(min(SINK, stop)), *range(max(0, stop - WINDOW - CHUNK), stop)})
+        assert reached.fields["k"][:, 0, 0].long().tolist() == expected, f"chunk {index}"
+        assert torch.equal(reached.fields["v"], -reached.fields["k"])
+        assert reached.row_offsets.tolist() == [0, len(expected)]
+        reached.fields["k"].zero_()
+        assert store.window(0)[0][0, -1, 0, 0] == stop - 1, "writing what the read returned changed the store"
+        step.check_calls()
+        store.commit(step.steps["dit_kv"], step.ctx)
+        step.end_calls()
+
+
+@pytest.mark.parametrize(("declared", "rids", "message"), [
+    ({"keep": False}, ("a",), "keep=False on the rolling store"),
+    ({"forks": (Fork(src="main", dst="main", at="end"),)}, ("a",), "a step forks the rolling store"),
+    ({}, ("a", "b"), "a step of 2 rows"),
+], ids=["scratch", "forks", "two_rows"])
+def test_a_rolling_step_keeps_one_row_s_adds(declared, rids, message):
+    handle, _, _ = _rolling(rids=rids)
+    with pytest.raises(ValueError, match=f"Array 'dit_kv': no layout yet: {message}"):
+        _rolling_step(handle, rids, **declared).begin_calls()
+
+
+def test_a_rolling_step_that_adds_nothing_is_refused():
+    handle, store, kernel = _rolling()
+    step = _rolling_step(handle)
+    assert _rolling_plan(step, store, kernel).ok
+    step.begin_calls()
+    with pytest.raises(ValueError, match="Array 'dit_kv': a step adds nothing, and the store's commit keeps"):
+        step.check_calls()
+
+
+def test_a_scratch_add_after_the_kept_add_is_refused_on_the_rolling_store():
+    """The store keeps a layer's last write of the step, so a scratch add after the kept one is what later chunks would
+    read."""
+    handle, store, kernel = _rolling()
+    step = _rolling_step(handle)
+    assert _rolling_plan(step, store, kernel).ok
+    step.begin_calls()
+    k = torch.zeros(CHUNK, HEADS, DIM)
+    handle.add(0, keep=True, k=k, v=k)
+    with pytest.raises(ValueError, match="Array 'dit_kv': an add on layer 0 after its kept add"):
+        handle.add(0, keep=False, k=k, v=k)
+
+
+def test_a_rolling_step_refuses_a_row_whose_request_sized_no_window():
+    handle, _, _ = _rolling(rids=())
+    with pytest.raises(ValueError, match=r"request a opened with no window, so reads\['self_attn'\] has no sizes"):
+        _rolling_step(handle)
+
+
+def test_a_rolling_layout_grows_in_one_loop():
+    with pytest.raises(RuntimeError, match="the rolling store's window holds one step, of one loop's growth"):
+        kv_layouts([_rolling_array()], {"dit_kv": {"main": Layout(
+            growth=(("rollout", CHUNK), ("refine", CHUNK)), kept_windows={"self_attn": KeptWindow(SINK, window=WINDOW)},
+        )}}, {})
+
+
+def test_chunks_declared_in_engine_order_write_one_range_after_another():
+    """A step's position is what the store committed when the step is declared. The engine declares a chunk after the
+    last one commits, on the thread that commits it, so each chunk lands behind the last, and behind the window once
+    the region is full."""
+    handle, store, kernel = _rolling()
+    ranges = []
+    for index in range(5):
+        step = _rolling_step(handle)
+        assert _rolling_plan(step, store, kernel).ok
+        row = store.current.rows[0]
+        ranges.append((row.write_start, row.write_stop))
+        _rolling_chunk(step, handle, store, index * CHUNK)
+    assert ranges == [(0, 12), (12, 24), (24, 36), (36, 48), (42, 54)], "a chunk was planned over another's range"
+
+
+def test_a_chunk_declared_before_the_last_one_commits_is_never_planned():
+    """Declared early, chunk k + 1 would take chunk k's position from the store and write over chunk k. The store's
+    admit refuses it once chunk k commits, so an engine that declared ahead would stop and not serve other frames."""
+    handle, store, kernel = _rolling()
+    first = _rolling_step(handle)
+    assert _rolling_plan(first, store, kernel).ok
+    early = _rolling_step(handle)
+    _rolling_chunk(first, handle, store)
+    planned = store.current
+    outcome = _rolling_plan(early, store, kernel)
+    assert not outcome.ok and "declares 0 written tokens; 12 were committed" in str(outcome.reason)
+    assert store.current is planned, "the early chunk was planned over the last one's range"
 
 
 # A read with no op
