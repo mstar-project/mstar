@@ -545,6 +545,13 @@ class Cosmos3Config:
     # compiles mid-traffic; the per-request patchify, rotary tables and
     # unpatchify run eager.
     compile_denoise_batched: bool = True
+    # [width, height] of the one-frame conditioning encode the vae_encoder node
+    # compiles, in Inductor's deterministic mode on channels-last encoder
+    # weights: a policy server's observation size, warmed at startup (a 736x544
+    # one encodes in 4.6 ms instead of 9.3 ms on an H200). Every other encode
+    # runs eager, so no request compiles mid-traffic; eager on channels-last
+    # weights is ~9% slower than stock. None (the default) keeps them all eager.
+    compile_vae_encode_size: tuple[int, int] | None = None
     # Which attention backends the DiT node declares (see
     # Cosmos3Model.get_node_resources). "dense_gen" (the default) declares the
     # paged FlashInfer backend the understanding prefill and the captured
@@ -602,6 +609,12 @@ class Cosmos3Config:
             value = getattr(self, name)
             if not isinstance(value, bool):
                 raise ValueError(f"Cosmos3 {name} must be true or false, got {value!r}.")
+        size = self.compile_vae_encode_size
+        if size is not None and not (
+            isinstance(size, (list, tuple)) and len(size) == 2
+            and all(isinstance(x, int) and not isinstance(x, bool) and x > 0 for x in size)
+        ):
+            raise ValueError(f"Cosmos3 compile_vae_encode_size must be [width, height] or null, got {size!r}.")
         if self.denoise_compile_mode not in DENOISE_COMPILE_MODES:
             raise ValueError(
                 f"Cosmos3 denoise_compile_mode must be one of {DENOISE_COMPILE_MODES}, "

@@ -1,5 +1,5 @@
-"""Decode helpers for the diffusers Wan VAE (``AutoencoderKLWan``), shared by the
-Wan VAE decoder nodes.
+"""Helpers for the diffusers Wan VAE (``AutoencoderKLWan``), shared by the Wan VAE
+decoder nodes and the encoders that compile their encode.
 
 ``AutoencoderKLWan.decode`` runs its causal decoder one latent frame per call
 against a feature cache that lives on the VAE instance and is cleared at the
@@ -182,7 +182,19 @@ def feat_cache_bytes(feat_cache: list) -> int:
 
 def compile_decode(fn, deterministic: bool = False):
     """``torch.compile`` a Wan VAE decode callable; every compiled Wan VAE
-    decode goes through here.
+    decode goes through here (``_compile_wan_vae``)."""
+    return _compile_wan_vae(fn, deterministic)
+
+
+def compile_encode(vae: nn.Module):
+    """``torch.compile`` ``vae``'s encode to its posterior mode (the latent a
+    conditioning encode keeps), in Inductor's deterministic mode, so every
+    server process encodes an input alike (``_compile_wan_vae``)."""
+    return _compile_wan_vae(lambda x: vae.encode(x).latent_dist.mode(), deterministic=True)
+
+
+def _compile_wan_vae(fn, deterministic: bool):
+    """``torch.compile`` a Wan VAE callable, one graph per input shape.
 
     Comprehensive padding is off. With it, Inductor on torch 2.13 pads the
     strides it picks for ``up_blocks[1]``'s shortcut ``x.clone()`` as if
