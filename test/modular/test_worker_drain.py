@@ -28,8 +28,10 @@ from mstar.utils.ipc_format import (
     DrainRequest,
     InputSignals,
     MessageSource,
+    NewRequest,
     RemoveRequest,
     ScheduleTPNode,
+    StopLoops,
     WorkerMessage,
     WorkerMessageType,
 )
@@ -144,9 +146,13 @@ def test_long_forward_services_other_requests_teardown_before_it_finishes():
     w.pipeline._wait_with_teardown(pending)
 
     assert w.forced == ["old"]
+    assert "busy" not in w.lifecycle.pending_drains
+    assert "busy" not in w.lifecycle.pending_removes
+    assert w.pipeline._step_result(pending) == future.result()
+    w.communicator.get_all_new_messages = list
+    w.ingest.process_messages()
     assert "busy" in w.lifecycle.pending_drains
     assert "busy" in w.lifecycle.pending_removes
-    assert w.pipeline._step_result(pending) == future.result()
 
 
 @pytest.mark.parametrize("speculation,side_lane", [(object(), False), (None, True)])
@@ -192,6 +198,120 @@ def test_gpu_wait_ready_event_does_not_start_a_waiter():
     step = SimpleNamespace(node_batch=SimpleNamespace(completion_event=SimpleNamespace(query=lambda: True)))
     w.executor.wait_for_step(step, while_waiting=lambda: pytest.fail("already complete"))
     assert w.executor._wait_pool is None
+
+
+@pytest.mark.parametrize("wait_kind", ["cpu", "gpu"])
+def test_wait_defers_duplex_stream_end_walk_and_loop_stop_until_postprocess(wait_kind):
+    """Late realtime inputs must not change what N's stop check and route see."""
+    w = _worker(known_rids=("busy", "old"), in_flight=("busy",))
+    sbuf = StreamBuffer("busy", "audio_frame", "Encoder", FixedChunkPolicy(chunk_size=1))
+    old_info = CurrentForwardPassInfo("busy", "decode", 0, 0, 10)
+    next_info = CurrentForwardPassInfo("busy", "prefill", 1, 0, 20)
+    state = w.request_state.per_request_info["busy"]
+    state.stream_buffers = {"audio_frame": sbuf}
+    state.current_fwd_info = old_info
+    walks, stops, seen = [], [], []
+    w._graph_runtime.set_walk = lambda *args: walks.append(args)
+    w._graph_runtime.apply_peer_loop_stops = lambda *args: stops.append(args)
+    w._graph_runtime.get_dynamic_loop_iters = lambda *args, **kwargs: []
+    w._graph_runtime.ingest_inputs_batch = lambda *args, **kwargs: None
+    w.request_state.update_request_info = lambda rid, current_fwd_info, **kwargs: setattr(
+        state, "current_fwd_info", current_fwd_info,
+    )
+    w.tensor_manager.start_read_tensors = lambda *args, **kwargs: []
+    messages = [
+        WorkerMessage(WorkerMessageType.INPUT_SIGNALS, InputSignals(
+            "busy", [], None, producer_done={"Encoder"}, producer_done_items={"audio_frame": 0},
+        )),
+        WorkerMessage(WorkerMessageType.INPUT_SIGNALS, InputSignals(
+            "busy", [GraphEdge(name="go", next_node="LLM")], next_info,
+        )),
+        WorkerMessage(WorkerMessageType.STOP_LOOPS, StopLoops(
+            "busy", {"decode"}, "default", loop_stop_times={"decode": (1,)},
+        )),
+        # Recording either active teardown would suppress publication by the
+        # unfinished step, even though _teardown cannot release its rows yet.
+        WorkerMessage(WorkerMessageType.DRAIN_REQUEST, DrainRequest("busy")),
+        WorkerMessage(WorkerMessageType.REMOVE_REQUEST, RemoveRequest("old")),
+        WorkerMessage(WorkerMessageType.REMOVE_REQUEST, RemoveRequest("busy")),
+    ]
+    w.communicator.get_all_new_messages = lambda: messages
+    future = Future()
+    admitted = Event()
+    admitted.set()
+    w.engine_manager.remove_request = lambda rid: future.set_result(BatchedModelOutput())
+    if wait_kind == "cpu":
+        w.pipeline._wait_with_teardown(SimpleNamespace(
+            future=future, node_batch=SimpleNamespace(launch_started_event=admitted),
+        ))
+    else:
+        w.pipeline._service_gpu_teardown()
+    assert w.forced == ["old"]
+
+    # Exercise the stop-check entry point after the completion wait. The
+    # model reads its step's info; routing reads the worker's current info.
+    node_batch = ExecutingBatch(
+        node_name="LLM", per_request_info={"busy": old_info},
+        step_context=StepContext(request_ids=("busy",), graph_walk="decode", slot=0, capture=False),
+    )
+    node_batch.request_ids = ["busy"]
+    batch = ScheduledBatch(node_name="LLM", graph_walk="decode", request_to_worker_graph={"busy": 0})
+    pending = SimpleNamespace(batch=batch, node_batch=node_batch, node_name="LLM", partition="default")
+
+    def check_stop(batch, outputs, **kwargs):
+        seen.append("check_stop")
+        assert not sbuf.producer_done
+        assert batch.per_request_info["busy"] is state.current_fwd_info is old_info
+        assert w.lifecycle.publishable(batch) == ["busy"]
+        return {}
+
+    checked = w.executor._check_stops(
+        pending, BatchedModelOutput(), {}, None, SimpleNamespace(check_stop_for_batch=check_stop),
+    )
+    assert checked.stops == {} and seen == ["check_stop"]
+    assert walks == stops == []  # no runtime routing change during the wait
+    assert state.current_fwd_info.graph_walk == batch.graph_walk == "decode"
+
+    w.communicator.get_all_new_messages = list
+    w.ingest.process_messages()
+    assert sbuf.producer_done and state.current_fwd_info is next_info
+    assert walks == [("busy", "default", "prefill")]
+    assert stops == [("busy", "default", {"decode": (1,)})]
+    assert "busy" in w.lifecycle.pending_drains and "busy" in w.lifecycle.pending_removes
+
+
+def test_wait_keeps_new_request_and_removals_in_order_across_polls():
+    w = _worker(known_rids=("old",))
+    new = WorkerMessage(WorkerMessageType.NEW_REQUEST, NewRequest(
+        "new", [], {}, [], CurrentForwardPassInfo("new", "decode", 0, 0, 10), {},
+    ))
+    first = [new, WorkerMessage(WorkerMessageType.REMOVE_REQUEST, RemoveRequest("new"))]
+    second = [WorkerMessage(WorkerMessageType.REMOVE_REQUEST, RemoveRequest("old"))]
+    polls = iter([first, second, []])
+    w.communicator.get_all_new_messages = lambda: next(polls)
+    w.pipeline._service_gpu_teardown()
+    w.pipeline._service_gpu_teardown()
+    assert w.forced == []
+    assert not w.lifecycle.pending_removes
+    assert w.lifecycle.park(WorkerMessage(WorkerMessageType.INPUT_SIGNALS, InputSignals("new", [], None)))
+    delivered = []
+    w.ingest._handlers[WorkerMessageType.NEW_REQUEST] = lambda body: delivered.append(("new", body.request_id))
+    w.ingest._handlers[WorkerMessageType.REMOVE_REQUEST] = lambda body: delivered.append(("remove", body.request_id))
+    w.ingest.process_messages()
+    assert delivered == [("new", "new"), ("remove", "new"), ("remove", "old")]
+
+
+def test_wait_queues_tp_heads_before_acking_drains():
+    w = _worker(known_rids=("old",), is_follower=True)
+    head = ScheduleTPNode(node_name="LLM", graph_walk="decode", request_ids=["old"])
+    messages = [
+        WorkerMessage(WorkerMessageType.DRAIN_REQUEST, DrainRequest("old", source=MessageSource.TP_RANK_0)),
+        WorkerMessage(WorkerMessageType.SCHEDULE_TP, head),
+    ]
+    w.communicator.get_all_new_messages = lambda: messages
+    w.pipeline._service_gpu_teardown()
+    assert w.lockstep.follow_head() is head
+    assert not _reads_done(w), "READS_DONE must wait for the queued TP step"
 
 
 def test_short_gpu_waits_stay_on_main_thread_and_relearn_long_waits(monkeypatch):

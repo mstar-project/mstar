@@ -701,7 +701,7 @@ class StepPipeline:
         for step in steps:
             if step is not None:
                 held.update(step.batch.request_to_worker_graph)
-        self.ingest.process_messages()
+        self.ingest.process_teardown_messages(held)
         self._teardown(held)
 
     def _count_turn(self, pending: "PendingBatch | None") -> None:
@@ -766,7 +766,7 @@ class StepPipeline:
             if wait((pending.future,), timeout=0.01).done:
                 break
             self._await_admit_settled(pending)
-            self.ingest.process_messages()
+            self.ingest.process_teardown_messages(self.in_flight_rids)
             self._teardown(self.in_flight_rids)
 
     def _step_result(self, pending: PendingBatch) -> BatchedModelOutput:

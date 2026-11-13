@@ -81,7 +81,12 @@ Execution flow (simplified)
 4. Outputs marked for the client are post-processed (``postprocess``) and streamed back.
 
 Workers service unrelated teardown during completion waits when admission and
-active batches permit it.
+active batches permit it. The wait only records teardown for unrelated requests
+and queues TP scheduling decisions; inputs, stream ends, loop stops, adapter
+changes and teardown for in-flight rows wait for the next normal message pass.
+This keeps an unfinished step's stop check, publication and routing on the state
+they had before the wait. Deferred messages precede newly arrived messages;
+teardown cannot overtake a deferred new request or removal.
 
 GPU completion waits shorter than the 10 ms teardown cadence use the direct
 ``event.synchronize()`` path, based on the preceding incomplete-event wait for

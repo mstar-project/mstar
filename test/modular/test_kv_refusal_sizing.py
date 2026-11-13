@@ -455,6 +455,10 @@ def test_gpu_wait_reclaims_unrelated_kv_pages_before_completion(speculative):
 
     assert pool._arena.num_free == free + 2
     assert set(pool._streams) == {"busy", "next"}
+    # In-flight teardowns cannot even be recorded during the wait: the GPU
+    # thread's publication filter reads pending removals/drains live.
+    assert not worker.lifecycle.pending_removes
+    worker.ingest.process_messages()
     assert worker.lifecycle.pending_removes == {"busy": -1, "next": -1}
     assert [message.body.request_id for message in sent] == ["old"]
 
