@@ -9,6 +9,7 @@ against the published configs of both checkpoints, with no weights and no GPU.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import huggingface_hub
@@ -305,6 +306,9 @@ def test_dummy_mode_takes_the_rig_from_the_name_and_reads_nothing(repo, rig, wir
 
 def test_dummy_prompt_has_the_declared_text_padding(monkeypatch, no_download):
     model = Praxis1Model(model_path_hf="runwayml/praxis-1-droid", skip_weight_loading=True)
+    model.config = replace(model.config, normalization={
+        "proprio_mean": [0.0] * 10, "proprio_std": [1.0] * 10,
+    })
     pads = []
 
     class Tokenizer:
@@ -321,7 +325,7 @@ def test_dummy_prompt_has_the_declared_text_padding(monkeypatch, no_download):
         return tokenizer
 
     monkeypatch.setattr(model, "_tokenizer", fake_tokenizer)
-    model.process_prompt("pick up cup")
+    model.process_prompt("pick up cup", robot_state=[0, 0, 0, 1, 0, 0, 0, 0])
     assert pads == [32, 32]
     assert no_download == []
 
@@ -330,6 +334,9 @@ def test_served_prompt_strips_text_and_keeps_the_checkpoint_blank(tmp_path, monk
     config = json.loads(json.dumps(DROID_CONFIG))
     config["text_encoder"]["blank_caption"] = "  "
     model = _model(tmp_path, config, monkeypatch)
+    model.config = replace(model.config, normalization={
+        "proprio_mean": [0.0] * 10, "proprio_std": [1.0] * 10,
+    })
     seen = []
 
     class Tokenizer:
@@ -343,7 +350,7 @@ def test_served_prompt_strips_text_and_keeps_the_checkpoint_blank(tmp_path, monk
         return tokenizer
 
     monkeypatch.setattr(model, "_tokenizer", fake_tokenizer)
-    model.process_prompt("  pick up cup\n")
+    model.process_prompt("  pick up cup\n", robot_state=[0, 0, 0, 1, 0, 0, 0, 0])
     assert seen == ["pick up cup", "  "]
     assert no_download == []
 
