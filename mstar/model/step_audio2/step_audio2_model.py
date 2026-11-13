@@ -36,23 +36,23 @@ import torch
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import FINAL_PREFILL, PartitionDefinition
 from mstar.distributed.base import ShardingConfig
-from mstar.engine.resources import (
-    AttentionConfig,
-    AttentionSpec,
-    KVSpec,
-    NodeResourceSpec,
-    PagedKVConfig,
-    PositionConfig,
-    PositionSpec,
-    RaggedAttentionConfig,
-    RaggedKeyPrefixAttentionSpec,
-    ResourceReqConfig,
-    SamplerSpec,
-    SamplingReqConfig,
+from mstar.engine.resources import NodeResourceSpec, RaggedAttentionConfig, RaggedKeyPrefixAttentionSpec
+from mstar.engine.state import (
+    Array,
+    Attend,
+    Causal,
+    KVEntry,
+    Layout,
+    Positions,
+    Read,
+    Rope,
+    Sampler,
+    SampleSettings,
+    Span,
 )
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, WalkStep
+from mstar.model.base import KVLabel, Model, ProcessPromptOutput, WalkStep
 from mstar.model.components.token2wav.keys import Token2WavKeys
 from mstar.model.components.token2wav.model import DIT_COMPUTE_DTYPE, HOP, WINDOW, load_token2wav
 from mstar.model.components.token2wav.resources import check_token2wav_slots, token2wav_resources
@@ -73,7 +73,6 @@ from mstar.model.step_audio2.config import (
     DEFAULT_SYSTEM_PROMPT,
     LLM_ATTN,
     LLM_KV,
-    LLM_POS,
     LLM_SAMPLER,
     PREFILL_AUDIO,
     PREFILL_TEXT,
@@ -268,27 +267,21 @@ class StepAudio2Model(Model):
     # Resources
     # ------------------------------------------------------------------
 
-    def get_node_resources(self) -> list[NodeResourceSpec]:
-        llm, audio = self.config.llm, self.config.audio
+    def declare_state(self) -> list[Array | Sampler]:
+        llm = self.config.llm
         return [
-            KVSpec(
-                resource_key=LLM_KV, nodes={LLM},
-                config=PagedKVConfig(
-                    num_layers=llm.num_hidden_layers,
-                    num_kv_heads=llm.num_key_value_heads,
-                    head_dim=llm.head_dim,
-                    max_seq_len=self.max_seq_len,
-                    num_qo_heads=llm.num_attention_heads,
-                ),
+            Array(
+                LLM_KV, nodes={LLM}, layers=frozenset(range(llm.num_hidden_layers)),
+                entry=KVEntry(heads=llm.num_key_value_heads, head_dim=llm.head_dim), max_len=self.max_seq_len,
+                positions=Positions(rope=Rope(theta=llm.rope_theta)),
+                reads={LLM_ATTN: Read(mask=Causal(), op=Attend(q_heads=llm.num_attention_heads))},
             ),
-            AttentionSpec(resource_key=LLM_ATTN, nodes={LLM}, config=AttentionConfig(kv_cache=LLM_KV)),
-            PositionSpec(
-                resource_key=LLM_POS, nodes={LLM},
-                config=PositionConfig(kv_cache=LLM_KV, rope_theta=llm.rope_theta),
-            ),
-            SamplerSpec(
-                resource_key=LLM_SAMPLER, nodes={LLM}, vocab_size=llm.vocab_size, enable_repetition_penalty=True,
-            ),
+            Sampler(LLM_SAMPLER, nodes={LLM}, vocab_size=llm.vocab_size, penalty=True),
+        ]
+
+    def get_node_resources(self) -> list[NodeResourceSpec]:
+        audio = self.config.audio
+        return [
             RaggedKeyPrefixAttentionSpec(
                 resource_key=AUDIO_ATTN, nodes={AUDIO},
                 config=RaggedAttentionConfig(
@@ -309,9 +302,9 @@ class StepAudio2Model(Model):
 
     def get_request_resource_configs(
         self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
-    ) -> dict[str, ResourceReqConfig]:
+    ) -> dict[str, SampleSettings]:
         knobs = {**DEFAULT_SAMPLING, **{k: model_kwargs[k] for k in SAMPLING_KEYS if k in model_kwargs}}
-        return {LLM_SAMPLER: SamplingReqConfig(**knobs)}
+        return {LLM_SAMPLER: SampleSettings(**knobs)}
 
     def request_kwargs(self) -> frozenset[str]:
         # ref_audio is read only to refuse it (``process_prompt``)
@@ -467,8 +460,8 @@ class StepAudio2Model(Model):
             metadata[SPEECH_MAX_TOKENS] = SPEECH_MAX_OUTPUT_TOKENS
         # the prefill writes every prompt row, placeholders included, then a row per decode step
         walk = PREFILL_AUDIO if mels else PREFILL_TEXT
-        layout = LabelLayout(spans=(Span("rows", walk, len(ids), len(ids), "text_inputs"),), growth=((DECODE_LOOP, 1),))
-        metadata["kv_layout"] = {LLM_KV: {"main": layout}}
+        layout = Layout(spans=(Span("rows", walk, len(ids), len(ids), "text_inputs"),), growth=((DECODE_LOOP, 1),))
+        metadata["state_layout"] = {LLM_KV: {"main": layout}}
         return ProcessPromptOutput(result, metadata)
 
     def get_max_output_tokens(self, **model_kwargs) -> int:
@@ -598,9 +591,7 @@ class StepAudio2Model(Model):
         from mstar.model.components.qwen3_lm import Qwen3DenseLM
 
         lm = self._build(
-            lambda: Qwen3DenseLM(
-                self.config.llm, attn_key=LLM_ATTN, kv_key=LLM_KV, pos_key=LLM_POS, comm_group=tp_group,
-            ),
+            lambda: Qwen3DenseLM(self.config.llm, array=LLM_KV, comm_group=tp_group),
             dtype, device,
         )
         load_llm_weights(lm, weights, device)

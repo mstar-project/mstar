@@ -29,18 +29,14 @@ from mstar.engine.accelerator_graph_config import (
 )
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import (
-    AttentionStep,
     KeyPrefixAttentionStep,
-    KVStep,
-    PositionStep,
-    SamplerStep,
     Segment,
     SlotLease,
     SubmoduleStep,
 )
-from mstar.engine.resources.attn.base import AttentionManager
-from mstar.engine.resources.sampler.resource import SamplerResource
+from mstar.engine.state import ArrayStep, SampleStep, at_last_token, last_sampled, sample
 from mstar.model.components.qwen3_lm import Qwen3DenseLM
+from mstar.model.components.sampled_token_decoder import splice_row_ids
 from mstar.model.multimodal import splice_media
 from mstar.model.step_audio2.components.audio import StepAudio2Audio, request_layout
 from mstar.model.step_audio2.config import (
@@ -54,9 +50,7 @@ from mstar.model.step_audio2.config import (
     DECODE_MIXED,
     DECODE_SPOKEN,
     DECODE_WALKS,
-    LLM_ATTN,
     LLM_KV,
-    LLM_POS,
     LLM_SAMPLER,
     PREFILL_AUDIO,
     PREFILL_TEXT,
@@ -116,6 +110,10 @@ class LLMSubmodule(ARNodeSubmodule):
         self.device_loopback = DeviceLoopback(
             walk=frozenset({DECODE, DECODE_SPOKEN}), signal="text_inputs", sampler=LLM_SAMPLER, buffer="new_token",
         )
+
+    def bind_state(self, handles: Mapping[str, Any]) -> None:
+        self.kv = handles[LLM_KV]
+        self.sampler = handles[LLM_SAMPLER]
 
     def resident_walks(self) -> frozenset[str]:
         # the decode preprocess reads only the token (RoPE comes off the position
@@ -195,9 +193,9 @@ class LLMSubmodule(ARNodeSubmodule):
     ) -> dict[str, Any]:
         device = self.get_device()
         if any(inp.input_ids is None for inp in inputs):
-            # a text row that looped back brings no token: read by slot, beside the rows
-            # that bring theirs (a spoken row, or a first decode step)
-            ids = self.loopback_inputs(engine_inputs, inputs)["input_ids"]
+            # a row that looped back brings no token: read by slot, beside the rows that
+            # bring theirs (a first decode step)
+            ids = splice_row_ids(last_sampled(self.sampler), inputs, decode=True)
         else:
             ids = torch.cat([inp.input_ids for inp in inputs]).to(device)
         if graph_walk in DECODE_WALKS:
@@ -223,12 +221,7 @@ class LLMSubmodule(ARNodeSubmodule):
                 Segment(request_id=rid, label="main", span=inp.input_seq_len)
                 for rid, inp in zip(request_ids, inputs, strict=True)
             ],
-            steps={
-                LLM_KV: KVStep(),
-                LLM_ATTN: AttentionStep(causal=True),
-                LLM_POS: PositionStep(),
-                LLM_SAMPLER: SamplerStep(apply_penalty=True, prefill_tracked_tokens=prompt),
-            },
+            state={LLM_KV: ArrayStep(), LLM_SAMPLER: SampleStep(prompt_tokens=prompt)},
         )
 
     # ------------------------------------------------------------------
@@ -240,13 +233,11 @@ class LLMSubmodule(ARNodeSubmodule):
         input_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """A decode step's ``input_ids``, or a prefill's ``input_embeds`` (``preprocess``)."""
-        attn: AttentionManager = engine_inputs.resources[LLM_ATTN]
-        sampler: SamplerResource = engine_inputs.resources[LLM_SAMPLER]
         embeds = self.model.embed(input_ids) if input_embeds is None else input_embeds
         hidden = self.model(embeds, label="main")
         if graph_walk not in DECODE_WALKS:
-            hidden = attn.select_last_hidden(hidden)
-        return sampler.sample(engine_inputs.request_ids, logits=self.model.logits(hidden))
+            hidden = at_last_token(self.kv, hidden)
+        return sample(self.sampler, self.model.logits(hidden))
 
     def forward(
         self, graph_walk: str, engine_inputs: ModelInputsFromEngine, input_ids: torch.Tensor | None = None,
