@@ -49,15 +49,18 @@ def test_the_replayed_block_loop_matches_the_inline_one():
     from mstar.engine.accelerator_graph_runner import PiecewiseAcceleratorGraphRunner, autocast_scope
     from mstar.engine.resources import StepContext, StepRunner
     from mstar.engine.resources.base import EngineResourceInfo, build_resource
+    from mstar.engine.state.adapters import node_handles, node_resources
     from mstar.model.components.block_loop_encoder import VISION_BLOCK_LOOP
     from mstar.model.muse.glimmer_model import MuseGlimmerModel
+    from mstar.model.submodule_base import engine_step
 
     bf16 = torch.bfloat16
     model = MuseGlimmerModel(_snapshot())
     node = model._create_submodule("vision_encoder", str(DEVICE), bf16, None)
-    specs = [s for s in model.get_node_resources() if "vision_encoder" in s.nodes]
+    specs = [s for s in node_resources(model) if "vision_encoder" in s.nodes]
     resources = {s.resource_key: build_resource(s, EngineResourceInfo(device=DEVICE)) for s in specs}
     node.bind_node_resources(resources)
+    node.bind_node_state(node_handles(model, "vision_encoder", resources))
     step_runner = StepRunner(resources, node_resources={"vision_encoder": list(resources)})
 
     # 64 x 48 patches: four windows, two of them partial, in the 4096 bucket
@@ -75,7 +78,7 @@ def test_the_replayed_block_loop_matches_the_inline_one():
     runner = PiecewiseAcceleratorGraphRunner(
         label=VISION_BLOCK_LOOP, config=dataclasses.replace(config, total_tokens=[bucket]),
         resources=resources, step_runner=step_runner, device=DEVICE, autocast_dtype=bf16,
-        num_slots=1, node_name="vision_encoder",
+        num_slots=1, node_name="vision_encoder", state_handles=node.state_handles,
     )
     runner.size_captures()
     runner.warmup_and_capture({runner._bucket(s) for s in runner.prepare_for_capture()})
@@ -88,10 +91,11 @@ def test_the_replayed_block_loop_matches_the_inline_one():
         step = None
         if not runners:
             # inline, the node's own step plans the attention
-            step = node.declare_step(WALK, [RID], [row])
+            step = engine_step(node, graph_walk=WALK, request_ids=[RID], inputs=[row])
             step.set_ctx(StepContext(request_ids=(RID,), graph_walk=WALK, slot=0, capture=False))
             assert step_runner.admit(step).ok
             step_runner.plan(step)
+            step.begin_calls()
         # leased, `_replay_block_loop` replays; unleased, the loop runs inline
         leases = {VISION_BLOCK_LOOP: lease} if runners else {}
         engine_inputs = SimpleNamespace(request_ids=[RID], piecewise_runners=runners, piecewise_leases=leases)
@@ -99,6 +103,7 @@ def test_the_replayed_block_loop_matches_the_inline_one():
             out = node.forward_batched(WALK, engine_inputs, **node.preprocess(WALK, None, [row]))
         if step is not None:
             step_runner.commit(step)
+            step.end_calls()
         return out[RID]["vision_embeds"][0].float()
 
     inline = encode({})

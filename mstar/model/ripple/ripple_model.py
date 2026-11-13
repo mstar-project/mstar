@@ -4,17 +4,14 @@ from pathlib import Path
 
 import torch
 
-from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec
-from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
-from mstar.engine.resources.position.config import PositionConfig, PositionSpec
-from mstar.engine.resources.spec import NodeResourceSpec
+from mstar.engine.state import Array, Attend, Causal, KVEntry, Positions, Read, Rope, Sampler, SampleSettings, Window
 from mstar.model.keys import MIXED
 from mstar.model.loader.base import StackedParamRule, load_weights_into
 from mstar.model.loader.iterators import iter_safetensors_shards
 from mstar.model.multimodal import PromptPart, chat_turns
-from mstar.model.multimodal_decoder import MIXED_SPLIT, MultimodalDecoderModel
+from mstar.model.multimodal_decoder import MIXED_SPLIT, SAMPLING_KEYS, MultimodalDecoderModel
 from mstar.model.rebuild import RebuildPolicy
-from mstar.model.ripple.config import ATTN_FULL, ATTN_SLIDING, KV_CACHE, ROPE, RippleConfig
+from mstar.model.ripple.config import ATTN_FULL, ATTN_SLIDING, KV_CACHE, SAMPLER, RippleConfig
 from mstar.model.submodule_base import ChunkingPolicy, NodeSubmodule
 from mstar.utils.fast_tokenize import encode_ids
 
@@ -54,42 +51,38 @@ class RippleModel(MultimodalDecoderModel):
         # not yet dropped: no drop and rebuild has run through its sliding-window KV pool
         return {}
 
-    def get_node_resources(self) -> list[NodeResourceSpec]:
+    def declare_state(self) -> list[Array | Sampler]:
         cfg = self.config
-        # each layer of the stack is the cache's layer at its stack index; the cache keeps only
-        # the window of the ones the sliding attention runs
-        sliding = tuple(i for i, s in enumerate(cfg.is_sliding) if s)
+        every = frozenset(range(cfg.num_hidden_layers))
+        # the cache keeps only the window of the layers the sliding read runs
+        sliding = frozenset(i for i, s in enumerate(cfg.is_sliding) if s)
+        attend = Attend(q_heads=cfg.num_attention_heads)
+        # the reference rounds its cos/sin to bf16 and rotates in fp32
+        rope = Rope(theta=cfg.rope_theta, rotary_dim=cfg.head_dim, table_dtype=torch.bfloat16)
         return [
-            KVSpec(
-                resource_key=KV_CACHE, nodes={"LLM"},
-                config=PagedKVConfig(
-                    num_layers=cfg.num_hidden_layers,
-                    num_kv_heads=cfg.num_key_value_heads,
-                    head_dim=cfg.head_dim,
-                    max_seq_len=cfg.max_position_embeddings,
-                    num_qo_heads=cfg.num_attention_heads,
-                ),
+            Array(
+                KV_CACHE, nodes={"LLM"}, layers=every,
+                entry=KVEntry(heads=cfg.num_key_value_heads, head_dim=cfg.head_dim),
+                max_len=cfg.max_position_embeddings, positions=Positions(rope=rope),
+                reads={
+                    ATTN_SLIDING: Read(mask=Window(cfg.sliding_window), op=attend, layers=sliding),
+                    ATTN_FULL: Read(mask=Causal(), op=attend, layers=every - sliding),
+                },
             ),
-            AttentionSpec(
-                resource_key=ATTN_SLIDING, nodes={"LLM"},
-                config=AttentionConfig(
-                    kv_cache=KV_CACHE, sliding_window=cfg.sliding_window, layers=sliding, splits=(MIXED_SPLIT,),
-                ),
+            Sampler(
+                SAMPLER, nodes={"LLM"}, vocab_size=cfg.vocab_size, penalty=True,
+                min_p=self._sampler_spec(cfg.vocab_size).enable_min_p,
             ),
-            AttentionSpec(
-                resource_key=ATTN_FULL, nodes={"LLM"},
-                config=AttentionConfig(kv_cache=KV_CACHE, splits=(MIXED_SPLIT,)),
-            ),
-            PositionSpec(
-                resource_key=ROPE, nodes={"LLM"},
-                # the reference rounds its cos/sin to bf16 and rotates in fp32
-                config=PositionConfig(
-                    kv_cache=KV_CACHE, rotary_dim=cfg.head_dim, rope_theta=cfg.rope_theta,
-                    rope_table_dtype=torch.bfloat16,
-                ),
-            ),
-            self._sampler_spec(cfg.vocab_size),
         ]
+
+    def kernel_settings(self) -> dict[str, dict]:
+        return {ATTN_SLIDING: {"splits": (MIXED_SPLIT,)}, ATTN_FULL: {"splits": (MIXED_SPLIT,)}}
+
+    def get_request_resource_configs(
+        self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
+    ) -> dict[str, SampleSettings]:
+        config = super().get_request_resource_configs(input_modalities, output_modalities, model_kwargs)[SAMPLER]
+        return {SAMPLER: SampleSettings(**{k: getattr(config, k) for k in SAMPLING_KEYS})}
 
     def get_chunking_policies(self) -> dict[str, tuple[ChunkingPolicy, ...]]:
         from mstar.model.ripple.submodules import RippleLLMSubmodule

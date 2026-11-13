@@ -13,17 +13,23 @@ from typing import Any
 import torch
 from jinja2 import TemplateError
 
-from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec
-from mstar.engine.resources.attn.ragged.config import (
-    RaggedAttentionConfig,
-    RaggedAttentionSpec,
+from mstar.engine.state import (
+    Array,
+    Attend,
+    Block,
+    Causal,
+    KVEntry,
+    Positions,
+    Read,
+    Rope,
+    Sampler,
+    SampleSettings,
+    Window,
 )
-from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
-from mstar.engine.resources.position.config import PositionConfig, PositionSpec
-from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.model.multimodal import PromptPart, messages_from_parts, vision_encoder
 from mstar.model.multimodal_decoder import (
     MIXED_SPLIT,
+    SAMPLING_KEYS,
     MediaIntake,
     MultimodalDecoderModel,
     PreparedMedia,
@@ -32,8 +38,14 @@ from mstar.model.muse.config import (
     ATTN_FULL,
     ATTN_SLIDING,
     KV_CACHE,
-    ROPE,
+    SAMPLER,
     VISION_ATTN,
+    VISION_FRAME_ATTN,
+    VISION_FRAME_TOKENS,
+    VISION_FULL,
+    VISION_WINDOW,
+    VISION_WINDOW_TOKENS,
+    WINDOW_ATTENTION,
     MuseGlimmerConfig,
     MuseGlimmerVisionConfig,
 )
@@ -127,9 +139,42 @@ class MuseGlimmerModel(MultimodalDecoderModel):
         # not yet dropped: no drop and rebuild has run through its sliding-window KV pool
         return {}
 
-    def get_node_resources(self) -> list[NodeResourceSpec]:
-        cfg = self.config
-        vision = self.vision_config
+    def declare_state(self) -> list[Array | Sampler]:
+        cfg, vision = self.config, self.vision_config
+        every = frozenset(range(cfg.num_hidden_layers))
+        # the cache keeps only the window of the layers the sliding read runs
+        sliding = frozenset(i for i, s in enumerate(cfg.is_sliding) if s)
+        attend = Attend(q_heads=cfg.num_attention_heads, scale=cfg.attn_scale)
+        tower = frozenset(range(len(vision.layer_types)))
+        windowed = frozenset(i for i, kind in enumerate(vision.layer_types) if kind == WINDOW_ATTENTION)
+
+        def tokens(name: str, read: str, label: str, layers: frozenset[int]) -> Array:
+            return Array(
+                name, nodes={"vision_encoder"}, layers=layers, labels={label}, max_len=0,
+                entry=KVEntry(heads=vision.num_attention_heads, head_dim=vision.head_dim),
+                reads={read: Read(mask=Block(), op=Attend(q_heads=vision.num_attention_heads))},
+            )
+
+        return [
+            Array(
+                KV_CACHE, nodes={"LLM"}, layers=every,
+                entry=KVEntry(heads=cfg.num_key_value_heads, head_dim=cfg.head_dim),
+                max_len=cfg.max_position_embeddings, positions=Positions(rope=Rope(theta=cfg.rope_theta)),
+                reads={
+                    ATTN_SLIDING: Read(mask=Window(cfg.sliding_window), op=attend, layers=sliding),
+                    ATTN_FULL: Read(mask=Causal(), op=attend, layers=every - sliding),
+                },
+            ),
+            Sampler(
+                SAMPLER, nodes={"LLM"}, vocab_size=cfg.vocab_size, penalty=True,
+                min_p=self._sampler_spec(cfg.vocab_size).enable_min_p,
+            ),
+            # windows first: both reads plan on the resource of the first, under its key
+            tokens(VISION_WINDOW_TOKENS, VISION_ATTN, VISION_WINDOW, windowed),
+            tokens(VISION_FRAME_TOKENS, VISION_FRAME_ATTN, VISION_FULL, tower - windowed),
+        ]
+
+    def kernel_settings(self) -> dict[str, dict]:
         # Segments a captured block-loop replay plans under each label
         # (windows, frames). Every replay plans for this many, so it is sized
         # to real prompts rather than the worst case: the top bucket's patches
@@ -139,49 +184,16 @@ class MuseGlimmerModel(MultimodalDecoderModel):
         from mstar.model.muse.submodules import VisionEncoderSubmodule
 
         top_bucket = VisionEncoderSubmodule.BLOCK_LOOP_PATCH_BUCKETS[-1]
-        max_segments = 4 * (top_bucket // vision.window_patches ** 2)
-        # each layer of the stack is the cache's layer at its stack index; the cache keeps
-        # only the window of the ones the sliding attention runs
-        sliding = tuple(i for i, s in enumerate(cfg.is_sliding) if s)
-        return [
-            KVSpec(
-                resource_key=KV_CACHE, nodes={"LLM"},
-                config=PagedKVConfig(
-                    num_layers=cfg.num_hidden_layers,
-                    num_kv_heads=cfg.num_key_value_heads,
-                    head_dim=cfg.head_dim,
-                    max_seq_len=cfg.max_position_embeddings,
-                    num_qo_heads=cfg.num_attention_heads,
-                ),
-            ),
-            AttentionSpec(
-                resource_key=ATTN_SLIDING, nodes={"LLM"},
-                config=AttentionConfig(
-                    kv_cache=KV_CACHE, sliding_window=cfg.sliding_window, layers=sliding,
-                    sm_scale=cfg.attn_scale, splits=(MIXED_SPLIT,),
-                ),
-            ),
-            AttentionSpec(
-                resource_key=ATTN_FULL, nodes={"LLM"},
-                config=AttentionConfig(
-                    kv_cache=KV_CACHE, sm_scale=cfg.attn_scale, splits=(MIXED_SPLIT,),
-                ),
-            ),
-            PositionSpec(
-                resource_key=ROPE, nodes={"LLM"},
-                config=PositionConfig(kv_cache=KV_CACHE, rope_theta=cfg.rope_theta),
-            ),
-            self._sampler_spec(cfg.vocab_size),
-            RaggedAttentionSpec(
-                resource_key=VISION_ATTN, nodes={"vision_encoder"},
-                config=RaggedAttentionConfig(
-                    num_qo_heads=vision.num_attention_heads,
-                    num_kv_heads=vision.num_attention_heads,
-                    head_dim=vision.head_dim,
-                    max_segments_per_step=max_segments,
-                ),
-            ),
-        ]
+        return {
+            ATTN_SLIDING: {"splits": (MIXED_SPLIT,)}, ATTN_FULL: {"splits": (MIXED_SPLIT,)},
+            VISION_ATTN: {"max_segments_per_step": 4 * (top_bucket // self.vision_config.window_patches ** 2)},
+        }
+
+    def get_request_resource_configs(
+        self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
+    ) -> dict[str, SampleSettings]:
+        config = super().get_request_resource_configs(input_modalities, output_modalities, model_kwargs)[SAMPLER]
+        return {SAMPLER: SampleSettings(**{k: getattr(config, k) for k in SAMPLING_KEYS})}
 
     # -----------------------------------------------------------------------
     # I/O
