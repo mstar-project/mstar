@@ -36,8 +36,14 @@ from mstar.model.praxis1.components.canvas import (
     tile_view_single_arm,
     tile_views_bimanual,
 )
+from mstar.model.praxis1.components.proprio import normalized_proprio
 from mstar.model.praxis1.config import Praxis1Config
-from mstar.model.praxis1.episode_history import STATE_NAME
+from mstar.model.praxis1.episode_history import (
+    BOUNDARY_STATE_NAME,
+    STATE_NAME,
+    boundary_offsets,
+    clean_depth,
+)
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
 
 logger = logging.getLogger(__name__)
@@ -165,10 +171,11 @@ class Praxis1VaeEncoderSubmodule(_Praxis1Node):
     happen here so the API server stages uint8 rather than floats.
     """
 
-    def __init__(self, config: Praxis1Config, vae: nn.Module, *, episode_history: bool = False) -> None:
+    def __init__(self, config: Praxis1Config, vae: nn.Module, *, max_context_chunks: int = 0) -> None:
         super().__init__(config)
         self.vae = vae
-        self.episode_history = episode_history
+        self.max_context_chunks = max_context_chunks
+        self.episode_history = max_context_chunks > 0
         latent = getattr(vae.config, "z_dim", None)
         if latent is not None and latent != self.config.latent_channels:
             raise ValueError(
@@ -239,7 +246,12 @@ class Praxis1VaeEncoderSubmodule(_Praxis1Node):
         return SubmoduleStep(
             segments=[Segment(rid, "main", int(inp.resource_step_info))
                       for rid, inp in zip(request_ids, inputs, strict=True)],
-            state={STATE_NAME: ArrayStep()},
+            state={
+                STATE_NAME: ArrayStep(),
+                BOUNDARY_STATE_NAME: ArrayStep(segments=tuple(
+                    Segment(rid, "main", 1) for rid in request_ids
+                )),
+            },
         )
 
     def forward(
@@ -267,15 +279,47 @@ class Praxis1VaeEncoderSubmodule(_Praxis1Node):
                 pose_valid = (history_pose_valid[-(history_append + 1):-1]
                               if history_append > 1 else history_pose_valid[-1:])
                 handle = self.state_handles[STATE_NAME]
+                boundary = self.state_handles[BOUNDARY_STATE_NAME]
+                previous = boundary.read(0).fields
+                previously_valid = bool(previous["history_valid"][-1, 0]) if len(previous["pose"]) else True
+                history_valid = previously_valid and bool(history_pose_valid[:-1].all())
+                boundary.add(
+                    0, pose=history_pose[-1:].to(device=device, dtype=torch.float32),
+                    history_valid=torch.tensor([[int(history_valid)]], dtype=torch.uint8, device=device),
+                )
                 handle.add(0, frame=added, pose=poses.to(device=device, dtype=torch.float32),
                            pose_valid=pose_valid.to(device=device, dtype=torch.uint8))
-                # The clean window is read through the engine's retained
-                # state. A later trunk port consumes its frames and poses.
-                handle.read(0)
+                observed = handle.read(0).fields
+                boundaries = boundary.read(0).fields
                 tiles = [view[-1:] for view in tiles]
             canvas = build_canvas(self._tiles(tiles))
             latent = self.vae_encode(canvas)
-        return {"obs_latents": [latent]}
+            if not self.episode_history:
+                return {"obs_latents": [latent]}
+            depth = clean_depth(len(observed["frame"]), self.max_context_chunks)
+            if depth:
+                clean_canvas = observed["frame"].permute(1, 0, 2, 3).unsqueeze(0).float()
+                clean = self.vae_encode(clean_canvas)
+                if self.config.embodiment == "single_arm":
+                    anchor = clean[:, :, :1].contiguous()
+                else:
+                    anchor = self.vae_encode(clean_canvas[:, :, :1])
+                offsets = boundary_offsets(depth)
+                from_stream = history_valid and bool(observed["pose_valid"].all())
+                if from_stream:
+                    poses_all = torch.cat((observed["pose"][list(offsets)], boundaries["pose"][-1:]))
+                else:
+                    poses_all = boundaries["pose"][-(depth + 1):]
+            else:
+                anchor = latent
+                clean = latent[:, :, :0]
+                poses_all = boundaries["pose"][-1:]
+            proprio_all = torch.cat([
+                normalized_proprio(row.cpu().tolist(), self.config.embodiment, self.config.normalization)
+                for row in poses_all
+            ], dim=1).to(device=device)
+        return {"obs_latents": [latent], "anchor_latents": [anchor],
+                "clean_latents": [clean], "proprio_all": [proprio_all]}
 
     def _tiles(self, views: list[torch.Tensor]) -> list[torch.Tensor]:
         """Each view at the checkpoint's tile size, by that rig's own rule.

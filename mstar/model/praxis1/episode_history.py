@@ -10,6 +10,7 @@ from __future__ import annotations
 FIRST_ROWS = 21
 LATER_ROWS = 24
 STATE_NAME = "executed_observations"
+BOUNDARY_STATE_NAME = "boundary_poses"
 
 
 def window_size(max_context_chunks: int) -> int:
@@ -38,3 +39,15 @@ def append_count(held: int, executed_rows: int) -> int:
     if executed_rows != LATER_ROWS:
         raise ValueError("later warm calls require 24 executed rows")
     return LATER_ROWS
+
+
+def clean_depth(held: int, max_context_chunks: int) -> int:
+    """The number of complete 21/24-frame chunks in the retained window."""
+    if held < FIRST_ROWS:
+        return 0
+    return min(1 + (held - FIRST_ROWS) // LATER_ROWS, max_context_chunks)
+
+
+def boundary_offsets(depth: int) -> tuple[int, ...]:
+    """Frame positions of the clean chunks' first poses."""
+    return tuple(0 if k == 0 else FIRST_ROWS + LATER_ROWS * (k - 1) for k in range(depth))

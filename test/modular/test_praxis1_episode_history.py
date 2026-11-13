@@ -17,6 +17,7 @@ from mstar.engine.state.adapters import build_specs, node_handles, state_steps
 from mstar.engine.state.episodes import EpisodeRowBindings
 from mstar.model.base import EpisodeView
 from mstar.model.praxis1.episode_history import (
+    BOUNDARY_STATE_NAME,
     FIRST_ROWS,
     LATER_ROWS,
     STATE_NAME,
@@ -51,13 +52,15 @@ def _pose():
 
 def test_declared_window_is_paired_and_bounded_by_reference_geometry():
     model = _model()
-    (array,) = model.declare_state()
+    array, boundaries = model.declare_state()
     assert array.name == STATE_NAME
     assert array.lifetime == "episode" and array.max_len is None
     assert array.reads["history"].mask.size == window_size(3) == 69
     assert array.entry.tensors["frame"].dtype == torch.uint8
     assert array.entry.tensors["pose"].shape == (8,)
     assert array.entry.tensors["pose_valid"].dtype == torch.uint8
+    assert boundaries.name == BOUNDARY_STATE_NAME
+    assert boundaries.reads["recent"].mask.size == 4
 
 
 def test_append_plan_tracks_cold_warm_reset_and_eviction():
@@ -165,13 +168,19 @@ def test_first_warm_25_row_client_stack_keeps_exact_reference_suffix(pose_histor
     )
     assert plan[-1].step_metadata["history_append"] == 20
 
-    node = Praxis1VaeEncoderSubmodule(model.config, _Vae(), episode_history=True)
+    node = Praxis1VaeEncoderSubmodule(model.config, _Vae(), max_context_chunks=3)
     node._tiles = lambda views: views
-    node.vae_encode = lambda canvas: canvas
-    handle = _Handle()
-    node.state_handles = {STATE_NAME: handle}
+    node.vae_encode = lambda canvas: canvas[:, :, ::4]
+    seed_pose = torch.tensor([[3.0, 0, 0.6, 1, 0, 0, 0, 0.5]])
+    handle = _Handle({
+        "frame": torch.full((1, 3, 3, 8), 3, dtype=torch.uint8),
+        "pose": seed_pose,
+        "pose_valid": torch.ones((1, 1), dtype=torch.uint8),
+    })
+    boundary = _Handle({"pose": seed_pose, "history_valid": torch.ones((1, 1), dtype=torch.uint8)})
+    node.state_handles = {STATE_NAME: handle, BOUNDARY_STATE_NAME: boundary}
     views = prepared.new_input_tensors["image_inputs"]
-    node.forward(
+    out = node.forward(
         "chunk",
         SimpleNamespace(),
         history_append=20,
@@ -182,18 +191,36 @@ def test_first_warm_25_row_client_stack_keeps_exact_reference_suffix(pose_histor
     _, added = handle.added[0]
     assert added["frame"][:, 0, 0, 0].tolist() == list(range(4, 24))
     assert added["pose_valid"].sum() == (20 if pose_history else 0)
+    assert out["anchor_latents"][0].shape[2] == 1
+    assert out["clean_latents"][0].shape[2] == 6
+    assert out["proprio_all"][0].shape == (1, 2, 10)
 
 
 class _Handle:
-    def __init__(self):
+    def __init__(self, prior=None):
         self.added = []
         self.reads = 0
+        self.prior = prior or {}
 
     def add(self, layer, **fields):
         self.added.append((layer, fields))
 
     def read(self, layer):
         self.reads += 1
+        if not self.added and not self.prior:
+            return SimpleNamespace(fields={
+                "pose": torch.empty((0, 8)),
+                "history_valid": torch.empty((0, 1), dtype=torch.uint8),
+            })
+        fields = dict(self.prior)
+        if self.added:
+            for name, value in self.added[-1][1].items():
+                fields[name] = torch.cat((fields[name], value)) if name in fields else value
+        return SimpleNamespace(fields=fields)
+
+    def commit(self):
+        self.prior = self.read(0).fields
+        self.added.clear()
 
 
 class _Vae(torch.nn.Module):
@@ -203,14 +230,64 @@ class _Vae(torch.nn.Module):
         self.config = SimpleNamespace(z_dim=None)
 
 
+def test_missing_pose_fallback_matches_reference_over_three_calls():
+    reference = pytest.importorskip("praxis.robot_io", reason="reference checkout not on PYTHONPATH")
+    stream = reference.ContiguousStreamContext(action_chunk=24, max_context_chunks=3)
+    model = _model()
+    node = Praxis1VaeEncoderSubmodule(model.config, _Vae(), max_context_chunks=3)
+    node._tiles = lambda views: views
+    node.vae_encode = lambda canvas: canvas[:, :, ::4]
+    frames = _Handle()
+    boundaries = _Handle()
+    node.state_handles = {STATE_NAME: frames, BOUNDARY_STATE_NAME: boundaries}
+    boundary_poses = []
+
+    for current, first, count in ((0, 0, 0), (21, 0, 21), (45, 21, 24)):
+        pose = [float(current) / 100, 0.0, 0.6, 1.0, 0.0, 0.0, 0.0, 0.5]
+        boundary_poses.append(pose)
+        prior = torch.arange(first, first + count, dtype=torch.uint8)[:, None, None, None].expand(-1, 3, 2, 2)
+        cur = torch.full((3, 2, 2), current, dtype=torch.uint8)
+        tensors = {
+            "image_inputs": [cur] * model.config.num_cameras,
+            "executed_frame_inputs": [prior] * model.config.num_cameras,
+            "executed_pose_inputs": [torch.empty((0, 8), dtype=torch.float32)],
+        }
+        prepared = model.process_prompt("pick", [], [], robot_state=pose, tensors=tensors)
+        if count:
+            clip = prior[None].permute(0, 2, 1, 3, 4)
+            stream.append_executed(clip, poses=None)
+        expected = reference.pose8_to_10d(np.asarray(boundary_poses[-(stream.depth + 1):], dtype=np.float32))
+        append = append_count(len(frames.prior.get("frame", [])), count)
+        out = node.forward(
+            "chunk", SimpleNamespace(), history_append=append,
+            history_pose=prepared.new_input_tensors["executed_pose_inputs"][0],
+            history_pose_valid=prepared.new_input_tensors["executed_pose_valid"][0],
+            **{f"view_{i}": view for i, view in enumerate(prepared.new_input_tensors["image_inputs"])},
+        )
+        assert out["clean_latents"][0].shape[2] == stream.depth * 6
+        np.testing.assert_allclose(out["proprio_all"][0][0].numpy(), expected, rtol=0, atol=1e-6)
+        frames.commit()
+        boundaries.commit()
+    assert boundaries.prior["history_valid"][-1, 0].item() == 0
+
+
 @pytest.mark.parametrize("append,expected", [(1, [99]), (20, list(range(1, 21))), (24, list(range(21, 45)))])
 def test_vae_state_adds_only_new_executed_rows(append, expected):
     model = _model()
-    node = Praxis1VaeEncoderSubmodule(model.config, _Vae(), episode_history=True)
+    node = Praxis1VaeEncoderSubmodule(model.config, _Vae(), max_context_chunks=3)
     node._tiles = lambda views: views
-    node.vae_encode = lambda canvas: canvas
-    handle = _Handle()
-    node.state_handles = {STATE_NAME: handle}
+    node.vae_encode = lambda canvas: canvas[:, :, ::4]
+    prior_values = [] if append == 1 else ([0] if append == 20 else list(range(21)))
+    prior_frame = torch.tensor(prior_values, dtype=torch.uint8)[:, None, None, None].expand(-1, 3, 1, 2)
+    prior_pose = torch.tensor(prior_values, dtype=torch.float32)[:, None].expand(-1, 8)
+    handle = _Handle({"frame": prior_frame, "pose": prior_pose,
+                      "pose_valid": torch.ones((len(prior_values), 1), dtype=torch.uint8)})
+    boundary_prior = [] if append == 1 else ([0] if append == 20 else [0, 21])
+    boundary = _Handle({
+        "pose": torch.tensor(boundary_prior, dtype=torch.float32)[:, None].expand(-1, 8),
+        "history_valid": torch.ones((len(boundary_prior), 1), dtype=torch.uint8),
+    })
+    node.state_handles = {STATE_NAME: handle, BOUNDARY_STATE_NAME: boundary}
     if append == 1:
         values = [99]
     elif append == 20:
@@ -262,29 +339,39 @@ def test_executed_window_matches_pinned_reference_after_slide_and_reset():
 def test_engine_keeps_paired_history_across_request_ids_then_clears_on_reset():
     model = _model()
     model.config = replace(model.config, tile_height=1, tile_width=1)
-    (array,) = model.declare_state()
-    (spec,) = build_specs([array])
-    pool = DenseWindowPool.build(spec, EngineResourceInfo(device=torch.device("cpu")))
-    handle = node_handles(model, "vae_encoder", {STATE_NAME: pool})[STATE_NAME]
+    arrays = model.declare_state()
+    pools = {spec.resource_key: DenseWindowPool.build(
+        spec, EngineResourceInfo(device=torch.device("cpu"))
+    ) for spec in build_specs(arrays)}
+    handles = node_handles(model, "vae_encoder", pools)
+    handle = handles[STATE_NAME]
+    boundary = handles[BOUNDARY_STATE_NAME]
     owners = EpisodeRowBindings()
 
     def call(rid, episode, values, reset=False):
-        pool.ingest_request(rid)
+        for pool in pools.values():
+            pool.ingest_request(rid)
         binding = owners.bind(rid, 0, episode)
-        pool.bind_episode(rid, 0, episode, cold=binding.cold, reset=reset)
+        for pool in pools.values():
+            pool.bind_episode(rid, 0, episode, cold=binding.cold, reset=reset)
         step = state_steps(
             SubmoduleStep(
                 segments=[Segment(rid, "main", len(values))],
-                state={STATE_NAME: ArrayStep()},
+                state={STATE_NAME: ArrayStep(),
+                       BOUNDARY_STATE_NAME: ArrayStep(segments=(Segment(rid, "main", 1),))},
             ),
-            {STATE_NAME: handle},
+            handles,
             graph_walk="chunk",
         )
         step.set_ctx(StepContext(request_ids=[rid], graph_walk="chunk", slot=0, capture=False))
-        assert pool.admit(step.steps[STATE_NAME], step.ctx).ok
-        pool.plan(step.steps[STATE_NAME], step.ctx)
+        for name, pool in pools.items():
+            assert pool.admit(step.steps[name], step.ctx).ok
+            pool.plan(step.steps[name], step.ctx)
         step.begin_calls()
         vals = torch.tensor(values, dtype=torch.uint8)
+        previous = boundary.read(0).fields
+        boundary.add(0, pose=torch.full((1, 8), float(values[-1])),
+                     history_valid=torch.ones((1, 1), dtype=torch.uint8))
         handle.add(
             0,
             frame=vals[:, None, None, None].expand(-1, 3, 1, model.config.num_cameras).clone(),
@@ -294,11 +381,17 @@ def test_engine_keeps_paired_history_across_request_ids_then_clears_on_reset():
         reached = handle.read(0)
         result = reached.fields["frame"][:, 0, 0, 0].tolist()
         assert reached.fields["pose"][:, 0].tolist() == [float(v) for v in result]
+        saved_boundary = boundary.read(0).fields
+        assert saved_boundary["pose"][-1, 0].item() == values[-1]
+        if not reset and rid > 1:
+            assert len(previous["pose"]) >= 1
         step.check_calls()
-        pool.commit(step.steps[STATE_NAME], step.ctx)
+        for name, pool in pools.items():
+            pool.commit(step.steps[name], step.ctx)
         step.commit_calls()
         step.end_calls()
-        pool.remove_request(rid)
+        for pool in pools.values():
+            pool.remove_request(rid)
         owners.unbind(rid)
         return result
 

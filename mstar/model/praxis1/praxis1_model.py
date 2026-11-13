@@ -60,7 +60,7 @@ from mstar.model.media_limits import read_image
 from mstar.model.praxis1.components.commands import compose_commands, pose_to_model
 from mstar.model.praxis1.components.proprio import normalized_proprio
 from mstar.model.praxis1.config import Praxis1Config, Praxis1ConfigError
-from mstar.model.praxis1.episode_history import STATE_NAME, append_count, window_size
+from mstar.model.praxis1.episode_history import BOUNDARY_STATE_NAME, STATE_NAME, append_count, window_size
 from mstar.model.praxis1.submodules import (
     Praxis1ActionHeadSubmodule,
     Praxis1TextEncoderSubmodule,
@@ -224,7 +224,12 @@ class Praxis1Model(Model):
             name="vae_encoder",
             input_names=["image_inputs", "executed_pose_inputs", "executed_pose_valid"]
             if self.sampler_defaults["max_context_chunks"] else ["image_inputs"],
-            outputs=[GraphEdge(next_node="backbone", name="obs_latents")],
+            outputs=[GraphEdge(next_node="backbone", name="obs_latents"), *(
+                [GraphEdge(next_node="backbone", name="anchor_latents"),
+                 GraphEdge(next_node="backbone", name="clean_latents"),
+                 GraphEdge(next_node="action_expert", name="proprio_all")]
+                if self.sampler_defaults["max_context_chunks"] else []
+            )],
         )
 
         # One Euler step: the backbone denoises the video window and leaves
@@ -234,6 +239,7 @@ class Praxis1Model(Model):
             name="backbone",
             input_names=[
                 "obs_latents",
+                *(["anchor_latents", "clean_latents"] if self.sampler_defaults["max_context_chunks"] else []),
                 "text_embeds",
                 "text_embeds_blank",
                 "video_latents",
@@ -246,7 +252,9 @@ class Praxis1Model(Model):
         )
         action_expert = GraphNode(
             name="action_expert",
-            input_names=["taps", "video_latents", "action_latents", "proprio"],
+            input_names=["taps", "video_latents", "action_latents", "proprio", *(
+                ["proprio_all"] if self.sampler_defaults["max_context_chunks"] else []
+            )],
             outputs=[
                 GraphEdge(next_node="backbone", name="video_latents"),
                 GraphEdge(next_node="backbone", name="action_latents"),
@@ -298,6 +306,7 @@ class Praxis1Model(Model):
         depth = self.sampler_defaults["max_context_chunks"]
         if depth == 0:
             return []
+        pose_width = 8 if self.config.embodiment == "single_arm" else 16
         return [Array(
             STATE_NAME,
             nodes={"vae_encoder"}, layers={0},
@@ -306,7 +315,7 @@ class Praxis1Model(Model):
                     (3, self.config.tile_height, self.config.tile_width * self.config.num_cameras),
                     dtype=torch.uint8,
                 ),
-                "pose": TensorType((8 if self.config.embodiment == "single_arm" else 16,), dtype=torch.float32),
+                "pose": TensorType((pose_width,), dtype=torch.float32),
                 # A missing historical pose leaves the camera history valid.
                 # The dense pool's fresh-row gather promotes bool to int64,
                 # so validity is stored as uint8 0/1.
@@ -314,6 +323,16 @@ class Praxis1Model(Model):
             }),
             max_len=None,
             reads={"history": Read(mask=Window(window_size(depth)))},
+            lifetime="episode",
+        ), Array(
+            BOUNDARY_STATE_NAME,
+            nodes={"vae_encoder"}, layers={0},
+            entry=Entry({
+                "pose": TensorType((pose_width,), dtype=torch.float32),
+                "history_valid": TensorType((1,), dtype=torch.uint8),
+            }),
+            max_len=None,
+            reads={"recent": Read(mask=Window(depth + 1))},
             lifetime="episode",
         )]
 
@@ -607,7 +626,7 @@ class Praxis1Model(Model):
                 .requires_grad_(False)
             )
             return Praxis1VaeEncoderSubmodule(
-                self.config, vae, episode_history=bool(self.sampler_defaults["max_context_chunks"])
+                self.config, vae, max_context_chunks=self.sampler_defaults["max_context_chunks"]
             )
         if node_name == "action_head":
             return Praxis1ActionHeadSubmodule(self.config)
