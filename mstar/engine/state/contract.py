@@ -97,6 +97,12 @@ class Block(Mask):
     """Sees the entries of q's own segment in this step, on an array with ``max_len`` 0."""
 
 
+@dataclass(frozen=True)
+class BlockPrefix(Block):
+    """Sees the first entries of q's own segment in this step, as many as the step gives that segment
+    (``ArrayStep.prefix_lens``): a key padding mask, whose entries past the prefix still query."""
+
+
 class Op:
     """A kernel the engine plans before the step and runs on an array's entries.
 
@@ -176,7 +182,7 @@ class Read:
         if self.op is not None and (self.op.writes or self.op.adds):
             raise ValueError(f"Read.op: a read changes no field, and {type(self.op).__name__} writes "
                              f"{list(self.op.writes)} and adds {list(self.op.adds)}")
-        if self.segmented and (self.packed or self.queries is not None or not isinstance(self.mask, Block)):
+        if self.segmented and (self.packed or self.queries is not None or type(self.mask) is not Block):
             raise ValueError(f"Read.segmented lays a request's segments end to end in one row, which takes Block(), "
                              f"packed=False and no queries, and got mask={self.mask!r}, packed={self.packed}, "
                              f"queries={self.queries!r}")
@@ -283,7 +289,7 @@ class Array:
             raise ValueError(f"{where}.layers has {sorted(read.layers - self.layers)}, outside the array's layers")
         if isinstance(read.mask, Window) and not _is_positive(read.mask.size):
             raise ValueError(f"{where}.mask.size must be a positive int, got {read.mask.size!r}")
-        if read.queries is not None and not isinstance(read.mask, Block):
+        if read.queries is not None and type(read.mask) is not Block:
             raise ValueError(f"{where}.queries: a read of another array's queries takes a mask that uses no query "
                              f"position, and {type(read.mask).__name__} does")
         if read.op is not None:
@@ -424,6 +430,7 @@ class ArrayStep:
     advance: tuple[int, ...] | None = None         # positions per row; None: the span
     position_ids: torch.Tensor | None = None       # explicit ids, (tokens,) in segment order
     host: Mapping[tuple[int, str, int], Mapping[str, object]] = EMPTY    # (row, label, layer) -> fields, at commit
+    prefix_lens: tuple[int, ...] | None = None     # per segment, the entries a BlockPrefix read sees
 
 
 @dataclass(frozen=True, kw_only=True)
