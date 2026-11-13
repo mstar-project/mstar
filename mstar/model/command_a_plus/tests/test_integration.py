@@ -107,7 +107,6 @@ class NodeTests(unittest.TestCase):
             self.assertEqual(set(tracked), {"a", "b"} if walk == "prefill" else set())
             output = self.node.forward_batched(walk, engine, **self.node.preprocess(walk, engine, inputs))
             self.assertEqual(output.row_outputs["new_token"].tolist(), expected)
-            self.assertEqual(sampler.sample.call_args.args[0], engine.request_ids)
         attention.select_last_hidden.assert_called_once()
 
     def test_its_eos_ends_either_prefill_and_the_decode_loop(self):

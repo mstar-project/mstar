@@ -412,21 +412,12 @@ def test_at_last_token_reads_the_reads_resource_and_a_paged_read_reports_no_sett
              lambda: kernel_setting(h, "attn", "max_segments_per_step"))
 
 
-def test_sample_takes_the_steps_rows_padding_included():
+def test_sample_and_last_sampled_hand_the_resource_no_rows():
     h = _sampler_handle()
-    seen = []
-    h.resource.sample = lambda rows, logits: seen.append(rows) or logits.argmax(-1)
-    ctx = _ctx(rows=(1,))
-    ctx.set_padded_rids((1, -1))
-    _begin(h, ctx=ctx)
-    assert sample(h, torch.eye(2, 8)).tolist() == [0, 1]
-    assert seen == [[1, -1]], "a padding row must stay in the rows, since the logits have a row for it"
-
-
-def test_last_sampled_reads_the_resource_with_the_steps_rows():
-    h = _sampler_handle()
-    h.resource.loopback_tokens = torch.tensor
+    h.resource.sample = lambda logits: logits.argmax(-1)
+    h.resource.loopback_tokens = lambda: torch.tensor([4, 5])
     _begin(h, ctx=_ctx(rows=(4, 5)))
+    assert sample(h, torch.eye(2, 8)).tolist() == [0, 1]
     assert last_sampled(h).tolist() == [4, 5]
 
 
@@ -451,7 +442,7 @@ def test_two_draws_in_a_step_draw_at_different_offsets_and_a_third_raises(monkey
 
 def test_a_step_that_samples_too_few_times_is_refused_by_its_check():
     h = _sampler_handle(draws=2)
-    h.resource.sample = lambda rows, logits: logits.argmax(-1)
+    h.resource.sample = lambda logits: logits.argmax(-1)
     step = _begin(h)
     sample(h, torch.randn(1, 8))
     with pytest.raises(ValueError, match=r"Sampler 'sampler': a step listing it sampled 1 times, and draws is 2"):
@@ -460,7 +451,7 @@ def test_a_step_that_samples_too_few_times_is_refused_by_its_check():
 
 def test_a_replay_checks_no_draws_and_inherits_none_from_a_failed_step():
     h = _sampler_handle()
-    h.resource.sample = lambda rows, logits: logits.argmax(-1)
+    h.resource.sample = lambda logits: logits.argmax(-1)
     failed = _begin(h)
     sample(h, torch.randn(1, 8))
     h.end_step(failed)
@@ -996,7 +987,7 @@ def test_a_sample_runs_behind_a_graph_break():
     resource = SimpleNamespace(sample=None)
 
     def record(note):
-        resource.sample = lambda rows, logits: (note(), logits.argmax(-1))[1]
+        resource.sample = lambda logits: (note(), logits.argmax(-1))[1]
         h.resource = resource
 
     assert _compiling_at_each_kernel(lambda x: sample(h, x), record) == [False]

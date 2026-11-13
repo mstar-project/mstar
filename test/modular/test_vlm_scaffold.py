@@ -434,13 +434,13 @@ def test_glimmer_samples_and_loops_back_off_its_resources():
     llm.model = _Decoder()
     engine_inputs = SimpleNamespace(request_ids=["r"], resources={
         SAMPLER: SimpleNamespace(
-            loopback_tokens=lambda rids: torch.tensor([9]) if rids == ["r"] else None,
-            sample=lambda rids, logits: (rids, logits),
+            loopback_tokens=lambda: torch.tensor([9]),
+            sample=lambda logits: logits,
         ),
         ATTN_FULL: SimpleNamespace(select_last_hidden=lambda x: x[-1:]),
     })
-    rows, logits = llm._forward("prefill_text", engine_inputs)
-    assert rows == ["r"] and torch.equal(logits, hidden[-1:]), "a prefill feeds the head each row's last token"
+    logits = llm._forward("prefill_text", engine_inputs)
+    assert torch.equal(logits, hidden[-1:]), "a prefill feeds the head each row's last token"
     assert llm.loopback_tokens(engine_inputs).tolist() == [9]
 
 
