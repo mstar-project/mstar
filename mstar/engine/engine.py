@@ -2725,12 +2725,11 @@ class Engine:
                 else publish_request_ids
             )
             if self._episode_pools:
-                active = {
-                    key: pool for key, pool in self._episode_pools.items()
-                    if batch.node_name in self._resource_nodes[key]
-                }
+                # WORKER_GRAPHS_DONE may leave from a later node that owns no
+                # episode arrays. Report the latest absolute count of every
+                # local pool so that completion carries what earlier nodes kept.
                 batch.episode_held = {
-                    rid: {key: pool.held(rid) for key, pool in active.items()} for rid in rids
+                    rid: {key: pool.held(rid) for key, pool in self._episode_pools.items()} for rid in rids
                 }
             if _LAZY_PUBLISH:
                 # Snapshot now, on the gpu thread, so the lengths are this

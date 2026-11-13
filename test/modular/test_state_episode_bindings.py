@@ -5,6 +5,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from mstar.conductor.episodes import EpisodeRecords
+from mstar.conductor.routing import Placement
 from mstar.engine.engine import Engine, ExecutingBatch
 from mstar.engine.resources.base import EngineResourceInfo
 from mstar.engine.resources.recurrent.dense_window import DenseWindowPool, DenseWindowSpec
@@ -588,6 +590,13 @@ def test_engine_binds_warm_episode_and_releases_it_only_on_explicit_end():
     first_batch = ExecutingBatch("decoder", {}, StepContext([11], "decode", 0, False))
     engine.finalize_batch(first_batch)
     assert first_batch.episode_held[11] == {"frames": 3}
+    terminal_batch = ExecutingBatch("action_head", {}, StepContext([11], "decode", 0, False))
+    engine.finalize_batch(terminal_batch)
+    assert terminal_batch.episode_held[11] == {"frames": 3}
+    records = EpisodeRecords()
+    records.admit("a", "request", 0, Placement({0: 0}, {}))
+    records.finish("a", "request", terminal_batch.episode_held[11])
+    assert records.view("a").held["frames"] == 3
     assert read(11, 2).shape[0] == 4
     second_batch = ExecutingBatch("decoder", {}, StepContext([11], "decode", 0, False))
     engine.finalize_batch(second_batch)
