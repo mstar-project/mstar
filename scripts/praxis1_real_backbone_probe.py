@@ -1,7 +1,8 @@
-"""Run the published DROID encoder and decoder on one small cold chunk.
+"""Run the published DROID encoder and decoder on one cold chunk.
 
 This is a bounded real-weight graph probe, not a serving or latency benchmark.
-The two-token video grid exercises all blocks while keeping attention small.
+The default two-token video grid keeps attention small; --grid-height 7 and
+--grid-width 26 exercise the published DROID token grid.
 The reference and port run sequentially so their weights do not coexist on GPU.
 """
 
@@ -40,7 +41,7 @@ def _eager_reference_attention(
     )
 
 
-def _inputs(config: Praxis1Config) -> tuple[torch.Tensor, ...]:
+def _inputs(config: Praxis1Config, height: int, width: int) -> tuple[torch.Tensor, ...]:
     generator = torch.Generator().manual_seed(109)
 
     def rand(*shape: int) -> torch.Tensor:
@@ -50,8 +51,8 @@ def _inputs(config: Praxis1Config) -> tuple[torch.Tensor, ...]:
 
     return (
         rand(1, 3, config.text_hidden_dim),
-        rand(1, config.latent_channels * 4, 1, 1, 2),
-        rand(1, config.latent_channels * 4, config.latents_per_chunk, 1, 2),
+        rand(1, config.latent_channels * 4, 1, height, width),
+        rand(1, config.latent_channels * 4, config.latents_per_chunk, height, width),
         torch.full((1, 1), 0.5, device="cuda", dtype=torch.bfloat16),
     )
 
@@ -97,14 +98,16 @@ def _run_native(
         load_component(getattr(backbone, name), root, f"backbone.{name}.", assign=True)
     backbone = backbone.eval().requires_grad_(False).to("cuda")
     text, anchor, noised, timestep = inputs
-    # Four register tokens, two anchor tokens, three text tokens, then the
-    # six noised frames with two spatial tokens each.
+    tokens_per_frame = anchor.shape[-2] * anchor.shape[-1]
+    # Four register tokens, one anchor grid, three text tokens, then six
+    # noised grids. The full DROID grid is 7x26 after VAE patchification.
     enc_mask = dense_chunk_causal_mask(
-        config.num_registers, 2, text.shape[1], config.latents_per_chunk * 2, 1, 0
+        config.num_registers, tokens_per_frame, text.shape[1],
+        config.latents_per_chunk * tokens_per_frame, 1, 0,
     ).to("cuda")
     dec_mask = visible(encoder_codes(
         config.num_registers, 0, 0,
-        config.latents_per_chunk * 2 * config.patch_size[1] * config.patch_size[2], 1, 0,
+        config.latents_per_chunk * tokens_per_frame * config.patch_size[1] * config.patch_size[2], 1, 0,
     )).to("cuda")
     started = time.perf_counter()
     with torch.inference_mode():
@@ -138,14 +141,17 @@ def main() -> None:
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--mstar-revision", required=True)
     parser.add_argument("--reference-revision", default="68f4d7a254b4bf41951d2e97f44b07f6cac2bf69")
+    parser.add_argument("--grid-height", type=int, default=1)
+    parser.add_argument("--grid-width", type=int, default=2)
     args = parser.parse_args()
     assert torch.cuda.is_available(), "this probe needs CUDA"
     root = args.checkpoint.resolve()
     config = Praxis1Config.from_checkpoint(root)
     assert config.embodiment == "single_arm", "this bounded probe expects DROID"
+    assert args.grid_height > 0 and args.grid_width > 0
     print(json.dumps({"phase": "source", "mstar_revision": args.mstar_revision,
                       "reference_revision": args.reference_revision, "checkpoint": str(root)}), flush=True)
-    inputs = _inputs(config)
+    inputs = _inputs(config, args.grid_height, args.grid_width)
     torch.cuda.reset_peak_memory_stats()
     expected_velocity, expected_tap = _run_reference(root, inputs)
     actual_velocity, actual_tap = _run_native(root, config, inputs)
