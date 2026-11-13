@@ -2468,7 +2468,11 @@ launch-bound at 9.2 s for 16 MP on a B300 against 0.45 s at 64, and the batched 
 bit-identical), ``vae_compile`` and ``text_cache_entries`` (the text node keeps the text rows
 of that many recent prompts and their references, keyed by a digest of the token ids and the
 vision tower's pixels, as SGLang's conditioning cache does: a repeat skips the 33B encoder and
-gets the same image; the configs keep 16, 0 turns it off); the attention backend is a resource setting
+gets the same image; the configs keep 16, 0 turns it off), ``capture_sizes`` (generated canvases whose
+text-to-image DiT step replays a CUDA graph, one per ``row_bucket`` of prompt rows up to
+``capture_text_rows``, default 512; the per-prompt layout is a step input, so one graph serves
+every prompt length of its bucket; edits, longer prompts and other sizes run eager; the SP2
+config captures 1024², 0.41 -> 0.39 s on 2 H200s, bit-identical); the attention backend is a resource setting
 (``resources: {dit_attn: {backend: sdpa}, refiner_attn: {backend: sdpa}}``). The
 configs: ``minimax_h3_image.yaml`` (2 GPUs, the DiT alone on one), ``minimax_h3_image_sp2.yaml``
 (the DiT Ulysses over 2 GPUs, the decoder in its SP group decoding half of the tiles per rank,

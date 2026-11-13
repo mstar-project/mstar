@@ -297,6 +297,13 @@ class H3StepLayout(NamedTuple):
     num_condition_rows: int   # keyframe rows, leading the video rows
     num_audio_rows: int
     num_pad_rows: int = 0
+    # Set where the prompt's length is not the step's to read (one captured graph per row
+    # bucket): the prompt arrives padded with zero rows to the bucket's capacity,
+    # ``row_source`` [S] picks each packed row from ``[prompt rows | video rows]`` (a padding
+    # row from a zero prompt row) and ``video_rows`` [Nv] are the video rows' packed rows.
+    # Video only; ``text_len`` and ``num_pad_rows`` then go unread.
+    row_source: torch.Tensor | None = None
+    video_rows: torch.Tensor | None = None
 
     @property
     def num_rows(self) -> int:
@@ -367,6 +374,15 @@ class H3DiT(nn.Module):
             pieces.append(inputs.text.new_zeros(inputs.text.shape[0], p1 - p0, inputs.text.shape[2]))
         return torch.cat(pieces, dim=1)
 
+    def sourced_rows(self, inputs: H3Inputs, layout: H3StepLayout, start: int, count: int) -> torch.Tensor:
+        """:meth:`packed_rows` by ``layout.row_source``: every video row projected (a row's projection
+        is the same whichever rows run with it), then the range's rows picked."""
+        if layout.num_audio_rows:
+            raise ValueError("a layout of row sources holds no audio rows")
+        linear = self.video_patch_proj
+        video = linear(inputs.video.to(linear.weight.dtype)).to(inputs.text.dtype)
+        return torch.cat([inputs.text, video], dim=1).index_select(1, layout.row_source.narrow(0, start, count))
+
     def forward(
         self, inputs: H3Inputs, layout: H3StepLayout, row_class: torch.Tensor | None = None, shard=None,
         head: torch.Tensor | None = None,
@@ -384,7 +400,10 @@ class H3DiT(nn.Module):
         cond, pad = layout.num_condition_rows, layout.num_pad_rows
         split = None if shard is None else split_range(shard)
         start, count = (0, layout.num_rows) if split is None else (split.start, split.count)
-        x = self.packed_rows(inputs, layout, start, count)
+        if layout.row_source is None:
+            x = self.packed_rows(inputs, layout, start, count)
+        else:
+            x = self.sourced_rows(inputs, layout, start, count)
         rope, row_index = layout.rope, layout.row_index
         if row_class is not None:
             row_class = torch.cat([row_class, row_class.new_zeros(pad)])
@@ -406,6 +425,8 @@ class H3DiT(nn.Module):
         out = video_out if final.audio_out is None else torch.cat([video_out, final.audio_out(h)], dim=-1)
         if split is not None:
             out = gather(shard, out, dim=1)
+        if layout.video_rows is not None:
+            return out.index_select(1, layout.video_rows), None
         text, audio_rows, end = layout.text_len, layout.num_audio_rows, layout.num_rows - pad
         patch_dim = self.cfg.patch_dim
         if final.audio_out is None:

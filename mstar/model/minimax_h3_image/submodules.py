@@ -13,6 +13,7 @@ against diffusers' pipeline.
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 
 import torch
@@ -143,7 +144,13 @@ class H3ImageDenoiseSubmodule(H3PackedDenoise):
     """One step of the fixed six-step grid over H3's packed DiT, with the step's head. The
     loop carries the image rows, reference rows first, fp32; only the generated rows are
     stepped. The references arrive as noise (seed_loop_back), are noised to t = 0.999 on the
-    first step and carried unchanged after."""
+    first step and carried unchanged after.
+
+    The step's layout travels as inputs (``LAYOUT_FROM_INPUTS``), so the prompts of one row
+    bucket share a captured graph (:meth:`graph_key`): ``capture_buckets`` lists text-to-image
+    graph keys. An edit's first step differs from the rest on the host, so edits run eager."""
+
+    LAYOUT_FROM_INPUTS = True
 
     STEP_SCALARS = {
         "sigma": StepScalar("sigmas"),
@@ -155,9 +162,17 @@ class H3ImageDenoiseSubmodule(H3PackedDenoise):
 
     def __init__(self, transformer: nn.Module, config: H3ImageConfig, **kwargs):
         super().__init__(transformer, config, **kwargs)
+        edits = [key for _, key in self.capture_buckets if key.references]
+        if edits:
+            raise ValueError(f"MiniMax-H3-Image captures text-to-image steps only; got edit buckets {edits}")
 
     def bucket_key_for(self, fwd_info: CurrentForwardPassInfo) -> H3ImageLayout:
         return layout_from_metadata(fwd_info.step_metadata)
+
+    def graph_key(self, bucket_key: H3ImageLayout) -> H3ImageLayout:
+        # the key at the longest prompt its row bucket holds; the prompt's vision spans are in its tags
+        capacity = self.padded_rows(bucket_key) - bucket_key.total_rows + bucket_key.text_len
+        return dataclasses.replace(bucket_key, text_len=capacity, text_image_spans=())
 
     def schedule_settings(self, fwd_info: CurrentForwardPassInfo) -> None:
         return None  # the checkpoint's fixed grid
@@ -184,7 +199,10 @@ class H3ImageDenoiseSubmodule(H3PackedDenoise):
 
     def request_inputs(self, fwd_info, inputs: NameToTensorList, bucket_key: H3ImageLayout) -> dict[str, torch.Tensor]:
         # host-side, so whether this is the first step is known without a sync
-        tensors = {TEXT_EMBEDS: inputs[TEXT_EMBEDS][0], FIRST_STEP: torch.tensor(self.step_index(fwd_info) == 0)}
+        text = inputs[TEXT_EMBEDS][0]
+        tensors = {TEXT_EMBEDS: self.padded_prompt(text, bucket_key),
+                   FIRST_STEP: torch.tensor(self.step_index(fwd_info) == 0),
+                   **self.layout_inputs(bucket_key, text.device)}
         if bucket_key.num_condition_rows:
             tensors[COND_LATENTS] = inputs[COND_LATENTS][0]
         return tensors
@@ -197,6 +215,7 @@ class H3ImageDenoiseSubmodule(H3PackedDenoise):
             TEXT_EMBEDS: torch.zeros(bucket_key.text_len, cfg.hidden_size, dtype=self.transformer.dtype,
                                      device=device),
             FIRST_STEP: torch.tensor(False),
+            **self.layout_inputs(bucket_key, device),
             **({COND_LATENTS: torch.zeros(bucket_key.num_condition_rows, cfg.patch_dim, device=device)}
                if bucket_key.num_condition_rows else {}),
         }
@@ -207,7 +226,7 @@ class H3ImageDenoiseSubmodule(H3PackedDenoise):
 
     def denoise(self, engine_inputs, bucket_key: H3ImageLayout, latents, timestep, sigma, sigma_next,
                 reference_timestep, head, text_embeds, first_step, cond_latents=None, **cond):
-        layout = self.layout(bucket_key, latents.device)
+        layout = self.staged_layout(bucket_key, cond, latents.device)
         n = layout.num_condition_rows
         if n and bool(first_step.all()):  # a CPU tensor: no sync
             t = torch.full((), REFERENCE_NOISE_AUG, dtype=torch.float32, device=latents.device)
