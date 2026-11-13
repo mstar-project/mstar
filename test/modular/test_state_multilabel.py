@@ -593,6 +593,23 @@ def test_two_streams_of_a_request_need_the_pages_of_both(monkeypatch):
                            request_layouts={"t3_kv": dict.fromkeys(LABELS, stream)})
 
 
+def test_a_placed_pool_counts_the_ranks_of_the_node_groups_that_run_its_nodes(monkeypatch):
+    """A pool placed by position over 2 SP ranks pages its window layer in half pages, so a request holds 8 full and
+    16 window pages rather than 8 and 8. The check hands the pool the ranks of the node groups that run its nodes,
+    so SP ranks under another node leave its count alone."""
+    pool = PagedKVConfig(num_layers=2, num_kv_heads=1, head_dim=8, max_seq_len=64, max_num_pages=20, page_size=8,
+                         context_parallel=True)
+    pool.keep_window(8, (1,))
+    monkeypatch.setattr("mstar.model.base.serving_resources",
+                        lambda model, config: [KVSpec(resource_key="kv", nodes={"llm"}, config=pool)])
+    split = {"ranks": [0, 1], "sp_size": 2}
+    config = {"max_concurrent_requests": 2, "node_groups": [{"node_names": ["llm"]}, {"node_names": ["vae"], **split}]}
+    check_kv_pools_fit(None, config, "cfg.yaml", logging.getLogger(__name__))
+    config["node_groups"] = [{"node_names": ["llm"], **split}]
+    with pytest.raises(ValueError, match=r"need 25 pages of resources.kv \(12 per request and the sink page\)"):
+        check_kv_pools_fit(None, config, "cfg.yaml", logging.getLogger(__name__))
+
+
 def test_at_last_token_over_every_row_of_one_label_takes_a_row_that_pads_the_step():
     """A padded step lists each row that pads it at span 0, and a call over every row returns what the plan selects
     for it, which nothing reads."""
