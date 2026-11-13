@@ -160,16 +160,18 @@ def test_only_the_spoken_decode_streams_to_the_vocoder_in_the_reference_clients_
     (connection,) = model.get_partition_topology().connections
     policy = connection.chunk_policy_factory()
     assert connection.edge_name == SPEECH_IDS and isinstance(policy, SlidingWindowChunkPolicy)
+    assert connection.by_value
     assert (policy.window_size(), policy.next_chunk_size(28)) == (28, 25)
     assert model.get_combined_graph_walks() == {"LLM": {DECODE_MIXED: {DECODE, DECODE_SPOKEN}}}
 
 
-def test_a_text_decode_loops_back_on_the_device_and_a_spoken_ones_ids_go_through_the_host():
+def test_both_decodes_loop_back_on_the_device_and_a_spoken_ones_ids_go_by_value():
     llm = an_llm()
-    assert llm.device_loopback_signals(DECODE) == {"text_inputs"}
-    assert llm.device_loopback_signals(DECODE_SPOKEN) == frozenset()
     for walk in (DECODE, DECODE_SPOKEN):
-        assert llm.inline_signals(walk) == {"text_inputs": "new_token"}
+        assert llm.device_loopback_signals(walk) == {"text_inputs"}
+    assert llm.inline_signals(DECODE) == {"text_inputs": "new_token"}
+    # one buffer, so the step's inline column carries both
+    assert llm.inline_signals(DECODE_SPOKEN) == {SPEECH_IDS: "new_token", "text_inputs": "new_token"}
 
 
 # --- stop and withhold -----------------------------------------------------------------------
@@ -282,9 +284,9 @@ def test_the_tower_steps_each_clip_as_a_key_prefix_segment_laid_out_against_its_
     tower = AudioEncoderSubmodule(torch.nn.Identity(), a_config())
     requests = {"a": [2502, 225], "b": [380]}
     inputs = [
-        tower.prepare_inputs(PREFILL_AUDIO, SimpleNamespace(step_metadata={AUDIO_MEL_FRAMES: frames}),
+        tower.prepare_inputs(PREFILL_AUDIO, SimpleNamespace(step_metadata={AUDIO_MEL_FRAMES: frames}, rid_handle=rid),
                              {AUDIO_MELS: [torch.zeros(128, sum(frames))]})
-        for frames in requests.values()
+        for rid, frames in requests.items()
     ]
     step = tower.declare_step(PREFILL_AUDIO, list(requests), inputs).steps[AUDIO_ATTN]
     want = [(rid, c) for rid, frames in requests.items() for c in request_layout(frames)]
@@ -292,6 +294,86 @@ def test_the_tower_steps_each_clip_as_a_key_prefix_segment_laid_out_against_its_
     assert step.key_lens == tuple(c.key_len for _, c in want)
     # the short clip is laid out against its own request's longest, not the other request's
     assert want[1][1] != request_layout([225])[0] and want[2][1] == request_layout([380])[0]
+
+
+def test_a_leased_tower_step_leaves_attention_to_the_block_loop_which_reads_the_clips_key_lens():
+    """Leased, the captured block loop declares the request's attention itself: each clip a
+    segment attending its valid keys, as the eager step does. Its capture's padding row,
+    which no request owns, attends all of its frames."""
+    from mstar.model.step_audio2.components.audio import request_layout
+    from mstar.model.step_audio2.submodules import AUDIO_BLOCK_LOOP, AudioEncoderSubmodule
+
+    tower = AudioEncoderSubmodule(torch.nn.Identity(), a_config())
+    frames = [2502, 225]
+    info = SimpleNamespace(step_metadata={AUDIO_MEL_FRAMES: frames}, rid_handle=7)
+    inp = tower.prepare_inputs(PREFILL_AUDIO, info, {AUDIO_MELS: [torch.zeros(128, sum(frames))]})
+    assert tower.declare_step(PREFILL_AUDIO, [7], [inp], piecewise_leases={AUDIO_BLOCK_LOOP: object()}) is None
+    region = tower.get_piecewise_accelerator_graph_configs(torch.device("cpu"), torch.float32)[AUDIO_BLOCK_LOOP]
+    layout = request_layout(frames)
+    step = region.region_step([7], [c.frames for c in layout]).steps[AUDIO_ATTN]
+    eager = tower.declare_step(PREFILL_AUDIO, [7], [inp]).steps[AUDIO_ATTN]
+    assert step.segments == eager.segments and step.key_lens == eager.key_lens
+    assert step.key_lens == tuple(c.key_len for c in layout) != tuple(c.frames for c in layout)
+    pad = region.region_step([-1], [512]).steps[AUDIO_ATTN]
+    assert pad.key_lens == (512,)
+
+
+def test_the_towers_block_loop_leases_within_the_resources_segment_limit():
+    """A replay's plan holds the attention resource's ``max_segments_per_request`` clips, as
+    configured: a request with more gets no lease and runs eagerly."""
+    from mstar.model.step_audio2.submodules import AUDIO_BLOCK_LOOP, AudioEncoderSubmodule
+    from mstar.model.submodule_base import NodeInputs
+
+    tower = AudioEncoderSubmodule(torch.nn.Identity(), a_config())
+    tower.bind_node_resources({AUDIO_ATTN: SimpleNamespace(max_segments_per_request=2)})
+    region = tower.get_piecewise_accelerator_graph_configs(torch.device("cpu"), torch.float32)[AUDIO_BLOCK_LOOP]
+
+    def request(clips):
+        return [NodeInputs(input_seq_len=100 * clips, kwargs={"layout": [None] * clips})]
+
+    assert region.can_lease(request(2)) and not region.can_lease(request(3))
+    assert tower.max_batch_size(PREFILL_AUDIO) == 1
+
+
+def test_every_decode_walk_replays_the_decode_capture_and_both_prefills_the_prefill_capture():
+    from mstar.engine.accelerator_graph_config import BatchedAcceleratorGraphConfig, PackedAcceleratorGraphConfig
+
+    decode, prefill = an_llm().get_accelerator_graph_configs(torch.device("cpu"))
+    assert isinstance(decode, BatchedAcceleratorGraphConfig) and isinstance(prefill, PackedAcceleratorGraphConfig)
+    assert {decode.capture_graph_walk, *decode.replay_graph_walks} == {DECODE, DECODE_SPOKEN, DECODE_MIXED}
+    assert {prefill.capture_graph_walk, *prefill.replay_graph_walks} == {PREFILL_TEXT, PREFILL_AUDIO}
+
+
+def test_a_prefill_batch_is_embedded_with_each_rows_tower_rows_at_its_placeholders():
+    """The prefill capture takes embeddings: ``preprocess`` splices each audio row's tower
+    output in at its placeholders, rows in order, beside a text row; a decode takes ids."""
+    from mstar.model.step_audio2.submodules import LLMSubmodule
+    from mstar.model.submodule_base import ARNodeInputs
+
+    class Embed(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed_tokens = torch.nn.Embedding(AUDIO_PATCH + 1, 4)
+
+        def embed(self, ids):
+            return self.embed_tokens(ids)
+
+    llm = LLMSubmodule(Embed(), a_config())
+    a = torch.tensor([1, AUDIO_PATCH, AUDIO_PATCH, 2])
+    b = torch.tensor([3, 4])
+    c = torch.tensor([AUDIO_PATCH, 5])
+    rows_a, rows_c = torch.randn(2, 4), torch.randn(1, 4)
+    inputs = [
+        ARNodeInputs(input_seq_len=4, input_ids=a, tensor_inputs={AUDIO_EMBEDS: rows_a}),
+        ARNodeInputs(input_seq_len=2, input_ids=b),
+        ARNodeInputs(input_seq_len=2, input_ids=c, tensor_inputs={AUDIO_EMBEDS: rows_c}),
+    ]
+    with torch.no_grad():
+        got = llm.preprocess(PREFILL_AUDIO, None, inputs)["input_embeds"]
+        want = llm.model.embed(torch.cat([a, b, c]))
+    want[1:3], want[6:7] = rows_a, rows_c
+    assert torch.equal(got, want)
+    assert set(llm.preprocess(DECODE_SPOKEN, None, [ARNodeInputs(input_seq_len=1, input_ids=b[:1])])) == {"input_ids"}
 
 
 # --- the vocoder's stream --------------------------------------------------------------------
@@ -631,3 +713,7 @@ def test_the_clients_text_leaves_out_speech_ids_and_special_tokens(tmp_path, tok
     assert detok.to_bytes(reply) == b"The Great Wall"
     assert b"".join(detok.token_bytes(t) for t in reply) == b"The Great Wall"
     assert set(model.text_output().stop_token_ids) == {EOT, TTS_END, ENDOFTEXT}
+
+
+def test_both_decodes_run_off_the_resident_tables():
+    assert an_llm().resident_walks() == {DECODE, DECODE_SPOKEN}

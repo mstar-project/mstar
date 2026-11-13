@@ -382,6 +382,8 @@ class StepAudio2Model(Model):
                 # the reference client's windows: 25 new codes and the 3 the flow looks
                 # ahead to, then whatever is left once the reply ends
                 chunk_policy_factory=lambda: SlidingWindowChunkPolicy(window=WINDOW, stride=HOP),
+                # one speech id an item, which the vocoder takes as a CPU window
+                by_value=True,
             )],
         )
 

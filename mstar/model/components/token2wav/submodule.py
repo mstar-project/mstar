@@ -167,19 +167,22 @@ class Token2WavSubmodule(NodeSubmodule):
             # stream's one chunk is final and empty. It still runs, voicing nothing,
             # as the empty step below does.
             return NodeInputs(tensor_inputs={"codes": torch.zeros(1, 0, dtype=torch.int32)}, kwargs={"last": True})
-        # A window whose codes all came inline is already a CPU tensor, so this copies
-        # nothing. A window holding a stored item (a row that ran no forward on its
-        # step) is on the device, and this is a host sync. The codes are needed on the
-        # host either way: a window's length decides its capture and its cache writes.
-        # Filtering the stop code on the device would need check_stop to filter outputs
-        # (an engine change), and would still leave the length on the device.
-        codes = inputs[self.keys.codes][0].reshape(-1).to("cpu", torch.int32)
-        # The TTS's stop code is streamed before its stop is seen. It is not speech, and
-        # it ends the speech: the window holding it is the last, as upstream's stream
-        # ends there.
+        codes = inputs[self.keys.codes][0].reshape(-1)
         if self.eos_code is None:
+            # Nothing to filter, and the window's length (which decides its capture and
+            # its cache writes) is its shape: no host copy here. A by-value window is
+            # already on the host; one holding a stored item stays on the device.
+            codes = codes.to(torch.int32)
             last = is_final_stream_chunk
         else:
+            # The TTS's stop code is streamed before its stop is seen. It is not speech,
+            # and it ends the speech: the window holding it is the last, as upstream's
+            # stream ends there. A window whose codes all came inline is already a CPU
+            # tensor, so this reads no device memory; one holding a stored item (a row
+            # that ran no forward on its step) is on the device, and this is a host sync.
+            # Filtering the stop code on the device would need check_stop to filter
+            # outputs (an engine change), and would leave the length on the device.
+            codes = codes.to("cpu", torch.int32)
             last = is_final_stream_chunk or bool((codes == self.eos_code).any())
             codes = codes[codes != self.eos_code]
         chunk = input_metadata.stream_chunks[self.keys.codes]
@@ -197,7 +200,8 @@ class Token2WavSubmodule(NodeSubmodule):
             state.add("last_window", chunk.start_offset)
         first = chunk.start_offset == 0
         if first:
-            codes = torch.cat([self._lead_silence, codes])
+            if self._lead_silence.numel():
+                codes = torch.cat([self._lead_silence.to(codes.device), codes])
             state.add("voice", fwd_info.step_metadata.get(self.keys.voice))
             # HiFT's excitation, window by window from the request's seed
             state.add("noise", torch.Generator(self.get_device()).manual_seed(fwd_info.random_seed))
