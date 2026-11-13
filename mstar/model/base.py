@@ -1,3 +1,4 @@
+import enum
 import functools
 import itertools
 import math
@@ -142,7 +143,7 @@ if TYPE_CHECKING:
     from mstar.model.components.moe_parallel import MoeParallelConfig
 
 if TYPE_CHECKING:
-    from mstar.engine.state import Array, Sampler, SampleSettings
+    from mstar.engine.state import Array, Sampler, SampleSettings, SeqShard
     from mstar.engine.state.adapters import StateSetup
     from mstar.worker.scheduling_policy import WalkPriority
 
@@ -165,15 +166,30 @@ class RobotIO(NamedTuple):
     action_dim: int
 
 
+class KeepAdapter(enum.Enum):
+    """``ProcessPromptOutput.lora_adapter`` left unset."""
+    KEEP = "keep"
+
+
+# the request runs on the adapter its client named, or on the base model
+KEEP_ADAPTER = KeepAdapter.KEEP
+
+
 class ProcessPromptOutput(NamedTuple):
     """Tensors from `process_prompt`, and metadata to carry beside them.
 
     The data worker folds ``metadata`` into the request's ``model_kwargs``, so
     what a model settles while tokenizing reaches
     `get_request_resource_configs` without a field of its own on the request.
+
+    ``lora_adapter`` is the LoRA adapter the model runs this prompt on, one of
+    ``Model.prompt_lora_adapters``, or None for the base model; the data worker
+    gives the request what the API server gives a client that names it
+    (``ServedModels.model_chose``). Unset keeps the client's choice.
     """
     new_input_tensors: NameToTensorList
     metadata: dict
+    lora_adapter: str | None | KeepAdapter = KEEP_ADAPTER
 
 
 class ClientChunk(NamedTuple):
@@ -789,7 +805,7 @@ class Model(ABC):
         """
         return []
 
-    def declare_state(self) -> "list[Array | Sampler]":
+    def declare_state(self) -> "list[Array | Sampler | SeqShard]":
         """The state the model keeps between steps, from which the engine builds the specs for it.
 
         A pure function of the model's config and the deployment's settings, since each process calls it.
@@ -1070,6 +1086,12 @@ class Model(ABC):
         that splits ``text_inputs`` around its attachments adds theirs."""
         return sum(ids.numel() for ids in tensors.get("text_inputs", ()))
 
+    def prompt_lora_adapters(self) -> frozenset[str]:
+        """The LoRA adapters ``process_prompt`` may run a prompt on
+        (``ProcessPromptOutput.lora_adapter``). The API server refuses, at startup, a
+        deployment whose ``resources: lora: adapters:`` block does not serve them all."""
+        return frozenset()
+
     def max_input_files(self) -> dict[str, int]:
         """Most files of each input modality one request may attach, e.g.
         ``{"audio": 1}``. The data worker refuses a request over it before
@@ -1224,7 +1246,7 @@ class Model(ABC):
     @abstractmethod
     def get_submodule(
         self, node_name: str, device="cpu", tp_group=None,
-        autocast_dtype: torch.dtype | None = None, sp_group=None,
+        autocast_dtype: torch.dtype | None = None,
         moe_parallel: "MoeParallelConfig | None" = None, cfg_group=None,
     ) -> torch.nn.Module | None:
         """Return the nn.Module for this node, or None for dummy mode.
@@ -1234,12 +1256,6 @@ class Model(ABC):
         Models that support tensor parallelism should forward it to
         parallel-linear constructors so weight shapes are partitioned at
         init time and the weight loaders shard correctly.
-
-        ``sp_group`` is the node's sequence-parallel comm group, orthogonal
-        to ``tp_group``. The engine manager only passes it when the node
-        participates in a non-trivial SP group, so models without SP support
-        never receive it. Models that support SP forward it to their
-        attention so it can all-to-all the sequence around the kernel.
 
         ``cfg_group`` is the node's classifier-free-guidance comm group, for
         a node in ``cfg_enabled_nodes`` whose group sets ``cfg_size > 1``

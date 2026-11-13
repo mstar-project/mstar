@@ -22,12 +22,13 @@ same batch.  A fixed-pipeline port has to pick one value for the whole server.
 import logging
 import math
 import os
+from typing import Any
 
 import numpy as np
 import torch
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.engine.resources import NodeResourceSpec, RaggedAttentionConfig, RaggedAttentionSpec
+from mstar.engine.state import Array, Attend, Block, Entry, Read, TensorType
 from mstar.graph.base import (
     GraphEdge,
     GraphNode,
@@ -52,6 +53,7 @@ from mstar.model.omnivoice.components.text import (
 from mstar.model.omnivoice.config import OmniVoiceConfig
 from mstar.model.omnivoice.submodules import (
     BACKBONE_ATTN,
+    BACKBONE_TOKENS,
     TARGET_LEN,
     UNMASK_LOOP_NAME,
     OmniVoiceBackboneSubmodule,
@@ -191,32 +193,26 @@ class OmniVoiceModel(Model):
     # Model ABC: structure
     # ------------------------------------------------------------------
 
-    def get_node_resources(self) -> list[NodeResourceSpec]:
-        """The backbone's ragged attention; nothing else, since every node
-        here is stateless.
+    def declare_state(self) -> list[Array]:
+        """The backbone's tokens within one unmask step; nothing else, since every node here is stateless.
 
         There is deliberately no KV cache.  The canvas is rewritten each
         iteration and attention is bidirectional, so the prefix attends *into*
         the region that changed and its hidden states change with it — nothing
-        computed at step k is valid at step k+1.  Sampling is not a sampler
-        resource either: the reveal picks cells by confidence rank across the
+        computed at step k is valid at step k+1.  Sampling is not a declared
+        sampler either: the reveal picks cells by confidence rank across the
         whole canvas rather than drawing one token per position.
         """
         body = self.config.backbone
-        return [
-            RaggedAttentionSpec(
-                resource_key=BACKBONE_ATTN,
-                nodes={"backbone"},
-                config=RaggedAttentionConfig(
-                    num_qo_heads=body.num_attention_heads,
-                    num_kv_heads=body.num_key_value_heads,
-                    head_dim=body.head_dim,
-                    # the conditional and unconditional documents
-                    max_segments_per_request=2,
-                    dtype=getattr(torch, self.config.load_dtype),
-                ),
-            )
-        ]
+        t = TensorType((body.num_key_value_heads, body.head_dim), dtype=getattr(torch, self.config.load_dtype), shard=0)
+        return [Array(
+            BACKBONE_TOKENS, nodes={"backbone"}, layers=frozenset(range(body.num_hidden_layers)),
+            entry=Entry({"k": t, "v": t}), max_len=0,
+            reads={BACKBONE_ATTN: Read(mask=Block(), op=Attend(q_heads=body.num_attention_heads))},
+        )]
+
+    def kernel_settings(self) -> dict[str, dict[str, Any]]:
+        return {BACKBONE_ATTN: {"max_segments_per_request": 2}}  # the conditional and unconditional documents
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         encode_reference = GraphNode(
@@ -637,9 +633,8 @@ class OmniVoiceModel(Model):
         device: str = "cpu",
         tp_group=None,
         autocast_dtype: torch.dtype | None = None,
-        sp_group=None,
     ) -> NodeSubmodule | None:
-        # tp_group / sp_group / autocast_dtype exist for interface parity:
+        # tp_group / autocast_dtype exist for interface parity:
         # OmniVoice declares no sharded nodes, and the weights load in the
         # checkpoint's own dtypes.
         if node_name in self._submodule_cache:

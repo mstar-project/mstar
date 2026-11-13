@@ -18,16 +18,19 @@ import pytest
 
 PORTED = (
     "mstar/model/qwen3_5", "mstar/model/command_a_plus", "mstar/model/wan22", "mstar/model/flux2_klein",
-    "mstar/model/z_image", "mstar/model/ltx2_5", "mstar/model/qwen3_omni", "mstar/model/minimax_h3", "mstar/model/pi05",
-    "mstar/model/vjepa2", "mstar/model/canary", "mstar/model/components/encoder_decoder.py",
+    "mstar/model/z_image", "mstar/model/ltx2_5", "mstar/model/qwen3_omni", "mstar/model/minimax_h3",
+    "mstar/model/kokoro", "mstar/model/omnilingual_asr", "mstar/model/omnivoice", "mstar/model/orpheus",
+    "mstar/model/voxcpm2",
     "mstar/model/canary_qwen", "mstar/model/qwen3_asr", "mstar/model/parakeet", "mstar/model/fish_s2_pro",
-    "mstar/model/qwen3_tts", "mstar/model/bagel", "mstar/model/chatterbox", "mstar/model/whisper",
+    "mstar/model/qwen3_tts",
+    "mstar/model/pi05", "mstar/model/vjepa2", "mstar/model/canary", "mstar/model/components/encoder_decoder.py",
+    "mstar/model/bagel", "mstar/model/chatterbox", "mstar/model/whisper",
     "mstar/model/waypoint", "mstar/model/lingbot_world",
 )
 FORBIDDEN_ATTRIBUTES = {
-    "node_resources", "resources", "request_state", "request_states", "per_request_states",
+    "node_resources", "resources", "request_state", "request_states", "per_request_states", "sequence_shard",
     # what a handle holds
-    "resource", "positions", "reads", "first_read", "_kv", "_attn", "_pool", "_runners", "_views", "_blocks",
+    "resource", "positions", "reads", "first_read", "_kv", "_attn", "_cross", "_pool", "_runners", "_views", "_blocks",
     "_bindings", "_layouts", "_update",
 }
 
@@ -47,7 +50,13 @@ ALLOWED = {
         "the page a model's `max_num_pages` counts in, where its pool is sized per request by a layout",
     ("mstar.engine.resources.lora.checkpoint", "LoraFile"): "a model's static LoRA merge at load, which holds no state",
     ("mstar.engine.resources.lora", "LoraSpec"): "the opt-in LoRA spec, written by hand: the contract declares no LoRA",
+    ("mstar.engine.resources", "SeqShardSpec"): (
+        "MiniMax-H3's video decoder's sequence shard, written by hand: a contract SeqShard brackets a label an array "
+        "opens, and the decoder has no arrays"
+    ),
 }
+# Where an allowed import may stand: the one file whose text says why. Any other ported file importing it fails.
+ALLOWED_ONLY_IN = {("mstar.engine.resources", "SeqShardSpec"): "mstar/model/minimax_h3/minimax_h3_model.py"}
 # Exceptions for one file, by file, module and name, which a later port of the same kind mustn't inherit.
 ALLOWED_IN: dict[tuple[str, str, str], str] = {
     ("mstar/model/bagel/bagel_model.py", "mstar.engine.resources", "KVReqConfig"):
@@ -63,18 +72,25 @@ ALLOWED_IN: dict[tuple[str, str, str], str] = {
 # Exceptions each scoped to one function and one attribute, by file, the function's qualified name in that file, and
 # the attribute: a graph break (`disable`) or a forbidden read the function may keep.
 ALLOWED_IN_FUNCTION = {
+    ("mstar/model/minimax_h3/submodules.py", "H3VideoDecoderSubmodule.declare_step", "sequence_shard"):
+        "the video decoder's hand-written sequence shard, which a contract SeqShard can't declare (no arrays)",
+    ("mstar/model/minimax_h3/submodules.py", "H3VideoDecoderSubmodule.run_batch", "sequence_shard"):
+        "the same hand-written shard",
     ("mstar/model/qwen3_omni/components/code2wav.py", "Qwen3OmniMoeCode2WavTransformerModel.forward", "disable"):
         "the vocoder's transformer, which keeps no state",
     ("mstar/model/qwen3_tts/components/depth_frame/frame.py", "DepthFrame.run", "disable"):
         "the depth kernel's Gluon launch, which a compiled decode can't trace; no state call sits behind it",
     ("mstar/model/qwen3_tts/submodules.py", "CodecSubmodule.batch_postprocess", "request_state"):
-        "the opt-in watermark's per-stream state, until it moves to a watermark node's plain Value (the "
-        "watermark-node issue)",
+        "the opt-in watermark's per-stream state, until it moves to a watermark node's plain Value (issue #1447)",
+    ("mstar/model/wan22/components/dit.py", "_token_runs", "disable"):
+        "the timestep runs of a rank's share of the tokens, read off the shard's range outside the DiT's guards",
     ("mstar/model/bagel/components/vit_encoder.py", "BagelViTAttention.attend", "disable"):
         "the ViT's eager varlen attention, flash-attn or a masked SDPA, which keeps no state",
     ("mstar/model/bagel/submodules.py", "ViTEncoderSubmodule._replay_block_loop", "disable"):
         "the ViT region's replay, which runs its captured graph; no state call sits behind it",
 }
+# what a module defines to be handed the node's built resources, rather than its handles (`bind_state`)
+RESOURCE_BINDS = {"bind_resources", "bind_node_resources"}
 
 
 def _in_functions(node: ast.AST, prefix: str = "", function: str | None = None):
@@ -106,12 +122,16 @@ def _violations(source: str, path: str = "") -> tuple[list[str], set[tuple[str, 
                 continue
             for alias in node.names:
                 key = (node.module, alias.name)
-                if key in ALLOWED or (path, *key) in ALLOWED_IN:
-                    used.add(key if key in ALLOWED else (path, *key))
+                if key in ALLOWED and ALLOWED_ONLY_IN.get(key, path) == path:
+                    used.add(key)
+                elif (path, *key) in ALLOWED_IN:
+                    used.add((path, *key))
                 else:
                     found.append(f"from {node.module} import {alias.name}")
         elif isinstance(node, ast.Import):
             found += [f"import {a.name}" for a in node.names if a.name.startswith("mstar.engine")]
+        elif isinstance(node, ast.FunctionDef) and node.name in RESOURCE_BINDS:
+            found.append(f"def {node.name} at line {node.lineno}, which takes the built resources")
         elif isinstance(node, ast.Attribute) and node.attr in FORBIDDEN_ATTRIBUTES:
             found.append(f".{node.attr} at line {node.lineno}")
         elif breaks:
@@ -162,17 +182,26 @@ def test_an_exception_for_one_file_refuses_the_import_in_another(monkeypatch):
     ("def f(e): return e.resources['kv']", ".resources"),
     ("def f(self): return self.node_resources['kv']", ".node_resources"),
     ("def f(self, rid): return self.request_state(rid)", ".request_state"),
+    ("def f(self): return self.request_states", ".request_states"),
     ("def f(e): return e.per_request_states", ".per_request_states"),
     ("def f(self): return self.sampler.resource", ".resource"),
     ("def f(self): return self.kv.positions", ".positions"),
     ("def f(self): return self.kv._kv", "._kv"),
+    ("def f(self): return self.sequence_shard.split_range('x')", ".sequence_shard"),
     ("def f(self): return self.kv.first_read", ".first_read"),
     ("def f(self): return self.kv.reads['attn']", ".reads"),
     ("@torch.compiler.disable\ndef f(): pass", "torch.compiler.disable"),
+    ("class M:\n    def bind_resources(self, resources): pass", "def bind_resources"),
 ])
 def test_the_lint_catches_each_way_past_the_contract(source, expected):
     found, _ = _violations(source)
     assert len(found) == 1 and expected in found[0], found
+
+
+def test_an_allowed_import_stands_only_in_the_file_that_needs_it():
+    source = "from mstar.engine.resources import SeqShardSpec"
+    assert _violations(source, "mstar/model/minimax_h3/minimax_h3_model.py")[0] == []
+    assert len(_violations(source, "mstar/model/wan22/wan22_model.py")[0]) == 1
 
 
 def test_the_lint_passes_the_contract_itself():
@@ -212,6 +241,10 @@ _WATERMARK = (_TTS, "CodecSubmodule.batch_postprocess", "request_state")
 def test_an_exception_covers_only_its_own_functions_attribute(path, source, found, used):
     """A key skips only its attribute, anywhere in its function, and is used only when it skips one."""
     assert _violations(source, path) == (found, used)
+
+
+def test_the_lint_reads_the_five_speech_packages():
+    assert {path.parts[2] for path in _sources()} >= {"kokoro", "omnilingual_asr", "omnivoice", "orpheus", "voxcpm2"}
 
 
 def test_the_lint_reads_all_five_reference_packages():

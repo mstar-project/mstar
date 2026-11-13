@@ -173,7 +173,9 @@ class _BagelPool:
                 positions = torch.zeros(count, dtype=torch.int32)
                 inputs[-1].custom_pos_ids = dict.fromkeys(("main", "cfg_text", "cfg_img"), positions)
         kv_step = _kv_step(self.llm, walk, list(rows), inputs, per_request_info={})
-        submodule_step = SubmoduleStep(steps={"kv": kv_step}, segments=list(kv_step.segments))
+        submodule_step = SubmoduleStep(
+            steps={"kv": kv_step}, segments=list(kv_step.segments), combined_labels=kv_step.combined_labels,
+        )
         submodule_step.set_ctx(StepContext(request_ids=tuple(rows), graph_walk=walk, slot=0, capture=False))
         assert self.runner.admit(submodule_step).outcome.ok
         self.runner.plan(submodule_step)

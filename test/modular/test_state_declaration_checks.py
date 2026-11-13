@@ -34,6 +34,7 @@ from mstar.engine.state import (
     Read,
     Rope,
     Sampler,
+    SeqShard,
     TensorType,
     Value,
     Window,
@@ -214,6 +215,31 @@ def _gdn_entry() -> Entry:
 def test_a_sampler_may_not_reuse_a_declared_name():
     problem = _one_problem(_array(reads={"r": _read()}), Sampler("r", nodes={"LLM"}, vocab_size=8))
     assert problem.startswith("Sampler 'r'.name") and "declared twice" in problem
+
+
+@pytest.mark.parametrize("shard, problem", [
+    (dict(walks={"mixed"}), "SeqShard 'shard'.walks: 'mixed' is a combined walk"),
+    (dict(walks={"encode"}), "SeqShard 'shard'.walks: 'encode' runs none of the shard's nodes"),
+    (dict(labels={"cfg"}), "SeqShard 'shard'.labels: ['cfg'] are opened by no array on nodes ['LLM']"),
+], ids=["combined walk", "walk off its nodes", "label no array opens"])
+def test_a_sequence_shard_lists_rows_walks_and_labels_its_arrays_open(shard, problem):
+    # a label or walk that never comes would leave the shard copying every step, and nothing would say so
+    declared = SeqShard("shard", nodes={"LLM"}, **shard)
+    assert _one_problem(_array(), declared, combined={"LLM": {"mixed": {"prefill", "decode"}}}).startswith(problem)
+
+
+def test_a_sequence_shard_lists_one_label_since_its_handle_brackets_one():
+    declared = SeqShard("shard", nodes={"LLM"}, labels={"main", "cfg"})
+    problem = _one_problem(_array(labels={"main", "cfg"}), declared)
+    assert problem.startswith("SeqShard 'shard'.labels: ['cfg', 'main'] are several")
+
+
+def test_a_sequence_shard_cuts_its_label_on_one_axis():
+    # rows of one span split each row alike (axis 1), packed tokens contiguously (axis 0): one tensor can't take both
+    rows = _array("rows", max_len=0, reads={"rows_attn": _read(mask=Block(), packed=False)})
+    packed = _array("packed", max_len=0, reads={"packed_attn": _read(mask=Block())})
+    problem = _one_problem(rows, packed, SeqShard("shard", nodes={"LLM"}))
+    assert problem.startswith("SeqShard 'shard'.labels: reads on nodes ['LLM'] take queries on ['main'] both as rows")
 
 
 def test_a_block_read_needs_max_len_zero():
@@ -635,6 +661,9 @@ def test_every_port_tested_model_digests_alike_in_processes_with_different_hash_
 class _OtherMask(Mask):
     """Has no fields, as `Causal` has none, so only its class tells them apart."""
 
+    uses_query_position = True
+    sees_step_whole = False
+
 
 _T = TensorType((4, 8), dtype=None, shard=0)
 _READ = Read(mask=Causal(), op=_ATTEND)
@@ -666,7 +695,6 @@ _FIELD_CHANGES = {
     "an unpacked block read": _array(max_len=0, reads={"r": Read(mask=Block(), op=_ATTEND, packed=False)}),
     "a segmented read": _array(max_len=0, reads={"r": Read(mask=Block(), op=_ATTEND, packed=False, segmented=True)}),
     "a cross read": _array(max_len=0, reads={"r": Read(mask=Block(), op=_ATTEND, queries="video")}),
-    "seq_sharded": _array(max_len=0, seq_sharded=True, reads={"r": Read(mask=Block(), op=_ATTEND)}),
     "a counter": _array(positions=Positions(), reads={"r": _READ}),
     "a rope": _array(positions=Positions(rope=Rope()), reads={"r": _READ}),
     **{

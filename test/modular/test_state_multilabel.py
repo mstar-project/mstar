@@ -112,6 +112,8 @@ def test_a_step_over_two_labels_binds_one_plan_named_for_both():
     h = _two_label_handle()
     step = state_steps(_step(h, segments=_label_major()), {"kv": h}, graph_walk="decode")
     assert step.steps["kv"].combined_labels == {LABELS: "main+uncond"}, "the KV resource would plan each label alone"
+    assert all(built.combined_labels == step.combined_labels for built in step.steps.values()), \
+        "a resource that plans the step's rows would pack them by their own labels"
     step.set_ctx(_ctx(rows=(1, 2)))
     h.begin_step(step)
     assert h.label == "main+uncond", "add, read and rope would plan under one label's rows"
@@ -505,7 +507,10 @@ def test_a_pool_where_no_node_runs_every_walk_has_no_leader():
 
 
 def test_a_pool_on_one_node_has_no_leader():
-    assert _leader(_pool("LLM"), Walks(nodes=BAGEL_WALKS)) is None
+    """Another array on several nodes fills the walks' nodes, and this pool's one node admits for itself."""
+    setup = StateSetup(walks=Walks(nodes=BAGEL_WALKS))
+    (kv,) = [spec for spec in build_specs([_pool("LLM")], setup=setup) if isinstance(spec, KVSpec)]
+    assert kv.leader is None
 
 
 def test_a_kept_arrays_handle_is_the_same_whichever_of_its_nodes_builds_it():
