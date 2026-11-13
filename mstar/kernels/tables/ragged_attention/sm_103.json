@@ -76,6 +76,25 @@
         "65536": {"us": 158959.85, "default_us": 590306.71, "cudnn_us": 167755.96, "fa4_us": 158959.85, "flashinfer_fa2_us": 590297.56},
         "75600": {"us": 210810.29, "default_us": 784867.31, "cudnn_us": 224988.0, "fa4_us": 210810.29, "flashinfer_fa2_us": 784898.67}
       }
+    },
+    {
+      "dtype": "bfloat16",
+      "shape": {"head_dim": 128, "num_kv_heads": 56, "num_qo_heads": 56},
+      "provenance": {"device": "NVIDIA B300 SXM6 AC", "arch": "sm_103", "date": "2026-11-13", "harness": "python -m benchmark.kernels.sweep ragged_attention --dtype bfloat16 --shape num_qo_heads=56,num_kv_heads=56,head_dim=128 --buckets 128,1024,4096,4608,8192,16384,32768,37985,65536", "torch": "2.11.0+cu130", "triton": "3.6.0", "cudnn": "9.24.0", "mstar": "63748406a", "note": "MiniMax-H3 DiT self-attention at 1344x768x124 (37985 request rows, then 159 padding rows to the compile bucket, eager), served on these rows. Rows: cudnn at every size, eagerly one call per run of equal segments (segments: runs). Past 32768 the sweep's uncapped times are within its 2% (37985: 1.9% faster, 65536 a tie), but served the B300 sits at its power cap, where torch's cuDNN engine draws less power than FlashInfer's cuDNN path for the same bits: 1,308-1,312 vs 1,282 MHz, 123.2 vs 125.0 s per 50-point clip (docs/models.rst)"},
+      "rows": {
+        "*": {"impl": "cudnn", "config": {"segments": "runs"}}
+      },
+      "measured": {
+        "128": {"us": 16.02, "default_us": 22.16, "cudnn_us": 16.02, "flashinfer_fa2_us": 35.46, "flashinfer_cudnn_us": 26.21},
+        "1024": {"us": 68.56, "default_us": 89.55, "cudnn_us": 68.56, "flashinfer_fa2_us": 327.9, "flashinfer_cudnn_us": 90.97},
+        "4096": {"us": 769.28, "default_us": 815.23, "cudnn_us": 769.28, "flashinfer_fa2_us": 3697.48, "flashinfer_cudnn_us": 812.77},
+        "4608": {"us": 923.42, "default_us": 1034.55, "cudnn_us": 923.42, "flashinfer_fa2_us": 4895.77, "flashinfer_cudnn_us": 977.36},
+        "8192": {"us": 3143.93, "default_us": 3469.47, "cudnn_us": 3143.93, "flashinfer_fa2_us": 14153.65, "flashinfer_cudnn_us": 3187.58},
+        "16384": {"us": 12564.19, "default_us": 13805.18, "cudnn_us": 12564.19, "flashinfer_fa2_us": 53148.97, "flashinfer_cudnn_us": 12857.7},
+        "32768": {"us": 54282.04, "default_us": 56452.28, "cudnn_us": 54282.04, "flashinfer_fa2_us": 208490.75, "flashinfer_cudnn_us": 56376.56},
+        "37985": {"us": 75470.89, "default_us": 76965.6, "cudnn_us": 75470.89, "flashinfer_fa2_us": 280641.64, "flashinfer_cudnn_us": 76308.41},
+        "65536": {"us": 225514.29, "default_us": 225042.86, "cudnn_us": 225514.29, "flashinfer_fa2_us": 827648.71, "flashinfer_cudnn_us": 228078.28}
+      }
     }
   ]
 }
