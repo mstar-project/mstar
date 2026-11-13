@@ -283,7 +283,8 @@ def carried(review, earlier, answered, pages):
     one, one this run judged fixed above carries that `fixed_in`, which judged checks, and one it judged
     still open loses any `fixed_in` from before); its risk level as a floor, with the `look_at` that names
     the decision, unless a maintainer other than the author has commented since (`answered`), when this review's
-    judgement stands; its questions, each until a maintainer's comment has answered it and this review says so
+    judgement stands (its `security` flag carries whatever anyone has said: a comment isn't an approval);
+    its questions, each until a maintainer's comment has answered it and this review says so
     (`answered_questions`), so one comment can't drop the rest and an answered one is shown no more (a question
     no longer holds the bot's approval, but it stays on the checklist until answered); and what the live test
     can't exercise (`live_test.untestable`) when this review names nothing, whatever anyone has said, since no
@@ -316,10 +317,10 @@ def carried(review, earlier, answered, pages):
         *[f if f["location"] in cleared else raised(f, f["location"]) for f in review["outside_diff"]],
         *[raised(with_verdict(f), f["location"]) for f in earlier.get("outside_diff", [])
           if f["location"] not in locations and f["location"] not in cleared]]}
+    old, new = earlier.get("risk"), review.get("risk")
+    if old and new:  # a comment isn't an approval: security-relevant code stays a person's to approve
+        review["risk"] = new = {**new, "security": bool(new.get("security") or old.get("security"))}
     if not answered:
-        old, new = earlier.get("risk"), review.get("risk")
-        if old and new:
-            review["risk"] = new = {**new, "security": bool(new.get("security") or old.get("security"))}
         if old and new and RISK_ORDER[old["level"]] > RISK_ORDER[new["level"]]:
             review["risk"] = {**new, "level": old["level"], "reason": f"Kept from the earlier review: {old['reason']}",
                               "look_at": [*new.get("look_at", []), *old.get("look_at", [])]}

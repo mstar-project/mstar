@@ -120,6 +120,9 @@ class TestReviewSummary(unittest.TestCase):
         self.assertTrue(secure["risk"]["security"], "a small fix commit could clear the security flag and approve")
         self.assertTrue(read_state(render(secure, [], "0123456789", "full", []))["risk"]["security"],
                         "the next re-review would not know the flag")
+        commented = carried({**review(), "risk": {**review()["risk"], "security": False}},
+                            {"risk": {**earlier["risk"], "security": True}}, True, [])
+        self.assertTrue(commented["risk"]["security"], "a maintainer's comment is not an approval of security code")
         decision = {"location": "a.py:1", "why": "new lifecycle state"}
         floored = carried(review(), {"risk": {**earlier["risk"], "look_at": [decision]}}, False, [])
         self.assertEqual(floored["risk"]["look_at"], [decision], "the checklist wouldn't name the decision kept")
