@@ -261,6 +261,10 @@ class TestReviewSummary(unittest.TestCase):
                          "the checklist's ranking would drift from what a human must decide first")
         self.assertNotIn("Approve if you're OK", text, "a list shown with no approval in view would ask for one")
         self.assertIn("Approve if you're OK with these.", SUMMARY["checklist"](r, pages, [], approving=True))
+        for risk in ({"level": "high"}, {"level": "low", "security": True}):
+            blocked = {**r, "risk": {**r["risk"], **risk}}
+            self.assertNotIn("Approve if you're OK", SUMMARY["checklist"](blocked, pages, [], approving=True),
+                             "the bot can't approve this one, so the list shouldn't say it will")
         self.assertNotIn("Approve if you're OK", render(r, pages, "0123456789", "light", []),
                          "an advisory review would ask for an approval")
         self.assertIn("Approve if you're OK", render(r, pages, "0123456789", "full", []))
