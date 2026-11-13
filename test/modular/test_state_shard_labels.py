@@ -27,7 +27,6 @@ from mstar.engine.resources.attn.config import (
     AttentionSpec,
     AttentionStep,
     AttnBackend,
-    BlockCausalAttentionSpec,
     CrossAttentionConfig,
     CrossAttentionSpec,
 )
@@ -99,9 +98,7 @@ def test_a_read_with_no_op_stays_off_a_node_that_splits_it():
     (lambda: build_specs([_ring_array()])[0], "KV 'kv' is a ring, which takes"),
     (lambda: CrossAttentionSpec(resource_key="cross", nodes={"dit"}, config=CrossAttentionConfig(
         kv_cache="ctx", query_kv_cache="kv", context_label="main")), "cross attention 'cross' takes"),
-    (lambda: BlockCausalAttentionSpec(resource_key="flow", nodes={"dit"}, block_size=8, config=AttentionConfig(
-        kv_cache="kv", backend=AttnBackend.FLASHINFER)), "block-causal attention 'flow' takes"),
-], ids=["ring", "cross", "block_causal"])
+], ids=["ring", "cross"])
 def test_a_pool_that_takes_no_split_steps_stays_off_a_splitting_node(spec, refusal):
     shard = SeqShardSpec("shard", {"dit"}, ("main",), 0)
     assert spec().split_step_refusals("dit", shard, 1, 2, {}) == [

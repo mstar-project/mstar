@@ -20,6 +20,7 @@ from mstar.engine.resources.attn.config import (
     AttentionSpec,
     AttentionStep,
     AttnBackend,
+    BlockCausalAttentionSpec,
     CrossAttentionConfig,
     CrossAttentionSpec,
 )
@@ -78,6 +79,7 @@ from mstar.engine.state.contract import (
     Attend,
     Bidirectional,
     Block,
+    BlockCausal,
     Causal,
     CausalConv,
     Entry,
@@ -683,7 +685,7 @@ class OpBinding:
 
     def for_mask(self, mask: Mask) -> "OpBinding":
         """The binding that runs the op through ``mask``: `kept_window_binding` through a kept window, and this one
-        through any other mask. The one place a field of the mask picks a binding."""
+        through any other mask. The one place a mask picks a binding, by its type or a field."""
         kept = self.kept_window_binding if isinstance(mask, Bidirectional) and mask.kept_window else None
         return self if kept is None else kept
 
@@ -749,6 +751,9 @@ class PagedAttend(OpBinding):
     def kept_window_binding(self) -> OpBinding:
         return KEPT_WINDOW_ATTEND
 
+    def for_mask(self, mask: Mask) -> OpBinding:
+        return BLOCK_CAUSAL_ATTEND if isinstance(mask, BlockCausal) else super().for_mask(mask)
+
     def specs(self, array: Array, key: str, read: Read) -> list[NodeResourceSpec]:
         windowed = isinstance(read.mask, Window)
         # AttentionConfig.layers counts among the pool's layers
@@ -801,6 +806,33 @@ class EagerDenseAttend(PagedAttend):
 
     def apply(self, spec: NodeResourceSpec | None, settings: Mapping[str, Any]) -> None:
         super().apply(spec, {field: value for field, value in settings.items() if field != "eager_backend"})
+
+
+class PagedBlockCausal(PagedAttend):
+    """`Attend` through `BlockCausal` on a paged array: a `BlockCausalAttentionSpec` over the array's pool."""
+
+    kernel_settings = frozenset()
+
+    def check(self, array: Array, key: str, read: Read) -> None:
+        if not read.packed:
+            raise _no_layout(array, f"reads[{key!r}] declares packed=False, and the block-causal kernel takes packed "
+                                    "rows")
+        if read.walks is not None:
+            raise _no_layout(array, f"reads[{key!r}].walks must be None: a block-causal read is its array's read on "
+                                    "every walk")
+
+    def specs(self, array: Array, key: str, read: Read) -> list[NodeResourceSpec]:
+        return [BlockCausalAttentionSpec(
+            resource_key=key, nodes=array.nodes, config=AttentionConfig(kv_cache=array.name), block_size=read.mask.size,
+        )]
+
+    def steps(
+        self, array: Array, key: str, read: Read, declared: ArrayStep, segments, steps: dict[str, Any],
+    ) -> None:
+        steps[key] = AttentionStep(segments=segments, causal=False)
+
+
+BLOCK_CAUSAL_ATTEND = PagedBlockCausal()
 
 
 class PagedCrossAttend(PagedAttend):
@@ -2123,7 +2155,7 @@ class PagedStorage(Storage):
     plans them as one combined plan."""
 
     handle_class = PagedArrayHandle
-    kernel_settings = frozenset({"max_num_pages"})
+    kernel_settings = frozenset({"max_num_pages", "page_size"})
     holds_row_entries = True
 
     def resolve(self, arrays: Sequence[Array], declared: Sequence[Array], setup: "StateSetup") -> Resolved:
@@ -2524,9 +2556,9 @@ def storage_of(array: Array) -> Storage:
 
 
 # `Attend` is an `AttentionSpec` on a paged array, a `CrossAttentionSpec` on one read with another array's queries and a
-# `RaggedAttentionSpec` within a step, so a binding is per storage and op type. A field of a read's mask can still swap
-# the binding, through `OpBinding.for_mask`, as a kept window does. The `SDPA` table below is the deployment's swap,
-# and `EAGER_DENSE` the model's, through its kernel settings.
+# `RaggedAttentionSpec` within a step, so a binding is per storage and op type. A read's mask can still swap the
+# binding, through `OpBinding.for_mask`, by its type (`BlockCausal`) or a field (a kept window). The `SDPA` table below
+# is the deployment's swap, and `EAGER_DENSE` the model's, through its kernel settings.
 BINDINGS: dict[tuple[Storage, type[Op | Positions | None]], OpBinding] = {
     (PAGED, Attend): PagedAttend(),
     (PAGED, type(None)): PagedNoOp(),

@@ -1,6 +1,12 @@
 """What a model declares about the state it keeps between steps.
 
 Declarations are values: mappings are read-only, sets are frozensets, and everything hashes.
+
+A node may also keep a session store: values one request leaves for a later request that names the same session. It is
+keyed by the client's session id, held in the node's process, bounded by count and by idle time, and an entry is pinned
+while a request uses it. Nothing else outlives a request. A lost entry is refused once, at the resuming request's first
+step, and a request that names a session is refused at submission when the node runs more than one replica
+(`Model.session_node`).
 """
 
 from collections.abc import Iterator, Mapping
@@ -158,6 +164,24 @@ class FrameWindow(Mask):
 
     def split_step_change(self) -> str:
         return "A step boundary inside a frame cuts what the frame's queries see"
+
+
+@dataclass(frozen=True)
+class BlockCausal(Mask):
+    """Blocks are runs of ``size`` entries from the row's first, and q is in block b = q // ``size``. Sees every entry
+    of blocks 0 to b. On an array with ``max_len`` 0, q's row is its segment in this step."""
+
+    uses_query_position = True
+    sees_step_whole = True
+
+    size: int
+
+    def __post_init__(self):
+        if not _is_positive(self.size):
+            raise ValueError(f"BlockCausal.size must be a positive int, got {self.size!r}")
+
+    def split_step_change(self) -> str:
+        return "A step boundary inside a block cuts what the block's queries see"
 
 
 class Op:

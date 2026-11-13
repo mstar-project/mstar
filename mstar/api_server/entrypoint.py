@@ -20,6 +20,7 @@ from collections.abc import Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from functools import cached_property
 from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, NamedTuple, Optional, Protocol
 
 import msgpack
@@ -511,6 +512,9 @@ class APIServer:
     _process_cpus: frozenset[int] = frozenset()
     # set in __init__; None until then, which a server built without it (a test's) keeps
     lora_admin: LoraAdmin | None = None
+    # each node's data-parallel replicas, which the serve entrypoint counts at start; a server without them refuses no
+    # session (`Model.session_node`)
+    node_replicas: Mapping[str, int] = MappingProxyType({})
 
     def __init__(
         self,
@@ -876,6 +880,13 @@ class APIServer:
         model_kwargs = normalize_generation_kwargs(model_kwargs)
         model_kwargs, prefix_root = self.lora_kwargs(model, model_kwargs)
         self._report_ignored_params(model_kwargs)
+        session = self.model.session_node(model_kwargs) if self.node_replicas else None
+        if session is not None and self.node_replicas.get(session, 1) > 1:
+            raise HTTPException(status_code=400, detail=(
+                f"this request names a session, and node {session!r}, which keeps sessions in its own process, runs on "
+                f"{self.node_replicas[session]} replicas here; no request is routed to a replica by its session, so "
+                "serve that node on one replica"
+            ))
 
         if file_streams:
             try:
@@ -2098,6 +2109,16 @@ def _data_parallel_replicas(model, config_path: str) -> DataParallelReplicas:
         return DataParallelReplicas(1, 1)
 
 
+def _node_replicas(model, config_path: str) -> dict[str, int]:
+    """Each node's data-parallel replicas, the most any worker graph that runs it has. A deployment it can't count
+    fails here, unlike `_data_parallel_replicas`, since a count of one would turn the session refusal off."""
+    replicas: dict[str, int] = {}
+    for wg in model.get_worker_graphs(config_path):
+        for node in wg.section.get_nodes():
+            replicas[node] = max(replicas.get(node, 1), len(wg.replica_ranks))
+    return replicas
+
+
 def _run_warmup_requests(
     server: APIServer, specs: list, replicas: DataParallelReplicas = DataParallelReplicas(1, 1),
     cache_dir: str | None = None,
@@ -3256,7 +3277,7 @@ def main(argv: list[str] | None = None):
         ready = api_server.finalize_setup()
         # A declaration may follow the placement, which only get_worker_graphs reads. The data worker declares at its
         # first prompt, after this.
-        model.get_worker_graphs(args.config)
+        api_server.node_replicas = _node_replicas(model, args.config)
         mismatch = digest_mismatch(
             declaration_digests(model.declare_state(), model.kernel_settings()), ready.declaration_digests,
             here="API server", there="conductor",
