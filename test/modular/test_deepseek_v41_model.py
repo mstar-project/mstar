@@ -19,20 +19,26 @@ sys.path.insert(0, ".")
 
 import pytest
 import torch
+import yaml
 from safetensors.torch import load_file, save_file
 
 from mstar.distributed.communication import CommGroup
+from mstar.engine.resources.base import EngineResourceInfo, build_resource
+from mstar.engine.resources.host_table.config import HostTableConfig, HostTableSpec, HostTableStep
+from mstar.engine.resources.step import StepContext
 from mstar.model.components.moe_parallel import MoeParallelConfig
 from mstar.model.deepseek_v41 import _testing
 from mstar.model.deepseek_v41._testing import add_request, cpu_engine, logit_gap, random_ids, run_request, run_step
-from mstar.model.deepseek_v41.components.engram import bucket_primes, table_rows
+from mstar.model.deepseek_v41.components.engram import Engram, bucket_primes, host_tables, table_name, table_rows
 from mstar.model.deepseek_v41.components.layers import DeepseekV41ForCausalLM
 from mstar.model.deepseek_v41.components.moe import DeepseekV41MoE
-from mstar.model.deepseek_v41.config import CSA, MOE_EXPERTS, STATE, DeepseekV41Config, kv_cache_key
+from mstar.model.deepseek_v41.config import CSA, ENGRAM, MOE_EXPERTS, STATE, DeepseekV41Config, kv_cache_key
 from mstar.model.deepseek_v41.deepseek_v41_model import DeepseekV41Model
 from mstar.model.deepseek_v41.weight_loader import load_deepseek_v41_weights, skipped, upcast_fp4_block
+from mstar.model.registry import get_model_class, model_init_kwargs
 from mstar.model.utils import check_loaded
 from mstar.utils.mx_round import dequant_row_fp4, pack_e2m1, pow2_ceil, round_e2m1
+from mstar.validation import validate_deployment
 
 FIXTURES = Path(__file__).parent / "fixtures"
 DTYPES = {"F32": torch.float32, "BF16": torch.bfloat16, "F8_E4M3": torch.float8_e4m3fn,
@@ -143,6 +149,28 @@ class TestCheckpointLayout:
                       if re.match(r"layers\.0\.ffn\.experts\.\d+\.", name))
         assert held * tp == shipped
         assert round(held * config.num_hidden_layers / 1e9, 1) == {1: 288.8, 8: 36.1}[tp]
+
+    def test_on_the_host_the_engram_tables_are_the_only_tensors_without_a_parameter(self):
+        """``engram_tables: host`` loads every other tensor as before, and what it declares to
+        the host table resource is the checkpoint's Engram tables, row for row and byte for byte."""
+        config = _checkpoint_config()
+        token_map = torch.arange(config.vocab_size) % config.engram_compressed_vocab_size
+        served = [(n, d, s) for n, d, s in _checkpoint_tensors() if not skipped(n)]
+        params = {}
+        for placement in ("device", "host"):
+            with torch.device("meta"):
+                lm = DeepseekV41ForCausalLM(dataclasses.replace(config, engram_tables=placement), token_map)
+            weights = ((name, torch.empty(shape, dtype=dtype, device="meta")) for name, dtype, shape in served)
+            check_loaded(lm, load_deepseek_v41_weights(lm, weights), "checkpoint layout")
+            params[placement] = {name for name, _ in lm.named_parameters()}
+        assert params["host"] < params["device"]
+        assert params["device"] - params["host"] == {
+            f"model.layers.{layer}.engram.{leaf}" for layer in (1, 14) for leaf in ("table", "table_scale")}
+        declared = {part.tensor: [table.rows, part.width]
+                    for table in host_tables(config).values() for part in table.parts}
+        stored = {name: [shape[0], shape[1] * dtype.itemsize] for name, dtype, shape in served
+                  if ".engram.embed." in name}
+        assert declared == stored and len(stored) == 4
 
     def test_what_is_skipped_is_dspark_vision_and_the_image_router_bias(self):
         names = [n for n, _, _ in _checkpoint_tensors() if skipped(n)]
@@ -491,3 +519,157 @@ class TestEngineCpu:
             run_step(engine, sampler, "prefill", {
                 "long": random_ids(snapshot[1], 65, seed=6), "short": random_ids(snapshot[1], 8, seed=7)})
         assert "'short'" not in str(failed.value)
+
+
+@pytest.fixture(scope="module")
+def two_table_snapshot(tmp_path_factory):
+    """The checkpoint's Engram shape: two layers, 2- to 4-grams."""
+    path = tmp_path_factory.mktemp("dsv41-engram")
+    config, _ = _testing.write_snapshot(path, DeepseekV41Config.reduced(
+        engram_layer_ids=(0, 5), engram_num_embeddings=(0, 0), engram_max_ngram_size=4, engram_n_heads=3), seed=3)
+    return path, config
+
+
+@pytest.mark.usefixtures("cpu")
+class TestEngramOnHost:
+    """``engram_tables: host`` reads the same rows from the checkpoint's mapped bytes, so the
+    logits are the device tables', bit for bit."""
+
+    PROMPT, STEPS = 45, 6
+
+    @pytest.mark.parametrize("tables", ["one-table", "two-tables"])
+    def test_prefill_and_decode_give_the_device_tables_logits(self, snapshot, two_table_snapshot, tables):
+        path, config = snapshot if tables == "one-table" else two_table_snapshot
+        ids = random_ids(config, self.PROMPT + self.STEPS, seed=1)
+        device = run_request(*cpu_engine(path, torch.float32)[:2], ids, self.PROMPT)
+        host = run_request(*cpu_engine(path, torch.float32, engram_tables="host")[:2], ids, self.PROMPT)
+        assert torch.equal(host, device)
+
+    def test_other_rows_from_the_host_move_the_logits(self, snapshot, monkeypatch):
+        """The check above can fail: the logits follow the rows the host hands back."""
+        from mstar.engine.resources.host_table.manager import HostTableManager
+
+        fetch = HostTableManager.fetch
+        monkeypatch.setattr(HostTableManager, "fetch", lambda self, ids: fetch(self, {
+            name: (rows + 1) % self.config.tables[name].rows for name, rows in ids.items()}))
+        ids = random_ids(snapshot[1], self.PROMPT + self.STEPS, seed=1)
+        device = run_request(*cpu_engine(snapshot[0], torch.float32)[:2], ids, self.PROMPT)
+        host = run_request(*cpu_engine(snapshot[0], torch.float32, engram_tables="host")[:2], ids, self.PROMPT)
+        assert logit_gap(host, device) > 1e-3
+
+    def test_two_requests_in_one_step_give_the_device_tables_logits(self, snapshot):
+        ids_a = random_ids(snapshot[1], self.PROMPT + self.STEPS, seed=1)
+        ids_b = random_ids(snapshot[1], 22 + self.STEPS, seed=2)
+
+        def both(**kwargs) -> torch.Tensor:
+            engine, sampler, _ = cpu_engine(snapshot[0], torch.float32, **kwargs)
+            for rid in "ab":
+                add_request(engine, rid)
+            rows = [run_step(engine, sampler, "prefill", {"a": ids_a[:self.PROMPT], "b": ids_b[:22]})]
+            for step in range(self.STEPS):
+                rows.append(run_step(engine, sampler, "decode", {
+                    "a": ids_a[self.PROMPT + step].view(1), "b": ids_b[22 + step].view(1)}))
+            return torch.stack([torch.stack([row["a"], row["b"]]) for row in rows])
+
+        assert torch.equal(both(engram_tables="host"), both())
+
+    @pytest.mark.parametrize("cut", [1, 19])
+    def test_a_prompt_fed_in_two_steps_gives_the_device_tables_logits(self, snapshot, cut):
+        ids = random_ids(snapshot[1], self.PROMPT, seed=3)
+
+        def second_step(**kwargs) -> torch.Tensor:
+            engine, sampler, _ = cpu_engine(snapshot[0], torch.float32, **kwargs)
+            add_request(engine, "r")
+            run_step(engine, sampler, "prefill", {"r": ids[:cut]})
+            return run_step(engine, sampler, "prefill", {"r": ids[cut:]})["r"]
+
+        assert torch.equal(second_step(engram_tables="host"), second_step())
+
+    def test_the_tables_are_neither_allocated_nor_read_for_the_device(self, snapshot, monkeypatch):
+        from mstar.model.loader import iterators
+
+        read, shards = {}, iterators.iter_safetensors_shards
+
+        def recording(*args, **kwargs):
+            for name, tensor in shards(*args, **kwargs):
+                read[name] = tensor.numel()
+                yield name, tensor
+
+        monkeypatch.setattr(iterators, "iter_safetensors_shards", recording)
+        model = DeepseekV41Model(str(snapshot[0]), max_seq_len=256, engram_tables="host")
+        lm = model.get_submodule("LLM").language_model
+        assert not [name for name, _ in lm.named_parameters() if ".engram.table" in name]
+        tables = {name: n for name, n in read.items() if ".engram.embed." in name}
+        assert len(tables) == 2 and not any(tables.values())
+        assert read["layers.1.engram.wkv.weight"]  # the rest of the layer still loads
+        assert [spec.resource_key for spec in model.get_node_resources()][-1] == ENGRAM
+
+    def test_a_serving_config_sizes_the_resource_only_under_the_host_placement(self, snapshot):
+        from mstar.model.base import serving_resources
+
+        block = {"resources": {ENGRAM: {"staging_bytes": 1 << 20, "prefault": False}}}
+        spec = serving_resources(DeepseekV41Model(str(snapshot[0]), engram_tables="host"), block)[-1]
+        assert (spec.resource_key, spec.config.staging_bytes, spec.config.prefault) == (ENGRAM, 1 << 20, False)
+        # the device placement declares no such resource, so its block is a config error
+        model = DeepseekV41Model(str(snapshot[0]))
+        assert ENGRAM not in [spec.resource_key for spec in model.get_node_resources()]
+        with pytest.raises(ValueError, match="unknown resource"):
+            serving_resources(model, block)
+
+    def test_another_placement_is_refused(self, snapshot):
+        with pytest.raises(ValueError, match="engram_tables must be 'device' or 'host'"):
+            DeepseekV41Model(str(snapshot[0]), engram_tables="pinned")
+
+    def test_under_tp_each_rank_reads_whole_rows_and_sums_nothing(self, tmp_path):
+        """On the device a rank holds a shard of the table and the ranks sum their lookups;
+        from the host every rank gets whole rows, the same values, with no collective."""
+        config = DeepseekV41Config.reduced()
+        layer, rows = config.engram_layer_ids[0], config.engram_num_embeddings[0]
+        g = torch.Generator().manual_seed(0)
+        pair = _testing._fp8_pair(torch.randn(rows, config.engram_head_dim, generator=g), 1, config.fp8_block)
+        ids = torch.randint(0, rows, (9, config.engram_hash_cols), generator=g)
+
+        summed = 0
+        for rank in range(2):
+            group = CommGroup(rank, rank, [0, 1])
+            group.all_reduce = lambda local: local  # this rank's term of the sum
+            engram = Engram(config, layer, group)
+            mine = slice(engram.row_start, engram.row_start + engram.rows)
+            engram.table.data.copy_(pair["weight"].view(torch.uint8)[mine])
+            engram.table_scale.data.copy_(pair["scale"].view(torch.uint8)[mine])
+            summed = summed + engram.lookup(ids, torch.float32)
+
+        save_file({f"{table_name(layer)}.{leaf}": tensor for leaf, tensor in pair.items()},
+                  str(tmp_path / "model.safetensors"))
+        on_host = dataclasses.replace(config, engram_tables="host")
+        tables = build_resource(
+            HostTableSpec(resource_key=ENGRAM, nodes={"LLM"}, config=HostTableConfig(
+                checkpoint=str(tmp_path), tables=host_tables(on_host))),
+            EngineResourceInfo(device=torch.device("cpu")))
+        group = CommGroup(1, 1, [0, 1])
+
+        def no_collective(local):
+            raise AssertionError("a lookup from the host sums nothing across ranks")
+
+        group.all_reduce = no_collective
+        engram = Engram(on_host, layer, group)
+        engram.bind_resources({ENGRAM: tables})
+        tables.plan(HostTableStep(), StepContext(request_ids=(), graph_walk="prefill", slot=0, capture=False))
+        tables.fetch({engram.host_table: ids})
+        assert torch.equal(engram.lookup(ids, torch.float32), summed)
+
+
+def test_the_tp8_config_starts_as_shipped_and_with_its_host_tables_switched_on(tmp_path):
+    """The serving config carries the host placement as comments: taken out of them, the
+    model declares the resource the block sizes, and the deployment still validates."""
+    shipped = (Path(__file__).resolve().parents[2] / "configs" / "deepseek_v41_flash_tp8.yaml").read_text()
+    switched_on = re.sub(
+        r"(?m)^( *)# ( *)(engram_tables: host|engram:|staging_bytes: \d+|prefault: \w+)$", r"\1\2\3", shipped)
+    for text, placement in ((shipped, "device"), (switched_on, "host")):
+        cfg = yaml.safe_load(text)
+        model = get_model_class(cfg["model"])(**{**model_init_kwargs(cfg["model"]), **cfg["model_kwargs"]})
+        assert model.config.engram_tables == placement
+        assert (ENGRAM in cfg["resources"]) == (placement == "host")
+        path = tmp_path / f"{placement}.yaml"
+        path.write_text(text)
+        validate_deployment(model, cfg, str(path))

@@ -107,6 +107,13 @@ class TestParity:
         assert torch.equal(got.argmax(-1), want.argmax(-1))
         assert _gap(got, want) < FP32_TOL, _gap(got, want)
 
+    def test_fp32_logits_match_the_reference_with_the_engram_tables_on_the_host(self, snapshot, fp32_reference):
+        ids, want = fp32_reference
+        engine, sampler, _ = cpu_engine(snapshot[0], torch.float32, engram_tables="host")
+        got = run_request(engine, sampler, ids, PROMPT)
+        assert torch.equal(got.argmax(-1), want.argmax(-1))
+        assert _gap(got, want) < FP32_TOL, _gap(got, want)
+
     def test_bf16_stays_within_the_references_own_spread(self, reference, snapshot, tmp_path, monkeypatch):
         """bf16 as shipped. With random weights at this size nothing has a margin, so a
         rounding moves a top-k and the logits with it: the reference itself moves by 2.6 to
@@ -163,6 +170,10 @@ def test_other_geometries_match_the_reference(reference, geometry, tmp_path):
     want = _reference_run(reference, (tmp_path / "snap", config, tokenizer), tmp_path / "ref", torch.float32, ids, 41)
     engine, sampler, _ = cpu_engine(tmp_path / "snap", torch.float32)
     assert _gap(run_request(engine, sampler, ids, 41), want) < FP32_TOL
+    if len(config.engram_layer_ids) > 1:
+        # and with both tables fetched from the host in one trip a step
+        engine, sampler, _ = cpu_engine(tmp_path / "snap", torch.float32, engram_tables="host")
+        assert _gap(run_request(engine, sampler, ids, 41), want) < FP32_TOL
 
 
 @pytest.mark.skipif(

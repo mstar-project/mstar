@@ -12,6 +12,7 @@ KV_CACHE = "kv_cache"    # paged latents of the compressed sources, a cache per 
 CSA = "csa"              # compressed sparse attention over those caches and each layer's window
 STATE = "state"          # recurrent pool: each layer's window, the compressors' open groups, the n-gram tail
 SAMPLER = "sampler"
+ENGRAM = "engram"        # the Engram tables in host memory, declared only when engram_tables is "host"
 LABEL = "main"
 # STATE blocks
 WINDOW = "window"
@@ -128,6 +129,10 @@ class DeepseekV41Config:
     # the routed experts: "fp4" as the checkpoint packs them, "fp8" their exact upcast to E4M3
     # blocks (twice the bytes), "dense" in the model's dtype (four times in bf16)
     moe_experts: str = "fp4"
+    # where the Engram tables are held: "device" shards them by rows across the TP ranks, which
+    # sum their lookups; "host" maps the checkpoint's bytes once for every rank (ENGRAM), and a
+    # step fetches its rows through the host
+    engram_tables: str = "device"
 
     def __post_init__(self):
         self.compress_ratios = tuple(self.compress_ratios)
@@ -177,6 +182,8 @@ class DeepseekV41Config:
                 raise ValueError("candidate_topk_blocks x candidate_block_size must cover index_topk")
         if len(self.engram_num_embeddings) != len(self.engram_layer_ids):
             raise ValueError("engram_num_embeddings needs one table size per engram layer")
+        if self.engram_tables not in ("device", "host"):
+            raise ValueError(f"engram_tables must be 'device' or 'host', got {self.engram_tables!r}")
 
     # --- the compressed sources ---
 
@@ -237,6 +244,12 @@ class DeepseekV41Config:
     @property
     def engram_hash_cols(self) -> int:
         return (self.engram_max_ngram_size - 1) * self.engram_n_heads
+
+    @property
+    def engram_on_host(self) -> bool:
+        """Whether a step fetches its Engram rows from host memory (ENGRAM) rather than
+        reading tables on the device."""
+        return bool(self.engram_layer_ids) and self.engram_tables == "host"
 
     @property
     def max_prompt_tokens(self) -> int:

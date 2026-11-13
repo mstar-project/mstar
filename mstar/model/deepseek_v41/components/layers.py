@@ -12,7 +12,7 @@ from mstar.model.deepseek_v41.components.attention import DeepseekV41Attention, 
 from mstar.model.deepseek_v41.components.engram import Engram, NgramHasher
 from mstar.model.deepseek_v41.components.moe import DeepseekV41MoE
 from mstar.model.deepseek_v41.components.rope import Rope
-from mstar.model.deepseek_v41.config import DeepseekV41Config
+from mstar.model.deepseek_v41.config import ENGRAM, DeepseekV41Config
 from mstar.model.glm5_next.mhc import Glm5NextHyperConnection
 
 
@@ -78,10 +78,20 @@ class DeepseekV41LanguageModel(nn.Module):
             if token_map is None:
                 raise ValueError("Engram hashes compressed token ids: pass the tokenizer's token_map")
             self.hasher = NgramHasher(config, token_map)
+        # ENGRAM, when the Engram tables are in host memory
+        self._host_tables = None
+
+    def bind_resources(self, resources: dict) -> None:
+        self._host_tables = resources.get(ENGRAM)
 
     def forward(self, input_ids: torch.Tensor, rows: torch.Tensor | None = None) -> torch.Tensor:
         """``input_ids (T,)`` flat batch -> the final hidden ``(T, hidden)``, or only ``rows``."""
         hashes = self.hasher(input_ids) if self.hasher is not None else None
+        if self._host_tables is not None:
+            # every Engram layer's rows in one trip to the host, before the first layer is queued
+            self._host_tables.fetch({
+                layer.engram.host_table: hashes[:, layer.engram.index]
+                for layer in self.layers if layer.engram is not None})
         hidden = self.embed(input_ids)
         streams = hidden.unsqueeze(1).repeat(1, self.hc_mult, 1)
         # the first block's attention reads the first stream alone

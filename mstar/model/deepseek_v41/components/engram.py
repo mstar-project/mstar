@@ -14,8 +14,9 @@ import torch
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
+from mstar.engine.resources.host_table.config import HostTable, HostTablePart
 from mstar.model.deepseek_v41.components.linear import RoundedLinear
-from mstar.model.deepseek_v41.config import CSA, LABEL, NGRAM, STATE, DeepseekV41Config
+from mstar.model.deepseek_v41.config import CSA, ENGRAM, LABEL, NGRAM, STATE, DeepseekV41Config
 from mstar.utils.fp8_block import E8M0_DTYPE, FP8_DTYPE
 
 
@@ -55,6 +56,22 @@ def bucket_primes(config: DeepseekV41Config) -> tuple[tuple[tuple[int, ...], ...
 def table_rows(config: DeepseekV41Config) -> tuple[int, ...]:
     """Rows of each engram layer's table: its bucket ranges end to end."""
     return tuple(sum(p for sizes in layer for p in sizes) for layer in bucket_primes(config))
+
+
+def table_name(layer: int) -> str:
+    """The checkpoint's stem of ``layer``'s Engram table, and the table's name on ENGRAM."""
+    return f"layers.{layer}.engram.embed"
+
+
+def host_tables(config: DeepseekV41Config) -> dict[str, HostTable]:
+    """The Engram tables as ENGRAM maps them from the checkpoint: a row's fp8 values, and a
+    scale byte per ``fp8_block`` of them."""
+    return {
+        table_name(layer): HostTable(rows=rows, parts=(
+            HostTablePart(f"{table_name(layer)}.weight", config.engram_head_dim),
+            HostTablePart(f"{table_name(layer)}.scale", config.engram_head_dim // config.fp8_block)))
+        for layer, rows in zip(config.engram_layer_ids, config.engram_num_embeddings, strict=True)
+    }
 
 
 def hash_multipliers(config: DeepseekV41Config) -> torch.Tensor:
@@ -165,26 +182,40 @@ class Engram(nn.Module):
         self.index = config.engram_layer_ids.index(layer)
         self.hidden_size, self.hc_mult = config.hidden_size, config.hc_mult
         self.eps, self.block = config.rms_norm_eps, config.fp8_block
-        # the table stays fp8 as stored, sharded by rows; a row is dequantized when it is read
         self.total_rows = config.engram_num_embeddings[self.index]
-        self.rows = -(-self.total_rows // self.comm_group.world_size)
-        self.row_start = self.comm_group.rank * self.rows
         width = config.engram_head_dim
-        self.table = nn.Parameter(torch.empty(self.rows, width, dtype=torch.uint8), requires_grad=False)
-        self.table_scale = nn.Parameter(
-            torch.empty(self.rows, width // self.block, dtype=torch.uint8), requires_grad=False)
+        # the table stays fp8 as stored, and a row is dequantized when it is read. On the host
+        # it is ENGRAM's, whole for every rank; on the device it is sharded by rows.
+        self.host_table = table_name(layer) if config.engram_on_host else None
+        self._host = None
+        if self.host_table is None:
+            self.rows = -(-self.total_rows // self.comm_group.world_size)
+            self.row_start = self.comm_group.rank * self.rows
+            self.table = nn.Parameter(torch.empty(self.rows, width, dtype=torch.uint8), requires_grad=False)
+            self.table_scale = nn.Parameter(
+                torch.empty(self.rows, width // self.block, dtype=torch.uint8), requires_grad=False)
         self.wkv = RoundedLinear(config.engram_hash_cols * width, config.hidden_size * (config.hc_mult + 1))
         self.q_weight = nn.Parameter(torch.ones(config.hc_mult, config.hidden_size))
         self.k_weight = nn.Parameter(torch.ones(config.hc_mult, config.hidden_size))
 
+    def bind_resources(self, resources: dict) -> None:
+        if self.host_table is not None:
+            self._host = resources[ENGRAM]
+
+    def _dequantize(self, values: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+        values = values.view(FP8_DTYPE).float().unflatten(-1, (-1, self.block))
+        return (values * scales.view(E8M0_DTYPE).float().unsqueeze(-1)).flatten(-2)
+
     def lookup(self, ids: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
         """Table rows ``ids (T, cols)`` dequantized: ``(T, cols, head_dim)``."""
+        if self.host_table is not None:
+            # the rows the model's forward fetched for the step's ids; every rank has them whole
+            return self._dequantize(*self._host.rows(self.host_table)).to(dtype)
         local = ids - self.row_start
         mine = (local >= 0) & (local < self.rows)
         local = torch.where(mine, local, 0)
-        values = self.table[local].view(FP8_DTYPE).float().unflatten(-1, (-1, self.block))
-        scales = self.table_scale[local].view(E8M0_DTYPE).float()
-        values = ((values * scales.unsqueeze(-1)).flatten(-2) * mine.unsqueeze(-1)).to(dtype)
+        values = self._dequantize(self.table[local], self.table_scale[local])
+        values = (values * mine.unsqueeze(-1)).to(dtype)
         if self.comm_group.world_size > 1:
             values = self.comm_group.all_reduce(values)
         return values

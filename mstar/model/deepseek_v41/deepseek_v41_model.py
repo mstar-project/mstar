@@ -21,6 +21,7 @@ from mstar.engine.resources import (
     SamplingReqConfig,
 )
 from mstar.engine.resources.csa.config import INDEX_PLANES, CSAConfig, CSASpec
+from mstar.engine.resources.host_table.config import HostTableConfig, HostTableSpec
 from mstar.engine.resources.kv.config import AuxPlanes, SpanKind
 from mstar.engine.resources.recurrent.config import (
     RecurrentBlockConfig,
@@ -37,6 +38,7 @@ from mstar.model.components.request_kwargs import (
 )
 from mstar.model.deepseek_v41.config import (
     CSA,
+    ENGRAM,
     LABEL,
     NGRAM,
     POOL_KV,
@@ -89,6 +91,9 @@ class DeepseekV41Model(ByteLevelTextOutput, Model):
         if "moe_experts" in kwargs:
             # replace() reruns the config's validation on the value
             self.config = dataclasses.replace(self.config, moe_experts=kwargs["moe_experts"])
+        if "engram_tables" in kwargs:
+            # rebuilt, so the config refuses a placement it does not know
+            self.config = dataclasses.replace(self.config, engram_tables=kwargs["engram_tables"])
         # requests that may hold state at once; the pool holds one more slot, its sink, and a
         # serve YAML sizes it under ``resources: state: {max_slots: N}``
         self.max_requests = _positive_int("max_requests", kwargs.get("max_requests", 32))
@@ -147,7 +152,7 @@ class DeepseekV41Model(ByteLevelTextOutput, Model):
             )
             for ratio in cfg.source_ratios
         ]
-        return [
+        specs: list[NodeResourceSpec] = [
             *caches,
             CSASpec(
                 resource_key=CSA,
@@ -174,6 +179,16 @@ class DeepseekV41Model(ByteLevelTextOutput, Model):
                 enable_min_p=bool(self.sampling_defaults.get("min_p")),
             ),
         ]
+        if cfg.engram_on_host:
+            from mstar.model.deepseek_v41.components.engram import host_tables
+
+            specs.append(HostTableSpec(
+                resource_key=ENGRAM,
+                nodes={"LLM"},
+                config=HostTableConfig(
+                    checkpoint=self.model_path_hf, cache_dir=self.cache_dir, tables=host_tables(cfg)),
+            ))
+        return specs
 
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
         label = {LABEL: KVLabel(growth=(("decode", "decode_loop"),))}
@@ -341,7 +356,7 @@ class DeepseekV41Model(ByteLevelTextOutput, Model):
             return
         with open(path) as f:
             read = DeepseekV41Config.from_hf_config(json.load(f))
-        for knob in ("max_seq_len", "max_output_tokens", "moe_experts"):
+        for knob in ("max_seq_len", "max_output_tokens", "moe_experts", "engram_tables"):
             setattr(read, knob, getattr(self.config, knob))
         self.config, self._config_from_checkpoint = read, True
 
@@ -359,10 +374,10 @@ class DeepseekV41Model(ByteLevelTextOutput, Model):
             return None
         self._adopt_checkpoint_config(source)
 
-        from mstar.model.deepseek_v41.components.engram import compressed_token_map
+        from mstar.model.deepseek_v41.components.engram import compressed_token_map, host_tables
         from mstar.model.deepseek_v41.components.layers import DeepseekV41ForCausalLM
         from mstar.model.deepseek_v41.submodules import DeepseekV41LLMSubmodule
-        from mstar.model.loader.iterators import iter_safetensors_shards
+        from mstar.model.loader.iterators import TensorSlice, iter_safetensors_shards
 
         token_map = None
         if self.config.engram_layer_ids:
@@ -375,7 +390,13 @@ class DeepseekV41Model(ByteLevelTextOutput, Model):
         if autocast_dtype is not None:
             language_model = _cast_floating(language_model, autocast_dtype)
         language_model.to_empty(device=device)
-        weights = iter_safetensors_shards(source, device=device, quant_methods=QUANT_METHODS)
+        # a table served from the host is the engine's to map: this rank reads none of its rows
+        on_host = set()
+        if self.config.engram_on_host:
+            on_host = {part.tensor for table in host_tables(self.config).values() for part in table.parts}
+        weights = iter_safetensors_shards(
+            source, device=device, quant_methods=QUANT_METHODS,
+            slice_spec=lambda name: TensorSlice(0, 0, 0) if name in on_host else None)
         check_loaded(language_model, language_model.load_weights(weights), source)
         process_weights_after_loading(language_model, torch.device(device))
         language_model.eval()

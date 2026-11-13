@@ -1015,10 +1015,21 @@ rank). ``model_kwargs``:
 ``max_seq_len`` (the context served, 65536), ``max_requests`` (requests holding state at
 once), ``moe_experts`` (how the routed experts are held: ``fp4``, the default, as the
 checkpoint packs them, 36 GB per GPU at TP8; ``fp8``, their exact upcast to E4M3 blocks, 68 GB;
-``dense``, bf16, 136 GB; the logits are the same bit for bit). The ``-1017`` refresh has the
-same layout: pass it as ``model_kwargs.checkpoint_path``. An ``ep_config: {parallel: ep}`` on
-the node group gives each rank whole routed experts (48 of the 384 at TP8, 2304 wide) instead
-of a slice of every one; its other keys are refused.
+``dense``, bf16, 136 GB; the logits are the same bit for bit), ``engram_tables`` (``device``,
+the default, or ``host``). The ``-1017`` refresh has the same layout: pass it as
+``model_kwargs.checkpoint_path``. An ``ep_config: {parallel: ep}`` on the node group gives each
+rank whole routed experts (48 of the 384 at TP8, 2304 wide) instead of a slice of every one;
+its other keys are refused.
+
+The two Engram tables are 203 GB of fp8 rows, of which a token reads 48 (12.7 KB). With
+``engram_tables: device`` each rank holds its shard of their rows (25.3 GB per GPU at TP8)
+and the ranks sum their lookups, one all-reduce per Engram layer. With ``host`` no rank
+holds them: the ``engram`` resource (``HostTableSpec`` in :doc:`adding_models`) maps the
+checkpoint's own bytes read-only, once for all ranks through the page cache (the host needs
+that 203 GB of memory free for it), and each step copies its hash ids to the host, gathers
+its rows there and copies them back, which makes the step wait for the one before it. The
+logits are the same; what it costs in tokens per second has not been measured on GPUs, so
+it is off by default.
 
 Chat renders each message in its role through the checkpoint's chat template (``developer``
 as ``system``; tool results fold into the next user turn, as the checkpoint's encoder writes

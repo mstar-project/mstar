@@ -16,6 +16,11 @@ model_kwargs:
   # the routed experts: fp4 as the checkpoint packs them (36 GB a rank), fp8 their exact
   # upcast to E4M3 blocks (68 GB), dense in bf16 (136 GB, past an H200 with the rest)
   moe_experts: fp4
+  # The two Engram tables (203 GB) from host memory instead of 25.3 GB a rank on the GPUs:
+  # one read-only mapping of the checkpoint's bytes for all ranks, each step's rows fetched
+  # through the host. Same values; its cost per step is not measured on GPUs yet. The host
+  # then needs 203 GB of page cache for them.
+  # engram_tables: host
 resources:
   # A cache per pooling ratio, a row per pooled group, each a latent of 512 and an index key
   # of 128 per source in their FP4 bytes (288 + 68): 890 bytes/token and 0.47 GB/rank together.
@@ -31,6 +36,11 @@ resources:
   state:
     # max_requests + the sink; 40 windows of 128 x 512 bf16 and the open groups: 5.6 MB/slot
     max_slots: 9
+  # with engram_tables: host, the tables' resource. Defaults: 4 MiB staged per copy (a
+  # 32 MiB pinned arena per rank), every page read and mapped at startup.
+  # engram:
+  #   staging_bytes: 4194304
+  #   prefault: true
 node_groups:
   - node_names: [LLM]
     ranks: [0, 1, 2, 3, 4, 5, 6, 7]

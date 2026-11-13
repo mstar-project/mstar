@@ -14,8 +14,9 @@ from mstar.engine.accelerator_graph_config import AcceleratorGraphConfig
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import KVStep, SamplerStep, Segment, SlotLease, SubmoduleStep
 from mstar.engine.resources.csa.config import CSAStep
+from mstar.engine.resources.host_table.config import HostTableStep
 from mstar.engine.resources.recurrent.config import RecurrentStep
-from mstar.model.deepseek_v41.config import CSA, LABEL, SAMPLER, STATE, DeepseekV41Config
+from mstar.model.deepseek_v41.config import CSA, ENGRAM, LABEL, SAMPLER, STATE, DeepseekV41Config
 from mstar.model.submodule_base import (
     END_PARTITION,
     ARNodeInputs,
@@ -113,6 +114,7 @@ class DeepseekV41LLMSubmodule(ARNodeSubmodule):
                 CSA: CSAStep(),
                 STATE: RecurrentStep(),
                 SAMPLER: SamplerStep(apply_penalty=True, prefill_tracked_tokens=prefill_tokens),
+                **({ENGRAM: HostTableStep()} if self.config.engram_on_host else {}),
             },
         )
 

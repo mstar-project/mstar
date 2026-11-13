@@ -164,8 +164,8 @@ def synthetic_tokenizer(vocab_size: int):
 def to_hf_config(config: DeepseekV41Config) -> dict:
     """``config`` as the checkpoint's config.json spells it (``from_hf_config``'s inverse)."""
     text = {f.name: getattr(config, f.name) for f in dataclasses.fields(config)}
-    for knob in ("max_seq_len", "max_output_tokens", "moe_experts", "fp8_block", "bos_token_id",
-                 "eos_token_ids", "pad_token_id"):
+    for knob in ("max_seq_len", "max_output_tokens", "moe_experts", "engram_tables", "fp8_block",
+                 "bos_token_id", "eos_token_ids", "pad_token_id"):
         text.pop(knob)
     text["rope_scaling"] = {
         "rope_type": "yarn", "factor": text.pop("rope_factor"), "beta_fast": text.pop("rope_beta_fast"),

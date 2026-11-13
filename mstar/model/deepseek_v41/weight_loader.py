@@ -5,9 +5,10 @@ The checkpoint names its tensors as its reference does (``layers.N.attn.wq_b.wei
 32 x 32 block and are dequantized to the model's dtype, which holds them exactly. Routed
 experts are packed E2M1 with a scale per row and 32 inputs: kept as those bytes, upcast to E4M3
 blocks without loss (refused where a block's row scales are too far apart), or dequantized, as
-``moe_experts`` says. The Engram tables stay fp8. Every tensor is sliced to this TP rank's
-shard here. Tensors of parts not served yet (the DSpark layers, the vision tower, the image
-router bias) are skipped by name; anything else unrecognized raises.
+``moe_experts`` says. The Engram tables stay fp8, and with ``engram_tables: host`` stay in the
+checkpoint's files for the engine to map. Every tensor is sliced to this TP rank's shard here.
+Tensors of parts not served yet (the DSpark layers, the vision tower, the image router bias)
+are skipped by name; anything else unrecognized raises.
 """
 from __future__ import annotations
 
@@ -134,6 +135,8 @@ class _Loader:
 
     def _engram_table(self, name: str, weight: torch.Tensor, scale: torch.Tensor) -> None:
         engram = self.modules[name]
+        if engram.host_table is not None:
+            return  # the engine maps it from the checkpoint's file: no parameter holds it
         weight, scale = weight.view(torch.uint8), scale.view(torch.uint8)
         rows = slice(engram.row_start, engram.row_start + engram.rows)
         for leaf, value, pad in (("table", weight[rows], 0), ("table_scale", scale[rows], None)):

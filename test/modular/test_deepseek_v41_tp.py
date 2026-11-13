@@ -28,7 +28,7 @@ TP2 = dict(moe_intermediate_size=64, o_lora_rank=32)
 TOL = 2e-5
 
 
-def _rank(rank: int, snapshot: str, store: str, out_dir: str, layout: str, parallel: str) -> None:
+def _rank(rank: int, snapshot: str, store: str, out_dir: str, layout: str, parallel: str, tables: str) -> None:
     from mstar.model.components.moe_parallel import MoeParallelConfig
 
     torch.set_num_threads(1)
@@ -37,7 +37,7 @@ def _rank(rank: int, snapshot: str, store: str, out_dir: str, layout: str, paral
         config = DeepseekV41Config.reduced(**TP2)
         engine, sampler, _ = _testing.build_engine(
             snapshot, torch.float32, tp_group=group, parallel_groups=groups,
-            moe_parallel=MoeParallelConfig(parallel=parallel), moe_experts=layout)
+            moe_parallel=MoeParallelConfig(parallel=parallel), moe_experts=layout, engram_tables=tables)
         ids = random_ids(config, PROMPT + STEPS, seed=11)
         torch.save(run_request(engine, sampler, ids, PROMPT), f"{out_dir}/{rank}.pt")
     finally:
@@ -53,12 +53,16 @@ def cpu(monkeypatch):
     torch.set_num_threads(threads)
 
 
-@pytest.mark.parametrize("layout, parallel", [("fp4", "tp"), ("fp8", "tp"), ("dense", "tp"), ("fp4", "ep")])
-def test_two_ranks_match_one(tmp_path, cpu, layout, parallel):
-    """A slice of every routed expert a rank, or with ``ep`` whole experts a rank."""
+@pytest.mark.parametrize("layout, parallel, tables", [
+    ("fp4", "tp", "device"), ("fp8", "tp", "device"), ("dense", "tp", "device"),
+    ("fp4", "ep", "device"), ("fp4", "tp", "host"),
+], ids=["fp4", "fp8", "dense", "whole-experts", "host-engram"])
+def test_two_ranks_match_one(tmp_path, cpu, layout, parallel, tables):
+    """A slice of every routed expert a rank, or with ``ep`` whole experts a rank; the Engram
+    tables sharded by rows and summed, or with ``host`` read whole by each rank."""
     snapshot = tmp_path / "snap"
     config, _ = _testing.write_snapshot(snapshot, DeepseekV41Config.reduced(**TP2), seed=5)
-    mp.spawn(_rank, args=(str(snapshot), str(tmp_path / "store"), str(tmp_path), layout, parallel), nprocs=2)
+    mp.spawn(_rank, args=(str(snapshot), str(tmp_path / "store"), str(tmp_path), layout, parallel, tables), nprocs=2)
     r0, r1 = (torch.load(tmp_path / f"{rank}.pt") for rank in (0, 1))
     assert torch.equal(r0, r1)
 
