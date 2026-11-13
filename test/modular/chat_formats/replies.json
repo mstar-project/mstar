@@ -162,6 +162,319 @@
      }
     }
    }
+  ],
+  "sglang_dsv41": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "celsius",
+         "fahrenheit"
+        ]
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "get_time",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "timezone": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "timezone"
+      ]
+     }
+    }
+   }
+  ],
+  "vllm_dsv4": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "location": {
+        "type": "string"
+       },
+       "unit": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "search",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "query": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "plan_trip",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "days": {
+        "type": "integer"
+       },
+       "flexible": {
+        "type": "boolean"
+       },
+       "cities": {
+        "type": "array",
+        "items": {
+         "type": "string"
+        }
+       },
+       "notes": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "run_command",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "command": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "set_timer",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "wait": {
+        "anyOf": [
+         {
+          "type": "object"
+         },
+         {
+          "type": "null"
+         }
+        ]
+       },
+       "patches": {
+        "allOf": [
+         {
+          "type": "array",
+          "items": {
+           "type": "object"
+          }
+         }
+        ]
+       }
+      }
+     }
+    }
+   }
+  ],
+  "dsv41_lookup": [
+   {
+    "type": "function",
+    "function": {
+     "name": "lookup",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "query": {
+        "type": "string"
+       },
+       "limit": {
+        "type": "integer"
+       }
+      }
+     }
+    }
+   }
+  ],
+  "dsv41_golden1": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "location": {
+        "type": "string",
+        "description": "The city name"
+       },
+       "unit": {
+        "type": "string",
+        "enum": [
+         "celsius",
+         "fahrenheit"
+        ],
+        "description": "Temperature unit"
+       }
+      },
+      "required": [
+       "location"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "search",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "query": {
+        "type": "string",
+        "description": "Search query"
+       },
+       "num_results": {
+        "type": "integer",
+        "description": "Number of results to return"
+       }
+      },
+      "required": [
+       "query"
+      ]
+     }
+    }
+   }
+  ],
+  "dsv41_golden3": [
+   {
+    "type": "function",
+    "function": {
+     "name": "search",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "queries": {
+        "type": "string",
+        "description": "query1||query2"
+       }
+      },
+      "required": [
+       "queries"
+      ],
+      "additionalProperties": false
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "open",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "open_list": {
+        "type": "array",
+        "items": {
+         "type": "object",
+         "properties": {
+          "id": {
+           "description": "ID or URL",
+           "anyOf": [
+            {
+             "type": "integer"
+            },
+            {
+             "type": "string"
+            }
+           ],
+           "default": -1
+          },
+          "loc": {
+           "type": "integer",
+           "description": "Start line",
+           "default": -1
+          },
+          "num_lines": {
+           "type": "integer",
+           "description": "",
+           "default": -1
+          }
+         },
+         "additionalProperties": false
+        },
+        "description": ""
+       }
+      },
+      "required": [
+       "open_list"
+      ],
+      "additionalProperties": false
+     }
+    }
+   }
+  ],
+  "dsv41_now": [
+   {
+    "type": "function",
+    "function": {
+     "name": "now",
+     "parameters": {
+      "type": "object",
+      "properties": {}
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "lookup",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "query": {
+        "type": "string"
+       },
+       "limit": {
+        "type": "integer"
+       }
+      }
+     }
+    }
+   }
   ]
  },
  "cases": [
@@ -912,6 +1225,571 @@
     "finish_reason": "stop"
    },
    "source": "sglang@4df3895bd rust/sglang-processor/tests/fixtures/openai_parity/glm-5.3.json case chat_thinking_cut"
+  },
+  {
+   "format": "deepseek_v41",
+   "id": "dsv41-answer-then-call",
+   "thinking": false,
+   "tools": "sglang_dsv41",
+   "forced_call": null,
+   "single_call": false,
+   "text": "I'll check the current weather in Paris for you.\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n<｜DSML｜ parameter name=\"city\" string=\"true\">Paris</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "expect": {
+    "reasoning_content": "",
+    "content": "I'll check the current weather in Paris for you.",
+    "tool_calls": [
+     {
+      "name": "get_weather",
+      "arguments": "{\"city\": \"Paris\"}"
+     }
+    ],
+    "finish_reason": "tool_calls"
+   },
+   "source": "sglang@4df3895bd rust/sglang-processor/tests/fixtures/openai_parity/deepseek-v4.1-flash.json case tools"
+  },
+  {
+   "format": "deepseek_v41",
+   "id": "dsv41-two-calls-one-block",
+   "thinking": false,
+   "tools": "sglang_dsv41",
+   "forced_call": null,
+   "single_call": false,
+   "text": "I'll get both pieces of information for you at the same time.\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n<｜DSML｜ parameter name=\"city\" string=\"true\">Paris</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"get_time\">\n<｜DSML｜ parameter name=\"timezone\" string=\"true\">Asia/Tokyo</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "expect": {
+    "reasoning_content": "",
+    "content": "I'll get both pieces of information for you at the same time.",
+    "tool_calls": [
+     {
+      "name": "get_weather",
+      "arguments": "{\"city\": \"Paris\"}"
+     },
+     {
+      "name": "get_time",
+      "arguments": "{\"timezone\": \"Asia/Tokyo\"}"
+     }
+    ],
+    "finish_reason": "tool_calls"
+   },
+   "source": "sglang@4df3895bd rust/sglang-processor/tests/fixtures/openai_parity/deepseek-v4.1-flash.json case tools_parallel"
+  },
+  {
+   "format": "deepseek_v41",
+   "id": "dsv41-reasoning-then-call",
+   "thinking": true,
+   "tools": "sglang_dsv41",
+   "forced_call": null,
+   "single_call": false,
+   "text": "The user wants the weather in Paris. Simple single tool call.</think>\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n<｜DSML｜ parameter name=\"city\" string=\"true\">Paris</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "expect": {
+    "reasoning_content": "The user wants the weather in Paris. Simple single tool call.",
+    "content": "",
+    "tool_calls": [
+     {
+      "name": "get_weather",
+      "arguments": "{\"city\": \"Paris\"}"
+     }
+    ],
+    "finish_reason": "tool_calls"
+   },
+   "source": "sglang@4df3895bd rust/sglang-processor/tests/fixtures/openai_parity/deepseek-v4.1-flash.json case tools_thinking_stream"
+  },
+  {
+   "format": "deepseek_v41",
+   "id": "dsv41-string-keeps-its-spaces",
+   "thinking": false,
+   "tools": "sglang_dsv41",
+   "forced_call": null,
+   "single_call": false,
+   "text": "I'll call get_weather with the city name including the surrounding spaces as you specified.\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n<｜DSML｜ parameter name=\"city\" string=\"true\"> New York </｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "expect": {
+    "reasoning_content": "",
+    "content": "I'll call get_weather with the city name including the surrounding spaces as you specified.",
+    "tool_calls": [
+     {
+      "name": "get_weather",
+      "arguments": "{\"city\": \" New York \"}"
+     }
+    ],
+    "finish_reason": "tool_calls"
+   },
+   "source": "sglang@4df3895bd rust/sglang-processor/tests/fixtures/openai_parity/deepseek-v4.1-flash.json case tools_spaced_string"
+  },
+  {
+   "format": "deepseek_v41",
+   "id": "dsv41-tools-offered-no-call",
+   "thinking": false,
+   "tools": "sglang_dsv41",
+   "forced_call": null,
+   "single_call": false,
+   "text": "Bonjour !",
+   "expect": {
+    "reasoning_content": "",
+    "content": "Bonjour !",
+    "tool_calls": [],
+    "finish_reason": "stop"
+   },
+   "source": "sglang@4df3895bd rust/sglang-processor/tests/fixtures/openai_parity/deepseek-v4.1-flash.json case tools_no_call"
+  },
+  {
+   "format": "deepseek_v41",
+   "id": "dsv41-no-tools-calls-are-text",
+   "thinking": false,
+   "tools": null,
+   "forced_call": null,
+   "single_call": false,
+   "text": "I'll check the current weather in Paris for you.\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n<｜DSML｜ parameter name=\"city\" string=\"true\">Paris</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "expect": {
+    "reasoning_content": "",
+    "content": "I'll check the current weather in Paris for you.\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n<｜DSML｜ parameter name=\"city\" string=\"true\">Paris</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+    "tool_calls": [],
+    "finish_reason": "stop"
+   },
+   "source": "sglang@4df3895bd rust/sglang-processor/tests/fixtures/openai_parity/deepseek-v4.1-flash.json case tools_none",
+   "note": "tool_choice none: the tools leave the prompt, so the parser has none, and the block is the answer's text, as SGLang returns it."
+  },
+  {
+   "format": "deepseek_v41",
+   "id": "dsv41-reasoning-then-answer",
+   "thinking": true,
+   "tools": null,
+   "forced_call": null,
+   "single_call": false,
+   "text": "We need answer briefly. 17*23=391. Need final.</think>391",
+   "expect": {
+    "reasoning_content": "We need answer briefly. 17*23=391. Need final.",
+    "content": "391",
+    "tool_calls": [],
+    "finish_reason": "stop"
+   },
+   "source": "sglang@4df3895bd rust/sglang-processor/tests/fixtures/openai_parity/deepseek-v4.1-flash.json case chat_thinking"
+  },
+  {
+   "format": "deepseek_v41",
+   "id": "dsv41-cut-in-reasoning",
+   "thinking": true,
+   "tools": null,
+   "forced_call": null,
+   "single_call": false,
+   "text": "We need answer briefly. 17*23=391.",
+   "expect": {
+    "reasoning_content": "We need answer briefly. 17*23=391.",
+    "content": "",
+    "tool_calls": [],
+    "finish_reason": "stop"
+   },
+   "source": "sglang@4df3895bd rust/sglang-processor/tests/fixtures/openai_parity/deepseek-v4.1-flash.json case chat_thinking_cut"
+  },
+  {
+   "format": "deepseek_v41",
+   "id": "dsv41-encoder-reasoning-answer-call",
+   "thinking": true,
+   "tools": "dsv41_lookup",
+   "forced_call": null,
+   "single_call": false,
+   "text": "  reason  </think>summary\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"lookup\">\n<｜DSML｜ parameter name=\"query\" string=\"true\">value</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"limit\" string=\"false\">2</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "expect": {
+    "reasoning_content": "  reason  ",
+    "content": "summary",
+    "tool_calls": [
+     {
+      "name": "lookup",
+      "arguments": "{\"query\": \"value\", \"limit\": 2}"
+     }
+    ],
+    "finish_reason": "tool_calls"
+   },
+   "source": "deepseek-ai/DeepSeek-V4.1-Flash@314113f8a encoding/test_encoding.py V41_TOOL_CALL_OUTPUT"
+  },
+  {
+   "format": "deepseek_v41",
+   "id": "vllm-content-then-call",
+   "thinking": false,
+   "tools": "vllm_dsv4",
+   "forced_call": null,
+   "single_call": false,
+   "text": "Let me check. <｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n<｜DSML｜ parameter name=\"location\" string=\"true\">Beijing</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"unit\" string=\"true\">celsius</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "expect": {
+    "reasoning_content": "",
+    "content": "Let me check.",
+    "tool_calls": [
+     {
+      "name": "get_weather",
+      "arguments": "{\"location\": \"Beijing\", \"unit\": \"celsius\"}"
+     }
+    ],
+    "finish_reason": "tool_calls"
+   },
+   "source": "vllm@d90e35cff tests/tool_parsers/test_deepseekv4_tool_parser.py::test_extract_tool_calls",
+   "note": "vLLM keeps the answer's trailing space (\"Let me check. \"). Here the answer is stripped at both ends."
+  },
+  {
+   "format": "deepseek_v41",
+   "id": "vllm-invoke-without-the-block",
+   "thinking": false,
+   "tools": "vllm_dsv4",
+   "forced_call": null,
+   "single_call": false,
+   "text": "<｜DSML｜ invoke name=\"search\">\n<｜DSML｜ parameter name=\"query\" string=\"true\">vllm</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "expect": {
+    "reasoning_content": "",
+    "content": "",
+    "tool_calls": [
+     {
+      "name": "search",
+      "arguments": "{\"query\": \"vllm\"}"
+     }
+    ],
+    "finish_reason": "tool_calls"
+   },
+   "source": "vllm@d90e35cff tests/tool_parsers/test_deepseekv4_tool_parser.py::test_missing_tool_calls_wrapper_is_recovered"
+  },
+  {
+   "format": "deepseek_v41",
+   "id": "vllm-typed-values",
+   "thinking": false,
+   "tools": "vllm_dsv4",
+   "forced_call": null,
+   "single_call": false,
+   "text": "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"plan_trip\">\n<｜DSML｜ parameter name=\"days\" string=\"false\">3</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"flexible\" string=\"false\">false</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"cities\" string=\"false\">[\"Beijing\",\"Shanghai\",\"Tokyo\",\"New York\"]</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"notes\" string=\"true\">靠窗座位</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "expect": {
+    "reasoning_content": "",
+    "content": "",
+    "tool_calls": [
+     {
+      "name": "plan_trip",
+      "arguments": "{\"days\": 3, \"flexible\": false, \"cities\": [\"Beijing\", \"Shanghai\", \"Tokyo\", \"New York\"], \"notes\": \"靠窗座位\"}"
+     }
+    ],
+    "finish_reason": "tool_calls"
+   },
+   "source": "vllm@d90e35cff tests/tool_parsers/test_deepseekv4_tool_parser.py::test_streaming_emits_incremental_argument_chunks"
+  },
+  {
+   "format": "deepseek_v41",
+   "id": "vllm-markup-in-a-string",
+   "thinking": false,
+   "tools": "vllm_dsv4",
+   "forced_call": null,
+   "single_call": false,
+   "text": "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"run_command\">\n<｜DSML｜ parameter name=\"command\" string=\"true\"><div class=\"a\">x > y</div>\n<div class=\"a\">x > y</div>\n<div class=\"a\">x > y</div>\n</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "expect": {
+    "reasoning_content": "",
+    "content": "",
+    "tool_calls": [
+     {
+      "name": "run_command",
+      "arguments": "{\"command\": \"<div class=\\\"a\\\">x > y</div>\\n<div class=\\\"a\\\">x > y</div>\\n<div class=\\\"a\\\">x > y</div>\\n\"}"
+     }
+    ],
+    "finish_reason": "tool_calls"
+   },
+   "source": "vllm@d90e35cff tests/tool_parsers/test_deepseekv4_tool_parser.py::test_streaming_string_argument_with_markup_is_incremental"
+  },
+  {
+   "format": "deepseek_v41",
+   "id": "vllm-redirect-in-a-string",
+   "thinking": false,
+   "tools": "vllm_dsv4",
+   "forced_call": null,
+   "single_call": false,
+   "text": "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"run_command\">\n<｜DSML｜ parameter name=\"command\" string=\"true\">git --version 2>&1</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "expect": {
+    "reasoning_content": "",
+    "content": "",
+    "tool_calls": [
+     {
+      "name": "run_command",
+      "arguments": "{\"command\": \"git --version 2>&1\"}"
+     }
+    ],
+    "finish_reason": "tool_calls"
+   },
+   "source": "vllm@d90e35cff tests/tool_parsers/test_deepseekv4_tool_parser.py::test_non_streaming_extract_with_angle_brackets"
+  },
+  {
+   "format": "deepseek_v41",
+   "id": "vllm-composed-schema-json",
+   "thinking": false,
+   "tools": "vllm_dsv4",
+   "forced_call": null,
+   "single_call": false,
+   "text": "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"set_timer\">\n<｜DSML｜ parameter name=\"wait\" string=\"false\">{\"type\":\"for\",\"minutes\":2880}</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"patches\" string=\"false\">[{\"op\":\"replace\",\"path\":\"/schedule\",\"value\":\"quiet\"}]</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "expect": {
+    "reasoning_content": "",
+    "content": "",
+    "tool_calls": [
+     {
+      "name": "set_timer",
+      "arguments": "{\"wait\": {\"type\": \"for\", \"minutes\": 2880}, \"patches\": [{\"op\": \"replace\", \"path\": \"/schedule\", \"value\": \"quiet\"}]}"
+     }
+    ],
+    "finish_reason": "tool_calls"
+   },
+   "source": "vllm@d90e35cff tests/tool_parsers/test_deepseekv4_tool_parser.py::test_composed_schema_converts_object_and_array_params"
+  },
+  {
+   "format": "deepseek_v41",
+   "id": "vllm-arguments-wrapper",
+   "thinking": false,
+   "tools": "vllm_dsv4",
+   "forced_call": null,
+   "single_call": false,
+   "text": "<｜DSML｜ calls><｜DSML｜ invoke name=\"get_weather\"><｜DSML｜ parameter name=\"arguments\" string=\"false\">{\"location\":\"Beijing\"}</｜DSML｜ parameter></｜DSML｜ invoke></｜DSML｜ calls>",
+   "expect": {
+    "reasoning_content": "",
+    "content": "",
+    "tool_calls": [
+     {
+      "name": "get_weather",
+      "arguments": "{\"arguments\": {\"location\": \"Beijing\"}}"
+     }
+    ],
+    "finish_reason": "tool_calls"
+   },
+   "source": "vllm@d90e35cff tests/tool_parsers/test_deepseekv4_tool_parser.py::test_extract_tool_calls_arguments_wrapper",
+   "note": "vLLM unwraps a lone \"arguments\" parameter that the schema lacks ({\"location\": \"Beijing\"}). Here the parameters are the arguments, as the model wrote them."
+  },
+  {
+   "format": "deepseek_v41",
+   "id": "string-false-is-json-whatever-the-schema",
+   "thinking": false,
+   "tools": "vllm_dsv4",
+   "forced_call": null,
+   "single_call": false,
+   "text": "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n<｜DSML｜ parameter name=\"location\" string=\"false\">94110</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"unit\" string=\"false\">C</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "expect": {
+    "reasoning_content": "",
+    "content": "",
+    "tool_calls": [
+     {
+      "name": "get_weather",
+      "arguments": "{\"location\": 94110, \"unit\": \"C\"}"
+     }
+    ],
+    "finish_reason": "tool_calls"
+   },
+   "source": "M*: DSML's own typing (encoding.py decode_dsml_to_arguments)",
+   "note": "string=\"false\" says the value is JSON: 94110 is a number though the schema says string, as DeepSeek's decoder reads it. A value that is not JSON (C) stays the text."
+  },
+  {
+   "format": "deepseek_v41",
+   "id": "no-string-attribute-the-schema-says",
+   "thinking": false,
+   "tools": "vllm_dsv4",
+   "forced_call": null,
+   "single_call": false,
+   "text": "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"plan_trip\">\n<｜DSML｜ parameter name=\"days\">3</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"notes\">7 nights</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "expect": {
+    "reasoning_content": "",
+    "content": "",
+    "tool_calls": [
+     {
+      "name": "plan_trip",
+      "arguments": "{\"days\": 3, \"notes\": \"7 nights\"}"
+     }
+    ],
+    "finish_reason": "tool_calls"
+   },
+   "source": "M*: vLLM's DSML pattern takes a parameter without string="
+  },
+  {
+   "format": "deepseek_v41",
+   "id": "unoffered-function-stays-text",
+   "thinking": false,
+   "tools": "dsv41_lookup",
+   "forced_call": null,
+   "single_call": false,
+   "text": "ok\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"rm_rf\">\n<｜DSML｜ parameter name=\"path\" string=\"true\">/</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "expect": {
+    "reasoning_content": "",
+    "content": "ok\n\n\n<｜DSML｜ invoke name=\"rm_rf\">\n<｜DSML｜ parameter name=\"path\" string=\"true\">/</｜DSML｜ parameter>\n</｜DSML｜ invoke>",
+    "tool_calls": [],
+    "finish_reason": "stop"
+   },
+   "source": "M*: as glm47 and qwen3_coder",
+   "note": "The invoke stays the answer's text; the block's own tags drop, as they always do."
+  },
+  {
+   "format": "deepseek_v41",
+   "id": "cut-inside-a-string-value",
+   "thinking": false,
+   "tools": "dsv41_lookup",
+   "forced_call": null,
+   "single_call": false,
+   "text": "<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"lookup\">\n<｜DSML｜ parameter name=\"query\" string=\"true\">val",
+   "expect": {
+    "reasoning_content": "",
+    "content": "",
+    "tool_calls": [
+     {
+      "name": "lookup",
+      "arguments": "{\"query\": \"val"
+     }
+    ],
+    "finish_reason": "stop"
+   }
+  },
+  {
+   "format": "deepseek_v41",
+   "id": "cut-inside-the-block-tag",
+   "thinking": false,
+   "tools": "dsv41_lookup",
+   "forced_call": null,
+   "single_call": false,
+   "text": "summary\n\n<｜DSML｜ ca",
+   "expect": {
+    "reasoning_content": "",
+    "content": "summary\n\n<｜DSML｜ ca",
+    "tool_calls": [],
+    "finish_reason": "stop"
+   }
+  },
+  {
+   "format": "deepseek_v41",
+   "id": "forced-named-call",
+   "thinking": false,
+   "tools": "dsv41_lookup",
+   "forced_call": "lookup",
+   "single_call": false,
+   "text": "<｜DSML｜ parameter name=\"query\" string=\"true\">value</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"limit\" string=\"false\">2</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "expect": {
+    "reasoning_content": "",
+    "content": "",
+    "tool_calls": [
+     {
+      "name": "lookup",
+      "arguments": "{\"query\": \"value\", \"limit\": 2}"
+     }
+    ],
+    "finish_reason": "tool_calls"
+   },
+   "source": "M*: tool_choice named, the prompt opens the call"
+  },
+  {
+   "format": "deepseek_v41",
+   "id": "forced-any-call",
+   "thinking": false,
+   "tools": "dsv41_lookup",
+   "forced_call": "",
+   "single_call": false,
+   "text": "lookup\">\n<｜DSML｜ parameter name=\"query\" string=\"true\">x</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "expect": {
+    "reasoning_content": "",
+    "content": "",
+    "tool_calls": [
+     {
+      "name": "lookup",
+      "arguments": "{\"query\": \"x\"}"
+     }
+    ],
+    "finish_reason": "tool_calls"
+   },
+   "source": "M*: tool_choice required over several tools, the model names one"
+  },
+  {
+   "format": "deepseek_v41",
+   "id": "single-call-ends-the-reply",
+   "thinking": false,
+   "tools": "dsv41_lookup",
+   "forced_call": null,
+   "single_call": true,
+   "text": "go\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"lookup\">\n<｜DSML｜ parameter name=\"query\" string=\"true\">a</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"lookup\">\n<｜DSML｜ parameter name=\"query\" string=\"true\">b</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "expect": {
+    "reasoning_content": "",
+    "content": "go",
+    "tool_calls": [
+     {
+      "name": "lookup",
+      "arguments": "{\"query\": \"a\"}"
+     }
+    ],
+    "finish_reason": "tool_calls"
+   },
+   "source": "M*: parallel_tool_calls false"
+  },
+  {
+   "format": "deepseek_v41",
+   "id": "encoder-golden-1-turn-1",
+   "thinking": true,
+   "tools": "dsv41_golden1",
+   "forced_call": null,
+   "single_call": false,
+   "text": "The user wants the weather in Beijing. I should call get_weather.</think>\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"get_weather\">\n<｜DSML｜ parameter name=\"location\" string=\"true\">Beijing</｜DSML｜ parameter>\n<｜DSML｜ parameter name=\"unit\" string=\"true\">celsius</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "expect": {
+    "reasoning_content": "The user wants the weather in Beijing. I should call get_weather.",
+    "content": "",
+    "tool_calls": [
+     {
+      "name": "get_weather",
+      "arguments": "{\"location\": \"Beijing\", \"unit\": \"celsius\"}"
+     }
+    ],
+    "finish_reason": "tool_calls"
+   },
+   "source": "deepseek-ai/DeepSeek-V4.1-Flash@314113f8a encoding/tests/test_output_1.txt"
+  },
+  {
+   "format": "deepseek_v41",
+   "id": "encoder-golden-3-turn-1",
+   "thinking": false,
+   "tools": "dsv41_golden3",
+   "forced_call": null,
+   "single_call": false,
+   "text": "\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"search\">\n<｜DSML｜ parameter name=\"queries\" string=\"true\">小柴胡冲剂 布洛芬 相互作用 一起吃</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "expect": {
+    "reasoning_content": "",
+    "content": "",
+    "tool_calls": [
+     {
+      "name": "search",
+      "arguments": "{\"queries\": \"小柴胡冲剂 布洛芬 相互作用 一起吃\"}"
+     }
+    ],
+    "finish_reason": "tool_calls"
+   },
+   "source": "deepseek-ai/DeepSeek-V4.1-Flash@314113f8a encoding/tests/test_output_3.txt"
+  },
+  {
+   "format": "deepseek_v41",
+   "id": "forced-named-call-without-arguments",
+   "thinking": false,
+   "tools": "dsv41_now",
+   "forced_call": "now",
+   "single_call": false,
+   "text": "</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "expect": {
+    "reasoning_content": "",
+    "content": "",
+    "tool_calls": [
+     {
+      "name": "now",
+      "arguments": "{}"
+     }
+    ],
+    "finish_reason": "tool_calls"
+   },
+   "note": "now takes no arguments, so the prompt ended in the empty call's own layout, name=\"now\">\\n\\n (one token after the name, as the encoder's turn has it)"
+  },
+  {
+   "format": "deepseek_v41",
+   "id": "block-ends-the-reasoning-without-close",
+   "thinking": true,
+   "tools": "dsv41_lookup",
+   "forced_call": null,
+   "single_call": false,
+   "text": "Look it up.\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"lookup\">\n<｜DSML｜ parameter name=\"query\" string=\"true\">x</｜DSML｜ parameter>\n</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+   "expect": {
+    "reasoning_content": "Look it up.\n\n",
+    "content": "",
+    "tool_calls": [
+     {
+      "name": "lookup",
+      "arguments": "{\"query\": \"x\"}"
+     }
+    ],
+    "finish_reason": "tool_calls"
+   },
+   "note": "the block ends the reasoning without </think>, as a call does for glm47; DeepSeek's own decoder refuses the reply (an assert)"
   }
  ]
 }

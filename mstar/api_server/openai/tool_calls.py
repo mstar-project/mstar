@@ -5,13 +5,16 @@ A template family writes a call in markup of its own (:class:`CallFormat`),
 named as vLLM's ``--tool-call-parser`` names it:
 
 * ``glm47`` (GLM-4.7 to GLM-5.3):
-  ``<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value>...</tool_call>``.
+  ``<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value>...</tool_call>``;
+* ``deepseek_v41`` (DeepSeek-V4.1's DSML): a ``<｜DSML｜ calls>`` block of
+  ``<｜DSML｜ invoke name="NAME">`` calls, each argument a
+  ``<｜DSML｜ parameter name="K" string="true">V</｜DSML｜ parameter>``.
 
-A family writes a string value bare and any other as JSON, so one state
-machine reads them all (:class:`ReplyParser`). It is
-``glm_chat.GlmReplyParser`` with the tags taken from the format: GLM still
-serves through its own, and ``test_chat_reply_corpus`` holds the two to the
-same deltas on every ``glm47`` reply.
+Each writes a string value bare and any other as JSON, so one state machine
+reads them all (:class:`ReplyParser`). It is ``glm_chat.GlmReplyParser`` with
+the tags taken from the format: GLM still serves through its own, and
+``test_chat_reply_corpus`` holds the two to the same deltas on every ``glm47``
+reply.
 """
 
 from __future__ import annotations
@@ -19,6 +22,8 @@ from __future__ import annotations
 import json
 import uuid
 from dataclasses import dataclass
+from enum import Enum
+from typing import NamedTuple
 
 # what a value is typed by, and how deltas join: the same for every format
 from mstar.api_server.openai.glm_chat import _arg_value, _json_types, _merged, _partial_tag
@@ -26,15 +31,35 @@ from mstar.api_server.openai.glm_chat import _arg_value, _json_types, _merged, _
 THINK_START, THINK_END = "<think>", "</think>"
 
 
+class ValueType(Enum):
+    """What a value's opening says the value is (``CallFormat.value_openings``)."""
+
+    TEXT = "text"  # the text as written
+    JSON = "json"  # a JSON value; one that is not JSON stays the text
+    SCHEMA = "schema"  # as the tool's schema says
+
+
+class ValueOpening(NamedTuple):
+    tag: str
+    type: ValueType
+
+
 @dataclass(frozen=True)
 class CallFormat:
     """How a template family writes one call: ``call_start NAME``, then per
     argument ``key_start KEY key_end value_start VALUE value_end``, then
-    ``call_end``. The name runs to the first ``key_start`` or the call's end.
+    ``call_end``.
+
+    With no ``name_end`` the name runs to the first ``key_start`` or the
+    call's end. ``value_openings``, in place of ``value_start``, are the tags a
+    value may follow its key with, each saying its type (DeepSeek's
+    ``string="true"``). ``section_start`` and ``section_end`` are a block the
+    calls sit in: not text, and its start ends the reasoning, as a call does.
 
     ``forced`` and ``forced_any`` are what a prompt ends with to open the
     reply inside a call to a named function (``{name}``), or to one the model
-    names.
+    names; ``forced_empty`` is ``forced`` for a function that takes no
+    arguments, where the template lays an empty call out differently.
     """
 
     name: str
@@ -42,20 +67,42 @@ class CallFormat:
     call_end: str
     key_start: str
     key_end: str
-    value_start: str
     value_end: str
     forced: str
     forced_any: str
+    name_end: str = ""
+    value_start: str = ""
+    value_openings: tuple[ValueOpening, ...] = ()
+    section_start: str = ""
+    section_end: str = ""
+    forced_empty: str = ""
 
-    def forced_prefix(self, name: str) -> str:
-        return self.forced.format(name=name) if name else self.forced_any
+    def forced_prefix(self, name: str, takes_arguments: bool = True) -> str:
+        if not name:
+            return self.forced_any
+        return (self.forced if takes_arguments or not self.forced_empty else self.forced_empty).format(name=name)
 
 
 GLM47 = CallFormat(
     "glm47", call_start="<tool_call>", call_end="</tool_call>", key_start="<arg_key>", key_end="</arg_key>",
     value_start="<arg_value>", value_end="</arg_value>", forced="<tool_call>{name}", forced_any="<tool_call>",
 )
-CALL_FORMATS = {f.name: f for f in (GLM47,)}
+DEEPSEEK_V41 = CallFormat(
+    # a name and a key end at their attribute's closing quote; the ">" after a name is text
+    # between arguments, which drops
+    "deepseek_v41", call_start='<｜DSML｜ invoke name="', name_end='"', call_end="</｜DSML｜ invoke>",
+    key_start='<｜DSML｜ parameter name="', key_end='"', value_end="</｜DSML｜ parameter>",
+    value_openings=(ValueOpening('string="true">', ValueType.TEXT), ValueOpening('string="false">', ValueType.JSON),
+                    ValueOpening(">", ValueType.SCHEMA)),
+    section_start="<｜DSML｜ calls>", section_end="</｜DSML｜ calls>",
+    # the encoder's layout up to the first parameter, after the prompt's </think>. Each ends on
+    # a token boundary of the turn the encoder writes: '">\n' before a parameter and '">\n\n'
+    # in a call without any are single tokens
+    forced='\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name="{name}">\n',
+    forced_empty='\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name="{name}">\n\n',
+    forced_any='\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name="',
+)
+CALL_FORMATS = {f.name: f for f in (GLM47, DEEPSEEK_V41)}
 
 
 class ReplyParser:
@@ -75,8 +122,8 @@ class ReplyParser:
 
     A call streams as it is written: its id and name once the name ends, then
     its ``arguments`` in pieces that add up to their ``json.dumps`` in any
-    chunking. A value the schema allows only as a string streams as it comes;
-    any other goes whole at its end. A value ends only at
+    chunking. A value that is a string (by its opening, else by the schema)
+    streams as it comes; any other goes whole at its end. A value ends only at
     ``value_end`` or the call's end, so markup inside it is the value's. A key
     given twice is in the JSON twice. A reply cut off inside a call keeps the
     call as far as it got, with no ``tool_calls`` finish; cut off before the
@@ -91,16 +138,18 @@ class ReplyParser:
         self._state = "reasoning" if thinking else "content"
         self._tools = tools
         self._buf = ""
-        # the tags read outside a call, by state
+        # the tags read outside a call, by state: a section's end only in the answer
         think = (THINK_START, THINK_END)
-        calls = (f.call_start,) if tools else ()
-        self._tags = {"reasoning": think + calls, "content": think + calls if thinking else calls}
+        calls = tuple(t for t in (f.call_start, f.section_start) if t) if tools else ()
+        answer = calls + ((f.section_end,) if calls and f.section_end else ())
+        self._tags = {"reasoning": think + calls, "content": think + answer if thinking else answer}
         # In a call: "name" until it ends, then "args" (between arguments), "key",
-        # "open" (past the key, before value_start) and "value"; "text" for a call to a
-        # function not offered. What ends each:
-        self._ends = {"name": (f.key_start, f.call_end), "text": (f.call_end,),
+        # "open" (past the key, before the value's opening) and "value"; "text" for a
+        # call to a function not offered. What ends each:
+        self._ends = {"name": (f.name_end or f.key_start, f.call_end), "text": (f.call_end,),
                       "args": (f.key_start, f.call_end), "key": (f.key_end, f.call_end),
                       "value": (f.value_end, f.call_end)}
+        self._openings = f.value_openings or (ValueOpening(f.value_start, ValueType.SCHEMA),)
         self._phase = "name"
         # the call's text up to the last feed, kept while it may still turn out text
         self._raw: list[str] = []
@@ -110,6 +159,8 @@ class ReplyParser:
         self._nargs = 0
         self._key: list[str] = []
         self._string = False
+        # the value's opening said it is JSON: no schema types it
+        self._json = False
         self._value: list[str] = []
         self._content_started = False
         self._held_space = ""
@@ -139,6 +190,7 @@ class ReplyParser:
         return out
 
     def _drain(self, final: bool) -> list[dict]:
+        f = self._format
         out, self._opening = self._opening, []
         while self._buf or (final and self._state == "call"):
             if self._state == "call":
@@ -159,8 +211,10 @@ class ReplyParser:
                 self._state = "content"
             elif tag == THINK_START:
                 self._state = "reasoning"
-            else:
+            elif tag == f.call_start:
                 self._state, self._phase = "call", "name"
+            else:  # the section's tags
+                self._state = "content"
         return _merged(out)
 
     def _drain_call(self, out: list[dict], final: bool) -> bool:
@@ -170,12 +224,13 @@ class ReplyParser:
         f, buf, phase = self._format, self._buf, self._phase
         if phase == "open":
             rest = buf.lstrip()
-            if rest.startswith(f.value_start):
-                self._buf = rest[len(f.value_start):]
-                self._open_value(out)
-                return True
+            for opening in self._openings:
+                if rest.startswith(opening.tag):
+                    self._buf = rest[len(opening.tag):]
+                    self._open_value(out, opening.type)
+                    return True
             self._buf = rest
-            if not final and f.value_start.startswith(rest):
+            if not final and any(o.tag.startswith(rest) for o in self._openings):
                 return False
             self._phase = "args"  # no value follows: the key drops
             return True
@@ -246,10 +301,14 @@ class ReplyParser:
         }]})
         self._phase = "args"
 
-    def _open_value(self, out: list[dict]) -> None:
+    def _open_value(self, out: list[dict], kind: ValueType) -> None:
         key = "".join(self._key).strip()
-        types = _json_types(self._props.get(key))
-        self._string = bool(types) and types <= {"string", "null"}
+        if kind is ValueType.SCHEMA:
+            types = _json_types(self._props.get(key))
+            self._string = bool(types) and types <= {"string", "null"}
+        else:
+            self._string = kind is ValueType.TEXT
+        self._json = kind is ValueType.JSON
         self._value = []
         opening = ("{" if not self._nargs else ", ") + json.dumps(key, ensure_ascii=False) + ": "
         self._args(out, opening + ('"' if self._string else ""))
@@ -260,7 +319,7 @@ class ReplyParser:
         if self._string:
             self._args(out, '"')
             return
-        schema = self._props.get("".join(self._key).strip())
+        schema = None if self._json else self._props.get("".join(self._key).strip())
         self._args(out, json.dumps(_arg_value("".join(self._value), schema), ensure_ascii=False))
 
     def _args(self, out: list[dict], text: str) -> None:

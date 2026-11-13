@@ -28,7 +28,7 @@ def _tools(case):
 
 def _parser(case):
     fmt, tools, forced = tool_calls.CALL_FORMATS[case["format"]], _tools(case), case["forced_call"]
-    prefix = "" if forced is None else fmt.forced_prefix(forced)
+    prefix = "" if forced is None else fmt.forced_prefix(forced, takes_arguments=bool(forced and tools[forced]))
     return tool_calls.ReplyParser(fmt, thinking=case["thinking"], tools=tools, reply_prefix=prefix,
                                   single_call=case["single_call"])
 
@@ -108,12 +108,13 @@ def test_any_text_parses_alike_in_any_chunking_and_whole_calls_are_json(fmt):
         {"type": "function", "function": {"name": "f", "parameters": {"type": "object", "properties": {
             "s": {"type": "string"}, "n": {"type": "integer"}, "o": {}}}}},
         {"type": "function", "function": {"name": "g", "parameters": {}}}])
-    tags = [fmt.call_start, fmt.call_end, fmt.key_start, fmt.key_end, fmt.value_start, fmt.value_end]
+    tags = [t for t in (fmt.call_start, fmt.call_end, fmt.key_start, fmt.key_end, fmt.value_start, fmt.value_end,
+                        fmt.name_end, fmt.section_start, fmt.section_end, *(o.tag for o in fmt.value_openings)) if t]
     frags = ["<think>", "</think>", *tags, *(t[:len(t) // 2] for t in tags), *(t[len(t) // 2:] for t in tags),
              "f", "g", "h", "s", "n", "o", " ", "\n", "<", "</", ">", '"', "x", "1", '"q"', "é", "[1]"]
 
     def run(text, size, forced, **kw):
-        prefix = "" if forced is None else fmt.forced_prefix(forced)
+        prefix = "" if forced is None else fmt.forced_prefix(forced, takes_arguments=forced == "f")
         return _reply(tool_calls.ReplyParser(fmt, tools=tools, reply_prefix=prefix, **kw),
                       [text[i:i + size].encode() for i in range(0, len(text), size)])
 
