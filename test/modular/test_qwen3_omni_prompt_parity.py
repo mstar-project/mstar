@@ -419,7 +419,7 @@ def test_an_image_a_few_pixels_tall_is_read_as_height_width_channels(model, heig
     from transformers import Qwen2VLImageProcessor
 
     model._processor.image_processor = Qwen2VLImageProcessor()
-    model._kv_layout = lambda *args: {}  # reads the checkpoint config; not what this checks
+    model._state_layout = lambda *args: {}  # reads the checkpoint config; not what this checks
     image = torch.randint(0, 256, (3, height, 128), dtype=torch.uint8)
     out = model.process_prompt("Describe.", ["image", "text"], ["text"], tensors={"image_inputs": [image]})
     # each attachment is a signal of its own (`split_spans`)

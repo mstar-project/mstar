@@ -26,6 +26,7 @@ from mstar.engine.state import (
     Fork,
     GatedDeltaNet,
     KVEntry,
+    PagedNHD,
     Positions,
     Read,
     Rope,
@@ -74,10 +75,10 @@ REFUSALS = {
                        "Array 'kv'.entry.tensors['k'].shard"),
     "a value's tensor": (lambda: _value(entry=Entry({"conv": TensorType((32, 0), dtype=None)})),
                          "Array 'gdn'.entry.tensors['conv'].shape"),
-    "host object": (lambda: _array(entry=Entry({}, host={"gen": torch.Generator})), "Array 'kv'.entry.host['gen']"),
-    "host list": (lambda: _array(entry=Entry({}, host={"ids": list})), "Array 'kv'.entry.host['ids']"),
-    "host tuple of objects": (lambda: _array(entry=Entry({}, host={"ids": tuple[object, ...]})),
-                              "Array 'kv'.entry.host['ids']"),
+    "host object": (lambda: _value(entry=Entry({}, host={"gen": torch.Generator})), "Array 'gdn'.entry.host['gen']"),
+    "host list": (lambda: _value(entry=Entry({}, host={"ids": list})), "Array 'gdn'.entry.host['ids']"),
+    "host tuple of objects": (lambda: _value(entry=Entry({}, host={"ids": tuple[object, ...]})),
+                              "Array 'gdn'.entry.host['ids']"),
     "window of zero": (lambda: _array(reads={"r": _read(mask=Window(0))}), "Array 'kv'.reads['r'].mask.size"),
     "q_heads of zero": (lambda: _array(reads={"r": _read(op=Attend(q_heads=0))}), "Array 'kv'.reads['r'].op.q_heads"),
     "empty read layers": (lambda: _array(reads={"r": _read(layers=set())}), "Array 'kv'.reads['r'].layers"),
@@ -140,6 +141,10 @@ REFUSALS = {
     ),
     "q_heads off the heads": (lambda: _array(reads={"r": _read(op=Attend(q_heads=6))}), "Array 'kv'.reads['r'].op"),
     "update off a Value": (lambda: _array(updates={"u": CausalConv()}), "Array 'kv'.updates['u']"),
+    "host fields off a Value": (lambda: _array(entry=Entry({}, host={"sent": bool})), "Array 'kv'.entry.host"),
+    "queries with a mask that uses the query's position": (
+        lambda: _array(reads={"r": _read(queries="video")}), "Array 'kv'.reads['r'].queries",
+    ),
     "update on one entry that isn't rewritable": (
         lambda: _array(entry=_GDN, max_len=1, updates={"u": CausalConv()}),
         "Array 'kv'.updates['u']: only a Value",
@@ -263,6 +268,11 @@ def test_kv_entry_is_k_and_v_sharded_on_the_heads():
 
 def test_an_entry_may_hold_only_host_fields():
     assert Entry({}, host={"eos_sent": bool}).tensors == {}, "a Value of host fields has no tensors"
+
+
+def test_a_paged_format_is_a_value_whatever_set_it_is_given():
+    assert PagedNHD(devices=["cuda"]) == PagedNHD(devices={"cuda"})
+    assert hash(PagedNHD(dtypes={torch.bfloat16})) == hash(PagedNHD(dtypes=[torch.bfloat16]))
 
 
 def test_a_fork_refuses_a_time_it_doesnt_have():
