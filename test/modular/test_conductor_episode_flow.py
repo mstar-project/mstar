@@ -45,6 +45,15 @@ class _EpisodeModel(StubModel):
         return [WalkStep("run")]
 
 
+class _TwoLabelEpisodeModel(_EpisodeModel):
+    def declare_state(self):
+        return [Array(
+            "frames", nodes={"llm"}, layers={0}, labels={"cond", "blank"},
+            entry=Entry({"frame": TensorType((1,), dtype=torch.uint8)}),
+            max_len=None, reads={"context": Read(mask=Window(4))}, lifetime="episode",
+        )]
+
+
 class _Comm:
     def __init__(self):
         self.sent = []
@@ -53,7 +62,8 @@ class _Comm:
         self.sent.append((worker, message))
 
 
-def _conductor(tmp_path, monkeypatch, *, replicas=1, capacity=1, pool_slots=None, **episode_config):
+def _conductor(tmp_path, monkeypatch, *, replicas=1, capacity=1, pool_slots=None,
+               model_type=_EpisodeModel, **episode_config):
     config = tmp_path / "cfg.yaml"
     config.write_text(yaml.safe_dump({
         "max_seq_len": 32,
@@ -64,7 +74,7 @@ def _conductor(tmp_path, monkeypatch, *, replicas=1, capacity=1, pool_slots=None
     comm = _Comm()
     monkeypatch.setattr(Conductor, "_launch_workers", lambda self: None)
     monkeypatch.setattr(conductor_mod, "make_communicator", lambda **kw: comm)
-    model = _EpisodeModel()
+    model = model_type()
     conductor = Conductor(model, str(config), socket_path_prefix=str(tmp_path / "s"))
     return conductor, model, comm
 
@@ -173,6 +183,15 @@ def test_changed_content_key_clears_just_its_array_before_planning(tmp_path, mon
 def test_startup_refuses_more_episode_slots_than_the_dense_pool_has(tmp_path, monkeypatch):
     with pytest.raises(ValueError, match="has 1 usable slots; episodes.max_episodes needs 2"):
         _conductor(tmp_path, monkeypatch, capacity=2, pool_slots=2)
+
+
+def test_startup_counts_each_label_of_an_episode_array(tmp_path, monkeypatch):
+    with pytest.raises(ValueError, match="8 slots"):
+        _conductor(tmp_path, monkeypatch, capacity=4, pool_slots=5,
+                   model_type=_TwoLabelEpisodeModel)
+    conductor, _, _ = _conductor(tmp_path, monkeypatch, capacity=4, pool_slots=9,
+                                model_type=_TwoLabelEpisodeModel)
+    assert conductor._episode_slots.capacity == 4
 
 
 def test_call_budget_refuses_after_the_first_admitted_call(tmp_path, monkeypatch):
