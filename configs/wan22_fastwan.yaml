@@ -12,6 +12,8 @@ model_kwargs:
   model_path_hf: FastVideo/FastWan2.2-TI2V-5B-FullAttn-Diffusers
   sampler: dmd
   vae_decode_fast_sizes: ["1280x704", "832x480"]
+  # the VAE decoder as a loop over pieces of the clip, each encoded while the next decodes (lossless)
+  stream_decode: true
 #   dmd_timesteps: [1000, 757, 522]
 
 node_groups:

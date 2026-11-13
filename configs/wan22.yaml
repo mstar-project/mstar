@@ -22,6 +22,8 @@ max_seq_len: 512
 model_kwargs:
   vae_decode_fast_sizes: ["1280x704", "832x480"]
   compile_dit_sizes: ["1280x704x81", "832x480x81"]
+  # the VAE decoder as a loop over pieces of the clip, each encoded while the next decodes (lossless)
+  stream_decode: true
 #   vae_decode_fast: false
 #   max_video_pixels: 536870912
 
