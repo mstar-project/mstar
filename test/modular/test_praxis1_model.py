@@ -9,11 +9,13 @@ against the published configs of both checkpoints, with no weights and no GPU.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import huggingface_hub
 import numpy as np
 import pytest
+import torch
 import yaml
 
 from mstar.api_server.openpi import OpenpiPolicy
@@ -81,7 +83,8 @@ DROID_CONFIG = {
         "tile_height": 224,
         "tile_width": 416,
     },
-    "text_encoder": {"model": "Qwen3.5-2B", "hidden_dim": 2048, "hidden_layer": -3},
+    "text_encoder": {"model": "Qwen3.5-2B", "hidden_dim": 2048, "hidden_layer": -3,
+                     "blank_caption": " "},
     "action_space": {"dim": 10},
 }
 
@@ -299,6 +302,65 @@ def test_dummy_mode_takes_the_rig_from_the_name_and_reads_nothing(repo, rig, wir
     assert (horizon, dim, model.max_input_files()["image"]) == wire
     assert set(model.get_graph_walk_graphs()) == {model.ENCODE_TEXT_WALK, model.CHUNK_WALK}
     assert no_download == []
+
+
+def test_dummy_prompt_has_the_declared_text_padding(monkeypatch, no_download):
+    model = Praxis1Model(model_path_hf="runwayml/praxis-1-droid", skip_weight_loading=True)
+    model.config = replace(model.config, normalization={
+        "proprio_mean": [0.0] * 10, "proprio_std": [1.0] * 10,
+    })
+    pads = []
+
+    class Tokenizer:
+        def __call__(self, *, pad_to_multiple_of, **kwargs):
+            pads.append(pad_to_multiple_of)
+            return {
+                "input_ids": torch.tensor([[1]]),
+                "attention_mask": torch.tensor([[1]]),
+            }
+
+    tokenizer = Tokenizer()
+
+    def fake_tokenizer():
+        return tokenizer
+
+    monkeypatch.setattr(model, "_tokenizer", fake_tokenizer)
+    model.process_prompt("pick up cup", robot_state=[0, 0, 0, 1, 0, 0, 0, 0])
+    assert pads == [32, 32]
+    assert no_download == []
+
+
+@pytest.mark.parametrize("caption", ["", "  "])
+def test_served_prompt_strips_text_and_normalizes_blank(tmp_path, monkeypatch, no_download, caption):
+    config = json.loads(json.dumps(DROID_CONFIG))
+    config["text_encoder"]["blank_caption"] = caption
+    model = _model(tmp_path, config, monkeypatch)
+    model.config = replace(model.config, normalization={
+        "proprio_mean": [0.0] * 10, "proprio_std": [1.0] * 10,
+    })
+    seen = []
+
+    class Tokenizer:
+        def __call__(self, *, text, **kwargs):
+            seen.append(text[0])
+            return {"input_ids": torch.tensor([[1]]), "attention_mask": torch.tensor([[1]])}
+
+    tokenizer = Tokenizer()
+
+    def fake_tokenizer():
+        return tokenizer
+
+    monkeypatch.setattr(model, "_tokenizer", fake_tokenizer)
+    model.process_prompt("  pick up cup\n", robot_state=[0, 0, 0, 1, 0, 0, 0, 0])
+    assert seen == ["pick up cup", " "]
+    assert no_download == []
+
+
+def test_served_checkpoint_requires_blank_caption():
+    config = json.loads(json.dumps(DROID_CONFIG))
+    del config["text_encoder"]["blank_caption"]
+    with pytest.raises(Praxis1ConfigError, match="blank_caption"):
+        Praxis1Config.from_dict(config)
 
 
 def test_the_config_read_fetches_config_json_only(tmp_path, monkeypatch):
