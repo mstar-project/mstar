@@ -28,6 +28,7 @@ from mstar.engine.state import (
     Fork,
     FrameWindow,
     GatedDeltaNet,
+    KeptWindow,
     KVEntry,
     Mamba2,
     PagedNHD,
@@ -383,3 +384,39 @@ def test_max_len_is_none_or_a_non_negative_int(max_len):
     assert _array(max_len=None).max_len is None, "None declares an unbounded log"
     with pytest.raises(ValueError, match=re.escape(f"Array 'kv'.max_len must be None or an int >= 0, got {max_len!r}")):
         _array(max_len=max_len)
+
+
+# Starts on an unbounded array
+
+
+def test_start_lengths_and_kept_windows_sit_only_on_an_unbounded_array():
+    _array(max_len=None, start_lengths=range(2, 5), kept_windows={"attn": KeptWindow(1, window=0, grows="sink")})
+    for field in ({"start_lengths": range(2, 5)}, {"kept_windows": {"attn": KeptWindow(1, window=2)}}):
+        with pytest.raises(ValueError, match=re.escape(
+            "Array 'kv': start_lengths and kept_windows size an unbounded array's kept window, and max_len is 16",
+        )):
+            _array(**field)
+
+
+@pytest.mark.parametrize("lengths", [range(4, 2), range(0, 8, 2), range(-1, 3), (2, 3, 4)])
+def test_start_lengths_are_every_length_between_two(lengths):
+    """The bounded KV sizes its slots over every length from the shortest start to the longest."""
+    with pytest.raises(ValueError, match=re.escape(
+        f"Array 'kv'.start_lengths must be a non-empty range of step 1 over lengths >= 0, got {lengths!r}",
+    )):
+        _array(max_len=None, start_lengths=lengths)
+
+
+def test_a_kept_windows_base_is_a_kept_window():
+    with pytest.raises(ValueError, match=re.escape("Array 'kv'.kept_windows['attn'] must be a KeptWindow, got (1, 0)")):
+        _array(max_len=None, kept_windows={"attn": (1, 0)})
+
+
+def test_a_kept_window_may_be_a_sink_alone():
+    """A 25 Hz conformer keeps its first entries and no window, as upstream truncates it to its prompt and 50 more."""
+    assert KeptWindow(50, window=0, grows="sink").window == 0, "a sink alone keeps entries"
+
+
+def test_a_kept_window_grows_on_its_sink_or_its_window():
+    with pytest.raises(ValueError, match=re.escape("KeptWindow.grows must be None, 'sink' or 'window', got 'both'")):
+        KeptWindow(1, window=1, grows="both")

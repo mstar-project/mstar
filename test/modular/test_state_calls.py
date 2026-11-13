@@ -23,6 +23,7 @@ from torch._dynamo.utils import counters
 
 from mstar.engine import state
 from mstar.engine.resources.attn.base import AttentionManager
+from mstar.engine.resources.kv.bounded.config import StreamPosition
 from mstar.engine.resources.kv.bounded.manager import BoundedKVManager
 from mstar.engine.resources.recurrent.config import RecurrentStep
 from mstar.engine.resources.recurrent.pool import RecurrentStatePool
@@ -35,13 +36,16 @@ from mstar.engine.state import (
     Array,
     ArrayStep,
     Attend,
+    Bidirectional,
     Block,
     Causal,
     CausalConv,
     Entry,
     Fork,
     GatedDeltaNet,
+    KeptWindow,
     KVEntry,
+    Layout,
     Mamba2,
     Positions,
     Read,
@@ -72,6 +76,7 @@ from mstar.engine.state.adapters import (
     _resolve,
     build_handle,
     build_specs,
+    kv_layouts,
     state_steps,
 )
 from mstar.engine.state.calls import ArrayHandle, SamplerHandle
@@ -2012,3 +2017,106 @@ def test_a_region_s_rows_reach_a_value_with_host_fields():
     _region(h, [1])
     h.check_step(step)
     h.end_step(step)
+
+
+# An unbounded array whose rows begin from shared starts, read through a kept window.
+
+
+def _started(**overrides) -> Array:
+    return _unbounded(**{
+        "reads": {"enc": Read(mask=Bidirectional(kept_window=True), op=Attend(q_heads=HEADS), packed=False)},
+        "start_lengths": range(2, 5), "kept_windows": {"enc": KeptWindow(1, window=2, grows="sink")}, **overrides,
+    })
+
+
+def _start(n: int, dtype=torch.float32) -> dict[str, torch.Tensor]:
+    return {field: torch.randn(2, n, HEADS, BOUNDED_DIM, dtype=dtype) for field in ("k", "v")}
+
+
+def _with_starts(*lengths) -> tuple[ArrayHandle, BoundedKVManager, list[dict[str, torch.Tensor]]]:
+    h, kv = _bounded(_started())
+    starts = [_start(n) for n in lengths]
+    h.set_starts(starts)
+    return h, kv, starts
+
+
+def test_each_row_reads_the_start_its_step_names():
+    """Row 1 begins from the 3-entry start and row 2 from the 2-entry one. The read hands the manager both, laid out as
+    the layer's source, and each row's position names its own."""
+    h, kv, starts = _with_starts(2, 3)
+    step = _bounded_step(h, kv, spans=(2, 2), enc_kv=ArrayStep(starts={1: 1, 2: 0}))
+    assert step.steps[h.name].positions == {
+        1: StreamPosition(source_len=3, written=0, source=1), 2: StreamPosition(source_len=2, written=0, source=0),
+    }
+    q, k, v, _ = _frames(rows=2)
+    bias = torch.randn(2, HEADS, 2, 16)
+    h.add(6, k=k, v=v)
+    out = h.read(6, q, distance_bias=bias)
+    direct = BoundedKVManager(kv.config, torch.device("cpu"), torch.float32)
+    assert direct.admit(step.steps[h.name], step.ctx).ok
+    direct.plan(step.steps[h.name], step.ctx)
+    source = torch.zeros(2, 1, HEADS, 3, 2 * BOUNDED_DIM)
+    for i, start in enumerate(starts):
+        source[i, 0, :, :start["k"].shape[1]] = torch.cat([start["k"][1], start["v"][1]], dim=-1).transpose(0, 1)
+    expected = direct.attend(1, q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), source, rel_bias=bias)
+    assert torch.equal(out, expected), "each row attends its own start, then its step's entries"
+
+
+def test_a_region_takes_a_rows_start_from_the_open_step():
+    """The node's step names each row's start once, and a region's step inside it names none."""
+    h, kv, _ = _with_starts(2, 3)
+    _bounded_step(h, kv, spans=(2,), enc_kv=ArrayStep(starts={1: 1}))
+    region = state_steps(_step(h, segments=[Segment(1, "main", 2)]), {h.name: h})
+    assert region.steps[h.name].positions[1] == StreamPosition(source_len=3, written=0, source=1), (
+        "the region would plan row 1 as padding, with no start"
+    )
+
+
+def test_set_starts_after_the_first_step_is_refused():
+    h, kv, starts = _with_starts(2)
+    _bounded_step(h, kv, enc_kv=ArrayStep(starts={1: 0}))
+    _refused(r"Array 'enc_kv': set_starts after the handle's first step", lambda: h.set_starts(starts))
+
+
+def test_a_start_of_a_length_outside_start_lengths_is_refused():
+    h, _ = _bounded(_started())
+    _refused(rf"Array 'enc_kv': start 0's k is \(2, 5, {HEADS}, {BOUNDED_DIM}\), and a start is \(layers 2, n, heads "
+             rf"{HEADS}, head_dim {BOUNDED_DIM}\) with n in range\(2, 5\)", lambda: h.set_starts([_start(5)]))
+
+
+def test_a_start_in_another_dtype_than_the_cache_is_refused():
+    h, _ = _bounded(_started())
+    _refused(r"Array 'enc_kv': start 0's k is torch.float16, and the bounded KV holds torch.float32",
+             lambda: h.set_starts([_start(3, dtype=torch.float16)]))
+
+
+def test_a_real_row_with_no_start_is_refused():
+    """The bounded KV would plan it as padding, and it would attend none of its start."""
+    h, _, _ = _with_starts(2)
+    _refused(r"Array 'enc_kv': rows \[1\] begin from no start", lambda: _begin(h, segments=[Segment(1, "main", 2)]))
+
+
+def test_a_capture_s_rows_begin_from_no_start():
+    h, _, _ = _with_starts(2)
+    step = state_steps(_step(h, segments=[Segment("dummy", "main", 2)], ctx=_ctx(capture=True, rows=("dummy",))),
+                       {h.name: h})
+    h.begin_step(step)
+    assert step.steps[h.name].positions == {}, "a capture's rows are padding, which the bounded KV plans as such"
+
+
+def test_a_start_past_those_set_is_refused():
+    h, _, _ = _with_starts(2)
+    _refused(r"Array 'enc_kv': row 1 begins from start 1, and set_starts gave 1", lambda: state_steps(
+        _step(h, segments=[Segment(1, "main", 2)], enc_kv=ArrayStep(starts={1: 1})), {h.name: h},
+    ))
+
+
+def test_starts_on_an_array_with_no_start_lengths_are_refused():
+    h, _ = _bounded()
+    _refused(r"Array 'enc_kv': a step names starts, and the array declares no start_lengths",
+             lambda: _begin(h, enc_kv=ArrayStep(starts={1: 0})))
+
+
+def test_a_layout_that_sizes_an_unbounded_kept_window_is_refused():
+    with pytest.raises(RuntimeError, match=r"state_layout\['enc_kv'\]\['main'\]\.kept_windows: an unbounded array"):
+        kv_layouts([_started()], {"enc_kv": {"main": Layout(kept_windows={"enc": KeptWindow(1, window=2)})}}, {})

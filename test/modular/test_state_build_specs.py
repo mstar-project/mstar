@@ -46,6 +46,7 @@ from mstar.engine.state import (
     CausalConv,
     Entry,
     GatedDeltaNet,
+    KeptWindow,
     KVEntry,
     Mamba2,
     Positions,
@@ -1086,3 +1087,45 @@ def test_node_handles_build_a_bounded_handle():
     assert isinstance(h, BoundedHandle) and list(h.reads) == ["enc_attn"], "the handle takes its read by its key"
     assert [bound.key for bound in h._bindings] == ["enc_attn", "rope"], "the read, then the positions entry"
     assert position(h, 1, "main") == 9 and h.written(1) == 9, "position() and the step builder read one count"
+
+
+def _kept(grows="sink", **overrides) -> Array:
+    """An unbounded array whose rows begin from starts of 2 to 4 entries, read through a kept window."""
+    return _unbounded(**{
+        "reads": {"enc_attn": _window(mask=Bidirectional(kept_window=True))}, "start_lengths": range(2, 5),
+        "kept_windows": {"enc_attn": KeptWindow(3, window=1, grows=grows)}, **overrides,
+    })
+
+
+@pytest.mark.parametrize("grows, kept", [
+    ("sink", lambda n: SinkWindow(3 + n, 1)),
+    ("window", lambda n: SinkWindow(3, 1 + n)),
+    (None, lambda n: SinkWindow(3, 1)),
+], ids=["sink", "window", "neither"])
+def test_a_kept_window_read_on_an_unbounded_array_builds_a_bounded_kv_over_its_starts(grows, kept):
+    (spec,) = build_specs([_kept(grows)])
+    config = spec.config
+    assert isinstance(spec, BoundedKVSpec) and (config.min_source_len, config.max_source_len) == (2, 4)
+    assert config.query_window is None and config.rows_per_request == 1, "every query of a step sees the same keys"
+    assert [config.retention_for(n) for n in range(2, 5)] == [kept(n) for n in range(2, 5)], (
+        "the side grows names gains the start's length, as upstream truncates"
+    )
+
+
+def test_an_unbounded_kept_window_read_without_start_lengths_is_refused():
+    _no_layout("reads['enc_attn'] keeps a window whose sizes grow from each row's start, and start_lengths is None",
+               _kept(start_lengths=None))
+
+
+def test_an_unbounded_kept_window_read_without_a_base_is_refused():
+    _no_layout("kept_windows gives no base for the kept-window read 'enc_attn'", _kept(kept_windows={}))
+
+
+def test_start_lengths_beside_a_window_read_are_refused():
+    _no_layout("start_lengths or kept_windows beside the Window read 'enc_attn', whose size is its own",
+               _unbounded(start_lengths=range(2, 5)))
+
+
+def test_a_base_for_no_kept_window_read_is_refused():
+    _no_layout("kept_windows names ['other'], which aren't kept-window reads of the array",
+               _kept(kept_windows={"enc_attn": KeptWindow(3, window=1), "other": KeptWindow(1, window=1)}))

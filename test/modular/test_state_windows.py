@@ -1139,3 +1139,19 @@ def test_a_frame_fits_the_block_mask_by_one_rule(tokens, fits):
         with pytest.raises(ValueError, match="must be a multiple of the sparse block size"):
             build()
 
+
+
+def test_a_paged_kept_window_still_refuses_no_window():
+    """A sink alone is an unbounded array's base; the paged pool keeps a window of at least one entry."""
+    with pytest.raises(RuntimeError, match=r"kept_windows\['self_attn'\] keeps no window"):
+        kv_layouts([_kept_array()], {"dit_kv": {"main": Layout(kept_windows={
+            "self_attn": KeptWindow(18, window=0),
+        })}}, {})
+
+
+def test_a_paged_kept_window_refuses_a_growing_base():
+    """A request's layout gives its sizes whole, so nothing grows them."""
+    with pytest.raises(RuntimeError, match=r"kept_windows\['self_attn'\]\.grows is 'sink'"):
+        kv_layouts([_kept_array()], {"dit_kv": {"main": Layout(kept_windows={
+            "self_attn": KeptWindow(18, window=24, grows="sink"),
+        })}}, {})
