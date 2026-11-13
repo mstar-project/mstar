@@ -904,7 +904,7 @@ class Speculator:
         if dropped:
             logger.warning(
                 "Speculation: dropped rids %s (no loop-back output from N)",
-                sorted(self._graph_runtime.get_rid_string(r) for r in dropped),
+                sorted(str(self._graph_runtime.get_rid_string(r)) for r in dropped),
             )
             # Its final chunks go back below; it must not flush or report done.
             speculation.node_batch.drop_rids(dropped)
