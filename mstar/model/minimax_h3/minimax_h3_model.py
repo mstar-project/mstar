@@ -36,9 +36,10 @@ from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import Model, TensorAndMetadata, WalkStep
 from mstar.model.components.diffusion.attention import dit_entry, refuse_attention_backend_kwarg
 from mstar.model.components.diffusion.step_cache import step_cache_policy
-from mstar.model.components.video_encode import encode_mp4
+from mstar.model.components.video_encode import Mp4Encoding, encode_mp4
 from mstar.model.media_limits import PILLOW_IMAGE_FORMATS, check_image_size
 from mstar.model.minimax_h3.components.layout import H3Layout
+from mstar.model.minimax_h3.components.video_vae import ClipWalk
 from mstar.model.minimax_h3.config import (
     AUDIO_CHANNELS,
     AUDIO_DECODER_NODE,
@@ -80,6 +81,7 @@ from mstar.model.minimax_h3.submodules import (
     TEXT_EMBEDS,
     TEXT_INPUTS,
     TEXT_SPAN,
+    VAE_TAIL,
     VIDEO_OUTPUT,
     VISION_PIXELS,
     H3AudioDecoderSubmodule,
@@ -98,6 +100,12 @@ ENCODE_KEYFRAMES_WALK = "encode_keyframes"
 GENERATE_AV_WALK = "generate_av"
 GENERATE_VIDEO_WALK = "generate_video"
 GENERATE_AUDIO_WALK = "generate_audio"
+# stream_decode: the video decoder as a loop, one temporal clip an iteration (its count is the
+# request's clips; this only bounds it: 15 s is 21 clips)
+DECODE_LOOP = "vae_decode_loop"
+MAX_DECODE_CLIPS = 64
+# the frames a streamed decode emits per clip: pieces of one mp4 (the data worker's VIDEO_PART)
+VIDEO_PART = "video_part"
 GENERATE_WALKS = {
     frozenset({"video", "audio"}): GENERATE_AV_WALK,
     frozenset({"video"}): GENERATE_VIDEO_WALK,
@@ -183,6 +191,7 @@ class H3Model(Model):
         vae_compile: bool = False,
         step_cache: dict | None = None,
         distilled_checkpoint: str | None = None,
+        stream_decode: bool = False,
         **kwargs,
     ):
         refuse_attention_backend_kwarg(kwargs)
@@ -211,6 +220,9 @@ class H3Model(Model):
             raise ValueError(f"row_bucket must be a positive int, got {row_bucket!r}")
         self.vae_tile_batch = int(vae_tile_batch)  # 1 decodes one tile a call, as the reference
         self.vae_compile = bool(vae_compile)
+        # the video decoder as a loop over its clips, each clip's frames encoded while the next
+        # decodes (lossless; one rank: not with an SP-sharded decoder)
+        self.stream_decode = bool(stream_decode)
         # opt-in, lossy: the DiT's step cache (components/diffusion/step_cache.py); None runs every step
         self.step_cache = step_cache_policy(step_cache, MAG_RATIOS)
         # a few-step distilled release (hub id or path) whose DiT replaces FL2VA's (H3Distilled)
@@ -310,10 +322,23 @@ class H3Model(Model):
         loop_outputs: list[GraphEdge] = []
         if video:
             loop_outputs.append(GraphEdge(next_node=VAE_DECODER_NODE, name=LATENTS))
-            decoders.append(GraphNode(
-                name=VAE_DECODER_NODE, enable_async_scheduling=self.async_scheduling, input_names=[LATENTS],
-                outputs=[GraphEdge(next_node=EMIT_TO_CLIENT, name=VIDEO_OUTPUT, output_modality="video")],
-            ))
+            if self.stream_decode:
+                decoders.append(Loop(
+                    name=DECODE_LOOP,
+                    section=GraphNode(
+                        name=VAE_DECODER_NODE, enable_async_scheduling=self.async_scheduling,
+                        input_names=[LATENTS, VAE_TAIL],
+                        outputs=[GraphEdge(next_node=VAE_DECODER_NODE, name=VAE_TAIL),
+                                 GraphEdge(next_node=EMIT_TO_CLIENT, name=VIDEO_OUTPUT, output_modality=VIDEO_PART)],
+                    ),
+                    max_iters=MAX_DECODE_CLIPS,
+                    outputs=[],
+                ))
+            else:
+                decoders.append(GraphNode(
+                    name=VAE_DECODER_NODE, enable_async_scheduling=self.async_scheduling, input_names=[LATENTS],
+                    outputs=[GraphEdge(next_node=EMIT_TO_CLIENT, name=VIDEO_OUTPUT, output_modality="video")],
+                ))
         if audio:
             loop_outputs.append(GraphEdge(next_node=AUDIO_DECODER_NODE, name=AUDIO_LATENTS))
             decoders.append(GraphNode(
@@ -557,7 +582,12 @@ class H3Model(Model):
         })
 
     def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
-        return {DENOISE_LOOP: h3_schedule(*self.resolve_schedule(model_kwargs)).num_steps}
+        caps = {DENOISE_LOOP: h3_schedule(*self.resolve_schedule(model_kwargs)).num_steps}
+        if self.stream_decode:
+            request = self.resolve_request(model_kwargs)
+            latent_frames = self.request_layout(request, 0).latent_frames
+            caps[DECODE_LOOP] = ClipWalk.of(self.config.video_vae).num_clips(latent_frames)
+        return caps
 
     # --------------------------------------------------------------- plan
     def request_layout(self, request: dict, text_len: int, anchors: tuple[str, ...] = ()) -> H3Layout:
@@ -623,8 +653,12 @@ class H3Model(Model):
         if modality != "video":
             raise ValueError(f"unsupported output modality for MiniMax-H3: {modality!r}")
         frames = (output[0] if output.ndim == 5 else output).cpu().numpy()
+        fps, options, pad_even = self.mp4_encoding(request_kwargs)
+        return encode_mp4(frames, fps, options=options, pad_even=pad_even)
+
+    def mp4_encoding(self, request_kwargs: dict | None = None) -> Mp4Encoding:
         # CRF 18, ultrafast: the encode is on the request's critical path
-        return encode_mp4(frames, FPS, options={"crf": "18", "preset": "ultrafast", "threads": "0"})
+        return Mp4Encoding(FPS, {"crf": "18", "preset": "ultrafast", "threads": "0"})
 
     def get_output_sample_rate(self, modality: str = "audio") -> int:
         return self.config.audio_vae.sample_rate
@@ -678,7 +712,8 @@ class H3Model(Model):
             )
         if node_name == VAE_DECODER_NODE:
             return H3VideoDecoderSubmodule(weight_loader.build_video_decoder(config, snapshot, device), config,
-                                           tile_batch=self.vae_tile_batch, compile_blocks=self.vae_compile)
+                                           tile_batch=self.vae_tile_batch, compile_blocks=self.vae_compile,
+                                           stream_loop=DECODE_LOOP if self.stream_decode else None)
         if node_name == AUDIO_DECODER_NODE:
             return H3AudioDecoderSubmodule(weight_loader.build_audio_vae(config, snapshot, device), config)
         logger.warning("MiniMax-H3 has no submodule for node %r; running it dummy", node_name)

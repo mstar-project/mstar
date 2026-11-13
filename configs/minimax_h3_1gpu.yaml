@@ -11,6 +11,8 @@ model_kwargs:
   compile: true
   vae_tile_batch: 28
   vae_compile: true
+  # the decoder as a loop over its clips, each clip's frames encoded while the next decodes
+  stream_decode: true
 
 node_groups:
   - node_names: [dit, text_encoder, vae_encoder, vae_decoder, audio_decoder]

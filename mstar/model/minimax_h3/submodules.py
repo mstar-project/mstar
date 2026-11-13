@@ -70,6 +70,8 @@ logger = logging.getLogger(__name__)
 TEXT_INPUTS, TEXT_EMBEDS = "text_inputs", "text_embeds"
 LATENTS, AUDIO_LATENTS = "latents", "audio_latents"
 VIDEO_OUTPUT, AUDIO_OUTPUT = "video_output", "audio_output"
+# the streamed decode's loop-back: the overlap a clip leaves the next one to cross-fade into
+VAE_TAIL = "vae_tail"
 # denoise step inputs, not edges (host-side): whether this is a request's first step, and whether
 # every row of it is on one timestep (video and audio both start at t = 0, no keyframe rows)
 FIRST_STEP, ONE_TIMESTEP = "first_step", "one_timestep"
@@ -457,18 +459,26 @@ class H3VideoDecoderSubmodule(_LayoutBatched, BatchedRows, NodeSubmodule):
     On SP ranks its sequence shard (``vae_shard``, ``exchanges=False``: nothing mixes
     clips but the cross-fade after the gather) splits each request's clips: each rank decodes
     its contiguous share and the shares are gathered on every rank, the DiT's ranks decoding
-    in lockstep, scheduled by its rank 0 between denoise steps."""
+    in lockstep, scheduled by its rank 0 between denoise steps.
+
+    With ``stream_loop`` it runs as that loop instead, one temporal clip an iteration (the
+    loop's count), and emits the frames each clip finishes as it goes (``video_part``), the
+    overlap it leaves the next clip carried on the ``vae_tail`` loop-back: the same tiles in
+    the same calls when a clip's tiles are a multiple of ``tile_batch``, so the same frames,
+    and the API server encodes each piece while the next one decodes. One request a step;
+    not with a sequence shard."""
 
     # the label a step declares a request's clips under
     CLIPS = "clips"
 
     disable_torch_compile = True
-    output_keys = (VIDEO_OUTPUT,)
 
     def __init__(self, vae: nn.Module, config: H3Config, *, max_batch_size: int = 1, tile_batch: int = 1,
-                 compile_blocks: bool = False):
+                 compile_blocks: bool = False, stream_loop: str | None = None):
         super().__init__()
         self.vae = vae
+        self.stream_loop = stream_loop
+        self.output_keys = (VIDEO_OUTPUT,) if stream_loop is None else (VIDEO_OUTPUT, VAE_TAIL)
         if compile_blocks and vae is not None:
             # static per tile count: a rank's tiles (its clips' times the canvas's) go
             # tile_batch at a time, so a count tile_batch doesn't divide, e.g. 2 x 16 at
@@ -480,12 +490,25 @@ class H3VideoDecoderSubmodule(_LayoutBatched, BatchedRows, NodeSubmodule):
         self.tile_batch = int(tile_batch)
 
     def prepare_inputs(self, graph_walk, fwd_info, inputs: NameToTensorList, **kwargs) -> NodeInputs:
-        return NodeInputs(tensor_inputs={LATENTS: inputs[LATENTS][0]},
-                          resource_step_info=layout_from_metadata(fwd_info.step_metadata))
+        node_inputs = NodeInputs(tensor_inputs={LATENTS: inputs[LATENTS][0]},
+                                 resource_step_info=layout_from_metadata(fwd_info.step_metadata))
+        if self.stream_loop is not None:
+            # iteration 0 has no loop-back yet; a clip that leaves no overlap sends an empty one
+            tail = (inputs.get(VAE_TAIL) or [None])[0]
+            node_inputs.kwargs = {"clip": int(fwd_info.dynamic_loop_iter_counts.get(self.stream_loop, 0)),
+                                  "tail": tail if tail is not None and tail.numel() else None}
+        return node_inputs
+
+    def can_batch(self, batch, model_inputs) -> bool:
+        # a streamed decode's requests are at clips of their own
+        return self.stream_loop is None and super().can_batch(batch, model_inputs)
 
     def preprocess(self, graph_walk, engine_inputs, inputs: list[NodeInputs]) -> dict:
-        return {LATENTS: torch.stack([inp.tensor_inputs[LATENTS] for inp in inputs]),
-                "layout": inputs[0].resource_step_info}
+        batch = {LATENTS: torch.stack([inp.tensor_inputs[LATENTS] for inp in inputs]),
+                 "layout": inputs[0].resource_step_info}
+        if self.stream_loop is not None:
+            batch.update(inputs[0].kwargs)
+        return batch
 
     def declare_step(self, graph_walk, request_ids, inputs: list[NodeInputs], **kwargs) -> SubmoduleStep | None:
         if self.sequence_shard is None:
@@ -497,15 +520,36 @@ class H3VideoDecoderSubmodule(_LayoutBatched, BatchedRows, NodeSubmodule):
         ]
         return SubmoduleStep(steps={}, segments=segments)
 
-    def run_batch(self, latents: torch.Tensor, layout: H3Layout, **kwargs):
+    def run_batch(self, latents: torch.Tensor, layout: H3Layout, clip: int | None = None,
+                  tail: torch.Tensor | None = None, **kwargs):
         # SDPA within each fixed-size tile, as the reference: dense, one segment, no capture,
         # so a ragged resource would add planning for nothing
         z = self.ends.latents(latents.to(self.get_device()), layout)
         shard = self.sequence_shard
         split = None if shard is None else shard.split_range(self.CLIPS)
+        if self.stream_loop is not None:
+            if split is not None:  # every rank of the instance refuses alike
+                raise ValueError("MiniMax-H3's streamed decode (stream_decode) runs on one rank, not a split decoder")
+            return self._decode_clip(z, layout, clip, tail)
         if split is None:
             return {VIDEO_OUTPUT: self.ends.frames(self.vae.decode(z, sdpa_attention, tile_batch=self.tile_batch))}
         return {VIDEO_OUTPUT: self.ends.frames(self._decode_shared(z, shard, split))}
+
+    def _decode_clip(self, z: torch.Tensor, layout: H3Layout, clip: int, tail: torch.Tensor | None) -> dict:
+        """Clip ``clip`` of the request's walk: the frames it finishes, and the overlap it leaves."""
+        num_latents = z.shape[2]
+        z, num_clips = self.vae.clip_plan(z)
+        if not 0 <= clip < num_clips:
+            raise ValueError(f"the streamed decode is at clip {clip} of a walk of {num_clips}")
+        if (tail is None) != (clip == 0 or self.vae.walk.token_drop == 0):
+            raise ValueError(f"clip {clip} of the streamed decode {'lacks' if tail is None else 'got'} an overlap")
+        decoded = self.vae.decode_clips(z, range(clip, clip + 1), sdpa_attention, self.tile_batch)[0]
+        last = clip == num_clips - 1
+        piece, tail = self.vae.walk.assemble_clip(
+            decoded, None if tail is None else tail[None], num_latents if last else None,
+        )
+        return {VIDEO_OUTPUT: self.ends.frames(piece),
+                VAE_TAIL: z.new_empty(1, 0) if tail is None else tail}
 
     def _decode_shared(self, z: torch.Tensor, shard, split) -> torch.Tensor:
         """This rank's range of the clips (``split``), gathered in clip order on every rank and
@@ -555,6 +599,6 @@ class H3AudioDecoderSubmodule(_LayoutBatched, BatchedRows, NodeSubmodule):
 
 
 __all__ = [
-    "H3TextEncoderSubmodule", "H3VaeEncoderSubmodule", "H3DenoiseSubmodule", "H3VideoDecoderSubmodule",
+    "VAE_TAIL", "H3TextEncoderSubmodule", "H3VaeEncoderSubmodule", "H3DenoiseSubmodule", "H3VideoDecoderSubmodule",
     "H3AudioDecoderSubmodule", "layout_from_metadata",
 ]

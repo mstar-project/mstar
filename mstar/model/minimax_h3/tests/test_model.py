@@ -507,6 +507,48 @@ def _tiny_decode_case():
     return vae, H3Config(video_vae=vcfg), layout, torch.randn(2, layout.num_video_rows, 4 * 2 * 2)
 
 
+def test_the_streamed_decode_emits_the_whole_decodes_frames():
+    """``stream_decode``: one clip an iteration, the overlap carried on the loop-back, the
+    pieces in order are the whole decode's frames, bit for bit."""
+    from mstar.model.minimax_h3.submodules import VAE_TAIL, VIDEO_OUTPUT, H3VideoDecoderSubmodule
+
+    vae, config, layout, rows = _tiny_decode_case()
+    whole = H3VideoDecoderSubmodule(vae, config)
+    stream = H3VideoDecoderSubmodule(vae, config, stream_loop="vae_decode_loop")
+    num_clips = vae.walk.num_clips(layout.latent_frames)
+    assert num_clips == 3 and vae.walk.token_drop > 0
+    with torch.no_grad():
+        want = whole.run_batch(rows[:1], layout)[VIDEO_OUTPUT]
+        pieces, tail = [], None
+        for clip in range(num_clips):
+            out = stream.run_batch(rows[:1], layout, clip=clip, tail=tail)
+            pieces.append(out[VIDEO_OUTPUT])
+            tail = out[VAE_TAIL][0] if out[VAE_TAIL].numel() else None
+        with pytest.raises(ValueError, match="lacks an overlap"):
+            stream.run_batch(rows[:1], layout, clip=1, tail=None)
+    assert tail is None  # the last clip finishes its own overlap
+    assert all(piece.shape[1] for piece in pieces)
+    assert torch.equal(torch.cat(pieces, dim=1), want)
+
+
+def test_stream_decode_makes_the_video_decoder_a_loop_over_its_clips():
+    from mstar.model.minimax_h3.components.video_vae import ClipWalk
+    from mstar.model.minimax_h3.minimax_h3_model import DECODE_LOOP, VIDEO_PART
+
+    model = _model(stream_decode=True)
+    walk = model.get_graph_walk_graphs()[GENERATE_AV_WALK]
+    loops = walk.get_loops()
+    assert set(loops) == {DENOISE_LOOP, DECODE_LOOP}
+    node = loops[DECODE_LOOP].section
+    assert [edge.output_modality for edge in node.outputs] == ["", VIDEO_PART]
+    caps = model.get_loop_caps(num_inference_steps=6)
+    latents = model.request_layout(model.resolve_request({}), 0).latent_frames
+    assert caps == {DENOISE_LOOP: 5, DECODE_LOOP: ClipWalk.of(H3Config().video_vae).num_clips(latents)}
+    assert caps[DECODE_LOOP] == 7  # the default 124 frames
+    assert DECODE_LOOP not in _model().get_loop_caps()
+    assert model.mp4_encoding() == _model().mp4_encoding()
+
+
 def _sp_resources(model: H3Model, keys, group) -> dict:
     """``keys``' resources from the model's own declaration on SP ranks ``group``, built and bound
     as the engine does, the ragged attention in fp32 over FlashInfer's CPU math."""
