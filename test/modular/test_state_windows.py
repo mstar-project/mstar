@@ -905,15 +905,17 @@ def test_reference_mode_builds_its_pool():
     assert kv_spec.config.num_qo_heads == HEADS
 
 
-def test_a_reach_read_holds_no_add():
-    """Every add writes its pages, which the reach reads back, so nothing waits on the handle for the read."""
+def test_a_reach_read_s_add_is_on_the_pages_before_its_read():
+    """Every add writes its pages, which the reach reads back. The handle holds the add for its read, as it does for
+    every read, and the read takes it."""
     handle, pool = _reach_handle()
     _reach_step(handle, pool, 12).begin_calls()
     k = torch.arange(12, dtype=torch.float32)[:, None, None]
     handle.add(0, k=k, v=-k)
-    assert handle._held is None
     page = pool._streams["a"]["main"].page_indices[0]
     assert pool.layer_view(0)[page, 0, :8].flatten().tolist() == list(range(8)), "the add should be on the pages"
+    handle.read(0)
+    assert handle._held is None, "the read should take the add the handle held for it"
 
 
 @pytest.mark.parametrize("mask", [Bidirectional(), Causal()], ids=["bidirectional", "causal"])
