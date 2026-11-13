@@ -32,8 +32,10 @@ from mstar.model.qwen3_tts.config import (
     CODE_PRED_SAMPLER,
     CODEC_STATE,
     LANGUAGE_ID_KEY,
+    LENGTH_BUDGET_KEY,
     PROMPT_LAYOUT_KEY,
     REF_CLIP_KEY,
+    REF_SAMPLES_KEY,
     SPEAKER_ID_KEY,
     TALKER_ATTN,
     TALKER_MIXED,
@@ -303,11 +305,21 @@ def test_qwen3_tts_1p7b_variants_share_class_configs_and_adapter():
         assert deployment["model"] == key
         # the same attention backend; pool sizes are per deployment
         assert deployment["resources"]["talker_attn"] == base_yaml["resources"]["talker_attn"]
-        ranks = {name: group["ranks"] for group in deployment["node_groups"] for name in group["node_names"]}
-        base_ranks = {name: group["ranks"] for group in base_yaml["node_groups"] for name in group["node_names"]}
-        assert ranks["Talker"] == base_ranks["Talker"] and ranks["Codec"] == base_ranks["Codec"]
         if key == "qwen3_tts_base":
+            # The default keeps the 0.6B's layout, the RefEncoder beside the Talker; the split config
+            # gives every node a worker of its own, all on one GPU under MPS, with the default's settings.
+            ranks = {name: group["ranks"] for group in deployment["node_groups"] for name in group["node_names"]}
+            base_ranks = {name: group["ranks"] for group in base_yaml["node_groups"] for name in group["node_names"]}
+            assert ranks["Talker"] == base_ranks["Talker"] and ranks["Codec"] == base_ranks["Codec"]
             assert ranks["RefEncoder"] == ranks["Talker"]   # the clone prefill runs on the Talker's GPU
+            assert not deployment.get("mps", False)
+            split = yaml.safe_load((CONFIG_PATH.parent / "qwen3tts_base_split.yaml").read_text(encoding="utf-8"))
+            devices = split.get("rank_devices", {})
+            split_ranks = [rank for group in split["node_groups"] for rank in group["ranks"]]
+            assert split["mps"] is True and {devices.get(rank, rank) for rank in split_ranks} == {0}
+            assert len(set(split_ranks)) == 3
+            shared = ("model", "max_seq_len", "model_kwargs", "resources", "knobs")
+            assert {k: split.get(k) for k in shared} == {k: deployment.get(k) for k in shared}
         else:
             assert deployment["node_groups"] == base_yaml["node_groups"]
         assert isinstance(get_adapter(key), Qwen3TTSAdapter)
@@ -531,9 +543,19 @@ def test_qwen3_tts_base_process_prompt_builds_in_context_clone():
         SPEAKER_ID_KEY: -1,
         LANGUAGE_ID_KEY: model.config.talker.codec_language_id["english"],
         REF_CLIP_KEY: clip_digest(clip),
+        REF_SAMPLES_KEY: clip.numel(),
         # All 13 reference frames lead the codec stream as context (fewer than left_context).
         "stream_lead_items": {"codec_tokens": 13},
+        # 2 x (1.38 s + 0.39 s x 3 tokens) at 12.5 frames/s
+        LENGTH_BUDGET_KEY: 64,
     }
+
+    # a stereo clip counts its samples per channel, as the RefEncoder downmixes it
+    stereo = model.process_prompt(
+        "hello big world", input_modalities=["audio", "text"], output_modalities=["audio"],
+        tensors={"audio_inputs": [torch.zeros(2, 24000 + 1)]}, ref_text="the reference says", language="English",
+    )
+    assert stereo.metadata[REF_SAMPLES_KEY] == 24001 and stereo.metadata[PROMPT_LAYOUT_KEY][4] == 13
 
     xvec = model.process_prompt(
         "hello", input_modalities=["audio", "text"], output_modalities=["audio"],
@@ -542,6 +564,34 @@ def test_qwen3_tts_base_process_prompt_builds_in_context_clone():
     assert xvec.metadata[PROMPT_LAYOUT_KEY] == [0, 1, 1, 0, 0]
     assert xvec.metadata[REF_CLIP_KEY] == clip_digest(clip.clone())
     assert "stream_lead_items" not in xvec.metadata   # no stream lead
+    assert xvec.metadata[LENGTH_BUDGET_KEY] == 45
+
+
+def test_qwen3_tts_clone_length_budget_caps_the_default_only():
+    model = _variant_model("base")
+    clip = torch.zeros(24000 + 1)
+    clone = model.process_prompt(
+        "hello big world", input_modalities=["audio", "text"], output_modalities=["audio"],
+        tensors={"audio_inputs": [clip]}, ref_text="the reference says", language="English",
+    ).metadata
+    assert model.get_max_output_tokens(**clone) == 64
+    assert model.get_loop_caps(**clone) == {model.DECODE_LOOP: 63}
+    # a request's own cap wins, above or below the budget
+    assert model.get_max_output_tokens(**clone, max_output_tokens=500) == 500
+    assert model.get_max_output_tokens(**clone, max_output_tokens=12) == 12
+    # a budget past the checkpoint's default leaves the default
+    assert model.get_max_output_tokens(**{LENGTH_BUDGET_KEY: 10**6}) == 8192
+    # live text: the length isn't known at the prompt, so no budget
+    live = model.process_prompt(
+        "hello", input_modalities=["audio", "text"], output_modalities=["audio"],
+        tensors={"audio_inputs": [clip]}, x_vector_only_mode=True, open_streams={"text_in"},
+    ).metadata
+    assert LENGTH_BUDGET_KEY not in live and model.get_max_output_tokens(**live) == 8192
+    # no reference clip, no budget
+    plain = _variant_model("custom_voice").process_prompt(
+        "hello big world", input_modalities=["text"], output_modalities=["audio"], voice="vivian",
+    ).metadata
+    assert LENGTH_BUDGET_KEY not in plain
 
     with pytest.raises(ValueError, match="ref_text"):
         model.process_prompt(
@@ -618,26 +668,30 @@ def test_qwen3_tts_base_declares_clone_walks_and_plans_them_for_reference_audio(
     # Non-Base variants do not even declare the clone walks (config-driven).
     assert "talker_prefill_clone" not in _variant_model("voice_design").get_graph_walk_graphs()
 
-    prompt = {PROMPT_LAYOUT_KEY: [0, 3, 1, 9, 13], SPEAKER_ID_KEY: -1, LANGUAGE_ID_KEY: -1, REF_CLIP_KEY: "clip"}
+    prompt = {
+        PROMPT_LAYOUT_KEY: [0, 3, 1, 9, 13], SPEAKER_ID_KEY: -1, LANGUAGE_ID_KEY: -1,
+        REF_CLIP_KEY: "clip", REF_SAMPLES_KEY: 24001,
+    }
     talker = model.walk_plan("Talker", ["audio", "text"], ["audio"], {}, prompt)
     assert [step.walk for step in talker] == ["talker_prefill_clone", "talker_decode"]
-    # The layout and the clip's key reach the RefEncoder and the Talker as step metadata.
+    # The layout and the clip's key and length reach the RefEncoder and the Talker as step metadata.
     assert talker[0].step_metadata == prompt
     # the decode reads where its text stream ends from the layout
     assert talker[1].step_metadata == {PROMPT_LAYOUT_KEY: prompt[PROMPT_LAYOUT_KEY]}
     # The codec runs its one walk
     assert [step.walk for step in model.walk_plan("Codec", ["audio", "text"], ["audio"], {}, {})] == ["codec_chunk"]
 
-    # The Base deployment maps the extra node and walks.
-    deployment = yaml.safe_load((CONFIG_PATH.parent / "qwen3tts_base.yaml").read_text(encoding="utf-8"))
-    groups = {name: group for group in deployment["node_groups"] for name in group["node_names"]}
-    assert "RefEncoder" in groups
-    assert "talker_prefill_clone" in groups["RefEncoder"]["graph_walks"]
-    assert groups["Codec"]["graph_walks"] == ["codec_chunk"]
-    by_walk = {}
-    for worker_graph in model.get_worker_graphs(str(CONFIG_PATH.parent / "qwen3tts_base.yaml")):
-        by_walk.setdefault(next(iter(worker_graph.graph_walks)), worker_graph)
-    assert {"talker_prefill_clone", "codec_chunk"} <= set(by_walk)
+    # The Base deployments, colocated and split (MPS), map the extra node and walks.
+    for name in ("qwen3tts_base.yaml", "qwen3tts_base_split.yaml"):
+        deployment = yaml.safe_load((CONFIG_PATH.parent / name).read_text(encoding="utf-8"))
+        groups = {node: group for group in deployment["node_groups"] for node in group["node_names"]}
+        assert "RefEncoder" in groups, name
+        assert "talker_prefill_clone" in groups["RefEncoder"]["graph_walks"], name
+        assert groups["Codec"]["graph_walks"] == ["codec_chunk"], name
+        by_walk = {}
+        for worker_graph in model.get_worker_graphs(str(CONFIG_PATH.parent / name)):
+            by_walk.setdefault(next(iter(worker_graph.graph_walks)), worker_graph)
+        assert {"talker_prefill_clone", "codec_chunk"} <= set(by_walk), name
 
 
 def test_qwen3_tts_config_rejects_unknown_variant():
@@ -1726,7 +1780,7 @@ def test_the_reference_audio_encoder_loads_the_flat_mimi_checkpoint(tmp_path):
 
     config = SimpleNamespace(
         supports_reference_audio=True, speaker_encoder=speaker_config,
-        codec=SimpleNamespace(encoder_config=encoder_config, num_quantizers=4),
+        codec=SimpleNamespace(encoder_config=encoder_config, num_quantizers=4, encode_downsample_rate=1920),
     )
     submodule = Qwen3TTSModel._create_ref_encoder_submodule(
         SimpleNamespace(config=config, local_dir=str(tmp_path)), "cpu",
@@ -2464,112 +2518,261 @@ def test_qwen3_tts_codec_single_forward_yields_one_request_samples():
         submodule.postprocess("r", None, {"audio_chunk": [torch.arange(8)]}, inputs=chunk)
 
 
-class _FakeCodecEncoder(torch.nn.Module):
-    """Stands in for the Mimi encoder: deterministic codes, one frame per 4 samples."""
+def _tiny_mimi(seed: int = 0) -> torch.nn.Module:
+    """transformers' Mimi at tiny widths, with distinct codebook entries (they start equal)."""
+    from transformers import MimiConfig, MimiModel
 
-    def __init__(self, num_quantizers: int):
-        super().__init__()
-        self.anchor = torch.nn.Parameter(torch.zeros(()))
-        self.num_quantizers = num_quantizers
-        self.calls = 0
+    torch.manual_seed(seed)
+    codec = MimiModel(MimiConfig(
+        hidden_size=32, intermediate_size=64, num_hidden_layers=1, num_attention_heads=2, num_key_value_heads=2,
+        head_dim=16, num_filters=4, codebook_size=64, codebook_dim=16, num_quantizers=4, upsample_groups=32,
+        vector_quantization_hidden_dimension=16,
+    )).eval()
+    with torch.no_grad():
+        for name, buffer in codec.named_buffers():
+            if name.endswith("embed_sum"):
+                buffer.normal_()
+    return codec
 
-    def encode(self, input_values, return_dict=True):
-        del return_dict
-        self.calls += 1
-        frames = input_values.shape[-1] // 4 + 2   # the real encoder pads a little
-        codes = torch.arange(frames).repeat(self.num_quantizers + 1, 1).unsqueeze(0)
-        return SimpleNamespace(audio_codes=codes)
+
+def _ref_encoder(config) -> tuple[torch.nn.Module, list[int]]:
+    """A RefEncoder over a tiny ECAPA and a tiny Mimi, and a count of its codec encodes."""
+    from mstar.model.qwen3_tts.components.speaker_encoder import Qwen3TTSSpeakerEncoder, speaker_mel
+    from mstar.model.qwen3_tts.config import Qwen3TTSSpeakerEncoderConfig
+    from mstar.model.qwen3_tts.submodules import RefEncoderSubmodule
+
+    speaker_config = Qwen3TTSSpeakerEncoderConfig(
+        enc_dim=config.talker.hidden_size, enc_channels=(16, 16, 16, 16, 48),
+        enc_se_channels=8, enc_attention_channels=8,
+    )
+    codec = _tiny_mimi()
+    speaker = Qwen3TTSSpeakerEncoder(speaker_config).eval()
+    submodule = RefEncoderSubmodule(speaker, speaker_mel(speaker_config), codec, config)
+    calls = [0]
+    encode = submodule.padded_codec.forward
+
+    def counted(*args, **kwargs):
+        calls[0] += 1
+        return encode(*args, **kwargs)
+
+    submodule.padded_codec.forward = counted
+    return submodule, calls
 
 
 def _ref_info(rid: str, clip: torch.Tensor, layout: list[int]) -> SimpleNamespace:
-    """The clone prefill's request info: ``process_prompt``'s layout and clip key in step metadata."""
-    return SimpleNamespace(
-        request_id=rid, rid_handle=rid, step_metadata={PROMPT_LAYOUT_KEY: layout, REF_CLIP_KEY: clip_digest(clip)},
-    )
+    """The clone prefill's request info: ``process_prompt``'s layout, clip key and sample count in step metadata."""
+    from mstar.model.qwen3_tts.config import mono_samples
+
+    return SimpleNamespace(request_id=rid, rid_handle=rid, step_metadata={
+        PROMPT_LAYOUT_KEY: layout, REF_CLIP_KEY: clip_digest(clip), REF_SAMPLES_KEY: mono_samples(clip),
+    })
+
+
+def _ref_step(submodule, infos: dict, clips: dict, captured: bool, padding=()) -> dict:
+    """One RefEncoder step over ``clips`` through prepare / preprocess / forward /
+    postprocess: eager, or with ``captured`` the inputs a replay stages (``padding``:
+    the bucket's template rows) and the forward it captured."""
+    walk = "talker_prefill_clone"
+    rids = list(clips)
+    inputs = [submodule.prepare_inputs(walk, infos[rid], {"audio_inputs": [clips[rid]]}) for rid in rids]
+    engine_inputs = ModelInputsFromEngine(request_ids=rids, per_request_info={}, captured=captured)
+    preprocessed = submodule.preprocess(walk, engine_inputs, [*inputs, *padding])
+    with torch.inference_mode():
+        if captured:
+            rows = submodule.forward_padded(walk, engine_inputs, **preprocessed).row_outputs
+            outputs = {rid: {name: [value[i:i + 1]] for name, value in rows.items()} for i, rid in enumerate(rids)}
+        else:
+            outputs = submodule.forward_batched(walk, engine_inputs, **preprocessed).per_rid_outputs
+    for rid, item in zip(rids, inputs, strict=True):
+        submodule.postprocess(rid, infos[rid], outputs[rid], inputs=item)
+    return {rid: (out["speaker_embed"][0], out["ref_codes"][0]) for rid, out in outputs.items()}
 
 
 def test_qwen3_tts_ref_encoder_emits_xvector_and_reference_frames():
-    from mstar.model.qwen3_tts.components.speaker_encoder import Qwen3TTSSpeakerEncoder, speaker_mel
-    from mstar.model.qwen3_tts.config import Qwen3TTSSpeakerEncoderConfig
-    from mstar.model.qwen3_tts.submodules import RefEncoderSubmodule
-
     config = _tiny_model_config()
-    speaker_config = Qwen3TTSSpeakerEncoderConfig(
-        enc_dim=config.talker.hidden_size, enc_channels=(16, 16, 16, 16, 48),
-        enc_se_channels=8, enc_attention_channels=8,
-    )
-    encoder = _FakeCodecEncoder(config.codec.num_quantizers)
-    submodule = RefEncoderSubmodule(
-        Qwen3TTSSpeakerEncoder(speaker_config), speaker_mel(speaker_config), encoder, config,
-    )
-    clip = torch.randn(2, 4000) * 0.1   # stereo, averaged to mono
-    prepared = submodule.prepare_inputs(
-        "talker_prefill_clone", _ref_info("clone", clip, [0, 2, 1, 5, 7]), {"audio_inputs": [clip]},
-    )
-    assert prepared.tensor_inputs["waveform"].shape == (4000,)
-    assert prepared.kwargs == {"ref_frames": 7, "clip_key": (clip_digest(clip), 7)}
-    engine_inputs = ModelInputsFromEngine(request_ids=["clone"], per_request_info={})
-    out = submodule.forward("talker_prefill_clone", engine_inputs, **submodule.preprocess(
-        "talker_prefill_clone", engine_inputs, [prepared]))
-    assert out["speaker_embed"][0].shape == (config.talker.hidden_size,)
-    assert out["ref_codes"][0].shape == (7, config.codec.num_quantizers)
-    assert out["ref_codes"][0][:, 0].tolist() == list(range(7))
-    assert encoder.calls == 1
+    submodule, calls = _ref_encoder(config)
+    clip = torch.randn(2, 12000) * 0.1   # stereo, averaged to mono
+    info = _ref_info("clone", clip, [0, 2, 1, 5, 7])
+    prepared = submodule.prepare_inputs("talker_prefill_clone", info, {"audio_inputs": [clip]})
+    assert prepared.tensor_inputs["waveform"].shape == (12000,)
+    assert prepared.kwargs == {
+        "ref_frames": 7, "clip_key": (clip_digest(clip), 7), "samples": 12000, "bucket_frames": 32,
+    }
+    embed, codes = _ref_step(submodule, {"clone": info}, {"clone": clip}, captured=False)["clone"]
+    assert embed.shape == (config.talker.hidden_size,)
+    assert codes.shape == (7, config.codec.num_quantizers)
+    with torch.inference_mode():
+        unpadded = submodule.codec_encoder.encode(clip.mean(dim=0).view(1, 1, -1), num_quantizers=4)
+    assert torch.equal(codes, unpadded.audio_codes[0].t())
+    assert calls[0] == 1
 
     # x-vector only: the codec encoder is skipped and a placeholder frame rides the edge.
-    prepared = submodule.prepare_inputs(
-        "talker_prefill_clone", _ref_info("xvec", clip[0], [0, 2, 1, 0, 0]), {"audio_inputs": [clip[0]]},
-    )
-    out = submodule.forward("talker_prefill_clone", engine_inputs, **submodule.preprocess(
-        "talker_prefill_clone", engine_inputs, [prepared]))
-    assert out["ref_codes"][0].shape == (1, config.codec.num_quantizers)
-    assert encoder.calls == 1
+    info = _ref_info("xvec", clip[0], [0, 2, 1, 0, 0])
+    embed, codes = _ref_step(submodule, {"xvec": info}, {"xvec": clip[0]}, captured=False)["xvec"]
+    assert codes.shape == (1, config.codec.num_quantizers) and not codes.any()
+    assert calls[0] == 1
 
 
 def test_qwen3_tts_ref_encoder_memoises_conditioning_by_clip_content():
-    from mstar.model.qwen3_tts.components.speaker_encoder import Qwen3TTSSpeakerEncoder, speaker_mel
-    from mstar.model.qwen3_tts.config import Qwen3TTSSpeakerEncoderConfig
-    from mstar.model.qwen3_tts.submodules import RefEncoderSubmodule
-
     config = _tiny_model_config()
-    speaker_config = Qwen3TTSSpeakerEncoderConfig(
-        enc_dim=config.talker.hidden_size, enc_channels=(16, 16, 16, 16, 48),
-        enc_se_channels=8, enc_attention_channels=8,
-    )
-    encoder = _FakeCodecEncoder(config.codec.num_quantizers)
-    submodule = RefEncoderSubmodule(
-        Qwen3TTSSpeakerEncoder(speaker_config), speaker_mel(speaker_config), encoder, config,
-    )
-    engine_inputs = ModelInputsFromEngine(request_ids=["clone"], per_request_info={})
+    submodule, calls = _ref_encoder(config)
 
     def encode(rid: str, clip: torch.Tensor, ref_frames: int):
-        prepared = submodule.prepare_inputs(
-            "talker_prefill_clone", _ref_info(rid, clip, [0, 2, 1, ref_frames, ref_frames]), {"audio_inputs": [clip]},
-        )
-        return submodule.forward("talker_prefill_clone", engine_inputs, **submodule.preprocess(
-            "talker_prefill_clone", engine_inputs, [prepared]))
+        info = _ref_info(rid, clip, [0, 2, 1, ref_frames, ref_frames])
+        return _ref_step(submodule, {rid: info}, {rid: clip}, captured=False)[rid]
 
-    clip_a = torch.randn(4000) * 0.1
+    clip_a = torch.randn(12000) * 0.1
     first = encode("a1", clip_a, 7)
-    assert encoder.calls == 1
+    assert calls[0] == 1
     # The same samples again (a fresh tensor, as an upload produces) cost no encoder pass
     # and yield the same conditioning.
     again = encode("a2", clip_a.clone(), 7)
-    assert encoder.calls == 1
-    assert again["speaker_embed"][0] is first["speaker_embed"][0]
-    assert torch.equal(again["ref_codes"][0], first["ref_codes"][0])
+    assert calls[0] == 1
+    assert torch.equal(again[0], first[0]) and torch.equal(again[1], first[1])
     # Other content, or the same clip used x-vector-only, is a different entry.
-    encode("b1", torch.randn(4000) * 0.1, 7)
-    assert encoder.calls == 2
+    encode("b1", torch.randn(12000) * 0.1, 7)
+    assert calls[0] == 2
     xvec = encode("a3", clip_a, 0)
-    assert encoder.calls == 2 and xvec["ref_codes"][0].shape == (1, config.codec.num_quantizers)
+    assert calls[0] == 2 and xvec[1].shape == (1, config.codec.num_quantizers)
     assert len(submodule._conditioning) == 3
     # The memo is bounded, oldest first.
     submodule.CONDITIONING_CACHE_SIZE = 2
-    encode("c1", torch.randn(4000) * 0.1, 7)
-    assert encoder.calls == 3 and len(submodule._conditioning) == 2
+    encode("c1", torch.randn(12000) * 0.1, 7)
+    assert calls[0] == 3 and len(submodule._conditioning) == 2
     encode("a4", clip_a, 7)   # evicted, so encoded again
-    assert encoder.calls == 4
+    assert calls[0] == 4
+
+
+def test_qwen3_tts_padded_codec_encode_gives_each_clip_its_unpadded_codes():
+    """Clips zero-padded to one width encode to their own unpadded codes, the last
+    frame included, whatever fills the padding. Read as running to the width
+    (what plain zero padding does), a clip's last frames encode the padding."""
+    from mstar.model.qwen3_tts.components.codec_encoder import PaddedCodecEncoder
+
+    codec = _tiny_mimi()
+    padded = PaddedCodecEncoder(codec, num_quantizers=4)
+    assert padded.hop == 1920
+    torch.manual_seed(1)
+    lengths = [5 * 1920 + 37, 7 * 1920 - 900, 3 * 1920 + 1, 4 * 1920 + 950, 6 * 1920 - 1, 2 * 1920 + 400]
+    width = 8 * 1920
+    clips = [torch.randn(n) * 0.3 for n in lengths]
+    batch = torch.stack([torch.nn.functional.pad(clip, (0, width - clip.numel())) for clip in clips])
+    batch += torch.randn_like(batch) * (torch.arange(width) >= torch.tensor(lengths).unsqueeze(1))
+    with torch.inference_mode():
+        codes = padded(batch, torch.tensor(lengths))
+        naive = padded(batch, torch.full((len(clips),), width))
+        references = [codec.encode(clip.view(1, 1, -1), num_quantizers=4).audio_codes[0].t() for clip in clips]
+        latents = padded.latents(batch, torch.tensor(lengths))
+        naive_latents = padded.latents(batch, torch.full((len(clips),), width))
+    assert codes.shape == (len(clips), 8, 4)
+    for row, reference in enumerate(references):
+        frames = -(-lengths[row] // 1920)
+        assert reference.shape[0] == frames
+        assert torch.equal(codes[row, :frames], reference)
+        # the negative control: the same frames but the last agree
+        assert torch.allclose(naive_latents[row, :, :frames - 1], latents[row, :, :frames - 1])
+        assert not torch.allclose(naive_latents[row, :, frames - 1], latents[row, :, frames - 1], atol=1e-3)
+    assert any(not torch.equal(naive[row, :ref.shape[0]], ref) for row, ref in enumerate(references))
+
+
+def test_qwen3_tts_padded_codec_encode_refuses_a_pad_mode_it_does_not_reproduce():
+    """A reflect conv would pad about the bucket's end, not the clip's."""
+    from transformers.models.mimi.modeling_mimi import MimiConv1d
+
+    from mstar.model.qwen3_tts.components.codec_encoder import PaddedCodecEncoder
+
+    codec = _tiny_mimi()
+    next(m for m in codec.encoder.modules() if isinstance(m, MimiConv1d)).pad_mode = "reflect"
+    with pytest.raises(TypeError, match="pad_mode 'reflect'"):
+        PaddedCodecEncoder(codec, num_quantizers=4)
+
+
+def test_qwen3_tts_padded_speaker_encoder_gives_each_clip_its_unpadded_xvector():
+    """Clips padded to one width get their own unpadded log-mel frames, and
+    their own x-vector whatever fills the frames past them. The negative
+    controls drop the mel's per-row reflect padding, then the encoder's masking."""
+    from mstar.model.qwen3_tts.components.speaker_encoder import Qwen3TTSSpeakerEncoder, speaker_mel
+    from mstar.model.qwen3_tts.config import Qwen3TTSSpeakerEncoderConfig
+
+    config = Qwen3TTSSpeakerEncoderConfig(
+        enc_dim=16, enc_channels=(16, 16, 16, 16, 48), enc_se_channels=8, enc_attention_channels=8,
+    )
+    torch.manual_seed(0)
+    encoder = Qwen3TTSSpeakerEncoder(config).eval().double()
+    mel = speaker_mel(config).double()
+    lengths = torch.tensor([24000 + 517, 30000, 48000 - 3])
+    width = 48000
+    clips = [torch.randn(n, dtype=torch.double) * 0.1 for n in lengths.tolist()]
+    batch = torch.stack([torch.nn.functional.pad(clip, (0, width - clip.numel())) for clip in clips])
+    noisy = batch + torch.randn_like(batch) * (torch.arange(width) >= lengths.unsqueeze(1))
+    frames = mel.num_frames(lengths)
+    with torch.inference_mode():
+        references = [encoder(mel(clip[None]).transpose(1, 2))[0] for clip in clips]
+        mels = mel(noisy, lengths)
+        past = torch.arange(mels.shape[-1]) >= frames.unsqueeze(1)
+        garbage = mels + torch.randn_like(mels) * past.unsqueeze(1)
+        embeds = encoder(garbage.transpose(1, 2), frames)
+        unreflected = encoder(mel(noisy).transpose(1, 2), frames)
+        unmasked = encoder(garbage.transpose(1, 2))
+    for row, (clip, reference) in enumerate(zip(clips, references, strict=True)):
+        unpadded = mel(clip[None])[0]
+        assert unpadded.shape[1] == frames[row]
+        torch.testing.assert_close(mels[row, :, :frames[row]], unpadded, rtol=0, atol=1e-12)
+        torch.testing.assert_close(embeds[row], reference, rtol=0, atol=1e-9)
+    # the full-width row needs neither; the others differ without them
+    for row in range(2):
+        assert (unreflected[row] - references[row]).abs().max() > 1e-4
+        assert (unmasked[row] - references[row]).abs().max() > 1e-2
+
+
+def test_qwen3_tts_ref_encoder_replay_gives_the_eager_conditioning():
+    """The engine's capture of a frame bucket: its configs and keys, and the
+    inputs a replay stages (the step's clips padded to the bucket, with a
+    template padding row) give each request the eager conditioning."""
+    from mstar.model.qwen3_tts.submodules import RefBucket, RefEncoderSubmodule
+
+    config = _tiny_model_config()
+    submodule, calls = _ref_encoder(config)
+    buckets = RefEncoderSubmodule.FRAME_BUCKETS
+    configs = submodule.get_accelerator_graph_configs(torch.device("cpu"))
+    assert [c.additional_key_info for c in configs] == [RefBucket(f, codes) for f in buckets for codes in (True, False)]
+    assert all(c.capture_forward_method == "forward_padded" and not c.compile for c in configs)
+    by_key = {c.additional_key_info: c for c in configs}
+
+    torch.manual_seed(2)
+    clips = {"a": torch.randn(30000) * 0.1, "b": torch.randn(41000) * 0.1, "x": torch.randn(20000) * 0.1}
+    layouts = {"a": [0, 2, 1, 5, 16], "b": [0, 2, 1, 5, 22], "x": [0, 2, 1, 0, 0]}
+    infos = {rid: _ref_info(rid, clip, layouts[rid]) for rid, clip in clips.items()}
+    walk = "talker_prefill_clone"
+    assert submodule.cg_key_info(walk, {r: infos[r] for r in "ab"}) == RefBucket(32, True)
+    assert submodule.cg_key_info(walk, {"x": infos["x"]}) == RefBucket(32, False)
+    # a step of two buckets, or a clip past the ladder, runs eager
+    assert submodule.cg_key_info(walk, infos) is None
+    long_clip = torch.zeros(buckets[-1] * 1920 + 1)
+    assert submodule.cg_key_info(walk, {"l": _ref_info("l", long_clip, [0, 2, 1, 5, buckets[-1] + 1])}) is None
+    assert submodule.split_batches_by_capture_key(walk)
+
+    eager = _ref_step(submodule, {r: infos[r] for r in "ab"}, {r: clips[r] for r in "ab"}, captured=False)
+    eager |= _ref_step(submodule, {"x": infos["x"]}, {"x": clips["x"]}, captured=False)
+    # memoised now, so eager again
+    assert submodule.cg_key_info(walk, {r: infos[r] for r in "ab"}) is None
+    submodule._conditioning.clear()
+    replayed = _ref_step(
+        submodule, {r: infos[r] for r in "ab"}, {r: clips[r] for r in "ab"}, captured=True,
+        padding=by_key[RefBucket(32, True)].get_node_inputs(2, 0),
+    )
+    replayed |= _ref_step(
+        submodule, {"x": infos["x"]}, {"x": clips["x"]}, captured=True,
+        padding=by_key[RefBucket(32, False)].get_node_inputs(1, 0),
+    )
+    assert calls[0] == 3   # two eager encodes, then one replay pass for both clips
+    for rid in clips:
+        (embed, codes), (eager_embed, eager_codes) = replayed[rid], eager[rid]
+        assert codes.shape == eager_codes.shape == (max(layouts[rid][4], 1), config.codec.num_quantizers)
+        assert torch.equal(codes, eager_codes)
+        torch.testing.assert_close(embed, eager_embed, rtol=0, atol=1e-5)
+    # the replay memoised the clips too
+    assert submodule.cg_key_info(walk, {"x": infos["x"]}) is None
 
 
 def test_qwen3_tts_codec_dtype_option():
@@ -2713,3 +2916,70 @@ def test_request_kwargs_spot_checks():
     ):
         assert key in declared, key
     assert "max_new_tokens" not in declared
+
+
+def test_qwen3_tts_ref_encoder_eager_encode_past_the_ladder_and_multi_pass_steps_match_unpadded():
+    """A clip past the bucket ladder runs the padded encode eagerly, and a step whose
+    rows need several codec passes concatenates them in order: both give each clip's
+    unpadded codes."""
+    config = _tiny_model_config()
+    submodule, _ = _ref_encoder(config)
+    submodule.FRAME_BUCKETS = (2,)
+    torch.manual_seed(3)
+    clip = torch.randn(5 * 1920 + 333) * 0.1
+    info = _ref_info("long", clip, [0, 2, 1, 5, 6])
+    assert submodule.cg_key_info("talker_prefill_clone", {"long": info}) is None
+    _, codes = _ref_step(submodule, {"long": info}, {"long": clip}, captured=False)["long"]
+    with torch.inference_mode():
+        reference = submodule.codec_encoder.encode(clip.view(1, 1, -1), num_quantizers=4).audio_codes[0].t()
+    assert torch.equal(codes, reference[:6])
+
+    submodule.CODEC_PASS_FRAMES = 1   # one row a pass
+    clips = [torch.randn(n) * 0.1 for n in (1920 + 7, 2 * 1920 - 5)]
+    batch = torch.stack([torch.nn.functional.pad(c, (0, 2 * 1920 - c.numel())) for c in clips])
+    with torch.inference_mode():
+        out = submodule.forward_padded("", None, batch, torch.tensor([c.numel() for c in clips]), True)
+        for row, c in enumerate(clips):
+            ref = submodule.codec_encoder.encode(c.view(1, 1, -1), num_quantizers=4).audio_codes[0].t()
+            assert torch.equal(out.row_outputs["ref_codes"][row, :ref.shape[0]], ref)
+
+
+def test_qwen3_tts_ref_encoder_buckets_by_sample_count_and_refreshes_its_memo_on_a_hit():
+    config = _tiny_model_config()
+    submodule, calls = _ref_encoder(config)
+    hop = config.codec.encode_downsample_rate
+    bucket = submodule.FRAME_BUCKETS[0]
+    assert submodule._bucket_frames({REF_SAMPLES_KEY: bucket * hop}) == bucket
+    assert submodule._bucket_frames({REF_SAMPLES_KEY: bucket * hop + 1}) == submodule.FRAME_BUCKETS[1]
+    assert submodule._bucket_frames({REF_SAMPLES_KEY: submodule.FRAME_BUCKETS[-1] * hop + 1}) is None
+
+    def encode(rid, clip):
+        info = _ref_info(rid, clip, [0, 2, 1, 5, 7])
+        return _ref_step(submodule, {rid: info}, {rid: clip}, captured=False)[rid]
+
+    submodule.CONDITIONING_CACHE_SIZE = 2
+    a, b, c = (torch.randn(12000) * 0.1 for _ in range(3))
+    encode("a1", a)
+    encode("b1", b)
+    encode("a2", a)   # a hit makes a the newest entry
+    encode("c1", c)   # so b is the one evicted
+    assert calls[0] == 3
+    encode("a3", a)
+    assert calls[0] == 3
+    encode("b2", b)
+    assert calls[0] == 4
+
+
+@pytest.mark.parametrize("shape, samples", [((100,), 100), ((2, 100), 100), ((100, 2), 100), ((3, 3), 3)])
+def test_qwen3_tts_reference_clip_samples_are_counted_as_the_downmix_gives_them(shape, samples):
+    from mstar.model.qwen3_tts.config import mono_clip, mono_samples
+
+    clip = torch.randn(shape)
+    assert mono_clip(clip).numel() == mono_samples(clip) == samples
+
+
+def test_qwen3_tts_reference_clip_of_more_than_two_axes_is_refused():
+    from mstar.model.qwen3_tts.config import mono_samples
+
+    with pytest.raises(ValueError, match="channels, samples"):
+        mono_samples(torch.zeros(1, 2, 100))
