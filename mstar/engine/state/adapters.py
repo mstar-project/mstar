@@ -57,6 +57,7 @@ from mstar.engine.resources.recurrent.config import (
     RecurrentStateSpec,
     RecurrentStep,
 )
+from mstar.engine.resources.recurrent.dense_window import DenseWindowSpec, DenseWindowStep
 from mstar.engine.resources.sampler.config import SamplerSpec, SamplerStep, SamplingReqConfig
 from mstar.engine.resources.sequence_shard import SeqShardSpec
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
@@ -2260,6 +2261,139 @@ class RingStorage(Storage):
         steps[handle.flex_key] = AttentionStep(segments=segments)
 
 
+class DenseWindowHandle(ArrayHandle):
+    """Packed whole reads from a bounded dense ring, with unbounded logical positions."""
+
+    def __init__(self, array: Array, resources: Mapping[str, Any], bindings, resolved):
+        super().__init__(array, resources)
+        self._pool = resources[array.name]
+        self._capacity = self._pool.window_size
+        self._pending: dict[int, dict[str, torch.Tensor]] = {}
+        self._added: dict[int, int] = {}
+
+    def begin_step(self, step) -> None:
+        self._pending.clear()
+        self._added.clear()
+        super().begin_step(step)
+
+    def check_step(self, step) -> None:
+        super().check_step(step)
+        if any(seg.span > 0 for seg in self._segments) and self._kept != self.array.layers:
+            raise self._refusal(f"a kept dense window step must add every layer {sorted(self.array.layers)}, "
+                                f"but added {sorted(self._kept)}")
+
+    def _check_storage(self, declared: ArrayStep, segments, ctx) -> None:
+        super()._check_storage(declared, segments, ctx)
+        if ctx.capture or ctx.replays:
+            raise self._refusal("dense whole reads have variable packed lengths and cannot replay a capture")
+        if not declared.keep or declared.forks:
+            raise self._refusal("dense windows need kept adds and do not yet support forks")
+        if ctx.repeats != 1:
+            raise self._refusal("dense window steps run once before their logical lengths commit")
+        if len({segment.label for segment in segments}) > 1:
+            raise self._refusal("a dense window step has one label")
+
+    @torch.compiler.disable
+    def add(self, layer: int | torch.Tensor, *, keep: bool | None = None, **fields: torch.Tensor) -> None:
+        layer = self._layer_id(layer)
+        self._record_add(layer, keep)
+        if keep is False:
+            raise self._refusal("a dense window add must be kept")
+        if set(fields) != set(self.array.entry.tensors):
+            raise self._refusal(f"add fields {sorted(fields)} differ from {sorted(self.array.entry.tensors)}")
+        total = sum(segment.span for segment in self._segments)
+        cap = self._capacity
+        updated = {}
+        for field, value in fields.items():
+            block = self._pool.block(field, self._pool_layer[layer])
+            if value.shape[0] != total or tuple(value.shape[1:]) != tuple(block.shape[2:]):
+                raise self._refusal(f"field {field!r} has shape {tuple(value.shape)}, expected "
+                                    f"({total}, {', '.join(map(str, block.shape[2:]))})")
+            if value.dtype != block.dtype or value.device != block.device:
+                raise self._refusal(f"field {field!r} has {value.dtype} on {value.device}, expected "
+                                    f"{block.dtype} on {block.device}")
+            rows = self._pool.gather(field, self._pool_layer[layer], label=self.label)
+            offset = 0
+            for row, segment in enumerate(self._segments):
+                end = offset + segment.span
+                first = max(offset, end - cap)
+                if first < end:
+                    old = self._pool.logical_length(segment.request_id, segment.label)
+                    positions = torch.arange(old + first - offset, old + segment.span, device=value.device) % cap
+                    rows[row].index_copy_(0, positions, value[first:end])
+                offset = end
+            self._pool.scatter_(field, rows, self._pool_layer[layer], label=self.label)
+            updated[field] = rows
+        self._pending[layer] = updated
+        self._added[layer] = 1
+
+    @torch.compiler.disable
+    def read(self, layer: int | torch.Tensor, q: torch.Tensor | None = None, **mask_args: Any) -> Reached:
+        layer = self._layer_id(layer)
+        if q is not None or mask_args:
+            raise self._refusal("a dense Window read takes no q or mask arguments")
+        self._record_read(layer)
+        fields = {}
+        lengths = [min(self._capacity, self._pool.logical_length(seg.request_id, seg.label)
+                       + (seg.span if layer in self._added else 0)) for seg in self._segments]
+        offsets = [0]
+        for length in lengths:
+            offsets.append(offsets[-1] + length)
+        for field in self.array.entry.tensors:
+            rows = self._pending.get(layer, {}).get(field)
+            if rows is None:
+                rows = self._pool.gather(field, self._pool_layer[layer], label=self.label)
+            packed = []
+            for row, (segment, length) in enumerate(zip(self._segments, lengths, strict=True)):
+                end = self._pool.logical_length(segment.request_id, segment.label)
+                if layer in self._added:
+                    end += segment.span
+                indices = torch.arange(end - length, end, device=rows.device) % self._capacity
+                packed.append(rows[row].index_select(0, indices))
+            fields[field] = torch.cat(packed) if packed else rows.new_empty((0, *rows.shape[2:]))
+        device = next(iter(fields.values())).device
+        return Reached(fields, row_offsets=torch.tensor(offsets, dtype=torch.int32, device=device))
+
+
+class DenseWindowStorage(Storage):
+    """A no-op whole read whose declared Window bounds a dense resident ring."""
+
+    handle_class = DenseWindowHandle
+    kernel_settings = frozenset({"max_slots"})
+
+    def resolve(self, arrays: Sequence[Array], declared: Sequence[Array], setup: "StateSetup") -> Resolved:
+        resolved = Resolved({}, {}, {}, {})
+        for array in arrays:
+            if len(array.reads) != 1:
+                raise _no_layout(array, "dense window storage needs exactly one read per array")
+            key, read = next(iter(array.reads.items()))
+            if read.layers is not None and read.layers != array.layers:
+                raise _no_layout(array, "dense window read must cover all layers")
+            size = read.mask.size
+            blocks = {
+                field: RecurrentBlockConfig(
+                    shape=(size, *tensor.shape), dtype=tensor.dtype,
+                    shard_dims=() if tensor.shard is None else (tensor.shard + 1,),
+                ) for field, tensor in array.entry.tensors.items()
+            }
+            resolved.specs[array.name] = [DenseWindowSpec(
+                resource_key=array.name, nodes=array.nodes,
+                config=RecurrentStateConfig(num_layers=len(array.layers), blocks=blocks,
+                                            max_slots=len(array.labels) + 1, labels=tuple(sorted(array.labels))),
+            )]
+            resolved.bound[array.name] = ()
+            resolved.resource_of[key] = array.name
+        return resolved
+
+    def steps(
+        self, handle: ArrayHandle, declared: ArrayStep, step: SubmoduleStep, segments, steps: dict[str, Any],
+    ) -> None:
+        # A zero-append read still addresses the request's saved slot. The
+        # recurrent allocator otherwise sends span-zero rows to its sink.
+        addressed = tuple(Segment(seg.request_id, seg.label, max(seg.span, 1)) for seg in segments)
+        steps[handle.name] = DenseWindowStep(segments=addressed, logical_segments=tuple(segments))
+
+
 class ValueStorage(Storage):
     """A rewritable array of one entry, in a recurrent state pool."""
 
@@ -2381,13 +2515,13 @@ VALUE = ValueStorage()
 VALUE_WITH_HOST = ValueWithHostStorage()
 HOST_VALUE = HostValueStorage()
 WITHIN_STEP = WithinStepStorage()
+DENSE_WINDOW = DenseWindowStorage()
 
 
 def storage_of(array: Array) -> Storage:
     """The storage today's resources keep ``array`` in."""
     if array.max_len is None:
-        raise _no_layout(array, "max_len=None needs a dense window storage binding; the existing K/V ring does not "
-                                "store generic tensor entries")
+        return DENSE_WINDOW
     if is_value(array):
         if not array.entry.tensors:
             return HOST_VALUE

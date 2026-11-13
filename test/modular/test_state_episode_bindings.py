@@ -1,10 +1,15 @@
-"""Episode ownership is separate from the resource that stores an array's rows."""
+"""Episode ownership and dense whole-read retention in the state contract."""
+
+from types import SimpleNamespace
 
 import pytest
 import torch
 
-from mstar.engine.state import Array, Block, Entry, KVEntry, Read, TensorType, Window
-from mstar.engine.state.adapters import PAGED, build_specs, storage_of
+from mstar.engine.resources.base import EngineResourceInfo
+from mstar.engine.resources.recurrent.dense_window import DenseWindowPool, DenseWindowSpec
+from mstar.engine.resources.step import Segment, StepContext, SubmoduleStep
+from mstar.engine.state import Array, ArrayStep, Block, Entry, KVEntry, Read, TensorType, Window
+from mstar.engine.state.adapters import DENSE_WINDOW, PAGED, build_specs, node_handles, state_steps, storage_of
 from mstar.engine.state.episodes import EpisodeRowBindings
 
 
@@ -91,8 +96,91 @@ def test_unbounded_dense_log_has_finite_read_derived_retention():
     frames = _frames(reads={"recent": Read(mask=Window(3)), "long": Read(mask=Window(7))})
     assert frames.max_len is None
     assert max(read.mask.size for read in frames.reads.values()) == 7
-    with pytest.raises(ValueError, match="dense window storage binding"):
+    assert storage_of(frames) is DENSE_WINDOW
+    with pytest.raises(ValueError, match="exactly one read"):
         build_specs([frames])
+
+
+def test_dense_window_keeps_only_latest_executed_frames_across_calls():
+    frames = _frames(reads={"context": Read(mask=Window(48))})
+    (spec,) = build_specs([frames])
+    assert isinstance(spec, DenseWindowSpec)
+    pool = DenseWindowPool.build(spec, EngineResourceInfo(device=torch.device("cpu")))
+    pool.ingest_request("a")
+    (handle,) = node_handles(SimpleNamespace(declare_state=lambda: [frames]), "decoder", {"frames": pool}).values()
+    executed = torch.empty((0, 3, 8, 8), dtype=torch.uint8)
+    for span in (21, 24, 24, 24):
+        values = torch.arange(executed.shape[0], executed.shape[0] + span, dtype=torch.uint8)
+        chunk = values[:, None, None, None].expand(-1, 3, 8, 8).clone()
+        step = state_steps(SubmoduleStep(
+            segments=[Segment("a", "main", span)], state={"frames": ArrayStep()},
+        ), {"frames": handle}, graph_walk="decode")
+        step.set_ctx(StepContext(request_ids=["a"], graph_walk="decode", slot=0, capture=False))
+        assert pool.admit(step.steps["frames"], step.ctx).ok
+        pool.plan(step.steps["frames"], step.ctx)
+        step.begin_calls()
+        handle.add(0, rgb=chunk)
+        reached = handle.read(0)
+        executed = torch.cat((executed, chunk))
+        assert torch.equal(reached.fields["rgb"], executed[-48:])
+        assert reached.row_offsets.tolist() == [0, min(48, executed.shape[0])]
+        step.check_calls()
+        pool.commit(step.steps["frames"], step.ctx)
+        step.end_calls()
+        assert pool.logical_length("a", "main") == executed.shape[0]
+
+    # A later zero-span read still addresses the resident row, then teardown
+    # clears its logical count before the same request id is reused.
+    step = state_steps(SubmoduleStep(
+        segments=[Segment("a", "main", 0)], state={"frames": ArrayStep()},
+    ), {"frames": handle}, graph_walk="decode")
+    step.set_ctx(StepContext(request_ids=["a"], graph_walk="decode", slot=0, capture=False))
+    assert pool.admit(step.steps["frames"], step.ctx).ok
+    pool.plan(step.steps["frames"], step.ctx)
+    step.begin_calls()
+    assert torch.equal(handle.read(0).fields["rgb"], executed[-48:])
+    step.check_calls()
+    pool.commit(step.steps["frames"], step.ctx)
+    step.end_calls()
+    pool.remove_request("a")
+    pool.ingest_request("a")
+    assert pool.logical_length("a", "main") == 0
+    step = state_steps(SubmoduleStep(
+        segments=[Segment("a", "main", 0)], state={"frames": ArrayStep()},
+    ), {"frames": handle}, graph_walk="decode")
+    step.set_ctx(StepContext(request_ids=["a"], graph_walk="decode", slot=0, capture=False))
+    assert pool.admit(step.steps["frames"], step.ctx).ok
+    pool.plan(step.steps["frames"], step.ctx)
+    step.begin_calls()
+    assert handle.read(0).fields["rgb"].shape == (0, 3, 8, 8)
+    step.check_calls()
+    pool.commit(step.steps["frames"], step.ctx)
+    step.end_calls()
+
+
+def test_dense_window_packs_different_row_lengths_and_refuses_capture():
+    frames = _frames(reads={"context": Read(mask=Window(4))})
+    (spec,) = build_specs([frames], kernel_settings={"frames": {"max_slots": 3}})
+    pool = DenseWindowPool.build(spec, EngineResourceInfo(device=torch.device("cpu")))
+    assert not pool.can_capture()
+    for rid in ("a", "b"):
+        pool.ingest_request(rid)
+    (handle,) = node_handles(SimpleNamespace(declare_state=lambda: [frames]), "decoder", {"frames": pool}).values()
+    step = state_steps(SubmoduleStep(
+        segments=[Segment("a", "main", 2), Segment("b", "main", 5)], state={"frames": ArrayStep()},
+    ), {"frames": handle}, graph_walk="decode")
+    step.set_ctx(StepContext(request_ids=["a", "b"], graph_walk="decode", slot=0, capture=False))
+    assert pool.admit(step.steps["frames"], step.ctx).ok
+    pool.plan(step.steps["frames"], step.ctx)
+    step.begin_calls()
+    values = torch.arange(7, dtype=torch.uint8)[:, None, None, None].expand(-1, 3, 8, 8).clone()
+    handle.add(0, rgb=values)
+    reached = handle.read(0)
+    assert reached.row_offsets.tolist() == [0, 2, 6]
+    assert torch.equal(reached.fields["rgb"], torch.cat((values[:2], values[-4:])))
+    step.check_calls()
+    pool.commit(step.steps["frames"], step.ctx)
+    step.end_calls()
 
 
 @pytest.mark.parametrize("override,match", [
