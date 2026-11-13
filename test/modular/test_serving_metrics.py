@@ -1302,7 +1302,7 @@ def _config(monkeypatch, tmp_path, text="model: fake\n") -> str:
             pass
 
         def get_worker_graphs(self, config_path):
-            pass
+            return []
 
         def declare_state(self):
             return []
@@ -1411,6 +1411,7 @@ def test_the_api_server_reads_the_placement_and_refuses_declarations_the_conduct
 
         def get_worker_graphs(self, config_path):
             calls.append("get_worker_graphs")
+            return []
 
         def declare_state(self):
             calls.append("declare_state")
