@@ -11,6 +11,7 @@ snapshot; bit-exactness against the reference lives in the parity harness, not h
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import os
 
@@ -22,14 +23,17 @@ from mstar.model.components.token2wav.model import (
     HIFT_MEL_CACHE,
     HIFT_TAIL,
     KEEP_RECENT,
+    LAST_WINDOW_TOKENS,
     SAMPLES_PER_FRAME,
     UP_RATE,
+    WINDOW,
     CacheCapacity,
     SineGen2Source,
     Token2Wav,
     Token2WavState,
     Token2WavVoice,
     VoiceBank,
+    excitation_samples,
     fade_in_out,
     slot_layout,
     window_frames,
@@ -815,3 +819,68 @@ def test_slot_check_wants_one_more_state_slot_than_each_cache(state, kv, ok):
     else:
         with pytest.raises(ValueError, match="must be one more than"):
             check_token2wav_slots(T2W_KEYS, resources, 9, "cfg.yaml")
+
+
+# HiFT's excitation, from the request's seed and the window's index
+
+
+def _kept_stream(model, seed: int, device) -> list:
+    """Upstream's draws for one request: a generator kept from its seed draws a first window, two full ones, then
+    each length a last window may have, every last one from the state the full ones left."""
+    source, full = model.hift.m_source, window_frames(WINDOW, False)
+    kept = torch.Generator(device=device).manual_seed(seed)
+    draws = [((full, k == 0, k), source.draw_noise(1, excitation_samples(full, k == 0), torch.float32, device, kept))
+             for k in range(3)]
+    state = kept.get_state()
+    for n in LAST_WINDOW_TOKENS:
+        kept.set_state(state)
+        frames = window_frames(n, True)
+        draws.append(((frames, False, 3), source.draw_noise(1, excitation_samples(frames, False), torch.float32,
+                                                            device, kept)))
+    return draws
+
+
+def _assert_window_noise_is_the_kept_streams(model, device) -> None:
+    for seed in (0, 1234, 2**40 + 7):
+        for (frames, first, k), want in _kept_stream(model, seed, device):
+            got = model.window_noise(frames, first, [(seed, k)])
+            assert torch.equal(got.phase, want.phase) and torch.equal(got.harmonic, want.harmonic), (
+                f"window {k} of seed {seed} ({frames} frames) would draw from another place in its stream"
+            )
+
+
+def test_noise_from_the_seed_and_window_is_the_kept_generators(random_token2wav):
+    _assert_window_noise_is_the_kept_streams(random_token2wav, "cpu")
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="a CUDA generator's offset is the derivation on the device")
+def test_noise_from_the_seed_and_window_is_the_kept_generators_on_the_device(random_token2wav):
+    """On the device the draw moves the generator's offset, measured there, in place of drawing the earlier windows."""
+    _assert_window_noise_is_the_kept_streams(copy.deepcopy(random_token2wav).cuda(), "cuda")
+
+
+def test_a_window_drawn_again_draws_the_same_noise(random_token2wav):
+    """A refused admit or an uncommitted forward runs a window again, which draws what it drew the first time."""
+    model = random_token2wav
+    first = model.window_noise(50, False, [(7, 4)])
+    model.window_noise(50, False, [(8, 2)])
+    again = model.window_noise(50, False, [(7, 4)])
+    assert torch.equal(first.harmonic, again.harmonic), "another request's draw would have moved this one's"
+
+
+def test_a_short_window_before_the_last_is_refused(random_token2wav):
+    """Window k's noise counts the draws of k full windows before it, so a shorter one would shift every later draw."""
+    from types import SimpleNamespace
+
+    from mstar.model.components.token2wav.submodule import Token2WavSubmodule
+    from mstar.model.submodule_base import InputMetadata
+
+    voice = random_token2wav.prepare_voice(VoicePrompt(
+        tokens=torch.randint(0, 6561, (1, 6), dtype=torch.int32), spk_emb=torch.randn(1, 192),
+        mel=torch.randn(1, 12, 80),
+    ))
+    node = Token2WavSubmodule(random_token2wav, T2W_KEYS, {"v": voice}, eos_code=6561, dit_dtype=torch.float32)
+    chunk = InputMetadata(stream_chunks={"tts_code": SimpleNamespace(start_offset=0, context_items=0, num_items=20)})
+    info = SimpleNamespace(rid_handle="a", step_metadata={"voice": "v"}, random_seed=0)
+    with pytest.raises(RuntimeError, match="a window before the last holds 23 codes"):
+        node.prepare_inputs("t2w_chunk", info, {"tts_code": [torch.arange(20)]}, input_metadata=chunk)
