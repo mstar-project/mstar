@@ -6,14 +6,17 @@ would notice, so this reads each package's source. The base classes are the brid
 says why it stands or which PR deletes it, and an exception nothing uses any more fails too, so the list only shrinks.
 
 A package that isn't ported has to be on the frozen list of those that predate this rule, so a new model arrives on
-the contract. Only the engine and the tests import the adapters that bind a declaration to a resource, and
-``contract.py`` imports nothing new from the resources, so the adapters can be replaced without touching a model.
+the contract. ``MODEL_REGISTRY`` loads a model only from a listed package, and from one module per unported package,
+so a model can't sit where that rule doesn't look. Only the engine and the tests import the adapters that bind a
+declaration to a resource, and ``contract.py`` imports nothing new from the resources, so the adapters can be replaced
+without touching a model.
 """
 
 from __future__ import annotations
 
 import ast
 import sys
+from collections import Counter
 from pathlib import Path
 
 sys.path.insert(0, ".")
@@ -164,12 +167,22 @@ def _sources() -> list[Path]:
 
 
 def _model_packages() -> list[str]:
-    """The directories under mstar/model/ that hold Python source, apart from the shared ones. A `__pycache__`, or a
-    package another branch left behind, holds none."""
+    """The directories under mstar/model/ that hold Python source, apart from the shared ones and an editor's dot
+    directories (`.ipynb_checkpoints`). A `__pycache__`, or a package another branch left behind, holds none."""
     return sorted(
         str(path) for path in Path("mstar/model").iterdir()
-        if path.is_dir() and str(path) not in SHARED and any(path.rglob("*.py"))
+        if path.is_dir() and not path.name.startswith(".") and str(path) not in SHARED and any(path.rglob("*.py"))
     )
+
+
+def _registered_modules() -> dict[str, str]:
+    """The entry PORTED or UNPORTED would name for each module `MODEL_REGISTRY` names. Each string in registry.py
+    that starts with ``mstar.`` is such a module, so an entry counts however it is added."""
+    tree = ast.parse(Path("mstar/model/registry.py").read_text())
+    return {
+        node.value: "/".join(node.value.split(".")[:3]) for node in ast.walk(tree)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value.startswith("mstar.")
+    }
 
 
 def _imports_adapters(source: str) -> bool:
@@ -286,6 +299,20 @@ def test_no_package_is_on_both_lists():
 def test_both_lists_name_only_packages_that_exist():
     gone = sorted(set(PORTED + UNPORTED) - set(_model_packages()))
     assert not gone, f"take {gone} off PORTED and UNPORTED, since mstar/model/ holds no such package"
+
+
+def test_every_registered_model_lives_in_a_listed_package():
+    stray = sorted(module for module, entry in _registered_modules().items() if entry not in PORTED + UNPORTED)
+    assert not stray, (
+        f"MODEL_REGISTRY loads a model from {stray}, which no package on PORTED or UNPORTED holds. Move it into a "
+        "package of its own under mstar/model/."
+    )
+
+
+def test_an_unported_package_registers_no_second_model_module():
+    counts = Counter(_registered_modules().values())
+    grown = sorted(entry for entry in UNPORTED if counts[entry] > 1)
+    assert not grown, f"{grown} register a second model module. Move it into a package of its own under mstar/model/."
 
 
 def test_only_the_engine_and_the_tests_import_the_adapters():
