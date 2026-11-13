@@ -2099,7 +2099,12 @@ when the server sets <code class="docutils literal notranslate"><span class="pre
 <code class="docutils literal notranslate"><span class="pre">client.tts(text,</span> <span class="pre">reference_audio=&quot;ref.wav&quot;,</span> <span class="pre">ref_text=&quot;...&quot;)</span></code>. The clip’s
 conditioning (x-vector and codec frames) is memoised by content, so a voice
 reused across requests, or by the sentence chunks of one long request, is
-encoded once; named, persisted voices arrive with the shared voice registry.</p></li>
+not encoded again once its conditioning is memoised; named, persisted voices
+arrive with the shared voice registry.
+A new clip of up to 20.5 s replays the engine’s capture of its frame bucket
+(<code class="docutils literal notranslate"><span class="pre">RefEncoderSubmodule.FRAME_BUCKETS</span></code>), padded to the bucket and encoded as
+the unpadded clip would be, up to kernel choice; a longer clip runs the same
+encode eagerly.</p></li>
 <li><p>Text layout follows the reference defaults: CustomVoice and VoiceDesign put
 the whole text in the prefill; Base feeds it one token per frame. Override
 per request with <code class="docutils literal notranslate"><span class="pre">non_streaming_mode</span></code>.</p></li>
@@ -2182,6 +2187,30 @@ On its own it lowers first-audio latency at high concurrency; with
 <code class="docutils literal notranslate"><span class="pre">mps:</span> <span class="pre">true</span></code> in the YAML (see <a class="reference internal" href="serving.html"><span class="doc">Serving</span></a>; <code class="docutils literal notranslate"><span class="pre">qwen3tts_split.yaml</span></code> sets
 it) the two workers’ kernels also overlap, which raised c=32 throughput by
 about a fifth on an H100.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">configs/qwen3tts_base.yaml</span></code> keeps the Base model’s nodes on one worker, on
+any GPU. <code class="docutils literal notranslate"><span class="pre">configs/qwen3tts_base_split.yaml</span></code> runs the Talker, the Codec and
+the RefEncoder on workers of their own, all on GPU 0, as clients of one MPS
+daemon (<code class="docutils literal notranslate"><span class="pre">mps:</span> <span class="pre">true</span></code>, NVIDIA only), so the Talker’s decode steps overlap codec
+windows and reference encodes. On an H200, serving seed-tts voice clones (two
+boots each), it served 83-87 audio seconds a second at c=8 and 189-215 at
+c=32, against 50-81 and 113-165 on one worker and 46-61 and 76-140 for
+sglang-omni; at c=1 it is level with one worker (16.6-17.1 against 15.0-18.7).
+Both start streaming after one frame and ramp to steady 16-frame chunks
+(<code class="docutils literal notranslate"><span class="pre">codec_chunk_schedule:</span> <span class="pre">[1,</span> <span class="pre">2,</span> <span class="pre">4]</span></code>, <code class="docutils literal notranslate"><span class="pre">codec_chunk_frames:</span> <span class="pre">16</span></code>), and size
+the Talker’s KV pool at 2304 pages, which fits an 80 GB GPU. Every Qwen3-TTS
+request reserves its whole footprint at admission, its prompt plus its length
+cap: a streamed one can’t pause (<code class="docutils literal notranslate"><span class="pre">unpausable_outputs</span></code>), and none can be
+rebuilt after a drop (its prompt is rows, not ids) without a host pool. That is
+a few pages for a clone of a sentence, about 66 for a request that asks for the
+checkpoint’s 8192 frames (34 of those fit).</p></li>
+<li><p>A clone without <code class="docutils literal notranslate"><span class="pre">max_output_tokens</span></code> stops within a budget set by its target
+text: twice the slowest natural stop of the 1.7B checkpoint, 1.38 s + 0.39 s a
+text token (sglang-omni’s fit; 2 of 78k natural stops of M*’s seed-tts clones
+ran past it), about 18 s for a 20-token sentence. Without it, a clone that
+runs away would decode to the checkpoint’s 8192 frames (11 minutes); about 1
+in 7000 did. A request’s own <code class="docutils literal notranslate"><span class="pre">max_output_tokens</span></code> replaces the budget, and
+live text (<code class="docutils literal notranslate"><span class="pre">text_in</span></code> left open) has none, since its length isn’t known at
+the prompt.</p></li>
 <li><p>The Talker’s layers run <code class="docutils literal notranslate"><span class="pre">Qwen3Attention</span></code>, so each layer’s q/k norm, RoPE and
 KV write are one kernel (<code class="docutils literal notranslate"><span class="pre">qk_norm_rope_kv_write</span></code>). It reads the RoPE theta off
 the position resource, which declares the checkpoint’s.</p></li>
