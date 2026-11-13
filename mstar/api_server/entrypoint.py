@@ -79,7 +79,7 @@ from mstar.utils.client_errors import client_error_text, scrub_paths
 from mstar.utils.exitcode import describe_exitcode
 from mstar.utils.gc_freeze import freeze_after_setup
 from mstar.utils.generation_kwargs import normalize_generation_kwargs
-from mstar.utils.logging_config import log_off_thread, quiet_noisy_loggers
+from mstar.utils.logging_config import REQUEST_LOGGER, configure_request_log, log_off_thread, quiet_noisy_loggers
 from mstar.utils.orphan import watch_parent
 from mstar.utils.socket_prefix import per_port_socket_prefix
 from mstar.utils.threads import Thread, pin_thread
@@ -89,6 +89,32 @@ if TYPE_CHECKING:
     import numpy as np
 
 logger = logging.getLogger(__name__)
+request_log = logging.getLogger(REQUEST_LOGGER)
+
+# The sets of ignored keys already reported, as digests: a client that sends a
+# key every request (a benchmark's ``temperature`` to a greedy model) is
+# reported once, not once per request. A digest rather than the names, and a
+# fixed number of them, so what a client sends never stays in memory; a
+# collision only skips one warning. Least recently seen go first.
+_REPORTED_IGNORED: collections.OrderedDict[int, None] = collections.OrderedDict()
+_REPORTED_IGNORED_MAX = 256
+_REPORTED_IGNORED_LOCK = threading.Lock()
+# what the warning names of a set: a client's keys can be as large as its body
+_REPORTED_NAMES_MAX = 20
+_REPORTED_NAME_CHARS = 64
+
+
+def _first_report(keys: tuple[str, ...]) -> bool:
+    """Whether ``keys`` is not among the recently reported sets; remembers it."""
+    digest = hash(keys)
+    with _REPORTED_IGNORED_LOCK:
+        if digest in _REPORTED_IGNORED:
+            _REPORTED_IGNORED.move_to_end(digest)
+            return False
+        _REPORTED_IGNORED[digest] = None
+        if len(_REPORTED_IGNORED) > _REPORTED_IGNORED_MAX:
+            _REPORTED_IGNORED.popitem(last=False)
+        return True
 
 STREAMING_ONLY_MODALITIES = frozenset({"video_frame"})
 
@@ -174,6 +200,7 @@ def _conductor_process_target(
         force=True,
     )
     quiet_noisy_loggers()
+    configure_request_log()
     log_off_thread()
     # A server started as a background job of a non-interactive shell inherits
     # SIGINT ignored, and Python keeps an inherited ignore, so the graceful stop
@@ -788,14 +815,17 @@ class APIServer:
     # ----------------------------------------------------------
 
     def _report_ignored_params(self, model_kwargs: dict) -> None:
-        """Log the keys the model does not read; the request is served regardless."""
+        """Log the keys the model does not read, once per set of keys; the
+        request is served regardless."""
         model = getattr(self, "model", None)
         declared = model.request_kwargs() if model is not None else None
         if declared is None:
             return
         ignored = sorted(set(model_kwargs) - declared - set(model.ENGINE_KWARGS) - set(model.LENGTH_KWARGS))
-        if ignored:
-            logger.warning("Ignoring model_kwargs this model does not read: %s", ignored)
+        if ignored and _first_report(tuple(ignored)):
+            names = [name[:_REPORTED_NAME_CHARS] for name in ignored[:_REPORTED_NAMES_MAX]]
+            more = f" and {len(ignored) - len(names)} more" if len(ignored) > len(names) else ""
+            logger.warning("Ignoring model_kwargs this model does not read: %s%s", names, more)
 
     def submit_request(
         self,
@@ -931,7 +961,7 @@ class APIServer:
             raw_inputs=raw_inputs,
         ))
 
-        logger.info(
+        request_log.debug(
             "Request %s submitted as %s  in=%s  out=%s",
             request_id, key, input_modalities, output_modalities,
         )
@@ -1296,7 +1326,7 @@ class APIServer:
                                 # release it once the client lets go.
                                 self.recently_completed[rid] = time.time()
                             elif message.message_type == "request_complete":
-                                logger.info("API server received %s done", rid)
+                                request_log.debug("API server received %s done", rid)
                                 self.recently_completed[rid] = time.time()
 
                                 if not message.body.output_chunk_counts:
@@ -1632,7 +1662,7 @@ class APIServer:
                     yield new_chunks
 
                 if done:
-                    logger.info("Async stream results received finish for %s", request_id)
+                    request_log.debug("Async stream results received finish for %s", request_id)
                     # flush remaining
                     remaining: list[ResultChunk] = []
                     finished_req: PendingRequest | None = None
@@ -3181,6 +3211,7 @@ def main(argv: list[str] | None = None):
         format="%(asctime)s %(levelname)s [api_server] %(name)s: %(message)s",
     )
     quiet_noisy_loggers()
+    configure_request_log()
     log_off_thread()
     api_key = resolve_api_key(args.api_key)
     api_key_guard.set(api_key)
