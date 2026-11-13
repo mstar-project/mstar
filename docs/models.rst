@@ -104,9 +104,13 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
        (see :doc:`clients`).
        ``LLM`` and ``action_expert`` share a KV cache, so ``node_groups`` must list them in
        one entry; the server refuses to start otherwise.
-   * - ``praxis1_{droid,yam}``
+   * - ``praxis1_{droid,yam}`` *(Not served yet)*
      - ``runwayml/praxis-1-{droid,yam}``
-     - Praxis-1 video-action policy: one call answers one chunk of the future, 6 video
+     - **Not served yet.** This build has the graph and the checkpoint's config reader
+       but no node computation, so ``mstar serve praxis1_droid`` (or ``praxis1_yam``)
+       refuses to start, before it downloads anything. The rest of this row describes
+       the model as it will be served once the compute lands.
+       Praxis-1 video-action policy: one call answers one chunk of the future, 6 video
        latents and 6 action tokens, which is 24 command rows at 15 Hz. The backbone
        denoises the video over a few Euler steps and the action expert denoises the
        actions from its hidden states each step.
@@ -115,7 +119,7 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
        rig, the canvas and every width come from the checkpoint's ``config.json``; a
        variant this build has not ported is refused at load rather than served.
        Both need the public Wan2.2 VAE and Qwen3.5-2B beside the checkpoint, which it
-       does not ship. Both serve openpi's policy WebSocket (see :doc:`clients`).
+       does not ship. Both will serve openpi's policy WebSocket (see :doc:`clients`).
        ``backbone``, ``action_expert`` and ``action_head`` run in one ``node_groups``
        entry: the expert reads the backbone's hidden states inside each Euler step.
    * - ``qwen3_5_{0.8,2,4,9,27}b``

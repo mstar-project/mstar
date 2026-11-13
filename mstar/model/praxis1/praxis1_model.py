@@ -17,8 +17,14 @@ The graph follows that shape:
   nodes sit in one loop body rather than in separate walks.
 
 The video of a chunk is predicted whether or not anyone wants to look at it:
-it is what conditions the next call. Decoding it back to pixels is not, so the
-VAE decoder only runs for a request that asked for video.
+it is what conditions the next call. Decoding that video back to pixels is not
+part of this graph yet: there is no VAE decoder node, and the predicted latents
+end the walk at ``action_head``.
+
+Nothing here serves yet. The nodes have no computation until the compute port
+lands, so a served model is refused at construction, before it fetches
+anything; dummy mode (``skip_weight_loading``) builds the graph for the startup
+checks and the tests.
 """
 
 from __future__ import annotations
@@ -55,6 +61,15 @@ DENOISE_LOOP_NAME = "praxis_denoise"
 # The state kwarg the openpi WebSocket protocol fills from a client's request.
 STATE_KWARG = "robot_state"
 
+# False until get_submodule can build the nodes. Until then a served model is
+# refused in the constructor, the first model code every serving process runs,
+# rather than in get_submodule once every process has started. The PR that
+# ports the compute deletes this.
+_SERVABLE = False
+
+# The denoise loop's ceiling when the checkpoint names none.
+DEFAULT_MAX_DENOISE_STEPS = 8
+
 
 class Praxis1Model(Model):
     """The served Praxis-1 policy.
@@ -82,7 +97,7 @@ class Praxis1Model(Model):
         self.vae_weights_hf: str = kwargs.pop("vae_weights_hf", "Wan-AI/Wan2.2-TI2V-5B")
         self.text_encoder_hf: str = kwargs.pop("text_encoder_hf", "Qwen/Qwen3.5-2B")
         # Sampler defaults of the deployment; a request may ask for fewer
-        # steps, never for more than the loop's cap.
+        # steps than num_steps, never for more (get_loop_caps).
         self.sampler_defaults: dict = {
             "num_steps": kwargs.pop("num_steps", 2),
             "t_shift": kwargs.pop("t_shift", 12.5),
@@ -92,9 +107,25 @@ class Praxis1Model(Model):
         }
         self._yaml_config_overrides: dict = dict(kwargs)
 
+        if not skip_weight_loading and not _SERVABLE:
+            raise NotImplementedError(
+                f"Praxis-1 ({model_path_hf}) is not servable yet: this build has its "
+                "graph and config reader but no node computation, which lands with the "
+                "compute port. Nothing was downloaded."
+            )
+
         self._repo_dir: Path | None = None
         self._submodule_cache: dict = {}
         self.config: Praxis1Config = self._load_config()
+        # A recipe past the loop's ceiling would have every request refused at
+        # the conductor, so it is refused once, here.
+        num_steps = self.sampler_defaults["num_steps"]
+        if isinstance(num_steps, bool) or not isinstance(num_steps, int) or not (
+            1 <= num_steps <= self.max_denoise_steps
+        ):
+            raise Praxis1ConfigError(
+                f"num_steps must be an integer in [1, {self.max_denoise_steps}]; got {num_steps!r}"
+            )
 
     # ------------------------------------------------------------------
     # Config
@@ -105,12 +136,15 @@ class Praxis1Model(Model):
             return self._repo_dir
         from huggingface_hub import snapshot_download
 
-        # config.json is all the data worker needs to build the graph; the
-        # weights come later, per submodule, on the worker that holds them.
+        # config.json is all the graph needs, and every process that builds
+        # the model builds the graph: the API server, the conductor and the
+        # data worker read nothing else. The weights are fetched per submodule,
+        # by get_submodule on the worker that holds them, so no other process
+        # pays for a download it never reads.
         local = snapshot_download(
             repo_id=self.model_path_hf,
             cache_dir=self.cache_dir,
-            allow_patterns=["config.json"] if self.skip_weight_loading else None,
+            allow_patterns=["config.json"],
         )
         self._repo_dir = Path(local)
         return self._repo_dir
@@ -139,6 +173,11 @@ class Praxis1Model(Model):
         if self.skip_weight_loading:
             return Praxis1Config.for_rig(self._rig())
         return Praxis1Config.from_checkpoint(self._ensure_repo())
+
+    @property
+    def max_denoise_steps(self) -> int:
+        """The denoise loop's ``max_iters``: a ceiling, not the step count."""
+        return int(self.config.raw.get("max_denoise_steps", DEFAULT_MAX_DENOISE_STEPS))
 
     # ------------------------------------------------------------------
     # Model ABC: the graph
@@ -190,15 +229,16 @@ class Praxis1Model(Model):
                 GraphEdge(next_node="backbone", name="video_latents"),
                 GraphEdge(next_node="backbone", name="action_latents"),
             ],
-            # the loop's cap keeps speculation off a request's last step
+            # get_loop_caps ends the loop on a request's last step, so nothing
+            # speculates past it
             enable_async_scheduling=True,
         )
 
         denoise_loop = Loop(
             name=DENOISE_LOOP_NAME,
             section=Sequential([backbone, action_expert]),
-            # Ceiling only; the request's step count is the loop's cap.
-            max_iters=self.config.raw.get("max_denoise_steps", 8),
+            # Ceiling only; get_loop_caps gives each request its step count.
+            max_iters=self.max_denoise_steps,
             outputs=[
                 GraphEdge(next_node="action_head", name="action_latents"),
                 GraphEdge(next_node="action_head", name="video_latents"),
@@ -206,9 +246,9 @@ class Praxis1Model(Model):
         )
 
         # The head turns the settled action latents into command rows. It is
-        # its own node because the video latents leave the walk here too: a
-        # request that wants the predicted video takes them to the decoder,
-        # and one that does not pays nothing for it.
+        # its own node because the video latents leave the walk here too, as
+        # the chunk's persisted latents. Nothing decodes them to pixels yet;
+        # a decoder node would read them here when that lands.
         action_head = GraphNode(
             name="action_head",
             input_names=["action_latents", "video_latents"],
@@ -292,8 +332,32 @@ class Praxis1Model(Model):
 
     def request_kwargs(self) -> frozenset[str]:
         # The sampler knobs come from the deployment YAML. What a request
-        # carries is the arm's pose and how much of the last chunk it ran.
-        return frozenset({STATE_KWARG, "executed_rows"})
+        # carries is the arm's pose, how much of the last chunk it ran, and
+        # optionally fewer Euler steps than the deployment's recipe.
+        return frozenset({STATE_KWARG, "executed_rows", "num_steps"})
+
+    def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
+        """The denoise loop runs the deployment's ``num_steps``, or the request's if fewer.
+
+        The cap is what ends the loop on a request's last Euler step: without
+        it the loop runs its ``max_iters`` ceiling, and the expert's async
+        scheduling would speculate a step past the last one. A request may ask
+        for fewer steps than the recipe, never more: the recipe is what the
+        checkpoint was tuned for, and the constructor already holds it under
+        the loop's ceiling.
+        """
+        recipe = self.sampler_defaults["num_steps"]
+        steps = model_kwargs.get("num_steps")
+        if steps is None:
+            return {DENOISE_LOOP_NAME: recipe}
+        if isinstance(steps, bool) or not isinstance(steps, int) or steps < 1:
+            raise ValueError(f"num_steps must be an integer >= 1; got {steps!r}")
+        if steps > recipe:
+            raise ValueError(
+                f"num_steps {steps} is more than this deployment's {recipe}; "
+                "a request may ask for fewer steps, never more"
+            )
+        return {DENOISE_LOOP_NAME: steps}
 
     def max_input_files(self) -> dict[str, int]:
         return {"image": self.config.num_cameras}
