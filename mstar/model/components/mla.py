@@ -54,7 +54,7 @@ from mstar.utils.mla_latent_norm import mla_latent_norm, mla_latent_norm_availab
 def _prep_attend(kv, layer, fused, q, q_nope, kv_norm_weight, eps, pos_ids):
     rank, rope_dim = kv_norm_weight.shape[0], kv.array.entry.tensors["kpe"].shape[0]
     kv_a, k_pe = fused[:, fused.shape[1] - rank - rope_dim:].split([rank, rope_dim], dim=-1)
-    # FlashInfer RMSNorm's alignment, and the RoPE kernel rotates in place, as in `MLAAttention._prep_and_attend`
+    # Clones, as in `MLAAttention._prep_and_attend`: FlashInfer's RMSNorm needs aligned input, and RoPE rotates in place
     kv_c = rms_norm(kv_a.clone(memory_format=torch.contiguous_format), kv_norm_weight, eps)
     q_pe, k_pe = rope(
         kv, q[..., -rope_dim:].clone(memory_format=torch.contiguous_format),
@@ -179,8 +179,7 @@ class MLAAttention(nn.Module):
         self._kv = None
         self._attn = None
         self._pos = None
-        # the model's id for this layer, a plain attribute that `.to(device)` leaves on the CPU, and the handle on the
-        # array ``kv_key`` names, where the model declares it
+        # the model's id for this layer, a plain attribute that `.to(device)` leaves on the CPU
         self.layer = None if layer_idx is None else torch.tensor(layer_idx, device="cpu")
         self.state = None
 
