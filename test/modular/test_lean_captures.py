@@ -213,7 +213,7 @@ def _capture_runner(resources, steps=None, blocked=()):
 
     def declare_step(graph_walk, **kwargs):
         keys = resources.keys() if steps is None else steps[graph_walk]
-        return SimpleNamespace(steps=dict.fromkeys(keys, object()), segments=None)
+        return SimpleNamespace(steps=dict.fromkeys(keys, object()), segments=None, state={})
 
     for key in blocked:
         resources[key].can_capture = lambda: False
@@ -223,7 +223,7 @@ def _capture_runner(resources, steps=None, blocked=()):
     return AcceleratorGraphRunner(
         submodule_name="N", submodule=submodule, resources=resources, step_runner=Mock(),
         device=torch.device("cpu"), autocast_dtype=None, joint_comm_group=SimpleNamespace(world_size=1),
-        num_slots=2,
+        num_slots=2, head_shards=1,
     )
 
 

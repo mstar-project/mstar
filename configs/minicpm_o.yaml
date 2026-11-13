@@ -1,7 +1,57 @@
 model: "minicpm_o"
 max_seq_len: 16384
+# One GPU (the whole checkpoint is ~19 GB in bf16), three workers. The
+# encoders run once per request and then idle, so they share the LLM's
+# worker. The TTS and the vocoder each get their own worker loop: a vocoder
+# step takes 40-150 ms, which on a shared loop would hold up the
+# TTS's few-millisecond decode steps (and the LLM's). On an H200 the three hold
+# 55.6 GiB after startup, highest sample 63.0 GiB under load; not booted on an
+# H100.
+rank_devices: {0: 0, 1: 0, 2: 0}
+# The three workers' kernels overlap as clients of one MPS daemon, rather than
+# time-slicing the GPU.
+mps: true
+# Requests past 32 in flight queue here. Nothing else caps the spoken replies
+# the TTS holds at once (the vocoder's slots gate only the vocoder), so tts_kv
+# is sized for this many; startup refuses a tts_kv that can't hold them.
+max_concurrent_requests: 32
+# Text and spoken replies decode in one step (`decode_mixed`) rather than taking
+# turns. Mixing is on by default only where the LLM has a token budget, and it
+# has none.
+speculation_mixes_walks: {LLM: true}
 node_groups:
-  # The encoders run once per request and then idle, so they share the
-  # LLM's GPU (the whole checkpoint is ~19 GB in bf16).
   - node_names: [LLM, vision_encoder, audio_encoder]
     ranks: [0]
+  - node_names: [TTS]
+    ranks: [1]
+  - node_names: [Token2Wav]
+    ranks: [2]
+resources:
+  # 128-token pages. The LLM's ~144 KiB/token: 384 pages (49k tokens) is 6.8 GiB.
+  # Admission reserves only a prompt's pages, so 32 long replies can outgrow them;
+  # 512 host pages (9 GiB of host memory) give a full pool a request to move, as
+  # qwen3omni_2gpu.yaml does, where without them every reply would wait until it
+  # timed out. At the cap of 32, with 2048 tokens out on an H200 (one run per
+  # size), a burst of prompts around 3.7k tokens or longer still waits, 2.5k does
+  # not; a wait warns to raise cpu_offload_pages.
+  llm_kv:
+    max_num_pages: 384
+    cpu_offload_pages: 512
+  # The TTS's ~60 KiB/token. A spoken reply's condition and codes fill at most
+  # its 4096 positions (32 pages), kept until its last code: 1025 pages (7.5 GiB)
+  # hold `max_concurrent_requests` full replies and the sink page. With fewer, a
+  # burst of long replies fills the pool and stalls.
+  tts_kv:
+    max_num_pages: 1025
+  # The vocoder holds a slot in each of these per spoken reply, ~0.4 GiB in all
+  # (t2w_state has one more, its sink; startup refuses counts that disagree). A
+  # reply waits for slots before its first audio, so they cap the replies being
+  # voiced at once.
+  t2w_state:
+    max_slots: 33
+  t2w_enc1_kv:
+    max_slots: 32
+  t2w_enc2_kv:
+    max_slots: 32
+  t2w_dit_kv:
+    max_slots: 32

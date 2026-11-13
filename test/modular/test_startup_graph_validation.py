@@ -15,6 +15,7 @@ none of them trips the new checks.
 import importlib.util
 import sys
 import types
+import urllib.error
 from pathlib import Path
 
 import pytest
@@ -47,12 +48,11 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class _ToyModel(StubModel):
-    def __init__(self, walks, partitions=None, topology=None, tp_enabled_nodes=(), sp_enabled_nodes=()):
+    def __init__(self, walks, partitions=None, topology=None, tp_enabled_nodes=()):
         self._walks = walks
         self._partitions = partitions
         self._topology = topology
         self._tp_enabled_nodes = set(tp_enabled_nodes)
-        self._sp_enabled_nodes = set(sp_enabled_nodes)
 
     def get_graph_walk_graphs(self):
         return self._walks()
@@ -64,8 +64,7 @@ class _ToyModel(StubModel):
         return self._topology() if self._topology else super().get_partition_topology()
 
     def get_default_sharding_config(self):
-        return ShardingConfig(groups=[], tp_enabled_nodes=self._tp_enabled_nodes, shard_dim={},
-                              sp_enabled_nodes=self._sp_enabled_nodes)
+        return ShardingConfig(groups=[], tp_enabled_nodes=self._tp_enabled_nodes, shard_dim={})
 
 
 def _config(tmp_path, node_groups) -> str:
@@ -714,12 +713,15 @@ def _kokoro(name, model_kwargs, tmp_path, monkeypatch):
 
 def _minicpm_o(name, model_kwargs, tmp_path, monkeypatch):
     from mstar.model.components.qwen3_lm import Qwen3LMConfig
+    from mstar.model.minicpm_o.components.tts import TTSConfig
     from mstar.model.minicpm_o.config import AudioConfig, MiniCPMOConfig, ResamplerConfig, VisionConfig
     from mstar.model.minicpm_o.minicpm_o_model import MiniCPMOModel
     config = MiniCPMOConfig(
         llm=Qwen3LMConfig(), vision=VisionConfig(), resampler=ResamplerConfig(), audio=AudioConfig(),
     )
-    return _bare(MiniCPMOModel, max_seq_len=64, config=config)
+    # the bundled voice's length, read from the checkpoint's clip in a real boot
+    voice = (6.016, 6.016)
+    return _bare(MiniCPMOModel, max_seq_len=64, config=config, tts_config=TTSConfig(), _voice_seconds=lambda: voice)
 
 
 def _orpheus(name, model_kwargs, tmp_path, monkeypatch):
@@ -739,6 +741,32 @@ def _minimax_h3(name, model_kwargs, tmp_path, monkeypatch):
     model = _constructed(name, model_kwargs)
     model.set_config(H3Config())
     return model
+
+
+def _phi4mm(name, model_kwargs, tmp_path, monkeypatch):
+    """Phi-4-mini's head and rotary geometry with two layers: the resource rules read
+    the layer and head counts and the rotary width, not the other sizes."""
+    from mstar.model.multimodal_decoder import MediaIntake
+    from mstar.model.phi4mm.audio import audio_encoder
+    from mstar.model.phi4mm.components.audio import Phi4MMAudioConfig
+    from mstar.model.phi4mm.components.vision import Phi4MMVisionConfig
+    from mstar.model.phi4mm.config import AUDIO_PAD_ID, IMAGE_PAD_ID, Phi4MMConfig
+    from mstar.model.phi4mm.phi4mm_model import Phi4MMModel
+    from mstar.model.phi4mm.vision import vision_media_encoder
+    config = Phi4MMConfig.from_hf({
+        "hidden_size": 3072, "intermediate_size": 8192, "num_hidden_layers": 2,
+        "num_attention_heads": 24, "num_key_value_heads": 8, "vocab_size": 1024,
+        "rms_norm_eps": 1e-5, "rope_theta": 10000.0, "partial_rotary_factor": 0.75,
+        "max_position_embeddings": 131072, "original_max_position_embeddings": 4096,
+        "rope_scaling": {"type": "longrope", "short_factor": [1.0] * 48, "long_factor": [1.0] * 48},
+        "tie_word_embeddings": True,
+    })
+    media = (
+        MediaIntake("image", vision_media_encoder(), IMAGE_PAD_ID, None),
+        MediaIntake("audio", audio_encoder(), AUDIO_PAD_ID, None),
+    )
+    return _bare(Phi4MMModel, config=config, vision_config=Phi4MMVisionConfig(),
+                 audio_config=Phi4MMAudioConfig(), media=media, local_dir="/nonexistent")
 
 
 def _qwen3_5(name, model_kwargs, tmp_path, monkeypatch):
@@ -920,6 +948,7 @@ _FACTORIES = {
     "RippleModel": _ripple,
     "OrpheusModel": _orpheus,
     "ParakeetModel": _parakeet,
+    "Phi4MMModel": _phi4mm,
     "Qwen3_5DenseModel": _qwen3_5,
     "Qwen3OmniModel": _qwen3_omni,
     "Qwen3TTSModel": _qwen3_tts,
@@ -946,6 +975,23 @@ def _drop_stubbed_imports():
                 del sys.modules[mod]
 
 
+def test_qwen3_5s_prefix_caches_open_beside_its_sequence_shard(tmp_path, monkeypatch):
+    """Its recurrent layers depend on the LLM's sequence shard, which plans from the step a prefix
+    hit trimmed and holds nothing to restore: at one rank the KV cache and the recurrent pool's
+    snapshots open as without it (the shipped configs' startup validation, above, refuses
+    otherwise)."""
+    from mstar.engine.resources.kv.config import opening_prefix_caches
+    from mstar.engine.resources.spec import apply_yaml_overrides, resolve_spec_dependencies
+    from mstar.engine.state.adapters import StateSetup
+    from mstar.model.base import enabled_resources
+    from mstar.model.qwen3_5.config import GDN_STATE, KV_CACHE, LINEAR_ATTN, LLM_SHARD
+
+    specs = enabled_resources(_qwen3_5("qwen3_5_9b", {}, tmp_path, monkeypatch), {}, StateSetup())
+    apply_yaml_overrides(specs, {"resources": {GDN_STATE: {"prefix_slots": 8}}})
+    assert LLM_SHARD in resolve_spec_dependencies(specs)[LINEAR_ATTN].depends_on()
+    assert {KV_CACHE, GDN_STATE} <= opening_prefix_caches(specs, {"LLM": 1}, checkpoint_named=True)
+
+
 @pytest.mark.parametrize("config_path", SHIPPED_CONFIGS, ids=lambda p: p.name)
 def test_shipped_config_passes_startup_validation(config_path, tmp_path, monkeypatch, _drop_stubbed_imports):
     config = yaml.safe_load(config_path.read_text())
@@ -953,7 +999,13 @@ def test_shipped_config_passes_startup_validation(config_path, tmp_path, monkeyp
     if name not in MODEL_REGISTRY:
         pytest.skip(f"model {name!r} is not in MODEL_REGISTRY")
     factory = _FACTORIES.get(MODEL_REGISTRY[name][1], _default)
-    model = factory(name, config.get("model_kwargs") or {}, tmp_path, monkeypatch)
+    try:
+        model = factory(name, config.get("model_kwargs") or {}, tmp_path, monkeypatch)
+    except (urllib.error.URLError, ConnectionError, TimeoutError) as e:
+        # A model that downloads a small file when built (Omnilingual ASR's tokenizer, from Meta's
+        # CDN) can't be checked while that host is down or its certificate has lapsed; that is the
+        # host's outage, not this config's.
+        pytest.skip(f"model {name!r} could not download what it is built from: {e}")
     conductor = _start_conductor(model, str(config_path), tmp_path, monkeypatch)
     assert conductor.worker_graphs
     # the workers the API server places from the config are the ones the walks run on

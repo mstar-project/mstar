@@ -238,7 +238,6 @@ def _submodule_class():
     from mstar.engine.resources.kv.config import KVStep
     from mstar.engine.resources.step import Segment, SubmoduleStep
     from mstar.model.multimodal import splice_media, vision_encoder
-    from mstar.model.qwen3_5.config import ROPE
     from mstar.model.qwen3_5.submodules import LLMSubmodule
 
     class _LLM(LLMSubmodule):
@@ -267,7 +266,7 @@ def _submodule_class():
             )
             self.head = torch.randn(HIDDEN, VOCAB)
             self.requires_grad_(False)
-            self.bind_node_resources({ROPE: _Rope()})
+            self.kv = SimpleNamespace(positions=_Rope())
             self.group, self.rank = group, rank
             # the stand-in's decode reads routed tokens, not the sampler's
             self.device_loopback = None
@@ -347,11 +346,14 @@ def _kv_manager(rank, prefix_cache):
             return lambda *args, **kwargs: None
 
     manager_mod.KVTransferManager = _NoTransfer
+    cfg = PagedKVConfig(
+        num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=4096, num_qo_heads=2,
+        max_num_pages=128, page_size=PAGE_SIZE, prefix_cache_tp=prefix_cache,
+    )
+    # what `KVManager.build` does first
+    cfg.shard(2)
     kv = KVManager(
-        cfg=PagedKVConfig(
-            num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=4096, num_qo_heads=2,
-            max_num_pages=128, page_size=PAGE_SIZE, prefix_cache_tp=prefix_cache,
-        ),
+        cfg=cfg,
         name=KV, joint_comm_group=SimpleNamespace(rank=rank, world_size=2),
         transfer_engine_info=None, device=torch.device("cpu"), dtype=torch.float32,
     )
@@ -392,7 +394,7 @@ def _engine(rank, group, kv, prefix_cache, graph_runtime):
     engine._runner = StepRunner(engine._resources, node_resources={NODE: [KV]})
     engine._submodules = {NODE: SubmoduleManagement(
         submodule=sub, forward=sub.forward, forward_batched=sub.forward_batched,
-        joint_comm_group=SimpleNamespace(rank=rank, world_size=2), resources={KV: kv},
+        joint_comm_group=SimpleNamespace(rank=rank, world_size=2), resources={KV: kv}, head_shards=2,
     )}
     engine._keyed_walks = {NODE: {TEXT_WALK}} if prefix_cache else {}
     engine._prefix_model = "_LLM"

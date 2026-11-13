@@ -25,7 +25,7 @@ from mstar.model.submodule_base import ARNodeInputs
 def _fake_transformer(cfg):
     return SimpleNamespace(
         proj_in=SimpleNamespace(weight=torch.zeros(1, dtype=torch.float32)),
-        sp_group=SimpleNamespace(world_size=1), comm_group=SimpleNamespace(world_size=1),
+        comm_group=SimpleNamespace(world_size=1),
         _rotary=stand_in_rotary(cfg),
     )
 

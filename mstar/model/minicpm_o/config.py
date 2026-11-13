@@ -8,7 +8,7 @@ file: the two disagree on what ends a turn (see ``MiniCPMOConfig.stop_token_ids`
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from mstar.model.components.qwen3_lm import Qwen3LMConfig
@@ -21,9 +21,27 @@ LLM_SAMPLER = "llm_sampler"
 VISION_ATTN = "vision_attn"
 RESAMPLER_ATTN = "resampler_attn"
 AUDIO_ATTN = "audio_attn"
+TTS_KV = "tts_kv"
+TTS_ATTN = "tts_attn"
+TTS_POS = "tts_pos"
+TTS_SAMPLER = "tts_sampler"
+T2W_STATE = "t2w_state"
+# token2wav attention caches, one resource per ``token2wav.CACHE_FAMILIES`` entry
+T2W_KV = {"enc1": "t2w_enc1_kv", "enc2": "t2w_enc2_kv", "dit": "t2w_dit_kv"}
 
 # the LLM's decode loop, which the KV layout and loop caps name
 DECODE_LOOP = "decode_loop"
+# Its walks: a text reply's, whose token loops back on the device, and a spoken
+# reply's, which also hands the TTS each step's input token and hidden. Their rows
+# share a step as DECODE_MIXED.
+DECODE = "decode"
+DECODE_SPOKEN = "decode_spoken"
+DECODE_MIXED = "decode_mixed"
+DECODE_WALKS = frozenset({DECODE, DECODE_SPOKEN, DECODE_MIXED})
+# a spoken reply's TTS walks and its decode loop
+TTS_PREFILL = "tts_prefill"
+TTS_DECODE = "tts_decode"
+TTS_DECODE_LOOP = "tts_decode_loop"
 # the walks that prefill the prompt and sample the reply's first token
 PREFILL_WALKS = frozenset({"prefill_text", "prefill_image", "prefill_audio", "prefill_omni"})
 
@@ -32,6 +50,9 @@ PREFILL_WALKS = frozenset({"prefill_text", "prefill_image", "prefill_audio", "pr
 # tensor, they would wait on the device)
 IMAGE_TGT_SIZES = "image_tgt_sizes"
 AUDIO_FEATURE_LENS = "audio_feature_lens"
+# a spoken reply's text cap (``get_max_output_tokens``), a default rather than a
+# length kwarg, so admission still fits it to the prompt
+SPEECH_TEXT_TOKENS = "speech_text_tokens"
 
 # ragged span labels
 PATCHES = "patches"
@@ -117,6 +138,7 @@ class MiniCPMOConfig:
     audio: AudioConfig
     # tokens that end a reply; filled from the tokenizer by the model
     stop_token_ids: tuple[int, ...] = ()
+    tts_config: dict = field(default_factory=dict)
 
     @classmethod
     def from_hf(cls, local_dir: str) -> "MiniCPMOConfig":
@@ -153,4 +175,23 @@ class MiniCPMOConfig:
                 kv_dim=vision.hidden_size,
             ),
             audio=audio,
+            tts_config=raw.get("tts_config", {}),
         )
+
+
+@dataclass(frozen=True)
+class TTSSampling:
+    """Upstream's ``TTSSamplingParams`` defaults and ``MiniCPMTTS.generate``
+    limits for the ``chat`` path."""
+    temperature: float = 0.8
+    top_p: float = 0.85
+    top_k: int = 25
+    # HF's TopPLogitsWarper min_tokens_to_keep in upstream's sampler
+    top_p_min_keep: int = 3
+    repetition_penalty: float = 1.05
+    # the frequency penalty counts the last this-many codes
+    penalty_window: int = 16
+    # EOS is masked until this many codes exist
+    min_new_tokens: int = 50
+    # upstream's 2048-step loop returns at most 2047 codes
+    max_new_tokens: int = 2047
