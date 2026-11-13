@@ -79,18 +79,3 @@ Execution flow (simplified)
    and admits each step's resource work around the forward pass. Workers then route the
    output tensors to downstream nodes and workers.
 4. Outputs marked for the client are post-processed (``postprocess``) and streamed back.
-
-Workers service unrelated teardown during completion waits when admission and
-active batches permit it. The wait only records teardown for unrelated requests
-and queues TP scheduling decisions; inputs, stream ends, loop stops, adapter
-changes and teardown for in-flight rows wait for the next normal message pass.
-This keeps an unfinished step's stop check, publication and routing on the state
-they had before the wait. Deferred messages precede newly arrived messages;
-teardown cannot overtake a deferred new request or removal.
-
-GPU completion waits shorter than the 10 ms teardown cadence use the direct
-``event.synchronize()`` path, based on the preceding incomplete-event wait for
-that node and walk. Unknown or previously longer waits use a helper thread so
-the main thread can service teardown. A step that becomes slow can delay cleanup
-once; its measured wait restores the helper path for the next step. This history
-is per node/walk, so a long prefill does not add thread switches to short decodes.
