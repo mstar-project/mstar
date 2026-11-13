@@ -177,7 +177,7 @@ async fn main() {
         served,
     };
 
-    // Allow-all CORS, matching mstar's CORSMiddleware configuration. A
+    // Allow-all CORS, as the FastAPI app's CORSMiddleware was configured. A
     // preflight's requested headers are echoed, as Starlette echoes them for
     // `allow_headers=["*"]`: browsers don't let a literal `*` cover
     // `Authorization`, so a page sending the API key would fail the preflight.
@@ -548,8 +548,8 @@ fn resolve_message(st: &AppState, surface: Surface) -> Result<&'static dyn OpenA
         format!("Model '{}' has no OpenAI-compatible adapter; use POST /generate", st.model_name)
     } else {
         format!(
-            "Model '{}' has an OpenAI adapter ({}) the Rust frontend does not serve; \
-             use POST /generate, or serve with --python-frontend",
+            "Model '{}' has an OpenAI adapter ({}) mstar-server does not serve; \
+             use POST /generate",
             st.model_name, st.python_adapter
         )
     };

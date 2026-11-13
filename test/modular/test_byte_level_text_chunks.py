@@ -8,8 +8,6 @@ what ``tokenizer.decode`` gives on the whole reply: special and added tokens
 (``<think>``, ``<|im_end|>`` under ``ignore_eos``) included.
 """
 
-import asyncio
-import json
 import random
 from types import SimpleNamespace
 
@@ -17,6 +15,7 @@ import pytest
 import torch
 
 from mstar.model.utils import TextChunkDetokenizer
+from mstar.utils.utf8_stream import Utf8Stream, decode_joined
 
 tokenizers = pytest.importorskip("tokenizers")
 transformers = pytest.importorskip("transformers")
@@ -174,7 +173,7 @@ def test_cleanup_of_tokenization_spaces_keeps_decode(fast_tokenizer):
 
 
 # ----------------------------------------------------------------------
-# each model's postprocess, end to end through chat completions
+# each model's postprocess, as a streaming and a non-streaming client reads it
 # ----------------------------------------------------------------------
 
 def _model(name, tokenizer):
@@ -212,42 +211,24 @@ def _chunks(model, ids, request_kwargs=None):
     ]
 
 
-class _BatchAPI:
-    def __init__(self, chunks):
-        self._chunks = chunks
-
-    async def iter_result_chunk_batches(self, request_id):
-        for c in self._chunks:
-            yield [c]
-
-
-def _sse_content(chunks):
-    from mstar.api_server.openai.serving_chat import _stream_events
-
-    async def run():
-        return [f async for f in _stream_events(_BatchAPI(chunks).iter_result_chunk_batches("r"), "m", "r", 24000)]
-
-    content = ""
-    for frame in asyncio.run(run()):
-        for line in frame.splitlines():
-            if line.startswith("data: ") and line != "data: [DONE]":
-                content += json.loads(line[6:])["choices"][0]["delta"].get("content") or ""
-    return content
+def _streamed(chunks):
+    """The text a client reading the chunks one at a time sees, decoded as it
+    arrives (what mstar-server's chat stream and the SDK do; their tests are
+    in rust/server/src/ and test_utf8_split_tokens.py)."""
+    stream = Utf8Stream()
+    return "".join(stream.feed(c.data) for c in chunks) + stream.flush()
 
 
 @pytest.mark.parametrize(("name", "kind"), MODELS)
 def test_a_split_character_comes_through_chat_whole(name, kind, request):
-    pytest.importorskip("fastapi")
-    from mstar.api_server.openai.serving_chat import _build_response
-
     tok = request.getfixturevalue(f"{kind}_tokenizer")
     model = _model(name, tok)
     ids = _ids(tok, REPLY + "<|im_end|>")
     chunks = _chunks(model, ids)
     expected = tok.decode(ids[:-1])
     assert "\ufffd" not in expected
-    assert _sse_content(chunks) == expected
-    assert _build_response("m", "r", chunks, 24000)["choices"][0]["message"]["content"] == expected
+    assert _streamed(chunks) == expected
+    assert decode_joined(c.data for c in chunks) == expected
 
 
 @pytest.mark.parametrize(("name", "kind"), MODELS)

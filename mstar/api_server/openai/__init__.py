@@ -1,7 +1,8 @@
-"""OpenAI-compatible API layer for mstar.
+"""The OpenAI-compatible layer's Python side.
 
-Sits alongside the native ``/generate`` endpoint and reuses the same request
-path (``APIServer.submit_request`` / ``collect_results`` / ``iter_result_chunks``).
-Per-model translation lives in :mod:`mstar.api_server.openai.adapters`; the HTTP
-endpoints in :mod:`mstar.api_server.openai.router` stay model-agnostic.
+``mstar-server`` (``rust/server/``) serves the OpenAI routes. What stays here is
+the per-model translation (:mod:`mstar.api_server.openai.adapters`, which the
+Dynamo integration serves through and the launcher reads facts from), the
+request models (:mod:`.protocol`), and the parts the API server answers over
+the bridge: transcription windows, the voice list, Smart Turn.
 """

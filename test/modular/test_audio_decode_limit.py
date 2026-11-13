@@ -7,7 +7,6 @@ the real-decoder cases skip when those are not installed.
 """
 
 import sys
-import tempfile
 import types
 from pathlib import Path
 
@@ -330,100 +329,89 @@ def test_omnilingual_asr_refuses_a_rate_past_the_range_before_reading(monkeypatc
 
 
 # --------------------------------------------------------------------------
-# /v1/audio/transcriptions
+# /v1/audio/transcriptions: mstar-server saves the upload and asks the bridge
+# to plan its windows (``WindowOp.PLAN``), which decodes it here
 # --------------------------------------------------------------------------
 
 
-class _StubAPI:
-    def __init__(self):
-        self.model_name = "whisper_large"
-        self.model = None
-        self.upload_dir = Path(tempfile.mkdtemp())
-        self.submits: list = []
+def _plan(upload: Path, model="whisper_large", op="plan"):
+    """The bridge's answer to mstar-server planning ``upload`` for ``model``'s
+    windows (then, for ``op="fixed"``, cutting them), as the route's policy
+    sends it; the bridge itself, with its loop and nothing to send to."""
+    import asyncio
 
-    def submit_request(self, **kw):
-        self.submits.append(kw)
-        return kw["request_id"]
+    from mstar.api_server.openai.adapters import get_adapter
+    from mstar.api_server.openai.serving_transcriptions import CUT_FRAME_SECONDS, CUT_SEARCH_SECONDS
+    from mstar.api_server.rust_frontend import RustFrontendBridge
 
-    async def collect_results(self, request_id, raw_request=None):
-        return [types.SimpleNamespace(modality="text", data=b" hi", metadata={})]
-
-    async def iter_result_chunks(self, request_id):
-        yield types.SimpleNamespace(modality="text", data=b" hi", metadata={})
-
-    def release_request(self, request_id):
-        pass
+    adapter = get_adapter(model)
+    window = adapter.window_seconds or adapter.max_audio_seconds
+    bridge = RustFrontendBridge.__new__(RustFrontendBridge)
+    bridge.sent, bridge._planners = [], {}
+    bridge._send = bridge.sent.append
+    bridge.server = types.SimpleNamespace(upload_dir=str(upload.parent))
+    bridge.loop = asyncio.new_event_loop()
+    try:
+        ops = ["plan"] if op == "plan" else ["plan", op]
+        for name in ops:
+            bridge._windows({
+                "op": name, "plan": 1, "rid": "r", "sub": 0, "path": str(upload), "max_seconds": window,
+                "balanced": adapter.balanced_windows, "whole_seconds": adapter.whole_seconds or window,
+                "search_seconds": adapter.window_search_seconds or CUT_SEARCH_SECONDS,
+                "frame_seconds": adapter.window_frame_seconds or CUT_FRAME_SECONDS,
+            })
+            bridge.loop.run_until_complete(asyncio.gather(*asyncio.all_tasks(bridge.loop)))
+    finally:
+        bridge.loop.close()
+    return bridge.sent[-1]["metadata"]
 
 
 @pytest.fixture
-def client(monkeypatch):
-    pytest.importorskip("fastapi")
-    pytest.importorskip("httpx")
-    from fastapi import FastAPI
-    from fastapi.testclient import TestClient
-
-    import mstar.api_server
-
-    fake_ep = types.ModuleType("mstar.api_server.entrypoint")
-    fake_ep.api_server = _StubAPI()
-    monkeypatch.setitem(sys.modules, "mstar.api_server.entrypoint", fake_ep)
-    monkeypatch.setattr(mstar.api_server, "entrypoint", fake_ep, raising=False)
-    from mstar.api_server.openai.router import router
-
-    app = FastAPI()
-    app.include_router(router)
-    return TestClient(app), fake_ep.api_server
-
-
-def _transcribe(client, content=b"RIFFaudio", filename="speech.webm", model="whisper_large"):
-    return client.post(
-        "/v1/audio/transcriptions", data={"model": model}, files={"file": (filename, content, "audio/webm")},
-    )
+def upload(tmp_path):
+    path = tmp_path / "uploads" / "speech.webm"
+    path.parent.mkdir()
+    path.write_bytes(b"RIFFaudio")
+    return path
 
 
 @pytest.mark.parametrize("model", ["whisper_large", "higgs_audio"])
-def test_transcription_without_a_header_duration_is_bounded_by_its_decode(monkeypatch, client, model):
+def test_transcription_without_a_header_duration_is_bounded_by_its_decode(monkeypatch, upload, model):
     # webm-like: soundfile cannot open it and FFmpeg reports no duration; on
     # main the upload went to the data worker undecoded, whatever its length
-    http, api = client
-    api.model_name = model
     _use_soundfile(monkeypatch, _NoSoundfile())
     calls = _fake_torchcodec(monkeypatch, MAX_AUDIO_SECONDS + 60)
-    r = _transcribe(http, model=model)
-    assert r.status_code == 413
-    assert "1800 s" in r.json()["error"]["message"]
-    assert api.submits == [] and calls["all"] == 0
-    assert list(api.upload_dir.iterdir()) == []
+    answer = _plan(upload, model)
+    assert answer["error"]["status"] == 413
+    assert "1800 s" in answer["error"]["message"]
+    assert calls["all"] == 0
+    assert list(upload.parent.iterdir()) == []
 
 
-def test_windowed_transcription_with_an_understated_header_is_refused(monkeypatch, client):
+def test_windowed_transcription_with_an_understated_header_is_refused(monkeypatch, upload):
     # the header says 60 s, so the header check passes; the decode runs on
-    http, api = client
+    upload = upload.rename(upload.with_name("speech.wav"))
     _use_soundfile(monkeypatch, _FakeSoundfile(TOO_LONG, header_seconds=60))
     _fake_torchcodec(monkeypatch, TOO_LONG)
-    r = _transcribe(http, filename="speech.wav")
-    assert r.status_code == 413
-    assert api.submits == []
+    assert _plan(upload)["error"]["status"] == 413
+    assert list(upload.parent.iterdir()) == []
 
 
-def test_transcription_under_the_limit_still_runs(monkeypatch, client):
-    http, api = client
+def test_transcription_under_the_limit_still_runs(monkeypatch, upload):
     _use_soundfile(monkeypatch, _NoSoundfile())
     _fake_torchcodec(monkeypatch, 20)
-    r = _transcribe(http)
-    assert r.status_code == 200, r.text
-    assert len(api.submits) == 1
+    answer = _plan(upload, op="fixed")
+    assert "error" not in answer, answer
+    assert answer["single"] and len(answer["windows"]) == 1
 
 
-def test_a_headerless_upload_longer_than_the_clip_is_windowed(monkeypatch, client):
+def test_a_headerless_upload_longer_than_the_clip_is_windowed(monkeypatch, upload):
     # once the decode gives the length, a 45 s upload is cut into Whisper's
     # 30 s windows like one whose header gives it (main sent it whole)
-    http, api = client
     _use_soundfile(monkeypatch, _NoSoundfile())
     _fake_torchcodec(monkeypatch, 45)
-    r = _transcribe(http)
-    assert r.status_code == 200, r.text
-    assert len(api.submits) == 2
+    answer = _plan(upload, op="fixed")
+    assert "error" not in answer, answer
+    assert answer["duration"] == pytest.approx(45) and len(answer["windows"]) == 2
 
 
 def test_an_unknown_soundfile_length_is_not_a_duration(monkeypatch, tmp_path):
@@ -489,7 +477,7 @@ def _flac_without_length(path: Path, seconds: float, rate: int = 16000) -> None:
     path.write_bytes(bytes(data))
 
 
-def test_flac_without_a_length_is_measured_by_decoding_it(client, tmp_path):
+def test_flac_without_a_length_is_measured_by_decoding_it(tmp_path):
     # main read libsndfile's "unknown" frame count as a duration of about
     # 5.8e14 s and refused a 2 minute clip with a 413
     pytest.importorskip("soundfile")
@@ -497,9 +485,9 @@ def test_flac_without_a_length_is_measured_by_decoding_it(client, tmp_path):
         import torchcodec.decoders  # noqa: F401
     except Exception as exc:  # noqa: BLE001 — needs FFmpeg's shared libraries too
         pytest.skip(f"torchcodec cannot load here: {exc}")
-    http, api = client
-    path = tmp_path / "speech.flac"
+    path = tmp_path / "uploads" / "speech.flac"
+    path.parent.mkdir()
     _flac_without_length(path, 120)
-    r = _transcribe(http, content=path.read_bytes(), filename="speech.flac")
-    assert r.status_code == 200, r.text
-    assert api.submits
+    answer = _plan(path, op="fixed")
+    assert "error" not in answer, answer
+    assert answer["duration"] == pytest.approx(120, abs=0.1) and len(answer["windows"]) >= 4

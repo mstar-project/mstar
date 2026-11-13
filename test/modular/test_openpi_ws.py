@@ -1,39 +1,26 @@
-"""The openpi WebSocket at ``/`` (``mstar.api_server.openpi``), and the decoded
-image path it feeds.
+"""The openpi policy (``mstar.api_server.openpi``) behind mstar-server's
+WebSocket at ``/``, and the decoded image path it feeds; the socket itself is
+tested in test/rust/test_rust_openpi.py.
 
 openpi's own client code is the oracle: ``_openpi_pack`` / ``_openpi_unpack``
-are ``openpi_client.msgpack_numpy`` and ``_OpenpiClient`` is
-``openpi_client.WebsocketClientPolicy`` (Physical-Intelligence/openpi,
-packages/openpi-client, Apache-2.0), cut to what a call uses. The client runs
-against a real uvicorn socket; the rest drive the route through Starlette's test
-client against a fake API server.
+are ``openpi_client.msgpack_numpy`` (Physical-Intelligence/openpi,
+packages/openpi-client, Apache-2.0).
 """
 
 from __future__ import annotations
 
-import asyncio
-import contextlib
 import functools
 import io
-import socket
-import threading
-import time
 
 import msgpack
 import numpy as np
 import pytest
 import torch
 
-pytest.importorskip("fastapi")
-pytest.importorskip("httpx")
-
-from fastapi.testclient import TestClient  # noqa: E402
-from starlette.websockets import WebSocketDisconnect  # noqa: E402
-
-from mstar.api_server import auth, entrypoint, openpi  # noqa: E402
-from mstar.api_server.data_worker import PreprocessWorkerThread  # noqa: E402
-from mstar.api_server.request_types import PreprocessInput, ResultChunk  # noqa: E402
-from mstar.model.pi05.pi05_model import Pi05Model  # noqa: E402
+from mstar.api_server import entrypoint, openpi
+from mstar.api_server.data_worker import PreprocessWorkerThread
+from mstar.api_server.request_types import PreprocessInput
+from mstar.model.pi05.pi05_model import Pi05Model
 
 # ----------------------------------------------------------------------
 # openpi_client, as the reference
@@ -60,27 +47,6 @@ def _openpi_unpack_array(obj):
 
 _openpi_pack = functools.partial(msgpack.packb, default=_openpi_pack_array)
 _openpi_unpack = functools.partial(msgpack.unpackb, object_hook=_openpi_unpack_array)
-
-
-class _OpenpiClient:
-    def __init__(self, host: str, port: int, api_key: str | None = None):
-        import websockets.sync.client
-
-        headers = {"Authorization": f"Api-Key {api_key}"} if api_key else None
-        self._ws = websockets.sync.client.connect(
-            f"ws://{host}:{port}", compression=None, max_size=None, additional_headers=headers,
-        )
-        self.metadata = _openpi_unpack(self._ws.recv())
-
-    def infer(self, obs: dict) -> dict:
-        self._ws.send(_openpi_pack(obs))
-        response = self._ws.recv()
-        if isinstance(response, str):
-            raise RuntimeError(f"Error in inference server:\n{response}")
-        return _openpi_unpack(response)
-
-    def close(self):
-        self._ws.close()
 
 
 # ----------------------------------------------------------------------
@@ -116,40 +82,6 @@ def _droid_obs(seed: int = 0, **extra) -> dict:
 
 def _model_output(i: int) -> np.ndarray:
     return (np.arange(HORIZON * WIDTH, dtype=np.float32).reshape(HORIZON, WIDTH) + 1000 * i)
-
-
-class _FakeServer:
-    """Stands in for ``APIServer``: records submissions, answers each with one
-    action chunk of the model's ``[15, 32]`` float32 bytes, or fails it."""
-
-    def __init__(self, policy):
-        self.openpi_policy = policy
-        self.submitted = []
-        self.fail_with: str | None = None
-        self.fatal_error = None
-
-    def cleanup(self):  # the app's shutdown hook calls it when a real server stops
-        pass
-
-    def submit_request(self, **kwargs):
-        rid = f"req-{len(self.submitted)}"
-        self.submitted.append(kwargs)
-        return rid
-
-    async def iter_result_chunks(self, request_id):
-        await asyncio.sleep(0)
-        if self.fail_with is not None:
-            yield ResultChunk(request_id, "error", self.fail_with.encode(), {"status": 400})
-            return
-        index = int(request_id.split("-")[1])
-        yield ResultChunk(request_id, "action", _model_output(index).tobytes())
-
-
-@pytest.fixture
-def served(monkeypatch):
-    fake = _FakeServer(_policy())
-    monkeypatch.setattr(entrypoint, "api_server", fake)
-    return fake
 
 
 # ----------------------------------------------------------------------
@@ -291,177 +223,8 @@ def test_reply_keeps_the_leading_action_dims():
         policy.actions(b"\0" * 4 * 10)
 
 
-# ----------------------------------------------------------------------
-# the connection
-# ----------------------------------------------------------------------
-
-def test_handshake_then_one_reply_per_observation(served):
-    with TestClient(entrypoint.app).websocket_connect("/") as ws:
-        assert _openpi_unpack(ws.receive_bytes()) == {}
-        replies = []
-        for i in range(2):
-            ws.send_bytes(_openpi_pack(_droid_obs(seed=i)))
-            replies.append(_openpi_unpack(ws.receive_bytes()))
-    for i, reply in enumerate(replies):
-        assert reply["actions"].shape == (HORIZON, 8) and reply["actions"].dtype == np.float32
-        np.testing.assert_array_equal(reply["actions"], _model_output(i)[:, :8])
-        assert reply["server_timing"]["infer_ms"] >= 0
-    assert "prev_total_ms" not in replies[0]["server_timing"]
-    assert replies[1]["server_timing"]["prev_total_ms"] >= 0
-    sub = served.submitted[0]
-    assert sub["text"] == "pick up the marker"
-    assert sub["input_modalities"] == ["image", "text"] and sub["output_modalities"] == ["action"]
-    assert len(sub["raw_inputs"]["image"]) == 2 and "file_paths" not in sub
-    assert len(sub["model_kwargs"]["robot_state"]) == 8
-
-
-def test_metadata_frame_is_the_configs(monkeypatch):
-    monkeypatch.setattr(entrypoint, "api_server", _FakeServer(_policy(metadata={"reset_pose": [0, -1.5]})))
-    with TestClient(entrypoint.app).websocket_connect("/") as ws:
-        assert _openpi_unpack(ws.receive_bytes()) == {"reset_pose": [0, -1.5]}
-
-
-@pytest.mark.parametrize("send", ["failed request", "bad observation", "text frame"])
-def test_a_failed_call_is_a_text_frame_then_a_close(served, send):
-    with TestClient(entrypoint.app).websocket_connect("/") as ws:
-        ws.receive_bytes()
-        if send == "failed request":
-            served.fail_with = "ValueError: the state has 8 values; the norm stats have 7"
-            ws.send_bytes(_openpi_pack(_droid_obs()))
-        elif send == "bad observation":
-            ws.send_bytes(_openpi_pack({"prompt": "no cameras"}))
-        else:
-            ws.send_text("{}")
-        text = ws.receive_text()
-        with pytest.raises(WebSocketDisconnect) as closed:
-            ws.receive_bytes()
-    assert closed.value.code == 1011
-    expected = {"failed request": "norm stats", "bad observation": "has no", "text frame": "binary msgpack"}[send]
-    assert expected in text
-
-
-def test_a_server_without_an_openpi_block_refuses_the_handshake(monkeypatch):
-    monkeypatch.setattr(entrypoint, "api_server", _FakeServer(None))
-    with pytest.raises(WebSocketDisconnect) as refused:
-        with TestClient(entrypoint.app).websocket_connect("/"):
-            pass
-    assert refused.value.code == 1008
-
-
-def test_healthz_answers_as_openpi_does(served):
-    r = TestClient(entrypoint.app).get("/healthz")
-    assert r.status_code == 200 and r.text == "OK\n"
-
-
-def test_healthz_is_not_served_without_an_openpi_block(monkeypatch):
-    monkeypatch.setattr(entrypoint, "api_server", _FakeServer(None))
-    assert TestClient(entrypoint.app).get("/healthz").status_code == 404
-
-
-@pytest.fixture
-def keyed():
-    entrypoint.api_key_guard.set("k3y")
-    yield TestClient(entrypoint.app)
-    entrypoint.api_key_guard.set(auth.resolve_api_key())
-
 
 API_KEY = {"Authorization": "Api-Key k3y"}
-
-
-def test_openpi_client_conventions_where_the_socket_is_served(served, keyed):
-    assert keyed.get("/healthz").status_code == 200  # no key, as openpi's server probes
-    with pytest.raises(WebSocketDisconnect):
-        with keyed.websocket_connect("/"):
-            pass
-    for headers in (API_KEY, {"Authorization": "Bearer k3y"}):
-        with keyed.websocket_connect("/", headers=headers) as ws:
-            assert _openpi_unpack(ws.receive_bytes()) == {}
-    with pytest.raises(WebSocketDisconnect):
-        with keyed.websocket_connect("/", headers={"Authorization": "Api-Key wrong"}):
-            pass
-
-
-def test_the_api_key_scheme_stays_on_the_openpi_socket(served, keyed):
-    """Every other route takes only Bearer, on a server with the socket too."""
-    assert keyed.get("/v1/models", headers=API_KEY).status_code == 401
-    assert keyed.post("/generate", headers=API_KEY).status_code == 401
-    with pytest.raises(WebSocketDisconnect) as refused:
-        with keyed.websocket_connect("/generate/ws", headers=API_KEY):
-            pass
-    assert refused.value.code == 1008
-
-
-def test_without_an_openpi_block_neither_convention_applies(monkeypatch, keyed):
-    monkeypatch.setattr(entrypoint, "api_server", _FakeServer(None))
-    assert keyed.get("/healthz").status_code == 401
-    with pytest.raises(WebSocketDisconnect) as refused:
-        with keyed.websocket_connect("/", headers=API_KEY):
-            pass
-    assert refused.value.code == 1008 and refused.value.reason == "invalid API key"
-
-
-def _free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
-@contextlib.contextmanager
-def _real_server(config: dict):
-    """The app on a real uvicorn socket, built as the server builds it."""
-    pytest.importorskip("websockets.sync.client")
-    import uvicorn
-
-    port = _free_port()
-    uv_config = entrypoint._uvicorn_config(entrypoint.app, "127.0.0.1", port, config)
-    uv_config.log_level = "warning"
-    server = uvicorn.Server(uv_config)
-    thread = threading.Thread(target=server.run, daemon=True)
-    thread.start()
-    try:
-        deadline = time.monotonic() + 10
-        while not server.started:
-            assert time.monotonic() < deadline, "uvicorn did not start"
-            time.sleep(0.02)
-        yield port
-    finally:
-        server.should_exit = True
-        thread.join(timeout=10)
-
-
-def test_openpi_client_over_a_real_socket(served):
-    with _real_server({}) as port:
-        client = _OpenpiClient("127.0.0.1", port)
-        assert client.metadata == {}
-        for i in range(3):
-            actions = client.infer(_droid_obs(seed=i))["actions"]
-            np.testing.assert_array_equal(actions, _model_output(i)[:, :8])
-        served.fail_with = "ValueError: refused"
-        with pytest.raises(RuntimeError, match="refused"):
-            client.infer(_droid_obs())
-        client.close()
-
-
-def test_an_observation_over_the_message_limit_closes_the_socket(served):
-    """openpi's client sets no size limit; the server's ws_max_message_mb does."""
-    from websockets.exceptions import ConnectionClosed
-
-    big = _droid_obs()
-    big["observation/exterior_image_1_left"] = np.zeros((1024, 1024, 3), np.uint8)  # 3 MiB
-    with _real_server({}) as port:  # under the default limit it is served
-        client = _OpenpiClient("127.0.0.1", port)
-        assert client.infer(big)["actions"].shape == (HORIZON, 8)
-        client.close()
-    served.submitted.clear()
-    with _real_server({"ws_max_message_mb": 1}) as port:
-        client = _OpenpiClient("127.0.0.1", port)
-        with pytest.raises(ConnectionClosed) as closed:
-            client.infer(big)
-        # The server closes with 1009 while the client may still be sending; the
-        # reset that closing over unread data causes can drop the close frame.
-        assert closed.value.rcvd is None or closed.value.rcvd.code == 1009
-        assert not served.submitted
-        client.close()
 
 
 # ----------------------------------------------------------------------

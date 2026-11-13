@@ -1,11 +1,13 @@
-"""LoRA's runtime updates on both frontends: ``/v1/load_lora_adapter`` and
-``/v1/unload_lora_adapter`` answer alike, and mstar-server's own selection
-follows the API server's served set, which the bridge pushes after every change,
-a conductor's answer that came after its request timed out included.
+"""LoRA's runtime updates on mstar-server: ``/v1/load_lora_adapter`` and
+``/v1/unload_lora_adapter`` answer as the Python routes did (their answers
+replayed as they gave them before they were removed, ``python_oracle``),
+and mstar-server's own selection follows the API server's served set, which
+the bridge pushes after every change, a conductor's answer that came after its
+request timed out included.
 
-Both frontends call the same ``LoraAdmin``, over a scripted conductor that
-answers from another thread, as the message thread does; the adapter file check
-is scripted too (``bad`` in a path refuses it)."""
+The calls reach a real ``LoraAdmin`` over a scripted conductor that answers
+from another thread, as the message thread does; the adapter file check is
+scripted too (``bad`` in a path refuses it)."""
 import json
 import threading
 import time
@@ -16,12 +18,11 @@ import urllib.request
 import pytest
 
 pytest.importorskip("mstar_rust")
-pytest.importorskip("fastapi")
 
-from fastapi.testclient import TestClient
+from python_oracle import python_side
 from test_rust_frontend import BINARY, _model_stack, _StubAPIServer
 
-from mstar.api_server import entrypoint, lora_admin
+from mstar.api_server import lora_admin
 from mstar.api_server.lora_admin import LoraAdmin
 from mstar.api_server.request_types import LoraAdapterResult
 from mstar.api_server.rust_frontend import SERVED_MODELS_ENV, served_models_json
@@ -100,31 +101,26 @@ def _http(port, method, path, body=None, content_type="application/json"):
         return _answer(e.code, e.headers.get("content-type"), e.read().decode())
 
 
-def _python_http(client, method, path, body=None, content_type="application/json"):
-    data = body if isinstance(body, bytes) or body is None else json.dumps(body).encode()
-    r = client.request(method, path, content=data, headers={"Content-Type": content_type} if content_type else {})
-    return _answer(r.status_code, r.headers.get("content-type"), r.text)
-
-
 def _models(answer):
     status, _, body = answer
     return status, [(m["id"], m.get("parent")) for m in body["data"]]
 
 
+def _answers(server, send, calls):
+    """Answers to ``calls`` (method, path, body[, content type]) from the launch
+    set, with ``/v1/models`` after every call."""
+    server.reset()
+    answers = []
+    for call in calls:
+        answers.append(send(*call))
+        answers.append(_models(send("GET", "/v1/models")))
+    return answers
+
+
 def _both(monkeypatch, server, port, calls):
-    """Each frontend's answers to ``calls`` (method, path, body[, content type]),
-    each from the launch set, with ``/v1/models`` after every call."""
-    monkeypatch.setattr(entrypoint, "api_server", server)
-    client = TestClient(entrypoint.app)
-    out = []
-    for send in (lambda *c: _python_http(client, *c), lambda *c: _http(port, *c)):
-        server.reset()
-        answers = []
-        for call in calls:
-            answers.append(send(*call))
-            answers.append(_models(send("GET", "/v1/models")))
-        out.append(answers)
-    return out
+    """Each frontend's answers to ``calls``: the Python route's as recorded."""
+    py = python_side()
+    return py, _answers(server, lambda *c: _http(port, *c), calls)
 
 
 @pytest.fixture(scope="module")

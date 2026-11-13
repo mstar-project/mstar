@@ -1,11 +1,12 @@
-"""``/v1/audio/transcriptions`` on mstar-server against the Python route.
+"""``/v1/audio/transcriptions`` on mstar-server, held to the Python route: the
+Python route's answers replayed as it gave them before it was removed
+(``python_oracle``).
 
-Each case sends the same multipart body to both frontends, served by one
-scripted ASR stub, and compares the response (status, body, stream events) and
-every window each submitted: the kwargs, the layout, and the window's length
-as the stub hears it. Both decode and cut the upload with the same
-``WindowPlanner``, the Rust side over the bridge's ``windows`` round trip.
-"""
+Each case sends a multipart body, served by a scripted ASR stub, and compares
+the response (status, body, stream events) and every window it submitted: the
+kwargs, the layout, and the window's length as the stub hears it. The upload is
+decoded and cut by the API server's ``WindowPlanner``, over the bridge's
+``windows`` round trip."""
 
 import asyncio
 import contextlib
@@ -27,11 +28,10 @@ pytest.importorskip("fastapi")
 np = pytest.importorskip("numpy")
 sf = pytest.importorskip("soundfile")
 
-from fastapi.testclient import TestClient
+from python_oracle import python_side
 from test_rust_frontend import BINARY, _Chunk, _free_port, _wait_healthy
 from test_rust_release import _leave, _until
 
-from mstar.api_server import entrypoint
 from mstar.api_server.openai.adapters import ADAPTER_REGISTRY
 from mstar.api_server.rust_frontend import (
     OPENAI_ADAPTER_ENV,
@@ -131,7 +131,7 @@ class _ASRStub:
         self._chunks[request_id] = self.script(record, len(self.submits) - 1)
         return request_id
 
-    async def collect_results(self, request_id, raw_request=None):
+    async def collect_results(self, request_id):
         return self._chunks.get(request_id, [])
 
     async def iter_result_chunks(self, request_id):
@@ -216,16 +216,14 @@ def _empty(directory: Path, timeout: float = 5.0) -> bool:
 
 
 def _both(stacks, monkeypatch, model, fields, file=("speech.wav", SHORT), script=None, request_kwargs=None, cap=None):
-    """The Python route's and mstar-server's (response, submits)."""
+    """The Python route's (as recorded) and mstar-server's (response, submits)."""
     stub, port = stacks(model, request_kwargs, cap)
-    if script is not None:
-        stub.script = script
+    # the stack is shared across the module: a case that names no script gets
+    # the default, not whatever the previous case left
+    stub.script = _hello if script is None else script
     body, ctype = _multipart(fields, file)
-    monkeypatch.setattr(entrypoint, "api_server", stub)
-    stub.reset()
-    py = TestClient(entrypoint.app).post("/v1/audio/transcriptions", content=body, headers={"Content-Type": ctype})
-    py_out = (_read(py.status_code, py.headers.get("content-type", ""), py.content), stub.submits)
-    assert _empty(stub.upload_dir), "the Python route left files"
+    py_out, py_clean = python_side()
+    assert py_clean, "the Python route left files"
     stub.reset()
     req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/audio/transcriptions", data=body,
                                  headers={"Content-Type": ctype})

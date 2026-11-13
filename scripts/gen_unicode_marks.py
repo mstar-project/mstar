@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """Write ``rust/server/src/unicode_marks.rs`` from this interpreter's ``unicodedata``.
 
-The Rust frontend has to split text exactly where the Python one does, and
-``speech_chunking`` asks whether a character is a combining mark
+mstar-server has to split text exactly where the Python adapters do (which
+the Dynamo integration serves through), and ``speech_chunking`` asks whether a character is a combining mark
 (``unicodedata.category(c).startswith("M")``) to decide a cut point. Rust's
 ``regex`` crate carries its own Unicode tables, which move with the crate and
 not with CPython, so ``\\p{M}`` there answers for a different Unicode version
 than ``unicodedata`` does here. The table this writes removes the question:
-the Rust side reads the marks of the interpreter the Python frontend runs on.
+the Rust side reads the marks of the interpreter the Python adapters run on.
 
 The table holds the marks of the interpreter the repository tests on: CPython
 3.12, which carries UCD 15.0.0, as does 3.13. Run this after a CPython upgrade
@@ -17,8 +17,8 @@ that moves the mark set (16.0.0 adds 51 of them, U+0897 among them)::
 
 ``test/modular/test_speech_chunking.py`` compares the checked-in table against
 the running interpreter's ``unicodedata`` over every code point, so a table
-that is not regenerated fails rather than quietly splitting text differently on
-the two frontends. Regenerating from an interpreter with a different mark set
+that is not regenerated fails rather than quietly splitting text differently in
+the two. Regenerating from an interpreter with a different mark set
 also moves the two cases pinned to U+0897, in ``speech_chunking.rs``.
 """
 

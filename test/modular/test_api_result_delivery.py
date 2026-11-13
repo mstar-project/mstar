@@ -10,7 +10,6 @@ success.
 
 import asyncio
 import gc
-import json
 import queue
 import threading
 import time
@@ -24,7 +23,6 @@ from fastapi import HTTPException
 from mstar.api_server import entrypoint
 from mstar.api_server.data_worker import PreprocessWorkerThread, ResultQueue
 from mstar.api_server.entrypoint import PendingRequest
-from mstar.api_server.openai.serving_videos import _stream_ndjson as _stream_video_ndjson
 from mstar.api_server.request_types import PreprocessInput, ResultChunk, ResultTensors
 from mstar.communication.event import EventWakeup
 from mstar.graph.base import GraphEdge
@@ -261,24 +259,26 @@ def test_stream_carries_error_as_final_chunk():
     assert chunks[-1].metadata["status"] == 500
 
 
-@pytest.mark.parametrize("route", ["generate", "videos"])
-def test_a_stream_that_times_out_mid_body_ends_with_an_error_line(route):
-    """The 200 is already sent, so the timeout has to arrive in band, on every
-    route that streams the request's chunks; the request is still aborted."""
+def test_a_stream_that_times_out_mid_body_raises_after_its_chunks():
+    """The chunks that arrived are handed on, then the timeout raises (the
+    frontend sends it in band, the 200 being already sent) and the request
+    is aborted."""
     pw = _StubPreprocessWorker()
     server = _api_server_stub(pw)
     server.timeout_seconds = 0.3
     req = _pending_request()
     req.chunks.append(ResultChunk(request_id="r3", modality="text", data=b"partial"))
     _register(server, "r3", req)
-    stream = server.async_stream_results("r3") if route == "generate" else _stream_video_ndjson(server, "r3")
+    chunks = []
 
     async def _collect():
-        return [json.loads(line) async for line in stream]
+        async for chunk in server.iter_result_chunks("r3"):
+            chunks.append(chunk)
 
-    lines = asyncio.run(_collect())
-    assert [line["modality"] for line in lines] == ["text", "error"]
-    assert lines[-1]["metadata"]["status"] == 500
+    with pytest.raises(HTTPException) as e:
+        asyncio.run(_collect())
+    assert [c.data for c in chunks] == [b"partial"]
+    assert e.value.status_code == 500
     assert pw.aborted == ["r3"]
 
 
@@ -321,29 +321,13 @@ def test_a_chunk_from_another_thread_wakes_the_stream_at_once():
         assert t_got - t_put < 0.05, f"chunk took {1000 * (t_got - t_put):.1f} ms"
 
 
-class _Client:
-    """The ``Request`` that ``collect_results`` asks whether the client left;
-    counts the asks."""
-
-    def __init__(self, gone=False):
-        self.gone = gone
-        self.checks = 0
-
-    async def is_disconnected(self):
-        self.checks += 1
-        return self.gone
-
-
 def test_a_finish_from_another_thread_wakes_collect_results_at_once():
-    """A non-streaming handler sleeps on the same wake as a streaming one: the
-    finish reaches it at once, and while it waits the client's connection is
-    checked on the 100 ms backstop, not every few ms (polling each waiting
-    request every 5 ms held the event loop at a few hundred in flight)."""
+    """A non-streaming wait sleeps on the same wake as a streaming one: the
+    finish reaches it at once rather than on the next timeout check."""
     pw = _StubPreprocessWorker()
     server = _api_server_stub(pw)
     req = _pending_request(streaming=False)
     _register(server, "r7", req)
-    client = _Client()
 
     async def _collect():
         finished = []
@@ -356,16 +340,13 @@ def test_a_finish_from_another_thread_wakes_collect_results_at_once():
                 finished.append(time.perf_counter())
                 req.notify()
 
-        start = time.perf_counter()
         threading.Thread(target=producer, daemon=True).start()
-        chunks = await server.collect_results("r7", client)
-        end = time.perf_counter()
-        return chunks, end - finished[0], end - start
+        chunks = await server.collect_results("r7")
+        return chunks, time.perf_counter() - finished[0]
 
-    chunks, lag, waited = asyncio.run(_collect())
+    chunks, lag = asyncio.run(_collect())
     assert [c.data for c in chunks] == [b"done"]
     assert lag < 0.05, f"the finish took {1000 * lag:.1f} ms to reach the handler"
-    assert client.checks <= waited / 0.1 + 1, f"{client.checks} disconnect checks in {waited:.2f} s"
     assert "r7" not in server.pending_requests
 
 
@@ -386,24 +367,6 @@ def _feed_tokens(server, req, rid, every=0.02, until=3.0):
 
 
 @pytest.mark.parametrize("generating", [False, True], ids=["idle", "generating"])
-def test_collect_results_still_releases_a_request_whose_client_left(generating):
-    """Also while the request keeps producing tokens: a wake per token must
-    not keep the handler from asking whether the client left."""
-    pw = _StubPreprocessWorker()
-    server = _api_server_stub(pw)
-    req = _pending_request(streaming=False)
-    _register(server, "r8", req)
-    if generating:
-        _feed_tokens(server, req, "r8")
-
-    start = time.perf_counter()
-    assert asyncio.run(server.collect_results("r8", _Client(gone=True))) == []
-    assert time.perf_counter() - start < 1.0
-    assert pw.aborted == ["r8"]
-    assert "r8" not in server.pending_requests
-
-
-@pytest.mark.parametrize("generating", [False, True], ids=["idle", "generating"])
 def test_collect_results_still_times_out(generating):
     pw = _StubPreprocessWorker()
     server = _api_server_stub(pw)
@@ -415,7 +378,7 @@ def test_collect_results_still_times_out(generating):
 
     start = time.perf_counter()
     with pytest.raises(HTTPException) as e:
-        asyncio.run(server.collect_results("r9", _Client()))
+        asyncio.run(server.collect_results("r9"))
     assert time.perf_counter() - start < 1.5
     assert e.value.status_code == 500
     assert pw.aborted == ["r9"]
@@ -559,29 +522,18 @@ def test_collect_results_cancellation_does_not_release_reused_request_id(old_out
     assert recorded == [(old_req, "abort")]
 
 
-def test_collect_results_cancellation_during_disconnect_check(monkeypatch):
+def test_collect_results_cancelled_while_waiting_releases_the_submission():
     pw = _StubPreprocessWorker()
     server = _api_server_stub(pw)
     server.submit_request(
-        text="prompt", request_id="disconnect", streaming=False,
+        text="prompt", request_id="cancelled", streaming=False,
         input_modalities=["text"], output_modalities=["text"],
     )
-    key = server.submission_key("disconnect")
-    # Enter the disconnect check on the first pass, without a timed sleep.
-    monkeypatch.setattr(entrypoint, "DISCONNECT_CHECK_S", 0)
+    key = server.submission_key("cancelled")
 
     async def cancel():
-        entered, blocked = asyncio.Event(), asyncio.Event()
-
-        async def is_disconnected():
-            entered.set()
-            await blocked.wait()
-            return False
-
-        task = asyncio.create_task(server.collect_results(
-            "disconnect", SimpleNamespace(is_disconnected=is_disconnected),
-        ))
-        await entered.wait()
+        task = asyncio.create_task(server.collect_results("cancelled"))
+        await asyncio.sleep(0)  # the task runs up to its wait for the finish
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task

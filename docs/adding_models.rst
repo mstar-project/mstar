@@ -113,11 +113,10 @@ is **not** the only wiring step. A model also needs:
 - an ``OpenAIAdapter`` subclass in ``ADAPTER_REGISTRY``
   (``mstar/api_server/openai/adapters.py``), *only* if the model maps onto OpenAI semantics
   such as ``chat.completions``, ``audio.speech`` or ``images.generate``. A model reached
-  only through ``POST /generate`` needs none. The adapter is ported to the Rust frontend in the
-  same change (a type implementing ``OpenAIAdapter`` in ``rust/server/src/adapters/`` and its
-  row in ``ADAPTERS``, tested by
-  ``test/rust/test_rust_openai_adapters.py``): ``mstar serve`` serves HTTP from ``mstar-server``,
-  the Python HTTP frontend is deprecated, and a surface only it serves is unfinished.
+  only through ``POST /generate`` needs none. ``mstar-server`` serves the routes, so the
+  adapter also needs its Rust port in the same change (a type implementing ``OpenAIAdapter``
+  in ``rust/server/src/adapters/`` and its row in ``ADAPTERS``, tested by
+  ``test/rust/test_rust_openai_adapters.py``).
 - the client-example tuples further down ``mstar/cli/main.py``, so ``mstar serve`` prints a
   usage snippet. Cosmetic, but user-visible.
 
@@ -4450,8 +4449,7 @@ streams (audio and video, say): each has its own buffer and its own end.
   and a final chunk, and a loop fed by the stream ends as any stream-terminated loop does.
   Over ``/generate/ws`` a client that opens with ``end_input: false`` appends and ends
   input explicitly (see :doc:`clients`), and a ``/v1/realtime`` conversation keeps it open
-  for the call's life; every other request ends the input as soon as it is submitted. Both
-  frontends serve ``/generate/ws`` and ``/v1/realtime``.
+  for the call's life; every other request ends the input as soon as it is submitted.
 - The API server's data worker is the stream's producer. The conductor tells it the
   consuming node and its ranks once per call, when it dispatches the request, and the data
   worker sends each append's items to every one of those ranks itself, and then the
@@ -4492,7 +4490,7 @@ Checklist
          [ ] the client-example tuples lower down (cosmetic, user-visible)
    [ ] docs/models.rst                            — one row in the registry-key table
    [ ] (optional) mstar/api_server/openai/adapters.py — only for OpenAI-compatible routes
-         [ ] and rust/server/src/adapters/ — the same adapter in the Rust frontend
+         [ ] and rust/server/src/adapters/ — its port, which mstar-server serves
    [ ] (optional) pyproject.toml extra            — if it needs deps the base install lacks
    [ ] (optional) async partitions if pipelined
 

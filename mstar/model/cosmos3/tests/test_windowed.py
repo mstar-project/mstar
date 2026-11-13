@@ -8,9 +8,6 @@ weights. Ported from #198's serving tests onto the resource-pool engine.
 
 from __future__ import annotations
 
-import asyncio
-import base64
-import json
 from types import SimpleNamespace
 
 import pytest
@@ -625,76 +622,21 @@ def test_windowed_stream_video_gen_params() -> None:
         plain._resolve_gen_params({"num_frames": 189, "stream_video": True}, [], ["video"])
 
 
-def test_video_streaming_ndjson_lines() -> None:
-    """stream_video turns the video handler into an NDJSON generator: indexed
-    video lines closed by a done line, an in-band error line terminal instead
-    on a failure after the first window, a refusal before it raised with its
-    status, and the non-streaming path collecting as before."""
-    from fastapi import HTTPException
-
-    from mstar.api_server.entrypoint import APIServer
+def test_video_request_passes_stream_video_through() -> None:
+    """``stream_video`` reaches the model as a kwarg (mstar-server then streams
+    the windows as NDJSON lines; test/rust/test_rust_videos.py); a plain
+    request carries none."""
     from mstar.api_server.openai.adapters import get_adapter
     from mstar.api_server.openai.protocol import VideoGenerationRequest
-    from mstar.api_server.openai.serving_videos import create_videos
-    from mstar.api_server.request_types import ResultChunk
-
-    class _Api:
-        upload_dir = "/tmp"
-        open_result_stream = APIServer.open_result_stream
-
-        def __init__(self, chunks):
-            self._chunks = chunks
-            self.submits = []
-
-        def submit_request(self, **kw):
-            self.submits.append(kw)
-            return kw["request_id"]
-
-        async def iter_result_chunks(self, request_id):  # noqa: ARG002
-            for c in self._chunks:
-                yield c
-
-        async def collect_results(self, request_id, raw_request=None):  # noqa: ARG002
-            return list(self._chunks)
 
     adapter = get_adapter("cosmos3")
-    streaming_req = VideoGenerationRequest(prompt="x", num_frames=57, window_mode="chained", stream_video=True)
-
-    async def _lines(api):
-        response = await create_videos(api, "cosmos3", adapter, streaming_req)
-        return [json.loads(line) async for line in response.body_iterator]
-
-    api = _Api([
-        ResultChunk(request_id="r", modality="video", data=b"w0"),
-        ResultChunk(request_id="r", modality="video", data=b"w1"),
-    ])
-    lines = asyncio.run(_lines(api))
-    assert api.submits[0]["streaming"] is True
-    assert api.submits[0]["model_kwargs"]["stream_video"] is True
-    assert [ln["modality"] for ln in lines] == ["video", "video", "done"]
-    assert [ln["metadata"]["index"] for ln in lines[:2]] == [0, 1]
-    assert base64.b64decode(lines[0]["data"]) == b"w0"
-    assert base64.b64decode(lines[1]["data"]) == b"w1"
-    assert lines[2]["metadata"]["chunks"] == 2
-
-    api = _Api([
-        ResultChunk(request_id="r", modality="video", data=b"w0"),
-        ResultChunk(request_id="r", modality="error", data=b"boom", metadata={"status": 500}),
-    ])
-    lines = asyncio.run(_lines(api))
-    assert [ln["modality"] for ln in lines] == ["video", "error"]
-    assert base64.b64decode(lines[1]["data"]) == b"boom"
-
-    api = _Api([ResultChunk(request_id="r", modality="error", data=b"bad image", metadata={"status": 400})])
-    with pytest.raises(HTTPException) as refused:
-        asyncio.run(_lines(api))
-    assert (refused.value.status_code, refused.value.detail) == (400, "bad image")
-
-    api = _Api([ResultChunk(request_id="r", modality="video", data=b"v")])
-    out = asyncio.run(create_videos(api, "cosmos3", adapter, VideoGenerationRequest(prompt="x", num_frames=57)))
-    assert api.submits[0]["streaming"] is False
-    assert "stream_video" not in api.submits[0]["model_kwargs"]
-    assert base64.b64decode(out["data"][0]["b64_json"]) == b"v"
+    streaming = adapter.video_to_request(
+        VideoGenerationRequest(prompt="x", num_frames=57, window_mode="chained", stream_video=True), "/tmp",
+    )
+    assert streaming.model_kwargs["stream_video"] is True
+    assert streaming.model_kwargs["window_mode"] == "chained"
+    plain = adapter.video_to_request(VideoGenerationRequest(prompt="x", num_frames=57), "/tmp")
+    assert "stream_video" not in plain.model_kwargs and plain.model_kwargs["num_frames"] == 57
 
 
 def test_session_gen_params() -> None:

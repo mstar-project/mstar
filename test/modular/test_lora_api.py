@@ -12,9 +12,7 @@ import logging
 import os
 import subprocess
 import sys
-import tempfile
 import threading
-import types
 from concurrent.futures import wait
 from pathlib import Path
 from types import SimpleNamespace
@@ -24,9 +22,7 @@ import torch
 
 pytest.importorskip("fastapi")
 pytest.importorskip("safetensors")
-from fastapi import FastAPI, HTTPException  # noqa: E402
-from fastapi.exceptions import RequestValidationError  # noqa: E402
-from fastapi.testclient import TestClient  # noqa: E402
+from fastapi import HTTPException  # noqa: E402
 from safetensors.torch import save_file  # noqa: E402
 
 try:
@@ -38,9 +34,8 @@ except ImportError:  # collected without package context
     from test_lora_tp_lockstep import _Barrier
 
 import mstar.communication.wire_types  # noqa: E402,F401  (registers the tags)
-from mstar.api_server.entrypoint import APIServer, request_validation_error, resolve_lora_spec  # noqa: E402
+from mstar.api_server.entrypoint import resolve_lora_spec  # noqa: E402
 from mstar.api_server.lora_admin import LoraAdmin  # noqa: E402
-from mstar.api_server.openai.adapters import OpenAIAdapter, SubmitArgs  # noqa: E402
 from mstar.api_server.request_types import APIServerMessage, LoraAdapterResult, RequestFailed  # noqa: E402
 from mstar.api_server.served_models import ServedModels  # noqa: E402
 from mstar.communication.wire import decode, encode  # noqa: E402
@@ -112,116 +107,17 @@ def paths(tmp_path):
 
 # --- the OpenAI `model` field ------------------------------------------------------------
 
-class _StubAPI:
-    def __init__(self, config):
-        self.model_name = BASE
-        self.model = make_model(get_output_sample_rate=lambda modality="audio": 24000)
-        self.served_models = _served(config)
-        self.lora_admin = None
-        self.upload_dir = Path(tempfile.mkdtemp())
-        self.last_submit = None
-
-    # the real APIServer's adapter selection, on this stub's ServedModels
-    lora_kwargs = APIServer.lora_kwargs
-
-    def submit_request(self, **kw):
-        kw["model_kwargs"] = self.lora_kwargs(kw.pop("model", None), kw.get("model_kwargs")).model_kwargs
-        self.last_submit = kw
-        return kw["request_id"]
-
-    async def collect_results(self, request_id, raw_request=None):
-        return [SimpleNamespace(modality="text", data=b"ok", metadata={})]
-
-
-def _client(monkeypatch, config, adapter=None):
-    import mstar.api_server
-    import mstar.api_server.openai.router as router_module
-
-    fake_ep = types.ModuleType("mstar.api_server.entrypoint")
-    stub = fake_ep.api_server = _StubAPI(config)
-    monkeypatch.setitem(sys.modules, "mstar.api_server.entrypoint", fake_ep)
-    monkeypatch.setattr(mstar.api_server, "entrypoint", fake_ep, raising=False)
-    if adapter is not None:
-        monkeypatch.setattr(router_module, "get_adapter", lambda name: adapter)
-    app = FastAPI()
-    # the real server's envelope for a body that fails its schema
-    app.add_exception_handler(RequestValidationError, request_validation_error)
-    app.include_router(router_module.router)
-    return TestClient(app), stub
-
-
-class _EveryRoute:
-    """An OpenAI adapter on every surface, passing the request's extra fields through."""
-
-    supports_chat = supports_speech = supports_images = supports_videos = True
-
-    @staticmethod
-    def _args(req, output):
-        return SubmitArgs(text="hi", input_modalities=["text"], output_modalities=[output],
-                          model_kwargs=dict(req.model_extra or {}))
-
-    def speech_to_request(self, req, upload_dir):
-        return self._args(req, "audio")
-
-    # the route's entry point: speech_to_request plus a sent speed
-    speech_request = OpenAIAdapter.speech_request
-
-    def image_to_request(self, req, upload_dir):
-        return self._args(req, "image")
-
-    def video_to_request(self, req, upload_dir):
-        return self._args(req, "video")
-
-    def image_edit_to_request(self, prompt, image_path, model_kwargs):
-        return SubmitArgs(text=prompt, input_modalities=["text", "image"], model_kwargs=dict(model_kwargs))
-
-
-_ROUTES = {
-    "chat": lambda c, b: c.post("/v1/chat/completions", json={"messages": [{"role": "user", "content": "hi"}], **b}),
-    "speech": lambda c, body: c.post("/v1/audio/speech", json={"input": "hi", **body}),
-    "images": lambda c, body: c.post("/v1/images/generations", json={"prompt": "hi", **body}),
-    "videos": lambda c, body: c.post("/v1/videos/generations", json={"prompt": "hi", **body}),
-    "image_edits": lambda c, body: c.post(
-        "/v1/images/edits", data={"prompt": "hi", **body}, files={"image": ("a.png", b"png")},
-    ),
-}
-
-
-@pytest.mark.parametrize("route", sorted(_ROUTES))
-def test_every_route_maps_the_model_field_to_an_adapter(monkeypatch, route):
-    client, stub = _client(monkeypatch, LORA_CONFIG, None if route == "chat" else _EveryRoute())
-    post = _ROUTES[route]
-    response = post(client, {"model": "sql"})
-    assert stub.last_submit["model_kwargs"][LORA_ADAPTER_KWARG] == "sql"
-    if route == "chat":
-        assert response.json()["model"] == "sql"
-    refused = [{"model": "nope"}]
-    if route in ("chat", "speech"):  # an extra-body adapter is checked like the model field
-        response = post(client, {LORA_ADAPTER_KWARG: "sql"})
-        assert stub.last_submit["model_kwargs"][LORA_ADAPTER_KWARG] == "sql"
-        if route == "chat":
-            assert response.json()["model"] == "sql"
-        refused += [{LORA_ADAPTER_KWARG: "nope"}, {"model": "sql", LORA_ADAPTER_KWARG: "other"}]
-    for body in refused:
-        stub.last_submit = None
-        response = post(client, body)
-        assert response.status_code == 400 and stub.last_submit is None, body
-    assert "unknown LoRA adapter" in post(client, {"model": "nope"}).text
-    response = post(client, {"model": BASE})
-    assert LORA_ADAPTER_KWARG not in stub.last_submit["model_kwargs"]
-    if route == "chat":
-        assert response.json()["model"] == BASE
-
-
-def test_models_lists_adapters_with_their_parent(monkeypatch):
-    client, stub = _client(monkeypatch, {})
-    cards = client.get("/v1/models").json()["data"]
-    assert [c["id"] for c in cards] == [BASE] and "parent" not in cards[0]
-    assert stub.served_models.adapter_for("anything") is None  # no LoRA: the field is not read
-    client, stub = _client(monkeypatch, LORA_CONFIG)
-    stub.served_models.add("loaded", b"\x02" * 32)  # a runtime load
-    cards = client.get("/v1/models").json()["data"]
-    assert [(c["id"], c.get("parent")) for c in cards] == [(BASE, None), ("sql", BASE), ("loaded", BASE)]
+def test_served_models_list_adapters_once_lora_is_on():
+    """What ``/v1/models`` lists beside the base model (mstar-server writes the cards)."""
+    served = _served({})
+    assert served.adapters == ()
+    assert served.adapter_for("anything") is None  # no LoRA: the field is not read
+    served = _served(LORA_CONFIG)
+    served.add("loaded", b"\x02" * 32)  # a runtime load
+    assert served.adapters == ("sql", "loaded")
+    assert served.adapter_for("sql") == "sql" and served.adapter_for(BASE) is None
+    with pytest.raises(ValueError, match="unknown LoRA adapter"):
+        served.adapter_for("nope")
 
 
 @pytest.mark.parametrize("resources", [{"typo": {}}, ["kv"], ["lora"]], ids=["typo", "list", "list_naming_lora"])
@@ -271,64 +167,14 @@ def test_submit_request_refuses_an_unserved_adapter_kwarg():
 
 # --- the admin endpoints -----------------------------------------------------------------
 
-class _Admin:
-    """The router's view of ``LoraAdmin``: what it was asked, and what it answers."""
-
-    def __init__(self, error=None):
-        self.calls, self.error = [], error
-
-    async def _answer(self, call, verb):
-        self.calls.append(call)
-        if self.error is not None:
-            raise self.error
-        return f"Success: LoRA adapter '{call[1]}' {verb} successfully."
-
-    async def load(self, name, path):
-        return await self._answer(("load", name, path), "added")
-
-    async def unload(self, name):
-        return await self._answer(("unload", name), "removed")
-
-
-_ENDPOINTS = (("/v1/load_lora_adapter", {"lora_name": "a", "lora_path": "/p"}),
-              ("/v1/unload_lora_adapter", {"lora_name": "a"}))
-
-
-@pytest.mark.parametrize("error,status,message", [
-    (None, 200, None),
-    (ValueError("why"), 400, "why"),
-    (ValueError("bad /srv/x/adapter.safetensors"), 400, "bad adapter.safetensors"),
-    (HTTPException(status_code=409, detail="why"), 409, "why"),
-    (RuntimeError("/srv/secret"), 500, "internal error (error id"),
-])
-def test_the_lora_endpoints(monkeypatch, error, status, message):
-    """vLLM's bodies; errors take every route's envelope: a ValueError is a 400 with
-    server paths cut to base names, anything else a 500 naming only an error id."""
-    client, stub = _client(monkeypatch, LORA_CONFIG)
-    stub.lora_admin = _Admin(error)
-    for (path, body), verb in zip(_ENDPOINTS, ("added", "removed"), strict=True):
-        r = client.post(path, json=body)
-        if error is None:
-            assert r.status_code == 200 and r.text == f"Success: LoRA adapter 'a' {verb} successfully."
-        else:
-            got = r.json()["error"]
-            assert r.status_code == status and got["code"] == status
-            assert got["type"] == ("invalid_request_error" if status < 500 else "server_error")
-            assert got["message"].startswith(message) and "/srv" not in got["message"]
-    # a missing field is a 400 and never reaches the admin
-    for path, body in (("/v1/load_lora_adapter", {"lora_name": "b"}), ("/v1/unload_lora_adapter", {})):
-        r = client.post(path, json=body)
-        assert r.status_code == 400 and r.json()["error"]["code"] == 400
-    assert stub.lora_admin.calls == [("load", "a", "/p"), ("unload", "a")]
-
-
-def test_the_lora_endpoints_are_404_without_runtime_updates(monkeypatch):
-    client, stub = _client(monkeypatch, LORA_CONFIG)
+def test_the_lora_endpoints_are_404_without_runtime_updates():
     sent = []
     for spec in (None, SimpleNamespace(runtime_updates=False)):
-        stub.lora_admin = LoraAdmin(spec, ServedModels(base=(BASE,)), sent.append)
-        for path, body in _ENDPOINTS:
-            assert client.post(path, json=body).status_code == 404
+        admin = LoraAdmin(spec, ServedModels(base=(BASE,)), sent.append)
+        for call in (admin.load("a", "/p"), admin.unload("a")):
+            with pytest.raises(HTTPException) as err:
+                asyncio.run(call)
+            assert err.value.status_code == 404
     assert sent == []
     # nor does the conductor act on one
     out = _Outbox()

@@ -215,9 +215,10 @@ Phase B, the comparison with the code, is in the abstraction-fit pass.
 
 Start by reading the change (all modes): the whole diff and the code around it: callers, callees,
 and the counterpart across every boundary the change crosses (Python/Rust, sender/receiver, rank 0/
-rank N, conductor/engine, API server/worker). A change to what an HTTP route accepts or returns
-(`mstar/api_server/`, an `OpenAIAdapter`, an `ADAPTER_REGISTRY` entry) has a counterpart in
-`rust/server/`: one that isn't there, or a new `NOT_PORTED` entry, breaks invariant 15. Check the
+rank N, conductor/engine, API server/worker). HTTP routes are served by `rust/server/` only: a
+change to what a route accepts or returns (an `OpenAIAdapter`, an `ADAPTER_REGISTRY` entry) has a
+counterpart in `rust/server/src/adapters/`, and one that isn't there, a new `NOT_PORTED` entry, or a
+route added on the Python side breaks invariant 15. Check the
 diff against every `AGENTS.md` invariant that applies to the layers it touches. Try to disprove each candidate finding before keeping it.
 
 ### 4.1 Behaviour (all modes)
@@ -578,7 +579,7 @@ decision that is a defect is also a finding, and one the PR leaves open is also 
 The live test is a second session that runs after the review, on the GPU box, with a shell there and
 nothing else: no GitHub token and no cloud keys. It follows `.claude/skills/live-pr-test/SKILL.md`
 (cluster mode: the box is already provisioned) end to end: its plan, risk map, reach before results,
-reference parity, both frontends where they apply. It gets the PR, the head commit to test, the
+reference parity. It gets the PR, the head commit to test, the
 review's reason for its call and its focus.
 
 **The review decides whether and what the live test runs**, on every review and re-review, from

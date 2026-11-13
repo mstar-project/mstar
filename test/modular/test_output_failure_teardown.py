@@ -12,18 +12,14 @@ stays the client's only answer, and every stream ends at that error.
 from __future__ import annotations
 
 import asyncio
-import json
 import queue
 import threading
 from types import SimpleNamespace
 
-import httpx
 import pytest
-from fastapi.testclient import TestClient
-from test_request_id_reuse import TEXT, _api_server, _PreprocessWorker, _routes, _wait
+from test_request_id_reuse import TEXT, _api_server, _PreprocessWorker
 from test_teardown_barrier import PREPROCESS, _conductor, _remove_targets, _request_data
 
-from mstar.api_server import entrypoint
 from mstar.api_server.data_worker import InlineTokens, PreprocessWorkerThread, RequestOutputState, ResultQueue
 from mstar.api_server.request_types import PreprocessInput, ResultChunk, ResultTensors
 from mstar.communication.event import EventWakeup
@@ -248,12 +244,6 @@ def _data_worker_failure(s, key, late=False):
     req.notify()
 
 
-def _fail_when_submitted(s, pw, n=1):
-    _wait(lambda: len(pw.inputs) >= n)
-    _wait(lambda: pw.inputs[n - 1].request_id in s.pending_requests)
-    _data_worker_failure(s, pw.inputs[n - 1].request_id)
-
-
 def test_a_stream_ends_at_the_data_worker_s_error():
     """The stream used to append its own copy of the error after the data
     worker's, and to hand on whatever followed it."""
@@ -282,57 +272,6 @@ def test_an_engine_failure_still_ends_the_stream_with_one_error():
         return [(c.modality, c.data) async for c in s.iter_result_chunks("X")]
 
     assert asyncio.run(read()) == [("error", b"failed in the engine")]
-
-
-def test_generate_streams_one_error_line(monkeypatch):
-    pw = _PreprocessWorker()
-    s = _api_server(pw)
-    _routes(monkeypatch, s)
-    failer = threading.Thread(target=_fail_when_submitted, args=(s, pw))
-    failer.start()
-
-    async def run():
-        transport = httpx.ASGITransport(app=entrypoint.app)
-        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-            # FastAPI 0.147+ reads an omitted bool form field as False, so
-            # send streaming the way mstar.client does.
-            return await client.post(
-                "/generate", data={"text": "first", "request_id": "X", "streaming": "true"},
-            )
-
-    response = asyncio.run(run())
-    failer.join()
-    lines = [json.loads(line) for line in response.text.splitlines()]
-    assert [line["modality"] for line in lines] == ["text", "error"]
-
-
-def test_websocket_replies_once_to_a_data_worker_failure(monkeypatch, tmp_path):
-    """A second error reply under the id would read as the answer to the
-    next request the client sends under it."""
-    pw = _PreprocessWorker()
-    s = _api_server(pw)
-    _routes(monkeypatch, s, tmp_path)
-    with TestClient(entrypoint.app).websocket_connect("/generate/ws") as ws:
-        failer = threading.Thread(target=_fail_when_submitted, args=(s, pw))
-        failer.start()
-        ws.send_text(json.dumps({"text": "first", "request_id": "X"}))
-        replies = [json.loads(ws.receive_text()) for _ in range(2)]
-        failer.join()
-        assert replies[1] == {
-            "request_id": "X", "error": "text output postprocessing failed", "status": 500,
-        }
-
-        ws.send_text(json.dumps({"text": "second", "request_id": "X"}))
-        _wait(lambda: len(pw.inputs) == 2)
-        with s.request_lock:
-            req = s.pending_requests[pw.inputs[1].request_id]
-            req.chunks.append(ResultChunk(request_id="X", modality="text", data=b"b", metadata={}))
-            req.event.set()
-        req.notify()
-        after = [json.loads(ws.receive_text()) for _ in range(2)]
-
-    assert "data" in replies[0] and "error" not in after[0]
-    assert after[1] == {"request_id": "X", "finish": True}
 
 
 def test_the_bridge_relays_one_error():

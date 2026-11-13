@@ -6,8 +6,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from mstar.api_server.media_io import png_to_data_url
 from mstar.api_server.openai.adapters import flatten_messages
-from mstar.api_server.openai.serving_chat import _build_response
 from mstar.model.multimodal import (
     PromptPart,
     check_attachments,
@@ -464,11 +464,14 @@ def test_an_image_chat_puts_each_turn_in_its_own_role_block(bagel, tmp_path):
 
 
 def test_a_replys_image_comes_back_in_the_next_user_turn(bagel, tmp_path):
-    """A client appends the assistant message a chat response carries and goes on."""
-    reply = _build_response("bagel", "chatcmpl-0", [
-        SimpleNamespace(modality="text", data=b"Here it is."),
-        SimpleNamespace(modality="image", data=b"\x89PNG"),
-    ], 24000)["choices"][0]["message"]
+    """A client appends the assistant message a chat response carries and goes on.
+
+    The message is the one mstar-server's ``build_chat_response`` writes for a
+    text chunk and an image chunk: a text part, then the image as a data URL."""
+    reply = {"role": "assistant", "content": [
+        {"type": "text", "text": "Here it is."},
+        {"type": "image_url", "image_url": {"url": png_to_data_url(b"\x89PNG")}},
+    ]}
     messages = [
         {"role": "user", "content": "Draw a red cube."},
         reply,

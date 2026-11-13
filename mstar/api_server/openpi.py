@@ -25,21 +25,15 @@ images reach the model decoded, with no file in between
 
 from __future__ import annotations
 
-import logging
 import math
-import time
 from dataclasses import dataclass, field
 from typing import NamedTuple
 
 import msgpack
 import numpy as np
 import torch
-from fastapi import HTTPException, WebSocket, WebSocketDisconnect
 
 from mstar.model.base import Model
-from mstar.utils.client_errors import client_error_text
-
-logger = logging.getLogger(__name__)
 
 # Array dtypes an observation may carry: bool, integers and floats.
 _NUMERIC_KINDS = frozenset("biuf")
@@ -228,78 +222,3 @@ class OpenpiPolicy:
 # ----------------------------------------------------------------------
 # The connection
 # ----------------------------------------------------------------------
-
-class _CallFailedError(Exception):
-    """The request failed after it was submitted; ``text`` is client-safe."""
-
-    def __init__(self, text: str):
-        super().__init__(text)
-        self.text = text
-
-
-async def _infer(api, policy: OpenpiPolicy, request: PolicyRequest) -> np.ndarray:
-    request_id = api.submit_request(
-        text=request.prompt,
-        raw_inputs={"image": request.images},
-        input_modalities=["image", "text"],
-        output_modalities=["action"],
-        model_kwargs=request.model_kwargs,
-        streaming=True,
-    )
-    data = None
-    # Leaving early (the handler cancelled) aborts the submission: the iterator owns that.
-    async for chunk in api.iter_result_chunks(request_id):
-        if chunk.modality == "error":
-            raise _CallFailedError(bytes(chunk.data).decode("utf-8", "replace"))
-        if chunk.modality == "action":
-            data = bytes(chunk.data)
-    if data is None:
-        raise RuntimeError("the request finished without actions")
-    return policy.actions(data)
-
-
-def _error_text(exc: Exception) -> str:
-    if isinstance(exc, _CallFailedError):
-        return exc.text
-    if isinstance(exc, HTTPException):
-        return str(exc.detail)
-    return client_error_text(exc, "openpi request failed", log=logger, type_name=False)[0]
-
-
-async def serve_connection(websocket: WebSocket, api) -> None:
-    """One robot's connection, served as openpi's ``WebsocketPolicyServer``
-    serves one. A server whose config has no ``openpi:`` block refuses the
-    handshake."""
-    policy = getattr(api, "openpi_policy", None)
-    if policy is None:
-        # closing before accept refuses the handshake (HTTP 403)
-        await websocket.close(code=1008, reason="this server has no openpi policy (no openpi: block in its config)")
-        return
-    await websocket.accept()
-    try:
-        await websocket.send_bytes(pack(policy.metadata))
-        prev_total_ms = None
-        while True:
-            # as openpi's server times it: prev_total_ms spans the wait for the observation too
-            start = time.monotonic()
-            message = await websocket.receive()
-            if message["type"] == "websocket.disconnect":
-                return
-            try:
-                if message.get("bytes") is None:
-                    raise ValueError("an observation is a binary msgpack frame")
-                obs = unpack(message["bytes"])
-                infer_start = time.monotonic()
-                actions = await _infer(api, policy, policy.request(obs))
-                infer_ms = (time.monotonic() - infer_start) * 1000
-            except Exception as exc:  # noqa: BLE001 — openpi's contract: the error as text, then close
-                await websocket.send_text(_error_text(exc))
-                await websocket.close(code=1011, reason="request failed; the error is in the previous frame")
-                return
-            timing = {"infer_ms": infer_ms}
-            if prev_total_ms is not None:
-                timing["prev_total_ms"] = prev_total_ms
-            await websocket.send_bytes(pack({"actions": actions, "server_timing": timing}))
-            prev_total_ms = (time.monotonic() - start) * 1000
-    except WebSocketDisconnect:
-        pass  # the robot went away; a send is the first to notice once its call has finished

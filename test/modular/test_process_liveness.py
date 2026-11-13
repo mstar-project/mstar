@@ -476,29 +476,6 @@ def test_stop_callback_registered_after_the_conductor_died_still_runs():
     assert stopped == ["late", "early"]
 
 
-def test_health_reports_unhealthy_once_fatal():
-    """A load balancer must stop routing here: /health has to fail as soon as
-    the deployment is going down, not stay 200 until the process exits."""
-    from fastapi.testclient import TestClient
-
-    import mstar.api_server.entrypoint as ep
-
-    client = TestClient(ep.app)
-    previous = ep.api_server
-    try:
-        ep.api_server = SimpleNamespace(fatal_error=None)
-        assert client.get("/health").status_code == 200
-
-        ep.api_server = SimpleNamespace(
-            fatal_error="worker worker_0 (pid 7) exited with signal SIGKILL"
-        )
-        response = client.get("/health")
-        assert response.status_code == 503
-        assert "worker_0" in response.json()["detail"]
-    finally:
-        ep.api_server = previous
-
-
 def test_dynamo_worker_exits_nonzero_when_conductor_dies():
     """The Dynamo entrypoint runs the same APIServer, so a dead conductor has
     to fail that process too rather than leave it registered and serving."""

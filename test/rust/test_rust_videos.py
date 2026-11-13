@@ -1,7 +1,9 @@
-"""``/v1/videos/generations`` on both frontends: each video adapter's submit or
-refusal, the generated audio track muxed into the mp4, and ``stream_video``'s
-NDJSON lines. The real ``mstar-server`` and bridge run against a scripted data
-plane; the Python route runs in-process (FastAPI's TestClient)."""
+"""``/v1/videos/generations`` on mstar-server: each video adapter's submit or
+refusal (against the Python adapter, live), the generated audio track muxed into
+the mp4, and ``stream_video``'s NDJSON lines, held to the Python route: the
+Python route's answers replayed as it gave them before it was removed
+(``python_oracle``). The real ``mstar-server`` and bridge run against a scripted
+data plane."""
 import base64
 import json
 import shutil
@@ -13,17 +15,13 @@ from pathlib import Path
 import pytest
 
 pytest.importorskip("mstar_rust")
-pytest.importorskip("fastapi")
 
-from fastapi.testclient import TestClient
+from python_oracle import python_side
 from test_rust_frontend import BINARY, _Chunk, _model_stack, _StubAPIServer
 from test_rust_openai_adapters import _model_of
 
-from mstar.api_server import entrypoint
-from mstar.api_server.entrypoint import APIServer
 from mstar.api_server.openai._util import check_inline_result
 from mstar.api_server.openai.adapters import ADAPTER_REGISTRY
-from mstar.api_server.served_models import ServedModels
 
 pytestmark = pytest.mark.skipif(BINARY is None, reason="mstar-server binary not built")
 
@@ -65,33 +63,6 @@ class _RustVideoStub(_StubAPIServer):
     async def iter_result_chunks(self, request_id):
         for c in _chunks(self.texts.get(request_id) or "", self.video):
             yield c
-
-
-class _PythonVideoServer:
-    """What ``create_videos`` calls on APIServer, answering as the Rust stub does."""
-
-    def __init__(self, model_name, upload_dir, video: bytes):
-        self.model_name, self.upload_dir, self.model, self.video = model_name, upload_dir, None, video
-        self.served_models = ServedModels.of(model_name, None)
-        self.submitted, self.texts = [], {}
-
-    def submit_request(self, **kwargs):
-        self.submitted.append(kwargs)
-        self.texts[kwargs["request_id"]] = kwargs["text"]
-        return kwargs["request_id"]
-
-    async def iter_result_chunks(self, request_id):
-        for c in _chunks(self.texts[request_id], self.video):
-            yield c
-
-    async def collect_results(self, request_id, raw_request=None):
-        return _chunks(self.texts[request_id], self.video)
-
-    def release_request(self, request_id):
-        pass
-
-    lora_kwargs = APIServer.lora_kwargs
-    open_result_stream = APIServer.open_result_stream
 
 
 def _post(port, body, timeout=60):
@@ -191,13 +162,22 @@ def test_a_remote_keyframe_follows_the_servers_remote_fetch_setting(cls, field, 
     else:
         assert (status, json.loads(data)["error"]["message"]) == (400, refusal)
 
-def _python_videos(model, body, tmp_path, monkeypatch, video):
-    monkeypatch.setattr(entrypoint, "api_server", _PythonVideoServer(model, tmp_path, video))
-    return TestClient(entrypoint.app).post("/v1/videos/generations", json=body)
-
-
 needs_ffmpeg = pytest.mark.skipif(shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None,
                                   reason="ffmpeg and ffprobe mux the audio track")
+
+
+def _ffmpeg_version() -> str:
+    return subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True, check=True).stdout.splitlines()[0]
+
+
+def _streams(mp4: bytes) -> list:
+    """What ffprobe reads of each stream, which another ffmpeg build muxing the
+    same commands still writes alike."""
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries",
+         "stream=codec_type,codec_name,r_frame_rate,time_base,nb_frames,sample_rate,channels,duration",
+         "-of", "json", "-"], input=mp4, capture_output=True, check=True).stdout
+    return sorted((json.loads(out)["streams"]), key=lambda st: st["codec_type"])
 
 
 @needs_ffmpeg
@@ -211,13 +191,16 @@ def test_a_videos_generated_sound_is_muxed_into_the_python_routes_mp4(fps, tmp_p
     body = {"model": model, "prompt": "with sound"}
     if fps is not None:
         body["fps"] = fps
-    py = _python_videos(model, body, tmp_path, monkeypatch, video)
+    py_status, _, py_body, py_ffmpeg = python_side()
     with _model_stack(model, _RustVideoStub(video)) as (port, _upload):
         status, _, data = _post(port, body)
-    assert (status, py.status_code) == (200, 200), data
+    assert (status, py_status) == (200, 200), data
     rust_mp4 = base64.b64decode(json.loads(data)["data"][0]["b64_json"])
-    python_mp4 = base64.b64decode(py.json()["data"][0]["b64_json"])
-    assert rust_mp4 == python_mp4
+    python_mp4 = base64.b64decode(json.loads(py_body)["data"][0]["b64_json"])
+    assert _streams(rust_mp4) == _streams(python_mp4)
+    if _ffmpeg_version() == py_ffmpeg:
+        # the build the Python route's answer was recorded with: byte for byte
+        assert rust_mp4 == python_mp4
     assert rust_mp4 != video, "no audio track was muxed in"
     streams = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "stream=codec_type", "-of", "csv=p=0", "-"],
                              input=rust_mp4, capture_output=True, check=True).stdout.decode().split()
@@ -229,12 +212,12 @@ def test_a_failed_mux_returns_the_video_alone_as_python_does(tmp_path, monkeypat
     video = b"not an mp4"
     model = _model_of("LTX25Adapter")
     body = {"model": model, "prompt": "with sound"}
-    py = _python_videos(model, body, tmp_path, monkeypatch, video)
+    py_status, _, py_body = python_side()
     with _model_stack(model, _RustVideoStub(video)) as (port, _upload):
         status, _, data = _post(port, body)
-    assert status == py.status_code == 200
+    assert status == py_status == 200
     assert base64.b64decode(json.loads(data)["data"][0]["b64_json"]) == video == base64.b64decode(
-        py.json()["data"][0]["b64_json"])
+        json.loads(py_body)["data"][0]["b64_json"])
 
 
 @pytest.mark.parametrize("prompt", ["two windows", "it fails late"], ids=["windows", "late-failure"])
@@ -243,12 +226,12 @@ def test_stream_video_writes_the_python_routes_ndjson(prompt, tmp_path, monkeypa
     count; a failure after the 200 ends it with its ``error`` line instead."""
     model = _model_of("Wan22Adapter")
     body = {"model": model, "prompt": prompt, "stream_video": True}
-    py = _python_videos(model, body, tmp_path, monkeypatch, b"mp4-bytes")
+    py_status, py_type, py_body = python_side()
     with _model_stack(model, _RustVideoStub(b"mp4-bytes")) as (port, _upload):
         status, ctype, data = _post(port, body)
-    assert (status, ctype) == (py.status_code, py.headers["content-type"]) == (200, "application/x-ndjson")
+    assert (status, ctype) == (py_status, py_type) == (200, "application/x-ndjson")
     rust_lines = [json.loads(line) for line in data.splitlines()]
-    python_lines = [json.loads(line) for line in py.content.splitlines()]
+    python_lines = [json.loads(line) for line in py_body.splitlines()]
     assert rust_lines == python_lines
     assert rust_lines[-1]["modality"] == ("done" if "windows" in prompt else "error")
 
@@ -258,8 +241,8 @@ def test_a_stream_video_the_engine_refuses_at_once_gets_its_status_on_both(tmp_p
     decode) is the response's status, not a 200 with an ``error`` line."""
     model = _model_of("Wan22Adapter")
     body = {"model": model, "prompt": "refused", "stream_video": True}
-    py = _python_videos(model, body, tmp_path, monkeypatch, b"mp4-bytes")
+    py_status, _, py_body = python_side()
     with _model_stack(model, _RustVideoStub(b"mp4-bytes")) as (port, _upload):
         status, _, data = _post(port, body)
-    assert status == py.status_code == 400
-    assert json.loads(data) == py.json()
+    assert status == py_status == 400
+    assert json.loads(data) == json.loads(py_body)

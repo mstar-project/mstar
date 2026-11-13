@@ -5,17 +5,14 @@ carries the full error and traceback under that id."""
 
 import asyncio
 import getpass
-import json
 import os
 import re
 from types import SimpleNamespace
 
 import pytest
-from fastapi.testclient import TestClient
 from PIL import Image
 from test_output_failure_teardown import _Model, _TensorManager, _thread
 
-from mstar.api_server import entrypoint
 from mstar.api_server.rust_frontend import RustFrontendBridge
 from mstar.engine.engine import ExecutingBatch
 from mstar.testing_utils.worker import make_scheduler, make_worker
@@ -151,9 +148,6 @@ class _FailingServer:
         self.exc = exc
         self.upload_dir = upload_dir
 
-    async def wait_for_request_id(self, request_id):
-        return None
-
     def submission_key(self, request_id):
         return request_id
 
@@ -168,19 +162,6 @@ class _FailingServer:
         yield
 
 
-def test_the_generate_catch_all_answers_with_an_error_id(monkeypatch, caplog):
-    segment = f"/dev/shm/mstar_arena_api_{os.getpid()}_77.seg0"
-    monkeypatch.setattr(entrypoint, "api_server", _FailingServer(RuntimeError(f"io on {segment}")))
-
-    response = TestClient(entrypoint.app).post("/generate", data={"text": "hi"})
-
-    assert response.status_code == 500
-    detail = response.json()["detail"]
-    _assert_clean(detail)
-    assert detail.startswith("internal error (error id ")
-    assert segment in _logged(caplog, _error_id(detail)).getMessage()
-
-
 def _bridge(server) -> RustFrontendBridge:
     """A Rust frontend bridge that records what it sends."""
     bridge = RustFrontendBridge.__new__(RustFrontendBridge)
@@ -191,36 +172,12 @@ def _bridge(server) -> RustFrontendBridge:
     return bridge
 
 
-@pytest.mark.parametrize("path", ["generate", "rust-frontend"])
-def test_a_refusal_reaches_the_client_without_its_directory(monkeypatch, path):
-    """As the OpenAI routes cut it: /generate and the Rust frontend sent it whole."""
-    server = _FailingServer(ValueError("cannot read /tmp/x/a.wav"))
-    if path == "generate":
-        monkeypatch.setattr(entrypoint, "api_server", server)
-        response = TestClient(entrypoint.app).post("/generate", data={"text": "hi"})
-        assert response.status_code == 400
-        text = response.json()["detail"]
-    else:
-        bridge = _bridge(server)
-        bridge._submit({"rid": "r1", "text": "hi"})
-        [message] = bridge.sent
-        assert message["metadata"] == {"status": 400, "refused": True}
-        text = message["data"].decode()
-    assert text == "cannot read a.wav"
-
-
-def test_generate_ws_answers_with_an_error_id(monkeypatch, tmp_path, caplog):
-    segment = f"/dev/shm/mstar_arena_api_{os.getpid()}_77.seg0"
-    server = _FailingServer(RuntimeError(f"io on {segment}"), upload_dir=tmp_path)
-    monkeypatch.setattr(entrypoint, "api_server", server)
-
-    with TestClient(entrypoint.app).websocket_connect("/generate/ws") as ws:
-        ws.send_text(json.dumps({"text": "hi", "request_id": "r1"}))
-        reply = json.loads(ws.receive_text())
-
-    assert reply["request_id"] == "r1"
-    _assert_clean(reply["error"])
-    assert segment in _logged(caplog, _error_id(reply["error"])).getMessage()
+def test_a_refusal_reaches_the_client_without_its_directory():
+    bridge = _bridge(_FailingServer(ValueError("cannot read /tmp/x/a.wav")))
+    bridge._submit({"rid": "r1", "text": "hi"})
+    [message] = bridge.sent
+    assert message["metadata"] == {"status": 400, "refused": True}
+    assert message["data"].decode() == "cannot read a.wav"
 
 
 def test_the_rust_frontend_bridge_answers_with_an_error_id(tmp_path, caplog):
@@ -295,77 +252,6 @@ def test_a_failed_kv_retrieve_reaches_the_client_without_its_path(caplog):
 
 SECRET = "token=sk-not-a-real-key-4242"
 
-# Each OpenAI route, the model it is served for, the serving function its
-# handler awaits, and a request that reaches that function.
-_ROUTES = [
-    ("/v1/chat/completions", "bagel", "serving_chat", "create_chat_completion",
-     {"json": {"model": "bagel", "messages": [{"role": "user", "content": "hi"}]}}),
-    ("/v1/audio/speech", "orpheus", "serving_speech", "create_speech",
-     {"json": {"model": "orpheus", "input": "hi", "voice": "tara"}}),
-    ("/v1/audio/transcriptions", "whisper_large", "serving_transcriptions", "create_transcription",
-     {"files": {"file": ("a.wav", b"RIFF")}}),
-    ("/v1/images/generations", "bagel", "serving_images", "create_images",
-     {"json": {"model": "bagel", "prompt": "a cat"}}),
-    ("/v1/videos/generations", "wan22", "serving_videos", "create_videos",
-     {"json": {"model": "wan22", "prompt": "a cat"}}),
-    ("/v1/images/edits", "bagel", "serving_images", "create_image_edit",
-     {"files": {"image": ("in.png", b"\x89PNG")}, "data": {"prompt": "x"}}),
-]
-
-
-def _openai_client(monkeypatch, model_name, upload_dir):
-    from fastapi import FastAPI
-
-    from mstar.api_server.openai.router import router
-
-    monkeypatch.setattr(entrypoint, "api_server", SimpleNamespace(
-        model_name=model_name, upload_dir=str(upload_dir), model=None,
-    ))
-    app = FastAPI()
-    app.include_router(router)
-    return TestClient(app)
-
-
-@pytest.mark.parametrize("route,model,module,func,request_kw", _ROUTES, ids=[r[0] for r in _ROUTES])
-def test_an_openai_route_answers_an_internal_error_with_an_error_id(
-    monkeypatch, tmp_path, caplog, route, model, module, func, request_kw,
-):
-    import importlib
-
-    upload = _upload(tmp_path, "7_clip.wav")
-
-    async def raising(*args, **kwargs):
-        raise RuntimeError(f"Could not open input file: {upload} ({SECRET})")
-
-    monkeypatch.setattr(importlib.import_module(f"mstar.api_server.openai.{module}"), func, raising)
-    response = _openai_client(monkeypatch, model, tmp_path).post(route, **request_kw)
-
-    assert response.status_code == 500
-    message = response.json()["error"]["message"]
-    _assert_clean(response.text)
-    assert SECRET not in response.text and "7_clip.wav" not in response.text
-    assert message.startswith("internal error (error id ")
-    logged = _logged(caplog, _error_id(message)).getMessage()
-    assert upload in logged and SECRET in logged and route in logged
-
-
-@pytest.mark.parametrize("route,model,module,func,request_kw", _ROUTES, ids=[r[0] for r in _ROUTES])
-def test_an_openai_route_keeps_a_refusal_without_its_path(
-    monkeypatch, tmp_path, caplog, route, model, module, func, request_kw,
-):
-    import importlib
-
-    upload = _upload(tmp_path, "7_clip.wav")
-
-    async def raising(*args, **kwargs):
-        raise ValueError(f"unsupported sample rate in {upload}")
-
-    monkeypatch.setattr(importlib.import_module(f"mstar.api_server.openai.{module}"), func, raising)
-    response = _openai_client(monkeypatch, model, tmp_path).post(route, **request_kw)
-
-    assert response.status_code == 400
-    assert response.json()["error"]["message"] == "unsupported sample rate in 7_clip.wav"
-
 
 def _wav_header(seconds_claimed: float, body: bytes, rate: int = 16000) -> bytes:
     """A 16-bit mono WAV whose header claims ``seconds_claimed`` of audio."""
@@ -401,35 +287,6 @@ def _rss_mib() -> float:
         return int(f.read().split()[1]) * os.sysconf("SC_PAGE_SIZE") / 2**20
 
 
-def test_a_transcription_whose_decode_fails_in_the_frontend_answers_with_an_error_id(
-    monkeypatch, tmp_path, caplog,
-):
-    """A header longer than the model's window makes the frontend decode the
-    upload (``WindowPlanner.prepare``). When that decode fails with an
-    unexpected error, here the FFmpeg fallback naming the saved upload as
-    torchcodec does, the client gets an error id and the upload is deleted."""
-    from mstar.api_server import media_io
-
-    seen = []
-
-    def ffmpeg_fails(path, *args, **kwargs):
-        seen.append(path)
-        raise RuntimeError(f"Could not open input file: {path} ({SECRET})")
-
-    monkeypatch.setattr(media_io, "decode_torchcodec_capped", ffmpeg_fails)
-    response = _openai_client(monkeypatch, "whisper_large", tmp_path).post(
-        "/v1/audio/transcriptions", files={"file": ("lecture.flac", _corrupt_flac(40))},
-    )
-
-    assert len(seen) == 1, "the frontend decode did not run"
-    assert response.status_code == 500
-    _assert_clean(response.text)
-    assert SECRET not in response.text and "lecture" not in response.text
-    message = response.json()["error"]["message"]
-    assert seen[0] in _logged(caplog, _error_id(message)).getMessage()
-    assert os.listdir(tmp_path) == []
-
-
 @pytest.mark.parametrize("name,payload", [
     ("garbage.wav", bytes(range(256)) * 200),
     ("truncated.wav", _wav_header(1, b"")[:30]),
@@ -437,42 +294,51 @@ def test_a_transcription_whose_decode_fails_in_the_frontend_answers_with_an_erro
     ("long_header_short_body.wav", _wav_header(600, b"\0" * 32000)),
     ("corrupt_long.flac", None),
 ], ids=lambda v: v if isinstance(v, str) else "")
-def test_hostile_transcription_uploads_get_a_clean_answer(monkeypatch, tmp_path, caplog, name, payload):
-    """Malformed files and headers that lie about their length: the answer
-    is the engine's (a stub here), a 4xx, or a 500 with an error id; never a
-    server path, never unbounded memory, and no upload left behind."""
+def test_hostile_transcription_uploads_get_a_clean_answer(tmp_path, caplog, name, payload):
+    """Malformed files and headers that lie about their length, as mstar-server
+    hands them to the bridge to plan their windows: the answer is windows, a
+    4xx, or a 500 with an error id; never a server path, never unbounded
+    memory, and no upload left behind once the request closes."""
+    from mstar.api_server.openai.adapters import get_adapter
+    from mstar.api_server.openai.serving_transcriptions import CUT_FRAME_SECONDS, CUT_SEARCH_SECONDS
+
     if payload is None:
         payload = _corrupt_flac(40)
-    client = _openai_client(monkeypatch, "whisper_large", tmp_path)
+    upload_dir = tmp_path / f"mstar_uploads_{USER}"
+    upload_dir.mkdir()
+    path = upload_dir / f"7_{name}"
+    path.write_bytes(payload)
+    window = get_adapter("whisper_large").max_audio_seconds
+    bridge = _bridge(SimpleNamespace(upload_dir=str(upload_dir)))
+    bridge._planners = {}
+    bridge.loop = asyncio.new_event_loop()
 
-    async def transcribe(**kwargs):
-        return [SimpleNamespace(modality="text", data=b"<|en|> hi", metadata={})]
+    def windows(op):
+        bridge._windows({"op": op, "plan": 1, "rid": "r1", "sub": 0, "path": str(path), "max_seconds": window,
+                         "balanced": False, "search_seconds": CUT_SEARCH_SECONDS,
+                         "frame_seconds": CUT_FRAME_SECONDS, "whole_seconds": window})
+        bridge.loop.run_until_complete(asyncio.gather(*asyncio.all_tasks(bridge.loop)))
 
-    entrypoint.api_server.submit_request = lambda **kw: kw["request_id"]
-    entrypoint.api_server.collect_results = lambda request_id, raw_request=None: transcribe()
     before = _rss_mib()
-    response = client.post("/v1/audio/transcriptions", files={"file": (name, payload)})
+    try:
+        windows("plan")
+        if "error" not in bridge.sent[-1]["metadata"]:
+            windows("fixed")
+        answer = bridge.sent[-1]["metadata"]
+        windows("close")
+    finally:
+        bridge.loop.close()
     grew = _rss_mib() - before
 
-    _assert_clean(response.text)
-    if response.status_code >= 500:
-        assert response.json()["error"]["message"].startswith("internal error (error id ")
+    # a plan's window paths are mstar-server's to read; an error is the client's
+    if "error" in answer:
+        error = answer["error"]
+        _assert_clean(error["message"])
+        if error["status"] >= 500:
+            assert error["message"].startswith("internal error (error id ")
+        else:
+            assert error["status"] in (400, 413), error
     else:
-        assert response.status_code in (200, 400, 413), response.text
+        assert answer["windows"]
     assert grew < 256, f"{name}: RSS grew {grew:.0f} MiB"
-    assert os.listdir(tmp_path) == []
-
-
-def test_an_openai_route_keeps_the_status_an_exception_names(monkeypatch, tmp_path):
-    from mstar.api_server import media_io
-    from mstar.api_server.openai import serving_chat
-
-    async def too_long(*args, **kwargs):
-        raise media_io.AudioTooLongError(1800)
-
-    monkeypatch.setattr(serving_chat, "create_chat_completion", too_long)
-    response = _openai_client(monkeypatch, "bagel", tmp_path).post(
-        "/v1/chat/completions", json={"model": "bagel", "messages": [{"role": "user", "content": "hi"}]},
-    )
-    assert response.status_code == 413
-    assert response.json()["error"]["message"] == str(media_io.AudioTooLongError(1800))
+    assert os.listdir(upload_dir) == []

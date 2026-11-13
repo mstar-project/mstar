@@ -1,0 +1,9999 @@
+{
+"test_a_failed_window_fails_the_upload_alike[0-false]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+503,
+{
+"error": {
+"code": 503,
+"message": "the engine gave up",
+"type": "server_error"
+}
+}
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 28.22,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 28.28,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 13.5,
+"streaming": false,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_a_failed_window_fails_the_upload_alike[0-true]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+[
+{
+"delta": " partial",
+"type": "transcript.text.delta"
+},
+{
+"error": {
+"code": 503,
+"message": "the engine gave up",
+"type": "server_error"
+},
+"type": "error"
+},
+"[DONE]"
+]
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 28.22,
+"streaming": true,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 28.28,
+"streaming": true,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 13.5,
+"streaming": true,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_a_failed_window_fails_the_upload_alike[1-false]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+503,
+{
+"error": {
+"code": 503,
+"message": "the engine gave up",
+"type": "server_error"
+}
+}
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 28.22,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 28.28,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 13.5,
+"streaming": false,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_a_failed_window_fails_the_upload_alike[1-true]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+[
+{
+"delta": " the",
+"type": "transcript.text.delta"
+},
+{
+"delta": " wind",
+"type": "transcript.text.delta"
+},
+{
+"delta": "ow of",
+"type": "transcript.text.delta"
+},
+{
+"delta": " 28.2",
+"type": "transcript.text.delta"
+},
+{
+"delta": "2 s, ",
+"type": "transcript.text.delta"
+},
+{
+"delta": "caf\u00e9",
+"type": "transcript.text.delta"
+},
+{
+"delta": " ",
+"type": "transcript.text.delta"
+},
+{
+"delta": " partial",
+"type": "transcript.text.delta"
+},
+{
+"error": {
+"code": 503,
+"message": "the engine gave up",
+"type": "server_error"
+},
+"type": "error"
+},
+"[DONE]"
+]
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 28.22,
+"streaming": true,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 28.28,
+"streaming": true,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 13.5,
+"streaming": true,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_a_looping_window_warms_up_and_stops_conditioning_alike[stream]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+[
+{
+"delta": "first part 3 second part",
+"type": "transcript.text.delta"
+},
+{
+"delta": " ",
+"type": "transcript.text.delta"
+},
+{
+"delta": "first part 7 second part",
+"type": "transcript.text.delta"
+},
+{
+"delta": " ",
+"type": "transcript.text.delta"
+},
+{
+"delta": "first part 11 second part",
+"type": "transcript.text.delta"
+},
+{
+"text": "first part 3 second part first part 7 second part first part 11 second part",
+"type": "transcript.text.done",
+"usage": {
+"seconds": 70,
+"type": "duration"
+}
+},
+"[DONE]"
+]
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 30.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"temperature": 0.2,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 30.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"temperature": 0.4,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 30.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"temperature": 0.6,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 30.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 30.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"language": "en",
+"temperature": 0.2,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 30.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"language": "en",
+"temperature": 0.4,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 30.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"language": "en",
+"temperature": 0.6,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 30.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 10.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"language": "en",
+"temperature": 0.2,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 10.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"language": "en",
+"temperature": 0.4,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 10.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"language": "en",
+"temperature": 0.6,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 10.0,
+"streaming": false,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_a_looping_window_warms_up_and_stops_conditioning_alike[verbose]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+{
+"duration": 70.0,
+"language": "en",
+"segments": [
+{
+"avg_logprob": 0.0,
+"compression_ratio": 0.8571428571428571,
+"end": 12.0,
+"id": 0,
+"no_speech_prob": 0.0,
+"seek": 0,
+"start": 0.0,
+"temperature": 0.6,
+"text": "first part 3",
+"tokens": []
+},
+{
+"avg_logprob": 0.0,
+"compression_ratio": 0.8571428571428571,
+"end": 24.0,
+"id": 1,
+"no_speech_prob": 0.0,
+"seek": 0,
+"start": 12.0,
+"temperature": 0.6,
+"text": "second part",
+"tokens": []
+},
+{
+"avg_logprob": 0.0,
+"compression_ratio": 0.8571428571428571,
+"end": 42.0,
+"id": 2,
+"no_speech_prob": 0.0,
+"seek": 0,
+"start": 30.0,
+"temperature": 0.6,
+"text": "first part 7",
+"tokens": []
+},
+{
+"avg_logprob": 0.0,
+"compression_ratio": 0.8571428571428571,
+"end": 54.0,
+"id": 3,
+"no_speech_prob": 0.0,
+"seek": 0,
+"start": 42.0,
+"temperature": 0.6,
+"text": "second part",
+"tokens": []
+},
+{
+"avg_logprob": 0.0,
+"compression_ratio": 0.8620689655172413,
+"end": 64.0,
+"id": 4,
+"no_speech_prob": 0.0,
+"seek": 0,
+"start": 60.0,
+"temperature": 0.6,
+"text": "first part 11",
+"tokens": []
+},
+{
+"avg_logprob": 0.0,
+"compression_ratio": 0.8620689655172413,
+"end": 68.0,
+"id": 5,
+"no_speech_prob": 0.0,
+"seek": 0,
+"start": 64.0,
+"temperature": 0.6,
+"text": "second part",
+"tokens": []
+}
+],
+"task": "transcribe",
+"text": "first part 3 second part first part 7 second part first part 11 second part",
+"usage": {
+"seconds": 70,
+"type": "duration"
+}
+}
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 30.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"temperature": 0.2,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 30.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"temperature": 0.4,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 30.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"temperature": 0.6,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 30.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 30.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"language": "en",
+"temperature": 0.2,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 30.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"language": "en",
+"temperature": 0.4,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 30.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"language": "en",
+"temperature": 0.6,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 30.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 10.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"language": "en",
+"temperature": 0.2,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 10.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"language": "en",
+"temperature": 0.4,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 10.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"language": "en",
+"temperature": 0.6,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 10.0,
+"streaming": false,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_a_missing_or_empty_upload_is_refused_alike[empty-file]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+400,
+{
+"error": {
+"code": 400,
+"message": "audio/transcriptions received an empty 'file'",
+"type": "invalid_request_error"
+}
+}
+]
+},
+[]
+]
+},
+true
+]
+},
+"test_a_missing_or_empty_upload_is_refused_alike[no-file]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+400,
+{
+"error": {
+"code": 400,
+"message": "audio/transcriptions requires a 'file' upload",
+"type": "invalid_request_error"
+}
+}
+]
+},
+[]
+]
+},
+true
+]
+},
+"test_a_model_without_the_route_is_a_404_alike#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+404,
+{
+"error": {
+"code": 404,
+"message": "Model 'kokoro' does not support this endpoint",
+"type": "invalid_request_error"
+}
+}
+]
+},
+[]
+]
+},
+true
+]
+},
+"test_a_parallel_window_that_stops_inside_a_segment_decodes_its_tail_alike[json]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+{
+"text": "the window of 28.22 s, caf\u00e9 the window of 28.28 s, caf\u00e9 the window of 13.50 s, caf\u00e9"
+}
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 28.22,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 28.28,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 13.5,
+"streaming": false,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_a_parallel_window_that_stops_inside_a_segment_decodes_its_tail_alike[stream]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+[
+{
+"delta": " the",
+"type": "transcript.text.delta"
+},
+{
+"delta": " wind",
+"type": "transcript.text.delta"
+},
+{
+"delta": "ow of",
+"type": "transcript.text.delta"
+},
+{
+"delta": " 28.2",
+"type": "transcript.text.delta"
+},
+{
+"delta": "2 s, ",
+"type": "transcript.text.delta"
+},
+{
+"delta": "caf\u00e9",
+"type": "transcript.text.delta"
+},
+{
+"delta": " ",
+"type": "transcript.text.delta"
+},
+{
+"delta": " the",
+"type": "transcript.text.delta"
+},
+{
+"delta": " wind",
+"type": "transcript.text.delta"
+},
+{
+"delta": "ow of",
+"type": "transcript.text.delta"
+},
+{
+"delta": " 28.2",
+"type": "transcript.text.delta"
+},
+{
+"delta": "8 s, ",
+"type": "transcript.text.delta"
+},
+{
+"delta": "caf\u00e9",
+"type": "transcript.text.delta"
+},
+{
+"delta": " ",
+"type": "transcript.text.delta"
+},
+{
+"delta": " the",
+"type": "transcript.text.delta"
+},
+{
+"delta": " wind",
+"type": "transcript.text.delta"
+},
+{
+"delta": "ow of",
+"type": "transcript.text.delta"
+},
+{
+"delta": " 13.5",
+"type": "transcript.text.delta"
+},
+{
+"delta": "0 s, ",
+"type": "transcript.text.delta"
+},
+{
+"delta": "caf\u00e9",
+"type": "transcript.text.delta"
+},
+{
+"text": "the window of 28.22 s, caf\u00e9 the window of 28.28 s, caf\u00e9 the window of 13.50 s, caf\u00e9",
+"type": "transcript.text.done",
+"usage": {
+"seconds": 70,
+"type": "duration"
+}
+},
+"[DONE]"
+]
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 28.22,
+"streaming": true,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 28.28,
+"streaming": true,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 13.5,
+"streaming": true,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_a_parallel_window_that_stops_inside_a_segment_decodes_its_tail_alike[verbose]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+{
+"duration": 70.0,
+"language": "en",
+"segments": [
+{
+"avg_logprob": 0.0,
+"compression_ratio": 0.0,
+"end": 11.29,
+"id": 0,
+"no_speech_prob": 0.0,
+"seek": 0,
+"start": 0.0,
+"temperature": 0.0,
+"text": "first part 0",
+"tokens": []
+},
+{
+"avg_logprob": 0.0,
+"compression_ratio": 0.0,
+"end": 22.58,
+"id": 1,
+"no_speech_prob": 0.0,
+"seek": 0,
+"start": 11.29,
+"temperature": 0.0,
+"text": "second part",
+"tokens": []
+},
+{
+"avg_logprob": 0.0,
+"compression_ratio": 0.0,
+"end": 24.839999999999996,
+"id": 2,
+"no_speech_prob": 0.0,
+"seek": 0,
+"start": 22.58,
+"temperature": 0.0,
+"text": "first part 3",
+"tokens": []
+},
+{
+"avg_logprob": 0.0,
+"compression_ratio": 0.0,
+"end": 27.089999999999996,
+"id": 3,
+"no_speech_prob": 0.0,
+"seek": 0,
+"start": 24.839999999999996,
+"temperature": 0.0,
+"text": "second part",
+"tokens": []
+},
+{
+"avg_logprob": 0.0,
+"compression_ratio": 0.0,
+"end": 39.53,
+"id": 4,
+"no_speech_prob": 0.0,
+"seek": 0,
+"start": 28.22,
+"temperature": 0.0,
+"text": "first part 1",
+"tokens": []
+},
+{
+"avg_logprob": 0.0,
+"compression_ratio": 0.0,
+"end": 50.84,
+"id": 5,
+"no_speech_prob": 0.0,
+"seek": 0,
+"start": 39.53,
+"temperature": 0.0,
+"text": "second part",
+"tokens": []
+},
+{
+"avg_logprob": 0.0,
+"compression_ratio": 0.0,
+"end": 53.1,
+"id": 6,
+"no_speech_prob": 0.0,
+"seek": 0,
+"start": 50.84,
+"temperature": 0.0,
+"text": "first part 4",
+"tokens": []
+},
+{
+"avg_logprob": 0.0,
+"compression_ratio": 0.0,
+"end": 55.370000000000005,
+"id": 7,
+"no_speech_prob": 0.0,
+"seek": 0,
+"start": 53.1,
+"temperature": 0.0,
+"text": "second part",
+"tokens": []
+},
+{
+"avg_logprob": 0.0,
+"compression_ratio": 0.0,
+"end": 61.9,
+"id": 8,
+"no_speech_prob": 0.0,
+"seek": 0,
+"start": 56.5,
+"temperature": 0.0,
+"text": "first part 2",
+"tokens": []
+},
+{
+"avg_logprob": 0.0,
+"compression_ratio": 0.0,
+"end": 67.3,
+"id": 9,
+"no_speech_prob": 0.0,
+"seek": 0,
+"start": 61.9,
+"temperature": 0.0,
+"text": "second part",
+"tokens": []
+},
+{
+"avg_logprob": 0.0,
+"compression_ratio": 0.0,
+"end": 68.38,
+"id": 10,
+"no_speech_prob": 0.0,
+"seek": 0,
+"start": 67.3,
+"temperature": 0.0,
+"text": "first part 5",
+"tokens": []
+},
+{
+"avg_logprob": 0.0,
+"compression_ratio": 0.0,
+"end": 69.46,
+"id": 11,
+"no_speech_prob": 0.0,
+"seek": 0,
+"start": 68.38,
+"temperature": 0.0,
+"text": "second part",
+"tokens": []
+}
+],
+"task": "transcribe",
+"text": "first part 0 second part first part 3 second part cut off first part 1 second part first part 4 second part cut off first part 2 second part first part 5 second part cut off",
+"usage": {
+"seconds": 70,
+"type": "duration"
+}
+}
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 28.22,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 28.28,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 13.5,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 5.64,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 5.66,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 2.7,
+"streaming": false,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_a_refused_request_reads_as_pythons[bad-format]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+400,
+{
+"error": {
+"code": 400,
+"message": "response_format must be one of ['json', 'text', 'verbose_json', 'srt', 'vtt']; got 'xml'",
+"type": "invalid_request_error"
+}
+}
+]
+},
+[]
+]
+},
+true
+]
+},
+"test_a_refused_request_reads_as_pythons[bad-knob-order]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+400,
+{
+"error": {
+"code": 400,
+"message": "top_k must be an integer >= 0 (0 is off); got 1.5",
+"type": "invalid_request_error"
+}
+}
+]
+},
+[]
+]
+},
+true
+]
+},
+"test_a_refused_request_reads_as_pythons[bad-knob]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+400,
+{
+"error": {
+"code": 400,
+"message": "top_p must be a finite number in (0, 1] (1 is off; greedy is temperature 0); got 2",
+"type": "invalid_request_error"
+}
+}
+]
+},
+[]
+]
+},
+true
+]
+},
+"test_a_refused_request_reads_as_pythons[bad-long-form]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+400,
+{
+"error": {
+"code": 400,
+"message": "long_form must be one of ['sequential', 'parallel']; got 'batch'",
+"type": "invalid_request_error"
+}
+}
+]
+},
+[]
+]
+},
+true
+]
+},
+"test_a_refused_request_reads_as_pythons[granularities-not-a-list]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+400,
+{
+"error": {
+"code": 400,
+"message": "1 validation error for TranscriptionRequest\ntimestamp_granularities\n  Input should be a valid list [type=list_type, input_value='word', input_type=str]\n    For further information visit https://errors.pydantic.dev/2.14/v/list_type",
+"type": "invalid_request_error"
+}
+}
+]
+},
+[]
+]
+},
+true
+]
+},
+"test_a_refused_request_reads_as_pythons[long-form-not-a-string]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+400,
+{
+"error": {
+"code": 400,
+"message": "long_form must be one of ['sequential', 'parallel']; got [1]",
+"type": "invalid_request_error"
+}
+}
+]
+},
+[]
+]
+},
+true
+]
+},
+"test_a_refused_request_reads_as_pythons[pydantic-several]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+400,
+{
+"error": {
+"code": 400,
+"message": "2 validation errors for TranscriptionRequest\nstream\n  Input should be a valid boolean, unable to interpret input [type=bool_parsing, input_value='maybe', input_type=str]\n    For further information visit https://errors.pydantic.dev/2.14/v/bool_parsing\nseed\n  Input should be a valid integer, unable to parse string as an integer [type=int_parsing, input_value='x', input_type=str]\n    For further information visit https://errors.pydantic.dev/2.14/v/int_parsing",
+"type": "invalid_request_error"
+}
+}
+]
+},
+[]
+]
+},
+true
+]
+},
+"test_a_refused_request_reads_as_pythons[response-format-null]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+400,
+{
+"error": {
+"code": 400,
+"message": "response_format must be one of ['json', 'text', 'verbose_json', 'srt', 'vtt']; got 'null'",
+"type": "invalid_request_error"
+}
+}
+]
+},
+[]
+]
+},
+true
+]
+},
+"test_a_refused_request_reads_as_pythons[seed-fractional]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+400,
+{
+"error": {
+"code": 400,
+"message": "1 validation error for TranscriptionRequest\nseed\n  Input should be a valid integer, got a number with a fractional part [type=int_from_float, input_value=5.5, input_type=float]\n    For further information visit https://errors.pydantic.dev/2.14/v/int_from_float",
+"type": "invalid_request_error"
+}
+}
+]
+},
+[]
+]
+},
+true
+]
+},
+"test_a_refused_request_reads_as_pythons[seed-past-int64]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+400,
+{
+"error": {
+"code": 400,
+"message": "seed must fit in a signed 64-bit integer, got 1180591620717411303424.",
+"type": "invalid_request_error"
+}
+}
+]
+},
+[]
+]
+},
+true
+]
+},
+"test_a_refused_request_reads_as_pythons[temperature-not-a-number]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+400,
+{
+"error": {
+"code": 400,
+"message": "1 validation error for TranscriptionRequest\ntemperature\n  Input should be a valid number, unable to parse string as a number [type=float_parsing, input_value='hot', input_type=str]\n    For further information visit https://errors.pydantic.dev/2.14/v/float_parsing",
+"type": "invalid_request_error"
+}
+}
+]
+},
+[]
+]
+},
+true
+]
+},
+"test_a_refused_request_reads_as_pythons[window-not-a-number]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+400,
+{
+"error": {
+"code": 400,
+"message": "window_seconds must be between 5 and 30 for this model",
+"type": "invalid_request_error"
+}
+}
+]
+},
+[]
+]
+},
+true
+]
+},
+"test_a_refused_request_reads_as_pythons[window-too-short]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+400,
+{
+"error": {
+"code": 400,
+"message": "window_seconds must be between 5 and 30 for this model",
+"type": "invalid_request_error"
+}
+}
+]
+},
+[]
+]
+},
+true
+]
+},
+"test_an_upload_no_decoder_reads_goes_whole_to_the_model_alike#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+{
+"duration": null,
+"language": null,
+"segments": [],
+"task": "transcribe",
+"text": "hello",
+"usage": {
+"seconds": 0,
+"type": "duration"
+}
+}
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": null,
+"streaming": false,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_an_upload_past_the_cap_is_a_413_alike#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+413,
+{
+"error": {
+"code": 413,
+"message": "audio is 1860 s; the limit is 1800 s",
+"type": "invalid_request_error"
+}
+}
+]
+},
+[]
+]
+},
+true
+]
+},
+"test_every_asr_adapter_answers_as_the_python_route[canary-0]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+{
+"text": "heard 39.66 s heard 30.34 s"
+}
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"language": "de",
+"target_language": "de"
+},
+"out": [
+"text"
+],
+"seconds": 39.66,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"language": "de",
+"target_language": "de"
+},
+"out": [
+"text"
+],
+"seconds": 30.34,
+"streaming": false,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_every_asr_adapter_answers_as_the_python_route[canary-1]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+{
+"text": "heard 39.66 s heard 30.34 s"
+}
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"language": "fr",
+"target_language": "en"
+},
+"out": [
+"text"
+],
+"seconds": 39.66,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"language": "fr",
+"target_language": "en"
+},
+"out": [
+"text"
+],
+"seconds": 30.34,
+"streaming": false,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_every_asr_adapter_answers_as_the_python_route[canary-2]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+400,
+{
+"error": {
+"code": 400,
+"message": "Canary translates to or from English only; got 'fr' -> 'de'",
+"type": "invalid_request_error"
+}
+}
+]
+},
+[]
+]
+},
+true
+]
+},
+"test_every_asr_adapter_answers_as_the_python_route[canary-3]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+400,
+{
+"error": {
+"code": 400,
+"message": "Canary does not support language 'xx'; supported: bg, hr, cs, da, nl, en, et, fi, fr, de, el, hu, it, lv, lt, mt, pl, pt, ro, sk, sl, es, sv, ru, uk",
+"type": "invalid_request_error"
+}
+}
+]
+},
+[]
+]
+},
+true
+]
+},
+"test_every_asr_adapter_answers_as_the_python_route[canary-4]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+400,
+{
+"error": {
+"code": 400,
+"message": "punctuation must be true or false; got 'yes'",
+"type": "invalid_request_error"
+}
+}
+]
+},
+[]
+]
+},
+true
+]
+},
+"test_every_asr_adapter_answers_as_the_python_route[canary-5]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+400,
+{
+"error": {
+"code": 400,
+"message": "task must be 'transcribe' or 'translate'; got 'summarize'",
+"type": "invalid_request_error"
+}
+}
+]
+},
+[]
+]
+},
+true
+]
+},
+"test_every_asr_adapter_answers_as_the_python_route[canary-6]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+400,
+{
+"error": {
+"code": 400,
+"message": "Canary does not produce timestamps; leave timestamp_granularities unset",
+"type": "invalid_request_error"
+}
+}
+]
+},
+[]
+]
+},
+true
+]
+},
+"test_every_asr_adapter_answers_as_the_python_route[canary-7]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+400,
+{
+"error": {
+"code": 400,
+"message": "a language is a code such as 'en'; got 5",
+"type": "invalid_request_error"
+}
+}
+]
+},
+[]
+]
+},
+true
+]
+},
+"test_every_asr_adapter_answers_as_the_python_route[canary-8]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+[
+{
+"delta": "hear",
+"type": "transcript.text.delta"
+},
+{
+"delta": "d 39.",
+"type": "transcript.text.delta"
+},
+{
+"delta": "66 s",
+"type": "transcript.text.delta"
+},
+{
+"delta": " ",
+"type": "transcript.text.delta"
+},
+{
+"delta": "hear",
+"type": "transcript.text.delta"
+},
+{
+"delta": "d 30.",
+"type": "transcript.text.delta"
+},
+{
+"delta": "34 s",
+"type": "transcript.text.delta"
+},
+{
+"text": "heard 39.66 s heard 30.34 s",
+"type": "transcript.text.done",
+"usage": {
+"seconds": 70,
+"type": "duration"
+}
+},
+"[DONE]"
+]
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"language": "en",
+"target_language": "en"
+},
+"out": [
+"text"
+],
+"seconds": 39.66,
+"streaming": true,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"language": "en",
+"target_language": "en"
+},
+"out": [
+"text"
+],
+"seconds": 30.34,
+"streaming": true,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_every_asr_adapter_answers_as_the_python_route[canary_qwen-0]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+{
+"text": "heard 39.66 s heard 30.34 s"
+}
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"language": "en_US"
+},
+"out": [
+"text"
+],
+"seconds": 39.66,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"language": "en_US"
+},
+"out": [
+"text"
+],
+"seconds": 30.34,
+"streaming": false,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_every_asr_adapter_answers_as_the_python_route[canary_qwen-1]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+400,
+{
+"error": {
+"code": 400,
+"message": "Canary-Qwen transcribes English only",
+"type": "invalid_request_error"
+}
+}
+]
+},
+[]
+]
+},
+true
+]
+},
+"test_every_asr_adapter_answers_as_the_python_route[canary_qwen-2]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+400,
+{
+"error": {
+"code": 400,
+"message": "Canary-Qwen only transcribes; task must be 'transcribe'; got 'translate'",
+"type": "invalid_request_error"
+}
+}
+]
+},
+[]
+]
+},
+true
+]
+},
+"test_every_asr_adapter_answers_as_the_python_route[canary_qwen-3]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+[
+{
+"delta": "hear",
+"type": "transcript.text.delta"
+},
+{
+"delta": "d 39.",
+"type": "transcript.text.delta"
+},
+{
+"delta": "66 s",
+"type": "transcript.text.delta"
+},
+{
+"delta": " ",
+"type": "transcript.text.delta"
+},
+{
+"delta": "hear",
+"type": "transcript.text.delta"
+},
+{
+"delta": "d 30.",
+"type": "transcript.text.delta"
+},
+{
+"delta": "34 s",
+"type": "transcript.text.delta"
+},
+{
+"text": "heard 39.66 s heard 30.34 s",
+"type": "transcript.text.done",
+"usage": {
+"seconds": 70,
+"type": "duration"
+}
+},
+"[DONE]"
+]
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 39.66,
+"streaming": true,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 30.34,
+"streaming": true,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_every_asr_adapter_answers_as_the_python_route[higgs_audio-0]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+{
+"text": "heard 28.22 s heard 28.28 s heard 13.5 s"
+}
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 28.22,
+"streaming": false,
+"text": "Transcribe, please."
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 28.28,
+"streaming": false,
+"text": "Transcribe, please."
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 13.5,
+"streaming": false,
+"text": "Transcribe, please."
+}
+]
+]
+},
+true
+]
+},
+"test_every_asr_adapter_answers_as_the_python_route[higgs_audio-1]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+"1\n00:00:00,000 --> 00:00:28,220\nheard 28.22 s\n\n2\n00:00:28,220 --> 00:00:56,500\nheard 28.28 s\n\n3\n00:00:56,500 --> 00:01:10,000\nheard 13.5 s\n"
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 28.22,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 28.28,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 13.5,
+"streaming": false,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_every_asr_adapter_answers_as_the_python_route[nemotron_asr-0]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+{
+"text": "heard 70.0 s"
+}
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"language": "xx"
+},
+"out": [
+"text"
+],
+"seconds": 70.0,
+"streaming": false,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_every_asr_adapter_answers_as_the_python_route[nemotron_asr-1]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+{
+"text": "heard 70.0 s"
+}
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 70.0,
+"streaming": false,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_every_asr_adapter_answers_as_the_python_route[nemotron_asr-2]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+400,
+{
+"error": {
+"code": 400,
+"message": "this model only transcribes; task must be 'transcribe'; got 'translate'",
+"type": "invalid_request_error"
+}
+}
+]
+},
+[]
+]
+},
+true
+]
+},
+"test_every_asr_adapter_answers_as_the_python_route[nemotron_asr-3]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+[
+{
+"delta": "hear",
+"type": "transcript.text.delta"
+},
+{
+"delta": "d 70.",
+"type": "transcript.text.delta"
+},
+{
+"delta": "0 s",
+"type": "transcript.text.delta"
+},
+{
+"text": "heard 70.0 s",
+"type": "transcript.text.done",
+"usage": {
+"seconds": 70,
+"type": "duration"
+}
+},
+"[DONE]"
+]
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 70.0,
+"streaming": true,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_every_asr_adapter_answers_as_the_python_route[omnilingual_asr_ctc_300m-0]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+{
+"duration": 25.0,
+"language": null,
+"segments": [
+{
+"avg_logprob": 0.0,
+"compression_ratio": 0.0,
+"end": 11.1,
+"id": 0,
+"no_speech_prob": 0.0,
+"seek": 0,
+"start": 0.0,
+"temperature": 0.0,
+"text": "heard 11.1 s",
+"tokens": []
+},
+{
+"avg_logprob": 0.0,
+"compression_ratio": 0.0,
+"end": 25.0,
+"id": 1,
+"no_speech_prob": 0.0,
+"seek": 0,
+"start": 11.1,
+"temperature": 0.0,
+"text": "heard 13.9 s",
+"tokens": []
+}
+],
+"task": "transcribe",
+"text": "heard 11.1 s heard 13.9 s",
+"usage": {
+"seconds": 25,
+"type": "duration"
+}
+}
+]
+},
+[
+{
+"in": [
+"audio"
+],
+"mk": {
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 11.1,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio"
+],
+"mk": {
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 13.9,
+"streaming": false,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_every_asr_adapter_answers_as_the_python_route[omnilingual_asr_ctc_300m-1]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+"WEBVTT\n\n00:00:00.000 --> 00:00:04.000\nheard 4.0 s\n\n00:00:04.000 --> 00:00:08.250\nheard 4.25 s\n\n00:00:08.250 --> 00:00:11.933\nheard 3.6834 s\n\n00:00:11.933 --> 00:00:15.389\nheard 3.4556 s\n\n00:00:15.389 --> 00:00:19.694\nheard 4.3056 s\n\n00:00:19.694 --> 00:00:25.000\nheard 5.3055 s\n"
+]
+},
+[
+{
+"in": [
+"audio"
+],
+"mk": {
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 4.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio"
+],
+"mk": {
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 4.25,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio"
+],
+"mk": {
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 3.6834,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio"
+],
+"mk": {
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 3.4556,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio"
+],
+"mk": {
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 4.3056,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio"
+],
+"mk": {
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 5.3055,
+"streaming": false,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_every_asr_adapter_answers_as_the_python_route[omnilingual_asr_ctc_300m-2]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+[
+{
+"delta": " hear",
+"type": "transcript.text.delta"
+},
+{
+"delta": "d 11.",
+"type": "transcript.text.delta"
+},
+{
+"delta": "1 s",
+"type": "transcript.text.delta"
+},
+{
+"delta": " ",
+"type": "transcript.text.delta"
+},
+{
+"delta": " hear",
+"type": "transcript.text.delta"
+},
+{
+"delta": "d 13.",
+"type": "transcript.text.delta"
+},
+{
+"delta": "9 s",
+"type": "transcript.text.delta"
+},
+{
+"text": "heard 11.1 s heard 13.9 s",
+"type": "transcript.text.done",
+"usage": {
+"seconds": 25,
+"type": "duration"
+}
+},
+"[DONE]"
+]
+]
+},
+[
+{
+"in": [
+"audio"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 11.1,
+"streaming": true,
+"text": ""
+},
+{
+"in": [
+"audio"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 13.9,
+"streaming": true,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_every_asr_adapter_answers_as_the_python_route[parakeet-0]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+{
+"text": "heard 70.0 s"
+}
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"language": "auto"
+},
+"out": [
+"text"
+],
+"seconds": 70.0,
+"streaming": false,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_every_asr_adapter_answers_as_the_python_route[parakeet-1]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+400,
+{
+"error": {
+"code": 400,
+"message": "unsupported language 'xx'; Parakeet detects one of: bg, hr, cs, da, nl, en, et, fi, fr, de, el, hu, it, lv, lt, mt, pl, pt, ro, sk, sl, es, sv, ru, uk",
+"type": "invalid_request_error"
+}
+}
+]
+},
+[]
+]
+},
+true
+]
+},
+"test_every_asr_adapter_answers_as_the_python_route[parakeet-2]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+{
+"text": "heard 70.0 s"
+}
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 70.0,
+"streaming": false,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_every_asr_adapter_answers_as_the_python_route[parakeet-3]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+{
+"text": "heard 70.0 s"
+}
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 70.0,
+"streaming": false,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_every_asr_adapter_answers_as_the_python_route[parakeet-4]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+[
+{
+"delta": "hear",
+"type": "transcript.text.delta"
+},
+{
+"delta": "d 70.",
+"type": "transcript.text.delta"
+},
+{
+"delta": "0 s",
+"type": "transcript.text.delta"
+},
+{
+"text": "heard 70.0 s",
+"type": "transcript.text.done",
+"usage": {
+"seconds": 70,
+"type": "duration"
+}
+},
+"[DONE]"
+]
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 70.0,
+"streaming": true,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_every_asr_adapter_answers_as_the_python_route[qwen3_asr-0]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+{
+"duration": 70.0,
+"language": "de",
+"segments": [
+{
+"avg_logprob": 0.0,
+"compression_ratio": 0.0,
+"end": 28.22,
+"id": 0,
+"no_speech_prob": 0.0,
+"seek": 0,
+"start": 0.0,
+"temperature": 0.0,
+"text": "guten Tag 0 jajajajajajajajajajajajajajajajajajajajajajajajaja",
+"tokens": []
+},
+{
+"avg_logprob": 0.0,
+"compression_ratio": 0.0,
+"end": 56.5,
+"id": 1,
+"no_speech_prob": 0.0,
+"seek": 0,
+"start": 28.22,
+"temperature": 0.0,
+"text": "guten Tag 1 jajajajajajajajajajajajajajajajajajajajajajajajaja",
+"tokens": []
+},
+{
+"avg_logprob": 0.0,
+"compression_ratio": 0.0,
+"end": 70.0,
+"id": 2,
+"no_speech_prob": 0.0,
+"seek": 0,
+"start": 56.5,
+"temperature": 0.0,
+"text": "guten Tag 2 jajajajajajajajajajajajajajajajajajajajajajajajaja",
+"tokens": []
+}
+],
+"task": "transcribe",
+"text": "guten Tag 0 ja guten Tag 1 ja guten Tag 2 ja",
+"usage": {
+"seconds": 70,
+"type": "duration"
+}
+}
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 28.22,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 28.28,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 13.5,
+"streaming": false,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_every_asr_adapter_answers_as_the_python_route[qwen3_asr-1]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+{
+"text": "hello again world world world hello again world world world hello again world world world"
+}
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"language": "en"
+},
+"out": [
+"text"
+],
+"seconds": 28.22,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"language": "en"
+},
+"out": [
+"text"
+],
+"seconds": 28.28,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"language": "en"
+},
+"out": [
+"text"
+],
+"seconds": 13.5,
+"streaming": false,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_every_asr_adapter_answers_as_the_python_route[qwen3_asr-2]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+[
+{
+"delta": "langu",
+"type": "transcript.text.delta"
+},
+{
+"delta": " ",
+"type": "transcript.text.delta"
+},
+{
+"delta": "langu",
+"type": "transcript.text.delta"
+},
+{
+"delta": " ",
+"type": "transcript.text.delta"
+},
+{
+"delta": "langu",
+"type": "transcript.text.delta"
+},
+{
+"text": "guten Tag 0 ja guten Tag 1 ja guten Tag 2 ja",
+"type": "transcript.text.done",
+"usage": {
+"seconds": 70,
+"type": "duration"
+}
+},
+"[DONE]"
+]
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 28.22,
+"streaming": true,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 28.28,
+"streaming": true,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 13.5,
+"streaming": true,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_every_asr_adapter_answers_as_the_python_route[qwen3_asr-3]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+{
+"duration": 70.0,
+"language": "de",
+"segments": [
+{
+"avg_logprob": 0.0,
+"compression_ratio": 0.0,
+"end": 70.0,
+"id": 0,
+"no_speech_prob": 0.0,
+"seek": 0,
+"start": 0.0,
+"temperature": 0.0,
+"text": "guten Tag 0 jajajajajajajajajajajajajajajajajajajajajajajajaja",
+"tokens": []
+}
+],
+"task": "transcribe",
+"text": "guten Tag 0 ja",
+"usage": {
+"seconds": 70,
+"type": "duration"
+}
+}
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 70.0,
+"streaming": false,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_every_asr_adapter_answers_as_the_python_route[qwen3_asr-4]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+400,
+{
+"error": {
+"code": 400,
+"message": "the prompt must not contain <|audio_pad|>",
+"type": "invalid_request_error"
+}
+}
+]
+},
+[]
+]
+},
+true
+]
+},
+"test_every_generation_knob_is_refused_alike[do_sample--1000000000]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+400,
+{
+"error": {
+"code": 400,
+"message": "do_sample must be true or false; got -1000000000",
+"type": "invalid_request_error"
+}
+}
+]
+},
+[]
+]
+},
+true
+]
+},
+"test_every_generation_knob_is_refused_alike[do_sample-nope]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+400,
+{
+"error": {
+"code": 400,
+"message": "do_sample must be true or false; got 'nope'",
+"type": "invalid_request_error"
+}
+}
+]
+},
+[]
+]
+},
+true
+]
+},
+"test_every_generation_knob_is_refused_alike[enable_thinking--1000000000]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+400,
+{
+"error": {
+"code": 400,
+"message": "enable_thinking must be true or false; got -1000000000",
+"type": "invalid_request_error"
+}
+}
+]
+},
+[]
+]
+},
+true
+]
+},
+"test_every_generation_knob_is_refused_alike[enable_thinking-nope]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+400,
+{
+"error": {
+"code": 400,
+"message": "enable_thinking must be true or false; got 'nope'",
+"type": "invalid_request_error"
+}
+}
+]
+},
+[]
+]
+},
+true
+]
+},
+"test_every_generation_knob_is_refused_alike[fps--1000000000]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+400,
+{
+"error": {
+"code": 400,
+"message": "fps must be a finite number > 0; got -1000000000",
+"type": "invalid_request_error"
+}
+}
+]
+},
+[]
+]
+},
+true
+]
+},
+"test_every_generation_knob_is_refused_alike[fps-nope]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+400,
+{
+"error": {
+"code": 400,
+"message": "fps must be a number > 0; got 'nope'",
+"type": "invalid_request_error"
+}
+}
+]
+},
+[]
+]
+},
+true
+]
+},
+"test_every_generation_knob_is_refused_alike[guidance_scale--1000000000]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+[
+{
+"delta": "hello",
+"type": "transcript.text.delta"
+},
+{
+"text": "hello",
+"type": "transcript.text.done",
+"usage": {
+"seconds": 6,
+"type": "duration"
+}
+},
+"[DONE]"
+]
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"guidance_scale": -1000000000
+},
+"out": [
+"text"
+],
+"seconds": 6.0,
+"streaming": true,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_every_generation_knob_is_refused_alike[guidance_scale-nope]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+400,
+{
+"error": {
+"code": 400,
+"message": "guidance_scale must be a number of any sign; got 'nope'",
+"type": "invalid_request_error"
+}
+}
+]
+},
+[]
+]
+},
+true
+]
+},
+"test_every_generation_knob_is_refused_alike[height--1000000000]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+400,
+{
+"error": {
+"code": 400,
+"message": "height must be an integer >= 1; got -1000000000",
+"type": "invalid_request_error"
+}
+}
+]
+},
+[]
+]
+},
+true
+]
+},
+"test_every_generation_knob_is_refused_alike[height-nope]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+400,
+{
+"error": {
+"code": 400,
+"message": "height must be an integer >= 1; got 'nope'",
+"type": "invalid_request_error"
+}
+}
+]
+},
+[]
+]
+},
+true
+]
+},
+"test_every_generation_knob_is_refused_alike[ignore_eos--1000000000]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+400,
+{
+"error": {
+"code": 400,
+"message": "ignore_eos must be true or false; got -1000000000",
+"type": "invalid_request_error"
+}
+}
+]
+},
+[]
+]
+},
+true
+]
+},
+"test_every_generation_knob_is_refused_alike[ignore_eos-nope]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+400,
+{
+"error": {
+"code": 400,
+"message": "ignore_eos must be true or false; got 'nope'",
+"type": "invalid_request_error"
+}
+}
+]
+},
+[]
+]
+},
+true
+]
+},
+"test_every_generation_knob_is_refused_alike[max_output_tokens--1000000000]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+400,
+{
+"error": {
+"code": 400,
+"message": "max_output_tokens must be an integer >= 1; got -1000000000",
+"type": "invalid_request_error"
+}
+}
+]
+},
+[]
+]
+},
+true
+]
+},
+"test_every_generation_knob_is_refused_alike[max_output_tokens-nope]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+400,
+{
+"error": {
+"code": 400,
+"message": "max_output_tokens must be an integer >= 1; got 'nope'",
+"type": "invalid_request_error"
+}
+}
+]
+},
+[]
+]
+},
+true
+]
+},
+"test_every_generation_knob_is_refused_alike[min_p--1000000000]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+400,
+{
+"error": {
+"code": 400,
+"message": "min_p must be a finite number in [0, 1] (0 is off); got -1000000000",
+"type": "invalid_request_error"
+}
+}
+]
+},
+[]
+]
+},
+true
+]
+},
+"test_every_generation_knob_is_refused_alike[min_p-nope]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+400,
+{
+"error": {
+"code": 400,
+"message": "min_p must be a number in [0, 1] (0 is off); got 'nope'",
+"type": "invalid_request_error"
+}
+}
+]
+},
+[]
+]
+},
+true
+]
+},
+"test_every_generation_knob_is_refused_alike[num_frames--1000000000]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+400,
+{
+"error": {
+"code": 400,
+"message": "num_frames must be an integer >= 1; got -1000000000",
+"type": "invalid_request_error"
+}
+}
+]
+},
+[]
+]
+},
+true
+]
+},
+"test_every_generation_knob_is_refused_alike[num_frames-nope]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+400,
+{
+"error": {
+"code": 400,
+"message": "num_frames must be an integer >= 1; got 'nope'",
+"type": "invalid_request_error"
+}
+}
+]
+},
+[]
+]
+},
+true
+]
+},
+"test_every_generation_knob_is_refused_alike[num_inference_steps--1000000000]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+400,
+{
+"error": {
+"code": 400,
+"message": "num_inference_steps must be an integer >= 1; got -1000000000",
+"type": "invalid_request_error"
+}
+}
+]
+},
+[]
+]
+},
+true
+]
+},
+"test_every_generation_knob_is_refused_alike[num_inference_steps-nope]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+400,
+{
+"error": {
+"code": 400,
+"message": "num_inference_steps must be an integer >= 1; got 'nope'",
+"type": "invalid_request_error"
+}
+}
+]
+},
+[]
+]
+},
+true
+]
+},
+"test_every_generation_knob_is_refused_alike[num_step--1000000000]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+400,
+{
+"error": {
+"code": 400,
+"message": "num_step must be an integer >= 1; got -1000000000",
+"type": "invalid_request_error"
+}
+}
+]
+},
+[]
+]
+},
+true
+]
+},
+"test_every_generation_knob_is_refused_alike[num_step-nope]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+400,
+{
+"error": {
+"code": 400,
+"message": "num_step must be an integer >= 1; got 'nope'",
+"type": "invalid_request_error"
+}
+}
+]
+},
+[]
+]
+},
+true
+]
+},
+"test_every_generation_knob_is_refused_alike[penalize_prompt--1000000000]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+400,
+{
+"error": {
+"code": 400,
+"message": "penalize_prompt must be true or false; got -1000000000",
+"type": "invalid_request_error"
+}
+}
+]
+},
+[]
+]
+},
+true
+]
+},
+"test_every_generation_knob_is_refused_alike[penalize_prompt-nope]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+400,
+{
+"error": {
+"code": 400,
+"message": "penalize_prompt must be true or false; got 'nope'",
+"type": "invalid_request_error"
+}
+}
+]
+},
+[]
+]
+},
+true
+]
+},
+"test_every_generation_knob_is_refused_alike[repetition_penalty--1000000000]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+400,
+{
+"error": {
+"code": 400,
+"message": "repetition_penalty must be a finite number > 0 (1 is off); got -1000000000",
+"type": "invalid_request_error"
+}
+}
+]
+},
+[]
+]
+},
+true
+]
+},
+"test_every_generation_knob_is_refused_alike[repetition_penalty-nope]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+400,
+{
+"error": {
+"code": 400,
+"message": "repetition_penalty must be a number > 0 (1 is off); got 'nope'",
+"type": "invalid_request_error"
+}
+}
+]
+},
+[]
+]
+},
+true
+]
+},
+"test_every_generation_knob_is_refused_alike[return_logprobs--1000000000]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+400,
+{
+"error": {
+"code": 400,
+"message": "return_logprobs must be true or false; got -1000000000",
+"type": "invalid_request_error"
+}
+}
+]
+},
+[]
+]
+},
+true
+]
+},
+"test_every_generation_knob_is_refused_alike[return_logprobs-nope]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+400,
+{
+"error": {
+"code": 400,
+"message": "return_logprobs must be true or false; got 'nope'",
+"type": "invalid_request_error"
+}
+}
+]
+},
+[]
+]
+},
+true
+]
+},
+"test_every_generation_knob_is_refused_alike[return_token_ids--1000000000]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+400,
+{
+"error": {
+"code": 400,
+"message": "return_token_ids must be true or false; got -1000000000",
+"type": "invalid_request_error"
+}
+}
+]
+},
+[]
+]
+},
+true
+]
+},
+"test_every_generation_knob_is_refused_alike[return_token_ids-nope]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+400,
+{
+"error": {
+"code": 400,
+"message": "return_token_ids must be true or false; got 'nope'",
+"type": "invalid_request_error"
+}
+}
+]
+},
+[]
+]
+},
+true
+]
+},
+"test_every_generation_knob_is_refused_alike[rollout_horizon--1000000000]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+400,
+{
+"error": {
+"code": 400,
+"message": "rollout_horizon must be an integer >= 0; got -1000000000",
+"type": "invalid_request_error"
+}
+}
+]
+},
+[]
+]
+},
+true
+]
+},
+"test_every_generation_knob_is_refused_alike[rollout_horizon-nope]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+400,
+{
+"error": {
+"code": 400,
+"message": "rollout_horizon must be an integer >= 0; got 'nope'",
+"type": "invalid_request_error"
+}
+}
+]
+},
+[]
+]
+},
+true
+]
+},
+"test_every_generation_knob_is_refused_alike[speed--1000000000]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+400,
+{
+"error": {
+"code": 400,
+"message": "speed must be a finite number > 0; got -1000000000",
+"type": "invalid_request_error"
+}
+}
+]
+},
+[]
+]
+},
+true
+]
+},
+"test_every_generation_knob_is_refused_alike[speed-nope]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+400,
+{
+"error": {
+"code": 400,
+"message": "speed must be a number > 0; got 'nope'",
+"type": "invalid_request_error"
+}
+}
+]
+},
+[]
+]
+},
+true
+]
+},
+"test_every_generation_knob_is_refused_alike[temperature--1000000000]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+400,
+{
+"error": {
+"code": 400,
+"message": "temperature must be a finite number >= 0 (0 is greedy); got -1000000000.0",
+"type": "invalid_request_error"
+}
+}
+]
+},
+[]
+]
+},
+true
+]
+},
+"test_every_generation_knob_is_refused_alike[temperature-nope]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+400,
+{
+"error": {
+"code": 400,
+"message": "1 validation error for TranscriptionRequest\ntemperature\n  Input should be a valid number, unable to parse string as a number [type=float_parsing, input_value='nope', input_type=str]\n    For further information visit https://errors.pydantic.dev/2.14/v/float_parsing",
+"type": "invalid_request_error"
+}
+}
+]
+},
+[]
+]
+},
+true
+]
+},
+"test_every_generation_knob_is_refused_alike[top_k--1000000000]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+400,
+{
+"error": {
+"code": 400,
+"message": "top_k must be an integer >= 0 (0 is off); got -1000000000",
+"type": "invalid_request_error"
+}
+}
+]
+},
+[]
+]
+},
+true
+]
+},
+"test_every_generation_knob_is_refused_alike[top_k-nope]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+400,
+{
+"error": {
+"code": 400,
+"message": "top_k must be an integer >= 0 (0 is off); got 'nope'",
+"type": "invalid_request_error"
+}
+}
+]
+},
+[]
+]
+},
+true
+]
+},
+"test_every_generation_knob_is_refused_alike[top_p--1000000000]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+400,
+{
+"error": {
+"code": 400,
+"message": "top_p must be a finite number in (0, 1] (1 is off; greedy is temperature 0); got -1000000000",
+"type": "invalid_request_error"
+}
+}
+]
+},
+[]
+]
+},
+true
+]
+},
+"test_every_generation_knob_is_refused_alike[top_p-nope]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+400,
+{
+"error": {
+"code": 400,
+"message": "top_p must be a number in (0, 1] (1 is off; greedy is temperature 0); got 'nope'",
+"type": "invalid_request_error"
+}
+}
+]
+},
+[]
+]
+},
+true
+]
+},
+"test_every_generation_knob_is_refused_alike[width--1000000000]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+400,
+{
+"error": {
+"code": 400,
+"message": "width must be an integer >= 1; got -1000000000",
+"type": "invalid_request_error"
+}
+}
+]
+},
+[]
+]
+},
+true
+]
+},
+"test_every_generation_knob_is_refused_alike[width-nope]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+400,
+{
+"error": {
+"code": 400,
+"message": "width must be an integer >= 1; got 'nope'",
+"type": "invalid_request_error"
+}
+}
+]
+},
+[]
+]
+},
+true
+]
+},
+"test_sequential_long_form_runs_as_the_python_route[closed-json]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+{
+"text": "first part 0 second part first part 2 second part first part 4 second part"
+}
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 30.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"initial_prompt": "first part 0 second part",
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 30.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 30.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"initial_prompt": "first part 0 second part first part 2 second part",
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 10.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 10.0,
+"streaming": false,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_sequential_long_form_runs_as_the_python_route[closed-pinned-temperature]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+{
+"text": "first part 0 second part first part 1 second part first part 2 second part"
+}
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"temperature": 0.3,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 30.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"initial_prompt": "first part 0 second part",
+"language": "en",
+"temperature": 0.3,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 30.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"initial_prompt": "first part 0 second part first part 1 second part",
+"language": "en",
+"temperature": 0.3,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 10.0,
+"streaming": false,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_sequential_long_form_runs_as_the_python_route[closed-srt]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+"1\n00:00:00,000 --> 00:00:12,000\nfirst part 0\n\n2\n00:00:12,000 --> 00:00:24,000\nsecond part\n\n3\n00:00:30,000 --> 00:00:42,000\nfirst part 2\n\n4\n00:00:42,000 --> 00:00:54,000\nsecond part\n\n5\n00:01:00,000 --> 00:01:04,000\nfirst part 4\n\n6\n00:01:04,000 --> 00:01:08,000\nsecond part\n"
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 30.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"initial_prompt": "first part 0 second part",
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 30.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 30.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"initial_prompt": "first part 0 second part first part 2 second part",
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 10.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 10.0,
+"streaming": false,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_sequential_long_form_runs_as_the_python_route[closed-stream]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+[
+{
+"delta": "first part 0 second part",
+"type": "transcript.text.delta"
+},
+{
+"delta": " ",
+"type": "transcript.text.delta"
+},
+{
+"delta": "first part 2 second part",
+"type": "transcript.text.delta"
+},
+{
+"delta": " ",
+"type": "transcript.text.delta"
+},
+{
+"delta": "first part 4 second part",
+"type": "transcript.text.delta"
+},
+{
+"text": "first part 0 second part first part 2 second part first part 4 second part",
+"type": "transcript.text.done",
+"usage": {
+"seconds": 70,
+"type": "duration"
+}
+},
+"[DONE]"
+]
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 30.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"initial_prompt": "first part 0 second part",
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 30.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 30.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"initial_prompt": "first part 0 second part first part 2 second part",
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 10.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 10.0,
+"streaming": false,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_sequential_long_form_runs_as_the_python_route[closed-verbose]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+{
+"duration": 70.0,
+"language": "en",
+"segments": [
+{
+"avg_logprob": 0.0,
+"compression_ratio": 0.8571428571428571,
+"end": 12.0,
+"id": 0,
+"no_speech_prob": 0.0,
+"seek": 0,
+"start": 0.0,
+"temperature": 0.0,
+"text": "first part 0",
+"tokens": []
+},
+{
+"avg_logprob": 0.0,
+"compression_ratio": 0.8571428571428571,
+"end": 24.0,
+"id": 1,
+"no_speech_prob": 0.0,
+"seek": 0,
+"start": 12.0,
+"temperature": 0.0,
+"text": "second part",
+"tokens": []
+},
+{
+"avg_logprob": 0.0,
+"compression_ratio": 0.8571428571428571,
+"end": 42.0,
+"id": 2,
+"no_speech_prob": 0.0,
+"seek": 0,
+"start": 30.0,
+"temperature": 0.0,
+"text": "first part 2",
+"tokens": []
+},
+{
+"avg_logprob": 0.0,
+"compression_ratio": 0.8571428571428571,
+"end": 54.0,
+"id": 3,
+"no_speech_prob": 0.0,
+"seek": 0,
+"start": 42.0,
+"temperature": 0.0,
+"text": "second part",
+"tokens": []
+},
+{
+"avg_logprob": 0.0,
+"compression_ratio": 0.8571428571428571,
+"end": 64.0,
+"id": 4,
+"no_speech_prob": 0.0,
+"seek": 0,
+"start": 60.0,
+"temperature": 0.0,
+"text": "first part 4",
+"tokens": []
+},
+{
+"avg_logprob": 0.0,
+"compression_ratio": 0.8571428571428571,
+"end": 68.0,
+"id": 5,
+"no_speech_prob": 0.0,
+"seek": 0,
+"start": 64.0,
+"temperature": 0.0,
+"text": "second part",
+"tokens": []
+}
+],
+"task": "transcribe",
+"text": "first part 0 second part first part 2 second part first part 4 second part",
+"usage": {
+"seconds": 70,
+"type": "duration"
+}
+}
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 30.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"initial_prompt": "first part 0 second part",
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 30.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 30.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"initial_prompt": "first part 0 second part first part 2 second part",
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 10.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 10.0,
+"streaming": false,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_sequential_long_form_runs_as_the_python_route[closed-window-seconds]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+{
+"text": "first part 0 second part first part 2 second part first part 4 second part first part 6 second part first part 8 second part first part 10 second part"
+}
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 12.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"initial_prompt": "first part 0 second part",
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 12.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 12.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"initial_prompt": "first part 0 second part first part 2 second part",
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 12.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 12.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"initial_prompt": "first part 0 second part first part 2 second part first part 4 second part",
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 12.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 12.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"initial_prompt": "first part 0 second part first part 2 second part first part 4 second part first part 6 second part",
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 12.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 12.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"initial_prompt": "first part 0 second part first part 2 second part first part 4 second part first part 6 second part first part 8 second part",
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 10.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 10.0,
+"streaming": false,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_sequential_long_form_runs_as_the_python_route[stops-inside-json]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+{
+"text": "first part 0 second part first part 2 second part first part 4 second part first part 6 second part first part 8 second part cut off"
+}
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 30.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"initial_prompt": "first part 0 second part",
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 30.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 30.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"initial_prompt": "first part 0 second part first part 2 second part",
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 22.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 22.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"initial_prompt": "first part 0 second part first part 2 second part first part 4 second part",
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 4.4,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 4.4,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"initial_prompt": "first part 0 second part first part 2 second part first part 4 second part first part 6 second part",
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 0.88,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 0.88,
+"streaming": false,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_sequential_long_form_runs_as_the_python_route[stops-inside-pinned-temperature]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+{
+"text": "first part 0 second part first part 1 second part first part 2 second part first part 3 second part first part 4 second part cut off"
+}
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"temperature": 0.3,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 30.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"initial_prompt": "first part 0 second part",
+"language": "en",
+"temperature": 0.3,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 30.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"initial_prompt": "first part 0 second part first part 1 second part",
+"language": "en",
+"temperature": 0.3,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 22.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"initial_prompt": "first part 0 second part first part 1 second part first part 2 second part",
+"language": "en",
+"temperature": 0.3,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 4.4,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"initial_prompt": "first part 0 second part first part 1 second part first part 2 second part first part 3 second part",
+"language": "en",
+"temperature": 0.3,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 0.88,
+"streaming": false,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_sequential_long_form_runs_as_the_python_route[stops-inside-srt]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+"1\n00:00:00,000 --> 00:00:12,000\nfirst part 0\n\n2\n00:00:12,000 --> 00:00:24,000\nsecond part\n\n3\n00:00:24,000 --> 00:00:36,000\nfirst part 2\n\n4\n00:00:36,000 --> 00:00:48,000\nsecond part\n\n5\n00:00:48,000 --> 00:00:56,800\nfirst part 4\n\n6\n00:00:56,800 --> 00:01:05,600\nsecond part\n\n7\n00:01:05,600 --> 00:01:07,360\nfirst part 6\n\n8\n00:01:07,360 --> 00:01:09,120\nsecond part\n\n9\n00:01:09,120 --> 00:01:09,470\nfirst part 8\n\n10\n00:01:09,470 --> 00:01:09,820\nsecond part\n"
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 30.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"initial_prompt": "first part 0 second part",
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 30.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 30.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"initial_prompt": "first part 0 second part first part 2 second part",
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 22.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 22.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"initial_prompt": "first part 0 second part first part 2 second part first part 4 second part",
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 4.4,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 4.4,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"initial_prompt": "first part 0 second part first part 2 second part first part 4 second part first part 6 second part",
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 0.88,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 0.88,
+"streaming": false,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_sequential_long_form_runs_as_the_python_route[stops-inside-stream]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+[
+{
+"delta": "first part 0 second part",
+"type": "transcript.text.delta"
+},
+{
+"delta": " ",
+"type": "transcript.text.delta"
+},
+{
+"delta": "first part 2 second part",
+"type": "transcript.text.delta"
+},
+{
+"delta": " ",
+"type": "transcript.text.delta"
+},
+{
+"delta": "first part 4 second part",
+"type": "transcript.text.delta"
+},
+{
+"delta": " ",
+"type": "transcript.text.delta"
+},
+{
+"delta": "first part 6 second part",
+"type": "transcript.text.delta"
+},
+{
+"delta": " ",
+"type": "transcript.text.delta"
+},
+{
+"delta": "first part 8 second part cut off",
+"type": "transcript.text.delta"
+},
+{
+"text": "first part 0 second part first part 2 second part first part 4 second part first part 6 second part first part 8 second part cut off",
+"type": "transcript.text.done",
+"usage": {
+"seconds": 70,
+"type": "duration"
+}
+},
+"[DONE]"
+]
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 30.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"initial_prompt": "first part 0 second part",
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 30.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 30.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"initial_prompt": "first part 0 second part first part 2 second part",
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 22.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 22.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"initial_prompt": "first part 0 second part first part 2 second part first part 4 second part",
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 4.4,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 4.4,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"initial_prompt": "first part 0 second part first part 2 second part first part 4 second part first part 6 second part",
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 0.88,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 0.88,
+"streaming": false,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_sequential_long_form_runs_as_the_python_route[stops-inside-verbose]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+{
+"duration": 70.0,
+"language": "en",
+"segments": [
+{
+"avg_logprob": 0.0,
+"compression_ratio": 0.9142857142857143,
+"end": 12.0,
+"id": 0,
+"no_speech_prob": 0.0,
+"seek": 0,
+"start": 0.0,
+"temperature": 0.0,
+"text": "first part 0",
+"tokens": []
+},
+{
+"avg_logprob": 0.0,
+"compression_ratio": 0.9142857142857143,
+"end": 24.0,
+"id": 1,
+"no_speech_prob": 0.0,
+"seek": 0,
+"start": 12.0,
+"temperature": 0.0,
+"text": "second part",
+"tokens": []
+},
+{
+"avg_logprob": 0.0,
+"compression_ratio": 0.9142857142857143,
+"end": 36.0,
+"id": 2,
+"no_speech_prob": 0.0,
+"seek": 0,
+"start": 24.0,
+"temperature": 0.0,
+"text": "first part 2",
+"tokens": []
+},
+{
+"avg_logprob": 0.0,
+"compression_ratio": 0.9142857142857143,
+"end": 48.0,
+"id": 3,
+"no_speech_prob": 0.0,
+"seek": 0,
+"start": 36.0,
+"temperature": 0.0,
+"text": "second part",
+"tokens": []
+},
+{
+"avg_logprob": 0.0,
+"compression_ratio": 0.9142857142857143,
+"end": 56.8,
+"id": 4,
+"no_speech_prob": 0.0,
+"seek": 0,
+"start": 48.0,
+"temperature": 0.0,
+"text": "first part 4",
+"tokens": []
+},
+{
+"avg_logprob": 0.0,
+"compression_ratio": 0.9142857142857143,
+"end": 65.6,
+"id": 5,
+"no_speech_prob": 0.0,
+"seek": 0,
+"start": 56.8,
+"temperature": 0.0,
+"text": "second part",
+"tokens": []
+},
+{
+"avg_logprob": 0.0,
+"compression_ratio": 0.9142857142857143,
+"end": 67.36,
+"id": 6,
+"no_speech_prob": 0.0,
+"seek": 0,
+"start": 65.6,
+"temperature": 0.0,
+"text": "first part 6",
+"tokens": []
+},
+{
+"avg_logprob": 0.0,
+"compression_ratio": 0.9142857142857143,
+"end": 69.11999999999999,
+"id": 7,
+"no_speech_prob": 0.0,
+"seek": 0,
+"start": 67.36,
+"temperature": 0.0,
+"text": "second part",
+"tokens": []
+},
+{
+"avg_logprob": 0.0,
+"compression_ratio": 0.9142857142857143,
+"end": 69.46999999999998,
+"id": 8,
+"no_speech_prob": 0.0,
+"seek": 0,
+"start": 69.11999999999999,
+"temperature": 0.0,
+"text": "first part 8",
+"tokens": []
+},
+{
+"avg_logprob": 0.0,
+"compression_ratio": 0.9142857142857143,
+"end": 69.82,
+"id": 9,
+"no_speech_prob": 0.0,
+"seek": 0,
+"start": 69.46999999999998,
+"temperature": 0.0,
+"text": "second part",
+"tokens": []
+}
+],
+"task": "transcribe",
+"text": "first part 0 second part first part 2 second part first part 4 second part first part 6 second part first part 8 second part cut off",
+"usage": {
+"seconds": 70,
+"type": "duration"
+}
+}
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 30.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"initial_prompt": "first part 0 second part",
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 30.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 30.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"initial_prompt": "first part 0 second part first part 2 second part",
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 22.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 22.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"initial_prompt": "first part 0 second part first part 2 second part first part 4 second part",
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 4.4,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 4.4,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"initial_prompt": "first part 0 second part first part 2 second part first part 4 second part first part 6 second part",
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 0.88,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 0.88,
+"streaming": false,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_sequential_long_form_runs_as_the_python_route[stops-inside-window-seconds]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+{
+"text": "first part 0 second part first part 2 second part first part 4 second part first part 6 second part first part 8 second part first part 10 second part first part 12 second part first part 14 second part first part 16 second part cut off"
+}
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 12.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"initial_prompt": "first part 0 second part",
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 12.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 12.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"initial_prompt": "first part 0 second part first part 2 second part",
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 12.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 12.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"initial_prompt": "first part 0 second part first part 2 second part first part 4 second part",
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 12.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 12.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"initial_prompt": "first part 0 second part first part 2 second part first part 4 second part first part 6 second part",
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 12.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 12.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"initial_prompt": "first part 0 second part first part 2 second part first part 4 second part first part 6 second part first part 8 second part",
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 12.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 12.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"initial_prompt": "first part 0 second part first part 2 second part first part 4 second part first part 6 second part first part 8 second part first part 10 second part",
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 12.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 12.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"initial_prompt": "first part 0 second part first part 2 second part first part 4 second part first part 6 second part first part 8 second part first part 10 second part first part 12 second part",
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 2.8,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 2.8,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"initial_prompt": "first part 0 second part first part 2 second part first part 4 second part first part 6 second part first part 8 second part first part 10 second part first part 12 second part first part 14 second part",
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 0.56,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 0.56,
+"streaming": false,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_the_drivers_add_conditioning_and_timestamps_only_for_a_model_that_reads_them[declared]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+{
+"duration": 70.0,
+"language": "en",
+"segments": [
+{
+"avg_logprob": 0.0,
+"compression_ratio": 0.9142857142857143,
+"end": 12.0,
+"id": 0,
+"no_speech_prob": 0.0,
+"seek": 0,
+"start": 0.0,
+"temperature": 0.0,
+"text": "first part 0",
+"tokens": []
+},
+{
+"avg_logprob": 0.0,
+"compression_ratio": 0.9142857142857143,
+"end": 24.0,
+"id": 1,
+"no_speech_prob": 0.0,
+"seek": 0,
+"start": 12.0,
+"temperature": 0.0,
+"text": "second part",
+"tokens": []
+},
+{
+"avg_logprob": 0.0,
+"compression_ratio": 0.9142857142857143,
+"end": 42.0,
+"id": 2,
+"no_speech_prob": 0.0,
+"seek": 0,
+"start": 30.0,
+"temperature": 0.0,
+"text": "first part 1",
+"tokens": []
+},
+{
+"avg_logprob": 0.0,
+"compression_ratio": 0.9142857142857143,
+"end": 54.0,
+"id": 3,
+"no_speech_prob": 0.0,
+"seek": 0,
+"start": 42.0,
+"temperature": 0.0,
+"text": "second part",
+"tokens": []
+},
+{
+"avg_logprob": 0.0,
+"compression_ratio": 0.9142857142857143,
+"end": 64.0,
+"id": 4,
+"no_speech_prob": 0.0,
+"seek": 0,
+"start": 60.0,
+"temperature": 0.0,
+"text": "first part 2",
+"tokens": []
+},
+{
+"avg_logprob": 0.0,
+"compression_ratio": 0.9142857142857143,
+"end": 68.0,
+"id": 5,
+"no_speech_prob": 0.0,
+"seek": 0,
+"start": 64.0,
+"temperature": 0.0,
+"text": "second part",
+"tokens": []
+}
+],
+"task": "transcribe",
+"text": "first part 0 second part cut off first part 1 second part cut off first part 2 second part cut off",
+"usage": {
+"seconds": 70,
+"type": "duration"
+}
+}
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 30.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 30.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 10.0,
+"streaming": false,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_the_drivers_add_conditioning_and_timestamps_only_for_a_model_that_reads_them[undeclared]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+{
+"duration": 70.0,
+"language": "en",
+"segments": [
+{
+"avg_logprob": 0.0,
+"compression_ratio": 0.9142857142857143,
+"end": 12.0,
+"id": 0,
+"no_speech_prob": 0.0,
+"seek": 0,
+"start": 0.0,
+"temperature": 0.0,
+"text": "first part 0",
+"tokens": []
+},
+{
+"avg_logprob": 0.0,
+"compression_ratio": 0.9142857142857143,
+"end": 24.0,
+"id": 1,
+"no_speech_prob": 0.0,
+"seek": 0,
+"start": 12.0,
+"temperature": 0.0,
+"text": "second part",
+"tokens": []
+},
+{
+"avg_logprob": 0.0,
+"compression_ratio": 0.9142857142857143,
+"end": 36.0,
+"id": 2,
+"no_speech_prob": 0.0,
+"seek": 0,
+"start": 24.0,
+"temperature": 0.0,
+"text": "first part 2",
+"tokens": []
+},
+{
+"avg_logprob": 0.0,
+"compression_ratio": 0.9142857142857143,
+"end": 48.0,
+"id": 3,
+"no_speech_prob": 0.0,
+"seek": 0,
+"start": 36.0,
+"temperature": 0.0,
+"text": "second part",
+"tokens": []
+},
+{
+"avg_logprob": 0.0,
+"compression_ratio": 0.9142857142857143,
+"end": 56.8,
+"id": 4,
+"no_speech_prob": 0.0,
+"seek": 0,
+"start": 48.0,
+"temperature": 0.0,
+"text": "first part 4",
+"tokens": []
+},
+{
+"avg_logprob": 0.0,
+"compression_ratio": 0.9142857142857143,
+"end": 65.6,
+"id": 5,
+"no_speech_prob": 0.0,
+"seek": 0,
+"start": 56.8,
+"temperature": 0.0,
+"text": "second part",
+"tokens": []
+},
+{
+"avg_logprob": 0.0,
+"compression_ratio": 0.9142857142857143,
+"end": 67.36,
+"id": 6,
+"no_speech_prob": 0.0,
+"seek": 0,
+"start": 65.6,
+"temperature": 0.0,
+"text": "first part 6",
+"tokens": []
+},
+{
+"avg_logprob": 0.0,
+"compression_ratio": 0.9142857142857143,
+"end": 69.11999999999999,
+"id": 7,
+"no_speech_prob": 0.0,
+"seek": 0,
+"start": 67.36,
+"temperature": 0.0,
+"text": "second part",
+"tokens": []
+},
+{
+"avg_logprob": 0.0,
+"compression_ratio": 0.9142857142857143,
+"end": 69.46999999999998,
+"id": 8,
+"no_speech_prob": 0.0,
+"seek": 0,
+"start": 69.11999999999999,
+"temperature": 0.0,
+"text": "first part 8",
+"tokens": []
+},
+{
+"avg_logprob": 0.0,
+"compression_ratio": 0.9142857142857143,
+"end": 69.82,
+"id": 9,
+"no_speech_prob": 0.0,
+"seek": 0,
+"start": 69.46999999999998,
+"temperature": 0.0,
+"text": "second part",
+"tokens": []
+}
+],
+"task": "transcribe",
+"text": "first part 0 second part first part 2 second part first part 4 second part first part 6 second part first part 8 second part cut off",
+"usage": {
+"seconds": 70,
+"type": "duration"
+}
+}
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 30.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"initial_prompt": "first part 0 second part",
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 30.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 30.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"initial_prompt": "first part 0 second part first part 2 second part",
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 22.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 22.0,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"initial_prompt": "first part 0 second part first part 2 second part first part 4 second part",
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 4.4,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 4.4,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"initial_prompt": "first part 0 second part first part 2 second part first part 4 second part first part 6 second part",
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 0.88,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"language": "en",
+"temperature": 0.0,
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 0.88,
+"streaming": false,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_whisper_answers_as_the_python_route[long-empty-format-words]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+{
+"text": "first part 0 second part first part 1 second part first part 2 second part"
+}
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"timestamps": "word"
+},
+"out": [
+"text"
+],
+"seconds": 28.22,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"timestamps": "word"
+},
+"out": [
+"text"
+],
+"seconds": 28.28,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"timestamps": "word"
+},
+"out": [
+"text"
+],
+"seconds": 13.5,
+"streaming": false,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_whisper_answers_as_the_python_route[long-empty-format]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+{
+"text": "the window of 28.22 s, caf\u00e9 the window of 28.28 s, caf\u00e9 the window of 13.50 s, caf\u00e9"
+}
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 28.22,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 28.28,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 13.5,
+"streaming": false,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_whisper_answers_as_the_python_route[long-extra-kwargs]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+{
+"text": "the window of 28.22 s, caf\u00e9 the window of 28.28 s, caf\u00e9 the window of 13.50 s, caf\u00e9"
+}
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"beam": {
+"n": 2
+},
+"note": "plain text",
+"top_k": 5
+},
+"out": [
+"text"
+],
+"seconds": 28.22,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"beam": {
+"n": 2
+},
+"note": "plain text",
+"top_k": 5
+},
+"out": [
+"text"
+],
+"seconds": 28.28,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"beam": {
+"n": 2
+},
+"note": "plain text",
+"top_k": 5
+},
+"out": [
+"text"
+],
+"seconds": 13.5,
+"streaming": false,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_whisper_answers_as_the_python_route[long-json]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+{
+"text": "the window of 28.22 s, caf\u00e9 the window of 28.28 s, caf\u00e9 the window of 13.50 s, caf\u00e9"
+}
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 28.22,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 28.28,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 13.5,
+"streaming": false,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_whisper_answers_as_the_python_route[long-language-and-prompt]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+{
+"text": "the window of 28.22 s, caf\u00e9 the window of 28.28 s, caf\u00e9 the window of 13.50 s, caf\u00e9"
+}
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"initial_prompt": "Hallo",
+"language": "de",
+"seed": 7,
+"temperature": 0.2
+},
+"out": [
+"text"
+],
+"seconds": 28.22,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"initial_prompt": "Hallo",
+"language": "de",
+"seed": 7,
+"temperature": 0.2
+},
+"out": [
+"text"
+],
+"seconds": 28.28,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"initial_prompt": "Hallo",
+"language": "de",
+"seed": 7,
+"temperature": 0.2
+},
+"out": [
+"text"
+],
+"seconds": 13.5,
+"streaming": false,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_whisper_answers_as_the_python_route[long-srt]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+"1\n00:00:00,000 --> 00:00:11,290\nfirst part 0\n\n2\n00:00:11,290 --> 00:00:22,580\nsecond part\n\n3\n00:00:28,220 --> 00:00:39,530\nfirst part 1\n\n4\n00:00:39,530 --> 00:00:50,840\nsecond part\n\n5\n00:00:56,500 --> 00:01:01,900\nfirst part 2\n\n6\n00:01:01,900 --> 00:01:07,300\nsecond part\n"
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 28.22,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 28.28,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 13.5,
+"streaming": false,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_whisper_answers_as_the_python_route[long-stereo-empty-format-words]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+{
+"text": "first part 0 second part first part 1 second part first part 2 second part"
+}
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"timestamps": "word"
+},
+"out": [
+"text"
+],
+"seconds": 28.22,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"timestamps": "word"
+},
+"out": [
+"text"
+],
+"seconds": 28.56,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"timestamps": "word"
+},
+"out": [
+"text"
+],
+"seconds": 8.22,
+"streaming": false,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_whisper_answers_as_the_python_route[long-stereo-empty-format]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+{
+"text": "the window of 28.22 s, caf\u00e9 the window of 28.56 s, caf\u00e9 the window of 8.22 s, caf\u00e9"
+}
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 28.22,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 28.56,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 8.22,
+"streaming": false,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_whisper_answers_as_the_python_route[long-stereo-extra-kwargs]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+{
+"text": "the window of 28.22 s, caf\u00e9 the window of 28.56 s, caf\u00e9 the window of 8.22 s, caf\u00e9"
+}
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"beam": {
+"n": 2
+},
+"note": "plain text",
+"top_k": 5
+},
+"out": [
+"text"
+],
+"seconds": 28.22,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"beam": {
+"n": 2
+},
+"note": "plain text",
+"top_k": 5
+},
+"out": [
+"text"
+],
+"seconds": 28.56,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"beam": {
+"n": 2
+},
+"note": "plain text",
+"top_k": 5
+},
+"out": [
+"text"
+],
+"seconds": 8.22,
+"streaming": false,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_whisper_answers_as_the_python_route[long-stereo-json]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+{
+"text": "the window of 28.22 s, caf\u00e9 the window of 28.56 s, caf\u00e9 the window of 8.22 s, caf\u00e9"
+}
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 28.22,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 28.56,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 8.22,
+"streaming": false,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_whisper_answers_as_the_python_route[long-stereo-language-and-prompt]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+{
+"text": "the window of 28.22 s, caf\u00e9 the window of 28.56 s, caf\u00e9 the window of 8.22 s, caf\u00e9"
+}
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"initial_prompt": "Hallo",
+"language": "de",
+"seed": 7,
+"temperature": 0.2
+},
+"out": [
+"text"
+],
+"seconds": 28.22,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"initial_prompt": "Hallo",
+"language": "de",
+"seed": 7,
+"temperature": 0.2
+},
+"out": [
+"text"
+],
+"seconds": 28.56,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"initial_prompt": "Hallo",
+"language": "de",
+"seed": 7,
+"temperature": 0.2
+},
+"out": [
+"text"
+],
+"seconds": 8.22,
+"streaming": false,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_whisper_answers_as_the_python_route[long-stereo-srt]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+"1\n00:00:00,000 --> 00:00:11,290\nfirst part 0\n\n2\n00:00:11,290 --> 00:00:22,580\nsecond part\n\n3\n00:00:28,220 --> 00:00:39,640\nfirst part 1\n\n4\n00:00:39,640 --> 00:00:51,070\nsecond part\n\n5\n00:00:56,780 --> 00:01:00,070\nfirst part 2\n\n6\n00:01:00,070 --> 00:01:03,360\nsecond part\n"
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 28.22,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 28.56,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 8.22,
+"streaming": false,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_whisper_answers_as_the_python_route[long-stereo-stream-verbose]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+[
+{
+"delta": " the",
+"type": "transcript.text.delta"
+},
+{
+"delta": " wind",
+"type": "transcript.text.delta"
+},
+{
+"delta": "ow of",
+"type": "transcript.text.delta"
+},
+{
+"delta": " 28.2",
+"type": "transcript.text.delta"
+},
+{
+"delta": "2 s, ",
+"type": "transcript.text.delta"
+},
+{
+"delta": "caf\u00e9",
+"type": "transcript.text.delta"
+},
+{
+"delta": " ",
+"type": "transcript.text.delta"
+},
+{
+"delta": " the",
+"type": "transcript.text.delta"
+},
+{
+"delta": " wind",
+"type": "transcript.text.delta"
+},
+{
+"delta": "ow of",
+"type": "transcript.text.delta"
+},
+{
+"delta": " 28.5",
+"type": "transcript.text.delta"
+},
+{
+"delta": "6 s, ",
+"type": "transcript.text.delta"
+},
+{
+"delta": "caf\u00e9",
+"type": "transcript.text.delta"
+},
+{
+"delta": " ",
+"type": "transcript.text.delta"
+},
+{
+"delta": " the",
+"type": "transcript.text.delta"
+},
+{
+"delta": " wind",
+"type": "transcript.text.delta"
+},
+{
+"delta": "ow of",
+"type": "transcript.text.delta"
+},
+{
+"delta": " 8.22",
+"type": "transcript.text.delta"
+},
+{
+"delta": " s, c",
+"type": "transcript.text.delta"
+},
+{
+"delta": "af\u00e9",
+"type": "transcript.text.delta"
+},
+{
+"text": "the window of 28.22 s, caf\u00e9 the window of 28.56 s, caf\u00e9 the window of 8.22 s, caf\u00e9",
+"type": "transcript.text.done",
+"usage": {
+"seconds": 65,
+"type": "duration"
+}
+},
+"[DONE]"
+]
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 28.22,
+"streaming": true,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 28.56,
+"streaming": true,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 8.22,
+"streaming": true,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_whisper_answers_as_the_python_route[long-stereo-stream]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+[
+{
+"delta": " the",
+"type": "transcript.text.delta"
+},
+{
+"delta": " wind",
+"type": "transcript.text.delta"
+},
+{
+"delta": "ow of",
+"type": "transcript.text.delta"
+},
+{
+"delta": " 28.2",
+"type": "transcript.text.delta"
+},
+{
+"delta": "2 s, ",
+"type": "transcript.text.delta"
+},
+{
+"delta": "caf\u00e9",
+"type": "transcript.text.delta"
+},
+{
+"delta": " ",
+"type": "transcript.text.delta"
+},
+{
+"delta": " the",
+"type": "transcript.text.delta"
+},
+{
+"delta": " wind",
+"type": "transcript.text.delta"
+},
+{
+"delta": "ow of",
+"type": "transcript.text.delta"
+},
+{
+"delta": " 28.5",
+"type": "transcript.text.delta"
+},
+{
+"delta": "6 s, ",
+"type": "transcript.text.delta"
+},
+{
+"delta": "caf\u00e9",
+"type": "transcript.text.delta"
+},
+{
+"delta": " ",
+"type": "transcript.text.delta"
+},
+{
+"delta": " the",
+"type": "transcript.text.delta"
+},
+{
+"delta": " wind",
+"type": "transcript.text.delta"
+},
+{
+"delta": "ow of",
+"type": "transcript.text.delta"
+},
+{
+"delta": " 8.22",
+"type": "transcript.text.delta"
+},
+{
+"delta": " s, c",
+"type": "transcript.text.delta"
+},
+{
+"delta": "af\u00e9",
+"type": "transcript.text.delta"
+},
+{
+"text": "the window of 28.22 s, caf\u00e9 the window of 28.56 s, caf\u00e9 the window of 8.22 s, caf\u00e9",
+"type": "transcript.text.done",
+"usage": {
+"seconds": 65,
+"type": "duration"
+}
+},
+"[DONE]"
+]
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 28.22,
+"streaming": true,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 28.56,
+"streaming": true,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 8.22,
+"streaming": true,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_whisper_answers_as_the_python_route[long-stereo-text-fields-as-sent]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+{
+"text": "the window of 28.22 s, caf\u00e9 the window of 28.56 s, caf\u00e9 the window of 8.22 s, caf\u00e9"
+}
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"initial_prompt": "2024",
+"language": "null"
+},
+"out": [
+"text"
+],
+"seconds": 28.22,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"initial_prompt": "2024",
+"language": "null"
+},
+"out": [
+"text"
+],
+"seconds": 28.56,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"initial_prompt": "2024",
+"language": "null"
+},
+"out": [
+"text"
+],
+"seconds": 8.22,
+"streaming": false,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_whisper_answers_as_the_python_route[long-stereo-text]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+"the window of 28.22 s, caf\u00e9 the window of 28.56 s, caf\u00e9 the window of 8.22 s, caf\u00e9"
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 28.22,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 28.56,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 8.22,
+"streaming": false,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_whisper_answers_as_the_python_route[long-stereo-verbose-words-only]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+{
+"duration": 65.0,
+"language": "en",
+"task": "transcribe",
+"text": "first part 0 second part first part 1 second part first part 2 second part",
+"usage": {
+"seconds": 65,
+"type": "duration"
+},
+"words": [
+{
+"end": 0.4,
+"start": 0.0,
+"word": "first"
+},
+{
+"end": 0.9,
+"start": 0.4,
+"word": "part"
+},
+{
+"end": 28.619999999999997,
+"start": 28.22,
+"word": "first"
+},
+{
+"end": 29.119999999999997,
+"start": 28.619999999999997,
+"word": "part"
+},
+{
+"end": 57.18,
+"start": 56.78,
+"word": "first"
+},
+{
+"end": 57.68,
+"start": 57.18,
+"word": "part"
+}
+]
+}
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"timestamps": "word"
+},
+"out": [
+"text"
+],
+"seconds": 28.22,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"timestamps": "word"
+},
+"out": [
+"text"
+],
+"seconds": 28.56,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"timestamps": "word"
+},
+"out": [
+"text"
+],
+"seconds": 8.22,
+"streaming": false,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_whisper_answers_as_the_python_route[long-stereo-verbose]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+{
+"duration": 65.0,
+"language": "en",
+"segments": [
+{
+"avg_logprob": 0.0,
+"compression_ratio": 0.0,
+"end": 11.29,
+"id": 0,
+"no_speech_prob": 0.0,
+"seek": 0,
+"start": 0.0,
+"temperature": 0.0,
+"text": "first part 0",
+"tokens": []
+},
+{
+"avg_logprob": 0.0,
+"compression_ratio": 0.0,
+"end": 22.58,
+"id": 1,
+"no_speech_prob": 0.0,
+"seek": 0,
+"start": 11.29,
+"temperature": 0.0,
+"text": "second part",
+"tokens": []
+},
+{
+"avg_logprob": 0.0,
+"compression_ratio": 0.0,
+"end": 39.64,
+"id": 2,
+"no_speech_prob": 0.0,
+"seek": 0,
+"start": 28.22,
+"temperature": 0.0,
+"text": "first part 1",
+"tokens": []
+},
+{
+"avg_logprob": 0.0,
+"compression_ratio": 0.0,
+"end": 51.07,
+"id": 3,
+"no_speech_prob": 0.0,
+"seek": 0,
+"start": 39.64,
+"temperature": 0.0,
+"text": "second part",
+"tokens": []
+},
+{
+"avg_logprob": 0.0,
+"compression_ratio": 0.0,
+"end": 60.07,
+"id": 4,
+"no_speech_prob": 0.0,
+"seek": 0,
+"start": 56.78,
+"temperature": 0.0,
+"text": "first part 2",
+"tokens": []
+},
+{
+"avg_logprob": 0.0,
+"compression_ratio": 0.0,
+"end": 63.36,
+"id": 5,
+"no_speech_prob": 0.0,
+"seek": 0,
+"start": 60.07,
+"temperature": 0.0,
+"text": "second part",
+"tokens": []
+}
+],
+"task": "transcribe",
+"text": "first part 0 second part first part 1 second part first part 2 second part",
+"usage": {
+"seconds": 65,
+"type": "duration"
+},
+"words": [
+{
+"end": 0.4,
+"start": 0.0,
+"word": "first"
+},
+{
+"end": 0.9,
+"start": 0.4,
+"word": "part"
+},
+{
+"end": 28.619999999999997,
+"start": 28.22,
+"word": "first"
+},
+{
+"end": 29.119999999999997,
+"start": 28.619999999999997,
+"word": "part"
+},
+{
+"end": 57.18,
+"start": 56.78,
+"word": "first"
+},
+{
+"end": 57.68,
+"start": 57.18,
+"word": "part"
+}
+]
+}
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"timestamps": "word"
+},
+"out": [
+"text"
+],
+"seconds": 28.22,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"timestamps": "word"
+},
+"out": [
+"text"
+],
+"seconds": 28.56,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"timestamps": "word"
+},
+"out": [
+"text"
+],
+"seconds": 8.22,
+"streaming": false,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_whisper_answers_as_the_python_route[long-stereo-vtt]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+"WEBVTT\n\n00:00:00.000 --> 00:00:28.220\nthe window of 28.22 s, caf\u00e9\n\n00:00:28.220 --> 00:00:56.780\nthe window of 28.56 s, caf\u00e9\n\n00:00:56.780 --> 00:01:05.000\nthe window of 8.22 s, caf\u00e9\n"
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 28.22,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 28.56,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 8.22,
+"streaming": false,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_whisper_answers_as_the_python_route[long-stream-verbose]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+[
+{
+"delta": " the",
+"type": "transcript.text.delta"
+},
+{
+"delta": " wind",
+"type": "transcript.text.delta"
+},
+{
+"delta": "ow of",
+"type": "transcript.text.delta"
+},
+{
+"delta": " 28.2",
+"type": "transcript.text.delta"
+},
+{
+"delta": "2 s, ",
+"type": "transcript.text.delta"
+},
+{
+"delta": "caf\u00e9",
+"type": "transcript.text.delta"
+},
+{
+"delta": " ",
+"type": "transcript.text.delta"
+},
+{
+"delta": " the",
+"type": "transcript.text.delta"
+},
+{
+"delta": " wind",
+"type": "transcript.text.delta"
+},
+{
+"delta": "ow of",
+"type": "transcript.text.delta"
+},
+{
+"delta": " 28.2",
+"type": "transcript.text.delta"
+},
+{
+"delta": "8 s, ",
+"type": "transcript.text.delta"
+},
+{
+"delta": "caf\u00e9",
+"type": "transcript.text.delta"
+},
+{
+"delta": " ",
+"type": "transcript.text.delta"
+},
+{
+"delta": " the",
+"type": "transcript.text.delta"
+},
+{
+"delta": " wind",
+"type": "transcript.text.delta"
+},
+{
+"delta": "ow of",
+"type": "transcript.text.delta"
+},
+{
+"delta": " 13.5",
+"type": "transcript.text.delta"
+},
+{
+"delta": "0 s, ",
+"type": "transcript.text.delta"
+},
+{
+"delta": "caf\u00e9",
+"type": "transcript.text.delta"
+},
+{
+"text": "the window of 28.22 s, caf\u00e9 the window of 28.28 s, caf\u00e9 the window of 13.50 s, caf\u00e9",
+"type": "transcript.text.done",
+"usage": {
+"seconds": 70,
+"type": "duration"
+}
+},
+"[DONE]"
+]
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 28.22,
+"streaming": true,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 28.28,
+"streaming": true,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 13.5,
+"streaming": true,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_whisper_answers_as_the_python_route[long-stream]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+[
+{
+"delta": " the",
+"type": "transcript.text.delta"
+},
+{
+"delta": " wind",
+"type": "transcript.text.delta"
+},
+{
+"delta": "ow of",
+"type": "transcript.text.delta"
+},
+{
+"delta": " 28.2",
+"type": "transcript.text.delta"
+},
+{
+"delta": "2 s, ",
+"type": "transcript.text.delta"
+},
+{
+"delta": "caf\u00e9",
+"type": "transcript.text.delta"
+},
+{
+"delta": " ",
+"type": "transcript.text.delta"
+},
+{
+"delta": " the",
+"type": "transcript.text.delta"
+},
+{
+"delta": " wind",
+"type": "transcript.text.delta"
+},
+{
+"delta": "ow of",
+"type": "transcript.text.delta"
+},
+{
+"delta": " 28.2",
+"type": "transcript.text.delta"
+},
+{
+"delta": "8 s, ",
+"type": "transcript.text.delta"
+},
+{
+"delta": "caf\u00e9",
+"type": "transcript.text.delta"
+},
+{
+"delta": " ",
+"type": "transcript.text.delta"
+},
+{
+"delta": " the",
+"type": "transcript.text.delta"
+},
+{
+"delta": " wind",
+"type": "transcript.text.delta"
+},
+{
+"delta": "ow of",
+"type": "transcript.text.delta"
+},
+{
+"delta": " 13.5",
+"type": "transcript.text.delta"
+},
+{
+"delta": "0 s, ",
+"type": "transcript.text.delta"
+},
+{
+"delta": "caf\u00e9",
+"type": "transcript.text.delta"
+},
+{
+"text": "the window of 28.22 s, caf\u00e9 the window of 28.28 s, caf\u00e9 the window of 13.50 s, caf\u00e9",
+"type": "transcript.text.done",
+"usage": {
+"seconds": 70,
+"type": "duration"
+}
+},
+"[DONE]"
+]
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 28.22,
+"streaming": true,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 28.28,
+"streaming": true,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 13.5,
+"streaming": true,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_whisper_answers_as_the_python_route[long-text-fields-as-sent]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+{
+"text": "the window of 28.22 s, caf\u00e9 the window of 28.28 s, caf\u00e9 the window of 13.50 s, caf\u00e9"
+}
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"initial_prompt": "2024",
+"language": "null"
+},
+"out": [
+"text"
+],
+"seconds": 28.22,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"initial_prompt": "2024",
+"language": "null"
+},
+"out": [
+"text"
+],
+"seconds": 28.28,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"initial_prompt": "2024",
+"language": "null"
+},
+"out": [
+"text"
+],
+"seconds": 13.5,
+"streaming": false,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_whisper_answers_as_the_python_route[long-text]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+"the window of 28.22 s, caf\u00e9 the window of 28.28 s, caf\u00e9 the window of 13.50 s, caf\u00e9"
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 28.22,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 28.28,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 13.5,
+"streaming": false,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_whisper_answers_as_the_python_route[long-verbose-words-only]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+{
+"duration": 70.0,
+"language": "en",
+"task": "transcribe",
+"text": "first part 0 second part first part 1 second part first part 2 second part",
+"usage": {
+"seconds": 70,
+"type": "duration"
+},
+"words": [
+{
+"end": 0.4,
+"start": 0.0,
+"word": "first"
+},
+{
+"end": 0.9,
+"start": 0.4,
+"word": "part"
+},
+{
+"end": 28.619999999999997,
+"start": 28.22,
+"word": "first"
+},
+{
+"end": 29.119999999999997,
+"start": 28.619999999999997,
+"word": "part"
+},
+{
+"end": 56.9,
+"start": 56.5,
+"word": "first"
+},
+{
+"end": 57.4,
+"start": 56.9,
+"word": "part"
+}
+]
+}
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"timestamps": "word"
+},
+"out": [
+"text"
+],
+"seconds": 28.22,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"timestamps": "word"
+},
+"out": [
+"text"
+],
+"seconds": 28.28,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"timestamps": "word"
+},
+"out": [
+"text"
+],
+"seconds": 13.5,
+"streaming": false,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_whisper_answers_as_the_python_route[long-verbose]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+{
+"duration": 70.0,
+"language": "en",
+"segments": [
+{
+"avg_logprob": 0.0,
+"compression_ratio": 0.0,
+"end": 11.29,
+"id": 0,
+"no_speech_prob": 0.0,
+"seek": 0,
+"start": 0.0,
+"temperature": 0.0,
+"text": "first part 0",
+"tokens": []
+},
+{
+"avg_logprob": 0.0,
+"compression_ratio": 0.0,
+"end": 22.58,
+"id": 1,
+"no_speech_prob": 0.0,
+"seek": 0,
+"start": 11.29,
+"temperature": 0.0,
+"text": "second part",
+"tokens": []
+},
+{
+"avg_logprob": 0.0,
+"compression_ratio": 0.0,
+"end": 39.53,
+"id": 2,
+"no_speech_prob": 0.0,
+"seek": 0,
+"start": 28.22,
+"temperature": 0.0,
+"text": "first part 1",
+"tokens": []
+},
+{
+"avg_logprob": 0.0,
+"compression_ratio": 0.0,
+"end": 50.84,
+"id": 3,
+"no_speech_prob": 0.0,
+"seek": 0,
+"start": 39.53,
+"temperature": 0.0,
+"text": "second part",
+"tokens": []
+},
+{
+"avg_logprob": 0.0,
+"compression_ratio": 0.0,
+"end": 61.9,
+"id": 4,
+"no_speech_prob": 0.0,
+"seek": 0,
+"start": 56.5,
+"temperature": 0.0,
+"text": "first part 2",
+"tokens": []
+},
+{
+"avg_logprob": 0.0,
+"compression_ratio": 0.0,
+"end": 67.3,
+"id": 5,
+"no_speech_prob": 0.0,
+"seek": 0,
+"start": 61.9,
+"temperature": 0.0,
+"text": "second part",
+"tokens": []
+}
+],
+"task": "transcribe",
+"text": "first part 0 second part first part 1 second part first part 2 second part",
+"usage": {
+"seconds": 70,
+"type": "duration"
+},
+"words": [
+{
+"end": 0.4,
+"start": 0.0,
+"word": "first"
+},
+{
+"end": 0.9,
+"start": 0.4,
+"word": "part"
+},
+{
+"end": 28.619999999999997,
+"start": 28.22,
+"word": "first"
+},
+{
+"end": 29.119999999999997,
+"start": 28.619999999999997,
+"word": "part"
+},
+{
+"end": 56.9,
+"start": 56.5,
+"word": "first"
+},
+{
+"end": 57.4,
+"start": 56.9,
+"word": "part"
+}
+]
+}
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"timestamps": "word"
+},
+"out": [
+"text"
+],
+"seconds": 28.22,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"timestamps": "word"
+},
+"out": [
+"text"
+],
+"seconds": 28.28,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"timestamps": "word"
+},
+"out": [
+"text"
+],
+"seconds": 13.5,
+"streaming": false,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_whisper_answers_as_the_python_route[long-vtt]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+"WEBVTT\n\n00:00:00.000 --> 00:00:28.220\nthe window of 28.22 s, caf\u00e9\n\n00:00:28.220 --> 00:00:56.500\nthe window of 28.28 s, caf\u00e9\n\n00:00:56.500 --> 00:01:10.000\nthe window of 13.50 s, caf\u00e9\n"
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 28.22,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 28.28,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 13.5,
+"streaming": false,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_whisper_answers_as_the_python_route[short-empty-format-words]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+{
+"text": "first part 0 second part"
+}
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"timestamps": "word"
+},
+"out": [
+"text"
+],
+"seconds": 6.0,
+"streaming": false,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_whisper_answers_as_the_python_route[short-empty-format]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+{
+"text": "the window of 6.00 s, caf\u00e9"
+}
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 6.0,
+"streaming": false,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_whisper_answers_as_the_python_route[short-extra-kwargs]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+{
+"text": "the window of 6.00 s, caf\u00e9"
+}
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"beam": {
+"n": 2
+},
+"note": "plain text",
+"top_k": 5
+},
+"out": [
+"text"
+],
+"seconds": 6.0,
+"streaming": false,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_whisper_answers_as_the_python_route[short-json]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+{
+"text": "the window of 6.00 s, caf\u00e9"
+}
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 6.0,
+"streaming": false,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_whisper_answers_as_the_python_route[short-language-and-prompt]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+{
+"text": "the window of 6.00 s, caf\u00e9"
+}
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"initial_prompt": "Hallo",
+"language": "de",
+"seed": 7,
+"temperature": 0.2
+},
+"out": [
+"text"
+],
+"seconds": 6.0,
+"streaming": false,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_whisper_answers_as_the_python_route[short-srt]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+"1\n00:00:00,000 --> 00:00:02,400\nfirst part 0\n\n2\n00:00:02,400 --> 00:00:04,800\nsecond part\n"
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 6.0,
+"streaming": false,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_whisper_answers_as_the_python_route[short-stream-verbose]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+[
+{
+"delta": " ",
+"type": "transcript.text.delta"
+},
+{
+"delta": "first",
+"type": "transcript.text.delta"
+},
+{
+"delta": " part",
+"type": "transcript.text.delta"
+},
+{
+"delta": " 0",
+"type": "transcript.text.delta"
+},
+{
+"delta": " s",
+"type": "transcript.text.delta"
+},
+{
+"delta": "econd",
+"type": "transcript.text.delta"
+},
+{
+"delta": " part",
+"type": "transcript.text.delta"
+},
+{
+"text": "first part 0 second part",
+"type": "transcript.text.done",
+"usage": {
+"seconds": 6,
+"type": "duration"
+}
+},
+"[DONE]"
+]
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"timestamps": "segment"
+},
+"out": [
+"text"
+],
+"seconds": 6.0,
+"streaming": true,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_whisper_answers_as_the_python_route[short-stream]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+[
+{
+"delta": " the",
+"type": "transcript.text.delta"
+},
+{
+"delta": " wind",
+"type": "transcript.text.delta"
+},
+{
+"delta": "ow of",
+"type": "transcript.text.delta"
+},
+{
+"delta": " 6.00",
+"type": "transcript.text.delta"
+},
+{
+"delta": " s, c",
+"type": "transcript.text.delta"
+},
+{
+"delta": "af\u00e9",
+"type": "transcript.text.delta"
+},
+{
+"text": "the window of 6.00 s, caf\u00e9",
+"type": "transcript.text.done",
+"usage": {
+"seconds": 6,
+"type": "duration"
+}
+},
+"[DONE]"
+]
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 6.0,
+"streaming": true,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_whisper_answers_as_the_python_route[short-text-fields-as-sent]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+{
+"text": "the window of 6.00 s, caf\u00e9"
+}
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"initial_prompt": "2024",
+"language": "null"
+},
+"out": [
+"text"
+],
+"seconds": 6.0,
+"streaming": false,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_whisper_answers_as_the_python_route[short-text]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+"the window of 6.00 s, caf\u00e9"
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 6.0,
+"streaming": false,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_whisper_answers_as_the_python_route[short-verbose-words-only]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+{
+"duration": 6.0,
+"language": "en",
+"task": "transcribe",
+"text": "first part 0 second part",
+"usage": {
+"seconds": 6,
+"type": "duration"
+},
+"words": [
+{
+"end": 0.4,
+"start": 0.0,
+"word": "first"
+},
+{
+"end": 0.9,
+"start": 0.4,
+"word": "part"
+}
+]
+}
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"timestamps": "word"
+},
+"out": [
+"text"
+],
+"seconds": 6.0,
+"streaming": false,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_whisper_answers_as_the_python_route[short-verbose]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+{
+"duration": 6.0,
+"language": "en",
+"segments": [
+{
+"avg_logprob": 0.0,
+"compression_ratio": 0.0,
+"end": 2.4,
+"id": 0,
+"no_speech_prob": 0.0,
+"seek": 0,
+"start": 0.0,
+"temperature": 0.0,
+"text": "first part 0",
+"tokens": []
+},
+{
+"avg_logprob": 0.0,
+"compression_ratio": 0.0,
+"end": 4.8,
+"id": 1,
+"no_speech_prob": 0.0,
+"seek": 0,
+"start": 2.4,
+"temperature": 0.0,
+"text": "second part",
+"tokens": []
+}
+],
+"task": "transcribe",
+"text": "first part 0 second part",
+"usage": {
+"seconds": 6,
+"type": "duration"
+},
+"words": [
+{
+"end": 0.4,
+"start": 0.0,
+"word": "first"
+},
+{
+"end": 0.9,
+"start": 0.4,
+"word": "part"
+}
+]
+}
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {
+"timestamps": "word"
+},
+"out": [
+"text"
+],
+"seconds": 6.0,
+"streaming": false,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_whisper_answers_as_the_python_route[short-vtt]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+"WEBVTT\n\n00:00:00.000 --> 00:00:06.000\nthe window of 6.00 s, caf\u00e9\n"
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 6.0,
+"streaming": false,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_windows_in_flight_follow_the_share_alike[false-2]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+{
+"text": "the window of 28.22 s, caf\u00e9 the window of 28.28 s, caf\u00e9 the window of 13.50 s, caf\u00e9"
+}
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 28.22,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 28.28,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 13.5,
+"streaming": false,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_windows_in_flight_follow_the_share_alike[false-64]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+{
+"text": "the window of 28.22 s, caf\u00e9 the window of 28.28 s, caf\u00e9 the window of 13.50 s, caf\u00e9"
+}
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 28.22,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 28.28,
+"streaming": false,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 13.5,
+"streaming": false,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_windows_in_flight_follow_the_share_alike[true-2]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+[
+{
+"delta": " the",
+"type": "transcript.text.delta"
+},
+{
+"delta": " wind",
+"type": "transcript.text.delta"
+},
+{
+"delta": "ow of",
+"type": "transcript.text.delta"
+},
+{
+"delta": " 28.2",
+"type": "transcript.text.delta"
+},
+{
+"delta": "2 s, ",
+"type": "transcript.text.delta"
+},
+{
+"delta": "caf\u00e9",
+"type": "transcript.text.delta"
+},
+{
+"delta": " ",
+"type": "transcript.text.delta"
+},
+{
+"delta": " the",
+"type": "transcript.text.delta"
+},
+{
+"delta": " wind",
+"type": "transcript.text.delta"
+},
+{
+"delta": "ow of",
+"type": "transcript.text.delta"
+},
+{
+"delta": " 28.2",
+"type": "transcript.text.delta"
+},
+{
+"delta": "8 s, ",
+"type": "transcript.text.delta"
+},
+{
+"delta": "caf\u00e9",
+"type": "transcript.text.delta"
+},
+{
+"delta": " ",
+"type": "transcript.text.delta"
+},
+{
+"delta": " the",
+"type": "transcript.text.delta"
+},
+{
+"delta": " wind",
+"type": "transcript.text.delta"
+},
+{
+"delta": "ow of",
+"type": "transcript.text.delta"
+},
+{
+"delta": " 13.5",
+"type": "transcript.text.delta"
+},
+{
+"delta": "0 s, ",
+"type": "transcript.text.delta"
+},
+{
+"delta": "caf\u00e9",
+"type": "transcript.text.delta"
+},
+{
+"text": "the window of 28.22 s, caf\u00e9 the window of 28.28 s, caf\u00e9 the window of 13.50 s, caf\u00e9",
+"type": "transcript.text.done",
+"usage": {
+"seconds": 70,
+"type": "duration"
+}
+},
+"[DONE]"
+]
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 28.22,
+"streaming": true,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 28.28,
+"streaming": true,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 13.5,
+"streaming": true,
+"text": ""
+}
+]
+]
+},
+true
+]
+},
+"test_windows_in_flight_follow_the_share_alike[true-64]#0": {
+"__tuple__": [
+{
+"__tuple__": [
+{
+"__tuple__": [
+200,
+[
+{
+"delta": " the",
+"type": "transcript.text.delta"
+},
+{
+"delta": " wind",
+"type": "transcript.text.delta"
+},
+{
+"delta": "ow of",
+"type": "transcript.text.delta"
+},
+{
+"delta": " 28.2",
+"type": "transcript.text.delta"
+},
+{
+"delta": "2 s, ",
+"type": "transcript.text.delta"
+},
+{
+"delta": "caf\u00e9",
+"type": "transcript.text.delta"
+},
+{
+"delta": " ",
+"type": "transcript.text.delta"
+},
+{
+"delta": " the",
+"type": "transcript.text.delta"
+},
+{
+"delta": " wind",
+"type": "transcript.text.delta"
+},
+{
+"delta": "ow of",
+"type": "transcript.text.delta"
+},
+{
+"delta": " 28.2",
+"type": "transcript.text.delta"
+},
+{
+"delta": "8 s, ",
+"type": "transcript.text.delta"
+},
+{
+"delta": "caf\u00e9",
+"type": "transcript.text.delta"
+},
+{
+"delta": " ",
+"type": "transcript.text.delta"
+},
+{
+"delta": " the",
+"type": "transcript.text.delta"
+},
+{
+"delta": " wind",
+"type": "transcript.text.delta"
+},
+{
+"delta": "ow of",
+"type": "transcript.text.delta"
+},
+{
+"delta": " 13.5",
+"type": "transcript.text.delta"
+},
+{
+"delta": "0 s, ",
+"type": "transcript.text.delta"
+},
+{
+"delta": "caf\u00e9",
+"type": "transcript.text.delta"
+},
+{
+"text": "the window of 28.22 s, caf\u00e9 the window of 28.28 s, caf\u00e9 the window of 13.50 s, caf\u00e9",
+"type": "transcript.text.done",
+"usage": {
+"seconds": 70,
+"type": "duration"
+}
+},
+"[DONE]"
+]
+]
+},
+[
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 28.22,
+"streaming": true,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 28.28,
+"streaming": true,
+"text": ""
+},
+{
+"in": [
+"audio",
+"text"
+],
+"mk": {},
+"out": [
+"text"
+],
+"seconds": 13.5,
+"streaming": true,
+"text": ""
+}
+]
+]
+},
+true
+]
+}
+}

@@ -809,7 +809,7 @@ def test_adapter_maps_the_request():
 
 
 class _InProcessAPI:
-    """The APIServer surface the transcription route uses, running the model
+    """``APIServer.submit_request`` for one transcription, running the model
     in-process: load_audio -> process_prompt -> the node -> postprocess."""
 
     def __init__(self, model, upload_dir):
@@ -835,7 +835,7 @@ class _InProcessAPI:
         self.results[kw["request_id"]] = [types.SimpleNamespace(modality="text", data=text, metadata={})]
         return kw["request_id"]
 
-    async def collect_results(self, request_id, raw_request=None):
+    async def collect_results(self, request_id):
         return self.results.pop(request_id)
 
     async def iter_result_chunks(self, request_id):
@@ -844,31 +844,6 @@ class _InProcessAPI:
 
     def release_request(self, request_id):
         self.results.pop(request_id, None)
-
-
-@pytest.fixture
-def route(tiny_model, tmp_path, monkeypatch):
-    pytest.importorskip("fastapi")
-    pytest.importorskip("httpx")
-    from fastapi import FastAPI
-    from fastapi.testclient import TestClient
-
-    import mstar.api_server
-
-    api = _InProcessAPI(tiny_model, tmp_path / "uploads")
-    api.model_name = KEYS[0]
-    fake_ep = types.ModuleType("mstar.api_server.entrypoint")
-    fake_ep.api_server = api
-    monkeypatch.setitem(sys.modules, "mstar.api_server.entrypoint", fake_ep)
-    monkeypatch.setattr(mstar.api_server, "entrypoint", fake_ep, raising=False)
-    monkeypatch.setitem(sys.modules, "soundfile", None)
-    monkeypatch.setitem(sys.modules, "torchcodec", None)
-    monkeypatch.setitem(sys.modules, "torchcodec.decoders", None)
-    from mstar.api_server.openai.router import router
-
-    app = FastAPI()
-    app.include_router(router)
-    return TestClient(app), api
 
 
 def _wav_upload(seconds: float, rate: int = 16000, seed: int = 0) -> bytes:
@@ -883,49 +858,28 @@ def _wav_upload(seconds: float, rate: int = 16000, seed: int = 0) -> bytes:
     return path.getvalue()
 
 
-def test_transcription_route_end_to_end(route, tiny_model, tmp_path):
-    client, api = route
-    upload = _wav_upload(2.5)
-    r = client.post(
-        "/v1/audio/transcriptions",
-        data={"model": KEYS[0], "language": "yo", "response_format": "json"},
-        files={"file": ("clip.wav", upload, "audio/wav")},
+def test_a_transcription_runs_the_adapter_and_the_model_end_to_end(tiny_model, tmp_path):
+    """The adapter's request through the model in-process, and its parse of
+    the reply, give the text of running the pieces by hand on the same file."""
+    pytest.importorskip("pydantic")
+    from mstar.api_server.openai.adapters import get_adapter
+    from mstar.api_server.openai.protocol import TranscriptionRequest
+
+    api = _InProcessAPI(tiny_model, tmp_path / "uploads")
+    path = tmp_path / "clip.wav"
+    path.write_bytes(_wav_upload(2.5))
+    adapter = get_adapter(KEYS[0])
+    req = TranscriptionRequest(model=KEYS[0], language="yo", response_format="json")
+    args = adapter.transcription_to_request(req, str(path))
+    rid = api.submit_request(
+        text=args.text, file_paths=args.file_paths, input_modalities=args.input_modalities,
+        output_modalities=args.output_modalities, model_kwargs=args.model_kwargs, request_id="r0",
     )
-    assert r.status_code == 200, r.text
-    # the same text as running the pieces by hand on the same file
-    path = tmp_path / "same.wav"
-    path.write_bytes(upload)
+    (chunk,) = api.results.pop(rid)
     wave_in = audio.preprocess(audio.load_waveform(str(path)))
     expected = tiny_model.postprocess(_run_node(api.sub, [wave_in])["r0"], "text").decode()
-    assert r.json() == {"text": expected.strip()}
-    assert len(api.submits) == 1 and api.submits[0]["input_modalities"] == ["audio"]
-    # no timestamps, and this fixture can't read the upload's duration (no
-    # soundfile/torchcodec), so the one window is untimed: no segments, one srt cue
-    r = client.post(
-        "/v1/audio/transcriptions",
-        data={"model": KEYS[0], "response_format": "verbose_json"},
-        files={"file": ("clip.wav", upload, "audio/wav")},
-    )
-    assert r.status_code == 200, r.text
-    assert r.json()["text"] == expected.strip() and r.json()["segments"] == []
-    r = client.post(
-        "/v1/audio/transcriptions",
-        data={"model": KEYS[0], "response_format": "srt"},
-        files={"file": ("clip.wav", upload, "audio/wav")},
-    )
-    assert r.status_code == 200 and r.text.count(" --> ") == 1, r.text
-
-
-def test_transcription_route_rejects_an_over_cap_clip_it_cannot_window(route):
-    # without soundfile/torchcodec the route cannot read the duration to window
-    # the upload, so the model sees all 41 s and refuses it rather than cutting it
-    client, api = route
-    r = client.post(
-        "/v1/audio/transcriptions",
-        data={"model": KEYS[0]},
-        files={"file": ("long.wav", _wav_upload(41), "audio/wav")},
-    )
-    assert r.status_code == 400 and "at most 40 s" in r.text, (r.status_code, r.text)
+    assert adapter.parse_transcript(chunk.data.decode(), req).text == expected.strip()
+    assert args.input_modalities == ["audio"]
 
 
 def test_long_uploads_are_cut_into_balanced_windows(tmp_path):
@@ -951,159 +905,3 @@ def test_long_uploads_are_cut_into_balanced_windows(tmp_path):
             audio.preprocess(torch.from_numpy(p))
 
 
-class _WaveSoundfile(types.ModuleType):
-    """``soundfile`` for WAV files over the standard library, so the route can
-    read durations and decode windowed uploads where soundfile isn't installed."""
-
-    def __init__(self):
-        super().__init__("soundfile")
-
-    @staticmethod
-    def _open(path):
-        with wave.open(str(path)) as wf:
-            pcm = np.frombuffer(wf.readframes(wf.getnframes()), dtype="<i2").reshape(-1, wf.getnchannels())
-            return pcm.astype(np.float32) / 32768.0, wf.getframerate()
-
-    def info(self, path):
-        with wave.open(str(path)) as wf:
-            return types.SimpleNamespace(frames=wf.getnframes(), samplerate=wf.getframerate())
-
-    def read(self, path, dtype="float32", always_2d=False):
-        data, rate = self._open(path)
-        return (data if always_2d or data.shape[1] > 1 else data[:, 0]), rate
-
-    def SoundFile(self, path):
-        return _WaveSoundFile(*self._open(path))
-
-
-class _WaveSoundFile:
-    """A ``_WaveSoundfile`` file opened for block reads."""
-
-    def __init__(self, data, rate):
-        self._data, self.samplerate, self._pos = data, rate, 0
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, *exc):
-        return False
-
-    def read(self, frames=-1, dtype="float32", always_2d=False):
-        end = len(self._data) if frames < 0 else min(self._pos + frames, len(self._data))
-        block, self._pos = self._data[self._pos : end], end
-        return block if always_2d or block.shape[1] > 1 else block[:, 0]
-
-
-@pytest.fixture
-def windowing_route(route, monkeypatch):
-    monkeypatch.setitem(sys.modules, "soundfile", _WaveSoundfile())
-    return route
-
-
-def _wav_bytes(samples: np.ndarray, rate: int = 16000) -> bytes:
-    buf = io.BytesIO()
-    with wave.open(buf, "wb") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
-        wf.setframerate(rate)
-        wf.writeframes(np.round(np.clip(samples, -1, 1) * 32767).astype("<i2").tobytes())
-    return buf.getvalue()
-
-
-def test_a_long_upload_ending_in_silence_is_transcribed(windowing_route):
-    client, api = windowing_route
-    rng = np.random.default_rng(3)
-    samples = np.concatenate([rng.uniform(-0.3, 0.3, 38 * 16000), np.zeros(round(2.01 * 16000))])
-    for fields, windows in (({}, 3), ({"window_seconds": "40"}, 2)):
-        api.submits.clear()
-        r = client.post(
-            "/v1/audio/transcriptions",
-            data={"model": KEYS[0], **fields},
-            files={"file": ("long.wav", _wav_bytes(samples), "audio/wav")},
-        )
-        assert r.status_code == 200, r.text
-        assert len(api.submits) >= windows
-        assert all("window_seconds" not in s["model_kwargs"] for s in api.submits)
-
-
-def test_uploads_up_to_20_s_are_heard_whole_and_longer_ones_in_16_s_windows(windowing_route):
-    client, api = windowing_route
-    rng = np.random.default_rng(5)
-    for seconds, fields, windows in ((20.0, {}, 1), (21.0, {}, 2), (39.0, {}, 3), (18.0, {"window_seconds": "10"}, 2)):
-        # every frame equally loud, so each cut stays on its nominal boundary
-        samples = 0.3 * rng.choice([-1.0, 1.0], int(seconds * 16000))
-        api.submits.clear()
-        r = client.post(
-            "/v1/audio/transcriptions",
-            data={"model": KEYS[0], **fields},
-            files={"file": ("a.wav", _wav_bytes(samples), "audio/wav")},
-        )
-        assert r.status_code == 200, r.text
-        assert len(api.submits) == windows, (seconds, fields, len(api.submits))
-
-
-def test_the_planner_takes_the_adapters_window_policy(tmp_path):
-    from mstar.api_server.openai.adapters import OmnilingualASRAdapter
-    from mstar.api_server.openai.serving_transcriptions import planner_for
-
-    path = tmp_path / "a.wav"
-    path.write_bytes(_wav_bytes(np.zeros(16000)))
-    planner = planner_for(OmnilingualASRAdapter(), str(path), tmp_path)
-    assert (planner.max_seconds, planner.whole_seconds, planner.balanced) == (16.0, 20.0, True)
-    assert (planner.search_seconds, planner.frame_seconds) == (5.0, 0.1)
-    # a short window a request asks for searches at most a third of its length
-    planner = planner_for(OmnilingualASRAdapter(), str(path), tmp_path, 6.0)
-    assert (planner.max_seconds, planner.whole_seconds, planner.search_seconds) == (6.0, 6.0, 2.0)
-
-
-def test_window_seconds_is_bounded_by_the_clip_cap(windowing_route):
-    client, api = windowing_route
-    for bad in ("4", "41", "nan", "soon"):
-        r = client.post(
-            "/v1/audio/transcriptions",
-            data={"model": KEYS[0], "window_seconds": bad},
-            files={"file": ("a.wav", _wav_bytes(np.zeros(16000)), "audio/wav")},
-        )
-        assert r.status_code == 400 and "window_seconds must be between 5 and 40" in r.text, (bad, r.text)
-    assert api.submits == []
-
-
-def test_a_windowed_upload_at_a_crafted_rate_is_refused_before_resampling(windowing_route, monkeypatch):
-    """Uploads over the window length are decoded by the route, not the model:
-    a 41 s WAV at 100,003 Hz used to build a 1.6G-float resampling kernel there
-    (seconds of a blocked event loop) before any check ran."""
-    client, api = windowing_route
-
-    def no_resample(*args, **kwargs):
-        raise AssertionError("resampled from an unsupported rate")
-
-    monkeypatch.setattr(torchaudio.functional, "resample", no_resample)
-    r = client.post(
-        "/v1/audio/transcriptions",
-        data={"model": KEYS[0]},
-        files={"file": ("odd.wav", _wav_bytes(np.zeros(41 * 100003), 100003), "audio/wav")},
-    )
-    assert r.status_code == 400 and "unsupported sample rate 100003 Hz" in r.text, r.text
-    assert api.submits == []
-    assert list(api.upload_dir.iterdir()) == []
-
-
-@pytest.mark.parametrize("stream", [False, True])
-@pytest.mark.parametrize("error", [RuntimeError, ImportError])
-def test_a_windowed_upload_that_fails_to_decode_is_removed(windowing_route, monkeypatch, stream, error):
-    # the header is readable, the body is not: the decode raises something other than ValueError
-    from mstar.api_server import media_io
-
-    def broken(path, sample_rate, max_seconds=None):
-        raise error("corrupt stream")
-
-    monkeypatch.setattr(media_io, "decode_audio", broken)
-    client, api = windowing_route
-    r = client.post(
-        "/v1/audio/transcriptions",
-        data={"model": KEYS[0], "stream": "true" if stream else "false"},
-        files={"file": ("corrupt.wav", _wav_bytes(np.zeros(21 * 16000)), "audio/wav")},
-    )
-    assert r.status_code == 500, r.text
-    assert api.submits == []
-    assert list(api.upload_dir.iterdir()) == []

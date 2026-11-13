@@ -84,7 +84,7 @@ Keep resident capacity separate from one-step batching: a pool may retain many s
 
 **Register it: [registration.md](references/registration.md) is the checklist.** `test/modular/test_model_registration.py` enforces the registry, the CLI default config and the docs row, so CI catches those three. Forgetting the CLI entry means `mstar serve <model>` exits `unknown model` no matter how correct the code is.
 
-If the model gets OpenAI routes, its adapter lands in both frontends: the Python HTTP frontend is being retired, so the Rust port (`rust/server/src/adapters/`) is part of the adapter, not a follow-up (AGENTS.md invariant 15; [registration.md](references/registration.md) §5).
+If the model gets OpenAI routes, its adapter is a Python class plus its Rust port (`rust/server/src/adapters/`): `mstar-server` serves the routes, so the port is part of the adapter, not a follow-up (AGENTS.md invariant 15; [registration.md](references/registration.md) §5).
 
 Grep for callers before overriding any base-model or submodule hook — the hook surface contains refactored-out methods that nothing calls, and overriding one is a silent no-op.
 

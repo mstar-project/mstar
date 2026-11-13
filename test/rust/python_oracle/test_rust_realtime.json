@@ -1,0 +1,4166 @@
+{
+"test_24khz_input_is_resampled_alike#0": {
+"__tuple__": [
+[
+{
+"session": {
+"id": "S",
+"input_audio_format": "pcm16",
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 16000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.created"
+},
+{
+"session": {
+"id": "S",
+"input_audio_format": {
+"rate": 24000,
+"type": "audio/pcm"
+},
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 24000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.updated"
+},
+{
+"delta": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w",
+"item_id": 0,
+"type": "conversation.item.input_audio_transcription.delta"
+},
+{
+"audio_seconds": 2.0,
+"chunk_id": 1,
+"item_id": 0,
+"text": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3",
+"type": "mstar.transcription.partial"
+},
+{
+"delta": "\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6 w",
+"item_id": 0,
+"type": "conversation.item.input_audio_transcription.delta"
+},
+{
+"audio_seconds": 4.0,
+"chunk_id": 2,
+"item_id": 0,
+"text": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6 w\u00f6rd7",
+"type": "mstar.transcription.partial"
+},
+{
+"delta": "\u00f6rd7 w\u00f6rd8 w\u00f6rd9",
+"item_id": 0,
+"type": "conversation.item.input_audio_transcription.delta"
+},
+{
+"audio_seconds": 5.0,
+"chunk_id": 3,
+"item_id": 0,
+"text": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6 w\u00f6rd7 w\u00f6rd8 w\u00f6rd9",
+"type": "mstar.transcription.partial"
+},
+{
+"item_id": 0,
+"type": "input_audio_buffer.committed"
+},
+{
+"item_id": 0,
+"transcript": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6 w\u00f6rd7 w\u00f6rd8 w\u00f6rd9",
+"type": "conversation.item.input_audio_transcription.completed"
+},
+{
+"type": "input_audio_buffer.cleared"
+},
+{
+"error": {
+"message": "unknown event 'mstar.end'",
+"type": "invalid_request_error"
+},
+"type": "error"
+}
+],
+[
+{
+"audio": "6b5a5f0e4a97c63ce35cd861ac5d63a254b17655",
+"mk": {},
+"seconds": 2.0
+},
+{
+"audio": "d73f73b80f0d73ab13f0c88c74e51e815f4a4253",
+"mk": {},
+"seconds": 4.0
+},
+{
+"audio": "3ed45a3cb38c8e523011c60dec5b6ffe87a22d66",
+"mk": {
+"assistant_prefix": "language English<asr_text>w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6 w"
+},
+"seconds": 5.0
+}
+]
+]
+},
+"test_a_refused_update_reads_as_pythons[chunk-cap]#0": {
+"__tuple__": [
+[
+{
+"session": {
+"id": "S",
+"input_audio_format": "pcm16",
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 16000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.created"
+},
+{
+"error": {
+"message": "mstar.chunk_seconds must be a number between 0.5 and 300; got 1000",
+"type": "invalid_request_error"
+},
+"type": "error"
+},
+{
+"session": {
+"id": "S",
+"input_audio_format": "pcm16",
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 16000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.updated"
+},
+{
+"error": {
+"message": "unknown event 'mstar.end'",
+"type": "invalid_request_error"
+},
+"type": "error"
+}
+],
+[]
+]
+},
+"test_a_refused_update_reads_as_pythons[chunk]#0": {
+"__tuple__": [
+[
+{
+"session": {
+"id": "S",
+"input_audio_format": "pcm16",
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 16000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.created"
+},
+{
+"error": {
+"message": "mstar.chunk_seconds must be a number between 0.5 and 300; got 'fast'",
+"type": "invalid_request_error"
+},
+"type": "error"
+},
+{
+"session": {
+"id": "S",
+"input_audio_format": "pcm16",
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 16000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.updated"
+},
+{
+"error": {
+"message": "unknown event 'mstar.end'",
+"type": "invalid_request_error"
+},
+"type": "error"
+}
+],
+[]
+]
+},
+"test_a_refused_update_reads_as_pythons[eagerness]#0": {
+"__tuple__": [
+[
+{
+"session": {
+"id": "S",
+"input_audio_format": "pcm16",
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 16000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.created"
+},
+{
+"error": {
+"message": "turn_detection.eagerness must be one of low, medium, high, auto; got 'very'",
+"type": "invalid_request_error"
+},
+"type": "error"
+},
+{
+"session": {
+"id": "S",
+"input_audio_format": "pcm16",
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 16000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.updated"
+},
+{
+"error": {
+"message": "unknown event 'mstar.end'",
+"type": "invalid_request_error"
+},
+"type": "error"
+}
+],
+[]
+]
+},
+"test_a_refused_update_reads_as_pythons[flag]#0": {
+"__tuple__": [
+[
+{
+"session": {
+"id": "S",
+"input_audio_format": "pcm16",
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 16000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.created"
+},
+{
+"error": {
+"message": "turn_detection.create_response must be a boolean; got 'yes'",
+"type": "invalid_request_error"
+},
+"type": "error"
+},
+{
+"session": {
+"id": "S",
+"input_audio_format": "pcm16",
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 16000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.updated"
+},
+{
+"error": {
+"message": "unknown event 'mstar.end'",
+"type": "invalid_request_error"
+},
+"type": "error"
+}
+],
+[]
+]
+},
+"test_a_refused_update_reads_as_pythons[format-extra]#0": {
+"__tuple__": [
+[
+{
+"session": {
+"id": "S",
+"input_audio_format": "pcm16",
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 16000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.created"
+},
+{
+"error": {
+"message": "input_audio_format takes only type and rate; got ['channels']",
+"type": "invalid_request_error"
+},
+"type": "error"
+},
+{
+"session": {
+"id": "S",
+"input_audio_format": "pcm16",
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 16000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.updated"
+},
+{
+"error": {
+"message": "unknown event 'mstar.end'",
+"type": "invalid_request_error"
+},
+"type": "error"
+}
+],
+[]
+]
+},
+"test_a_refused_update_reads_as_pythons[format-no-type]#0": {
+"__tuple__": [
+[
+{
+"session": {
+"id": "S",
+"input_audio_format": "pcm16",
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 16000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.created"
+},
+{
+"error": {
+"message": "input_audio_format.type must be \"audio/pcm\", \"audio/pcmu\" or \"audio/pcma\"; got None",
+"type": "invalid_request_error"
+},
+"type": "error"
+},
+{
+"session": {
+"id": "S",
+"input_audio_format": "pcm16",
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 16000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.updated"
+},
+{
+"error": {
+"message": "unknown event 'mstar.end'",
+"type": "invalid_request_error"
+},
+"type": "error"
+}
+],
+[]
+]
+},
+"test_a_refused_update_reads_as_pythons[format-type]#0": {
+"__tuple__": [
+[
+{
+"session": {
+"id": "S",
+"input_audio_format": "pcm16",
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 16000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.created"
+},
+{
+"error": {
+"message": "input_audio_format.type must be \"audio/pcm\", \"audio/pcmu\" or \"audio/pcma\"; got 'audio/opus'",
+"type": "invalid_request_error"
+},
+"type": "error"
+},
+{
+"session": {
+"id": "S",
+"input_audio_format": "pcm16",
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 16000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.updated"
+},
+{
+"error": {
+"message": "unknown event 'mstar.end'",
+"type": "invalid_request_error"
+},
+"type": "error"
+}
+],
+[]
+]
+},
+"test_a_refused_update_reads_as_pythons[format]#0": {
+"__tuple__": [
+[
+{
+"session": {
+"id": "S",
+"input_audio_format": "pcm16",
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 16000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.created"
+},
+{
+"error": {
+"message": "input_audio_format must be pcm16, g711_ulaw, g711_alaw or an object; got 'mp3'",
+"type": "invalid_request_error"
+},
+"type": "error"
+},
+{
+"session": {
+"id": "S",
+"input_audio_format": "pcm16",
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 16000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.updated"
+},
+{
+"error": {
+"message": "unknown event 'mstar.end'",
+"type": "invalid_request_error"
+},
+"type": "error"
+}
+],
+[]
+]
+},
+"test_a_refused_update_reads_as_pythons[g711-rate-bool]#0": {
+"__tuple__": [
+[
+{
+"session": {
+"id": "S",
+"input_audio_format": "pcm16",
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 16000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.created"
+},
+{
+"error": {
+"message": "input_audio_format: audio/pcma is 8000 Hz; got rate True",
+"type": "invalid_request_error"
+},
+"type": "error"
+},
+{
+"session": {
+"id": "S",
+"input_audio_format": "pcm16",
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 16000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.updated"
+},
+{
+"error": {
+"message": "unknown event 'mstar.end'",
+"type": "invalid_request_error"
+},
+"type": "error"
+}
+],
+[]
+]
+},
+"test_a_refused_update_reads_as_pythons[g711-rate]#0": {
+"__tuple__": [
+[
+{
+"session": {
+"id": "S",
+"input_audio_format": "pcm16",
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 16000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.created"
+},
+{
+"error": {
+"message": "input_audio_format: audio/pcmu is 8000 Hz; got rate 16000",
+"type": "invalid_request_error"
+},
+"type": "error"
+},
+{
+"session": {
+"id": "S",
+"input_audio_format": "pcm16",
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 16000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.updated"
+},
+{
+"error": {
+"message": "unknown event 'mstar.end'",
+"type": "invalid_request_error"
+},
+"type": "error"
+}
+],
+[]
+]
+},
+"test_a_refused_update_reads_as_pythons[idle]#0": {
+"__tuple__": [
+[
+{
+"session": {
+"id": "S",
+"input_audio_format": "pcm16",
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 16000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.created"
+},
+{
+"error": {
+"message": "turn_detection.idle_timeout_ms is not supported",
+"type": "invalid_request_error"
+},
+"type": "error"
+},
+{
+"session": {
+"id": "S",
+"input_audio_format": "pcm16",
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 16000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.updated"
+},
+{
+"error": {
+"message": "unknown event 'mstar.end'",
+"type": "invalid_request_error"
+},
+"type": "error"
+}
+],
+[]
+]
+},
+"test_a_refused_update_reads_as_pythons[language-long]#0": {
+"__tuple__": [
+[
+{
+"session": {
+"id": "S",
+"input_audio_format": "pcm16",
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 16000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.created"
+},
+{
+"error": {
+"message": "input_audio_transcription.language must be at most 32 characters; got 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx'",
+"type": "invalid_request_error"
+},
+"type": "error"
+},
+{
+"session": {
+"id": "S",
+"input_audio_format": "pcm16",
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 16000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.updated"
+},
+{
+"error": {
+"message": "unknown event 'mstar.end'",
+"type": "invalid_request_error"
+},
+"type": "error"
+}
+],
+[]
+]
+},
+"test_a_refused_update_reads_as_pythons[language]#0": {
+"__tuple__": [
+[
+{
+"session": {
+"id": "S",
+"input_audio_format": "pcm16",
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 16000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.created"
+},
+{
+"error": {
+"message": "input_audio_transcription.language must be a string; got 5",
+"type": "invalid_request_error"
+},
+"type": "error"
+},
+{
+"session": {
+"id": "S",
+"input_audio_format": "pcm16",
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 16000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.updated"
+},
+{
+"error": {
+"message": "unknown event 'mstar.end'",
+"type": "invalid_request_error"
+},
+"type": "error"
+}
+],
+[]
+]
+},
+"test_a_refused_update_reads_as_pythons[not-objects]#0": {
+"__tuple__": [
+[
+{
+"session": {
+"id": "S",
+"input_audio_format": "pcm16",
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 16000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.created"
+},
+{
+"error": {
+"message": "mstar must be an object",
+"type": "invalid_request_error"
+},
+"type": "error"
+},
+{
+"session": {
+"id": "S",
+"input_audio_format": "pcm16",
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 16000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.updated"
+},
+{
+"error": {
+"message": "unknown event 'mstar.end'",
+"type": "invalid_request_error"
+},
+"type": "error"
+}
+],
+[]
+]
+},
+"test_a_refused_update_reads_as_pythons[rate-bool]#0": {
+"__tuple__": [
+[
+{
+"session": {
+"id": "S",
+"input_audio_format": "pcm16",
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 16000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.created"
+},
+{
+"error": {
+"message": "input_audio_format.rate True Hz is not supported; use one of [8000, 11025, 16000, 22050, 24000, 32000, 44100, 48000]",
+"type": "invalid_request_error"
+},
+"type": "error"
+},
+{
+"session": {
+"id": "S",
+"input_audio_format": "pcm16",
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 16000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.updated"
+},
+{
+"error": {
+"message": "unknown event 'mstar.end'",
+"type": "invalid_request_error"
+},
+"type": "error"
+}
+],
+[]
+]
+},
+"test_a_refused_update_reads_as_pythons[rate-float]#0": {
+"__tuple__": [
+[
+{
+"session": {
+"id": "S",
+"input_audio_format": "pcm16",
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 16000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.created"
+},
+{
+"error": {
+"message": "input_audio_format.rate 16000.0 Hz is not supported; use one of [8000, 11025, 16000, 22050, 24000, 32000, 44100, 48000]",
+"type": "invalid_request_error"
+},
+"type": "error"
+},
+{
+"session": {
+"id": "S",
+"input_audio_format": "pcm16",
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 16000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.updated"
+},
+{
+"error": {
+"message": "unknown event 'mstar.end'",
+"type": "invalid_request_error"
+},
+"type": "error"
+}
+],
+[]
+]
+},
+"test_a_refused_update_reads_as_pythons[rate]#0": {
+"__tuple__": [
+[
+{
+"session": {
+"id": "S",
+"input_audio_format": "pcm16",
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 16000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.created"
+},
+{
+"error": {
+"message": "input_audio_format.rate 44000 Hz is not supported; use one of [8000, 11025, 16000, 22050, 24000, 32000, 44100, 48000]",
+"type": "invalid_request_error"
+},
+"type": "error"
+},
+{
+"session": {
+"id": "S",
+"input_audio_format": "pcm16",
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 16000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.updated"
+},
+{
+"error": {
+"message": "unknown event 'mstar.end'",
+"type": "invalid_request_error"
+},
+"type": "error"
+}
+],
+[]
+]
+},
+"test_a_refused_update_reads_as_pythons[semantic]#0": {
+"__tuple__": [
+[
+{
+"session": {
+"id": "S",
+"input_audio_format": "pcm16",
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 16000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.created"
+},
+{
+"error": {
+"message": "semantic_vad is unavailable here (no Smart Turn weights on this server; see the server log); use server_vad, or set turn_detection to null and commit with input_audio_buffer.commit",
+"type": "invalid_request_error"
+},
+"type": "error"
+},
+{
+"session": {
+"id": "S",
+"input_audio_format": "pcm16",
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 16000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.updated"
+},
+{
+"error": {
+"message": "unknown event 'mstar.end'",
+"type": "invalid_request_error"
+},
+"type": "error"
+}
+],
+[]
+]
+},
+"test_a_refused_update_reads_as_pythons[silence]#0": {
+"__tuple__": [
+[
+{
+"session": {
+"id": "S",
+"input_audio_format": "pcm16",
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 16000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.created"
+},
+{
+"error": {
+"message": "turn_detection.silence_duration_ms must be an integer between 0 and 10000; got 1.5",
+"type": "invalid_request_error"
+},
+"type": "error"
+},
+{
+"session": {
+"id": "S",
+"input_audio_format": "pcm16",
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 16000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.updated"
+},
+{
+"error": {
+"message": "unknown event 'mstar.end'",
+"type": "invalid_request_error"
+},
+"type": "error"
+}
+],
+[]
+]
+},
+"test_a_refused_update_reads_as_pythons[threshold]#0": {
+"__tuple__": [
+[
+{
+"session": {
+"id": "S",
+"input_audio_format": "pcm16",
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 16000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.created"
+},
+{
+"error": {
+"message": "turn_detection.threshold must be a number between 0 and 1; got 2",
+"type": "invalid_request_error"
+},
+"type": "error"
+},
+{
+"session": {
+"id": "S",
+"input_audio_format": "pcm16",
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 16000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.updated"
+},
+{
+"error": {
+"message": "unknown event 'mstar.end'",
+"type": "invalid_request_error"
+},
+"type": "error"
+}
+],
+[]
+]
+},
+"test_a_refused_update_reads_as_pythons[turn-key]#0": {
+"__tuple__": [
+[
+{
+"session": {
+"id": "S",
+"input_audio_format": "pcm16",
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 16000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.created"
+},
+{
+"error": {
+"message": "turn_detection.'speed' is not supported",
+"type": "invalid_request_error"
+},
+"type": "error"
+},
+{
+"session": {
+"id": "S",
+"input_audio_format": "pcm16",
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 16000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.updated"
+},
+{
+"error": {
+"message": "unknown event 'mstar.end'",
+"type": "invalid_request_error"
+},
+"type": "error"
+}
+],
+[]
+]
+},
+"test_a_refused_update_reads_as_pythons[turn-type]#0": {
+"__tuple__": [
+[
+{
+"session": {
+"id": "S",
+"input_audio_format": "pcm16",
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 16000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.created"
+},
+{
+"error": {
+"message": "turn_detection type 'magic' is not supported; use server_vad, semantic_vad, or null to commit with input_audio_buffer.commit",
+"type": "invalid_request_error"
+},
+"type": "error"
+},
+{
+"session": {
+"id": "S",
+"input_audio_format": "pcm16",
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 16000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.updated"
+},
+{
+"error": {
+"message": "unknown event 'mstar.end'",
+"type": "invalid_request_error"
+},
+"type": "error"
+}
+],
+[]
+]
+},
+"test_a_refused_update_reads_as_pythons[unfixed-float]#0": {
+"__tuple__": [
+[
+{
+"session": {
+"id": "S",
+"input_audio_format": "pcm16",
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 16000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.created"
+},
+{
+"error": {
+"message": "mstar.unfixed_chunks must be an integer >= 0; got 1.5",
+"type": "invalid_request_error"
+},
+"type": "error"
+},
+{
+"session": {
+"id": "S",
+"input_audio_format": "pcm16",
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 16000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.updated"
+},
+{
+"error": {
+"message": "unknown event 'mstar.end'",
+"type": "invalid_request_error"
+},
+"type": "error"
+}
+],
+[]
+]
+},
+"test_a_refused_update_reads_as_pythons[unfixed]#0": {
+"__tuple__": [
+[
+{
+"session": {
+"id": "S",
+"input_audio_format": "pcm16",
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 16000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.created"
+},
+{
+"error": {
+"message": "mstar.unfixed_tokens must be an integer >= 0; got -1",
+"type": "invalid_request_error"
+},
+"type": "error"
+},
+{
+"session": {
+"id": "S",
+"input_audio_format": "pcm16",
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 16000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.updated"
+},
+{
+"error": {
+"message": "unknown event 'mstar.end'",
+"type": "invalid_request_error"
+},
+"type": "error"
+}
+],
+[]
+]
+},
+"test_an_append_or_item_past_the_cap_is_refused_alike#0": {
+"__tuple__": [
+[
+{
+"session": {
+"id": "S",
+"input_audio_format": "pcm16",
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 16000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.created"
+},
+{
+"session": {
+"id": "S",
+"input_audio_format": "g711_ulaw",
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 8000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.updated"
+},
+{
+"error": {
+"message": "an append holds at most 300 s of audio; send it in shorter appends",
+"type": "invalid_request_error"
+},
+"type": "error"
+},
+{
+"session": {
+"id": "S",
+"input_audio_format": "pcm16",
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 16000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.updated"
+},
+{
+"delta": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6 w\u00f6rd7 w\u00f6rd8 w\u00f6rd9 w\u00f6rd10 w\u00f6rd11 w\u00f6rd12 w\u00f6rd13 w\u00f6rd14 w\u00f6rd15 w\u00f6rd16 w\u00f6rd17 w\u00f6rd18 w\u00f6rd19 w\u00f6rd20 w\u00f6rd21 w\u00f6rd22 w\u00f6rd23 w\u00f6rd24 w\u00f6rd25 w\u00f6rd26 w\u00f6rd27 w\u00f6rd28 w\u00f6rd29 w\u00f6rd30 w\u00f6rd31 w\u00f6rd32 w\u00f6rd33 w\u00f6rd34 w\u00f6rd35 w\u00f6rd36 w\u00f6rd37 w\u00f6rd38 w\u00f6rd39 w\u00f6rd40 w\u00f6rd41 w\u00f6rd42 w\u00f6rd43 w\u00f6rd44 w\u00f6rd45 w\u00f6rd46 w\u00f6rd47 w\u00f6rd48 w\u00f6rd49 w\u00f6rd50 w\u00f6rd51 w\u00f6rd52 w\u00f6rd53 w\u00f6rd54 w\u00f6rd55 w\u00f6rd56 w\u00f6rd57 w\u00f6rd58 w\u00f6rd59 w\u00f6rd60 w\u00f6rd61 w\u00f6rd62 w\u00f6rd63 w\u00f6rd64 w\u00f6rd65 w\u00f6rd66 w\u00f6rd67 w\u00f6rd68 w\u00f6rd69 w\u00f6rd70 w\u00f6rd71 w\u00f6rd72 w\u00f6rd73 w\u00f6rd74 w\u00f6rd75 w\u00f6rd76 w\u00f6rd77 w\u00f6rd78 w\u00f6rd79 w\u00f6rd80 w\u00f6rd81 w\u00f6rd82 w\u00f6rd83 w\u00f6rd84 w\u00f6rd85 w\u00f6rd86 w\u00f6rd87 w\u00f6rd88 w\u00f6rd89 w\u00f6rd90 w\u00f6rd91 w\u00f6rd92 w\u00f6rd93 w\u00f6rd94 w\u00f6rd95 w\u00f6rd96 w\u00f6rd97 w\u00f6rd98 w\u00f6rd99 w\u00f6rd100 w\u00f6rd101 w\u00f6rd102 w\u00f6rd103 w\u00f6rd104 w\u00f6rd105 w\u00f6rd106 w\u00f6rd107 w\u00f6rd108 w\u00f6rd109 w\u00f6rd110 w\u00f6rd111 w\u00f6rd112 w\u00f6rd113 w\u00f6rd114 w\u00f6rd115 w\u00f6rd116 w\u00f6rd117 w\u00f6rd118 w\u00f6rd119 w\u00f6rd120 w\u00f6rd121 w\u00f6rd122 w\u00f6rd123 w\u00f6rd124 w\u00f6rd125 w\u00f6rd126 w\u00f6rd127 w\u00f6rd128 w\u00f6rd129 w\u00f6rd130 w\u00f6rd131 w\u00f6rd132 w\u00f6rd133 w\u00f6rd134 w\u00f6rd135 w\u00f6rd136 w\u00f6rd137 w\u00f6rd138 w\u00f6rd139 w\u00f6rd140 w\u00f6rd141 w\u00f6rd142 w\u00f6rd143 w\u00f6rd144 w\u00f6rd145 w\u00f6rd146 w\u00f6rd147 w\u00f6rd148 w\u00f6rd149 w\u00f6rd150 w\u00f6rd151 w\u00f6rd152 w\u00f6rd153 w\u00f6rd154 w\u00f6rd155 w\u00f6rd156 w\u00f6rd157 w\u00f6rd158 w\u00f6rd159 w\u00f6rd160 w\u00f6rd161 w\u00f6rd162 w\u00f6rd163 w\u00f6rd164 w\u00f6rd165 w\u00f6rd166 w\u00f6rd167 w\u00f6rd168 w\u00f6rd169 w\u00f6rd170 w\u00f6rd171 w\u00f6rd172 w\u00f6rd173 w\u00f6rd174 w\u00f6rd175 w\u00f6rd176 w\u00f6rd177 w\u00f6rd178 w\u00f6rd179 w\u00f6rd180 w\u00f6rd181 w\u00f6rd182 w\u00f6rd183 w\u00f6rd184 w\u00f6rd185 w\u00f6rd186 w\u00f6rd187 w\u00f6rd188 w\u00f6rd189 w\u00f6rd190 w\u00f6rd191 w\u00f6rd192 w\u00f6rd193 w\u00f6rd194 w\u00f6rd195 w\u00f6rd196 w\u00f6rd197 w\u00f6rd198 w\u00f6rd199 w\u00f6rd200 w\u00f6rd201 w\u00f6rd202 w\u00f6rd203 w\u00f6rd204 w\u00f6rd205 w\u00f6rd206 w\u00f6rd207 w\u00f6rd208 w\u00f6rd209 w\u00f6rd210 w\u00f6rd211 w\u00f6rd212 w\u00f6rd213 w\u00f6rd214 w\u00f6rd215 w\u00f6rd216 w\u00f6rd217 w\u00f6rd218 w\u00f6rd219 w\u00f6rd220 w\u00f6rd221 w\u00f6rd222 w\u00f6rd223 w\u00f6rd224 w\u00f6rd225 w\u00f6rd226 w\u00f6rd227 w\u00f6rd228 w\u00f6rd229 w\u00f6rd230 w\u00f6rd231 w\u00f6rd232 w\u00f6rd233 w\u00f6rd234 w\u00f6rd235 w\u00f6rd236 w\u00f6rd237 w\u00f6rd238 w\u00f6rd239 w\u00f6rd240 w\u00f6rd241 w\u00f6rd242 w\u00f6rd243 w\u00f6rd244 w\u00f6rd245 w\u00f6rd246 w\u00f6rd247 w\u00f6rd248 w\u00f6rd249 w\u00f6rd250 w\u00f6rd251 w\u00f6rd252 w\u00f6rd253 w\u00f6rd254 w\u00f6rd255 w\u00f6rd256 w\u00f6rd257 w\u00f6rd258 w\u00f6rd259 w\u00f6rd260 w\u00f6rd261 w\u00f6rd262 w\u00f6rd263 w\u00f6rd264 w\u00f6rd265 w\u00f6rd266 w\u00f6rd267 w\u00f6rd268 w\u00f6rd269 w\u00f6rd270 w\u00f6rd271 w\u00f6rd272 w\u00f6rd273 w\u00f6rd274 w\u00f6rd275 w\u00f6rd276 w\u00f6rd277 w\u00f6rd278 w\u00f6rd279 w\u00f6rd280 w\u00f6rd281 w\u00f6rd282 w\u00f6rd283 w\u00f6rd284 w\u00f6rd285 w\u00f6rd286 w\u00f6rd287 w\u00f6rd288 w\u00f6rd289 w\u00f6rd290 w\u00f6rd291 w\u00f6rd292 w\u00f6rd293 w\u00f6rd294 w\u00f6rd295 w\u00f6rd296 w\u00f6rd297 w\u00f6rd298 w\u00f6rd299 w\u00f6rd300 w\u00f6rd301 w\u00f6rd302 w\u00f6rd303 w\u00f6rd304 w\u00f6rd305 w\u00f6rd306 w\u00f6rd307 w\u00f6rd308 w\u00f6rd309 w\u00f6rd310 w\u00f6rd311 w\u00f6rd312 w\u00f6rd313 w\u00f6rd314 w\u00f6rd315 w\u00f6rd316 w\u00f6rd317 w\u00f6rd318 w\u00f6",
+"item_id": 0,
+"type": "conversation.item.input_audio_transcription.delta"
+},
+{
+"audio_seconds": 160.0,
+"chunk_id": 80,
+"item_id": 0,
+"text": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6 w\u00f6rd7 w\u00f6rd8 w\u00f6rd9 w\u00f6rd10 w\u00f6rd11 w\u00f6rd12 w\u00f6rd13 w\u00f6rd14 w\u00f6rd15 w\u00f6rd16 w\u00f6rd17 w\u00f6rd18 w\u00f6rd19 w\u00f6rd20 w\u00f6rd21 w\u00f6rd22 w\u00f6rd23 w\u00f6rd24 w\u00f6rd25 w\u00f6rd26 w\u00f6rd27 w\u00f6rd28 w\u00f6rd29 w\u00f6rd30 w\u00f6rd31 w\u00f6rd32 w\u00f6rd33 w\u00f6rd34 w\u00f6rd35 w\u00f6rd36 w\u00f6rd37 w\u00f6rd38 w\u00f6rd39 w\u00f6rd40 w\u00f6rd41 w\u00f6rd42 w\u00f6rd43 w\u00f6rd44 w\u00f6rd45 w\u00f6rd46 w\u00f6rd47 w\u00f6rd48 w\u00f6rd49 w\u00f6rd50 w\u00f6rd51 w\u00f6rd52 w\u00f6rd53 w\u00f6rd54 w\u00f6rd55 w\u00f6rd56 w\u00f6rd57 w\u00f6rd58 w\u00f6rd59 w\u00f6rd60 w\u00f6rd61 w\u00f6rd62 w\u00f6rd63 w\u00f6rd64 w\u00f6rd65 w\u00f6rd66 w\u00f6rd67 w\u00f6rd68 w\u00f6rd69 w\u00f6rd70 w\u00f6rd71 w\u00f6rd72 w\u00f6rd73 w\u00f6rd74 w\u00f6rd75 w\u00f6rd76 w\u00f6rd77 w\u00f6rd78 w\u00f6rd79 w\u00f6rd80 w\u00f6rd81 w\u00f6rd82 w\u00f6rd83 w\u00f6rd84 w\u00f6rd85 w\u00f6rd86 w\u00f6rd87 w\u00f6rd88 w\u00f6rd89 w\u00f6rd90 w\u00f6rd91 w\u00f6rd92 w\u00f6rd93 w\u00f6rd94 w\u00f6rd95 w\u00f6rd96 w\u00f6rd97 w\u00f6rd98 w\u00f6rd99 w\u00f6rd100 w\u00f6rd101 w\u00f6rd102 w\u00f6rd103 w\u00f6rd104 w\u00f6rd105 w\u00f6rd106 w\u00f6rd107 w\u00f6rd108 w\u00f6rd109 w\u00f6rd110 w\u00f6rd111 w\u00f6rd112 w\u00f6rd113 w\u00f6rd114 w\u00f6rd115 w\u00f6rd116 w\u00f6rd117 w\u00f6rd118 w\u00f6rd119 w\u00f6rd120 w\u00f6rd121 w\u00f6rd122 w\u00f6rd123 w\u00f6rd124 w\u00f6rd125 w\u00f6rd126 w\u00f6rd127 w\u00f6rd128 w\u00f6rd129 w\u00f6rd130 w\u00f6rd131 w\u00f6rd132 w\u00f6rd133 w\u00f6rd134 w\u00f6rd135 w\u00f6rd136 w\u00f6rd137 w\u00f6rd138 w\u00f6rd139 w\u00f6rd140 w\u00f6rd141 w\u00f6rd142 w\u00f6rd143 w\u00f6rd144 w\u00f6rd145 w\u00f6rd146 w\u00f6rd147 w\u00f6rd148 w\u00f6rd149 w\u00f6rd150 w\u00f6rd151 w\u00f6rd152 w\u00f6rd153 w\u00f6rd154 w\u00f6rd155 w\u00f6rd156 w\u00f6rd157 w\u00f6rd158 w\u00f6rd159 w\u00f6rd160 w\u00f6rd161 w\u00f6rd162 w\u00f6rd163 w\u00f6rd164 w\u00f6rd165 w\u00f6rd166 w\u00f6rd167 w\u00f6rd168 w\u00f6rd169 w\u00f6rd170 w\u00f6rd171 w\u00f6rd172 w\u00f6rd173 w\u00f6rd174 w\u00f6rd175 w\u00f6rd176 w\u00f6rd177 w\u00f6rd178 w\u00f6rd179 w\u00f6rd180 w\u00f6rd181 w\u00f6rd182 w\u00f6rd183 w\u00f6rd184 w\u00f6rd185 w\u00f6rd186 w\u00f6rd187 w\u00f6rd188 w\u00f6rd189 w\u00f6rd190 w\u00f6rd191 w\u00f6rd192 w\u00f6rd193 w\u00f6rd194 w\u00f6rd195 w\u00f6rd196 w\u00f6rd197 w\u00f6rd198 w\u00f6rd199 w\u00f6rd200 w\u00f6rd201 w\u00f6rd202 w\u00f6rd203 w\u00f6rd204 w\u00f6rd205 w\u00f6rd206 w\u00f6rd207 w\u00f6rd208 w\u00f6rd209 w\u00f6rd210 w\u00f6rd211 w\u00f6rd212 w\u00f6rd213 w\u00f6rd214 w\u00f6rd215 w\u00f6rd216 w\u00f6rd217 w\u00f6rd218 w\u00f6rd219 w\u00f6rd220 w\u00f6rd221 w\u00f6rd222 w\u00f6rd223 w\u00f6rd224 w\u00f6rd225 w\u00f6rd226 w\u00f6rd227 w\u00f6rd228 w\u00f6rd229 w\u00f6rd230 w\u00f6rd231 w\u00f6rd232 w\u00f6rd233 w\u00f6rd234 w\u00f6rd235 w\u00f6rd236 w\u00f6rd237 w\u00f6rd238 w\u00f6rd239 w\u00f6rd240 w\u00f6rd241 w\u00f6rd242 w\u00f6rd243 w\u00f6rd244 w\u00f6rd245 w\u00f6rd246 w\u00f6rd247 w\u00f6rd248 w\u00f6rd249 w\u00f6rd250 w\u00f6rd251 w\u00f6rd252 w\u00f6rd253 w\u00f6rd254 w\u00f6rd255 w\u00f6rd256 w\u00f6rd257 w\u00f6rd258 w\u00f6rd259 w\u00f6rd260 w\u00f6rd261 w\u00f6rd262 w\u00f6rd263 w\u00f6rd264 w\u00f6rd265 w\u00f6rd266 w\u00f6rd267 w\u00f6rd268 w\u00f6rd269 w\u00f6rd270 w\u00f6rd271 w\u00f6rd272 w\u00f6rd273 w\u00f6rd274 w\u00f6rd275 w\u00f6rd276 w\u00f6rd277 w\u00f6rd278 w\u00f6rd279 w\u00f6rd280 w\u00f6rd281 w\u00f6rd282 w\u00f6rd283 w\u00f6rd284 w\u00f6rd285 w\u00f6rd286 w\u00f6rd287 w\u00f6rd288 w\u00f6rd289 w\u00f6rd290 w\u00f6rd291 w\u00f6rd292 w\u00f6rd293 w\u00f6rd294 w\u00f6rd295 w\u00f6rd296 w\u00f6rd297 w\u00f6rd298 w\u00f6rd299 w\u00f6rd300 w\u00f6rd301 w\u00f6rd302 w\u00f6rd303 w\u00f6rd304 w\u00f6rd305 w\u00f6rd306 w\u00f6rd307 w\u00f6rd308 w\u00f6rd309 w\u00f6rd310 w\u00f6rd311 w\u00f6rd312 w\u00f6rd313 w\u00f6rd314 w\u00f6rd315 w\u00f6rd316 w\u00f6rd317 w\u00f6rd318 w\u00f6rd319",
+"type": "mstar.transcription.partial"
+},
+{
+"error": {
+"message": "the item would pass 300 s of audio; commit or clear the input audio buffer first",
+"type": "invalid_request_error"
+},
+"type": "error"
+},
+{
+"error": {
+"message": "unknown event 'mstar.end'",
+"type": "invalid_request_error"
+},
+"type": "error"
+}
+],
+[
+{
+"audio": "f0a40e80bfc8a98f5f8f78e2f532bfd2b7d3d937",
+"mk": {},
+"seconds": 160.0
+}
+]
+]
+},
+"test_client_committed_items_stream_as_the_python_route#0": {
+"__tuple__": [
+[
+{
+"session": {
+"id": "S",
+"input_audio_format": "pcm16",
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 16000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.created"
+},
+{
+"delta": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w",
+"item_id": 0,
+"type": "conversation.item.input_audio_transcription.delta"
+},
+{
+"audio_seconds": 2.0,
+"chunk_id": 1,
+"item_id": 0,
+"text": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3",
+"type": "mstar.transcription.partial"
+},
+{
+"delta": "\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6 w",
+"item_id": 0,
+"type": "conversation.item.input_audio_transcription.delta"
+},
+{
+"audio_seconds": 4.0,
+"chunk_id": 2,
+"item_id": 0,
+"text": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6 w\u00f6rd7",
+"type": "mstar.transcription.partial"
+},
+{
+"delta": "\u00f6rd7",
+"item_id": 0,
+"type": "conversation.item.input_audio_transcription.delta"
+},
+{
+"item_id": 0,
+"type": "input_audio_buffer.committed"
+},
+{
+"item_id": 0,
+"transcript": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6 w\u00f6rd7",
+"type": "conversation.item.input_audio_transcription.completed"
+},
+{
+"session": {
+"id": "S",
+"input_audio_format": "pcm16",
+"input_audio_transcription": {
+"language": "en",
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 1.0,
+"max_item_seconds": 300.0,
+"sample_rate": 16000,
+"unfixed_chunks": 0,
+"unfixed_tokens": 3
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.updated"
+},
+{
+"delta": "w\u00f6rd0 w\u00f6",
+"item_id": 1,
+"type": "conversation.item.input_audio_transcription.delta"
+},
+{
+"audio_seconds": 1.0,
+"chunk_id": 1,
+"item_id": 1,
+"text": "w\u00f6rd0 w\u00f6rd1",
+"type": "mstar.transcription.partial"
+},
+{
+"delta": "rd1 w\u00f6rd2 w\u00f6",
+"item_id": 1,
+"type": "conversation.item.input_audio_transcription.delta"
+},
+{
+"audio_seconds": 2.0,
+"chunk_id": 2,
+"item_id": 1,
+"text": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3",
+"type": "mstar.transcription.partial"
+},
+{
+"delta": "rd3 w\u00f6rd4 w\u00f6",
+"item_id": 1,
+"type": "conversation.item.input_audio_transcription.delta"
+},
+{
+"audio_seconds": 3.0,
+"chunk_id": 3,
+"item_id": 1,
+"text": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3 w\u00f6rd4 w\u00f6rd5",
+"type": "mstar.transcription.partial"
+},
+{
+"delta": "rd5",
+"item_id": 1,
+"type": "conversation.item.input_audio_transcription.delta"
+},
+{
+"item_id": 1,
+"type": "input_audio_buffer.committed"
+},
+{
+"item_id": 1,
+"transcript": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3 w\u00f6rd4 w\u00f6rd5",
+"type": "conversation.item.input_audio_transcription.completed"
+},
+{
+"error": {
+"message": "unknown event 'mstar.end'",
+"type": "invalid_request_error"
+},
+"type": "error"
+}
+],
+[
+{
+"audio": "6b5a5f0e4a97c63ce35cd861ac5d63a254b17655",
+"mk": {},
+"seconds": 2.0
+},
+{
+"audio": "d73f73b80f0d73ab13f0c88c74e51e815f4a4253",
+"mk": {},
+"seconds": 4.0
+},
+{
+"audio": "4388d9cd52940b1b9b8f4236df8db2b84033630a",
+"mk": {
+"language": "en",
+"temperature": 0.0
+},
+"seconds": 1.0
+},
+{
+"audio": "001ca2ef3c8f52142f6854a6ecf7d580e0dc9a5e",
+"mk": {
+"assistant_prefix": "w\u00f6rd0 w\u00f6",
+"language": "en",
+"temperature": 0.0
+},
+"seconds": 2.0
+},
+{
+"audio": "413cb128b5291b1d784a97fb143afc981222a9ce",
+"mk": {
+"assistant_prefix": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6",
+"language": "en",
+"temperature": 0.0
+},
+"seconds": 3.0
+}
+]
+]
+},
+"test_every_input_format_reaches_the_engine_alike[g711_alaw]#0": {
+"__tuple__": [
+[
+{
+"session": {
+"id": "S",
+"input_audio_format": "pcm16",
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 16000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.created"
+},
+{
+"session": {
+"id": "S",
+"input_audio_format": "g711_alaw",
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 8000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.updated"
+},
+{
+"delta": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w",
+"item_id": 0,
+"type": "conversation.item.input_audio_transcription.delta"
+},
+{
+"audio_seconds": 2.0,
+"chunk_id": 1,
+"item_id": 0,
+"text": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3",
+"type": "mstar.transcription.partial"
+},
+{
+"delta": "\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6 w",
+"item_id": 0,
+"type": "conversation.item.input_audio_transcription.delta"
+},
+{
+"audio_seconds": 4.0,
+"chunk_id": 2,
+"item_id": 0,
+"text": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6 w\u00f6rd7",
+"type": "mstar.transcription.partial"
+},
+{
+"delta": "\u00f6rd7 w\u00f6rd8 w\u00f6rd9",
+"item_id": 0,
+"type": "conversation.item.input_audio_transcription.delta"
+},
+{
+"audio_seconds": 5.0,
+"chunk_id": 3,
+"item_id": 0,
+"text": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6 w\u00f6rd7 w\u00f6rd8 w\u00f6rd9",
+"type": "mstar.transcription.partial"
+},
+{
+"item_id": 0,
+"type": "input_audio_buffer.committed"
+},
+{
+"item_id": 0,
+"transcript": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6 w\u00f6rd7 w\u00f6rd8 w\u00f6rd9",
+"type": "conversation.item.input_audio_transcription.completed"
+},
+{
+"error": {
+"message": "unknown event 'mstar.end'",
+"type": "invalid_request_error"
+},
+"type": "error"
+}
+],
+[
+{
+"audio": "2880e25d915fa05319c05f31f612530bb676e2a4",
+"mk": {},
+"seconds": 2.0
+},
+{
+"audio": "9c601266146d64728b718af3aecbfb920036f177",
+"mk": {},
+"seconds": 4.0
+},
+{
+"audio": "eee7c8785d72df1f1fd0091d846ad843b6be7f09",
+"mk": {
+"assistant_prefix": "language English<asr_text>w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6 w"
+},
+"seconds": 5.0
+}
+]
+]
+},
+"test_every_input_format_reaches_the_engine_alike[g711_ulaw]#0": {
+"__tuple__": [
+[
+{
+"session": {
+"id": "S",
+"input_audio_format": "pcm16",
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 16000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.created"
+},
+{
+"session": {
+"id": "S",
+"input_audio_format": "g711_ulaw",
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 8000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.updated"
+},
+{
+"delta": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w",
+"item_id": 0,
+"type": "conversation.item.input_audio_transcription.delta"
+},
+{
+"audio_seconds": 2.0,
+"chunk_id": 1,
+"item_id": 0,
+"text": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3",
+"type": "mstar.transcription.partial"
+},
+{
+"delta": "\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6 w",
+"item_id": 0,
+"type": "conversation.item.input_audio_transcription.delta"
+},
+{
+"audio_seconds": 4.0,
+"chunk_id": 2,
+"item_id": 0,
+"text": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6 w\u00f6rd7",
+"type": "mstar.transcription.partial"
+},
+{
+"delta": "\u00f6rd7 w\u00f6rd8 w\u00f6rd9",
+"item_id": 0,
+"type": "conversation.item.input_audio_transcription.delta"
+},
+{
+"audio_seconds": 5.0,
+"chunk_id": 3,
+"item_id": 0,
+"text": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6 w\u00f6rd7 w\u00f6rd8 w\u00f6rd9",
+"type": "mstar.transcription.partial"
+},
+{
+"item_id": 0,
+"type": "input_audio_buffer.committed"
+},
+{
+"item_id": 0,
+"transcript": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6 w\u00f6rd7 w\u00f6rd8 w\u00f6rd9",
+"type": "conversation.item.input_audio_transcription.completed"
+},
+{
+"error": {
+"message": "unknown event 'mstar.end'",
+"type": "invalid_request_error"
+},
+"type": "error"
+}
+],
+[
+{
+"audio": "ac6706b7e35807ceb6840238bdbed0d4e4e75478",
+"mk": {},
+"seconds": 2.0
+},
+{
+"audio": "8099cbbe342b5b1e6ab5f35604e6c217fc7c1d8d",
+"mk": {},
+"seconds": 4.0
+},
+{
+"audio": "a256624f9d193ca20b16975a4bde675c68c53309",
+"mk": {
+"assistant_prefix": "language English<asr_text>w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6 w"
+},
+"seconds": 5.0
+}
+]
+]
+},
+"test_every_input_format_reaches_the_engine_alike[pcm-11025]#0": {
+"__tuple__": [
+[
+{
+"session": {
+"id": "S",
+"input_audio_format": "pcm16",
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 16000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.created"
+},
+{
+"session": {
+"id": "S",
+"input_audio_format": {
+"rate": 11025,
+"type": "audio/pcm"
+},
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 11025,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.updated"
+},
+{
+"delta": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w",
+"item_id": 0,
+"type": "conversation.item.input_audio_transcription.delta"
+},
+{
+"audio_seconds": 2.0,
+"chunk_id": 1,
+"item_id": 0,
+"text": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3",
+"type": "mstar.transcription.partial"
+},
+{
+"delta": "\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6 w",
+"item_id": 0,
+"type": "conversation.item.input_audio_transcription.delta"
+},
+{
+"audio_seconds": 4.0,
+"chunk_id": 2,
+"item_id": 0,
+"text": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6 w\u00f6rd7",
+"type": "mstar.transcription.partial"
+},
+{
+"delta": "\u00f6rd7 w\u00f6rd8 w\u00f6rd9",
+"item_id": 0,
+"type": "conversation.item.input_audio_transcription.delta"
+},
+{
+"audio_seconds": 5.0,
+"chunk_id": 3,
+"item_id": 0,
+"text": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6 w\u00f6rd7 w\u00f6rd8 w\u00f6rd9",
+"type": "mstar.transcription.partial"
+},
+{
+"item_id": 0,
+"type": "input_audio_buffer.committed"
+},
+{
+"item_id": 0,
+"transcript": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6 w\u00f6rd7 w\u00f6rd8 w\u00f6rd9",
+"type": "conversation.item.input_audio_transcription.completed"
+},
+{
+"error": {
+"message": "unknown event 'mstar.end'",
+"type": "invalid_request_error"
+},
+"type": "error"
+}
+],
+[
+{
+"audio": "a8aebbb595df2b9a408cb96a905643f0721d5170",
+"mk": {},
+"seconds": 2.0
+},
+{
+"audio": "7d21315cf0794682ee5b4b3e01712b1ecb2bc1b9",
+"mk": {},
+"seconds": 4.0
+},
+{
+"audio": "489bc8621a690a854abdfe69db63aa11e743a246",
+"mk": {
+"assistant_prefix": "language English<asr_text>w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6 w"
+},
+"seconds": 5.0
+}
+]
+]
+},
+"test_every_input_format_reaches_the_engine_alike[pcm-22050]#0": {
+"__tuple__": [
+[
+{
+"session": {
+"id": "S",
+"input_audio_format": "pcm16",
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 16000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.created"
+},
+{
+"session": {
+"id": "S",
+"input_audio_format": {
+"rate": 22050,
+"type": "audio/pcm"
+},
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 22050,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.updated"
+},
+{
+"delta": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w",
+"item_id": 0,
+"type": "conversation.item.input_audio_transcription.delta"
+},
+{
+"audio_seconds": 2.0,
+"chunk_id": 1,
+"item_id": 0,
+"text": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3",
+"type": "mstar.transcription.partial"
+},
+{
+"delta": "\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6 w",
+"item_id": 0,
+"type": "conversation.item.input_audio_transcription.delta"
+},
+{
+"audio_seconds": 4.0,
+"chunk_id": 2,
+"item_id": 0,
+"text": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6 w\u00f6rd7",
+"type": "mstar.transcription.partial"
+},
+{
+"delta": "\u00f6rd7 w\u00f6rd8 w\u00f6rd9",
+"item_id": 0,
+"type": "conversation.item.input_audio_transcription.delta"
+},
+{
+"audio_seconds": 5.0,
+"chunk_id": 3,
+"item_id": 0,
+"text": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6 w\u00f6rd7 w\u00f6rd8 w\u00f6rd9",
+"type": "mstar.transcription.partial"
+},
+{
+"item_id": 0,
+"type": "input_audio_buffer.committed"
+},
+{
+"item_id": 0,
+"transcript": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6 w\u00f6rd7 w\u00f6rd8 w\u00f6rd9",
+"type": "conversation.item.input_audio_transcription.completed"
+},
+{
+"error": {
+"message": "unknown event 'mstar.end'",
+"type": "invalid_request_error"
+},
+"type": "error"
+}
+],
+[
+{
+"audio": "028509652a658f1ad153f0ff6684263c22c075e6",
+"mk": {},
+"seconds": 2.0
+},
+{
+"audio": "f17962c2e494d976de70de25b0e2c366c2c1db9f",
+"mk": {},
+"seconds": 4.0
+},
+{
+"audio": "72e8790a0791889f4b6d1853adff8c0f5ba5b849",
+"mk": {
+"assistant_prefix": "language English<asr_text>w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6 w"
+},
+"seconds": 5.0
+}
+]
+]
+},
+"test_every_input_format_reaches_the_engine_alike[pcm-32000]#0": {
+"__tuple__": [
+[
+{
+"session": {
+"id": "S",
+"input_audio_format": "pcm16",
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 16000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.created"
+},
+{
+"session": {
+"id": "S",
+"input_audio_format": {
+"rate": 32000,
+"type": "audio/pcm"
+},
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 32000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.updated"
+},
+{
+"delta": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w",
+"item_id": 0,
+"type": "conversation.item.input_audio_transcription.delta"
+},
+{
+"audio_seconds": 2.0,
+"chunk_id": 1,
+"item_id": 0,
+"text": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3",
+"type": "mstar.transcription.partial"
+},
+{
+"delta": "\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6 w",
+"item_id": 0,
+"type": "conversation.item.input_audio_transcription.delta"
+},
+{
+"audio_seconds": 4.0,
+"chunk_id": 2,
+"item_id": 0,
+"text": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6 w\u00f6rd7",
+"type": "mstar.transcription.partial"
+},
+{
+"delta": "\u00f6rd7 w\u00f6rd8 w\u00f6rd9",
+"item_id": 0,
+"type": "conversation.item.input_audio_transcription.delta"
+},
+{
+"audio_seconds": 5.0,
+"chunk_id": 3,
+"item_id": 0,
+"text": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6 w\u00f6rd7 w\u00f6rd8 w\u00f6rd9",
+"type": "mstar.transcription.partial"
+},
+{
+"item_id": 0,
+"type": "input_audio_buffer.committed"
+},
+{
+"item_id": 0,
+"transcript": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6 w\u00f6rd7 w\u00f6rd8 w\u00f6rd9",
+"type": "conversation.item.input_audio_transcription.completed"
+},
+{
+"error": {
+"message": "unknown event 'mstar.end'",
+"type": "invalid_request_error"
+},
+"type": "error"
+}
+],
+[
+{
+"audio": "8c6b45eb8b3ae66f97ad5bf267b34290d648aee8",
+"mk": {},
+"seconds": 2.0
+},
+{
+"audio": "14e8cc2b9c77089e3d0ebf4d949eec562a969030",
+"mk": {},
+"seconds": 4.0
+},
+{
+"audio": "d68d30942c6bd43059dc1019cd56d1c70038ad15",
+"mk": {
+"assistant_prefix": "language English<asr_text>w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6 w"
+},
+"seconds": 5.0
+}
+]
+]
+},
+"test_every_input_format_reaches_the_engine_alike[pcm-44100]#0": {
+"__tuple__": [
+[
+{
+"session": {
+"id": "S",
+"input_audio_format": "pcm16",
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 16000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.created"
+},
+{
+"session": {
+"id": "S",
+"input_audio_format": {
+"rate": 44100,
+"type": "audio/pcm"
+},
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 44100,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.updated"
+},
+{
+"delta": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w",
+"item_id": 0,
+"type": "conversation.item.input_audio_transcription.delta"
+},
+{
+"audio_seconds": 2.0,
+"chunk_id": 1,
+"item_id": 0,
+"text": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3",
+"type": "mstar.transcription.partial"
+},
+{
+"delta": "\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6 w",
+"item_id": 0,
+"type": "conversation.item.input_audio_transcription.delta"
+},
+{
+"audio_seconds": 4.0,
+"chunk_id": 2,
+"item_id": 0,
+"text": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6 w\u00f6rd7",
+"type": "mstar.transcription.partial"
+},
+{
+"delta": "\u00f6rd7 w\u00f6rd8 w\u00f6rd9",
+"item_id": 0,
+"type": "conversation.item.input_audio_transcription.delta"
+},
+{
+"audio_seconds": 5.0,
+"chunk_id": 3,
+"item_id": 0,
+"text": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6 w\u00f6rd7 w\u00f6rd8 w\u00f6rd9",
+"type": "mstar.transcription.partial"
+},
+{
+"item_id": 0,
+"type": "input_audio_buffer.committed"
+},
+{
+"item_id": 0,
+"transcript": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6 w\u00f6rd7 w\u00f6rd8 w\u00f6rd9",
+"type": "conversation.item.input_audio_transcription.completed"
+},
+{
+"error": {
+"message": "unknown event 'mstar.end'",
+"type": "invalid_request_error"
+},
+"type": "error"
+}
+],
+[
+{
+"audio": "6bbbd048eaf7d8672ff91d151852e18658680ad5",
+"mk": {},
+"seconds": 2.0
+},
+{
+"audio": "4e2900843a889df5815a453cbee06ca03a48d728",
+"mk": {},
+"seconds": 4.0
+},
+{
+"audio": "673ace88aca4b05cc9b6d06725fd257295e70dd3",
+"mk": {
+"assistant_prefix": "language English<asr_text>w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6 w"
+},
+"seconds": 5.0
+}
+]
+]
+},
+"test_every_input_format_reaches_the_engine_alike[pcm-48000]#0": {
+"__tuple__": [
+[
+{
+"session": {
+"id": "S",
+"input_audio_format": "pcm16",
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 16000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.created"
+},
+{
+"session": {
+"id": "S",
+"input_audio_format": {
+"rate": 48000,
+"type": "audio/pcm"
+},
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 48000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.updated"
+},
+{
+"delta": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w",
+"item_id": 0,
+"type": "conversation.item.input_audio_transcription.delta"
+},
+{
+"audio_seconds": 2.0,
+"chunk_id": 1,
+"item_id": 0,
+"text": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3",
+"type": "mstar.transcription.partial"
+},
+{
+"delta": "\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6 w",
+"item_id": 0,
+"type": "conversation.item.input_audio_transcription.delta"
+},
+{
+"audio_seconds": 4.0,
+"chunk_id": 2,
+"item_id": 0,
+"text": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6 w\u00f6rd7",
+"type": "mstar.transcription.partial"
+},
+{
+"delta": "\u00f6rd7 w\u00f6rd8 w\u00f6rd9",
+"item_id": 0,
+"type": "conversation.item.input_audio_transcription.delta"
+},
+{
+"audio_seconds": 5.0,
+"chunk_id": 3,
+"item_id": 0,
+"text": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6 w\u00f6rd7 w\u00f6rd8 w\u00f6rd9",
+"type": "mstar.transcription.partial"
+},
+{
+"item_id": 0,
+"type": "input_audio_buffer.committed"
+},
+{
+"item_id": 0,
+"transcript": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6 w\u00f6rd7 w\u00f6rd8 w\u00f6rd9",
+"type": "conversation.item.input_audio_transcription.completed"
+},
+{
+"error": {
+"message": "unknown event 'mstar.end'",
+"type": "invalid_request_error"
+},
+"type": "error"
+}
+],
+[
+{
+"audio": "76fcf7544411c4d4391aaaa155aaa7b3c6a8143a",
+"mk": {},
+"seconds": 2.0
+},
+{
+"audio": "f532eb3afdb5a01ba7d90f850de8208a4eecb54d",
+"mk": {},
+"seconds": 4.0
+},
+{
+"audio": "9b8d3c19a734419437bcefcd8b03aa0dd813263f",
+"mk": {
+"assistant_prefix": "language English<asr_text>w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6 w"
+},
+"seconds": 5.0
+}
+]
+]
+},
+"test_every_input_format_reaches_the_engine_alike[pcm-8000]#0": {
+"__tuple__": [
+[
+{
+"session": {
+"id": "S",
+"input_audio_format": "pcm16",
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 16000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.created"
+},
+{
+"session": {
+"id": "S",
+"input_audio_format": {
+"rate": 8000,
+"type": "audio/pcm"
+},
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 8000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.updated"
+},
+{
+"delta": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w",
+"item_id": 0,
+"type": "conversation.item.input_audio_transcription.delta"
+},
+{
+"audio_seconds": 2.0,
+"chunk_id": 1,
+"item_id": 0,
+"text": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3",
+"type": "mstar.transcription.partial"
+},
+{
+"delta": "\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6 w",
+"item_id": 0,
+"type": "conversation.item.input_audio_transcription.delta"
+},
+{
+"audio_seconds": 4.0,
+"chunk_id": 2,
+"item_id": 0,
+"text": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6 w\u00f6rd7",
+"type": "mstar.transcription.partial"
+},
+{
+"delta": "\u00f6rd7 w\u00f6rd8 w\u00f6rd9",
+"item_id": 0,
+"type": "conversation.item.input_audio_transcription.delta"
+},
+{
+"audio_seconds": 5.0,
+"chunk_id": 3,
+"item_id": 0,
+"text": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6 w\u00f6rd7 w\u00f6rd8 w\u00f6rd9",
+"type": "mstar.transcription.partial"
+},
+{
+"item_id": 0,
+"type": "input_audio_buffer.committed"
+},
+{
+"item_id": 0,
+"transcript": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6 w\u00f6rd7 w\u00f6rd8 w\u00f6rd9",
+"type": "conversation.item.input_audio_transcription.completed"
+},
+{
+"error": {
+"message": "unknown event 'mstar.end'",
+"type": "invalid_request_error"
+},
+"type": "error"
+}
+],
+[
+{
+"audio": "d2df2bc685449cad3dadaa7b8e440bcd19f8e92e",
+"mk": {},
+"seconds": 2.0
+},
+{
+"audio": "bf51af953820d10ac42dd4cb6ddfc818b11286d5",
+"mk": {},
+"seconds": 4.0
+},
+{
+"audio": "d649a45bbad6594c6ec37091c4d40fdf72808c39",
+"mk": {
+"assistant_prefix": "language English<asr_text>w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6 w"
+},
+"seconds": 5.0
+}
+]
+]
+},
+"test_every_input_format_reaches_the_engine_alike[pcma-8000]#0": {
+"__tuple__": [
+[
+{
+"session": {
+"id": "S",
+"input_audio_format": "pcm16",
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 16000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.created"
+},
+{
+"session": {
+"id": "S",
+"input_audio_format": "g711_alaw",
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 8000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.updated"
+},
+{
+"delta": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w",
+"item_id": 0,
+"type": "conversation.item.input_audio_transcription.delta"
+},
+{
+"audio_seconds": 2.0,
+"chunk_id": 1,
+"item_id": 0,
+"text": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3",
+"type": "mstar.transcription.partial"
+},
+{
+"delta": "\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6 w",
+"item_id": 0,
+"type": "conversation.item.input_audio_transcription.delta"
+},
+{
+"audio_seconds": 4.0,
+"chunk_id": 2,
+"item_id": 0,
+"text": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6 w\u00f6rd7",
+"type": "mstar.transcription.partial"
+},
+{
+"delta": "\u00f6rd7 w\u00f6rd8 w\u00f6rd9",
+"item_id": 0,
+"type": "conversation.item.input_audio_transcription.delta"
+},
+{
+"audio_seconds": 5.0,
+"chunk_id": 3,
+"item_id": 0,
+"text": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6 w\u00f6rd7 w\u00f6rd8 w\u00f6rd9",
+"type": "mstar.transcription.partial"
+},
+{
+"item_id": 0,
+"type": "input_audio_buffer.committed"
+},
+{
+"item_id": 0,
+"transcript": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6 w\u00f6rd7 w\u00f6rd8 w\u00f6rd9",
+"type": "conversation.item.input_audio_transcription.completed"
+},
+{
+"error": {
+"message": "unknown event 'mstar.end'",
+"type": "invalid_request_error"
+},
+"type": "error"
+}
+],
+[
+{
+"audio": "2880e25d915fa05319c05f31f612530bb676e2a4",
+"mk": {},
+"seconds": 2.0
+},
+{
+"audio": "9c601266146d64728b718af3aecbfb920036f177",
+"mk": {},
+"seconds": 4.0
+},
+{
+"audio": "eee7c8785d72df1f1fd0091d846ad843b6be7f09",
+"mk": {
+"assistant_prefix": "language English<asr_text>w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6 w"
+},
+"seconds": 5.0
+}
+]
+]
+},
+"test_every_input_format_reaches_the_engine_alike[pcmu-default]#0": {
+"__tuple__": [
+[
+{
+"session": {
+"id": "S",
+"input_audio_format": "pcm16",
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 16000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.created"
+},
+{
+"session": {
+"id": "S",
+"input_audio_format": "g711_ulaw",
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 8000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.updated"
+},
+{
+"delta": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w",
+"item_id": 0,
+"type": "conversation.item.input_audio_transcription.delta"
+},
+{
+"audio_seconds": 2.0,
+"chunk_id": 1,
+"item_id": 0,
+"text": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3",
+"type": "mstar.transcription.partial"
+},
+{
+"delta": "\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6 w",
+"item_id": 0,
+"type": "conversation.item.input_audio_transcription.delta"
+},
+{
+"audio_seconds": 4.0,
+"chunk_id": 2,
+"item_id": 0,
+"text": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6 w\u00f6rd7",
+"type": "mstar.transcription.partial"
+},
+{
+"delta": "\u00f6rd7 w\u00f6rd8 w\u00f6rd9",
+"item_id": 0,
+"type": "conversation.item.input_audio_transcription.delta"
+},
+{
+"audio_seconds": 5.0,
+"chunk_id": 3,
+"item_id": 0,
+"text": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6 w\u00f6rd7 w\u00f6rd8 w\u00f6rd9",
+"type": "mstar.transcription.partial"
+},
+{
+"item_id": 0,
+"type": "input_audio_buffer.committed"
+},
+{
+"item_id": 0,
+"transcript": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6 w\u00f6rd7 w\u00f6rd8 w\u00f6rd9",
+"type": "conversation.item.input_audio_transcription.completed"
+},
+{
+"error": {
+"message": "unknown event 'mstar.end'",
+"type": "invalid_request_error"
+},
+"type": "error"
+}
+],
+[
+{
+"audio": "ac6706b7e35807ceb6840238bdbed0d4e4e75478",
+"mk": {},
+"seconds": 2.0
+},
+{
+"audio": "8099cbbe342b5b1e6ab5f35604e6c217fc7c1d8d",
+"mk": {},
+"seconds": 4.0
+},
+{
+"audio": "a256624f9d193ca20b16975a4bde675c68c53309",
+"mk": {
+"assistant_prefix": "language English<asr_text>w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6 w"
+},
+"seconds": 5.0
+}
+]
+]
+},
+"test_protocol_errors_read_as_pythons#0": {
+"__tuple__": [
+[
+{
+"session": {
+"id": "S",
+"input_audio_format": "pcm16",
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 16000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.created"
+},
+{
+"error": {
+"message": "an event must be a JSON text message, not binary",
+"type": "invalid_request_error"
+},
+"type": "error"
+},
+{
+"error": {
+"message": "not JSON",
+"type": "invalid_request_error"
+},
+"type": "error"
+},
+{
+"error": {
+"message": "an event must be a JSON object",
+"type": "invalid_request_error"
+},
+"type": "error"
+},
+{
+"error": {
+"message": "unknown event 'nope'",
+"type": "invalid_request_error"
+},
+"type": "error"
+},
+{
+"error": {
+"code": "invalid_audio",
+"message": "audio is not base64",
+"type": "invalid_request_error"
+},
+"type": "error"
+},
+{
+"error": {
+"code": "invalid_audio",
+"message": "audio is not base64",
+"type": "invalid_request_error"
+},
+"type": "error"
+},
+{
+"delta": "w\u00f6rd0 w\u00f6rd1",
+"item_id": 0,
+"type": "conversation.item.input_audio_transcription.delta"
+},
+{
+"audio_seconds": 1.0000625,
+"chunk_id": 1,
+"item_id": 0,
+"text": "w\u00f6rd0 w\u00f6rd1",
+"type": "mstar.transcription.partial"
+},
+{
+"item_id": 0,
+"type": "input_audio_buffer.committed"
+},
+{
+"item_id": 0,
+"transcript": "w\u00f6rd0 w\u00f6rd1",
+"type": "conversation.item.input_audio_transcription.completed"
+},
+{
+"session": {
+"id": "S",
+"input_audio_format": "pcm16",
+"input_audio_transcription": {
+"language": "xx",
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 16000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.updated"
+},
+{
+"error": {
+"message": "unsupported language 'xx' (see config.json)",
+"type": "invalid_request_error"
+},
+"type": "error"
+},
+{
+"item_id": 1,
+"type": "input_audio_buffer.committed"
+},
+{
+"item_id": 1,
+"transcript": "",
+"type": "conversation.item.input_audio_transcription.completed"
+},
+{
+"session": {
+"id": "S",
+"input_audio_format": "pcm16",
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": "boom"
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 16000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.updated"
+},
+{
+"error": {
+"message": "realtime step failed (error id X)",
+"type": "server_error"
+},
+"type": "error"
+},
+{
+"item_id": 2,
+"type": "input_audio_buffer.committed"
+},
+{
+"item_id": 2,
+"transcript": "",
+"type": "conversation.item.input_audio_transcription.completed"
+},
+{
+"session": {
+"id": "S",
+"input_audio_format": "pcm16",
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": "paths"
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 16000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.updated"
+},
+{
+"error": {
+"message": "cannot read <upload>/rt-abc-1.wav (not under , nor /tmp, nor 'a b.json')",
+"type": "invalid_request_error"
+},
+"type": "error"
+},
+{
+"item_id": 3,
+"type": "input_audio_buffer.committed"
+},
+{
+"item_id": 3,
+"transcript": "",
+"type": "conversation.item.input_audio_transcription.completed"
+},
+{
+"session": {
+"id": "S",
+"input_audio_format": "pcm16",
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": "paths"
+},
+"mstar": {
+"chunk_seconds": 0.5,
+"max_item_seconds": 300.0,
+"sample_rate": 16000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.updated"
+},
+{
+"error": {
+"message": "unknown event 'mstar.end'",
+"type": "invalid_request_error"
+},
+"type": "error"
+}
+],
+[
+{
+"audio": "09a24dd121b859400bfd6830e483ebab79f6677b",
+"mk": {},
+"seconds": 1.0000625
+},
+{
+"audio": "733354f04d1cf3ddc1b73f5c65a84e0c7c0a1c60",
+"mk": {
+"language": "xx",
+"temperature": 0.0
+},
+"seconds": 1.0
+},
+{
+"audio": "733354f04d1cf3ddc1b73f5c65a84e0c7c0a1c60",
+"mk": {
+"initial_prompt": "boom",
+"temperature": 0.0
+},
+"seconds": 1.0
+},
+{
+"audio": "733354f04d1cf3ddc1b73f5c65a84e0c7c0a1c60",
+"mk": {
+"initial_prompt": "paths",
+"temperature": 0.0
+},
+"seconds": 1.0
+}
+]
+]
+},
+"test_semantic_vad_asks_the_end_of_turn_model_alike[auto]#0": {
+"__tuple__": [
+[
+{
+"session": {
+"id": "S",
+"input_audio_format": "pcm16",
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 16000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.created"
+},
+{
+"session": {
+"id": "S",
+"input_audio_format": "pcm16",
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 16000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": {
+"create_response": true,
+"eagerness": "auto",
+"interrupt_response": true,
+"type": "semantic_vad"
+}
+},
+"type": "transcription_session.updated"
+},
+{
+"audio_start_ms": 0,
+"item_id": 0,
+"type": "input_audio_buffer.speech_started"
+},
+{
+"delta": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w",
+"item_id": 0,
+"type": "conversation.item.input_audio_transcription.delta"
+},
+{
+"audio_seconds": 2.0,
+"chunk_id": 1,
+"item_id": 0,
+"text": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3",
+"type": "mstar.transcription.partial"
+},
+{
+"delta": "\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6 w",
+"item_id": 0,
+"type": "conversation.item.input_audio_transcription.delta"
+},
+{
+"audio_seconds": 4.0,
+"chunk_id": 2,
+"item_id": 0,
+"text": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6 w\u00f6rd7",
+"type": "mstar.transcription.partial"
+},
+{
+"delta": "\u00f6rd7 w\u00f6rd8 w\u00f6rd9 w\u00f6rd10 w",
+"item_id": 0,
+"type": "conversation.item.input_audio_transcription.delta"
+},
+{
+"audio_seconds": 6.0,
+"chunk_id": 3,
+"item_id": 0,
+"text": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6 w\u00f6rd7 w\u00f6rd8 w\u00f6rd9 w\u00f6rd10 w\u00f6rd11",
+"type": "mstar.transcription.partial"
+},
+{
+"delta": "\u00f6rd11 w\u00f6rd12 w\u00f6rd13 w\u00f6rd14 w",
+"item_id": 0,
+"type": "conversation.item.input_audio_transcription.delta"
+},
+{
+"audio_seconds": 8.0,
+"chunk_id": 4,
+"item_id": 0,
+"text": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6 w\u00f6rd7 w\u00f6rd8 w\u00f6rd9 w\u00f6rd10 w\u00f6rd11 w\u00f6rd12 w\u00f6rd13 w\u00f6rd14 w\u00f6rd15",
+"type": "mstar.transcription.partial"
+},
+{
+"delta": "\u00f6rd15 w\u00f6rd16 w\u00f6rd17 w\u00f6rd18 w",
+"item_id": 0,
+"type": "conversation.item.input_audio_transcription.delta"
+},
+{
+"audio_seconds": 10.0,
+"chunk_id": 5,
+"item_id": 0,
+"text": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6 w\u00f6rd7 w\u00f6rd8 w\u00f6rd9 w\u00f6rd10 w\u00f6rd11 w\u00f6rd12 w\u00f6rd13 w\u00f6rd14 w\u00f6rd15 w\u00f6rd16 w\u00f6rd17 w\u00f6rd18 w\u00f6rd19",
+"type": "mstar.transcription.partial"
+},
+{
+"audio_end_ms": 10900,
+"item_id": 0,
+"type": "input_audio_buffer.speech_stopped"
+},
+{
+"delta": "\u00f6rd19 w\u00f6rd20",
+"item_id": 0,
+"type": "conversation.item.input_audio_transcription.delta"
+},
+{
+"audio_seconds": 10.9,
+"chunk_id": 6,
+"item_id": 0,
+"text": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6 w\u00f6rd7 w\u00f6rd8 w\u00f6rd9 w\u00f6rd10 w\u00f6rd11 w\u00f6rd12 w\u00f6rd13 w\u00f6rd14 w\u00f6rd15 w\u00f6rd16 w\u00f6rd17 w\u00f6rd18 w\u00f6rd19 w\u00f6rd20",
+"type": "mstar.transcription.partial"
+},
+{
+"item_id": 0,
+"type": "input_audio_buffer.committed"
+},
+{
+"item_id": 0,
+"transcript": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6 w\u00f6rd7 w\u00f6rd8 w\u00f6rd9 w\u00f6rd10 w\u00f6rd11 w\u00f6rd12 w\u00f6rd13 w\u00f6rd14 w\u00f6rd15 w\u00f6rd16 w\u00f6rd17 w\u00f6rd18 w\u00f6rd19 w\u00f6rd20",
+"type": "conversation.item.input_audio_transcription.completed"
+},
+{
+"error": {
+"message": "unknown event 'mstar.end'",
+"type": "invalid_request_error"
+},
+"type": "error"
+}
+],
+[
+{
+"audio": "6b5a5f0e4a97c63ce35cd861ac5d63a254b17655",
+"mk": {},
+"seconds": 2.0
+},
+{
+"audio": "d73f73b80f0d73ab13f0c88c74e51e815f4a4253",
+"mk": {},
+"seconds": 4.0
+},
+{
+"audio": "3114fb4a9b6abf0029833281b992615734775e1b",
+"mk": {
+"assistant_prefix": "language English<asr_text>w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6 w"
+},
+"seconds": 6.0
+},
+{
+"audio": "b2d0449c6945af0455d3ca9a290e451984085691",
+"mk": {
+"assistant_prefix": "language English<asr_text>w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6 w\u00f6rd7 w\u00f6rd8 w\u00f6rd9 w\u00f6rd10 w"
+},
+"seconds": 8.0
+},
+{
+"audio": "88fbe7d395d320769275601eca1814164afa879e",
+"mk": {
+"assistant_prefix": "language English<asr_text>w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6 w\u00f6rd7 w\u00f6rd8 w\u00f6rd9 w\u00f6rd10 w\u00f6rd11 w\u00f6rd12 w\u00f6rd13 w\u00f6rd14 w"
+},
+"seconds": 10.0
+},
+{
+"audio": "4e96e3d7c930d4159a11785ce4cadd87a62e3ed1",
+"mk": {
+"assistant_prefix": "language English<asr_text>w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6 w\u00f6rd7 w\u00f6rd8 w\u00f6rd9 w\u00f6rd10 w\u00f6rd11 w\u00f6rd12 w\u00f6rd13 w\u00f6rd14 w\u00f6rd15 w\u00f6rd16 w\u00f6rd17 w\u00f6rd18 w"
+},
+"seconds": 10.9
+}
+]
+]
+},
+"test_semantic_vad_asks_the_end_of_turn_model_alike[high]#0": {
+"__tuple__": [
+[
+{
+"session": {
+"id": "S",
+"input_audio_format": "pcm16",
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 16000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.created"
+},
+{
+"session": {
+"id": "S",
+"input_audio_format": "pcm16",
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 16000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": {
+"create_response": true,
+"eagerness": "high",
+"interrupt_response": true,
+"type": "semantic_vad"
+}
+},
+"type": "transcription_session.updated"
+},
+{
+"audio_start_ms": 0,
+"item_id": 0,
+"type": "input_audio_buffer.speech_started"
+},
+{
+"delta": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w",
+"item_id": 0,
+"type": "conversation.item.input_audio_transcription.delta"
+},
+{
+"audio_seconds": 2.0,
+"chunk_id": 1,
+"item_id": 0,
+"text": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3",
+"type": "mstar.transcription.partial"
+},
+{
+"audio_end_ms": 2912,
+"item_id": 0,
+"type": "input_audio_buffer.speech_stopped"
+},
+{
+"delta": "\u00f6rd3 w\u00f6rd4",
+"item_id": 0,
+"type": "conversation.item.input_audio_transcription.delta"
+},
+{
+"audio_seconds": 2.912,
+"chunk_id": 2,
+"item_id": 0,
+"text": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3 w\u00f6rd4",
+"type": "mstar.transcription.partial"
+},
+{
+"item_id": 0,
+"type": "input_audio_buffer.committed"
+},
+{
+"item_id": 0,
+"transcript": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3 w\u00f6rd4",
+"type": "conversation.item.input_audio_transcription.completed"
+},
+{
+"audio_start_ms": 2912,
+"item_id": 1,
+"type": "input_audio_buffer.speech_started"
+},
+{
+"delta": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w",
+"item_id": 1,
+"type": "conversation.item.input_audio_transcription.delta"
+},
+{
+"audio_seconds": 2.0,
+"chunk_id": 1,
+"item_id": 1,
+"text": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3",
+"type": "mstar.transcription.partial"
+},
+{
+"delta": "\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6 w",
+"item_id": 1,
+"type": "conversation.item.input_audio_transcription.delta"
+},
+{
+"audio_seconds": 4.0,
+"chunk_id": 2,
+"item_id": 1,
+"text": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6 w\u00f6rd7",
+"type": "mstar.transcription.partial"
+},
+{
+"delta": "\u00f6rd7 w\u00f6rd8 w\u00f6rd9 w\u00f6rd10 w",
+"item_id": 1,
+"type": "conversation.item.input_audio_transcription.delta"
+},
+{
+"audio_seconds": 6.0,
+"chunk_id": 3,
+"item_id": 1,
+"text": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6 w\u00f6rd7 w\u00f6rd8 w\u00f6rd9 w\u00f6rd10 w\u00f6rd11",
+"type": "mstar.transcription.partial"
+},
+{
+"audio_end_ms": 9920,
+"item_id": 1,
+"type": "input_audio_buffer.speech_stopped"
+},
+{
+"delta": "\u00f6rd11 w\u00f6rd12 w\u00f6rd13",
+"item_id": 1,
+"type": "conversation.item.input_audio_transcription.delta"
+},
+{
+"audio_seconds": 7.008,
+"chunk_id": 4,
+"item_id": 1,
+"text": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6 w\u00f6rd7 w\u00f6rd8 w\u00f6rd9 w\u00f6rd10 w\u00f6rd11 w\u00f6rd12 w\u00f6rd13",
+"type": "mstar.transcription.partial"
+},
+{
+"item_id": 1,
+"type": "input_audio_buffer.committed"
+},
+{
+"item_id": 1,
+"transcript": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6 w\u00f6rd7 w\u00f6rd8 w\u00f6rd9 w\u00f6rd10 w\u00f6rd11 w\u00f6rd12 w\u00f6rd13",
+"type": "conversation.item.input_audio_transcription.completed"
+},
+{
+"item_id": 2,
+"type": "input_audio_buffer.committed"
+},
+{
+"item_id": 2,
+"transcript": "",
+"type": "conversation.item.input_audio_transcription.completed"
+},
+{
+"error": {
+"message": "unknown event 'mstar.end'",
+"type": "invalid_request_error"
+},
+"type": "error"
+}
+],
+[
+{
+"audio": "6b5a5f0e4a97c63ce35cd861ac5d63a254b17655",
+"mk": {},
+"seconds": 2.0
+},
+{
+"audio": "b2217a8b6e635d6da32e3a0df361c7fc1f77689f",
+"mk": {},
+"seconds": 2.912
+},
+{
+"audio": "fa918304a62f6a46a494ccc7921fdebee89a8604",
+"mk": {},
+"seconds": 2.0
+},
+{
+"audio": "e83657724fe022f63fdb948f21b476d42a515c9e",
+"mk": {},
+"seconds": 4.0
+},
+{
+"audio": "e5d032272d22dbcf9c98ad657bc704353df4be3b",
+"mk": {
+"assistant_prefix": "language English<asr_text>w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6 w"
+},
+"seconds": 6.0
+},
+{
+"audio": "67791233f8ed1c8ed5e7e74fc0ca1ed60588acd7",
+"mk": {
+"assistant_prefix": "language English<asr_text>w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6 w\u00f6rd7 w\u00f6rd8 w\u00f6rd9 w\u00f6rd10 w"
+},
+"seconds": 7.008
+}
+]
+]
+},
+"test_server_vad_cuts_the_same_turns[16000]#0": {
+"__tuple__": [
+[
+{
+"session": {
+"id": "S",
+"input_audio_format": "pcm16",
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 16000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.created"
+},
+{
+"session": {
+"id": "S",
+"input_audio_format": "pcm16",
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 16000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": {
+"create_response": true,
+"interrupt_response": true,
+"prefix_padding_ms": 300,
+"silence_duration_ms": 600,
+"threshold": 0.5,
+"type": "server_vad"
+}
+},
+"type": "transcription_session.updated"
+},
+{
+"audio_start_ms": 0,
+"item_id": 0,
+"type": "input_audio_buffer.speech_started"
+},
+{
+"delta": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w",
+"item_id": 0,
+"type": "conversation.item.input_audio_transcription.delta"
+},
+{
+"audio_seconds": 2.0,
+"chunk_id": 1,
+"item_id": 0,
+"text": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3",
+"type": "mstar.transcription.partial"
+},
+{
+"audio_end_ms": 3616,
+"item_id": 0,
+"type": "input_audio_buffer.speech_stopped"
+},
+{
+"delta": "\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6",
+"item_id": 0,
+"type": "conversation.item.input_audio_transcription.delta"
+},
+{
+"audio_seconds": 3.616,
+"chunk_id": 2,
+"item_id": 0,
+"text": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6",
+"type": "mstar.transcription.partial"
+},
+{
+"item_id": 0,
+"type": "input_audio_buffer.committed"
+},
+{
+"item_id": 0,
+"transcript": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6",
+"type": "conversation.item.input_audio_transcription.completed"
+},
+{
+"audio_start_ms": 3892,
+"item_id": 1,
+"type": "input_audio_buffer.speech_started"
+},
+{
+"delta": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w",
+"item_id": 1,
+"type": "conversation.item.input_audio_transcription.delta"
+},
+{
+"audio_seconds": 2.0,
+"chunk_id": 1,
+"item_id": 1,
+"text": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3",
+"type": "mstar.transcription.partial"
+},
+{
+"audio_end_ms": 7680,
+"item_id": 1,
+"type": "input_audio_buffer.speech_stopped"
+},
+{
+"delta": "\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6",
+"item_id": 1,
+"type": "conversation.item.input_audio_transcription.delta"
+},
+{
+"audio_seconds": 3.788,
+"chunk_id": 2,
+"item_id": 1,
+"text": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6",
+"type": "mstar.transcription.partial"
+},
+{
+"item_id": 1,
+"type": "input_audio_buffer.committed"
+},
+{
+"item_id": 1,
+"transcript": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6",
+"type": "conversation.item.input_audio_transcription.completed"
+},
+{
+"item_id": 2,
+"type": "input_audio_buffer.committed"
+},
+{
+"item_id": 2,
+"transcript": "",
+"type": "conversation.item.input_audio_transcription.completed"
+},
+{
+"error": {
+"message": "unknown event 'mstar.end'",
+"type": "invalid_request_error"
+},
+"type": "error"
+}
+],
+[
+{
+"audio": "6b5a5f0e4a97c63ce35cd861ac5d63a254b17655",
+"mk": {},
+"seconds": 2.0
+},
+{
+"audio": "26f419fff1fd3591c39e927847f94b6e5343bf62",
+"mk": {},
+"seconds": 3.616
+},
+{
+"audio": "ed4edfaeb45d13ca3ffd0d1ced9682b671c51b37",
+"mk": {},
+"seconds": 2.0
+},
+{
+"audio": "4c3abef23cb383fad0ad57157d70b68288db2f1d",
+"mk": {},
+"seconds": 3.788
+}
+]
+]
+},
+"test_server_vad_cuts_the_same_turns[24000]#0": {
+"__tuple__": [
+[
+{
+"session": {
+"id": "S",
+"input_audio_format": "pcm16",
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 16000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": null
+},
+"type": "transcription_session.created"
+},
+{
+"session": {
+"id": "S",
+"input_audio_format": {
+"rate": 24000,
+"type": "audio/pcm"
+},
+"input_audio_transcription": {
+"language": null,
+"model": "qwen3_asr",
+"prompt": ""
+},
+"mstar": {
+"chunk_seconds": 2.0,
+"max_item_seconds": 300.0,
+"sample_rate": 24000,
+"unfixed_chunks": 2,
+"unfixed_tokens": 5
+},
+"object": "realtime.transcription_session",
+"turn_detection": {
+"create_response": true,
+"interrupt_response": true,
+"prefix_padding_ms": 300,
+"silence_duration_ms": 600,
+"threshold": 0.5,
+"type": "server_vad"
+}
+},
+"type": "transcription_session.updated"
+},
+{
+"audio_start_ms": 0,
+"item_id": 0,
+"type": "input_audio_buffer.speech_started"
+},
+{
+"delta": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w",
+"item_id": 0,
+"type": "conversation.item.input_audio_transcription.delta"
+},
+{
+"audio_seconds": 2.0,
+"chunk_id": 1,
+"item_id": 0,
+"text": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3",
+"type": "mstar.transcription.partial"
+},
+{
+"audio_end_ms": 3616,
+"item_id": 0,
+"type": "input_audio_buffer.speech_stopped"
+},
+{
+"delta": "\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6",
+"item_id": 0,
+"type": "conversation.item.input_audio_transcription.delta"
+},
+{
+"audio_seconds": 3.616,
+"chunk_id": 2,
+"item_id": 0,
+"text": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6",
+"type": "mstar.transcription.partial"
+},
+{
+"item_id": 0,
+"type": "input_audio_buffer.committed"
+},
+{
+"item_id": 0,
+"transcript": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6",
+"type": "conversation.item.input_audio_transcription.completed"
+},
+{
+"audio_start_ms": 3892,
+"item_id": 1,
+"type": "input_audio_buffer.speech_started"
+},
+{
+"delta": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w",
+"item_id": 1,
+"type": "conversation.item.input_audio_transcription.delta"
+},
+{
+"audio_seconds": 2.0,
+"chunk_id": 1,
+"item_id": 1,
+"text": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3",
+"type": "mstar.transcription.partial"
+},
+{
+"audio_end_ms": 7680,
+"item_id": 1,
+"type": "input_audio_buffer.speech_stopped"
+},
+{
+"delta": "\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6",
+"item_id": 1,
+"type": "conversation.item.input_audio_transcription.delta"
+},
+{
+"audio_seconds": 3.788,
+"chunk_id": 2,
+"item_id": 1,
+"text": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6",
+"type": "mstar.transcription.partial"
+},
+{
+"item_id": 1,
+"type": "input_audio_buffer.committed"
+},
+{
+"item_id": 1,
+"transcript": "w\u00f6rd0 w\u00f6rd1 w\u00f6rd2 w\u00f6rd3 w\u00f6rd4 w\u00f6rd5 w\u00f6rd6",
+"type": "conversation.item.input_audio_transcription.completed"
+},
+{
+"item_id": 2,
+"type": "input_audio_buffer.committed"
+},
+{
+"item_id": 2,
+"transcript": "",
+"type": "conversation.item.input_audio_transcription.completed"
+},
+{
+"error": {
+"message": "unknown event 'mstar.end'",
+"type": "invalid_request_error"
+},
+"type": "error"
+}
+],
+[
+{
+"audio": "6b5a5f0e4a97c63ce35cd861ac5d63a254b17655",
+"mk": {},
+"seconds": 2.0
+},
+{
+"audio": "62ef429ca155eea4dba88aff561eaab5f213830b",
+"mk": {},
+"seconds": 3.616
+},
+{
+"audio": "a1f44e704374172dd1ab73e922bc0c3fa68c840b",
+"mk": {},
+"seconds": 2.0
+},
+{
+"audio": "c3b7d9f93a574b5092e126f7a9dec8e9e37b0c49",
+"mk": {},
+"seconds": 3.788
+}
+]
+]
+}
+}

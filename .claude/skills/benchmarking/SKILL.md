@@ -43,13 +43,13 @@ mstar serve <model> --gpus 0,1 --config configs/<name>.yaml
 
 The default config is the standard one; the others in `configs/` cover stress testing and the TP configurations. `--gpus` must supply at least as many devices as the config's rank list uses — check the `ranks:` lists in the YAML, which is the authority (a `tp2_sp2` config wants four).
 
-**Poll `/health` for readiness. Do not grep the log for "Application startup complete".**
+**Poll `/health` for readiness. Do not grep the log for a startup line.**
 
 ```bash
 curl -sf http://127.0.0.1:$PORT/health
 ```
 
-If another server still holds the port, the Python frontend (`--python-frontend`) logs startup-complete and only *afterwards* logs `[Errno 98] address already in use`. A log-grep readiness check sails straight past that and every request then fails with connection-refused. `mstar-server`, the default, stops with `mstar-server: could not listen on http://…: Address already in use` and `mstar serve` exits 3, but a `/health` poll still answers from whatever holds the port, so check the port is free before starting.
+If another server still holds the port, `mstar-server` fails to bind it (`Address already in use`) only once the workers are up and the warmups have run, often minutes in; until then the other server answers `/health`. That is why `server.sh` checks that the process answering `/health` is the one it started.
 
 **Transport:** benchmark over SHM, which is the default `--tensor-comm-protocol` and the safe single-node choice. SHM is the Rust shared-memory arena. Its segment size and count come from the size of `/dev/shm` unless `MSTAR_SHM_ARENA_SEGMENT_MB` / `MSTAR_SHM_ARENA_MAX_SEGMENTS` are set (each process logs them at startup), and a tensor that does not fit spills to a per-tensor file, with an `ARENA: spilling` warning in the server log. **TCP is very high variance — never use it for numbers.** Do run an untimed functional smoke test with `--tensor-comm-protocol TCP` occasionally to confirm the path works.
 

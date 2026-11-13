@@ -35,10 +35,9 @@ reflects depends on where it was measured:
   second, and the conductor adds them to its next status message, so worker families
   can be up to two seconds old. A lost or reordered message cannot corrupt a counter:
   every message carries totals, not increments, and the API server keeps the latest.
-- **Rust frontend.** ``mstar-server``, the default frontend, serves ``/metrics`` by
-  asking the API server for the rendered text over the bridge, so both frontends show
-  the same families. It answers ``503`` if the bridge does not reply within two
-  seconds. ``mstar-server`` counts its own HTTP refusals and sends the totals with each
+- **HTTP frontend.** ``mstar-server`` serves ``/metrics`` by asking the API server for
+  the rendered text over the bridge. It answers ``503`` if the bridge does not reply
+  within two seconds. ``mstar-server`` counts its own HTTP refusals and sends the totals with each
   ``/metrics`` request, and the API server exports them in
   ``mstar_http_refusals_total``.
 
@@ -97,7 +96,7 @@ Requests
 --------
 
 Exported by the API server, recorded where a request leaves it, the same way for
-``/generate``, ``/generate/ws``, the OpenAI routes and both frontends.
+``/generate``, ``/generate/ws`` and the OpenAI routes.
 
 ``mstar_requests_total{model_name, output_modalities, outcome}``
    Counter. Requests that left the API server. ``success``: the result went to the
@@ -203,17 +202,17 @@ request's media and runs the model's prompt processing, one request at a time.
 HTTP refusals
 -------------
 
-Exported by the API server, counted by whichever frontend serves the deployment.
+Exported by the API server, counted by ``mstar-server``.
 
 ``mstar_http_refusals_total{model_name, route, status}``
    Counter. HTTP requests the frontend answered with an error without submitting them
    to the API server: ``401`` (missing or wrong API key), ``413`` (body over
    ``MSTAR_MAX_BODY_MB``), ``422`` (body that fails validation), ``400`` (a bad form
    field or request), ``409`` (a ``request_id`` in flight), ``404`` (unknown route, or
-   a model without the endpoint), ``405`` (wrong method), and ``503`` when the Rust
-   frontend's ``MSTAR_MAX_CONCURRENT_REQUESTS`` cap turns a request away. WebSocket
-   handshakes are not counted. Unless ``--python-frontend`` is set, the values are the
-   totals ``mstar-server`` sent with the latest ``/metrics`` request.
+   a model without the endpoint), ``405`` (wrong method), and ``503`` when the
+   ``MSTAR_MAX_CONCURRENT_REQUESTS`` cap turns a request away. WebSocket handshakes are
+   not counted. The values are the totals ``mstar-server`` sent with the latest
+   ``/metrics`` request.
 
 Conductor
 ---------
@@ -439,5 +438,5 @@ To scrape from an existing Prometheus, add a job for the server's address:
          - targets: ["localhost:8000"]
 
 The conductor and workers report once a second, so a scrape interval under a second
-only repeats values. Keep the scrape timeout above two seconds: ``mstar-server``
-waits that long for the bridge before answering ``503``.
+only repeats values. Keep the scrape timeout above two seconds: ``mstar-server`` waits
+that long for the bridge before answering ``503``.

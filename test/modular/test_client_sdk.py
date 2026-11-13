@@ -256,12 +256,13 @@ def _stream_with(client, resp):
 
 
 def test_stream_takes_the_binary_path_when_the_server_says_so():
-    from mstar.api_server.entrypoint import _chunk_to_binary_frame
+    from stream_frames import binary_frame
+
     from mstar.api_server.request_types import ResultChunk
     from mstar.client.media import BINARY_STREAM_MEDIA_TYPE
 
     payload = bytes(range(256)) * 8
-    header, body = _chunk_to_binary_frame(
+    header, body = binary_frame(
         ResultChunk(request_id="r", modality="text", data=payload, metadata={})
     )
     resp = _fake_response(BINARY_STREAM_MEDIA_TYPE, header + body)

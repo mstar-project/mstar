@@ -1,0 +1,190 @@
+{
+"test_a_generate_stream_reads_as_pythons_down_to_a_late_error[frames]#0": {
+"__tuple__": [
+"application/vnd.mstar.frames",
+{
+"__bytes__": "eyJtb2RhbGl0eSI6InRleHQiLCJuYnl0ZXMiOjMsIm1ldGFkYXRhIjp7InRva2VuX2lkcyI6WzFdfX0KSGVseyJtb2RhbGl0eSI6ImF1ZGlvIiwibmJ5dGVzIjoxMDI0LCJtZXRhZGF0YSI6eyJzYW1wbGVfcmF0ZSI6MjQwMDB9fQoAAQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4/QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl9gYWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXp7fH1+f4CBgoOEhYaHiImKi4yNjo+QkZKTlJWWl5iZmpucnZ6foKGio6SlpqeoqaqrrK2ur7CxsrO0tba3uLm6u7y9vr/AwcLDxMXGx8jJysvMzc7P0NHS09TV1tfY2drb3N3e3+Dh4uPk5ebn6Onq6+zt7u/w8fLz9PX29/j5+vv8/f7/AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7PD0+P0BBQkNERUZHSElKS0xNTk9QUVJTVFVWV1hZWltcXV5fYGFiY2RlZmdoaWprbG1ub3BxcnN0dXZ3eHl6e3x9fn+AgYKDhIWGh4iJiouMjY6PkJGSk5SVlpeYmZqbnJ2en6ChoqOkpaanqKmqq6ytrq+wsbKztLW2t7i5uru8vb6/wMHCw8TFxsfIycrLzM3Oz9DR0tPU1dbX2Nna29zd3t/g4eLj5OXm5+jp6uvs7e7v8PHy8/T19vf4+fr7/P3+/wABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4fICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj9AQUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVpbXF1eX2BhYmNkZWZnaGlqa2xtbm9wcXJzdHV2d3h5ent8fX5/gIGCg4SFhoeIiYqLjI2Oj5CRkpOUlZaXmJmam5ydnp+goaKjpKWmp6ipqqusra6vsLGys7S1tre4ubq7vL2+v8DBwsPExcbHyMnKy8zNzs/Q0dLT1NXW19jZ2tvc3d7f4OHi4+Tl5ufo6err7O3u7/Dx8vP09fb3+Pn6+/z9/v8AAQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYGRobHB0eHyAhIiMkJSYnKCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4/QEFCQ0RFRkdISUpLTE1OT1BRUlNUVVZXWFlaW1xdXl9gYWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXp7fH1+f4CBgoOEhYaHiImKi4yNjo+QkZKTlJWWl5iZmpucnZ6foKGio6SlpqeoqaqrrK2ur7CxsrO0tba3uLm6u7y9vr/AwcLDxMXGx8jJysvMzc7P0NHS09TV1tfY2drb3N3e3+Dh4uPk5ebn6Onq6+zt7u/w8fLz9PX29/j5+vv8/f7/eyJtb2RhbGl0eSI6ImVycm9yIiwibmJ5dGVzIjoyMSwibWV0YWRhdGEiOnsic3RhdHVzIjo1MDB9fQpFcnJvciBpbiB3b3JrZXI6IGJvb20="
+}
+]
+},
+"test_a_generate_stream_reads_as_pythons_down_to_a_late_error[ndjson]#0": {
+"__tuple__": [
+"application/vnd.mstar.frames",
+{
+"__bytes__": "eyJtb2RhbGl0eSI6ICJ0ZXh0IiwgImRhdGEiOiAiU0dWcyIsICJtZXRhZGF0YSI6IHsidG9rZW5faWRzIjogWzFdfX0KeyJtb2RhbGl0eSI6ICJhdWRpbyIsICJkYXRhIjogIkFBRUNBd1FGQmdjSUNRb0xEQTBPRHhBUkVoTVVGUllYR0JrYUd4d2RIaDhnSVNJakpDVW1KeWdwS2lzc0xTNHZNREV5TXpRMU5qYzRPVG83UEQwK1AwQkJRa05FUlVaSFNFbEtTMHhOVGs5UVVWSlRWRlZXVjFoWldsdGNYVjVmWUdGaVkyUmxabWRvYVdwcmJHMXViM0J4Y25OMGRYWjNlSGw2ZTN4OWZuK0FnWUtEaElXR2g0aUppb3VNalk2UGtKR1NrNVNWbHBlWW1acWJuSjJlbjZDaG9xT2twYWFucUttcXE2eXRycSt3c2JLenRMVzJ0N2k1dXJ1OHZiNi93TUhDdzhURnhzZkl5Y3JMek0zT3o5RFIwdFBVMWRiWDJObmEyOXpkM3QvZzRlTGo1T1htNStqcDZ1dnM3ZTd2OFBIeTgvVDE5dmY0K2ZyNy9QMysvd0FCQWdNRUJRWUhDQWtLQ3d3TkRnOFFFUklURkJVV0Z4Z1pHaHNjSFI0ZklDRWlJeVFsSmljb0tTb3JMQzB1THpBeE1qTTBOVFkzT0RrNk96dzlQajlBUVVKRFJFVkdSMGhKU2t0TVRVNVBVRkZTVTFSVlZsZFlXVnBiWEYxZVgyQmhZbU5rWldabmFHbHFhMnh0Ym05d2NYSnpkSFYyZDNoNWVudDhmWDUvZ0lHQ2c0U0Zob2VJaVlxTGpJMk9qNUNSa3BPVWxaYVhtSm1hbTV5ZG5wK2dvYUtqcEtXbXA2aXBxcXVzcmE2dnNMR3lzN1MxdHJlNHVicTd2TDIrdjhEQndzUEV4Y2JIeU1uS3k4ek56cy9RMGRMVDFOWFcxOWpaMnR2YzNkN2Y0T0hpNCtUbDV1Zm82ZXJyN08zdTcvRHg4dlAwOWZiMytQbjYrL3o5L3Y4QUFRSURCQVVHQndnSkNnc01EUTRQRUJFU0V4UVZGaGNZR1JvYkhCMGVIeUFoSWlNa0pTWW5LQ2txS3l3dExpOHdNVEl6TkRVMk56ZzVPanM4UFQ0L1FFRkNRMFJGUmtkSVNVcExURTFPVDFCUlVsTlVWVlpYV0ZsYVcxeGRYbDlnWVdKalpHVm1aMmhwYW10c2JXNXZjSEZ5YzNSMWRuZDRlWHA3ZkgxK2Y0Q0Jnb09FaFlhSGlJbUtpNHlOam8rUWtaS1RsSldXbDVpWm1wdWNuWjZmb0tHaW82U2xwcWVvcWFxcnJLMnVyN0N4c3JPMHRiYTN1TG02dTd5OXZyL0F3Y0xEeE1YR3g4akp5c3ZNemM3UDBOSFMwOVRWMXRmWTJkcmIzTjNlMytEaDR1UGs1ZWJuNk9ucTYrenQ3dS93OGZMejlQWDI5L2o1K3Z2OC9mNy9BQUVDQXdRRkJnY0lDUW9MREEwT0R4QVJFaE1VRlJZWEdCa2FHeHdkSGg4Z0lTSWpKQ1VtSnlncEtpc3NMUzR2TURFeU16UTFOamM0T1RvN1BEMCtQMEJCUWtORVJVWkhTRWxLUzB4TlRrOVFVVkpUVkZWV1YxaFpXbHRjWFY1ZllHRmlZMlJsWm1kb2FXcHJiRzF1YjNCeGNuTjBkWFozZUhsNmUzeDlmbitBZ1lLRGhJV0doNGlKaW91TWpZNlBrSkdTazVTVmxwZVltWnFibkoyZW42Q2hvcU9rcGFhbnFLbXFxNnl0cnErd3NiS3p0TFcydDdpNXVydTh2YjYvd01IQ3c4VEZ4c2ZJeWNyTHpNM096OURSMHRQVTFkYlgyTm5hMjl6ZDN0L2c0ZUxqNU9YbTUranA2dXZzN2U3djhQSHk4L1QxOXZmNCtmcjcvUDMrL3c9PSIsICJtZXRhZGF0YSI6IHsic2FtcGxlX3JhdGUiOiAyNDAwMH19CnsibW9kYWxpdHkiOiAiZXJyb3IiLCAiZGF0YSI6ICJSWEp5YjNJZ2FXNGdkMjl5YTJWeU9pQmliMjl0IiwgIm1ldGFkYXRhIjogeyJzdGF0dXMiOiA1MDB9fQo="
+}
+]
+},
+"test_both_frontends_route_under_a_root_path_alike[bare]#0": [
+200,
+200,
+404,
+404,
+404
+],
+"test_both_frontends_route_under_a_root_path_alike[trailing-slash]#0": [
+404,
+200,
+404,
+404,
+404
+],
+"test_generate_refuses_a_body_that_is_not_a_form_as_python_does[json]#0": {
+"__tuple__": [
+400,
+{
+"detail": "/generate takes multipart/form-data or urlencoded fields, not application/json"
+}
+]
+},
+"test_generate_refuses_a_body_that_is_not_a_form_as_python_does[plain]#0": {
+"__tuple__": [
+400,
+{
+"detail": "/generate takes multipart/form-data or urlencoded fields, not text/plain"
+}
+]
+},
+"test_generate_submits_the_layout_python_does[empty-layout]#0": {
+"files": {
+"image": [
+{
+"__bytes__": "iVBORy1h"
+}
+]
+},
+"in": [
+"image",
+"text"
+],
+"parts": [
+{
+"index": 0,
+"modality": "image",
+"role": null,
+"text": null
+},
+{
+"index": 0,
+"modality": "text",
+"role": null,
+"text": "hi"
+}
+],
+"status": 200,
+"text": "hi"
+},
+"test_generate_submits_the_layout_python_does[empty-text]#0": {
+"files": {
+"image": [
+{
+"__bytes__": "iVBORy1h"
+}
+]
+},
+"in": [
+"image"
+],
+"parts": null,
+"status": 200,
+"text": null
+},
+"test_generate_submits_the_layout_python_does[files-then-text]#0": {
+"files": {
+"audio": [
+{
+"__bytes__": "UklGRi1i"
+}
+],
+"image": [
+{
+"__bytes__": "iVBORy1h"
+},
+{
+"__bytes__": "iVBORy1j"
+}
+]
+},
+"in": [
+"image",
+"audio",
+"image",
+"text"
+],
+"parts": [
+{
+"index": 0,
+"modality": "image",
+"role": null,
+"text": null
+},
+{
+"index": 0,
+"modality": "audio",
+"role": null,
+"text": null
+},
+{
+"index": 1,
+"modality": "image",
+"role": null,
+"text": null
+},
+{
+"index": 0,
+"modality": "text",
+"role": null,
+"text": "describe both"
+}
+],
+"status": 200,
+"text": "describe both"
+},
+"test_generate_submits_the_layout_python_does[layout-text-no-text]#0": {
+"files": {
+"image": [
+{
+"__bytes__": "iVBORy1h"
+}
+]
+},
+"in": [
+"image"
+],
+"parts": null,
+"status": 200,
+"text": null
+},
+"test_generate_submits_the_layout_python_does[layout-without-text]#0": {
+"files": {
+"image": [
+{
+"__bytes__": "iVBORy1h"
+}
+]
+},
+"in": [
+"image",
+"text"
+],
+"parts": null,
+"status": 200,
+"text": "hi"
+},
+"test_generate_submits_the_layout_python_does[text-only]#0": {
+"files": {},
+"in": [
+"text"
+],
+"parts": [
+{
+"index": 0,
+"modality": "text",
+"role": null,
+"text": "just text"
+}
+],
+"status": 200,
+"text": "just text"
+}
+}

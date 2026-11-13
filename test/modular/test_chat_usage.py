@@ -4,16 +4,15 @@ The data worker counts the prompt's positions (``Model.prompt_tokens``) and
 each text chunk's tokens, and flags the chunk a stop token ended; the
 conductor returns the prompt count and the output cap it resolved on
 ``request_complete``, and the API server ends a ``report_usage`` submission
-with a ``usage`` chunk the chat handlers turn into OpenAI's ``usage`` and
-``finish_reason``. The Rust frontend's side is in ``rust/server/src/main.rs``
-and ``test/rust/test_rust_frontend.py``.
+with a ``usage`` chunk that ``mstar-server``'s chat handler turns into
+OpenAI's ``usage`` and ``finish_reason`` (``rust/server/src/main.rs``, tested
+there and in ``test/rust/test_rust_frontend.py``).
 """
 from __future__ import annotations
 
 import asyncio
 import dataclasses
 import inspect
-import json
 import queue
 import threading
 from types import SimpleNamespace
@@ -31,7 +30,6 @@ from mstar.api_server.request_types import (
     RequestComplete,
     ResultChunk,
 )
-from mstar.api_server.served_models import Selected
 from mstar.communication.event import EventWakeup
 from mstar.conductor.request_info import WalkStep
 from mstar.graph.base import GraphEdge, GraphNode
@@ -409,101 +407,3 @@ def test_a_failed_request_gets_its_error_and_no_usage():
 
 
 # -- the chat handler ---------------------------------------------------------
-
-
-def _usage(finish="length"):
-    return ResultChunk(request_id="r", modality=USAGE, data=b"", metadata={
-        "prompt_tokens": 5, "completion_tokens": 4, "finish_reason": finish,
-    })
-
-
-class _ChatAPI:
-    """Just enough APIServer for ``create_chat_completion``."""
-
-    model = None
-
-    def __init__(self, chunks, upload_dir):
-        self.chunks = chunks
-        self.upload_dir = upload_dir
-        self.submitted = {}
-
-    def lora_kwargs(self, model, model_kwargs):
-        return Selected(model_kwargs)
-
-    def submit_request(self, **kwargs):
-        self.submitted = kwargs
-
-    async def collect_results(self, request_id, raw_request=None):
-        return self.chunks
-
-    async def open_result_stream(self, request_id, raw_request=None, batches=False):
-        async def replay():
-            yield self.chunks
-        return replay()
-
-    def release_request(self, request_id):
-        pass
-
-
-def _chat(chunks, tmp_path, **fields):
-    pytest.importorskip("fastapi")
-    from mstar.api_server.openai.adapters import SubmitArgs
-    from mstar.api_server.openai.protocol import ChatCompletionRequest
-    from mstar.api_server.openai.serving_chat import create_chat_completion
-
-    api = _ChatAPI(chunks, tmp_path)
-    adapter = SimpleNamespace(chat_to_request=lambda req, upload_dir: SubmitArgs(text="hi", input_modalities=["text"]))
-    req = ChatCompletionRequest(messages=[{"role": "user", "content": "hi"}], **fields)
-
-    async def run():
-        resp = await create_chat_completion(api, "m", adapter, req)
-        if not fields.get("stream"):
-            return resp
-        frames = [f async for f in resp.body_iterator]
-        return [json.loads(line[6:]) for f in frames for line in f.splitlines()
-                if line.startswith("data: ") and line != "data: [DONE]"]
-
-    return asyncio.run(run()), api
-
-
-@pytest.mark.parametrize("finish", ["length", "stop"])
-def test_a_chat_reply_reports_the_usage_chunk(finish, tmp_path):
-    text = ResultChunk(request_id="r", modality="text", data=b"hello")
-    resp, api = _chat([text, _usage(finish)], tmp_path)
-    assert api.submitted["report_usage"] is True
-    assert resp["choices"][0]["message"]["content"] == "hello"
-    assert resp["choices"][0]["finish_reason"] == finish
-    assert resp["usage"] == {"prompt_tokens": 5, "completion_tokens": 4, "total_tokens": 9}
-
-
-@pytest.mark.parametrize("include_usage", [False, True])
-def test_a_chat_stream_ends_with_its_finish_reason_and_usage_only_when_asked(include_usage, tmp_path):
-    text = ResultChunk(request_id="r", modality="text", data=b"hello")
-    events, api = _chat([text, _usage()], tmp_path, stream=True,
-                        stream_options={"include_usage": include_usage})
-    assert api.submitted["report_usage"] is True
-    assert "".join(e["choices"][0]["delta"].get("content", "") for e in events if e["choices"]) == "hello"
-    with_usage = [e for e in events if "usage" in e]
-    finish = events[-2] if include_usage else events[-1]
-    assert finish["choices"][0]["finish_reason"] == "length"
-    if include_usage:
-        assert with_usage == [events[-1]]
-        assert events[-1]["choices"] == []
-        assert events[-1]["usage"] == {"prompt_tokens": 5, "completion_tokens": 4, "total_tokens": 9}
-    else:
-        assert with_usage == []
-
-
-@pytest.mark.parametrize("sent, reported", [("false", False), (0, False), ("yes", True), (1, True)])
-def test_include_usage_reads_a_bool_as_the_rust_frontend_does(sent, reported, tmp_path):
-    """Both frontends read ``include_usage`` as pydantic reads a bool (the Rust
-    side's ``flex::opt_bool``): ``"false"`` asks for no usage chunk."""
-    text = ResultChunk(request_id="r", modality="text", data=b"hello")
-    events, _ = _chat([text, _usage()], tmp_path, stream=True, stream_options={"include_usage": sent})
-    assert bool([e for e in events if "usage" in e]) is reported
-
-
-def test_a_non_bool_include_usage_is_refused(tmp_path):
-    pydantic = pytest.importorskip("pydantic")
-    with pytest.raises(pydantic.ValidationError):
-        _chat([], tmp_path, stream=True, stream_options={"include_usage": "maybe"})

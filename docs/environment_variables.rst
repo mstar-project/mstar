@@ -258,13 +258,12 @@ model, so they are named for it.
        model code does not run on transformers 5). Unset under transformers 5,
        the SDK comparison skips.
 
-Serving (API server)
---------------------
+Serving
+-------
 
-Read by ``mstar-serve`` / ``mstar.api_server.entrypoint``, whichever frontend
-serves HTTP. Where a row describes how a route answers, it is the Python
-frontend's (``--python-frontend``); ``mstar-server``'s rows are under
-`Serving (Rust frontend)`_.
+Read by ``mstar-serve`` (``mstar.api_server.entrypoint`` and the bridge in
+``mstar/api_server/rust_frontend.py``) and by the ``mstar-server`` binary it
+launches as its HTTP frontend (see :doc:`installation`).
 
 .. list-table::
    :header-rows: 1
@@ -275,9 +274,10 @@ frontend's (``--python-frontend``); ``mstar-server``'s rows are under
      - Meaning
    * - ``MSTAR_MAX_BODY_MB``
      - ``128``
-     - Request body limit on every route, as in the Rust frontend: a larger
-       body gets a 413, refused on its ``Content-Length`` or, for a chunked
-       upload, while it is read. ``/v1/audio/transcriptions`` keeps its own
+     - Request body limit on every route, multipart uploads included
+       (``rust/server/src/main.rs``): a larger body gets a 413, refused on
+       its ``Content-Length`` or, for a chunked upload, while it is read.
+       ``/v1/audio/transcriptions`` keeps its own
        512 MiB file cap when this is lower. A body refused on its
        ``Content-Length`` is answered before it is read, so a client that
        writes the whole body before reading the reply can see a connection
@@ -292,24 +292,24 @@ frontend's (``--python-frontend``); ``mstar-server``'s rows are under
        request reaches the pod (Run:AI serves a workload at
        ``/<project>/<job-name>/``, for instance); without it every route
        404s. A path under the prefix is routed without it, and any other path
-       as sent, on both frontends (Starlette's ``root_path``; ``route_path``
-       in ``rust/server/src/main.rs``). Empty by default, so a direct
-       deployment is unaffected.
+       as sent (``route_path`` in ``rust/server/src/main.rs``). Empty by
+       default, so a direct deployment is unaffected.
    * - ``MSTAR_MAX_IMAGES_PER_REQUEST``
      - ``10``
-     - Largest ``n`` one ``/v1/images/generations`` request may ask for (see
-       :func:`mstar.api_server.openai.serving_images.max_images_per_request`);
+     - Largest ``n`` one ``/v1/images/generations`` request may ask for;
        ``n`` outside ``1`` to this value is a 400 before anything is
-       submitted. The Rust frontend and the Dynamo bridge apply the same
-       variable and default.
+       submitted. Read by ``mstar-server`` and, with the same default, by the
+       Dynamo bridge
+       (:func:`mstar.api_server.openai.serving_images.max_images_per_request`).
    * - ``MSTAR_API_KEY``
      - unset
      - API key (read by :func:`mstar.api_server.auth.resolve_api_key`;
        ``--api-key`` overrides it). When set, every route except
        ``/health`` and ``/metrics`` needs ``Authorization: Bearer <key>``, WebSocket
        handshakes included; unset or empty turns the check off. The
-       launcher passes it on to the Rust frontend only (the conductor and
-       workers do not inherit it), and
+       launcher passes it on to ``mstar-server`` only, which reads it once at
+       startup (``rust/server/src/auth.rs``; the conductor and workers do not
+       inherit it), and
        :class:`mstar.client.MStarClient` sends it when not given
        ``api_key``. See :ref:`api-key`.
    * - ``MSTAR_SILERO_VAD_PATH``
@@ -328,20 +328,6 @@ frontend's (``--python-frontend``); ``mstar-server``'s rows are under
        local Hugging Face cache is used if present; with neither, or with a
        file whose inputs or outputs differ, ``semantic_vad`` sessions are
        refused. Never downloaded.
-
-Serving (Rust frontend)
------------------------
-
-Read by the ``mstar-server`` binary, ``mstar serve``'s default HTTP frontend,
-and its bridge (see :doc:`installation`).
-
-.. list-table::
-   :header-rows: 1
-   :widths: 28 14 58
-
-   * - Variable
-     - Default
-     - Meaning
    * - ``MSTAR_SERVER_BIN``
      - unset
      - Path to the ``mstar-server`` binary. Fallback order:
@@ -350,38 +336,31 @@ and its bridge (see :doc:`installation`).
        the in-repo ``rust/server/target/release`` build. In a checkout the
        fallbacks skip a binary built from other sources, while this one is
        used with a warning (``find_server_binary``).
-   * - ``MSTAR_API_KEY``
-     - unset
-     - Same rule as the Python server (``rust/server/src/auth.rs``, read
-       once at startup): every route except ``/health`` and ``/metrics`` needs
-       ``Authorization: Bearer <key>``. ``mstar-serve``
-       sets it from ``--api-key`` / its own environment.
    * - ``MSTAR_REQUEST_TIMEOUT_S``
      - ``600``
-     - Per-request budget in the Rust frontend, in seconds; on expiry the
+     - Per-request budget in ``mstar-server``, in seconds; on expiry the
        client gets an error and the request is aborted in the backend. ``0``
        times every request out; a negative, non-finite or unreadable value is
        the default. ``mstar serve`` sets it from ``--timeout``
        (``launch_rust_server``).
    * - ``MSTAR_SAMPLE_RATE``
      - ``24000``
-     - Sample rate stamped on the Rust frontend's WAV output.
+     - Sample rate stamped on ``mstar-server``'s WAV output.
        ``mstar serve`` sets it to the model's
-       ``get_output_sample_rate("audio")``, as the Python frontend reads it.
+       ``get_output_sample_rate("audio")``.
    * - ``MSTAR_LIBSNDFILE``
      - unset
-     - The libsndfile the Rust frontend opens at startup to encode ``mp3``,
+     - The libsndfile ``mstar-server`` opens at startup to encode ``mp3``,
        ``flac`` and ``opus`` speech (``rust/server/src/sndfile.rs``), called as
-       ``soundfile.write`` calls it, so the files are the Python frontend's
-       byte for byte (an Ogg stream's random serial aside). Unset, only ``wav``
-       and ``pcm`` are produced, as on the Python frontend without
-       ``soundfile``. ``launch_rust_server`` sets it to the library
+       ``soundfile.write`` calls it, so the files are ``soundfile``'s byte for
+       byte (an Ogg stream's random serial aside). Unset, only ``wav`` and
+       ``pcm`` are produced. ``launch_rust_server`` sets it to the library
        ``soundfile`` loaded (``soundfile_library``) and drops an inherited
        value; it is opened at run time, never linked, as its LAME encoder is
        LGPL.
    * - ``MSTAR_SERVED_MODELS``
      - unset
-     - The names a Rust-frontend request's ``model`` may carry, as JSON: the
+     - The names a request's ``model`` may carry, as JSON: the
        base model's names and the LoRA adapters served at launch
        (``api_server/served_models.py``, ``rust/server/src/served_models.rs``);
        the API server pushes each later change over the bridge. Unset serves
@@ -389,7 +368,7 @@ and its bridge (see :doc:`installation`).
        ``launch_rust_server`` sets it from the API server's ``ServedModels``.
    * - ``MSTAR_TRANSCRIPTION``
      - unset
-     - What the Rust frontend's ``/v1/audio/transcriptions`` needs from the
+     - What ``mstar-server``'s ``/v1/audio/transcriptions`` needs from the
        served model, as JSON: the kwargs it declares, the deployment's
        ``max_concurrent_requests``, the adapter's language tables, and the
        pydantic version its error text cites. Not for deployments to set:
@@ -403,7 +382,7 @@ and its bridge (see :doc:`installation`).
        ``openpi_facts``.
    * - ``MSTAR_WS_MAX_BYTES``
      - the body limit
-     - The largest WebSocket message the Rust frontend reads, in bytes: the
+     - The largest WebSocket message ``mstar-server`` reads, in bytes: the
        config's ``ws_max_message_mb``. Not for deployments to set:
        ``launch_rust_server`` sets it.
    * - ``MSTAR_CLIENT_STREAMS``
@@ -413,7 +392,7 @@ and its bridge (see :doc:`installation`).
        ``launch_rust_server`` sets it from ``APIServer.client_streams``.
    * - ``MSTAR_REALTIME``
      - unset
-     - What the Rust frontend's ``/v1/realtime`` runs with, as JSON: for a
+     - What ``mstar-server``'s ``/v1/realtime`` runs with, as JSON: for a
        model with an audio client stream, what a conversation needs from it
        (``conversation_facts``); for realtime transcription, the ONNX Runtime
        library ``onnxruntime`` loads, Silero's weights, why Smart Turn did not
@@ -421,9 +400,10 @@ and its bridge (see :doc:`installation`).
        set: ``launch_rust_server`` sets it from ``realtime_facts``.
    * - ``MSTAR_ALLOW_REMOTE``
      - ``0``
-     - Allow ``http(s)`` media URLs in requests, fetched server-side by both
-       frontends (``media_io.save_remote_url`` and ``save_remote_url`` in
-       ``rust/server/src/media.rs``). Off by default. A fetch follows at
+     - Allow ``http(s)`` media URLs in requests, fetched server-side by
+       ``mstar-server`` (``save_remote_url`` in ``rust/server/src/media.rs``)
+       and, behind the Dynamo bridge, by ``media_io.save_remote_url``. Off by
+       default. A fetch follows at
        most 3 redirects and takes at most 30 s; proxy variables are not
        used, so the connection goes to the address that was checked. A host
        that resolves to a loopback, private, link-local, multicast or
@@ -432,9 +412,9 @@ and its bridge (see :doc:`installation`).
        NAT64 ``64:ff9b::/96``, 6to4 ``2002::/16``, IPv4-compatible) is
        judged by that IPv4 address. Failures return a 400 with a short
        message; the details are only logged. HTTPS certificates are checked
-       against the system trust store on the Python frontend and against
-       the bundled Mozilla roots (``webpki-roots``) on the Rust frontend,
-       so a private CA added to the system store is trusted by Python only.
+       against the bundled Mozilla roots (``webpki-roots``) in
+       ``mstar-server`` and against the system trust store in Python, so a
+       private CA added to the system store is trusted by Python only.
    * - ``MSTAR_REMOTE_ALLOWED_HOSTS``
      - unset
      - Comma-separated hosts and ``*.suffix`` patterns (``*.example.com``
@@ -444,7 +424,7 @@ and its bridge (see :doc:`installation`).
        canonical form (an ASCII name, dotted-decimal IPv4, compressed IPv6
        such as ``[::1]``); other spellings of an address (``2130706433``,
        ``0x7f000001``, ``127.1``, ``[0:0:0:0:0:0:0:1]``) never match. Read
-       by the same two functions; the Rust frontend reads it once at
+       by the same two functions; ``mstar-server`` reads it once at
        startup.
    * - ``MSTAR_REMOTE_MAX_BYTES``
      - ``67108864``
@@ -456,9 +436,6 @@ and its bridge (see :doc:`installation`).
      - Admission cap on in-flight generation requests; beyond it clients
        get an immediate 503 instead of queueing into the request timeout.
        ``/health``, ``/metrics`` and ``/v1/models`` bypass the cap.
-   * - ``MSTAR_MAX_BODY_MB``
-     - ``128``
-     - Request body limit (multipart uploads included).
    * - ``MSTAR_TOKENIZE_PARALLEL``
      - ``1``
      - When a long prompt is encoded as parallel chunks, set
@@ -483,8 +460,8 @@ and its bridge (see :doc:`installation`).
 Request media
 -------------
 
-Read by the model's media loaders in the data worker's preprocess thread,
-behind either frontend. All four are also checked once when the data worker
+Read by the model's media loaders in the data worker's preprocess thread.
+All four are also checked once when the data worker
 starts (:func:`mstar.model.media_limits.check_media_limits`), so an invalid
 value stops the server instead of failing every media request. The pixel and
 audio caps hold for a request's files together (:class:`mstar.model.media_limits.RequestMediaBudget`),
@@ -578,7 +555,7 @@ Worker scheduling
    * - ``MSTAR_STEP_THREAD_CORE``
      - config's ``knobs: step_thread_core``, else ``auto``
      - Pin each worker's main, GPU and plan threads, and the API server's
-       message thread and Rust frontend bridge on a CPU of their own. A step
+       message thread and ``mstar-server`` bridge on a CPU of their own. A step
        hands work between the three worker threads several times and every
        step's tokens pass from the message thread to the bridge; on a host
        whose idle cores drop into deep C-states, each handoff to a sleeping

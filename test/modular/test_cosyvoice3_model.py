@@ -72,7 +72,6 @@ from mstar.model.cosyvoice3.submodules import (
 from mstar.model.registry import HF_MODELS, get_model_class
 from mstar.streaming.chunk_policy import ScheduledLeftContextChunkPolicy
 from mstar.streaming.stream_buffer import StreamBuffer
-from mstar.testing_utils.model import make_model
 
 CONFIG_PATH = Path(__file__).resolve().parents[2] / "configs" / "cosyvoice3.yaml"
 SR = 24_000
@@ -559,19 +558,15 @@ def test_adapter_sizes_pieces_of_other_scripts_by_their_tokens(text, max_chars):
 
 
 def test_long_speech_input_is_planned_as_reference_pieces():
-    """``/v1/audio/speech`` plans a CosyVoice3 input through the adapter's
-    splitter by default; ``sentence_chunking: false`` keeps it whole."""
-    from mstar.api_server.openai.serving_speech import _plan_chunks
-
+    """A long CosyVoice3 ``/v1/audio/speech`` input is past the adapter's
+    chunking threshold and its splitter cuts it into pieces; a short one stays
+    a single request (mstar-server plans the pieces from these settings)."""
     adapter = adapters.CosyVoice3Adapter()
     text = (_PASSAGE * 5).strip()
-    request = SpeechRequest(model="cosyvoice3", input=text)
-    assert _plan_chunks(request, adapter, text) == adapter.split_speech_text(text)
-    assert len(_plan_chunks(request, adapter, text)) > 1
-    whole = SpeechRequest(model="cosyvoice3", input=text, sentence_chunking=False)
-    assert _plan_chunks(whole, adapter, text) == [text]
+    assert len(text) >= adapter.speech_chunk_min_chars
+    assert len(adapter.split_speech_text(text)) > 1
     short = "One benchmark sentence of about forty words stays a single request."
-    assert _plan_chunks(SpeechRequest(model="cosyvoice3", input=short), adapter, short) == [short]
+    assert len(short) < adapter.speech_chunk_min_chars
 
 
 def test_adapter_maps_voice_instructions_and_sampling(tmp_path):
@@ -670,45 +665,6 @@ def test_an_upload_the_server_cannot_write_is_not_a_bad_request(tmp_path, monkey
         adapters.CosyVoice3Adapter().speech_to_request(_speech(ref_audio=ref, ref_text="w"), tmp_path)
     assert not isinstance(raised.value, ValueError)
     assert str(raised.value) == "the server could not store ref_audio"
-
-
-def test_an_upload_write_failure_is_a_500_with_no_path(tmp_path, monkeypatch):
-    """Through the route: the client gets a 500 that names no upload path."""
-    import sys
-    import types
-
-    pytest.importorskip("httpx")
-    from fastapi import FastAPI
-    from fastapi.testclient import TestClient
-
-    import mstar.api_server
-    from mstar.api_server.openai.router import router
-
-    api = SimpleNamespace(
-        model_name="cosyvoice3",
-        model=make_model(get_output_sample_rate=lambda modality="audio": 24000),
-        upload_dir=tmp_path,
-        submit_request=lambda **kw: pytest.fail("nothing is submitted"),
-    )
-    fake_ep = types.ModuleType("mstar.api_server.entrypoint")
-    fake_ep.api_server = api
-    monkeypatch.setitem(sys.modules, "mstar.api_server.entrypoint", fake_ep)
-    monkeypatch.setattr(mstar.api_server, "entrypoint", fake_ep, raising=False)
-
-    def fail(path, data):
-        raise OSError(28, "No space left on device", str(path))
-
-    monkeypatch.setattr(Path, "write_bytes", fail)
-    app = FastAPI()
-    app.include_router(router)
-    r = TestClient(app, raise_server_exceptions=False).post(
-        "/v1/audio/speech",
-        json={"model": "cosyvoice3", "input": "hello", "ref_audio": "data:audio/wav;base64," + _NOT_AUDIO,
-              "ref_text": "w"},
-    )
-    assert r.status_code == 500
-    assert "internal error (error id " in r.json()["error"]["message"]
-    assert str(tmp_path) not in r.text
 
 
 def test_adapter_refuses_a_file_under_the_upload_dir(tmp_path):

@@ -1,0 +1,549 @@
+{
+"test_a_chat_runs_under_the_adapter_its_model_names[adapter-full]#0": {
+"models": {
+"__set__": [
+"sql"
+]
+},
+"resolved": {
+"__tuple__": [
+{
+"lora_adapter": "sql",
+"lora_digest": {
+"__bytes__": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE="
+}
+},
+{
+"__bytes__": "VBJYI4bueHH5hiGtF94X+ulbpQEnQywe36KqL2O3vto="
+}
+]
+},
+"status": 200,
+"submits": 1
+},
+"test_a_chat_runs_under_the_adapter_its_model_names[adapter-stream]#0": {
+"models": {
+"__set__": [
+"sql"
+]
+},
+"resolved": {
+"__tuple__": [
+{
+"lora_adapter": "sql",
+"lora_digest": {
+"__bytes__": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE="
+}
+},
+{
+"__bytes__": "VBJYI4bueHH5hiGtF94X+ulbpQEnQywe36KqL2O3vto="
+}
+]
+},
+"status": 200,
+"submits": 1
+},
+"test_a_chat_runs_under_the_adapter_its_model_names[base-name-full]#0": {
+"models": {
+"__set__": [
+"qwen3_5_0.8b"
+]
+},
+"resolved": {
+"__tuple__": [
+{},
+{
+"__bytes__": ""
+}
+]
+},
+"status": 200,
+"submits": 1
+},
+"test_a_chat_runs_under_the_adapter_its_model_names[base-name-stream]#0": {
+"models": {
+"__set__": [
+"qwen3_5_0.8b"
+]
+},
+"resolved": {
+"__tuple__": [
+{},
+{
+"__bytes__": ""
+}
+]
+},
+"status": 200,
+"submits": 1
+},
+"test_a_chat_runs_under_the_adapter_its_model_names[kwarg-agrees-full]#0": {
+"models": {
+"__set__": [
+"chat"
+]
+},
+"resolved": {
+"__tuple__": [
+{
+"lora_adapter": "chat",
+"lora_digest": {
+"__bytes__": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI="
+}
+},
+{
+"__bytes__": "RzLn0XiOyAmkdA8CEf7otnrXKaPWsY8B7piUQWxkZsA="
+}
+]
+},
+"status": 200,
+"submits": 1
+},
+"test_a_chat_runs_under_the_adapter_its_model_names[kwarg-agrees-stream]#0": {
+"models": {
+"__set__": [
+"chat"
+]
+},
+"resolved": {
+"__tuple__": [
+{
+"lora_adapter": "chat",
+"lora_digest": {
+"__bytes__": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI="
+}
+},
+{
+"__bytes__": "RzLn0XiOyAmkdA8CEf7otnrXKaPWsY8B7piUQWxkZsA="
+}
+]
+},
+"status": 200,
+"submits": 1
+},
+"test_a_chat_runs_under_the_adapter_its_model_names[kwarg-disagrees-full]#0": {
+"message": "model 'sql' and lora_adapter 'chat' name different adapters",
+"status": 400,
+"submits": 0
+},
+"test_a_chat_runs_under_the_adapter_its_model_names[kwarg-disagrees-stream]#0": {
+"message": "model 'sql' and lora_adapter 'chat' name different adapters",
+"status": 400,
+"submits": 0
+},
+"test_a_chat_runs_under_the_adapter_its_model_names[kwarg-full]#0": {
+"models": {
+"__set__": [
+"chat"
+]
+},
+"resolved": {
+"__tuple__": [
+{
+"lora_adapter": "chat",
+"lora_digest": {
+"__bytes__": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI="
+}
+},
+{
+"__bytes__": "RzLn0XiOyAmkdA8CEf7otnrXKaPWsY8B7piUQWxkZsA="
+}
+]
+},
+"status": 200,
+"submits": 1
+},
+"test_a_chat_runs_under_the_adapter_its_model_names[kwarg-stream]#0": {
+"models": {
+"__set__": [
+"chat"
+]
+},
+"resolved": {
+"__tuple__": [
+{
+"lora_adapter": "chat",
+"lora_digest": {
+"__bytes__": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI="
+}
+},
+{
+"__bytes__": "RzLn0XiOyAmkdA8CEf7otnrXKaPWsY8B7piUQWxkZsA="
+}
+]
+},
+"status": 200,
+"submits": 1
+},
+"test_a_chat_runs_under_the_adapter_its_model_names[kwarg-unknown-full]#0": {
+"message": "unknown LoRA adapter 'nope'; this deployment serves ['chat', 'sql']",
+"status": 400,
+"submits": 0
+},
+"test_a_chat_runs_under_the_adapter_its_model_names[kwarg-unknown-stream]#0": {
+"message": "unknown LoRA adapter 'nope'; this deployment serves ['chat', 'sql']",
+"status": 400,
+"submits": 0
+},
+"test_a_chat_runs_under_the_adapter_its_model_names[no-model-full]#0": {
+"models": {
+"__set__": [
+"qwen3_5_0.8b"
+]
+},
+"resolved": {
+"__tuple__": [
+{},
+{
+"__bytes__": ""
+}
+]
+},
+"status": 200,
+"submits": 1
+},
+"test_a_chat_runs_under_the_adapter_its_model_names[no-model-stream]#0": {
+"models": {
+"__set__": [
+"qwen3_5_0.8b"
+]
+},
+"resolved": {
+"__tuple__": [
+{},
+{
+"__bytes__": ""
+}
+]
+},
+"status": 200,
+"submits": 1
+},
+"test_a_chat_runs_under_the_adapter_its_model_names[repo-name-full]#0": {
+"models": {
+"__set__": [
+"qwen3_5_0.8b"
+]
+},
+"resolved": {
+"__tuple__": [
+{},
+{
+"__bytes__": ""
+}
+]
+},
+"status": 200,
+"submits": 1
+},
+"test_a_chat_runs_under_the_adapter_its_model_names[repo-name-stream]#0": {
+"models": {
+"__set__": [
+"qwen3_5_0.8b"
+]
+},
+"resolved": {
+"__tuple__": [
+{},
+{
+"__bytes__": ""
+}
+]
+},
+"status": 200,
+"submits": 1
+},
+"test_a_chat_runs_under_the_adapter_its_model_names[unknown-full]#0": {
+"message": "unknown LoRA adapter 'nope'; this deployment serves ['chat', 'sql']",
+"status": 400,
+"submits": 0
+},
+"test_a_chat_runs_under_the_adapter_its_model_names[unknown-stream]#0": {
+"message": "unknown LoRA adapter 'nope'; this deployment serves ['chat', 'sql']",
+"status": 400,
+"submits": 0
+},
+"test_an_image_edit_runs_under_the_adapter_its_form_names[adapter]#0": {
+"__tuple__": [
+200,
+null,
+{
+"__tuple__": [
+{
+"lora_adapter": "sql",
+"lora_digest": {
+"__bytes__": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE="
+}
+},
+{
+"__bytes__": "VBJYI4bueHH5hiGtF94X+ulbpQEnQywe36KqL2O3vto="
+}
+]
+}
+]
+},
+"test_an_image_edit_runs_under_the_adapter_its_form_names[kwarg-disagrees]#0": {
+"__tuple__": [
+200,
+"model 'sql' and lora_adapter 'chat' name different adapters",
+null
+]
+},
+"test_an_image_edit_runs_under_the_adapter_its_form_names[kwarg]#0": {
+"__tuple__": [
+200,
+null,
+{
+"__tuple__": [
+{
+"lora_adapter": "chat",
+"lora_digest": {
+"__bytes__": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI="
+}
+},
+{
+"__bytes__": "RzLn0XiOyAmkdA8CEf7otnrXKaPWsY8B7piUQWxkZsA="
+}
+]
+}
+]
+},
+"test_an_image_edit_runs_under_the_adapter_its_form_names[no-model]#0": {
+"__tuple__": [
+200,
+null,
+{
+"__tuple__": [
+{},
+{
+"__bytes__": ""
+}
+]
+}
+]
+},
+"test_an_image_edit_runs_under_the_adapter_its_form_names[unknown]#0": {
+"__tuple__": [
+200,
+"unknown LoRA adapter 'nope'; this deployment serves ['chat', 'sql']",
+null
+]
+},
+"test_speech_images_and_videos_run_under_the_adapter_too[adapter-images]#0": {
+"__tuple__": [
+200,
+null,
+{
+"__tuple__": [
+{
+"lora_adapter": "sql",
+"lora_digest": {
+"__bytes__": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE="
+}
+},
+{
+"__bytes__": "VBJYI4bueHH5hiGtF94X+ulbpQEnQywe36KqL2O3vto="
+}
+]
+}
+]
+},
+"test_speech_images_and_videos_run_under_the_adapter_too[adapter-speech]#0": {
+"__tuple__": [
+200,
+null,
+{
+"__tuple__": [
+{
+"lora_adapter": "sql",
+"lora_digest": {
+"__bytes__": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE="
+}
+},
+{
+"__bytes__": "VBJYI4bueHH5hiGtF94X+ulbpQEnQywe36KqL2O3vto="
+}
+]
+}
+]
+},
+"test_speech_images_and_videos_run_under_the_adapter_too[adapter-videos]#0": {
+"__tuple__": [
+200,
+null,
+{
+"__tuple__": [
+{
+"lora_adapter": "sql",
+"lora_digest": {
+"__bytes__": "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQE="
+}
+},
+{
+"__bytes__": "VBJYI4bueHH5hiGtF94X+ulbpQEnQywe36KqL2O3vto="
+}
+]
+}
+]
+},
+"test_speech_images_and_videos_run_under_the_adapter_too[kwarg-disagrees-images]#0": {
+"__tuple__": [
+200,
+"model 'sql' and lora_adapter 'chat' name different adapters",
+null
+]
+},
+"test_speech_images_and_videos_run_under_the_adapter_too[kwarg-disagrees-speech]#0": {
+"__tuple__": [
+200,
+"model 'sql' and lora_adapter 'chat' name different adapters",
+null
+]
+},
+"test_speech_images_and_videos_run_under_the_adapter_too[kwarg-disagrees-videos]#0": {
+"__tuple__": [
+200,
+"model 'sql' and lora_adapter 'chat' name different adapters",
+null
+]
+},
+"test_speech_images_and_videos_run_under_the_adapter_too[kwarg-images]#0": {
+"__tuple__": [
+200,
+null,
+{
+"__tuple__": [
+{
+"lora_adapter": "chat",
+"lora_digest": {
+"__bytes__": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI="
+}
+},
+{
+"__bytes__": "RzLn0XiOyAmkdA8CEf7otnrXKaPWsY8B7piUQWxkZsA="
+}
+]
+}
+]
+},
+"test_speech_images_and_videos_run_under_the_adapter_too[kwarg-speech]#0": {
+"__tuple__": [
+200,
+null,
+{
+"__tuple__": [
+{
+"lora_adapter": "chat",
+"lora_digest": {
+"__bytes__": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI="
+}
+},
+{
+"__bytes__": "RzLn0XiOyAmkdA8CEf7otnrXKaPWsY8B7piUQWxkZsA="
+}
+]
+}
+]
+},
+"test_speech_images_and_videos_run_under_the_adapter_too[kwarg-videos]#0": {
+"__tuple__": [
+200,
+null,
+{
+"__tuple__": [
+{
+"lora_adapter": "chat",
+"lora_digest": {
+"__bytes__": "AgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgI="
+}
+},
+{
+"__bytes__": "RzLn0XiOyAmkdA8CEf7otnrXKaPWsY8B7piUQWxkZsA="
+}
+]
+}
+]
+},
+"test_speech_images_and_videos_run_under_the_adapter_too[no-model-images]#0": {
+"__tuple__": [
+200,
+null,
+{
+"__tuple__": [
+{},
+{
+"__bytes__": ""
+}
+]
+}
+]
+},
+"test_speech_images_and_videos_run_under_the_adapter_too[no-model-speech]#0": {
+"__tuple__": [
+200,
+null,
+{
+"__tuple__": [
+{},
+{
+"__bytes__": ""
+}
+]
+}
+]
+},
+"test_speech_images_and_videos_run_under_the_adapter_too[no-model-videos]#0": {
+"__tuple__": [
+200,
+null,
+{
+"__tuple__": [
+{},
+{
+"__bytes__": ""
+}
+]
+}
+]
+},
+"test_speech_images_and_videos_run_under_the_adapter_too[unknown-images]#0": {
+"__tuple__": [
+200,
+"unknown LoRA adapter 'nope'; this deployment serves ['chat', 'sql']",
+null
+]
+},
+"test_speech_images_and_videos_run_under_the_adapter_too[unknown-speech]#0": {
+"__tuple__": [
+200,
+"unknown LoRA adapter 'nope'; this deployment serves ['chat', 'sql']",
+null
+]
+},
+"test_speech_images_and_videos_run_under_the_adapter_too[unknown-videos]#0": {
+"__tuple__": [
+200,
+"unknown LoRA adapter 'nope'; this deployment serves ['chat', 'sql']",
+null
+]
+},
+"test_v1_models_lists_the_adapters_beside_the_base_model#0": [
+{
+"id": "qwen3_5_0.8b",
+"object": "model",
+"owned_by": "mstar"
+},
+{
+"id": "sql",
+"object": "model",
+"owned_by": "mstar",
+"parent": "qwen3_5_0.8b"
+},
+{
+"id": "chat",
+"object": "model",
+"owned_by": "mstar",
+"parent": "qwen3_5_0.8b"
+}
+]
+}

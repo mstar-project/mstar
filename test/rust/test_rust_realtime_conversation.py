@@ -1,12 +1,12 @@
-"""``/v1/realtime`` conversations on mstar-server against the Python route.
+"""``/v1/realtime`` conversations on mstar-server, held to the Python route: the
+Python route's answers replayed as it gave them before it was removed
+(``python_oracle``).
 
-One scripted full-duplex model serves both frontends: it records the call's
-opening and every append's samples, and plays a fixed script of text and
-audio chunks (each stamped with its loop step and turn marks, as the data
-worker stamps them). Each case sends the same client events to both and
+A scripted full-duplex model records the call's opening and every append's
+samples, and plays a fixed script of text and audio chunks (each stamped with
+its loop step and turn marks, as the data worker stamps them). Each case
 compares every server event (ids numbered in order of appearance), how the
-socket closed, and the audio the stream got, sample for sample.
-"""
+socket closed, and the audio the stream got, sample for sample."""
 
 import asyncio
 import base64
@@ -30,11 +30,10 @@ np = pytest.importorskip("numpy")
 import websockets.exceptions
 import websockets.sync.client
 from fastapi import HTTPException
-from fastapi.testclient import TestClient
-from starlette.websockets import WebSocketDisconnect
+from python_oracle import python_side
 from test_rust_frontend import BINARY, _Chunk, _free_port, _wait_healthy
 
-from mstar.api_server import entrypoint, media_io
+from mstar.api_server import media_io
 from mstar.api_server.rust_frontend import REALTIME_ENV, RustFrontendBridge, realtime_facts
 from mstar.streaming.topology import CLIENT, ClientAudio, Connection
 
@@ -208,25 +207,6 @@ def _normalized(events: list[dict]) -> list[dict]:
     return out
 
 
-def _python(server, frames, until, linger):
-    entrypoint.api_server = server
-    events, code = [], None
-    try:
-        with TestClient(entrypoint.app).websocket_connect("/v1/realtime") as ws:
-            events.append(json.loads(ws.receive_text()))
-            for f in frames:
-                if isinstance(f, float):
-                    time.sleep(f)
-                    continue
-                (ws.send_bytes if isinstance(f, bytes) else ws.send_text)(f)
-            while until is None or not until(events):
-                events.append(json.loads(ws.receive_text()))
-            time.sleep(linger)
-    except WebSocketDisconnect as closed:
-        code = closed.code
-    return events, code
-
-
 def _rust_session(port, frames, until, linger):
     events, code = [], None
     try:
@@ -246,20 +226,25 @@ def _rust_session(port, frames, until, linger):
     return events, code
 
 
-def _both(stacks, monkeypatch, kind, events, *, script=(), end=True, refuse=0, until=None, linger=0.0):
-    """Each frontend's (events, close code) and what its call got. ``events``
-    may hold floats, seconds to wait; ``until`` stops reading (the socket
-    left open), else the session reads until the server closes it."""
+def _side(server, run, setup, reduce):
+    """One frontend's (normalised events, close code, what its call got), as ``reduce`` keeps it."""
+    server.reset(*setup)
+    evs, code = run()
+    return reduce((_normalized(evs), code, {"submits": server.submits, "appends": list(server.appends),
+                                            "rejected": server.rejected}))
+
+
+def _both(stacks, monkeypatch, kind, events, *, script=(), end=True, refuse=0, until=None, linger=0.0,
+          reduce=lambda side: side):
+    """Each frontend's (events, close code) and what its call got, the Python
+    route's as recorded. ``events`` may hold floats, seconds to wait; ``until``
+    stops reading (the socket left open), else the session reads until the
+    server closes it. ``reduce`` keeps what the case compares of each side."""
     server, port = stacks(kind)
-    monkeypatch.setattr(entrypoint, "api_server", server)
     frames = [e if isinstance(e, (str, bytes, float)) else json.dumps(e) for e in events]
-    out = []
-    for run in (lambda: _python(server, frames, until, linger), lambda: _rust_session(port, frames, until, linger)):
-        server.reset(script, end, refuse)
-        evs, code = run()
-        out.append((_normalized(evs), code, {"submits": server.submits, "appends": list(server.appends),
-                                              "rejected": server.rejected}))
-    return out
+    setup = (script, end, refuse)
+    py = python_side()
+    return py, _side(server, lambda: _rust_session(port, frames, until, linger), setup, reduce)
 
 
 def _text(step, data=b"", mark=None):
@@ -357,6 +342,11 @@ def test_a_failed_call_finishes_its_reply_and_closes_as_pythons(stacks, monkeypa
     assert py[1] == (1011 if status >= 500 else 1000)
 
 
+def _without_end(side):
+    events, code, call = side
+    return [e for e in events if not _is_end(e)], code, call
+
+
 @pytest.mark.parametrize("fmt", [
     {"type": "audio/pcm", "rate": 24000}, {"type": "audio/pcm", "rate": 16000}, {"type": "audio/pcm", "rate": 48000},
     {"type": "audio/pcm", "rate": 11025}, {"type": "audio/pcmu"}, {"type": "audio/pcma"},
@@ -375,9 +365,8 @@ def test_audio_reaches_the_stream_and_the_client_alike(stacks, monkeypatch, fmt)
     update = {"type": "session.update", "session": {"audio": {"input": {"format": fmt}, "output": {"format": fmt}}}}
     # the call stays open, so every append is taken; END and the reply race on either frontend
     py, rust = _both(stacks, monkeypatch, "marks", [update, *appends, END], script=SCRIPTS["one-reply"], end=False,
-                     until=lambda evs: "response.done" in _kinds(evs) and any(_is_end(e) for e in evs))
-    for side in (py, rust):
-        side[0][:] = [e for e in side[0] if not _is_end(e)]
+                     until=lambda evs: "response.done" in _kinds(evs) and any(_is_end(e) for e in evs),
+                     reduce=_without_end)
     _assert_same(py, rust, audio=False)
     # the clock pads the pause after the last append by each frontend's own wall time
     heard_py, heard_rust = np.concatenate(py[2]["appends"]), np.concatenate(rust[2]["appends"])
@@ -471,17 +460,22 @@ def test_an_append_that_fails_inside_the_server_is_an_error_event_alike(stacks, 
     assert any(e.get("error", {}).get("message") == "the append failed (error id X)" for e in py[0])
 
 
+def _shapes(side):
+    """Each append's (size, whether any sample is nonzero)."""
+    return [(a.size, bool(a.any())) for a in side[2]["appends"]]
+
+
 def test_a_paused_client_is_padded_with_whole_frames_of_silence(stacks, monkeypatch):
     """The model steps only on audio it hears: a client that pauses is padded
     with silence once it is a frame past the jitter allowance behind. Timed by
     each frontend's own clock, so what is compared is the shape."""
     fmt = {"type": "session.update", "session": {"audio": {"input": {"format": {"type": "audio/pcm", "rate": 16000}}}}}
     events = [fmt, _append(_tone(16000, 0.25).tobytes()), 1.2, {"type": "input_audio_buffer.commit"}]
-    for _, _, call in _both(stacks, monkeypatch, "marks", events, end=False,
-                            until=lambda evs: evs[-1]["type"] == "input_audio_buffer.committed"):
-        tone, *pads = call["appends"]
-        assert tone.size == 4000 and pads and all(not p.any() and p.size % FRAME == 0 for p in pads)
-        assert 6 * FRAME <= sum(p.size for p in pads) <= 13 * FRAME
+    for appends in _both(stacks, monkeypatch, "marks", events, end=False,
+                         until=lambda evs: evs[-1]["type"] == "input_audio_buffer.committed", reduce=_shapes):
+        (tone, _), *pads = appends
+        assert tone == 4000 and pads and all(not audible and size % FRAME == 0 for size, audible in pads)
+        assert 6 * FRAME <= sum(size for size, _ in pads) <= 13 * FRAME
 
 
 @pytest.mark.parametrize("kind, query", [
@@ -490,15 +484,12 @@ def test_a_paused_client_is_padded_with_whole_frames_of_silence(stacks, monkeypa
 ])
 def test_the_route_is_refused_as_pythons(stacks, monkeypatch, kind, query):
     server, port = stacks(kind)
-    monkeypatch.setattr(entrypoint, "api_server", server)
-    with pytest.raises(WebSocketDisconnect) as py:
-        with TestClient(entrypoint.app).websocket_connect(f"/v1/realtime{query}") as ws:
-            ws.receive_text()
+    py = python_side()
     with websockets.sync.client.connect(f"ws://127.0.0.1:{port}/v1/realtime{query}") as ws:
         with pytest.raises(websockets.exceptions.ConnectionClosed) as rust:
             ws.recv(timeout=10)
-    assert (rust.value.rcvd.code, rust.value.rcvd.reason) == (py.value.code, py.value.reason)
-    assert py.value.code == 1008
+    assert (rust.value.rcvd.code, rust.value.rcvd.reason) == py
+    assert py[0] == 1008
 
 
 

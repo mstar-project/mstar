@@ -442,9 +442,9 @@ def test_a_handler_letting_go_of_a_parked_request_wakes_the_loop():
     req.event.set()
     server.recently_completed["r"] = time.time()
     server._live["r"], server._client_ids["r"] = "r", "r"
-    server.release_submission("r")
+    server.release_request("r")
     assert _signals(worker.results_wakeup) == 1
-    server.release_submission("r")  # already gone: nothing to do
+    server.release_request("r")  # already gone: nothing to do
     assert _signals(worker.results_wakeup) == 0
 
     call = _pending(server, "call")

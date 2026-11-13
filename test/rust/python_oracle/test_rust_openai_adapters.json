@@ -1,0 +1,592 @@
+{
+"test_both_frontends_answer_a_chat_with_the_same_status_and_body[cosmos3_edge-bad-role]#0": {
+"__tuple__": [
+400,
+{
+"error": {
+"code": 400,
+"message": "a message's role must be system, developer, user or assistant, not 'tool'",
+"type": "invalid_request_error"
+}
+}
+]
+},
+"test_both_frontends_answer_a_chat_with_the_same_status_and_body[cosmos3_edge-chat-stream-usage]#0": {
+"__tuple__": [
+200,
+[
+{
+"choices": [
+{
+"delta": {
+"content": "Hello ",
+"role": "assistant"
+},
+"finish_reason": null,
+"index": 0
+}
+],
+"created": "*",
+"id": "*",
+"model": "cosmos3_edge",
+"object": "chat.completion.chunk"
+},
+{
+"choices": [
+{
+"delta": {
+"content": "world"
+},
+"finish_reason": null,
+"index": 0
+}
+],
+"created": "*",
+"id": "*",
+"model": "cosmos3_edge",
+"object": "chat.completion.chunk"
+},
+{
+"choices": [
+{
+"delta": {},
+"finish_reason": "length",
+"index": 0
+}
+],
+"created": "*",
+"id": "*",
+"model": "cosmos3_edge",
+"object": "chat.completion.chunk"
+},
+{
+"choices": [],
+"created": "*",
+"id": "*",
+"model": "cosmos3_edge",
+"object": "chat.completion.chunk",
+"usage": {
+"completion_tokens": 2,
+"prompt_tokens": 3,
+"total_tokens": 5
+}
+},
+"[DONE]"
+]
+]
+},
+"test_both_frontends_answer_a_chat_with_the_same_status_and_body[cosmos3_edge-chat-stream]#0": {
+"__tuple__": [
+200,
+[
+{
+"choices": [
+{
+"delta": {
+"content": "Hello ",
+"role": "assistant"
+},
+"finish_reason": null,
+"index": 0
+}
+],
+"created": "*",
+"id": "*",
+"model": "cosmos3_edge",
+"object": "chat.completion.chunk"
+},
+{
+"choices": [
+{
+"delta": {
+"content": "world"
+},
+"finish_reason": null,
+"index": 0
+}
+],
+"created": "*",
+"id": "*",
+"model": "cosmos3_edge",
+"object": "chat.completion.chunk"
+},
+{
+"choices": [
+{
+"delta": {},
+"finish_reason": "length",
+"index": 0
+}
+],
+"created": "*",
+"id": "*",
+"model": "cosmos3_edge",
+"object": "chat.completion.chunk"
+},
+"[DONE]"
+]
+]
+},
+"test_both_frontends_answer_a_chat_with_the_same_status_and_body[cosmos3_edge-chat]#0": {
+"__tuple__": [
+200,
+{
+"choices": [
+{
+"finish_reason": "length",
+"index": 0,
+"message": {
+"content": "Hello world",
+"role": "assistant"
+}
+}
+],
+"created": "*",
+"id": "*",
+"model": "cosmos3_edge",
+"object": "chat.completion",
+"usage": {
+"completion_tokens": 2,
+"prompt_tokens": 3,
+"total_tokens": 5
+}
+}
+]
+},
+"test_both_frontends_answer_a_chat_with_the_same_status_and_body[cosmos3_edge-json-mode]#0": {
+"__tuple__": [
+400,
+{
+"error": {
+"code": 400,
+"message": "response_format needs constrained decoding; only {'type': 'text'} is served",
+"type": "invalid_request_error"
+}
+}
+]
+},
+"test_both_frontends_answer_a_chat_with_the_same_status_and_body[cosmos3_edge-remote-image]#0": {
+"__tuple__": [
+400,
+{
+"error": {
+"code": 400,
+"message": "Remote media fetch is disabled on this server",
+"type": "invalid_request_error"
+}
+}
+]
+},
+"test_both_frontends_answer_a_chat_with_the_same_status_and_body[cosmos3_edge-server-path-image]#0": {
+"__tuple__": [
+400,
+{
+"error": {
+"code": 400,
+"message": "server file paths are refused; send media as a data URL or a file upload",
+"type": "invalid_request_error"
+}
+}
+]
+},
+"test_both_frontends_answer_a_chat_with_the_same_status_and_body[cosmos3_edge-tool-call]#0": {
+"__tuple__": [
+400,
+{
+"error": {
+"code": 400,
+"message": "tool calling is not supported for this model",
+"type": "invalid_request_error"
+}
+}
+]
+},
+"test_both_frontends_answer_a_chat_with_the_same_status_and_body[pi05-bad-role]#0": {
+"__tuple__": [
+404,
+{
+"error": {
+"code": 404,
+"message": "Model 'pi05' has no OpenAI-compatible adapter; use POST /generate",
+"type": "model_not_found"
+}
+}
+]
+},
+"test_both_frontends_answer_a_chat_with_the_same_status_and_body[pi05-chat-stream-usage]#0": {
+"__tuple__": [
+404,
+{
+"error": {
+"code": 404,
+"message": "Model 'pi05' has no OpenAI-compatible adapter; use POST /generate",
+"type": "model_not_found"
+}
+}
+]
+},
+"test_both_frontends_answer_a_chat_with_the_same_status_and_body[pi05-chat-stream]#0": {
+"__tuple__": [
+404,
+{
+"error": {
+"code": 404,
+"message": "Model 'pi05' has no OpenAI-compatible adapter; use POST /generate",
+"type": "model_not_found"
+}
+}
+]
+},
+"test_both_frontends_answer_a_chat_with_the_same_status_and_body[pi05-chat]#0": {
+"__tuple__": [
+404,
+{
+"error": {
+"code": 404,
+"message": "Model 'pi05' has no OpenAI-compatible adapter; use POST /generate",
+"type": "model_not_found"
+}
+}
+]
+},
+"test_both_frontends_answer_a_chat_with_the_same_status_and_body[pi05-json-mode]#0": {
+"__tuple__": [
+404,
+{
+"error": {
+"code": 404,
+"message": "Model 'pi05' has no OpenAI-compatible adapter; use POST /generate",
+"type": "model_not_found"
+}
+}
+]
+},
+"test_both_frontends_answer_a_chat_with_the_same_status_and_body[pi05-remote-image]#0": {
+"__tuple__": [
+404,
+{
+"error": {
+"code": 404,
+"message": "Model 'pi05' has no OpenAI-compatible adapter; use POST /generate",
+"type": "model_not_found"
+}
+}
+]
+},
+"test_both_frontends_answer_a_chat_with_the_same_status_and_body[pi05-server-path-image]#0": {
+"__tuple__": [
+404,
+{
+"error": {
+"code": 404,
+"message": "Model 'pi05' has no OpenAI-compatible adapter; use POST /generate",
+"type": "model_not_found"
+}
+}
+]
+},
+"test_both_frontends_answer_a_chat_with_the_same_status_and_body[pi05-tool-call]#0": {
+"__tuple__": [
+404,
+{
+"error": {
+"code": 404,
+"message": "Model 'pi05' has no OpenAI-compatible adapter; use POST /generate",
+"type": "model_not_found"
+}
+}
+]
+},
+"test_both_frontends_answer_a_chat_with_the_same_status_and_body[qwen3_5_0.8b-bad-role]#0": {
+"__tuple__": [
+400,
+{
+"error": {
+"code": 400,
+"message": "a message's role must be system, developer, user or assistant, not 'tool'",
+"type": "invalid_request_error"
+}
+}
+]
+},
+"test_both_frontends_answer_a_chat_with_the_same_status_and_body[qwen3_5_0.8b-chat-stream-usage]#0": {
+"__tuple__": [
+200,
+[
+{
+"choices": [
+{
+"delta": {
+"content": "Hello ",
+"role": "assistant"
+},
+"finish_reason": null,
+"index": 0
+}
+],
+"created": "*",
+"id": "*",
+"model": "qwen3_5_0.8b",
+"object": "chat.completion.chunk"
+},
+{
+"choices": [
+{
+"delta": {
+"content": "world"
+},
+"finish_reason": null,
+"index": 0
+}
+],
+"created": "*",
+"id": "*",
+"model": "qwen3_5_0.8b",
+"object": "chat.completion.chunk"
+},
+{
+"choices": [
+{
+"delta": {},
+"finish_reason": "length",
+"index": 0
+}
+],
+"created": "*",
+"id": "*",
+"model": "qwen3_5_0.8b",
+"object": "chat.completion.chunk"
+},
+{
+"choices": [],
+"created": "*",
+"id": "*",
+"model": "qwen3_5_0.8b",
+"object": "chat.completion.chunk",
+"usage": {
+"completion_tokens": 2,
+"prompt_tokens": 3,
+"total_tokens": 5
+}
+},
+"[DONE]"
+]
+]
+},
+"test_both_frontends_answer_a_chat_with_the_same_status_and_body[qwen3_5_0.8b-chat-stream]#0": {
+"__tuple__": [
+200,
+[
+{
+"choices": [
+{
+"delta": {
+"content": "Hello ",
+"role": "assistant"
+},
+"finish_reason": null,
+"index": 0
+}
+],
+"created": "*",
+"id": "*",
+"model": "qwen3_5_0.8b",
+"object": "chat.completion.chunk"
+},
+{
+"choices": [
+{
+"delta": {
+"content": "world"
+},
+"finish_reason": null,
+"index": 0
+}
+],
+"created": "*",
+"id": "*",
+"model": "qwen3_5_0.8b",
+"object": "chat.completion.chunk"
+},
+{
+"choices": [
+{
+"delta": {},
+"finish_reason": "length",
+"index": 0
+}
+],
+"created": "*",
+"id": "*",
+"model": "qwen3_5_0.8b",
+"object": "chat.completion.chunk"
+},
+"[DONE]"
+]
+]
+},
+"test_both_frontends_answer_a_chat_with_the_same_status_and_body[qwen3_5_0.8b-chat]#0": {
+"__tuple__": [
+200,
+{
+"choices": [
+{
+"finish_reason": "length",
+"index": 0,
+"message": {
+"content": "Hello world",
+"role": "assistant"
+}
+}
+],
+"created": "*",
+"id": "*",
+"model": "qwen3_5_0.8b",
+"object": "chat.completion",
+"usage": {
+"completion_tokens": 2,
+"prompt_tokens": 3,
+"total_tokens": 5
+}
+}
+]
+},
+"test_both_frontends_answer_a_chat_with_the_same_status_and_body[qwen3_5_0.8b-json-mode]#0": {
+"__tuple__": [
+400,
+{
+"error": {
+"code": 400,
+"message": "response_format needs constrained decoding; only {'type': 'text'} is served",
+"type": "invalid_request_error"
+}
+}
+]
+},
+"test_both_frontends_answer_a_chat_with_the_same_status_and_body[qwen3_5_0.8b-remote-image]#0": {
+"__tuple__": [
+400,
+{
+"error": {
+"code": 400,
+"message": "Remote media fetch is disabled on this server",
+"type": "invalid_request_error"
+}
+}
+]
+},
+"test_both_frontends_answer_a_chat_with_the_same_status_and_body[qwen3_5_0.8b-server-path-image]#0": {
+"__tuple__": [
+400,
+{
+"error": {
+"code": 400,
+"message": "server file paths are refused; send media as a data URL or a file upload",
+"type": "invalid_request_error"
+}
+}
+]
+},
+"test_both_frontends_answer_a_chat_with_the_same_status_and_body[qwen3_5_0.8b-tool-call]#0": {
+"__tuple__": [
+400,
+{
+"error": {
+"code": 400,
+"message": "tool calling is not supported for this model",
+"type": "invalid_request_error"
+}
+}
+]
+},
+"test_both_frontends_list_the_voices_alike[no-voice-list]#0": {
+"__tuple__": [
+404,
+{
+"error": {
+"code": 404,
+"message": "Model 'orpheus' does not publish a voice list",
+"type": "invalid_request_error"
+}
+}
+]
+},
+"test_both_frontends_list_the_voices_alike[no-voice-list]#1": {
+"__tuple__": [
+404,
+{
+"error": {
+"code": 404,
+"message": "Model 'orpheus' does not publish a voice list",
+"type": "invalid_request_error"
+}
+}
+]
+},
+"test_both_frontends_list_the_voices_alike[not-a-speech-model]#0": {
+"__tuple__": [
+404,
+{
+"error": {
+"code": 404,
+"message": "Model 'qwen3_5_0.8b' does not support this endpoint",
+"type": "invalid_request_error"
+}
+}
+]
+},
+"test_both_frontends_list_the_voices_alike[not-a-speech-model]#1": {
+"__tuple__": [
+404,
+{
+"error": {
+"code": 404,
+"message": "Model 'qwen3_5_0.8b' does not support this endpoint",
+"type": "invalid_request_error"
+}
+}
+]
+},
+"test_both_frontends_list_the_voices_alike[voices]#0": {
+"__tuple__": [
+200,
+{
+"default_voice": "tara",
+"object": "list",
+"voices": [
+{
+"id": "tara",
+"name": "tara"
+},
+{
+"id": "leo",
+"name": "leo"
+}
+]
+}
+]
+},
+"test_both_frontends_list_the_voices_alike[voices]#1": {
+"__tuple__": [
+200,
+{
+"default_voice": "tara",
+"object": "list",
+"voices": [
+{
+"id": "tara",
+"name": "tara"
+},
+{
+"id": "leo",
+"name": "leo"
+},
+{
+"id": "nova",
+"name": "nova"
+}
+]
+}
+]
+}
+}

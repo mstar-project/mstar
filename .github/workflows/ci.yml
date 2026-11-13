@@ -235,15 +235,15 @@ jobs:
         run: |
           # pyyaml: the runtime tests reach mstar.model.base, which imports it;
           # prometheus-client: the frontend's /metrics test renders a real registry;
-          # fastapi, uvicorn, python-multipart and httpx: the Rust/Python chat
-          # parity cases run the Python app through fastapi's TestClient;
+          # fastapi (and the pydantic it brings): the API server and the Python
+          # adapters the parity cases compare against import it;
           # soundfile (its wheel bundles libsndfile): the voice-clip checks and
           # the compressed-speech byte parity, which skip without it;
           # websockets and onnxruntime: the WebSocket parity cases and realtime's
           # turn detection; tokenizers: the realtime suite's stand-in tokenizer;
           # silero-vad only for its bundled ONNX file, so without its torchaudio
           pip install pytest==9.2.0 msgpack numpy pyyaml prometheus-client \
-            fastapi uvicorn python-multipart httpx soundfile websockets onnxruntime tokenizers
+            fastapi soundfile websockets onnxruntime tokenizers
           pip install --no-deps silero-vad
           # cpu torch + triton: the arena test imports the tensor-transport
           # stack, which reaches mstar.utils.sampling (triton at module level).

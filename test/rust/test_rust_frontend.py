@@ -23,6 +23,8 @@ import pytest
 
 pytest.importorskip("mstar_rust")
 
+from python_oracle import python_side
+
 from mstar.api_server.rust_frontend import (
     OPENAI_ADAPTER_ENV,
     RustFrontendBridge,
@@ -301,11 +303,15 @@ class _GeneratePython:
         self.submitted.append(kwargs)
         return kwargs["request_id"] or "rid"
 
-    async def collect_results(self, request_id, raw_request=None):
+    async def collect_results(self, request_id):
         return [_Chunk("text", b"ok")]
 
 
 _GENERATE_FILES = [("a.png", b"\x89PNG-a"), ("b.wav", b"RIFF-b"), ("c.png", b"\x89PNG-c")]
+
+
+def _parts(ps):
+    return None if ps is None else [dataclasses.asdict(p) for p in ps]
 
 
 @pytest.mark.parametrize("fields,files", [
@@ -321,18 +327,10 @@ def test_generate_submits_the_layout_python_does(fields, files, tmp_path, monkey
     """Ordered parts (each file, then the text), the modalities in that order
     with repeats, and an explicit layout taken as given except that a text slot
     is added for the text and dropped without it, as Python's ``/generate``."""
-    pytest.importorskip("fastapi")
-    from fastapi.testclient import TestClient
-
-    from mstar.api_server import entrypoint
-
     form = {"output_modalities": "text", "streaming": "false", **fields}
     uploads = [("files", (name, data)) for name, data in files]
-    python = _GeneratePython(tmp_path)
-    monkeypatch.setattr(entrypoint, "api_server", python)
-    reply = TestClient(entrypoint.app).post("/generate", data=form, files=uploads or None)
-    assert reply.status_code == 200, reply.text
-    (want,) = python.submitted
+    want = python_side()
+    assert want["status"] == 200, want["reply"]
 
     stub = _StubAPIServer()
     with _model_stack("qwen3_omni", stub) as (port, _upload):
@@ -346,12 +344,10 @@ def test_generate_submits_the_layout_python_does(fields, files, tmp_path, monkey
         (sub,) = stub.submitted
         got_files = {m: [Path(p).read_bytes() for p in ps] for m, ps in (sub["files"] or {}).items()}
 
-    want_files = {m: [Path(p).read_bytes() for p in ps] for m, ps in (want["file_paths"] or {}).items()}
     assert sub["text"] == want["text"]
-    assert sub["in"] == want["input_modalities"]
-    parts = lambda ps: None if ps is None else [dataclasses.asdict(p) for p in ps]  # noqa: E731
-    assert parts(sub["parts"]) == parts(want["prompt_parts"])
-    assert got_files == want_files
+    assert sub["in"] == want["in"]
+    assert _parts(sub["parts"]) == want["parts"]
+    assert got_files == want["files"]
 
 
 def _post_raw(port, path, raw_bytes, content_type="application/json", timeout=15):
@@ -1464,16 +1460,10 @@ def test_the_running_environment_s_binary_wins_over_one_on_path(tmp_path, monkey
     ("text/plain", b"hi"),
 ], ids=["json", "plain"])
 def test_generate_refuses_a_body_that_is_not_a_form_as_python_does(ctype, body, tmp_path, monkeypatch):
-    pytest.importorskip("fastapi")
-    from fastapi.testclient import TestClient
-
-    from mstar.api_server import entrypoint
-
-    monkeypatch.setattr(entrypoint, "api_server", _GeneratePython(tmp_path))
-    py = TestClient(entrypoint.app).post("/generate", content=body, headers={"Content-Type": ctype})
+    want = python_side()
     with _model_stack("qwen3_omni", _StubAPIServer()) as (port, _upload):
         status, got = _post_raw(port, "/generate", body, content_type=ctype)
-    assert (status, got) == (py.status_code, py.json()) and status == 400
+    assert (status, got) == want and status == 400
 
 
 class _FailsAfterTwoChunksStub(_StubAPIServer):
@@ -1490,22 +1480,8 @@ def test_a_generate_stream_reads_as_pythons_down_to_a_late_error(binary):
     """The bytes each frontend writes for the same chunks parse to the same
     items: NDJSON lines, or ``Accept: application/vnd.mstar.frames`` frames,
     and a failure after the 200 as Python's in-band ``error`` chunk."""
-    from mstar.api_server.entrypoint import (
-        BINARY_STREAM_MEDIA_TYPE,
-        _chunk_to_binary_frame,
-        _chunk_to_ndjson_payload,
-    )
-
     stub = _FailsAfterTwoChunksStub()
-    sent = [
-        _Chunk("text", b"Hel", {"token_ids": [1]}),
-        _Chunk("audio", bytes(range(256)) * 4, {"sample_rate": 24000}),
-        _Chunk("error", b"Error in worker: boom", {"status": 500}),
-    ]
-    if binary:
-        python_body = b"".join(b"".join(_chunk_to_binary_frame(c)) for c in sent)
-    else:
-        python_body = "".join(_chunk_to_ndjson_payload(c) for c in sent).encode()
+    frames_type, python_body = python_side()
 
     def items(body: bytes):
         if binary:
@@ -1515,12 +1491,12 @@ def test_a_generate_stream_reads_as_pythons_down_to_a_late_error(binary):
     data = urllib.parse.urlencode({"text": "hi", "output_modalities": "text,audio"}).encode()
     headers = {"Content-Type": "application/x-www-form-urlencoded"}
     if binary:
-        headers["Accept"] = BINARY_STREAM_MEDIA_TYPE
+        headers["Accept"] = frames_type
     with _model_stack("qwen3_omni", stub) as (port, _up):
         req = urllib.request.Request(f"http://127.0.0.1:{port}/generate", data=data, headers=headers)
         with urllib.request.urlopen(req, timeout=30) as r:
             ctype, vary, rust_body = r.headers["Content-Type"], r.headers["Vary"], r.read()
-    assert ctype == (BINARY_STREAM_MEDIA_TYPE if binary else "application/x-ndjson")
+    assert ctype == (frames_type if binary else "application/x-ndjson")
     assert vary == "Accept"
     assert items(rust_body) == items(python_body)
 
@@ -1529,15 +1505,8 @@ def test_a_generate_stream_reads_as_pythons_down_to_a_late_error(binary):
 def test_both_frontends_route_under_a_root_path_alike(root, tmp_path, monkeypatch):
     """MSTAR_ROOT_PATH as Starlette's ``root_path`` routes it: a path under the
     prefix as set loses it, and any other path is routed as sent."""
-    pytest.importorskip("fastapi")
-    from fastapi.testclient import TestClient
-
-    from mstar.api_server import entrypoint
-
-    monkeypatch.setattr(entrypoint, "api_server", None)
     paths = ["/proj/job/v1/models", "/v1/models", "/proj/jobs/v1/models", "/proj/job", "/proj/jobv1/models"]
-    client = TestClient(entrypoint.app, root_path=root)
-    want = [client.get(p).status_code for p in paths]
+    want = python_side()
     with _model_stack("qwen3_omni", _StubAPIServer(), env={"MSTAR_ROOT_PATH": root}) as (port, _up):
         got = []
         for p in paths:
@@ -1547,6 +1516,79 @@ def test_both_frontends_route_under_a_root_path_alike(root, tmp_path, monkeypatc
             except urllib.error.HTTPError as e:
                 got.append(e.code)
     assert got == want, list(zip(paths, got, want, strict=True))
+
+
+
+def _early_status(port, path, total, headers, chunked=False, ctype="application/json", size=64 * 1024):
+    """POST a ``total``-byte body and return the status and JSON body the
+    server answers with, even when it answers (and closes) before reading the body, which
+    leaves a client that sends first and reads after with only a broken pipe.
+    ``chunked`` sends it with ``Transfer-Encoding: chunked``, so nothing tells
+    the server the size up front."""
+    import http.client
+    import select
+
+    head = [f"POST {path} HTTP/1.1", "Host: 127.0.0.1", f"Content-Type: {ctype}", "Connection: close",
+            "Transfer-Encoding: chunked" if chunked else f"Content-Length: {total}"]
+    head += [f"{k}: {v}" for k, v in headers.items()]
+    pieces = [b"x" * min(size, total - i) for i in range(0, total, size)]
+    if chunked:
+        pieces = [b"%x\r\n%b\r\n" % (len(p), p) for p in pieces] + [b"0\r\n\r\n"]
+    with socket.create_connection(("127.0.0.1", port), timeout=15) as sock:
+        sock.sendall(("\r\n".join(head) + "\r\n\r\n").encode())
+        for piece in pieces:
+            if select.select([sock], [], [], 0)[0]:
+                break
+            try:
+                sock.sendall(piece)
+            except (BrokenPipeError, ConnectionResetError):
+                break
+        reply = http.client.HTTPResponse(sock)
+        reply.begin()
+        body = reply.read()
+    return reply.status, json.loads(body) if body.startswith(b"{") else body
+
+
+def test_the_api_key_guards_sockets_and_comes_before_the_body_limit():
+    """With a key set, a WebSocket handshake without it is refused (403, as
+    the Python server's close-before-accept read on the wire), a 401 keeps
+    CORS's headers, an oversized body without the key is a 401 rather than a
+    413, a body over the limit is refused whether or not it declares its
+    length, and the probes stay open under a root path."""
+    websockets_client = pytest.importorskip("websockets.sync.client")
+    import websockets.exceptions
+
+    key = "s3cret"
+    good = {"Authorization": f"Bearer {key}"}
+    env = {"MSTAR_API_KEY": key, "MSTAR_MAX_BODY_MB": "1", "MSTAR_ROOT_PATH": "/prefix"}
+    stub = _StubAPIServer()
+    with _model_stack("qwen3_omni", stub, env=env) as (port, _up):
+        for path in ("/generate/ws", "/v1/realtime", "/prefix/generate/ws"):
+            for headers in ({}, {"Authorization": "Bearer wrong"}):
+                with pytest.raises(websockets.exceptions.InvalidStatus) as refused:
+                    websockets_client.connect(f"ws://127.0.0.1:{port}{path}", additional_headers=headers,
+                                              open_timeout=10)
+                assert refused.value.response.status_code == 403, (path, headers)
+        with websockets_client.connect(f"ws://127.0.0.1:{port}/generate/ws", additional_headers=good,
+                                       open_timeout=10):
+            pass
+
+        status, headers = _status(port, "POST", "/v1/chat/completions", {"Origin": "https://app.example"}, b"{}")
+        assert status == 401 and headers.get("access-control-allow-origin")
+
+        form = "multipart/form-data; boundary=b"
+        for chunked in (False, True):
+            assert _early_status(port, "/v1/chat/completions", 2 << 20, {}, chunked)[0] == 401
+            status, body = _early_status(port, "/v1/chat/completions", 2 << 20, good, chunked)
+            assert status == 413 and body["error"]["code"] == 413, chunked
+            assert "MSTAR_MAX_BODY_MB" in body["error"]["message"]
+            status, body = _early_status(port, "/generate", 2 << 20, good, chunked, form)
+            assert status == 413 and "1 MiB" in body["detail"] and "MSTAR_MAX_BODY_MB" in body["detail"], chunked
+
+        for path in ("/health", "/prefix/health", "/metrics", "/prefix/metrics"):
+            assert _status(port, "GET", path)[0] != 401, path
+        assert _status(port, "GET", "/prefix/v1/models")[0] == 401
+    assert not stub.submitted, "a refused request reached the backend"
 
 
 def _bare_server_cmd(port) -> list[str]:

@@ -287,10 +287,10 @@ def _serve(args: argparse.Namespace) -> None:
     if args.enable_metrics:
         argv += ["--enable-metrics"]
     if args.python_frontend:
-        if args.rust_frontend or args.rust_frontend_bin:
-            raise SystemExit("mstar: --python-frontend serves without mstar-server, "
-                             "so it takes no --rust-frontend(-bin)")
-        argv += ["--python-frontend"]
+        raise SystemExit("mstar: the Python frontend (--python-frontend) was removed; "
+                         "mstar-server is the only HTTP frontend")
+    if args.rust_frontend:
+        argv += ["--rust-frontend"]   # accepted, and warned about: mstar-server is the only frontend
     if args.rust_frontend_bin:
         argv += ["--rust-frontend-bin", args.rust_frontend_bin]
 
@@ -347,13 +347,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--enable-metrics", action="store_true",
         help="serve Prometheus metrics at /metrics (needs mstar-ai[metrics])",
     )
-    serve.add_argument(
-        "--python-frontend", action="store_true",
-        help="serve HTTP from the deprecated uvicorn/FastAPI frontend instead "
-             "of mstar-server, the default",
-    )
-    # the default since mstar-server became it; kept so existing commands run
     serve.add_argument("--rust-frontend", action="store_true", help=argparse.SUPPRESS)
+    serve.add_argument("--python-frontend", action="store_true", help=argparse.SUPPRESS)
     serve.add_argument(
         "--rust-frontend-bin", default=None,
         help="path to the mstar-server binary (default: MSTAR_SERVER_BIN, "

@@ -1,15 +1,13 @@
-"""``/v1/audio/speech`` on ``mstar-server`` against the Python route, for every
-adapter class whose speech it ports.
+"""``/v1/audio/speech`` on ``mstar-server``, for every adapter class whose speech
+it ports, held to the Python route: the Python route's answers replayed as it
+gave them before it was removed (``python_oracle``).
 
-Both frontends take the same requests against backends that answer with the
-same audio: the Rust one through the real binary and bridge, the Python one
-through ``serving_speech.create_speech`` (fastapi's TestClient for the HTTP
-answer, its streaming body iterator for the pieces it writes). Checked: what
-each submits (text, modalities, model kwargs, the piece ids of a chunked
-input), the status and body of each refusal, and the response bytes, headers
-and HTTP chunks. Skipped unless the ``mstar_rust`` extension, the server
-binary and fastapi are installed."""
-import asyncio
+mstar-server runs through the real binary and bridge against a backend that
+answers with fixed audio. Checked: what it submits (text, modalities, model
+kwargs, the piece ids of a chunked input), the status and body of each refusal,
+and the response bytes, headers and HTTP chunks. The sentence splitters are
+compared with the Python ones live. Skipped unless the ``mstar_rust`` extension
+and the server binary are built."""
 import base64
 import json
 import random
@@ -22,18 +20,12 @@ import pytest
 pytest.importorskip("mstar_rust")
 pytest.importorskip("fastapi")
 
-from fastapi import HTTPException
-from fastapi.testclient import TestClient
+from python_oracle import python_side
 from test_rust_frontend import BINARY, _Chunk, _model_stack, _StubAPIServer
 from test_rust_openai_adapters import NOT_PORTED, _classes, _model_of, _post
 
-from mstar.api_server import entrypoint
-from mstar.api_server.entrypoint import APIServer
-from mstar.api_server.openai import _util, serving_speech
 from mstar.api_server.openai.adapters import ADAPTER_REGISTRY
-from mstar.api_server.openai.protocol import SpeechRequest
 from mstar.api_server.rust_frontend import LIBSNDFILE_ENV, soundfile_library
-from mstar.api_server.served_models import ServedModels
 
 pytestmark = pytest.mark.skipif(BINARY is None, reason="mstar-server binary not built")
 
@@ -69,44 +61,7 @@ class _RustSpeechStub(_StubAPIServer):
             yield c
 
 
-class _PythonSpeechServer:
-    """What ``create_speech`` calls on APIServer, answering as the Rust stub does."""
-
-    open_result_stream = APIServer.open_result_stream
-
-    def __init__(self, model_name, upload_dir):
-        self.model_name, self.upload_dir, self.model = model_name, upload_dir, None
-        self.served_models = ServedModels.of(model_name, None)
-        self.submitted, self.texts, self.released = [], {}, []
-
-    def submit_request(self, **kwargs):
-        self.submitted.append(kwargs)
-        self.texts[kwargs["request_id"]] = kwargs["text"]
-        return kwargs["request_id"]
-
-    async def iter_result_chunks(self, request_id):
-        for c in _scripted(self.texts[request_id]):
-            yield c
-
-    async def collect_results(self, request_id, raw_request=None):
-        chunks = _scripted(self.texts[request_id])
-        if chunks[0].modality == "error":
-            raise HTTPException(status_code=chunks[0].metadata["status"], detail=chunks[0].data.decode())
-        return chunks
-
-    def release_request(self, request_id):
-        self.released.append(request_id)
-
-
 _RID = re.compile(r"^speech-[0-9a-f]{32}")
-
-# Does the Python frontend write compact SSE JSON? ``_util.sse`` prefers orjson
-# and falls back to ``json.dumps``, which spaces its separators. orjson is not a
-# declared dependency, so the frames are byte-identical to the Rust frontend's
-# (which always writes compact JSON) only where it is installed; everywhere else
-# the two still agree on the events, their order and their HTTP framing.
-_COMPACT_SSE = _util.sse({"a": 1}) == 'data: {"a":1}\n\n'
-
 
 SSE_TYPE = "text/event-stream; charset=utf-8"
 
@@ -125,40 +80,9 @@ def _sse_pieces(pieces) -> list[dict]:
     return [_sse_frame(piece) for piece in pieces]
 
 
-def _sse_body(body: bytes) -> list[dict]:
-    """The events of one whole SSE body, for an answer read without its chunks."""
-    assert body.endswith(b"\n\n"), body
-    return [_sse_frame(frame + b"\n\n") for frame in body.split(b"\n\n")[:-1]]
-
-
-def _comparable(answer: tuple) -> tuple:
-    """An answer with an SSE body reduced to its events, where the Python
-    frontend has no orjson and so writes the same events with wider JSON."""
-    if _COMPACT_SSE or answer[1] != SSE_TYPE:
-        return answer
-    return (*answer[:3], _sse_body(answer[3]), answer[4])
-
-
-def _python_submits(submitted: list[dict]) -> list[dict]:
-    # ``model`` names a LoRA adapter on the Python frontend; the Rust frontend
-    # refuses to start with LoRA on, so it sends none.
-    return [{"rid": _RID.sub("speech-*", s["request_id"]), "text": s["text"], "in": s["input_modalities"],
-             "out": s["output_modalities"], "mk": s["model_kwargs"], "files": s["file_paths"],
-             "streaming": s["streaming"]} for s in submitted]
-
-
 def _rust_submits(submitted: list[dict]) -> list[dict]:
     return [{"rid": _RID.sub("speech-*", s["rid"]), "text": s["text"], "in": s["in"], "out": s["out"],
              "mk": s["mk"], "files": s["files"], "streaming": s["streaming"]} for s in submitted]
-
-
-def _python_answer(model, body, tmp_path, monkeypatch):
-    """(status, content type, cache control, body, submits) from the Python route."""
-    api = _PythonSpeechServer(model, tmp_path)
-    monkeypatch.setattr(entrypoint, "api_server", api)
-    r = TestClient(entrypoint.app).post("/v1/audio/speech", json=body)
-    return (r.status_code, r.headers.get("content-type"), r.headers.get("cache-control"), r.content,
-            _python_submits(api.submitted))
 
 
 def _rust_answer(port, stub, body):
@@ -243,15 +167,17 @@ def test_both_frontends_submit_and_answer_a_speech_the_same_way(cls, case, strea
     stub = _RustSpeechStub()
     with _model_stack(model, stub) as (port, _upload):
         rust = _rust_answer(port, stub, body)
-    python = _python_answer(model, body, tmp_path, monkeypatch)
-    assert _comparable(rust) == _comparable(python)
+    python = python_side()
+    assert rust == python
     assert rust[0] == 200, rust
 
 
-def test_a_long_qwen3_tts_input_goes_out_as_pieces_with_offset_seeds(tmp_path, monkeypatch):
-    """What the parity case above compares, spelled out once."""
+def test_a_long_qwen3_tts_input_goes_out_as_pieces_with_offset_seeds():
+    """What the parity case above compares, spelled out once, on mstar-server."""
     body = {**SPEECH_CASES["chunked"], "stream": True}
-    _, _, _, _, submits = _python_answer("qwen3_tts_1p7b", body, tmp_path, monkeypatch)
+    stub = _RustSpeechStub()
+    with _model_stack("qwen3_tts_1p7b", stub) as (port, _upload):
+        *_, submits = _rust_answer(port, stub, body)
     assert [s["rid"] for s in submits] == [f"speech-*-{i}" for i in range(len(submits))]
     assert len(submits) == 3
     assert [s["mk"]["seed"] for s in submits] == [2**63 - 2, 2**63 - 1, -(2**63)]
@@ -300,7 +226,7 @@ def test_both_frontends_refuse_a_speech_with_the_same_status_and_text(case, tmp_
     stub = _RustSpeechStub()
     with _model_stack(model, stub) as (port, _upload):
         rust = _post(port, "/v1/audio/speech", body)
-    python = _python_answer(model, body, tmp_path, monkeypatch)
+    python = python_side()
     assert rust[0] in (400, 404), rust
     assert (rust[0], json.loads(rust[1])) == (python[0], json.loads(python[3]))
 
@@ -343,19 +269,12 @@ def test_a_compressed_speech_is_the_python_routes_bytes(case, fmt, tmp_path, mon
     stub = _RustSpeechStub()
     with _model_stack(model, stub, env={LIBSNDFILE_ENV: libsndfile}) as (port, _upload):
         rust = _rust_answer(port, stub, body)
-    python = _python_answer(model, body, tmp_path, monkeypatch)
+    python = python_side()
     assert rust[0] == 200, rust
     if fmt == "opus":
         rust = (*rust[:3], _without_ogg_serial(rust[3]), *rust[4:])
         python = (*python[:3], _without_ogg_serial(python[3]), *python[4:])
     assert rust == python
-
-
-async def _python_pieces(model, body, tmp_path):
-    """The byte strings the Python route's streaming body yields, in order."""
-    api = _PythonSpeechServer(model, tmp_path)
-    resp = await serving_speech.create_speech(api, model, ADAPTER_REGISTRY[model], SpeechRequest(**body))
-    return [piece async for piece in resp.body_iterator]
 
 
 @pytest.mark.parametrize("fmt", ["wav", "pcm"])
@@ -366,7 +285,7 @@ def test_a_streamed_speech_is_framed_as_the_python_route_frames_it(text, fmt, tm
     stub = _RustSpeechStub()
     with _model_stack("qwen3_tts_1p7b", stub) as (port, _upload):
         status, headers, chunks = _http(port, body)
-    python = asyncio.run(_python_pieces("qwen3_tts_1p7b", body, tmp_path))
+    python = python_side()
     assert status == 200
     assert chunks == python
     assert len(python) == 2 * len(stub.submitted) + (fmt == "wav")
@@ -385,19 +304,19 @@ def test_an_sse_speech_stream_is_framed_as_the_python_route_frames_it(text, fmt,
     stub = _RustSpeechStub()
     with _model_stack("qwen3_tts_1p7b", stub) as (port, _upload):
         status, headers, chunks = _http(port, body)
-    python = asyncio.run(_python_pieces("qwen3_tts_1p7b", dict(body), tmp_path))
+    python = python_side()
     assert (status, headers.get("content-type")) == (200, SSE_TYPE)
     # one event per HTTP chunk on the Rust side, per yielded piece on the
     # Python side, the same events in the same order
     events = _sse_pieces(chunks)
     assert events == _sse_pieces(python)
-    if _COMPACT_SSE:
-        assert chunks == [piece.encode() for piece in python]
+    # recorded with orjson, so the Python route's frames were compact JSON, as mstar-server's are
+    assert chunks == [piece.encode() for piece in python]
     assert [e["type"] for e in events] == ["speech.audio.delta"] * (len(events) - 1) + ["speech.audio.done"]
     # the deltas carry exactly what the un-wrapped stream would have written
     raw = {**{k: v for k, v in body.items() if k != "stream_format"}, "stream": True}
     assert b"".join(base64.b64decode(e["audio"]) for e in events[:-1]) == b"".join(
-        asyncio.run(_python_pieces("qwen3_tts_1p7b", raw, tmp_path)))
+        python_side())
 
 
 def test_an_sse_speech_stream_ends_a_failure_with_an_in_band_error_event(tmp_path):
@@ -407,12 +326,12 @@ def test_an_sse_speech_stream_ends_a_failure_with_an_in_band_error_event(tmp_pat
     stub = _RustSpeechStub()
     with _model_stack("qwen3_tts_1p7b", stub) as (port, _upload):
         status, headers, chunks = _http(port, body)
-    python = asyncio.run(_python_pieces("qwen3_tts_1p7b", dict(body), tmp_path))
+    python = python_side()
     assert (status, headers.get("content-type")) == (200, SSE_TYPE)
     events = _sse_pieces(chunks)
     assert events == _sse_pieces(python)
-    if _COMPACT_SSE:
-        assert chunks == [piece.encode() for piece in python]
+    # recorded with orjson, so the Python route's frames were compact JSON, as mstar-server's are
+    assert chunks == [piece.encode() for piece in python]
     assert events[-1] == {"type": "error", "error": {
         "message": "input refused by the model", "type": "invalid_request_error", "code": 400}}
     assert [e["type"] for e in events[:-1]] == ["speech.audio.delta"] * (len(events) - 1)
@@ -433,8 +352,7 @@ def test_stream_format_does_not_stream_a_compressed_container(sf, tmp_path, monk
     stub = _RustSpeechStub()
     with _model_stack("qwen3_tts_1p7b", stub) as (port, _upload):
         rust = [_rust_answer(port, stub, b) for b in (plain, switched, streamed)]
-    python = [_python_answer("qwen3_tts_1p7b", b, tmp_path, monkeypatch)
-              for b in (plain, switched, streamed)]
+    python = python_side()
     for frontend in (rust, python):
         was_plain, was_switched, was_streamed = frontend
         assert was_switched == was_plain, "stream_format changed a compressed answer"
@@ -458,8 +376,8 @@ def test_stream_format_is_not_forwarded_as_a_model_kwarg(tmp_path, monkeypatch):
     stub = _RustSpeechStub()
     with _model_stack("qwen3_tts_1p7b", stub) as (port, _upload):
         rust = _rust_answer(port, stub, body)
-    python = _python_answer("qwen3_tts_1p7b", body, tmp_path, monkeypatch)
-    assert _comparable(rust) == _comparable(python) and rust[0] == 200, rust
+    python = python_side()
+    assert rust == python and rust[0] == 200, rust
     assert rust[4] and all(s["streaming"] for s in rust[4])
     assert all("stream_format" not in s["mk"] for s in rust[4] + python[4])
     assert [s["mk"] for s in rust[4]] == [{"seed": 4, "top_k": 30, "voice": "ryan"}]
@@ -589,16 +507,13 @@ def test_both_frontends_take_or_refuse_a_voice_clip_alike(cls, case, tmp_path, m
         stub.upload_dir = upload
         status, headers, data = _http(port, body)
         rust_submits = _with_bytes(_rust_submits(stub.submitted))
-    api = _PythonSpeechServer(model, tmp_path)
-    monkeypatch.setattr(entrypoint, "api_server", api)
-    py = TestClient(entrypoint.app).post("/v1/audio/speech", json=body)
-    python_submits = _with_bytes(_python_submits(api.submitted))
+    py_status, py_type, _, py_body, python_submits = python_side()
     rust_body = b"".join(data)
-    if py.status_code != 200:
-        assert (status, json.loads(rust_body)) == (py.status_code, py.json())
+    if py_status != 200:
+        assert (status, json.loads(rust_body)) == (py_status, json.loads(py_body))
         assert rust_submits == python_submits == []
         return
     assert status == 200, rust_body
-    assert (headers.get("content-type"), rust_body) == (py.headers.get("content-type"), py.content)
+    assert (headers.get("content-type"), rust_body) == (py_type, py_body)
     assert rust_submits == python_submits
     assert "audio" in rust_submits[0]["in"]

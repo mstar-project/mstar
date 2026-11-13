@@ -12,7 +12,7 @@ If a hang, crash, or other bug has several plausible causes, the tempting fix is
 
 | Layer | Path | Owns |
 | --- | --- | --- |
-| API server | `mstar/api_server/` | tokenization, media loading, and the deprecated Python HTTP frontend (`--python-frontend`, invariant 15) |
+| API server | `mstar/api_server/` | tokenization, media loading, and the bridge to the HTTP frontend, `mstar-server` (invariant 15) |
 | Conductor | `mstar/conductor/` | request lifecycle, graph-walk transitions, worker selection |
 | Worker | `mstar/worker/` | one process per GPU: micro-scheduler, async execution, tensor routing |
 | Engine | `mstar/engine/engine.py` | compiles forwards, captures accelerator graphs, batches, runs admit/plan/forward/commit |
@@ -185,14 +185,15 @@ A worker keys its own state by a small integer handle ([mstar/worker/rid_table.p
 - **New handle-keyed state has to be purged when the handle is released**, or it silently attaches to whichever request is given that handle next. `rid_table.py` lists the state known to be handle-keyed; add to it. Clearing at the top of a per-step routine is not a substitute, because early returns skip it.
 - **An unknown rid off the wire is expected; an unknown rid from local state is a bug.** A message can name a request this rank has already removed, so the lookup returns `None` rather than raising — handle that case explicitly at each call site, and say which of the two it is.
 
-### 15. API surfaces land in the Rust frontend
+### 15. API surfaces live in `mstar-server`
 
-`mstar-server` (`rust/server/`) is `mstar serve`'s default HTTP frontend. The Python HTTP frontend (the FastAPI routes in `mstar/api_server/entrypoint.py`, `mstar/api_server/openai/router.py` and its `serving_*.py`), behind `--python-frontend`, is deprecated and due for removal. Until it is gone, both serve, and nothing new may be served by Python alone:
+`mstar serve` serves HTTP from `mstar-server` (`rust/server/`) only. The Python API server behind it (`RustFrontendBridge` in `mstar/api_server/rust_frontend.py`) preprocesses requests and talks to the conductor; it serves no route itself.
 
-- **A new OpenAI adapter, endpoint, request field, response format or stream shape lands in `rust/server/` in the same PR** as its Python counterpart, with a test in `test/rust/` that sends the same request to both frontends and compares what reaches `submit_request` and what the client gets back (`test_rust_openai_adapters.py` and `test_rust_frontend.py` have the pattern). A model's adapter is a class in `ADAPTER_REGISTRY` plus a type implementing `OpenAIAdapter` in `rust/server/src/adapters/` and its row in `ADAPTERS`.
-- **`NOT_PORTED` in `test/rust/test_rust_openai_adapters.py` only shrinks.** Adding to it is a regression of the migration, not a follow-up.
-- **What the data worker does per request stays in Python for now**: `process_prompt`, tokenization, detokenization, and media a model's own loader decodes (`ref_audio` is checked by that loader, `media_io.check_ref_audio`). That code is behind both frontends and is not part of this rule.
-- **A behavior change to a surface both frontends serve changes both**, so the two don't drift (an adapter's refusal text, a default, a status code).
+- **A new OpenAI adapter, endpoint, request field, response format or stream shape lands in `rust/server/`**, with a test in `test/rust/`. A model's adapter is a class in `ADAPTER_REGISTRY` (it declares the model's surfaces, names the Rust port to `mstar-server`, and translates requests for the Dynamo bridge) plus a type implementing `OpenAIAdapter` in `rust/server/src/adapters/` and its row in `ADAPTERS`.
+- **`NOT_PORTED` in `test/rust/test_rust_openai_adapters.py` stays empty**: every surface a registered adapter declares is served.
+- **The parity suites in `test/rust/` replay what the retired Python routes answered** (`test/rust/python_oracle.py`). A new case has no recording to replay; write its expectation out.
+- **What the data worker does per request stays in Python for now**: `process_prompt`, tokenization, detokenization, and media a model's own loader decodes (`ref_audio` is checked by that loader, `media_io.check_ref_audio`). That code is behind the bridge and is not part of this rule.
+- **A behavior change to an adapter changes its Python class and its Rust port together**, so `mstar-server` and the Dynamo bridge don't drift (a refusal text, a default, a status code).
 
 ## Testing
 
@@ -240,7 +241,7 @@ Output-quality artifacts get the same check, against the reference implementatio
 
 When rebasing onto a `main` that moved, check each resolution for hunks that kept **both** sides. Two got through one rebase here: one reinstated a behaviour the commit existed to remove, and the other defeated a guard's fall-through so a step admitted with nothing reserved. Both read as plausible merges, and neither conflicted again afterwards — the modular tests caught them, which is the argument for running them per step rather than at the end.
 
-The Rust extension under `rust/` is a build artifact, so it goes stale after merging or rebasing onto a `main` that changed `rust/`; so does `mstar-server` (`rust/server/`, `mstar serve`'s default HTTP frontend). In a checkout, a stale extension is refused wherever a graph runtime or tensor store is built (`require_rust_extension`), and `find_server_binary` skips a stale `mstar-server` (one named by `MSTAR_SERVER_BIN` or `--rust-frontend-bin` only gets a warning), so a stale build stops the server at startup and fails the tests that need it. Run the rebuild command the refusal prints as given: its `touch` is what makes cargo rebuild sources copied in with old mtimes (`git archive | tar x`, `rsync -a`, `cp -p`). Code that calls `mstar_rust` directly is not checked; there a stale build still imports fine and fails at call time, often as an unexpected-keyword `TypeError`.
+The Rust extension under `rust/` is a build artifact, so it goes stale after merging or rebasing onto a `main` that changed `rust/`; so does `mstar-server` (`rust/server/`), which `mstar serve` needs. In a checkout, a stale extension is refused wherever a graph runtime or tensor store is built (`require_rust_extension`), and `find_server_binary` skips a stale `mstar-server` (one named by `MSTAR_SERVER_BIN` or `--rust-frontend-bin` only gets a warning), so a stale build stops the server at startup and fails the tests that need it. Run the rebuild command the refusal prints as given: its `touch` is what makes cargo rebuild sources copied in with old mtimes (`git archive | tar x`, `rsync -a`, `cp -p`). Code that calls `mstar_rust` directly is not checked; there a stale build still imports fine and fails at call time, often as an unexpected-keyword `TypeError`.
 
 Unix-socket paths are limited to about 107 characters, so a long `--basetemp` or `TMPDIR` makes the ZMQ-based Rust tests fail with `File name too long`, which reads like a real failure. Use a short `--basetemp`, and a different one per run: pytest empties an existing `--basetemp` at startup, which fails any run already using it.
 
