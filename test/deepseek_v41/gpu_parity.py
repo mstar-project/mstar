@@ -33,6 +33,9 @@ import torch.multiprocessing as mp
 
 PROMPT, STEPS = 45, 14
 TP2 = dict(moe_intermediate_size=64, o_lora_rank=32)
+# the reduced model at widths the reference's own kernels compile for
+KERNEL_WIDTHS = dict(hidden_size=128, head_dim=64, qk_rope_head_dim=16, q_lora_rank=64, o_lora_rank=64,
+                     index_head_dim=64, moe_intermediate_size=64, engram_head_dim=64)
 # (name, the node group's expert split, model kwargs) of each two-rank run
 TP2_RUNS = (("sliced-experts", "tp", {}), ("whole-experts", "ep", {}), ("host-engram", "tp", {"engram_tables": "host"}))
 
@@ -111,9 +114,13 @@ def mode_kernels(args) -> dict:
         bits(f"fp4_act_quant/{label}/b32/e8m0", real.fp4_act_quant(x.clone(), 32), fake.fp4_act_quant(x.clone(), 32))
         bits(f"fp4_act_quant/{label}/b32/e8m0/inplace", [real.fp4_act_quant(x.clone(), 32, True)],
              [fake.fp4_act_quant(x.clone(), 32, True)])
-        bits(f"fp4_act_quant/{label}/b16/e4m3/inplace",
-             [real.fp4_act_quant(x.clone(), 16, True, scale_dtype=T.FP8)],
-             [fake.fp4_act_quant(x.clone(), 16, True, scale_dtype=T.FP8)])
+        # an E4M3 scale holds a block's maximum up to 6 x 448; past it the cast is undefined
+        held = x.float().unflatten(-1, (-1, 16)).abs().amax(-1).amax(-1) <= 2688
+        for part, rows_ in (("in range", x[held]), ("past 6 x 448", x[~held])):
+            if rows_.shape[0]:
+                bits(f"fp4_act_quant/{label}/b16/e4m3/inplace/{part}",
+                     [real.fp4_act_quant(rows_.clone(), 16, True, scale_dtype=T.FP8)],
+                     [fake.fp4_act_quant(rows_.clone(), 16, True, scale_dtype=T.FP8)])
 
     # the GEMMs as Linear.forward calls them: activations quantized per 32, E8M0 scales
     m, k, n = 67, 640, 96
@@ -126,19 +133,27 @@ def mode_kernels(args) -> dict:
     close("fp4_gemm", real.fp4_gemm(a, a_s, b4, w4["scale"], T.E8M0, 32),
           fake.fp4_gemm(a, a_s, b4, w4["scale"], T.E8M0, 32))
 
+    def randn32(*shape):  # the reference's fp32 parameters, whatever the default dtype
+        return torch.randn(*shape, generator=g, device=device, dtype=torch.float32)
+
     for heads, dim, keys, picked in ((16, 64, 300, 136), (64, 512, 2000, 640), (4, 32, 40, 16)):
-        q, kv = randn(2, 9, heads, dim), randn(2, keys, dim)
-        sink = torch.randn(heads, generator=g, device=device)
+        q, kv, sink = randn(2, 9, heads, dim), randn(2, keys, dim), randn32(heads)
         idx = torch.randint(0, keys, (2, 9, picked), generator=g, device=device, dtype=torch.int32)
         idx[:, :, -picked // 5:] = -1
         idx[0, 0] = -1  # a row that attends nothing
-        got = real.sparse_attn(q, kv, sink, idx, dim ** -0.5)
-        close(f"sparse_attn/h{heads}d{dim}k{picked}", got, fake.sparse_attn(q, kv, sink, idx, dim ** -0.5))
+        name = f"sparse_attn/h{heads}d{dim}k{picked}"
+        try:
+            got = real.sparse_attn(q, kv, sink, idx, dim ** -0.5)
+        except Exception as error:  # noqa: BLE001 - a shape the kernel does not compile for is a result
+            _emit(rows, name, {"error": f"{type(error).__name__}: {str(error)[-160:]}"})
+            continue
+        close(name, got, fake.sparse_attn(q, kv, sink, idx, dim ** -0.5))
+        close(name + "/vs-exact-softmax", got, _exact_sparse_attn(q, kv, sink, idx, dim ** -0.5))
 
     hc = 4
-    mixes = torch.randn(2, 33, (2 + hc) * hc, generator=g, device=device)
-    scale = 1 + 0.2 * torch.randn(3, generator=g, device=device)
-    base = torch.randn((2 + hc) * hc, generator=g, device=device)
+    mixes = randn32(2, 33, (2 + hc) * hc)
+    scale = 1 + 0.2 * randn32(3)
+    base = randn32((2 + hc) * hc)
     for name, got, want in zip(("pre", "post", "comb"), real.hc_split_sinkhorn(mixes, scale, base, hc, 20, 1e-6),
                                fake.hc_split_sinkhorn(mixes, scale, base, hc, 20, 1e-6), strict=True):
         _emit(rows, f"hc_split_sinkhorn/{name}", {"max_abs": (got.float() - want.float()).abs().max().item()})
@@ -151,6 +166,9 @@ def _reference_run(ref, snapshot, config, tokenizer, ids, prompt, dtype, device)
     default = torch.get_default_dtype()
     torch.set_default_dtype(dtype)
     torch.set_default_device(device)
+    # the reference runs under torch's default, full fp32 matmuls; importing M*'s engine set TF32
+    matmul = torch.get_float32_matmul_precision()
+    torch.set_float32_matmul_precision("highest")
     try:
         with tempfile.TemporaryDirectory() as work:
             model = T.reference_model(ref, snapshot, config, tokenizer, work)
@@ -160,6 +178,7 @@ def _reference_run(ref, snapshot, config, tokenizer, ids, prompt, dtype, device)
             out.append(model(ids[None, i:i + 1], i)[1][0])
         return torch.stack(out).float().cpu()
     finally:
+        torch.set_float32_matmul_precision(matmul)
         torch.set_default_dtype(default)
         torch.set_default_device("cpu")
 
@@ -203,20 +222,40 @@ def mode_tp1(args) -> dict:
             other = _engine_run(tmp, ids, PROMPT, torch.float32, device, **kwargs)
             _emit(rows, f"fp32/mstar({name})-vs-mstar", {
                 "equal": bool(torch.equal(other, got32)), "gap": T.logit_gap(other, got32)})
-        if not args.no_kernels:
-            real = T.load_reference(args.reference, _real_kernels(args.reference))
-            want16 = _reference_run(real, tmp, config, tokenizer, ids, PROMPT, torch.bfloat16, device)
-            same16 = _reference_run(standin, tmp, config, tokenizer, ids, PROMPT, torch.bfloat16, device)
-            real.model.sparse_attn = _exact_sparse_attn
-            other16 = _reference_run(real, tmp, config, tokenizer, ids, PROMPT, torch.bfloat16, device)
-            got16 = _engine_run(tmp, ids, PROMPT, torch.bfloat16, device)
-            runs = (("reference(stand-ins)", same16), ("reference(exact softmax)", other16), ("mstar", got16))
-            for name, got in runs:
-                _emit(rows, f"bf16/{name}-vs-reference(kernels)", {
-                    "gap": T.logit_gap(got, want16),
-                    "argmax_equal_steps": int((got.argmax(-1) == want16.argmax(-1)).sum()), "steps": got.shape[0]})
         torch.save({"fp32": got32, "ids": ids}, args.out + ".pt")
+    if not args.no_kernels:
+        try:
+            _kernel_rows(args, rows, device)
+        except Exception as error:  # noqa: BLE001 - the fp32 rows above stand without these
+            _emit(rows, "bf16/reference(kernels)", {"error": f"{type(error).__name__}: {str(error)[-200:]}"})
     return rows
+
+
+def _kernel_rows(args, rows: dict[str, dict], device: str) -> None:
+    """bf16 as shipped, the reference on its own kernels, which need more width than the
+    reduced model has (their attention tiles a head in 64s)."""
+    from mstar.model.deepseek_v41 import _testing as T
+    from mstar.model.deepseek_v41.config import DeepseekV41Config
+
+    standin = T.load_reference(args.reference)
+    real = T.load_reference(args.reference, _real_kernels(args.reference))
+    with tempfile.TemporaryDirectory() as tmp:
+        config, tokenizer = T.write_snapshot(tmp, DeepseekV41Config.reduced(**KERNEL_WIDTHS), seed=0)
+        ids = T.random_ids(config, PROMPT + STEPS, seed=1)
+        want16 = _reference_run(real, tmp, config, tokenizer, ids, PROMPT, torch.bfloat16, device)
+        same16 = _reference_run(standin, tmp, config, tokenizer, ids, PROMPT, torch.bfloat16, device)
+        real.model.sparse_attn = _exact_sparse_attn
+        other16 = _reference_run(real, tmp, config, tokenizer, ids, PROMPT, torch.bfloat16, device)
+        got16 = _engine_run(tmp, ids, PROMPT, torch.bfloat16, device)
+        runs = (("reference(stand-ins)", same16), ("reference(exact softmax)", other16), ("mstar", got16))
+        for name, got in runs:
+            _emit(rows, f"bf16/{name}-vs-reference(kernels)", {
+                "gap": T.logit_gap(got, want16),
+                "argmax_equal_steps": int((got.argmax(-1) == want16.argmax(-1)).sum()), "steps": got.shape[0]})
+        # M*'s attention is one softmax: what it leaves between itself and the reference on one
+        _emit(rows, "bf16/mstar-vs-reference(exact softmax)", {
+            "gap": T.logit_gap(got16, other16),
+            "argmax_equal_steps": int((got16.argmax(-1) == other16.argmax(-1)).sum()), "steps": got16.shape[0]})
 
 
 def _tp2_rank(rank: int, args, port: int, snapshot: str, run: str) -> None:
