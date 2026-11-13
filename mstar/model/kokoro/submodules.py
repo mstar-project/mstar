@@ -2,10 +2,10 @@
 across requests, with CUDA graphs per length bucket.
 
 ``process_prompt`` hands every request all of its chunks at once (padded
-``[n_chunks, T]`` phoneme ids, lengths, one style row per chunk, speed). Each
-iteration of the ``chunk_loop`` synthesizes chunk ``i`` for every request in
-the batch and emits its PCM to the client; ``check_stop`` ends a request's
-loop after its last chunk.
+``[n_chunks, T]`` phoneme ids, one style row per chunk, speed), and their
+lengths as step metadata. Each iteration of the ``chunk_loop`` synthesizes
+chunk ``i`` for every request in the batch and emits its PCM to the client;
+``check_stop`` ends a request's loop after its last chunk.
 
 The forward has one host read, the frame count, between two static halves.
 Each half is captured as a piecewise CUDA graph per padded length bucket:
@@ -44,9 +44,9 @@ from mstar.model.kokoro.components import KokoroTTS
 from mstar.model.kokoro.config import (
     AUDIO_CHUNK,
     BOUNDARY_TOKEN_ID,
+    CHUNK_LENGTHS,
     CHUNK_LOOP,
     PHONEME_IDS,
-    PHONEME_LENS,
     REF_STYLE,
     SPEED,
     KokoroModelConfig,
@@ -156,11 +156,7 @@ class KokoroSynthSubmodule(NodeSubmodule):
     ) -> NodeInputs | None:
         """Select this iteration's chunk; ``None`` once the request has none left."""
         del graph_walk, kwargs
-        state = self.request_state(fwd_info.rid_handle)
-        if "chunk_lengths" not in state:
-            # One host read per request: the chunk lengths size every later slice.
-            state.add("chunk_lengths", inputs[PHONEME_LENS][0].tolist())
-        chunk_lengths: list[int] = state["chunk_lengths"]
+        chunk_lengths = fwd_info.step_metadata[CHUNK_LENGTHS]
         iteration = fwd_info.dynamic_loop_iter_counts.get(CHUNK_LOOP, 0)
         if iteration >= len(chunk_lengths):
             return None
@@ -182,7 +178,7 @@ class KokoroSynthSubmodule(NodeSubmodule):
         outputs: dict[str, list[torch.Tensor]],
     ) -> set[str]:
         del outputs
-        num_chunks = len(self.request_state(request_id).get("chunk_lengths", ()))
+        num_chunks = len(request_info.step_metadata[CHUNK_LENGTHS])
         if request_info.dynamic_loop_iter_counts.get(CHUNK_LOOP, 0) + 1 >= num_chunks:
             return {CHUNK_LOOP}
         return set()
