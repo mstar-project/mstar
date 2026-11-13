@@ -543,8 +543,8 @@ class _Lockstep:
     def __getattr__(self, name):
         return getattr(self.sampler, name)
 
-    def step(self, model_output, sample, step_index, solver, generator=None):
-        got = self.sampler.step(model_output, sample, step_index, solver, generator)
+    def step(self, model_output, sample, step_index, solver, noise=None):
+        got = self.sampler.step(model_output, sample, step_index, solver, noise)
         want = self.reference.step(model_output, self.reference.timesteps[step_index], sample, return_dict=False)[0]
         assert torch.equal(got[0], want), f"step {step_index}"
         self.steps += 1

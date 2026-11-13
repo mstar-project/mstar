@@ -12,5 +12,5 @@ class StubSampler:
     def initial_state(self, sample):
         return {}
 
-    def step(self, model_output, sample, step_index, solver, generator=None):
+    def step(self, model_output, sample, step_index, solver, noise=None):
         return self.update(sample, model_output), {}

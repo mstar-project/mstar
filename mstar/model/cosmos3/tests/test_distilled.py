@@ -112,11 +112,9 @@ def test_distilled_scheduler_and_sde_step(tmp_path) -> None:
     reference SDE update drawn from the request's generator."""
     sub = _distilled_dit(tmp_path)
     sampler = sub._new_scheduler(4, torch.device("cpu"), flow_shift=12.0, use_karras_sigma=True)
-    sched = sampler.scheduler
-    assert type(sched).__name__ == "FlowMatchEulerDiscreteScheduler"
-    assert torch.allclose(sched.timesteps.float(), torch.tensor(SIGMAS) * 1000)
-    assert torch.allclose(sched.sigmas.float(), torch.tensor(SIGMAS + [0.0]))
-    assert sched.config.stochastic_sampling
+    assert torch.allclose(sampler.timesteps.float(), torch.tensor(SIGMAS) * 1000)
+    assert torch.allclose(sampler.sigmas.float(), torch.tensor(SIGMAS + [0.0]))
+    assert sampler.config.stochastic_sampling
 
     gen = torch.Generator().manual_seed(7)
     st = sub.request_state("r")
@@ -129,8 +127,6 @@ def test_distilled_scheduler_and_sde_step(tmp_path) -> None:
     ref = (1.0 - SIGMAS[1]) * (x - SIGMAS[0] * v) + SIGMAS[1] * eps
     assert torch.allclose(out, ref, atol=1e-6)
     # The last step lands on x0 exactly (sigma' = 0).
-    for _ in range(2):
-        sched.step(v.unsqueeze(0), sched.timesteps[sched.step_index], out.unsqueeze(0), generator=gen)
     last, _ = sub._scheduler_step(st, v, x, 3, {})
     assert torch.allclose(last, x - SIGMAS[3] * v, atol=1e-6)
 

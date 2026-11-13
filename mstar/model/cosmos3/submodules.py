@@ -277,7 +277,7 @@ class _UniPCSampler:
     def initial_state(self, sample: torch.Tensor) -> dict[str, torch.Tensor]:
         return initial_state(sample)
 
-    def step(self, model_output, sample, step_index: int, solver, generator=None):
+    def step(self, model_output, sample, step_index: int, solver, noise=None):
         step = unipc_step(
             model_output, sample,
             UniPCState(model_outputs=solver[MODEL_OUTPUTS], last_sample=solver[LAST_SAMPLE]),
@@ -287,23 +287,36 @@ class _UniPCSampler:
 
 
 class _DistilledSampler:
-    """The 4-step distilled sampler: diffusers' FlowMatchEuler with the checkpoint's
-    stochastic (SDE) step, which re-noises from the request's generator, so it has
-    no state to carry on an edge and keeps its own step count."""
+    """The 4-step distilled sampler: diffusers' FlowMatchEuler update with the checkpoint's
+    stochastic (SDE) step, over the scheduler's sigmas at the loop's step index. Its noise
+    comes in as a tensor, so it has no state to carry on an edge or between steps."""
 
     def __init__(self, scheduler):
-        self.scheduler = scheduler
         self.config = scheduler.config
         self.host_timesteps = scheduler.timesteps.tolist()
         self.timesteps = scheduler.timesteps
+        self.sigmas = scheduler.sigmas
 
     def initial_state(self, sample: torch.Tensor) -> dict[str, torch.Tensor]:
         return {}
 
-    def step(self, model_output, sample, step_index: int, solver, generator=None):
-        kwargs = {} if generator is None else {"generator": generator}
-        out = self.scheduler.step(model_output, self.timesteps[step_index], sample, return_dict=False, **kwargs)
-        return out[0], {}
+    def noise(self, sample: torch.Tensor, generator) -> torch.Tensor | None:
+        """The SDE step's noise for ``sample``, drawn as `FlowMatchEulerDiscreteScheduler.step` draws it."""
+        if not self.config.stochastic_sampling:
+            return None
+        from diffusers.utils.torch_utils import randn_tensor
+
+        return randn_tensor(sample.shape, generator=generator, device=sample.device, dtype=torch.float32)
+
+    def step(self, model_output, sample, step_index: int, solver, noise=None):
+        # `FlowMatchEulerDiscreteScheduler.step`'s update, in its order and dtypes
+        sample = sample.to(torch.float32)
+        sigma, sigma_next = self.sigmas[step_index], self.sigmas[step_index + 1]
+        if self.config.stochastic_sampling:
+            prev = (1.0 - sigma_next) * (sample - sigma * model_output) + sigma_next * noise
+        else:
+            prev = sample + (sigma_next - sigma) * model_output
+        return prev.to(model_output.dtype), {}
 
 
 def _host_timesteps(scheduler) -> list:
@@ -805,12 +818,13 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
     @staticmethod
     def _scheduler_step(st, velocity, latents, step_index: int, solver):
         """One scheduler update of a ``[C, T, H, W]`` latent, and the solver state
-        its loop-back edges carry. A distilled request carries its SDE generator
-        (``sde_generator``, the same one its initial noise came from, as in the
-        reference), so the stochastic step is seedable; UniPC takes no generator."""
-        new_latents, solver = st["scheduler"].step(
-            velocity.unsqueeze(0), latents.unsqueeze(0), step_index, solver, generator=st.get("sde_generator"),
-        )
+        its loop-back edges carry. A distilled request's SDE noise is drawn from its
+        generator (``sde_generator``, the same one its initial noise came from, as in
+        the reference), so the stochastic step is seedable; UniPC takes no noise."""
+        sample = latents.unsqueeze(0)
+        generator = st.get("sde_generator")
+        noise = None if generator is None else st["scheduler"].noise(sample, generator)
+        new_latents, solver = st["scheduler"].step(velocity.unsqueeze(0), sample, step_index, solver, noise=noise)
         return new_latents.squeeze(0), solver
 
     def _build_action_static(
