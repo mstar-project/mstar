@@ -56,6 +56,7 @@ from mstar.model.base import (
     WalkStep,
 )
 from mstar.model.media_limits import read_image
+from mstar.model.praxis1.components.proprio import normalized_proprio
 from mstar.model.praxis1.config import Praxis1Config, Praxis1ConfigError
 from mstar.model.praxis1.submodules import (
     Praxis1TextEncoderSubmodule,
@@ -89,6 +90,7 @@ class Praxis1Model(Model):
 
     ENCODE_TEXT_WALK = "encode_text"
     CHUNK_WALK = "chunk"
+    PREPROCESS_ONLY_KWARGS = (STATE_KWARG,)
 
     def __init__(
         self,
@@ -233,7 +235,7 @@ class Praxis1Model(Model):
         )
         action_expert = GraphNode(
             name="action_expert",
-            input_names=["taps", "video_latents", "action_latents"],
+            input_names=["taps", "video_latents", "action_latents", "proprio"],
             outputs=[
                 GraphEdge(next_node="backbone", name="video_latents"),
                 GraphEdge(next_node="backbone", name="action_latents"),
@@ -352,7 +354,9 @@ class Praxis1Model(Model):
             return output.detach().cpu().to(torch.float32).numpy().tobytes()
         raise ValueError(f"Unsupported modality for Praxis-1: {modality!r}")
 
-    def process_prompt(self, prompt: str | None, *args, **kwargs) -> ProcessPromptOutput:
+    def process_prompt(
+        self, prompt: str | None, *args, robot_state: object = None, **kwargs
+    ) -> ProcessPromptOutput:
         """Tokenize the task text and the blank caption, once per request.
 
         Both are tokenized here rather than in the node, so the node's
@@ -383,12 +387,14 @@ class Praxis1Model(Model):
 
         task_ids, task_mask = encode(task)
         blank_ids, blank_mask = encode(blank)
+        proprio = normalized_proprio(robot_state, self.config.embodiment, self.config.normalization)
         return ProcessPromptOutput(
             new_input_tensors={
                 "text_ids": [task_ids],
                 "text_mask": [task_mask],
                 "blank_ids": [blank_ids],
                 "blank_mask": [blank_mask],
+                "proprio": [proprio],
             },
             metadata={"text_tokens": int(task_mask.sum())},
         )
@@ -423,7 +429,17 @@ class Praxis1Model(Model):
         steps: list[WalkStep] = []
         if not input_signals.get("text_embeds"):
             steps.append(WalkStep(self.ENCODE_TEXT_WALK))
-        steps.append(WalkStep(self.CHUNK_WALK))
+        steps.append(
+            WalkStep(
+                self.CHUNK_WALK,
+                step_metadata={
+                    "num_steps": self.get_loop_caps(**model_kwargs)[DENOISE_LOOP_NAME],
+                    "t_shift": self.sampler_defaults["t_shift"],
+                    "cfg_scale": self.sampler_defaults["cfg_scale"],
+                    "cfg_video_scale": self.sampler_defaults["cfg_video_scale"],
+                },
+            )
+        )
         return steps
 
     def get_submodule(

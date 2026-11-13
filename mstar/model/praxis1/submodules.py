@@ -305,6 +305,7 @@ class Praxis1ActionExpertSubmodule(_Praxis1Node):
                 "taps": inputs["taps"][0],
                 "video_latents": inputs["video_latents"][0],
                 "action_latents": inputs["action_latents"][0],
+                "proprio": inputs["proprio"][0],
             }
         )
 
@@ -315,6 +316,7 @@ class Praxis1ActionExpertSubmodule(_Praxis1Node):
         taps: torch.Tensor,
         video_latents: torch.Tensor,
         action_latents: torch.Tensor,
+        proprio: torch.Tensor,
         **kwargs,
     ) -> NameToTensorList:
         raise NotImplementedError(
