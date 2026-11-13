@@ -77,6 +77,7 @@ from mstar.utils.knobs import kv_chain_lazy_steps, kv_pinned_indptrs
 from mstar.utils.profiler import PhaseLaps
 
 if TYPE_CHECKING:
+    from mstar.engine.resources.context_parallel import ContextParallel
     from mstar.engine.resources.kv.resident import KVResidentTables
     from mstar.engine.resources.recurrent.pool import RecurrentStatePool
     from mstar.engine.resources.resident import (
@@ -556,8 +557,19 @@ class _SlotBuffer:
 
 class KVManager(AttentionResource):
     prefix_skip_safe = True
+    # written through an exchange (`sequence_shard`): the step's every token, or a ring's own ones
+    # (`write_kv(tokens=)`)
+    supports_split_steps = True
+    # the node's sequence shard, which refuses a write outside an exchange (`check_bypass`)
+    _sequence_shard = None
     # this pool's resident tables, once a node's planner bound them
     _resident: "KVResidentTables | None" = None
+    # Tokens a commit can run ahead of what has been read back and keyed, past
+    # the one a step always has: the step in flight's and the one committing's
+    # extra replays, 2 * (repeats - 1) for the most this pool has repeated. It
+    # only loosens the chain-drop check, so a pool-wide high mark is safe: a gap
+    # that never fills still outgrows it and drops the chain, a few tokens later.
+    _run_lag: int = 0
 
     def __init__(
         self,
@@ -581,6 +593,8 @@ class KVManager(AttentionResource):
                 "its nodes from one TP group"
             )
         tp_cache = False
+        # the cache is sized off the placement, and off the head counts `build` sharded
+        placement = cfg.place(joint_comm_group, name)
         if joint_comm_group is not None:
             tp_cache = joint_comm_group.world_size > 1 and cfg.prefix_cache and cfg.prefix_cache_tp
             if tp_cache and cfg.cpu_offload_pages > 0:
@@ -597,10 +611,14 @@ class KVManager(AttentionResource):
                     "and a read from another group would take pages outside rank 0's order. Serve "
                     "the nodes from one group or set prefix_cache_tp to false."
                 )
-        self.kv_cache = KVCache(
-            cfg, device, dtype
-        )
+        self.kv_cache = KVCache(cfg, device, dtype, placement)
         self.name = name
+        cp = placement
+        logger.info(
+            "KV %s: %.2f GiB on this rank, %d pages of %d slots%s", name, self.kv_cache.nbytes / 2**30,
+            cfg.max_num_pages, self.kv_cache.page_slots,
+            "" if cp is None else f" (context parallel, {cp.size} ranks, {type(cp).__name__})",
+        )
         self._needs_remote_transfer = needs_remote_transfer
 
         self._arena = new_page_arena(cfg.num_units)
@@ -1250,7 +1268,7 @@ class KVManager(AttentionResource):
 
     def _index_filled_pages(
         self, segment: Segment, stream: CacheStream, ctx: StepContext,
-        touched: list[tuple[int, int]],
+        touched: list[tuple[int, int]], span: int,
     ) -> None:
         """Offer every page this commit filled to the index. ``touched`` holds
         ``(index, end)`` for each span of the layout this commit wrote into.
@@ -1276,11 +1294,11 @@ class KVManager(AttentionResource):
         # what was here before this write, not after: a decode step can commit
         # before the token it writes is read back and counted. the lazy chain
         # extension holds back a few steps more (`extend_prefix_chains_batch`)
-        lag = (
+        lag = self._run_lag + (
             self._chain_pending.get(segment.request_id, 0) * self._chain_backlog_width
             if self._chain_backlog else 0
         )
-        if stream.released or stream.stored_len - segment.span > chain.covered_len + lag:
+        if stream.released or stream.stored_len - span > chain.covered_len + lag:
             stream.chain = None
             return
         ended = None
@@ -1789,11 +1807,19 @@ class KVManager(AttentionResource):
         if hold is not None:
             self._release(rid, stream, hold)
 
+    @property
+    def placement(self) -> "ContextParallel | None":
+        """This rank's placement of the pool's positions (``PagedKVConfig.context_parallel``), which
+        the resources over it read here; None when it is off."""
+        return self.kv_cache.placement
+
     def fingerprint(self) -> bytes:
+        cp = self.placement
         return fingerprint(
             self.config.layout.value, self.config.tokens_per_page,
             self.kv_cache.tensor.dtype, self._world_size,
             self.config.prefix_cache_salt,
+            *(() if cp is None else ("context_parallel", cp.size, type(cp).__name__)),
         )
 
     def ingest_request(self, rid, overrides: KVReqConfig | None=None):
@@ -2181,7 +2207,8 @@ class KVManager(AttentionResource):
             # chunked row reserves ahead, so those steps take every row here.
             ready: list[CacheStream] = []
             rows = step.segments
-            if not ctx.capture and not ahead and len(self._groups) == 1:
+            repeats = ctx.repeats
+            if not ctx.capture and not ahead and repeats == 1 and len(self._groups) == 1:
                 ready, slow = self._arena.admit_rows(streams, rows, ctx.real_rows(), sink or None, page_size)
                 rows = [rows[i] for i in slow]
             for segment in rows:
@@ -2203,7 +2230,7 @@ class KVManager(AttentionResource):
                     stream = self._ensure_label(rid, label)
                 marked.append((segment, stream))
                 # a chunked row reserves the rest of its walk up front, in every group
-                span = segment.span
+                span = segment.span * repeats
                 if ahead and reserve_ahead.holds_for(rid):
                     span += ahead.get(rid, 0)
                 seq_len = span + stream.stored_len
@@ -2440,9 +2467,11 @@ class KVManager(AttentionResource):
         return KVPlanState(token_to_page=empty, token_to_cache=empty, total_tokens=0)
 
     def _decode_plan_state(
-        self, views: list[SequenceView] | None, page_size: int, pages=None, offsets=None,
+        self, views: list[SequenceView] | None, page_size: int, pages=None, offsets=None, *,
+        placement: "ContextParallel | None",
     ) -> KVPlanState:
-        """Write addressing for a step appending one token per request.
+        """Write addressing for a step appending one token per request, at ``placement``'s slots
+        of a placed group (None for an unplaced one).
 
         The packed path needs the indptrs on device and ~a dozen kernels to
         unpack them per token. A decode step's slot is just the end of each
@@ -2451,6 +2480,8 @@ class KVManager(AttentionResource):
         """
         if pages is None or offsets is None:
             pages, offsets = self._decode_locations(views, page_size)
+        if placement is not None:
+            pages, offsets = placement.write_slots(pages, offsets)
         n = len(pages)
         host = np.empty(2 * n, np.int64)
         host[:n], host[n:] = pages, offsets
@@ -2472,17 +2503,20 @@ class KVManager(AttentionResource):
         return pages, offsets
 
     def _stage_packed_plan_state(
-        self, indptrs: PagedIndptrs, static_state: KVPlanState, capture_len: int, page_size: int,
+        self, indptrs: PagedIndptrs, static_state: KVPlanState, capture_len: int, page_size: int, *,
+        placement: "ContextParallel | None",
     ) -> KVPlanState:
         """``_packed_addressing`` staged into the captured state."""
         total = int(indptrs.qo_indptr[-1])
         if total == 0:
             # every row reads without writing (a zero-span context label)
             return self._stage_static(static_state, (), (), 0)
-        both = self._packed_addressing(indptrs, total, page_size)
+        both = self._packed_addressing(indptrs, total, page_size, placement=placement)
         return self._stage_static(static_state, both[:total], both[total:], total)
 
-    def _packed_addressing(self, indptrs: PagedIndptrs, total: int, page_size: int) -> np.ndarray:
+    def _packed_addressing(
+        self, indptrs: PagedIndptrs, total: int, page_size: int, *, placement: "ContextParallel | None",
+    ) -> np.ndarray:
         """Each new token's page, then each one's offset in it (``2 * total``
         int64), from the plan's host indptrs: tokens are appended after each
         row's stored length. One Rust call when the extension has it."""
@@ -2493,7 +2527,7 @@ class KVManager(AttentionResource):
                 qo, indptrs.paged_kv_indptr.numpy(), indptrs.paged_kv_indices.numpy(),
                 indptrs.paged_kv_last_page_len.numpy(), page_size, both,
             )
-            return both
+            return self._placed(both, total, placement)
         kvp = indptrs.paged_kv_indptr.numpy()
         spans = np.diff(qo)
         seg = np.repeat(np.arange(len(spans)), spans)
@@ -2512,25 +2546,37 @@ class KVManager(AttentionResource):
         both = np.empty(2 * total, np.int64)
         page, both[total:] = np.divmod(pos, page_size)
         both[:total] = indptrs.paged_kv_indices.numpy()[kvp[:-1][seg] + page]
+        return self._placed(both, total, placement)
+
+    @staticmethod
+    def _placed(both: np.ndarray, total: int, placement: "ContextParallel | None") -> np.ndarray:
+        """``both`` (``_packed_addressing``'s layout) at this rank's slots of a placed group
+        (``ContextParallel.write_slots``), in place."""
+        if placement is not None:
+            both[:total], both[total:] = placement.write_slots(both[:total], both[total:])
         return both
 
-    def _host_plan_state(self, indptrs: PagedIndptrs, total: int, page_size: int) -> KVPlanState:
+    def _host_plan_state(
+        self, indptrs: PagedIndptrs, total: int, page_size: int, *, placement: "ContextParallel | None",
+    ) -> KVPlanState:
         """An eager write's addressing: computed on the host and uploaded in
         one page-locked copy, rather than unpacked on the device from
         uploaded indptrs (four copies and a dozen small kernels a step)."""
-        host = self._packed_addressing(indptrs, total, page_size)
+        host = self._packed_addressing(indptrs, total, page_size, placement=placement)
         both = torch.empty(2 * total, dtype=torch.long, device=self._device)
         self._plan_stager.copy_(both, host)
         return KVPlanState(token_to_page=both[:total], token_to_cache=both[total:], total_tokens=total)
 
     def _stage_decode_plan_state(
         self, views: list[SequenceView] | None, static_state: KVPlanState,
-        capture_len: int, page_size: int, pages=None, offsets=None,
+        capture_len: int, page_size: int, pages=None, offsets=None, *, placement: "ContextParallel | None",
     ) -> KVPlanState:
         """``_decode_plan_state`` staged into the captured state, with no device
         staging tensor."""
         if pages is None or offsets is None:
             pages, offsets = self._decode_locations(views, page_size)
+        if placement is not None:
+            pages, offsets = placement.write_slots(pages, offsets)
         return self._stage_static(static_state, pages, offsets, len(pages))
 
     def _setup_plan_states(
@@ -2542,6 +2588,8 @@ class KVManager(AttentionResource):
             # written outside the graph (KVStep.eager_write): never staged
             lease = None
         page_size = self._groups[group].page_size
+        # the placement stripes the first group alone; a window group is whole on every partner
+        placement = self.placement if group == 0 else None
         for plan_label, indptrs in plan_output.items():
             label = (plan_label, group)
             if indptrs.is_decode and lease is not None:
@@ -2555,7 +2603,7 @@ class KVManager(AttentionResource):
                     None if located else indptrs.views,
                     self._static_plan_state(lease.slot, label, lease.bucket.num_tokens),
                     lease.bucket.num_tokens, page_size,
-                    pages=indptrs.decode_pages, offsets=indptrs.decode_offsets,
+                    pages=indptrs.decode_pages, offsets=indptrs.decode_offsets, placement=placement,
                 )
                 self._staged_outputs[(lease.slot, label)] = indptrs
                 if ctx.is_preplan:
@@ -2569,7 +2617,7 @@ class KVManager(AttentionResource):
                 plan_state = self._stage_packed_plan_state(
                     indptrs.cpu_indptrs,
                     self._static_plan_state(lease.slot, label, lease.bucket.num_tokens),
-                    lease.bucket.num_tokens, page_size,
+                    lease.bucket.num_tokens, page_size, placement=placement,
                 )
                 self._staged_outputs[(lease.slot, label)] = indptrs
                 if ctx.is_preplan:
@@ -2581,7 +2629,7 @@ class KVManager(AttentionResource):
             if indptrs.is_decode:
                 plan_state = self._decode_plan_state(
                     None if indptrs.decode_pages is not None else indptrs.views, page_size,
-                    indptrs.decode_pages, indptrs.decode_offsets,
+                    indptrs.decode_pages, indptrs.decode_offsets, placement=placement,
                 )
             elif total_tokens == 0:
                 # every segment span 0 (a decoder reading the encoder context
@@ -2589,7 +2637,7 @@ class KVManager(AttentionResource):
                 # addressing to upload and unpack
                 plan_state = self._empty_plan_state()
             else:
-                plan_state = self._host_plan_state(indptrs.cpu_indptrs, total_tokens, page_size)
+                plan_state = self._host_plan_state(indptrs.cpu_indptrs, total_tokens, page_size, placement=placement)
             # (a leased step staged above: these are eager)
             if eager_write and ctx.is_preplan and plan_state.token_to_page.is_cuda:
                 plan_state.ready = torch.cuda.Event()
@@ -2621,7 +2669,7 @@ class KVManager(AttentionResource):
         page_size = self._groups[group].page_size
         if pending:
             return self._plan_output(self._sequence_views(segments, pending, ctx, sink, group), page_size, ring)
-        if not ctx.capture and group == 0:
+        if not ctx.capture and group == 0 and ctx.repeats == 1:
             return self._plan_label_rows(segments, ctx, sink, ring, page_size)
         streams = self._streams
         capture = ctx.capture
@@ -2644,7 +2692,8 @@ class KVManager(AttentionResource):
                 continue
             stream = streams[s.request_id][s.label].group(group)
             sids.append(stream.page_indices.sid)
-            lens.append(span + stream.stored_len)
+            # a step that repeats plans its last replay: every page it reaches
+            lens.append(span * ctx.repeats + stream.stored_len)
             gens.append(stream.generation)
         if sink_rows:
             sink_pages = self._sink_pages
@@ -3102,7 +3151,11 @@ class KVManager(AttentionResource):
             is_pad = ctx.is_padding_row
             sink = step.sink
             rows = () if ctx.capture else step.segments
-            if rows and self._index is None and not retention and not windows and not _DEBUG_ASSERTS:
+            repeats = ctx.repeats
+            if repeats != 1:
+                # a repeated step's stored spans are `repeats` of what it declared (see `_run_lag`)
+                self._run_lag = max(self._run_lag, 2 * (repeats - 1))
+            if rows and repeats == 1 and self._index is None and not retention and not windows and not _DEBUG_ASSERTS:
                 # nothing to index, adopt, retain or check: the arena moves
                 # every row's counts in one call, and hands back the ones it can't
                 slow = self._arena.commit_rows(streams, rows, ctx.real_rows(), sink or None, step.commit)
@@ -3115,7 +3168,8 @@ class KVManager(AttentionResource):
                 # tokens (image_gen, action_gen) still read these pages, and
                 # leaving the mark set would make the request unevictable
                 stream.step_in_flight = False
-                if step.commit and segment.span > 0:
+                span = segment.span * repeats
+                if step.commit and span > 0:
                     # an offload beat the mark (claimed before this step's
                     # admit). the host copy predates the span, so writing the
                     # length here would be lost on reload
@@ -3123,12 +3177,12 @@ class KVManager(AttentionResource):
                         logger.warning(
                             "KV %s: dropping %d committed tokens for %s label "
                             "%s; the stream was offloaded mid-step",
-                            self.name, segment.span,
+                            self.name, span,
                             segment.request_id, segment.label,
                         )
                         self._readonly_epoch += 1
                         continue
-                    stream.stored_len += segment.span
+                    stream.stored_len += span
                     if stream.converted and self._world_size > 1 and stream.chain is not None:
                         # Above one rank a hit is stamped at commit, which every rank runs in step order,
                         # so every rank evicts the same pages.
@@ -3144,17 +3198,17 @@ class KVManager(AttentionResource):
                     touched = []
                     if stream.span_cursor is not None and (stream.chain is not None or _DEBUG_ASSERTS):
                         written = stream.stored_len + stream.released
-                        touched = stream.span_cursor.advance(written - segment.span, written)
+                        touched = stream.span_cursor.advance(written - span, written)
                         if _DEBUG_ASSERTS:
                             self._assert_layout(segment, stream, touched, ctx, policy)
                     if index_on and stream.chain is not None:
-                        self._index_filled_pages(segment, stream, ctx, touched)
+                        self._index_filled_pages(segment, stream, ctx, touched, span)
                     # so a claim taken in a window the mark misses still fails
                     # `_commit_offload`'s generation guard
                     stream.generation += 1
                     for g, group in windows:
                         part = stream.group(g)
-                        part.stored_len += segment.span
+                        part.stored_len += span
                         part.generation += 1
                         # What the window's layers can no longer read goes back to the pool, as
                         # below. No touch: this commit already dropped the read-only plans of
@@ -5418,6 +5472,25 @@ class KVManager(AttentionResource):
 
     # Resident planning
 
+    def max_repeats(self, step: KVStep, ctx: StepContext) -> int:
+        """What the pool can hand over covers, one page a row at most: a refused
+        admit would break the chain for pages a shorter run doesn't need. Past
+        a row's reach (its pages, or ``max_seq_len``) there is no table row."""
+        if ctx.resident is None:
+            return 1
+        step_rows = {(s.request_id, s.label) for s in step.segments if s.span and ctx.is_real_row(s.request_id)}
+        with self._lock:
+            # the room a refused admit would count: pages other requests' allotments hold aren't ours
+            if self._room() < max(len(step_rows), 1):
+                return 1
+            longest = max((
+                self._streams[rid][label].stored_len for rid, label in step_rows
+                if label in self._streams.get(rid, ())
+            ), default=0)
+        page_size = self._groups[0].page_size
+        reach = min(self.config.max_seq_len, self.config.request_pages * page_size)
+        return max(1, min(page_size, reach - longest))
+
     def resident_refusal(self) -> str | None:
         if len(self._groups) > 1:
             return "a pool with sliding-window layers holds its pages per group, which a block table row can't"
@@ -5425,6 +5498,11 @@ class KVManager(AttentionResource):
             return f"the {self.kv_cache.layout.value} layout has no resident write path"
         if self._needs_remote_transfer:
             return "a pool read across nodes takes pages a resident row doesn't track"
+        if self.placement is not None:
+            return (
+                "a context-parallel pool writes each token on one rank, at that rank's slot of the page "
+                "(ContextParallel.write_slots), which the resident write path doesn't address"
+            )
         return None
 
     def bind_resident(self, planner: "ResidentPlanner", key: str) -> None:
@@ -5483,6 +5561,22 @@ class KVManager(AttentionResource):
         # unlike attention, every read here needs a usable index
         self._default_layer_idx = 0
 
+    def bind_sequence_shard(self, shard) -> None:
+        """The sequence shard an attention over this pool exchanges split steps through
+        (`AttentionManager.bind_dependencies`): a write outside an exchange raises (`check_bypass`).
+        One per pool, since the writes check this one shard whichever node's step is running."""
+        if self._sequence_shard is not None and self._sequence_shard is not shard:
+            raise ValueError(
+                f"KV {self.name!r} serves nodes under two sequence shards: declare one SeqShardSpec "
+                "over every node of the pool"
+            )
+        self._sequence_shard = shard
+
+    def opens_label(self, rid: int, label: str) -> bool:
+        """Whether request ``rid`` opened ``label``. A padding row has no config, and opens any."""
+        overrides = self._overrides.get(rid)
+        return overrides is None or label in overrides.opened_labels(self._nodes)
+
     @torch.compiler.disable
     def write_target(self, layer_idx: int = None, label: str = None):
         """Where this step's K/V go, for a layer that writes them itself in a
@@ -5492,6 +5586,8 @@ class KVManager(AttentionResource):
             layer_idx = self._default_layer_idx
         if label is None:
             label = self._default_label
+        if self._sequence_shard is not None:
+            self._sequence_shard.check_bypass(label, "KV write_target", by_head=self.placement is None)
         if self.kv_cache.layout != KVLayout.NHD:
             raise NotImplementedError(f"write_target is not implemented for layout {self.kv_cache.layout}")
         state = self._current_plan_states[label, self._layer_group[layer_idx]]
@@ -5513,24 +5609,6 @@ class KVManager(AttentionResource):
         return self.kv_cache.layer_view(layer_idx)
 
     @torch.compiler.disable
-    def read_kv(self, layer_idx: int=None, plan_label: str=None) -> torch.Tensor:
-        """
-        The slots this step's plan writes, e.g. for NHD:
-        [num_tokens, 2, num_kv_heads, head_dim] (K at index 0, V at 1).
-        """
-        if layer_idx is None:
-            layer_idx = self._default_layer_idx
-        if plan_label is None:
-            plan_label = self._default_label
-        plan_state = self._current_plan_states[plan_label, self._layer_group[layer_idx]]
-        n = plan_state.total_tokens
-        return self.kv_cache.read_tokens(
-            layer_idx=layer_idx,
-            page_idx=plan_state.token_to_page[:n],
-            cache_idx=plan_state.token_to_cache[:n],
-        )
-
-    @torch.compiler.disable
     def write_slots(self, label: str=None) -> tuple[torch.Tensor, torch.Tensor]:
         """The (page, offset-in-page) slots ``write_kv`` scatters this step's tokens to, as
         device tensors, for a kernel that writes the cache itself. Under a capture lease they
@@ -5539,6 +5617,8 @@ class KVManager(AttentionResource):
             raise ValueError(f"KV {self.name}: a pool with full and sliding layers writes through write_kv only")
         if label is None:
             label = self._default_label
+        if self._sequence_shard is not None:
+            self._sequence_shard.check_bypass(label, "KV write_slots", by_head=self.placement is None)
         plan_state = self._current_plan_states[label, 0]
         n = plan_state.total_tokens
         return plan_state.token_to_page[:n], plan_state.token_to_cache[:n]
@@ -5546,28 +5626,32 @@ class KVManager(AttentionResource):
     @torch.compiler.disable
     def write_kv(
         self, k: torch.Tensor, v: torch.Tensor | None = None,
-        layer_idx: int=None, label: str=None, return_tensor: bool = False,
-    ) -> torch.Tensor | None:
+        layer_idx: int=None, label: str=None, tokens: torch.Tensor | None = None,
+    ) -> None:
         """Write K, V into this step's planned slots (under MLA: the per-token
-        latent as ``k`` and ``v=None``).
-
-        Returns nothing by default: reading the slots back is a gather no
-        caller wants today, and skipping it keeps the write a pure mutation.
-        """
+        latent as ``k`` and ``v=None``). ``tokens``: which of the step's tokens
+        ``k`` and ``v`` hold, by index (a ring's own share); by default its first."""
         if layer_idx is None:
             layer_idx = self._default_layer_idx
         if label is None:
             label = self._default_label
+        if self._sequence_shard is not None:
+            self._sequence_shard.check_bypass(label, "KV write_kv", by_head=self.placement is None)
         plan_state = self._current_plan_states[label, self._layer_group[layer_idx]]
         if plan_state.ready is not None:
             torch.cuda.current_stream(k.device).wait_event(plan_state.ready)
+        if tokens is not None:
+            self.kv_cache.write_tokens(
+                layer_idx=layer_idx, k=k, v=v,
+                page_idx=plan_state.token_to_page[tokens], cache_idx=plan_state.token_to_cache[tokens],
+            )
+            return
         # an eager write may carry only the real rows; the padding rows' tokens
         # come last in the plan (on SINK_PAGE) and are skipped
         n = min(plan_state.total_tokens, k.shape[0])
-        return self.kv_cache.write_tokens(
+        self.kv_cache.write_tokens(
             layer_idx=layer_idx,
             k=k[:n], v=None if v is None else v[:n],
             page_idx=plan_state.token_to_page[:n],
             cache_idx=plan_state.token_to_cache[:n],
-            return_tensor=return_tensor,
         )

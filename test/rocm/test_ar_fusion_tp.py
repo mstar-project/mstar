@@ -227,6 +227,8 @@ def _parity(ranks: _Ranks) -> list[Row]:
                 )
                 row.inputs_untouched = torch.equal(x, x0) and torch.equal(res, res0)
                 rows.append(row)
+        if fusion is not None:
+            fusion.close()
     return rows
 
 
@@ -252,6 +254,7 @@ def _capture(ranks: _Ranks) -> list[Row]:
                         ranks, group, pool, hidden, tokens, gemma, registered,
                         GraphCaptureScope,
                     ))
+        fusion.close()
     return rows
 
 
@@ -344,6 +347,8 @@ def _timing(ranks: _Ranks) -> list[Row]:
                 row = Row("timing", ranks.rank, ranks.world, hidden, tokens, path=name)
                 row.us_per_call = _time_in_graph(ranks, group, pool, fn, registered)
                 rows.append(row)
+        if fusion is not None:
+            fusion.close()
     return rows
 
 

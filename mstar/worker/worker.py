@@ -330,6 +330,7 @@ class Worker:
             enable_prof=self.enable_prof,
             device_capability=self.device_capability,
         )
+        self._graph_runtime.set_inline_streams(self.engine_manager.inline_streams.keys)
         self._never_publish_unshared(all_worker_graph_ids_to_instances)
 
         self.request_state = RequestStateManager(
@@ -342,7 +343,11 @@ class Worker:
             graph_runtime=self._graph_runtime, topology=topology,
         )
 
-        layout = replace(layout, side_keys=frozenset(self.engine_manager.side_keys))
+        layout = replace(
+            layout, side_keys=frozenset(self.engine_manager.side_keys),
+            tensor_streams=self.engine_manager.inline_streams.tensor_streams,
+            inline_carried=self.engine_manager.inline_streams.carried,
+        )
         self.layout = layout
         self._rebuilds = _make_rebuilds(
             model, model_config, layout.my_walks, layout.parallel_nodes, self.device, self.engine_manager.engine,

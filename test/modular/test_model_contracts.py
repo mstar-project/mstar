@@ -19,6 +19,8 @@ from huggingface_hub.errors import EntryNotFoundError
 import mstar.model.bagel.bagel_model as bagel_mod
 from mstar.conductor.conductor import Conductor
 from mstar.engine.resources.sampler.config import SamplerSpec, SamplingReqConfig
+from mstar.engine.state import Sampler
+from mstar.engine.state.adapters import node_resources, sampling_configs
 from mstar.model.bagel.bagel_model import BagelModel, check_request_kwargs
 from mstar.model.base import MAX_OUTPUT_TOKENS, Model
 from mstar.model.components.diffusion.image_io import OUTPUT_FORMAT_KWARGS
@@ -376,7 +378,9 @@ def _qwen3_5_model(defaults=None) -> Qwen3_5DenseModel:
 
 
 def _qwen3_5_sampler(model, **kw) -> SamplingReqConfig:
-    return model.get_request_resource_configs([], [], kw)[QWEN3_5_SAMPLER]
+    """The request's sampler config, as the conductor converts Qwen3.5's settings."""
+    sampler = Sampler(QWEN3_5_SAMPLER, nodes={"LLM"}, vocab_size=model.config.vocab_size)
+    return sampling_configs(model.get_request_resource_configs([], [], kw), [sampler])[QWEN3_5_SAMPLER]
 
 
 def test_qwen3_5_request_kwargs_are_the_keys_it_reads():
@@ -428,7 +432,7 @@ def test_qwen3_5_enable_thinking_must_be_a_bool(bad):
 def test_qwen3_5_real_0_8b_has_no_generation_config_and_no_min_p_capability():
     model = Qwen3_5DenseModel(str(next(CACHED_0_8B.iterdir())))
     assert model.sampling_defaults == {}
-    spec = next(s for s in model.get_node_resources() if s.resource_key == QWEN3_5_SAMPLER)
+    spec = next(s for s in node_resources(model) if s.resource_key == QWEN3_5_SAMPLER)
     assert spec.enable_repetition_penalty and not spec.enable_min_p
 
 
@@ -459,6 +463,13 @@ def _omni_model(local_dir=None) -> Qwen3OmniModel:
 def omni_released(tmp_path):
     (tmp_path / "generation_config.json").write_text(json.dumps(OMNI_GENERATION_CONFIG))
     return _omni_model(tmp_path)
+
+
+def _omni_samplers(model, model_kwargs) -> dict[str, SamplingReqConfig]:
+    """The request's sampler configs, as the conductor converts Qwen3-Omni's settings."""
+    samplers = [Sampler(name, nodes={"Thinker"}, vocab_size=16) for name in (THINKER_SAMPLER, TALKER_SAMPLER,
+                                                                              CODE_PRED_SAMPLER)]
+    return sampling_configs(model.get_request_resource_configs([], [], model_kwargs), samplers)
 
 
 def _omni_talker_args(model, model_kwargs, output_modalities=("text", "audio")):
@@ -518,10 +529,10 @@ def test_qwen3_omni_plain_keys_target_the_thinker_and_prefixed_keys_win(omni_rel
 
 def test_qwen3_omni_code_predictor_gets_no_penalty_and_refuses_one(omni_released):
     spec = SimpleNamespace(enable_repetition_penalty=False, enable_min_p=False)
-    config = omni_released.get_request_resource_configs([], [], {})[CODE_PRED_SAMPLER]
+    config = _omni_samplers(omni_released, {})[CODE_PRED_SAMPLER]
     assert config.repetition_penalty == 1
     config.validate(spec)
-    asked = omni_released.get_request_resource_configs([], [], {"code_predictor_repetition_penalty": 1.2})
+    asked = _omni_samplers(omni_released, {"code_predictor_repetition_penalty": 1.2})
     with pytest.raises(ValueError, match="repetition_penalty"):
         asked[CODE_PRED_SAMPLER].validate(spec)
 
@@ -537,14 +548,17 @@ def test_qwen3_omni_checkpoint_min_p_turns_the_capability_on(tmp_path):
     )
     model.config = SimpleNamespace(
         thinker_text=text, talker_text=text, thinker_head_dim=8, talker_head_dim=8,
-        code_predictor=SimpleNamespace(vocab_size=16),
+        code_predictor=SimpleNamespace(vocab_size=16), num_code_groups=2,
+        audio_encoder=SimpleNamespace(encoder_layers=1, encoder_attention_heads=1, head_dim=8),
+        vision=SimpleNamespace(depth=1, num_heads=1, head_dim=8),
     )
-    model._encoder_resources = lambda: []  # the encoders' attention needs their configs
-    specs = {s.resource_key: s for s in model.get_node_resources() if isinstance(s, SamplerSpec)}
+    # the encoders' settings and the Thinker's LoRA spec need configs this one lacks
+    model.kernel_settings, model.get_node_resources = dict, list
+    specs = {s.resource_key: s for s in node_resources(model) if isinstance(s, SamplerSpec)}
     assert specs[THINKER_SAMPLER].enable_min_p and specs[TALKER_SAMPLER].enable_min_p
     assert not specs[CODE_PRED_SAMPLER].enable_min_p
     # a plain request takes those defaults and is not refused
-    for key, config in model.get_request_resource_configs([], [], {}).items():
+    for key, config in sampling_configs(model.get_request_resource_configs([], [], {}), model.declare_state()).items():
         config.validate(specs[key])
 
 

@@ -21,6 +21,7 @@ from mstar.engine.resources.linear_attn.gdn_kernels import (
     GDNPrefillPlan,
 )
 from mstar.platforms.compile import compiled
+from mstar.utils.h2d import to_device_nonblocking
 
 # Must match `BLOCK_M` in mstar/utils/causal_conv1d/kernels.py, which passes it
 # as an explicit constexpr rather than autotuning it.
@@ -103,6 +104,34 @@ class ConvMetadata:
     token_chunk_offset_ptr: torch.Tensor
 
 
+def _conv_programs(spans: Sequence[int]) -> tuple[list[int], list[int]]:
+    """The varlen conv kernel's programs over rows ``spans``: one per ``_CONV_BLOCK_M`` chunk of each
+    row, as (row, chunk) pairs."""
+    rows, offsets = [], []
+    for row, span in enumerate(spans):
+        chunks = -(-span // _CONV_BLOCK_M)  # ceil
+        rows.extend([row] * chunks)
+        offsets.extend(range(chunks))
+    return rows, offsets
+
+
+def conv_metadata(spans: Sequence[int], device: torch.device) -> ConvMetadata:
+    """``ConvMetadata`` for an eager conv over rows ``spans``, sized to them, uploaded in one copy:
+    without it the kernel builds it in its grid lambda, a host sync per call."""
+    rows, offsets = _conv_programs(spans)
+    block = to_device_nonblocking(np.array(rows + offsets, dtype=np.int32), device)
+    needed = len(rows)
+    batch_ptr, offset_ptr = block[:needed], block[needed:]
+    return ConvMetadata(
+        nums_dict={_CONV_BLOCK_M: {
+            "tot": needed, "mlist_len": needed, "mlist": None, "offsetlist": None,
+            "batch_ptr": batch_ptr, "token_chunk_offset_ptr": offset_ptr,
+        }},
+        batch_ptr=batch_ptr,
+        token_chunk_offset_ptr=offset_ptr,
+    )
+
+
 # Compiled: eager it is a launch per op. The caller marks only the token dim
 # dynamic (``compiled``'s ``dynamic_args``), so the head dim stays static.
 def _masked_rows(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -170,12 +199,7 @@ class GDNPrefillWrapper(GDNWrapper):
     ):
         # Build Launch geometry for this step's conv; see `ConvMetadata`
         block = _CONV_BLOCK_M
-        # one Triton program per BLOCK_M chunk of each row
-        rows, offsets = [], []
-        for row, span in enumerate(spans):
-            chunks = -(-span // block)  # ceil
-            rows.extend([row] * chunks)
-            offsets.extend(range(chunks))
+        rows, offsets = _conv_programs(spans)
 
         needed = len(rows)
         if self._accelerator_graph:
@@ -579,6 +603,11 @@ class GDNMixedWrapper(GDNWrapper):
     @property
     def takes_strided_inputs(self) -> bool:
         return self._staged
+    def halves(self) -> tuple[GDNDecodeWrapper, GDNPrefillWrapper, int]:
+        """The decode half, the chunked half, and the step's token the chunked half starts at
+        (past the decode run eagerly), which a step split over SP ranks runs apart
+        (`GDNManager.run`)."""
+        return self._decode, self._prefill, self._front
 
     def _buf(self, name: str, n: int, dtype: torch.dtype) -> torch.Tensor:
         """A device index buffer, sized once to the bucket under capture."""

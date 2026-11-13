@@ -19,7 +19,8 @@ from dataclasses import dataclass
 
 import torch
 
-from mstar.engine.resources.linear_attn.config import LinearAttnBackend, LinearAttnConfig
+from mstar.engine.resources.linear_attn.base import gather_rows, scatter_rows
+from mstar.engine.resources.linear_attn.config import LinearAttnBackend, LinearAttnConfig, bf16_gdn_state_fits
 from mstar.engine.resources.linear_attn.gdn_stage import gdn_stage_applies, stage_gdn_prefill_inputs
 from mstar.engine.resources.recurrent.config import DeltaNetGeometry
 from mstar.platforms import current_platform
@@ -64,6 +65,23 @@ class GDNDecodePlan:
 
     slots: torch.Tensor  # [n] int32, straight off the pool's addressing
     num_rows: int
+
+
+def gdn_kernel(name: str, device: torch.device):
+    """FlashInfer's GDN kernel ``name`` (its chunked prefill or its decode), or on a CPU tensor its
+    torch stand-in (`gdn_cpu`), so the resource's paths run in a test without a GPU; no CUDA tensor
+    reaches the stand-in."""
+    if device.type == "cpu":
+        from mstar.engine.resources.linear_attn import gdn_cpu
+
+        return getattr(gdn_cpu, name)
+    if name == "chunk_gated_delta_rule":
+        from flashinfer.gdn_prefill import chunk_gated_delta_rule
+
+        return chunk_gated_delta_rule
+    from flashinfer.gdn_decode import gated_delta_rule_decode_pretranspose
+
+    return gated_delta_rule_decode_pretranspose
 
 
 def _with_room(t: torch.Tensor, rows: int) -> torch.Tensor:
@@ -260,8 +278,8 @@ class FlashInferGDNKernels(GDNKernels):
                 f"gdn state dtype {state_dtype} is not supported: FlashInfer's "
                 "pool decode paths are fp32 and bf16."
             )
-        # The bf16 decode kernel is pool-only and K=V=128 only.
-        if geometry.head_k_dim != 128 or geometry.head_v_dim != 128:
+        # The bf16 decode kernel is pool-only.
+        if not bf16_gdn_state_fits(geometry.head_k_dim, geometry.head_v_dim):
             raise NotImplementedError(
                 f"a bf16 gdn state needs K=V=128, got K={geometry.head_k_dim} "
                 f"V={geometry.head_v_dim}; declare an fp32 pool instead."
@@ -314,35 +332,14 @@ class FlashInferPrefill(GDNPrefillKernel):
         """Unstaged, ``q``, ``k`` and ``v`` arrive with the padded tail zeroed
         (the tail can hold inf); only the gates' is zeroed here. The stage reads
         them through the token mask."""
-        from flashinfer.gdn_prefill import chunk_gated_delta_rule
+        chunk_gated_delta_rule = gdn_kernel("chunk_gated_delta_rule", q.device)
 
         slots = plan.slots.to(torch.int64)
 
-        # static per pool, so safe to branch on under capture
-        if not self._kernels.has_sink:
-            # Without a sink a padding row carries -1, which index_select and
-            # index_copy_ cannot take; point it at a live row's slot and mask.
-            live = slots >= 0
-            any_live = live.any()
-            ref = torch.argmax(live.to(torch.uint8)).view(1)
-            ref_slot = torch.index_select(slots, 0, ref).clamp_min(0)
-            addr = torch.where(live, slots, ref_slot)
-            carried = plan.has_state & live
-        else:
-            addr = slots
-            carried = plan.has_state
-
         # SM90 takes packed, sequence-ordered state (`state_indices` is
-        # SM100/SM103 only), so gather here and scatter back.
-        initial = torch.index_select(state, 0, addr).to(self._kernels.prefill_dtype)
-
-        # zero the rows that start fresh, by select rather than boolean mask:
-        # `initial[~mask] = 0` is a data-dependent shape and cannot be captured
-        initial = torch.where(
-            carried.view(-1, 1, 1, 1),
-            initial,
-            torch.zeros((), dtype=initial.dtype, device=initial.device),
-        )
+        # SM100/SM103 only), so gather here and scatter back. A row that starts
+        # fresh, or a padding row on -1 (no sink), gathers zeros.
+        initial = gather_rows(state, slots, plan.has_state).to(self._kernels.prefill_dtype)
 
         # One spare row per batch row, so the token `plan` hands each padding
         # row is addressable even when the real batch fills the bucket exactly.
@@ -387,16 +384,12 @@ class FlashInferPrefill(GDNPrefillKernel):
             **snapshot_args,
         )
 
-        if not self._kernels.has_sink:
-            # Padding rows write to `ref_slot` the live row's own result, or with
-            # no live row what is already there, so slot 0 is not disturbed.
-            padded = torch.where(
-                any_live,
-                torch.index_select(final, 0, ref),
-                torch.index_select(state, 0, ref_slot).to(final.dtype),
-            )
-            final = torch.where(live.view(-1, 1, 1, 1), final, padded)
-        state.index_copy_(0, addr, final.to(state.dtype))
+        # static per pool, so safe to branch on under capture: without a sink a
+        # padding row carries -1, which `scatter_rows` points at a live row's slot
+        if self._kernels.has_sink:
+            state.index_copy_(0, slots, final.to(state.dtype))
+        else:
+            scatter_rows(state, slots, final)
         if plan.every:
             index = plan.snapshot_index
             state.index_copy_(0, index[2], plan.checkpoints.index_select(0, index[0]).to(state.dtype))
@@ -416,7 +409,7 @@ class FlashInferDecode(GDNDecodeKernel):
         self.qk_l2norm_in_kernel = kernels.qk_l2norm
 
     def run(self, plan, q, k, v, a, b, state, a_log, dt_bias):
-        from flashinfer.gdn_decode import gated_delta_rule_decode_pretranspose
+        gated_delta_rule_decode_pretranspose = gdn_kernel("gated_delta_rule_decode_pretranspose", q.device)
 
         # Uninitialized output: the kernel writes every row, except one whose
         # slot is -1 (only with the sink off), which it would leave as found.
