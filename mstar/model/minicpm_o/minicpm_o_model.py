@@ -63,7 +63,11 @@ from mstar.model.components.token2wav.model import (
     LEAD_SILENCE,
     load_token2wav,
 )
-from mstar.model.components.token2wav.resources import check_token2wav_slots, token2wav_resources
+from mstar.model.components.token2wav.state import (
+    check_token2wav_slots,
+    token2wav_kernel_settings,
+    token2wav_state,
+)
 from mstar.model.components.token2wav.submodule import Token2WavSubmodule
 from mstar.model.minicpm_o import processor, weight_loader
 from mstar.model.minicpm_o.components.audio import MiniCPMOAudio
@@ -87,7 +91,9 @@ from mstar.model.minicpm_o.config import (
     RESAMPLER_KV,
     RESAMPLER_QUERIES,
     SPEECH_TEXT_TOKENS,
+    T2W_ATTN,
     T2W_KV,
+    T2W_REQUEST,
     T2W_STATE,
     TTS_ATTN,
     TTS_DECODE,
@@ -134,7 +140,7 @@ TTS_SAMPLING = TTSSampling()
 VOICES = {"default": "HT_ref_audio.wav"}
 DEFAULT_VOICE = "default"
 T2W_DEFAULT_SLOTS = 9
-T2W_KEYS = Token2WavKeys(codes="tts_code", state=T2W_STATE, kv=T2W_KV)
+T2W_KEYS = Token2WavKeys(codes="tts_code", state=T2W_STATE, request=T2W_REQUEST, kv=T2W_KV, attn=T2W_ATTN)
 # PagedKVConfig's default, which `kernel_settings` sets on the TTS's pool so that `validate_config_yaml` checks the
 # pool the engine builds
 TTS_KV_PAGES = 2048
@@ -218,8 +224,8 @@ class MiniCPMOModel(Model):
         self._voices: dict[str, torch.Tensor] = {}
 
     def validate_config_yaml(self, config: dict, config_path: str) -> None:
-        """A spoken reply holds a slot of each ``t2w_*`` resource, so one count sizes
-        them all: ``t2w_state`` has one more (its sink). Set apart, the smallest caps
+        """A spoken reply holds a slot of each ``t2w_*`` array, so one count sizes
+        them all: each slot Value has one more (its sink). Set apart, the smallest caps
         concurrent spoken replies and the rest strand ~0.4 GiB a slot.
 
         The vocoder's slots don't hold back the TTS: it takes every spoken reply the
@@ -286,12 +292,9 @@ class MiniCPMOModel(Model):
             # upstream's TTS sampling (see TTSSubmodule)
             Sampler(TTS_SAMPLER, nodes={TTS}, vocab_size=tts.num_audio_tokens, penalty=False, eos_ids=(tts.eos_code,),
                     repetition_window=TTS_SAMPLING.penalty_window, top_p_first=True),
+            # ~0.4 GB a slot (one speaking request) for the bundled voices
+            *token2wav_state(T2W_KEYS, TOKEN2WAV, self._voice_seconds()),
         ]
-
-    def get_node_resources(self):
-        # Token2Wav's specs stay hand-written (see docs/adding_models.rst). ~0.4 GB a slot (one speaking request)
-        # for the bundled voices; `t2w_state.max_slots` in the yaml sizes it.
-        return token2wav_resources(T2W_KEYS, TOKEN2WAV, self._voice_seconds(), T2W_DEFAULT_SLOTS)
 
     def kernel_settings(self) -> dict[str, dict[str, Any]]:
         return {
@@ -299,6 +302,7 @@ class MiniCPMOModel(Model):
             # request with more runs eagerly
             AUDIO_ATTN: {"max_segments_per_request": 4},
             TTS_KV: {"max_num_pages": TTS_KV_PAGES},
+            **token2wav_kernel_settings(T2W_KEYS, T2W_DEFAULT_SLOTS),
         }
 
     def _voice_seconds(self) -> tuple[float, float]:

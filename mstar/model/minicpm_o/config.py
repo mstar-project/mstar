@@ -27,9 +27,12 @@ AUDIO_ATTN = "audio_attn"
 TTS_KV = "tts_kv"
 TTS_ATTN = "tts_attn"
 TTS_SAMPLER = "tts_sampler"
-T2W_STATE = "t2w_state"
-# token2wav attention caches, one resource per ``token2wav.CACHE_FAMILIES`` entry
+# token2wav's slots, one Value per ``token2wav.SLOT_PARTS`` entry, and its host fields
+T2W_STATE = {"conv": "t2w_conv", "vocoder": "t2w_vocoder", "tail": "t2w_tail"}
+T2W_REQUEST = "t2w_request"
+# token2wav attention caches, one array per ``token2wav.CACHE_FAMILIES`` entry, and their reads
 T2W_KV = {"enc1": "t2w_enc1_kv", "enc2": "t2w_enc2_kv", "dit": "t2w_dit_kv"}
+T2W_ATTN = {"enc1": "t2w_enc1_attn", "enc2": "t2w_enc2_attn", "dit": "t2w_dit_attn"}
 
 # the LLM's decode loop, which the KV layout and loop caps name
 DECODE_LOOP = "decode_loop"

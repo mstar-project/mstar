@@ -45,8 +45,6 @@ from mstar.model.minicpm_o.config import (
     PATCHES,
     QUERIES,
     RESAMPLER_ATTN,
-    T2W_KV,
-    T2W_STATE,
     TTS_ATTN,
     TTS_DECODE,
     TTS_KV,
@@ -54,7 +52,7 @@ from mstar.model.minicpm_o.config import (
     TTS_SAMPLER,
     VISION_ATTN,
 )
-from mstar.model.minicpm_o.minicpm_o_model import AUDIO, LLM, TTS, TTS_SAMPLING, VISION
+from mstar.model.minicpm_o.minicpm_o_model import AUDIO, LLM, TOKEN2WAV, TTS, TTS_SAMPLING, VISION
 from mstar.model.minicpm_o.submodules import AudioEncoderSubmodule, LLMSubmodule, TTSSubmodule, VisionEncoderSubmodule
 from mstar.model.submodule_base import ARNodeInputs, NodeInputs
 
@@ -97,13 +95,13 @@ def _reference(model) -> list:
 
 def test_specs_equal_the_hand_written_ones(tmp_path):
     model = a_model(tmp_path)
-    skipped = {"tts_pos", *(spec.resource_key for spec in model.get_node_resources())}
+    skipped = {"tts_pos", *(spec.resource_key for spec in node_resources(model) if TOKEN2WAV in spec.nodes)}
     declared = {spec.resource_key: spec for spec in node_resources(model) if spec.resource_key not in skipped}
     assert declared == {spec.resource_key: spec for spec in _reference(model)}
 
 
-def test_the_port_writes_only_token2wav_by_hand(tmp_path):
-    assert {spec.resource_key for spec in a_model(tmp_path).get_node_resources()} == {T2W_STATE, *T2W_KV.values()}
+def test_minicpm_o_writes_no_spec_by_hand(tmp_path):
+    assert not a_model(tmp_path).get_node_resources()
 
 
 def test_the_declarations_have_no_problems(tmp_path):

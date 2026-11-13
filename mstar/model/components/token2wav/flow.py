@@ -8,8 +8,8 @@ Ported from Step-Audio2's ``CausalMaskedDiffWithXvec`` (``cosyvoice2/flow/flow.p
 The reference keeps its streaming caches in buffers shared by every caller. Here every
 attention layer is handed a ``KVCache`` saying where its keys|values live: ``DenseKV`` over a
 request's own cache tensor (any window, one request; ops, operand layouts and concatenation
-orders follow the reference so the result is bit-identical), or ``BoundedLayerKV`` on the
-engine's bounded KV resource (a batch of windows at any positions, capturable).
+orders follow the reference so the result is bit-identical), or ``HandleLayerKV`` through its
+array's handle (a batch of windows at any positions, capturable).
 
 Classifier-free guidance runs the conditional and unconditional rows of a request side by side
 (rows ``2b`` and ``2b + 1``), which is also how the DiT caches store them.
@@ -71,34 +71,48 @@ class DenseKV:
             self.buf[:, :, n:k.shape[2]] = torch.cat((k[:, :, n:], v[:, :, n:]), dim=-1)
 
 
-class BoundedLayerKV:
-    """One layer's cache on the engine's bounded KV resource, for the rows its step
-    planned (at any positions): ``source [voices, rows, H, L, 2d]`` the layer's voices in
-    stream order (``token2wav.CACHE_FAMILIES``)."""
+class HandleLayerKV:
+    """One layer's cache through its array's handle, for the rows the step planned (at any
+    positions). ``rows`` query rows make one row of the array: the DiT's guidance rows ride
+    as heads, which attention runs apart, so the fold is exact. ``max_keys`` is the most
+    entries a row keeps before a step."""
 
-    def __init__(self, resource, layer_idx: int, source: torch.Tensor):
-        self.resource = resource
-        self.layer_idx = layer_idx
-        self.source = source
+    def __init__(self, handle, layer: int, rows: int, max_keys: int):
+        self.handle = handle
+        self.layer = layer
+        self.rows = rows
+        self.max_keys = max_keys
 
-    def retained(self) -> torch.Tensor:
-        """``[rows]`` each row's retained entries, which is also its noise offset."""
-        return self.resource.current.retained()
+    def attend_folded(
+        self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, rel_bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """``q, k, v [N, H, T, d]`` -> ``[N / rows, T, rows * H, d]``, a request's rows side by
+        side at each step, as the read returns them."""
+        n, h, t, d = q.shape
+        b = n // self.rows
 
-    @property
-    def max_keys(self) -> int:
-        """The most keys a row retains (before this step's own)."""
-        return self.resource.config.max_retained
+        def rows_as_heads(x: torch.Tensor) -> torch.Tensor:
+            return x.reshape(b, self.rows * h, t, d).transpose(1, 2)
+
+        self.handle.add(self.layer, k=rows_as_heads(k), v=rows_as_heads(v))
+        bias = {} if rel_bias is None else {"distance_bias": rel_bias}
+        return self.handle.read(self.layer, rows_as_heads(q), **bias)
 
     def attend(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, rel_bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """``q, k, v [N, H, T, d]`` -> ``[N, T, H, d]``."""
-        return self.resource.attend(self.layer_idx, q, k, v, self.source, rel_bias=rel_bias)
+        out = self.attend_folded(q, k, v, rel_bias)
+        if self.rows == 1:
+            return out
+        n, h, t, d = q.shape
+        # Copy back to contiguous rows. A strided input sends the projection after attention
+        # through another matmul, which rounds differently.
+        return out.view(n // self.rows, t, self.rows, h, d).transpose(1, 2).contiguous().view(n, t, h, d)
 
 
 # what an attention layer is handed
-KVCache = DenseKV | BoundedLayerKV
+KVCache = DenseKV | HandleLayerKV
 
 
 class FlowKV(NamedTuple):
@@ -178,7 +192,7 @@ class RelPositionAttention(nn.Module):
             self._bands[(t, width)] = band
         return band
 
-    def _attend_bounded(self, q, k, v, pe: torch.Tensor, kv: BoundedLayerKV) -> torch.Tensor:
+    def _attend_bounded(self, q, k, v, pe: torch.Tensor, kv: HandleLayerKV) -> torch.Tensor:
         b, t = q.shape[:2]
         band = self._band(pe, t, kv.max_keys + 2 * t - 1)
         bd = torch.matmul((q + self.pos_bias_v).transpose(1, 2), band)  # [B, H, T, width]
@@ -187,12 +201,12 @@ class RelPositionAttention(nn.Module):
 
     def forward(self, x: torch.Tensor, pos_emb: torch.Tensor, kv: KVCache) -> torch.Tensor:
         """``x [B, T, D]``; this chunk's keys/values go after the cached ones. On a
-        ``BoundedLayerKV`` ``pos_emb`` is the whole table (``StreamingTokenEncoder.pe``)."""
+        ``HandleLayerKV`` ``pos_emb`` is the whole table (``StreamingTokenEncoder.pe``)."""
         b, t, _ = x.shape
         q = self.linear_q(x).view(b, -1, self.h, self.d_k)
         k = self.linear_k(x).view(b, -1, self.h, self.d_k).transpose(1, 2)
         v = self.linear_v(x).view(b, -1, self.h, self.d_k).transpose(1, 2)
-        if isinstance(kv, BoundedLayerKV):
+        if isinstance(kv, HandleLayerKV):
             return self._attend_bounded(q, k, v, pos_emb, kv)
         cached = kv.read()
         if cached is not None:
@@ -308,7 +322,7 @@ class StreamingTokenEncoder(nn.Module):
         ``kv1`` / ``kv2``: one cache per 25 Hz / 50 Hz layer. The reference positions the 25 Hz
         stage at ``len2 // 2``, which equals ``len1`` because ``len2 == 2 * len1`` on entry."""
         # on bounded caches each row's positions come from its own plan
-        bounded = isinstance(kv1[0], BoundedLayerKV)
+        bounded = isinstance(kv1[0], HandleLayerKV)
         if not bounded:
             len1, len2 = kv1[0].length, kv2[0].length
             assert len2 == UP_RATE * len1, (len1, len2)
@@ -379,7 +393,7 @@ class DiTAttention(nn.Module):
         q = self.q_norm(self._heads(self.to_q(x)))
         k = self.k_norm(self._heads(self.to_k(x)))
         v = self._heads(self.to_v(x))
-        if isinstance(kv, BoundedLayerKV):
+        if isinstance(kv, HandleLayerKV):
             return self.proj(kv.attend(q, k, v).reshape(b, t, -1))
         cached = kv.read()
         if cached is not None:
@@ -500,7 +514,7 @@ class DiT(nn.Module):
         """``x, mu, cond [N, 80, T]``, ``spks [N, 80]``; ``mods [depth, 9, r, 1, 512]`` /
         ``final_mod [2, r, 1, 512]`` the step's time modulations (``ChunkCFM.constants``),
         ``cnn_cache [depth, N, 1024, 2]`` and ``kv`` (one per block) its caches."""
-        if x.is_cuda and kv and isinstance(kv[0], BoundedLayerKV):
+        if x.is_cuda and kv and isinstance(kv[0], HandleLayerKV):
             from mstar.model.components.token2wav.kernels import dit_forward
 
             return dit_forward(self, x, mu, mods, final_mod, spks, cond, cnn_cache, kv)
@@ -574,14 +588,15 @@ class ChunkCFM(nn.Module):
         cond: torch.Tensor,
         cnn_cache: torch.Tensor,
         kv: list[list[KVCache]],
+        noise_offsets: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """``mu, cond [B, 80, T]``, ``spks [B, 80]``; ``cnn_cache [steps, depth, 2B, 1024, 2]``
         and ``kv`` (per step, per block) over the ``2B`` guidance rows. A row's cache length
-        is its noise offset: shared by the rows of dense caches, per row on bounded ones."""
+        is its noise offset: shared by the rows of dense caches, and ``noise_offsets [B]``
+        on handles."""
         b, t = mu.shape[0], mu.size(2)
-        if isinstance(kv[0][0], BoundedLayerKV):
-            offsets = kv[0][0].retained()[:b].long()
-            index = offsets[:, None] + torch.arange(t, device=mu.device)
+        if noise_offsets is not None:
+            index = noise_offsets[:, None] + torch.arange(t, device=mu.device)
             x = self.rand_noise[0][:, index].transpose(0, 1).contiguous()
         else:
             n_cached = kv[0][0].length
@@ -630,13 +645,15 @@ class Token2WavFlow(nn.Module):
         enc_cnn: torch.Tensor,
         dit_cnn: torch.Tensor,
         kv: FlowKV,
+        noise_offsets: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """``tokens [B, T]`` (int) -> mel ``[B, 80, 2 (T - 3)]`` (``2T`` when ``last_chunk``).
         ``spk [B, 80]`` is ``project_speaker``'s output, ``cond`` the prompt mel when
         building a voice's caches, else zeros. ``enc_cnn [B, 512, 6]`` and ``dit_cnn [steps,
-        depth, 2B, 1024, 2]`` are updated in place, the attention caches through ``kv``."""
+        depth, 2B, 1024, 2]`` are updated in place, the attention caches through ``kv``, whose
+        handles take each row's DiT kept count in ``noise_offsets [B]``."""
         h = self.encoder(self.input_embedding(tokens), last_chunk, enc_cnn, kv.enc1, kv.enc2)
         h = self.encoder_proj(h)
         if cond is None:
             cond = torch.zeros_like(h).transpose(1, 2).contiguous()
-        return self.decoder(h.transpose(1, 2).contiguous(), spk, cond, dit_cnn, kv.dit)
+        return self.decoder(h.transpose(1, 2).contiguous(), spk, cond, dit_cnn, kv.dit, noise_offsets)

@@ -1550,7 +1550,10 @@ writes none), unmasked, and its writes land after. Pass
 from shared prefixes that the slots should not copy; each row reads the one its
 ``StreamPosition.source`` names, so rows of different prefixes share a batch and a graph. ``rel_bias`` adds a term that depends only on
 the query-key distance, for Transformer-XL-style relative positions. A streaming vocoder
-like MiniCPM-o's token2wav fits three of them: its two conformer caches and its DiT's.
+like MiniCPM-o's token2wav fits three of them: its two conformer caches and its DiT's. It
+declares each as an ``Array`` with ``max_len=None`` and a kept-window read
+(``token2wav_state`` in ``mstar/model/components/token2wav/state.py``): its voices' prompts
+are the arrays' starts, and the DiT's two guidance rows are heads of one entry.
 
 Two flags cover retention rules that are not quite a token FIFO.
 ``SinkWindow(window_includes_step=True)`` counts the step's own tokens toward the window.
@@ -2515,12 +2518,6 @@ holds each ported package to that.
 Qwen3-TTS's ``batch_postprocess`` keeps the opt-in watermark's per-stream state in
 ``request_state`` under one named lint exception, until it moves to a watermark node's plain
 Value (issue #1447).
-MiniCPM-o's Token2Wav node, in ``mstar/model/components/token2wav``, which the lint doesn't
-read, isn't on the contract yet: it reads ``request_state`` and its resources directly, and
-``get_node_resources`` returns its hand-written slot pool and three bounded caches. Each cache
-keeps a sink and a window and starts from a voice prompt that every request in the voice
-shares, and the DiT's holds two rows a request, which no contract array declares yet. A
-follow-up issue moves the node onto the contract.
 
 ``ModelInputsFromEngine`` carries six other useful fields:
 
