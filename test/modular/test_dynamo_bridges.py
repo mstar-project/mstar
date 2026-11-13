@@ -1110,30 +1110,54 @@ def test_realtime_refused_format_is_not_applied(tmp_path, fmt):
         assert wf.getframerate() == 24000 and wf.readframes(wf.getnframes()) == PCM
 
 
-def test_the_worker_builds_its_server_on_the_deployment_config(monkeypatch, tmp_path):
-    """Without it a Dynamo worker had no prefix-cache keys, LoRA adapters or request limits."""
+def _build_server(monkeypatch, tmp_path, config, idle_hold="off"):
+    """Run the Dynamo worker's ``build_server`` on ``config`` with the model,
+    server, conductor and CPU setup stubbed; returns what it built and what it
+    held."""
     import yaml
 
     from mstar.api_server import entrypoint
     from mstar.integrations.dynamo import worker
 
-    config = {"model": "whisper_large", "preprocess_torch_threads": None, "max_call_input_mb": 1}
     path = tmp_path / "c.yaml"
     path.write_text(yaml.safe_dump(config))
-    seen = {}
-    model = SimpleNamespace()
-    monkeypatch.setattr("mstar.model.registry.get_model_class", lambda name: lambda **kw: model)
+    seen = {"held": 0}
+
+    def hold_idle():
+        seen["held"] += 1
+        return "held"
+
+    monkeypatch.setattr("mstar.model.registry.get_model_class", lambda name: lambda **kw: SimpleNamespace())
     monkeypatch.setattr(entrypoint, "deployment_cpu_plan", lambda c: None)
-    monkeypatch.setattr(worker.cpus, "install", lambda plan: None)
+    monkeypatch.setattr(entrypoint.cpus, "install", lambda plan: None)
+    monkeypatch.setattr(entrypoint.cpus, "hold_idle", hold_idle)
+    monkeypatch.setattr(entrypoint.knobs, "idle_hold", lambda: idle_hold)
     monkeypatch.setattr(entrypoint, "APIServer", lambda **kw: seen.setdefault("server", SimpleNamespace(**kw)))
     monkeypatch.setattr(worker.mp, "get_context", lambda method: SimpleNamespace(Process=lambda **kw: seen.setdefault(
         "conductor", SimpleNamespace(start=lambda: None, pid=1, **kw))))
+    # build_server keeps the API key from the processes it starts by popping it
+    monkeypatch.delenv("MSTAR_API_KEY", raising=False)
     worker.build_server(SimpleNamespace(
         config=str(path), cache_dir=None, socket_path_prefix="p", upload_dir="u", timeout=1,
         tensor_comm_protocol="TCP", log_level="INFO"))
+    return seen
+
+
+def test_the_worker_builds_its_server_on_the_deployment_config(monkeypatch, tmp_path):
+    """Without it a Dynamo worker had no prefix-cache keys, LoRA adapters or request limits."""
+    config = {"model": "whisper_large", "preprocess_torch_threads": None, "max_call_input_mb": 1}
+    seen = _build_server(monkeypatch, tmp_path, config)
     assert seen["server"].model_config == config
     # the conductor reads the same config, which the server resolved (``resolve_lora_spec``)
     assert seen["conductor"].kwargs == {"model_config": config}
+
+
+@pytest.mark.parametrize("hold", ["qos", "off"])
+def test_the_worker_takes_the_idle_hold_the_config_asks_for(monkeypatch, tmp_path, hold):
+    """``knobs: idle_hold: qos`` holds the CPUs out of deep idle for the
+    worker's life, as it does for the native server."""
+    seen = _build_server(monkeypatch, tmp_path, {"model": "whisper_large", "preprocess_torch_threads": None}, hold)
+    assert seen["held"] == (1 if hold == "qos" else 0)
 
 
 def test_the_worker_runs_the_deployment_s_warmups_before_it_serves(monkeypatch):
