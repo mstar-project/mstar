@@ -57,6 +57,7 @@ from mstar.model.base import (
     WalkStep,
 )
 from mstar.model.media_limits import read_image
+from mstar.model.praxis1.components.commands import compose_commands
 from mstar.model.praxis1.components.proprio import normalized_proprio
 from mstar.model.praxis1.config import Praxis1Config, Praxis1ConfigError
 from mstar.model.praxis1.submodules import (
@@ -92,7 +93,7 @@ class Praxis1Model(Model):
 
     ENCODE_TEXT_WALK = "encode_text"
     CHUNK_WALK = "chunk"
-    PREPROCESS_ONLY_KWARGS = (STATE_KWARG,)
+    PREPROCESS_ONLY_KWARGS = (STATE_KWARG, "action_format", "pose_descriptor", "control_mode")
 
     def __init__(
         self,
@@ -310,7 +311,9 @@ class Praxis1Model(Model):
         # The sampler knobs come from the deployment YAML. What a request
         # carries is the arm's pose, how much of the last chunk it ran, and
         # optionally fewer Euler steps than the deployment's recipe.
-        return frozenset({STATE_KWARG, "executed_rows", "num_steps"})
+        return frozenset({
+            STATE_KWARG, "executed_rows", "num_steps", "action_format", "pose_descriptor", "control_mode",
+        })
 
     def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
         """The denoise loop runs the deployment's ``num_steps``, or the request's if fewer.
@@ -353,8 +356,21 @@ class Praxis1Model(Model):
         self, output: torch.Tensor, modality: str, request_kwargs: dict | None = None
     ) -> bytes:
         if modality == "action":
-            # float32 rows, as the openpi wire wants them.
-            return output.detach().cpu().to(torch.float32).numpy().tobytes()
+            rows = output.detach().cpu().to(torch.float32).numpy()
+            kwargs = request_kwargs or {}
+            output_format = kwargs.get("action_format", "openpi")
+            if output_format == "openpi":
+                return rows.tobytes()
+            if output_format == "positronic":
+                from mstar.api_server.openpi import pack
+
+                commands = compose_commands(
+                    rows, kwargs.get(STATE_KWARG), self.config.embodiment,
+                    fps=self.config.grid_hz, descriptor=kwargs.get("pose_descriptor", ""),
+                    control_mode=kwargs.get("control_mode", "none"),
+                )
+                return pack(commands)
+            raise ValueError(f"unsupported Praxis-1 action format {output_format!r}")
         raise ValueError(f"Unsupported modality for Praxis-1: {modality!r}")
 
     def process_prompt(
