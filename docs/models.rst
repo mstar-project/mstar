@@ -2436,6 +2436,41 @@ Deployment knobs (``model_kwargs``; the SP configs set ``compile``, ``vae_tile_b
   over 8 VBench prompts; ``{threshold: 0.03, max_skip_steps: 2}`` computes 24, 38.0 s, at
   24.7 dB and 0.829; ``{threshold: 0.01, max_skip_steps: 1}`` computes 33, 1.45x, at
   28.5 dB and 0.896.
+  At the default 768p clip use the table calibrated there,
+  ``mag_ratios: "1344x768x124"`` (``configs/minimax_h3_1gpu.yaml``). On one B300, 50
+  points, 8 VBench prompts, against the dense clip (126.5 s; bit-identical across boots):
+
+  .. list-table::
+     :header-rows: 1
+
+     * - ``step_cache`` (with that table)
+       - steps computed
+       - s/clip
+       - PSNR (dB)
+       - SSIM
+       - LPIPS
+     * - ``{threshold: 0.01, max_skip_steps: 1}``
+       - 31 of 49
+       - 80.4 (1.56x)
+       - 27.7
+       - 0.883
+       - 0.082
+     * - ``{threshold: 0.03, max_skip_steps: 2}``
+       - 24
+       - 63.1 (1.98x)
+       - 25.7
+       - 0.852
+       - 0.101
+     * - ``{threshold: 0.06, max_skip_steps: 3}``
+       - 20
+       - 53.3 (2.35x)
+       - 24.8
+       - 0.824
+       - 0.125
+
+  SGLang's Cache-DiT on the same GPU, prompts and seeds, against its own dense clip, is
+  2.10x at 19.8 dB / 0.733 / 0.238 (``SGLANG_CACHE_DIT_RDT=0.08``) and 2.82x at
+  17.4 dB / 0.636 / 0.350 (its default).
 
 **FastH3** (``distilled_checkpoint``; ``configs/minimax_h3_fasth3.yaml``, one B300):
 FastVideo's ``FastVideo/FastVideo-FastH3-8-Step-V2`` is the DiT distilled with DMD2 to 8

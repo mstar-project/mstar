@@ -414,10 +414,17 @@ def audio_latent_num_frames(num_frames: int) -> int:
 # MagCache tables for the DiT's opt-in step cache (``step_cache`` in model_kwargs), by name: the residual magnitude
 # ratio per step of a dense run, logged by ``{method: magcache_calibrate}``. "default" is 50 sigma points (49 steps) at
 # 832x480x124: the mean over 9 VBench prompts on an H200 (the prompts' tables differ by under 0.012 per step up to
-# step 44, 0.03 at the last).
+# step 44, 0.03 at the last). "1344x768x124" is the same at the default 768p clip, on one B300 (within 0.012 per step
+# of "default"; the two pick different steps at the same threshold).
 MAG_RATIOS: dict[str, tuple[float, ...]] = {"default": (
     1.0, 1.01652, 1.01393, 1.01425, 1.01119, 1.01121, 1.01226, 1.01007, 1.00951, 1.01045, 1.01024, 1.01365, 1.00825,
     1.00995, 1.00849, 1.0063, 1.00979, 1.00785, 1.01023, 1.00972, 1.0084, 1.00895, 1.0065, 1.00733, 1.0099, 1.00828,
     1.00829, 1.01073, 1.00948, 1.00752, 1.00888, 1.01014, 1.00698, 1.00898, 1.01058, 1.00625, 1.00862, 1.00868,
     1.00844, 1.0081, 1.00986, 1.00641, 1.00711, 1.00558, 0.9983, 1.00084, 0.99087, 0.97868, 0.9366,
+),
+    "1344x768x124": (
+    1.0, 1.01852, 1.01365, 1.01308, 1.012, 1.01181, 1.01296, 1.01042, 1.00951, 1.011, 1.00839, 1.01098, 1.00783,
+    1.00948, 1.00799, 1.00692, 1.00959, 1.00765, 1.00979, 1.00851, 1.00779, 1.00955, 1.00743, 1.00726, 1.00999,
+    1.00849, 1.00813, 1.0107, 1.00893, 1.00719, 1.00883, 1.01068, 1.00746, 1.00904, 1.01098, 1.00711, 1.00938,
+    1.00876, 1.00875, 1.00784, 1.00979, 1.00613, 1.00653, 1.00581, 0.99837, 1.00028, 0.98951, 0.97371, 0.9248,
 )}
