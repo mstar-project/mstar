@@ -162,26 +162,34 @@ class DeepseekV41Attention(nn.Module):
     def bind_resources(self, resources: dict) -> None:
         self._csa, self._state = resources[CSA], resources[STATE]
 
-    def _window(self, kv: torch.Tensor, rows) -> tuple[torch.Tensor, torch.Tensor]:
-        """The rows each query's window holds, as ``(rows, idx)`` for the CSA resource: the
-        step's own ``kv`` and, for positions before the step, the request's ring in ``STATE``
+    def _window(self, kv: torch.Tensor, rows) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """The rows each query's window holds, as ``(rows, idx, columns)`` for the CSA resource:
+        the step's own ``kv`` and, for positions before the step, the request's ring in ``STATE``
         (a token at position p sits in ring slot ``p % window``). Then the ring takes the
-        step's last ``window`` rows."""
+        step's last ``window`` rows.
+
+        The columns are laid out as the checkpoint's reference lays them, since the softmax
+        accumulates over a row's entries in blocks: a prompt's row has as many columns as the
+        prompt has tokens, up to the window, from its oldest row on; a decode row has the whole
+        ring, oldest first, the slots not yet filled leading."""
         win = self.window
         ring = self._state.gather(WINDOW, self.layer, label=LABEL)  # (requests, window, D)
         requests = ring.shape[0]
         row = torch.arange(kv.shape[0], device=kv.device)
-        back = torch.arange(win, device=kv.device)
-        pos = rows.pos[:, None] - back[None, :]
-        in_step = (row - rows.first)[:, None] >= back[None, :]
-        from_ring = rows.row_req[:, None] * win + pos % win
-        idx = torch.where(in_step, requests * win + row[:, None] - back[None, :], from_ring)
-        idx = torch.where(pos >= 0, idx, -1)
+        col = torch.arange(win, device=kv.device)[None, :]
+        start = rows.pos - (row - rows.first)
+        decode = (rows.req_rows[rows.row_req] == 1) & (start > 0)
+        columns = torch.where(decode, win, rows.end.clamp_max(win))
+        pos = torch.where(decode, rows.pos - win + 1, (rows.pos - win + 1).clamp_min(0))[:, None] + col
+        held = (pos >= 0) & (pos <= rows.pos[:, None]) & (col < columns[:, None])
+        in_step = requests * win + rows.first[:, None] + pos - start[:, None]
+        in_ring = rows.row_req[:, None] * win + pos % win
+        idx = torch.where(held, torch.where(pos >= start[:, None], in_step, in_ring), -1)
         source = torch.cat([ring.flatten(0, 1), kv], dim=0)
         tail = rows.pos >= rows.end - win
         ring[rows.row_req[tail], rows.pos[tail] % win] = kv[tail].to(ring.dtype)
         self._state.scatter_(WINDOW, ring, self.layer, label=LABEL)
-        return source, idx
+        return source, idx, columns
 
     def _select(self, x, q_latent, latent, rows, rope: Rope, angles, shared: SharedSelection):
         """This layer's pick of the compressed cache: its own indexer's, or the last one's."""
@@ -195,7 +203,8 @@ class DeepseekV41Attention(nn.Module):
         q, w = self.indexer.query(x, q_latent, angles)
         scores = self._csa.scores(ratio, self.plane, q, w, label=LABEL)
         if self.comm_group.world_size > 1:
-            scores = self.comm_group.all_reduce(scores)
+            # the ranks' sum, rounded as one rank's scores are
+            scores = self.comm_group.all_reduce(scores).to(x.dtype).float()
         keep = None
         if self.is_candidate_source:
             shared.candidates = self._csa.candidates(
@@ -213,7 +222,7 @@ class DeepseekV41Attention(nn.Module):
         q_latent = self.q_norm(self.wq_a(x))
         q = rotate_tail(self.wq_b(q_latent).unflatten(-1, (self.num_heads, self.head_dim)), angles)
         kv = round_fp8(rotate_tail(self.kv_norm(self.wkv(x)), angles), self.block)
-        window, window_idx = self._window(kv, rows)
+        window, window_idx, window_cols = self._window(kv, rows)
 
         slots = None
         if compressed:
@@ -222,7 +231,7 @@ class DeepseekV41Attention(nn.Module):
             if latent is not None:
                 latent = rotate_tail(latent, rope.angles(rows.pos + 1 - self.ratio, True))
                 self._csa.write(self.ratio, self.plane, latent=latent, label=LABEL)
-        out = self._csa.attend(q, self.attn_sink, window, window_idx, self.ratio, self.plane, slots)
+        out = self._csa.attend(q, self.attn_sink, window, window_idx, window_cols, self.ratio, self.plane, slots)
         # the cache holds rotated latents, so the output carries the query's rotation
         out = rotate_tail(out, angles, inverse=True)
 

@@ -33,9 +33,6 @@ import torch.multiprocessing as mp
 
 PROMPT, STEPS = 45, 14
 TP2 = dict(moe_intermediate_size=64, o_lora_rank=32)
-# the reduced model at widths the reference's own kernels compile for
-KERNEL_WIDTHS = dict(hidden_size=128, head_dim=64, qk_rope_head_dim=16, q_lora_rank=64, o_lora_rank=64,
-                     index_head_dim=64, moe_intermediate_size=64, engram_head_dim=64)
 # (name, the node group's expert split, model kwargs) of each two-rank run
 TP2_RUNS = (("sliced-experts", "tp", {}), ("whole-experts", "ep", {}), ("host-engram", "tp", {"engram_tables": "host"}))
 
@@ -240,7 +237,7 @@ def _kernel_rows(args, rows: dict[str, dict], device: str) -> None:
     standin = T.load_reference(args.reference)
     real = T.load_reference(args.reference, _real_kernels(args.reference))
     with tempfile.TemporaryDirectory() as tmp:
-        config, tokenizer = T.write_snapshot(tmp, DeepseekV41Config.reduced(**KERNEL_WIDTHS), seed=0)
+        config, tokenizer = T.write_snapshot(tmp, DeepseekV41Config.reduced(**T.KERNEL_WIDTHS), seed=0)
         ids = T.random_ids(config, PROMPT + STEPS, seed=1)
         want16 = _reference_run(real, tmp, config, tokenizer, ids, PROMPT, torch.bfloat16, device)
         same16 = _reference_run(standin, tmp, config, tokenizer, ids, PROMPT, torch.bfloat16, device)

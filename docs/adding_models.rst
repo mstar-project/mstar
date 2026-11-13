@@ -944,9 +944,14 @@ The spec types are:
        512-wide latent where bf16 takes 1,024, reading the rounded values back; the cache then
        declares its row widths as those bytes in its own elements (checked at build). ``select``
        takes each row's top ``topk`` groups, equal scores to the earlier one, optionally
-       inside a ``candidates`` mask of best blocks (a two-level selection); ``attend`` takes
-       the window rows from the model, which keeps them wherever it likes (a recurrent pool
-       block, for one). The torch reference: eager only, no captured graphs.
+       inside a ``candidates`` mask of best blocks (a two-level selection), and hands them
+       back in position order; ``scores`` computes in the queries' dtype, so in bf16
+       near-equal scores round together as in the model's reference. ``attend`` takes the
+       window rows from the model, which keeps them wherever it likes (a recurrent pool
+       block, for one), and how many of their columns each row has; its softmax accumulates
+       over a row's entries (the window columns, then the picks) ``softmax_block`` at a time,
+       each block's probabilities rounded to the queries' dtype, the arithmetic of the kernel
+       DeepSeek-V4.1 was served with. The torch reference: eager only, no captured graphs.
    * - ``DSASpec(config=DSAConfig(kv_cache=..., topk=...))``
      - DeepSeek sparse attention (DSA) over the named ``KVLayout.MLA`` cache: past ``topk``
        keys, each query row attends only the ``topk`` tokens its indexer scores highest.

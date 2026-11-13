@@ -13,7 +13,37 @@ from mstar.model.deepseek_v41.components.linear import RMSNorm
 from mstar.model.deepseek_v41.components.moe import DeepseekV41MoE
 from mstar.model.deepseek_v41.components.rope import Rope
 from mstar.model.deepseek_v41.config import ENGRAM, DeepseekV41Config
-from mstar.model.glm5_next.mhc import Glm5NextHyperConnection
+
+
+class HyperConnection(nn.Module):
+    """One hyper-connection site: from the live streams, the weights that collapse them into a
+    sublayer's input (``pre``), place its output (``post``) and mix the streams (``comb``, made
+    doubly stochastic by Sinkhorn steps). In fp32, in the order the checkpoint's reference
+    computes it: the streams are projected and then scaled by their RMS, not normalized first."""
+
+    def __init__(self, config: DeepseekV41Config) -> None:
+        super().__init__()
+        self.hc, self.eps, self.rms_eps = config.hc_mult, config.hc_eps, config.rms_norm_eps
+        self.iters = config.hc_sinkhorn_iters
+        mix = (2 + self.hc) * self.hc
+        self.fn = nn.Parameter(torch.empty(mix, self.hc * config.hidden_size, dtype=torch.float32))
+        self.base = nn.Parameter(torch.empty(mix, dtype=torch.float32))
+        self.scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
+
+    def weights(self, streams: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """``streams (T, hc, hidden)`` -> ``pre (T, hc)``, ``post (T, hc)``, ``comb (T, hc, hc)``."""
+        hc, eps = self.hc, self.eps
+        flat = streams.flatten(1).float()
+        mixes = F.linear(flat, self.fn) * torch.rsqrt(flat.square().mean(-1, keepdim=True) + self.rms_eps)
+        pre = torch.sigmoid(mixes[..., :hc] * self.scale[0] + self.base[:hc]) + eps
+        post = 2 * torch.sigmoid(mixes[..., hc:2 * hc] * self.scale[1] + self.base[hc:2 * hc])
+        comb = (mixes[..., 2 * hc:] * self.scale[2] + self.base[2 * hc:]).unflatten(-1, (hc, hc))
+        comb = comb.softmax(-1) + eps
+        comb = comb / (comb.sum(-2, keepdim=True) + eps)
+        for _ in range(self.iters - 1):
+            comb = comb / (comb.sum(-1, keepdim=True) + eps)
+            comb = comb / (comb.sum(-2, keepdim=True) + eps)
+        return pre, post, comb
 
 
 def collapse(streams: torch.Tensor, pre: torch.Tensor) -> torch.Tensor:
@@ -23,9 +53,9 @@ def collapse(streams: torch.Tensor, pre: torch.Tensor) -> torch.Tensor:
 
 def update(streams: torch.Tensor, out: torch.Tensor, post: torch.Tensor, comb: torch.Tensor) -> torch.Tensor:
     """A sublayer's output written back: placed by ``post``, the streams mixed by ``comb``, in
-    fp32 as the checkpoint was trained."""
-    mixed = torch.matmul(comb.transpose(-1, -2), streams.float())
-    return (post.unsqueeze(-1) * out.float().unsqueeze(-2) + mixed).to(streams.dtype)
+    fp32 and summed stream by stream, as the reference sums it."""
+    mixed = torch.sum(comb.unsqueeze(-1) * streams.unsqueeze(-2), dim=1)
+    return (post.unsqueeze(-1) * out.unsqueeze(-2) + mixed).to(out.dtype)
 
 
 class DeepseekV41Block(nn.Module):
@@ -41,23 +71,17 @@ class DeepseekV41Block(nn.Module):
         self.ffn = DeepseekV41MoE(config, comm_group, moe_parallel)
         self.attn_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.ffn_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.hc_attn = self._site(config)
-        self.hc_ffn = self._site(config)
-
-    @staticmethod
-    def _site(config: DeepseekV41Config) -> Glm5NextHyperConnection:
-        return Glm5NextHyperConnection(
-            hidden_size=config.hidden_size, hc_mult=config.hc_mult, hc_eps=config.hc_eps,
-            hc_sinkhorn_iters=config.hc_sinkhorn_iters, rms_norm_eps=config.rms_norm_eps)
+        self.hc_attn = HyperConnection(config)
+        self.hc_ffn = HyperConnection(config)
 
     def forward(self, streams: torch.Tensor, pre: torch.Tensor, rope: Rope,
                 shared: SharedSelection) -> tuple[torch.Tensor, torch.Tensor]:
         """``streams (T, hc, hidden)`` and the collapse weights for this block's attention;
         returns the streams and the weights for the next block's."""
-        attn_pre, post, comb = (w.squeeze(0) for w in self.hc_attn.weights(streams.unsqueeze(0)))
+        attn_pre, post, comb = self.hc_attn.weights(streams)
         out = self.attn(self.attn_norm(collapse(streams, pre)), rope, shared)
         streams = update(streams, out, post, comb)
-        ffn_pre, post, comb = (w.squeeze(0) for w in self.hc_ffn.weights(streams.unsqueeze(0)))
+        ffn_pre, post, comb = self.hc_ffn.weights(streams)
         out = self.ffn(self.ffn_norm(collapse(streams, attn_pre)))
         return update(streams, out, post, comb), ffn_pre
 

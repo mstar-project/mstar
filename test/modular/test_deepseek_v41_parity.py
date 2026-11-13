@@ -26,7 +26,7 @@ from mstar.model.deepseek_v41._testing import add_request, cpu_engine, run_reque
 from mstar.model.deepseek_v41._testing import logit_gap as _gap
 from mstar.model.deepseek_v41._testing import random_ids as _ids
 from mstar.model.deepseek_v41.components import attention
-from mstar.model.deepseek_v41.config import MOE_EXPERTS, DeepseekV41Config
+from mstar.model.deepseek_v41.config import CSA, MOE_EXPERTS, DeepseekV41Config
 
 REFERENCE_DIR = os.environ.get("DSV41_REFERENCE_DIR")
 pytestmark = [
@@ -114,12 +114,27 @@ class TestParity:
         assert torch.equal(got.argmax(-1), want.argmax(-1))
         assert _gap(got, want) < FP32_TOL, _gap(got, want)
 
-    def test_bf16_stays_within_the_references_own_spread(self, reference, snapshot, tmp_path, monkeypatch):
-        """bf16 as shipped. With random weights at this size nothing has a margin, so a
-        rounding moves a top-k and the logits with it: the reference itself moves by 2.6 to
-        4.3 sigma when only its attention kernel is swapped for an exact softmax (seeds 0-2).
-        M* is held to that spread, which shows it runs in bf16, not that it is right: the
-        fp32 case above is the gate, and bf16 parity needs real weights."""
+    @pytest.mark.parametrize("seed", [0, 1])
+    def test_bf16_logits_are_the_references_bit_for_bit(self, reference, tmp_path, seed):
+        """bf16 as shipped, where every rounding counts: the attention's block-wise softmax and
+        its entry order, the norm's one rounding, the hyper-connection's operation order and the
+        index scores in bf16 are each the reference's, so the logits are too. On the wider
+        reduced model; the reference's kernels are their torch stand-ins."""
+        config, tokenizer = _testing.write_snapshot(
+            tmp_path / "snap", DeepseekV41Config.reduced(**_testing.KERNEL_WIDTHS), seed=seed)
+        ids = _ids(config, PROMPT + STEPS, seed=seed + 1)
+        snapshot = (tmp_path / "snap", config, tokenizer)
+        want = _reference_run(reference, snapshot, tmp_path / "ref", torch.bfloat16, ids, PROMPT)
+        engine, sampler, _ = cpu_engine(tmp_path / "snap", torch.bfloat16)
+        assert torch.equal(run_request(engine, sampler, ids, PROMPT), want)
+
+    def test_bf16_at_the_smallest_widths_stays_within_the_references_own_spread(
+            self, reference, snapshot, tmp_path, monkeypatch):
+        """At the default reduced widths bf16 index scores tie, and the reference takes
+        ``torch.topk``'s order among equal scores where M* takes the earlier group: a row's
+        pick can differ, and with random weights at this size the logits with it. The reference
+        itself moves by 2.6 to 4.3 sigma when only its attention kernel is swapped for an exact
+        softmax (seeds 0-2); M* is held inside that."""
         ids = _ids(snapshot[1], PROMPT + STEPS, seed=1)
         want = _reference_run(reference, snapshot, tmp_path / "a", torch.bfloat16, ids, PROMPT)
         monkeypatch.setattr(reference.model, "sparse_attn", _exact_sparse_attn)
@@ -129,7 +144,7 @@ class TestParity:
         assert torch.isfinite(got).all()
         spread = _gap(other, want)
         assert spread > 0  # the two reference kernels did differ
-        assert _gap(got, want) < 2 * spread, (_gap(got, want), spread)
+        assert _gap(got, want) < spread, (_gap(got, want), spread)
 
     def test_two_requests_in_one_step_each_match_their_own_reference(
             self, reference, snapshot, fp32_reference, tmp_path):
@@ -204,6 +219,42 @@ def test_the_checkpoints_tokenizer_compresses_to_the_vocabulary_its_tables_were_
     lookup, count = compressed_token_map(AutoTokenizer.from_pretrained(REFERENCE_DIR))
     config = DeepseekV41Config.from_hf_config(json.loads((Path(REFERENCE_DIR) / "config.json").read_text()))
     assert (len(lookup), count) == (config.vocab_size, config.engram_compressed_vocab_size)
+
+
+@pytest.fixture(scope="module")
+def wide(reference, tmp_path_factory):
+    """The wider reduced model, a prompt and four decode steps, and the reference's bf16 logits."""
+    path = tmp_path_factory.mktemp("dsv41-wide")
+    config, tokenizer = _testing.write_snapshot(path, DeepseekV41Config.reduced(**_testing.KERNEL_WIDTHS), seed=0)
+    ids = _ids(config, PROMPT + 4, seed=1)
+    want = _reference_run(reference, (path, config, tokenizer), path / "ref", torch.bfloat16, ids, PROMPT)
+    return path, ids, want
+
+
+class TestTheBf16GateCanFail:
+    """What bf16 bit-identity hangs on, each changed alone: the logits are no longer the reference's."""
+
+    def _logits(self, wide, edit=None):
+        path, ids, _ = wide
+        engine, sampler, _ = cpu_engine(path, torch.bfloat16)
+        if edit is not None:
+            edit(engine)
+        return run_request(engine, sampler, ids, PROMPT)
+
+    def test_as_built_they_are(self, wide):
+        assert torch.equal(self._logits(wide), wide[2])
+
+    def test_with_the_softmax_in_other_blocks(self, wide):
+        def edit(engine):  # a row has 16 entries here: 4 blocks of them where the reference has one
+            engine._resources[CSA].config.softmax_block = 4
+
+        assert not torch.equal(self._logits(wide, edit), wide[2])
+
+    def test_with_the_index_scores_in_fp32(self, wide, monkeypatch):
+        scores = csa_manager.CSAManager.scores
+        monkeypatch.setattr(csa_manager.CSAManager, "scores", lambda self, ratio, plane, q, w, **k: scores(
+            self, ratio, plane, q.float(), w.float(), **k))
+        assert not torch.equal(self._logits(wide), wide[2])
 
 
 class TestTheGateCanFail:

@@ -20,6 +20,12 @@ import torch
 from mstar.model.deepseek_v41.config import DeepseekV41Config
 from mstar.utils.mx_round import pack_e2m1, pow2_ceil, quant_fp4, quant_fp8, round_e2m1, unpack_e2m1
 
+# The reduced model at widths the reference's own kernels compile for (their attention tiles a
+# head in 64s). Also the least width at which bf16 index scores rarely tie: at the default
+# reduced widths a row's pick can hang on the order ``torch.topk`` gives equal scores.
+KERNEL_WIDTHS = dict(hidden_size=128, head_dim=64, qk_rope_head_dim=16, q_lora_rank=64, o_lora_rank=64,
+                     index_head_dim=64, moe_intermediate_size=64, engram_head_dim=64)
+
 FP8 = torch.float8_e4m3fn
 E8M0 = torch.float8_e8m0fnu
 FP4X2 = torch.float4_e2m1fn_x2

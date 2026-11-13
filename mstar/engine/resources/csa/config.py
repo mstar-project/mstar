@@ -55,6 +55,10 @@ class CSAConfig:
     # and the resource reads them as bytes.
     latent_rows: Fp4Rows | None = None
     key_rows: Fp4Rows | None = None
+    # the softmax runs over a row's entries a block of this many at a time, each block's
+    # probabilities rounded to the queries' dtype before they weight the entries: the arithmetic
+    # of the kernel DeepSeek-V4.1 was served with, which its logits in bf16 depend on
+    softmax_block: int = 64
     # bytes of fp32 scores one selection launch holds, and of gathered rows one attention launch
     score_bytes: int = 256 << 20
     attend_bytes: int = 256 << 20

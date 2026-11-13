@@ -271,10 +271,11 @@ class CSAManager(Resource):
 
     def scores(self, ratio: int, plane: int, q: torch.Tensor, w: torch.Tensor,
                label: str | None = None) -> torch.Tensor:
-        """``[rows, groups]`` fp32 indexer scores of each row against its request's keys in
-        ``plane`` of the ``ratio`` cache, ``sum_h w[h] * relu(q[h] . key)``; -inf past the groups
-        the row sees. ``q (rows, heads, index_head_dim)``, ``w (rows, heads)`` with every scale
-        folded in."""
+        """``[rows, groups]`` indexer scores of each row against its request's keys in ``plane``
+        of the ``ratio`` cache, ``sum_h w[h] * relu(q[h] . key)``; -inf past the groups the row
+        sees. ``q (rows, heads, index_head_dim)``, ``w (rows, heads)`` with every scale folded
+        in. Computed in ``q``'s dtype, as the model's reference scores, and returned in fp32:
+        in bf16 near-equal scores round together, and which rows a query picks follows."""
         rows = self.current(label)
         view = self._cache(ratio).aux_view(INDEX_PLANES, plane)
         flat = view.view(-1, view.shape[-1])
@@ -291,9 +292,9 @@ class CSAManager(Resource):
                 for c0 in range(0, q.shape[0], chunk):
                     c1 = min(c0 + chunk, q.shape[0])
                     slots = rows.slots(ratio, rows.row_req[c0:c1, None], group[None, :])
-                    keys = _load(flat[slots], self.config.key_rows, q.shape[-1])
-                    dots = torch.einsum("rhd,rjd->rhj", q[c0:c1].float(), keys).relu_()
-                    out[c0:c1] = torch.einsum("rh,rhj->rj", w[c0:c1].float(), dots)
+                    keys = _load(flat[slots], self.config.key_rows, q.shape[-1]).to(q.dtype)
+                    dots = torch.einsum("rhd,rjd->rhj", q[c0:c1], keys).relu_()
+                    out[c0:c1] = (dots * w[c0:c1].unsqueeze(-1)).sum(dim=1)
                 return out.masked_fill_(group[None, :] >= seen[:, None], -torch.inf)
             for req, (r0, n, start) in enumerate(rows.spans):
                 count = (start + n) // ratio  # groups the span's last row sees
@@ -301,11 +302,12 @@ class CSAManager(Resource):
                     continue
                 req_ids = torch.full((count,), req, dtype=torch.long, device=q.device)
                 keys = _load(flat[rows.slots(ratio, req_ids, group[:count])], self.config.key_rows, q.shape[-1])
+                keys = keys.to(q.dtype)
                 chunk = max(1, self.config.score_bytes // (4 * heads * count))
                 for c0 in range(r0, r0 + n, chunk):
                     c1 = min(c0 + chunk, r0 + n)
-                    dots = torch.einsum("rhd,jd->rhj", q[c0:c1].float(), keys).relu_()
-                    out[c0:c1, :count] = torch.einsum("rh,rhj->rj", w[c0:c1].float(), dots)
+                    dots = torch.einsum("rhd,jd->rhj", q[c0:c1], keys).relu_()
+                    out[c0:c1, :count] = (dots * w[c0:c1].unsqueeze(-1)).sum(dim=1)
         return out.masked_fill_(group[None, :] >= seen[:, None], -torch.inf)
 
     def candidates(self, ratio: int, scores: torch.Tensor, topk_blocks: int, block_size: int,
@@ -317,43 +319,67 @@ class CSAManager(Resource):
                label: str | None = None) -> torch.Tensor:
         """``[rows, k]`` slots, in the ``ratio`` cache, of each row's top ``topk`` groups by
         ``scores`` (within ``keep``, a ``candidates`` mask; equal scores to the earlier group),
-        -1 where a row sees fewer."""
+        in the groups' order, then -1 where a row sees fewer."""
         rows = self.current(label)
         if keep is not None:
             scores = scores.masked_fill(~keep[:, :scores.shape[1]], -torch.inf)
         values, indices = top_scores(scores, min(self.config.topk, scores.shape[1]))
-        live = values > -torch.inf
+        # by position, as the softmax's blocks take them; the groups a row does not see last
+        indices = torch.where(values > -torch.inf, indices, scores.shape[1]).sort(dim=-1).values
+        live = indices < scores.shape[1]
         return torch.where(live, rows.slots(ratio, rows.row_req[:, None], torch.where(live, indices, 0)), -1)
 
-    def attend(self, q: torch.Tensor, sink: torch.Tensor, window: torch.Tensor,
-               window_idx: torch.Tensor, ratio: int | None = None, plane: int | None = None,
+    def attend(self, q: torch.Tensor, sink: torch.Tensor, window: torch.Tensor, window_idx: torch.Tensor,
+               window_cols: torch.Tensor, ratio: int | None = None, plane: int | None = None,
                slots: torch.Tensor | None = None) -> torch.Tensor:
-        """``[rows, heads, D]``: each row's heads over its window rows ``window[window_idx]``
-        (``window (m, D)``, ``window_idx (rows, w)``, -1 none) and its ``slots`` of ``plane``'s
-        latents in the ``ratio`` cache (``select``'s, -1 none), one softmax at
-        ``config.sm_scale`` with ``sink (heads,)`` in its denominator. A row with nothing to
-        attend gets zeros."""
-        width = q.shape[-1]
+        """``[rows, heads, D]``: each row's heads over its entries, one softmax at
+        ``config.sm_scale`` with ``sink (heads,)`` in its denominator. A row's entries are its
+        window rows ``window[window_idx[:window_cols]]`` (``window (m, D)``, ``window_idx (rows,
+        w)``, -1 an empty column) and then its ``slots`` of ``plane``'s latents in the ``ratio``
+        cache (``select``'s, -1 none). The softmax accumulates over them ``config.softmax_block``
+        at a time, so where a row's entries sit decides which share a block. A row with nothing
+        to attend gets zeros."""
+        count, heads, width = q.shape
         latent = None
+        picks = 0 if slots is None else slots.shape[1]
         if slots is not None:
             view = self._cache(ratio).layer_view(plane)
             latent = view.view(-1, view.shape[-1])
-        entries = window_idx.shape[1] + (0 if slots is None else slots.shape[1])
-        chunk = max(1, self.config.attend_bytes // (8 * max(entries, 1) * width))
+        # each row's entries packed: its window columns, then its picks
+        col = torch.arange(window_idx.shape[1] + picks, device=q.device)[None, :]
+        at = col.clamp_max(window_idx.shape[1] - 1).expand(count, -1)
+        from_window = torch.where(col < window_cols[:, None], window_idx.gather(1, at), -1)
+        from_cache = None
+        if slots is not None:
+            pick = col - window_cols[:, None]
+            from_cache = torch.where((pick >= 0) & (pick < picks), slots.gather(1, pick.clamp(0, picks - 1)), -1)
+        block = self.config.softmax_block
+        chunk = max(1, self.config.attend_bytes // (8 * block * width))
         out = torch.empty_like(q)
-        sink = sink.float()[None, :, None]
+        sink = sink.float()[None, :]
         with torch.autocast(q.device.type, enabled=False):
-            for c0 in range(0, q.shape[0], chunk):
-                c1 = min(c0 + chunk, q.shape[0])
-                idx = window_idx[c0:c1]
-                rows, valid = window[idx.clamp_min(0)].float(), idx >= 0
-                if latent is not None:
-                    picked = slots[c0:c1]
-                    rows = torch.cat(
-                        [rows, _load(latent[picked.clamp_min(0)], self.config.latent_rows, width)], dim=1)
-                    valid = torch.cat([valid, picked >= 0], dim=1)
-                logits = torch.einsum("rhd,rkd->rhk", q[c0:c1].float(), rows) * self.config.sm_scale
-                logits = logits.masked_fill(~valid[:, None, :], -torch.inf)
-                prob = torch.cat([logits, sink.expand(c1 - c0, -1, 1)], dim=-1).softmax(-1)[..., :-1]
-                out[c0:c1] = torch.einsum("rhk,rkd->rhd", prob, rows).to(out.dtype)
+            for c0 in range(0, count, chunk):
+                c1 = min(c0 + chunk, count)
+                query = q[c0:c1].float()
+                acc = torch.zeros(c1 - c0, heads, width, dtype=torch.float32, device=q.device)
+                total = torch.zeros(c1 - c0, heads, dtype=torch.float32, device=q.device)
+                peak = torch.full_like(total, -1e30)
+                for b0 in range(0, col.shape[1], block):
+                    idx = from_window[c0:c1, b0:b0 + block]
+                    valid = idx >= 0
+                    entries = window[idx.clamp_min(0)].float() * valid[..., None]
+                    if from_cache is not None:
+                        picked = from_cache[c0:c1, b0:b0 + block]
+                        live = picked >= 0
+                        entries = entries + _load(
+                            latent[picked.clamp_min(0)], self.config.latent_rows, width) * live[..., None]
+                        valid = valid | live
+                    scores = torch.einsum("rhd,rkd->rhk", query, entries) * self.config.sm_scale
+                    scores = scores.masked_fill(~valid[:, None, :], -torch.inf)
+                    last, peak = peak, torch.maximum(peak, scores.amax(-1))
+                    decay = torch.exp(last - peak)
+                    prob = torch.exp(scores - peak[..., None])
+                    total = total * decay + prob.sum(-1)
+                    acc = acc * decay[..., None] + torch.einsum("rhk,rkd->rhd", prob.to(q.dtype).float(), entries)
+                out[c0:c1] = (acc / (total + torch.exp(sink - peak))[..., None]).to(out.dtype)
         return out
