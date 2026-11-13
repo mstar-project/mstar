@@ -12,7 +12,7 @@ from mstar.engine.resources.step import Segment, StepContext, SubmoduleStep
 from mstar.engine.state import Array, ArrayStep, Block, Entry, KVEntry, Read, TensorType, Window
 from mstar.engine.state.adapters import DENSE_WINDOW, PAGED, build_specs, node_handles, state_steps, storage_of
 from mstar.engine.state.episodes import EpisodeRowBindings
-from mstar.utils.ipc_format import EndEpisode, RemoveRequest
+from mstar.utils.ipc_format import EndEpisode, RemoveRequest, WorkerMessage, WorkerMessageType
 from mstar.worker.input_ingest import InputIngest
 from mstar.worker.step_pipeline import StepPipeline
 
@@ -78,6 +78,20 @@ def test_a_live_request_or_another_episode_cannot_take_an_owned_slot():
         rows.bind(32, 5, "robot-b")
     with pytest.raises(ValueError, match="owns slot 5, not 6"):
         rows.bind(32, 6, "robot-a")
+
+
+def test_idle_slot_is_available_only_to_its_current_episode():
+    rows = EpisodeRowBindings()
+    assert rows.slot_available(2, "a")
+    rows.bind(11, 2, "a")
+    assert not rows.slot_available(2, "a")
+    rows.unbind(11)
+    assert rows.slot_available(2, "a")
+    assert not rows.slot_available(2, "b")
+    assert not rows.slot_available(2, None)
+    rows.end("a")
+    assert rows.slot_available(2, "b")
+    assert rows.slot_available(2, None)
 
 
 @pytest.mark.parametrize("handle,slot,episode", [
@@ -214,6 +228,150 @@ def test_failed_warm_step_keeps_the_previous_episode_window():
     pool.commit(resumed.steps["frames"], resumed.ctx)
     resumed.commit_calls()
     resumed.end_calls()
+
+
+def _text_embeds():
+    return Array(
+        "text_embeds", nodes={"backbone"}, layers={0}, labels={"cond", "blank"},
+        entry=Entry({"h": TensorType((2,), dtype=torch.float32)}),
+        max_len=None, reads={"history": Read(mask=Window(3))}, lifetime="episode",
+    )
+
+
+def test_dense_episode_step_keeps_two_labels_separate_across_calls_and_rollback():
+    embeds = _text_embeds()
+    (spec,) = build_specs([embeds])
+    assert spec.config.usable_slots == 2
+    pool = DenseWindowPool.build(spec, EngineResourceInfo(device=torch.device("cpu")))
+    owners = EpisodeRowBindings()
+    handle = node_handles(SimpleNamespace(declare_state=lambda: [embeds]), "backbone",
+                          {"text_embeds": pool})["text_embeds"]
+
+    def open_request(rid):
+        pool.ingest_request(rid)
+        binding = owners.bind(rid, 0, "episode-a")
+        pool.bind_episode(rid, 0, "episode-a", cold=binding.cold, reset=False)
+
+    def start(rid, cond_span, blank_span):
+        step = state_steps(SubmoduleStep(
+            segments=[Segment(rid, "cond", cond_span), Segment(rid, "blank", blank_span)],
+            state={"text_embeds": ArrayStep()},
+        ), {"text_embeds": handle}, graph_walk="backbone")
+        step.set_ctx(StepContext(request_ids=[rid], graph_walk="backbone", slot=0, capture=False))
+        assert pool.admit(step.steps["text_embeds"], step.ctx).ok
+        pool.plan(step.steps["text_embeds"], step.ctx)
+        step.begin_calls()
+        return step
+
+    def commit(step):
+        step.check_calls()
+        pool.commit(step.steps["text_embeds"], step.ctx)
+        step.commit_calls()
+        step.end_calls()
+
+    cond = torch.tensor([[1., 1.], [2., 2.]])
+    blank = torch.tensor([[8., 8.]])
+    open_request(1)
+    first = start(1, 2, 1)
+    handle.add(0, h=torch.cat((cond, blank)))
+    reached = handle.read(0)
+    assert reached.row_offsets.tolist() == [0, 2, 3]
+    assert torch.equal(reached.fields["h"], torch.cat((cond, blank)))
+    commit(first)
+    assert (pool.logical_length(1, "cond"), pool.logical_length(1, "blank"), pool.held(1)) == (2, 1, 3)
+    pool.remove_request(1)
+    owners.unbind(1)
+
+    open_request(2)
+    warm = start(2, 0, 0)
+    reached = handle.read(0)
+    assert reached.row_offsets.tolist() == [0, 2, 3]
+    assert torch.equal(reached.fields["h"], torch.cat((cond, blank)))
+    commit(warm)
+
+    failed = start(2, 2, 1)
+    changed = torch.tensor([[9., 9.], [10., 10.], [11., 11.]])
+    handle.add(0, h=changed)
+    assert handle.read(0).row_offsets.tolist() == [0, 3, 5]
+    pool.rollback_admit(failed.steps["text_embeds"], failed.ctx)
+    failed.end_calls()
+    pool.remove_request(2)
+    owners.unbind(2)
+
+    open_request(3)
+    resumed = start(3, 0, 0)
+    reached = handle.read(0)
+    assert reached.row_offsets.tolist() == [0, 2, 3]
+    assert torch.equal(reached.fields["h"], torch.cat((cond, blank)))
+    commit(resumed)
+
+    newest = torch.tensor([[3., 3.], [4., 4.], [5., 5.]])
+    wrapped = start(3, 3, 0)
+    handle.add(0, h=newest)
+    reached = handle.read(0)
+    assert reached.row_offsets.tolist() == [0, 3, 4]
+    assert torch.equal(reached.fields["h"], torch.cat((newest, blank)))
+    commit(wrapped)
+    assert (pool.logical_length(3, "cond"), pool.logical_length(3, "blank"), pool.held(3)) == (5, 1, 4)
+
+
+def test_dense_episode_multilabel_packs_mixed_requests_and_enforces_slot_pressure():
+    embeds = _text_embeds()
+    (spec,) = build_specs([embeds], kernel_settings={"text_embeds": {"max_slots": 5}})
+    pool = DenseWindowPool.build(spec, EngineResourceInfo(device=torch.device("cpu")))
+    for rid in (1, 2, 3):
+        pool.ingest_request(rid)
+    handle = node_handles(SimpleNamespace(declare_state=lambda: [embeds]), "backbone",
+                          {"text_embeds": pool})["text_embeds"]
+    segments = [Segment(1, "cond", 2), Segment(2, "cond", 1),
+                Segment(1, "blank", 1), Segment(2, "blank", 2)]
+    step = state_steps(SubmoduleStep(segments=segments, state={"text_embeds": ArrayStep()}),
+                       {"text_embeds": handle}, graph_walk="backbone")
+    step.set_ctx(StepContext(request_ids=[1, 2], graph_walk="backbone", slot=0, capture=False))
+    assert pool.admit(step.steps["text_embeds"], step.ctx).ok
+    pool.plan(step.steps["text_embeds"], step.ctx)
+    step.begin_calls()
+    values = torch.arange(6, dtype=torch.float32)[:, None].expand(-1, 2).clone()
+    handle.add(0, h=values)
+    reached = handle.read(0)
+    assert reached.row_offsets.tolist() == [0, 2, 3, 4, 6]
+    assert torch.equal(reached.fields["h"], values)
+    step.check_calls()
+    pool.commit(step.steps["text_embeds"], step.ctx)
+    step.commit_calls()
+    step.end_calls()
+    assert pool.held(1) == pool.held(2) == 3
+
+    pressure = state_steps(SubmoduleStep(
+        segments=[Segment(3, "cond", 1), Segment(3, "blank", 1)],
+        state={"text_embeds": ArrayStep()},
+    ), {"text_embeds": handle}, graph_walk="backbone")
+    pressure.set_ctx(StepContext(request_ids=[3], graph_walk="backbone", slot=0, capture=False))
+    assert not pool.admit(pressure.steps["text_embeds"], pressure.ctx).ok
+    pool.rollback_admit(pressure.steps["text_embeds"], pressure.ctx)
+
+    warm = state_steps(SubmoduleStep(
+        segments=[Segment(1, "cond", 0), Segment(2, "cond", 0),
+                  Segment(1, "blank", 0), Segment(2, "blank", 0)],
+        state={"text_embeds": ArrayStep()},
+    ), {"text_embeds": handle}, graph_walk="backbone")
+    warm.set_ctx(StepContext(request_ids=[1, 2], graph_walk="backbone", slot=0, capture=False))
+    assert pool.admit(warm.steps["text_embeds"], warm.ctx).ok
+    pool.plan(warm.steps["text_embeds"], warm.ctx)
+    warm.begin_calls()
+    assert torch.equal(handle.read(0).fields["h"], values)
+    warm.check_calls()
+    pool.commit(warm.steps["text_embeds"], warm.ctx)
+    warm.commit_calls()
+    warm.end_calls()
+
+    captured = state_steps(SubmoduleStep(
+        segments=[Segment(1, "cond", 0), Segment(1, "blank", 0)],
+        state={"text_embeds": ArrayStep()},
+    ), {"text_embeds": handle}, graph_walk="backbone")
+    captured.set_ctx(StepContext(request_ids=[1], graph_walk="backbone", slot=0, capture=True))
+    with pytest.raises(ValueError, match="cannot replay a capture"):
+        captured.begin_calls()
 
 
 def test_dense_window_refuses_rebuild_drop_without_mutating_history():
@@ -491,7 +649,7 @@ def test_end_waits_for_an_unadmitted_episode_queued_behind_a_busy_slot():
     ingest = object.__new__(InputIngest)
     ingest._pending_episode_requests = {0: [queued]}
     busy = True
-    ingest._engines = SimpleNamespace(episode_slot_busy=lambda slot: busy)
+    ingest._engines = SimpleNamespace(episode_slot_available=lambda slot, episode: not busy)
     admitted = []
     ingest._add_new_request = admitted.append
 
@@ -532,7 +690,7 @@ def test_deferred_episode_new_request_replays_all_partitions_then_next_call():
     second_partition = SimpleNamespace(request_id="call-a")
     next_call = SimpleNamespace(request_id="call-b")
     ingest._pending_episode_requests = {2: [first, second_partition, next_call]}
-    ingest._engines = SimpleNamespace(episode_slot_busy=lambda slot: False)
+    ingest._engines = SimpleNamespace(episode_slot_available=lambda slot, episode: True)
     replayed = []
     ingest._add_new_request = replayed.append
     ingest.retry_episode_requests()
@@ -547,7 +705,7 @@ def test_remove_then_new_in_one_worker_batch_waits_for_drained_release():
     ingest._pending_episode_requests = {}
     ingest._runtime = SimpleNamespace(get_rid_handle=lambda wire: 11 if wire == "old" else None)
     busy = True
-    ingest._engines = SimpleNamespace(episode_slot_busy=lambda slot: busy)
+    ingest._engines = SimpleNamespace(episode_slot_available=lambda slot, episode: not busy)
     removed = []
     ingest._lifecycle = SimpleNamespace(remove=lambda rid, body, seq: removed.append((rid, seq)))
     ingest._lockstep = SimpleNamespace(last_consumed_seq=3)
@@ -557,6 +715,43 @@ def test_remove_then_new_in_one_worker_batch_waits_for_drained_release():
     ingest._add_new_request(next_call)
     assert ingest._pending_episode_requests == {2: [next_call]}
     busy = False  # `_release_request` has finished on this worker.
+    replayed = []
+    ingest._add_new_request = replayed.append
+    ingest.retry_episode_requests()
+    assert replayed == [next_call]
+
+
+def test_idle_end_then_new_in_one_worker_batch_waits_for_slot_release():
+    rows = EpisodeRowBindings()
+    rows.bind(11, 2, "old")
+    rows.unbind(11)
+    ingest = object.__new__(InputIngest)
+    ingest._pending_episode_requests = {}
+    ingest._runtime = SimpleNamespace(get_rid_handle=lambda wire: None)
+
+    ingest._engines = SimpleNamespace(
+        episode_slot_busy=rows.slot_busy,
+        episode_slot_available=lambda slot, episode_id: rows.idle_slot("old") is None,
+    )
+    ends = []
+    ingest._lifecycle = SimpleNamespace(
+        end_episode=ends.append,
+        takes_input=lambda wire: pytest.fail("new call admitted before old episode ended"),
+    )
+    ingest._handlers = {
+        WorkerMessageType.END_EPISODE: ingest._end_episode,
+        WorkerMessageType.NEW_REQUEST: ingest._add_new_request,
+    }
+    old_end = EndEpisode("old", 2)
+    next_call = SimpleNamespace(request_id="new", episode_id="new", episode_slot=2)
+    ingest._dispatch([
+        WorkerMessage(WorkerMessageType.END_EPISODE, old_end),
+        WorkerMessage(WorkerMessageType.NEW_REQUEST, next_call),
+    ])
+    assert ends == [old_end]
+    assert ingest._pending_episode_requests == {2: [next_call]}
+
+    rows.end("old")
     replayed = []
     ingest._add_new_request = replayed.append
     ingest.retry_episode_requests()

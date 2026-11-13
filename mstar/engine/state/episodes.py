@@ -77,6 +77,14 @@ class EpisodeRowBindings:
         with self._lock:
             return slot in self._active_by_slot
 
+    def slot_available(self, slot: int, episode_id: str | None) -> bool:
+        """Whether this episode may start a new request in the assigned slot."""
+        with self._lock:
+            return slot not in self._active_by_slot and (
+                slot not in self._owner_by_slot
+                or (episode_id is not None and self._owner_by_slot[slot] == episode_id)
+            )
+
     def unbind(self, request_handle: int) -> EpisodeBinding:
         """Detach a request, releasing its slot only if it was temporary."""
         with self._lock:

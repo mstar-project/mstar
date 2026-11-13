@@ -73,7 +73,7 @@ class DenseWindowPool(RecurrentStatePool):
 
     def held(self, rid: str) -> int:
         """Entries a later read can still reach, after the last committed step."""
-        return min(self.logical_length(rid, self.config.labels[0]), self.window_size)
+        return sum(min(self.logical_length(rid, label), self.window_size) for label in self.config.labels)
 
     def bind_episode(self, rid: int, slot: int, episode_id: str | None, *, cold: bool, reset: bool) -> None:
         """Use the conductor-assigned owner slot; never allocate a second slot here."""
