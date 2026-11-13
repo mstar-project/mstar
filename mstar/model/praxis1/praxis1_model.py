@@ -186,6 +186,14 @@ class Praxis1Model(Model):
     def _ensure_repo(self) -> Path:
         if self._repo_dir is not None:
             return self._repo_dir
+        local = Path(self.model_path_hf).expanduser()
+        if local.is_dir():
+            if not (local / "config.json").is_file():
+                raise FileNotFoundError(f"Praxis checkpoint lacks config.json in {local}")
+            self._repo_dir = local.resolve()
+            return self._repo_dir
+        if local.is_absolute() or self.model_path_hf.startswith(("./", "../")):
+            raise FileNotFoundError(f"Praxis checkpoint directory does not exist: {local}")
         from huggingface_hub import snapshot_download
 
         # config.json is all the graph needs, and every process that builds

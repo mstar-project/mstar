@@ -424,6 +424,32 @@ def test_dummy_mode_takes_the_rig_from_the_name_and_reads_nothing(repo, rig, wir
     assert no_download == []
 
 
+def test_local_checkpoint_directory_needs_no_hub_fetch(tmp_path, monkeypatch, no_download):
+    root = tmp_path / "praxis-1-droid"
+    root.mkdir()
+    (root / "config.json").write_text(json.dumps(DROID_CONFIG))
+    (root / "model.safetensors.index.json").write_text(json.dumps({
+        "weight_map": {"action_expert.marker": "expert.safetensors"},
+    }))
+    (root / "expert.safetensors").write_bytes(b"")
+    monkeypatch.setattr(praxis1_model, "_SERVABLE", True)
+    model = Praxis1Model(str(root), skip_weight_loading=False)
+    assert model._ensure_repo() == root
+    assert model._ensure_component_weights("action_expert.") == root
+    assert no_download == []
+
+    (root / "expert.safetensors").unlink()
+    with pytest.raises(FileNotFoundError, match="Praxis weights lack expert.safetensors"):
+        model._ensure_component_weights("action_expert.")
+
+
+def test_missing_local_checkpoint_does_not_turn_into_a_hub_id(tmp_path, monkeypatch, no_download):
+    monkeypatch.setattr(praxis1_model, "_SERVABLE", True)
+    with pytest.raises(FileNotFoundError, match="Praxis checkpoint directory does not exist"):
+        Praxis1Model(str(tmp_path / "praxis-1-droid"), skip_weight_loading=False)
+    assert no_download == []
+
+
 def test_dummy_prompt_has_the_declared_text_padding(monkeypatch, no_download):
     model = Praxis1Model(model_path_hf="runwayml/praxis-1-droid", skip_weight_loading=True)
     model.config = replace(model.config, normalization={
