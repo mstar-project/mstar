@@ -425,7 +425,8 @@ class GDNManager(LinearAttnManager):
             got, final = gdn_kernel("chunk_gated_delta_rule", q.device)(
                 q=q.index_select(0, chunk.index), k=k.index_select(0, chunk.index), v=values,
                 g=alpha.index_select(0, chunk.index), beta=beta.index_select(0, chunk.index),
-                scale=self.config.sm_scale, initial_state=initial.to(self._kernels.prefill_dtype), output_final_state=True,
+                scale=self.config.sm_scale, initial_state=initial.to(self._kernels.prefill_dtype),
+                output_final_state=True,
                 cu_seqlens=chunk.cu, use_qk_l2norm_in_kernel=False,
             )
             if not zero_values:
