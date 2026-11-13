@@ -1410,7 +1410,7 @@ class Conductor:
                     and len(self.requests) >= self.max_concurrent_requests):
                 break
             body = self.waiting_queue.pop(0)
-            if (self._episode_array_names and body.episode is not None and
+            if (self._uses_episode_records(body) and body.episode is not None and
                     (body.episode in blocked_episodes or self._episode_records.busy(body.episode))):
                 blocked_episodes.add(body.episode)
                 self.waiting_queue.append(body)
@@ -1451,18 +1451,19 @@ class Conductor:
         except ValueError as exc:
             self._reject_request(body.request_id, str(exc), status=400)
             return
-        if self._episode_array_names:
+        episode_active = self._uses_episode_records(body)
+        if episode_active:
             self._expire_episode_slots(time.monotonic())
-        if self._episode_array_names and body.episode is not None and (
+        if episode_active and body.episode is not None and (
             type(body.episode) is not str or not body.episode
         ):
             self._reject_request(body.request_id, "episode id must be a non-empty string", status=400)
             return
-        if (self._episode_array_names and body.episode is not None and
+        if (episode_active and body.episode is not None and
                 self._episode_records.closed_or_ending(body.episode)):
             self._reject_request(body.request_id, "episode ended", status=410)
             return
-        if (self._episode_array_names and body.episode is not None and
+        if (episode_active and body.episode is not None and
                 (self._episode_records.busy(body.episode) or
                  any(waiting.episode == body.episode for waiting in self.waiting_queue))):
             queued = sum(waiting.episode == body.episode for waiting in self.waiting_queue)
@@ -1583,7 +1584,7 @@ class Conductor:
         # requests keep their explicit seed or the request-id-derived seed.
         seed = _request_seed(model_kwargs, _seed_id(body))
 
-        episode_active = bool(self._episode_array_names)
+        episode_active = self._uses_episode_records(body)
         episode_keys = {} if body.episode_keys is None else body.episode_keys
         if episode_active:
             if type(body.reset_episode) is not bool:
@@ -1603,8 +1604,6 @@ class Conductor:
             episode_seed = self._episode_records.seed_for(body.episode, model_kwargs.get("episode_seed"))
             if episode_seed is not None:
                 seed = episode_seed
-        elif model_kwargs.get("episode_seed") is not None:
-            raise ValueError("episode_seed requires declared episode state")
 
         partitions = self.model.get_partitions()
         topology = self.model.get_partition_topology()
@@ -1909,6 +1908,16 @@ class Conductor:
     def _episode_owner(episode_id: str | None, request_id: str) -> str:
         return f"episode:{episode_id}" if episode_id is not None else f"request:{request_id}"
 
+    def _uses_episode_records(self, body: NewRequestConductor) -> bool:
+        """A seeded session uses the existing record even without stored arrays."""
+        return bool(
+            self._episode_array_names
+            or (body.model_kwargs or {}).get("episode_seed") is not None
+            or (type(body.episode) is str and (
+                self._episode_records.has(body.episode)
+                or self._episode_records.closed_or_ending(body.episode)))
+        )
+
     def _send_end_episode(self, episode_id: str, slot: int, workers: set[str]) -> None:
         for worker_id in sorted(workers):
             self.communicator.send(
@@ -1926,7 +1935,9 @@ class Conductor:
             self._episode_slots.release(self._episode_owner(episode_id, ""), workers, slot)
 
     def _end_episode(self, body: EndEpisodeConductor) -> None:
-        if not self._episode_array_names:
+        if (not self._episode_array_names and not (
+                type(body.episode_id) is str and self._episode_records.has(body.episode_id))
+                and not any(request.episode == body.episode_id for request in self.waiting_queue)):
             return
         episode_id = body.episode_id
         if type(episode_id) is not str or not episode_id:
@@ -2119,7 +2130,7 @@ class Conductor:
         a stalled drain barrier through, and drop stale early-message entries so
         they can't accumulate for requests that never come back."""
         now = time.perf_counter()
-        if self._episode_array_names and self._expire_episode_slots(time.monotonic()):
+        if self._expire_episode_slots(time.monotonic()):
             self._try_admit_waiting()
         for request_id in self._pop_expired(self._draining_deadlines, now):
             dr = self.draining.get(request_id)

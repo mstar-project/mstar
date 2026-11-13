@@ -3,8 +3,12 @@
 import pytest
 import torch
 import yaml
+from fastapi.testclient import TestClient
 
 import mstar.conductor.conductor as conductor_mod
+from mstar.api_server import entrypoint, openpi
+from mstar.api_server.positronic import PositronicPolicy
+from mstar.api_server.request_types import ResultChunk
 from mstar.conductor.conductor import Conductor
 from mstar.conductor.request_info import WalkStep
 from mstar.conductor.routing import Placement
@@ -61,6 +65,12 @@ class _AttentionEpisodeModel(_EpisodeModel):
             CHUNK_CAUSAL_LAYOUT_KWARG: {"within_step": {"main": {"attn": lengths}}},
         })]
 
+
+class _SeedOnlyModel(_EpisodeModel):
+    def declare_state(self):
+        return []
+
+
 class _TwoLabelEpisodeModel(_EpisodeModel):
     def declare_state(self):
         return [Array(
@@ -85,7 +95,9 @@ def _conductor(tmp_path, monkeypatch, *, replicas=1, capacity=1, pool_slots=None
         "max_seq_len": 32,
         "node_groups": [{"node_names": ["llm"], "ranks": list(range(replicas))}],
         "episodes": {"max_episodes": capacity, **episode_config},
-        "resources": {"frames": {"max_slots": pool_slots or capacity + 1}},
+        "resources": {} if model_type is _SeedOnlyModel else {
+            "frames": {"max_slots": pool_slots or capacity + 1},
+        },
     }))
     comm = _Comm()
     monkeypatch.setattr(Conductor, "_launch_workers", lambda self: None)
@@ -200,6 +212,86 @@ def test_session_base_seed_reaches_worker_and_advances_across_reset(tmp_path, mo
     conductor._ingest_request(second)
     assert _new_requests(comm, "second")[0][1].request_info.random_seed == 18
     assert conductor._episode_records.view("robot-a").calls == 2
+
+
+def test_seeded_cold_session_uses_episode_record_without_arrays(tmp_path, monkeypatch):
+    conductor, _, comm = _conductor(tmp_path, monkeypatch, model_type=_SeedOnlyModel)
+    first = _request("first", "robot-a")
+    first.model_kwargs["episode_seed"] = 17
+    conductor._ingest_request(first)
+    assert _new_requests(comm, "first")[0][1].request_info.random_seed == 17
+
+    second = _request("second", "robot-a", reset=True)
+    second.model_kwargs["episode_seed"] = 17
+    conductor._ingest_request(second)
+    assert _new_requests(comm, "second") == []
+    _complete(conductor, "first")
+    sent = _new_requests(comm, "second")
+    assert len(sent) == 1 and sent[0][1].request_info.random_seed == 18
+    assert sent[0][1].reset_episode is True
+    _complete(conductor, "second")
+
+    missing_seed = _request("missing-seed", "robot-a")
+    conductor._ingest_request(missing_seed)
+    assert _new_requests(comm, "missing-seed") == []
+
+    conductor._end_episode(EndEpisodeConductor("robot-a"))
+    assert not conductor._episode_records.has("robot-a")
+    assert any(msg.message_type == WorkerMessageType.END_EPISODE for _, msg in comm.sent)
+
+
+def test_cold_positronic_session_reaches_conductor_with_advanced_seed(tmp_path, monkeypatch):
+    conductor, _, comm = _conductor(tmp_path, monkeypatch, model_type=_SeedOnlyModel)
+
+    class IntakeAPI:
+        positronic_policy = PositronicPolicy({"robot": "stub"}, observation_format="praxis1")
+
+        def __init__(self):
+            self.calls = 0
+
+        def submit_request(self, *, episode, reset_episode, model_kwargs, **kwargs):
+            self.calls += 1
+            rid = f"call-{self.calls}"
+            request = _request(rid, episode, reset=reset_episode)
+            request.model_kwargs = model_kwargs
+            conductor._ingest_request(request)
+            return rid
+
+        async def iter_result_chunks(self, request_id):
+            yield ResultChunk(request_id, "action", openpi.pack([{}] * 21))
+            _complete(conductor, request_id)
+
+        def end_episode(self, episode_id):
+            conductor._end_episode(EndEpisodeConductor(episode_id))
+
+    monkeypatch.setattr(entrypoint, "api_server", IntakeAPI())
+    with TestClient(entrypoint.app).websocket_connect("/api/v1/session?sample_seed=17") as ws:
+        assert openpi.unpack(ws.receive_bytes())["status"] == "loading"
+        ready = openpi.unpack(ws.receive_bytes())
+        assert ready["meta"]["sample_seed_base"] == 17
+        for call in range(2):
+            ws.send_bytes(openpi.pack({
+                "session_id": ready["session_id"], "observation": {"task": "go"},
+            }))
+            assert len(openpi.unpack(ws.receive_bytes())["result"]) == 21
+            assert _new_requests(comm, f"call-{call + 1}")[0][1].request_info.random_seed == 17 + call
+        ws.send_bytes(openpi.pack({"session_id": ready["session_id"], "end_session": True}))
+        assert openpi.unpack(ws.receive_bytes())["end_session"] is True
+    assert not conductor._episode_records.has(ready["session_id"])
+
+
+def test_seed_only_session_keeps_call_index_after_slot_eviction(tmp_path, monkeypatch):
+    conductor, _, comm = _conductor(tmp_path, monkeypatch, model_type=_SeedOnlyModel, capacity=1)
+    for rid, episode, base, expected in (
+        ("first", "robot-a", 17, 17),
+        ("other", "robot-b", 99, 99),
+        ("again", "robot-a", 17, 18),
+    ):
+        request = _request(rid, episode)
+        request.model_kwargs["episode_seed"] = base
+        conductor._ingest_request(request)
+        assert _new_requests(comm, rid)[0][1].request_info.random_seed == expected
+        _complete(conductor, rid)
 
 
 def test_warm_episode_stays_on_first_replica_when_router_would_rotate(tmp_path, monkeypatch):
