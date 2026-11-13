@@ -4,17 +4,19 @@ import logging
 from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
+import numpy as np
 import torch
 
 from mstar.engine.resources.attn.base import (
-    AttentionManager,
     AttentionWrapper,
     EagerSlotKey,
+    PlacedAttention,
     captured_page_capacity,
     one_token_rows,
+    own_queries,
 )
 from mstar.engine.resources.attn.config import AttentionStep, refuse_context_only
-from mstar.engine.resources.attn.workspace import Workspace, WorkspacePool
+from mstar.engine.resources.attn.workspace import Workspace
 from mstar.engine.resources.attn.wrappers import (
     FlashInferDecodeWrapper,
     FlashInferMixedWrapper,
@@ -24,7 +26,7 @@ from mstar.engine.resources.attn.wrappers import (
     fmha_decode_applies,
 )
 from mstar.engine.resources.base import CGSlotKey
-from mstar.engine.resources.context_parallel import ContextParallel, ContextParallelWrapper
+from mstar.engine.resources.context_parallel import KeyRows, OwnTokensKernel, RingAttentionWrapper, SPPlacement
 from mstar.engine.resources.kv.config import PagedKVConfig
 from mstar.engine.resources.kv.keys import fingerprint
 from mstar.engine.resources.kv.plan import KVPlanOutputs
@@ -32,17 +34,19 @@ from mstar.engine.resources.resident_hooks import ANY_REPEATS
 from mstar.engine.resources.spec import CombinedSplit
 from mstar.engine.resources.step import SlotLease, StepContext
 from mstar.platforms import current_platform
+from mstar.utils.h2d import to_device_nonblocking
 from mstar.utils.profiler import PhaseLaps
 
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
+    from mstar.engine.resources.context_parallel import ShareCapture
     from mstar.engine.resources.resident import CapturedResidentStep
 
 
-class FlashInferManager(AttentionManager):
+class FlashInferManager(PlacedAttention):
+    supports_split_steps = True
     supports_drop = True
-    supports_context_parallel = True
 
     def __init__(
         self,
@@ -59,11 +63,9 @@ class FlashInferManager(AttentionManager):
         layers: tuple[int, ...] | None = None,
         sm_scale: float | None = None,
     ):
-        self._kv_cache_name = kv_cache
+        super().__init__(kv_cache, device, dtype, kv_config)
         self._splits = {split.combined_walk: split for split in splits}
         self._max_rows_in_combined = max_rows_in_combined or {}
-        self._device = device
-        self._dtype = dtype
         # FlashInfer counts preceding positions; M* counts the current token too.
         self._window_left = -1 if sliding_window is None else sliding_window - 1
         # The index of the group of the pool's layers this reads (`PagedKVConfig.groups`): the
@@ -77,18 +79,11 @@ class FlashInferManager(AttentionManager):
         if len(groups) > 1:
             self._layers = frozenset(layers or self._group.layers)
 
-        # label to plan state
-        self._current_plan_states: dict[str, AttentionWrapper] = {}
-
         # persistent, because constructing one allocates FlashInfer's own
         # workspaces and is far from free per step
         self._eager_plan_states: dict[EagerSlotKey, AttentionWrapper] = {}
         self._cg_plan_states: dict[CGSlotKey, AttentionWrapper] = {}
 
-        self._preplan_states: dict[str, AttentionWrapper] = {}
-        self._preplanned = False
-
-        self._kv_config = kv_config
         check_flashinfer_head_dim(kv_config.head_dim, device)     # at load, not at the first plan
         self._wrapper_kv_kwargs = dict(
             num_qo_heads=kv_config.num_qo_heads,
@@ -107,12 +102,46 @@ class FlashInferManager(AttentionManager):
         )
         self._sm_scale = sm_scale
 
-        self._workspaces = WorkspacePool(device, owner=kv_cache)
+        # a split label's whole step's qo_indptr, for `select_last_hidden` (`kv_gather` plans this
+        # rank's queries alone)
+        self._step_qo: dict[str, torch.Tensor] = {}
         # walk -> whether its captured decode kernels see a row's length per replay
         self._repeat_walks: dict[str, bool] = {}
 
-    def _bind_placement(self, placement: ContextParallel) -> None:
-        if not self._decode_tensor_cores and not placement.over_sp:
+    def bind_dependencies(self, resources) -> None:
+        # the pool, built, has paged its groups for its placement (`PagedKVConfig.placed_groups`)
+        self._group = self._kv_config.groups[self._group_idx]
+        self._wrapper_kv_kwargs["page_size"] = self._group.page_size
+        super().bind_dependencies(resources)
+        # every attention over the pool: a window's layers are whole on every partner, so not placed,
+        # but they prefill in the same node's lockstep steps
+        if isinstance(resources[self._kv_cache_name].placement, SPPlacement):
+            self._check_fa2_over_sp()
+
+    def _check_fa2_over_sp(self) -> None:
+        """Over an SP-placed pool: one such server hung at its first 32k prefill on fa2 and the cause
+        isn't known (#1363), so a prefill on fa2 is warned of. Read from the config and the GPU, so
+        every rank of the node decides alike."""
+        capability = current_platform.cuda_capability(self._device)
+        # FlashInfer has fa3 for SM90 only (`_check_window_pool`)
+        fa3 = capability is not None and capability[0] == 9
+        backend = self._wrapper_kv_kwargs["backend"]
+        # an explicit fa2 on any GPU; `auto` where the capability says FlashInfer has no fa3
+        on_fa2 = (backend == "fa2" and self._device.type == "cuda") or (
+            backend == "auto" and capability is not None and not fa3
+        )
+        if on_fa2:
+            logger.warning(
+                "attention %r over SP-placed KV pool %r prefills on FlashInfer's fa2 kernel; an unexplained "
+                "one-off lockstep hang in an fa2 prefill is still open (#1363)",
+                self._resource_key, self._kv_cache_name,
+            )
+
+    def _bind_placement(self, geometry: dict[str, int]) -> None:
+        if geometry["num_qo_heads"] != self._kv_config.num_qo_heads and not self._decode_tensor_cores:
+            # a rank attending every partner's query heads over its one KV head (TP placement) forms
+            # a GQA group FlashInfer's CUDA-core decode can have no kernel for
+            self._decode_tensor_cores = True
             logger.info(
                 "attention over context-parallel KV pool %r decodes on tensor cores although "
                 "decode_tensor_cores is off: a TP-placed rank's query heads over its one KV head can form "
@@ -124,8 +153,6 @@ class FlashInferManager(AttentionManager):
                 "decode_fmha is on: the merge needs each partial's lse", self._kv_cache_name,
             )
         capability = current_platform.cuda_capability(self._device)
-        # FlashInfer has fa3 for SM90 only (`_check_window_pool`)
-        fa3 = capability is not None and capability[0] == 9
         if capability is not None and capability >= (10, 0) and self._wrapper_kv_kwargs["backend"] == "auto":
             # from SM100 auto can send short rows to cuDNN, whose lse the merge isn't known to
             # read right (`_check_window_pool` resolves it the same way)
@@ -134,22 +161,8 @@ class FlashInferManager(AttentionManager):
                 "attention over context-parallel KV pool %r plans on fa2 for flashinfer_backend 'auto'",
                 self._kv_cache_name,
             )
-        # one SP-placed server hung at its first 32k prefill on fa2 and the cause isn't known (#1363)
-        backend = self._wrapper_kv_kwargs["backend"]
-        # an explicit fa2 on any GPU; `auto` where the capability says FlashInfer has no fa3
-        on_fa2 = (backend == "fa2" and self._device.type == "cuda") or (
-            backend == "auto" and capability is not None and not fa3
-        )
-        if placement.over_sp and on_fa2:
-            logger.warning(
-                "attention over SP-placed KV pool %r prefills on FlashInfer's fa2 kernel; an unexplained one-off "
-                "lockstep hang in an fa2 prefill is still open (#1363)",
-                self._kv_cache_name,
-            )
+        self._wrapper_kv_kwargs.update(geometry)
         cfg = self._kv_config
-        self._wrapper_kv_kwargs.update(
-            ContextParallelWrapper.local_geometry(placement, cfg.tokens_per_page, cfg.num_qo_heads),
-        )
         self._new_kwargs = dict(
             num_qo_heads=cfg.num_qo_heads, num_kv_heads=cfg.num_kv_heads, head_dim=cfg.head_dim,
             device=self._device, backend=self._wrapper_kv_kwargs["backend"], q_data_type=self._dtype,
@@ -298,6 +311,24 @@ class FlashInferManager(AttentionManager):
         )
         return wrapper if wrapper.has_kernel(config.head_dim, config.num_qo_heads) else None
 
+    def _ring_wrapper(self, label: str, slot: int):
+        """The eager ``RingAttentionWrapper`` a split step of ``label`` plans on ``slot`` under the
+        sequence shard's ``exchange: ring``: one context wrapper per partner, over the label's
+        workspace (they run one after another on one stream). FlashInfer is the one backend that takes both split
+        steps and a placed pool, which a ring needs."""
+        key = EagerSlotKey(label=label, slot=slot, ring=True)
+        wrapper = self._eager_plan_states.get(key)
+        if wrapper is None:
+            workspace = self._workspaces.get(label, slot)
+            paged = [
+                self.paged_kernel(workspace, False, dict(self._wrapper_kv_kwargs), None)
+                for _ in range(self._placement.size)
+            ]
+            wrapper = self._eager_plan_states[key] = RingAttentionWrapper(
+                self._placement, self._kv_config.tokens_per_page, self._dtype, paged, self._device,
+            )
+        return wrapper
+
     def _eager_wrapper(
         self, label: str, is_decode: bool, slot: int
     ) -> AttentionWrapper:
@@ -326,21 +357,26 @@ class FlashInferManager(AttentionManager):
             self._eager_plan_states[key] = wrapper
         return wrapper
 
-    def _context_wrapper(self, workspace, decode, kwargs, max_total_tokens):
+    def paged_kernel(self, workspace, decode, kwargs, max_total_tokens):
         if decode:
-            # under TP placement a rank attends every partner's query heads over one KV head, a GQA
-            # group FlashInfer's CUDA-core decode may have no kernel for
-            tensor_cores = self._decode_tensor_cores or not self._placement.over_sp
-            return FlashInferDecodeWrapper(workspace_buffer=workspace, use_tensor_cores=tensor_cores, **kwargs)
+            # on tensor cores under TP placement (`_bind_placement`)
+            return FlashInferDecodeWrapper(
+                workspace_buffer=workspace, use_tensor_cores=self._decode_tensor_cores, **kwargs,
+            )
         return FlashInferPrefillWrapper(workspace_buffer=workspace, max_total_tokens=max_total_tokens, **kwargs)
 
-    def _own_tokens_wrapper(self, workspace, kwargs, max_total_tokens):
+    def own_tokens_kernel(self, workspace, kwargs, captured, whole):
+        if not whole:
+            return super().own_tokens_kernel(workspace, kwargs, captured, whole)
+        # whole rows read their keys as contiguous runs, which the ragged prefill takes 1.06-1.16x
+        # faster than one-slot pages on a captured step (H200, FA2 and FA3)
         from mstar.engine.resources.attn.ragged.wrappers import FlashInferRaggedPrefillWrapper
 
-        return FlashInferRaggedPrefillWrapper(
-            workspace, max_num_segments=kwargs.get("batch_size"), max_total_tokens=max_total_tokens,
+        ragged = FlashInferRaggedPrefillWrapper(
+            workspace, max_num_segments=kwargs.get("batch_size"), max_total_tokens=captured and captured.tokens,
             accelerator_graph=kwargs.get("accelerator_graph", False), owns_padding=True, **self._new_kwargs,
         )
+        return _WholeRows(ragged, captured)
 
     @property
     def supports_preplan(self):
@@ -372,14 +408,16 @@ class FlashInferManager(AttentionManager):
         )
         if self._preplanned:
             # the wrappers were planned a step early against this same step's
-            # KV plan; nothing left to do but promote them
+            # KV plan; nothing left to do but promote them (a leased step, so copied)
             self._current_plan_states = self._preplan_states
             self._preplan_states = {}
             self._preplanned = False
+            self._step_qo.clear()
             return
 
         plan_outputs: KVPlanOutputs = ctx.plan_results.get(self._kv_cache_name)
         assert plan_outputs is not None, f"Attention Manager expected plan result from {self._kv_cache_name}"
+        shard_plan = self._check_sequence_shard(ctx)
         if self._group_idx:
             plan_outputs = plan_outputs.groups[self._group_idx]
 
@@ -388,9 +426,30 @@ class FlashInferManager(AttentionManager):
         plan_states = self._preplan_states if ctx.is_preplan else self._current_plan_states
 
         plan_states.clear()
+        if not ctx.is_preplan:
+            # not on a pre-plan: the step in flight may still read its own
+            self._step_qo.clear()
         laps = PhaseLaps(f"{ctx.plan_phase}.attn.")
         for label, kv_out in plan_outputs.items():
             indptrs = kv_out.cpu_indptrs
+            r = None if shard_plan is None else shard_plan.ranges.get(label)
+            if r is not None and self._split_exchange == "kv_gather":
+                # this rank's own queries over the whole step's keys, every rank storing the
+                # group whole (eager only, `SeqShardSpec.eager`)
+                assert lease is None, "a leased step split under kv_gather"
+                own = own_queries(indptrs, r, self._group.page_size, step.causal)
+                wrapper = self._eager_wrapper(label, False, ctx.slot)
+                wrapper.plan(causal=step.causal, dtype=self._dtype, window_left=self._window_left,
+                             **own.to_kwargs_dict())
+                self._step_qo[label] = to_device_nonblocking(indptrs.qo_indptr, self._device)
+                plan_states[label] = wrapper
+                continue
+            if r is not None and self._split_exchange == "ring":
+                assert lease is None, "a leased step split under ring"
+                wrapper = self._ring_wrapper(label, ctx.slot)
+                wrapper.plan(kv_out, r.counts, causal=step.causal)
+                plan_states[label] = wrapper
+                continue
             if lease is not None:
                 num_rows = indptrs.qo_indptr.shape[0] - 1
                 wrapper = self._cg_wrapper(lease, label, num_rows, ctx.force_prefill)
@@ -422,19 +481,11 @@ class FlashInferManager(AttentionManager):
 
         self._preplanned = ctx.is_preplan
 
-    def clear_preplan(self):
-        if self._placement is not None:
-            # the dropped plan's H2Ds went on the plan stream, which the step that runs instead
-            # waits on no event from, so its own-token wrappers must not skip their plans
-            for wrapper in self._preplan_states.values():
-                wrapper.forget_plan()
-        # rebind rather than clear: a consumed preplan dict is the live one
-        self._preplanned = False
-        self._preplan_states = {}
-
     ### Submodule-level functionality
     @torch.compiler.disable
     def qo_indptr_buf(self, label: str="main") -> torch.Tensor | None:
+        if label in self._step_qo:
+            return self._step_qo[label]
         if label not in self._current_plan_states:
             return
         # decode wrappers never set one
@@ -483,6 +534,10 @@ class FlashInferManager(AttentionManager):
     def _attend(
         self, q: torch.Tensor, label: str, kv_cache_layer: torch.Tensor, layer_idx: int | None = None,
     ) -> torch.Tensor:
+        if self._shard is not None:
+            # every rank stores a kv_gather attention's layers whole, heads over TP
+            by_head = self._placement is None and self._split_exchange != "kv_gather"
+            self._shard.check_bypass(label, "attention run", by_head=by_head)
         if self._layers is not None:
             # an explicit layer over the cursor, checked as the cursor is
             if layer_idx is not None:
@@ -496,3 +551,24 @@ class FlashInferManager(AttentionManager):
         if o.dtype != q.dtype:
             o = o.to(q.dtype)
         return o
+
+
+class _WholeRows(OwnTokensKernel):
+    """FlashInfer's ragged prefill as the own-token kernel for whole rows, each over its own tokens
+    (``KeyRows.whole``): their keys are contiguous runs of the step's, which it reads in place. It
+    takes no other rows, whose keys would have to be gathered."""
+
+    whole_rows_only = True
+
+    def __init__(self, ragged, captured: "ShareCapture | None"):
+        self._ragged, self.captured = ragged, captured
+
+    def plan(self, rows: KeyRows, causal: bool) -> None:
+        self._ragged.plan(torch.from_numpy(rows.qo_indptr.astype(np.int32)), causal=causal)
+
+    def run(self, q, k, v):
+        return self._ragged.run(q, k, v, return_lse=True)
+
+    def forget_plan(self) -> None:
+        # it skips a layout it already holds (`_RaggedPrefillBase.forget_plan`)
+        self._ragged.forget_plan()

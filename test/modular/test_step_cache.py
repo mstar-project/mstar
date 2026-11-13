@@ -103,9 +103,9 @@ _FLAT = {"method": "magcache", "mag_ratios": [1.0, 1.0], "threshold": 1.0, "max_
 _FLAT_PLAN = (False, True, False, True, False, False)
 
 
-def _tiny_dit(sp_group=None) -> Wan22DiT:
+def _tiny_dit() -> Wan22DiT:
     torch.manual_seed(0)
-    dit = Wan22DiT(Wan22Config(**_TINY), sp_group=sp_group)
+    dit = Wan22DiT(Wan22Config(**_TINY))
     for param in dit.parameters():
         torch.nn.init.normal_(param, std=0.2)
     return dit.eval()

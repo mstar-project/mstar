@@ -5,10 +5,8 @@ import types
 import pytest
 import torch
 
-from mstar.distributed.base import ShardingConfig
-from mstar.distributed.communication import CommGroup, WorkerParallelGroups
+from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine.node_dtype import resolve_model_dtype, resolve_node_dtype
-from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.testing_utils.model import StubModel
@@ -93,25 +91,3 @@ def test_runtime_scope_dtype_matches_load_cast():
             assert weight.dtype is (dtype or torch.float32), name
     finally:
         manager.shutdown()
-
-
-def test_a_node_placing_its_kv_positions_over_its_sp_ranks_loads_without_the_sp_group():
-    """It runs replicated across those ranks, so its model gets no SP group to run its own
-    sequence parallelism with."""
-    kwargs = {}
-
-    def get_submodule(name, device, **extra):
-        kwargs[name] = extra
-
-    model = _Model(torch.bfloat16)
-    model.get_submodule = get_submodule
-    model.get_node_resources = lambda: [KVSpec(resource_key="kv", nodes={"inherit"}, config=PagedKVConfig(
-        num_layers=1, num_kv_heads=2, head_dim=8, max_seq_len=64, page_size=16, context_parallel=True,
-    ))]
-    model.get_default_sharding_config = lambda: ShardingConfig(groups=[], tp_enabled_nodes=set(), shard_dim={})
-    groups = WorkerParallelGroups(num_workers=2, global_rank=0)
-    sp = CommGroup(my_global_rank=0, my_group_rank=0, group_members=[0, 1])
-    groups.add("inherit", sp, "sp")
-    groups.node_to_instance_comm["inherit"] = sp
-    _build(model, groups).shutdown()
-    assert "sp_group" not in kwargs["inherit"]

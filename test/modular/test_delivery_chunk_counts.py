@@ -105,7 +105,7 @@ def drive(runtime, put, prefills: int, decode_steps: int, inline: bool = False) 
             put(uuid)
             uuids.append(uuid)
         extra = {} if inline_value is None else dict(
-            inline_signal="new_token", inline_values=[inline_value],
+            inline_signals=["new_token"], inline_values=[inline_value],
         )
         out = runtime.complete_and_route_batch(RouteInput(
             partition="default", graph_walk=walk, node_name=NODE, output_signals=signals,

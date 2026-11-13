@@ -48,12 +48,11 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class _ToyModel(StubModel):
-    def __init__(self, walks, partitions=None, topology=None, tp_enabled_nodes=(), sp_enabled_nodes=()):
+    def __init__(self, walks, partitions=None, topology=None, tp_enabled_nodes=()):
         self._walks = walks
         self._partitions = partitions
         self._topology = topology
         self._tp_enabled_nodes = set(tp_enabled_nodes)
-        self._sp_enabled_nodes = set(sp_enabled_nodes)
 
     def get_graph_walk_graphs(self):
         return self._walks()
@@ -65,8 +64,7 @@ class _ToyModel(StubModel):
         return self._topology() if self._topology else super().get_partition_topology()
 
     def get_default_sharding_config(self):
-        return ShardingConfig(groups=[], tp_enabled_nodes=self._tp_enabled_nodes, shard_dim={},
-                              sp_enabled_nodes=self._sp_enabled_nodes)
+        return ShardingConfig(groups=[], tp_enabled_nodes=self._tp_enabled_nodes, shard_dim={})
 
 
 def _config(tmp_path, node_groups) -> str:
@@ -975,6 +973,23 @@ def _drop_stubbed_imports():
         for mod in set(sys.modules) - before:
             if mod.startswith("mstar.model.qwen3_omni"):
                 del sys.modules[mod]
+
+
+def test_qwen3_5s_prefix_caches_open_beside_its_sequence_shard(tmp_path, monkeypatch):
+    """Its recurrent layers depend on the LLM's sequence shard, which plans from the step a prefix
+    hit trimmed and holds nothing to restore: at one rank the KV cache and the recurrent pool's
+    snapshots open as without it (the shipped configs' startup validation, above, refuses
+    otherwise)."""
+    from mstar.engine.resources.kv.config import opening_prefix_caches
+    from mstar.engine.resources.spec import apply_yaml_overrides, resolve_spec_dependencies
+    from mstar.engine.state.adapters import StateSetup
+    from mstar.model.base import enabled_resources
+    from mstar.model.qwen3_5.config import GDN_STATE, KV_CACHE, LINEAR_ATTN, LLM_SHARD
+
+    specs = enabled_resources(_qwen3_5("qwen3_5_9b", {}, tmp_path, monkeypatch), {}, StateSetup())
+    apply_yaml_overrides(specs, {"resources": {GDN_STATE: {"prefix_slots": 8}}})
+    assert LLM_SHARD in resolve_spec_dependencies(specs)[LINEAR_ATTN].depends_on()
+    assert {KV_CACHE, GDN_STATE} <= opening_prefix_caches(specs, {"LLM": 1}, checkpoint_named=True)
 
 
 @pytest.mark.parametrize("config_path", SHIPPED_CONFIGS, ids=lambda p: p.name)

@@ -26,7 +26,8 @@ import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.distributed.base import ShardingConfig
-from mstar.engine.state import Array, Attend, Block, Read
+from mstar.engine.resources import SeqShardSpec
+from mstar.engine.state import Array, Attend, Block, Read, SeqShard
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Parallel, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import Model, TensorAndMetadata, WalkStep
@@ -44,6 +45,7 @@ from mstar.model.minimax_h3.config import (
     DIT_ATTN,
     DIT_NODE,
     DIT_ROWS,
+    DIT_SHARD,
     FPS,
     H3_REPO,
     MAG_RATIOS,
@@ -56,6 +58,7 @@ from mstar.model.minimax_h3.config import (
     TEXT_ENCODER_NODE,
     VAE_DECODER_NODE,
     VAE_ENCODER_NODE,
+    VAE_SHARD,
     H3Config,
     align_num_frames,
     audio_latent_num_frames,
@@ -232,15 +235,16 @@ class H3Model(Model):
         return str(self.snapshot)
 
     # ------------------------------------------------------------ structure
-    def declare_state(self) -> list[Array]:
-        """The DiT's attention over each request's packed rows, its padding a segment of its own in the same row, and
-        the token refiner's over the prompt; nothing here keeps state."""
+    def declare_state(self) -> list[Array | SeqShard]:
+        """The DiT's attention over each request's packed rows, its padding a segment of its own in the same row, the
+        token refiner's over the prompt, and the DiT's sequence shard; nothing here keeps state. On SP ranks the
+        shard splits the packed rows (one row a step, read segmented, so cut contiguously), which the attention
+        exchanges for heads (Ulysses); on SDPA it can't run there."""
         t = self.config.transformer
         heads, entry = t.num_attention_heads, dit_entry(t.num_attention_heads, t.attention_head_dim)
         return [
             Array(
                 DIT_ROWS, nodes={DIT_NODE}, layers=frozenset(range(t.num_layers)), entry=entry, max_len=0,
-                seq_sharded=True,
                 reads={DIT_ATTN: Read(mask=Block(), op=Attend(q_heads=heads), packed=False, segmented=True)},
             ),
             Array(
@@ -248,11 +252,23 @@ class H3Model(Model):
                 entry=entry, labels={TEXT_SPAN}, max_len=0,
                 reads={REFINER_ATTN: Read(mask=Block(), op=Attend(q_heads=heads), packed=False)},
             ),
+            SeqShard(DIT_SHARD, nodes={DIT_NODE}, labels={H3DenoiseSubmodule.MAIN_SPAN}),
         ]
 
     def kernel_settings(self) -> dict[str, dict[str, Any]]:
         # the DiT's two segments are a request's rows and their padding
         return {DIT_ATTN: {"max_segments_per_request": 2, "workspace_mb": 128}, REFINER_ATTN: {"workspace_mb": 128}}
+
+    def get_node_resources(self) -> list[SeqShardSpec]:
+        """The video decoder's sequence shard, which splits each request's clips, which nothing exchanges
+        (``exchanges=False``); every request of a decoder batch is one layout, so one clip count (``axis`` 1). The
+        decoder has no arrays, so its shard is written by hand, not a `SeqShard`."""
+        return [
+            SeqShardSpec(
+                resource_key=VAE_SHARD, nodes={VAE_DECODER_NODE}, labels=(H3VideoDecoderSubmodule.CLIPS,), axis=1,
+                exchanges=False,
+            ),
+        ]
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         def text_node(*inputs: str) -> GraphNode:
@@ -599,21 +615,20 @@ class H3Model(Model):
         return None
 
     def get_default_sharding_config(self) -> ShardingConfig:
-        # The dit shards its rows by rank (Ulysses), the video decoder its clips. No tensor
-        # parallelism: the linears support it, but no config or test runs it.
-        return ShardingConfig(groups=[], tp_enabled_nodes=set(), shard_dim={},
-                              sp_enabled_nodes={DIT_NODE, VAE_DECODER_NODE})
+        # The dit shards its rows by rank (its sequence shard). No tensor parallelism: the
+        # linears support it, but no config or test runs it.
+        return ShardingConfig(groups=[], tp_enabled_nodes=set(), shard_dim={})
 
-    def get_submodule(self, node_name: str, device="cpu", tp_group=None, autocast_dtype=None, sp_group=None):
+    def get_submodule(self, node_name: str, device="cpu", tp_group=None, autocast_dtype=None):
         if node_name in self._submodule_cache:
             return self._submodule_cache[node_name]
-        submodule = self._create_submodule(node_name, device, tp_group, sp_group)
+        submodule = self._create_submodule(node_name, device, tp_group)
         self._submodule_cache[node_name] = submodule
         if submodule is not None:
             logger.info("loaded MiniMax-H3 submodule for node %s", node_name)
         return submodule
 
-    def _create_submodule(self, node_name: str, device, tp_group=None, sp_group=None) -> NodeSubmodule | None:
+    def _create_submodule(self, node_name: str, device, tp_group=None) -> NodeSubmodule | None:
         if self.skip_weight_loading:
             return None
         from mstar.model.minimax_h3 import weight_loader
@@ -629,15 +644,14 @@ class H3Model(Model):
             return H3VaeEncoderSubmodule(weight_loader.build_keyframe_encoder(config, snapshot, device))
         if node_name == DIT_NODE:
             return H3DenoiseSubmodule(
-                weight_loader.build_transformer(config, snapshot, device, comm_group=tp_group, sp_group=sp_group),
+                weight_loader.build_transformer(config, snapshot, device, comm_group=tp_group),
                 config, loop_name=DENOISE_LOOP,
                 max_batch_size=1, compile_blocks=self.compile, row_bucket=self.row_bucket,
                 step_cache=self.step_cache,
             )
         if node_name == VAE_DECODER_NODE:
             return H3VideoDecoderSubmodule(weight_loader.build_video_decoder(config, snapshot, device), config,
-                                           tile_batch=self.vae_tile_batch, compile_blocks=self.vae_compile,
-                                           sp_group=sp_group)
+                                           tile_batch=self.vae_tile_batch, compile_blocks=self.vae_compile)
         if node_name == AUDIO_DECODER_NODE:
             return H3AudioDecoderSubmodule(weight_loader.build_audio_vae(config, snapshot, device), config)
         logger.warning("MiniMax-H3 has no submodule for node %r; running it dummy", node_name)
