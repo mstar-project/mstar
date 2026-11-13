@@ -34,12 +34,11 @@ PORTED = (
 )
 # The list only shrinks: a package leaves it when its port lands, and nothing is added to it.
 UNPORTED = (
-    "mstar/model/bagel", "mstar/model/canary", "mstar/model/canary_qwen", "mstar/model/chatterbox",
-    "mstar/model/cosmos3", "mstar/model/cosyvoice3", "mstar/model/fish_s2_pro", "mstar/model/glm52",
-    "mstar/model/glm5_next", "mstar/model/higgs_audio", "mstar/model/lingbot_world", "mstar/model/minicpm_o",
-    "mstar/model/muse", "mstar/model/nemotron_duplex", "mstar/model/parakeet", "mstar/model/phi4mm", "mstar/model/pi05",
-    "mstar/model/qwen3_asr", "mstar/model/qwen3_tts", "mstar/model/ripple", "mstar/model/vjepa2",
-    "mstar/model/waypoint", "mstar/model/whisper",
+    "mstar/model/bagel", "mstar/model/canary", "mstar/model/chatterbox", "mstar/model/cosmos3",
+    "mstar/model/cosyvoice3", "mstar/model/glm52", "mstar/model/glm5_next", "mstar/model/higgs_audio",
+    "mstar/model/lingbot_world", "mstar/model/minicpm_o", "mstar/model/muse", "mstar/model/nemotron_duplex",
+    "mstar/model/phi4mm", "mstar/model/pi05", "mstar/model/ripple", "mstar/model/vjepa2", "mstar/model/waypoint",
+    "mstar/model/whisper",
 )
 # shared code under mstar/model/ that holds no model
 SHARED = ("mstar/model/components", "mstar/model/loader")
@@ -94,6 +93,7 @@ ALLOWED_NODE_RESOURCES = {
     "mstar/model/qwen3_5/qwen3_5_model.py": _LORA,
     "mstar/model/qwen3_omni/qwen3_omni_model.py": _LORA,
     "mstar/model/orpheus/orpheus_model.py": _LORA,
+    "mstar/model/qwen3_tts/qwen3_tts_model.py": _LORA,
     "mstar/model/minimax_h3/minimax_h3_model.py": (
         "the video decoder's sequence shard, which a contract SeqShard can't declare since the decoder has no arrays"
     ),
@@ -108,6 +108,7 @@ ADAPTER_IMPORTERS = {
     "mstar/conductor/conductor.py": "the conductor converts a request's `SampleSettings` into sampler configs",
     "mstar/validation/__init__.py": "`validate_deployment` checks a deployment's state setup before a worker spawns",
     "benchmark/command_a_plus/validate_checkpoint.py": _BY_HAND,
+    "benchmark/lora/module_parity.py": _BY_HAND,
     "benchmark/ltx2_5/profile_step.py": _BY_HAND,
 }
 # the source directories, apart from test/
