@@ -419,8 +419,12 @@ the layout names there, so the model returns no ``KVReqConfig`` for them. On one
 doesn't name, it opens the labels ``kv_labels()`` lists for it, or ``main`` where that lists
 none, and a paged array needs a layout for each label it opens, so leaving one out fails the
 request: lay out every paged array. A layout may be empty where an opened label is never
-written. A Value's layout is ``Layout()``, because a Value takes one slot per label. A layout
-has four fields:
+written. A Value's layout is ``Layout()``, because a Value takes one slot per label. A sized
+Value is the exception: ``Value(..., largest={...})`` declares fields whose shapes name sizes
+(``Size("lat_h", scale=8)``), its layout gives the request's own (``Layout(sizes={...})``), and the
+engine admits the request by its fields' bytes at those sizes. Its ``read`` hands the row's
+tensors over and ``write`` keeps the ones it is given, with no copy either way, so a step
+writes or clears every field it read. A paged layout has four fields:
 
 - ``spans``: the committed writes known at intake, in walk order. A ``Span`` has a
   ``kind``: ``"ids"`` for token ids from the tensor ``source`` names, ``"digest"`` for KV

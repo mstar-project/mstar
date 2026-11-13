@@ -250,6 +250,11 @@ class ArrayHandle(StepHandle):
             raise self._refusal(self._write_refused)
         raise self._unsupported("write")
 
+    def clear(self, layer: int | torch.Tensor, *fields: str) -> None:
+        """Drop ``fields`` for the step's row and give their bytes back, on a sized Value. A cleared field stays unset
+        for the rest of the request."""
+        raise self._unsupported("clear")
+
     def set_start(self, start: Mapping[str, torch.Tensor]) -> None:
         """What a row of this Value reads while it has nothing written, has span 0 or pads a step: ``start``'s tensor
         for each field it names, of one entry's shape on this rank, and zeros for the rest. A resident step reads each
