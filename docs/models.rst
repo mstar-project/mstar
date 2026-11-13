@@ -2431,6 +2431,23 @@ Deployment knobs (``model_kwargs``; the SP configs set ``compile``, ``vae_tile_b
   24.7 dB and 0.829; ``{threshold: 0.01, max_skip_steps: 1}`` computes 33, 1.45x, at
   28.5 dB and 0.896.
 
+**FastH3** (``distilled_checkpoint``; ``configs/minimax_h3_fasth3.yaml``, one B300):
+FastVideo's ``FastVideo/FastVideo-FastH3-8-Step-V2`` is the DiT distilled with DMD2 to 8
+unguided forwards, text to audio+video only. Its transformer (diffusers' layout) replaces
+FL2VA's DiT and token refiner; the conditioner and the VAEs stay FL2VA's. It was trained with
+VSA (0.8 sparsity); M* runs it with dense attention and never reads the VSA compression gates.
+It is sampled as FastVideo samples it: H3's Euler step on the release's rungs
+(``fastvideo_inference.json``: 999, 874, ..., 125) over 1000 plus a terminal 0, shifted in fp32
+by 10 (video) and 3 (audio). ``num_inference_steps`` is 9 sigma points (the default) and the
+shifts are the release's: anything else, and keyframes, are a 400; ``step_cache`` is refused
+at startup. On one B300 (1344x768, 124
+frames, compiled, warm) a clip takes 23.0-23.5 s, against 126.5 s for the base's 50 points.
+Against diffusers' pipeline over the same transformer on FastVideo's grid
+(``oracle.py --distilled``, ``parity.py --distilled``), the seeded noise, the layout, the
+timesteps and the conditioner (FastH3's token refiner) are bit-identical, and each
+teacher-forced DiT step is 1.4-3.8% rel L2 off, where the base port on the same B300 and tree is
+1.1-3.4% off (so not bit-identical on that GPU either).
+
 The attention kernel is a resource's setting: ``backend: sdpa`` on the ``dit_attn`` and
 ``refiner_attn`` resources runs the reference's kernel, and FlashInfer runs without it. SDPA on
 ``dit_attn`` is refused on SP ranks, which every shipped config but ``minimax_h3_2gpu.yaml`` is.

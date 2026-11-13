@@ -12,6 +12,9 @@ Nodes:
 Walks: encode_text or encode_keyframes, then generate_{av,video,audio}[_keyframes]: the
 denoise loop and the decoders asked for. Video and audio always denoise together; the
 walk only picks the decoders. Request knobs: docs/models.rst.
+
+``distilled_checkpoint`` serves a few-step distilled DiT (FastVideo's FastH3) in place of
+FL2VA's, on its trained rungs; the rest of the model is FL2VA's.
 """
 
 from __future__ import annotations
@@ -42,6 +45,7 @@ from mstar.model.minimax_h3.config import (
     DEFAULT_NUM_FRAMES,
     DEFAULT_NUM_INFERENCE_STEPS,
     DENOISE_LOOP,
+    DISTILLED_PATTERNS,
     DIT_ATTN,
     DIT_NODE,
     DIT_ROWS,
@@ -178,6 +182,7 @@ class H3Model(Model):
         vae_tile_batch: int = 1,
         vae_compile: bool = False,
         step_cache: dict | None = None,
+        distilled_checkpoint: str | None = None,
         **kwargs,
     ):
         refuse_attention_backend_kwarg(kwargs)
@@ -208,6 +213,10 @@ class H3Model(Model):
         self.vae_compile = bool(vae_compile)
         # opt-in, lossy: the DiT's step cache (components/diffusion/step_cache.py); None runs every step
         self.step_cache = step_cache_policy(step_cache, MAG_RATIOS)
+        # a few-step distilled release (hub id or path) whose DiT replaces FL2VA's (H3Distilled)
+        self.distilled_checkpoint = distilled_checkpoint
+        if distilled_checkpoint is not None and self.step_cache is not None:
+            raise ValueError("MiniMax-H3 step_cache's tables are a 50-point dense run's; not for a distilled DiT")
         self._snapshot = None
         self._config: H3Config | None = None
         self.tokenizer = None
@@ -225,7 +234,11 @@ class H3Model(Model):
     def config(self) -> H3Config:
         """Read from the checkpoint on first use; ``set_config`` pins one for tests."""
         if self._config is None:
-            self._config = H3Config.from_snapshot(self.snapshot)
+            config = H3Config.from_snapshot(self.snapshot)
+            if self.distilled_checkpoint is not None:
+                config = config.with_distilled(resolve_snapshot_dir(
+                    self.distilled_checkpoint, self.cache_dir, allow_patterns=DISTILLED_PATTERNS))
+            self._config = config
         return self._config
 
     def set_config(self, config: H3Config) -> None:
@@ -353,8 +366,9 @@ class H3Model(Model):
             raise ValueError(f"{config_path}: {exc}") from exc
 
     def max_input_files(self) -> dict[str, int]:
-        # refused before the data worker decodes anything; process_prompt takes only these
-        return {"image": MAX_KEYFRAMES, "audio": 0, "video": 0}
+        # refused before the data worker decodes anything; process_prompt takes only these. A
+        # distilled DiT was distilled for text to audio+video alone.
+        return {"image": 0 if self.config.distilled else MAX_KEYFRAMES, "audio": 0, "video": 0}
 
     def load_image(self, filepath: str, device: str) -> TensorAndMetadata:
         """A keyframe as decoded RGB, uint8 ``[3, H, W]``: ``process_prompt`` puts it on the
@@ -428,13 +442,25 @@ class H3Model(Model):
         return request
 
     def resolve_schedule(self, model_kwargs: dict) -> ScheduleArgs:
-        steps = _positive_int(model_kwargs, "num_inference_steps", DEFAULT_NUM_INFERENCE_STEPS)
+        distilled = self.config.distilled
+        default = DEFAULT_NUM_INFERENCE_STEPS if distilled is None else len(distilled.rungs) + 1
+        steps = _positive_int(model_kwargs, "num_inference_steps", default)
         if not 2 <= steps <= MAX_INFERENCE_STEPS + 1:
             raise ValueError(f"MiniMax-H3 num_inference_steps must be in [2, {MAX_INFERENCE_STEPS + 1}]; got {steps}")
         video_shift = _positive_float(model_kwargs, "flow_shift", self.config.video_shift)
         audio_shift = _positive_float(model_kwargs, "audio_flow_shift", self.config.audio_shift)
-        h3_schedule(steps, video_shift, audio_shift)  # a grid the two schedules can't share is a 400
-        return ScheduleArgs(steps, video_shift, audio_shift)
+        rungs = None
+        if distilled is not None:
+            # the recipe the DiT was distilled for is the only one it samples
+            if (steps, video_shift, audio_shift) != (default, distilled.video_shift, distilled.audio_shift):
+                raise ValueError(
+                    f"this MiniMax-H3 DiT is distilled for {len(distilled.rungs)} steps (num_inference_steps "
+                    f"{default}) at flow_shift {distilled.video_shift:g} / audio_flow_shift "
+                    f"{distilled.audio_shift:g}; got {steps}, {video_shift:g} / {audio_shift:g}"
+                )
+            rungs = distilled.rungs
+        h3_schedule(steps, video_shift, audio_shift, rungs)  # a grid the two schedules can't share is a 400
+        return ScheduleArgs(steps, video_shift, audio_shift, rungs)
 
     @staticmethod
     def _generate_walk_for(output_modalities: list[str] | None, keyframes: bool = False) -> str:
@@ -637,14 +663,15 @@ class H3Model(Model):
         if node_name == TEXT_ENCODER_NODE:
             return H3TextEncoderSubmodule(
                 weight_loader.build_text_encoder(config, snapshot, device),
-                weight_loader.build_text_conditioner(config, snapshot, device),
+                weight_loader.build_text_conditioner(config, snapshot, device, dit_source=config.dit_source),
                 vision=weight_loader.build_vision_tower(snapshot, device), config=config,
             )
         if node_name == VAE_ENCODER_NODE:
             return H3VaeEncoderSubmodule(weight_loader.build_keyframe_encoder(config, snapshot, device))
         if node_name == DIT_NODE:
             return H3DenoiseSubmodule(
-                weight_loader.build_transformer(config, snapshot, device, comm_group=tp_group),
+                weight_loader.build_transformer(config, snapshot, device, comm_group=tp_group,
+                                                dit_source=config.dit_source),
                 config, loop_name=DENOISE_LOOP,
                 max_batch_size=1, compile_blocks=self.compile, row_bucket=self.row_bucket,
                 step_cache=self.step_cache,

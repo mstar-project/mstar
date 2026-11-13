@@ -13,6 +13,11 @@ FL2VA: ``--image`` (first frame) and / or ``--last-image``; the canvas then foll
 first keyframe unless ``--height`` / ``--width`` are given. The Qwen3-VL call's inputs
 (the presentation's token ids, the processor's pixels and grids) and the encoded
 keyframe latents are recorded too.
+
+``--distilled <FastH3 release>``: its diffusers-layout transformer instead of FL2VA's, sampled
+as FastVideo samples it (``MiniMaxH3DenoisingStage._set_shifted_schedule``): the release's
+rungs over 1000 and a terminal 0, shifted in fp32 by its video / audio shifts, through the
+same scheduler step; ``--steps`` is then the rungs plus one.
 """
 
 from __future__ import annotations
@@ -83,6 +88,51 @@ def build_transformer(snapshot: Path, device: str):
     return model.to(device).eval()
 
 
+def build_distilled_transformer(release: Path, device: str):
+    """A distilled release's transformer (FastH3: diffusers' layout, every tensor bf16) as diffusers'
+    ``from_pretrained(torch_dtype=bfloat16)`` holds it: ``_keep_in_fp32_modules`` upcast. VSA's
+    compression gates are dropped: dense attention reads none."""
+    from diffusers import MiniMaxH3Transformer3DModel
+    from safetensors import safe_open
+
+    src = release / "transformer"
+    cfg = {k: v for k, v in json.loads((src / "config.json").read_text()).items() if not k.startswith("_")}
+    fp32 = tuple(f"{name}." for name in MiniMaxH3Transformer3DModel._keep_in_fp32_modules)
+    state = {}
+    for shard in sorted(src.glob("diffusion_pytorch_model-*.safetensors")):
+        with safe_open(str(shard), framework="pt", device="cpu") as f:
+            for key in f.keys():
+                if ".attn.to_gate_compress." not in key:
+                    tensor = f.get_tensor(key)
+                    state[key] = tensor.float() if key.startswith(fp32) else tensor
+    with torch.device("meta"):
+        model = MiniMaxH3Transformer3DModel(**cfg)
+    missing, unexpected = model.load_state_dict(state, strict=False, assign=True)
+    if unexpected or [m for m in missing if not m.endswith("rope.inv_freq")]:
+        raise RuntimeError(f"transformer load: missing {missing[:4]}, unexpected {unexpected[:4]}")
+    n = model.config.rope_freq_dim
+    model.rope.inv_freq = 1.0 / (model.config.rope_theta ** (torch.arange(0, 2 * n, 2, dtype=torch.float32) / (2 * n)))
+    return model.to(device).eval()
+
+
+def rung_schedulers(release: Path):
+    """The video and audio schedulers on the release's trained rungs, FastVideo's grid."""
+    from diffusers import MiniMaxH3Scheduler
+
+    contract = json.loads((release / "fastvideo_inference.json").read_text())
+    rungs = contract["dmd_denoising_steps"]
+
+    class RungScheduler(MiniMaxH3Scheduler):
+        def set_timesteps(self, num_inference_steps=None, device=None, sigmas=None):
+            # the pipeline's step count and per-request shift are the recipe's; the grid is the rungs'
+            base = torch.tensor([r / 1000.0 for r in rungs] + [0.0], dtype=torch.float32)
+            shift = float(self.config.shift)
+            super().set_timesteps(device=device, sigmas=shift * base / (1 + (shift - 1) * base))
+
+    return tuple(RungScheduler(shift=float(contract[f"{m}_scheduler_shift"]), shift_provided_sigmas=False)
+                 for m in ("video", "audio"))
+
+
 def build_text_encoder(snapshot: Path, device: str, layers: int = 51):
     from transformers import AutoConfig, Qwen3VLForConditionalGeneration
 
@@ -109,6 +159,7 @@ def main():
     p.add_argument("--attention", default="native", help="diffusers attention backend (native / flash / ...)")
     p.add_argument("--record-every", type=int, default=1, help="record the transformer's I/O every k steps")
     p.add_argument("--skip-decode", action="store_true")
+    p.add_argument("--distilled", type=Path, default=None, help="a distilled release (FastH3) whose DiT to sample")
     args = p.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     keyframes = {}
@@ -125,7 +176,12 @@ def main():
     from transformers import Qwen2TokenizerFast, Qwen3VLProcessor
 
     t0 = time.time()
-    transformer = build_transformer(args.snapshot, args.device)
+    if args.distilled is None:
+        transformer = build_transformer(args.snapshot, args.device)
+        schedulers = MiniMaxH3Scheduler(shift=12.0), MiniMaxH3Scheduler(shift=3.0)
+    else:
+        transformer = build_distilled_transformer(args.distilled, args.device)
+        schedulers = rung_schedulers(args.distilled)
     if args.attention != "native":
         transformer.set_attention_backend(args.attention)
     text_encoder = build_text_encoder(args.snapshot, args.device)
@@ -152,7 +208,7 @@ def main():
         transformer=transformer, text_encoder=text_encoder, vae=vae, audio_vae=audio_vae,
         tokenizer=Qwen2TokenizerFast.from_pretrained(args.snapshot / "FL2VA" / "tokenizer"),
         processor=Qwen3VLProcessor.from_pretrained(args.snapshot / "FL2VA" / "processor"),
-        scheduler=MiniMaxH3Scheduler(shift=12.0), audio_scheduler=MiniMaxH3Scheduler(shift=3.0),
+        scheduler=schedulers[0], audio_scheduler=schedulers[1],
     )
 
     steps = []
