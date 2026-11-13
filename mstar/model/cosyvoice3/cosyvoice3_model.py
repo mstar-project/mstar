@@ -16,8 +16,8 @@ Walks and partitions::
     LM partition:     prefill        (cross-lingual / instruct)  llm
                       prefill_voice  (zero-shot, with ref_text)  speaker_encoder -> llm
                       decode         Loop over llm, one speech token per step
-    Token2Wav:        token2wav      flow -> hift, fed by the ``speech_tokens``
-                                     stream from the LM
+    Token2Wav:        token2wav      Loop over flow -> hift, one iteration per
+                                     chunk of the ``speech_tokens`` stream
 
 Every request needs a reference voice: an uploaded clip (``ref_audio``) or a
 preset from ``voices_dir``; the checkpoint ships none. With its transcript
@@ -43,28 +43,24 @@ import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import PartitionDefinition
-from mstar.engine.resources import (
-    AttentionConfig,
-    AttentionSpec,
-    BlockCausalAttentionSpec,
-    KVReqConfig,
-    KVSpec,
-    NodeResourceSpec,
-    PagedKVConfig,
-    PositionConfig,
-    PositionSpec,
-    ResourceReqConfig,
-)
-from mstar.engine.resources.recurrent.config import (
-    RecurrentBlockConfig,
-    RecurrentStateConfig,
-    RecurrentStateSpec,
+from mstar.engine.state import (
+    Array,
+    Attend,
+    BlockCausal,
+    Causal,
+    Entry,
+    KVEntry,
+    Layout,
+    Positions,
+    Read,
+    Rope,
+    TensorType,
+    Value,
 )
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import (
     KVLabel,
-    LabelLayout,
     Model,
     ProcessPromptOutput,
     Span,
@@ -89,16 +85,14 @@ from mstar.model.cosyvoice3.config import (
     FLOW_KV_PAGE_FRAMES,
     FLOW_NODE,
     FLOW_TAILS,
-    FLOW_TAILS_LABEL,
     FLOW_UNCOND_LABEL,
     HIFT_NODE,
     HIFT_STATE,
-    HIFT_STATE_LABEL,
     LM_ATTN,
     LM_KV,
     LM_LABEL,
     LM_NODE,
-    LM_POS,
+    RAS_HISTORY,
     SAMPLE_RATE,
     SPEAKER_ENCODER_NODE,
     SYSTEM_PROMPT,
@@ -108,19 +102,22 @@ from mstar.model.cosyvoice3.config import (
 from mstar.model.cosyvoice3.submodules import (
     AUDIO_CHUNK,
     DECODE_LOOP,
+    FLOW_COUNTS,
     FLOW_NEW_FRAMES_REGION,
+    HIFT_COUNTS,
+    HIFT_MEL,
     MAX_SPEECH_TOKENS,
     MEL,
     MEL_FINAL,
-    MEL_TAIL_BLOCK,
     MIN_SPEECH_TOKENS,
-    PHASE_CARRY_BLOCK,
     PREV_TOKEN,
     PROMPT_TOKENS,
+    RAW_TOKENS,
     REF_AUDIO,
     SPEECH_TOKENS,
-    TAILS_BLOCK,
     TEXT_INPUTS,
+    TOKEN2WAV_LOOP,
+    VOICE,
     VOICE_KEY,
     reference_tokens,
 )
@@ -350,101 +347,64 @@ class CosyVoice3Model(Model):
                 f"{config_path}: prefill_token_buckets can't set {FLOW_NODE}/{FLOW_NEW_FRAMES_REGION}; its "
                 "buckets also pack the flow's rows and size its cache, so set model_kwargs.flow_new_frame_buckets"
             )
-        check_kv_pools_fit(self, config, config_path, logger)
-        cap = config.get("max_concurrent_requests")
-        if not isinstance(cap, int) or isinstance(cap, bool) or cap < 1:
-            return  # check_kv_pools_fit reports it
-        if self.config.flow_cache_frames:
-            # the common check counts one stream a request, and a row keeps two
-            # without an override, the pool `_flow_resources` builds
-            default = self._flow_kv_pages(DEFAULT_FLOW_REQUESTS)
-            pages = (config.get("resources", {}).get(FLOW_KV) or {}).get("max_num_pages", default)
-            if pages < self._flow_kv_pages(cap):
-                raise ValueError(
-                    f"{config_path}: {cap} concurrent requests need {self._flow_kv_pages(cap)} pages of "
-                    f"resources.{FLOW_KV}: each keeps two streams of {self.config.flow_cache_frames} frames"
-                )
+        # a request keeps both of the flow's streams at once
+        layouts = {FLOW_KV: self._flow_layouts()} if self.config.flow_cache_frames else None
+        check_kv_pools_fit(self, config, config_path, logger, request_layouts=layouts)
 
     def _flow_kv_pages(self, requests: int) -> int:
         return 1 + requests * 2 * -(-self.config.flow_cache_frames // FLOW_KV_PAGE_FRAMES)
 
-    def get_node_resources(self) -> list[NodeResourceSpec]:
-        lm = self.config.lm
-        kv = PagedKVConfig(
-            num_layers=lm.num_hidden_layers,
-            num_kv_heads=lm.num_key_value_heads,
-            head_dim=lm.head_dim,
-            max_seq_len=self._max_seq_len(),
-            num_qo_heads=lm.num_attention_heads,
-        )
-        specs: list[NodeResourceSpec] = [
-            KVSpec(resource_key=LM_KV, nodes={LM_NODE}, config=kv),
-            AttentionSpec(
-                resource_key=LM_ATTN,
-                nodes={LM_NODE},
-                config=AttentionConfig(kv_cache=LM_KV, decode_fmha=True),
-            ),
-            PositionSpec(
-                resource_key=LM_POS,
-                nodes={LM_NODE},
-                config=PositionConfig(kv_cache=LM_KV, rope_theta=lm.rope_theta),
-            ),
-        ]
-        return specs + hift_state_specs(self.config) + self._flow_resources()
-
-    def _flow_resources(self) -> list[NodeResourceSpec]:
+    def declare_state(self) -> list[Array]:
         cfg = self.config
-        if not cfg.flow_cache_frames:
-            return []
-        dit = cfg.flow.dit
-        steps = cfg.flow.cfm.n_timesteps
-        return [
-            # one layer per DiT block per Euler step: each sees its own K/V of the frames before it
-            KVSpec(
-                resource_key=FLOW_KV,
-                nodes={FLOW_NODE},
-                config=PagedKVConfig(
-                    num_layers=dit.depth * steps,
-                    num_kv_heads=dit.heads,
-                    num_qo_heads=dit.heads,
-                    head_dim=dit.dim_head,
-                    max_seq_len=cfg.flow_cache_frames,
-                    max_num_pages=self._flow_kv_pages(DEFAULT_FLOW_REQUESTS),
-                    page_size=FLOW_KV_PAGE_FRAMES,
-                    prefix_cache=False,
-                ),
+        lm, dit, steps = cfg.lm, cfg.flow.dit, cfg.flow.cfm.n_timesteps
+        arrays = [
+            Array(
+                LM_KV, nodes={LM_NODE}, layers=frozenset(range(lm.num_hidden_layers)),
+                entry=KVEntry(heads=lm.num_key_value_heads, head_dim=lm.head_dim), max_len=self._max_seq_len(),
+                reads={LM_ATTN: Read(mask=Causal(), op=Attend(q_heads=lm.num_attention_heads))},
+                # `ParallelAttention` passed these on every call, which picks FlashInfer's llama31 kernel. At
+                # rope_scale 1 they change no frequency.
+                positions=Positions(rope=Rope(
+                    theta=lm.rope_theta, low_freq_factor=1.0, high_freq_factor=1.0, old_context_len=8192,
+                )),
             ),
-            BlockCausalAttentionSpec(
-                resource_key=FLOW_ATTN,
-                nodes={FLOW_NODE},
-                config=AttentionConfig(kv_cache=FLOW_KV),
-                block_size=dit.static_chunk_size,
-            ),
-            RecurrentStateSpec(
-                resource_key=FLOW_TAILS,
-                nodes={FLOW_NODE},
-                config=RecurrentStateConfig(
-                    num_layers=1,
-                    # Euler step, CFG branch, convolution: the kernel's left context
-                    blocks={
-                        TAILS_BLOCK: RecurrentBlockConfig(
-                            shape=(4 * steps, dit.conv_pos_kernel - 1, dit.dim), dtype=None, per_layer=False,
-                        )
-                    },
-                    max_slots=2 * DEFAULT_FLOW_REQUESTS,
-                    labels=(FLOW_TAILS_LABEL,),
-                ),
-            ),
+            Value(RAS_HISTORY, nodes={LM_NODE}, layers=frozenset({0}), entry=Entry({
+                "tokens": TensorType((max(cfg.sampling.ras_window, 1),), dtype=torch.int64),
+            })),
         ]
+        if cfg.flow_cache_frames:
+            arrays += [
+                # one layer per DiT block per Euler step: each sees its own K/V of the frames before it
+                Array(
+                    FLOW_KV, nodes={FLOW_NODE}, layers=frozenset(range(dit.depth * steps)),
+                    entry=KVEntry(heads=dit.heads, head_dim=dit.dim_head), max_len=cfg.flow_cache_frames,
+                    labels=frozenset({FLOW_COND_LABEL, FLOW_UNCOND_LABEL}),
+                    reads={FLOW_ATTN: Read(mask=BlockCausal(dit.static_chunk_size), op=Attend(q_heads=dit.heads))},
+                ),
+                # Euler step, CFG branch, convolution: the kernel's left context
+                Value(FLOW_TAILS, nodes={FLOW_NODE}, layers=frozenset({0}), entry=Entry({
+                    "tails": TensorType((4 * steps, dit.conv_pos_kernel - 1, dit.dim), dtype=None),
+                })),
+            ]
+        if cfg.hift_captured:
+            # what a captured vocoder keeps per stream
+            arrays.append(Value(HIFT_STATE, nodes={HIFT_NODE}, layers=frozenset({0}), entry=Entry({
+                "mel_tail": TensorType((cfg.hift.in_channels, cfg.hift_tail_frames), dtype=torch.float32),
+                "phase_carry": TensorType((cfg.hift.nb_harmonics + 1,), dtype=torch.float32),
+            })))
+        return arrays
 
-    def get_request_resource_configs(
-        self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
-    ) -> dict[str, ResourceReqConfig]:
-        del input_modalities, output_modalities, model_kwargs
-        configs: dict[str, ResourceReqConfig] = {LM_KV: KVReqConfig(needed_labels=[LM_LABEL])}
+    def kernel_settings(self) -> dict[str, dict[str, Any]]:
+        settings: dict[str, dict[str, Any]] = {LM_ATTN: {"decode_fmha": True}}
         if self.config.flow_cache_frames:
-            configs[FLOW_KV] = KVReqConfig(needed_labels=[FLOW_COND_LABEL, FLOW_UNCOND_LABEL])
-        return configs
+            settings[FLOW_KV] = {
+                "max_num_pages": self._flow_kv_pages(DEFAULT_FLOW_REQUESTS), "page_size": FLOW_KV_PAGE_FRAMES,
+            }
+            settings[FLOW_TAILS] = {"max_slots": 2 * DEFAULT_FLOW_REQUESTS}
+        if self.config.hift_captured:
+            # a slot per request, and the sink
+            settings[HIFT_STATE] = {"max_slots": HIFT_STATE_REQUESTS + 1}
+        return settings
 
     def resolve_generation_kwargs(self, model_kwargs: dict | None) -> dict[str, Any]:
         """Every public knob, defaulted and range-checked, so a bad value is a
@@ -502,16 +462,17 @@ class CosyVoice3Model(Model):
             labels[FLOW_KV] = {FLOW_COND_LABEL: KVLabel(), FLOW_UNCOND_LABEL: KVLabel()}
         return labels
 
-    def _flow_layout(self) -> LabelLayout:
-        """At most a row's budget; hops decide how it splits into steps."""
+    def _flow_layouts(self) -> dict[str, Layout]:
+        """Each of a request's two streams: at most a row's budget; hops decide how it splits into steps."""
         frames = self.config.flow_cache_frames
-        return LabelLayout(spans=(Span("rows", "token2wav", frames, frames, SPEECH_TOKENS),))
+        layout = Layout(spans=(Span("rows", "token2wav", frames, frames, SPEECH_TOKENS),))
+        return {FLOW_COND_LABEL: layout, FLOW_UNCOND_LABEL: layout}
 
     @staticmethod
-    def _lm_layout(walk: str, text_tokens: int, prompt_tokens: int) -> LabelLayout:
+    def _lm_layout(walk: str, text_tokens: int, prompt_tokens: int) -> Layout:
         """What the LM writes: ``[sos | text | task_id | prompt speech]`` as ``build_prefill_embeds``
         lays it out, then a row per decode step."""
-        return LabelLayout(
+        return Layout(
             spans=(
                 Span("rows", walk, 1, 1, TEXT_INPUTS),
                 Span("ids", walk, text_tokens, text_tokens, TEXT_INPUTS),
@@ -564,19 +525,33 @@ class CosyVoice3Model(Model):
             max_iters=self._speech_limit,
             outputs=[],
         )
-        token2wav = Sequential(
-            [
-                GraphNode(
-                    name=FLOW_NODE,
-                    input_names=[SPEECH_TOKENS, REF_AUDIO],
-                    outputs=[GraphEdge(next_node=HIFT_NODE, name=MEL), GraphEdge(next_node=HIFT_NODE, name=MEL_FINAL)],
-                ),
-                GraphNode(
-                    name=HIFT_NODE,
-                    input_names=[MEL, MEL_FINAL],
-                    outputs=[GraphEdge(next_node=EMIT_TO_CLIENT, name=AUDIO_CHUNK, output_modality="audio")],
-                ),
-            ]
+        token2wav = Loop(
+            name=TOKEN2WAV_LOOP,
+            section=Sequential(
+                [
+                    GraphNode(
+                        name=FLOW_NODE,
+                        input_names=[SPEECH_TOKENS, REF_AUDIO, VOICE, FLOW_COUNTS, RAW_TOKENS],
+                        outputs=[
+                            GraphEdge(next_node=HIFT_NODE, name=MEL),
+                            GraphEdge(next_node=HIFT_NODE, name=MEL_FINAL),
+                            *(GraphEdge(next_node=FLOW_NODE, name=name) for name in (VOICE, FLOW_COUNTS, RAW_TOKENS)),
+                        ],
+                    ),
+                    GraphNode(
+                        name=HIFT_NODE,
+                        input_names=[MEL, MEL_FINAL, HIFT_COUNTS, HIFT_MEL],
+                        outputs=[
+                            GraphEdge(next_node=EMIT_TO_CLIENT, name=AUDIO_CHUNK, output_modality="audio"),
+                            GraphEdge(next_node=HIFT_NODE, name=HIFT_COUNTS),
+                            GraphEdge(next_node=HIFT_NODE, name=HIFT_MEL),
+                        ],
+                    ),
+                ]
+            ),
+            # a chunk brings at least one new token, and the stream's end may come as a chunk of its own
+            max_iters=self._speech_limit + 2,
+            outputs=[],
         )
         return {"prefill": prefill, "prefill_voice": prefill_voice, "decode": decode, "token2wav": token2wav}
 
@@ -759,13 +734,9 @@ class CosyVoice3Model(Model):
                 MAX_SPEECH_TOKENS: max(max_len, 1),
                 VOICE_KEY: int(voice_key_for(wav)[0]),
                 PROMPT_MODE: mode,
-                "kv_layout": {
+                "state_layout": {
                     LM_KV: {LM_LABEL: layout},
-                    **(
-                        {FLOW_KV: {FLOW_COND_LABEL: self._flow_layout(), FLOW_UNCOND_LABEL: self._flow_layout()}}
-                        if self.config.flow_cache_frames
-                        else {}
-                    ),
+                    **({FLOW_KV: self._flow_layouts()} if self.config.flow_cache_frames else {}),
                 },
             },
         )
@@ -915,33 +886,6 @@ class CosyVoice3Model(Model):
         hift.load_weights((k, v.to(device)) for k, v in self._state_dict(self.config.hift_weights))
         hift.keep_f0_predictor_in_float64()
         return HiFTSubmodule(hift.eval(), self.config)
-
-
-def hift_state_specs(config: CosyVoice3Config, dtype: torch.dtype = torch.float32) -> list[NodeResourceSpec]:
-    """What a captured vocoder keeps per stream: its mel tail and phase carry."""
-    if not config.hift_captured:
-        return []
-    hift = config.hift
-    return [
-        RecurrentStateSpec(
-            resource_key=HIFT_STATE,
-            nodes={HIFT_NODE},
-            config=RecurrentStateConfig(
-                num_layers=1,
-                blocks={
-                    MEL_TAIL_BLOCK: RecurrentBlockConfig(
-                        shape=(hift.in_channels, config.hift_tail_frames), dtype=dtype, per_layer=False,
-                    ),
-                    PHASE_CARRY_BLOCK: RecurrentBlockConfig(
-                        shape=(hift.nb_harmonics + 1,), dtype=dtype, per_layer=False,
-                    ),
-                },
-                # a slot per request, and the sink
-                max_slots=HIFT_STATE_REQUESTS + 1,
-                labels=(HIFT_STATE_LABEL,),
-            ),
-        )
-    ]
 
 
 def _parse_dtype(name: str) -> torch.dtype:

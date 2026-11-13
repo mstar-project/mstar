@@ -51,7 +51,7 @@ Parameter paths match ``hift.pt`` (weight norm folded).
 from __future__ import annotations
 
 import math
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import NamedTuple
 
@@ -456,6 +456,18 @@ class HiftStreamState:
     def mel_end(self) -> int:
         return self.mel_start + int(self.mel.shape[-1])
 
+    def edges(self) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        """The state as it goes to the stream's next chunk: its counts on the host, then its mel and phase carry, a
+        carry it hasn't got as a 0-element tensor."""
+        counts = torch.tensor([self.mel_start, self.carry_frame, self.emitted, self.done], dtype=torch.int64)
+        return counts, [self.mel, self.mel.new_empty(0) if self.carry is None else self.carry]
+
+    @classmethod
+    def from_edges(cls, counts: Sequence[int], mel: Sequence[torch.Tensor]) -> HiftStreamState:
+        mel_start, carry_frame, emitted, done = counts
+        window, carry = mel
+        return cls(window, mel_start, carry if carry.numel() else None, carry_frame, emitted, bool(done))
+
 
 def stream_vocode(
     hift: CausalHiFTGenerator,
@@ -520,6 +532,18 @@ class CapturedStream:
     done: bool = False
     # frames not run yet, since nothing was final to emit
     pending: torch.Tensor | None = None
+
+    def edges(self, device: torch.device) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        """As `HiftStreamState.edges`: the counts on the host, then the pending mel. A pending mel of no frames goes as
+        none, which `plan_stream_row` treats as no pending frames."""
+        counts = torch.tensor([self.received, self.emitted, self.carry_frame, self.done], dtype=torch.int64)
+        return counts, [torch.empty(0, device=device) if self.pending is None else self.pending]
+
+    @classmethod
+    def from_edges(cls, counts: Sequence[int], mel: Sequence[torch.Tensor]) -> CapturedStream:
+        received, emitted, carry_frame, done = counts
+        (pending,) = mel
+        return cls(received, emitted, carry_frame, bool(done), pending if pending.numel() else None)
 
 
 class StreamRow(NamedTuple):
