@@ -27,7 +27,13 @@ from mstar.engine.resources.linear_attn.config import LinearAttnSpec, LinearAttn
 from mstar.engine.resources.recurrent.config import RecurrentBlockConfig, RecurrentStateSpec
 from mstar.engine.resources.recurrent.pool import RecurrentStatePool
 from mstar.engine.resources.sampler.config import SamplerSpec
-from mstar.engine.resources.spec import CombinedSplit, apply_yaml_overrides, spec_dependency_problems
+from mstar.engine.resources.sequence_shard import sequence_parallel_refusals
+from mstar.engine.resources.spec import (
+    CombinedSplit,
+    apply_yaml_overrides,
+    resolve_spec_dependencies,
+    spec_dependency_problems,
+)
 from mstar.engine.state import (
     Array,
     Attend,
@@ -42,6 +48,7 @@ from mstar.engine.state import (
     Positions,
     Read,
     Sampler,
+    SeqShard,
     TensorType,
     Value,
     Window,
@@ -853,3 +860,15 @@ def test_sdpa_refuses_a_block_causal_read():
     setup, problems = state_setup({"resources": {"vision_attn": {"backend": "sdpa"}}}, [array])
     assert "vision_attn" not in setup.by_read, "a worker would attend each row whole"
     assert len(problems) == 1 and "mask must be Block, the mask SdpaAttend runs within a step" in problems[0], problems
+
+
+def test_a_block_causal_read_within_a_step_is_refused_on_a_node_that_splits_its_steps():
+    """Its resource takes no split steps, which the engine would otherwise refuse only once it builds the resource."""
+    audio = Array("audio", nodes={"llm"}, layers={0}, entry=KVEntry(heads=4, head_dim=16), max_len=0,
+                  reads={"audio_attn": _read(mask=BlockCausal(25))})
+    shard = SeqShard("shard", nodes={"llm"}, labels={"vision"})
+    specs = resolve_spec_dependencies(build_specs([_within(labels={"vision"}), audio, shard]))
+    refusals = sequence_parallel_refusals(specs.values(), "llm", 1, 2)
+    assert any("'audio_attn' takes no split steps" in refusal for refusal in refusals), (
+        "the node would load, and its SP ranks would each attend a share of the audio as if it were whole"
+    )
