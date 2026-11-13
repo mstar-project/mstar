@@ -489,10 +489,16 @@ def positions(h: ArrayHandle) -> torch.Tensor:
     return _positions(h).pos_ids(h.label)
 
 
-def rope(h: ArrayHandle, q: torch.Tensor, k: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """``q`` and ``k`` rotated at this step's positions with the declared `Rope`."""
+def rope(
+    h: ArrayHandle, q: torch.Tensor, k: torch.Tensor | None, *, at: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """``q`` and ``k`` rotated with the declared `Rope`, at this step's positions, or at ``at``, (tokens,) on the
+    device, for a pass that sits elsewhere. ``k`` None rotates ``q`` alone."""
     h._check_open("rope")
-    return _positions(h).apply_qk(q, k, label=h.label, rope_dtype=h.rope_dtype or q.dtype)
+    rope_dtype = h.rope_dtype or q.dtype
+    if at is None:
+        return _positions(h).apply_qk(q, k, label=h.label, rope_dtype=rope_dtype)
+    return _positions(h).apply_qk(q, k, label=h.label, rope_dtype=rope_dtype, pos_ids=at)
 
 
 @torch.compiler.disable

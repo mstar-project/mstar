@@ -270,6 +270,7 @@ SNAPSHOT = {
         ["h", "POSITIONAL_OR_KEYWORD", None],
         ["q", "POSITIONAL_OR_KEYWORD", None],
         ["k", "POSITIONAL_OR_KEYWORD", None],
+        ["at", "KEYWORD_ONLY", "None"],
     ],
     "state_op": [
         ["adds", "KEYWORD_ONLY", "()"],

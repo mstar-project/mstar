@@ -1035,7 +1035,10 @@ class _Counter:
     def pos_ids(self, label: str) -> torch.Tensor:
         raise _no_layout(self._array, "positions(), and its positions are a count with no ids")
 
-    def apply_qk(self, q: torch.Tensor, k: torch.Tensor, *, label: str, rope_dtype: torch.dtype) -> tuple:
+    def apply_qk(
+        self, q: torch.Tensor, k: torch.Tensor | None, *, label: str, rope_dtype: torch.dtype,
+        pos_ids: torch.Tensor | None = None,
+    ) -> tuple:
         raise _no_layout(self._array, "rope(), and its positions declare no Rope")
 
 
