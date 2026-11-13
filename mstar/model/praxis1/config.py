@@ -64,6 +64,7 @@ _SHARED_DEFAULTS = {
     "window_frames": 93, "n_chunks": 4, "grid_hz": 15.0,
     "latent_channels": 48, "vae_stride": (4, 16, 16), "patch_size": (1, 2, 2),
     "text_model": "Qwen3.5-2B", "text_hidden_dim": 2048, "text_hidden_layer": -3,
+    "text_pad_to_multiple_of": 32,
     "antialias": True,
 }
 
@@ -143,6 +144,7 @@ class Praxis1Config:
     text_model: str
     text_hidden_dim: int
     text_hidden_layer: int
+    text_pad_to_multiple_of: int
 
     normalization: Mapping[str, Any] = field(default_factory=dict)
     raw: Mapping[str, Any] = field(default_factory=dict)
@@ -266,6 +268,9 @@ class Praxis1Config:
 
         stride = video.get("vae_stride", (4, 16, 16))
         patch_size = video.get("patch_size", (1, 2, 2))
+        text_pad_to_multiple_of = int(text.get("pad_to_multiple_of", 32))
+        if text_pad_to_multiple_of < 1:
+            raise Praxis1ConfigError("text pad_to_multiple_of must be positive")
 
         return cls(
             embodiment=embodiment,
@@ -313,6 +318,7 @@ class Praxis1Config:
             text_model=str(text.get("model", "Qwen3.5-2B")),
             text_hidden_dim=int(text.get("hidden_dim", 2048)),
             text_hidden_layer=int(text.get("hidden_layer", -3)),
+            text_pad_to_multiple_of=text_pad_to_multiple_of,
             normalization=_section(config, "normalization"),
             raw=dict(config),
         )
