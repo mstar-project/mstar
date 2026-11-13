@@ -76,7 +76,7 @@ from mstar.utils.ipc_format import (
     WorkerMessage,
     WorkerMessageType,
 )
-from mstar.utils.logging_config import quiet_noisy_loggers
+from mstar.utils.logging_config import REQUEST_LOGGER, quiet_noisy_loggers
 from mstar.utils.orphan import exit_when_orphaned
 from mstar.utils.profiler import nvtx_enabled, range_pop, range_push
 from mstar.utils.threads import Thread
@@ -84,6 +84,7 @@ from mstar.validation import validate_deployment
 from mstar.validation.resources import streamed_partitions
 
 logger = logging.getLogger(__name__)
+request_log = logging.getLogger(REQUEST_LOGGER)
 
 
 def _walk_io(model: Model) -> tuple[dict[str, tuple[tuple[str, str], ...]], dict[str, frozenset[str]], frozenset[str]]:
@@ -1264,7 +1265,7 @@ class Conductor:
                     and len(self.requests) >= self.max_concurrent_requests):
                 break
             body = self.waiting_queue.pop(0)
-            logger.debug(
+            request_log.debug(
                 "Admitting queued request %s (%d/%s in-flight)",
                 body.request_id, len(self.requests),
                 str(self.max_concurrent_requests),
@@ -1306,7 +1307,7 @@ class Conductor:
                 )
                 return
             self._queued_since_summary += 1
-            logger.debug(
+            request_log.debug(
                 "Request %s queued (at capacity: %d/%d)",
                 body.request_id, len(self.requests),
                 self.max_concurrent_requests,
@@ -1377,7 +1378,7 @@ class Conductor:
         self, body: NewRequestConductor
     ):
         """Actually dispatch a request to workers (no admission check)."""
-        logger.debug("Conductor ingesting request %s", body.request_id)
+        request_log.debug("Conductor ingesting request %s", body.request_id)
         ingest_time = time.perf_counter()
         # A request admitted on arrival never waited.
         arrival_time = (
@@ -1735,7 +1736,7 @@ class Conductor:
                 ),
             )
         self._drop_request(request_id)
-        logger.debug("Tore down request %s; freed worker resources", request_id)
+        request_log.debug("Tore down request %s; freed worker resources", request_id)
         self._try_admit_waiting()
 
     def _handle_reads_done(self, body: ReadsDone):
@@ -1876,7 +1877,7 @@ class Conductor:
         self, request_id: str
     ):
         """Called when all partitions are done."""
-        logger.debug("Request %s done", request_id)
+        request_log.debug("Request %s done", request_id)
         self._done_since_summary += 1
         request_data = self.requests[request_id]
         request_data.conductor_finish_time = time.perf_counter()
@@ -2067,7 +2068,7 @@ class Conductor:
         # downstream connections get `producer_done`.
         done = pstate.worker_reported_done
         if pstate.num_output_tokens >= request_data.max_output_tokens:
-            logger.debug(
+            request_log.debug(
                 "Partition %s reached max output tokens %d. Ending.",
                 partition_name, request_data.max_output_tokens,
             )

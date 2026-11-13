@@ -4,8 +4,12 @@ import pytest
 
 pytest.importorskip("torch")
 
+import types  # noqa: E402
+from collections import deque  # noqa: E402
+
 from mstar.conductor import conductor as conductor_mod  # noqa: E402
-from mstar.conductor.conductor import Conductor  # noqa: E402
+from mstar.conductor.conductor import Conductor, RequestData  # noqa: E402
+from mstar.utils.ipc_format import NewRequestConductor  # noqa: E402
 
 
 def _conductor(requests=(), waiting=()) -> Conductor:
@@ -55,3 +59,37 @@ def test_the_wait_for_messages_ends_at_the_summary():
     c._draining_deadlines = c._early_reads_done_deadlines = c._early_abort_deadlines = []
     c._next_summary = conductor_mod.time.perf_counter() + 1
     assert c._ms_to_next_timed_check() <= 1000
+
+
+def _serving_conductor(max_concurrent=None) -> Conductor:
+    """Enough state for the real ingest and done paths, sending into a list."""
+    c = _conductor()
+    c.sent = []
+    c.communicator = types.SimpleNamespace(send=lambda entity_id, msg: c.sent.append((entity_id, msg)))
+    c.max_concurrent_requests = max_concurrent
+    c.draining, c._drain_ttl_s, c._client_streams = {}, 120.0, {}
+    c._early_reads_done, c._early_abort_requests = {}, set()
+    c._draining_deadlines = deque()
+    c._early_reads_done_deadlines = deque()
+    c._early_abort_deadlines = deque()
+    c.enable_prof = c.enable_nvtx = False
+    return c
+
+
+def _request(rid: str) -> NewRequestConductor:
+    return NewRequestConductor(
+        request_id=rid, initial_signals={}, initial_input_modalities=["text"],
+        initial_output_modalities=["text"], input_metadata={}, model_kwargs={},
+    )
+
+
+def test_a_request_done_and_one_queued_at_capacity_are_counted():
+    c = _serving_conductor(max_concurrent=1)
+    c._register_request("a", RequestData(
+        persist_signals={}, persist_signal_ref_cnt={}, worker_graph_to_workers={0: ["w0"]},
+        all_worker_graph_ids={0}, max_output_tokens=1, random_seed=0, resource_configs={},
+    ))
+    c._ingest_request(_request("b"))            # at capacity: waits
+    c._process_request_done("a")
+    assert [b.request_id for b in c.waiting_queue] == ["b"]
+    assert (c._done_since_summary, c._queued_since_summary) == (1, 1)

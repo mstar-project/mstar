@@ -78,7 +78,7 @@ from mstar.utils.client_errors import client_error_text, scrub_paths
 from mstar.utils.exitcode import describe_exitcode
 from mstar.utils.gc_freeze import freeze_after_setup
 from mstar.utils.generation_kwargs import normalize_generation_kwargs
-from mstar.utils.logging_config import log_off_thread, quiet_noisy_loggers
+from mstar.utils.logging_config import REQUEST_LOGGER, configure_request_log, log_off_thread, quiet_noisy_loggers
 from mstar.utils.orphan import watch_parent
 from mstar.utils.socket_prefix import per_port_socket_prefix
 from mstar.utils.threads import Thread, pin_thread
@@ -88,6 +88,7 @@ if TYPE_CHECKING:
     import numpy as np
 
 logger = logging.getLogger(__name__)
+request_log = logging.getLogger(REQUEST_LOGGER)
 
 # The sets of ignored keys already reported, as digests: a client that sends a
 # key every request (a benchmark's ``temperature`` to a greedy model) is
@@ -198,6 +199,7 @@ def _conductor_process_target(
         force=True,
     )
     quiet_noisy_loggers()
+    configure_request_log()
     log_off_thread()
     # A server started as a background job of a non-interactive shell inherits
     # SIGINT ignored, and Python keeps an inherited ignore, so the graceful stop
@@ -958,7 +960,7 @@ class APIServer:
             raw_inputs=raw_inputs,
         ))
 
-        logger.debug(
+        request_log.debug(
             "Request %s submitted as %s  in=%s  out=%s",
             request_id, key, input_modalities, output_modalities,
         )
@@ -1323,7 +1325,7 @@ class APIServer:
                                 # release it once the client lets go.
                                 self.recently_completed[rid] = time.time()
                             elif message.message_type == "request_complete":
-                                logger.debug("API server received %s done", rid)
+                                request_log.debug("API server received %s done", rid)
                                 self.recently_completed[rid] = time.time()
 
                                 if not message.body.output_chunk_counts:
@@ -1659,7 +1661,7 @@ class APIServer:
                     yield new_chunks
 
                 if done:
-                    logger.debug("Async stream results received finish for %s", request_id)
+                    request_log.debug("Async stream results received finish for %s", request_id)
                     # flush remaining
                     remaining: list[ResultChunk] = []
                     finished_req: PendingRequest | None = None
@@ -3184,6 +3186,7 @@ def main(argv: list[str] | None = None):
         format="%(asctime)s %(levelname)s [api_server] %(name)s: %(message)s",
     )
     quiet_noisy_loggers()
+    configure_request_log()
     log_off_thread()
     api_key = resolve_api_key(args.api_key)
     api_key_guard.set(api_key)
