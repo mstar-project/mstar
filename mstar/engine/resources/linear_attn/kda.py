@@ -292,8 +292,8 @@ class KDAManager(LinearAttnManager):
                 # its prefill slices the spans on the host, so a replay would run the capture's
                 raise RuntimeError(
                     f"kda: {type(self.kernels).__name__} can't run a captured prefill "
-                    f"({lease.bucket}); leave the node's prefill buckets out where "
-                    "KDAManager.prefill_capturable is False"
+                    f"({lease.bucket}): a packed config whose largest bucket has one token a row "
+                    "passes can_capture and still reaches here"
                 )
             host = self.kernels.layout(spans, num_tokens, lease is not None)
             if host is not None:
