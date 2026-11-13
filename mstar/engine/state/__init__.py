@@ -18,6 +18,7 @@ from mstar.engine.state.calls import (
     host,
     kernel_setting,  # noqa: F401
     last_sampled,
+    openable,
     position,
     positions,
     rope,
@@ -99,6 +100,7 @@ __all__ = [
     "gather",
     "host",
     "last_sampled",
+    "openable",
     "position",
     "positions",
     "rope",

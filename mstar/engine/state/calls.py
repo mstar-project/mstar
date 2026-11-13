@@ -293,6 +293,9 @@ class ArrayHandle(StepHandle):
         runs it and the field's view."""
         raise self._unsupported(f"an update of type {kind.__name__}")
 
+    def _openable(self) -> int:
+        raise self._unsupported("openable")
+
     def _host(self, request: int, label: str, layer: int) -> Mapping[str, object]:
         raise self._unsupported("host")
 
@@ -441,6 +444,12 @@ def split_range(h: ShardHandle):
 def host(h: ArrayHandle, request: int, label: str, layer: int | torch.Tensor) -> Mapping[str, object]:
     """One entry's host fields on the host, as the last committed step left them."""
     return h._host(request, label, h._layer_id(layer))
+
+
+def openable(h: ArrayHandle) -> int:
+    """How many more requests ``h``'s array can open a label for now, on the host. A Value holds one entry per request
+    and label. At bind, before any request holds a slot, it is the Value's capacity."""
+    return h._openable()
 
 
 def _positions(h: ArrayHandle, cause: str = "the array declares no positions") -> Any:

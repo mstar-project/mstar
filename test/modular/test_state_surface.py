@@ -24,8 +24,8 @@ from mstar.engine.state.calls import ArrayHandle
 _POSITIONAL = {"PagedNHDTarget", "Segment", "SlotLease", "Span"}
 # The calls take the handle first, then what every call names, and only then keywords.
 _CALLS = {
-    "add_read", "at_last_token", "causal_conv", "gated_delta_net", "gather", "host", "last_sampled", "position",
-    "positions", "rope", "sample", "scatter", "split_range",
+    "add_read", "at_last_token", "causal_conv", "gated_delta_net", "gather", "host", "last_sampled", "openable",
+    "position", "positions", "rope", "sample", "scatter", "split_range",
 }
 # Each public name's parameters as ``[name, kind, default]``. A dataclass's parameters are its fields.
 SNAPSHOT = {
@@ -247,6 +247,9 @@ SNAPSHOT = {
     ],
     "last_sampled": [
         ["s", "POSITIONAL_OR_KEYWORD", None],
+    ],
+    "openable": [
+        ["h", "POSITIONAL_OR_KEYWORD", None],
     ],
     "position": [
         ["h", "POSITIONAL_OR_KEYWORD", None],

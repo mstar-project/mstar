@@ -1630,6 +1630,9 @@ class ValueHandle(ArrayHandle):
         self._record_update(field, layer)
         return runner, view
 
+    def _openable(self) -> int:
+        return self._pool.num_free_slots
+
 
 class _OneEntryPerRow(Reached):
     """A Value read's `Reached`. Its ``row_offsets`` is built only when asked for, so a read that doesn't ask launches
