@@ -40,6 +40,7 @@ import torch
 
 sys.path.insert(0, ".")
 
+from torch._dynamo.testing import CompileCounter
 from torch.nn.attention.flex_attention import (
     _DEFAULT_SPARSE_BLOCK_SIZE,
     BlockMask,
@@ -474,12 +475,12 @@ def test_make_block_mask_rejects_unaligned_and_non_multiple_lengths():
 # ---------------------------------------------------------------------------
 
 
-def plan_frame(manager: AttentionManager, frame: int) -> None:
-    """Stage session 0's masks for ``frame``."""
+def plan_frame(manager: AttentionManager, frame: int, slot: int = 0) -> None:
+    """Stage session 0's masks for ``frame`` in ``slot``."""
     manager.plan(
         AttentionStep(),
         StepContext(
-            request_ids=("r",), graph_walk="rollout", slot=0, capture=False,
+            request_ids=("r",), graph_walk="rollout", slot=slot, capture=False,
             plan_results={"kv": RingPlan(("r",), (0,), (frame,))},
         ),
     )
@@ -562,6 +563,61 @@ def test_attend_takes_the_compiled_path():
     assert (got - trap).abs().max().item() > 1e-2, (
         "attend's output is indistinguishable from the eager path; the mask is not honoured"
     )
+
+
+class _Block(torch.nn.Module):
+    """One layer's attention call, as a model's block makes it."""
+
+    def __init__(self, manager: AttentionManager):
+        super().__init__()
+        self.manager = manager
+
+    def forward(self, q, k, v):
+        return self.manager.attend(q, k, v, enable_gqa=True, layer_idx=0)
+
+
+def test_both_slots_attend_through_one_compiled_graph():
+    """The engine's pre-plan stages a step into one of two slots, in turn. A
+    block that guards on the slot compiles once per slot, which doubled the
+    compiles of Waypoint's DiT and added two minutes to its boot."""
+    q, k, v = qkv(visible_row((0,)))
+    manager = build_attention(AttnBackend.FLEX, ring_config())
+    counter = CompileCounter()
+    block = torch.compile(_Block(manager), backend=counter)
+
+    for slot in (0, 1, 0, 1):
+        plan_frame(manager, 1, slot=slot)
+        block(q, k, v)
+
+    assert counter.frame_count == 1, f"two slots compiled {counter.frame_count} graphs of one block"
+
+
+def test_a_step_attends_through_its_own_slot_s_buffer():
+    manager = build_attention(AttnBackend.FLEX, ring_config())
+    geometry = manager._geometry(manager._kv_config.layers[0])
+
+    for slot in (0, 1):
+        plan_frame(manager, 1, slot=slot)
+        assert manager._step_masks[0] is manager._planned_masks[(slot, geometry, 1)], (
+            f"slot {slot}'s captured graph baked its own buffer's address, and would replay another's"
+        )
+
+
+def test_attend_refuses_rows_the_plan_did_not_stage():
+    q, k, v = qkv(visible_row((0,)))
+    manager = build_attention(AttnBackend.FLEX, ring_config())
+    plan_frame(manager, 1)
+
+    with pytest.raises(RuntimeError, match="staged this step's masks for 1 rows"):
+        manager.attend(q.repeat(2, 1, 1, 1), k.repeat(2, 1, 1, 1), v.repeat(2, 1, 1, 1), enable_gqa=True, layer_idx=0)
+
+
+def test_attend_before_a_plan_is_refused():
+    q, k, v = qkv(visible_row((0,)))
+    manager = build_attention(AttnBackend.FLEX, ring_config())
+
+    with pytest.raises(RuntimeError, match="no mask staged"):
+        manager.attend(q, k, v, enable_gqa=True, layer_idx=0)
 
 
 def test_flex_attention_masked_is_a_compiled_callable():
