@@ -590,17 +590,19 @@ def test_ltx_on_sdpa_at_sp1_declares_no_step_as_main_did():
 
 def _h3_reference() -> list:
     """`H3Model.get_node_resources` before the port (#1138's): the DiT's attention over its rows and their padding, the
-    refiner's over the prompt, and the DiT's and the video decoder's sequence shards."""
+    refiner's over the prompt, and the DiT's and the video decoder's sequence shards. Since then the DiT's Ulysses
+    exchange pipelines over 2 head groups."""
     t = H3Config().transformer
     return [
         RaggedAttentionSpec(
             resource_key=key, nodes={node}, labels={label},
             config=RaggedAttentionConfig(
                 num_qo_heads=t.num_attention_heads, num_kv_heads=t.num_attention_heads, head_dim=t.attention_head_dim,
-                max_segments_per_request=segments, dtype=torch.bfloat16, workspace_mb=128,
+                max_segments_per_request=segments, dtype=torch.bfloat16, workspace_mb=128, ulysses_head_groups=groups,
             ),
         )
-        for key, node, label, segments in ((H3_ATTN, "dit", "main", 2), (REFINER_ATTN, "text_encoder", "text", 1))
+        for key, node, label, segments, groups in (
+            (H3_ATTN, "dit", "main", 2, 2), (REFINER_ATTN, "text_encoder", "text", 1, 1))
     ] + [
         SeqShardSpec(resource_key=DIT_SHARD, nodes={"dit"}, labels=("main",), axis=0),
         SeqShardSpec(resource_key=VAE_SHARD, nodes={"vae_decoder"}, labels=("clips",), axis=1, exchanges=False),

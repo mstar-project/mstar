@@ -112,6 +112,15 @@ class _Tokenizer:
         return self.SPECIAL.get(token)
 
 
+def test_the_dits_ulysses_exchange_pipelines_over_two_head_groups():
+    """The DiT's read pipelines its Ulysses exchange over 2 head groups; the refiner's keeps the defaults."""
+    from mstar.model.minimax_h3.config import DIT_ATTN, REFINER_ATTN
+
+    settings = _model().kernel_settings()
+    assert settings[DIT_ATTN] == {"max_segments_per_request": 2, "workspace_mb": 128, "ulysses_head_groups": 2}
+    assert settings[REFINER_ATTN] == {"workspace_mb": 128}
+
+
 def test_graph_walks_and_nodes():
     model = _model()
     walks = model.get_graph_walk_graphs()
