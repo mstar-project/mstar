@@ -30,6 +30,7 @@ from mstar.model.qwen3_tts.config import (
     CODE_PRED_SAMPLER,
     CODEC_STATE,
     LANGUAGE_ID_KEY,
+    LENGTH_BUDGET_KEY,
     PROMPT_LAYOUT_KEY,
     REF_CLIP_KEY,
     REF_SAMPLES_KEY,
@@ -542,6 +543,8 @@ def test_qwen3_tts_base_process_prompt_builds_in_context_clone():
         REF_SAMPLES_KEY: clip.numel(),
         # All 13 reference frames lead the codec stream as context (fewer than left_context).
         "stream_lead_items": {"codec_tokens": 13},
+        # 2 x (1.38 s + 0.39 s x 3 tokens) at 12.5 frames/s
+        LENGTH_BUDGET_KEY: 64,
     }
 
     # a stereo clip counts its samples per channel, as the RefEncoder downmixes it
@@ -558,6 +561,34 @@ def test_qwen3_tts_base_process_prompt_builds_in_context_clone():
     assert xvec.metadata[PROMPT_LAYOUT_KEY] == [0, 1, 1, 0, 0]
     assert xvec.metadata[REF_CLIP_KEY] == clip_digest(clip.clone())
     assert "stream_lead_items" not in xvec.metadata   # no stream lead
+    assert xvec.metadata[LENGTH_BUDGET_KEY] == 45
+
+
+def test_qwen3_tts_clone_length_budget_caps_the_default_only():
+    model = _variant_model("base")
+    clip = torch.zeros(24000 + 1)
+    clone = model.process_prompt(
+        "hello big world", input_modalities=["audio", "text"], output_modalities=["audio"],
+        tensors={"audio_inputs": [clip]}, ref_text="the reference says", language="English",
+    ).metadata
+    assert model.get_max_output_tokens(**clone) == 64
+    assert model.get_loop_caps(**clone) == {model.DECODE_LOOP: 63}
+    # a request's own cap wins, above or below the budget
+    assert model.get_max_output_tokens(**clone, max_output_tokens=500) == 500
+    assert model.get_max_output_tokens(**clone, max_output_tokens=12) == 12
+    # a budget past the checkpoint's default leaves the default
+    assert model.get_max_output_tokens(**{LENGTH_BUDGET_KEY: 10**6}) == 8192
+    # live text: the length isn't known at the prompt, so no budget
+    live = model.process_prompt(
+        "hello", input_modalities=["audio", "text"], output_modalities=["audio"],
+        tensors={"audio_inputs": [clip]}, x_vector_only_mode=True, open_streams={"text_in"},
+    ).metadata
+    assert LENGTH_BUDGET_KEY not in live and model.get_max_output_tokens(**live) == 8192
+    # no reference clip, no budget
+    plain = _variant_model("custom_voice").process_prompt(
+        "hello big world", input_modalities=["text"], output_modalities=["audio"], voice="vivian",
+    ).metadata
+    assert LENGTH_BUDGET_KEY not in plain
 
     with pytest.raises(ValueError, match="ref_text"):
         model.process_prompt(

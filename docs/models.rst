@@ -1352,12 +1352,20 @@ Qwen3-TTS notes
   sglang-omni; at c=1 it is level with one worker (16.6-17.1 against 15.0-18.7).
   Both start streaming after one frame and ramp to steady 16-frame chunks
   (``codec_chunk_schedule: [1, 2, 4]``, ``codec_chunk_frames: 16``), and size
-  the Talker's KV pool at 2304 pages, which admits 34 clones at once and fits an
-  80 GB GPU. Every Qwen3-TTS request reserves its whole footprint at admission,
-  its prompt plus the default length (the checkpoint's 8192 frames), about 66
-  pages: a streamed one can't pause (``unpausable_outputs``), and none can be
-  rebuilt after a drop (its prompt is rows, not ids) without a host pool. Raise
-  ``max_num_pages`` on a larger GPU (4608 admit 69).
+  the Talker's KV pool at 2304 pages, which fits an 80 GB GPU. Every Qwen3-TTS
+  request reserves its whole footprint at admission, its prompt plus its length
+  cap: a streamed one can't pause (``unpausable_outputs``), and none can be
+  rebuilt after a drop (its prompt is rows, not ids) without a host pool. That is
+  a few pages for a clone of a sentence, about 66 for a request that asks for the
+  checkpoint's 8192 frames (34 of those fit).
+- A clone without ``max_output_tokens`` stops within a budget set by its target
+  text: twice the slowest natural stop of the 1.7B checkpoint, 1.38 s + 0.39 s a
+  text token (sglang-omni's fit; 2 of 78k natural stops of M*'s seed-tts clones
+  ran past it), about 18 s for a 20-token sentence. Without it, a clone that
+  runs away would decode to the checkpoint's 8192 frames (11 minutes); about 1
+  in 7000 did. A request's own ``max_output_tokens`` replaces the budget, and
+  live text (``text_in`` left open) has none, since its length isn't known at
+  the prompt.
 - The Talker's layers run ``Qwen3Attention``, so each layer's q/k norm, RoPE and
   KV write are one kernel (``qk_norm_rope_kv_write``). It reads the RoPE theta off
   the position resource, which declares the checkpoint's.
