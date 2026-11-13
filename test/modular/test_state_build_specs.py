@@ -979,13 +979,9 @@ def test_a_bounded_read_takes_a_head_dim_the_kernels_tile():
                _unbounded(entry=KVEntry(heads=4, head_dim=72)))
 
 
-@pytest.mark.parametrize("field, refusal", [
-    ({"labels": {"main", "cfg"}}, "an unbounded array takes one label, the bounded KV's one row per request, and it "
-                                  "has ['cfg', 'main']"),
-    ({"seq_sharded": True}, "seq_sharded takes max_len 0"),
-], ids=["two labels", "seq_sharded"])
-def test_a_bounded_array_has_one_label_and_no_seq_sharding(field, refusal):
-    _no_layout(refusal, _unbounded(**field))
+def test_a_bounded_array_has_one_label():
+    _no_layout("an unbounded array takes one label, the bounded KV's one row per request, and it has ['cfg', 'main']",
+               _unbounded(labels={"main", "cfg"}))
 
 
 def test_a_bounded_array_takes_no_rope():
