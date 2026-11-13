@@ -1,18 +1,17 @@
 model: "praxis1_droid"
 
-# Serving remains gated until the published checkpoint and session path are
-# validated. This config can be checked without downloading model weights.
+# Serving remains gated while live session and simulation checks finish.
+# This config can be checked without downloading model weights.
 
-# Every praxis1 node is stateless (no KV cache); max_seq_len only satisfies the
-# conductor's config check. The value is the backbone's widest encoder sequence:
+# max_seq_len bounds the backbone's widest encoder sequence:
 # 4 registers + the anchor and the window's video tokens after the (1,2,2) patch
 # + the padded task text, rounded up.
 max_seq_len: 16384
 
 
-# Praxis-1 on the single-arm DROID rig (runwayml/praxis-1-droid). This is a
-# cold-only openpi bring-up mode, not Runway's stateful Positronic session wire.
-# Compare it with reference context_mode=stateless, which is for debugging.
+# Praxis-1 on the single-arm DROID rig (runwayml/praxis-1-droid). Openpi calls
+# remain cold, while Positronic connections retain executed-frame context.
+# Compare cold openpi with reference context_mode=stateless, which is for debugging.
 #
 # A request carries two camera frames, the exterior view then the wrist view, the
 # task text, and robot_state = the FR3 hand pose as [xyz(3) quat_wxyz(4) grip(1)].
@@ -21,7 +20,7 @@ max_seq_len: 16384
 # before normalizing proprio. The reply is [21, 10] denormalized relative
 # Cartesian action rows at 15 Hz,
 # each [xyz(3) rot6d(6) grip(1)]. The gripper is clipped to [0, 1]. Every
-# request starts at depth 0; no predicted video becomes the next call's context.
+# openpi request starts at depth 0; no predicted video becomes the next call's context.
 #
 # The canvas, the pose frame and the rig all come from the checkpoint's config.json,
 # so none of them is a knob here. num_cameras follows the rig's views and is baked
@@ -38,7 +37,20 @@ model_kwargs:
   t_shift: 12.5
   cfg_scale: 1.0
   cfg_video_scale: 4.0
-  max_context_chunks: 0
+  max_context_chunks: 1
+  max_text_tokens: 256
+
+# Four active episode slots. Each history array has one label plus a sink slot;
+# text has two labels per episode plus the sink. The conductor checks capacity
+# against these resource overrides at startup.
+episodes:
+  max_episodes: 4
+  max_calls: 64
+  idle_timeout_s: 600
+resources:
+  executed_observations: {max_slots: 5}
+  boundary_poses: {max_slots: 5}
+  text_embeds: {max_slots: 9}
 
 # The last Euler step still computes conditional encoder taps for actions. It
 # skips the video decoder and video-only blank-caption guidance, since the
@@ -51,6 +63,23 @@ openpi:
   images: [observation/exterior_image_1_left, observation/wrist_image_left]
   state: [observation/cartesian_position, observation/gripper_position]
   action_dims: 10
+
+# Protocol v2 returns absolute pose-composed command dictionaries. The ready
+# frame identifies the checkpoint and sampler recipe used for this deployment.
+positronic:
+  observation_format: praxis1
+  prompt_key: task
+  control_mode: none
+  meta:
+    checkpoint: runwayml/praxis-1-droid
+    rig: single_arm
+    max_context_chunks: 1
+    num_steps: 2
+    t_shift: 12.5
+    cfg_scale: 1.0
+    cfg_video_scale: 4.0
+    skip_video_decoder: true
+    attention_backend: triton
 
 node_groups:
   - node_names:

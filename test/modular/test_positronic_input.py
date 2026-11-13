@@ -116,18 +116,19 @@ def test_missing_pose_history_keeps_the_reference_camera_window_warm():
     assert result.robot_state == [0, 0, pytest.approx(0.6), 1, 0, 0, 0, 0.25]
 
 
-def test_short_executed_window_restarts_before_admission():
-    frames = np.stack([np.full((3, 4, 3), i, np.uint8) for i in range(21)])
+@pytest.mark.parametrize("expected_rows,frame_count", [(21, 21), (24, 22)])
+def test_short_executed_window_restarts_before_admission(expected_rows, frame_count):
+    frames = np.stack([np.full((3, 4, 3), i, np.uint8) for i in range(frame_count)])
     obs = {
         "image.exterior": frames, "image.wrist": frames,
-        "robot_state.ee_pose": np.array([[i, 0, 0.6, 1, 0, 0, 0] for i in range(21)], np.float32),
-        "grip": np.zeros(21, np.float32),
+        "robot_state.ee_pose": np.array([[i, 0, 0.6, 1, 0, 0, 0] for i in range(frame_count)], np.float32),
+        "grip": np.zeros(frame_count, np.float32),
     }
-    result = decode_praxis_frame(pack({"session_id": "id", "observation": obs}), "single_arm", 21)
+    result = decode_praxis_frame(pack({"session_id": "id", "observation": obs}), "single_arm", expected_rows)
     assert result.reset_episode and result.executed_rows == 0
     assert all(stack.shape[0] == 0 for stack in result.executed_frames)
     assert result.executed_poses.shape == (0, 8)
-    assert int(result.images[0][0, 0, 0]) == 20
+    assert int(result.images[0][0, 0, 0]) == frame_count - 1
 
 
 def test_bimanual_executed_window_keeps_three_views_and_aligned_pose16():

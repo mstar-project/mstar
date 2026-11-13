@@ -20,6 +20,7 @@ import torch
 import yaml
 
 from mstar.api_server.openpi import OpenpiPolicy
+from mstar.api_server.positronic import PositronicPolicy
 from mstar.conductor.conductor import Conductor
 from mstar.graph.base import GraphNode, Loop, Sequential
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
@@ -27,6 +28,7 @@ from mstar.model.praxis1 import praxis1_model
 from mstar.model.praxis1.config import Praxis1Config, Praxis1ConfigError
 from mstar.model.praxis1.praxis1_model import DENOISE_LOOP_NAME, Praxis1Model
 from mstar.model.registry import get_model_class, model_init_kwargs
+from mstar.validation import validate_deployment
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -186,15 +188,44 @@ def test_the_rig_decides_the_wire():
     ],
 )
 def test_cold_openpi_reply_has_21_relative_rows(tmp_path, monkeypatch, name, config, width):
-    model = _model(tmp_path, config, monkeypatch)
     shipped = yaml.safe_load((ROOT / "configs" / f"{name}.yaml").read_text())
-    assert shipped["model_kwargs"]["max_context_chunks"] == 0
+    model = _model(
+        tmp_path, config, monkeypatch,
+        max_context_chunks=shipped["model_kwargs"]["max_context_chunks"],
+        max_text_tokens=shipped["model_kwargs"].get("max_text_tokens"),
+    )
     policy = OpenpiPolicy.from_config(shipped["openpi"], model)
     assert policy.action_horizon == 21
     cold_rows = np.zeros((21, width), dtype=np.float32)
     assert policy.actions(cold_rows.tobytes()).shape == cold_rows.shape
     with pytest.raises(RuntimeError, match=f"not 21x{width}"):
         policy.actions(np.zeros((24, width), dtype=np.float32).tobytes())
+
+
+def test_droid_session_config_is_sized_and_gated(tmp_path, monkeypatch):
+    config_path = ROOT / "configs" / "praxis1_droid.yaml"
+    shipped = yaml.safe_load(config_path.read_text())
+    defaults = shipped["model_kwargs"]
+    model = _model(
+        tmp_path, DROID_CONFIG, monkeypatch,
+        max_context_chunks=defaults["max_context_chunks"],
+        max_text_tokens=defaults["max_text_tokens"],
+    )
+    assert validate_deployment(model, shipped, str(config_path))
+    policy = PositronicPolicy.from_config(shipped["positronic"], model)
+    assert policy.observation_format == "praxis1"
+    assert policy.meta["checkpoint"] == "runwayml/praxis-1-droid"
+    assert policy.meta["max_context_chunks"] == defaults["max_context_chunks"] == 1
+
+    cold = _model(tmp_path, DROID_CONFIG, monkeypatch, max_context_chunks=0)
+    with pytest.raises(ValueError, match="no ready Positronic session adapter"):
+        PositronicPolicy.from_config(shipped["positronic"], cold)
+    yam = _model(tmp_path, _yam_config(), monkeypatch, max_context_chunks=1, max_text_tokens=256)
+    with pytest.raises(ValueError, match="no ready Positronic session adapter"):
+        PositronicPolicy.from_config(shipped["positronic"], yam)
+    monkeypatch.setattr(praxis1_model, "_SERVABLE", False)
+    with pytest.raises(ValueError, match="no ready Positronic session adapter"):
+        PositronicPolicy.from_config(shipped["positronic"], model)
 
 
 def test_the_canvas_takes_the_views_to_latents():

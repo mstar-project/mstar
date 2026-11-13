@@ -102,8 +102,8 @@ TEXT_STATE_NAME = "text_embeds"
 STATE_KWARG = "robot_state"
 MODEL_POSE_KWARG = "_praxis_model_pose"
 
-# The towers exist, but published weights and a served session are not yet
-# validated. Refuse startup before any process downloads the checkpoint.
+# Serving remains disabled while live session and simulation checks finish.
+# Refuse startup before any process downloads the checkpoint.
 _SERVABLE = False
 
 # The denoise loop's ceiling when the checkpoint names none.
@@ -123,6 +123,14 @@ class Praxis1Model(Model):
     CHUNK_WARM_WALK = "chunk_warm"
     INTERNAL_KWARGS = (MODEL_POSE_KWARG,)
     PREPROCESS_ONLY_KWARGS = (STATE_KWARG, MODEL_POSE_KWARG, "pose_descriptor", "control_mode")
+
+    @property
+    def POSITRONIC_SESSION_READY(self) -> bool:
+        """Only the validated DROID episode mode may expose the session wire."""
+        return (
+            _SERVABLE and self.config.embodiment == "single_arm"
+            and self.sampler_defaults["max_context_chunks"] > 0
+        )
 
     def __init__(
         self,
