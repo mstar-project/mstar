@@ -12,7 +12,8 @@ Graph walks (4):
     encode_text   - text_encoder; persists text_embeds_pos / text_embeds_neg
     encode_image  - vae_encoder; persists image_latent (I2V requests only)
     video_gen     - T2V: Loop("denoise_loop") over dit, then vae_decoder ->
-                    EMIT_TO_CLIENT (modality "video")
+                    EMIT_TO_CLIENT (modality "video"; with ``stream_decode``,
+                    Loop("vae_decode_loop") over vae_decoder emitting "video_part"s)
     video_gen_i2v - I2V: same topology; dit additionally consumes the
                     persisted image_latent for first-frame injection
 
@@ -49,7 +50,7 @@ from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import Model, WalkStep
 from mstar.model.components.diffusion.attention import dit_entry, refuse_attention_backend_kwarg
 from mstar.model.components.diffusion.step_cache import step_cache_policy
-from mstar.model.components.video_encode import encode_mp4
+from mstar.model.components.video_encode import Mp4Encoding, encode_mp4
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.wan22.config import (
     DIT_SHARD,
@@ -62,6 +63,7 @@ from mstar.model.wan22.config import (
     Wan22Config,
 )
 from mstar.model.wan22.submodules import (
+    DECODE_LOOP,
     DENOISE_LOOP_NAME,
     Wan22DitSubmodule,
     Wan22DmdDitSubmodule,
@@ -75,6 +77,11 @@ logger = logging.getLogger(__name__)
 
 # libx264, which postprocess encodes with, refuses a frame wider or taller than this
 _MP4_MAX_SIDE = 16384
+
+# stream_decode: the decoder loop's ceiling (the request's piece count is its cap; 256 pieces of
+# 3 latents is a 3069-frame clip), and the pieces it emits, one mp4's (the data worker's VIDEO_PART)
+MAX_DECODE_PARTS = 256
+VIDEO_PART = "video_part"
 
 # Every model_kwargs key a request may carry; the video adapter maps ``size``
 # onto height/width and forwards num_frames and fps.
@@ -109,6 +116,8 @@ class Wan22Model(Model):
         vae_decode_fast: bool = True,
         vae_decode_fast_sizes: tuple[str, ...] | None = None,
         step_cache: dict | None = None,
+        stream_decode: bool = False,
+        stream_decode_latents: int = Wan22Config.stream_decode_latents,
         sampler: str = SAMPLER_UNIPC,
         dmd_timesteps: tuple[int, ...] | None = None,
         dmd_shift: float | None = None,
@@ -128,6 +137,7 @@ class Wan22Model(Model):
             max_video_pixels=self._require_positive_int("max_video_pixels", max_video_pixels),
             vae_decode_fast=vae_decode_fast, vae_decode_fast_sizes=vae_decode_fast_sizes, step_cache=step_cache,
             sampler=sampler, dmd_timesteps=dmd_timesteps, dmd_shift=dmd_shift,
+            stream_decode=stream_decode, stream_decode_latents=stream_decode_latents,
         )
         self.config.compile_dit_grids()  # a malformed list fails at startup
         step_cache_policy(step_cache, MAG_RATIOS)  # and so does a malformed step cache
@@ -265,10 +275,15 @@ class Wan22Model(Model):
                 GraphEdge(
                     next_node=EMIT_TO_CLIENT,
                     name="video_output",
-                    output_modality="video",
+                    # streamed: each iteration's frames are a piece of one mp4 (the data worker's)
+                    output_modality=VIDEO_PART if self.config.stream_decode else "video",
                 ),
             ],
         )
+        if self.config.stream_decode:
+            # one piece of the clip an iteration (get_loop_caps counts them); the latents re-enter
+            # each iteration, the decoder's cache stays with the node (Wan22VaeDecoderSubmodule)
+            vae_decoder = Loop(name=DECODE_LOOP, section=vae_decoder, max_iters=MAX_DECODE_PARTS, outputs=[])
         return Sequential([denoise_loop, vae_decoder])
 
     # ------------------------------------------------------------------
@@ -527,9 +542,14 @@ class Wan22Model(Model):
         # the loop ends on the request's own step count, and is never speculated past it;
         # past the loop's max_iters the conductor refuses the request
         steps = self._get(model_kwargs, "num_inference_steps", self.config.default_num_inference_steps)
+        caps = {}
         if isinstance(steps, int) and not isinstance(steps, bool) and steps >= 1:
-            return {DENOISE_LOOP_NAME: steps}
-        return {}
+            caps[DENOISE_LOOP_NAME] = steps
+        if self.config.stream_decode:
+            frames = self._get(model_kwargs, "num_frames", self.config.default_num_frames)
+            if isinstance(frames, int) and not isinstance(frames, bool) and frames >= 1:
+                caps[DECODE_LOOP] = self.config.decode_parts(frames)
+        return caps
 
     def request_kwargs(self) -> frozenset[str]:
         return REQUEST_KWARGS
@@ -544,7 +564,10 @@ class Wan22Model(Model):
         """
         if modality != "video":
             raise ValueError(f"Unsupported modality for Wan2.2: {modality!r}")
+        fps, options, pad_even = self.mp4_encoding(request_kwargs)
+        return encode_mp4(output.cpu().numpy(), fps, options=options, pad_even=pad_even)
 
+    def mp4_encoding(self, request_kwargs: dict | None = None) -> Mp4Encoding:
         # An explicit ``fps: null`` means "unset", same as an absent key.
         raw_fps = (request_kwargs or {}).get("fps")
         if raw_fps is None:
@@ -559,7 +582,7 @@ class Wan22Model(Model):
         # As Cosmos3, LTX-2.5 and MiniMax-H3 encode: the multithreaded ultrafast preset at CRF 18. The
         # encode runs after the VAE decode, on the request's critical path (1280x704x81 on an H200 box:
         # 1.23 s with libx264's defaults, 0.23 s here), and CRF 18 is less lossy than the default 23.
-        return encode_mp4(output.cpu().numpy(), fps, options={"crf": "18", "preset": "ultrafast", "threads": "0"})
+        return Mp4Encoding(fps, {"crf": "18", "preset": "ultrafast", "threads": "0"})
 
     # ------------------------------------------------------------------
     # Model ABC: forward pass orchestration

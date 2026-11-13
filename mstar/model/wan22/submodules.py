@@ -45,6 +45,8 @@ logger = logging.getLogger(__name__)
 # Stop signals are registered by loop name, so the model and the stop logic below
 # must agree on this literal.
 DENOISE_LOOP_NAME = "denoise_loop"
+# stream_decode: the decoder as a loop, one piece of the clip an iteration
+DECODE_LOOP = "vae_decode_loop"
 
 # --- VAE-decode tiling gate calibration (Wan22VaeDecoderSubmodule) -----------
 # Untiled AutoencoderKLWan.decode peak scales with output SPATIAL area H*W, nearly
@@ -630,6 +632,10 @@ class Wan22VaeDecoderSubmodule(_Fp32IslandMixin, NodeSubmodule):
     stock ``vae.decode`` / ``tiled_decode`` and compiles nothing. The engine
     still never wraps the forward; only the decoder's steady-state call is
     compiled.
+
+    With ``config.stream_decode`` the node runs as the ``vae_decode_loop``, one
+    piece of the clip an iteration (``_decode_part``), and each piece's frames go
+    to the API server's mp4 writer while the next piece decodes.
     """
 
     disable_torch_compile = True
@@ -679,7 +685,10 @@ class Wan22VaeDecoderSubmodule(_Fp32IslandMixin, NodeSubmodule):
         inputs: NameToTensorList,
         **kwargs,
     ) -> NodeInputs:
-        return NodeInputs(tensor_inputs={"latents": inputs["latents"][0]})
+        node_inputs = NodeInputs(tensor_inputs={"latents": inputs["latents"][0]})
+        if self.config.stream_decode:
+            node_inputs.kwargs = {"part": int(fwd_info.dynamic_loop_iter_counts.get(DECODE_LOOP, 0))}
+        return node_inputs
 
     def _output_size(self, latents: torch.Tensor) -> tuple[int, int, int]:
         """(height, width, num_frames) the latent grid decodes to — the inverse of
@@ -728,47 +737,97 @@ class Wan22VaeDecoderSubmodule(_Fp32IslandMixin, NodeSubmodule):
             )
         return mode
 
+    def _vae_latents(self, latents: torch.Tensor):
+        """The VAE in its decode dtype, and ``latents`` de-normalized for it."""
+        vae = self.vae
+        vae_dtype = self._decode_dtype()
+        if next(vae.parameters()).dtype != vae_dtype:
+            vae = vae.to(vae_dtype)
+        latents = latents.to(device=self.get_device(), dtype=vae_dtype)
+        mean, inv_std = latent_affine(vae, latents.dtype, latents.device)
+        return vae, latents / inv_std + mean
+
+    def _decode_path(self, vae, latents: torch.Tensor) -> str:
+        """"tiled", "fast" or "stock" for this clip (Feature 1: untiled vs tiled from live
+        free VRAM at decode time), with the VAE in that path's layout."""
+        vae_dtype = self._decode_dtype()
+        device = latents.device
+        height, width, num_frames = self._output_size(latents)
+        elt_bytes = torch.finfo(vae_dtype).bits // 8
+        estimate = self._estimated_untiled_peak_bytes(height, width, num_frames, elt_bytes)
+        mode = self._resolve_tiling_mode()
+        free_bytes, _total = torch.cuda.mem_get_info(device)
+        tiled = self._decode_should_tile(mode, free_bytes, estimate)
+        logger.info(
+            "Wan2.2 VAE decode: %s (%dx%d x%df, est untiled peak %.1f GiB, "
+            "free %.1f GiB, margin %.2f, mode=%s)",
+            "tiled" if tiled else "untiled", height, width, num_frames,
+            estimate / 2**30, free_bytes / 2**30, _DECODE_UNTILED_SAFETY_MARGIN, mode,
+        )
+        fast = self._fast is not None and not tiled and (width, height) in self._fast_sizes
+        if self._fast is not None and not fast:
+            # One request per step, so nothing else decodes on this VAE
+            # while its layout switches; the fast decode switches it back.
+            self._fast.use_stock_layout()
+        return "tiled" if tiled else "fast" if fast else "stock"
+
+    @staticmethod
+    def _frames(video: torch.Tensor) -> torch.Tensor:
+        # Quantize to 8-bit at the worker boundary, as rgb24 frames (see class docstring).
+        return truncate_to_uint8(video[0]).permute(1, 2, 3, 0).contiguous()
+
+    def _decode(self, vae, latents: torch.Tensor, path: str) -> torch.Tensor:
+        if path == "tiled":
+            return vae.tiled_decode(latents, return_dict=False)[0]
+        if path == "fast":
+            return self._fast.decode(latents)
+        return vae.decode(latents, return_dict=False)[0]
+
     def forward(
         self,
         graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
         latents: torch.Tensor,
+        part: int | None = None,
         **kwargs,
     ) -> NameToTensorList:
         with _inference_ctx():
-            vae = self.vae
-            vae_dtype = self._decode_dtype()
-            if next(vae.parameters()).dtype != vae_dtype:
-                vae = vae.to(vae_dtype)
-            device = self.get_device()
-            latents = latents.to(device=device, dtype=vae_dtype)
-            mean, inv_std = latent_affine(vae, latents.dtype, latents.device)
-            latents = latents / inv_std + mean
-
-            # Feature 1: pick untiled vs tiled from live free VRAM at decode time.
-            height, width, num_frames = self._output_size(latents)
-            elt_bytes = torch.finfo(vae_dtype).bits // 8
-            estimate = self._estimated_untiled_peak_bytes(height, width, num_frames, elt_bytes)
-            mode = self._resolve_tiling_mode()
-            free_bytes, _total = torch.cuda.mem_get_info(device)
-            tiled = self._decode_should_tile(mode, free_bytes, estimate)
-            logger.info(
-                "Wan2.2 VAE decode: %s (%dx%d x%df, est untiled peak %.1f GiB, "
-                "free %.1f GiB, margin %.2f, mode=%s)",
-                "tiled" if tiled else "untiled", height, width, num_frames,
-                estimate / 2**30, free_bytes / 2**30, _DECODE_UNTILED_SAFETY_MARGIN, mode,
-            )
-            fast = self._fast is not None and not tiled and (width, height) in self._fast_sizes
-            if self._fast is not None and not fast:
-                # One request per step, so nothing else decodes on this VAE
-                # while its layout switches; the fast decode switches it back.
-                self._fast.use_stock_layout()
-            if tiled:
-                video = vae.tiled_decode(latents, return_dict=False)[0]
-            elif fast:
-                video = self._fast.decode(latents)
-            else:
-                video = vae.decode(latents, return_dict=False)[0]
-            # Quantize to 8-bit at the worker boundary, as rgb24 frames (see class docstring).
-            frames = truncate_to_uint8(video[0]).permute(1, 2, 3, 0).contiguous()
+            if part is not None:
+                return {"video_output": [self._decode_part(engine_inputs.request_ids[0], latents, part)]}
+            vae, latents = self._vae_latents(latents)
+            frames = self._frames(self._decode(vae, latents, self._decode_path(vae, latents)))
         return {"video_output": [frames]}
+
+    def _decode_part(self, request_id: str, latents: torch.Tensor, part: int) -> torch.Tensor:
+        """Piece ``part`` of the clip (``stream_decode``): latents ``[part * n, part * n + n)``,
+        n = ``stream_decode_latents``, continuing the decoder cache the earlier pieces left in
+        the request's state. The fast path runs the same decoder calls as the whole-clip
+        decode, the post-quant conv over the whole clip once, so the pieces in order are its
+        frames bit for bit. A clip on another path decodes whole on piece 0 and is cut into
+        the same pieces."""
+        state = self.request_state(request_id)
+        per_part = self.config.stream_decode_latents
+        num_latents = latents.shape[2]
+        start, stop = part * per_part, min((part + 1) * per_part, num_latents)
+        if not 0 <= start < num_latents or (part > 0) != ("stream_cache" in state):
+            raise ValueError(f"piece {part} of a streamed decode of {num_latents} latent frames is out of order")
+        if part == 0:
+            vae, latents = self._vae_latents(latents)
+            path = self._decode_path(vae, latents)
+            if path == "fast":
+                from mstar.model.components import wan_vae
+
+                state.add("stream_cache", wan_vae.new_feat_cache(self.vae))
+                state.add("stream_x", self._fast.post_quant(latents))
+            else:
+                state.add("stream_cache", self._frames(self._decode(vae, latents, path)))
+        cache = state.get("stream_cache")
+        if isinstance(cache, torch.Tensor):  # decoded whole: this piece's frames of it
+            temporal = self.config.vae_scale_factor_temporal
+            frames = cache[(start - 1) * temporal + 1 if start else 0:(stop - 1) * temporal + 1]
+        else:
+            x = state.get("stream_x")[:, :, start:stop]
+            frames = self._frames(self._fast.decode_stream(x, cache, clip_start=part == 0, post_quantized=True))
+        if stop == num_latents:  # the last piece: the cache goes now, not with the request
+            state.remove(("stream_cache", "stream_x"))
+        return frames

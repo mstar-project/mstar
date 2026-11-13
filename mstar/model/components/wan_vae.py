@@ -263,6 +263,14 @@ class DecoderStep:
         return out
 
 
+def post_quant(vae: nn.Module, z: torch.Tensor) -> torch.Tensor:
+    """``vae.post_quant_conv(z)``, in the decode path's layout: the decoder's input."""
+    x = vae.post_quant_conv(z)
+    if is_channels_last(vae):
+        x = x.contiguous(memory_format=torch.channels_last_3d)
+    return x
+
+
 def decode_causal(
     vae: nn.Module,
     z: torch.Tensor,
@@ -271,6 +279,7 @@ def decode_causal(
     *,
     clip_start: bool,
     latents_per_call: int = 1,
+    post_quantized: bool = False,
 ) -> torch.Tensor:
     """Decode the latent frames ``z`` (``[B, C, T, h, w]``, already
     de-normalized) as the continuation of the stream whose decoder cache is
@@ -285,10 +294,12 @@ def decode_causal(
     rest at once; the clip-start latent always decodes alone). Same math as
     one per call; fewer, larger kernels, at a peak activation memory that
     grows with the frames per call.
+
+    ``post_quantized``: ``z`` is already ``post_quant(vae, z)``, e.g. a slice of a
+    whole clip's, so a clip decoded in pieces runs that conv once over the clip as
+    ``vae.decode`` does.
     """
-    x = vae.post_quant_conv(z)
-    if is_channels_last(vae):
-        x = x.contiguous(memory_format=torch.channels_last_3d)
+    x = z if post_quantized else post_quant(vae, z)
     outs = []
     start = 0
     if clip_start:
@@ -338,10 +349,18 @@ class FastDecoder:
 
     def decode_stream(
         self, z: torch.Tensor, feat_cache: list, *, clip_start: bool, latents_per_call: int = 1,
+        post_quantized: bool = False,
     ) -> torch.Tensor:
         """``decode_causal`` continuing the stream whose cache is ``feat_cache``."""
         self._use_layout(self.channels_last)
         with torch.autocast(device_type=z.device.type, enabled=False):
             return decode_causal(
                 self.vae, z, feat_cache, self.step, clip_start=clip_start, latents_per_call=latents_per_call,
+                post_quantized=post_quantized,
             )
+
+    def post_quant(self, z: torch.Tensor) -> torch.Tensor:
+        """``post_quant`` in this decode's layout, for ``decode_stream(..., post_quantized=True)``."""
+        self._use_layout(self.channels_last)
+        with torch.autocast(device_type=z.device.type, enabled=False):
+            return post_quant(self.vae, z)
