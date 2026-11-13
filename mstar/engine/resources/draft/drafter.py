@@ -283,6 +283,9 @@ class ObserveInputs(NamedTuple):
     # is then over the step's tokens
     mixed: MixedRows | None = None
     ids: torch.Tensor | None = None
+    # the step's other preprocessed tensors (`PrefillInputs.tensors`): a mixed step's prompt rows' own
+    # inputs, such as `DRAFT_FOLLOWING`
+    tensors: Mapping[str, torch.Tensor] = MappingProxyType({})
 
 
 class PrefillInputs(NamedTuple):
@@ -424,6 +427,7 @@ def draft_mixed_step(
     target: Callable[[torch.Tensor, torch.Tensor], TargetOutput],
     drafter: Drafter,
     resources: dict[str, Any],
+    tensors: Mapping[str, torch.Tensor] = MappingProxyType({}),
     resident: CapturedResidentStep | None = None,
 ) -> VerifyResult:
     """`draft_verify_step` for a mixed prompt-plus-verify step: ``ids`` ``[tokens]`` the step's ids (a verify
@@ -456,7 +460,7 @@ def draft_mixed_step(
                            "target returned none")
     result = sampler.verify(request_ids, logits.view(n, k + 1, -1), drafts, refuse=rows.prompt)
     block = torch.cat([anchors.reshape(n, 1).long(), drafts], dim=1)
-    carry = drafter.observe(ObserveInputs(block, result, hidden, mixed=rows, ids=block_ids))
+    carry = drafter.observe(ObserveInputs(block, result, hidden, mixed=rows, ids=block_ids, tensors=tensors))
     if needs.carry is not None:
         if carry is None:
             raise RuntimeError("a drafter that declares a carry returned none from observe")

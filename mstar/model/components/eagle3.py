@@ -35,7 +35,7 @@ from mstar.engine.resources.draft.drafter import (
 from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.engine.resources.step import ResourceStep
 from mstar.engine.resources.taps.config import TapSpec, TapStep
-from mstar.model.components.chained_draft import at_last_rows, chain_drafts, kept_rows
+from mstar.model.components.chained_draft import at_last_rows, chain_drafts, kept_rows, mixed_next_ids
 from mstar.model.components.hosted_drafter import HostedDrafter, HostedDrafterDecl
 
 logger = logging.getLogger(__name__)
@@ -154,6 +154,9 @@ class Eagle3(HostedDrafterDecl):
             carry=CarrySpec(cfg.hidden_size, CARRY_DTYPE),
             # each prompt row reads the next prompt token, which the prompt step brings (`DRAFT_FOLLOWING`)
             chunk_boundary=ChunkBoundary.FOLLOWING,
+            # a mixed step's chain runs over its tokens, and one pass after the target is a verify row's
+            # observe and a prompt row's prefill
+            mixed=True,
             geometry=geometry,
         )
 
@@ -313,14 +316,29 @@ class Eagle3Drafter(nn.Module, HostedDrafter):
     # ── verify step ──
 
     def propose(self, inputs: DraftInputs) -> torch.Tensor:
-        return chain_drafts(inputs.carry.to(self.fc.weight.dtype), inputs.num_draft_tokens, self._head, self._draft)
+        return chain_drafts(
+            inputs.carry.to(self.fc.weight.dtype), inputs.num_draft_tokens, self._head, self._draft, inputs.mixed,
+        )
 
     def observe(self, inputs: ObserveInputs) -> torch.Tensor:
         """The layer's K/V over the block from the target's taps there, and the new carry: its output at each row's
         last kept position."""
         result = inputs.result
+        if inputs.mixed is not None:
+            return self._observe_mixed(inputs)
         out = self._head(self._fused_taps(), result.tokens.reshape(-1), keep=kept_rows(inputs.block, result.accepted))
         return out.to(CARRY_DTYPE)
+
+    def _observe_mixed(self, inputs: ObserveInputs) -> torch.Tensor:
+        """A mixed step's one pass over its tokens after the target: a verify row's block reads the tokens the
+        verify gave (`observe`), a prompt row's tokens their following ones and its last the token it sampled
+        (`prefill`). Each row's carry is the output at its last kept place, a prompt row's at its last."""
+        rows, result = inputs.mixed, inputs.result
+        width = result.tokens.shape[1]
+        nxt = mixed_next_ids(rows, inputs.tensors[DRAFT_FOLLOWING], result.tokens)
+        kept = rows.at.gather(1, result.accepted[:, None].clamp(max=width - 1))[:, 0]
+        keep = torch.where(rows.prompt, rows.at[:, 0], kept)
+        return self._head(self._fused_taps(), nxt, keep=keep).to(CARRY_DTYPE)
 
 
 @torch.compiler.disable

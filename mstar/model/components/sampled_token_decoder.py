@@ -456,9 +456,11 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
 
         def row(n: int) -> ARNodeInputs:
             verify = n == block
+            following = {} if verify or not self._reads_following else {
+                DRAFT_FOLLOWING: torch.zeros(n, dtype=torch.long, device=device)}
             return ARNodeInputs(
                 input_ids=torch.zeros(1 if verify else n, dtype=torch.long, device=device), input_seq_len=n,
-                graph_walk=self.DECODE_WALK if verify else self.PREFILL_WALK,
+                graph_walk=self.DECODE_WALK if verify else self.PREFILL_WALK, tensor_inputs=following,
             )
 
         def layout(total_tokens: int, bs: int) -> list[int]:
@@ -476,7 +478,7 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
             capture_batch_sizes=sizes,
             compile_mode=self.capture_compile_mode(MIXED),
             token_layout=layout,
-            input_seq_dims={MIXED_KIND: 0},
+            input_seq_dims={MIXED_KIND: 0, DRAFT_FOLLOWING: 0} if self._reads_following else {MIXED_KIND: 0},
         )
 
     @property
@@ -713,7 +715,15 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
         ids = torch.cat([blocks.reshape(-1), *(to_device_nonblocking(p.long(), device) for p in prompt)])
         tokens = sum(p.numel() for p in prompt)
         kind = torch.cat([torch.arange(block).repeat(verify), torch.full((tokens,), -1)])
-        return {"input_ids": ids, MIXED_KIND: to_device_nonblocking(kind, device)}
+        out = {"input_ids": ids, MIXED_KIND: to_device_nonblocking(kind, device)}
+        if self._reads_following:
+            # the prompt rows' own (`prepare_inputs`), the verify rows' unread
+            following = [inp.tensor_inputs[DRAFT_FOLLOWING] for inp in inputs[verify:] if inp.input_seq_len]
+            out[DRAFT_FOLLOWING] = torch.cat([
+                torch.zeros(verify * block, dtype=torch.long, device=device),
+                *(to_device_nonblocking(f.long(), device) for f in following),
+            ])
+        return out
 
     def _pack_following(self, out: dict, graph_walk: str, inputs: list[ARNodeInputs]) -> None:
         """A prompt step's `DRAFT_FOLLOWING`, its rows' in row order, for a drafter that reads it."""
@@ -901,7 +911,7 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
             hidden = model(model.embed(ids), label="main", **decoder_kwargs)
             return TargetOutput(model.logits(hidden.index_select(0, at)), hidden if wants_hidden else None)
 
-        result = self.draft_mixed_step(engine_inputs, input_ids, rows, target)
+        result = self.draft_mixed_step(engine_inputs, input_ids, rows, target, tensors)
         out = self.verify_output(result)
         # a prompt row's first token extends its prompt's keys, as a prompt step's host copy does
         out.check_stop_buffers["text_inputs"] = result.tokens[:, 0]
