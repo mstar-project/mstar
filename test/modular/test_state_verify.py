@@ -315,6 +315,39 @@ def test_two_eager_steps_keep_two_tables():
     )
 
 
+class _StubEvent:
+    """Notes when it is recorded and waited on, in place of a CUDA event."""
+
+    def __init__(self, log):
+        self.log = log
+
+    def record(self):
+        self.log.append("record")
+
+    def synchronize(self):
+        self.log.append("synchronize")
+
+
+def test_a_count_waits_for_its_settle_s_copy_and_not_the_rest_of_the_step():
+    """GLM-5.2 settles before its MTP seed pass. A count that waited for the whole forward would hold the next step's
+    admit until the seed pass ends, where ``main`` admitted and planned that step while the seed pass ran."""
+    kv, log = _StubKV(), []
+    h = _handle(kv=kv)
+    step = _step(h)
+    h.begin_step(step)
+    h.verify._table.landed = _StubEvent(log)
+    k = torch.randn(2 * SPAN, HEADS, DIM)
+    for layer in range(LAYERS):
+        h.add(layer, k=k, v=k)
+    settle(h, torch.tensor([3, 1]))
+    log.append("later passes")
+    h.check_step(step)
+    h.commit_step(step)
+    h.end_step(step)
+    assert [count.delta() for *_, count in kv.deferred] == [-1, -3]
+    assert log == ["record", "later passes", "synchronize"], "the count would wait for the passes after its copy"
+
+
 def _overwritten_count():
     """Row 0's count of verify step 1, whose table step 3 reused."""
     kv = _StubKV()

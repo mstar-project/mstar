@@ -1154,12 +1154,14 @@ class Rewind(OpBinding):
 class _CountTable:
     """A verify step's counts on the host, row 0 the step's number and row r the count of its row r, copied there
     from ``staging`` on the device by a copy a capture records. Past its rows it holds every one of ``ranks`` TP
-    ranks' counts, where the debug compare gathers them."""
+    ranks' counts, where the debug compare gathers them. ``landed`` is recorded right after the copies, in the graph
+    when captured, so a read waits for the counts and not for the rest of the forward."""
 
     def __init__(self, rows: int, ranks: int, device: torch.device):
         self.rows, self.ranks = rows, ranks
         self.host = torch.zeros(1 + rows * (1 + ranks), dtype=torch.int64, pin_memory=device.type == "cuda")
         self.staging = torch.zeros(rows, dtype=torch.int64, device=device)
+        self.landed = torch.cuda.Event(external=True) if device.type == "cuda" else None
 
 
 class _Counts:
@@ -1281,6 +1283,8 @@ class RewindRun(VerifyRun):
             gathered = self._group.all_gather(self._table.staging[:rows], dim=0)
             start = 1 + self._table.rows
             self._table.host[start:start + gathered.numel()].copy_(gathered, non_blocking=True)
+        if self._table.landed is not None:
+            self._table.landed.record()
 
     def end(self, ctx) -> None:
         if self._table is not None and not self._settled:
@@ -1289,11 +1293,8 @@ class RewindRun(VerifyRun):
     def commit(self, ctx) -> None:
         if self._table is None or ctx.capture:
             return
-        done = None
-        if self._device.type == "cuda":
-            done = torch.cuda.Event()
-            done.record()
-        counts = _Counts(self._table, self._number, tuple(segment.span for segment in self._segments), done)
+        spans = tuple(segment.span for segment in self._segments)
+        counts = _Counts(self._table, self._number, spans, self._table.landed)
         positions = self.handle.positions
         for row, segment in enumerate(self._segments):
             if ctx.is_real_row(segment.request_id):
