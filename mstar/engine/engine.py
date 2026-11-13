@@ -1449,13 +1449,13 @@ class Engine:
                     key, self._prefix_model,
                 )
             else:
-                restoring = sorted(
-                    over.resource_key for over in unrestorable(specs_by_key, opened)
-                    if not over.nodes.isdisjoint(spec.nodes)
-                )
+                over = [over for over in unrestorable(specs_by_key, opened) if not over.nodes.isdisjoint(spec.nodes)]
+                restoring = sorted(spec.resource_key for spec in over)
+                reasons = sorted(filter(None, (spec.restore_refusal() for spec in over)))
                 logger.info(
-                    "KV %s: prefix cache off: %s on %s can't restore a cached prefix",
+                    "KV %s: prefix cache off: %s on %s can't restore a cached prefix%s",
                     key, ", ".join(restoring) or "a resource", nodes,
+                    f" ({'; '.join(reasons)})" if reasons else "",
                 )
 
     def prepare_inputs(self, batch: ExecutingBatch) -> None:

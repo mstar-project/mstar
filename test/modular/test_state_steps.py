@@ -25,7 +25,7 @@ from mstar.engine.resources.attn.ragged.config import RaggedAttentionConfig, Rag
 from mstar.engine.resources.kv import manager as kv_manager
 from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PagedKVConfig
 from mstar.engine.resources.linear_attn.config import LinearAttnStep, bf16_gdn_state_fits
-from mstar.engine.resources.linear_attn.gdn import GDNManager
+from mstar.engine.resources.linear_attn.gdn_kernels import FlashInferGDNKernels
 from mstar.engine.resources.position.config import PositionConfig, PositionSpec, PositionStep
 from mstar.engine.resources.recurrent.config import DeltaNetGeometry, RecurrentStep
 from mstar.engine.resources.sampler.config import SamplerSpec, SamplerStep, SamplingReqConfig
@@ -888,7 +888,7 @@ def test_the_glue_stores_a_bf16_gdn_state_exactly_where_the_resource_takes_one(k
     if stored is torch.float32:
         geometry = DeltaNetGeometry(num_k_heads=4, num_v_heads=4, head_k_dim=k, head_v_dim=v, conv_kernel_size=4)
         with pytest.raises(NotImplementedError, match="a bf16 gdn state needs K=V=128"):
-            GDNManager._check_state_dtype(torch.bfloat16, geometry, False)
+            FlashInferGDNKernels._check_state_dtype(torch.bfloat16, geometry, False)
 
 
 def test_a_position_call_on_an_array_that_declares_no_positions_is_refused_by_name():

@@ -2,7 +2,8 @@
 steps split over SP ranks.
 
 ``LinearAttnManager.build`` picks the manager for the configured variant (`gdn`,
-`kda` or `mamba2`), by deferred import so naming one does not load the others.
+`kda` or `mamba2`), by deferred import so naming one does not load the others, and for GDN the kernels
+it runs.
 
 On a split step (``sequence_shard``) each rank holds a contiguous range of the step's tokens. The
 recurrent pool stays copied over SP: every rank holds every head its TP rank does, and after each
@@ -39,12 +40,35 @@ from mstar.engine.resources.sequence_shard import (
     conv_halo_plan,
 )
 from mstar.engine.resources.step import StepContext
+from mstar.platforms import current_platform
 from mstar.utils.h2d import to_device_nonblocking
 
 if TYPE_CHECKING:
     from mstar.engine.resources.linear_attn.wrappers import ConvMetadata
 
 logger = logging.getLogger(__name__)
+
+
+def resolve_linear_attn_backend(
+    backend: LinearAttnBackend, device: torch.device | None = None,
+) -> LinearAttnBackend:
+    """The backend a spec's ``backend`` runs on ``device`` (None: for a spec
+    answering before any resource is built, which the conductor and data worker
+    do too, so it reads the stack torch was built for, not the GPUs this process
+    sees; a deployment runs one build).
+
+    The one place ``AUTO`` becomes a kernel choice: AITER on an AMD GPU, where
+    FlashInfer has no GDN kernels, and FlashInfer everywhere else, as before
+    ``AUTO`` existed (a resource on the CPU device runs no kernel at all). Any
+    other value is returned as is, so a spec or YAML that names a backend gets
+    that backend.
+    """
+    if backend is not LinearAttnBackend.AUTO:
+        return backend
+    rocm = torch.version.hip is not None if device is None else device.type == "cuda" and current_platform.is_rocm()
+    if rocm:
+        return LinearAttnBackend.AITER
+    return LinearAttnBackend.FLASHINFER
 
 
 class Chunk(NamedTuple):
@@ -155,9 +179,8 @@ class LinearAttnManager(AttentionResource):
         backend = spec.config.backend
         variant = spec.config.variant
         if variant is LinearAttnVariant.MAMBA2:
-            if backend is not LinearAttnBackend.FLASHINFER:
-                raise ValueError(f"Unknown linear attention backend {backend!r}")
-            # Its own kernels (Triton), planned against the same pool.
+            # Its own kernels (Triton) on every backend, planned against the
+            # same pool.
             from mstar.engine.resources.linear_attn.mamba2 import Mamba2Manager
 
             return Mamba2Manager(
@@ -172,7 +195,7 @@ class LinearAttnManager(AttentionResource):
         # also checks the pool's shapes: `from_blocks` raises on another family's
         geometry = DeltaNetGeometry.from_blocks(pool_config.blocks)
         if variant is LinearAttnVariant.KDA:
-            if backend is LinearAttnBackend.FLASHINFER:
+            if backend in (LinearAttnBackend.AUTO, LinearAttnBackend.FLASHINFER):
                 # the config's default, which is GDN's; KDA has no FlashInfer path
                 backend = spec.config.backend = LinearAttnBackend.TRITON
             if backend is not LinearAttnBackend.TRITON:
@@ -194,19 +217,30 @@ class LinearAttnManager(AttentionResource):
                 conv_dtype=pool_config.blocks["conv"].resolved_dtype(info.kv_dtype),
             )
 
-        if backend is not LinearAttnBackend.FLASHINFER:
-            raise ValueError(f"Unknown linear attention backend {backend!r}")
         if variant is LinearAttnVariant.GDN:
             from mstar.engine.resources.linear_attn.gdn import GDNManager
+            from mstar.engine.resources.linear_attn.gdn_kernels import build_gdn_kernels
 
+            backend = resolve_linear_attn_backend(backend, info.device)
+            state_dtype = pool_config.blocks["state"].resolved_dtype(info.kv_dtype)
+            has_sink = not pool_config.disable_sink_slot
+            kernels = build_gdn_kernels(
+                backend,
+                config=spec.config,
+                geometry=geometry,
+                state_dtype=state_dtype,
+                has_sink=has_sink,
+                device=info.device,
+            )
             return GDNManager(
                 config=spec.config,
                 max_rows_in_combined=info.max_rows_in_combined,
                 geometry=geometry,
                 num_layers=pool_config.num_layers,
-                state_dtype=pool_config.blocks["state"].resolved_dtype(info.kv_dtype),
-                has_sink=not pool_config.disable_sink_slot,
+                state_dtype=state_dtype,
+                has_sink=has_sink,
                 device=info.device,
+                kernels=kernels,
             )
         raise ValueError(f"Unknown linear attention variant {variant!r}")
 

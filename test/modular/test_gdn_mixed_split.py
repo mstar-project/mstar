@@ -23,6 +23,7 @@ from mstar.engine.resources.linear_attn.config import (
     LinearAttnVariant,
 )
 from mstar.engine.resources.linear_attn.gdn import GDNManager
+from mstar.engine.resources.linear_attn.gdn_kernels import FlashInferGDNKernels
 from mstar.engine.resources.linear_attn.gdn_stage import gdn_stage_applies
 from mstar.engine.resources.linear_attn.wrappers import GDNMixedWrapper, GDNPrefillWrapper
 from mstar.engine.resources.recurrent.config import (
@@ -38,7 +39,8 @@ from mstar.platforms import current_platform
 from mstar.utils.causal_conv1d import PAD_SLOT_ID
 
 requires_gpu = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="FlashInfer's GDN kernels need a GPU"
+    not torch.cuda.is_available() or current_platform.is_rocm(),
+    reason="FlashInfer's GDN kernels need an NVIDIA GPU (test/rocm/test_gdn_aiter.py covers AMD)",
 )
 
 HEADS, DIM, CONV_DIM, WIDTH, SLOTS = 4, 128, 256, 4, 16
@@ -112,6 +114,10 @@ def _guard(pool):
     return pool.as_strided(pool.shape[1:], pool.stride()[1:], pool.storage_offset() - pool.stride(0))
 
 
+def _kernels(null_slot, stage_inputs=False):
+    return FlashInferGDNKernels(has_sink=null_slot != NO_SLOT, stage_inputs=stage_inputs)
+
+
 def _reference(device, x, weight, inputs, layout, null_slot=SINK_SLOT):
     SPANS, SLOT_IDS, HAS_STATE = _cols(layout)
     state, conv = _pools(device)
@@ -120,7 +126,7 @@ def _reference(device, x, weight, inputs, layout, null_slot=SINK_SLOT):
     w = GDNPrefillWrapper(
         device=device, pad_slot_id=PAD_SLOT_ID, null_slot_id=null_slot,
         num_tokens=x.shape[0], bs=len(SPANS), accelerator_graph=True,
-        has_sink_state=null_slot != NO_SLOT,
+        has_sink_state=null_slot != NO_SLOT, kernels=_kernels(null_slot),
     )
     w.plan(
         SPANS,
@@ -157,7 +163,7 @@ def _mixed(device, x, weight, inputs, accelerator_graph, layout, decode_rows=Non
         device=device, pad_slot_id=PAD_SLOT_ID, null_slot_id=null_slot,
         num_tokens=bucket_tokens, bs=decode_rows or bucket_bs,
         accelerator_graph=accelerator_graph, max_prefill_rows=MAX_PROMPTS,
-        has_sink_state=null_slot != NO_SLOT, stage_inputs=stage_inputs,
+        has_sink_state=null_slot != NO_SLOT, kernels=_kernels(null_slot, stage_inputs),
     )
     w.plan(spans, tuple(slots), tuple(has))
     conv_out = w.run_conv(x, conv, weight)[:tokens]
@@ -246,7 +252,7 @@ def test_a_replay_of_another_layout_matches_the_chunked_path():
     w = GDNMixedWrapper(
         device=device, pad_slot_id=PAD_SLOT_ID, null_slot_id=SINK_SLOT,
         num_tokens=bucket_tokens, bs=bucket_bs, accelerator_graph=True,
-        max_prefill_rows=MAX_PROMPTS,
+        max_prefill_rows=MAX_PROMPTS, kernels=_kernels(SINK_SLOT),
     )
     state, conv = _pools(device)
     x_buf = torch.zeros(bucket_tokens, CONV_DIM, device=device, dtype=torch.bfloat16)
@@ -318,7 +324,7 @@ def test_the_decode_halfs_width_changes_no_real_rows_result():
 def test_too_many_prompt_rows_for_the_bucket_is_refused():
     w = GDNMixedWrapper(
         device=torch.device("cpu"), pad_slot_id=PAD_SLOT_ID, null_slot_id=SINK_SLOT,
-        num_tokens=64, bs=8, accelerator_graph=True, max_prefill_rows=2,
+        num_tokens=64, bs=8, accelerator_graph=True, max_prefill_rows=2, kernels=_kernels(SINK_SLOT),
     )
     with pytest.raises(RuntimeError, match="prompt rows"):
         w.plan([4, 4, 4, 1], (1, 2, 3, 4), (False, False, False, True))
@@ -403,7 +409,7 @@ def test_a_mixed_steps_prompt_rows_save_the_snapshots_the_chunked_path_saves(acc
     ref_state, ref_conv = pools()
     ref = GDNPrefillWrapper(
         device=device, pad_slot_id=PAD_SLOT_ID, null_slot_id=SINK_SLOT,
-        num_tokens=tokens, bs=len(spans), accelerator_graph=True,
+        num_tokens=tokens, bs=len(spans), accelerator_graph=True, kernels=_kernels(SINK_SLOT),
     )
     ref.plan(
         spans, torch.tensor(slot_ids, dtype=torch.int32, device=device),
@@ -432,7 +438,7 @@ def test_a_mixed_steps_prompt_rows_save_the_snapshots_the_chunked_path_saves(acc
     w = GDNMixedWrapper(
         device=device, pad_slot_id=PAD_SLOT_ID, null_slot_id=SINK_SLOT,
         num_tokens=bucket_tokens, bs=bucket_bs,
-        accelerator_graph=accelerator_graph, max_prefill_rows=MAX_PROMPTS,
+        accelerator_graph=accelerator_graph, max_prefill_rows=MAX_PROMPTS, kernels=_kernels(SINK_SLOT),
     )
     w.plan(spans, tuple(slot_ids), tuple(has), snapshots, every, buffer)
     conv_out = w.run_conv(x, conv, weight)[:tokens]

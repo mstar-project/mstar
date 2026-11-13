@@ -27,6 +27,7 @@ from mstar.engine.resources.linear_attn.config import (
     LinearAttnVariant,
 )
 from mstar.engine.resources.linear_attn.gdn import GDNManager
+from mstar.engine.resources.linear_attn.gdn_kernels import FlashInferGDNKernels
 from mstar.engine.resources.linear_attn.wrappers import GDNPrefillWrapper
 from mstar.engine.resources.recurrent.config import (
     RecurrentBlockConfig,
@@ -34,6 +35,7 @@ from mstar.engine.resources.recurrent.config import (
     RecurrentStateSpec,
 )
 from mstar.engine.resources.recurrent.pool import RecurrentStatePool
+from mstar.platforms import current_platform
 from mstar.utils.causal_conv1d import PAD_SLOT_ID
 
 POOL, BACKEND = "gdn_state", "linear_attn"
@@ -86,7 +88,8 @@ def test_backend_takes_the_sink_setting_off_the_pool():
 # --- the gather/scatter itself --------------------------------------------
 
 requires_gpu = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="FlashInfer's chunked kernel needs a GPU"
+    not (torch.cuda.is_available() and current_platform.is_cuda()),
+    reason="FlashInfer's chunked kernel needs an NVIDIA GPU",
 )
 
 
@@ -123,6 +126,7 @@ def make_wrapper(device, has_sink: bool, accelerator_graph: bool = False):
         num_tokens=BUCKET_TOKENS if accelerator_graph else None,
         bs=4 if accelerator_graph else None,
         accelerator_graph=accelerator_graph,
+        kernels=FlashInferGDNKernels(has_sink=has_sink),
     )
 
 

@@ -1,7 +1,7 @@
-"""Gated delta rule through FlashInfer's GDN kernels.
+"""Gated delta rule, on the kernels a ``GDNKernels`` names for this platform.
 
 One kernel per batch: all-one-token rows take the recurrent decode path,
-anything else the chunked path, which also handles span-1 and zero-span padding.
+anything else the prefill path, which also handles span-1 and zero-span padding.
 
 The pool's plan result arrives through ``ctx.plan_results`` and its per-layer
 block as a plain tensor argument to ``run``.
@@ -15,7 +15,7 @@ from collections.abc import Mapping
 import torch
 
 from mstar.distributed.communication import gather_sequence
-from mstar.engine.resources.base import CGSlotKey, CGSlotSpec, Resource
+from mstar.engine.resources.base import BucketKey, CGSlotKey, CGSlotSpec, Resource
 from mstar.engine.resources.linear_attn.base import (
     Chunk,
     LinearAttnManager,
@@ -23,14 +23,13 @@ from mstar.engine.resources.linear_attn.base import (
     gather_rows,
     scatter_rows,
 )
-from mstar.engine.resources.linear_attn.config import LinearAttnConfig, LinearAttnStep, bf16_gdn_state_fits
-from mstar.engine.resources.linear_attn.gdn_stage import gdn_stage_applies
+from mstar.engine.resources.linear_attn.config import LinearAttnConfig, LinearAttnStep
+from mstar.engine.resources.linear_attn.gdn_kernels import FlashInferGDNKernels, GDNKernels, gdn_kernel
 from mstar.engine.resources.linear_attn.wrappers import (
     GDNDecodeWrapper,
     GDNMixedWrapper,
     GDNPrefillWrapper,
     GDNWrapper,
-    gdn_kernel,
 )
 from mstar.engine.resources.recurrent.config import DeltaNetGeometry
 from mstar.engine.resources.recurrent.pool import (
@@ -60,19 +59,6 @@ def _l2norm_qk(q: torch.Tensor, k: torch.Tensor) -> tuple[torch.Tensor, torch.Te
     return norm(q), norm(k)
 
 
-# What each arch's chunked prefill kernel will read as its packed state.
-# SM90 is fp32 only; Blackwell takes the narrower ones, so a bf16 pool is not
-# forced through an fp32 round trip there.
-_PREFILL_STATE_DTYPES: dict[int, tuple[torch.dtype, ...]] = {
-    9: (torch.float32,),
-    10: (
-        torch.float32, torch.bfloat16, torch.float16,
-        torch.float8_e4m3fn, torch.float8_e5m2,
-    ),
-    12: (torch.float32,),
-}
-
-
 class GDNManager(LinearAttnManager):
     supports_split_steps = True
     # the state is the recurrent pool's, which a drop zeroes
@@ -86,6 +72,7 @@ class GDNManager(LinearAttnManager):
         state_dtype: torch.dtype,
         has_sink: bool,
         device: torch.device,
+        kernels: GDNKernels,
         max_rows_in_combined: Mapping[str, int | None] | None = None,
     ):
         self.config = config
@@ -97,24 +84,15 @@ class GDNManager(LinearAttnManager):
         self._device = device
         self._pool_key = config.recurrent_state
         self._has_sink = has_sink
-
-        major = (
-            torch.cuda.get_device_capability(device)[0]
-            if device.type == "cuda" else 9
-        )
-        allowed = _PREFILL_STATE_DTYPES.get(major, (torch.float32,))
-        # Cast only where the arch cannot read the pool as is: a bf16 pool on
-        # SM90 round-trips through fp32 for prefill (`GDNPrefillWrapper.run`).
-        self._prefill_dtype = (
-            state_dtype if state_dtype in allowed else torch.float32
-        )
-        self._check_state_dtype(state_dtype, geometry, has_sink)
-        self._stage_prefill = gdn_stage_applies(device, geometry)
+        # chosen once, by `LinearAttnManager.build`; every wrapper runs these
+        self._kernels = kernels
 
         # See `build_cuda_graph_buffers`.
         self._cg_max_bs = 0
         self._cg_max_tokens = 0
         self._cg_wrappers: dict[CGSlotKey, GDNWrapper] = {}
+        # buckets `capture_refusal` refuses: warmed on the eager wrappers, which run them when serving
+        self._eager_buckets: set[BucketKey] = set()
         # The prefills' state checkpoints, sized once to the largest bucket and
         # shared: one forward runs at a time, and each graph holds the address.
         # An eager step fits it (`RecurrentStatePool._checkpoint_every`), and
@@ -134,39 +112,6 @@ class GDNManager(LinearAttnManager):
         self._preplanned = False
         self._cached_plan_output: tuple[dict[str, GDNWrapper], dict[str, SplitRows]] | None = None
 
-    @staticmethod
-    def _check_state_dtype(
-        state_dtype: torch.dtype, geometry: DeltaNetGeometry, has_sink: bool,
-    ) -> None:
-        if state_dtype is torch.float32:
-            return
-        if state_dtype is not torch.bfloat16:
-            raise NotImplementedError(
-                f"gdn state dtype {state_dtype} is not supported: FlashInfer's "
-                "pool decode paths are fp32 and bf16."
-            )
-        # The bf16 decode kernel is pool-only.
-        if not bf16_gdn_state_fits(geometry.head_k_dim, geometry.head_v_dim):
-            raise NotImplementedError(
-                f"a bf16 gdn state needs K=V=128, got K={geometry.head_k_dim} "
-                f"V={geometry.head_v_dim}; declare an fp32 pool instead."
-            )
-        from flashinfer import gdn_decode
-
-        if not gdn_decode._GDN_DECODE_BF16_STATE_AVAILABLE:
-            raise NotImplementedError(
-                "a bf16 gdn state needs FlashInfer's bf16 decode backend, "
-                "which this build does not have; declare an fp32 pool instead."
-            )
-        if not has_sink:
-            # That kernel writes a -1 index to slot 0, which without a sink
-            # belongs to a request.
-            raise ValueError(
-                "a bf16 gdn state needs the pool's sink slot: its decode "
-                "kernel writes padding rows to slot 0 rather than skipping "
-                "them. Unset RecurrentStateConfig.disable_sink_slot."
-            )
-
     def max_repeats(self, step, ctx) -> int:
         return ANY_REPEATS  # decode addresses the pool by slot alone
 
@@ -185,6 +130,10 @@ class GDNManager(LinearAttnManager):
     def bind_dependencies(self, resources: Mapping[str, Resource]) -> None:
         super().bind_dependencies(resources)
         self._pool = resources.get(self._pool_key)
+        if self._pool is not None and not self._kernels.writes_snapshots:
+            self._pool.refuse_snapshots(
+                f"{self._pool_key!r}'s GDN kernels ({type(self._kernels).__name__}) keep no state checkpoints"
+            )
 
     # Step lifecycle
 
@@ -243,8 +192,11 @@ class GDNManager(LinearAttnManager):
         """The wrapper this (label, walk) plans into, built once and reused.
 
         Under capture it is keyed per (bucket, slot, label) and sized to the
-        bucket, since the graph holds its buffers' addresses.
+        bucket, since the graph holds its buffers' addresses. A bucket that is not
+        captured runs on the eager wrappers, warm-up included.
         """
+        if lease is not None and lease.bucket in self._eager_buckets:
+            lease = None
         if lease is None:
             # both walks can run eagerly under one label
             key, store = (label, "split" if split is not None else is_decode), self._eager_wrappers
@@ -264,9 +216,6 @@ class GDNManager(LinearAttnManager):
                 store[key] = GDNMixedWrapper(
                     device=self._device,
                     pad_slot_id=PAD_SLOT_ID,
-                    sm_scale=self.config.sm_scale,
-                    qk_l2norm=self.config.qk_l2norm,
-                    prefill_dtype=self._prefill_dtype,
                     bs=bs,
                     num_tokens=tok,
                     accelerator_graph=lease is not None,
@@ -276,31 +225,27 @@ class GDNManager(LinearAttnManager):
                         split.max_prefill_rows(self._max_rows_in_combined, lease.bucket.bs)
                         if lease is not None else None
                     ),
-                    stage_inputs=self._stage_prefill,
+                    kernels=self._kernels,
                 )
             elif is_decode:
                 store[key] = GDNDecodeWrapper(
                     device=self._device,
                     pad_slot_id=PAD_SLOT_ID,
-                    sm_scale=self.config.sm_scale,
-                    qk_l2norm=self.config.qk_l2norm,
                     bs=bs,
                     accelerator_graph=lease is not None,
                     null_slot_id=null_slot_id,
+                    kernels=self._kernels,
                 )
             else:
                 store[key] = GDNPrefillWrapper(
                     device=self._device,
                     pad_slot_id=PAD_SLOT_ID,
-                    sm_scale=self.config.sm_scale,
-                    qk_l2norm=self.config.qk_l2norm,
-                    prefill_dtype=self._prefill_dtype,
                     bs=bs,
                     num_tokens=tok,
                     accelerator_graph=lease is not None,
                     has_sink_state=self._has_sink,
                     null_slot_id=null_slot_id,
-                    stage_inputs=self._stage_prefill,
+                    kernels=self._kernels,
                 )
         return store[key]
 
@@ -459,6 +404,10 @@ class GDNManager(LinearAttnManager):
         no values and its offset from zeros, which needs equal key and value dims), runs a row
         continuing into it from the state it gets, and every row's final state is gathered into
         every replica."""
+        if not isinstance(self._kernels, FlashInferGDNKernels):
+            raise ValueError("a split step whose heads don't divide over the SP ranks passes state with "
+                             "FlashInfer's chunked kernel, which the 'aiter' backend doesn't have; "
+                             "pick an SP size that divides each rank's heads")
         group, plan = split.seq_range.group, split.hand_off
         alpha = torch.exp(-torch.exp(a_log.float()) * torch.nn.functional.softplus(a.float() + dt_bias.float()))
         beta = torch.sigmoid(b.float())
@@ -476,7 +425,8 @@ class GDNManager(LinearAttnManager):
             got, final = gdn_kernel("chunk_gated_delta_rule", q.device)(
                 q=q.index_select(0, chunk.index), k=k.index_select(0, chunk.index), v=values,
                 g=alpha.index_select(0, chunk.index), beta=beta.index_select(0, chunk.index),
-                scale=self.config.sm_scale, initial_state=initial.to(self._prefill_dtype), output_final_state=True,
+                scale=self.config.sm_scale, initial_state=initial.to(self._kernels.prefill_dtype),
+                output_final_state=True,
                 cu_seqlens=chunk.cu, use_qk_l2norm_in_kernel=False,
             )
             if not zero_values:
@@ -536,14 +486,23 @@ class GDNManager(LinearAttnManager):
     def build_accelerator_graph_buffers(
         self, slots: list[CGSlotSpec], max_bs: int, max_seq_len: int,
     ) -> None:
-        del slots
+        self._eager_buckets.update(spec.bucket for spec in slots if self.capture_refusal(spec) is not None)
         # A floor under every capture wrapper's row count, so none reallocates
         # if a wider layout reaches it; announced before any bucket plans.
         self._cg_max_bs = max(self._cg_max_bs, max_bs)
         self._cg_max_tokens = max(self._cg_max_tokens, max_seq_len)
 
+    def capture_refusal(self, spec: CGSlotSpec) -> str | None:
+        # one-token rows take the decode kernel, which every backend captures;
+        # a longer row takes the prefill kernel the backend can capture, whose
+        # cost may grow with that row
+        if spec.max_row_tokens <= 1:
+            return None
+        return self._kernels.uncapturable_prefill(spec.max_row_tokens)
+
     def cleanup(self):
         self._cg_wrappers.clear()
+        self._eager_buckets.clear()
         self._eager_wrappers.clear()
         self._current.clear()
         self._split_rows.clear()

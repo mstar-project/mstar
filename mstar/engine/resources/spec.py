@@ -149,6 +149,13 @@ class NodeResourceSpec(ABC):
         those of the resources it depends on that restore."""
         return False
 
+    def restore_refusal(self) -> str | None:
+        """Why a resource that `restores_prefix` can't, even over open caches that
+        restore (None when it can): kernels that write no state checkpoints into
+        the pool it depends on, say. Fixed at startup like `keeps_prefix_cache`;
+        `unrestorable` then keeps every cache on its nodes shut."""
+        return None
+
     @property
     def storage(self) -> "Storage | None":
         """How this resource stores its per-request state over a node's ranks: ``by_head`` (each
