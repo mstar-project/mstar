@@ -1038,8 +1038,8 @@ def _run_windowed_kv_served(model, dit, resources, md, cond_ids, uncond_ids, dev
 def test_windowed_kv_matches_reference() -> None:
     """The served kv path — block-causal denoise over committed context,
     commit passes, page-floor release — must reproduce the hand-rolled
-    reference bit-tightly on the sdpa resources (sequential guidance, the
-    bit-exact regime), window by window."""
+    reference bit-tightly on the sdpa resources, window by window. The
+    reference packs the guidance branches as the served step does."""
     ctx = _windowed_scenario()
     if ctx is None:
         print("  (skipped windowed-kv reference parity: needs COSMOS3_NANO_DIR + CUDA)")
