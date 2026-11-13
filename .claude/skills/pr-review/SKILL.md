@@ -523,7 +523,8 @@ A question doesn't hold the bot's approval; a finding does, and an open P0–P2 
 from starting. So a suspected defect that the live test can settle is a question and a `live_test.focus`
 item (§7), so the live test checks it and a pass settles it. Only one that neither the code nor the live
 test can settle and that would rank P2 or above is filed as a finding, marked suspected, with its "how to
-confirm" line. Otherwise ask questions for direction and scope and for what only a person can answer:
+confirm" line. `focus` holds at most eight items; past eight, file each remaining suspected defect that
+would rank P2 or above as a suspected finding (which holds approval), not as a question. Otherwise ask questions for direction and scope and for what only a person can answer:
 intended behaviour on a path the PR doesn't mention, whether a human checked generated audio or images,
 why a design departs from the pattern `AGENTS.md` describes. Say what the answer would change. Don't ask
 the author to "verify", "double-check" or "consider", and don't ask what the code does; read it.
