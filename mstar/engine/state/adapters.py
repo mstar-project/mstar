@@ -2181,10 +2181,12 @@ class BoundedStorage(Storage):
             resolved.resource_of.update(_resources_of(array, bound))
         return resolved
 
-    def steps(self, handle: BoundedHandle, declared: ArrayStep, step: SubmoduleStep, steps: dict[str, Any]) -> None:
-        steps[handle.name] = BoundedKVStep(segments=declared.segments, positions={
+    def steps(
+        self, handle: BoundedHandle, declared: ArrayStep, step: SubmoduleStep, segments, steps: dict[str, Any],
+    ) -> None:
+        steps[handle.name] = BoundedKVStep(segments=segments, positions={
             segment.request_id: StreamPosition(source_len=0, written=handle.written(segment.request_id))
-            for segment in segments_of(declared, step)
+            for segment in segments
         })
 
 
