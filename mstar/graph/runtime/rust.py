@@ -194,7 +194,6 @@ def sharding_args(config: ShardingConfig) -> dict:
         ],
         "shard_dim": list(config.shard_dim.items()),
         "tp_enabled_nodes": sorted(config.tp_enabled_nodes),
-        "sp_enabled_nodes": sorted(config.sp_enabled_nodes),
     }
 
 
@@ -222,6 +221,14 @@ def _column(t: torch.Tensor | None) -> tuple[int, int, int, str]:
     if t is None:
         return 0, 0, 0, ""
     return t.data_ptr(), t.shape[0], t.stride(0), _dtype_name(t.dtype)
+
+
+def _withheld_columns(withheld: Mapping[str, list[int]] | None) -> dict[str, list]:
+    """``RouteInput.withheld`` as Rust takes it: a signal column and a rid
+    list per signal, nothing when there is none."""
+    if not withheld:
+        return {}
+    return {"withheld_signals": list(withheld), "withheld_rids": [list(r) for r in withheld.values()]}
 
 
 class RustGraphRuntime(GraphRuntime):
@@ -659,12 +666,13 @@ class RustGraphRuntime(GraphRuntime):
             "rids": list(input.wg_ids.keys),
             "tensors": list(input.tensors),
             "num_tensors": list(input.num_tensors),
-            "inline_signal": input.inline_signal,
+            "inline_signals": list(input.inline_signals),
             "inline_values": list(input.inline_values),
             "logprobs": list(input.logprobs),
             "walks": input.walks,
             "rid_walk_idx": input.rid_walk_idx,
             "loop_strides": input.loop_strides,
+            **_withheld_columns(input.withheld),
         })
         return self._route_output(out)
 
@@ -710,6 +718,9 @@ class RustGraphRuntime(GraphRuntime):
             [p.reads_token for p in policies.values()],
             [sorted(p.eos_tokens) for p in policies.values()],
         )
+
+    def loop_room(self, node_name: str, graph_walk: str, loop_name: str, rids: list[int], stride: int) -> int:
+        return self._rust.loop_room(node_name, graph_walk, loop_name, rids, stride)
 
     def register_stop_limits(self, rid: int, info: CurrentForwardPassInfo) -> None:
         cap = (1 << 32) - 1  # also "no limit": a loop count never reaches it
@@ -760,25 +771,28 @@ class RustGraphRuntime(GraphRuntime):
             runtime_stops=request.runtime_stops,
             token_ptr=ptr, token_rows=rows, token_stride=stride, token_dtype=dtype,
             row_rids=list(request.row_rids),
-            inline_signal=None if inline is None else inline.signal,
+            inline_signals=[] if inline is None else list(inline.signals),
             inline_ptr=iptr, inline_rows=irows, inline_stride=istride, inline_dtype=idtype,
             partition_done=list(request.partition_done), python_send=request.python_send,
-            loop_strides=request.loop_strides,
+            loop_strides=request.loop_strides, token_width=request.token_width,
+            **_withheld_columns(request.withheld),
         )
         return self._postprocess_step(out)
 
     def resume_postprocess(
         self, stops: Mapping[int, set[str]] | None = None, dropped: Iterable[int] = (),
         stored: RouteTensors | None = None, send: SendInput | None = None,
+        withheld: Mapping[str, list[int]] | None = None,
     ) -> PostprocessStep:
         if stops is not None:
             out = self._rust.resume_postprocess_stops(
                 list(stops), [sorted(v) for v in stops.values()], list(dropped),
+                **_withheld_columns(withheld),
             )
         elif stored is not None:
             out = self._rust.resume_postprocess_store(
                 tensors=list(stored.tensors), num_tensors=list(stored.num_tensors),
-                inline_signal=stored.inline_signal, inline_values=list(stored.inline_values),
+                inline_signals=list(stored.inline_signals), inline_values=list(stored.inline_values),
                 logprobs=list(stored.logprobs),
             )
         elif send is not None:

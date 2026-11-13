@@ -11,11 +11,19 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import huggingface_hub
 import pytest
+import yaml
 
+from mstar.conductor.conductor import Conductor
 from mstar.graph.base import GraphNode, Loop, Sequential
+from mstar.graph.special_destinations import EMIT_TO_CLIENT
+from mstar.model.praxis1 import praxis1_model
 from mstar.model.praxis1.config import Praxis1Config, Praxis1ConfigError
-from mstar.model.praxis1.praxis1_model import Praxis1Model
+from mstar.model.praxis1.praxis1_model import DENOISE_LOOP_NAME, Praxis1Model
+from mstar.model.registry import get_model_class, model_init_kwargs
+
+ROOT = Path(__file__).resolve().parents[2]
 
 # The two published checkpoints, as their config.json describes them.
 DROID_CONFIG = {
@@ -102,10 +110,46 @@ def _yam_config() -> dict:
     return config
 
 
-def _model(tmp_path: Path, config: dict, monkeypatch: pytest.MonkeyPatch) -> Praxis1Model:
+def _model(
+    tmp_path: Path, config: dict, monkeypatch: pytest.MonkeyPatch, **model_kwargs
+) -> Praxis1Model:
+    """The model as serving builds it, from the checkpoint's config.json.
+
+    ``_ensure_repo`` is the only download the constructor makes, so pointing
+    it at ``tmp_path`` keeps this offline, and lifting ``_SERVABLE`` stands in
+    for the compute port. Nothing here calls ``get_submodule``, so no node is
+    built.
+    """
     (tmp_path / "config.json").write_text(json.dumps(config))
     monkeypatch.setattr(Praxis1Model, "_ensure_repo", lambda self: tmp_path)
-    return Praxis1Model(model_path_hf="runwayml/praxis-1-droid", skip_weight_loading=True)
+    monkeypatch.setattr(praxis1_model, "_SERVABLE", True)
+    return Praxis1Model(
+        model_path_hf="runwayml/praxis-1-droid", skip_weight_loading=False, **model_kwargs
+    )
+
+
+@pytest.fixture
+def no_download(monkeypatch: pytest.MonkeyPatch) -> list[dict]:
+    """Fail any test that reaches the Hub; the calls it would have made."""
+    calls: list[dict] = []
+
+    def refuse(**kwargs):
+        calls.append(kwargs)
+        raise AssertionError(f"snapshot_download was called: {kwargs}")
+
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", refuse)
+    return calls
+
+
+def _loop_conductor(model: Praxis1Model) -> Conductor:
+    """A conductor with only what ``_loop_caps`` reads: the model and its loops' ``max_iters``."""
+    conductor = Conductor.__new__(Conductor)
+    conductor.model = model
+    conductor._loop_max_iters = {}
+    for walk in model.get_graph_walk_graphs().values():
+        for name, loop in walk.get_loops().items():
+            conductor._loop_max_iters[name] = loop.max_iters
+    return conductor
 
 
 def test_the_rig_decides_the_wire():
@@ -268,7 +312,7 @@ def test_robot_io_matches_the_checkpoint(tmp_path, monkeypatch):
 
 
 def test_the_text_walk_persists_what_the_chunk_walk_reads(tmp_path, monkeypatch):
-    """The task text is constant for an episode, so no policy call re-encodes it."""
+    """Persisted text is available to later walks of the same request."""
     model = _model(tmp_path, DROID_CONFIG, monkeypatch)
     walks = model.get_graph_walk_graphs()
     assert set(walks) == {model.ENCODE_TEXT_WALK, model.CHUNK_WALK}
@@ -298,15 +342,113 @@ def test_the_denoise_loop_carries_both_latents(tmp_path, monkeypatch):
     # Both latents loop back for the next step.
     assert {edge.name for edge in expert.outputs} == {"video_latents", "action_latents"}
     assert all(edge.next_node == "backbone" for edge in expert.outputs)
-    # and leave the loop once it settles.
-    assert {edge.name for edge in loop.outputs} == {"video_latents", "action_latents"}
+    # Only the actions leave once it settles: the predicted video has no reader.
+    assert {edge.name for edge in loop.outputs} == {"action_latents"}
 
 
-def test_the_actions_are_what_reaches_the_client(tmp_path, monkeypatch):
+def test_the_actions_are_all_that_leaves_the_chunk_walk(tmp_path, monkeypatch):
+    """The next call is conditioned on real frames, never on the predicted
+    video, so a chunk walk persists nothing and hands the client only rows."""
     model = _model(tmp_path, DROID_CONFIG, monkeypatch)
-    head = _node(model.get_graph_walk_graphs()[model.CHUNK_WALK], "action_head")
-    emitted = [edge for edge in head.outputs if edge.output_modality]
-    assert [(edge.name, edge.output_modality) for edge in emitted] == [("actions", "action")]
+    chunk = model.get_graph_walk_graphs()[model.CHUNK_WALK]
+    edges = [edge for node in chunk.get_nodes().values() for edge in node.outputs]
+    edges += [edge for loop in chunk.get_loops().values() for edge in loop.outputs]
+
+    to_client = [edge for edge in edges if edge.next_node == EMIT_TO_CLIENT]
+    assert [(edge.name, edge.output_modality) for edge in to_client] == [("actions", "action")]
+    assert [edge.name for edge in edges if edge.persist] == []
+    # No edge carries the predicted video past the loop.
+    head = _node(chunk, "action_head")
+    assert "video_latents" not in head.input_names
+
+
+def test_the_served_model_reads_the_checkpoint_config(tmp_path, monkeypatch, no_download):
+    """Values the published shape does not have reach the model, so the
+    tests above ran on config.json and not on the rig defaults."""
+    config = json.loads(json.dumps(DROID_CONFIG))
+    config["max_denoise_steps"] = 4
+    config["action_expert"]["max_action_tokens"] = 32
+    served = _model(tmp_path, config, monkeypatch)
+    dummy = Praxis1Model(model_path_hf="runwayml/praxis-1-droid", skip_weight_loading=True)
+
+    assert (served.config.max_action_tokens, dummy.config.max_action_tokens) == (32, 64)
+    assert (served.max_denoise_steps, dummy.max_denoise_steps) == (4, 8)
+    loops = served.get_graph_walk_graphs()[served.CHUNK_WALK].get_loops()
+    assert loops[DENOISE_LOOP_NAME].max_iters == 4
+
+
+@pytest.mark.parametrize(
+    "repo, rig, wire",
+    [
+        ("runwayml/praxis-1-droid", "single_arm", (24, 10, 2)),
+        ("runwayml/praxis-1-yam", "bimanual", (24, 20, 3)),
+    ],
+)
+def test_dummy_mode_takes_the_rig_from_the_name_and_reads_nothing(repo, rig, wire, no_download):
+    """The startup checks build the model with no checkpoint, so dummy mode
+    must never reach the Hub, and must still build the rig's wire."""
+    model = Praxis1Model(model_path_hf=repo, skip_weight_loading=True)
+    _, horizon, dim = model.robot_io()
+    assert model.config.embodiment == rig
+    assert (horizon, dim, model.max_input_files()["image"]) == wire
+    assert set(model.get_graph_walk_graphs()) == {model.ENCODE_TEXT_WALK, model.CHUNK_WALK}
+    assert no_download == []
+
+
+def test_the_config_read_fetches_config_json_only(tmp_path, monkeypatch):
+    """Every process builds the graph from config.json; none of them may pull
+    the weights, which only get_submodule on a worker reads."""
+    calls: list[dict] = []
+
+    def fetch(**kwargs):
+        calls.append(kwargs)
+        (tmp_path / "config.json").write_text(json.dumps(DROID_CONFIG))
+        return str(tmp_path)
+
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", fetch)
+    monkeypatch.setattr(praxis1_model, "_SERVABLE", True)
+    Praxis1Model(model_path_hf="runwayml/praxis-1-droid", skip_weight_loading=False)
+    assert [call["allow_patterns"] for call in calls] == [["config.json"]]
+
+
+@pytest.mark.parametrize("name", ["praxis1_droid", "praxis1_yam"])
+def test_serving_is_refused_before_anything_is_downloaded(name, no_download):
+    """``mstar serve`` builds the model from the registry and the shipped
+    config, as here; with no node computation yet that has to stop at once,
+    not after a download and every process's startup."""
+    shipped = yaml.safe_load((ROOT / "configs" / f"{name}.yaml").read_text())
+    with pytest.raises(NotImplementedError, match="not servable yet"):
+        get_model_class(name)(**{**model_init_kwargs(name), **shipped["model_kwargs"]})
+    assert no_download == []
+
+
+def test_the_loop_runs_the_recipe_not_its_ceiling(tmp_path, monkeypatch):
+    """A 2-step recipe ends the loop on step 2. Undeclared, the conductor
+    would give the loop its ceiling of 8, and the expert's async scheduling
+    a step to speculate past the last."""
+    model = _model(tmp_path, DROID_CONFIG, monkeypatch, num_steps=2)
+    conductor = _loop_conductor(model)
+    assert conductor._loop_max_iters == {DENOISE_LOOP_NAME: 8}
+    assert conductor._loop_caps({}) == {DENOISE_LOOP_NAME: 2}
+    # A request may ask for fewer steps.
+    assert conductor._loop_caps({"num_steps": 1}) == {DENOISE_LOOP_NAME: 1}
+    assert "num_steps" in model.request_kwargs()
+
+
+@pytest.mark.parametrize(
+    "num_steps, message",
+    [(3, "never more"), (0, "integer >= 1"), (True, "integer"), ("2", "integer")],
+)
+def test_a_request_cannot_raise_the_step_count(tmp_path, monkeypatch, num_steps, message):
+    model = _model(tmp_path, DROID_CONFIG, monkeypatch, num_steps=2)
+    with pytest.raises(ValueError, match=message):
+        model.get_loop_caps(num_steps=num_steps)
+
+
+def test_a_recipe_past_the_loop_ceiling_is_refused_at_construction(tmp_path, monkeypatch):
+    """Otherwise every request would be refused at the conductor."""
+    with pytest.raises(Praxis1ConfigError, match="num_steps"):
+        _model(tmp_path, DROID_CONFIG, monkeypatch, num_steps=9)
 
 
 def test_nothing_here_decodes_tokens(tmp_path, monkeypatch):

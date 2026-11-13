@@ -143,7 +143,8 @@ if TYPE_CHECKING:
     from mstar.model.components.moe_parallel import MoeParallelConfig
 
 if TYPE_CHECKING:
-    from mstar.engine.state import Array, Sampler, SampleSettings
+    from mstar.engine.state import Array, Sampler, SampleSettings, SeqShard
+    from mstar.engine.state.adapters import StateSetup
     from mstar.worker.scheduling_policy import WalkPriority
 
 DECODE = "decode"
@@ -548,7 +549,7 @@ def streamed_inputs(model: "Model", graph_walk: str, graph: GraphSection) -> set
     }
 
 
-def enabled_resources(model: "Model", model_config: dict) -> list[NodeResourceSpec]:
+def enabled_resources(model: "Model", model_config: dict, setup: "StateSetup") -> list[NodeResourceSpec]:
     """The resource specs a deployment's YAML turns on, before its ``resources:``
     overrides: the model's declaration, less the opt-in specs (``NodeResourceSpec.opt_in``)
     its ``resources:`` block does not name. Raises the first problem with the declaration,
@@ -561,19 +562,22 @@ def enabled_resources(model: "Model", model_config: dict) -> list[NodeResourceSp
         raise ValueError(problems[0])
     named = (model_config.get("resources") or {}).keys()
     return [
-        spec for spec in node_resources(model)
+        spec for spec in node_resources(model, setup=setup)
         if not spec.opt_in or spec.resource_key in named
     ]
 
 
-def declared_resources(model: "Model", model_config: dict) -> list[NodeResourceSpec]:
+def declared_resources(
+    model: "Model", model_config: dict, setup: "StateSetup | None" = None,
+) -> list[NodeResourceSpec]:
     """The resource specs a deployment declares: ``enabled_resources`` with the YAML's
     overrides applied. A ``per_node`` spec is whole here, as the API server checks
     requests and adapters against it; ``serving_resources`` splits it."""
     from mstar.engine.resources.spec import apply_yaml_overrides
+    from mstar.engine.state.adapters import spec_overrides
 
-    specs = enabled_resources(model, model_config)
-    apply_yaml_overrides(specs, model_config)
+    specs = enabled_resources(model, model_config, setup or deployment_setup(model, model_config))
+    apply_yaml_overrides(specs, spec_overrides(model_config))
     return specs
 
 
@@ -601,7 +605,20 @@ def parse_autocast_dtype(value) -> torch.dtype | None:
     return dtype
 
 
-def serving_resources(model: "Model", model_config: dict) -> list[NodeResourceSpec]:
+def deployment_setup(model: "Model", model_config: dict) -> "StateSetup":
+    """The `StateSetup` ``model_config`` asks for, raising its first problem, for callers that skip
+    ``validate_deployment``, which reports them all."""
+    from mstar.engine.state.adapters import state_setup
+
+    setup, problems = state_setup(model_config, model.declare_state())
+    if problems:
+        raise ValueError(problems[0])
+    return setup
+
+
+def serving_resources(
+    model: "Model", model_config: dict, setup: "StateSetup | None" = None,
+) -> list[NodeResourceSpec]:
     """The resource specs a deployment builds: ``declared_resources``, as
     ``built_resources``.
 
@@ -610,7 +627,7 @@ def serving_resources(model: "Model", model_config: dict) -> list[NodeResourceSp
     ``validate_deployment`` takes the same steps, reporting every problem rather than
     the first.
     """
-    return built_resources(declared_resources(model, model_config))
+    return built_resources(declared_resources(model, model_config, setup))
 
 
 class Model(ABC):
@@ -788,7 +805,7 @@ class Model(ABC):
         """
         return []
 
-    def declare_state(self) -> "list[Array | Sampler]":
+    def declare_state(self) -> "list[Array | Sampler | SeqShard]":
         """The state the model keeps between steps, from which the engine builds the specs for it.
 
         A pure function of the model's config and the deployment's settings, since each process calls it.
@@ -1223,7 +1240,7 @@ class Model(ABC):
     @abstractmethod
     def get_submodule(
         self, node_name: str, device="cpu", tp_group=None,
-        autocast_dtype: torch.dtype | None = None, sp_group=None,
+        autocast_dtype: torch.dtype | None = None,
         moe_parallel: "MoeParallelConfig | None" = None, cfg_group=None,
     ) -> torch.nn.Module | None:
         """Return the nn.Module for this node, or None for dummy mode.
@@ -1233,12 +1250,6 @@ class Model(ABC):
         Models that support tensor parallelism should forward it to
         parallel-linear constructors so weight shapes are partitioned at
         init time and the weight loaders shard correctly.
-
-        ``sp_group`` is the node's sequence-parallel comm group, orthogonal
-        to ``tp_group``. The engine manager only passes it when the node
-        participates in a non-trivial SP group, so models without SP support
-        never receive it. Models that support SP forward it to their
-        attention so it can all-to-all the sequence around the kernel.
 
         ``cfg_group`` is the node's classifier-free-guidance comm group, for
         a node in ``cfg_enabled_nodes`` whose group sets ``cfg_size > 1``
