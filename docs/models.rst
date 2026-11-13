@@ -2513,8 +2513,10 @@ torch 2.12; build it from FastVideo's repository for the GPU and the installed t
 ``TORCH_CUDA_ARCH_LIST=10.3a CMAKE_ARGS=-DFASTVIDEO_KERNEL_BUILD_ULYSSES_A2A=OFF pip install
 --no-build-isolation "git+https://github.com/hao-ai-lab/FastVideo@ec9145ab3d86b2255b6fa3bbbb2845859c72cafd#subdirectory=fastvideo-kernel"``
 (``10.0a`` for B200; needs scikit-build-core and the CUTLASS submodule). On one B300 (1344x768,
-124 frames, compiled, warm) a clip takes 18.5-18.7 s with VSA and 23.0-23.5 s dense, against
-18.2 s for SGLang's FastH3 with VSA on the same GPU, whose DiT forward M*'s matches. Each VSA
+124 frames, compiled, warm) a clip takes 18.5-18.9 s with VSA and 23.0-23.5 s dense, against
+18.0-18.2 s for SGLang's FastH3 with VSA on the same GPU. The DiT forwards are within 1%; the
+rest is the output path: SGLang encodes the mp4 while its VAE decodes and muxes the audio in the
+same ffmpeg pass, where M* encodes after the decode and muxes in a second pass. Each VSA
 attention call is 12 ms where dense cuDNN is 26 ms; dense queries (text, audio) attend everything, and each video query tile its 132
 best of 660 video key tiles. VSA's output against dense's on 8 prompts is 10.8 dB / SSIM 0.37 (a
 different clip, not a degraded one), the same as SGLang's VSA against its own dense; against an
@@ -2524,8 +2526,7 @@ It is sampled as FastVideo samples it: H3's Euler step on the release's rungs
 (``fastvideo_inference.json``: 999, 874, ..., 125) over 1000 plus a terminal 0, shifted in fp32
 by 10 (video) and 3 (audio). ``num_inference_steps`` is 9 sigma points (the default) and the
 shifts are the release's: anything else, and keyframes, are a 400; ``step_cache`` is refused
-at startup. On one B300 (1344x768, 124
-frames, compiled, warm) a clip takes 23.0-23.5 s, against 126.5 s for the base's 50 points.
+at startup. The base's 50 points take 126.5 s on the same GPU.
 Against diffusers' pipeline over the same transformer on FastVideo's grid
 (``oracle.py --distilled``, ``parity.py --distilled``), the seeded noise, the layout, the
 timesteps and the conditioner (FastH3's token refiner) are bit-identical, and each
