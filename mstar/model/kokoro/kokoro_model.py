@@ -6,7 +6,7 @@ Graph (one node, one walk)::
         text --G2P (misaki / espeak-ng)--> sentence chunks --> phoneme ids,
         one style row per chunk from the voice pack (or blend), speed
              |
-             v   phoneme_ids [n, T], phoneme_lens [n], ref_style [n, 256], speed [1]
+             v   phoneme_ids [n, T], ref_style [n, 256], speed [1], and the chunk lengths as step metadata
     ┌─ chunk_loop ──────────────────────────────────────────────────────┐
     │  kokoro  (GPU) : PL-BERT -> prosody (durations, F0, energy)        │
     │                  -> text encoder -> iSTFTNet decoder               │
@@ -27,16 +27,15 @@ from typing import Any
 import torch
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.engine.resources import NodeResourceSpec
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import Model, WalkStep
+from mstar.model.base import Model, ProcessPromptOutput, WalkStep
 from mstar.model.kokoro.config import (
     AUDIO_CHUNK,
     BOUNDARY_TOKEN_ID,
+    CHUNK_LENGTHS,
     CHUNK_LOOP,
     PHONEME_IDS,
-    PHONEME_LENS,
     REF_STYLE,
     SPEED,
     SYNTH_NODE,
@@ -82,6 +81,8 @@ def _resolve_snapshot(repo_id: str, cache_dir: str | None, allow_patterns: list[
 class KokoroModel(Model):
     """Model contract for Kokoro-82M (``hexgrad/Kokoro-82M``)."""
 
+    INTERNAL_KWARGS = (CHUNK_LENGTHS,)
+
     def __init__(
         self,
         model_path_hf: str,
@@ -115,14 +116,10 @@ class KokoroModel(Model):
 
     # -- graph -------------------------------------------------------------
 
-    def get_node_resources(self) -> list[NodeResourceSpec]:
-        """Kokoro is not autoregressive and keeps no state between steps."""
-        return []
-
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         synth = GraphNode(
             name=SYNTH_NODE,
-            input_names=[PHONEME_IDS, PHONEME_LENS, REF_STYLE, SPEED],
+            input_names=[PHONEME_IDS, REF_STYLE, SPEED],
             outputs=[GraphEdge(next_node=EMIT_TO_CLIENT, name=AUDIO_CHUNK, output_modality="audio")],
             # The loop length is per request (its chunk count); speculating
             # an extra iteration would synthesize a chunk that does not exist.
@@ -150,7 +147,7 @@ class KokoroModel(Model):
         output_modalities: list[str],
         tensors: NameToTensorList | None = None,
         **kwargs: Any,
-    ) -> NameToTensorList:
+    ) -> ProcessPromptOutput:
         del tensors
         if "audio" not in output_modalities:
             raise ValueError("Kokoro produces audio; request output_modalities=['audio']")
@@ -196,17 +193,15 @@ class KokoroModel(Model):
             raise ValueError(f"G2P produced a {longest}-phoneme chunk; the window is {self.config.max_phonemes}")
 
         ids = [torch.tensor(self.tokenize(c.phonemes), dtype=torch.long) for c in chunks]
-        lengths = torch.tensor([len(x) for x in ids], dtype=torch.long)
-        padded = torch.full((len(ids), int(lengths.max())), BOUNDARY_TOKEN_ID, dtype=torch.long)
+        lengths = [len(x) for x in ids]
+        padded = torch.full((len(ids), max(lengths)), BOUNDARY_TOKEN_ID, dtype=torch.long)
         for row, x in enumerate(ids):
             padded[row, : len(x)] = x
         style = torch.stack([self.voices.style(voice, len(c.phonemes)) for c in chunks])
-        return {
-            PHONEME_IDS: [padded],
-            PHONEME_LENS: [lengths],
-            REF_STYLE: [style],
-            SPEED: [torch.tensor([speed], dtype=torch.float32)],
-        }
+        return ProcessPromptOutput(
+            {PHONEME_IDS: [padded], REF_STYLE: [style], SPEED: [torch.tensor([speed], dtype=torch.float32)]},
+            {CHUNK_LENGTHS: lengths},
+        )
 
     # -- walk plan ---------------------------------------------------------
 
@@ -220,7 +215,7 @@ class KokoroModel(Model):
     ) -> list[WalkStep]:
         """The single walk synthesizes every chunk (``process_prompt`` refuses a
         request that asks for no audio)."""
-        return [WalkStep(SYNTH_WALK)]
+        return [WalkStep(SYNTH_WALK, step_metadata={CHUNK_LENGTHS: model_kwargs[CHUNK_LENGTHS]})]
 
     # -- output ------------------------------------------------------------
 

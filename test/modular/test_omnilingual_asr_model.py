@@ -618,7 +618,7 @@ def test_model_hooks_are_not_shadowed(tiny_model):
 
 
 def test_graph_is_one_stateless_node(tiny_model):
-    assert tiny_model.get_node_resources() == []
+    assert tiny_model.declare_state() == []
     walks = tiny_model.get_graph_walk_graphs()
     assert list(walks) == [TRANSCRIBE_WALK]
     node = walks[TRANSCRIBE_WALK]
@@ -708,14 +708,13 @@ def test_a_step_over_the_audio_budget_is_not_encoded_packed(tiny_model, monkeypa
     resource's segment ceiling (a YAML override may set it below
     `max_batch_size`), planned whole otherwise. One over the budget plans and
     leases nothing and encodes padded per sub-batch."""
-    from mstar.model.omnilingual_asr.config import ENCODER_ATTN
     from mstar.model.omnilingual_asr.submodules import ENCODER_LOOP, OmniASRCTCSubmodule
 
     sub = tiny_model.get_submodule(ENCODER_NODE, "cpu")
     small = OmniASRCTCSubmodule(sub.model, max_batch_size=4, max_batch_seconds=0.5)  # 8000 samples
-    small.node_resources = {ENCODER_ATTN: types.SimpleNamespace(max_segments_per_step=2)}
+    small.tokens = types.SimpleNamespace(_kernel_setting=lambda read, field: {"max_segments_per_step": 2}[field])
     packed_calls = []
-    monkeypatch.setattr(small, "_transcribe_packed", lambda waves, attn, ei: packed_calls.append(len(waves)) or [
+    monkeypatch.setattr(small, "_transcribe_packed", lambda waves, ei: packed_calls.append(len(waves)) or [
         torch.zeros(n, dtype=torch.long) for n in small.model.frame_lengths([w.shape[0] for w in waves])
     ])
     torch.manual_seed(6)
@@ -729,7 +728,7 @@ def test_a_step_over_the_audio_budget_is_not_encoded_packed(tiny_model, monkeypa
             for r, w in zip(rids, waves, strict=True)
         ]
         declared = small.declare_step(TRANSCRIBE_WALK, rids, inputs)
-        engine_inputs = types.SimpleNamespace(request_ids=rids, resources={ENCODER_ATTN: object()})
+        engine_inputs = types.SimpleNamespace(request_ids=rids)
         pre = small.preprocess(TRANSCRIBE_WALK, engine_inputs, inputs)
         with torch.no_grad():
             out = small.forward_batched(TRANSCRIBE_WALK, engine_inputs, **pre)

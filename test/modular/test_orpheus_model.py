@@ -7,6 +7,7 @@ import pytest
 import torch
 
 from mstar.conductor.conductor import Conductor
+from mstar.engine.state.adapters import node_resources, sampling_configs
 from mstar.model.orpheus.config import SAMPLER, OrpheusModelConfig
 from mstar.model.orpheus.orpheus_model import OrpheusModel, _checkpoint_sampling_defaults
 
@@ -75,14 +76,19 @@ def test_config_defaults_and_forwarded_knobs():
     assert (cfg.top_k, cfg.penalize_prompt) == (50, False)
 
 
+def _sampling(model, model_kwargs: dict):
+    """The model's sampler spec and a request's config for it, as the engine builds and the conductor resolves them."""
+    spec = next(s for s in node_resources(model) if s.resource_key == SAMPLER)
+    config = sampling_configs(model.get_request_resource_configs([], [], model_kwargs), model.declare_state())
+    return spec, config[SAMPLER]
+
+
 def test_min_p_is_refused_unless_the_checkpoint_defaults_it():
-    model = _model()
-    spec = next(s for s in model.get_node_resources() if s.resource_key == SAMPLER)
+    spec, config = _sampling(_model(), {"min_p": 0.1})
     with pytest.raises(ValueError, match="min_p"):
-        model.get_request_resource_configs([], [], {"min_p": 0.1})[SAMPLER].validate(spec)
-    model = _model(dataclasses.replace(OrpheusModelConfig(), min_p=0.05))
-    spec = next(s for s in model.get_node_resources() if s.resource_key == SAMPLER)
-    model.get_request_resource_configs([], [], {})[SAMPLER].validate(spec)
+        config.validate(spec)
+    spec, config = _sampling(_model(dataclasses.replace(OrpheusModelConfig(), min_p=0.05)), {})
+    config.validate(spec)
 
 
 def test_absent_voice_is_the_default():
