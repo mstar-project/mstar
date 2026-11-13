@@ -16,7 +16,7 @@ from mstar.model.components.diffusion.step_cache import (
 )
 from mstar.model.submodule_base import InputMetadata, ModelInputsFromEngine
 from mstar.model.wan22.components.dit import Wan22DiT
-from mstar.model.wan22.config import Wan22Config
+from mstar.model.wan22.config import MAG_RATIOS, Wan22Config
 from mstar.model.wan22.submodules import DENOISE_LOOP_NAME, Wan22DitSubmodule
 from mstar.model.wan22.wan22_model import Wan22Model
 
@@ -267,3 +267,10 @@ def test_cfg_ranks_take_the_same_decisions_and_keep_their_own_branch():
         _run_loop(sub)
         assert sub.request_state("r0").tensors[RESIDUAL].shape == (1, 8, 24)
     assert not torch.equal(*(sub.request_state("r0").tensors[RESIDUAL] for sub in ranks))
+
+
+def test_a_step_cache_with_a_distilled_sampler_is_refused():
+    """The calibrated table is a UniPC run's: resampled to FastWan's 3 steps it would skip the middle one."""
+    assert step_cache_policy({"method": "magcache"}, MAG_RATIOS).reuse_plan(3) == (False, True, False)
+    with pytest.raises(ValueError, match="unipc sampler only"):
+        Wan22Config(sampler="dmd", step_cache=_FLAT)
