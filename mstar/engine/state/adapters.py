@@ -54,6 +54,7 @@ from mstar.engine.resources.linear_attn.config import (
 )
 from mstar.engine.resources.position.config import PositionConfig, PositionSpec, PositionStep
 from mstar.engine.resources.recurrent.config import (
+    DeltaNetGeometry,
     RecurrentBlockConfig,
     RecurrentStateConfig,
     RecurrentStateSpec,
@@ -1374,13 +1375,40 @@ class KDA(LinearAttnBinding):
             ),
         )]
 
+    def steps(
+        self, array: Array, key: str, op: KimiDelta, declared: ArrayStep, segments, steps: dict[str, Any],
+    ) -> None:
+        steps[key] = LinearAttnStep(segments=segments, speculative=declared.verify)
+
     def layout(self, field: str) -> OpBinding:
         return K_LAST_STATE if field == "state" else OpBinding()
+
+    def verify_blocks(self, array: Array) -> Mapping[str, RecurrentBlockConfig]:
+        """The last verify block's inputs and the conv window before it, on two sides, and each slot's count and side,
+        which the next step replays from."""
+        if array.verify_span == 1:
+            return EMPTY
+        conv, state = array.entry.tensors["conv"], array.entry.tensors["state"]
+        heads, head_dim = state.shape[0], state.shape[1]
+        blocks = DeltaNetGeometry(
+            num_k_heads=heads, num_v_heads=heads, head_k_dim=head_dim, head_v_dim=head_dim,
+            conv_kernel_size=conv.shape[1] + 1,
+        ).to_blocks(conv_dtype=conv.dtype, speculative_tokens=array.verify_span - 1)
+        return {name: block for name, block in blocks.items() if name.startswith("spec_")}
+
+    def settle(self, run: "_KimiDeltaRun", kept: torch.Tensor, label: str) -> None:
+        """Write each row's kept count and flip the side it replays from, at the plan's slots. Device ops, so a capture
+        records them, and padding rows write the sink."""
+        plan = run.kda.settle_verify(label)
+        slots = plan.slot_ids[:plan.num_rows].long()
+        spec_len, spec_side = run.pool.block("spec_len"), run.pool.block("spec_side")
+        spec_len.index_copy_(0, slots, kept[:plan.num_rows].to(torch.int32).unsqueeze(1))
+        spec_side.index_copy_(0, slots, 1 - spec_side.index_select(0, slots))
 
     def bind(self, array: Array, key: str, resources: Mapping[str, Any]) -> "_KimiDeltaRun":
         op = array.updates[key]
         resources[key].bind_layer(lower_bound=op.lower_bound, full_rank_output_gate=op.full_rank_gate)
-        return _KimiDeltaRun(array, op, resources[key])
+        return _KimiDeltaRun(array, op, resources[key], resources[array.name])
 
 
 class KLastState(OpBinding):
@@ -1404,14 +1432,15 @@ K_LAST_STATE = KLastState()
 
 class _KimiDeltaRun:
     """`KDAManager.run` for `kimi_delta`, with each layer's kernel parameters built once per `KimiDeltaWeights`
-    object, so weights rebuilt after a move rebuild them."""
+    object, so weights rebuilt after a move rebuild them, and its verify blocks looked up once."""
 
-    def __init__(self, array: Array, op: KimiDelta, kda: Any):
+    def __init__(self, array: Array, op: KimiDelta, kda: Any, pool: Any):
         self._name = array.name
         self._op = op
-        self._kda = kda
+        self.kda, self.pool = kda, pool
         # pool layer -> the weights its parameters were built from, and the parameters
         self._params: dict[int, tuple[KimiDeltaWeights, Any]] = {}
+        self._spec: dict[int, Any] = {}
 
     def run(
         self, i: int, qkv: torch.Tensor, g: torch.Tensor, beta: torch.Tensor, conv: torch.Tensor, state: torch.Tensor,
@@ -1421,7 +1450,14 @@ class _KimiDeltaRun:
         if built is None or built[0] is not weights:
             self._check_gate(weights, gate)
             built = self._params[i] = (weights, self._kernel_params(weights, state))
-        return self._kda.run(qkv, g, beta, conv, state, built[1], gate=gate, label=label)
+        spec = None
+        if self.kda.speculative_tokens:
+            spec = self._spec.get(i)
+            if spec is None:
+                from mstar.engine.resources.linear_attn.kda import SpecBlocks
+
+                spec = self._spec[i] = SpecBlocks.of(self.pool, i)
+        return self.kda.run(qkv, g, beta, conv, state, built[1], gate=gate, label=label, spec=spec)
 
     def _check_gate(self, weights: KimiDeltaWeights, gate: torch.Tensor | None) -> None:
         full = self._op.full_rank_gate

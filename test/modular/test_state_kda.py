@@ -41,6 +41,8 @@ P = HEADS * DIM
 class _StubKDA:
     """Records the parameters each run gets instead of running the kernels."""
 
+    speculative_tokens = 0
+
     def __init__(self):
         self.params = []
 
