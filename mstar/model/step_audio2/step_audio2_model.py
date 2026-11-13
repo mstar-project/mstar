@@ -36,10 +36,11 @@ import torch
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import FINAL_PREFILL, PartitionDefinition
 from mstar.distributed.base import ShardingConfig
-from mstar.engine.resources import NodeResourceSpec, RaggedAttentionConfig, RaggedKeyPrefixAttentionSpec
+from mstar.engine.resources import NodeResourceSpec
 from mstar.engine.state import (
     Array,
     Attend,
+    BlockPrefix,
     Causal,
     KVEntry,
     Layout,
@@ -65,6 +66,7 @@ from mstar.model.step_audio2.config import (
     AUDIO_EMBEDS,
     AUDIO_MEL_FRAMES,
     AUDIO_MELS,
+    AUDIO_TOKENS,
     DECODE,
     DECODE_LOOP,
     DECODE_MIXED,
@@ -268,7 +270,7 @@ class StepAudio2Model(Model):
     # ------------------------------------------------------------------
 
     def declare_state(self) -> list[Array | Sampler]:
-        llm = self.config.llm
+        llm, audio = self.config.llm, self.config.audio
         return [
             Array(
                 LLM_KV, nodes={LLM}, layers=frozenset(range(llm.num_hidden_layers)),
@@ -277,19 +279,20 @@ class StepAudio2Model(Model):
                 reads={LLM_ATTN: Read(mask=Causal(), op=Attend(q_heads=llm.num_attention_heads))},
             ),
             Sampler(LLM_SAMPLER, nodes={LLM}, vocab_size=llm.vocab_size, penalty=True),
+            # each clip a segment, whose frames query and whose first key_len frames are its keys
+            Array(
+                AUDIO_TOKENS, nodes={AUDIO}, layers=frozenset(range(audio.n_audio_layer)),
+                entry=KVEntry(heads=audio.n_audio_head, head_dim=audio.head_dim), max_len=0,
+                reads={AUDIO_ATTN: Read(mask=BlockPrefix(), op=Attend(q_heads=audio.n_audio_head))},
+            ),
         ]
 
+    def kernel_settings(self) -> dict[str, dict[str, Any]]:
+        # a request's 25 s clips; more run eagerly once the tower captures
+        return {AUDIO_ATTN: {"max_segments_per_request": 8}}
+
     def get_node_resources(self) -> list[NodeResourceSpec]:
-        audio = self.config.audio
         return [
-            RaggedKeyPrefixAttentionSpec(
-                resource_key=AUDIO_ATTN, nodes={AUDIO},
-                config=RaggedAttentionConfig(
-                    num_qo_heads=audio.n_audio_head, num_kv_heads=audio.n_audio_head, head_dim=audio.head_dim,
-                    # a request's 25 s clips; more run eagerly once the tower captures
-                    max_segments_per_request=8,
-                ),
-            ),
             *token2wav_resources(T2W_KEYS, TOKEN2WAV, self._voice_seconds(), T2W_DEFAULT_SLOTS, T2W_STREAMING),
         ]
 
@@ -585,7 +588,9 @@ class StepAudio2Model(Model):
         if node_name == TOKEN2WAV:
             return self._create_token2wav(weights, device)
         if node_name == AUDIO:
-            tower = self._build(lambda: StepAudio2Audio(self.config.audio, attn_key=AUDIO_ATTN), dtype, device)
+            tower = self._build(
+                lambda: StepAudio2Audio(self.config.audio, attn_key=None, array=AUDIO_TOKENS), dtype, device,
+            )
             load_audio_weights(tower, weights, device)
             return AudioEncoderSubmodule(tower.requires_grad_(False).eval(), self.config)
         from mstar.model.components.qwen3_lm import Qwen3DenseLM

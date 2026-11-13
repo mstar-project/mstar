@@ -29,12 +29,11 @@ from mstar.engine.accelerator_graph_config import (
 )
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import (
-    KeyPrefixAttentionStep,
     Segment,
     SlotLease,
     SubmoduleStep,
 )
-from mstar.engine.state import ArrayStep, SampleStep, at_last_token, last_sampled, sample
+from mstar.engine.state import ArrayStep, SampleStep, at_last_token, kernel_setting, last_sampled, sample
 from mstar.model.components.qwen3_lm import Qwen3DenseLM
 from mstar.model.components.sampled_token_decoder import splice_row_ids
 from mstar.model.multimodal import splice_media
@@ -45,6 +44,7 @@ from mstar.model.step_audio2.config import (
     AUDIO_MEL_FRAMES,
     AUDIO_MELS,
     AUDIO_PATCH,
+    AUDIO_TOKENS,
     DECODE,
     DECODE_LOOP,
     DECODE_MIXED,
@@ -299,14 +299,18 @@ class AudioEncoderSubmodule(NodeSubmodule):
         super().__init__()
         self.model = model
         self.config = config
+        # Scratch: the replayed request's key lengths, set just before the block loop's replay, which declares its
+        # step from them (``_block_loop_step``) inside the same call.
+        self._replay_key_lens: tuple[int, ...] | None = None
+
+    def bind_state(self, handles: Mapping[str, Any]) -> None:
+        self.tokens = handles[AUDIO_TOKENS]
 
     def prepare_inputs(
         self, graph_walk: str, fwd_info: CurrentForwardPassInfo, inputs: NameToTensorList, **kwargs: Any,
     ) -> NodeInputs:
         mel_frames = list(fwd_info.step_metadata[AUDIO_MEL_FRAMES])
         layout = request_layout(mel_frames)
-        # the captured block loop's step reads them (``_block_loop_step``)
-        self.request_state(fwd_info.rid_handle).add("key_lens", [c.key_len for c in layout])
         return NodeInputs(
             input_seq_len=sum(c.frames for c in layout),
             tensor_inputs={"mels": inputs[AUDIO_MELS][0]},
@@ -321,10 +325,10 @@ class AudioEncoderSubmodule(NodeSubmodule):
         if (piecewise_leases or {}).get(AUDIO_BLOCK_LOOP):
             return None
         clips = [(rid, c) for rid, inp in zip(request_ids, inputs, strict=True) for c in inp.kwargs["layout"]]
-        return SubmoduleStep(steps={AUDIO_ATTN: KeyPrefixAttentionStep(
-            segments=tuple(Segment(request_id=rid, label="main", span=c.frames) for rid, c in clips),
-            key_lens=tuple(c.key_len for _, c in clips),
-        )})
+        return SubmoduleStep(
+            segments=[Segment(request_id=rid, label="main", span=c.frames) for rid, c in clips],
+            state={AUDIO_TOKENS: ArrayStep(prefix_lens=tuple(c.key_len for _, c in clips))},
+        )
 
     def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
         return True
@@ -357,17 +361,16 @@ class AudioEncoderSubmodule(NodeSubmodule):
         """A replay's step: the request's clips, each attending its valid keys. At capture
         the row is the runner's padding, which attends all of its frames."""
         (rid,) = request_ids
-        state = self.request_states.get(rid)
-        key_lens = state.kwargs["key_lens"] if state is not None and "key_lens" in state.kwargs else seq_lens
-        return SubmoduleStep(steps={AUDIO_ATTN: KeyPrefixAttentionStep(
-            segments=tuple(Segment(request_id=rid, label="main", span=n) for n in seq_lens),
-            key_lens=tuple(key_lens),
-        )})
+        key_lens = self._replay_key_lens if self._replay_key_lens is not None else tuple(seq_lens)
+        return SubmoduleStep(
+            segments=[Segment(request_id=rid, label="main", span=n) for n in seq_lens],
+            state={AUDIO_TOKENS: ArrayStep(prefix_lens=key_lens)},
+        )
 
     def _fits_block_loop(self, inputs: list[NodeInputs]) -> bool:
         """Whether the request's clips fit a replay's attention plan: the resource's
         per-request ceiling, read from it so a YAML override holds."""
-        per_request = self.node_resources[AUDIO_ATTN].max_segments_per_request
+        per_request = kernel_setting(self.tokens, AUDIO_ATTN, "max_segments_per_request")
         return sum(len(inp.kwargs["layout"]) for inp in inputs) <= per_request * len(inputs)
 
     @torch.compiler.disable
@@ -377,12 +380,16 @@ class AudioEncoderSubmodule(NodeSubmodule):
         """The block loop replayed for the step's one request, or None if not leased."""
         if AUDIO_BLOCK_LOOP not in engine_inputs.piecewise_leases:
             return None
-        return engine_inputs.piecewise_runners[AUDIO_BLOCK_LOOP].run(
-            static_inputs={"hidden": hidden},
-            request_ids=[engine_inputs.request_ids[0]],
-            seq_lens=[c.frames for c in layout],
-            real_bs=1,
-        ).get_view("hidden")
+        self._replay_key_lens = tuple(c.key_len for c in layout)
+        try:
+            return engine_inputs.piecewise_runners[AUDIO_BLOCK_LOOP].run(
+                static_inputs={"hidden": hidden},
+                request_ids=[engine_inputs.request_ids[0]],
+                seq_lens=[c.frames for c in layout],
+                real_bs=1,
+            ).get_view("hidden")
+        finally:
+            self._replay_key_lens = None
 
     def preprocess(
         self, graph_walk: str, engine_inputs: ModelInputsFromEngine, inputs: list[NodeInputs],
