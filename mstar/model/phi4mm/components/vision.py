@@ -34,7 +34,7 @@ from torch import nn
 
 from mstar.distributed.communication import CommGroup
 from mstar.model.components.distributed.linear import QKVParallelLinear
-from mstar.model.keys import VISION_ATTN
+from mstar.model.phi4mm.config import VISION_TOKENS
 
 # the checkpoint's image path; everything under it this module loads or names in
 # `unused_weight`
@@ -110,31 +110,29 @@ class Phi4MMVisionConfig:
 
 
 class Phi4MMVisionAttention(nn.Module):
-    """Non-causal attention within each crop the step planned on the ragged
-    attention resource; q, k and v in one GEMM (the loader stacks the
-    checkpoint's three)."""
+    """Non-causal attention within each crop the step planned on the vision
+    array; q, k and v in one GEMM (the loader stacks the checkpoint's three)."""
 
-    def __init__(self, config: Phi4MMVisionConfig):
+    def __init__(self, config: Phi4MMVisionConfig, layer: int):
         super().__init__()
         dim = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.head_dim = config.head_dim
         self.qkv_proj = QKVParallelLinear(CommGroup.trivial(), dim, self.head_dim, self.num_heads, self.num_heads)
         self.out_proj = nn.Linear(dim, dim)
-        self.ragged_attn = None
+        self.layer = layer
+        self.state = None
 
-    def bind_resources(self, resources: dict) -> None:
-        """See ``NodeSubmodule.bind_node_resources``."""
-        self.ragged_attn = resources.get(VISION_ATTN)
+    def bind_state(self, handles: dict) -> None:
+        self.state = handles.get(VISION_TOKENS)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.ragged_attn is None:
-            raise ValueError(
-                f"the vision tower has no attention plan: declare a RaggedAttentionSpec under {VISION_ATTN!r}"
-            )
+        if self.state is None:
+            raise ValueError(f"the vision tower has no attention plan: declare the array {VISION_TOKENS!r}")
         n = x.shape[0]
         q, k, v = (t.view(n, self.num_heads, self.head_dim) for t in self.qkv_proj(x).chunk(3, dim=-1))
-        return self.out_proj(self.ragged_attn.run(q, k, v).reshape(n, -1))
+        self.state.add(self.layer, k=k, v=v)
+        return self.out_proj(self.state.read(self.layer, q).reshape(n, -1))
 
 
 class Phi4MMVisionMLP(nn.Module):
@@ -148,10 +146,10 @@ class Phi4MMVisionMLP(nn.Module):
 
 
 class Phi4MMVisionEncoderLayer(nn.Module):
-    def __init__(self, config: Phi4MMVisionConfig):
+    def __init__(self, config: Phi4MMVisionConfig, layer: int):
         super().__init__()
         self.layer_norm1 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-        self.self_attn = Phi4MMVisionAttention(config)
+        self.self_attn = Phi4MMVisionAttention(config, layer)
         self.layer_norm2 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.mlp = Phi4MMVisionMLP(config)
 
@@ -178,7 +176,7 @@ class Phi4MMVisionEmbeddings(nn.Module):
 class Phi4MMVisionEncoder(nn.Module):
     def __init__(self, config: Phi4MMVisionConfig):
         super().__init__()
-        self.layers = nn.ModuleList(Phi4MMVisionEncoderLayer(config) for _ in range(config.layers_run))
+        self.layers = nn.ModuleList(Phi4MMVisionEncoderLayer(config, i) for i in range(config.layers_run))
 
 
 class Phi4MMVisionTower(nn.Module):

@@ -35,13 +35,15 @@ from mstar.model.keys import VISION_ATTN
 from mstar.model.multimodal import MEDIA_LAYOUT
 from mstar.model.phi4mm import vision as vision_mod
 from mstar.model.phi4mm.tests._paths import ORACLE, snapshot
+from mstar.model.phi4mm.tests._state import bind_vision, vision_step
 from mstar.model.phi4mm.vision import (
     GLOBAL_PIXEL_VALUES,
     PIXEL_VALUES,
     VISION_OUTPUT,
     create_vision_submodule,
     image_intake,
-    vision_resources,
+    vision_array,
+    vision_kernel_settings,
 )
 from mstar.model.submodule_base import ModelInputsFromEngine
 
@@ -106,14 +108,16 @@ class Served(NamedTuple):
 
 def _served(dtype: torch.dtype) -> Served:
     from mstar.engine.resources.base import EngineResourceInfo, build_resource
+    from mstar.engine.state.adapters import build_specs
 
     node = create_vision_submodule(str(Path(SNAPSHOT).parent), "cuda", dtype)
     if dtype == torch.float32:
         attn = SegmentSDPA()
     else:
-        (spec,) = vision_resources(node.vision_config)
+        config = node.vision_config
+        (spec,) = build_specs([vision_array(config)], kernel_settings={VISION_ATTN: vision_kernel_settings(config)})
         attn = build_resource(spec, EngineResourceInfo(device=torch.device("cuda"), kv_dtype=dtype))
-    node.bind_node_resources({VISION_ATTN: attn})
+    bind_vision(node, attn)
     return Served(node, attn)
 
 
@@ -154,8 +158,6 @@ class StepOut(NamedTuple):
 
 def _step(served: Served, requests: list[list[str]]) -> StepOut:
     node, attn = served
-    from mstar.engine.resources import StepContext
-
     rids, infos, inputs = [], {}, []
     for i, names in enumerate(requests):
         prepared = [_intake(n, node.vision_config) for n in names]
@@ -170,11 +172,9 @@ def _step(served: Served, requests: list[list[str]]) -> StepOut:
             PIXEL_VALUES: [p.inputs[PIXEL_VALUES] for p in prepared],
             GLOBAL_PIXEL_VALUES: [p.inputs[GLOBAL_PIXEL_VALUES] for p in prepared],
         }))
-    step = node.declare_step("prefill_vision", rids, inputs)
-    attn.plan(step.get(VISION_ATTN), StepContext(request_ids=rids, graph_walk="prefill_vision", slot=0,
-                                                  capture=False))
     engine = ModelInputsFromEngine(request_ids=rids, per_request_info=infos)
-    with torch.inference_mode():
+    with vision_step(node, rids, inputs) as step, torch.inference_mode():
+        attn.plan(step.get(VISION_ATTN), step.ctx)
         kwargs = node.preprocess("prefill_vision", engine, inputs)
         out = node.forward_batched("prefill_vision", engine, **kwargs)
         tensors = {k: v for k, v in kwargs.items() if torch.is_tensor(v)}
