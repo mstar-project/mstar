@@ -28,6 +28,8 @@ def main() -> None:
     parser.add_argument("--qwen", type=Path, required=True)
     parser.add_argument("--native-vae-root", type=Path,
                         help="also run the reference policy using M*'s Diffusers VAE encode")
+    parser.add_argument("--trace-output", type=Path,
+                        help="save reference input tensors and per-step sampler trace for stage isolation")
     parser.add_argument("--mstar-revision", required=True)
     parser.add_argument("--skip-last-video", action="store_true",
                         help="use the reference serving optimization; M* E5 currently decodes both steps")
@@ -103,10 +105,51 @@ def main() -> None:
             "peak_gpu_gib": round(torch.cuda.max_memory_allocated() / (1024**3), 2),
         }), flush=True)
 
+    baseline_rel = None
+    if args.trace_output is not None:
+        with torch.inference_mode():
+            baseline = session().step(observation)
+        baseline_rel = np.asarray(baseline.action_rel, dtype=np.float32).copy()
+        del baseline
+        report("reference_pth_untraced", baseline_rel)
+    current = session()
+    events: list[tuple[str, torch.Tensor]] = []
+    if args.trace_output is not None:
+        original_sample = pipeline.policy.sample_window_joint
+
+        def traced_sample(**kwargs):
+            return original_sample(
+                **kwargs,
+                trace=lambda name, value: events.append((name, value.detach().cpu().contiguous())),
+            )
+
+        pipeline.policy.sample_window_joint = traced_sample
     with torch.inference_mode():
-        reference = session().step(observation)
+        reference = current.step(observation)
     torch.cuda.synchronize()
     report("reference_pth", np.asarray(reference.action_rel, dtype=np.float32))
+    if args.trace_output is not None:
+        traced_rel = np.asarray(reference.action_rel, dtype=np.float32)
+        print(json.dumps({"phase": "trace_perturbation", "max_abs":
+                          float(np.abs(traced_rel - baseline_rel).max()),
+                          "exact": bool(np.array_equal(traced_rel, baseline_rel))}), flush=True)
+        args.trace_output.parent.mkdir(parents=True, exist_ok=True)
+        def on_cpu(value):
+            if isinstance(value, torch.Tensor):
+                return value.detach().cpu().contiguous()
+            if isinstance(value, (tuple, list)):
+                return [on_cpu(item) for item in value]
+            return value
+
+        torch.save({
+            "inputs": {key: on_cpu(value) for key, value in reference.inputs.items()},
+            "pred_action_norm": reference.pred_action_norm.detach().cpu().contiguous(),
+            "action_rel": np.asarray(reference.action_rel, dtype=np.float32),
+            "events": events,
+        }, args.trace_output)
+        pipeline.policy.sample_window_joint = original_sample
+        print(json.dumps({"phase": "reference_stage_trace", "path": str(args.trace_output),
+                          "events": [name for name, _ in events]}), flush=True)
     del reference
 
     if args.native_vae_root is not None:
