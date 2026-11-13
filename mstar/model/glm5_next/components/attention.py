@@ -50,7 +50,7 @@ class Glm5NextMLAAttention(MLAAttention):
             raise ValueError(
                 "Glm5NextMLAAttention serves the absorbed path only (mla_absorb=True)"
             )
-        super().__init__(config, comm_group, layer_idx, kv_key=KV_CACHE, attn_key=None, pos_key=None)
+        super().__init__(config, comm_group, layer_idx, kv_key=KV_CACHE)
         # every full-attention layer, the MTP layer's too, ships its own indexer
         self.indexer = Glm5NextIndexer(config)
 

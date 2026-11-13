@@ -302,7 +302,7 @@ def test_the_shared_mla_is_glm52s_dense_path(absorb):
 
     (naive, naive_cfg), (absorbed, absorbed_cfg) = _build_pair(seed=11)
     glm, cfg = (absorbed, absorbed_cfg) if absorb else (naive, naive_cfg)
-    base = MLAAttention(cfg, layer_idx=0, kv_key=KV, attn_key=None, pos_key=None)
+    base = MLAAttention(cfg, layer_idx=0, kv_key=KV)
     base.load_state_dict(naive.state_dict())
     base.process_weights_after_loading()
     torch.manual_seed(12)

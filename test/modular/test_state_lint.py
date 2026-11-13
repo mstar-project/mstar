@@ -28,6 +28,7 @@ PORTED = (
     "mstar/model/waypoint", "mstar/model/lingbot_world",
     "mstar/model/glm52",
     "mstar/model/glm5_next", "mstar/model/components/kda.py", "mstar/model/components/distributed/kda.py",
+    "mstar/model/components/mla.py",
 )
 FORBIDDEN_ATTRIBUTES = {
     "node_resources", "resources", "request_state", "request_states", "per_request_states", "sequence_shard",
