@@ -11,6 +11,7 @@ split did.
 from __future__ import annotations
 
 import sys
+from dataclasses import replace
 from types import SimpleNamespace
 
 sys.path.insert(0, ".")
@@ -29,7 +30,7 @@ from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.sequence_shard import SeqShardSpec
 from mstar.engine.resources.spec import resolve_spec_dependencies
 from mstar.engine.resources.step import ResourceStep, Segment, StepContext, SubmoduleStep
-from mstar.engine.state import Array, ArrayStep, Attend, Block, Causal, KVEntry, Read, TensorType, adapters
+from mstar.engine.state import Array, ArrayStep, Attend, Block, Causal, KVEntry, Positions, Read, TensorType, adapters
 from mstar.engine.state.adapters import (
     SDPA,
     WITHIN_STEP,
@@ -578,3 +579,45 @@ def test_a_segmented_read_over_two_requests_is_refused_when_it_opens():
     step.set_state_handles((_segmented_on_sdpa(),))
     with pytest.raises(ValueError, match="Array 'a': no layout yet: a segmented read in a step of several requests"):
         step.begin_calls()
+
+
+def _resampler() -> list[Array]:
+    """MiniCPM-o's resampler: learned queries, which no read attends among themselves, read a slice's patches."""
+    queries = Array("queries", nodes={"dit"}, layers={0}, entry=Entry({}), max_len=0, labels={"queries"})
+    return [_array("patch_kv", "resampler", queries="queries", label="patches"), queries]
+
+
+def test_an_array_with_no_reads_lays_out_a_cross_reads_queries_and_builds_no_spec():
+    arrays = _resampler()
+    (spec,) = build_specs(arrays)
+    assert type(spec) is RaggedCrossAttentionSpec and spec.resource_key == "resampler", spec
+    patches = (Segment(1, "patches", 9), Segment(1, "patches", 4))
+    queries = (Segment(1, "queries", 2), Segment(1, "queries", 2))
+    step = SubmoduleStep(state={"patch_kv": ArrayStep(segments=patches), "queries": ArrayStep(segments=queries)})
+    cross = state_steps(step, _handles(arrays)).steps["resampler"]
+    assert isinstance(cross, RaggedCrossAttentionStep) and cross.pairs == (("queries", "patches"),), cross
+    assert _by_label(cross) == {"queries": queries, "patches": patches}
+
+
+def test_a_step_of_only_an_array_with_no_reads_is_no_step_at_all():
+    step = SubmoduleStep(state={"queries": ArrayStep(segments=(Segment(1, "queries", 2),))})
+    assert state_steps(step, _handles(_resampler())) is None, "it would plan a resource that nothing reads"
+
+
+@pytest.mark.parametrize("call, tensors", [("add", ("k", "v")), ("read", ("q",))])
+def test_an_array_with_no_reads_takes_no_add_or_read(call, tensors):
+    queries = _handles(_resampler())["queries"]
+    with pytest.raises(ValueError, match=f"no layout yet: {call} on a QueriesOnlyHandle"):
+        getattr(queries, call)(0, **{name: torch.ones(1, HEADS, DIM) for name in tensors})
+
+
+def test_an_array_with_no_reads_takes_no_positions():
+    patch_kv, queries = _resampler()
+    with pytest.raises(ValueError, match="Array 'queries': no layout yet: positions,"):
+        build_specs([patch_kv, replace(queries, positions=Positions())])
+
+
+def test_an_array_with_no_reads_holds_no_fields():
+    patch_kv, queries = _resampler()
+    with pytest.raises(ValueError, match=r"Array 'queries': entry must be Entry\(\{\}\)"):
+        build_specs([patch_kv, replace(queries, entry=_entry())])

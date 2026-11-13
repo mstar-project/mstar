@@ -500,6 +500,21 @@ def test_a_cross_read_is_refused_naming_its_array_and_the_cause(arrays, where, c
     assert problem.startswith("Array 'text'.") and where in problem and cause in problem
 
 
+def _queries() -> Array:
+    return Array("video", nodes={"LLM"}, layers={0}, entry=Entry({}), max_len=0)
+
+
+def test_an_array_with_no_reads_that_lays_out_a_cross_reads_queries_has_no_problems():
+    assert state_declaration_problems(_StubModel(_cross(), _queries())) == []
+
+
+def test_an_array_with_no_reads_must_lay_out_a_reads_queries():
+    assert _one_problem(_queries()) == (
+        "Array 'video'.reads: with max_len 0 and no reads, the array only lays out another read's queries, and no "
+        "read's queries names 'video'"
+    )
+
+
 def _flag() -> Array:
     return Value("flags", nodes={"LLM"}, layers={0}, entry=Entry({}, host={"sent": bool}))
 
