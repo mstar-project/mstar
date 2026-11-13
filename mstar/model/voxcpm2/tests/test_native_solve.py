@@ -128,7 +128,7 @@ def test_real_weights_compile_capture_and_fallback(monkeypatch, record_property)
     torch.cuda.current_stream().wait_stream(stream)
     assert all(torch.equal(a, b) for a, b in zip(outputs, expected, strict=True))
 
-    # Replays must read current inputs, including each row's CFG, without
+    # Replays must read current inputs, including CFG and the timestep schedule, without
     # recapture. Keep every graph/output live while refreshing its inputs.
     with torch.cuda.stream(stream):
         expected = []
@@ -136,6 +136,7 @@ def test_real_weights_compile_capture_and_fallback(monkeypatch, record_property)
             for dst, src in zip(ys, inputs(ys[0].shape[0]), strict=True):
                 dst.copy_(src)
             ys[4].add_(0.25)
+            ys[5].copy_(cfm_t_span(10, "cuda", torch.bfloat16, sway_sampling_coef=0.5))
             expected.append(model.predict_patch(*ys).clone())
             graph.replay()
     torch.cuda.current_stream().wait_stream(stream)
