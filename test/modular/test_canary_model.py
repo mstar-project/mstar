@@ -467,9 +467,9 @@ def test_decoder_node_caps_captures_and_names(snapshot):
     assert POS == "positions" and POS in step.steps and POS in {s.resource_key for s in model.get_node_resources()}
 
 
-def test_canary_keeps_mains_token_path_unless_a_deployment_asks_it_to_repeat():
-    """Main left Canary's device loop-back off as a measured change of its own;
-    ``step_repeats:`` turns it on, with resident decode and the runtime's stop."""
+def test_canary_decodes_on_the_device_and_resident_tables_by_default():
+    """Decode loops its token back on the device and runs on resident tables
+    without a deployment asking; ``step_repeats:`` leaves that as it is."""
     from types import SimpleNamespace
 
     from mstar.model.canary.config import SAMPLER
@@ -477,7 +477,8 @@ def test_canary_keeps_mains_token_path_unless_a_deployment_asks_it_to_repeat():
     from mstar.testing_utils.engine import make_engine, make_mgmt
 
     node = _tiny_node()
-    assert node.device_loopback is None and not node.resident_walks()
+    loopback = DeviceLoopback(node.DECODE_WALK, "text_inputs", SAMPLER, "new_token")
+    assert node.device_loopback == loopback and node.resident_walks() == {node.DECODE_WALK}
     sampler = SimpleNamespace(
         enable_device_loopback_reader=lambda: None,
         lean_capture=False, force_double_buffer=False, supports_preplan=False,
@@ -486,5 +487,5 @@ def test_canary_keeps_mains_token_path_unless_a_deployment_asks_it_to_repeat():
 
     engine.enable_repeats("decoder", {node.DECODE_WALK})
 
-    assert node.device_loopback == DeviceLoopback(node.DECODE_WALK, "text_inputs", SAMPLER, "new_token")
+    assert node.device_loopback == loopback
     assert node.resident_walks() == {node.DECODE_WALK} and node.get_stop_policies(node.DECODE_WALK)
