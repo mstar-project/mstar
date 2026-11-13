@@ -485,6 +485,9 @@ def _clone_value(value):
         return value.clone()
     if isinstance(value, dict):
         return {key: _clone_value(item) for key, item in value.items()}
+    if isinstance(value, tuple) and hasattr(value, "_fields"):
+        # a NamedTuple (a bucket key) takes its fields positionally
+        return type(value)(*(_clone_value(item) for item in value))
     if isinstance(value, (list, tuple)):
         return type(value)(_clone_value(item) for item in value)
     return value
