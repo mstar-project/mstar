@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import sys
+from dataclasses import replace
 from types import SimpleNamespace
 
 sys.path.insert(0, ".")
@@ -19,6 +20,7 @@ import torch
 from test_kv_layout_intake import _Model as _IntakeModel
 from test_kv_layout_intake import _preprocess
 from test_state_calls import (
+    HEADS,
     TOKENS,
     _add,
     _array,
@@ -29,6 +31,7 @@ from test_state_calls import (
     _step,
     _StubAttn,
     _StubDense,
+    _StubExchange,
     _StubKV,
     _tensors,
     _value_handle,
@@ -116,6 +119,32 @@ def test_a_step_over_two_labels_binds_one_plan_named_for_both():
     step.set_ctx(_ctx(rows=(1, 2)))
     h.begin_step(step)
     assert h.label == "main+uncond", "add, read and rope would plan under one label's rows"
+
+
+def test_a_step_that_packs_two_labels_on_one_array_refuses_another_array_listed_on_one():
+    """Every array on KV pages plans the labels a step packs together, so an array the step lists on one of them would
+    plan a label it has no rows on, a ``KeyError`` in the KV plan."""
+    array = replace(_array(), name="draft", reads={"draft_attn": Read(mask=Causal(), op=Attend(q_heads=HEADS))})
+    one = build_handle(array, {"draft": _StubKV(), "draft_attn": _StubAttn()}, _resolve([array], StateSetup()))
+    step = SubmoduleStep(segments=_label_major(), state={
+        "kv": ArrayStep(), "draft": ArrayStep(segments=[Segment(row, "main", TOKENS) for row in (1, 2)]),
+    })
+    _refused(
+        r"Array 'draft': no layout yet: a step lists it on labels \['main'\] and Array 'kv' on \['main', 'uncond'\]",
+        lambda: state_steps(step, {"kv": _two_label_handle(), "draft": one}, graph_walk="decode"),
+    )
+
+
+def test_a_step_that_combines_labels_itself_refuses_a_paged_array_it_lists_on_one():
+    """A model that hasn't moved declares ``combined_labels`` on its step, where no array packs them, and an array on
+    KV pages plans them all the same."""
+    step = SubmoduleStep(segments=_label_major(), combined_labels={LABELS: "cfg"}, state={
+        "kv": ArrayStep(segments=[Segment(row, "main", TOKENS) for row in (1, 2)]),
+    })
+    _refused(
+        r"Array 'kv': no layout yet: a step lists it on labels \['main'\] and combines \['main', 'uncond'\]",
+        lambda: state_steps(step, {"kv": _two_label_handle()}, graph_walk="decode"),
+    )
 
 
 def test_a_step_over_one_label_plans_as_before():
@@ -243,11 +272,13 @@ def _per_walk(**reads) -> Array:
     })
 
 
-def _per_walk_handle(array=None) -> ArrayHandle:
+def _per_walk_handle(array=None, attn=None) -> ArrayHandle:
+    """Built as a node builds it, since `node_handles` reads the model's combined walks."""
     array = array or _per_walk()
-    resolved = _resolve([array], StateSetup(walks=Walks(combined={"LLM": COMBINED})))
-    resources = {"kv": _StubKV(), **{key: _StubAttn() for key in set(resolved.resource_of.values())}}
-    return build_handle(array, resources, resolved=resolved)
+    model = SimpleNamespace(declare_state=lambda: [array], get_combined_graph_walks=lambda: {"LLM": COMBINED})
+    keys = set(_resolve([array], StateSetup()).resource_of.values())
+    resources = {"kv": _StubKV(), **{key: attn(key) if attn else _StubAttn() for key in keys}}
+    return node_handles(model, "LLM", resources)["kv"]
 
 
 def _causal(h: ArrayHandle, walk: str | None) -> dict[str, bool]:
@@ -353,9 +384,7 @@ def _two_spec_handle() -> ArrayHandle:
     """Two reads that build different specs over different layers, each on its own walk, and walk ``c`` with none."""
     array = _per_walk(causal=Read(mask=Causal(), op=Attend(q_heads=2), walks={"a"}, layers={0, 1}),
                       local=Read(mask=Window(16), op=Attend(q_heads=2), walks={"b"}, layers={2, 3}))
-    resolved = _resolve([array], StateSetup())
-    resources = {"kv": _StubKV(), **{key: _Named(key) for key in set(resolved.resource_of.values())}}
-    return build_handle(array, resources, resolved=resolved)
+    return _per_walk_handle(array, attn=_Named)
 
 
 def _at_last_token_on(h: ArrayHandle, walk: str):
@@ -400,15 +429,24 @@ def test_kernel_settings_reach_the_shared_spec_and_two_values_for_one_field_are_
 # An add a read takes k and v from
 
 
-def test_an_add_while_another_layers_add_waits_for_its_read_is_refused():
-    h = _kv_handle(attn=_StubDense())
+class _DenseExchange(_StubExchange):
+    """Takes k and v at the read, through its exchange, as the dense backend does on a node whose shard splits. Its
+    exchange writes nothing, so an add it never reads reaches no page."""
+
+    requires_kv_write = False
+
+
+@pytest.mark.parametrize("attn", [_StubDense, _DenseExchange], ids=["direct", "exchange"])
+def test_an_add_while_another_layers_add_waits_for_its_read_is_refused(attn):
+    h = _kv_handle(attn=attn())
     _begin(h)
     _add(h, 0)
     _refused(r"Array 'kv': an add on layer 1 while layer 0's add waits for its read", lambda: _add(h, 1))
 
 
-def test_a_kept_step_that_ends_with_an_add_unread_is_refused():
-    h = _kv_handle(attn=_StubDense())
+@pytest.mark.parametrize("attn", [_StubDense, _DenseExchange], ids=["direct", "exchange"])
+def test_a_kept_step_that_ends_with_an_add_unread_is_refused(attn):
+    h = _kv_handle(attn=attn())
     step = _begin(h)
     q, _, _ = _tensors()
     for layer in range(4):
@@ -565,6 +603,23 @@ def test_two_streams_of_a_request_need_the_pages_of_both(monkeypatch):
                                          r"doesn't cap"):
         check_kv_pools_fit(model, config, "cfg.yaml", logging.getLogger(__name__),
                            request_layouts={"t3_kv": dict.fromkeys(LABELS, stream)})
+
+
+def test_a_placed_pool_counts_the_ranks_of_the_node_groups_that_run_its_nodes(monkeypatch):
+    """A pool placed by position over 2 SP ranks pages its window layer in half pages, so a request holds 8 full and
+    16 window pages rather than 8 and 8. The check hands the pool the ranks of the node groups that run its nodes,
+    so SP ranks under another node leave its count alone."""
+    pool = PagedKVConfig(num_layers=2, num_kv_heads=1, head_dim=8, max_seq_len=64, max_num_pages=20, page_size=8,
+                         context_parallel=True)
+    pool.keep_window(8, (1,))
+    monkeypatch.setattr("mstar.model.base.serving_resources",
+                        lambda model, config: [KVSpec(resource_key="kv", nodes={"llm"}, config=pool)])
+    split = {"ranks": [0, 1], "sp_size": 2}
+    config = {"max_concurrent_requests": 2, "node_groups": [{"node_names": ["llm"]}, {"node_names": ["vae"], **split}]}
+    check_kv_pools_fit(None, config, "cfg.yaml", logging.getLogger(__name__))
+    config["node_groups"] = [{"node_names": ["llm"], **split}]
+    with pytest.raises(ValueError, match=r"need 25 pages of resources.kv \(12 per request and the sink page\)"):
+        check_kv_pools_fit(None, config, "cfg.yaml", logging.getLogger(__name__))
 
 
 def test_at_last_token_over_every_row_of_one_label_takes_a_row_that_pads_the_step():
