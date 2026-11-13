@@ -1,4 +1,4 @@
-"""The Qwen3-TTS 1.7B depth loop as one kernel (``DepthFrame``) against the loop it replaces.
+"""The Qwen3-TTS depth loop (0.6B and 1.7B) as one kernel (``DepthFrame``) against the loop it replaces.
 
 The task lists put the two halves of a split O or DOWN tile on the two CTAs of one cluster, which
 add their partial sums through each other's shared memory; a half dealt to any other CTA adds the
@@ -84,7 +84,7 @@ class _StubSampler:
 class _StubFrame:
     """Records its launches instead of running the kernel."""
 
-    max_rows = 64
+    max_rows, min_rows = 64, 2
     kv_cache = positions = partials = None
 
     def __init__(self):
@@ -131,6 +131,12 @@ def test_a_step_with_more_rows_than_the_frame_holds_runs_the_loop():
     assert frame.runs == 0, "the frame ran past its row scratch"
 
 
+def test_a_one_row_step_runs_the_loop():
+    frame = _StubFrame()
+    assert _run_depth(_talker(frame), _StubSampler(draw=object()), rows=1) == "loop"
+    assert frame.runs == 0, "the frame ran a step the loop runs faster"
+
+
 def test_without_the_frame_the_loop_runs():
     assert _run_depth(_talker(None), _StubSampler(draw=object())) == "loop"
 
@@ -148,29 +154,41 @@ def _depth_loop(predictor, talker_table, hidden, codes):
     return all_codes, embed_sum, logits_seen[-1], predictor.depth.kv_cache[:, :codes.shape[0]]
 
 
-def _predictor():
+def _predictor(talker_width: int = 2048, device: str = "cuda"):
+    """A random CodePredictor under a Talker of ``talker_width``: the 1.7B's 2048, projected into the predictor, or
+    the 0.6B's 1024, unprojected."""
     from mstar.model.components.code_predictor_kernels import ResidualCodePredictor
     from mstar.model.qwen3_tts.config import Qwen3TTSModelConfig, Qwen3TTSTalkerConfig
 
     torch.manual_seed(0)
-    config = Qwen3TTSModelConfig(talker=Qwen3TTSTalkerConfig(hidden_size=2048))
-    predictor = ResidualCodePredictor(config.code_predictor, 2048, 128, embed_sum_dtype=None)
-    predictor = predictor.to("cuda", torch.bfloat16).eval()
+    config = Qwen3TTSModelConfig(talker=Qwen3TTSTalkerConfig(hidden_size=talker_width))
+    predictor = ResidualCodePredictor(config.code_predictor, talker_width, 128, embed_sum_dtype=None)
+    predictor = predictor.to(device, torch.bfloat16).eval()
     for name, param in predictor.named_parameters():
         if name.endswith("norm.weight"):
             param.data.uniform_(0.5, 1.5)
         else:
             param.data.normal_(std=0.02)
-    talker_table = torch.randn(config.talker.vocab_size, 2048, device="cuda", dtype=torch.bfloat16)
+    talker_table = torch.randn(config.talker.vocab_size, talker_width, device=device, dtype=torch.bfloat16)
     predictor.consolidate_stacked_weights()
     return predictor, talker_table
 
 
-@pytest.fixture(scope="module")
-def _frame():
+@pytest.mark.parametrize("talker_width", [2048, 1024], ids=["1.7B", "0.6B"])
+def test_both_checkpoints_code_predictors_fit_the_kernel(talker_width):
+    """The 0.6B's Talker is as wide as its predictor, so it has no input projection; the kernel takes it padded."""
+    from mstar.model.qwen3_tts.components import depth_frame
+
+    predictor, talker_table = _predictor(talker_width, device="cpu")
+    assert depth_frame.fits(predictor, talker_table)
+    assert not depth_frame.fits(predictor, talker_table[:, :512]), "a table of another width fits"
+
+
+@pytest.fixture(scope="module", params=[2048, 1024], ids=["1.7B", "0.6B"])
+def _frame(request):
     from mstar.model.qwen3_tts.components.depth_frame.frame import DepthFrame
 
-    predictor, talker_table = _predictor()
+    predictor, talker_table = _predictor(request.param)
     return predictor, talker_table, DepthFrame(predictor, talker_table)
 
 
@@ -179,7 +197,7 @@ def _frame():
 def test_the_frame_with_given_codes_matches_the_depth_loop(_frame, bs):
     """The same frame at every size: a row count specialized at its first launch would break the later sizes."""
     predictor, talker_table, frame = _frame
-    hidden = torch.randn(bs, 2048, device="cuda", dtype=torch.bfloat16)
+    hidden = torch.randn(bs, talker_table.shape[1], device="cuda", dtype=torch.bfloat16)
     codes = torch.randint(0, 2048, (bs, 16), device="cuda")
     codes[:, 0] = torch.randint(0, talker_table.shape[0], (bs,), device="cuda")
     with torch.no_grad():
@@ -216,7 +234,7 @@ def test_a_sampled_frame_draws_its_last_group_from_its_own_logits_at_the_last_of
 
     predictor, talker_table, frame = _frame
     bs = 13
-    hidden = torch.randn(bs, 2048, device="cuda", dtype=torch.bfloat16)
+    hidden = torch.randn(bs, talker_table.shape[1], device="cuda", dtype=torch.bfloat16)
     layer0 = torch.randint(0, talker_table.shape[0], (bs,), device="cuda")
     draw = _draw(bs, offset=5)
     kv, positions, partials = frame.kv_cache, frame.positions, frame.partials
@@ -234,7 +252,7 @@ def test_a_captured_frame_replays_what_it_ran(_frame):
     """The engine captures the Talker step with the frame's cluster launch inside it."""
     predictor, talker_table, frame = _frame
     bs = 13
-    hidden = torch.randn(bs, 2048, device="cuda", dtype=torch.bfloat16)
+    hidden = torch.randn(bs, talker_table.shape[1], device="cuda", dtype=torch.bfloat16)
     layer0 = torch.randint(0, talker_table.shape[0], (bs,), device="cuda")
     positions, partials = frame.positions, frame.partials
     draw = _draw(bs, offset=5)

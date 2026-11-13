@@ -13,6 +13,13 @@ from mstar.model.qwen3_tts.components.depth_frame.schedule import NPAGES, TB
 
 XSTAGES = 5  # 16 KB slots x streams through
 MAX_ROWS, GROUPS = 64, 16
+# the Talker width the kernel is built for (the 1.7B's); a 1024-wide Talker (the 0.6B) is zero-padded to it
+KERNEL_TALKER_WIDTH = 2048
+
+
+def _aligned(t: torch.Tensor) -> torch.Tensor:
+    """``t``, or a 16-byte-aligned copy of it."""
+    return t if t.data_ptr() % 16 == 0 else t.clone()
 
 
 class DepthFrame:
@@ -23,6 +30,8 @@ class DepthFrame:
     """
 
     max_rows = MAX_ROWS
+    # A frame costs about 2 ms at any row count; the launched loop is cheaper for one row (H200, both checkpoints).
+    min_rows = 2
 
     def __init__(self, code_predictor, talker_table: torch.Tensor):
         cp, fused = code_predictor, code_predictor.fused
@@ -30,6 +39,11 @@ class DepthFrame:
         layers, hidden, inter = len(fused.qkv), fused.o[0].shape[0], fused.down[0].shape[1]
         self.head_dim = attn.head_dim
         self.eps, self.eps_q, self.eps_k = fused.eps, attn.q_norm.variance_epsilon, attn.k_norm.variance_epsilon
+        # A Talker as wide as the predictor (the 0.6B) has no input projection. The kernel still runs its
+        # in-projection phase, as [I | 0] over the hidden state zero-padded to the kernel's width, so every input
+        # is exact; the embedding sum it writes is padded the same way, and `run` reads back the Talker's columns.
+        self.talker_width = talker_table.shape[1]
+        self.padded = self.talker_width != KERNEL_TALKER_WIDTH
         self._stack_weights(cp, talker_table, layers, hidden, inter)
         self._allocate_scratch(fused, attn, layers, hidden, inter)
         self._schedule(torch.cuda.get_device_properties(self.X.device).multi_processor_count // 2 * 2, layers)
@@ -38,7 +52,7 @@ class DepthFrame:
         self.m64 = linear.layouts(64)[0]
         self.attn_layouts = attend.layouts()
         self._compiled: dict[bool, tuple] = {}
-        self._compile_sampled(talker_table.shape[1], attn, layers)
+        self._compile_sampled(KERNEL_TALKER_WIDTH, attn, layers)
 
     def _stack_weights(self, cp, talker_table: torch.Tensor, layers: int, hidden: int, inter: int) -> None:
         """Each projection's weights for all layers in one matrix, and the TMA descriptors its tiles load through."""
@@ -46,20 +60,30 @@ class DepthFrame:
         # each 32-row GATEUP tile's gate rows then its up rows, so one task reads one 64-row tile
         gate_up = [torch.stack([g.view(inter // 32, 32, hidden), u.view(inter // 32, 32, hidden)], dim=1)
                    for g, u in zip(fused.gate, fused.up, strict=True)]
+        cemb = torch.stack([e.weight for e in cp.model.codec_embedding])
+        if self.padded:
+            ref = fused.qkv[0]
+            win = torch.zeros(hidden, KERNEL_TALKER_WIDTH, device=ref.device, dtype=ref.dtype)
+            win[:, :self.talker_width] = torch.eye(hidden, device=ref.device, dtype=ref.dtype)
+            bias_in = torch.zeros(hidden, device=ref.device, dtype=ref.dtype)
+            # the predictor's inputs are the tables' own rows
+            self.tp0, self.tproj = talker_table.contiguous(), cemb[:-1].contiguous()
+            self.tab0, cemb = self._pad(talker_table), self._pad(cemb)
+        else:
+            win, bias_in = cp.small_to_mtp_projection.weight, cp.small_to_mtp_projection.bias
+            # group 0's input is a row of the projected Talker table, as groups 1-14's are of `input_tables`
+            with torch.no_grad():
+                self.tp0 = cp.small_to_mtp_projection(talker_table).contiguous()
+            self.tproj = torch.stack(cp.input_tables)
+            self.tab0 = talker_table
         self.w = dict(
             qkv=torch.cat(fused.qkv), o=torch.cat(fused.o), down=torch.cat(fused.down),
-            gu=torch.cat(gate_up).reshape(-1, hidden), head=fused.heads.reshape(-1, hidden),
-            win=cp.small_to_mtp_projection.weight,
+            gu=torch.cat(gate_up).reshape(-1, hidden), head=fused.heads.reshape(-1, hidden), win=win,
         )
-        self.bias_in = cp.small_to_mtp_projection.bias
+        self.bias_in = bias_in
         self.qn = torch.stack([cp.model.layers[i].self_attn.q_norm.weight for i in range(layers)])
         self.kn = torch.stack([cp.model.layers[i].self_attn.k_norm.weight for i in range(layers)])
-        self.tab0 = talker_table
-        # group 0's input is a row of the projected Talker table, as groups 1-14's are of `input_tables`
-        with torch.no_grad():
-            self.tp0 = cp.small_to_mtp_projection(talker_table).contiguous()
-        self.cemb = torch.stack([e.weight for e in cp.model.codec_embedding])
-        self.tproj = torch.stack(cp.input_tables)
+        self.cemb = cemb
 
         sl4 = linear.shared_layout(4)
 
@@ -71,9 +95,18 @@ class DepthFrame:
         self.wd = [tiles(self.w["qkv"], 32, 8), tiles(self.w["o"], 16, 8), tiles(self.w["gu"], 64, 4),
                    tiles(self.w["down"], 16, 4), tiles(self.w["win"], 16, 8), tiles(self.w["head"], 16, 8)]
 
+    @staticmethod
+    def _pad(t: torch.Tensor) -> torch.Tensor:
+        """``t`` with its last axis zero-padded to the kernel's Talker width."""
+        return torch.nn.functional.pad(t, (0, KERNEL_TALKER_WIDTH - t.shape[-1])).contiguous()
+
     def _allocate_scratch(self, fused, attn, layers: int, hidden: int, inter: int) -> None:
         """The activations tasks hand from phase to phase, and the KV cache, positions and partial sums of a frame."""
         dev, bf = self.w["qkv"].device, self.w["qkv"].dtype
+        if self.padded:
+            # the hidden state and the embedding sum at the kernel's width; columns past the Talker's stay zero
+            self.hidden_in = torch.zeros(MAX_ROWS, KERNEL_TALKER_WIDTH, device=dev, dtype=bf)
+            self.sum_out = torch.zeros(MAX_ROWS, KERNEL_TALKER_WIDTH, device=dev, dtype=self.tab0.dtype)
         self.X = torch.zeros(MAX_ROWS, hidden, device=dev, dtype=bf)
         self.QKV = torch.zeros(MAX_ROWS, self.w["qkv"].shape[0] // layers, device=dev, dtype=bf)
         self.ATT = torch.zeros(MAX_ROWS, fused.o[0].shape[1], device=dev, dtype=bf)
@@ -129,11 +162,18 @@ class DepthFrame:
         """
         rows = last_hidden.shape[0]
         assert rows <= MAX_ROWS, f"the frame kernel runs at most {MAX_ROWS} rows, got {rows}"
+        out_sum = codec_embed_sum
+        if self.padded:
+            self.hidden_in[:rows, :self.talker_width].copy_(last_hidden)
+            last_hidden, codec_embed_sum = self.hidden_in[:rows], self.sum_out[:rows]
         sampled = draw is not None
         if not sampled:
             # typed placeholders: the draw's loads are compiled out
             z = torch.zeros(1, device=last_hidden.device)
             draw = FusedDrawArgs(z, z.int(), z, z.long(), z.long())
+        # the kernel only reads these, so an input a caller hands in at an offset is copied to an aligned one
+        codes_in = _aligned(codes_in)
+        draw = FusedDrawArgs(*(_aligned(t) for t in draw))
         args = self._args(last_hidden, codes_in, kv_cache, positions, partials, all_codes, codec_embed_sum, draw,
                           rows, sampled)
         if sampled not in self._compiled:
@@ -142,12 +182,17 @@ class DepthFrame:
         args["OFF"] = off
         self.ctrs.zero_()
         compiled[(self.grid // 2, 1, 1)](*[args[n] for n in kernel.frame_kernel.arg_names])
+        if self.padded:
+            out_sum.copy_(codec_embed_sum[:, :self.talker_width])
 
     def _args(self, last_hidden, codes_in, kv_cache, positions, partials, all_codes, codec_embed_sum, draw, rows,
               sampled):
-        tensors = (last_hidden, codes_in, kv_cache, positions, partials, all_codes, codec_embed_sum, *draw)
+        tensors = dict(last_hidden=last_hidden, codes_in=codes_in, kv_cache=kv_cache, positions=positions,
+                       partials=partials, all_codes=all_codes, codec_embed_sum=codec_embed_sum,
+                       **{f"draw.{name}": t for name, t in zip(draw._fields, draw, strict=True)})
         # The kernel was specialized on the first call's pointers being 16-byte aligned.
-        assert all(t.data_ptr() % 16 == 0 for t in tensors), "the frame kernel's tensors must be 16-byte aligned"
+        misaligned = [name for name, t in tensors.items() if t.data_ptr() % 16]
+        assert not misaligned, f"the frame kernel's tensors must be 16-byte aligned, not {misaligned}"
         return dict(
             TASKS=self.tasks, NTASKS=self.ntasks, CTRS=self.ctrs,
             x_desc=self.xd[0], att_desc=self.xd[1], act_desc=self.xd[2],
