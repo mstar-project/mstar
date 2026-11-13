@@ -20,7 +20,7 @@ from torch import nn
 from mstar.model.components.diffusion import modulation, qk_norm_rope
 from mstar.model.components.diffusion.ffn import gelu_tanh_ffn
 from mstar.model.components.mlp import MLP
-from mstar.model.wan22.components.dit import Wan22RoPE3D
+from mstar.model.wan22.components.dit import Wan22DiTAttention, Wan22RoPE3D
 from mstar.model.wan22.config import Wan22Config
 
 CUDA = torch.cuda.is_available()
@@ -203,4 +203,57 @@ def test_gelu_epilogue_matches_eager():
     assert torch.equal(compiled, got)
     # the down-projection sums thousands of rounded activations, so fewer elements
     # come out equal than for the single-pass kernels
+    _assert_bf16_close(got, want, min_equal=0.3)
+
+
+def _self_attention(device, dim=256, heads=2, seq=48):
+    torch.manual_seed(0)
+    attn = Wan22DiTAttention(dim, heads, EPS).to(device, torch.bfloat16)
+    x = torch.randn(2, seq, dim, device=device, dtype=torch.bfloat16)
+    ang = torch.rand(seq, dim // heads // 2, device=device) * 6
+    rope = (ang.cos().repeat_interleave(2, 1), ang.sin().repeat_interleave(2, 1))
+    return attn, x, rope
+
+
+def test_fused_qkv_views_one_weight_and_keeps_eager_bitwise():
+    attn, x, rope = _self_attention("cpu")
+    with torch.inference_mode():
+        want = attn(x, rotary_emb=rope)
+        attn.fuse_qkv()
+        got = attn(x, rotary_emb=rope)
+    assert torch.equal(got, want)
+    for i, proj in enumerate((attn.q_proj, attn.k_proj, attn.v_proj)):
+        assert proj.weight.untyped_storage().data_ptr() == attn.qkv_weight.untyped_storage().data_ptr()
+        assert torch.equal(proj.weight, attn.qkv_weight[i * 256:(i + 1) * 256])
+    assert "qkv_weight" not in attn.state_dict()
+
+
+@needs_kernels
+@pytest.mark.parametrize("heads", [40, 31], ids=["even_pairs", "odd_pairs"])
+def test_rms_norm_rope_kernel_reads_slices_of_a_fused_projection(heads):
+    """q and k as column slices of one [B, S, 3W] output give the dense inputs' bits."""
+    g = torch.Generator(device="cpu").manual_seed(2)
+    width, seq = heads * 128, 64
+    qkv = torch.randn(2, seq, 3 * width, generator=g).cuda().bfloat16()
+    q, k, _ = qkv.chunk(3, dim=-1)
+    norms = [nn.RMSNorm(width, eps=EPS, device="cuda", dtype=torch.bfloat16) for _ in range(2)]
+    ang = torch.rand(seq, 64, generator=g).cuda() * 6
+    cos, sin = ang.cos().repeat_interleave(2, 1), ang.sin().repeat_interleave(2, 1)
+    fn = torch.compile(lambda a, b: qk_norm_rope.rms_norm_rope(a, b, *norms, cos, sin, heads), dynamic=False)
+    with torch.inference_mode():
+        got = fn(q, k)
+        want = fn(q.contiguous(), k.contiguous())
+    for g_t, w_t in zip(got, want, strict=True):
+        assert torch.equal(g_t, w_t)
+
+
+@needs_kernels
+def test_compiled_fused_qkv_self_attention_matches_eager():
+    """Compiled, the fused projection's one GEMM and the strided norm feed the same attention as eager's three
+    GEMMs, to bf16 rounding (GEMM tiles and the norm kernel's summation order)."""
+    attn, x, rope = _self_attention("cuda", dim=1536, heads=12, seq=600)
+    attn.fuse_qkv()
+    with torch.inference_mode():
+        want = attn(x, rotary_emb=rope)
+        got = torch.compile(attn, fullgraph=True, dynamic=False)(x, rotary_emb=rope)
     _assert_bf16_close(got, want, min_equal=0.3)

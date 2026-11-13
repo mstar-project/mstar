@@ -182,7 +182,7 @@ def build_wan22_dit(
             f"{len(missing)} unloaded parameters {missing[:5]} — refusing to "
             "serve a partially loaded transformer."
         )
-    return dit.eval()
+    return dit.fuse_qkv().eval()
 
 
 # The original Wan layout's module names (Wan-AI's own repos, LightX2V's distill LoRAs) -> diffusers'.
@@ -210,5 +210,6 @@ def convert_wan_lora_keys(sd: dict[str, torch.Tensor]) -> dict[str, torch.Tensor
 
 
 def apply_dit_loras(dit: Wan22DiT, files: list[LoraFile]) -> None:
-    """Fold the configured adapters into one DiT's weights (static merge)."""
+    """Fold the configured adapters into one DiT's weights (static merge). In place, so the fused q / k / v weight
+    the loader left (``Wan22DiT.fuse_qkv``) takes them through the Linears that view it."""
     apply_loras(dit, files, remap_checkpoint_key, convert_keys=convert_wan_lora_keys)

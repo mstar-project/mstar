@@ -191,6 +191,7 @@ def test_lightx2v_lora_merges_at_scale_one(tmp_path):
     generator = torch.Generator().manual_seed(0)
     for p in dit.parameters():
         p.data = torch.randn(p.shape, generator=generator).to(p.dtype)
+    dit.fuse_qkv()  # as the loader leaves it, before the LoRAs fold in
     before = {name: p.detach().clone() for name, p in dit.named_parameters()}
     down = torch.randn(4, 16, generator=generator).to(torch.bfloat16)
     up = torch.randn(16, 4, generator=generator).to(torch.bfloat16)
@@ -208,6 +209,8 @@ def test_lightx2v_lora_merges_at_scale_one(tmp_path):
     expected = (before[target].float() + 0.5 * (up.float() @ down.float())).to(before[target].dtype)
     assert torch.equal(after[target], expected)
     assert all(torch.equal(after[name], value) for name, value in before.items() if name != target)
+    # the merge writes through the Linear's view, so the fused weight a compiled forward reads has it too
+    assert torch.equal(dit.blocks[0].self_attn.qkv_weight[:16], expected)
 
 
 def test_a14b_distill_yaml_builds_its_graphs():

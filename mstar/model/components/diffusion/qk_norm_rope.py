@@ -32,20 +32,20 @@ if triton is not None:
     @triton.jit
     def _rms_norm_rope_kernel(
         q_ptr, k_ptr, qw_ptr, kw_ptr, cos_ptr, sin_ptr, q_out_ptr, k_out_ptr,
-        seq, width, q_eps, k_eps, HEAD_DIM: tl.constexpr, BLOCK_PAIRS: tl.constexpr,
+        seq, width, q_stride, k_stride, q_eps, k_eps, HEAD_DIM: tl.constexpr, BLOCK_PAIRS: tl.constexpr,
     ):
         row = tl.program_id(0).to(tl.int64)
         if tl.program_id(1) == 0:
-            x_ptr, w_ptr, out_ptr, eps = q_ptr, qw_ptr, q_out_ptr, q_eps
+            x_ptr, w_ptr, out_ptr, eps, stride = q_ptr, qw_ptr, q_out_ptr, q_eps, q_stride
         else:
-            x_ptr, w_ptr, out_ptr, eps = k_ptr, kw_ptr, k_out_ptr, k_eps
+            x_ptr, w_ptr, out_ptr, eps, stride = k_ptr, kw_ptr, k_out_ptr, k_eps, k_stride
         pos = row % seq
         pairs = tl.arange(0, BLOCK_PAIRS)
         pmask = pairs < width // 2
         offs = pairs[:, None] * 2 + tl.arange(0, 2)[None, :]
         mask = pmask[:, None]
 
-        x = tl.load(x_ptr + row * width + offs, mask=mask, other=0.0).to(tl.float32)
+        x = tl.load(x_ptr + row * stride + offs, mask=mask, other=0.0).to(tl.float32)
         mean_sq = tl.sum(tl.sum(x * x, axis=1), axis=0) / width
         # eps arrives as fp64 from a compiled caller; keep the row in fp32
         rstd = tl.math.rsqrt(mean_sq + eps.to(tl.float32))
@@ -66,12 +66,22 @@ if triton is not None:
         cos: torch.Tensor, sin: torch.Tensor, q_eps: float, k_eps: float,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         batch, seq, width = q.shape
-        q_out, k_out = torch.empty_like(q), torch.empty_like(k)
+        # q and k may be views into a fused projection: rows at their own stride; the outputs are dense
+        q_out = torch.empty((batch, seq, width), dtype=q.dtype, device=q.device)
+        k_out = torch.empty((batch, seq, width), dtype=k.dtype, device=k.device)
         wrap_triton(_rms_norm_rope_kernel)[(batch * seq, 2)](
-            q, k, q_weight, k_weight, cos, sin, q_out, k_out, seq, width, q_eps, k_eps,
+            q, k, q_weight, k_weight, cos, sin, q_out, k_out, seq, width, q.stride(1), k.stride(1), q_eps, k_eps,
             HEAD_DIM=cos.shape[-1], BLOCK_PAIRS=triton.next_power_of_2(width // 2), num_warps=8,
         )
         return q_out, k_out
+
+
+def _uniform_rows(x: torch.Tensor) -> torch.Tensor:
+    """``x [B, S, W]`` as is when its ``B * S`` rows sit at one stride with dense columns (a slice of a fused
+    projection's output), else a dense copy."""
+    if x.stride(2) == 1 and (x.shape[0] == 1 or x.stride(0) == x.shape[1] * x.stride(1)):
+        return x
+    return x.contiguous()
 
 
 def rms_norm_rope(
@@ -80,7 +90,8 @@ def rms_norm_rope(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """``rope(q_norm(q)), rope(k_norm(k))`` for ``q, k [B, S, H * D]`` and fp32
     tables ``cos, sin [S, D]`` (each frequency repeated over its pair), returned
-    as ``[B, S, H, D]``. Both norms span the whole ``H * D`` row."""
+    as ``[B, S, H, D]``. Both norms span the whole ``H * D`` row. ``q`` and ``k``
+    may be column slices of one ``[B, S, 3 * H * D]`` projection."""
 
     def eager(x: torch.Tensor, norm: nn.RMSNorm) -> torch.Tensor:
         return apply_rotary_interleaved(norm(x).unflatten(2, (num_heads, -1)), cos, sin)
@@ -88,7 +99,7 @@ def rms_norm_rope(
     if triton is not None and q.is_cuda and torch.compiler.is_compiling():
         assert q.shape == k.shape and cos.shape == (q.shape[1], q.shape[2] // num_heads)
         q_out, k_out = _rms_norm_rope_op(
-            q.contiguous(), k.contiguous(), q_norm.weight, k_norm.weight, cos.contiguous(), sin.contiguous(),
+            _uniform_rows(q), _uniform_rows(k), q_norm.weight, k_norm.weight, cos.contiguous(), sin.contiguous(),
             q_norm.eps, k_norm.eps,
         )
         return q_out.unflatten(2, (num_heads, -1)), k_out.unflatten(2, (num_heads, -1))
