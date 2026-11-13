@@ -7,9 +7,10 @@ says why it stands or which PR deletes it, and an exception nothing uses any mor
 
 A package that isn't ported has to be on the frozen list of those that predate this rule, so a new model arrives on
 the contract. ``MODEL_REGISTRY`` loads a model only from a listed package, and from one module per unported package,
-so a model can't sit where that rule doesn't look. Only the engine and the tests import the adapters that bind a
-declaration to a resource, and ``contract.py`` imports nothing new from the resources, so the adapters can be replaced
-without touching a model.
+so a model can't sit where that rule doesn't look. The adapters that bind a declaration to a resource are imported only
+by the engine outside the state package, the tests and the files listed with a reason, and ``contract.py`` imports
+nothing new from the resources, so the adapters can be replaced without touching a model and importing
+``mstar.engine.state`` never loads them.
 """
 
 from __future__ import annotations
@@ -92,7 +93,7 @@ ALLOWED_NODE_RESOURCES = {
 }
 ADAPTERS = "mstar.engine.state.adapters"
 _BY_HAND = "the script builds a node's resources and handles by hand, as a test does"
-# the files outside mstar/engine/ and the tests that import the adapters, each with its reason
+# the files that import the adapters from outside mstar/engine/ and the tests, each with its reason
 ADAPTER_IMPORTERS = {
     "mstar/model/base.py": "the model base class resolves a deployment's resource specs from its declarations",
     "mstar/model/submodule_base.py": "`engine_step` expands a node's declared step for the engine",
@@ -185,14 +186,20 @@ def _registered_modules() -> dict[str, str]:
     }
 
 
-def _imports_adapters(source: str) -> bool:
+def _imports_adapters(source: str, path: str) -> bool:
     # Most files never name the adapters, and parsing all of them takes seconds.
     if "adapters" not in source:
         return False
+    package = Path(path).parent.parts
     for node in ast.walk(ast.parse(source)):
         if isinstance(node, ast.ImportFrom):
+            module = node.module
+            if node.level:
+                # one dot is the file's own package, and each further dot goes up one
+                base = ".".join(package[:len(package) + 1 - node.level])
+                module = f"{base}.{node.module}" if node.module else base
             names = {alias.name for alias in node.names}
-            if node.module == ADAPTERS or (node.module == "mstar.engine.state" and "adapters" in names):
+            if module == ADAPTERS or (module == "mstar.engine.state" and "adapters" in names):
                 return True
         elif isinstance(node, ast.Import) and ADAPTERS in {alias.name for alias in node.names}:
             return True
@@ -200,10 +207,11 @@ def _imports_adapters(source: str) -> bool:
 
 
 def _adapter_importers() -> set[str]:
-    """The files outside mstar/engine/ and the tests that import the adapters."""
+    """The files that import the adapters, apart from those in mstar/engine/ and the tests."""
     return {
         str(path) for root in SOURCE_ROOTS for path in Path(root).rglob("*.py")
-        if path.parts[:2] != ("mstar", "engine") and "tests" not in path.parts and _imports_adapters(path.read_text())
+        if path.parts[:2] != ("mstar", "engine") and "tests" not in path.parts
+        and _imports_adapters(path.read_text(), str(path))
     }
 
 
@@ -315,23 +323,38 @@ def test_an_unported_package_registers_no_second_model_module():
     assert not grown, f"{grown} register a second model module. Move it into a package of its own under mstar/model/."
 
 
-def test_only_the_engine_and_the_tests_import_the_adapters():
+def test_only_the_engine_the_tests_and_the_listed_files_import_the_adapters():
     unlisted = sorted(_adapter_importers() - ADAPTER_IMPORTERS.keys())
     assert not unlisted, (
-        f"{unlisted} import {ADAPTERS}, which only mstar/engine/ and the tests do. Import from `mstar.engine.state` "
-        "instead."
+        f"{unlisted} import {ADAPTERS}. Import from `mstar.engine.state` instead, or, if a file needs the adapters, "
+        "add it to ADAPTER_IMPORTERS with its reason."
     )
 
 
-@pytest.mark.parametrize("source, expected", [
-    ("from mstar.engine.state.adapters import node_handles", True),
-    ("from mstar.engine.state import Array, adapters", True),
-    ("import mstar.engine.state.adapters", True),
-    ("from mstar.engine.state import Array", False),
-    ("from mstar.api_server.openai import adapters", False),
+def test_no_other_file_of_the_state_package_imports_the_adapters():
+    adapters = Path(*ADAPTERS.split(".")).with_suffix(".py")
+    importers = sorted(
+        str(path) for path in adapters.parent.rglob("*.py")
+        if path != adapters and _imports_adapters(path.read_text(), str(path))
+    )
+    assert not importers, (
+        f"{importers} import the adapters, so importing `mstar.engine.state` would load them and the resources' Triton "
+        "kernels. Move the code that needs them into adapters.py."
+    )
+
+
+@pytest.mark.parametrize("source, path, expected", [
+    ("from mstar.engine.state.adapters import node_handles", "mstar/model/base.py", True),
+    ("from mstar.engine.state import Array, adapters", "mstar/model/base.py", True),
+    ("import mstar.engine.state.adapters", "mstar/model/base.py", True),
+    ("from .adapters import node_handles", CONTRACT, True),
+    ("from . import adapters", CONTRACT, True),
+    ("from mstar.engine.state import Array", "mstar/model/base.py", False),
+    ("from mstar.api_server.openai import adapters", "mstar/model/base.py", False),
+    ("from . import adapters", "mstar/api_server/openai/router.py", False),
 ])
-def test_the_lint_tells_the_state_adapters_from_other_imports(source, expected):
-    assert _imports_adapters(source) is expected, source
+def test_the_lint_tells_the_state_adapters_from_other_imports(source, path, expected):
+    assert _imports_adapters(source, path) is expected, source
 
 
 def test_the_contract_imports_nothing_new_from_the_resources():
