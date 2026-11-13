@@ -256,7 +256,8 @@ class ObserveInputs(NamedTuple):
     # `DrafterNeeds.target_hidden`; None otherwise
     hidden: torch.Tensor | None = None
     # a mixed step's layout and its target's input ids ``[tokens]`` (`DraftInputs.mixed`): what the drafter
-    # writes over the step's tokens here is what a prompt step would write for its prompt rows
+    # writes over the step's tokens here is what a prompt step would write for its prompt rows; ``hidden``
+    # is then over the step's tokens
     mixed: MixedRows | None = None
     ids: torch.Tensor | None = None
 
@@ -361,20 +362,25 @@ def draft_mixed_step(
     request_ids: Sequence[int],
     ids: torch.Tensor,
     rows: MixedRows,
-    target: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+    target: Callable[[torch.Tensor, torch.Tensor], TargetOutput],
     drafter: Drafter,
     resources: dict[str, Any],
     resident: CapturedResidentStep | None = None,
 ) -> VerifyResult:
     """`draft_verify_step` for a mixed prompt-plus-verify step: ``ids`` ``[tokens]`` the step's ids (a verify
     row's last emitted token at its block's first place), ``rows`` its layout, and ``target`` maps the ids
-    with the drafts in place and ``rows.at`` to the logits there ``[n * (k + 1), V]``. A verify row runs as in
-    a verify step; a prompt row tests no draft and samples its one token from its last position's logits
-    (`SamplerResource.verify`'s ``refuse``), so it leaves with accepted 0. Capturable."""
+    with the drafts in place and ``rows.at`` to a `TargetOutput`: the logits there ``[n * (k + 1), V]``, and
+    the hidden states over the step's tokens for a drafter that reads them. A verify row runs as in a verify
+    step; a prompt row tests no draft and samples its one token from its last position's logits
+    (`SamplerResource.verify`'s ``refuse``), so it leaves with accepted 0. A carrying drafter's ``observe``
+    returns every row's carry: a prompt row's is its prompt's first (kept on its last chunk). No resource
+    corrects a mixed step's state in its graph (startup refuses one). Capturable."""
     k = sampler.verify_draft_tokens
     n = rows.start.shape[0]
+    needs = drafter.needs
     anchors = ids[rows.at[:, 0]]
-    drafts = drafter.propose(DraftInputs(request_ids, anchors, resources, k, mixed=rows))
+    carry = _read_carry(sampler, request_ids, n) if needs.carry is not None else None
+    drafts = drafter.propose(DraftInputs(request_ids, anchors, resources, k, carry, mixed=rows))
     if drafts.shape != (n, k):
         raise ValueError(f"drafter proposed {tuple(drafts.shape)} drafts for {n} rows of {k}")
     drafts = sampler.agree(drafts.long())
@@ -382,10 +388,20 @@ def draft_mixed_step(
     places = torch.where(rows.prompt[:, None], rows.tokens, rows.at[:, 1:])
     block_ids = torch.cat([ids.long(), ids.new_zeros(1, dtype=torch.long)])
     block_ids = block_ids.scatter(0, places.reshape(-1), drafts.reshape(-1))[: rows.tokens]
-    logits = target(block_ids, rows.at.reshape(-1))
+    out = target(block_ids, rows.at.reshape(-1))
+    if not isinstance(out, TargetOutput):
+        raise TypeError(f"a mixed step's target returns a TargetOutput, not {type(out).__name__}")
+    logits, hidden = out
+    if needs.target_hidden and hidden is None:
+        raise RuntimeError("the drafter reads the target's hidden states (DrafterNeeds.target_hidden), and the "
+                           "target returned none")
     result = sampler.verify(request_ids, logits.view(n, k + 1, -1), drafts, refuse=rows.prompt)
     block = torch.cat([anchors.reshape(n, 1).long(), drafts], dim=1)
-    drafter.observe(ObserveInputs(block, result, mixed=rows, ids=block_ids))
+    carry = drafter.observe(ObserveInputs(block, result, hidden, mixed=rows, ids=block_ids))
+    if needs.carry is not None:
+        if carry is None:
+            raise RuntimeError("a drafter that declares a carry returned none from observe")
+        sampler.store_loopback_state(DRAFT_CARRY, request_ids, carry)
     if resident is not None and resident.buffers.advance is not None:
         # an asynchronous mixed step's verify rows advance their KV length cells by what each keeps, as a
         # verify step's do; its prompt rows' entries land on the trash row, which the advance skips

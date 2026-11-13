@@ -11,7 +11,7 @@ import torch
 
 sys.path.insert(0, ".")
 
-from spec_toy import NODE, STOP, Driver, ToyModel, engine, every, oracle, reference  # noqa: E402
+from spec_toy import NODE, STOP, Driver, ToyModel, carry_oracle, engine, every, oracle, reference  # noqa: E402
 
 from mstar.engine.resources.draft.config import DraftMode  # noqa: E402
 from mstar.engine.resources.draft.drafter import ChunkBoundary, DrafterNeeds, mixed_rows  # noqa: E402
@@ -139,7 +139,9 @@ def _mixed(prompts, late, drafter=oracle, steps_before=2, temperature=0.0, seed=
     return driver, stopped
 
 
-@pytest.mark.parametrize("drafter", [oracle, every(2), every(1)], ids=["oracle", "every-2nd-wrong", "all-wrong"])
+@pytest.mark.parametrize(
+    "drafter", [oracle, every(2), every(1), carry_oracle], ids=["oracle", "every-2nd-wrong", "all-wrong", "carrying"],
+)
 def test_a_mixed_steps_rows_decode_as_in_steps_of_their_own(drafter):
     """Greedy parity: every reply is the target's, as when the late prompts ran their own prompt steps; the
     verify rows' take-backs keep positions at their KV lengths through every step (`check_offsets`)."""
@@ -212,6 +214,33 @@ def test_top_p_first_changes_some_seeded_reply_on_a_verifying_node(monkeypatch, 
         return [out[0].out if path == "mixed" else out for out in outs]
 
     assert replies(True) != replies(False)
+
+
+def test_a_carrying_drafter_reads_its_carry_and_stores_a_prompt_rows_first():
+    """The carrying oracle drafts off its carry alone: it is accepted in full on the mixed step's verify row,
+    and on the late prompt's first verify step, whose carry the mixed step stored."""
+    driver = Driver(engine(K, carry_oracle, mixed=True))
+    driver.add(1, PROMPTS[1], MAX)
+    driver.step([1])
+    driver.add(4, None, MAX)
+    draft = driver.eng._drafts[NODE]
+    before = draft.accepted
+    driver.mixed_step([1], {4: LATE[4]})
+    assert draft.accepted == before + K
+    before = draft.accepted
+    driver.step([1, 4])
+    assert draft.accepted == before + 2 * K
+
+
+def test_a_node_whose_resources_correct_a_verify_steps_state_refuses_mixed_steps(monkeypatch):
+    """A resource that corrects a verify step's state in its graph (GDN's) reads every row as a verify
+    block, which a mixed step's prompt rows aren't: the node refuses at load, and without a mixed walk loads."""
+    from mstar.engine.resources.position.manager import RopeManager
+
+    monkeypatch.setattr(RopeManager, "correct_verify_state", lambda self, result: None)
+    with pytest.raises(ValueError, match=r"resources \['rope'\] correct a verify step's state in its graph"):
+        engine(K, oracle, mixed=True)
+    engine(K, oracle)
 
 
 def test_a_prompt_row_leaves_with_its_first_token_and_counts_no_verify_row():

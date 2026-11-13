@@ -101,12 +101,13 @@ class _CarryDrafter(_Drafter):
 
     def __init__(self, k: int):
         super().__init__(k)
-        self.needs = DrafterNeeds(chunk_boundary=ChunkBoundary.NONE, carry=CarrySpec(1, torch.float32))
+        self.needs = DrafterNeeds(chunk_boundary=ChunkBoundary.NONE, carry=CarrySpec(1, torch.float32), mixed=True)
         self._sums = None
 
     def propose(self, inputs: DraftInputs) -> torch.Tensor:
         n, k = inputs.input_ids.shape[0], self.k
-        position = inputs.resources["rope"].pos_ids("main").view(n, k + 1)[:, 0]
+        positions = inputs.resources["rope"].pos_ids("main")
+        position = positions.view(n, k + 1)[:, 0] if inputs.mixed is None else positions[inputs.mixed.at[:, 0]]
         # what the KV held before the step, then the step's input token
         self._sums = inputs.carry[:, 0].round().long()
         kv_sum, token, drafts = self._sums + inputs.input_ids, inputs.input_ids, []
@@ -119,7 +120,14 @@ class _CarryDrafter(_Drafter):
     def observe(self, inputs: ObserveInputs) -> torch.Tensor:
         block, result = inputs.block, inputs.result
         kept = torch.arange(block.shape[1])[None, :] <= result.accepted[:, None]
-        return (self._sums + (block * kept).sum(1)).float()[:, None]
+        sums = self._sums + (block * kept).sum(1)
+        rows = inputs.mixed
+        if rows is not None:
+            # a mixed step's prompt row: its prompt's sum, as its prompt step would store it
+            spans = zip(rows.start.tolist(), rows.end.tolist(), strict=True)
+            prompt = torch.stack([inputs.ids[s:e].sum() for s, e in spans])
+            sums = torch.where(rows.prompt, prompt, sums)
+        return sums.float()[:, None]
 
 
 def oracle(k):
@@ -268,7 +276,8 @@ class ToyLM(ARNodeSubmodule):
             qo = torch.nn.functional.pad(counts.cumsum(0), (1, 0))
             rows = mixed_rows(qo, kwargs["mixed_kind"], self.k + 1)
             result = self.draft_mixed_step(
-                engine_inputs, ids, rows, lambda block_ids, at: self._target(engine_inputs, block_ids).logits[at],
+                engine_inputs, ids, rows,
+                lambda block_ids, at: TargetOutput(self._target(engine_inputs, block_ids).logits[at], None),
             )
             return self.verify_output(result)
         n = len(rids)

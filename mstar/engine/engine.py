@@ -1137,6 +1137,14 @@ class Engine:
             if key in mgmt.resources
             and type(mgmt.resources[key]).correct_verify_state is not Resource.correct_verify_state
         )
+        if decl.mixed_walk is not None and correcting_keys:
+            # their correction reads every row as a verify block, which a mixed step's prompt rows aren't; from
+            # the resources' types, alike on every rank
+            raise ValueError(
+                f"{decl.node}: resources {list(correcting_keys)} correct a verify step's state in its graph, which "
+                f"a mixed prompt-plus-verify step ({decl.mixed_walk!r}) doesn't run: verify asynchronously, or "
+                "run the node's prompts in steps of their own"
+            )
         submodule.bind_draft(DrafterShare(
             decl.walk, stop.sampler, decl.config.num_draft_tokens, stop.prefill_walks,
             carry_writes(decl.needs), decl.prefill_steps, decl.verify_steps,

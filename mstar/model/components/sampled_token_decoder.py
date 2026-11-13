@@ -847,8 +847,11 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
         decoder_kwargs = self.decoder_kwargs(MIXED, engine_inputs, input_ids.shape[0], **tensors)
         model = self.model
 
-        def target(ids: torch.Tensor, at: torch.Tensor) -> torch.Tensor:
-            return model.logits(model(model.embed(ids), label="main", **decoder_kwargs).index_select(0, at))
+        wants_hidden = self.drafter.needs.target_hidden
+
+        def target(ids: torch.Tensor, at: torch.Tensor) -> TargetOutput:
+            hidden = model(model.embed(ids), label="main", **decoder_kwargs)
+            return TargetOutput(model.logits(hidden.index_select(0, at)), hidden if wants_hidden else None)
 
         result = self.draft_mixed_step(engine_inputs, input_ids, rows, target)
         out = self.verify_output(result)
