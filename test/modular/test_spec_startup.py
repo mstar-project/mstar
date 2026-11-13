@@ -164,6 +164,26 @@ def test_block_causal_attention_is_refused_though_its_parent_can_verify():
     assert any("'attn'" in p and "block-causal" in p for p in problems), problems
 
 
+def test_a_context_parallel_pool_is_refused():
+    specs = _specs()
+    specs["kv_cache"] = KVSpec(
+        "kv_cache", {NODE}, PagedKVConfig(num_layers=2, num_kv_heads=2, head_dim=8, max_seq_len=64,
+                                          context_parallel=True), draft_slack=8,
+    )
+    problems = resource_problems(_decl(), specs)
+    assert any("'kv_cache'" in p and "context-parallel" in p for p in problems), problems
+    assert resource_problems(_decl(), _specs()) == []
+
+
+def test_a_node_that_shards_its_sequence_is_refused():
+    """`SeqShardSpec` keeps the base's refusal: a verify step of k + 1 rows a request would split
+    over the node's SP ranks, which nothing on the verify path takes."""
+    from mstar.engine.resources.sequence_shard import SeqShardSpec
+
+    problems = resource_problems(_decl(), _specs(seq=SeqShardSpec("seq", {NODE}, labels=("main",), axis=0)))
+    assert any("'seq'" in p and "declares no speculative decoding support" in p for p in problems), problems
+
+
 def test_a_sampler_with_a_history_or_logprobs_is_refused():
     specs = _specs(sampler=SamplerSpec("sampler", {NODE}, vocab_size=32, max_repetition_window=8))
     assert any("history" in p for p in resource_problems(_decl(), specs))
