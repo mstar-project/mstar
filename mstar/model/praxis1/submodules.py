@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 class _Praxis1Node(NodeSubmodule):
     """Shared plumbing: every node here is per-request and uncompiled.
 
-    One policy call is one request's chunk. Rows of different episodes share
+    One policy call is one request's chunk. Rows of different requests share
     neither a window nor a canvas, so nothing batches across them, and the
     data-dependent denoise loop is the case ``disable_torch_compile`` exists
     for.
@@ -58,8 +58,8 @@ class Praxis1TextEncoderSubmodule(_Praxis1Node):
 
     Emits the task embedding and the blank-caption embedding beside it: the
     video guidance pass needs the unconditional branch, and the caption is
-    fixed for the checkpoint, so both are encoded once and persist for the
-    episode.
+    fixed for the checkpoint, so both are encoded once and persist between
+    walks of this request.
     """
 
     def __init__(self, config: Praxis1Config, encoder: nn.Module) -> None:
