@@ -28,6 +28,7 @@ from mstar.model.components.distributed import (
 from mstar.model.components.distributed.linear_attn import ParallelGatedDeltaNet
 from mstar.model.components.distributed.mlp import ParallelGatedMLP
 from mstar.model.components.linear_attn import GDNProjLayout
+from mstar.model.components.quant_linear import QuantizableLinears
 from mstar.model.qwen3_5.components.rope import (
     apply_partial_mrope,
     compute_3d_cos_sin,
@@ -253,6 +254,13 @@ class Qwen3_5LanguageModel(nn.Module):
     ) -> torch.Tensor:
         self.rope_cache.set(*(cos_sin or (None, None)))
         return run_layers(self.layers, query_sequence, self.norm, no_cursor, self.comm_group)
+
+
+# ``quantization:``: the decoder layers' projections may go low precision; the LM head (the embedding itself on
+# tied checkpoints) stays bf16, as in Qwen's own FP8 checkpoints.
+QUANTIZABLE_LINEARS = QuantizableLinears(
+    candidates=("model.layers.*.self_attn.*", "model.layers.*.mlp.*"), keep_bf16=("lm_head",),
+)
 
 
 class Qwen3_5ForCausalLM(nn.Module):

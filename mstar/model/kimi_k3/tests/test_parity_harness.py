@@ -1,0 +1,70 @@
+"""The GPU parity harness (``test/kimi_k3/gpu_truncated_parity.py``) on CPU: what it reads as a
+step's logits must be that step's, also when the step is a captured replay."""
+from __future__ import annotations
+
+import importlib.util
+from pathlib import Path
+
+import torch
+
+from mstar.model.kimi_k3 import truncate
+from mstar.model.kimi_k3.tests.reference import reference_logits
+from mstar.model.kimi_k3.tests.test_truncate import TINY, make_tiny_release
+
+ROOT = Path(__file__).resolve().parents[4]
+
+
+def _harness():
+    spec = importlib.util.spec_from_file_location("kimi_gpu_parity", ROOT / "test/kimi_k3/gpu_truncated_parity.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class _ReplayList(list):
+    """A sampler's logits list as a captured replay leaves it: the sampler's Python ran at capture
+    only, so nothing past the first entry is appended."""
+
+    def append(self, item):
+        if not self:
+            super().append(item)
+
+
+def test_generate_reads_each_steps_logits_even_when_the_sampler_runs_no_python(tmp_path):
+    """The logits come back as the step's row output and must be the sampled token's argmax: a decode
+    that replays captured graphs runs none of the sampler's Python, so its logits list stops at the
+    prefill's (read from it, every dense case fails with an error of ~10, the control's size). With
+    the list frozen the harness's logits still match the reference."""
+    harness = _harness()
+    harness._cpu_stubs()
+    (tmp_path / "release").mkdir()
+    ref_sd = make_tiny_release(tmp_path / "release")
+    # the harness's input: a cut of the release with its experts decoded to bf16 (here every layer)
+    truncate.main(["--src", str(tmp_path / "release"), "--dst", str(tmp_path / "cut"), "--layers", "5",
+                   "--experts", str(TINY["experts"])])
+    engine, model = harness.build(str(tmp_path / "cut"), "cpu", dtype=torch.float32)
+    engine._resources["sampler"].logits = _ReplayList()
+    prompt = torch.randint(0, model.config.vocab_size, (9,), generator=torch.Generator().manual_seed(3))
+    run = harness.generate(engine, {"a": prompt}, steps=4)["a"]
+    seq = torch.cat([prompt, torch.tensor(run["tokens"][:-1])])
+    ref = reference_logits({k: v.float() for k, v in ref_sd.items()}, seq, model.config,
+                           logits_from=len(prompt) - 1)
+    torch.testing.assert_close(run["logits"], ref, atol=2e-4, rtol=0)
+
+
+def test_the_dsa_control_attends_only_keys_the_engine_did_not_pick():
+    """The control replays each query past top-k on visible keys outside the engine's picks (the
+    earliest, at most top-k); queries within top-k see every key either way. The dense reference is
+    too close to be the control: ~1 logit from the top-16 reference, under twice a B300 bf16 engine's
+    error on one prompt."""
+    harness = _harness()
+    run = {"dsa": {3: {2: torch.tensor([0, 1, 2, 3])},
+                   6: {2: torch.tensor([6, 4, 0, 2]), 3: torch.tensor([1, 2, 3, -1])},
+                   9: {2: torch.tensor([9, 8, 7, 6])}}}
+    out = harness._unpicked(run, topk=4)
+    assert set(out) == {2, 3} and 3 not in out[2]
+    assert out[2][6].tolist() == [1, 3, 5] and out[3][6].tolist() == [0, 4, 5, 6]
+    assert out[2][9].tolist() == [0, 1, 2, 3]
+    for layer, rows in out.items():
+        for pos, keys in rows.items():
+            assert not set(keys.tolist()) & set(run["dsa"][pos][layer].tolist())

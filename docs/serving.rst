@@ -410,8 +410,8 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        regions, on a name that is neither a walk nor a region of the node or is both
        (on a node whose model declares no region, every name that is no walk), and on a
        region captured by batch size alone; a walk or region the node captures nothing
-       for at this deployment (a model that turns its captures off, such as GLM-5.2 with
-       ``dsa_long_context``) is logged and skipped. Loading also fails where a model
+       for at this deployment (a model that turns its captures off, such as GLM-5.2's prefill
+       with ``dsa_long_context`` and MTP) is logged and skipped. Loading also fails where a model
        refuses a region whose buckets it uses elsewhere: CosyVoice3's
        ``flow/solve_new_frames`` takes ``model_kwargs.flow_new_frame_buckets``. The
        key replaces ``model_kwargs.prefill_token_buckets``,
@@ -727,7 +727,10 @@ A node whose resources keep state only on a grid of tokens counted from where a 
 chunk starts on it. Qwen3.5 with its prefix cache on cuts whole KV pages (128 tokens by
 default), since its GDN snapshots sit on page boundaries. There ``min_chunk_tokens`` rounds
 up to a page, a budget under a page fails loading, and one under three pages logs a warning:
-a step can then leave up to a page, less one token, of its budget unused.
+a step can then leave up to a page, less one token, of its budget unused. A model can also
+declare that a walk's cuts run a multiple of so many tokens (``ChunkingPolicy.chunk_align``;
+Kimi K3.1's is 64, where its MLA rows replay a packed prefill capture): the scheduler cuts to
+the least common multiple of the two.
 
 Most chunked walks run inside a combined walk, which batches a node's prompts and its
 decode rows into one step: ``mixed`` for Qwen3.5's and Orpheus's LLM, ``mixed_text`` for
@@ -1327,9 +1330,9 @@ or ``increase()``.
   ``mstar_prefix_cache_hit_tokens_total{model_name, component}``: counters, prompt
   tokens looked up in the prefix cache (once per request, its whole keyed prompt) and
   tokens found there. Only models that key their prompts for prefix reuse (BAGEL,
-  Orpheus, Qwen3.5 and Qwen3-Omni's Thinker) count, and above one rank only with
-  ``prefix_cache_tp`` set. Qwen3.5's hit counts the KV cache's tokens before its
-  recurrent pool cuts the hit to a snapshot.
+  Kimi K3, Orpheus, Qwen3.5 and Qwen3-Omni's Thinker) count, and above one rank only with
+  ``prefix_cache_tp`` set. Kimi K3's and Qwen3.5's hits count the KV cache's tokens before
+  their recurrent pool cuts the hit to a snapshot.
 - ``mstar_component_pending_steps{model_name, component}``: gauge, requests whose next
   step on the node is ready (its inputs arrived) and not running: waiting for room in a
   step or for the worker to pick the node.

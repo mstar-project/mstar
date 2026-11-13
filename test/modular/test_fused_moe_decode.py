@@ -147,6 +147,34 @@ def test_swiglu_limit_reaches_every_activation(tokens, limit, launches):
             assert floats == [7.0 if limit else 0.0]
 
 
+GROUPED = ("_plan_kernel", "_grouped_gate_up_kernel", "_grouped_down_kernel", "_sum_kernel")
+
+
+@pytest.mark.parametrize("tokens", [11, 17, 23, 33, 50, 63])
+def test_a_grouped_launch_compiles_as_the_next_power_of_two_does(tokens, launches):
+    """The grouped kernels' compile-time arguments for any token count are those of the next
+    power of two, which a decode capture already compiled: an eager step of another count (a
+    prefill past a cached prefix) compiles nothing new."""
+    def keys(n):
+        launches.clear()
+        decode.experts(*_host_layer(n), block_size=BLOCK)
+        return [(name, kw) for name, _, _, kw in launches]
+
+    tb = 1 << (tokens - 1).bit_length()
+    assert keys(tokens) == keys(tb)
+    assert [name for name, _ in keys(tokens)] == list(GROUPED)
+
+
+def test_no_grouped_kernel_specializes_on_the_token_count():
+    """Triton keys a compile on an int argument's value class (1, a multiple of 16), so a
+    kernel that specializes on T compiles again for an odd count its capture never ran."""
+    if not hasattr(decode._plan_kernel, "params"):
+        pytest.skip("needs triton's JITFunction")
+    for name in GROUPED:
+        kernel = getattr(decode, name)
+        assert "T" in [p.name for p in kernel.params if p.do_not_specialize], name
+
+
 def test_split_x_rounds_hidden_up_to_a_power_of_two(launches):
     decode.experts(*_host_layer(16, hidden=3072), block_size=BLOCK)
     (plan,) = [kw for name, _, _, kw in launches if name == "_plan_kernel"]

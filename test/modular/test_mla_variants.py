@@ -66,8 +66,17 @@ def test_rope_dims_need_a_position_resource_and_nope_has_none():
     MLAAttention(_config(False), kv_key="kv", attn_key="attn", pos_key="pos")
     with pytest.raises(ValueError, match="pos_key"):
         MLAAttention(_config(False), kv_key="kv", attn_key="attn", pos_key=None)
-    with pytest.raises(ValueError, match="no decoupled dims"):
-        MLAAttention(_config(False, mla_use_nope=True), kv_key="kv", attn_key="attn", pos_key=None)
+
+
+def test_nope_keeps_decoupled_dims_unrotated():
+    """Kimi K3's layout: ``mla_use_nope`` with decoupled dims keeps them in the query and the cache
+    row, but rotates nothing, so no position resource is bound."""
+    m = MLAAttention(_config(False, mla_use_nope=True), kv_key="kv", attn_key="attn", pos_key=None)
+    m.bind_resources({"kv": object(), "attn": object()})
+    assert m.mla_cache_kpe == ROPE and m._pos is None
+    q, k = torch.randn(T, HEADS, ROPE), torch.randn(T, 1, ROPE)
+    q2, k2 = m._rope(torch.arange(T), q, k)
+    assert q2 is q and k2 is k
 
 
 def test_nope_mla_binds_no_position_resource():

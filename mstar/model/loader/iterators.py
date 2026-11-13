@@ -32,7 +32,6 @@ from typing import NamedTuple
 
 import numpy as np
 import torch
-from safetensors import safe_open
 
 from mstar.model.loader.quantization import refuse_unserved_quantization
 from mstar.utils.threads import ThreadPool
@@ -112,6 +111,15 @@ def _read_tensor(fd: int, rd: _Read) -> torch.Tensor:
         )
         buf = sliced
     return buf.view(rd.dtype).view(shape)
+
+
+def safe_open(*args, **kwargs):
+    """``safetensors.safe_open``, imported on first use: safetensors is an optional dependency, and the
+    conductor, worker and API server import this package (through mstar.quantization) whether or not
+    they read a checkpoint."""
+    from safetensors import safe_open as open_file
+
+    return open_file(*args, **kwargs)
 
 
 def _read_with_safetensors(path: Path, key: str, spec: TensorSlice | None) -> torch.Tensor:

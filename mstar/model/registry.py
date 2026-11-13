@@ -24,6 +24,8 @@ MODEL_REGISTRY: dict[str, tuple[str, str]] = {
     "glm52": ("mstar.model.glm52.glm52_model", "Glm52Model"),
     "glm5_next": ("mstar.model.glm5_next.glm5_next_model", "Glm5NextModel"),
     "higgs_audio": ("mstar.model.higgs_audio.higgs_audio_model", "HiggsAudioModel"),
+    "kimi_k3": ("mstar.model.kimi_k3.kimi_k3_model", "KimiK3Model"),
+    "kimi_k31": ("mstar.model.kimi_k3.kimi_k3_model", "KimiK31Model"),
     "minicpm_o": ("mstar.model.minicpm_o.minicpm_o_model", "MiniCPMOModel"),
     "phi4mm": ("mstar.model.phi4mm.phi4mm_model", "Phi4MMModel"),
     "nemotron_duplex": ("mstar.model.nemotron_duplex.nemotron_duplex_model", "NemotronDuplexModel"),
@@ -129,6 +131,10 @@ HF_MODELS: dict[str, dict] = {
     # GLM-5.3-Flash: 34 KDA linear-attention + 11 MLA layers with mHC residuals,
     # fp8 checkpoint, text only (the ViT is skipped). TP8 on 8xH100.
     "glm5_next": {"model_path_hf": "zai-org/GLM-5.3-Flash"},
+    # Kimi K3 / K3.1 Pro: 69 KDA + 24 gated MLA layers (K3.1: + DSA indexer), 896-expert latent
+    # MoE with MXFP4 experts, text only (the vision tower is skipped). TP8 on 8x B300.
+    "kimi_k3": {"model_path_hf": "moonshotai/Kimi-K3"},
+    "kimi_k31": {"model_path_hf": "moonshotai/Kimi-K3.1-Pro"},
     # Higgs-Audio v3 STT: Whisper-style audio tower + Qwen3-1.7B LLM.
     # (The v2 checkpoints are TTS/generation models, not ASR.)
     "higgs_audio": {"model_path_hf": "bosonai/higgs-audio-v3-stt"},

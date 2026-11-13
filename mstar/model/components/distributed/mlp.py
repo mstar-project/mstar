@@ -24,6 +24,7 @@ from __future__ import annotations
 from typing import Callable
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
@@ -96,7 +97,15 @@ class ParallelGatedMLP(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate_up = self.gate_up_proj(x)
+        gate_up_proj = self.gate_up_proj
+        # (a model may hold another linear kind here, with no format slot)
+        fmt = getattr(gate_up_proj, "quant_format", None)
+        # a format that runs the SwiGLU in its GEMM's epilogue (block fp8 at decode): one launch, not two; not
+        # with a bias, another activation, or a LoRA delta bound around the GEMM (its class then has its own forward)
+        if (fmt is not None and fmt.has_glu and self.act is F.silu and gate_up_proj.bias is None
+                and type(gate_up_proj).forward is ColumnParallelLinear.forward):
+            return self.down_proj(gate_up_proj.quant_glu(x))
+        gate_up = gate_up_proj(x)
         if self.fused_silu:
             return self.down_proj(torch.ops.mstar.silu_and_mul(gate_up))
         gate, up = gate_up.split(self.intermediate_size_per_partition, dim=-1)

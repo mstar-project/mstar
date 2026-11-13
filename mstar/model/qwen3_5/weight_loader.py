@@ -58,13 +58,15 @@ def _load(
     path: str | Path,
     device: torch.device | str,
     selectors: list[dict],
-    expected: set[str],
+    expected,
 ) -> set[str]:
-    """Fill ``expected`` from the shards each selector picks out, or raise.
+    """Fill ``expected()`` from the shards each selector picks out, or raise.
 
     A selector (``prefix=`` or ``keys=``) only narrows which shards open; the
     model's ``checkpoint_rules()`` decide what loads. An unfilled parameter is
-    fatal, since a half-loaded tower produces plausible garbage.
+    fatal, since a half-loaded tower produces plausible garbage. ``expected`` is
+    asked after the load: a layer loaded as a quantized checkpoint stores it under
+    other names (``mstar.quantization``).
     """
     rules = model.checkpoint_rules()
     loaded: set[str] = set()
@@ -75,7 +77,7 @@ def _load(
             name_remapper=rules.remap,
             stacked_params=list(rules.stacked_params),
         )
-    missing = sorted(expected - loaded)
+    missing = sorted(expected() - loaded)
     if missing:
         raise ValueError(
             f"{len(missing)} parameter(s) got no weight, e.g. {missing[:5]}"
@@ -96,7 +98,7 @@ def load_qwen3_5_weights(
         selectors.append({"keys": {_LM_HEAD}})
     return _load(
         model, path, device, selectors,
-        expected={
+        expected=lambda: {
             n for n, _ in model.named_parameters()
             # tied: the checkpoint carries no tensor for it
             if not (tied and n == _LM_HEAD)
@@ -112,5 +114,5 @@ def load_qwen3_5_vision_weights(
     """Load the ViT. Returns the parameter paths that were filled."""
     return _load(
         model, path, device, [{"prefix": _VISION_PREFIX}],
-        expected={n for n, _ in model.named_parameters()},
+        expected=lambda: {n for n, _ in model.named_parameters()},
     )

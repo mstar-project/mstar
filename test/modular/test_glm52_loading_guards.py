@@ -10,9 +10,9 @@ from mstar.model.glm52.weight_loader import _refuse_fp8
 def test_fp8_tensors_without_a_quant_config_are_refused():
     ok = [("a.weight", torch.zeros(2, dtype=torch.bfloat16))]
     assert list(_refuse_fp8(iter(ok))) == ok
-    with pytest.raises(ValueError, match="quantization_config"):
+    with pytest.raises(ValueError, match="no quantization plan is active"):
         list(_refuse_fp8(iter([("b.weight", torch.zeros(2, dtype=torch.float8_e4m3fn))])))
-    with pytest.raises(ValueError, match="quantization_config"):
+    with pytest.raises(ValueError, match="no quantization plan is active"):
         list(_refuse_fp8(iter([("b.weight_scale_inv", torch.ones(1))])))
 
 

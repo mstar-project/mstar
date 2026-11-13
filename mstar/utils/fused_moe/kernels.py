@@ -33,7 +33,8 @@ import triton.language as tl
 
 from mstar.kernels import Impl, KernelOp, TableEntry, Target, Tolerance, register
 from mstar.kernels.registry import on_reset
-from mstar.utils.quant_fp8 import FP8_DTYPE
+from mstar.utils.quant_fp8 import FP8_DTYPE, per_token_group_quant_fp8
+from mstar.utils.situ import SiTU
 
 # ---------------------------------------------------------------------------
 # Main grouped-GEMM kernel (used for both gate_up and down projections)
@@ -451,13 +452,15 @@ def _tanh(x):
 
 
 @triton.jit
-def _apply_activation(x, ACTIVATION_TYPE: tl.constexpr):
+def _apply_activation(x, ACTIVATION_TYPE: tl.constexpr, SITU_BETA):
     x = x.to(tl.float32)
     if ACTIVATION_TYPE == "silu":
         return x * tl.sigmoid(x)
     elif ACTIVATION_TYPE == "gelu":
         k = 0.7978845608028654  # sqrt(2/pi)
         return 0.5 * x * (1.0 + _tanh(k * (x + 0.044715 * x * x * x)))
+    elif ACTIVATION_TYPE == "situ":
+        return SITU_BETA * _tanh(x / SITU_BETA) * tl.sigmoid(x)
     else:
         tl.static_assert(False, "Unsupported activation")
         return x
@@ -469,22 +472,35 @@ def act_and_mul_kernel(
     down_input_ptr,
     hidden_size,
     SWIGLU_LIMIT,
+    SITU_BETA,
+    SITU_LINEAR_BETA,
+    rows_ptr,
+    num_rows,
     BLOCK_SIZE: tl.constexpr,
     ACTIVATION_TYPE: tl.constexpr,
     HAS_SWIGLU_CLAMP: tl.constexpr,
+    HAS_SITU_LINEAR_BETA: tl.constexpr,
+    HAS_ROWS: tl.constexpr,
 ):
-    """Per-slot SwiGLU activation.
+    """Per-slot gated activation.
 
     Input ``gateup_output`` has layout ``(M*topk, 2*inter)`` with the
     gate half in columns ``[0:inter]`` and the up half in columns
     ``[inter:2*inter]``.  Writes ``act(gate) * up`` to ``down_input`` of
-    shape ``(M*topk, inter)``.
+    shape ``(M*topk, inter)``. SiTU (``mstar.utils.situ``) also bends the up
+    half, ``lb * tanh(up / lb)``, and multiplies in fp32 as its reference does.
     """
     in_dtype = gateup_output_ptr.dtype.element_ty
     out_dtype = down_input_ptr.dtype.element_ty
 
     half = hidden_size // 2
-    pid = tl.program_id(0)
+    # int64: a slot's row offset, M * top_k * 2I, passes 2^31 past ~21K tokens at EP8's 2I = 6144
+    pid = tl.program_id(0).to(tl.int64)
+    if HAS_ROWS:
+        # only the rows a GEMM tile wrote (expert-parallel: the other ranks' slots are never written or read)
+        pid = tl.load(rows_ptr + pid).to(tl.int64)
+        if pid >= num_rows:
+            return
 
     gate_row = gateup_output_ptr + pid * hidden_size
     up_row = gate_row + half
@@ -498,33 +514,49 @@ def act_and_mul_kernel(
         if HAS_SWIGLU_CLAMP:
             gate = tl.minimum(gate, SWIGLU_LIMIT)
             up = tl.maximum(tl.minimum(up, SWIGLU_LIMIT), -SWIGLU_LIMIT)
-        activated = _apply_activation(gate, ACTIVATION_TYPE).to(in_dtype)
-        out = activated * up
+        if ACTIVATION_TYPE == "situ":
+            up32 = up.to(tl.float32)
+            if HAS_SITU_LINEAR_BETA:
+                up32 = SITU_LINEAR_BETA * _tanh(up32 / SITU_LINEAR_BETA)
+            out = _apply_activation(gate, ACTIVATION_TYPE, SITU_BETA) * up32
+        else:
+            activated = _apply_activation(gate, ACTIVATION_TYPE, SITU_BETA).to(in_dtype)
+            out = activated * up
         tl.store(out_row + offset, out.to(out_dtype), mask=mask)
 
 
 def act_and_mul_triton(
     gateup_output: torch.Tensor,
     down_input: torch.Tensor,
-    activation: str = "silu",
+    activation: "str | SiTU" = "silu",
     swiglu_limit: float | None = None,
+    rows: torch.Tensor | None = None,
 ) -> None:
-    """Launch SwiGLU with an optional pre-activation clamp."""
+    """Launch the gated activation (``silu``, ``gelu``, a ``SiTU`` or its ``spec`` string) with an
+    optional pre-activation clamp; with ``rows`` (``moe_align_block_size``'s sorted slot ids), only
+    the slots listed there (ids past the last slot are padding)."""
     assert gateup_output.is_contiguous()
     assert down_input.is_contiguous()
     assert gateup_output.shape[0] == down_input.shape[0]
     assert gateup_output.shape[1] == 2 * down_input.shape[1]
 
-    grid = (down_input.shape[0],)
+    situ = activation if isinstance(activation, SiTU) else SiTU.parse(activation)
+    grid = (down_input.shape[0] if rows is None else rows.shape[0],)
     hidden_size = gateup_output.shape[1]
     act_and_mul_kernel[grid](
         gateup_output,
         down_input,
         hidden_size,
         0.0 if swiglu_limit is None else swiglu_limit,
+        1.0 if situ is None else situ.beta,
+        1.0 if situ is None or situ.linear_beta is None else situ.linear_beta,
+        rows if rows is not None else down_input,
+        down_input.shape[0],
         BLOCK_SIZE=512,
-        ACTIVATION_TYPE=activation,
+        ACTIVATION_TYPE="situ" if situ is not None else activation,
         HAS_SWIGLU_CLAMP=swiglu_limit is not None,
+        HAS_SITU_LINEAR_BETA=situ is not None and situ.linear_beta is not None,
+        HAS_ROWS=rows is not None,
     )
 
 
@@ -557,7 +589,8 @@ def act_and_mul_quant_fp8_kernel(
     if HAS_SWIGLU_CLAMP:
         gate = tl.minimum(gate, SWIGLU_LIMIT)
         up = tl.maximum(tl.minimum(up, SWIGLU_LIMIT), -SWIGLU_LIMIT)
-    activated = _apply_activation(gate, ACTIVATION_TYPE).to(in_dtype)
+    # SwiGLU / GeGLU only (no beta): act_and_mul_quant_fp8 launches a SiTU as the two kernels this one fuses
+    activated = _apply_activation(gate, ACTIVATION_TYPE, 1.0).to(in_dtype)
     y = (activated * up).to(in_dtype).to(tl.float32)
     y_s = tl.maximum(tl.max(tl.abs(y), axis=1), eps) / fp8_max
     y_q = tl.minimum(tl.maximum(y / y_s[:, None], fp8_min), fp8_max).to(q_ptr.dtype.element_ty)
@@ -573,11 +606,16 @@ def act_and_mul_quant_fp8(
     eps: float = 1e-10,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """:func:`act_and_mul_triton` then ``per_token_group_quant_fp8(_, group_size)`` in one
-    launch: ``(q, s)``, e4m3 ``(M, inter)`` and fp32 ``(M, inter // group_size)``."""
+    launch: ``(q, s)``, e4m3 ``(M, inter)`` and fp32 ``(M, inter // group_size)``. A SiTU
+    (its ``spec`` string) runs as those two launches."""
     assert gateup_output.is_contiguous() and gateup_output.dim() == 2
     M, two_inter = gateup_output.shape
     inter = two_inter // 2
     assert inter % group_size == 0, f"inter {inter} must be a multiple of group_size {group_size}"
+    if SiTU.parse(activation) is not None:
+        act = torch.empty((M, inter), dtype=gateup_output.dtype, device=gateup_output.device)
+        act_and_mul_triton(gateup_output, act, activation=activation, swiglu_limit=swiglu_limit)
+        return per_token_group_quant_fp8(act, group_size, eps)
     finfo = torch.finfo(FP8_DTYPE)
     q = torch.empty((M, inter), dtype=FP8_DTYPE, device=gateup_output.device)
     s = torch.empty((M, inter // group_size), dtype=torch.float32, device=gateup_output.device)

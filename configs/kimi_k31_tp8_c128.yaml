@@ -1,0 +1,30 @@
+model: "kimi_k31"
+# kimi_k31_tp8.yaml at 128 concurrent requests on 8x B300 (288 GB): 128 KDA slots and decode graphs
+# up to 128 rows, so a c=128 load decodes in one step instead of queueing half of it behind a
+# 64-row cap. Per rank: ~195 GB of weights (MXFP4 experts as stored), KDA state 129 slots x
+# ~56 MB = ~7.3 GB, the latent cache 2049 pages x 128 tokens x ~27.6 KB = ~7.2 GB: ~210 GB of 288,
+# leaving ~78 GB for activations, graphs and the all-reduce workspace. 2048-token contexts, as
+# kimi_k31_tp8.yaml (dense MLA is exactly K3.1's DSA there).
+max_seq_len: 2048
+max_concurrent_requests: 128
+tp_allreduce: "flashinfer"
+tp_allreduce_max_kb: 32768
+tp_async_sched: true
+model_kwargs:
+  max_seq_len: 2048
+  kda_max_requests: 128
+  # the default ladder stops at 64; 96 keeps a 65..96-row step from padding to 128
+  decode_capture_batch_sizes: [1, 2, 4, 8, 16, 24, 32, 48, 64, 96, 128]
+resources:
+  kv_cache:
+    # 128 requests of 2048 tokens at 128 tokens a page plus the sink
+    max_num_pages: 2049
+    page_size: 128
+  kda_state:
+    # 128 requests plus the sink
+    max_slots: 129
+node_groups:
+  - node_names: [LLM]
+    ranks: [0, 1, 2, 3, 4, 5, 6, 7]
+    tp_size: 8
+    graph_walks: [prefill, decode]

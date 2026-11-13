@@ -571,15 +571,17 @@ the pool's ``resources:`` key. Each snapshot slot costs as much as a request slo
 - A prefill keeps the state at its last page boundary before its end, since a resend's KV
   hit always leaves the last page to recompute, and at its KV hit's last page
   boundary when that is past what it restored. A shared prefix is then served from the third request
-  that shares it. A step longer than the largest captured bucket checkpoints less often, so that
-  its checkpoints fit the captured steps' buffer, and keeps its boundaries on that interval.
+  that shares it. Under GDN, a step longer than the largest captured bucket checkpoints less often,
+  so that its checkpoints fit the captured steps' buffer, and keeps its boundaries on that interval;
+  KDA's kernels store each snapshot themselves and keep every page, at the end of one of
+  their 64-token chunks, so loading refuses a KV ``page_size`` that isn't a multiple of 64.
 - A prompt the step budget cuts into chunks keeps each chunk's last boundary (a chunk with
   more of its prompt to come keeps its own end), so a resend restores past its first chunk,
   and a later chunk's snapshot makes the earlier one the first to evict, as a reply's is.
   Checkpoints fall a page apart from where a chunk starts, so the pool declares a page as its
   ``chunk_alignment`` and the scheduler cuts its chunks whole pages long.
-- A decode step that ends a page keeps the state there, so a later turn that re-sends the
-  reply restores it. It replaces the request's previous decode snapshot once the KV chain
+- A decode step that ends a page keeps the state there, where the KV cache keys the decode walk,
+  so a later turn that re-sends the reply restores it. It replaces the request's previous decode snapshot once the KV chain
   keys its page; a step whose token never reaches the chain, such as the one speculated
   past the reply's end, leaves the previous one in place.
 - A snapshot is keyed by the KV chain's key at its page. A full set of slots evicts the
@@ -587,12 +589,15 @@ the pool's ``resources:`` key. Each snapshot slot costs as much as a request slo
   so the slots hold about one prompt each. A decode snapshot that a later prompt restores
   is kept like a prompt's from then on.
 
-Snapshots stay off without ``prefix_slots``, and also above one rank, without a named KV
-cache, when that cache isn't on every node of the pool, or when its ``prefix_cache`` is
-off or can't open at the pool's world size; in those cases the pool allocates no snapshot
-slots. Neither does a pool whose cache the engine keeps shut for another reason, such as a
-model that names no checkpoint and sets no salt. Every cache on the node of a pool without
-snapshots stays shut, and the engine logs which pool kept it shut.
+Snapshots stay off without ``prefix_slots``, and also without a named KV cache, when that
+cache isn't on every node of the pool, or when its ``prefix_cache`` is off or can't open at
+the pool's world size (above one rank, only with ``prefix_cache_tp``); in those cases the
+pool allocates no snapshot slots. Neither does a pool whose cache the engine keeps shut for
+another reason, such as a model that names no checkpoint and sets no salt. Every cache on
+the node of a pool without snapshots stays shut, and the engine logs which pool kept it shut.
+Above one rank rank 0 leases a request's snapshot as it sends the step, as it does the KV
+pages, and the other ranks restore the same slot. A prompt cut into chunks is leased as rank 0
+measures it, so every chunk starts past the hit, and only its first chunk carries the lease.
 ``opening_prefix_caches`` in ``mstar/engine/resources/kv/config.py`` is that rule over the
 specs. The engine evaluates it once, before it builds any resource, and opens exactly the
 caches it returns of those it holds; the conductor's routing and the API server's prompt
@@ -880,6 +885,13 @@ The spec types are:
        ``kv_lora_rank`` and ``qk_rope_head_dim``, and sets ``num_kv_heads`` to 1 and
        ``head_dim`` to their sum. Every rank holds the whole latent; only
        ``num_qo_heads`` shards, and MLA attention needs it set to the model's query heads.
+       ``aux_planes`` names per-token state of its own width on the same pages
+       (``AuxPlanes(num_layers, width)``, DSA's index keys for one): it shares the page
+       table, is copied and freed with the pages, and is read and written through
+       ``KVManager.aux_view`` and ``write_aux``. CPU offload, a cross-instance KV
+       retrieve and a pool that keeps a window (below) refuse aux planes for now. An eager
+       forward that runs a long step's tokens in windows writes each window at its own
+       slots inside ``KVManager.token_window(start, end)``.
        A pool keeps only a window of the layers a windowed attention over it runs
        (``AttentionConfig.sliding_window``, below); its ``page_size``, ``max_num_pages``
        and ``cpu_offload_pages`` then work as described there.
@@ -979,18 +991,27 @@ The spec types are:
        (replicas included) or hand out
        ``write_slots`` yet either; each of these is refused.
    * - ``DSASpec(config=DSAConfig(kv_cache=..., topk=...))``
-     - DeepSeek sparse attention (DSA) over the named ``KVLayout.MLA`` cache. A step
-       declares ``DSAStep()``, and the resource takes each request's rows from the KV plan.
-       The model's indexer layers store their index keys (``store_keys``) and pick each
-       query's top ``topk`` positions by the indexer's score (``select``); a layer that
-       reuses an earlier layer's pick reads it with ``shared_selection``. ``attend`` runs
-       absorbed MLA over just the picked latents. The keys sit in per-request buffers
-       outside the paged pool and the selection runs per request on the host, so the
-       resource is eager only, a prompt must fit in ``topk`` and past ``topk`` a request
-       decodes one row per step. Once one row of a batch passes ``topk``, every row of it
-       attends its pick. GLM-5.2 declares it under ``dsa_long_context``. Planned: the keys
-       move onto the MLA cache's pages under its page table, so the allocator, eviction and
-       prefix caching cover them, and selection gets fixed-shape buffers so decode captures.
+     - DeepSeek sparse attention (DSA) over the named ``KVLayout.MLA`` cache: past ``topk``
+       keys, each query row attends only the ``topk`` tokens its indexer scores highest.
+       The index keys sit on the cache's pages, in the aux planes ``INDEX_PLANES`` the
+       model declares on its ``PagedKVConfig``, so they share its page table; a row is
+       ``index_head_dim`` wide, three times that with ``kpool`` above 1 (checked at build).
+       A step declares ``DSAStep()``: ``plan`` builds its rows from the KV plan, into
+       buffers of the capture slot under a lease (the graph reads them, every plan refills
+       them), and the layers write their keys, select and attend through the resource
+       (``write_index``, ``select``, ``attend``), on device and under CUDA graphs. A pass
+       over some of a step's rows narrows the plan (``rows``, ``pick``) and writes at their
+       own slots inside ``KVManager.token_window`` or ``token_rows``; ``dense`` leaves a
+       pass to dense attention.
+       ``kpool`` above 1 scores one pooled key per ``kpool`` tokens (GLM-5.3);
+       ``dense_below_topk`` attends densely while no row sees more than ``topk`` keys
+       (GLM-5.2); ``sm_scale`` is the absorbed MLA's softmax scale, which every sparse
+       attention runs at. The build refuses a cache it cannot use: a page size that is not
+       a power-of-two multiple of ``kpool``, and on CUDA a cache that is not bf16 or a
+       FlashInfer before 0.6.18. A deployment sizes the resource under ``resources:``:
+       ``workspace_mb`` (the floor of each FlashInfer workspace), ``prefill_score_bytes``
+       (an eager prefill's scores per launch) and ``shard_min_rows`` (the rows per rank
+       from which a prefill's selection splits across TP ranks).
    * - ``CrossAttentionSpec(config=CrossAttentionConfig(...))``
      - Attention over a paged context that is written once and never extended.
        ``backend`` defaults to ``AttnBackend.AUTO``. Only FlashInfer is implemented.
@@ -1112,11 +1133,11 @@ The spec types are:
        (``LinearAttnStep(speculative=True)``), and ``KDACallable.set_prefix_len``
        settles each one's accepted drafts. The layers are shared:
        ``ParallelGatedDeltaNet`` and ``ParallelKimiDeltaAttention``
-       (``mstar/model/components/distributed/``, over ``KDAConfig``). A KDA layer tells
-       the resource its gates as it binds: with Kimi K3's full-rank output gate
-       (``full_rank_output_gate``) the resource runs the torch reference. Where the fused
-       kernels run, activations other than bf16 or a forget-gate bound below -5 are a
-       ValueError at load. The torch reference's prefill can't be captured
+       (``mstar/model/components/distributed/``, over ``KDAConfig``). The fused kernels
+       take either output gate: GLM-5.3's low-rank one or Kimi K3's full-rank one
+       (``full_rank_output_gate``), whose pre-activation the layer's input projection
+       already computes. Where the fused kernels run, activations other than bf16 or a
+       forget-gate bound below -5 are a ValueError at load. The torch reference's prefill can't be captured
        (``KDAManager.prefill_capturable`` is False), so the resource refuses a prefill
        bucket on it and the model leaves those buckets out.
    * - ``LoraSpec`` (built by ``module_lora_spec``)
@@ -1186,7 +1207,7 @@ The rows below name specs where a declaration doesn't reach them yet.
    * - Decoder of an encoder-decoder model
      - The three or four specs above, plus a second ``KVSpec`` for the encoder context
        and a ``CrossAttentionSpec`` over that second cache.
-   * - An LLM with DeepSeek sparse attention (GLM-5.2)
+   * - An LLM with DeepSeek sparse attention (GLM-5.2, GLM-5.3)
      - The specs above over an MLA cache (``KVLayout.MLA``, ``AttnBackend.FLASHINFER_MLA``),
        plus a ``DSASpec`` over the same cache.
    * - A node that carries per-request state between steps of a loop (an RNN-T
@@ -2128,6 +2149,11 @@ and ends at the prompt's length. To opt a walk in:
   - ``reserve_whole_prefill`` (default on): a row's first chunk reserves the state its
     whole prefill needs, so a part-done row cannot wedge on a full pool. Turn it off for
     a walk whose state grows by something other than the tokens a step runs.
+  - ``chunk_align`` (default 1): a row cut mid-way runs a multiple of this many tokens, so
+    its next chunk starts on one. A row starts at 0 or past a cached prefix, a whole
+    number of KV pages, so an alignment that divides the page keeps every chunk on it.
+    Kimi K3.1 declares 64: a chunk starting off a 64-key boundary has its MLA rows split
+    into single-query rows, which no captured prefill holds, and keeps no KDA snapshot.
 
   A resource that keeps state only on a grid counted from a chunk's start declares
   ``Resource.chunk_alignment``, and a cut chunk of the node's rows is then a multiple of
@@ -3126,6 +3152,13 @@ that a misspelled setting is never silently ignored:
    * - ``SeqShardSpec``
      - ``min_tokens``, ``exchange`` (``auto`` / ``none`` / ``ulysses`` / ``all_gather`` /
        ``ring``; see **Sequence and context parallelism** below)
+   * - ``DSASpec``
+     - ``workspace_mb`` (MiB each FlashInfer workspace of its sparse plans starts at; one per
+       walk and capture slot, one for eager steps), ``prefill_score_bytes`` (bytes of fp32
+       scores an eager prefill's selection holds per launch), ``shard_min_rows`` (the rows
+       per rank from which a prefill's selection splits across TP ranks); each a positive
+       integer. The defaults (128 MiB, 256 MiB, 64) are what
+       ``configs/glm5_next_tp8_longctx.yaml`` serves with.
    * - ``LoraSpec``
      - ``max_slots`` (adapters resident on the device at once, beside the zero adapter),
        ``max_rank`` (the largest rank served; slots are sized to it), ``cpu_capacity``
@@ -3462,6 +3495,45 @@ its context partial before the gather.
    A top-level ``kv_cache:`` block is no longer read. It raises an error at load time,
    with a message describing the migration. Move the block under ``resources:``, keyed by
    the resource name.
+
+Quantization per deployment
+~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A ``quantization:`` block picks a weight format per layer, for every model that declares its weights roots
+(``Model.get_quantization_roots``: the root class its loader fills, which linears may go low precision and
+which stay bf16 as a ``QuantizableLinears``, and its ``CheckpointRules``). Without the block a declared model
+serves its checkpoint as stored, so a block-fp8 checkpoint (``quant_method: fp8``) loads into fp8 layers.
+
+.. code-block:: yaml
+
+   quantization:
+     format: fp8_block            # auto (default) | bf16 | fp8_tensor | fp8_channel | fp8_block | mxfp8 | nvfp4
+                                  # | mxfp4 | w4a16
+     layers:                      # ordered, first match wins
+       - {match: "model.layers.0-3.**", format: bf16}
+       - {match: "model.layers.*.mlp.*", format: fp8_channel}
+     keep_bf16: [lm_head]
+     nodes:                       # per node; its rules go before the top level's
+       vision_encoder: {format: bf16}
+
+Patterns are module paths under the root (each dotted segment an ``fnmatch`` pattern or an index range, ``**``
+for any number of segments, or ``re:<regex>``). The checkpoint's format per linear is read from its safetensors
+headers, so the compressed-tensors, modelopt, AWQ, GPTQ and DeepSeek-style layouts are all recognised; one with
+no loader yet, a rule that matches nothing, a rule on a layer the model keeps bf16, or a stored format served as
+another quantized one is refused at startup with every problem listed. A default format that doesn't fit one
+layer's width keeps that layer bf16 and logs why. Tensor-parallel linears and MoE experts take a format in place,
+each rank quantizing or loading its own shard. ``python -m mstar.quantization.convert`` writes a bf16
+checkpoint's chosen linears as block fp8; ``benchmark/quantization/qa_gate.py`` and ``bench_linears.py`` are the
+quality gate and the GEMM sweep for a format.
+
+4-bit checkpoints load as stored, in compressed-tensors' layout: ``pack-quantized`` int4 (symmetric or with zero
+points, any group), AutoAWQ and GPTQ (repacked to it as they stream in; a GPTQ act-order checkpoint is refused),
+``mxfp4-pack-quantized`` (Kimi K3's routed experts) and modelopt NVFP4 (``nvidia/*-NVFP4``; its GEMM needs
+compute capability 10.0, so ``auto`` refuses it elsewhere and ``format: bf16`` dequantizes it instead). ``w4a16``
+and ``mxfp4`` run a Triton GEMM that dequantizes each weight tile to bf16 in registers (Ampere and later; both can
+also quantize a bf16 checkpoint at load); MoE routed experts take every 4-bit format, through a Triton grouped GEMM
+on H100/H200 and FlashInfer's TRT-LLM FP4 MoE (MXFP4, NVFP4) on B200/B300. ``bench_experts.py`` times the experts'
+formats against the bf16 fused MoE.
 
 Routing across data-parallel replicas
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

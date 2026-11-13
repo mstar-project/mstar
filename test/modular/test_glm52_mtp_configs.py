@@ -95,7 +95,7 @@ def test_the_draft_chain_and_the_seed_carry_the_post_norm_stream():
     ns._mtp_read_seed = lambda slots: (seed_h, torch.tensor([3, 5]))
     ns._draft_tokens = lambda h_head, prev: h_head.sum(-1).abs().long() % vocab
     ns._hidden = lambda ids, pos, *dsa: torch.randn(ids.shape[0], hidden)
-    ns._dsa_use = lambda *dsa: nullcontext()
+    ns._dsa_dense = nullcontext
     ns.lm_head = lambda h: torch.randn(h.shape[0], vocab)
     ns._broadcast = lambda t: t
     ns._stage_verdict = lambda *a: None

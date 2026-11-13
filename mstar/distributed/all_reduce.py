@@ -213,12 +213,14 @@ class MultimemAllReduce(SymmMemAllReduce):
 class FlashInferAllReduce(AllReduce):
     """FlashInfer's one-kernel all-reduce for 2-D bf16 messages that fit its
     workspace, NCCL for the rest. The workspace is sized in bytes, so one serves
-    any hidden size."""
+    any hidden size. Compiled code takes the same path as eager: the size check
+    runs inside the op (``allreduce_flashinfer``), where Dynamo does not trace it,
+    rather than sending every compiled all-reduce to NCCL."""
 
     mode = "flashinfer"
 
     def __init__(self, group: "CommGroup", max_bytes: int):
-        from mstar.distributed.ar_fusion import create_workspace
+        from mstar.distributed.ar_fusion import _FALLBACK_GROUPS, create_workspace
 
         self.world_size = group.world_size
         self.ws_id = create_workspace(
@@ -226,17 +228,20 @@ class FlashInferAllReduce(AllReduce):
         )
         if self.ws_id is None:
             raise RuntimeError("no FlashInfer all-reduce workspace")
+        _FALLBACK_GROUPS[self.ws_id] = group.device_group
 
     def all_reduce(self, input_: torch.Tensor, pg: "dist.ProcessGroup") -> torch.Tensor:
-        from mstar.distributed.ar_fusion import _WORKSPACES, allreduce_oneshot
+        from mstar.distributed.ar_fusion import _WORKSPACES, allreduce_flashinfer, allreduce_oneshot
 
         if (
-            not torch.compiler.is_compiling()
-            and input_.dim() == 2 and input_.dtype == torch.bfloat16
+            input_.dim() == 2 and input_.dtype == torch.bfloat16
             and input_.is_cuda and input_.is_contiguous()
-            and _WORKSPACES[self.ws_id].is_buffer_size_sufficient(self.world_size, *input_.shape, input_.dtype)
         ):
-            return allreduce_oneshot(input_, self.ws_id)
+            if torch.compiler.is_compiling():
+                # the workspace's size check is no traceable code: the op makes it per call
+                return allreduce_flashinfer(input_, self.ws_id, self.world_size)
+            if _WORKSPACES[self.ws_id].is_buffer_size_sufficient(self.world_size, *input_.shape, input_.dtype):
+                return allreduce_oneshot(input_, self.ws_id)
         return super().all_reduce(input_, pg)
 
 

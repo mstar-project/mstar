@@ -141,6 +141,7 @@ def _applying_chunking(build):
 
 if TYPE_CHECKING:
     from mstar.model.components.moe_parallel import MoeParallelConfig
+    from mstar.quantization.resolve import QuantizationRoot
 
 if TYPE_CHECKING:
     from mstar.engine.state import Array, Sampler, SampleSettings, SeqShard
@@ -818,6 +819,13 @@ class Model(ABC):
         ``max_num_pages`` on a paged array and ``max_slots`` on a Value with tensor fields. A deployment's
         ``resources:`` block overrides each pool size."""
         return {}
+
+    def get_quantization_roots(self) -> list["QuantizationRoot"]:
+        """The weights roots whose linears (and MoE experts) a ``quantization:`` block may set, one per node
+        that has one (``mstar.quantization.resolve.QuantizationRoot``). The engine resolves each root's plan
+        against the deployment's block and the checkpoint, and carries it out around the node's own weight
+        loader. Default: none, so the block can't name this model's nodes and its checkpoints load as today."""
+        return []
 
     def checkpoint_path(self) -> str | None:
         """Where this model's weights and config sit on disk.

@@ -77,6 +77,9 @@ class _Engine(_RoomEngine):
     def chunk_alignment(self, node_name):
         return 1
 
+    def chunk_align(self, node_name, graph_walk):
+        return 1
+
     def walk_token_caps(self, node_name, graph_walk):
         return None
 

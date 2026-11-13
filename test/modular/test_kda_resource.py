@@ -50,7 +50,7 @@ class _Recorder:
         self.runs: list[tuple] = []
         self.verifies: list[tuple] = []
 
-    def layout(self, spans, num_tokens, fixed):
+    def layout(self, spans, num_tokens, fixed, snapshots=None):
         self.layouts.append((spans, num_tokens, fixed))
         return [num_tokens, *spans]
 
@@ -141,8 +141,8 @@ def test_refuses_a_pool_it_cannot_run(kwargs, match):
 def test_default_kernels(monkeypatch):
     """The resource picks the fused kernels where they run the pool and the layers it binds,
     and the torch reference (no captured prefill) off CUDA, on ROCm (the fused kernels inline
-    PTX), at a head dim they aren't validated for, and for a layer with a full-rank output gate.
-    A spec that leaves the config's default backend builds."""
+    PTX) and at a head dim they aren't validated for. A spec that leaves the config's default
+    backend builds."""
     _, kda = build(backend=LinearAttnBackend.FLASHINFER)
     assert isinstance(kda, KDAManager) and isinstance(kda.kernels, TorchKDAKernels)
     assert not kda.prefill_capturable
@@ -156,12 +156,9 @@ def test_default_kernels(monkeypatch):
 
     monkeypatch.setattr(kda_mod.kda_triton, "_HAS_TRITON", True)
     kda = built_on_cuda(dim=128)
-    kda.bind_layer(lower_bound=-5.0, full_rank_output_gate=False)
+    kda.bind_layer(lower_bound=-5.0)
     assert isinstance(kda.kernels, TritonKDAKernels) and kda.prefill_capturable
     assert isinstance(built_on_cuda(dim=16).kernels, TorchKDAKernels)
-    kda = built_on_cuda(dim=128)
-    kda.bind_layer(lower_bound=-5.0, full_rank_output_gate=True)
-    assert isinstance(kda.kernels, TorchKDAKernels)
     monkeypatch.setattr(kda_mod.current_platform, "is_rocm", lambda: True)
     assert isinstance(built_on_cuda(dim=128).kernels, TorchKDAKernels)
     # the torch reference takes any activation dtype and bound
@@ -185,10 +182,7 @@ def test_what_the_fused_kernels_cant_run_is_refused_at_load(monkeypatch):
         device=torch.device("cuda"), dependencies={POOL: pool_spec},
     ))
     with pytest.raises(ValueError, match="bound -6.0 is below the fused kernels' -5"):
-        kda.bind_layer(lower_bound=-6.0, full_rank_output_gate=False)
-    # a full-rank gate runs the torch reference, which takes any bound
-    kda.bind_layer(lower_bound=-6.0, full_rank_output_gate=True)
-    assert isinstance(kda.kernels, TorchKDAKernels)
+        kda.bind_layer(lower_bound=-6.0)
 
 
 def test_eager_plans():
@@ -524,6 +518,13 @@ def test_triton_bundle_reads_one_projection_row():
         _merged_row(qkv, g, beta.clone(), gate, params)
     with pytest.raises(ValueError, match="column slice"):
         _merged_row(qkv, gate, beta, g, params)
+    with pytest.raises(ValueError, match="output gate"):
+        _merged_row(qkv, g, beta, None, params)
+    # without g_b the gate is the full-rank [P] pre-activation, which a low-rank slice isn't
     params.g_b = None
-    with pytest.raises(ValueError, match="up-projections"):
+    with pytest.raises(ValueError, match="full-rank pre-activation"):
         _merged_row(qkv, g, beta, gate, params)
+    full = torch.zeros(4, 4 * h * d + h + d + 6)
+    qkv, beta = full[:, :p3], full[:, p3:p3 + h]
+    g, gate = full[:, p3 + h:p3 + h + d], full[:, p3 + h + d:p3 + h + d + h * d]
+    assert _merged_row(qkv, g, beta, gate, params) is qkv

@@ -15,6 +15,7 @@ from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
     AttnBackend,
+    AuxPlanes,
     DSAConfig,
     DSASpec,
     KVLayout,
@@ -26,6 +27,7 @@ from mstar.engine.resources import (
     SamplerSpec,
     SamplingReqConfig,
 )
+from mstar.engine.resources.dsa.config import INDEX_PLANES
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, WalkStep
@@ -34,6 +36,7 @@ from mstar.model.components.request_kwargs import (
     generation_config_dir,
     sampling_defaults,
 )
+from mstar.model.glm52.components.indexer import full_indexer_layers
 from mstar.model.glm52.config import (
     ATTN_RESOURCE,
     DSA_RESOURCE,
@@ -49,6 +52,7 @@ from mstar.model.utils import (
     ByteLevelTextOutput,
     capture_ladder,
     load_snapshot_tokenizer,
+    long_context_kwargs,
     read_fp8_block_quant_config,
     resolve_checkpoint,
 )
@@ -70,7 +74,6 @@ QUANT_METHODS = ("fp8",)
 
 # what zai-org/GLM-5.2's generation_config.json declares, for a checkpoint whose file is not at hand
 DEFAULT_SAMPLING = MappingProxyType({"temperature": 1.0, "top_p": 0.95})
-
 
 class Glm52Model(ByteLevelTextOutput, Model):
     """GLM-5.2: 753B MoE causal LM (MLA + DSA), text in / text out."""
@@ -102,9 +105,9 @@ class Glm52Model(ByteLevelTextOutput, Model):
         if "num_hidden_layers" in kwargs:
             # serve the first N layers of a deeper checkpoint
             self.config.num_hidden_layers = int(kwargs["num_hidden_layers"])
-        if kwargs.get("dsa_long_context", False):
-            # Opt-in DSA engine path (configs/glm52_tp8_longctx.yaml). The
-            # sparse gather reads the paged latent cache, so the naive
+        if long_context_kwargs(kwargs):
+            # Opt-in DSA engine path (configs/glm52_tp8_longctx.yaml). Sparse
+            # attention reads the paged latent cache, so the naive
             # (mla_absorb=False) backend cannot host it.
             if not self.config.mla_absorb:
                 raise ValueError(
@@ -112,6 +115,9 @@ class Glm52Model(ByteLevelTextOutput, Model):
                     "gathers selected latents from the paged MLA cache"
                 )
             self.config.dsa_long_context = True
+            if "prefill_window_tokens" in kwargs:
+                self.config.prefill_window_tokens = int(kwargs["prefill_window_tokens"])
+            self.config.dsa_shard_prefill = bool(kwargs.get("dsa_shard_prefill", False))
             # Guard + KV sizing move from index_topk to the serving window.
             self.config.max_seq_len = int(kwargs.get("max_seq_len", 8192))
         retired = sorted(k for k in _RETIRED_KWARGS if k in kwargs)
@@ -147,13 +153,6 @@ class Glm52Model(ByteLevelTextOutput, Model):
             generation_config_dir(self.model_path_hf, cache_dir), DEFAULT_SAMPLING)
 
     def _check_mtp(self, kwargs: dict) -> None:
-        if self.config.dsa_long_context:
-            # the draft loop stays in the short-context regime; k-store sync
-            # and rewind for the sparse path are not written
-            raise ValueError(
-                "mtp_num_draft_tokens and dsa_long_context are mutually "
-                "exclusive: MTP drafting is short-context only"
-            )
         if self._config_variant in ("reduced", "reduced_fp8"):
             from mstar.model.glm52.components.indexer import is_full_indexer_layer
 
@@ -205,9 +204,8 @@ class Glm52Model(ByteLevelTextOutput, Model):
         # the layer-78 draft module keeps its KV in one extra layer plane at
         # index num_hidden_layers, on the trunk's page table (draft-tail rows
         # are overwritten as the verified stream advances into them).
-        num_kv_layers = self.config.num_hidden_layers + (
-            1 if self.config.mtp_num_draft_tokens > 0 else 0
-        )
+        mtp_planes = 1 if self.config.mtp_num_draft_tokens > 0 else 0
+        num_kv_layers = self.config.num_hidden_layers + mtp_planes
         nodes = {"LLM"}
         if self.config.mla_absorb:
             kv = PagedKVConfig(
@@ -219,6 +217,12 @@ class Glm52Model(ByteLevelTextOutput, Model):
                 layout=KVLayout.MLA,
                 kv_lora_rank=self.config.kv_lora_rank,
                 qk_rope_head_dim=self.config.qk_rope_head_dim,
+                # dsa_long_context: the indexer's keys on the latents' pages, an index_head_dim
+                # row per token for each FULL layer (and the MTP layer)
+                aux_planes={INDEX_PLANES: AuxPlanes(
+                    num_layers=len(full_indexer_layers(self.config)) + mtp_planes,
+                    width=self.config.index_head_dim,
+                )} if self.config.dsa_long_context else {},
             )
             attn = AttentionSpec(
                 resource_key=ATTN_RESOURCE, nodes=nodes,
@@ -262,7 +266,10 @@ class Glm52Model(ByteLevelTextOutput, Model):
             # past index_topk each query attends its indexer's top index_topk latents
             specs.append(DSASpec(
                 resource_key=DSA_RESOURCE, nodes=nodes,
-                config=DSAConfig(kv_cache=KV_RESOURCE, topk=self.config.index_topk),
+                config=DSAConfig(
+                    kv_cache=KV_RESOURCE, topk=self.config.index_topk,
+                    sm_scale=self.config.softmax_scale, dense_below_topk=True,
+                    index_head_dim=self.config.index_head_dim),
             ))
         return specs
 
@@ -463,6 +470,25 @@ class Glm52Model(ByteLevelTextOutput, Model):
     # Model ABC: submodule loading
     # -------------------------------------------------------------------
 
+    def get_quantization_roots(self):
+        from mstar.model.glm52.quantization import glm52_quantization_root
+
+        return [glm52_quantization_root(self.config, checkpoint_dir=self._local_checkpoint)]
+
+    def _local_checkpoint(self) -> str | None:
+        """The checkpoint directory when its files are here already (never a download)."""
+        path = getattr(self, "model_path_hf", None)
+        if not path:
+            return None
+        if Path(path).is_dir():
+            return str(path)
+        try:
+            from huggingface_hub import snapshot_download
+
+            return snapshot_download(repo_id=path, cache_dir=self.cache_dir, local_files_only=True)
+        except Exception:  # noqa: BLE001 - not cached here: the boot check skips the checkpoint's headers
+            return None
+
     def get_submodule(
         self, node_name: str, device: str = "cpu", tp_group=None,
         autocast_dtype: torch.dtype | None = None,
@@ -557,8 +583,7 @@ class Glm52Model(ByteLevelTextOutput, Model):
         if quant is not None:
             self.config.quantization_config = quant
             logger.info(
-                "Glm52Model: fp8 %s checkpoint (block %s) — non-expert linears "
-                "fp8=%s, routed experts fp8-resident=%s, kernels=%s.",
-                quant.fmt, quant.weight_block_size, self.config.dense_fp8,
-                self.config.moe_fp8_resident, self.config.kernels,
+                "Glm52Model: fp8 %s checkpoint (block %s); routed experts fp8-resident=%s, "
+                "kernels=%s; the quantization plan places the rest.",
+                quant.fmt, quant.weight_block_size, self.config.moe_fp8_resident, self.config.kernels,
             )

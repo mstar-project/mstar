@@ -82,13 +82,15 @@ class Glm52ModelConfig:
     mtp_num_draft_tokens: int = 0
     # Engine half of DSA (opt-in; configs/glm52_tp8_longctx.yaml). Off: the
     # submodule guard holds every context to index_topk, where dense MLA IS
-    # the exact DSA computation. On: the guard checks max_seq_len instead,
-    # FULL layers hand their index keys and queries to the DSA resource
-    # (mstar/engine/resources/dsa), which picks each query's top index_topk,
-    # and decode beyond index_topk attends just those latents. Decode-only
-    # beyond topk (prefill prompts must still fit index_topk) and eager-only
-    # (the resource selects per request on the host).
+    # the exact DSA computation. On: the guard checks max_seq_len instead, and
+    # every row past index_topk, prefill rows included, attends its indexer's
+    # top index_topk latents (the DSA resource, mstar/engine/resources/dsa).
     dsa_long_context: bool = False
+    # dsa_long_context: a prefill step longer than this runs the trunk in row chunks
+    # of it, which bound its activations
+    prefill_window_tokens: int = 8192
+    # under TP, each rank selects a block of a long prefill's rows, all-gathered after
+    dsa_shard_prefill: bool = False
 
     # --- MoE ---
     first_k_dense_replace: int = 3  # layers 0..2 are dense
@@ -127,8 +129,9 @@ class Glm52ModelConfig:
 
     # --- quantization / serving knobs ---
     # The official checkpoint is FP8 e4m3 with [128, 128] block scales
-    # (`weight_scale_inv`). Populated from config.json by Glm52Model. The routed experts
-    # and the non-expert linears it stores in fp8 stay fp8 (``dense_fp8``).
+    # (`weight_scale_inv`). Populated from config.json by Glm52Model; the read plan slices
+    # its experts per rank. Which linears stay fp8 is the node's quantization plan
+    # (glm52/quantization.py).
     quantization_config: Fp8BlockQuantConfig | None = None
     # Keep routed experts FP8-resident (uint8 container + block scales). Disabling this
     # dequantizes them to bf16 on load — fine for reduced tests, but bf16 routed experts
@@ -158,18 +161,6 @@ class Glm52ModelConfig:
     def tuned_kernels(self) -> bool:
         """``kernels: auto``, the tuned kernels rather than the reference."""
         return self.kernels == "auto"
-
-    @property
-    def dense_fp8(self) -> bool:
-        """Whether the non-expert linears the checkpoint stores in fp8 stay fp8 with their block
-        scales: exactly when it is block fp8. kv_b_proj still dequantizes, since the absorbed
-        MLA folds it into w_kc / w_vc."""
-        return self.quantization_config is not None
-
-    @property
-    def fp8_shared_expert(self) -> bool:
-        # the decode chain runs the shared expert faster from bf16 weights
-        return self.dense_fp8 and not self.tuned_kernels
 
     @property
     def qk_head_dim(self) -> int:
@@ -210,9 +201,9 @@ class Glm52ModelConfig:
         """The longest prompt served. Decode runs at least one step after the
         prefill and the next may already be scheduled when it stops, so the
         prompt leaves two steps' rows under the context limit (an MTP step
-        writes k + 1); a DSA prefill attends densely, within index_topk."""
+        writes k + 1). The paged DSA path selects past index_topk in prefill too."""
         limit = self.max_seq_len if self.dsa_long_context else self.index_topk
-        return min(limit - 2 * (self.mtp_num_draft_tokens + 1), self.index_topk)
+        return limit - 2 * (self.mtp_num_draft_tokens + 1)
 
     @classmethod
     def from_hf_config(cls, hf_config: dict) -> "Glm52ModelConfig":

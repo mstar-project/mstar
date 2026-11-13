@@ -210,7 +210,7 @@ def test_processing_releases_the_folded_sources_and_is_idempotent():
         assert lin.weight.numel() == 0
         assert isinstance(lin.weight, torch.nn.Parameter)
         assert lin.weight.dtype == src["q_a"].dtype
-    assert attn.q_a_proj.out_features == cfg.q_lora_rank  # split point still read
+    assert attn.q_lora_rank == cfg.q_lora_rank  # split point still read
     assert attn.absorbed_sources_released
     # the still-needed projections and the built buffers are intact
     assert attn.q_b_proj.weight.numel() > 0 and attn.o_proj.weight.numel() > 0

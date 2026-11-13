@@ -23,6 +23,7 @@ from mstar.engine.resources.linear_attn.kda_torch import (
     gated_rms_norm,
     recurrent_kda_step,
 )
+from mstar.utils import small_m_gemm
 
 
 @dataclass
@@ -327,14 +328,11 @@ class KimiDeltaAttention(nn.Module):
                 "(DeltaNetGeometry.to_blocks(conv_dtype=...))"
             )
         if kda is not None:
-            kda.bind_layer(
-                lower_bound=self.forget_gate.gate_lower_bound,
-                full_rank_output_gate=self.full_rank_output_gate,
-            )
+            kda.bind_layer(lower_bound=self.forget_gate.gate_lower_bound)
 
     def params(self) -> KDAParams:
-        """What the KDA resource's kernels read besides the activations. A full-rank output
-        gate leaves the gate and the norm to this layer (``g_b`` None)."""
+        """What the KDA resource's kernels read besides the activations. ``g_b`` None: the
+        output gate is full-rank, its pre-activation the gate ``forward`` passes."""
         if self._params is None:
             self._params = KDAParams(
                 conv_weight=self.conv1d.weight.view(self.conv_dim, -1),
@@ -361,18 +359,13 @@ class KimiDeltaAttention(nn.Module):
             )
         # One GEMM for q | k | v | beta | f_a | gate input; the kernels read the
         # columns of each row where this puts them.
-        proj = F.linear(hidden_states, self._in_proj_weight)
+        proj = small_m_gemm.linear(hidden_states, self._in_proj_weight)
         p, h, d = self.qkv_dim, self.num_heads, self.head_dim
         qkv, beta = proj[:, :3 * p], proj[:, 3 * p:3 * p + h]
         f_a = proj[:, 3 * p + h:3 * p + h + d]
-        if self.full_rank_output_gate:
-            gate = proj[:, 3 * p + h + d:3 * p + h + d + p]
-            out = self.mix(qkv, f_a, beta, self.params(), layer_idx=layer_idx)
-            t = hidden_states.shape[0]
-            out = self.o_norm(out.view(t, h, d), gate.view(t, h, d)).reshape(t, p)
-        else:
-            g_a = proj[:, 3 * p + h + d:3 * p + h + 2 * d]
-            out = self.mix(qkv, f_a, beta, self.params(), gate=g_a, layer_idx=layer_idx)
+        # the output gate: its full-rank pre-activation, or the low-rank g_a
+        gate = proj[:, 3 * p + h + d:3 * p + h + d + (p if self.full_rank_output_gate else d)]
+        out = self.mix(qkv, f_a, beta, self.params(), gate=gate, layer_idx=layer_idx)
         return self._project_out(out, hidden_states)
 
     def _project_out(self, out: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:

@@ -361,6 +361,8 @@ def _w8a16_tiles(M: int, N: int, K: int, glu: bool, block_size=(128, 128)) -> di
 
 
 def _w8a16(x, w, s, block_size, glu, cfg=None):
+    # the kernel loads the weight's bytes and bitcasts them (an e4m3 pointer can't take its masked loads' zero)
+    w = w.view(torch.uint8)
     M, K = x.shape
     N = w.shape[0] // 2 if glu else w.shape[0]
     bo, bi = block_size
