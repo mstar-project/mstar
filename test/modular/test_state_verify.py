@@ -182,7 +182,6 @@ def _host_value(**entry) -> Array:
      "PagedCrossStorage"),
     ([_array(span=2, positions=None, reads={"attn": Read(mask=FrameWindow(16, frames=2), op=ATTEND, packed=False)})],
      "RingStorage"),
-    ([_host_value(tensors={"x": TensorType((4,), dtype=torch.float32)})], "ValueStorage"),
     ([_host_value(tensors={"x": TensorType((4,), dtype=torch.float32)}, host={"n": int})], "ValueWithHostStorage"),
     ([_host_value(tensors={}, host={"n": int})], "HostValueStorage"),
 ])

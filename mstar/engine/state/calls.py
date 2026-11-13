@@ -57,6 +57,12 @@ class VerifyRun:
     def settle(self, kept: torch.Tensor) -> None:
         raise self.handle._refusal("settle, and the array declares no verify span")
 
+    def check_read(self) -> None:
+        """Refuse a read of the whole entry, where part of it lives elsewhere between verify steps."""
+
+    def check_update(self) -> None:
+        """Refuse an update after this step's settle."""
+
     def end(self, ctx) -> None:
         """Refuse a verify step whose calls didn't settle it, in an eager step or at capture."""
 
@@ -523,7 +529,10 @@ def rope(h: ArrayHandle, q: torch.Tensor, k: torch.Tensor) -> tuple[torch.Tensor
 @torch.compiler.disable
 def settle(h: ArrayHandle, kept: torch.Tensor) -> None:
     """End this verify step's block on ``h``'s array: row r keeps the first ``kept[r]`` entries its adds wrote this
-    step, and the rest are as if never added. ``kept`` is (rows,) int on the device, padding rows included."""
+    step, and the rest are as if never added. ``kept`` is (rows,) int on the device, padding rows included.
+
+    On a Value, the entry is as if the step's updates had run over each row's first ``kept[r]`` tokens. It comes after
+    the step's last update, and no read follows it."""
     h._check_open("settle")
     h.verify.settle(kept)
 

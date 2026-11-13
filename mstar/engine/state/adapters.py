@@ -702,6 +702,14 @@ class OpBinding:
         """The binding whose `block`, `stored` and `from_stored` lay out ``field``, one the op writes."""
         return self
 
+    def verify_blocks(self, array: Array) -> Mapping[str, RecurrentBlockConfig]:
+        """The pool blocks beyond ``array``'s fields that the op, a Value's update, keeps between verify steps."""
+        return EMPTY
+
+    def settle(self, run: Any, kept: torch.Tensor, label: str) -> None:
+        """Settle this verify step on ``run``, the update's: row r keeps what its first ``kept[r]`` tokens ran."""
+        raise ValueError(f"{type(self).__name__} keeps no verify blocks, so it settles no verify step")
+
     def apply(self, spec: NodeResourceSpec | None, settings: Mapping[str, Any]) -> None:
         """Set ``settings``, the op's `kernel_settings`, on ``spec``, its resource's."""
         for field, value in settings.items():
@@ -1192,6 +1200,55 @@ class RewindRun(VerifyRun):
                 self._kv.defer_correct_len(segment.request_id, segment.label, count)
                 if positions is not None:
                     positions.defer_correct_len(segment.request_id, segment.label, count)
+
+
+class UpdateSettle(OpBinding):
+    """Verify steps on a Value, which the update that keeps verify blocks settles in the graph."""
+
+    def check(self, array: Array, key: str, verify: Verify) -> None:
+        _settling_update(array)
+
+    def attach(self, handle: ArrayHandle, key: str, run: Any) -> None:
+        handle.verify = UpdateSettleRun(handle)
+
+
+class UpdateSettleRun(VerifyRun):
+    """The verify steps of a Value. Between them part of the entry lives in the settling update's verify blocks, so
+    the Value is never read whole."""
+
+    def __init__(self, handle: "ValueHandle"):
+        super().__init__(handle)
+        settling = _settling_update(handle.array)
+        self._binding, self._run = settling.binding, handle._runners[type(settling.declared)]
+        self._verifying = self._settled = False
+
+    def begin(self, declared: ArrayStep, segments: Sequence[Segment], ctx) -> None:
+        self._verifying, self._settled = declared.verify, False
+
+    def check_read(self) -> None:
+        raise self.handle._no_layout("a read of a Value that verifies, part of whose entry lives in its update's "
+                                     "verify blocks between verify steps")
+
+    def check_update(self) -> None:
+        if self._settled:
+            raise self.handle._refusal("an update after this verify step's settle")
+
+    def settle(self, kept: torch.Tensor) -> None:
+        h = self.handle
+        if not self._verifying:
+            raise h._refusal("settle on a step that doesn't verify")
+        if self._settled:
+            raise h._refusal("a second settle in one verify step")
+        updated = set(h.array.entry.tensors) - h._step_written
+        unrun = sorted({(field, layer) for field in updated for layer in h.array.layers} - h._updated)
+        if unrun:
+            raise h._refusal(f"settle before the updates of {unrun}, and it comes after the step's last update")
+        self._settled = True
+        self._binding.settle(self._run, kept, h.label)
+
+    def end(self, ctx) -> None:
+        if self._verifying and not self._settled:
+            raise self.handle._refusal("a verify step ends with no settle, and its update keeps every token it ran")
 
 
 class WithinStepAttend(OpBinding, ABC):
@@ -1877,13 +1934,15 @@ class ValueHandle(ArrayHandle):
             field: {layer: self._pool.block(field, i) for layer, i in self._pool_layer.items()}
             for field in array.entry.tensors
         }
-        self._runners = {
-            type(bound.declared): bound.binding.bind(array, resolved.resource_of[bound.key], resources)
-            for bound in bindings
-        }
+        # the updates' runs; the verify entry, under the array's own name, attaches the run of its verify steps
+        runs = {bound.key: bound.binding.bind(array, resolved.resource_of[bound.key], resources) for bound in bindings}
+        self._runners = {type(bound.declared): runs[bound.key] for bound in bindings if bound.key != array.name}
         self._layouts = _field_layouts(array, bindings)
         # `_step_written` holds the fields a kept step writes itself, and `_written` those each layer's write set.
         self._step_written = written_by_step(array)
+        for bound in bindings:
+            if bound.key == array.name:
+                bound.binding.attach(self, bound.key, runs[bound.key])
         self._written: dict[int, set[str]] = {}
         self._stepped = False
 
@@ -1927,6 +1986,7 @@ class ValueHandle(ArrayHandle):
         if q is not None or mask_args:
             given = sorted({*mask_args, *(("q",) if q is not None else ())})
             raise self._refusal(f"a Value's read takes no q and no keyword, and got {given}")
+        self.verify.check_read()
         self._record_read(layer)
         if layer in self._written or any(updated == layer for _, updated in self._updated):
             raise self._refusal(f"a read of layer {layer} after its write or update in this step")
@@ -1987,6 +2047,7 @@ class ValueHandle(ArrayHandle):
         runner = self._runners.get(kind)
         if runner is None:
             raise self._refusal(f"an update of type {kind.__name__}, which the array doesn't declare")
+        self.verify.check_update()
         views = tuple(self.block(field, layer) for field in kind.writes)
         for field in kind.writes:
             self._record_update(field, layer)
@@ -2681,11 +2742,14 @@ class ValueStorage(Storage):
                                         f"{[other.name for other in holders]}")
             kv_cache = holders[0].name
         layouts = _field_layouts(array, bound)
+        blocks = {field: layouts[field].block(tensor) for field, tensor in array.entry.tensors.items()}
+        for each in bound:
+            blocks.update(each.binding.verify_blocks(array))
         pool = RecurrentStateSpec(
             resource_key=array.name, nodes=array.nodes,
             config=RecurrentStateConfig(
                 num_layers=len(array.layers),
-                blocks={field: layouts[field].block(tensor) for field, tensor in array.entry.tensors.items()},
+                blocks=blocks,
                 kv_cache=kv_cache,
                 labels=tuple(sorted(array.labels)),
             ),
@@ -2820,6 +2884,7 @@ BINDINGS: dict[tuple[Storage, type[Op | Positions | Verify | None]], OpBinding] 
     (VALUE, GatedDeltaNet): GDN(),
     (VALUE, CausalConv): ConvOnLinearAttn(),
     (VALUE, KimiDelta): KDA(),
+    (VALUE, Verify): UpdateSettle(),
 }
 # What `backend: sdpa` binds in place of the default, for each storage and op type SDPA can run.
 SDPA: dict[tuple[Storage, type[Op]], OpBinding] = {(WITHIN_STEP, Attend): SdpaAttend()}
@@ -2886,6 +2951,20 @@ def _bindings(
     return tuple(bound)
 
 
+def _settling_update(array: Array) -> BoundOp:
+    """The update that settles the verify steps of ``array``, a Value: of its updates, the one whose binding keeps
+    verify blocks."""
+    storage = storage_of(array)
+    settling = [
+        BoundOp(key, op, BINDINGS[(storage, type(op))]) for key, op in array.updates.items()
+        if BINDINGS[(storage, type(op))].verify_blocks(array)
+    ]
+    if len(settling) != 1:
+        raise _no_layout(array, f"a Value verifies through one update that keeps verify blocks, and the array has "
+                                f"{[each.key for each in settling]}")
+    return settling[0]
+
+
 def _no_binding(storage: Storage, array: Array, where: str, *, update: bool) -> ValueError:
     """The refusal of ``where``, a read's op or an update ``storage`` has no binding for, naming the ops of that kind it
     binds: a read's op changes no field, and an update writes one."""
@@ -2910,5 +2989,8 @@ def _op_specs(array: Array, bound: Sequence[BoundOp]) -> list[NodeResourceSpec]:
 def _field_layouts(array: Array, bound: Sequence[BoundOp]) -> dict[str, OpBinding]:
     """Each of ``array``'s fields with the binding that lays it out in the pool: the update's that writes it, or the
     base binding's layout as declared."""
-    written = {field: each.binding.layout(field) for each in bound for field in each.declared.writes}
+    written = {
+        field: each.binding.layout(field) for each in bound if isinstance(each.declared, Op)
+        for field in each.declared.writes
+    }
     return {field: written.get(field, OpBinding()) for field in array.entry.tensors}

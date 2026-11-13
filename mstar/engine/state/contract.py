@@ -473,9 +473,12 @@ def read_layers(array: Array, read: Read) -> frozenset[int]:
     return read.layers or array.layers
 
 
-def Value(name, *, nodes, layers, entry, updates=EMPTY) -> Array:
+def Value(name, *, nodes, layers, entry, updates=EMPTY, verify_span=1) -> Array:
     """A rewritable array of one entry."""
-    return Array(name, nodes=nodes, layers=layers, entry=entry, updates=updates, max_len=1, rewritable=True)
+    return Array(
+        name, nodes=nodes, layers=layers, entry=entry, updates=updates, max_len=1, rewritable=True,
+        verify_span=verify_span,
+    )
 
 
 @dataclass(frozen=True)

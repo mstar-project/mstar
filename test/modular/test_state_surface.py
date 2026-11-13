@@ -224,6 +224,7 @@ SNAPSHOT = {
         ["layers", "KEYWORD_ONLY", None],
         ["entry", "KEYWORD_ONLY", None],
         ["updates", "KEYWORD_ONLY", '{}'],
+        ["verify_span", "KEYWORD_ONLY", '1'],
     ],
     "Window": [
         ["size", "POSITIONAL_OR_KEYWORD", None],
