@@ -24,6 +24,7 @@ from mstar.api_server.positronic import PositronicPolicy
 from mstar.conductor.conductor import Conductor
 from mstar.graph.base import GraphNode, Loop, Sequential
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
+from mstar.model.base import EpisodeView
 from mstar.model.praxis1 import praxis1_model
 from mstar.model.praxis1.config import Praxis1Config, Praxis1ConfigError
 from mstar.model.praxis1.praxis1_model import DENOISE_LOOP_NAME, Praxis1Model
@@ -226,6 +227,23 @@ def test_droid_session_config_is_sized_and_gated(tmp_path, monkeypatch):
     monkeypatch.setattr(praxis1_model, "_SERVABLE", False)
     with pytest.raises(ValueError, match="no ready Positronic session adapter"):
         PositronicPolicy.from_config(shipped["positronic"], model)
+
+
+def test_droid_session_config_keeps_idless_openpi_cold(tmp_path, monkeypatch):
+    shipped = yaml.safe_load((ROOT / "configs" / "praxis1_droid.yaml").read_text())
+    model = _model(
+        tmp_path, DROID_CONFIG, monkeypatch,
+        max_context_chunks=shipped["model_kwargs"]["max_context_chunks"],
+        max_text_tokens=shipped["model_kwargs"]["max_text_tokens"],
+    )
+    steps = model.walk_plan(
+        "", ["image", "text"], ["action"], {"image_inputs": [object()]},
+        {"action_format": "openpi", "text_tokens": 4, "blank_tokens": 1},
+        episode=EpisodeView(None, 0, {}),
+    )
+    assert steps[-1].walk == model.CHUNK_WALK
+    assert steps[-1].step_metadata["history_held"] == 0
+    assert steps[-1].step_metadata["history_append"] == 1
 
 
 def test_the_canvas_takes_the_views_to_latents():
