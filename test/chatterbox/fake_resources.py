@@ -308,7 +308,7 @@ class _FakeStreamPool:
     def block(self, field, layer):
         return torch.empty(1, *self.entry[field].shape, dtype=self.entry[field].dtype)
 
-    def gather(self, field, layer, *, label, start=None):
+    def gather(self, field, layer, *, label):
         fresh = torch.zeros(self.entry[field].shape, dtype=self.entry[field].dtype)
         return torch.stack([self.slots.get(rid, {}).get(field, fresh) for rid in self.rows])
 

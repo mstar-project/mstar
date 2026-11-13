@@ -25,6 +25,7 @@ from mstar.engine import state
 from mstar.engine.resources.attn.base import AttentionManager
 from mstar.engine.resources.recurrent.config import RecurrentStep
 from mstar.engine.resources.recurrent.pool import RecurrentStatePool
+from mstar.engine.resources.resident import build_planner
 from mstar.engine.resources.sampler import utils as sampler_utils
 from mstar.engine.resources.sampler.config import SamplerStep
 from mstar.engine.resources.sampler.resource import SamplerResource
@@ -1437,6 +1438,24 @@ def test_set_start_after_the_first_step_is_refused():
 def test_set_start_refuses_what_the_field_cant_hold(start, cause):
     h, _ = _plain_value()
     _refused(rf"Array 'state': {cause}", lambda: h.set_start(start))
+
+
+def test_a_pool_with_a_start_declines_resident_planning():
+    """A resident step reads each row's slot, which holds zeros until the row's first write, so a row with nothing
+    written would read zeros where it asked for its start."""
+    h, pool = _plain_value()
+    h.set_start({"x": torch.full((2, 3), 7.0)})
+    planner, why = build_planner("LLM", ("decode",), {"state": pool}, {}, torch.device("cpu"), 4)
+    assert planner is None and "start" in why, "the node would run resident steps that read zeros for the start"
+
+
+def test_a_second_handle_on_the_pool_can_not_change_its_start():
+    """A pool's rows all read one start, so a second handle can't change what the first one's rows read."""
+    h, pool = _plain_value()
+    h.set_start({"x": torch.full((2, 3), 7.0)})
+    other = build_handle(h.array, {"state": pool}, _resolve([h.array], StateSetup()))
+    other.set_start({"x": torch.full((2, 3), 7.0)})
+    _refused(r"a start that differs from the one it holds", lambda: other.set_start({"x": torch.full((2, 3), 8.0)}))
 
 
 def test_keep_false_on_a_plain_value_is_refused():

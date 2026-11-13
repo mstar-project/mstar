@@ -205,6 +205,9 @@ class _StubResource:
     def block(self, name, i):
         return torch.empty(0)
 
+    def set_start(self, start):
+        pass
+
     def run(self, q, k=None, v=None, label=None):
         return q
 
