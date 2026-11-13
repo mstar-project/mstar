@@ -463,6 +463,10 @@ def test_duplex_layers_run_standalone_with_no_handle():
         ssm_state_size=8, n_groups=2, time_step_rank=8, combined_embed_dim=32,
     )
     llm = NemotronHLLM(nano)
+    mixer = next(m for m in llm.modules() if isinstance(m, Mamba2Mixer))
+    # Mamba2Mixer leaves A_log, D and dt_bias as torch.empty for the checkpoint to fill.
+    for param in (mixer.A_log, mixer.D, mixer.dt_bias):
+        torch.nn.init.normal_(param)
     enc_config = FastConformerConfig(hidden_size=32, num_heads=4, num_layers=2, intermediate_size=64, num_mel_bins=16,
                                      subsampling_channels=8, causal=True, left_context=6)
     keyed = FastConformerEncoder(enc_config, kv_key=ENCODER_KV, conv_key=ENCODER_STATE)
@@ -477,7 +481,6 @@ def test_duplex_layers_run_standalone_with_no_handle():
     assert all(layer.state is None for layer in stateful)
 
     x = torch.randn(5, nano.hidden_size)
-    mixer = next(m for m in llm.modules() if isinstance(m, Mamba2Mixer))
     h = torch.randn(2, 7, enc_config.hidden_size)
     with torch.no_grad():
         torch.testing.assert_close(mixer(x), mixer.prefill(x)[0])
