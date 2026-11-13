@@ -713,8 +713,9 @@ def check_kv_pools_fit(model, config: dict, config_path: str, log: logging.Logge
     """Refuse a ``max_concurrent_requests`` the model's KV caches cannot hold.
 
     A request keeps its pages from prefill to its last token. Past a pool, a
-    prefill batch is refused and the worker offloads decoding requests to
-    admit it, which costs far more than queueing would. So the cap's requests
+    prefill batch is refused. With host pages (``cpu_offload_pages``) the worker
+    offloads decoding requests to admit it, which costs far more than queueing
+    would. Without them it retries until requests time out. So the cap's requests
     at full length must fit each cache next to its sink page; the conductor
     queues the rest. Warnings go to the model's ``log``.
     """
@@ -725,8 +726,9 @@ def check_kv_pools_fit(model, config: dict, config_path: str, log: logging.Logge
     if cap is None:
         log.warning(
             "%s sets no max_concurrent_requests: past the requests the KV caches "
-            "hold, the worker offloads decoding requests to admit new ones instead "
-            "of queueing them", config_path,
+            "hold, new ones aren't queued. A cache with cpu_offload_pages offloads "
+            "decoding requests to admit them, and one without stalls until requests "
+            "time out", config_path,
         )
         return
     if not isinstance(cap, int) or isinstance(cap, bool) or cap < 1:

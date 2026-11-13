@@ -656,6 +656,23 @@ def test_higgs_loopback_decode_prep_copies_no_pageable_index(monkeypatch):
     assert out["input_ids"].shape == (2,)
 
 
+def test_kokoro_chunk_prep_reads_no_tensor():
+    """A request's chunk lengths ride its step metadata, so selecting its chunk reads nothing on the host."""
+    from mstar.model.kokoro.config import CHUNK_LENGTHS, CHUNK_LOOP, PHONEME_IDS, REF_STYLE, SPEED
+    from mstar.model.kokoro.submodules import KokoroSynthSubmodule
+
+    sub = KokoroSynthSubmodule(torch.nn.Linear(1, 1), None)
+    inputs = {
+        PHONEME_IDS: [torch.zeros(2, 5, dtype=torch.long)], REF_STYLE: [torch.zeros(2, 16)], SPEED: [torch.ones(1)],
+    }
+    for k, length in enumerate((5, 3)):
+        with _HostReads() as prep:
+            row = sub.prepare_inputs("synth", _fwd(1, "synth", {CHUNK_LENGTHS: [5, 3]}, CHUNK_LOOP, k), inputs)
+        assert prep.reads == [], f"chunk {k}: host reads {prep.reads}"
+        assert row.input_seq_len == length and row.tensor_inputs["input_ids"].shape == (length,)
+    assert sub.prepare_inputs("synth", _fwd(1, "synth", {CHUNK_LENGTHS: [5, 3]}, CHUNK_LOOP, 2), inputs) is None
+
+
 def test_higgs_encoder_prep_reads_no_tensor():
     """The audio encoder's per-chunk embedding counts come from the clip's
     ``MEDIA_LAYOUT`` grid ``process_prompt`` filled, not off a lengths tensor."""

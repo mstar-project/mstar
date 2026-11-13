@@ -35,7 +35,7 @@ reflects depends on where it was measured:
   second, and the conductor adds them to its next status message, so worker families
   can be up to two seconds old. A lost or reordered message cannot corrupt a counter:
   every message carries totals, not increments, and the API server keeps the latest.
-- **Rust frontend.** With ``--rust-frontend``, ``mstar-server`` serves ``/metrics`` by
+- **Rust frontend.** ``mstar-server``, the default frontend, serves ``/metrics`` by
   asking the API server for the rendered text over the bridge, so both frontends show
   the same families. It answers ``503`` if the bridge does not reply within two
   seconds. ``mstar-server`` counts its own HTTP refusals and sends the totals with each
@@ -212,8 +212,8 @@ Exported by the API server, counted by whichever frontend serves the deployment.
    field or request), ``409`` (a ``request_id`` in flight), ``404`` (unknown route, or
    a model without the endpoint), ``405`` (wrong method), and ``503`` when the Rust
    frontend's ``MSTAR_MAX_CONCURRENT_REQUESTS`` cap turns a request away. WebSocket
-   handshakes are not counted. With ``--rust-frontend``, the values are the totals
-   ``mstar-server`` sent with the latest ``/metrics`` request.
+   handshakes are not counted. Unless ``--python-frontend`` is set, the values are the
+   totals ``mstar-server`` sent with the latest ``/metrics`` request.
 
 Conductor
 ---------
@@ -266,6 +266,12 @@ TP, SP or CFG instance count once: the instance's first rank reports.
    Gauge. Pages the prefix cache names. Running requests may also hold some of them;
    the cache frees the others when a request needs the room.
 
+``mstar_kv_pages_lent{model_name, component, resource}``
+   Gauge. Pages guaranteed requests lent that aren't free: what preemptible requests
+   borrowed, and a guaranteed request's own cache hits until its walk takes them over.
+   A guaranteed request takes a borrowed page back by moving a borrower when it needs
+   the page and none is free.
+
 ``mstar_rebuild_host_bytes_used{model_name, component}``
    Gauge. Bytes of the worker's rebuild host pool that hold kept prompt ids and host
    copies, which a request dropped from the KV cache is rebuilt from. A prompt the pool has no room for
@@ -299,9 +305,9 @@ TP, SP or CFG instance count once: the instance's first rank reports.
    cuts to 0 still counts.
 
 ``mstar_kv_preemptions_total{model_name, component}``
-   Counter. Requests chosen to move to the host or drop because a grant past a request's reservation ran short
-   of KV pages, on a single rank. Their pages go to the request that ran short, which counts too when it moves
-   itself to the host to wait.
+   Counter. Requests chosen to move to the host or drop because a request's grant ran short of KV pages, on a
+   single rank: past its reservation, or for a guaranteed request into pages it lent. Their pages go to the
+   request that ran short, which counts too when it moves itself to the host to wait.
 
 ``mstar_kv_drops_total{model_name, component}``
    Counter. Chosen requests whose KV was dropped. A request leaves before its drop when
@@ -319,7 +325,16 @@ TP, SP or CFG instance count once: the instance's first rank reports.
 
 ``mstar_kv_returns_preempted_total{model_name, component}``
    Counter. Requests preempted again before they sampled a token since they were last preempted. Only
-   requests that keep a rebuild log are counted.
+   requests that keep a rebuild log are counted. A request moved to the host again before its next step,
+   or that gave back an allotment it never wrote into, counts too, though neither move cost it a token.
+
+``mstar_kv_take_backs_total{model_name, component}``
+   Counter. Preempted requests that moved so a guaranteed request could take back pages
+   it lent. They count in ``mstar_kv_preemptions_total`` too.
+
+``mstar_kv_take_back_waits_total{model_name, component}``
+   Counter. Waits by guaranteed requests to take back pages they lent, since no request
+   holding them could move yet. Each wait holds up a stream that can't pause.
 
 ``mstar_component_pending_steps{model_name, component}``
    Gauge. Requests whose next step on the node is ready (its inputs arrived) and not
@@ -439,5 +454,5 @@ To scrape from an existing Prometheus, add a job for the server's address:
          - targets: ["localhost:8000"]
 
 The conductor and workers report once a second, so a scrape interval under a second
-only repeats values. Keep the scrape timeout above two seconds with
-``--rust-frontend``, which waits that long for the bridge before answering ``503``.
+only repeats values. Keep the scrape timeout above two seconds: ``mstar-server``
+waits that long for the bridge before answering ``503``.

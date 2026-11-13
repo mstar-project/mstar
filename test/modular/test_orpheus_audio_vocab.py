@@ -11,8 +11,10 @@ import pytest
 import torch
 from torch import nn
 
+from mstar.engine.state import Sampler
+from mstar.engine.state.calls import SamplerHandle
 from mstar.model.components.distributed import ColumnParallelLinear
-from mstar.model.orpheus.config import ATTN, SAMPLER, OrpheusModelConfig
+from mstar.model.orpheus.config import SAMPLER, OrpheusModelConfig
 from mstar.model.orpheus.submodules import OrpheusLLMSubmodule
 from mstar.model.submodule_base import HostRows
 
@@ -68,7 +70,9 @@ def _forward(rank: int = 0, tp_size: int = 1):
     lm = _FakeLM(rank, tp_size)
     sub = OrpheusLLMSubmodule(lm, _config())
     sampler = _GreedySampler()
-    engine_inputs = SimpleNamespace(resources={SAMPLER: sampler, ATTN: None}, request_ids=list("abcd"))
+    sub.sampler = SamplerHandle(Sampler(SAMPLER, nodes={"LLM"}, vocab_size=V), sampler)
+    sub.sampler.begin_step(SimpleNamespace(ctx=SimpleNamespace(padded_request_ids=list("abcd"))))
+    engine_inputs = SimpleNamespace(request_ids=list("abcd"))
     with torch.no_grad():
         out = sub.forward("decode", engine_inputs, input_ids=IDS)["new_token"]
         full = lm.full_head(lm.embed_tokens(IDS))

@@ -186,6 +186,17 @@ def librosa_mel_filters(
     return weights
 
 
+def reflect_pad_index(lengths: torch.Tensor, width: int, pad: int) -> torch.Tensor:
+    """Gather index ``[B, width + 2 * pad]`` that reflect-pads each row's first
+    ``lengths`` positions of a ``width``-wide buffer by ``pad`` on both sides,
+    as ``F.pad(mode="reflect")`` pads the unpadded row. Past a row's padding
+    it reads clamped positions, so it stays finite whatever fills them."""
+    position = torch.arange(-pad, width + pad, device=lengths.device).abs()
+    last = (lengths - 1).unsqueeze(1)
+    index = torch.where(position > last, 2 * last - position, position)
+    return index.clamp(0, width - 1)
+
+
 class MatchaLogMel(nn.Module):
     """The Matcha/CosyVoice log-mel, ``[B, T] -> [B, num_mels, F]``.
 
@@ -208,10 +219,17 @@ class MatchaLogMel(nn.Module):
         self.register_buffer("window", torch.hann_window(win_size), persistent=False)
         self.pad = (n_fft - hop_size) // 2
 
-    def forward(self, wav: torch.Tensor) -> torch.Tensor:
+    def forward(self, wav: torch.Tensor, lengths: torch.Tensor | None = None) -> torch.Tensor:
+        """``lengths`` ([B] samples): rows zero-padded to one width, each
+        reflect-padded about its own end rather than the batch's, so a row's
+        first ``num_frames(length)`` frames are its unpadded mel and the
+        frames past them are padding."""
         if wav.dim() == 1:
             wav = wav[None]
-        wav = F.pad(wav.unsqueeze(1), (self.pad, self.pad), mode="reflect").squeeze(1)
+        if lengths is None:
+            wav = F.pad(wav.unsqueeze(1), (self.pad, self.pad), mode="reflect").squeeze(1)
+        else:
+            wav = wav.gather(1, reflect_pad_index(lengths, wav.shape[-1], self.pad))
         spec = torch.stft(
             wav, self.n_fft, hop_length=self.hop_size, win_length=self.win_size, window=self.window,
             center=False, pad_mode="reflect", normalized=False, onesided=True, return_complex=True,

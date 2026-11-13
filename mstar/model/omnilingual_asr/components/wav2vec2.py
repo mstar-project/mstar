@@ -36,6 +36,8 @@ the positional convolution, and attention keys past a row's length are masked.
 
 from __future__ import annotations
 
+import functools
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -225,8 +227,8 @@ class Encoder(nn.Module):
         self.layer_norm = nn.LayerNorm(cfg.model_dim, eps=cfg.layer_norm_eps)
 
     def forward(self, x: torch.Tensor, attn_mask: torch.Tensor | None, attn_fn=None) -> torch.Tensor:
-        for layer in self.layers:
-            x = layer(x, attn_mask, attn_fn)
+        for i, layer in enumerate(self.layers):
+            x = layer(x, attn_mask, None if attn_fn is None else functools.partial(attn_fn, i))
         return self.layer_norm(x)
 
 
@@ -266,8 +268,8 @@ class Wav2Vec2CTC(nn.Module):
 
     def encode_packed(self, x: torch.Tensor, attn_fn) -> torch.Tensor:
         """``(T, model_dim)``, every row's valid frames end to end -> ``(T, vocab)``
-        logits. ``attn_fn(q, k, v)`` attends within each row's span (a varlen
-        kernel): no padding reaches the encoder."""
+        logits. ``attn_fn(layer, q, k, v)`` attends within each row's span (a
+        varlen kernel): no padding reaches the encoder."""
         return self.final_proj(self.encoder(x, None, attn_fn))
 
     def frame_lengths(self, seq_lens: list[int]) -> list[int]:

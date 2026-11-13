@@ -549,11 +549,14 @@ def main(argv: list[str] | None = None) -> None:
                 step_metadata=prompt,
             ), {"audio_inputs": [clip.data]},
         )
+        engine_inputs = ModelInputsFromEngine(request_ids=["clone"], per_request_info={})
         with torch.no_grad():
             encoded = ref_encoder.forward(
-                "talker_prefill_clone", ModelInputsFromEngine(request_ids=["clone"], per_request_info={}),
-                **ref_encoder.preprocess("talker_prefill_clone", None, [prepared]),
+                "talker_prefill_clone", engine_inputs,
+                **ref_encoder.preprocess("talker_prefill_clone", engine_inputs, [prepared]),
             )
+        # postprocess cuts the codes to the clip's frames, as it does after an engine step
+        ref_encoder.postprocess("clone", None, encoded, prepared)
         _, item = clone
         their_xvec = item.ref_spk_embedding.to(args.device).float()
         our_xvec = encoded["speaker_embed"][0].float()

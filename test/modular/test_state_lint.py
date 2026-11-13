@@ -27,6 +27,8 @@ import pytest
 PORTED = (
     "mstar/model/qwen3_5", "mstar/model/command_a_plus", "mstar/model/wan22", "mstar/model/flux2_klein",
     "mstar/model/z_image", "mstar/model/ltx2_5", "mstar/model/qwen3_omni", "mstar/model/minimax_h3",
+    "mstar/model/kokoro", "mstar/model/omnilingual_asr", "mstar/model/omnivoice", "mstar/model/orpheus",
+    "mstar/model/voxcpm2",
 )
 # The list only shrinks: a package leaves it when its port lands, and nothing is added to it.
 UNPORTED = (
@@ -41,7 +43,7 @@ UNPORTED = (
 # shared code under mstar/model/ that holds no model
 SHARED = ("mstar/model/components", "mstar/model/loader")
 FORBIDDEN_ATTRIBUTES = {
-    "node_resources", "resources", "request_state", "per_request_states", "sequence_shard",
+    "node_resources", "resources", "request_state", "request_states", "per_request_states", "sequence_shard",
     # what a handle holds
     "resource", "positions", "reads", "first_read", "_kv", "_attn", "_pool", "_runners", "_views", "_blocks",
     "_bindings", "_layouts", "_update",
@@ -52,7 +54,8 @@ ALLOWED = {
     ("mstar.engine.accelerator_graph_config", name): _CAPTURE
     for name in (
         "AcceleratorGraphConfig", "BatchedAcceleratorGraphConfig", "DETERMINISTIC_COMPILE_MODE",
-        "PackedAcceleratorGraphConfig", "PiecewiseCallInputs", "geometric_batch_sizes",
+        "PackedAcceleratorGraphConfig", "PiecewiseAcceleratorGraphConfig", "PiecewiseBatchedConfig",
+        "PiecewiseCallInputs", "PiecewiseCaptureShape", "PiecewisePackedConfig", "geometric_batch_sizes",
     )
 } | {
     ("mstar.engine.engine", "ExecutingBatch"): "the annotation of `NodeSubmodule.can_batch`, a base class's hook",
@@ -257,6 +260,7 @@ def test_every_exception_is_still_used():
     ("def f(e): return e.resources['kv']", ".resources"),
     ("def f(self): return self.node_resources['kv']", ".node_resources"),
     ("def f(self, rid): return self.request_state(rid)", ".request_state"),
+    ("def f(self): return self.request_states", ".request_states"),
     ("def f(e): return e.per_request_states", ".per_request_states"),
     ("def f(self): return self.sampler.resource", ".resource"),
     ("def f(self): return self.kv.positions", ".positions"),
@@ -288,6 +292,10 @@ def test_the_lint_lets_a_named_function_keep_its_break_and_no_other():
     found, used = _violations(source, "mstar/model/qwen3_omni/components/code2wav.py")
     assert used == {("mstar/model/qwen3_omni/components/code2wav.py", "forward")}
     assert len(found) == 1 and "at line 3" in found[0]
+
+
+def test_the_lint_reads_the_five_speech_packages():
+    assert {path.parts[2] for path in _sources()} >= {"kokoro", "omnilingual_asr", "omnivoice", "orpheus", "voxcpm2"}
 
 
 def test_the_lint_reads_all_five_reference_packages():
