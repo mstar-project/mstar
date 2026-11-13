@@ -182,6 +182,8 @@ def test_base_reference_clip_becomes_xvector_frames_and_clone_prefill(loaded):
             "talker_prefill_clone", engine_inputs,
             **ref_encoder.preprocess("talker_prefill_clone", engine_inputs, [prepared]),
         )
+        # postprocess cuts the codes to the clip's frames, as it does after an engine step
+        ref_encoder.postprocess("clone", None, encoded, prepared)
     torch.cuda.synchronize()
     xvec, codes = encoded["speaker_embed"][0], encoded["ref_codes"][0]
     assert xvec.shape == (model.config.talker.hidden_size,) and torch.isfinite(xvec.float()).all()

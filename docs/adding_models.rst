@@ -4098,11 +4098,12 @@ T3 layout on both labels of a guided request with the decode loop at its limit.
 The decoder node's ``declare_step`` shows how a write-once context is expressed with spans.
 Canary's comes from ``EncoderDecoderNode`` (``mstar/model/components/encoder_decoder.py``),
 a ``SampledTokenDecoder`` that adds only the cross-attention part: the context, an array with a
-``Bidirectional()`` read and ``queries=``, and the encoder output on the prefill row, which its
-decoder adds to the context before its layers read it. Whisper's declares its own, since it
-adds the context eagerly and captures prefill. The context segments have a non-zero span in
-the prefill step that adds them, and a span of 0 in every later step. The prefill step's commit
-converts the reservation into resident pages that the later steps read.
+``Bidirectional()`` read and ``queries=``, and the encoder output on the prefill row, which
+``preprocess`` adds to the context (``ArrayStep(eager_add=True)``) so the prefill replays a
+graph sized by its prompt. Whisper's declares its own and adds its context the same way. The
+context segments have a non-zero span in the prefill step that adds them, and a span of 0 in
+every later step. The prefill step's commit converts the reservation into resident pages that the
+later steps read.
 
 The forward reads the step's ids with ``positions(self.kv)``, a prefill's last token per row
 with ``at_last_token``, and draws with ``sample``. A decode step takes its input tokens from

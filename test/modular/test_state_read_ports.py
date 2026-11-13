@@ -327,7 +327,7 @@ def test_canary_steps_equal_the_hand_written_ones(walk, span, clips):
         )
         for clip in clips
     ]
-    node = CanaryDecoderSubmodule(None, model.config)
+    node = CanaryDecoderSubmodule(None, model.config, max_context=model._max_encoder_frames())
     step = state_steps(node.declare_step(walk, ["a", "b"], inputs), _handles(model, "decoder"))
     context = tuple(
         Segment(request_id=rid, label=CONTEXT_LABEL, span=clip) for rid, clip in zip("ab", clips, strict=True)
@@ -336,7 +336,8 @@ def test_canary_steps_equal_the_hand_written_ones(walk, span, clips):
     _assert_steps_equal(step, SubmoduleStep(segments=_segments((span, span)), steps={
         KV_CACHE: KVStep(),
         ATTN: AttentionStep(causal=True),
-        CROSS_KV_CACHE: KVStep(segments=context),
+        # the prefill adds the context in `preprocess`, outside its captured graph
+        CROSS_KV_CACHE: KVStep(segments=context, eager_write=walk == "prefill"),
         CROSS_ATTN: AttentionStep(segments=context, causal=False),
         SAMPLER: SamplerStep(apply_penalty=True, prefill_tracked_tokens=prompts),
         ROPE: PositionStep(),
@@ -638,7 +639,7 @@ def _canary_node():
     log: list = []
     resources = {spec.resource_key: _Recording(spec.resource_key, log) for spec in node_resources(model)}
     handles = node_handles(model, "decoder", resources)
-    node = CanaryDecoderSubmodule(CanaryDecoderModel(config).eval(), config)
+    node = CanaryDecoderSubmodule(CanaryDecoderModel(config).eval(), config, max_context=13)
     for parameter in node.parameters():
         parameter.data.normal_(0, 0.02)
     node.bind_node_state(handles)
@@ -675,8 +676,9 @@ def test_canarys_prefill_adds_the_context_before_any_layer_reads_it():
     ]
     assert _canary_step(node, handles, "prefill", inputs).shape == (2,)
     assert log == [
-        ("positions", "main"),
+        # in `preprocess`, before the forward reads its positions
         ("write", CROSS_KV_CACHE, 0, CONTEXT_LABEL, 20), ("write", CROSS_KV_CACHE, 1, CONTEXT_LABEL, 20),
+        ("positions", "main"),
         *_canary_layers(),
         ("last_token", ATTN, "main"),
         ("sample", ("a", "b")),
