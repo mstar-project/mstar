@@ -629,8 +629,8 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         if "new_token" not in outputs:
             return set()
         # in-step truncation leaves a stop id only as the LAST element
-        last = int(outputs["new_token"][0].reshape(-1)[-1])
-        emitted = int(outputs["count"][0])
+        last = outputs["new_token"][0].reshape(-1).tolist()[-1]
+        emitted = outputs["count"][0].item()
         if emitted >= self._budget(request_info) or self._token_stops(request_id, last, request_info):
             return self._stop_names(request_info)
         return set()
