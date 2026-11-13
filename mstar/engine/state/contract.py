@@ -76,6 +76,19 @@ def KVEntry(*, heads: int, head_dim: int) -> Entry:
     return Entry({"k": t, "v": t})
 
 
+def LatentEntry(*, rank: int, rope_dim: int) -> Entry:
+    """One token's MLA latent: ``ckv`` of ``rank`` entries and, with ``rope_dim`` above 0, the decoupled RoPE key
+    ``kpe``. Every query head reads both, so neither is sharded."""
+    if not _is_positive(rank):
+        raise ValueError(f"LatentEntry.rank must be a positive int, got {rank!r}")
+    if not (type(rope_dim) is int and rope_dim >= 0):
+        raise ValueError(f"LatentEntry.rope_dim must be an int >= 0, got {rope_dim!r}")
+    tensors = {"ckv": TensorType((rank,), dtype=None)}
+    if rope_dim:
+        tensors["kpe"] = TensorType((rope_dim,), dtype=None)
+    return Entry(tensors)
+
+
 class Mask:
     """Which entries a read at log position q sees. An entry's index is its log position."""
 
@@ -216,6 +229,34 @@ class GatedDeltaNet(Op):
     def check(self, where: str, entry: Entry) -> None:
         if len(entry.tensors["state"].shape) != 3:
             raise ValueError(f"{where}: GatedDeltaNet needs entry field state of shape (h_v, d_k, d_v)")
+
+
+@dataclass(frozen=True)
+class LatentAttend(Op):
+    """Absorbed multi-head latent attention. Head h scores a reached entry by ``q[h] . ckv`` plus ``q_pe[h] . kpe``,
+    times ``scale``, and returns the softmax-weighted sum of ``ckv``, (tokens, q_heads, rank). It reads ``kpe`` where
+    the entry has it. The caller folds the key up-projection into ``q`` and applies the value up-projection to the
+    result."""
+
+    # the field every latent entry holds
+    reads = ("ckv",)
+    q_heads: int
+    _: KW_ONLY
+    scale: float    # the original query-key head dim's, which the absorbed width doesn't give
+
+    def check(self, where: str, entry: Entry) -> None:
+        if not _is_positive(self.q_heads):
+            raise ValueError(f"{where}.q_heads must be a positive int, got {self.q_heads!r}")
+        if not (isinstance(self.scale, float) and self.scale > 0):
+            raise ValueError(f"{where}.scale must be a positive float, got {self.scale!r}")
+        ckv, kpe = entry.tensors["ckv"], entry.tensors.get("kpe")
+        for name, tensor in (("ckv", ckv), ("kpe", kpe)):
+            if tensor is not None and (len(tensor.shape) != 1 or tensor.shard is not None):
+                raise ValueError(f"{where}: LatentAttend needs entry field {name} 1-D and unsharded, since every query "
+                                 f"head reads it, and it is {tensor.shape} with shard {tensor.shard}")
+        if kpe is not None and kpe.dtype != ckv.dtype:
+            raise ValueError(f"{where}: LatentAttend needs ckv and kpe of one dtype, and they are {ckv.dtype} and "
+                             f"{kpe.dtype}")
 
 
 @dataclass(frozen=True, kw_only=True)

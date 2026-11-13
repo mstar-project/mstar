@@ -84,6 +84,8 @@ from mstar.engine.state.contract import (
     FrameWindow,
     GatedDeltaNet,
     KVEntry,
+    LatentAttend,
+    LatentEntry,
     Layout,
     Mask,
     Op,
@@ -914,6 +916,60 @@ class ReachRead(PagedRead):
         raise _no_layout(self._array, "at_last_token on an array whose read has no op, which lays out no queries")
 
 
+class PagedLatentAttend(OpBinding):
+    """`LatentAttend` on a latent array: FlashInfer's MLA attention over the array's pool."""
+
+    def check(self, array: Array, key: str, read: Read) -> None:
+        if not isinstance(read.mask, Causal):
+            raise _no_layout(array, f"reads[{key!r}].mask must be Causal, the mask FlashInfer's MLA plan has")
+        if read.walks is not None:
+            raise _no_layout(array, f"reads[{key!r}].walks must be None, since FlashInfer's MLA plan has no walk")
+        if not read.packed:
+            raise _no_layout(array, f"reads[{key!r}] declares packed=False, and FlashInfer's MLA kernel takes packed "
+                                    "queries")
+
+    def specs(self, array: Array, key: str, read: Read) -> list[NodeResourceSpec]:
+        return [AttentionSpec(
+            resource_key=key, nodes=array.nodes,
+            config=AttentionConfig(kv_cache=array.name, backend=AttnBackend.FLASHINFER_MLA, sm_scale=read.op.scale),
+        )]
+
+    def steps(
+        self, array: Array, key: str, read: Read, declared: ArrayStep, segments, steps: dict[str, Any],
+    ) -> None:
+        steps[key] = AttentionStep(segments=segments, causal=read.mask.uses_query_position)
+
+    def bind(self, array: Array, key: str, resources: Mapping[str, Any]) -> "_LatentRead":
+        return _LatentRead(array, resources[key])
+
+    def attach(self, handle: ArrayHandle, key: str, run: Any) -> None:
+        handle.reads[key] = run
+
+
+class _LatentRead:
+    """What a latent array's read runs: the MLA resource's absorbed attention, which reads the pages alone and takes
+    the rope query in place of k and v."""
+
+    def __init__(self, array: Array, attn: Any):
+        self._array = array
+        self._attn = attn
+
+    @property
+    def requires_kv_write(self) -> bool:
+        return self._attn.requires_kv_write
+
+    def run(
+        self, q: torch.Tensor, *, label: str, kv_cache_layer: torch.Tensor, q_pe: torch.Tensor,
+        selected: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if selected is not None:
+            raise ValueError(f"Array {self._array.name!r}: selected, on a read whose mask picks no positions")
+        return self._attn.run(q, label=label, kv_cache_layer=kv_cache_layer, q_pe=q_pe)
+
+    def select_last_hidden(self, x: torch.Tensor, label: str = "main") -> torch.Tensor:
+        return self._attn.select_last_hidden(x, label=label)
+
+
 class PositionsBinding(OpBinding):
     """An array's `Positions`, which a position resource keeps per request under `position_key`, with the `Rope` its
     calls rotate by."""
@@ -1442,6 +1498,53 @@ class PagedCrossHandle(PagedArrayHandle):
         self._check_open("at_last_token")
         raise self._refusal(f"at_last_token lays x out by this array's segments, and its read's queries are laid out "
                             f"by {self.queries.array.name!r}; call it on that array")
+
+
+class LatentHandle(PagedArrayHandle):
+    """Adds and reads through the MLA pages of a latent array. An add joins ``ckv`` and ``kpe`` into one row and
+    writes it, and a read attends the pages with ``q`` and ``q_pe``, so the handle holds nothing between them."""
+
+    def __init__(
+        self, array: Array, resources: Mapping[str, Any], bindings: tuple[BoundOp, ...], resolved: "Resolved",
+    ):
+        super().__init__(array, resources, bindings, resolved)
+        self._rank, self._rope_dim = self.storage._latent(array)
+        self._fields = {"ckv", "kpe"} if self._rope_dim else {"ckv"}
+
+    def _check_labels(self, labels: set[str], segments) -> None:
+        raise self._no_layout(f"a step touches labels {sorted(labels)}, and an MLA plan holds one label")
+
+    def _needs_step_kv(self, attn: Any) -> bool:
+        """Never: the absorbed read attends the pages alone."""
+        return False
+
+    @torch.compiler.disable
+    def add(self, layer: int | torch.Tensor, *, keep: bool | None = None, **fields: torch.Tensor) -> None:
+        layer = self._layer_id(layer)
+        if fields.keys() != self._fields:
+            raise self._refusal(f"an add of fields {sorted(fields)}, and the latent entry holds {sorted(self._fields)}")
+        self._record_add(layer, keep)
+        row = torch.cat([fields["ckv"], fields["kpe"]], -1) if self._rope_dim else fields["ckv"]
+        self._kv.write_kv(row, None, layer_idx=self._pool_layer[layer], label=self.label)
+
+    @torch.compiler.disable
+    def read(self, layer: int | torch.Tensor, q: torch.Tensor | None = None, **mask_args: Any) -> torch.Tensor:
+        """Attend ``q``, (tokens, q_heads, rank), with ``q_pe``, (tokens, q_heads, rope_dim), which a latent with no
+        ``kpe`` takes none of. ``selected`` goes to the layer's read, whose mask says whether it takes one."""
+        layer = self._layer_id(layer)
+        if q is None:
+            raise self._no_layout("a read with no op")
+        unknown = sorted(mask_args.keys() - {"q_pe", "selected"})
+        if unknown:
+            raise self._no_layout(f"read arguments {unknown}, which neither LatentAttend nor a mask defines")
+        q_pe = mask_args.pop("q_pe", None)
+        if (q_pe is None) == bool(self._rope_dim):
+            raise self._refusal(f"a read with{'out' if q_pe is None else ''} q_pe, on a latent of rope_dim "
+                                f"{self._rope_dim}, which takes q_pe exactly when it holds kpe")
+        self._record_read(layer)
+        if q_pe is None:
+            q_pe = q.new_empty(*q.shape[:2], 0)
+        return self._attn[layer].run(q, label=self.label, kv_cache_layer=self._views[layer], q_pe=q_pe, **mask_args)
 
 
 class RingHandle(ArrayHandle):
@@ -2043,7 +2146,7 @@ class PagedStorage(Storage):
         return len(array.nodes) > 1
 
     def _pool(self, array: Array, walks: "Walks") -> KVSpec:
-        heads, head_dim = _kv_shape(array)
+        geometry = self._geometry(array)
         if not array.reads:
             raise _no_layout(array, "reads is empty, and PagedKVConfig needs num_qo_heads from an Attend read")
         joined = sorted(label for label in array.labels if "+" in label)
@@ -2057,10 +2160,18 @@ class PagedStorage(Storage):
         return KVSpec(
             resource_key=array.name, nodes=array.nodes,
             leader=_leader(array, walks) if self.takes_leader(array) else None,
-            config=PagedKVConfig(
-                num_layers=len(array.layers), num_qo_heads=q_heads.pop() if q_heads else None,
-                num_kv_heads=heads, head_dim=head_dim, max_seq_len=array.max_len,
-            ),
+            config=self._pool_config(array, geometry, q_heads.pop() if q_heads else None),
+        )
+
+    def _geometry(self, array: Array) -> tuple[int, int]:
+        """The two sizes the pool takes from ``array``'s entry, refused where the entry holds anything else."""
+        return _kv_shape(array)
+
+    def _pool_config(self, array: Array, geometry: tuple[int, int], q_heads: int | None) -> PagedKVConfig:
+        heads, head_dim = geometry
+        return PagedKVConfig(
+            num_layers=len(array.layers), num_qo_heads=q_heads, num_kv_heads=heads, head_dim=head_dim,
+            max_seq_len=array.max_len,
         )
 
     def _read_specs(self, array: Array, bound: Sequence[BoundOp]) -> tuple[list[NodeResourceSpec], dict[str, str]]:
@@ -2199,6 +2310,32 @@ class PagedCrossStorage(PagedStorage):
     ) -> None:
         handle.queries.segments(handle, step)
         super().steps(handle, declared, step, segments, steps)
+
+
+class LatentStorage(PagedStorage):
+    """An append-only array of MLA latents, in a pool of KV pages in FlashInfer's MLA layout, one row per token."""
+
+    handle_class = LatentHandle
+
+    @staticmethod
+    def _latent(array: Array) -> tuple[int, int]:
+        """``array``'s ``(rank, rope_dim)``, which its pool and its handle take."""
+        ckv, kpe = array.entry.tensors["ckv"], array.entry.tensors.get("kpe")
+        rank = ckv.shape[0] if len(ckv.shape) == 1 else 0
+        rope_dim = kpe.shape[0] if kpe is not None and len(kpe.shape) == 1 else 0
+        if not rank or array.entry != LatentEntry(rank=rank, rope_dim=rope_dim):
+            raise _no_layout(array, "entry must be a LatentEntry, all the MLA layout holds")
+        return rank, rope_dim
+
+    def _geometry(self, array: Array) -> tuple[int, int]:
+        return self._latent(array)
+
+    def _pool_config(self, array: Array, geometry: tuple[int, int], q_heads: int | None) -> PagedKVConfig:
+        rank, rope_dim = geometry
+        return PagedKVConfig(
+            num_layers=len(array.layers), num_qo_heads=q_heads, num_kv_heads=1, head_dim=rank + rope_dim,
+            max_seq_len=array.max_len, layout=KVLayout.MLA, kv_lora_rank=rank, qk_rope_head_dim=rope_dim,
+        )
 
 
 class RingStorage(Storage):
@@ -2373,6 +2510,7 @@ class WithinStepStorage(Storage):
 PAGED = PagedStorage()
 PAGED_BY_WALK = PagedByWalkStorage()
 PAGED_CROSS = PagedCrossStorage()
+LATENT = LatentStorage()
 RING = RingStorage()
 VALUE = ValueStorage()
 VALUE_WITH_HOST = ValueWithHostStorage()
@@ -2392,6 +2530,8 @@ def storage_of(array: Array) -> Storage:
         return WITHIN_STEP
     if array.reads and all(isinstance(read.mask, FrameWindow) for read in array.reads.values()):
         return RING
+    if "ckv" in array.entry.tensors:
+        return LATENT
     if any(read.queries is not None for read in array.reads.values()):
         return PAGED_CROSS
     return PAGED_BY_WALK if reads_differ_by_walk(array) else PAGED
@@ -2408,6 +2548,8 @@ BINDINGS: dict[tuple[Storage, type[Op | Positions | None]], OpBinding] = {
     (PAGED_BY_WALK, Positions): PositionsBinding(),
     (PAGED_CROSS, Attend): PagedCrossAttend(),
     (PAGED_CROSS, Positions): PositionsBinding(),
+    (LATENT, LatentAttend): PagedLatentAttend(),
+    (LATENT, Positions): PositionsBinding(),
     (RING, Attend): FlexAttend(),
     (RING, Positions): CounterPositions(),
     (WITHIN_STEP, Attend): RaggedAttend(),
