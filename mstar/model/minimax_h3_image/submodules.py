@@ -28,7 +28,7 @@ from mstar.model.components.diffusion.compile_utils import compile_blocks as com
 from mstar.model.components.diffusion.denoise_loop import StepScalar
 from mstar.model.components.diffusion.flow_match import FlowMatchSchedule
 from mstar.model.minimax_h3.components.layout import patchify_video
-from mstar.model.minimax_h3.components.transformer import H3Inputs, H3StepLayout
+from mstar.model.minimax_h3.components.transformer import H3Inputs, H3StepLayout, StepModulation
 from mstar.model.minimax_h3.components.video_vae import stitch_tiles
 from mstar.model.minimax_h3.config import PIXEL_MEAN, PIXEL_STD
 from mstar.model.minimax_h3.submodules import (
@@ -148,7 +148,11 @@ class H3ImageDenoiseSubmodule(H3PackedDenoise):
 
     The step's layout travels as inputs (``LAYOUT_FROM_INPUTS``), so the prompts of one row
     bucket share a captured graph (:meth:`graph_key`): ``capture_buckets`` lists text-to-image
-    graph keys. An edit's first step differs from the rest on the host, so edits run eager."""
+    graph keys. An edit's first step differs from the rest on the host, so edits run eager.
+
+    Every request walks the same grid, so each step's AdaLN rows (13B of the DiT's weights
+    read for one or two rows) are computed once a process, for text-to-image and for edits,
+    and a step reads its own by its head, which is its index on the grid."""
 
     LAYOUT_FROM_INPUTS = True
 
@@ -165,6 +169,23 @@ class H3ImageDenoiseSubmodule(H3PackedDenoise):
         edits = [key for _, key in self.capture_buckets if key.references]
         if edits:
             raise ValueError(f"MiniMax-H3-Image captures text-to-image steps only; got edit buckets {edits}")
+        # timesteps a step embeds (1: text-to-image; 2: an edit's, with the references') -> the grid's rows
+        self._modulation: dict[int, StepModulation] = {}
+
+    def step_modulation(self, timesteps: int, device) -> StepModulation:
+        """The grid's AdaLN rows for steps that embed ``timesteps`` timesteps, built on first use,
+        which for a captured step is :meth:`capture_request_inputs`, before the capture."""
+        modulation = self._modulation.get(timesteps)
+        if modulation is None:
+            if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+                # a capture records the GEMMs rather than running them: the rows would hold nothing
+                raise RuntimeError("MiniMax-H3-Image builds its AdaLN rows before a capture, not in it")
+            schedule = h3_image_schedule(self.config.sigmas)
+            grid = schedule.timesteps.view(-1, 1)
+            if timesteps == 2:
+                grid = torch.stack([schedule.timesteps, schedule.reference_timesteps], dim=-1)
+            modulation = self._modulation[timesteps] = self.transformer.step_modulation(grid.to(device))
+        return modulation
 
     def bucket_key_for(self, fwd_info: CurrentForwardPassInfo) -> H3ImageLayout:
         return layout_from_metadata(fwd_info.step_metadata)
@@ -209,6 +230,7 @@ class H3ImageDenoiseSubmodule(H3PackedDenoise):
 
     def capture_request_inputs(self, bucket_key: H3ImageLayout, device) -> dict[str, torch.Tensor]:
         cfg = self.config.transformer
+        self.step_modulation(1, device)  # the rows a captured step reads, outside its capture
         return {
             LATENTS: torch.zeros(bucket_key.num_condition_rows + bucket_key.num_video_rows, cfg.patch_dim,
                                  device=device),
@@ -235,7 +257,9 @@ class H3ImageDenoiseSubmodule(H3PackedDenoise):
         # text-to-image request, then the references' 0.999 for an edit
         timesteps = torch.stack([timestep, reference_timestep], dim=-1) if n else timestep.view(-1, 1)
         inputs = H3Inputs(video=latents, audio=None, text=text_embeds, timesteps=timesteps.float())
-        velocity, _ = self.transformer(inputs, layout, shard=self.shard, head=head.long())
+        head = head.long()
+        velocity, _ = self.transformer(inputs, layout, shard=self.shard, head=head,
+                                       modulation=self.step_modulation(timesteps.shape[-1], latents.device), step=head)
         generated = h3_image_step(latents[:, n:], velocity[:, n:], sigma, sigma_next)
         return torch.cat([latents[:, :n], generated], dim=1) if n else generated
 

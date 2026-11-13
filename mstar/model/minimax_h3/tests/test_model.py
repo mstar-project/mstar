@@ -750,6 +750,30 @@ def test_padding_rows_change_no_output():
             torch.testing.assert_close(a, b, rtol=1e-5, atol=1e-6)
 
 
+def test_a_step_on_its_grids_modulation_rows_equals_the_step_from_its_timesteps():
+    """A step handed its grid's AdaLN rows (``step_modulation``) returns what it returns from
+    its own timesteps, at every step of the grid: the rows are the step's own GEMMs, run once."""
+    dit, config, layout, inputs = _padding_case()
+    node = H3DenoiseSubmodule(dit, config, loop_name=DENOISE_LOOP, row_bucket=16)
+    step_layout = node.build_layout(layout, "cpu")
+    grid = torch.tensor([[1.0, 0.9, 0.999], [0.7, 0.6, 0.999], [0.2, 0.1, 0.999]])
+    with torch.no_grad():
+        modulation = dit.step_modulation(grid)
+    for k in range(grid.shape[0]):
+        at_k = inputs._replace(timesteps=grid[k:k + 1])
+        outputs = []
+        for kwargs in ({}, {"modulation": modulation, "step": torch.tensor([k])}):
+            step = _opened(node, layout, _on_sdpa(config))
+            with torch.no_grad():
+                # with the rows, the step's timesteps go unread
+                outputs.append(dit(at_k._replace(timesteps=torch.full_like(grid[:1], float("nan"))) if kwargs
+                                   else at_k, step_layout, **kwargs))
+            step.end_calls()
+        want, got = outputs
+        for a, b in zip(got, want, strict=True):
+            assert torch.equal(a, b)
+
+
 def test_padding_rows_stay_finite_and_never_reach_the_request():
     """Zeros in, the padding rows stay finite through every block; made NaN before the first
     block, they still leave every output as it was: attention keeps them in their own segment
