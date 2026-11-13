@@ -195,10 +195,13 @@ class TopKRouter(nn.Module):
 class NoAuxTcRouter(nn.Module):
     """DeepSeek-V3's ``noaux_tc`` router, groupless (``n_group=1``), as GLM-5.x routes.
 
-    Sigmoid scores in fp32; each token's top-k by score + ``e_score_correction_bias``; weights
+    Sigmoid scores in fp32 (``scoring_func`` "sqrtsoftplus": ``sqrt(softplus(logit))``, as
+    DeepSeek-V4.1 routes); each token's top-k by score + ``e_score_correction_bias``; weights
     are the unbiased scores of those experts, renormalized if ``norm_topk_prob``, times
     ``routed_scaling_factor``. Stateless (see the router contract above).
     """
+
+    SCORING = ("sigmoid", "sqrtsoftplus")
 
     def __init__(
         self,
@@ -207,8 +210,12 @@ class NoAuxTcRouter(nn.Module):
         num_experts_per_tok: int,
         routed_scaling_factor: float,
         norm_topk_prob: bool = True,
+        scoring_func: str = "sigmoid",
     ) -> None:
         super().__init__()
+        if scoring_func not in self.SCORING:
+            raise ValueError(f"scoring_func {scoring_func!r} is not one of {self.SCORING}")
+        self.scoring_func = scoring_func
         self.hidden_size = hidden_size
         self.n_routed_experts = n_routed_experts
         self.top_k = num_experts_per_tok
@@ -239,6 +246,9 @@ class NoAuxTcRouter(nn.Module):
         give the same weights bit for bit (a GEMM sums the logits in another order)."""
         self._weight_fp32 = self.weight.detach().float()
         self._route_op = self._topk_op = None
+        if topk_kernel and self.scoring_func != "sigmoid":
+            raise ValueError("fused_moe's router kernels score with sigmoid, not "
+                             f"{self.scoring_func!r}")
         if topk_kernel:
             from mstar.utils.fused_moe import decode  # registers the ops
 
@@ -270,7 +280,7 @@ class NoAuxTcRouter(nn.Module):
                 logits, self.e_score_correction_bias, self.top_k, self.routed_scaling_factor,
                 self.norm_topk_prob)
             return topk_weights, topk_ids, None
-        scores = logits.sigmoid()  # (T, E)
+        scores = logits.sigmoid() if self.scoring_func == "sigmoid" else F.softplus(logits).sqrt()  # (T, E)
 
         biased = scores + self.e_score_correction_bias.unsqueeze(0)
         topk_ids = torch.topk(biased, k=self.top_k, dim=-1, sorted=False)[1]
