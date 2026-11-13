@@ -73,7 +73,6 @@ An episode is named by the frontend, owned by the conductor, and held by the eng
 class Array:
     ...
     lifetime: Literal["request", "episode"] = "request"   # episode: kept across the episode's requests
-    retention: Literal["bounded", "sliding"] = "bounded"   # sliding: episode arrays only
 
 # what walk_plan and step_metadata see; built by the conductor, not by the model
 class EpisodeView(NamedTuple):
@@ -92,7 +91,7 @@ class ProcessPromptOutput(NamedTuple):
 ```yaml
 # serving config
 episodes:
-  max_episodes: 16        # slots per replica; every episode array is sized max_episodes x its max_len
+  max_episodes: 16        # episode identities per replica; capacity follows declarations and read bounds
   idle_timeout_s: 600     # an episode with no call for this long is ended
   max_calls: null         # the reference's max_chunks_per_episode; null is unbounded
   max_queued_calls: 1     # calls of one episode waiting behind the one in flight
@@ -171,7 +170,7 @@ Rejected:
 
 - **Implicit reset on a prompt change.** The reference changes the prompt without restarting the context, and the key rule covers the one array that depends on the prompt.
 - **Resetting silently at `max_calls`.** The robot would keep moving on a cold context; the reference stops the session.
-- **Keeping some arrays across a restart.** Clearing everything is one rule, and re-encoding a prompt costs one text-encoder pass. §11 asks whether a model needs more.
+- **Keeping some arrays across a restart.** Clearing everything is the initial rule, and re-encoding a prompt costs one text-encoder pass. A different scope needs a concrete model use case.
 
 ---
 
@@ -179,24 +178,20 @@ Rejected:
 
 **Proposal.** A model declares each retained thing as an `Array` with `lifetime="episode"`:
 
-- `max_len` is the maximum number of resident entries in one episode slot, not
-  the number of entries the whole episode may append. `retention="bounded"`
-  (the default) refuses an append past that capacity. `retention="sliding"`
-  discards the oldest entries before appending new ones. Sliding is valid only
-  for episode arrays; request arrays keep today's absolute-log-position rule.
+- `max_len` keeps its current meaning: the maximum logical log length. `max_len=0` remains scratch within a step. An executed-frame array needs a log whose logical positions keep advancing without a fixed end, but the declaration syntax for that is left to the world-models contract work. There is no separate retention field. The engine may free entries when declared reads can no longer reach them; request arrays keep their current bounded-log rule.
 - `nodes` say which node reads and writes it; the array lives on the workers that run that node, inside their engines, one slot per episode on every rank of the node's lockstep instance (replicated, or split where a `TensorType.shard` says).
-- A step appends with `handle.add` ([calls.py](../../mstar/engine/state/calls.py) line 194) and reads with `handle.read` (line 201). For a sliding episode array, storage tracks a monotonically increasing logical position and a bounded physical ring, returning retained entries in chronological order. An add larger than `max_len` is refused. An empty `reads` reads all *resident* entries; a `Window` read narrows visibility within them. `Window` by itself only specifies visibility ([contract.py](../../mstar/engine/state/contract.py) lines 88-92); it cannot recycle today's absolute log positions (`contract.py` lines 205-219).
+- A step appends with `handle.add` ([calls.py](../../mstar/engine/state/calls.py) line 194) and reads with `handle.read` (line 201). A `Read(mask=Window(size=69))` describes which executed frames a Praxis step can reach ([contract.py](../../mstar/engine/state/contract.py) lines 88-92 and 156-165). The engine would keep logical positions monotonic across calls, free entries once no future declared read can reach them, and return reached entries in chronological order. Finite windows alone do not prove finite retention if a later step can query an older position or another read has a wider or unbounded mask. The contract must validate all reads and position behavior before deriving a resident bound; otherwise it refuses an unbounded log. Today's `Array.max_len` validation and storage planning assume a bounded log (`contract.py` lines 205-219). The [RFC review](https://github.com/mstar-project/mstar/issues/1487#issuecomment-6846550286) says an unpublished world-models PR, stacked on #1387, derives ring retention from reads; E1 should reuse and verify that contract when it opens.
 - A no-op read returns `Reached`, each field's entries packed by row (`contract.py` lines 470-474).
 
 The conductor holds only the record (§3). The model object holds nothing: the calls count reaches a step as `step_metadata["episode_calls"]`, and everything else is in the arrays.
 
-For Praxis-1 (§9) that is two arrays: `text_embeds` on the backbone, entry `{"h": TensorType((2048,), dtype=bf16)}` with labels `cond` and `blank`, bounded by the model's maximum prompt length; and `executed` on the VAE encoder, entry `{"frame": TensorType((3, 256, 832), dtype=uint8), "pose": TensorType((8,), dtype=float32)}`, `max_len` 69 and `retention="sliding"`. At three context chunks the resident window grows to 69 frames, then each new 24-frame chunk replaces the oldest 24. The fourth such addition has 93 logical frames but still 69 resident frames. `EpisodeView.held["executed"]` is the resident count, not the lifetime append count.
+For Praxis-1 (§9) that is two arrays: `text_embeds` on the backbone, entry `{"h": TensorType((2048,), dtype=bf16)}` with labels `cond` and `blank`, bounded by the model's maximum prompt length; and `executed` on the VAE encoder, entry `{"frame": TensorType((3, 256, 832), dtype=uint8), "pose": TensorType((8,), dtype=float32)}`, with an unbounded logical log declaration and a 69-frame `Window` read. At three context chunks the reachable window grows to 69 frames, then each new 24-frame chunk makes the oldest 24 unreachable if query positions advance as proposed. The fourth addition reaches 93 logical frames but 69 are reachable through this read after it completes. Storage also needs room for any in-flight append and capture scratch; the world-models contract will determine that bound. `EpisodeView.held["executed"]` is the resident count, not the lifetime append count.
 
-**Does it fit `declare_state`?** The description fits: `Entry` takes any named tensors with a dtype and a shard, and `max_len`, `labels`, masks and the no-op `Read` say the rest. Five things are missing:
+**Does it fit `declare_state`?** `Entry` takes named tensors with a dtype and a shard, and `labels`, masks and no-op `Read` say how a step uses them. Five things are missing:
 
-1. **A lifetime and retention.** Arrays are per request today (`contract.py` line 213). `lifetime` and `retention` are the new declaration fields. Only episode arrays may slide; bounded arrays keep the current append limit.
-2. **A storage.** No storage holds an append-only array that is not K/V or serves a no-op read. `PagedStorage` takes only a `KVEntry` with an `Attend` read ([adapters.py](../../mstar/engine/state/adapters.py) lines 194-199 and 1256), `storage_of` sends every other append-only array with a nonzero `max_len` there (lines 1391-1397), and nothing outside `contract.py` returns `Reached`. This needs an `EpisodeStorage`: a dense buffer of `max_episodes x max_len` entries per layer, with a ring head and resident length for sliding arrays and a bounded length for others. It maps logical positions to physical offsets when planning reads and writes, stages addresses in `plan` with `force_double_buffer` (invariant 7), and returns resident rows in chronological order. Eager and captured steps address the same rows.
-3. **Binding a request to an episode.** The engine registers a request's state on `NEW_REQUEST` and purges it on removal (`engine.py` lines 3906 and 3937-3954). A named episode attaches the request to its slot on `NEW_REQUEST` (clearing it on a reset or key change), detaches on `REMOVE_REQUEST` without freeing the slot, and frees it on `END_EPISODE`. A request without an episode id borrows a slot from the same pool on `NEW_REQUEST` and frees it on `REMOVE_REQUEST`. It receives `EpisodeView(id=None, calls=0, held={...: 0}, cold=None)` and every such request starts cold. Both named and temporary slots count against admission (§6); neither can overwrite a slot held by a live call. The episode's slot is keyed by episode, while the temporary slot and the request-to-slot binding are keyed by request handle and included in `rid_table.py`'s purge rule.
+1. **A lifetime and unbounded logical log.** Arrays are per request and require integer `max_len` today (`contract.py` lines 205-219). `lifetime="episode"` changes who owns the rows and when they are released. An unbounded logical log also needs a declaration, whose spelling and validation should follow the world-models PR. Existing integer `max_len` keeps its append limit, including the scratch meaning of zero. There is no separate retention mode.
+2. **A dense storage, independent of lifetime.** No current storage holds an append-only non-K/V array with a no-op read. `PagedStorage` takes only a `KVEntry` with an `Attend` read ([adapters.py](../../mstar/engine/state/adapters.py) lines 194-199 and 1256), and `storage_of` sends every other append-only array with nonzero `max_len` there (lines 1391-1397). A dense storage can serve bounded request arrays as well as episode arrays. For a windowed log it needs a ring and a validated read-derived resident bound, with logical-to-physical mapping in `plan` and `force_double_buffer` for capture (invariant 7). Storage selection stays about entry and operation type, not lifetime; paged and ring K/V storages can use the same episode binding. The exact ring and binding interfaces depend on the unpublished world-models work.
+3. **Binding a request to an episode across storages.** The engine registers a request's state on `NEW_REQUEST` and purges it on removal (`engine.py` lines 3906 and 3937-3954). A named episode binds its request handle to the episode's rows on `NEW_REQUEST` (clearing them on a reset or key change), unbinds on `REMOVE_REQUEST` without freeing the rows, and frees them on `END_EPISODE`. A request without an episode id borrows a temporary slot and frees it on `REMOVE_REQUEST`. It receives `EpisodeView(id=None, calls=0, held={...: 0}, cold=None)` and every such request starts cold. The binding and its cleanup are common to dense, paged and ring storage. Both named and temporary slots count against admission (§6); neither can overwrite rows held by a live call. The temporary binding is keyed by request handle and included in `rid_table.py`'s purge rule.
 4. **What the plan sees.** `walk_plan` gets only this request's signals (`base.py` lines 999-1006). It gains an `episode: EpisodeView` keyword, passed only to a model that declares episode arrays, so no existing override changes. `held` comes from the workers' `WORKER_GRAPHS_DONE`, as persisted signals already do (`conductor.py` line 1977).
 5. **Keys.** `ProcessPromptOutput.episode_keys` (§4), since a retained value made from a prompt is only valid for that prompt.
 
@@ -204,7 +199,7 @@ Why this shape:
 
 - **Where the reader is.** The arrays sit on the node that reads them, so a warm call moves no retained bytes between GPUs. A persisted tensor stays with its producer and is read over the transport on each call.
 - **The engine owns the memory.** A slot pool sized at startup is something admission can count (§6); state a model allocated itself would turn a full pool into an OOM (invariant 1, heuristic 4).
-- **One call interface for per-request and per-episode state.** Both use `add` and `read`; rolling retention is an explicit second choice because a request array's absolute log positions cannot silently become a ring.
+- **One call interface for per-request and per-episode state.** Both use `add` and `read`; lifetime changes the owner of a row, while read masks determine which old entries remain reachable. The storage format follows the entry and operation, so an episode does not introduce a parallel K/V mechanism.
 
 Rejected:
 
@@ -219,22 +214,23 @@ Rejected:
 
 **Proposal.**
 
-- **Per slot.** A named episode and a temporary idless request have the same declared footprint: the sum over its episode arrays of `max_len` x entry bytes x layers, per rank. For Praxis-1 at three context chunks it is 69 x 0.61 MiB of frames plus a few MiB of text, about 44 MiB; at one chunk, about 15 MiB. A sliding array's logical append count can exceed `max_len`, but its resident count and physical allocation cannot. Per-deployment `max_len` goes in `resources:` as today (invariant 2).
-- **Per replica.** `episodes.max_episodes` slots, allocated at startup on each worker that holds an episode array. A worker whose slots don't fit refuses to start, naming the array and the size.
+- **Per slot.** A named episode and a temporary idless request need the same capacity. A bounded array contributes its declared `max_len`; an unbounded logical log contributes a resident bound derived from all reads, position rules, maximum in-flight append and capture scratch. If the bound cannot be proved, the declaration is refused before serving. Praxis-1's 69-frame window is about 42 MiB of frame entries, plus text and storage overhead; this is not the whole slot reservation. Per-deployment sizing still belongs under `resources:` (invariant 2).
+- **Per replica.** `episodes.max_episodes` episode identities have capacity reserved or budgeted at startup in each storage that holds an episode array. A worker whose declared capacity cannot fit refuses to start, naming the array and the size.
 - **Admission.** A call for a new episode, one whose slot was taken, or an idless call to a model with episode arrays needs a slot on the replica the router picks. It takes a free slot, or evicts the least recently used idle named episode there (no call in flight or queued). A temporary slot belongs to its live request and cannot be evicted. When every slot holds a busy episode or temporary request, the call waits in the conductor's queue, in arrival order, as a request over `max_concurrent_requests` waits today (`conductor.py` lines 1288-1305). A call of an episode that has its slot never waits for one.
 - **Eviction.** The conductor chooses, LRU by `last_end` over idle episodes on that replica, and sends `END_EPISODE` to the episode's workers before the new episode's `NEW_REQUEST`. An episode with a call in flight or queued is never evicted.
 - **Temporary slot release.** An idless request frees its slot on `REMOVE_REQUEST`; no `END_EPISODE`, record, idle timer or later warm call is involved.
 - **What the client sees.** The evicted episode's next call starts cold: `held` is empty, so `walk_plan` runs every producer again, and the call is otherwise correct. `EpisodeView.cold` gives the model the reason, and a metric counts evictions and cold starts by reason. A wire notice is an open question (§11).
 
-Relation to [admission_and_preemption.md](admission_and_preemption.md): an episode slot is a fixed-size slot like the recurrent state pool and the sampler's rows there (§3: a request waits at admission until a slot is free, and never runs short after), except that it outlives its requests, so its idle time is what eviction takes back. Slots are not KV pages, so KV preemption never touches them, and a KV victim keeps its episode. A node with a rebuild policy needs every resource to support a drop (that doc's §4 table); `EpisodeStorage` supports one by keeping its entries, as attention does.
+Relation to [admission_and_preemption.md](admission_and_preemption.md): an episode slot is an ownership key that outlives its requests. Admission must budget each underlying dense, paged or ring storage before a call runs (§3), and idle eviction returns that episode's allocations. It is not a second KV mechanism: KV pages retain their existing storage and preemption rules. A node with a rebuild policy needs every resource to support a drop (that doc's §4 table); each storage with episode rows must support that lifecycle.
 
-The two lifetimes share the same slot pool. Sliding retention replaces *entries*
-inside a slot; eviction releases an *idle episode's entire slot*:
+The two lifetimes share the same episode identity pool. A read mask can make old
+entries unreachable within an episode; eviction releases an idle episode's
+entire identity and its allocations:
 
 ```mermaid
 flowchart LR
     Free[Free slot] -->|named episode starts| Named[Named episode slot]
-    Named -->|append; slide oldest entries at capacity| Named
+    Named -->|append; release entries no read can reach| Named
     Named -->|idle eviction or close| Free
     Free -->|idless request starts| Temp[Temporary request slot]
     Temp -->|REMOVE_REQUEST| Free
@@ -244,13 +240,13 @@ flowchart LR
 
 Why this shape:
 
-- **Slots, not pages.** Each array's per-episode size is known at startup, so a slot per episode makes admission a count and eviction one message, with no fragmentation. The ring KV manager hands out fixed sessions the same way ([ring/manager.py](../../mstar/engine/resources/kv/ring/manager.py) lines 344-349).
+- **One identity across storages.** The conductor admits and evicts an episode as a unit, while each storage keeps its own layout. A finite resident bound is known from declarations before startup; the ring KV manager already hands out fixed sessions ([ring/manager.py](../../mstar/engine/resources/kv/ring/manager.py) lines 344-349).
 - **Idle first.** An idle episode costs a cold start when its robot comes back; a busy one would be corrupted mid-call.
 - **The conductor decides.** It is the only process that sees every episode's state on a replica, and its choice reaches every rank in the same order (invariant 11).
 
 Rejected:
 
-- **Sharing the KV pool.** It would let episodes and KV trade memory, but it ties this design to preemption's classes before either has been measured together. §9 of the admission doc already lists one pool per GPU as later work.
+- **One global pool across dense and KV storages.** It would let unrelated resources trade memory, but it ties this design to preemption's classes before those storages have been measured together. §9 of the admission doc lists one pool per GPU as later work; episode ownership can use each storage's existing capacity rules meanwhile.
 - **Refusing a new episode when full.** A busy server would turn away robots while idle ones held their slots.
 - **Moving idle episodes to the host.** Worth it if cold starts turn out expensive, and left for later (§11).
 
@@ -271,7 +267,7 @@ Rejected:
 | A worker holding it is lost | the conductor ends every episode placed there | `cold="lost"` on the next call, if the conductor outlives the worker |
 | Process restart | nothing to send | every episode is in memory and is gone; connection-scoped ids die with their sockets, so no client can name a stale one |
 
-Leaked episodes are bounded three ways: the slot count is a hard cap on retained memory, which was allocated at startup anyway; the idle timeout returns any slot a lost close left behind; and a record without a slot holds no tensors and lives only as long as its connection.
+Leaked episodes are bounded three ways: the slot count and per-storage admission budgets cap retained memory; the idle timeout returns any slot a lost close left behind; and a record without a slot holds no tensors and lives only as long as its connection.
 
 Why this shape:
 
@@ -321,8 +317,8 @@ The openpi `RobotIO.action_horizon` is 21 in this mode, so the existing fixed-si
 **Other users.** Candidates, not checked against their references:
 
 - Any robot policy that conditions on more history than one observation carries. pi0.5 conditions on the current observation only and is unaffected.
-- Interactive world models. Waypoint keeps a ring KV per request today (`ring/manager.py`); a session that spans requests could keep it as an episode array once K/V arrays can have an episode lifetime.
-- Multi-turn agent and chat sessions, which today rely on content-keyed prefix reuse. An episode-lifetime KV would keep a session's KV without re-matching it, but it needs the KV manager to hold episode slots and a class under the admission doc, so it is out of scope here (§11).
+- Interactive world models. Waypoint keeps a ring KV per request today (`ring/manager.py`); an episode-lifetime declaration should let the same storage keep a session's KV across requests. A concrete Waypoint session still needs its own integration check.
+- Multi-turn agent and chat sessions, which today rely on content-keyed prefix reuse. Episode-lifetime K/V should use the same ownership binding rather than a new KV storage. Their admission and model integration remain later work.
 - Full-duplex models already run a call as one long request (§0) and don't need this.
 
 ---
@@ -339,7 +335,7 @@ Staging, each step independently reviewable and testable. The cold-only openpi b
 
 | Step | Contents |
 |---|---|
-| E1 | `lifetime`, `retention`, `EpisodeStorage`, bind and detach in the engine, `END_EPISODE`; modular tests append 21 + 24 + 24 + 24 frames into a 69-frame sliding slot, check chronological reads and bounded memory across many calls, and check a temporary slot is freed on `REMOVE_REQUEST` |
+| E1 | Stack on the unpublished world-models PR once open and verify its read-derived ring contract; add `lifetime="episode"`, a generic request-handle-to-episode-row binding across storages, independent dense whole-read storage, and `END_EPISODE`. Modular tests append 21 + 24 + 24 + 24 frames through a 69-frame window, check chronological reads and bounded resident memory, reject unbounded or backward-reaching reads without a proven bound, and free a temporary slot on `REMOVE_REQUEST` |
 | E2 | The conductor's record, pinned placement, `EpisodeView` to `walk_plan`, per-episode queue, `max_calls`, keys; tests show a named episode resumes warm and separate idless requests start cold |
 | E3 | Shared-slot admission for named and temporary calls, eviction, idle timeout, cleanup on failure and worker loss, metrics; pressure tests cover a full pool and an in-flight temporary request |
 | E4 | Both Python and Rust frontends: the new Positronic `/api/v1/session` API, including connection id, reset, close and reply behavior; `test/rust` checks a stubbed Positronic cold/warm session across both frontends |
@@ -351,9 +347,7 @@ Staging, each step independently reviewable and testable. The cold-only openpi b
 
 1. **Client-supplied ids.** Should a client be able to name its episode, to survive a reconnect or to drive episodes over `/generate/ws`? If so, scoped to its API key, and is the idle timeout then the only cleanup?
 2. **The cold-start notice.** Should a Positronic reply report when a previously warm session was evicted or ended idle, so the client can tell why its next call is cold? If so, where in the wire reply?
-3. **Text embeddings across episodes.** Is a content-keyed encoder-output cache, as the reference's process-wide memo, worth building alongside, for many robots on one task?
+3. **Text embeddings across episodes.** A content-keyed encoder-output cache is separate from episode state. If built, should it include Chatterbox's voice LRU so both share one cache policy?
 4. **Idle episodes to host memory** instead of dropping them, once cold-start cost is measured?
-5. **Episode-lifetime K/V arrays** for agent sessions: a follow-up design under the admission doc, or out of scope for M*?
-6. **Per-connection settings.** The reference takes `max_chunks_per_episode` and sampler settings per session from the URL query. Should the Positronic route accept the same settings, or is the deployment config enough?
-7. **Restart scope.** Is clearing every array on a restart enough, or does some model need an array kept across `reset_context`?
-8. **Defaults.** `max_episodes` 16 and `idle_timeout_s` 600 are guesses until measured on a robot workload.
+5. **Per-connection settings.** The reference takes `max_chunks_per_episode` and sampler settings per session from the URL query. Should the Positronic route accept the same settings, or is the deployment config enough?
+6. **Defaults.** `max_episodes` 16 and `idle_timeout_s` 600 are guesses until measured on a robot workload.
