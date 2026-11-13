@@ -14,12 +14,21 @@ from types import SimpleNamespace
 sys.path.insert(0, ".")
 
 import pytest
+import torch
 from test_state_calls import HEADS, LAYERS, TOKENS, _array, _ctx, _refused, _StubAttn, _StubDense, _StubKV, _tensors
+from test_state_kept_reads import _CpuVarlenSdpa
 
+from mstar.communication.tensors import LocalTransferEngine
+from mstar.engine.resources.attn.base import EagerSlotKey
 from mstar.engine.resources.attn.config import AttentionSpec, AttnBackend
+from mstar.engine.resources.attn.dense import DenseAttentionManager
+from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PagedKVConfig, RetentionPolicy
+from mstar.engine.resources.kv.manager import KVManager
+from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.step import Segment, StepContext, SubmoduleStep
 from mstar.engine.state import Array, ArrayStep, Attend, Bidirectional, Block, Causal, Read
 from mstar.engine.state.adapters import build_specs, node_handles, state_setup, state_steps
+from mstar.model.base import LabelLayout
 
 EAGER = {"attn_gen": {"eager_backend": "dense"}}
 
@@ -134,3 +143,54 @@ def test_an_eager_kernel_runs_only_a_bidirectional_read():
         "Bidirectional to take eager_backend dense, since the dense kernel has no causal plan and no window"
     ]
     assert "attn_gen" not in setup.by_read, "a causal read would attend past its mask on the dense kernel"
+
+
+def _windowed_pool(page_size: int, sink: int, window: int) -> KVManager:
+    """A CPU pool of one layer of one head of one value, whose entries hold their log positions, with request ``a``
+    under an exact retention of ``sink`` and ``window``."""
+    cfg = PagedKVConfig(
+        num_layers=1, num_qo_heads=1, num_kv_heads=1, head_dim=1, max_seq_len=64 * page_size, max_num_pages=64,
+        page_size=page_size,
+    )
+    pool = KVManager(
+        cfg=cfg, name="kv", joint_comm_group=None,
+        transfer_engine_info=TransferEngineInfo("h", "h", LocalTransferEngine("h")), device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    layout = LabelLayout(growth=(("rollout", 1),), retention=RetentionPolicy(window, sink, exact=True))
+    request = KVReqConfig(needed_labels=["main"])
+    request.apply_conductor_config(kv_layout={"main": layout.row()}, loop_caps={"rollout": 10_000})
+    pool.ingest_request("a", overrides=request)
+    return pool
+
+
+@pytest.mark.parametrize("page_size", [16, 128])
+def test_the_dense_prefix_is_the_kept_reach(page_size):
+    """Against the dense reference: after each of 30 commits of uneven spans, a denoise step on the dense kernel
+    attends the first ``sink`` log positions and the last ``window`` the stream kept, while the pool releases pages
+    behind the sink. Gathering whole pages from the first would attend the released ones' successors in their place."""
+    sink, window = 2 * page_size + 5, 3 * page_size + 7
+    pool = _windowed_pool(page_size, sink, window)
+    dense = DenseAttentionManager(
+        kv_cache="kv", device=torch.device("cpu"), dtype=torch.float32, kv_config=pool.config,
+        wrapper_class=_CpuVarlenSdpa,
+    )
+    ctx = StepContext(request_ids=("a",), graph_walk="rollout", slot=0, capture=False)
+    start = 0
+    for commit in range(30):
+        span = 1 + (7 * commit) % (page_size // 2)
+        step = KVStep(segments=(Segment("a", "main", span),))
+        assert pool.admit(step, ctx).ok
+        pool.plan(step, ctx)
+        pool.write_kv(*([torch.arange(start, start + span, dtype=torch.float32)[:, None, None]] * 2), layer_idx=0,
+                      label="main")
+        pool.commit(step, ctx)
+        start += span
+        denoise = KVStep(segments=(Segment("a", "main", 4),), commit=False)
+        assert pool.admit(denoise, ctx).ok
+        plan = dense._build_plan(pool.plan(denoise, ctx)["main"], False, EagerSlotKey(label="main", slot=0))
+        k, _ = dense._prefix_kv(plan.segments[0], 0, pool.layer_view(0))
+        pool.commit(denoise, ctx)
+        expected = sorted({*range(min(sink, start)), *range(max(sink, start - window), start)})
+        assert plan.cu_k == (0, len(expected) + 4), f"the denoise after commit {commit} plans another key length"
+        assert k.flatten().long().tolist() == expected, f"the denoise after commit {commit} attends other entries"
