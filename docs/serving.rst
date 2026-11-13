@@ -82,6 +82,15 @@ mstar serve
      - off
      - Serve Prometheus metrics at ``/metrics`` (see :ref:`serving-metrics`).
        Needs ``.[metrics]``.
+   * - ``--enable-nvtx``
+     - off
+     - Emit NVTX markers for CUDA profiling. Disabled on XPU and CPU.
+   * - ``--timeout``
+     - ``600``
+     - Per-request timeout (seconds).
+   * - ``--tcp-transfer-device``
+     - (auto)
+     - Network device for TCP tensor transport.
 
 Each model maps to a default config (override with ``--config``):
 

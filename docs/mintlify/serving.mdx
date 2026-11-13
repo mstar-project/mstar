@@ -34,6 +34,9 @@ mstar serve <model> [options]
 | `--log-stats` | off | Print a per-request profile when each request finishes (see [Request profiling](/serving#request-profiling)). |
 | `--log-stats-file` | stdout | Append the per-request profiles to this file instead of stdout (implies `--log-stats`). |
 | `--enable-metrics` | off | Serve Prometheus metrics at `/metrics` (see [Metrics](/serving#serving-metrics)). Needs `.[metrics]`. |
+| `--enable-nvtx` | off | Emit NVTX markers for CUDA profiling. Disabled on XPU and CPU. |
+| `--timeout` | `600` | Per-request timeout (seconds). |
+| `--tcp-transfer-device` | (auto) | Network device for TCP tensor transport. |
 
 Each model maps to a default config (override with `--config`):
 
