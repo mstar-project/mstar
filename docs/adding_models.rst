@@ -754,7 +754,10 @@ deployment YAML tunes them under ``resources:`` (see :ref:`Step 6 <config-yaml>`
 - ``Positions(rope=)``: a position counter per request and label, on an append-only array
   that keeps entries. ``rope=None`` is a counter only. ``Rope`` carries ``theta``,
   ``rotary_dim``, ``interleave``, ``scale``, the Llama 3.1 factors (all three or none), the
-  rotation's ``dtype`` and a ``table_dtype`` for a cos/sin table built once. On the contract
+  rotation's ``dtype`` and a ``table_dtype`` for a cos/sin table built once. ``longrope`` takes
+  a ``LongRoPE``'s short and long factor sets, and a request rotates with the long set when the
+  prompt length ``process_prompt`` sets under ``MAX_POSITION_KWARG`` passes the original context
+  (Phi-4-multimodal). On the contract
   this picks the kernel, and a shared layer's ``rope_*`` arguments have no effect, so a port
   declares what its layer passed before. The counter is
   separate from log positions: a kept step advances it by each row's advance, a fork copies
@@ -870,7 +873,7 @@ a refused admit draws the same noise.
 ``kernel_settings(self)`` is a temporary hook for what the engine doesn't pick itself yet:
 ``splits``, ``decode_fmha`` and ``decode_tensor_cores`` on a read of an array that keeps entries,
 ``splits`` on a ``GatedDeltaNet``, and ``max_segments_per_request``, ``max_segments_per_step``,
-``compile_op`` and ``workspace_mb`` on a ``Block`` read. Under an array's name it sets the default size of the array's pool, ``max_num_pages``
+``compile_op``, ``workspace_mb`` and ``backend`` on a ``Block`` read. Under an array's name it sets the default size of the array's pool, ``max_num_pages``
 on a paged array and ``max_slots`` on a ``Value`` with tensor fields, which a deployment's
 ``resources:`` block overrides. A cross read on an array that keeps entries takes
 ``decode_tensor_cores`` alone, and two reads that share a resource can't set one field to two

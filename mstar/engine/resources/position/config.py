@@ -169,10 +169,16 @@ class PositionSpec(NodeResourceSpec):
     def request_config(self, model_kwargs: dict | None) -> "PositionReqConfig | None":
         """Under LongRoPE, the length the request's table is chosen by, from
         ``MAX_POSITION_KWARG``, which a model sets in ``process_prompt`` (the data worker
-        drops a client's); without it, the short table."""
-        length = (model_kwargs or {}).get(MAX_POSITION_KWARG)
-        if length is None or self.config.longrope is None:
+        drops a client's)."""
+        if self.config.longrope is None:
             return None
+        length = (model_kwargs or {}).get(MAX_POSITION_KWARG)
+        if length is None:
+            raise RuntimeError(
+                f"position resource {self.resource_key!r} picks each request's LongRoPE table by "
+                f"{MAX_POSITION_KWARG!r}, which the model's process_prompt didn't set, so the request would rotate "
+                "with the short table whatever its length"
+            )
         return PositionReqConfig(max_position=length)
 
     def prefix_variant(self, model_kwargs: dict | None) -> bytes | None:

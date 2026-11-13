@@ -7,9 +7,9 @@ an image (with or without audio), ``speech`` for audio alone, the base model for
 text. The adapters are the engine LoRA pool's, read from the checkpoint's PEFT
 directories, so rows on different adapters share a batch.
 
-LongRoPE picks its table per request from the prompt's length (the position
-resource's ``MAX_POSITION_KWARG``): a prompt past 4096 tokens runs on the long
-table throughout, others on the short one. The reference also switches a request
+LongRoPE picks its table per request from the prompt's length
+(``MAX_POSITION_KWARG``): a prompt past 4096 tokens runs on the long table
+throughout, others on the short one. The reference also switches a request
 whose output crosses 4096 tokens, recomputing its cache; this one stays on the
 table it started on.
 """
@@ -19,14 +19,23 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
+from typing import Any
 
 import torch
 from transformers import GPT2TokenizerFast
 
-from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec
-from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
-from mstar.engine.resources.position.config import MAX_POSITION_KWARG, PositionConfig, PositionSpec
-from mstar.engine.resources.spec import NodeResourceSpec
+from mstar.engine.state import (
+    MAX_POSITION_KWARG,
+    Array,
+    Attend,
+    Causal,
+    KVEntry,
+    Layout,
+    Positions,
+    Read,
+    Rope,
+    Sampler,
+)
 from mstar.model.base import KEEP_ADAPTER, KeepAdapter, ProcessPromptOutput, TensorAndMetadata
 from mstar.model.components.audio_features import load_speech_file, speech_file_rate
 from mstar.model.multimodal import TEXT, PromptPart, chat_turns
@@ -40,13 +49,14 @@ from mstar.model.phi4mm.config import (
     AUDIO_PAD_ID,
     IMAGE_PAD_ID,
     KV_CACHE,
-    ROPE,
+    SAMPLER,
     SPEECH_ADAPTER,
     VISION_ADAPTER,
+    VISION_ATTN,
     Phi4MMConfig,
     read_hf_config,
 )
-from mstar.model.phi4mm.vision import vision_media_encoder
+from mstar.model.phi4mm.vision import vision_array, vision_kernel_settings, vision_media_encoder
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.utils.fast_tokenize import encode_ids
 
@@ -125,40 +135,31 @@ class Phi4MMModel(MultimodalDecoderModel):
     # Resources
     # -----------------------------------------------------------------------
 
-    def get_node_resources(self) -> list[NodeResourceSpec]:
+    def declare_state(self) -> list[Array | Sampler]:
         cfg = self.config
         return [
-            KVSpec(
-                resource_key=KV_CACHE, nodes={"LLM"},
-                config=PagedKVConfig(
-                    num_layers=cfg.num_hidden_layers,
-                    num_kv_heads=cfg.num_key_value_heads,
-                    head_dim=cfg.head_dim,
-                    max_seq_len=cfg.max_position_embeddings,
-                    num_qo_heads=cfg.num_attention_heads,
-                ),
-            ),
-            AttentionSpec(
-                resource_key=ATTN, nodes={"LLM"},
-                config=AttentionConfig(kv_cache=KV_CACHE, splits=(MIXED_SPLIT,)),
-            ),
-            PositionSpec(
-                resource_key=ROPE, nodes={"LLM"},
+            Array(
+                KV_CACHE, nodes={"LLM"}, layers=frozenset(range(cfg.num_hidden_layers)),
+                entry=KVEntry(heads=cfg.num_key_value_heads, head_dim=cfg.head_dim),
+                max_len=cfg.max_position_embeddings,
                 # the reference rounds its cos/sin to the activations' bf16
-                config=PositionConfig(
-                    kv_cache=KV_CACHE, rotary_dim=cfg.rotary_dim, rope_theta=cfg.rope_theta,
-                    longrope=cfg.longrope, rope_table_dtype=torch.bfloat16,
-                ),
+                positions=Positions(rope=Rope(
+                    theta=cfg.rope_theta, rotary_dim=cfg.rotary_dim, table_dtype=torch.bfloat16, longrope=cfg.longrope,
+                )),
+                reads={ATTN: Read(mask=Causal(), op=Attend(q_heads=cfg.num_attention_heads))},
             ),
-            self._sampler_spec(cfg.vocab_size),
-            *self._encoder_resources(),
-            self._lora_spec(),
+            Sampler(
+                SAMPLER, nodes={"LLM"}, vocab_size=cfg.vocab_size, penalty=True,
+                min_p=self._sampler_spec(cfg.vocab_size).enable_min_p,
+            ),
+            vision_array(self.vision_config),
         ]
 
-    def _encoder_resources(self) -> list[NodeResourceSpec]:
-        from mstar.model.phi4mm.vision import vision_resources
+    def kernel_settings(self) -> dict[str, dict[str, Any]]:
+        return {ATTN: {"splits": (MIXED_SPLIT,)}, VISION_ATTN: vision_kernel_settings(self.vision_config)}
 
-        return vision_resources(self.vision_config)
+    def get_node_resources(self):
+        return [self._lora_spec()]
 
     def _lora_spec(self):
         from mstar.model.phi4mm.lora import phi4mm_lora_spec
@@ -195,6 +196,10 @@ class Phi4MMModel(MultimodalDecoderModel):
     def process_prompt(self, prompt, input_modalities, output_modalities, tensors=None, prompt_parts=None, **kwargs):
         out = super().process_prompt(prompt, input_modalities, output_modalities, tensors, prompt_parts, **kwargs)
         metadata = dict(out.metadata)
+        kv = metadata.pop("kv_layout")[KV_CACHE]["main"]
+        metadata["state_layout"] = {KV_CACHE: {"main": Layout(spans=kv.spans, growth=kv.growth)}}
+        if kv.keyed_spans is not None:
+            metadata["keyed_spans"] = {KV_CACHE: {"main": kv.keyed_spans}}
         # the table LongRoPE runs the request on, from the prompt's length
         metadata[MAX_POSITION_KWARG] = int(out.new_input_tensors["text_inputs"][0].numel())
         return ProcessPromptOutput(out.new_input_tensors, metadata, self._adapter_for(tensors or {}))

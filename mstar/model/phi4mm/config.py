@@ -11,12 +11,14 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
-from mstar.engine.resources.position.config import LongRoPE
-from mstar.model.keys import KV_CACHE, ROPE, VISION_ATTN  # noqa: F401  (the scaffold's keys)
+from mstar.engine.state import LongRoPE
+from mstar.model.keys import KV_CACHE, SAMPLER, VISION_ATTN  # noqa: F401  (the scaffold's keys)
 
-# the LLM's attention; KV, positions, sampler and the vision tower's attention take
-# the scaffold's keys
+# the LLM's attention; KV, sampler and the vision tower's attention take the scaffold's
+# keys
 ATTN = "attn"
+# the vision tower's keys and values, which last one step
+VISION_TOKENS = "vision_tokens"
 
 # the pads the processor writes for each attachment, expanded to one per embedding row
 IMAGE_PAD_ID = 200010  # <|endoftext10|>

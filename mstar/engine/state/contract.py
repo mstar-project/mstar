@@ -11,6 +11,7 @@ import torch
 
 from mstar.engine.resources.attn.config import SP_EXCHANGES
 from mstar.engine.resources.kv.config import Span
+from mstar.engine.resources.position.config import LongRoPE
 from mstar.engine.resources.step import Segment
 
 
@@ -225,6 +226,21 @@ class Rope:
     old_context_len: int | None = None
     dtype: torch.dtype | None = None           # None: q's
     table_dtype: torch.dtype | None = None     # None: angles in the kernel
+    longrope: LongRoPE | None = None           # None: one table for every request
+
+    def __post_init__(self):
+        llama31 = (self.low_freq_factor, self.high_freq_factor, self.old_context_len)
+        if self.longrope is not None and (self.scale != 1.0 or any(f is not None for f in llama31)):
+            raise ValueError(
+                f"Rope.longrope divides the frequencies by its own factors, so it takes scale 1.0 and no Llama 3.1 "
+                f"factors, and got scale={self.scale}, (low_freq_factor, high_freq_factor, old_context_len)={llama31}"
+            )
+        factors = None if self.longrope is None else len(self.longrope.short_factor)
+        if factors is not None and self.rotary_dim is not None and factors != self.rotary_dim // 2:
+            raise ValueError(
+                f"Rope.longrope needs {self.rotary_dim // 2} factors per set for rotary_dim {self.rotary_dim}, "
+                f"and got {factors}"
+            )
 
 
 @dataclass(frozen=True, kw_only=True)

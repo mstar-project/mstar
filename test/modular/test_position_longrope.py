@@ -159,7 +159,6 @@ def test_the_spec_builds_the_manager_its_config_and_its_prefix_variant():
         resource_key="pos", nodes={"LLM"},
         config=PositionConfig(kv_cache="kv", rotary_dim=ROTARY_DIM, longrope=LONGROPE),
     )
-    assert spec.request_config({}) is None and spec.prefix_variant({}) is None
     assert spec.request_config({MAX_POSITION_KWARG: 16}) == PositionReqConfig(max_position=16)
     assert spec.prefix_variant({MAX_POSITION_KWARG: 16}) is None
     assert spec.prefix_variant({MAX_POSITION_KWARG: 17}) == b"longrope-long"

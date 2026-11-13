@@ -69,20 +69,23 @@ def test_the_prompt_length_picks_the_longrope_table(model):
     """``process_prompt`` sets the ceiling the position spec builds the request's
     table and prefix variant from."""
     from mstar.engine.resources.position.config import MAX_POSITION_KWARG, PositionSpec
+    from mstar.engine.state.adapters import node_resources
 
     out = model.process_prompt("hello", ["text"], ["text"], {"text_inputs": []}, parts(("text", "hello")))
     n = out.new_input_tensors["text_inputs"][0].numel()
     assert out.metadata[MAX_POSITION_KWARG] == n
-    (spec,) = [s for s in model.get_node_resources() if isinstance(s, PositionSpec)]
+    (spec,) = [s for s in node_resources(model) if isinstance(s, PositionSpec)]
     assert spec.prefix_variant(out.metadata) is None
     assert spec.prefix_variant({MAX_POSITION_KWARG: 5000}) == b"longrope-long"
     assert spec.config.rotary_dim == 96 and spec.config.rope_table_dtype is torch.bfloat16
 
 
 def test_walks_and_resources(model):
+    from mstar.engine.state.adapters import node_resources
+
     walks = set(model.get_graph_walk_graphs())
     assert {"prefill_text", "prefill_vision", "prefill_audio", "prefill_vision_audio", "decode"} <= walks
-    keys = {s.resource_key for s in model.get_node_resources()}
+    keys = {s.resource_key for s in node_resources(model)}
     assert {"kv_cache", "attn", "rope", "sampler", "vision_attn", "lora"} <= keys
 
 
