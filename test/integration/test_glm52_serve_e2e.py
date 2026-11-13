@@ -81,9 +81,9 @@ def _fp8_pair(sd, base, weight):
 
 
 def _hf_checkpoint(model, cfg):
-    """Emit HF-style keys: routed experts as fp8 pairs (mandatory for the
-    fp8-resident containers), o_proj/kv_b_proj as fp8 pairs (dense
-    dequant-on-load coverage), everything else bf16 passthrough."""
+    """Emit HF-style keys as the fp8 checkpoint stores them: the routed experts, the
+    attention projections, the shared expert and the dense MLPs as fp8 pairs (kv_b_proj
+    dequantizes on load), the norms, router, embedding and head bf16."""
     inter = cfg.intermediate_size
     moe_inter = cfg.moe_intermediate_size
     shared_inter = cfg.moe_intermediate_size * cfg.n_shared_experts
@@ -92,10 +92,10 @@ def _hf_checkpoint(model, cfg):
     for i, layer in enumerate(m.layers):
         p = f"model.layers.{i}."
         a = layer.self_attn
-        sd[p + "self_attn.q_a_proj.weight"] = a.q_a_proj.weight
+        _fp8_pair(sd, p + "self_attn.q_a_proj", a.q_a_proj.weight)
         sd[p + "self_attn.q_a_layernorm.weight"] = a.q_a_layernorm.weight
-        sd[p + "self_attn.q_b_proj.weight"] = a.q_b_proj.weight
-        sd[p + "self_attn.kv_a_proj_with_mqa.weight"] = a.kv_a_proj_with_mqa.weight
+        _fp8_pair(sd, p + "self_attn.q_b_proj", a.q_b_proj.weight)
+        _fp8_pair(sd, p + "self_attn.kv_a_proj_with_mqa", a.kv_a_proj_with_mqa.weight)
         sd[p + "self_attn.kv_a_layernorm.weight"] = a.kv_a_layernorm.weight
         _fp8_pair(sd, p + "self_attn.kv_b_proj", a.kv_b_proj.weight)
         _fp8_pair(sd, p + "self_attn.o_proj", a.o_proj.weight)
@@ -118,13 +118,13 @@ def _hf_checkpoint(model, cfg):
                 _fp8_pair(sd, p + f"mlp.experts.{e}.up_proj", gup[e, moe_inter:, :])
                 _fp8_pair(sd, p + f"mlp.experts.{e}.down_proj", dwn[e])
             sh = mlp.shared_expert
-            sd[p + "mlp.shared_experts.gate_proj.weight"] = sh.gate_up_proj.weight[:shared_inter]
-            sd[p + "mlp.shared_experts.up_proj.weight"] = sh.gate_up_proj.weight[shared_inter:]
-            sd[p + "mlp.shared_experts.down_proj.weight"] = sh.down_proj.weight
+            _fp8_pair(sd, p + "mlp.shared_experts.gate_proj", sh.gate_up_proj.weight[:shared_inter])
+            _fp8_pair(sd, p + "mlp.shared_experts.up_proj", sh.gate_up_proj.weight[shared_inter:])
+            _fp8_pair(sd, p + "mlp.shared_experts.down_proj", sh.down_proj.weight)
         else:
-            sd[p + "mlp.gate_proj.weight"] = mlp.gate_up_proj.weight[:inter]
-            sd[p + "mlp.up_proj.weight"] = mlp.gate_up_proj.weight[inter:]
-            sd[p + "mlp.down_proj.weight"] = mlp.down_proj.weight
+            _fp8_pair(sd, p + "mlp.gate_proj", mlp.gate_up_proj.weight[:inter])
+            _fp8_pair(sd, p + "mlp.up_proj", mlp.gate_up_proj.weight[inter:])
+            _fp8_pair(sd, p + "mlp.down_proj", mlp.down_proj.weight)
     sd["model.norm.weight"] = m.norm.weight
     sd["lm_head.weight"] = model.lm_head.weight
     return {k: v.detach().cpu().clone().contiguous() for k, v in sd.items()}
@@ -162,7 +162,7 @@ class _Serve:
         specs = model.get_node_resources()
         apply_yaml_overrides(specs, kv_yaml)
         by_key = resolve_spec_dependencies(specs)
-        groups = JointGroups(tp_group=CommGroup.trivial(), sp_group=CommGroup.trivial())
+        groups = JointGroups(tp_group=CommGroup.trivial(), sp_group=CommGroup.trivial(), instance=CommGroup.trivial())
         transfer = TransferEngineInfo(
             my_entity_id="glm52_serve_e2e", my_session_id="glm52_serve_e2e",
             transfer_engine=LocalTransferEngine("localhost"),
@@ -185,7 +185,7 @@ class _Serve:
         # vocab, so greedy decode on random weights can hit one and stop
         # early — which would break the exact-length assertions below.
         self.overrides = model.get_request_resource_configs(
-            {}, model_kwargs={"temperature": 0.0, "ignore_eos": True, **model_kwargs},
+            [], [], model_kwargs={"temperature": 0.0, "ignore_eos": True, **model_kwargs},
         )
         self.runner.ingest_request(rid, self.overrides)
 
@@ -230,13 +230,12 @@ class _Serve:
             resource.cleanup()
 
 
-def _run_generation(model, submodule, cfg, prompt_ids, max_tokens):
-    """The real serve loop: prefill -> decode -> check_stop, all through
-    ``forward_batched`` and the sampler resource (greedy)."""
+def _run_generation(model, submodule, prompt_ids, max_tokens):
+    """The real serve loop: prefill -> decode to the request's loop cap or a
+    stop, all through ``forward_batched`` and the sampler resource (greedy)."""
     serve = _Serve(model, submodule)
     info = serve.info(max_tokens)
     generated: list[int] = []
-    stopped = False
     try:
         out = serve.step("prefill", info, prompt_ids)
         new_token = out["new_token"][0]
@@ -245,24 +244,20 @@ def _run_generation(model, submodule, cfg, prompt_ids, max_tokens):
         generated.append(int(new_token.item()))
         next_token = out["text_inputs"][0]
         # as the runtime: a prefill stop ends the request (END_PARTITION); otherwise decode
-        stopped = END_PARTITION in submodule.check_stop(serve.rid, info, out)
-        if not stopped:
+        if END_PARTITION not in submodule.check_stop(serve.rid, info, out):
             info.graph_walk = "decode"
-            for step in range(max_tokens + 4):  # +slack; check_stop must break first
+            for _ in range(model.get_loop_caps(max_output_tokens=max_tokens)["decode_loop"]):
                 out = serve.step("decode", info, next_token)
                 new_token = out["new_token"][0]
                 submodule.postprocess(serve.rid, info, out)
                 assert out["text_inputs"] is out["new_token"]
-                info.dynamic_loop_iter_counts["decode_loop"] = step
-                stop = submodule.check_stop(serve.rid, info, out)
                 generated.append(int(new_token.item()))
                 next_token = out["text_inputs"][0]
-                if stop:
-                    stopped = True
+                if submodule.check_stop(serve.rid, info, out):
                     break
     finally:
         serve.close()
-    return generated, stopped
+    return generated
 
 
 def _prefill_logits(model, submodule, prompt_ids):
@@ -310,13 +305,13 @@ def test_serve_path_prefill_decode_loop_fp8(tmp_path):
     assert torch.isfinite(logits).all()
 
     MAX_TOKENS = 6
-    generated, stopped = _run_generation(model, submodule, cfg, prompt_ids, MAX_TOKENS)
+    generated = _run_generation(model, submodule, prompt_ids, MAX_TOKENS)
 
-    assert stopped, "decode loop did not terminate via check_stop"
     assert len(generated) == MAX_TOKENS, generated  # max_tokens counts the prefill-emitted token (vLLM semantics)
     assert all(0 <= t < cfg.vocab_size for t in generated), generated
 
-    out_bytes = model.postprocess(torch.tensor(generated), "text")
+    # with the request's ignore_eos, as the data worker passes it: an end-of-turn id is text too
+    out_bytes = model.postprocess(torch.tensor(generated), "text", request_kwargs={"ignore_eos": True})
     assert isinstance(out_bytes, bytes)
     assert len(out_bytes) == len(generated)  # byte mode: 1 byte per id
 
@@ -328,7 +323,7 @@ def test_serve_path_is_deterministic_fp8(tmp_path):
     prompt_ids = model.process_prompt("serve", ["text"], ["text"]).new_input_tensors["text_inputs"][0].to(DEVICE)
 
     runs = [
-        _run_generation(model, submodule, model.config, prompt_ids, max_tokens=5)[0]
+        _run_generation(model, submodule, prompt_ids, max_tokens=5)
         for _ in range(2)
     ]
     assert runs[0] == runs[1], runs

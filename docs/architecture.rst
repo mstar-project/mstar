@@ -59,8 +59,8 @@ Core design principles
   ``prefill``, ``decode``, ``image_gen``) via ``get_graph_walk_graphs()``.
 - **Disaggregated.** Logical computation nodes map to physical workers via the YAML
   config's ``node_groups`` (node names → GPU ranks).
-- **Models declare, the engine executes.** A model declares its resources in
-  ``get_node_resources()``, and declares what each step does to them in
+- **Models declare, the engine executes.** A model declares its state in
+  ``declare_state()`` and any other resources in ``get_node_resources()``, and declares what each step does to them in
   ``NodeSubmodule.declare_step()``. The engine performs admission, planning, capture and
   commit. A step that cannot be admitted therefore becomes backpressure that the scheduler
   can resolve by eviction, instead of an error inside a forward pass.
@@ -72,8 +72,9 @@ Execution flow (simplified)
 
 1. The API server receives a request, loads media, and calls the model's
    ``process_prompt`` to produce the initial tensors.
-2. The conductor seeds the initial graph walk (e.g. ``prefill``) and asks the model for
-   the next forward-pass arguments after each graph walk completes.
+2. The conductor asks the model once, at ingest, for each partition's walk plan
+   (``walk_plan``: e.g. ``prefill`` then ``decode``), and runs it: it sends each walk its
+   inputs and moves to the next walk as each one completes.
 3. Workers execute the ready graph nodes on GPU through the engine. The engine declares
    and admits each step's resource work around the forward pass. Workers then route the
    output tensors to downstream nodes and workers.

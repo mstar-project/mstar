@@ -138,16 +138,13 @@ def main():
     torch.set_float32_matmul_precision("high")
     device = torch.device("cuda")
     model = Flux2KleinModel(
-        model_path_hf=args.repo, attention_backend="sdpa", compile=args.compile,
+        model_path_hf=args.repo, compile=args.compile,
         compile_exact_ops=["norms"] if args.exact_ops else False, vae_compile=args.vae_compile, accelerator_graph=False,
         capture_sizes=[[args.height, args.width]],
     )
     model.set_config(Flux2KleinConfig.from_snapshot(resolve_snapshot_dir(args.repo)))
     t0 = time.perf_counter()
     subs = {name: model.get_submodule(name, device=device) for name in ("text_encoder", "dit", "vae_decoder")}
-    if args.vae_compile:
-        # as the engine does at load: compile the decode for this grid (unwarmed grids decode eagerly)
-        subs["vae_decoder"].warmup([model.config.latent_grid(args.height, args.width)])
     torch.cuda.synchronize()
     print(f"loaded in {time.perf_counter() - t0:.1f}s; peak alloc {torch.cuda.max_memory_allocated() / 2**30:.2f} GiB")
     oracle = Path(args.oracle_dir) if args.oracle_dir else None

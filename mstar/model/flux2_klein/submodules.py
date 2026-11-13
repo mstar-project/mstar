@@ -24,11 +24,14 @@ from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.accelerator_graph_config import geometric_batch_sizes
 from mstar.model.components.batched_rows import BatchedRows
-from mstar.model.components.diffusion.compile_utils import ExactOps, compile_transformer_forward
+from mstar.model.components.diffusion.compile_utils import (
+    ExactOps,
+    compile_transformer_forward,
+    step_schedule_recompile_limit,
+)
 from mstar.model.components.diffusion.decode_utils import (
     VAE_MAX_DECODE_BATCH,
-    compile_vae_decode,
-    decode_in_chunks,
+    WarmedDecode,
 )
 from mstar.model.components.diffusion.denoise_loop import LATENTS, DenoiseLoopSubmodule
 from mstar.model.components.diffusion.flow_match import FlowMatchSchedule, euler_step
@@ -44,7 +47,8 @@ from mstar.model.components.diffusion.image_io import (
 )
 from mstar.model.components.diffusion.qwen3.submodule import TEXT_EMBEDS
 from mstar.model.components.diffusion.rope import MultiAxisRoPE
-from mstar.model.flux2_klein.config import Flux2KleinConfig
+from mstar.model.components.quant_linear import BF16, StepDtypes
+from mstar.model.flux2_klein.config import JOINT_TOKENS, Flux2KleinConfig
 from mstar.model.submodule_base import NodeInputs, NodeSubmodule
 
 logger = logging.getLogger(__name__)
@@ -143,17 +147,20 @@ class KleinDenoiseSubmodule(DenoiseLoopSubmodule):
         config: Flux2KleinConfig,
         *,
         loop_name: str,
-        attn_resource_key: str | None,
         compile_transformer: bool = True, compile_eager_rounding: bool = True, compile_exact_ops: ExactOps = False,
         max_batch_size: int = 8,
         capture_buckets=(),
         capture_batch_sizes=(1, 2, 4, 8),
+        step_dtypes: StepDtypes | None = None,
+        bf16_transformer: nn.Module | None = None,
     ):
         super().__init__(
-            loop_name=loop_name, max_batch_size=max_batch_size, attn_resource_key=attn_resource_key,
-            capture_buckets=capture_buckets, capture_batch_sizes=capture_batch_sizes,
+            loop_name=loop_name, max_batch_size=max_batch_size,
+            capture_buckets=capture_buckets, capture_batch_sizes=capture_batch_sizes, step_dtypes=step_dtypes,
         )
         self.transformer = transformer
+        # A low-precision transformer's bf16 twin, for the steps a schedule runs in bf16.
+        self.bf16_transformer = bf16_transformer
         self.config = config
         self.rope = MultiAxisRoPE(config.transformer.rope_theta, config.transformer.axes_dims_rope)
         self._compiled_shapes: set[tuple] = set()
@@ -161,20 +168,21 @@ class KleinDenoiseSubmodule(DenoiseLoopSubmodule):
         if self._compile:
             # In place, so the module keeps its identity (dtype property, tests' swaps);
             # dynamic=False traces one graph per (batch, shape) — announced per shape.
-            compile_transformer_forward(
-                transformer, eager_rounding=compile_eager_rounding, exact_ops=compile_exact_ops,
-            )
+            for module in (transformer, bf16_transformer):
+                if module is not None:
+                    compile_transformer_forward(
+                        module, eager_rounding=compile_eager_rounding, exact_ops=compile_exact_ops,
+                        recompile_limit=step_schedule_recompile_limit(step_dtypes),
+                    )
 
     # hooks -----------------------------------------------------------------
     def bucket_key_for(self, fwd_info: CurrentForwardPassInfo) -> KleinShape:
         return shape_from_metadata(self.config, fwd_info.step_metadata)
 
-    def schedule_for(self, fwd_info, bucket_key: KleinShape) -> FlowMatchSchedule:
-        return FlowMatchSchedule.build(
-            self.config.scheduler, int(fwd_info.step_metadata["num_inference_steps"]), bucket_key.image_tokens,
-        )
+    def schedule_for(self, walk: str, num_steps: int, bucket_key: KleinShape) -> FlowMatchSchedule:
+        return FlowMatchSchedule.build(self.config.scheduler, int(num_steps), bucket_key.image_tokens)
 
-    def seed_latents(self, fwd_info, bucket_key: KleinShape, generator: torch.Generator) -> torch.Tensor:
+    def seed_latents(self, bucket_key: KleinShape, generator: torch.Generator) -> torch.Tensor:
         # randn_tensor parity: drawn in the packed [C, h, w] layout in bf16 on the CPU
         # generator, then packed row-major to tokens.
         h, w = bucket_key.grid
@@ -190,6 +198,9 @@ class KleinDenoiseSubmodule(DenoiseLoopSubmodule):
 
     def num_tokens(self, bucket_key: KleinShape) -> int:
         return bucket_key.total_tokens
+
+    def attention_segments(self, bucket_key: KleinShape):
+        return {JOINT_TOKENS: ((self.MAIN_SPAN, bucket_key.total_tokens),)}
 
     def capture_request_inputs(self, bucket_key: KleinShape, device) -> dict[str, torch.Tensor]:
         dtype = self.transformer.dtype
@@ -224,7 +235,8 @@ class KleinDenoiseSubmodule(DenoiseLoopSubmodule):
             if key not in self._compiled_shapes:
                 self._compiled_shapes.add(key)
                 logger.info("FLUX.2 klein: compiling the transformer for shape %s (one-time pause)", key)
-        velocity = self.transformer(model_input, text_embeds, timestep_in, rope, ragged=self._ragged())
+        transformer = self.bf16_transformer if self.step_dtype == BF16 else self.transformer
+        velocity = transformer(model_input, text_embeds, timestep_in, rope)
         velocity = velocity[:, : latents.shape[1]]
         return euler_step(latents, velocity, sigma, sigma_next)
 
@@ -254,51 +266,16 @@ class KleinVaeDecoderSubmodule(BatchedRows, NodeSubmodule):
         self.vae = vae
         self.config = config
         self._max_batch_size = max_batch_size
-        # torch.compile (max-autotune, no cudagraphs) takes the 1024^2 decode from 89 to 29 ms on an
-        # H100; its fused bf16 reductions move the image by <= 5.6e-2 in [-1, 1] (~56 dB), so it is a
-        # deployment knob and stays off for the bit-exact parity path. CUDA graphs would add nothing:
-        # the compiled decode is not launch-bound (measured), so the node declares no captures.
-        self._compiled = bool(compile_decode)
-        self._decode_one = compile_vae_decode(vae) if compile_decode else vae.decode
-        # compiled: only these batch sizes are ever decoded (larger batches are split into them)
-        self._decode_batch_sizes = (
-            tuple(geometric_batch_sizes(min(max_batch_size, VAE_MAX_DECODE_BATCH))) if compile_decode else ()
+        # torch.compile (max-autotune, no cudagraphs) took the 1024^2 decode from 89 to 29 ms on an
+        # H100, moving the image by <= 5.6e-2 in [-1, 1] (~56 dB), before the folded upsample and the
+        # split GroupNorm (compile_vae_decode). Not bit-exact, so it is a deployment knob and stays off
+        # for the bit-exact parity path. CUDA graphs would add nothing: the compiled decode is not
+        # launch-bound (measured), so the node declares no captures.
+        ph, pw = config.vae.patch_size
+        self._vae_decode = WarmedDecode(
+            vae, compile_decode, geometric_batch_sizes(min(max_batch_size, VAE_MAX_DECODE_BATCH)),
+            [(config.vae.latent_channels, h * ph, w * pw) for h, w in warmup_grids], self.get_device(),
         )
-        # latent shapes (batch, H, W) the compiled decode was warmed with; any other shape decodes eager:
-        # a fresh max-autotune compile inside a request cost 40-100 s (measured on 1024x768 / 512^2 edits)
-        self._warmed: set[tuple[int, int, int]] = set()
-        # Before the warm-up, not after: the loader leaves requires_grad=True and
-        # Engine.load_model only clears it later. Dynamo guards on requires_grad, so
-        # a graph warmed with it set fails its guard on the first served decode and
-        # recompiles under max-autotune *inside* the request -- the warm-up is thrown
-        # away exactly when it matters.
-        vae.requires_grad_(False)
-        self.warmup(warmup_grids)
-
-    def _decode_chunk(self, latent: torch.Tensor) -> torch.Tensor:
-        key = (int(latent.shape[0]), int(latent.shape[-2]), int(latent.shape[-1]))
-        if self._compiled and key not in self._warmed:
-            return self.vae.decode(latent)
-        return self._decode_one(latent)
-
-    def _decode(self, latents: torch.Tensor) -> torch.Tensor:
-        return decode_in_chunks(self._decode_chunk, latents, self._decode_batch_sizes)
-
-    def warmup(self, grids: Sequence[tuple[int, int]]) -> None:
-        """Decode zeros at every decode batch size for every token grid at load, so the compiles
-        and their autotuning happen before the first request (only when the decode is compiled)."""
-        if not self._compiled:
-            return
-        for h, w in grids:
-            patch = self.config.vae.patch_size
-            for bs in self._decode_batch_sizes:
-                latent = torch.zeros(
-                    bs, self.config.vae.latent_channels, h * patch[0], w * patch[1],
-                    device=self.get_device(), dtype=self.vae.dtype,
-                )
-                with torch.no_grad():
-                    self._decode_one(latent)
-                self._warmed.add((int(latent.shape[0]), int(latent.shape[-2]), int(latent.shape[-1])))
 
     def prepare_inputs(self, graph_walk, fwd_info, inputs: NameToTensorList, **kwargs) -> NodeInputs:
         grid = self.config.latent_grid(int(fwd_info.step_metadata["height"]), int(fwd_info.step_metadata["width"]))
@@ -319,5 +296,5 @@ class KleinVaeDecoderSubmodule(BatchedRows, NodeSubmodule):
     def run_batch(self, latents: torch.Tensor, grid: tuple[int, int], **kwargs):
         latents = latents.to(device=self.get_device(), dtype=self.vae.dtype)
         patched = self.vae.denormalize_latents(unpack_latents(latents, *grid))
-        image = self._decode(unpatchify_latents(patched))
+        image = self._vae_decode(unpatchify_latents(patched))
         return {IMAGE_OUTPUT: pixels_to_uint8(image)}

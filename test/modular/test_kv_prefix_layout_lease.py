@@ -28,7 +28,7 @@ from mstar.api_server.data_worker import PreprocessWorkerThread
 from mstar.engine.resources import StepContext
 from mstar.engine.resources.base import KeyedWalks
 from mstar.engine.resources.kv import manager as manager_mod
-from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PrefixSpan
+from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PrefixSpan, StreamLayout
 from mstar.engine.resources.kv.manager import KVManager, SpanCursor
 from mstar.engine.resources.position.config import PositionStep
 from mstar.engine.resources.step import Segment, SubmoduleStep
@@ -337,6 +337,35 @@ def test_the_mark_reaches_the_manager_on_a_keyed_span():
 
     assert [span.opens_step for span in spans] == [True, False, True, False, False]
     assert [span.digest for span in spans] == [None, DIGEST, None, OTHER_DIGEST, None]
+
+
+def test_a_layout_and_its_streams_cursor_split_it_into_the_same_steps():
+    layout = _config(TWO_IMAGES, text_walk=IMAGE_WALK, opens=(0, 2)).kv_layout["main"]
+    # a span of another walk opens a step though it isn't marked to
+    other_walk = StreamLayout(spans=(PrefixSpan(5, 5, TEXT_WALK), PrefixSpan(7, 1, IMAGE_WALK, opens_step=False)))
+
+    steps, cursor = layout.steps(), SpanCursor(layout.spans)
+    for step in steps:
+        assert cursor.next_step(IMAGE_WALK) == step, "the KV would expect a row the layout's steps don't have"
+        cursor.done += len(step)
+
+    assert [len(step) for step in steps] == [2, 3], "the text after the last image would be a step of its own"
+    assert [len(step) for step in other_walk.steps()] == [1, 1], "one step would write two walks' spans"
+
+
+def test_a_step_that_changes_walk_fails_where_its_layout_is_built():
+    # `next_step` ends a step at a change of walk, so the image would be looked up as a step of its own
+    def layout(text_walk: str, opens_step: bool = True) -> LabelLayout:
+        return LabelLayout(spans=(
+            Span("ids", text_walk, len(TEXT), len(TEXT), "text_inputs", opens_step=opens_step),
+            Span("digest", IMAGE_WALK, IMAGE, 1, DIGEST, opens_step=False),
+        ))
+
+    with pytest.raises(ValueError, match=f"span 1 of walk '{IMAGE_WALK}'.*span 0 before it is of walk '{TEXT_WALK}'"):
+        layout(TEXT_WALK).row()
+    with pytest.raises(ValueError, match="span 0 .* no span comes before it"):
+        layout(IMAGE_WALK, opens_step=False).row()
+    assert [row[6] for row in layout(IMAGE_WALK).row()[0]] == [True, False]
 
 
 _DISAGREEING = {

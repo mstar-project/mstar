@@ -200,6 +200,7 @@ def test_published_positions_travel_to_a_branch_on_another_node(harness):
 def _decode_capture_inputs(cfg_on: bool):
     """The template rows a decode capture hands declare_step and preprocess."""
     stub = types.SimpleNamespace(
+        config=types.SimpleNamespace(accelerator_graph=True),
         PREFILL_TEXT_TOKEN_BUCKETS=LLMSubmodule.PREFILL_TEXT_TOKEN_BUCKETS,
         PREFILL_TEXT_CAPTURE_BATCH_SIZES=(
             LLMSubmodule.PREFILL_TEXT_CAPTURE_BATCH_SIZES

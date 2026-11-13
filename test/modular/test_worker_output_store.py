@@ -3,7 +3,7 @@ node's edges carry."""
 import torch
 
 from mstar.communication.arena import ArenaShmCommunicationManager
-from mstar.worker.worker import Worker
+from mstar.testing_utils.worker import make_worker
 
 
 class _NullCommunicator:
@@ -12,11 +12,12 @@ class _NullCommunicator:
 
 
 def _worker(tmp_path):
-    w = Worker.__new__(Worker)
-    w.tensor_manager = ArenaShmCommunicationManager(
+    w = make_worker(
+        tensor_manager=ArenaShmCommunicationManager(
         my_entity_id="worker_0", hostname="localhost", device="cpu",
         communicator=_NullCommunicator(), shm_dir=str(tmp_path),
         use_arena=False,
+    ),
     )
     return w
 
@@ -53,7 +54,7 @@ def test_new_token_counts_dedup_per_rid_not_across_rids(tmp_path):
                   stored.flat_uuids[1]]
     signal_idxs = [0, 0, 0]
 
-    counts = w._count_new_tokens(
+    counts = w.executor._count_new_tokens(
         [0, 1, 2], flat_rids, flat_uuids, signals, signal_idxs,
     )
 

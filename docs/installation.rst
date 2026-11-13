@@ -59,7 +59,9 @@ extension (see `Rust extension`_).
 .. important::
 
    **For CUDA installs, always pass** ``--torch-backend=auto``. ``mstar`` floors
-   PyTorch at 2.10 (``torch>=2.10.0`` / ``torchvision>=0.25.0`` / ``torchaudio>=2.10.0``).
+   PyTorch at 2.10 (``torch>=2.10.0`` / ``torchvision>=0.25.0`` /
+   ``torchaudio>=2.10.0,!=2.11.1``; torchaudio 2.11.1 needs a newer torch than its
+   metadata says and fails to load next to torch 2.11 or 2.12).
    The flag tells
    ``uv`` to detect your driver's CUDA version and fetch the **matching** torch build
    — cu128 on a CUDA 12.x box, cu130 on a CUDA 13.x box. This matters because source-
@@ -141,6 +143,9 @@ Model families and some output formats need extra packages, exposed as pip *extr
    * - ``.[orpheus]``
      - Orpheus TTS runtime: ``transformers``, ``flashinfer-python``, ``safetensors``,
        ``einops``, ``huggingface-hub``, ``mooncake-transfer-engine``.
+   * - ``.[minicpm_o]``
+     - MiniCPM-o 4.5 runtime: ``transformers``, ``flashinfer-python``, ``safetensors``,
+       ``soundfile``, ``torchaudio`` / ``torchcodec``, ``Pillow``, ``huggingface-hub``.
    * - ``.[fish_s2_pro]``
      - Fish Audio S2-Pro runtime: ``transformers``, ``flashinfer-python``, ``safetensors``,
        ``soundfile`` (reference-clip decoding), ``huggingface-hub``, ``mooncake-transfer-engine``.
@@ -150,13 +155,15 @@ Model families and some output formats need extra packages, exposed as pip *extr
        see `omnivoice (OmniVoice)`_.
    * - ``.[pi05]``
      - Pi0.5 runtime: ``transformers``, ``flashinfer-python``, ``safetensors``,
-       ``triton``, ``huggingface-hub``, ``mooncake-transfer-engine``.
+       ``huggingface-hub``, ``mooncake-transfer-engine``. Its tokenizer
+       comes from the gated ``google/paligemma-3b-pt-224``: accept its license on
+       Hugging Face and set ``HF_TOKEN``, or the server refuses to start.
    * - ``.[vjepa2]`` / ``.[vjepa2_ac]``
      - V-JEPA 2 runtime: ``safetensors``, ``torchcodec``, ``huggingface-hub``,
        ``mooncake-transfer-engine`` (``vjepa2_ac`` also adds ``flashinfer-python``).
    * - ``.[glm]``
      - GLM runtime: ``transformers``, ``flashinfer-python``, ``safetensors``,
-       ``triton``, ``huggingface-hub``, ``mooncake-transfer-engine``, and ``ninja``
+       ``huggingface-hub``, ``mooncake-transfer-engine``, and ``ninja``
        (speeds up the JIT build of the vendored MoE align kernel).
    * - ``.[waypoint]``
      - Index-hosted Waypoint dependencies: ``huggingface-hub``, ``safetensors``,
@@ -252,6 +259,12 @@ The GPU model families depend on:
   (see `flash-attn (LingBot-World)`_).
 - **flash-attn-4** — Waypoint's flex-attention ``FLASH`` backend. **Not installed by any
   extra**; install it separately (see `flash-attn-4 (Waypoint, FA3 sm90 kernel)`_).
+- **fa3-fwd** — FlashAttention-3 forward, the ``dense`` attention backend (Cosmos3's dense
+  passes, its reasoner's vision tower). The wheel is built against one CUDA major: 0.0.2 for a
+  CUDA 12 torch (``+cu12x``), 0.0.3 for CUDA 13 (``+cu130``). The extras take the latest, so next
+  to a CUDA 12 torch install ``fa3-fwd==0.0.2``. A mismatched wheel fails to import, and every
+  ``dense`` attention then runs on FlashInfer with a warning at startup; check with
+  ``python -c "import fa3_fwd_interface"``.
 - **mooncake-transfer-engine** (0.3.13.post1 or newer) — RDMA tensor transport for
   multi-GPU, disaggregated deployments. Single-node deployments can use shared-memory
   (``SHM``) or ``TCP`` transport instead (see :doc:`serving`, which also covers the network
@@ -461,8 +474,8 @@ https://pytorch.org/get-started/locally/. Keep all three packages on the same ``
 ``torchcodec`` doesn't declare its ``torch`` version, so the resolver otherwise picks the
 newest release (0.17 at the time of writing), which fails to load next to torch 2.10; 0.10
 is the release built against it.
-The ``[asr]`` extra pins that pair itself (``torch`` 2.10 with ``torchcodec`` 0.10, as in the
-Docker images), so installing it puts ``torch`` on 2.10.
+The ``[asr]`` extra pins that set itself (``torch`` 2.10 with ``torchaudio`` 2.10 and
+``torchcodec`` 0.10, as in the Docker images), so installing it puts ``torch`` on 2.10.
 
 Verify the install
 ------------------
@@ -524,6 +537,12 @@ directory. The shim is not tied to the torch it was built against: any torch in
 the supported range runs it, and the arena checks that at startup. ``import
 mstar_rust``, ``cargo test`` and ``rust/server`` need neither torch nor the shim.
 
+Rebuild whenever ``rust/`` changes, pulled or your own: in a checkout, the
+conductor and each worker refuse an extension built from other ``rust/``
+sources (compared by content, ``mstar_rust.BUILD_SOURCE_HASH``), which would
+otherwise import fine and fail mid-request. An installed wheel has no ``rust/``
+beside ``mstar`` and is not checked.
+
 The CPU test suites build a graph runtime too, so contributors need it as well,
 Mac contributors included: install ``cargo`` through rustup and run the same
 command. Build with ``--release`` — an unoptimized debug build (maturin's
@@ -560,7 +579,11 @@ Optional: the Rust HTTP frontend
 
 ``mstar-server`` (``rust/server/``) serves the HTTP surface — routes, OpenAI
 translation, SSE streaming, uploads — from Rust, with the Python process
-keeping preprocessing and the conductor protocol. A Linux wheel that carries
+keeping preprocessing and the conductor protocol. It is replacing the Python
+HTTP frontend, which is being retired: new routes and adapters land in both
+(see "API surfaces land in the Rust frontend" in ``AGENTS.md``), and
+``mstar serve`` will use the Rust frontend for every model once it serves
+everything the Python one does. A Linux wheel that carries
 the extension also installs the binary next to ``mstar-serve``; otherwise build
 it. Then opt in:
 
@@ -577,16 +600,26 @@ frontend, not the model, can be the limit.
 
 The binary is resolved via ``--rust-frontend-bin`` / ``MSTAR_SERVER_BIN`` /
 the environment's scripts directory / ``$PATH`` / the in-repo build. Its knobs
-are listed in :doc:`environment_variables`.
+are listed in :doc:`environment_variables`. From a checkout, a binary built from
+other ``rust/`` or ``rust/server/`` sources is skipped, and if none is left the
+error gives the command that rebuilds it; one named by the flag or the variable
+is used with a warning. ``mstar-server --source-hash`` prints the hashes of the
+sources a build was made from.
 
 The OpenAI routes take the model's adapter from the same registry as the Python
 frontend (``ADAPTER_REGISTRY`` in ``mstar/api_server/openai/adapters.py``):
 ``mstar-server`` ports adapter classes, not model names, so every model of a
-ported class is served. Chat is served for every model the Python frontend serves
-it for. Some speech, image and video adapters, and the transcription and realtime
-routes, are not ported yet (``NOT_PORTED`` in
-``test/rust/test_rust_openai_adapters.py``); there ``mstar-server`` answers 404,
-logs a warning at startup, and ``/generate`` still works.
+ported class is served. Chat, speech, images, videos and transcriptions are
+served for every model the Python frontend serves them for; a transcription's
+upload is decoded and cut into windows by the API server's ``WindowPlanner``,
+over the bridge, so both frontends read the same formats. The WebSocket
+routes are served too: ``/generate/ws``, ``/v1/realtime`` (conversations with
+full-duplex models, and transcription, whose server turn detection runs Silero
+through the ONNX Runtime library ``onnxruntime`` ships; ``semantic_vad`` asks the
+API server's Smart Turn), and openpi's socket at
+``/`` where the config has an ``openpi:`` block. ``mstar-server`` does not
+offer per-message deflate, so ``ws_per_message_deflate`` has no effect there:
+a client that asks for it gets uncompressed frames.
 
 Troubleshooting
 ---------------

@@ -17,7 +17,7 @@ from mstar.model.command_a_plus.components.language_model import (
     CommandAPlusRouter,
 )
 from mstar.model.command_a_plus.config import CommandAPlusConfig
-from mstar.model.command_a_plus.tests.test_backbone import bind_test_resources, dense_reference
+from mstar.model.command_a_plus.tests.test_backbone import begin_test_step, bind_test_resources, dense_reference
 from mstar.model.components.norm import BiasFreeLayerNorm
 
 CUDA = torch.cuda.is_available()
@@ -76,6 +76,18 @@ class FusedKernelTests(unittest.TestCase):
         gate, up = gate_up.chunk(2, dim=-1)
         torch.testing.assert_close(out[:, 1400:], (F.silu(gate) * up) * 0.5, atol=0, rtol=0)
         self.assertTrue((out[:, :1400] == 0).all())
+
+    def test_route_align_stays_a_sigmoid_route_by_default(self):
+        """The decoder path passes no ``softmax``, as it did before the kernel moved."""
+        import mstar.utils.fused_moe.route as moved
+        from mstar.model.command_a_plus.kernels import ROUTE_ALIGN_MAX_SLOTS, route_align
+
+        self.assertIs(route_align, moved.route_align)
+        self.assertEqual(ROUTE_ALIGN_MAX_SLOTS, moved.ROUTE_ALIGN_MAX_SLOTS)
+        logits = self.randn(4, 128).to(torch.bfloat16)
+        weights, _, _ = route_align(logits, 8, 16, torch.bfloat16)
+        softmax, _, _ = route_align(logits, 8, 16, torch.bfloat16, softmax=True)
+        self.assertFalse(torch.equal(weights, softmax))
 
     def test_route_align_matches_topk_and_moe_align(self):
         from mstar.model.command_a_plus.kernels import route_align
@@ -154,7 +166,8 @@ class FusedBackboneTests(unittest.TestCase):
         with torch.inference_mode():
             for start, stop in [(0, 5), (5, 6), (6, 7), (7, 8), (8, 9)]:
                 pos.positions["main"] = torch.arange(start, stop)
-                outputs.append(model(model.embed_tokens(token_ids[start:stop]), label="main"))
+                begin_test_step(model, stop - start)
+                outputs.append(model(model.embed_tokens(token_ids[start:stop])))
         return torch.cat(outputs)
 
     def test_fused_matches_unfused_and_dense_reference(self):

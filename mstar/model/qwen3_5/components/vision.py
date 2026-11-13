@@ -10,7 +10,7 @@ import torch
 from torch import nn
 
 from mstar.model.components.qwen3_vit import VisionBlock, VisionPatchEmbed, VisionRotaryEmbedding
-from mstar.model.qwen3_5.config import VISION_ATTN, Qwen3_5VisionConfig
+from mstar.model.qwen3_5.config import VISION_ATTN, VISION_TOKENS, Qwen3_5VisionConfig
 
 
 class VisionPatchMerger(nn.Module):
@@ -45,7 +45,7 @@ class Qwen3_5VisionModel(nn.Module):
         )
         self.rotary_pos_emb = VisionRotaryEmbedding(config)
         self.blocks = nn.ModuleList(
-            VisionBlock(config, VISION_ATTN) for _ in range(config.depth)
+            VisionBlock(config, VISION_ATTN, array=VISION_TOKENS, layer=layer) for layer in range(config.depth)
         )
         self.merger = VisionPatchMerger(config)
 
@@ -67,12 +67,21 @@ class Qwen3_5VisionModel(nn.Module):
         hidden, cos, sin = self.embed(pixel_values, indices, weights, position_ids)
         return self.merger(self.encode(hidden, cos, sin))
 
+    def checkpoint_rules(self):
+        """How the checkpoint's ``model.visual.*`` lands here, for its weight loader and
+        for LoRA adapters."""
+        from mstar.model.loader import CheckpointRules
+        from mstar.model.qwen3_5.weight_loader import qwen3_5_vision_name_remapper
+
+        return CheckpointRules(remap=qwen3_5_vision_name_remapper)
+
     def embed(
         self,
         pixel_values: torch.Tensor,
         indices: torch.Tensor,
         weights: torch.Tensor,
         position_ids: torch.Tensor,
+        **_: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Patch embed plus the resampled position table, and the rope for
         the blocks: everything before the block loop, per patch."""
@@ -98,3 +107,8 @@ class Qwen3_5VisionModel(nn.Module):
         for block in self.blocks:
             hidden = block(hidden, cos, sin)
         return hidden
+
+    def project(self, hidden: torch.Tensor, **_: torch.Tensor) -> torch.Tensor:
+        """The patch merger: one LLM-width token per ``spatial_merge_size ** 2``
+        block of patches."""
+        return self.merger(hidden)

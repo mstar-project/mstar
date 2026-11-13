@@ -17,8 +17,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from mstar.distributed.communication import CommGroup, JointGroups
 from mstar.engine.engine import Engine
-from mstar.engine.resources.base import CachedPrefix, EngineResourceInfo, Resource
+from mstar.engine.resources.base import CachedPrefix, EngineResourceInfo
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig, opening_prefix_caches
 from mstar.engine.resources.kv.keys import chain
@@ -38,6 +39,9 @@ from mstar.engine.resources.spec import CombinedSplit, NodeResourceSpec
 from mstar.engine.resources.step import Segment, StepContext
 from mstar.graph.base import GraphNode
 from mstar.model.base import KVLabel, PrefixKeys
+from mstar.testing_utils.engine import make_engine
+from mstar.testing_utils.model import StubModel
+from mstar.testing_utils.resource import StubResource
 from mstar.validation.resources import _unskippable_resources
 
 NODE, WALK, PAGE = "llm", "prefill", 4
@@ -64,12 +68,16 @@ class _StubChains:
     def chain_keys(self, rid, label, pages):
         return self.keys.get(rid, [])[:pages]
 
+    def bind_snapshots(self, pool):
+        del pool
+
 
 def _build(config: RecurrentStateConfig, world_size: int = 1, prefix_cache: bool = True) -> RecurrentStatePool:
     """The pool as the engine builds it, over a KV cache whose `prefix_cache` is ``prefix_cache``."""
     kv = _specs(0)["kv"]
     kv.config.prefix_cache = prefix_cache
-    group = type("Group", (), {"world_size": world_size})() if world_size > 1 else None
+    tp = CommGroup(my_global_rank=0, my_group_rank=0, group_members=list(range(world_size)))
+    group = JointGroups(tp_group=tp, sp_group=CommGroup.trivial(), instance=tp) if world_size > 1 else None
     spec = RecurrentStateSpec(resource_key="state", nodes=set(kv.nodes), config=config)
     return RecurrentStatePool.build(spec, EngineResourceInfo(
         device=torch.device("cpu"), joint_comm_group=group, dependencies={"kv": kv},
@@ -88,8 +96,12 @@ def _pool(prefix_slots: int = 2, world_size: int = 1, prefix_cache: bool = True)
     return pool
 
 
-def _ctx(rid: str) -> StepContext:
-    return StepContext(request_ids=(rid,), graph_walk=WALK, slot=0, capture=False)
+def _ctx(rid: str, after: int = 0) -> StepContext:
+    """``after`` tokens of the row's prompt run after this step, as for a chunk mid-prefill."""
+    return StepContext(
+        request_ids=(rid,), graph_walk=WALK, slot=0, capture=False,
+        chunk_tokens_after={rid: after} if after else {},
+    )
 
 
 def _step(rid: str, span: int) -> RecurrentStep:
@@ -207,9 +219,23 @@ def test_a_pool_keeps_snapshot_slots_only_for_a_cache_the_engine_opens():
     )
 
 
-def test_a_negative_prefix_slots_override_is_refused():
-    with pytest.raises(ValueError, match="prefix_slots=-1"):
-        _specs(0)["state"].apply_yaml_overrides(prefix_slots=-1)
+@pytest.mark.parametrize("override, refusal", [
+    ({"prefix_slots": -1}, "prefix_slots must be an integer >= 0; got -1"),
+    # the sink takes one slot, so no request would ever be admitted
+    ({"max_slots": 1}, "max_slots=1"),
+])
+def test_a_slot_override_that_cannot_work_is_refused(override, refusal):
+    with pytest.raises(ValueError, match=refusal):
+        _specs(0)["state"].apply_yaml_overrides(**override)
+
+
+def test_a_pool_too_small_for_one_requests_labels_is_refused():
+    """A request holds a slot per label, so one usable slot never admits two."""
+    with pytest.raises(ValueError, match="max_slots=2"):
+        RecurrentStateConfig(
+            num_layers=1, blocks={"state": RecurrentBlockConfig(shape=(3,), dtype=torch.float32)},
+            max_slots=2, labels=("main", "fork"),
+        )
 
 
 @pytest.mark.parametrize("admitted", [False, True])
@@ -236,15 +262,11 @@ def test_a_refused_admit_turns_the_restore_back_into_a_lease():
     assert pool._snap_refs == {pool._leases["b"].slot: 1}, "the re-probe took a second reference"
 
 
-class _StubHit(Resource):
+class _StubHit(StubResource):
     """A KV cache that holds the first ``length`` tokens of every prompt."""
 
     def __init__(self, length: int | None):
         self.length = length
-
-    @classmethod
-    def build(cls, spec, info):
-        raise NotImplementedError
 
     def resolve_cached_prefix(self, rid, node_name, graph_walk, inputs):
         return None if self.length is None else CachedPrefix("main", self.length, self.length)
@@ -285,11 +307,8 @@ class _StubTransfer:
         pass
 
 
-class _Keyed:
+class _Keyed(StubModel):
     """Keys ``main`` on ``kv`` from the prompt walk, decode extending it."""
-
-    def checkpoint_path(self):
-        return None
 
     def preprocess_fingerprint(self):
         return "_Keyed"
@@ -303,12 +322,8 @@ class _Keyed:
         return {WALK: GraphNode(name="LLM", input_names=["text_inputs"], outputs=[])}
 
 
-class _StubGDN(Resource):
+class _StubGDN(StubResource):
     """A linear-attention resource over the pool, which can't skip a prefix itself."""
-
-    @classmethod
-    def build(cls, spec, info):
-        raise NotImplementedError
 
 
 def _specs(prefix_slots: int) -> dict[str, NodeResourceSpec]:
@@ -332,13 +347,14 @@ def _specs(prefix_slots: int) -> dict[str, NodeResourceSpec]:
 def _open(monkeypatch, prefix_slots: int = 2, world_size: int = 1) -> Engine:
     monkeypatch.setattr(manager_mod, "KVTransferManager", _StubTransfer)
     specs = _specs(prefix_slots)
-    engine = Engine.__new__(Engine)
-    engine._resources = {
-        "kv": KVManager(cfg=specs["kv"].config, name="kv", joint_comm_group=None,
-                        transfer_engine_info=None, device=torch.device("cpu")),
-        "state": _build(specs["state"].config, world_size),
-        "gdn": _StubGDN(),
-    }
+    engine = make_engine(
+        _resources={
+            "kv": KVManager(cfg=specs["kv"].config, name="kv", joint_comm_group=None,
+                            transfer_engine_info=None, device=torch.device("cpu")),
+            "state": _build(specs["state"].config, world_size),
+            "gdn": _StubGDN(),
+        },
+    )
     instance = {"LLM": world_size}
     opened = opening_prefix_caches(specs.values(), instance, checkpoint_named=False)
     engine._open_prefix_caches(specs, _Keyed(), instance, opened, None)
@@ -431,8 +447,7 @@ def test_the_engine_opens_the_caches_the_startup_rule_opens(monkeypatch, specs, 
     local = [spec for spec in specs if not spec.nodes.isdisjoint(instance)]
     # as Engine.load_model evaluates it, once, for the builds and for opening
     rule = opening_prefix_caches(specs, instance, checkpoint_named=False)
-    engine = Engine.__new__(Engine)
-    engine._resources = {}
+    engine = make_engine()
     for spec in local:
         size = min(instance[node] for node in spec.nodes & instance.keys())
         if isinstance(spec, KVSpec):
@@ -441,7 +456,8 @@ def test_the_engine_opens_the_caches_the_startup_rule_opens(monkeypatch, specs, 
                 transfer_engine_info=None, device=torch.device("cpu"),
             )
         elif isinstance(spec, RecurrentStateSpec):
-            group = type("Group", (), {"world_size": size})() if size > 1 else None
+            tp = CommGroup(my_global_rank=0, my_group_rank=0, group_members=list(range(size)))
+            group = JointGroups(tp_group=tp, sp_group=CommGroup.trivial(), instance=tp) if size > 1 else None
             engine._resources[spec.resource_key] = RecurrentStatePool.build(spec, EngineResourceInfo(
                 device=torch.device("cpu"), joint_comm_group=group,
                 dependencies={dep: by_key[dep] for dep in spec.depends_on()},
@@ -476,7 +492,8 @@ def test_a_keyed_node_refuses_a_pool_whose_backend_writes_no_snapshots(variant):
     assert problems and "'state' cannot serve a request" in problems[0], problems
 
 
-@pytest.mark.parametrize("depends_on", [set(), {"kv"}])
+# an undeclared dependency is reported by `spec_dependency_problems`, and mustn't crash this check
+@pytest.mark.parametrize("depends_on", [set(), {"kv"}, {"undeclared"}])
 def test_a_keyed_node_still_refuses_a_resource_that_cant_skip_a_prefix(depends_on):
     class _Unskippable(NodeResourceSpec):
         @property
@@ -569,6 +586,74 @@ def test_a_prefill_hands_its_kept_states_to_the_backend_and_commit_files_them():
     assert pool._slots["a"]["main"].tokens == 19, "later boundaries would be placed from the wrong length"
 
 
+def _chunks(pool: RecurrentStatePool, rid: str, tokens: list[int], spans: list[int]) -> None:
+    """Prefill ``tokens`` from token 0 in chunks of ``spans``, each its own step."""
+    pool.ingest_request(rid)
+    pool._kv.add(rid, tokens)
+    pool.resolve_cached_prefix(rid, NODE, WALK, None)
+    left = sum(spans)
+    for span in spans:
+        left -= span
+        step, ctx = _step(rid, span), _ctx(rid, left)
+        assert pool.admit(step, ctx).ok
+        pool.plan(step, ctx)
+        pool.commit(step, ctx)
+
+
+def test_a_chunked_prompt_keeps_its_last_boundary_so_a_resend_restores_past_its_first_chunk():
+    """A step budget cuts a long prompt into chunks. With only the first chunk's boundary kept,
+    every resend restores there and runs the rest of the prompt again."""
+    pool = _pool(prefix_slots=3)
+    _chunks(pool, "a", A[:19], [8, 11])
+    assert _probe(pool, "b", A[:19], hit=16).tokens == 16
+    assert pool.chunk_alignment == PAGE, "the scheduler would cut chunks off the page grid"
+
+
+def test_a_later_chunk_makes_the_earlier_chunks_snapshot_the_first_to_evict():
+    """Two snapshots a chunked prompt would hold half as many prompts as slots, and a resend
+    cycle longer than the slots then restores nothing."""
+    pool = _pool(prefix_slots=4)
+    prompts = {"x": (A[:19], [8, 11]), "y": (list(range(100, 119)), [8, 11]),
+               "z1": (list(range(200, 219)), [19]), "z2": (list(range(300, 319)), [19])}
+    for rid, (tokens, spans) in prompts.items():
+        _chunks(pool, rid, tokens, spans)
+        pool.remove_request(rid)
+    assert _probe(pool, "b", A[:19], hit=16).tokens == 16
+
+
+def test_an_earlier_chunks_snapshot_still_serves_a_prompt_that_shares_only_that_chunk():
+    """A later chunk makes the earlier chunk's snapshot the first to evict once it files, not as it
+    reserves: with every slot a prompt's, the earlier one would be the only candidate, and a prompt
+    sharing just the first chunk (a long system prompt) would restore nothing."""
+    pool = _pool(prefix_slots=3)
+    for rid, tokens in {"p": range(100, 119), "q": range(200, 219), "r": range(300, 319)}.items():
+        _chunks(pool, rid, list(tokens), [19])
+        pool.remove_request(rid)
+    _chunks(pool, "x", A[:19], [8, 11])
+    pool.remove_request("x")
+    assert _probe(pool, "b", A[:12] + [99] * 7, hit=12).tokens == 8
+
+
+def test_a_chunk_of_one_page_keeps_its_end_so_a_budget_of_a_page_still_keeps_snapshots():
+    """A chunk with more of its prompt to come keeps the boundary at its end; the page before
+    its last token, which a resend of the whole prompt runs again, is what a prompt's last chunk keeps."""
+    pool = _pool(prefix_slots=4)
+    _chunks(pool, "a", A[:19], [PAGE] * 4 + [3])
+    assert _probe(pool, "b", A[:19], hit=16).tokens == 16
+    assert [reply for _, reply in pool._snap_meta.values()] == [True, True, True, False], (
+        "each chunk's snapshot should make the one before it the first to evict"
+    )
+
+
+def test_a_chunk_that_starts_off_the_page_grid_keeps_no_boundary():
+    """Its checkpoints fall a page apart from where it starts, so none is on a page."""
+    pool = _pool(prefix_slots=3)
+    _chunks(pool, "a", A[:19], [7])
+    step = _step("a", 12)
+    assert pool.admit(step, _ctx("a")).ok
+    assert not pool._snap_writes
+
+
 @pytest.mark.parametrize("release", ["rollback", "removal"])
 def test_a_prefill_that_never_commits_gives_its_snapshot_slots_back(release):
     """A forward that raises gets neither commit nor rollback, only the request's removal.
@@ -612,6 +697,30 @@ def test_a_decode_step_onto_a_page_boundary_saves_its_state():
     assert decode.tokens == 4 and decode.key == pool._kv.chain_key("a", "main", 1)
     assert pool._snap_by_key[decode.key] == decode.slot
     assert bool((pool._blocks["state"][:, decode.slot] == 3.0).all()), "the snapshot is not the state at 4"
+
+
+def test_a_step_that_repeats_snapshots_the_length_its_replays_reach():
+    """One host step stands for five decode iterations: the state it leaves covers
+    3 + 5 tokens, so its snapshot is the second page's, not the first's."""
+    pool = _pool()
+    _reply(pool)
+    step, ctx = _step("a", 1), _ctx("a")
+    ctx.repeats = 5
+    assert pool.admit(step, ctx).ok
+    pool.plan(step, ctx)
+    pool.commit(step, ctx)
+    decode = pool._decode[("a", "main")]
+    assert decode.tokens == 8 and decode.key == pool._kv.chain_key("a", "main", 2)
+
+
+def test_a_run_ends_on_the_next_page_boundary_while_snapshots_are_on():
+    """A replay can't stop to copy the state mid-run, so a run that crossed a
+    boundary would skip that page's snapshot."""
+    pool = _pool()
+    _reply(pool)
+    assert pool.max_repeats(_step("a", 1), _ctx("a")) == 1  # at 3 of a 4-token page
+    _decode(pool, "a", 1)
+    assert pool.max_repeats(_step("a", 1), _ctx("a")) == PAGE
 
 
 def test_a_decode_snapshot_is_filed_once_the_chain_keys_its_page():

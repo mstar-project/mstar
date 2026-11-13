@@ -6,14 +6,13 @@ frame than the processor's resize and crop.
 """
 
 import json
-import sys
-import types
 
 import pytest
 import torch
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.graph.base import TensorPointerInfo
+from mstar.model.vjepa2 import vjepa2_model
 from mstar.model.vjepa2.submodules import VJepa2EncoderSubmodule
 from mstar.model.vjepa2.vjepa2_model import (
     _IMAGENET_MEAN,
@@ -70,16 +69,23 @@ def hf_model(tmp_path):
 
 
 @pytest.mark.parametrize("hw", [(180, 320), (320, 180), (256, 256), (480, 640)])
-def test_preprocess_matches_hf_processor(hf_model, hw):
-    """Same pixels as HF's processor. Being within one uint8 step is not enough:
-    the float resize this replaced was, and cost ~0.1 of embedding cosine."""
+def test_preprocess_matches_hf_processor(hf_model, hw, monkeypatch):
+    """Same pixels as HF's processor on the whole clip, though process_prompt
+    runs it on each decode group as it lands. Being within one uint8 step is
+    not enough: the float resize this replaced was, and cost ~0.1 of embedding
+    cosine."""
     from transformers.models.vjepa2.video_processing_vjepa2 import VJEPA2VideoProcessor
 
     frames = _clip(8, *hw)
     ref = VJEPA2VideoProcessor()(videos=frames, return_tensors="pt")["pixel_values_videos"][0]
-    # channels last, as torchcodec decodes them
+    # channels last, as torchcodec decodes them, in uneven decode groups
     decoded = frames.permute(0, 2, 3, 1).contiguous().permute(0, 3, 1, 2)
-    out = hf_model.process_prompt(None, ["video"], ["embedding"], tensors={"video_inputs": [decoded]})
+    monkeypatch.setattr(vjepa2_model, "decode_frames_at", lambda src, idx, transform: torch.cat(
+        [transform(decoded[grp]) for grp in torch.tensor(idx).tensor_split([1, 4])]))
+    out = hf_model.process_prompt(
+        None, ["video"], ["embedding"], tensors={"video_inputs": [torch.zeros(1, dtype=torch.uint8)]},
+        input_metadata={"video_inputs": [{"sampled_indices": list(range(8))}]},
+    )
     ours = out.new_input_tensors["video_frames"][0]
     assert ours.shape == ref.shape == (8, 3, 256, 256)
     assert (ours - ref).abs().max().item() < 1e-4
@@ -88,7 +94,7 @@ def test_preprocess_matches_hf_processor(hf_model, hw):
 def test_hf_crop_is_narrower(hf_model):
     """The processor crops 256 out of a 292-pixel short side, so the square's
     top and bottom rows fall outside it."""
-    out = _pixels(hf_model._preprocess_video(_frames(180, 320), target_frames=2))
+    out = _pixels(hf_model._preprocess_frames(_frames(180, 320)))
     assert out.shape == (2, 3, 256, 256)
     assert out[..., 0, :].min() > 0.4
     assert out[..., -1, :].max() < 0.6
@@ -103,29 +109,6 @@ def test_a_checkpoint_without_a_video_processor_is_refused_at_startup(tmp_path):
 def test_a_processor_that_crops_another_size_is_refused_at_startup(tmp_path):
     with pytest.raises(ValueError, match="crops"):
         VJepa2Model(_checkpoint(tmp_path, crop_size=384))
-
-
-def test_load_video_hands_over_the_decoded_bytes(monkeypatch):
-    """process_prompt gets the decoder's uint8 frames as they are, so no float
-    copy of the full-size clip is made."""
-    decoded = _clip(4, 36, 64)
-
-    class Decoder:
-        metadata = types.SimpleNamespace(num_frames=4, height=36, width=64)
-
-        def __init__(self, *_args, **_kwargs):
-            pass
-
-        def get_frames_at(self, indices):
-            return types.SimpleNamespace(data=decoded[indices])
-
-    decoders = types.ModuleType("torchcodec.decoders")
-    decoders.VideoDecoder = Decoder
-    monkeypatch.setitem(sys.modules, "torchcodec", types.ModuleType("torchcodec"))
-    monkeypatch.setitem(sys.modules, "torchcodec.decoders", decoders)
-    video = VJepa2Model("unused", skip_weight_loading=True).load_video("clip.mp4", "cpu").data
-    assert video.dtype == torch.uint8
-    assert torch.equal(video, decoded)
 
 
 @pytest.mark.parametrize("hw", [(180, 320), (320, 180), (256, 256)])
@@ -176,20 +159,24 @@ def _pointer(tensor: torch.Tensor) -> TensorPointerInfo:
 
 
 @pytest.mark.parametrize("stream", [False, True])
-def test_ac_rollout_request_replays_the_encoder_capture(stream):
+def test_ac_rollout_request_replays_the_encoder_capture(stream, monkeypatch):
     """An AC rollout clip goes through the request's own trim and crop and lands
     on the encoder capture's key; a clip of any other shape runs eager without a
     word, so a change to either would quietly drop the capture."""
+    # the frames load_video sampled, decoded by index as the request's decode does
+    clip = torch.randint(0, 256, (16, 3, 180, 320), dtype=torch.uint8)
+    monkeypatch.setattr(vjepa2_model, "decode_frames_at", lambda src, idx, transform: transform(clip[idx]))
     model = VJepa2ACModel("unused", skip_weight_loading=True)
     kwargs = {"actions": [[0.1] * 7] * 4, "states": [[0.2] * 7] * 4, "rollout_horizon": 4, "stream_rollout": stream}
     out = model.process_prompt(
-        None, ["video"], ["embedding"], tensors={"video_inputs": [_clip(16, 180, 320)]}, **kwargs,
+        None, ["video"], ["embedding"], tensors={"video_inputs": [torch.zeros(1, dtype=torch.uint8)]},
+        input_metadata={"video_inputs": [{"sampled_indices": list(range(16))}]}, **kwargs,
     ).new_input_tensors
     signals = {name: [_pointer(t) for t in tensors] for name, tensors in out.items()}
-    args = model.get_initial_forward_pass_args("p0", ["video"], ["embedding"], signals, kwargs)
-    walk = args.full_metadata.graph_walk
+    (step,) = model.walk_plan("p0", ["video"], ["embedding"], signals, kwargs)
+    walk = step.walk
     info = CurrentForwardPassInfo(request_id="r", graph_walk=walk, fwd_index=0, random_seed=0, max_tokens=0)
-    info.step_metadata.update(args.step_metadata)
+    info.step_metadata.update(step.step_metadata)
 
     encoder = VJepa2EncoderSubmodule(encoder=None, config=model.config)
     (capture,) = encoder.get_accelerator_graph_configs(torch.device("cpu"))

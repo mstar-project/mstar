@@ -14,15 +14,23 @@ from collections.abc import Mapping
 
 import torch
 
+from mstar.distributed.communication import gather_sequence
 from mstar.engine.resources.base import CGSlotKey, CGSlotSpec, Resource
-from mstar.engine.resources.linear_attn.base import LinearAttnManager
-from mstar.engine.resources.linear_attn.config import LinearAttnConfig, LinearAttnStep
+from mstar.engine.resources.linear_attn.base import (
+    Chunk,
+    LinearAttnManager,
+    SplitRows,
+    gather_rows,
+    scatter_rows,
+)
+from mstar.engine.resources.linear_attn.config import LinearAttnConfig, LinearAttnStep, bf16_gdn_state_fits
 from mstar.engine.resources.linear_attn.gdn_stage import gdn_stage_applies
 from mstar.engine.resources.linear_attn.wrappers import (
     GDNDecodeWrapper,
     GDNMixedWrapper,
     GDNPrefillWrapper,
     GDNWrapper,
+    gdn_kernel,
 )
 from mstar.engine.resources.recurrent.config import DeltaNetGeometry
 from mstar.engine.resources.recurrent.pool import (
@@ -32,6 +40,8 @@ from mstar.engine.resources.recurrent.pool import (
     RecurrentStatePool,
     checkpoint_rows,
 )
+from mstar.engine.resources.resident_hooks import ANY_REPEATS
+from mstar.engine.resources.sequence_shard import state_passing, ulysses
 from mstar.engine.resources.spec import CombinedSplit
 from mstar.engine.resources.step import Segment, SlotLease, StepContext
 from mstar.platforms.compile import compiled
@@ -41,9 +51,8 @@ logger = logging.getLogger(__name__)
 
 
 # Run compiled: eager, the normalize is four full-size passes per tensor (fp32
-# copy, norm, divide, cast); compiled, one. Not dynamic=True: a symbolic head dim
-# made the reduction ~3x slower; the token count goes dynamic on its own at the
-# second size.
+# copy, norm, divide, cast); compiled, one. Only the token count is dynamic: a
+# symbolic head dim made the reduction ~3x slower.
 def _l2norm_qk(q: torch.Tensor, k: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """Both in one compiled call, so a layer pays one guard check, not two."""
     def norm(t):
@@ -65,6 +74,10 @@ _PREFILL_STATE_DTYPES: dict[int, tuple[torch.dtype, ...]] = {
 
 
 class GDNManager(LinearAttnManager):
+    supports_split_steps = True
+    # the state is the recurrent pool's, which a drop zeroes
+    supports_drop = True
+
     def __init__(
         self,
         config: LinearAttnConfig,
@@ -113,11 +126,13 @@ class GDNManager(LinearAttnManager):
         self._eager_wrappers: dict[tuple[str, bool], GDNWrapper] = {}
 
         self._current: dict[str, GDNWrapper] = {}
+        # label -> this rank's share of it, for a label the step splits over SP ranks
+        self._split_rows: dict[str, SplitRows] = {}
 
         # Pre-planning mutates no live state, so staging is just caching the
         # result.
         self._preplanned = False
-        self._cached_plan_output: dict[str, GDNWrapper] | None = None
+        self._cached_plan_output: tuple[dict[str, GDNWrapper], dict[str, SplitRows]] | None = None
 
     @staticmethod
     def _check_state_dtype(
@@ -130,8 +145,8 @@ class GDNManager(LinearAttnManager):
                 f"gdn state dtype {state_dtype} is not supported: FlashInfer's "
                 "pool decode paths are fp32 and bf16."
             )
-        # The bf16 decode kernel is pool-only and K=V=128 only.
-        if geometry.head_k_dim != 128 or geometry.head_v_dim != 128:
+        # The bf16 decode kernel is pool-only.
+        if not bf16_gdn_state_fits(geometry.head_k_dim, geometry.head_v_dim):
             raise NotImplementedError(
                 f"a bf16 gdn state needs K=V=128, got K={geometry.head_k_dim} "
                 f"V={geometry.head_v_dim}; declare an fp32 pool instead."
@@ -152,11 +167,23 @@ class GDNManager(LinearAttnManager):
                 "them. Unset RecurrentStateConfig.disable_sink_slot."
             )
 
-    def depends_on(self) -> set[str]:
-        # the pool plans first; its addressing arrives via `ctx.plan_results`
-        return {self._pool_key}
+    def max_repeats(self, step, ctx) -> int:
+        return ANY_REPEATS  # decode addresses the pool by slot alone
+
+    def resident_refusal(self) -> str | None:
+        # decode addresses the pool by slot alone, which the pool's table holds. Resident decode on a
+        # node whose steps split is not tested (a replay runs no split code, but nothing has replayed
+        # beside split prefills). From the shard's bind (the group's size and the spec), so every
+        # rank of the node decides alike
+        if self._shard is None:
+            return None
+        return (
+            f"its steps split over {self._shard.group.world_size} SP ranks, and "
+            "resident decode there is untested"
+        )
 
     def bind_dependencies(self, resources: Mapping[str, Resource]) -> None:
+        super().bind_dependencies(resources)
         self._pool = resources.get(self._pool_key)
 
     # Step lifecycle
@@ -170,22 +197,30 @@ class GDNManager(LinearAttnManager):
             "linear-attn preplan is already pending; clear_preplan before "
             "planning a different step ahead"
         )
+        if ctx.resident is not None:
+            # a replayed decode wrapper reads only the pool's slots, which its graph fills
+            return self._current
         self.reset_default_cursors()
         if self._preplanned:
-            self._current = self._cached_plan_output
+            self._current, self._split_rows = self._cached_plan_output
             self.clear_preplan()
             return self._current
 
         addressing: dict[str, RecurrentAddressing] = ctx.plan_results[self._pool_key]
 
-        self._current = {}
+        self._current, self._split_rows = {}, {}
         for label, segments in self._group_by_label(step.segments or ()).items():
-            self._current[label] = self._build_plan(
+            wrapper = self._current[label] = self._build_plan(
                 label, segments, addressing[label], ctx
             )
+            # an eager split walk's step runs its leading decode rows apart (`GDNMixedWrapper`)
+            run = wrapper.halves[2] if isinstance(wrapper, GDNMixedWrapper) else 0
+            split = self._plan_split(label, [seg.span for seg in segments], addressing[label], ctx, run)
+            if split is not None:
+                self._split_rows[label] = split
         if ctx.is_preplan:
             self._preplanned = True
-            self._cached_plan_output = self._current
+            self._cached_plan_output = self._current, self._split_rows
         return self._current
 
     def clear_preplan(self):
@@ -365,16 +400,110 @@ class GDNManager(LinearAttnManager):
         it (see `GDNWrapper.qk_l2norm_in_kernel`).
         """
         plan = self.current_plan(label)
-        if self.config.qk_l2norm and not plan.qk_l2norm_in_kernel:
-            q, k = compiled(_l2norm_qk)(q, k)
+        split = self._split_rows.get(self._default_label if label is None else label)
+        # a split step's hand-off runs the chunked kernel itself, which normalizes nothing
+        in_kernel = plan.qk_l2norm_in_kernel and (split is None or self._split_exchange == "ulysses")
+        if self.config.qk_l2norm and not in_kernel:
+            q, k = compiled(_l2norm_qk, dynamic_args=(0, 1))(q, k)
         # a split projection gives column views; copy only for a kernel that
         # needs them contiguous
         if not plan.takes_strided_inputs:
             v = v.contiguous()
             a = a.contiguous()
             b = b.contiguous()
+        if split is None:
+            return plan.run(q, k, v, a, b, state_layer, a_log, dt_bias)
+        decode, prefill, _ = plan.halves if isinstance(plan, GDNMixedWrapper) else (None, plan, 0)
+        if split.run:
+            # the decode run, copied: every rank runs it on every head, in place on its replica
+            decode = decode.run(*self._decode_slab(split, q, k, v, a, b), state_layer, a_log, dt_bias)
+        else:
+            decode = None
+        exchange = self._ulysses if self._split_exchange == "ulysses" else self._state_passing
+        out = exchange(prefill, split, q, k, v, a, b, state_layer, a_log, dt_bias)
+        if decode is not None:
+            # this rank's tokens of the run lead its share
+            rank, counts = split.seq_range.group.rank, split.decode_tokens
+            start = sum(counts[:rank])
+            out[: counts[rank]] = decode[start:start + counts[rank]].to(out.dtype)
+        return out
 
-        return plan.run(q, k, v, a, b, state_layer, a_log, dt_bias)
+    def _ulysses(self, prefill: GDNWrapper, split: SplitRows, q, k, v, a, b, state_layer, a_log, dt_bias):
+        """A split step's prompt rows by head (``sequence_shard.ulysses``): every token of a block
+        of heads, the chunked half run on it over the replica's block of the state, and the
+        block's final states gathered into every replica. The decode run's tokens ride the
+        exchange; the chunked half (planned eagerly past the run) doesn't read them."""
+        group = split.seq_range.group
+        heads = state_layer.shape[1] // group.world_size
+        lo, hi = group.rank * heads, (group.rank + 1) * heads
+        front, slots = split.run, split.prompt_slots
+
+        def run(q, k, v, a, b):
+            if not split.has_prompt:
+                # nothing past the run (from the shared plan, so alike on every rank)
+                return torch.zeros_like(v)
+            block = state_layer[:, lo:hi]
+            out = prefill.run(
+                q[front:], k[front:], v[front:], a[front:], b[front:], block, a_log[lo:hi], dt_bias[lo:hi],
+            )
+            finals = group.all_gather(block.index_select(0, slots.long().clamp_min(0)), dim=1)
+            scatter_rows(state_layer, slots, finals)
+            return torch.cat([out.new_zeros(front, *out.shape[1:]), out]) if front else out
+
+        return ulysses(run, q, k, v, a, b, r=split.seq_range)
+
+    def _state_passing(self, prefill: GDNWrapper, split: SplitRows, q, k, v, a, b, state_layer, a_log, dt_bias):
+        """A split step's prompt rows by token (``sequence_shard.state_passing``), as planned
+        (``HandOff``): each rank runs the rows starting on it from their slots, hands off the row it
+        passes on (its final, or for a middle piece the piece's transition from the identity with
+        no values and its offset from zeros, which needs equal key and value dims), runs a row
+        continuing into it from the state it gets, and every row's final state is gathered into
+        every replica."""
+        group, plan = split.seq_range.group, split.hand_off
+        alpha = torch.exp(-torch.exp(a_log.float()) * torch.nn.functional.softplus(a.float() + dt_bias.float()))
+        beta = torch.sigmoid(b.float())
+        heads, dim_v, dim_k = state_layer.shape[1:]
+        out = v.new_zeros(v.shape[0], heads, dim_v)
+        finals: dict[int, torch.Tensor] = {}
+
+        def chunked(chunk: Chunk, initial: torch.Tensor, zero_values: bool = False) -> torch.Tensor:
+            # the chunked kernel over the chunk's rows here, a sequence each (with `zero_values`, its
+            # second half has no values); never on an empty set, on which the kernel deadlocks
+            # while the other ranks wait in the hand-off
+            values = v.index_select(0, chunk.index)
+            if zero_values:
+                values[values.shape[0] // 2:] = 0
+            got, final = gdn_kernel("chunk_gated_delta_rule", q.device)(
+                q=q.index_select(0, chunk.index), k=k.index_select(0, chunk.index), v=values,
+                g=alpha.index_select(0, chunk.index), beta=beta.index_select(0, chunk.index),
+                scale=self.config.sm_scale, initial_state=initial.to(self._prefill_dtype), output_final_state=True,
+                cu_seqlens=chunk.cu, use_qk_l2norm_in_kernel=False,
+            )
+            if not zero_values:
+                start = 0
+                for j, i in enumerate(chunk.rows):
+                    span, at = int(plan.spans[i]), int(plan.offsets[i])
+                    out[at:at + span] = got[start:start + span].to(out.dtype)
+                    finals[i] = final[j].float()
+                    start += span
+            return final.float()
+
+        if plan.fresh is not None:
+            chunked(plan.fresh, gather_rows(state_layer, plan.fresh_slots, plan.fresh_has_state))
+        identity = torch.eye(dim_k, device=q.device).expand(heads, dim_k, dim_k)
+        transition, offset = identity, state_layer.new_zeros(heads, dim_v, dim_k, dtype=torch.float32)
+        if plan.middle is not None:
+            # its offset from zeros, its transition from the identity with no values
+            offset, transition = chunked(plan.middle, torch.stack([torch.zeros_like(identity), identity]), True)
+        elif plan.passes is not None:
+            transition, offset = torch.zeros_like(identity), finals[plan.passes]
+        entering = state_passing(group, transition, offset, torch.matmul)
+        if plan.first is not None:
+            chunked(plan.first, entering[None])
+        local = [finals[i] for i in plan.rows if i in plan.ends]
+        mine = torch.stack(local) if local else offset.new_zeros(0, heads, dim_v, dim_k)
+        scatter_rows(state_layer, plan.ended_slots, gather_sequence(group, mine, plan.counts))
+        return out
 
     @torch.compiler.disable
     def run_conv(
@@ -394,6 +523,9 @@ class GDNManager(LinearAttnManager):
         in place. Padding rows carry the pool's null slot, which both conv
         kernels skip.
         """
+        label = self._default_label if label is None else label
+        if label in self._split_rows:
+            return self._conv_split(label, x, conv_layer, weight, bias, activation)
         return self.current_plan(label).run_conv(
             x=x, conv_layer=conv_layer, weight=weight, bias=bias,
             activation=activation,
@@ -414,4 +546,6 @@ class GDNManager(LinearAttnManager):
         self._cg_wrappers.clear()
         self._eager_wrappers.clear()
         self._current.clear()
+        self._split_rows.clear()
         self._checkpoints = None
+

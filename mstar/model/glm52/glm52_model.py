@@ -2,13 +2,15 @@
 
 import json
 import logging
+from collections.abc import Mapping
 from pathlib import Path
+from types import MappingProxyType
 
 import torch
 from jinja2 import TemplateError
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import CurrentForwardConductorMetadata
+from mstar.conductor.request_info import FINAL_PREFILL
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
@@ -26,10 +28,16 @@ from mstar.engine.resources import (
 )
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span
+from mstar.model.base import KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, WalkStep
+from mstar.model.components.request_kwargs import (
+    SAMPLING_KEYS,
+    generation_config_dir,
+    sampling_defaults,
+)
 from mstar.model.glm52.config import (
     ATTN_RESOURCE,
     DSA_RESOURCE,
+    KERNELS,
     KV_RESOURCE,
     POS_RESOURCE,
     SAMPLER_RESOURCE,
@@ -37,17 +45,43 @@ from mstar.model.glm52.config import (
 )
 from mstar.model.multimodal import TEXT, PromptPart, chat_turns
 from mstar.model.submodule_base import NodeSubmodule
+from mstar.model.utils import (
+    ByteLevelTextOutput,
+    capture_ladder,
+    load_snapshot_tokenizer,
+    read_fp8_block_quant_config,
+    resolve_checkpoint,
+)
 from mstar.utils.generation_kwargs import normalize_generation_kwargs
-from mstar.utils.hf_snapshot import resolve_snapshot_dir
 
 logger = logging.getLogger(__name__)
 
+# kernels: auto fuses all-reduces up to this size into the next add + RMSNorm; larger ones
+# reduce, add and norm apart
+AR_FUSION_MAX_BYTES = 1 << 20
+# model_kwargs that kernels and the checkpoint's quantization replaced, refused rather than ignored
+_RETIRED_KWARGS = (
+    "moe_quant_kernel", "moe_decode_kernel", "moe_router_kernel", "moe_prefill_kernel",
+    "moe_fused_allreduce", "dense_fp8", "mla_fused_prep", "fused_add_rmsnorm",
+    "prefill_last_layer_rows")
+# The quantized checkpoint formats GLM-5.2's loader reads itself: fp8 block-scale
+# (weight_loader.py dequantizes the dense weights and keeps the routed experts fp8).
+QUANT_METHODS = ("fp8",)
 
-class Glm52Model(Model):
+# what zai-org/GLM-5.2's generation_config.json declares, for a checkpoint whose file is not at hand
+DEFAULT_SAMPLING = MappingProxyType({"temperature": 1.0, "top_p": 0.95})
+
+
+class Glm52Model(ByteLevelTextOutput, Model):
     """GLM-5.2: 753B MoE causal LM (MLA + DSA), text in / text out."""
+
+    DECODE_LOOP = "decode_loop"
 
     # the conductor builds the fused-MoE align op before spawning the workers
     prebuild_fused_moe = True
+    # the checkpoint's sampling defaults, under whatever a request sets (set by
+    # `__init__`; a model built without it takes the published recipe)
+    sampling_defaults: Mapping[str, object] = DEFAULT_SAMPLING
 
     def __init__(
         self,
@@ -80,24 +114,67 @@ class Glm52Model(Model):
             self.config.dsa_long_context = True
             # Guard + KV sizing move from index_topk to the serving window.
             self.config.max_seq_len = int(kwargs.get("max_seq_len", 8192))
-        if "moe_quant_kernel" in kwargs:
-            self.config.moe_quant_kernel = str(kwargs["moe_quant_kernel"])
-        if "graph_compile" in kwargs:
-            self.config.graph_compile = bool(kwargs["graph_compile"])
-        for key in ("prefill_token_buckets", "prefill_capture_batch_sizes"):
-            if key in kwargs:
-                setattr(self.config, key, [int(n) for n in kwargs[key]])
-        if int(kwargs.get("mtp_num_draft_tokens", 0)) > 0:
+        retired = sorted(k for k in _RETIRED_KWARGS if k in kwargs)
+        if retired:
+            # a config that still names one would otherwise serve without what it asks for
             raise ValueError(
-                "mtp_num_draft_tokens > 0: GLM-5.2 MTP speculative decoding is "
-                "not supported yet and follows as a separate change; serve with "
-                "mtp_num_draft_tokens=0"
-            )
+                f"{retired}: GLM-5.2 has no such switch; model_kwargs.kernels picks its kernels "
+                f"({' or '.join(KERNELS)}) and the checkpoint its fp8 linears")
+        if "kernels" in kwargs:
+            if kwargs["kernels"] not in KERNELS:
+                raise ValueError(f"kernels must be one of {KERNELS}, got {kwargs['kernels']!r}")
+            self.config.kernels = kwargs["kernels"]
+        if "graph_compile" in kwargs:
+            # bool("false") is True
+            if not isinstance(kwargs["graph_compile"], bool):
+                raise ValueError(f"graph_compile must be true or false, got {kwargs['graph_compile']!r}")
+            self.config.graph_compile = kwargs["graph_compile"]
+        if "prefill_capture_batch_sizes" in kwargs:
+            self.config.prefill_capture_batch_sizes = capture_ladder(
+                "prefill_capture_batch_sizes", kwargs["prefill_capture_batch_sizes"])
+        if "mtp_num_draft_tokens" in kwargs:
+            k = kwargs["mtp_num_draft_tokens"]
+            if isinstance(k, bool) or not isinstance(k, int) or k < 0:
+                raise ValueError(f"mtp_num_draft_tokens must be an integer, 0 (off) or more, got {k!r}")
+            self.config.mtp_num_draft_tokens = k
+        if self.config.mtp_num_draft_tokens > 0:
+            self._check_mtp(kwargs)
         # "byte" maps UTF-8 bytes to token ids for reduced serve (no HF IO).
         self._tokenizer_mode = kwargs.get("tokenizer_mode", "hf")
         self._tokenizer = None
-        self._detokenizer = None
         self._submodule_cache: dict[str, NodeSubmodule | None] = {}
+        self.sampling_defaults = sampling_defaults(
+            generation_config_dir(self.model_path_hf, cache_dir), DEFAULT_SAMPLING)
+
+    def _check_mtp(self, kwargs: dict) -> None:
+        if self.config.dsa_long_context:
+            # the draft loop stays in the short-context regime; k-store sync
+            # and rewind for the sparse path are not written
+            raise ValueError(
+                "mtp_num_draft_tokens and dsa_long_context are mutually "
+                "exclusive: MTP drafting is short-context only"
+            )
+        if self._config_variant in ("reduced", "reduced_fp8"):
+            from mstar.model.glm52.components.indexer import is_full_indexer_layer
+
+            # reduced() has 2 trunk layers, which puts the MTP layer on a SHARED indexer
+            # slot; grow the trunk so it lands FULL, as layer 78 does in the real geometry
+            if not is_full_indexer_layer(self.config, self.config.num_hidden_layers):
+                self.config.num_hidden_layers = (
+                    self.config.index_skip_topk_offset - 1 + self.config.index_topk_freq
+                )
+        elif "num_hidden_layers" in kwargs:
+            # every checkpoint layer past the trunk routes to the draft module
+            raise ValueError(
+                "mtp_num_draft_tokens needs the checkpoint's own trunk depth; "
+                "with num_hidden_layers set, trunk layers would load as the MTP layer"
+            )
+        if self.config.max_prompt_tokens < 1:
+            # two verify blocks of k + 1 rows stay free under the context limit
+            raise ValueError(
+                f"mtp_num_draft_tokens={self.config.mtp_num_draft_tokens} leaves no room for a "
+                f"prompt in the {self.context_limit()}-token context"
+            )
 
     def _checkpoint_config(self) -> Glm52ModelConfig:
         """A local checkpoint's config.json geometry, else the official one."""
@@ -114,42 +191,8 @@ class Glm52Model(Model):
         # Lazy: weights AND tokenizer load on demand so the conductor process
         # never touches the 750 GB checkpoint or HF IO in dummy/byte mode.
         if self._tokenizer is None:
-            from transformers import AutoTokenizer
-
-            tokenizer_source = str(
-                resolve_snapshot_dir(self.model_path_hf, cache_dir=self.cache_dir))
-            try:
-                self._tokenizer = AutoTokenizer.from_pretrained(
-                    tokenizer_source, cache_dir=self.cache_dir,
-                )
-            except ValueError:
-                # The checkpoint's tokenizer_config declares transformers-5's
-                # TokenizersBackend class, which transformers 4.x cannot
-                # construct — but the underlying tokenizer.json is
-                # version-independent, so building a fast tokenizer straight
-                # from it encodes identically.
-                self._tokenizer = self._fast_tokenizer_fallback(tokenizer_source)
+            self._tokenizer = load_snapshot_tokenizer(self.model_path_hf, self.cache_dir)
         return self._tokenizer
-
-    @staticmethod
-    def _fast_tokenizer_fallback(source: str):
-        from transformers import PreTrainedTokenizerFast
-
-        snap = Path(source)
-        tokenizer = PreTrainedTokenizerFast(
-            tokenizer_file=str(snap / "tokenizer.json"))
-        template = snap / "chat_template.jinja"
-        if template.is_file():
-            tokenizer.chat_template = template.read_text()
-        # built from tokenizer.json alone, the tokenizer has no special tokens, so the
-        # detokenizer would print <|user|> and the other turn markers into replies
-        config = snap / "tokenizer_config.json"
-        if config.is_file():
-            cfg = json.loads(config.read_text())
-            special = {k: cfg[k] for k in ("eos_token", "pad_token") if cfg.get(k)}
-            tokenizer.add_special_tokens(
-                {**special, "additional_special_tokens": list(cfg.get("extra_special_tokens") or [])})
-        return tokenizer
 
     # -------------------------------------------------------------------
     # Model ABC: resources
@@ -158,8 +201,13 @@ class Glm52Model(Model):
     def get_node_resources(self) -> list[NodeResourceSpec]:
         # Absorbed MLA caches one latent row per token per layer
         # (kv_lora_rank + rope dims = 576) shared by all 64 query heads. No
-        # Yarn -> the softmax scale is plain qk_head_dim**-0.5.
-        num_kv_layers = self.config.num_hidden_layers
+        # Yarn -> the softmax scale is plain qk_head_dim**-0.5. With MTP on,
+        # the layer-78 draft module keeps its KV in one extra layer plane at
+        # index num_hidden_layers, on the trunk's page table (draft-tail rows
+        # are overwritten as the verified stream advances into them).
+        num_kv_layers = self.config.num_hidden_layers + (
+            1 if self.config.mtp_num_draft_tokens > 0 else 0
+        )
         nodes = {"LLM"}
         if self.config.mla_absorb:
             kv = PagedKVConfig(
@@ -202,9 +250,12 @@ class Glm52Model(Model):
                 resource_key=POS_RESOURCE, nodes=nodes,
                 config=self.config.position_config(),
             ),
+            # min-p only where the checkpoint defaults it; elsewhere a request's
+            # min_p > 0 is refused at admission
             SamplerSpec(
                 resource_key=SAMPLER_RESOURCE, nodes=nodes,
                 vocab_size=self.config.vocab_size,
+                enable_min_p=bool(self.sampling_defaults.get("min_p")),
             ),
         ]
         if self.config.dsa_long_context:
@@ -255,11 +306,8 @@ class Glm52Model(Model):
                     ),
                 ],
             ),
-            # Runaway guard only: the per-request budget is the loop cap
-            # (get_loop_caps), set from the request's max_tokens. Sized to the most
-            # decode steps any prompt can take before the context guard, not
-            # to the default budget: at the default, every request asking for
-            # more was cut short at 1025 tokens with no error.
+            # The window every request's loop cap (get_loop_caps) must fit: the
+            # most decode steps a one-token prompt can take before the context guard.
             max_iters=self.max_decode_steps(),
             outputs=[],
         )
@@ -267,73 +315,21 @@ class Glm52Model(Model):
         return dict(prefill=prefill, decode=decode)
 
     # -------------------------------------------------------------------
-    # Model ABC: conductor state machine (prefill -> decode -> done)
+    # Model ABC: walk plan
 
-    def get_initial_forward_pass_args(
+    def walk_plan(
         self,
         partition_name: str,
         input_modalities: list[str],
         output_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]],
-        model_kwargs: dict | None = None,
-    ) -> ForwardPassArgs:
-        full_metadata = CurrentForwardConductorMetadata(
-            input_modalities=input_modalities,
-            output_modalities=output_modalities,
-            graph_walk="prefill",
-            is_prefill=True,
-        )
-
-        graph_edge = GraphEdge(next_node="LLM", name="text_inputs")
-        graph_edge.tensor_info = input_signals.get("text_inputs", [])
-        inputs = [graph_edge]
-        unpersist_tensors = sum([inp.tensor_info for inp in inputs], start=[])
-
-        return ForwardPassArgs(
-            full_metadata=full_metadata,
-            inputs=inputs,
-            unpersist_tensors=unpersist_tensors,
-            step_metadata={"is_prefill": True},
-        )
-
-    def get_partition_forward_pass_args(
-        self,
-        partition_name: str,
-        partition_metadata: CurrentForwardConductorMetadata,
-        persist_signals: dict[str, list[TensorPointerInfo]],
-        incoming_connections=None,
-    ) -> ForwardPassArgs:
-        metadata = partition_metadata
-        request_done = False
-
-        if metadata.is_prefill:
-            metadata.is_prefill = False
-            metadata.graph_walk = "decode"
-        elif metadata.graph_walk == "decode":
-            # The decode Loop ran to EOS (submodule check_stop) or to
-            # max_iters; either way the request is finished.
-            request_done = True
-            metadata.kwargs["decode_finished"] = True
-
-        if request_done:
-            return ForwardPassArgs(
-                full_metadata=metadata,
-                inputs=[],
-                unpersist_tensors=[],
-                request_done=True,
-            )
-
-        graph_edge = GraphEdge(next_node="LLM", name="text_inputs")
-        graph_edge.tensor_info = persist_signals.get("new_token", [])
-        unpersist_tensors = list(graph_edge.tensor_info)
-        inputs = [graph_edge]
-
-        return ForwardPassArgs(
-            full_metadata=metadata,
-            inputs=inputs,
-            unpersist_tensors=unpersist_tensors,
-            step_metadata={"is_prefill": metadata.is_prefill},
-        )
+        model_kwargs: dict,
+    ) -> list[WalkStep]:
+        # one prefill over the prompt, then decode until the stop check ends it
+        return [
+            WalkStep("prefill", step_metadata={FINAL_PREFILL: True}),
+            WalkStep("decode", bind={"text_inputs": "new_token"}),
+        ]
 
     # -------------------------------------------------------------------
     # Model ABC: prompt processing
@@ -350,6 +346,15 @@ class Glm52Model(Model):
     ) -> NameToTensorList | ProcessPromptOutput:
         if prompt is None:
             return {}
+        # read here, in the data worker: a bad knob is the client's 400 before any work
+        sampling = self.get_request_resource_configs([], [], kwargs)[SAMPLER_RESOURCE]
+        if self.config.mtp_num_draft_tokens > 0:
+            # refused here as a 400; prepare_inputs would refuse it as a 500
+            if sampling.temperature != 0 or sampling.repetition_penalty != 1:
+                raise ValueError(
+                    f"MTP drafting is greedy only (temperature={sampling.temperature}, "
+                    f"repetition_penalty={sampling.repetition_penalty}); serve with mtp_num_draft_tokens: 0"
+                )
         if self._tokenizer_mode == "byte":
             # Reduced serve maps UTF-8 bytes directly to token ids, avoiding HF IO.
             vocab = self.config.vocab_size
@@ -397,21 +402,22 @@ class Glm52Model(Model):
         return input_ids[0]
 
     def get_request_resource_configs(
-        self, partition_fwd_args: dict[str, ForwardPassArgs],
-        model_kwargs: dict | None = None,
+        self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
     ) -> dict[str, ResourceReqConfig]:
-        del partition_fwd_args
+        del input_modalities, output_modalities
         model_kwargs = normalize_generation_kwargs(model_kwargs)
-        keys = ["temperature", "top_p", "repetition_penalty", "ignore_eos"]
         params = {
-            k: model_kwargs.get(k, getattr(self.config, k))
-            for k in keys
+            **self.sampling_defaults,
+            **{k: model_kwargs[k] for k in SAMPLING_KEYS if k in model_kwargs},
         }
-        # the sampler's own knobs with no config default; dropped, a request got neither
-        for k, cast in (("top_k", int), ("min_p", float)):
-            if model_kwargs.get(k) is not None:
-                params[k] = cast(model_kwargs[k])
+        if self.config.mtp_num_draft_tokens > 0 and "temperature" not in model_kwargs:
+            # greedy by default under MTP, so a request that names no temperature serves
+            # rather than being refused; an explicit temperature > 0 still is
+            params["temperature"] = 0.0
         return {SAMPLER_RESOURCE: SamplingReqConfig(**params)}
+
+    def request_kwargs(self) -> frozenset[str]:
+        return frozenset({"max_output_tokens", *SAMPLING_KEYS})
 
     def context_limit(self) -> int:
         """The bound the submodule's preprocess holds every context to:
@@ -421,18 +427,14 @@ class Glm52Model(Model):
 
     def max_decode_steps(self) -> int:
         """Decode iterations a one-token prompt can run within the window; the
-        conductor caps a longer prompt's loop at the room it leaves."""
+        conductor caps a longer prompt's loop at the room it leaves. Under MTP
+        each iteration emits at least one token, so it bounds those loops too."""
         return self.context_limit() - 1
 
     def get_max_output_tokens(self, **model_kwargs):
         budget = normalize_generation_kwargs(model_kwargs).get(
             "max_output_tokens", self.config.max_output_tokens)
         return self.context_limit() if budget is None else budget
-
-    def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
-        # the prefill emits the first of max_output_tokens, so the loop runs one fewer: the
-        # whole window is max_iters, and the conductor refuses a cap past it
-        return {"decode_loop": max(1, self.get_max_output_tokens(**model_kwargs) - 1)}
 
     # -------------------------------------------------------------------
     # Model ABC: postprocess
@@ -445,19 +447,7 @@ class Glm52Model(Model):
         **kwargs,
     ) -> bytes:
         if modality == "text":
-            token_ids = output.flatten().tolist()
-            if self._tokenizer_mode == "byte":
-                # Synthetic reduced models emit arbitrary byte ids; return raw
-                # bytes without ever touching the HF tokenizer.
-                return bytes((t & 0xFF) for t in token_ids)
-            # The tokens' raw bytes (byte-level BPE): a character split across
-            # tokens reaches the client whole, where decoding each token alone
-            # gives U+FFFD. Special tokens drop, as with skip_special_tokens.
-            if self._detokenizer is None:
-                from mstar.model.utils import ByteLevelDetokenizer
-
-                self._detokenizer = ByteLevelDetokenizer(self.tokenizer)
-            return self._detokenizer.to_bytes(token_ids)
+            return super().postprocess(output, modality, **kwargs)
         raise ValueError(f"Unsupported modality for GLM-5.2: {modality!r}")
 
     # -------------------------------------------------------------------
@@ -476,7 +466,6 @@ class Glm52Model(Model):
     def get_submodule(
         self, node_name: str, device: str = "cpu", tp_group=None,
         autocast_dtype: torch.dtype | None = None,
-        sp_group=None,
     ) -> NodeSubmodule | None:
         if node_name in self._submodule_cache:
             return self._submodule_cache[node_name]
@@ -518,9 +507,16 @@ class Glm52Model(Model):
         self._load_checkpoint(language_model, source, device, tp_group)
         process_weights_after_loading(language_model, torch.device(device))
         language_model.eval()
+        if self.config.tuned_kernels and tp_group is not None and tp_group.world_size > 1:
+            # collective over the TP group; every rank builds the LLM here
+            dtype = language_model.model.norm.weight.dtype
+            tp_group.init_allreduce_fusion(
+                self.config.hidden_size, dtype,
+                max_tokens=AR_FUSION_MAX_BYTES // (self.config.hidden_size * dtype.itemsize),
+            )
 
         logger.info("Successfully loaded GLM-5.2 submodule for %s", node_name)
-        submodule = Glm52LLMSubmodule(language_model=language_model, config=self.config)
+        submodule = Glm52LLMSubmodule(language_model, self.config)
         return submodule
 
     def _load_checkpoint(self, language_model, source: str, device, tp_group) -> None:
@@ -531,7 +527,7 @@ class Glm52Model(Model):
 
         index_file = Path(source) / "model.safetensors.index.json"
         if not index_file.is_file():
-            load_weights(language_model, source, device=device)
+            load_weights(language_model, source, device=device, quant_methods=QUANT_METHODS)
             return
 
         with open(index_file) as f:
@@ -540,45 +536,29 @@ class Glm52Model(Model):
         tp_size = tp_group.world_size if tp_group is not None else 1
         keys, specs = build_glm52_read_plan(
             checkpoint_keys, self.config, tp_rank, tp_size,
+            load_mtp=language_model.mtp is not None,
         )
         logger.info(
             "Glm52Model fast read plan: %d/%d keys, %d sliced (tp %d/%d)",
             len(keys), len(checkpoint_keys), len(specs), tp_rank, tp_size,
         )
         weights = iter_safetensors_shards(
-            source, device=device, keys=keys, slice_spec=specs.get,
+            source, device=device, keys=keys, slice_spec=specs.get, quant_methods=QUANT_METHODS,
         )
         language_model.load_weights(weights)
 
     def _resolve_checkpoint(self) -> str | None:
-        path = getattr(self, "model_path_hf", None)
-        if not path:
-            return None
-        if Path(path).exists():
-            return str(path)
-        return str(resolve_snapshot_dir(path, cache_dir=self.cache_dir))
+        return resolve_checkpoint(self.model_path_hf, self.cache_dir)
 
     def _maybe_apply_checkpoint_quant_config(self, source: str) -> None:
-        from mstar.utils.fp8_block import Fp8BlockQuantConfig
-
         if self.config.quantization_config is not None:
             return
-        config_json = Path(source) / "config.json"
-        if not config_json.is_file():
-            return
-        try:
-            with open(config_json) as f:
-                raw = json.load(f)
-        except (OSError, ValueError) as e:  # unreadable / malformed — stay bf16
-            logger.warning("Glm52Model: could not read %s: %s", config_json, e)
-            return
-        quant = Fp8BlockQuantConfig.from_hf_config_dict(
-            raw.get("quantization_config"),
-        )
+        quant = read_fp8_block_quant_config(source)
         if quant is not None:
-            logger.info(
-                "Glm52Model: fp8 %s checkpoint (block %s) — dense dequant on "
-                "load, routed experts fp8-resident=%s.",
-                quant.fmt, quant.weight_block_size, self.config.moe_fp8_resident,
-            )
             self.config.quantization_config = quant
+            logger.info(
+                "Glm52Model: fp8 %s checkpoint (block %s) — non-expert linears "
+                "fp8=%s, routed experts fp8-resident=%s, kernels=%s.",
+                quant.fmt, quant.weight_block_size, self.config.dense_fp8,
+                self.config.moe_fp8_resident, self.config.kernels,
+            )

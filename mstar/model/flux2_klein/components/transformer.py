@@ -13,22 +13,42 @@ Layout of one denoise step over a request's tokens ``[txt (T) | img (L) | ref (R
 Numerics contract: bf16 weights everywhere (the checkpoint has no fp32 islands);
 the sinusoidal embedding and RoPE tables are fp32, rotary application and the
 final cast follow the reference op-for-op. Attention goes through
-:func:`mstar.model.components.diffusion.attention.joint_attention` — SDPA (the
-reference kernel) or the engine's ragged FlashInfer resource when the submodule
-binds one. RoPE tables are per-shape derived state supplied by the caller.
+:func:`mstar.model.components.diffusion.attention.attend` — the read of the array
+it binds, or SDPA (the reference kernel) with no engine behind it. RoPE tables are
+per-shape derived state supplied by the caller.
 """
 
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
+from typing import Any
 
 import torch
 from torch import nn
 
-from mstar.model.components.diffusion.attention import RaggedAttentionFn, joint_attention
+from mstar.model.components.diffusion.attention import attend
 from mstar.model.components.diffusion.rope import apply_rotary_interleaved
 from mstar.model.components.linear import FusedColumnLinear
-from mstar.model.flux2_klein.config import Flux2TransformerConfig
+from mstar.model.components.quant_linear import QuantizableLinears
+from mstar.model.flux2_klein.config import JOINT_TOKENS, Flux2TransformerConfig
+
+# ``linear_dtype``: the GEMM-bound block linears may go low precision. The linears that set the modulation and take the
+# latents in and out carry little of the step's FLOPs and all of its conditioning, so they stay bf16. The text
+# stream's feed-forward output reaches 4080 on 4B and 5056 on 9B over the 100 protocol prompts' steps (a few double
+# blocks; the rest stay under 700), above what NVFP4 holds at a unit tensor scale.
+QUANTIZABLE_LINEARS = QuantizableLinears(
+    candidates=(
+        "double_blocks.*.attn.img_qkv", "double_blocks.*.attn.txt_qkv", "double_blocks.*.attn.img_out",
+        "double_blocks.*.attn.txt_out", "double_blocks.*.img_ff.linear_*", "double_blocks.*.txt_ff.linear_*",
+        "single_blocks.*.qkv_mlp", "single_blocks.*.out",
+    ),
+    keep_bf16=(
+        "time_embed.*", "guidance_embed.*", "mod_double_img", "mod_double_txt", "mod_single",
+        "img_in", "txt_in", "norm_out_mod", "proj_out",
+    ),
+    input_amax={"double_blocks.*.txt_ff.linear_out": 5056.0},
+)
 
 
 def sinusoidal_timestep_embedding(timesteps: torch.Tensor, dim: int, max_period: float = 10000.0) -> torch.Tensor:
@@ -83,10 +103,12 @@ class Flux2JointAttention(nn.Module):
     q/k RMSNorms; the two streams are concatenated ``[txt | img]`` for one joint attention
     and split again for their own output projections."""
 
-    def __init__(self, dim: int, num_heads: int, head_dim: int, eps: float):
+    def __init__(self, dim: int, num_heads: int, head_dim: int, eps: float, layer: int):
         super().__init__()
         inner = num_heads * head_dim
         self.head_dim = head_dim
+        self.layer = torch.tensor(layer, device="cpu")
+        self.state = None
         # One GEMM per stream for q, k, v; the checkpoint's separate to_q/to_k/to_v (and
         # add_{q,k,v}_proj) load into the shards by name through the loader's stacked rules.
         self.img_qkv = FusedColumnLinear(dim, {"q": inner, "k": inner, "v": inner}, bias=False)
@@ -99,12 +121,14 @@ class Flux2JointAttention(nn.Module):
         self.img_out = nn.Linear(inner, dim, bias=False)
         self.txt_out = nn.Linear(inner, dim, bias=False)
 
+    def bind_state(self, handles: Mapping[str, Any]) -> None:
+        self.state = handles.get(JOINT_TOKENS)
+
     def forward(
         self,
         img: torch.Tensor,
         txt: torch.Tensor,
         rope: tuple[torch.Tensor, torch.Tensor],
-        ragged: RaggedAttentionFn | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         num_txt = txt.shape[1]
         q_i, k_i, v_i = self.img_qkv(img).chunk(3, dim=-1)
@@ -117,7 +141,7 @@ class Flux2JointAttention(nn.Module):
         cos, sin = rope
         q = apply_rotary_interleaved(q, cos, sin)
         k = apply_rotary_interleaved(k, cos, sin)
-        out = joint_attention(q, k, v, ragged).flatten(2, 3).to(q.dtype)
+        out = attend(self.state, self.layer, q, k, v).flatten(2, 3).to(q.dtype)
         txt_out, img_out = out[:, :num_txt], out[:, num_txt:]
         return self.img_out(img_out), self.txt_out(txt_out)
 
@@ -125,12 +149,12 @@ class Flux2JointAttention(nn.Module):
 class Flux2DoubleBlock(nn.Module):
     """One double-stream block (diffusers ``Flux2TransformerBlock``)."""
 
-    def __init__(self, config: Flux2TransformerConfig):
+    def __init__(self, config: Flux2TransformerConfig, layer: int):
         super().__init__()
         dim, eps = config.hidden_size, config.eps
         self.img_norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
         self.txt_norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
-        self.attn = Flux2JointAttention(dim, config.num_attention_heads, config.attention_head_dim, eps)
+        self.attn = Flux2JointAttention(dim, config.num_attention_heads, config.attention_head_dim, eps, layer)
         self.img_norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
         self.txt_norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
         self.img_ff = SwiGLUFeedForward(dim, config.mlp_hidden_dim)
@@ -143,14 +167,13 @@ class Flux2DoubleBlock(nn.Module):
         mod_img: tuple[torch.Tensor, ...],
         mod_txt: tuple[torch.Tensor, ...],
         rope: tuple[torch.Tensor, torch.Tensor],
-        ragged: RaggedAttentionFn | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         shift_a, scale_a, gate_a, shift_m, scale_m, gate_m = mod_img
         t_shift_a, t_scale_a, t_gate_a, t_shift_m, t_scale_m, t_gate_m = mod_txt
         img_attn, txt_attn = self.attn(
             _modulate(self.img_norm1, img, shift_a, scale_a),
             _modulate(self.txt_norm1, txt, t_shift_a, t_scale_a),
-            rope, ragged,
+            rope,
         )
         img = img + gate_a * img_attn
         img = img + gate_m * self.img_ff(self.img_norm2(img) * (1 + scale_m) + shift_m)
@@ -164,9 +187,11 @@ class Flux2SingleBlock(nn.Module):
     one fused input GEMM yields q, k, v and the SwiGLU input; one fused output GEMM
     consumes ``[attn | mlp]``."""
 
-    def __init__(self, config: Flux2TransformerConfig):
+    def __init__(self, config: Flux2TransformerConfig, layer: int):
         super().__init__()
         dim, eps = config.hidden_size, config.eps
+        self.layer = torch.tensor(layer, device="cpu")
+        self.state = None
         self.head_dim = config.attention_head_dim
         self.inner_dim = config.num_attention_heads * config.attention_head_dim
         self.mlp_hidden_dim = config.mlp_hidden_dim
@@ -177,12 +202,14 @@ class Flux2SingleBlock(nn.Module):
         self.out = nn.Linear(self.inner_dim + self.mlp_hidden_dim, dim, bias=False)
         self.act = nn.SiLU()
 
+    def bind_state(self, handles: Mapping[str, Any]) -> None:
+        self.state = handles.get(JOINT_TOKENS)
+
     def forward(
         self,
         x: torch.Tensor,
         mod: tuple[torch.Tensor, ...],
         rope: tuple[torch.Tensor, torch.Tensor],
-        ragged: RaggedAttentionFn | None,
     ) -> torch.Tensor:
         shift, scale, gate = mod
         proj = self.qkv_mlp(_modulate(self.norm, x, shift, scale))
@@ -191,7 +218,7 @@ class Flux2SingleBlock(nn.Module):
         cos, sin = rope
         q = apply_rotary_interleaved(self.q_norm(q), cos, sin)
         k = apply_rotary_interleaved(self.k_norm(k), cos, sin)
-        attn = joint_attention(q, k, v, ragged).flatten(2, 3).to(q.dtype)
+        attn = attend(self.state, self.layer, q, k, v).flatten(2, 3).to(q.dtype)
         gate_in, up = mlp.split(self.mlp_hidden_dim, dim=-1)
         out = self.out(torch.cat([attn, self.act(gate_in) * up], dim=-1))
         return x + gate * out
@@ -215,8 +242,10 @@ class Flux2DiT(nn.Module):
         self.mod_act = nn.SiLU()
         self.img_in = nn.Linear(config.in_channels, dim, bias=False)
         self.txt_in = nn.Linear(config.joint_attention_dim, dim, bias=False)
-        self.double_blocks = nn.ModuleList(Flux2DoubleBlock(config) for _ in range(config.num_layers))
-        self.single_blocks = nn.ModuleList(Flux2SingleBlock(config) for _ in range(config.num_single_layers))
+        self.double_blocks = nn.ModuleList(Flux2DoubleBlock(config, i) for i in range(config.num_layers))
+        self.single_blocks = nn.ModuleList(
+            Flux2SingleBlock(config, config.num_layers + i) for i in range(config.num_single_layers)
+        )
         self.norm_out = nn.LayerNorm(dim, elementwise_affine=False, eps=config.eps)
         self.norm_out_mod = nn.Linear(dim, 2 * dim, bias=False)
         self.proj_out = nn.Linear(dim, config.patch_size * config.patch_size * config.out_channels, bias=False)
@@ -244,7 +273,6 @@ class Flux2DiT(nn.Module):
         timestep: torch.Tensor,
         rope: tuple[torch.Tensor, torch.Tensor],
         guidance: torch.Tensor | None = None,
-        ragged: RaggedAttentionFn | None = None,
     ) -> torch.Tensor:
         """``img [B, L(+R), in_channels]`` packed latent tokens (bf16), ``txt [B, T,
         joint_attention_dim]``, ``timestep [B]`` (sigma, latents' dtype), ``rope`` the fp32
@@ -260,10 +288,10 @@ class Flux2DiT(nn.Module):
         img = self.img_in(img)
         txt = self.txt_in(txt)
         for block in self.double_blocks:
-            img, txt = block(img, txt, mod_img, mod_txt, rope, ragged)
+            img, txt = block(img, txt, mod_img, mod_txt, rope)
         x = torch.cat([txt, img], dim=1)
         for block in self.single_blocks:
-            x = block(x, mod_single, rope, ragged)
+            x = block(x, mod_single, rope)
         x = x[:, num_txt:]
         scale, shift = self.norm_out_mod(mod_act).chunk(2, dim=1)
         x = self.norm_out(x) * (1 + scale)[:, None, :] + shift[:, None, :]

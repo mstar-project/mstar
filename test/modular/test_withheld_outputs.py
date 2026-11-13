@@ -5,7 +5,7 @@
 read; ``Engine.check_stop_for_batch`` records it on the batch and the worker
 leaves those outputs out of the store, so the route carries zero tensors for
 them (a streaming edge then gets no item). Drives the real engine method and
-the real ``Worker._postprocess_batch`` on CPU, with the graph runtime stubbed
+the real ``StepExecutor.postprocess`` on CPU, with the graph runtime stubbed
 to record what it was asked to route.
 """
 
@@ -15,13 +15,15 @@ import torch
 
 from mstar.communication.arena import ArenaShmCommunicationManager
 from mstar.communication.communicator import BaseCommunicator
-from mstar.engine.engine import Engine, ExecutingBatch
+from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import StepContext
 from mstar.graph.runtime.base import FreedTensors, PhasedPostprocess, RouteOutput
 from mstar.model.submodule_base import BatchedModelOutput, BatchedStopCheck, HostRows, NodeSubmodule, StopCheck
+from mstar.testing_utils.engine import make_engine, make_mgmt
+from mstar.testing_utils.worker import make_worker
+from mstar.worker.host_copies import _LazyPerRid
 from mstar.worker.micro_scheduler import ScheduledBatch
 from mstar.worker.stream_buffers import StreamBufferManager
-from mstar.worker.worker import Worker, _LazyPerRid
 
 NODE, WALK, STOP_TOKEN, LOOP = "producer", "decode", 9, "loop"
 KEEP, DROP = 1, 2
@@ -89,8 +91,7 @@ def _outputs():
 
 
 def _engine(submodule):
-    engine = Engine.__new__(Engine)
-    engine._submodules = {NODE: SimpleNamespace(submodule=submodule)}
+    engine = make_engine(_submodules={NODE: make_mgmt(submodule=submodule)})
     return engine
 
 
@@ -176,6 +177,9 @@ class _RecordingRuntime(PhasedPostprocess):
     def send_outputs(self, send_input):
         return []
 
+    def check_stops(self, *args):
+        return None  # undecided: the model's check_stop runs (STOPS)
+
     def complete_and_route_batch(self, route_input):
         self.routes.append(route_input)
         return RouteOutput(
@@ -184,36 +188,34 @@ class _RecordingRuntime(PhasedPostprocess):
         )
 
 
-def test_the_worker_routes_no_tensor_for_a_withheld_output(tmp_path):
+def _postprocess(tmp_path, runtime_checks=False):
+    """One step of ``_Producer`` through the worker's postprocess; the runtime."""
     engine = _engine(_Producer())
-    w = Worker.__new__(Worker)
-    w._phase_period = 0
-    w.enable_nvtx = w.enable_prof = False
-    w.device = torch.device("cpu")
-    w._innermost_loop_by_node = {}
-    w._walk_drivers = {}  # no producer-driven walk transitions here
-    w._stop_token_signal = {}  # no declared stop policies: check_stop decides
-    w._graph_runtime = _RecordingRuntime()
-    w.scheduler = SimpleNamespace(failed_rids=set())
-    w.tensor_manager = ArenaShmCommunicationManager(
+    runtime = _RecordingRuntime()
+    tensor_manager = ArenaShmCommunicationManager(
         my_entity_id="worker_0", hostname="localhost", device="cpu",
         communicator=_Communicator(), shm_dir=str(tmp_path),
         use_arena=False,
     )
-    w.engine_manager = SimpleNamespace(get_engine=lambda node: SimpleNamespace(
-        check_stop_for_batch=engine.check_stop_for_batch,
-        extend_prefix_chains=lambda batch, outputs, **kwargs: None,
-        materialize_publish=lambda batch, rids: None,
-        after_output_copy=lambda batch: None,
-        step_finished=lambda batch, outputs, **kwargs: None,
-    ))
-    w.request_state = SimpleNamespace(
+    request_state = SimpleNamespace(
         per_request_info={},
         buffer_publish_info=lambda *args: None,
         get_fwd_info=lambda rid, partition: None,
         get_pending_publish_info=lambda rid, partition: {},
     )
-    w.streams = StreamBufferManager(w.request_state, w.tensor_manager, [])  # no streams
+    w = make_worker(
+        graph_runtime=runtime,
+        tensor_manager=tensor_manager,
+        engine_manager=SimpleNamespace(get_engine=lambda node: SimpleNamespace(
+            check_stop_for_batch=engine.check_stop_for_batch,
+            extend_prefix_chains=lambda batch, outputs, **kwargs: None,
+            materialize_publish=lambda batch, rids: None,
+            after_output_copy=lambda batch: None,
+            step_finished=lambda batch, outputs, **kwargs: None,
+        )),
+        request_state=request_state,
+        streams=StreamBufferManager(request_state, tensor_manager, []),  # no streams
+    )
     pending = SimpleNamespace(
         batch=ScheduledBatch(
             node_name=NODE, graph_walk=WALK, request_to_worker_graph={KEEP: 0, DROP: 0},
@@ -223,12 +225,29 @@ def test_the_worker_routes_no_tensor_for_a_withheld_output(tmp_path):
         node_name=NODE, partition="default", graph_walk=WALK, loop_name=None,
         speculative_new_iter=False,
     )
+    if runtime_checks:
+        # the runtime checks the walk's stops, and cannot decide: STOPS
+        w.executor._stop_token_signal[(NODE, WALK)] = None
+    w.executor.postprocess(pending, BatchedModelOutput(per_rid_outputs=_outputs()))
+    return runtime
 
-    Worker._postprocess_batch(w, pending, BatchedModelOutput(per_rid_outputs=_outputs()))
 
-    assert w._graph_runtime.stops == [{DROP: [LOOP]}]
-    (route,) = w._graph_runtime.routes
+def test_the_worker_routes_no_tensor_for_a_withheld_output(tmp_path):
+    runtime = _postprocess(tmp_path)
+    assert runtime.stops == [{DROP: [LOOP]}]
+    (route,) = runtime.routes
     assert list(route.wg_ids.keys) == [KEEP, DROP]
     # (KEEP: token, frame), (DROP: token, frame): the stop step's frame carries nothing
     assert route.num_tensors == [1, 1, 1, 0]
     assert len(route.tensors) == 3
+    assert route.withheld == {"frame": [DROP]}
+
+
+def test_the_stops_resume_names_what_the_check_withheld(tmp_path):
+    """When the runtime's own stop check cannot decide, the model's runs on
+    STOPS, after the request was built: the resume names its withheld rows,
+    so a signal riding the inline column sends them nothing too."""
+    runtime = _postprocess(tmp_path, runtime_checks=True)
+    assert runtime.stops == [{DROP: [LOOP]}]
+    (route,) = runtime.routes
+    assert route.withheld == {"frame": [DROP]}

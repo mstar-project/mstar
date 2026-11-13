@@ -20,8 +20,13 @@ pub mod communicator;
 #[cfg(feature = "python")]
 pub mod graph;
 #[cfg(feature = "python")]
+pub mod kv_plan;
+#[cfg(feature = "python")]
+pub mod page_arena;
+#[cfg(feature = "python")]
 pub mod shards;
 pub mod shm;
+pub mod source_hash;
 #[cfg(feature = "python")]
 pub mod tensors;
 #[cfg(feature = "python")]
@@ -29,3 +34,8 @@ pub mod torch_abi;
 
 #[cfg(feature = "python")]
 pub use bindings::PyZmqCommunicator;
+
+/// The content hash of the sources this crate was built from (build.rs):
+/// the extension's BUILD_SOURCE_HASH, and the half of rust/server's that
+/// describes the library it links.
+pub const BUILD_SOURCE_HASH: &str = env!("MSTAR_RUST_SOURCE_HASH");

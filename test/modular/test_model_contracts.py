@@ -1,0 +1,841 @@
+"""Per-model halves of the generation-input contract:
+the keys each model reads, its output limit, its checkpoint defaults, and the
+inputs it refuses. Models with a general test module keep theirs there."""
+
+from __future__ import annotations
+
+import glob
+import importlib
+import json
+import types
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+import torch
+from huggingface_hub.constants import HF_HUB_CACHE
+from huggingface_hub.errors import EntryNotFoundError
+
+import mstar.model.bagel.bagel_model as bagel_mod
+from mstar.conductor.conductor import Conductor
+from mstar.engine.resources.sampler.config import SamplerSpec, SamplingReqConfig
+from mstar.engine.state import Sampler
+from mstar.engine.state.adapters import node_resources, sampling_configs
+from mstar.model.bagel.bagel_model import BagelModel, check_request_kwargs
+from mstar.model.base import MAX_OUTPUT_TOKENS, Model
+from mstar.model.components.diffusion.image_io import OUTPUT_FORMAT_KWARGS
+from mstar.model.higgs_audio.config import HiggsAudioModelConfig
+from mstar.model.higgs_audio.higgs_audio_model import DEFAULT_SAMPLING as HIGGS_DEFAULT_SAMPLING
+from mstar.model.higgs_audio.higgs_audio_model import HiggsAudioModel
+from mstar.model.higgs_audio.higgs_audio_model import sampling_defaults as higgs_sampling_defaults
+from mstar.model.keys import SAMPLER as HIGGS_SAMPLER
+from mstar.model.multimodal_decoder import SAMPLING_KEYS as MMD_SAMPLING_KEYS
+from mstar.model.omnivoice.config import OmniVoiceConfig
+from mstar.model.omnivoice.omnivoice_model import OmniVoiceModel, output_shaping
+from mstar.model.qwen3_5.config import SAMPLER as QWEN3_5_SAMPLER
+from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
+from mstar.model.qwen3_omni.config import CODE_PRED_SAMPLER, TALKER_SAMPLER, THINKER_SAMPLER
+from mstar.model.qwen3_omni.qwen3_omni_model import Qwen3OmniModel
+from mstar.model.registry import MODEL_REGISTRY
+from mstar.model.utils import load_generation_defaults
+from mstar.model.vjepa2.vjepa2_model import VJepa2Model
+from mstar.model.whisper.config import SAMPLER as WHISPER_SAMPLER
+from mstar.model.whisper.config import WhisperModelConfig
+from mstar.model.whisper.whisper_model import DEFAULT_SAMPLING as WHISPER_DEFAULT_SAMPLING
+from mstar.model.whisper.whisper_model import WhisperModel
+from mstar.model.whisper.whisper_model import sampling_defaults as whisper_sampling_defaults
+
+
+def _cached_snapshots(repo_id: str) -> list[str]:
+    """The checkpoint's snapshots in the HF cache; empty on CI, where the checks
+    of an inline fixture against the real file skip."""
+    return glob.glob(f"{HF_HUB_CACHE}/models--{repo_id.replace('/', '--')}/snapshots/*")
+
+
+# ── bagel ───────────────────────────────────────────────────────────────────
+
+BAGEL_CONFIG_DEFAULTS = {
+    "temperature": 0.6, "top_k": 0, "top_p": 1.0,
+    "repetition_penalty": 1.05, "ignore_eos": False,
+}
+
+
+def _loop_conductor(model) -> Conductor:
+    """A conductor with only what ``_loop_caps`` reads: the model and its loops' ``max_iters``."""
+    c = Conductor.__new__(Conductor)
+    c.model = model
+    c._loop_max_iters = {}
+    for walk in model.get_graph_walk_graphs().values():
+        for name, loop in walk.get_loops().items():
+            c._loop_max_iters[name] = max(loop.max_iters, c._loop_max_iters.get(name, 0))
+    return c
+
+
+def _bagel_model(**sampling) -> BagelModel:
+    model = BagelModel.__new__(BagelModel)
+    model.config = SimpleNamespace(
+        vocab_size=32, num_timesteps=50, max_latent_size=64, latent_downsample=16, **BAGEL_CONFIG_DEFAULTS,
+    )
+    model.sampling_defaults = {**BAGEL_CONFIG_DEFAULTS, **sampling}
+    model._has_cfg_parallel = False
+    model._image_gen_remote_handoff = False
+    return model
+
+
+def test_bagel_request_kwargs_cover_what_bagel_and_its_adapter_read():
+    keys = _bagel_model().request_kwargs()
+    assert {
+        "temperature", "top_p", "top_k", "min_p", "repetition_penalty",
+        "ignore_eos", "penalize_prompt", "max_output_tokens",
+        "cfg_text_scale", "cfg_img_scale", "cfg_interval", "cfg_renorm_type",
+        "cfg_renorm_min", "think_mode", "width", "height", "image_preprocess",
+    } <= keys
+    assert "do_sample" not in keys and "size" not in keys
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"cfg_renorm_type": "bogus"},
+    {"cfg_text_scale": "4"},
+    {"cfg_img_scale": True},
+    {"cfg_img_scale": float("nan")},
+    {"cfg_interval": [0.6, 0.4]},
+    {"cfg_interval": [0.0, 1.5]},
+    {"cfg_interval": 0.4},
+    {"cfg_renorm_min": 2.0},
+    {"think_mode": "false"},
+    {"think_mode": 1},
+    {"image_preprocess": "hf"},
+    {"width": 1000},
+    {"width": 2048},
+    {"height": 0},
+    {"height": 512.0},
+    {"width": "512"},
+])
+def test_bagel_out_of_range_knobs_are_a_400(kwargs):
+    with pytest.raises(ValueError, match=next(iter(kwargs))):
+        check_request_kwargs(kwargs, max_side=1024, stride=16)
+
+
+def test_bagel_valid_knobs_pass():
+    check_request_kwargs({
+        "cfg_text_scale": 4, "cfg_img_scale": 1.0, "cfg_interval": (0.4, 1.0),
+        "cfg_renorm_type": "text_channel", "cfg_renorm_min": 0.0,
+        "think_mode": True, "image_preprocess": "vllm", "width": 512, "height": 1024,
+    }, max_side=1024, stride=16)
+    check_request_kwargs(None, max_side=1024, stride=16)
+
+
+def test_bagel_process_prompt_rejects_before_tokenizing():
+    with pytest.raises(ValueError, match="cfg_renorm_type"):
+        _bagel_model().process_prompt(None, ["text"], ["image"], cfg_renorm_type="x")
+
+
+def test_bagel_sampling_forwards_min_p_and_penalize_prompt():
+    sampling = _bagel_model().get_sampling_config(
+        "LLM", {"min_p": 0.1, "penalize_prompt": False, "temperature": 0.0},
+    )
+    assert sampling.min_p == 0.1
+    assert sampling.penalize_prompt is False
+    assert sampling.temperature == 0.0
+    assert sampling.repetition_penalty == 1.05
+
+
+def test_bagel_checkpoint_knob_values_are_ignored_but_do_sample_false_is_greedy(tmp_path, monkeypatch):
+    # BAGEL-7B-MoT ships Qwen2.5-7B-Instruct's file; its values are not BAGEL's recipe
+    qwen2_5 = {"do_sample": True, "repetition_penalty": 1.05, "temperature": 0.7, "top_p": 0.8, "top_k": 20}
+    monkeypatch.setattr(
+        bagel_mod, "hf_hub_download",
+        lambda **kw: str(tmp_path / kw["filename"]),
+    )
+    model = _bagel_model()
+    (tmp_path / "generation_config.json").write_text(json.dumps(qwen2_5))
+    model.sampling_defaults = model._load_sampling_defaults("repo", None)
+    assert model.sampling_defaults == BAGEL_CONFIG_DEFAULTS
+    sampling = model.get_sampling_config("LLM", {"top_k": 5})
+    assert (sampling.temperature, sampling.top_p, sampling.top_k) == (0.6, 1.0, 5)
+    assert sampling.min_p == 0.0
+
+    (tmp_path / "generation_config.json").write_text(json.dumps({**qwen2_5, "do_sample": False}))
+    assert model._load_sampling_defaults("repo", None) == {**BAGEL_CONFIG_DEFAULTS, "temperature": 0.0}
+
+
+def test_bagel_no_generation_config_keeps_config_defaults(monkeypatch):
+    def missing(**kw):
+        raise EntryNotFoundError("no file")
+
+    monkeypatch.setattr(bagel_mod, "hf_hub_download", missing)
+    model = _bagel_model()
+    assert model._load_sampling_defaults("repo", None) == BAGEL_CONFIG_DEFAULTS
+
+
+def test_bagel_decode_runs_one_fewer_than_max_output_tokens():
+    # the prefill emits the first token, so the decode loop's cap is one fewer
+    assert _bagel_model().get_loop_caps(max_output_tokens=16)["decode_loop"] == 15
+
+
+
+# ── higgs_audio ─────────────────────────────────────────────────────────────
+
+def _higgs_model(defaults=None) -> HiggsAudioModel:
+    model = object.__new__(HiggsAudioModel)
+    model.config = HiggsAudioModelConfig()
+    model.sampling_defaults = dict(HIGGS_DEFAULT_SAMPLING if defaults is None else defaults)
+    return model
+
+
+def _higgs_sampler(model, **kw) -> SamplingReqConfig:
+    return model.get_request_resource_configs([], [], kw)[HIGGS_SAMPLER]
+
+
+def _higgs_spec(model):
+    return next(s for s in model.get_node_resources() if s.resource_key == HIGGS_SAMPLER)
+
+
+def test_higgs_request_kwargs_are_the_keys_it_reads():
+    keys = _higgs_model().request_kwargs()
+    for read in ("enable_thinking", "temperature", "top_p", "top_k", "min_p",
+                 "repetition_penalty", "penalize_prompt", "ignore_eos", "max_output_tokens"):
+        assert read in keys
+    # sent by the transcription adapter but never read
+    assert "language" not in keys and "timestamps" not in keys
+
+
+def test_higgs_default_output_cap():
+    c = Conductor.__new__(Conductor)
+    c.model = _higgs_model()
+    assert c._max_output_tokens({}) == 1024
+    assert c._max_output_tokens({"max_output_tokens": 7}) == 7
+
+
+def test_higgs_default_is_greedy_and_client_knobs_are_forwarded():
+    model = _higgs_model()
+    cfg = _higgs_sampler(model)
+    assert (cfg.temperature, cfg.top_p, cfg.top_k) == (0.0, 1.0, 0)
+    cfg = _higgs_sampler(model, temperature=0.3, top_k=8, ignore_eos=True)
+    assert (cfg.temperature, cfg.top_k, cfg.ignore_eos) == (0.3, 8, True)
+
+
+@pytest.mark.parametrize("kw", [{"repetition_penalty": 0.9}, {"min_p": 0.05}])
+def test_higgs_unsupported_knobs_are_refused_at_admission(kw):
+    model = _higgs_model()
+    with pytest.raises(ValueError, match="does not support"):
+        _higgs_sampler(model, **kw).validate(_higgs_spec(model))
+
+
+def test_higgs_checkpoint_generation_config_sets_the_defaults(tmp_path):
+    # the shape bosonai/higgs-audio-v3-stt ships: token ids only, no sampling knobs
+    (tmp_path / "generation_config.json").write_text(json.dumps(
+        {"_from_model_config": True, "bos_token_id": 151643, "eos_token_id": 151643}
+    ))
+    assert higgs_sampling_defaults(tmp_path) == HIGGS_DEFAULT_SAMPLING
+    (tmp_path / "generation_config.json").write_text(json.dumps({"do_sample": False, "top_p": 0.5, "min_p": 0.1}))
+    defaults = higgs_sampling_defaults(tmp_path)
+    assert defaults == {"temperature": 0.0, "top_p": 0.5, "min_p": 0.1}
+    model = _higgs_model(defaults)
+    _higgs_sampler(model).validate(_higgs_spec(model))
+
+
+@pytest.mark.parametrize("bad", ["false", 0, 1])
+def test_higgs_enable_thinking_must_be_a_bool(bad):
+    with pytest.raises(ValueError, match="enable_thinking must be a boolean"):
+        _higgs_model()._prompt_ids([], {"audio": [torch.zeros(1)]}, enable_thinking=bad)
+
+
+
+# ── omnivoice ───────────────────────────────────────────────────────────────
+
+def _omnivoice_model() -> OmniVoiceModel:
+    model = object.__new__(OmniVoiceModel)
+    model.config = OmniVoiceConfig()
+    model._submodule_cache = {}
+    model._ensure_data_worker_assets = lambda: None
+    return model
+
+
+def _omnivoice_initial_args(model, **kwargs):
+    signals = {"prefix_ids": ["p"], "prefix_audio_mask": ["m"]}
+    # process_prompt settles target_len and hands it over in model_kwargs
+    return model.walk_plan("default", ["text"], ["audio"], signals, {"target_len": 50, **kwargs})[0]
+
+
+def test_omnivoice_request_kwargs_include_the_adapter_alias_and_every_knob():
+    declared = _omnivoice_model().request_kwargs()
+    # the speech adapter maps voice -> instruct; speed is forwarded
+    assert {"instruct", "speed", "language", "ref_text", "duration", "denoise"} <= declared
+    assert {"num_step", "guidance_scale", "t_shift", "class_temperature", "position_temperature"} <= declared
+    assert {"postprocess_output", "pad_duration", "fade_duration", "layer_penalty_factor"} <= declared
+    assert "voice" not in declared and "temperature" not in declared
+
+
+def test_omnivoice_defaults_when_absent():
+    meta = _omnivoice_initial_args(_omnivoice_model()).step_metadata
+    gen = OmniVoiceConfig().generation
+    assert meta["num_step"] == gen.num_step and meta["guidance_scale"] == gen.guidance_scale
+    assert meta["class_temperature"] == 0.0
+    assert output_shaping({}) == {"enabled": True, "pad_duration": 0.1, "fade_duration": 0.1}
+
+
+def test_omnivoice_valid_knobs_pass_through():
+    meta = _omnivoice_initial_args(
+        _omnivoice_model(), num_step=64, guidance_scale=0, class_temperature=0, t_shift=0.5,
+    ).step_metadata
+    assert meta["num_step"] == 64 and meta["guidance_scale"] == 0.0 and meta["t_shift"] == 0.5
+    assert output_shaping({"postprocess_output": False})["enabled"] is False
+
+
+def test_omnivoice_num_step_past_the_unmask_loop_is_refused_by_the_conductor():
+    model = _omnivoice_model()
+    top = model.config.generation.max_num_step
+    conductor = _loop_conductor(model)
+    assert conductor._loop_caps({"num_step": top})[OmniVoiceModel.UNMASK_LOOP_NAME] == top
+    with pytest.raises(ValueError, match="iterations"):
+        conductor._loop_caps({"num_step": top + 1})
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"num_step": 0}, "num_step must be an integer >= 1"),
+        ({"num_step": 16.0}, "num_step must be an integer"),
+        ({"num_step": "16"}, "num_step must be an integer"),
+        ({"guidance_scale": "2"}, "guidance_scale must be a finite number"),
+        ({"guidance_scale": float("nan")}, "guidance_scale must be a finite number"),
+        ({"t_shift": 0}, "t_shift must be > 0"),
+        ({"class_temperature": -1.0}, "class_temperature must be >= 0"),
+        ({"position_temperature": True}, "position_temperature must be a finite number"),
+    ],
+)
+def test_omnivoice_bad_step_knobs_are_400s_at_both_seams(kwargs, match):
+    model = _omnivoice_model()
+    with pytest.raises(ValueError, match=match):
+        _omnivoice_initial_args(model, **kwargs)
+    with pytest.raises(ValueError, match=match):
+        model.process_prompt("Hello", ["text"], ["audio"], **kwargs)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"postprocess_output": "false"}, "postprocess_output must be true or false"),
+        ({"pad_duration": -0.1}, "pad_duration must be in"),
+        ({"fade_duration": 11.0}, "fade_duration must be in"),
+    ],
+)
+def test_omnivoice_bad_output_shaping_is_a_400_at_intake(kwargs, match):
+    with pytest.raises(ValueError, match=match):
+        _omnivoice_model().process_prompt("Hello", ["text"], ["audio"], **kwargs)
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "match"),
+    [
+        ({"speed": 0}, "speed must be > 0"),
+        ({"speed": -1.0}, "speed must be > 0"),
+        ({"speed": "1.2"}, "speed must be a finite number"),
+        ({"duration": 0}, "duration must be > 0"),
+        ({"duration": -2.0}, "duration must be > 0"),
+        ({"duration": 0.001}, "shorter than one codec frame"),
+        ({"denoise": "false"}, "denoise must be true or false"),
+        ({"denoise": 2}, "denoise must be true or false"),
+        ({"instruct": ""}, "instruct must be a non-empty string"),
+        ({"language": 3}, "language must be a non-empty string"),
+        ({"ref_text": ""}, "ref_text must be a non-empty string"),
+    ],
+)
+def test_omnivoice_bad_prompt_knobs_are_400s(kwargs, match):
+    with pytest.raises(ValueError, match=match):
+        _omnivoice_model().process_prompt("Hello", ["text"], ["audio"], **kwargs)
+
+
+def test_omnivoice_flags_take_0_and_1():
+    """JSON clients send 0/1 for booleans; both flags read them the same way."""
+    from mstar.model.omnivoice.omnivoice_model import _flag, output_shaping
+
+    assert _flag({"denoise": 0}, "denoise", True) is False
+    assert output_shaping({"postprocess_output": 1})["enabled"] is True
+
+
+
+# ── qwen3_5 ─────────────────────────────────────────────────────────────────
+
+QWEN3_5_27B = {
+    "bos_token_id": 248044, "do_sample": True, "eos_token_id": [248046, 248044],
+    "pad_token_id": 248044, "temperature": 0.6, "top_k": 20, "top_p": 0.95,
+}
+CACHED_0_8B = Path.home() / ".cache/huggingface/hub/models--Qwen--Qwen3.5-0.8B/snapshots"
+
+
+def qwen3_5_sampling_defaults(checkpoint_dir) -> dict:
+    """What ``MultimodalDecoderModel.__init__`` reads from a checkpoint."""
+    return {k: v for k, v in load_generation_defaults(checkpoint_dir).items() if k in MMD_SAMPLING_KEYS}
+
+
+def _qwen3_5_model(defaults=None) -> Qwen3_5DenseModel:
+    model = object.__new__(Qwen3_5DenseModel)
+    model.config = types.SimpleNamespace(max_position_embeddings=262144, vocab_size=248320)
+    model.sampling_defaults = dict(defaults or {})
+    return model
+
+
+def _qwen3_5_sampler(model, **kw) -> SamplingReqConfig:
+    """The request's sampler config, as the conductor converts Qwen3.5's settings."""
+    sampler = Sampler(QWEN3_5_SAMPLER, nodes={"LLM"}, vocab_size=model.config.vocab_size)
+    return sampling_configs(model.get_request_resource_configs([], [], kw), [sampler])[QWEN3_5_SAMPLER]
+
+
+def test_qwen3_5_request_kwargs_are_the_keys_it_reads():
+    keys = _qwen3_5_model().request_kwargs()
+    for read in ("enable_thinking", "temperature", "top_p", "top_k", "min_p",
+                 "repetition_penalty", "penalize_prompt", "ignore_eos", "max_output_tokens"):
+        assert read in keys
+
+
+def test_qwen3_5_default_output_cap():
+    c = Conductor.__new__(Conductor)
+    c.model = _qwen3_5_model()
+    assert c._max_output_tokens({}) == 2048
+    assert c._max_output_tokens({"max_output_tokens": 262144}) == 262144
+
+
+def test_qwen3_5_checkpoint_defaults_fill_unset_knobs(tmp_path):
+    (tmp_path / "generation_config.json").write_text(json.dumps(QWEN3_5_27B))
+    defaults = qwen3_5_sampling_defaults(tmp_path)
+    assert defaults == {"temperature": 0.6, "top_k": 20, "top_p": 0.95}
+    model = _qwen3_5_model(defaults)
+    cfg = _qwen3_5_sampler(model)
+    assert (cfg.temperature, cfg.top_k, cfg.top_p, cfg.repetition_penalty) == (0.6, 20, 0.95, 1)
+    cfg = _qwen3_5_sampler(model, top_k=0, temperature=0.0, repetition_penalty=1.1, penalize_prompt=False)
+    assert (cfg.temperature, cfg.top_k, cfg.top_p) == (0.0, 0, 0.95)
+    assert (cfg.repetition_penalty, cfg.penalize_prompt) == (1.1, False)
+
+
+def test_qwen3_5_without_a_generation_config_the_engine_defaults_apply(tmp_path):
+    assert qwen3_5_sampling_defaults(tmp_path) == {}
+    cfg = _qwen3_5_sampler(_qwen3_5_model())
+    assert (cfg.temperature, cfg.top_k, cfg.top_p) == (0.6, 0, 1)
+
+
+def test_qwen3_5_min_p_is_forwarded_so_the_node_refuses_it():
+    spec = SamplerSpec(resource_key=QWEN3_5_SAMPLER, nodes={"LLM"}, vocab_size=10, enable_min_p=False)
+    with pytest.raises(ValueError, match="min_p"):
+        _qwen3_5_sampler(_qwen3_5_model(), min_p=0.1).validate(spec)
+    _qwen3_5_sampler(_qwen3_5_model(), min_p=0.0).validate(spec)
+
+
+@pytest.mark.parametrize("bad", ["false", 0, "yes"])
+def test_qwen3_5_enable_thinking_must_be_a_bool(bad):
+    with pytest.raises(ValueError, match="enable_thinking must be a boolean"):
+        _qwen3_5_model().process_prompt("hi", ["text"], ["text"], enable_thinking=bad)
+
+
+@pytest.mark.skipif(not CACHED_0_8B.is_dir(), reason="Qwen3.5-0.8B metadata not cached")
+def test_qwen3_5_real_0_8b_has_no_generation_config_and_no_min_p_capability():
+    model = Qwen3_5DenseModel(str(next(CACHED_0_8B.iterdir())))
+    assert model.sampling_defaults == {}
+    spec = next(s for s in node_resources(model) if s.resource_key == QWEN3_5_SAMPLER)
+    assert spec.enable_repetition_penalty and not spec.enable_min_p
+
+
+
+# ── qwen3_omni ──────────────────────────────────────────────────────────────
+
+OMNI_GENERATION_CONFIG = {
+    "talker_max_new_tokens": 4096,
+    "talker_repetition_penalty": 1.05,
+    "talker_temperature": 0.9,
+    "talker_top_k": 50,
+    "talker_top_p": 1.0,
+}
+OMNI_CACHED = [f"{s}/generation_config.json" for s in _cached_snapshots("Qwen/Qwen3-Omni-30B-A3B-Instruct")
+               if Path(f"{s}/generation_config.json").is_file()]
+
+
+def _omni_model(local_dir=None) -> Qwen3OmniModel:
+    model = Qwen3OmniModel.__new__(Qwen3OmniModel)
+    model.local_dir = str(local_dir) if local_dir is not None else None
+    model.config = SimpleNamespace(
+        talker=SimpleNamespace(speaker_id={"chelsie": 2301, "ethan": 2302, "aiden": 2303}),
+    )
+    return model
+
+
+@pytest.fixture
+def omni_released(tmp_path):
+    (tmp_path / "generation_config.json").write_text(json.dumps(OMNI_GENERATION_CONFIG))
+    return _omni_model(tmp_path)
+
+
+def _omni_samplers(model, model_kwargs) -> dict[str, SamplingReqConfig]:
+    """The request's sampler configs, as the conductor converts Qwen3-Omni's settings."""
+    samplers = [Sampler(name, nodes={"Thinker"}, vocab_size=16) for name in (THINKER_SAMPLER, TALKER_SAMPLER,
+                                                                              CODE_PRED_SAMPLER)]
+    return sampling_configs(model.get_request_resource_configs([], [], model_kwargs), samplers)
+
+
+def _omni_talker_args(model, model_kwargs, output_modalities=("text", "audio")):
+    """The Talker's first step (its prefill), or None when it runs no walks."""
+    plan = model.walk_plan("Talker", ["text"], list(output_modalities), {"text_inputs": ["t0"]}, model_kwargs)
+    return plan[0] if plan else None
+
+
+@pytest.mark.skipif(not OMNI_CACHED, reason="Qwen3-Omni checkpoint not cached")
+def test_qwen3_omni_fixture_matches_the_cached_checkpoint():
+    with open(OMNI_CACHED[0]) as f:
+        assert json.load(f) == OMNI_GENERATION_CONFIG
+
+
+def test_qwen3_omni_defaults_come_from_the_checkpoint(omni_released):
+    configs = omni_released.get_request_resource_configs([], [], {})
+    talker = configs[TALKER_SAMPLER]
+    assert (talker.temperature, talker.top_k, talker.top_p, talker.repetition_penalty) == (
+        0.9, 50, 1.0, 1.05,
+    )
+    # the checkpoint names no Thinker or CodePredictor knob; the fallback applies
+    thinker = configs[THINKER_SAMPLER]
+    assert (thinker.temperature, thinker.top_p, thinker.top_k) == (0.7, 0.9, 0)
+    code_pred = configs[CODE_PRED_SAMPLER]
+    assert (code_pred.temperature, code_pred.top_k, code_pred.top_p) == (1.0, 50, 0.8)
+    assert _omni_talker_args(omni_released, {}).step_metadata["talker_max_tokens"] == 4096
+
+
+def test_qwen3_omni_no_checkpoint_falls_back():
+    model = _omni_model()
+    assert model.get_max_output_tokens() == MAX_OUTPUT_TOKENS
+    assert _omni_talker_args(model, {}).step_metadata["talker_max_tokens"] == MAX_OUTPUT_TOKENS
+
+
+def test_qwen3_omni_plain_keys_target_the_thinker_and_prefixed_keys_win(omni_released):
+    configs = omni_released.get_request_resource_configs([], [], {
+        "temperature": 0.2, "top_p": 0.5, "top_k": 7, "repetition_penalty": 1.1,
+        "penalize_prompt": False, "ignore_eos": True,
+    })
+    thinker = configs[THINKER_SAMPLER]
+    assert (thinker.temperature, thinker.top_p, thinker.top_k, thinker.repetition_penalty) == (
+        0.2, 0.5, 7, 1.1,
+    )
+    assert thinker.penalize_prompt is False and thinker.ignore_eos is True
+    # plain keys do not reach the other stages
+    assert configs[TALKER_SAMPLER].temperature == 0.9
+    assert configs[CODE_PRED_SAMPLER].temperature == 1.0
+
+    configs = omni_released.get_request_resource_configs([], [], {
+        "temperature": 0.2, "thinker_temperature": 0.4,
+        "talker_temperature": 0.3, "code_predictor_top_k": 5,
+    })
+    assert configs[THINKER_SAMPLER].temperature == 0.4
+    assert configs[TALKER_SAMPLER].temperature == 0.3
+    assert configs[CODE_PRED_SAMPLER].top_k == 5
+
+
+def test_qwen3_omni_code_predictor_gets_no_penalty_and_refuses_one(omni_released):
+    spec = SimpleNamespace(enable_repetition_penalty=False, enable_min_p=False)
+    config = _omni_samplers(omni_released, {})[CODE_PRED_SAMPLER]
+    assert config.repetition_penalty == 1
+    config.validate(spec)
+    asked = _omni_samplers(omni_released, {"code_predictor_repetition_penalty": 1.2})
+    with pytest.raises(ValueError, match="repetition_penalty"):
+        asked[CODE_PRED_SAMPLER].validate(spec)
+
+
+def test_qwen3_omni_checkpoint_min_p_turns_the_capability_on(tmp_path):
+    (tmp_path / "generation_config.json").write_text(json.dumps(
+        {**OMNI_GENERATION_CONFIG, "min_p": 0.05, "talker_min_p": 0.02}
+    ))
+    model = _omni_model(tmp_path)
+    text = SimpleNamespace(
+        num_hidden_layers=1, num_key_value_heads=1, num_attention_heads=1,
+        max_position_embeddings=8, vocab_size=16,
+    )
+    model.config = SimpleNamespace(
+        thinker_text=text, talker_text=text, thinker_head_dim=8, talker_head_dim=8,
+        code_predictor=SimpleNamespace(vocab_size=16), num_code_groups=2,
+        audio_encoder=SimpleNamespace(encoder_layers=1, encoder_attention_heads=1, head_dim=8),
+        vision=SimpleNamespace(depth=1, num_heads=1, head_dim=8),
+    )
+    # the encoders' settings and the Thinker's LoRA spec need configs this one lacks
+    model.kernel_settings, model.get_node_resources = dict, list
+    specs = {s.resource_key: s for s in node_resources(model) if isinstance(s, SamplerSpec)}
+    assert specs[THINKER_SAMPLER].enable_min_p and specs[TALKER_SAMPLER].enable_min_p
+    assert not specs[CODE_PRED_SAMPLER].enable_min_p
+    # a plain request takes those defaults and is not refused
+    for key, config in sampling_configs(model.get_request_resource_configs([], [], {}), model.declare_state()).items():
+        config.validate(specs[key])
+
+
+@pytest.mark.parametrize("value", [0, 1.5, True, "100"])
+def test_qwen3_omni_talker_max_output_tokens_out_of_range_is_a_400(omni_released, value):
+    with pytest.raises(ValueError, match="talker_max_output_tokens"):
+        _omni_talker_args(omni_released, {"talker_max_output_tokens": value})
+
+
+def test_qwen3_omni_talker_max_output_tokens_is_honored(omni_released):
+    args = _omni_talker_args(omni_released, {"talker_max_output_tokens": 4096})
+    assert args.step_metadata["talker_max_tokens"] == 4096
+    assert args.step_metadata["talker_max_tokens"] == 4096
+
+
+def test_qwen3_omni_voice_default_and_case(omni_released):
+    assert _omni_talker_args(omni_released, {}).step_metadata["voice"] == "Ethan"
+    assert _omni_talker_args(omni_released, {"voice": "chelsie"}).step_metadata["voice"] == "chelsie"
+    assert _omni_talker_args(omni_released, {"voice": "Aiden"}).step_metadata["voice"] == "Aiden"
+
+
+@pytest.mark.parametrize("voice", ["", "alloy", 3])
+def test_qwen3_omni_bad_voice_is_a_400(omni_released, voice):
+    with pytest.raises(ValueError, match="voice"):
+        _omni_talker_args(omni_released, {"voice": voice})
+    # an explicit voice is checked on text-only output too
+    with pytest.raises(ValueError, match="voice"):
+        _omni_talker_args(omni_released, {"voice": voice}, output_modalities=("text",))
+
+
+def test_qwen3_omni_request_kwargs_spot_checks(omni_released):
+    declared = omni_released.request_kwargs()
+    for key in (
+        "temperature", "top_p", "top_k", "min_p", "repetition_penalty", "penalize_prompt",
+        "thinker_temperature", "thinker_top_p", "talker_temperature", "talker_top_p",
+        "talker_top_k", "talker_repetition_penalty", "code_predictor_top_k",
+        "code_predictor_temperature", "talker_max_output_tokens", "voice", "ignore_eos",
+        "max_output_tokens", "seed",
+    ):
+        assert key in declared, key
+    assert "do_sample" not in declared
+    assert "subtalker_temperature" not in declared
+
+
+
+# ── vjepa2 ──────────────────────────────────────────────────────────────────
+
+@pytest.fixture(scope="module")
+def vjepa2_masked():
+    return VJepa2Model(
+        model_path_hf="facebook/vjepa2-vitl-fpc64-256", skip_weight_loading=True, predictor_kind="vjepa2_masked"
+    )
+
+
+@pytest.fixture(scope="module")
+def vjepa2_ac_model():
+    return VJepa2Model(model_path_hf="facebook/vjepa2-ac-vitg", skip_weight_loading=True, predictor_kind="ac")
+
+
+def _vjepa2_video(frames: int) -> dict:
+    """process_prompt's video kwargs: the frames load_video sampled, decoded by
+    the stub `_vjepa2_decode` installs."""
+    return {
+        "tensors": {"video_inputs": [torch.rand(frames, 3, 32, 40)]},
+        "input_metadata": {"video_inputs": [{"sampled_indices": list(range(frames))}]},
+    }
+
+
+@pytest.fixture(autouse=True)
+def _vjepa2_decode(monkeypatch):
+    from mstar.model.vjepa2 import vjepa2_model
+
+    monkeypatch.setattr(
+        # without weights there is no HF video processor, so the frames go through as they are
+        vjepa2_model, "decode_frames_at", lambda src, idx, transform: src[torch.tensor(idx)],
+    )
+
+
+def test_vjepa2_request_kwargs_and_no_token_limit(vjepa2_masked):
+    declared = vjepa2_masked.request_kwargs()
+    assert {"num_frames", "rollout_horizon", "stream_rollout", "skip_predictor", "mpc"} <= declared
+    assert {"actions", "states", "extrinsics", "goal_hidden", "goal_hidden_fill"} <= declared
+    assert {"context_mask", "target_mask"} <= declared
+
+
+def test_vjepa2_rollout_horizon_past_the_loop_is_refused_by_the_conductor(vjepa2_masked):
+    limit = vjepa2_masked.config.max_rollout_horizon
+    with pytest.raises(ValueError, match="iterations"):
+        _loop_conductor(vjepa2_masked)._loop_caps({"rollout_horizon": limit + 1})
+
+
+@pytest.mark.parametrize("horizon", [-1, 2.0, "4", True])
+def test_vjepa2_bad_rollout_horizon_is_a_400(vjepa2_masked, horizon):
+    with pytest.raises(ValueError, match="rollout_horizon must be an integer >= 0"):
+        vjepa2_masked._initial_walk({"rollout_horizon": horizon})
+    with pytest.raises(ValueError, match="rollout_horizon"):
+        vjepa2_masked.process_prompt(None, ["video"], ["video"], **_vjepa2_video(4), rollout_horizon=horizon)
+
+
+def test_vjepa2_rollout_horizon_range_is_honored_not_clamped(vjepa2_masked):
+    assert vjepa2_masked._initial_walk({"rollout_horizon": 0}) == VJepa2Model.PREFILL_VIDEO
+    assert vjepa2_masked._initial_walk({"rollout_horizon": 1}) == VJepa2Model.PREFILL_VIDEO
+    limit = vjepa2_masked.config.max_rollout_horizon
+    frames = {"video_frames": [SimpleNamespace(dims=[1])]}
+    [step] = vjepa2_masked.walk_plan("default", ["video"], ["video"], frames, {"rollout_horizon": limit})
+    assert step.walk == VJepa2Model.PREFILL_VIDEO_ROLLOUT
+    # the horizon is the rollout loop's cap; one past max_iters the conductor refuses
+    assert vjepa2_masked.get_loop_caps(rollout_horizon=limit) == {vjepa2_masked.ROLLOUT_LOOP_NAME: limit}
+
+
+@pytest.mark.parametrize("flag", ["stream_rollout", "skip_predictor", "mpc"])
+@pytest.mark.parametrize("value", ["false", 0, 1])
+def test_vjepa2_flags_must_be_bools(vjepa2_masked, flag, value):
+    with pytest.raises(ValueError, match=f"{flag} must be true or false"):
+        vjepa2_masked._initial_walk({flag: value, "rollout_horizon": 4})
+    with pytest.raises(ValueError, match=f"{flag} must be true or false"):
+        vjepa2_masked.process_prompt(None, ["video"], ["video"], **_vjepa2_video(4), **{flag: value})
+
+
+@pytest.mark.parametrize("num_frames", [0, -2, 9, 4.0, "4"])
+def test_vjepa2_num_frames_outside_the_decoded_clip_is_a_400(vjepa2_masked, num_frames):
+    with pytest.raises(ValueError, match=r"num_frames must be an integer in \[1, 8\]"):
+        vjepa2_masked.process_prompt(None, ["video"], ["video"], **_vjepa2_video(8), num_frames=num_frames)
+
+
+def test_vjepa2_num_frames_default_and_explicit(vjepa2_masked):
+    out = vjepa2_masked.process_prompt(None, ["video"], ["video"], **_vjepa2_video(8)).new_input_tensors
+    assert out["video_frames"][0].shape[0] == 8
+    out = vjepa2_masked.process_prompt(
+        None, ["video"], ["video"], **_vjepa2_video(8), num_frames=4,
+    ).new_input_tensors
+    assert out["video_frames"][0].shape[0] == 4
+
+
+def test_vjepa2_ac_inputs_must_be_numeric(vjepa2_ac_model):
+    good = {"actions": [[0.0] * 7] * 4, "states": [[0.0] * 7] * 4}
+    with pytest.raises(ValueError, match="actions must be a numeric array"):
+        vjepa2_ac_model.process_prompt(None, ["video"], ["video"], **{**good, "actions": [["a"] * 7] * 4})
+    with pytest.raises(ValueError, match="states must be a numeric array"):
+        vjepa2_ac_model.process_prompt(None, ["video"], ["video"], **{**good, "states": [[0.0] * 7, [0.0] * 3]})
+    with pytest.raises(ValueError, match="goal_hidden_fill must be a number"):
+        vjepa2_ac_model.process_prompt(None, ["video"], ["video"], mpc=True, goal_hidden_fill="1", **good)
+    # the trajectory check uses the validated horizon: 5 needs 1 + 5 - 1 = 5 steps
+    with pytest.raises(ValueError, match="trajectory length >= .* = 5; got 4"):
+        vjepa2_ac_model.process_prompt(None, ["video"], ["video"], rollout_horizon=5, **good)
+    out = vjepa2_ac_model.process_prompt(None, ["video"], ["video"], rollout_horizon=4, **good).new_input_tensors
+    assert out["actions"][0].shape == (4, 7)
+
+
+
+# ── whisper ─────────────────────────────────────────────────────────────────
+
+WHISPER_CACHED = _cached_snapshots("openai/whisper-large-v3")
+
+
+def _whisper_model(defaults=None) -> WhisperModel:
+    model = object.__new__(WhisperModel)
+    model.config = WhisperModelConfig(
+        lang_to_id={"<|en|>": 50259, "<|de|>": 50261},
+        task_to_id={"transcribe": 50360, "translate": 50359},
+    )
+    model.sampling_defaults = dict(WHISPER_DEFAULT_SAMPLING if defaults is None else defaults)
+    return model
+
+
+def _whisper_sampler(model, **kw) -> SamplingReqConfig:
+    return model.get_request_resource_configs([], [], kw)[WHISPER_SAMPLER]
+
+
+def _whisper_spec(model):
+    return next(s for s in model.get_node_resources() if s.resource_key == WHISPER_SAMPLER)
+
+
+def test_whisper_request_kwargs_are_the_keys_it_reads():
+    keys = _whisper_model().request_kwargs()
+    for read in ("language", "task", "temperature", "top_p", "top_k", "min_p",
+                 "repetition_penalty", "penalize_prompt", "ignore_eos", "max_output_tokens"):
+        assert read in keys
+    # sent by the transcription adapter
+    assert "initial_prompt" in keys and "timestamps" in keys
+
+
+def test_whisper_default_is_the_decode_loop_bound():
+    model = _whisper_model()
+    assert model.get_max_output_tokens() == 444
+    # the prefill samples the first of the 444
+    assert model.get_graph_walk_graphs()["decode"].max_iters == 443
+
+
+@pytest.mark.parametrize("over", [445, 448])
+def test_whisper_over_limit_is_refused_not_clamped(over):
+    """448, the position table's size, is past the 444 the forced prompt leaves."""
+    c = _loop_conductor(_whisper_model())
+    assert c._max_output_tokens({"max_output_tokens": 444}) == 444
+    # the prefill samples the first token
+    assert c._loop_caps({"max_output_tokens": 10}) == {"decode_loop": 9}
+    c._loop_caps({"max_output_tokens": 444})
+    with pytest.raises(ValueError, match="at most 443"):
+        c._loop_caps({"max_output_tokens": over})
+
+
+def test_whisper_default_is_greedy_and_client_knobs_are_forwarded():
+    model = _whisper_model()
+    cfg = _whisper_sampler(model)
+    assert (cfg.temperature, cfg.top_p, cfg.top_k) == (0.0, 1.0, 0)
+    cfg = _whisper_sampler(model, temperature=0.4, top_p=0.9, top_k=5, penalize_prompt=False)
+    assert (cfg.temperature, cfg.top_p, cfg.top_k, cfg.penalize_prompt) == (0.4, 0.9, 5, False)
+
+
+@pytest.mark.parametrize("kw", [{"repetition_penalty": 1.2}, {"min_p": 0.1}])
+def test_whisper_unsupported_knobs_are_refused_at_admission(kw):
+    model = _whisper_model()
+    with pytest.raises(ValueError, match="does not support"):
+        _whisper_sampler(model, **kw).validate(_whisper_spec(model))
+    _whisper_sampler(model).validate(_whisper_spec(model))
+
+
+def test_whisper_checkpoint_generation_config_sets_the_defaults(tmp_path):
+    (tmp_path / "generation_config.json").write_text(json.dumps(
+        {"do_sample": True, "temperature": 0.7, "top_k": 3, "repetition_penalty": 1.1, "max_length": 448}
+    ))
+    defaults = whisper_sampling_defaults(tmp_path)
+    assert defaults == {"temperature": 0.7, "top_p": 1.0, "top_k": 3, "repetition_penalty": 1.1}
+    # a checkpoint penalty turns the capability on, so its own default is not refused
+    model = _whisper_model(defaults)
+    _whisper_sampler(model).validate(_whisper_spec(model))
+
+
+@pytest.mark.skipif(not WHISPER_CACHED, reason="whisper-large-v3 not cached")
+def test_whisper_real_checkpoint_declares_no_sampling_so_greedy_stays():
+    snapshot = Path(WHISPER_CACHED[0])
+    assert whisper_sampling_defaults(snapshot) == WHISPER_DEFAULT_SAMPLING
+
+
+@pytest.mark.parametrize("kw", [{"language": 5}, {"task": ["transcribe"]}, {"language": ""}, {"language": "xx"}])
+def test_whisper_bad_language_or_task_is_a_value_error(kw):
+    model = _whisper_model()
+    if isinstance(kw.get("language"), str):
+        # a string reaches the token lookup, which needs the audio checks passed
+        with pytest.raises(ValueError, match="language"):
+            model.config.decoder_prompt_ids(language=kw["language"])
+        return
+    with pytest.raises(ValueError, match="must be a string"):
+        model.process_prompt(None, ["audio"], ["text"], tensors={"audio_inputs": [torch.zeros(1600)]}, **kw)
+
+
+# ── every registered model ─────────────────────────────────────────────────
+
+_MODEL_CLASSES = sorted(set(MODEL_REGISTRY.values()))
+
+
+@pytest.mark.parametrize(("module", "name"), _MODEL_CLASSES, ids=[name for _, name in _MODEL_CLASSES])
+def test_every_registered_model_declares_its_request_kwargs(module, name):
+    """Without a declaration the server cannot log a key the model ignores."""
+    try:
+        cls = getattr(importlib.import_module(module), name)
+    except ImportError as exc:
+        pytest.skip(f"{module} needs an optional dependency: {exc}")
+    assert cls.request_kwargs is not Model.request_kwargs, f"{name} does not override request_kwargs()"
+
+
+@pytest.mark.parametrize(("module", "name", "keys"), [
+    ("mstar.model.flux2_klein.flux2_klein_model", "Flux2KleinModel",
+     {"height", "width", "num_inference_steps", "guidance_scale", *OUTPUT_FORMAT_KWARGS}),
+    ("mstar.model.z_image.z_image_model", "ZImageModel",
+     {"height", "width", "num_inference_steps", "guidance_scale", *OUTPUT_FORMAT_KWARGS}),
+    ("mstar.model.ltx2_5.ltx2_5_model", "LTX25Model",
+     {"height", "width", "num_frames", "fps", "recipe", "num_inference_steps", "guidance_scale"}),
+    ("mstar.model.lingbot_world.lingbot_world_model", "LingBotWorldModel",
+     {"camera_poses", "intrinsics", "num_frames", "height", "width"}),
+    ("mstar.model.omnilingual_asr.omnilingual_asr_model", "OmnilingualASRModel", set()),
+    ("mstar.model.minimax_h3.minimax_h3_model", "H3Model",
+     {"height", "width", "num_frames", "num_inference_steps", "flow_shift", "audio_flow_shift", "keyframe_anchors"}),
+])
+def test_generator_and_ctc_request_kwargs(module, name, keys):
+    try:
+        cls = getattr(importlib.import_module(module), name)
+    except ImportError as exc:  # LingBot-World's VAE needs diffusers
+        pytest.skip(f"{module} needs an optional dependency: {exc}")
+    assert object.__new__(cls).request_kwargs() == keys

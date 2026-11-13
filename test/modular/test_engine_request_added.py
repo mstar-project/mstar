@@ -2,20 +2,18 @@
 its resources took it, and leaves the request on none of them when one raises."""
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 import pytest
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.chunking import ChunkingManagement
-from mstar.engine.engine import Engine
+from mstar.engine.state import Entry, Value
+from mstar.testing_utils.engine import make_engine, make_mgmt
 
 
 class _Runner:
     def __init__(self, log):
         self.log = log
 
-    def ingest_request(self, rid, overrides=None):
+    def ingest_request(self, rid, overrides=None, arrival=None):
         self.log.append(("ingest", rid))
 
     def remove_request(self, rid):
@@ -36,15 +34,10 @@ class _Submodule:
 
 
 def _engine(*submodules):
-    engine = Engine.__new__(Engine)
     log = []
-    engine._runner = _Runner(log)
-    engine._resources = {}
-    engine._loopback_steps = {}
-    engine._chunking = ChunkingManagement({})
-    engine._submodules = {
-        name: SimpleNamespace(submodule=_Submodule(log, name, raises)) for name, raises in submodules
-    }
+    engine = make_engine(_runner=_Runner(log), _submodules={
+        name: make_mgmt(_Submodule(log, name, raises)) for name, raises in submodules
+    })
     return engine, log
 
 
@@ -69,3 +62,13 @@ def test_a_raising_submodule_leaves_the_request_nowhere():
     with pytest.raises(ValueError):
         engine.add_request(3, None, _info())
     assert log == [("ingest", 3), ("dit", 3, 5), ("remove", 3), ("dit.cleanup", 3), ("vae.cleanup", 3)]
+
+
+def test_a_request_opens_its_host_fields_and_a_removal_closes_them():
+    engine, _ = _engine(("dit", False))
+    flags = Value("flags", nodes={"dit"}, layers={0}, entry=Entry({}, host={"sent": bool}))
+    engine._state_setup.host_fields.declare(flags)
+    engine.add_request(3)
+    assert engine._state_setup.host_fields.is_open(3), "with no request info too: the resources take it either way"
+    engine.remove_request(3)
+    assert not engine._state_setup.host_fields.is_open(3), "a handle is recycled once the request is removed"

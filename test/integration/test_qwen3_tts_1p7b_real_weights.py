@@ -27,7 +27,9 @@ VARIANTS = {
 # talker.* minus code_predictor.*  |  code_predictor.*  |  speech_tokenizer decoder.*
 TALKER_PARAMS = 1_741_550_592
 CODE_PREDICTOR_PARAMS = 175_125_760
-CODEC_PARAMS = 114_323_137
+# the checkpoint's 114,323,137 less the SnakeBeta alpha/beta (23,232), which load
+# into FusedSnakeBeta's buffers
+CODEC_PARAMS = 114_299_905
 
 
 def _find_cached_snapshot(repo: str) -> Path | None:
@@ -124,8 +126,8 @@ def test_prefill_layout_matches_variant(loaded):
     # [speaker], pad.
     tags = 3 + 1 + (1 if variant == "custom_voice" else 0) + 1
     assert prepared.input_seq_len == instruct_len + 3 + tags + (text_len + 1) + 1
-    state = talker.request_state(f"prefill-{variant}")
-    assert state["trailing_text_hidden"].shape == (0, model.config.talker.hidden_size)
+    # the prefill took the whole text and TTS EOS: nothing streams
+    assert result.new_input_tensors["text_in"] == []
 
 
 def test_depth_loop_runs_through_projection(loaded):

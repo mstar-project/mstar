@@ -78,7 +78,8 @@ def compute_3d_cos_sin(
     -------
     cos : torch.Tensor  shape ``(seq_len, head_dim)``
     sin : torch.Tensor  shape ``(seq_len, head_dim)``
-        Ready to be used with :func:`apply_interleaved_mrope`.
+        The rotate-half tables the Thinker's attention rotates q and k by
+        (``qk_norm_rope_table_kv_write``).
     """
     # position_ids_3d: (3, seq_len)  ->  (3, 1, seq_len)
     #   for matmul with inv_freq: (1, head_dim//2, 1)
@@ -97,11 +98,8 @@ def compute_3d_cos_sin(
     cos = (emb.cos() * attention_scaling).squeeze(0)  # (seq_len, head_dim)
     sin = (emb.sin() * attention_scaling).squeeze(0)  # (seq_len, head_dim)
 
-    # Cast back to the model dtype (e.g. bfloat16) so that the subsequent
-    # ``q * cos`` / ``k * cos`` multiplications inside apply_interleaved_mrope
-    # don't promote q/k to fp32 -- which would mismatch the paged KV cache
-    # dtype that FlashInfer's attention call expects.  HF does the same
-    # (modeling_qwen3_omni_moe.py:1329).
+    # Rounded to the model dtype (e.g. bfloat16), as HF rounds them
+    # (modeling_qwen3_omni_moe.py:1329), so the rotation reads the same tables.
     if target_dtype is not None:
         cos = cos.to(target_dtype)
         sin = sin.to(target_dtype)
@@ -150,56 +148,6 @@ def _apply_interleaved_mrope_freqs(
     return freqs_t
 
 
-def apply_interleaved_mrope(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    cos: torch.Tensor,
-    sin: torch.Tensor,
-    unsqueeze_dim: int = 1,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Apply interleaved multimodal RoPE to query and key tensors.
-
-    This applies the standard rotate-half RoPE using cos/sin that have
-    *already* been interleaved via :func:`compute_3d_cos_sin`.
-
-    Parameters
-    ----------
-    q : torch.Tensor
-        Query tensor.  Typical shapes:
-        - ``(batch, heads, seq_len, head_dim)`` (``unsqueeze_dim=1`` is a no-op
-          when cos already has a heads broadcast dim, but the unsqueeze makes
-          ``(seq_len, head_dim)`` -> ``(1, seq_len, head_dim)`` broadcastable).
-        - ``(tokens, heads, head_dim)`` for disaggregated / packed inputs.
-    k : torch.Tensor
-        Key tensor, same layout as ``q`` but may have fewer heads (GQA).
-    cos : torch.Tensor
-        Cosine embeddings from :func:`compute_3d_cos_sin`.
-    sin : torch.Tensor
-        Sine embeddings from :func:`compute_3d_cos_sin`.
-    unsqueeze_dim : int
-        Dimension along which to unsqueeze cos/sin so they broadcast with
-        q/k.  Default 1 matches the HF convention for
-        ``(batch, heads, seq_len, head_dim)`` layout.
-
-    Returns
-    -------
-    q_embed, k_embed : torch.Tensor
-        Rotated query and key tensors, same shape and dtype as inputs.
-    """
-    cos = cos.unsqueeze(unsqueeze_dim)
-    sin = sin.unsqueeze(unsqueeze_dim)
-    q_embed = (q * cos) + (_rotate_half(q) * sin)
-    k_embed = (k * cos) + (_rotate_half(k) * sin)
-    return q_embed, k_embed
-
-
-def _rotate_half(x: torch.Tensor) -> torch.Tensor:
-    """Rotate half the hidden dims -- standard RoPE helper."""
-    x1 = x[..., : x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2 :]
-    return torch.cat((-x2, x1), dim=-1)
-
-
 # -----------------------------------------------------------------------
 # Position-ID construction  (per-modality helpers)
 # -----------------------------------------------------------------------
@@ -242,50 +190,6 @@ def get_rope_index_text(
     positions = torch.arange(seq_len, dtype=torch.float, device=device) + float(
         start_pos
     )
-    return positions.unsqueeze(0).expand(3, -1).contiguous()
-
-
-def get_rope_index_audio(
-    num_audio_tokens: int,
-    start_pos: float,
-    device: torch.device | None = None,
-    position_id_per_seconds: int = 25,
-) -> torch.Tensor:
-    """Build 3D MRoPE position IDs for an audio-only span.
-
-    All three components advance together, one per audio token — audio
-    tokens are positioned exactly like text.  Without vision inputs, HF's
-    ``get_rope_index`` takes its non-spatial branch and returns
-    ``(cumsum(attention_mask) - 1).expand(3, -1, -1)``; checked against the
-    real implementation, an audio span comes back as t == h == w ==
-    2, 3, 4, ….
-
-    Pinning h/w to a constant instead (what this did before) leaves the
-    ``mrope_section`` bands that read those components with no positional
-    progression across the span, which degrades long audio the most.
-
-    Parameters
-    ----------
-    num_audio_tokens : int
-        Number of audio tokens produced by the audio encoder.
-    start_pos : float
-        Starting position offset.
-    device : torch.device, optional
-        Device for the returned tensor.
-    position_id_per_seconds : int
-        Unused here -- kept for API symmetry.  It applies to HF's spatial
-        branch (vision present), where audio position IDs come from
-        timestamps rather than token index.
-
-    Returns
-    -------
-    pos_ids_3d : torch.Tensor
-        Shape ``(3, num_audio_tokens)``.  ``dtype=torch.float``.
-    """
-    del position_id_per_seconds  # kept for API compatibility
-    positions = torch.arange(
-        num_audio_tokens, dtype=torch.float, device=device
-    ) + float(start_pos)
     return positions.unsqueeze(0).expand(3, -1).contiguous()
 
 
@@ -344,9 +248,10 @@ def get_rope_index_vision(
                 (num_tokens,), float(start_pos), dtype=torch.float, device=device
             )
         else:
+            # a video's frame groups step by their time, from start_pos like h and w
             temporal = (
                 torch.arange(grid_t, dtype=torch.float, device=device) * seconds_per_grid * position_id_per_seconds
-            ).view(-1, 1).expand(-1, llm_grid_h * llm_grid_w).flatten().float()
+            ).view(-1, 1).expand(-1, llm_grid_h * llm_grid_w).flatten().float() + float(start_pos)
 
         h_index = (
             torch.arange(llm_grid_h, dtype=torch.float, device=device)

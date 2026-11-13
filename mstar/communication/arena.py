@@ -159,6 +159,32 @@ def _shm_space() -> tuple[int | None, int | None]:
     return st.f_frsize * st.f_blocks, st.f_frsize * st.f_bavail
 
 
+def _sweep_orphan_segments() -> None:
+    """A SIGKILLed server never runs Drop, orphaning up to its full
+    arena in /dev/shm until reboot. Names embed the owning pid, so a
+    startup sweep can reclaim any segment whose owner is gone. Files we
+    cannot judge (foreign naming) or cannot remove (another user's)
+    are left with a debug note."""
+    try:
+        names = os.listdir("/dev/shm")
+    except OSError:
+        return
+    for name in names:
+        if not name.startswith("mstar_arena_"):
+            continue
+        parts = name.split(".")[0].rsplit("_", 2)
+        if len(parts) != 3 or not parts[1].isdigit():
+            continue   # pre-uniquification or foreign naming: skip
+        if os.path.exists(f"/proc/{parts[1]}"):
+            continue   # owner alive
+        try:
+            os.unlink(f"/dev/shm/{name}")
+            logger.info("ARENA: swept orphaned segment %s "
+                        "(owner pid %s is gone)", name, parts[1])
+        except OSError as e:
+            logger.debug("ARENA: cannot sweep %s: %s", name, e)
+
+
 def export_arena_plan(worker_devices: list[str] | None) -> None:
     """Size every arena of this deployment once, from /dev/shm's free space
     before any of them exists, and hand the sizes to the processes the caller
@@ -166,6 +192,11 @@ def export_arena_plan(worker_devices: list[str] | None) -> None:
     arena itself, for its workers on ``worker_devices``; None (no deployment
     config) drops a plan an earlier server in this process left."""
     os.environ.pop(ARENA_PLAN_ENV, None)
+    if worker_devices is not None:
+        # a dead run's segments and files count against the free space until
+        # they are gone, and a restart would size itself around them
+        _sweep_orphan_segments()
+        _sweep_dead_namespaces(_default_shm_dir(), "")
     _, avail = _shm_space()
     if worker_devices is None or avail is None:
         return
@@ -509,7 +540,7 @@ class ArenaShmCommunicationManager(TensorCommunicationManager):
         # pid in the name drives the orphan sweep below.
         import secrets
 
-        self._sweep_orphans()
+        _sweep_orphan_segments()
         ns = self._shm_namespace
         base = (f"mstar_{ns}_arena_{my_entity_id}_{secrets.token_hex(4)}"
                 if ns else f"mstar_arena_{my_entity_id}_{os.getpid()}_"
@@ -617,31 +648,6 @@ class ArenaShmCommunicationManager(TensorCommunicationManager):
         return self._transport.spill_path(entity_id, uuid)
 
     # -- segments --------------------------------------------------------
-
-    def _sweep_orphans(self) -> None:
-        """A SIGKILLed server never runs Drop, orphaning up to its full
-        arena in /dev/shm until reboot. Names embed the owning pid, so a
-        startup sweep can reclaim any segment whose owner is gone. Files we
-        cannot judge (foreign naming) or cannot remove (another user's)
-        are left with a debug note."""
-        try:
-            names = os.listdir("/dev/shm")
-        except OSError:
-            return
-        for name in names:
-            if not name.startswith("mstar_arena_"):
-                continue
-            parts = name.split(".")[0].rsplit("_", 2)
-            if len(parts) != 3 or not parts[1].isdigit():
-                continue   # pre-uniquification or foreign naming: skip
-            if os.path.exists(f"/proc/{parts[1]}"):
-                continue   # owner alive
-            try:
-                os.unlink(f"/dev/shm/{name}")
-                logger.info("ARENA: swept orphaned segment %s "
-                            "(owner pid %s is gone)", name, parts[1])
-            except OSError as e:
-                logger.debug("ARENA: cannot sweep %s: %s", name, e)
 
     def stats_summary(self) -> dict:
         """Occupancy/fragmentation snapshot (named apart from the raw

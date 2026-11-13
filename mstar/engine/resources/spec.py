@@ -7,16 +7,22 @@ configs unchanged, so a model only overrides it to add resources beyond
 what those configs already describe.
 """
 
+import dataclasses
 import logging
 from abc import ABC, abstractmethod
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, NamedTuple, Protocol
 
 if TYPE_CHECKING:
+    from mstar.engine.resources.attn.config import SpExchange
     from mstar.engine.resources.base import Resource
+    from mstar.engine.resources.sequence_shard import SeqShardSpec
 
 logger = logging.getLogger(__name__)
+
+# how a resource stores its per-request state over a node's ranks (`NodeResourceSpec.storage`)
+Storage = Literal["by_head", "by_position", "copied"]
 
 
 @dataclass(frozen=True)
@@ -99,6 +105,17 @@ class RoutingMirror(Protocol):
 class NodeResourceSpec(ABC):
     resource_key: str
     nodes: set[str]
+    # Built only when the serving config's ``resources:`` block names this spec's key
+    # (``mstar.model.base.serving_resources``): a resource a deployment turns on, such as
+    # per-request LoRA adapters, declared beside the model's other resources.
+    opt_in: ClassVar[bool] = False
+    # Built as one instance per node (``for_node``) rather than one shared by its nodes:
+    # for a resource whose nodes share no state and may sit in different lockstep
+    # instances (a vision tower beside a tensor-parallel LLM). ``serving_resources``
+    # splits it, so every process that builds or validates requests (the conductor and
+    # workers) sees the instances, keyed ``<resource_key>@<node>`` (``instance_key``); the
+    # serving config's block still names the declared key.
+    per_node: ClassVar[bool] = False
 
     def __post_init__(self):
         if not isinstance(self.nodes, set):
@@ -133,6 +150,43 @@ class NodeResourceSpec(ABC):
         return False
 
     @property
+    def storage(self) -> "Storage | None":
+        """How this resource stores its per-request state over a node's ranks: ``by_head`` (each
+        rank a slice of the heads, over TP x SP), ``by_position`` (each a share of every page's
+        token positions over ranks that would otherwise hold the same heads, heads over TP:
+        ``mstar.engine.resources.context_parallel``), or ``copied`` (heads over TP, every SP rank the
+        whole state: a recurrent pool). None for one holding none. A resource
+        over pools that are all ``copied`` shards its heads over TP (``EngineResourceInfo.head_shards``),
+        and a node whose pools store by position runs copied unless its shard's exchange splits it.
+        From raw fields, as the shard's hooks."""
+        return None
+
+    def resolve_exchange(self, specs: Mapping[str, "NodeResourceSpec"]) -> "SpExchange":
+        """How a split step's tokens reach this resource (``sequence_shard``): ``none`` (the
+        default) for a resource that takes none. From raw fields, so the sequence shard's
+        ``derive`` can ask in any order; a node's steps split where its shard's ``node_exchange``
+        isn't ``none`` and any of its resources answers otherwise (``SeqShardSpec.splits``).
+
+        Every hook the sequence shard reads is computed from the spec's own raw fields and other
+        specs' hooks, never from a field ``derive`` sets: specs derive in key order, so such a
+        field may still hold its default when the shard derives."""
+        return "none"
+
+    def splits_eagerly(self, specs: Mapping[str, "NodeResourceSpec"]) -> bool:
+        """Whether this resource's split steps run eagerly only, their plans differing by rank
+        where a graph holds one: a node with one captures no step that may split
+        (``SeqShardSpec.eager``). False (the default) for one whose split steps replay in a graph.
+        From raw fields, as ``resolve_exchange``."""
+        return False
+
+    def split_step_refusals(
+        self, node: str, shard: "SeqShardSpec", tp: int, sp: int, specs: Mapping[str, "NodeResourceSpec"],
+    ) -> list[str]:
+        """What this resource can't run on ``node``, whose steps ``shard`` splits over ``sp`` SP
+        ranks (``tp`` TP ranks each), among ``specs`` (every spec, by key); each a sentence."""
+        return []
+
+    @property
     @abstractmethod
     def resource_class(self) -> "type[Resource]":
         """What builds this spec. Imported inside the property, so declaring a
@@ -152,6 +206,25 @@ class NodeResourceSpec(ABC):
         attentions declare), after a deployment's overrides; return what is wrong with it.
         Idempotent: it runs wherever the specs resolve (`resolve_spec_dependencies`)."""
         return []
+    def for_node(self, node: str) -> "NodeResourceSpec | None":
+        """A ``per_node`` spec's instance for ``node`` alone, or None when ``node`` needs
+        none."""
+        return dataclasses.replace(self, resource_key=instance_key(self.resource_key, node), nodes={node})
+
+    def request_config(self, model_kwargs: dict | None) -> "ResourceReqConfig | None":
+        """The config a request is opened with on this resource, built from its kwargs, or
+        None. The conductor adds it to the model's own (``get_request_resource_configs``),
+        so a resource the deployment declares needs no model code to take request
+        settings."""
+        return None
+
+    def prefix_variant(self, model_kwargs: dict) -> bytes | None:
+        """What sets a request's KV on this resource apart from another's for the same
+        tokens (a LongRoPE table picked per request), from the kwargs ``request_config``
+        reads; None (the default) for nothing. The API server's data worker folds it into
+        the request's prefix-cache root, so the two never share pages. Called per request
+        on the data worker's threads, so it reads only ``model_kwargs`` and the spec."""
+        return None
 
     def apply_yaml_overrides(self, **kwargs):
         """Patch declared parameters from this resource's YAML block.
@@ -172,6 +245,12 @@ class NodeResourceSpec(ABC):
                 f"resource {self.resource_key!r} takes no YAML overrides; got "
                 f"{sorted(kwargs)}"
             )
+
+
+def instance_key(resource_key: str, node: str) -> str:
+    """The key of a ``per_node`` spec's instance for ``node``: the same on every rank,
+    since it names the node rather than the worker."""
+    return f"{resource_key}@{node}"
 
 
 class ResourceReqConfig:
@@ -251,6 +330,12 @@ TOP_LEVEL_KV_CACHE = (
     "move it under `resources:` keyed by resource name, e.g.\n"
     "resources:\n  kv_cache:\n    max_num_pages: 1024"
 )
+
+
+def check_sizes(sizes: Mapping[str, Any], smallest: int = 1) -> None:
+    for name, value in sizes.items():
+        if isinstance(value, bool) or not isinstance(value, int) or value < smallest:
+            raise ValueError(f"{name} must be an integer >= {smallest}; got {value!r}")
 
 
 def unknown_overrides_message(unknown: list[str], declared: Collection[str]) -> str:

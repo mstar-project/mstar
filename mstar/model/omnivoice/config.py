@@ -55,7 +55,7 @@ class OmniVoiceGenerationDefaults:
     """Per-request decoding knobs and their defaults.
 
     Every one of these is per-request: they ride ``step_metadata`` and are
-    resolved once in ``OmniVoiceModel.get_initial_forward_pass_args``.  This is
+    resolved once in ``OmniVoiceModel.walk_plan``.  This is
     the reason to serve OmniVoice on a graph runtime at all — a fixed-pipeline
     port has to pick one value for the whole server.
     """
@@ -68,8 +68,9 @@ class OmniVoiceGenerationDefaults:
     class_temperature: float = 0.0
     denoise: bool = True
 
-    # Ceiling for the unmask Loop's ``max_iters``.  A request's own num_step
-    # stops the loop early via check_stop; this only bounds the graph.
+    # Ceiling for the unmask Loop's ``max_iters`` and the largest num_step a
+    # request may ask for (above it is a 400). A request's own num_step is the
+    # loop's cap.
     max_num_step: int = 64
 
 
@@ -101,7 +102,7 @@ class OmniVoiceConfig:
     max_target_seconds: float = 30.0
 
     # Requests per step. Packing is ragged so length skew costs nothing; this
-    # bounds the Python-side per-item work and the number of reveal loops.
+    # bounds a step's per-request host work (inputs, the canvas layout).
     max_batch_size: int = 16
 
     # The cap that actually matters: a step's cost is sum(doc_lens) tokens
@@ -124,13 +125,6 @@ class OmniVoiceConfig:
     # runs the same layer loop eagerly.
     backbone_graphs: bool = True
     backbone_capture_batch_sizes: list[int] = field(default_factory=lambda: [1, 2, 4, 8, 16])
-    # Packed tokens per step (both CFG documents of every request); a step
-    # above the largest bucket runs eagerly. Past a few thousand tokens the
-    # step is GPU-bound, eager launches hide behind it, and a bucket's padding
-    # would only add work.
-    backbone_token_buckets: list[int] = field(
-        default_factory=lambda: [256, 512, 768, 1024, 1536, 2048, 2560, 3072, 3584, 4096]
-    )
 
     @property
     def audio_embedding_rows(self) -> int:
