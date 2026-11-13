@@ -1134,7 +1134,8 @@ class _CountTable:
 
 
 class _Counts:
-    """A verify step's counts, read from its table once, when the first of its rows is applied."""
+    """A verify step's counts, read from its table when the first of its rows is applied. A read that raises keeps
+    nothing, so every later read of the step's rows raises too."""
 
     def __init__(self, table: _CountTable, number: int, spans: tuple[int, ...], done: torch.cuda.Event | None):
         self._table, self._number, self._spans, self._done = table, number, spans, done
@@ -1148,17 +1149,18 @@ class _Counts:
             if number != self._number:
                 raise RuntimeError(f"the count table of verify step {self._number} was overwritten by step {number} "
                                    "before its counts were applied")
-            self._kept = self._table.host[1:len(self._spans) + 1].tolist()
-            self._compare_ranks()
+            kept = self._table.host[1:len(self._spans) + 1].tolist()
+            self._compare_ranks(kept)
+            self._kept = kept
         return self._kept[row] - self._spans[row]
 
-    def _compare_ranks(self) -> None:
+    def _compare_ranks(self, kept: list[int]) -> None:
         table = self._table
         if not table.ranks:
             return
         start = 1 + table.rows
         ranks = table.host[start:start + table.ranks * len(self._spans)].view(table.ranks, -1).tolist()
-        if any(counts != self._kept for counts in ranks):
+        if any(counts != kept for counts in ranks):
             raise RuntimeError(f"the TP ranks settled verify step {self._number} differently, {ranks}, and each "
                                "would move its own pages by its own counts")
 
