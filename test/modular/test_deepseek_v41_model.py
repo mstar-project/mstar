@@ -252,6 +252,29 @@ class TestEngineCpu:
             whole = self._solo(snapshot, ids[:self.PROMPT + step], self.PROMPT + step)[0]
             assert logit_gap(stepped[step][None], whole[None]) < 1e-5
 
+    def test_the_launch_sizes_a_deployment_sets_change_no_logit(self, snapshot):
+        """``score_bytes`` and ``attend_bytes`` cut a step's scoring and attention into
+        launches: a few rows a launch give what one launch gives, on prefill and decode rows."""
+        ids_a = random_ids(snapshot[1], self.PROMPT + self.STEPS, seed=8)
+        ids_b = random_ids(snapshot[1], 30 + self.STEPS, seed=9)
+
+        def run(**sizes):
+            engine, sampler, _ = cpu_engine(snapshot[0], torch.float32)
+            for name, value in sizes.items():
+                setattr(engine._resources[CSA].config, name, value)
+            for rid in "ab":
+                add_request(engine, rid)
+            rows = [run_step(engine, sampler, "prefill", {"a": ids_a[:self.PROMPT], "b": ids_b[:30]})]
+            for step in range(self.STEPS):
+                rows.append(run_step(engine, sampler, "decode", {
+                    "a": ids_a[self.PROMPT + step].view(1), "b": ids_b[30 + step].view(1)}))
+            return torch.stack([torch.stack([r[rid] for r in rows]) for rid in "ab"])
+
+        whole = run()
+        # about three prefill rows and one decode row a launch at the reduced sizes
+        pieces = run(score_bytes=4 * 16 * 3 * 22, attend_bytes=8 * 16 * 32 * 3)
+        assert logit_gap(pieces, whole) < 1e-5
+
     def test_a_cache_holds_a_row_per_pooled_group_however_the_tokens_arrive(self, snapshot):
         """19 prompt tokens in steps of 1, 7 and 11, then 5 decode steps: 24 tokens, so 24 rows
         in the ratio-1 cache and 12 in the ratio-2 one, whose odd steps write nothing."""

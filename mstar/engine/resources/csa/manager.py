@@ -33,13 +33,11 @@ _MAIN = "main"
 @dataclass
 class CSACache:
     """One cache's addressing for a step. Device: ``pages``, the flat page list of the step's
-    requests and one spare entry (a request may hold no page yet), ``page_start`` each
-    request's first entry in it, and ``written``, the step's rows whose token completes a
-    group, in the order the cache's step writes them."""
+    requests and one spare entry (a request may hold no page yet), and ``page_start``, each
+    request's first entry in it."""
 
     pages: torch.Tensor
     page_start: torch.Tensor
-    written: torch.Tensor
     page_size: int
 
 
@@ -202,7 +200,6 @@ class CSAManager(Resource):
         first: list[int] = []
         end: list[int] = []
         spans: list[tuple[int, int, int]] = []
-        written: dict[int, list[int]] = {ratio: [] for ratio in self.config.caches}
         for i, (rid, _, n) in enumerate(segments):
             row0, start = len(pos), self._tokens.get(rid, 0)
             spans.append((row0, n, start))
@@ -210,9 +207,6 @@ class CSAManager(Resource):
             row_req.extend([i] * n)
             first.extend([row0] * n)
             end.extend([start + n] * n)
-            for ratio, rows in written.items():
-                # the tokens at the end of a group: positions p with (p + 1) % ratio == 0
-                rows.extend(range(row0 + -(start + 1) % ratio, row0 + n, ratio))
 
         def host(values) -> torch.Tensor:
             return torch.as_tensor(values, dtype=torch.long)
@@ -229,8 +223,7 @@ class CSAManager(Resource):
                         f"({have - start // ratio} to {have})")
             indptr = kv_out.cpu_indptrs
             # the page lists stay tensors: a long context's are the bulk of the plan
-            parts += [torch.cat([host(indptr.paged_kv_indices), host([0])]), host(indptr.paged_kv_indptr[:-1]),
-                      host(written[ratio])]
+            parts += [torch.cat([host(indptr.paged_kv_indices), host([0])]), host(indptr.paged_kv_indptr[:-1])]
 
         # one copy from pinned memory, which waits for nothing on the stream
         staged = torch.empty(sum(p.numel() for p in parts), dtype=torch.long, device=self._device)
@@ -238,7 +231,7 @@ class CSAManager(Resource):
         cuts = iter(staged.split([p.numel() for p in parts]))
         rows = CSARows(*(next(cuts) for _ in range(6)), caches={}, spans=spans)
         for ratio in self.config.caches:
-            rows.caches[ratio] = CSACache(next(cuts), next(cuts), next(cuts), self.page_sizes[ratio])
+            rows.caches[ratio] = CSACache(next(cuts), next(cuts), self.page_sizes[ratio])
         return rows
 
     def commit(self, step: CSAStep, ctx: StepContext) -> None:
@@ -264,18 +257,17 @@ class CSAManager(Resource):
               keys: torch.Tensor | None = None, label: str | None = None) -> None:
         """Write the step's ``latent`` rows ``[rows, latent_dim]`` and its index ``keys``
         ``[rows, index_head_dim]`` (either may be left for a later call) to ``plane`` of the
-        ``ratio`` cache: the rows that complete a group, at the slots the cache's step planned.
-        The other rows' are dropped. A cache of ``Fp4Rows`` rounds them to its grid."""
-        written = self.current(label).caches[ratio].written
-        if not written.numel():
-            return
-        kv = self._cache(ratio)
-        if latent is not None:
-            rows = _store(latent.index_select(0, written), self.config.latent_rows, kv.layer_view(plane))
-            kv.write_kv(rows, None, layer_idx=plane, label=label)
-        if keys is not None:
-            rows = _store(keys.index_select(0, written), self.config.key_rows, kv.aux_view(INDEX_PLANES, plane))
-            kv.write_aux(INDEX_PLANES, rows, layer_idx=plane, label=label)
+        ``ratio`` cache. A row whose token completes a group goes to that group's slot, which
+        the cache's step reserved; the others go to the cache's spare row, so the write has the
+        step's shape whichever rows complete one. A cache of ``Fp4Rows`` rounds them to its grid."""
+        rows, kv = self.current(label), self._cache(ratio)
+        seen = rows.groups(ratio)
+        spare, _ = kv.spare_row()
+        slots = torch.where((rows.pos + 1) % ratio == 0, rows.slots(ratio, rows.row_req, seen - 1), spare)
+        for values, fmt, view in ((latent, self.config.latent_rows, kv.layer_view(plane)),
+                                  (keys, self.config.key_rows, kv.aux_view(INDEX_PLANES, plane))):
+            if values is not None:
+                view.view(-1, view.shape[-1])[slots] = _store(values, fmt, view).to(view.dtype)
 
     def scores(self, ratio: int, plane: int, q: torch.Tensor, w: torch.Tensor,
                label: str | None = None) -> torch.Tensor:
@@ -292,6 +284,17 @@ class CSAManager(Resource):
         group = torch.arange(width, device=q.device)
         heads = q.shape[1]
         with torch.autocast(q.device.type, enabled=False):
+            if all(n == 1 for _, n, _ in rows.spans):
+                # a decode step: every row against its own request's keys, a launch per chunk
+                # of rows instead of one per request
+                chunk = max(1, self.config.score_bytes // (4 * width * max(heads, q.shape[-1])))
+                for c0 in range(0, q.shape[0], chunk):
+                    c1 = min(c0 + chunk, q.shape[0])
+                    slots = rows.slots(ratio, rows.row_req[c0:c1, None], group[None, :])
+                    keys = _load(flat[slots], self.config.key_rows, q.shape[-1])
+                    dots = torch.einsum("rhd,rjd->rhj", q[c0:c1].float(), keys).relu_()
+                    out[c0:c1] = torch.einsum("rh,rhj->rj", w[c0:c1].float(), dots)
+                return out.masked_fill_(group[None, :] >= seen[:, None], -torch.inf)
             for req, (r0, n, start) in enumerate(rows.spans):
                 count = (start + n) // ratio  # groups the span's last row sees
                 if count == 0:
