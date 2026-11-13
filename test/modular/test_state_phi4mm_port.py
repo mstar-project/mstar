@@ -10,6 +10,7 @@ pads the tower's head_dim of 72 to 128.
 from __future__ import annotations
 
 import sys
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -35,6 +36,7 @@ from mstar.engine.state.analysis import state_declaration_problems
 from mstar.model.base import LabelLayout, ProcessPromptOutput, enabled_resources, serving_resources
 from mstar.model.keys import MIXED
 from mstar.model.multimodal_decoder import MIXED_SPLIT, MultimodalDecoderModel
+from mstar.model.phi4mm.components.language_model import Phi4MiniLM
 from mstar.model.phi4mm.submodules import Phi4MMLLMSubmodule
 from mstar.model.phi4mm.vision import Phi4MMVisionEncoderSubmodule
 from mstar.model.submodule_base import ARNodeInputs, engine_step
@@ -114,6 +116,16 @@ def test_phi4mm_specs_equal_the_hand_written_ones_on_its_published_config():
 
 def test_phi4mm_writes_only_lora_by_hand():
     assert {spec.resource_key for spec in _phi4mm().get_node_resources()} == {LORA_RESOURCE_KEY}
+
+
+def test_phi4mm_llm_layers_each_carry_their_own_kv_layer():
+    """The other CPU tests never build the LLM, so a missing or wrong index would first fail on a GPU."""
+    cfg = replace(
+        _phi4mm().config, hidden_size=32, intermediate_size=64, num_attention_heads=2, num_key_value_heads=1,
+        num_hidden_layers=3,
+    )
+    layers = [None if layer.self_attn.layer is None else int(layer.self_attn.layer) for layer in Phi4MiniLM(cfg).layers]
+    assert layers == list(range(cfg.num_hidden_layers)), "a layer would add and read another layer's KV, or none"
 
 
 def _llm(model) -> Phi4MMLLMSubmodule:
