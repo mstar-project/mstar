@@ -24,6 +24,7 @@ from mstar.model.components.token2wav.flow import MEL_BINS
 from mstar.model.components.token2wav.keys import Token2WavKeys
 from mstar.model.components.token2wav.model import (
     CACHE_FAMILIES,
+    HOP,
     LAST_WINDOW_TOKENS,
     LEAD_SILENCE,
     SILENCE_CODE,
@@ -179,12 +180,15 @@ class Token2WavSubmodule(NodeSubmodule):
         if first:
             codes = torch.cat([self._lead_silence, codes])
             state.add("voice", fwd_info.step_metadata.get(self.keys.voice))
-            # HiFT's excitation, window by window from the request's seed
-            state.add("noise", torch.Generator(self.get_device()).manual_seed(fwd_info.random_seed))
+        if not last and codes.shape[0] != WINDOW:
+            raise RuntimeError(f"a window before the last holds {codes.shape[0]} codes, and HiFT's noise for window k "
+                               f"assumes every window before it held {WINDOW}")
         # Window k starts 25k codes into the silence-led stream (its look-back
         # included), which is what its caches hold before it (``_cache_steps``).
         state.add("written", 0 if first else chunk.start_offset + LEAD_SILENCE)
-        return NodeInputs(tensor_inputs={"codes": codes[None]}, kwargs={"last": last, "first": first})
+        # HiFT's excitation, from the request's seed and the window's index
+        draw = (fwd_info.random_seed, (chunk.start_offset + LEAD_SILENCE) // HOP)
+        return NodeInputs(tensor_inputs={"codes": codes[None]}, kwargs={"last": last, "first": first, "draw": draw})
 
     def declare_step(
         self, graph_walk: str, request_ids: list[str], inputs: list[NodeInputs], **kwargs,
@@ -326,7 +330,8 @@ class Token2WavSubmodule(NodeSubmodule):
     ) -> dict[str, Any]:
         device = self.get_device()
         return {"rows": [
-            (inp.tensor_inputs["codes"].to(device), inp.kwargs["last"], inp.kwargs.get("first", False))
+            (inp.tensor_inputs["codes"].to(device), inp.kwargs["last"], inp.kwargs.get("first", False),
+             inp.kwargs.get("draw"))
             for inp in inputs
         ]}
 
@@ -337,13 +342,13 @@ class Token2WavSubmodule(NodeSubmodule):
         whatever its voice and position, then HiFT, batched over rows that are all or none
         their request's first window."""
         runners = engine_inputs.piecewise_runners
-        out, first, flows = {}, {}, {}
-        for rid, (codes, last, is_first) in zip(engine_inputs.request_ids, rows, strict=True):
+        out, first, draws, flows = {}, {}, {}, {}
+        for rid, (codes, last, is_first, draw) in zip(engine_inputs.request_ids, rows, strict=True):
             if not codes.shape[1]:
                 # past its last window (``prepare_inputs``)
                 out[rid] = {}
                 continue
-            first[rid] = is_first
+            first[rid], draws[rid] = is_first, draw
             flows.setdefault((codes.shape[1], last), []).append((rid, codes))
 
         mels, hifts = {}, {}
@@ -362,7 +367,7 @@ class Token2WavSubmodule(NodeSubmodule):
                 self.eager_region("hift", is_first, last)]
             for chunk in self._chunks(runner, rids, last):
                 mel = torch.stack([mels[rid] for rid in chunk])
-                wav = self._run_hift(engine_inputs, runner, chunk, mel, is_first, last)
+                wav = self._run_hift(engine_inputs, runner, chunk, mel, is_first, last, [draws[rid] for rid in chunk])
                 for i, rid in enumerate(chunk):
                     out[rid] = {self.keys.audio: [wav[i]]}
         return out
@@ -394,10 +399,11 @@ class Token2WavSubmodule(NodeSubmodule):
         mel: torch.Tensor,
         first: bool,
         last: bool,
+        draws: list[tuple[int, int]],
     ) -> torch.Tensor:
         """``window_vocode`` and then (eagerly: the inverse STFT syncs) ``window_finish``,
         on the rows the region just planned: the rows' samples."""
-        noise = self.model.window_noise(mel.shape[-1], first, [self.request_state(r)["noise"] for r in rids])
+        noise = self.model.window_noise(mel.shape[-1], first, draws)
         out = runner.run(
             static_inputs={"mel": mel, "phase": noise.phase, "harmonic": noise.harmonic},
             request_ids=rids, seq_lens=[mel.shape[-1]] * len(rids), real_bs=len(rids),

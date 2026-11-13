@@ -755,10 +755,11 @@ def test_hift_noise_is_the_requests_own(random_token2wav):
     chunk = InputMetadata(stream_chunks={"tts_code": SimpleNamespace(start_offset=0, context_items=0, num_items=25)})
 
     def first_window(seeds: dict[str, int]) -> torch.Tensor:
-        rids = list(seeds)
+        rids, draws = list(seeds), []
         for rid, seed in seeds.items():
             info = SimpleNamespace(rid_handle=rid, step_metadata={"voice": "v"}, random_seed=seed)
-            node.prepare_inputs("t2w_chunk", info, {"tts_code": [torch.arange(25)]}, input_metadata=chunk)
+            inputs = node.prepare_inputs("t2w_chunk", info, {"tts_code": [torch.arange(25)]}, input_metadata=chunk)
+            draws.append(inputs.kwargs["draw"])
         _, _, _, commit = kv_steps.window(rids, 28, False)
         resources = {T2W_STATE: kv_steps.pool, **{T2W_KV[n]: kv_steps.resources[n] for n in T2W_KV}}
         engine_inputs = ModelInputsFromEngine(request_ids=rids, per_request_info={}, resources=resources)
@@ -769,7 +770,7 @@ def test_hift_noise_is_the_requests_own(random_token2wav):
                 return SimpleNamespace(get_view=out.__getitem__)
 
         # the node draws the noise itself
-        node._run_hift(engine_inputs, Runner(), rids, mel.expand(len(rids), -1, -1), True, False)
+        node._run_hift(engine_inputs, Runner(), rids, mel.expand(len(rids), -1, -1), True, False, draws)
         commit()
         # the excitation it held back for the next window: the noise, nearly alone
         return torch.stack([kv_steps.slot(r)["hift_source"] for r in rids])

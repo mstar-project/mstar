@@ -13,7 +13,7 @@ reference does, which is bit-exact against it at fp32; the batched path matches 
 summation order and TF32.
 
 The flow's initial noise is a slice of a fixed buffer (``ChunkCFM.rand_noise``); HiFT's
-excitation draws are an input (``window_noise``), from each request's own generator.
+excitation draws are an input (``window_noise``), from each request's seed and the window's index.
 """
 
 from __future__ import annotations
@@ -447,6 +447,10 @@ class Token2Wav(nn.Module):
         self.hift = StepAudioHiFT()
         self.voice_encoder = VoicePromptEncoder()
         self.register_buffer("speech_window", torch.from_numpy(np.hamming(2 * HIFT_TAIL)), persistent=False)
+        # scratch: seeded before every draw, so no draw reads what another left
+        self._noise_rng: torch.Generator | None = None
+        # how far a full first and a full later window's draws move a CUDA generator's offset, once measured
+        self._draw_steps: tuple[int, int] | None = None
 
     @torch.inference_mode()
     def prepare_voice(self, prompt: VoicePrompt) -> Token2WavVoice:
@@ -526,14 +530,44 @@ class Token2Wav(nn.Module):
             state.set("hift_source", source[:, :, -HIFT_TAIL:])
         return {"magnitude": magnitude, "phase": phase}
 
-    def window_noise(self, frames: int, first: bool, generators: list[torch.Generator | None]) -> HiFTNoise:
-        """HiFT's excitation draws for windows of ``frames`` mel frames, a row from each
-        generator, each drawn as a one-request ``stream`` call draws it: a request's audio
-        then depends on its own seed alone, not on its batch."""
-        length = (frames + (0 if first else HIFT_MEL_CACHE)) * SAMPLES_PER_FRAME
-        device = self.speech_window.device
-        rows = [self.hift.m_source.draw_noise(1, length, torch.float32, device, g) for g in generators]
+    def window_noise(self, frames: int, first: bool, draws: list[tuple[int, int] | None]) -> HiFTNoise:
+        """HiFT's excitation draws for windows of ``frames`` mel frames: for each ``(seed, k)``, window k's draw
+        from the stream ``seed`` starts, as a one-request ``stream`` call draws it, so a request's audio depends on
+        its own seed alone, not on its batch. None draws from the global generator, for a capture's rows."""
+        length = excitation_samples(frames, first)
+        rows = [self._draw(length, draw) for draw in draws]
         return HiFTNoise(phase=torch.cat([r.phase for r in rows]), harmonic=torch.cat([r.harmonic for r in rows]))
+
+    def _draw(self, length: int, draw: tuple[int, int] | None) -> HiFTNoise:
+        device, source = self.speech_window.device, self.hift.m_source
+        if draw is None:
+            return source.draw_noise(1, length, torch.float32, device, None)
+        seed, k = draw
+        if self._noise_rng is None or self._noise_rng.device != device:
+            self._noise_rng = torch.Generator(device=device)
+        rng = self._noise_rng.manual_seed(seed)
+        if device.type == "cuda":
+            rng.set_offset(self._offset(k))
+        else:
+            # a CPU generator has no offset: draw the windows before it
+            for window in range(k):
+                source.draw_noise(1, excitation_samples(window_frames(WINDOW, False), window == 0), torch.float32,
+                                  device, rng)
+        return source.draw_noise(1, length, torch.float32, device, rng)
+
+    def _offset(self, k: int) -> int:
+        """Where window k's draw starts on a CUDA generator. Every window before it is full, so it is the first
+        window's step and k - 1 later ones, measured on the device: a Philox step depends on the launch grid."""
+        if self._draw_steps is None:
+            rng, steps = torch.Generator(device=self.speech_window.device), []
+            for first in (True, False):
+                before = rng.get_offset()
+                self.hift.m_source.draw_noise(1, excitation_samples(window_frames(WINDOW, False), first), torch.float32,
+                                              rng.device, rng)
+                steps.append(rng.get_offset() - before)
+            self._draw_steps = (steps[0], steps[1])
+        first, later = self._draw_steps
+        return 0 if k == 0 else first + (k - 1) * later
 
     @torch.inference_mode()
     def window_finish(
@@ -556,6 +590,11 @@ class Token2Wav(nn.Module):
         if first:
             return torch.cat([speech.new_zeros(speech.shape[0], HIFT_TAIL), speech[:, :-HIFT_TAIL]], dim=1)
         return speech[:, :-HIFT_TAIL]
+
+def excitation_samples(frames: int, first: bool) -> int:
+    """HiFT's excitation length for a window of ``frames`` mel frames, its held-back frames included after the first."""
+    return (frames + (0 if first else HIFT_MEL_CACHE)) * SAMPLES_PER_FRAME
+
 
 # The token counts a last window after a full one can have: the left context plus 0 to
 # HOP - 1 new codes (a full window's worth would have made a full window).
