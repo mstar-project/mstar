@@ -1141,8 +1141,9 @@ class PreprocessWorkerThread:
                 input_open=bool(self._client_edges - input.ends),
                 streaming=input.streaming,
                 prompt_tokens=num_prompt_tokens,
+                episode=input.episode,
                 episode_keys=episode_keys,
-                reset_episode=reset_episode,
+                reset_episode=input.reset_episode or reset_episode,
             ),
         )
         self.communicator.send("conductor", msg)
