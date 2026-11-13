@@ -160,6 +160,21 @@ class FrameWindow(Mask):
         return "A step boundary inside a frame cuts what the frame's queries see"
 
 
+@dataclass(frozen=True)
+class BlockCausal(Mask):
+    """Blocks are runs of ``size`` entries from the row's first, and q is in block b = q // ``size``. Sees every entry
+    of blocks 0 to b. On an array with ``max_len`` 0, q's row is its segment in this step."""
+
+    uses_query_position = True
+    sees_step_whole = True
+
+    size: int
+
+    def __post_init__(self):
+        if not _is_positive(self.size):
+            raise ValueError(f"BlockCausal.size must be a positive int, got {self.size!r}")
+
+
 class Op:
     """A kernel the engine plans before the step and runs on an array's entries.
 
