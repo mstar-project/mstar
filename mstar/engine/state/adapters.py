@@ -414,6 +414,10 @@ def _combined_labels(
 
     Every array on KV pages plans them, so an array the step lists on other labels is refused.
     """
+    if not step.combined_labels and not any(
+        isinstance(steps.get(name), KVStep) and steps[name].combined_labels for name in step.state
+    ):
+        return {}
     paged = {name: steps[name] for name in step.state if isinstance(steps.get(name), KVStep)}
     combined = dict(step.combined_labels)
     for built in paged.values():
