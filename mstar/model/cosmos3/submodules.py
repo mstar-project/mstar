@@ -2931,7 +2931,8 @@ class Cosmos3VAEDecoderARSubmodule(Cosmos3VAEDecoderSubmodule):
         return NodeInputs(
             tensor_inputs={"latents": chunks[0]},
             kwargs={
-                "window": int(fwd_info.dynamic_loop_iter_counts[VIDEO_DECODE_AR_LOOP]),
+                # no count until a step of this partition has run, and the first window is its first
+                "window": int(fwd_info.dynamic_loop_iter_counts.get(VIDEO_DECODE_AR_LOOP, 0)),
                 "edges": {
                     name: inputs[name] for name in (DECODE_TAIL, DECODE_SENT, DECODE_FRAMES, DECODE_CACHE)
                     if name in inputs
