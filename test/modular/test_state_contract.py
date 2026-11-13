@@ -81,6 +81,12 @@ REFUSALS = {
                               "Array 'gdn'.entry.host['ids']"),
     "window of zero": (lambda: _array(reads={"r": _read(mask=Window(0))}), "Array 'kv'.reads['r'].mask.size"),
     "q_heads of zero": (lambda: _array(reads={"r": _read(op=Attend(q_heads=0))}), "Array 'kv'.reads['r'].op.q_heads"),
+    "scale of zero": (
+        lambda: _array(reads={"r": _read(op=Attend(q_heads=8, scale=0.0))}), "Array 'kv'.reads['r'].op.scale",
+    ),
+    "scale as text": (
+        lambda: _array(reads={"r": _read(op=Attend(q_heads=8, scale="0.1"))}), "Array 'kv'.reads['r'].op.scale",
+    ),
     "empty read layers": (lambda: _array(reads={"r": _read(layers=set())}), "Array 'kv'.reads['r'].layers"),
     "empty read walks": (lambda: _array(reads={"r": _read(walks=set())}), "Array 'kv'.reads['r'].walks"),
     "read layers from an empty generator": (lambda: _array(reads={"r": _read(layers=(i for i in ()))}),
