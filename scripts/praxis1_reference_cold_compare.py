@@ -29,6 +29,10 @@ def main() -> None:
     parser.add_argument("--native-vae-root", type=Path,
                         help="also run the reference policy using M*'s Diffusers VAE encode")
     parser.add_argument("--mstar-revision", required=True)
+    parser.add_argument("--skip-last-video", action="store_true",
+                        help="use the reference serving optimization; M* E5 currently decodes both steps")
+    parser.add_argument("--reference-simple", action="store_true",
+                        help="disable reference context caching, expert overlap and paired guidance")
     parser.add_argument("--rtol", type=float, default=0.03)
     parser.add_argument("--atol", type=float, default=0.03)
     args = parser.parse_args()
@@ -69,10 +73,16 @@ def main() -> None:
     )
 
     def session():
-        return pipeline.session(
+        current = pipeline.session(
             prompt, seed=seed, max_context_chunks=0,
-            control_mode="none", exec_horizon=None, sampler=settings, skip_last_video=True,
+            control_mode="none", exec_horizon=None, sampler=settings,
+            skip_last_video=args.skip_last_video,
         )
+        if args.reference_simple:
+            current.ctx_cache = False
+            current.overlap_expert = False
+            current.pair_cfg = False
+        return current
 
     def report(label: str, expected: np.ndarray) -> None:
         assert expected.shape == actual.shape, (expected.shape, actual.shape)
@@ -81,6 +91,8 @@ def main() -> None:
         close = np.isclose(actual, expected, rtol=args.rtol, atol=args.atol)
         print(json.dumps({
             "phase": label, "mstar_revision": args.mstar_revision,
+            "skip_last_video": args.skip_last_video,
+            "reference_simple": args.reference_simple,
             "reference_revision": "68f4d7a254b4bf41951d2e97f44b07f6cac2bf69",
             "checkpoint": str(args.checkpoint), "shape": list(actual.shape),
             "max_abs": float(diff.max()), "mean_abs": float(diff.mean()),
