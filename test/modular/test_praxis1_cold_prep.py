@@ -58,6 +58,12 @@ def test_noise_salts_are_distinct_and_reproducible() -> None:
     assert video.device.type == action.device.type == "cpu"
 
 
+@pytest.mark.parametrize("shift", [float("nan"), float("inf"), float("-inf"), 0.0])
+def test_time_grid_rejects_invalid_shift(shift: float) -> None:
+    with pytest.raises(ValueError, match="finite and positive"):
+        window_time_grid(2, shift)
+
+
 def test_cold_pose_and_sampler_match_reference() -> None:
     pytest.importorskip("praxis", reason="reference checkout is not on PYTHONPATH")
     from praxis.robot_io import pose8_to_10d, proprio_normalize

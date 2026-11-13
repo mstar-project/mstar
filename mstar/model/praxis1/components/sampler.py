@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 
 import torch
@@ -21,8 +22,8 @@ def window_time_grid(num_steps: int, shift: float) -> tuple[float, ...]:
     """Descending float64 Euler times, including the final zero."""
     if num_steps < 1:
         raise ValueError("num_steps must be positive")
-    if shift <= 0:
-        raise ValueError("t_shift must be positive")
+    if not math.isfinite(shift) or shift <= 0:
+        raise ValueError("t_shift must be finite and positive")
     times = torch.linspace(1.0, 0.0, num_steps + 1, dtype=torch.float64)
     if shift != 1.0:
         times = shift * times / (1.0 + (shift - 1.0) * times)
