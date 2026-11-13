@@ -1,5 +1,6 @@
 """The model-facing state contract. ``__all__`` is its whole surface, and after release the surface only grows."""
 
+from mstar.engine.resources.attn.ragged.config import VideoSparseLayout  # noqa: F401
 from mstar.engine.resources.kv.config import Span
 from mstar.engine.resources.step import (
     Segment,
@@ -49,7 +50,9 @@ from mstar.engine.state.contract import (
 )
 from mstar.engine.state.state_op import state_op
 
-# `kernel_setting` and `SubmoduleStep` stay out of `__all__`, whose names can't be removed after release.
+# `kernel_setting`, `SubmoduleStep` and `VideoSparseLayout` stay out of `__all__`, whose names can't be removed after
+# release. `VideoSparseLayout` (a `Segment.layout` the `vsa` attention reads) is importable here so a ported model
+# declares it through the contract.
 # `kernel_setting` is temporary. `SubmoduleStep` is the engine's own dataclass, and the rebuild after release replaces
 # its `steps`, `cg_key_info` and `_ctx`.
 __all__ = [

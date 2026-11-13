@@ -14,9 +14,9 @@ tokens: ``[B, G, D]``, group ``g`` covering tokens ``[g * S/G, (g+1) * S/G)``.
 
 Compiled, Inductor lowers this to a looped two-pass reduction once ``D`` is
 past its persistent-reduction width (1024), reading the row twice, so inside a
-compiled region the kernel below does it in one: the row is read once into
-registers, the mean and variance are taken there, and both outputs are
-written once. Eager calls run the same math as plain PyTorch ops, which is
+compiled region the kernel below does it in one launch per row: chunked passes
+for the mean, the centered variance and the output, the later passes reading
+the row back from L1 / L2, and both outputs written once. Eager calls run the same math as plain PyTorch ops, which is
 what the reference implementations hold bit-exact. The kernel rounds the
 residual to the stream dtype before normalizing it, as eager does; its mean and
 variance are reduced in a different order, so it agrees with eager to fp32
@@ -80,37 +80,55 @@ if triton is not None:
         x_ptr, res_ptr, gate_ptr, shift_ptr, scale_ptr, w_ptr, b_ptr, x_out_ptr, out_ptr,
         seq, tokens_per_group, groups, mod_batch_stride, mod_group_stride, dim, eps: tl.constexpr,
         HAS_RES: tl.constexpr, HAS_GATE: tl.constexpr, HAS_SHIFT: tl.constexpr, HAS_SCALE: tl.constexpr,
-        HAS_W: tl.constexpr, HAS_B: tl.constexpr, BLOCK_D: tl.constexpr,
+        HAS_W: tl.constexpr, HAS_B: tl.constexpr, CHUNK: tl.constexpr, NCHUNK: tl.constexpr,
     ):
+        # One row per program, in CHUNK-wide passes: the sum, the centered sum of squares, then
+        # the output. A whole-row tile is padded to a power of two (8192 lanes for d 5120) and
+        # holds the row in registers; chunked, the second and third reads hit L1 / L2.
         row = tl.program_id(0).to(tl.int64)
-        cols = tl.arange(0, BLOCK_D)
-        mask = cols < dim
-        offs = row * dim + cols
+        base = row * dim
         batch = row // seq
         group = (row % seq) // tokens_per_group
-        mod = batch * mod_batch_stride + group * mod_group_stride + cols
+        mod_base = batch * mod_batch_stride + group * mod_group_stride
+        # the residual case normalizes the x' it writes
+        src_ptr = x_out_ptr if HAS_RES else x_ptr
+        acc = tl.zeros([CHUNK], dtype=tl.float32)
+        for c in tl.static_range(NCHUNK):
+            cols = c * CHUNK + tl.arange(0, CHUNK)
+            mask = cols < dim
+            x = tl.load(x_ptr + base + cols, mask=mask, other=0.0)
+            if HAS_RES:
+                y = tl.load(res_ptr + base + cols, mask=mask, other=0.0).to(tl.float32)
+                if HAS_GATE:
+                    y = y * tl.load(gate_ptr + mod_base + cols, mask=mask, other=0.0)
+                x = (x.to(tl.float32) + y).to(x_ptr.dtype.element_ty)
+                tl.store(x_out_ptr + base + cols, x, mask=mask)
+            acc += x.to(tl.float32)
+        mean = tl.sum(acc, axis=0) / dim
+        acc = tl.zeros([CHUNK], dtype=tl.float32)
+        for c in tl.static_range(NCHUNK):
+            cols = c * CHUNK + tl.arange(0, CHUNK)
+            mask = cols < dim
+            diff = tl.where(mask, tl.load(src_ptr + base + cols, mask=mask, other=0.0).to(tl.float32) - mean, 0.0)
+            acc += diff * diff
+        rstd = tl.math.rsqrt(tl.sum(acc, axis=0) / dim + eps)
+        for c in tl.static_range(NCHUNK):
+            cols = c * CHUNK + tl.arange(0, CHUNK)
+            mask = cols < dim
+            out = (tl.load(src_ptr + base + cols, mask=mask, other=0.0).to(tl.float32) - mean) * rstd
+            if HAS_W:
+                out = out * tl.load(w_ptr + cols, mask=mask, other=0.0)
+            if HAS_B:
+                out = out + tl.load(b_ptr + cols, mask=mask, other=0.0)
+            if HAS_SCALE:
+                out = out * (1 + tl.load(scale_ptr + mod_base + cols, mask=mask, other=0.0))
+            if HAS_SHIFT:
+                out = out + tl.load(shift_ptr + mod_base + cols, mask=mask, other=0.0)
+            tl.store(out_ptr + base + cols, out.to(out_ptr.dtype.element_ty), mask=mask)
 
-        x = tl.load(x_ptr + offs, mask=mask, other=0.0)
-        if HAS_RES:
-            y = tl.load(res_ptr + offs, mask=mask, other=0.0).to(tl.float32)
-            if HAS_GATE:
-                y = y * tl.load(gate_ptr + mod, mask=mask, other=0.0)
-            x = (x.to(tl.float32) + y).to(x_ptr.dtype.element_ty)
-            tl.store(x_out_ptr + offs, x, mask=mask)
-        xf = x.to(tl.float32)
-        mean = tl.sum(xf, axis=0) / dim
-        diff = tl.where(mask, xf - mean, 0.0)
-        var = tl.sum(diff * diff, axis=0) / dim
-        out = diff * tl.math.rsqrt(var + eps)
-        if HAS_W:
-            out = out * tl.load(w_ptr + cols, mask=mask, other=0.0)
-        if HAS_B:
-            out = out + tl.load(b_ptr + cols, mask=mask, other=0.0)
-        if HAS_SCALE:
-            out = out * (1 + tl.load(scale_ptr + mod, mask=mask, other=0.0))
-        if HAS_SHIFT:
-            out = out + tl.load(shift_ptr + mod, mask=mask, other=0.0)
-        tl.store(out_ptr + offs, out.to(out_ptr.dtype.element_ty), mask=mask)
+    # chunk width and warps per program, measured on a B300 at d 3072 and 5120 (the residual
+    # variant reads two streams and writes two, so it runs fewer warps per row)
+    _CHUNK = 1024
 
     def _launch(x, residual, gate, shift, scale, weight, bias, eps, x_out, out):
         batch, seq, dim = x.shape
@@ -127,7 +145,7 @@ if triton is not None:
             x_out, out, seq, seq // groups, groups, mod_strides[0], mod_strides[1], dim, eps,
             HAS_RES=residual is not None, HAS_GATE=gate is not None, HAS_SHIFT=shift is not None,
             HAS_SCALE=scale is not None, HAS_W=weight is not None, HAS_B=bias is not None,
-            BLOCK_D=triton.next_power_of_2(dim), num_warps=8,
+            CHUNK=_CHUNK, NCHUNK=triton.cdiv(dim, _CHUNK), num_warps=4 if residual is not None else 8,
         )
 
     @triton_op("mstar::ada_layer_norm", mutates_args=())

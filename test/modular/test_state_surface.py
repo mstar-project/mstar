@@ -154,6 +154,7 @@ SNAPSHOT = {
         ["request_id", "POSITIONAL_OR_KEYWORD", None],
         ["label", "POSITIONAL_OR_KEYWORD", None],
         ["span", "POSITIONAL_OR_KEYWORD", None],
+        ["layout", "POSITIONAL_OR_KEYWORD", 'None'],
     ],
     "SeqShard": [
         ["name", "POSITIONAL_OR_KEYWORD", None],

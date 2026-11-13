@@ -46,6 +46,9 @@ def _pcm(seconds: float = 1.0, rate: int = 48000, channels: int = 2) -> bytes:
 
 def _chunks(prompt: str, video: bytes) -> list:
     """What the scripted data plane returns for ``prompt``."""
+    if "premuxed" in prompt:  # the data worker wrote the audio into the mp4 already
+        return [_Chunk("video", video, {"audio_muxed": True}),
+                _Chunk("audio", _pcm(), {"sample_rate": 48000, "num_channels": 2})]
     if "sound" in prompt:
         return [_Chunk("video", video), _Chunk("audio", _pcm(), {"sample_rate": 48000, "num_channels": 2})]
     if "windows" in prompt:
@@ -222,6 +225,20 @@ def test_a_videos_generated_sound_is_muxed_into_the_python_routes_mp4(fps, tmp_p
     streams = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "stream=codec_type", "-of", "csv=p=0", "-"],
                              input=rust_mp4, capture_output=True, check=True).stdout.decode().split()
     assert sorted(streams) == ["audio", "video"]
+
+
+def test_an_mp4_the_data_worker_muxed_is_returned_as_it_is_on_both(tmp_path, monkeypatch):
+    """A video chunk marked ``audio_muxed`` already carries its audio track: neither
+    frontend muxes the request's audio chunk into it again."""
+    video = _clip()
+    model = _model_of("MiniMaxH3Adapter")
+    body = {"model": model, "prompt": "premuxed sound"}
+    py = _python_videos(model, body, tmp_path, monkeypatch, video)
+    with _model_stack(model, _RustVideoStub(video)) as (port, _upload):
+        status, _, data = _post(port, body)
+    assert (status, py.status_code) == (200, 200), data
+    assert base64.b64decode(json.loads(data)["data"][0]["b64_json"]) == video == base64.b64decode(
+        py.json()["data"][0]["b64_json"])
 
 
 @needs_ffmpeg

@@ -57,6 +57,7 @@ from mstar.engine.resources.step import ResourceStep, StepContext
 from mstar.utils.h2d import to_device_nonblocking
 
 if TYPE_CHECKING:
+    from mstar.distributed.ulysses_pipeline import UlyssesPipeline
     from mstar.engine.resources.attn.config import SpExchange
     from mstar.model.components.moe_parallel import MoeParallelConfig
 
@@ -678,39 +679,32 @@ def _check_entry(r: SeqRange, *xs: torch.Tensor | None) -> None:
     )
 
 
-def _seq_view(x: torch.Tensor, r: SeqRange) -> torch.Tensor:
-    return x if r.rows is None else x.unflatten(0, (r.rows, -1))
-
-
-def _packed(x: torch.Tensor, r: SeqRange) -> torch.Tensor:
-    return x if r.rows is None else x.flatten(0, 1)
-
-
 def ulysses(run: Callable, *xs: torch.Tensor | None, r: SeqRange):
-    """Split tokens to split heads: one all-to-all of each of ``xs`` (``[n, H, ...]``, this rank's
-    tokens, heads on dim 1; None passed through) to ``[N, H / P, ...]``, one exchange per dtype,
-    ``run`` on them, and its output back by token. None where ``run`` returns None (a K/V write
-    alone). Attention passes q, k and v; a recurrent layer its projections and gates.
+    """Split tokens to split heads: each of ``xs`` (``[n, H, ...]``, this rank's tokens, heads on dim
+    1; None passed through) to ``[N, H / P, ...]`` (``CommGroup.tokens_to_heads``), ``run`` on them,
+    and its output back by token (``heads_to_tokens``). None where ``run`` returns None (a K/V write
+    alone). Attention passes q, k and v; a recurrent layer its projections and gates. A ``[B, S,
+    ...]`` label exchanges each row on its own, so a row's tokens arrive where the kernel reads them.
 
     Eager, as main's exchange is (`CommGroup.all_to_all`): a traced variant measured no faster."""
     _check_entry(r, *xs)
-    seq, head = (0, 1) if r.rows is None else (1, 2)
-    parts = [_seq_view(x, r) for x in xs if x is not None]
-    exchanged: list[torch.Tensor | None] = [None] * len(parts)
-    for dtype in dict.fromkeys(x.dtype for x in parts):
-        # `all_to_all` packs one dtype; the dtypes come in the same order on every rank
-        chosen = [i for i, x in enumerate(parts) if x.dtype == dtype]
-        got = r.group.all_to_all(
-            [parts[i] for i in chosen], scatter_dim=head, gather_dim=seq, gather_sizes=list(r.counts),
-        )
-        for i, x in zip(chosen, got, strict=True):
-            exchanged[i] = _packed(x, r)
-    it = iter(exchanged)
-    out = run(*(None if x is None else next(it) for x in xs))
+    counts = list(r.counts)
+    exchanged = [None if x is None else r.group.tokens_to_heads(x, counts, r.rows) for x in xs]
+    out = run(*exchanged)
     if out is None:
         return None
-    out = r.group.all_to_all(_seq_view(out, r), scatter_dim=seq, gather_dim=head, scatter_sizes=list(r.counts))
-    return _packed(out, r)
+    return r.group.heads_to_tokens(out, counts, r.rows)
+
+
+def pipelined_ulysses(run: Callable, q, k, v, r: SeqRange, pipeline: UlyssesPipeline):
+    """``ulysses`` of an attention's q, k and v, the exchange pipelined over head groups
+    (``UlyssesPipeline``) where it serves the call: ``run`` then attends one group's heads at a time.
+    The NCCL exchange (``ulysses``) where it doesn't, and for a K/V write alone."""
+    _check_entry(r, q, k, v)
+    out = None
+    if q is not None:
+        out = pipeline(q, k, v, list(r.counts), r.rows, run, lambda: ulysses(run, q, k, v, r=r))
+    return ulysses(run, q, k, v, r=r) if out is None else out
 
 
 def _whole(r: SeqRange, xs: Sequence[torch.Tensor | None]) -> list[torch.Tensor | None]:

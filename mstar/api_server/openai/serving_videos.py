@@ -52,15 +52,20 @@ async def create_videos(api, model_name, adapter, req, raw_request=None):
     # b64_json response. A sound request additionally emits a raw
     # 16-bit PCM audio chunk, which is muxed into the mp4 as an AAC track (one
     # playable file with sound); if the mux fails the plain video is returned.
+    # A chunk marked ``audio_muxed`` already has it: the data worker wrote it in the
+    # pass that encoded the video (``Model.mp4_encoding``).
     # The mux also rescales the video timestamps to the request frame rate: the
     # video-only container always plays at the model's default fps, which would
     # drift out of sync with the true-time audio track for other request rates.
     request_fps = args.model_kwargs.get("fps")
-    videos = [c.data for c in chunks if c.modality == "video"]
+    video_chunks = [c for c in chunks if c.modality == "video"]
+    videos = [c.data for c in video_chunks]
     audios = [c for c in chunks if c.modality == "audio"]
     data = []
     for i, video in enumerate(videos):
-        if i < len(audios):
+        if (video_chunks[i].metadata or {}).get("audio_muxed"):
+            pass  # the data worker wrote the audio into this mp4 as it encoded it
+        elif i < len(audios):
             audio = audios[i]
             try:
                 # ffprobe + ffmpeg, up to minutes: off the event loop
