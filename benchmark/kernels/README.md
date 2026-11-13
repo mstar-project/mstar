@@ -87,6 +87,9 @@ gets faster on a GPU without a change to model code.
   (`--shape num_qo_heads=...,num_kv_heads=...,head_dim=...`), rows by the longest query segment:
   torch's cuDNN SDPA (`cudnn`) or a FlashInfer ragged backend (`flashinfer`, `{"backend": ...}`),
   each timed through the resource's graph-mode wrapper at 1 and 8 segments of the bucket's length.
+  Dao's FlashAttention-3 (`fa3`, Hopper, `flash_attn_3` installed) is timed as varlen there; its eager
+  wrapper runs a dense call per segment, which wins only at the power cap (the module's sustained column):
+  the sm_90 28-head rows (MiniMax-H3 at SP2) come from that column, as their provenance says.
   `python -m benchmark.kernels.ragged_attention --heads 24 --seq 4608` prints a wider table at
   one size, with kernels the resource can't replay (FlashInfer cutlass, torch's FA2). The sm_103
   table was written with `--arch`, which names the file for the architecture, not the GPU model.
