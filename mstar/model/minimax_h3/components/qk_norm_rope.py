@@ -51,9 +51,10 @@ def qk_norm_rope(qkv: torch.Tensor, weights: torch.Tensor, cos: torch.Tensor, si
     # (28 local heads under TP2 would)
     if heads % block:
         raise ValueError(f"qk_norm_rope needs a multiple of {block} heads, got {heads}")
+    # 2 warps: 16% faster than 4 at H3's shape on B300 and bit-identical to it (8 warps is not)
     _qk_norm_rope_kernel[(rows, 2 * heads // block)](
         qkv, weights, cos, sin, out, eps, qkv.stride(0), cos.stride(0),
-        H=heads, D=d, HALF=rotary_dim // 2, ROT=rotary_dim, HB=block, num_warps=4, enable_fp_fusion=False,
+        H=heads, D=d, HALF=rotary_dim // 2, ROT=rotary_dim, HB=block, num_warps=2, enable_fp_fusion=False,
     )
     return out
 

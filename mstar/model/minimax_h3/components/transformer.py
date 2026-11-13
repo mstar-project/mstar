@@ -216,7 +216,11 @@ class H3Block(nn.Module):
             return term.index_select(1, row_index)
 
         h = self.norm1(x) * (1.0 + rows(scale_msa)) + rows(shift_msa)
-        x = x + rows(gate_msa) * self.attn(h, rope)
+        # the attention first: `rows(gate_msa)` evaluated before it would be gathered on the
+        # compiled block's near side of its break and carried across as a full [B, S, hidden]
+        # tensor (written once, read twice); after it, the far side gathers from the small table
+        attn = self.attn(h, rope)
+        x = x + rows(gate_msa) * attn
         h = self.norm2(x) * (1.0 + rows(scale_mlp)) + rows(shift_mlp)
         return x + rows(gate_mlp) * self.mlp(h)
 
