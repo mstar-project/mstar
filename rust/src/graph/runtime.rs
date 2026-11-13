@@ -345,6 +345,7 @@ pub struct GraphRuntime {
         graph_walk: &str,
         publication_encoded: Option<&[u8]>,
         profiling_encoded: Option<&[u8]>,
+        episode_held: Option<&[(String, i64)]>,
         speculative: bool,
     ) -> PyResult<Vec<u8>> {
         let request_id = self.rid_name(rid)?;
@@ -373,6 +374,7 @@ pub struct GraphRuntime {
             is_first_tp_rank,
             persist_signals,
             new_token_counts: &new_tokens,
+            episode_held: episode_held.unwrap_or(&[]),
             output_signal_names: output_signals,
             partition_name,
             partition_done,
@@ -3597,7 +3599,8 @@ impl GraphRuntime {
     /// `send_outputs` takes them.
     #[pyo3(signature = (
         info_rids, request_infos, ntc_rids, new_token_counts, prof_rids, profiling,
-        publish_rids, publications, skip_rids = Vec::new(),
+        publish_rids, publications, held_rids = Vec::new(), held_counts = Vec::new(),
+        skip_rids = Vec::new(),
     ))]
     #[allow(clippy::too_many_arguments)]
     fn resume_postprocess_send(
@@ -3606,11 +3609,13 @@ impl GraphRuntime {
         ntc_rids: Vec<u32>, new_token_counts: Vec<FxHashMap<String, i64>>,
         prof_rids: Vec<u32>, profiling: Vec<Option<Vec<u8>>>,
         publish_rids: Vec<u32>, publications: Vec<Option<Vec<u8>>>,
+        held_rids: Vec<u32>, held_counts: Vec<FxHashMap<String, i64>>,
         skip_rids: Vec<u32>,
     ) -> PyResult<postprocess::PostprocessOut> {
         let args = postprocess::SendArgs {
             info_rids, request_infos, ntc_rids, new_token_counts, prof_rids, profiling,
             publish_rids, publications, skip_rids,
+            held_rids, held_counts,
         };
         self.pp_resume_send(py, args)
     }
@@ -3703,7 +3708,8 @@ impl GraphRuntime {
     #[pyo3(signature = (
         completion_id, info_rids, request_infos,
         ntc_rids, new_token_counts, prof_rids, profiling,
-        publish_rids, publications, skip_rids = Vec::new(),
+        publish_rids, publications, held_rids = Vec::new(), held_counts = Vec::new(),
+        skip_rids = Vec::new(),
     ))]
     #[allow(clippy::too_many_arguments)]
     fn send_outputs(
@@ -3720,6 +3726,8 @@ impl GraphRuntime {
         profiling: Vec<Option<Vec<u8>>>,
         publish_rids: Vec<u32>,
         publications: Vec<Option<Vec<u8>>>,
+        held_rids: Vec<u32>,
+        held_counts: Vec<FxHashMap<String, i64>>,
         skip_rids: Vec<u32>,
     ) -> PyResult<Vec<u32>> {
         // Released for the whole frame phase rather than around each send.
@@ -3745,7 +3753,8 @@ impl GraphRuntime {
         let t_body = std::time::Instant::now();
         let built = self.build_send_frames(
             completion_id, info_rids, request_infos, ntc_rids, new_token_counts,
-            prof_rids, profiling, publish_rids, publications, skip_rids,
+            prof_rids, profiling, publish_rids, publications, held_rids, held_counts,
+            skip_rids,
         );
         send_timing::record_body(t_body);
         let (out, frames) = built?;
@@ -4090,6 +4099,8 @@ impl GraphRuntime {
         profiling: Vec<Option<Vec<u8>>>,
         publish_rids: Vec<u32>,
         publications: Vec<Option<Vec<u8>>>,
+        held_rids: Vec<u32>,
+        held_counts: Vec<FxHashMap<String, i64>>,
         // failed after routing: none of their frames go out
         skip_rids: Vec<u32>,
     ) -> PyResult<(Vec<u32>, Vec<(String, Vec<u8>)>)> {
@@ -4101,6 +4112,11 @@ impl GraphRuntime {
                 .into_iter()
                 .zip(new_token_counts)
                 .map(|(r, m)| (r, m.into_iter().collect()))
+                .collect();
+            let episode_held: FxHashMap<u32, Vec<(String, i64)>> = held_rids
+                .into_iter()
+                .zip(held_counts)
+                .map(|(rid, counts)| (rid, counts.into_iter().collect()))
                 .collect();
             let profiling: Vec<(u32, Option<Vec<u8>>)> =
                 prof_rids.into_iter().zip(profiling).collect();
@@ -4345,6 +4361,7 @@ impl GraphRuntime {
                     rid, &wg_ids, is_first_tp_rank, &partition, &graph_walk,
                     publications.get(&rid).and_then(|b| b.as_deref()),
                     profiling.get(&rid).and_then(|b| b.as_deref()),
+                    episode_held.get(&rid).map(Vec::as_slice),
                     spec_flags.get(&rid).copied().unwrap_or(false),
                 )?;
                 frames.push(("conductor".to_string(), bytes));

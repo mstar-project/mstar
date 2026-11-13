@@ -398,6 +398,11 @@ Read by the ``mstar-server`` binary and its bridge
        checked it, the metadata frame packed), as JSON; unset serves no socket
        at ``/``. Not for deployments to set: ``launch_rust_server`` sets it from
        ``openpi_facts``.
+   * - ``MSTAR_POSITRONIC``
+     - unset
+     - The deployment's ``positronic:`` session policy, as JSON; unset serves
+       no ``/api/v1/session`` socket. Not for deployments to set:
+       ``launch_rust_server`` sets it from ``positronic_facts``.
    * - ``MSTAR_WS_MAX_BYTES``
      - the body limit
      - The largest WebSocket message the Rust frontend reads, in bytes: the

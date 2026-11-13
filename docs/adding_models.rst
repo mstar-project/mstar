@@ -697,8 +697,9 @@ and of ``kernel_settings()`` against the conductor's at startup, and a mismatch 
 server, naming what differs.
 
 An **array** holds, per request, per label and per declared layer, entries at log positions
-``0`` to ``n - 1``, with ``n <= max_len``. An entry's index is its log position, never its
-RoPE position or a ring slot.
+``0`` to ``n - 1``. A finite ``max_len`` bounds ``n``; a dense window can instead have an
+unbounded logical count with bounded resident storage. An entry's index is its log position,
+never its RoPE position or a ring slot.
 
 .. code-block:: python
 
@@ -723,6 +724,15 @@ deployment YAML tunes them under ``resources:`` (see :ref:`Step 6 <config-yaml>`
   positions=)``. ``nodes`` lists who may touch the array, and ``layers`` holds the model's
   own layer ids. Layer sets of different arrays may overlap. ``labels`` names the streams a
   request may open, ``{"main"}`` by default.
+  ``max_len=None`` permits an unbounded logical append count for a tensor array with one
+  no-op ``Window(size)`` read over all its layers. The engine keeps only the latest
+  ``size`` entries per row in a dense ring, and ``read`` returns those entries packed
+  with row offsets. This path runs eagerly because packed lengths change between calls.
+  Set ``resources: {<array name>: {max_slots: N}}`` to hold more concurrent rows; one
+  slot is reserved for padding. The conservative default is two slots, so a
+  deployment must size this resource for its request or episode capacity. A
+  request-lifetime row is freed at request teardown; an episode-lifetime row
+  stays until its episode ends.
 - ``Entry({field: TensorType(shape, dtype=, shard=)})``: what one entry holds. Shapes are
   global, before sharding. ``dtype=None`` is the engine's compute dtype, and ``shard`` is
   the axis split across TP ranks, ``None`` when every GPU holds all of it.

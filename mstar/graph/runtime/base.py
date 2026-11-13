@@ -559,6 +559,7 @@ class SendInput(NamedTuple):
     # Opaque to the runtime: it forwards each on the frames it builds.
     per_request_info: ParallelList[int, CurrentForwardPassInfo]
     new_token_counts: ParallelList[int, dict[str, int]]
+    episode_held: ParallelList[int, dict[str, int]] | None = None
 
     # WORKER_GRAPHS_DONE fields the runtime cannot derive, so they come in here.
     # rid -> (rx_info, tx_info, graph_timings). All three are populated only

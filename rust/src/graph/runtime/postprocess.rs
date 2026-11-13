@@ -595,7 +595,7 @@ impl GraphRuntime {
         self.build_send_frames(
             pp.completion_id, args.info_rids, args.request_infos, args.ntc_rids,
             args.new_token_counts, args.prof_rids, args.profiling, args.publish_rids,
-            args.publications, args.skip_rids,
+            args.publications, args.held_rids, args.held_counts, args.skip_rids,
         )
     }
 
@@ -645,6 +645,8 @@ pub(super) struct SendArgs {
     pub profiling: Vec<Option<Vec<u8>>>,
     pub publish_rids: Vec<u32>,
     pub publications: Vec<Option<Vec<u8>>>,
+    pub held_rids: Vec<u32>,
+    pub held_counts: Vec<FxHashMap<String, i64>>,
     /// rids that failed after routing: none of their frames go out
     pub skip_rids: Vec<u32>,
 }
