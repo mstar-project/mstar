@@ -279,7 +279,7 @@ def _cuda_flags(lib: str, arch: str) -> list[str]:
     flags = ["-O3", "-std=c++17", "--expt-relaxed-constexpr", f"-DMSTAR_MARLIN_MOE_LIB={lib}",
              f"-gencode=arch=compute_{arch},code=sm_{arch}"]
     # nvcc 13 makes a __global__ template's host stub static by default; the selector (one file) takes the
-    # address of instantiations made in others (the B300's nvcc 13.2: "undefined hidden symbol" at link)
+    # address of instantiations made in others (nvcc 13.2: "undefined hidden symbol" at link)
     if _nvcc_version() >= (12, 8):
         flags.append("-static-global-template-stub=false")
     return flags

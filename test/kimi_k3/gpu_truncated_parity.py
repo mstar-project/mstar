@@ -126,7 +126,7 @@ def build(ckpt: str, device: str, overrides: dict | None = None, group=None, gro
         # what the engine applies from a serving config's prefill_token_buckets
         sub.PREFILL_TOKEN_BUCKETS = list(prefill_buckets)
     # the step's logits come back as a row output: a captured decode replays the graph, not the
-    # sampler's Python, so a list the sampler appends to would hold the last eager step's (job 1461)
+    # sampler's Python, so a list the sampler appends to would hold the last eager step's
     sub.__class__ = _logits_submodule_class()
     if force_small_m:
         force_small_m_backends(sub)
@@ -285,9 +285,9 @@ def _forced(run: dict) -> dict[int, dict[int, torch.Tensor]]:
 
 def _unpicked(run: dict, topk: int) -> dict[int, dict[int, torch.Tensor]]:
     """The DSA control: each query past ``topk`` replayed on visible keys the engine did not pick (the
-    earliest, at most ``topk``), so the check must tell a wrong selection apart. The dense reference was
-    the control before: on a 4-layer cut at top-16 it sits only ~1 logit from the sparse one, under twice
-    a B300 bf16 engine's error on a sensitive prompt (04c dsa/p3: 0.90 vs 0.58, the engine 1.6x the bf16
+    earliest, at most ``topk``), so the check must tell a wrong selection apart. The dense reference is
+    too close for that: on a 4-layer cut at top-16 it sits only ~1 logit from the sparse one, under twice
+    a B300 bf16 engine's error on a sensitive prompt (case dsa/p3: 0.90 vs 0.58, the engine 1.6x the bf16
     reference's spread, the same against a CPU fp32 reference)."""
     out: dict[int, dict[int, torch.Tensor]] = {}
     for pos, layers in run["dsa"].items():
@@ -441,7 +441,7 @@ def evaluate(cases: list[tuple], args, failures: list) -> list[dict]:
             # reference's do (an fp32 engine: not at all), or only by near-ties: keys swapped across
             # the cut whose fp32 scores sit within bf16's own swap distance of it (twice the bf16
             # reference's largest, at least 0.25 std). On a 28-pick sample the bf16 reference's count
-            # alone is noisy (job 1461: 4 on one token sequence, 13 on another for the same prompt).
+            # alone is noisy (4 on one token sequence, 13 on another for the same prompt).
             allowed = 0 if fp32_engine else 2 * stats["bf16_ref_picks_differing"] + 2
             near_tie = max(0.25, 2 * stats["bf16_ref_swap_gap_over_std_max"])
             far = stats["swap_gap_over_std_max"] > near_tie
@@ -571,9 +571,9 @@ def _tp2_rank(rank: int, args, port: int) -> None:
             group.device_group = group.cpu_group = group._all_reduce = None
             torch.distributed.destroy_process_group()
         return
-    # On GPUs a rank exits without tearing down: job 1461's ranks saved their results, then hung at the
-    # barrier / NCCL teardown with their decode graphs captured (0% GPU, host futex waits) until the
-    # job's time limit. mp.spawn's join still waits for both ranks' files.
+    # On GPUs a rank exits without tearing down: with their decode graphs captured, ranks that have saved
+    # their results hang at the barrier / NCCL teardown (0% GPU, host futex waits). mp.spawn's join still
+    # waits for both ranks' files.
     import traceback
 
     code = 0
@@ -819,7 +819,7 @@ def mode_capture(args) -> int:
             continue
         filler = every[3][1]
         beside = teacher_forced("f", prompts, eager_tokens, captured=False, extra=filler)
-        # Eager, no padding anywhere: the same 4-row step with only the 4th row changed. Job 1480 found
+        # Eager, no padding anywhere: the same 4-row step with only the 4th row changed. A GPU run had
         # the padded replay 1.19 off the eager 4-row step (median 0.06, no flips), as far as eager 4 rows
         # is from eager 3 (1.46). Rows do not mix logically (CPU: 2e-6 in fp32), so the hypothesis is
         # rounding that depends on the neighbours: the MoE kernels' tiles follow every token's routing
@@ -928,7 +928,7 @@ def mode_prefill_capture(args) -> int:
         neighbour = compare(f"prefill_capture/{name}/eager_neighbour", [b[:n] for b in beside], eager)
         padded.append((name, row))
         spreads.append(max(neighbour["prefill_max_diff"], neighbour["decode_max_diff"]))
-    # One neighbour row is one draw of the bf16 noise a row's company moves it by (job 1733: 0.08 to 1.41
+    # One neighbour row is one draw of the bf16 noise a row's company moves it by (0.08 to 1.41
     # across the cases); a padded replay may move a row as far as the run's real neighbours do, never flip
     # a decisive step.
     bound = max([0.25, *(1.5 * s for s in spreads)])

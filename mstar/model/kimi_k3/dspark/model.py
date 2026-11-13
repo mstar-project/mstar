@@ -43,9 +43,9 @@ from mstar.model.kimi_k3.dspark.rope import YarnRotary
 
 class DSparkRMSNorm(RMSNorm):
     """``RMSNorm`` in its input's precision. On CUDA ``mstar::rms_norm`` runs an fp32 input in bf16
-    outside autocast (FlashInfer takes half precision only), which made the fp32 drafter, the oracle
-    of the GPU check, a bf16 one (job 1465: 1.07 off the float64 reference at logit std 3.2). Half
-    precision and autocast keep the kernel."""
+    outside autocast (FlashInfer takes half precision only), which makes the fp32 drafter, the oracle
+    of the GPU check, a bf16 one (1.07 off the float64 reference at logit std 3.2). Half precision
+    and autocast keep the kernel."""
 
     def forward(self, hidden_states: torch.Tensor, comm_group=None) -> torch.Tensor:
         if hidden_states.dtype == torch.float32 and not torch.is_autocast_enabled(hidden_states.device.type):

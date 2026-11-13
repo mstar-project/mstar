@@ -539,9 +539,9 @@ class KimiLatentMoE(ParallelSparseMoeBlock):
         """The routed experts (and their all-reduce, with ``reduce_results``), eager inside the
         compiled MoE region (the submodule's ``compile_regions``): their kernels are already fused
         (Marlin, the W4A16 or the fused bf16 MoE), and the bf16 path's tuned-config lookup takes
-        Python ints Dynamo cannot trace symbolically (H200 job 1624). With ``logits`` the kernel
-        routes them itself (``_kernel_routes``): no top-k, gather or renormalize launches here, and no
-        padding mask (the kernel picks every row's experts; ``token_valid`` masks only ids the block chose)."""
+        Python ints Dynamo cannot trace symbolically. With ``logits`` the kernel routes them itself
+        (``_kernel_routes``): no top-k, gather or renormalize launches here, and no padding mask (the
+        kernel picks every row's experts; ``token_valid`` masks only ids the block chose)."""
         if logits is None:
             return self.experts_forward(z, routing_weights, selected_experts, reduce_results=reduce_results,
                                         token_valid=token_valid)

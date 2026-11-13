@@ -115,22 +115,22 @@ class KimiK3ModelConfig:
     # before the routed experts' all-reduce + norm so every collective stays on the main stream: "shared" (the shared
     # experts beside the router and the routed experts), "routed" (the router and routed experts beside the shared
     # experts: vLLM's stream assignment), "off" (one stream). true / false read as "shared" / "off". Either overlap
-    # is the same dependency structure as vLLM's (B300 slot 7 nsys: one layer's shared experts beside its routing
-    # and routed experts, no overlap across layers); B300 slot 8, TP8 c=1 ITL p50 against one stream's 12.92 ms:
+    # is the same dependency structure as vLLM's (nsys on B300: one layer's shared experts beside its routing
+    # and routed experts, no overlap across layers). B300 TP8 c=1 ITL p50 against one stream's 12.92 ms:
     # shared 12.54, routed 13.38.
     shared_experts_overlap: str = "shared"
     shared_experts_overlap_max_tokens: int = 32
     # the latent MoE's front (router logits, latent, shared experts' SiTU activation): "gemm", the packed GEMM, its
     # casts and the SiTU kernel (with the overlap above, the shared experts on the side stream); "split", with the
     # shared overlap the router's GEMM on the side stream ahead of the shared experts, beside the latent's bf16 GEMM
-    # on the main stream (vLLM's layout: B300 slot 9, router 4.5 us beside the latent's 9.3 against the packed
+    # on the main stream (vLLM's layout: on B300, router 4.5 us beside the latent's 9.3 against the packed
     # fp32 GEMM's 13.0 + 3.2); "flashinfer", FlashInfer's generated Kimi-K3 program (latent_front.py: SM100 / SM103,
     # up to 128 rows, one launch for all three, one stream), refused at load where it can't run
     latent_moe_front: str = "gemm"
     # a padded step's padding rows skip the routed experts (routed to the sentinel id, weight 0): the MoE tiles
     # follow every row's routing, so a captured replay's real rows otherwise depend on what the padding row (its
-    # contents not the step's) routes to. H200 job 1818, the MXFP4 cut: a 3-row step replayed on the 4-row graph
-    # came out bit for bit as the 3-row eager step with it, in every overlap mode (1.09-1.28 apart without it,
+    # contents not the step's) routes to. On an H200 with the MXFP4 cut, a 3-row step replayed on the 4-row graph
+    # is bit for bit the 3-row eager step with it, in every overlap mode (1.09-1.28 apart without it,
     # varying run to run). Every call then skips slots, which FlashInfer's FP4 MoE is tuned for at load. Where the
     # router runs inside FlashInfer's FP4 MoE (routed_experts_routing: kernel, B300) the kernel picks every row's
     # experts from the logits and the mask can't reach them: the padding rows route as they would unmasked.

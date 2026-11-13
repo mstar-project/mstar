@@ -83,7 +83,7 @@ def bisect(drafts: dict, cfg, states: torch.Tensor, anchor: int, label: str) -> 
     """Each drafter (``name -> module``) against the float64 reference at every recorded point:
     the max error and the median one over the reference's std there. The reference rounds its rope
     angles as fp32 does (vLLM's and HF's tables, and the drafter's): exact angles drift from them by
-    position x 3e-8 rad, which job 1473 saw as a 20x larger error at 8192 rows than at 512. The
+    position x 3e-8 rad, which shows as a 20x larger error at 8192 rows than at 512. The
     exact-angle reference's rows are printed too (``.../exact_angles``), ungated."""
     from mstar.model.kimi_k3.tests.test_dspark import _reference
 

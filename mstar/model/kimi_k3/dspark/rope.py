@@ -53,7 +53,7 @@ class YarnRotary(nn.Module):
 
     def _apply(self, fn, recurse=True):
         # A dtype cast of the drafter (``.to(torch.bfloat16)``) must not reach the frequencies: at
-        # position 8K a bf16 frequency is off by up to ~10 rad (GPU job 1465). Moves still apply.
+        # position 8K a bf16 frequency is off by up to ~10 rad. Moves still apply.
         super()._apply(fn, recurse)
         self.inv_freq = yarn_inv_freq(self.dim, self.params).to(self.inv_freq.device)
         return self

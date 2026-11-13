@@ -168,10 +168,9 @@ def _load(path, **kwargs):
 
 
 def test_mxfp4_experts_never_allocate_the_bf16_stacks(tmp_path, monkeypatch):
-    """B300 04c: built on meta, the model's ``to_empty`` gave every MoE block its bf16 expert stacks
-    (4.59 GiB of gate_up a layer at TP8) before the scope swapped in the packed storage, and TP8
-    ran out of memory at load. The scope prepares the root on meta now: no float tensor of a bf16
-    expert stack's shape is ever made, and the bytes ``to_empty`` allocates for the experts are
+    """The scope prepares the root on meta, so ``to_empty`` never gives a MoE block its bf16 expert
+    stacks (at TP8 4.59 GiB of gate_up a layer, over 92 layers more than a B300 holds): no float tensor
+    of a bf16 expert stack's shape is ever made, and the bytes ``to_empty`` allocates for the experts are
     exactly their packed e2m1 codes and e8m0 scales (0.5 + 1/32 bytes a weight, not 2)."""
     at_to_empty = {}
     to_empty = torch.nn.Module.to_empty
@@ -261,9 +260,9 @@ def _experts_block(sub):
 
 def test_on_a_blackwell_gpu_the_situ_experts_take_flashinfers_mxfp4_x_mxfp8_moe(tmp_path, monkeypatch):
     """vLLM's kimi-k31 image serves K3.1's experts on sm_103 with FLASHINFER_TRTLLM_MXFP4_MXFP8: trtllm-gen's MXFP4
-    x MXFP8 MoE, SiTU fused into FC1 (its MXFP4 x bf16 SiTU kernel doesn't exist, B300 04c). Where FlashInfer's
-    FP4 MoE is available and its load probe agrees, the SiTU experts take it with MXFP8 activations, not Marlin;
-    the load logs the backend once, as the B300 kit's kernel grep reads it."""
+    x MXFP8 MoE, SiTU fused into FC1 (its MXFP4 x bf16 SiTU kernel doesn't exist). Where FlashInfer's FP4 MoE is
+    available and its load probe agrees, the SiTU experts take it with MXFP8 activations, not Marlin; the load
+    logs the backend once, the line a deployment greps to confirm the kernel."""
     make_tiny_release(tmp_path)
     sub, _, _ = _load(tmp_path)
     block = _experts_block(sub)

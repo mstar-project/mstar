@@ -24,8 +24,9 @@ def test_an_empty_step_aligns_to_nothing(device):
 @pytest.mark.parametrize("tokens", [1, 4, 64, 128, 256, 1024])
 @pytest.mark.parametrize("block_size", [8, 16, 64])
 def test_the_cuda_op_places_slots_as_the_torch_fallback_does_on_every_call(experts, tokens, block_size):
-    """vLLM's large-batch placement ranked slots by atomicAdd, so the order within an expert
-    changed between calls with the same ids and Marlin MoE's output with it (H200 job 1656)."""
+    """Up to 4096 slots the op places them as the torch fallback does, on every call. vLLM's
+    large-batch placement ranks slots by atomicAdd, so the order within an expert changes between
+    calls with the same ids, and Marlin MoE's output with it."""
     from mstar.utils.fused_moe import align
 
     if not align._cuda_op_available():

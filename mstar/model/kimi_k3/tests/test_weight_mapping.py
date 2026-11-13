@@ -161,9 +161,9 @@ def test_release_mxfp4_experts_load_as_stored(variant, rank, tp):
 @pytest.mark.parametrize("variant, rank", [("k31", 0), ("k31_ep", 5)])
 def test_a_b300_rank_allocates_its_mxfp4_experts_packed(variant, rank):
     """A TP8 / EP8 rank's bytes as the scope prepares the root on meta, which is what ``materialize``'s
-    ``to_empty`` then allocates: the experts packed, 168.4 GiB (as bf16 stacks 634 GiB, which ran every
-    B300 rank out of memory at load in 04c), 187.1 GiB in all. With tp8's KV and KDA pools (~6.8 GiB;
-    tp8_c128 ~13.5) that leaves ~70 GiB of a B300's 267.68 GiB for activations and graphs."""
+    ``to_empty`` then allocates: the experts packed, 168.4 GiB (as bf16 stacks 634 GiB, more than a
+    B300 holds), 187.1 GiB in all. With tp8's KV and KDA pools (~6.8 GiB; tp8_c128 ~13.5) that leaves
+    ~70 GiB of a B300's 267.68 GiB for activations and graphs."""
     cfg = _VARIANTS[variant]()
     module = _build(cfg, rank, 8)
     _scope(cfg, _release_scan()).prepare_meta(module)

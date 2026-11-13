@@ -295,9 +295,9 @@ def test_two_ranks_draft_as_one(tmp_path):
 
 
 def test_rope_tables_stay_fp32_in_a_bf16_drafter():
-    """GPU job 1465: ``.to(torch.bfloat16)`` cast the rope's ``inv_freq`` buffer, so at position
-    ~8K a bf16 drafter's angles were off by up to ~10 rad (bf16 vs fp32 drafts agreed 2/28). The
-    tables of a bf16 drafter equal an fp32 one's at the release's rope, far into the context."""
+    """The tables of a bf16 drafter equal an fp32 one's at the release's rope, far into the context.
+    A ``.to(torch.bfloat16)`` that casts the rope's ``inv_freq`` buffer puts a bf16 drafter's angles
+    off by up to ~10 rad at position ~8K (on a GPU, bf16 vs fp32 drafts agreed 2/28)."""
     cfg = DSparkConfig.reduced(qk_rope_head_dim=64, rope=DSparkConfig().rope)
     d32 = DSparkDraft(cfg, nn.Identity(), nn.Identity())
     d16 = DSparkDraft(cfg, nn.Identity(), nn.Identity()).to(torch.bfloat16)
@@ -310,10 +310,10 @@ def test_rope_tables_stay_fp32_in_a_bf16_drafter():
 
 
 def test_an_fp32_drafter_normalizes_in_fp32_whatever_the_kernel(monkeypatch):
-    """GPU job 1465: on CUDA ``mstar::rms_norm`` runs an fp32 input in bf16 (FlashInfer takes half
-    precision only), so the fp32 drafter, the GPU check's oracle, was 1.07 off the float64 reference
-    (logit std 3.2). With the norm kernel stood in by that downcast here, the fp32 drafter still
-    matches the reference."""
+    """On CUDA ``mstar::rms_norm`` runs an fp32 input in bf16 (FlashInfer takes half precision only);
+    through it the fp32 drafter, the GPU check's oracle, is 1.07 off the float64 reference (logit std
+    3.2). With the norm kernel stood in by that downcast here, the fp32 drafter still matches the
+    reference."""
     from mstar.model.components import norm
 
     def cuda_like(x, weight, eps=1e-6, rms_norm_dtype=None):
@@ -330,12 +330,12 @@ def test_an_fp32_drafter_normalizes_in_fp32_whatever_the_kernel(monkeypatch):
 
 
 def test_at_long_context_the_drafter_is_fp32_rope_angles_off_exact():
-    """GPU job 1473: at 8192 context rows the fp32 drafter drifted from the float64 reference by
-    ~20x what it does at 512 (context rows 4e-4 -> 7.6e-3, final norm median/std 1.5e-5 -> 6e-4),
-    from the first layer's cache rows on. The cause is the rope angle: position x frequency rounds in
-    fp32 (2.4e-4 rad at 8192, 3.9e-3 at 131072), as vLLM's and HF's fp32 tables round it, the
-    convention the drafter keeps. Against a reference rounding its angles the same way and exact
-    otherwise, the drafter at ~8K positions is as close as at short ones; against exact angles it is not."""
+    """Against a reference rounding its rope angles as fp32 does and exact otherwise, the drafter at ~8K
+    positions is as close as at short ones; against exact angles it is not. Position x frequency
+    rounds in fp32 (2.4e-4 rad at 8192, 3.9e-3 at 131072), as vLLM's and HF's fp32 tables round it,
+    the convention the drafter keeps. Against exact angles the fp32 drafter at 8192 context rows is
+    ~20x further off than at 512 (on a GPU: context rows 4e-4 -> 7.6e-3, final norm median/std
+    1.5e-5 -> 6e-4), from the first layer's cache rows on."""
     cfg = DSparkConfig.reduced(qk_rope_head_dim=64, rope=DSparkConfig().rope)
     torch.manual_seed(0)
     draft = DSparkDraft(cfg, nn.Embedding(cfg.vocab_size, cfg.hidden_size),

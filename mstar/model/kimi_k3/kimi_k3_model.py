@@ -187,8 +187,8 @@ class KimiK3Model(Model):
         table = kwargs.get("small_m_gemm_table")
         self.small_m_gemm_table = str(table) if table else None
         # with compile_glue: the AttnRes reads' regions too (their Triton op inside), or only the MLP blocks.
-        # Off: the reads are Triton kernels with the residual add fused, and a region around them added
-        # launches (H200 job 1639, full model: 3,170 a decode step with them, 2,844 without; no faster)
+        # Off: the reads are Triton kernels with the residual add fused, and a region around them adds
+        # launches (H200, full model: 3,170 a decode step with them, 2,844 without; no faster)
         self.compile_reads = bool(kwargs.get("compile_reads", False))
         # the KDA conv tail's dtype, which must match the projections' (CPU tests pass fp32)
         self.kda_conv_dtype = kwargs.get("kda_conv_dtype", torch.bfloat16)
@@ -497,8 +497,8 @@ class KimiK3Model(Model):
     def _create_submodule(self, node_name, device, tp_group=None, autocast_dtype=None):
         if node_name != "LLM":
             return None
-        # B300 job 20261108T003606Z: loaded in __init__, the table reached only the conductor; every worker
-        # projection ran cuBLAS (nvjet) while the config named it
+        # here, not in __init__: a worker gets the model pickled, without running __init__, so a table loaded
+        # there stays in the conductor and every worker projection runs cuBLAS
         self._load_small_m_gemm_table()
         source = self._resolve_checkpoint()
         if source is None:
@@ -514,7 +514,7 @@ class KimiK3Model(Model):
             language_model = KimiK3ForCausalLM(self.config, comm_group=tp_group)
         language_model = language_model.to(autocast_dtype or torch.bfloat16)
         # the MXFP4 experts get their packed storage on meta: to_empty must never allocate the bf16 stacks
-        # they replace (TP8: 4.59 GiB of gate_up a layer, 92 layers; B300 04c ran out of memory there)
+        # they replace (TP8: 4.59 GiB of gate_up a layer, 92 layers: more than a B300 holds)
         materialize(language_model, device)
         self._load_checkpoint(language_model, source, device)
         process_weights_after_loading(language_model, torch.device(device))

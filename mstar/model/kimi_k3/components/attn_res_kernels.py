@@ -33,8 +33,8 @@ except ImportError:  # pragma: no cover - CPU-only installs
 
 # From rows on, one fused program a row; below, the split pair. Then (hidden slice, warps) by
 # rows: at least 8 elements a thread (16-byte loads) on each, as fewer measured 2-10x slower.
-# H200, us per read at 1 / 64 / 2048 rows and 8 blocks (benchmark/kimi_k3/attn_res_read.py,
-# job 1628): torch chain 38.6 / 103 / 2047; these 3.9 / 6.5 / 116.
+# H200, us per read at 1 / 64 / 2048 rows and 8 blocks (benchmark/kimi_k3/attn_res_read.py):
+# torch chain 38.6 / 103 / 2047; these 3.9 / 6.5 / 116.
 FUSED_MIN_ROWS = 256
 
 
@@ -50,9 +50,9 @@ _PDL: dict[torch.device, bool] = {}
 def _pdl(device: torch.device) -> bool:
     """Programmatic dependent launch (Hopper and newer NVIDIA): the mix kernel launches while
     the partial kernel runs and waits on it in-kernel. Off unless ``MSTAR_ATTN_RES_PDL=1``: with
-    it on, k31-all's H200 parity saw capture replay off eager by 0.73 (job 1641) and, with only
-    the partial kernel releasing, still 2 flipped decisive tokens in one of two TP1 runs (1644);
-    with it off, capture and TP1 passed every run (1643)."""
+    it on, the H200 parity runs had capture replay off eager by 0.73 and, with only the partial
+    kernel releasing, still 2 flipped decisive tokens in one of two TP1 runs; with it off, capture
+    and TP1 passed every run."""
     if device.type != "cuda" or os.environ.get("MSTAR_ATTN_RES_PDL") != "1":
         return False
     if device not in _PDL:
@@ -67,8 +67,8 @@ if triton is not None:
         """Wait for the previous grid (PDL). ``RELEASE`` lets the next grid launch now: only the
         partial kernel does, its successor being the mix kernel, which waits on it. The mix and
         fused kernels' successors are any kernel, and a PDL-launched one that reads before waiting
-        saw this read unfinished under CUDA-graph replay (H200 job 1641, k31-all: capture/bs4
-        replay vs eager off by 0.73 with the MLP regions compiled; 0.06 without the release)."""
+        sees this read unfinished under CUDA-graph replay (H200, a 4-row capture: replay vs eager
+        off by 0.73 with the MLP regions compiled; 0.06 without the release)."""
         if PDL:
             tl.extra.cuda.gdc_wait()
             if RELEASE:

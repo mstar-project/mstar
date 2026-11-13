@@ -513,7 +513,7 @@ def test_the_fold_refuses_what_its_kernel_would_index_past(monkeypatch):
     scales, weight = torch.rand(3, 4).bfloat16(), torch.ones(48).bfloat16()
     assert group.moe_finalize_unfit(permuted, idx, scales, weight) is None
     bad = {
-        "expanded index": (permuted, idx.flatten(), scales, weight),  # slot 8: [1 x 16] read as 16 tokens x 16
+        "expanded index": (permuted, idx.flatten(), scales, weight),  # flat: [1 x 16] would read as 16 tokens x 16
         "routing weights": (permuted, idx, scales.float(), weight),
         "permuted rows": (permuted[:11], idx, scales, weight),
         "not [rows, hidden] dense": (torch.randn(48, 40).bfloat16().t(), idx, scales, weight),
@@ -531,7 +531,7 @@ def test_the_fold_refuses_what_its_kernel_would_index_past(monkeypatch):
 def test_from_logits_can_leave_the_finalize_to_the_caller(monkeypatch):
     """``from_logits(finalize=False)``: the MoE stops before its top-k sum (do_finalize False) and hands back
     its permuted rows, routing weights and expanded index, the last as ``[tokens, top_k]`` (FlashInfer's is flat,
-    and the fold kernel takes top_k off its last dim: B300 slot 8 read past it at 1 token)."""
+    and the fold kernel takes top_k off its last dim: a flat one reads past it, already at 1 token)."""
     from types import SimpleNamespace
 
     from mstar.utils.fused_moe import fp4_flashinfer
@@ -680,8 +680,8 @@ def test_the_fold_needs_every_rank_routing_in_the_kernel_and_a_probe(monkeypatch
 def test_the_fold_probe_launches_nothing_a_rank_could_fault_on(monkeypatch):
     """``_probe_fold`` (collective) launches the fold only once every rank's unfinalized MoE output passed the
     kernel's contract on the host and its expanded index (each a permuted row or -1) on the device, by vote:
-    B300 slot 8's probe ran the kernel on a flat index, faulted (sticky), and the "fallback" died with it. A
-    rank that says no, or another rank's no, launches nothing; a device fault stops the load, saying so."""
+    a kernel launched on a bad index faults, the fault is sticky, and no fallback runs after it. A rank
+    that says no, or another rank's no, launches nothing; a device fault stops the load, saying so."""
     from mstar.model.kimi_k3.components import moe as kmoe
 
     monkeypatch.setattr(kmoe, "FOLD_MAX_TOKENS", 4)
@@ -780,7 +780,7 @@ def test_triton_mxfp4_experts_take_situ():
 def test_blackwell_fp4_moe_takes_situ_with_both_betas():
     """FlashInfer's TRT-LLM FP4 MoE (B200/B300) runs SwiGLU and SiTU with both betas (its
     activation_type Situ); any other activation keeps MXFP4 experts on the Triton kernel. So does
-    SiTU on MXFP4 with bf16 activations, Kimi's W4A16: trtllm-gen has no such kernel (B300 04c)."""
+    SiTU on MXFP4 with bf16 activations, Kimi's W4A16: trtllm-gen has no such kernel."""
     from mstar.utils.fused_moe.fp4_flashinfer import unsupported_activation
 
     assert unsupported_activation("silu") is None

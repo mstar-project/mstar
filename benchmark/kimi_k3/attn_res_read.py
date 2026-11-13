@@ -28,7 +28,7 @@ D, EPS = 7168, 1e-6
 
 
 def chain_read(prefix, blocks_tm, norm_w, proj_w):
-    """The read on k31-marlin (7ae0ded88): ``(T, m, D)`` stack, per-read score weight."""
+    """The torch chain the port ran: ``(T, m, D)`` stack, per-read score weight."""
     sw = score_weight(norm_w, proj_w)
     with torch.autocast(device_type="cuda", enabled=False):
         v = torch.cat((blocks_tm, prefix.unsqueeze(1)), dim=1).float()

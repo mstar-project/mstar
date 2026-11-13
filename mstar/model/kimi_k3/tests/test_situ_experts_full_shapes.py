@@ -1,5 +1,5 @@
-"""Kimi K3.1's routed experts (MXFP4 x bf16, SiTU 4/25: ``fused_experts_w4a16``, what the B300 serves them with)
-at a rank's full geometry on CPU (from the quant-w4 lane).
+"""Kimi K3.1's routed experts on the Triton kernel (MXFP4 x bf16, SiTU 4/25: ``fused_experts_w4a16``) at a rank's
+full geometry on CPU.
 
 - the alignment buffers, the GEMM grids and the per-call caches at 8192 tokens x top-16 over 896 experts (TP8) and
   112 local experts with the other ranks' slots on the sentinel (EP8), against the int32 / grid limits the kernels

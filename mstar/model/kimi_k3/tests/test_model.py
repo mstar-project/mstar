@@ -170,7 +170,7 @@ def test_dsa_decode_replays_the_dense_capture_until_a_row_nears_index_topk():
                                         ("kimi_k31_tp8_32k", 64), ("kimi_k31_tp8_40k", 64)])
 def test_shipped_configs_decode_as_many_rows_as_they_admit(name, rows):
     """The decode cap (the largest graph that fits the KDA slots) equals the config's admission:
-    a lower cap queues the rest of a c=N load behind it (the MoE-gap audit's -38% on Qwen3-Omni)."""
+    a lower cap queues the rest of a c=N load behind it (-38% on Qwen3-Omni)."""
     from types import SimpleNamespace
 
     from mstar.model.kimi_k3.components.causal_lm import KimiK3ForCausalLM
@@ -271,9 +271,8 @@ def test_a_prompt_is_cut_on_64_token_boundaries():
 
 
 def test_the_small_m_gemm_table_loads_in_the_process_that_builds_the_submodule(tmp_path, monkeypatch):
-    """The conductor pickles the model to each worker without running __init__ (spawn): a table loaded
-    there never reached the workers, whose projections all ran cuBLAS (B300 profile 20261108T003606Z).
-    The worker's submodule build loads it."""
+    """The conductor pickles the model to each worker without running __init__ (spawn), so a table loaded
+    there reaches no worker and their projections all run cuBLAS. The worker's submodule build loads it."""
     import json
     import pickle
 

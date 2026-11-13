@@ -2,8 +2,8 @@
 the CPU: the conductor's ``validate_deployment`` at the release's geometry, then
 ``EngineManager.build`` (the submodule's load under its quantization scope, the post-load checks,
 the engine's resources) on the tiny MXFP4 release with the config's model kwargs and resources, one
-rank. B300 04c: tp8 and tp8_c128 died at startup on every rank because the LLM node chunks its
-prefill without reporting ``get_input_sequence_len``, a check no engine-level test reaches."""
+rank. The build runs startup checks no engine-level test reaches: it refuses a node that chunks its
+prefill without reporting ``get_input_sequence_len``."""
 import types
 from pathlib import Path
 
@@ -30,7 +30,7 @@ _RELEASES = {"kimi_k31": "moonshotai/Kimi-K3.1-Pro", "kimi_k3": "moonshotai/Kimi
 
 
 def _release_kwargs(cfg: dict) -> dict:
-    """The config's model kwargs, minus what points at a checkpoint (the 04c item adds the path)."""
+    """The config's model kwargs, minus what points at a checkpoint."""
     return {k: v for k, v in (cfg.get("model_kwargs") or {}).items() if k != "checkpoint_path"}
 
 
@@ -91,10 +91,10 @@ def test_the_shipped_config_boots_a_worker(path, tmp_path):
 
 @pytest.mark.parametrize("name", ["kimi_k31", "kimi_k3"])
 def test_the_openai_chat_endpoint_serves_kimi_with_the_benches_fields(name, tmp_path):
-    """/v1/chat/completions has an adapter for Kimi (B300 04c: without one it answered 404 after a ~10 min
+    """/v1/chat/completions has an adapter for Kimi (without one it answers 404, on a B300 after a ~10 min
     load), and the fields the benches send reach the model: ``max_tokens`` caps the reply, ``ignore_eos``
     reaches the sampler, and ``enable_thinking: false`` (flat, M*'s; or in ``chat_template_kwargs``,
-    vLLM's) renders the prompt without thinking, as vLLM's item 02b replies were."""
+    vLLM's) renders the prompt without thinking."""
     from mstar.api_server.openai.adapters import get_adapter
     from mstar.api_server.openai.protocol import ChatCompletionRequest
     from mstar.model.kimi_k3.config import SAMPLER

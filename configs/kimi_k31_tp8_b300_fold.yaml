@@ -2,7 +2,7 @@ model: "kimi_k31"
 # kimi_k31_tp8_b300.yaml with the routed finalize folded into the routed all-reduce + RMSNorm
 # (routed_experts_finalize: fused): up to 128 tokens the trtllm-gen MoE stops before its finalize and FlashInfer's
 # kMoEFinalizeARResidualRMSNorm sums each token's top-k rows, reduces and norms in one kernel, on a TRT-LLM IPC
-# workspace (B300 slot 7: finalizeKernel 92 x 5.5 us = 0.51 ms a c=1 step). At load every rank probes the fold
+# workspace (on a B300: finalizeKernel 92 x 5.5 us = 0.51 ms a c=1 step). At load every rank probes the fold
 # against the MoE's finalize + the fused all-reduce + RMSNorm (host-side contract checks first, then all ranks
 # launch or none does); a probe that disagrees keeps the finalize in the MoE, a device fault stops the load naming
 # routed_experts_finalize: kernel. Off in kimi_k31_tp8_b300.yaml; this file is that one with the fold, to A/B it
@@ -34,7 +34,8 @@ model_kwargs:
   # routed experts: auto = FlashInfer's trtllm-gen MXFP4 x MXFP8 MoE with SiTU fused on B200/B300 (vLLM's
   # FLASHINFER_TRTLLM_MXFP4_MXFP8) where its load probe agrees, else Marlin; trtllm / marlin force one. Its
   # tactics are tuned at load (routed_experts_autotune, default true; routed_experts_tune_tokens, default
-  # every FlashInfer bucket: 1..256, 512..8192) and kept per GPU under ~/.cache/mstar/flashinfer_moe_tune: the first boot pays for it
+  # every FlashInfer bucket: 1..256, 512..8192) and kept per GPU under ~/.cache/mstar/flashinfer_moe_tune:
+  # the first boot pays for it
   routed_experts_backend: auto
   # the routed finalize folded into the routed all-reduce + RMSNorm (see the top); kernel in kimi_k31_tp8_b300.yaml
   routed_experts_finalize: fused

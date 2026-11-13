@@ -176,7 +176,7 @@ def test_cuda_marlin_moe_matches_the_dequantized_experts(kind, group, skip):
             out = M.fused_experts_marlin(x, *args, wts, ids, kind, group, situ.spec, skip, 0)
         graph.replay()
         torch.cuda.synchronize()
-        # Not bit-exact once an expert spans several blocks (job 1597: 300+ tokens here): moe_align orders an
+        # Not bit-exact once an expert spans several blocks (300+ tokens here): moe_align orders an
         # expert's tokens by atomics, and Marlin splits a tile's K reduction by the tile's place in its work list,
         # so a token's sum can split differently run to run. Within a GEMM's rounding of each other.
         if m <= 64:

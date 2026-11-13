@@ -629,8 +629,8 @@ def test_flashinfer_routing(nccl_calls, flashinfer, message, kernel):
 def test_compiled_flashinfer_takes_the_op_that_sizes_the_message_itself(monkeypatch, nccl_calls, flashinfer):
     """Under torch.compile a 2-D bf16 message goes to ``allreduce_flashinfer``, an op Dynamo does not
     trace into, which picks FlashInfer's kernel or NCCL per call (the workspace's size check is no
-    traceable code); before, every compiled all-reduce went to NCCL, so a compiled region's ran
-    NCCL where the eager forward's ran FlashInfer's kernel."""
+    traceable code), so a compiled region's all-reduce takes the path the eager forward's does. Any
+    other message goes to NCCL."""
     from mstar.distributed import ar_fusion
 
     g, _, routed = flashinfer

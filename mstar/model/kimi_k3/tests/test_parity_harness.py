@@ -31,10 +31,10 @@ class _ReplayList(list):
 
 
 def test_generate_reads_each_steps_logits_even_when_the_sampler_runs_no_python(tmp_path):
-    """GPU job 1461: decode replayed captured graphs, the harness read logits from the sampler's
-    Python list, which stopped at the prefill's, and every dense case failed (error ~10, the
-    control's size; argmax agreeing on the prefill row only). The logits now come back as the step's
-    row output and must be the sampled token's argmax; with the list frozen they match the reference."""
+    """The logits come back as the step's row output and must be the sampled token's argmax: a decode
+    that replays captured graphs runs none of the sampler's Python, so its logits list stops at the
+    prefill's (read from it, every dense case fails with an error of ~10, the control's size). With
+    the list frozen the harness's logits still match the reference."""
     harness = _harness()
     harness._cpu_stubs()
     (tmp_path / "release").mkdir()
@@ -53,9 +53,10 @@ def test_generate_reads_each_steps_logits_even_when_the_sampler_runs_no_python(t
 
 
 def test_the_dsa_control_attends_only_keys_the_engine_did_not_pick():
-    """B300 04c: the dense control sat ~1 logit from the top-16 reference, under twice a bf16 engine's
-    error on one prompt. The control replays each query past top-k on visible keys outside the
-    engine's picks (the earliest, at most top-k); queries within top-k see every key either way."""
+    """The control replays each query past top-k on visible keys outside the engine's picks (the
+    earliest, at most top-k); queries within top-k see every key either way. The dense reference is
+    too close to be the control: ~1 logit from the top-16 reference, under twice a B300 bf16 engine's
+    error on one prompt."""
     harness = _harness()
     run = {"dsa": {3: {2: torch.tensor([0, 1, 2, 3])},
                    6: {2: torch.tensor([6, 4, 0, 2]), 3: torch.tensor([1, 2, 3, -1])},

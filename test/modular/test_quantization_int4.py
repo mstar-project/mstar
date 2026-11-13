@@ -586,7 +586,7 @@ def test_blackwell_fp4_experts_match_the_reference(stored, layout, group, tol):
 @pytest.mark.parametrize("skip", [False, True])
 def test_blackwell_mxfp4_situ_experts_take_mxfp8_and_match_the_reference(stored, skip):
     """Kimi's SiTU over MXFP4 experts: trtllm-gen ships it only with MXFP8 activations (vLLM's
-    FLASHINFER_TRTLLM_MXFP4_MXFP8; no MXFP4 x bf16 SiTU kernel, B300 04c), which the load takes once its probe
+    FLASHINFER_TRTLLM_MXFP4_MXFP8; no MXFP4 x bf16 SiTU kernel), which the load takes once its probe
     agrees; W4A8 against the bf16-activation reference within MXFP8's rounding. ``skip`` routes a slot to the
     sentinel id (expert parallelism, padding rows), whose expert count the routing kernel takes in 4s."""
     from mstar.utils.fused_moe.fp4_flashinfer import TrtllmFp4Experts

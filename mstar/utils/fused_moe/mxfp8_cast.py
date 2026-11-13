@@ -11,9 +11,9 @@ amax times ``rcp.approx.ftz(448)``, rounded up to a power of two (``cvt.rp.satfi
 bits: the biased exponent plus one where the mantissa is not 0; a value at or below 2^-127, zero included,
 gives 2^-127); the values are multiplied by ``rcp.approx.ftz`` of the scale (exact for a power of two), or by 0
 where the scale is 2^-127: its float is denormal, which TRT-LLM's ``SFValue != 0`` test flushes to zero under
-ftz, so an all-zero or tiny block (amax * rcp(448) at or below 2^-127) comes out as zeros (B300 slot 10 caught
-this: the first version multiplied by +inf and saturated such blocks to 448); 0 also for 2^127, whose reciprocal
-the ftz flushes; then clamped to +-448 and rounded to e4m3 (``cvt.rn.satfinite``).
+ftz, so an all-zero or tiny block (amax * rcp(448) at or below 2^-127) comes out as zeros (a multiply by the
+scale's reciprocal, +inf, would saturate such blocks to 448); 0 also for 2^127, whose reciprocal the ftz
+flushes; then clamped to +-448 and rounded to e4m3 (``cvt.rn.satfinite``).
 """
 from __future__ import annotations
 

@@ -247,12 +247,12 @@ class FlashInferMLAWrapper:
 
 # Where the head count is one FlashInfer's 64/128-query tile doesn't divide (Kimi K3's 96, 12 a rank at
 # TP8), its planned MLA backends (fa2, fa3) refuse a multi-query causal row whose tile boundary falls
-# inside a query at a key that starts a KV tile (``_validate_fa_causal_tile_bound``; GPU job 1529:
-# "causal tile boundary ... query=2, key=64"). Which rows: those whose first query sits at an offset off
-# a 64-key boundary (at 12 heads, offsets 11, 22, 43 and 54 mod 64): a verify block, a drafter's block,
-# and a prompt the scheduler cut mid-way, whose next chunk starts anywhere (B300 pre-flight audit: ~90%
-# of c=64 waves of ~1K-token prompts). A one-query row, and a row starting on a 64-key boundary, pass for
-# every head count and KV tile (16, 32, 64; checked exhaustively against the rule in the tests).
+# inside a query at a key that starts a KV tile (``_validate_fa_causal_tile_bound``: "causal tile
+# boundary ... query=2, key=64"). Which rows: those whose first query sits at an offset off a 64-key
+# boundary (at 12 heads, offsets 11, 22, 43 and 54 mod 64): a verify block, a drafter's block, and a
+# prompt the scheduler cut mid-way, whose next chunk starts anywhere (in ~90% of c=64 waves of
+# ~1K-token prompts). A one-query row, and a row starting on a 64-key boundary, pass for every head
+# count and KV tile (16, 32, 64; checked exhaustively against the rule in the tests).
 ROW_ALIGN = 64
 
 

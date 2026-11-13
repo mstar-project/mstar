@@ -1,9 +1,8 @@
 """The MLA attention resource's plan for causal rows off a 64-key boundary (a verify block, a drafter's
 block, a prompt chunk the scheduler cut mid-way): single-query rows up to the boundary, then the rest as
 one causal row, since FlashInfer 0.7.2's planned MLA backends refuse a causal row whose query/key offset
-puts a tile boundary on a KV tile's first key at a head count their query tile doesn't divide (GPU job
-1529: "fa3 MLA causal tile boundary is unsupported: ... query=2, key=64, native KV tile=64"; the B300
-pre-flight audit: a cut prompt's next chunk at 12 heads a rank)."""
+puts a tile boundary on a KV tile's first key at a head count their query tile doesn't divide ("fa3 MLA
+causal tile boundary is unsupported: ... query=2, key=64, native KV tile=64"; Kimi K3's 12 heads a rank)."""
 from __future__ import annotations
 
 import torch

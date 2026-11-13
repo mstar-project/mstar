@@ -15,10 +15,10 @@
 // ``moe_align_block_size_stable_kernel``: each expert's slots in increasing slot
 // order, as the torch fallback places them. vLLM's placement ranks each slot by
 // atomicAdd, so the order within an expert changes from call to call, and Marlin
-// MoE's output follows the order of its rows (H200 job 1656: one MoE block, the
-// same input, 47 of 200 calls differed at 256 tokens; with the order fixed, 0).
+// MoE's output follows the order of its rows (H200, one MoE block, the same
+// input: 47 of 200 calls differed at 256 tokens; with the order fixed, 0).
 // Past STABLE_MAX_SLOTS (prefill chunks) vLLM's placement stays: the single-block
-// stable kernel ran 309 us at 8192 tokens x top-16 against its 55 (job 1659).
+// stable kernel ran 309 us at 8192 tokens x top-16 against its 55.
 //
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright contributors to the vLLM project

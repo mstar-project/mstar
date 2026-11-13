@@ -3,7 +3,7 @@
 Prefill and decode share the forward; per step it declares the latent KV cache, the MLA
 attention over it, the KDA recurrent pool and the KDA resource, the sampler, and under
 ``dsa_long_context`` the DSA resource. Decode is captured per batch size, DSA included (the routed experts on
-CUDA take the fused kernels: bf16, fp8, or MXFP4 on Triton / FlashInfer's FP4 MoE). Prefill is
+CUDA take the fused kernels: bf16, fp8, or MXFP4 on FlashInfer's FP4 MoE, Marlin or Triton). Prefill is
 captured at packed token buckets where the serving config names them (``prefill_token_buckets``,
 which the engine applies) and the context stays within index_topk; else eager.
 """
@@ -141,9 +141,9 @@ class KimiK3LLMSubmodule(ARNodeSubmodule):
         Prefill, where the serving config names ``prefill_token_buckets`` (none by default: declared
         empty, for the engine to fill) and dsa_long_context is off:
         one graph per (rows, token bucket), rows up to ``prefill_capture_batch_sizes`` and the KDA
-        slots. An eager prefill step issues ~2.2 ms of host work a layer whatever its length (H200
-        job 1707: 205 ms over the 93 layers from 64 to 1920 tokens; the B300's 960-token step ran
-        216-221 ms), which a replay skips. A step past the largest bucket or row count runs eager."""
+        slots. An eager prefill step issues ~2.2 ms of host work a layer whatever its length (H200:
+        205 ms over the 93 layers from 64 to 1920 tokens; B300: 216-221 ms for a 960-token step),
+        which a replay skips. A step past the largest bucket or row count runs eager."""
         attn = self.node_resources.get(ATTN) if self.node_resources else None
         if device.type != "cpu" and attn is not None and not attn.uses_kernel:
             logger.warning("kimi_k3: MLA is on the torch fallback, which cannot be captured; decode runs eager")
@@ -261,7 +261,7 @@ class KimiK3LLMSubmodule(ARNodeSubmodule):
         self, graph_walk: str, fwd_info: CurrentForwardPassInfo, inputs: NameToTensorList, **kwargs,
     ) -> InputSeqLenInfo | None:
         """A prompt's token count, which the chunked prefill (``get_chunking_policies``) cuts by; it is
-        ``prepare_inputs``' ``input_seq_len`` of the whole prompt. Main's engine manager refuses a node that
+        ``prepare_inputs``' ``input_seq_len`` of the whole prompt. The engine manager refuses a node that
         chunks a walk without it, at startup."""
         if graph_walk == "prefill" and inputs.get("text_inputs"):
             return InputSeqLenInfo(int(inputs["text_inputs"][0].shape[0]))

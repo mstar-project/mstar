@@ -39,7 +39,7 @@ TUNE_MAX_TOKENS = 8192
 # the buckets the boot tuning profiles by default: every one a call can look up (FlashInfer's hybrid buckets under
 # TUNE_MAX_TOKENS): decode 1..256, and prefill in steps of 256 to 2048, of 512 to 4096, then 8192. M* captures prefill
 # at 512..8192 tokens (prefill_token_buckets; 6144 looks up 8192) and runs other counts eager, so every prefill
-# bucket is served (B300 slot 8: a 3072-token step on the default tactic); a bucket left out keeps that default
+# bucket is served; a bucket left out keeps the default tactic
 TUNE_TOKENS = (1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 768, 1024, 1280, 1536, 1792, 2048, 2560, 3072, 3584, 4096, 8192)
 
 
@@ -47,7 +47,7 @@ def unsupported_activation(activation, fmt: str = "mxfp4", activation_dtype: str
     """Why the TRT-LLM FP4 MoE can't run the experts' gated activation, None when it can: SwiGLU, or a SiTU
     with both betas (its ``activation_type`` Situ takes them per expert as ``gemm1_alpha`` / ``gemm1_beta``),
     except SiTU on MXFP4 weights with bf16 activations: FlashInfer 0.7.2.post1's trtllm-gen ships no
-    ``MxE2m1 x Bfloat16`` SiTuGlu batched GEMM (B300 04c: "No kernel found" at decode, tiles 8 and 16), so
+    ``MxE2m1 x Bfloat16`` SiTuGlu batched GEMM ("No kernel found" at decode, tiles 8 and 16), so
     Kimi's W4A16 experts take the Triton kernel. Its Kimi W4A8 SiTU MoE (``backend="cake"``, sm_103a,
     MXFP4 x MXFP8) is not wired here; trtllm-gen's MXFP4 x MXFP8 SiTU (``activation_dtype="mxfp8"``) is."""
     from mstar.utils.situ import SiTU
@@ -172,7 +172,7 @@ def probe(block, device: torch.device, activation: str, experts: int = 16, token
     at every count in ``tokens`` (trtllm-gen picks its tile from the tokens per expert: these span decode's
     smallest to prefill's largest); MXFP8 rounds both GEMMs' inputs to e4m3 per 32, a few percent, while a wrong
     layout or activation is order 1. ``(why not, "")`` otherwise, an exception included: no cubin for these
-    dtypes or this tile ("No kernel found", B300 04c), a FlashInfer without the op or the activation.
+    dtypes or this tile ("No kernel found"), a FlashInfer without the op or the activation.
 
     With ``routing``, the kernel routes each case itself from random logits (``from_logits``, the block's bias
     over the probed experts) and the reference takes ``deepseek_v3_route``'s ids and weights: the in-kernel

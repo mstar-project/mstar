@@ -333,7 +333,7 @@ def _tp2_rank(rank: int, args, port: int) -> None:
     Path(f"{args.out}.rank{rank}").write_text(json.dumps({"rows": rows, "failures": failures, "runs": keep}))
     sys.stdout.flush()
     sys.stderr.flush()
-    # as gpu_truncated_parity's TP2 ranks: exit without the NCCL teardown (job 1461's ranks hung in it)
+    # as gpu_truncated_parity's TP2 ranks: exit without the NCCL teardown, which hangs
     os._exit(code)
 
 

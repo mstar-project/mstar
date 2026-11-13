@@ -185,8 +185,8 @@ def attn_res_read_norm(
             except Exception as exc:  # noqa: BLE001 - its program didn't build or load: off for the process
                 if _device_fault(exc):
                     raise
-                # B300 slot 10 (flashinfer 0.7.2): the wheel ships no generated sources, so the JIT build fails
-                # ("Ninja build failed ... missing") before any launch, for most call shapes
+                # flashinfer 0.7.2's wheel ships no generated sources, so the JIT build fails ("Ninja build
+                # failed ... missing") before any launch, for most call shapes
                 _FI[prefix.device] = None
                 logger.warning("FlashInfer's kimi_k3_attn_res can't run here (%s: %s); the Triton read serves every "
                                "AttnRes site from now on", type(exc).__name__, str(exc)[:300])

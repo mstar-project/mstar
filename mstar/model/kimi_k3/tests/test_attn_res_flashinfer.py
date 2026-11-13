@@ -163,9 +163,9 @@ def test_a_call_flashinfer_refuses_falls_back_to_the_triton_read(monkeypatch):
 
 
 def test_a_flashinfer_that_cant_build_its_programs_is_off_for_the_process(monkeypatch):
-    """B300 slot 10: flashinfer 0.7.2's JIT build fails (the wheel ships no generated sources). The first failing
-    call runs the Triton read, the write and the norm, and FlashInfer is off for the device from then on (one
-    warning); a CUDA error is not swallowed."""
+    """A FlashInfer whose JIT build fails (0.7.2's wheel ships no generated sources): the first failing call runs
+    the Triton read, the write and the norm, and FlashInfer is off for the device from then on (one warning); a
+    CUDA error is not swallowed."""
     tried = []
 
     def kimi_k3_attn_res(*args, **kwargs):
