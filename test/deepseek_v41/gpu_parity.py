@@ -9,10 +9,12 @@ checkpoint repo's ``inference/`` code and, for the kernels, ``tilelang`` (the re
 reference on (``_testing.reference_kernels``), on random and on tie inputs: the roundings bit for
 bit, the GEMMs and the attention in units of the result's bf16 spacing.
 ``tp1``: the reduced random-weight model. In fp32, M* through the ``Engine`` on the GPU against
-the reference on the stand-ins (the CPU gate, on CUDA). In bf16, the reference on its own kernels
+the reference on the stand-ins (the CPU gate, on CUDA), and against itself with the other expert
+layouts and with the Engram tables on the host. In bf16, the reference on its own kernels
 against itself on the stand-ins and against M*, next to the reference's own spread when only its
 attention kernel is swapped for an exact softmax.
-``tp2``: two ranks (NCCL on cuda:0 and cuda:1; gloo with ``--engine-device cpu``) against one.
+``tp2``: two ranks (NCCL on cuda:0 and cuda:1; gloo with ``--engine-device cpu``) against one:
+a slice of every expert a rank, whole experts a rank, and the Engram tables on the host.
 """
 from __future__ import annotations
 
@@ -31,6 +33,8 @@ import torch.multiprocessing as mp
 
 PROMPT, STEPS = 45, 14
 TP2 = dict(moe_intermediate_size=64, o_lora_rank=32)
+# (name, the node group's expert split, model kwargs) of each two-rank run
+TP2_RUNS = (("sliced-experts", "tp", {}), ("whole-experts", "ep", {}), ("host-engram", "tp", {"engram_tables": "host"}))
 
 
 def _real_kernels(reference: str) -> types.ModuleType:
@@ -187,6 +191,12 @@ def mode_tp1(args) -> dict:
         got32 = _engine_run(tmp, ids, PROMPT, torch.float32, device)
         rows["fp32/mstar-vs-reference(stand-ins)"] = {
             "gap": T.logit_gap(got32, want32), "argmax_equal": bool(torch.equal(got32.argmax(-1), want32.argmax(-1)))}
+        # the same values held or fetched another way: every one bit-identical on CPU
+        for name, kwargs in (("fp8 experts", {"moe_experts": "fp8"}), ("dense experts", {"moe_experts": "dense"}),
+                             ("host tables", {"engram_tables": "host"})):
+            other = _engine_run(tmp, ids, PROMPT, torch.float32, device, **kwargs)
+            rows[f"fp32/mstar({name})-vs-mstar"] = {
+                "equal": bool(torch.equal(other, got32)), "gap": T.logit_gap(other, got32)}
         if not args.no_kernels:
             real = T.load_reference(args.reference, _real_kernels(args.reference))
             want16 = _reference_run(real, tmp, config, tokenizer, ids, PROMPT, torch.bfloat16, device)
@@ -203,18 +213,23 @@ def mode_tp1(args) -> dict:
     return rows
 
 
-def _tp2_rank(rank: int, args, port: int, snapshot: str) -> None:
+def _tp2_rank(rank: int, args, port: int, snapshot: str, run: str) -> None:
     from mstar.distributed.communication import CommGroup, WorkerParallelGroups
+    from mstar.model.components.moe_parallel import MoeParallelConfig
     from mstar.model.deepseek_v41 import _testing as T
     from mstar.model.deepseek_v41.config import DeepseekV41Config
 
+    _, parallel, kwargs = next(r for r in TP2_RUNS if r[0] == run)
+    kwargs = dict(kwargs, moe_parallel=MoeParallelConfig(parallel=parallel))
     config = DeepseekV41Config.reduced(**TP2)
     ids = T.random_ids(config, PROMPT + STEPS, seed=1)
+    out = f"{args.out}.{run}.rank{rank}"
     if not args.engine_device.startswith("cuda"):
-        group, groups = T.gloo_tp_rank(rank, 2, f"{snapshot}.store")
+        group, groups = T.gloo_tp_rank(rank, 2, f"{snapshot}.{run}.store")
         try:
-            torch.save(_engine_run(snapshot, ids, PROMPT, torch.float32, "cpu", tp_group=group, parallel_groups=groups),
-                       f"{args.out}.rank{rank}")
+            logits = _engine_run(snapshot, ids, PROMPT, torch.float32, "cpu", tp_group=group,
+                                 parallel_groups=groups, **kwargs)
+            torch.save({"float32": logits}, out)
         finally:
             T.close_gloo_tp_rank(group)
         return
@@ -229,9 +244,8 @@ def _tp2_rank(rank: int, args, port: int, snapshot: str) -> None:
 
     code = 0
     try:
-        out = {dtype: _engine_run(snapshot, ids, PROMPT, getattr(torch, dtype), f"cuda:{rank}", tp_group=group,
-                                  parallel_groups=groups) for dtype in ("float32", "bfloat16")}
-        torch.save(out, f"{args.out}.rank{rank}")
+        torch.save({dtype: _engine_run(snapshot, ids, PROMPT, getattr(torch, dtype), f"cuda:{rank}", tp_group=group,
+                                       parallel_groups=groups, **kwargs) for dtype in ("float32", "bfloat16")}, out)
     except BaseException:
         traceback.print_exc()
         code = 1
@@ -245,23 +259,23 @@ def mode_tp2(args) -> dict:
     from mstar.model.deepseek_v41.config import DeepseekV41Config
 
     cuda = args.engine_device.startswith("cuda")
-    with socket.socket() as s:
-        s.bind(("127.0.0.1", 0))
-        port = s.getsockname()[1]
     rows: dict[str, dict] = {}
     with tempfile.TemporaryDirectory() as tmp:
         snapshot = str(Path(tmp) / "snap")
         config, _ = T.write_snapshot(snapshot, DeepseekV41Config.reduced(**TP2), seed=0)
         ids = T.random_ids(config, PROMPT + STEPS, seed=1)
-        mp.spawn(_tp2_rank, args=(args, port, snapshot), nprocs=2)
-        r0, r1 = (torch.load(f"{args.out}.rank{rank}") for rank in (0, 1))
-        if not cuda:
-            r0, r1 = {"float32": r0}, {"float32": r1}
-        for dtype, got in r0.items():
-            one = _engine_run(snapshot, ids, PROMPT, getattr(torch, dtype), "cuda:0" if cuda else "cpu")
-            rows[f"{dtype}/tp2-vs-tp1"] = {
-                "ranks_equal": bool(torch.equal(got, r1[dtype])), "gap": T.logit_gap(got, one),
-                "argmax_equal_steps": int((got.argmax(-1) == one.argmax(-1)).sum()), "steps": got.shape[0]}
+        one = {dtype: _engine_run(snapshot, ids, PROMPT, getattr(torch, dtype), "cuda:0" if cuda else "cpu")
+               for dtype in (("float32", "bfloat16") if cuda else ("float32",))}
+        for run, _, _ in TP2_RUNS:
+            with socket.socket() as s:
+                s.bind(("127.0.0.1", 0))
+                port = s.getsockname()[1]
+            mp.spawn(_tp2_rank, args=(args, port, snapshot, run), nprocs=2)
+            r0, r1 = (torch.load(f"{args.out}.{run}.rank{rank}") for rank in (0, 1))
+            for dtype, got in r0.items():
+                rows[f"{dtype}/{run}/tp2-vs-tp1"] = {
+                    "ranks_equal": bool(torch.equal(got, r1[dtype])), "gap": T.logit_gap(got, one[dtype]),
+                    "argmax_equal_steps": int((got.argmax(-1) == one[dtype].argmax(-1)).sum()), "steps": got.shape[0]}
     return rows
 
 
