@@ -1292,6 +1292,7 @@ class _StopError(Exception):
 
 def _config(monkeypatch, tmp_path, text="model: fake\n") -> str:
     """A config for a model that needs nothing to build."""
+    from mstar.api_server import rust_frontend
     from mstar.model import registry
 
     class _Model:
@@ -1302,6 +1303,8 @@ def _config(monkeypatch, tmp_path, text="model: fake\n") -> str:
 
     cfg = tmp_path / "cfg.yaml"
     cfg.write_text(text)
+    # main() resolves the binary before loading anything; CI builds none.
+    monkeypatch.setattr(rust_frontend, "find_server_binary", lambda explicit=None: "mstar-server")
     monkeypatch.setattr(registry, "get_model_class", lambda name: _Model)
     monkeypatch.setattr(entrypoint, "model_init_kwargs", lambda name: {})
     # sizing torch's pool would outlive the test in this process
@@ -1328,12 +1331,17 @@ def _main_until_api_server(monkeypatch, tmp_path, *argv):
 
 def test_metrics_start_after_the_warmup_requests_and_before_the_bind(monkeypatch, tmp_path):
     """Warmups compile first shapes; counting them would fill the latency
-    histograms with startup time."""
+    histograms with startup time. The bind is mstar-server's launch."""
+    from mstar.api_server import rust_frontend
+
     events = []
 
     class _Server:
         fatal_error = None
         model_config: dict = {}
+        model = None
+        served_models = openpi_policy = None
+        client_streams = frozenset()
 
         def __init__(self, **kwargs):
             pass
@@ -1356,6 +1364,58 @@ def test_metrics_start_after_the_warmup_requests_and_before_the_bind(monkeypatch
         def start(self):
             pass
 
+    def launch(*args, **kwargs):
+        events.append("bind")
+        raise _StopError
+
+    cfg = _config(monkeypatch, tmp_path, "model: fake\nwarmup_requests:\n  - text: hi\n")
+    # main() assigns the module's api_server; drop it for the tests after this one.
+    monkeypatch.setattr(entrypoint, "api_server", None, raising=False)
+    monkeypatch.setattr(entrypoint, "MISSING_DEPENDENCY", None)
+    monkeypatch.setattr(entrypoint, "APIServer", _Server)
+    monkeypatch.setattr(entrypoint.mp, "get_context",
+                        lambda method: types.SimpleNamespace(Process=lambda **kw: _Conductor()))
+    monkeypatch.setattr(entrypoint, "_data_parallel_replicas",
+                        lambda model, config_path: entrypoint.DataParallelReplicas(1, 1))
+    monkeypatch.setattr(entrypoint, "_run_warmup_requests",
+                        lambda server, specs, replicas, **kw: events.append("warmup"))
+    for facts in ("transcription_facts", "openpi_facts", "realtime_facts"):
+        monkeypatch.setattr(rust_frontend, facts, lambda *a, **k: None)
+    monkeypatch.setattr(rust_frontend, "launch_rust_server", launch)
+    monkeypatch.setattr(entrypoint, "_shutdown_conductor_process", lambda proc: None)
+
+    with pytest.raises(_StopError):
+        entrypoint.main(["--config", cfg, "--enable-metrics"])
+
+    assert events == ["setup", "warmup", "metrics", "bind"]
+
+
+def test_python_frontend_serves_from_uvicorn_without_mstar_server(monkeypatch, tmp_path):
+    """``--python-frontend`` binds uvicorn, after the warmups and metrics as
+    mstar-server is, and never looks for an mstar-server build."""
+    from mstar.api_server import rust_frontend
+
+    events = []
+
+    class _Server:
+        fatal_error = None
+        model_config: dict = {}
+
+        def __init__(self, **kwargs):
+            pass
+
+        def finalize_setup(self):
+            events.append("setup")
+
+        def enable_metrics(self):
+            events.append("metrics")
+
+        def set_on_fatal(self, callback):
+            pass
+
+        def cleanup(self):
+            pass
+
     class _Uvicorn:
         started = True
 
@@ -1365,13 +1425,17 @@ def test_metrics_start_after_the_warmup_requests_and_before_the_bind(monkeypatch
         def run(self):
             events.append("bind")
 
+    def no_binary(explicit=None):
+        raise AssertionError("--python-frontend looked for mstar-server")
+
     cfg = _config(monkeypatch, tmp_path, "model: fake\nwarmup_requests:\n  - text: hi\n")
-    # main() assigns the module's api_server; restore it for the tests after this one.
-    monkeypatch.setattr(entrypoint, "api_server", entrypoint.api_server)
+    monkeypatch.setattr(rust_frontend, "find_server_binary", no_binary)
+    monkeypatch.setattr(entrypoint, "api_server", None, raising=False)
     monkeypatch.setattr(entrypoint, "MISSING_DEPENDENCY", None)
     monkeypatch.setattr(entrypoint, "APIServer", _Server)
     monkeypatch.setattr(entrypoint.mp, "get_context",
-                        lambda method: types.SimpleNamespace(Process=lambda **kw: _Conductor()))
+                        lambda method: types.SimpleNamespace(Process=lambda **kw: types.SimpleNamespace(
+                            pid=1, start=lambda: None)))
     monkeypatch.setattr(entrypoint, "_data_parallel_replicas",
                         lambda model, config_path: entrypoint.DataParallelReplicas(1, 1))
     monkeypatch.setattr(entrypoint, "_run_warmup_requests",
@@ -1380,9 +1444,105 @@ def test_metrics_start_after_the_warmup_requests_and_before_the_bind(monkeypatch
     monkeypatch.setattr(entrypoint.ws_frames, "start", lambda: None)
     monkeypatch.setattr(entrypoint, "_shutdown_conductor_process", lambda proc: None)
 
-    entrypoint.main(["--config", cfg, "--enable-metrics"])
+    entrypoint.main(["--config", cfg, "--enable-metrics", "--python-frontend"])
 
     assert events == ["setup", "warmup", "metrics", "bind"]
+
+
+@pytest.mark.parametrize("extra", [["--rust-frontend"], ["--rust-frontend-bin", "/x/mstar-server"]])
+def test_python_frontend_takes_no_mstar_server_flags(monkeypatch, tmp_path, extra):
+    cfg = _config(monkeypatch, tmp_path)
+    with pytest.raises(SystemExit) as exited:
+        entrypoint.main(["--config", cfg, "--python-frontend", *extra])
+    assert exited.value.code == 2
+
+
+def _serve_against(monkeypatch, tmp_path, server_code: str, bridge_runs: bool):
+    """Run ``mstar serve`` with a fake model and bridge, and ``server_code`` as
+    mstar-server. With ``bridge_runs`` the bridge runs until it is stopped;
+    otherwise it returns at once, as it does on a SIGINT. Returns the
+    mstar-server process and the exit code of ``main`` (None when it returned)."""
+    import subprocess
+    import sys
+    import threading
+
+    from mstar.api_server import rust_frontend
+
+    class _Server:
+        fatal_error = None
+        model_config: dict = {}
+        model = None
+        served_models = openpi_policy = None
+        client_streams = frozenset()
+
+        def __init__(self, **kwargs):
+            pass
+
+        def finalize_setup(self):
+            pass
+
+        def set_on_fatal(self, callback):
+            pass
+
+        def cleanup(self):
+            pass
+
+    class _Bridge:
+        def __init__(self, server, bridge_dir):
+            self.stopped = threading.Event()
+
+        def run(self, frontend=None):
+            if bridge_runs:
+                assert self.stopped.wait(timeout=30), "the bridge was never stopped"
+
+        def stop(self):
+            self.stopped.set()
+
+    procs = []
+
+    def launch(*args, **kwargs):
+        procs.append(subprocess.Popen([sys.executable, "-c", server_code], stdout=subprocess.PIPE, text=True))
+        procs[0].stdout.readline()  # up, with its signal handler in place
+        return procs[0]
+
+    cfg = _config(monkeypatch, tmp_path)
+    monkeypatch.setattr(entrypoint, "api_server", None, raising=False)
+    monkeypatch.setattr(entrypoint, "MISSING_DEPENDENCY", None)
+    monkeypatch.setattr(entrypoint, "APIServer", _Server)
+    monkeypatch.setattr(entrypoint.mp, "get_context",
+                        lambda method: types.SimpleNamespace(Process=lambda **kw: types.SimpleNamespace(
+                            pid=1, start=lambda: None)))
+    for facts in ("transcription_facts", "openpi_facts", "realtime_facts"):
+        monkeypatch.setattr(rust_frontend, facts, lambda *a, **k: None)
+    monkeypatch.setattr(rust_frontend, "launch_rust_server", launch)
+    monkeypatch.setattr(rust_frontend, "RustFrontendBridge", _Bridge)
+    monkeypatch.setattr(entrypoint, "_shutdown_conductor_process", lambda proc: None)
+
+    try:
+        entrypoint.main(["--config", cfg])
+    except SystemExit as exited:
+        return procs[0], exited.code
+    return procs[0], None
+
+
+@pytest.mark.parametrize("server_exit, main_exit", [(101, 3), (0, None)], ids=["crashed", "stopped"])
+def test_mstar_serve_stops_when_mstar_server_exits(monkeypatch, tmp_path, server_exit, main_exit):
+    """A crash, a kill or a lost port ends mstar-server; the bridge then stops
+    and ``mstar serve`` exits 3. mstar-server exits 0 when a signal stops it."""
+    _, code = _serve_against(monkeypatch, tmp_path, f"print(flush=True); raise SystemExit({server_exit})",
+                             bridge_runs=True)
+    assert code == main_exit
+
+
+def test_mstar_serve_exits_after_mstar_server(monkeypatch, tmp_path):
+    """mstar-server drains on SIGTERM; ``mstar serve`` waits for it to exit."""
+    draining = ("import signal, sys, time\n"
+                "signal.signal(signal.SIGTERM, lambda *a: (time.sleep(0.5), sys.exit(0)))\n"
+                "print(flush=True)\n"
+                "time.sleep(30)\n")
+    proc, code = _serve_against(monkeypatch, tmp_path, draining, bridge_runs=False)
+    assert code is None
+    assert proc.poll() == 0
 
 
 def _conductor_spawn_kwargs(monkeypatch, tmp_path, *argv) -> dict:
