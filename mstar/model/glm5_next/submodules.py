@@ -325,6 +325,10 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
             state[MTP_SEED] = ArrayStep()
         return SubmoduleStep(segments=segments, state=state)
 
+    def step_is_input_free(self, graph_walk: str) -> bool:
+        # every decode row spans one block, as the capture's template row does, and declares nothing else
+        return graph_walk == "decode"
+
     def preprocess(
         self,
         graph_walk: str,
