@@ -33,6 +33,7 @@ from mstar.model.cosmos3.config import Cosmos3Config
 from mstar.model.cosmos3.tests.test_engine_cache import (
     _engine_resources,
     _forward_step,
+    _prompt_md,
     _SdpaResources,
 )
 
@@ -341,14 +342,16 @@ def test_action_engine_matches_fused() -> None:
                                   use_system_prompt=False, add_resolution_template=False,
                                   add_duration_template=False)
     rid = "ra"
-    md = {"height": h, "width": w, "num_frames": nf, "fps": fps, "action_fps": fps, "guidance_scale": 1.0,
-          "num_inference_steps": steps, "action_mode": "inverse_dynamics", "action_chunk_size": chunk,
-          "raw_action_dim": raw, "domain_id": dom, "flow_shift": fshift}
+    md = _prompt_md(
+        model, cond_ids, [], height=h, width=w, num_frames=nf, fps=fps, action_fps=fps, guidance_scale=1.0,
+        num_inference_steps=steps, action_mode="inverse_dynamics", action_chunk_size=chunk, raw_action_dim=raw,
+        domain_id=dom, flow_shift=fshift,
+    )
     fwd = CurrentForwardPassInfo(request_id=rid, rid_handle=rid, graph_walk="prefill", fwd_index=0,
                                  random_seed=0, max_tokens=0, step_metadata=md)
     resources = _SdpaResources().as_dict()
     ni = dit.prepare_inputs("prefill", fwd, {"text_inputs": [torch.tensor(cond_ids, dtype=torch.long, device=device)]})
-    _forward_step(dit, "prefill", resources, [rid], {rid: fwd}, [ni])
+    _forward_step(model, dit, "prefill", resources, [rid], {rid: fwd}, [ni])
     fwd.graph_walk = "action_gen"
     latents, action_latents = cond_latent.to(LATENT_DTYPE), a_noise.clone()
     solver = initial_state(dit._packed(latents, action_latents))
@@ -356,7 +359,7 @@ def test_action_engine_matches_fused() -> None:
         fwd.dynamic_loop_iter_counts["action_gen_loop"] = k
         ni = dit.prepare_inputs("action_gen", fwd, {
             "latents": [latents], "action_latents": [action_latents], **{n: [t] for n, t in solver.items()}})
-        out = _forward_step(dit, "action_gen", resources, [rid], {rid: fwd}, [ni])
+        out = _forward_step(model, dit, "action_gen", resources, [rid], {rid: fwd}, [ni])
         latents, action_latents = out["latents"][0], out["action_latents"][0]
         solver = {n: out[n][0] for n in solver}
     dit.cleanup_request(rid)
@@ -539,11 +542,11 @@ def test_action_cross_request_batch_matches_individual() -> None:
     def _prefill(rid, idx, resources):
         fwd = CurrentForwardPassInfo(
             request_id=rid, rid_handle=rid, graph_walk="prefill", fwd_index=0,
-            random_seed=seeds[idx], max_tokens=0, step_metadata=_md())
+            random_seed=seeds[idx], max_tokens=0, step_metadata=_prompt_md(model, conds[idx], [], **_md()))
         ni = dit.prepare_inputs("prefill", fwd, {
             "text_inputs": [torch.tensor(conds[idx], dtype=torch.long, device=device)],
         })
-        _forward_step(dit, "prefill", resources, [rid], {rid: fwd}, [ni])
+        _forward_step(model, dit, "prefill", resources, [rid], {rid: fwd}, [ni])
         fwd.graph_walk = "action_gen"
         if rid not in cond_lat:
             cond_lat[rid] = _encode(rid)
@@ -561,9 +564,7 @@ def test_action_cross_request_batch_matches_individual() -> None:
             inp = ({"cond_latents": [cond_lat[rid]]} if lat is None
                    else {"latents": [lat], "action_latents": [act], **{n: [t] for n, t in solver.items()}})
             ni = dit.prepare_inputs("action_gen", fwd, inp)
-            out = _forward_step(
-                dit, "action_gen", resources, [rid], {rid: fwd}, [ni],
-            )
+            out = _forward_step(model, dit, "action_gen", resources, [rid], {rid: fwd}, [ni])
             lat, act = out["latents"][0], out["action_latents"][0]
             solver = {n: out[n][0] for n in SOLVER_STATE}
         dit.cleanup_request(rid)
@@ -588,9 +589,7 @@ def test_action_cross_request_batch_matches_individual() -> None:
                     **{n: [t] for n, t in solver[rid].items()},
                 }
                 inputs.append(dit.prepare_inputs("action_gen", fwds[rid], inp))
-            out = _forward_step(
-                dit, "action_gen", resources, rids, fwds, inputs, batched=True,
-            )
+            out = _forward_step(model, dit, "action_gen", resources, rids, fwds, inputs, batched=True)
             for rid in rids:
                 o = out[rid]
                 lat[rid], act[rid] = o["latents"][0], o["action_latents"][0]

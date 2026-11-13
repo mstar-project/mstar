@@ -977,9 +977,10 @@ class RetentionPolicy:
     generation): once the committed tokens behind ``protected_prefix`` exceed
     ``context_budget``, the oldest unprotected pages are released.
 
-    A committing step declares it for its stream on ``KVStep.retention`` and
-    ``KVManager.commit`` applies it, so the release happens between steps as
-    far as every planner is concerned: a pre-plan of the next step gates on
+    ``KVManager.commit`` applies it, a request layout's exact one to its
+    stream (``LabelLayout.retention``) and a window group's to the group's
+    layers, so the release happens between steps as far as every planner is
+    concerned: a pre-plan of the next step gates on
     this commit and sees the compacted stream. Whole pages only (the page
     straddling the prefix boundary and a partial tail page stay), so the
     realized context can run over the budget by up to a page; the excess is
@@ -1113,10 +1114,6 @@ class KVStep(ResourceStep):
     fork_rids: frozenset | None = None
     # (request_id, label) pairs that run against SINK_PAGE and hold no pages
     sink: frozenset[tuple[str, str]] = frozenset()
-    # (request_id, label) -> the retention a committing stream declares for
-    # itself this step, applied at commit. It rides with the step rather than
-    # living on the stream, so an offload has nothing to lose.
-    retention: Mapping[tuple[str, str], RetentionPolicy] = field(default_factory=dict)
     # Set by the manager when the step commits, while copies to the host are on: its count of commits so far.
     # The submodule doesn't declare it, as it doesn't declare `SubmoduleStep`'s context.
     commits: int = field(default=0, init=False, compare=False, repr=False)

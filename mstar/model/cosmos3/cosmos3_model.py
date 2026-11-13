@@ -55,30 +55,34 @@ from __future__ import annotations
 
 import logging
 import math
+from collections.abc import Mapping
 from pathlib import Path
+from typing import Any
 
 import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import PartitionDefinition
 from mstar.distributed.base import ShardingConfig
-from mstar.engine.resources import (
-    AttentionConfig,
-    AttentionSpec,
-    AttnBackend,
-    KVReqConfig,
-    KVSpec,
-    NodeResourceSpec,
-    PagedKVConfig,
-    PositionConfig,
-    PositionSpec,
-    ResourceReqConfig,
-    SamplerSpec,
-    SamplingReqConfig,
-    SeqShardSpec,
-)
-from mstar.engine.resources.attn.ragged.config import RaggedAttentionConfig, RaggedAttentionSpec, RaggedAttnBackend
+from mstar.engine.resources.attn.ragged.config import RaggedAttnBackend
 from mstar.engine.resources.spec import CombinedSplit
+from mstar.engine.state import (
+    Array,
+    Attend,
+    Bidirectional,
+    Block,
+    Causal,
+    Entry,
+    KeptWindow,
+    KVEntry,
+    Layout,
+    Positions,
+    Read,
+    Sampler,
+    SampleSettings,
+    SeqShard,
+    Value,
+)
 from mstar.engine.windowing import WindowSchedule
 from mstar.graph.base import (
     GraphEdge,
@@ -90,7 +94,7 @@ from mstar.graph.base import (
     TensorPointerInfo,
 )
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.base import KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, WalkStep
+from mstar.model.base import KVLabel, Model, ProcessPromptOutput, Span, WalkStep
 from mstar.model.components.diffusion.unipc import SOLVER_STATE
 from mstar.model.components.mrope import layout_extent
 from mstar.model.components.video_encode import encode_mp4
@@ -103,6 +107,7 @@ from mstar.model.cosmos3.components.packing import (
     resolve_action_domain_id,
 )
 from mstar.model.cosmos3.config import Cosmos3Config
+from mstar.model.cosmos3.constants import KV_CACHE, SEQ_SHARD, VISION_TOKENS
 from mstar.model.cosmos3.submodules import (
     ACTION_GEN_LOOP,
     ACTION_VIDEO_GEN_LOOP,
@@ -115,19 +120,20 @@ from mstar.model.cosmos3.submodules import (
     DECODE_SENT,
     DECODE_TAIL,
     DENOISE_LOOP_FOR_WALK,
-    GEN_WALKS,
     IMAGE_GEN_LOOP,
-    KV_CACHE,
+    PREFILL_WALKS,
+    PROGRESS,
     REASONER_DECODE_LOOP,
     REASONER_LABEL,
     SAMPLER,
-    SEQ_SHARD,
+    SESSION_TAIL,
     SOUND_WALKS,
     UNCOND_LABEL,
     VIDEO_DECODE_AR_LOOP,
     VIDEO_GEN_AR_LOOP,
     VIDEO_GEN_LOOP,
     VIDEO_SOUND_GEN_LOOP,
+    WINDOW_COND,
     Cosmos3AudioDecoderSubmodule,
     Cosmos3DiTSubmodule,
     Cosmos3ReasonerSubmodule,
@@ -139,7 +145,7 @@ from mstar.model.cosmos3.submodules import (
     latent_frames,
     sound_frames,
 )
-from mstar.model.keys import MIXED, ROPE, VISION_ATTN
+from mstar.model.keys import MIXED, VISION_ATTN
 from mstar.model.media_limits import UndecodableMediaError, VideoBudget
 from mstar.model.multimodal import (
     MEDIA_LAYOUT,
@@ -263,10 +269,12 @@ class Cosmos3Model(Model):
     # {denoise loop: iterations}, settled by process_prompt, which alone sees
     # the output modality that picks the loop and its step count
     DENOISE_CAP = "denoise_cap"
+    # each guidance branch's prompt length, which the denoise steps' statics are built for
+    PROMPT_LENGTHS = constants.PROMPT_LENGTHS
     # and the width of a policy request's robot_state, which process_prompt
     # hands the conductor (the values themselves ride the action_inputs edge),
     # and a reasoner prompt's media layout
-    INTERNAL_KWARGS = (DENOISE_CAP, "robot_state_dim", "action_shape", MEDIA_LAYOUT)
+    INTERNAL_KWARGS = (DENOISE_CAP, PROMPT_LENGTHS, "robot_state_dim", "action_shape", MEDIA_LAYOUT)
 
     PREFILL_WALK = constants.PREFILL_WALK
     PREFILL_COND_WALK = constants.PREFILL_COND_WALK
@@ -397,96 +405,89 @@ class Cosmos3Model(Model):
     # Model ABC: structure
     # ------------------------------------------------------------------
 
-    def _reasoner_sampler_spec(self) -> SamplerSpec:
-        """The reasoner's sampler; its min-p filter is on when the checkpoint
-        defaults min_p, so that default is not refused."""
-        return SamplerSpec(
-            resource_key=SAMPLER, nodes={REASONER_NODE},
-            vocab_size=self.config.vocab_size,
-            enable_repetition_penalty=True,
-            enable_min_p=bool(getattr(self, "_generation_defaults", {}).get("min_p")),
-        )
+    def declare_state(self) -> list[Array | Sampler | SeqShard]:
+        """One pool holds every guidance branch's text K/V under its own label, and the reasoner's beside them: the
+        reasoner is the DiT's understanding pathway run as a text model. Prefills and the reasoner read it causally,
+        generation steps bidirectionally, through the window a windowed deployment keeps. ``PROGRESS`` holds where a
+        request's draws stand between steps.
 
-    def get_node_resources(self) -> list[NodeResourceSpec]:
-        """The DiT's KV cache and the attention backends over it.
-
-        One cache holds every guidance branch's understanding K/V under its
-        own label. Attention is declared twice because the two pathways want
-        different backends and the choice cannot be per-layer:
-
-        * ``attn`` (paged FlashInfer) is what the understanding tower's
-          prefill writes through — the denoise steps read that K/V back out of
-          the pages, so it has to land there — and what a captured denoise
-          graph replays against, the dense path being eager-only.
-        * ``attn_gen`` (dense FA3) is what an eager denoise step runs: it
-          recomputes all of its K/V every step and only reuses the frozen text
-          prefix, so the paged path's per-step full-buffer write and
-          ``wrapper.plan`` are dead work. ``declare_step`` names one or the
-          other per step; both are drop-in for the same declaration.
-
-        ``attention_backend="flashinfer"`` skips the dense spec, which leaves
-        every step on the paged path.
-
-        On SP ranks the sequence shard splits a generation step's tokens
-        (each guidance branch's, or the batched pack's) over them; the
-        attentions trade them for heads around the kernel, the pool storing
-        K/V by head. Prefills and the reasoner's steps run whole on each rank.
-
-        The two specs share one ``PagedKVConfig`` object on purpose: a deployment
-        that resizes the cache through ``apply_yaml_overrides`` has to resize
-        what the wrappers are planned against too.
-        """
-        kv_config = PagedKVConfig(
-            num_layers=self.config.num_hidden_layers,
-            num_kv_heads=self.config.num_key_value_heads,
-            head_dim=self.config.head_dim,
-            max_seq_len=self.config.max_position_embeddings,
-            num_qo_heads=self.config.num_attention_heads,
-        )
-        # The reasoner is the same transformer (the DiT's understanding
-        # pathway) run as a text model, so it shares the pool and the paged
-        # backend; only its sampler is its own.
-        kv_nodes = {DIT_NODE, REASONER_NODE} if self._reasoner_enabled() else {DIT_NODE}
-        specs: list[NodeResourceSpec] = [
-            KVSpec(resource_key=KV_CACHE, nodes=kv_nodes, config=kv_config),
-            AttentionSpec(
-                resource_key=ATTN,
-                nodes=kv_nodes,
-                config=AttentionConfig(
-                    kv_cache=KV_CACHE, backend=AttnBackend.AUTO,
-                    # only the reasoner runs mixed (prompt + decode) steps
-                    splits=(REASONER_MIXED_SPLIT,) if self._reasoner_enabled() else (),
-                ),
+        On SP ranks the sequence shard splits a generation step's tokens over them. Prefills and the reasoner's steps
+        run whole on each rank."""
+        c = self.config
+        reasoner = self._reasoner_enabled()
+        kv_nodes = {DIT_NODE, REASONER_NODE} if reasoner else {DIT_NODE}
+        und_walks = {*PREFILL_WALKS, *(self._reasoner_walks() if reasoner else ())}
+        gen_walks = {self.IMAGE_GEN_WALK, self.VIDEO_GEN_WALK, *ACTION_WALKS}
+        if self._sound_serving_enabled():
+            gen_walks.update(SOUND_WALKS)
+        if self._windowed_serving_enabled():
+            gen_walks.add(self.VIDEO_GEN_AR_WALK)
+        attend = Attend(q_heads=c.num_attention_heads)
+        state: list[Array | Sampler | SeqShard] = [
+            Array(
+                KV_CACHE, nodes=kv_nodes, layers=frozenset(range(c.num_hidden_layers)),
+                entry=KVEntry(heads=c.num_key_value_heads, head_dim=c.head_dim), max_len=c.max_position_embeddings,
+                labels={COND_LABEL, UNCOND_LABEL},
+                reads={
+                    ATTN: Read(mask=Causal(), op=attend, walks=und_walks),
+                    ATTN_GEN: Read(
+                        mask=Bidirectional(kept_window=self._windowed_serving_enabled()), op=attend, walks=gen_walks,
+                    ),
+                },
+                # the reasoner's counter, which its layers turn into 3D mRoPE themselves
+                positions=Positions() if reasoner else None,
             ),
-            # over every node of the pool: the attentions over it depend on it
-            SeqShardSpec(
-                resource_key=SEQ_SHARD, nodes=kv_nodes, labels=(COND_LABEL, UNCOND_LABEL), axis=0,
-                walks=(*GEN_WALKS, *SOUND_WALKS, *ACTION_WALKS),
-            ),
+            Value(PROGRESS, nodes={DIT_NODE}, layers=frozenset({0}), entry=Entry({}, host={"rng": bytes})),
+            SeqShard(SEQ_SHARD, nodes=kv_nodes, labels={COND_LABEL, UNCOND_LABEL}, walks=gen_walks),
         ]
-        if self._reasoner_enabled():
-            specs.append(self._reasoner_sampler_spec())
-            # The reasoner's position counter. Its layers apply the 3D mRoPE
-            # themselves, from these positions or a media prompt's own.
-            specs.append(PositionSpec(
-                resource_key=ROPE, nodes={REASONER_NODE}, config=PositionConfig(kv_cache=KV_CACHE),
-            ))
-            specs.append(self._vision_attention_spec())
-        if self.config.attention_backend == "dense_gen":
-            specs.append(AttentionSpec(
-                resource_key=ATTN_GEN,
-                nodes={DIT_NODE},
-                config=AttentionConfig(
-                    kv_cache=KV_CACHE, backend=AttnBackend.DENSE,
+        if reasoner:
+            vision = c.reasoner.vision
+            heads = vision.num_attention_heads
+            state += [
+                # its min-p filter is on when the checkpoint defaults min_p, so that default is not refused
+                Sampler(
+                    SAMPLER, nodes={REASONER_NODE}, vocab_size=c.vocab_size, penalty=True,
+                    min_p=bool(getattr(self, "_generation_defaults", {}).get("min_p")),
                 ),
-            ))
-        elif self.config.attention_backend != "flashinfer":
+                Array(
+                    VISION_TOKENS, nodes={VISION_ENCODER_NODE}, layers=frozenset(range(vision.num_hidden_layers)),
+                    entry=KVEntry(heads=heads, head_dim=vision.hidden_size // heads), max_len=0,
+                    reads={VISION_ATTN: Read(mask=Block(), op=Attend(q_heads=heads))},
+                ),
+            ]
+        return state
+
+    def kernel_settings(self) -> dict[str, dict[str, Any]]:
+        """With ``attention_backend: dense_gen`` an eager generation step runs the dense kernel: it recomputes all of
+        its K/V every step and reuses only the kept text, so the paged kernel's page write and plan are dead work.
+        ``flashinfer`` leaves every step on the paged kernel."""
+        c = self.config
+        if c.attention_backend not in ("dense_gen", "flashinfer"):
             raise ValueError(
-                f"Unknown Cosmos3 attention_backend "
-                f"{self.config.attention_backend!r} "
-                "(expected 'dense_gen' or 'flashinfer')"
+                f"Unknown Cosmos3 attention_backend {c.attention_backend!r} (expected 'dense_gen' or 'flashinfer')"
             )
-        return specs
+        settings: dict[str, dict[str, Any]] = {}
+        if c.attention_backend == "dense_gen":
+            settings[ATTN_GEN] = {"eager_backend": "dense"}
+        if self._reasoner_enabled():
+            from mstar.model.cosmos3.submodules import Cosmos3VisionEncoderSubmodule
+
+            reasoner = c.reasoner
+            # the smallest frame the processors make bounds a replay's segments
+            min_patches = min(
+                reasoner.image_processor.min_pixels, reasoner.video_processor.min_pixels,
+            ) // reasoner.vision.patch_size ** 2
+            # only the reasoner runs mixed (prompt + decode) steps
+            settings[ATTN] = {"splits": (REASONER_MIXED_SPLIT,)}
+            settings[VISION_ATTN] = {
+                "max_segments_per_step": (
+                    Cosmos3VisionEncoderSubmodule.BLOCK_LOOP_PATCH_BUCKETS[-1] // max(min_patches, 1)
+                ),
+                # FA3 varlen takes head_dim 72 as it is; FlashInfer pads it to 128 (three pads, a zero fill and a
+                # slice a layer). Falls back to FlashInfer where FA3 can't load.
+                "backend": RaggedAttnBackend.DENSE,
+            }
+        return settings
 
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
         uncond = KVLabel()
@@ -494,30 +495,6 @@ class Cosmos3Model(Model):
             return {KV_CACHE: {COND_LABEL: uncond, UNCOND_LABEL: uncond}}
         main = KVLabel(growth=((self.REASONER_DECODE_WALK, REASONER_DECODE_LOOP),))
         return {KV_CACHE: {COND_LABEL: main, UNCOND_LABEL: uncond}}
-
-    def _vision_attention_spec(self) -> RaggedAttentionSpec:
-        """The vision tower's attention, a segment per image or video frame."""
-        from mstar.model.cosmos3.submodules import Cosmos3VisionEncoderSubmodule
-
-        reasoner = self.config.reasoner
-        vision = reasoner.vision
-        # the smallest frame the processors make bounds a replay's segments
-        min_patches = min(
-            reasoner.image_processor.min_pixels, reasoner.video_processor.min_pixels,
-        ) // vision.patch_size ** 2
-        return RaggedAttentionSpec(
-            resource_key=VISION_ATTN, nodes={VISION_ENCODER_NODE},
-            config=RaggedAttentionConfig(
-                num_qo_heads=vision.num_attention_heads,
-                num_kv_heads=vision.num_attention_heads,
-                head_dim=vision.hidden_size // vision.num_attention_heads,
-                max_segments_per_step=Cosmos3VisionEncoderSubmodule.BLOCK_LOOP_PATCH_BUCKETS[-1] // max(min_patches, 1),
-                # FA3 varlen takes head_dim 72 as it is; FlashInfer pads it to 128
-                # (three pads, a zero fill and a slice a layer). Falls back to
-                # FlashInfer where FA3 can't load.
-                backend=RaggedAttnBackend.DENSE,
-            ),
-        )
 
     def get_combined_graph_walks(self) -> dict[str, dict[str, set[str]]]:
         # the reasoner's text and media prompt rows share steps with its decode rows
@@ -546,62 +523,27 @@ class Cosmos3Model(Model):
 
     def get_request_resource_configs(
         self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
-    ) -> dict[str, ResourceReqConfig]:
-        """Which cache labels a request is opened with.
+    ) -> dict[str, SampleSettings]:
+        """A text request's sampling, on the reasoner. The labels a request opens come from its layout."""
+        if "text" not in output_modalities:
+            return {}
+        return {SAMPLER: self._sample_settings(model_kwargs or {})}
 
-        Both guidance branches, unconditionally: a request's guidance regime
-        is only settled at prefill (it follows ``guidance_scale``, which
-        ``process_prompt`` resolves), and naming a label a request never
-        writes costs nothing — labels are created on first write.
-        """
-        mk = model_kwargs or {}
-        # a text request decodes on the reasoner, every other generates media
-        if "text" in output_modalities:
-            sampling = self.get_sampling_config(REASONER_NODE, mk)
-            return {
-                KV_CACHE: KVReqConfig(needed_labels=[REASONER_LABEL]),
-                SAMPLER: SamplingReqConfig(
-                    temperature=sampling.temperature, top_k=sampling.top_k,
-                    top_p=sampling.top_p, min_p=sampling.min_p,
-                    repetition_penalty=sampling.repetition_penalty,
-                    penalize_prompt=sampling.penalize_prompt, ignore_eos=sampling.ignore_eos,
-                ),
-            }
-        return {
-            KV_CACHE: KVReqConfig(needed_labels=[COND_LABEL, UNCOND_LABEL]),
-        }
-
-    def get_sampling_config(self, node_name: str, model_kwargs: dict | None = None):
+    def _sample_settings(self, mk: dict) -> SampleSettings:
         """The reasoner's sampling knobs: OpenAI-standard ``temperature`` /
         ``top_p`` plus ``top_k`` / ``min_p`` / ``repetition_penalty`` /
         ``penalize_prompt`` / ``ignore_eos`` from ``extra_body``. A knob the
         request leaves unset takes the checkpoint's ``generation_config.json``
         value, then the config's. Values pass through unconverted; the
         sampler's ``validate`` refuses a wrong type or range."""
-        from mstar.engine.resources.sampler.utils import SamplingConfig
-
-        mk = model_kwargs or {}
         defaults = {
             "temperature": self.config.reasoner_temperature, "top_k": 0, "top_p": 1.0,
             "min_p": 0.0, "repetition_penalty": 1.0,
             **getattr(self, "_generation_defaults", {}),
             "penalize_prompt": True, "ignore_eos": False,
         }
-
-        def pick(key):
-            value = mk.get(key)
-            return defaults[key] if value is None else value
-
-        return SamplingConfig(
-            vocab_size=self.config.vocab_size,
-            temperature=pick("temperature"),
-            top_k=pick("top_k"),
-            top_p=pick("top_p"),
-            min_p=pick("min_p"),
-            repetition_penalty=pick("repetition_penalty"),
-            penalize_prompt=pick("penalize_prompt"),
-            ignore_eos=pick("ignore_eos"),
-        )
+        knobs = ("temperature", "top_k", "top_p", "min_p", "repetition_penalty", "penalize_prompt", "ignore_eos")
+        return SampleSettings(**{key: defaults[key] if mk.get(key) is None else mk[key] for key in knobs})
 
     def request_kwargs(self) -> frozenset[str]:
         """Every request key this model reads, adapter-mapped ones included."""
@@ -788,14 +730,16 @@ class Cosmos3Model(Model):
 
         # action_gen: like image_gen but the loop body jointly denoises the video
         # and action latents (threaded as two self-edges), and the predicted
-        # action — not a decoded video — is what the request emits.
+        # action — not a decoded video — is what the request emits. The
+        # request's clean action or robot state enters as ``action_inputs``, an
+        # external input like ``cond_latents``.
         action_gen = Sequential(
             [
                 Loop(
                     name=ACTION_GEN_LOOP,
                     section=GraphNode(
                         name=DIT_NODE,
-                        input_names=self._denoise_inputs("latents", "action_latents"),
+                        input_names=[*self._denoise_inputs("latents", "action_latents"), "action_inputs"],
                         outputs=self._denoise_loop_back("latents", "action_latents"),
                         enable_async_scheduling=True,
                     ),
@@ -827,7 +771,7 @@ class Cosmos3Model(Model):
                     name=ACTION_VIDEO_GEN_LOOP,
                     section=GraphNode(
                         name=DIT_NODE,
-                        input_names=self._denoise_inputs("latents", "action_latents"),
+                        input_names=[*self._denoise_inputs("latents", "action_latents"), "action_inputs"],
                         outputs=self._denoise_loop_back("latents", "action_latents"),
                         enable_async_scheduling=True,
                     ),
@@ -884,7 +828,9 @@ class Cosmos3Model(Model):
     def _windowed_walks(self) -> dict[str, GraphSection]:
         """Windowed AR video: the same denoise loop, run window by window. On
         each window's last iteration the DiT emits the finished window's
-        latents on a streaming edge; the vae_decoder_ar node — its own
+        latents on a streaming edge. The window's pinned frames ride
+        ``WINDOW_COND`` and the decode context a session keeps rides
+        ``SESSION_TAIL``, both loop-back edges. The vae_decoder_ar node — its own
         partition, so it decodes window k while the loop denoises window k+1
         — consumes them one window per chunk and emits the video."""
         video_gen_ar = Sequential(
@@ -893,9 +839,11 @@ class Cosmos3Model(Model):
                     name=VIDEO_GEN_AR_LOOP,
                     section=GraphNode(
                         name=DIT_NODE,
-                        input_names=self._denoise_inputs("latents"),
+                        input_names=[*self._denoise_inputs("latents"), WINDOW_COND, SESSION_TAIL],
                         outputs=[
                             *self._denoise_loop_back("latents"),
+                            GraphEdge(next_node=DIT_NODE, name=WINDOW_COND),
+                            GraphEdge(next_node=DIT_NODE, name=SESSION_TAIL),
                             StreamingGraphEdge(
                                 next_node=VAE_DECODER_AR_NODE,
                                 name="window_latents",
@@ -1041,15 +989,18 @@ class Cosmos3Model(Model):
                 torch.tensor(cond_ids, dtype=torch.long),
                 torch.tensor(uncond_ids, dtype=torch.long),
             ]
-        }, kwargs, {"kv_layout": {KV_CACHE: layout}, **cap})
+        }, kwargs, {
+            "state_layout": {KV_CACHE: layout}, self.PROMPT_LENGTHS: (len(cond_ids), len(uncond_ids)), **cap,
+        })
 
     def _gen_layout(
         self, p: dict, cond_ids: list[int], uncond_ids: list[int], input_modalities: list[str], tensors: dict,
-    ) -> dict[str, LabelLayout]:
+    ) -> dict[str, Layout]:
         """Each guidance branch's writes: its prompt at prefill, one denoise step's
         latents as scratch, and in window mode ``kv`` each window's latents once
-        they are clean, under the schedule's retention, with the window's denoise
-        steps as that span's scratch."""
+        they are clean, with the window's denoise steps as that span's scratch. A
+        kv-mode request's generation read keeps the schedule's context behind
+        its prompt."""
         config = self.config
         if "video" in input_modalities and "video_inputs" in tensors:
             prefill = self.PREFILL_COND_VIDEO_WALK
@@ -1081,14 +1032,22 @@ class Cosmos3Model(Model):
             scratch = latent_frames(p["num_frames"], config) * per_frame
             if p.get("generate_sound"):
                 scratch += sound_frames(p, config)[1]
-        layouts = {UNCOND_LABEL: LabelLayout()}
+        context = schedule.context_units * per_frame if windows else 0
+        layouts = {UNCOND_LABEL: Layout(kept_windows=self._kept_windows())}
         branches = [(COND_LABEL, cond_ids), (UNCOND_LABEL, uncond_ids)]
         for label, ids in branches if float(p["guidance_scale"]) != 1.0 else branches[:1]:
-            layouts[label] = LabelLayout(
+            layouts[label] = Layout(
                 spans=(Span("ids", prefill, len(ids), len(ids), "text_inputs"), *windows), scratch=scratch,
-                retention=schedule.retention(per_frame, len(ids)) if windows else None,
+                kept_windows=self._kept_windows(len(ids), context) if context else self._kept_windows(),
             )
         return layouts
+
+    def _kept_windows(self, sink: int = 0, window: int = 0) -> dict[str, KeptWindow]:
+        """The window the generation read keeps on a windowed deployment: ``window`` entries behind ``sink``, or,
+        with no ``window``, every entry the array holds."""
+        if not self._windowed_serving_enabled():
+            return {}
+        return {ATTN_GEN: KeptWindow(sink, window=window or self.config.max_position_embeddings)}
 
     def _action_prompt_output(self, tensors: NameToTensorList, kwargs: dict, metadata: dict | None = None):
         """Put conditioning values on a tensor edge; only their shape is metadata.
@@ -1247,14 +1206,14 @@ class Cosmos3Model(Model):
         walk = self.REASONER_PREFILL_VISION_WALK if ordered_patches else self.REASONER_PREFILL_WALK
         # a vision run spans its merged grid's longer side in positions, not its tokens
         advance = layout_extent(layout, reasoner.vision.spatial_merge_size, ids.numel())
-        main = LabelLayout(
+        main = Layout(
             # media rows fill the expanded placeholders, so the span is rows, not ids
             spans=(Span("rows", walk, ids.numel(), advance, "text_inputs"),),
-            growth=((REASONER_DECODE_LOOP, 1),),
+            growth=((REASONER_DECODE_LOOP, 1),), kept_windows=self._kept_windows(),
         )
         return ProcessPromptOutput(out, {
             MEDIA_LAYOUT: layout,
-            "kv_layout": {KV_CACHE: {REASONER_LABEL: main, UNCOND_LABEL: LabelLayout()}},
+            "state_layout": {KV_CACHE: {REASONER_LABEL: main, UNCOND_LABEL: Layout(kept_windows=self._kept_windows())}},
         })
 
     def load_video(self, filepath: str, device: str):
@@ -1844,6 +1803,11 @@ class Cosmos3Model(Model):
         # video shift (Edge: 12.0) or a request flow_shift wins.
         params.setdefault("flow_shift", constants.V2V_DEFAULT_FLOW_SHIFT)
 
+    def session_node(self, model_kwargs: Mapping[str, Any]) -> str | None:
+        # the session is read only on a windowed request (`_resolve_window_params`)
+        windowed = model_kwargs.get("window_mode") is not None or model_kwargs.get("stream_video") is True
+        return DIT_NODE if windowed and model_kwargs.get("session_id") is not None else None
+
     def walk_plan(
         self,
         partition_name: str,
@@ -1883,7 +1847,10 @@ class Cosmos3Model(Model):
             prefill = WalkStep(prefill.walk, step_metadata={**knobs, **prefill.step_metadata})
             decode = WalkStep(self.REASONER_DECODE_WALK, bind={"text_inputs": "new_token"}, step_metadata=knobs)
             return [prefill, decode]
-        params = self._resolve_gen_params(model_kwargs, input_modalities, output_modalities)
+        params = {
+            **self._resolve_gen_params(model_kwargs, input_modalities, output_modalities),
+            self.PROMPT_LENGTHS: model_kwargs.get(self.PROMPT_LENGTHS),
+        }
         # Visual conditioning routes through a conditioned prefill that also feeds
         # the DiT the input to VAE-encode: a video (action inverse-dynamics) or an
         # image (image-to-video, action policy/forward-dynamics). Fall back to the

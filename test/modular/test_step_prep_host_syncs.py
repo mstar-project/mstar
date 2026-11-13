@@ -30,18 +30,21 @@ from diffusers import UniPCMultistepScheduler
 from torch import nn
 from torch.overrides import TorchFunctionMode
 
-from mstar.engine.windowing import WindowSchedule
 from mstar.model.components.diffusion.unipc import SOLVER_STATE
 from mstar.model.cosmos3 import constants as C
 from mstar.model.cosmos3.config import Cosmos3Config
+from mstar.model.cosmos3.constants import PROMPT_LENGTHS
 from mstar.model.cosmos3.submodules import (
     ACTION_GEN_LOOP,
     ACTION_VIDEO_GEN_LOOP,
     IMAGE_GEN_LOOP,
+    SESSION_TAIL,
     VIDEO_GEN_AR_LOOP,
     VIDEO_SOUND_GEN_LOOP,
+    WINDOW_COND,
     Cosmos3DiTSubmodule,
 )
+from mstar.model.cosmos3.tests.stubs import bind_progress
 from mstar.model.omnivoice.config import OmniVoiceConfig
 from mstar.model.omnivoice.submodules import UNMASK_LOOP_NAME, OmniVoiceBackboneSubmodule
 from mstar.model.submodule_base import NodeInputs
@@ -340,11 +343,13 @@ def _cosmos3(monkeypatch=None, capture=False):
         proj_in=SimpleNamespace(weight=torch.zeros(1, dtype=torch.float32)),
         comm_group=SimpleNamespace(world_size=1),
         _rotary=stand_in_rotary(config),
+        action_dim=4,
     )
     sub = Cosmos3DiTSubmodule(
         transformer=transformer, config=config, scheduler=UniPCMultistepScheduler(),
     )
     sub.get_device = lambda: torch.device("cpu")
+    bind_progress(sub, "r", "r0", "r1")
     if capture:
         configs = sub.get_accelerator_graph_configs("cpu")
         assert {config.capture_graph_walk for config in configs} == {
@@ -353,29 +358,32 @@ def _cosmos3(monkeypatch=None, capture=False):
     return sub
 
 
-# walk, its loop, the latent edges it carries, and the request state it reads
+# a 64x64 request with one latent frame (4 tokens), as its walk plan's step metadata gives it
+_COSMOS3_MD = {"height": 64, "width": 64, "num_inference_steps": 8, "flow_shift": 3.0, PROMPT_LENGTHS: (7, 9)}
+# a policy request over three latent frames, the first its clean observation
+_POLICY = {"action_mode": "policy", "action_chunk_size": 8, "raw_action_dim": 2, "num_frames": 9}
+
+# walk, its loop, the latent edges it carries, and the step metadata it reads beyond _COSMOS3_MD
 _COSMOS3_WALKS = [
     (C.IMAGE_GEN_WALK, IMAGE_GEN_LOOP, ("latents",), {"guidance_interval": (400.0, 1000.0)}),
     (C.VIDEO_GEN_WALK, "video_gen_loop", ("latents",), {"guidance_interval": None}),
-    (C.VIDEO_SOUND_GEN_WALK, VIDEO_SOUND_GEN_LOOP, ("latents", "sound_latents"), {"num_sound": 3}),
-    (C.ACTION_GEN_WALK, ACTION_GEN_LOOP, ("latents", "action_latents"), {}),
-    (C.ACTION_VIDEO_GEN_WALK, ACTION_VIDEO_GEN_LOOP, ("latents", "action_latents"), {}),
+    (C.VIDEO_SOUND_GEN_WALK, VIDEO_SOUND_GEN_LOOP, ("latents", "sound_latents"), {"generate_sound": True}),
+    (C.ACTION_GEN_WALK, ACTION_GEN_LOOP, ("latents", "action_latents"), _POLICY),
+    (C.ACTION_VIDEO_GEN_WALK, ACTION_VIDEO_GEN_LOOP, ("latents", "action_latents"),
+     {**_POLICY, "action_mode": "forward_dynamics"}),
 ]
 
 
 @pytest.mark.parametrize("walk,loop,edges,extra", _COSMOS3_WALKS)
 @pytest.mark.parametrize("cfg", [True, False])
 def test_cosmos3_step_prep_reads_no_tensor(walk, loop, edges, extra, cfg):
+    """Every step rebuilds the request's settings from its step metadata, so that build reads nothing either once the
+    first step has filled the memo."""
     sub = _cosmos3()
     steps = 8
     ch = sub.config.latent_channel
-    cond = {"num_vision_tokens": 16, "num_action_tokens": 4}
-    st = sub.request_state("r")
-    st.add_all(
-        cond=cond, uncond=dict(cond) if cfg else None, gs=6.0,
-        scheduler=sub._new_scheduler(steps, "cpu", flow_shift=3.0),
-        latent_shape=(1, ch, 1, 4, 4), **extra,
-    )
+    md = {**_COSMOS3_MD, **extra, "guidance_scale": 6.0 if cfg else 1.0}
+    st = sub._settings(md, 0, {}, torch.device("cpu"))
     # the interval splits the default schedule, so cfg_active changes mid-loop
     if walk == C.IMAGE_GEN_WALK and cfg:
         t = st["scheduler"].timesteps
@@ -388,44 +396,44 @@ def test_cosmos3_step_prep_reads_no_tensor(walk, loop, edges, extra, cfg):
 
     for k in range(1, steps):
         with _HostReads() as host:
-            got = sub.prepare_inputs(walk, _fwd("r", walk, {}, loop, k), inputs(k))
+            got = sub.prepare_inputs(walk, _fwd("r", walk, md, loop, k), inputs(k))
         assert host.reads == [], f"step {k}: host reads {host.reads}"
         assert got.tensor_inputs.keys() >= {*edges, *SOLVER_STATE}
         assert torch.equal(got.tensor_inputs["latents"], inputs(k)["latents"][0])
     with pytest.raises(KeyError, match=loop):
-        sub.prepare_inputs(walk, _fwd("r", walk), inputs(1))
+        sub.prepare_inputs(walk, _fwd("r", walk, md), inputs(1))
 
 
 def test_cosmos3_windowed_captured_step_prep_reads_no_tensor(monkeypatch):
     """A chained windowed request on a captured shape: the global loop counter
-    maps to the within-window step and the staged graph inputs match."""
+    maps to the within-window step and the staged graph inputs match. A window's
+    first step draws its noise and keeps the generator's state, which is on the
+    host, for the next window: that read alone."""
     sub = _cosmos3(monkeypatch, capture=True)
     ch = sub.config.latent_channel
-    cond, uncond = sub._window_statics(
-        list(range(7)), list(range(9)), 64, 64, 3, 24.0,
-        has_image_condition=False, cond_units=1, device="cpu", first_window=False,
-    )
-    st = sub.request_state("r")
-    st.add_all(
-        cond=cond, uncond=uncond, gs=6.0, guidance_interval=None,
-        scheduler=sub._new_scheduler(3, "cpu"),
-        latent_shape=(1, ch, 3, 4, 4), ar_schedule=WindowSchedule(6, 3, overlap_units=1),
-        ar_steps=3, ar_iters_per_window=3, ar_total_iters=9, ar_kv_mode=False,
-    )
-
-    inputs = {"latents": [torch.zeros(1, ch, 3, 4, 4)], **{name: [torch.zeros(1)] for name in SOLVER_STATE}}
+    md = {
+        **_COSMOS3_MD, "num_inference_steps": 3, "guidance_scale": 6.0, "window_mode": "chained",
+        "total_latent_units": 7, "window_latent_units": 3, "overlap_latent_units": 1,
+    }
+    window = (1, ch, 3, 4, 4)
+    inputs = {
+        "latents": [torch.zeros(window)], WINDOW_COND: [torch.zeros(window)], SESSION_TAIL: [torch.zeros(0)],
+        **{name: [torch.zeros(1)] for name in SOLVER_STATE},
+    }
 
     def prepare(k):
-        return sub.prepare_inputs(C.VIDEO_GEN_AR_WALK, _fwd("r", C.VIDEO_GEN_AR_WALK, {}, VIDEO_GEN_AR_LOOP, k), inputs)
+        return sub.prepare_inputs(C.VIDEO_GEN_AR_WALK, _fwd("r", C.VIDEO_GEN_AR_WALK, md, VIDEO_GEN_AR_LOOP, k), inputs)
 
-    prepare(1)  # the per-statics mask cache is filled on first use
+    for k in range(9):  # the memo is filled on each window's first use
+        prepare(k)
     for k in range(1, 9):
         with _HostReads() as host:
             got = prepare(k)
-        assert host.reads == [], f"step {k}: host reads {host.reads}"
+        assert host.reads == ([] if k % 3 else ["numpy"]), f"step {k}: host reads {host.reads}"
         assert got is not None
     ni = prepare(4)
-    assert ni.resource_step_info.capture_key == (1, ch, 3, 4, 4)
+    assert ni.resource_step_info.capture_key == window
+    st = ni.kwargs["settings"]
     assert torch.equal(ni.tensor_inputs["vision_timesteps"],
                        st["scheduler"].timesteps[1].to(torch.float32).expand(12))
 
@@ -435,6 +443,12 @@ class _CosmosStubTransformer:
     step can take are the submodule's and the solver's."""
 
     proj_in = SimpleNamespace(weight=torch.zeros(1, dtype=torch.bfloat16))
+    action_dim = 4
+
+    def __init__(self, config):
+        from mstar.model.cosmos3.tests.test_rotary_table import stand_in_rotary
+
+        self._rotary = stand_in_rotary(config)
 
     @staticmethod
     def _branches(latents, vision_timesteps, band):
@@ -447,10 +461,10 @@ class _CosmosStubTransformer:
     def denoise_step_row(self, static, latents, vision_timesteps, *args, **kwargs):
         return {"latents": latents, "vision_timesteps": vision_timesteps, **kwargs}
 
-    def denoise_step_batched(self, reqs, label, attn):
+    def denoise_step_batched(self, reqs):
         return [self._branches(r["latents"], r["vision_timesteps"], r.get("sound_latents")) for r in reqs]
 
-    def denoise_step_action_batched(self, reqs, label, attn, with_cfg):
+    def denoise_step_action_batched(self, reqs, with_cfg):
         return [self._branches(r["latents"], r["vision_timesteps"], r["action_latents"]) for r in reqs]
 
 
@@ -461,53 +475,35 @@ _EDGE_SCHEDULER = {
     "sigma_max": 200.0,
 }
 
-
-def _cosmos3_request(sub, walk, rid, steps, device):
-    """A request past its prefill: one latent frame of 4 tokens, per walk's extras."""
-    ch = sub.config.latent_channel
-    bf16 = dict(device=device, dtype=torch.bfloat16)
-    cond = {
-        "num_vision_tokens": 16, "num_noisy_vision_tokens": 16, "num_action_tokens": 4,
-        "num_noisy_action_tokens": 4, "rotary": (None, None), "vision_token_shapes": [(1, 4, 4)],
-        "vision_noisy_frame_indexes": [None], "mse_gen_indexes": None, "action_token_shapes": None,
-        "action_noisy_frame_indexes": None, "action_mse_gen_indexes": None, "sound_token_shapes": None,
-        "sound_noisy_frame_indexes": None, "sound_mse_gen_indexes": None,
-    }
-    extra = {}
-    if walk == C.VIDEO_SOUND_GEN_WALK:
-        extra = {"num_sound": 3}
-    elif walk == C.ACTION_GEN_WALK:
-        extra = {
-            "raw_action_dim": 2, "action_chunk": 3, "action_dim": 4, "domain_t": None,
-            "vmask": torch.zeros(1, 1, 1, 1, 1, **bf16), "cond_video_latents": torch.zeros(1, ch, 1, 4, 4, **bf16),
-            "action_clean_mask": torch.zeros(1, 3, 1, **bf16), "clean_action": torch.zeros(1, 3, 4, **bf16),
-        }
-    sub.request_state(rid).add_all(
-        cond=cond, uncond=dict(cond), gs=6.0, guidance_interval=None, latent_shape=(1, ch, 1, 4, 4),
-        scheduler=sub._new_scheduler(steps, device, flow_shift=12.0), **extra,
-    )
-
-
 _COSMOS3_STEP_WALKS = [
-    (C.VIDEO_GEN_WALK, "video_gen_loop", None),
-    (C.VIDEO_SOUND_GEN_WALK, VIDEO_SOUND_GEN_LOOP, "sound_latents"),
-    (C.ACTION_GEN_WALK, ACTION_GEN_LOOP, "action_latents"),
+    (C.VIDEO_GEN_WALK, "video_gen_loop", None, {}),
+    (C.VIDEO_SOUND_GEN_WALK, VIDEO_SOUND_GEN_LOOP, "sound_latents", {"generate_sound": True}),
+    (C.ACTION_GEN_WALK, ACTION_GEN_LOOP, "action_latents", _POLICY),
 ]
 
 
-def _cosmos3_stepper(walk, loop, band, rows, steps, device, wrap=lambda sampler: sampler):
+def _cosmos3_stepper(walk, loop, band, extra, rows, steps, device, wrap=lambda sampler: sampler):
     """A generator of whole engine passes over a fresh DiT, prepare through forward,
-    yielding ``(k, {rid: edges})`` after each."""
+    yielding ``(k, {rid: edges})`` after each. ``wrap`` wraps each request's own
+    sampler, which the memo would otherwise share between requests of one schedule."""
     sub = _cosmos3()
     sub._scheduler_template = UniPCMultistepScheduler.from_config(_EDGE_SCHEDULER)
-    sub.transformer = _CosmosStubTransformer()
+    sub.transformer = _CosmosStubTransformer(sub.config)
     sub.get_device = lambda: device
     rids = [f"r{i}" for i in range(rows)]
-    for rid in rids:
-        _cosmos3_request(sub, walk, rid, steps, device)
-        st = sub.request_state(rid)
-        st.add("scheduler", wrap(st["scheduler"]))
-    fwds = {rid: _fwd(rid, walk, {}, loop, 0) for rid in rids}
+    samplers = {}
+    settings = sub._settings
+
+    def own_sampler(md, step_index, inputs, device):
+        st = settings(md, step_index, inputs, device)
+        if md["row"] not in samplers:
+            samplers[md["row"]] = wrap(st["scheduler"])
+        st["scheduler"] = samplers[md["row"]]
+        return st
+
+    sub._settings = own_sampler
+    md = {**_COSMOS3_MD, **extra, "num_inference_steps": steps, "flow_shift": 12.0, "guidance_scale": 6.0}
+    fwds = {rid: _fwd(rid, walk, {**md, "row": rid}, loop, 0) for rid in rids}
     for rid in rids:
         fwds[rid].random_seed = int(rid[1:]) + 7
     carried = {rid: {} for rid in rids}
@@ -518,7 +514,7 @@ def _cosmos3_stepper(walk, loop, band, rows, steps, device, wrap=lambda sampler:
             fwds[rid].dynamic_loop_iter_counts[loop] = k
             prepared.append(sub.prepare_inputs(walk, fwds[rid], carried[rid]))
         engine_inputs = SimpleNamespace(
-            request_ids=rids, per_request_info=fwds, per_request_states=None, resources={"attn": None},
+            request_ids=rids, per_request_info=fwds, per_request_states=None, resources={},
             step=None, captured=False,
         )
         stacked = sub.preprocess(walk, engine_inputs, prepared)
@@ -552,8 +548,8 @@ class _Lockstep:
 
 
 @pytest.mark.parametrize("rows", [1, 2], ids=["single", "batched"])
-@pytest.mark.parametrize("walk,loop,band", _COSMOS3_STEP_WALKS, ids=["video", "sound", "action"])
-def test_cosmos3_step_is_the_reference_scheduler(walk, loop, band, rows):
+@pytest.mark.parametrize("walk,loop,band,extra", _COSMOS3_STEP_WALKS, ids=["video", "sound", "action"])
+def test_cosmos3_step_is_the_reference_scheduler(walk, loop, band, extra, rows):
     """Every path's whole schedule, one row or a batch, in lockstep with diffusers."""
     samplers = []
 
@@ -561,20 +557,20 @@ def test_cosmos3_step_is_the_reference_scheduler(walk, loop, band, rows):
         samplers.append(_Lockstep(sampler, 6))
         return samplers[-1]
 
-    for _ in _cosmos3_stepper(walk, loop, band, rows, 6, torch.device("cpu"), wrap=lockstep):
+    for _ in _cosmos3_stepper(walk, loop, band, extra, rows, 6, torch.device("cpu"), wrap=lockstep):
         pass
     assert [sampler.steps for sampler in samplers] == [6] * rows
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="the host sync is a CUDA stream sync")
 @pytest.mark.parametrize("rows", [1, 2], ids=["single", "batched"])
-@pytest.mark.parametrize("walk,loop,band", _COSMOS3_STEP_WALKS, ids=["video", "sound", "action"])
-def test_cosmos3_step_takes_no_host_sync(walk, loop, band, rows):
+@pytest.mark.parametrize("walk,loop,band,extra", _COSMOS3_STEP_WALKS, ids=["video", "sound", "action"])
+def test_cosmos3_step_takes_no_host_sync(walk, loop, band, extra, rows):
     """A schedule of the eager denoise step as the engine drives it, under sync-debug
     mode from the step after the seeds. Four steps cover the predictor alone, both
     corrector orders and the last step; sound and action step the packed state."""
     device = torch.device("cuda")
-    passes = _cosmos3_stepper(walk, loop, band, rows, 4, device)
+    passes = _cosmos3_stepper(walk, loop, band, extra, rows, 4, device)
     next(passes)  # the seeds are host work
     torch.cuda.synchronize()
     torch.cuda.set_sync_debug_mode("error")

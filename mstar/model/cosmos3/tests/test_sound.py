@@ -29,6 +29,7 @@ from mstar.model.cosmos3.tests.test_engine_cache import (
     _engine_resources,
     _forward_step,
     _load,
+    _prompt_md,
     _SdpaResources,
 )
 
@@ -246,8 +247,10 @@ def _run_cache_once_sound(model, dit, resources, init, sound_init, cond_ids, unc
     from mstar.conductor.request_info import CurrentForwardPassInfo
 
     rid = "rs0"
-    md = {"height": H, "width": W, "num_frames": FRAMES, "fps": 24.0,
-          "guidance_scale": GS, "num_inference_steps": STEPS, "generate_sound": True}
+    md = _prompt_md(
+        model, cond_ids, uncond_ids, height=H, width=W, num_frames=FRAMES, fps=24.0, guidance_scale=GS,
+        num_inference_steps=STEPS, generate_sound=True,
+    )
     fwd = CurrentForwardPassInfo(
         request_id=rid, rid_handle=rid, graph_walk="prefill",
         fwd_index=0, random_seed=SEED, max_tokens=0, step_metadata=md,
@@ -257,7 +260,7 @@ def _run_cache_once_sound(model, dit, resources, init, sound_init, cond_ids, unc
         torch.tensor(uncond_ids, dtype=torch.long, device=device),
     ]
     ni = dit.prepare_inputs("prefill", fwd, {"text_inputs": text_inputs})
-    _forward_step(dit, "prefill", resources, [rid], {rid: fwd}, [ni])
+    _forward_step(model, dit, "prefill", resources, [rid], {rid: fwd}, [ni])
 
     latents, sound_latents = init.clone(), sound_init.clone()
     solver = initial_state(dit._packed(latents, sound_latents))
@@ -267,9 +270,7 @@ def _run_cache_once_sound(model, dit, resources, init, sound_init, cond_ids, unc
         ni = dit.prepare_inputs(VIDEO_SOUND_GEN_WALK, fwd, {
             "latents": [latents], "sound_latents": [sound_latents], **{n: [t] for n, t in solver.items()},
         })
-        out = _forward_step(
-            dit, VIDEO_SOUND_GEN_WALK, resources, [rid], {rid: fwd}, [ni],
-        )
+        out = _forward_step(model, dit, VIDEO_SOUND_GEN_WALK, resources, [rid], {rid: fwd}, [ni])
         latents = out["latents"][0]
         sound_latents = out["sound_latents"][0]
         solver = {n: out[n][0] for n in solver}
@@ -322,16 +323,10 @@ def test_sound_cache_once_matches_fused_exact() -> None:
     if ctx is None:
         print("  (skipped sound cache-once parity: needs COSMOS3_NANO_DIR + CUDA)")
         return
-    dit = ctx["dit"]
-    prev = dit.batched_cfg
-    dit.batched_cfg = False
-    try:
-        lat, snd = _run_cache_once_sound(
-            ctx["model"], dit, _SdpaResources().as_dict(), ctx["init"], ctx["sound_init"],
-            ctx["cond"], ctx["uncond"], ctx["device"],
-        )
-    finally:
-        dit.batched_cfg = prev
+    lat, snd = _run_cache_once_sound(
+        ctx["model"], ctx["dit"], _SdpaResources().as_dict(), ctx["init"], ctx["sound_init"],
+        ctx["cond"], ctx["uncond"], ctx["device"],
+    )
     vdiff = (ctx["lat_fused"].float() - lat.reshape(ctx["lat_fused"].shape).float()).abs().max().item()
     sdiff = (ctx["sound_fused"].float() - snd.reshape(ctx["sound_fused"].shape).float()).abs().max().item()
     assert vdiff <= 1e-3, f"sound-walk video latents differ from fused by {vdiff:.3e} (> 1e-3)"

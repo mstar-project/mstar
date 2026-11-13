@@ -16,8 +16,11 @@ import pytest
 import torch
 
 from mstar.model.cosmos3.config import Cosmos3Config
+from mstar.model.cosmos3.constants import PROMPT_LENGTHS
 from mstar.model.cosmos3.cosmos3_model import Cosmos3Model
 from mstar.model.cosmos3.submodules import IMAGE_GEN_LOOP, Cosmos3DiTSubmodule
+from mstar.model.cosmos3.tests.stubs import bind_progress
+from mstar.model.cosmos3.tests.test_rotary_table import stand_in_rotary
 
 SIGMAS = [1.0, 0.9375, 0.8333333333333334, 0.625]
 
@@ -109,18 +112,16 @@ def _distilled_dit(tmp_path):
 def test_distilled_scheduler_and_sde_step(tmp_path) -> None:
     """The per-request scheduler is FlowMatchEuler over the fixed sigmas
     (timesteps = sigma x 1000, a trailing zero sigma), and one step is the
-    reference SDE update drawn from the request's generator."""
+    reference SDE update with noise drawn from the request's generator."""
     sub = _distilled_dit(tmp_path)
     sampler = sub._new_scheduler(4, torch.device("cpu"), flow_shift=12.0, use_karras_sigma=True)
     assert torch.allclose(sampler.timesteps.float(), torch.tensor(SIGMAS) * 1000)
     assert torch.allclose(sampler.sigmas.float(), torch.tensor(SIGMAS + [0.0]))
     assert sampler.config.stochastic_sampling
 
-    gen = torch.Generator().manual_seed(7)
-    st = sub.request_state("r")
-    st.add_all(scheduler=sampler, sde_generator=gen)
     x = torch.randn(16, 3, 4, 4)
     v = torch.randn_like(x)
+    st = {"scheduler": sampler, "sde_noise": sampler.noise(x.unsqueeze(0), torch.Generator().manual_seed(7))}
     out, solver = sub._scheduler_step(st, v, x, 0, {})
     assert solver == {}, "the distilled step carries nothing but the sample"
     eps = torch.randn((1, *x.shape), generator=torch.Generator().manual_seed(7))[0]
@@ -136,68 +137,47 @@ def test_distilled_i2v_loop_repins_anchor(tmp_path, monkeypatch) -> None:
     velocity: the SDE re-noises every frame, and frame 0 is re-pinned to the
     conditioning anchor after each step."""
     sub = _distilled_dit(tmp_path)
+    sub.transformer._rotary = stand_in_rotary(sub.config)
     monkeypatch.setattr(sub, "get_device", lambda: torch.device("cpu"))
-    latent_shape = (1, 16, 3, 4, 4)
-    anchor = torch.full(latent_shape, 0.25)
-    n_tokens = 3 * 4  # 3 latent frames x (4/2 x 4/2) patches
-    st = sub.request_state("r")
-    st.add_all(
-        cond={"num_vision_tokens": n_tokens, "num_noisy_vision_tokens": n_tokens - 4},
-        uncond=None, gs=1.0, guidance_interval=None,
-        scheduler=sub._new_scheduler(4, torch.device("cpu")), latent_shape=latent_shape, num_sound=None,
-    )
+    bind_progress(sub, "r", "r2", "r3")
+    md = {
+        "num_frames": 9, "height": 64, "width": 64, "has_image_condition": True, "guidance_scale": 1.0,
+        "num_inference_steps": 4, PROMPT_LENGTHS: (7, 0),
+    }
+    anchor = torch.full(sub._latent_shape(64, 64, 9), 0.25)
     calls = []
 
-    def fake_denoise(attn, static, latents, vision_timesteps, label):
+    def fake_denoise(static, latents, vision_timesteps):
         calls.append(float(vision_timesteps[0]))
         vel = torch.full_like(latents, 0.5)
         vel[:, :, 0] = 0.0  # zero velocity on the clean anchor, as the transformer's unpatchify yields
         return vel
 
     monkeypatch.setattr(sub, "_denoise", fake_denoise)
-    counts = {"video_gen_loop": 0}
-    fwd = SimpleNamespace(
-        request_id="r", rid_handle="r", random_seed=3, graph_walk="video_gen", dynamic_loop_iter_counts=counts,
-    )
-    ei = SimpleNamespace(
-        request_ids=["r"], per_request_states=None, resources={"attn": "paged"}, step=None,
-        per_request_info={"r": fwd},
-    )
+
+    def first_step(rid):
+        fwd = SimpleNamespace(
+            request_id=rid, rid_handle=rid, random_seed=3, step_metadata=md,
+            dynamic_loop_iter_counts={"video_gen_loop": 0},
+        )
+        return fwd, SimpleNamespace(request_ids=[rid], per_request_info={rid: fwd})
+
+    fwd, ei = first_step("r")
     inputs = {"cond_latents": [anchor]}
     for step in range(4):
-        counts["video_gen_loop"] = step
+        fwd.dynamic_loop_iter_counts["video_gen_loop"] = step
         ni = sub.prepare_inputs("video_gen", fwd, inputs)
         assert ni is not None and not ni.resource_step_info.cfg
         out = sub.forward("video_gen", ei, **sub.preprocess("video_gen", ei, [ni]))
         lat = out["latents"][0]
         assert torch.equal(lat[:, :, 0], anchor[:, :, 0].to(lat.dtype)), f"anchor drifted at step {step}"
         assert not torch.equal(lat[:, :, 1], anchor[:, :, 1])
-        inputs = {"latents": [lat]}
+        inputs = {"latents": [lat], "cond_latents": [anchor]}
     assert calls == [1000.0, 937.5, pytest.approx(833.333, abs=0.01), 625.0]
     # Deterministic: the same seed reproduces the rollout.
-    st2 = sub.request_state("r2")
-    st2.add_all(**{k: st[k] for k in ("cond", "uncond", "gs", "guidance_interval", "latent_shape", "num_sound")},
-                scheduler=sub._new_scheduler(4, torch.device("cpu")))
-    start = {"video_gen_loop": 0}
-    fwd2 = SimpleNamespace(
-        request_id="r2", rid_handle="r2", random_seed=3, graph_walk="video_gen", dynamic_loop_iter_counts=start,
-    )
-    ni = sub.prepare_inputs("video_gen", fwd2, {"cond_latents": [anchor]})
-    ei2 = SimpleNamespace(
-        request_ids=["r2"], per_request_states=None, resources={"attn": "paged"}, step=None,
-        per_request_info={"r2": fwd2},
-    )
-    first2 = sub.forward("video_gen", ei2, **sub.preprocess("video_gen", ei2, [ni]))["latents"][0]
-    st3 = sub.request_state("r3")
-    st3.add_all(**{k: st[k] for k in ("cond", "uncond", "gs", "guidance_interval", "latent_shape", "num_sound")},
-                scheduler=sub._new_scheduler(4, torch.device("cpu")))
-    fwd3 = SimpleNamespace(
-        request_id="r3", rid_handle="r3", random_seed=3, graph_walk="video_gen", dynamic_loop_iter_counts=start,
-    )
-    ni = sub.prepare_inputs("video_gen", fwd3, {"cond_latents": [anchor]})
-    ei3 = SimpleNamespace(
-        request_ids=["r3"], per_request_states=None, resources={"attn": "paged"}, step=None,
-        per_request_info={"r3": fwd3},
-    )
-    first3 = sub.forward("video_gen", ei3, **sub.preprocess("video_gen", ei3, [ni]))["latents"][0]
-    assert torch.equal(first2, first3)
+    firsts = []
+    for rid in ("r2", "r3"):
+        fwd, ei = first_step(rid)
+        ni = sub.prepare_inputs("video_gen", fwd, {"cond_latents": [anchor]})
+        firsts.append(sub.forward("video_gen", ei, **sub.preprocess("video_gen", ei, [ni]))["latents"][0])
+    assert torch.equal(*firsts)

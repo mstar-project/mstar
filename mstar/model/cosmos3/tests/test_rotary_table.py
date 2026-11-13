@@ -16,16 +16,14 @@ from mstar.model.cosmos3 import constants as C
 from mstar.model.cosmos3.components.packing import build_static_inputs
 from mstar.model.cosmos3.components.transformer import Cosmos3OmniTransformer, Cosmos3RotaryEmbedding
 from mstar.model.cosmos3.submodules import (
-    ATTN,
     CAPTURED_GEN_INPUTS,
-    CFG_BATCHED_LABEL,
     COND_LABEL,
     UNCOND_LABEL,
     Cosmos3DiTSubmodule,
 )
 from mstar.model.cosmos3.tests.stubs import StubSampler
 from mstar.model.cosmos3.tests.test_edge import _init_all, _tiny_edge_config
-from mstar.model.cosmos3.tests.test_engine_cache import _SdpaResources
+from mstar.model.cosmos3.tests.test_engine_cache import _SdpaResources, declaring
 
 POSITION_FIELDS = ("position_ids", "gen_position_ids", "vision_mrope_ids", "sound_mrope_ids", "action_mrope_ids")
 STRIDE = 4  # generation tokens per latent frame at 64x64 (4x4 latents, 2x2 patches)
@@ -46,7 +44,7 @@ def _tiny(dtype=torch.float32, compile_denoise=False, **overrides):
     _init_all(model)
     model.to(dtype)
     res = _SdpaResources()
-    res.bind(model)
+    res.bind(declaring(cfg), model)
     sub = Cosmos3DiTSubmodule(model, cfg, scheduler=None)
     sub.get_device = lambda: torch.device("cpu")
     return sub, model, cfg, res
@@ -97,56 +95,50 @@ def test_window_tables_slice_with_the_window(monkeypatch) -> None:
     sub, model, cfg, _ = _tiny()
     ids, unc_ids = list(range(6)), list(range(9))
     full = sub._build_static(ids, 64, 64, 1 + 11 * 4, 24.0, False, "cpu")  # 12 latent frames
-    st = sub.request_state("r")
-    st.add_all(
-        ar_kv_mode=True, ar_statics={}, ar_size=(64, 64), ar_cond_ids=ids, ar_uncond_ids=unc_ids,
-        ar_fps=24.0, ar_has_image_condition=False,
-    )
+
+    def statics(plan, kv_mode):
+        return sub._window_statics(
+            ids, unc_ids, 64, 64, plan.units, 24.0, has_image_condition=False, cond_units=plan.cond_units,
+            device="cpu", first_window=plan.index == 0, start_unit=plan.start if kv_mode else 0,
+        )
+
     kv = WindowSchedule(total_units=12, window_units=4, context_units=6, overlap_units=0)
     for w in range(kv.num_windows):
         plan = kv.window(w)
-        cond, uncond = sub._window_statics_for(st, plan, "cpu")
+        cond, uncond = statics(plan, kv_mode=True)
         rows = slice(plan.start * STRIDE, plan.end * STRIDE)
         assert _equal(cond["rotary"], (full["rotary"][0][rows], full["rotary"][1][rows]))
         assert uncond["rotary"][0].shape == cond["rotary"][0].shape
         assert not set(POSITION_FIELDS) & set(cond)
 
-    st.add("ar_kv_mode", False)
     chained = WindowSchedule(total_units=13, window_units=4, overlap_units=1)  # four full windows
-    tables = [sub._window_statics_for(st, chained.window(w), "cpu")[0]["rotary"] for w in range(chained.num_windows)]
+    tables = [statics(plan, kv_mode=False)[0]["rotary"] for plan in chained.windows()]
     assert all(t is tables[1] for t in tables[2:]) and tables[0] is not tables[1]
 
     commits = []
-    monkeypatch.setattr(model, "commit_window", lambda lat, rot, label, attn: commits.append((rot, label)))
-    monkeypatch.setattr(sub, "_finish_window", lambda *a: {})
+    monkeypatch.setattr(model, "commit_window", lambda lat, rot: commits.append(rot))
+    monkeypatch.setattr(sub, "_end_window", lambda *a: {})
     plan = chained.window(1)
-    cond, uncond = sub._window_statics_for(st, plan, "cpu")
-    st.add_all(cond=cond, uncond=uncond, ar_schedule=chained, ar_tokens_per_unit=STRIDE)
+    cond, uncond = statics(plan, kv_mode=False)
+    st = {"cond": cond, "uncond": uncond, "ar_schedule": chained, "ar_tokens_per_unit": STRIDE}
     x = torch.zeros(sub._window_latent_shape(64, 64, plan.units))
     head = plan.cond_units * STRIDE
-    sub._commit_window("paged", st, x, window_index=1)
-    (rot, label), = commits
-    assert label == CFG_BATCHED_LABEL and len(rot) == 2
+    sub._commit_window(st, x, 1, {})
+    (rot,) = commits
+    assert len(rot) == 2, "a commit adds both guidance branches' K/V in one pass"
     assert _equal(rot[0], tuple(t[head:] for t in cond["rotary"]))
     assert _equal(rot[1], tuple(t[head:] for t in uncond["rotary"]))
-    sub.batched_cfg = False
-    sub._commit_window("paged", st, x, window_index=1)
-    assert [c[1] for c in commits[1:]] == [COND_LABEL, UNCOND_LABEL]
-    assert _equal(commits[2][0][0], tuple(t[head:] for t in uncond["rotary"]))
 
 
 def _prefill(model, res, statics):
     for label, s in statics.items():
-        res.plan(label, [(label, s["und_len"])], causal=True)
-        model.prefill_und(s["input_ids"], s["text_mrope_ids"], label)
-        res.kv.promote()
+        res.step(C.PREFILL_WALK, [("r", label, s["und_len"])], lambda s=s: model.prefill_und(
+            s["input_ids"], s["text_mrope_ids"]))
 
 
-def _run(res, plan_label, groups, fn):
-    res.plan(plan_label, groups, causal=False)
-    out = fn()
-    res.kv.pending = {}  # a denoise step's own K/V is never committed
-    return out
+def _run(res, segments, fn, walk=C.IMAGE_GEN_WALK):
+    """``fn`` in one denoise step over ``segments``, which keeps none of its own K/V."""
+    return res.step(walk, segments, fn, keep=False)
 
 
 def test_denoise_steps_take_the_table(monkeypatch) -> None:
@@ -178,21 +170,18 @@ def test_denoise_steps_take_the_table(monkeypatch) -> None:
         raise AssertionError("a denoise step built a rotary table")
 
     monkeypatch.setattr(model.rotary_emb, "forward", no_table)
-    attn, n = res.attn, cond["num_vision_tokens"]
-    both = [(COND_LABEL, n), (UNCOND_LABEL, n)]
+    n = cond["num_vision_tokens"]
+    both = [("r", COND_LABEL, n), ("r", UNCOND_LABEL, n)]
     with torch.no_grad():
-        v_c = _run(res, COND_LABEL, [(COND_LABEL, n)], lambda: sub._denoise(attn, cond, latent, ts, COND_LABEL))
-        v_u = _run(res, UNCOND_LABEL, [(UNCOND_LABEL, n)],
-                   lambda: sub._denoise(attn, uncond, latent, ts, UNCOND_LABEL))
+        v_c = _run(res, both[:1], lambda: sub._denoise(cond, latent, ts))
+        v_u = _run(res, both[1:], lambda: sub._denoise(uncond, latent, ts))
         assert torch.allclose(v_c, fused[0], atol=1e-4), (v_c - fused[0]).abs().max()
-        b_c, b_u = _run(res, CFG_BATCHED_LABEL, both, lambda: model.denoise_step_batched_cfg(
+        b_c, b_u = _run(res, both, lambda: model.denoise_step_batched_cfg(
             latent, ts, cond["rotary"], uncond["rotary"], cond["vision_token_shapes"],
-            cond["vision_noisy_frame_indexes"], cond["mse_gen_indexes"], CFG_BATCHED_LABEL, attn,
+            cond["vision_noisy_frame_indexes"], cond["mse_gen_indexes"],
         ))
         req = Cosmos3OmniTransformer.denoise_step_row(cond, latent, ts, cond["rotary"], uncond["rotary"])
-        ((x_c, x_u),) = _run(
-            res, CFG_BATCHED_LABEL, both, lambda: model.denoise_step_batched([req], CFG_BATCHED_LABEL, attn),
-        )
+        ((x_c, x_u),) = _run(res, both, lambda: model.denoise_step_batched([req]))
     for got in (b_c, x_c):
         assert torch.allclose(got, v_c, atol=1e-5)
     for got in (b_u, x_u):
@@ -205,8 +194,8 @@ def test_denoise_steps_take_the_table(monkeypatch) -> None:
     m = a_cond["num_vision_tokens"] + a_cond["num_action_tokens"]
     with torch.no_grad():
         seq = [
-            _run(res, label, [(label, m)], lambda s=s, label=label: sub._denoise_action(
-                attn, s, latent, action, vts, ats, domain, label))
+            _run(res, [("r", label, m)], lambda s=s: sub._denoise_action(s, latent, action, vts, ats, domain),
+                 walk=C.ACTION_GEN_WALK)
             for label, s in ((COND_LABEL, a_cond), (UNCOND_LABEL, a_unc))
         ]
         areq = {
@@ -219,14 +208,15 @@ def test_denoise_steps_take_the_table(monkeypatch) -> None:
             "action_noisy_frame_indexes": a_cond["action_noisy_frame_indexes"],
             "action_mse_gen_indexes": a_cond["action_mse_gen_indexes"], "action_domain_id": domain,
         }
-        (batched,) = _run(res, CFG_BATCHED_LABEL, [(COND_LABEL, m), (UNCOND_LABEL, m)],
-                          lambda: model.denoise_step_action_batched([areq], CFG_BATCHED_LABEL, attn, with_cfg=True))
+        (batched,) = _run(res, [("r", COND_LABEL, m), ("r", UNCOND_LABEL, m)],
+                          lambda: model.denoise_step_action_batched([areq], with_cfg=True), walk=C.ACTION_GEN_WALK)
         for (sv, sa), (bv, ba) in zip(seq, batched, strict=True):
             assert torch.allclose(bv, sv, atol=1e-5) and torch.allclose(ba, sa, atol=1e-5)
 
-        res.plan(CFG_BATCHED_LABEL, both, causal=False)
-        model.commit_window(latent, [cond["rotary"], uncond["rotary"]], CFG_BATCHED_LABEL, attn)
-        assert {label for label, _ in res.kv.pending} == {COND_LABEL, UNCOND_LABEL}
+        prefix = {label: res.kv.committed[(label, 0)][0].shape[0] for label in (COND_LABEL, UNCOND_LABEL)}
+        res.step(C.VIDEO_GEN_WALK, both, lambda: model.commit_window(latent, [cond["rotary"], uncond["rotary"]]))
+        kept = {label: res.kv.committed[(label, 0)][0].shape[0] - prefix[label] for label in prefix}
+        assert kept == {COND_LABEL: n, UNCOND_LABEL: n}, "a commit keeps each branch's window K/V"
 
 
 def test_served_batched_paths_run_the_real_step() -> None:
@@ -250,35 +240,33 @@ def test_served_batched_paths_run_the_real_step() -> None:
     sub._slim_statics(cond, uncond)
     sub._slim_statics(cond_s, uncond_s)
 
-    def state(rid_cond, rid_uncond, **kwargs):
-        for rid in rids:
-            sub.request_state(rid).add_all(cond=rid_cond, uncond=rid_uncond, gs=gs, scheduler=sched, **kwargs)
+    def settings(rid_cond, rid_uncond, **kwargs):
+        return {rid: dict(cond=rid_cond, uncond=rid_uncond, gs=gs, scheduler=sched, **kwargs) for rid in rids}
 
     latents = {rid: torch.randn(sub._latent_shape(64, 64, 9)) for rid in rids}
     sound = {rid: torch.randn(1, cfg.sound_dim, 4) for rid in rids}
     ei = SimpleNamespace(
-        request_ids=rids, step=None, resources=res.as_dict(), per_request_states=None,
+        request_ids=rids, step=None,
         per_request_info={
             rid: SimpleNamespace(dynamic_loop_iter_counts={"video_sound_gen_loop": i, "video_gen_loop": i})
             for i, rid in enumerate(rids)
         },
     )
 
-    def groups(span):
-        return [(COND_LABEL, span)] * 2 + [(UNCOND_LABEL, span)] * 2
+    def segments(span):
+        return [(rid, label, span) for label in (COND_LABEL, UNCOND_LABEL) for rid in rids]
 
     n = cond["num_vision_tokens"]
     with torch.no_grad():
-        state(cond_s, uncond_s, num_sound=4)
-        joint = _run(res, CFG_BATCHED_LABEL, groups(n + 4), lambda: sub.forward_batched(
+        joint = _run(res, segments(n + 4), lambda: sub.forward_batched(
             C.VIDEO_SOUND_GEN_WALK, ei, latents=latents, sound_latents=sound,
-        ))
-        state(cond, uncond)
-        eager = _run(res, CFG_BATCHED_LABEL, groups(n), lambda: sub.forward_batched(
-            C.VIDEO_GEN_WALK, ei, latents=latents,
-        ))
+            settings=settings(cond_s, uncond_s, num_sound=4),
+        ), walk=C.VIDEO_SOUND_GEN_WALK)
+        eager = _run(res, segments(n), lambda: sub.forward_batched(
+            C.VIDEO_GEN_WALK, ei, latents=latents, settings=settings(cond, uncond),
+        ), walk=C.VIDEO_GEN_WALK)
         sub._capture_layout = {tuple(latents["a"].shape): cond}
-        captured = _run(res, CFG_BATCHED_LABEL, groups(n), lambda: sub.forward_captured(
+        captured = _run(res, segments(n), lambda: sub.forward_captured(
             C.VIDEO_GEN_WALK, ei,
             latents=torch.stack([latents[rid] for rid in rids]),
             vision_timesteps=torch.stack([torch.full((n,), t) for t in sched.timesteps.tolist()]),
@@ -287,7 +275,7 @@ def test_served_batched_paths_run_the_real_step() -> None:
             cos_uncond=torch.stack([uncond["rotary"][0]] * 2),
             sin_uncond=torch.stack([uncond["rotary"][1]] * 2),
             noisy_token_mask=torch.ones(2, n),
-        ))
+        ), walk=C.VIDEO_GEN_WALK)
     for rid in rids:
         uncond_v = captured[rid]["uncond_v"][0]
         velocity = uncond_v + gs * (captured[rid]["cond_v"][0] - uncond_v)
@@ -315,20 +303,21 @@ def test_captured_inputs_stack_the_tables(monkeypatch) -> None:
         assert single[key].shape == (3 * STRIDE, cfg.head_dim) and single[key].dtype == torch.bfloat16
 
     sched = StubSampler(torch.tensor([900.0, 500.0]))
+    sub._sampler = lambda *args: sched
     sub._solver_state = ()
     rids, inputs = ["a", "b"], []
     x = torch.zeros(1, cfg.latent_channel, 3, 4, 4, dtype=torch.bfloat16)
     for i, rid in enumerate(rids):
-        cond = sub._static(list(range(5 + i)), 64, 64, 9, 24.0, True, "cpu")
-        uncond = sub._static(list(range(9 + 2 * i)), 64, 64, 9, 24.0, True, "cpu")
-        sub.request_state(rid).add_all(
-            cond=cond, uncond=uncond, gs=6.0, guidance_interval=None, scheduler=sched,
-            latent_shape=(1, cfg.latent_channel, 3, 4, 4),
-        )
+        md = {
+            "height": 64, "width": 64, "num_frames": 9, "has_image_condition": True, "guidance_scale": 6.0,
+            C.PROMPT_LENGTHS: (5 + i, 9 + 2 * i),
+        }
         fwd = SimpleNamespace(
             request_id=rid, rid_handle=rid, random_seed=0, dynamic_loop_iter_counts={"video_gen_loop": 1},
+            step_metadata=md,
         )
         inp = sub.prepare_inputs(C.VIDEO_GEN_WALK, fwd, {"latents": [x]})
+        cond, uncond = inp.kwargs["settings"]["cond"], inp.kwargs["settings"]["uncond"]
         t = inp.tensor_inputs
         assert t["cos_cond"] is cond["rotary"][0] and t["sin_cond"] is cond["rotary"][1]
         assert t["cos_uncond"] is uncond["rotary"][0] and t["sin_uncond"] is uncond["rotary"][1]
@@ -343,17 +332,14 @@ def test_captured_inputs_stack_the_tables(monkeypatch) -> None:
 
     calls = []
     zero = torch.zeros(1)
-    monkeypatch.setattr(model, "denoise_step_batched", lambda reqs, label, attn: calls.append(reqs) or [
-        (zero, zero) for _ in reqs])
+    monkeypatch.setattr(model, "denoise_step_batched", lambda reqs: calls.append(reqs) or [(zero, zero) for _ in reqs])
     monkeypatch.setattr(model, "denoise_step_batched_cfg", lambda *a, **k: calls.append(a) or (zero, zero))
-    ei = SimpleNamespace(request_ids=rids, step=None, resources={ATTN: "paged"})
-    sub.forward_captured(C.VIDEO_GEN_WALK, ei, **packed)
+    sub.forward_captured(C.VIDEO_GEN_WALK, SimpleNamespace(request_ids=rids), **packed)
     for i, req in enumerate(calls[-1]):
         assert _equal(req["rotary_cond"], (packed["cos_cond"][i], packed["sin_cond"][i]))
         assert _equal(req["rotary_uncond"], (packed["cos_uncond"][i], packed["sin_uncond"][i]))
     one = {key: value[:1] for key, value in packed.items()}
-    sub.forward_captured(C.VIDEO_GEN_WALK, SimpleNamespace(request_ids=rids[:1], step=None,
-                                                           resources={ATTN: "paged"}), **one)
+    sub.forward_captured(C.VIDEO_GEN_WALK, SimpleNamespace(request_ids=rids[:1]), **one)
     args = calls[-1]
     assert _equal(args[2], (one["cos_cond"][0], one["sin_cond"][0]))
     assert _equal(args[3], (one["cos_uncond"][0], one["sin_uncond"][0]))

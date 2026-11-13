@@ -45,3 +45,11 @@ ACTION_VIDEO_GEN_WALK = "action_video_gen"
 REASONER_PREFILL_WALK = "prefill_text"
 REASONER_PREFILL_VISION_WALK = "prefill_vision"
 REASONER_DECODE_WALK = "decode"
+
+# The DiT's KV array, which the reasoner shares, and the sequence shard over its nodes
+KV_CACHE = "kv"
+SEQ_SHARD = "seq_shard"
+# the reasoner's vision tower's within-frame K/V, which no step keeps
+VISION_TOKENS = "vision_tokens"
+# each guidance branch's prompt length, which a generation request's step metadata carries for its statics
+PROMPT_LENGTHS = "prompt_lengths"

@@ -1,8 +1,8 @@
 """The Cosmos3-Edge vision tower served on `PackedBlockLoopEncoder`: `embed`,
-then `encode` over the frames the step planned on the ragged attention
-resource, then `project`, must be the reference `forward` (attention within
-each frame of the packed patches), for a step packing several requests'
-images and video frames; and the node plans one segment per layout run."""
+then `encode` over the frames the step planned on its vision tokens' array,
+then `project`, must be the reference `forward` (attention within each frame
+of the packed patches), for a step packing several requests' images and video
+frames; and the node plans one segment per layout run."""
 
 from __future__ import annotations
 
@@ -12,19 +12,23 @@ import torch
 
 from mstar.model.cosmos3.components.vision import Cosmos3VisionModel, frame_attention
 from mstar.model.cosmos3.config import Cosmos3ReasonerConfig, Cosmos3VisionEncoderConfig
+from mstar.model.cosmos3.constants import VISION_TOKENS
 from mstar.model.keys import VISION_ATTN
 from mstar.model.multimodal import MEDIA_LAYOUT
 
 
 class _PlannedFrames:
-    """The ragged attention resource as the encoder blocks see it: attention
-    within each planned segment."""
+    """The vision tokens' handle as the encoder blocks see it: a layer's add, then
+    its read, attention within each planned segment."""
 
     def __init__(self, lengths: list[int]):
         self.lengths = lengths
 
-    def run(self, q, k, v, label=None):
-        return frame_attention(q, k, v, self.lengths)
+    def add(self, layer, k, v):
+        self.k, self.v = k, v
+
+    def read(self, layer, q):
+        return frame_attention(q, self.k, self.v, self.lengths)
 
 
 def _tower() -> Cosmos3VisionModel:
@@ -53,7 +57,7 @@ def test_the_served_path_is_the_reference_forward():
         pos = torch.cat([model.position_table(h, w) for _, h, w in frames])
         plan = _PlannedFrames([h * w for _, h, w in frames])
         for layer in model.visual.encoder.layers:
-            layer.self_attn.bind_resources({VISION_ATTN: plan})
+            layer.self_attn.bind_state({VISION_TOKENS: plan})
         hidden, cos, sin = model.embed(pixels, pos)
         served = model.project(model.encode(hidden, cos, sin))
     assert served.shape == ref.shape == (patches // 4, 24)
@@ -104,17 +108,13 @@ def test_the_block_loop_runs_in_bf16_without_autocast():
     assert {t.dtype for t in buffers.values()} == {torch.bfloat16}
 
 
-def test_the_vision_attention_declares_fa3():
+def test_the_vision_attention_declares_fa3(tmp_path):
     """head_dim 72 runs unpadded on FA3 varlen; FlashInfer would pad it to 128."""
-    from mstar.engine.resources.attn.ragged.config import RaggedAttnBackend
-    from mstar.model.cosmos3.cosmos3_model import Cosmos3Model
+    from test_cosmos3_edge_model import _model, _specs
 
-    model = Cosmos3Model.__new__(Cosmos3Model)
-    model.config = SimpleNamespace(reasoner=SimpleNamespace(
-        vision=SimpleNamespace(num_attention_heads=16, hidden_size=1152, patch_size=16),
-        image_processor=SimpleNamespace(min_pixels=65536), video_processor=SimpleNamespace(min_pixels=4096),
-    ))
-    spec = model._vision_attention_spec()
+    from mstar.engine.resources.attn.ragged.config import RaggedAttnBackend
+
+    (spec,) = [spec for spec in _specs(_model(tmp_path)) if spec.resource_key == VISION_ATTN]
     assert spec.config.head_dim == 72 and spec.config.backend is RaggedAttnBackend.DENSE
 
 

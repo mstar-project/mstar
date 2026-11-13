@@ -23,6 +23,7 @@ takes ~16 GB of host memory.
 
 from __future__ import annotations
 
+import functools
 import os
 from pathlib import Path
 
@@ -30,7 +31,10 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from mstar.model.cosmos3 import constants as C
+from mstar.model.cosmos3.submodules import COND_LABEL
 from mstar.model.cosmos3.tests.test_edge import EDGE_DIR
+from mstar.model.cosmos3.tests.test_engine_cache import _SdpaResources, declaring
 
 REF = os.environ.get("COSMOS3_EDGE_REF")
 needs_ref = pytest.mark.skipif(
@@ -85,12 +89,6 @@ class _SdpaKV:
         )
         return out.transpose(1, 2).squeeze(0)
 
-
-def _bind(module, res):
-    for child in module.modules():
-        bind = getattr(child, "bind_resources", None)
-        if bind is not None:
-            bind({"kv": res, "attn": res})
 
 
 @needs_ref
@@ -163,8 +161,8 @@ def test_reasoner_logits_and_greedy_tokens_match_reference() -> None:
     model = model.to_empty(device="cpu").float()
     load_transformer_weights(model, EDGE_DIR, device="cpu")
     model.eval()
-    res = _SdpaKV()
-    _bind(model, res)
+    res = _SdpaResources()
+    res.bind(declaring(cfg), model)
 
     ids = rec["input_ids"]
     pos = rec["position_ids"]
@@ -174,7 +172,8 @@ def test_reasoner_logits_and_greedy_tokens_match_reference() -> None:
         embeds = model.embed_tokens(ids)
         mask = (ids == r.image_token_id) | (ids == r.video_token_id)
         embeds = embeds.masked_scatter(mask.unsqueeze(-1), vision_tokens.to(embeds.dtype))
-        hidden = model.text_forward(embeds, pos, "main")
+        prompt = [("r", COND_LABEL, ids.numel())]
+        hidden = res.step(C.PREFILL_WALK, prompt, lambda: model.text_forward(embeds, pos))
         logits = model.lm_head(hidden[-1:])[0]
     ref_logits = rec["prefill_last_logits"]
     err = (logits - ref_logits).abs().max().item()
@@ -188,7 +187,9 @@ def test_reasoner_logits_and_greedy_tokens_match_reference() -> None:
     with torch.no_grad():
         for _ in range(len(rec["greedy_tokens"]) - 1):
             step_pos = torch.full((3, 1), next_pos, dtype=torch.long)
-            h = model.text_forward(model.embed_tokens(torch.tensor([token])), step_pos, "main")
+            embeds = model.embed_tokens(torch.tensor([token]))
+            run = functools.partial(model.text_forward, embeds, step_pos)
+            h = res.step(C.PREFILL_WALK, [("r", COND_LABEL, 1)], run)
             token = int(model.lm_head(h)[0].argmax())
             produced.append(token)
             next_pos += 1

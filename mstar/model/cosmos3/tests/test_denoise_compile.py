@@ -1,13 +1,15 @@
 """The denoise step's compile switches: the mode's torch.compile arguments,
 which forwards get compiled, and the yaml validation."""
 
+import functools
+
 import pytest
 import torch
 
 from mstar.engine import accelerator_graph_runner
+from mstar.model.cosmos3 import constants as C
 from mstar.model.cosmos3.config import DENOISE_COMPILE_MODES, Cosmos3Config
 from mstar.model.cosmos3.submodules import (
-    CFG_BATCHED_LABEL,
     COND_LABEL,
     UNCOND_LABEL,
     Cosmos3DiTSubmodule,
@@ -97,17 +99,18 @@ def test_warmup_compiles_runs_the_real_step_and_a_served_row_reuses_its_compile(
     sub, model, cfg, res = _tiny(compile_denoise=True, video_size_default=(64, 64), num_frames_video=13)
     step, calls = model.denoise_step_batched, []
 
-    def recording_step(requests, label, attn):
-        results = step(requests, label, attn)
-        calls.append((requests, label, results))
+    def recording_step(requests):
+        results = step(requests)
+        calls.append((requests, results))
         return results
 
     monkeypatch.setattr(model, "denoise_step_batched", recording_step)
+    sub.bind_node_state(res.handles)
     with torch.no_grad():  # as the engine calls it
         sub.warmup_compiles()
-    [(requests, label, results)] = calls
+    [(requests, results)] = calls
     latent_size = sub._latent_shape(64, 64, 13)
-    assert len(requests) == 2 and label == CFG_BATCHED_LABEL and requests[0]["latents"].shape == latent_size
+    assert len(requests) == 2 and requests[0]["latents"].shape == latent_size
     assert 4 * requests[0]["rotary_cond"][0].shape[0] == cfg.hidden_size
     assert [v.shape for branches in results for v in branches] == [latent_size] * 4
 
@@ -116,9 +119,9 @@ def test_warmup_compiles_runs_the_real_step_and_a_served_row_reuses_its_compile(
     timesteps = torch.full((static["num_noisy_vision_tokens"],), 500.0)
     row = model.denoise_step_row(static, latents, timesteps, static["rotary"], static["rotary"])
     n = static["num_vision_tokens"]
-    res.plan(CFG_BATCHED_LABEL, [(COND_LABEL, n), (UNCOND_LABEL, n)], causal=False)
+    both = [("r", COND_LABEL, n), ("r", UNCOND_LABEL, n)]
     with torch.no_grad(), torch.compiler.set_stance("fail_on_recompile"):
-        ((cond_v, uncond_v),) = step([row], CFG_BATCHED_LABEL, res.attn)
+        ((cond_v, uncond_v),) = res.step(C.IMAGE_GEN_WALK, both, lambda: step([row]), keep=False)
     assert cond_v.shape == uncond_v.shape == latents.shape
 
     compiled, stacks = model.gen_layers_batched, []
@@ -137,11 +140,12 @@ def test_warmup_compiles_runs_the_real_step_and_a_served_row_reuses_its_compile(
         "action_mse_gen_indexes": a_static["action_mse_gen_indexes"], "action_domain_id": torch.tensor([2]),
     }
     m = a_static["num_vision_tokens"] + a_static["num_action_tokens"]
-    for with_cfg, groups in ((True, [(COND_LABEL, m), (UNCOND_LABEL, m)]), (False, [(COND_LABEL, m)])):
-        res.plan(CFG_BATCHED_LABEL, groups, causal=False)
+    for with_cfg, labels in ((True, (COND_LABEL, UNCOND_LABEL)), (False, (COND_LABEL,))):
+        segments = [("r", label, m) for label in labels]
+        run = functools.partial(model.denoise_step_action_batched, [areq], with_cfg)
         with torch.no_grad(), torch.compiler.set_stance("fail_on_recompile"):
-            (branches,) = model.denoise_step_action_batched([areq], CFG_BATCHED_LABEL, res.attn, with_cfg)
-        assert len(branches) == len(groups)
+            (branches,) = res.step(C.ACTION_GEN_WALK, segments, run, keep=False)
+        assert len(branches) == len(labels)
     assert [a[0].shape[0] for a in stacks] == [2 * m, m]
 
 

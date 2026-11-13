@@ -164,21 +164,29 @@ def test_a_failed_window_decodes_again_from_its_edges(monkeypatch, vae) -> None:
     assert torch.equal(retried[0], whole[:, :, 29:53]) and torch.equal(third[0], whole[:, :, 53:])
 
 
-def test_resumed_session_warms_up_from_the_stored_latents(monkeypatch, vae) -> None:
-    """A resumed session's first window decodes behind the session's stored
-    latent context (the store never holds a decoder cache), exactly as the
-    re-decode path does; its later windows run warm."""
+# Request 2 of a session whose request 1 covered units [0, 14): it resumes at
+# unit 14, its first window re-pinning 12..14 behind the session's last 3
+# latents, which the DiT sends ahead of the window's.
+_RESUME = {"resume_latent_units": OVERLAP, "window_latent_units": WINDOW, "total_latent_units": 14}
+
+
+def _resumed(stream: torch.Tensor) -> list:
+    windows = _windows(stream, start=12)
+    return [torch.cat([stream[:, :, 11:14], windows[0]], dim=2), *windows[1:]]
+
+
+def test_a_resumed_session_warms_up_from_the_context_the_dit_sends(monkeypatch, vae) -> None:
+    """A resumed session's first window decodes behind the session's decode
+    context, which arrives ahead of the window's latents (no decoder cache
+    outlives a request), exactly as the re-decode path does; its later
+    windows run warm."""
     stream = _stream(26)
     first = _windows(stream)[:2]  # request 1: units [0, 14)
-    # Request 2 resumes at unit 14 with its first window re-pinning 12..14.
-    resumed = _windows(stream, start=12)
     outs = {}
     for warm in (True, False):
         sub = _decoder(monkeypatch, vae, warm=warm)
-        _run(sub, "r1", first, 53, session_id="s")
-        stored = sub._sessions.get("s")
-        assert torch.is_tensor(stored) and stored.shape[2] == 3
-        outs[warm] = _run(sub, "r2", resumed, 48, session_id="s", resume_latent_units=OVERLAP)
+        _run(sub, "r1", first, 53)
+        outs[warm] = _run(sub, "r2", _resumed(stream), 48, **_RESUME)
     assert [c.shape[2] for c in outs[True]] == [24, 24]
     _u8_close(outs[True][0], outs[False][0])
     # The second window continues the cache: the stream from the stored
@@ -243,16 +251,16 @@ def test_window_in_one_decoder_call(monkeypatch, vae) -> None:
 
 
 def test_resumed_first_window_is_not_grouped(monkeypatch, vae) -> None:
-    """At ``=0`` a resumed session's first window re-decodes its stored
+    """At ``=0`` a resumed session's first window re-decodes its decode
     context ahead of the new latents one latent per call, so it peaks no
     higher than the default; the windows after it are grouped."""
     stream = _stream(26)
     sub = _decoder(monkeypatch, vae)
     sub.config.windowed_decode_latents_per_call = 0
-    _run(sub, "r1", _windows(stream)[:2], 53, session_id="s")
+    _run(sub, "r1", _windows(stream)[:2], 53)
     calls = _record_calls(sub)
-    _run(sub, "r2", _windows(stream, start=12), 48, session_id="s", resume_latent_units=OVERLAP)
-    # 3 stored context latents + 6 new, then one 6-latent call.
+    _run(sub, "r2", _resumed(stream), 48, **_RESUME)
+    # 3 context latents + 6 new, then one 6-latent call.
     assert calls == [1] * 9 + [6]
 
 
