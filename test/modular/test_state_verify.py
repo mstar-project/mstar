@@ -334,6 +334,36 @@ def test_the_eager_tables_grow_outside_capture():
              lambda: h.begin_step(_step(h, ctx=_ctx(lease=lease, capture=True))))
 
 
+class _StubGroup:
+    """A second TP rank, which settled ``other``."""
+
+    world_size = 2
+
+    def __init__(self, other):
+        self.other = torch.tensor(other)
+
+    def all_gather(self, counts, dim=0):
+        return torch.cat([counts, self.other], dim)
+
+
+def _settled_on_two_ranks(other, monkeypatch):
+    monkeypatch.setattr(adapters, "_DEBUG_ASSERTS", True)
+    kv = _StubKV()
+    kv.tp_group = _StubGroup(other)
+    _verify(_handle(kv=kv), [3, 2])
+    return kv.deferred[0][2]
+
+
+def test_tp_ranks_that_settle_alike_apply_their_count(monkeypatch):
+    assert _settled_on_two_ranks([3, 2], monkeypatch).delta() == -1, "ranks that agree apply the count"
+
+
+def test_the_tp_compare_refuses_counts_that_differ(monkeypatch):
+    count = _settled_on_two_ranks([3, 1], monkeypatch)
+    with pytest.raises(RuntimeError, match=r"settled verify step 1 differently, \[\[3, 2\], \[3, 1\]\]"):
+        count.delta()
+
+
 # The resources
 
 
