@@ -285,6 +285,14 @@ frontend's (``--python-frontend``); ``mstar-server``'s rows are under
        gets the 413 before it sends the body. It also caps one
        message on every WebSocket route unless the config sets
        ``ws_max_message_mb``; a larger one closes the socket (1009).
+   * - ``MSTAR_LOG_REQUESTS``
+     - unset
+     - ``1`` logs each request's lifecycle (submitted, queued at capacity,
+       admitted, done, torn down) whatever ``--log-level`` is, on either
+       frontend (:func:`mstar.utils.logging_config.configure_request_log`).
+       The lines are DEBUG, on the ``mstar.requests`` logger; turning on all
+       of DEBUG for them also logs every transport message and tensor, which
+       slows a server. Without it, the conductor logs a summary once a minute.
    * - ``MSTAR_ROOT_PATH``
      - ``""``
      - Mount the app under a URL sub-path. Set it when an ingress routes the

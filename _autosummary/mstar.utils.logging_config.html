@@ -742,6 +742,7 @@
             </div>
             <nav aria-label="Page">
                 <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.logging_config.configure_request_log"><code class="docutils literal notranslate"><span class="pre">configure_request_log()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.logging_config.log_off_thread"><code class="docutils literal notranslate"><span class="pre">log_off_thread()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.logging_config.quiet_noisy_loggers"><code class="docutils literal notranslate"><span class="pre">quiet_noisy_loggers()</span></code></a></li>
 </ul>
@@ -760,15 +761,30 @@
 <p class="rubric">Functions</p>
 <div class="pst-scrollable-table-container"><table class="autosummary longtable table">
 <tbody>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.logging_config.log_off_thread" title="mstar.utils.logging_config.log_off_thread"><code class="xref py py-obj docutils literal notranslate"><span class="pre">log_off_thread</span></code></a>()</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.logging_config.configure_request_log" title="mstar.utils.logging_config.configure_request_log"><code class="xref py py-obj docutils literal notranslate"><span class="pre">configure_request_log</span></code></a>()</p></td>
+<td><p>With <code class="docutils literal notranslate"><span class="pre">MSTAR_LOG_REQUESTS=1</span></code>, log the request lifecycle lines whatever the process's level.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.logging_config.log_off_thread" title="mstar.utils.logging_config.log_off_thread"><code class="xref py py-obj docutils literal notranslate"><span class="pre">log_off_thread</span></code></a>()</p></td>
 <td><p>Hand the root logger's records to a thread that writes them.</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.utils.logging_config.quiet_noisy_loggers" title="mstar.utils.logging_config.quiet_noisy_loggers"><code class="xref py py-obj docutils literal notranslate"><span class="pre">quiet_noisy_loggers</span></code></a>([level])</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.utils.logging_config.quiet_noisy_loggers" title="mstar.utils.logging_config.quiet_noisy_loggers"><code class="xref py py-obj docutils literal notranslate"><span class="pre">quiet_noisy_loggers</span></code></a>([level])</p></td>
 <td><p>Raise chatty third-party loggers to <code class="docutils literal notranslate"><span class="pre">level</span></code> (default WARNING).</p></td>
 </tr>
 </tbody>
 </table>
 </div>
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.utils.logging_config.configure_request_log">
+<span class="sig-prename descclassname"><span class="pre">mstar.utils.logging_config.</span></span><span class="sig-name descname"><span class="pre">configure_request_log</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/logging_config.html#configure_request_log"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.logging_config.configure_request_log" title="Link to this definition">#</a></dt>
+<dd><p>With <code class="docutils literal notranslate"><span class="pre">MSTAR_LOG_REQUESTS=1</span></code>, log the request lifecycle lines whatever
+the process’s level. Call once after <code class="docutils literal notranslate"><span class="pre">logging.basicConfig</span></code> in each process.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Return type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
 <dl class="py function">
 <dt class="sig sig-object py" id="mstar.utils.logging_config.log_off_thread">
 <span class="sig-prename descclassname"><span class="pre">mstar.utils.logging_config.</span></span><span class="sig-name descname"><span class="pre">log_off_thread</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/utils/logging_config.html#log_off_thread"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.utils.logging_config.log_off_thread" title="Link to this definition">#</a></dt>
@@ -850,6 +866,7 @@ level. Call once after <code class="docutils literal notranslate"><span class="p
   </div>
   <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.logging_config.configure_request_log"><code class="docutils literal notranslate"><span class="pre">configure_request_log()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.logging_config.log_off_thread"><code class="docutils literal notranslate"><span class="pre">log_off_thread()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.logging_config.quiet_noisy_loggers"><code class="docutils literal notranslate"><span class="pre">quiet_noisy_loggers()</span></code></a></li>
 </ul>

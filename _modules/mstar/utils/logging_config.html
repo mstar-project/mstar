@@ -1035,6 +1035,7 @@ window.runMermaid = runMermaid;</script>
   <h1>Source code for mstar.utils.logging_config</h1><div class="highlight"><pre>
 <span></span><span class="kn">import</span><span class="w"> </span><span class="nn">atexit</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">logging</span>
+<span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">queue</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Callable</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">logging.handlers</span><span class="w"> </span><span class="kn">import</span> <span class="n">QueueHandler</span>
@@ -1052,6 +1053,22 @@ window.runMermaid = runMermaid;</script>
     <span class="s2">"huggingface_hub"</span><span class="p">,</span>
     <span class="s2">"filelock"</span><span class="p">,</span>
 <span class="p">)</span>
+
+
+<span class="c1"># Each request's lifecycle lines (submitted, queued, admitted, done, torn down)</span>
+<span class="c1"># log at DEBUG to this logger, so they can be turned on without the rest of</span>
+<span class="c1"># DEBUG, which logs per transport message and per tensor.</span>
+<span class="n">REQUEST_LOGGER</span> <span class="o">=</span> <span class="s2">"mstar.requests"</span>
+
+
+<div class="viewcode-block" id="configure_request_log">
+<a class="viewcode-back" href="../../../_autosummary/mstar.utils.logging_config.html#mstar.utils.logging_config.configure_request_log">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">configure_request_log</span><span class="p">()</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""With ``MSTAR_LOG_REQUESTS=1``, log the request lifecycle lines whatever</span>
+<span class="sd">    the process's level. Call once after ``logging.basicConfig`` in each process."""</span>
+    <span class="k">if</span> <span class="n">os</span><span class="o">.</span><span class="n">environ</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"MSTAR_LOG_REQUESTS"</span><span class="p">)</span> <span class="o">==</span> <span class="s2">"1"</span><span class="p">:</span>
+        <span class="n">logging</span><span class="o">.</span><span class="n">getLogger</span><span class="p">(</span><span class="n">REQUEST_LOGGER</span><span class="p">)</span><span class="o">.</span><span class="n">setLevel</span><span class="p">(</span><span class="n">logging</span><span class="o">.</span><span class="n">DEBUG</span><span class="p">)</span></div>
+
 
 
 <div class="viewcode-block" id="quiet_noisy_loggers">

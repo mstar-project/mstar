@@ -1148,7 +1148,8 @@ take a stage prefix (<code class="docutils literal notranslate"><span class="pre
 rules; an unprefixed knob sets the primary stage (the thinker of Qwen3-Omni, the talker
 of Qwen3-TTS), and a prefixed one wins over it for its stage.</p>
 <p>A knob the model does not read is not an error: the request is served, and the server
-logs its name as ignored (check the server log for typos such as <code class="docutils literal notranslate"><span class="pre">temprature</span></code>).</p>
+logs its name as ignored, on the first request that sends that set of names (check the server log
+for typos such as <code class="docutils literal notranslate"><span class="pre">temprature</span></code>).</p>
 </section>
 <section id="python-sdk">
 <h2>Python SDK<a class="headerlink" href="#python-sdk" title="Link to this heading">#</a></h2>
@@ -1405,7 +1406,7 @@ time: refusing a 31 min file takes about as long as decoding it.
 Whisper also reads <code class="docutils literal notranslate"><span class="pre">task</span></code> (<code class="docutils literal notranslate"><span class="pre">transcribe</span></code>, the default, or <code class="docutils literal notranslate"><span class="pre">translate</span></code> into
 English). Its <code class="docutils literal notranslate"><span class="pre">max_output_tokens</span></code> is at most 444, the 448-position table less the
 forced prompt; more is a 400. Higgs-Audio’s default is 1024. A key the model does not
-read is logged as ignored on each request that sends it.</p></li>
+read is logged as ignored, on the first request that sends that set of keys.</p></li>
 <li><p><strong>Omnilingual ASR</strong> (<code class="docutils literal notranslate"><span class="pre">omnilingual_asr_ctc_*</span></code>): no language code is needed for any of
 its 1,600+ languages, and <code class="docutils literal notranslate"><span class="pre">language</span></code> / <code class="docutils literal notranslate"><span class="pre">prompt</span></code> / <code class="docutils literal notranslate"><span class="pre">temperature</span></code> have no effect. A
 clip of up to 20 s is one request; a longer upload is cut into windows of about equal

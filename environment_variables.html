@@ -1098,7 +1098,16 @@ gets the 413 before it sends the body. It also caps one
 message on every WebSocket route unless the config sets
 <code class="docutils literal notranslate"><span class="pre">ws_max_message_mb</span></code>; a larger one closes the socket (1009).</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_ROOT_PATH</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_LOG_REQUESTS</span></code></p></td>
+<td><p>unset</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">1</span></code> logs each request’s lifecycle (submitted, queued at capacity,
+admitted, done, torn down) whatever <code class="docutils literal notranslate"><span class="pre">--log-level</span></code> is, on either
+frontend (<a class="reference internal" href="_autosummary/mstar.utils.logging_config.html#mstar.utils.logging_config.configure_request_log" title="mstar.utils.logging_config.configure_request_log"><code class="xref py py-func docutils literal notranslate"><span class="pre">mstar.utils.logging_config.configure_request_log()</span></code></a>).
+The lines are DEBUG, on the <code class="docutils literal notranslate"><span class="pre">mstar.requests</span></code> logger; turning on all
+of DEBUG for them also logs every transport message and tensor, which
+slows a server. Without it, the conductor logs a summary once a minute.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_ROOT_PATH</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">&quot;&quot;</span></code></p></td>
 <td><p>Mount the app under a URL sub-path. Set it when an ingress routes the
 deployment at a prefix and does not strip that prefix before the
@@ -1109,7 +1118,7 @@ as sent, on both frontends (Starlette’s <code class="docutils literal notransl
 in <code class="docutils literal notranslate"><span class="pre">rust/server/src/main.rs</span></code>). Empty by default, so a direct
 deployment is unaffected.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_MAX_IMAGES_PER_REQUEST</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_MAX_IMAGES_PER_REQUEST</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">10</span></code></p></td>
 <td><p>Largest <code class="docutils literal notranslate"><span class="pre">n</span></code> one <code class="docutils literal notranslate"><span class="pre">/v1/images/generations</span></code> request may ask for (see
 <a class="reference internal" href="_autosummary/mstar.api_server.openai.serving_images.html#mstar.api_server.openai.serving_images.max_images_per_request" title="mstar.api_server.openai.serving_images.max_images_per_request"><code class="xref py py-func docutils literal notranslate"><span class="pre">mstar.api_server.openai.serving_images.max_images_per_request()</span></code></a>);
@@ -1117,7 +1126,7 @@ deployment is unaffected.</p></td>
 submitted. The Rust frontend and the Dynamo bridge apply the same
 variable and default.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_API_KEY</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_API_KEY</span></code></p></td>
 <td><p>unset</p></td>
 <td><p>API key (read by <a class="reference internal" href="_autosummary/mstar.api_server.auth.html#mstar.api_server.auth.resolve_api_key" title="mstar.api_server.auth.resolve_api_key"><code class="xref py py-func docutils literal notranslate"><span class="pre">mstar.api_server.auth.resolve_api_key()</span></code></a>;
 <code class="docutils literal notranslate"><span class="pre">--api-key</span></code> overrides it). When set, every route except
@@ -1128,7 +1137,7 @@ workers do not inherit it), and
 <code class="xref py py-class docutils literal notranslate"><span class="pre">mstar.client.MStarClient</span></code> sends it when not given
 <code class="docutils literal notranslate"><span class="pre">api_key</span></code>. See <a class="reference internal" href="serving.html#api-key"><span class="std std-ref">API key</span></a>.</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SILERO_VAD_PATH</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SILERO_VAD_PATH</span></code></p></td>
 <td><p>unset</p></td>
 <td><p>Silero VAD ONNX file (<code class="docutils literal notranslate"><span class="pre">silero_vad.onnx</span></code>) for <code class="docutils literal notranslate"><span class="pre">/v1/realtime</span></code>
 <code class="docutils literal notranslate"><span class="pre">server_vad</span></code> turn detection, read by
@@ -1137,7 +1146,7 @@ workers do not inherit it), and
 with a file whose inputs or outputs differ (the package’s other
 exports), <code class="docutils literal notranslate"><span class="pre">server_vad</span></code> sessions are refused. Never downloaded.</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SMART_TURN_PATH</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MSTAR_SMART_TURN_PATH</span></code></p></td>
 <td><p>unset</p></td>
 <td><p>Pipecat Smart Turn v3 ONNX file for <code class="docutils literal notranslate"><span class="pre">/v1/realtime</span></code> <code class="docutils literal notranslate"><span class="pre">semantic_vad</span></code>,
 read by <code class="docutils literal notranslate"><span class="pre">realtime_vad.smart_turn_weights</span></code>. Unset, the
