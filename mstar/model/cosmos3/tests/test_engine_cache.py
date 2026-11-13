@@ -143,7 +143,7 @@ def dit_handles(model, resources):
 def kv_config(model, state_layout, loop_caps) -> KVReqConfig:
     """The ``kv`` config a request opens with, from what its ``process_prompt`` laid out, as the conductor builds it."""
     layout = kv_layouts(model.declare_state(), state_layout, {})[KV_CACHE]
-    config = KVReqConfig()
+    config = KVReqConfig(needed_labels=list(layout))
     config.apply_conductor_config(kv_layout={label: each.row() for label, each in layout.items()}, loop_caps=loop_caps)
     return config
 
@@ -432,6 +432,7 @@ def _forward_step(
         if step is not None:
             step.check_calls()
             runner.commit(step)
+            step.commit_calls()
     finally:
         if step is not None:
             step.end_calls()
