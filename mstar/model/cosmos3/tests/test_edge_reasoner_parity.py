@@ -32,9 +32,10 @@ import torch
 import torch.nn.functional as F
 
 from mstar.model.cosmos3 import constants as C
-from mstar.model.cosmos3.submodules import COND_LABEL
+from mstar.model.cosmos3.submodules import COND_LABEL, SAMPLER
 from mstar.model.cosmos3.tests.test_edge import EDGE_DIR
-from mstar.model.cosmos3.tests.test_engine_cache import _SdpaResources, declaring
+from mstar.model.cosmos3.tests.test_engine_cache import _SdpaAttention, _SdpaKV, _SdpaResources, declaring
+from mstar.testing_utils.resource import StubResource
 
 REF = os.environ.get("COSMOS3_EDGE_REF")
 needs_ref = pytest.mark.skipif(
@@ -43,52 +44,94 @@ needs_ref = pytest.mark.skipif(
 )
 
 
-class _SdpaKV:
-    """kv + attn stand-in for one request: appends this step's K/V to the
-    per-layer history and attends causally over [history | step]."""
+class _StreamKV(_SdpaKV):
+    """`_SdpaKV` with a stream per request: its K/V by request and layer."""
 
-    requires_kv_write = True
+    def plan(self, step, ctx):
+        self.segments = tuple(step.segments)
 
-    def __init__(self):
-        self._label = "main"
-        self._layer = 0
-        self.history: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
-        self._pending = None
+    def write_kv(self, k, v, layer_idx=None, label=None, tokens=None):
+        layer = self.layer_view(layer_idx)
+        offset = 0
+        for seg in self.segments:
+            self.pending[(seg.request_id, layer)] = (k[offset:offset + seg.span], v[offset:offset + seg.span])
+            offset += seg.span
 
-    @property
-    def default_label(self):
-        return self._label
 
-    def set_default_label(self, label):
-        self._label = label
-
-    def set_default_layer_idx(self, i):
-        self._layer = i
-
-    def layer_view(self, layer_idx=None):
-        return self._layer if layer_idx is None else layer_idx
-
-    def write_kv(self, k, v, layer_idx=None, label=None):
-        self._pending = (k, v)
+class _CausalSdpa(_SdpaAttention):
+    """`_SdpaAttention` over a `_StreamKV`: each request's queries attend causally over what it kept and this step's
+    K/V."""
 
     def run(self, q, label=None, kv_cache_layer=None, k=None, v=None, layer_idx=None):
-        k, v = self._pending
-        self._pending = None
-        prev = self.history.get(kv_cache_layer)
-        if prev is not None:
-            k = torch.cat([prev[0], k])
-            v = torch.cat([prev[1], v])
-        self.history[kv_cache_layer] = (k, v)
-        n_q = q.shape[0]
-        n_k = k.shape[0]
-        # Causal over the whole stream; queries are the last n_q positions.
-        mask = torch.ones(n_q, n_k, dtype=torch.bool).tril(diagonal=n_k - n_q)
-        out = F.scaled_dot_product_attention(
-            q.unsqueeze(0).transpose(1, 2), k.unsqueeze(0).transpose(1, 2), v.unsqueeze(0).transpose(1, 2),
-            attn_mask=mask, enable_gqa=True,
-        )
-        return out.transpose(1, 2).squeeze(0)
+        layer = self._default_layer_idx if layer_idx is None else layer_idx
+        outs, offset = [], 0
+        for seg in self._kv.segments:
+            rows = slice(offset, offset + seg.span)
+            offset += seg.span
+            k_i, v_i = k[rows], v[rows]
+            kept = self._kv.committed.get((seg.request_id, layer))
+            if kept is not None:
+                k_i, v_i = torch.cat([kept[0], k_i]), torch.cat([kept[1], v_i])
+            # the step's queries are the stream's last positions, which sdpa's is_causal would align to its first
+            mask = torch.ones(seg.span, k_i.shape[0], dtype=torch.bool).tril(diagonal=k_i.shape[0] - seg.span)
+            out = F.scaled_dot_product_attention(
+                q[rows].unsqueeze(0).transpose(1, 2), k_i.unsqueeze(0).transpose(1, 2),
+                v_i.unsqueeze(0).transpose(1, 2), attn_mask=mask, enable_gqa=True,
+            )
+            outs.append(out.transpose(1, 2).squeeze(0))
+        return torch.cat(outs)
 
+    def select_last_hidden(self, x, label="main"):
+        return x[torch.tensor([seg.span for seg in self._kv.segments]).cumsum(0) - 1]
+
+
+class _CountedPositions(StubResource):
+    """The positions stand-in: one counter per request, a step's positions read off it, moved as the step declares."""
+
+    def __init__(self):
+        self.counters: dict[str, int] = {}
+        self.planned = None
+
+    def position(self, rid, label):
+        return self.counters.get(rid, 0)
+
+    def pos_ids(self, label):
+        return self.planned
+
+    def plan(self, step, ctx):
+        self.planned = torch.cat([
+            torch.arange(self.position(seg.request_id, seg.label), self.position(seg.request_id, seg.label) + seg.span)
+            for seg in step.segments
+        ])
+
+    def commit(self, step, ctx):
+        advance = step.advance or tuple(seg.span for seg in step.segments)
+        for seg, n in zip(step.segments, advance, strict=True):
+            self.counters[seg.request_id] = self.position(seg.request_id, seg.label) + n
+
+
+class _GreedySampler(StubResource):
+    """The sampler stand-in. It keeps no slot masters, so a decode step takes the ids it is routed."""
+
+    has_slot_masters = False
+
+    def sample(self, request_ids, logits, **kwargs):
+        return logits.argmax(dim=-1)
+
+
+class _StreamResources(_SdpaResources):
+    """`_SdpaResources` as the reasoner needs them: a stream per request, causal reads over what it kept, counted
+    positions and a greedy sampler."""
+
+    def __init__(self):
+        super().__init__()
+        self.kv = _StreamKV()
+        self.attn = _CausalSdpa(self.kv)
+        self.positions = _CountedPositions()
+        self.sampler = _GreedySampler()
+
+    def as_dict(self):
+        return {**super().as_dict(), SAMPLER: self.sampler}
 
 
 @needs_ref
@@ -161,7 +204,7 @@ def test_reasoner_logits_and_greedy_tokens_match_reference() -> None:
     model = model.to_empty(device="cpu").float()
     load_transformer_weights(model, EDGE_DIR, device="cpu")
     model.eval()
-    res = _SdpaResources()
+    res = _StreamResources()
     res.bind(declaring(cfg), model)
 
     ids = rec["input_ids"]
@@ -196,98 +239,31 @@ def test_reasoner_logits_and_greedy_tokens_match_reference() -> None:
     assert produced == rec["greedy_tokens"].tolist(), (produced, rec["greedy_tokens"].tolist())
 
 
-class _FakeSampler:
-    """Greedy stand-in for the sampler resource. It keeps no slot masters, so
-    a decode step takes the ids it is routed."""
-
-    has_slot_masters = False
-
-    def sample(self, request_ids, logits):
-        return logits.argmax(dim=-1)
-
-
-class _PackedSdpaKV(_SdpaKV):
-    """Multi-request variant: the step's packed K/V splits into per-request
-    streams by the declared spans (``plan``), each with its own history."""
-
-    def __init__(self):
-        super().__init__()
-        self.spans: list[int] = []
-        self.rids: list[str] = []
-        self.history = {}  # (rid, layer) -> (k, v)
-
-    def plan(self, rids, spans):
-        self.rids, self.spans = list(rids), list(spans)
-
-    def select_last_hidden(self, hidden):
-        return hidden[torch.tensor(self.spans).cumsum(0) - 1]
-
-    def run(self, q, label=None, kv_cache_layer=None, k=None, v=None, layer_idx=None):
-        k_all, v_all = self._pending
-        self._pending = None
-        outs, off = [], 0
-        for rid, span in zip(self.rids, self.spans, strict=True):
-            q_i, k_i, v_i = q[off:off + span], k_all[off:off + span], v_all[off:off + span]
-            off += span
-            prev = self.history.get((rid, kv_cache_layer))
-            if prev is not None:
-                k_i = torch.cat([prev[0], k_i])
-                v_i = torch.cat([prev[1], v_i])
-            self.history[(rid, kv_cache_layer)] = (k_i, v_i)
-            n_q, n_k = q_i.shape[0], k_i.shape[0]
-            mask = torch.ones(n_q, n_k, dtype=torch.bool).tril(diagonal=n_k - n_q)
-            o = F.scaled_dot_product_attention(
-                q_i.unsqueeze(0).transpose(1, 2), k_i.unsqueeze(0).transpose(1, 2), v_i.unsqueeze(0).transpose(1, 2),
-                attn_mask=mask, enable_gqa=True,
-            )
-            outs.append(o.transpose(1, 2).squeeze(0))
-        return torch.cat(outs)
-
-
-class _Positions:
-    """Position resource stand-in: one counter per request, each step's
-    planned positions read off it, moved as the step declares."""
-
-    def __init__(self):
-        self.counters: dict[str, int] = {}
-        self.planned = None
-
-    def position(self, rid, label):
-        return self.counters.get(rid, 0)
-
-    def plan(self, step):
-        self.planned = torch.cat([
-            torch.arange(self.position(seg.request_id, seg.label), self.position(seg.request_id, seg.label) + seg.span)
-            for seg in step.segments
-        ])
-
-    def pos_ids(self, label):
-        return self.planned
-
-    def commit(self, step, rope):
-        advance = step.steps[rope].advance or tuple(seg.span for seg in step.segments)
-        for seg, n in zip(step.segments, advance, strict=True):
-            self.counters[seg.request_id] = self.position(seg.request_id, seg.label) + n
-
-
 def run_served_reasoner(model, cfg, encoder, ids, grid, vision_tokens, steps, rids=("a", "b")):
     """``steps`` greedy tokens of each of ``rids`` (identical requests packed
     per step) through ``Cosmos3ReasonerSubmodule``'s served path: prepare_inputs
-    -> declare_step -> preprocess -> forward_batched, the vision prefill and
-    then decode, over stand-in kv/attn/sampler/position resources."""
+    -> the step it declares, admitted and planned -> preprocess -> forward_batched
+    -> commit, the vision prefill and then decode, with the node's handles over
+    stand-in resources."""
     import types
 
+    from mstar.engine.resources import StepContext, StepRunner
+    from mstar.engine.state.adapters import node_handles, state_setup
     from mstar.model.cosmos3.components.reasoner import vision_layout
     from mstar.model.cosmos3.constants import REASONER_DECODE_WALK, REASONER_PREFILL_VISION_WALK
-    from mstar.model.cosmos3.submodules import ATTN, KV_CACHE, SAMPLER, Cosmos3ReasonerSubmodule
-    from mstar.model.keys import ROPE
+    from mstar.model.cosmos3.cosmos3_model import REASONER_NODE
+    from mstar.model.cosmos3.submodules import Cosmos3ReasonerSubmodule
     from mstar.model.multimodal import MEDIA_LAYOUT
-    from mstar.model.submodule_base import ModelInputsFromEngine
+    from mstar.model.submodule_base import ModelInputsFromEngine, engine_step
 
     sub = Cosmos3ReasonerSubmodule(transformer=model, config=cfg, encoders=(encoder,))
-    kv, pos = _PackedSdpaKV(), _Positions()
-    resources = {KV_CACHE: kv, ATTN: kv, SAMPLER: _FakeSampler(), ROPE: pos}
+    resources = _StreamResources().as_dict()
+    cosmos3 = declaring(cfg)
+    setup, problems = state_setup({}, cosmos3.declare_state(), cosmos3.kernel_settings())
+    assert not problems, problems
     sub.bind_node_resources(resources)
+    sub.bind_node_state(node_handles(cosmos3, REASONER_NODE, resources, setup=setup))
+    runner = StepRunner(resources)
     rids = list(rids)
     layout = vision_layout(ids, cfg.reasoner, [grid], [], encoder.output)
 
@@ -297,15 +273,21 @@ def run_served_reasoner(model, cfg, encoder, ids, grid, vision_tokens, steps, ri
             for rid in rids
         }
         inputs = [sub.prepare_inputs(walk, fwd[rid], per_request_inputs[rid]) for rid in rids]
-        declared = sub.declare_step(walk, rids, inputs)
-        assert [seg.label for seg in declared.segments] == ["main"] * len(rids)
-        kv.plan(rids, [seg.span for seg in declared.segments])
-        pos.plan(declared)
-        ei = ModelInputsFromEngine(request_ids=rids, per_request_info=fwd, resources=resources)
-        pre = sub.preprocess(walk, ei, inputs)
-        with torch.no_grad():
-            tokens = sub.forward_batched(walk, ei, **pre).row_outputs["new_token"]
-        pos.commit(declared, ROPE)
+        declared = engine_step(sub, graph_walk=walk, request_ids=rids, inputs=inputs)
+        assert [seg.label for seg in declared.segments] == [COND_LABEL] * len(rids)
+        declared.set_ctx(StepContext(tuple(rids), walk, 0, False))
+        assert runner.admit(declared).ok
+        runner.plan(declared)
+        declared.begin_calls()
+        try:
+            ei = ModelInputsFromEngine(request_ids=rids, per_request_info=fwd, step=declared)
+            pre = sub.preprocess(walk, ei, inputs)
+            with torch.no_grad():
+                tokens = sub.forward_batched(walk, ei, **pre).row_outputs["new_token"]
+            declared.check_calls()
+            runner.commit(declared)
+        finally:
+            declared.end_calls()
         return tokens
 
     tokens = step(REASONER_PREFILL_VISION_WALK, {
