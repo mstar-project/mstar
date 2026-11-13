@@ -92,7 +92,9 @@ from mstar.model.praxis1.submodules import (
     ENCODER_COND_KV,
     EXPERT_QUERIES,
     EXPERT_TRUNK_KEYS,
+    Praxis1ActionExpertSubmodule,
     Praxis1ActionHeadSubmodule,
+    Praxis1BackboneSubmodule,
     Praxis1TextEncoderSubmodule,
     Praxis1VaeEncoderSubmodule,
 )
@@ -206,6 +208,30 @@ class Praxis1Model(Model):
         )
         self._repo_dir = Path(local)
         return self._repo_dir
+
+    def _ensure_component_weights(self, prefix: str) -> Path:
+        """Fetch only indexed shards needed by one tower, pinned to the config revision."""
+        from huggingface_hub import hf_hub_download
+        from huggingface_hub.errors import EntryNotFoundError
+
+        from mstar.model.praxis1.weight_loader import INDEX, SINGLE, required_shards
+
+        root = self._ensure_repo()
+        revision = root.name if root.parent.name == "snapshots" else None
+        if not (root / INDEX).is_file() and not (root / SINGLE).is_file():
+            if revision is None:
+                raise FileNotFoundError(f"Praxis weights lack {INDEX} or {SINGLE} in {root}")
+            try:
+                hf_hub_download(self.model_path_hf, INDEX, revision=revision, cache_dir=self.cache_dir)
+            except EntryNotFoundError:
+                hf_hub_download(self.model_path_hf, SINGLE, revision=revision, cache_dir=self.cache_dir)
+        for filename in required_shards(root, prefix):
+            if (root / filename).is_file():
+                continue
+            if revision is None:
+                raise FileNotFoundError(f"Praxis weights lack {filename} in {root}")
+            hf_hub_download(self.model_path_hf, filename, revision=revision, cache_dir=self.cache_dir)
+        return root
 
     def _rig(self) -> str:
         """The rig this registry entry serves, from the checkpoint it names."""
@@ -763,8 +789,26 @@ class Praxis1Model(Model):
             )
         if node_name == "action_head":
             return Praxis1ActionHeadSubmodule(self.config)
-        if node_name in ("backbone", "action_expert"):
-            raise NotImplementedError(
-                f"the Praxis-1 trunk node {node_name!r} lands with the backbone port"
-            )
+        if node_name == "backbone":
+            from mstar.model.praxis1.native_towers import build_backbone
+            from mstar.model.praxis1.weight_loader import load_component
+
+            with torch.device("meta"):
+                backbone = build_backbone(self.config)
+            for component in ("encoder", "decoder"):
+                prefix = f"backbone.{component}."
+                root = self._ensure_component_weights(prefix)
+                load_component(getattr(backbone, component), root, prefix, assign=True)
+            return Praxis1BackboneSubmodule(
+                self.config, backbone, episode_text=self.sampler_defaults["max_context_chunks"] > 0,
+            ).to(device)
+        if node_name == "action_expert":
+            from mstar.model.praxis1.native_towers import build_expert
+            from mstar.model.praxis1.weight_loader import load_component
+
+            with torch.device("meta"):
+                expert = build_expert(self.config)
+            root = self._ensure_component_weights("action_expert.")
+            load_component(expert, root, "action_expert.", assign=True)
+            return Praxis1ActionExpertSubmodule(self.config, expert).to(device)
         raise ValueError(f"Praxis-1 has no node {node_name!r}")

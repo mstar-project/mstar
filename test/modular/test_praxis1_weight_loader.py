@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
 import pytest
 import torch
@@ -11,6 +12,9 @@ from safetensors.torch import save_file
 from mstar.model.praxis1 import weight_loader as loader
 from mstar.model.praxis1.components.action_expert import ActionExpertBlock
 from mstar.model.praxis1.components.encoder import EncoderTower, TrunkStack
+from mstar.model.praxis1.config import Praxis1Config
+from mstar.model.praxis1.native_towers import build_backbone, build_expert
+from mstar.model.praxis1.praxis1_model import Praxis1Model
 
 
 def _encoder() -> EncoderTower:
@@ -176,3 +180,76 @@ def test_fp8_checkpoint_is_refused_before_opening_weights(tmp_path, monkeypatch)
         loader.required_shards(tmp_path, "action_expert.blocks.0.")
     with pytest.raises(ValueError, match="quant_method fp8"):
         loader.load_component(source, tmp_path, "action_expert.blocks.0.")
+
+
+def _tiny_config():
+    from tests.tiny_model import tiny_config
+
+    raw = tiny_config()
+    config = replace(
+        Praxis1Config.for_rig("single_arm"), raw=raw,
+        dim=64, timestep_dim=16, encoder_depth=3, decoder_depth=2,
+        tap_blocks=(0, 2), num_heads=4, num_kv_heads=2, head_dim=16,
+        num_routed_experts=4, top_k_routed=2, expert_hidden=32,
+        dense_ffn_hidden=96, dispatch_chunk_size=40,
+        expert_dim=64, expert_layers=4, expert_heads=1, expert_head_dim=64,
+        trunk_dim=64, text_hidden_dim=32,
+    )
+    return raw, config
+
+
+def test_native_factory_matches_all_tiny_reference_keys_and_shapes() -> None:
+    pytest.importorskip("praxis", reason="reference checkout is not on PYTHONPATH")
+    from praxis.model import PraxisPolicy
+
+    raw, config = _tiny_config()
+    reference = PraxisPolicy.from_config(raw)
+    backbone = build_backbone(config)
+    expert = build_expert(config)
+    for expected, actual in (
+        (reference.backbone.encoder, backbone.encoder),
+        (reference.backbone.decoder, backbone.decoder),
+        (reference.action_expert, expert),
+    ):
+        mapped = {loader._local_key(key): value for key, value in expected.state_dict().items()}
+        assert {key: value.shape for key, value in mapped.items()} == {
+            key: value.shape for key, value in actual.state_dict().items()
+        }
+
+
+def test_model_loads_only_native_tower_shards_from_local_tiny_checkpoint(tmp_path) -> None:
+    pytest.importorskip("praxis", reason="reference checkout is not on PYTHONPATH")
+    from praxis.model import PraxisPolicy
+
+    raw, config = _tiny_config()
+    reference = PraxisPolicy.from_config(raw)
+    weight_map = {}
+    for name, component in (
+        ("backbone.encoder", reference.backbone.encoder),
+        ("backbone.decoder", reference.backbone.decoder),
+        ("action_expert", reference.action_expert),
+    ):
+        tensors = {}
+        for index, (key, value) in enumerate(component.state_dict().items()):
+            tensors[f"{name}.{key}"] = torch.full_like(value, (index + 1) / 100).contiguous()
+        filename = f"{name}.safetensors"
+        save_file(tensors, tmp_path / filename)
+        weight_map.update(dict.fromkeys(tensors, filename))
+    (tmp_path / loader.INDEX).write_text(json.dumps({"weight_map": weight_map}))
+    (tmp_path / "config.json").write_text(json.dumps(raw))
+
+    model = Praxis1Model("runwayml/praxis-1-droid", skip_weight_loading=True)
+    model.config = config
+    model._repo_dir = tmp_path
+    model.skip_weight_loading = False
+    backbone_node = model._create_submodule("backbone", "cpu")
+    expert_node = model._create_submodule("action_expert", "cpu")
+    assert not any(value.is_meta for value in backbone_node.state_dict().values())
+    assert not any(value.is_meta for value in expert_node.state_dict().values())
+    for component in (
+        backbone_node.backbone.encoder,
+        backbone_node.backbone.decoder,
+        expert_node.expert,
+    ):
+        assert all(torch.equal(value, torch.full_like(value, (index + 1) / 100))
+                   for index, value in enumerate(component.state_dict().values()))
