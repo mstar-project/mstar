@@ -373,7 +373,7 @@ def _talker() -> TalkerSubmodule:
 ])
 def test_voxcpm2_steps_equal_the_hand_written_ones(walk, lengths):
     rids = [1, 2]
-    inputs = [ARNodeInputs(input_seq_len=n, kwargs={"step": 0, "rng": b"state"}) for n in lengths]
+    inputs = [ARNodeInputs(input_seq_len=n, kwargs={"step": 0, "from_request": True}) for n in lengths]
     step = engine_step(_talker(), graph_walk=walk, request_ids=rids, inputs=inputs)
     reference = SubmoduleStep(
         segments=_segments(rids, inputs),

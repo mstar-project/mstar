@@ -996,8 +996,7 @@ def test_talker_host_writes_rely_on_exec_declaring_again_after_a_pre_plan(model)
     step.begin_calls()
     step.commit_calls()
     step.end_calls()
-    assert _committed(talker, "r") == {"generated": before["generated"] + 1, "rng": prepared.kwargs["rng"]}
-    assert prepared.kwargs["rng"] != before["rng"], "the draw moved the generator"
+    assert _committed(talker, "r") == {"generated": before["generated"] + 1}
 
 
 def test_talker_declaring_a_step_twice_advances_it_once(model):
@@ -1015,7 +1014,7 @@ def test_talker_capture_rows_carry_cfg_and_no_rng_and_write_nothing(model, walk)
     talker, _, _ = _talker(model)
     graphs = {graph.capture_graph_walk: graph for graph in talker.get_accelerator_graph_configs(torch.device("cpu"))}
     rows = graphs[walk].get_node_inputs(2, 128)
-    assert all("rng" not in row.kwargs for row in rows), "a capture's rows have no open fields to write"
+    assert all("from_request" not in row.kwargs for row in rows), "a capture's rows have no open fields to write"
     step = talker.declare_step(walk, [91, 92], rows)
     assert TALKER_STEP not in step.state
     packed = talker.preprocess(walk, SimpleNamespace(request_ids=[91, 92]), rows)
@@ -1081,9 +1080,9 @@ def test_the_residual_stack_rotates_at_the_base_arrays_positions_or_not_at_all(m
 
 def test_talker_noise_comes_in_order_from_the_seed_through_host_bytes(model):
     talker, _, _ = _talker(model)
-    first, after_first = talker._draw(b"", 4)
-    second, _ = talker._draw(after_first, 4)
-    again, _ = talker._draw(after_first, 4)
+    first = talker._draw(0, 4)
+    second = talker._draw(1, 4)
+    again = talker._draw(1, 4)
     assert torch.equal(again, second), "a re-prepared step draws from the same committed state"
     expected = torch.Generator().manual_seed(4)
     torch.testing.assert_close(first, torch.randn((1, 8, 4), generator=expected)[0])
@@ -1096,15 +1095,13 @@ def test_talker_noise_through_host_bytes_equals_one_kept_cuda_generator(model):
     between, as one kept generator would have drawn."""
     talker = TalkerSubmodule(_random_generator(model.config).cuda(), model.config, 4)
     kept = torch.Generator(device="cuda").manual_seed(4)
-    state = b""
     for step in range(4):
-        noise, after = talker._draw(state, 4)
+        noise = talker._draw(step, 4)
         if step == 2:
-            again, _ = talker._draw(state, 4)
+            again = talker._draw(step, 4)
             assert torch.equal(again, noise), "a refused step draws the same noise from the same committed state"
         expected = torch.randn((1, 8, 4), generator=kept, device="cuda", dtype=talker._dtype())[0]
         assert torch.equal(noise, expected), f"draw {step}"
-        state = after
 
 
 def test_talker_declares_the_same_span_in_both_caches(model):
@@ -1209,7 +1206,7 @@ def test_talker_packs_a_mixed_batch_like_per_request_prompts(model):
         out = talker.forward_batched("talker_prefill_clone", engine, **packed)
     patches = {rid: out[rid]["latent_patch"][0] for rid in rids}
     _commit(talker, "talker_prefill_clone", rids, prepared)
-    design = ARNodeInputs(input_seq_len=1, kwargs={"step": 1, "rng": prepared[1].kwargs["rng"]})
+    design = ARNodeInputs(input_seq_len=1, kwargs={"step": 1, "from_request": True})
     _commit(talker, "talker_decode", ["design"], [design])  # one row a patch ahead
     decode_infos = {rid: _decode_info(rid, i, meta) for i, (rid, (_, meta)) in enumerate(requests.items())}
     prepared = [
