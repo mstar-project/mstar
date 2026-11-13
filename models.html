@@ -2823,6 +2823,18 @@ run eager; every later call is compiled in Inductor’s deterministic mode. An
 image (one latent) keeps the compiled stock <code class="docutils literal notranslate"><span class="pre">vae.decode</span></code> on that copy, which
 is faster for a single frame. False decodes everything with the compiled stock
 <code class="docutils literal notranslate"><span class="pre">vae.decode</span></code> on the shared instance.</p>
+<p>Placed on several ranks with <code class="docutils literal notranslate"><span class="pre">tp_size</span></code> (<code class="docutils literal notranslate"><span class="pre">configs/cosmos3_super_i2v_4step_tp2.yaml</span></code>
+puts it on both GPUs), the <code class="docutils literal notranslate"><span class="pre">vae_decoder</span></code> node splits every decode by rows over them
+(<code class="docutils literal notranslate"><span class="pre">HeightShardedDecoder</span></code> in <code class="docutils literal notranslate"><span class="pre">mstar/model/components/wan_vae.py</span></code>), images included:
+each rank decodes a band of every frame, a 3-row conv takes one row of each neighbour’s
+band, the mid-block attention gathers the frame, and the uint8 frames are gathered at
+the end. On Super I2V at 832x480x121 (2x H200) the decode takes 0.95 s instead of 1.56 s.
+The frames match a one-rank decode up to conv-algorithm rounding: a few uint8 levels on
+a minority of pixels, since cuDNN picks its bf16 algorithms per shape. It needs
+<code class="docutils literal notranslate"><span class="pre">vae_decode_fast</span></code>.
+The decode runs in lockstep on the node’s ranks, so a rank that fails mid-decode
+(an out-of-memory error, say) leaves the others waiting in a collective: at 1280x720x121 each
+rank peaks about 10 GB above its idle use on an H200, with about 60 GB to spare.</p>
 <p>Two or more requests at the same denoise step run one cross-request forward
 (<code class="docutils literal notranslate"><span class="pre">max_gen_batch_size</span></code>, default 8) for video, image, sound and action. With
 <code class="docutils literal notranslate"><span class="pre">compile_denoise_batched</span></code> (default on) the layer stack these steps share is
