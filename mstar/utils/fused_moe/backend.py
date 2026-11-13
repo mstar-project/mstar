@@ -13,9 +13,19 @@ AITER is faster in our numbers, but its output isn't bitwise reproducible.
 from __future__ import annotations
 
 import enum
+from typing import NamedTuple
 
 import torch
 from torch import nn
+
+
+class MoEProblem(NamedTuple):
+    """Sizes of one MoE layer's expert GEMMs, minus the token count."""
+
+    num_experts: int
+    intermediate_size: int  # per expert and rank, i.e. w2.shape[2]
+    hidden_size: int
+    top_k: int
 
 
 class MoEBackend(str, enum.Enum):
@@ -27,9 +37,10 @@ class MoEBackend(str, enum.Enum):
 class FusedMoEBackend:
     """Computes the routed experts of one MoE layer."""
 
-    def __init__(self, intermediate_size: int):
-        # per expert and rank, i.e. w2.shape[2]
-        self.intermediate_size = intermediate_size
+    name: str = "?"
+
+    def __init__(self, problem: MoEProblem):
+        self.problem = problem
 
     def prepare_weights(self, w1: nn.Parameter, w2: nn.Parameter) -> None:
         """Convert freshly loaded expert weights, in place, to this backend's layout."""
@@ -51,10 +62,15 @@ class FusedMoEBackend:
         (``fused_experts``'s)."""
         raise NotImplementedError
 
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}({self.problem})"
+
 
 class TritonFusedMoE(FusedMoEBackend):
     """fused_experts, which takes its tiles from the GPU's ``moe_gemm`` table
     (``mstar.kernels``) when it has these sizes, else the kernel's defaults."""
+
+    name = "triton"
 
     def __call__(self, hidden_states, w1, w2, topk_weights, topk_ids, skip_invalid=False, alignment=None):
         from mstar.utils.fused_moe.runner import fused_experts
@@ -64,13 +80,13 @@ class TritonFusedMoE(FusedMoEBackend):
         )
 
 
-def make_moe_backend(kind: MoEBackend | str, intermediate_size: int) -> FusedMoEBackend:
+def make_moe_backend(kind: MoEBackend | str, problem: MoEProblem) -> FusedMoEBackend:
     """Build the backend named by kind. Raises if it can't run here."""
     kind = MoEBackend(kind)
     if kind in (MoEBackend.AUTO, MoEBackend.TRITON):
-        return TritonFusedMoE(intermediate_size)
+        return TritonFusedMoE(problem)
     if kind is MoEBackend.AITER:
         from mstar.utils.fused_moe.backend_aiter import AiterFusedMoE
 
-        return AiterFusedMoE(intermediate_size)
+        return AiterFusedMoE(problem)
     raise ValueError(f"unknown MoE backend {kind!r}")

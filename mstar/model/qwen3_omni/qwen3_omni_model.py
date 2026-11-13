@@ -73,6 +73,7 @@ from mstar.model.base import (
 )
 from mstar.model.components import MoeParallelConfig
 from mstar.model.components.code_predictor_kernels import ResidualCodePredictor
+from mstar.model.components.moe import prepare_moe_weights
 from mstar.model.media_limits import VideoBudget, probe_video
 from mstar.model.multimodal import (
     TEXT,
@@ -1682,6 +1683,7 @@ class Qwen3OmniModel(Model):
             stacked_params=self._get_thinker_stacked_params(),
             name_remapper=self._thinker_remap,
         )
+        prepare_moe_weights(thinker_model)
         thinker_model.eval()
 
 
@@ -1751,6 +1753,7 @@ class Qwen3OmniModel(Model):
             stacked_params=stacked,
             name_remapper=self._thinker_remap,
         )
+        prepare_moe_weights(talker_model)
         talker_model.eval()
 
         from mstar.model.qwen3_omni.submodules import TalkerSubmodule

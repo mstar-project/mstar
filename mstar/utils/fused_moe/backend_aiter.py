@@ -17,7 +17,7 @@ import importlib.util
 import torch
 from torch import nn
 
-from mstar.utils.fused_moe.backend import FusedMoEBackend
+from mstar.utils.fused_moe.backend import FusedMoEBackend, MoEProblem
 
 # CK's two-stage MoE GEMMs tile the intermediate dimension by 128.
 _INTER_ALIGN = 128
@@ -46,22 +46,26 @@ def _(hidden_states, w1, w2, topk_weights, topk_ids):
 
 
 class AiterFusedMoE(FusedMoEBackend):
-    def __init__(self, intermediate_size: int):
+    name = "aiter"
+
+    def __init__(self, problem: MoEProblem):
         from mstar.platforms import current_platform
 
-        super().__init__(intermediate_size)
+        super().__init__(problem)
         if not current_platform.is_rocm():
             raise ValueError(f"MoE backend 'aiter' runs on AMD GPUs only, not {current_platform.name}")
         if importlib.util.find_spec("aiter") is None:
             raise ValueError("MoE backend 'aiter' needs the aiter package")
-        if intermediate_size % _INTER_ALIGN:
+        if problem.intermediate_size % _INTER_ALIGN:
             raise ValueError(
                 f"MoE backend 'aiter': the per-rank expert intermediate size "
-                f"{intermediate_size} is not a multiple of {_INTER_ALIGN}; use 'triton'"
+                f"{problem.intermediate_size} is not a multiple of {_INTER_ALIGN}; use 'triton'"
             )
         self._prepared = False
 
     def prepare_weights(self, w1: nn.Parameter, w2: nn.Parameter) -> None:
+        if self._prepared:
+            return
         from aiter.ops.shuffle import shuffle_weight
 
         for w in (w1, w2):
