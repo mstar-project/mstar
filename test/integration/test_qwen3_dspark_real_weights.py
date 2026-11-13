@@ -45,6 +45,7 @@ import json
 import math
 import re
 import sys
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -104,6 +105,9 @@ PRESSURE_PAGES = 128
 TP2_PRESSURE = ("dspark", "eagle3")
 # requests preempted for pages, and those of them dropped (main's `Preemption` counts)
 PREEMPTION_COUNTERS = ("mstar_kv_preemptions_total", "mstar_kv_drops_total")
+# a host pool far below the pages the pressure rounds set aside at their peak (~60), so it fills and requests
+# turn guaranteed: they lend what they haven't written, the verify slack included, and take it back
+LENDING_HOST_PAGES = 16
 
 TOKENS = 128
 
@@ -159,7 +163,7 @@ def drafter(request) -> Drafter:
 def _config(tmp: Path, name: str, drafter: Drafter, *, draft_mode: str | None, verify_backend: str | None = None,
             tp: int = 1,
             captured: bool = True, max_num_pages: int | None = None,
-            max_batch_tokens: int | dict | None = None) -> Path:
+            max_batch_tokens: int | dict | None = None, cpu_offload_pages: int | None = None) -> Path:
     base = drafter.config if draft_mode else "configs/qwen3_8b.yaml"
     config = yaml.safe_load((REPO / base).read_text())
     resources = config.setdefault("resources", {})
@@ -178,7 +182,8 @@ def _config(tmp: Path, name: str, drafter: Drafter, *, draft_mode: str | None, v
     kv["page_size"] = PAGE
     if max_num_pages:
         # pages run out under load: requests are offloaded and reloaded
-        kv.update(max_num_pages=max_num_pages, cpu_offload_pages=4 * max_num_pages)
+        host = 4 * max_num_pages if cpu_offload_pages is None else cpu_offload_pages
+        kv.update(max_num_pages=max_num_pages, cpu_offload_pages=host)
     if max_batch_tokens is not None:
         config["max_batch_tokens"] = {"LLM": max_batch_tokens}
     if tp > 1:
@@ -276,8 +281,18 @@ def _walk_steps(url: str) -> dict[str, float]:
 RUNS: dict[str, dict] = {}
 
 
+def _gauge_peak(url: str, name: str, stop: threading.Event, peak: list[float]) -> None:
+    """The highest total of gauge ``name`` at ``/metrics``, polled until ``stop``."""
+    while not stop.wait(0.5):
+        try:
+            text = requests.get(url + "/metrics", timeout=30).text
+        except requests.RequestException:
+            continue
+        peak[0] = max(peak[0], sum(float(v) for v in re.findall(rf"^{name}(?:{{[^}}]*}})? ([0-9.e+]+)$", text, re.M)))
+
+
 def _run(tmp_path_factory, drafter: Drafter, name: str, *, sampled_too: bool = False, repeat: bool = False,
-         pressure: bool = False, crowd: int = 0, staggered: bool = False, **kw) -> dict:
+         pressure: bool = False, crowd: int = 0, staggered: bool = False, lending: bool = False, **kw) -> dict:
     """Serve ``name`` once and keep what every test reads of it."""
     # a plain run is every drafter's baseline; a speculative one is its drafter's
     name = f"{drafter.id}_{name}" if kw.get("draft_mode") else name
@@ -310,7 +325,22 @@ def _run(tmp_path_factory, drafter: Drafter, name: str, *, sampled_too: bool = F
         elif pressure:
             start = _counters(url, wait=False) if speculative else None
             moved = _totals(url, *PREEMPTION_COUNTERS)
-            run["rounds"] = fp32_screen.rounds(_reply, url, name, PROMPTS, 4, ROUNDS)
+            if lending:
+                # the pool's take-backs, and the most pages lent and borrowed at once: a gauge the workers report
+                # each second, so a borrow shorter than that can come and go between two reports
+                (take_backs,) = _totals(url, "mstar_kv_take_backs_total")
+                stop, peak = threading.Event(), [0.0]
+                poller = threading.Thread(target=_gauge_peak, args=(url, "mstar_kv_pages_lent", stop, peak))
+                poller.start()
+            try:
+                run["rounds"] = fp32_screen.rounds(_reply, url, name, PROMPTS, 4, ROUNDS)
+            finally:
+                if lending:
+                    stop.set()
+                    poller.join()
+            if lending:
+                run["lent_peak"] = peak[0]
+                run["take_backs"] = _totals(url, "mstar_kv_take_backs_total")[0] - take_backs
             if speculative:
                 run["tau"] = _tau(start, _counters(url))
             # the requests preempted for pages (`Preemption`), and those dropped rather than moved to the host;
@@ -602,6 +632,23 @@ def test_tp2_kv_pressure_offloads_and_completes(tmp_path_factory, drafter, fp32)
     run = _run(tmp_path_factory, drafter, "tp2_async_pressure", draft_mode="asynchronous", tp=2,
                max_num_pages=PRESSURE_PAGES, pressure=True, debug_asserts=True)
     _check_pressure(f"{drafter.id} tp2 pressure", plain, run, fp32)
+
+
+def test_kv_pressure_with_a_small_host_lends_and_takes_back(tmp_path_factory, drafter, fp32):
+    """The pressure rounds with a host pool too small to take every request it would move (``LENDING_HOST_PAGES``):
+    requests turn guaranteed and lend what they haven't written of their reservations, the verify slack included,
+    and preemptible requests borrow it. A guaranteed request whose grant runs short takes the pages back by moving
+    a borrower. Pages are lent and taken back, nothing is dropped, and the replies pass the fp32 screen against
+    plain under the same pressure."""
+    if drafter.id != "dspark":
+        pytest.skip("the lending rounds run for DSpark")
+    pages = dict(max_num_pages=PRESSURE_PAGES, cpu_offload_pages=LENDING_HOST_PAGES, pressure=True, lending=True)
+    plain = _run(tmp_path_factory, drafter, "plain_lending", draft_mode=None, **pages)
+    run = _run(tmp_path_factory, drafter, "async_lending", draft_mode="asynchronous", **pages)
+    print(f"{drafter.id} lending: peak pages lent {run['lent_peak']:.0f}, take-backs {run['take_backs']:.0f}")
+    # each take-back moves a request that borrowed pages a guaranteed one lent, so it counts lending too
+    assert run["take_backs"] > 0, "no guaranteed request took back a page it lent"
+    _check_pressure(f"{drafter.id} lending", plain, run, fp32)
 
 
 def _check_pressure(label: str, plain: dict, run: dict, fp32) -> None:
