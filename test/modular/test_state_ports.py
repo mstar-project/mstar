@@ -81,6 +81,12 @@ from mstar.model.components.request_kwargs import sampler_capabilities
 from mstar.model.keys import MIXED, PREFILL_TEXT, ROPE
 from mstar.model.multimodal import media_walk_names, vision_encoder
 from mstar.model.multimodal_decoder import MultimodalDecoderModel
+from mstar.model.muse import config as muse_config
+from mstar.model.muse.components.vision import MuseGlimmerVisionModel
+from mstar.model.muse.config import MuseGlimmerConfig, MuseGlimmerVisionConfig
+from mstar.model.muse.glimmer_model import MuseGlimmerModel
+from mstar.model.muse.submodules import LLMSubmodule as GlimmerLLMSubmodule
+from mstar.model.muse.submodules import VisionEncoderSubmodule as GlimmerEncoderSubmodule
 from mstar.model.qwen3_5.components.language_model import Qwen3_5ForCausalLM, Qwen3_5LanguageModel
 from mstar.model.qwen3_5.config import (
     ATTN,
@@ -1105,3 +1111,227 @@ def test_ripple_steps_equal_the_hand_written_ones(walk, rows):
     }
     step = engine_step(node, graph_walk=walk, request_ids=rids, inputs=inputs)
     _assert_steps_equal(step, _ripple_reference_step(rids, inputs, prefill))
+
+
+# Muse Glimmer: Ripple's cache, read at the checkpoint's softmax scale, and a tower whose windows and frames are two
+# arrays on one ragged resource
+
+
+_MUSE_TEXT = dict(
+    num_hidden_layers=8, hidden_size=64, intermediate_size=96, num_attention_heads=4, num_key_value_heads=2,
+    head_dim=16, vocab_size=64, layer_types=(["sliding_attention"] * 3 + ["full_attention"]) * 2,
+    layer_rope_theta=([5e5] * 3 + [0.0]) * 2, sliding_window=5, max_position_embeddings=128, rms_norm_eps=1e-5,
+    post_norm_eps=1e-8, image_token_id=9,
+)
+_MUSE_VISION = dict(
+    hidden_size=16, intermediate_size=32, num_attention_heads=2, num_hidden_layers=4, patch_size=14, patch_temporal=2,
+    merge_size=2, pos_emb_height=4, pos_emb_width=4, layer_types=["window_attention"] * 3 + ["full_attention"],
+    out_hidden_size=64, projector_hidden_size=32, text_hidden_size=64,
+)
+
+
+def _muse(**overrides) -> MuseGlimmerModel:
+    model = MuseGlimmerModel.__new__(MuseGlimmerModel)
+    model.config = MuseGlimmerConfig(**{**_MUSE_TEXT, **overrides})
+    model.vision_config = MuseGlimmerVisionConfig(**_MUSE_VISION)
+    model.media = (SimpleNamespace(encoder=vision_encoder()),)
+    model.sampling_defaults = {"temperature": 1.0}
+    return model
+
+
+def _muse_reference(model: MuseGlimmerModel) -> list:
+    config, vision = model.config, model.vision_config
+    sliding = tuple(i for i, s in enumerate(config.is_sliding) if s)
+    top_bucket = GlimmerEncoderSubmodule.BLOCK_LOOP_PATCH_BUCKETS[-1]
+    return [
+        KVSpec(resource_key=KV_CACHE, nodes={"LLM"}, config=PagedKVConfig(
+            num_layers=config.num_hidden_layers, num_kv_heads=config.num_key_value_heads, head_dim=config.head_dim,
+            max_seq_len=config.max_position_embeddings, num_qo_heads=config.num_attention_heads,
+        )),
+        AttentionSpec(resource_key=muse_config.ATTN_SLIDING, nodes={"LLM"}, config=AttentionConfig(
+            kv_cache=KV_CACHE, sliding_window=config.sliding_window, layers=sliding, sm_scale=config.attn_scale,
+            splits=(_MIXED_SPLIT,),
+        )),
+        AttentionSpec(resource_key=muse_config.ATTN_FULL, nodes={"LLM"}, config=AttentionConfig(
+            kv_cache=KV_CACHE, sm_scale=config.attn_scale, splits=(_MIXED_SPLIT,),
+        )),
+        PositionSpec(resource_key=ROPE, nodes={"LLM"}, config=PositionConfig(
+            kv_cache=KV_CACHE, rope_theta=config.rope_theta,
+        )),
+        SamplerSpec(resource_key=SAMPLER, nodes={"LLM"}, vocab_size=config.vocab_size,
+                    enable_repetition_penalty=True, enable_min_p=False),
+        # labels, which only a sequence shard reads (`RaggedAttentionSpec.derive`), and the tower's node has none
+        RaggedAttentionSpec(
+            resource_key=VISION_ATTN, nodes={"vision_encoder"},
+            labels={muse_config.VISION_WINDOW, muse_config.VISION_FULL},
+            config=RaggedAttentionConfig(
+                num_qo_heads=vision.num_attention_heads, num_kv_heads=vision.num_attention_heads,
+                head_dim=vision.head_dim, max_segments_per_step=4 * (top_bucket // vision.window_patches ** 2),
+            ),
+        ),
+    ]
+
+
+def test_muse_specs_equal_the_hand_written_ones():
+    model = _muse()
+    _assert_equal_per_key(node_resources(model), _muse_reference(model))
+
+
+@pytest.mark.parametrize("path", _published("MuseGlimmerModel"), ids=lambda path: path.stem)
+def test_muse_specs_equal_the_hand_written_ones_on_every_published_config(path):
+    deployment = yaml.safe_load(path.read_text())
+    model = _muse()
+    reference = _muse_reference(model)
+    apply_yaml_overrides(reference, deployment)
+    specs = serving_resources(model, deployment)
+    _assert_equal_per_key(specs, reference)
+    kv = {spec.resource_key: spec for spec in specs}[KV_CACHE].config
+    expected = {spec.resource_key: spec for spec in reference}[KV_CACHE].config
+    assert kv.groups == expected.groups, "groups don't compare in the dataclass, and they hold the window's layers"
+
+
+def test_a_yaml_override_of_muse_s_vision_ceiling_still_holds():
+    model = _muse()
+    overrides = {"resources": {VISION_ATTN: {"max_segments_per_step": 3}}}
+    reference = _muse_reference(model)
+    apply_yaml_overrides(reference, overrides)
+    specs = serving_resources(model, overrides)
+    _assert_equal_per_key(specs, reference)
+    assert {spec.resource_key: spec for spec in specs}[VISION_ATTN].config.max_segments_per_step == 3
+
+
+def test_muse_refuses_query_heads_off_its_kv_heads():
+    with pytest.raises(ValueError, match=re.escape("Array 'kv_cache'.reads['attn_sliding'].op")):
+        _muse(num_attention_heads=6, num_key_value_heads=4).declare_state()
+
+
+def test_muse_writes_no_spec_by_hand():
+    assert _muse().get_node_resources() == []
+
+
+def test_muse_declarations_have_no_problems():
+    assert state_declaration_problems(_muse()) == []
+
+
+def test_muse_request_settings_convert_to_the_hand_written_ones():
+    model = _muse()
+    kwargs = {"temperature": 0.5, "top_p": 0.9}
+    converted = sampling_configs(model.get_request_resource_configs([], [], kwargs), model.declare_state())
+    assert converted == MultimodalDecoderModel.get_request_resource_configs(model, [], [], kwargs)
+
+
+def _muse_reference_step(rids, inputs, prefill_tokens, advance) -> SubmoduleStep:
+    return SubmoduleStep(
+        segments=[
+            Segment(request_id=rid, label="main", span=inp.input_seq_len)
+            for rid, inp in zip(rids, inputs, strict=True)
+        ],
+        steps={
+            KV_CACHE: KVStep(),
+            muse_config.ATTN_SLIDING: AttentionStep(causal=True),
+            muse_config.ATTN_FULL: AttentionStep(causal=True),
+            SAMPLER: SamplerStep(apply_penalty=True, prefill_tracked_tokens=prefill_tokens),
+            ROPE: PositionStep(advance=advance),
+        },
+    )
+
+
+@pytest.mark.parametrize("walk, rows, advance", [
+    ("prefill_text", [(5, None, None), (2, None, None)], None), ("decode", [(1, None, None)] * 3, None),
+    (MIXED, [(5, "prefill_text", None), (1, "decode", None)], None), ("prefill_vision", [(4, None, 6)], (6,)),
+])
+def test_muse_llm_steps_equal_the_hand_written_ones(walk, rows, advance):
+    model = _muse()
+    llm = _bind(GlimmerLLMSubmodule(torch.nn.Module(), model.config, (vision_encoder(),)), model)
+    rids = list(range(len(rows)))
+    inputs = [
+        ARNodeInputs(input_ids=torch.arange(n), input_seq_len=n, graph_walk=row_walk, resource_step_info=info)
+        for n, row_walk, info in rows
+    ]
+    prefill = {
+        rid: inp.input_ids for rid, inp in zip(rids, inputs, strict=True) if (inp.graph_walk or walk) != "decode"
+    }
+    step = engine_step(llm, graph_walk=walk, request_ids=rids, inputs=inputs)
+    _assert_steps_equal(step, _muse_reference_step(rids, inputs, prefill, advance))
+
+
+def _muse_encoder() -> GlimmerEncoderSubmodule:
+    model = _muse()
+    encoder = GlimmerEncoderSubmodule(torch.nn.Linear(1, 1), model.vision_config, "vision_embeds")
+    return _bind(encoder, model, "vision_encoder")
+
+
+def _assert_vision_steps_equal(step: SubmoduleStep, reference: SubmoduleStep) -> None:
+    """As `_assert_steps_equal`, with the hand-written attention's segments as a tuple: the two arrays' segments on
+    the one resource join into a tuple, where the hand-written step held the step's own list."""
+    attention = reference.steps[VISION_ATTN]
+    reference.steps[VISION_ATTN] = replace(attention, segments=tuple(attention.segments))
+    _assert_steps_equal(step, reference)
+
+
+def test_muse_vision_step_equals_the_hand_written_one():
+    """Each array lays out its own label's segments, and the resource they share plans both, as the one step did."""
+    window, full = muse_config.VISION_WINDOW, muse_config.VISION_FULL
+    inputs = [SimpleNamespace(resource_step_info={window: (4, 4), full: (8,)})]
+    step = engine_step(_muse_encoder(), graph_walk="prefill_vision", request_ids=[1], inputs=inputs)
+    reference = SubmoduleStep(
+        segments=[Segment(1, window, 4), Segment(1, window, 4), Segment(1, full, 8)],
+        steps={VISION_ATTN: AttentionStep(causal=False)},
+    )
+    _assert_vision_steps_equal(step, reference)
+
+
+class _StubRagged(_StubResource):
+    """Records the label each read runs under."""
+
+    def __init__(self):
+        self.labels = []
+
+    def run(self, q, k=None, v=None, label=None):
+        self.labels.append(label)
+        return q
+
+
+def test_muse_tower_layers_attend_within_windows_or_frames_as_their_type_says():
+    """The hand-written blocks passed their own label to `run`. Here the label comes from the array a block adds to,
+    which must also declare the block's layer."""
+    model, window, full = _muse(), muse_config.VISION_WINDOW, muse_config.VISION_FULL
+    vision, ragged = model.vision_config, _StubRagged()
+    encoder = GlimmerEncoderSubmodule(MuseGlimmerVisionModel(vision), vision, "vision_embeds")
+    encoder.bind_node_state(node_handles(model, "vision_encoder", {VISION_ATTN: ragged}))
+    inputs = [SimpleNamespace(resource_step_info={window: (4, 4), full: (8,)})]
+    step = engine_step(encoder, graph_walk="prefill_vision", request_ids=[1], inputs=inputs)
+    step.set_ctx(StepContext((1,), "prefill_vision", 0, False))
+    step.begin_calls()
+    cos, sin = torch.ones(8, vision.head_dim), torch.zeros(8, vision.head_dim)
+    encoder.model.encode(torch.zeros(8, vision.hidden_size), cos, sin)
+    step.end_calls()
+    expected = [window if kind == muse_config.WINDOW_ATTENTION else full for kind in vision.layer_types]
+    assert ragged.labels == expected, "a tower layer attended under the other layer type's label"
+
+
+def test_muse_vision_region_steps_equal_the_hand_written_ones():
+    encoder = _muse_encoder()
+    config = encoder.get_piecewise_accelerator_graph_configs(torch.device("cpu"), torch.bfloat16)[VISION_BLOCK_LOOP]
+    runner = object.__new__(PiecewiseAcceleratorGraphRunner)
+    runner._config, runner._segment_keys, runner._state_handles = config, (), encoder.state_handles
+    window, full = muse_config.VISION_WINDOW, muse_config.VISION_FULL
+    reference = SubmoduleStep(
+        segments=[Segment(7, window, 3), Segment(7, window, 5), Segment(7, full, 3), Segment(7, full, 5)],
+        steps={VISION_ATTN: AttentionStep(causal=False)},
+    )
+    _assert_vision_steps_equal(runner._region_step([7], [3, 5]), reference)
+
+
+def test_muse_leased_vision_step_declares_none_as_it_did():
+    leases = {VISION_BLOCK_LOOP: object()}
+    step = engine_step(
+        _muse_encoder(), graph_walk="prefill_vision", request_ids=[1], inputs=[], piecewise_leases=leases,
+    )
+    assert step is None
+
+
+def test_muse_vision_capture_check_reads_the_ceiling_in_effect():
+    encoder = _muse_encoder()
+    encoder.vision.reads[VISION_ATTN].max_segments_per_step = 2
+    assert encoder._fits_replay(16, 2) and not encoder._fits_replay(16, 3), "a YAML override should hold"
