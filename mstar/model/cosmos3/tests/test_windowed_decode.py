@@ -370,3 +370,11 @@ def test_model_load_checks_the_streaming_decode_overrides() -> None:
 
     with pytest.raises(ValueError, match="windowed_decode_latents_per_call"):
         Cosmos3Model(model_path_hf="unused", skip_weight_loading=True, windowed_decode_latents_per_call=-2)
+
+
+def test_a_config_that_still_caps_the_warm_streams_is_refused_at_load() -> None:
+    """The cap is gone, so a deployment that set it would run uncapped behind a warning."""
+    from mstar.model.cosmos3.cosmos3_model import Cosmos3Model
+
+    with pytest.raises(ValueError, match="windowed_decode_max_warm_streams is no longer read"):
+        Cosmos3Model(model_path_hf="unused", skip_weight_loading=True, windowed_decode_max_warm_streams=2)
