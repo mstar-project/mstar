@@ -32,6 +32,7 @@ from mstar.engine.resources.attn.ragged.config import (
     RaggedCrossAttentionStep,
     cross_label,
 )
+from mstar.engine.resources.dsa.config import DSAConfig, DSASpec, DSAStep
 from mstar.engine.resources.kv.config import (
     KVLayout,
     KVSpec,
@@ -101,8 +102,10 @@ from mstar.engine.state.contract import (
     Sampler,
     SampleSettings,
     SampleStep,
+    Selected,
     SeqShard,
     TensorType,
+    TopK,
     Window,
     is_value,
     read_layers,
@@ -939,8 +942,8 @@ class PagedLatentAttend(OpBinding):
     """`LatentAttend` on a latent array: FlashInfer's MLA attention over the array's pool."""
 
     def check(self, array: Array, key: str, read: Read) -> None:
-        if not isinstance(read.mask, Causal):
-            raise _no_layout(array, f"reads[{key!r}].mask must be Causal, the mask FlashInfer's MLA plan has")
+        if not isinstance(read.mask, Causal | Selected):
+            raise _no_layout(array, f"reads[{key!r}].mask must be Causal or Selected, the masks a latent read plans")
         if read.walks is not None:
             raise _no_layout(array, f"reads[{key!r}].walks must be None, since FlashInfer's MLA plan has no walk")
         if not read.packed:
@@ -957,6 +960,9 @@ class PagedLatentAttend(OpBinding):
         self, array: Array, key: str, read: Read, declared: ArrayStep, segments, steps: dict[str, Any],
     ) -> None:
         steps[key] = AttentionStep(segments=segments, causal=read.mask.uses_query_position)
+
+    def for_mask(self, mask: Mask) -> OpBinding:
+        return SELECTED_LATENT_ATTEND if isinstance(mask, Selected) else self
 
     def bind(self, array: Array, key: str, resources: Mapping[str, Any]) -> "_LatentRead":
         return _LatentRead(array, resources[key])
@@ -987,6 +993,58 @@ class _LatentRead:
 
     def select_last_hidden(self, x: torch.Tensor, label: str = "main") -> torch.Tensor:
         return self._attn.select_last_hidden(x, label=label)
+
+
+class SelectedLatentAttend(PagedLatentAttend):
+    """`LatentAttend` through a `Selected` mask: DSA's attention over each row's picks, on the DSA resource of the array
+    ``of`` names, and FlashInfer's MLA plan for a step whose rows reach no more than they pick."""
+
+    def bind(self, array: Array, key: str, resources: Mapping[str, Any]) -> "_SelectedRead":
+        read = next(read for read in array.reads.values() if isinstance(read.mask, Selected))
+        return _SelectedRead(array, resources[key], resources[read.mask.of], read.op.scale)
+
+
+SELECTED_LATENT_ATTEND = SelectedLatentAttend()
+
+
+class _SelectedRead(_LatentRead):
+    """A latent read through a `Selected` mask, which runs the dense plan where the model passes no picks."""
+
+    def __init__(self, array: Array, attn: Any, dsa: Any, scale: float):
+        super().__init__(array, attn)
+        self._dsa, self._scale = dsa, scale
+
+    def run(
+        self, q: torch.Tensor, *, label: str, kv_cache_layer: torch.Tensor, q_pe: torch.Tensor,
+        selected: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if selected is None:
+            return self._attn.run(q, label=label, kv_cache_layer=kv_cache_layer, q_pe=q_pe)
+        if _DEBUG_ASSERTS:
+            self._check_distinct(selected)
+        return self._dsa.attend(selected, q, q_pe, kv_cache_layer, self._scale, label=label)
+
+    def _check_distinct(self, selected: torch.Tensor) -> None:
+        picks = selected.sort(dim=1).values
+        twice = ((picks[:, 1:] == picks[:, :-1]) & (picks[:, 1:] >= 0)).any(dim=1)
+        if twice.any():
+            raise ValueError(f"Array {self._array.name!r}: selected names a position twice in row "
+                             f"{int(twice.nonzero()[0])}")
+
+
+class DsaTopK(OpBinding):
+    """`TopK` on a key array: today's DSA resource, whose spec and step the key storage builds."""
+
+    def check(self, array: Array, key: str, read: Read) -> None:
+        if not isinstance(read.mask, Causal):
+            raise _no_layout(array, f"reads[{key!r}].mask must be Causal, the reach DSA's selection scores")
+        if read.walks is not None:
+            raise _no_layout(array, f"reads[{key!r}].walks must be None, since DSA's plan has no walk")
+        if not read.packed:
+            raise _no_layout(array, f"reads[{key!r}] declares packed=False, and DSA's selection takes packed queries")
+
+    def resource(self, array: Array, key: str) -> str:
+        return array.name
 
 
 class PositionsBinding(OpBinding):
@@ -1769,6 +1827,45 @@ class LatentHandle(PagedArrayHandle):
         if q_pe is None:
             q_pe = q.new_empty(*q.shape[:2], 0)
         return self._attn[layer].run(q, label=self.label, kv_cache_layer=self._views[layer], q_pe=q_pe, **mask_args)
+
+
+class DsaKeyHandle(ArrayHandle):
+    """Adds and reads DSA index keys through today's DSA resource, which keeps each request's keys in its own store
+    and picks each row's top positions over them."""
+
+    def __init__(
+        self, array: Array, resources: Mapping[str, Any], bindings: tuple[BoundOp, ...], resolved: "Resolved",
+    ):
+        super().__init__(array, resources)
+        self._bindings = bindings
+        (bound,) = bindings
+        self._dsa = bound.binding.bind(array, resolved.resource_of[bound.key], resources)
+
+    def _check_storage(self, declared: ArrayStep, segments, ctx) -> None:
+        if not declared.keep or declared.forks:
+            raise self._refusal("a step sets keep=False or forks, and the key store appends every add to its request")
+        super()._check_storage(declared, segments, ctx)
+
+    @torch.compiler.disable
+    def add(self, layer: int | torch.Tensor, *, keep: bool | None = None, **fields: torch.Tensor) -> None:
+        layer = self._layer_id(layer)
+        if fields.keys() != {"k"}:
+            raise self._refusal(f"an add of fields {sorted(fields)}, and the key entry holds ['k']")
+        self._record_add(layer, keep)
+        self._dsa.store_keys(self._pool_layer[layer], fields["k"], label=self.label)
+
+    @torch.compiler.disable
+    def read(self, layer: int | torch.Tensor, q: torch.Tensor | None = None, **mask_args: Any) -> torch.Tensor:
+        """Each row's `TopK` picks for ``q``, with the head ``weights``."""
+        layer = self._layer_id(layer)
+        if q is None or mask_args.keys() != {"weights"}:
+            raise self._refusal(f"a read with q {'None' if q is None else 'given'} and arguments {sorted(mask_args)}, "
+                                "and TopK takes q and weights")
+        self._record_read(layer)
+        return self._dsa.select(self._pool_layer[layer], q, mask_args["weights"], label=self.label)
+
+    def _selects(self) -> bool:
+        return self._dsa.needs_selection(self.label)
 
 
 class RingHandle(ArrayHandle):
@@ -2562,6 +2659,41 @@ class LatentStorage(PagedStorage):
         )
 
 
+class DsaKeyStorage(Storage):
+    """An append-only array of DSA index keys, which today's DSA resource keeps per request in its own store, outside
+    any pages, for the one latent array whose `Selected` read names it."""
+
+    handle_class = DsaKeyHandle
+
+    def resolve(self, arrays: Sequence[Array], declared: Sequence[Array], setup: "StateSetup") -> Resolved:
+        resolved = Resolved({}, {}, {}, {})
+        for array in arrays:
+            resolved.bound[array.name] = _bindings(self, array)
+            if len(array.reads) > 1:
+                raise _no_layout(array, f"reads {sorted(array.reads)}, and a DSA resource runs one TopK read")
+            if array.entry.tensors.keys() != {"k"} or array.entry.host:
+                raise _no_layout(array, "an entry other than k alone, which is all a DSA key store holds")
+            if len(array.labels) > 1:
+                raise _no_layout(array, f"labels {sorted(array.labels)}, and a DSA plan holds one label")
+            latents = [
+                other.name for other in declared
+                if any(isinstance(read.mask, Selected) and read.mask.of == array.name for read in other.reads.values())
+            ]
+            if len(latents) != 1:
+                raise _no_layout(array, f"latent arrays {latents} pick through it, and a DSA resource serves one pool")
+            ((key, read),) = array.reads.items()
+            resolved.specs[array.name] = [DSASpec(
+                resource_key=array.name, nodes=array.nodes, config=DSAConfig(kv_cache=latents[0], topk=read.op.count),
+            )]
+            resolved.resource_of[key] = array.name
+        return resolved
+
+    def steps(
+        self, handle: ArrayHandle, declared: ArrayStep, step: SubmoduleStep, segments, steps: dict[str, Any],
+    ) -> None:
+        steps[handle.name] = DSAStep()
+
+
 class RingStorage(Storage):
     """An append-only array whose reads are all frame windows, in a ring of frame slots per layer that keeps only what
     the layer's window reaches. Its reads share one flex attention resource, which stages every layer's mask from the
@@ -2735,6 +2867,7 @@ PAGED = PagedStorage()
 PAGED_BY_WALK = PagedByWalkStorage()
 PAGED_CROSS = PagedCrossStorage()
 LATENT = LatentStorage()
+DSA_KEYS = DsaKeyStorage()
 RING = RingStorage()
 VALUE = ValueStorage()
 VALUE_WITH_HOST = ValueWithHostStorage()
@@ -2754,6 +2887,8 @@ def storage_of(array: Array) -> Storage:
         return WITHIN_STEP
     if array.reads and all(isinstance(read.mask, FrameWindow) for read in array.reads.values()):
         return RING
+    if array.reads and all(isinstance(read.op, TopK) for read in array.reads.values()):
+        return DSA_KEYS
     if "ckv" in array.entry.tensors:
         return LATENT
     if any(read.queries is not None for read in array.reads.values()):
@@ -2776,6 +2911,7 @@ BINDINGS: dict[tuple[Storage, type[Op | Positions | Verify | None]], OpBinding] 
     (LATENT, LatentAttend): PagedLatentAttend(),
     (LATENT, Positions): PositionsBinding(),
     (LATENT, Verify): Rewind(),
+    (DSA_KEYS, TopK): DsaTopK(),
     (RING, Attend): FlexAttend(),
     (RING, Positions): CounterPositions(),
     (WITHIN_STEP, Attend): RaggedAttend(),
@@ -2834,7 +2970,7 @@ def _bindings(
     if array.positions is not None:
         binding = BINDINGS.get((storage, Positions))
         if binding is None:
-            raise _no_layout(array, "positions, which only an append-only array that keeps entries holds")
+            raise _no_layout(array, f"positions, which today's resources don't keep on {type(storage).__name__}")
         bound.append(BoundOp(position_key(array), array.positions, binding))
     if array.verify_span > 1:
         binding = BINDINGS.get((storage, Verify))

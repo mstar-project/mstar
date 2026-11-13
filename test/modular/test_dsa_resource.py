@@ -257,7 +257,7 @@ def test_a_selecting_step_stages_its_page_tables_once(monkeypatch):
     for _ in range(3):
         dsa.attend(torch.zeros(2, 4, dtype=torch.int32), torch.randn(2, 2, 16),
                    torch.randn(2, 2, 8), torch.randn(4, 4, 24), 1.0)
-    assert calls == [[0, 1, 2, 3, 0, 2, 0, 0]]  # pages, each row's offset, each row's start
+    assert calls == [[0, 1, 2, 3, 0, 2, 0, 0, 5, 6]]  # pages, each row's offset, start and position
     _plan(dsa, [SequenceView("r0", "main", [0], length=3, to_compute=1)])
     assert len(calls) == 1  # dense: nothing to stage
 

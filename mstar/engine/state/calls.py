@@ -336,6 +336,9 @@ class ArrayHandle(StepHandle):
     def _host(self, request: int, label: str, layer: int) -> Mapping[str, object]:
         raise self._unsupported("host")
 
+    def _selects(self) -> bool:
+        raise self._unsupported("selects")
+
 
 class SamplerHandle(StepHandle):
     """The calls on one declared sampler. Its rows are the step's, padding included."""
@@ -511,6 +514,13 @@ def rope(
     if at is None:
         return _positions(h).apply_qk(q, k, label=h.label, rope_dtype=rope_dtype)
     return _positions(h).apply_qk(q, k, label=h.label, rope_dtype=rope_dtype, pos_ids=at)
+
+
+def selects(h: ArrayHandle) -> bool:
+    """Whether some row of this step reaches more entries than ``h``'s `TopK` read picks, on the host. When none does,
+    each row's pick is its `Causal` reach, and the read can be skipped."""
+    h._check_open("selects")
+    return h._selects()
 
 
 @torch.compiler.disable

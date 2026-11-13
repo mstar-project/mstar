@@ -173,6 +173,22 @@ class FrameWindow(Mask):
         return "A step boundary inside a frame cuts what the frame's queries see"
 
 
+@dataclass(frozen=True)
+class Selected(Mask):
+    """Sees the positions ``selected`` names for q's row that are at most q. ``selected`` is (tokens, n) int32, -1 where
+    a row names fewer than n, and no position twice in a row. With ``selected`` None it sees what `Causal` sees. ``of``
+    names the array whose `TopK` read picks the positions, which holds an entry at each of this array's positions."""
+
+    uses_query_position = True
+    sees_step_whole = False
+
+    of: str
+
+    def __post_init__(self):
+        if not (isinstance(self.of, str) and self.of):
+            raise ValueError(f"Selected.of must be a non-empty str, got {self.of!r}")
+
+
 class Op:
     """A kernel the engine plans before the step and runs on an array's entries.
 
@@ -257,6 +273,28 @@ class LatentAttend(Op):
         if kpe is not None and kpe.dtype != ckv.dtype:
             raise ValueError(f"{where}: LatentAttend needs ckv and kpe of one dtype, and they are {ckv.dtype} and "
                              f"{kpe.dtype}")
+
+
+@dataclass(frozen=True)
+class TopK(Op):
+    """DSA's indexer. Query row t scores each reached entry by the sum over heads h of ``weights[t, h] * relu(q[t, h] .
+    k)``, in fp32, and returns the positions of its ``count`` best, (tokens, count) int32, best first, ties to the
+    earlier position, -1 past the entries it reaches. ``q`` is (tokens, heads, head_dim), ``weights`` (tokens, heads).
+    Another score is another op."""
+
+    reads = ("k",)
+    count: int
+    _: KW_ONLY
+    heads: int
+
+    def check(self, where: str, entry: Entry) -> None:
+        for name in ("count", "heads"):
+            if not _is_positive(getattr(self, name)):
+                raise ValueError(f"{where}.{name} must be a positive int, got {getattr(self, name)!r}")
+        k = entry.tensors["k"]
+        if len(k.shape) != 1 or k.shard is not None:
+            raise ValueError(f"{where}: TopK needs entry field k 1-D and unsharded, since every head scores it, and it "
+                             f"is {k.shape} with shard {k.shard}")
 
 
 @dataclass(frozen=True, kw_only=True)

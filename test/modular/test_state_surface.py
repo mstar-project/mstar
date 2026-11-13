@@ -194,6 +194,9 @@ SNAPSHOT = {
         ["label", "POSITIONAL_OR_KEYWORD", None],
         ["span", "POSITIONAL_OR_KEYWORD", None],
     ],
+    "Selected": [
+        ["of", "POSITIONAL_OR_KEYWORD", None],
+    ],
     "SeqShard": [
         ["name", "POSITIONAL_OR_KEYWORD", None],
         ["nodes", "KEYWORD_ONLY", None],
@@ -219,6 +222,10 @@ SNAPSHOT = {
         ["shape", "POSITIONAL_OR_KEYWORD", None],
         ["dtype", "KEYWORD_ONLY", None],
         ["shard", "KEYWORD_ONLY", 'None'],
+    ],
+    "TopK": [
+        ["count", "POSITIONAL_OR_KEYWORD", None],
+        ["heads", "KEYWORD_ONLY", None],
     ],
     "Value": [
         ["name", "POSITIONAL_OR_KEYWORD", None],
@@ -304,6 +311,9 @@ SNAPSHOT = {
         ["h", "POSITIONAL_OR_KEYWORD", None],
         ["xs", "VAR_POSITIONAL", None],
         ["dim", "KEYWORD_ONLY", "None"],
+    ],
+    "selects": [
+        ["h", "POSITIONAL_OR_KEYWORD", None],
     ],
     "settle": [
         ["h", "POSITIONAL_OR_KEYWORD", None],
