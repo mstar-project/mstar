@@ -1034,11 +1034,6 @@ The spec types are:
      - Self-attention within each span over a prefix of its keys
        (``KeyPrefixAttentionStep(key_lens=...)``): every token queries, only the first
        ``key_lens[i]`` are keys. Same config. See `Key padding within spans`_.
-   * - ``RaggedChunkCausalAttentionSpec(config=RaggedAttentionConfig(...))``
-     - Teacher-forcing attention over a ``[global | noised | clean]`` layout cut into chunks
-       (``ChunkCausalAttentionStep(layouts=...)``): the clean stream block-causal, the noised
-       stream block-diagonal, a noised chunk reading the clean chunks before it. Runs
-       ``flex_attention``; ``backend`` must be ``AUTO``. See `Teacher forcing over chunks`_.
    * - ``BlockCausalAttentionSpec(config=AttentionConfig(kv_cache=...), block_size=...)``
      - The same mask over a paged KV cache: a row's new tokens attend its cached blocks and
        their own, and a step runs only new tokens. FlashInfer only. See `Block-causal
@@ -1467,31 +1462,6 @@ and step it with ``KeyPrefixAttentionStep``, one segment per span and ``key_lens
 the segments, each in ``1..span``. The resource gathers each span's key prefix into a key layout
 of its own and runs the cross-attention kernel against it; under a captured graph the gather
 index is a static buffer the plan restages, padded to the bucket's tokens.
-
-Teacher forcing over chunks
-^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-A chunk-causal video model trained with teacher forcing (Praxis-1's encoder) runs, in one
-forward, a conditioning prefix (registers, an anchor frame, text), the chunks being denoised,
-and a clean copy of the chunks before them. Declare a ``RaggedChunkCausalAttentionSpec`` and
-step it with ``ChunkCausalAttentionStep``, one segment per request and one
-``ChunkCausalLayout(global_len, chunk_len, noised_len, clean_len)`` per segment, in tokens and
-in that order; both streams are cut into ``chunk_len``-token chunks from their own start. Within
-a segment every token reads the global prefix and a global reads only globals; a clean token of
-chunk ``c`` reads clean chunks ``0..c``; a noised token reads its own noised chunk and the clean
-chunks before ``c``, never its own; a clean token reads no noised token. A layout with
-``clean_len=0`` is the decoder tower's mask, globals plus block-diagonal noise.
-
-Visibility depends on the query's stream as well as its chunk, so no key range or page list per
-query block expresses it, and this kind runs ``flex_attention`` (``MSTAR_FLEX_BACKEND``, as the
-ring attention does) over a ``BlockMask`` the resource plans: the tile lists are exact, and a
-``mask_mod`` decides each pair inside a partial tile from one int32 tag per token. Under FLASH,
-tiles every pair of which is visible are listed as full; under TRITON every tile is partial,
-since splitting full tiles off changes the order the kernel accumulates them in. ``mask_block_size`` (default 128) is
-the tile; FLASH on Blackwell rounds it up to 256. Under a captured graph the mask covers the
-bucket's tokens, the tail being padding that attends only itself and whose output rows are
-zeroed. FlashInfer-only fields of the config (``flashinfer_backend``, ``compile_op``,
-``workspace_mb``) are refused at build. Each sequence length compiles the kernel once.
 
 Block-causal attention over a KV cache
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

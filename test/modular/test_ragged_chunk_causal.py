@@ -27,11 +27,8 @@ from torch.nn.attention.flex_attention import flex_attention
 
 from mstar.engine.resources import (
     BucketKey,
-    ChunkCausalAttentionStep,
-    ChunkCausalLayout,
     RaggedAttentionConfig,
     RaggedAttnBackend,
-    RaggedChunkCausalAttentionSpec,
     Segment,
     SlotLease,
     StepContext,
@@ -43,6 +40,11 @@ from mstar.engine.resources.attn.ragged.chunk_causal import (
     chunk_causal_blocks,
     chunk_causal_runs,
     dense_visibility,
+)
+from mstar.engine.resources.attn.ragged.config import (
+    ChunkCausalAttentionStep,
+    ChunkCausalLayout,
+    RaggedChunkCausalAttentionSpec,
 )
 from mstar.engine.resources.base import EngineResourceInfo, build_resource
 
