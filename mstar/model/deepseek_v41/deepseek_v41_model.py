@@ -1,5 +1,6 @@
 """DeepseekV41Model: DeepSeek-V4.1-Flash, text in / text out."""
 
+import dataclasses
 import json
 import logging
 from collections.abc import Mapping
@@ -85,10 +86,9 @@ class DeepseekV41Model(ByteLevelTextOutput, Model):
             self.config = DeepseekV41Config()
         if "max_seq_len" in kwargs:
             self.config.max_seq_len = _positive_int("max_seq_len", kwargs["max_seq_len"])
-        if "moe_fp8_resident" in kwargs:
-            if not isinstance(kwargs["moe_fp8_resident"], bool):
-                raise ValueError(f"moe_fp8_resident must be true or false, got {kwargs['moe_fp8_resident']!r}")
-            self.config.moe_fp8_resident = kwargs["moe_fp8_resident"]
+        if "moe_experts" in kwargs:
+            # replace() reruns the config's validation on the value
+            self.config = dataclasses.replace(self.config, moe_experts=kwargs["moe_experts"])
         # requests that may hold state at once; the pool holds one more slot, its sink, and a
         # serve YAML sizes it under ``resources: state: {max_slots: N}``
         self.max_requests = _positive_int("max_requests", kwargs.get("max_requests", 32))
@@ -341,7 +341,7 @@ class DeepseekV41Model(ByteLevelTextOutput, Model):
             return
         with open(path) as f:
             read = DeepseekV41Config.from_hf_config(json.load(f))
-        for knob in ("max_seq_len", "max_output_tokens", "moe_fp8_resident"):
+        for knob in ("max_seq_len", "max_output_tokens", "moe_experts"):
             setattr(read, knob, getattr(self.config, knob))
         self.config, self._config_from_checkpoint = read, True
 

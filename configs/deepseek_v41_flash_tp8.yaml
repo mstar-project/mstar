@@ -1,7 +1,7 @@
 model: "deepseek_v41"
 # DeepSeek-V4.1-Flash, text only, on one 8-GPU node (TP8): 8x H200 or larger. The 510 GB
-# checkpoint is 67 GB a rank as stored; with the routed experts upcast from fp4 to fp8
-# (moe_fp8_resident, the default) and the dense linears in bf16 it is about 100 GB a rank.
+# checkpoint is 67 GB a rank as stored; with the routed experts held as stored (36 GB a rank)
+# and the dense linears in bf16, the weights served are about 65 GB a rank.
 # Resolve the checkpoint through the HF cache (HF_HOME) or pass model_kwargs.checkpoint_path
 # (the -1017 refresh has the same layout).
 #
@@ -13,6 +13,9 @@ model_kwargs:
   max_seq_len: 65536
   # requests that hold state at once: the pool below holds one more slot, its sink
   max_requests: 8
+  # the routed experts: fp4 as the checkpoint packs them (36 GB a rank), fp8 their exact
+  # upcast to E4M3 blocks (68 GB), dense in bf16 (136 GB, past an H200 with the rest)
+  moe_experts: fp4
 resources:
   # A cache per pooling ratio, a row per pooled group, each a latent of 512 and an index key
   # of 128 per source in their FP4 bytes (288 + 68): 890 bytes/token and 0.47 GB/rank together.

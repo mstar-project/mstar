@@ -7,7 +7,11 @@ shape, read from the 48 shard headers.
 """
 from __future__ import annotations
 
+import dataclasses
+import itertools
 import json
+import math
+import re
 import sys
 from pathlib import Path
 
@@ -17,11 +21,13 @@ import pytest
 import torch
 from safetensors.torch import load_file, save_file
 
+from mstar.distributed.communication import CommGroup
 from mstar.model.deepseek_v41 import _testing
 from mstar.model.deepseek_v41._testing import add_request, cpu_engine, logit_gap, random_ids, run_request, run_step
 from mstar.model.deepseek_v41.components.engram import bucket_primes, table_rows
 from mstar.model.deepseek_v41.components.layers import DeepseekV41ForCausalLM
-from mstar.model.deepseek_v41.config import CSA, STATE, DeepseekV41Config, kv_cache_key
+from mstar.model.deepseek_v41.components.moe import DeepseekV41MoE
+from mstar.model.deepseek_v41.config import CSA, MOE_EXPERTS, STATE, DeepseekV41Config, kv_cache_key
 from mstar.model.deepseek_v41.deepseek_v41_model import DeepseekV41Model
 from mstar.model.deepseek_v41.weight_loader import load_deepseek_v41_weights, skipped, upcast_fp4_block
 from mstar.model.utils import check_loaded
@@ -50,6 +56,11 @@ def _checkpoint_tensors():
             yield name, DTYPES[dtype], shape
 
 
+def _rank(rank: int, tp: int) -> CommGroup:
+    """Rank ``rank`` of a ``tp``-wide group that never communicates."""
+    return CommGroup(my_global_rank=rank, my_group_rank=rank, group_members=list(range(tp)))
+
+
 class TestCheckpointConfig:
     def test_the_checkpoints_config_parses_to_the_defaults(self):
         assert _checkpoint_config() == DeepseekV41Config()
@@ -57,7 +68,7 @@ class TestCheckpointConfig:
     def test_round_trip_through_the_hf_spelling(self):
         config = DeepseekV41Config.reduced()
         read = DeepseekV41Config.from_hf_config(_testing.to_hf_config(config))
-        for knob in ("max_seq_len", "moe_fp8_resident", "max_position_embeddings"):
+        for knob in ("max_seq_len", "max_position_embeddings"):
             setattr(read, knob, getattr(config, knob))
         assert read == config
 
@@ -103,18 +114,30 @@ class TestCheckpointConfig:
 
 class TestCheckpointLayout:
     """Every checkpoint tensor has a parameter of its shape or is named as not served, and
-    every parameter is filled: the full-size model on ``meta``, the tensors too."""
+    every parameter is filled: the full-size model on ``meta``, the tensors too. At TP8, the
+    last rank's shard of each."""
 
-    @pytest.mark.parametrize("fp8_resident", [False, True])
-    def test_full_size_model_loads_every_tensor_by_name_and_shape(self, fp8_resident):
-        config = _checkpoint_config()
-        config.moe_fp8_resident = fp8_resident
+    @pytest.mark.parametrize("moe_experts, tp", [*((layout, 1) for layout in MOE_EXPERTS), ("fp4", 8)])
+    def test_full_size_model_loads_every_tensor_by_name_and_shape(self, moe_experts, tp):
+        config = dataclasses.replace(_checkpoint_config(), moe_experts=moe_experts)
         token_map = torch.arange(config.vocab_size) % config.engram_compressed_vocab_size
         with torch.device("meta"):
-            lm = DeepseekV41ForCausalLM(config, token_map)
+            lm = DeepseekV41ForCausalLM(config, token_map, comm_group=_rank(tp - 1, tp))
         served = [(n, d, s) for n, d, s in _checkpoint_tensors() if not skipped(n)]
         weights = ((name, torch.empty(shape, dtype=dtype, device="meta")) for name, dtype, shape in served)
         check_loaded(lm, load_deepseek_v41_weights(lm, weights), "checkpoint layout")
+
+    @pytest.mark.parametrize("tp", [1, 8])
+    def test_fp4_experts_are_held_in_the_checkpoints_own_bytes(self, tp):
+        """A rank's routed experts take its share of the bytes the checkpoint stores them in."""
+        config = _checkpoint_config()
+        with torch.device("meta"):
+            moe = DeepseekV41MoE(config, _rank(tp - 1, tp))
+        held = sum(p.numel() * p.element_size() for p in moe.experts.parameters())
+        shipped = sum(math.prod(shape) * dtype.itemsize for name, dtype, shape in _checkpoint_tensors()
+                      if re.match(r"layers\.0\.ffn\.experts\.\d+\.", name))
+        assert held * tp == shipped
+        assert round(held * config.num_hidden_layers / 1e9, 1) == {1: 288.8, 8: 36.1}[tp]
 
     def test_what_is_skipped_is_dspark_vision_and_the_image_router_bias(self):
         names = [n for n, _, _ in _checkpoint_tensors() if skipped(n)]
@@ -146,25 +169,26 @@ class TestLoaderGuards:
     def test_a_missing_tensor_refuses_to_load(self, snapshot, tmp_path):
         path = _variant(snapshot, tmp_path, lambda t: t.pop("layers.3.attn.indexer.wk.weight"))
         with pytest.raises(KeyError, match="missing 1 parameters"):
-            DeepseekV41Model(str(path), max_seq_len=256, moe_fp8_resident=False).get_submodule("LLM")
+            DeepseekV41Model(str(path), max_seq_len=256).get_submodule("LLM")
 
-    def test_one_missing_expert_matrix_refuses_to_load(self, snapshot, tmp_path):
+    @pytest.mark.parametrize("moe_experts", MOE_EXPERTS)
+    def test_one_missing_expert_matrix_refuses_to_load(self, snapshot, tmp_path, moe_experts):
         def drop(tensors):
             del tensors["layers.2.ffn.experts.5.w3.weight"], tensors["layers.2.ffn.experts.5.w3.scale"]
 
         with pytest.raises(KeyError, match="gate_up_proj"):
             DeepseekV41Model(str(_variant(snapshot, tmp_path, drop)), max_seq_len=256,
-                             moe_fp8_resident=False).get_submodule("LLM")
+                             moe_experts=moe_experts).get_submodule("LLM")
 
     def test_a_weight_without_its_scale_refuses_to_load(self, snapshot, tmp_path):
         path = _variant(snapshot, tmp_path, lambda t: t.pop("layers.0.attn.wq_b.scale"))
         with pytest.raises(KeyError, match="without their weight or scale"):
-            DeepseekV41Model(str(path), max_seq_len=256, moe_fp8_resident=False).get_submodule("LLM")
+            DeepseekV41Model(str(path), max_seq_len=256).get_submodule("LLM")
 
     def test_an_unknown_tensor_refuses_to_load(self, snapshot, tmp_path):
         path = _variant(snapshot, tmp_path, lambda t: t.update({"layers.0.attn.extra.weight": torch.zeros(2, 2)}))
         with pytest.raises(KeyError, match="has no parameter"):
-            DeepseekV41Model(str(path), max_seq_len=256, moe_fp8_resident=False).get_submodule("LLM")
+            DeepseekV41Model(str(path), max_seq_len=256).get_submodule("LLM")
 
     def test_another_tokenizer_than_the_tables_were_hashed_with_is_refused(self, snapshot, tmp_path):
         path = _variant(snapshot, tmp_path, lambda t: None)
@@ -172,7 +196,7 @@ class TestLoaderGuards:
         hf["text_config"]["engram_compressed_vocab_size"] += 1
         (path / "config.json").write_text(json.dumps(hf))
         with pytest.raises(ValueError, match="tables were hashed over"):
-            DeepseekV41Model(str(path), max_seq_len=256, moe_fp8_resident=False).get_submodule("LLM")
+            DeepseekV41Model(str(path), max_seq_len=256).get_submodule("LLM")
 
 
 class TestExpertUpcast:
@@ -197,6 +221,128 @@ class TestExpertUpcast:
             upcast_fp4_block(packed, scale, 32)
 
 
+class _OneMoE(torch.nn.Module):
+    """One block's MoE under the name the loader finds it by, ``model.layers.0.ffn``."""
+
+    def __init__(self, config: DeepseekV41Config, group: CommGroup | None = None) -> None:
+        super().__init__()
+        self.config, self.comm_group = config, group or CommGroup.trivial()
+        self.model = torch.nn.Module()
+        self.model.layers = torch.nn.ModuleList([torch.nn.Module()])
+        self.model.layers[0].ffn = DeepseekV41MoE(config, group)
+
+    @property
+    def ffn(self) -> DeepseekV41MoE:
+        return self.model.layers[0].ffn
+
+
+def _read_mxfp4(packed: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """MXFP4 bytes as an expert kernel reads them: input ``k``'s E2M1 code in byte ``k // 2``, the
+    even input in the low nibble, the sign in the code's bit 3; a row's scale byte ``s`` for its
+    inputs ``32 g`` to ``32 g + 31`` is ``2 ** (s - 127)``."""
+    codes = torch.stack([packed & 0xF, packed >> 4], dim=-1).flatten(-2).long()
+    values = torch.where(codes >= 8, -1.0, 1.0) * torch.tensor([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0])[codes & 7]
+    # an fp32 with exponent field s and no mantissa bits is 2 ** (s - 127)
+    return values * (scale.int() << 23).view(torch.float32).repeat_interleave(32, dim=-1)
+
+
+def _all_reduce_after(sums: list[torch.Tensor]):
+    """A rank's all-reduce in a group whose ranks run one after another: its tensor plus what
+    the ranks before it sent in the same call (``sums``, which it updates)."""
+    calls = itertools.count()
+
+    def all_reduce(tensor: torch.Tensor) -> torch.Tensor:
+        call = next(calls)
+        if call == len(sums):
+            sums.append(torch.zeros_like(tensor))
+        sums[call] = sums[call] + tensor
+        return sums[call]
+
+    return all_reduce
+
+
+def _run_ranks(config: DeepseekV41Config, tensors: dict[str, torch.Tensor], x: torch.Tensor,
+               tp: int) -> list[torch.Tensor]:
+    """One block's MoE over a ``tp``-wide group, rank after rank: each rank's output, the last
+    one's being the group's."""
+    sums: list[torch.Tensor] = []
+    outs = []
+    for rank in range(tp):
+        root = _OneMoE(config, _rank(rank, tp))
+        check_loaded(root, load_deepseek_v41_weights(root, tensors.items()), "one block")
+        root.ffn.comm_group.all_reduce = _all_reduce_after(sums)
+        outs.append(root.ffn(x))
+    return outs
+
+
+class TestExpertLayouts:
+    @pytest.mark.parametrize("value", ["fp16", "FP4", True, None])
+    def test_an_unknown_layout_is_refused(self, value):
+        with pytest.raises(ValueError, match="moe_experts must be one of"):
+            DeepseekV41Config(moe_experts=value)
+        with pytest.raises(ValueError, match="moe_experts must be one of"):
+            DeepseekV41Model("deepseek-ai/DeepSeek-V4.1-Flash", moe_experts=value)
+
+    def test_a_rank_slice_that_splits_a_scale_group_is_refused(self):
+        with pytest.raises(ValueError, match="scale blocks"):
+            DeepseekV41MoE(DeepseekV41Config.reduced(), _rank(0, 2))  # 32 / 2 = 16 dims a rank
+        # 48 dims are whole 16-wide activation blocks, not whole 32-wide fp4 scale groups
+        config = DeepseekV41Config.reduced(fp8_block=16, moe_intermediate_size=48)
+        DeepseekV41MoE(dataclasses.replace(config, moe_experts="dense"))
+        with pytest.raises(ValueError, match="fp4 experts scale 32 inputs"):
+            DeepseekV41MoE(config)
+
+    @pytest.mark.parametrize("tp", [2, 8])
+    def test_a_ranks_packed_bytes_are_its_slice_of_the_dense_weights(self, tp):
+        """At the checkpoint's widths (TP8: 288 intermediate dims a rank, 9 scale groups), for
+        every rank: the bytes it holds, read as the MXFP4 expert kernels read them, are its rows
+        of gate then up and its columns of down."""
+        config = dataclasses.replace(_checkpoint_config(), n_routed_experts=2, num_experts_per_tok=1)
+        hidden, inter, local = config.hidden_size, config.moe_intermediate_size, config.moe_intermediate_size // tp
+        g = torch.Generator().manual_seed(tp)
+        tensors, full = {}, {}
+        for which, (rows, cols) in {"w1": (inter, hidden), "w3": (inter, hidden), "w2": (hidden, inter)}.items():
+            # every code, scales over 2 ** -8 to 2 ** 8; the stack's second expert
+            packed = torch.randint(0, 256, (rows, cols // 2), generator=g, dtype=torch.uint8)
+            scale = torch.randint(119, 136, (rows, cols // 32), generator=g, dtype=torch.uint8)
+            tensors[f"layers.0.ffn.experts.1.{which}.weight"] = packed.view(torch.int8)
+            tensors[f"layers.0.ffn.experts.1.{which}.scale"] = scale.view(torch.float8_e8m0fnu)
+            full[which] = _read_mxfp4(packed, scale)
+
+        def experts(layout: str, rank: int):
+            root = _OneMoE(dataclasses.replace(config, moe_experts=layout), _rank(rank, tp))
+            load_deepseek_v41_weights(root, tensors.items())
+            return root.ffn.experts
+
+        for rank in range(tp):
+            mine = slice(rank * local, (rank + 1) * local)
+            gate_up, down = torch.cat([full["w1"][mine], full["w3"][mine]]), full["w2"][:, mine]
+            fp4 = experts("fp4", rank)
+            assert {name: (p.dtype, tuple(p.shape)) for name, p in fp4.named_parameters()} == {
+                "gate_up_proj_packed": (torch.uint8, (2, 2 * local, hidden // 2)),
+                "gate_up_proj_scale": (torch.uint8, (2, 2 * local, hidden // 32)),
+                "down_proj_packed": (torch.uint8, (2, hidden, local // 2)),
+                "down_proj_scale": (torch.uint8, (2, hidden, local // 32)),
+            }
+            assert torch.equal(_read_mxfp4(fp4.gate_up_proj_packed[1], fp4.gate_up_proj_scale[1]), gate_up)
+            assert torch.equal(_read_mxfp4(fp4.down_proj_packed[1], fp4.down_proj_scale[1]), down)
+        # the last rank's slices are what the dense layout holds for it
+        dense = experts("dense", tp - 1)
+        assert torch.equal(dense.gate_up_proj[1], gate_up) and torch.equal(dense.down_proj[1], down)
+
+    @pytest.mark.usefixtures("cpu")
+    @pytest.mark.parametrize("tp", [2, 8])
+    def test_over_a_tp_group_fp4_is_dense_bit_for_bit_and_the_group_matches_one_rank(self, tp):
+        config = DeepseekV41Config.reduced(moe_intermediate_size=32 * tp)
+        tensors = {name: t for name, t in _testing.random_checkpoint(config, seed=0).items()
+                   if name.startswith("layers.0.ffn.")}
+        x = torch.randn(24, config.hidden_size, generator=torch.Generator().manual_seed(1))
+        fp4 = _run_ranks(config, tensors, x, tp)
+        dense = _run_ranks(dataclasses.replace(config, moe_experts="dense"), tensors, x, tp)
+        assert all(torch.equal(a, b) for a, b in zip(fp4, dense, strict=True))
+        assert logit_gap(fp4[-1], _run_ranks(config, tensors, x, 1)[0]) < 1e-5
+
+
 @pytest.fixture
 def cpu(monkeypatch):
     _testing.patch_cpu_engine(monkeypatch)
@@ -208,31 +354,44 @@ def cpu(monkeypatch):
 
 @pytest.mark.usefixtures("cpu")
 class TestEngineCpu:
-    PROMPT, STEPS = 45, 6
+    PROMPT, SHORT, STEPS = 45, 22, 6
 
     def _solo(self, snapshot, ids, prompt, **kwargs):
         engine, sampler, _ = cpu_engine(snapshot[0], torch.float32, **kwargs)
         return run_request(engine, sampler, ids, prompt)
 
-    def test_fp8_resident_experts_give_the_dequantized_experts_logits(self, snapshot):
-        ids = random_ids(snapshot[1], self.PROMPT + self.STEPS, seed=1)
-        dense = self._solo(snapshot, ids, self.PROMPT)
-        resident = self._solo(snapshot, ids, self.PROMPT, moe_fp8_resident=True)
-        assert torch.equal(resident, dense)
-
-    def test_two_requests_in_one_step_match_each_alone(self, snapshot):
-        ids_a = random_ids(snapshot[1], self.PROMPT + self.STEPS, seed=1)
-        ids_b = random_ids(snapshot[1], 22 + self.STEPS, seed=2)
-        alone_a, alone_b = self._solo(snapshot, ids_a, self.PROMPT), self._solo(snapshot, ids_b, 22)
-        engine, sampler, _ = cpu_engine(snapshot[0], torch.float32)
-        for rid in "ab":
+    def _pair(self, snapshot, dtype=torch.float32, **kwargs):
+        """Two requests prefilled in one step and decoded together: each one's ids, its logits
+        step by step, and the model."""
+        ids = {"a": random_ids(snapshot[1], self.PROMPT + self.STEPS, seed=1),
+               "b": random_ids(snapshot[1], self.SHORT + self.STEPS, seed=2)}
+        prompt = {"a": self.PROMPT, "b": self.SHORT}
+        engine, sampler, model = cpu_engine(snapshot[0], dtype, **kwargs)
+        for rid in ids:
             add_request(engine, rid)
-        rows = [run_step(engine, sampler, "prefill", {"a": ids_a[:self.PROMPT], "b": ids_b[:22]})]
+        rows = [run_step(engine, sampler, "prefill", {rid: ids[rid][:prompt[rid]] for rid in ids})]
         for step in range(self.STEPS):
             rows.append(run_step(engine, sampler, "decode", {
-                "a": ids_a[self.PROMPT + step].view(1), "b": ids_b[22 + step].view(1)}))
-        assert logit_gap(torch.stack([r["a"] for r in rows]), alone_a) < 1e-5
-        assert logit_gap(torch.stack([r["b"] for r in rows]), alone_b) < 1e-5
+                rid: ids[rid][prompt[rid] + step].view(1) for rid in ids}))
+        return ids, {rid: torch.stack([row[rid] for row in rows]) for rid in ids}, model
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
+    @pytest.mark.parametrize("moe_experts", ["fp4", "fp8"])
+    def test_packed_experts_give_the_dense_experts_logits_bit_for_bit(self, snapshot, moe_experts, dtype):
+        def experts(model):
+            return model.get_submodule("LLM").language_model.model.layers[0].ffn.experts
+
+        _, dense, dense_model = self._pair(snapshot, dtype, moe_experts="dense")
+        _, packed, packed_model = self._pair(snapshot, dtype, moe_experts=moe_experts)
+        assert {p.dtype for p in experts(dense_model).parameters()} == {dtype}
+        assert next(experts(packed_model).parameters()).dtype == torch.uint8
+        for rid in dense:
+            assert torch.isfinite(dense[rid]).all() and torch.equal(packed[rid], dense[rid])
+
+    def test_two_requests_in_one_step_match_each_alone(self, snapshot):
+        ids, together, _ = self._pair(snapshot)
+        assert logit_gap(together["a"], self._solo(snapshot, ids["a"], self.PROMPT)) < 1e-5
+        assert logit_gap(together["b"], self._solo(snapshot, ids["b"], self.SHORT)) < 1e-5
 
     @pytest.mark.parametrize("cut", [1, 8, 19, 32])
     def test_a_prompt_fed_in_two_steps_matches_one(self, snapshot, cut):

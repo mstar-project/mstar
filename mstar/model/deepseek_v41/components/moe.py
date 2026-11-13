@@ -3,9 +3,17 @@ shared expert, with the reference's rounding.
 
 Every expert GEMM reads its input rounded to FP8 in 32-wide groups, and the routing weight
 scales an expert's activation before the down projection rounds it. ``_dispatch`` is that
-arithmetic expert by expert, the numerics anchor a fused kernel is held to. The routed experts
-stay in the checkpoint's bytes' worth of fp8 (``moe_fp8_resident``: its fp4 upcast to E4M3
-blocks, in ``fused_moe``'s layout) or in the model's dtype.
+arithmetic expert by expert, the numerics anchor a fused kernel is held to.
+
+The routed experts are held as ``moe_experts`` says, the same values each way:
+
+- ``fp4``: the checkpoint's bytes, MXFP4. ``gate_up_proj_packed (E, 2 * inter, hidden / 2)`` and
+  ``down_proj_packed (E, hidden, inter / 2)`` hold two E2M1 codes a byte along the inputs (the
+  even input in the low nibble), gate rows before up rows; ``gate_up_proj_scale (E, 2 * inter,
+  hidden / 32)`` and ``down_proj_scale (E, hidden, inter / 32)`` hold one E8M0 byte per row and
+  32 inputs. A hit expert is dequantized for the step.
+- ``fp8``: their upcast to E4M3 32 x 32 blocks, in ``fused_moe``'s layout.
+- ``dense``: the model's dtype.
 """
 from __future__ import annotations
 
@@ -18,8 +26,11 @@ from mstar.distributed.utils import divide
 from mstar.model.components.moe import NoAuxTcRouter
 from mstar.model.deepseek_v41.components.linear import fp32_linear
 from mstar.model.deepseek_v41.config import DeepseekV41Config
-from mstar.utils.fp8_block import dequantize_fp8_block_weight
-from mstar.utils.mx_round import round_fp8
+from mstar.utils.fp8_block import E8M0_DTYPE, dequantize_fp8_block_weight
+from mstar.utils.mx_round import dequant_row_fp4, round_fp8
+
+# MXFP4's scale group: one E8M0 scale per 32 inputs of a row
+FP4_GROUP = 32
 
 
 class DeepseekV41MoE(nn.Module):
@@ -31,11 +42,15 @@ class DeepseekV41MoE(nn.Module):
         self.num_experts = config.n_routed_experts
         self.swiglu_limit = config.swiglu_limit
         self.block = config.fp8_block
+        self.layout = config.moe_experts
         # each rank holds a slice of every expert's intermediate dim, whole scale blocks of it
         self.inter = divide(config.moe_intermediate_size, self.tp_size)
         if self.inter % self.block:
             raise ValueError(f"a rank's {self.inter} intermediate dims are not whole {self.block}-wide scale blocks")
-        self.fp8_experts = config.moe_fp8_resident
+        if self.layout == "fp4" and (self.inter % FP4_GROUP or self.hidden_size % FP4_GROUP):
+            raise ValueError(
+                f"fp4 experts scale {FP4_GROUP} inputs at a time: a rank's {self.inter} intermediate dims and "
+                f"the hidden size {self.hidden_size} must be whole groups (moe_experts: fp8 or dense otherwise)")
 
         self.gate = NoAuxTcRouter(
             hidden_size=config.hidden_size,
@@ -47,7 +62,15 @@ class DeepseekV41MoE(nn.Module):
         )
         experts, hidden, inter, block = self.num_experts, self.hidden_size, self.inter, self.block
         self.experts = nn.Module()
-        if self.fp8_experts:
+        if self.layout == "fp4":
+            def stored(rows: int, width: int) -> nn.Parameter:
+                return nn.Parameter(torch.empty(experts, rows, width, dtype=torch.uint8), requires_grad=False)
+
+            self.experts.gate_up_proj_packed = stored(2 * inter, hidden // 2)
+            self.experts.gate_up_proj_scale = stored(2 * inter, hidden // FP4_GROUP)
+            self.experts.down_proj_packed = stored(hidden, inter // 2)
+            self.experts.down_proj_scale = stored(hidden, inter // FP4_GROUP)
+        elif self.layout == "fp8":
             self.experts.gate_up_proj_fp8 = nn.Parameter(
                 torch.empty(experts, 2 * inter, hidden, dtype=torch.uint8), requires_grad=False)
             self.experts.gate_up_proj_scale_inv = nn.Parameter(
@@ -70,9 +93,16 @@ class DeepseekV41MoE(nn.Module):
         self.gate.finalize_weights()
 
     def _expert_weights(self, expert: torch.Tensor, dtype: torch.dtype):
+        """One routed expert's ``(gate_up, down)`` in ``dtype``: what ``dense`` holds, whatever
+        the layout."""
         exp = self.experts
-        if not self.fp8_experts:
+        if self.layout == "dense":
             return exp.gate_up_proj[expert], exp.down_proj[expert]
+        if self.layout == "fp4":
+            gate_up_scale = exp.gate_up_proj_scale[expert].view(E8M0_DTYPE)
+            down_scale = exp.down_proj_scale[expert].view(E8M0_DTYPE)
+            return (dequant_row_fp4(exp.gate_up_proj_packed[expert], gate_up_scale, dtype),
+                    dequant_row_fp4(exp.down_proj_packed[expert], down_scale, dtype))
         block = (self.block, self.block)
         return (
             dequantize_fp8_block_weight(exp.gate_up_proj_fp8[expert], exp.gate_up_proj_scale_inv[expert],

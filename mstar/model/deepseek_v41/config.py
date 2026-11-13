@@ -19,6 +19,8 @@ POOL_KV = "pool_kv"
 POOL_SCORE = "pool_score"
 NGRAM = "ngram"
 
+# how the routed experts are held (``moe_experts``)
+MOE_EXPERTS = ("fp4", "fp8", "dense")
 
 
 def kv_cache_key(ratio: int) -> str:
@@ -123,9 +125,9 @@ class DeepseekV41Config:
     # the context served; the latent cache is sized to it
     max_seq_len: int = 65536
     max_output_tokens: int | None = None
-    # the routed experts as the checkpoint's fp8 upcast of their fp4 (uint8 and block scales);
-    # off holds them in the model's dtype, four times the checkpoint's bytes
-    moe_fp8_resident: bool = True
+    # the routed experts: "fp4" as the checkpoint packs them, "fp8" their exact upcast to E4M3
+    # blocks (twice the bytes), "dense" in the model's dtype (four times in bf16)
+    moe_experts: str = "fp4"
 
     def __post_init__(self):
         self.compress_ratios = tuple(self.compress_ratios)
@@ -144,6 +146,8 @@ class DeepseekV41Config:
             raise ValueError(f"one shared expert is the only layout ported, got {self.n_shared_experts}")
         if self.scoring_func != "sqrtsoftplus":
             raise ValueError(f"scoring_func {self.scoring_func!r}: only sqrtsoftplus is ported")
+        if self.moe_experts not in MOE_EXPERTS:
+            raise ValueError(f"moe_experts must be one of {MOE_EXPERTS}, got {self.moe_experts!r}")
         if self.num_attention_heads % self.o_groups:
             raise ValueError("num_attention_heads must divide into o_groups")
         for width in (self.head_dim, self.index_head_dim, self.q_lora_rank, self.hidden_size,
@@ -296,7 +300,7 @@ class DeepseekV41Config:
             engram_layer_ids=(1,), engram_num_embeddings=(0,), engram_max_ngram_size=3,
             engram_vocab_size=50, engram_n_heads=2, engram_head_dim=32,
             engram_compressed_vocab_size=512, num_nextn_predict_layers=1,
-            max_position_embeddings=512, max_seq_len=256, moe_fp8_resident=False,
+            max_position_embeddings=512, max_seq_len=256,
         )
         base.update(overrides)
         config = cls(**base)

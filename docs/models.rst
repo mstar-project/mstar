@@ -1013,9 +1013,10 @@ trained to round it to (``kv_cache_x2`` and ``kv_cache_x1``, together 890 bytes 
 rank), and each request's windows in the recurrent pool (``state``, 5.6 MB a request per
 rank). ``model_kwargs``:
 ``max_seq_len`` (the context served, 65536), ``max_requests`` (requests holding state at
-once), ``moe_fp8_resident`` (the routed experts as an exact fp8 upcast of their fp4, on by
-default: 68 GB per GPU at TP8; off holds them in bf16, twice that). The ``-1017`` refresh has
-the same layout: pass it as ``model_kwargs.checkpoint_path``.
+once), ``moe_experts`` (how the routed experts are held: ``fp4``, the default, as the
+checkpoint packs them, 36 GB per GPU at TP8; ``fp8``, their exact upcast to E4M3 blocks, 68 GB;
+``dense``, bf16, 136 GB; the logits are the same bit for bit). The ``-1017`` refresh has the
+same layout: pass it as ``model_kwargs.checkpoint_path``.
 
 Chat renders each message in its role through the checkpoint's chat template (``developer``
 as ``system``; tool results fold into the next user turn, as the checkpoint's encoder writes

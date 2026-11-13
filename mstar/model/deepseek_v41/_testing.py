@@ -164,7 +164,7 @@ def synthetic_tokenizer(vocab_size: int):
 def to_hf_config(config: DeepseekV41Config) -> dict:
     """``config`` as the checkpoint's config.json spells it (``from_hf_config``'s inverse)."""
     text = {f.name: getattr(config, f.name) for f in dataclasses.fields(config)}
-    for knob in ("max_seq_len", "max_output_tokens", "moe_fp8_resident", "fp8_block", "bos_token_id",
+    for knob in ("max_seq_len", "max_output_tokens", "moe_experts", "fp8_block", "bos_token_id",
                  "eos_token_ids", "pad_token_id"):
         text.pop(knob)
     text["rope_scaling"] = {
@@ -394,7 +394,7 @@ def build_engine(path: str | Path, dtype: torch.dtype, device: str = "cpu", tp_g
     from mstar.model.deepseek_v41.deepseek_v41_model import DeepseekV41Model
     from mstar.testing_utils.resource import StubResource
 
-    model_kwargs = {"max_seq_len": 256, "max_requests": 4, "moe_fp8_resident": False, **model_kwargs}
+    model_kwargs = {"max_seq_len": 256, "max_requests": 4, **model_kwargs}
     model = DeepseekV41Model(str(path), **model_kwargs)
     sub = model.get_submodule("LLM", device=device, tp_group=tp_group, autocast_dtype=dtype)
     engine = Engine(None, autocast_dtype=None)

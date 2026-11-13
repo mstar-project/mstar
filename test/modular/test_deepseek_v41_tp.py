@@ -50,8 +50,9 @@ def cpu(monkeypatch):
     torch.set_num_threads(threads)
 
 
-@pytest.mark.parametrize("model_kwargs", [{}, {"moe_fp8_resident": True}], ids=["dense-experts", "fp8-experts"])
-def test_two_ranks_match_one(tmp_path, cpu, model_kwargs):
+@pytest.mark.parametrize("layout", ["fp4", "fp8", "dense"])
+def test_two_ranks_match_one(tmp_path, cpu, layout):
+    model_kwargs = {"moe_experts": layout}
     snapshot = tmp_path / "snap"
     config, _ = _testing.write_snapshot(snapshot, DeepseekV41Config.reduced(**TP2), seed=5)
     mp.spawn(_rank, args=(str(snapshot), str(tmp_path / "store"), str(tmp_path), model_kwargs), nprocs=2)

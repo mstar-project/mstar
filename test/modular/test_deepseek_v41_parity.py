@@ -26,7 +26,7 @@ from mstar.model.deepseek_v41._testing import add_request, cpu_engine, run_reque
 from mstar.model.deepseek_v41._testing import logit_gap as _gap
 from mstar.model.deepseek_v41._testing import random_ids as _ids
 from mstar.model.deepseek_v41.components import attention
-from mstar.model.deepseek_v41.config import DeepseekV41Config
+from mstar.model.deepseek_v41.config import MOE_EXPERTS, DeepseekV41Config
 
 REFERENCE_DIR = os.environ.get("DSV41_REFERENCE_DIR")
 pytestmark = [
@@ -98,9 +98,10 @@ def fp32_reference(reference, snapshot, tmp_path_factory):
 
 
 class TestParity:
-    def test_fp32_logits_match_the_reference_step_by_step(self, snapshot, fp32_reference):
+    @pytest.mark.parametrize("moe_experts", MOE_EXPERTS)
+    def test_fp32_logits_match_the_reference_step_by_step(self, snapshot, fp32_reference, moe_experts):
         ids, want = fp32_reference
-        engine, sampler, _ = cpu_engine(snapshot[0], torch.float32)
+        engine, sampler, _ = cpu_engine(snapshot[0], torch.float32, moe_experts=moe_experts)
         got = run_request(engine, sampler, ids, PROMPT)
         assert got.shape == want.shape
         assert torch.equal(got.argmax(-1), want.argmax(-1))
