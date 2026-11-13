@@ -147,7 +147,7 @@ def test_a_rebuild_refuses_a_kept_window_on_its_decode_walks():
     """A rebuild recomputes the decode steps in prefill rows, where a kept window cuts other entries than each step
     saw. Only the kept window takes the loop's walks."""
     kept = _array(reads={"attn": _read(Bidirectional(kept_window=True), walks={"decode"})})
-    assert state_declaration_problems(_Model(kept, rebuilt=True)) == [
+    assert state_declaration_problems(_Model(kept, rebuilt=True, kv_labels={"kv": {"main": KVLabel()}})) == [
         "Array 'kv'.reads['attn']: Bidirectional on walk 'decode', which dit's rebuild policy replaces with its "
         "prefill rows. A kept window cuts other entries from a prefill row than from the steps it replaces, so drop "
         "the rebuild policy"
@@ -1003,21 +1003,6 @@ def test_a_reach_is_refused_under_capture():
     handle, pool = _reach_handle()
     step = _reach_step(handle, pool, 12, capture=True)
     with pytest.raises(ValueError, match="Array 'dit_kv': no layout yet: a read with no op in a captured step"):
-        step.begin_calls()
-
-
-@pytest.mark.parametrize("op", [None, Attend(q_heads=1)], ids=["no_op", "attend"])
-@pytest.mark.parametrize("state_layout", [{}, {"dit_kv": {}}], ids=["no_array", "no_label"])
-def test_a_kept_window_read_refuses_a_row_whose_request_sized_no_window(op, state_layout):
-    """A request that gives no `Layout` for a label keeps every entry of it, and the read would reach them all with
-    no error: 72 entries by the sixth chunk of 12, where a sink of 18 and a window of 24 reach 54. The step that
-    lists the row refuses before its forward, for a read with an op and for one without."""
-    handle, pool = _reach_handle(op=op, state_layout=state_layout)
-    step = _reach_step(handle, pool, 12)
-    with pytest.raises(ValueError, match=r"Array 'dit_kv': request a keeps no window on label 'main', so "
-                                         r"reads\['self_attn'\] would reach every entry; "
-                                         r"state_layout\['dit_kv'\]\['main'\] must be a Layout that gives "
-                                         r"kept_windows\['self_attn'\]"):
         step.begin_calls()
 
 

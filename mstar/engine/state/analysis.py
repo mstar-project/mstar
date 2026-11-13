@@ -52,6 +52,7 @@ def state_declaration_problems(model: "Model") -> list[str]:
         problems += _combined_walk_problems(array, combined_walks(array, combined_by_node))
         problems += _array_problems(array)
     problems += _kv_label_problems(model.kv_labels(), arrays)
+    problems += _kept_window_label_problems(model.kv_labels(), arrays)
     problems += _cross_read_problems(arrays)
     problems += _regrouping_problems(model, arrays, graphs)
     problems += _value_problems(arrays, model.kv_labels())
@@ -156,6 +157,21 @@ def _kv_label_problems(kv_labels: Mapping[str, Mapping[str, object]], arrays: Se
             f"kv_labels()[{key!r}][{label!r}]: it is not in Array {key!r}.labels, {sorted(by_name[key].labels)}"
             for label in sorted(labels.keys() - by_name[key].labels)
         ]
+    return problems
+
+
+def _kept_window_label_problems(kv_labels: Mapping[str, Mapping[str, object]], arrays: Sequence[Array]) -> list[str]:
+    """A kept window is sized by each request's layout, and the conductor refuses a request that opens a label with
+    no layout only on the pools ``kv_labels`` names."""
+    problems: list[str] = []
+    for array in arrays:
+        kept = [key for key, read in array.reads.items() if isinstance(read.mask, Bidirectional)
+                and read.mask.kept_window]
+        missing = sorted(array.labels - kv_labels.get(array.name, EMPTY).keys())
+        if kept and missing:
+            problems.append(f"Array {array.name!r}.reads[{kept[0]!r}] keeps a window, and labels {missing} aren't in "
+                            f"kv_labels()[{array.name!r}], so a request could open them with no layout and reads"
+                            f"[{kept[0]!r}] would reach every entry; add them to kv_labels()[{array.name!r}]")
     return problems
 
 

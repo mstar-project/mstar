@@ -1245,8 +1245,6 @@ class PagedArrayHandle(ArrayHandle):
             layer for bound in bindings if not bound.binding.takes_queries
             for layer in read_layers(array, bound.declared)
         )
-        # the reads through a kept window, which each request's layout sizes for the labels it opens
-        self._windowed = [bound.key for bound in bindings if bound.binding.keeps_window]
         # each op with its resource, built once since `state_steps` runs on every step, replays too
         self._ops = [(resolved.resource_of[bound.key], bound) for bound in bindings]
         # whether `check_step` needs an add, for a step that lists a row on the pages at span above 0
@@ -1296,17 +1294,6 @@ class PagedArrayHandle(ArrayHandle):
         self._combined = bool(combined)
         if combined:
             self.label = next(iter(combined.values()))
-        # A capture's padding rows open with no layout, so each reaches only the span it adds.
-        if not self._windowed or not self._segments or step.ctx.replays or step.ctx.capture:
-            return
-        placeholders = step.state[self.name].placeholders
-        for view in self._kv.views(self.label):
-            if view.retention is None and (view.request_id, view.label) not in placeholders:
-                key = self._windowed[0]
-                raise self._refusal(
-                    f"request {view.request_id} keeps no window on label {view.label!r}, so reads[{key!r}] would "
-                    f"reach every entry; state_layout[{self.name!r}][{view.label!r}] must be a Layout that gives "
-                    f"kept_windows[{key!r}]")
 
     def check_step(self, step) -> None:
         # in the step's forward, before its commit: the last add, if its layer went unread
