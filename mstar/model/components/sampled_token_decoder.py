@@ -189,8 +189,8 @@ class SampledTokenDecoder(TokenStepNode, ARNodeSubmodule):
         """Decode reads its token off the sampler and its rows' positions off the
         position resource (`preprocess`), so a walk asked to repeat may run on
         resident tables and loop its token back, even where the node's own path
-        doesn't: Canary keeps main's routed token, a measured choice of its own,
-        unless a deployment asks."""
+        doesn't: Canary-Qwen keeps the routed token, a measured choice of its
+        own, unless a deployment asks."""
         super().enable_repeats(walks)
         if self.DECODE_WALK in self._repeat_walks and self.device_loopback is None:
             self.device_loopback = self._decode_loopback()

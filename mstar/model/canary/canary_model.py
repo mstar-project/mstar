@@ -329,7 +329,7 @@ class CanaryModel(Model):
                 name_remapper=CanaryDecoderModel.remap,
             )
             check_loaded(decoder, loaded, "Canary decoder")
-            return CanaryDecoderSubmodule(decoder.eval(), self.config)
+            return CanaryDecoderSubmodule(decoder.eval(), self.config, max_context=self._max_encoder_frames())
         return None
 
 

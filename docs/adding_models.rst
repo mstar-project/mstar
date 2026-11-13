@@ -4044,9 +4044,9 @@ can call the same way.
 The decoder node's ``declare_step`` shows how a write-once context is expressed with spans.
 Canary's comes from ``EncoderDecoderNode`` (``mstar/model/components/encoder_decoder.py``),
 a ``SampledTokenDecoder`` that adds only the cross-attention part: the context segments,
-and the encoder output on the prefill row, which its decoder writes into the context
-before its layers read it. Whisper's declares its own, since it writes the context eagerly
-and captures prefill. The context segments have a non-zero span in the prefill step that
+and the encoder output on the prefill row, which ``preprocess`` writes into the context
+(``KVStep.eager_write``) so the prefill replays a graph sized by its prompt. Whisper's
+declares its own and writes its context the same way. The context segments have a non-zero span in the prefill step that
 writes them, and a span of 0 in every later step. The ``commit`` in the prefill step
 converts the reservation into resident pages that the later steps read.
 
