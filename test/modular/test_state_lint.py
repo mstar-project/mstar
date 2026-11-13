@@ -344,6 +344,30 @@ def test_an_exception_covers_only_its_own_functions_attribute(path, source, foun
     assert _violations(source, path) == (found, used)
 
 
+_OMNI = "mstar/model/qwen3_omni/qwen3_omni_model.py"
+
+
+@pytest.mark.parametrize("path, body, refused", [
+    (_OMNI, "return [self._lora_spec()]", False),
+    (_OMNI, "return [self._lora_spec(), *token2wav_resources()]", True),
+    (_OMNI, "return [self._lora_spec()] + token2wav_resources()", True),
+    (_OMNI, "return token2wav_resources()", True),
+    (_OMNI, "if self.speaks:\n            return token2wav_resources()\n        return [self._lora_spec()]", True),
+    ("mstar/model/minicpm_o/minicpm_o_model.py", "return token2wav_resources()", True),
+], ids=["the listed spec", "a second spec", "a second list", "another spec", "another spec on one path",
+        "an unlisted file"])
+def test_an_override_returns_only_the_spec_its_file_is_listed_for(path, body, refused):
+    """Token2Wav's hand-written specs reached the engine from a ported model this way: a shared module the lint
+    doesn't read built them, and the model's ``get_node_resources`` returned them."""
+    source = (
+        "from mstar.model.components.token2wav.resources import token2wav_resources\n"
+        f"class Model:\n    def get_node_resources(self):\n        {body}\n"
+    )
+    found, used = _violations(source, path)
+    assert bool(found) == refused, f"`{body}` in {path} gave {found}"
+    assert used == (set() if refused else {path}), "an exception is used only by the override it allows"
+
+
 def test_the_lint_reads_the_five_speech_packages():
     assert {path.parts[2] for path in _sources()} >= {"kokoro", "omnilingual_asr", "omnivoice", "orpheus", "voxcpm2"}
 
