@@ -397,7 +397,7 @@ def test_resolve_records_the_resource_every_op_runs_on():
 
 
 @pytest.mark.parametrize("field, refusal", [
-    ({"positions": Positions()}, "positions, which only an append-only array that keeps entries holds"),
+    ({"positions": Positions()}, "positions, which today's resources don't keep on HostValueStorage"),
 ])
 def test_a_host_value_is_refused_what_only_another_storage_holds(field, refusal):
     flags = replace(Value("flags", nodes={"talker"}, layers={0}, entry=Entry({}, host={"sent": bool})), **field)

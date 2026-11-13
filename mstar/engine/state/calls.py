@@ -305,6 +305,18 @@ class ArrayHandle(StepHandle):
         """Whether ``op``'s fused kernel writes this array itself, in place of its reference running the calls."""
         return False
 
+    def fused_target(self, layer: int) -> Any:
+        """Record ``layer``'s add, which a fused op makes, and give where its kernel writes the step's entries."""
+        raise self._unsupported("fused_target")
+
+    def _pages(self) -> torch.Tensor:
+        """The whole pool a fused op writes into, which the debug check and `conformance_problems` copy."""
+        raise self._unsupported("_pages")
+
+    def _slots(self, layer: int) -> tuple:
+        """An index of this step's slots on ``layer`` into any tensor shaped as `_pages`."""
+        raise self._unsupported("_slots")
+
     def _check_capture(self, walks: Collection[str]) -> None:
         """Raise if a capture replayed on ``walks`` would plan this array's reads differently on some of them."""
 
@@ -334,6 +346,9 @@ class ArrayHandle(StepHandle):
 
     def _host(self, request: int, label: str, layer: int) -> Mapping[str, object]:
         raise self._unsupported("host")
+
+    def _selects(self) -> bool:
+        raise self._unsupported("selects")
 
 
 class SamplerHandle(StepHandle):
@@ -520,10 +535,23 @@ def positions(h: ArrayHandle) -> torch.Tensor:
     return _positions(h).pos_ids(h.label)
 
 
-def rope(h: ArrayHandle, q: torch.Tensor, k: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """``q`` and ``k`` rotated at this step's positions with the declared `Rope`."""
+def rope(
+    h: ArrayHandle, q: torch.Tensor, k: torch.Tensor | None, *, at: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """``q`` and ``k`` rotated with the declared `Rope`, at this step's positions, or at ``at``, (tokens,) on the
+    device, for a pass that sits elsewhere. ``k`` None rotates ``q`` alone."""
     h._check_open("rope")
-    return _positions(h).apply_qk(q, k, label=h.label, rope_dtype=h.rope_dtype or q.dtype)
+    rope_dtype = h.rope_dtype or q.dtype
+    if at is None:
+        return _positions(h).apply_qk(q, k, label=h.label, rope_dtype=rope_dtype)
+    return _positions(h).apply_qk(q, k, label=h.label, rope_dtype=rope_dtype, pos_ids=at)
+
+
+def selects(h: ArrayHandle) -> bool:
+    """Whether some row of this step reaches more entries than ``h``'s `TopK` read picks, on the host. When none does,
+    each row's pick is its `Causal` reach, and the read can be skipped."""
+    h._check_open("selects")
+    return h._selects()
 
 
 @torch.compiler.disable

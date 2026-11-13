@@ -21,7 +21,7 @@ from mstar.engine.state.adapters import LatentHandle, PagedArrayHandle, RingHand
 from mstar.engine.state.calls import ArrayHandle
 
 # Today's types the surface re-exports, and a NamedTuple, whose fields stay positional.
-_POSITIONAL = {"PagedNHDTarget", "Segment", "SlotLease", "Span"}
+_POSITIONAL = {"PagedLatentTarget", "PagedNHDTarget", "Segment", "SlotLease", "Span"}
 # The calls take the handle first, then what every call names, and only then keywords.
 _CALLS = {
     "add_read", "at_last_token", "causal_conv", "gated_delta_net", "gather", "host", "kimi_delta", "last_sampled",
@@ -120,6 +120,22 @@ SNAPSHOT = {
         ["scratch", "KEYWORD_ONLY", '0'],
         ["kept_windows", "KEYWORD_ONLY", '{}'],
     ],
+    "PagedFormat": [
+        ["dtypes", "KEYWORD_ONLY", 'None'],
+        ["devices", "KEYWORD_ONLY", 'None'],
+    ],
+    "PagedLatent": [
+        ["dtypes", "KEYWORD_ONLY", 'None'],
+        ["devices", "KEYWORD_ONLY", 'None'],
+        ["rope_table", "KEYWORD_ONLY", 'False'],
+    ],
+    "PagedLatentTarget": [
+        ["cache", "POSITIONAL_OR_KEYWORD", None],
+        ["page_of_token", "POSITIONAL_OR_KEYWORD", None],
+        ["slot_of_token", "POSITIONAL_OR_KEYWORD", None],
+        ["count", "POSITIONAL_OR_KEYWORD", None],
+        ["rope_table", "POSITIONAL_OR_KEYWORD", None],
+    ],
     "PagedNHD": [
         ["dtypes", "KEYWORD_ONLY", 'None'],
         ["devices", "KEYWORD_ONLY", 'None'],
@@ -192,6 +208,9 @@ SNAPSHOT = {
         ["label", "POSITIONAL_OR_KEYWORD", None],
         ["span", "POSITIONAL_OR_KEYWORD", None],
     ],
+    "Selected": [
+        ["of", "POSITIONAL_OR_KEYWORD", None],
+    ],
     "SeqShard": [
         ["name", "POSITIONAL_OR_KEYWORD", None],
         ["nodes", "KEYWORD_ONLY", None],
@@ -217,6 +236,10 @@ SNAPSHOT = {
         ["shape", "POSITIONAL_OR_KEYWORD", None],
         ["dtype", "KEYWORD_ONLY", None],
         ["shard", "KEYWORD_ONLY", 'None'],
+    ],
+    "TopK": [
+        ["count", "POSITIONAL_OR_KEYWORD", None],
+        ["heads", "KEYWORD_ONLY", None],
     ],
     "Value": [
         ["name", "POSITIONAL_OR_KEYWORD", None],
@@ -297,6 +320,7 @@ SNAPSHOT = {
         ["h", "POSITIONAL_OR_KEYWORD", None],
         ["q", "POSITIONAL_OR_KEYWORD", None],
         ["k", "POSITIONAL_OR_KEYWORD", None],
+        ["at", "KEYWORD_ONLY", "None"],
     ],
     "state_op": [
         ["adds", "KEYWORD_ONLY", "()"],
@@ -314,6 +338,9 @@ SNAPSHOT = {
         ["h", "POSITIONAL_OR_KEYWORD", None],
         ["xs", "VAR_POSITIONAL", None],
         ["dim", "KEYWORD_ONLY", "None"],
+    ],
+    "selects": [
+        ["h", "POSITIONAL_OR_KEYWORD", None],
     ],
     "settle": [
         ["h", "POSITIONAL_OR_KEYWORD", None],

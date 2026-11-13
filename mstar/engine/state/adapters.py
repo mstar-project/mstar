@@ -32,6 +32,7 @@ from mstar.engine.resources.attn.ragged.config import (
     RaggedCrossAttentionStep,
     cross_label,
 )
+from mstar.engine.resources.dsa.config import DSAConfig, DSASpec, DSAStep
 from mstar.engine.resources.kv.config import (
     KVLayout,
     KVSpec,
@@ -94,6 +95,10 @@ from mstar.engine.state.contract import (
     Layout,
     Mask,
     Op,
+    PagedFormat,
+    PagedLatent,
+    PagedLatentTarget,
+    PagedNHD,
     PagedNHDTarget,
     Positions,
     Reached,
@@ -101,8 +106,10 @@ from mstar.engine.state.contract import (
     Sampler,
     SampleSettings,
     SampleStep,
+    Selected,
     SeqShard,
     TensorType,
+    TopK,
     Window,
     is_value,
     read_layers,
@@ -955,8 +962,8 @@ class PagedLatentAttend(OpBinding):
     """`LatentAttend` on a latent array: FlashInfer's MLA attention over the array's pool."""
 
     def check(self, array: Array, key: str, read: Read) -> None:
-        if not isinstance(read.mask, Causal):
-            raise _no_layout(array, f"reads[{key!r}].mask must be Causal, the mask FlashInfer's MLA plan has")
+        if not isinstance(read.mask, Causal | Selected):
+            raise _no_layout(array, f"reads[{key!r}].mask must be Causal or Selected, the masks a latent read plans")
         if read.walks is not None:
             raise _no_layout(array, f"reads[{key!r}].walks must be None, since FlashInfer's MLA plan has no walk")
         if not read.packed:
@@ -973,6 +980,9 @@ class PagedLatentAttend(OpBinding):
         self, array: Array, key: str, read: Read, declared: ArrayStep, segments, steps: dict[str, Any],
     ) -> None:
         steps[key] = AttentionStep(segments=segments, causal=read.mask.uses_query_position)
+
+    def for_mask(self, mask: Mask) -> OpBinding:
+        return SELECTED_LATENT_ATTEND if isinstance(mask, Selected) else self
 
     def bind(self, array: Array, key: str, resources: Mapping[str, Any]) -> "_LatentRead":
         return _LatentRead(array, resources[key])
@@ -1013,6 +1023,61 @@ class HoledLatentAttend(PagedLatentAttend):
             raise _no_layout(array, f"reads[{key!r}].mask must be Causal, the one mask a holed array's marks are "
                                     "written for")
         super().check(array, key, read)
+
+    def for_mask(self, mask: Mask) -> OpBinding:
+        return self
+
+
+class SelectedLatentAttend(PagedLatentAttend):
+    """`LatentAttend` through a `Selected` mask: DSA's attention over each row's picks, on the DSA resource of the array
+    ``of`` names, and FlashInfer's MLA plan for a step whose rows reach no more than they pick."""
+
+    def bind(self, array: Array, key: str, resources: Mapping[str, Any]) -> "_SelectedRead":
+        read = next(read for read in array.reads.values() if isinstance(read.mask, Selected))
+        return _SelectedRead(array, resources[key], resources[read.mask.of], read.op.scale)
+
+
+SELECTED_LATENT_ATTEND = SelectedLatentAttend()
+
+
+class _SelectedRead(_LatentRead):
+    """A latent read through a `Selected` mask, which runs the dense plan where the model passes no picks."""
+
+    def __init__(self, array: Array, attn: Any, dsa: Any, scale: float):
+        super().__init__(array, attn)
+        self._dsa, self._scale = dsa, scale
+
+    def run(
+        self, q: torch.Tensor, *, label: str, kv_cache_layer: torch.Tensor, q_pe: torch.Tensor,
+        selected: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if selected is None:
+            return self._attn.run(q, label=label, kv_cache_layer=kv_cache_layer, q_pe=q_pe)
+        if _DEBUG_ASSERTS:
+            self._check_distinct(selected)
+        return self._dsa.attend(selected, q, q_pe, kv_cache_layer, self._scale, label=label)
+
+    def _check_distinct(self, selected: torch.Tensor) -> None:
+        picks = selected.sort(dim=1).values
+        twice = ((picks[:, 1:] == picks[:, :-1]) & (picks[:, 1:] >= 0)).any(dim=1)
+        if twice.any():
+            raise ValueError(f"Array {self._array.name!r}: selected names a position twice in row "
+                             f"{int(twice.nonzero()[0])}")
+
+
+class DsaTopK(OpBinding):
+    """`TopK` on a key array: today's DSA resource, whose spec and step the key storage builds."""
+
+    def check(self, array: Array, key: str, read: Read) -> None:
+        if not isinstance(read.mask, Causal):
+            raise _no_layout(array, f"reads[{key!r}].mask must be Causal, the reach DSA's selection scores")
+        if read.walks is not None:
+            raise _no_layout(array, f"reads[{key!r}].walks must be None, since DSA's plan has no walk")
+        if not read.packed:
+            raise _no_layout(array, f"reads[{key!r}] declares packed=False, and DSA's selection takes packed queries")
+
+    def resource(self, array: Array, key: str) -> str:
+        return array.name
 
 
 class PositionsBinding(OpBinding):
@@ -1065,7 +1130,10 @@ class _Counter:
     def pos_ids(self, label: str) -> torch.Tensor:
         raise _no_layout(self._array, "positions(), and its positions are a count with no ids")
 
-    def apply_qk(self, q: torch.Tensor, k: torch.Tensor, *, label: str, rope_dtype: torch.dtype) -> tuple:
+    def apply_qk(
+        self, q: torch.Tensor, k: torch.Tensor | None, *, label: str, rope_dtype: torch.dtype,
+        pos_ids: torch.Tensor | None = None,
+    ) -> tuple:
         raise _no_layout(self._array, "rope(), and its positions declare no Rope")
 
 
@@ -1089,11 +1157,12 @@ class Rewind(OpBinding):
 
 class _CountTable:
     """A verify step's counts on the host, row 0 the step's number and row r the count of its row r, copied there
-    from ``staging`` on the device by a copy a capture records."""
+    from ``staging`` on the device by a copy a capture records. Past its rows it holds every one of ``ranks`` TP
+    ranks' counts, where the debug compare gathers them."""
 
-    def __init__(self, rows: int, device: torch.device):
-        self.rows = rows
-        self.host = torch.zeros(rows + 1, dtype=torch.int64, pin_memory=device.type == "cuda")
+    def __init__(self, rows: int, ranks: int, device: torch.device):
+        self.rows, self.ranks = rows, ranks
+        self.host = torch.zeros(1 + rows * (1 + ranks), dtype=torch.int64, pin_memory=device.type == "cuda")
         self.staging = torch.zeros(rows, dtype=torch.int64, device=device)
 
 
@@ -1113,7 +1182,18 @@ class _Counts:
                 raise RuntimeError(f"the count table of verify step {self._number} was overwritten by step {number} "
                                    "before its counts were applied")
             self._kept = self._table.host[1:len(self._spans) + 1].tolist()
+            self._compare_ranks()
         return self._kept[row] - self._spans[row]
+
+    def _compare_ranks(self) -> None:
+        table = self._table
+        if not table.ranks:
+            return
+        start = 1 + table.rows
+        ranks = table.host[start:start + table.ranks * len(self._spans)].view(table.ranks, -1).tolist()
+        if any(counts != self._kept for counts in ranks):
+            raise RuntimeError(f"the TP ranks settled verify step {self._number} differently, {ranks}, and each "
+                               "would move its own pages by its own counts")
 
 
 class _RowCount(NamedTuple):
@@ -1134,6 +1214,9 @@ class RewindRun(VerifyRun):
         super().__init__(handle)
         self._kv = kv
         self._device = kv.layer_view(0).device
+        # under MSTAR_KV_DEBUG_ASSERTS, the pool's TP group, whose ranks must settle the same counts
+        self._group = kv.tp_group if _DEBUG_ASSERTS else None
+        self._ranks = 0 if self._group is None or self._group.world_size == 1 else self._group.world_size
         self._tables: dict[tuple, _CountTable] = {}
         self._number = 0
         # this step's table while it verifies, its segments and its context
@@ -1157,7 +1240,7 @@ class RewindRun(VerifyRun):
         key = (lease.slot, lease.bucket) if captured else ("eager", (self._number + 1) % 2)
         table = self._tables.get(key)
         if table is None or (not captured and table.rows < len(segments)):
-            table = self._tables[key] = _CountTable(len(segments), self._device)
+            table = self._tables[key] = _CountTable(len(segments), self._ranks, self._device)
         elif table.rows < len(segments):
             raise refusal(f"a verify step of {len(segments)} rows on capture slot {lease.slot}, and its slot's count "
                           f"table holds {table.rows}")
@@ -1195,6 +1278,11 @@ class RewindRun(VerifyRun):
         self._settled = True
         self._table.staging[:rows].copy_(kept[:rows])
         self._table.host[1:rows + 1].copy_(self._table.staging[:rows], non_blocking=True)
+        if self._ranks:
+            # on the forward's stream, where every rank reaches it between the model's own collectives
+            gathered = self._group.all_gather(self._table.staging[:rows], dim=0)
+            start = 1 + self._table.rows
+            self._table.host[start:start + gathered.numel()].copy_(gathered, non_blocking=True)
 
     def end(self, ctx) -> None:
         if self._table is not None and not self._settled:
@@ -1588,6 +1676,9 @@ class PagedArrayHandle(ArrayHandle):
     `Resolved` gives it."""
 
     _write_refused = "write on an append-only array"
+    # the one class of formats a state op's kernel addresses these pages in, and the pool layout it takes
+    page_format: ClassVar[type[PagedFormat]] = PagedNHD
+    page_layout: ClassVar[KVLayout] = KVLayout.NHD
 
     def __init__(
         self, array: Array, resources: Mapping[str, Any], bindings: tuple[BoundOp, ...], resolved: "Resolved",
@@ -1798,16 +1889,19 @@ class PagedArrayHandle(ArrayHandle):
         return self._ops
 
     def takes_fused(self, op: "StateOp") -> bool:
-        """An op that adds to the array, on a pool in one of its formats, while no layer's read takes k and v at its
-        kernel, which would never see the pages the op writes. A step whose reads attend its own k and v also runs
-        the reference (``fused_ops``)."""
+        """An op that adds to the array, in a format of the handle's one class that takes the pool's pages, while no
+        layer's read takes k and v at its kernel, which would never see the pages the op writes. A step whose reads
+        attend its own k and v also runs the reference (``fused_ops``)."""
         cache = self._kv.kv_cache
-        dtype, device = cache.dtype, cache.device.type
         dense = any(not attn.requires_kv_write for attn in self._attn.values())
-        return bool(op.adds) and cache.layout is KVLayout.NHD and not dense and any(
-            (fmt.dtypes is None or dtype in fmt.dtypes) and (fmt.devices is None or device in fmt.devices)
+        return bool(op.adds) and cache.layout is self.page_layout and not dense and any(
+            type(fmt) is self.page_format and fmt.matches(cache.dtype, cache.device.type) and self._takes_format(fmt)
             for fmt in op.formats
         )
+
+    def _takes_format(self, fmt: PagedFormat) -> bool:
+        """Whether the handle has what ``fmt`` asks for past its pages' dtype and device."""
+        return True
 
     @property
     def fused_ops(self) -> frozenset[str]:
@@ -1826,6 +1920,14 @@ class PagedArrayHandle(ArrayHandle):
         """Record ``layer``'s add, which a fused op makes, and give where it writes the step's entries."""
         self._record_add(layer, None)
         return PagedNHDTarget(*self._kv.write_target(layer_idx=self._pool_layer[layer], label=self.label))
+
+    def _pages(self) -> torch.Tensor:
+        return self._kv.kv_cache.tensor
+
+    def _slots(self, layer: int) -> tuple:
+        target = PagedNHDTarget(*self._kv.write_target(layer_idx=self._pool_layer[layer], label=self.label))
+        pages, slots = target.page_of_token[:target.count], target.slot_of_token[:target.count]
+        return self._pool_layer[layer], pages, slice(None), slots
 
 
 class PagedByWalkHandle(PagedArrayHandle):
@@ -1926,6 +2028,9 @@ class LatentHandle(PagedArrayHandle):
     """Adds and reads through the MLA pages of a latent array. An add joins ``ckv`` and ``kpe`` into one row and
     writes it, and a read attends the pages with ``q`` and ``q_pe``, so the handle holds nothing between them."""
 
+    page_format = PagedLatent
+    page_layout = KVLayout.MLA
+
     def __init__(
         self, array: Array, resources: Mapping[str, Any], bindings: tuple[BoundOp, ...], resolved: "Resolved",
     ):
@@ -1939,6 +2044,23 @@ class LatentHandle(PagedArrayHandle):
     def _needs_step_kv(self, attn: Any) -> bool:
         """Never: the absorbed read attends the pages alone."""
         return False
+
+    def _takes_format(self, fmt: PagedLatent) -> bool:
+        # the fused prep turns interleaved pairs from the position resource's own table
+        positions = self.positions
+        return not fmt.rope_table or (
+            positions is not None and positions.cos_sin_table is not None and positions.interleave
+        )
+
+    def fused_target(self, layer: int) -> PagedLatentTarget:
+        self._record_add(layer, None)
+        pages, slots = self._kv.write_slots(label=self.label)
+        table = None if self.positions is None else self.positions.cos_sin_table
+        return PagedLatentTarget(self._views[layer], pages, slots, pages.shape[0], table)
+
+    def _slots(self, layer: int) -> tuple:
+        pages, slots = self._kv.write_slots(label=self.label)
+        return self._pool_layer[layer], pages, slots
 
     @torch.compiler.disable
     def add(self, layer: int | torch.Tensor, *, keep: bool | None = None, **fields: torch.Tensor) -> None:
@@ -2020,6 +2142,45 @@ class HoledHandle(LatentHandle):
         self._record_read(layer)
         ones = self._rows(self._ones, q.shape[0], lambda rows: q.new_ones(rows, q.shape[1], HOLE_SLOT))
         return self._attn[layer].run(q, label=self.label, kv_cache_layer=self._views[layer], q_pe=ones)
+
+
+class DsaKeyHandle(ArrayHandle):
+    """Adds and reads DSA index keys through today's DSA resource, which keeps each request's keys in its own store
+    and picks each row's top positions over them."""
+
+    def __init__(
+        self, array: Array, resources: Mapping[str, Any], bindings: tuple[BoundOp, ...], resolved: "Resolved",
+    ):
+        super().__init__(array, resources)
+        self._bindings = bindings
+        (bound,) = bindings
+        self._dsa = bound.binding.bind(array, resolved.resource_of[bound.key], resources)
+
+    def _check_storage(self, declared: ArrayStep, segments, ctx) -> None:
+        if not declared.keep or declared.forks:
+            raise self._refusal("a step sets keep=False or forks, and the key store appends every add to its request")
+        super()._check_storage(declared, segments, ctx)
+
+    @torch.compiler.disable
+    def add(self, layer: int | torch.Tensor, *, keep: bool | None = None, **fields: torch.Tensor) -> None:
+        layer = self._layer_id(layer)
+        if fields.keys() != {"k"}:
+            raise self._refusal(f"an add of fields {sorted(fields)}, and the key entry holds ['k']")
+        self._record_add(layer, keep)
+        self._dsa.store_keys(self._pool_layer[layer], fields["k"], label=self.label)
+
+    @torch.compiler.disable
+    def read(self, layer: int | torch.Tensor, q: torch.Tensor | None = None, **mask_args: Any) -> torch.Tensor:
+        """Each row's `TopK` picks for ``q``, with the head ``weights``."""
+        layer = self._layer_id(layer)
+        if q is None or mask_args.keys() != {"weights"}:
+            raise self._refusal(f"a read with q {'None' if q is None else 'given'} and arguments {sorted(mask_args)}, "
+                                "and TopK takes q and weights")
+        self._record_read(layer)
+        return self._dsa.select(self._pool_layer[layer], q, mask_args["weights"], label=self.label)
+
+    def _selects(self) -> bool:
+        return self._dsa.needs_selection(self.label)
 
 
 class RingHandle(ArrayHandle):
@@ -2836,6 +2997,41 @@ class HoledStorage(LatentStorage):
         )
 
 
+class DsaKeyStorage(Storage):
+    """An append-only array of DSA index keys, which today's DSA resource keeps per request in its own store, outside
+    any pages, for the one latent array whose `Selected` read names it."""
+
+    handle_class = DsaKeyHandle
+
+    def resolve(self, arrays: Sequence[Array], declared: Sequence[Array], setup: "StateSetup") -> Resolved:
+        resolved = Resolved({}, {}, {}, {})
+        for array in arrays:
+            resolved.bound[array.name] = _bindings(self, array)
+            if len(array.reads) > 1:
+                raise _no_layout(array, f"reads {sorted(array.reads)}, and a DSA resource runs one TopK read")
+            if array.entry.tensors.keys() != {"k"} or array.entry.host:
+                raise _no_layout(array, "an entry other than k alone, which is all a DSA key store holds")
+            if len(array.labels) > 1:
+                raise _no_layout(array, f"labels {sorted(array.labels)}, and a DSA plan holds one label")
+            latents = [
+                other.name for other in declared
+                if any(isinstance(read.mask, Selected) and read.mask.of == array.name for read in other.reads.values())
+            ]
+            if len(latents) != 1:
+                raise _no_layout(array, f"latent arrays {latents} pick through it, and a DSA resource serves one pool")
+            ((key, read),) = array.reads.items()
+            resolved.specs[array.name] = [DSASpec(
+                resource_key=array.name, nodes=array.nodes, config=DSAConfig(kv_cache=latents[0], topk=read.op.count),
+            )]
+            resolved.resource_of[key] = array.name
+        return resolved
+
+    def steps(
+        self, handle: ArrayHandle, declared: ArrayStep, step: SubmoduleStep, segments, steps: dict[str, Any],
+    ) -> None:
+        steps[handle.name] = DSAStep()
+
+
 class RingStorage(Storage):
     """An append-only array whose reads are all frame windows, in a ring of frame slots per layer that keeps only what
     the layer's window reaches. Its reads share one flex attention resource, which stages every layer's mask from the
@@ -3013,6 +3209,7 @@ PAGED_BY_WALK = PagedByWalkStorage()
 PAGED_CROSS = PagedCrossStorage()
 LATENT = LatentStorage()
 HOLED = HoledStorage()
+DSA_KEYS = DsaKeyStorage()
 RING = RingStorage()
 VALUE = ValueStorage()
 VALUE_WITH_HOST = ValueWithHostStorage()
@@ -3032,6 +3229,8 @@ def storage_of(array: Array) -> Storage:
         return WITHIN_STEP
     if array.reads and all(isinstance(read.mask, FrameWindow) for read in array.reads.values()):
         return RING
+    if array.reads and all(isinstance(read.op, TopK) for read in array.reads.values()):
+        return DSA_KEYS
     if "ckv" in array.entry.tensors:
         return HOLED if array.verify_span > 1 and "kpe" not in array.entry.tensors else LATENT
     if any(read.queries is not None for read in array.reads.values()):
@@ -3056,6 +3255,7 @@ BINDINGS: dict[tuple[Storage, type[Op | Positions | Verify | None]], OpBinding] 
     (LATENT, Verify): Rewind(),
     (HOLED, LatentAttend): HoledLatentAttend(),
     (HOLED, Verify): Holes(),
+    (DSA_KEYS, TopK): DsaTopK(),
     (RING, Attend): FlexAttend(),
     (RING, Positions): CounterPositions(),
     (WITHIN_STEP, Attend): RaggedAttend(),
@@ -3116,7 +3316,7 @@ def _bindings(
     if array.positions is not None:
         binding = BINDINGS.get((storage, Positions))
         if binding is None:
-            raise _no_layout(array, "positions, which only an append-only array that keeps entries holds")
+            raise _no_layout(array, f"positions, which today's resources don't keep on {type(storage).__name__}")
         bound.append(BoundOp(position_key(array), array.positions, binding))
     if array.verify_span > 1:
         binding = BINDINGS.get((storage, Verify))

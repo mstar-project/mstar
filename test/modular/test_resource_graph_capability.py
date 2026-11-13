@@ -93,6 +93,28 @@ def test_resource_capability_filters_recipes_and_preserves_strict_mode(
             fail_if_graphs_required([str(bucket) for bucket in missing])
 
 
+def test_a_config_a_resource_blocks_neither_replays_its_walk_nor_caps_its_batch():
+    config = BatchedAcceleratorGraphConfig(
+        capture_graph_walk="decode", capture_batch_sizes=[1, 2],
+        single_request_inputs=NodeInputs(tensor_inputs={}, input_seq_len=1),
+    )
+    submodule = SimpleNamespace(
+        get_accelerator_graph_configs=lambda *args: [config], compiled_entries_per_shape=1,
+        declare_step=Mock(return_value=SimpleNamespace(steps={"attention": object()}, state={})),
+    )
+    runner = AcceleratorGraphRunner(
+        submodule_name="llm", submodule=submodule,
+        resources={"attention": make_resource(can_capture=lambda step: False)},
+        step_runner=Mock(), device=torch.device("cpu"), autocast_dtype=None,
+        joint_comm_group=SimpleNamespace(world_size=1), num_slots=2, head_shards=1,
+    )
+    assert runner.max_batch_size_for("decode") == 2 and runner.captures_walk("decode")
+    runner.prepare_for_capture()
+    assert runner.max_batch_size_for("decode") is None and not runner.captures_walk("decode"), (
+        "the scheduler would split an eager walk at a batch size nothing was captured for"
+    )
+
+
 @pytest.mark.parametrize("piecewise", [False, True])
 def test_empty_capture_batch_sizes_capture_nothing(piecewise):
     """``capture_batch_sizes=[]`` means no capture in both runners (``None`` is the

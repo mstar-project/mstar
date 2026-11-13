@@ -157,8 +157,8 @@ class DSAPlan:
     ``last_selection``: the last FULL layer's pick this forward, which SHARED layers reuse.
 
     Under selection every row is its request's one decode row, and ``pages`` holds the rows'
-    page tables back to back on the device: row ``r``'s starts at ``row_page_offset[r]``, and
-    its first token sits ``row_start[r]`` slots into it."""
+    page tables back to back on the device: row ``r``'s starts at ``row_page_offset[r]``, its
+    first token sits ``row_start[r]`` slots into it, and it sits at position ``row_position[r]``."""
 
     spans: list[DSASpan]
     needs_selection: bool
@@ -166,6 +166,7 @@ class DSAPlan:
     pages: torch.Tensor | None = None
     row_page_offset: torch.Tensor | None = None
     row_start: torch.Tensor | None = None
+    row_position: torch.Tensor | None = None
 
 
 class DSAManager(Resource):
@@ -186,6 +187,10 @@ class DSAManager(Resource):
 
     def depends_on(self) -> set[str]:
         return {self.config.kv_cache}
+
+    def can_capture(self, step) -> bool:
+        # every call loops over the step's requests on the host
+        return False
 
     def remove_request(self, rid: str) -> None:
         self.keys.evict(rid)
@@ -227,11 +232,13 @@ class DSAManager(Resource):
         pages = [page for span in plan.spans for page in span.pages]
         offsets = list(itertools.accumulate((len(span.pages) for span in plan.spans[:-1]), initial=0))
         starts = [span.page_start for span in plan.spans]
-        staged = to_device_nonblocking(pages + offsets + starts, self._device, dtype=torch.long)
+        positions = [span.ctx_start for span in plan.spans]
+        staged = to_device_nonblocking(pages + offsets + starts + positions, self._device, dtype=torch.long)
         n, rows = len(pages), len(plan.spans)
         plan.pages = staged[:n]
         plan.row_page_offset = staged[n:n + rows]
-        plan.row_start = staged[n + rows:]
+        plan.row_start = staged[n + rows:n + 2 * rows]
+        plan.row_position = staged[n + 2 * rows:]
 
     def needs_selection(self, label: str = _MAIN) -> bool:
         """Whether this step's rows attend a pick rather than every key."""
@@ -292,11 +299,12 @@ class DSAManager(Resource):
 
         ``latent_layer`` is the MLA cache's layer view ``[pages, page_size, kv_lora_rank +
         rope]``, this step's latents already written; ``selection`` holds request-local
-        positions (-1: none). Past ``topk`` a request decodes, so row ``r`` is request ``r``'s."""
+        positions (-1: none), and a pick past its row's position is masked. Past ``topk`` a
+        request decodes, so row ``r`` is request ``r``'s."""
         plan = self._plans[label]
         rank = q_nope.shape[-1]  # the ckv width, after w_kc absorption
         query = torch.cat([q_nope, q_pe], dim=-1).float()  # (T, H, rank + rope)
-        live = selection >= 0
+        live = (selection >= 0) & (selection <= plan.row_position[:, None])
         slots = selection.clamp_min(0).long() + plan.row_start[:, None]  # (T, topk)
         pages = plan.pages[plan.row_page_offset[:, None] + slots // self.page_size]
         picked = latent_layer[pages, slots % self.page_size].float()  # (T, topk, rank + rope)

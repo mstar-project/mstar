@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
 import numpy as np
 import torch
 
-from mstar.distributed.communication import JointGroups
+from mstar.distributed.communication import CommGroup, JointGroups
 from mstar.engine.resources.base import (
     AttentionResource,
     CachedLease,
@@ -3110,6 +3110,11 @@ class KVManager(AttentionResource):
         self._preplan_key = None
         self._preplan_states = {}
         self._cached_plan_output = None
+
+    @property
+    def tp_group(self) -> CommGroup | None:
+        """The TP group of the ranks this pool spans, which hold the same requests; None on one worker."""
+        return None if self._comm_group is None else self._comm_group.tp_group
 
     def defer_correct_len(self, rid: str, label: str, correction: Correction) -> None:
         """Move the stream by ``correction`` through `correct_len` before anything next reads its length: at the next

@@ -16,7 +16,9 @@ from mstar.engine.state.contract import (
     Block,
     Read,
     Sampler,
+    Selected,
     SeqShard,
+    TopK,
     is_value,
     read_layers,
 )
@@ -52,6 +54,7 @@ def state_declaration_problems(model: "Model") -> list[str]:
         problems += _array_problems(array)
     problems += _kv_label_problems(model.kv_labels(), arrays)
     problems += _cross_read_problems(arrays)
+    problems += _selected_problems(arrays)
     problems += _regrouping_problems(model, arrays, graphs)
     problems += _value_problems(arrays, model.kv_labels())
     for declared in declarations:
@@ -181,6 +184,30 @@ def _cross_read_problems(arrays: Sequence[Array]) -> list[str]:
             elif not array.nodes <= queried.nodes:
                 problems.append(f"{where}: {read.queries!r} isn't on nodes {sorted(array.nodes - queried.nodes)}, so a "
                                 "step there has no segments to lay the queries out by")
+    return problems
+
+
+def _selected_problems(arrays: Sequence[Array]) -> list[str]:
+    """A `Selected` read's picks index its own array's log, so the array ``of`` names holds an entry at each of its
+    positions, and only a `TopK` read picks them."""
+    by_name = {array.name: array for array in arrays}
+    problems: list[str] = []
+    for array in arrays:
+        for key, read in array.reads.items():
+            if not isinstance(read.mask, Selected):
+                continue
+            where = f"Array {array.name!r}.reads[{key!r}].mask.of"
+            keys = by_name.get(read.mask.of)
+            if keys is None:
+                problems.append(f"{where}: {read.mask.of!r} names no declared array, of {sorted(by_name)}")
+                continue
+            differ = [name for name in ("nodes", "labels", "max_len", "verify_span")
+                      if getattr(keys, name) != getattr(array, name)]
+            if differ:
+                problems.append(f"{where}: Array {keys.name!r} has other {', '.join(differ)}, and it holds an entry at "
+                                "each position the picks name")
+            if not keys.reads or any(not isinstance(other.op, TopK) for other in keys.reads.values()):
+                problems.append(f"{where}: Array {keys.name!r} has a read other than TopK, the read that picks")
     return problems
 
 

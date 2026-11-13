@@ -44,6 +44,7 @@ from mstar.engine.state import (
     LatentEntry,
     Positions,
     Read,
+    Selected,
     TensorType,
     Value,
     Window,
@@ -62,6 +63,8 @@ ATTEND = Attend(q_heads=HEADS)
 
 class _StubKV:
     """Holds pages per layer and records the counts it is handed instead of applying them."""
+
+    tp_group = None
 
     def __init__(self):
         self.pages = torch.zeros(LAYERS, SLOTS, 2, HEADS, DIM)
@@ -339,6 +342,36 @@ def test_the_eager_tables_grow_outside_capture():
              lambda: h.begin_step(_step(h, ctx=_ctx(lease=lease, capture=True))))
 
 
+class _StubGroup:
+    """A second TP rank, which settled ``other``."""
+
+    world_size = 2
+
+    def __init__(self, other):
+        self.other = torch.tensor(other)
+
+    def all_gather(self, counts, dim=0):
+        return torch.cat([counts, self.other], dim)
+
+
+def _settled_on_two_ranks(other, monkeypatch):
+    monkeypatch.setattr(adapters, "_DEBUG_ASSERTS", True)
+    kv = _StubKV()
+    kv.tp_group = _StubGroup(other)
+    _verify(_handle(kv=kv), [3, 2])
+    return kv.deferred[0][2]
+
+
+def test_tp_ranks_that_settle_alike_apply_their_count(monkeypatch):
+    assert _settled_on_two_ranks([3, 2], monkeypatch).delta() == -1, "ranks that agree apply the count"
+
+
+def test_the_tp_compare_refuses_counts_that_differ(monkeypatch):
+    count = _settled_on_two_ranks([3, 1], monkeypatch)
+    with pytest.raises(RuntimeError, match=r"settled verify step 1 differently, \[\[3, 2\], \[3, 1\]\]"):
+        count.delta()
+
+
 # The resources
 
 
@@ -610,8 +643,9 @@ def test_the_holed_storage_binds_its_read_and_verify_entries():
     _refused("must be LatentAttend", lambda: build_specs([_holed(reads={"attn": Read(mask=Causal())})]))
 
 
-def test_a_holed_array_reads_causally():
-    reads = {"attn": Read(mask=Window(8), op=LatentAttend(HEADS, scale=0.125))}
+@pytest.mark.parametrize("mask", [Window(8), Selected(of="keys")], ids=["window", "selected"])
+def test_a_holed_array_reads_causally(mask):
+    reads = {"attn": Read(mask=mask, op=LatentAttend(HEADS, scale=0.125))}
     _refused("mask must be Causal, the one mask a holed array's marks are written for",
              lambda: build_specs([_holed(reads=reads)]))
 

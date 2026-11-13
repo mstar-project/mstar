@@ -9,6 +9,7 @@ layout can't hold.
 from __future__ import annotations
 
 import sys
+from types import SimpleNamespace
 
 sys.path.insert(0, ".")
 
@@ -25,12 +26,21 @@ from mstar.engine.state import (
     Entry,
     LatentAttend,
     LatentEntry,
+    PagedLatent,
+    PagedLatentTarget,
+    PagedNHD,
+    Positions,
     Read,
+    Rope,
     TensorType,
     Window,
     at_last_token,
+    state_op,
 )
 from mstar.engine.state.adapters import LATENT, StateSetup, _resolve, build_handle, build_specs, storage_of
+from mstar.engine.state.calls import ArrayHandle
+
+state_op_module = sys.modules["mstar.engine.state.state_op"]
 
 LAYERS, SLOTS, HEADS, RANK, ROPE = 3, 32, 4, 16, 8
 TOKENS = 3
@@ -207,3 +217,126 @@ def test_at_last_token_on_a_latent_array_asks_the_mla_plan():
     _begin(h)
     x = torch.randn(TOKENS, 2)
     assert torch.equal(at_last_token(h, x), x[-1:]), "the MLA resource's plan should select each row's last token"
+
+
+# The latent state-op format
+
+
+class _StubMLAPages(_StubLatentKV):
+    """Pages in the MLA layout, (pages, page_size, rank + rope_dim) per layer, where a step writes token t to page 0,
+    slot t."""
+
+    def __init__(self):
+        super().__init__()
+        self.pages = torch.zeros(LAYERS, 2, SLOTS, RANK + ROPE)
+        self.kv_cache = SimpleNamespace(layout=KVLayout.MLA, dtype=self.pages.dtype, device=self.pages.device,
+                                        tensor=self.pages)
+
+    def write_kv(self, k, v=None, layer_idx=None, label=None, tokens=None):
+        self.pages[layer_idx, 0, :k.shape[0]] = k
+
+    def write_slots(self, label=None):
+        return torch.zeros(TOKENS, dtype=torch.long), torch.arange(TOKENS)
+
+
+class _StubRope:
+    """The table and pairing of a position resource, which the fused prep rotates with."""
+
+    def __init__(self, interleave=True, table=True):
+        self.interleave = interleave
+        self.cos_sin_table = torch.ones(SLOTS, ROPE) if table else None
+
+
+class _NoPages(ArrayHandle):
+    """A handle over a storage that keeps no pages."""
+
+    def _check_storage(self, declared, segments, ctx):
+        pass
+
+
+@pytest.fixture
+def _op(monkeypatch):
+    """Makes a state op in ``formats`` that writes the latent rows itself, in an empty registry."""
+    monkeypatch.setattr(state_op_module, "STATE_OPS", {})
+
+    def make(*formats, kernel=None):
+        def write_latent(kv, layer, ckv, kpe, *, target):
+            target.cache[target.page_of_token, target.slot_of_token] = torch.cat([ckv, kpe], -1)
+
+        def reference(kv, layer, ckv, kpe):
+            kv.add(layer, ckv=ckv, kpe=kpe)
+
+        return state_op(adds=("kv",), formats=formats, reference=reference)(kernel or write_latent)
+
+    return make
+
+
+def _rows():
+    return torch.ones(TOKENS, RANK), torch.ones(TOKENS, ROPE)
+
+
+def test_the_latent_handle_takes_the_fused_prep_on_mla_pages(_op):
+    write = _op(PagedLatent())
+    h = _handle(kv=_StubMLAPages())
+    assert h.takes_fused(write.op), "a latent op would run its reference on the pages it addresses"
+    _begin(h)
+    target = h.fused_target(1)
+    assert isinstance(target, PagedLatentTarget) and target.count == TOKENS and target.rope_table is None
+    assert target.cache.data_ptr() == h._kv.pages[1].data_ptr() and 1 in h._kept, (
+        "the fused op is layer 1's add, into layer 1's pages"
+    )
+
+
+def test_a_latent_handle_takes_no_nhd_format(_op):
+    assert not _handle(kv=_StubMLAPages()).takes_fused(_op(PagedNHD()).op), (
+        "an NHD kernel would write MLA pages as (tokens, heads, head_dim)"
+    )
+
+
+def test_a_latent_array_with_no_positions_takes_no_rope_table_op(_op):
+    assert not _handle(kv=_StubMLAPages()).takes_fused(_op(PagedLatent(rope_table=True)).op), (
+        "the kernel would rotate with a table no position resource holds"
+    )
+
+
+@pytest.mark.parametrize("rope, fused", [
+    (_StubRope(), True), (_StubRope(interleave=False), False), (_StubRope(table=False), False),
+])
+def test_a_rope_table_op_needs_the_position_resource_s_interleaved_table(_op, rope, fused):
+    array = _latent(positions=Positions(rope=Rope()))
+    resources = {"kv": _StubMLAPages(), "attn": _StubMLA(), "rope": rope}
+    h = build_handle(array, resources, _resolve([array], StateSetup()))
+    assert h.takes_fused(_op(PagedLatent(rope_table=True)).op) is fused
+
+
+def _fused_call(make, kernel=None):
+    write = make(PagedLatent(), kernel=kernel)
+    h = _handle(kv=_StubMLAPages())
+    h.fused_ops = frozenset({write.op.name})
+    _begin(h)
+    return lambda: write(h, 0, *_rows())
+
+
+def test_the_debug_check_reads_latent_slots(_op, monkeypatch):
+    monkeypatch.setattr(state_op_module, "_DEBUG_ASSERTS", True)
+    _fused_call(_op)()
+
+    def write_past(kv, layer, ckv, kpe, *, target):
+        target.cache[1, 0] = 1.0
+
+    _refused("changed 24 elements outside this step's slots", _fused_call(_op, write_past))
+
+
+def test_conformance_compares_a_latent_kernel_on_the_step_s_slots(_op):
+    write = _op(PagedLatent())
+    h = _handle(kv=_StubMLAPages())
+    _begin(h)
+    assert state_op_module.conformance_problems(write, (h, 0, *_rows()), 0.0) == [], (
+        "a kernel that writes what its reference adds, where it adds it, conforms"
+    )
+
+
+def test_a_handle_with_no_pages_refuses_pool_and_slots():
+    h = _NoPages(_latent(), {})
+    for call in (h._pages, lambda: h._slots(0), lambda: h.fused_target(0)):
+        _refused(r"no layout yet: \w+ on a _NoPages", call)
