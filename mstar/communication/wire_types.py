@@ -44,6 +44,7 @@ from mstar.utils.ipc_format import (
     DrainRequest,
     EdgeItems,
     EnableMetrics,
+    EndEpisode,
     FailRequests,
     InputSignals,
     LoadLoraAdapter,
@@ -76,6 +77,7 @@ _TYPES: dict[str, type] = {
     # worker-bound bodies
     "new_request": NewRequest,
     "remove_request": RemoveRequest,
+    "end_episode": EndEpisode,
     "drain_request": DrainRequest,
     "input_signals": InputSignals,
     "edge_items": EdgeItems,
