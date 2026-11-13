@@ -1200,10 +1200,8 @@ class ValueHandle(ArrayHandle):
         }
         self._layouts = _field_layouts(array, bindings)
         # `_step_written` holds the fields a kept step writes itself, and `_written` those each layer's write set.
-        # `_start` holds each layer's start state from `set_start`, in the pool's layout, fixed from the first step on.
         self._step_written = written_by_step(array)
         self._written: dict[int, set[str]] = {}
-        self._start: dict[int, dict[str, torch.Tensor]] = {}
         self._stepped = False
 
     def begin_step(self, step) -> None:
@@ -1249,10 +1247,9 @@ class ValueHandle(ArrayHandle):
         self._record_read(layer)
         if layer in self._written or any(updated == layer for _, updated in self._updated):
             raise self._refusal(f"a read of layer {layer} after its write or update in this step")
-        start = self._start.get(layer, EMPTY)
         fields = {}
         for field in self.array.entry.tensors:
-            read = self._pool.gather(field, self._pool_layer[layer], label=self.label, start=start.get(field))
+            read = self._pool.gather(field, self._pool_layer[layer], label=self.label)
             fields[field] = self._declared(field, read)
         return _OneEntryPerRow(fields)
 
@@ -1263,10 +1260,10 @@ class ValueHandle(ArrayHandle):
         undeclared = start.keys() - self.array.entry.tensors.keys()
         if undeclared:
             raise self._refusal(f"start names fields {sorted(undeclared)}, of {sorted(self.array.entry.tensors)}")
-        self._start = {
-            layer: {field: self._stored(field, layer, value, value.shape, "start") for field, value in start.items()}
-            for layer in self.array.layers
-        }
+        self._pool.set_start({
+            (field, self._pool_layer[layer]): self._stored(field, layer, value, value.shape, "start")
+            for layer in self.array.layers for field, value in start.items()
+        })
 
     def _stored(self, field: str, layer: int, value: torch.Tensor, shape: torch.Size, what: str) -> torch.Tensor:
         """``value``, whose entries are of ``shape``, in the layout and dtype the pool stores ``field`` in."""
