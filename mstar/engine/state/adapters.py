@@ -2057,7 +2057,7 @@ class PagedStorage(Storage):
     plans them as one combined plan."""
 
     handle_class = PagedArrayHandle
-    kernel_settings = frozenset({"max_num_pages"})
+    kernel_settings = frozenset({"max_num_pages", "page_size"})
     holds_row_entries = True
 
     def resolve(self, arrays: Sequence[Array], declared: Sequence[Array], setup: "StateSetup") -> Resolved:
