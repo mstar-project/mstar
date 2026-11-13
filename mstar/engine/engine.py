@@ -1135,7 +1135,11 @@ class Engine:
         if decl.needs.carry is not None:
             self._check_carry_rows(decl, sampler, mgmt)
         sampler.bind_verify(decl.config.num_draft_tokens)
-        sampler.bind_graph_reads(decl.walk, verify_writes(decl.needs))
+        # every walk whose captured steps read the drafter's state: a mixed step's verify rows read it as a
+        # verify step's do (`draft_mixed_step`)
+        for walk in (decl.walk, decl.mixed_walk):
+            if walk is not None:
+                sampler.bind_graph_reads(walk, verify_writes(decl.needs))
         for resource in mgmt.resources.values():
             # never refuses: what a resource can't do, its capabilities said before the agreement
             resource.bind_verify_walk(decl.walk, decl.config.block, decl.config.kv_slack)

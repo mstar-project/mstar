@@ -232,6 +232,15 @@ def test_a_carrying_drafter_reads_its_carry_and_stores_a_prompt_rows_first():
     assert draft.accepted == before + 2 * K
 
 
+def test_a_mixed_steps_captures_read_the_carry_staged():
+    """A captured mixed step reads its rows' carry as a verify step's does, staged off the masters
+    (`bind_graph_reads`), so a growth of the masters between capture and replay never strands its read."""
+    from mstar.engine.resources.draft.drafter import DRAFT_CARRY
+
+    reads = engine(K, carry_oracle, mixed=True)._resources["sampler"]._graph_reads
+    assert DRAFT_CARRY in reads["decode"] and DRAFT_CARRY in reads["mixed"]
+
+
 @pytest.mark.parametrize("mode", ["synchronous", "asynchronous"])
 def test_a_node_whose_resources_correct_a_verify_steps_state_refuses_mixed_steps(monkeypatch, mode):
     """A resource that corrects a verify step's state in its graph (GDN's) reads every row as a verify
