@@ -106,17 +106,18 @@ class _Expert(nn.Module):
         return noised_action_latents * 0.1 + action_timesteps[:, :, None] * 0.3 + proprio_latents.mean() * 0.2
 
 
-def _info(step: int):
+def _info(step: int, num_steps: int = 2):
     return CurrentForwardPassInfo(
         request_id="r", graph_walk="chunk", fwd_index=step, random_seed=17, max_tokens=1,
-        step_metadata={"num_steps": 2, "t_shift": 1.0, "cfg_video_scale": 4.0, "cfg_scale": 1.0,
+        step_metadata={"num_steps": num_steps, "t_shift": 1.0, "cfg_video_scale": 4.0, "cfg_scale": 1.0,
                        "text_tokens": 3, "blank_tokens": 2},
         dynamic_loop_iter_counts={"praxis_denoise": step},
     )
 
 
 @pytest.mark.parametrize("depth", [0, 1])
-def test_cold_and_warm_node_flow_matches_reference_sampler(depth: int) -> None:
+@pytest.mark.parametrize("num_steps", [1, 2])
+def test_cold_and_warm_node_flow_matches_reference_sampler(depth: int, num_steps: int) -> None:
     config = replace(Praxis1Config.for_rig("single_arm"), latent_channels=1, latents_per_chunk=6)
     encoder, decoder = _Encoder(), _Decoder()
     backbone = Praxis1BackboneSubmodule(
@@ -137,7 +138,7 @@ def test_cold_and_warm_node_flow_matches_reference_sampler(depth: int) -> None:
         "video_latents": seeded_normal((1, 4, k * 6, 1, 1), 17, VIDEO_SALT),
         "action_latents": seeded_normal((1, k * 6, config.action_patch_dim), 17, ACTION_SALT),
     }
-    for step in range(2):
+    for step in range(num_steps):
         input_tensors = {
             "obs_latents": [torch.zeros(1, 4, 1, 1, 1)],
             "text_embeds": [text], "text_embeds_blank": [blank],
@@ -148,12 +149,13 @@ def test_cold_and_warm_node_flow_matches_reference_sampler(depth: int) -> None:
                                  clean_latents=[torch.zeros(1, 4, depth * 6, 1, 1)],
                                  proprio_all=[proprio])
         input_tensors.update({name: [value] for name, value in carried.items()})
-        prepared = backbone.prepare_inputs("chunk", _info(step), input_tensors)
-        expected_resources = ({ENCODER_COND_KV} if step == 1 else {
+        prepared = backbone.prepare_inputs("chunk", _info(step, num_steps), input_tensors)
+        final_step = step == num_steps - 1
+        expected_resources = ({ENCODER_COND_KV} if final_step else {
             ENCODER_COND_KV, ENCODER_BLANK_KV, DECODER_COND_KV, DECODER_BLANK_KV,
         })
         assert set(backbone.declare_step("chunk", ["r"], [prepared]).state) == expected_resources
-        if step == 1:
+        if final_step:
             # The final forward must not even look up a decoder handle that
             # its resource declaration omitted.
             backbone.state_handles = {ENCODER_COND_KV: states[ENCODER_COND_KV]}
@@ -162,7 +164,7 @@ def test_cold_and_warm_node_flow_matches_reference_sampler(depth: int) -> None:
         expert_inputs["proprio"] = [proprio[:, -1:]]
         if depth:
             expert_inputs["proprio_all"] = [proprio]
-        prepared_expert = expert.prepare_inputs("chunk", _info(step), expert_inputs)
+        prepared_expert = expert.prepare_inputs("chunk", _info(step, num_steps), expert_inputs)
         assert set(expert.declare_step("chunk", ["r"], [prepared_expert]).state) == {
             EXPERT_QUERIES, EXPERT_TRUNK_KEYS,
         }
@@ -170,13 +172,13 @@ def test_cold_and_warm_node_flow_matches_reference_sampler(depth: int) -> None:
             "chunk", None, **prepared_expert.tensor_inputs, **prepared_expert.kwargs,
         ).items()}
 
-    ts = window_time_grid(2, 1.0)
+    ts = window_time_grid(num_steps, 1.0)
     expected_video = seeded_normal((1, 4, k * 6, 1, 1), 17, VIDEO_SALT)
     expected_action = seeded_normal((1, k * 6, config.action_patch_dim), 17, ACTION_SALT)
-    for step in range(2):
+    for step in range(num_steps):
         cond_velocity = expected_video * 0.25 + text.mean() * 0.5
         blank_velocity = expected_video * 0.25 + blank.mean() * 0.5
-        if step != 1:
+        if step != num_steps - 1:
             expected_video = expected_video + (ts[step + 1] - ts[step]) * guidance_combine(
                 cond_velocity, blank_velocity, 4.0,
             )
@@ -184,10 +186,13 @@ def test_cold_and_warm_node_flow_matches_reference_sampler(depth: int) -> None:
         expected_action = expected_action + (ts[step + 1] - ts[step]) * action_velocity
     torch.testing.assert_close(carried["video_latents"], expected_video, rtol=0, atol=0)
     torch.testing.assert_close(carried["action_latents"], expected_action, rtol=0, atol=0)
-    assert encoder.calls == 3  # two guided passes, then the final conditional taps
-    assert decoder.calls == 2  # both decoder passes belong to the first Euler step
-    for state in states.values():
-        assert state.calls
+    assert encoder.calls == 2 * (num_steps - 1) + 1
+    assert decoder.calls == 2 * (num_steps - 1)
+    for name, state in states.items():
+        if num_steps == 1 and name in {ENCODER_BLANK_KV, DECODER_COND_KV, DECODER_BLANK_KV}:
+            assert not state.calls
+        else:
+            assert state.calls
 
 
 @pytest.mark.parametrize("held,rows,clean_frames", [(0, 0, 0), (1, 21, 6)])
