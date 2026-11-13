@@ -1567,6 +1567,8 @@ within itself and matches the offline mask. ``rel_bias`` is then indexed by that
 ``[rows, H, T, left + 1]``, and passed unscaled (the kernel scales the sum by
 ``head_dim ** -0.5``). A per-query window takes no sink, and its right context is 0.
 ``retention`` may be a single ``SinkWindow`` when it does not depend on the source length.
+``BoundedKVConfig(ieee=True)`` attends a float32 cache in IEEE fp32 rather than TF32; on the
+state contract it is the read's kernel setting ``ieee``, on for a float32 entry.
 ``BoundedKVConfig(dtype=None)`` stores the cache in the engine's KV dtype, for layers that
 compute in it. The streaming FastConformer (Nemotron VoiceChat's ``ENCODER_KV``, an ``Array``
 with ``max_len=None`` and a ``Window`` read, which the state contract holds in such a cache) is

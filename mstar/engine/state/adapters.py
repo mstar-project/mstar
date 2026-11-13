@@ -1004,8 +1004,10 @@ class _Counter:
 
 
 class BoundedAttend(OpBinding):
-    """`Attend` on an unbounded array: the bounded KV's attention, which stores the step's keys as it attends. No spec,
-    no step and no kernel setting."""
+    """`Attend` on an unbounded array: the bounded KV's attention, which stores the step's keys as it attends. No spec
+    and no step, and its one kernel setting is the bounded KV's fp32 precision."""
+
+    kernel_settings = frozenset({"ieee"})
 
     def check(self, array: Array, key: str, read: Read) -> None:
         heads, head_dim, _ = _kv_entry(array, "BoundedKVConfig")
@@ -1058,7 +1060,7 @@ def _bounded_attend(
     rows by time by heads."""
     return kv.attend(
         layer_idx, q.to(k.dtype).transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), source,
-        rel_bias=distance_bias, ieee=k.dtype == torch.float32,
+        rel_bias=distance_bias,
     )
 
 
@@ -2693,7 +2695,7 @@ class BoundedStorage(Storage):
                 resource_key=array.name, nodes=array.nodes,
                 config=BoundedKVConfig(
                     num_layers=len(array.layers), num_heads=heads, head_dim=head_dim, rows_per_request=1, dtype=dtype,
-                    **window,
+                    ieee=dtype == torch.float32, **window,
                 ),
             )]
             resolved.resource_of.update(_resources_of(array, bound))

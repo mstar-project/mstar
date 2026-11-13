@@ -1040,11 +1040,9 @@ def test_a_bounded_array_takes_no_rope():
                _unbounded(positions=Positions(rope=Rope())))
 
 
-def test_the_bounded_read_takes_no_kernel_settings():
-    with pytest.raises(ValueError, match=re.escape(
-        "kernel_settings['enc_attn'] names no read or update of the declarations that takes kernel settings, and no "
-        "array, of ['enc']",
-    )):
+def test_the_bounded_read_takes_only_its_precision_as_a_kernel_setting():
+    with pytest.raises(ValueError, match=re.escape("kernel_settings['enc_attn'] sets ['max_slots']; it may set only "
+                                                   "['ieee']")):
         build_specs([_unbounded()], kernel_settings={"enc_attn": {"max_slots": 4}})
 
 

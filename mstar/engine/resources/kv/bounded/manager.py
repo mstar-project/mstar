@@ -116,7 +116,7 @@ class BoundedKVManager(Resource):
         source: torch.Tensor | None = None,
         plan: BoundedPlan | None = None,
         rel_bias: torch.Tensor | None = None,
-        ieee: bool = False,
+        ieee: bool | None = None,
         row_source: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """Attention for ``q, k, v [B * rows, H, T, D]`` over each row's retained
@@ -128,8 +128,9 @@ class BoundedKVManager(Resource):
         per-query window (``BoundedKVConfig.query_window``) it is indexed by distance,
         ``[B * rows, H, T, window + 1]``. Rows whose
         source is -1 read theirs from ``row_source = (storage [slots, rows, H, L, 2D],
-        slots [>= B])``, e.g. another resource's per-request entries."""
+        slots [>= B])``, e.g. another resource's per-request entries. ``ieee`` None takes the config's."""
         plan = plan or self.current
+        ieee = self.config.ieee if ieee is None else ieee
         cache = self._cache[layer_idx]
         self._check_attend(q, k, v, cache, source, plan, rel_bias, row_source)
         if q.device.type == "cpu":
