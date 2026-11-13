@@ -30,7 +30,12 @@ pytestmark = pytest.mark.skipif(BINARY is None, reason="mstar-server binary not 
 @pytest.mark.parametrize("meta", [{"bytes": b"x"}, {"nan": float("nan")}])
 def test_policy_metadata_must_pass_the_rust_launcher_json(meta):
     with pytest.raises(ValueError, match="meta must be JSON serializable"):
-        PositronicPolicy.from_config({"meta": meta})
+        PositronicPolicy.from_config({"meta": meta}, object())
+
+
+def test_config_cannot_advertise_ready_without_a_model_session_adapter():
+    with pytest.raises(ValueError, match="no ready Positronic session adapter"):
+        PositronicPolicy.from_config({"meta": {"robot": "praxis"}}, object())
 
 
 class Stub:

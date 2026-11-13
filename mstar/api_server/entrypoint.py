@@ -565,7 +565,7 @@ class APIServer:
         )
         positronic_block = (model_config or {}).get("positronic")
         self.positronic_policy = (
-            None if positronic_block is None else PositronicPolicy.from_config(positronic_block)
+            None if positronic_block is None else PositronicPolicy.from_config(positronic_block, model)
         )
         # what an OpenAI request's `model` field may name: the base model, or an adapter
         self.served_models = ServedModels.of(
