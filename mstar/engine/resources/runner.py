@@ -463,6 +463,9 @@ class StepRunner:
     def newer_than(self, rid: str) -> list[str] | None:
         return self._admission.newer_than(rid)
 
+    def older_than(self, rid: str) -> list[str]:
+        return self._admission.older_than(rid)
+
     def refusals(self) -> list[Refusal]:
         return self._admission.refusals()
 
