@@ -238,6 +238,21 @@ def dense_sdpa_attend(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: o
     return F.scaled_dot_product_attention(q, k, v, attn_mask=None if mask is None else mask[None, None])
 
 
+_RESOURCE_MASK = object()
+
+
+def expert_resource_attend(state, layer: int) -> Callable:
+    """Adapt one expert layer to its declared cross or self attention read."""
+    def run(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: object) -> torch.Tensor:
+        if mask is not _RESOURCE_MASK:
+            raise ValueError("expert resource attention takes visibility from its declared read")
+        q, k, v = (x.transpose(1, 2) for x in (q, k, v))
+        state.add(layer, k=k, v=v)
+        return state.read(layer, q).transpose(1, 2)
+
+    return run
+
+
 class ActionExpertBlock(nn.Module):
     """One expert layer: attention, then a GEGLU MLP, each behind its own AdaLN.
 
@@ -495,6 +510,7 @@ class ActionExpert(nn.Module):
         cross_mask: object,
         self_mask: object,
         attend: Callable = dense_sdpa_attend,
+        attend_for_layer: Callable[[int, bool], Callable] | None = None,
     ) -> torch.Tensor:
         """Predict action velocity; masks encode the caller's window policy."""
         if len(trunk_features) != self.num_cross_layers:
@@ -555,25 +571,36 @@ class ActionExpert(nn.Module):
         )
         q_table = self.rope_table(q_ids)
         k_table = self.rope_table(kv_rope_ids)
-        if cross_mask is None or self_mask is None:
+        if attend_for_layer is None and (cross_mask is None or self_mask is None):
             raise ValueError("expert cross and self masks are required")
+        if attend_for_layer is not None and (cross_mask is not None or self_mask is not None):
+            raise ValueError("resource attention declares its masks; do not pass model masks")
         if isinstance(cross_mask, torch.Tensor) and cross_mask.shape != (x.shape[1], expected_kv):
             raise ValueError("cross mask does not match expert queries and trunk keys")
         if isinstance(self_mask, torch.Tensor) and self_mask.shape != (x.shape[1], x.shape[1]):
             raise ValueError("self mask does not match expert queries")
         global_kv = None if global_tokens is None else self.text_proj(global_tokens)
         cross_idx = 0
-        for block in self.blocks:
+        for layer, block in enumerate(self.blocks):
+            layer_attend = attend if attend_for_layer is None else attend_for_layer(layer, block.is_cross)
             if block.is_cross:
                 tap = trunk_features[cross_idx]
                 if self.tap_norm_scale is not None:
                     tap = (expert_rms_norm(tap) * self.tap_norm_scale).to(tap.dtype)
                 frame_kv = self.tap_proj(tap)
                 kv = frame_kv if global_kv is None else torch.cat([global_kv.to(frame_kv.dtype), frame_kv], dim=1)
-                x = block(x, cond, kv_source=kv, mask=cross_mask, q_table=q_table, k_table=k_table, attend=attend)
+                x = block(
+                    x, cond, kv_source=kv,
+                    mask=cross_mask if attend_for_layer is None else _RESOURCE_MASK,
+                    q_table=q_table, k_table=k_table, attend=layer_attend,
+                )
                 cross_idx += 1
             else:
-                x = block(x, cond, kv_source=None, mask=self_mask, q_table=q_table, k_table=q_table, attend=attend)
+                x = block(
+                    x, cond, kv_source=None,
+                    mask=self_mask if attend_for_layer is None else _RESOURCE_MASK,
+                    q_table=q_table, k_table=q_table, attend=layer_attend,
+                )
         out = self.head(self.norm_out(x[:, -n_actions:]))
         if self.head_plus_zero:
             out = out + 0.0

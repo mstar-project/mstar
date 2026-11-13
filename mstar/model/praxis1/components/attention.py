@@ -74,6 +74,22 @@ def sdpa_attend(
     )
 
 
+def resource_attend(state, layer: int) -> Callable:
+    """Adapt trunk ``[B,H,S,D]`` attention to a declared within-step read.
+
+    The ``ChunkCausal`` declaration owns visibility. A dense mask here would
+    be a second, possibly different rule, so this path refuses one.
+    """
+    def run(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: object) -> torch.Tensor:
+        if mask is not None:
+            raise ValueError("resource attention takes visibility from the declared ChunkCausal read")
+        q, k, v = (t.transpose(1, 2) for t in (q, k, v))
+        state.add(layer, k=k, v=v)
+        return state.read(layer, q).transpose(1, 2)
+
+    return run
+
+
 class Attention(nn.Module):
     """Grouped-query self-attention with a per-head sigmoid gate."""
 

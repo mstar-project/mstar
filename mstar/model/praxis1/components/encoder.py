@@ -410,6 +410,7 @@ class TrunkStack(nn.Module):
         attend: Callable = sdpa_attend,
         fuse_residual: bool = False,
         x_mod: torch.Tensor | None = None,
+        attend_for_layer: Callable[[int], Callable] | None = None,
     ) -> tuple[torch.Tensor, list[torch.Tensor]]:
         """Map ``x`` ``(B, N, C)`` to ``(B, N, C)`` and return the taps.
 
@@ -429,7 +430,8 @@ class TrunkStack(nn.Module):
             if self.modulators is not None and x_mod is None:
                 raise ValueError("a modulated stack needs x_mod")
             modulation = (self.modulators[i], x_mod, self.modulation_dtype) if self.modulators is not None else None
-            result = block(x, rope, mask, attend, pending, defer, modulation)
+            layer_attend = attend_for_layer(i) if attend_for_layer is not None else attend
+            result = block(x, rope, mask, layer_attend, pending, defer, modulation)
             x, pending = result if defer else (result, None)
             if i in tap_blocks:
                 taps[i] = x
@@ -554,6 +556,7 @@ class EncoderTower(nn.Module):
         mask: torch.Tensor | None = None,
         attend: Callable = sdpa_attend,
         fuse_residual: bool = False,
+        attend_for_layer: Callable[[int], Callable] | None = None,
     ) -> tuple[torch.Tensor, TapFeatures]:
         """Encode a chunk-causal window of K chunks.
 
@@ -615,12 +618,15 @@ class EncoderTower(nn.Module):
             rope_shifts,
         )
         positions = positions.unsqueeze(0).to(x.device)
-        if mask is None:
+        if mask is None and attend_for_layer is None:
             mask = dense_chunk_causal_mask(n_reg, n_anchor, n_text, chunk * tpf, kk, kk - 1 if n_clean else 0).to(
                 x.device
             )
 
-        out, taps = self.core(x, positions, mask, self.tap_blocks, attend, fuse_residual)
+        out, taps = self.core(
+            x, positions, mask, self.tap_blocks, attend, fuse_residual,
+            attend_for_layer=attend_for_layer,
+        )
         if self.positive_zero_residual_add:
             # Not dead code: this turns every -0.0 the stack produced into
             # +0.0, which is what the original implementation's output
