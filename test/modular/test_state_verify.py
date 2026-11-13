@@ -832,3 +832,60 @@ def test_the_captured_holed_buffers_never_grow_in_a_recording(monkeypatch):
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
     _capture_step(h, 4, capture=True)
     _refused("a recording of 4 rows past the captured buffers' 2", lambda: h.add(0, ckv=torch.randn(4, RANK)))
+
+
+@pytest.mark.skipif(not (torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9),
+                    reason="needs sm90 (FlashInfer MLA)")
+@torch.no_grad()
+def test_holes_move_flashinfer_mla_by_at_most_one_bf16_ulp():
+    """A verify block's queries over a cache whose rejected rows carry HOLE in the rope
+    slot, against the same cache without those rows: the query rope part of ones scores a
+    real key +0 and a hole about -6.4e5, so only the kernel's split of the keys moves. That
+    moves about half the outputs by one bf16 ulp of their row's largest value, as a second
+    request in the batch (another split) does too."""
+    from mstar.engine.resources.attn.flashinfer_mla import FlashInferMLAWrapper
+    from mstar.engine.resources.attn.workspace import WorkspacePool
+
+    torch.manual_seed(0)
+    dev = torch.device("cuda", 0)
+    heads, latent, rope, page, block = 8, 512, adapters.HOLE_SLOT, 128, 4
+    real = 700
+    keep = torch.rand(real + 400) < real / (real + 400)  # holes spread through the context
+    keep[-block:] = True  # the query block's own rows are real
+    n_all = int(keep.numel())
+    ckv = torch.randn(n_all, latent, device=dev, dtype=torch.bfloat16)
+    kpe = torch.zeros(n_all, rope, device=dev, dtype=torch.bfloat16)
+    kpe[~keep.to(dev)] = HOLE
+    q_nope = torch.randn(block, heads, latent, device=dev, dtype=torch.bfloat16)
+    ones = torch.ones(block, heads, rope, device=dev, dtype=torch.bfloat16)
+
+    def attend(rows, q_pe):
+        n = rows.shape[0]
+        pages = -(-n // page)
+        cache = torch.zeros(pages, page, latent + rope, device=dev, dtype=torch.bfloat16)
+        cache.view(-1, latent + rope)[:n] = torch.cat([ckv, kpe], -1)[rows]
+        # main's wrappers take a pool's Workspace (#1142), not a raw buffer
+        workspace = WorkspacePool(torch.device(dev), size_mb=128).get("main")
+        wrapper = FlashInferMLAWrapper(
+            workspace, num_qo_heads=heads, kv_lora_rank=latent, qk_rope_head_dim=rope,
+            page_size=page, sm_scale=192 ** -0.5, device=dev)
+        assert not wrapper.fallback
+        wrapper.plan(
+            qo_indptr=torch.tensor([0, block], dtype=torch.int32),
+            paged_kv_indptr=torch.tensor([0, pages], dtype=torch.int32),
+            paged_kv_indices=torch.arange(pages, dtype=torch.int32),
+            paged_kv_last_page_len=torch.tensor([n - (pages - 1) * page], dtype=torch.int32),
+            causal=True, dtype=torch.bfloat16,
+        )
+        return wrapper.run(q_nope, q_pe, cache).float()
+
+    everything = torch.arange(n_all, device=dev)
+    only_real = everything[keep.to(dev)]
+    base = attend(only_real, ones)
+    # a real key's rope slot is 0, so the rope part of the query is exact
+    assert torch.equal(attend(only_real, torch.zeros_like(ones)), base)
+    holes = attend(everything, ones)
+    # one bf16 ulp of each (query, head) row's largest output
+    ulp = torch.exp2(torch.floor(torch.log2(base.abs().amax(-1, keepdim=True))) - 7)
+    diff = (holes - base).abs()
+    assert (diff <= ulp).all(), (diff / ulp).max()

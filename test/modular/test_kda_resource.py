@@ -6,12 +6,12 @@ the torch bundle runs at the end.
 from __future__ import annotations
 
 import contextlib
+from types import SimpleNamespace
 
 import pytest
 import torch
 
 from mstar.engine.resources.base import EngineResourceInfo, build_resource
-from mstar.engine.resources.convenience import KDACallable
 from mstar.engine.resources.linear_attn.config import (
     LinearAttnBackend,
     LinearAttnConfig,
@@ -34,6 +34,7 @@ from mstar.engine.resources.recurrent.config import (
 )
 from mstar.engine.resources.recurrent.pool import SINK_SLOT, RecurrentStatePool
 from mstar.engine.resources.step import BucketKey, Segment, SlotLease, StepContext
+from mstar.engine.state import adapters
 
 POOL, KDA = "kda_state", "kda"
 HEADS, DIM = 2, 16
@@ -272,31 +273,21 @@ def _ptr(t):
     return t.data_ptr(), tuple(t.shape)
 
 
-def test_the_callable_hands_the_bundle_each_layers_blocks():
-    """The layer names no block: the callable resolves its conv and state, by the cursor or
-    an explicit index, and a pool without speculative blocks has none to hand over."""
-    pool, kda = build()
-    rec = kda.kernels = _Recorder()
-    p = plan(pool, kda, ["a"], [4], eager(["a"]))
-    mix = KDACallable(pool, kda)
-    assert mix.current_plan() is p
-    gate = torch.zeros(4, DIM)
-    args = (torch.zeros(4, 3 * HEADS * DIM), torch.zeros(4, DIM), torch.zeros(4, HEADS), params())
-    mix(*args, gate=gate, layer_idx=2)
-    mix.set_layer_idx(1)
-    mix(*args, gate=gate)
-    for (got, conv, state, got_gate), layer in zip(rec.runs, (2, 1), strict=True):
-        assert got is p and got_gate is gate
-        assert _ptr(conv) == _ptr(pool.block("conv", layer))
-        assert _ptr(state) == _ptr(pool.block("state", layer))
-    assert mix._blocks[1].spec is None
+def _run(pool, kda, layer, qkv, g, beta, p, gate=None):
+    """`KDAManager.run` on ``layer``'s blocks, as a KDA Value's update hands them over."""
+    spec = SpecBlocks.of(pool, layer) if kda.speculative_tokens else None
+    return kda.run(qkv, g, beta, pool.block("conv", layer), pool.block("state", layer), p, gate=gate, spec=spec)
+
+
+def _settle(pool, kda, accepted):
+    """A KDA Value's settle: each row keeps its accepted drafts and the token after them."""
+    adapters.KDA().settle(SimpleNamespace(kda=kda, pool=pool), accepted + 1, "main")
 
 
 def test_a_speculative_step_runs_verify_blocks():
     pool, kda = build(speculative_tokens=2)
     assert kda.speculative_tokens == 2
     rec = kda.kernels = _Recorder()
-    mix = KDACallable(pool, kda)
     # each request's prefill commits before its first verify step
     ctx = eager(["a", "b"])
     plan(pool, kda, ["a", "b"], [4, 2], ctx)
@@ -306,8 +297,8 @@ def test_a_speculative_step_runs_verify_blocks():
     assert p.is_verify and p.block == 3 and not p.is_decode
     assert p.layout is None and len(rec.layouts) == layouts
     gate = torch.zeros(6, DIM)
-    mix(torch.zeros(6, 3 * HEADS * DIM), torch.zeros(6, DIM), torch.zeros(6, HEADS), params(),
-        gate=gate, layer_idx=1)
+    _run(pool, kda, 1, torch.zeros(6, 3 * HEADS * DIM), torch.zeros(6, DIM), torch.zeros(6, HEADS), params(),
+         gate=gate)
     ((got, spec, got_gate),) = rec.verifies
     assert got is p and got_gate is gate and rec.runs == []
     want = SpecBlocks.of(pool, 1)
@@ -316,24 +307,23 @@ def test_a_speculative_step_runs_verify_blocks():
 
     # the verdicts: a keeps one of its two drafts, b none; the next step reads the other side
     slots = [pool._slots[r]["main"].index for r in "ab"]
-    mix.set_prefix_len(torch.tensor([1, 0]))
+    _settle(pool, kda, torch.tensor([1, 0]))
     assert want.prefix_len[slots, 0].tolist() == [2, 1]
     assert want.side[slots, 0].tolist() == [1, 1]
     commit(pool, ["a", "b"], [3, 3], ctx)
     plan(pool, kda, ["a", "b"], [3, 3], eager(["a", "b"], walk="decode"), speculative=True)
-    mix.set_prefix_len(torch.tensor([2, 2]))
+    _settle(pool, kda, torch.tensor([2, 2]))
     assert want.prefix_len[slots, 0].tolist() == [3, 3]
     assert want.side[slots, 0].tolist() == [0, 0]
     # every layer shares the count
     assert SpecBlocks.of(pool, 0).prefix_len.data_ptr() == want.prefix_len.data_ptr()
 
 
-def test_set_prefix_len_leaves_the_slots_outside_the_step():
+def test_a_settle_leaves_the_slots_outside_the_step():
     """A captured verify bucket's padding row writes the sink; another request's slot,
     not in the step, keeps its count and side."""
     pool, kda = build(speculative_tokens=2)
     kda.kernels = _Recorder()
-    mix = KDACallable(pool, kda)
     ctx = eager(["a", "c"])
     plan(pool, kda, ["a", "c"], [2, 2], ctx)
     commit(pool, ["a", "c"], [2, 2], ctx)
@@ -343,26 +333,25 @@ def test_set_prefix_len_leaves_the_slots_outside_the_step():
     capture = ["cap0", "cap1"]
     plan(pool, kda, capture, [3, 3],
          leased(capture, capture, bs=2, tokens=6, walk="decode", capture=True), speculative=True)
-    mix.set_prefix_len(torch.tensor([0, 0]))
+    _settle(pool, kda, torch.tensor([0, 0]))
     plan(pool, kda, ["a", "pad"], [3, 3],
          leased(["a"], ["a", "pad"], bs=2, tokens=6, walk="decode"), speculative=True)
-    mix.set_prefix_len(torch.tensor([1, 2]))
+    _settle(pool, kda, torch.tensor([1, 2]))
     assert (spec.prefix_len[a, 0].item(), spec.side[a, 0].item()) == (2, 1)
     assert (spec.prefix_len[c, 0].item(), spec.side[c, 0].item()) == (2, 1)
     assert spec.prefix_len[SINK_SLOT, 0].item() == 3
 
 
 def test_a_verify_step_settles_its_count_once_and_its_requests_keep_verifying():
-    """The resource refuses a verify step whose forward skips set_prefix_len or calls it
+    """The resource refuses a verify step whose forward skips its settle or settles it
     twice, a replay of a capture that skipped it, and a step that doesn't verify for a
     request that verified, whose state is behind its accepted drafts."""
     pool, kda = build(speculative_tokens=2)
     kda.kernels = _Recorder()
-    mix = KDACallable(pool, kda)
     ctx = eager(["a", "b"])
     plan(pool, kda, ["a", "b"], [2, 2], ctx)
     with pytest.raises(RuntimeError, match="didn't verify"):
-        mix.set_prefix_len(torch.tensor([0, 0]))
+        _settle(pool, kda, torch.tensor([0, 0]))
     commit(pool, ["a", "b"], [2, 2], ctx)
 
     def verify(rids, ctx):
@@ -373,11 +362,11 @@ def test_a_verify_step_settles_its_count_once_and_its_requests_keep_verifying():
 
     ctx = eager(["a"], walk="decode")
     step = verify(["a"], ctx)
-    with pytest.raises(RuntimeError, match="without set_prefix_len"):
+    with pytest.raises(RuntimeError, match="without a settle"):
         kda.commit(step, ctx)
-    mix.set_prefix_len(torch.tensor([1]))
-    with pytest.raises(RuntimeError, match="twice"):
-        mix.set_prefix_len(torch.tensor([1]))
+    _settle(pool, kda, torch.tensor([1]))
+    with pytest.raises(RuntimeError, match="a second settle"):
+        _settle(pool, kda, torch.tensor([1]))
     kda.commit(step, ctx)
     commit(pool, ["a"], [3], ctx)
     with pytest.raises(ValueError, match="only a verify step replays"):
@@ -385,7 +374,7 @@ def test_a_verify_step_settles_its_count_once_and_its_requests_keep_verifying():
     plan(pool, kda, ["b"], [1], eager(["b"], walk="decode"))  # b never verified
 
     verify(["c0"], leased(["c0"], ["c0"], bs=1, tokens=3, walk="decode", capture=True))
-    with pytest.raises(RuntimeError, match="ran no set_prefix_len"):
+    with pytest.raises(RuntimeError, match="ran no settle"):
         verify(["a"], leased(["a"], ["a"], bs=1, tokens=3, walk="decode"))
     kda.remove_request("a")  # its handle can go to a request that hasn't verified
     plan(pool, kda, ["a"], [1], eager(["a"], walk="decode"))
@@ -429,18 +418,17 @@ def _torch_inputs(tokens, device, seed=1):
 def _prefill_then_decode(pool, kda, rids, spans, p, device, guard=contextlib.nullcontext):
     """A prefill step over ``spans``, then one decode token per row; the outputs. Only the
     layer calls run under ``guard()``."""
-    mix = KDACallable(pool, kda)
     prompt = _torch_inputs(sum(spans), device)
     token = _torch_inputs(len(rids), device, seed=2)
     ctx = eager(rids)
     plan(pool, kda, rids, spans, ctx)
     with guard():
-        first = mix(*prompt, p, layer_idx=1)
+        first = _run(pool, kda, 1, *prompt, p)
     commit(pool, rids, spans, ctx)
     ctx = eager(rids, walk="decode")
     plan(pool, kda, rids, [1] * len(rids), ctx)
     with guard():
-        second = mix(*token, p, layer_idx=1)
+        second = _run(pool, kda, 1, *token, p)
     commit(pool, rids, [1] * len(rids), ctx)
     return first, second
 
@@ -452,11 +440,11 @@ def test_the_torch_bundle_keeps_each_row_in_its_own_slot():
     qkv, g, beta = _torch_inputs(8, CPU)
     pool, kda = build()
     plan(pool, kda, ["x", "y"], [5, 3], eager(["x", "y"]))
-    together = KDACallable(pool, kda)(qkv, g, beta, p, layer_idx=1)
+    together = _run(pool, kda, 1, qkv, g, beta, p)
     for rid, rows in (("x", slice(0, 5)), ("y", slice(5, 8))):
         alone, akda = build()
         plan(alone, akda, [rid], [rows.stop - rows.start], eager([rid]))
-        out = KDACallable(alone, akda)(qkv[rows], g[rows], beta[rows], p, layer_idx=1)
+        out = _run(alone, akda, 1, qkv[rows], g[rows], beta[rows], p)
         torch.testing.assert_close(out, together[rows], rtol=0, atol=0)
         mine, theirs = pool._slots[rid]["main"].index, alone._slots[rid]["main"].index
         for name in ("conv", "state"):

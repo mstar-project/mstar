@@ -3,6 +3,7 @@ config: prefill/decode parity, the layer schedule, the node resources, the MTP l
 loader."""
 import sys
 import types
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -16,7 +17,6 @@ from mstar.engine.resources import (  # noqa: E402
     KVLayout,
     KVSpec,
     SamplerSpec,
-    SamplingReqConfig,
     StepRunner,
     resolve_spec_dependencies,
 )
@@ -30,6 +30,9 @@ from mstar.engine.resources.linear_attn.config import (  # noqa: E402
 from mstar.engine.resources.recurrent.config import RecurrentStateSpec  # noqa: E402
 from mstar.engine.resources.recurrent.pool import RecurrentStatePool  # noqa: E402
 from mstar.engine.resources.step import StepContext  # noqa: E402
+from mstar.engine.state import SampleSettings  # noqa: E402
+from mstar.engine.state.adapters import node_handles, state_steps  # noqa: E402
+from mstar.model.base import serving_resources  # noqa: E402
 from mstar.model.components.distributed import ParallelKimiDeltaAttention  # noqa: E402
 from mstar.model.glm5_next.components.attention import Glm5NextMLAAttention  # noqa: E402
 from mstar.model.glm5_next.components.causal_lm import Glm5NextForCausalLM  # noqa: E402
@@ -40,6 +43,7 @@ from mstar.model.glm5_next.config import (  # noqa: E402
     KDA_STATE,
     KV_CACHE,
     LABEL,
+    MTP_SEED,
     SAMPLER,
     Glm5NextModelConfig,
 )
@@ -158,7 +162,7 @@ class _Harness:
         _randomize(self.lm, dtype)
         self.sub = Glm5NextLLMSubmodule(self.lm, self.cfg)
 
-        specs = self.model.get_node_resources()
+        specs = serving_resources(self.model, {})
         for spec in specs:
             if isinstance(spec, KVSpec):
                 spec.apply_yaml_overrides(page_size=_PAGE_SIZE, max_num_pages=_MAX_PAGES)
@@ -172,6 +176,8 @@ class _Harness:
             self.resources[spec.resource_key] = build_resource(spec, info)
         self.runner = StepRunner(self.resources, node_resources={"LLM": list(self.resources)})
         self.sub.bind_node_resources(self.resources)
+        self.handles = node_handles(self.model, "LLM", self.resources)
+        self.sub.bind_node_state(self.handles)
 
         self.kv = self.resources[KV_CACHE]
         self.attn = self.resources[ATTN]
@@ -203,18 +209,26 @@ class _Harness:
         node_inputs = [
             ARNodeInputs(input_ids=ids, input_seq_len=ids.shape[0]) for ids in token_rows
         ]
-        step = self.sub.declare_step(walk, request_ids, node_inputs)
+        declared = self.sub.declare_step(walk, request_ids, node_inputs)
+        # these tests read logits, never sampled tokens
+        state = {name: declared_step for name, declared_step in declared.state.items() if name != SAMPLER}
+        step = state_steps(replace(declared, state=state), self.handles, graph_walk=walk)
         step.set_ctx(StepContext(
             request_ids=tuple(request_ids), graph_walk=walk, slot=0, capture=False,
         ))
-        step.steps.pop(SAMPLER)  # these tests read logits, never sampled tokens
         outcome = self.runner.admit(step)
         assert outcome.ok, outcome.reason
         self.runner.plan(step)
+        step.begin_calls()
         return step, node_inputs
 
-    def close_step(self, step) -> None:
+    def close_step(self, step, every_layer: bool = True) -> None:
+        """``every_layer``: the step ran the whole stack, whose calls the handles check."""
+        if every_layer:
+            step.check_calls()
         self.runner.commit(step)
+        step.commit_calls()
+        step.end_calls()
 
     def engine_inputs(self, request_ids: list[str]) -> ModelInputsFromEngine:
         return ModelInputsFromEngine(
@@ -308,45 +322,36 @@ def test_prefill_matches_stepwise_decode_batched():
 
 
 class _KVSpy:
-    """Records which latent plane the MLA layers write and read through the
-    KV resource."""
+    """Records which of the latent pool's layers the MLA layers write through the KV resource."""
 
     def __init__(self, kv):
         self.writes: list[int] = []
-        self.views: list[int] = []
-        write, view = kv.write_kv, kv.layer_view
+        write = kv.write_kv
 
         def spy_write(latent, v=None, layer_idx=None, label=None):
             self.writes.append(layer_idx)
             return write(latent, v, layer_idx=layer_idx, label=label)
 
-        def spy_view(layer_idx=None):
-            self.views.append(layer_idx)
-            return view(layer_idx)
-
         kv.write_kv = spy_write
-        kv.layer_view = spy_view
 
 
 @torch.no_grad()
 def test_layer_schedule_honored():
-    """idx % 4 == 3 -> MLA on its compact plane, else KDA on the pool; a dense MLP iff
-    idx < first_k_dense_replace. A prefill writes the MLA planes in order and fills only its
-    own slot of the pool."""
+    """idx % 4 == 3 -> MLA on the latent array, else KDA on the KDA Value, each at its model
+    layer id; a dense MLP iff idx < first_k_dense_replace. A prefill writes the latent pool's
+    layers in order and fills only its own slot of the KDA pool."""
     h = _Harness(seed=15)
     cfg, model = h.cfg, h.lm
 
     for idx, layer in enumerate(model.model.layers):
         if idx % 4 == 3:
             assert isinstance(layer.self_attn, Glm5NextMLAAttention)
-            assert layer.kv_plane == cfg.full_attn_layer_indices.index(idx)
-            assert layer.self_attn.kv_plane == layer.kv_plane
             assert layer.self_attn.indexer is not None
-            assert layer.self_attn._kv is h.kv and layer.self_attn._attn is h.attn
+            assert layer.self_attn.state is h.handles[KV_CACHE]
         else:
             assert isinstance(layer.self_attn, ParallelKimiDeltaAttention)
-            assert layer.kda_pos == cfg.kda_layer_indices.index(idx)
-            assert layer.self_attn.mix.pool is h.pool and layer.self_attn.mix.attn is h.kda
+            assert layer.self_attn.state is h.handles[KDA_STATE]
+        assert int(layer.self_attn.layer) == idx
         mlp = Glm5NextGatedMLP if idx < cfg.first_k_dense_replace else Glm5NextSparseMoeBlock
         assert isinstance(layer.mlp, mlp)
     assert h.kv.kv_cache.num_layers == len(cfg.full_attn_layer_indices)
@@ -354,7 +359,7 @@ def test_layer_schedule_honored():
     spy = _KVSpy(h.kv)
     h.ingest("r0")
     h.prefill(["r0"], [torch.randint(0, cfg.vocab_size, (6,))])
-    assert spy.writes == spy.views == [0, 1]
+    assert spy.writes == [0, 1]
     slot = _slot_of(h.pool, "r0")
     recurrent, conv = h.pool._blocks["state"], h.pool._blocks["conv"]
     for kda_pos in range(len(cfg.kda_layer_indices)):
@@ -367,14 +372,13 @@ def test_layer_schedule_honored():
 
 
 def test_kda_layers_hold_no_per_slot_state():
-    """The pool is the only per-slot storage: the KDA layers bind the one pool
-    and the one KDA resource, and no layer keeps a staging plane of its own."""
+    """The pool is the only per-slot storage: the KDA layers bind the one KDA Value, and no
+    layer keeps a staging plane of its own."""
     h = _Harness(seed=15, max_slots=6)  # 7 slots: a size no model dim shares
     slots = h.pool.config.max_slots
     kda_layers = [layer for layer in h.lm.model.layers if layer.is_linear_attention]
     assert len(kda_layers) > 1
-    assert len({id(layer.self_attn.mix.pool) for layer in kda_layers}) == 1
-    assert len({id(layer.self_attn.mix.attn) for layer in kda_layers}) == 1
+    assert {id(layer.self_attn.state) for layer in kda_layers} == {id(h.handles[KDA_STATE])}
     for module in h.lm.modules():
         tensors = [*module.parameters(recurse=False), *module.buffers(recurse=False),
                    *(v for v in vars(module).values() if isinstance(v, torch.Tensor))]
@@ -385,11 +389,14 @@ def test_kda_layers_hold_no_per_slot_state():
 
 
 def _specs_by_key(model: Glm5NextModel) -> dict:
-    specs = model.get_node_resources()
-    assert [type(s) for s in specs] == [
-        KVSpec, AttentionSpec, SamplerSpec, RecurrentStateSpec, LinearAttnSpec]
-    assert all(s.nodes == {"LLM"} for s in specs)
-    return {s.resource_key: s for s in specs}
+    specs = {s.resource_key: s for s in serving_resources(model, {})}
+    seed = {MTP_SEED: RecurrentStateSpec} if model.config.mtp_num_draft_tokens else {}
+    assert {key: type(s) for key, s in specs.items()} == {
+        KV_CACHE: KVSpec, ATTN: AttentionSpec, SAMPLER: SamplerSpec, KDA_STATE: RecurrentStateSpec,
+        KDA: LinearAttnSpec, **seed,
+    }
+    assert all(s.nodes == {"LLM"} for s in specs.values())
+    return specs
 
 
 @pytest.mark.parametrize("name", ["glm5_next_tp8.yaml", "glm5_next_tp8_mtp.yaml"])
@@ -402,17 +409,27 @@ def test_serve_yaml_pages_cover_the_slot_pool(name):
     kv, kda = serve["resources"]["kv_cache"], serve["resources"]["kda_state"]
     cfg = Glm5NextModelConfig(max_seq_len=serve["max_seq_len"])
     cfg.mtp_num_draft_tokens = serve["model_kwargs"]["mtp_num_draft_tokens"]
-    # both pools hold a sink out of circulation
-    requests = kda["max_slots"] - 1
-    assert (kv["max_num_pages"] - 1) * kv["page_size"] >= requests * cfg.kv_rows
+    # both pools hold a sink out of circulation, and a request holds k + 1 rows a token of the context
+    requests, rows = kda["max_slots"] - 1, cfg.context_limit * (cfg.mtp_num_draft_tokens + 1)
+    assert (kv["max_num_pages"] - 1) * kv["page_size"] >= requests * rows
+
+
+def test_glm5next_refuses_a_seed_pool_short_of_the_cap():
+    """Each MTP request holds a draft seed slot beside its KDA slot, so a YAML that raises one pool and not the other
+    is refused at load."""
+    import yaml
+
+    serve = yaml.safe_load((Path(__file__).parents[2] / "configs" / "glm5_next_tp8_mtp.yaml").read_text())
+    model = Glm5NextModel("x", **serve["model_kwargs"])
+    model.validate_config_yaml(serve, "glm5_next_tp8_mtp.yaml")
+    serve["resources"][MTP_SEED]["max_slots"] = serve["max_concurrent_requests"]
+    with pytest.raises(ValueError, match=MTP_SEED):
+        model.validate_config_yaml(serve, "glm5_next_tp8_mtp.yaml")
 
 
 def test_glm5next_model_constructs_from_config():
-    """The five node resources, full-size and reduced; each builds on CPU."""
-    model = object.__new__(Glm5NextModel)
-    model.config = Glm5NextModelConfig()
-    model.kda_max_requests = 32
-    model.kda_conv_dtype = torch.bfloat16
+    """The five node resources the declarations build, full-size and reduced; each builds on CPU."""
+    model = Glm5NextModel("zai-org/GLM-5.3-Flash")
     specs = _specs_by_key(model)
 
     kv = specs[KV_CACHE].config
@@ -459,7 +476,7 @@ def test_glm5next_model_constructs_from_config():
 
     # Per-request sampler config: model_kwargs over the checkpoint's defaults.
     (req,) = constructed.get_request_resource_configs([], [], {"temperature": 0.0, "top_k": 3}).values()
-    assert isinstance(req, SamplingReqConfig)
+    assert isinstance(req, SampleSettings)
     assert req.temperature == 0.0 and req.top_k == 3
     assert req.top_p == 0.95
 
@@ -489,14 +506,15 @@ def test_mtp_off_and_on_both_construct():
     model_on, cfg = h.lm, h.cfg
     mtp = model_on.mtp
     assert mtp is not None
-    # the draft plane is the compact index after the trunk's MLA planes, not layer index 45
-    assert mtp.kv_plane == len(cfg.full_attn_layer_indices)
-    assert h.kv.kv_cache.num_layers == mtp.kv_plane + 1  # the spec declared it
+    # the draft layer is model layer 45, which the latent array declares after the trunk's
+    draft = len(cfg.full_attn_layer_indices)
+    assert int(mtp.transformer_layer.self_attn.layer) == cfg.num_hidden_layers
+    assert h.kv.kv_cache.num_layers == draft + 1
     # plain residual: the checkpoint has no mHC tensors at layer 45
     assert not hasattr(mtp.transformer_layer, "attn_hc")
     assert isinstance(mtp.transformer_layer.self_attn, Glm5NextMLAAttention)
     assert mtp.transformer_layer.self_attn.indexer is not None  # own FULL indexer
-    assert mtp.transformer_layer.self_attn._kv is h.kv  # bound like the trunk
+    assert mtp.transformer_layer.self_attn.state is h.handles[KV_CACHE]  # bound like the trunk
 
     # (embeds, prev_hidden) -> the shared-head norm output, which is the lm_head's input and
     # the next draft's prev_hidden
@@ -506,9 +524,9 @@ def test_mtp_off_and_on_both_construct():
     embeds = model_on.model.embed_tokens(torch.tensor([5]))
     prev_hidden = torch.randn(1, cfg.hidden_size)
     head_input = mtp(embeds, prev_hidden)
-    h.close_step(step)
+    h.close_step(step, every_layer=False)
     assert head_input.shape == (1, cfg.hidden_size)
-    assert spy.writes == spy.views == [mtp.kv_plane]  # the layer set its own plane
+    assert spy.writes == [draft]  # the pool layer of its own id
     assert model_on.lm_head(head_input).shape == (1, cfg.vocab_size)
     h.remove("r0")
 
@@ -524,17 +542,18 @@ def test_mtp_block_row_query_matches_the_causal_block():
     hidden = h.cfg.hidden_size
     h.ingest("r0")
     step, _ = h.open_step("prefill", ["r0"], [torch.arange(2, 7)])
-    layer(torch.randn(5, hidden))  # the MTP plane's context
-    h.close_step(step)
+    layer(torch.randn(5, hidden))  # the MTP layer's context
+    h.close_step(step, every_layer=False)
     block = 4
     x = torch.randn(block, hidden)
     step, _ = h.open_step("prefill", ["r0"], [torch.zeros(block, dtype=torch.long)])
+    latents = x.new_zeros(1, block, attn.kv_lora_rank)
+    # the draft passes' adds are scratch, so they come before the step's kept add, as in a verify step
+    rows = [layer(x[row:row + 1], row=row, latents=latents)[0] for row in range(block)]
     whole = layer(x)
-    latents = x.new_zeros(1, block, attn.kv_lora_rank + attn.mla_cache_kpe)
     for row in range(block):
-        got = layer(x[row:row + 1], row=row, latents=latents)
-        torch.testing.assert_close(got[0], whole[row], rtol=1e-4, atol=1e-5)
-    h.close_step(step)
+        torch.testing.assert_close(rows[row], whole[row], rtol=1e-4, atol=1e-5)
+    h.close_step(step, every_layer=False)
     h.remove("r0")
 
 

@@ -1,8 +1,8 @@
 """Kimi delta attention (KDA): the layer's weights.
 
-The state and kernels belong to the engine's KDA resource, reached through ``KDACallable``:
-``forward`` runs a step there, while ``prefill`` / ``decode_step`` run the reference math
-(``kda_torch``) on state the caller holds, as a parity oracle. ``ParallelKimiDeltaAttention``
+The state is a Value the engine holds: ``forward`` runs a step through ``kimi_delta`` on the
+layer's handle, while ``prefill`` / ``decode_step`` run the reference math (``kda_torch``) on
+state the caller holds, as a parity oracle. ``ParallelKimiDeltaAttention``
 (``components/distributed/kda.py``) builds one rank's share.
 """
 from __future__ import annotations
@@ -13,8 +13,6 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from mstar.engine.resources.convenience import KDACallable
-from mstar.engine.resources.linear_attn.kda import KDAParams
 from mstar.engine.resources.linear_attn.kda_torch import (
     causal_conv1d_prefill,
     causal_conv1d_update,
@@ -23,6 +21,7 @@ from mstar.engine.resources.linear_attn.kda_torch import (
     gated_rms_norm,
     recurrent_kda_step,
 )
+from mstar.engine.state import KimiDeltaWeights, kimi_delta
 
 
 @dataclass
@@ -102,18 +101,20 @@ class KDAGatedRMSNorm(nn.Module):
 
 
 class KimiDeltaAttention(nn.Module):
-    """One KDA layer. ``kda_key`` / ``state_key`` name the KDA resource and the recurrent pool
-    holding its state."""
+    """One KDA layer, model layer ``layer`` of the Value named ``state_key``."""
 
     def __init__(
         self,
         config: KDAConfig,
         dtype: torch.dtype = torch.bfloat16,
         *,
-        kda_key: str = "kda",
         state_key: str = "kda_state",
+        layer: int | None = None,
     ) -> None:
         super().__init__()
+        self._state_key = state_key
+        self.layer = None if layer is None else torch.tensor(layer, device="cpu")
+        self.state = None
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_heads
         self.head_dim = config.head_dim
@@ -150,10 +151,8 @@ class KimiDeltaAttention(nn.Module):
         # q | k | v | b | f_a | gate input, built by process_weights_after_loading; a buffer
         # so `.to()` moves it
         self.register_buffer("_in_proj_weight", None, persistent=False)
-        # bound once at load, by `bind_resources`
-        self._kda_key, self._state_key = kda_key, state_key
-        self.mix: KDACallable | None = None
-        self._params: KDAParams | None = None
+        # built with the fused weight, and again after a move
+        self.weights: KimiDeltaWeights | None = None
 
     # -- the dense reference, on state the caller holds -----------------------
 
@@ -183,7 +182,7 @@ class KimiDeltaAttention(nn.Module):
         weights.append(weights[0].new_zeros(pad, self.hidden_size))
         self._in_proj_weight = torch.cat(weights).detach()
         self._view_in_proj()
-        self._params = None
+        self.weights = self._kimi_delta_weights()
 
     def _view_in_proj(self) -> None:
         start = 0
@@ -310,53 +309,40 @@ class KimiDeltaAttention(nn.Module):
         core_attn_out = recurrent_kda_step(query, key, value, g, beta, recurrent_state)
         return self._finalize(core_attn_out, hidden_states, hidden_shape)
 
-    # -- through the engine's KDA resource --------------------------------
+    # -- through the layer's Value -----------------------------------------
 
-    def bind_resources(self, resources: dict) -> None:
-        """Resolve the resources this layer calls. See ``NodeSubmodule.bind_node_resources``."""
-        kda = resources[self._kda_key]
-        self.mix = KDACallable(resources[self._state_key], kda)
+    def bind_state(self, handles: dict) -> None:
+        """See ``Attention.bind_state``."""
+        self.state = handles.get(self._state_key)
+        if self.state is None:
+            return
         # The conv tail is read alongside the projected activations, so the
-        # pool must hold them in the dtype the layer was loaded in.
-        pool_dtype = self.mix.conv_dtype
-        proj_dtype = self.q_proj.weight.dtype
-        if pool_dtype != proj_dtype:
+        # Value must hold it in the dtype the layer was loaded in.
+        declared, proj_dtype = self.state.array.entry.tensors["conv"].dtype, self.q_proj.weight.dtype
+        if declared != proj_dtype:
             raise RuntimeError(
-                f"KDA conv state is {pool_dtype} but the KDA projections are "
-                f"{proj_dtype}; declare the pool's conv block in the projections' dtype "
-                "(DeltaNetGeometry.to_blocks(conv_dtype=...))"
-            )
-        if kda is not None:
-            kda.bind_layer(
-                lower_bound=self.forget_gate.gate_lower_bound,
-                full_rank_output_gate=self.full_rank_output_gate,
+                f"KDA conv state is {declared} but the KDA projections are "
+                f"{proj_dtype}; declare the Value's conv field in the projections' dtype"
             )
 
-    def params(self) -> KDAParams:
-        """What the KDA resource's kernels read besides the activations. A full-rank output
-        gate leaves the gate and the norm to this layer (``g_b`` None)."""
-        if self._params is None:
-            self._params = KDAParams(
-                conv_weight=self.conv1d.weight.view(self.conv_dim, -1),
-                A_log=self.forget_gate.A_log,
-                dt_bias=self.forget_gate.dt_bias,
-                lower_bound=self.forget_gate.gate_lower_bound,
-                num_heads=self.num_heads,
-                head_dim=self.head_dim,
-                scale=self.head_dim ** -0.5,
-                f_b=self.forget_gate.f_b_proj.weight,
-                g_b=None if self.full_rank_output_gate else self.g_b_proj.weight,
-                norm_weight=self.o_norm.weight,
-                norm_eps=self.o_norm.variance_epsilon,
-            )
-        return self._params
+    def _kimi_delta_weights(self) -> KimiDeltaWeights:
+        full = self.full_rank_output_gate
+        return KimiDeltaWeights(
+            conv=self.conv1d.weight.view(self.conv_dim, -1),
+            a_log=self.forget_gate.A_log,
+            dt_bias=self.forget_gate.dt_bias,
+            f_b=self.forget_gate.f_b_proj.weight,
+            g_b=None if full else self.g_b_proj.weight,
+            norm_weight=None if full else self.o_norm.weight,
+            norm_eps=self.o_norm.variance_epsilon,
+        )
 
-    def forward(self, hidden_states: torch.Tensor, layer_idx: int | None = None) -> torch.Tensor:
-        """``(T, hidden)`` through the KDA resource, state in the pool's ``layer_idx`` blocks
-        (this layer's index among the KDA layers; None: the ``mix`` cursor's)."""
-        if self.mix is None or self._in_proj_weight is None:
+    def forward(self, hidden_states: torch.Tensor, *, decode: bool = False) -> torch.Tensor:
+        """``(T, hidden)`` through ``kimi_delta``. ``decode``: the step decodes or verifies,
+        rather than prefills."""
+        if self.state is None or self.weights is None:
             raise RuntimeError(
-                f"{type(self).__name__} needs its engine resources bound and "
+                f"{type(self).__name__} needs its state bound and "
                 "process_weights_after_loading run before a forward"
             )
         # One GEMM for q | k | v | beta | f_a | gate input; the kernels read the
@@ -367,17 +353,17 @@ class KimiDeltaAttention(nn.Module):
         f_a = proj[:, 3 * p + h:3 * p + h + d]
         if self.full_rank_output_gate:
             gate = proj[:, 3 * p + h + d:3 * p + h + d + p]
-            out = self.mix(qkv, f_a, beta, self.params(), layer_idx=layer_idx)
+            out = kimi_delta(self.state, self.layer, qkv, f_a, beta, self.weights)
             t = hidden_states.shape[0]
             out = self.o_norm(out.view(t, h, d), gate.view(t, h, d)).reshape(t, p)
         else:
             g_a = proj[:, 3 * p + h + d:3 * p + h + 2 * d]
-            out = self.mix(qkv, f_a, beta, self.params(), gate=g_a, layer_idx=layer_idx)
-        return self._project_out(out, hidden_states)
+            out = kimi_delta(self.state, self.layer, qkv, f_a, beta, self.weights, gate=g_a)
+        return self._project_out(out, hidden_states, decode)
 
-    def _project_out(self, out: torch.Tensor, hidden_states: torch.Tensor) -> torch.Tensor:
+    def _project_out(self, out: torch.Tensor, hidden_states: torch.Tensor, decode: bool) -> torch.Tensor:
         """``o_proj``; the tensor-parallel layer sums the ranks' partials here."""
-        del hidden_states
+        del hidden_states, decode
         return self.o_proj(out)
 
     def _apply(self, fn, recurse=True):
@@ -385,5 +371,5 @@ class KimiDeltaAttention(nn.Module):
         if self._in_proj_weight is not None:
             # `_apply` moved the projections apart from the fused weight
             self._view_in_proj()
-        self._params = None
+            self.weights = self._kimi_delta_weights()
         return result

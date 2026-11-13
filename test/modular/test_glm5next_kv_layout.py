@@ -1,5 +1,6 @@
 """GLM-5.3-Flash's paged KV layout, through the real conductor: each request is held to the
-cache rows its prompt leaves, and under MTP a decode step counts its whole k + 1 block."""
+cache rows its prompt leaves, and under MTP a decode step counts its whole k + 1 block, which
+the holed pool keeps."""
 
 from __future__ import annotations
 
@@ -13,6 +14,7 @@ from test_kv_layout_intake import _Comm, _preprocess, _ScriptDoneError
 
 import mstar.conductor.conductor as conductor_mod
 from mstar.conductor.conductor import Conductor
+from mstar.model.base import serving_resources
 from mstar.model.glm5_next.config import KV_CACHE
 from mstar.model.glm5_next.glm5_next_model import Glm5NextModel
 from mstar.utils.ipc_format import ConductorMessage, ConductorMessageType, NewRequestConductor, SetupDone
@@ -25,6 +27,12 @@ _K = pytest.mark.parametrize("k", [0, 3], ids=["plain", "mtp"])
 
 def _model(**kwargs) -> Glm5NextModel:
     return Glm5NextModel(model_path_hf="", tokenizer_mode="byte", **kwargs)
+
+
+def _rows(model: Glm5NextModel) -> int:
+    """The cache rows a request may hold: the latent pool's, ``max_len`` for each verify block's row."""
+    (pool,) = (spec for spec in serving_resources(model, {}) if spec.resource_key == KV_CACHE)
+    return pool.config.max_seq_len
 
 
 def _conduct(model: Glm5NextModel, model_kwargs: dict, tmp_path, monkeypatch) -> list:
@@ -68,9 +76,9 @@ def _failed(sent: list) -> list[int]:
 def test_the_label_is_declared_and_grows_by_the_block(k):
     model = _model(mtp_num_draft_tokens=k)
 
-    assert list(_undeclared_pools(model.get_node_resources(), model)) == []
+    assert list(_undeclared_pools(serving_resources(model, {}), model)) == []
     assert list(_unknown_prefix_walks(model)) == []
-    layout = model.process_prompt("hello", ["text"], ["text"]).metadata["kv_layout"][KV_CACHE]["main"]
+    layout = model.process_prompt("hello", ["text"], ["text"]).metadata["state_layout"][KV_CACHE]["main"]
     assert [(span.walk, span.length) for span in layout.spans] == [("prefill", PROMPT)]
     assert layout.growth == (("decode_loop", k + 1),)
 
@@ -78,7 +86,8 @@ def test_the_label_is_declared_and_grows_by_the_block(k):
 @_K
 def test_a_request_that_asks_no_length_fills_the_cache_rows(tmp_path, monkeypatch, k):
     model = _model(mtp_num_draft_tokens=k)
-    rows, block = model.config.kv_rows, k + 1
+    rows, block = _rows(model), k + 1
+    assert rows == model.config.context_limit * block
 
     new_request = _dispatched(_conduct(model, _preprocess(model, {}), tmp_path, monkeypatch))
 
@@ -93,7 +102,7 @@ def test_the_most_tokens_the_context_holds_are_admitted(tmp_path, monkeypatch, k
     """The rows rejected drafts take never refuse a request the context holds: the room is
     the window's after the prompt, under MTP two verify blocks short of it."""
     model = _model(mtp_num_draft_tokens=k)
-    max_tokens = model.config.index_topk - PROMPT - (2 * (k + 1) - 1 if k else 0)
+    max_tokens = model.config.context_limit - PROMPT - (2 * (k + 1) - 1 if k else 0)
 
     sent = _conduct(model, _preprocess(model, {"max_output_tokens": max_tokens}), tmp_path, monkeypatch)
 
@@ -109,7 +118,7 @@ def test_mtp_refuses_a_max_tokens_the_window_cant_hold(past):
     rather than cut it short."""
     model = _model(mtp_num_draft_tokens=3)
     prompt = "x" * 1000
-    room = model.config.index_topk - 2 * 4 + 1 - len(prompt)
+    room = model.config.context_limit - 2 * 4 + 1 - len(prompt)
     if past:
         with pytest.raises(ValueError, match=f"emits at most {room} tokens"):
             model.process_prompt(prompt, ["text"], ["text"], max_output_tokens=room + 1)
@@ -122,7 +131,7 @@ def test_max_tokens_past_the_rows_its_prompt_leaves_is_a_400(tmp_path, monkeypat
     """Without MTP the conductor refuses it; under MTP the window binds first."""
     model = _model()
     # the prompt's rows and a row per decode step fill the cache; the last token is never stored
-    fits = model.config.kv_rows - PROMPT + 1
+    fits = _rows(model) - PROMPT + 1
 
     sent = _conduct(model, _preprocess(model, {"max_output_tokens": fits + past}), tmp_path, monkeypatch)
 

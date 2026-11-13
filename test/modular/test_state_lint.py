@@ -26,6 +26,7 @@ PORTED = (
     "mstar/model/pi05", "mstar/model/vjepa2", "mstar/model/canary", "mstar/model/components/encoder_decoder.py",
     "mstar/model/bagel", "mstar/model/chatterbox", "mstar/model/whisper",
     "mstar/model/waypoint", "mstar/model/lingbot_world",
+    "mstar/model/glm5_next", "mstar/model/components/kda.py", "mstar/model/components/distributed/kda.py",
 )
 FORBIDDEN_ATTRIBUTES = {
     "node_resources", "resources", "request_state", "request_states", "per_request_states", "sequence_shard",
@@ -38,10 +39,10 @@ _CAPTURE = "a capture's buckets and compile mode, which the engine doesn't pick 
 ALLOWED = {
     ("mstar.engine.accelerator_graph_config", name): _CAPTURE
     for name in (
-        "AcceleratorGraphConfig", "BatchedAcceleratorGraphConfig", "DETERMINISTIC_COMPILE_MODE",
-        "PackedAcceleratorGraphConfig", "PiecewiseAcceleratorGraphConfig", "PiecewiseBatchedConfig",
-        "PiecewiseCallInputs", "PiecewiseCaptureShape", "PiecewisePackedConfig", "decode_rows_then_prompt",
-        "geometric_batch_sizes",
+        "AcceleratorGraphConfig", "BatchedAcceleratorGraphConfig", "DEFAULT_CAPTURE_BATCH_SIZES",
+        "DETERMINISTIC_COMPILE_MODE", "PackedAcceleratorGraphConfig", "PiecewiseAcceleratorGraphConfig",
+        "PiecewiseBatchedConfig", "PiecewiseCallInputs", "PiecewiseCaptureShape", "PiecewisePackedConfig",
+        "decode_rows_then_prompt", "geometric_batch_sizes",
     )
 } | {
     ("mstar.engine.accelerator_graph_runner", "compile_kwargs"): _CAPTURE,
@@ -67,6 +68,13 @@ ALLOWED_IN: dict[tuple[str, str, str], str] = {
     for module, name in (
         ("mstar.engine.accelerator_graph_backend", "CapturedGraph"),
         ("mstar.engine.accelerator_graph_runner", "capture_into_graph"),
+    )
+} | {
+    ("mstar/model/components/kda.py", "mstar.engine.resources.linear_attn.kda_torch", name):
+        "the layer's torch oracle (`prefill`, `decode_step`), which the KDA tests compare `kimi_delta` against"
+    for name in (
+        "causal_conv1d_prefill", "causal_conv1d_update", "chunk_kda", "forget_gate", "gated_rms_norm",
+        "recurrent_kda_step",
     )
 }
 # Exceptions each scoped to one function and one attribute, by file, the function's qualified name in that file, and

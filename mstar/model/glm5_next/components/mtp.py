@@ -30,7 +30,6 @@ class Glm5NextMTPModule(nn.Module):
         self, config: Glm5NextModelConfig, comm_group: CommGroup | None = None
     ) -> None:
         super().__init__()
-        self.kv_plane = len(config.full_attn_layer_indices)
         self.enorm = build_rmsnorm(config)
         self.hnorm = build_rmsnorm(config)
         self.eh_proj = nn.Linear(
@@ -39,7 +38,6 @@ class Glm5NextMTPModule(nn.Module):
         self.transformer_layer = Glm5NextPlainDecoderLayer(
             config,
             layer_idx=config.num_hidden_layers,
-            kv_plane=self.kv_plane,
             comm_group=comm_group,
         )
         self.shared_head = Glm5NextSharedHead(config)

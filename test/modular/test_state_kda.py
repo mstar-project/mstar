@@ -2,7 +2,7 @@
 
 KDA's kernels read and write the window and the state together, in whatever launches they split them into, so
 GLM-5.3's layers handed one resource both blocks. On the contract that is one update call, `kimi_delta`, which records
-both fields and runs the kernels on the blocks `KDACallable` passed. A layer's kernel parameters are built from its
+both fields and runs the kernels on the layer's two blocks. A layer's kernel parameters are built from its
 weights once, and again for a weights object rebuilt after a move, as GLM-5.3 reset them in `_apply`.
 """
 

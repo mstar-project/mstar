@@ -5,39 +5,31 @@ import logging
 from collections.abc import Mapping
 from pathlib import Path
 from types import MappingProxyType
+from typing import Any
 
 import torch
 from jinja2 import TemplateError
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import FINAL_PREFILL
-from mstar.engine.resources import (
-    AttentionConfig,
-    AttentionSpec,
-    AttnBackend,
-    KVLayout,
-    KVSpec,
-    NodeResourceSpec,
-    PagedKVConfig,
-    ResourceReqConfig,
-    SamplerSpec,
-    SamplingReqConfig,
-)
-from mstar.engine.resources.linear_attn.config import (
-    LinearAttnBackend,
-    LinearAttnConfig,
-    LinearAttnSpec,
-    LinearAttnVariant,
-)
-from mstar.engine.resources.recurrent.config import (
-    DeltaNetGeometry,
-    RecurrentBlockConfig,
-    RecurrentStateConfig,
-    RecurrentStateSpec,
+from mstar.engine.state import (
+    Array,
+    Causal,
+    Entry,
+    KimiDelta,
+    LatentAttend,
+    LatentEntry,
+    Layout,
+    Read,
+    Sampler,
+    SampleSettings,
+    Span,
+    TensorType,
+    Value,
 )
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
-from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, WalkStep
+from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
+from mstar.model.base import KVLabel, Model, ProcessPromptOutput, WalkStep
 from mstar.model.components.request_kwargs import (
     SAMPLING_KEYS,
     generation_config_dir,
@@ -45,11 +37,12 @@ from mstar.model.components.request_kwargs import (
 )
 from mstar.model.glm5_next.config import (
     ATTN,
+    COUNT,
     KDA,
     KDA_STATE,
     KV_CACHE,
-    MTP_DRAFT,
-    MTP_HIDDEN,
+    MTP_SEED,
+    PROMPT_LEN,
     SAMPLER,
     Glm5NextModelConfig,
 )
@@ -58,6 +51,7 @@ from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.utils import (
     ByteLevelTextOutput,
     capture_ladder,
+    check_kv_pools_fit,
     check_loaded,
     load_snapshot_tokenizer,
     process_weights_after_loading,
@@ -82,6 +76,7 @@ class Glm5NextModel(ByteLevelTextOutput, Model):
     DECODE_LOOP = "decode_loop"
     # the conductor builds the fused-MoE align op before spawning the workers
     prebuild_fused_moe = True
+    INTERNAL_KWARGS = (PROMPT_LEN,)
     # the checkpoint's sampling defaults, under whatever a request sets (set by
     # `__init__`; a model built without it takes the published recipe)
     sampling_defaults: Mapping[str, object] = DEFAULT_SAMPLING
@@ -112,13 +107,12 @@ class Glm5NextModel(ByteLevelTextOutput, Model):
             self.config.moe_quant_kernel = str(kwargs["moe_quant_kernel"])
         if "mtp_num_draft_tokens" in kwargs:
             k = kwargs["mtp_num_draft_tokens"]
-            # the cache rows are max_seq_len * (k + 1), and a prompt leaves two verify blocks of
-            # index_topk free: k must leave room for both
+            # a prompt leaves two verify blocks of the context free: k must leave room for both
             if (isinstance(k, bool) or not isinstance(k, int) or k < 0
-                    or self.config.index_topk - 2 * (k + 1) < 1):
+                    or self.config.context_limit - 2 * (k + 1) < 1):
                 raise ValueError(
                     f"mtp_num_draft_tokens must be an integer from 0 (off) to "
-                    f"{(self.config.index_topk - 3) // 2}, got {k!r}")
+                    f"{(self.config.context_limit - 3) // 2}, got {k!r}")
             self.config.mtp_num_draft_tokens = k
         if "prefill_graphs" in kwargs:
             # bool("false") is True
@@ -151,92 +145,61 @@ class Glm5NextModel(ByteLevelTextOutput, Model):
         return self._tokenizer
 
     # -------------------------------------------------------------------
-    # Model ABC: KV cache config
+    # Model ABC: state
     # -------------------------------------------------------------------
 
-    def get_node_resources(self) -> list[NodeResourceSpec]:
-        """The LLM node's five resources."""
-        num_kv_layers = len(self.config.full_attn_layer_indices) + (
-            1 if self.config.mtp_num_draft_tokens > 0 else 0
-        )
-        kda_blocks = DeltaNetGeometry(
-            num_k_heads=self.config.linear_num_heads,
-            num_v_heads=self.config.linear_num_heads,
-            head_k_dim=self.config.linear_head_dim,
-            head_v_dim=self.config.linear_head_dim,
-            conv_kernel_size=self.config.linear_conv_kernel_size,
-        ).to_blocks(
-            conv_dtype=self.kda_conv_dtype,
-            # an MTP decode step verifies k + 1 tokens per request
-            speculative_tokens=self.config.mtp_num_draft_tokens,
-        )
-        if self.config.mtp_num_draft_tokens > 0:
-            # the next step's draft seed, in the model's dtype (the KDA projections')
-            kda_blocks[MTP_HIDDEN] = RecurrentBlockConfig(
-                shape=(self.config.hidden_size,), dtype=self.kda_conv_dtype, per_layer=False,
-            )
-            kda_blocks[MTP_DRAFT] = RecurrentBlockConfig(
-                shape=(1,), dtype=torch.long, per_layer=False,
-            )
-        return [
-            KVSpec(
-                resource_key=KV_CACHE,
-                nodes={"LLM"},
-                config=PagedKVConfig(
-                    num_layers=num_kv_layers,
-                    num_kv_heads=1,
-                    head_dim=self.config.kv_lora_rank + self.config.mla_cache_kpe,
-                    max_seq_len=self.config.kv_rows,
-                    num_qo_heads=self.config.num_attention_heads,
-                    layout=KVLayout.MLA,
-                    kv_lora_rank=self.config.kv_lora_rank,
-                    qk_rope_head_dim=self.config.mla_cache_kpe,
-                ),
+    def declare_state(self) -> list[Array | Sampler]:
+        cfg, k = self.config, self.config.mtp_num_draft_tokens
+        nodes = frozenset({"LLM"})
+        h, d = cfg.linear_num_heads, cfg.linear_head_dim
+        state = [
+            Array(
+                KV_CACHE, nodes=nodes, layers={*cfg.full_attn_layer_indices, *([cfg.num_hidden_layers] if k else [])},
+                entry=LatentEntry(rank=cfg.kv_lora_rank, rope_dim=0), max_len=cfg.context_limit, verify_span=k + 1,
+                reads={ATTN: Read(mask=Causal(), op=LatentAttend(cfg.num_attention_heads, scale=cfg.softmax_scale))},
             ),
-            AttentionSpec(
-                resource_key=ATTN,
-                nodes={"LLM"},
-                config=AttentionConfig(
-                    kv_cache=KV_CACHE,
-                    backend=AttnBackend.FLASHINFER_MLA,
-                    sm_scale=self.config.qk_head_dim ** -0.5,
-                ),
+            Value(
+                KDA_STATE, nodes=nodes, layers=cfg.kda_layer_indices, verify_span=k + 1,
+                entry=Entry({
+                    "conv": TensorType(
+                        (3 * h * d, cfg.linear_conv_kernel_size - 1), dtype=self.kda_conv_dtype, shard=0,
+                    ),
+                    "state": TensorType((h, d, d), dtype=torch.float32, shard=0),
+                }),
+                updates={KDA: KimiDelta(lower_bound=float(cfg.gate_lower_bound))},
             ),
-            # min-p only where the checkpoint defaults it; elsewhere a request's
-            # min_p > 0 is refused at admission
-            SamplerSpec(
-                resource_key=SAMPLER,
-                nodes={"LLM"},
-                vocab_size=self.config.vocab_size,
-                enable_repetition_penalty=True,
-                enable_min_p=bool(self.sampling_defaults.get("min_p")),
-            ),
-            RecurrentStateSpec(
-                resource_key=KDA_STATE,
-                nodes={"LLM"},
-                config=RecurrentStateConfig(
-                    num_layers=len(self.config.kda_layer_indices),
-                    blocks=kda_blocks,
-                    max_slots=self.kda_max_requests + 1,  # + the sink
-                ),
-            ),
-            LinearAttnSpec(
-                resource_key=KDA,
-                nodes={"LLM"},
-                config=LinearAttnConfig(
-                    recurrent_state=KDA_STATE,
-                    variant=LinearAttnVariant.KDA,
-                    backend=LinearAttnBackend.TRITON,
-                ),
+            # min-p only where the checkpoint defaults it; elsewhere a request's min_p > 0 is refused at admission
+            Sampler(
+                SAMPLER, nodes=nodes, vocab_size=cfg.vocab_size, penalty=True,
+                min_p=bool(self.sampling_defaults.get("min_p")),
             ),
         ]
+        if k:
+            state.append(Value(
+                MTP_SEED, nodes=nodes, layers={0},
+                entry=Entry({
+                    "hidden": TensorType((cfg.hidden_size,), dtype=self.kda_conv_dtype),
+                    "draft": TensorType((), dtype=torch.long),
+                }),
+            ))
+        return state
+
+    def kernel_settings(self) -> dict[str, dict[str, Any]]:
+        # every request holding KDA state takes a slot, and each pool keeps one more, its sink
+        slots = {"max_slots": self.kda_max_requests + 1}
+        if self.config.mtp_num_draft_tokens:
+            return {KDA_STATE: slots, MTP_SEED: slots}
+        return {KDA_STATE: slots}
+
+    def validate_config_yaml(self, config: dict, config_path: str) -> None:
+        check_kv_pools_fit(self, config, config_path, logger)
 
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
         return {KV_CACHE: {"main": KVLabel(growth=(("decode", "decode_loop"),))}}
 
     def get_request_resource_configs(
         self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
-    ) -> dict[str, ResourceReqConfig]:
+    ) -> dict[str, SampleSettings]:
         del input_modalities, output_modalities
         model_kwargs = normalize_generation_kwargs(model_kwargs)
         params = {
@@ -247,46 +210,44 @@ class Glm5NextModel(ByteLevelTextOutput, Model):
             # MTP verifies greedily: a request that names no temperature gets 0, and an
             # explicit one > 0 is refused in process_prompt
             params["temperature"] = 0.0
-        return {SAMPLER: SamplingReqConfig(**params)}
+        return {SAMPLER: SampleSettings(**params)}
 
     # -------------------------------------------------------------------
     # Model ABC: graph walk definitions
     # -------------------------------------------------------------------
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
-        # MTP keeps this graph: the draft seed lives in the request's KDA slot, and a
-        # verify step's tokens leave on new_token like a decode step's
-        prefill = GraphNode(
-            name="LLM",
-            input_names=["text_inputs"],
-            outputs=[
-                GraphEdge(
-                    next_node=EMIT_TO_CLIENT,
-                    name="new_token",
-                    output_modality="text",
-                    conductor_new_token=True,
-                    persist=True,
-                ),
-            ],
-        )
+        # a verify step's tokens leave on new_token like a decode step's
+        prefill_outputs = [
+            GraphEdge(
+                next_node=EMIT_TO_CLIENT,
+                name="new_token",
+                output_modality="text",
+                conductor_new_token=True,
+                persist=True,
+            ),
+        ]
+        decode_inputs = ["text_inputs"]
+        decode_outputs = [
+            GraphEdge(
+                next_node="LLM",
+                name="text_inputs",
+            ),
+            GraphEdge(
+                next_node=EMIT_TO_CLIENT,
+                name="new_token",
+                output_modality="text",
+            ),
+        ]
+        if self.config.mtp_num_draft_tokens > 0:
+            prefill_outputs.append(GraphEdge(next_node=EMPTY_DESTINATION, name=COUNT, persist=True))
+            decode_inputs.append(COUNT)
+            decode_outputs.append(GraphEdge(next_node="LLM", name=COUNT))
+        prefill = GraphNode(name="LLM", input_names=["text_inputs"], outputs=prefill_outputs)
 
         decode = Loop(
             name="decode_loop",
-            section=GraphNode(
-                name="LLM",
-                input_names=["text_inputs"],
-                outputs=[
-                    GraphEdge(
-                        next_node="LLM",
-                        name="text_inputs",
-                    ),
-                    GraphEdge(
-                        next_node=EMIT_TO_CLIENT,
-                        name="new_token",
-                        output_modality="text",
-                    ),
-                ],
-            ),
+            section=GraphNode(name="LLM", input_names=decode_inputs, outputs=decode_outputs),
             # Runaway guard; the per-request budget lives in check_stop.
             max_iters=self.max_decode_steps(),
             outputs=[],
@@ -308,7 +269,8 @@ class Glm5NextModel(ByteLevelTextOutput, Model):
         # one prefill over the prompt, then decode until the stop check ends it
         return [
             WalkStep("prefill", step_metadata={FINAL_PREFILL: True}),
-            WalkStep("decode", bind={"text_inputs": "new_token"}),
+            WalkStep("decode", bind={"text_inputs": "new_token"},
+                     step_metadata={PROMPT_LEN: model_kwargs[PROMPT_LEN]}),
         ]
 
     # -------------------------------------------------------------------
@@ -354,32 +316,36 @@ class Glm5NextModel(ByteLevelTextOutput, Model):
             input_ids = self.tokenizer(prompt, return_tensors="pt").input_ids[0]
 
         # Decode runs at least one step, and one more may already be scheduled
-        # when it stops, so the prompt leaves two steps' tokens of index_topk
+        # when it stops, so the prompt leaves two steps' tokens of the context
         # free (an MTP step keeps k + 1). A ValueError here reaches the client
         # as a 400.
-        limit = self.config.index_topk - 2 * (self.config.mtp_num_draft_tokens + 1)
+        limit = self.config.context_limit - 2 * (self.config.mtp_num_draft_tokens + 1)
         if input_ids.numel() > limit:
             raise ValueError(
                 f"prompt is {input_ids.numel()} tokens; GLM-5.3-Flash is served "
                 f"with at most {limit}"
             )
         n = input_ids.numel()
-        # a decode step writes one row, or under MTP its whole verify block (the rejected
-        # drafts stay as holes), so the KV pool sizes a request at its worst case
         block = self.config.mtp_num_draft_tokens + 1
         budget = kwargs.get("max_output_tokens")
         if block > 1 and budget is not None:
             # MTP decode stops two blocks short of the window (_mtp_check_stop), so a max_tokens
             # past that is refused here rather than cut short
-            room = self.config.index_topk - 2 * block + 1 - n
+            room = self.config.context_limit - 2 * block + 1 - n
             if budget > room:
                 raise ValueError(
                     f"max_tokens={budget} after a {n}-token prompt: GLM-5.3-Flash with MTP "
                     f"emits at most {room} tokens after it"
                 )
-        layout = LabelLayout(spans=(Span("ids", "prefill", n, n, "text_inputs"),), growth=(("decode_loop", block),))
+        prompt = Span("ids", "prefill", n, n, "text_inputs")
+        layouts = {
+            KV_CACHE: {"main": Layout(spans=(prompt,), growth=(("decode_loop", block),))},
+            KDA_STATE: {"main": Layout()},
+        }
+        if self.config.mtp_num_draft_tokens:
+            layouts[MTP_SEED] = {"main": Layout()}
         return ProcessPromptOutput(
-            {"text_inputs": [input_ids.to(torch.long)]}, {"kv_layout": {KV_CACHE: {"main": layout}}},
+            {"text_inputs": [input_ids.to(torch.long)]}, {"state_layout": layouts, PROMPT_LEN: n},
         )
 
     def _render_chat(self, prompt: str, prompt_parts: list[PromptPart] | None) -> torch.Tensor:
@@ -408,19 +374,17 @@ class Glm5NextModel(ByteLevelTextOutput, Model):
 
     def max_decode_steps(self) -> int:
         """Decode iterations a one-token prompt can run before its context
-        reaches index_topk or its cache rows reach kv_rows (an MTP step stores
-        k + 1); check_stop stops every request before either."""
-        cfg = self.config
-        return min(cfg.index_topk - 1, (cfg.kv_rows - 1) // (cfg.mtp_num_draft_tokens + 1))
+        reaches the limit; check_stop stops every request before it."""
+        return self.config.context_limit - 1
 
     def get_max_output_tokens(self, **model_kwargs):
-        # A request that names none runs as far as the decode loop can (under MTP the cache
-        # rows bind first), and the conductor fits it to the room its prompt leaves. One that
-        # names more than index_topk, which a one-token prompt's window holds, is refused by
-        # the conductor: its decode loop cap is past max_iters.
+        # A request that names none runs as far as the decode loop can, and the conductor fits
+        # it to the room its prompt leaves. One that names more than the context, which a
+        # one-token prompt's window holds, is refused by the conductor: its decode loop cap is
+        # past max_iters.
         budget = normalize_generation_kwargs(model_kwargs).get("max_output_tokens", self.config.max_output_tokens)
         if budget is None:
-            return min(self.config.index_topk, self.max_decode_steps() + 1)
+            return self.config.context_limit
         return budget
 
     def request_kwargs(self) -> frozenset[str]:
@@ -498,8 +462,6 @@ class Glm5NextModel(ByteLevelTextOutput, Model):
         self._load_checkpoint(language_model, source, device, tp_group)
         process_weights_after_loading(language_model, torch.device(device))
         language_model.eval()
-        # The declared conv-tail dtype must match the loaded projections.
-        self.kda_conv_dtype = language_model.kda_conv_dtype()
 
         logger.info("Successfully loaded GLM-5.3-Flash submodule for %s", node_name)
         return Glm5NextLLMSubmodule(

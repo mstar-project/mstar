@@ -1,12 +1,27 @@
 """The mHC kernels in ``fused_decode``, and a whole decoder layer on the fused kernels, against
 the torch reference on CUDA. The KDA kernels' own parity tests are in test_kda_triton.py."""
+import contextlib
+
 import pytest
 import torch
 
-from mstar.engine.resources.convenience import KDACallable
 from mstar.engine.resources.linear_attn.kda import KDAPlan
 from mstar.engine.resources.linear_attn.kda_torch import TorchKDAKernels
 from mstar.engine.resources.linear_attn.kda_triton import TritonKDAKernels
+from mstar.engine.resources.step import Segment, StepContext, SubmoduleStep
+from mstar.engine.state import (
+    Array,
+    ArrayStep,
+    Attend,
+    Causal,
+    Entry,
+    KimiDelta,
+    KVEntry,
+    Read,
+    TensorType,
+    Value,
+)
+from mstar.engine.state.adapters import StateSetup, _resolve, build_handle
 from mstar.model.components.norm import RMSNorm
 from mstar.model.glm5_next import fused_decode
 from mstar.model.glm5_next.components.decoder_layer import Glm5NextDecoderLayer
@@ -71,6 +86,9 @@ class _Kda:
     def __init__(self, plan, kernels):
         self.plan, self.kernels = plan, kernels
 
+    def bind_layer(self, **gates):
+        return
+
     def current_plan(self, label=None):
         return self.plan
 
@@ -78,15 +96,41 @@ class _Kda:
         return self.kernels.run_paged(qkv, g, beta, self.plan, conv, state, params, gate=gate)
 
 
+_KV = Array("kv", nodes={"LLM"}, layers={0}, entry=KVEntry(heads=1, head_dim=8), max_len=8,
+            reads={"attn": Read(mask=Causal(), op=Attend(q_heads=1))})
+
+
+class _Value:
+    """A KDA layer's Value over one layer's pool blocks, whose steps the stub resource runs on ``plan``."""
+
+    def __init__(self, kda, rec, conv, plan, kernels):
+        h, d = kda.num_heads, kda.head_dim
+        entry = Entry({"conv": TensorType((3 * h * d, conv.shape[-1]), dtype=conv.dtype),
+                       "state": TensorType((h, d, d), dtype=torch.float32)})
+        value = Value("kda_state", nodes={"LLM"}, layers={int(kda.layer)}, entry=entry,
+                      updates={"kda": KimiDelta(lower_bound=kda.forget_gate.gate_lower_bound)})
+        self.resource = _Kda(plan, kernels)
+        self.h = build_handle(value, {"kda_state": _Pool(rec, conv), "kda": self.resource},
+                              _resolve([_KV, value], StateSetup()))
+        kda.bind_state({"kda_state": self.h})
+
+    @contextlib.contextmanager
+    def step(self):
+        """A step over the plan's rows, around the layer's calls."""
+        spans = self.resource.plan.spans
+        step = SubmoduleStep(segments=[Segment(row, "main", n) for row, n in enumerate(spans)],
+                             state={"kda_state": ArrayStep()})
+        step.set_ctx(StepContext(request_ids=tuple(range(len(spans))), graph_walk="decode", slot=0, capture=False))
+        self.h.begin_step(step)
+        yield
+        self.h.end_step(step)
+
+
 def _decode_plan(slots):
     slots = slots.to(torch.int32)
     n = slots.shape[0]
     return KDAPlan(slot_ids=slots, has_state=torch.ones_like(slots, dtype=torch.bool),
                    spans=(1,) * n, num_tokens=n, is_decode=True)
-
-
-def _bind(kda, rec, conv, plan, kernels):
-    kda.mix = KDACallable(_Pool(rec, conv), _Kda(plan, kernels))
 
 
 # -- mHC ---------------------------------------------------------------------
@@ -216,18 +260,20 @@ def test_kda_layer_fused_matches_reference(batch, monkeypatch):
         "conv": torch.randn(batch + 1, 3 * heads * dim, 3, device="cuda").to(torch.bfloat16),
     }
     plan = _decode_plan(torch.arange(1, batch + 1, device="cuda"))
-    _bind(layer.self_attn, pools["state"], pools["conv"], plan, TritonKDAKernels())
+    value = _Value(layer.self_attn, pools["state"], pools["conv"], plan, TritonKDAKernels())
     streams = torch.randn(1, batch, cfg.hc_mult, cfg.hidden_size, device="cuda",
                           dtype=torch.bfloat16)
     saved = {k: v.clone() for k, v in pools.items()}
     with torch.no_grad():
-        out = layer(streams)
+        with value.step():
+            out = layer(streams)
         fused_pools = {k: v.clone() for k, v in pools.items()}
         for k, v in saved.items():
             pools[k].copy_(v)
-        layer.self_attn.mix.attn.kernels = TorchKDAKernels()
+        value.resource.kernels = TorchKDAKernels()
         monkeypatch.setattr(fused_decode, "_ENABLED", False)
-        ref = layer(streams)
+        with value.step():
+            ref = layer(streams)
     torch.testing.assert_close(out, ref, rtol=3e-2, atol=3e-2)
     for k, ref_pool in pools.items():
         torch.testing.assert_close(fused_pools[k], ref_pool, rtol=1e-2, atol=1e-2)

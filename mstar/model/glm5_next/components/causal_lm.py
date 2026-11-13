@@ -43,9 +43,10 @@ class Glm5NextLanguageModel(nn.Module):
         input_ids: torch.Tensor,
         return_prenorm: bool = False,
         rows: torch.Tensor | None = None,
+        decode: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         """``input_ids (T,)`` flat batch -> ``(T, hidden)`` final hidden, or only its
-        ``rows``."""
+        ``rows``. ``decode``: the step decodes or verifies, rather than prefills."""
         hidden_states = self.embed_tokens(input_ids)
         # (1, T, hc_mult, hidden): one batch row over the flat tokens is exact, as mHC is per token
         hidden_streams = expand_streams(hidden_states.unsqueeze(0), self.hc_mult)
@@ -53,7 +54,7 @@ class Glm5NextLanguageModel(nn.Module):
         last = len(self.layers) - 1
         for idx, decoder_layer in enumerate(self.layers):
             hidden_streams, pending = decoder_layer.forward_carry(
-                hidden_streams, pending, rows=rows if idx == last else None)
+                hidden_streams, pending, rows=rows if idx == last else None, decode=decode)
         if pending is not None:
             hidden_streams = fused_decode.update_streams(hidden_streams, *pending)
         collapsed = self.hc_head(hidden_streams).squeeze(0)
@@ -82,14 +83,6 @@ class Glm5NextForCausalLM(nn.Module):
     def forward(self, input_ids: torch.Tensor, **kwargs) -> torch.Tensor:
         hidden_states = self.model(input_ids)
         return self.lm_head(hidden_states)
-
-    def kda_conv_dtype(self) -> torch.dtype:
-        """The KDA projection dtype: the pool's conv state must match it, because
-        the conv reads the tail alongside the projected activations."""
-        for layer in self.model.layers:
-            if layer.is_linear_attention:
-                return layer.self_attn.q_proj.weight.dtype
-        raise RuntimeError("no KDA layer in the schedule")  # unreachable by config
 
     def load_weights(self, weights, **kwargs) -> set[str]:
         from mstar.model.glm5_next.weight_loader import load_glm5_next_hf_weights

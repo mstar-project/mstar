@@ -21,26 +21,29 @@ from mstar.engine.resources import (
 )
 from mstar.engine.resources.base import EngineResourceInfo, Resource, build_resource
 from mstar.engine.resources.kv import manager as kv_mod
+from mstar.engine.resources.linear_attn.config import LinearAttnStep
 from mstar.engine.resources.linear_attn.kda import KDAPlan
 from mstar.engine.resources.linear_attn.kda_torch import TorchKDAKernels
 from mstar.engine.resources.linear_attn.kda_triton import TritonKDAKernels
 from mstar.engine.resources.recurrent.pool import SINK_SLOT, RecurrentStatePool
 from mstar.engine.resources.spec import resolve_spec_dependencies
 from mstar.engine.resources.step import StepContext
+from mstar.engine.state.adapters import node_handles
+from mstar.model.base import serving_resources
 from mstar.model.glm5_next.components.causal_lm import Glm5NextForCausalLM
 from mstar.model.glm5_next.components.moe import Glm5NextSparseMoeBlock
 from mstar.model.glm5_next.config import (
-    ATTN,
     KDA,
     KDA_STATE,
     KV_CACHE,
     LABEL,
+    PROMPT_LEN,
     SAMPLER,
     Glm5NextModelConfig,
 )
 from mstar.model.glm5_next.glm5_next_model import Glm5NextModel, process_weights_after_loading
 from mstar.model.glm5_next.submodules import Glm5NextLLMSubmodule
-from mstar.model.submodule_base import END_PARTITION, ARNodeInputs, HostRows, ModelInputsFromEngine
+from mstar.model.submodule_base import END_PARTITION, ARNodeInputs, HostRows, ModelInputsFromEngine, engine_step
 from mstar.testing_utils.engine import make_engine, make_mgmt
 from mstar.testing_utils.resource import StubResource
 
@@ -133,6 +136,7 @@ def _info(
     max_tokens: int = 64,
     ignore_eos: bool = False,
     decode_iters: int | None = 0,
+    prompt_len: int = 4,
 ) -> CurrentForwardPassInfo:
     counts = {} if decode_iters is None else {"decode_loop": decode_iters}
     return CurrentForwardPassInfo(
@@ -140,6 +144,8 @@ def _info(
         max_tokens=max_tokens,
         resource_configs={SAMPLER: SamplingReqConfig(temperature=0.0, ignore_eos=ignore_eos)},
         dynamic_loop_iter_counts=counts,
+        # the walk plan puts the prompt's length in the decode step's metadata alone
+        step_metadata={PROMPT_LEN: prompt_len} if walk == "decode" else {},
     )
 
 
@@ -159,13 +165,13 @@ def _padding_input() -> ARNodeInputs:
 
 
 class _Harness:
-    """The submodule bound to the model's real resources, driven by a
+    """The submodule bound to the model's real resources and its handles over them, driven by a
     ``StepRunner`` the way the engine drives it."""
 
     def __init__(self, seed: int = 0, dtype: torch.dtype = torch.float32, max_slots: int = MAX_SLOTS):
         self.model, self.lm, self.cfg = _build_model(seed=seed, dtype=dtype, max_slots=max_slots)
         self.sub = Glm5NextLLMSubmodule(self.lm, self.cfg)
-        specs = self.model.get_node_resources()
+        specs = serving_resources(self.model, {})
         by_key = resolve_spec_dependencies(specs)
         self.resources: dict[str, Resource] = {}
         for spec in specs:
@@ -179,15 +185,16 @@ class _Harness:
             self.resources[spec.resource_key] = build_resource(spec, info)
         self.runner = StepRunner(self.resources, node_resources={"LLM": list(self.resources)})
         self.sub.bind_node_resources(self.resources)
+        self.sub.bind_node_state(node_handles(self.model, "LLM", self.resources))
         self.kv = self.resources[KV_CACHE]
         self.pool = self.resources[KDA_STATE]
         self.kda = self.resources[KDA]
         self.last_step: SubmoduleStep | None = None
 
-    def context(self, rid: str) -> int:
-        """The tokens the submodule counts as the request's context."""
-        state = self.sub.request_states.get(rid)
-        return 0 if state is None else state.get("context", 0)
+    def stored(self, rid: str) -> int:
+        """The request's rows in the latent pool, 0 for one that holds none."""
+        stream = self.kv._streams.get(rid)
+        return 0 if stream is None else stream[LABEL].stored_len
 
     @property
     def usable(self) -> int:
@@ -224,7 +231,7 @@ class _Harness:
         ctx = StepContext(request_ids=tuple(rids), graph_walk=walk, slot=0, capture=False)
         if padded is not None:
             ctx.set_padded_rids(tuple(step_rids))
-        step = self.sub.declare_step(walk, step_rids, node_inputs)
+        step = engine_step(self.sub, walk, step_rids, node_inputs)
         step.set_ctx(ctx)
         admit = self.runner.admit(step)
         assert admit.ok, admit.reason
@@ -232,12 +239,16 @@ class _Harness:
         engine_inputs = ModelInputsFromEngine(
             request_ids=step_rids, per_request_info={}, resources=self.resources, step=step,
         )
+        step.begin_calls()
         pre = self.sub.preprocess(walk, engine_inputs, node_inputs)
         # the engine runs exec under no_grad (engine.py); the MLA layers'
         # absorbed projections are built from live params and carry grad_fn
         with torch.no_grad():
             raw = self.sub.forward_batched(walk, engine_inputs, **pre)
+        step.check_calls()
         self.runner.commit(step)
+        step.commit_calls()
+        step.end_calls()
         rows = raw.row_outputs["new_token"]
         out = {rid: {"new_token": [rows[i : i + 1]]} for i, rid in enumerate(step_rids)}
         # the engine's per-request tail, after the forward
@@ -275,11 +286,10 @@ class TestConstruction:
         assert sub.config is model.config
         assert sub.lm_head is sub.language_model.lm_head
         assert not sub.language_model.training
-        # the declared conv-tail dtype follows the loaded projections, so the pool the engine
-        # builds next matches the layer
-        assert model.kda_conv_dtype == torch.float32
-        kda_spec = next(s for s in model.get_node_resources() if s.resource_key == KDA_STATE)
-        assert kda_spec.config.blocks["conv"].dtype == torch.float32
+        # the declared conv-tail dtype stays the model kwarg's after load, since a declaration reads no process state;
+        # the KDA layer compares it with its projections at bind
+        (kda,) = (array for array in model.declare_state() if array.name == KDA_STATE)
+        assert kda.entry.tensors["conv"].dtype == model.kda_conv_dtype == torch.bfloat16
         assert sub.node_resources == {}
 
         # non-LLM nodes have no submodule, and a dummy build (no checkpoint) is None
@@ -289,7 +299,7 @@ class TestConstruction:
 
 
 class TestDeclareStep:
-    def test_a_step_declares_every_resource_and_tracks_only_the_prompt(self):
+    def test_a_step_declares_every_array_and_tracks_only_the_prompt(self):
         _model, lm, cfg = _build_model(seed=1)
         sub = Glm5NextLLMSubmodule(lm, cfg)
         ids = {"a": torch.arange(5), "b": torch.arange(3)}
@@ -298,18 +308,16 @@ class TestDeclareStep:
         step = sub.declare_step("prefill", list(ids), inputs)
 
         assert step.segments == [Segment("a", LABEL, 5), Segment("b", LABEL, 3)]
-        assert set(step.keys()) == {KV_CACHE, ATTN, SAMPLER, KDA_STATE, KDA}
-        for key in step.keys():
-            assert step.get(key).segments is step.segments, key
+        assert set(step.state) == {KV_CACHE, KDA_STATE, SAMPLER}
         # the prompt goes to the sampler's seen-token mask, for the repetition penalty
-        sampler = step.get(SAMPLER)
+        sampler = step.state[SAMPLER]
         assert sampler.apply_penalty is True
-        assert list(sampler.prefill_tracked_tokens) == ["a", "b"]
-        assert all(sampler.prefill_tracked_tokens[rid] is ids[rid] for rid in ids)
+        assert list(sampler.prompt_tokens) == ["a", "b"]
+        assert all(sampler.prompt_tokens[rid] is ids[rid] for rid in ids)
 
         decode = sub.declare_step("decode", ["a", "b"], [_padding_input(), _padding_input()])
         assert decode.segments == [Segment(rid, LABEL, 1) for rid in ("a", "b")]
-        assert decode.get(SAMPLER).prefill_tracked_tokens == {}
+        assert decode.state[SAMPLER].prompt_tokens == {}
 
     def test_rid_input_mismatch_is_loud(self):
         _model, lm, cfg = _build_model(seed=1)
@@ -334,13 +342,13 @@ class TestPreprocess:
             assert pre["input_ids"].dtype == torch.long
 
     def test_prepare_inputs_counts_committed_tokens(self):
-        """The cap is on the context, the tokens of the steps that ran plus this step's; the
-        refusal runs before any admit, so it leaks nothing."""
+        """The cap is on the context, the prompt and the tokens emitted before this step plus
+        this step's; the refusal runs before any admit, so it leaks nothing."""
         h = _Harness(seed=3)
         h.ingest("r", "other")
-        limit = h.cfg.index_topk
+        limit = h.cfg.context_limit
         h.step("prefill", {"r": torch.arange(4)})
-        assert h.context("r") == 4
+        assert h.stored("r") == 4
         holders_before = _holders(h.pool)
         free_before = h.pool.num_free_slots
 
@@ -348,14 +356,14 @@ class TestPreprocess:
         out = h.prepare("decode", "r", torch.zeros(limit - 4, dtype=torch.long))
         assert out.input_seq_len == limit - 4
         # one past it is refused
-        with pytest.raises(RuntimeError, match=r"exceeds index_topk"):
+        with pytest.raises(RuntimeError, match=rf"context {limit + 1} exceeds {limit}"):
             h.prepare("decode", "r", torch.zeros(limit - 3, dtype=torch.long))
         # another request with no history still gets the full budget
         assert h.prepare("prefill", "other", torch.zeros(limit, dtype=torch.long)).input_seq_len == limit
 
         assert _holders(h.pool) == holders_before
         assert h.pool.num_free_slots == free_before
-        assert h.context("r") == 4
+        assert h.stored("r") == 4
         h.remove("r", "other")
 
 
@@ -402,10 +410,10 @@ class TestCudaGraphs:
 
     @pytest.mark.parametrize("fused_kda", [False, True])
     def test_prefill_rows_follow_the_captured_prefill(self, monkeypatch, fused_kda):
-        """Prefill is captured only on the kernels the KDA resource picked if they capture it
-        (the fused ones), and the engine holds a captured prefill to the largest graph the
-        pool holds rows for: a larger step would run eager and compile the MoE decode kernels
-        for its row count mid-serve. An eager prefill is held to the free slots alone."""
+        """The engine holds a captured prefill to the largest graph the pool holds rows for: a
+        larger step would run eager and compile the MoE decode kernels for its row count
+        mid-serve. The torch KDA kernels can't replay a prefill, so the runner drops its configs,
+        and an eager prefill is held to the free slots alone."""
         h = _Harness(seed=35)
         sub = h.sub
         monkeypatch.setattr(h.kda, "kernels", TritonKDAKernels() if fused_kda else TorchKDAKernels())
@@ -413,14 +421,19 @@ class TestCudaGraphs:
         sub.config.prefill_capture_batch_sizes = [1, 2, h.usable + 1]
 
         def engine_cap(walk: str) -> int | None:
+            configs = sub.get_accelerator_graph_configs(DEVICE)
+            prefill = LinearAttnStep(segments=(Segment("r", LABEL, 128),))
             runner = AcceleratorGraphRunner.__new__(AcceleratorGraphRunner)
-            runner._capture_configs = sub.get_accelerator_graph_configs(DEVICE)
-            runner._blocked_configs = frozenset()
+            runner._capture_configs = configs
+            runner._blocked_configs = frozenset(
+                i for i, config in enumerate(configs)
+                if config.capture_graph_walk == "prefill" and not h.kda.can_capture(prefill)
+            )
             engine = make_engine(_submodules={"LLM": make_mgmt(submodule=sub, capture_runner=runner)})
             return engine.get_max_batch_size("LLM", walk)
 
         walks = [c.capture_graph_walk for c in sub.get_accelerator_graph_configs(DEVICE)]
-        assert walks == (["decode", "prefill"] if fused_kda else ["decode"])
+        assert walks == ["decode", "prefill"]
         assert engine_cap("prefill") == (2 if fused_kda else h.usable)
         assert sub.max_batch_size("decode") == h.usable
         # no graphs at all (the fp8 reference MoE): prefill runs eager
@@ -538,8 +551,8 @@ class TestPaddedRows:
         # the real row resumes its state; the padding row reads the sink as zeros
         assert plan.has_state.tolist() == [True, False]
         # commit: the real row only; the padding row leased nothing
-        assert h.context("r0") == len(prompt) + 1
-        assert h.context(pad) == 0
+        assert h.stored("r0") == len(prompt) + 1
+        assert h.stored(pad) == 0
         assert _slot_of(h.pool, pad) is None
         assert h.pool.num_free_slots == h.usable - 1
 

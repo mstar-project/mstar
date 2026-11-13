@@ -1,7 +1,7 @@
 """Kimi delta attention planned against the recurrent state pool.
 
 As in ``gdn.py``, the pool's addressing arrives through ``ctx.plan_results`` and a
-layer's blocks reach ``run`` as tensors, which ``convenience.KDACallable`` resolves.
+layer's blocks reach ``run`` as tensors, which a KDA Value's handle resolves.
 The math is a kernel bundle's, which the resource picks from the pool and its layers' gates:
 ``kda_triton.TritonKDAKernels`` where they run it, ``kda_torch.TorchKDAKernels``
 elsewhere. A bundle implements ``layout`` (the token layout its prefill reads, or
@@ -284,7 +284,7 @@ class KDAManager(LinearAttnManager):
                     plan.capture_key = key
                 elif key not in self._cg_settled:
                     raise RuntimeError(
-                        f"kda: the capture of {key} ran no set_prefix_len, so its replays "
+                        f"kda: the capture of {key} ran no settle, so its replays "
                         "would leave each verify step's count unsettled"
                     )
         elif not is_decode and self.kernels is not None:
@@ -347,7 +347,7 @@ class KDAManager(LinearAttnManager):
             for label, plan in self._current.items():
                 if not plan.settled:
                     raise RuntimeError(
-                        f"kda: a verify step under {label!r} ended without set_prefix_len"
+                        f"kda: a verify step under {label!r} ended without a settle"
                     )
         self._verifying.update(ctx.request_ids)
 
@@ -358,13 +358,13 @@ class KDAManager(LinearAttnManager):
 
     @torch.compiler.disable
     def settle_verify(self, label: str | None = None) -> KDAPlan:
-        """This verify step's plan, for ``KDACallable.set_prefix_len`` to write its accepted
-        count; once per step."""
+        """This verify step's plan, for a KDA Value's settle to write its accepted count;
+        once per step."""
         plan = self.current_plan(label)
         if not plan.is_verify:
-            raise RuntimeError("kda: set_prefix_len after a step that didn't verify")
+            raise RuntimeError("kda: a settle after a step that didn't verify")
         if plan.settled:
-            raise RuntimeError("kda: set_prefix_len twice for one verify step")
+            raise RuntimeError("kda: a second settle in one verify step")
         plan.settled = True
         if plan.capture_key is not None:
             self._cg_settled.add(plan.capture_key)

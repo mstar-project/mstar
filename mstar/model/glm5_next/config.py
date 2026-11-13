@@ -9,19 +9,20 @@ FULL_ATTENTION = "deepseek_sparse_attention"
 DENSE_MLP = "dense"
 SPARSE_MLP = "sparse"
 
-# Resource keys the model declares in get_node_resources and the layers
-# bind by (bind_resources); the serving YAML tunes them under `resources:`.
-KV_CACHE = "kv_cache"      # MLA latent pages of the full-attention layers and the MTP layer
-ATTN = "attn"              # the absorbed-MLA attention backend over KV_CACHE
+# The arrays the model declares and the layers bind by; the serving YAML sizes their pools under `resources:`.
+KV_CACHE = "kv_cache"      # MLA latents of the full-attention layers and the MTP layer
+ATTN = "attn"              # KV_CACHE's absorbed-MLA read
 SAMPLER = "sampler"
-KDA_STATE = "kda_state"    # recurrent pool: the conv and delta-rule state of the 34 KDA layers
-KDA = "kda"                # the KDA linear attention run against KDA_STATE
-# KDA_STATE blocks held per request with MTP: the MTP state that drafts the next
-# step's first token, and that draft
-MTP_HIDDEN = "mtp_hidden"
-MTP_DRAFT = "mtp_draft"
+KDA_STATE = "kda_state"    # the conv and delta-rule state of the 34 KDA layers
+KDA = "kda"                # KDA_STATE's Kimi delta update
+# With MTP, the MTP state that drafts the next step's first token, and that draft
+MTP_SEED = "mtp_seed"
 # The one cache stream label glm5_next uses (single-label model).
 LABEL = "main"
+# the prompt's length, which `process_prompt` hands to the walk's step metadata
+PROMPT_LEN = "prompt_len"
+# With MTP, the tokens a request has emitted, which its walks carry from step to step
+COUNT = "count"
 
 # Full attention at idx % 4 == 3, KDA elsewhere; _validate holds every config,
 # reduced ones included, to it.
@@ -291,19 +292,10 @@ class Glm5NextModelConfig:
         return self.qk_head_dim ** -0.5
 
     @property
-    def mla_cache_kpe(self) -> int:
-        """Rope-slot width of the MLA latent cache. NoPE needs none; MTP keeps
-        a 64-wide slot to mask rejected draft rows."""
-        return 64 if self.mtp_num_draft_tokens > 0 else 0
-
-    @property
-    def kv_rows(self) -> int:
-        """Cache rows a request may hold. Its real context is held to
-        max_seq_len; under MTP each verify step also leaves its rejected drafts
-        as holes. Admission books every step's whole block (no draft accepted),
-        so k + 1 rows a token keep the rows from refusing a request its context
-        holds. Pages are taken as the rows fill, so the bound allocates nothing."""
-        return self.max_seq_len * (self.mtp_num_draft_tokens + 1)
+    def context_limit(self) -> int:
+        """The longest context served: dense MLA computes exactly what DSA would only within
+        index_topk."""
+        return min(self.index_topk, self.max_seq_len)
 
     @property
     def padded_head_dim(self) -> int:

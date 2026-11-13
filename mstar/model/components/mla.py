@@ -236,6 +236,10 @@ class MLAAttention(nn.Module):
             if q_pe is None:
                 self.state.add(self.layer, keep=keep, k=k, v=v)
                 return self.state.read(self.layer, q)
+            if not self.qk_rope_head_dim:
+                # no decoupled dims: the entry is ckv alone, and the read takes no rope query
+                self.state.add(self.layer, keep=keep, ckv=k)
+                return self.state.read(self.layer, q)
             self.state.add(self.layer, keep=keep, ckv=k[:, :self.kv_lora_rank], kpe=k[:, self.kv_lora_rank:])
             return self.state.read(self.layer, q, q_pe=q_pe, selected=selected)
         layer_idx = self.cache_layer_idx
@@ -389,7 +393,7 @@ class MLAAttention(nn.Module):
         q_nope_all[:, row] = torch.einsum("thd,hdl->thl", q_nope, self.w_kc)
         attn = self._write_and_attend(
             q_nope_all.view(n * block, h, -1), latents.view(n * block, -1), None,
-            q_pe=q_pe_all.view(n * block, h, -1), keep=False)
+            q_pe=q_pe_all.view(n * block, h, q_pe_all.shape[-1]), keep=False)
         out = self._out(attn.view(n, block, h, -1)[:, row])
         return self.o_proj(out)
 
