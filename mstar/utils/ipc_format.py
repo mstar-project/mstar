@@ -37,6 +37,7 @@ class WorkerMessageType(Enum):
     NEW_REQUEST = "new_request"
     DRAIN_REQUEST = "drain_request"
     REMOVE_REQUEST = "remove_request"
+    END_EPISODE = "end_episode"
     INPUT_SIGNALS = "input_signals"
     EDGE_ITEMS = "edge_items"
     UNPERSIST_TENSORS = "unpersist"
@@ -73,6 +74,12 @@ class RemoveRequest(MessageBody):
     # broadcast, so they tear the request down at the same point in the step
     # sequence it did, maintaining KV cache state symmetry.
     after_tp_seq: int = -1
+
+
+@dataclass
+class EndEpisode(MessageBody):
+    episode_id: str
+    episode_slot: int
 
 
 @dataclass
