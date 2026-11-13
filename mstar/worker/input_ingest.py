@@ -177,9 +177,10 @@ class InputIngest:
 
     def _add_new_request(self, body: NewRequest) -> None:
         wire_rid = body.request_id
-        if (body.episode_slot is not None and self._runtime.get_rid_handle(wire_rid) is None
-                and self._engines.episode_slot_busy(body.episode_slot)):
-            self._pending_episode_requests.setdefault(body.episode_slot, []).append(body)
+        episode_slot = getattr(body, "episode_slot", None)
+        if (episode_slot is not None and self._runtime.get_rid_handle(wire_rid) is None
+                and self._engines.episode_slot_busy(episode_slot)):
+            self._pending_episode_requests.setdefault(episode_slot, []).append(body)
             return
         lifecycle = self._lifecycle
         # Any worker can handle a DRAIN before the conductor's NEW_REQUEST, and a TP follower gets rank 0's. After
@@ -218,11 +219,17 @@ class InputIngest:
                 unheld = () if self._set_rebuildable is None else self._set_rebuildable(
                     rid, body.request_info.resource_configs,
                 )
-                self._engines.add_request(
-                    rid, body.request_info.resource_configs, body.request_info,
-                    episode_id=body.episode_id, episode_slot=body.episode_slot,
-                    reset_episode=body.reset_episode, episode_clear=body.episode_clear,
-                )
+                episode_id = getattr(body, "episode_id", None)
+                reset = getattr(body, "reset_episode", False)
+                clear = getattr(body, "episode_clear", ())
+                if episode_slot is None and episode_id is None and not reset and not clear:
+                    self._engines.add_request(rid, body.request_info.resource_configs, body.request_info)
+                else:
+                    self._engines.add_request(
+                        rid, body.request_info.resource_configs, body.request_info,
+                        episode_id=episode_id, episode_slot=episode_slot,
+                        reset_episode=reset, episode_clear=clear,
+                    )
                 # Rank 0 journals each refused log once the engine holds the request, since a follower's replay
                 # changes the request's KV config.
                 for node in unheld:
