@@ -100,6 +100,12 @@ def test_an_eager_read_builds_the_dense_kernel_under_its_own_key():
     assert specs["attn_gen"].config.backend is AttnBackend.DENSE, "the eager steps would run the paged kernel"
 
 
+def test_the_split_checks_take_an_eager_read_for_a_paged_one():
+    setup, _ = state_setup({}, [_eager()], EAGER)
+    sdpa_reads = [read for read, binding in setup.by_read.items() if not binding.plans]
+    assert sdpa_reads == [], "the engine and validate_deployment would raise reading plans on the eager binding"
+
+
 def test_a_leased_step_plans_the_paged_kernel_and_others_the_dense():
     h = _handle()
     assert {leased: sorted(_expanded(h, leased).steps.keys() - {"kv"}) for leased in (False, True)} == {
