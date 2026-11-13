@@ -774,6 +774,34 @@ def test_tensor_state_is_optional(tmp_path):
     assert "robot_state" not in server.submitted[0]["model_kwargs"]
 
 
+@pytest.mark.parametrize("refused", [False, True])
+def test_a_submit_schedules_its_uploads_for_cleanup(tmp_path, monkeypatch, refused):
+    """The bridges save a request's media under upload_dir, and nothing past the
+    submit deletes it, so each submit hands it to the deferred cleanup the
+    native routes use, also when the server refuses it."""
+    from mstar.api_server import media_io
+    from mstar.api_server.openai.adapters import SubmitArgs
+    from mstar.integrations.dynamo.bridges import _submit
+
+    scheduled = []
+    monkeypatch.setattr(media_io, "schedule_upload_cleanup", lambda paths, root: scheduled.append((paths, root)))
+
+    class Server(_FakeRealtimeServer):
+        def submit_request(self, **kwargs):
+            super().submit_request(**kwargs)
+            if refused:
+                raise ValueError("refused")
+
+    server = Server([], tmp_path)
+    args = SubmitArgs(text="hi", file_paths={"image": [str(tmp_path / "a.png")]}, input_modalities=["image", "text"])
+    if refused:
+        with pytest.raises(ValueError, match="refused"):
+            _submit(server, args, "req")
+    else:
+        _submit(server, args, "req")
+    assert server.submitted and scheduled == [(args.file_paths, server.upload_dir)]
+
+
 def test_tensor_prompt_as_bytes(tmp_path):
     # The request-plane codec may deliver Bytes elements as byte strings
     # instead of int lists; both must decode.
