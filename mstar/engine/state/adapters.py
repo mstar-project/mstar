@@ -1681,7 +1681,7 @@ class BoundedHandle(ArrayHandle):
         self._attend = self.reads[next(iter(array.reads))]
         self._kv = resources[array.name]
 
-    def written(self, rid: int) -> int:
+    def written(self, rid: str) -> int:
         """The entries the bounded KV committed for ``rid``."""
         return self._kv.written(rid)
 
