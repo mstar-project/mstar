@@ -11,6 +11,7 @@ from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.engine import ForwardPassInfoWrapper
 from mstar.engine.resources import SamplingReqConfig
 from mstar.engine.resources.kv.manager import SpanCursor
+from mstar.engine.state import Layout
 from mstar.model.base import LabelLayout, Span
 from mstar.model.submodule_base import InputMetadata
 
@@ -77,7 +78,10 @@ def _pointer(tensor: torch.Tensor):
 
 
 def _bagel_request(model, prompt, input_modalities, output_modalities, kwargs):
+    from test_bagel_guidance_sink import _model
+
     from mstar.conductor.request_info import DEFAULT_PARTITION
+    from mstar.engine.state.adapters import kv_layouts
     from mstar.model.bagel.submodules import (
         DENOISE_WALKS,
         IMAGE_SENTINELS,
@@ -92,13 +96,15 @@ def _bagel_request(model, prompt, input_modalities, output_modalities, kwargs):
     tensors = out.new_input_tensors
     signals = {name: [_pointer(t) for t in by_name] for name, by_name in tensors.items()}
     # what the data worker folds into model_kwargs from process_prompt
-    stamped = {key: value for key, value in out.metadata.items() if key != "kv_layout"}
+    stamped = {key: value for key, value in out.metadata.items() if key not in ("state_layout", "keyed_spans")}
     request_kwargs = {**kwargs, **stamped}
     plan = model.walk_plan(DEFAULT_PARTITION, input_modalities, output_modalities, signals, request_kwargs)
     config = model.get_request_resource_configs(input_modalities, output_modalities, request_kwargs)["kv"]
     cap = model.get_loop_caps(max_output_tokens=6)["decode_loop"]
+    # as the data worker converts them
+    layouts = kv_layouts(_model().declare_state(), out.metadata["state_layout"], out.metadata.get("keyed_spans", {}))
     config.apply_conductor_config(
-        kv_layout={label: layout.row() for label, layout in out.metadata["kv_layout"]["kv"].items()},
+        kv_layout={label: layout.row() for label, layout in layouts["kv"].items()},
         loop_caps={"decode_loop": cap},
     )
     vae = VAEEncoderSubmodule(
@@ -154,6 +160,8 @@ class _BagelPool:
         self.llm = _llm()
 
     def step(self, walk: str, rows: dict, guided: dict) -> None:
+        from test_bagel_guidance_sink import _kv_step
+
         from mstar.engine.resources import StepContext
         from mstar.engine.resources.step import SubmoduleStep
         from mstar.model.submodule_base import ARNodeInputs
@@ -164,10 +172,9 @@ class _BagelPool:
             if walk not in {"prefill_text", "decode"}:
                 positions = torch.zeros(count, dtype=torch.int32)
                 inputs[-1].custom_pos_ids = dict.fromkeys(("main", "cfg_text", "cfg_img"), positions)
-        declared = self.llm.declare_step(walk, list(rows), inputs, per_request_info={})
-        kv_step = declared.steps["kv"]
+        kv_step = _kv_step(self.llm, walk, list(rows), inputs, per_request_info={})
         submodule_step = SubmoduleStep(
-            steps={"kv": kv_step}, segments=list(kv_step.segments), combined_labels=declared.combined_labels,
+            steps={"kv": kv_step}, segments=list(kv_step.segments), combined_labels=kv_step.combined_labels,
         )
         submodule_step.set_ctx(StepContext(request_ids=tuple(rows), graph_walk=walk, slot=0, capture=False))
         assert self.runner.admit(submodule_step).outcome.ok
@@ -298,18 +305,27 @@ def test_a_reference_clip_is_laid_out_at_the_tokens_the_tokenizer_makes_of_it(va
         assert int(lens[0]) == reference_tokens(samples, config), f"a {samples}-sample clip is laid out wrong"
 
 
-@pytest.mark.parametrize(("cfg_weight", "clip"), [(0.0, False), (0.5, False), (0.5, True)])
-def test_chatterbox_lays_out_every_label_it_declares(cfg_weight, clip):
+@pytest.mark.parametrize(("cfg_weight", "clip", "labels"), [
+    (0.0, False, {"main"}), (0.5, False, {"main", "uncond"}), (0.5, True, {"main", "uncond"}),
+])
+def test_chatterbox_opens_the_labels_its_guidance_lays_out(cfg_weight, clip, labels):
     from test_chatterbox_model import _make_model, _tone
+
+    from mstar.conductor.conductor import Conductor
+    from mstar.engine.state.adapters import kv_layouts
 
     model = _make_model()
     tensors = {"audio_inputs": [_tone(2.0)]} if clip else None
-
     output = model.process_prompt("hello", ["text", "audio"] if clip else ["text"], ["audio"],
                                   tensors=tensors, cfg_weight=cfg_weight)
+    layout = kv_layouts(model.declare_state(), output.metadata["state_layout"], {})
 
-    opened = model.get_request_resource_configs([], [], {"cfg_weight": cfg_weight})["t3_kv"].opened_labels()
-    assert set(output.metadata["kv_layout"]["t3_kv"]) == opened, "the layout doesn't name the labels the request opens"
+    conductor = SimpleNamespace(
+        model=model, _declarations=model.declare_state, _node_resources=list,
+        _kv_labels={key: tuple(labels) for key, labels in model.kv_labels().items()},
+    )
+    configs = Conductor._get_resource_configs(conductor, [], [], {"cfg_weight": cfg_weight, "kv_layout": layout})
+    assert configs["t3_kv"].opened_labels() == labels, "an unguided request would open a stream it never lays out"
 
 
 class _Cosmos3Tokenizer:
@@ -409,7 +425,7 @@ def test_fish_lays_out_the_rows_its_prefill_builds(clone):
 
     output = model.process_prompt("hi", ["text", "audio"] if clone else ["text"], ["audio"], tensors, ref_text="r")
 
-    layout = output.metadata["kv_layout"]
+    layout = output.metadata["state_layout"]
     [span] = layout[AR_KV]["main"].spans
     assert span.walk == ("ar_prefill_clone" if clone else "ar_prefill")
     prefix_len, frames = output.metadata[PROMPT_LAYOUT_KEY]
@@ -588,12 +604,12 @@ def test_qwen3_tts_lays_out_the_rows_its_prefill_builds(variant, text, kwargs):
         text, ["audio", "text"] if clone else ["text"], ["audio"], tensors=tensors, **kwargs,
     )
 
-    layout, metadata = output.metadata["kv_layout"], output.metadata
+    layout, metadata = output.metadata["state_layout"], output.metadata
     [span] = layout[TALKER_KV]["main"].spans
     assert span.walk == ("talker_prefill_clone" if clone else "talker_prefill")
     frames = metadata[PROMPT_LAYOUT_KEY][4]
-    prefill = _tiny_qwen3_tts_talker()._build_prefill(
-        "r", torch.zeros_like(output.new_input_tensors["text_inputs"][0]), metadata[PROMPT_LAYOUT_KEY],
+    prefill, _ = _tiny_qwen3_tts_talker()._build_prefill(
+        torch.zeros_like(output.new_input_tensors["text_inputs"][0]), metadata[PROMPT_LAYOUT_KEY],
         speaker_id=40 if metadata[SPEAKER_ID_KEY] >= 0 else -1,
         language_id=41 if metadata[LANGUAGE_ID_KEY] >= 0 else -1,
         speaker_embed=torch.randn(16) if clone else None,
@@ -655,8 +671,8 @@ def test_vjepa2_lays_out_a_frame_per_rollout_iteration(extrinsics):
     if extrinsics:
         kwargs["extrinsics"] = [[0.3] * 6] * 5
 
-    rollout = model.process_prompt(None, ["video"], ["video"], rollout_horizon=5, **kwargs).metadata["kv_layout"]
-    once = model.process_prompt(None, ["video"], ["video"], **kwargs).metadata["kv_layout"]
+    rollout = model.process_prompt(None, ["video"], ["video"], rollout_horizon=5, **kwargs).metadata["state_layout"]
+    once = model.process_prompt(None, ["video"], ["video"], **kwargs).metadata["state_layout"]
 
     step = VJepa2ACRolloutPredictorSubmodule(None, model.config).prepare_inputs(
         "prefill_video_rollout", SimpleNamespace(dynamic_loop_iter_counts={"rollout_loop": 0}), {
@@ -665,8 +681,8 @@ def test_vjepa2_lays_out_a_frame_per_rollout_iteration(extrinsics):
         },
     )
     assert rollout[KV_CACHE]["main"].growth == (("rollout_loop", step.input_seq_len),)
-    assert once[KV_CACHE]["main"] == LabelLayout(), "a walk that never runs the rollout is laid out"
-    assert _vjepa2("masked").process_prompt(None, ["video"], ["video"]).metadata["kv_layout"] == {}
+    assert once[KV_CACHE]["main"] == Layout(), "a walk that never runs the rollout is laid out"
+    assert _vjepa2("masked").process_prompt(None, ["video"], ["video"]).metadata["state_layout"] == {}
 
 
 
@@ -757,7 +773,7 @@ def test_whisper_lays_out_the_forced_prompt_and_the_encoders_whole_window(second
 
     output = model.process_prompt(None, ["audio"], ["text"], tensors={"audio_inputs": [clip]}, **kwargs)
 
-    layout, tensors = output.metadata["kv_layout"], output.new_input_tensors
+    layout, tensors = output.metadata["state_layout"], output.new_input_tensors
     prompt = len(tensors["text_inputs"][0])
     spans = [(span.walk, span.length) for span in layout[KV_CACHE]["main"].spans]
     if language is None:

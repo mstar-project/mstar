@@ -13,13 +13,14 @@ from pathlib import Path
 
 from mstar.model.components.aut_encoder import AuTEncoderConfig
 from mstar.model.components.qwen3_lm import Qwen3LMConfig
-from mstar.model.keys import KV_CACHE, ROPE, SAMPLER  # noqa: F401 - the LLM's resources, under the scaffold's keys
+from mstar.model.keys import KV_CACHE, SAMPLER  # noqa: F401 - the LLM's array and sampler, under the scaffold's keys
 from mstar.model.qwen3_asr.constants import ASR_TEXT_TAG  # noqa: F401 - the model's modules import it from here
 
 # ---------------------------------------------------------------------------
 # Resource keys and graph names
 # ---------------------------------------------------------------------------
 # audio_encoder node: cacheless windowed attention
+AUT_TOKENS = "aut_tokens"
 AUT_ATTN = "aut_attn"
 # LLM node
 ATTN = "attn"

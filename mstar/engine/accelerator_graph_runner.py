@@ -32,7 +32,7 @@ from mstar.engine.node_dtype import node_scope
 from mstar.engine.resources import BucketKey, CGSlotSpec, KVStep, Resource, SlotLease, StepContext, StepRunner
 from mstar.engine.resources.resident import ResidentPlanner
 from mstar.engine.resources.step import PIECEWISE_WALK, lean_subsets
-from mstar.engine.state.adapters import state_steps
+from mstar.engine.state.adapters import check_capture, state_steps
 from mstar.engine.state.calls import ShardHandle
 from mstar.engine.state.contract import EMPTY
 from mstar.model.submodule_base import (
@@ -771,6 +771,10 @@ class AcceleratorGraphRunner:
         self._capture_configs: list[AcceleratorGraphConfig] = (
             submodule.get_accelerator_graph_configs(device, head_shards)
         )
+        for config in self._capture_configs:
+            check_capture(
+                getattr(submodule, "state_handles", {}), {config.capture_graph_walk, *config.replay_graph_walks},
+            )
         if token_ladders:
             apply_token_ladders(
                 submodule_name, self._capture_configs, token_ladders, step_tokens, self._batch_sizes,

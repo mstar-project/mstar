@@ -80,7 +80,7 @@ def _greedy(head, states: torch.Tensor, prompt: torch.Tensor | None, step=None) 
 
     with fp32_precision_scope(Fp32Precision("highest", None)):
         lengths = torch.tensor([states.shape[1]], device=states.device)
-        state = {name: start[None].clone() for name, start in head.initial_state().items()}
+        state = {name: start[None].clone() for name, start in head.initial_state("highest").items()}
         tokens = []
         for _ in range(head.config.decode_iterations(states.shape[1])):
             chunk, active = head.advance(states, lengths, state, CHUNK, step, prompt)

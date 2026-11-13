@@ -297,6 +297,9 @@ class _AttendCore:
     def __init__(self, rows: _Rows):
         self.attend = CausalAttend(rows)
 
+    def reads_step_kv(self, label=None):
+        return True
+
     def run(self, q, *, label, kv_cache_layer, k, v, layer_idx):
         return self.attend(q, k, v)
 
@@ -667,15 +670,30 @@ def tiny():
 
 
 def _orpheus():
+    from mstar.engine.state.adapters import node_handles
     from mstar.model.orpheus.components.language_model import OrpheusForCausalLM
-    from mstar.model.orpheus.config import OrpheusModelConfig
+    from mstar.model.orpheus.config import ATTN, KV_CACHE, ROPE, SAMPLER, OrpheusModelConfig
     from mstar.model.orpheus.orpheus_model import OrpheusModel
     from mstar.model.orpheus.submodules import OrpheusLLMSubmodule
+
+    def stub_cores(sub, rows: _Rows):
+        """``sub`` with its handles on Orpheus's declared state bound over stubs of the kernels, which read ``rows``."""
+        resources = {KV_CACHE: _Unread(), ATTN: _AttendCore(rows), ROPE: _NoRotation(), SAMPLER: None}
+        sub.bind_node_state(node_handles(model_object(OrpheusModel, sub.config), "LLM", resources))
+        return sub
 
     def build(c, group, weights):
         lm = OrpheusForCausalLM(c, comm_group=group).to(DTYPE)
         lm.load_weights(weights.items())
-        return OrpheusLLMSubmodule(lm.requires_grad_(False).eval(), c)
+        return stub_cores(OrpheusLLMSubmodule(lm.requires_grad_(False).eval(), c), _Rows())
+
+    def run_(sub, rows):
+        lengths = _Rows([len(r) for r in rows])
+        stub_cores(sub, lengths)
+        x = sub.model.embed(torch.cat(rows))
+        with step_over(sub, lengths, (KV_CACHE,)):
+            hidden = sub.model(x, label="main")
+        return _per_row(hidden, sub.model.logits(_last(hidden, lengths.lengths)), lengths.lengths)
 
     return Stack(
         config=tiny, lora_spec=lambda c: _declared(model_object(OrpheusModel, c)), build=build,
@@ -684,9 +702,7 @@ def _orpheus():
                       "model.embed_tokens": (c.hidden_size, c.vocab_size)},
         a2=lambda c: _subset(llama_layers(c, "model."), "0.self_attn.q_proj", "0.self_attn.v_proj",
                              "1.mlp.down_proj"),
-        run=_ids_run(lambda s: s.model, lambda s, ids: s.model.embed(ids),
-                     lambda s, x: s.model(x, label="main"), lambda s, x: s.model.logits(x)),
-        declare=_declare("prefill"), inputs=_tokens(lambda c: c.vocab_size),
+        run=run_, declare=_declare("prefill"), inputs=_tokens(lambda c: c.vocab_size),
         released=lambda: (model_object(OrpheusModel, OrpheusModelConfig()),
                           lambda c, g: OrpheusForCausalLM(c, comm_group=g)),
         embedding=("model.embed_tokens",),
@@ -856,9 +872,14 @@ def _omni():
 
 
 def _qwen3_tts():
+    from mstar.engine.state.adapters import node_handles
     from mstar.model.components.code_predictor_kernels import ResidualCodePredictor
     from mstar.model.qwen3_tts.components.talker import Qwen3TTSTalkerModel
     from mstar.model.qwen3_tts.config import (
+        CODE_PRED_SAMPLER,
+        TALKER_ATTN,
+        TALKER_KV,
+        TALKER_SAMPLER,
         Qwen3TTSCodePredictorConfig,
         Qwen3TTSModelConfig,
         Qwen3TTSTalkerConfig,
@@ -868,6 +889,34 @@ def _qwen3_tts():
 
     dims = dict(num_attention_heads=4, num_key_value_heads=2, hidden_size=16, intermediate_size=32,
                 head_dim=4, vocab_size=64)
+
+    class AtZero:
+        """The step's tokens at position 0, which the layers' fused RoPE leaves unrotated."""
+
+        def __init__(self, rows: _Rows):
+            self.rows = rows
+
+        def pos_ids(self, label):
+            return torch.zeros(sum(self.rows.lengths), dtype=torch.long)
+
+    def stub_cores(sub, rows: _Rows):
+        """``sub`` with its handles on the Talker's declared state bound over stubs of the kernels, which read
+        ``rows``."""
+        declaring = model_object(Qwen3TTSModel, sub.config, codec_dtype=torch.float32)
+        resources = {
+            TALKER_KV: _Unread(), TALKER_ATTN: _AttendCore(rows), "talker_pos": AtZero(rows), TALKER_SAMPLER: None,
+            CODE_PRED_SAMPLER: None,
+        }
+        sub.bind_node_state(node_handles(declaring, "Talker", resources))
+        return sub
+
+    def run_(sub, rows):
+        lengths = _Rows([len(r) for r in rows])
+        stub_cores(sub, lengths)
+        x = sub.model.model.codec_embedding(torch.cat(rows))
+        with step_over(sub, lengths, (TALKER_KV,)):
+            hidden = sub.model(x)
+        return _per_row(hidden, sub.model.codec_head(_last(hidden, lengths.lengths)), lengths.lengths)
 
     def weights(c):
         tc = c.talker
@@ -886,15 +935,14 @@ def _qwen3_tts():
         )),
         lora_spec=lambda c: _declared(model_object(Qwen3TTSModel, c, codec_dtype=torch.float32)),
         # the code predictor sits beside the Talker, with relative paths of the same shape
-        build=lambda c, group, w: TalkerSubmodule(
+        build=lambda c, group, w: stub_cores(TalkerSubmodule(
             _loaded(Qwen3TTSTalkerModel(c, comm_group=group).to(DTYPE), w),
             ResidualCodePredictor(c.code_predictor, c.talker.hidden_size, TalkerSubmodule.MAX_BATCH_SIZE,
-                                  embed_sum_dtype=None).to(DTYPE), c),
+                                  embed_sum_dtype=None).to(DTYPE), c), _Rows()),
         weights=weights,
         a1=lambda c: {**llama_layers(c.talker, "model."), "codec_head": (c.talker.vocab_size, c.talker.hidden_size)},
         a2=lambda c: _subset(llama_layers(c.talker, "model."), "q_proj", "gate_proj"),
-        run=_ids_run(lambda s: s.model, lambda s, ids: s.model.model.codec_embedding(ids),
-                     lambda s, x: s.model(x, label="main"), lambda s, x: s.model.codec_head(x)),
+        run=run_,
         declare=_declare("talker_prefill"), inputs=_tokens(lambda c: c.talker.vocab_size),
         released=lambda: (model_object(Qwen3TTSModel, Qwen3TTSModelConfig(), codec_dtype=torch.float32),
                           lambda c, g: Qwen3TTSTalkerModel(c, comm_group=g)),
@@ -919,10 +967,17 @@ def _t3_config():
 def _chatterbox_t3():
     """Under classifier-free guidance T3 runs every request twice, cond rows then uncond
     rows, and each copy takes the request's adapter. A row is ``[cond, uncond]`` embeddings."""
+    from mstar.engine.state.adapters import node_handles
     from mstar.model.chatterbox.chatterbox_model import ChatterboxModel
     from mstar.model.chatterbox.components.t3 import T3Model
-    from mstar.model.chatterbox.config import ChatterboxConfig
+    from mstar.model.chatterbox.config import T3_ATTN, T3_KV, T3_NODE, T3_POS, T3_SAMPLER, ChatterboxConfig
     from mstar.model.chatterbox.submodules import T3Submodule
+
+    def stub_cores(sub, rows: _Rows):
+        """``sub`` with its handles on T3's declared state bound over stubs of the kernels, which read ``rows``."""
+        resources = {T3_KV: _Unread(), T3_ATTN: _AttendCore(rows), T3_POS: _NoRotation(), T3_SAMPLER: None}
+        sub.bind_node_state(node_handles(model_object(ChatterboxModel, sub.config), T3_NODE, resources))
+        return sub
 
     def weights(c):
         """The reference layout (``tfmr.*``, separate q/k/v and gate/up), from a model's
@@ -947,13 +1002,14 @@ def _chatterbox_t3():
     def build(c, group, w):
         model = T3Model(c.t3, comm_group=group).to(DTYPE)
         model.load_weights(w.items())
-        return T3Submodule(model.requires_grad_(False).eval(), c, builtin_voice=None)
+        return stub_cores(T3Submodule(model.requires_grad_(False).eval(), c, builtin_voice=None), _Rows())
 
     def run(sub, rows):
-        k, lengths = len(rows), [r.shape[1] for r in rows] * 2
-        stub_attention(sub.model, lengths)
-        hidden = sub.model.hidden(torch.cat([r[0] for r in rows] + [r[1] for r in rows]), label="cfg")
-        per = _per_row(hidden, sub.model.logits(_last(hidden, lengths)), lengths)
+        k, lengths = len(rows), _Rows([r.shape[1] for r in rows] * 2)
+        stub_cores(sub, lengths)
+        with step_over(sub, lengths, (T3_KV,)):
+            hidden = sub.model.hidden(torch.cat([r[0] for r in rows] + [r[1] for r in rows]))
+        per = _per_row(hidden, sub.model.logits(_last(hidden, lengths.lengths)), lengths.lengths)
         return [tuple(torch.cat(p) for p in zip(per[i], per[i + k], strict=True)) for i in range(k)]
 
     return Stack(

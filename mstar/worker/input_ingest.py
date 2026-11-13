@@ -21,6 +21,7 @@ from mstar.utils.containers import ParallelList
 from mstar.utils.ipc_format import (
     DrainRequest,
     EdgeItems,
+    EndEpisode,
     InputSignals,
     MessageSource,
     NewRequest,
@@ -86,11 +87,13 @@ class InputIngest:
         # marks each paged KV cache of a request's first NewRequest rebuildable or not, before the engine adds it,
         # and returns the nodes whose log of the request the rebuild pool couldn't hold
         self._set_rebuildable = set_rebuildable
+        self._pending_episode_requests: dict[int, list[NewRequest]] = {}
         self.lora_loads = LoraLoads(services)
         self._handlers = {
             WorkerMessageType.NEW_REQUEST: self._add_new_request,
             WorkerMessageType.DRAIN_REQUEST: self._drain_request,
             WorkerMessageType.REMOVE_REQUEST: self._remove_request,
+            WorkerMessageType.END_EPISODE: self._end_episode,
             WorkerMessageType.INPUT_SIGNALS: self._process_new_inputs,
             WorkerMessageType.EDGE_ITEMS: self._process_edge_items,
             WorkerMessageType.TENSOR_RECEIVED: self._handle_tensor_received,
@@ -174,6 +177,11 @@ class InputIngest:
 
     def _add_new_request(self, body: NewRequest) -> None:
         wire_rid = body.request_id
+        episode_slot = getattr(body, "episode_slot", None)
+        if (episode_slot is not None and self._runtime.get_rid_handle(wire_rid) is None
+                and self._engines.episode_slot_busy(episode_slot)):
+            self._pending_episode_requests.setdefault(episode_slot, []).append(body)
+            return
         lifecycle = self._lifecycle
         # Any worker can handle a DRAIN before the conductor's NEW_REQUEST, and a TP follower gets rank 0's. After
         # READS_DONE the worker still takes the request in, without reads, since on a follower rank 0's moves for the
@@ -211,9 +219,17 @@ class InputIngest:
                 unheld = () if self._set_rebuildable is None else self._set_rebuildable(
                     rid, body.request_info.resource_configs,
                 )
-                self._engines.add_request(
-                    rid, body.request_info.resource_configs, body.request_info,
-                )
+                episode_id = getattr(body, "episode_id", None)
+                reset = getattr(body, "reset_episode", False)
+                clear = getattr(body, "episode_clear", ())
+                if episode_slot is None and episode_id is None and not reset and not clear:
+                    self._engines.add_request(rid, body.request_info.resource_configs, body.request_info)
+                else:
+                    self._engines.add_request(
+                        rid, body.request_info.resource_configs, body.request_info,
+                        episode_id=episode_id, episode_slot=episode_slot,
+                        reset_episode=reset, episode_clear=clear,
+                    )
                 # Rank 0 journals each refused log once the engine holds the request, since a follower's replay
                 # changes the request's KV config.
                 for node in unheld:
@@ -256,6 +272,7 @@ class InputIngest:
         if rid is not None:
             self._lifecycle.remove(rid, body, self._lockstep.last_consumed_seq)
             return
+        self._drop_pending_episode_request(body.request_id)
         # Never admitted here, or already removed: no handle-keyed state to
         # clear, on any rank: the conductor sends a request's NEW_REQUESTs and
         # its REMOVE down one FIFO socket and forgets it after, so no NEW_REQUEST
@@ -264,6 +281,40 @@ class InputIngest:
         for message in self._lifecycle.removed(None, body.request_id):
             self.drop_for_removed(message)
         self._lockstep.clear_wire_rid(body.request_id)
+
+    def _end_episode(self, body: EndEpisode) -> None:
+        # The conductor can close an idle connection. A preceding request's
+        # REMOVE may still be waiting for its GPU step to drain on this worker.
+        self._lifecycle.end_episode(body)
+
+    def retry_episode_requests(self) -> None:
+        """Admit queued calls only after the prior request's drained teardown."""
+        for slot, pending in list(self._pending_episode_requests.items()):
+            if self._engines.episode_slot_busy(slot):
+                continue
+            body = pending.pop(0)
+            wire_rid = body.request_id
+            # A request may have several partitions on this worker. They all
+            # share one handle and must arrive together before the slot is
+            # considered busy again for a *different* request.
+            same = []
+            while pending and pending[0].request_id == wire_rid:
+                same.append(pending.pop(0))
+            if not pending:
+                del self._pending_episode_requests[slot]
+            self._add_new_request(body)
+            for partition in same:
+                self._add_new_request(partition)
+
+    def has_pending_episode(self, episode_id: str, slot: int) -> bool:
+        """An END must wait until a queued NEW has run or been removed."""
+        return any(body.episode_id == episode_id for body in self._pending_episode_requests.get(slot, ()))
+
+    def _drop_pending_episode_request(self, wire_rid: str) -> None:
+        for slot, pending in list(self._pending_episode_requests.items()):
+            pending[:] = [body for body in pending if body.request_id != wire_rid]
+            if not pending:
+                del self._pending_episode_requests[slot]
 
     def _drain_request(self, body: DrainRequest) -> None:
         self._lifecycle.drain(body)

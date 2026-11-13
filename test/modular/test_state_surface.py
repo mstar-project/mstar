@@ -17,15 +17,15 @@ sys.path.insert(0, ".")
 import pytest
 
 from mstar.engine import state
-from mstar.engine.state.adapters import PagedArrayHandle, ValueHandle, WithinStepHandle
+from mstar.engine.state.adapters import PagedArrayHandle, RingHandle, ValueHandle, WithinStepHandle
 from mstar.engine.state.calls import ArrayHandle
 
 # Today's types the surface re-exports, and a NamedTuple, whose fields stay positional.
-_POSITIONAL = {"PagedNHDTarget", "Reached", "Segment", "SlotLease", "Span"}
+_POSITIONAL = {"PagedNHDTarget", "Segment", "SlotLease", "Span"}
 # The calls take the handle first, then what every call names, and only then keywords.
 _CALLS = {
-    "at_last_token", "causal_conv", "gated_delta_net", "gather", "host", "last_sampled", "position", "positions",
-    "rope", "sample", "scatter", "split_range",
+    "add_read", "at_last_token", "causal_conv", "gated_delta_net", "gather", "host", "last_sampled", "position",
+    "positions", "rope", "sample", "scatter", "split_range",
 }
 # Each public name's parameters as ``[name, kind, default]``. A dataclass's parameters are its fields.
 SNAPSHOT = {
@@ -40,6 +40,7 @@ SNAPSHOT = {
         ["rewritable", "KEYWORD_ONLY", 'False'],
         ["labels", "KEYWORD_ONLY", "frozenset({'main'})"],
         ["positions", "KEYWORD_ONLY", 'None'],
+        ["lifetime", "KEYWORD_ONLY", "'request'"],
     ],
     "ArrayStep": [
         ["segments", "KEYWORD_ONLY", 'None'],
@@ -54,6 +55,9 @@ SNAPSHOT = {
     ],
     "Attend": [
         ["q_heads", "POSITIONAL_OR_KEYWORD", None],
+    ],
+    "Bidirectional": [
+        ["kept_window", "KEYWORD_ONLY", 'False'],
     ],
     "Block": [],
     "Causal": [],
@@ -70,6 +74,11 @@ SNAPSHOT = {
         ["at", "KEYWORD_ONLY", None],
         ["rows", "KEYWORD_ONLY", 'None'],
     ],
+    "FrameWindow": [
+        ["tokens", "POSITIONAL_OR_KEYWORD", None],
+        ["frames", "KEYWORD_ONLY", None],
+        ["stride", "KEYWORD_ONLY", '1'],
+    ],
     "GatedDeltaNet": [
         ["qk_l2norm", "KEYWORD_ONLY", 'True'],
         ["scale", "KEYWORD_ONLY", 'None'],
@@ -78,10 +87,15 @@ SNAPSHOT = {
         ["heads", "KEYWORD_ONLY", None],
         ["head_dim", "KEYWORD_ONLY", None],
     ],
+    "KeptWindow": [
+        ["sink", "POSITIONAL_OR_KEYWORD", None],
+        ["window", "KEYWORD_ONLY", None],
+    ],
     "Layout": [
         ["spans", "KEYWORD_ONLY", '()'],
         ["growth", "KEYWORD_ONLY", '()'],
         ["scratch", "KEYWORD_ONLY", '0'],
+        ["kept_windows", "KEYWORD_ONLY", '{}'],
     ],
     "PagedNHD": [
         ["dtypes", "KEYWORD_ONLY", 'None'],
@@ -98,7 +112,7 @@ SNAPSHOT = {
     ],
     "Reached": [
         ["fields", "POSITIONAL_OR_KEYWORD", None],
-        ["row_offsets", "POSITIONAL_OR_KEYWORD", None],
+        ["row_offsets", "KEYWORD_ONLY", None],
     ],
     "Read": [
         ["mask", "KEYWORD_ONLY", None],
@@ -191,9 +205,17 @@ SNAPSHOT = {
     "Window": [
         ["size", "POSITIONAL_OR_KEYWORD", None],
     ],
+    "add_read": [
+        ["h", "POSITIONAL_OR_KEYWORD", None],
+        ["layer", "POSITIONAL_OR_KEYWORD", None],
+        ["q", "POSITIONAL_OR_KEYWORD", 'None'],
+        ["keep", "KEYWORD_ONLY", 'None'],
+        ["keywords", "VAR_KEYWORD", None],
+    ],
     "at_last_token": [
         ["h", "POSITIONAL_OR_KEYWORD", None],
         ["x", "POSITIONAL_OR_KEYWORD", None],
+        ["label", "KEYWORD_ONLY", 'None'],
     ],
     "causal_conv": [
         ["h", "POSITIONAL_OR_KEYWORD", None],
@@ -310,13 +332,20 @@ def test_the_surface_equals_the_snapshot():
     assert _surface() == SNAPSHOT, "an addition updates SNAPSHOT, and a change in meaning comes as a new name"
 
 
-@pytest.mark.parametrize("handle", [ArrayHandle, PagedArrayHandle, ValueHandle, WithinStepHandle])
+@pytest.mark.parametrize("handle", [ArrayHandle, PagedArrayHandle, ValueHandle, WithinStepHandle, RingHandle])
 def test_a_handles_calls_equal_the_snapshot(handle):
     surface = {
         name: [[p.name, p.kind.name, _default(p)] for p in inspect.signature(getattr(handle, name)).parameters.values()]
         for name in HANDLE_SNAPSHOT
     }
     assert surface == HANDLE_SNAPSHOT, "`add`, `read` and `write` are the surface a layer calls"
+
+
+def test_set_start_equals_the_snapshot():
+    surface = [[p.name, p.kind.name, _default(p)] for p in inspect.signature(ArrayHandle.set_start).parameters.values()]
+    assert surface == [
+        ["self", "POSITIONAL_OR_KEYWORD", None], ["start", "POSITIONAL_OR_KEYWORD", None],
+    ], "`set_start` is the call a submodule makes at bind for a Value's start state"
 
 
 def test_every_field_after_the_first_is_keyword_only():

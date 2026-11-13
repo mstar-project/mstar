@@ -253,7 +253,7 @@ def test_each_step_gets_fresh_step_objects():
     handles = _handles(_kv())
     first = state_steps(SubmoduleStep(segments=[Segment(1, "main", 1)], state={"kv": ArrayStep()}), handles)
     second = state_steps(SubmoduleStep(segments=[Segment(2, "main", 2)], state={"kv": ArrayStep()}), handles)
-    assert first.steps["kv"].segments == [Segment(1, "main", 1)], "SubmoduleStep writes segments onto its step objects"
+    assert first.steps["kv"].segments == [Segment(1, "main", 1)], "a step's KVStep carries that step's segments"
     assert second.steps["kv"].segments == [Segment(2, "main", 2)]
 
 
@@ -780,8 +780,8 @@ class _EngineNode(NodeSubmodule):
         self.declared_handles = handles
 
 
-def _load_engine(monkeypatch, node, model):
-    monkeypatch.setattr(engine_module, "node_handles", lambda model, name, resources, **kwargs: {"kv": name})
+def _load_engine(monkeypatch, nodes, model, handles=lambda model, name, resources, **kwargs: {"kv": name}):
+    monkeypatch.setattr(engine_module, "node_handles", handles)
     joint = SimpleNamespace(
         world_size=1, tp_group=SimpleNamespace(barrier=lambda: None, world_size=1),
         sp_group=SimpleNamespace(world_size=1),
@@ -792,20 +792,31 @@ def _load_engine(monkeypatch, node, model):
     )
     engine = Engine(None, autocast_dtype=None)
     engine.load_model(
-        submodules={"LLM": node}, specs=[], parallel_groups=groups, device=torch.device("cpu"),
+        submodules=nodes, specs=[], parallel_groups=groups, device=torch.device("cpu"),
         transfer_engine_info=None, model=model,
     )
 
 
 def test_the_engine_binds_a_nodes_handles_when_it_loads_a_model(monkeypatch):
     node = _EngineNode()
-    _load_engine(monkeypatch, node, make_model(checkpoint_path=lambda: None))
+    _load_engine(monkeypatch, {"LLM": node}, make_model(checkpoint_path=lambda: None))
     assert node.declared_handles == {"kv": "LLM"}
+
+
+def test_nodes_in_one_process_share_their_handles(monkeypatch):
+    nodes = {name: _EngineNode() for name in ("LLM_cfg_text", "LLM_cfg_img")}
+    _load_engine(monkeypatch, nodes, make_model(checkpoint_path=lambda: None),
+                 handles=lambda model, name, resources, built, **kwargs: {"kv": built.setdefault("kv", object())})
+    text, image = (node.declared_handles for node in nodes.values())
+    assert text["kv"] is image["kv"], (
+        "BAGEL's LLM nodes share one language model, so a handle per node would leave the shared layers on the handle "
+        "of the node bound last, which the other node's steps never open"
+    )
 
 
 def test_the_engine_binds_nothing_when_it_loads_no_model(monkeypatch):
     node = _EngineNode()
-    _load_engine(monkeypatch, node, model=None)
+    _load_engine(monkeypatch, {"LLM": node}, model=None)
     assert node.declared_handles is None
 
 
@@ -832,6 +843,28 @@ def test_a_kv_manager_says_which_labels_a_request_opened(monkeypatch):
     assert kv.opens_label(2, "cfg"), "a padding row has no config"
     kv.ingest_request(3, KVReqConfig(needed_labels_per_node={"LLM": ["cfg"]}))
     assert kv.opens_label(3, "cfg"), "a label opened per node isn't in needed_labels"
+
+
+class _Declares:
+    def __init__(self, *declarations):
+        self.declarations = list(declarations)
+
+    def declare_state(self):
+        return self.declarations
+
+
+def test_state_dtype_on_a_plain_value_is_refused_by_the_deployment():
+    plain = Value("plain", nodes={"LLM"}, layers={0}, entry=Entry({"state": TensorType((2,), dtype=torch.float32)}))
+    (problem,) = deployment_problems(_Declares(plain), {"plain": {"state_dtype": "bfloat16"}})
+    assert problem.startswith("Array 'plain': resources.plain.state_dtype"), (
+        "only a field an update op writes takes a stored dtype"
+    )
+
+
+def test_state_dtype_on_a_gated_delta_net_is_the_deployments_choice():
+    entry = Entry({"state": TensorType((2, 8, 8), dtype=torch.float32, shard=0)})
+    gated = Value("gdn", nodes={"LLM"}, layers={0}, entry=entry, updates={"d": GatedDeltaNet()})
+    assert deployment_problems(_Declares(gated), {"gdn": {"state_dtype": "bfloat16"}}) == []
 
 
 # One place for each rule that more than one site reads

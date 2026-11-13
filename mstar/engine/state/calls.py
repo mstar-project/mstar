@@ -7,13 +7,24 @@ the graph: a compiled frame of a walk the shard never splits traces them straigh
 """
 
 from abc import abstractmethod
-from collections.abc import Mapping, Sequence
-from typing import TYPE_CHECKING, Any
+from collections.abc import Collection, Iterable, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, overload
 
 import torch
 
+from mstar.engine.resources.sampler.utils import FUSED_DRAW_MAX_VOCAB, FusedDrawArgs
 from mstar.engine.resources.step import Segment, StepHandle
-from mstar.engine.state.contract import EMPTY, Array, ArrayStep, CausalConv, GatedDeltaNet, Op, Sampler, SeqShard
+from mstar.engine.state.contract import (
+    EMPTY,
+    Array,
+    ArrayStep,
+    CausalConv,
+    GatedDeltaNet,
+    Op,
+    Reached,
+    Sampler,
+    SeqShard,
+)
 
 if TYPE_CHECKING:
     from mstar.engine.state.state_op import StateOp
@@ -30,7 +41,7 @@ def pool_layers(array: Array) -> dict[int, int]:
 
 
 class ArrayHandle(StepHandle):
-    """A node's calls on one declared array. Each kind of storage has a handle that implements the calls it runs, and
+    """The calls on one declared array. Each kind of storage has a handle that implements the calls it runs, and
     this class refuses the rest as having no layout yet.
 
     ``layer`` is always the model's layer id as declared: the int, or a 0-d int64 CPU tensor holding it. A compiled
@@ -47,6 +58,8 @@ class ArrayHandle(StepHandle):
     # the position resource and the dtype its `Rope` rotates in, where the array declares positions
     positions: Any = None
     rope_dtype: torch.dtype | None = None
+    # the cause `write` is refused with on an append-only array's handle; None leaves it "no layout yet"
+    _write_refused: str | None = None
 
     def __init__(self, array: Array, resources: Mapping[str, Any]):
         self.array = array
@@ -57,10 +70,11 @@ class ArrayHandle(StepHandle):
 
         self._pool_layer = pool_layers(array)
 
-        # This step's calls, checked in eager steps and at capture.
+        # This step's segments, and its calls, checked in eager steps and at capture.
         # `_held` is the k and v an add left for `_held_layer`'s read, on a kernel that takes them there.
         # `_kept` holds the layers whose kept add has run, `_scratch` those with a scratch add, `_read` those read,
         # and `_updated` the update calls run.
+        self._segments: Sequence[Segment] = ()
         self._open = False
         self._keep = True
         self._capturing = False
@@ -94,9 +108,9 @@ class ArrayHandle(StepHandle):
             raise self._refusal("a step began while another is open")
         self._open = True
         declared: ArrayStep = step.state[self.name]
-        segments = segments_of(declared, step)
-        if segments:
-            self.label = segments[0].label
+        self._segments = segments_of(declared, step) or ()
+        if self._segments:
+            self.label = self._segments[0].label
         # on a replay too, whose `eager_add` adds still run
         self._keep = declared.keep
         self._capturing = step.ctx.capture
@@ -107,7 +121,7 @@ class ArrayHandle(StepHandle):
             self._check_host_writes(declared, step.ctx)
         if step.ctx.replays:
             return
-        self._check_step(declared, segments or (), step.ctx)
+        self._check_step(declared, self._segments, step.ctx)
 
     def check_step(self, step) -> None:
         if step.ctx.replays or not self._keep:
@@ -137,7 +151,7 @@ class ArrayHandle(StepHandle):
             raise self._refusal(f"a step touches labels {sorted(labels - declared_labels)}, and the array declares "
                                 f"{sorted(declared_labels)}")
         if len(labels) > 1:
-            raise self._no_layout(f"a step touches labels {sorted(labels)}, and a plan holds one per call")
+            self._check_labels(labels, segments)
         forked = {label for fork in declared.forks for label in (fork.src, fork.dst)}
         if forked - declared_labels:
             raise self._refusal(f"a fork names labels {sorted(forked - declared_labels)}, and the array declares "
@@ -145,6 +159,10 @@ class ArrayHandle(StepHandle):
         if declared.advance is not None or declared.position_ids is not None:
             _positions(self, "a step sets advance or position_ids, and the array declares no positions")
         self._check_storage(declared, segments, ctx)
+
+    def _check_labels(self, labels: set[str], segments) -> None:
+        """Refuse a step over several ``labels`` unless this storage plans them as one."""
+        raise self._no_layout(f"a step touches labels {sorted(labels)}, and a plan holds one per call")
 
     @abstractmethod
     def _check_storage(self, declared: ArrayStep, segments, ctx) -> None:
@@ -160,13 +178,12 @@ class ArrayHandle(StepHandle):
         self._check_open("add")
         if layer not in self.array.layers:
             raise self._refusal(f"add on layer {layer}, which the array doesn't declare")
-        if layer in self._read:
-            raise self._refusal(f"an add on layer {layer} after a read in the same layer")
+        kept = self._keep and keep is not False
         if layer in self._kept:
             raise self._refusal(f"an add on layer {layer} after its kept add")
         if keep and not self._keep:
             raise self._refusal(f"keep=True on layer {layer} in a step with keep=False, whose commit keeps no add")
-        (self._kept if self._keep and keep is not False else self._scratch).add(layer)
+        (self._kept if kept else self._scratch).add(layer)
 
     def _record_read(self, layer: int) -> None:
         self._check_open("read")
@@ -192,34 +209,72 @@ class ArrayHandle(StepHandle):
         return held
 
     def add(self, layer: int | torch.Tensor, *, keep: bool | None = None, **fields: torch.Tensor) -> None:
-        """Append each row's span at its next log positions. A kept add happens once per layer per step, as the
-        layer's last add. ``keep`` False is scratch: it can repeat, and lasts until the next add or the end of the step.
-        None takes the step's ``keep``. The resources keep or drop a step's adds as a whole, so a step that keeps needs
-        each layer to end on a kept add, and a step with ``keep`` False refuses ``keep=True``."""
+        """Append each row's span at its next log positions, before or after a read of the layer. A kept add happens
+        once per layer per step, as the layer's last add. ``keep`` False is scratch: it can repeat, and lasts until the
+        next add or the end of the step. None takes the step's ``keep``. The resources keep or drop a step's adds as a
+        whole, so a step that keeps needs each layer to end on a kept add, and a step with ``keep`` False refuses
+        ``keep=True``."""
         raise self._unsupported("add")
 
-    def read(self, layer: int | torch.Tensor, q: torch.Tensor | None = None, **mask_args: Any) -> torch.Tensor:
+    @overload
+    def read(self, layer: int | torch.Tensor, q: torch.Tensor, **mask_args: Any) -> torch.Tensor: ...
+
+    @overload
+    def read(self, layer: int | torch.Tensor, q: None = None, **mask_args: Any) -> Reached: ...
+
+    def read(
+        self, layer: int | torch.Tensor, q: torch.Tensor | None = None, **mask_args: Any,
+    ) -> torch.Tensor | Reached:
         """Attend ``q`` through the read declared for ``layer``: kept entries from earlier steps, plus this layer's
-        latest add, at the positions its mask reaches."""
+        latest add, at the positions its mask reaches. A read that declares no op takes no ``q`` and returns the
+        entries it reaches."""
         raise self._unsupported("read")
+
+    def _add_read(
+        self, layer: int | torch.Tensor, q: torch.Tensor | None, *, keep: bool | None, **keywords: Any,
+    ) -> torch.Tensor | Reached:
+        self._check_add_read("add_read")
+        fields = self.array.entry.tensors
+        self.add(layer, keep=keep, **{name: keywords.pop(name) for name in fields if name in keywords})
+        return self.read(layer, q, **keywords)
+
+    def _check_add_read(self, call: str) -> None:
+        """Raise unless this storage's add and read can share one graph break. ``call`` names the caller in the
+        refusal."""
+        raise self._unsupported(call)
 
     def write(self, layer: int | torch.Tensor, *, at: torch.Tensor | None = None, **fields: torch.Tensor) -> None:
         """Overwrite entries in place, on a rewritable array. ``at`` gives each token's log position, and is omitted
         for a Value."""
-        if not self.array.rewritable:
-            raise self._refusal("write on an append-only array")
+        if self._write_refused is not None:
+            raise self._refusal(self._write_refused)
         raise self._unsupported("write")
+
+    def set_start(self, start: Mapping[str, torch.Tensor]) -> None:
+        """What a row of this Value reads while it has nothing written, has span 0 or pads a step: ``start``'s tensor
+        for each field it names, of one entry's shape on this rank, and zeros for the rest. A resident step reads each
+        row's slot and not the start, so the node of a Value with a start stays host-planned
+        (`NodeSubmodule.resident_walks`). The tensors are made at load and never written, since a captured read keeps
+        their address."""
+        raise self._unsupported("set_start")
 
     def block(self, field: str, layer: int) -> torch.Tensor:
         """``layer``'s view of the entry field ``field``, for an update's op."""
         raise self._unsupported("block")
 
-    def at_last_token(self, x: torch.Tensor) -> torch.Tensor:
+    def at_last_token(self, x: torch.Tensor, *, label: str | None = None) -> torch.Tensor:
         raise self._unsupported("at_last_token")
 
     def takes_fused(self, op: "StateOp") -> bool:
         """Whether ``op``'s fused kernel writes this array itself, in place of its reference running the calls."""
         return False
+
+    def _check_capture(self, walks: Collection[str]) -> None:
+        """Raise if a capture replayed on ``walks`` would plan this array's reads differently on some of them."""
+
+    def _step_ops(self, walk: str | None) -> Iterable[tuple[str, Any]]:
+        """The bound ops whose steps a step on ``walk`` builds, each with the resource key its step goes under."""
+        return ((bound.key, bound) for bound in self._bindings)
 
     def _kernel_setting(self, read: str, field: str) -> Any:
         if read not in self.reads:
@@ -233,9 +288,9 @@ class ArrayHandle(StepHandle):
                                 f"{sorted(binding.read_back) or 'none'}")
         return getattr(self.reads[read], field)
 
-    def _update(self, kind: type[Op], field: str, layer: int) -> tuple[Any, torch.Tensor]:
-        """Record the update of type ``kind`` on ``layer``'s ``field``, and return the resource that runs it and the
-        field's view."""
+    def _update(self, kind: type[Op], layer: int) -> tuple[Any, torch.Tensor]:
+        """Record the update of type ``kind`` on ``layer``'s field that ``kind`` writes, and return the resource that
+        runs it and the field's view."""
         raise self._unsupported(f"an update of type {kind.__name__}")
 
     def _host(self, request: int, label: str, layer: int) -> Mapping[str, object]:
@@ -243,7 +298,7 @@ class ArrayHandle(StepHandle):
 
 
 class SamplerHandle(StepHandle):
-    """A node's calls on one declared sampler. Its rows are the step's, padding included."""
+    """The calls on one declared sampler. Its rows are the step's, padding included."""
 
     def __init__(self, sampler: Sampler, resource: Any):
         self.sampler = sampler
@@ -252,6 +307,7 @@ class SamplerHandle(StepHandle):
         self.rows = ()
         self._open = False
         self._drawn = 0
+        self._fused = False
 
     def _refusal(self, cause: str) -> ValueError:
         return ValueError(f"Sampler {self.name!r}: {cause}")
@@ -262,19 +318,23 @@ class SamplerHandle(StepHandle):
         self._open = True
         self.rows = step.ctx.padded_request_ids
         self._drawn = 0
+        self._fused = False
 
     def check_step(self, step) -> None:
         # a step that keeps no row's sample may skip the kernel: an eager prefill short of its last chunk
         if step.ctx.replays or (not self._drawn and step.state[self.name].kept_rows == frozenset()):
             return
         if self._drawn != self.sampler.draws:
-            raise self._refusal(f"a step listing it sampled {self._drawn} times, and draws is {self.sampler.draws}")
+            counted = (f"counted {self._drawn} draws by sample and drew" if self._fused
+                       else f"sampled {self._drawn} times")
+            raise self._refusal(f"a step listing it {counted}, and draws is {self.sampler.draws}")
 
     def commit_step(self, step) -> None:
         """Nothing: the resource holds a sampler's state."""
 
     def end_step(self, step) -> None:
         self._open = False
+        self._fused = False
 
 
 class ShardHandle(StepHandle):
@@ -317,13 +377,36 @@ class ShardHandle(StepHandle):
         self.label = self.walk = None
 
 
+@overload
+def add_read(
+    h: ArrayHandle, layer: int | torch.Tensor, q: torch.Tensor, *, keep: bool | None = None, **keywords: Any,
+) -> torch.Tensor: ...
+
+
+@overload
+def add_read(
+    h: ArrayHandle, layer: int | torch.Tensor, q: None = None, *, keep: bool | None = None, **keywords: Any,
+) -> Reached: ...
+
+
+@torch.compiler.disable
+def add_read(
+    h: ArrayHandle, layer: int | torch.Tensor, q: torch.Tensor | None = None, *, keep: bool | None = None,
+    **keywords: Any,
+) -> torch.Tensor | Reached:
+    """`add` then `read` on ``layer`` behind one graph break, for a layer with nothing traced between them, so it
+    compiles no frame for the gap. A keyword that names an entry field goes to `add`, and any other to `read`. As
+    `read`, a read with no op takes no ``q`` and returns the entries it reaches."""
+    return h._add_read(layer, q, keep=keep, **keywords)
+
+
 @torch.compiler.disable
 def causal_conv(
     h: ArrayHandle, layer: int | torch.Tensor, x: torch.Tensor, *, weight: torch.Tensor,
     bias: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """The declared `CausalConv` over ``x``, which reads and writes ``layer``'s ``conv`` field in place."""
-    run, conv = h._update(CausalConv, "conv", h._layer_id(layer))
+    run, conv = h._update(CausalConv, h._layer_id(layer))
     return run.run_conv(x, conv_layer=conv, weight=weight, bias=bias, label=h.label)
 
 
@@ -333,7 +416,7 @@ def gated_delta_net(
     b: torch.Tensor, a_log: torch.Tensor, dt_bias: torch.Tensor,
 ) -> torch.Tensor:
     """The declared `GatedDeltaNet`, which reads and writes ``layer``'s ``state`` field in place."""
-    run, state = h._update(GatedDeltaNet, "state", h._layer_id(layer))
+    run, state = h._update(GatedDeltaNet, h._layer_id(layer))
     return run.run(q, k, v, a, b, state_layer=state, a_log=a_log, dt_bias=dt_bias, label=h.label)
 
 
@@ -395,11 +478,37 @@ def sample(s: SamplerHandle, logits: torch.Tensor) -> torch.Tensor:
     return s.resource.sample(list(s.rows), logits=logits)
 
 
+@torch.compiler.disable
+def fused_draw_args(s: SamplerHandle) -> FusedDrawArgs | None:
+    """Not frozen yet, like the rest of the fused draw. Each row's sampling parameters, padding rows included, for a
+    kernel in the forward that draws as `sample` would. None when `sample` would draw any other way this step, or the
+    declared vocabulary is past what `draw_row` reproduces, and the model then calls `sample`."""
+    if not s._open:
+        raise s._refusal("fused_draw_args in a step that doesn't list the sampler")
+    args = None if s.sampler.vocab_size > FUSED_DRAW_MAX_VOCAB else s.resource.fused_draw_args()
+    s._fused = args is not None
+    return args
+
+
+@torch.compiler.disable
+def drew(s: SamplerHandle, n: int) -> None:
+    """Not frozen yet, like the rest of the fused draw. Count ``n`` draws a kernel made from `fused_draw_args`, and
+    advance each row's sampling state as ``n`` `sample` calls would. Called after the launch, so the advance is ordered
+    after the kernel's reads."""
+    if not s._fused:
+        raise s._refusal("drew, and no fused_draw_args this step returned arguments")
+    if not (type(n) is int and n >= 1 and s._drawn + n <= s.sampler.draws):
+        raise s._refusal(f"drew({n!r}) after {s._drawn} draws, and draws is {s.sampler.draws}")
+    s.resource.advance_offsets(n)
+    s._drawn += n
+
+
 # Eager as a whole, as `AttentionManager.select_last_hidden` explains.
 @torch.compiler.disable
-def at_last_token(h: ArrayHandle, x: torch.Tensor) -> torch.Tensor:
-    """``x`` at each row's last token in this step, in row order."""
-    return h.at_last_token(x)
+def at_last_token(h: ArrayHandle, x: torch.Tensor, *, label: str | None = None) -> torch.Tensor:
+    """``x`` at the last token of each (row, label) the step touches on ``h``, in segment order; with ``label``, only
+    that label's, in row order. On a step over one label both are each row's last token, in row order."""
+    return h.at_last_token(x, label=label)
 
 
 def last_sampled(s: SamplerHandle) -> torch.Tensor:

@@ -27,6 +27,8 @@ from mstar.profile.format import GraphTiming, RxInfo, TxInfo
 from mstar.utils.ipc_format import (
     ConductorMessage,
     ConductorMessageType,
+    EndEpisode,
+    EndEpisodeConductor,
     FailRequests,
     InputSignals,
     MoveKind,
@@ -82,6 +84,22 @@ def roundtrip(msg):
     out = decode(encode(msg))
     assert type(out) is type(msg)
     return out
+
+
+def test_end_episode_message_keeps_logical_owner():
+    msg = WorkerMessage(
+        message_type=WorkerMessageType.END_EPISODE,
+        body=EndEpisode(episode_id="robot-a", episode_slot=3),
+    )
+    assert roundtrip(msg).body == msg.body
+
+
+def test_end_episode_conductor_message_keeps_connection_identity():
+    msg = ConductorMessage(
+        message_type=ConductorMessageType.END_EPISODE,
+        body=EndEpisodeConductor(episode_id="robot-a"),
+    )
+    assert roundtrip(msg).body == msg.body
 
 
 # ----------------------------------------------------------------------

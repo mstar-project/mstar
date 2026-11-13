@@ -44,6 +44,21 @@ COMPONENT_IN_FLIGHT = Family(
     "dispatched and whose completion it has not received yet.",
     ("component",),
 )
+EPISODES = Family(
+    "mstar_episodes", GAUGE,
+    "Named episodes by conductor state.",
+    ("state",),
+)
+EPISODE_SLOTS_USED = Family(
+    "mstar_episode_slots_used", GAUGE,
+    "Logical episode slots reserved on each worker, including temporary calls.",
+    ("worker",),
+)
+EPISODE_EVICTIONS = Family(
+    "mstar_episode_evictions_total", COUNTER,
+    "Idle episodes whose rows the conductor released to free a slot or after a timeout.",
+    ("reason",),
+)
 ROUTING_PREDICTED_SAVING = Family(
     "mstar_routing_predicted_saving_total", COUNTER,
     "Per term of the data-parallel replica cost, the saving the mirrors "
@@ -79,6 +94,11 @@ KV_PAGES_CACHED = Family(
     "running requests also hold; the cache frees the others on demand.",
     ("component", "resource"),
 )
+KV_PAGES_LENT = Family(
+    "mstar_kv_pages_lent", GAUGE,
+    "Pages of a paged KV cache that guaranteed requests lent that aren't free.",
+    ("component", "resource"),
+)
 STEP_SECONDS = Family(
     "mstar_step_seconds", HISTOGRAM,
     "Engine steps: from the later of the step's hand-off to the GPU thread and "
@@ -108,7 +128,7 @@ PREFIX_CACHE_HIT_TOKENS = Family(
 )
 KV_PREEMPTIONS = Family(
     "mstar_kv_preemptions_total", COUNTER,
-    "Requests chosen to move to the host or drop when an older request's grant, or their own, ran short of KV pages.",
+    "Requests chosen to move to the host or drop when another request's grant, or their own, ran short of KV pages.",
     ("component",),
 )
 KV_DROPS = Family(
@@ -135,6 +155,16 @@ KV_RETURNS_PREEMPTED = Family(
     "mstar_kv_returns_preempted_total", COUNTER,
     "Requests preempted again before they sampled a token since they were last preempted. Only requests that "
     "keep a rebuild log are counted.",
+    ("component",),
+)
+KV_TAKE_BACKS = Family(
+    "mstar_kv_take_backs_total", COUNTER,
+    "Preempted requests that moved so a guaranteed request could take back pages it lent.",
+    ("component",),
+)
+KV_TAKE_BACK_WAITS = Family(
+    "mstar_kv_take_back_waits_total", COUNTER,
+    "Waits by guaranteed requests to take back pages they lent, since no request holding them could move.",
     ("component",),
 )
 COMPONENT_PENDING_STEPS = Family(
@@ -192,9 +222,10 @@ TRANSFER_SECONDS = Family(
 #: conductor sums the workers' series and forwards them in its status message.
 WORKER_FAMILIES: dict[str, Family] = {
     f.name: f for f in (
-        KV_PAGES_USED, KV_PAGES_TOTAL, KV_PAGES_CACHED, STEP_SECONDS, BATCH_SIZE,
+        KV_PAGES_USED, KV_PAGES_TOTAL, KV_PAGES_CACHED, KV_PAGES_LENT, STEP_SECONDS, BATCH_SIZE,
         PREFIX_CACHE_QUERY_TOKENS, PREFIX_CACHE_HIT_TOKENS, KV_PREEMPTIONS, KV_DROPS, KV_REBUILD_TOKENS,
-        KV_PREEMPTED_AGAIN, KV_RETURNS_PREEMPTED, KV_REBUILD_CACHED_PAGES, COMPONENT_PENDING_STEPS,
+        KV_PREEMPTED_AGAIN, KV_RETURNS_PREEMPTED, KV_TAKE_BACKS, KV_TAKE_BACK_WAITS, KV_REBUILD_CACHED_PAGES,
+        COMPONENT_PENDING_STEPS,
         REBUILD_HOST_BYTES_USED, REBUILD_HOST_BYTES_TOTAL,
         TRANSFER_BYTES, TRANSFERS, TRANSFER_SECONDS,
     )
@@ -203,5 +234,8 @@ WORKER_FAMILIES: dict[str, Family] = {
 #: Families the conductor's status message carries, exported from the latest
 #: message.
 STATUS_FAMILIES: dict[str, Family] = {
-    f.name: f for f in (CONDUCTOR_REQUESTS, COMPONENT_IN_FLIGHT, ROUTING_PREDICTED_SAVING)
+    f.name: f for f in (
+        CONDUCTOR_REQUESTS, COMPONENT_IN_FLIGHT, EPISODES, EPISODE_SLOTS_USED,
+        EPISODE_EVICTIONS, ROUTING_PREDICTED_SAVING,
+    )
 } | WORKER_FAMILIES

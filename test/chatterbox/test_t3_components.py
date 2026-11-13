@@ -19,16 +19,11 @@ pytest.importorskip("chatterbox.models")
 from chatterbox.models.t3 import T3  # noqa: E402
 from chatterbox.models.t3.modules.cond_enc import T3Cond  # noqa: E402
 from chatterbox.models.t3.modules.t3_config import T3Config as RefT3Config  # noqa: E402
-from fake_resources import FakeT3Resources  # noqa: E402
+from fake_resources import FakeT3State  # noqa: E402
 from safetensors.torch import load_file  # noqa: E402
 
 from mstar.model.chatterbox.components.t3 import T3Model  # noqa: E402
-from mstar.model.chatterbox.config import (  # noqa: E402
-    T3_ATTN,
-    T3_KV,
-    T3_POS,
-    ChatterboxConfig,
-)
+from mstar.model.chatterbox.config import ChatterboxConfig  # noqa: E402
 from mstar.model.chatterbox.loader import (  # noqa: E402
     iter_weights,
     materialize,
@@ -75,8 +70,8 @@ class Pair:
         self.model = materialize(model, "cpu", torch.float32)
         self.model.load_weights(iter_weights(f"{snapshot}/{self.config.t3_weights}"))
         self.model.eval()
-        self.fakes = FakeT3Resources()
-        self.fakes.bind(self.model, T3_ATTN, T3_KV, T3_POS)
+        self.fakes = FakeT3State(self.config)
+        self.fakes.bind_handles(self.model)
 
         gen = torch.Generator().manual_seed(1234)
         t3 = self.config.t3
@@ -207,8 +202,8 @@ def test_backbone_prefill_and_decode_match_reference(pair: Pair):
 
     # ours: both requests packed into one step
     pair.fakes.reset()
-    pos_ids = pair.fakes.plan(seq_lens)
-    hidden = pair.model.hidden(torch.cat(rows), label="main", position_ids=pos_ids)
+    with pair.fakes.opened(pair.fakes.stack_step(seq_lens), "prefill") as pos_ids:
+        hidden = pair.model.hidden(torch.cat(rows), position_ids=pos_ids)
     logits = pair.model.logits(hidden)
     ends = torch.tensor(seq_lens).cumsum(0)
     starts = ends - torch.tensor(seq_lens)
@@ -236,8 +231,8 @@ def test_backbone_prefill_and_decode_match_reference(pair: Pair):
             assert _max_diff(emb, ref_emb[0]) < 1e-6
             _, logits_i, pasts[i] = _ref_forward(pair, ref_emb, pasts[i])
             ref_step_logits.append(logits_i[0, -1])
-        pos_ids = pair.fakes.plan([1, 1])
-        hidden = pair.model.hidden(torch.cat(step_rows), label="main", position_ids=pos_ids)
+        with pair.fakes.opened(pair.fakes.stack_step([1, 1]), "decode") as pos_ids:
+            hidden = pair.model.hidden(torch.cat(step_rows), position_ids=pos_ids)
         logits = pair.model.logits(hidden)
         worst = max(_max_diff(logits[i], ref_step_logits[i]) for i in range(2))
         print(f"[{pair.variant}] decode step {step} logits max abs diff {worst:.2e}")
@@ -252,10 +247,10 @@ def test_backbone_ignores_or_requires_position_ids(pair: Pair):
     """Llama takes its positions from the resource; GPT-2 must be handed them."""
     emb = torch.zeros(3, pair.config.t3.hidden_size)
     pair.fakes.reset()
-    pair.fakes.plan([3])
     if pair.config.t3.backbone.is_gpt2:
         with pytest.raises(ValueError, match="position_ids"):
-            pair.model.hidden(emb, label="main")
+            pair.model.hidden(emb)
     else:
-        out = pair.model.hidden(emb, label="main")
+        with pair.fakes.opened(pair.fakes.stack_step([3]), "prefill"):
+            out = pair.model.hidden(emb)
         assert out.shape == emb.shape

@@ -5,6 +5,7 @@ without pulling FlashInfer in behind it.
 """
 
 import copy
+import logging
 import math
 from abc import ABC, abstractmethod
 from collections.abc import Collection, Iterable, Mapping, Sequence
@@ -21,6 +22,8 @@ if TYPE_CHECKING:
     from mstar.engine.resources.context_parallel import ContextParallel
     from mstar.engine.resources.sequence_shard import SeqShardSpec
     from mstar.engine.resources.spec import Storage
+
+logger = logging.getLogger(__name__)
 
 
 class KVLayout(Enum):
@@ -94,6 +97,15 @@ class KVConfig(ABC):
         the rest raise — a paged key against a ring config is a typo, and the
         spec's contract is that a typo is loud.
         """
+
+    def capacity_problem(
+        self, spec: "KVSpec", requests: int, request: "KVReqConfig | None",
+        axis_sizes: Sequence[Mapping[str, int]] = (),
+    ) -> str | None:
+        """Why ``spec``'s pool can't hold ``requests`` requests at once, each opened with ``request``, on node groups
+        of ``axis_sizes`` (as `NodeResourceSpec.capacity_problem` takes them), or None. None by default, for a pool its
+        window sizes rather than its requests."""
+        return None
 
 
 DEFAULT_PAGE_SIZE = 128
@@ -321,6 +333,41 @@ class PagedKVConfig(KVConfig):
             layout.pages(caps, group.page_size, group.retention) for group in later
         )
 
+    def capacity_problem(
+        self, spec: "KVSpec", requests: int, request: "KVReqConfig | None",
+        axis_sizes: Sequence[Mapping[str, int]] = (),
+    ) -> str | None:
+        """Each request holds the pages ``request`` lays out at its caps, or one stream of ``max_seq_len`` where it
+        lays out none, next to the sink page."""
+        # In arena pages. A stream of max_seq_len holds every token of every group, a window's too, since a one-step
+        # prefill keeps its whole prompt until it commits. A pool placed by position over a node group's ranks pages
+        # its window groups as `placed_groups` does.
+        per_request = max(
+            request.pages(spec.nodes, request.loop_caps or {}, pool) if request is not None
+            else sum(-(-self.max_seq_len // group.page_size) for group in pool.groups)
+            for pool in (self, *self._placed(spec, axis_sizes))
+        )
+        need = 1 + requests * per_request
+        if need <= self.num_units:
+            return None
+        return (
+            f"{requests} concurrent requests (max_concurrent_requests) need {self.pages_of(need, round_up=True)} pages "
+            f"of resources.{spec.resource_key} ({self.pages_of(per_request, round_up=True)} per request and the sink "
+            f"page), which has {self.max_num_pages}; raise max_num_pages, or lower max_concurrent_requests or the "
+            "tokens a request may hold"
+        )
+
+    def _placed(self, spec: "KVSpec", axis_sizes: Sequence[Mapping[str, int]]) -> "list[PagedKVConfig]":
+        """This config as each node group of ``axis_sizes`` pages it, where it sets ``context_parallel``.
+        A group it can't place on is validation's to report."""
+        placed = []
+        for sizes in axis_sizes if self.context_parallel else ():
+            try:
+                placed.append(self.paged_for(spec.resource_key, sizes["tp"], sizes["sp"]))
+            except ValueError:
+                pass
+        return placed
+
     @property
     def latent_dim(self) -> int:
         """Per-token cache width under MLA."""
@@ -380,6 +427,8 @@ class RingKVConfig(KVConfig):
     layers: tuple[RingKVLayerConfig, ...]
     # How many sessions are resident at once. NOT a batch.
     num_sessions: int = 1
+    # the most frames a request commits, which admit holds it to; None for no cap
+    max_frames: int | None = None
 
     @property
     def total_sessions(self) -> int:
@@ -409,6 +458,27 @@ class RingKVConfig(KVConfig):
                 f"num_sessions must be a positive int; got {self.num_sessions!r}. A node serving "
                 "zero sessions refuses every request at admit."
             )
+        if self.max_frames is not None and not (type(self.max_frames) is int and self.max_frames >= 1):
+            raise ValueError(f"max_frames must be None or a positive int; got {self.max_frames!r}")
+
+    def capacity_problem(
+        self, spec: "KVSpec", requests: int, request: "KVReqConfig | None",
+        axis_sizes: Sequence[Mapping[str, int]] = (),
+    ) -> str | None:
+        """A request holds a session from its first step until it is torn down. Sessions past the cap are allocated
+        and never filled, which is only a warning."""
+        if requests > self.num_sessions:
+            return (
+                f"{requests} concurrent requests (max_concurrent_requests) need {requests} sessions of "
+                f"resources.{spec.resource_key}, which has {self.num_sessions}; raise num_sessions or lower "
+                "max_concurrent_requests"
+            )
+        if requests < self.num_sessions:
+            logger.warning(
+                "resources.%s holds %d sessions and max_concurrent_requests is %d, so %d of them are allocated and "
+                "never filled", spec.resource_key, self.num_sessions, requests, self.num_sessions - requests,
+            )
+        return None
 
     def apply_yaml_overrides(self, num_sessions: int | None = None, **kwargs) -> None:
         """``num_sessions`` only. Nothing else here is a deployment knob."""
@@ -623,6 +693,11 @@ class KVReqConfig(ResourceReqConfig):
         if spec is None or not isinstance(spec.config, PagedKVConfig):
             return
         for label, layout in (self.kv_layout or {}).items():
+            # the release keeps an exact window in the first group alone, and a kept-window read is its array's only one
+            if layout.retention is not None and layout.retention.exact and len(spec.config.groups) > 1:
+                raise ValueError(
+                    f"{spec.resource_key!r}: label {label!r} keeps an exact window, and the pool has window groups"
+                )
             positions = layout.positions(self.loop_caps or {})
             if layout.retention is None and positions > spec.config.max_seq_len:
                 raise ValueError(
@@ -867,6 +942,12 @@ class KVSpec(NodeResourceSpec):
         storage strategy, so the config answers for them."""
         self.config.apply_yaml_overrides(**kwargs)
 
+    def capacity_problem(
+        self, requests: int, request: ResourceReqConfig | None, axis_sizes: Sequence[Mapping[str, int]] = (),
+    ) -> str | None:
+        """Forwarded to the config, as `apply_yaml_overrides` is: how requests fill a pool is the storage strategy's."""
+        return self.config.capacity_problem(self, requests, request, axis_sizes)
+
     def keeps_prefix_cache(self, world_size: int, checkpoint_named: bool) -> bool:
         return isinstance(self.config, PagedKVConfig) and self.config.keeps_prefix_cache(world_size, checkpoint_named)
 
@@ -900,10 +981,16 @@ class RetentionPolicy:
     realized context can run over the budget by up to a page; the excess is
     re-offered at the next commit. ``protected_prefix`` tokens at the head (a
     text prompt, say) are never released.
+
+    A prefix that ends inside a page keeps that whole page, so the release
+    would count the page's later tokens against the budget and could free
+    some of the latest ``context_budget`` tokens. An ``exact`` policy counts
+    the prefix to the end of its page instead, and keeps all of them.
     """
     context_budget: int
     # front tokens the window never releases; only pages within them are indexed
     protected_prefix: int = 0
+    exact: bool = False
 
     def __post_init__(self):
         if self.context_budget <= 0:
@@ -911,12 +998,17 @@ class RetentionPolicy:
         if self.protected_prefix < 0:
             raise ValueError(f"protected_prefix must be >= 0, got {self.protected_prefix}")
 
+    def kept_prefix(self, page_size: int) -> int:
+        """The tokens at the head the release counts as the prefix: ``protected_prefix``, rounded up to a page of
+        ``page_size`` when ``exact``."""
+        return -(-self.protected_prefix // page_size) * page_size if self.exact else self.protected_prefix
+
     def max_pages(self, page_size: int, step: int = 0) -> int:
         """The most pages of ``page_size`` a stream under this policy holds, with a step of
         ``step`` tokens past its prefix. `KVManager._apply_retention` leaves less than a page over
-        the budget, so the window peaks at the protected prefix plus the budget, or at the prefix
+        the budget, so the window peaks at the kept prefix plus the budget, or at the prefix
         rounded up to a page if that is larger, plus a page of overrun and the step."""
-        prefix = self.protected_prefix
+        prefix = self.kept_prefix(page_size)
         window = max(prefix + self.context_budget, -(-prefix // page_size) * page_size)
         return -(-(window + page_size - 1 + step) // page_size)
 
@@ -1024,6 +1116,4 @@ class KVStep(ResourceStep):
 
 @dataclass(frozen=True, kw_only=True)
 class RingKVStep(ResourceStep):
-    """One ring clock per request in the step's batch."""
-
-    frames: tuple[tuple[str, int], ...]
+    """A step of a ring: one frame per row, which its commit counts."""

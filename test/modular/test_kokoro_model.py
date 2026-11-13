@@ -20,7 +20,7 @@ import yaml
 
 sys.path.insert(0, ".")
 
-from mstar.conductor.request_info import CurrentForwardPassInfo  # noqa: E402
+from mstar.conductor.request_info import CurrentForwardPassInfo, WalkStep  # noqa: E402
 from mstar.graph.base import GraphNode, Loop  # noqa: E402
 from mstar.graph.special_destinations import EMIT_TO_CLIENT  # noqa: E402
 from mstar.model.kokoro import g2p  # noqa: E402
@@ -30,9 +30,9 @@ from mstar.model.kokoro.components.stft import RealSTFT  # noqa: E402
 from mstar.model.kokoro.config import (  # noqa: E402
     AUDIO_CHUNK,
     BOUNDARY_TOKEN_ID,
+    CHUNK_LENGTHS,
     CHUNK_LOOP,
     PHONEME_IDS,
-    PHONEME_LENS,
     REF_STYLE,
     SPEED,
     SYNTH_NODE,
@@ -468,7 +468,7 @@ def test_graph_is_one_streaming_loop(voices_dir):
     assert isinstance(loop, Loop) and loop.name == CHUNK_LOOP and loop.max_iters == model.config.max_chunks
     node = loop.section
     assert isinstance(node, GraphNode) and node.name == SYNTH_NODE
-    assert node.input_names == {PHONEME_IDS, PHONEME_LENS, REF_STYLE, SPEED}
+    assert node.input_names == {PHONEME_IDS, REF_STYLE, SPEED}
     assert node.enable_async_scheduling is False
     emits = [e for e in node.outputs if e.next_node == EMIT_TO_CLIENT]
     assert [(e.name, e.output_modality) for e in emits] == [(AUDIO_CHUNK, "audio")]
@@ -478,8 +478,9 @@ def test_graph_is_one_streaming_loop(voices_dir):
 def test_process_prompt_tensors(voices_dir):
     model = make_model(voices_dir)
     out = model.process_prompt("Hello. Bye!", ["text"], ["audio"], voice="af_sky(2)+af_heart", speed=1.25)
-    ids, lens, style, speed = out[PHONEME_IDS][0], out[PHONEME_LENS][0], out[REF_STYLE][0], out[SPEED][0]
-    assert ids.shape == (2, 8) and lens.tolist() == [8, 6]  # "ab cd." -> 6 ids + bos/eos; "efg!" -> 4 + 2
+    tensors = out.new_input_tensors
+    ids, style, speed = tensors[PHONEME_IDS][0], tensors[REF_STYLE][0], tensors[SPEED][0]
+    assert ids.shape == (2, 8) and out.metadata[CHUNK_LENGTHS] == [8, 6]  # "ab cd." -> 6 ids + bos/eos; "efg!" -> 4 + 2
     assert ids[0, 0] == BOUNDARY_TOKEN_ID and ids[0, 7] == BOUNDARY_TOKEN_ID and ids[1, 6:].tolist() == [0, 0]
     assert ids[0, 1:7].tolist() == [VOCAB[c] for c in "ab cd."]
     assert style.shape == (2, 16)
@@ -521,7 +522,7 @@ def test_voices_and_requests_follow_the_installed_g2p(voices_dir):
     model.g2p.unavailable.clear()
     assert model.get_voices() == ["af_heart", "af_sky", "am_adam", "zf_xiaobei"]
     out = model.process_prompt("你好", ["text"], ["audio"], voice="zf_xiaobei")
-    assert out[PHONEME_LENS][0].tolist() == [5]  # <bos> a b . <eos>
+    assert out.metadata[CHUNK_LENGTHS] == [5]  # <bos> a b . <eos>
 
 
 def test_missing_language_backend_is_reported_once(monkeypatch):
@@ -551,7 +552,13 @@ def test_process_prompt_language_and_phonemes(voices_dir):
     model.process_prompt("Hola", ["text"], ["audio"], voice="am_adam", lang_code="es")
     assert model.g2p.calls[-1] == ("Hola", "es")
     out = model.process_prompt(None, ["text"], ["audio"], phonemes="ab cd")
-    assert out[PHONEME_IDS][0].shape == (1, 7) and model.g2p.calls[-1][0] == "Hola"
+    assert out.new_input_tensors[PHONEME_IDS][0].shape == (1, 7) and model.g2p.calls[-1][0] == "Hola"
+
+
+def test_walk_plan_carries_the_chunk_lengths(voices_dir):
+    model = make_model(voices_dir)
+    kwargs = {CHUNK_LENGTHS: [8, 6]}
+    assert model.walk_plan("default", ["text"], ["audio"], {}, kwargs) == [WalkStep(SYNTH_WALK, step_metadata=kwargs)]
 
 
 def test_postprocess(voices_dir):
@@ -585,6 +592,7 @@ def _fwd_info(rid: str, iteration: int, seed: int = 0) -> CurrentForwardPassInfo
     info = CurrentForwardPassInfo(
         request_id=rid, graph_walk=SYNTH_WALK, fwd_index=0, random_seed=seed, max_tokens=0,
         rid_handle=HANDLES.setdefault(rid, len(HANDLES) + 1),
+        step_metadata={CHUNK_LENGTHS: {"r1": [4, 5], "r2": [3], "a": [5], "b": [7]}[rid]},
     )
     info.dynamic_loop_iter_counts[CHUNK_LOOP] = iteration
     return info
@@ -595,9 +603,9 @@ def test_submodule_iterates_chunks_and_stops():
     submodule = KokoroSynthSubmodule(tiny_model(), config)
     torch.manual_seed(0)
     requests = {
-        "r1": {PHONEME_IDS: [torch.tensor([[0, 1, 2, 0, 0], [0, 3, 4, 5, 0]])], PHONEME_LENS: [torch.tensor([4, 5])],
+        "r1": {PHONEME_IDS: [torch.tensor([[0, 1, 2, 0, 0], [0, 3, 4, 5, 0]])],
                REF_STYLE: [torch.randn(2, 16)], SPEED: [torch.tensor([1.0])]},
-        "r2": {PHONEME_IDS: [torch.tensor([[0, 7, 0]])], PHONEME_LENS: [torch.tensor([3])],
+        "r2": {PHONEME_IDS: [torch.tensor([[0, 7, 0]])],
                REF_STYLE: [torch.randn(1, 16)], SPEED: [torch.tensor([1.5])]},
     }
     prepared = {
@@ -608,7 +616,6 @@ def test_submodule_iterates_chunks_and_stops():
     # iteration 1 exists only for r1; iteration 2 for nobody
     assert submodule.prepare_inputs(SYNTH_WALK, _fwd_info("r1", 1), requests["r1"]).input_seq_len == 5
     assert submodule.prepare_inputs(SYNTH_WALK, _fwd_info("r2", 1), requests["r2"]) is None
-    # the engine passes the rid handle, not the request id string
     assert submodule.check_stop(HANDLES["r1"], _fwd_info("r1", 0), {}) == set()
     assert submodule.check_stop(HANDLES["r1"], _fwd_info("r1", 1), {}) == {CHUNK_LOOP}
     assert submodule.check_stop(HANDLES["r2"], _fwd_info("r2", 0), {}) == {CHUNK_LOOP}
@@ -630,8 +637,6 @@ def test_submodule_iterates_chunks_and_stops():
     # the same chunk alone and inside a padded batch agree to rounding
     assert single.shape == out["r2"][AUDIO_CHUNK][0].shape
     assert rel_l2(single.float(), out["r2"][AUDIO_CHUNK][0].float()) < 5e-3
-    submodule.cleanup_request(HANDLES["r1"])
-    assert HANDLES["r1"] not in submodule.request_states
 
 
 def test_openai_adapter_maps_speech_request():
@@ -905,10 +910,10 @@ def test_bad_request_values_are_400s(voices_dir, kwargs, match):
 
 def test_absent_knobs_take_the_defaults(voices_dir):
     model = make_model(voices_dir)
-    out = model.process_prompt("Hi", ["text"], ["audio"])
+    out = model.process_prompt("Hi", ["text"], ["audio"]).new_input_tensors
     assert out[SPEED][0].tolist() == [model.config.default_speed]
     assert torch.equal(out[REF_STYLE][0][0], model.voices.style(model.config.default_voice, 6))
-    assert model.process_prompt("Hi", ["text"], ["audio"], speed=2)[SPEED][0].tolist() == [2.0]
+    assert model.process_prompt("Hi", ["text"], ["audio"], speed=2).new_input_tensors[SPEED][0].tolist() == [2.0]
 
 
 def test_keyed_noise_is_standard_normal_and_batch_independent():
@@ -945,9 +950,9 @@ def test_source_noise_follows_the_request_seed_not_the_global_rng():
     submodule = KokoroSynthSubmodule(model, tiny_config())
     torch.manual_seed(0)
     requests = {
-        "a": {PHONEME_IDS: [torch.tensor([[0, 1, 2, 3, 0]])], PHONEME_LENS: [torch.tensor([5])],
+        "a": {PHONEME_IDS: [torch.tensor([[0, 1, 2, 3, 0]])],
               REF_STYLE: [torch.randn(1, 16)], SPEED: [torch.tensor([1.0])]},
-        "b": {PHONEME_IDS: [torch.tensor([[0, 7, 4, 5, 6, 8, 0]])], PHONEME_LENS: [torch.tensor([7])],
+        "b": {PHONEME_IDS: [torch.tensor([[0, 7, 4, 5, 6, 8, 0]])],
               REF_STYLE: [torch.randn(1, 16)], SPEED: [torch.tensor([0.8])]},
     }
     state = torch.get_rng_state()

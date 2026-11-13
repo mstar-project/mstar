@@ -19,11 +19,13 @@ import torch
 from mstar.engine.state import (
     Array,
     Attend,
+    Bidirectional,
     Block,
     Causal,
     CausalConv,
     Entry,
     Fork,
+    FrameWindow,
     GatedDeltaNet,
     KVEntry,
     PagedNHD,
@@ -35,7 +37,7 @@ from mstar.engine.state import (
     Value,
     Window,
 )
-from mstar.engine.state.contract import Op
+from mstar.engine.state.contract import Mask, Op
 
 _ENTRY = KVEntry(heads=4, head_dim=8)
 _GDN = Entry({
@@ -65,7 +67,6 @@ def _holding(tensor: TensorType) -> Array:
 
 
 REFUSALS = {
-    "empty shape": (lambda: _holding(TensorType((), dtype=None)), "Array 'kv'.entry.tensors['k'].shape"),
     "list shape": (lambda: _holding(TensorType([4, 8], dtype=None)), "Array 'kv'.entry.tensors['k'].shape"),
     "zero in shape": (lambda: _holding(TensorType((4, 0), dtype=None)), "Array 'kv'.entry.tensors['k'].shape"),
     "bool in shape": (lambda: _holding(TensorType((True, 8), dtype=None)), "Array 'kv'.entry.tensors['k'].shape"),
@@ -145,6 +146,18 @@ REFUSALS = {
     "queries with a mask that uses the query's position": (
         lambda: _array(reads={"r": _read(queries="video")}), "Array 'kv'.reads['r'].queries",
     ),
+    "queries with no op": (
+        lambda: _array(reads={"r": Read(mask=Bidirectional(), queries="video")}),
+        "Array 'kv'.reads['r'].queries: a read with no op",
+    ),
+    "queries naming the read's own array": (
+        lambda: _array(reads={"r": _read(mask=Bidirectional(), queries="kv")}),
+        "Array 'kv'.reads['r'].queries names this array",
+    ),
+    "queries naming the read's own array, within the step": (
+        lambda: _array(max_len=0, reads={"r": _read(mask=Block(), queries="kv")}),
+        "Array 'kv'.reads['r'].queries names this array",
+    ),
     "update on one entry that isn't rewritable": (
         lambda: _array(entry=_GDN, max_len=1, updates={"u": CausalConv()}),
         "Array 'kv'.updates['u']: only a Value",
@@ -177,8 +190,14 @@ def test_a_bad_declaration_is_refused_naming_the_array_and_field(name):
     assert str(refused.value).startswith(where), f"the refusal should open with {where}: {refused.value}"
 
 
+@dataclass(frozen=True)
+class _UndeclaredMask(Mask):
+    """Sets neither property a mask declares."""
+
+
 @pytest.mark.parametrize("build, where", [
     (lambda: Read(mask="nope"), "Read.mask"),
+    (lambda: Read(mask=_UndeclaredMask()), "Read.mask: _UndeclaredMask leaves ['uses_query_position'"),
     (lambda: Read(mask=Causal(), op="garbage"), "Read.op"),
     (lambda: Read(mask=Causal(), op=CausalConv()), "Read.op: a read changes no field"),
 ])
@@ -186,6 +205,27 @@ def test_a_bad_mask_or_op_is_refused_when_the_read_is_built(build, where):
     with pytest.raises(ValueError) as refused:
         build()
     assert str(refused.value).startswith(where), f"the refusal should open with {where}: {refused.value}"
+
+
+@pytest.mark.parametrize("mask, uses_query_position, sees_step_whole", [
+    (Causal(), True, False), (Window(4), True, False), (Block(), False, True), (Bidirectional(), False, True),
+    (FrameWindow(4, frames=2), True, True),
+])
+def test_each_mask_says_whether_it_uses_the_query_position_and_sees_a_step_whole(
+    mask, uses_query_position, sees_step_whole,
+):
+    """`queries` takes a mask that uses no query position, and a regrouped walk refuses one that sees a step whole."""
+    assert (mask.uses_query_position, mask.sees_step_whole) == (uses_query_position, sees_step_whole)
+
+
+@pytest.mark.parametrize("mask, change", [
+    (Block(), "Block sees each step's adds as a whole"),
+    (Bidirectional(), "Bidirectional sees each step's adds as a whole"),
+    (FrameWindow(4, frames=2), "A step boundary inside a frame cuts what the frame's queries see"),
+])
+def test_each_mask_that_sees_a_step_whole_says_what_a_split_step_changes(mask, change):
+    """The refusal of a regrouped walk gives the sentence of the read's mask."""
+    assert mask.split_step_change() == change
 
 
 @dataclass(frozen=True)
@@ -284,3 +324,17 @@ def test_a_fork_refuses_a_time_it_doesnt_have():
 def test_a_sampler_with_a_list_of_eos_ids_stays_hashable():
     sampler = Sampler("s", nodes={"LLM"}, vocab_size=8, eos_ids=[1, 2])
     assert hash(sampler) == hash(Sampler("s", nodes={"LLM"}, vocab_size=8, eos_ids=(1, 2)))
+
+
+def test_a_scalar_field_declares_an_empty_shape():
+    assert _value(entry=Entry({"count": TensorType((), dtype=torch.int64)})).entry.tensors["count"].shape == ()
+
+
+def test_a_scalar_field_has_no_axis_to_shard():
+    with pytest.raises(ValueError, match=r"shard must be None or an axis of shape \(\)"):
+        _value(entry=Entry({"count": TensorType((), dtype=torch.int64, shard=0)}))
+
+
+def test_a_scalar_field_has_no_kv_layout():
+    with pytest.raises(ValueError, match="Attend needs entry fields"):
+        _array(entry=_entry(TensorType((), dtype=None), TensorType((), dtype=None)), reads={"attn": _read()})

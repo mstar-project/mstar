@@ -5,6 +5,7 @@ for by dense fakes; and the decoder node's context spans and stop checks. The
 encoder's parity is in test_fastconformer.py."""
 
 import json
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -94,7 +95,7 @@ def test_process_prompt_and_its_limits(snapshot):
     assert out.new_input_tensors["audio"][0].shape == (16_000,)
     assert out.new_input_tensors["text_inputs"][0].tolist() == model.config.prompt_ids("de", "en")
     # the decoder writes the prompt, then a slot per step; the context is the clip's encoder frames
-    layout = out.metadata["kv_layout"]
+    layout = out.metadata["state_layout"]
     assert set(layout) == set(model.kv_labels()) and all(set(layout[k]) == set(v) for k, v in model.kv_labels().items())
     assert layout["kv_cache"]["main"].spans[0].length == PROMPT_LENGTH
     assert layout["cross_kv_cache"]["main"].spans[0].length == model.config.encoder.output_lengths(100)
@@ -187,34 +188,36 @@ def test_adapter_maps_and_refuses():
 
 
 class _FakeSelfAttention:
-    """Dense stand-in for the paged KV + attention pair, one request: the K/V
-    written so far are its pages, and causal SDPA is the kernel."""
+    """Dense stand-in for the self-attention array's handle, one request: the
+    K/V added so far are its pages, and causal SDPA is the kernel. It hands the
+    node the step's position ids, and keeps the hidden states it picks each
+    row's last token from."""
 
-    requires_kv_write = True
+    label = "main"
 
     def __init__(self):
-        self._label, self._layer = "main", 0
         self._kv: dict[int, tuple[list, list]] = {}
         self._pending = None
+        self.positions = None
+        self.seen = None
 
-    @property
-    def default_label(self):
-        return self._label
+    def _check_open(self, call):
+        pass
 
-    def set_default_label(self, label):
-        self._label = label
+    def at_last_token(self, hidden, *, label=None):
+        self.seen = hidden
+        return hidden[-1:]
 
-    def set_default_layer_idx(self, idx):
-        self._layer = idx
+    def _add_read(self, layer, q, *, keep, k, v):
+        assert keep is None, "this fake keeps every add"
+        self.add(layer, k=k, v=v)
+        return self.read(layer, q)
 
-    def layer_view(self):
-        return self._layer
-
-    def write_kv(self, k, v):
+    def add(self, layer, *, k, v):
         self._pending = (k, v)
 
-    def run(self, q, kv_cache_layer, k=None, v=None):
-        ks, vs = self._kv.setdefault(kv_cache_layer, ([], []))
+    def read(self, layer, q):
+        ks, vs = self._kv.setdefault(int(layer), ([], []))
         ks.append(self._pending[0])
         vs.append(self._pending[1])
         k_all, v_all = torch.cat(ks), torch.cat(vs)
@@ -225,44 +228,26 @@ class _FakeSelfAttention:
         return out.transpose(0, 1)
 
 
+class _FakeSampler:
+    """The sampler's handle for one row, handing back the logits it's given."""
+
+    _open, _drawn, rows = True, 0, ("a",)
+    sampler = SimpleNamespace(draws=2 ** 31)
+    resource = SimpleNamespace(sample=lambda rows, logits: logits)
+
+
 class _FakeContext:
-    """The cross-attention context cache: the clip's K/V per layer, written once."""
+    """The context array's handle: the clip's K/V per layer, added once and read
+    whole with no mask."""
 
     def __init__(self):
-        self._layer, self.kv = 0, {}
+        self.kv = {}
 
-    def set_default_layer_idx(self, idx):
-        self._layer = idx
+    def add(self, layer, *, k, v):
+        self.kv[int(layer)] = (k, v)
 
-    def layer_view(self):
-        return self._layer
-
-    def write_kv(self, k, v, label):
-        self.kv[self._layer] = (k, v)
-
-
-class _LastRows:
-    """The attention resource's pick of a prefill row's last token, for one
-    row; keeps the hidden states it was handed."""
-
-    seen = None
-
-    def select_last_hidden(self, hidden):
-        self.seen = hidden
-        return hidden[-1:]
-
-
-class _FakeCross:
-    """Cross-attention over the whole context, no mask."""
-
-    def __init__(self, context: _FakeContext):
-        self.context = context
-
-    def set_default_label(self, label):
-        pass
-
-    def run(self, q, kv_cache_layer):
-        k, v = self.context.kv[kv_cache_layer]
+    def read(self, layer, q):
+        k, v = self.kv[int(layer)]
         out = torch.nn.functional.scaled_dot_product_attention(q.transpose(0, 1), k.transpose(0, 1), v.transpose(0, 1))
         return out.transpose(0, 1)
 
@@ -272,11 +257,9 @@ def test_decoder_matches_hf():
     decode steps, through the decoder node's forward: the decoder's hidden
     states against HF's ``CanaryDecoder`` at every prefill position, and the
     logits it samples from at each step, loaded through the serving loader."""
-    from types import SimpleNamespace
-
     transformers = pytest.importorskip("transformers")
     modeling = pytest.importorskip("transformers.models.canary.modeling_canary")
-    from mstar.model.canary.config import ATTN, CROSS_ATTN, CROSS_KV_CACHE, KV_CACHE, POS, SAMPLER
+    from mstar.model.canary.config import CROSS_KV_CACHE, KV_CACHE, SAMPLER
     from mstar.model.canary.submodules import CanaryDecoderSubmodule
     from mstar.model.components.fastconformer import FastConformerConfig
     from mstar.model.loader import WHISPER_STACKED_PARAMS, load_hf_weights
@@ -298,20 +281,17 @@ def test_decoder_matches_hf():
     check_loaded(ours, load_hf_weights(
         ours, weights, stacked_params=WHISPER_STACKED_PARAMS, name_remapper=CanaryDecoderModel.remap,
     ), "decoder")
-    self_attn, context = _FakeSelfAttention(), _FakeContext()
+    handles = {KV_CACHE: _FakeSelfAttention(), CROSS_KV_CACHE: _FakeContext(), SAMPLER: _FakeSampler()}
     for module in ours.modules():
-        if hasattr(module, "bind_resources") and module is not ours:
-            module.bind_resources({ATTN: self_attn, KV_CACHE: self_attn, CROSS_ATTN: _FakeCross(context),
-                                   CROSS_KV_CACHE: context})
-
-    node, last_rows = CanaryDecoderSubmodule(ours, config), _LastRows()
+        if hasattr(module, "bind_state"):
+            module.bind_state(handles)
+    node, kv = CanaryDecoderSubmodule(ours, config, max_context=13), handles[KV_CACHE]
+    node.bind_state(handles)
 
     def run(walk, inputs, positions):
         """One step as the engine runs it, with a sampler that hands back its logits."""
-        engine_inputs = SimpleNamespace(request_ids=["a"], resources={
-            POS: SimpleNamespace(pos_ids=lambda label: positions), ATTN: last_rows,
-            SAMPLER: SimpleNamespace(sample=lambda request_ids, logits: logits),
-        })
+        kv.positions = SimpleNamespace(pos_ids=lambda label: positions)
+        engine_inputs = SimpleNamespace(request_ids=["a"])
         rows = [node.prepare_inputs(walk, None, inputs)]
         return node.forward_batched(walk, engine_inputs, **node.preprocess(walk, engine_inputs, rows))
 
@@ -322,7 +302,7 @@ def test_decoder_matches_hf():
         out = run("prefill", {"text_inputs": [tokens], "encoder_states": [encoder_states]}, torch.arange(9))
         expected = reference(tokens[None], position_ids=torch.arange(9)[None],
                              encoder_hidden_states=encoder_states[None]).last_hidden_state[0]
-        assert torch.allclose(last_rows.seen, expected, atol=1e-4), (last_rows.seen - expected).abs().max()
+        assert torch.allclose(kv.seen, expected, atol=1e-4), (kv.seen - expected).abs().max()
         assert torch.allclose(out.row_outputs["new_token"], ours.logits(expected[-1:]), atol=1e-3)
         for step in range(2):
             nxt = torch.randint(0, 50, (1,))
@@ -343,14 +323,14 @@ def _tiny_node():
         encoder=FastConformerConfig(), hidden_size=32, num_layers=1, num_heads=4, intermediate_size=64,
         vocab_size=50, max_position_embeddings=64, eos_token_id=3,
     )
-    return CanaryDecoderSubmodule(CanaryDecoderModel(config), config)
+    return CanaryDecoderSubmodule(CanaryDecoderModel(config), config, max_context=13)
 
 
 def test_prefill_reserves_each_clips_context_once():
-    """The cross-attention context is written at prefill: each request's
+    """The cross-attention context is added at prefill: each request's
     segment spans its encoder frames, in the order the frames are concatenated
-    for the write; on decode the span is zero."""
-    from mstar.model.canary.config import CROSS_ATTN, CROSS_KV_CACHE
+    for the add; on decode the span is zero."""
+    from mstar.model.canary.config import CROSS_KV_CACHE
     from mstar.model.submodule_base import ARNodeInputs
 
     node = _tiny_node()
@@ -358,14 +338,48 @@ def test_prefill_reserves_each_clips_context_once():
     prefill = [ARNodeInputs(input_ids=torch.arange(9), input_seq_len=9, tensor_inputs={"encoder_states": c})
                for c in clips]
     step = node.declare_step("prefill", ["a", "b"], prefill)
-    for key in (CROSS_KV_CACHE, CROSS_ATTN):
-        assert [(s.request_id, s.span) for s in step.steps[key].segments] == [("a", 13), ("b", 7)]
+    assert [(s.request_id, s.span) for s in step.state[CROSS_KV_CACHE].segments] == [("a", 13), ("b", 7)]
     assert [s.span for s in step.segments] == [9, 9]
-    assert torch.equal(node.preprocess("prefill", None, prefill)["encoder_states"], torch.cat(clips))
+    # added in `preprocess`, outside the prefill's graph, which is sized by the prompt alone
+    assert step.state[CROSS_KV_CACHE].eager_add
+    written = []
+    node.model.add_context = written.append
+    assert "encoder_states" not in node.preprocess("prefill", None, prefill)
+    assert len(written) == 1 and torch.equal(written[0], torch.cat(clips))
     decode = [ARNodeInputs(input_ids=torch.tensor([5]), input_seq_len=1) for _ in clips]
     step = node.declare_step("decode", ["a", "b"], decode)
-    assert [s.span for s in step.steps[CROSS_KV_CACHE].segments] == [0, 0]
-    assert "encoder_states" not in node.preprocess("decode", None, decode)
+    assert [s.span for s in step.state[CROSS_KV_CACHE].segments] == [0, 0]
+    assert not step.state[CROSS_KV_CACHE].eager_add
+    assert "encoder_states" not in node.preprocess("decode", None, decode) and len(written) == 1
+
+
+def test_a_padded_prefill_replay_projects_only_the_real_rows_context():
+    """A replay pads its rows to the bucket's batch size with rows of no
+    tokens; they carry no context, so the eager context add projects the
+    real clips' frames and nothing for the padding."""
+    from collections import namedtuple
+    from types import SimpleNamespace
+
+    from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner
+    from mstar.model.canary.config import CROSS_KV_CACHE
+    from mstar.model.submodule_base import ARNodeInputs
+
+    node = _tiny_node()
+    _, prefill = node.get_accelerator_graph_configs(torch.device("cpu"))
+    clips = [torch.randn(13, 32), torch.randn(7, 32)]
+    real = [ARNodeInputs(input_ids=torch.arange(PROMPT_LENGTH), input_seq_len=PROMPT_LENGTH,
+                         tensor_inputs={"encoder_states": c}) for c in clips]
+    # the runner's own padding of a 2-row step to a 5-row bucket
+    bucket = namedtuple("Bucket", "bs")(5)
+    runner = SimpleNamespace(_buckets={bucket: SimpleNamespace(config=prefill)})
+    rows = AcceleratorGraphRunner.pad_inputs(runner, SimpleNamespace(bucket=bucket), real)
+    assert len(rows) == 5 and rows[:2] == real
+    step = node.declare_step("prefill", ["a", "b", "p0", "p1", "p2"], rows)
+    assert [s.span for s in step.state[CROSS_KV_CACHE].segments] == [13, 7, 0, 0, 0]
+    written = []
+    node.model.add_context = written.append
+    node.preprocess("prefill", None, rows)
+    assert len(written) == 1 and torch.equal(written[0], torch.cat(clips))
 
 
 @pytest.mark.parametrize("width", [1, 3])
@@ -402,17 +416,24 @@ def test_batched_stop_check_agrees_with_the_per_request_one(width):
 
 
 def test_decoder_node_caps_captures_and_names(snapshot):
-    """What the shared decoder gives Canary's node, as before the scaffold:
-    prefill batches capped, only decode captured on its ladder, the sampled
-    token fed back, the walk, loop and sampler names of Canary's graph, and
-    positions advanced on the resource the model declares, under its key."""
-    from mstar.model.canary.config import POS, SAMPLER
+    """What the shared decoder gives Canary's node: prefill batches capped,
+    decode captured on its ladder and prefill packed at the prompt's length per
+    row, the sampled token fed back, the walk, loop and sampler names of
+    Canary's graph, and positions advanced on the array the model declares,
+    under its key."""
+    from mstar.engine.state.adapters import node_resources
+    from mstar.model.canary.config import KV_CACHE, SAMPLER
     from mstar.model.submodule_base import ARNodeInputs
 
     node = _tiny_node()
     assert node.max_batch_size("prefill") == 32 and node.max_batch_size("decode") is None
-    (capture,) = node.get_accelerator_graph_configs(torch.device("cpu"))
+    capture, prefill = node.get_accelerator_graph_configs(torch.device("cpu"))
     assert capture.capture_graph_walk == "decode" and capture.capture_batch_sizes == [1, 2, 4, 8, 16, 32, 64]
+    assert prefill.capture_graph_walk == "prefill" and prefill.capture_batch_sizes == [1, 2, 4, 8, 16, 32]
+    assert [prefill.get_total_tokens(bs) for bs in (1, 4, 32)] == [[PROMPT_LENGTH], [4 * PROMPT_LENGTH], [320]]
+    # template rows reserve the longest clip's context
+    rows = prefill.get_node_inputs(4, 4 * PROMPT_LENGTH)
+    assert [(r.input_seq_len, r.tensor_inputs["encoder_states"].shape[0]) for r in rows] == [(PROMPT_LENGTH, 13)] * 4
     outputs = {"new_token": [torch.tensor([5])]}
     node.postprocess("a", None, outputs)
     assert outputs["text_inputs"] is outputs["new_token"]
@@ -423,12 +444,12 @@ def test_decoder_node_caps_captures_and_names(snapshot):
     assert {e.name for e in walks[node.DECODE_WALK].section.outputs} == {"text_inputs"}
     step = node.declare_step("decode", ["a"], [ARNodeInputs(input_ids=torch.tensor([5]), input_seq_len=1)])
     # the resource key YAML overrides name
-    assert POS == "positions" and POS in step.steps and POS in {s.resource_key for s in model.get_node_resources()}
+    assert KV_CACHE in step.state and "rope" in {s.resource_key for s in node_resources(model)}
 
 
-def test_canary_keeps_mains_token_path_unless_a_deployment_asks_it_to_repeat():
-    """Main left Canary's device loop-back off as a measured change of its own;
-    ``step_repeats:`` turns it on, with resident decode and the runtime's stop."""
+def test_canary_decodes_on_the_device_and_resident_tables_by_default():
+    """Decode loops its token back on the device and runs on resident tables
+    without a deployment asking; ``step_repeats:`` leaves that as it is."""
     from types import SimpleNamespace
 
     from mstar.model.canary.config import SAMPLER
@@ -436,7 +457,8 @@ def test_canary_keeps_mains_token_path_unless_a_deployment_asks_it_to_repeat():
     from mstar.testing_utils.engine import make_engine, make_mgmt
 
     node = _tiny_node()
-    assert node.device_loopback is None and not node.resident_walks()
+    loopback = DeviceLoopback(node.DECODE_WALK, "text_inputs", SAMPLER, "new_token")
+    assert node.device_loopback == loopback and node.resident_walks() == {node.DECODE_WALK}
     sampler = SimpleNamespace(
         enable_device_loopback_reader=lambda: None,
         lean_capture=False, force_double_buffer=False, supports_preplan=False,
@@ -445,5 +467,5 @@ def test_canary_keeps_mains_token_path_unless_a_deployment_asks_it_to_repeat():
 
     engine.enable_repeats("decoder", {node.DECODE_WALK})
 
-    assert node.device_loopback == DeviceLoopback(node.DECODE_WALK, "text_inputs", SAMPLER, "new_token")
+    assert node.device_loopback == loopback
     assert node.resident_walks() == {node.DECODE_WALK} and node.get_stop_policies(node.DECODE_WALK)

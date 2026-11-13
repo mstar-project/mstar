@@ -36,42 +36,31 @@ import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import PartitionDefinition
-from mstar.engine.resources import (
-    AttentionConfig,
-    AttentionSpec,
-    KVSpec,
-    NodeResourceSpec,
-    PagedKVConfig,
-    PositionConfig,
-    PositionSpec,
-)
+from mstar.engine.state import Array, Attend, Causal, Entry, KVEntry, Layout, Positions, Read, Span, Value
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.base import (
-    KVLabel,
-    LabelLayout,
-    Model,
-    ProcessPromptOutput,
-    Span,
-    TensorAndMetadata,
-    WalkStep,
-)
+from mstar.model.base import KVLabel, Model, ProcessPromptOutput, TensorAndMetadata, WalkStep
 from mstar.model.submodule_base import NodeSubmodule
+from mstar.model.utils import check_kv_pools_fit
 from mstar.model.voxcpm2.config import (
     AUDIO_START_TOKEN,
     BASE_ATTN,
     BASE_KV,
-    BASE_POS,
+    CFG_KEY,
     MIN_LEN_KEY,
     MODE_REF_CONTINUATION,
     MODE_REFERENCE,
     MODE_ZERO_SHOT,
+    PAGE_TOKENS,
     PATCH_BUDGET_KEY,
     PROMPT_MODE_KEY,
     REF_DIGEST_KEY,
     RES_ATTN,
     RES_KV,
+    TALKER_DECODE_METADATA,
+    TALKER_STEP,
     TALKER_STEP_METADATA,
+    MiniCPM4Config,
     VoxCPM2Config,
 )
 from mstar.streaming.chunk_policy import ScheduledLeftContextChunkPolicy
@@ -150,7 +139,7 @@ class VoxCPM2Model(Model):
     MAX_PATCHES_PER_TEXT_TOKEN = 3.0
     # configs/voxcpm2.yaml's max_concurrent_requests; the KV pools default to its size
     DEFAULT_MAX_CONCURRENT = 32
-    PREFILL_INPUTS = ("text_inputs", "gen_params")
+    PREFILL_INPUTS = ("text_inputs",)
     REF_ENCODER_INPUTS = ("audio_inputs",)
 
     def __init__(self, model_path_hf: str, cache_dir: str | None = None, **kwargs: Any) -> None:
@@ -205,64 +194,32 @@ class VoxCPM2Model(Model):
     # -- resources / graph --------------------------------------------------
 
     def validate_config_yaml(self, config: dict, config_path: str) -> None:
-        """Refuse a request cap either LM cache cannot hold.
+        """Refuse a request cap either LM cache cannot hold."""
+        check_kv_pools_fit(self, config, config_path, logger)
 
-        Nothing preempts a request once a cache is full: the worker retries the
-        step that found no free page until the requests time out, while the
-        server still reports healthy. A request holds at most ``max_length``
-        positions (``process_prompt`` refuses longer ones), so
-        ``max_concurrent_requests`` such requests must fit in each cache next to
-        its sink page; the conductor queues the rest.
-        """
-        cap = config.get("max_concurrent_requests")
-        if cap is None:
-            logger.warning(
-                "%s sets no max_concurrent_requests: a burst of long requests can fill "
-                "the VoxCPM2 KV caches and stall until the requests time out", config_path,
+    def declare_state(self) -> list[Array]:
+        def lm(name: str, stack: MiniCPM4Config, read: str, positions: Positions | None = None) -> Array:
+            return Array(
+                name, nodes={"Talker"}, layers=frozenset(range(stack.num_hidden_layers)),
+                entry=KVEntry(heads=stack.num_key_value_heads, head_dim=stack.head_dim),
+                max_len=self.config.max_length, positions=positions,
+                reads={read: Read(mask=Causal(), op=Attend(q_heads=stack.num_attention_heads))},
             )
-            return
-        if not isinstance(cap, int) or isinstance(cap, bool) or cap < 1:
-            raise ValueError(f"{config_path}: max_concurrent_requests must be a positive int; got {cap!r}")
-        overrides = config.get("resources") or {}
-        for spec in self.get_node_resources():
-            if not isinstance(spec, KVSpec):
-                continue
-            override = overrides.get(spec.resource_key) or {}
-            page_size = int(override.get("page_size", spec.config.tokens_per_page))
-            max_num_pages = int(override.get("max_num_pages", spec.config.max_num_pages))
-            per_request = -(-self.config.max_length // page_size)
-            need = 1 + cap * per_request
-            if need > max_num_pages:
-                raise ValueError(
-                    f"{config_path}: {cap} concurrent requests (max_concurrent_requests) need "
-                    f"{need} pages of resources.{spec.resource_key} ({per_request} per "
-                    f"{self.config.max_length}-position request and the sink page), which has "
-                    f"{max_num_pages}; raise max_num_pages or lower max_concurrent_requests"
-                )
 
-    def get_node_resources(self) -> list[NodeResourceSpec]:
-        def kv(stack) -> PagedKVConfig:
-            config = PagedKVConfig(
-                num_layers=stack.num_hidden_layers,
-                num_kv_heads=stack.num_key_value_heads,
-                head_dim=stack.head_dim,
-                num_qo_heads=stack.num_attention_heads,
-                max_seq_len=self.config.max_length,
-            )
-            # the shipped max_concurrent_requests at the full context, and the
-            # sink page: 2049 pages, about 9.7 GB for both LMs
-            config.max_num_pages = 1 + self.DEFAULT_MAX_CONCURRENT * -(-config.max_seq_len // config.tokens_per_page)
-            return config
-
-        nodes = {"Talker"}
         return [
-            KVSpec(resource_key=BASE_KV, nodes=nodes, config=kv(self.config.lm)),
-            AttentionSpec(resource_key=BASE_ATTN, nodes=nodes, config=AttentionConfig(kv_cache=BASE_KV)),
             # positions only: LongRoPE is applied from the model's own table
-            PositionSpec(resource_key=BASE_POS, nodes=nodes, config=PositionConfig(kv_cache=BASE_KV)),
-            KVSpec(resource_key=RES_KV, nodes=nodes, config=kv(self.config.residual)),
-            AttentionSpec(resource_key=RES_ATTN, nodes=nodes, config=AttentionConfig(kv_cache=RES_KV)),
+            lm(BASE_KV, self.config.lm, BASE_ATTN, Positions()),
+            lm(RES_KV, self.config.residual, RES_ATTN),
+            # patches committed so far, and the noise generator's state after the last committed draw
+            Value(TALKER_STEP, nodes={"Talker"}, layers=frozenset({0}),
+                  entry=Entry({}, host={"generated": int, "rng": bytes})),
         ]
+
+    def kernel_settings(self) -> dict[str, dict[str, Any]]:
+        # the shipped max_concurrent_requests at the full context, and the sink page: 2049 pages, about 9.7 GB for
+        # both LMs
+        pages = 1 + self.DEFAULT_MAX_CONCURRENT * -(-self.config.max_length // PAGE_TOKENS)
+        return {BASE_KV: {"max_num_pages": pages}, RES_KV: {"max_num_pages": pages}}
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         def talker(input_names: list[str], loop: bool) -> GraphNode:
@@ -439,9 +396,9 @@ class VoxCPM2Model(Model):
         tensors: NameToTensorList | None = None,
         **kwargs: Any,
     ) -> NameToTensorList | ProcessPromptOutput:
-        """Tokenize the request into ``text_inputs`` and ``gen_params``
-        (``[cfg_value]``); the prompt mode, patch budget, ``min_len`` and the
-        reference clip's digest go to the Talker in ``step_metadata``.
+        """Tokenize the request into ``text_inputs``; ``cfg_value``, the prompt
+        mode, patch budget, ``min_len`` and the reference clip's digest go to
+        the Talker in ``step_metadata``.
 
         Voice design: ``instruct`` (or OpenAI's ``instructions``) becomes the
         ``(description)`` prefix of the text, the reference's format.
@@ -510,10 +467,7 @@ class VoxCPM2Model(Model):
                 f"VoxCPM2 prompt of {prompt_len} positions plus up to {max_patches} patches exceeds "
                 f"the model's {self.config.max_length}-position context"
             )
-        outputs = {
-            "text_inputs": [torch.tensor(ids, dtype=torch.long)],
-            "gen_params": [torch.tensor([cfg_value], dtype=torch.float32)],
-        }
+        outputs = {"text_inputs": [torch.tensor(ids, dtype=torch.long)]}
         # every INTERNAL_KWARGS key is set in every mode: the data worker lays
         # this over the request's own kwargs, so a key left out stays client-controlled
         lead = min(self.config.prompt_context_patches, ref_patches) if mode == MODE_REF_CONTINUATION else 0
@@ -522,14 +476,15 @@ class VoxCPM2Model(Model):
             PROMPT_MODE_KEY: mode,
             MIN_LEN_KEY: min_len,
             REF_DIGEST_KEY: digest,
+            CFG_KEY: cfg_value,
         }
         if lead:  # the data worker strips a client's stream_lead_items
             metadata["stream_lead_items"] = {STREAM_EDGE: lead}
         # both LMs write the same rows: the prompt (``build_prompt``), then one per decode step
         walk = "talker_prefill" if mode == MODE_ZERO_SHOT else "talker_prefill_clone"
         prefill = Span("ids" if mode == MODE_ZERO_SHOT else "rows", walk, prompt_len, prompt_len, "text_inputs")
-        layout = LabelLayout(spans=(prefill,), growth=(("talker_decode_loop", 1),))
-        metadata["kv_layout"] = {BASE_KV: {"main": layout}, RES_KV: {"main": layout}}
+        layout = Layout(spans=(prefill,), growth=(("talker_decode_loop", 1),))
+        metadata["state_layout"] = {BASE_KV: {"main": layout}, RES_KV: {"main": layout}}
         return ProcessPromptOutput(outputs, metadata)
 
     # -- walk plan ------------------------------------------------------------------
@@ -556,7 +511,10 @@ class VoxCPM2Model(Model):
                 step_metadata={key: model_kwargs[key] for key in TALKER_STEP_METADATA if key in model_kwargs},
             )
             # the prefill's patch spends a one-patch budget; a decode step would only veto itself
-            return [prefill] if budget == 1 else [prefill, WalkStep("talker_decode")]
+            decode = WalkStep(
+                "talker_decode", step_metadata={key: model_kwargs[key] for key in TALKER_DECODE_METADATA},
+            )
+            return [prefill] if budget == 1 else [prefill, decode]
         if partition_name == "VAEDecoder":
             return [WalkStep("vae_chunk")] if "audio" in output_modalities else []
         raise ValueError(f"Unknown VoxCPM2 partition: {partition_name!r}")

@@ -22,11 +22,13 @@ sys.path.insert(0, ".")
 
 import pytest
 import torch
+from test_bagel_guidance_sink import _handles
 
 from mstar.engine.resources import PagedKVConfig, PositionConfig, StepContext, StepRunner
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.position.manager import RopeManager
+from mstar.engine.state.adapters import state_steps
 from mstar.model.bagel.submodules import MIXED_TEXT, LLMSubmodule, active_labels
 from mstar.model.submodule_base import ARNodeInputs
 
@@ -66,20 +68,22 @@ class _Harness:
         self.runner = StepRunner({"kv": self.kv, "rope": self.rope})
         self.runner.ingest_request(RID)
 
-        # declare_step reads only these off the submodule
+        # declare_step reads only this off the submodule
         self.submodule = types.SimpleNamespace(
             node_name="LLM",
-            CFG_BATCHED_LABEL=LLMSubmodule.CFG_BATCHED_LABEL,
             _get_active_labels=lambda walk, cfg: active_labels(walk, cfg, "LLM"),
         )
+        self.handles = _handles()
 
-    def run(self, graph_walk: str, span: int, pos_ids=None) -> None:
+    def run(self, graph_walk: str, span: int, pos_ids=None) -> dict[str, list[int]]:
+        """One step on ``graph_walk``, committed. The positions it planned, by plan."""
         inputs = ARNodeInputs(input_seq_len=span)
         inputs.resource_step_info = True  # requires_cfg
         if pos_ids is not None:
             inputs.custom_pos_ids = pos_ids
-        step = LLMSubmodule.declare_step(
-            self.submodule, graph_walk, [RID], [inputs]
+        step = state_steps(
+            LLMSubmodule.declare_step(self.submodule, graph_walk, [RID], [inputs]), self.handles,
+            graph_walk=graph_walk,
         )
         # attention and the sampler are out of scope here
         step.steps.pop("attn", None)
@@ -89,7 +93,9 @@ class _Harness:
         ))
         assert self.runner.admit(step).ok
         self.runner.plan(step)
+        planned = {plan: ids.tolist() for plan, ids in self.rope._current_pos_ids.items()}
         self.runner.commit(step)
+        return planned
 
     def denoise(self) -> dict[str, int]:
         """One Euler step, latents pinned at each branch's current position."""
@@ -157,6 +163,22 @@ def test_image_editing_forks_cfg_text_after_the_image_blocks(harness):
     }
 
 
+def test_a_guided_decode_after_an_image_plans_each_label_at_its_own_position(harness):
+    """A guided decode plans ``main`` and ``cfg_img`` as one plan, ``main``'s row first. After an edit's image, a VAE
+    block and a ViT block, ``cfg_img`` is two positions behind ``main``, so a plan that took one counter for both rows
+    would rotate ``cfg_img``'s query at a position its keys were never written at."""
+    n_img = 256
+    harness.run("prefill_text", S_SYS)
+    harness.run("prefill_vae", n_img)
+    harness.run("prefill_vit", n_img)
+    harness.run("prefill_text", S_PROMPT)
+    before = harness.positions()
+
+    planned = harness.run("decode", 1)
+
+    assert planned == {"main+cfg_img": [before["main"], before["cfg_img"]]}, "a row would decode at another's position"
+
+
 def test_flow_matching_leaves_the_counters_where_prefill_left_them(harness):
     """The denoise loop reads frozen caches and writes nothing.
 
@@ -219,7 +241,6 @@ def _llm_stub():
     """Everything `declare_step` and `preprocess` read off the submodule."""
     return types.SimpleNamespace(
         node_name="LLM",
-        CFG_BATCHED_LABEL=LLMSubmodule.CFG_BATCHED_LABEL,
         _get_active_labels=lambda walk, cfg: active_labels(walk, cfg, "LLM"),
         _batch_get_requires_cfg=LLMSubmodule._batch_get_requires_cfg.__get__(
             object()
@@ -229,7 +250,7 @@ def _llm_stub():
 
 def _segments_by_label(step):
     out: dict[str, set[str]] = {}
-    for segment in step.steps["kv"].segments:
+    for segment in step.segments:
         out.setdefault(segment.label, set()).add(segment.request_id)
     return out
 
@@ -249,7 +270,7 @@ def test_a_mixed_step_forks_only_its_prompt_rows():
         submodule, MIXED_TEXT, ["guided", "decoding"], [guided, decoding],
     )
 
-    kv = step.steps["kv"]
+    kv = state_steps(step, _handles(), graph_walk=MIXED_TEXT).steps["kv"]
     assert kv.pre_forks == (("main", "cfg_text"),)
     assert kv.fork_rids == {"guided"}
 

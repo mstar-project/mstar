@@ -656,6 +656,23 @@ def test_higgs_loopback_decode_prep_copies_no_pageable_index(monkeypatch):
     assert out["input_ids"].shape == (2,)
 
 
+def test_kokoro_chunk_prep_reads_no_tensor():
+    """A request's chunk lengths ride its step metadata, so selecting its chunk reads nothing on the host."""
+    from mstar.model.kokoro.config import CHUNK_LENGTHS, CHUNK_LOOP, PHONEME_IDS, REF_STYLE, SPEED
+    from mstar.model.kokoro.submodules import KokoroSynthSubmodule
+
+    sub = KokoroSynthSubmodule(torch.nn.Linear(1, 1), None)
+    inputs = {
+        PHONEME_IDS: [torch.zeros(2, 5, dtype=torch.long)], REF_STYLE: [torch.zeros(2, 16)], SPEED: [torch.ones(1)],
+    }
+    for k, length in enumerate((5, 3)):
+        with _HostReads() as prep:
+            row = sub.prepare_inputs("synth", _fwd(1, "synth", {CHUNK_LENGTHS: [5, 3]}, CHUNK_LOOP, k), inputs)
+        assert prep.reads == [], f"chunk {k}: host reads {prep.reads}"
+        assert row.input_seq_len == length and row.tensor_inputs["input_ids"].shape == (length,)
+    assert sub.prepare_inputs("synth", _fwd(1, "synth", {CHUNK_LENGTHS: [5, 3]}, CHUNK_LOOP, 2), inputs) is None
+
+
 def test_higgs_encoder_prep_reads_no_tensor():
     """The audio encoder's per-chunk embedding counts come from the clip's
     ``MEDIA_LAYOUT`` grid ``process_prompt`` filled, not off a lengths tensor."""
@@ -684,12 +701,12 @@ def test_qwen3_omni_audio_encoder_prep_reads_no_tensor():
     from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import _get_feat_extract_output_lengths
 
     from mstar.model.components.aut_encoder import AuTEncoder, AuTEncoderConfig
-    from mstar.model.qwen3_omni.config import AUDIO_ATTN
+    from mstar.model.qwen3_omni.config import AUDIO_TOKENS
     from mstar.model.qwen3_omni.submodules import AudioEncoderSubmodule
 
     config = AuTEncoderConfig(d_model=16, encoder_layers=1, encoder_attention_heads=2, encoder_ffn_dim=32,
                               downsample_hidden_size=4, output_dim=8)
-    sub = AudioEncoderSubmodule(AuTEncoder(config, attn_key=AUDIO_ATTN), config=None)
+    sub = AudioEncoderSubmodule(AuTEncoder(config, array=AUDIO_TOKENS), config=None)
     for frames in (1234, 3000):
         with _HostReads() as reads:
             row = sub.prepare_inputs("prefill_audio", _fwd("r", "prefill_audio"), {

@@ -4,7 +4,7 @@ Reuses ``ParallelAttention`` (which already supports per-head QK-norm,
 fused QKV projection, and TP-sharded o_proj). The Qwen3-specific piece
 is the 3D MRoPE path used by the Thinker — for ``use_mrope=True`` q/k
 norm, the rotation by externally provided ``cos_sin_3d`` and the KV
-write run in one Triton kernel, the state op ``qk_norm_rope_table_kv_write``.
+write run in one Triton kernel, the state op ``qk_norm_rope_table_attend``, which also reads the layer.
 Talker uses standard 1D RoPE (``use_mrope=False``) through its array's
 positions. Every state call names its layer.
 
@@ -19,43 +19,39 @@ from typing import Optional, Tuple
 import torch
 
 from mstar.distributed.communication import CommGroup
-from mstar.engine.state import PagedNHD, PagedNHDTarget, rope, state_op
+from mstar.engine.state import PagedNHD, PagedNHDTarget, add_read, rope, state_op
 from mstar.model.components.distributed import ParallelAttention
-from mstar.model.components.norm import rms_norm
+from mstar.model.components.qk_norm_rope import norm_rotate
 
 
-def _norm_rotate(
-    x: torch.Tensor, weight: torch.Tensor, eps: float, cos: torch.Tensor, sin: torch.Tensor,
-) -> torch.Tensor:
-    half = x.shape[-1] // 2
-    normed = rms_norm(x.reshape(-1, x.shape[-1]), weight, eps).view(x.shape)
-    return normed * cos + torch.cat((-normed[..., half:], normed[..., :half]), dim=-1) * sin
-
-
-def _norm_rotate_add(
+def _norm_rotate_attend(
     kv, layer, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, q_weight: torch.Tensor, k_weight: torch.Tensor,
     cos: torch.Tensor, sin: torch.Tensor, q_eps: float, k_eps: float,
-) -> None:
+) -> torch.Tensor:
     cos, sin = cos[: q.shape[0], None], sin[: q.shape[0], None]
-    rotated_k = _norm_rotate(k, k_weight, k_eps, cos, sin)
-    q.copy_(_norm_rotate(q, q_weight, q_eps, cos, sin))
+    rotated_k = norm_rotate(k, k_weight, k_eps, cos, sin)
+    q.copy_(norm_rotate(q, q_weight, q_eps, cos, sin))
     kv.add(layer, k=rotated_k, v=v)
+    return kv.read(layer, q)
 
 
 # The kernel is CUDA's, so any other device takes the reference.
-@state_op(adds=("kv",), mutates=("q",), formats=(PagedNHD(devices={"cuda"}),), reference=_norm_rotate_add)
-def qk_norm_rope_table_kv_write(
+@state_op(
+    adds=("kv",), reads=("kv",), mutates=("q",), formats=(PagedNHD(devices={"cuda"}),), reference=_norm_rotate_attend,
+)
+def qk_norm_rope_table_attend(
     kv, layer, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, q_weight: torch.Tensor, k_weight: torch.Tensor,
     cos: torch.Tensor, sin: torch.Tensor, q_eps: float, k_eps: float, *, target: PagedNHDTarget,
-) -> None:
+) -> torch.Tensor:
     """Per-head q/k norm and the rotation by rotate-half ``cos`` and ``sin`` rows, in place on ``q``, and this layer's
-    K/V write, in one launch."""
+    K/V write, in one launch, then the layer's read."""
     from mstar.utils import attention
 
     attention.qk_norm_rope_table_kv_write(
         q, k, v, q_weight, k_weight, cos, sin, target.cache, target.page_of_token, target.slot_of_token,
         min(target.count, q.shape[0]), q_eps, k_eps,
     )
+    return kv.read(layer, q)
 
 
 class Qwen3OmniAttention(ParallelAttention):
@@ -110,18 +106,16 @@ class Qwen3OmniAttention(ParallelAttention):
         q, k, v = self._project_qkv(hidden_states)
 
         if self.use_mrope and cos_sin_3d is not None:
-            qk_norm_rope_table_kv_write(
+            attn_output = qk_norm_rope_table_attend(
                 self.state, self.layer, q, k, v, self.q_norm.weight, self.k_norm.weight, *cos_sin_3d,
                 float(self.q_norm.variance_epsilon), float(self.k_norm.variance_epsilon),
             )
-            attn_output = self.state.read(self.layer, q)
         else:
             q, k = self._apply_qk_norm(q, k)
-            # Here, not through `_attend_state`, whose break in `add` would compile the rotation in a frame of its own.
+            # Here, not through `_attend_state`, whose break would compile the rotation in a frame of its own.
             if self._pos_key is not None:
                 q, k = rope(self.state, q, k)
-            self.state.add(self.layer, k=k, v=v)
-            attn_output = self.state.read(self.layer, q)
+            attn_output = add_read(self.state, self.layer, q, k=k, v=v)
 
         attn_output = attn_output.reshape(num_tokens, self.num_heads * self.head_dim)
         return self.o_proj(attn_output)

@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
-"""Compare mstar's LingBot-World-V2 1.3B against the reference oracle.
+"""Compare mstar's LingBot-World-V2 1.3B against the reference oracle, on the parts that run without the engine.
 
-Drives the mstar submodules the way the engine does (prepare_inputs ->
-preprocess -> forward, one rollout iteration per chunk) on the oracle's
-inputs, and compares:
+Runs the text encoder and the dit's VAE in process on the oracle's inputs, and compares:
 
   inputs        tokenizer ids, the resized conditioning image, each chunk's
                 Plucker rays
@@ -11,11 +9,10 @@ inputs, and compares:
                 vs the reference T5 context
   condition     the dit's chunk-by-chunk diffusers Wan2.1 VAE encode vs the
                 reference's whole-clip ``y``
-  dit (teacher-forced)  the mstar DiT fed the reference's own context and y:
-                every DiT call's input and output, every chunk's x0, and the
-                streamed warm-cache decode vs the reference's whole-clip decode
   decode        mstar's per-chunk warm-cache decode of the oracle latents
-  end-to-end    mstar's own text embeds and condition through the whole rollout
+
+The DiT reads its K/V through the engine's declared state, so the rollout runs served:
+``serve_rollout.py --reference-numerics --oracle-dir`` compares its frames with the oracle's video.
 
     python test/lingbot_world/run_parity.py --oracle-dir /tmp/lingbot/oracle \
         --example <repo>/examples/03 --out /tmp/lingbot/parity
@@ -26,7 +23,6 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import time
 from pathlib import Path
 
 import numpy as np
@@ -35,20 +31,11 @@ import torch
 torch.set_float32_matmul_precision("high")
 
 from mstar.conductor.request_info import CurrentForwardPassInfo  # noqa: E402
-from mstar.engine.resources import StepRunner  # noqa: E402
-from mstar.engine.resources.base import EngineResourceInfo  # noqa: E402
-from mstar.engine.resources.kv.rolling import RollingKVReqConfig  # noqa: E402
-from mstar.engine.resources.step import StepContext  # noqa: E402
+from mstar.model.components import wan_vae  # noqa: E402
 from mstar.model.lingbot_world import submodules  # noqa: E402
 from mstar.model.lingbot_world.components.camera import plucker_embedding  # noqa: E402
 from mstar.model.lingbot_world.lingbot_world_model import REFERENCE_MODEL_KWARGS, LingBotWorldModel  # noqa: E402
-from mstar.model.lingbot_world.submodules import (  # noqa: E402
-    DIT_KV,
-    ROLLOUT_LOOP_NAME,
-    ROLLOUT_WALK,
-    first_frame_mask,
-    rolling_extent,
-)
+from mstar.model.lingbot_world.submodules import first_frame_mask  # noqa: E402
 from mstar.model.submodule_base import ModelInputsFromEngine  # noqa: E402
 
 DEVICE = torch.device("cuda")
@@ -105,92 +92,14 @@ def fwd_info(walk: str, md: dict, rid: int) -> CurrentForwardPassInfo:
     )
 
 
-def bind_resources(model, sub, overrides: dict | None = None) -> StepRunner:
-    """Build the node's engine resources as the engine does (``overrides`` are a
-    YAML's ``resources:`` entries), bind them, and return the runner that
-    ``drive`` steps them with."""
-    resources = {}
-    for spec in model.get_node_resources():
-        if overrides and spec.resource_key in overrides:
-            spec.apply_yaml_overrides(**overrides[spec.resource_key])
-        resources[spec.resource_key] = spec.resource_class.build(
-            spec, EngineResourceInfo(device=DEVICE, nodes=frozenset(spec.nodes)))
-    sub.bind_node_resources(resources)
-    return StepRunner(resources)
-
-
-def open_request(sub, runner: StepRunner, rid: int, image: torch.Tensor, num_latent_frames: int) -> None:
-    """Open ``rid`` as the worker does: ingest the rolling K/V it declares (its sink
-    plus window at the output size, as ``get_request_resource_configs`` returns), then
-    admit it through the engine's queue, which sets that room aside."""
-    tokens = sum(rolling_extent(sub.config, tuple(image.shape[-2:]), num_latent_frames))
-    runner.ingest_request(rid, {DIT_KV: RollingKVReqConfig(tokens=tokens)})
-    admitted = runner.admit_retrieve(rid, "dit", ROLLOUT_WALK)
-    if not (admitted.outcome.ok and admitted.outcome.ready):
-        raise RuntimeError(f"request {rid} was not admitted: {admitted.outcome.reason}")
-
-
-def drive(sub, walk: str, info: CurrentForwardPassInfo, inputs: dict, runner: StepRunner | None = None) -> dict:
-    """One step of a batch of one, as the engine runs it: prepare_inputs, then
-    with a ``runner`` the declared step's admit and plan, the forward, and the
-    commit."""
+def drive(sub, walk: str, info: CurrentForwardPassInfo, inputs: dict) -> dict:
+    """One step of a batch of one on a node that declares no step, as the engine runs it: prepare_inputs, preprocess,
+    then the forward."""
     node_inputs = sub.prepare_inputs(graph_walk=walk, fwd_info=info, inputs=inputs)
     rid = info.rid_handle
-    step = sub.declare_step(walk, [rid], [node_inputs]) if runner is not None else None
-    if step is not None:
-        step.set_ctx(StepContext(request_ids=(rid,), graph_walk=walk, slot=0, capture=False))
-        outcome = runner.admit(step)
-        if not outcome.ok:
-            raise RuntimeError(f"{walk}: admit refused for {rid}: {outcome.reason}")
-        runner.plan(step)
     eng = ModelInputsFromEngine(request_ids=[rid], per_request_info={rid: info})
     pre = sub.preprocess(graph_walk=walk, engine_inputs=eng, inputs=[node_inputs])
-    out = sub.forward(graph_walk=walk, engine_inputs=eng, **pre)
-    if step is not None:
-        runner.commit(step)
-    return out
-
-
-def rollout(sub, runner: StepRunner, text_embeds, image, camera_poses, intrinsics, md: dict, rid: int,
-            condition=None):
-    """One full rollout through the dit node; per chunk: x0 latents, float
-    frames, emitted uint8 frames, wall time. Also every DiT call (x, t, flow).
-    ``condition`` (``[20, lat_f, h, w]``) stands in for the dit's own encode."""
-    calls: list[dict] = []
-    handle = sub.dit.register_forward_hook(
-        lambda m, a, o: calls.append({"x": a[0].detach().cpu().clone(), "t": a[1].detach().cpu().clone(),
-                                      "flow": o.detach().cpu().clone()})
-    )
-    info = fwd_info("rollout", md, rid)
-    inputs = {"text_embeds_pos": [text_embeds], "image_inputs": [image],
-              "camera_poses": [camera_poses], "intrinsics": [intrinsics], "clock": []}
-    open_request(sub, runner, rid, image, md["num_latent_frames"])
-    latents, pixels, conditions, frames, times = [], [], [], [], []
-    encode = submodules.encode_condition_chunk
-    if condition is not None:
-        submodules.encode_condition_chunk = (
-            lambda vae, image, cache, first, n, cfg: condition[:, first:first + n].to(image.device))
-    try:
-        for k in range(md["num_latent_frames"] // sub.config.chunk_size):
-            info.dynamic_loop_iter_counts[ROLLOUT_LOOP_NAME] = k
-            torch.cuda.synchronize()
-            t0 = time.perf_counter()
-            out = drive(sub, "rollout", info, inputs, runner)
-            torch.cuda.synchronize()
-            times.append(time.perf_counter() - t0)
-            st = sub.request_state(rid)
-            latents.append(st["chunk_latents"].cpu())
-            pixels.append(st["chunk_pixels"].cpu())
-            conditions.append(st["chunk_condition"].cpu())
-            frames.append(out["video_output"][0].cpu())
-            inputs["clock"] = out["clock"]
-    finally:
-        submodules.encode_condition_chunk = encode
-    handle.remove()
-    runner.remove_request(rid)
-    sub.cleanup_request(rid)
-    return {"latents": latents, "pixels": pixels, "conditions": conditions, "frames": frames, "times": times,
-            "calls": calls}
+    return sub.forward(graph_walk=walk, engine_inputs=eng, **pre)
 
 
 def main():
@@ -204,7 +113,6 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
     meta = json.loads((oracle / "metadata.json").read_text())
     ref_in = torch.load(oracle / "inputs.pt")
-    ref_calls = torch.load(oracle / "calls.pt")
     ref_latents = torch.load(oracle / "latents.pt")
     ref_video = torch.load(oracle / "video.pt")
     report: dict = {"oracle": meta, "float32_matmul_precision": torch.get_float32_matmul_precision()}
@@ -251,8 +159,6 @@ def main():
 
     # ---- condition, chunk by chunk ------------------------------------------
     dit_sub = model.get_submodule("dit", device="cuda").to(DEVICE)
-    dit_sub.keep_chunk_outputs = True
-    runner = bind_resources(model, dit_sub)
     cache = submodules.EncoderStream(dit_sub.encoder_vae)
     cond = torch.cat([
         submodules.encode_condition_chunk(dit_sub.encoder_vae, image.to(DEVICE), cache, k * cs, cs, cfg)
@@ -262,57 +168,13 @@ def main():
     report["vae_encode"] = stats(cond[4:], ref_in["vae_latent"])
     report["mask_equal"] = same(cond[:4].cpu(), ref_mask)
 
-    # ---- dit, teacher-forced ----------------------------------------------
-    ref_text = torch.zeros(1, cfg.text_len, cfg.text_dim, dtype=ref_in["context"].dtype)
-    ref_text[0, :n_tok] = ref_in["context"]
-    ref_cond = torch.cat([ref_mask, ref_in["vae_latent"]])
-    tf = rollout(dit_sub, runner, ref_text.to(DEVICE), image.to(DEVICE), tensors["camera_poses"][0],
-                 tensors["intrinsics"][0], md, rid=3, condition=ref_cond.to(DEVICE))
-    report["dit_calls"] = {"ours": len(tf["calls"]), "ref": len(ref_calls)}
-    report["dit_calls_bit_exact"] = {
-        "x_in": all(same(a["x"], b["x"]) for a, b in zip(tf["calls"], ref_calls, strict=True)),
-        "t": all(same(a["t"], b["t"]) for a, b in zip(tf["calls"], ref_calls, strict=True)),
-        "flow": all(same(a["flow"], b["flow"]) for a, b in zip(tf["calls"], ref_calls, strict=True)),
-    }
-    pairs = enumerate(zip(tf["calls"], ref_calls, strict=True))
-    first_bad = next((i for i, (a, b) in pairs if not same(a["flow"], b["flow"])), None)
-    report["dit_first_divergent_call"] = first_bad
-    if first_bad is not None:
-        report["dit_first_divergent_flow"] = stats(tf["calls"][first_bad]["flow"], ref_calls[first_bad]["flow"])
-    report["teacher_forced_chunks"] = [
-        {"chunk": k, "latent": stats(x, ref_latents[:, k * cs:(k + 1) * cs])} for k, x in enumerate(tf["latents"])
-    ]
-    tf_video = torch.cat(tf["pixels"], dim=2)[0]
-    report["teacher_forced_video"] = frame_stats(tf_video, ref_video)
-    report["teacher_forced_frames_per_chunk"] = [p.shape[2] for p in tf["pixels"]]
-
     # ---- decode only ------------------------------------------------------
-    st = dit_sub.request_state(99)
-    from mstar.model.components import wan_vae
-    st.add("feat_cache", wan_vae.new_feat_cache(dit_sub.vae))
+    feat_cache = wan_vae.new_feat_cache(dit_sub.vae)
     with torch.inference_mode():
-        dec = [dit_sub._decode(ref_latents[:, k * cs:(k + 1) * cs].to(DEVICE), st, clip_start=k == 0).cpu()
+        dec = [dit_sub._decode(ref_latents[:, k * cs:(k + 1) * cs].to(DEVICE), feat_cache, clip_start=k == 0).cpu()
                for k in range(lat_f // cs)]
-    dit_sub.cleanup_request(99)
     report["decode_streamed_vs_reference"] = frame_stats(torch.cat(dec, dim=2)[0], ref_video)
 
-    # ---- end to end -------------------------------------------------------
-    e2e = rollout(dit_sub, runner, ours_text.to(DEVICE), image.to(DEVICE), tensors["camera_poses"][0],
-                  tensors["intrinsics"][0], md, rid=4)
-    report["e2e_condition"] = stats(torch.cat(e2e["conditions"], dim=1), ref_cond)
-    report["e2e_chunks"] = []
-    for k, (x, p) in enumerate(zip(e2e["latents"], e2e["pixels"], strict=True)):
-        lo = 0 if k == 0 else 1 + (k * cs - 1) * 4
-        hi = 1 + ((k + 1) * cs - 1) * 4
-        report["e2e_chunks"].append({
-            "chunk": k, "latent": stats(x, ref_latents[:, k * cs:(k + 1) * cs]),
-            "frames": frame_stats(p[0], ref_video[:, lo:hi]),
-        })
-    report["e2e_video"] = frame_stats(torch.cat(e2e["pixels"], dim=2)[0], ref_video)
-    report["chunk_seconds_e2e"] = e2e["times"]
-    report["peak_memory_gib"] = torch.cuda.max_memory_allocated() / 2**30
-
-    torch.save({"e2e_frames": e2e["frames"], "tf_frames": tf["frames"]}, out_dir / "mstar_frames.pt")
     (out_dir / "results.json").write_text(json.dumps(report, indent=2, default=str))
     print(json.dumps(report, indent=2, default=str))
     if bad := mismatches(report):

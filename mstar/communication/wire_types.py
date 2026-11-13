@@ -19,6 +19,7 @@ from mstar.api_server.request_types import (
     ResultChunk,
     ResultTensors,
     ResultTokens,
+    WorkersReady,
 )
 from mstar.communication.wire import _set_polymorphic, register
 from mstar.conductor.request_info import CurrentForwardPassInfo
@@ -43,6 +44,8 @@ from mstar.utils.ipc_format import (
     DrainRequest,
     EdgeItems,
     EnableMetrics,
+    EndEpisode,
+    EndEpisodeConductor,
     FailRequests,
     InputSignals,
     LoadLoraAdapter,
@@ -75,6 +78,7 @@ _TYPES: dict[str, type] = {
     # worker-bound bodies
     "new_request": NewRequest,
     "remove_request": RemoveRequest,
+    "end_episode": EndEpisode,
     "drain_request": DrainRequest,
     "input_signals": InputSignals,
     "edge_items": EdgeItems,
@@ -89,6 +93,7 @@ _TYPES: dict[str, type] = {
     "setup_done": SetupDone,
     "abort_request": AbortRequest,
     "new_request_conductor": NewRequestConductor,
+    "end_episode_conductor": EndEpisodeConductor,
     "reads_done": ReadsDone,
     "fail_requests": FailRequests,
     "worker_status": WorkerStatus,
@@ -104,6 +109,7 @@ _TYPES: dict[str, type] = {
     "request_failed": RequestFailed,
     "conductor_status": ConductorStatus,
     "lora_adapter_result": LoraAdapterResult,
+    "workers_ready": WorkersReady,
     "result_chunk": ResultChunk,
     "preprocess_input": PreprocessInput,
     "data_worker_profile": DataWorkerProfile,

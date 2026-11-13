@@ -13,24 +13,22 @@ from functools import cached_property
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
-# Resource label constants (decoder node)
+# The decoder node's arrays, reads and sampler
 # ---------------------------------------------------------------------------
 KV_CACHE = "kv_cache"
 ATTN = "attn"
 SAMPLER = "sampler"
-# The sampler's loop-back state holding each request's timestamp rule state
-TS_RULES = "ts_rules"
-# Positions: Whisper has no RoPE. The resource is declared for its
-# per-(request, label) position counter, which drives the learned absolute
-# ``embed_positions`` lookup; the attention layers never call it.
-POS = "positions"
+# Each request's timestamp rule state and the transcript it has sampled so far
+DECODER_STATE = "decoder_state"
 
-# The encoder context lives in its own KV cache so the self-attention
+# The encoder context lives in its own array so the self-attention
 # resource, which plans a wrapper per label of the cache it names, never sees
-# it. Written once at prefill, read (zero-span) by every later step.
+# it. Added once at prefill, read (zero-span) by every later step.
 CROSS_KV_CACHE = "cross_kv_cache"
 CROSS_ATTN = "cross_attn"
 CONTEXT_LABEL = "main"
+# the engine's default page, which kv_pages counts in
+PAGE_TOKENS = 128
 
 # Graph node names, shared by the model, the submodules and the configs.
 ENCODER_NODE = "audio_encoder"

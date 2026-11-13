@@ -53,6 +53,7 @@ from mstar.engine.resources.lora.config import LORA_ADAPTER_KWARG, LORA_DIGEST_K
 from mstar.engine.resources.position.config import MAX_POSITION_KWARG
 from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.engine.state.adapters import kv_layouts
+from mstar.engine.state.contract import Array
 from mstar.model.base import (
     KEEP_ADAPTER,
     ClientChunk,
@@ -678,6 +679,8 @@ class PreparedInput(NamedTuple):
     model_kwargs: dict
     # for the response's usage (``Model.prompt_tokens``)
     prompt_tokens: int
+    episode_keys: dict[str, str] | None = None
+    reset_episode: bool = False
 
 
 class PreparingInput(NamedTuple):
@@ -1007,6 +1010,8 @@ class PreprocessWorkerThread:
             model_kwargs.pop(name, None)
         open_streams = self._client_edges - input.ends
         num_prompt_tokens = 0
+        episode_keys = None
+        reset_episode = False
         if self.model is not None:
             prompt_tensors = self.model.process_prompt(
                 input.text,
@@ -1020,6 +1025,8 @@ class PreprocessWorkerThread:
             )
             root = input.prefix_root
             if isinstance(prompt_tensors, ProcessPromptOutput):
+                episode_keys = dict(prompt_tensors.episode_keys or {})
+                reset_episode = prompt_tensors.reset_episode
                 selected = input.model_kwargs or {}
                 model_kwargs.update(prompt_tensors.metadata)
                 if prompt_tensors.lora_adapter is not KEEP_ADAPTER or any(
@@ -1048,6 +1055,8 @@ class PreprocessWorkerThread:
                 # under the base model's empty root its pages would serve base requests
                 model_kwargs["prefix_cache"] = False
             if _prefix_cache(model_kwargs):
+                if self._whole_reads:
+                    self._check_whole_steps(layouts)
                 for spec in self._variant_specs:
                     root = self._fold_variant(spec, model_kwargs, root)
                 model_kwargs.update(self._prefix_keys(
@@ -1059,7 +1068,9 @@ class PreprocessWorkerThread:
             tensors["text_inputs"] = [torch.tensor(
                 list(byte_data), dtype=torch.uint8, device=self.device
             )]
-        return PreparedInput(tensors, input_metadata, model_kwargs, num_prompt_tokens)
+        return PreparedInput(
+            tensors, input_metadata, model_kwargs, num_prompt_tokens, episode_keys, reset_episode,
+        )
 
     def _model_chose(
         self, output: ProcessPromptOutput, model_kwargs: dict, selected: dict, root: bytes,
@@ -1096,7 +1107,7 @@ class PreprocessWorkerThread:
         self, input: PreprocessInput, prepared: PreparedInput, profile: DataWorkerProfile | None,
     ) -> None:
         """Store a prepared request's tensors and hand it to the conductor."""
-        tensors, input_metadata, model_kwargs, num_prompt_tokens = prepared
+        tensors, input_metadata, model_kwargs, num_prompt_tokens, episode_keys, reset_episode = prepared
 
         # A client stream's first chunk, not a prompt signal: a one-shot upload
         # is a stream of one chunk. Stored before the request reaches the
@@ -1130,6 +1141,8 @@ class PreprocessWorkerThread:
                 input_open=bool(self._client_edges - input.ends),
                 streaming=input.streaming,
                 prompt_tokens=num_prompt_tokens,
+                episode_keys=episode_keys,
+                reset_episode=reset_episode,
             ),
         )
         self.communicator.send("conductor", msg)
@@ -1529,6 +1542,35 @@ class PreprocessWorkerThread:
         if root:
             kwargs["prefix_root"] = root
         return kwargs
+
+    def _check_whole_steps(self, layouts: dict) -> None:
+        """Refuse a keyed span that a prefix hit could end inside a step of: an ids span, or a digest span sharing its
+        step, on a walk that reads the array through a Block or Bidirectional read, which sees each step's adds as a
+        whole. The layout is the model's, so this raises ``RuntimeError``, which fails the request with a 500."""
+        for array, by_label in self._keyed_labels.items():
+            whole = self._whole_reads.get(array, {})
+            for label in by_label.keys() & layouts.get(array, {}).keys():
+                spans = layouts[array][label].spans
+                for i, span in enumerate(spans[:layouts[array][label].keyed_count()]):
+                    read = whole.get(span.walk, whole.get(None))
+                    shares = not span.opens_step or (i + 1 < len(spans) and not spans[i + 1].opens_step)
+                    if read is not None and (span.kind == "ids" or shares):
+                        what = "an ids span" if span.kind == "ids" else "a digest span that shares its step"
+                        raise RuntimeError(f"Array {array!r}.reads[{read!r}] reads walk {span.walk!r} as a whole, "
+                                           f"and span {i} of {label!r} is {what}, so a prefix hit could end inside the "
+                                           "step")
+
+    @cached_property
+    def _whole_reads(self) -> dict[str, dict[str | None, str]]:
+        """Each declared array's Block and Bidirectional reads, by the walks they name, or None for every walk. An
+        array with neither, or with no keyed label, is left out."""
+        return {
+            array.name: whole for array in self._declarations
+            if isinstance(array, Array) and array.name in self._keyed_labels and (whole := {
+                walk: key for key, read in array.reads.items() if read.mask.sees_step_whole
+                for walk in read.walks or (None,)
+            })
+        }
 
     def _page_layout(
         self, prefix_keys: PrefixKeys, layout: tuple[Span, ...],

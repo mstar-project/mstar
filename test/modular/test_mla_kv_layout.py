@@ -61,6 +61,16 @@ def test_write_read_and_pointers():
     assert torch.equal(cache.layer_view(1)[4, :3], latent[:3]) and not cache.layer_view(1)[4, 3].any()
 
 
+def test_read_tokens_gathers_the_slots_write_tokens_scattered():
+    cache = KVCache(_cfg(), torch.device("cpu"), torch.float32)
+    latent = torch.randn(5, 12)
+    pages = torch.tensor([2, 2, 2, 2, 3])
+    offs = torch.tensor([0, 1, 2, 3, 0])
+    cache.write_tokens(1, latent, None, pages, offs)
+    back = cache.read_tokens(1, pages.flip(0), offs.flip(0))
+    assert torch.equal(back, latent.flip(0)), "the gather should return each slot's latent, in the order asked"
+
+
 class _StubTransfer:
     def __init__(self, *a, **k):
         pass

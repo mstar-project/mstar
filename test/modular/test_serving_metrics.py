@@ -33,6 +33,7 @@ from mstar.api_server.request_types import (
     RequestComplete,
     RequestFailed,
     ResultChunk,
+    WorkersReady,
 )
 from mstar.communication import wire
 from mstar.communication.event import EventWakeup
@@ -1300,6 +1301,15 @@ def _config(monkeypatch, tmp_path, text="model: fake\n") -> str:
         def __init__(self, **kwargs):
             pass
 
+        def get_worker_graphs(self, config_path):
+            pass
+
+        def declare_state(self):
+            return []
+
+        def kernel_settings(self):
+            return {}
+
     cfg = tmp_path / "cfg.yaml"
     cfg.write_text(text)
     monkeypatch.setattr(registry, "get_model_class", lambda name: _Model)
@@ -1340,6 +1350,7 @@ def test_metrics_start_after_the_warmup_requests_and_before_the_bind(monkeypatch
 
         def finalize_setup(self):
             events.append("setup")
+            return WorkersReady(declaration_digests={})
 
         def enable_metrics(self):
             events.append("metrics")
@@ -1383,6 +1394,65 @@ def test_metrics_start_after_the_warmup_requests_and_before_the_bind(monkeypatch
     entrypoint.main(["--config", cfg, "--enable-metrics"])
 
     assert events == ["setup", "warmup", "metrics", "bind"]
+
+
+def test_the_api_server_reads_the_placement_and_refuses_declarations_the_conductor_doesnt_share(monkeypatch, tmp_path):
+    """A declaration can follow the placement, as Bagel's nodes follow its CFG branches, and only `get_worker_graphs`
+    reads the placement. The API server reads it before it declares, and stops before the bind on a mismatch."""
+    from mstar.model import registry
+
+    calls = []
+
+    class _Placed:
+        PREPROCESS_TORCH_THREADS = None
+
+        def __init__(self, **kwargs):
+            pass
+
+        def get_worker_graphs(self, config_path):
+            calls.append("get_worker_graphs")
+
+        def declare_state(self):
+            calls.append("declare_state")
+            return []
+
+        def kernel_settings(self):
+            calls.append("kernel_settings")
+            return {}
+
+    class _Server:
+        fatal_error = None
+        model_config: dict = {}
+
+        def __init__(self, **kwargs):
+            pass
+
+        def finalize_setup(self):
+            return WorkersReady(declaration_digests={"kv": "0" * 64})
+
+        def cleanup(self):
+            pass
+
+    class _Conductor:
+        pid = 1
+
+        def start(self):
+            pass
+
+    cfg = _config(monkeypatch, tmp_path)
+    monkeypatch.setattr(registry, "get_model_class", lambda name: _Placed)
+    monkeypatch.setattr(entrypoint, "api_server", entrypoint.api_server)
+    monkeypatch.setattr(entrypoint, "MISSING_DEPENDENCY", None)
+    monkeypatch.setattr(entrypoint, "APIServer", _Server)
+    monkeypatch.setattr(entrypoint.mp, "get_context",
+                        lambda method: types.SimpleNamespace(Process=lambda **kw: _Conductor()))
+    monkeypatch.setattr(entrypoint.uvicorn, "Server", lambda config: pytest.fail("bound with a mismatch"))
+    monkeypatch.setattr(entrypoint, "_shutdown_conductor_process", lambda proc: None)
+
+    with pytest.raises(RuntimeError, match=r"the API server and the conductor declare different state: kv \(only on "
+                                           r"the conductor\)"):
+        entrypoint.main(["--config", cfg])
+    assert calls == ["get_worker_graphs", "declare_state", "kernel_settings"], "it declared before the placement"
 
 
 def _conductor_spawn_kwargs(monkeypatch, tmp_path, *argv) -> dict:

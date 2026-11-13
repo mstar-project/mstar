@@ -6,16 +6,14 @@ from dataclasses import replace
 
 import pytest
 import torch
+from test_bagel_guidance_sink import _kv_step, _llm
 
-from mstar.model.bagel.submodules import LLMSubmodule
 from mstar.model.submodule_base import ARNodeInputs
 
 
 @pytest.fixture
 def llm():
-    llm = object.__new__(LLMSubmodule)
-    llm.__dict__["node_name"] = "LLM"
-    return llm
+    return _llm()
 
 
 def _prompt(n=10, guided=True):
@@ -32,9 +30,9 @@ def test_a_guided_prompt_forks_on_its_first_chunk_only(llm):
     first = replace(llm.split_inputs("prefill_text", None, _prompt(), 0, 4), chunk_start=0, chunk_total=10)
     later = replace(llm.split_inputs("prefill_text", None, _prompt(), 4, 8), chunk_start=4, chunk_total=10)
 
-    kv = llm.declare_step("prefill_text", ["a", "b"], [first, later]).steps["kv"]
+    kv = _kv_step(llm, "prefill_text", ["a", "b"], [first, later])
     assert kv.pre_forks == (("main", "cfg_text"),) and kv.fork_rids == frozenset({"a"})
 
-    kv = llm.declare_step("prefill_text", ["b"], [later]).steps["kv"]
+    kv = _kv_step(llm, "prefill_text", ["b"], [later])
     assert kv.pre_forks == ()
 

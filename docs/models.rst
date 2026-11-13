@@ -244,9 +244,10 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
        A request carries the whole camera trajectory as JSON in ``model_kwargs``, which the API
        server caps at 1 MiB: about 3,900 frames of ``[4, 4]`` float32 poses; send ``[F, 3, 4]``
        rows for up to the 4,077-frame maximum. One rollout at a time: the model refuses any
-       other ``max_concurrent_requests`` until each rollout's text K/V and VAE caches, which
-       are outside the rolling K/V pool (``resources: dit_kv: pool_tokens``), are engine
-       resources. The DiT's attention runs
+       other ``max_concurrent_requests``, since each rollout's VAE caches go from chunk to chunk
+       on the rollout loop's edges, outside the K/V pool. The pool holds one rollout's sink and
+       latest window at 720x1280 (``resources: dit_kv: max_num_pages``, 509 pages), and a
+       deployment that serves only 464x832 can set 215. The DiT's attention runs
        through the engine's ragged attention resource, its blocks are compiled (Inductor's
        deterministic mode), the condition encode runs channels-last, and the VAE decode is
        channels-last, compiled and bf16 where cuDNN >= 9.16 (frames 51 dB from the fp32 decode).
@@ -1278,7 +1279,12 @@ Qwen3-TTS notes
   ``client.tts(text, reference_audio="ref.wav", ref_text="...")``. The clip's
   conditioning (x-vector and codec frames) is memoised by content, so a voice
   reused across requests, or by the sentence chunks of one long request, is
-  encoded once; named, persisted voices arrive with the shared voice registry.
+  not encoded again once its conditioning is memoised; named, persisted voices
+  arrive with the shared voice registry.
+  A new clip of up to 20.5 s replays the engine's capture of its frame bucket
+  (``RefEncoderSubmodule.FRAME_BUCKETS``), padded to the bucket and encoded as
+  the unpadded clip would be, up to kernel choice; a longer clip runs the same
+  encode eagerly.
 - Text layout follows the reference defaults: CustomVoice and VoiceDesign put
   the whole text in the prefill; Base feeds it one token per frame. Override
   per request with ``non_streaming_mode``.
@@ -1361,6 +1367,30 @@ Qwen3-TTS notes
   ``mps: true`` in the YAML (see :doc:`serving`; ``qwen3tts_split.yaml`` sets
   it) the two workers' kernels also overlap, which raised c=32 throughput by
   about a fifth on an H100.
+- ``configs/qwen3tts_base.yaml`` keeps the Base model's nodes on one worker, on
+  any GPU. ``configs/qwen3tts_base_split.yaml`` runs the Talker, the Codec and
+  the RefEncoder on workers of their own, all on GPU 0, as clients of one MPS
+  daemon (``mps: true``, NVIDIA only), so the Talker's decode steps overlap codec
+  windows and reference encodes. On an H200, serving seed-tts voice clones (two
+  boots each), it served 83-87 audio seconds a second at c=8 and 189-215 at
+  c=32, against 50-81 and 113-165 on one worker and 46-61 and 76-140 for
+  sglang-omni; at c=1 it is level with one worker (16.6-17.1 against 15.0-18.7).
+  Both start streaming after one frame and ramp to steady 16-frame chunks
+  (``codec_chunk_schedule: [1, 2, 4]``, ``codec_chunk_frames: 16``), and size
+  the Talker's KV pool at 2304 pages, which fits an 80 GB GPU. Every Qwen3-TTS
+  request reserves its whole footprint at admission, its prompt plus its length
+  cap: a streamed one can't pause (``unpausable_outputs``), and none can be
+  rebuilt after a drop (its prompt is rows, not ids) without a host pool. That is
+  a few pages for a clone of a sentence, about 66 for a request that asks for the
+  checkpoint's 8192 frames (34 of those fit).
+- A clone without ``max_output_tokens`` stops within a budget set by its target
+  text: twice the slowest natural stop of the 1.7B checkpoint, 1.38 s + 0.39 s a
+  text token (sglang-omni's fit; 2 of 78k natural stops of M*'s seed-tts clones
+  ran past it), about 18 s for a 20-token sentence. Without it, a clone that
+  runs away would decode to the checkpoint's 8192 frames (11 minutes); about 1
+  in 7000 did. A request's own ``max_output_tokens`` replaces the budget, and
+  live text (``text_in`` left open) has none, since its length isn't known at
+  the prompt.
 - The Talker's layers run ``Qwen3Attention``, so each layer's q/k norm, RoPE and
   KV write are one kernel (``qk_norm_rope_kv_write``). It reads the RoPE theta off
   the position resource, which declares the checkpoint's.

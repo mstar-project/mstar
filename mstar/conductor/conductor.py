@@ -20,8 +20,10 @@ from mstar.api_server.request_types import (
     ConductorStatus,
     RequestComplete,
     RequestFailed,
+    WorkersReady,
 )
 from mstar.communication.communicator import CommProtocol, make_communicator
+from mstar.conductor.episodes import EpisodeCallLimitError, EpisodeCapacityError, EpisodeRecords, EpisodeSlots
 from mstar.conductor.lora_ops import LoraAdapterOps
 from mstar.conductor.mps import MpsDaemon
 from mstar.conductor.request_info import (
@@ -47,10 +49,12 @@ from mstar.engine.resources.kv.config import (
 from mstar.engine.resources.lora.config import LoraSpec
 from mstar.engine.state import SampleSettings
 from mstar.engine.state.adapters import sampling_configs
+from mstar.engine.state.analysis import declaration_digests
 from mstar.graph.base import GraphEdge, NodeAndGraphWalk, TensorPointerInfo
 from mstar.model.base import Model, WorkerGraph, serving_resources, streamed_inputs
 from mstar.model.submodule_base import chunk_loop_name
 from mstar.observability import catalog
+from mstar.observability.recorders import Counter as MetricCounter
 from mstar.observability.recorders import Gauge, MetricSnapshot, merge
 from mstar.platforms import apply_process_env_defaults, current_platform
 from mstar.profile.format import RxInfo, TxInfo
@@ -65,6 +69,8 @@ from mstar.utils.ipc_format import (
     ClientStreamRoute,
     ConductorMessageType,
     DrainRequest,
+    EndEpisode,
+    EndEpisodeConductor,
     FailRequests,
     InputSignals,
     NewRequest,
@@ -299,6 +305,7 @@ def _worker_process_target(
     env: dict[str, str] | None = None,
     local_worker_devices: list[str] | None = None,
     all_worker_graph_ids_to_instances: dict[int, list[list[str]]] | None = None,
+    declaration_digests: dict[str, str] | None = None,
 ):
     """Top-level target for spawned worker processes. Must be module-level for
     picklability. ``status_interval_s`` turns on the worker's metrics;
@@ -358,6 +365,7 @@ def _worker_process_target(
             tcp_transfer_device=tcp_transfer_device,
             status_interval_s=status_interval_s,
             local_worker_devices=local_worker_devices,
+            declaration_digests=declaration_digests,
         )
     except SystemExit:
         raise  # the graceful exit above (SIGTERM, or the watchdog), not a failure
@@ -382,6 +390,11 @@ class RequestData:
     sharding_config: ShardingConfig | None = None
     # what the replica pick recorded for the request; released in _drop_request
     routing: RoutingHandle | None = None
+    episode_id: str | None = None
+    episode_slot: int | None = None
+    episode_workers: set[str] = field(default_factory=set)
+    episode_held: dict[str, int] = field(default_factory=dict)
+    episode_admitted: bool = False
     # set once a NewRequest goes out; before that a failed ingest has nothing to drain
     dispatched: bool = False
     # persisted name -> the (partition, pass) whose reports wrote what is held
@@ -536,6 +549,38 @@ class Conductor:
         # Every check that needs only the model, this YAML and the environment,
         # before any worker exists; raises listing every problem found.
         deployment = validate_deployment(model, self.model_config, model_config_file)
+        # Computed after the placement is read, since a declaration may read it. Each worker and the API server
+        # compare their own digests against these.
+        self._declaration_digests = declaration_digests(self._declarations(), model.kernel_settings())
+        self._episode_array_names = frozenset(
+            declaration.name for declaration in self._declarations()
+            if getattr(declaration, "lifetime", "request") == "episode"
+        )
+        episode_config = self.model_config.get("episodes") or {}
+        if not isinstance(episode_config, dict):
+            raise ValueError("episodes must be a mapping")
+        self._episode_records = EpisodeRecords()
+        self._episode_slots = EpisodeSlots(episode_config.get("max_episodes", 16))
+        for spec in self._node_resources():
+            if spec.resource_key in self._episode_array_names:
+                usable = getattr(spec.config, "usable_slots", None)
+                if usable is None or usable < self._episode_slots.capacity:
+                    raise ValueError(
+                        f"episode array {spec.resource_key!r} has {usable} usable slots; "
+                        f"episodes.max_episodes needs {self._episode_slots.capacity}"
+                    )
+        self._episode_max_calls = episode_config.get("max_calls")
+        self._episode_max_queued_calls = episode_config.get("max_queued_calls", 1)
+        self._episode_idle_timeout_s = episode_config.get("idle_timeout_s", 600)
+        if self._episode_max_calls is not None and (
+            type(self._episode_max_calls) is not int or self._episode_max_calls < 1
+        ):
+            raise ValueError("episodes.max_calls must be a positive int or null")
+        if type(self._episode_max_queued_calls) is not int or self._episode_max_queued_calls < 1:
+            raise ValueError("episodes.max_queued_calls must be a positive int")
+        if (type(self._episode_idle_timeout_s) not in (int, float) or
+                not math.isfinite(self._episode_idle_timeout_s) or self._episode_idle_timeout_s <= 0):
+            raise ValueError("episodes.idle_timeout_s must be a positive finite number")
         self.device_type = accelerator_type()
         self.enable_nvtx = nvtx_enabled(enable_nvtx, torch.device(self.device_type))
         logger.info("Detected worker device type: %s", self.device_type)
@@ -567,6 +612,17 @@ class Conductor:
             worker_graph.worker_graph_id: worker_graph
             for worker_graph in worker_graphs
         }
+        for declaration in self._declarations():
+            if getattr(declaration, "lifetime", "request") != "episode":
+                continue
+            groups = {
+                wg._group_id for wg in self.worker_graphs.values()
+                if declaration.nodes & set(wg.section.get_nodes())
+            }
+            if len(groups) != 1:
+                raise ValueError(
+                    f"episode array {declaration.name!r} needs one node group, got {sorted(groups)}"
+                )
 
         # Set up worker graph TP ranks; validate_deployment checked each worker
         # graph belongs to one sharding group of its instance size.
@@ -655,6 +711,9 @@ class Conductor:
         )
         self._requests_gauge = Gauge(catalog.CONDUCTOR_REQUESTS)
         self._in_flight_gauge = Gauge(catalog.COMPONENT_IN_FLIGHT)
+        self._episodes_gauge = Gauge(catalog.EPISODES)
+        self._episode_slots_gauge = Gauge(catalog.EPISODE_SLOTS_USED)
+        self._episode_evictions = MetricCounter(catalog.EPISODE_EVICTIONS)
         # worker id -> its latest WorkerStatus snapshots (cumulative)
         self._worker_metrics: dict[str, list[MetricSnapshot]] = {}
 
@@ -804,8 +863,9 @@ class Conductor:
             getattr(cfg, "return_logprobs", False) for cfg in configs.values()
         ):
             raise ValueError("this model does not report logprobs; leave return_logprobs unset")
+        layout = (model_kwargs or {}).get("kv_layout") or {}
         for key, labels in self._kv_labels.items():
-            configs.setdefault(key, KVReqConfig(needed_labels=list(labels)))
+            configs.setdefault(key, KVReqConfig(needed_labels=list(layout.get(key, labels))))
         # each declared resource builds its own config from the request's kwargs (a LoRA
         # pool's from the adapter it names), so a model needs no request code for one
         for spec in self._node_resources():
@@ -956,6 +1016,7 @@ class Conductor:
                     "tcp_transfer_device": self.tcp_transfer_device,
                     "status_interval_s": self._status_interval_s,
                     "env": self._mps.client_env if self._mps is not None else None,
+                    "declaration_digests": self._declaration_digests,
                 },
                 daemon=False,
             )
@@ -1250,17 +1311,24 @@ class Conductor:
 
     def _try_admit_waiting(self):
         """Drain the waiting queue up to the concurrency cap."""
-        while self.waiting_queue:
+        blocked_episodes: set[str] = set()
+        for _ in range(len(self.waiting_queue)):
             if (self.max_concurrent_requests is not None
                     and len(self.requests) >= self.max_concurrent_requests):
                 break
             body = self.waiting_queue.pop(0)
+            if (self._episode_array_names and body.episode is not None and
+                    (body.episode in blocked_episodes or self._episode_records.busy(body.episode))):
+                blocked_episodes.add(body.episode)
+                self.waiting_queue.append(body)
+                continue
             logger.info(
                 "Admitting queued request %s (%d/%s in-flight)",
                 body.request_id, len(self.requests),
                 str(self.max_concurrent_requests),
             )
-            self._admit_request(body)
+            if not self._admit_request(body) and body.episode is not None:
+                blocked_episodes.add(body.episode)
 
     def _ingest_request(
         self, body: NewRequestConductor
@@ -1285,6 +1353,28 @@ class Conductor:
             _request_seed(body.model_kwargs or {}, _seed_id(body))
         except ValueError as exc:
             self._reject_request(body.request_id, str(exc), status=400)
+            return
+        if self._episode_array_names:
+            self._expire_episode_slots(time.monotonic())
+        if self._episode_array_names and body.episode is not None and (
+            type(body.episode) is not str or not body.episode
+        ):
+            self._reject_request(body.request_id, "episode id must be a non-empty string", status=400)
+            return
+        if (self._episode_array_names and body.episode is not None and
+                self._episode_records.closed_or_ending(body.episode)):
+            self._reject_request(body.request_id, "episode ended", status=410)
+            return
+        if (self._episode_array_names and body.episode is not None and
+                (self._episode_records.busy(body.episode) or
+                 any(waiting.episode == body.episode for waiting in self.waiting_queue))):
+            queued = sum(waiting.episode == body.episode for waiting in self.waiting_queue)
+            if queued >= self._episode_max_queued_calls or body.input_open:
+                self._reject_request(body.request_id, "episode call queue full", status=429)
+                return
+            self.waiting_queue.append(body)
+            if self._status_interval_s is not None:
+                self._queued_since[body.request_id] = time.perf_counter()
             return
         if (self.max_concurrent_requests is not None
                 and len(self.requests) >= self.max_concurrent_requests):
@@ -1322,6 +1412,19 @@ class Conductor:
         """
         try:
             self._do_ingest_request(body)
+        except EpisodeCallLimitError as exc:
+            self._drop_request(body.request_id)
+            self._end_episode(EndEpisodeConductor(body.episode))
+            self._reject_request(body.request_id, str(exc), status=400)
+            return True
+        except EpisodeCapacityError:
+            # Planning registered the request before slot reservation. It sent
+            # nothing to workers, so keep the preprocess inputs for the retry.
+            self._drop_request(body.request_id)
+            self.waiting_queue.append(body)
+            if self._status_interval_s is not None:
+                self._queued_since.setdefault(body.request_id, time.perf_counter())
+            return False
         # Any failure must reach the client.
         except Exception as exc:  # noqa: BLE001
             request_data = self.requests.get(body.request_id)
@@ -1345,6 +1448,7 @@ class Conductor:
                 self._remove_request(
                     body.request_id, request_data, failure_error=f"Ingest failed: {text}",
                 )
+        return True
 
     def _reject_request(self, request_id: str, error: str, status: int):
         """Fail a request that was never dispatched to any worker.
@@ -1382,6 +1486,24 @@ class Conductor:
         # already rejected a bad one.
         seed = _request_seed(model_kwargs, _seed_id(body))
 
+        episode_active = bool(self._episode_array_names)
+        episode_keys = {} if body.episode_keys is None else body.episode_keys
+        if episode_active:
+            if type(body.reset_episode) is not bool:
+                raise ValueError("reset_episode must be a bool")
+            if not isinstance(episode_keys, dict) or any(
+                type(name) is not str or type(key) is not str for name, key in episode_keys.items()
+            ):
+                raise ValueError("episode_keys must map array names to strings")
+            if unknown := sorted(episode_keys.keys() - self._episode_array_names):
+                raise ValueError(f"episode_keys names undeclared episode arrays {unknown}")
+            self._episode_records.can_admit(body.episode, self._episode_max_calls)
+            if (self._episode_records.slot_for(body.episode) is None and
+                    not self._episode_records.idle() and
+                    not self._episode_slots.has_free_on_any(self.worker_ids)):
+                raise EpisodeCapacityError
+            episode_view = self._episode_records.view(body.episode, episode_keys, body.reset_episode)
+
         partitions = self.model.get_partitions()
         topology = self.model.get_partition_topology()
 
@@ -1396,9 +1518,13 @@ class Conductor:
         # doesn't use is done from the start
         for p in partitions:
             pstate = partition_states[p.name]
-            pstate.plan = self.model.walk_plan(
+            plan_args = (
                 p.name, body.initial_input_modalities, body.initial_output_modalities,
                 body.initial_signals, model_kwargs,
+            )
+            pstate.plan = (
+                self.model.walk_plan(*plan_args, episode=episode_view)
+                if episode_active else self.model.walk_plan(*plan_args)
             )
             stream_moved = p.name in self.producer_triggered_partitions
             # refuse a plan the conductor can't run: a step whose walk isn't one of the
@@ -1484,7 +1610,11 @@ class Conductor:
         groups_run = self._router.groups_run(
             name for name, pstate in partition_states.items() if not pstate.is_done
         )
-        placement = self._router.pick(resource_configs, groups_run)
+        placement = (
+            self._episode_records.placement_for(
+                body.episode, lambda: self._router.pick(resource_configs, groups_run),
+            ) if episode_active else self._router.pick(resource_configs, groups_run)
+        )
         worker_graph_to_workers = self._assign_worker_graphs_to_workers(placement.replicas)
 
         # Build per-connection streaming state. None for a client stream: the
@@ -1522,6 +1652,7 @@ class Conductor:
             conductor_ingest_time=ingest_time,
             conductor_arrival_time=arrival_time,
             prompt_tokens=body.prompt_tokens,
+            episode_id=body.episode if episode_active else None,
         )
         self._register_request(body.request_id, request_data)
 
@@ -1532,6 +1663,30 @@ class Conductor:
             first_steps[p.name] = self._plan_step(request_data, pstate, 0) if pstate.plan else ForwardPassArgs()
             self._set_partition_worker_graph_ids(body.request_id, p.name, pstate.graph_walk)
         released = self._consumed(request_data, [name for name, ps in partition_states.items() if not ps.is_done])
+
+        episode_clear: list[str] = []
+        if episode_active:
+            workers = set(worker_to_worker_graph_ids)
+            slot = self._episode_records.slot_for(body.episode)
+            new_slot = slot is None
+            owner = self._episode_owner(body.episode, body.request_id)
+            if new_slot:
+                slot = self._reserve_episode_slot(owner, workers)
+            try:
+                if not body.reset_episode:
+                    episode_clear = self._episode_records.clear_arrays(body.episode, episode_keys)
+                self._episode_records.admit(
+                    body.episode, body.request_id, slot, placement,
+                    keys=episode_keys, reset=body.reset_episode,
+                    max_calls=self._episode_max_calls, workers=workers,
+                )
+            except Exception:
+                if new_slot:
+                    self._episode_slots.release(owner, workers, slot)
+                raise
+            request_data.episode_slot = slot
+            request_data.episode_workers = workers
+            request_data.episode_admitted = True
 
         # only now: a request refused before this leaves nothing in the mirrors
         request_data.routing = self._router.add(placement, resource_configs, groups_run)
@@ -1560,6 +1715,10 @@ class Conductor:
                     worker_graph_to_workers=worker_graph_to_workers,
                     initial_inputs=initial_inputs,
                     loop_caps=loop_caps,
+                    episode_id=request_data.episode_id,
+                    episode_slot=request_data.episode_slot,
+                    reset_episode=body.reset_episode if episode_active else False,
+                    episode_clear=episode_clear,
                     request_info=CurrentForwardPassInfo(
                         request_id=body.request_id,
                         graph_walk=pstate.graph_walk,
@@ -1636,6 +1795,86 @@ class Conductor:
     def _register_request(self, request_id: str, request_data: RequestData) -> None:
         self.requests[request_id] = request_data
 
+    @staticmethod
+    def _episode_owner(episode_id: str | None, request_id: str) -> str:
+        return f"episode:{episode_id}" if episode_id is not None else f"request:{request_id}"
+
+    def _send_end_episode(self, episode_id: str, slot: int, workers: set[str]) -> None:
+        for worker_id in sorted(workers):
+            self.communicator.send(
+                worker_id, WorkerMessage(
+                    message_type=WorkerMessageType.END_EPISODE, body=EndEpisode(episode_id, slot),
+                ),
+            )
+
+    def _close_episode(self, episode_id: str) -> None:
+        if not self._episode_records.has(episode_id):
+            return
+        slot, workers = self._episode_records.end(episode_id)
+        if slot is not None:
+            self._send_end_episode(episode_id, slot, workers)
+            self._episode_slots.release(self._episode_owner(episode_id, ""), workers, slot)
+
+    def _end_episode(self, body: EndEpisodeConductor) -> None:
+        if not self._episode_array_names:
+            return
+        episode_id = body.episode_id
+        if type(episode_id) is not str or not episode_id:
+            raise ValueError("episode id must be a non-empty string")
+        queued = [request for request in self.waiting_queue if request.episode == episode_id]
+        self.waiting_queue = [request for request in self.waiting_queue if request.episode != episode_id]
+        for request in queued:
+            self._reject_request(request.request_id, "episode ended", status=410)
+        if not self._episode_records.mark_ending(episode_id):
+            self._close_episode(episode_id)
+
+    def _reserve_episode_slot(self, owner: str, workers: set[str]) -> int:
+        slot = self._episode_slots.reserve(owner, workers)
+        if slot is not None:
+            return slot
+        queued = {request.episode for request in self.waiting_queue}
+        eligible = {
+            self._episode_owner(episode_id, ""): (episode_id, record)
+            for episode_id, record in self._episode_records.idle()
+            if episode_id not in queued and self._episode_owner(episode_id, "") != owner
+        }
+        candidates = []
+        for candidate_slot in range(self._episode_slots.capacity):
+            occupants = self._episode_slots.occupants(workers, candidate_slot)
+            if occupants <= eligible.keys():
+                victims = [eligible[occupant] for occupant in occupants]
+                candidates.append((len(victims), min(old.last_end for _, old in victims), candidate_slot, victims))
+        if not candidates:
+            raise EpisodeCapacityError
+        _, _, _, victims = min(candidates)
+        for old_id, old in victims:
+            old_slot, old_workers = old.slot, old.workers
+            self._send_end_episode(old_id, old_slot, old_workers)
+            self._episode_records.evict(old_id)
+            self._episode_evictions.inc(("pressure",))
+            self._episode_slots.release(self._episode_owner(old_id, ""), old_workers, old_slot)
+        slot = self._episode_slots.reserve(owner, workers)
+        if slot is None:
+            raise AssertionError("planned episode victims did not free their common slot")
+        return slot
+
+    def _expire_episode_slots(self, now: float) -> bool:
+        freed = False
+        queued = {request.episode for request in self.waiting_queue}
+        for episode_id, record in self._episode_records.idle():
+            if now - record.last_end < self._episode_idle_timeout_s:
+                break
+            if episode_id in queued:
+                continue
+            slot, workers = record.slot, record.workers
+            self._send_end_episode(episode_id, slot, workers)
+            self._episode_records.evict(episode_id, "idle")
+            self._episode_evictions.inc(("idle",))
+            self._episode_slots.release(self._episode_owner(episode_id, ""), workers, slot)
+            freed = True
+        self._episode_records.forget_expired_closed(now, self._episode_idle_timeout_s)
+        return freed
+
     def _drop_request(self, request_id: str) -> None:
         """The one way a request leaves ``self.requests``, so what the replica pick recorded cannot leak."""
         request_data = self.requests.pop(request_id, None)
@@ -1643,6 +1882,22 @@ class Conductor:
             self._router.remove(request_data.routing, [
                 name for name, pstate in request_data.partition_states.items() if pstate.fwd_pass_number
             ])
+        if request_data is None or not request_data.episode_admitted:
+            return
+        slot = request_data.episode_slot
+        workers = request_data.episode_workers
+        episode_id = request_data.episode_id
+        if episode_id is None:
+            self._episode_slots.release(self._episode_owner(None, request_id), workers, slot)
+        elif request_data.completion_sent:
+            self._episode_records.finish(episode_id, request_id, request_data.episode_held)
+            if self._episode_records.ending(episode_id):
+                self._close_episode(episode_id)
+        else:
+            self._episode_records.fail(episode_id, request_id)
+            self._send_end_episode(episode_id, slot, workers)
+            self._episode_slots.release(self._episode_owner(episode_id, request_id), workers, slot)
+            self._end_episode(EndEpisodeConductor(episode_id))
 
     def _register_draining(
         self, request_id: str, expected_acks: set[str], participants: set[str],
@@ -1754,6 +2009,8 @@ class Conductor:
         a stalled drain barrier through, and drop stale early-message entries so
         they can't accumulate for requests that never come back."""
         now = time.perf_counter()
+        if self._episode_array_names and self._expire_episode_slots(time.monotonic()):
+            self._try_admit_waiting()
         for request_id in self._pop_expired(self._draining_deadlines, now):
             dr = self.draining.get(request_id)
             if dr is None:
@@ -1923,6 +2180,15 @@ class Conductor:
             participants=workers | {self.PREPROCESS_WORKER},
         )
 
+    def _record_episode_held(self, body: WorkerGraphsDone, request_data: RequestData) -> None:
+        if not request_data.episode_admitted or not body.is_first_tp_rank or not body.episode_held:
+            return
+        if unknown := set(body.episode_held) - self._episode_array_names:
+            raise ValueError(f"worker reported undeclared episode arrays {sorted(unknown)}")
+        if any(type(count) is not int or count < 0 for count in body.episode_held.values()):
+            raise ValueError("worker reported invalid episode held counts")
+        request_data.episode_held.update(body.episode_held)
+
     def _process_worker_graphs_done(
         self, body: WorkerGraphsDone
     ) -> list[str]:
@@ -1939,6 +2205,7 @@ class Conductor:
             return []
 
         request_data = self.requests[body.request_id]
+        self._record_episode_held(body, request_data)
         partition_name = body.partition_name
         if self.enable_prof:
             request_data.graph_timings.update(body.graph_timings)
@@ -2335,6 +2602,8 @@ class Conductor:
         that finishes a partition's pass is queued on ``done_partition_forwards``."""
         if message.message_type == ConductorMessageType.NEW_REQUEST:
             self._ingest_request(message.body)
+        elif message.message_type == ConductorMessageType.END_EPISODE:
+            self._end_episode(message.body)
         elif message.message_type == ConductorMessageType.ABORT_REQUEST:
             self._abort_request(message.body.request_id)
         elif message.message_type == ConductorMessageType.FAIL_REQUESTS:
@@ -2435,6 +2704,11 @@ class Conductor:
         states.set(("draining",), len(self.draining))
         for node, count in in_flight.items():
             self._in_flight_gauge.set((node,), count)
+        for state, count in self._episode_records.state_counts().items():
+            self._episodes_gauge.set((state,), count)
+        used = self._episode_slots.used_by_worker()
+        for worker in self.worker_ids:
+            self._episode_slots_gauge.set((worker,), used.get(worker, 0))
         # Summed across workers: a node's replicas each report their own; for
         # the engine families the other ranks of a lockstep instance report
         # nothing, while every rank counts the tensor transfers it reads.
@@ -2443,7 +2717,9 @@ class Conductor:
             for snap in snapshots:
                 by_family.setdefault(snap.name, []).append(snap)
         return ConductorStatus(metrics=[
-            states.snapshot(), self._in_flight_gauge.snapshot(), self._router.predicted_saving.snapshot(),
+            states.snapshot(), self._in_flight_gauge.snapshot(),
+            self._episodes_gauge.snapshot(), self._episode_slots_gauge.snapshot(),
+            self._episode_evictions.snapshot(), self._router.predicted_saving.snapshot(),
             *(merge(family, by_family.get(name, ()))
               for name, family in catalog.WORKER_FAMILIES.items()),
         ])
@@ -2478,7 +2754,7 @@ class Conductor:
 
         self.communicator.send(
             "api_server",
-            APIServerMessage(message_type="setup_done")
+            APIServerMessage(message_type="setup_done", body=WorkersReady(self._declaration_digests))
         )
 
         while True:

@@ -364,19 +364,6 @@ class CosyVoice3Model(Model):
                     f"{config_path}: {cap} concurrent requests need {self._flow_kv_pages(cap)} pages of "
                     f"resources.{FLOW_KV}: each keeps two streams of {self.config.flow_cache_frames} frames"
                 )
-        from mstar.model.base import serving_resources
-
-        try:
-            specs = serving_resources(self, config)
-        except ValueError:
-            return  # a `resources:` block the validation's resource checks report
-        for spec in specs:
-            if isinstance(spec, RecurrentStateSpec) and spec.config.usable_slots < cap:
-                raise ValueError(
-                    f"{config_path}: {cap} concurrent requests (max_concurrent_requests) need as many slots "
-                    f"in resources.{spec.resource_key}, which holds {spec.config.usable_slots}; raise its "
-                    "max_slots or lower max_concurrent_requests"
-                )
 
     def _flow_kv_pages(self, requests: int) -> int:
         return 1 + requests * 2 * -(-self.config.flow_cache_frames // FLOW_KV_PAGE_FRAMES)

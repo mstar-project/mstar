@@ -32,7 +32,7 @@ def test_an_image_alone_is_still_prefilled(output):
     """Understanding or editing an image with no text: the image is the prefill."""
     out = _model().process_prompt("", ["image"], [output], tensors={"image_inputs": [torch.rand(3, 64, 64)]})
 
-    assert out.metadata["kv_layout"]["kv"]["main"].spans
+    assert out.metadata["state_layout"]["kv"]["main"].spans
 
 
 @pytest.mark.parametrize("output", ["text", "image"])
