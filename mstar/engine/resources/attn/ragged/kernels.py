@@ -11,7 +11,8 @@ entry gives sizes no served model has run that with a ``"*"`` row naming ``flash
 Rows name ``flashinfer``, with ``{"backend": ...}`` for one of FlashInfer's
 ragged backends, or ``cudnn`` (torch's cuDNN SDPA) or ``fa4`` (FlashAttention 4's
 dense forward) over equal-length segments (``cudnn_wrappers``), which a layout of
-unequal ones leaves for FlashInfer.
+unequal ones leaves for FlashInfer, or ``fa3``, Dao's FlashAttention-3 on Hopper over
+any layout (``dense_wrappers``).
 ``python -m benchmark.kernels.sweep ragged_attention`` writes them.
 """
 
@@ -85,6 +86,26 @@ def _fa4_import_error() -> str | None:
     return None
 
 
+def _fa3_unavailable(target: Target) -> str | None:
+    if target.device.type != "cuda" or not current_platform.is_cuda():
+        return "FlashAttention-3 needs an NVIDIA GPU"
+    capability = current_platform.cuda_capability(target.device)
+    if capability != (9, 0):
+        return f"FlashAttention-3 runs on Hopper (sm_90), not compute capability {capability}"
+    if target.dtype not in (torch.bfloat16, torch.float16):
+        return f"FA3 takes bf16 / fp16, not {target.dtype}"
+    head_dim = target.shape["head_dim"]
+    padded = padded_head_dim(head_dim)
+    if padded != head_dim:
+        return f"head dim {head_dim} is padded to {padded} for FlashInfer, which the FA3 wrapper doesn't take"
+    try:
+        import flash_attn_interface  # noqa: F401
+    except Exception as exc:  # noqa: BLE001  # a broken install raises more than ImportError
+        return (f"flash_attn_3 is not importable ({type(exc).__name__}: {exc}); it installs from the PyTorch "
+                "wheel index of torch's CUDA build, e.g. https://download.pytorch.org/whl/cu128")
+    return None
+
+
 RAGGED_ATTENTION = register(KernelOp(
     name="ragged_attention",
     shape=("num_qo_heads", "num_kv_heads", "head_dim"),
@@ -97,6 +118,8 @@ RAGGED_ATTENTION = register(KernelOp(
              doc="torch's cuDNN SDPA over equal-length segments"),
         Impl("fa4", check=_fa4_unavailable, tolerance=Tolerance(2e-2),
              doc="FlashAttention 4's dense forward over equal-length segments (Blackwell)"),
+        Impl("fa3", check=_fa3_unavailable, tolerance=Tolerance(2e-2),
+             doc="Dao's FlashAttention-3 (flash_attn_3) over any layout (Hopper)"),
     ),
     doc="cacheless self-attention's kernel by one rank's head geometry and the longest query segment",
 ))
