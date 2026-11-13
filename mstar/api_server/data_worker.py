@@ -915,6 +915,11 @@ class PreprocessWorkerThread:
         other; a held reorder chunk can be a full 11 MiB 720p frame."""
         self.in_flight_requests.discard(request_id)
         self._cancel_mp4(request_id)
+        output = self.request_output_state.get(request_id)
+        if output is not None:
+            # The mp4's done-callbacks hold this state, so the reference back to the mp4 is a cycle, and the
+            # writer (its encoder and the mp4, ~40 MB at 1280x704) would wait for a full collection.
+            output.mp4 = None
         for state_name in (
             "tensor_uuid_to_metadata_per_request",
             "request_model_kwargs",
