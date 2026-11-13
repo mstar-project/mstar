@@ -304,9 +304,11 @@ def test_no_package_is_on_both_lists():
     assert not both, f"take {both} off UNPORTED, since PORTED lists them"
 
 
-def test_both_lists_name_only_packages_that_exist():
-    gone = sorted(set(PORTED + UNPORTED) - set(_model_packages()))
-    assert not gone, f"take {gone} off PORTED and UNPORTED, since mstar/model/ holds no such package"
+def test_every_entry_exists_and_every_unported_entry_is_a_package():
+    gone = sorted(entry for entry in PORTED + UNPORTED if not Path(entry).exists())
+    assert not gone, f"take {gone} off PORTED and UNPORTED, since no such file or package exists"
+    not_packages = sorted(set(UNPORTED) - set(_model_packages()))
+    assert not not_packages, f"take {not_packages} off UNPORTED, which lists only model packages under mstar/model/"
 
 
 def test_every_registered_model_lives_in_a_listed_package():
