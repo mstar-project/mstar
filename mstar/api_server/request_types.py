@@ -172,6 +172,9 @@ class PreprocessInput:
     input_modalities: list[str]
     output_modalities: list[str]
     model_kwargs: dict
+    # System-owned session identity and reset, separate from model kwargs.
+    episode: str | None = None
+    reset_episode: bool = False
 
     # Ordered text/attachment sequence, when the entrypoint preserved it.
     prompt_parts: list[PromptPart] | None = None

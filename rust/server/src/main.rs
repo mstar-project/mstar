@@ -228,6 +228,7 @@ async fn main() {
         .route("/", any(ws::openpi::openpi_ws))
         .route("/healthz", get(ws::openpi::healthz))
         .route("/generate/ws", any(ws::generate::generate_ws))
+        .route("/api/v1/session", any(ws::positronic::positronic_ws))
         .route("/v1/realtime", any(realtime::realtime))
         .merge(api)
         .layer(DefaultBodyLimit::max(body_limit_mb << 20))
