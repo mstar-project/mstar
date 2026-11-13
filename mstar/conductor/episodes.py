@@ -258,6 +258,12 @@ class EpisodeSlots:
                 return slot
         return None
 
+    def has_free_on_any(self, workers: list[str]) -> bool:
+        return any(
+            (worker, slot) not in self._owners
+            for worker in workers for slot in range(self.capacity)
+        )
+
     def release(self, owner: str, workers: set[str], slot: int) -> None:
         if any(self._owners.get((worker, slot)) != owner for worker in workers):
             raise ValueError(f"episode slot {slot} is not held by {owner!r} on all workers")

@@ -240,6 +240,7 @@ pub struct WorkerGraphsDone<'a> {
     pub is_first_tp_rank: bool,
     pub persist_signals: Vec<(Sym, Vec<TensorPointerInfo>)>,
     pub new_token_counts: &'a [(String, i64)],
+    pub episode_held: &'a [(String, i64)],
     pub output_signal_names: Vec<Sym>,
     pub partition_name: &'a str,
     pub partition_done: bool,
@@ -269,6 +270,9 @@ impl WorkerGraphsDone<'_> {
                 tensor_infos(m.buf(), bk, infos);
             }
             str_counts(m.key("new_token_counts"), self.new_token_counts);
+            if !self.episode_held.is_empty() {
+                str_counts(m.key("episode_held"), self.episode_held);
+            }
             w_arr(
                 m.key("output_signal_names"),
                 self.output_signal_names.len() as u32,

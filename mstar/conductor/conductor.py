@@ -1478,6 +1478,10 @@ class Conductor:
             if unknown := sorted(episode_keys.keys() - self._episode_array_names):
                 raise ValueError(f"episode_keys names undeclared episode arrays {unknown}")
             self._episode_records.can_admit(body.episode, self._episode_max_calls)
+            if (self._episode_records.slot_for(body.episode) is None and
+                    not self._episode_records.idle() and
+                    not self._episode_slots.has_free_on_any(self.worker_ids)):
+                raise EpisodeCapacityError
             episode_view = self._episode_records.view(body.episode, episode_keys, body.reset_episode)
 
         partitions = self.model.get_partitions()
