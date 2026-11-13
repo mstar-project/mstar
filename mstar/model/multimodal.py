@@ -149,6 +149,10 @@ def messages_from_parts(
 # What GLM-5.2's and GLM-5.3's chat templates read of ``chat_template_kwargs``; other keys
 # are dropped, as some would collide with apply_chat_template's own arguments.
 GLM_TEMPLATE_KWARGS = ("enable_thinking", "reasoning_effort", "clear_thinking")
+# The same of DeepSeek-V4.1's: ``enable_thinking`` is its template's name for the encoder's
+# thinking mode, ``reasoning_effort`` a budget of 1 to 100 or ``low``/``high``/``max``, and
+# ``drop_thinking`` whether earlier turns' reasoning leaves a prompt that lists no tools.
+DEEPSEEK_V41_TEMPLATE_KWARGS = ("enable_thinking", "reasoning_effort", "drop_thinking")
 
 
 def render_chat_template(

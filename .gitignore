@@ -15,6 +15,7 @@ uv.lock
 !mstar/model/command_a_plus/tests/fixtures/tiny_config.json
 !test/modular/fixtures/*.json
 !test/modular/chat_formats/*.json
+!test/modular/chat_templates/*/*.json
 profiler/
 traces/
 
