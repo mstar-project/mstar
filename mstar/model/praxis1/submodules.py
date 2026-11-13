@@ -16,7 +16,6 @@ Qwen3.5 reading the hidden layer the checkpoint asks for.
 from __future__ import annotations
 
 import logging
-from typing import Any
 
 import torch
 from torch import nn
@@ -63,10 +62,33 @@ class Praxis1TextEncoderSubmodule(_Praxis1Node):
     episode.
     """
 
-    def __init__(self, config: Praxis1Config, encoder: nn.Module, tokenizer: Any) -> None:
+    def __init__(self, config: Praxis1Config, encoder: nn.Module) -> None:
         super().__init__(config)
         self.encoder = encoder
-        self.tokenizer = tokenizer
+        self._check(encoder)
+
+    def _check(self, encoder: nn.Module) -> None:
+        """Refuse a text encoder the checkpoint cannot have been trained on.
+
+        Both facts are cheap to read and expensive to find later. A wrong
+        hidden size makes the backbone's text projection reject its input,
+        which at least fails; too few layers is the quiet one, because
+        ``hidden_states[-3]`` still indexes and just returns a different
+        layer's states.
+        """
+        hidden = getattr(encoder.config, "hidden_size", None)
+        if hidden is not None and hidden != self.config.text_hidden_dim:
+            raise ValueError(
+                f"the text encoder is {hidden}-wide, the checkpoint wants "
+                f"{self.config.text_hidden_dim}"
+            )
+        layers = getattr(encoder.config, "num_hidden_layers", None)
+        needed = abs(self.config.text_hidden_layer)
+        if layers is not None and layers < needed:
+            raise ValueError(
+                f"the checkpoint reads hidden layer {self.config.text_hidden_layer}, "
+                f"but this encoder has only {layers} layers"
+            )
 
     def prepare_inputs(
         self,
@@ -75,41 +97,55 @@ class Praxis1TextEncoderSubmodule(_Praxis1Node):
         inputs: NameToTensorList,
         **kwargs,
     ) -> NodeInputs:
-        return NodeInputs(tensor_inputs={"text_inputs": inputs["text_inputs"][0]})
+        return NodeInputs(
+            tensor_inputs={
+                "text_ids": inputs["text_ids"][0],
+                "text_mask": inputs["text_mask"][0],
+                "blank_ids": inputs["blank_ids"][0],
+                "blank_mask": inputs["blank_mask"][0],
+            }
+        )
 
     def forward(
         self,
         graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
-        text_inputs: torch.Tensor,
+        text_ids: torch.Tensor,
+        text_mask: torch.Tensor,
+        blank_ids: torch.Tensor,
+        blank_mask: torch.Tensor,
         **kwargs,
     ) -> NameToTensorList:
-        device = self.get_device()
         with torch.inference_mode():
-            task = self._encode(text_inputs.to(device))
-            blank = self._encode(self._blank_ids().to(device))
+            task = self._encode(text_ids, text_mask)
+            blank = self._encode(blank_ids, blank_mask)
         return {"text_embeds": [task], "text_embeds_blank": [blank]}
 
-    def _blank_ids(self) -> torch.Tensor:
-        text = str(self.config.raw.get("text_encoder", {}).get("blank_caption", ""))
-        ids = self.tokenizer(text, add_special_tokens=True).input_ids
-        return torch.tensor(ids, dtype=torch.long)[None]
+    def _encode(self, ids: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """The hidden states of one prompt, ``(1, S, 2048)``, padding removed.
 
-    def _encode(self, ids: torch.Tensor) -> torch.Tensor:
-        """Hidden states at ``text_encoder.hidden_layer`` (-3 for both rigs).
+        Two things here are easy to invert. The padding is on the *tokens*,
+        up to a multiple of 32, and it is there for the kernel rather than
+        for the model: the attention mask hides those positions, and the
+        states handed on are trimmed back to the prompt's own length. Padding
+        the output instead would hand the backbone 32-aligned rows the
+        checkpoint never attends to.
 
-        The checkpoint reads a layer below the last, so the encoder runs with
-        ``output_hidden_states`` and the projection takes that layer, not the
-        final one.
+        And the layer is ``-3``, the output of decoder layer 21 of 24, before
+        the final norm. The last hidden state is a different tensor.
         """
-        out = self.encoder(ids, output_hidden_states=True)
-        hidden = out.hidden_states[self.config.text_hidden_layer]
-        pad = self.config.raw.get("text_encoder", {}).get("pad_to_multiple_of", 32)
-        if pad:
-            remainder = hidden.shape[1] % pad
-            if remainder:
-                hidden = torch.nn.functional.pad(hidden, (0, 0, 0, pad - remainder))
-        return hidden
+        device = self.get_device()
+        ids, mask = ids.to(device), mask.to(device)
+        if ids.dim() == 1:
+            ids, mask = ids[None], mask[None]
+        states = self.encoder(
+            input_ids=ids,
+            attention_mask=mask,
+            output_hidden_states=True,
+            use_cache=False,
+        ).hidden_states[self.config.text_hidden_layer]
+        length = int(mask.sum(dim=-1)[0])
+        return states[:1, :length]
 
 
 class Praxis1VaeEncoderSubmodule(_Praxis1Node):
@@ -123,6 +159,12 @@ class Praxis1VaeEncoderSubmodule(_Praxis1Node):
     def __init__(self, config: Praxis1Config, vae: nn.Module) -> None:
         super().__init__(config)
         self.vae = vae
+        latent = getattr(vae.config, "z_dim", None)
+        if latent is not None and latent != self.config.latent_channels:
+            raise ValueError(
+                f"the VAE has {latent} latent channels, the checkpoint wants "
+                f"{self.config.latent_channels}"
+            )
 
     def vae_encode(self, canvas: torch.Tensor) -> torch.Tensor:
         """The canvas to the policy's latent, ``(1, 192, T', h, w)`` float32.

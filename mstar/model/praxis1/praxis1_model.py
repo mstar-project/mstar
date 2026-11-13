@@ -47,6 +47,10 @@ from mstar.model.base import (
 )
 from mstar.model.media_limits import read_image
 from mstar.model.praxis1.config import Praxis1Config, Praxis1ConfigError
+from mstar.model.praxis1.submodules import (
+    Praxis1TextEncoderSubmodule,
+    Praxis1VaeEncoderSubmodule,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -94,6 +98,7 @@ class Praxis1Model(Model):
 
         self._repo_dir: Path | None = None
         self._submodule_cache: dict = {}
+        self._tokenizer_cache = None
         self.config: Praxis1Config = self._load_config()
 
     # ------------------------------------------------------------------
@@ -150,7 +155,7 @@ class Praxis1Model(Model):
         # policy call pays for the text encoder.
         encode_text = GraphNode(
             name="text_encoder",
-            input_names=["text_inputs"],
+            input_names=["text_ids", "text_mask", "blank_ids", "blank_mask"],
             outputs=[
                 GraphEdge(next_node=EMPTY_DESTINATION, name="text_embeds", persist=True),
                 GraphEdge(next_node=EMPTY_DESTINATION, name="text_embeds_blank", persist=True),
@@ -318,9 +323,57 @@ class Praxis1Model(Model):
         raise ValueError(f"Unsupported modality for Praxis-1: {modality!r}")
 
     def process_prompt(self, prompt: str | None, *args, **kwargs) -> ProcessPromptOutput:
-        raise NotImplementedError(
-            "Praxis-1 prompt handling lands with the text encoder port"
+        """Tokenize the task text and the blank caption, once per episode.
+
+        Both are tokenized here rather than in the node, so the node's
+        forward stays tensor in and tensor out. The padding is the
+        reference's: up to a multiple of 32, with the mask carried beside the
+        ids so the node can trim the states back afterwards.
+
+        A blank prompt becomes a single space rather than the empty string,
+        which is what the reference does and what leaves the unconditional
+        branch a token to read.
+        """
+        tok = self._tokenizer()
+        task = prompt if (prompt and prompt.strip()) else " "
+        blank = self._blank_caption()
+        pad = self.config.text_pad_to_multiple_of
+
+        def encode(text: str) -> tuple:
+            batch = tok(
+                text=[text],
+                padding=True,
+                truncation=False,
+                add_special_tokens=True,
+                return_attention_mask=True,
+                pad_to_multiple_of=pad,
+                return_tensors="pt",
+            )
+            return batch["input_ids"][0], batch["attention_mask"][0]
+
+        task_ids, task_mask = encode(task)
+        blank_ids, blank_mask = encode(blank)
+        return ProcessPromptOutput(
+            new_input_tensors={
+                "text_ids": [task_ids],
+                "text_mask": [task_mask],
+                "blank_ids": [blank_ids],
+                "blank_mask": [blank_mask],
+            },
+            metadata={"text_tokens": int(task_mask.sum())},
         )
+
+    def _blank_caption(self) -> str:
+        """The unconditional caption the checkpoint names, or a single space."""
+        text = str(self.config.raw.get("text_encoder", {}).get("blank_caption", " "))
+        return text if text.strip() else " "
+
+    def _tokenizer(self):
+        if self._tokenizer_cache is None:
+            from transformers import AutoProcessor
+
+            self._tokenizer_cache = AutoProcessor.from_pretrained(self.text_encoder_hf)
+        return self._tokenizer_cache
 
     # ------------------------------------------------------------------
     # Model ABC: forward pass orchestration
@@ -350,6 +403,54 @@ class Praxis1Model(Model):
         tp_group=None,
         autocast_dtype: torch.dtype | None = None,
     ) -> torch.nn.Module | None:
-        raise NotImplementedError(
-            f"Praxis-1 submodule {node_name!r} lands with the compute port"
-        )
+        if node_name in self._submodule_cache:
+            return self._submodule_cache[node_name]
+        submodule = self._create_submodule(node_name, device)
+        self._submodule_cache[node_name] = submodule
+        return submodule
+
+    def _create_submodule(self, node_name: str, device: str) -> torch.nn.Module | None:
+        """Build one node from the checkpoint and the two public components.
+
+        Dummy mode returns None, which is what lets the graph, the walks and
+        the request layouts be tested on a machine with no weights.
+
+        The trunk nodes are not here yet. They raise rather than returning
+        None, because None means "run this node without real computation" and
+        a policy that silently emits nothing would look like a working server
+        that commands an arm badly.
+        """
+        if self.skip_weight_loading:
+            return None
+        if node_name == "text_encoder":
+            from transformers import AutoModel
+
+            encoder = (
+                AutoModel.from_pretrained(
+                    self.text_encoder_hf,
+                    cache_dir=self.cache_dir,
+                    dtype=torch.bfloat16,
+                )
+                .eval()
+                .requires_grad_(False)
+            )
+            return Praxis1TextEncoderSubmodule(self.config, encoder)
+        if node_name == "vae_encoder":
+            from diffusers import AutoencoderKLWan
+
+            vae = (
+                AutoencoderKLWan.from_pretrained(
+                    self.vae_weights_hf,
+                    subfolder="vae",
+                    cache_dir=self.cache_dir,
+                    torch_dtype=torch.bfloat16,
+                )
+                .eval()
+                .requires_grad_(False)
+            )
+            return Praxis1VaeEncoderSubmodule(self.config, vae)
+        if node_name in ("backbone", "action_expert", "action_head"):
+            raise NotImplementedError(
+                f"the Praxis-1 trunk node {node_name!r} lands with the backbone port"
+            )
+        raise ValueError(f"Praxis-1 has no node {node_name!r}")
