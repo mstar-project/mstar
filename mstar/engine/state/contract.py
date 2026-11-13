@@ -174,6 +174,9 @@ class BlockCausal(Mask):
         if not _is_positive(self.size):
             raise ValueError(f"BlockCausal.size must be a positive int, got {self.size!r}")
 
+    def split_step_change(self) -> str:
+        return "A step boundary inside a block cuts what the block's queries see"
+
 
 class Op:
     """A kernel the engine plans before the step and runs on an array's entries.
