@@ -100,6 +100,10 @@ from mstar.model.qwen3_5.config import (
 from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
 from mstar.model.qwen3_5.submodules import LLMSubmodule, VisionEncoderSubmodule
 from mstar.model.registry import MODEL_REGISTRY
+from mstar.model.ripple import config as ripple_config
+from mstar.model.ripple.config import RippleConfig
+from mstar.model.ripple.ripple_model import RippleModel
+from mstar.model.ripple.submodules import RippleLLMSubmodule
 from mstar.model.submodule_base import ARNodeInputs, engine_step
 
 _MIXED_SPLIT = CombinedSplit(MIXED, prefill_walks=("prefill_text",))
@@ -988,3 +992,116 @@ def test_command_a_plus_layout_converts_to_the_hand_written_one(tmp_path):
     reference = {KV_CACHE: {"main": LabelLayout(spans=(span,), growth=(("decode_loop", 1),))}}
     assert converted == reference
     assert converted[KV_CACHE]["main"].row() == reference[KV_CACHE]["main"].row()
+
+
+# Ripple-65B: one cache read through a window on its sliding layers and causally on the rest, as Command A+'s is
+
+
+_RIPPLE = dict(
+    model_type="ricursive", hidden_act="silu", use_valres=True, use_gated_attention=True, gate_full_precision=True,
+    tie_word_embeddings=False, vocab_size=64, hidden_size=32, intermediate_size=48, num_hidden_layers=10,
+    num_attention_heads=4, num_key_value_heads=2, head_dim=16,
+    layer_types=(["sliding_attention"] * 4 + ["full_attention"]) * 2, sliding_window=5,
+    max_position_embeddings=128, rope_theta=10000.0, rms_norm_eps=1e-6, embed_scale=4.0, ffn_clamp_threshold=0.5,
+    eos_token_id=[1, 2],
+)
+
+
+def _ripple(**overrides) -> RippleModel:
+    model = RippleModel.__new__(RippleModel)
+    model.config = RippleConfig.from_dict({**_RIPPLE, **overrides})
+    model.sampling_defaults = {"temperature": 1.0}
+    return model
+
+
+def _ripple_reference(model: RippleModel) -> list:
+    config = model.config
+    sliding = tuple(i for i, s in enumerate(config.is_sliding) if s)
+    return [
+        KVSpec(resource_key=KV_CACHE, nodes={"LLM"}, config=PagedKVConfig(
+            num_layers=config.num_hidden_layers, num_kv_heads=config.num_key_value_heads, head_dim=config.head_dim,
+            max_seq_len=config.max_position_embeddings, num_qo_heads=config.num_attention_heads,
+        )),
+        AttentionSpec(resource_key=ripple_config.ATTN_SLIDING, nodes={"LLM"}, config=AttentionConfig(
+            kv_cache=KV_CACHE, sliding_window=config.sliding_window, layers=sliding, splits=(_MIXED_SPLIT,),
+        )),
+        AttentionSpec(resource_key=ripple_config.ATTN_FULL, nodes={"LLM"}, config=AttentionConfig(
+            kv_cache=KV_CACHE, splits=(_MIXED_SPLIT,),
+        )),
+        PositionSpec(resource_key=ROPE, nodes={"LLM"}, config=PositionConfig(
+            kv_cache=KV_CACHE, rotary_dim=config.head_dim, rope_theta=config.rope_theta,
+            rope_table_dtype=torch.bfloat16,
+        )),
+        SamplerSpec(resource_key=SAMPLER, nodes={"LLM"}, vocab_size=config.vocab_size,
+                    enable_repetition_penalty=True, enable_min_p=False),
+    ]
+
+
+def test_ripple_specs_equal_the_hand_written_ones():
+    model = _ripple()
+    _assert_equal_per_key(node_resources(model), _ripple_reference(model))
+
+
+@pytest.mark.parametrize("path", _published("RippleModel"), ids=lambda path: path.stem)
+def test_ripple_specs_equal_the_hand_written_ones_on_every_published_config(path):
+    deployment = yaml.safe_load(path.read_text())
+    model = _ripple()
+    reference = _ripple_reference(model)
+    apply_yaml_overrides(reference, deployment)
+    specs = serving_resources(model, deployment)
+    _assert_equal_per_key(specs, reference)
+    kv = {spec.resource_key: spec for spec in specs}[KV_CACHE].config
+    expected = {spec.resource_key: spec for spec in reference}[KV_CACHE].config
+    assert kv.groups == expected.groups, "groups don't compare in the dataclass, and they hold the window's layers"
+
+
+def test_ripple_refuses_query_heads_off_its_kv_heads():
+    with pytest.raises(ValueError, match=re.escape("Array 'kv_cache'.reads['attn_sliding'].op")):
+        _ripple(num_attention_heads=6, num_key_value_heads=4).declare_state()
+
+
+def test_ripple_writes_no_spec_by_hand():
+    assert _ripple().get_node_resources() == []
+
+
+def test_ripple_declarations_have_no_problems():
+    assert state_declaration_problems(_ripple()) == []
+
+
+def test_ripple_request_settings_convert_to_the_hand_written_ones():
+    model = _ripple()
+    kwargs = {"temperature": 0.5, "top_p": 0.9}
+    converted = sampling_configs(model.get_request_resource_configs([], [], kwargs), model.declare_state())
+    assert converted == MultimodalDecoderModel.get_request_resource_configs(model, [], [], kwargs)
+
+
+def _ripple_reference_step(rids, inputs, prefill_tokens) -> SubmoduleStep:
+    return SubmoduleStep(
+        segments=[
+            Segment(request_id=rid, label="main", span=inp.input_seq_len)
+            for rid, inp in zip(rids, inputs, strict=True)
+        ],
+        steps={
+            KV_CACHE: KVStep(),
+            ripple_config.ATTN_SLIDING: AttentionStep(causal=True),
+            ripple_config.ATTN_FULL: AttentionStep(causal=True),
+            SAMPLER: SamplerStep(apply_penalty=True, prefill_tracked_tokens=prefill_tokens),
+            ROPE: PositionStep(),
+        },
+    )
+
+
+@pytest.mark.parametrize("walk, rows", [
+    ("prefill_text", [(5, None), (2, None)]), ("decode", [(1, None)] * 3),
+    (MIXED, [(5, "prefill_text"), (1, "decode")]),
+])
+def test_ripple_steps_equal_the_hand_written_ones(walk, rows):
+    model = _ripple()
+    node = _bind(RippleLLMSubmodule(torch.nn.Module(), model.config), model)
+    rids = list(range(len(rows)))
+    inputs = [ARNodeInputs(input_ids=torch.arange(n), input_seq_len=n, graph_walk=row_walk) for n, row_walk in rows]
+    prefill = {
+        rid: inp.input_ids for rid, inp in zip(rids, inputs, strict=True) if (inp.graph_walk or walk) != "decode"
+    }
+    step = engine_step(node, graph_walk=walk, request_ids=rids, inputs=inputs)
+    _assert_steps_equal(step, _ripple_reference_step(rids, inputs, prefill))
