@@ -164,6 +164,9 @@ def test_the_search_writes_a_methods_file_whose_plans_spend_their_budget(tmp_pat
             assert not plan[0].reuse and not plan[1].reuse  # the first fifth of 8 steps is kept
     per_prompt = json.loads((tmp_path / "per_prompt.json").read_text())
     assert set(per_prompt) == {"5", "6"} and set(per_prompt["5"]) == {"0", "1"}
+    cal = Calibration.from_json(json.loads((tmp_path / "calibration.json").read_text()))
+    agreement = search.plan_agreement(cal, [5, 6])
+    assert len(agreement) == 2 and agreement[0].startswith("budget 5: each prompt's own plan shares ")
     assert Calibration.from_json(json.loads((tmp_path / "calibration.json").read_text())).sensitivity is not None
 
 

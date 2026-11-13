@@ -118,6 +118,26 @@ def refined_method(
     )
 
 
+def plan_agreement(cal: Calibration, budgets: list[int], restarts: tuple[int, ...] = ()) -> list[str]:
+    """One line per budget: how far each prompt's own best reuse plan is from the shared one, in computed steps
+    they share and in the tables' price each prompt pays for running the shared plan instead of its own."""
+    lines = []
+    for budget in budgets:
+        shared = search_plan(cal.reuse_error, budget=budget, restarts=restarts).computed
+        overlap, excess = [], []
+        for run in cal.runs:
+            own = search_plan(run["reuse_error"], budget=budget, restarts=restarts)
+            overlap.append(len(set(own.computed) & set(shared)))
+            paid = plan_cost(shared, run["reuse_error"], restarts=restarts)
+            excess.append(paid / own.cost - 1.0 if own.cost > 0 else 0.0)
+        lines.append(
+            f"budget {budget}: each prompt's own plan shares {min(overlap)}-{max(overlap)} of {budget} computed steps "
+            f"with the shared plan; running the shared plan costs a prompt {100 * sum(excess) / len(excess):.1f}% "
+            f"more table error than its own (worst {100 * max(excess):.1f}%)"
+        )
+    return lines
+
+
 def _compare(cal: Calibration, backend: InprocBackend, methods: list[dict[str, Any]], restarts) -> list[str]:
     """One line per method: its plan and the tables' price for it, next to the same-budget searched plans."""
     lines = []
@@ -179,6 +199,7 @@ def main(argv: list[str] | None = None) -> None:
     (out / "searched.json").write_text(json.dumps(methods, indent=1))
     if args.per_prompt:
         (out / "per_prompt.json").write_text(json.dumps(per_prompt_plans(cal, budgets, restarts)))
+        print("\n".join(plan_agreement(cal, budgets, restarts)))
     print(f"mag_ratios = {[round(r, 5) for r in cal.mag_ratios]}")
     print("\n".join(_compare(cal, backend, methods + compared, restarts)))
     backend.close()
