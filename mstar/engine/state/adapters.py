@@ -119,6 +119,10 @@ if TYPE_CHECKING:
 # for the step.
 _DEBUG_ASSERTS = os.environ.get("MSTAR_KV_DEBUG_ASSERTS", "0") == "1"
 
+# A holed array marks a rejected entry's rope slot, the 64-wide slot FlashInfer's MLA kernel runs beside rank 512,
+# with HOLE, and its reads pass a rope query of ones, so the entry scores 64 * HOLE and softmax takes it to zero.
+HOLE, HOLE_SLOT = -1.0e4, 64
+
 
 def node_resources(model: "Model", *, setup: "StateSetup | None" = None) -> list[NodeResourceSpec]:
     """The specs ``model`` declares through `declare_state`, then the ones it writes by hand."""
@@ -1001,6 +1005,16 @@ class _LatentRead:
         return self._attn.select_last_hidden(x, label=label)
 
 
+class HoledLatentAttend(PagedLatentAttend):
+    """`LatentAttend` on a holed array."""
+
+    def check(self, array: Array, key: str, read: Read) -> None:
+        if not isinstance(read.mask, Causal):
+            raise _no_layout(array, f"reads[{key!r}].mask must be Causal, the one mask a holed array's marks are "
+                                    "written for")
+        super().check(array, key, read)
+
+
 class PositionsBinding(OpBinding):
     """An array's `Positions`, which a position resource keeps per request under `position_key`, with the `Rope` its
     calls rotate by."""
@@ -1201,6 +1215,62 @@ class RewindRun(VerifyRun):
                 self._kv.defer_correct_len(segment.request_id, segment.label, count)
                 if positions is not None:
                     positions.defer_correct_len(segment.request_id, segment.label, count)
+
+
+class Holes(OpBinding):
+    """Verify steps on a holed array, whose pages keep each verify block whole."""
+
+    def resource(self, array: Array, key: str) -> str:
+        return array.name
+
+    def attach(self, handle: ArrayHandle, key: str, run: Any) -> None:
+        handle.verify = HolesRun(handle, run)
+
+
+class HolesRun(VerifyRun):
+    """The verify steps of a holed array. Settle marks the entries each row didn't keep as holes, on every layer added
+    so far, and an add after it marks its own layer, all in device ops a capture records, so no count reaches the
+    host and nothing is rewound."""
+
+    def __init__(self, handle: "HoledHandle", kv: Any):
+        super().__init__(handle)
+        self._kv = kv
+        # this step's verify block and, once it has settled, each entry's mark, (rows * block, 1)
+        self._block: int | None = None
+        self._marks: torch.Tensor | None = None
+
+    def begin(self, declared: ArrayStep, segments: Sequence[Segment], ctx) -> None:
+        self._block = self._marks = None
+        if not declared.verify or ctx.replays:
+            return
+        spans, span = sorted({segment.span for segment in segments}), self.handle.array.verify_span
+        if len(spans) != 1 or not 1 <= spans[0] <= span:
+            raise self.handle._refusal(f"a verify step whose rows add {spans} entries, and a holed array marks one "
+                                       f"block of 1 to verify_span {span} on every row")
+        self._block = spans[0]
+
+    def settle(self, kept: torch.Tensor) -> None:
+        h = self.handle
+        if self._block is None:
+            raise h._refusal("settle on a step that doesn't verify")
+        if self._marks is not None:
+            raise h._refusal("a second settle in one verify step")
+        keep = torch.arange(self._block, device=kept.device) < kept[:, None]
+        self._marks = torch.where(keep.reshape(-1, 1), 0.0, HOLE)
+        for layer in sorted(h._kept):
+            self.mark(layer)
+
+    def mark(self, layer: int) -> None:
+        """Write this step's marks into the rope slot of ``layer``'s entries, once the step has settled."""
+        if self._marks is None:
+            return
+        pages, offsets = self._kv.write_slots(self.handle.label)
+        cache = self._kv.layer_view(self.handle._pool_layer[layer])
+        cache[pages, offsets, self.handle._rank:] = self._marks.to(cache.dtype).expand(-1, HOLE_SLOT)
+
+    def end(self, ctx) -> None:
+        if self._block is not None and self._marks is None:
+            raise self.handle._refusal("a verify step ends with no settle, and its rejected entries stay unmarked")
 
 
 class UpdateSettle(OpBinding):
@@ -1897,6 +1967,59 @@ class LatentHandle(PagedArrayHandle):
         if q_pe is None:
             q_pe = q.new_empty(*q.shape[:2], 0)
         return self._attn[layer].run(q, label=self.label, kv_cache_layer=self._views[layer], q_pe=q_pe, **mask_args)
+
+
+class HoledHandle(LatentHandle):
+    """Adds and reads through the MLA pages of a holed array. An add copies ``ckv`` into staging rows whose rope slot
+    stays zero, a kept entry's mark, and a read passes a rope query of ones. A captured step and an eager step each
+    have their own buffers, so an eager step that outgrows the captured ones never moves what a graph recorded."""
+
+    def __init__(
+        self, array: Array, resources: Mapping[str, Any], bindings: tuple[BoundOp, ...], resolved: "Resolved",
+    ):
+        super().__init__(array, resources, bindings, resolved)
+        # each keyed by whether the step is a capture
+        self._staging: dict[bool, torch.Tensor] = {}
+        self._ones: dict[bool, torch.Tensor] = {}
+
+    def takes_fused(self, op: "StateOp") -> bool:
+        """Never: no format names the rope slot, which a kept entry keeps at zero."""
+        return False
+
+    def _rows(self, buffers: dict[bool, torch.Tensor], rows: int, make: Callable[[int], torch.Tensor]) -> torch.Tensor:
+        held = buffers.get(self._capturing)
+        if held is None or held.shape[0] < rows:
+            if self._capturing and torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+                raise self._refusal(f"a recording of {rows} rows past the captured buffers' "
+                                    f"{0 if held is None else held.shape[0]}, and every kept graph records them at "
+                                    "one address")
+            held = buffers[self._capturing] = make(rows)
+        return held[:rows]
+
+    @torch.compiler.disable
+    def add(self, layer: int | torch.Tensor, *, keep: bool | None = None, **fields: torch.Tensor) -> None:
+        layer = self._layer_id(layer)
+        if fields.keys() != {"ckv"}:
+            raise self._refusal(f"an add of fields {sorted(fields)}, and the latent entry holds ['ckv']")
+        self._record_add(layer, keep)
+        ckv = fields["ckv"]
+        staging = self._rows(self._staging, ckv.shape[0], lambda rows: ckv.new_zeros(rows, self._rank + HOLE_SLOT))
+        staging[:, :self._rank].copy_(ckv)
+        self._kv.write_kv(staging, None, layer_idx=self._pool_layer[layer], label=self.label)
+        if layer in self._kept:
+            self.verify.mark(layer)
+
+    @torch.compiler.disable
+    def read(self, layer: int | torch.Tensor, q: torch.Tensor | None = None, **mask_args: Any) -> torch.Tensor:
+        """Attend ``q``, (tokens, q_heads, rank), with the rope query of ones."""
+        layer = self._layer_id(layer)
+        if q is None:
+            raise self._no_layout("a read with no op")
+        if mask_args:
+            raise self._no_layout(f"read arguments {sorted(mask_args)}, which a holed array's read takes none of")
+        self._record_read(layer)
+        ones = self._rows(self._ones, q.shape[0], lambda rows: q.new_ones(rows, q.shape[1], HOLE_SLOT))
+        return self._attn[layer].run(q, label=self.label, kv_cache_layer=self._views[layer], q_pe=ones)
 
 
 class RingHandle(ArrayHandle):
@@ -2697,6 +2820,22 @@ class LatentStorage(PagedStorage):
         )
 
 
+class HoledStorage(LatentStorage):
+    """A latent array with no ``kpe`` that verifies. Each verify step keeps its whole block in the pages, and the
+    entries a row didn't keep stay as holes, marked in the rope slot such a latent leaves free, so a request holds up
+    to ``max_len * verify_span`` rows."""
+
+    handle_class = HoledHandle
+
+    def _pool_config(self, array: Array, geometry: tuple[int, int], q_heads: int | None) -> PagedKVConfig:
+        rank, _ = geometry
+        return PagedKVConfig(
+            num_layers=len(array.layers), num_qo_heads=q_heads, num_kv_heads=1, head_dim=rank + HOLE_SLOT,
+            max_seq_len=array.max_len * array.verify_span, layout=KVLayout.MLA, kv_lora_rank=rank,
+            qk_rope_head_dim=HOLE_SLOT,
+        )
+
+
 class RingStorage(Storage):
     """An append-only array whose reads are all frame windows, in a ring of frame slots per layer that keeps only what
     the layer's window reaches. Its reads share one flex attention resource, which stages every layer's mask from the
@@ -2873,6 +3012,7 @@ PAGED = PagedStorage()
 PAGED_BY_WALK = PagedByWalkStorage()
 PAGED_CROSS = PagedCrossStorage()
 LATENT = LatentStorage()
+HOLED = HoledStorage()
 RING = RingStorage()
 VALUE = ValueStorage()
 VALUE_WITH_HOST = ValueWithHostStorage()
@@ -2893,7 +3033,7 @@ def storage_of(array: Array) -> Storage:
     if array.reads and all(isinstance(read.mask, FrameWindow) for read in array.reads.values()):
         return RING
     if "ckv" in array.entry.tensors:
-        return LATENT
+        return HOLED if array.verify_span > 1 and "kpe" not in array.entry.tensors else LATENT
     if any(read.queries is not None for read in array.reads.values()):
         return PAGED_CROSS
     return PAGED_BY_WALK if reads_differ_by_walk(array) else PAGED
@@ -2914,6 +3054,8 @@ BINDINGS: dict[tuple[Storage, type[Op | Positions | Verify | None]], OpBinding] 
     (LATENT, LatentAttend): PagedLatentAttend(),
     (LATENT, Positions): PositionsBinding(),
     (LATENT, Verify): Rewind(),
+    (HOLED, LatentAttend): HoledLatentAttend(),
+    (HOLED, Verify): Holes(),
     (RING, Attend): FlexAttend(),
     (RING, Positions): CounterPositions(),
     (WITHIN_STEP, Attend): RaggedAttend(),
