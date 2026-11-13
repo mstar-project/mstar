@@ -29,6 +29,7 @@ class EpisodeRecord:
     last_end: float = 0.0
     cold: str | None = None
     workers: set[str] = field(default_factory=set)
+    ending: bool = False
 
 
 def _snapshot(record: EpisodeRecord | None, episode_id: str | None) -> EpisodeView:
@@ -46,6 +47,7 @@ class EpisodeRecords:
 
     def __init__(self) -> None:
         self._records: dict[str, EpisodeRecord] = {}
+        self._closed: dict[str, float] = {}
 
     def view(
         self, episode_id: str | None, keys: Mapping[str, str] | None = None,
@@ -75,7 +77,11 @@ class EpisodeRecords:
             return
         if type(episode_id) is not str or not episode_id:
             raise ValueError(f"episode id must be a non-empty str or None, got {episode_id!r}")
+        if episode_id in self._closed:
+            raise ValueError(f"episode {episode_id!r} has ended")
         record = self._records.get(episode_id)
+        if record is not None and record.ending:
+            raise ValueError(f"episode {episode_id!r} is ending")
         if record is not None and record.in_flight is not None:
             raise ValueError(f"episode {episode_id!r} already runs request {record.in_flight!r}")
         if max_calls is not None and record is not None and record.calls >= max_calls:
@@ -88,6 +94,25 @@ class EpisodeRecords:
     def slot_for(self, episode_id: str | None) -> int | None:
         record = self._records.get(episode_id) if episode_id is not None else None
         return record.slot if record is not None else None
+
+    def mark_ending(self, episode_id: str) -> bool:
+        """Mark a close while a call drains; return whether it is in flight."""
+        record = self._records.get(episode_id)
+        if record is None:
+            self._closed[episode_id] = time.monotonic()
+            return False
+        record.ending = True
+        return record.in_flight is not None
+
+    def has(self, episode_id: str) -> bool:
+        return episode_id in self._records
+
+    def ending(self, episode_id: str) -> bool:
+        record = self._records.get(episode_id)
+        return record is not None and record.ending
+
+    def closed_or_ending(self, episode_id: str) -> bool:
+        return episode_id in self._closed or self.ending(episode_id)
 
     def placement_for(self, episode_id: str | None, pick: Callable[[], Placement]) -> Placement:
         """Re-use a named episode's replica without consulting the router again."""
@@ -171,6 +196,7 @@ class EpisodeRecords:
         if record.in_flight is not None:
             raise ValueError(f"episode {episode_id!r} is in flight")
         del self._records[episode_id]
+        self._closed[episode_id] = time.monotonic()
         return record.slot, record.workers
 
     def evict(self, episode_id: str, reason: str = "evicted") -> tuple[int, set[str]]:
@@ -193,6 +219,7 @@ class EpisodeRecords:
         if record.in_flight != request_id:
             raise ValueError(f"episode {episode_id!r} does not run request {request_id!r}")
         del self._records[episode_id]
+        self._closed[episode_id] = time.monotonic()
         return record.slot, record.workers
 
     def idle(self) -> list[tuple[str, EpisodeRecord]]:
@@ -207,6 +234,9 @@ class EpisodeRecords:
         for name, record in list(self._records.items()):
             if record.slot is None and record.in_flight is None and now - record.last_end >= 2 * ttl:
                 del self._records[name]
+        for name, ended_at in list(self._closed.items()):
+            if now - ended_at >= 2 * ttl:
+                del self._closed[name]
 
 
 class EpisodeSlots:

@@ -69,6 +69,7 @@ from mstar.utils.ipc_format import (
     ConductorMessageType,
     DrainRequest,
     EndEpisode,
+    EndEpisodeConductor,
     FailRequests,
     InputSignals,
     NewRequest,
@@ -1346,6 +1347,10 @@ class Conductor:
             self._reject_request(body.request_id, "episode id must be a non-empty string", status=400)
             return
         if (self._episode_array_names and body.episode is not None and
+                self._episode_records.closed_or_ending(body.episode)):
+            self._reject_request(body.request_id, "episode ended", status=410)
+            return
+        if (self._episode_array_names and body.episode is not None and
                 (self._episode_records.busy(body.episode) or
                  any(waiting.episode == body.episode for waiting in self.waiting_queue))):
             queued = sum(waiting.episode == body.episode for waiting in self.waiting_queue)
@@ -1772,21 +1777,41 @@ class Conductor:
 
     def _send_end_episode(self, episode_id: str, slot: int, workers: set[str]) -> None:
         for worker_id in sorted(workers):
-            self._send_for_teardown(
-                episode_id, worker_id,
-                WorkerMessage(
-                    message_type=WorkerMessageType.END_EPISODE,
-                    body=EndEpisode(episode_id, slot),
+            self.communicator.send(
+                worker_id, WorkerMessage(
+                    message_type=WorkerMessageType.END_EPISODE, body=EndEpisode(episode_id, slot),
                 ),
             )
+
+    def _close_episode(self, episode_id: str) -> None:
+        if not self._episode_records.has(episode_id):
+            return
+        slot, workers = self._episode_records.end(episode_id)
+        if slot is not None:
+            self._send_end_episode(episode_id, slot, workers)
+            self._episode_slots.release(self._episode_owner(episode_id, ""), workers, slot)
+
+    def _end_episode(self, body: EndEpisodeConductor) -> None:
+        if not self._episode_array_names:
+            return
+        episode_id = body.episode_id
+        if type(episode_id) is not str or not episode_id:
+            raise ValueError("episode id must be a non-empty string")
+        queued = [request for request in self.waiting_queue if request.episode == episode_id]
+        self.waiting_queue = [request for request in self.waiting_queue if request.episode != episode_id]
+        for request in queued:
+            self._reject_request(request.request_id, "episode ended", status=410)
+        if not self._episode_records.mark_ending(episode_id):
+            self._close_episode(episode_id)
 
     def _reserve_episode_slot(self, owner: str, workers: set[str]) -> int:
         slot = self._episode_slots.reserve(owner, workers)
         if slot is not None:
             return slot
-        for old_id, _ in self._episode_records.idle():
-            old_slot, old_workers = self._episode_records.evict(old_id)
+        for old_id, old in self._episode_records.idle():
+            old_slot, old_workers = old.slot, old.workers
             self._send_end_episode(old_id, old_slot, old_workers)
+            self._episode_records.evict(old_id)
             self._episode_slots.release(self._episode_owner(old_id, ""), old_workers, old_slot)
             slot = self._episode_slots.reserve(owner, workers)
             if slot is not None:
@@ -1798,8 +1823,9 @@ class Conductor:
         for episode_id, record in self._episode_records.idle():
             if now - record.last_end < self._episode_idle_timeout_s:
                 break
-            slot, workers = self._episode_records.evict(episode_id, "idle")
+            slot, workers = record.slot, record.workers
             self._send_end_episode(episode_id, slot, workers)
+            self._episode_records.evict(episode_id, "idle")
             self._episode_slots.release(self._episode_owner(episode_id, ""), workers, slot)
             freed = True
         self._episode_records.forget_expired_cold(now, self._episode_idle_timeout_s)
@@ -1821,10 +1847,13 @@ class Conductor:
             self._episode_slots.release(self._episode_owner(None, request_id), workers, slot)
         elif request_data.completion_sent:
             self._episode_records.finish(episode_id, request_id, request_data.episode_held)
+            if self._episode_records.ending(episode_id):
+                self._close_episode(episode_id)
         else:
             self._episode_records.fail(episode_id, request_id)
             self._send_end_episode(episode_id, slot, workers)
             self._episode_slots.release(self._episode_owner(episode_id, request_id), workers, slot)
+            self._end_episode(EndEpisodeConductor(episode_id))
 
     def _register_draining(
         self, request_id: str, expected_acks: set[str], participants: set[str],
@@ -2529,6 +2558,8 @@ class Conductor:
         that finishes a partition's pass is queued on ``done_partition_forwards``."""
         if message.message_type == ConductorMessageType.NEW_REQUEST:
             self._ingest_request(message.body)
+        elif message.message_type == ConductorMessageType.END_EPISODE:
+            self._end_episode(message.body)
         elif message.message_type == ConductorMessageType.ABORT_REQUEST:
             self._abort_request(message.body.request_id)
         elif message.message_type == ConductorMessageType.FAIL_REQUESTS:

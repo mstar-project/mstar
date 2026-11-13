@@ -7,7 +7,7 @@ import pytest
 from mstar.conductor.conductor import Conductor
 from mstar.conductor.episodes import EpisodeCapacityError, EpisodeRecords, EpisodeSlots
 from mstar.conductor.routing import Placement
-from mstar.utils.ipc_format import NewRequestConductor, WorkerGraphsDone
+from mstar.utils.ipc_format import EndEpisodeConductor, NewRequestConductor, WorkerGraphsDone
 
 
 def _placement(replica: int) -> Placement:
@@ -198,3 +198,75 @@ def test_slot_pressure_requeues_without_leaking_a_registered_request():
     assert conductor._admit_request(body) is False
     assert conductor.requests == {}
     assert conductor.waiting_queue == [body]
+
+
+def test_close_waits_for_in_flight_call_then_ends_its_slot():
+    conductor = object.__new__(Conductor)
+    conductor._episode_array_names = frozenset({"frames"})
+    conductor._episode_records = EpisodeRecords()
+    conductor._episode_slots = EpisodeSlots(1)
+    conductor.waiting_queue = []
+    workers = {"w0"}
+    assert conductor._episode_slots.reserve("episode:robot-a", workers) == 0
+    conductor._episode_records.admit("robot-a", "call-1", 0, _placement(0), workers=workers)
+    sent = []
+    conductor.communicator = SimpleNamespace(send=lambda worker, msg: sent.append((worker, msg)))
+
+    conductor._end_episode(EndEpisodeConductor("robot-a"))
+    assert sent == []
+    with pytest.raises(ValueError, match="is ending"):
+        conductor._episode_records.can_admit("robot-a")
+    conductor.requests = {"call-1": SimpleNamespace(
+        routing=None, episode_admitted=True, episode_slot=0, episode_workers=workers,
+        episode_id="robot-a", completion_sent=True, episode_held={"frames": 21},
+    )}
+    conductor._drop_request("call-1")
+    assert len(sent) == 1
+    assert sent[0][1].body.episode_id == "robot-a"
+    assert sent[0][1].body.episode_slot == 0
+    assert conductor._episode_slots.reserve("request:r", workers) == 0
+
+
+def test_close_before_preprocessing_finishes_rejects_late_admission():
+    episodes = EpisodeRecords()
+    assert episodes.mark_ending("robot-a") is False
+    with pytest.raises(ValueError, match="has ended"):
+        episodes.can_admit("robot-a")
+
+
+def test_eviction_sends_end_before_reusing_a_workers_slot():
+    conductor = object.__new__(Conductor)
+    conductor._episode_records = EpisodeRecords()
+    conductor._episode_slots = EpisodeSlots(1)
+    workers = {"w0"}
+    conductor._episode_slots.reserve("episode:old", workers)
+    conductor._episode_records.admit("old", "call-1", 0, _placement(0), workers=workers)
+    conductor._episode_records.finish("old", "call-1", {"frames": 21})
+    sent = []
+    conductor.communicator = SimpleNamespace(send=lambda worker, msg: sent.append((worker, msg)))
+
+    assert conductor._reserve_episode_slot("episode:new", workers) == 0
+    sent.append(("w0", "next NEW_REQUEST"))
+    assert sent[0][1].body.episode_id == "old"
+    assert sent[0][1].body.episode_slot == 0
+    assert sent[1][1] == "next NEW_REQUEST"
+    assert conductor._episode_records.view("old").cold == "evicted"
+
+
+def test_failed_end_send_does_not_reassign_a_live_row():
+    conductor = object.__new__(Conductor)
+    conductor._episode_records = EpisodeRecords()
+    conductor._episode_slots = EpisodeSlots(1)
+    workers = {"w0"}
+    conductor._episode_slots.reserve("episode:old", workers)
+    conductor._episode_records.admit("old", "call-1", 0, _placement(0), workers=workers)
+    conductor._episode_records.finish("old", "call-1", {"frames": 21})
+
+    def fail_send(_worker, _msg):
+        raise OSError("outbox closed")
+
+    conductor.communicator = SimpleNamespace(send=fail_send)
+    with pytest.raises(OSError, match="outbox closed"):
+        conductor._reserve_episode_slot("episode:new", workers)
+    assert conductor._episode_slots.reserve("episode:new", workers) is None
+    assert conductor._episode_records.view("old").held["frames"] == 21

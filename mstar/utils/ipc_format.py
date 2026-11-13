@@ -363,6 +363,7 @@ class WorkerMessage:
 
 class ConductorMessageType(Enum):
     NEW_REQUEST = "new_request"
+    END_EPISODE = "end_episode"
     WORKER_GRAPHS_DONE = "worker_graphs_done"
     SETUP_DONE = "setup_done"
     ABORT_REQUEST = "abort_request"
@@ -397,6 +398,11 @@ class NewRequestConductor(MessageBody):
     episode: str | None = None
     episode_keys: dict[str, str] | None = None
     reset_episode: bool = False
+
+
+@dataclass
+class EndEpisodeConductor(MessageBody):
+    episode_id: str
 
 
 @dataclass
