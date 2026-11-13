@@ -29,6 +29,7 @@ from mstar.engine.resources.attn.ragged.config import (
     RaggedChunkCausalAttentionSpec,
     RaggedCrossAttentionSpec,
     RaggedCrossAttentionStep,
+    RaggedExpertAttentionSpec,
     RaggedKeyPrefixAttentionSpec,
     cross_label,
 )
@@ -283,6 +284,35 @@ class RaggedChunkCausalAttnManager(AttentionResource):
 
         return _build_ragged(
             spec, info, FlexChunkCausalManager,
+            block_size=resolve_mask_block_size(spec.mask_block_size, info.device),
+            full_blocks=full_blocks_for_backend(),
+        )
+
+
+class RaggedExpertAttnManager(AttentionResource):
+    """Expert masks through the existing cacheless ragged plan and run path."""
+
+    prefix_skip_safe = True
+
+    @classmethod
+    def build(cls, spec: RaggedExpertAttentionSpec, info: EngineResourceInfo):
+        config = spec.config
+        if config.backend is not RaggedAttnBackend.AUTO or config.compile_op or (
+            config.flashinfer_backend is not None or config.workspace_mb is not None
+        ):
+            raise ValueError("expert attention requires flex auto backend without FlashInfer or compile_op settings")
+        from mstar.engine.resources.attn.ragged.chunk_causal import (
+            full_blocks_for_backend,
+            resolve_mask_block_size,
+        )
+        from mstar.engine.resources.attn.ragged.expert_flex import FlexExpertManager
+
+        return _build_ragged(
+            spec, info, FlexExpertManager,
+            mode=spec.mode, chunk_len=spec.chunk_len,
+            future_per_chunk=spec.future_per_chunk,
+            tokens_per_frame=spec.tokens_per_frame, window_frames=spec.window_frames,
+            include_noised=spec.include_noised,
             block_size=resolve_mask_block_size(spec.mask_block_size, info.device),
             full_blocks=full_blocks_for_backend(),
         )

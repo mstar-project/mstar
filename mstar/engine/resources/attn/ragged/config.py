@@ -98,6 +98,14 @@ class ChunkCausalAttentionStep(ResourceStep):
     layouts: tuple[ChunkCausalLayout, ...] = ()
 
 
+@dataclass(frozen=True)
+class ExpertAttentionStep(ResourceStep):
+    """One mask layout per request segment, with paired labels for cross reads."""
+
+    pairs: tuple[tuple[str, str], ...] = ()
+    layouts: tuple[tuple[int, int, int, int], ...] = ()  # chunks, globals, clean frames, noised frames
+
+
 @dataclass
 class RaggedAttentionConfig:
     """Varlen attention over segments packed into one forward, with no KV
@@ -439,3 +447,37 @@ class RaggedChunkCausalAttentionSpec(_RaggedSpecBase):
         from mstar.engine.resources.attn.ragged.base import RaggedChunkCausalAttnManager
 
         return RaggedChunkCausalAttnManager
+
+
+@dataclass
+class RaggedExpertAttentionSpec(_RaggedSpecBase):
+    """Cacheless flex attention for expert cross or same-chunk self reads."""
+
+    mode: Literal["cross", "self"] = "self"
+    chunk_len: int = 1
+    future_per_chunk: int = 1
+    tokens_per_frame: int = 1
+    window_frames: int = 1
+    include_noised: bool = True
+    mask_block_size: int | None = None
+
+    def __post_init__(self):
+        super().__post_init__()
+        if self.mode not in ("cross", "self"):
+            raise ValueError(f"unknown expert mode {self.mode!r}")
+        for name in ("chunk_len", "future_per_chunk", "tokens_per_frame", "window_frames"):
+            value = getattr(self, name)
+            if type(value) is not int or value <= 0:
+                raise ValueError(f"expert attention {name} must be positive int")
+        if type(self.include_noised) is not bool:
+            raise ValueError("expert attention include_noised must be bool")
+        if self.mask_block_size is not None and (
+            type(self.mask_block_size) is not int or self.mask_block_size <= 0
+        ):
+            raise ValueError("expert mask_block_size must be positive int or None")
+
+    @property
+    def resource_class(self) -> "type[Resource]":
+        from mstar.engine.resources.attn.ragged.base import RaggedExpertAttnManager
+
+        return RaggedExpertAttnManager
