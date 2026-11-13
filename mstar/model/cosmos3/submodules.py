@@ -349,8 +349,9 @@ class GenStepInfo:
     speedup; declaring the dense one for a step that does get a slot would try
     to capture an eager-only backend, so the safe direction over-declares.
 
-    ``cfg_active`` narrows the eager single-request declaration only. It is
-    deliberately not part of ``capture_key`` — see ``cg_key_info``.
+    ``cfg_active`` narrows the eager declarations: the single-request step's,
+    and a cross-request action step's, whose rows ``can_batch`` keeps to one
+    value. It is deliberately not part of ``capture_key`` — see ``cg_key_info``.
     """
     cfg: bool                 # this request has an unconditional branch at all
     cfg_active: bool          # ...and this step is inside its guidance interval
@@ -1568,9 +1569,8 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             # Cross-request batch: one combined plan over every request's
             # guidance branches (a single branch when guidance is off). The
             # image and sound batched forwards run both branches whenever the
-            # branch exists. The action one runs the conditional branch alone
-            # when no row is inside its guidance interval, as a single request
-            # does (rows outside it in a guided batch drop the other branch).
+            # branch exists. An action batch's rows agree on guidance this step
+            # (`can_batch`), so it runs both branches or the conditional one alone.
             cfg = infos[0].cfg and (graph_walk not in ACTION_WALKS or any(info.cfg_active for info in infos))
             labels = (COND_LABEL, UNCOND_LABEL) if cfg else (COND_LABEL,)
             return self._gen_step(
@@ -1773,9 +1773,11 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         ``_forward_action_gen`` call this for the same step, so the declared
         attention (batched vs cond-only) matches the forward that runs.
 
-        The captured path and the cross-request batch always run both
-        branches; ``postprocess`` and ``forward_batched`` call this to keep
-        the conditional one outside the interval. See ``cg_key_info`` for why
+        The captured path and the cross-request image / video batch always
+        run both branches; ``postprocess`` and ``forward_batched`` call this
+        to keep the conditional one outside the interval. A cross-request
+        action batch runs only the branches its rows' shared value calls for
+        (``can_batch``). See ``cg_key_info`` for why
         the interval is not folded into the capture key."""
         if st["uncond"] is None:
             return False
@@ -2062,7 +2064,14 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             # policy -- or all two-branch), so one plan covers the batch. Modes
             # and embodiment domains may differ: each request's masks, scheduler
             # and domain-aware action projection are applied per request.
-            return len({st["uncond"] is not None for st in sts}) == 1
+            # Rows must also agree on whether this step guides: a batch runs
+            # both branches for every row once any row is inside its
+            # guidance_interval, which doubles the work of the rows outside it.
+            infos = [self._gen_step_info(inp) for inp in model_inputs]
+            return (
+                len({st["uncond"] is not None for st in sts}) == 1
+                and len({info.cfg_active for info in infos}) == 1
+            )
         return False
 
     def max_batch_size(self, graph_walk: str):
@@ -2200,9 +2209,9 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         forward. Mirrors the image batched path: build each request's static gen
         inputs (clamping a request that has run one step past its denoise count),
         run one batched transformer pass, then per request combine the guidance
-        branches (when present) and apply its own joint scheduler step. When no
-        row is inside its guidance interval the batch runs the conditional
-        branch alone, as ``declare_step`` planned it."""
+        branches (when present) and apply its own joint scheduler step. The rows
+        agree on guidance this step (``can_batch``), so the batch runs both
+        branches or the conditional one alone, as ``declare_step`` planned it."""
         states = self._states(engine_inputs)
         attn = self._gen_attn(engine_inputs)
         rids = engine_inputs.request_ids
@@ -2249,8 +2258,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         out = {}
         for (rid, st, lat, act, k), branches in zip(meta, results, strict=True):
             video_v, action_v = branches[0]
-            # The batch runs both branches, but a step outside the request's
-            # guidance_interval keeps the conditional one, as the single path does.
+            # `can_batch` keeps the rows to one value; the per-row check is belt and braces.
             if with_cfg and self._cfg_active(st, k):
                 uncond_video, uncond_action = branches[1]
                 video_v = _guided(video_v, uncond_video, st["gs"], lat.dtype)
