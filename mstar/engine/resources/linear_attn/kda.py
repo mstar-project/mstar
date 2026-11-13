@@ -13,7 +13,7 @@ stages the layout into buffers that stay put under capture.
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import NamedTuple
 
@@ -196,6 +196,18 @@ class KDAManager(LinearAttnManager):
         """Whether a captured prefill replays with each step's spans on these kernels."""
         return self.kernels.prefill_capturable
 
+    def can_capture(self, step: LinearAttnStep) -> bool:
+        """False for a prefill step these kernels can't replay. A packed config whose step has one token a row reads
+        as a decode here, and still raises at capture."""
+        spans = [max(segment.span, 0) for segment in step.segments or ()]
+        return self.prefill_capturable or not self.is_prefill(spans, step.speculative, force_prefill=False)
+
+    @staticmethod
+    def is_prefill(spans: Sequence[int], speculative: bool, force_prefill: bool) -> bool:
+        """Whether a step of ``spans`` runs the prefill kernels: no verify step, and packed, empty or with a row of
+        other than one token."""
+        return not speculative and (force_prefill or not spans or any(span != 1 for span in spans))
+
     # Step lifecycle
 
     @property
@@ -251,8 +263,7 @@ class KDAManager(LinearAttnManager):
         num_tokens = lease.bucket.num_tokens if lease is not None else sum(spans)
         # as GDN: a packed capture replays uneven spans, so it always takes the prefill
         # kernels, even when it captured one token per row
-        is_decode = (not speculative and not ctx.force_prefill and rows > 0
-                     and all(s == 1 for s in spans))
+        is_decode = not speculative and not self.is_prefill(spans, speculative, ctx.force_prefill)
         plan = KDAPlan(
             slot_ids=addressing.slot_indices[:rows],
             has_state=addressing.has_state[:rows],

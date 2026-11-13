@@ -33,11 +33,11 @@ def test_resource_owns_kernel_capture_support(device_type):
                     FlashInferCrossManager, GDNManager, Mamba2Manager):
             resource = object.__new__(cls)
             resource._device = torch.device(device_type)
-            assert resource.can_capture()
+            assert resource.can_capture(None)
     sampler = object.__new__(SamplerResource)
     sampler._device = torch.device(device_type)
-    assert sampler.can_capture() is (device_type != "cpu")
-    assert not object.__new__(DenseAttentionManager).can_capture()
+    assert sampler.can_capture(None) is (device_type != "cpu")
+    assert not object.__new__(DenseAttentionManager).can_capture(None)
 
 
 @pytest.mark.parametrize("piecewise", [False, True])
@@ -45,7 +45,7 @@ def test_resource_owns_kernel_capture_support(device_type):
 def test_resource_capability_filters_recipes_and_preserves_strict_mode(
     monkeypatch, caplog, piecewise, can_capture,
 ):
-    resource = make_resource(can_capture=lambda: can_capture)
+    resource = make_resource(can_capture=lambda step: can_capture)
     step = SimpleNamespace(steps={"attention": object()}, state={})
     declare = Mock(return_value=step)
     step_runner = Mock()
@@ -97,7 +97,7 @@ def test_resource_capability_filters_recipes_and_preserves_strict_mode(
 def test_empty_capture_batch_sizes_capture_nothing(piecewise):
     """``capture_batch_sizes=[]`` means no capture in both runners (``None`` is the
     runner's defaults)."""
-    resource = SimpleNamespace(can_capture=lambda: True, force_double_buffer=False, lean_capture=False)
+    resource = SimpleNamespace(can_capture=lambda step: True, force_double_buffer=False, lean_capture=False)
     declare = Mock(return_value=SimpleNamespace(steps={"attention": object()}))
     if piecewise:
         runner = PiecewiseAcceleratorGraphRunner(

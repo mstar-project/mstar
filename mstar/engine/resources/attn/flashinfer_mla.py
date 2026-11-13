@@ -267,6 +267,9 @@ class FlashInferMLAManager(AttentionManager):
         return torch.device(self._device).type == "cuda" and flashinfer_mla_supports(
             self._kv_config.kv_lora_rank, self._kv_config.qk_rope_head_dim)
 
+    def can_capture(self, step) -> bool:
+        return self.uses_kernel
+
     def _cg_wrapper(self, lease: SlotLease, label: str, num_rows: int):
         if not self.uses_kernel:
             # the fallback reads its plan from host lists, so a replay would

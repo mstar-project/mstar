@@ -115,7 +115,7 @@ def blocked_capture_resources(step, resources: Mapping[str, Resource]) -> list[s
     """Return resource keys that prevent capture of the declared step."""
     if step is None:
         return []
-    return sorted(key for key in step.steps if not resources[key].can_capture())
+    return sorted(key for key, resource_step in step.steps.items() if not resources[key].can_capture(resource_step))
 
 
 def placed_combined_pools(step, resources: Mapping[str, Resource]) -> list[str]:

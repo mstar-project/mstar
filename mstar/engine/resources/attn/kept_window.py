@@ -46,7 +46,7 @@ class KeptWindowAttention(AttentionManager):
     def bind_dependencies(self, resources) -> None:
         self._kv = resources[self._kv_cache_name]
 
-    def can_capture(self) -> bool:
+    def can_capture(self, step) -> bool:
         return False
 
     @property

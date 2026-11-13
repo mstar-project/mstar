@@ -143,7 +143,7 @@ class RollingKVManager(Resource):
         self._admit_taken: set[int] = set()
         self._current: RollingPlan | None = None
 
-    def can_capture(self) -> bool:
+    def can_capture(self, step) -> bool:
         # A replay's padding rows would need scratch K/V to write into, and regions
         # move when the pool is rearranged; a step that declares this store runs eager.
         return False

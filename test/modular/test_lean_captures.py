@@ -216,7 +216,7 @@ def _capture_runner(resources, steps=None, blocked=()):
         return SimpleNamespace(steps=dict.fromkeys(keys, object()), segments=None, state={})
 
     for key in blocked:
-        resources[key].can_capture = lambda: False
+        resources[key].can_capture = lambda step: False
     configs = _configs()
     submodule = SimpleNamespace(get_accelerator_graph_configs=lambda *args: configs, declare_step=declare_step,
                                 compiled_entries_per_shape=1)

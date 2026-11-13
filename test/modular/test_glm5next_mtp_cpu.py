@@ -450,7 +450,9 @@ def _serve(engine, prompt: torch.Tensor, max_tokens: int, ignore_eos=False, walk
 
 
 def _errors(caplog) -> list[str]:
-    return [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+    # On the CPU the MLA resource runs its fallback, which no graph replays, so the runner drops the decode capture.
+    dropped = "Dropping accelerator graph config 0 for LLM: resources cannot capture: ['attn']"
+    return [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR and r.getMessage() != dropped]
 
 
 @pytest.mark.parametrize("k", [0, 3])
