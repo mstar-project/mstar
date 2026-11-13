@@ -255,3 +255,40 @@ def test_plan_refuses_a_prefill_past_topk():
     with pytest.raises(RuntimeError, match="decode-only"):
         _plan(dsa, [SequenceView("r0", "main", [1, 2], length=7, to_compute=2)])
 
+
+class _StubKeys:
+    """The index key array's handle: every step selects, and each read returns a fresh pick."""
+
+    def _check_open(self, call):
+        pass
+
+    def _selects(self):
+        return True
+
+    def add(self, layer, k):
+        pass
+
+    def read(self, layer, q, weights):
+        return torch.randint(0, 8, (q.shape[0], 4))
+
+
+def test_shared_layers_take_the_last_full_pick_from_the_model():
+    """A SHARED layer attends the rows the FULL layer before it picked in the same forward, which the model's
+    carried pick hands it, as ``shared_selection`` did, and the next FULL layer's pick replaces it."""
+    from mstar.model.glm52.components.attention import CarriedPick, Glm52MLAAttention
+    from mstar.model.glm52.config import INDEX_KEYS, Glm52ModelConfig
+
+    cfg = Glm52ModelConfig.reduced()
+    cfg.mla_absorb = cfg.dsa_long_context = True
+    carried = CarriedPick()
+    full, shared = (Glm52MLAAttention(cfg, layer_idx=i, carried=carried) for i in (0, 1))
+    assert full.indexer is not None and shared.indexer is None
+    full.indexer.compute_k = lambda h, pos: torch.zeros(h.shape[0], cfg.index_head_dim)
+    full.indexer.compute_query = lambda q_c, h, pos: (torch.zeros(h.shape[0], 2, 8), torch.ones(h.shape[0], 2))
+    for layer in (full, shared):
+        layer.bind_state({INDEX_KEYS: _StubKeys()})
+    h, pos = torch.zeros(2, cfg.hidden_size), torch.arange(2)
+    picked = full._index_pass(h, None, pos)
+    assert shared._index_pass(h, None, pos) is picked, "the SHARED layer would attend another pick"
+    later = full._index_pass(h, None, pos)
+    assert later is not picked and shared._index_pass(h, None, pos) is later
