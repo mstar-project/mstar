@@ -1113,6 +1113,16 @@ def test_talker_noise_from_the_seed_and_offset_equals_one_kept_cuda_generator(mo
         _commit(talker, walk, ["r"], [prepared])
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_talker_cuda_draw_reaches_any_count_from_the_seed_and_the_offset(model):
+    """On CUDA the offset reaches draw k directly, and it is still the k-th draw of one generator kept from the seed."""
+    talker = TalkerSubmodule(_random_generator(model.config).cuda(), model.config, 4)
+    kept = torch.Generator(device="cuda").manual_seed(4)
+    expected = [torch.randn((1, 8, 4), generator=kept, device="cuda", dtype=talker._dtype())[0] for _ in range(8)]
+    for count in (0, 1, 7, 2, 2, 5):
+        assert torch.equal(talker._draw(count, 4), expected[count]), f"draw {count}"
+
+
 def test_talker_declares_the_same_span_in_both_caches(model):
     talker, _, _ = _talker(model)
     step = engine_step(talker, "talker_decode", ["a", "b"], [ARNodeInputs(input_seq_len=1)] * 2)
