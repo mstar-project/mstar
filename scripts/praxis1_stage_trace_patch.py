@@ -54,14 +54,22 @@ def install_trace(namespace):
         def traced(self, *args, _original=original, _signature=signature, _name=name, **kwargs):
             bound = _signature.bind_partial(self, *args, **kwargs)
             # Only tensor inputs and small scalar settings. Exclude engine
-            # handles and model weights from diagnostic artifacts.
+            # handles, model weights, and the 28-layer trunk tap stack. At the
+            # published grid the taps alone exceed 200 MiB per Euler step.
+            skipped = {"self", "engine_inputs", "graph_walk", "kwargs", "views"}
+            if _name == "Praxis1ActionExpertSubmodule":
+                skipped.update(("taps", "tap_embeddings", "tap_rope_ids", "tap_geometry"))
             inputs = {
                 key: _cpu(value)
                 for key, value in bound.arguments.items()
-                if key not in ("self", "engine_inputs", "graph_walk", "kwargs")
+                if key not in skipped
             }
             result = _original(self, *args, **kwargs)
-            artifact = {"stage": _name, "inputs": inputs, "outputs": _cpu(result)}
+            recorded = result
+            if _name == "Praxis1BackboneSubmodule":
+                recorded = {key: value for key, value in result.items()
+                            if key in ("expert_video_latents", "expert_action_latents")}
+            artifact = {"stage": _name, "inputs": inputs, "outputs": _cpu(recorded)}
             path = _output / f"{os.getpid()}-{next(_counter):03d}-{_name}.pt"
             torch.save(artifact, path)
             return result
