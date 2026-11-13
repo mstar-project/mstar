@@ -754,7 +754,10 @@ deployment YAML tunes them under ``resources:`` (see :ref:`Step 6 <config-yaml>`
 - ``Positions(rope=)``: a position counter per request and label, on an append-only array
   that keeps entries. ``rope=None`` is a counter only. ``Rope`` carries ``theta``,
   ``rotary_dim``, ``interleave``, ``scale``, the Llama 3.1 factors (all three or none), the
-  rotation's ``dtype`` and a ``table_dtype`` for a cos/sin table built once. On the contract
+  rotation's ``dtype`` and a ``table_dtype`` for a cos/sin table built once. ``longrope`` takes
+  a ``LongRoPE``'s short and long factor sets, and a request rotates with the long set when the
+  prompt length ``process_prompt`` sets under ``MAX_POSITION_KWARG`` passes the original context
+  (Phi-4-multimodal). On the contract
   this picks the kernel, and a shared layer's ``rope_*`` arguments have no effect, so a port
   declares what its layer passed before. The counter is
   separate from log positions: a kept step advances it by each row's advance, a fork copies

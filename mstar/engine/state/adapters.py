@@ -258,7 +258,7 @@ def _position_spec(array: Array) -> PositionSpec:
             config, rotary_dim=rope.rotary_dim, interleave=rope.interleave, rope_scale=rope.scale,
             rope_theta=rope.theta, rope_dtype=rope.dtype, rope_table_dtype=rope.table_dtype,
             low_freq_factor=rope.low_freq_factor, high_freq_factor=rope.high_freq_factor,
-            old_context_len=rope.old_context_len,
+            old_context_len=rope.old_context_len, longrope=rope.longrope,
         )
     return PositionSpec(resource_key=position_key(array), nodes=array.nodes, config=config)
 
