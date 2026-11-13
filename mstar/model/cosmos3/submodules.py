@@ -914,7 +914,6 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         fps = float(md.get("fps", 24.0))
         steps = int(md.get("num_inference_steps", self.config.num_inference_steps))
         cond_len, uncond_len = md[PROMPT_LENGTHS]
-        # past its length a prompt's slimmed statics don't depend on its tokens
         ids = ([0] * cond_len, [0] * uncond_len if _has_guidance(md) else None)
         st = {
             "gs": float(md.get("guidance_scale", 6.0)),
@@ -1121,7 +1120,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         if cond_units:
             st["vmask"] = self._pin_mask(plan.units, range(cond_units), device, self.transformer.proj_in.weight.dtype)
         if resume_units:
-            # pinned by this request since its prefill, which refused it missing
+            # The prefill pinned the session, and refused the request if it was missing.
             st["resume_latents"], st["session_tail"] = self._sessions.get(st["session_id"])
             st["resume_context"] = st["session_tail"]
         elif plan.index == 0:
@@ -2508,8 +2507,8 @@ class Cosmos3VAEEncoderSubmodule(NodeSubmodule):
 
     Runs in parallel with the DiT's understanding-tower prefill (the conditioned
     prefill walks put the two nodes in a ``Parallel`` section) and emits
-    ``cond_latents`` as a persist signal the conductor threads into the
-    generation walk's first iteration. Everything is re-derived from the request
+    ``cond_latents`` as a persist signal, which the generation walk's loop hands
+    to every iteration. Everything is re-derived from the request
     metadata so the node stays stateless and placeable on any rank. Per mode:
       - image-to-video: the single conditioning frame, encoded standalone (the
         Wan VAE is temporally causal, so frame 0 encodes bit-identically alone);

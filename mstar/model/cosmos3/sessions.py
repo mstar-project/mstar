@@ -32,11 +32,11 @@ class SessionStore:
     A request that names a session ``begin``s it, which pins it for the
     request's duration (a second request on a live session is refused),
     reads the stored state with ``get`` (which promotes it), and either
-    ``put``s the new state when it is
-    done or ``end``s the session. ``release`` unpins whatever a removed
-    request held. Only idle sessions count against ``capacity`` and can be
-    evicted (expired ones first, then the oldest); live ones never are, so
-    the store holds at most ``capacity`` idle plus the in-flight sessions.
+    ``put``s the new state when it is done or ``end``s the session.
+    ``release`` unpins whatever a removed request held. Only idle sessions
+    count against ``capacity`` and can be evicted (expired ones first, then
+    the oldest); live ones never are, so the store holds at most
+    ``capacity`` idle plus the in-flight sessions.
     """
 
     def __init__(
