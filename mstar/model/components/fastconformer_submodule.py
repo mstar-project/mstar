@@ -20,6 +20,7 @@ from mstar.engine.accelerator_graph_config import (
 from mstar.engine.engine import ExecutingBatch
 from mstar.model.components.audio_features import NemoLogMel
 from mstar.model.components.fastconformer import FastConformerEncoder
+from mstar.model.components.sdpa_backends import no_cudnn_sdpa
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
 from mstar.utils.h2d import to_device_nonblocking
 
@@ -212,7 +213,9 @@ class FastConformerEncoderSubmodule(NodeSubmodule):
                         static_inputs={"features": padded, "lengths": lengths}, real_bs=len(part),
                     )["states"]
                 else:
-                    batch_states = self._run(pad_sequence([features[r] for r in part], batch_first=True), lengths)
+                    # eager lengths vary per call, so keep their attention off cuDNN's per-shape builds
+                    with no_cudnn_sdpa():
+                        batch_states = self._run(pad_sequence([features[r] for r in part], batch_first=True), lengths)
                 for i, r in enumerate(part):
                     states[r] = batch_states[i, :out_lengths[r]]
         return states
