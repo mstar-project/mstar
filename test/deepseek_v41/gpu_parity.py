@@ -37,6 +37,12 @@ TP2 = dict(moe_intermediate_size=64, o_lora_rank=32)
 TP2_RUNS = (("sliced-experts", "tp", {}), ("whole-experts", "ep", {}), ("host-engram", "tp", {"engram_tables": "host"}))
 
 
+def _emit(rows: dict[str, dict], name: str, row: dict) -> None:
+    """Record a result and print it at once: a run cut short still shows what it finished."""
+    rows[name] = row
+    print(f"{name}: {json.dumps(row)}", flush=True)
+
+
 def _real_kernels(reference: str) -> types.ModuleType:
     import importlib.util
 
@@ -67,7 +73,7 @@ def _tie_inputs(device) -> torch.Tensor:
         row = torch.linspace(-1, 1, 128, device=device) * top
         row[5] = top
         rows.append(row)
-    return torch.stack(rows).to(torch.bfloat16)
+    return torch.stack(rows).repeat(1, 5).to(torch.bfloat16)  # 640 wide, as the random rows
 
 
 def mode_kernels(args) -> dict:
@@ -85,13 +91,13 @@ def mode_kernels(args) -> dict:
     def bits(name: str, got, want) -> None:
         got = [t.contiguous().view(torch.uint8) if t.dtype.itemsize == 1 else t for t in got]
         want = [t.contiguous().view(torch.uint8) if t.dtype.itemsize == 1 else t for t in want]
-        rows[name] = {"equal": all(torch.equal(a, b) for a, b in zip(got, want, strict=True)),
-                      "differing": int(sum((a != b).sum() for a, b in zip(got, want, strict=True)))}
+        _emit(rows, name, {"equal": all(torch.equal(a, b) for a, b in zip(got, want, strict=True)),
+                           "differing": int(sum((a != b).sum() for a, b in zip(got, want, strict=True)))})
 
     def close(name: str, got, want) -> None:
         err = (got.float() - want.float()).abs() / _spacing(want)
-        rows[name] = {"max_ulp": err.max().item(), "mean_ulp": err.mean().item(),
-                      "finite": bool(torch.isfinite(got.float()).all())}
+        _emit(rows, name, {"max_ulp": err.max().item(), "mean_ulp": err.mean().item(),
+                           "finite": bool(torch.isfinite(got.float()).all())})
 
     spread = torch.exp(torch.linspace(-12, 8, 96, device=device))[:, None]
     inputs = {"random": (randn(96, 640) * spread).to(torch.bfloat16), "ties": _tie_inputs(device)}
@@ -135,7 +141,7 @@ def mode_kernels(args) -> dict:
     base = torch.randn((2 + hc) * hc, generator=g, device=device)
     for name, got, want in zip(("pre", "post", "comb"), real.hc_split_sinkhorn(mixes, scale, base, hc, 20, 1e-6),
                                fake.hc_split_sinkhorn(mixes, scale, base, hc, 20, 1e-6), strict=True):
-        rows[f"hc_split_sinkhorn/{name}"] = {"max_abs": (got.float() - want.float()).abs().max().item()}
+        _emit(rows, f"hc_split_sinkhorn/{name}", {"max_abs": (got.float() - want.float()).abs().max().item()})
     return rows
 
 
@@ -189,14 +195,14 @@ def mode_tp1(args) -> dict:
         standin = T.load_reference(args.reference)
         want32 = _reference_run(standin, tmp, config, tokenizer, ids, PROMPT, torch.float32, device)
         got32 = _engine_run(tmp, ids, PROMPT, torch.float32, device)
-        rows["fp32/mstar-vs-reference(stand-ins)"] = {
-            "gap": T.logit_gap(got32, want32), "argmax_equal": bool(torch.equal(got32.argmax(-1), want32.argmax(-1)))}
+        _emit(rows, "fp32/mstar-vs-reference(stand-ins)", {
+            "gap": T.logit_gap(got32, want32), "argmax_equal": bool(torch.equal(got32.argmax(-1), want32.argmax(-1)))})
         # the same values held or fetched another way: every one bit-identical on CPU
         for name, kwargs in (("fp8 experts", {"moe_experts": "fp8"}), ("dense experts", {"moe_experts": "dense"}),
                              ("host tables", {"engram_tables": "host"})):
             other = _engine_run(tmp, ids, PROMPT, torch.float32, device, **kwargs)
-            rows[f"fp32/mstar({name})-vs-mstar"] = {
-                "equal": bool(torch.equal(other, got32)), "gap": T.logit_gap(other, got32)}
+            _emit(rows, f"fp32/mstar({name})-vs-mstar", {
+                "equal": bool(torch.equal(other, got32)), "gap": T.logit_gap(other, got32)})
         if not args.no_kernels:
             real = T.load_reference(args.reference, _real_kernels(args.reference))
             want16 = _reference_run(real, tmp, config, tokenizer, ids, PROMPT, torch.bfloat16, device)
@@ -206,9 +212,9 @@ def mode_tp1(args) -> dict:
             got16 = _engine_run(tmp, ids, PROMPT, torch.bfloat16, device)
             runs = (("reference(stand-ins)", same16), ("reference(exact softmax)", other16), ("mstar", got16))
             for name, got in runs:
-                rows[f"bf16/{name}-vs-reference(kernels)"] = {
+                _emit(rows, f"bf16/{name}-vs-reference(kernels)", {
                     "gap": T.logit_gap(got, want16),
-                    "argmax_equal_steps": int((got.argmax(-1) == want16.argmax(-1)).sum()), "steps": got.shape[0]}
+                    "argmax_equal_steps": int((got.argmax(-1) == want16.argmax(-1)).sum()), "steps": got.shape[0]})
         torch.save({"fp32": got32, "ids": ids}, args.out + ".pt")
     return rows
 
@@ -273,9 +279,9 @@ def mode_tp2(args) -> dict:
             mp.spawn(_tp2_rank, args=(args, port, snapshot, run), nprocs=2)
             r0, r1 = (torch.load(f"{args.out}.{run}.rank{rank}") for rank in (0, 1))
             for dtype, got in r0.items():
-                rows[f"{dtype}/{run}/tp2-vs-tp1"] = {
+                _emit(rows, f"{dtype}/{run}/tp2-vs-tp1", {
                     "ranks_equal": bool(torch.equal(got, r1[dtype])), "gap": T.logit_gap(got, one[dtype]),
-                    "argmax_equal_steps": int((got.argmax(-1) == one[dtype].argmax(-1)).sum()), "steps": got.shape[0]}
+                    "argmax_equal_steps": int((got.argmax(-1) == one[dtype].argmax(-1)).sum()), "steps": got.shape[0]})
     return rows
 
 
@@ -291,8 +297,6 @@ def main() -> int:
     meta = {"torch": torch.__version__, "cuda": torch.version.cuda, "device": args.engine_device,
             "gpu": torch.cuda.get_device_name(0) if args.engine_device.startswith("cuda") else None}
     Path(args.out).write_text(json.dumps({"mode": args.mode, "meta": meta, "rows": rows}, indent=1))
-    for name, row in rows.items():
-        print(f"{name}: {json.dumps(row)}", flush=True)
     return 0
 
 
