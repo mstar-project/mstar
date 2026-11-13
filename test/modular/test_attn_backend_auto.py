@@ -1,15 +1,14 @@
 """``AUTO`` attention backends, resolved when the resource is built.
 
 ``AUTO`` resolves to FlashInfer on NVIDIA, Intel and CPU processes, the old
-default. On ROCm, paged and cross attention resolve to AITER, or to AMD's
-FlashInfer build where AITER is unsafe or missing (always FlashInfer for a
-windowed pool), and ragged attention to ``DENSE``, which runs AITER's varlen
-kernel. A backend named in a spec or YAML is built as named.
+default. On ROCm it resolves to AITER, or to AMD's FlashInfer build where AITER
+is unsafe or missing. A backend named in a spec or YAML is built as named.
 Builds use the CPU device since the managers allocate nothing until their
 first plan.
 """
 
 import dataclasses
+import inspect
 import logging
 import types
 
@@ -42,6 +41,11 @@ from mstar.engine.resources.attn.base import (
 )
 from mstar.engine.resources.attn.cross import CrossAttentionManager, FlashInferCrossManager
 from mstar.engine.resources.attn.flashinfer import FlashInferManager
+from mstar.engine.resources.attn.ragged import aiter as rocm_ragged
+from mstar.engine.resources.attn.ragged.aiter import (
+    AiterRaggedCrossManager,
+    AiterRaggedManager,
+)
 from mstar.engine.resources.attn.ragged.base import resolve_ragged_attn_backend
 from mstar.engine.resources.attn.ragged.dense import (
     DenseRaggedCrossManager,
@@ -331,7 +335,7 @@ def test_yaml_rejects_an_unknown_backend():
 def rocm(monkeypatch):
     """A ROCm process whose AITER and FlashInfer-ROCm installs each import or not."""
 
-    def setup(aiter: bool = True, flashinfer: bool = True):
+    def setup(aiter: bool = True, flashinfer: bool = True, varlen: bool = True):
         monkeypatch.setattr(platforms, "resolve_platform", RocmPlatform)
         monkeypatch.setattr(
             rocm_attn, "aiter_paged_unavailable_reason",
@@ -340,6 +344,10 @@ def rocm(monkeypatch):
         monkeypatch.setattr(
             rocm_attn, "flashinfer_rocm_unavailable_reason",
             lambda: None if flashinfer else "ImportError: no flashinfer.rocm",
+        )
+        monkeypatch.setattr(
+            rocm_ragged, "aiter_varlen_unavailable_reason",
+            lambda: None if varlen else "ImportError: no aiter",
         )
 
     return setup
@@ -392,6 +400,7 @@ def test_cuda_never_asks_for_the_rocm_kernels(monkeypatch):
 
     monkeypatch.setattr(rocm_attn, "aiter_paged_unavailable_reason", unexpected_import)
     monkeypatch.setattr(rocm_attn, "flashinfer_rocm_unavailable_reason", unexpected_import)
+    monkeypatch.setattr(rocm_ragged, "aiter_varlen_unavailable_reason", unexpected_import)
     assert resolve_attn_backend(AttnBackend.AUTO, CPU, 64) is AttnBackend.FLASHINFER
     assert resolve_ragged_attn_backend(RaggedAttnBackend.AUTO, CPU) is RaggedAttnBackend.FLASHINFER
     assert flashinfer_kwargs(paged(128), "auto") == {"backend": "auto", "decode_tensor_cores": True}
@@ -477,30 +486,81 @@ def test_aiter_refuses_what_its_kernel_was_not_checked_for(rocm):
         AttentionManager.build(attention_spec(backend=AttnBackend.AITER), info)
 
 
-def test_rocm_ragged_auto_is_dense(rocm):
-    """DENSE runs AITER's varlen kernel through the shared ragged manager base
-    (and AMD's FlashInfer build where AITER is missing)."""
-    rocm()
-    assert resolve_ragged_attn_backend(RaggedAttnBackend.AUTO, CPU) is RaggedAttnBackend.DENSE
+@pytest.mark.parametrize(
+    ("varlen", "flashinfer", "expected"),
+    [(True, True, RaggedAttnBackend.AITER), (False, True, RaggedAttnBackend.FLASHINFER)],
+)
+def test_rocm_ragged_auto(rocm, varlen, flashinfer, expected):
+    rocm(varlen=varlen, flashinfer=flashinfer)
+    assert resolve_ragged_attn_backend(RaggedAttnBackend.AUTO, CPU) is expected
+
+
+def test_rocm_ragged_with_neither_is_a_startup_error(rocm):
+    rocm(varlen=False, flashinfer=False)
+    with pytest.raises(RuntimeError, match="No ragged attention backend"):
+        resolve_ragged_attn_backend(RaggedAttnBackend.AUTO, CPU)
 
 
 @pytest.mark.parametrize(
     ("spec_class", "manager_class"),
-    [(RaggedAttentionSpec, DenseRaggedManager), (RaggedCrossAttentionSpec, DenseRaggedCrossManager)],
+    [(RaggedAttentionSpec, AiterRaggedManager), (RaggedCrossAttentionSpec, AiterRaggedCrossManager)],
 )
-def test_rocm_ragged_builds_dense(rocm, monkeypatch, spec_class, manager_class):
+def test_rocm_ragged_builds_aiter(rocm, spec_class, manager_class):
     rocm()
-    monkeypatch.setattr(dense_module, "_VARLEN_IMPORT_ERROR", None)
-    dense_module._fa3_unavailable_reason.cache_clear()
-    try:
-        spec = spec_class(resource_key="ragged", nodes={"node"}, config=ragged_config())
-        manager = build_resource(spec, EngineResourceInfo(device=CPU, kv_dtype=torch.bfloat16))
-    finally:
-        dense_module._fa3_unavailable_reason.cache_clear()
+    spec = spec_class(resource_key="ragged", nodes={"node"}, config=ragged_config())
+    manager = build_resource(spec, EngineResourceInfo(device=CPU, kv_dtype=torch.bfloat16))
     assert type(manager) is manager_class
 
 
-def test_rocm_block_causal_attention_builds_flashinfer(rocm):
+def public_surface(manager) -> dict:
+    """What a model or the engine can reach on ``manager``: every public
+    property or attribute with its value, every method with its parameters."""
+    surface = {}
+    for name in dir(manager):
+        if name.startswith("_"):
+            continue
+        value = getattr(manager, name)
+        if callable(value) and not isinstance(inspect.getattr_static(manager, name), property):
+            value = [(p.name, p.kind, p.default) for p in inspect.signature(value).parameters.values()]
+        surface[name] = value
+    return surface
+
+
+@pytest.mark.parametrize(
+    ("spec_class", "manager_class"),
+    [(RaggedAttentionSpec, AiterRaggedManager), (RaggedCrossAttentionSpec, AiterRaggedCrossManager)],
+)
+def test_rocm_ragged_managers_are_drop_ins_for_flashinfers(rocm, spec_class, manager_class):
+    """Models are written against the FlashInfer managers, so whatever AUTO
+    builds on ROCm has to offer the same properties, with the same values for
+    the same config, and the same methods."""
+    rocm()
+
+    def build(backend):
+        spec = spec_class(resource_key="ragged", nodes={"node"}, config=ragged_config(backend=backend))
+        apply_yaml_overrides([spec], {"resources": {"ragged": {"max_segments_per_request": 3}}})
+        return build_resource(spec, EngineResourceInfo(device=CPU, kv_dtype=torch.bfloat16))
+
+    flashinfer, rocm_default = build(RaggedAttnBackend.FLASHINFER), build(RaggedAttnBackend.AUTO)
+    assert type(rocm_default) is manager_class
+    expected = public_surface(flashinfer)
+    # the FlashInfer wrapper type the manager builds, not something callers use
+    del expected["wrapper_class"]
+    assert expected["max_segments_per_request"] == 3
+    assert public_surface(rocm_default) == expected
+
+
+def test_yaml_names_the_aiter_backends():
+    spec = attention_spec()
+    spec.apply_yaml_overrides(backend="aiter")
+    assert spec.config.backend is AttnBackend.AITER
+    ragged = RaggedAttentionSpec(resource_key="ragged", nodes={"node"}, config=ragged_config())
+    ragged.apply_yaml_overrides(backend="aiter")
+    assert ragged.config.backend is RaggedAttnBackend.AITER
+
+
+def test_rocm_block_causal_auto_builds_flashinfer(rocm):
+    """AITER's varlen has no block-causal case, so AUTO sends it to FlashInfer."""
     rocm()
     spec = RaggedBlockCausalAttentionSpec(
         resource_key="ragged", nodes={"node"}, config=ragged_config(), block_size=4,
@@ -514,9 +574,3 @@ def test_rocm_auto_with_a_window_builds_flashinfer(rocm):
     rocm()
     manager = AttentionManager.build(attention_spec(sliding_window=2048), kv_info(paged(128)))
     assert type(manager) is FlashInferManager
-
-
-def test_yaml_names_the_aiter_backend():
-    spec = attention_spec()
-    spec.apply_yaml_overrides(backend="aiter")
-    assert spec.config.backend is AttnBackend.AITER

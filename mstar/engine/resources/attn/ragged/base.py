@@ -34,12 +34,25 @@ def resolve_ragged_attn_backend(
     backend: RaggedAttnBackend, device: torch.device,
 ) -> RaggedAttnBackend:
     """Ragged counterpart of ``attn.base.resolve_attn_backend``. On ROCm,
-    ``AUTO`` is ``DENSE``, which runs AITER's varlen flash attention (and AMD's
-    FlashInfer build where AITER is missing; see ``dense_or_flashinfer``)."""
+    ``AUTO`` is AITER's varlen flash attention, or AMD's FlashInfer build if
+    AITER is missing."""
     if backend is not RaggedAttnBackend.AUTO:
         return backend
     if current_platform.is_rocm():
-        return RaggedAttnBackend.DENSE
+        from mstar.engine.resources.attn import aiter as rocm
+        from mstar.engine.resources.attn.ragged import aiter as rocm_ragged
+
+        aiter_reason = rocm_ragged.aiter_varlen_unavailable_reason()
+        if aiter_reason is None:
+            return RaggedAttnBackend.AITER
+        flashinfer_reason = rocm.flashinfer_rocm_unavailable_reason()
+        if flashinfer_reason is None:
+            return RaggedAttnBackend.FLASHINFER
+        raise RuntimeError(
+            "No ragged attention backend on this ROCm install: AITER's varlen "
+            f"flash attention is not importable ({aiter_reason}), nor is AMD's "
+            f"FlashInfer build ({flashinfer_reason})."
+        )
     return RaggedAttnBackend.FLASHINFER
 
 
@@ -108,6 +121,10 @@ class RaggedAttnManager(AttentionResource):
             )
 
             return _build_ragged(spec, info, FlashInferRaggedManager)
+        if backend is RaggedAttnBackend.AITER:
+            from mstar.engine.resources.attn.ragged.aiter import AiterRaggedManager
+
+            return _build_ragged(spec, info, AiterRaggedManager)
         raise ValueError(f"Unknown ragged attention backend {backend!r}")
 
 
@@ -135,6 +152,10 @@ class RaggedCrossAttnManager(AttentionResource):
             )
 
             return _build_ragged(spec, info, FlashInferRaggedCrossManager)
+        if backend is RaggedAttnBackend.AITER:
+            from mstar.engine.resources.attn.ragged.aiter import AiterRaggedCrossManager
+
+            return _build_ragged(spec, info, AiterRaggedCrossManager)
         raise ValueError(f"Unknown ragged cross attention backend {backend!r}")
 
 
@@ -147,6 +168,9 @@ class RaggedBlockCausalAttnManager(AttentionResource):
     @classmethod
     def build(cls, spec: RaggedBlockCausalAttentionSpec, info: EngineResourceInfo):
         backend = resolve_ragged_attn_backend(spec.config.backend, info.device)
+        if backend is RaggedAttnBackend.AITER and spec.config.backend is RaggedAttnBackend.AUTO:
+            # AITER's varlen has no block-causal case (same reason as DENSE below)
+            backend = RaggedAttnBackend.FLASHINFER
         if backend is RaggedAttnBackend.DENSE:
             from mstar.engine.resources.attn.ragged.dense import _warn_ragged_dense_fallback
 

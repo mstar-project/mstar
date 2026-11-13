@@ -384,7 +384,7 @@ def test_cross_attention_captured_decode():
     assert nonfinite == 0 and err < 1, (err, nonfinite)
 
 
-# --- ragged (cacheless): AUTO on ROCm builds DENSE, which runs AITER varlen ------
+# --- ragged (cacheless) ---------------------------------------------------------
 
 
 def _ragged(cls, d, hq=16, hkv=16, max_segments=2):
@@ -399,10 +399,10 @@ def _segments(label, spans):
 @pytest.mark.parametrize("d", [64, 72, 80, 128])
 @pytest.mark.parametrize("causal", [False, True])
 def test_ragged_parity(d, causal):
-    from mstar.engine.resources.attn.ragged.dense import DenseRaggedManager
+    from mstar.engine.resources.attn.ragged.aiter import AiterRaggedManager
 
     spans = [300, 17, 64]
-    m = _ragged(DenseRaggedManager, d)
+    m = _ragged(AiterRaggedManager, d)
     m.plan(AttentionStep(segments=_segments("img", spans), causal=causal),
            StepContext(request_ids=["r0", "r1", "r2"], graph_walk="w", slot=0, capture=False))
     n = sum(spans)
@@ -415,9 +415,9 @@ def test_ragged_parity(d, causal):
 
 @pytest.mark.parametrize("d", [72, 128])
 def test_ragged_captured_with_empty_padding_segments(d):
-    from mstar.engine.resources.attn.ragged.dense import DenseRaggedManager
+    from mstar.engine.resources.attn.ragged.aiter import AiterRaggedManager
 
-    m = _ragged(DenseRaggedManager, d)
+    m = _ragged(AiterRaggedManager, d)
     lease = SlotLease(slot=0, bucket=BucketKey("w", 2, 512))
     m.plan(AttentionStep(segments=_segments("img", [256, 256]), causal=False),
            StepContext(request_ids=["r0", "r1"], graph_walk="w", slot=0, capture=False, slot_lease=lease))
@@ -447,9 +447,9 @@ def test_ragged_one_request_with_several_segments_replays(d):
     """One request a replay with a segment per image or frame group, like
     Qwen3.5's vision block loop at batch size 1. Captured over one span, as the
     piecewise runner does, then replayed with up to ``max_segments_per_request``."""
-    from mstar.engine.resources.attn.ragged.dense import DenseRaggedManager
+    from mstar.engine.resources.attn.ragged.aiter import AiterRaggedManager
 
-    m = _ragged(DenseRaggedManager, d, hq=12, hkv=12, max_segments=4)
+    m = _ragged(AiterRaggedManager, d, hq=12, hkv=12, max_segments=4)
     lease = SlotLease(slot=0, bucket=BucketKey("w", 1, 1024))
 
     def plan(spans):
@@ -479,9 +479,9 @@ def test_ragged_one_request_with_several_segments_replays(d):
 
 
 def test_ragged_cross_parity():
-    from mstar.engine.resources.attn.ragged.dense import DenseRaggedCrossManager
+    from mstar.engine.resources.attn.ragged.aiter import AiterRaggedCrossManager
 
-    m = _ragged(DenseRaggedCrossManager, 128, hq=16, hkv=8)
+    m = _ragged(AiterRaggedCrossManager, 128, hq=16, hkv=8)
     q_spans, kv_spans = [40, 9], [77, 300]
     segments = _segments("vid", q_spans) + _segments("txt", kv_spans)
     m.plan(RaggedCrossAttentionStep(segments=segments, pairs=(("vid", "txt"),)),
