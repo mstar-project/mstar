@@ -725,6 +725,11 @@ def test_a_holed_array_reads_causally(mask):
              lambda: build_specs([_holed(reads=reads)]))
 
 
+def test_a_holed_array_keeps_no_positions():
+    _refused("positions, which today's resources don't keep on HoledStorage",
+             lambda: build_specs([_holed(positions=Positions())]))
+
+
 def test_the_holed_pool_holds_max_len_times_the_span():
     (pool,) = (spec for spec in build_specs([_holed()]) if spec.resource_key == "kv")
     config = pool.config
