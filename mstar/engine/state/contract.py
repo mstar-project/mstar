@@ -143,10 +143,14 @@ class Op:
 class Attend(Op):
     reads = ("k", "v")
     q_heads: int    # a multiple of the heads of the entry's k and v
+    _: KW_ONLY
+    scale: float | None = None    # the softmax scale; None: head_dim ** -0.5
 
     def check(self, where: str, entry: Entry) -> None:
         if not _is_positive(self.q_heads):
             raise ValueError(f"{where}.q_heads must be a positive int, got {self.q_heads!r}")
+        if self.scale is not None and not (type(self.scale) in (int, float) and self.scale > 0):
+            raise ValueError(f"{where}.scale must be None or a positive number, got {self.scale!r}")
         k, v = entry.tensors["k"], entry.tensors["v"]
         if len(k.shape) != 2 or len(v.shape) != 2 or k.shape[0] != v.shape[0]:
             raise ValueError(f"{where}: Attend needs entry fields k (h, d_k) and v (h, d_v)")

@@ -742,8 +742,8 @@ deployment YAML tunes them under ``resources:`` (see :ref:`Step 6 <config-yaml>`
   tokens see. A keyed walk whose node doesn't take ``PrefixKeys.tensor``, as BAGEL's ``LLM`` on
   ``prefill_vit``, is checked per request instead: an ids span, or a digest span that shares its
   step, on such a walk fails the request.
-  ``Attend(q_heads=)`` is attention with the model's query heads, a multiple of
-  the entry's heads.
+  ``Attend(q_heads=, scale=)`` is attention with the model's query heads, a multiple of
+  the entry's heads, at softmax scale ``scale``, ``head_dim ** -0.5`` when None.
 - ``Value(name, nodes=, layers=, entry=, updates=)``: a rewritable array of one entry, such
   as a recurrent state. ``updates`` names the kernels that read and write one of its fields
   in place: ``CausalConv()`` needs a field ``conv`` of shape ``(channels, kernel - 1)``, and

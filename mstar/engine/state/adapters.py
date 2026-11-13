@@ -670,6 +670,7 @@ class PagedAttend(OpBinding):
                 kv_cache=array.name,
                 sliding_window=read.mask.size if windowed else None,
                 layers=tuple(kv_layer[layer] for layer in sorted(read_layers(array, read))) if windowed else None,
+                sm_scale=read.op.scale,
             ),
         )]
 
@@ -696,6 +697,8 @@ class PagedCrossAttend(PagedAttend):
     def check(self, array: Array, key: str, read: Read) -> None:
         if not isinstance(read.mask, Bidirectional):
             raise _no_layout(array, f"reads[{key!r}].mask must be Bidirectional, the mask CrossAttentionConfig has")
+        if read.op.scale is not None:
+            raise _no_layout(array, f"reads[{key!r}].op.scale must be None, since CrossAttentionConfig has no scale")
         if read.walks is not None:
             raise _no_layout(array, f"reads[{key!r}].walks must be None, since CrossAttentionConfig has no walk")
 
@@ -768,6 +771,9 @@ class SdpaAttend(WithinStepAttend):
         if read.packed:
             raise _no_layout(array, f"reads[{key!r}] runs SDPA, which can't tell one segment of packed queries from "
                                     "the next, and a read of rows of one length declares packed=False")
+        if read.op.scale is not None:
+            raise _no_layout(array, f"reads[{key!r}].op.scale must be None, since sdpa_attention attends at "
+                                    "head_dim ** -0.5")
 
     def apply(self, spec: NodeResourceSpec | None, settings: Mapping[str, Any]) -> None:
         """Nothing: SDPA builds no resource to set."""
@@ -1955,6 +1961,7 @@ class WithinStepStorage(Storage):
             queries.plan_label(array)
             config = RaggedAttentionConfig(
                 num_qo_heads=read.op.q_heads, num_kv_heads=heads, head_dim=head_dim, dtype=dtype,
+                sm_scale=read.op.scale,
             )
             spec = queries.spec_class(resource_key=key, nodes=array.nodes, config=config)
             spec = shared.setdefault((queries.spec_class, array.nodes, astuple(config)), spec)
