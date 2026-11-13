@@ -13,7 +13,9 @@ import json
 import time
 from pathlib import Path
 
+import praxis.layers as reference_layers
 import torch
+import torch.nn.functional as F
 from praxis.checkpoint import load_config, load_state_dict_from_dir, strict_load
 from praxis.model import PraxisPolicy
 
@@ -22,6 +24,20 @@ from mstar.model.praxis1.components.encoder import dense_chunk_causal_mask
 from mstar.model.praxis1.config import Praxis1Config
 from mstar.model.praxis1.native_towers import build_backbone
 from mstar.model.praxis1.weight_loader import load_component
+
+
+def _eager_reference_attention(
+    q, k, v, block_mask=None, scale=None, enable_gqa=False, kernel_options=None,
+):
+    """Use the reference BlockMask with SDPA when its CUTE Flash kernel is absent."""
+    query = torch.arange(q.shape[-2], device=q.device)[:, None]
+    key = torch.arange(k.shape[-2], device=k.device)[None, :]
+    mask = block_mask.mask_mod(
+        torch.tensor(0, device=q.device), torch.tensor(0, device=q.device), query, key,
+    )
+    return F.scaled_dot_product_attention(
+        q, k, v, attn_mask=mask, scale=scale, enable_gqa=enable_gqa,
+    )
 
 
 def _inputs(config: Praxis1Config) -> tuple[torch.Tensor, ...]:
@@ -49,6 +65,13 @@ def _run_reference(root: Path, inputs: tuple[torch.Tensor, ...]) -> tuple[torch.
         strict_load(module, weights, assign=True)
         del weights
     backbone = policy.backbone.eval().requires_grad_(False).to("cuda")
+    # The published checkpoint selects the optional CUTE Flash path, which
+    # the isolated M* runtime does not install. Keep the checkpoint's masks
+    # and tower math, and compare both towers under SDPA instead.
+    reference_layers._compiled_flex_attention = _eager_reference_attention
+    for module in backbone.modules():
+        if isinstance(module, reference_layers.Attention):
+            module.backend = "triton"
     del policy
     started = time.perf_counter()
     with torch.inference_mode():
