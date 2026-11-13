@@ -19,6 +19,7 @@ from mstar.model.glm5_next.config import (
     COUNT,
     KDA_STATE,
     KV_CACHE,
+    MTP_SEED,
     PROMPT_LEN,
     SAMPLER,
     Glm5NextModelConfig,
@@ -303,8 +304,10 @@ def test_captured_verify_matches_eager_and_greedy(greedy, k, batch):
     # step allows because nothing it plans waits on the last verdict.
     ahead, _ = eng.generate(_prompts(lengths), captured_decode=True, preplan=True)
     assert ahead == graph, ("preplanned", ahead, "graph", graph)
-    kv, pool = eng.resources[KV_CACHE], eng.resources[KDA_STATE]
+    kv = eng.resources[KV_CACHE]
     # the graph runner's padding streams stay resident; the requests' are gone
     assert not any(rid in kv._streams for rid in _prompts(lengths))
-    assert pool.num_free_slots == pool.config.usable_slots
+    for key in (KDA_STATE, MTP_SEED):
+        pool = eng.resources[key]
+        assert pool.num_free_slots == pool.config.usable_slots, f"{key} kept a slot of a removed request"
 

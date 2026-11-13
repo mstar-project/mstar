@@ -23,7 +23,7 @@ from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.step import StepContext
 from mstar.model.base import serving_resources
 from mstar.model.glm5_next.components.causal_lm import Glm5NextForCausalLM
-from mstar.model.glm5_next.config import COUNT, KDA_STATE, KV_CACHE, LABEL, PROMPT_LEN, SAMPLER
+from mstar.model.glm5_next.config import COUNT, KDA_STATE, KV_CACHE, LABEL, MTP_SEED, PROMPT_LEN, SAMPLER
 from mstar.model.glm5_next.glm5_next_model import Glm5NextModel, process_weights_after_loading
 from mstar.model.glm5_next.submodules import Glm5NextLLMSubmodule
 from mstar.model.submodule_base import ARNodeInputs, InputMetadata
@@ -183,8 +183,9 @@ def _generate(engine, prompts: dict[str, torch.Tensor], max_tokens: int) -> dict
         live = [rid for rid in live if not stops.get(rid)]
     for rid in prompts:
         engine.remove_request(rid)
-    pool = engine._resources[KDA_STATE]
-    assert pool.num_free_slots == pool.config.usable_slots
+    for key in (KDA_STATE, MTP_SEED) if block > 1 else (KDA_STATE,):
+        pool = engine._resources[key]
+        assert pool.num_free_slots == pool.config.usable_slots, f"{key} kept a slot of a removed request"
     return seqs
 
 
