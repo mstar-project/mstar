@@ -60,6 +60,60 @@ def _quat_matrix(quat: np.ndarray) -> np.ndarray:
     ], dtype=np.float64)
 
 
+def _matrix_quat(matrix: np.ndarray) -> np.ndarray:
+    """A float64 rotation matrix to xyzw, with the reference's branch order."""
+    diagonal = [matrix[0, 0], matrix[1, 1], matrix[2, 2], matrix[0, 0] + matrix[1, 1] + matrix[2, 2]]
+    choice = int(np.argmax(diagonal))
+    quat = np.empty(4, dtype=np.float64)
+    if choice != 3:
+        i, j, k = choice, (choice + 1) % 3, (choice + 2) % 3
+        quat[i] = 1 - diagonal[3] + 2 * matrix[i, i]
+        quat[j] = matrix[j, i] + matrix[i, j]
+        quat[k] = matrix[k, i] + matrix[i, k]
+        quat[3] = matrix[k, j] - matrix[j, k]
+    else:
+        quat[0] = matrix[2, 1] - matrix[1, 2]
+        quat[1] = matrix[0, 2] - matrix[2, 0]
+        quat[2] = matrix[1, 0] - matrix[0, 1]
+        quat[3] = 1 + diagonal[3]
+    x, y, z, w = quat
+    return quat / np.sqrt(x * x + y * y + z * z + w * w)
+
+
+def pose_to_model(pose_now: object, embodiment: str, descriptor: str = "") -> np.ndarray:
+    """Convert a raw client-frame pose8 or world-frame pose16 to model space.
+
+    This is the inverse of the frame conversion in :func:`compose_commands`.
+    The source reference is ``praxis.single_arm.pose8_to_model``.
+    """
+    width = {"single_arm": 8, "bimanual": 16}.get(embodiment)
+    if width is None:
+        raise ValueError(f"unsupported robot embodiment {embodiment!r}")
+    try:
+        pose = np.asarray(pose_now, dtype=np.float64)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("robot pose must be numeric") from exc
+    if pose.shape != (width,) or not np.isfinite(pose).all():
+        raise ValueError(f"robot pose needs {width} finite values")
+    if max(abs(pose[3:7])) == 0 or (width == 16 and max(abs(pose[11:15])) == 0):
+        raise ValueError("robot pose has a zero quaternion")
+    if embodiment == "bimanual":
+        if descriptor:
+            raise ValueError("bimanual pose uses the rig world frame, not a pose descriptor")
+        return pose.astype(np.float32)
+    frame = RIG_FRAMES.get(descriptor)
+    if frame is None:
+        raise ValueError(f"unknown single-arm pose frame {descriptor!r}")
+    rot = _quat_matrix(pose[3:7])
+    result = pose.copy()
+    result[:3] = pose[:3] - np.asarray(frame.base_offset) - frame.tool_offset * rot[:, 2]
+    turn = np.asarray(frame.turn).T @ _no_turn
+    xyzw = _matrix_quat(rot @ turn)
+    result[3:7] = xyzw[[3, 0, 1, 2]]
+    result[7] = np.clip(result[7], 0.0, 1.0)
+    return result.astype(np.float32)
+
+
 def _rot6d_matrix(r6: np.ndarray) -> np.ndarray:
     a0 = r6[:3].astype(np.float64)
     a1 = r6[3:6].astype(np.float64)

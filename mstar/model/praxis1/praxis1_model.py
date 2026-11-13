@@ -57,7 +57,7 @@ from mstar.model.base import (
     WalkStep,
 )
 from mstar.model.media_limits import read_image
-from mstar.model.praxis1.components.commands import compose_commands
+from mstar.model.praxis1.components.commands import compose_commands, pose_to_model
 from mstar.model.praxis1.components.proprio import normalized_proprio
 from mstar.model.praxis1.config import Praxis1Config, Praxis1ConfigError
 from mstar.model.praxis1.submodules import (
@@ -72,6 +72,7 @@ DENOISE_LOOP_NAME = "praxis_denoise"
 
 # The state kwarg the openpi WebSocket protocol fills from a client's request.
 STATE_KWARG = "robot_state"
+MODEL_POSE_KWARG = "_praxis_model_pose"
 
 # False until get_submodule can build the nodes. Until then a served model is
 # refused in the constructor, the first model code every serving process runs,
@@ -93,7 +94,8 @@ class Praxis1Model(Model):
 
     ENCODE_TEXT_WALK = "encode_text"
     CHUNK_WALK = "chunk"
-    PREPROCESS_ONLY_KWARGS = (STATE_KWARG, "action_format", "pose_descriptor", "control_mode")
+    INTERNAL_KWARGS = (MODEL_POSE_KWARG,)
+    PREPROCESS_ONLY_KWARGS = (STATE_KWARG, MODEL_POSE_KWARG, "action_format", "pose_descriptor", "control_mode")
 
     def __init__(
         self,
@@ -364,8 +366,11 @@ class Praxis1Model(Model):
             if output_format == "positronic":
                 from mstar.api_server.openpi import pack
 
+                model_pose = kwargs.get(MODEL_POSE_KWARG)
+                if model_pose is None:
+                    raise ValueError("Positronic commands need a model-frame pose from process_prompt")
                 commands = compose_commands(
-                    rows, kwargs.get(STATE_KWARG), self.config.embodiment,
+                    rows, model_pose, self.config.embodiment,
                     fps=self.config.grid_hz, descriptor=kwargs.get("pose_descriptor", ""),
                     control_mode=kwargs.get("control_mode", "none"),
                 )
@@ -406,6 +411,13 @@ class Praxis1Model(Model):
 
         task_ids, task_mask = encode(task)
         blank_ids, blank_mask = encode(blank)
+        metadata = {"text_tokens": int(task_mask.sum())}
+        if kwargs.get("action_format") == "positronic":
+            model_pose = pose_to_model(
+                robot_state, self.config.embodiment, kwargs.get("pose_descriptor", ""),
+            )
+            metadata[MODEL_POSE_KWARG] = model_pose.tolist()
+            robot_state = model_pose.tolist()
         proprio = normalized_proprio(robot_state, self.config.embodiment, self.config.normalization)
         return ProcessPromptOutput(
             new_input_tensors={
@@ -415,7 +427,7 @@ class Praxis1Model(Model):
                 "blank_mask": [blank_mask],
                 "proprio": [proprio],
             },
-            metadata={"text_tokens": int(task_mask.sum())},
+            metadata=metadata,
         )
 
     def _blank_caption(self) -> str:
