@@ -99,10 +99,12 @@ class KVConfig(ABC):
         """
 
     def capacity_problem(
-        self, spec: "KVSpec", requests: int, request: "KVReqConfig | None", node_groups: Sequence[Mapping] = (),
+        self, spec: "KVSpec", requests: int, request: "KVReqConfig | None",
+        axis_sizes: Sequence[Mapping[str, int]] = (),
     ) -> str | None:
-        """Why ``spec``'s pool can't hold ``requests`` requests at once, each opened with ``request``, on the
-        deployment's ``node_groups``, or None. None by default, for a pool its window sizes rather than its requests."""
+        """Why ``spec``'s pool can't hold ``requests`` requests at once, each opened with ``request``, on node groups
+        of ``axis_sizes`` (as `NodeResourceSpec.capacity_problem` takes them), or None. None by default, for a pool its
+        window sizes rather than its requests."""
         return None
 
 
@@ -332,7 +334,8 @@ class PagedKVConfig(KVConfig):
         )
 
     def capacity_problem(
-        self, spec: "KVSpec", requests: int, request: "KVReqConfig | None", node_groups: Sequence[Mapping] = (),
+        self, spec: "KVSpec", requests: int, request: "KVReqConfig | None",
+        axis_sizes: Sequence[Mapping[str, int]] = (),
     ) -> str | None:
         """Each request holds the pages ``request`` lays out at its caps, or one stream of ``max_seq_len`` where it
         lays out none, next to the sink page."""
@@ -342,7 +345,7 @@ class PagedKVConfig(KVConfig):
         per_request = max(
             request.pages(spec.nodes, request.loop_caps or {}, pool) if request is not None
             else sum(-(-self.max_seq_len // group.page_size) for group in pool.groups)
-            for pool in (self, *self._placed(spec, node_groups))
+            for pool in (self, *self._placed(spec, axis_sizes))
         )
         need = 1 + requests * per_request
         if need <= self.num_units:
@@ -354,15 +357,13 @@ class PagedKVConfig(KVConfig):
             "tokens a request may hold"
         )
 
-    def _placed(self, spec: "KVSpec", node_groups: Sequence[Mapping]) -> "list[PagedKVConfig]":
-        """This config as each of ``node_groups`` that ``spec`` runs on pages it, where it sets ``context_parallel``.
+    def _placed(self, spec: "KVSpec", axis_sizes: Sequence[Mapping[str, int]]) -> "list[PagedKVConfig]":
+        """This config as each node group of ``axis_sizes`` pages it, where it sets ``context_parallel``.
         A group it can't place on is validation's to report."""
         placed = []
-        for group in node_groups if self.context_parallel else ():
-            if not spec.nodes & set(group.get("node_names", ())):
-                continue
+        for sizes in axis_sizes if self.context_parallel else ():
             try:
-                placed.append(self.paged_for(spec.resource_key, group.get("tp_size", 1), group.get("sp_size", 1)))
+                placed.append(self.paged_for(spec.resource_key, sizes["tp"], sizes["sp"]))
             except ValueError:
                 pass
         return placed
@@ -939,10 +940,10 @@ class KVSpec(NodeResourceSpec):
         self.config.apply_yaml_overrides(**kwargs)
 
     def capacity_problem(
-        self, requests: int, request: ResourceReqConfig | None, node_groups: Sequence[Mapping] = (),
+        self, requests: int, request: ResourceReqConfig | None, axis_sizes: Sequence[Mapping[str, int]] = (),
     ) -> str | None:
         """Forwarded to the config, as `apply_yaml_overrides` is: how requests fill a pool is the storage strategy's."""
-        return self.config.capacity_problem(self, requests, request, node_groups)
+        return self.config.capacity_problem(self, requests, request, axis_sizes)
 
     def keeps_prefix_cache(self, world_size: int, checkpoint_named: bool) -> bool:
         return isinstance(self.config, PagedKVConfig) and self.config.keeps_prefix_cache(world_size, checkpoint_named)

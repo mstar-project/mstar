@@ -120,15 +120,13 @@ def node_resources(model: "Model", *, setup: "StateSetup | None" = None) -> list
 
 
 def _with_walks(model: "Model", declarations: Sequence[Array | Sampler], setup: "StateSetup") -> "StateSetup":
-    """``setup`` with ``model``'s `Walks`. Building the walk graphs can read checkpoints, so each field is built only
-    when an array's storage takes it: the nodes each walk runs, for a pool on several nodes, and the combined walks, for
-    an array whose reads differ by walk."""
+    """``setup`` with ``model``'s `Walks`. Building the walk graphs can read checkpoints, so they are built only when a
+    pool on several nodes takes its leader from them."""
     held = [(storage_of(declared), declared) for declared in declarations if isinstance(declared, Array)]
     nodes = EMPTY
     if any(storage.takes_leader(array) for storage, array in held):
         nodes = {walk: frozenset(graph.get_nodes()) for walk, graph in model.get_graph_walk_graphs().items()}
-    combined = model.get_combined_graph_walks() if any(storage.takes_combined_walks for storage, _ in held) else EMPTY
-    return replace(setup, walks=Walks(nodes, combined))
+    return replace(setup, walks=Walks(nodes))
 
 
 def build_specs(
@@ -167,15 +165,13 @@ def _resolve(arrays: Sequence[Array], setup: "StateSetup") -> "Resolved":
     bound: dict[str, tuple[BoundOp, ...]] = {}
     resource_of: dict[str, str] = {}
     queries: dict[str, QuerySide] = {}
-    walk_reads: dict[str, WalkReads] = {}
     for storage, held in by_storage.items():
         each = storage.resolve(held, arrays, setup)
         specs |= each.specs
         bound |= each.bound
         resource_of |= each.resource_of
         queries |= each.queries
-        walk_reads |= each.walk_reads
-    return Resolved(specs, bound, resource_of, queries, walk_reads)
+    return Resolved(specs, bound, resource_of, queries)
 
 
 def state_setup(config: Mapping[str, Any], declarations: Sequence[Array | Sampler]) -> tuple["StateSetup", list[str]]:
@@ -354,7 +350,14 @@ def node_handles(
     built = {} if built is None else built
     declarations = model.declare_state()
     setup = _with_walks(model, declarations, setup)
-    resolved = _resolve([declared for declared in declarations if isinstance(declared, Array)], setup)
+    arrays = [declared for declared in declarations if isinstance(declared, Array)]
+    resolved = _resolve(arrays, setup)
+    by_walk = [array for array in arrays if storage_of(array) is PAGED_BY_WALK]
+    if by_walk:
+        combined = model.get_combined_graph_walks()
+        resolved = resolved._replace(walk_reads={
+            array.name: _walk_reads(array, resolved.resource_of, combined_walks(array, combined)) for array in by_walk
+        })
     for declared in declarations:
         if node in declared.nodes and declared.name not in built:
             built[declared.name] = build_handle(declared, resources, resolved, setup)
@@ -415,13 +418,36 @@ def state_steps(
             )
     for builder in builders.values():
         steps.update(builder.steps())
-    # A step's forward packs one set of labels together, which `SubmoduleStep` holds for all of its resources.
-    combined = dict(step.combined_labels)
-    for built in steps.values():
-        combined.update(built.combined_labels)
-    expanded = replace(step, steps=steps, combined_labels=combined)
+    expanded = replace(step, steps=steps, combined_labels=_combined_labels(step, steps, handles))
     expanded.set_state_handles((*(handles[name] for name in step.state), *shards))
     return expanded
+
+
+def _combined_labels(
+    step: SubmoduleStep, steps: Mapping[str, Any], handles: Mapping[str, Any],
+) -> dict[tuple[str, ...], str]:
+    """The labels ``step``'s forward packs together, which `SubmoduleStep` holds once for all of its resources.
+
+    Every array on KV pages plans them, so an array the step lists on other labels is refused.
+    """
+    if not step.combined_labels and not any(
+        isinstance(steps.get(name), KVStep) and steps[name].combined_labels for name in step.state
+    ):
+        return {}
+    paged = {name: steps[name] for name in step.state if isinstance(steps.get(name), KVStep)}
+    combined = dict(step.combined_labels)
+    for built in paged.values():
+        combined.update(built.combined_labels)
+    for name, built in paged.items():
+        packed = next((labels for labels in combined if labels not in built.combined_labels), None)
+        if packed is not None:
+            other = next((f"Array {o!r} on" for o, b in paged.items() if packed in b.combined_labels), "combines")
+            raise _no_layout(
+                handles[name].array,
+                f"a step lists it on labels {list(step_labels(built.segments))} and {other} {list(packed)}, which it "
+                "packs into one plan for every array on KV pages",
+            )
+    return combined
 
 
 def check_capture(handles: Mapping[str, ArrayHandle | SamplerHandle], walks: Collection[str]) -> None:
@@ -1163,15 +1189,16 @@ class PagedArrayHandle(ArrayHandle):
 
     def _write_unread(self) -> None:
         """Write the held add of a layer the step didn't read where its write waits for the read's exchange, so
-        each add is written once: when the next add or the step's check finds it still held."""
+        each add is written once: when the next add or the step's check finds it still held. A kernel that takes k
+        and v at the read has no write to make, so its add stays held."""
         layer = self._held_layer
-        if layer is not None and _exchanges(self._attn[layer], self.label):
+        if layer is not None and _exchanges(self._attn[layer], self.label) and self._attn[layer].requires_kv_write:
             self._write(layer, *self._take_hold(layer))
 
     def _unwritten(self) -> bool:
-        """Whether no page holds the held add: its kernel takes k and v at the read, and no exchange writes them."""
+        """Whether no page holds the held add: its kernel takes k and v at the read."""
         attn = self._attn.get(self._held_layer)
-        return attn is not None and not attn.requires_kv_write and not _exchanges(attn, self.label)
+        return attn is not None and not attn.requires_kv_write
 
     def _needs_step_kv(self, attn: Any) -> bool:
         """Whether a read through ``attn`` attends the step's own k and v rather than only the pages, or goes through
@@ -1887,7 +1914,7 @@ class WalkReads(NamedTuple):
 class Resolved(NamedTuple):
     """Arrays resolved into today's resources: each array's specs, its ops' included, and its ops with the bindings that
     run them, by its name, the key of the resource each op runs on, how each read within a step or with ``queries``
-    lays out its queries, and the `WalkReads` of each array whose reads differ by walk."""
+    lays out its queries, and, where handles are built, the `WalkReads` of each array whose reads differ by walk."""
 
     specs: dict[str, list[NodeResourceSpec]]
     bound: dict[str, tuple[BoundOp, ...]]
@@ -1902,8 +1929,6 @@ class Storage(ABC):
     handle_class: ClassVar[type[ArrayHandle]]
     # the pool sizes `kernel_settings` may set under the array's name, until the engine sizes its pools itself
     kernel_settings: ClassVar[frozenset[str]] = frozenset()
-    # whether an array here reads by walk, so a combined walk takes its reads from the walks it batches
-    takes_combined_walks: ClassVar[bool] = False
     # whether an array here holds each row's own entries, whose pages a Value's update snapshots are keyed by
     holds_row_entries: ClassVar[bool] = False
 
@@ -2026,9 +2051,8 @@ class PagedStorage(Storage):
         self, handle: ArrayHandle, declared: ArrayStep, step: SubmoduleStep, segments, steps: dict[str, Any],
     ) -> None:
         pre, post, rows = _forks(handle.array, declared)
-        ordered = segments_of(declared, step)
         # label-major, so a step over several labels starts and ends on different ones
-        labels = step_labels(ordered) if ordered and ordered[0].label != ordered[-1].label else ()
+        labels = step_labels(segments) if segments and segments[0].label != segments[-1].label else ()
         steps[handle.name] = KVStep(
             segments=segments, commit=declared.keep, pre_forks=pre, post_forks=post, fork_rids=rows,
             sink=declared.placeholders, eager_write=declared.eager_add,
@@ -2098,14 +2122,6 @@ class PagedByWalkStorage(PagedStorage):
     walk those of the walks it batches."""
 
     handle_class = PagedByWalkHandle
-    takes_combined_walks = True
-
-    def resolve(self, arrays: Sequence[Array], declared: Sequence[Array], setup: "StateSetup") -> Resolved:
-        resolved = super().resolve(arrays, declared, setup)
-        return resolved._replace(walk_reads={
-            array.name: _walk_reads(array, resolved.resource_of, combined_walks(array, setup.walks.combined))
-            for array in arrays
-        })
 
 
 class PagedCrossStorage(PagedStorage):
@@ -2357,10 +2373,9 @@ SDPA: dict[tuple[Storage, type[Op]], OpBinding] = {(WITHIN_STEP, Attend): SdpaAt
 
 class Walks(NamedTuple):
     """The model's walks, where a storage needs them: the nodes each walk runs, from which a pool on several nodes takes
-    its leader, and each node's combined walks, with the walks each batches, which give a combined walk its reads."""
+    its leader."""
 
     nodes: Mapping[str, frozenset[str]] = EMPTY
-    combined: Mapping[str, Mapping[str, Collection[str]]] = EMPTY
 
 
 @dataclass(frozen=True)

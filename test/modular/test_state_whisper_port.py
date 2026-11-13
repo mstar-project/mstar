@@ -478,6 +478,31 @@ def test_a_step_reads_a_looped_rows_token_off_the_sampler_beside_a_routed_rows_o
     assert rows[0][3:6] == [10, 11, 12] and rows[1][3:5] == [20, 30], "a token would land in another row's slot"
 
 
+def test_a_repeated_decode_step_forces_each_of_its_tokens_up_to_the_stop():
+    """With ``step_repeats`` on decode the runtime checks the stop once a launch has run every replay, so the replays
+    past end-of-text write their tokens to the decoder state too, each reading its token off the sampler. The align
+    walk forces what the stop check recorded before the port: every token of the repeated step up to its stop."""
+    driver = _Driver(_tiny_config(max_target_positions=MAXPOS))
+    driver.node.node_resources = {SAMPLER: driver.sampler}
+    driver.node.enable_repeats({DECODE_WALK})
+    assert driver.node.get_stop_policies(DECODE_WALK), "decode's stop would be left to check_stop, a token a step"
+    request = _WordRequest(driver, 0, language="en")
+    first, decoded = 10, [11, EOT, 13, 14]
+    driver.sampler.tokens = [first, *decoded]
+    request.step(PREFILL_WALK, {"text_inputs": request.tensors["text_inputs"], **request.encoder})
+    request.next_walk()
+    # a launch of three replays, the second sampling end-of-text, then one more step before the request leaves
+    request.step(DECODE_WALK, {"text_inputs": [torch.tensor([first])]})
+    for _ in decoded[1:]:
+        driver.step(DECODE_WALK, {0: (request.info(), {})}, looped={0})
+    request.next_walk()
+    request.step(ALIGN_WALK, request.encoder)
+    language = driver.node.config.language_token("en")
+    assert driver.batch["input_ids"].tolist() == [SOT, language, TRANSCRIBE, NOTS, 10, 11, EOT], (
+        "the align walk would time a token a replay sampled past the stop"
+    )
+
+
 def test_requests_sharing_the_decoder_state_each_force_their_own_transcript():
     """Random requests through one pool, as the designer's script drew them: either prompt path, a prompt carried over
     as context or not, text and timestamp tokens, an end-of-text the prompt walk or a decode step samples, steps past

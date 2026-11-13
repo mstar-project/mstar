@@ -730,6 +730,7 @@ def check_kv_pools_fit(
     sized for, with its loops at ``loop_caps``, and a pool it doesn't name
     holds one stream of its ``max_seq_len``.
     """
+    from mstar.distributed.base import node_group_axis_sizes
     from mstar.engine.resources import KVReqConfig
     from mstar.engine.state.adapters import kv_layouts
     from mstar.model.base import serving_resources
@@ -760,7 +761,11 @@ def check_kv_pools_fit(
         rows = {label: layout.row() for label, layout in by_label.items()}
         requests[key] = KVReqConfig(needed_labels=list(rows))
         requests[key].apply_conductor_config(kv_layout=rows, loop_caps=loop_caps)
+    node_groups = config.get("node_groups") or ()
     for spec in specs:
-        problem = spec.capacity_problem(cap, requests.get(spec.resource_key), config.get("node_groups") or ())
+        axis_sizes = [
+            node_group_axis_sizes(group) for group in node_groups if spec.nodes & set(group.get("node_names", ()))
+        ]
+        problem = spec.capacity_problem(cap, requests.get(spec.resource_key), axis_sizes)
         if problem is not None:
             raise ValueError(f"{config_path}: {problem}")
