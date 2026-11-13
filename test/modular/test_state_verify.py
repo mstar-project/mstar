@@ -307,14 +307,18 @@ def test_two_eager_steps_keep_two_tables():
     )
 
 
-def test_an_overwritten_count_table_raises():
+def _overwritten_count():
+    """Row 0's count of verify step 1, whose table step 3 reused."""
     kv = _StubKV()
     h = _handle(kv=kv)
     for kept in ([3, 1], [2, 2], [1, 1]):
         _verify(h, kept)
-    first = kv.deferred[0][2]
+    return kv.deferred[0][2]
+
+
+def test_an_overwritten_count_table_raises():
     with pytest.raises(RuntimeError, match="the count table of verify step 1 was overwritten by step 3"):
-        first.delta()
+        _overwritten_count().delta()
 
 
 def test_a_captured_step_numbers_its_table_on_replay_only():
@@ -432,6 +436,29 @@ def test_a_request_left_out_of_the_next_step_still_gets_its_count(_kv):
         "every admit applies every held count, so b's can't wait until a later step reuses its table"
     )
     assert _kv._deferred == {}
+
+
+@pytest.mark.parametrize("unreadable", ["overwritten", "tp_ranks_apart"])
+def test_a_count_read_that_raises_keeps_the_count_held(_kv, monkeypatch, unreadable):
+    """The pre-plan admit is the first to read a count, and a raise there is logged and the step planned again
+    inline. The inline admit has to find the count still held and raise too, or it plans the step past the tokens
+    the verify step rejected."""
+    count = _overwritten_count() if unreadable == "overwritten" else _settled_on_two_ranks([3, 1], monkeypatch)
+    rope = RopeManager(PositionConfig(kv_cache="kv"), torch.device("cpu"))
+    rope.ingest_request("a")
+    rope.correct_len("a", "main", SPAN)
+    _grow(_kv, SPAN)
+    position_step = PositionStep(segments=(Segment("a", "main", 1),))
+    ctx = StepContext(request_ids=("a",), graph_walk="decode", slot=0, capture=False)
+    admits = ((_kv, lambda: _grow(_kv, 1)), (rope, lambda: rope.admit(position_step, ctx)))
+    for resource, _ in admits:
+        resource.defer_correct_len("a", "main", count)
+    for resource, admit in admits:
+        for _ in range(2):
+            with pytest.raises(RuntimeError):
+                admit()
+            assert resource._deferred == {"a": {"main": count}}, "a count read that raises would drop the count"
+    assert (_stored(_kv), rope._counters["a"]["main"]) == (SPAN, SPAN), "the pages and the positions would move apart"
 
 
 def test_a_victim_s_count_is_applied_before_its_offload_or_drop(_kv):
