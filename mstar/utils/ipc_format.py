@@ -380,6 +380,9 @@ class NewRequestConductor(MessageBody):
     streaming: bool = False
     # the prompt's token count, echoed on RequestComplete for the response's usage
     prompt_tokens: int | None = None
+    # Set only by an episode-capable frontend, after it binds the connection.
+    # A model without episode arrays ignores it and keeps the request path.
+    episode: str | None = None
 
 
 @dataclass
