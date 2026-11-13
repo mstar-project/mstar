@@ -756,6 +756,7 @@ Two more methods control batching and CUDA graphs: `can_batch` with `forward_bat
   - `per_chunk_outputs`: streaming edges sent on every chunk as it runs, for a consumer that can start on a prefix. Any edge in neither set carries the final chunk's output alone.
   - `reuses_cached_prefix`: a callable saying whether a row may start past its cached prefix; `None` (the default) is always. Set it where a row may have to write its prefix again.
   - `reserve_whole_prefill` (default on): a row's first chunk reserves the state its whole prefill needs, so a part-done row cannot wedge on a full pool. Turn it off for a walk whose state grows by something other than the tokens a step runs.
+  - `chunk_align` (default 1): a row cut mid-way runs a multiple of this many tokens, so its next chunk starts on one. A row starts at 0 or past a cached prefix, a whole number of KV pages, so an alignment that divides the page keeps every chunk on it. Kimi K3.1 declares 64: a chunk starting off a 64-key boundary has its MLA rows split into single-query rows, which no captured prefill holds, and keeps no KDA snapshot.
 
   A resource that keeps state only on a grid counted from a chunk's start declares `Resource.chunk_alignment`, and a cut chunk of the node's rows is then a multiple of every alignment its resources declare (`Engine.chunk_alignment`). The chunk floor rounds up to it, and a budget under it fails loading.
 
