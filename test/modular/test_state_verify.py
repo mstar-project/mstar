@@ -9,7 +9,9 @@ its table would leave the pages and the positions apart, and no kernel would not
 
 from __future__ import annotations
 
+import re
 import sys
+from dataclasses import dataclass
 
 sys.path.insert(0, ".")
 sys.path.insert(0, "test/modular")
@@ -24,6 +26,8 @@ from mstar.engine.resources.kv.config import KVStep, PagedKVConfig
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.position.config import PositionConfig, PositionStep
 from mstar.engine.resources.position.manager import RopeManager
+from mstar.engine.resources.recurrent.config import RecurrentBlockConfig
+from mstar.engine.resources.recurrent.pool import RecurrentStatePool
 from mstar.engine.resources.step import BucketKey, SlotLease, SubmoduleStep
 from mstar.engine.state import (
     Array,
@@ -39,12 +43,14 @@ from mstar.engine.state import (
     Positions,
     Read,
     TensorType,
+    Value,
     Window,
     adapters,
     settle,
 )
 from mstar.engine.state.adapters import StateSetup, _resolve, build_handle, build_specs, state_steps
 from mstar.engine.state.analysis import state_declaration_problems
+from mstar.engine.state.calls import VerifyRun
 from mstar.engine.state.contract import Op
 from mstar.model.base import KVLabel, PrefixKeys
 
@@ -422,3 +428,105 @@ def test_position_waits_for_a_pending_count():
     rope.admit(PositionStep(segments=(Segment("b", "main", 1),)), StepContext(
         request_ids=("b",), graph_walk="decode", slot=0, capture=False))
     assert rope._counters["b"]["main"] == 5 and rope._deferred == {}, "the next admit applies every held count"
+
+
+# Verify on a Value
+
+
+@dataclass(frozen=True)
+class _Recurrence(Op):
+    """An update of a Value's field, bound to keep a verify block."""
+
+    reads = writes = ("x",)
+
+
+@dataclass(frozen=True)
+class _OtherRecurrence(_Recurrence):
+    """A second update type, since a Value holds one update of each type."""
+
+
+class _KeepsBlocks(adapters.OpBinding):
+    """Keeps one verify block above span 1, and records each settle instead of running a kernel."""
+
+    def __init__(self):
+        self.settled = []
+
+    def verify_blocks(self, array):
+        return {"spec_x": RecurrentBlockConfig(shape=(1,), dtype=torch.int32, per_layer=False)} if (
+            array.verify_span > 1) else {}
+
+    def settle(self, run, kept, label):
+        self.settled.append((run, kept, label))
+
+
+def _keeps_blocks(monkeypatch) -> _KeepsBlocks:
+    binding = _KeepsBlocks()
+    for kind in (_Recurrence, _OtherRecurrence):
+        monkeypatch.setitem(adapters.BINDINGS, (adapters.VALUE, kind), binding)
+    return binding
+
+
+def _value(updates, span=2) -> Array:
+    return Value("v", nodes={"LLM"}, layers={0, 1}, entry=Entry({"x": TensorType((4,), dtype=torch.float32)}),
+                 updates=updates, verify_span=span)
+
+
+def _value_handle(span=2):
+    """A Value whose one update keeps a verify block, and the run its update calls."""
+    arrays = [_array(span=1), _value({"a": _Recurrence()}, span)]
+    (config,) = (spec.config for spec in build_specs(arrays) if spec.resource_key == "v")
+    run = object()
+    resources = {"v": RecurrentStatePool(torch.device("cpu"), config, kv_dtype=torch.float32), "a": run}
+    return build_handle(arrays[1], resources, _resolve(arrays, StateSetup())), run
+
+
+def _value_step(h, verify=True) -> SubmoduleStep:
+    step = SubmoduleStep(segments=[Segment(1, "main", 2)], state={h.name: ArrayStep(verify=verify)})
+    step.set_ctx(_ctx((1,)))
+    return step
+
+
+@pytest.mark.parametrize("updates, found", [
+    ({}, "[]"), ({"a": _Recurrence(), "b": _OtherRecurrence()}, "['a', 'b']"),
+], ids=["none", "two"])
+def test_a_value_verifies_only_through_an_update_with_verify_blocks(monkeypatch, updates, found):
+    _keeps_blocks(monkeypatch)
+    _refused(re.escape(f"a Value verifies through one update that keeps verify blocks, and the array has {found}"),
+             lambda: build_specs([_array(span=1), _value(updates)]))
+
+
+def test_a_value_s_pool_holds_its_update_s_verify_blocks(monkeypatch):
+    _keeps_blocks(monkeypatch)
+    (config,) = (spec.config for spec in build_specs([_array(span=1), _value({"a": _Recurrence()})])
+                 if spec.resource_key == "v")
+    assert set(config.blocks) == {"x", "spec_x"}, "the verify block sits in the Value's pool beside its field"
+
+
+def test_a_value_handle_attaches_only_its_verify_entry(monkeypatch):
+    _keeps_blocks(monkeypatch)
+    h, _ = _value_handle()
+    assert set(h._runners) == {_Recurrence}, "the verify entry is no update the handle runs"
+    assert isinstance(h.verify, adapters.UpdateSettleRun), "the verify entry gives the handle its verify steps' run"
+    assert type(_value_handle(span=1)[0].verify) is VerifyRun, "a Value at span 1 refuses verify steps"
+
+
+def test_a_value_settles_after_its_last_update(monkeypatch):
+    binding = _keeps_blocks(monkeypatch)
+    h, run = _value_handle()
+    kept = torch.tensor([2])
+    step = _value_step(h)
+    h.begin_step(step)
+    h._update(_Recurrence, 0)
+    _refused(re.escape("settle before the updates of [('x', 1)]"), lambda: settle(h, kept))
+    _refused("a verify step ends with no settle", lambda: h.check_step(step))
+    h._update(_Recurrence, 1)
+    settle(h, kept)
+    _refused("an update after this verify step's settle", lambda: h._update(_Recurrence, 0))
+    assert binding.settled == [(run, kept, "main")], "the update's binding settles the step on the update's run"
+
+
+def test_a_value_that_verifies_is_not_read_whole(monkeypatch):
+    _keeps_blocks(monkeypatch)
+    h, _ = _value_handle()
+    h.begin_step(_value_step(h, verify=False))
+    _refused("no layout yet: a read of a Value that verifies", lambda: h.read(0))
