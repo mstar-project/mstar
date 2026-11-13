@@ -25,6 +25,7 @@ from mstar.engine.state.calls import (
     rope,
     sample,
     scatter,
+    settle,
     split_range,
 )
 from mstar.engine.state.contract import (
@@ -43,6 +44,8 @@ from mstar.engine.state.contract import (
     KimiDelta,
     KimiDeltaWeights,
     KVEntry,
+    LatentAttend,
+    LatentEntry,
     Layout,
     PagedNHD,
     PagedNHDTarget,
@@ -81,6 +84,8 @@ __all__ = [
     "KeptWindow",
     "KimiDelta",
     "KimiDeltaWeights",
+    "LatentAttend",
+    "LatentEntry",
     "Layout",
     "PagedNHD",
     "PagedNHDTarget",
@@ -112,6 +117,7 @@ __all__ = [
     "rope",
     "sample",
     "scatter",
+    "settle",
     "split_range",
     "state_op",
 ]

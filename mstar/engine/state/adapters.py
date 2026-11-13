@@ -3,6 +3,7 @@ storage and op type, and a handle per storage. It builds the specs, steps and la
 
 import dataclasses
 import functools
+import os
 from abc import ABC, abstractmethod
 from collections import Counter
 from collections.abc import Callable, Collection, Mapping, Sequence
@@ -71,7 +72,7 @@ from mstar.engine.state.analysis import (
     shard_axis,
     written_by_step,
 )
-from mstar.engine.state.calls import ArrayHandle, SamplerHandle, ShardHandle, pool_layers, segments_of
+from mstar.engine.state.calls import ArrayHandle, SamplerHandle, ShardHandle, VerifyRun, pool_layers, segments_of
 from mstar.engine.state.contract import (
     EMPTY,
     Array,
@@ -87,6 +88,8 @@ from mstar.engine.state.contract import (
     KimiDelta,
     KimiDeltaWeights,
     KVEntry,
+    LatentAttend,
+    LatentEntry,
     Layout,
     Mask,
     Op,
@@ -109,6 +112,11 @@ from mstar.model.components.diffusion.attention import FrameSDPA, joint_attentio
 if TYPE_CHECKING:
     from mstar.engine.state.state_op import StateOp
     from mstar.model.base import LabelLayout, Model
+
+
+# Off by default: `settle` reads each eager verify step's counts back to the host to check their range, which waits
+# for the step.
+_DEBUG_ASSERTS = os.environ.get("MSTAR_KV_DEBUG_ASSERTS", "0") == "1"
 
 
 def node_resources(model: "Model", *, setup: "StateSetup | None" = None) -> list[NodeResourceSpec]:
@@ -617,11 +625,20 @@ def sampling_configs(
 # Bindings
 
 
+@dataclass(frozen=True)
+class Verify:
+    """The key of an array's verify steps in `BINDINGS`, bound after its positions where its ``verify_span``,
+    ``span``, is above 1."""
+
+    span: int
+
+
 class BoundOp(NamedTuple):
-    """One of an array's reads or updates, or its positions, under its key, with the binding that runs it."""
+    """One of an array's reads or updates, its positions or its verify steps, under its key, with the binding that
+    runs it."""
 
     key: str
-    declared: Read | Op | Positions
+    declared: Read | Op | Positions | Verify
     binding: "OpBinding"
 
 
@@ -921,6 +938,60 @@ class ReachRead(PagedRead):
         raise _no_layout(self._array, "at_last_token on an array whose read has no op, which lays out no queries")
 
 
+class PagedLatentAttend(OpBinding):
+    """`LatentAttend` on a latent array: FlashInfer's MLA attention over the array's pool."""
+
+    def check(self, array: Array, key: str, read: Read) -> None:
+        if not isinstance(read.mask, Causal):
+            raise _no_layout(array, f"reads[{key!r}].mask must be Causal, the mask FlashInfer's MLA plan has")
+        if read.walks is not None:
+            raise _no_layout(array, f"reads[{key!r}].walks must be None, since FlashInfer's MLA plan has no walk")
+        if not read.packed:
+            raise _no_layout(array, f"reads[{key!r}] declares packed=False, and FlashInfer's MLA kernel takes packed "
+                                    "queries")
+
+    def specs(self, array: Array, key: str, read: Read) -> list[NodeResourceSpec]:
+        return [AttentionSpec(
+            resource_key=key, nodes=array.nodes,
+            config=AttentionConfig(kv_cache=array.name, backend=AttnBackend.FLASHINFER_MLA, sm_scale=read.op.scale),
+        )]
+
+    def steps(
+        self, array: Array, key: str, read: Read, declared: ArrayStep, segments, steps: dict[str, Any],
+    ) -> None:
+        steps[key] = AttentionStep(segments=segments, causal=read.mask.uses_query_position)
+
+    def bind(self, array: Array, key: str, resources: Mapping[str, Any]) -> "_LatentRead":
+        return _LatentRead(array, resources[key])
+
+    def attach(self, handle: ArrayHandle, key: str, run: Any) -> None:
+        handle.reads[key] = run
+
+
+class _LatentRead:
+    """What a latent array's read runs: the MLA resource's absorbed attention, which reads the pages alone and takes
+    the rope query in place of k and v."""
+
+    def __init__(self, array: Array, attn: Any):
+        self._array = array
+        self._attn = attn
+
+    @property
+    def requires_kv_write(self) -> bool:
+        return self._attn.requires_kv_write
+
+    def run(
+        self, q: torch.Tensor, *, label: str, kv_cache_layer: torch.Tensor, q_pe: torch.Tensor,
+        selected: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if selected is not None:
+            raise ValueError(f"Array {self._array.name!r}: selected, on a read whose mask picks no positions")
+        return self._attn.run(q, label=label, kv_cache_layer=kv_cache_layer, q_pe=q_pe)
+
+    def select_last_hidden(self, x: torch.Tensor, label: str = "main") -> torch.Tensor:
+        return self._attn.select_last_hidden(x, label=label)
+
+
 class PositionsBinding(OpBinding):
     """An array's `Positions`, which a position resource keeps per request under `position_key`, with the `Rope` its
     calls rotate by."""
@@ -973,6 +1044,154 @@ class _Counter:
 
     def apply_qk(self, q: torch.Tensor, k: torch.Tensor, *, label: str, rope_dtype: torch.dtype) -> tuple:
         raise _no_layout(self._array, "rope(), and its positions declare no Rope")
+
+
+class Rewind(OpBinding):
+    """Verify steps on a paged pool. The pool keeps each verify block whole, and the KV and position resources each
+    move their stream back by what its row didn't keep, before anything reads its length again."""
+
+    def check(self, array: Array, key: str, verify: Verify) -> None:
+        windowed = sorted(name for name, read in array.reads.items() if isinstance(read.mask, Window))
+        if windowed:
+            raise _no_layout(array, f"verify_span {verify.span} beside Window reads {windowed}, whose pool keeps KV "
+                                    "groups, and `KVManager.correct_len` moves no grouped stream")
+
+    def resource(self, array: Array, key: str) -> str:
+        return array.name
+
+    def attach(self, handle: ArrayHandle, key: str, run: Any) -> None:
+        """Give ``handle`` the run of its verify steps over ``run``, the array's pool."""
+        handle.verify = RewindRun(handle, run)
+
+
+class _CountTable:
+    """A verify step's counts on the host, row 0 the step's number and row r the count of its row r, copied there
+    from ``staging`` on the device by a copy a capture records."""
+
+    def __init__(self, rows: int, device: torch.device):
+        self.rows = rows
+        self.host = torch.zeros(rows + 1, dtype=torch.int64, pin_memory=device.type == "cuda")
+        self.staging = torch.zeros(rows, dtype=torch.int64, device=device)
+
+
+class _Counts:
+    """A verify step's counts, read from its table once, when the first of its rows is applied."""
+
+    def __init__(self, table: _CountTable, number: int, spans: tuple[int, ...], done: torch.cuda.Event | None):
+        self._table, self._number, self._spans, self._done = table, number, spans, done
+        self._kept: list[int] | None = None
+
+    def delta(self, row: int) -> int:
+        if self._kept is None:
+            if self._done is not None:
+                self._done.synchronize()
+            number = int(self._table.host[0])
+            if number != self._number:
+                raise RuntimeError(f"the count table of verify step {self._number} was overwritten by step {number} "
+                                   "before its counts were applied")
+            self._kept = self._table.host[1:len(self._spans) + 1].tolist()
+        return self._kept[row] - self._spans[row]
+
+
+class _RowCount(NamedTuple):
+    """One row's `Correction`: minus the entries of its verify block it didn't keep."""
+
+    counts: _Counts
+    row: int
+
+    def delta(self) -> int:
+        return self.counts.delta(self.row)
+
+
+class RewindRun(VerifyRun):
+    """The verify steps of a paged array. Each settles into a count table on the host: one per capture slot, made at
+    capture, and two for eager steps, by the parity of the step's number."""
+
+    def __init__(self, handle: ArrayHandle, kv: Any):
+        super().__init__(handle)
+        self._kv = kv
+        self._device = kv.layer_view(0).device
+        self._tables: dict[tuple, _CountTable] = {}
+        self._number = 0
+        # this step's table while it verifies, its segments and its context
+        self._table: _CountTable | None = None
+        self._segments: Sequence[Segment] = ()
+        self._ctx = None
+        self._settled = False
+
+    def begin(self, declared: ArrayStep, segments: Sequence[Segment], ctx) -> None:
+        self._table = None
+        if not declared.verify:
+            return
+        refusal = self.handle._refusal
+        if ctx.repeats > 1:
+            raise refusal(f"a verify step whose capture replays {ctx.repeats} times, and its count table holds one "
+                          "step's counts")
+        if not ctx.replays:
+            self._check(declared, segments)
+        lease = ctx.slot_lease
+        captured = lease is not None and lease.bucket is not None
+        key = (lease.slot, lease.bucket) if captured else ("eager", (self._number + 1) % 2)
+        table = self._tables.get(key)
+        if table is None or (not captured and table.rows < len(segments)):
+            table = self._tables[key] = _CountTable(len(segments), self._device)
+        elif table.rows < len(segments):
+            raise refusal(f"a verify step of {len(segments)} rows on capture slot {lease.slot}, and its slot's count "
+                          f"table holds {table.rows}")
+        self._number += 1
+        # a capture leaves the number to its replays, each of which writes its own before its launch
+        if not ctx.capture:
+            table.host[0] = self._number
+        self._table, self._segments, self._ctx, self._settled = table, segments, ctx, False
+
+    def _check(self, declared: ArrayStep, segments: Sequence[Segment]) -> None:
+        refusal = self.handle._refusal
+        if not declared.keep or declared.forks or declared.placeholders:
+            raise refusal("a verify step with keep=False, forks or placeholders, and a settle cuts only the blocks a "
+                          "step keeps on the streams it adds to")
+        span = self.handle.array.verify_span
+        for segment in segments:
+            if not 1 <= segment.span <= span:
+                raise refusal(f"a verify step adds {segment.span} entries for row {segment.request_id}, and a verify "
+                              f"block holds 1 to verify_span {span}")
+        if len({segment.label for segment in segments}) > 1:
+            raise refusal("a verify step over several labels, and its count table holds one row per request")
+
+    def settle(self, kept: torch.Tensor) -> None:
+        refusal = self.handle._refusal
+        if self._table is None:
+            raise refusal("settle on a step that doesn't verify")
+        if self._settled:
+            raise refusal("a second settle in one verify step")
+        rows = len(self._segments)
+        if _DEBUG_ASSERTS and not self._ctx.capture:
+            for segment, count in zip(self._segments, kept[:rows].tolist(), strict=True):
+                if self._ctx.is_real_row(segment.request_id) and not 1 <= count <= segment.span:
+                    raise refusal(f"settle keeps {count} entries of row {segment.request_id}, whose verify block "
+                                  f"holds {segment.span}")
+        self._settled = True
+        self._table.staging[:rows].copy_(kept[:rows])
+        self._table.host[1:rows + 1].copy_(self._table.staging[:rows], non_blocking=True)
+
+    def end(self, ctx) -> None:
+        if self._table is not None and not self._settled:
+            raise self.handle._refusal("a verify step ends with no settle, and its pages keep every entry it added")
+
+    def commit(self, ctx) -> None:
+        if self._table is None or ctx.capture:
+            return
+        done = None
+        if self._device.type == "cuda":
+            done = torch.cuda.Event()
+            done.record()
+        counts = _Counts(self._table, self._number, tuple(segment.span for segment in self._segments), done)
+        positions = self.handle.positions
+        for row, segment in enumerate(self._segments):
+            if ctx.is_real_row(segment.request_id):
+                count = _RowCount(counts, row)
+                self._kv.defer_correct_len(segment.request_id, segment.label, count)
+                if positions is not None:
+                    positions.defer_correct_len(segment.request_id, segment.label, count)
 
 
 class WithinStepAttend(OpBinding, ABC):
@@ -1538,6 +1757,53 @@ class PagedCrossHandle(PagedArrayHandle):
         self._check_open("at_last_token")
         raise self._refusal(f"at_last_token lays x out by this array's segments, and its read's queries are laid out "
                             f"by {self.queries.array.name!r}; call it on that array")
+
+
+class LatentHandle(PagedArrayHandle):
+    """Adds and reads through the MLA pages of a latent array. An add joins ``ckv`` and ``kpe`` into one row and
+    writes it, and a read attends the pages with ``q`` and ``q_pe``, so the handle holds nothing between them."""
+
+    def __init__(
+        self, array: Array, resources: Mapping[str, Any], bindings: tuple[BoundOp, ...], resolved: "Resolved",
+    ):
+        super().__init__(array, resources, bindings, resolved)
+        self._rank, self._rope_dim = self.storage._latent(array)
+        self._fields = {"ckv", "kpe"} if self._rope_dim else {"ckv"}
+
+    def _check_labels(self, labels: set[str], segments) -> None:
+        raise self._no_layout(f"a step touches labels {sorted(labels)}, and an MLA plan holds one label")
+
+    def _needs_step_kv(self, attn: Any) -> bool:
+        """Never: the absorbed read attends the pages alone."""
+        return False
+
+    @torch.compiler.disable
+    def add(self, layer: int | torch.Tensor, *, keep: bool | None = None, **fields: torch.Tensor) -> None:
+        layer = self._layer_id(layer)
+        if fields.keys() != self._fields:
+            raise self._refusal(f"an add of fields {sorted(fields)}, and the latent entry holds {sorted(self._fields)}")
+        self._record_add(layer, keep)
+        row = torch.cat([fields["ckv"], fields["kpe"]], -1) if self._rope_dim else fields["ckv"]
+        self._kv.write_kv(row, None, layer_idx=self._pool_layer[layer], label=self.label)
+
+    @torch.compiler.disable
+    def read(self, layer: int | torch.Tensor, q: torch.Tensor | None = None, **mask_args: Any) -> torch.Tensor:
+        """Attend ``q``, (tokens, q_heads, rank), with ``q_pe``, (tokens, q_heads, rope_dim), which a latent with no
+        ``kpe`` takes none of. ``selected`` goes to the layer's read, whose mask says whether it takes one."""
+        layer = self._layer_id(layer)
+        if q is None:
+            raise self._no_layout("a read with no op")
+        unknown = sorted(mask_args.keys() - {"q_pe", "selected"})
+        if unknown:
+            raise self._no_layout(f"read arguments {unknown}, which neither LatentAttend nor a mask defines")
+        q_pe = mask_args.pop("q_pe", None)
+        if (q_pe is None) == bool(self._rope_dim):
+            raise self._refusal(f"a read with{'out' if q_pe is None else ''} q_pe, on a latent of rope_dim "
+                                f"{self._rope_dim}, which takes q_pe exactly when it holds kpe")
+        self._record_read(layer)
+        if q_pe is None:
+            q_pe = q.new_empty(*q.shape[:2], 0)
+        return self._attn[layer].run(q, label=self.label, kv_cache_layer=self._views[layer], q_pe=q_pe, **mask_args)
 
 
 class RingHandle(ArrayHandle):
@@ -2142,7 +2408,7 @@ class PagedStorage(Storage):
         return len(array.nodes) > 1
 
     def _pool(self, array: Array, walks: "Walks") -> KVSpec:
-        heads, head_dim = _kv_shape(array)
+        geometry = self._geometry(array)
         if not array.reads:
             raise _no_layout(array, "reads is empty, and PagedKVConfig needs num_qo_heads from an Attend read")
         joined = sorted(label for label in array.labels if "+" in label)
@@ -2156,10 +2422,18 @@ class PagedStorage(Storage):
         return KVSpec(
             resource_key=array.name, nodes=array.nodes,
             leader=_leader(array, walks) if self.takes_leader(array) else None,
-            config=PagedKVConfig(
-                num_layers=len(array.layers), num_qo_heads=q_heads.pop() if q_heads else None,
-                num_kv_heads=heads, head_dim=head_dim, max_seq_len=array.max_len,
-            ),
+            config=self._pool_config(array, geometry, q_heads.pop() if q_heads else None),
+        )
+
+    def _geometry(self, array: Array) -> tuple[int, int]:
+        """The two sizes the pool takes from ``array``'s entry, refused where the entry holds anything else."""
+        return _kv_shape(array)
+
+    def _pool_config(self, array: Array, geometry: tuple[int, int], q_heads: int | None) -> PagedKVConfig:
+        heads, head_dim = geometry
+        return PagedKVConfig(
+            num_layers=len(array.layers), num_qo_heads=q_heads, num_kv_heads=heads, head_dim=head_dim,
+            max_seq_len=array.max_len,
         )
 
     def _read_specs(self, array: Array, bound: Sequence[BoundOp]) -> tuple[list[NodeResourceSpec], dict[str, str]]:
@@ -2298,6 +2572,32 @@ class PagedCrossStorage(PagedStorage):
     ) -> None:
         handle.queries.segments(handle, step)
         super().steps(handle, declared, step, segments, steps)
+
+
+class LatentStorage(PagedStorage):
+    """An append-only array of MLA latents, in a pool of KV pages in FlashInfer's MLA layout, one row per token."""
+
+    handle_class = LatentHandle
+
+    @staticmethod
+    def _latent(array: Array) -> tuple[int, int]:
+        """``array``'s ``(rank, rope_dim)``, which its pool and its handle take."""
+        ckv, kpe = array.entry.tensors["ckv"], array.entry.tensors.get("kpe")
+        rank = ckv.shape[0] if len(ckv.shape) == 1 else 0
+        rope_dim = kpe.shape[0] if kpe is not None and len(kpe.shape) == 1 else 0
+        if not rank or array.entry != LatentEntry(rank=rank, rope_dim=rope_dim):
+            raise _no_layout(array, "entry must be a LatentEntry, all the MLA layout holds")
+        return rank, rope_dim
+
+    def _geometry(self, array: Array) -> tuple[int, int]:
+        return self._latent(array)
+
+    def _pool_config(self, array: Array, geometry: tuple[int, int], q_heads: int | None) -> PagedKVConfig:
+        rank, rope_dim = geometry
+        return PagedKVConfig(
+            num_layers=len(array.layers), num_qo_heads=q_heads, num_kv_heads=1, head_dim=rank + rope_dim,
+            max_seq_len=array.max_len, layout=KVLayout.MLA, kv_lora_rank=rank, qk_rope_head_dim=rope_dim,
+        )
 
 
 class RingStorage(Storage):
@@ -2472,6 +2772,7 @@ class WithinStepStorage(Storage):
 PAGED = PagedStorage()
 PAGED_BY_WALK = PagedByWalkStorage()
 PAGED_CROSS = PagedCrossStorage()
+LATENT = LatentStorage()
 RING = RingStorage()
 VALUE = ValueStorage()
 VALUE_WITH_HOST = ValueWithHostStorage()
@@ -2491,6 +2792,8 @@ def storage_of(array: Array) -> Storage:
         return WITHIN_STEP
     if array.reads and all(isinstance(read.mask, FrameWindow) for read in array.reads.values()):
         return RING
+    if "ckv" in array.entry.tensors:
+        return LATENT
     if any(read.queries is not None for read in array.reads.values()):
         return PAGED_CROSS
     return PAGED_BY_WALK if reads_differ_by_walk(array) else PAGED
@@ -2499,14 +2802,18 @@ def storage_of(array: Array) -> Storage:
 # `Attend` is an `AttentionSpec` on a paged array, a `CrossAttentionSpec` on one read with another array's queries and a
 # `RaggedAttentionSpec` within a step, so a binding is per storage and op type. A field of a read's mask can still swap
 # the binding, through `OpBinding.for_mask`, as a kept window does, and the `SDPA` table below is the deployment's swap.
-BINDINGS: dict[tuple[Storage, type[Op | Positions | None]], OpBinding] = {
+BINDINGS: dict[tuple[Storage, type[Op | Positions | Verify | None]], OpBinding] = {
     (PAGED, Attend): PagedAttend(),
     (PAGED, type(None)): PagedNoOp(),
     (PAGED, Positions): PositionsBinding(),
+    (PAGED, Verify): Rewind(),
     (PAGED_BY_WALK, Attend): PagedAttend(),
     (PAGED_BY_WALK, Positions): PositionsBinding(),
     (PAGED_CROSS, Attend): PagedCrossAttend(),
     (PAGED_CROSS, Positions): PositionsBinding(),
+    (LATENT, LatentAttend): PagedLatentAttend(),
+    (LATENT, Positions): PositionsBinding(),
+    (LATENT, Verify): Rewind(),
     (RING, Attend): FlexAttend(),
     (RING, Positions): CounterPositions(),
     (WITHIN_STEP, Attend): RaggedAttend(),
@@ -2544,9 +2851,9 @@ def _default_binding(storage: Storage, read: Read) -> OpBinding | None:
 def _bindings(
     storage: Storage, array: Array, chosen: Mapping[str, OpBinding] = EMPTY,
 ) -> tuple[BoundOp, ...]:
-    """``array``'s reads, then its updates, then its positions, each with the binding that runs it on ``storage``:
-    ``chosen``'s for a read it names, and `BINDINGS`' for the rest. Each binding checks its op. Refuses a pair
-    `BINDINGS` has no entry for, and a second update of one type."""
+    """``array``'s reads, then its updates, then its positions and its verify steps, each with the binding that runs it
+    on ``storage``: ``chosen``'s for a read it names, and `BINDINGS`' for the rest. Each binding checks its op.
+    Refuses a pair `BINDINGS` has no entry for, and a second update of one type."""
     bound = []
     for key, read in array.reads.items():
         binding = _default_binding(storage, read)
@@ -2568,6 +2875,12 @@ def _bindings(
         if binding is None:
             raise _no_layout(array, "positions, which only an append-only array that keeps entries holds")
         bound.append(BoundOp(position_key(array), array.positions, binding))
+    if array.verify_span > 1:
+        binding = BINDINGS.get((storage, Verify))
+        if binding is None:
+            raise _no_layout(array, f"verify_span {array.verify_span}, which today's resources settle on no "
+                                    f"{type(storage).__name__}")
+        bound.append(BoundOp(array.name, Verify(array.verify_span), binding))
     for each in bound:
         each.binding.check(array, each.key, each.declared)
     return tuple(bound)

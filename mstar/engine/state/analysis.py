@@ -133,6 +133,9 @@ def _array_problems(array: Array) -> list[str]:
         elif not isinstance(read.mask, Block) and not array.max_len:
             problems.append(f"{where}.reads[{key!r}].mask: every read of an array with max_len 0 is a Block read, "
                             f"and this one is {type(read.mask).__name__}")
+        if array.verify_span > 1 and read.mask.sees_step_whole:
+            problems.append(f"{where}.verify_span: {array.verify_span} beside reads[{key!r}]. "
+                            f"{read.mask.split_step_change()}, and a settle keeps only part of a verify step's adds")
     if array.positions is not None:
         if array.rewritable or not array.max_len:
             problems.append(f"{where}.positions: positions sit only on an append-only array that keeps entries")
@@ -155,6 +158,12 @@ def _kv_label_problems(kv_labels: Mapping[str, Mapping[str, object]], arrays: Se
             f"kv_labels()[{key!r}][{label!r}]: it is not in Array {key!r}.labels, {sorted(by_name[key].labels)}"
             for label in sorted(labels.keys() - by_name[key].labels)
         ]
+        if by_name[key].verify_span > 1:
+            problems += [
+                f"Array {key!r}.verify_span: {by_name[key].verify_span}, and kv_labels()[{key!r}][{label!r}] keys for "
+                "prefix reuse, which would key the entries a settle drops"
+                for label, kv_label in sorted(labels.items()) if kv_label.keys is not None
+            ]
     return problems
 
 

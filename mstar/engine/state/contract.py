@@ -76,6 +76,19 @@ def KVEntry(*, heads: int, head_dim: int) -> Entry:
     return Entry({"k": t, "v": t})
 
 
+def LatentEntry(*, rank: int, rope_dim: int) -> Entry:
+    """One token's MLA latent: ``ckv`` of ``rank`` entries and, with ``rope_dim`` above 0, the decoupled RoPE key
+    ``kpe``. Every query head reads both, so neither is sharded."""
+    if not _is_positive(rank):
+        raise ValueError(f"LatentEntry.rank must be a positive int, got {rank!r}")
+    if not (type(rope_dim) is int and rope_dim >= 0):
+        raise ValueError(f"LatentEntry.rope_dim must be an int >= 0, got {rope_dim!r}")
+    tensors = {"ckv": TensorType((rank,), dtype=None)}
+    if rope_dim:
+        tensors["kpe"] = TensorType((rope_dim,), dtype=None)
+    return Entry(tensors)
+
+
 class Mask:
     """Which entries a read at log position q sees. An entry's index is its log position."""
 
@@ -218,6 +231,34 @@ class GatedDeltaNet(Op):
             raise ValueError(f"{where}: GatedDeltaNet needs entry field state of shape (h_v, d_k, d_v)")
 
 
+@dataclass(frozen=True)
+class LatentAttend(Op):
+    """Absorbed multi-head latent attention. Head h scores a reached entry by ``q[h] . ckv`` plus ``q_pe[h] . kpe``,
+    times ``scale``, and returns the softmax-weighted sum of ``ckv``, (tokens, q_heads, rank). It reads ``kpe`` where
+    the entry has it. The caller folds the key up-projection into ``q`` and applies the value up-projection to the
+    result."""
+
+    # the field every latent entry holds
+    reads = ("ckv",)
+    q_heads: int
+    _: KW_ONLY
+    scale: float    # the original query-key head dim's, which the absorbed width doesn't give
+
+    def check(self, where: str, entry: Entry) -> None:
+        if not _is_positive(self.q_heads):
+            raise ValueError(f"{where}.q_heads must be a positive int, got {self.q_heads!r}")
+        if not (isinstance(self.scale, float) and self.scale > 0):
+            raise ValueError(f"{where}.scale must be a positive float, got {self.scale!r}")
+        ckv, kpe = entry.tensors["ckv"], entry.tensors.get("kpe")
+        for name, tensor in (("ckv", ckv), ("kpe", kpe)):
+            if tensor is not None and (len(tensor.shape) != 1 or tensor.shard is not None):
+                raise ValueError(f"{where}: LatentAttend needs entry field {name} 1-D and unsharded, since every query "
+                                 f"head reads it, and it is {tensor.shape} with shard {tensor.shard}")
+        if kpe is not None and kpe.dtype != ckv.dtype:
+            raise ValueError(f"{where}: LatentAttend needs ckv and kpe of one dtype, and they are {ckv.dtype} and "
+                             f"{kpe.dtype}")
+
+
 @dataclass(frozen=True, kw_only=True)
 class KimiDelta(Op):
     """Kimi delta attention over each row's ``conv`` window, (3 * heads * head_dim, kernel - 1), and ``state``, (heads,
@@ -309,7 +350,7 @@ class Rope:
 class Positions:
     """Each row's position on the array, which the model rotates or embeds its next tokens at. It reads no entries,
     and it lives on the host and moves when a step is planned: by the row's span, by ``ArrayStep.advance`` or by
-    ``ArrayStep.position_ids``. It forks and takes prefix hits with its array."""
+    ``ArrayStep.position_ids``, and back by a verify step's settle. It forks and takes prefix hits with its array."""
 
     rope: Rope | None = None    # None: a counter only
 
@@ -336,6 +377,7 @@ class Array:
     rewritable: bool = False
     labels: frozenset[str] = frozenset({"main"})
     positions: Positions | None = None
+    verify_span: int = 1    # the most entries one verify step adds per row (1: no verify step)
 
     def __post_init__(self):
         object.__setattr__(self, "nodes", frozenset(self.nodes))
@@ -354,6 +396,10 @@ class Array:
             raise ValueError(f"{where}.labels must be non-empty")
         if not (type(self.max_len) is int and self.max_len >= 0):
             raise ValueError(f"{where}.max_len must be an int >= 0, got {self.max_len!r}")
+        if not _is_positive(self.verify_span):
+            raise ValueError(f"{where}.verify_span must be a positive int, got {self.verify_span!r}")
+        if self.verify_span > 1 and not self.max_len:
+            raise ValueError(f"{where}.verify_span: max_len 0 keeps nothing for a verify step to settle")
         self._check_entry()
         for key, read in self.reads.items():
             self._check_read(key, read)
@@ -535,6 +581,7 @@ class ArrayStep:
     advance: tuple[int, ...] | None = None         # positions per row; None: the span
     position_ids: torch.Tensor | None = None       # explicit ids, (tokens,) in segment order
     host: Mapping[tuple[int, str, int], Mapping[str, object]] = EMPTY    # (row, label, layer) -> fields, at commit
+    verify: bool = False                           # each row's adds are a verify block, which `settle` cuts
 
 
 @dataclass(frozen=True, kw_only=True)
