@@ -14,6 +14,7 @@ import torch
 
 from mstar.engine.resources.attn.config import AttnBackend
 from mstar.engine.resources.attn.ragged.config import RaggedAttnBackend
+from mstar.engine.resources.step import StepContext
 from mstar.engine.state.adapters import node_resources, state_setup
 from mstar.model.cosmos3 import constants as C
 from mstar.model.cosmos3.config import Cosmos3Config
@@ -22,6 +23,7 @@ from mstar.model.cosmos3.submodules import (
     ATTN,
     ATTN_GEN,
     COND_LABEL,
+    IMAGE_GEN_LOOP,
     PROGRESS,
     SAMPLER,
     SESSION_TAIL,
@@ -36,6 +38,7 @@ from mstar.model.cosmos3.tests.stubs import StubSampler, bind_progress
 from mstar.model.cosmos3.tests.test_edge import _tiny_edge_config
 from mstar.model.cosmos3.tests.test_engine_cache import _SdpaResources, dit_handles
 from mstar.model.cosmos3.tests.test_rotary_table import stand_in_rotary
+from mstar.model.cosmos3.tests.test_video_capture import _dit_with_buckets
 from mstar.model.keys import ROPE, VISION_ATTN
 from mstar.model.submodule_base import ARNodeInputs, engine_step
 
@@ -121,6 +124,45 @@ def test_a_windowed_request_draws_each_window_from_where_progress_left_its_gener
     generator = torch.Generator().manual_seed(11)
     for window, latents in enumerate(drawn):
         assert torch.equal(latents, torch.randn(latents.shape, generator=generator)), f"window {window}'s noise"
+
+
+def test_a_replayed_distilled_step_leaves_the_generator_where_the_next_step_draws(monkeypatch):
+    """A distilled step draws its SDE noise in ``prepare_inputs`` and records where the generator stands under
+    ``PROGRESS``. A captured step declares that write on every replay, and a replay that dropped it would draw the
+    first step's noise again at every step, with no error."""
+    dit, _ = _dit_with_buckets(monkeypatch, guidance_scale=1.0, is_distilled=True, distilled_sigmas=(1.0, 0.75, 0.5))
+    dit.config.scheduler.stochastic_sampling = True
+    monkeypatch.setattr(dit, "get_device", lambda: CPU)
+    model = Cosmos3Model(model_path_hf="unused", skip_weight_loading=True)
+    model.config = dit.config
+    handles, setup = dit_handles(model, _SdpaResources().as_dict())
+    dit.bind_node_state(handles)
+    setup.host_fields.open("r")
+    md = {"height": 64, "width": 64, "guidance_scale": 1.0, "num_inference_steps": 3, C.PROMPT_LENGTHS: (7, 0)}
+    fwd = SimpleNamespace(
+        request_id="r", rid_handle="r", random_seed=11, step_metadata=md, dynamic_loop_iter_counts={},
+    )
+    lease, noise, latents = SimpleNamespace(), [], None
+    for k in range(3):
+        fwd.dynamic_loop_iter_counts[IMAGE_GEN_LOOP] = k
+        inputs = dit.prepare_inputs(C.IMAGE_GEN_WALK, fwd, {"latents": [latents]} if k else {})
+        latents = inputs.tensor_inputs["latents"]
+        noise.append(inputs.kwargs["settings"]["sde_noise"])
+        step = engine_step(dit, graph_walk=C.IMAGE_GEN_WALK, request_ids=["r"], inputs=[inputs], slot_lease=lease)
+        ctx = StepContext(request_ids=["r"], graph_walk=C.IMAGE_GEN_WALK, slot=0, capture=False)
+        ctx.slot_lease = lease
+        step.set_ctx(ctx)
+        assert step.cg_key_info is not None and ctx.replays, "the step would run eager"
+        # the calls a replay makes around its captured graph, then its commit
+        step.begin_calls()
+        step.end_calls()
+        step.commit_calls()
+    generator = torch.Generator().manual_seed(11)
+    torch.randn(latents.shape, generator=generator, dtype=latents.dtype)  # the request's initial latents
+    for k, drawn in enumerate(noise):
+        assert torch.equal(drawn, torch.randn(drawn.shape, generator=generator)), (
+            f"step {k} drew other noise than the request's generator gives after {k} steps"
+        )
 
 
 def test_the_dit_alone_keeps_a_session_and_refuses_a_missing_one_at_the_prefill():
