@@ -17,15 +17,24 @@ import torch
 
 sys.path.insert(0, ".")
 
+from mstar.distributed.communication import CommGroup  # noqa: E402
+from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner  # noqa: E402
 from mstar.engine.resources import resident as resident_mod  # noqa: E402
 from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec  # noqa: E402
 from mstar.engine.resources.base import CGSlotKey, MoveKind, Residency, Resource  # noqa: E402
+from mstar.engine.resources.context_parallel import TPPlacement  # noqa: E402
 from mstar.engine.resources.kv import manager as manager_mod  # noqa: E402
 from mstar.engine.resources.kv.config import KVLayout, KVReqConfig, KVSpec, KVStep, PagedKVConfig  # noqa: E402
 from mstar.engine.resources.kv.manager import KVManager  # noqa: E402
 from mstar.engine.resources.kv.plan import SINK_PAGE  # noqa: E402
-from mstar.engine.resources.position.config import PositionConfig, PositionStep, PosScheme  # noqa: E402
-from mstar.engine.resources.position.manager import RopeManager  # noqa: E402
+from mstar.engine.resources.position.config import (  # noqa: E402
+    LongRoPE,
+    PositionConfig,
+    PositionReqConfig,
+    PositionStep,
+    PosScheme,
+)
+from mstar.engine.resources.position.manager import LongRopeManager, RopeManager  # noqa: E402
 from mstar.engine.resources.recurrent.config import (  # noqa: E402
     RecurrentBlockConfig,
     RecurrentStateConfig,
@@ -33,15 +42,18 @@ from mstar.engine.resources.recurrent.config import (  # noqa: E402
 )
 from mstar.engine.resources.recurrent.pool import SINK_SLOT, RecurrentStatePool  # noqa: E402
 from mstar.engine.resources.resident import TRASH_SLOT, ResidentPlanner, build_planner  # noqa: E402
+from mstar.engine.resources.sequence_shard import SequenceShard  # noqa: E402
 from mstar.engine.resources.spec import resolve_spec_dependencies  # noqa: E402
 from mstar.engine.resources.step import (  # noqa: E402
     AllocationFailed,
     BucketKey,
+    ResourceStep,
     Segment,
     SlotLease,
     StepContext,
     SubmoduleStep,
 )
+from mstar.model.submodule_base import BatchedModelOutput
 from mstar.testing_utils.resource import StubResource
 from mstar.testing_utils.worker import make_worker
 from mstar.utils import knobs  # noqa: E402
@@ -52,6 +64,22 @@ from mstar.worker.scheduled_batch import ScheduledBatch  # noqa: E402
 PAGE = 4
 WALK = "decode"
 CPU = torch.device("cpu")
+MAX_SEQ_LEN = 512
+# a request whose prompt reaches past 16 positions rotates with the long half
+LONGROPE = LongRoPE((1.0,) * 4, (2.0,) * 4, original_max_position_embeddings=16, max_position_embeddings=1024)
+
+# Every test here also runs on LongRoPE (`_all_on_longrope`), where each ingest of a
+# handle flips its table, so a recycled or displaced row changes halves.
+_ON_LONGROPE = {"on": False}
+_INGESTS: dict[tuple[int, int], int] = {}
+
+
+@pytest.fixture(autouse=True, params=[False, True], ids=["rope", "longrope"])
+def _all_on_longrope(request):
+    _ON_LONGROPE["on"] = request.param
+    _INGESTS.clear()
+    yield
+    _ON_LONGROPE["on"] = False
 
 
 class _StubTransfer:
@@ -73,10 +101,14 @@ def _stub_transfer(monkeypatch):
     monkeypatch.setattr(manager_mod, "KVTransferManager", _StubTransfer)
 
 
-def _resources(cpu_offload_pages: int = 0, max_num_pages: int = 64, pool_slots: int = 9):
+def _resources(
+    cpu_offload_pages: int = 0, max_num_pages: int = 64, pool_slots: int = 9, longrope: bool | None = None,
+):
+    if longrope is None:
+        longrope = _ON_LONGROPE["on"]
     kv = KVManager(
         cfg=PagedKVConfig(
-            num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=512,
+            num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=MAX_SEQ_LEN,
             max_num_pages=max_num_pages, page_size=PAGE, cpu_offload_pages=cpu_offload_pages,
         ),
         name="kv", joint_comm_group=None, transfer_engine_info=None, device=CPU, dtype=torch.float32,
@@ -85,16 +117,26 @@ def _resources(cpu_offload_pages: int = 0, max_num_pages: int = 64, pool_slots: 
     pool = RecurrentStatePool(device=CPU, config=RecurrentStateConfig(
         num_layers=1, max_slots=pool_slots, blocks={"state": RecurrentBlockConfig(shape=(2,), dtype=torch.float32)},
     ))
-    rope = RopeManager(PositionConfig(kv_cache="kv"), CPU, max_seq_len=512, head_dim=8)
+    if longrope:
+        rope = LongRopeManager(
+            PositionConfig(kv_cache="kv", longrope=LONGROPE), CPU, max_seq_len=MAX_SEQ_LEN, head_dim=8,
+        )
+    else:
+        rope = RopeManager(PositionConfig(kv_cache="kv"), CPU, max_seq_len=MAX_SEQ_LEN, head_dim=8)
     # page-locked memory needs a GPU, and nothing here copies out of it asynchronously
     rope._pinned_pos_ids_buffer = lambda key, n: torch.empty(n, dtype=torch.long)
     return {"kv": kv, "pool": pool, "rope": rope}
 
 
-def _ingest(res: dict[str, Resource], rid: int) -> None:
+def _ingest(res: dict[str, Resource], rid: int, max_position: int | None = None) -> None:
+    if max_position is None and isinstance(res["rope"], LongRopeManager):
+        # a handle's tables alternate from one ingest to the next, from its id on
+        n = _INGESTS.get((id(res["rope"]), rid), 0)
+        _INGESTS[(id(res["rope"]), rid)] = n + 1
+        max_position = 20 if (rid + n) % 2 else 3
     res["kv"].ingest_request(rid, KVReqConfig())
     res["pool"].ingest_request(rid, None)
-    res["rope"].ingest_request(rid, None)
+    res["rope"].ingest_request(rid, None if max_position is None else PositionReqConfig(max_position=max_position))
 
 
 def _host_step(res, rids, spans, walk="prefill", advance=None):
@@ -114,13 +156,15 @@ def _host_step(res, rids, spans, walk="prefill", advance=None):
     return SubmoduleStep(steps={"kv": kv}, segments=list(segments)), ctx
 
 
-def _captured_step(res, planner: ResidentPlanner | None, rids, slot, bs, preplan=False, run=True):
+def _captured_step(res, planner: ResidentPlanner | None, rids, slot, bs, preplan=False, run=True, repeats=1):
     """One decode step on a bucket of ``bs`` rows. With a planner, the replay of a
-    resident capture; without one, the host plan of the same step."""
+    resident capture, ``repeats`` times; without one, the host plan of the same step."""
     padded = tuple(rids) + tuple(-(i + 1) for i in range(bs - len(rids)))
     bucket = BucketKey(graph_walk=WALK, bs=bs, num_tokens=bs)
     lease = SlotLease(slot=slot, bucket=bucket)
-    ctx = StepContext(request_ids=tuple(rids), graph_walk=WALK, slot=slot, capture=False, slot_lease=lease)
+    ctx = StepContext(
+        request_ids=tuple(rids), graph_walk=WALK, slot=slot, capture=False, slot_lease=lease, repeats=repeats,
+    )
     ctx.set_padded_rids(padded)
     segments = tuple(Segment(r, "main", 1) for r in padded)
     kv, pool, rope = KVStep(segments=segments), RecurrentStep(segments=segments), PositionStep(segments=segments)
@@ -167,15 +211,28 @@ def _replay(res, planner, s, promote=True):
         if promote:
             _promote(res, planner, s)
         planner.flush(ctx.resident_plan)
-        planner.gather(s.captured)
     state = res["kv"]._static_plan_state(lease.slot, ("main", 0), bucket.num_tokens)
     ck = CGSlotKey(bucket=bucket, slot=lease.slot, label="main")
-    s.pages = state.token_to_page[: bucket.bs].tolist()
-    s.offsets = state.token_to_cache[: bucket.bs].tolist()
-    s.positions = res["rope"]._static_pos_ids[ck][: bucket.bs].tolist()
-    s.pool_slots = res["pool"]._cg_addressing[ck].slot_indices[: bucket.bs].tolist()
-    if planner is not None:
-        planner.commit_in_graph(s.captured)
+    s.replays = []
+    rope = res["rope"]
+    for _ in range(ctx.repeats):
+        if planner is not None:
+            planner.gather(s.captured)
+        s.pages = state.token_to_page[: bucket.bs].tolist()
+        s.offsets = state.token_to_cache[: bucket.bs].tolist()
+        if isinstance(rope, LongRopeManager):
+            # its positions and table ids, the two rows of one buffer
+            both = rope._static_pos_ids[CGSlotKey(bucket=bucket, slot=lease.slot, label="main#longrope")]
+            s.positions, s.table_ids = both.view(2, bucket.num_tokens)[:, : bucket.bs].tolist()
+        else:
+            s.positions = rope._static_pos_ids[ck][: bucket.bs].tolist()
+        s.pool_slots = res["pool"]._cg_addressing[ck].slot_indices[: bucket.bs].tolist()
+        s.replays.append(SimpleNamespace(
+            pages=s.pages, offsets=s.offsets, positions=s.positions, pool_slots=s.pool_slots,
+            table_ids=getattr(s, "table_ids", None),
+        ))
+        if planner is not None:
+            planner.commit_in_graph(s.captured)
     res["kv"].commit(s.kv, ctx)
     res["pool"].commit(s.pool, ctx)
     res["rope"].commit(s.rope, ctx)
@@ -184,14 +241,19 @@ def _replay(res, planner, s, promote=True):
     return s
 
 
-def _setup(prompts: dict[int, int], cpu_offload_pages: int = 0, max_num_pages: int = 64, pool_slots: int = 9):
-    """The same requests prefilled on resident resources and on a host-planned reference."""
-    live = _resources(cpu_offload_pages, max_num_pages, pool_slots)
-    ref = _resources(cpu_offload_pages, max_num_pages, pool_slots)
+def _setup(
+    prompts: dict[int, int], cpu_offload_pages: int = 0, max_num_pages: int = 64, pool_slots: int = 9,
+    longrope: bool | None = None,
+):
+    """The same requests prefilled on resident resources and on a host-planned
+    reference. With ``longrope``, each request's prompt length picks its table;
+    left None, the module's LongRoPE pass alternates each handle's table."""
+    live = _resources(cpu_offload_pages, max_num_pages, pool_slots, longrope)
+    ref = _resources(cpu_offload_pages, max_num_pages, pool_slots, longrope)
     planner = ResidentPlanner("n", {WALK}, {k: live[k] for k in ("kv", "pool", "rope")}, CPU, max_bs=4)
     for res in (live, ref):
         for rid, n in prompts.items():
-            _ingest(res, rid)
+            _ingest(res, rid, n if longrope else None)
             _host_step(res, [rid], [n])
     return live, ref, planner
 
@@ -201,6 +263,8 @@ def _same(a, b, real: int):
     assert a.offsets[:real] == b.offsets[:real]
     assert a.positions[:real] == b.positions[:real]
     assert a.pool_slots[:real] == b.pool_slots[:real]
+    if hasattr(b, "table_ids"):
+        assert a.table_ids[:real] == b.table_ids[:real]
 
 
 def _row(planner: ResidentPlanner, live, rid: int):
@@ -245,6 +309,77 @@ def test_steps_with_crossings_match_the_host_plan_and_the_host_lengths():
         assert tables.host_cols[slot] == live["kv"]._streams[rid]["main"].stored_len // PAGE + (
             1 if live["kv"]._streams[rid]["main"].stored_len % PAGE else 0
         )
+
+
+@pytest.mark.parametrize("repeats", [2, 3, PAGE], ids=lambda n: f"{n}_replays")
+def test_a_repeated_step_addresses_each_replay_as_host_plans_would(repeats):
+    """Every replay of a step that repeats writes and attends where a host plan
+    of that iteration would, page crossings included, with no host work between
+    replays; the host's mirrors then stand where the stream does."""
+    # 17 is past LongRoPE's original length, so request 2 starts on the long table
+    live, ref, planner = _setup({1: 3, 2: 17, 3: 8}, longrope=True)
+    rids = [1, 2, 3]
+    for t in range(6):
+        a = _captured_step(live, planner, rids, slot=t % 2, bs=4, repeats=repeats)
+        for i, replay in enumerate(a.replays):
+            b = _captured_step(ref, None, rids, slot=(t + i) % 2, bs=4)
+            assert (replay.offsets[:3], replay.positions[:3]) == (b.offsets[:3], b.positions[:3])
+            if replay.table_ids is not None:  # each replay's table row advances with its position
+                assert replay.table_ids[:3] == b.table_ids[:3]
+            # a run reserves ahead, so its page numbers aren't the host's: each is the row's own
+            for row, rid in enumerate(rids):
+                page = live["kv"]._streams[rid]["main"].page_indices[replay.positions[row] // PAGE]
+                assert replay.pages[row] == page
+    tables = live["kv"]._resident
+    for rid in rids:
+        _assert_row(planner, live, rid)
+        assert tables.host_len[planner.slot_of(rid)] == live["kv"]._streams[rid]["main"].stored_len
+
+
+def test_a_repeat_feeds_each_replay_the_last_one_s_token_and_keeps_a_column_per_replay():
+    """A replay overwrites its stop buffers and reads its static input, so a step
+    that repeats hands each replay the token before it and keeps every one."""
+    tokens = torch.tensor([5, 7])
+    ids = torch.zeros(2, 1, dtype=torch.long)
+
+    class Graph:
+        def replay(self):
+            tokens.copy_(ids.reshape(-1) + 1)
+
+    outputs = BatchedModelOutput(check_stop_buffers={"new_token": tokens, "text_inputs": tokens})
+    slot = SimpleNamespace(run=None, graph=Graph(), static_inputs={"input_ids": ids}, static_outputs=outputs)
+    runner = AcceleratorGraphRunner.__new__(AcceleratorGraphRunner)
+    runner.slot_for = lambda lease: slot
+    runner._repeat_carries = {WALK: {"new_token": "input_ids"}}
+    lease = SimpleNamespace(bucket=SimpleNamespace(graph_walk=WALK))
+    wide = runner.repeat(lease, outputs, 3).check_stop_buffers
+    assert wide["new_token"].tolist() == [[5, 6, 7], [7, 8, 9]]
+    assert wide["text_inputs"] is wide["new_token"]
+
+    # a walk that never accepted repeats can't run several: every resource would commit them
+    runner._repeat_carries = {}
+    assert runner.repeat(lease, outputs, 1) is outputs
+    with pytest.raises(ValueError, match="never accepted repeats"):
+        runner.repeat(lease, outputs, 3)
+
+
+@pytest.mark.parametrize("repeats", [1, 3], ids=lambda n: f"{n}_replays")
+def test_a_row_a_host_step_moved_does_not_rewind_on_each_replay(repeats):
+    """A one-token host step leaves a row's length to be refreshed. A run after
+    it refreshes it once, not at the head of every replay; a one-iteration step
+    writes it as a cell on the graph's scatter, with nothing to flush."""
+    live, ref, planner = _setup({1: 5})
+    _captured_step(live, planner, [1], slot=0, bs=1)
+    _captured_step(ref, None, [1], slot=0, bs=1)
+    step, ctx = _host_step(live, [1], [1], walk=WALK)
+    planner.commit(step, ctx)
+    _host_step(ref, [1], [1], walk=WALK)
+    a = _captured_step(live, planner, [1], slot=1, bs=1, repeats=repeats)
+    for i, replay in enumerate(a.replays):
+        b = _captured_step(ref, None, [1], slot=(1 + i) % 2, bs=1)
+        assert (replay.offsets[:1], replay.positions[:1]) == (b.offsets[:1], b.positions[:1])
+    if repeats == 1:
+        assert not a.ctx.resident_plan.writes.rows, "a one-iteration step flushed a run the scatter writes as a cell"
 
 
 def test_a_steady_batch_keeps_its_row():
@@ -362,6 +497,29 @@ def test_a_position_offset_carries_through_a_row():
     b = _captured_step(ref, None, [1], slot=0, bs=1)
     _same(a, b, 1)
     assert a.positions[0] == 6
+
+
+def test_longrope_rows_read_their_own_half_of_the_table():
+    """Short and long requests side by side, each row's table id on its own half:
+    through page crossings, a row joining, and rows trading places, so a slot's
+    neighbour reads the other half."""
+    prompts = {1: 3, 2: 17, 3: 8, 4: 20}
+    long = {rid for rid, n in prompts.items() if LONGROPE.is_long(n)}
+    assert long == {2, 4}
+    live, ref, planner = _setup({rid: prompts[rid] for rid in (1, 2, 3)}, longrope=True)
+    batches = [[1, 2, 3]] * 6 + [[2, 1, 4, 3]] * 6 + [[4, 3, 2, 1]] * 6
+    for t, rids in enumerate(batches):
+        if t == 6:
+            for res in (live, ref):
+                _ingest(res, 4, prompts[4])
+                _host_step(res, [4], [prompts[4]])
+        a = _captured_step(live, planner, rids, slot=t % 2, bs=4)
+        b = _captured_step(ref, None, rids, slot=t % 2, bs=4)
+        _same(a, b, len(rids))
+        half = [MAX_SEQ_LEN if rid in long else 0 for rid in rids]
+        assert a.table_ids[: len(rids)] == [p + h for p, h in zip(a.positions[: len(rids)], half, strict=True)]
+        # a padding row reads the trash row, in range of the table
+        assert all(0 <= i < 2 * MAX_SEQ_LEN for i in a.table_ids)
 
 
 def test_a_chunked_prefill_row_is_whole_at_its_first_decode_step():
@@ -633,7 +791,7 @@ def test_the_graph_built_page_arrays_match_the_host_lengths_and_the_block_table(
         host_len[slot] = n
     tables = SimpleNamespace(host_len=host_len, page_size=page, key="kv", _qo_indptr={})
     streams = {"kv": SimpleNamespace(reads=not appends)}
-    plan = SimpleNamespace(slots=torch.tensor(order).numpy(), writes=SimpleNamespace(streams=streams))
+    plan = SimpleNamespace(slots=torch.tensor(order).numpy(), writes=SimpleNamespace(streams=streams), repeats=1)
     want = KVResidentTables.decode_indptrs(tables, plan, bs)
     assert attn._paged_kv_indptr_buf.tolist() == want.paged_kv_indptr.tolist()
     assert attn._paged_kv_last_page_len_buf.tolist() == want.paged_kv_last_page_len.tolist()
@@ -642,6 +800,23 @@ def test_the_graph_built_page_arrays_match_the_host_lengths_and_the_block_table(
     pages += [[SINK_PAGE]] * (bs - len(order))
     end = int(want.paged_kv_indptr[-1])
     assert attn._paged_kv_indices_buf[:end].tolist() == [p for row in pages for p in row]
+
+@pytest.mark.parametrize("reads", [False, True], ids=["appends", "reads"])
+def test_a_step_that_repeats_plans_its_schedule_for_its_last_replay(reads):
+    """The graph builds each replay's page arrays, but the host plans the
+    schedule once: for the longest rows, which a shorter replay's lengths fit."""
+    from mstar.engine.resources.kv.resident import KVResidentTables
+
+    tables = SimpleNamespace(host_len=torch.tensor([0, 15, 3]).numpy(), page_size=16, key="kv", _qo_indptr={})
+    streams = {"kv": SimpleNamespace(reads=reads)}
+    plan = SimpleNamespace(slots=torch.tensor([1, 2]).numpy(), writes=SimpleNamespace(streams=streams), repeats=4)
+
+    got = KVResidentTables.decode_indptrs(tables, plan, 3)
+
+    # the padding row reads its one sink token
+    assert got.kv_lens.tolist() == ([15, 3, 1] if reads else [19, 7, 1])
+    assert got.paged_kv_indptr.tolist() == ([0, 1, 2, 3] if reads else [0, 2, 3, 4])
+
 
 # ---- slots ----
 
@@ -731,6 +906,9 @@ def _assert_step_read_its_streams(live, s, rids) -> None:
         assert s.offsets[i] == wrote % PAGE
         assert s.positions[i] == live["rope"].position(rid, "main") - 1
         assert s.pool_slots[i] == live["pool"]._slots[rid]["main"].index
+        rope = live["rope"]
+        if isinstance(rope, LongRopeManager):
+            assert s.table_ids[i] == s.positions[i] + (MAX_SEQ_LEN if rid in rope._long_rids else 0)
 
 
 def _assert_held_rows(planner, live) -> None:
@@ -1004,7 +1182,7 @@ def test_a_stream_wider_than_a_row_raises():
     with pytest.raises(ValueError, match="fit a block table row"):
         tables.row(9, [1, 2, 3], 1, [0] * planner.narrow_cols, writes)
     plan = SimpleNamespace(
-        slots=torch.tensor([1]).numpy(), rids=(7,), taken=set(), writes=writes, crossed={}, moved=set(),
+        repeats=1, slots=torch.tensor([1]).numpy(), rids=(7,), taken=set(), writes=writes, crossed={}, moved=set(),
     )
     tables.host_len[1], tables.host_cols[1] = 8, 2
     with pytest.raises(ValueError, match="fit a block table row"):
@@ -1190,7 +1368,9 @@ def _refused_worker(engine, line):
     ``line`` the requests in the order a step reaches them."""
     pushed = []
     worker = make_worker(
-        graph_runtime=SimpleNamespace(push_back_node=lambda node, rids, graphs: pushed.append(rids)),
+        graph_runtime=SimpleNamespace(
+            push_back_node=lambda node, rids, graphs: pushed.append(rids), get_rid_string=str,
+        ),
         engine_manager=SimpleNamespace(get_engine=lambda node: engine),
         scheduler=SimpleNamespace(
             could_refill=lambda *a: False,
@@ -1662,6 +1842,7 @@ class _Fmha:
 
     plans_in_graph = True
     supports_gather_resident = False
+    supports_repeats = True
 
     def __init__(self):
         self.calls = []
@@ -1819,6 +2000,35 @@ def test_a_resource_without_a_table_refuses():
     assert planner is None and "_Spare keeps no resident table" in why
 
 
+def test_a_sequence_shard_leaves_the_node_resident():
+    """Qwen3.5 declares its shard at every SP size, and Cosmos3-Edge's reasoner shares the dit's
+    (#1295): the shard holds no per-request state and never splits a one-token-a-row step, so it
+    costs no node its resident decode, at one SP rank or more. Its steps replay on the tables and
+    plan copied."""
+    res = _resources()
+    res["shard"] = SequenceShard(("main",), 0, None, 0, CommGroup.trivial())
+    planner, why = _build({k: res[k] for k in ("kv", "pool", "rope", "shard")})
+    assert planner is not None and why == ""
+    _ingest(res, 1)
+    _host_step(res, [1], [3])
+    s = _captured_step(res, planner, [1], 0, 2)
+    assert s.positions[0] == 3
+    assert not res["shard"].plan(ResourceStep(segments=s.kv.segments), s.ctx).split
+    planner, why = _build({"shard": SequenceShard(("main",), 0, None, 0, SimpleNamespace(world_size=2))})
+    assert planner is not None and why == ""
+
+
+def test_gdn_on_a_node_whose_steps_split_refuses():
+    """Resident decode beside split prefills is untested, so a GDN node whose steps split plans on the host."""
+    from mstar.engine.resources.linear_attn.gdn import GDNManager
+
+    manager = GDNManager.__new__(GDNManager)
+    manager._shard = None
+    assert manager.resident_refusal() is None
+    manager._shard = SimpleNamespace(group=SimpleNamespace(world_size=2))
+    assert "split over 2 SP ranks" in manager.resident_refusal()
+
+
 def test_a_pool_shared_with_a_host_planned_node_builds():
     res = _resources()
     planner, why = _build({"kv": res["kv"]}, nodes={"kv": ("n", "m")})
@@ -1847,6 +2057,15 @@ def test_a_pool_read_across_nodes_refuses():
     res["kv"]._needs_remote_transfer = True
     planner, why = _build({"kv": res["kv"]})
     assert planner is None and "across nodes" in why
+
+
+def test_a_context_parallel_pool_refuses():
+    """Its write addresses are this rank's slots of each page (`ContextParallel.write_slots`), which
+    the resident gather, at the logical page size, would not give."""
+    res = _resources()
+    res["kv"].kv_cache.placement = TPPlacement(2, 0, None, (0, 1))
+    planner, why = _build({"kv": res["kv"]})
+    assert planner is None and "context-parallel" in why
 
 
 def test_the_mla_layout_refuses():
@@ -2147,3 +2366,16 @@ def test_a_cross_attention_without_a_query_pool_plans_on_the_host():
     step = SimpleNamespace(streams={}, host_planned=False, bucket=None, slot=0, lengths_only=set())
     manager.resident_gather(step)
     assert step.host_planned and not step.lengths_only
+
+
+def test_a_walk_repeats_only_if_every_captured_wrapper_says_it_sees_each_replays_lengths():
+    from mstar.engine.resources.attn.wrappers import FlashInferPrefillWrapper
+
+    fmha = _fmha_manager("kv", _Fmha())
+    fmha._repeat_walks = {}
+    ctx = SimpleNamespace(graph_walk=WALK)
+    assert fmha.max_repeats(None, ctx) > 1
+    # a prefill wrapper's host plan fixes the lengths its replays see
+    prefill = _fmha_manager("kv", FlashInferPrefillWrapper.__new__(FlashInferPrefillWrapper))
+    prefill._repeat_walks = {}
+    assert prefill.max_repeats(None, ctx) == 1

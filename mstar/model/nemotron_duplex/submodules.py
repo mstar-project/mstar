@@ -550,11 +550,12 @@ class EarTTSTalkerSubmodule(ARNodeSubmodule):
         ]
         return SubmoduleStep(
             segments=segments,
+            combined_labels={("main", "uncond"): TALKER_CFG_LABEL},
             # the same answer as cg_key_info(): a warm-up prefill in the batch
             # keeps the step off the fixed-shape decode capture
             cg_key_info=None if any(inp.kwargs.get("first") for inp in inputs) else self.DECODE_KEY,
             steps={
-                TALKER_KV: KVStep(combined_labels={("main", "uncond"): TALKER_CFG_LABEL}),
+                TALKER_KV: KVStep(),
                 TALKER_ATTN: AttentionStep(causal=True),
                 TALKER_POS: PositionStep(),
                 # one decoded frame per session, a slot each

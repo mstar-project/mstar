@@ -95,6 +95,10 @@ class _Runtime:
     def get_rid_handle(wire_rid):
         return wire_rid
 
+    @staticmethod
+    def get_rid_string(handle):
+        return handle
+
     def _names(self, target, node_name, walk):
         return target[0] == node_name and target[1] in (
             walk, self.combined_walk_of.get((node_name, walk)),

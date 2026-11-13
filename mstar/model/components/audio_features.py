@@ -334,9 +334,14 @@ class NemoLogMel:
         pad = self.n_fft // 2
         device = self.window.device
         source = waveforms[0].device
-        # host clips are padded straight into pinned memory: one copy to the device
+        # host clips are padded straight into pinned memory: one copy to the device.
+        # The width is rounded up to whole seconds: cuFFT builds a plan per
+        # (rows, frames) shape (~6 ms on an H100), and at the exact width the
+        # frames were new on almost every served batch. Frames past each clip's
+        # end are cut below
         pin = source.type == "cpu" and DeviceCapability.of(device).pin_memory
-        x = torch.zeros(len(waveforms), max(lengths), dtype=torch.float32, device=source, pin_memory=pin)
+        width = -(-max(lengths) // self.sampling_rate) * self.sampling_rate
+        x = torch.zeros(len(waveforms), width, dtype=torch.float32, device=source, pin_memory=pin)
         for row, w in enumerate(waveforms):
             x[row, :lengths[row]] = w.reshape(-1)
         x = to_device_nonblocking(x, device)
@@ -461,6 +466,25 @@ def load_speech_file(path: str, sample_rate: int, max_seconds: float) -> torch.T
     with decoding_upload(path, "the audio", ffmpeg=True):
         waveform, rate = _decode(path, sample_rate, max_seconds)
     return _resample(waveform, rate, sample_rate)
+
+
+def speech_file_rate(path: str) -> int | None:
+    """The upload's own sample rate, from its header (libsndfile's, else FFmpeg's
+    through torchcodec), before anything decodes; None where neither reads it, which
+    `load_speech_file` then refuses. For a model whose front end depends on it."""
+    try:
+        import soundfile
+
+        return int(soundfile.info(path).samplerate)
+    except Exception:  # noqa: BLE001 — not a libsndfile container; ask FFmpeg
+        pass
+    try:
+        from torchcodec.decoders import AudioDecoder
+
+        rate = AudioDecoder(path).metadata.sample_rate
+    except Exception:  # noqa: BLE001 — undecodable: the decode reports it
+        return None
+    return None if rate is None else int(rate)
 
 
 def load_reference_clip(

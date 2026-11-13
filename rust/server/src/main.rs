@@ -280,6 +280,7 @@ async fn main() {
         .with_graceful_shutdown(shutdown_signal())
         .await
         .unwrap();
+    transcription::remove_local_uploads();
 }
 
 /// Exits once the process that launched this one is gone (`mstar serve`
@@ -322,6 +323,7 @@ async fn shutdown_signal() {
     tokio::spawn(async {
         tokio::time::sleep(std::time::Duration::from_secs(30)).await;
         eprintln!("mstar-server: drain deadline reached, exiting");
+        transcription::remove_local_uploads();
         std::process::exit(0);
     });
 }

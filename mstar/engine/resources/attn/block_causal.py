@@ -128,6 +128,11 @@ class PagedBlockCausalWrapper(FlashInferPrefillWrapper):
 class FlashInferBlockCausalManager(FlashInferManager):
     """Attention over a KV pool's rows, block-causally; see ``BlockCausalAttentionSpec``."""
 
+    # its wrappers plan per block, over the pool's whole slots
+    supports_context_parallel = False
+    # and its builder sets no sequence shard, so no exchange routes a split step's tokens to them
+    supports_split_steps = False
+
     def __init__(self, block_size: int, **kwargs):
         super().__init__(**kwargs)
         self._block_size = block_size
