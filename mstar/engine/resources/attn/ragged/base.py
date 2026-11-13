@@ -26,6 +26,7 @@ from mstar.engine.resources.attn.ragged.config import (
     RaggedAttentionSpec,
     RaggedAttnBackend,
     RaggedBlockCausalAttentionSpec,
+    RaggedChunkCausalAttentionSpec,
     RaggedCrossAttentionSpec,
     RaggedCrossAttentionStep,
     RaggedKeyPrefixAttentionSpec,
@@ -241,6 +242,50 @@ class RaggedKeyPrefixAttnManager(AttentionResource):
 
             return _build_ragged(spec, info, FlashInferRaggedKeyPrefixManager)
         raise ValueError(f"Unknown ragged key-prefix attention backend {backend!r}")
+
+
+class RaggedChunkCausalAttnManager(AttentionResource):
+    """Cacheless teacher-forcing attention over a chunked two-stream layout; see
+    ``RaggedChunkCausalAttentionSpec``."""
+
+    prefix_skip_safe = True
+
+    @classmethod
+    def build(cls, spec: RaggedChunkCausalAttentionSpec, info: EngineResourceInfo):
+        config = spec.config
+        if config.backend is not RaggedAttnBackend.AUTO:
+            # FlashInfer, FA3 and cuDNN take a key range (or page list) per query
+            # block, which cannot say that a key is visible to one stream's
+            # queries in a block and not the other's
+            raise ValueError(
+                f"chunk-causal attention {spec.resource_key!r} runs flex_attention only; "
+                f"backend must be 'auto', got {config.backend.value!r}"
+            )
+        # fields of the shared config that only FlashInfer's managers read: refused
+        # rather than ignored, so a declaration never silently means nothing
+        ignored = [
+            name for name, value in (
+                ("flashinfer_backend", config.flashinfer_backend),
+                ("compile_op", config.compile_op or None),
+                ("workspace_mb", config.workspace_mb),
+            ) if value is not None
+        ]
+        if ignored:
+            raise ValueError(
+                f"chunk-causal attention {spec.resource_key!r} runs flex_attention, which "
+                f"does not read {', '.join(ignored)}"
+            )
+        from mstar.engine.resources.attn.ragged.chunk_causal import (
+            FlexChunkCausalManager,
+            full_blocks_for_backend,
+            resolve_mask_block_size,
+        )
+
+        return _build_ragged(
+            spec, info, FlexChunkCausalManager,
+            block_size=resolve_mask_block_size(spec.mask_block_size, info.device),
+            full_blocks=full_blocks_for_backend(),
+        )
 
 
 # Live managers by op key, which is how the custom op below names one: an op

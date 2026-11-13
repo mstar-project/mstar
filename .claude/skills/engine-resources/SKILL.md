@@ -21,6 +21,7 @@ Entries marked *open PR* are not on `main` yet. Check the checkout; if your port
 | attention within one forward, no cache | `RaggedAttentionSpec` | block-diagonal per span, optionally causal |
 | | `RaggedCrossAttentionSpec` | one contiguous key range per query segment |
 | | `RaggedBlockCausalAttentionSpec` (#381) | each block attends its span's prefix of blocks |
+| | `RaggedChunkCausalAttentionSpec` | teacher forcing over `[global \| noised \| clean]` chunks: clean block-causal, noised block-diagonal, noised reads earlier clean chunks; flex_attention over a planned `BlockMask` |
 | a block-causal stream, running only new tokens | paged KV + `BlockCausalAttentionSpec` | a row's new tokens attend its cached blocks and their own |
 | a fixed-size cache per request: a sink plus a sliding window, optionally after a shared read-only prefix | bounded KV (`BoundedKVSpec`, #816) | rows at any position in one batch; per-row source; a per-distance score term |
 | a sink plus a sliding window for long chunks (a causal video DiT), attended by the model's own kernel | rolling KV (`RollingKVSpec`) | the window kept compacted, so a step's keys are one contiguous slice for a ragged kernel; per-request sink and window in tokens, each request an exact-size region of a pool reserved at startup; no attention of its own, eager only |
