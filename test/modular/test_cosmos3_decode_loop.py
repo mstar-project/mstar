@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 from test_streaming_consumer_loop import RUNTIMES
+from test_streaming_consumer_loop_served import CASES, _Served
 
 pytest.importorskip("diffusers")
 
@@ -64,6 +65,29 @@ def test_a_whole_video_is_the_streamed_windows_joined(monkeypatch, frames):
     joined = torch.cat([out["video_output"][0] for out in streamed if "video_output" in out])
     assert joined.shape[0] == frames
     assert torch.equal(whole[-1]["video_output"][0], joined), "the assembled video left the streamed frames"
+
+
+def test_the_first_window_decodes_on_the_request_as_the_worker_opens_it(monkeypatch, tmp_path):
+    """A worker counts a loop's iterations onto a request after each step of its partition, and the decoder's first
+    step is its loop's first iteration, so the first window comes with no count. Read as one that must be there, it
+    failed every served windowed request."""
+    served = _Served(tmp_path, CASES["cosmos3"])
+    served._produce()
+    served.worker.ingest.poll_stream_buffers()
+    info = served.worker.request_state.get_fwd_info(served.rid, served.consumer_partition)
+    info.step_metadata = {"num_windows": 2, "overlap_latent_units": 2, "num_frames": 77, "stream_video": True}
+    sub = _decoder(monkeypatch, _tiny_vae())
+    first, second = _windows(_stream(20))[:2]
+    inputs = sub.prepare_inputs(C.VIDEO_DECODE_AR_WALK, info, {"window_latents": [first]})
+    assert inputs.kwargs["window"] == 0
+    engine_inputs = SimpleNamespace(request_ids=[served.rid], per_request_info={served.rid: info})
+    out = sub.forward(C.VIDEO_DECODE_AR_WALK, engine_inputs, **inputs.tensor_inputs, **inputs.kwargs)
+    assert out["video_output"][0].shape[0] > 0, "the first window would send no frame"
+    served._step(served.reader)
+    served.rt.update_dynamic_loop_iters({served.rid: info}, served.consumer_partition)
+    edges = {name: out[name] for name in EDGES if name in out}
+    inputs = sub.prepare_inputs(C.VIDEO_DECODE_AR_WALK, info, {"window_latents": [second], **edges})
+    assert inputs.kwargs["window"] == 1, "the second window would decode as the stream's first"
 
 
 @RUNTIMES
