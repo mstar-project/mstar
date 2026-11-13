@@ -30,6 +30,7 @@ from mstar.engine.state import (
     TensorType,
     Value,
     kimi_delta,
+    settle,
 )
 from mstar.engine.state.adapters import StateSetup, _resolve, build_handle, build_specs
 
@@ -67,9 +68,9 @@ def _entry(**changes: TensorType) -> Entry:
     })
 
 
-def _kda_value(op: KimiDelta | None = None, entry: Entry | None = None) -> Array:
+def _kda_value(op: KimiDelta | None = None, entry: Entry | None = None, span: int = 1) -> Array:
     return Value("kda_state", nodes={"LLM"}, layers={3, 7}, entry=entry or _entry(),
-                 updates={"kda": op or KimiDelta(lower_bound=-5.0)})
+                 updates={"kda": op or KimiDelta(lower_bound=-5.0)}, verify_span=span)
 
 
 def _handle(array: Array, kda) -> tuple:
@@ -90,8 +91,8 @@ def _inputs(tokens: int) -> tuple[torch.Tensor, ...]:
     return torch.randn(tokens, 3 * P), torch.randn(tokens, DIM), torch.randn(tokens, HEADS), torch.randn(tokens, DIM)
 
 
-def _open(h, segments, ctx=None) -> SubmoduleStep:
-    step = SubmoduleStep(segments=list(segments), state={h.name: ArrayStep()})
+def _open(h, segments, ctx=None, verify=False) -> SubmoduleStep:
+    step = SubmoduleStep(segments=list(segments), state={h.name: ArrayStep(verify=verify)})
     step.set_ctx(ctx or StepContext(request_ids=[s.request_id for s in segments], graph_walk="decode", slot=0,
                                     capture=False))
     h.begin_step(step)
@@ -162,21 +163,25 @@ def test_kimi_delta_refuses_weights_its_gate_flag_disagrees_with(full_rank, weig
     assert str(refused.value).endswith(f"and got {wrong}"), "the refusal names each disagreeing argument"
 
 
-def _kda_manager() -> KDAManager:
+def _geometry() -> DeltaNetGeometry:
+    return DeltaNetGeometry(num_k_heads=HEADS, num_v_heads=HEADS, head_k_dim=DIM, head_v_dim=DIM,
+                            conv_kernel_size=KERNEL)
+
+
+def _kda_manager(speculative_tokens: int = 0) -> KDAManager:
     """On the CPU, so on the torch kernels."""
-    geometry = DeltaNetGeometry(num_k_heads=HEADS, num_v_heads=HEADS, head_k_dim=DIM, head_v_dim=DIM,
-                                conv_kernel_size=KERNEL)
     config = LinearAttnConfig(recurrent_state="kda_state", variant=LinearAttnVariant.KDA)
-    return KDAManager(config, geometry, num_layers=2, state_dtype=torch.float32, device=CPU, conv_dtype=torch.float32)
+    return KDAManager(config, _geometry(), num_layers=2, state_dtype=torch.float32, device=CPU,
+                      conv_dtype=torch.float32, speculative_tokens=speculative_tokens)
 
 
-def _plan(pool, kda, spans, walk) -> tuple[list[Segment], StepContext, RecurrentStep]:
+def _plan(pool, kda, spans, walk, verify=False) -> tuple[list[Segment], StepContext, RecurrentStep]:
     segments = [Segment(rid, "main", span) for rid, span in zip("ab", spans, strict=False)]
     ctx = StepContext(request_ids=[segment.request_id for segment in segments], graph_walk=walk, slot=0, capture=False)
     pool_step = RecurrentStep(segments=tuple(segments))
     assert pool.admit(pool_step, ctx).ok
     ctx.plan_results["kda_state"] = pool.plan(pool_step, ctx)
-    kda.plan(LinearAttnStep(segments=tuple(segments)), ctx)
+    kda.plan(LinearAttnStep(segments=tuple(segments), speculative=verify), ctx)
     return segments, ctx, pool_step
 
 
@@ -224,3 +229,40 @@ def test_a_kda_value_stores_its_state_k_last():
     h.write(3, state=state)
     slot = int(ctx.plan_results["kda_state"]["main"].slot_indices[0])
     assert torch.equal(pool.block("state", 0)[slot], state[0].transpose(-1, -2)), "the kernels read state K-last"
+
+
+def test_a_value_s_verify_span_sizes_its_verify_blocks():
+    blocks = _geometry().to_blocks(conv_dtype=torch.float32, speculative_tokens=2)
+    want = {name: block for name, block in blocks.items() if name.startswith("spec_")}
+    for span, verify in ((3, want), (1, {})):
+        specs = build_specs([_kv(), _kda_value(span=span)], kernel_settings={"kda_state": {"max_slots": 4}})
+        (config,) = (spec.config for spec in specs if spec.resource_key == "kda_state")
+        got = {name: block for name, block in config.blocks.items() if name.startswith("spec_")}
+        assert got == verify, f"verify_span {span} keeps the verify blocks of {span - 1} drafts"
+
+
+def test_a_kda_settle_writes_the_count_and_flips_the_side():
+    torch.manual_seed(0)
+    weights, kda = _weights(), _kda_manager(speculative_tokens=2)
+    h, pool = _handle(_kda_value(span=3), kda)
+    for rid in "ab":
+        pool.ingest_request(rid)
+    slots = None
+    for spans, walk, kept, side in (((2, 2), "prefill", None, None), ((3, 3), "decode", [2, 1], 1),
+                                    ((3, 3), "decode", [3, 3], 0)):
+        verify = kept is not None
+        qkv, g, beta, gate = _inputs(sum(spans))
+        segments, ctx, pool_step = _plan(pool, kda, spans, walk, verify=verify)
+        slots = slots or [int(i) for i in ctx.plan_results["kda_state"]["main"].slot_indices]
+        step = _open(h, segments, ctx, verify=verify)
+        for layer in (3, 7):
+            kimi_delta(h, layer, qkv, g, beta, weights, gate=gate)
+        if verify:
+            settle(h, torch.tensor(kept))
+        h.check_step(step)
+        h.end_step(step)
+        kda.commit(LinearAttnStep(segments=tuple(segments), speculative=verify), ctx)
+        pool.commit(pool_step, ctx)
+        if verify:
+            assert pool.block("spec_len")[slots, 0].tolist() == kept, "settle writes each row's kept count"
+            assert pool.block("spec_side")[slots, 0].tolist() == [side] * 2, "and flips the side the next step reads"
