@@ -5,6 +5,7 @@ alignment, the keyframes' noise level) is below, named for diffusers' constants.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import math
 from dataclasses import dataclass, field
@@ -245,6 +246,59 @@ class H3AudioVAEConfig:
         return config
 
 
+# A distilled release's sampling contract (FastVideo's FastH3), beside its diffusers-layout transformer.
+DISTILLED_CONTRACT = "fastvideo_inference.json"
+DISTILLED_PATTERNS = [DISTILLED_CONTRACT, "transformer/*", "scheduler/*", "audio_scheduler/*"]
+# diffusers' MiniMaxH3Transformer3DModel config names -> H3TransformerConfig's
+_DIFFUSERS_CONFIG_NAMES = {
+    "num_refiner_layers": "token_refiner_num_layers", "ffn_dim": "ffn_hidden_size", "in_channels": "latents_dim",
+    "audio_in_channels": "audio_latents_dim", "freq_dim": "timestep_input_dim",
+    "time_embed_hidden_dim": "time_embed_hidden_size", "rope_freq_dim": "rope_inv_freq_len",
+}
+
+
+@dataclass(frozen=True)
+class H3Distilled:
+    """A few-step distilled H3 DiT (FastVideo's FastH3 8-Step V2): its transformer in diffusers'
+    layout, sampled without guidance on the rungs and shifts it was trained for (one forward per
+    rung, ``schedule.rung_sigmas``). Text to audio+video only: the keyframe tasks were not distilled."""
+
+    transformer: Path            # the diffusers-layout transformer directory
+    rungs: tuple[int, ...]       # dmd_denoising_steps
+    video_shift: float
+    audio_shift: float
+
+    @classmethod
+    def from_dir(cls, root: Path, base: H3TransformerConfig) -> "H3Distilled":
+        """Read the release at ``root``; refuse one whose recipe this port doesn't sample or whose
+        transformer isn't ``base``'s architecture."""
+        root = Path(root)
+        contract = json.loads((root / DISTILLED_CONTRACT).read_text())
+        rungs = contract.get("dmd_denoising_steps")
+        if not isinstance(rungs, list) or not rungs:
+            raise ValueError(f"{root / DISTILLED_CONTRACT}: no dmd_denoising_steps")
+        if contract.get("task") != "t2av":
+            raise ValueError(f"{root}: distilled for task {contract.get('task')!r}; only t2av is supported")
+        if float(contract.get("guidance_scale", 1.0)) != 1.0:
+            raise ValueError(f"{root}: guidance_scale {contract['guidance_scale']}; a distilled H3 runs without CFG")
+        if int(contract.get("transformer_forwards", len(rungs))) != len(rungs):
+            raise ValueError(f"{root}: {contract['transformer_forwards']} transformer forwards for {len(rungs)} rungs")
+        shifts = []
+        for modality, scheduler in (("video", "scheduler"), ("audio", "audio_scheduler")):
+            shift = float(contract[f"{modality}_scheduler_shift"])
+            config = root / scheduler / "scheduler_config.json"
+            if config.exists() and float(json.loads(config.read_text()).get("shift", shift)) != shift:
+                raise ValueError(f"{root}: {scheduler}'s shift disagrees with {DISTILLED_CONTRACT}'s {shift}")
+            shifts.append(shift)
+        dit = json.loads((root / "transformer" / "config.json").read_text())
+        arch = {_DIFFUSERS_CONFIG_NAMES.get(k, k): tuple(v) if isinstance(v, list) else v for k, v in dit.items()}
+        differ = {k: (v, getattr(base, k)) for k, v in arch.items()
+                  if k in base.__dataclass_fields__ and v != getattr(base, k)}
+        if differ:
+            raise ValueError(f"{root}: the distilled transformer is not the base DiT's architecture: {differ}")
+        return cls(root / "transformer", tuple(int(r) for r in rungs), shifts[0], shifts[1])
+
+
 @dataclass
 class H3Config:
     transformer: H3TransformerConfig = field(default_factory=H3TransformerConfig)
@@ -266,6 +320,19 @@ class H3Config:
     mrope_section: tuple[int, ...] = (24, 20, 20)
     # the text encoder's positions: the longest prompt the reference can encode
     text_max_positions: int = TEXT_MAX_POSITIONS
+    # a few-step distilled DiT in place of FL2VA's (``with_distilled``)
+    distilled: H3Distilled | None = None
+
+    def with_distilled(self, root: Path) -> "H3Config":
+        """This config with the distilled release at ``root``'s DiT and its recipe's shifts."""
+        distilled = H3Distilled.from_dir(root, self.transformer)
+        return dataclasses.replace(self, distilled=distilled, video_shift=distilled.video_shift,
+                                   audio_shift=distilled.audio_shift)
+
+    @property
+    def dit_source(self) -> Path | None:
+        """The diffusers-layout transformer to load instead of FL2VA's, if any."""
+        return None if self.distilled is None else self.distilled.transformer
 
     @classmethod
     def from_snapshot(cls, snapshot: Path) -> "H3Config":

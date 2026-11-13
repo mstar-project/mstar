@@ -398,7 +398,9 @@ class H3DenoiseSubmodule(H3PackedDenoise):
 
     def schedule_settings(self, fwd_info: CurrentForwardPassInfo) -> ScheduleArgs:
         meta = fwd_info.step_metadata
-        return ScheduleArgs(int(meta["num_inference_steps"]), float(meta["video_shift"]), float(meta["audio_shift"]))
+        rungs = None if self.config.distilled is None else self.config.distilled.rungs
+        return ScheduleArgs(int(meta["num_inference_steps"]), float(meta["video_shift"]), float(meta["audio_shift"]),
+                            rungs)
 
     def schedule_for(self, walk: str, settings: ScheduleArgs, bucket_key: H3Layout) -> H3Schedule:
         return h3_schedule(*settings)
