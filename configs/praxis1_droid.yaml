@@ -63,6 +63,16 @@ openpi:
   images: [observation/exterior_image_1_left, observation/wrist_image_left]
   state: [observation/cartesian_position, observation/gripper_position]
   action_dims: 10
+  metadata:
+    checkpoint: runwayml/praxis-1-droid
+    rig: single_arm
+    max_context_chunks: 0
+    num_steps: 2
+    t_shift: 12.5
+    cfg_scale: 1.0
+    cfg_video_scale: 4.0
+    skip_video_decoder: true
+    attention_backend: triton
 
 # Protocol v2 returns absolute pose-composed command dictionaries. The ready
 # frame identifies the checkpoint and sampler recipe used for this deployment.

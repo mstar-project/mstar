@@ -8,6 +8,7 @@ against the published configs of both checkpoints, with no weights and no GPU.
 
 from __future__ import annotations
 
+import base64
 import json
 from dataclasses import replace
 from pathlib import Path
@@ -19,8 +20,9 @@ import pytest
 import torch
 import yaml
 
-from mstar.api_server.openpi import OpenpiPolicy
+from mstar.api_server.openpi import OpenpiPolicy, unpack
 from mstar.api_server.positronic import PositronicPolicy
+from mstar.api_server.rust_frontend import openpi_facts
 from mstar.conductor.conductor import Conductor
 from mstar.graph.base import GraphNode, Loop, Sequential
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
@@ -214,10 +216,14 @@ def test_droid_session_config_is_sized_and_gated(tmp_path, monkeypatch):
     )
     assert validate_deployment(model, shipped, str(config_path))
     policy = PositronicPolicy.from_config(shipped["positronic"], model)
+    openpi_policy = OpenpiPolicy.from_config(shipped["openpi"], model)
     assert policy.observation_format == "praxis1"
     assert policy.control_mode == "droid_impedance"
     assert policy.meta["checkpoint"] == "runwayml/praxis-1-droid"
     assert policy.meta["max_context_chunks"] == defaults["max_context_chunks"] == 1
+    assert openpi_policy.metadata["max_context_chunks"] == 0
+    # Both Python and Rust send this same packed first WebSocket frame.
+    assert unpack(base64.b64decode(openpi_facts(openpi_policy)["metadata"])) == openpi_policy.metadata
 
     cold = _model(tmp_path, DROID_CONFIG, monkeypatch, max_context_chunks=0)
     with pytest.raises(ValueError, match="no ready Positronic session adapter"):
