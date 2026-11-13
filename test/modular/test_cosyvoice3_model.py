@@ -28,10 +28,19 @@ import yaml
 
 from mstar.api_server.openai import adapters
 from mstar.api_server.openai.protocol import SpeechRequest
+from mstar.engine.resources.position.config import PositionConfig
+from mstar.engine.resources.step import StepContext
+from mstar.engine.state.adapters import node_handles, node_resources
 from mstar.model.base import TensorAndMetadata
 from mstar.model.chatterbox.chatterbox_model import voice_key_for
 from mstar.model.cosyvoice3.components.dit import _SinusEmbedding, chunk_attention_mask
-from mstar.model.cosyvoice3.components.flow import CosyVoice3Flow, CosyVoice3FlowRow, PreLookaheadLayer, ReferenceVoice
+from mstar.model.cosyvoice3.components.flow import (
+    CosyVoice3Flow,
+    CosyVoice3FlowRow,
+    FlowCounts,
+    PreLookaheadLayer,
+    ReferenceVoice,
+)
 from mstar.model.cosyvoice3.components.hift import CausalHiFTGenerator, HiftStreamState, stream_vocode
 from mstar.model.cosyvoice3.components.lm import CosyVoice3LM
 from mstar.model.cosyvoice3.components.sampling import hashed_uniform, ras_sample
@@ -41,7 +50,8 @@ from mstar.model.cosyvoice3.config import (
     LM_ATTN,
     LM_KV,
     LM_LABEL,
-    LM_POS,
+    LM_NODE,
+    RAS_HISTORY,
     SYSTEM_PROMPT,
     CausalHiFTConfig,
     CosyVoice3Config,
@@ -53,15 +63,20 @@ from mstar.model.cosyvoice3.cosyvoice3_model import LM_PARTITION, PROMPT_MODE, T
 from mstar.model.cosyvoice3.submodules import (
     AUDIO_CHUNK,
     DECODE_LOOP,
-    HISTORY,
+    FLOW_COUNTS,
+    HIFT_COUNTS,
+    HIFT_MEL,
     MAX_SPEECH_TOKENS,
     MEL,
     MEL_FINAL,
     MIN_SPEECH_TOKENS,
     PREV_TOKEN,
     PROMPT_TOKENS,
+    RAW_TOKENS,
     SPEECH_TOKENS,
     TEXT_INPUTS,
+    TOKEN2WAV_LOOP,
+    VOICE,
     VOICE_KEY,
     FlowSubmodule,
     HiFTSubmodule,
@@ -70,6 +85,7 @@ from mstar.model.cosyvoice3.submodules import (
     filter_tokens,
 )
 from mstar.model.registry import HF_MODELS, get_model_class
+from mstar.model.submodule_base import engine_step
 from mstar.streaming.chunk_policy import ScheduledLeftContextChunkPolicy
 from mstar.streaming.stream_buffer import StreamBuffer
 from mstar.testing_utils.model import make_model
@@ -78,14 +94,13 @@ CONFIG_PATH = Path(__file__).resolve().parents[2] / "configs" / "cosyvoice3.yaml
 SR = 24_000
 
 
-def _fake_resources():
-    """Chatterbox's CPU stand-ins for the paged KV, attention and position
-    resources (plain RoPE when given no Llama-3 factors, as Qwen2 uses)."""
+def _fakes():
+    """Chatterbox's CPU stand-ins for the paged KV, attention and position resources and a Value's pool."""
     path = Path(__file__).resolve().parents[1] / "chatterbox" / "fake_resources.py"
     spec = importlib.util.spec_from_file_location("cosyvoice3_test_fake_resources", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    return module.FakeT3Resources()
+    return module
 
 
 class _Tokenizer:
@@ -225,7 +240,7 @@ def test_graph_walks_and_partitions(model):
     walks = model.get_graph_walk_graphs()
     assert set(walks) == {"prefill", "prefill_voice", "decode", "token2wav"}
     assert [n.name for n in walks["prefill_voice"].sections] == ["speaker_encoder", "llm"]
-    assert [n.name for n in walks["token2wav"].sections] == ["flow", "hift"]
+    assert [n.name for n in walks["token2wav"].section.sections] == ["flow", "hift"]
     assert walks["decode"].max_iters == model.config.max_speech_tokens
     partitions = {p.name: p for p in model.get_partitions()}
     assert partitions[LM_PARTITION].graph_walks == {"prefill", "prefill_voice", "decode"}
@@ -248,7 +263,7 @@ def test_process_prompt_modes_and_token_limits(model):
     assert torch.equal(zero.new_input_tensors[TEXT_INPUTS][0], expected)
     assert zero.new_input_tensors["ref_audio"][0].shape == clip.shape
     # 2x and 20x the text's 3 tokens; the voice key is the clip's content hash
-    assert {k: v for k, v in zero.metadata.items() if k != "kv_layout"} == {
+    assert {k: v for k, v in zero.metadata.items() if k != "state_layout"} == {
         MIN_SPEECH_TOKENS: 6,
         MAX_SPEECH_TOKENS: 60,
         VOICE_KEY: int(voice_key_for(clip)[0]),
@@ -278,7 +293,7 @@ def test_process_prompt_modes_and_token_limits(model):
     assert (forced.metadata[MIN_SPEECH_TOKENS], forced.metadata[MAX_SPEECH_TOKENS]) == (2, 100)
     # every key the conductor reads back is one the data worker strips from the client
     for out in (zero, cross, instruct, capped, forced):
-        assert set(out.metadata) - {"kv_layout"} <= set(model.INTERNAL_KWARGS)
+        assert set(out.metadata) - {"state_layout"} <= set(model.INTERNAL_KWARGS)
 
 
 @pytest.mark.parametrize(
@@ -810,6 +825,49 @@ def test_ras_respects_blocked_ids_and_is_batch_invariant():
 # -- LM -------------------------------------------------------------------------------
 
 
+def _declaring(cfg: CosyVoice3Config) -> CosyVoice3Model:
+    """A model that declares ``cfg``'s state, loading nothing."""
+    model = object.__new__(CosyVoice3Model)
+    model.config = cfg
+    return model
+
+
+class _LMState:
+    """The LM node's state handles over chatterbox's fakes, and its steps run as the engine runs them."""
+
+    def __init__(self, cfg: CosyVoice3Config):
+        fakes, model = _fakes(), _declaring(cfg)
+        pos = next(spec for spec in node_resources(model) if isinstance(spec.config, PositionConfig))
+        (history,) = [array for array in model.declare_state() if array.name == RAS_HISTORY]
+        self.kv_attn = fakes.FakeKVAttention()
+        self.pos = fakes.FakePositionManager(pos.config)
+        self.history = fakes._FakeStreamPool(history.entry.tensors)
+        resources = {
+            LM_KV: self.kv_attn, LM_ATTN: self.kv_attn, pos.resource_key: self.pos, RAS_HISTORY: self.history,
+        }
+        self.handles = node_handles(model, LM_NODE, resources)
+
+    def run(self, sub: LMSubmodule, walk: str, rids: list[int], prepared: list):
+        """One step of ``rids``: declared, planned on the fakes and open for its forward's calls."""
+        step = engine_step(sub, graph_walk=walk, request_ids=rids, inputs=prepared)
+        step.set_ctx(StepContext(request_ids=rids, graph_walk=walk, slot=None, capture=False))
+        seq_lens = [p.input_seq_len for p in prepared]
+        self.kv_attn.plan(seq_lens)
+        self.pos.plan(seq_lens)
+        self.history.rows = tuple(rids)
+        step.begin_calls()
+        out = sub.forward_batched(walk, None, **sub.preprocess(walk, None, prepared))
+        step.check_calls()
+        step.commit_calls()
+        step.end_calls()
+        return out
+
+    def reset(self) -> None:
+        self.kv_attn.reset()
+        self.pos.reset()
+        self.history.slots.clear()
+
+
 def _lm(cfg: CosyVoice3Config, seed: int = 0):
     torch.manual_seed(seed)
     lm = CosyVoice3LM(cfg.lm).eval()
@@ -817,9 +875,9 @@ def _lm(cfg: CosyVoice3Config, seed: int = 0):
         # the layers allocate without initialising (the checkpoint fills them)
         for name, param in lm.named_parameters():
             param.fill_(1.0) if "norm" in name else param.normal_(0, 0.1)
-    res = _fake_resources()
-    res.bind(lm, LM_ATTN, LM_KV, LM_POS)
-    return LMSubmodule(lm, cfg), res
+    sub, res = LMSubmodule(lm, cfg), _LMState(cfg)
+    sub.bind_node_state(res.handles)
+    return sub, res
 
 
 def _info(rid: int, seed: int, limits=(0, 30), **knobs):
@@ -834,7 +892,9 @@ def _info(rid: int, seed: int, limits=(0, 30), **knobs):
         "ignore_eos": False,
         **knobs,
     }
-    return SimpleNamespace(rid_handle=rid, request_id=rid, random_seed=seed, step_metadata=meta)
+    return SimpleNamespace(
+        rid_handle=rid, request_id=rid, random_seed=seed, step_metadata=meta, dynamic_loop_iter_counts={DECODE_LOOP: 0},
+    )
 
 
 def _rows(out, rids) -> dict:
@@ -846,21 +906,20 @@ def _lm_run(sub, res, requests: dict, steps: int, **knobs) -> dict[int, list[int
     """Prefill every request together, then batched decode steps until one stops."""
     rids = list(requests)
     infos = {rid: _info(rid, requests[rid][1], limits=requests[rid][0]["limits"], **knobs) for rid in rids}
-    engine = SimpleNamespace(request_ids=rids, resources={LM_ATTN: res.kv_attn})
     tokens: dict[int, list[int]] = {rid: [] for rid in rids}
     live = list(rids)
     walk, inputs = "prefill", {rid: requests[rid][0] for rid in rids}
-    for _ in range(steps):
+    for i in range(steps):
         prepared = [sub.prepare_inputs(walk, infos[rid], inputs[rid]) for rid in live]
-        res.plan([p.input_seq_len for p in prepared])
-        engine.request_ids = live
-        out = _rows(sub.forward_batched(walk, engine, **sub.preprocess(walk, engine, prepared)), live)
+        out = _rows(res.run(sub, walk, live, prepared), live)
         stopped = []
         for rid, p in zip(live, prepared, strict=True):
             sub.postprocess(rid, infos[rid], out[rid], inputs=p)
             tokens[rid].append(int(out[rid][SPEECH_TOKENS][0]))
             inputs[rid] = {PREV_TOKEN: out[rid][PREV_TOKEN]}
             infos[rid].graph_walk = walk
+            # the next step is decode iteration i
+            infos[rid].dynamic_loop_iter_counts[DECODE_LOOP] = i
             # the runtime ends the loop at its cap, the budget
             if sub.check_stop(rid, infos[rid], out[rid]) or len(tokens[rid]) >= requests[rid][0]["limits"][1]:
                 stopped.append(rid)
@@ -992,12 +1051,10 @@ def test_lm_stops_on_any_control_id_or_the_length_cap():
 def _lm_prefill_then_decode(sub, res, limits, **knobs):
     """One request: prefill, postprocess, then one decode step on the prefill token."""
     info = _info(0, 0, limits=limits, ras_window=0, **knobs)
-    engine = SimpleNamespace(request_ids=[0], resources={LM_ATTN: res.kv_attn})
     tokens, inputs = [], _lm_request()
     for walk in ("prefill", "decode"):
         prepared = sub.prepare_inputs(walk, info, inputs)
-        res.plan([prepared.input_seq_len])
-        out = _rows(sub.forward_batched(walk, engine, **sub.preprocess(walk, engine, [prepared])), [0])[0]
+        out = _rows(res.run(sub, walk, [0], [prepared]), [0])[0]
         sub.postprocess(0, info, out, inputs=prepared)
         tokens.append(int(out[SPEECH_TOKENS][0]))
         inputs = {PREV_TOKEN: out[PREV_TOKEN]}
@@ -1031,7 +1088,6 @@ def test_the_prefill_and_the_loop_cap_spend_the_token_budget(model, budget):
     sub, res = _lm(cfg)
     _fixed_logits(sub, favourite=5, second=6)
     info = _info(0, 0, limits=(0, budget), ras_window=0)
-    engine = SimpleNamespace(request_ids=[0], resources={LM_ATTN: res.kv_attn})
     caps = model.get_loop_caps(**{MAX_SPEECH_TOKENS: budget})
     assert model.get_loop_caps(max_new_tokens=budget) == caps
     decode_steps = 0 if budget == 1 else caps[DECODE_LOOP]
@@ -1040,8 +1096,7 @@ def test_the_prefill_and_the_loop_cap_spend_the_token_budget(model, budget):
     with torch.no_grad():
         for step in range(decode_steps + 1):
             prepared = sub.prepare_inputs(walk, info, inputs)
-            res.plan([prepared.input_seq_len])
-            out = _rows(sub.forward_batched(walk, engine, **sub.preprocess(walk, engine, [prepared])), [0])[0]
+            out = _rows(res.run(sub, walk, [0], [prepared]), [0])[0]
             sub.postprocess(0, info, out, inputs=prepared)
             inputs = {PREV_TOKEN: out[PREV_TOKEN]}
             info.graph_walk = walk
@@ -1050,6 +1105,7 @@ def test_the_prefill_and_the_loop_cap_spend_the_token_budget(model, budget):
             # a speech token ends nothing but the prefill of a one-token budget
             assert stops == ({DECODE_LOOP} if budget == 1 and step == 0 else set())
             walk = "decode"
+            info.dynamic_loop_iter_counts[DECODE_LOOP] = step
     assert tokens == budget
 
 
@@ -1122,7 +1178,7 @@ def test_process_prompt_lays_out_the_rows_the_lm_prefill_writes(model, kwargs, w
     clip = _clip(2.0)
     tensors = {"audio_inputs": [clip]}
     out = model.process_prompt("one two three", ["text", "audio"], ["audio"], tensors=tensors, **kwargs)
-    layout = out.metadata["kv_layout"][LM_KV][LM_LABEL]
+    layout = out.metadata["state_layout"][LM_KV][LM_LABEL]
     ids = out.new_input_tensors[TEXT_INPUTS][0]
     prompt = torch.zeros(reference_tokens(clip.numel(), model.config) if prompt_tokens else 0, dtype=torch.long)
 
@@ -1134,10 +1190,11 @@ def test_process_prompt_lays_out_the_rows_the_lm_prefill_writes(model, kwargs, w
 
 
 def test_kv_labels_pass_the_load_checks_and_the_longest_request_fits(model):
-    from mstar.engine.resources.kv.config import refuse_undeclared_labels
+    from mstar.engine.resources import KVReqConfig
+    from mstar.engine.state.adapters import kv_layouts
     from mstar.validation.resources import _undeclared_pools, _unknown_prefix_walks
 
-    specs = model.get_node_resources()
+    specs = node_resources(model)
     assert list(_unknown_prefix_walks(model)) == []
     assert list(_undeclared_pools(specs, model)) == []
 
@@ -1146,14 +1203,12 @@ def test_kv_labels_pass_the_load_checks_and_the_longest_request_fits(model):
     kwargs["max_new_tokens"] = model.config.max_speech_tokens
     out = model.process_prompt(text, ["text", "audio"], ["audio"], tensors={"audio_inputs": [_clip(30.0)]}, **kwargs)
     model_kwargs = {**kwargs, **out.metadata}
-    configs = model.get_request_resource_configs([], [], model_kwargs)
-    layout = model_kwargs["kv_layout"]
-    refuse_undeclared_labels("CosyVoice3Model", {k: tuple(v) for k, v in model.kv_labels().items()}, layout, configs)
+    # as the data worker and the conductor open the request; an undeclared name raises
+    layout = kv_layouts(model.declare_state(), model_kwargs["state_layout"], {})
     caps = model.get_loop_caps(**model_kwargs)
-    kv = configs[LM_KV]
-    kv.apply_conductor_config(
-        kv_layout={label: row.row() for label, row in layout[LM_KV].items()}, loop_caps=caps,
-    )
+    rows = {label: row.row() for label, row in layout[LM_KV].items()}
+    kv = KVReqConfig(needed_labels=list(rows))
+    kv.apply_conductor_config(kv_layout=rows, loop_caps=caps)
     spec = next(s for s in specs if s.resource_key == LM_KV)
     kv.validate(spec)
     positions = kv.kv_layout[LM_LABEL].positions(caps)
@@ -1193,20 +1248,22 @@ def test_lm_ras_counts_repeats_in_the_requests_own_window():
     assert favourites(ras_window=0) == list(range(18))
 
 
-def test_lm_ras_history_is_committed_once_per_step():
+def test_lm_ras_history_keeps_a_re_run_steps_token_once():
+    """Decode iteration i keeps its input token in slot ``i % W`` of the ring, so a step run again writes the ring it
+    wrote the first time."""
     cfg = _tiny_config()
-    sub, _ = _lm(cfg)
+    sub, res = _lm(cfg)
     info = _info(3, 0)
-    sub.prepare_inputs("prefill", info, _lm_request())
-    state = sub.request_state(3)
-    again = sub.prepare_inputs("decode", info, {PREV_TOKEN: [torch.tensor([9])]})
-    sub.prepare_inputs("decode", info, {PREV_TOKEN: [torch.tensor([9])]})  # re-driven step
-    assert state["history"].tolist() == [-1] * 10  # not committed until postprocess
-    sub.postprocess(3, info, {SPEECH_TOKENS: [torch.tensor([4])]}, inputs=again)
-    assert state["history"].tolist() == [-1] * 9 + [9] and state["generated"] == 1
+    with torch.no_grad():
+        res.run(sub, "prefill", [3], [sub.prepare_inputs("prefill", info, _lm_request())])
+        assert res.history.slots[3]["tokens"].tolist() == [-1] * 10
+        step = sub.prepare_inputs("decode", info, {PREV_TOKEN: [torch.tensor([9])]})
+        res.run(sub, "decode", [3], [step])
+        res.run(sub, "decode", [3], [step])  # re-driven step
+    assert res.history.slots[3]["tokens"].tolist() == [9] + [-1] * 9, "the re-run step kept its token twice"
 
 
-def _row_tensors_per_value(sub, info, seed, step, min_len, history, force_eos):
+def _row_tensors_per_value(sub, info, seed, step, min_len, force_eos):
     """The decode inputs as the node built them before it staged columns: one
     device tensor per value per row, the knobs re-read from the metadata."""
     meta = info.step_metadata
@@ -1214,7 +1271,6 @@ def _row_tensors_per_value(sub, info, seed, step, min_len, history, force_eos):
     threshold = float(window) * float(sub._knob(meta, "ras_tau")) if window > 0 else 0.0
     ignore_eos = bool(meta.get("ignore_eos", False))
     return {
-        HISTORY: history,
         "force_eos": torch.tensor([force_eos]),
         "seed": torch.tensor([seed], dtype=torch.long),
         "step": torch.tensor([step], dtype=torch.long),
@@ -1243,9 +1299,10 @@ def _assert_same_packed(new, old):
 
 
 def test_lm_staged_columns_equal_the_per_value_tensors():
-    """Mixed knobs, prefill then decode, a re-prepared step, the wasted step
-    after a forced EOS, and the capture template rows: the packed inputs the
-    forward reads are the ones the per-value construction gave."""
+    """Mixed knobs, prefill then decode, a re-prepared step, a first decode
+    step forced to EOS and the steps after it, and the capture template rows:
+    the packed inputs the forward reads are the ones the per-value
+    construction gave."""
     cfg = _tiny_config()
     sub, _ = _lm(cfg)
     control = cfg.lm.speech_token_size + 2
@@ -1260,31 +1317,23 @@ def test_lm_staged_columns_equal_the_per_value_tensors():
     infos = {rid: _info(rid, seed, limits=limits, **knobs) for rid, (seed, limits, knobs, _) in rows.items()}
     ended: dict[int, bool] = {}
 
-    def check(walk, step_inputs):
+    def check(walk, step_inputs, count=0):
+        for info in infos.values():
+            info.dynamic_loop_iter_counts[DECODE_LOOP] = count
         prepared = [sub.prepare_inputs(walk, infos[rid], step_inputs[rid]) for rid in rows]
         old_rows = []
-        for rid, inp in zip(rows, prepared, strict=True):
-            seed, (min_len, max_len), knobs, _ = rows[rid]
-            state = sub.request_state(rid)
+        for rid, (seed, (min_len, max_len), knobs, _) in rows.items():
             force = False
-            if walk == "decode":
-                if rid not in ended:
-                    token = int(step_inputs[rid][PREV_TOKEN][0].item())
-                    stopped = not knobs.get("ignore_eos", False) and token >= cfg.lm.speech_token_size
-                    ended[rid] = stopped or int(state["generated"]) >= max_len
-                force = ended[rid]
-            old_rows.append(
-                _row_tensors_per_value(
-                    sub,
-                    infos[rid],
-                    seed & (2**63 - 1),
-                    int(state["generated"]),
-                    min_len,
-                    inp.tensor_inputs[HISTORY],
-                    force,
-                )
-            )
+            # only the first decode step reads the prefill token
+            if walk == "decode" and count == 0:
+                token = int(step_inputs[rid][PREV_TOKEN][0].item())
+                stopped = not knobs.get("ignore_eos", False) and token >= cfg.lm.speech_token_size
+                ended[rid] = force = stopped or max_len <= 1
+            step = count + 1 if walk == "decode" else 0
+            old_rows.append(_row_tensors_per_value(sub, infos[rid], seed & (2**63 - 1), step, min_len, force))
         old = _stack_per_value([inp.input_embeds for inp in prepared], old_rows)
+        if walk == "decode":
+            old[PREV_TOKEN] = torch.tensor([int(step_inputs[rid][PREV_TOKEN][0]) for rid in rows])
         _assert_same_packed(sub.preprocess(walk, None, prepared), old)
         return prepared
 
@@ -1296,16 +1345,15 @@ def test_lm_staged_columns_equal_the_per_value_tensors():
         commit(check("prefill", {rid: _lm_request(4 + rid, prompt=rid % 3) for rid in rows}))
         for k in range(4):
             step_inputs = {rid: {PREV_TOKEN: [torch.tensor([tokens[k]])]} for rid, (*_, tokens) in rows.items()}
-            prepared = check("decode", step_inputs)
+            prepared = check("decode", step_inputs, k)
             if k == 1:
-                prepared = check("decode", step_inputs)  # re-driven before postprocess
+                prepared = check("decode", step_inputs, k)  # re-driven before postprocess
             commit(prepared)
         assert ended == {0: False, 1: True, 2: True, 3: False, 4: False}
 
         graph = sub.get_accelerator_graph_configs(torch.device("cpu"))[0]
         template = graph.single_request_inputs
         per_value = {
-            HISTORY: torch.full((sub.window,), -1, dtype=torch.long),
             "seed": torch.zeros(1, dtype=torch.long),
             "step": torch.zeros(1, dtype=torch.long),
             "temperature": torch.ones(1),
@@ -1319,6 +1367,7 @@ def test_lm_staged_columns_equal_the_per_value_tensors():
         }
         dummies = graph.get_node_inputs(4, 4)
         old = _stack_per_value([d.input_embeds for d in dummies], [per_value] * 4)
+        old[PREV_TOKEN] = torch.zeros(4, dtype=torch.long)
         _assert_same_packed(sub.preprocess("decode", None, dummies), old)
         # a padded replay batch: real rows, then the bucket's template rows
         live = [sub.prepare_inputs("decode", infos[rid], {PREV_TOKEN: [torch.tensor([2])]}) for rid in (0, 1)]
@@ -1364,7 +1413,8 @@ def test_lm_steps_and_flow_solve_issue_no_host_sync_on_cuda():
             sub.preprocess("prefill", None, [prefill])
             sub.postprocess(0, info, {SPEECH_TOKENS: [sampled]}, inputs=prefill)
             packed = []
-            for token in fed:
+            for count, token in enumerate(fed):
+                info.dynamic_loop_iter_counts[DECODE_LOOP] = count
                 step = sub.prepare_inputs("decode", info, {PREV_TOKEN: [token]})
                 packed.append(sub.preprocess("decode", None, [step]))
                 sub.postprocess(0, info, {SPEECH_TOKENS: [sampled]}, inputs=step)
@@ -1373,15 +1423,15 @@ def test_lm_steps_and_flow_solve_issue_no_host_sync_on_cuda():
     finally:
         torch.cuda.set_sync_debug_mode(mode)
     assert sum(p.numel() for p in pieces) == 60 * hift.upsample_factor
-    # the first decode step's input is the prefill token, here EOS: every decode step is forced
-    assert [p["force_eos"].tolist() for p in packed] == [[[True]], [[True]]]
+    # the first decode step's input is the prefill token, here EOS, and only that step reads it
+    assert [p["force_eos"].tolist() for p in packed] == [[[True]], [[False]]]
 
 
 def test_lm_declares_one_kv_segment_per_request_and_a_decode_capture():
     cfg = _tiny_config()
     sub, _ = _lm(cfg)
     step = sub.declare_step("decode", [0, 1], [SimpleNamespace(input_seq_len=1)] * 2)
-    assert set(step.steps) == {LM_KV, LM_ATTN, LM_POS}
+    assert set(step.state) == {LM_KV, RAS_HISTORY}
     assert [(s.request_id, s.span) for s in step.segments] == [(0, 1), (1, 1)]
     graph = sub.get_accelerator_graph_configs(torch.device("cpu"))[0]
     assert graph.capture_graph_walk == "decode" and graph.capture_batch_sizes == [1, 2, 4, 8, 16, 32]
@@ -1437,14 +1487,14 @@ def test_flow_hop_plan_follows_the_reference_ramp():
     voice = _voice(cfg, prompt_tokens=10)
     # first hop 25 tokens, stretched to align prompt + hop on a 25-token chunk: 40; then 50, 100, 100
     assert [sub.hop_size(k, 10) for k in range(4)] == [40, 50, 100, 100]
-    state = sub.request_state(0)
+    counts = FlowCounts()
     tokens = torch.zeros(300, dtype=torch.long)
-    assert sub.plan(state, voice, tokens[:42], final=False) is None  # 40 + 3 look-ahead not there yet
-    assert sub.plan(state, voice, tokens[:43], final=False).settle == 40
-    state.add("settled", 40)
-    assert sub.plan(state, voice, tokens[:200], final=False).settle == 190  # 90 and 190 in one solve
-    state.add("settled", 190)
-    final = sub.plan(state, voice, tokens[:200], final=True)
+    assert sub.plan(counts, voice, tokens[:42], final=False) is None  # 40 + 3 look-ahead not there yet
+    assert sub.plan(counts, voice, tokens[:43], final=False).settle == 40
+    counts.settled = 40
+    assert sub.plan(counts, voice, tokens[:200], final=False).settle == 190  # 90 and 190 in one solve
+    counts.settled = 190
+    final = sub.plan(counts, voice, tokens[:200], final=True)
     assert final.final and final.settle == 200
 
 
@@ -1493,9 +1543,10 @@ def test_flow_node_solves_without_tf32_and_restores_the_engine_setting(monkeypat
     torch.set_float32_matmul_precision("high")
     torch.backends.cudnn.allow_tf32 = True
     try:
-        node._run([0], [torch.randint(0, 40, (12,))], [voice], [True], [2])
+        tokens = torch.randint(0, 40, (12,))
+        node._run([0], [tokens], [voice], [tokens], [FlowCounts()], [True], [2])
         with pytest.raises(RuntimeError, match="boom"):
-            node._run([1], [torch.randint(0, 40, (12,))], [voice], [True], [2])
+            node._run([1], [tokens], [voice], [tokens], [FlowCounts()], [True], [2])
         assert seen == [("highest", False)] * 2
         assert (torch.get_float32_matmul_precision(), torch.backends.cudnn.allow_tf32) == ("high", True)
     finally:
@@ -1625,34 +1676,41 @@ def test_hift_node_final_flush_without_new_frames_releases_the_tail():
     node = HiFTSubmodule(_random_hift(cfg), cfg)
     mel = torch.randn(80, 30, dtype=torch.float64)
     info = SimpleNamespace(rid_handle=0, request_id=0)
-    outs = []
+    outs, stream = [], {}
     for frames, final in ((mel, False), (mel[:, :0], True)):
-        p = node.prepare_inputs("token2wav", info, {MEL: [frames], MEL_FINAL: [torch.tensor([final])]})
-        outs.append(node.forward("token2wav", None, **node.preprocess("token2wav", None, [p]))[AUDIO_CHUNK][0])
+        p = node.prepare_inputs("token2wav", info, {MEL: [frames], MEL_FINAL: [torch.tensor([final])], **stream})
+        out = node.forward("token2wav", None, **node.preprocess("token2wav", None, [p]))
+        outs.append(out[AUDIO_CHUNK][0])
+        stream = {HIFT_COUNTS: out[HIFT_COUNTS], HIFT_MEL: out[HIFT_MEL]}
     assert [o.numel() for o in outs] == [22 * 480, 8 * 480] and outs[0].dtype == torch.int16
 
 
 # -- end to end: the #429 invariant ---------------------------------------------------------
 
 
-def _stream_token2wav(cfg, flow_node, hift_node, policy, tokens: list[int]) -> list[torch.Tensor]:
+def _stream_token2wav(flow_node, hift_node, policy, voice, tokens: list[int]) -> list[torch.Tensor]:
     """Feed tokens one at a time through a real StreamBuffer and the two
-    Token2Wav nodes, as the worker does; return the emitted audio chunks."""
+    Token2Wav nodes, as the worker does, each node getting back the loop-back
+    edges of its last chunk, and ``voice`` on the first chunk's voice edge;
+    return the emitted audio chunks."""
     buffer = StreamBuffer(request_id=0, edge_name=SPEECH_TOKENS, from_partition=LM_PARTITION, policy=policy)
     info = SimpleNamespace(rid_handle=0, request_id=0, step_metadata={"n_cfm_timesteps": 3})
     chunks: list[torch.Tensor] = []
+    flow_edges, hift_edges = {VOICE: voice.edge()}, {}
 
     def drain():
         while buffer.has_chunk_ready():
             chunk = buffer.pop_chunk()
             p = flow_node.prepare_inputs(
-                "token2wav", info, {SPEECH_TOKENS: [chunk.data["data"]]}, is_final_stream_chunk=chunk.is_final
+                "token2wav", info, {SPEECH_TOKENS: [chunk.data["data"]], **flow_edges},
+                is_final_stream_chunk=chunk.is_final,
             )
             mel = flow_node.forward("token2wav", None, **flow_node.preprocess("token2wav", None, [p]))
-            h = hift_node.prepare_inputs("token2wav", info, mel)
-            chunks.append(
-                hift_node.forward("token2wav", None, **hift_node.preprocess("token2wav", None, [h]))[AUDIO_CHUNK][0]
-            )
+            flow_edges.update((name, mel[name]) for name in (VOICE, FLOW_COUNTS, RAW_TOKENS))
+            h = hift_node.prepare_inputs("token2wav", info, {MEL: mel[MEL], MEL_FINAL: mel[MEL_FINAL], **hift_edges})
+            audio = hift_node.forward("token2wav", None, **hift_node.preprocess("token2wav", None, [h]))
+            hift_edges.update((name, audio[name]) for name in (HIFT_COUNTS, HIFT_MEL))
+            chunks.append(audio[AUDIO_CHUNK][0])
 
     for i, token in enumerate(tokens):
         buffer.pre_read_register(f"t{i}")
@@ -1670,14 +1728,13 @@ def test_streamed_audio_equals_the_whole_streaming_decode(model, num_tokens, pro
     flow, hift = _random_flow(cfg), _random_hift(cfg)
     flow_node, hift_node = FlowSubmodule(flow, None, cfg), HiFTSubmodule(hift, cfg)
     voice = _voice(cfg, prompt_tokens)
-    flow_node.request_state(0).add("voice", voice)
     g = torch.Generator().manual_seed(num_tokens)
     tokens = torch.randint(3, 40, (num_tokens,), generator=g).tolist()
     tokens[num_tokens // 2 : num_tokens // 2 + 8] = [1] * min(8, num_tokens - num_tokens // 2)  # a silent run
     tokens.append(cfg.lm.eos_token)
     policy = model.get_partition_topology().connections[0].chunk_policy_factory()
     with torch.no_grad():
-        chunks = _stream_token2wav(cfg, flow_node, hift_node, policy, tokens)
+        chunks = _stream_token2wav(flow_node, hift_node, policy, voice, tokens)
         kept = filter_tokens(torch.tensor(tokens), cfg)
         mel = flow.solve_rows([CosyVoice3FlowRow(voice, kept, kept.numel(), final=True, streaming=True)], 3)[0]
         whole, _ = hift.vocode(mel[None], finalize=True)
@@ -1696,11 +1753,10 @@ def test_offline_deployment_decodes_once_with_full_attention(model):
     flow, hift = _random_flow(cfg), _random_hift(cfg)
     flow_node, hift_node = FlowSubmodule(flow, None, cfg), HiFTSubmodule(hift, cfg)
     voice = _voice(cfg, 10)
-    flow_node.request_state(0).add("voice", voice)
     tokens = torch.randint(3, 40, (60,), generator=torch.Generator().manual_seed(0)).tolist() + [cfg.lm.eos_token]
     policy = model.get_partition_topology().connections[0].chunk_policy_factory()
     with torch.no_grad():
-        chunks = _stream_token2wav(cfg, flow_node, hift_node, policy, tokens)
+        chunks = _stream_token2wav(flow_node, hift_node, policy, voice, tokens)
         row = CosyVoice3FlowRow(voice, torch.tensor(tokens[:-1]), 60, final=True, streaming=False)
         mel = flow.solve_rows([row], 3)[0]
         whole, _ = hift.vocode(mel[None], finalize=True)
@@ -1777,7 +1833,7 @@ def test_whole_floats_pass_for_integer_knobs(model):
 def test_a_token_budget_past_the_decode_loop_is_refused_not_clamped(model):
     c = _loop_conductor(model)
     limit = model._speech_limit
-    assert c._loop_caps({"max_new_tokens": limit}) == {DECODE_LOOP: limit - 1}
+    assert c._loop_caps({"max_new_tokens": limit}) == {DECODE_LOOP: limit - 1, TOKEN2WAV_LOOP: limit + 2}
     with pytest.raises(ValueError, match="max_new_tokens"):
         c._loop_caps({"max_new_tokens": limit + 1})
 

@@ -36,9 +36,9 @@ from torch import nn
 from mstar.distributed.communication import CommGroup
 from mstar.model.chatterbox.loader import load_component
 from mstar.model.components import DecoderLayer, RMSNorm
-from mstar.model.components.decoder_layer import run_layers
+from mstar.model.components.decoder_layer import no_cursor, run_layers
 from mstar.model.components.distributed import ParallelAttention, ParallelGatedMLP
-from mstar.model.cosyvoice3.config import LM_ATTN, LM_KV, LM_POS, LMConfig
+from mstar.model.cosyvoice3.config import LM_KV, LMConfig
 from mstar.model.loader import LLAMA_STACKED_PARAMS
 
 
@@ -63,9 +63,8 @@ class CosyVoice3LM(nn.Module):
                         qkv_bias=True,
                         rope_theta=config.rope_theta,
                         input_hidden_size=config.hidden_size,
-                        attn_key=LM_ATTN,
                         kv_key=LM_KV,
-                        pos_key=LM_POS,
+                        layer=i,
                     ),
                     mlp=ParallelGatedMLP(
                         comm_group=comm_group,
@@ -76,7 +75,7 @@ class CosyVoice3LM(nn.Module):
                     input_layernorm=RMSNorm(config.hidden_size, eps=config.rms_norm_eps),
                     post_attention_layernorm=RMSNorm(config.hidden_size, eps=config.rms_norm_eps),
                 )
-                for _ in range(config.num_hidden_layers)
+                for i in range(config.num_hidden_layers)
             ]
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -106,15 +105,9 @@ class CosyVoice3LM(nn.Module):
 
     # -- transformer --------------------------------------------------------
 
-    def hidden(self, input_embeds: torch.Tensor, *, label: str) -> torch.Tensor:
-        """``[N, D] -> [N, D]`` over the packed step. The label and the layer
-        index are cursors on the shared resources: bind once, advance per layer."""
-        self.layers[0].self_attn.attend.bind_step(label)
-        return run_layers(self.layers, input_embeds, self.norm, self._set_cursor, self.comm_group)
-
-    @torch.compiler.disable
-    def _set_cursor(self, i: int, mixer: nn.Module) -> None:
-        mixer.attend.set_layer_idx(i)
+    def hidden(self, input_embeds: torch.Tensor) -> torch.Tensor:
+        """``[N, D] -> [N, D]`` over the packed step."""
+        return run_layers(self.layers, input_embeds, self.norm, no_cursor, self.comm_group)
 
     def logits(self, hidden: torch.Tensor) -> torch.Tensor:
         """float32 logits over the speech vocabulary (the head is kept in float32;

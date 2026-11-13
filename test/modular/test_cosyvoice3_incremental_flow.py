@@ -20,12 +20,14 @@ from mstar.engine.accelerator_graph_runner import PiecewiseAcceleratorGraphRunne
 from mstar.engine.resources.base import EngineResourceInfo, build_resource
 from mstar.engine.resources.runner import StepRunner
 from mstar.engine.resources.spec import resolve_spec_dependencies
+from mstar.engine.state.adapters import node_handles, node_resources
 from mstar.model.cosyvoice3.components.dit import DiT, PackedRows
-from mstar.model.cosyvoice3.components.flow import CosyVoice3Flow, CosyVoice3FlowRow, ReferenceVoice
+from mstar.model.cosyvoice3.components.flow import CosyVoice3Flow, CosyVoice3FlowRow, FlowCounts, ReferenceVoice
 from mstar.model.cosyvoice3.config import (
     FLOW_ATTN,
     FLOW_COND_LABEL,
     FLOW_KV,
+    FLOW_NODE,
     FLOW_TAILS,
     FLOW_UNCOND_LABEL,
     CosyVoice3Config,
@@ -110,22 +112,23 @@ def _row(cfg, settle, prompt=5, final=False, streaming=True):
 def test_a_row_runs_from_what_it_has_cached():
     cfg = _config()
     node = _node(cfg)
-    state = node.request_state(1)
-    item = node._new_frames_row(0, 1, _row(cfg, 20), 3, object())
+    counts = FlowCounts()
+    item = node._new_frames_row(0, _row(cfg, 20), counts, 3, object())
     assert (item.first, item.end) == (0, 50)
-    state.add("cached_frames", 50)
-    item = node._new_frames_row(0, 1, _row(cfg, 45), 3, object())
+    counts.cached_frames = 50
+    item = node._new_frames_row(0, _row(cfg, 45), counts, 3, object())
     assert (item.first, item.end) == (50, 100)
 
 
 def test_a_row_past_its_budget_resolves_for_good():
     cfg = _config(flow_cache_frames=100)
     node = _node(cfg)
-    assert node._new_frames_row(0, 2, _row(cfg, 45), 3, object()) is not None
-    assert node._new_frames_row(0, 2, _row(cfg, 70), 3, object()) is None
-    assert node.request_state(2).get("resolving") is True
+    counts = FlowCounts()
+    assert node._new_frames_row(0, _row(cfg, 45), counts, 3, object()) is not None
+    assert node._new_frames_row(0, _row(cfg, 70), counts, 3, object()) is None
+    assert counts.resolving is True
     # even a row short enough again, which no stream does, would miss the frames skipped
-    assert node._new_frames_row(0, 2, _row(cfg, 45), 3, object()) is None
+    assert node._new_frames_row(0, _row(cfg, 45), counts, 3, object()) is None
 
 
 @pytest.mark.parametrize(
@@ -135,8 +138,7 @@ def test_a_row_past_its_budget_resolves_for_good():
 def test_what_the_captured_solve_cant_run_resolves(steps, streaming, runner):
     cfg = _config()
     node = _node(cfg)
-    node.request_state(3)
-    assert node._new_frames_row(0, 3, _row(cfg, 20, streaming=streaming), steps, runner) is None
+    assert node._new_frames_row(0, _row(cfg, 20, streaming=streaming), FlowCounts(), steps, runner) is None
 
 
 def test_batches_stay_within_the_largest_capture():
@@ -150,15 +152,16 @@ def test_batches_stay_within_the_largest_capture():
 def test_a_capture_left_out_for_memory_falls_back_to_resolving(monkeypatch):
     cfg = _config()
     node = _node(cfg)
-    node.request_state(4)
     region = SimpleNamespace(can_run=lambda bs, tokens: False)
     called = []
     monkeypatch.setattr(node, "_solve", lambda rows, steps, runners: called.append(len(rows)) or [torch.zeros(80, 2)])
     # the first hop settles 45 tokens behind a 5-token prompt, and reads 3 more
-    tokens = _tokens(60, 1)
+    tokens, counts = _tokens(60, 1), FlowCounts()
     with torch.no_grad():
-        node._run([4], [tokens], [_voice(cfg, 5, 1)], [False], [3], {FLOW_NEW_FRAMES_REGION: region})
-    assert called == [1] and node.request_state(4).get("resolving") is True
+        node._run(
+            [4], [tokens], [_voice(cfg, 5, 1)], [tokens], [counts], [False], [3], {FLOW_NEW_FRAMES_REGION: region},
+        )
+    assert called == [1] and counts.resolving is True
 
 
 def test_packing_lays_each_rows_tail_before_its_new_frames():
@@ -170,7 +173,7 @@ def test_packing_lays_each_rows_tail_before_its_new_frames():
     batch = [_NewFramesRow(0, rows[0], 0, 50), _NewFramesRow(1, rows[1], 50, 100)]
     packed = node._pack_new_frames(batch).rows
     k = cfg.flow.dit.conv_pos_kernel - 1
-    assert packed.positions.tolist() == [*range(50), *range(50, 100)]
+    assert packed.frame_at.tolist() == [*range(50), *range(50, 100)]
     assert packed.tail_at[0].tolist() == list(range(1, 1 + k))
     assert packed.seq_at[0].item() == 1 + k
     assert packed.tail_at[1, 0].item() == 1 + k + 50
@@ -205,7 +208,7 @@ def test_conv_position_with_tails_equals_one_whole_convolution():
                 positions += [0] * n
                 cursor += k + n
             rows = PackedRows(
-                positions=torch.tensor(positions + [0] * pad),
+                frame_at=torch.tensor(positions + [0] * pad),
                 seq_at=torch.tensor(seq_at + [0] * pad),
                 tail_at=torch.tensor(tail_at),
                 last_at=torch.tensor(last_at),
@@ -232,13 +235,19 @@ def _model(tmp_path, monkeypatch, **kwargs) -> CosyVoice3Model:
     return CosyVoice3Model("x", **kwargs)
 
 
+def _declaring(cfg) -> CosyVoice3Model:
+    """A model that declares ``cfg``'s state, loading nothing."""
+    model = object.__new__(CosyVoice3Model)
+    model.config = cfg
+    return model
+
+
 def test_the_flow_declares_its_cache_when_on(tmp_path, monkeypatch):
     model = _model(tmp_path, monkeypatch)
-    keys = {spec.resource_key for spec in model.get_node_resources()}
+    keys = {spec.resource_key for spec in node_resources(model)}
     assert {FLOW_KV, FLOW_ATTN, FLOW_TAILS} <= keys
     assert set(model.kv_labels()[FLOW_KV]) == {FLOW_COND_LABEL, FLOW_UNCOND_LABEL}
-    configs = model.get_request_resource_configs(["text"], ["audio"], {})
-    assert configs[FLOW_KV].needed_labels == [FLOW_COND_LABEL, FLOW_UNCOND_LABEL]
+    assert set(model._flow_layouts()) == {FLOW_COND_LABEL, FLOW_UNCOND_LABEL}
 
 
 @pytest.mark.parametrize(
@@ -252,8 +261,7 @@ def test_the_flow_declares_its_cache_when_on(tmp_path, monkeypatch):
 def test_the_cache_is_off_where_it_cant_run(tmp_path, monkeypatch, kwargs):
     model = _model(tmp_path, monkeypatch, **kwargs)
     assert model.config.flow_cache_frames == 0
-    assert FLOW_KV not in {spec.resource_key for spec in model.get_node_resources()}
-    assert FLOW_KV not in model.get_request_resource_configs(["text"], ["audio"], {})
+    assert FLOW_KV not in {spec.resource_key for spec in node_resources(model)}
 
 
 @pytest.mark.parametrize(
@@ -276,7 +284,7 @@ def test_a_pool_too_small_for_the_requests_is_refused(tmp_path, monkeypatch):
         "max_concurrent_requests": 4,
         "resources": {FLOW_KV: {"max_num_pages": pages - 1}},
     }
-    with pytest.raises(ValueError, match="two streams"):
+    with pytest.raises(ValueError, match="pages of resources.flow_kv"):
         model.validate_config_yaml(config, "test.yaml")
     config["resources"][FLOW_KV]["max_num_pages"] = pages
     model.validate_config_yaml(config, "test.yaml")
@@ -288,7 +296,7 @@ def test_without_an_override_the_cap_is_checked_against_the_default_pool(tmp_pat
 
     config = {"model": "cosyvoice3", "max_concurrent_requests": DEFAULT_FLOW_REQUESTS}
     model.validate_config_yaml(config, "test.yaml")
-    with pytest.raises(ValueError, match="two streams"):
+    with pytest.raises(ValueError, match="pages of resources.flow_kv"):
         model.validate_config_yaml({**config, "max_concurrent_requests": DEFAULT_FLOW_REQUESTS + 1}, "test.yaml")
 
 
@@ -319,9 +327,8 @@ class _Rig:
         self.device = torch.device("cuda", torch.cuda.current_device())
         self.cfg = cfg
         self.flow = _flow(cfg, torch.bfloat16, self.device, seed)
-        model = SimpleNamespace(config=cfg, _lm_dtype=torch.bfloat16)
-        model._flow_kv_pages = lambda requests: CosyVoice3Model._flow_kv_pages(model, requests)
-        specs = CosyVoice3Model._flow_resources(model)
+        model = _declaring(cfg)
+        specs = [spec for spec in node_resources(model) if FLOW_NODE in spec.nodes]
         by_key = resolve_spec_dependencies(specs)
         self.resources = {}
         for spec in specs:
@@ -334,21 +341,23 @@ class _Rig:
             self.resources[spec.resource_key] = build_resource(spec, info)
         self.steps = StepRunner(self.resources, node_resources={"flow": list(self.resources)})
         self.node = FlowSubmodule(self.flow, None, cfg)
-        self.node.bind_node_resources(self.resources)
+        self.handles = node_handles(model, FLOW_NODE, self.resources)
+        self.node.bind_node_state(self.handles)
+        self.counts = {}
         pool = get_accelerator_graph_backend(self.device).graph_pool_handle()
         self.runners = {}
         configs = self.node.get_piecewise_accelerator_graph_configs(self.device, torch.bfloat16)
         for label, config in configs.items():
             runner = PiecewiseAcceleratorGraphRunner(
                 label=label, config=config, resources=self.resources, step_runner=self.steps, device=self.device,
-                autocast_dtype=None, num_slots=1, memory_pool=pool,
+                autocast_dtype=None, num_slots=1, memory_pool=pool, state_handles=self.handles,
             )
             runner.warmup_and_capture(None)
             assert runner.any_graphs and not runner.dropped_shapes
             self.runners[label] = runner
 
     def open(self, rid):
-        self.node.request_state(rid)
+        self.counts[rid] = FlowCounts()
         self.steps.ingest_request(rid, {FLOW_KV: self._kv_config()})
 
     def _kv_config(self):
@@ -360,7 +369,8 @@ class _Rig:
         """One node step; each row's newly settled mel."""
         n = self.cfg.flow.cfm.n_timesteps
         with torch.no_grad():
-            out = self.node._run(rids, tokens_list, voices, finals, [n] * len(rids), self.runners)
+            counts = [self.counts[rid] for rid in rids]
+            out = self.node._run(rids, tokens_list, voices, tokens_list, counts, finals, [n] * len(rids), self.runners)
         return [o["mel"][0] for o in out]
 
 
@@ -467,7 +477,7 @@ def test_a_row_past_its_budget_carries_on_by_resolving():
     voice = _voice(cfg, 25, 3, rig.device)
     tokens = _tokens(120, 4, rig.device)
     got = _chain(rig, 1, voice, tokens, [28, 78, 120])  # 50 + 100 + 240 frames with the prompt
-    assert rig.node.request_state(1).get("resolving") is True
+    assert rig.counts[1].resolving is True
     assert got.shape == (cfg.flow.output_size, 240)
     row = CosyVoice3FlowRow(voice, tokens, 120, final=True, streaming=True)
     with torch.no_grad():

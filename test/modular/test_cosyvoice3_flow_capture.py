@@ -18,7 +18,7 @@ import torch
 from mstar.engine import accelerator_graph_runner as cgr
 from mstar.engine.accelerator_graph_backend import get_accelerator_graph_backend
 from mstar.engine.accelerator_graph_runner import PiecewiseAcceleratorGraphRunner
-from mstar.model.cosyvoice3.components.flow import CosyVoice3Flow, CosyVoice3FlowRow, ReferenceVoice
+from mstar.model.cosyvoice3.components.flow import CosyVoice3Flow, CosyVoice3FlowRow, FlowCounts, ReferenceVoice
 from mstar.model.cosyvoice3.config import CosyVoice3Config, DiTConfig, FlowConfig
 from mstar.model.cosyvoice3.submodules import MEL, FlowSubmodule, flow_region
 
@@ -128,12 +128,11 @@ def _solve(node: FlowSubmodule, cases, runners=None, n_timesteps=None) -> list[t
     """One node step over fresh requests: ``cases`` is (voice, tokens, final)."""
     steps = n_timesteps or node.config.flow.cfm.n_timesteps
     rids = list(range(len(cases)))
+    tokens = [t for _, t, _ in cases]
     out = node._run(
-        rids, [t for _, t, _ in cases], [v for v, _, _ in cases], [f for _, _, f in cases], [steps] * len(cases),
-        runners,
+        rids, tokens, [v for v, _, _ in cases], tokens, [FlowCounts() for _ in cases], [f for _, _, f in cases],
+        [steps] * len(cases), runners,
     )
-    for rid in rids:
-        node.cleanup_request(rid)
     return [o[MEL][0] for o in out]
 
 
@@ -255,11 +254,10 @@ def test_streamed_hops_through_the_buckets_equal_one_eager_stream(monkeypatch):
     tokens, voice = _tokens(47, 5), _voice(cfg, 10)
 
     def stream(node, runners):
-        hops = []
+        hops, counts = [], FlowCounts()
         for n, final in ((43, False), (47, True)):
-            out = node._run([0], [tokens[:n]], [voice], [final], [3], runners)
+            out = node._run([0], [tokens[:n]], [voice], [tokens[:n]], [counts], [final], [3], runners)
             hops.append(out[0][MEL][0])
-        node.cleanup_request(0)
         return torch.cat(hops, dim=-1)
 
     node = FlowSubmodule(_flow(cfg), None, cfg)
