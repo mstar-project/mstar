@@ -52,6 +52,7 @@ SNAPSHOT = {
         ["advance", "KEYWORD_ONLY", 'None'],
         ["position_ids", "KEYWORD_ONLY", 'None'],
         ["host", "KEYWORD_ONLY", '{}'],
+        ["mask_step", "KEYWORD_ONLY", 'None'],
     ],
     "Attend": [
         ["q_heads", "POSITIONAL_OR_KEYWORD", None],
@@ -61,6 +62,16 @@ SNAPSHOT = {
     "Causal": [],
     "CausalConv": [
         ["activation", "KEYWORD_ONLY", "'silu'"],
+    ],
+    "ChunkCausal": [],
+    "ChunkCausalLayout": [
+        ["global_len", "KEYWORD_ONLY", None],
+        ["chunk_len", "KEYWORD_ONLY", None],
+        ["noised_len", "KEYWORD_ONLY", None],
+        ["clean_len", "KEYWORD_ONLY", '0'],
+    ],
+    "ChunkCausalStep": [
+        ["layouts", "KEYWORD_ONLY", None],
     ],
     "Entry": [
         ["tensors", "POSITIONAL_OR_KEYWORD", None],
