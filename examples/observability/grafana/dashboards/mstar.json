@@ -2113,8 +2113,8 @@
     },
     {
       "type": "timeseries",
-      "title": "KV cache pages used",
-      "description": "Share of each paged KV cache's pages off the free list, per graph node and cache; dashed: share the prefix cache names (it frees the ones no request holds on demand).",
+      "title": "KV cache pages and rebuild host pool used",
+      "description": "Share of each paged KV cache's pages off the free list, per graph node and cache; dashed: share the prefix cache names (it frees the ones no request holds on demand); dotted: share of the rebuild host pool holding kept prompt ids (a prompt that doesn't fit is never dropped).",
       "datasource": {
         "type": "prometheus",
         "uid": "prom"
@@ -2161,6 +2161,24 @@
                 }
               }
             ]
+          },
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "C"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dot",
+                  "dash": [
+                    0,
+                    10
+                  ]
+                }
+              }
+            ]
           }
         ]
       },
@@ -2194,6 +2212,16 @@
           },
           "expr": "sum by (component, resource) (mstar_kv_pages_cached{model_name=~\"$model\"}) / sum by (component, resource) (mstar_kv_pages_total{model_name=~\"$model\"})",
           "legendFormat": "{{component}}/{{resource}} cached",
+          "range": true
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prom"
+          },
+          "expr": "sum by (component) (mstar_rebuild_host_bytes_used{model_name=~\"$model\"}) / sum by (component) (mstar_rebuild_host_bytes_total{model_name=~\"$model\"})",
+          "legendFormat": "{{component}} rebuild host pool",
           "range": true
         }
       ],
@@ -2560,12 +2588,195 @@
       "id": 36
     },
     {
+      "type": "timeseries",
+      "title": "KV preemptions per second",
+      "description": "Requests chosen to drop when a grant past a reservation ran short of KV pages, those dropped, requests preempted a second time, and returned requests preempted again before they kept another token.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prom"
+      },
+      "gridPos": {
+        "x": 0,
+        "y": 141,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "showPoints": "never",
+            "spanNulls": true
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prom"
+          },
+          "expr": "sum by (component) (rate(mstar_kv_preemptions_total{model_name=~\"$model\"}[1m]))",
+          "legendFormat": "{{component}} preempted",
+          "range": true
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prom"
+          },
+          "expr": "sum by (component) (rate(mstar_kv_drops_total{model_name=~\"$model\"}[1m]))",
+          "legendFormat": "{{component}} dropped",
+          "range": true
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prom"
+          },
+          "expr": "sum by (component) (rate(mstar_kv_preempted_again_total{model_name=~\"$model\"}[1m]))",
+          "legendFormat": "{{component}} preempted again",
+          "range": true
+        },
+        {
+          "refId": "D",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prom"
+          },
+          "expr": "sum by (component) (rate(mstar_kv_returns_preempted_total{model_name=~\"$model\"}[1m]))",
+          "legendFormat": "{{component}} returns preempted again",
+          "range": true
+        }
+      ],
+      "id": 48
+    },
+    {
+      "type": "timeseries",
+      "title": "KV rebuilds: tokens prefilled and cached pages found",
+      "description": "Tokens the rebuild rows prefilled per second, cache hits included; dashed: pages a rebuild row found in the prefix cache per second.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "prom"
+      },
+      "gridPos": {
+        "x": 12,
+        "y": 141,
+        "w": 12,
+        "h": 8
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "showPoints": "never",
+            "spanNulls": true
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "unit": "short"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byFrameRefID",
+              "options": "B"
+            },
+            "properties": [
+              {
+                "id": "custom.lineStyle",
+                "value": {
+                  "fill": "dash",
+                  "dash": [
+                    10,
+                    10
+                  ]
+                }
+              },
+              {
+                "id": "custom.axisPlacement",
+                "value": "right"
+              },
+              {
+                "id": "unit",
+                "value": "short"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none"
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prom"
+          },
+          "expr": "sum by (component) (rate(mstar_kv_rebuild_tokens_total{model_name=~\"$model\"}[1m]))",
+          "legendFormat": "{{component}} rebuild tok/s",
+          "range": true
+        },
+        {
+          "refId": "B",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "prom"
+          },
+          "expr": "sum by (component) (rate(mstar_kv_rebuild_cached_pages_total{model_name=~\"$model\"}[1m]))",
+          "legendFormat": "{{component}} cached pages/s",
+          "range": true
+        }
+      ],
+      "id": 47
+    },
+    {
       "type": "row",
       "title": "Tensor transport",
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 141,
+        "y": 149,
         "w": 24,
         "h": 1
       },
@@ -2582,7 +2793,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 142,
+        "y": 150,
         "w": 12,
         "h": 8
       },
@@ -2640,7 +2851,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 142,
+        "y": 150,
         "w": 12,
         "h": 8
       },
@@ -2708,7 +2919,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 150,
+        "y": 158,
         "w": 12,
         "h": 8
       },
@@ -2780,7 +2991,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 150,
+        "y": 158,
         "w": 12,
         "h": 8
       },
@@ -2848,7 +3059,7 @@
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 158,
+        "y": 166,
         "w": 24,
         "h": 1
       },
@@ -2866,7 +3077,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 159,
+        "y": 167,
         "w": 12,
         "h": 8
       },
@@ -3045,7 +3256,7 @@
       },
       "gridPos": {
         "x": 12,
-        "y": 159,
+        "y": 167,
         "w": 12,
         "h": 8
       },
@@ -3101,7 +3312,7 @@
       },
       "gridPos": {
         "x": 0,
-        "y": 167,
+        "y": 175,
         "w": 24,
         "h": 8
       },

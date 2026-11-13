@@ -1,7 +1,9 @@
 
+from abc import ABC, abstractmethod
 from collections.abc import Callable, Collection, KeysView, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import Enum
+from itertools import combinations
 from typing import Any, ClassVar, NamedTuple
 
 # The graph walk on a piecewise region's step context: the region declares, plans and
@@ -25,10 +27,15 @@ class Segment(NamedTuple):
     label: str
     span: int
 
+
 @dataclass(frozen=True)
 class ResourceStep:
     # Work for one resource, for one step
     segments: tuple[Segment, ...] | None = None
+    # source labels -> the plan label one forward packs them under (batched CFG, say); the
+    # resources that plan the step's layout (KV, the sequence shard) read it. Out of the hash, so a
+    # step without other unhashable fields stays hashable
+    combined_labels: dict[tuple[str, ...], str] = field(default_factory=dict, kw_only=True, hash=False)
 
 @dataclass(frozen=True)
 class BucketKey:
@@ -37,10 +44,23 @@ class BucketKey:
     num_tokens: int
     # Matches additional_key_info in CudaGraphConfig
     cg_key_info: Any | None = None
+    # the keys of the resources this capture leaves running lean
+    # (`Resource.lean_capture`); empty for the plain bucket every step can replay
+    lean: frozenset[str] = frozenset()
 
     def __str__(self) -> str:
         key = "" if self.cg_key_info is None else f",key={self.cg_key_info}"
-        return f"{self.graph_walk}[bs={self.bs},tokens={self.num_tokens}{key}]"
+        lean = f",lean={'+'.join(sorted(self.lean))}" if self.lean else ""
+        return f"{self.graph_walk}[bs={self.bs},tokens={self.num_tokens}{key}{lean}]"
+
+
+def lean_subsets(keys: Sequence[str]) -> tuple[frozenset[str], ...]:
+    """The non-empty subsets of ``keys``, largest first, those of one size in the
+    order of ``keys``: the lean twins a step that leaves all of ``keys`` lean may
+    replay, in the order it tries them."""
+    return tuple(
+        frozenset(subset) for size in range(len(keys), 0, -1) for subset in combinations(keys, size)
+    )
 
 
 @dataclass(frozen=True)
@@ -121,12 +141,33 @@ class StepContext:
     # plan prefill attention even when every row is one token: a packed
     # capture's forward reads per-row token offsets
     force_prefill: bool = False
+    # How many times this step's capture replays: the host plans once and the
+    # step counts for this many iterations. The worker asks, and `StepRunner`
+    # narrows it to what the step's resources allow (`Resource.max_repeats`).
+    repeats: int = 1
+    # the node's `ResidentPlanner` when this step's capture reads the resident
+    # tables: a resource then stages nothing per row (see `resources/resident.py`)
+    resident: Any = None
+    # what that planner staged for this step
+    resident_plan: Any = None
     # rid -> input tokens a chunked row runs after this step
     chunk_tokens_after: Mapping[int, int] = field(default_factory=dict)
     # the rows whose walk grows its state by those tokens, so a resource may
     # reserve them now (``ChunkingPolicy.reserve_whole_prefill``). Check it
     # before reserving by ``chunk_tokens_after``.
     reserve_whole_prefill: PerReqSetting = ALL_SET
+    # rows that recompute KV their request already had: the step throws their
+    # samples away, and they change no per-request state but the KV
+    rebuild_rids: frozenset[int] = frozenset()
+    # the keys of the resources that run lean this step: its lease's
+    # (`BucketKey.lean`), or for an eager step those whose `lean_for` holds for
+    # every row. Set by the engine; a piecewise region's step takes its bucket's.
+    lean: frozenset[str] = frozenset()
+
+    @property
+    def replays(self) -> bool:
+        """Whether this step replays a captured graph, so its forward runs no Python."""
+        return self.slot_lease is not None and not self.capture
 
     def walk_of(self, rid: int) -> str:
         return self.request_walks.get(rid, self.graph_walk)
@@ -148,6 +189,16 @@ class StepContext:
             real = self._real_rids = frozenset(self.request_ids)
         return rid in real
 
+    def real_rows(self) -> frozenset | None:
+        """``request_ids`` as a set when the step has padding rows, else None
+        (no row is padding)."""
+        if self._padded_request_ids is None:
+            return None
+        real = self._real_rids
+        if real is None:
+            real = self._real_rids = frozenset(self.request_ids)
+        return real
+
     def is_padding_row(self, rid: str) -> bool:
         """Whether ``rid`` is a replay's padding row rather than a real request.
 
@@ -164,25 +215,72 @@ class StepContext:
         self.piecewise_leases = leases
 
 
+class StepHandle(ABC):
+    """What a layer holds for something a step's ``state`` lists. The engine opens it around each step's calls."""
+
+    @abstractmethod
+    def begin_step(self, step: "SubmoduleStep") -> None:
+        """Answer for ``step`` from here on. Raises if the handle is already open."""
+
+    @abstractmethod
+    def check_step(self, step: "SubmoduleStep") -> None:
+        """Refuse the step's calls as a whole, before any resource commits them."""
+
+    @abstractmethod
+    def end_step(self, step: "SubmoduleStep") -> None:
+        """Close the handle, on any path out of the step."""
+
+    @abstractmethod
+    def commit_step(self, step: "SubmoduleStep") -> None:
+        """Apply what the handle itself holds of a step the resources just committed."""
+
+
 @dataclass(frozen=True)
 class SubmoduleStep:
-    steps: dict[str, ResourceStep] # resource key -> step within cumulative
+    # resource key -> step within cumulative
+    steps: dict[str, ResourceStep] = field(default_factory=dict)
 
     # used for convenience only: if a ResourceStep does not specify segments,
     # it gets this list
     segments: list[Segment] | None = None
+    # the labels this step's forward packs together, declared once here: every ResourceStep
+    # that doesn't set its own gets it, and a ResourceStep that sets any other (or any, when this is empty)
+    # is refused, so the KV plan and the sequence shard agree
+    combined_labels: dict[tuple[str, ...], str] = field(default_factory=dict, kw_only=True)
 
     # Matches additional_key_info in CudaGraphConfig
     cg_key_info: Any | None = None
 
     _ctx: StepContext = None # set by the engine
 
+    # declared array or sampler -> what this step does to it, which the engine
+    # expands into ``steps`` (`mstar.engine.state.adapters.state_steps`)
+    state: Mapping[str, Any] = field(default_factory=dict)
+    # the handles of what ``state`` lists, and of the node's sequence shard, set by that expansion
+    state_handles: tuple[StepHandle, ...] = field(default=(), init=False)
+
     def __post_init__(self):
-        if self.segments is None:
-            return
-        for step in self.steps.values():
-            if step.segments is None:
+        if not self.combined_labels:
+            for key, step in self.steps.items():
+                if step.combined_labels:
+                    raise ValueError(
+                        f"step {key!r} declares combined_labels {step.combined_labels}, its submodule step none: "
+                        "declare them once, on the SubmoduleStep"
+                    )
+            if self.segments is None:
+                return
+        for key, step in self.steps.items():
+            if step.segments is None and self.segments is not None:
                 object.__setattr__(step, "segments", self.segments)
+            if not self.combined_labels:
+                continue
+            if not step.combined_labels:
+                object.__setattr__(step, "combined_labels", self.combined_labels)
+            elif step.combined_labels != self.combined_labels:
+                raise ValueError(
+                    f"step {key!r} declares combined_labels {step.combined_labels}, its submodule step "
+                    f"{self.combined_labels}: declare them once, on the SubmoduleStep"
+                )
 
     @property
     def ctx(self):
@@ -192,6 +290,25 @@ class SubmoduleStep:
         # the step is frozen so a submodule can't rewrite its own declaration;
         # the engine still owns this one field
         object.__setattr__(self, "_ctx", ctx)
+
+    def set_state_handles(self, handles: tuple[StepHandle, ...]) -> None:
+        object.__setattr__(self, "state_handles", handles)
+
+    def begin_calls(self) -> None:
+        for handle in self.state_handles:
+            handle.begin_step(self)
+
+    def check_calls(self) -> None:
+        for handle in self.state_handles:
+            handle.check_step(self)
+
+    def commit_calls(self) -> None:
+        for handle in self.state_handles:
+            handle.commit_step(self)
+
+    def end_calls(self) -> None:
+        for handle in self.state_handles:
+            handle.end_step(self)
 
     def get(self, key: str) -> ResourceStep | None:
         return self.steps.get(key)
@@ -273,6 +390,8 @@ class FullAdmitOutcome(NamedTuple):
     failed_resource: str | None = None
     # waits for capacity on its node, until `StepRunner.admit_waiting` admits it
     queued: bool = False
+    # dropped on its node: not ready until a rebuild from its token ids lands
+    rebuild: bool = False
 
     @property
     def ok(self) -> bool:
@@ -291,3 +410,4 @@ FULL_ADMIT_OK = FullAdmitOutcome(ADMIT_OK)
 # admitted, but something it needs has not landed yet: retry, don't fail
 FULL_ADMIT_NOT_READY = FullAdmitOutcome(AdmitOutcome(ok=True, ready=False))
 FULL_ADMIT_QUEUED = FullAdmitOutcome(AdmitOutcome(ok=True, ready=False), queued=True)
+FULL_ADMIT_REBUILD = FullAdmitOutcome(AdmitOutcome(ok=True, ready=False), rebuild=True)

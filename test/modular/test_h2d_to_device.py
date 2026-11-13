@@ -7,11 +7,12 @@ from __future__ import annotations
 
 import types
 
+import numpy as np
 import pytest
 import torch
 
 from mstar.utils import h2d
-from mstar.utils.h2d import to_device_nonblocking
+from mstar.utils.h2d import PinnedStager, to_device_nonblocking
 
 
 @pytest.fixture(params=["cuda", "xpu"])
@@ -44,6 +45,15 @@ def test_a_non_contiguous_input_is_copied_correctly(accelerator_device):
     assert torch.equal(got.cpu(), tensor)
 
 
+def test_a_numpy_array_is_staged_through_pinned_memory(accelerator_device):
+    """torch.tensor(ndarray, pin_memory=True) raises, so an array (a plan's token indices)
+    goes through the tensor path; the CPU device never pins, so only this case catches it."""
+    array = np.arange(12, dtype=np.int32).reshape(3, 4)[:, ::2]
+    got = to_device_nonblocking(array, accelerator_device, torch.int64)
+    torch.accelerator.synchronize(accelerator_device)
+    assert got.dtype == torch.int64 and torch.equal(got.cpu(), torch.from_numpy(array.copy()).long())
+
+
 def test_an_empty_tensor_arrives_with_its_shape(accelerator_device):
     got = to_device_nonblocking(torch.empty(0, 3), accelerator_device)
     assert got.shape == (0, 3) and got.device == accelerator_device
@@ -71,3 +81,24 @@ def test_an_already_pinned_tensor_is_copied_from_in_place(monkeypatch, contiguou
     # a non-contiguous one is packed into a pinned buffer: ``.to`` would pack it pageable and sync
     assert (pinned_allocs == []) == contiguous and (got.data_ptr() == source.data_ptr()) == contiguous
     assert torch.equal(got, source)
+
+
+def test_runs_fill_their_destinations_in_order():
+    stager = PinnedStager(torch.long, numel=4)
+    store = torch.zeros(10, dtype=torch.long)
+    stager.copy_runs_([store[1:3], store[6:9]], [1, 2, 3, 4, 5])
+    assert store.tolist() == [0, 1, 2, 0, 0, 0, 3, 4, 5, 0]
+
+
+def test_runs_past_the_staging_buffer_grow_it(accelerator_device):
+    stager = PinnedStager(torch.long, numel=4)
+    # two runs that together are past one segment, so the claim grows the arena
+    run = stager._seg_numel // 2 + 8
+    store = torch.zeros(4 * run, dtype=torch.long, device=accelerator_device)
+    values = np.arange(1, 2 * run + 1, dtype=np.int64)
+    stager.copy_runs_([store[:run], store[2 * run:3 * run]], values)
+    torch.accelerator.synchronize(accelerator_device)
+    assert stager._seg_numel >= 2 * run
+    assert store[:run].tolist() == values[:run].tolist()
+    assert store[run:2 * run].tolist() == [0] * run
+    assert store[2 * run:3 * run].tolist() == values[run:].tolist()

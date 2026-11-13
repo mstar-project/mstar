@@ -14,6 +14,12 @@ from dataclasses import dataclass
 WAN22_VARIANT_TI2V_5B = "ti2v_5b"
 
 
+# The DiT's self-attention: the array over its tokens, and the read that names its resource.
+DIT_TOKENS, SELF_ATTN = "dit_tokens", "dit_self_attn"
+# On SP ranks, splits each row of the DiT's tokens over them (the SeqShard in Wan22Model.declare_state).
+DIT_SHARD = "dit_seq_shard"
+
+
 @dataclass
 class Wan22Config:
     """Wan2.2-TI2V-5B model configuration.
@@ -45,7 +51,6 @@ class Wan22Config:
     text_max_seq_len: int = 512
 
     # Wan2.2-VAE (vae/config.json)
-    vae_z_dim: int = 48
     vae_scale_factor_spatial: int = 16  # pixels per latent cell (H and W)
     vae_scale_factor_temporal: int = 4  # frames per latent frame
 
@@ -65,7 +70,7 @@ class Wan22Config:
     default_negative_prompt: str = ""
     video_fps: int = 24
 
-    # Ceiling on the denoise loop; the per-request step count is clamped to it.
+    # The denoise loop's max_iters; the conductor refuses a num_inference_steps past it.
     max_denoise_steps: int = 100
 
     # Ceiling on a request's height x width x num_frames (about 3.6x the default
@@ -87,12 +92,6 @@ class Wan22Config:
     # own compiled graph, on top of the shapes above.
     dit_max_batch_size: int = 1
 
-    # The DiT's self-attention kernel: "flashinfer" runs it through the engine's
-    # ragged resource (FlashInfer's ragged prefill, FA3 on Hopper); "sdpa" runs
-    # torch SDPA, the reference pipeline's kernel. The cross-attention always
-    # runs SDPA.
-    attention_backend: str = "flashinfer"
-
     # VAE-decode tiling policy: "auto" decodes untiled when free VRAM comfortably
     # exceeds the estimated untiled peak for the output size and tiles otherwise;
     # "tiled"/"untiled" force a path. WAN22_VAE_DECODE_TILING overrides at runtime.
@@ -113,10 +112,6 @@ class Wan22Config:
         # rather than read as on.
         if not isinstance(self.vae_decode_fast, bool):
             raise ValueError(f"Wan2.2 vae_decode_fast must be true or false, got {self.vae_decode_fast!r}.")
-        if self.attention_backend not in ("flashinfer", "sdpa"):
-            raise ValueError(
-                f"Wan2.2 attention_backend must be 'flashinfer' or 'sdpa', got {self.attention_backend!r}."
-            )
         self.fast_decode_sizes()
 
     def fast_decode_sizes(self) -> frozenset[tuple[int, int]]:

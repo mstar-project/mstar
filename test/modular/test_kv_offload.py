@@ -139,7 +139,7 @@ def _scribble(mgr: KVManager) -> None:
 
 
 def _assert_pages_conserved(mgr: KVManager) -> None:
-    free = list(mgr._arena.allocator.free_pages.queue)
+    free = mgr._arena.free_pages()
     held = [
         page
         for streams in mgr._streams.values()
@@ -705,7 +705,7 @@ def test_removing_a_request_forgets_its_unwind_record():
 
     mgr.remove_request("r0")
 
-    assert mgr._admit_reserved_pages == {}, (
+    assert not mgr._admit_reserved_pages, (
         "the record outlived the request; the next holder of this handle would "
         "have its pages unwound"
     )
@@ -724,7 +724,7 @@ def test_resetting_a_request_forgets_its_unwind_record():
 
     mgr.reset_request("r0", free=True)
 
-    assert mgr._admit_reserved_pages == {}
+    assert not mgr._admit_reserved_pages
 
 
 @requires_cuda

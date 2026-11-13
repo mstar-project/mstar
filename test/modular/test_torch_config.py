@@ -8,18 +8,51 @@ import pytest
 import torch
 
 from mstar.engine import _default_compile_caches, recompile_limit
-from mstar.worker.worker import Worker
+from mstar.testing_utils.worker import make_worker
 
 
 def test_executor_thread_gets_torch_config():
-    worker = Worker.__new__(Worker)  # skips __init__, which opens sockets
-    worker.device = torch.device("cpu")
-    with ThreadPoolExecutor(1, initializer=worker._init_engine_thread) as ex:
+    worker = make_worker(device=torch.device("cpu"))
+    with ThreadPoolExecutor(1, initializer=worker.executor._init_engine_thread) as ex:
         limit, unspec = ex.submit(lambda: (
             torch._dynamo.config.recompile_limit,
             torch._dynamo.config.allow_unspec_int_on_nn_module,
         )).result()
     assert (limit, unspec) == (recompile_limit(), True)
+
+
+def test_the_engine_threads_start_before_a_compiled_call_can_raise_the_limit():
+    """Before torch 2.12 dynamo's config is process-wide: a thread whose initializer ran only at
+    its first job would read and write the limit beside another thread's ``with_recompile_limit``,
+    so the pool's thread runs its initializer when the pool is built."""
+    worker = make_worker(device=torch.device("cpu"))
+    started = []
+    init = worker.executor._init_engine_thread
+    worker.executor._init_engine_thread = lambda: (started.append(1), init())
+    pool = worker.executor._engine_thread_pool("mstar-plan")
+    try:
+        assert started == [1], "the engine thread's initializer waited for its first job"
+    finally:
+        pool.shutdown()
+
+
+def test_a_raised_recompile_limit_holds_inside_its_calls_only():
+    from mstar.engine import with_recompile_limit
+
+    config = torch._dynamo.config
+    seen = []
+    before = (config.recompile_limit, config.accumulated_recompile_limit)
+    wrapped = with_recompile_limit(
+        lambda: seen.append((config.recompile_limit, config.accumulated_recompile_limit)), 500)
+    wrapped()
+    # past dynamo's per-code-object total too, or the entries over it would run uncompiled
+    assert seen == [(500, 500)]
+    assert (config.recompile_limit, config.accumulated_recompile_limit) == before
+
+    def plain():
+        return None
+
+    assert with_recompile_limit(plain, None) is plain
 
 
 @pytest.mark.parametrize(

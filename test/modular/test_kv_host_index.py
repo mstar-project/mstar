@@ -10,9 +10,9 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 
+from mstar.engine.resources import StepAllowance
 from mstar.engine.resources.kv import manager as manager_mod
-from mstar.engine.resources.kv.arena import PageArena
-from mstar.engine.resources.kv.cache import PageAllocator
+from mstar.engine.resources.kv.arena import new_page_arena
 from mstar.engine.resources.kv.config import KVReqConfig, KVStep, PagedKVConfig, PrefixSpan, StreamLayout
 from mstar.engine.resources.kv.cpu_page_pool import CPUPagePool
 from mstar.engine.resources.kv.keys import chain
@@ -38,13 +38,15 @@ class _Event:
 
 class _HostPool(CPUPagePool):
     def __init__(self, max_cpu_pages: int):
-        self.arena = PageArena(kv_cache=None, allocator=PageAllocator(max_cpu_pages))
+        self.arena = new_page_arena(max_cpu_pages)
         self.index = PrefixIndex(self.arena)
-        self.offloaded = {}
+        self.arena.index = self.index
+        self.offloaded, self.reserved = {}, {}
+        self._unmoved = 0
         self._refused_logged_at = None
         self._refused_unlogged = 0
-        self.dropped = self.written = self.cancelled = 0
-        self._dropped_logged_at = None
+        self.dropped = self.written = self.cancelled = self.guaranteed = 0
+        self._dropped_logged_at = self._guaranteed_logged_at = None
         self.copied_out: list[int] = []
         self.copied_in: list[int] = []
         self.written_out: list[int] = []
@@ -89,6 +91,7 @@ def _manager(max_num_pages: int = 128, host_pages: int = 64) -> KVManager:
         ),
         name="kv", joint_comm_group=None, transfer_engine_info=None,
         device=torch.device("cpu"), dtype=torch.float32,
+        host_allowance=StepAllowance(),
     )
     kv.enable_prefix_cache(ROOT)
     kv._cpu_pool = _HostPool(host_pages)
@@ -193,7 +196,7 @@ def test_a_full_host_evicts_cached_pages_and_never_an_offloaded_requests():
 
     assert kv.offload("c") == 0, "c fit on a host that b fills"
     assert _host_pages(kv, "b") == held
-    assert all(kv._cpu_pool.arena.num_owners[page] for page in held), (
+    assert all(kv._cpu_pool.arena.owners(page) for page in held), (
         "making room for c freed a page b is still offloaded on"
     )
 
@@ -311,7 +314,7 @@ def test_a_request_removed_while_its_prefix_is_arriving_leaks_nothing():
 
     kv.remove_request("b")
 
-    assert all(kv._arena.num_owners[page] for page in arriving), (
+    assert all(kv._arena.owners(page) for page in arriving), (
         "a page still being copied into went back to the free list"
     )
     _land(kv)
@@ -351,4 +354,16 @@ def test_a_request_looked_up_skips_the_host_walk_until_its_stream_resets():
     assert len(kv._cpu_pool.copied_in) == copied + 6, "a request whose stream reset didn't look its prefix up again"
 
 
+def test_a_host_pool_needs_the_engines_allowance():
+    """The pool built an allowance of its own when none was passed, so a caller that left out the engine's gave the
+    copy engine a second budget."""
+    kv = KVManager(
+        cfg=PagedKVConfig(num_layers=1, num_kv_heads=1, head_dim=4, max_seq_len=4096, max_num_pages=8,
+                          page_size=PAGE_SIZE),
+        name="kv", joint_comm_group=None, transfer_engine_info=None, device=torch.device("cpu"), dtype=torch.float32,
+    )
+    kv.enable_prefix_cache(ROOT)
+    kv._cpu_pool = _HostPool(8)
 
+    with pytest.raises(AssertionError, match="StepAllowance"):
+        kv._open_host_writes()

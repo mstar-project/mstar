@@ -2,9 +2,10 @@ import torch
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
-from mstar.distributed.utils import divide, split_tensor_along_last_dim
+from mstar.distributed.utils import divide, kv_head_replicas, split_tensor_along_last_dim
 from mstar.engine.resources.lora.config import LoraTarget
 from mstar.model.components.lora.capable import LoraBound, LoraCapable, apply_lora
+from mstar.model.components.quant_linear import QuantCapability
 
 
 class _ColumnLora(LoraBound):
@@ -150,6 +151,12 @@ class ColumnParallelLinear(nn.Module, LoraCapable):
             return self.comm_group.all_gather(output_parallel, dim=-1)
         return output_parallel
 
+    def quant_capability(self) -> QuantCapability:
+        return QuantCapability(False, (
+            "a tensor-parallel linear gathers or splits around its own GEMM; a format would apply per shard "
+            "([N / tp, K] here) inside that forward, which takes no format yet"
+        ))
+
     def lora_target(self) -> LoraTarget:
         return LoraTarget(
             in_features=self.input_size_per_partition,
@@ -201,12 +208,14 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         ``param`` at the correct offset.
 
         ``loaded_weight`` is the full checkpoint tensor for the sub-shard
-        identified by ``loaded_shard_id`` (an index into ``output_sizes``).
+        identified by ``loaded_shard_id`` (an index into ``output_sizes``), or
+        with ``loaded_shard_id=None`` every sub-shard stored fused, in order
+        (Phi-3 and Phi-4's ``gate_up_proj``).
         """
-        assert loaded_shard_id is not None, (
-            "MergedColumnParallelLinear.weight_loader requires a loaded_shard_id "
-            "(index into output_sizes)."
-        )
+        if loaded_shard_id is None:
+            for shard_id, part in enumerate(loaded_weight.split(self.output_sizes, dim=0)):
+                self.weight_loader(param, part, shard_id)
+            return
         assert 0 <= loaded_shard_id < len(self.output_sizes)
         shard_output_size = self.output_sizes[loaded_shard_id]
         shard_per_partition = shard_output_size // self.tp_size
@@ -227,12 +236,16 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
         dst.copy_(src)
 
     def lora_target(self) -> LoraTarget:
-        # a slice per sub-shard, named by the index the stacked rules route by
+        # a slice per sub-shard, named by the index the stacked rules route by; a
+        # module with no shard id is stored fused, as `weight_loader` loads it, so
+        # it packs every slice
+        names = tuple(range(len(self.output_sizes)))
         return LoraTarget(
             in_features=self.input_size_per_partition,
             out_slices=tuple(self.output_sizes),
             parallel="column",
-            slice_names=tuple(range(len(self.output_sizes))),
+            slice_names=names,
+            slice_packs=((None, names),) if len(names) > 1 else None,
         )
 
 
@@ -269,12 +282,7 @@ class QKVParallelLinear(ColumnParallelLinear):
         # Divide the weight matrix along the last dimension.
         tp_size = comm_group.world_size
         self.num_heads = divide(self.total_num_heads, tp_size)
-        if tp_size >= self.total_num_kv_heads:
-            self.num_kv_heads = 1
-            self.num_kv_head_replicas = divide(tp_size, self.total_num_kv_heads)
-        else:
-            self.num_kv_heads = divide(self.total_num_kv_heads, tp_size)
-            self.num_kv_head_replicas = 1
+        self.num_kv_heads, self.num_kv_head_replicas = kv_head_replicas(self.total_num_kv_heads, tp_size)
         input_size = self.hidden_size
         output_size = (
             self.num_heads * self.head_size
@@ -306,11 +314,22 @@ class QKVParallelLinear(ColumnParallelLinear):
         """Copy this rank's q / k / v slice into ``param`` at the right
         offset within the merged qkv parameter.
 
-        ``loaded_shard_id`` must be one of ``"q"``, ``"k"``, or ``"v"``.
+        ``loaded_shard_id`` is one of ``"q"``, ``"k"``, or ``"v"``, or None for
+        a checkpoint that stores the three fused, unsharded, in that order
+        (Phi-3 and Phi-4's ``qkv_proj``).
         For GQA where ``tp_size > total_num_kv_heads`` the K / V heads
         are replicated across ranks (each rank in the same KV-replica
         group loads the same KV head).
         """
+        if loaded_shard_id is None:
+            sizes = (
+                self.total_num_heads * self.head_size,
+                self.total_num_kv_heads * self.head_size,
+                self.total_num_kv_heads * self.v_head_size,
+            )
+            for shard_id, part in zip(("q", "k", "v"), loaded_weight.split(sizes, dim=0), strict=True):
+                self.weight_loader(param, part, shard_id)
+            return
         assert loaded_shard_id in ("q", "k", "v"), (
             f"QKVParallelLinear.weight_loader requires loaded_shard_id "
             f"in {{'q','k','v'}}, got {loaded_shard_id!r}"
@@ -359,6 +378,8 @@ class QKVParallelLinear(ColumnParallelLinear):
             parallel="column",
             slice_names=("q", "k", "v"),
             slice_units=(self.total_num_heads, kv, kv),
+            # a module with no shard id is stored fused, as `weight_loader` loads it
+            slice_packs=((None, ("q", "k", "v")),),
         )
 
 
@@ -498,6 +519,12 @@ class RowParallelLinear(nn.Module, LoraCapable):
 
         return output
 
+    def quant_capability(self) -> QuantCapability:
+        return QuantCapability(False, (
+            "a tensor-parallel linear all-reduces its partial GEMM; a format would apply per shard ([N, K / tp] "
+            "here, K / tp meeting the format's K alignment) inside that forward, which takes no format yet"
+        ))
+
     def lora_target(self) -> LoraTarget:
         return LoraTarget(
             in_features=self.input_size_per_partition * self.tp_size,
@@ -531,12 +558,7 @@ class KVColumnParallelLinear(ColumnParallelLinear):
         tp_size = comm_group.world_size
         self.head_size = head_size
         self.total_num_kv_heads = total_num_kv_heads
-        if tp_size >= total_num_kv_heads:
-            self.num_kv_heads = 1
-            self.num_kv_head_replicas = divide(tp_size, total_num_kv_heads)
-        else:
-            self.num_kv_heads = divide(total_num_kv_heads, tp_size)
-            self.num_kv_head_replicas = 1
+        self.num_kv_heads, self.num_kv_head_replicas = kv_head_replicas(total_num_kv_heads, tp_size)
         super().__init__(
             comm_group=comm_group,
             input_size=input_size,

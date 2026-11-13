@@ -592,12 +592,18 @@ class MooncakeTransferEngine(TensorTransferEngine):
             raise NotImplementedError(f"Unknown protocol {protocol} for mooncake")
 
         self._engine = TransferEngine()
-        self._engine.initialize(
+        # a bad device or fabric is a return code, not a raise
+        ret = self._engine.initialize(
             hostname,
             metadata_server,
             protocol.value.lower(),
             transfer_device,
         )
+        if ret != 0:
+            raise SystemExit(
+                f"Mooncake TransferEngine initialize failed (rc={ret}) for "
+                f"hostname={hostname!r} protocol={protocol.value} device={transfer_device!r}"
+            )
         self._session_id = f"{hostname}:{self._engine.get_rpc_port()}"
 
     def register_memory(self, ptr: int, nbytes: int) -> int:
@@ -1643,7 +1649,8 @@ class TensorCommunicationManager(ABC):
             )
 
     def ack_unread_tensors(self, graph_edges: list[GraphEdge]):
-        """Ack tensors for an already-removed request without reading them.
+        """Ack tensors without reading them, for edges nothing here will consume: a
+        removed request, one with a remove pending, or a stream with no buffer here.
 
         The producer holds these buffers until it gets the TENSOR_RECEIVED ack;
         emit it here so it can reclaim them.

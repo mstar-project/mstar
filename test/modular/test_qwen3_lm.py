@@ -6,6 +6,9 @@ fakes (causal SDPA over the accumulated K/V with GQA, and textbook RoPE), so
 one prefill plus a few decode steps are compared logit for logit.
 """
 
+import sys
+import types
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -15,6 +18,7 @@ pytest.importorskip("transformers")
 from transformers import Qwen3Config, Qwen3ForCausalLM  # noqa: E402
 
 from mstar.distributed.communication import CommGroup  # noqa: E402
+from mstar.engine.resources.convenience import AttentionCallable  # noqa: E402
 from mstar.model.components.qwen3_lm import Qwen3DenseLM, Qwen3LMConfig  # noqa: E402
 
 ATTN, KV, POS = "attn", "kv", "rope"
@@ -226,10 +230,8 @@ class _StubMixer(torch.nn.Module):
 
 def test_qwen3_5_layer_loop_compiles_no_frame_per_layer(dynamo_counts):
     """A captured forward compiles with static ints, so a compiled frame that
-    holds the layer index (Qwen3.5's ``set_cursor`` moves each layer's cursor)
-    recompiles per layer until the recompile limit: four layers must compile
-    no more frames than two. And the frame that holds it must not fail the
-    capture stance, as a ``recursive=False`` one does."""
+    holds the layer index recompiles per layer until the recompile limit: four
+    layers must compile no more frames than two."""
     from mstar.model.qwen3_5.components.language_model import Qwen3_5LanguageModel
     from mstar.model.qwen3_5.config import FULL_ATTENTION, LINEAR_ATTENTION, Qwen3_5Config
 
@@ -245,7 +247,7 @@ def test_qwen3_5_layer_loop_compiles_no_frame_per_layer(dynamo_counts):
         lm = Qwen3_5LanguageModel(config)
         for layer in lm.layers:
             layer.self_attn = _StubMixer(config.hidden_size)
-        return dynamo_counts(lambda h: lm(h, label="main"), torch.randn(3, config.hidden_size)).compiles
+        return dynamo_counts(lm, torch.randn(3, config.hidden_size)).compiles
 
     assert compiles(4) == compiles(2)
 
@@ -268,3 +270,32 @@ def test_the_position_resource_says_when_a_layer_may_fuse_its_rope(overrides, he
         device=torch.device("cpu"), head_dim=head_dim,
     )
     assert rope.fusable_rope_theta(head_dim) == (1e6 if fusable else None)
+
+
+@pytest.mark.parametrize("splits", [False, True])
+def test_a_layer_whose_steps_may_split_writes_its_kv_through_the_exchange(monkeypatch, splits):
+    """The fused norm/RoPE/KV-write kernel writes where ``write_target`` says, outside the
+    exchange a node whose steps may split over SP ranks attends through (which hands the write
+    this rank's tokens and heads), so such a layer rotates in place and calls ``attend``."""
+    calls = []
+    monkeypatch.setitem(sys.modules, "mstar.utils.attention", types.SimpleNamespace(
+        qk_norm_rope_inplace=lambda *args: calls.append("rotate"),
+        qk_norm_rope_kv_write=lambda *args: calls.append("fused_write"),
+    ))
+
+    class Attend:
+        # Ulysses' plan states attend only the pages: reads_step_kv is False
+        attn = types.SimpleNamespace(reads_step_kv=lambda: False, run=lambda q, kv_cache_layer: q)
+        kv = types.SimpleNamespace(write_target=lambda: (None, None, None, 4), layer_view=lambda: None)
+
+        def _exchanges(self):
+            return splits
+
+        def __call__(self, q, k, v):
+            calls.append("attend")
+            return q
+
+    norm = types.SimpleNamespace(variance_epsilon=1e-6, weight=None)
+    x = torch.zeros(4, 2, 8)
+    AttentionCallable.norm_rope_attend(Attend(), x, x, x, norm, norm, None, 1e6)
+    assert calls == (["rotate", "attend"] if splits else ["fused_write"])

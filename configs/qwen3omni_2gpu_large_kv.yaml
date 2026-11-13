@@ -1,7 +1,10 @@
 model: "qwen3_omni"
 max_seq_len: 32768
-# The Thinker's KV pool at its default 2,048 pages, 24 GiB at 12 MiB a page. It fits
-# beside the weights on an H200; qwen3omni_2gpu.yaml sizes it for an 80 GB GPU.
+# The 2-GPU placement for H200-class GPUs: qwen3omni_2gpu.yaml with the Thinker's KV
+# pool at its default 2,048 pages (256k tokens, 24 GiB at 12 MiB a page) and no host
+# pages, for workloads whose concurrent requests hold more than 128k tokens of Thinker
+# KV; see the Qwen3-Omni notes in docs/models.rst for its caveats. On 80 GB GPUs, serve
+# qwen3omni_2gpu_h100.yaml.
 node_groups:
   - node_names: [audio_encoder, vision_encoder]
     ranks: [1]

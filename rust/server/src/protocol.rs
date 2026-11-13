@@ -8,7 +8,7 @@
 //! keep the multimodal shapes (audio in `message.audio`, images as data URLs)
 //! flexible, exactly as the Python side does.
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
 
@@ -72,6 +72,12 @@ mod flex {
         }
     }
 
+    /// [`opt_f64`] for a field whose presence matters: serde calls this only
+    /// for a field the request sent, so an absent one stays `None` (the default).
+    pub fn sent_f64<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Option<f64>>, D::Error> {
+        opt_f64(d).map(Some)
+    }
+
     pub fn opt_bool<'de, D: Deserializer<'de>>(d: D) -> Result<Option<bool>, D::Error> {
         match Option::<Value>::deserialize(d)? {
             None | Some(Value::Null) => Ok(None),
@@ -89,6 +95,14 @@ mod flex {
             Some(other) => Err(Error::custom(format!("expected a boolean, got {other}"))),
         }
     }
+}
+
+/// A chat's `stream_options`; `include_usage` is a bool as pydantic reads one,
+/// matching Python's `StreamOptions`.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct StreamOptions {
+    #[serde(default, deserialize_with = "flex::opt_bool")]
+    pub include_usage: Option<bool>,
 }
 
 /// One chat message. `content` is either a plain string or an array of
@@ -114,7 +128,7 @@ pub enum Content {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChatCompletionRequest {
     pub messages: Vec<ChatMessage>,
-    #[allow(dead_code)] // accepted for OpenAI compatibility; the loaded model is fixed
+    /// A LoRA adapter's name runs that adapter (`ServedModels`); the base model's, or none, runs it.
     #[serde(default)]
     pub model: Option<String>,
     /// Passed on as sent; the server's normalize_generation_kwargs holds the rules.
@@ -126,13 +140,10 @@ pub struct ChatCompletionRequest {
     pub max_tokens: Option<i64>,
     #[serde(default, deserialize_with = "flex::opt_i64")]
     pub max_completion_tokens: Option<i64>,
-    /// Accepted for OpenAI compatibility (declared so it does NOT leak into
-    /// `extra` -> model_kwargs); single-choice responses only, as in mstar.
-    #[allow(dead_code)]
+    /// Single-choice responses only: anything but 1 is refused.
     #[serde(default, deserialize_with = "flex::opt_i64")]
     pub n: Option<i64>,
-    /// Accepted for OpenAI compatibility; stop sequences are not applied.
-    #[allow(dead_code)]
+    /// Stop sequences are not applied, so a non-empty one is refused.
     #[serde(default)]
     pub stop: Option<Value>, // str | [str]
     #[serde(default, deserialize_with = "flex::opt_i64")]
@@ -141,6 +152,9 @@ pub struct ChatCompletionRequest {
     /// instead of hard-erroring. Absent / null / false all mean non-streaming.
     #[serde(default, deserialize_with = "flex::opt_bool")]
     pub stream: Option<bool>,
+    /// `{"include_usage": true}` ends a stream with a chunk that carries `usage`.
+    #[serde(default)]
+    pub stream_options: Option<StreamOptions>,
 
     // Multimodal output (vllm-omni / sglang-omni style).
     #[serde(default)]
@@ -157,22 +171,32 @@ pub struct ChatCompletionRequest {
 #[derive(Debug, Clone, Deserialize)]
 pub struct SpeechRequest {
     pub input: String,
-    #[allow(dead_code)] // accepted for OpenAI compatibility; the loaded model is fixed
+    /// A LoRA adapter's name runs that adapter (`ServedModels`); the base model's, or none, runs it.
     #[serde(default)]
     pub model: Option<String>,
     #[serde(default)]
     pub voice: Option<String>,
     #[serde(default = "default_wav")]
     pub response_format: String,
-    /// Accepted for OpenAI compatibility (kept out of `extra`); playback-rate
-    /// adjustment is not applied, as in mstar.
-    #[allow(dead_code)]
-    #[serde(default, deserialize_with = "flex::opt_f64")]
-    pub speed: Option<f64>,
+    /// Kept out of `extra`. `None` when the request did not send it,
+    /// `Some(None)` for an explicit `null`: `audio_speech` forwards a sent
+    /// speed (pydantic's `model_fields_set`) and leaves an unsent one out.
+    #[serde(default, deserialize_with = "flex::sent_f64")]
+    pub speed: Option<Option<f64>>,
     /// `bool | None` in Python (default False); accept an explicit `null`
     /// instead of hard-erroring. Absent / null / false all mean non-streaming.
     #[serde(default, deserialize_with = "flex::opt_bool")]
     pub stream: Option<bool>,
+    /// OpenAI's own streaming switch (`"audio"` | `"sse"`), which its SDK — and
+    /// so LiveKit's TTS plugin — sends instead of `stream`. Declared, so it is
+    /// kept out of `extra` and never reaches the engine as a model kwarg, as
+    /// `create_speech` pops it out of pydantic's `model_extra`. Held as a
+    /// `Value`, not a `String`: absent and an explicit `null` both read as
+    /// "not sent", and any other value is the handler's 400 naming or quoting
+    /// it, not a schema rejection — which is what `stream_format not in (None,
+    /// "audio", "sse")` answers on the Python side.
+    #[serde(default)]
+    pub stream_format: Option<Value>,
     /// Passed on as sent; the server's normalize_generation_kwargs holds the rules.
     #[serde(default)]
     pub temperature: Option<Value>,
@@ -189,7 +213,7 @@ pub struct SpeechRequest {
 #[derive(Debug, Clone, Deserialize)]
 pub struct ImageGenerationRequest {
     pub prompt: String,
-    #[allow(dead_code)] // accepted for OpenAI compatibility; the loaded model is fixed
+    /// A LoRA adapter's name runs that adapter (`ServedModels`); the base model's, or none, runs it.
     #[serde(default)]
     pub model: Option<String>,
     /// OpenAI `n`: number of images to generate (submitted as n engine requests).
@@ -197,7 +221,6 @@ pub struct ImageGenerationRequest {
     pub n: Option<i64>,
     #[serde(default)]
     pub size: Option<String>,
-    #[allow(dead_code)]
     #[serde(default)]
     pub response_format: Option<String>,
     #[serde(default, deserialize_with = "flex::opt_i64")]
@@ -215,15 +238,13 @@ pub struct ImageGenerationRequest {
 #[derive(Debug, Clone, Deserialize)]
 pub struct VideoGenerationRequest {
     pub prompt: String,
-    #[allow(dead_code)] // accepted for OpenAI compatibility; the loaded model is fixed
+    /// A LoRA adapter's name runs that adapter (`ServedModels`); the base model's, or none, runs it.
     #[serde(default)]
     pub model: Option<String>,
-    #[allow(dead_code)]
     #[serde(default, deserialize_with = "flex::opt_i64")]
     pub n: Option<i64>,
     #[serde(default)]
     pub size: Option<String>,
-    #[allow(dead_code)]
     #[serde(default)]
     pub response_format: Option<String>,
     #[serde(default, deserialize_with = "flex::opt_i64")]
@@ -246,40 +267,6 @@ pub struct VideoGenerationRequest {
 
 fn default_wav() -> String {
     "wav".to_string()
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct ModelCard {
-    pub id: String,
-    pub object: String,
-    pub created: i64,
-    pub owned_by: String,
-}
-
-impl ModelCard {
-    pub fn new(id: impl Into<String>, created: i64) -> Self {
-        Self {
-            id: id.into(),
-            object: "model".to_string(),
-            created,
-            owned_by: "mstar".to_string(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct ModelList {
-    pub object: String,
-    pub data: Vec<ModelCard>,
-}
-
-impl ModelList {
-    pub fn new(data: Vec<ModelCard>) -> Self {
-        Self {
-            object: "list".to_string(),
-            data,
-        }
-    }
 }
 
 #[cfg(test)]
@@ -326,6 +313,23 @@ mod tests {
     }
 
     #[test]
+    fn include_usage_reads_a_bool_as_pydantic_does() {
+        let usage = |v: &str| {
+            chat(&format!(r#"{{"messages":[],"stream":true,"stream_options":{{"include_usage":{v}}}}}"#))
+                .stream_options
+                .and_then(|o| o.include_usage)
+        };
+        assert_eq!(usage("true"), Some(true));
+        assert_eq!(usage(r#""false""#), Some(false));
+        assert_eq!(usage("1"), Some(true));
+        assert_eq!(usage("null"), None);
+        assert!(serde_json::from_str::<ChatCompletionRequest>(
+            r#"{"messages":[],"stream_options":{"include_usage":"maybe"}}"#
+        )
+        .is_err());
+    }
+
+    #[test]
     fn rejects_genuinely_invalid_scalars() {
         // A non-integral value for an int field is still an error.
         assert!(serde_json::from_str::<ChatCompletionRequest>(
@@ -357,6 +361,41 @@ mod tests {
         assert_eq!(max_tokens("-9223372036854775808.0").unwrap(), Some(i64::MIN));
         let seed = r#"{"messages":[],"seed":1e20}"#;
         assert!(serde_json::from_str::<ChatCompletionRequest>(seed).is_err());
+    }
+
+    #[test]
+    fn speech_speed_tells_unsent_from_null() {
+        let speed = |body: &str| serde_json::from_str::<SpeechRequest>(body).unwrap().speed;
+        assert_eq!(speed(r#"{"input":"x"}"#), None);
+        assert_eq!(speed(r#"{"input":"x","speed":null}"#), Some(None));
+        assert_eq!(speed(r#"{"input":"x","speed":"1.5"}"#), Some(Some(1.5)));
+        assert!(serde_json::from_str::<SpeechRequest>(r#"{"input":"x","speed":"fast"}"#).is_err());
+    }
+
+    /// `stream_format` parses as a declared field, so it stays out of `extra`
+    /// and never reaches the engine as a model kwarg — `create_speech` pops it
+    /// out of `model_extra` for the same reason. Any JSON type parses; the
+    /// handler is what refuses a value that is not `"audio"` or `"sse"`.
+    #[test]
+    fn speech_stream_format_parses_and_stays_out_of_extra() {
+        let speech = |body: &str| serde_json::from_str::<SpeechRequest>(body).unwrap();
+        for body in [
+            r#"{"input":"x"}"#,
+            r#"{"input":"x","stream_format":null}"#,
+            r#"{"input":"x","stream_format":"sse"}"#,
+            r#"{"input":"x","stream_format":"audio"}"#,
+            r#"{"input":"x","stream_format":"nonsense"}"#,
+            r#"{"input":"x","stream_format":17}"#,
+        ] {
+            assert!(!speech(body).extra.contains_key("stream_format"), "{body}");
+        }
+        assert_eq!(speech(r#"{"input":"x"}"#).stream_format, None);
+        assert_eq!(speech(r#"{"input":"x","stream_format":null}"#).stream_format, None);
+        assert_eq!(speech(r#"{"input":"x","stream_format":"sse"}"#).stream_format, Some(json!("sse")));
+        assert_eq!(speech(r#"{"input":"x","stream_format":17}"#).stream_format, Some(json!(17)));
+        // the neighbouring unknown field still flows through as a model kwarg
+        let r = speech(r#"{"input":"x","stream_format":"sse","sentence_chunking":false}"#);
+        assert_eq!(r.extra.get("sentence_chunking"), Some(&json!(false)));
     }
 
     #[test]

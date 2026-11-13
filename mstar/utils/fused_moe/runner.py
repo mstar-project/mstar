@@ -9,13 +9,16 @@ handle only the gate_up GEMM, SwiGLU, down GEMM, and weighted sum over top-k.
 """
 from __future__ import annotations
 
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 import triton.language as tl
 
+from mstar.platforms import current_platform
+from mstar.utils.fused_moe import align
 from mstar.utils.fused_moe.align import moe_align_block_size
 from mstar.utils.fused_moe.kernels import (
+    act_and_mul_quant_fp8,
     act_and_mul_triton,
     get_config,
     get_default_config,
@@ -24,6 +27,9 @@ from mstar.utils.fused_moe.kernels import (
     moe_sum_reduce_triton,
 )
 from mstar.utils.quant_fp8 import FP8_DTYPE, per_token_group_quant_fp8
+
+if TYPE_CHECKING:
+    from mstar.model.components.moe import ExpertsLora
 
 
 class MoeAlignment(NamedTuple):
@@ -38,15 +44,44 @@ class MoeAlignment(NamedTuple):
 def moe_block_m(num_tokens: int, w1: torch.Tensor, top_k: int) -> int:
     """``BLOCK_SIZE_M`` that :func:`fused_experts` aligns to for this batch."""
     experts, two_inter, hidden = w1.shape
-    return get_config(M=num_tokens, E=experts, N=two_inter, K=hidden, top_k=top_k)[0]["BLOCK_SIZE_M"]
+    config, _ = get_config(M=num_tokens, E=experts, N=two_inter, K=hidden, top_k=top_k,
+                           dtype=w1.dtype, device=w1.device)
+    return config["BLOCK_SIZE_M"]
 
 
-def _tl_compute_type(dtype: torch.dtype) -> tl.dtype:
+def _align_ids(topk_ids: torch.Tensor) -> torch.Tensor:
+    """``topk_ids`` as ``moe_align_block_size`` reads them: int32 or int64 as they come (a
+    router's int64 ids need no cast kernel), any other integer type cast to int32."""
+    if topk_ids.dtype not in (torch.int32, torch.int64):
+        topk_ids = topk_ids.to(torch.int32)
+    return topk_ids.contiguous()
+
+
+def tl_compute_type(dtype: torch.dtype) -> tl.dtype:
+    """The Triton dtype the fused-MoE kernel stores its output in, for inputs in ``dtype``."""
     if dtype == torch.bfloat16:
         return tl.bfloat16
     if dtype == torch.float16:
         return tl.float16
     raise ValueError(f"fused_experts: unsupported dtype {dtype}; use bf16 or fp16")
+
+
+def runs_per_pair(
+    hidden_states: torch.Tensor, w1: torch.Tensor, top_k: int, activation: str = "silu",
+    skip_invalid: bool = False,
+) -> bool:
+    """Whether ``fused_experts``, given no alignment and no LoRA, runs this batch as per-pair
+    GEMVs, which read none: a caller that could precompute one has no use for it then. Up to
+    the ``moe_decode`` entry's crossover for these experts on this GPU (``decode.routed_tuning``)."""
+    if skip_invalid or activation != "silu" or not hidden_states.is_cuda or not current_platform.is_cuda():
+        return False
+    # imported here: it needs triton's CUDA extras, which CPU hosts may lack. Its per-pair
+    # tiles target NVIDIA GPUs, so ROCm keeps the grouped path.
+    from mstar.utils.fused_moe import decode
+
+    tuning = decode.routed_tuning(hidden_states, w1, top_k)
+    return hidden_states.shape[0] <= tuning.pair_max_tokens and decode.routed_fits(
+        w1.shape[2], w1.shape[1] // 2, tuning)
 
 
 def fused_experts(
@@ -59,6 +94,7 @@ def fused_experts(
     reduce_results: bool = True,
     skip_invalid: bool = False,
     alignment: MoeAlignment | None = None,
+    lora: "ExpertsLora | None" = None,
 ) -> torch.Tensor:
     """Grouped-GEMM Triton MoE dispatch.
 
@@ -79,7 +115,7 @@ def fused_experts(
         ``(tokens, top_k)``, routing probabilities (possibly
         renormalized).  Dtype matches ``hidden_states``.
     topk_ids : torch.Tensor
-        ``(tokens, top_k)`` int; will be cast to int32 if not already.
+        ``(tokens, top_k)`` int32 or int64, read as they are; any other integer type is cast to int32.
     activation : str
         ``"silu"`` (default) or ``"gelu"``.  Qwen3-Omni always uses silu.
     reduce_results : bool
@@ -94,6 +130,10 @@ def fused_experts(
     alignment : MoeAlignment, optional
         Precomputed alignment of ``topk_ids``. Its ``block_m`` must be
         :func:`moe_block_m` for this shape. Computed here when omitted.
+    lora : ExpertsLora, optional
+        Per-request LoRA deltas on the experts, added to the gate+up GEMM's
+        output before the activation and to the down GEMM's (weighted)
+        output before the top-k sum. None when the layer has none bound.
 
     Returns
     -------
@@ -116,12 +156,24 @@ def fused_experts(
     assert two_inter == 2 * inter, f"w1 dim[1] {two_inter} != 2 * w2 dim[2] {2 * inter}"
 
     top_k = topk_ids.shape[1]
-    # moe_align_block_size expects int32; torch.topk returns int64.
-    topk_ids = topk_ids.to(torch.int32).contiguous()
+    topk_ids = _align_ids(topk_ids)
     topk_weights = topk_weights.contiguous()
+    if alignment is None and lora is None and runs_per_pair(hidden_states, w1, top_k, activation, skip_invalid):
+        from mstar.utils.fused_moe import decode
 
-    config, down_config = get_config(M=num_tokens, E=E, N=two_inter, K=hidden, top_k=top_k)
-    compute_type = _tl_compute_type(hidden_states.dtype)
+        # At a few tokens each expert's GEMM tile is mostly padding rows: per-pair GEMVs
+        # read the same weights without the sort, the padding or a separate SwiGLU and sum.
+        # LoRA deltas join the grouped GEMMs' outputs, which this path has none of.
+        return decode.routed_experts(hidden_states, w1, w2, topk_weights, topk_ids,
+                                     reduce=reduce_results)
+
+    # tuned launch options must reach a compiled launch as constants, and the alignment's torch
+    # fallback breaks the graph before it, so a compiled call without the CUDA op runs the default
+    # tiles. K is the weights' (static under any compile), not the activations'.
+    tuned = alignment is not None or not torch.compiler.is_compiling() or align._cuda_op_available()
+    config, down_config = get_config(M=num_tokens, E=E, N=two_inter, K=k_in, top_k=top_k,
+                                     dtype=hidden_states.dtype, device=hidden_states.device, tuned=tuned)
+    compute_type = tl_compute_type(hidden_states.dtype)
 
     # 1. Token permute + per-expert block alignment.
     block_m = config["BLOCK_SIZE_M"]
@@ -164,6 +216,8 @@ def fused_experts(
         config=config,
         compute_type=compute_type,
     )
+    if lora is not None:
+        lora.gate_up_(hidden_states, cache1)
 
     # 4. SwiGLU: cache2[slot] = silu(gate) * up
     act_and_mul_triton(cache1, cache2, activation=activation)
@@ -185,6 +239,8 @@ def fused_experts(
         config=down_config,
         compute_type=compute_type,
     )
+    if lora is not None:
+        lora.down_(cache2, cache3.view(m_topk, hidden), topk_weights)
 
     # 6. Sum over the top-k slots -> (tokens, hidden).
     if not reduce_results:
@@ -321,7 +377,7 @@ def _fused_experts_fp8_impl(
     assert tuple(w2_scale_inv.shape) == expect2, f"w2_scale_inv {tuple(w2_scale_inv.shape)} != {expect2}"
 
     top_k = topk_ids.shape[1]
-    topk_ids = topk_ids.to(torch.int32).contiguous()
+    topk_ids = _align_ids(topk_ids)
     topk_weights = topk_weights.contiguous()
 
     config = get_default_config(M=num_tokens, E=E, N=two_inter, K=hidden, top_k=top_k)
@@ -340,7 +396,7 @@ def _fused_experts_fp8_impl(
         # launches read the same alignment, so it must match across them.
         config.update(BLOCK_SIZE_N=128, GROUP_SIZE_M=32, num_warps=4, num_stages=3)
         config_down = dict(config)
-    compute_type = _tl_compute_type(hidden_states.dtype)
+    compute_type = tl_compute_type(hidden_states.dtype)
 
     # 1. Token permute + per-expert block alignment.
     sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(topk_ids, config["BLOCK_SIZE_M"], E)
@@ -349,11 +405,6 @@ def _fused_experts_fp8_impl(
     m_topk = num_tokens * top_k
     cache1 = torch.empty(
         (m_topk, two_inter),
-        device=hidden_states.device,
-        dtype=hidden_states.dtype,
-    )
-    cache2 = torch.empty(
-        (m_topk, inter),
         device=hidden_states.device,
         dtype=hidden_states.dtype,
     )
@@ -383,11 +434,8 @@ def _fused_experts_fp8_impl(
         block_shape=block_size,
     )
 
-    # 4. SwiGLU in bf16, then requantize the intermediate for GEMM-2.
-    act_and_mul_triton(
-        cache1, cache2, activation=activation, swiglu_limit=swiglu_limit,
-    )
-    a2_q, a2_s = per_token_group_quant_fp8(cache2, block_k)
+    # 4. SwiGLU in bf16, requantized for GEMM-2 in the same kernel.
+    a2_q, a2_s = act_and_mul_quant_fp8(cache1, block_k, activation=activation, swiglu_limit=swiglu_limit)
 
     # 5. Down GEMM (weighted); top_k=1 exactly as in fused_experts so the
     # kernel reads intermediate rows (and their scales) by slot index.

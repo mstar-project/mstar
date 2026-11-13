@@ -19,11 +19,12 @@ Graph walks:
 
 import json
 import logging
+from collections.abc import Mapping
 
 import torch
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import CurrentForwardConductorMetadata, StreamingConnectionState
+from mstar.conductor.request_info import FINAL_PREFILL
 from mstar.engine.resources import (
     AttentionConfig,
     AttentionSpec,
@@ -36,11 +37,17 @@ from mstar.engine.resources import (
     PositionSpec,
     ResourceReqConfig,
     SamplerSpec,
-    SamplingReqConfig,
 )
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import ForwardPassArgs, KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, TensorAndMetadata
+from mstar.model.base import (
+    KVLabel,
+    LabelLayout,
+    Model,
+    ProcessPromptOutput,
+    Span,
+    WalkStep,
+)
 from mstar.model.canary.config import (
     ATTN,
     CONTEXT_LABEL,
@@ -52,9 +59,17 @@ from mstar.model.canary.config import (
     SAMPLER,
     CanaryModelConfig,
 )
-from mstar.model.components.audio_features import HOP_LENGTH, SAMPLE_RATE, clip_samples, load_speech_file
+from mstar.model.components.audio_features import HOP_LENGTH, clip_samples
+from mstar.model.components.request_kwargs import (
+    GREEDY_SAMPLING,
+    SAMPLING_KEYS,
+    checked_request_kwargs,
+    sampler_capabilities,
+    sampling_config,
+    sampling_defaults,
+)
 from mstar.model.submodule_base import NodeSubmodule
-from mstar.model.utils import SentencePieceDetokenizer, check_kv_pools_fit, check_loaded, kv_pages
+from mstar.model.utils import SentencePieceDetokenizer, TextOutput, check_kv_pools_fit, check_loaded, kv_pages
 from mstar.utils.hf_snapshot import resolve_snapshot_dir
 
 logger = logging.getLogger(__name__)
@@ -66,6 +81,11 @@ CHECKPOINT_FILES = ["*.json", "*.jinja", "*.safetensors"]
 class CanaryModel(Model):
     """Canary speech recognition / translation: FastConformer encoder +
     autoregressive Transformer decoder."""
+
+    DECODE_LOOP = "decode_loop"
+    # greedy, as NeMo and HF decode Canary, under the checkpoint's
+    # generation_config.json; set by __init__
+    sampling_defaults: Mapping[str, object] = GREEDY_SAMPLING
 
     # the route's 40 s window, plus slack for containers that decode longer than
     # their header said; still the largest encoder graph and 4 context pages
@@ -80,6 +100,7 @@ class CanaryModel(Model):
         self.model_path_hf = model_path_hf
         self.local_dir = resolve_snapshot_dir(model_path_hf, cache_dir, allow_patterns=CHECKPOINT_FILES)
         self.config = CanaryModelConfig.from_pretrained(self.local_dir)
+        self.sampling_defaults = sampling_defaults(self.local_dir)
         tokenizer = json.loads((self.local_dir / "tokenizer.json").read_text())
         self._detokenizer = SentencePieceDetokenizer(tokenizer)
         self._submodule_cache: dict[str, NodeSubmodule | None] = {}
@@ -136,7 +157,7 @@ class CanaryModel(Model):
             SamplerSpec(
                 resource_key=SAMPLER, nodes={"decoder"},
                 vocab_size=cfg.vocab_size,
-                enable_repetion_penalty=False,
+                **sampler_capabilities(self.sampling_defaults),
             ),
         ]
 
@@ -144,36 +165,26 @@ class CanaryModel(Model):
         check_kv_pools_fit(self, config, config_path, logger)
 
     def get_request_resource_configs(
-        self, partition_fwd_args: dict[str, ForwardPassArgs],
-        model_kwargs: dict | None = None,
+        self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
     ) -> dict[str, ResourceReqConfig]:
-        del partition_fwd_args
-        model_kwargs = model_kwargs or {}
-        return {
-            SAMPLER: SamplingReqConfig(
-                # greedy by default, as NeMo and HF decode Canary
-                temperature=model_kwargs.get("temperature", 0.0),
-                top_p=model_kwargs.get("top_p", 1.0),
-                ignore_eos=model_kwargs.get("ignore_eos", False),
-            )
-        }
+        del input_modalities, output_modalities
+        return {SAMPLER: sampling_config(self.sampling_defaults, model_kwargs)}
+
+    def request_kwargs(self) -> frozenset[str]:
+        return frozenset({"language", "target_language", "punctuation", "max_output_tokens", *SAMPLING_KEYS})
 
     # -------------------------------------------------------------------
     # graph walks
     # -------------------------------------------------------------------
 
     def get_max_output_tokens(self, **model_kwargs):
-        # the decoder's position table bounds prompt + transcript
+        # The decoder's position table bounds prompt + transcript. A larger
+        # request is refused by the conductor against the decode loop, not clamped.
         limit = self.config.max_position_embeddings - PROMPT_LENGTH
-        requested = model_kwargs.get("max_output_tokens")
-        return limit if requested is None else min(requested, limit)
+        return checked_request_kwargs(model_kwargs).get("max_output_tokens", limit)
 
     def get_max_output_tokens_limit(self) -> int:
         return self.get_max_output_tokens()
-
-    def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
-        # the prefill emits the first of max_output_tokens, so the loop runs one fewer
-        return {"decode_loop": max(1, self.get_max_output_tokens(**model_kwargs) - 1)}
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         prefill = Sequential([
@@ -196,64 +207,29 @@ class CanaryModel(Model):
                 name="decoder",
                 input_names=["text_inputs"],
                 outputs=[
-                    GraphEdge(next_node=EMIT_TO_CLIENT, name="new_token", output_modality="text"),
+                    GraphEdge(next_node=EMIT_TO_CLIENT, name="text_inputs", output_modality="text"),
                     GraphEdge(next_node="decoder", name="text_inputs"),
                 ],
             ),
-            max_iters=self.get_max_output_tokens(),
+            # the default request's iterations: past them a request overruns the position table
+            max_iters=self.get_loop_caps()["decode_loop"],
             outputs=[],
         )
         return dict(prefill=prefill, decode=decode)
 
-    def get_initial_forward_pass_args(
+    def walk_plan(
         self,
         partition_name: str,
         input_modalities: list[str],
         output_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]],
-        model_kwargs: dict | None = None,
-    ) -> ForwardPassArgs:
-        metadata = CurrentForwardConductorMetadata(
-            input_modalities=input_modalities,
-            output_modalities=output_modalities,
-            graph_walk="prefill",
-            is_prefill=True,
-        )
-        audio_edge = GraphEdge(next_node="audio_encoder", name="audio")
-        audio_edge.tensor_info = input_signals.get("audio", [])
-        text_edge = GraphEdge(next_node="decoder", name="text_inputs")
-        text_edge.tensor_info = input_signals.get("text_inputs", [])
-        inputs = [audio_edge, text_edge]
-        return ForwardPassArgs(
-            full_metadata=metadata,
-            inputs=inputs,
-            unpersist_tensors=sum([inp.tensor_info for inp in inputs], start=[]),
-            step_metadata={"is_prefill": True},
-        )
-
-    def get_partition_forward_pass_args(
-        self,
-        partition_name: str,
-        partition_metadata: CurrentForwardConductorMetadata,
-        persist_signals: dict[str, list[TensorPointerInfo]],
-        incoming_connections: list[StreamingConnectionState] | None = None,
-    ) -> ForwardPassArgs:
-        """prefill -> decode loop -> done."""
-        metadata = partition_metadata
-        if metadata.is_prefill:
-            metadata.is_prefill = False
-            metadata.graph_walk = "decode"
-        elif metadata.graph_walk == "decode":
-            # the decode loop returned: EOS or the token limit
-            return ForwardPassArgs(full_metadata=metadata, inputs=[], unpersist_tensors=[], request_done=True)
-        edge = GraphEdge(next_node="decoder", name="text_inputs")
-        edge.tensor_info = persist_signals.get("new_token", [])
-        return ForwardPassArgs(
-            full_metadata=metadata,
-            inputs=[edge],
-            unpersist_tensors=list(edge.tensor_info),
-            step_metadata={"is_prefill": False},
-        )
+        model_kwargs: dict,
+    ) -> list[WalkStep]:
+        # the prefill hears the clip and samples the first token; decode feeds each one back
+        return [
+            WalkStep("prefill", step_metadata={FINAL_PREFILL: True}),
+            WalkStep("decode", bind={"text_inputs": "new_token"}),
+        ]
 
     # -------------------------------------------------------------------
     # prompt / output
@@ -272,11 +248,15 @@ class CanaryModel(Model):
         default English), ``target_language`` (translation; default the
         speech's language) and ``punctuation`` (default on)."""
         samples = clip_samples(tensors, self.MAX_AUDIO_SECONDS, "Canary")
-        source = kwargs.get("language") or "en"
-        target = kwargs.get("target_language") or source
-        punctuation = kwargs.get("punctuation", True)
+        kw = checked_request_kwargs(kwargs)
+        target = kw.get("target_language")
+        if target is not None and not isinstance(target, str):
+            raise ValueError(f"target_language must be a string; got {target!r}")
+        punctuation = kw.get("punctuation", True)
         if not isinstance(punctuation, bool):
             raise ValueError(f"punctuation must be true or false; got {punctuation!r}")
+        source = kw.get("language") or "en"
+        target = target or source
         prompt_ids = self.config.prompt_ids(source, target, punctuation)
         # the encoder's frames for this clip, as the encoder node counts them
         context = int(self.config.encoder.output_lengths(samples.shape[0] // HOP_LENGTH))
@@ -303,14 +283,8 @@ class CanaryModel(Model):
     def max_input_files(self) -> dict[str, int]:
         return {"audio": 1}
 
-    def load_audio(self, filepath: str, device: str) -> TensorAndMetadata:
-        audio = load_speech_file(filepath, SAMPLE_RATE, self.MAX_AUDIO_SECONDS)
-        return TensorAndMetadata(data=audio, metadata=dict(sample_rate=SAMPLE_RATE, num_channels=1))
-
-    def postprocess(self, output: torch.Tensor, modality: str, **kwargs) -> bytes:
-        if modality == "text":
-            return self._detokenizer.to_bytes(output.reshape(-1).tolist())
-        raise ValueError(f"Unsupported modality for Canary: {modality!r}")
+    def text_output(self) -> TextOutput:
+        return TextOutput(self._detokenizer)
 
     # -------------------------------------------------------------------
     # submodules
@@ -355,7 +329,7 @@ class CanaryModel(Model):
                 name_remapper=CanaryDecoderModel.remap,
             )
             check_loaded(decoder, loaded, "Canary decoder")
-            return CanaryDecoderSubmodule(decoder=decoder.eval(), config=self.config)
+            return CanaryDecoderSubmodule(decoder.eval(), self.config)
         return None
 
 

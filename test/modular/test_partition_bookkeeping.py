@@ -21,13 +21,14 @@ from test_graph_runtime import (
 import mstar.conductor.conductor as conductor_mod
 from mstar.communication.tensor_uuid import TensorUuidMinter
 from mstar.conductor.conductor import Conductor
-from mstar.conductor.request_info import CurrentForwardConductorMetadata, PartitionDefinition
+from mstar.conductor.request_info import PartitionDefinition, WalkStep
 from mstar.graph.base import GraphEdge, GraphNode, Loop
 from mstar.graph.runtime.base import RouteInput, SendInput
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import ForwardPassArgs, Model, WorkerGraph
+from mstar.model.base import WorkerGraph
 from mstar.streaming.chunk_policy import FixedChunkPolicy
 from mstar.streaming.topology import Connection, PartitionTopology
+from mstar.testing_utils.model import StubModel
 from mstar.utils.containers import ParallelList
 from mstar.utils.ipc_format import NewRequestConductor
 
@@ -108,7 +109,7 @@ def test_split_inputs_keeps_persist_order_across_walks():
     assert [x.uuid for x in got.tensor_info] == [1, 2, 3]
 
 
-class _TwoStreamModel(Model):
+class _TwoStreamModel(StubModel):
     def get_graph_walk_graphs(self):
         return {"p": GraphNode(name="p", input_names=["x"], outputs=[]),
                 "c": GraphNode(name="c", input_names=["y"], outputs=[])}
@@ -122,25 +123,9 @@ class _TwoStreamModel(Model):
             Connection("P", "C", "second", lambda: FixedChunkPolicy(1)),
         ])
 
-    def get_initial_forward_pass_args(self, partition_name, *a, **k):
-        walk = "p" if partition_name == "P" else "c"
-        return ForwardPassArgs(CurrentForwardConductorMetadata(graph_walk=walk, is_prefill=False), [], [])
-
-    def get_partition_forward_pass_args(self, partition_name, partition_metadata, *a, **k):
-        # P ends; C waits on its streams
-        return ForwardPassArgs(partition_metadata, [], [], request_done=partition_name == "P")
-
-    def get_node_resources(self):
-        return []
-
-    def process_prompt(self, *a, **k):
-        return {}
-
-    def postprocess(self, *a, **k):
-        return b""
-
-    def get_submodule(self, *a, **k):
-        return None
+    def walk_plan(self, partition_name, *a, **k):
+        # P ends after its one pass; C waits on its streams
+        return [WalkStep("p" if partition_name == "P" else "c")]
 
 
 class _ColonNamesModel(_TwoStreamModel):
@@ -160,9 +145,8 @@ class _ColonNamesModel(_TwoStreamModel):
             Connection("P", "C", "x:y", lambda: FixedChunkPolicy(1)),
         ])
 
-    def get_initial_forward_pass_args(self, partition_name, *a, **k):
-        metadata = CurrentForwardConductorMetadata(graph_walk=self.WALKS[partition_name], is_prefill=False)
-        return ForwardPassArgs(metadata, [], [])
+    def walk_plan(self, partition_name, *a, **k):
+        return [WalkStep(self.WALKS[partition_name])]
 
 
 def _two_stream_conductor(tmp_path, monkeypatch, model=None):
@@ -179,12 +163,6 @@ def _two_stream_conductor(tmp_path, monkeypatch, model=None):
     return c
 
 
-def test_parallel_stream_connections_are_both_tracked(tmp_path, monkeypatch):
-    c = _two_stream_conductor(tmp_path, monkeypatch)
-    names = sorted(x.edge_name for x in c.requests["rid"].get_incoming_connections("C"))
-    assert names == ["first", "second"], f"conductor tracks only {names}"
-
-
 def test_producer_done_goes_once_per_consumer_partition(tmp_path, monkeypatch):
     c = _two_stream_conductor(tmp_path, monkeypatch)
     sent = []
@@ -193,15 +171,13 @@ def test_producer_done_goes_once_per_consumer_partition(tmp_path, monkeypatch):
     c._process_done_forward("rid", "P")
 
     assert sent == [("P", "C")]
-    assert all(x.producer_done for x in c.requests["rid"].get_incoming_connections("C"))
+    done = sorted(x.edge_name for x in c.requests["rid"].streaming_connections.values() if x.producer_done)
+    assert done == ["first", "second"], f"conductor ends only {done}"
 
 
 def test_connections_whose_names_join_alike_are_both_tracked(tmp_path, monkeypatch):
     c = _two_stream_conductor(tmp_path, monkeypatch, _ColonNamesModel())
     sent = []
     monkeypatch.setattr(c, "_send_producer_done", lambda rid, src, dst: sent.append((src, dst)))
-    req = c.requests["rid"]
-    assert [x.edge_name for x in req.get_incoming_connections("C:x")] == ["y"]
-    assert [x.edge_name for x in req.get_incoming_connections("C")] == ["x:y"]
     c._process_done_forward("rid", "P")
     assert sorted(sent) == [("P", "C"), ("P", "C:x")]

@@ -24,7 +24,8 @@ from torch import nn
 from mstar.distributed.communication import CommGroup
 from mstar.model.components import RMSNorm
 from mstar.model.components.decoder_layer import DecoderLayer, run_layers
-from mstar.model.components.distributed import ParallelAttention, ParallelGatedMLP
+from mstar.model.components.distributed import ParallelGatedMLP
+from mstar.model.components.qwen3_lm import Qwen3Attention
 from mstar.model.qwen3_tts.config import (
     TALKER_ATTN,
     TALKER_KV,
@@ -59,7 +60,7 @@ class Qwen3TTSTalkerLayer(DecoderLayer):
         comm_group: CommGroup | None = None,
     ) -> None:
         super().__init__(
-            self_attn=ParallelAttention(
+            self_attn=Qwen3Attention(
                 hidden_size=config.hidden_size,
                 num_heads=config.num_attention_heads,
                 num_kv_heads=config.num_key_value_heads,
@@ -117,6 +118,10 @@ class Qwen3TTSTalkerLanguageModel(nn.Module):
         return run_layers(self.layers, input_embeds, self.norm)
 
 
+def _not_code_predictor(name: str) -> str | None:
+    return None if name.startswith("code_predictor.") else name
+
+
 class Qwen3TTSTalkerModel(nn.Module):
     """Talker backbone, text projection, and codec-group-0 output head."""
 
@@ -135,6 +140,16 @@ class Qwen3TTSTalkerModel(nn.Module):
         )
         self.codec_head = nn.Linear(
             talker.hidden_size, talker.vocab_size, bias=False
+        )
+
+    def checkpoint_rules(self):
+        """How the checkpoint's ``talker.*`` tensors land here (the CodePredictor's,
+        under ``talker.code_predictor.``, load into their own module), and where LoRA
+        adapters land."""
+        from mstar.model.loader import LLAMA_STACKED_PARAMS, CheckpointRules
+
+        return CheckpointRules(
+            stacked_params=tuple(LLAMA_STACKED_PARAMS), remap=_not_code_predictor, prefix="talker.",
         )
 
     def forward(

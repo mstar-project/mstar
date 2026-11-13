@@ -21,6 +21,7 @@ from mstar.model.media_limits import (
     probe_video,
     read_image,
 )
+from mstar.testing_utils.model import make_model
 from mstar.utils.cpus import CpuPlan
 
 # by path: importing the package would import the Qwen3-Omni model, which needs flashinfer
@@ -165,16 +166,14 @@ def test_refused_image_reaches_the_client_as_a_400(tmp_path, no_decode):
     wt.device = "cpu"
     wt._keyed_labels = {}
     wt._live_requests = {}
-    wt.model = types.SimpleNamespace(
-        load_image=lambda p, device: Model.load_image(None, p, device), max_input_files=dict,
-    )
+    wt.model = make_model()
     request = PreprocessInput(
         request_id="r1", text="describe it", file_paths={"image": [path]},
         input_modalities=["image", "text"], output_modalities=["text"], model_kwargs={},
     )
     with pytest.raises(ValueError) as info:
         wt._process_input(request)
-    wt._fail_request("r1", info.value, "preprocessing", abort=False)
+    wt._fail_request("r1", info.value, "preprocessing", abort=False, intake=True)
     chunk = wt.out_queue.get_nowait()
     assert chunk.modality == "error"
     assert chunk.metadata["status"] == 400
@@ -225,9 +224,10 @@ class _Metadata:
     average_fps: float = 30.0
 
 
-def _fake_torchcodec(monkeypatch, pulled, metadata=None, opened=None):
+def _fake_torchcodec(monkeypatch, pulled, metadata=None, opened=None, key_frames=None):
     class FakeDecoder:
-        def __init__(self, *_args, **kwargs):
+        def __init__(self, source=None, *_args, **kwargs):
+            self.source = source
             self.metadata = metadata or _Metadata()
             if opened is not None:
                 opened.append(kwargs)
@@ -245,9 +245,20 @@ def _fake_torchcodec(monkeypatch, pulled, metadata=None, opened=None):
             return torch.zeros(3, 64, 64, dtype=torch.uint8)
 
         def get_frames_at(self, indices):
+            if isinstance(self.source, str):
+                pathlib.Path(self.source).read_bytes()  # a decoder on a path reads the file to decode
             pulled.extend(indices)
-            return torch.zeros(len(indices), 3, self.metadata.height, self.metadata.width, dtype=torch.uint8)
+            # every pixel of a frame holds its index (mod 256), to tell the frames apart
+            frames = (torch.tensor(indices, dtype=torch.int64) % 256).to(torch.uint8)
+            return frames.view(-1, 1, 1, 1).expand(-1, 3, self.metadata.height, self.metadata.width)
 
+    if key_frames is not None:  # what _get_key_frame_indices returns, or the exception it raises
+        def _get_key_frame_indices(self):
+            if isinstance(key_frames, Exception):
+                raise key_frames
+            return key_frames
+
+        FakeDecoder._get_key_frame_indices = _get_key_frame_indices
     decoders = types.ModuleType("torchcodec.decoders")
     decoders.VideoDecoder = FakeDecoder
     monkeypatch.setitem(sys.modules, "torchcodec", types.ModuleType("torchcodec"))
@@ -274,6 +285,100 @@ def test_vjepa2_refuses_sampled_frames_over_the_budget_before_decoding(monkeypat
     with pytest.raises(ValueError, match="MSTAR_MAX_VIDEO_PIXELS"):
         model.load_video("clip.mp4", "cpu")
     assert pulled == []
+
+
+def test_vjepa2_refuses_a_video_without_load_video_metadata():
+    """A video tensor it can't decode is an error, not a request without a video."""
+    from mstar.model.vjepa2.vjepa2_model import VJepa2Model
+
+    model = VJepa2Model("unused", skip_weight_loading=True)
+    with pytest.raises(ValueError, match="load_video"):
+        model.process_prompt(None, ["video"], ["video"], tensors={"video_inputs": [torch.zeros(8, 3, 64, 64)]})
+
+
+@pytest.mark.parametrize("kwargs, decoded", [
+    ({"rollout_horizon": 0}, 64),
+    ({"rollout_horizon": 4}, 8),
+    # the encoder-only walk encodes the whole clip, whatever horizon the request names
+    ({"rollout_horizon": 4, "skip_predictor": True}, 64),
+])
+def test_vjepa2_ac_decodes_only_the_frames_its_walk_encodes(monkeypatch, tmp_path, kwargs, decoded):
+    from mstar.model.vjepa2.vjepa2_model import VJepa2Model
+
+    pulled = []
+    _fake_torchcodec(monkeypatch, pulled, _Metadata(num_frames=1000, height=64, width=64))
+    model = VJepa2Model("unused", skip_weight_loading=True, predictor_kind="ac")
+    upload = tmp_path / "clip.mp4"
+    upload.write_bytes(b"not decoded by the fake")
+    loaded = model.load_video(str(upload), "cpu")
+    assert pulled == []
+    upload.unlink()  # the API server deletes an upload on a timer that doesn't wait for the decode
+    out = model.process_prompt(
+        None, ["video"], ["video"],
+        tensors={"video_inputs": [loaded.data]}, input_metadata={"video_inputs": [loaded.metadata]},
+        actions=[[0.0] * 7] * 4, states=[[0.0] * 7] * 4, **kwargs,
+    ).new_input_tensors
+    assert pulled == loaded.metadata["sampled_indices"][:decoded]
+    assert out["video_frames"][0].shape[0] == decoded
+    assert out["video_inputs"] == []
+
+
+def _vjepa2_prompt(monkeypatch, tmp_path, **kwargs):
+    """V-JEPA 2's masked-predictor process_prompt on a 1000-frame upload."""
+    from mstar.model.vjepa2.vjepa2_model import VJepa2Model
+
+    _fake_torchcodec(monkeypatch, [], _Metadata(num_frames=1000, height=64, width=64))
+    model = VJepa2Model("unused", skip_weight_loading=True)
+    model._preprocess_frames = lambda frames: frames.float()  # no HF processor without weights
+    upload = tmp_path / "clip.mp4"
+    upload.write_bytes(b"not decoded by the fake")
+    loaded = model.load_video(str(upload), "cpu")
+    return model.process_prompt(
+        None, ["video"], ["video"],
+        tensors={"video_inputs": [loaded.data]}, input_metadata={"video_inputs": [loaded.metadata]}, **kwargs,
+    ).new_input_tensors
+
+
+@pytest.mark.parametrize("masks", [
+    {"target_mask": [[0, 1]]},  # alone, it was replaced by the full-coverage default
+    {"context_mask": [[0, 1]]},
+    {"context_mask": [[0, 1]], "target_mask": [[256]]},  # 2 frames are 256 tokens; the gather device-asserted
+    {"context_mask": [[0, 1]], "target_mask": [["abc"]]},  # a TypeError: a 500
+    {"context_mask": [[0.9, 1]], "target_mask": [[1]]},  # silently truncated to [[0, 1]]
+])
+def test_vjepa2_masks_come_together_and_index_the_clips_tokens(monkeypatch, tmp_path, masks):
+    with pytest.raises(ValueError, match="mask"):
+        _vjepa2_prompt(monkeypatch, tmp_path, num_frames=2, **masks)
+    out = _vjepa2_prompt(monkeypatch, tmp_path, num_frames=2, context_mask=[[0, 255]], target_mask=[[1]])
+    assert out["target_mask"][0].tolist() == [[1]]
+
+
+@pytest.mark.parametrize("key_frames, decoders", [
+    (torch.tensor([0, 10, 20, 30, 40]), 3),  # one per group of GOPs; the index's decoder decodes the first
+    ([0, 10, 20, 30, 40], 3),  # the list torchcodec's annotation promises
+    (RuntimeError("private API changed"), 1),  # an unusable index: one decoder, not an error
+])
+def test_gop_split_decode_returns_the_frames_in_the_order_asked(monkeypatch, key_frames, decoders):
+    """Sampled frames grouped by keyframe interval decode on separate decoders, each frame
+    once, and come back in the order asked for, duplicates included; without a usable
+    keyframe index they decode on one decoder."""
+    from mstar.model.components import video_decode
+
+    pulled, opened = [], []
+    _fake_torchcodec(monkeypatch, pulled, opened=opened, key_frames=key_frames)
+    monkeypatch.setattr(video_decode, "_max_decoders", lambda: 3)
+    indices = [41, 3, 22, 3, 15, 0, 35, 22, 8]
+    frames = video_decode.decode_frames_at(torch.zeros(16, dtype=torch.uint8), indices)
+    assert frames[:, 0, 0, 0].tolist() == indices
+    assert sorted(pulled) == sorted(set(indices) if decoders > 1 else indices)
+    assert len(opened) == decoders
+
+
+def test_the_installed_torchcodec_still_has_the_keyframe_index():
+    """The GOP split reads a private torchcodec method and falls back to one decoder
+    without it, so a torchcodec bump that drops it would only show as slower decodes."""
+    VideoDecoder = pytest.importorskip("torchcodec.decoders").VideoDecoder
+    assert callable(getattr(VideoDecoder, "_get_key_frame_indices", None))
 
 
 def _mp4(path, frames, side=64):
@@ -472,6 +577,57 @@ def test_flux2_checks_the_header_of_the_formats_pillow_decodes(tmp_path, monkeyp
         _flux2().load_image(str(path), "cpu")
 
 
+def _lingbot():
+    from mstar.model.lingbot_world.lingbot_world_model import LingBotWorldModel
+
+    return object.__new__(LingBotWorldModel)
+
+
+_IMAGE_LOADERS = pytest.mark.parametrize("load", [
+    lambda path: read_image(path).float() / 255,
+    lambda path: read_image(path, rgb=True).float() / 255,
+    lambda path: _flux2().load_image(path, "cpu").data,
+    lambda path: _lingbot().load_image(path, "cpu").data.float() / 255,
+], ids=["read_image", "read_image_rgb", "flux2_pillow", "lingbot_pillow"])
+
+
+def _left_half_white(path: str, exif: bytes) -> None:
+    from PIL import Image
+
+    stored = Image.new("RGB", (128, 64))
+    stored.paste((255, 255, 255), (0, 0, 64, 64))
+    stored.save(path, exif=exif, quality=100, lossless=True, dpi=(72, 72))
+
+
+@_IMAGE_LOADERS
+@pytest.mark.parametrize("ext", ["jpg", "webp"])
+def test_an_image_is_read_upright_by_its_exif_orientation(tmp_path, load, ext):
+    """A phone photo is stored sideways with an EXIF orientation; it reached the models rotated
+    (torchvision's WebP decoder ignores the orientation)."""
+    from PIL import Image
+
+    exif = Image.Exif()
+    exif[0x0112] = 6  # shown rotated 90 degrees clockwise: the stored left half is the top
+    path = str(tmp_path / f"phone.{ext}")
+    _left_half_white(path, exif.tobytes())
+    out = load(path)
+    assert tuple(out.shape) == (3, 128, 64)
+    assert out[:, 16, 32].tolist() == pytest.approx([1, 1, 1], abs=0.05)
+    assert out[:, 112, 32].tolist() == pytest.approx([0, 0, 0], abs=0.05)
+
+
+@_IMAGE_LOADERS
+@pytest.mark.parametrize("ext", ["jpg", "webp"])
+def test_an_image_with_a_malformed_exif_block_is_read_as_stored(tmp_path, load, ext):
+    """Pillow parses EXIF only when asked; a garbage block must not fail an image that decodes."""
+    path = str(tmp_path / f"odd.{ext}")
+    _left_half_white(path, b"Exif\0\0garbage!")
+    out = load(path)
+    assert tuple(out.shape) == (3, 64, 128)
+    assert out[:, 32, 16].tolist() == pytest.approx([1, 1, 1], abs=0.05)
+    assert out[:, 32, 112].tolist() == pytest.approx([0, 0, 0], abs=0.05)
+
+
 def test_animated_webp_is_read_by_pillow_as_its_first_frame(tmp_path, no_decode):
     from PIL import Image
 
@@ -538,7 +694,7 @@ def decoded(monkeypatch):
 
     paths = []
 
-    def decode(path, mode=None):
+    def decode(path, mode=None, apply_exif_orientation=False):
         paths.append(path)
         return torch.zeros(3, 1, 1, dtype=torch.uint8)
 
@@ -550,13 +706,11 @@ def test_images_in_one_request_share_the_image_limit(tmp_path, decoded):
     """Eight 9000x9000 images each fit the default limit; together they are
     refused at the second, before it is decoded."""
     paths = [_png(tmp_path / f"copy{i}.png", 9_000, 9_000, rows=0) for i in range(8)]
-    wt = _preprocess_thread(types.SimpleNamespace(
-        load_image=lambda p, device: Model.load_image(None, p, device), max_input_files=dict,
-    ))
+    wt = _preprocess_thread(make_model())
     with pytest.raises(ValueError, match="images decode to more than .* together") as info:
         wt._process_input(_image_request(paths))
     assert decoded == paths[:1]
-    wt._fail_request("r1", info.value, "preprocessing", abort=False)
+    wt._fail_request("r1", info.value, "preprocessing", abort=False, intake=True)
     assert wt.out_queue.get_nowait().metadata["status"] == 400
 
 
@@ -573,7 +727,7 @@ def test_images_up_to_the_limit_together_all_load(tmp_path, decoded, monkeypatch
 def test_too_many_files_are_refused_before_any_is_loaded(tmp_path, monkeypatch):
     monkeypatch.setenv("MSTAR_MAX_MEDIA_FILES", "2")
     loaded = []
-    wt = _preprocess_thread(types.SimpleNamespace(load_image=lambda p, device: loaded.append(p), max_input_files=dict))
+    wt = _preprocess_thread(make_model(load_image=lambda p, device: loaded.append(p)))
     paths = [_png(tmp_path / f"img{i}.png", 8, 8) for i in range(3)]
     with pytest.raises(ValueError, match="attaches 3 media files; the limit is 2"):
         wt._process_input(_image_request(paths))

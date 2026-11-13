@@ -7,20 +7,26 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from test_kv_prefix_lease import _StubTransfer
 from test_nemotron_duplex_codec import tiny_codec
 from test_nemotron_duplex_talker_batch import CHAR_PAD, S2C, TINY, make_talker
 
-from mstar.engine.resources import AttentionStep, KVStep, PositionStep
+from mstar.engine.resources import AttentionStep, KVStep, PositionStep, StepRunner
+from mstar.engine.resources.kv import manager as manager_mod
+from mstar.engine.resources.kv.config import DEFAULT_PAGE_SIZE, KVReqConfig, PagedKVConfig
+from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.recurrent import RecurrentStep
 from mstar.model.nemotron_duplex.components.eartts_talker import _rand_rows, maskgit_schedule
 from mstar.model.nemotron_duplex.config import (
     CODEC_STATE,
+    NANO_KV,
     TALKER_ATTN,
     TALKER_CFG_LABEL,
     TALKER_KV,
     TALKER_POS,
     NemotronDuplexConfig,
 )
+from mstar.model.nemotron_duplex.nemotron_duplex_model import NemotronDuplexModel
 from mstar.model.nemotron_duplex.submodules import EarTTSTalkerSubmodule
 
 P = 37   # speaker warm-up positions
@@ -257,3 +263,60 @@ def test_warmup_steps_run_eager_and_steady_state_steps_hit_the_decode_capture():
     assert sub.declare_step("talker_decode", ["b"], [later]).cg_key_info == sub.DECODE_KEY
     (cfg,) = sub.get_accelerator_graph_configs(torch.device("cpu"))
     assert cfg.additional_key_info == sub.DECODE_KEY
+
+
+POOLS = pytest.mark.parametrize("key, labels, loop", [
+    (TALKER_KV, ("main", "uncond"), "talker_decode_loop"), (NANO_KV, ("main",), "decode_loop"),
+], ids=["talker", "nano"])
+
+
+def _sessions(monkeypatch, key: str, labels: tuple[str, ...], loop: str):
+    """DEFAULT_SESSIONS sessions with the longest system prompt, in the layout `process_prompt` gives them, on the
+    pool of ``key`` the model sizes. Returns the model, the pool and whether each session was admitted."""
+    monkeypatch.setattr(manager_mod, "KVTransferManager", _StubTransfer)
+    model = NemotronDuplexModel.__new__(NemotronDuplexModel)
+    model.config = NemotronDuplexConfig()
+    ids = torch.zeros(1, model.max_prompt_tokens, dtype=torch.long)
+    model._tokenizer = lambda prompt, return_tensors: SimpleNamespace(input_ids=ids)
+    layouts = model.process_prompt(
+        "a prompt", ["audio", "text"], ["audio", "text"], tensors={"audio_inputs": [torch.zeros(16000)]},
+    ).metadata["kv_layout"][key]
+    pages = model.talker_kv_pages if key == TALKER_KV else model.nano_kv_pages
+    kv = KVManager(
+        cfg=PagedKVConfig(num_layers=1, num_kv_heads=1, head_dim=8, max_seq_len=4096,
+                          max_num_pages=pages(DEFAULT_PAGE_SIZE), page_size=DEFAULT_PAGE_SIZE),
+        name=key, joint_comm_group=None, transfer_engine_info=None,
+        device=torch.device("cpu"), dtype=torch.float32,
+    )
+    kv.local_loops = {loop}
+    runner = StepRunner({key: kv}, node_resources={"node": [key]})
+    for session in range(model.DEFAULT_SESSIONS):
+        config = KVReqConfig(needed_labels=list(labels), unpausable=True)
+        config.apply_conductor_config(
+            kv_layout={label: layouts[label].row() for label in labels},
+            loop_caps={loop: model.get_max_output_tokens()},
+        )
+        runner.ingest_request(f"s{session}", {key: config}, session)
+    admitted = [
+        runner.admit_retrieve(f"s{session}", "node", "decode").ready for session in range(model.DEFAULT_SESSIONS)
+    ]
+    return model, kv, admitted
+
+
+@POOLS
+def test_every_session_of_the_longest_length_fits_its_pool_at_once(monkeypatch, key, labels, loop):
+    """A session's audio can't pause, so the pool reserves each of its streams at the loop caps."""
+    _, _, admitted = _sessions(monkeypatch, key, labels, loop)
+
+    assert all(admitted), f"{admitted.count(False)} sessions wait for a stream's loop cap the pool wasn't sized for"
+
+
+@POOLS
+def test_a_session_reserves_what_its_frames_write_and_no_page_for_its_loop_caps_margin(monkeypatch, key, labels, loop):
+    """A loop's cap runs LOOP_ITERS_MARGIN past the session's frames, and no session writes that margin. Reserving
+    it took a page a talker stream, 1.75 GiB over 32 sessions."""
+    model, kv, _ = _sessions(monkeypatch, key, labels, loop)
+    prefix = model.TALKER_WARMUP_POSITIONS if key == TALKER_KV else model.max_prompt_tokens
+    per_stream = -(-(prefix + model.max_session_frames + 1) // DEFAULT_PAGE_SIZE)
+
+    assert kv._allotments["s0"].pages == len(labels) * per_stream, "a session reserved pages for its loop caps' margin"

@@ -1,18 +1,26 @@
 from dataclasses import dataclass, field
 
+from mstar.model import keys
 from mstar.streaming.chunk_policy import ScheduledLeftContextChunkPolicy
 
-# Constants
-KV_CACHE = "kv_cache"
+# resource keys this model declares; the shared scaffolds read `keys`' ones
+KV_CACHE = keys.KV_CACHE
 ATTN = "attn"
-SAMPLER = "sampler"
-ROPE = "rope"
+SAMPLER = keys.SAMPLER
+ROPE = keys.ROPE
 
-# SNAC captures one CUDA graph per window size at every capture batch size,
-# and every size from 1 frame up to the widest window occurs (final flushes),
-# so the widest window (left + right context + largest chunk) bounds startup
-# and graph memory.
+# SNAC captures one CUDA graph per window size ``snac_window_frames`` lists, at
+# every capture batch size, so the widest window (left + right context +
+# largest chunk) bounds startup and graph memory. Some of those sizes never
+# replay: a window past the decoder's left reach is padded to the widest.
 SNAC_MAX_WINDOW_FRAMES = 16
+
+# A decoded frame's audio depends on fewer than this many frames to its left:
+# the snac_24khz decoder's receptive field reaches about 2.5 frames, and
+# frames 3 or more into a window decode the same audio (to float rounding) with
+# any frames prepended. So it is also the default left context
+# (``snac_left_context_frames``): more adds nothing to a window's audio.
+SNAC_LEFT_REACH_FRAMES = 3
 
 @dataclass
 class OrpheusModelConfig:
@@ -39,7 +47,8 @@ class OrpheusModelConfig:
     # Special token IDs
     start_token_id: int = 128259
     end_token_ids: list[int] = field(default_factory=lambda: [128009, 128260, 128261, 128257])
-    stop_token_id: int = 128258
+    # end of speech
+    stop_token_ids: frozenset[int] = frozenset({128258})
     pad_token_id: int = 128263
     custom_token_base_id: int = 128256  # vocab_id of <custom_token_0>
 
@@ -65,15 +74,17 @@ class OrpheusModelConfig:
     # plus the largest chunk may be at most ``SNAC_MAX_WINDOW_FRAMES``.
     snac_chunk_schedule: tuple[int, ...] = (4, 2, 2, 2)
     snac_chunk_frames: int = 4
-    snac_left_context_frames: int = 3
+    snac_left_context_frames: int = SNAC_LEFT_REACH_FRAMES
     snac_right_context_frames: int = 2
 
-    # Generation defaults
+    # Sampling recipe; the checkpoint's generation_config.json is Llama's, so only do_sample is read
     temperature: float = 0.6
     top_p: float = 0.8
+    top_k: int = 0
+    min_p: float = 0.0
     repetition_penalty: float = 1.3
+    penalize_prompt: bool = True
     ignore_eos: bool = False  # benchmark parity: decode to max_tokens regardless of EOS
-    max_new_tokens: int = 4096
 
     # Available voices
     available_voices: list[str] = field(
@@ -82,6 +93,10 @@ class OrpheusModelConfig:
     default_voice: str = "tara"
 
     def __post_init__(self):
+        # The LM head computes the custom-token rows alone and reads -inf for
+        # the text rows (``output_start``), so a stop token must be one of them.
+        if min(self.stop_token_ids) < self.custom_token_base_id:
+            raise ValueError("Orpheus's stop tokens must be custom tokens")
         if self.default_voice not in self.available_voices:
             raise ValueError(
                 f"default_voice {self.default_voice!r} is not in available_voices"
@@ -119,23 +134,14 @@ class OrpheusModelConfig:
         )
 
     def snac_window_frames(self) -> list[int]:
-        """Every window size, in frames, a stream can hand the decoder.
+        """Every window size, in frames, a stream can hand the decoder: every
+        width from one frame to the widest window the schedule pops.
 
-        The schedule's windows and every final flush: the policy runs over
-        each stream length until the windows repeat. The windows do not depend
-        on when tokens arrive, only on how many there are. A window shorter
-        than a frame (a stream shorter than a frame, or a final flush holding
-        only the EOS token) decodes one silent frame, as in ``prepare_inputs``.
+        A final flush can stop anywhere inside a chunk's window, and each
+        chunk's context is at most the previous window, so the flushes fill
+        every width below the widest. A window shorter than a frame (a stream
+        shorter than a frame, or a final flush holding only the EOS token)
+        decodes one silent frame, as in ``prepare_inputs``.
         """
-        tpf = self.tokens_per_frame
-        steady = self.snac_left_context_frames + self.snac_right_context_frames + self.snac_chunk_frames
-        sizes = {1}
-        for frames in range(1, sum(self.snac_chunk_schedule) + 2 * steady + 1):
-            policy, left = self.snac_chunk_policy(), frames * tpf + 1  # the EOS token streams last
-            while policy.is_ready(left):
-                sizes.add(policy.window_size() // tpf)
-                stride = policy.next_chunk_size(left)
-                policy.register_chunk(stride)
-                left -= stride
-            sizes.add(max(left // tpf, 1))
-        return sorted(sizes)
+        widest = max(self.snac_chunk_policy().window_sizes()) // self.tokens_per_frame
+        return list(range(1, widest + 1))

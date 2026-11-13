@@ -12,8 +12,10 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
+from mstar.engine.resources.linear_attn.base import gather_rows, scatter_rows
 from mstar.engine.resources.linear_attn.gdn_stage import stage_gdn_prefill_inputs
 from mstar.platforms.compile import compiled
+from mstar.utils.h2d import to_device_nonblocking
 
 # Must match `BLOCK_M` in mstar/utils/causal_conv1d/kernels.py, which passes it
 # as an explicit constexpr rather than autotuning it.
@@ -108,6 +110,51 @@ class ConvMetadata:
     token_chunk_offset_ptr: torch.Tensor
 
 
+def gdn_kernel(name: str, device: torch.device):
+    """FlashInfer's GDN kernel ``name`` (its chunked prefill or its decode), or on a CPU tensor its
+    torch stand-in (`gdn_cpu`), so the resource's paths run in a test without a GPU; no CUDA tensor
+    reaches the stand-in."""
+    if device.type == "cpu":
+        from mstar.engine.resources.linear_attn import gdn_cpu
+
+        return getattr(gdn_cpu, name)
+    if name == "chunk_gated_delta_rule":
+        from flashinfer.gdn_prefill import chunk_gated_delta_rule
+
+        return chunk_gated_delta_rule
+    from flashinfer.gdn_decode import gated_delta_rule_decode_pretranspose
+
+    return gated_delta_rule_decode_pretranspose
+
+
+def _conv_programs(spans: Sequence[int]) -> tuple[list[int], list[int]]:
+    """The varlen conv kernel's programs over rows ``spans``: one per ``_CONV_BLOCK_M`` chunk of each
+    row, as (row, chunk) pairs."""
+    rows, offsets = [], []
+    for row, span in enumerate(spans):
+        chunks = -(-span // _CONV_BLOCK_M)  # ceil
+        rows.extend([row] * chunks)
+        offsets.extend(range(chunks))
+    return rows, offsets
+
+
+def conv_metadata(spans: Sequence[int], device: torch.device) -> ConvMetadata:
+    """``ConvMetadata`` for an eager conv over rows ``spans``, sized to them, uploaded in one copy:
+    without it the kernel builds it in its grid lambda, a host sync per call."""
+    rows, offsets = _conv_programs(spans)
+    block = to_device_nonblocking(np.array(rows + offsets, dtype=np.int32), device)
+    needed = len(rows)
+    batch_ptr, offset_ptr = block[:needed], block[needed:]
+    return ConvMetadata(
+        nums_dict={_CONV_BLOCK_M: {
+            "tot": needed, "mlist_len": needed, "mlist": None, "offsetlist": None,
+            "batch_ptr": batch_ptr, "token_chunk_offset_ptr": offset_ptr,
+        }},
+        batch_ptr=batch_ptr,
+        token_chunk_offset_ptr=offset_ptr,
+    )
+
+
 def _with_room(t: torch.Tensor, rows: int) -> torch.Tensor:
     """``t`` with ``rows`` zeroed rows appended along dim 0."""
     return torch.cat((t, t.new_zeros((rows, *t.shape[1:]))), dim=0)
@@ -115,8 +162,8 @@ def _with_room(t: torch.Tensor, rows: int) -> torch.Tensor:
 
 # The chunked path's elementwise work around its kernels, compiled into one
 # kernel each: run eagerly, it was a dozen launches per layer and about a
-# third of a long prefill's GPU time on Qwen3.5-0.8B. Pointwise only, so
-# dynamic=True costs nothing here (unlike a reduction over a symbolic head dim).
+# third of a long prefill's GPU time on Qwen3.5-0.8B. The callers mark only the
+# token dim dynamic (``compiled``'s ``dynamic_args``), so the head dim stays static.
 
 
 def _masked_rows(x: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -207,12 +254,7 @@ class GDNPrefillWrapper(GDNWrapper):
     ):
         # Build Launch geometry for this step's conv; see `ConvMetadata`
         block = _CONV_BLOCK_M
-        # one Triton program per BLOCK_M chunk of each row
-        rows, offsets = [], []
-        for row, span in enumerate(spans):
-            chunks = -(-span // block)  # ceil
-            rows.extend([row] * chunks)
-            offsets.extend(range(chunks))
+        rows, offsets = _conv_programs(spans)
 
         needed = len(rows)
         if self._accelerator_graph:
@@ -413,7 +455,7 @@ class GDNPrefillWrapper(GDNWrapper):
         # same mask, so the tail never reaches a kernel.
         if self._stage_inputs:
             return out
-        return compiled(_masked_rows, dynamic=True)(out, self._plan_state.token_mask)
+        return compiled(_masked_rows, dynamic_args=(0, 1))(out, self._plan_state.token_mask)
 
     def _save_conv_snapshots(self, x: torch.Tensor, conv_layer: torch.Tensor):
         """A snapshot's conv state is the inputs before its boundary, the
@@ -430,35 +472,14 @@ class GDNPrefillWrapper(GDNWrapper):
         output has under capture (the tail can hold inf; ``run`` zeroes only
         the gates'), and as ``GDNMixedWrapper``'s does, which writes only its
         decode run's rows over it. The stage reads them through the token mask."""
-        from flashinfer.gdn_prefill import chunk_gated_delta_rule
+        chunk_gated_delta_rule = gdn_kernel("chunk_gated_delta_rule", q.device)
 
         slots = self._plan_state.slots.to(torch.int64)
 
-        # static per pool, so safe to branch on under capture
-        if not self._has_sink_state:
-            # Without a sink a padding row carries -1, which index_select and
-            # index_copy_ cannot take; point it at a live row's slot and mask.
-            live = slots >= 0
-            any_live = live.any()
-            ref = torch.argmax(live.to(torch.uint8)).view(1)
-            ref_slot = torch.index_select(slots, 0, ref).clamp_min(0)
-            addr = torch.where(live, slots, ref_slot)
-            carried = self._plan_state.has_state & live
-        else:
-            addr = slots
-            carried = self._plan_state.has_state
-
         # SM90 takes packed, sequence-ordered state (`state_indices` is
-        # SM100/SM103 only), so gather here and scatter back.
-        initial = torch.index_select(state, 0, addr).to(self._prefill_dtype)
-
-        # zero the rows that start fresh, by select rather than boolean mask:
-        # `initial[~mask] = 0` is a data-dependent shape and cannot be captured
-        initial = torch.where(
-            carried.view(-1, 1, 1, 1),
-            initial,
-            torch.zeros((), dtype=initial.dtype, device=initial.device),
-        )
+        # SM100/SM103 only), so gather here and scatter back. A row that starts
+        # fresh, or a padding row on -1 (no sink), gathers zeros.
+        initial = gather_rows(state, slots, self._plan_state.has_state).to(self._prefill_dtype)
 
         # One spare row per batch row, so the token `plan` hands each padding
         # row is addressable even when the real batch fills the bucket exactly.
@@ -478,7 +499,9 @@ class GDNPrefillWrapper(GDNWrapper):
                 q, k, v, a, b = (_with_room(t, rows) for t in (q, k, v, a, b))
             # The padded tail is zeroed so inf there can't poison the result: q, k
             # and v by `run_conv`, whose output they are, the gates here.
-            alpha, beta = compiled(_chunked_gates, dynamic=True)(a, b, a_log, dt_bias, self._plan_state.token_mask)
+            alpha, beta = compiled(_chunked_gates, dynamic_args=(0, 1, 4))(
+                a, b, a_log, dt_bias, self._plan_state.token_mask,
+            )
 
         snapshot_args = {}
         if self._every:
@@ -502,16 +525,12 @@ class GDNPrefillWrapper(GDNWrapper):
             **snapshot_args,
         )
 
-        if not self._has_sink_state:
-            # Padding rows write to `ref_slot` the live row's own result, or with
-            # no live row what is already there, so slot 0 is not disturbed.
-            padded = torch.where(
-                any_live,
-                torch.index_select(final, 0, ref),
-                torch.index_select(state, 0, ref_slot).to(final.dtype),
-            )
-            final = torch.where(live.view(-1, 1, 1, 1), final, padded)
-        state.index_copy_(0, addr, final.to(state.dtype))
+        # static per pool, so safe to branch on under capture: without a sink a
+        # padding row carries -1, which `scatter_rows` points at a live row's slot
+        if self._has_sink_state:
+            state.index_copy_(0, slots, final.to(state.dtype))
+        else:
+            scatter_rows(state, slots, final)
         if self._every:
             index = self._snapshot_index[:, : self._num_snapshots]
             state.index_copy_(0, index[2], checkpoints.index_select(0, index[0]).to(state.dtype))
@@ -583,7 +602,7 @@ class GDNDecodeWrapper(GDNWrapper):
         )
 
     def run(self, q, k, v, g, beta, state, a_log, dt_bias):
-        from flashinfer.gdn_decode import gated_delta_rule_decode_pretranspose
+        gated_delta_rule_decode_pretranspose = gdn_kernel("gated_delta_rule_decode_pretranspose", q.device)
 
         # Uninitialized output: the kernel writes every row, except one whose
         # slot is -1 (only with the sink off), which it would leave as found.
@@ -725,6 +744,13 @@ class GDNMixedWrapper(GDNWrapper):
         self._num_seqs = 0
         # where the chunked half's tokens start: past the decode run eagerly
         self._front = 0
+
+    @property
+    def halves(self) -> tuple[GDNDecodeWrapper, GDNPrefillWrapper, int]:
+        """The decode half, the chunked half, and the step's token the chunked half starts at
+        (past the decode run eagerly), which a step split over SP ranks runs apart
+        (`GDNManager.run`)."""
+        return self._decode, self._prefill, self._front
 
     def _buf(self, name: str, n: int, dtype: torch.dtype) -> torch.Tensor:
         """A device index buffer, sized once to the bucket under capture."""

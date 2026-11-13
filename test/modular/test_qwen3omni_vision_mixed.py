@@ -7,9 +7,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from mstar.model.qwen3_omni.config import THINKER_MIXED, THINKER_POS
+from mstar.model.qwen3_omni.config import THINKER_KV, THINKER_MIXED, THINKER_SHARD
 from mstar.model.qwen3_omni.submodules import ThinkerSubmodule
-from mstar.model.submodule_base import ARNodeInputs
+from mstar.model.submodule_base import ARNodeInputs, with_segment_steps
 
 HIDDEN = 4
 
@@ -47,7 +47,47 @@ def test_each_row_of_a_mixed_step_advances_positions_by_its_own_rule(thinker):
 
     step = thinker.declare_step(THINKER_MIXED, [0, 1, 2], rows)
 
-    assert step.steps[THINKER_POS].advance == (1, 9, 2)
+    assert step.state[THINKER_KV].advance == (1, 9, 2)
+
+
+class _TokenEmbedder:
+    """The Thinker body as `preprocess` reads it: token ``t`` embeds as a row of ``t``s."""
+
+    mask_padding = False
+    model = SimpleNamespace(embed_tokens=lambda ids: ids.float().unsqueeze(-1).expand(-1, HIDDEN))
+
+    def maybe_log_expert_load(self, synthetic=False):
+        pass
+
+
+@pytest.mark.parametrize("walks", [
+    ["thinker_decode"] * 3,
+    ["thinker_decode", "prefill_text", "thinker_decode", "thinker_decode"],
+    ["prefill_text", "thinker_decode"],
+])
+def test_a_step_s_decode_rows_are_embedded_each_in_its_place(thinker, walks):
+    """A step's decode tokens are embedded in one call and laid back in row
+    order beside the prompt rows' own embeddings."""
+    lens = [1 if walk == "thinker_decode" else 2 for walk in walks]
+    thinker.config.thinker_head_dim, thinker.config.thinker_text = 128, SimpleNamespace(rope_theta=1e6)
+    thinker.__dict__.update(
+        model=_TokenEmbedder(), _cached_device=torch.device("cpu"), _inv_freq=None,
+        kv=SimpleNamespace(
+            _check_open=lambda call: None, label="main",
+            positions=SimpleNamespace(pos_ids=lambda label: torch.arange(sum(lens))),
+        ),
+    )
+    rows = [
+        ARNodeInputs(input_seq_len=1, input_ids=torch.tensor([10 + i]), graph_walk=walk) if walk == "thinker_decode"
+        else ARNodeInputs(input_seq_len=2, input_embeds=torch.full((2, HIDDEN), -1.0 - i), graph_walk=walk)
+        for i, walk in enumerate(walks)
+    ]
+    engine_inputs = SimpleNamespace(synthetic=False, request_ids=list(range(len(rows))), real_seq_len=None)
+
+    embeds = thinker.preprocess(THINKER_MIXED, engine_inputs, rows)["input_embeds"]
+
+    expected = [10 + i if walk == "thinker_decode" else -1 - i for i, walk in enumerate(walks) for _ in range(lens[i])]
+    assert embeds[:, 0].tolist() == expected, "a decode row was handed another row's embedding"
 
 
 @pytest.mark.parametrize("step_walk,walks,key", [
@@ -85,8 +125,26 @@ def test_declare_step_stamps_the_key_cg_key_info_leased(thinker, step_walk, walk
     assert step.cg_key_info == thinker.cg_key_info(step_walk, info)
 
 
+@pytest.mark.parametrize("step_walk,walks", [
+    ("thinker_decode", ["thinker_decode", "thinker_decode"]),
+    ("prefill_text", ["prefill_text"]),
+    ("prefill_vision", ["prefill_vision"]),
+    (THINKER_MIXED, ["thinker_decode", "prefill_audio"]),
+])
+def test_every_step_plans_the_sequence_shard_over_its_tokens(thinker, step_walk, walks):
+    """The Thinker's attention and positions depend on its sequence shard, whose step the engine
+    adds from the node's segments (the Thinker declares none), at any SP size."""
+    rows = [_row(1 if w == "thinker_decode" else 3, w) for w in walks]
+
+    step = with_segment_steps(thinker.declare_step(step_walk, list(range(len(rows))), rows), (THINKER_SHARD,))
+
+    assert step.steps[THINKER_SHARD].segments == tuple(step.segments) and len(step.segments) == len(rows)
+
+
 class _DecodeModel:
     """The Thinker body at decode: one hidden per row, a token per row."""
+
+    model = SimpleNamespace(embed_tokens=lambda input_ids: torch.randn(len(input_ids), HIDDEN))
 
     def __call__(self, input_embeds, **kwargs):
         return input_embeds, input_embeds, input_embeds
@@ -96,22 +154,25 @@ class _DecodeModel:
 
 
 class _Greedy:
-    def sample(self, request_ids, logits):
-        return logits.argmax(-1)
+    """A sampler's handle, over a resource that takes each row's best token."""
+
+    _open, _drawn, sampler, rows = True, 0, SimpleNamespace(draws=1 << 30), ()
+    resource = SimpleNamespace(sample=lambda request_ids, logits: logits.argmax(-1))
+
+
+def _decode_inputs(rows):
+    """What ``preprocess`` hands an eager decode step's forward."""
+    return {"input_ids": torch.zeros(rows, dtype=torch.long), "cos_3d": torch.zeros(rows), "sin_3d": torch.zeros(rows)}
 
 
 def _decode_rows_outputs(thinker, step_walk, walks):
     """What postprocess leaves for each decode row of a step: from a decode
     step (row views of one clone) or a mixed one (cut from the pack)."""
-    from mstar.model.qwen3_omni.config import THINKER_ATTN, THINKER_SAMPLER
-
     rids = [str(i) for i in range(len(walks))]
     if step_walk == "thinker_decode":
-        thinker.__dict__["model"] = _DecodeModel()
-        engine_inputs = SimpleNamespace(
-            resources={THINKER_ATTN: None, THINKER_SAMPLER: _Greedy()}, request_ids=rids,
-        )
-        out = thinker.forward_batched(step_walk, engine_inputs, input_embeds=torch.randn(len(rids), HIDDEN))
+        thinker.__dict__.update(model=_DecodeModel(), sampler=_Greedy())
+        engine_inputs = SimpleNamespace(request_ids=rids)
+        out = thinker.forward_batched(step_walk, engine_inputs, **_decode_inputs(len(rids)))
         # what the engine hands each row: views of one clone of the batch tensor
         rows = out.clone_row_outputs(len(rids))
         per_row = [{name: [rows[name].split(1)[i]] for name in rows} for i in range(len(rids))]
@@ -150,12 +211,10 @@ def test_a_decode_step_s_thinker_states_are_the_rows_the_engine_handed_out(think
     """A decode step's ``thinker_states`` row output is already the Talker's
     layer-0 row, so postprocess leaves the engine's row view as it is: a
     rebound slice would fail the row-output fast store's identity check."""
-    from mstar.model.qwen3_omni.config import THINKER_ATTN, THINKER_SAMPLER
-
     rids = ["0", "1", "2"]
-    thinker.__dict__["model"] = _DecodeModel()
-    engine_inputs = SimpleNamespace(resources={THINKER_ATTN: None, THINKER_SAMPLER: _Greedy()}, request_ids=rids)
-    out = thinker.forward_batched("thinker_decode", engine_inputs, input_embeds=torch.randn(len(rids), HIDDEN))
+    thinker.__dict__.update(model=_DecodeModel(), sampler=_Greedy())
+    engine_inputs = SimpleNamespace(request_ids=rids)
+    out = thinker.forward_batched("thinker_decode", engine_inputs, **_decode_inputs(len(rids)))
     rows = out.clone_row_outputs(len(rids))
     views = rows["thinker_states"].split(1)
     for i, rid in enumerate(rids):
@@ -166,9 +225,7 @@ def test_a_decode_step_s_thinker_states_are_the_rows_the_engine_handed_out(think
         assert outputs["thinker_states"][0].shape == (1, HIDDEN)
     # a lone decode row runs the unbatched forward: the same layer-0 row
     info = SimpleNamespace(graph_walk="thinker_decode", step_metadata={})
-    single = SimpleNamespace(
-        resources={THINKER_SAMPLER: _Greedy()}, request_ids=["0"], single_request_info=info,
-    )
-    outputs = thinker.forward("thinker_decode", single, input_embeds=torch.randn(1, HIDDEN))
+    single = SimpleNamespace(request_ids=["0"], single_request_info=info)
+    outputs = thinker.forward("thinker_decode", single, **_decode_inputs(1))
     thinker.postprocess("0", info, outputs)
     assert outputs["thinker_states"][0].shape == (1, HIDDEN)

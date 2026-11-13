@@ -15,6 +15,7 @@ none of them trips the new checks.
 import importlib.util
 import sys
 import types
+import urllib.error
 from pathlib import Path
 
 import pytest
@@ -36,23 +37,22 @@ from mstar.distributed.base import ShardingConfig
 from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential
 from mstar.graph.runtime.base import ColumnarEdgeSpecs, RouteInput, SendInput
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.base import Model
 from mstar.model.registry import MODEL_REGISTRY, get_model_class, model_init_kwargs
 from mstar.streaming.chunk_policy import FixedChunkPolicy
 from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
+from mstar.testing_utils.model import StubModel
 from mstar.utils.containers import ParallelList
 from mstar.validation import validate_deployment
 
 ROOT = Path(__file__).resolve().parents[2]
 
 
-class _ToyModel(Model):
-    def __init__(self, walks, partitions=None, topology=None, tp_enabled_nodes=(), sp_enabled_nodes=()):
+class _ToyModel(StubModel):
+    def __init__(self, walks, partitions=None, topology=None, tp_enabled_nodes=()):
         self._walks = walks
         self._partitions = partitions
         self._topology = topology
         self._tp_enabled_nodes = set(tp_enabled_nodes)
-        self._sp_enabled_nodes = set(sp_enabled_nodes)
 
     def get_graph_walk_graphs(self):
         return self._walks()
@@ -64,26 +64,7 @@ class _ToyModel(Model):
         return self._topology() if self._topology else super().get_partition_topology()
 
     def get_default_sharding_config(self):
-        return ShardingConfig(groups=[], tp_enabled_nodes=self._tp_enabled_nodes, shard_dim={},
-                              sp_enabled_nodes=self._sp_enabled_nodes)
-
-    def get_node_resources(self):
-        return []
-
-    def get_initial_forward_pass_args(self, *a, **k):
-        raise NotImplementedError
-
-    def get_partition_forward_pass_args(self, *a, **k):
-        raise NotImplementedError
-
-    def process_prompt(self, *a, **k):
-        return {}
-
-    def postprocess(self, *a, **k):
-        return b""
-
-    def get_submodule(self, *a, **k):
-        return None
+        return ShardingConfig(groups=[], tp_enabled_nodes=self._tp_enabled_nodes, shard_dim={})
 
 
 def _config(tmp_path, node_groups) -> str:
@@ -227,9 +208,8 @@ def _stream_model(chunk_walk, extra_walks=None, tp_enabled_nodes=(), producer=No
     return _ToyModel(
         walks,
         partitions=lambda: [
-            PartitionDefinition(name="P", graph_walks={"gen"}, initial_walk="gen"),
-            PartitionDefinition(name="C", graph_walks={"chunk", *(extra_walks or {})},
-                                initial_walk="chunk", producer_partitions=["P"]),
+            PartitionDefinition(name="P", graph_walks={"gen"}),
+            PartitionDefinition(name="C", graph_walks={"chunk", *(extra_walks or {})}),
         ],
         topology=lambda: PartitionTopology(partitions=["P", "C"], connections=[
             Connection(from_partition="P", to_partition="C", edge_name="codes",
@@ -719,13 +699,29 @@ def _z_image(name, model_kwargs, tmp_path, monkeypatch):
 
 
 def _higgs(name, model_kwargs, tmp_path, monkeypatch):
-    from mstar.model.higgs_audio.higgs_audio_model import HiggsAudioModel, HiggsAudioModelConfig
-    return _bare(HiggsAudioModel, config=HiggsAudioModelConfig())
+    from mstar.model.higgs_audio.higgs_audio_model import HiggsAudioModel, HiggsAudioModelConfig, audio_encoder
+    from mstar.model.multimodal_decoder import MediaIntake
+    config = HiggsAudioModelConfig()
+    pad = config.audio_in_token_idx
+    return _bare(HiggsAudioModel, config=config, media=(MediaIntake("audio", audio_encoder(), pad, None),))
 
 
 def _kokoro(name, model_kwargs, tmp_path, monkeypatch):
     from mstar.model.kokoro.kokoro_model import KokoroModel, KokoroModelConfig
     return _bare(KokoroModel, config=KokoroModelConfig())
+
+
+def _minicpm_o(name, model_kwargs, tmp_path, monkeypatch):
+    from mstar.model.components.qwen3_lm import Qwen3LMConfig
+    from mstar.model.minicpm_o.components.tts import TTSConfig
+    from mstar.model.minicpm_o.config import AudioConfig, MiniCPMOConfig, ResamplerConfig, VisionConfig
+    from mstar.model.minicpm_o.minicpm_o_model import MiniCPMOModel
+    config = MiniCPMOConfig(
+        llm=Qwen3LMConfig(), vision=VisionConfig(), resampler=ResamplerConfig(), audio=AudioConfig(),
+    )
+    # the bundled voice's length, read from the checkpoint's clip in a real boot
+    voice = (6.016, 6.016)
+    return _bare(MiniCPMOModel, max_seq_len=64, config=config, tts_config=TTSConfig(), _voice_seconds=lambda: voice)
 
 
 def _orpheus(name, model_kwargs, tmp_path, monkeypatch):
@@ -740,9 +736,44 @@ def _ltx2_5(name, model_kwargs, tmp_path, monkeypatch):
     return model
 
 
+def _minimax_h3(name, model_kwargs, tmp_path, monkeypatch):
+    from mstar.model.minimax_h3.config import H3Config
+    model = _constructed(name, model_kwargs)
+    model.set_config(H3Config())
+    return model
+
+
+def _phi4mm(name, model_kwargs, tmp_path, monkeypatch):
+    """Phi-4-mini's head and rotary geometry with two layers: the resource rules read
+    the layer and head counts and the rotary width, not the other sizes."""
+    from mstar.model.multimodal_decoder import MediaIntake
+    from mstar.model.phi4mm.audio import audio_encoder
+    from mstar.model.phi4mm.components.audio import Phi4MMAudioConfig
+    from mstar.model.phi4mm.components.vision import Phi4MMVisionConfig
+    from mstar.model.phi4mm.config import AUDIO_PAD_ID, IMAGE_PAD_ID, Phi4MMConfig
+    from mstar.model.phi4mm.phi4mm_model import Phi4MMModel
+    from mstar.model.phi4mm.vision import vision_media_encoder
+    config = Phi4MMConfig.from_hf({
+        "hidden_size": 3072, "intermediate_size": 8192, "num_hidden_layers": 2,
+        "num_attention_heads": 24, "num_key_value_heads": 8, "vocab_size": 1024,
+        "rms_norm_eps": 1e-5, "rope_theta": 10000.0, "partial_rotary_factor": 0.75,
+        "max_position_embeddings": 131072, "original_max_position_embeddings": 4096,
+        "rope_scaling": {"type": "longrope", "short_factor": [1.0] * 48, "long_factor": [1.0] * 48},
+        "tie_word_embeddings": True,
+    })
+    media = (
+        MediaIntake("image", vision_media_encoder(), IMAGE_PAD_ID, None),
+        MediaIntake("audio", audio_encoder(), AUDIO_PAD_ID, None),
+    )
+    return _bare(Phi4MMModel, config=config, vision_config=Phi4MMVisionConfig(),
+                 audio_config=Phi4MMAudioConfig(), media=media, local_dir="/nonexistent")
+
+
 def _qwen3_5(name, model_kwargs, tmp_path, monkeypatch):
     """Small text-only shapes: the resource rules read the layer and head
     counts, not their sizes."""
+    from mstar.model.multimodal import vision_encoder
+    from mstar.model.multimodal_decoder import MediaIntake
     from mstar.model.qwen3_5.config import FULL_ATTENTION, LINEAR_ATTENTION, Qwen3_5Config
     from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
     config = Qwen3_5Config(
@@ -753,7 +784,60 @@ def _qwen3_5(name, model_kwargs, tmp_path, monkeypatch):
         linear_value_head_dim=128, linear_conv_kernel_dim=4,
         vocab_size=1024, rms_norm_eps=1e-6, max_position_embeddings=262144,
     )
-    return _bare(Qwen3_5DenseModel, config=config, vision_config=None)
+    return _bare(
+        Qwen3_5DenseModel, config=config, vision_config=None,
+        media=(MediaIntake("image", vision_encoder(), 0, None),),
+    )
+
+
+def _muse_configs(text_cls, max_positions):
+    """Small Muse text and vision shapes: the resource rules read the layer
+    and head counts, not their sizes."""
+    from mstar.model.muse.config import (
+        FULL_ATTENTION,
+        SLIDING_ATTENTION,
+        WINDOW_ATTENTION,
+        MuseGlimmerVisionConfig,
+    )
+    text = text_cls(
+        num_hidden_layers=4, hidden_size=256, intermediate_size=512, num_attention_heads=8,
+        num_key_value_heads=2, head_dim=64, vocab_size=1024,
+        layer_types=[SLIDING_ATTENTION] * 3 + [FULL_ATTENTION], layer_rope_theta=[5e5] * 3 + [0.0],
+        sliding_window=1024, max_position_embeddings=max_positions, rms_norm_eps=1e-5,
+        post_norm_eps=1e-5, image_token_id=0,
+    )
+    vision = MuseGlimmerVisionConfig(
+        hidden_size=64, intermediate_size=128, num_attention_heads=2, num_hidden_layers=2,
+        patch_size=14, patch_temporal=2, merge_size=2, pos_emb_height=32, pos_emb_width=32,
+        layer_types=[WINDOW_ATTENTION, FULL_ATTENTION], out_hidden_size=256,
+        projector_hidden_size=256, text_hidden_size=256,
+    )
+    return text, vision
+
+
+def _muse_glimmer(name, model_kwargs, tmp_path, monkeypatch):
+    from mstar.model.multimodal import vision_encoder
+    from mstar.model.multimodal_decoder import MediaIntake
+    from mstar.model.muse.config import MuseGlimmerConfig
+    from mstar.model.muse.glimmer_model import MuseGlimmerModel
+    config, vision_config = _muse_configs(MuseGlimmerConfig, 131072)
+    return _bare(
+        MuseGlimmerModel, config=config, vision_config=vision_config,
+        media=(MediaIntake("image", vision_encoder(), 0, None),),
+    )
+
+
+def _ripple(name, model_kwargs, tmp_path, monkeypatch):
+    from mstar.model.ripple.config import RippleConfig
+    from mstar.model.ripple.ripple_model import RippleModel
+    config = RippleConfig(
+        vocab_size=100352, hidden_size=5120, intermediate_size=40960, num_hidden_layers=80,
+        num_attention_heads=80, num_key_value_heads=8, head_dim=128,
+        layer_types=(("sliding_attention",) * 4 + ("full_attention",)) * 16,
+        sliding_window=1024, max_position_embeddings=2097152, rope_theta=10000.0, rms_norm_eps=1e-6,
+        embed_scale=71.55, ffn_clamp_threshold=20.0, stop_token_ids=(100265, 100257),
+    )
+    return _bare(RippleModel, config=config)
 
 
 def _qwen3_omni(name, model_kwargs, tmp_path, monkeypatch):
@@ -776,15 +860,22 @@ _QWEN3_TTS_VARIANTS = {
 
 def _qwen3_tts(name, model_kwargs, tmp_path, monkeypatch):
     from mstar.model.qwen3_tts.config import Qwen3TTSModelConfig
-    from mstar.model.qwen3_tts.qwen3_tts_model import Qwen3TTSModel
+    from mstar.model.qwen3_tts.qwen3_tts_model import Qwen3TTSModel, codec_dtype
     kind, size = _QWEN3_TTS_VARIANTS[name]
-    return _bare(Qwen3TTSModel, config=Qwen3TTSModelConfig(tts_model_type=kind, tts_model_size=size))
+    return _bare(
+        Qwen3TTSModel, config=Qwen3TTSModelConfig(tts_model_type=kind, tts_model_size=size),
+        # get_node_resources sizes the codec state pool in this dtype
+        codec_dtype=codec_dtype(model_kwargs.get("codec_dtype", "float32")),
+    )
 
 
 def _qwen3_asr(name, model_kwargs, tmp_path, monkeypatch):
+    from mstar.model.multimodal_decoder import MediaIntake
     from mstar.model.qwen3_asr.config import Qwen3ASRModelConfig
-    from mstar.model.qwen3_asr.qwen3_asr_model import Qwen3ASRModel
-    return _bare(Qwen3ASRModel, config=Qwen3ASRModelConfig())
+    from mstar.model.qwen3_asr.qwen3_asr_model import Qwen3ASRModel, audio_encoder
+    config = Qwen3ASRModelConfig()
+    pad = config.audio_token_id
+    return _bare(Qwen3ASRModel, config=config, media=(MediaIntake("audio", audio_encoder(), pad, None),))
 
 
 def _voxcpm2(name, model_kwargs, tmp_path, monkeypatch):
@@ -802,7 +893,7 @@ def _voxcpm2(name, model_kwargs, tmp_path, monkeypatch):
 
 def _whisper(name, model_kwargs, tmp_path, monkeypatch):
     from mstar.model.whisper.whisper_model import WhisperModel, WhisperModelConfig
-    return _bare(WhisperModel, config=WhisperModelConfig())
+    return _bare(WhisperModel, config=WhisperModelConfig(), sampling_defaults={})
 
 
 def _canary(name, model_kwargs, tmp_path, monkeypatch):
@@ -850,9 +941,14 @@ _FACTORIES = {
     "ZImageModel": _z_image,
     "HiggsAudioModel": _higgs,
     "KokoroModel": _kokoro,
+    "MiniCPMOModel": _minicpm_o,
     "LTX25Model": _ltx2_5,
+    "H3Model": _minimax_h3,
+    "MuseGlimmerModel": _muse_glimmer,
+    "RippleModel": _ripple,
     "OrpheusModel": _orpheus,
     "ParakeetModel": _parakeet,
+    "Phi4MMModel": _phi4mm,
     "Qwen3_5DenseModel": _qwen3_5,
     "Qwen3OmniModel": _qwen3_omni,
     "Qwen3TTSModel": _qwen3_tts,
@@ -879,6 +975,23 @@ def _drop_stubbed_imports():
                 del sys.modules[mod]
 
 
+def test_qwen3_5s_prefix_caches_open_beside_its_sequence_shard(tmp_path, monkeypatch):
+    """Its recurrent layers depend on the LLM's sequence shard, which plans from the step a prefix
+    hit trimmed and holds nothing to restore: at one rank the KV cache and the recurrent pool's
+    snapshots open as without it (the shipped configs' startup validation, above, refuses
+    otherwise)."""
+    from mstar.engine.resources.kv.config import opening_prefix_caches
+    from mstar.engine.resources.spec import apply_yaml_overrides, resolve_spec_dependencies
+    from mstar.engine.state.adapters import StateSetup
+    from mstar.model.base import enabled_resources
+    from mstar.model.qwen3_5.config import GDN_STATE, KV_CACHE, LINEAR_ATTN, LLM_SHARD
+
+    specs = enabled_resources(_qwen3_5("qwen3_5_9b", {}, tmp_path, monkeypatch), {}, StateSetup())
+    apply_yaml_overrides(specs, {"resources": {GDN_STATE: {"prefix_slots": 8}}})
+    assert LLM_SHARD in resolve_spec_dependencies(specs)[LINEAR_ATTN].depends_on()
+    assert {KV_CACHE, GDN_STATE} <= opening_prefix_caches(specs, {"LLM": 1}, checkpoint_named=True)
+
+
 @pytest.mark.parametrize("config_path", SHIPPED_CONFIGS, ids=lambda p: p.name)
 def test_shipped_config_passes_startup_validation(config_path, tmp_path, monkeypatch, _drop_stubbed_imports):
     config = yaml.safe_load(config_path.read_text())
@@ -886,7 +999,13 @@ def test_shipped_config_passes_startup_validation(config_path, tmp_path, monkeyp
     if name not in MODEL_REGISTRY:
         pytest.skip(f"model {name!r} is not in MODEL_REGISTRY")
     factory = _FACTORIES.get(MODEL_REGISTRY[name][1], _default)
-    model = factory(name, config.get("model_kwargs") or {}, tmp_path, monkeypatch)
+    try:
+        model = factory(name, config.get("model_kwargs") or {}, tmp_path, monkeypatch)
+    except (urllib.error.URLError, ConnectionError, TimeoutError) as e:
+        # A model that downloads a small file when built (Omnilingual ASR's tokenizer, from Meta's
+        # CDN) can't be checked while that host is down or its certificate has lapsed; that is the
+        # host's outage, not this config's.
+        pytest.skip(f"model {name!r} could not download what it is built from: {e}")
     conductor = _start_conductor(model, str(config_path), tmp_path, monkeypatch)
     assert conductor.worker_graphs
     # the workers the API server places from the config are the ones the walks run on

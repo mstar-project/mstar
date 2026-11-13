@@ -26,11 +26,11 @@ except ImportError:  # collected without package context
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from test_lora_pool import admitted, ctx, ingest, lora_runner, make_spec, settle_reads, step, write_adapter
 
-from mstar.engine.resources.lora import LoraStep  # noqa: E402
 from mstar.engine.resources.lora.pool import LoraAdapterPool  # noqa: E402
 from mstar.engine.resources.step import (  # noqa: E402
     ADMIT_OK,
     AdmitRuntimeError,
+    ResourceStep,
 )
 
 ADAPTERS = ("a1", "a2", "a3", "a4")
@@ -234,8 +234,8 @@ def test_the_host_tier_follows_the_ingests_not_when_reads_land(tmp_path):
     paths = _write_adapters(tmp_path, ("a1", "a2", "a3"))
     fast, slow = (LoraAdapterPool(make_spec(paths, cpu_capacity=1), "cpu", rank=r, world_size=2,
                                   decides=r == 0) for r in (0, 1))
-    gate, read = threading.Event(), slow.store._read
-    slow.store._read = lambda name, path: gate.wait(10) and read(name, path)
+    gate, read = threading.Event(), slow.store.read
+    slow.store.read = lambda name, path, digest: gate.wait(10) and read(name, path, digest)
     for pool in (fast, slow):
         ingest(pool, "x", "a2")
         settle_reads(fast)
@@ -290,15 +290,15 @@ def test_no_rank_waits_on_a_retry_once_a_load_has_failed(tmp_path):
 def _fail_reads(pool: LoraAdapterPool, name: str, first: threading.Event, then: threading.Event) -> None:
     """``name``'s reads on ``pool`` fail: the first once ``first`` is set, any later once
     ``then`` is (or after 10 s)."""
-    read, tries = pool.store._read, []
+    read, tries = pool.store.read, []
 
-    def unreadable(adapter, path):
+    def unreadable(adapter, path, digest):
         if adapter != name:
-            return read(adapter, path)
+            return read(adapter, path, digest)
         tries.append(adapter)
         (first if len(tries) == 1 else then).wait(10)
         raise OSError(f"{adapter} is unreadable")
-    pool.store._read = unreadable
+    pool.store.read = unreadable
 
 
 # --- the worker's admit fence --------------------------------------------------------------
@@ -309,7 +309,7 @@ class _PicksSlotPerMiss(LoraAdapterPool):
 
     def admit(self, step, ctx):
         for seg in step.segments:
-            outcome = super().admit(LoraStep(segments=(seg,)), ctx)
+            outcome = super().admit(ResourceStep(segments=(seg,)), ctx)
             if not outcome.ok:
                 return outcome
         return ADMIT_OK
@@ -376,8 +376,8 @@ def test_a_teardown_inside_a_two_miss_admit_does_not_split_the_ranks(tmp_path, p
     assert not errors and v1 == v2 == "ok"
     for pool in ranks:
         pool.remove_request("h")
-    gate, read = threading.Event(), follower.store._read
-    follower.store._read = lambda name, path: (name != "a2" or gate.wait(10)) and read(name, path)
+    gate, read = threading.Event(), follower.store.read
+    follower.store.read = lambda name, path, digest: (name != "a2" or gate.wait(10)) and read(name, path, digest)
     for pool in ranks:
         ingest(pool, "rA", "a2")
         ingest(pool, "rB", "a3")
@@ -404,7 +404,7 @@ def test_a_teardown_inside_a_two_miss_admit_does_not_split_the_ranks(tmp_path, p
 
 # --- the agreement over real gloo ----------------------------------------------------------
 
-def _gloo_worker(rank: int, store: str, out_dir: str, lora_paths: dict):
+def _gloo_worker(rank: int, store: str, out_dir: str, lora_paths: dict, axis: str):
     import torch.distributed as dist
 
     from mstar.distributed.communication import CommGroup, JointGroups
@@ -412,21 +412,27 @@ def _gloo_worker(rank: int, store: str, out_dir: str, lora_paths: dict):
 
     dist.init_process_group("gloo", init_method=f"file://{store}", rank=rank, world_size=2,
                             timeout=timedelta(seconds=60))
-    tp = CommGroup(my_global_rank=rank, my_group_rank=rank, group_members=[0, 1])
-    tp.device_group = tp.cpu_group = dist.group.WORLD
-    tp.initialized = True
-    tp.init_all_reduce()
-    joint = JointGroups(tp_group=tp, sp_group=CommGroup.trivial())
-    pool = LoraAdapterPool.build(make_spec(lora_paths, max_slots=2, cpu_capacity=1),
-                                 EngineResourceInfo(device=torch.device("cpu"), joint_comm_group=joint))
+    group = CommGroup(my_global_rank=rank, my_group_rank=rank, group_members=[0, 1])
+    group.device_group = group.cpu_group = dist.group.WORLD
+    group.initialized = True
+    group.init_all_reduce()
+    if axis == "tp":
+        joint = JointGroups(tp_group=group, sp_group=CommGroup.trivial(), instance=group)
+        info = EngineResourceInfo(device=torch.device("cpu"), joint_comm_group=joint)
+    else:
+        # a node placing its KV positions over its 2 SP ranks: heads over TP alone (1), and every
+        # SP rank runs every row
+        joint = JointGroups(tp_group=CommGroup.trivial(), sp_group=group, instance=group)
+        info = EngineResourceInfo(device=torch.device("cpu"), replicated_over_sp=True, joint_comm_group=joint)
+    pool = LoraAdapterPool.build(make_spec(lora_paths, max_slots=2, cpu_capacity=1), info)
     if rank == 1:
-        read = pool.store._read
+        read = pool.store.read
 
-        def flaky(name, path):
+        def flaky(name, path, digest):
             if name == "a2":
                 raise OSError("read error on rank 1 only")
-            return read(name, path)
-        pool.store._read = flaky
+            return read(name, path, digest)
+        pool.store.read = flaky
     for rid, adapter in (("ok", "a1"), ("bad", "a2")):
         ingest(pool, rid, adapter)
     result = {"agree": [_verdict(pool.admit(step([rid]), ctx([rid]))) for rid in ("ok", "bad")],
@@ -435,11 +441,13 @@ def _gloo_worker(rank: int, store: str, out_dir: str, lora_paths: dict):
     dist.destroy_process_group()
 
 
-def test_gloo_a_load_failing_on_one_rank_is_refused_on_both(tmp_path):
+@pytest.mark.parametrize("axis", ["tp", "cp_over_sp"])
+def test_gloo_a_load_failing_on_one_rank_is_refused_on_both(axis, tmp_path):
+    """Over TP ranks, and over the SP ranks of a node that places its KV positions over them."""
     import torch.multiprocessing as mp
 
     lora_paths = _write_adapters(tmp_path, ("a1", "a2"))
-    mp.spawn(_gloo_worker, args=(str(tmp_path / "store"), str(tmp_path), lora_paths), nprocs=2, join=True)
+    mp.spawn(_gloo_worker, args=(str(tmp_path / "store"), str(tmp_path), lora_paths, axis), nprocs=2, join=True)
     for r in range(2):
         result = torch.load(tmp_path / f"rank{r}.pt")
         assert result["agree"] == ["ok", ("load", ("bad",))]

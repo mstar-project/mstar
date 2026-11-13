@@ -22,6 +22,7 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 
+from mstar.engine.resources import StepAllowance
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv import page_copier
 from mstar.engine.resources.kv.config import KVLayout, KVReqConfig, KVStep, PagedKVConfig, PrefixSpan, StreamLayout
@@ -92,6 +93,7 @@ def _manager(
         name="kv", joint_comm_group=None, transfer_engine_info=None,
         device=torch.device("cuda" if cpu_offload_pages else "cpu"),
         dtype=torch.float32,
+        host_allowance=StepAllowance(),
     )
     kv.enable_prefix_cache(ROOT)
     return kv
@@ -142,7 +144,7 @@ def _paint(kv: KVManager, pages: list[int], base: float) -> torch.Tensor:
 
 
 def _scribble_free(kv: KVManager) -> None:
-    kv.kv_cache.tensor[:, list(kv._arena.allocator.free_pages.queue)] = -99.0
+    kv.kv_cache.tensor[:, kv._arena.free_pages()] = -99.0
 
 
 def _published(kv: KVManager, rid: str, seq_len: int, pages: list[int]):

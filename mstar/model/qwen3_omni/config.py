@@ -16,7 +16,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Tuple
 
+from mstar.model import keys
 from mstar.model.components.aut_encoder import AuTEncoderConfig
+from mstar.streaming.chunk_policy import ScheduledLeftContextChunkPolicy
 
 # ---------------------------------------------------------------------------
 # Resource label constants
@@ -28,14 +30,22 @@ THINKER_ATTN = "thinker_attn"
 TALKER_ATTN = "talker_attn"
 # the encoders' cacheless attention (ragged: within each window / frame)
 AUDIO_ATTN = "audio_attn"
-VISION_ATTN = "vision_attn"
+# the shared ViT node (`PackedBlockLoopEncoder`) reads `keys`' one
+VISION_ATTN = keys.VISION_ATTN
+# What each encoder's attention reads, and what the Talker keeps per request.
+AUDIO_TOKENS, VISION_TOKENS = "audio_tokens", "vision_tokens"
+TALKER_TEXT = "talker_text"
 
 THINKER_POS = "thinker_pos"
 TALKER_POS = "talker_pos"
 
 THINKER_SAMPLER = "thinker_sampler"
+# whether a Thinker step's tokens split over its SP ranks
+THINKER_SHARD = "thinker_shard"
 # combined walk of the Thinker's text/audio prefill and decode
 THINKER_MIXED = "thinker_mixed"
+# the decode walk of a request with no audio output: no states for the Talker
+THINKER_TEXT_DECODE = "thinker_text_decode"
 TALKER_SAMPLER = "talker_sampler"
 CODE_PRED_SAMPLER = "code_sampler"
 
@@ -390,11 +400,13 @@ class Code2WavConfig:
                 f"and the next window's context must re-decode them, or they are lost at every chunk boundary"
             )
 
-    @property
-    def codec_max_window(self) -> int:
-        """Frames in the widest window the chunk schedule pops. Every window
-        is padded to it, so the vocoder runs (and captures) one shape."""
-        return self.codec_left_context_frames + max((self.codec_chunk_frames, *self.codec_chunk_schedule))
+    def chunk_policy(self) -> ScheduledLeftContextChunkPolicy:
+        """The Talker -> Code2Wav edge's chunking, in codec frames."""
+        return ScheduledLeftContextChunkPolicy(
+            schedule=self.codec_chunk_schedule,
+            chunk=self.codec_chunk_frames,
+            left_context=self.codec_left_context_frames,
+        )
 
     def get_hf_config(self):
         from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (

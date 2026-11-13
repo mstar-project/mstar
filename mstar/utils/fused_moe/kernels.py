@@ -25,15 +25,14 @@ Triton-specific boilerplate out of the runner.
 
 from __future__ import annotations
 
-import functools
-import json
-from pathlib import Path
 from typing import Any, Dict
 
 import torch
 import triton
 import triton.language as tl
 
+from mstar.kernels import Impl, KernelOp, TableEntry, Target, Tolerance, register
+from mstar.kernels.registry import on_reset
 from mstar.utils.quant_fp8 import FP8_DTYPE
 
 # ---------------------------------------------------------------------------
@@ -73,6 +72,7 @@ def fused_moe_kernel(
     top_k: tl.constexpr,
     compute_type: tl.constexpr,
     even_Ks: tl.constexpr,
+    ACCUMULATE: tl.constexpr,
 ):
     """Compute one ``[BLOCK_SIZE_M, BLOCK_SIZE_N]`` tile of the MoE output.
 
@@ -87,6 +87,9 @@ def fused_moe_kernel(
     holds the permuted slot indices (< ``num_valid_tokens`` for real
     tokens, >= for padding) and ``expert_ids`` maps each ``BLOCK_SIZE_M``
     block to the expert index.
+
+    ``ACCUMULATE`` adds the tile into ``C`` instead of overwriting it (a
+    LoRA delta onto a base GEMM's output).
     """
     pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
@@ -138,11 +141,12 @@ def fused_moe_kernel(
         moe_weight = tl.load(topk_weights_ptr + offs_token, mask=token_mask, other=0)
         accumulator = accumulator * moe_weight[:, None]
 
-    accumulator = accumulator.to(compute_type)
-
     offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
     c_ptrs = c_ptr + stride_cm * offs_token[:, None] + stride_cn * offs_cn[None, :]
     c_mask = token_mask[:, None] & (offs_cn[None, :] < N)
+    if ACCUMULATE:
+        accumulator += tl.load(c_ptrs, mask=c_mask, other=0.0).to(tl.float32)
+    accumulator = accumulator.to(compute_type)
     tl.store(c_ptrs, accumulator, mask=c_mask)
 
 
@@ -271,23 +275,6 @@ def _grid_rows(sorted_token_ids: torch.Tensor, topk_ids: torch.Tensor, block_m: 
     return min(sorted_token_ids.shape[0], topk_ids.numel() * block_m)
 
 
-def _launch_options(config: Dict[str, Any]) -> Dict[str, Any]:
-    """``config`` as launch keywords, without ``num_warps`` and ``num_stages``
-    on a traced launch.
-
-    The table lookup graph-breaks, so under a dynamic-shape compile the config
-    enters the traced frame as an input whose ints dynamo makes symbols, and
-    its Triton wrapper takes launch options only as constants. A traced launch
-    keeps the tuned tiles with Triton's default warps and stages; eager
-    launches keep them all. (Under dynamo a symbolic int is not an
-    ``isinstance`` of ``torch.SymInt``, so they cannot be dropped only when
-    symbolic.)
-    """
-    if torch.compiler.is_compiling():
-        return {k: v for k, v in config.items() if k not in ("num_warps", "num_stages")}
-    return config
-
-
 def invoke_fused_moe_kernel(
     A: torch.Tensor,
     B: torch.Tensor,
@@ -301,6 +288,7 @@ def invoke_fused_moe_kernel(
     top_k: int,
     config: Dict[str, Any],
     compute_type: tl.dtype,
+    accumulate: bool = False,
 ) -> None:
     """Launch :func:`fused_moe_kernel` with the right grid size.
 
@@ -314,7 +302,7 @@ def invoke_fused_moe_kernel(
         Output buffer, shape ``(M*topk, N)`` for GEMM-1 or reshape-viewed
         ``(M*topk, hidden)`` for GEMM-2.
     topk_weights, topk_ids : torch.Tensor
-        Router output, shapes ``(M, top_k)``.  ``topk_ids`` must be int32.
+        Router output, shapes ``(M, top_k)``.  ``topk_ids`` int32 or int64.
     sorted_token_ids, expert_ids, num_tokens_post_padded : torch.Tensor
         Outputs of :func:`moe_align_block_size`.
     mul_routed_weight : bool
@@ -328,6 +316,8 @@ def invoke_fused_moe_kernel(
         Tile sizes; output of :func:`get_default_config`.
     compute_type : triton.language.dtype
         Dtype for the accumulator store.
+    accumulate : bool
+        Add into ``C`` rather than overwrite it.
     """
     assert topk_weights.stride(1) == 1
     assert sorted_token_ids.stride(0) == 1
@@ -365,7 +355,8 @@ def invoke_fused_moe_kernel(
         top_k=top_k,
         compute_type=compute_type,
         even_Ks=even_Ks,
-        **_launch_options(config),
+        ACCUMULATE=accumulate,
+        **config,
     )
 
 
@@ -537,6 +528,74 @@ def act_and_mul_triton(
     )
 
 
+@triton.jit
+def act_and_mul_quant_fp8_kernel(
+    gateup_output_ptr,
+    q_ptr,
+    s_ptr,
+    inter,
+    SWIGLU_LIMIT,
+    eps,
+    fp8_min,
+    fp8_max,
+    GROUP: tl.constexpr,
+    NUM_GROUPS: tl.constexpr,
+    GROUPS_P2: tl.constexpr,
+    ACTIVATION_TYPE: tl.constexpr,
+    HAS_SWIGLU_CLAMP: tl.constexpr,
+):
+    """One slot's :func:`act_and_mul_kernel` row, quantized to e4m3 in ``GROUP``-wide groups as
+    :func:`mstar.utils.quant_fp8.per_token_group_quant_fp8_kernel` quantizes it: the same
+    values bit for bit, without the bf16 intermediate's round trip through memory."""
+    in_dtype = gateup_output_ptr.dtype.element_ty
+    row = tl.program_id(0).to(tl.int64)
+    g = tl.arange(0, GROUPS_P2)
+    offs = g[:, None] * GROUP + tl.arange(0, GROUP)[None, :]
+    mask = (g < NUM_GROUPS)[:, None]
+    gate = tl.load(gateup_output_ptr + row * 2 * inter + offs, mask=mask, other=0.0)
+    up = tl.load(gateup_output_ptr + row * 2 * inter + inter + offs, mask=mask, other=0.0)
+    if HAS_SWIGLU_CLAMP:
+        gate = tl.minimum(gate, SWIGLU_LIMIT)
+        up = tl.maximum(tl.minimum(up, SWIGLU_LIMIT), -SWIGLU_LIMIT)
+    activated = _apply_activation(gate, ACTIVATION_TYPE).to(in_dtype)
+    y = (activated * up).to(in_dtype).to(tl.float32)
+    y_s = tl.maximum(tl.max(tl.abs(y), axis=1), eps) / fp8_max
+    y_q = tl.minimum(tl.maximum(y / y_s[:, None], fp8_min), fp8_max).to(q_ptr.dtype.element_ty)
+    tl.store(q_ptr + row * inter + offs, y_q, mask=mask)
+    tl.store(s_ptr + row * NUM_GROUPS + g, y_s, mask=g < NUM_GROUPS)
+
+
+def act_and_mul_quant_fp8(
+    gateup_output: torch.Tensor,
+    group_size: int,
+    activation: str = "silu",
+    swiglu_limit: float | None = None,
+    eps: float = 1e-10,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """:func:`act_and_mul_triton` then ``per_token_group_quant_fp8(_, group_size)`` in one
+    launch: ``(q, s)``, e4m3 ``(M, inter)`` and fp32 ``(M, inter // group_size)``."""
+    assert gateup_output.is_contiguous() and gateup_output.dim() == 2
+    M, two_inter = gateup_output.shape
+    inter = two_inter // 2
+    assert inter % group_size == 0, f"inter {inter} must be a multiple of group_size {group_size}"
+    finfo = torch.finfo(FP8_DTYPE)
+    q = torch.empty((M, inter), dtype=FP8_DTYPE, device=gateup_output.device)
+    s = torch.empty((M, inter // group_size), dtype=torch.float32, device=gateup_output.device)
+    if M:
+        groups = inter // group_size
+        act_and_mul_quant_fp8_kernel[(M,)](
+            gateup_output, q, s, inter,
+            0.0 if swiglu_limit is None else swiglu_limit,
+            eps, finfo.min, finfo.max,
+            GROUP=group_size,
+            NUM_GROUPS=groups,
+            GROUPS_P2=triton.next_power_of_2(groups),
+            ACTIVATION_TYPE=activation,
+            HAS_SWIGLU_CLAMP=swiglu_limit is not None,
+        )
+    return q, s
+
+
 # ---------------------------------------------------------------------------
 # Sum-reduce over the top-k dimension
 # ---------------------------------------------------------------------------
@@ -638,37 +697,84 @@ def moe_sum_reduce_triton(
 # ---------------------------------------------------------------------------
 
 
-def config_path(E: int, N: int, K: int, device_name: str | None = None) -> Path:
-    """Where ``mstar.utils.fused_moe.tune`` writes configs for this shape and GPU."""
-    if device_name is None:
-        device_name = torch.cuda.get_device_name()
-    device_name = device_name.replace(" ", "_")
-    return Path(__file__).parent / "configs" / f"E={E},N={N},K={K},device_name={device_name}.json"
+def _triton_unavailable(target: Target) -> str | None:
+    if target.device.type != "cuda":
+        return f"needs a CUDA or ROCm device, not {target.device.type}"
+    if target.dtype not in (torch.bfloat16, torch.float16):
+        return f"runs bf16 and fp16 activations, not {target.dtype}"
+    return None
 
 
-@functools.lru_cache(maxsize=None)
-def _tuned_configs(E: int, N: int, K: int) -> dict[int, dict] | None:
-    path = config_path(E, N, K)
-    if not path.is_file():
-        return None
-    return {int(m): cfg for m, cfg in json.loads(path.read_text()).items()}
+# fused_experts' two grouped GEMMs: gate/up (N = 2 * the per-rank expert intermediate size,
+# K = hidden) and down. Rows are keyed by the token count M. A row's config holds the gate/up
+# tiles, and its "down" holds the down GEMM's differences, except BLOCK_SIZE_M, which the two
+# GEMMs share because they share one alignment. The sweep checks candidates against the same
+# kernel at its default tiles, within the tolerance of bf16 accumulation order.
+MOE_GEMM = register(KernelOp(
+    name="moe_gemm",
+    shape=("E", "N", "K", "top_k"),
+    bucket="M",
+    impls=(Impl("triton", _triton_unavailable, Tolerance(1e-2, 1e-3)),),
+    doc="fused_experts' bf16/fp16 grouped expert GEMMs (gate/up, then down)",
+))
+
+_TILE_ROWS: dict[tuple, tuple | None] = {}
+on_reset(_TILE_ROWS.clear)
 
 
-def get_config(M: int, E: int, N: int, K: int, top_k: int) -> tuple[Dict[str, int], Dict[str, int]]:
-    """Tile configs for the gate/up GEMM and the down GEMM.
+@torch.compiler.assume_constant_result
+def _tile_rows(E: int, N: int, K: int, top_k: int, dtype: torch.dtype,
+               device: torch.device | None) -> tuple | None:
+    """The tuned rows for this shape as ``(bounds, configs)``: the rows' upper bounds (all but
+    the last row's) and each row's ``(gate/up items, down items)``; None where no table has the
+    shape. A constant to dynamo: traced, the table read would break the graph at every compiled
+    MoE layer."""
+    key = (E, N, K, top_k, dtype, device)
+    if key not in _TILE_ROWS:
+        entry = MOE_GEMM.lookup(dtype, {"E": E, "N": N, "K": K, "top_k": top_k}, device)
+        _TILE_ROWS[key] = None if entry is None else _entry_tiles(entry)
+    return _TILE_ROWS[key]
 
-    Uses the tuned table for this shape and GPU when present, taking the entry
-    for the nearest tuned batch size, else :func:`get_default_config` for both.
-    The two GEMMs share ``BLOCK_SIZE_M`` because they share one alignment.
+
+def _entry_tiles(entry: TableEntry) -> tuple:
+    """A ``moe_gemm`` entry's rows as :func:`_tile_rows` returns them. Every row carries its
+    tiles: the default ones depend on the token count, so a row can't defer to them."""
+    bounds, configs = [], []
+    for m, choice in entry.rows:
+        if choice.config is None or "BLOCK_SIZE_M" not in choice.config:
+            raise ValueError(f"{entry.source}: every moe_gemm row needs its tiles, BLOCK_SIZE_M included")
+        up = dict(choice.config)
+        down_overrides = up.pop("down", {})
+        down = {**up, **down_overrides, "BLOCK_SIZE_M": up["BLOCK_SIZE_M"]}
+        if m is not None:
+            bounds.append(m)
+        configs.append((tuple(up.items()), tuple(down.items())))
+    return tuple(bounds), tuple(configs)
+
+
+def get_config(
+    M: int, E: int, N: int, K: int, top_k: int,
+    dtype: torch.dtype = torch.bfloat16, device: torch.device | None = None, tuned: bool = True,
+) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    """Tile configs for the gate/up GEMM and the down GEMM: the row that takes ``M`` tokens in
+    the ``moe_gemm`` table entry for this shape on this GPU, else :func:`get_default_config`.
+
+    Under ``torch.compile`` the configs must reach the Triton launch as constants (dynamo
+    refuses a symbolic ``num_warps``): the rows are a constant per expert shape and ``top_k``
+    (static under the engine's compiles; a symbolic key would make them data again), and the
+    row search below is traced, so a symbolic ``M`` only adds guards. A caller that may break the
+    graph before the launch passes ``tuned=False``.
     """
-    tuned = _tuned_configs(E, N, K)
-    if tuned is None:
+    rows = _tile_rows(E, N, K, top_k, dtype, device) if tuned else None
+    if rows is None:
         config = get_default_config(M, E, N, K, top_k)
-        return config, config
-    up = dict(tuned[min(tuned, key=lambda m: abs(m - M))])
-    down_overrides = up.pop("down", {})
-    down = {**up, **down_overrides, "BLOCK_SIZE_M": up["BLOCK_SIZE_M"]}
-    return up, down
+        return config, dict(config)
+    bounds, configs = rows
+    i = 0
+    while i < len(bounds) and M > bounds[i]:
+        i += 1
+    up, down = configs[i]
+    return dict(up), dict(down)
 
 
 def get_default_config(M: int, E: int, N: int, K: int, top_k: int) -> Dict[str, int]:

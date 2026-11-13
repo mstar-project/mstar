@@ -13,10 +13,12 @@ keys are viewed as pages of one token, and each query block is one paged
 host-side index arithmetic done at plan time.
 """
 
+import numpy as np
 import torch
 
-from mstar.engine.resources.attn.ragged.wrappers import padded_head_dim
+from mstar.engine.resources.attn.ragged.wrappers import padded_head_dim, zero_unplanned_rows
 from mstar.engine.resources.attn.workspace import Workspace
+from mstar.engine.resources.kv.plan import token_runs
 
 
 def block_causal_layout(
@@ -28,7 +30,7 @@ def block_causal_layout(
     queries ``[off + i*B, off + min((i+1)*B, L))`` and keys
     ``[off, off + min((i+1)*B, L))``.
     """
-    qo, kv = [0], [0]
+    qo = [0]
     starts: list[int] = []
     lens: list[int] = []
     off = 0
@@ -36,17 +38,11 @@ def block_causal_layout(
         for s in range(0, n, block_size):
             e = min(s + block_size, n)
             qo.append(qo[-1] + e - s)
-            kv.append(kv[-1] + e)
             starts.append(off)
             lens.append(e)
         off += n
-    if not lens:
-        return qo, kv, torch.zeros(0, dtype=torch.int32)
-    lens_t = torch.tensor(lens, dtype=torch.int64)
-    # each block's prefix as a run of consecutive token ids, all runs end to end
-    run_start = torch.tensor(starts, dtype=torch.int64) - torch.tensor(kv[:-1], dtype=torch.int64)
-    indices = torch.arange(kv[-1], dtype=torch.int64) + run_start.repeat_interleave(lens_t)
-    return qo, kv, indices.to(torch.int32)
+    kv, indices = token_runs(np.array(starts, dtype=np.int64), np.array(lens, dtype=np.int64))
+    return qo, kv.tolist(), torch.from_numpy(indices.astype(np.int32))
 
 
 def max_blocks(max_segments: int, max_tokens: int, block_size: int) -> int:
@@ -105,7 +101,6 @@ class RaggedBlockCausalWrapper:
         self._workspace = workspace_buffer
 
         if not accelerator_graph:
-            self._out_buf = None
             self.attn_wrapper = flashinfer.BatchPrefillWithPagedKVCacheWrapper(
                 self._workspace.tensor, "NHD", backend=backend,
             )
@@ -128,12 +123,6 @@ class RaggedBlockCausalWrapper:
             paged_kv_indices_buf=self._kv_indices_buf,
             paged_kv_last_page_len_buf=self._last_page_len_buf,
             backend=backend,
-        )
-        # Own the output so a replay's unplanned tail is a known value; see
-        # `_RaggedPrefillBase.__init__`.
-        self._out_buf = torch.zeros(
-            max_total_tokens, num_qo_heads, self.padded_head_dim,
-            dtype=q_data_type, device=device,
         )
         # FlashInfer latches its row ceilings on the first plan; prime at the
         # bucket's worst case so a small first plan can't cap it.
@@ -194,8 +183,6 @@ class RaggedBlockCausalWrapper:
             sm_scale=self.sm_scale,
             q_data_type=self.q_data_type,
         )
-        if self._out_buf is not None:
-            self._out_buf[total:].zero_()
 
     def _pad_head_dim(self, t: torch.Tensor) -> torch.Tensor:
         if t.shape[-1] == self.padded_head_dim:
@@ -214,7 +201,7 @@ class RaggedBlockCausalWrapper:
         qp, kp, vp = (self._pad_head_dim(t.to(self.q_data_type)) for t in (q, k, v))
         # each token is a page of one: [num_pages, page_size=1, H, D]
         kv = (kp.unsqueeze(1), vp.unsqueeze(1))
-        if self._out_buf is None:
+        if not self.accelerator_graph:
             out = self.attn_wrapper.run(qp, kv)
         else:
             n = qp.shape[0]
@@ -222,7 +209,8 @@ class RaggedBlockCausalWrapper:
                 f"RaggedBlockCausalWrapper: {n} rows exceeds the "
                 f"{self.max_total_tokens} this graph-mode wrapper was built for"
             )
-            out = self.attn_wrapper.run(qp, kv, out=self._out_buf[:n])
+            out = self.attn_wrapper.run(qp, kv, out=torch.empty_like(qp, memory_format=torch.contiguous_format))
+            zero_unplanned_rows(out, self._qo_indptr_buf)
         if self.padded_head_dim != self.head_dim and not padded_in:
             return out[..., : self.head_dim].contiguous()
-        return out.clone() if self._out_buf is not None else out
+        return out

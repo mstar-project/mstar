@@ -1,8 +1,11 @@
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field
 from enum import Enum, IntEnum
+from typing import NamedTuple
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.resources import PublishedInfo
+from mstar.engine.resources.base import CachedLease, MoveKind
 from mstar.graph.base import GraphEdge, TensorPointerInfo
 from mstar.graph.loop_indices import NestedLoopIndices
 from mstar.observability.recorders import MetricSnapshot
@@ -43,6 +46,8 @@ class WorkerMessageType(Enum):
     TP_NO_SPEC = "tp_no_spec"
     ENABLE_METRICS = "enable_metrics"
     CLIENT_STREAM_ROUTE = "client_stream_route"
+    LOAD_LORA_ADAPTER = "load_lora_adapter"
+    UNLOAD_LORA_ADAPTER = "unload_lora_adapter"
 
 
 @dataclass
@@ -136,6 +141,16 @@ class EdgeItems(MessageBody):
     # the arena segment each item is in (an index into names), -1 for none
     shm_segment_idx: list[int] = field(default_factory=list)
     shm_offsets: list[int] = field(default_factory=list)
+    # A frame of inline items carries each item's value here instead of the
+    # descriptor columns above: a token the producer took off its stop check's
+    # host copy, so nothing is staged, read or acknowledged.
+    values: list[int] = field(default_factory=list)
+
+    @property
+    def request_id(self) -> str | None:
+        """The request of a one-row frame (one parked for a request that has
+        not arrived), None for a frame of several."""
+        return self.request_ids[0] if len(self.request_ids) == 1 else None
 
 
 @dataclass
@@ -174,12 +189,26 @@ class StopLoops(MessageBody):
     loop_stop_times: dict[str, NestedLoopIndices] = field(default_factory=dict)
 
 
+class Move(NamedTuple):
+    rid: str
+    kind: MoveKind
+    # A move applies to the KV resource keyed `pool`, or, when `pool` is empty, to the whole of node `node`.
+    # `count` is the number of pages of a RESERVE, an EARMARK or an ALLOT, the pages a GUARANTEE or a WAIT asks for,
+    # 1 for an UNRESERVE whose RESERVE made the allotment rather than grew it, and the tokens a DROP's rebuild writes.
+    pool: str = ""
+    count: int = 0
+    victims: tuple[str, ...] = ()
+    node: str = ""
+
+
 @dataclass
 class OffloadDelta:
-    """A rank's offloads and reloads, in the order it made them.
+    """A rank's moves, in the order the followers replay them.
 
-    Ordered so the follower replays the leader's decisions in the same order: a
-    sequence that worked for the leader works for the followers too.
+    That is the order the leader made them in, so a sequence that worked for the
+    leader works for the followers too, except that a node's offload goes ahead of
+    the moves its pools made as it freed room (`add` with ``at``). A follower can
+    replay those only after the offload.
 
     Holds WIRE request ids, not worker-local handles: a handle is minted per
     worker, so rank 0's would name different requests on the follower.
@@ -192,56 +221,86 @@ class OffloadDelta:
     lean on that.
     """
 
-    # parallel lists: rids[i] was offloaded if is_offload[i], else reloaded
+    # parallel lists, one entry per `Move`
     rids: list[str] = field(default_factory=list)
-    is_offload: list[bool] = field(default_factory=list)
+    kinds: list[MoveKind] = field(default_factory=list)
+    pools: list[str] = field(default_factory=list)
+    counts: list[int] = field(default_factory=list)
+    victims: list[list[str]] = field(default_factory=list)
+    nodes: list[str] = field(default_factory=list)
 
     @classmethod
     def new(cls) -> "OffloadDelta":
         return cls()
 
-    def add_offloaded(self, rid: str):
-        self.rids.append(rid)
-        self.is_offload.append(True)
+    def add(
+        self, kind: MoveKind, rid: str, pool: str = "", count: int = 0, victims: Sequence[str] = (), node: str = "",
+        at: int | None = None,
+    ):
+        """Append the move, or put it ahead of the moves from index ``at`` on."""
+        at = len(self) if at is None else at
+        self.rids.insert(at, rid)
+        self.kinds.insert(at, kind)
+        self.pools.insert(at, pool)
+        self.counts.insert(at, count)
+        self.victims.insert(at, list(victims))
+        self.nodes.insert(at, node)
 
-    def add_reloaded(self, rid: str):
-        self.rids.append(rid)
-        self.is_offload.append(False)
+    def cancel(self, rid: str, kind: MoveKind, pool: str) -> bool:
+        """Drop the last move if it is ``kind`` on ``rid`` in ``pool`` and moves no victims, and return whether a move
+        was dropped."""
+        if not (self.rids and (self.rids[-1], self.kinds[-1], self.pools[-1]) == (rid, kind, pool)) or self.victims[-1]:
+            return False
+        for column in (self.rids, self.kinds, self.pools, self.counts, self.victims, self.nodes):
+            column.pop()
+        return True
 
     def __len__(self):
         return len(self.rids)
 
-    def peek_left(self) -> tuple[str, bool] | None:
+    def peek_left(self) -> Move | None:
         if not len(self):
             return
-        return (self.rids[0], self.is_offload[0])
+        return Move(
+            self.rids[0], self.kinds[0], self.pools[0], self.counts[0], tuple(self.victims[0]), self.nodes[0],
+        )
 
-    def pop_left(self) -> tuple[str, bool] | None:
+    def pop_left(self) -> Move | None:
         if not len(self):
             return None
-        return (self.rids.pop(0), self.is_offload.pop(0))
+        return Move(
+            self.rids.pop(0), self.kinds.pop(0), self.pools.pop(0), self.counts.pop(0), tuple(self.victims.pop(0)),
+            self.nodes.pop(0),
+        )
 
     def copy(self) -> "OffloadDelta":
         """An independent queue holding the same moves.
 
         One per follower: each replays at its own pace, popping as it goes.
         """
-        return OffloadDelta(list(self.rids), list(self.is_offload))
+        return OffloadDelta(
+            list(self.rids), list(self.kinds), list(self.pools), list(self.counts), list(self.victims),
+            list(self.nodes),
+        )
 
     def take(self) -> "OffloadDelta":
         """Hand the queue over and leave this one empty.
 
         Copies and clears rather than rebinding, so a holder of this delta (the
-        engine keeps its journal in a dict) sees it emptied.
+        engine keeps its journal) sees it emptied.
         """
         taken = self.copy()
-        self.rids.clear()
-        self.is_offload.clear()
+        for column in (self.rids, self.kinds, self.pools, self.counts, self.victims, self.nodes):
+            column.clear()
         return taken
 
     def extend(self, other: "OffloadDelta") -> None:
         self.rids.extend(other.rids)
-        self.is_offload.extend(other.is_offload)
+        self.kinds.extend(other.kinds)
+        self.pools.extend(other.pools)
+        self.counts.extend(other.counts)
+        self.victims.extend(other.victims)
+        self.nodes.extend(other.nodes)
 
 
 @dataclass
@@ -258,8 +317,8 @@ class ScheduleTPNode(MessageBody):
     walks: list[str] = field(default_factory=list)
     walk_idx: list[int] = field(default_factory=list)
     # rank 0's prefix-cache leases, by wire request id and then resource
-    prefix_hits: dict[str, dict[str, list[int]]] = field(default_factory=dict)
-    page_trails: dict[str, tuple[int, int]] = field(default_factory=dict)
+    prefix_hits: dict[str, dict[str, CachedLease]] = field(default_factory=dict)
+    page_trails: dict[str, tuple[int, ...]] = field(default_factory=dict)
     # A row of the step takes an input a follower reads from elsewhere: every
     # rank agrees on whose read failed before preparing the step
     read_check: bool = False
@@ -299,6 +358,9 @@ class ConductorMessageType(Enum):
     READS_DONE = "reads_done"
     WORKER_STATUS = "worker_status"
     ENABLE_METRICS = "enable_metrics"
+    LOAD_LORA_ADAPTER = "load_lora_adapter"
+    UNLOAD_LORA_ADAPTER = "unload_lora_adapter"
+    LORA_ADAPTER_ACK = "lora_adapter_ack"
 
 
 @dataclass
@@ -315,6 +377,9 @@ class NewRequestConductor(MessageBody):
     # A client stream the opening leaves open: a live call, which is refused
     # rather than queued at max_concurrent_requests.
     input_open: bool = False
+    streaming: bool = False
+    # the prompt's token count, echoed on RequestComplete for the response's usage
+    prompt_tokens: int | None = None
 
 
 @dataclass
@@ -332,7 +397,6 @@ class WorkerGraphsDone(MessageBody):
     # The walk the completed pass ran under. The conductor follows it for a
     # partition whose walk the stream drives.
     graph_walk: str = field(default="")
-    stream_tokens_consumed: dict[str, int] = field(default_factory=dict)  # edge_name -> tokens consumed from stream
     # Stream edge -> destination worker -> items sent since the last report.
     # Every rank reports its own.
     stream_items_sent: dict[str, dict[str, int]] = field(default_factory=dict)
@@ -385,6 +449,37 @@ class EnableMetrics(MessageBody):
     """Start the workers' histograms and counters. The API server sends it to
     the conductor after its warmup requests; the conductor forwards it to
     every worker (``WorkerMetrics.start_counting``)."""
+
+
+@dataclass
+class LoadLoraAdapter(MessageBody):
+    """Serve a LoRA adapter from now on (``POST /v1/load_lora_adapter``). The API server
+    sends it to the conductor, which forwards it to every worker hosting the LoRA pool
+    and answers once all of them have acknowledged. ``op_id`` pairs the acks and the
+    answer with the request; ``lora_path`` is a safetensors file every process can read.
+    ``lora_digest`` (hex) is the digest of the weights the API server checked and keys
+    the prefix cache under: a worker reading other weights refuses the load.
+    """
+    op_id: str
+    lora_name: str
+    lora_path: str
+    lora_digest: str
+
+
+@dataclass
+class UnloadLoraAdapter(MessageBody):
+    """Stop serving a LoRA adapter to new requests (``POST /v1/unload_lora_adapter``);
+    routed like ``LoadLoraAdapter``."""
+    op_id: str
+    lora_name: str
+
+
+@dataclass
+class LoraAdapterAck(MessageBody):
+    """A worker's answer to a load or unload: ``error`` is None when it succeeded."""
+    op_id: str
+    worker_id: str
+    error: str | None = None
 
 
 @dataclass

@@ -1,16 +1,20 @@
-"""Window plumbing on CPU, plus single-GPU numerical and replay tests that check FlashInfer
-against an explicit FP32 PyTorch attention reference."""
+"""Window and softmax-scale plumbing on CPU, plus single-GPU numerical and replay tests that
+check FlashInfer against an explicit FP32 PyTorch attention reference."""
 
 import importlib.util
 import itertools
 import os
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from typing import NamedTuple
 from unittest.mock import MagicMock, patch
 
 import torch
+import yaml
 
+from mstar.engine.resources.attn import wrappers
 from mstar.engine.resources.attn.base import AttentionManager
 from mstar.engine.resources.attn.config import (
     AttentionConfig,
@@ -22,7 +26,8 @@ from mstar.engine.resources.attn.config import (
     derive_kv_groups,
 )
 from mstar.engine.resources.attn.flashinfer import FlashInferManager
-from mstar.engine.resources.base import EngineResourceInfo, Resource
+from mstar.engine.resources.attn.workspace import WorkspacePool
+from mstar.engine.resources.base import EngineResourceInfo
 from mstar.engine.resources.kv.config import (
     DEFAULT_PAGE_SIZE,
     KVGroup,
@@ -38,6 +43,7 @@ from mstar.engine.resources.kv.plan import KVPlanOutput, KVPlanOutputs, Sequence
 from mstar.engine.resources.runner import StepRunner
 from mstar.engine.resources.spec import CombinedSplit, resolve_spec_dependencies
 from mstar.engine.resources.step import BucketKey, Segment, SlotLease, StepContext, SubmoduleStep
+from mstar.testing_utils.resource import StubResource
 
 # A captured plan stages its host arrays behind a CUDA event.
 CAPTURED = (False, True) if torch.cuda.is_available() else (False,)
@@ -107,11 +113,36 @@ class SlidingWindowTests(unittest.TestCase):
             self.assertEqual(AttentionConfig("kv", sliding_window=value).sliding_window, value)
 
     def test_unsupported_backend_fails_before_dependency_access(self):
-        for backend in (AttnBackend.DENSE, AttnBackend.XPU_PAGED):
-            spec = AttentionSpec(resource_key="attn", nodes={"LLM"},
-                                 config=AttentionConfig("kv", backend=backend, sliding_window=4))
-            with self.subTest(backend=backend), self.assertRaisesRegex(ValueError, backend.name):
+        # MLA reads sm_scale but not the window
+        cases = [(AttnBackend.FLASHINFER_MLA, "sliding_window")] + [
+            (backend, name)
+            for backend in (AttnBackend.DENSE, AttnBackend.FLEX, AttnBackend.XPU_PAGED)
+            for name in ("sliding_window", "sm_scale")
+        ]
+        for backend, name in cases:
+            config = AttentionConfig("kv", backend=backend, **{name: 4})
+            spec = AttentionSpec(resource_key="attn", nodes={"LLM"}, config=config)
+            with self.subTest(backend=backend, config=name), \
+                    self.assertRaisesRegex(ValueError, f"{backend.name}.*ignores {name}"):
                 AttentionManager.build(spec, EngineResourceInfo(device=torch.device("cpu")))
+
+    def test_window_and_scale_change_the_fingerprint(self):
+        plain = build_manager(None)
+        keys = {m.fingerprint() for m in (plain, build_manager(4), build_manager(None, sm_scale=0.25))}
+        self.assertEqual(len(keys), 3)
+        # neither declared: the base's key, which every existing model already has
+        self.assertEqual(plain.fingerprint(), AttentionManager.fingerprint(plain))
+
+    def test_mixed_wrapper_hands_the_scale_to_both_halves(self):
+        workspaces = WorkspacePool(torch.device("cpu"), size_mb=1)
+        mixed = wrappers.FlashInferMixedWrapper(
+            decode_workspace=workspaces.get("decode"), prefill_workspace=workspaces.get("prefill"),
+            num_qo_heads=4, num_kv_heads=2,
+            head_dim=128, page_size=16, batch_size=2, max_total_tokens=8, max_num_pages=8,
+            max_prefill_rows=1, device=torch.device("cpu"), sm_scale=0.5,
+        )
+        for half in (mixed._decode, mixed._prefill):
+            self.assertEqual(half.sm_scale, 0.5)
 
     def test_unbounded_dense_backend_and_fallback_are_unchanged(self):
         module = "mstar.engine.resources.attn.dense"
@@ -124,16 +155,18 @@ class SlidingWindowTests(unittest.TestCase):
         self.assertIsInstance(manager, FlashInferManager)
         self.assertEqual(manager._window_left, -1)
 
-    def test_both_wrappers_receive_window_and_reuse_plans(self):
-        for window, expected in ((None, -1), (1, 0), (4, 3)):
+    def test_both_wrappers_receive_window_and_scale_and_reuse_plans(self):
+        for (window, expected), scale in itertools.product(((None, -1), (1, 0), (4, 3)), (None, 0.25)):
             for captured in CAPTURED:
                 for query_lengths in ([7, 5], [1, 1]):
-                    with self.subTest(window=window, captured=captured, queries=query_lengths):
-                        manager = build_manager(window)
+                    with self.subTest(window=window, scale=scale, captured=captured, queries=query_lengths):
+                        manager = build_manager(window, sm_scale=scale)
                         ctx = context([7, 5], query_lengths, captured)
                         manager.plan(AttentionStep(), ctx)
                         wrapper = manager._current_plan_states["main"]
-                        self.assertEqual(wrapper.attn_wrapper.plan.call_args.kwargs["window_left"], expected)
+                        kwargs = wrapper.attn_wrapper.plan.call_args.kwargs
+                        self.assertEqual(kwargs["window_left"], expected)
+                        self.assertEqual(kwargs["sm_scale"], scale)
                         self.assertEqual(wrapper.accelerator_graph, captured)
                         manager.plan(AttentionStep(), ctx)
                         self.assertIs(manager._current_plan_states["main"], wrapper)
@@ -162,13 +195,9 @@ class SlidingWindowTests(unittest.TestCase):
         ctx = context([7, 5], [7, 5])
         kv_output = ctx.plan_results.pop("kv")
 
-        class RecordingKV(Resource):
+        class RecordingKV(StubResource):
             plans = 0
             commits = 0
-
-            @classmethod
-            def build(cls, spec, info):
-                return cls()
 
             @property
             def supports_preplan(self):
@@ -283,6 +312,36 @@ class SlidingWindowTests(unittest.TestCase):
         self.assertEqual(free - kv._arena.num_free, 9)
         kv.rollback_admit(step, ctx)
         self.assertEqual(kv._arena.num_free, free)
+
+    def test_capacity_benchmark_counts_what_admission_lets_in(self):
+        """At one rank `benchmark/kv_capacity.py` stops at the request admission makes wait. A
+        request's window gives its pages back once its prompt is written, so one rank lets in
+        what the pages hold, as above one rank, where nothing allots."""
+        from benchmark import kv_capacity
+
+        def requests(shards):
+            cfg = window_pool(num_qo_heads=1, num_kv_heads=1, head_dim=4)
+            return kv_capacity.fill(cfg, 64, shards=shards, decode=16, device="cpu")["requests"]
+
+        self.assertEqual([requests(1), requests(2)], [2, 2])
+
+    def test_capacity_benchmark_finds_the_pool_a_model_declares_as_state(self):
+        """Command A+ declares its KV pool through `declare_state`, so its `get_node_resources`
+        alone holds none, and `benchmark/kv_capacity.py` raised for every Command A+ config."""
+        from benchmark import kv_capacity
+
+        fixture = Path(__file__).resolve().parents[2] / "mstar/model/command_a_plus/tests/fixtures/tiny_config.json"
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "config.json").write_text(fixture.read_text())
+            config = Path(directory) / "serving.yaml"
+            config.write_text(yaml.safe_dump({
+                "model": "command_a_plus", "model_kwargs": {"max_seq_len": 64},
+                "resources": {"kv_cache": {"max_num_pages": 32}},
+                "node_groups": [{"node_names": ["LLM"], "ranks": [0, 1], "tp_size": 2}],
+            }))
+            cfg, _, _, shards = kv_capacity.kv_configs(config, model_path=directory)
+        self.assertEqual([g.layers for g in cfg.groups], [(3,), (0, 1, 2)], "layers 0 to 2 keep a window")
+        self.assertEqual((cfg.max_num_pages, cfg.num_kv_heads, shards), (32, 1, 2), "the YAML's pool, one rank of two")
 
     def test_window_pool_refusals(self):
         # what depends on the device is refused as the attention builds: FlashInfer's fa3 is SM90's only
@@ -410,13 +469,14 @@ class SlidingWindowGPU(unittest.TestCase):
                 self.cache[pages[pos // 16], 0, pos % 16] = self.k[request, pos]
                 self.cache[pages[pos // 16], 1, pos % 16] = self.v[request, pos]
 
-    def reference(self, lengths, query_lengths, window):
+    def reference(self, lengths, query_lengths, window, scale=None):
+        scale = 128 ** -0.5 if scale is None else scale
         results = []
         for request, (n, nq) in enumerate(zip(lengths, query_lengths, strict=True)):
             q = self.q[request, n - nq:n].float().transpose(0, 1)
             k = self.k[request, :n].float().repeat_interleave(2, dim=1).transpose(0, 1)
             v = self.v[request, :n].float().repeat_interleave(2, dim=1).transpose(0, 1)
-            scores = q @ k.transpose(-1, -2) / (128 ** 0.5)
+            scores = q @ k.transpose(-1, -2) * scale
             qpos = torch.arange(n - nq, n, device="cuda")[:, None]
             kpos = torch.arange(n, device="cuda")[None, :]
             allowed = kpos <= qpos
@@ -429,27 +489,55 @@ class SlidingWindowGPU(unittest.TestCase):
         return torch.cat([self.q[r, n - nq:n] for r, (n, nq) in enumerate(zip(lengths, query_lengths, strict=True))])
 
     def test_prefill_and_four_decode_steps(self):
-        managers = {window: build_manager(window, "cuda") for window in (None, 1, 4)}
-        for increment in range(5):
-            lengths = [19 + increment, 9 + increment]
-            queries = lengths if increment == 0 else [1, 1]
-            ctx = context(lengths, queries)
-            q = self.packed_queries(lengths, queries)
-            for window, manager in managers.items():
-                with self.subTest(window=window, step=increment):
-                    manager.plan(AttentionStep(), ctx)
-                    actual = manager.run(q, "main", self.cache)
-                    torch.testing.assert_close(
-                        actual.float(), self.reference(lengths, queries, window), atol=0.015, rtol=0.015
-                    )
-        # At the final decode positions, key zero is outside either local window.
-        q = self.packed_queries([23, 13], [1, 1])
-        before = {w: m.run(q, "main", self.cache).clone() for w, m in managers.items()}
-        for page in (3, 4):
-            self.cache[page, :, 0] = 100
-        for window in (1, 4):
-            torch.testing.assert_close(managers[window].run(q, "main", self.cache), before[window], atol=0, rtol=0)
-        self.assertFalse(torch.equal(managers[None].run(q, "main", self.cache), before[None]))
+        # The second case prompts over a cached prefix, so a window starts mid-page, under a
+        # scale; its short row decodes from exactly the window's width to past it.
+        cases = (([19, 9], [19, 9], None), ([19, 3], [5, 2], 3.87 / 128 ** 0.5))
+        for prompt, prompt_queries, scale in cases:
+            managers = {window: build_manager(window, "cuda", sm_scale=scale) for window in (None, 1, 4)}
+            for increment in range(5):
+                lengths = [n + increment for n in prompt]
+                queries = prompt_queries if increment == 0 else [1, 1]
+                ctx = context(lengths, queries)
+                q = self.packed_queries(lengths, queries)
+                for window, manager in managers.items():
+                    with self.subTest(scale=scale, window=window, step=increment):
+                        manager.plan(AttentionStep(), ctx)
+                        actual = manager.run(q, "main", self.cache)
+                        torch.testing.assert_close(
+                            actual.float(), self.reference(lengths, queries, window, scale),
+                            atol=0.015, rtol=0.015,
+                        )
+            # At the final decode positions, key zero is outside either local window.
+            q = self.packed_queries(lengths, [1, 1])
+            before = {w: m.run(q, "main", self.cache).clone() for w, m in managers.items()}
+            poisoned = self.cache.clone()
+            poisoned[[3, 4], :, 0] = 100
+            for window in (1, 4):
+                torch.testing.assert_close(managers[window].run(q, "main", poisoned), before[window], atol=0, rtol=0)
+            self.assertFalse(torch.equal(managers[None].run(q, "main", poisoned), before[None]))
+
+    def test_mixed_step_with_window_and_scale(self):
+        # a decode row beside a prompt over a cached prefix, padded to a bucket's tokens
+        lengths, queries, scale = [20, 13], [1, 9], 3.87 / 128 ** 0.5
+        indptrs = context(lengths, queries).plan_results["kv"]["main"].cpu_indptrs
+        real = sum(queries)
+        workspaces = WorkspacePool(torch.device("cuda"), size_mb=32)
+        mixed = wrappers.FlashInferMixedWrapper(
+            decode_workspace=workspaces.get("decode"), prefill_workspace=workspaces.get("prefill"),
+            num_qo_heads=4, num_kv_heads=2, head_dim=128, page_size=16, batch_size=2, max_total_tokens=real + 7,
+            max_num_pages=16, max_prefill_rows=1, device=torch.device("cuda"), sm_scale=scale,
+        )
+        mixed.plan(
+            causal=True, dtype=torch.bfloat16, window_left=3, qo_indptr=indptrs.qo_indptr,
+            paged_kv_indptr=indptrs.paged_kv_indptr, paged_kv_indices=indptrs.paged_kv_indices,
+            paged_kv_last_page_len=indptrs.paged_kv_last_page_len, kv_lens=indptrs.kv_lens,
+        )
+        q = torch.zeros(real + 7, 4, 128, device="cuda", dtype=torch.bfloat16)
+        q[:real] = self.packed_queries(lengths, queries)
+        torch.testing.assert_close(
+            mixed.run(q, self.cache)[:real].float(), self.reference(lengths, queries, 4, scale),
+            atol=0.015, rtol=0.015,
+        )
 
     def test_cuda_graph_prefill_and_decode_replanning(self):
         manager = build_manager(4, "cuda")

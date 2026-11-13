@@ -20,16 +20,13 @@ same batch.  A fixed-pipeline port has to pick one value for the whole server.
 """
 
 import logging
+import math
 import os
 
 import numpy as np
 import torch
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import (
-    CurrentForwardConductorMetadata,
-    StreamingConnectionState,
-)
 from mstar.engine.resources import NodeResourceSpec, RaggedAttentionConfig, RaggedAttentionSpec
 from mstar.graph.base import (
     GraphEdge,
@@ -40,13 +37,13 @@ from mstar.graph.base import (
     TensorPointerInfo,
 )
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.base import ForwardPassArgs, Model, ProcessPromptOutput
+from mstar.model.base import Model, ProcessPromptOutput, WalkStep
 from mstar.model.omnivoice.components.backbone import (
     OmniVoiceBackbone,
     assert_flashinfer_api,
     assert_flashinfer_patched,
 )
-from mstar.model.omnivoice.components.codec import load_codec
+from mstar.model.omnivoice.components.codec import load_codec, post_process
 from mstar.model.omnivoice.components.text import (
     build_prefix,
     resolve_instruct,
@@ -65,6 +62,85 @@ from mstar.model.submodule_base import NodeSubmodule
 
 logger = logging.getLogger(__name__)
 
+# Every model_kwargs key a request may carry. The speech adapter maps the
+# OpenAI ``voice`` onto ``instruct``.
+REQUEST_KWARGS = frozenset({
+    "num_step", "guidance_scale", "t_shift", "layer_penalty_factor", "position_temperature",
+    "class_temperature", "postprocess_output", "pad_duration", "fade_duration",
+    "speed", "duration", "language", "instruct", "ref_text", "denoise",
+})
+
+
+def _number(kwargs: dict, key: str, default: float, rule: str = "", ok=None) -> float:
+    """``kwargs[key]`` as a finite JSON number satisfying ``ok``; ``default`` when absent."""
+    value = kwargs.get(key)
+    if value is None:
+        return float(default)
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise ValueError(f"{key} must be a finite number{' ' + rule if rule else ''}; got {value!r}")
+    if ok is not None and not ok(value):
+        raise ValueError(f"{key} must be {rule}; got {value!r}")
+    return float(value)
+
+
+def _flag(kwargs: dict, key: str, default: bool) -> bool:
+    value = kwargs.get(key)
+    if value is None:
+        return default
+    # 0 and 1 as well: JSON clients send them for booleans
+    if isinstance(value, str) or value not in (True, False):
+        raise ValueError(f"{key} must be true or false; got {value!r}")
+    return bool(value)
+
+
+def _text(kwargs: dict, key: str) -> str | None:
+    value = kwargs.get(key)
+    if value is not None and (not isinstance(value, str) or not value.strip()):
+        raise ValueError(f"{key} must be a non-empty string; got {value!r}")
+    return value
+
+
+def resolve_step_knobs(kwargs: dict, defaults) -> dict:
+    """The per-request unmask knobs, validated; ValueError names the bad one
+    (``output_shaping`` checks the output knobs)."""
+    num_step = kwargs.get("num_step", defaults.num_step)
+    # past the unmask loop's max_iters, the conductor refuses it (get_loop_caps)
+    if isinstance(num_step, bool) or not isinstance(num_step, int) or num_step < 1:
+        raise ValueError(f"num_step must be an integer >= 1; got {num_step!r}")
+    return {
+        "num_step": num_step,
+        # 0 disables CFG
+        "guidance_scale": _number(kwargs, "guidance_scale", defaults.guidance_scale),
+        "t_shift": _number(kwargs, "t_shift", defaults.t_shift, "> 0", lambda v: v > 0),
+        "layer_penalty_factor": _number(kwargs, "layer_penalty_factor", defaults.layer_penalty_factor),
+        # 0 is argmax / no Gumbel noise
+        "position_temperature": _number(
+            kwargs, "position_temperature", defaults.position_temperature, ">= 0", lambda v: v >= 0
+        ),
+        "class_temperature": _number(
+            kwargs, "class_temperature", defaults.class_temperature, ">= 0", lambda v: v >= 0
+        ),
+    }
+
+
+# Request kwarg: a clone's reference RMS, the level ``postprocess`` matches
+REF_RMS_KEY = "output_ref_rms"
+
+# The longest silence pad, or fade, a request may ask for at each end, in seconds
+MAX_SHAPING_SECONDS = 10.0
+
+
+def output_shaping(kwargs: dict) -> dict:
+    """The request's output-shaping kwargs as ``post_process`` takes them.
+    ``process_prompt`` reads them too, so a bad value fails the request before
+    it generates."""
+    shaping = {"enabled": _flag(kwargs, "postprocess_output", True)}
+    for key in ("pad_duration", "fade_duration"):
+        shaping[key] = _number(
+            kwargs, key, 0.1, f"in [0, {MAX_SHAPING_SECONDS:g}] seconds", lambda v: 0 <= v <= MAX_SHAPING_SECONDS,
+        )
+    return shaping
+
 
 class OmniVoiceModel(Model):
     """k2-fsa/OmniVoice."""
@@ -75,8 +151,9 @@ class OmniVoiceModel(Model):
 
     UNMASK_LOOP_NAME = UNMASK_LOOP_NAME
     # The canvas length process_prompt settles (it needs the tokenizer and the
-    # duration estimator); it reaches the backbone as step metadata.
-    INTERNAL_KWARGS = (TARGET_LEN,)
+    # duration estimator), which reaches the backbone as step metadata, and a
+    # clone's reference level, which `postprocess` matches.
+    INTERNAL_KWARGS = (TARGET_LEN, REF_RMS_KEY)
 
     def __init__(
         self,
@@ -94,10 +171,11 @@ class OmniVoiceModel(Model):
         self.model_path_hf = os.environ.get("MSTAR_OMNIVOICE_MODEL_PATH") or model_path_hf
         self.cache_dir = cache_dir
         self.config = OmniVoiceConfig()
+        # Uploads decode at the Higgs-Audio-v2 codec's rate, not 16 kHz: a 16 kHz
+        # reference would not error, it would clone a voice pitched and paced wrong.
+        self.AUDIO_INPUT_RATE = self.config.sample_rate
         if "backbone_graphs" in kwargs:
             self.config.backbone_graphs = bool(kwargs["backbone_graphs"])
-        if "backbone_token_buckets" in kwargs:
-            self.config.backbone_token_buckets = sorted(int(n) for n in kwargs["backbone_token_buckets"])
         self.skip_weight_loading = skip_weight_loading
 
         # Loaded lazily on the data worker so construction never hits the
@@ -187,12 +265,9 @@ class OmniVoiceModel(Model):
                     GraphEdge(next_node="backbone", name="audio_tokens"),
                     GraphEdge(next_node="backbone", name="step_index"),
                 ],
-                # Async scheduling may dispatch an iteration past the stop;
-                # OmniVoiceBackboneSubmodule.prepare_inputs vetoes the
-                # overshoot by returning None.
                 enable_async_scheduling=True,
             ),
-            # Ceiling only; the request's own num_step stops the loop early.
+            # Ceiling only; each request's num_step is the loop's cap.
             max_iters=self.config.generation.max_num_step,
             outputs=[
                 # Matched by name against the section's loop-back edges: the
@@ -201,14 +276,9 @@ class OmniVoiceModel(Model):
             ],
         )
 
-        code2wav_inputs = ["audio_tokens"]
-        if clone:
-            # Level matching only has a target when there is a reference.
-            code2wav_inputs.append("ref_rms")
-
         code2wav = GraphNode(
             name="code2wav",
-            input_names=code2wav_inputs,
+            input_names=["audio_tokens"],
             outputs=[
                 GraphEdge(
                     next_node=EMIT_TO_CLIENT,
@@ -222,25 +292,6 @@ class OmniVoiceModel(Model):
     # ------------------------------------------------------------------
     # Model ABC: I/O
     # ------------------------------------------------------------------
-
-    def load_audio(self, filepath: str, device: str):
-        """Decode the cloning reference at the **codec's** rate, not the default.
-
-        ``Model.load_audio`` decodes at 16 kHz, which is right for the ASR
-        models in the tree and wrong here: the Higgs-Audio-v2 codec encodes at
-        24 kHz, and feeding it 16 kHz samples would not error — it would encode
-        a reference pitched and paced wrong, and clone that. Like the base
-        loader, libsndfile first: torchcodec needs an FFmpeg built with audio
-        decoders, which some deployment images lack (#639).
-        """
-        from mstar.model.base import TensorAndMetadata
-        from mstar.model.components.audio_features import load_audio_file
-
-        rate = self.config.sample_rate
-        audio = load_audio_file(filepath, rate)
-        return TensorAndMetadata(
-            data=audio, metadata=dict(sample_rate=rate, num_channels=1)
-        )
 
     def _ensure_data_worker_assets(self):
         """Load the tokenizer and duration estimator on first use.
@@ -309,7 +360,7 @@ class OmniVoiceModel(Model):
         est = self._duration_estimator.estimate_duration(
             text, ref_text, num_ref_audio_tokens
         )
-        if speed > 0 and speed != 1.0:
+        if speed != 1.0:
             est = est / speed
         return max(1, int(est))
 
@@ -323,9 +374,9 @@ class OmniVoiceModel(Model):
     ) -> ProcessPromptOutput:
         """Validate, then build the canvas prefix on the data worker.
 
-        Every malformed-request check lives here rather than in
-        ``get_initial_forward_pass_args``: a ValueError here becomes a 400,
-        while the same raise at the conductor is swallowed and the client hangs.
+        Every malformed-request check runs here, before the tokenizer, so a
+        bad knob is a 400 without any work; ``walk_plan`` repeats only the
+        cheap step-knob checks.
 
         The prefix is built once and shipped, not rebuilt per iteration —
         tokenizing the text 32 times would be the dominant cost for a short
@@ -335,6 +386,20 @@ class OmniVoiceModel(Model):
             raise ValueError("OmniVoice requires a non-empty text prompt")
         if set(output_modalities) != {"audio"}:
             raise ValueError("OmniVoice generates audio only")
+        resolve_step_knobs(kwargs, self.config.generation)
+        speed = _number(kwargs, "speed", 1.0, "> 0", lambda v: v > 0)
+        target_len = None
+        if kwargs.get("duration") is not None:
+            duration = _number(kwargs, "duration", 0.0, "> 0 (seconds)", lambda v: v > 0)
+            target_len = self.config.target_tokens_for_seconds(duration)
+            if target_len < 1:
+                raise ValueError(
+                    f"duration {duration}s is shorter than one codec frame ({1 / self.config.frame_rate:.3f}s)"
+                )
+        language = _text(kwargs, "language")
+        instruct = _text(kwargs, "instruct")
+        denoise = _flag(kwargs, "denoise", self.config.generation.denoise)
+        output_shaping(kwargs)
 
         self._ensure_data_worker_assets()
 
@@ -342,7 +407,7 @@ class OmniVoiceModel(Model):
         # arrives as "audio_inputs". It is re-emitted under the graph's own
         # edge name below so the node contract does not depend on that.
         ref_audio = (tensors or {}).get("audio_inputs")
-        ref_text = kwargs.get("ref_text")
+        ref_text = _text(kwargs, "ref_text")
         if ref_audio and not ref_text:
             # The reference auto-transcribes with Whisper when ref_text is
             # missing. That is a second model on the serving path and a second
@@ -371,11 +436,7 @@ class OmniVoiceModel(Model):
                     f"Reference audio is shorter than one codec hop ({hop} samples)"
                 )
 
-        speed = float(kwargs.get("speed") or 1.0)
-        duration = kwargs.get("duration")
-        if duration is not None:
-            target_len = self.config.target_tokens_for_seconds(float(duration))
-        else:
+        if target_len is None:
             target_len = self._estimate_target_tokens(
                 prompt, ref_text, num_ref_tokens, speed
             )
@@ -395,29 +456,30 @@ class OmniVoiceModel(Model):
             tokenizer=self.tokenizer,
             text=prompt,
             num_audio_codebook=self.config.num_audio_codebook,
-            language=resolve_language(kwargs.get("language")),
-            instruct=resolve_instruct(kwargs.get("instruct"), prompt),
+            language=resolve_language(language),
+            instruct=resolve_instruct(instruct, prompt),
             ref_text=ref_text,
             # The reference tokens are not available on the data worker; the
-            # ref_encoder walk supplies them, and get_initial_forward_pass_args
-            # splices them into the prefix before the loop starts. The style
-            # span still has to know a reference is coming, hence the flag.
+            # ref_encoder walk supplies them, and the backbone appends them to
+            # the prefix. The style span still has to know a reference is
+            # coming, hence the flag.
             ref_audio_tokens=None,
             has_reference=bool(ref_audio),
-            denoise=bool(kwargs.get("denoise", self.config.generation.denoise)),
+            denoise=denoise,
         )
 
         out: NameToTensorList = {
             "prefix_ids": [prefix_ids],
             "prefix_audio_mask": [prefix_audio_mask],
         }
+        metadata = {TARGET_LEN: target_len}
         if ref_audio:
             out["ref_audio_inputs"] = [ref_waveform]
             # The *original* RMS, measured before the level normalisation in
-            # _prepare_reference: post_process uses it to put the clone back at
-            # the source's loudness, so a quiet reference yields quiet speech.
-            out["ref_rms"] = [torch.tensor([ref_rms], dtype=torch.float32)]
-        return ProcessPromptOutput(out, {TARGET_LEN: target_len})
+            # _prepare_reference: ``postprocess`` uses it to put the clone back
+            # at the source's loudness, so a quiet reference yields quiet speech.
+            metadata[REF_RMS_KEY] = float(ref_rms)
+        return ProcessPromptOutput(out, metadata)
 
     def _prepare_reference(
         self, waveform: torch.Tensor, ref_text: str | None
@@ -479,18 +541,15 @@ class OmniVoiceModel(Model):
         self._codec_hop = int(cfg.hop_length)
         return self._codec_hop
 
-    def get_initial_forward_pass_args(
+    def walk_plan(
         self,
         partition_name: str,
         input_modalities: list[str],
         output_modalities: list[str],
-        input_signals: dict[str, list],
-        model_kwargs: dict | None = None,
-    ) -> ForwardPassArgs:
-        model_kwargs = model_kwargs or {}
-        # Backstops. process_prompt already rejected each of these on the data
-        # worker where a ValueError becomes a 400; a raise here runs at the
-        # conductor, whose loop swallows it and leaves the client hanging.
+        input_signals: dict[str, list[TensorPointerInfo]],
+        model_kwargs: dict,
+    ) -> list[WalkStep]:
+        # Backstops: process_prompt already rejected each of these.
         if not input_signals.get("prefix_ids") or TARGET_LEN not in model_kwargs:
             raise ValueError("OmniVoice requires a processed prompt (prefix_ids, target_len)")
         target_output = output_modalities[0] if output_modalities else "audio"
@@ -499,149 +558,18 @@ class OmniVoiceModel(Model):
                 f"OmniVoice only generates audio; got output modality {target_output!r}."
             )
 
-        is_clone = bool(input_signals.get("ref_audio_inputs"))
-        schedule = []
-        if is_clone:
-            schedule.append(self.ENCODE_REFERENCE_WALK)
-        schedule.append(
-            self.SPEECH_GEN_CLONE_WALK if is_clone else self.SPEECH_GEN_WALK
-        )
+        if input_signals.get("ref_audio_inputs"):
+            walks = [self.ENCODE_REFERENCE_WALK, self.SPEECH_GEN_CLONE_WALK]
+        else:
+            walks = [self.SPEECH_GEN_WALK]
 
-        defaults = self.config.generation
-        requested_steps = int(model_kwargs.get("num_step", defaults.num_step))
-        num_step = max(1, min(requested_steps, defaults.max_num_step))
-        if num_step != requested_steps:
-            logger.info(
-                "Clamped num_step from %d to %d (max_num_step=%d)",
-                requested_steps, num_step, defaults.max_num_step,
-            )
-
-        kwargs = {
-            "walk_schedule": schedule,
-            "walk_step": 0,
+        # What the submodules read from ``request_info.step_metadata``.
+        request = {
             # from process_prompt, which settles it on the data worker
             TARGET_LEN: int(model_kwargs[TARGET_LEN]),
-            "num_step": num_step,
-            "guidance_scale": float(
-                model_kwargs.get("guidance_scale", defaults.guidance_scale)
-            ),
-            "t_shift": float(model_kwargs.get("t_shift", defaults.t_shift)),
-            "layer_penalty_factor": float(
-                model_kwargs.get("layer_penalty_factor", defaults.layer_penalty_factor)
-            ),
-            "position_temperature": float(
-                model_kwargs.get("position_temperature", defaults.position_temperature)
-            ),
-            "class_temperature": float(
-                model_kwargs.get("class_temperature", defaults.class_temperature)
-            ),
-            "postprocess_output": bool(model_kwargs.get("postprocess_output", True)),
-            "pad_duration": float(model_kwargs.get("pad_duration", 0.1)),
-            "fade_duration": float(model_kwargs.get("fade_duration", 0.1)),
+            **resolve_step_knobs(model_kwargs, self.config.generation),
         }
-
-        full_metadata = CurrentForwardConductorMetadata(
-            input_modalities=input_modalities,
-            output_modalities=output_modalities,
-            graph_walk=schedule[0],
-            is_prefill=True,
-            kwargs=kwargs,
-        )
-
-        # Only the FIRST walk is seeded here. Everything else stays persisted
-        # and is picked up from ``persist_signals`` when the schedule steps --
-        # feeding a later walk's node now would target a node this walk does
-        # not contain.
-        if is_clone:
-            edge = GraphEdge(next_node="ref_encoder", name="ref_audio_inputs")
-            edge.tensor_info = input_signals["ref_audio_inputs"]
-            inputs = [edge]
-        else:
-            inputs = self._speech_gen_inputs(schedule[0], input_signals)
-
-        unpersist_tensors = sum([inp.tensor_info for inp in inputs], start=[])
-        return ForwardPassArgs(
-            full_metadata=full_metadata,
-            inputs=inputs,
-            unpersist_tensors=unpersist_tensors,
-            step_metadata=self._get_step_metadata(full_metadata),
-        )
-
-    def _get_step_metadata(self, metadata: CurrentForwardConductorMetadata) -> dict:
-        """Per-pass metadata the submodules read from ``request_info.step_metadata``."""
-        kw = metadata.kwargs
-        return {
-            "is_prefill": metadata.is_prefill,
-            TARGET_LEN: kw[TARGET_LEN],
-            "num_step": kw["num_step"],
-            "guidance_scale": kw["guidance_scale"],
-            "t_shift": kw["t_shift"],
-            "layer_penalty_factor": kw["layer_penalty_factor"],
-            "position_temperature": kw["position_temperature"],
-            "class_temperature": kw["class_temperature"],
-            "postprocess_output": kw["postprocess_output"],
-            "pad_duration": kw["pad_duration"],
-            "fade_duration": kw["fade_duration"],
-        }
-
-    def _speech_gen_inputs(
-        self, walk: str, persist_signals: dict[str, list[TensorPointerInfo]],
-    ) -> list[GraphEdge]:
-        """External inputs seeding a speech walk.
-
-        The loop-back edges go in empty; the backbone seeds the canvas and the
-        step counter at iteration 0.
-        """
-        inputs: list[GraphEdge] = []
-        for name in ("prefix_ids", "prefix_audio_mask"):
-            edge = GraphEdge(next_node="backbone", name=name)
-            edge.tensor_info = persist_signals.get(name, [])
-            inputs.append(edge)
-        if walk == self.SPEECH_GEN_CLONE_WALK:
-            ref_edge = GraphEdge(next_node="backbone", name="ref_audio_tokens")
-            ref_edge.tensor_info = persist_signals.get("ref_audio_tokens", [])
-            inputs.append(ref_edge)
-            rms_edge = GraphEdge(next_node="code2wav", name="ref_rms")
-            rms_edge.tensor_info = persist_signals.get("ref_rms", [])
-            inputs.append(rms_edge)
-        inputs += [
-            GraphEdge(next_node="backbone", name="audio_tokens"),
-            GraphEdge(next_node="backbone", name="step_index"),
-        ]
-        return inputs
-
-    def get_partition_forward_pass_args(
-        self,
-        partition_name: str,
-        partition_metadata: CurrentForwardConductorMetadata,
-        persist_signals: dict[str, list[TensorPointerInfo]],
-        incoming_connections: list[StreamingConnectionState] | None = None,
-    ) -> ForwardPassArgs:
-        """Step through the request's fixed walk schedule; done after the speech walk."""
-        metadata = partition_metadata
-        request_done = False
-        inputs: list[GraphEdge] = []
-
-        schedule = metadata.kwargs["walk_schedule"]
-        step = metadata.kwargs["walk_step"] + 1
-        if step < len(schedule):
-            metadata.kwargs["walk_step"] = step
-            walk = schedule[step]
-            metadata.graph_walk = walk
-            metadata.is_prefill = walk == self.ENCODE_REFERENCE_WALK
-            inputs = self._speech_gen_inputs(walk, persist_signals)
-        else:
-            # The speech walk completed — one utterance per request.
-            request_done = True
-
-        unpersist_tensors = sum([inp.tensor_info for inp in inputs], start=[])
-        return ForwardPassArgs(
-            full_metadata=metadata,
-            inputs=inputs,
-            unpersist_tensors=unpersist_tensors,
-            step_metadata=self._get_step_metadata(metadata),
-            request_done=request_done,
-        )
+        return [WalkStep(walk, step_metadata=request) for walk in walks]
 
     def get_autocast_dtype(self):
         """No engine autocast: the fused kernels need one dtype throughout.
@@ -652,16 +580,52 @@ class OmniVoiceModel(Model):
         """
         return None
 
+    def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
+        # the loop ends on the request's own num_step, and is never speculated past it;
+        # past the loop's max_iters the conductor refuses the request
+        num_step = model_kwargs.get("num_step", self.config.generation.num_step)
+        if isinstance(num_step, int) and not isinstance(num_step, bool) and num_step >= 1:
+            return {UNMASK_LOOP_NAME: num_step}
+        return {}
+
+    def request_kwargs(self) -> frozenset[str]:
+        return REQUEST_KWARGS
+
     def get_output_sample_rate(self, modality: str = "audio") -> int:
         return self.config.sample_rate
 
-    def postprocess(self, output: torch.Tensor, modality: str, **kwargs) -> bytes:
-        """Raw PCM16 bytes; the handler wraps them in the requested container."""
-        if modality == "audio":
-            if output.numel() == 0:
-                return b""
-            return output.cpu().numpy().astype(np.int16).tobytes()
-        raise ValueError(f"Unsupported modality for OmniVoice: {modality!r}")
+    def postprocess(
+        self, output: torch.Tensor, modality: str, request_kwargs: dict | None = None, **kwargs,
+    ) -> bytes:
+        """The decoded waveform shaped as the reference does it (silence trim,
+        level, fade and pad; ``post_process``), as raw PCM16 bytes the handler
+        wraps in the requested container.
+
+        This host work runs here, on the API side, rather than in the worker's
+        code2wav step, where it held up the unmask loop of every other request.
+        """
+        if modality != "audio":
+            raise ValueError(f"Unsupported modality for OmniVoice: {modality!r}")
+        if output.numel() == 0:
+            return b""
+        kw = request_kwargs or {}
+        waveform = output.detach().float().cpu().numpy().reshape(-1)
+        if not np.isfinite(waveform).all():
+            # code2wav poisons a canvas that still held MASK cells with NaN (see there)
+            raise RuntimeError(
+                "OmniVoice decoded a waveform that is not finite: its canvas still held masked cells "
+                "at decode (the unmask loop ended early), or the codec itself produced NaN or inf."
+            )
+        waveform = post_process(
+            waveform,
+            config=self.config,
+            # None means "no reference to match" and selects peak
+            # normalisation instead; that is a different code path, not a
+            # default value, so it must stay None rather than become 0.
+            ref_rms=kw.get(REF_RMS_KEY),
+            **output_shaping(kw),
+        )
+        return (np.clip(waveform, -1, 1) * 32767).astype(np.int16).tobytes()
 
     # ------------------------------------------------------------------
     # Model ABC: submodule loading
@@ -673,9 +637,8 @@ class OmniVoiceModel(Model):
         device: str = "cpu",
         tp_group=None,
         autocast_dtype: torch.dtype | None = None,
-        sp_group=None,
     ) -> NodeSubmodule | None:
-        # tp_group / sp_group / autocast_dtype exist for interface parity:
+        # tp_group / autocast_dtype exist for interface parity:
         # OmniVoice declares no sharded nodes, and the weights load in the
         # checkpoint's own dtypes.
         if node_name in self._submodule_cache:

@@ -31,11 +31,10 @@ from typing import Any
 import torch
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.conductor.request_info import CurrentForwardConductorMetadata, StreamingConnectionState
 from mstar.engine.resources import NodeResourceSpec
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import ForwardPassArgs, Model, TensorAndMetadata
+from mstar.model.base import Model, TensorAndMetadata, WalkStep
 from mstar.model.omnilingual_asr.audio import load_waveform, preprocess
 from mstar.model.omnilingual_asr.config import (
     ENCODER_ATTN,
@@ -72,6 +71,11 @@ class OmnilingualASRModel(Model):
     * ``max_batch_size`` (16): requests per encoder step. ``max_batch_seconds``
       (320): padded audio per forward; a step over it runs as several forwards.
     """
+
+    # Requests prepare at once: the loaders and process_prompt keep no shared
+    # state, and the decode releases the GIL. Inline at c=32, a 300M request
+    # queued 84 of its 102 ms behind the ones before it.
+    PREPROCESS_PARALLEL = True
 
     def __init__(
         self,
@@ -164,6 +168,10 @@ class OmnilingualASRModel(Model):
         waveform = load_waveform(filepath)
         return TensorAndMetadata(data=waveform, metadata=dict(sample_rate=SAMPLE_RATE, num_channels=1))
 
+    def request_kwargs(self) -> frozenset[str]:
+        # argmax CTC: the transcription adapter's language, prompt and temperature are not read
+        return frozenset()
+
     def process_prompt(
         self,
         prompt: str | None,
@@ -184,37 +192,18 @@ class OmnilingualASRModel(Model):
         waveform = audio[0].detach().to("cpu", torch.float32).reshape(-1)
         return {WAVEFORM: [preprocess(waveform)]}
 
-    # -- conductor state machine -------------------------------------------
+    # -- walk plan ---------------------------------------------------------
 
-    def get_initial_forward_pass_args(
+    def walk_plan(
         self,
         partition_name: str,
         input_modalities: list[str],
         output_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]],
-        model_kwargs: dict | None = None,
-    ) -> ForwardPassArgs:
-        del partition_name, model_kwargs
-        metadata = CurrentForwardConductorMetadata(
-            input_modalities=input_modalities,
-            output_modalities=output_modalities,
-            graph_walk=TRANSCRIBE_WALK,
-            is_prefill=True,
-        )
-        edge = GraphEdge(next_node=ENCODER_NODE, name=WAVEFORM)
-        edge.tensor_info = input_signals.get(WAVEFORM, [])
-        return ForwardPassArgs(full_metadata=metadata, inputs=[edge], unpersist_tensors=list(edge.tensor_info))
-
-    def get_partition_forward_pass_args(
-        self,
-        partition_name: str,
-        partition_metadata: CurrentForwardConductorMetadata,
-        persist_signals: dict[str, list[TensorPointerInfo]],
-        incoming_connections: list[StreamingConnectionState] | None = None,
-    ) -> ForwardPassArgs:
-        """One walk transcribes the clip; when it returns, the request is done."""
-        del partition_name, persist_signals, incoming_connections
-        return ForwardPassArgs(full_metadata=partition_metadata, inputs=[], unpersist_tensors=[], request_done=True)
+        model_kwargs: dict,
+    ) -> list[WalkStep]:
+        """One walk transcribes the clip."""
+        return [WalkStep(TRANSCRIBE_WALK)]
 
     # -- output ------------------------------------------------------------
 
@@ -234,9 +223,8 @@ class OmnilingualASRModel(Model):
         device: str = "cpu",
         tp_group=None,
         autocast_dtype: torch.dtype | None = None,
-        sp_group=None,
     ) -> NodeSubmodule:
-        del tp_group, autocast_dtype, sp_group
+        del tp_group, autocast_dtype
         if node_name != ENCODER_NODE:
             raise ValueError(f"Unknown Omnilingual ASR node: {node_name!r}")
         if node_name not in self._submodule_cache:

@@ -10,6 +10,8 @@ import torch
 
 sys.path.insert(0, ".")
 
+from mstar.conductor.conductor import Conductor  # noqa: E402
+from mstar.engine.state.adapters import node_resources, state_setup  # noqa: E402
 from mstar.graph.base import GraphNode, Loop, Sequential, TensorPointerInfo  # noqa: E402
 from mstar.graph.special_destinations import EMIT_TO_CLIENT  # noqa: E402
 from mstar.model.z_image.config import DENOISE_LOOP, DIT_ATTN, ZImageConfig  # noqa: E402
@@ -68,8 +70,10 @@ def test_graph_structure():
 
 
 def test_resources_and_dummy_mode():
-    assert [s.resource_key for s in _make_model().get_node_resources()] == [DIT_ATTN]
-    assert _make_model(attention_backend="sdpa").get_node_resources() == []
+    assert [s.resource_key for s in node_resources(_make_model())] == [DIT_ATTN]
+    model = _make_model()
+    setup, _ = state_setup({"resources": {DIT_ATTN: {"backend": "sdpa"}}}, model.declare_state())
+    assert node_resources(model, setup=setup) == []
     model = _make_model()
     assert all(model.get_submodule(n) is None for n in model.nodes)
     assert model.get_autocast_dtype() is None
@@ -85,24 +89,48 @@ def test_process_prompt_and_validation():
         model.process_prompt("x", ["image", "text"], ["image"])
     with pytest.raises(ValueError, match="multiple of 16"):
         model.process_prompt("x", ["text"], ["image"], height=1000)
-    with pytest.raises(ValueError, match="num_inference_steps"):
-        model.process_prompt("x", ["text"], ["image"], num_inference_steps=0)
+
+
+def test_steps_past_the_loop_ceiling_are_refused_not_clamped():
+    model = _make_model()
+    ceiling = model.config.max_denoise_steps
+    assert model.get_loop_caps(num_inference_steps=8) == {DENOISE_LOOP: 8}
+    conductor = Conductor.__new__(Conductor)
+    conductor.model = model
+    # read off the graph, so the test also checks the loop's max_iters is the ceiling
+    conductor._loop_max_iters = {
+        name: loop.max_iters
+        for walk in model.get_graph_walk_graphs().values()
+        for name, loop in walk.get_loops().items()
+    }
+    assert conductor._loop_caps({"num_inference_steps": ceiling}) == {DENOISE_LOOP: ceiling}
+    with pytest.raises(ValueError, match=f"at most {ceiling}"):
+        conductor._loop_caps({"num_inference_steps": ceiling + 1})
 
 
 def test_schedule_and_caption_bucket_from_token_count():
     model = _make_model()
-    args = model.get_initial_forward_pass_args("default", ["text"], ["image"], {"text_inputs": [_info("t", [45])]},
-                                               model_kwargs={"width": 768, "num_inference_steps": 8})
-    md = args.full_metadata
-    assert md.graph_walk == ENCODE_TEXT_WALK and md.kwargs["walk_schedule"] == [ENCODE_TEXT_WALK, IMAGE_GEN_WALK]
-    assert args.step_metadata["text_len"] == 45 and args.step_metadata["cap_len"] == 64
-    assert (args.step_metadata["height"], args.step_metadata["width"]) == (1024, 768)
-    shape = shape_from_metadata(model.config, args.step_metadata)
+    plan = model.walk_plan("default", ["text"], ["image"], {"text_inputs": [_info("t", [45])]},
+                           {"width": 768, "num_inference_steps": 8})
+    assert [step.walk for step in plan] == [ENCODE_TEXT_WALK, IMAGE_GEN_WALK]
+    md = plan[0].step_metadata
+    assert md["text_len"] == 45 and md["cap_len"] == 64
+    assert (md["height"], md["width"]) == (1024, 768)
+    shape = shape_from_metadata(model.config, md)
     assert shape == ZShape(grid=(64, 48), cap_len=64) and shape.image_tokens_padded == 3072
-    nxt = model.get_partition_forward_pass_args("default", md, {"text_embeds": [_info("e", [1, 64, 2560])]})
-    assert nxt.full_metadata.graph_walk == IMAGE_GEN_WALK and not nxt.request_done
-    assert {e.name for e in nxt.inputs} == {"text_embeds", "latents"}
-    assert model.get_partition_forward_pass_args("default", nxt.full_metadata, {}).request_done
+
+
+@pytest.mark.parametrize("requested", [3, 50])
+def test_the_loop_cap_is_the_schedules_step_count(requested):
+    """The DiT indexes its schedule by the loop counter, so the loop must end on
+    the step count the schedule is built from (past the loop's ceiling the
+    conductor refuses the request)."""
+    model = _make_model()
+    plan = model.walk_plan("default", ["text"], ["image"], {"text_inputs": [_info("t", [45])]},
+                           {"num_inference_steps": requested})
+    steps = plan[-1].step_metadata["num_inference_steps"]
+    assert steps == requested
+    assert model.get_loop_caps(num_inference_steps=requested) == {DENOISE_LOOP: steps}
 
 
 def test_capture_shapes_cover_sizes_times_caption_buckets():
@@ -159,11 +187,16 @@ def test_requests_above_max_image_area_are_rejected():
     small.set_config(ZImageConfig())
     with pytest.raises(ValueError, match="max_image_area"):
         small._resolve_size(dict(height=1024, width=1040))
+    # a side past the rotary table (512 tokens of 16 px) indexed past its end, inside the area cap
+    assert model._resolve_size(dict(height=16, width=8192)) == (16, 8192)
+    with pytest.raises(ValueError, match="8192"):
+        model._resolve_size(dict(height=16, width=8208))
 
 
 def test_vae_decoder_decodes_unwarmed_shapes_eagerly(monkeypatch):
-    """Mirror of the klein test: unwarmed latent shapes skip the compiled decode (no in-request autotune)."""
-    import mstar.model.z_image.submodules as subs
+    """A latent shape the compiled decode was not warmed with goes to the eager decode: an in-request
+    max-autotune compile cost 40-100 s on 1024x768 / 512^2 edits."""
+    import mstar.model.components.diffusion.decode_utils as subs
     from mstar.model.z_image.config import ZImageConfig
     from mstar.model.z_image.submodules import ZImageVaeDecoderSubmodule
 
@@ -196,10 +229,10 @@ def test_vae_decoder_decodes_unwarmed_shapes_eagerly(monkeypatch):
     h, w = config.latent_grid(1024, 1024)
     assert len(vae.compiled) == 2 and vae.eager == []
     vae.compiled.clear()
-    node._decode_fn(torch.zeros(2, c, h * p, w * p))
-    assert [s[0] for s in vae.compiled] == [2] and vae.eager == []
-    node._decode_fn(torch.zeros(1, c, h * p // 2, w * p))
-    assert len(vae.eager) == 1 and [s[0] for s in vae.compiled] == [2]
+    node._vae_decode(torch.zeros(3, c, h * p, w * p))  # warmed grid: compiled chunks of 2 + 1
+    assert [s[0] for s in vae.compiled] == [2, 1] and vae.eager == []
+    node._vae_decode(torch.zeros(1, c, h * p // 2, w * p))  # unwarmed grid: eager
+    assert len(vae.eager) == 1 and [s[0] for s in vae.compiled] == [2, 1]
 
 
 def test_blank_prompts_are_rejected():
@@ -214,3 +247,28 @@ def test_blank_prompts_are_rejected():
     for bad in (None, "", "   "):
         with pytest.raises(ValueError, match="text prompt"):
             model.process_prompt(bad, ["text"], ["image"])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+def test_fused_qk_norm_rope_matches_the_eager_modules():
+    """The compiled forward's fused q/k norm + rotary rounds where the eager modules do: at most a
+    bf16 ulp on a handful of elements (fp32 sum order of the variance)."""
+    from mstar.model.z_image.components.qk_norm_rope import fits, qk_norm_rope
+    from mstar.model.z_image.components.transformer import ScaledRMSNorm, ZImageRoPE, apply_rotary_complex
+
+    torch.manual_seed(0)
+    seq, heads = 300, 4
+    q, k, _ = (t.unflatten(-1, (-1, 128)) for t in
+               (torch.randn(2, seq, 3 * heads * 128, device="cuda") * 2).to(torch.bfloat16).chunk(3, dim=-1))
+    norms = [ScaledRMSNorm(128, 1e-5) for _ in range(2)]
+    for norm in norms:
+        norm.weight.data = (1 + 0.2 * torch.randn(128)).to(device="cuda", dtype=torch.bfloat16)
+    rope = ZImageRoPE(256.0, (32, 48, 48), (1024, 512, 512))
+    freqs = rope(torch.stack([torch.arange(seq), torch.arange(seq) % 17, torch.arange(seq) // 17], -1)).cuda()
+    assert fits(q, k, norms[0].weight, freqs) and not fits(q, k, norms[0].weight, freqs[1:])
+    got = qk_norm_rope(q, k, norms[0].weight, norms[1].weight, freqs, 1e-5)
+    with torch.no_grad():
+        for x, norm, out in zip((q, k), norms, got, strict=True):
+            diff = (apply_rotary_complex(norm(x), freqs).float() - out.float()).abs()
+            assert out.is_contiguous() and (diff > 0).float().mean() < 1e-4
+            assert diff.max() <= 2 ** -6 * apply_rotary_complex(norm(x), freqs).float().abs().max()

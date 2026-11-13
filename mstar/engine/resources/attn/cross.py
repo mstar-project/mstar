@@ -1,6 +1,6 @@
 """Cross-attention over a context written once and never extended."""
 
-from typing import Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import numpy as np
 import torch
@@ -9,6 +9,7 @@ from mstar.engine.resources.attn.base import (
     AttentionWrapper,
     EagerSlotKey,
     PlanCacheKey,
+    captured_page_capacity,
     resolve_attn_backend,
 )
 from mstar.engine.resources.attn.config import (
@@ -27,6 +28,7 @@ from mstar.engine.resources.base import (
     CGSlotKey,
     EngineResourceInfo,
 )
+from mstar.engine.resources.kv.arena import PlanColumns
 from mstar.engine.resources.kv.config import PagedKVConfig
 from mstar.engine.resources.kv.plan import (
     SINK_PAGE,
@@ -35,7 +37,12 @@ from mstar.engine.resources.kv.plan import (
     PagedIndptrs,
     SequenceView,
 )
+from mstar.engine.resources.resident_hooks import ANY_REPEATS
 from mstar.engine.resources.step import SlotLease, StepContext
+from mstar.utils.profiler import PhaseLaps
+
+if TYPE_CHECKING:
+    from mstar.engine.resources.resident import CapturedResidentStep
 
 
 class _LastPlan(NamedTuple):
@@ -118,8 +125,15 @@ class FlashInferCrossManager(CrossAttentionManager):
         self._eager_plan_states: dict[EagerSlotKey, AttentionWrapper] = {}
         self._cg_plan_states: dict[CGSlotKey, AttentionWrapper] = {}
 
+        # the lengths a resident step's wrapper last scheduled, by wrapper key
+        self._scheduled_lens: dict = {}
+        # a resident step's query indptr, by row count
+        self._resident_qo_indptr: dict[int, torch.Tensor] = {}
         self._preplan_states: dict[str, AttentionWrapper] = {}
         self._preplanned = False
+        # the wrapper keys a pending preplan planned, whose cached plans a
+        # dropped preplan leaves naming workspaces it filled on the plan stream
+        self._preplan_keys: list = []
         # wrapper key (EagerSlotKey, or CGSlotKey under capture) -> its last plan
         self._last_plans: dict[Any, _LastPlan] = {}
 
@@ -135,6 +149,32 @@ class FlashInferCrossManager(CrossAttentionManager):
         )
 
         self._workspaces = WorkspacePool(device, owner=kv_cache)
+
+    def resident_refusal(self) -> str | None:
+        if self._query_kv_cache_name == self._kv_cache_name:
+            return "a context in the query's own pool would be a second stream on one resident row"
+        return None
+
+    def max_repeats(self, step, ctx) -> int:
+        # the context doesn't grow and a replay's queries pack as its step's, so one plan serves every replay
+        return ANY_REPEATS
+
+    def resident_gather(self, step: "CapturedResidentStep") -> None:
+        # the host still plans FlashInfer's schedule
+        step.host_planned = True
+        if self._query_kv_cache_name is None:
+            # its query packing comes off the step's rows, and it plans on the host whole
+            return
+        pool, query = self._kv_cache_name, step.streams[self._query_kv_cache_name]
+        wrapper = self._cg_plan_states.get(CGSlotKey(bucket=step.bucket, slot=step.slot, label=query.label))
+        if wrapper is not None and wrapper.supports_gather_resident:
+            # the context's paged arrays come off the tables
+            table = step.block_tables[pool]
+            wrapper.gather_resident(
+                step.store, step.slots, step.buffers.kv_len[pool], table.stride, table.col,
+                appends=not step.streams[pool].reads,
+            )
+            step.lengths_only.add(pool)
 
     def depends_on(self):
         # a query side with no cache contributes no dependency: its packing
@@ -174,16 +214,21 @@ class FlashInferCrossManager(CrossAttentionManager):
             self._current_plan_states = self._preplan_states
             self._preplan_states = {}
             self._preplanned = False
+            self._preplan_keys = []
             return
 
+        laps = PhaseLaps(f"{ctx.plan_phase}.cross_attn.")
         context_out = self._context_output(ctx)
         context_views = None
+        context_rids = None
         # a preplan leases a different cg slot, so its wrappers and workspaces
         # are disjoint from the ones the in-flight forward reads
         plan_states = self._preplan_states if ctx.is_preplan else self._current_plan_states
 
         plan_states.clear()
-        for plan_label, packing in self._query_packings(step, ctx).items():
+        packings = self._query_packings(step, ctx)
+        laps.lap("packing")
+        for plan_label, packing in packings.items():
             qo_indptr = tuple(packing.qo_indptr.tolist())
             num_rows = len(qo_indptr) - 1
             # every row queries one token (a span-0 row does not)
@@ -192,31 +237,54 @@ class FlashInferCrossManager(CrossAttentionManager):
                 plan_label, lease, num_rows=num_rows, slot=ctx.slot, decode=decode,
             )
             request_ids = tuple(packing.request_ids)
+            if ctx.is_preplan:
+                self._preplan_keys.append(state_key)
+            if ctx.resident is not None and (lease.bucket, self._kv_cache_name) in ctx.resident.lengths_only:
+                # FlashInfer's schedule reads only the lengths, which a context keeps
+                indptrs = context_out.cpu_indptrs
+                lens = indptrs.kv_lens.numpy().tobytes()
+                if self._scheduled_lens.get(state_key) != lens:
+                    wrapper.plan_schedule(indptrs.paged_kv_indptr, indptrs.kv_lens)
+                    self._scheduled_lens[state_key] = lens
+                laps.lap("schedule")
+                plan_states[plan_label] = wrapper
+                continue
+            self._scheduled_lens.pop(state_key, None)
             last = self._last_plans.get(state_key)
             if (
                 last is not None and last.context is context_out
                 and last.request_ids == request_ids and last.qo_indptr == qo_indptr
             ):
                 plan_states[plan_label] = wrapper
+                laps.lap("unchanged")
                 continue
-            if context_views is None:
-                context_views = {view.request_id: view for view in context_out.views}
-            indptrs = self._build_indptrs(packing, context_views, plan_label)
+            if context_rids is None and context_out.columns is not None:
+                context_rids = tuple(row[0] for row in context_out.rows)
+            if request_ids == context_rids:
+                indptrs = self._context_indptrs(packing, context_out.columns)
+            else:
+                if context_views is None:
+                    context_views = {view.request_id: view for view in context_out.views}
+                indptrs = self._build_indptrs(packing, context_views)
+            laps.lap("indptrs" if request_ids == context_rids else "indptrs_views")
 
             # The context pages are immutable once written, so only the query
             # side moves between steps; when neither moved, FlashInfer's plan
             # is skippable. Every tensor here is on CPU.
             plan_key = PlanCacheKey(
                 q_seq_lens=qo_indptr,
+                page_indptr=indptrs.paged_kv_indptr.numpy().tobytes(),
                 page_indices=indptrs.paged_kv_indices.numpy().tobytes(),
                 last_page_lens=indptrs.paged_kv_last_page_len.numpy().tobytes(),
             )
+            laps.lap("plan_key")
             if last is None or last.plan_key != plan_key:
                 wrapper.plan(
                     causal=False,
                     dtype=self._dtype,
                     **indptrs.to_kwargs_dict()
                 )
+                laps.lap("wrapper_plan")
             self._last_plans[state_key] = _LastPlan(context_out, request_ids, qo_indptr, plan_key)
             plan_states[plan_label] = wrapper
 
@@ -226,6 +294,12 @@ class FlashInferCrossManager(CrossAttentionManager):
         # rebind rather than clear: a consumed preplan dict is the live one
         self._preplanned = False
         self._preplan_states = {}
+        # a step run in its place on the same slot must plan again rather than
+        # skip to a schedule whose copies nothing ordered before its replay
+        for key in self._preplan_keys:
+            self._scheduled_lens.pop(key, None)
+            self._last_plans.pop(key, None)
+        self._preplan_keys = []
 
     def _context_output(self, ctx: StepContext):
         """The context label's KV plan output (its views are each request's
@@ -251,6 +325,15 @@ class FlashInferCrossManager(CrossAttentionManager):
     ) -> dict[str, QueryPacking]:
         if self._query_kv_cache_name is None:
             return self._step_query_packings(step)
+        if ctx.resident is not None:
+            # one query token a row, in the step's row order; the query pool's
+            # plan of a resident step may carry no views
+            rids = ctx.padded_request_ids
+            qo = self._resident_qo_indptr.get(len(rids))
+            if qo is None:
+                qo = self._resident_qo_indptr[len(rids)] = torch.arange(len(rids) + 1, dtype=torch.int32)
+            label = ctx.resident_plan.writes.streams[self._query_kv_cache_name].label
+            return {label: QueryPacking(request_ids=list(rids), qo_indptr=qo)}
 
         plan_outputs: KVPlanOutputs = ctx.plan_results.get(
             self._query_kv_cache_name
@@ -265,9 +348,12 @@ class FlashInferCrossManager(CrossAttentionManager):
                 label: kv_out for label, kv_out in plan_outputs.items()
                 if label != self._context_label
             }
+        # `rows` (request id first) spares building the views
         return {
             label: QueryPacking(
-                request_ids=[view.request_id for view in kv_out.views],
+                request_ids=[
+                    view.request_id for view in kv_out.views
+                ] if kv_out.rows is None else [row[0] for row in kv_out.rows],
                 qo_indptr=kv_out.cpu_indptrs.qo_indptr,
             )
             for label, kv_out in plan_outputs.items()
@@ -277,8 +363,8 @@ class FlashInferCrossManager(CrossAttentionManager):
         """Query packing off this step's own segments, for a query side with no
         KV cache: one entry per segment, in declared order.
 
-        No ``combined_labels`` here — that grouping lives on ``KVStep``, so a
-        cacheless query side plans one label per segment label.
+        ``combined_labels`` is read off the KV plan, not here, so a cacheless
+        query side plans one label per segment label.
         """
         rids: dict[str, list[str]] = {}
         qo_indptrs: dict[str, list[int]] = {}
@@ -295,11 +381,35 @@ class FlashInferCrossManager(CrossAttentionManager):
             for label, label_rids in rids.items()
         }
 
+    @staticmethod
+    def _context_indptrs(packing: QueryPacking, cols: PlanColumns) -> PagedIndptrs:
+        """``_build_indptrs`` when the query rows are the context label's rows
+        in order: its arrays are the context plan's, but for a row with no
+        context pages, which reads one SINK_PAGE token here."""
+        indptr, pages, last, lens = cols.kv_indptr, cols.indices, cols.last_page_len, cols.kv_lens
+        if not cols.all_have_pages:
+            counts = np.diff(indptr)
+            empty = counts == 0
+            sink_indptr = np.zeros_like(indptr)
+            np.cumsum(counts + empty, out=sink_indptr[1:])
+            sink_pages = np.full(int(sink_indptr[-1]), SINK_PAGE, np.int32)
+            # each real page moves up by the sink pages inserted before its row
+            sink_pages[np.arange(len(pages)) + np.repeat(sink_indptr[:-1] - indptr[:-1], counts)] = pages
+            one = np.int32(1)
+            indptr, pages = sink_indptr, sink_pages
+            last, lens = np.where(empty, one, last), np.where(empty, one, lens)
+        return PagedIndptrs(
+            qo_indptr=packing.qo_indptr,
+            paged_kv_indptr=torch.from_numpy(indptr),
+            paged_kv_indices=torch.from_numpy(pages),
+            paged_kv_last_page_len=torch.from_numpy(last),
+            kv_lens=torch.from_numpy(lens).as_subclass(HostLens),
+        )
+
     def _build_indptrs(
         self,
         packing: QueryPacking,
         context_views: dict[str, SequenceView],
-        plan_label: str,
     ) -> PagedIndptrs:
         """key off context, query off the packing
 
@@ -336,13 +446,6 @@ class FlashInferCrossManager(CrossAttentionManager):
             last = context.last_page_len(page_size) or page_size
             last_page_lens.append(last)
             kv_lens.append((n_pages - 1) * page_size + last)
-
-        # fork repeats pages, so batch can index more than held in cache.
-        assert len(all_pages) <= self._kv_config.max_num_pages, (
-            f"cross attention plan {plan_label!r} indexes {len(all_pages)} "
-            f"pages but the context cache holds {self._kv_config.max_num_pages}; "
-            "raise max_num_pages on the context cache's PagedKVConfig"
-        )
 
         # numpy builds an int32 array from a list in about half the time
         # `torch.tensor(list)` takes; host `kv_lens` let a captured decode
@@ -381,15 +484,19 @@ class FlashInferCrossManager(CrossAttentionManager):
             else:
                 # built on first plan for the key; see FlashInferManager._cg_wrapper
                 workspace = self._workspaces.get(plan_label, lease.slot)
+                # rows with one cached context (a prefix hit, a fork) each name its pages, so the
+                # step's index list can outgrow the pool
+                max_num_pages = captured_page_capacity(num_rows, lease.bucket.num_tokens, self._kv_config)
+                kv_kwargs = {**self._wrapper_kv_kwargs, "max_num_pages": max_num_pages}
                 if decode:
-                    wrapper = self._decode_wrapper(workspace, batch_size=num_rows, accelerator_graph=True)
+                    wrapper = self._decode_wrapper(workspace, kv_kwargs, batch_size=num_rows, accelerator_graph=True)
                 else:
                     wrapper = FlashInferPrefillWrapper(
                         workspace_buffer=workspace,
                         batch_size=num_rows,
                         max_total_tokens=lease.bucket.num_tokens,
                         accelerator_graph=True,
-                        **self._wrapper_kv_kwargs,
+                        **kv_kwargs,
                     )
                 self._cg_plan_states[key] = wrapper
             return key, wrapper
@@ -401,14 +508,13 @@ class FlashInferCrossManager(CrossAttentionManager):
         if wrapper is None:
             workspace = self._workspaces.get(plan_label, slot)
             if decode:
-                wrapper = self._decode_wrapper(workspace)
+                wrapper = self._decode_wrapper(workspace, self._wrapper_kv_kwargs)
             else:
                 wrapper = FlashInferPrefillWrapper(workspace_buffer=workspace, **self._wrapper_kv_kwargs)
             self._eager_plan_states[key] = wrapper
         return key, wrapper
 
-    def _decode_wrapper(self, workspace: Workspace, **kwargs) -> FlashInferDecodeWrapper:
-        kv = self._wrapper_kv_kwargs
+    def _decode_wrapper(self, workspace: Workspace, kv: dict, **kwargs) -> FlashInferDecodeWrapper:
         return FlashInferDecodeWrapper(
             workspace_buffer=workspace,
             num_qo_heads=kv["num_qo_heads"], num_kv_heads=kv["num_kv_heads"],
