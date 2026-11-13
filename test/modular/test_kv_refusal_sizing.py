@@ -10,7 +10,6 @@ gives up.
 from __future__ import annotations
 
 import sys
-from threading import Event
 from types import SimpleNamespace
 
 sys.path.insert(0, ".")
@@ -35,7 +34,7 @@ from mstar.engine.resources.spec import resolve_spec_dependencies
 from mstar.engine.resources.step import AdmitRuntimeError, AllocationFailed, Segment, StepContext
 from mstar.testing_utils.engine import make_engine
 from mstar.testing_utils.worker import bound, deliver, make_worker
-from mstar.utils.ipc_format import DrainRequest, RemoveRequest, WorkerMessage, WorkerMessageType
+from mstar.utils.ipc_format import RemoveRequest, WorkerMessage, WorkerMessageType
 from mstar.worker.micro_scheduler import ScheduledBatch
 from mstar.worker.stream_buffers import StreamBufferManager
 from mstar.worker.worker import Worker
@@ -357,7 +356,7 @@ def _engine_manager(**pools: KVManager) -> SimpleNamespace:
     return SimpleNamespace(remove_request=engine.remove_request)
 
 
-def _teardown_over(sched, known_rids, engine_manager, communicator=None):
+def _teardown_over(sched, known_rids, engine_manager):
     """A real teardown path over ``sched``; the rid strings are their own handles."""
     request_state = SimpleNamespace(
         per_request_info=dict.fromkeys(known_rids), remove_request=lambda rid: None,
@@ -375,88 +374,10 @@ def _teardown_over(sched, known_rids, engine_manager, communicator=None):
     worker = make_worker(
         scheduler=sched, engine_manager=engine_manager, request_state=request_state, graph_runtime=runtime,
         tensor_manager=tensor_manager, streams=StreamBufferManager(request_state, tensor_manager, []),
-        communicator=communicator,
     )
     for rid in known_rids:
         worker.lifecycle.add(rid, rid)
     return worker
-
-
-@pytest.mark.parametrize("speculative", [False, True])
-def test_gpu_wait_reclaims_unrelated_kv_pages_before_completion(speculative):
-    pool = _manager(16)
-    assert _admit(pool, {"old": 2 * PAGE_SIZE, "busy": PAGE_SIZE, "next": PAGE_SIZE}, commit=True).ok
-    free = pool._arena.num_free
-    complete = Event()
-    admitted = Event()
-    admitted.set()
-    sent = []
-    polls = []
-
-    class Completion:
-        def query(self):
-            return complete.is_set()
-
-        def synchronize(self):
-            assert complete.wait(1), "KV pages stayed allocated behind unrelated GPU work"
-
-    completion = Completion()
-
-    def messages():
-        if complete.is_set():
-            return []
-        polls.append(True)
-        if len(polls) == 1:
-            return [WorkerMessage(WorkerMessageType.DRAIN_REQUEST, DrainRequest(rid))
-                    for rid in ("old", "busy", "next")]
-        assert pool._arena.num_free == free, "DRAIN alone must retain the pages"
-        return [WorkerMessage(WorkerMessageType.REMOVE_REQUEST, RemoveRequest(rid))
-                for rid in ("old", "busy", "next")]
-
-    manager = _engine_manager(kv=pool)
-    remove = manager.remove_request
-
-    def release(rid):
-        assert rid == "old" and not complete.is_set()
-        assert not completion.query(), "KV pages were retained until unrelated GPU completion"
-        freed = remove(rid)
-        assert pool._arena.num_free == free + 2
-        complete.set()
-        return freed
-
-    manager.remove_request = release
-    communicator = SimpleNamespace(send=lambda target, message: sent.append(message), get_all_new_messages=messages)
-    worker = _teardown_over(_scheduler(_SchedEngine(max_bs=16)), ("old", "busy", "next"), manager, communicator)
-    worker.executor.device = torch.device("cuda")
-    pending = SimpleNamespace(
-        batch=ScheduledBatch(node_name=SCHED_NODE, graph_walk=SCHED_WALK, request_to_worker_graph={"busy": 0}),
-        node_batch=SimpleNamespace(completion_event=completion, launch_started_event=admitted),
-        node_name=SCHED_NODE, graph_walk=SCHED_WALK, lane=0,
-    )
-    worker.pipeline._set_pending(pending)
-    if speculative:
-        worker.pipeline._spec_pending = SimpleNamespace(
-            batch=ScheduledBatch(node_name=SCHED_NODE, graph_walk=SCHED_WALK, request_to_worker_graph={"next": 0}),
-            node_batch=SimpleNamespace(launch_started_event=admitted),
-        )
-        worker.pipeline._speculation = SimpleNamespace(submitted=True, plan_future=None)
-    else:
-        worker.pipeline.in_flight_rids.add("next")
-    worker.executor.postprocess = lambda step, outputs, **kwargs: worker.executor.wait_for_step(
-        step, while_waiting=kwargs.get("while_waiting"),
-    )
-    try:
-        worker.pipeline._finish_step(pending, {})
-    finally:
-        complete.set()
-        wait_pool = getattr(worker.executor, "_wait_pool", None)
-        if wait_pool is not None:
-            wait_pool.shutdown()
-
-    assert pool._arena.num_free == free + 2
-    assert set(pool._streams) == {"busy", "next"}
-    assert worker.lifecycle.pending_removes == {"busy": -1, "next": -1}
-    assert [message.body.request_id for message in sent] == ["old"]
 
 
 def _remove(worker, *rids: str) -> None:

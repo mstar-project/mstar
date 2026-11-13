@@ -82,5 +82,4 @@ Execution flow (simplified)
 
 Successful requests are removed after every participating worker has finished its
 reads and the API data worker has delivered the outputs. The drain timeout can
-force removal. Workers service unrelated teardown during completion waits when
-admission and active batches permit it.
+force removal.
