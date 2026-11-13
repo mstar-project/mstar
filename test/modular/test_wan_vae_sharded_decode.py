@@ -11,6 +11,7 @@ import torch
 
 pytest.importorskip("diffusers")
 
+from diffusers.models.autoencoders.autoencoder_kl_wan import WanAttentionBlock  # noqa: E402
 from test_wan_vae_decode import tiny_wan_vae  # noqa: E402
 
 from mstar.model.components import wan_vae  # noqa: E402
@@ -100,17 +101,20 @@ def test_a_layer_that_cannot_split_exactly_is_refused(module) -> None:
         wan_vae.HeightShardedConv2d.adopt(module)
 
 
-def test_a_row_crossing_layer_without_a_band_class_is_refused() -> None:
-    """A layer the conversion doesn't know must work per row, or sharding is refused."""
+@pytest.mark.parametrize("extra, why", [
+    (lambda: torch.nn.Conv3d(4, 4, 3, padding=1), "isn't known to work per pixel"),
+    (lambda: torch.nn.GroupNorm(2, 4), "isn't known to work per pixel"),
+    (lambda: torch.nn.AvgPool2d(2), "isn't known to work per pixel"),
+    (lambda: type("MyAttention", (WanAttentionBlock,), {})(4), "isn't known to work per pixel"),
+    (lambda: wan_vae.ChannelsLastUpsample(scale_factor=2.0, mode="bilinear"), "blends rows"),
+])
+def test_a_layer_not_known_to_work_per_row_is_refused(extra, why) -> None:
+    """Every layer of the decoder is either converted or known to work per pixel;
+    anything else, a subclass of a known layer included, refuses the conversion."""
     vae = tiny_wan_vae("wan22")
     wan_vae.to_channels_last(vae)
-    vae.decoder.add_module("extra", torch.nn.Conv3d(4, 4, 3, padding=1))
-    with pytest.raises(ValueError, match="reaches across rows"):
-        wan_vae.to_height_sharded(vae, None)
-    vae = tiny_wan_vae("wan22")
-    wan_vae.to_channels_last(vae)
-    vae.decoder.add_module("extra", torch.nn.Upsample(scale_factor=2, mode="bilinear"))
-    with pytest.raises(ValueError, match="blends rows"):
+    vae.decoder.add_module("extra", extra())
+    with pytest.raises(ValueError, match=why):
         wan_vae.to_height_sharded(vae, None)
 
 

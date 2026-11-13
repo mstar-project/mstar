@@ -20,8 +20,16 @@ from typing import TYPE_CHECKING
 import torch
 import torch.nn.functional as F
 from diffusers.models.autoencoders.autoencoder_kl_wan import (
+    DupUp3D,
     WanAttentionBlock,
     WanCausalConv3d,
+    WanDecoder3d,
+    WanMidBlock,
+    WanResample,
+    WanResidualBlock,
+    WanResidualUpBlock,
+    WanRMS_norm,
+    WanUpBlock,
     WanUpsample,
     unpatchify,
 )
@@ -526,12 +534,21 @@ class HeightShardedAttentionBlock(WanAttentionBlock):
         return full.narrow(3, sum(sizes[:rank]), sizes[rank])
 
 
-# The decoder's layers that see across rows, by class; every other layer is per pixel.
+# The decoder's layers that see across rows, by exact class.
 _SHARDED_CLASS = {
     ChannelsLastCausalConv3d: HeightShardedCausalConv3d,
     ChannelsLastConv2d: HeightShardedConv2d,
     WanAttentionBlock: HeightShardedAttentionBlock,
 }
+# Every other layer of the two Wan decoders, by exact class: each works per pixel
+# (RMS norms over channels, activations, the 2x nearest upsample, DupUp3D's
+# channel-to-pixel shuffle) or only holds layers that are checked themselves. A
+# band passes through them as the whole frame would. A class outside both sets,
+# a subclass included (it may override ``forward``), refuses the conversion.
+_PER_PIXEL = frozenset({
+    WanDecoder3d, WanMidBlock, WanResidualBlock, WanUpBlock, WanResidualUpBlock, WanResample,
+    WanRMS_norm, DupUp3D, ChannelsLastUpsample, nn.SiLU, nn.Dropout, nn.Identity, nn.ModuleList, nn.Sequential,
+})
 
 
 def is_height_sharded(vae: nn.Module) -> bool:
@@ -540,30 +557,25 @@ def is_height_sharded(vae: nn.Module) -> bool:
 
 def to_height_sharded(vae: nn.Module, group: CommGroup) -> HeightShard:
     """Switch a channels-last decoder's row-crossing layers to their sharded
-    classes, in place, all sharing one ``HeightShard``. Refuses a layer it can't
-    split exactly (only one-row-padded 3-row kernels can be)."""
+    classes, in place, all sharing one ``HeightShard``. Refuses the conversion
+    for a conv it can't split exactly (only one-row-padded 3-row kernels can be)
+    and for any layer it doesn't know to work per pixel (``_PER_PIXEL``)."""
     if not is_channels_last(vae):
         raise ValueError("Shard a Wan VAE decoder after switching it to channels-last")
     shard = HeightShard(group)
     for module in vae.decoder.modules():
-        sharded = _SHARDED_CLASS.get(type(module))
-        if sharded is not None and sharded.adopt(module):
-            module.__class__ = sharded
-            module.shard = shard
-        else:
-            _refuse_unsplit(module)
+        kind = type(module)
+        sharded = _SHARDED_CLASS.get(kind)
+        if sharded is not None:
+            if sharded.adopt(module):
+                module.__class__ = sharded
+                module.shard = shard
+            continue  # adopt refuses what it can't split; False is a per-pixel kernel (1x1)
+        if kind not in _PER_PIXEL:
+            raise ValueError(f"Can't split a Wan VAE decoder by rows: {kind.__name__} isn't known to work per pixel")
+        if kind is ChannelsLastUpsample and module.mode not in ("nearest", "nearest-exact"):
+            raise ValueError(f"Can't split a Wan VAE decoder by rows: a {module.mode} upsample blends rows")
     return shard
-
-
-def _refuse_unsplit(module: nn.Module) -> None:
-    """A layer left as it is must work per row: no conv reaching across rows,
-    no upsample that blends them."""
-    if isinstance(module, nn.modules.conv._ConvNd):
-        rows = module.kernel_size[-2]
-        if rows != 1 or module.stride[-2] != 1:
-            raise ValueError(f"{type(module).__name__} reaches across rows and has no row-band class")
-    elif isinstance(module, nn.Upsample) and module.mode not in ("nearest", "nearest-exact"):
-        raise ValueError(f"A {module.mode} upsample blends rows and can't be split by rows")
 
 
 class HeightShardedDecoder(FastDecoder):
