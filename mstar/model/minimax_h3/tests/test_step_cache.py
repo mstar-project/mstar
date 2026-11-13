@@ -84,3 +84,15 @@ def test_the_serving_config_names_the_policy():
         MAG_RATIOS["default"])
     with pytest.raises(ValueError, match="no calibrated"):
         H3Model(skip_weight_loading=True, step_cache={"mag_ratios": "768p"})
+
+
+def test_the_768p_table_gives_the_measured_plans():
+    # 50 sigma points at 1344x768x124 on one B300: the computed-step counts the docs' quality table was measured at
+    table = MAG_RATIOS["1344x768x124"]
+    assert len(table) == len(MAG_RATIOS["default"]) == 49
+    plans = {(t, k): MagCache(mag_ratios=table, threshold=t, max_skip_steps=k).reuse_plan(49).count(False)
+             for t, k in ((0.01, 1), (0.03, 2), (0.06, 3))}
+    assert plans == {(0.01, 1): 31, (0.03, 2): 24, (0.06, 3): 20}
+    model = H3Model(skip_weight_loading=True, step_cache={"mag_ratios": "1344x768x124", "threshold": 0.06,
+                                                         "max_skip_steps": 3})
+    assert model.step_cache.mag_ratios == table
