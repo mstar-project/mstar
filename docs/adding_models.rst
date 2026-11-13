@@ -831,7 +831,11 @@ Resource specs
 The engine builds these specs from ``declare_state``, and a deployment tunes them under the
 declared names. A model that hasn't moved to declarations still writes them by hand in
 ``get_node_resources``, which returns a flat list of ``NodeResourceSpec`` objects and is
-``[]`` by default. Every spec has these common members:
+``[]`` by default. A new model package declares its state through the contract and is listed
+in ``PORTED`` in ``test/modular/test_state_lint.py``, which fails a package that is on
+neither ``PORTED`` nor its frozen ``UNPORTED`` list. ``get_node_resources`` remains for the
+packages on ``UNPORTED``, and in a ported package only for a spec the contract doesn't
+declare, such as the opt-in ``LoraSpec``. Every spec has these common members:
 
 - ``resource_key`` is the name of this resource. Three places use this name, and all three
   must agree: the layers bind to it, ``declare_step`` uses it as the key of its
