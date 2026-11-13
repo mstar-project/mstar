@@ -175,6 +175,26 @@ def test_nemo_log_mel_batch_gives_each_clip_what_it_gets_alone(normalize, reflec
     assert torch.equal(batch[-1], torch.zeros_like(batch[-1])) or not normalize
 
 
+@pytest.mark.parametrize("reflect_edges", [False, True])
+def test_nemo_log_mel_batch_runs_the_stft_at_whole_seconds(monkeypatch, reflect_edges):
+    """cuFFT builds a plan per STFT shape (rows x frames), so a served batch's
+    width is rounded up to whole seconds: two batches of the same rows and
+    different lengths share one plan."""
+    widths = []
+    stft = torch.stft
+
+    def recording_stft(x, *args, **kwargs):
+        widths.append(x.shape[-1] - (0 if not reflect_edges else 512))
+        return stft(x, *args, **kwargs)
+
+    monkeypatch.setattr(torch, "stft", recording_stft)
+    log_mel = NemoLogMel(reflect_edges=reflect_edges)
+    for n in (16_001, 31_999):
+        feats = log_mel.batch([torch.randn(n) * 0.2, torch.randn(4_000) * 0.2])
+        assert feats[0].shape[0] == n // 160 + reflect_edges
+    assert widths == [32_000, 32_000]
+
+
 def test_nemo_log_mel_batch_refuses_a_clip_under_two_frames():
     with pytest.raises(ValueError, match="300 samples"):
         NemoLogMel().batch([torch.randn(16_000), torch.randn(300)])

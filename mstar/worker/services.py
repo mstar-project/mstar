@@ -87,9 +87,11 @@ class WorkerLayout:
     # (node, walk) keys on the side lane; known once ``EngineManager.build`` has
     # validated them, so ``Worker`` fills this in after building the engines
     side_keys: frozenset[tuple[str, str]] = frozenset()
-    # (node, walk) -> its streamed signals that go as tensors there
-    # (``InlineStreams.tensor_streams``), likewise filled in after the engines
+    # (node, walk) -> its streamed signals that go as tensors there, and the
+    # signals its inline column carries on every edge (``InlineStreams``),
+    # likewise filled in after the engines
     tensor_streams: Mapping[tuple[str, str], frozenset[str]] = field(default_factory=_no_entries)
+    inline_carried: Mapping[tuple[str, str], frozenset[str]] = field(default_factory=_no_entries)
     # wg id -> its nodes, for every worker graph of the deployment
     all_wg_nodes: Mapping[int, set[str]] = field(default_factory=_no_entries)
     # (graph_walk, node) -> innermost enclosing loop
