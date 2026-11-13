@@ -601,6 +601,12 @@ def _fa4_wrapper(manager, label: str, slot: int, config, **graph_kwargs) -> _Rag
     return Fa4UniformPrefillWrapper(**manager._kwargs, **graph_kwargs)
 
 
+def _fa3_wrapper(manager, label: str, slot: int, config, **graph_kwargs) -> _RaggedPrefillBase:
+    from mstar.engine.resources.attn.ragged.dense_wrappers import Fa3RaggedPrefillWrapper
+
+    return Fa3RaggedPrefillWrapper(**manager._kwargs, **graph_kwargs)
+
+
 @dataclass(frozen=True)
 class WrapperFactory:
     """How a self-attention manager builds one implementation's wrapper for a
@@ -618,6 +624,7 @@ WRAPPER_FACTORIES: Mapping[str, WrapperFactory] = MappingProxyType({
     "flashinfer": WrapperFactory(_flashinfer_wrapper),
     "cudnn": WrapperFactory(_cudnn_wrapper, layout_bound=True),
     "fa4": WrapperFactory(_fa4_wrapper, layout_bound=True),
+    "fa3": WrapperFactory(_fa3_wrapper),
 })
 
 # What a layout runs where its row can't take it, and what a resource without a

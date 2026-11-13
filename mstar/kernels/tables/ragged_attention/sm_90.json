@@ -1,0 +1,22 @@
+{
+  "format": 2,
+  "op": "ragged_attention",
+  "entries": [
+    {
+      "dtype": "bfloat16",
+      "shape": {"head_dim": 128, "num_kv_heads": 28, "num_qo_heads": 28},
+      "provenance": {"device": "NVIDIA H200", "arch": "sm_90", "date": "2026-11-13", "harness": "python -m benchmark.kernels.ragged_attention --heads 28 --seq 8192 16384 32768 37985 65536 --segments 1 --seconds 5 (sustained column)", "torch": "2.11.0+cu128", "flash_attn_3": "3.0.1", "flashinfer": "0.7.2", "note": "MiniMax-H3 under Ulysses SP2 (56 heads, 28 a rank) at 1344x768x124 (37,985 rows and a padding row, eager), served on the fa3 row. Rows from the sustained column: at the 690 W cap FA3's dense call per segment is 2-3.4% faster than FlashInfer's fa3 from 8192 tokens up, and burst timing (the sweep's) ties. Up to 32768 tokens the row keeps FlashInfer: MiniMax-H3-Image's SP2 buckets (up to ~16.6K tokens, 1024^2 captured) were not re-validated on fa3"},
+      "rows": {
+        "32768": {"impl": "flashinfer"},
+        "*": {"impl": "fa3"}
+      },
+      "measured": {
+        "8192": {"us": 1503.2, "default_us": 1503.2, "flashinfer_fa3_us": 1503.2, "fa3_us": 1471.2, "fa3_varlen_us": 1501.0},
+        "16384": {"us": 6008.6, "default_us": 6008.6, "flashinfer_fa3_us": 6008.6, "fa3_us": 5816.6, "fa3_varlen_us": 5973.3},
+        "32768": {"us": 23448.8, "default_us": 23448.8, "flashinfer_fa3_us": 23448.8, "fa3_us": 22726.3, "fa3_varlen_us": 23474.3},
+        "37985": {"us": 30249.3, "default_us": 31133.4, "flashinfer_fa3_us": 31133.4, "fa3_us": 30249.3, "fa3_varlen_us": 31085.1},
+        "65536": {"us": 90263.3, "default_us": 93446.6, "flashinfer_fa3_us": 93446.6, "fa3_us": 90263.3, "fa3_varlen_us": 93210.9}
+      }
+    }
+  ]
+}

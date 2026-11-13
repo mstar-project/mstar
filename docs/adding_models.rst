@@ -1336,7 +1336,12 @@ klein 4B's entry, LTX-2.5's 32-head video self-attention klein 9B's): under a CU
 ``auto`` stays on FA2 there (its cutlass plan can't be replanned in graph mode, and its cuDNN path needs
 cuDNN 9.24), which is 3.5-5x slower from 1k to 64k tokens. An entry whose larger sizes no served model
 has run bounds them with a numeric last row and a ``"*"`` row naming ``flashinfer``, the resource's own
-default. A GPU of the architecture reads the file
+default. On ``sm_90`` (H200) the table names Dao's FlashAttention-3 (``fa3``: the ``flash_attn_3`` wheel
+from PyTorch's index for torch's CUDA build) for MiniMax-H3's 28 heads a rank under Ulysses SP2, above 32,768
+tokens. An eager plan of a few segments runs FA3's dense kernel once per segment, the varlen call's bits, ~3%
+faster than FlashInfer's FA3 backend at the GPU's power cap; it reads the head count off q / k / v, so the Ulysses
+head-group pipeline runs over it. Where ``flash_attn_3`` doesn't import, the entry is refused with a warning and
+FlashInfer runs. A GPU of the architecture reads the file
 whichever model it is, and the build-time log names the GPU the row was swept on. The cuDNN wrapper runs a layout of equal-length
 segments, a DiT batch's, as one dense ``[segments, S, H, D]`` call. A captured one replays only
 the layout it was planned with, so a captured bucket takes it only when the step that plans it
@@ -3788,8 +3793,8 @@ command for that shape (``kernel table: no moe_gemm bfloat16 E=128,N=1536,K=2048
 A block-fp8 dense linear (``fp8_linear``, ``mstar/utils/dense_fp8.py``) takes its kernel per token
 count the same way: the w8a16 Triton kernel, FlashInfer's or cuBLAS's block-scale GEMM, where the
 GPU's row names one that runs there. A cacheless self-attention (``ragged_attention``) takes its
-kernel per head geometry and longest query segment: torch's cuDNN SDPA or one of FlashInfer's
-ragged backends. A table can also be named for an architecture (``sm_103.json``) rather than one
+kernel per head geometry and longest query segment: torch's cuDNN SDPA, Dao's FlashAttention-3 on
+Hopper, or one of FlashInfer's ragged backends. A table can also be named for an architecture (``sm_103.json``) rather than one
 GPU model, for rows that hold on every GPU of it; the sweep's ``--arch`` writes that file.
 
 ``python -m benchmark.kernels.sweep`` times the candidates at those shapes on one GPU, checks
