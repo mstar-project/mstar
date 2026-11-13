@@ -1,5 +1,8 @@
 """Real ported towers through the E5 graph nodes, against pinned Praxis CPU output."""
 
+from dataclasses import replace
+from types import SimpleNamespace
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -13,11 +16,17 @@ from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.accelerator_graph_runner import autocast_scope
 from mstar.engine.node_dtype import resolve_node_dtype
 from mstar.engine.resources.attn.ragged.expert_mask import cross_visibility, self_visibility
+from mstar.engine.resources.base import EngineResourceInfo, build_resource
+from mstar.engine.resources.step import StepContext
 from mstar.engine.state import ExpertCross, ExpertCrossLayout, ExpertSelf, ExpertSelfLayout
+from mstar.engine.state.adapters import build_specs, node_handles, state_steps
+from mstar.model.base import EpisodeView
 from mstar.model.praxis1.components.chunk_mask import encoder_codes, visible
 from mstar.model.praxis1.components.encoder import dense_chunk_causal_mask
 from mstar.model.praxis1.components.sampler import ACTION_SALT, VIDEO_SALT, seeded_normal
+from mstar.model.praxis1.episode_history import STATE_NAME
 from mstar.model.praxis1.native_towers import build_backbone, build_expert
+from mstar.model.praxis1.praxis1_model import Praxis1Model
 from mstar.model.praxis1.submodules import (
     DECODER_BLANK_KV,
     DECODER_COND_KV,
@@ -61,19 +70,21 @@ class _DenseReferenceHandle:
 
 @pytest.mark.parametrize("k", [1, 2])
 @pytest.mark.parametrize("engine_autocast", [False, True])
+@pytest.mark.parametrize("declared_resources", [False, True])
+@pytest.mark.parametrize("video_scale", [1.0, 4.0])
 def test_real_tower_graph_nodes_match_reference_cold_and_warm(
-    k: int, engine_autocast: bool, monkeypatch,
+    k: int, engine_autocast: bool, declared_resources: bool, video_scale: float, monkeypatch,
 ) -> None:
     monkeypatch.setattr(L, "_compiled_flex_attention", _eager_reference_flex)
     previous_threads = torch.get_num_threads()
     torch.set_num_threads(1)
     try:
-        _run_case(k, engine_autocast)
+        _run_case(k, engine_autocast, declared_resources, video_scale)
     finally:
         torch.set_num_threads(previous_threads)
 
 
-def _run_case(k: int, engine_autocast: bool) -> None:
+def _run_case(k: int, engine_autocast: bool, declared_resources: bool, video_scale: float) -> None:
     _, c = _tiny_config()
     ref = tiny_policy(seed=7, dtype=torch.float32).eval()
     portb = build_backbone(c).eval()
@@ -90,7 +101,7 @@ def _run_case(k: int, engine_autocast: bool) -> None:
     anchor = torch.randn(1, 192, 1, 2, 4, generator=gen)
     clean = torch.randn(1, 192, (k - 1) * 6, 2, 4, generator=gen) if k > 1 else None
     pro = torch.randn(1, k, 10, generator=gen)
-    settings = SamplerSettings(num_steps=2, t_shift=1.0)
+    settings = SamplerSettings(num_steps=2, t_shift=1.0, cfg_video_scale=video_scale)
     with torch.no_grad():
         vr, ar = ref.sample_window_joint(
             text,
@@ -126,8 +137,57 @@ def _run_case(k: int, engine_autocast: bool) -> None:
     }
     bn = Praxis1BackboneSubmodule(c, portb)
     en = Praxis1ActionExpertSubmodule(c, porte)
-    bn.state_handles = handles
-    en.state_handles = handles
+    resources = None
+    if declared_resources:
+        model = Praxis1Model(
+            "runwayml/praxis-1-droid", skip_weight_loading=True,
+            max_context_chunks=1, max_text_tokens=8, t_shift=1.0,
+            cfg_video_scale=video_scale,
+        )
+        # The tiny reference feeds an already patched 2x4 encoder grid. The
+        # declaration derives that grid from a 4x8 VAE latent canvas.
+        model.config = replace(c, canvas_height=4 * c.vae_stride[1], canvas_width=8 * c.vae_stride[2])
+        arrays = [array for array in model.declare_state() if array.name in handles]
+        resources = {
+            spec.resource_key: build_resource(
+                spec, EngineResourceInfo(device=torch.device("cpu"), kv_dtype=torch.float32),
+            ) for spec in build_specs(arrays)
+        }
+        declared_model = SimpleNamespace(declare_state=lambda: arrays)
+        bn.state_handles = node_handles(declared_model, "backbone", resources)
+        en.state_handles = node_handles(declared_model, "action_expert", resources)
+        episode = EpisodeView("r", 0, {STATE_NAME: 1} if k == 2 else {})
+        walk = model.walk_plan(
+            "", ["image"], ["action"], {"image_inputs": [object()]},
+            {"executed_rows": 21 if k == 2 else 0, "text_tokens": 3,
+             "blank_tokens": 2, "action_format": "positronic"}, episode,
+        )[-1]
+        metadata = walk.step_metadata
+    else:
+        bn.state_handles = handles
+        en.state_handles = handles
+        metadata = {
+            "num_steps": 2, "t_shift": 1.0, "cfg_video_scale": video_scale,
+            "cfg_scale": 1.0, "text_tokens": 3, "blank_tokens": 2,
+        }
+
+    def activate(node, info, prepared):
+        if resources is None:
+            return None
+        declared = node.declare_step("chunk", ["r"], [prepared])
+        planned = state_steps(declared, node.state_handles, per_request_info={"r": info})
+        ctx = StepContext(request_ids=["r"], graph_walk="chunk", slot=0, capture=False)
+        for key, resource_step in planned.steps.items():
+            resources[key].plan(resource_step, ctx)
+        planned.set_ctx(ctx)
+        for handle in planned.state_handles:
+            handle.begin_step(planned)
+        return planned
+
+    def deactivate(planned):
+        if planned is not None:
+            for handle in planned.state_handles:
+                handle.end_step(planned)
     state = {
         "video_latents": [seeded_normal((1, 192, k * f, 2, 4), 17, VIDEO_SALT)],
         "action_latents": [seeded_normal((1, k * f, 40), 17, ACTION_SALT)],
@@ -140,14 +200,7 @@ def _run_case(k: int, engine_autocast: bool) -> None:
                 fwd_index=step,
                 random_seed=17,
                 max_tokens=1,
-                step_metadata={
-                    "num_steps": 2,
-                    "t_shift": 1.0,
-                    "cfg_video_scale": 4.0,
-                    "cfg_scale": 1.0,
-                    "text_tokens": 3,
-                    "blank_tokens": 2,
-                },
+                step_metadata=metadata,
                 dynamic_loop_iter_counts={"praxis_denoise": step},
             )
             inp = {"obs_latents": [anchor], "text_embeds": [text], "text_embeds_blank": [blank], **state}
@@ -155,14 +208,26 @@ def _run_case(k: int, engine_autocast: bool) -> None:
                 inp.update(anchor_latents=[anchor], clean_latents=[clean])
             prepared = bn.prepare_inputs("chunk", info, inp)
             dtype = resolve_node_dtype(bn, torch.bfloat16) if engine_autocast else None
-            with autocast_scope(dtype, "cpu", "backbone"):
-                out = bn.forward("chunk", None, **prepared.tensor_inputs, **prepared.kwargs)
+            planned = activate(bn, info, prepared)
+            try:
+                with autocast_scope(dtype, "cpu", "backbone"):
+                    out = bn.forward("chunk", None, **prepared.tensor_inputs, **prepared.kwargs)
+            finally:
+                deactivate(planned)
             ein = {**out, "proprio": [pro[:, -1:]]}
             if clean is not None:
                 ein["proprio_all"] = [pro]
             prepared = en.prepare_inputs("chunk", info, ein)
             dtype = resolve_node_dtype(en, torch.bfloat16) if engine_autocast else None
-            with autocast_scope(dtype, "cpu", "action_expert"):
-                state = en.forward("chunk", None, **prepared.tensor_inputs, **prepared.kwargs)
-    assert torch.equal(state["video_latents"][0], vr)
-    assert torch.equal(state["action_latents"][0], ar)
+            planned = activate(en, info, prepared)
+            try:
+                with autocast_scope(dtype, "cpu", "action_expert"):
+                    state = en.forward("chunk", None, **prepared.tensor_inputs, **prepared.kwargs)
+            finally:
+                deactivate(planned)
+    if declared_resources:
+        torch.testing.assert_close(state["video_latents"][0], vr, rtol=1e-5, atol=2e-6)
+        torch.testing.assert_close(state["action_latents"][0], ar, rtol=1e-5, atol=2e-6)
+    else:
+        assert torch.equal(state["video_latents"][0], vr)
+        assert torch.equal(state["action_latents"][0], ar)
