@@ -83,8 +83,31 @@ def test_head_refuses_bad_checkpoint_normalization(bad: dict) -> None:
 def test_head_refuses_an_action_window_with_wrong_token_count() -> None:
     head = _head("single_arm")
     tokens = torch.zeros(1, head.config.action_tokens - 1, head.config.action_patch_dim)
-    with pytest.raises(ValueError, match="expected 21 rows"):
+    with pytest.raises(ValueError, match="whole latent chunks"):
         head.forward("chunk", None, tokens)
+
+
+@pytest.mark.parametrize("rig", ["single_arm", "bimanual"])
+def test_warm_head_returns_only_last_24_rows_against_reference(rig: str) -> None:
+    pytest.importorskip("praxis", reason="reference checkout is not on PYTHONPATH")
+    from praxis import bimanual, robot_io, single_arm
+
+    head = _head(rig)
+    config = head.config
+    tokens = torch.randn(1, 2 * config.action_tokens, config.action_patch_dim)
+    stats = robot_io.NormStats(
+        action_q01=head.action_q01.numpy(), action_q99=head.action_q99.numpy(),
+        proprio_mean=np.zeros(config.action_dim, np.float32),
+        proprio_std=np.ones(config.action_dim, np.float32),
+    )
+    reference = single_arm if rig == "single_arm" else bimanual
+    _, expected = reference.decode_actions(tokens[:, -config.action_tokens:], stats, depth=1,
+                                           dims=head.q99_dims.numpy())
+    got = head.forward("chunk", None, tokens, action_format="positronic")["actions"][0]
+    assert got.shape == (24, config.action_dim)
+    assert np.array_equal(got.numpy(), expected)
+    with pytest.raises(ValueError, match="Positronic session"):
+        head.forward("chunk", None, tokens, action_format="openpi")
 
 
 def test_model_builds_its_action_head_from_checkpoint_stats() -> None:

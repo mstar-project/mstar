@@ -25,7 +25,9 @@ def test_backbone_reuses_cond_and_blank_after_a_new_request():
     (spec,) = build_specs([text_array])
     pool = DenseWindowPool.build(spec, EngineResourceInfo(device=torch.device("cpu")))
     handles = node_handles(SimpleNamespace(declare_state=lambda: [text_array]), "backbone", {TEXT_STATE_NAME: pool})
-    node = Praxis1BackboneSubmodule(model.config, torch.nn.Identity(), episode_text=True)
+    node = Praxis1BackboneSubmodule(
+        model.config, torch.nn.Identity(), episode_text=True, attention_resources=False,
+    )
     node.bind_node_state(handles)
     owners = EpisodeRowBindings()
 
@@ -54,7 +56,7 @@ def test_backbone_reuses_cond_and_blank_after_a_new_request():
         planned.begin_calls()
         got = node.episode_text_embeddings(
             prepared.tensor_inputs.get("text_embeds"), prepared.tensor_inputs.get("text_embeds_blank"),
-            **prepared.kwargs,
+            **{key: prepared.kwargs[key] for key in ("write_text", "text_tokens", "blank_tokens")},
         )
         planned.check_calls()
         pool.commit(planned.steps[TEXT_STATE_NAME], ctx)

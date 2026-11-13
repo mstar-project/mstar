@@ -25,10 +25,10 @@ window. The VAE node writes and reads that window; a later trunk port must
 consume its clean encoding. The predicted video latents end at the denoise
 loop, and nothing predicted leaves the walk except the action rows.
 
-Nothing here serves yet. The nodes have no computation until the compute port
-lands, so a served model is refused at construction, before it fetches
-anything; dummy mode (``skip_weight_loading``) builds the graph for the startup
-checks and the tests.
+Nothing here serves yet. The production trunk weight loader and session
+validation still need to land, so a served model is refused at construction
+before it fetches anything. Dummy mode (``skip_weight_loading``) builds the
+graph for startup checks and CPU tests.
 """
 
 from __future__ import annotations
@@ -40,7 +40,28 @@ from pathlib import Path
 
 import torch
 
-from mstar.engine.state import Array, Entry, Read, TensorType, Window
+from mstar.engine.state import (
+    Array,
+    Attend,
+    ChunkCausal,
+    ChunkCausalLayout,
+    Entry,
+    ExpertCross,
+    ExpertCrossLayout,
+    ExpertSelf,
+    ExpertSelfLayout,
+    KVEntry,
+    Layout,
+    Read,
+    TensorType,
+    Window,
+)
+from mstar.engine.state.adapters import (
+    CHUNK_CAUSAL_LAYOUT_KWARG,
+    EXPERT_LAYOUT_KWARG,
+    chunk_causal_layouts,
+    expert_layouts,
+)
 from mstar.graph.base import (
     GraphEdge,
     GraphNode,
@@ -62,8 +83,15 @@ from mstar.model.media_limits import read_image
 from mstar.model.praxis1.components.commands import compose_commands, pose_to_model
 from mstar.model.praxis1.components.proprio import normalized_proprio
 from mstar.model.praxis1.config import Praxis1Config, Praxis1ConfigError
-from mstar.model.praxis1.episode_history import BOUNDARY_STATE_NAME, STATE_NAME, append_count, window_size
+from mstar.model.praxis1.episode_history import BOUNDARY_STATE_NAME, STATE_NAME, append_count, clean_depth, window_size
 from mstar.model.praxis1.submodules import (
+    ATTN_READS,
+    DECODER_BLANK_KV,
+    DECODER_COND_KV,
+    ENCODER_BLANK_KV,
+    ENCODER_COND_KV,
+    EXPERT_QUERIES,
+    EXPERT_TRUNK_KEYS,
     Praxis1ActionHeadSubmodule,
     Praxis1TextEncoderSubmodule,
     Praxis1VaeEncoderSubmodule,
@@ -309,16 +337,38 @@ class Praxis1Model(Model):
         }
 
     def declare_state(self) -> list:
-        """Pair executed frames and poses in one bounded episode window.
-
-        A zero context depth keeps the existing cold-only graph. The
-        backbone's per-call Euler K/V is a separate later compute port.
-        """
+        """Declare within-step attention and optional executed-frame episode state."""
         depth = self.sampler_defaults["max_context_chunks"]
+        c = self.config
+        p = (c.latent_height // c.patch_size[1]) * (c.latent_width // c.patch_size[2])
+        f = c.latents_per_chunk
+        future = int(c.raw.get("action_expert", {}).get("num_future_per_chunk", 8))
+        clean_only = bool(c.raw.get("action_expert", {}).get("clean_only_conditioning", False))
+        trunk = [
+            Array(name, nodes={"backbone"}, labels={name},
+                  layers=set(range(c.encoder_depth if "encoder" in name else c.decoder_depth)),
+                  entry=KVEntry(heads=c.num_kv_heads, head_dim=c.head_dim), max_len=0,
+                  reads={ATTN_READS[name]: Read(mask=ChunkCausal(f * p if "encoder" in name else f * p * 4),
+                                                op=Attend(q_heads=c.num_heads))})
+            for name in (ENCODER_COND_KV, ENCODER_BLANK_KV, DECODER_COND_KV, DECODER_BLANK_KV)
+        ]
+        expert = [
+            Array(EXPERT_QUERIES, nodes={"action_expert"}, labels={EXPERT_QUERIES},
+                  layers=set(range(1, c.expert_layers, 2)),
+                  entry=KVEntry(heads=c.expert_heads, head_dim=c.expert_head_dim), max_len=0,
+                  reads={ATTN_READS[EXPERT_QUERIES]: Read(mask=ExpertSelf(f, future),
+                                                        op=Attend(q_heads=c.expert_heads))}),
+            Array(EXPERT_TRUNK_KEYS, nodes={"action_expert"}, labels={EXPERT_TRUNK_KEYS},
+                  layers=set(range(0, c.expert_layers, 2)),
+                  entry=KVEntry(heads=c.expert_heads, head_dim=c.expert_head_dim), max_len=0,
+                  reads={ATTN_READS[EXPERT_TRUNK_KEYS]: Read(
+                      mask=ExpertCross(f, future, p, c.window_frames, include_noised=not clean_only),
+                      op=Attend(q_heads=c.expert_heads), queries=EXPERT_QUERIES)}),
+        ]
         if depth == 0:
-            return []
+            return [*trunk, *expert]
         pose_width = 8 if self.config.embodiment == "single_arm" else 16
-        return [Array(
+        return [*trunk, *expert, Array(
             STATE_NAME,
             nodes={"vae_encoder"}, layers={0},
             entry=Entry({
@@ -350,7 +400,7 @@ class Praxis1Model(Model):
             nodes={"backbone"}, labels={"cond", "blank"}, layers={0},
             entry=Entry({"h": TensorType((self.config.text_hidden_dim,), dtype=torch.bfloat16)}),
             max_len=None,
-            reads={"history": Read(mask=Window(self.max_text_tokens))},
+            reads={"praxis_text_history": Read(mask=Window(self.max_text_tokens))},
             lifetime="episode",
         )]
 
@@ -589,15 +639,60 @@ class Praxis1Model(Model):
             "t_shift": self.sampler_defaults["t_shift"],
             "cfg_scale": self.sampler_defaults["cfg_scale"],
             "cfg_video_scale": self.sampler_defaults["cfg_video_scale"],
+            "action_format": model_kwargs.get("action_format", "openpi"),
+            "text_tokens": model_kwargs.get("text_tokens", 0),
+            "blank_tokens": model_kwargs.get("blank_tokens", 0),
         }
+        if metadata["cfg_scale"] != 1.0:
+            raise ValueError("Praxis expert CFG needs a blank tap stream, which this graph has not declared")
         if self.sampler_defaults["max_context_chunks"]:
             metadata["text_write"] = not has_episode_text
-            metadata["text_tokens"] = model_kwargs.get("text_tokens", 0)
-            metadata["blank_tokens"] = model_kwargs.get("blank_tokens", 0)
             held = 0 if episode is None else episode.held.get(STATE_NAME, 0)
             rows = model_kwargs.get("executed_rows", 0)
             metadata["history_append"] = append_count(held, rows)
             metadata["history_held"] = held
+        else:
+            held = 0
+        depth = clean_depth(held + metadata.get("history_append", 0), self.sampler_defaults["max_context_chunks"])
+        k = depth + 1
+        c = self.config
+        p = (c.latent_height // c.patch_size[1]) * (c.latent_width // c.patch_size[2])
+        f = c.latents_per_chunk
+        g = c.num_registers + p
+        decoder_tokens = k * f * p * c.patch_size[1] * c.patch_size[2]
+        text = int(model_kwargs.get("text_tokens", 0))
+        blank = int(model_kwargs.get("blank_tokens", 0))
+        layout = {
+            ENCODER_COND_KV: {ENCODER_COND_KV: Layout(chunk_causal={
+                ATTN_READS[ENCODER_COND_KV]: ChunkCausalLayout(
+                    global_len=g + text, noised_len=k * f * p, clean_len=depth * f * p,
+                ),
+            })},
+            ENCODER_BLANK_KV: {ENCODER_BLANK_KV: Layout(chunk_causal={
+                ATTN_READS[ENCODER_BLANK_KV]: ChunkCausalLayout(
+                    global_len=g + blank, noised_len=k * f * p, clean_len=depth * f * p,
+                ),
+            })},
+            DECODER_COND_KV: {DECODER_COND_KV: Layout(chunk_causal={
+                ATTN_READS[DECODER_COND_KV]: ChunkCausalLayout(
+                    global_len=c.num_registers, noised_len=decoder_tokens,
+                ),
+            })},
+            DECODER_BLANK_KV: {DECODER_BLANK_KV: Layout(chunk_causal={
+                ATTN_READS[DECODER_BLANK_KV]: ChunkCausalLayout(
+                    global_len=c.num_registers, noised_len=decoder_tokens,
+                ),
+            })},
+            EXPERT_QUERIES: {EXPERT_QUERIES: Layout(expert_self={
+                ATTN_READS[EXPERT_QUERIES]: ExpertSelfLayout(k),
+            })},
+            EXPERT_TRUNK_KEYS: {EXPERT_TRUNK_KEYS: Layout(expert_cross={
+                ATTN_READS[EXPERT_TRUNK_KEYS]: ExpertCrossLayout(k, g + text, depth * f, k * f),
+            })},
+        }
+        declared = self.declare_state()
+        metadata[CHUNK_CAUSAL_LAYOUT_KWARG] = chunk_causal_layouts(declared, layout)
+        metadata[EXPERT_LAYOUT_KWARG] = expert_layouts(declared, layout)
         steps.append(
             WalkStep(
                 self.CHUNK_WALK,

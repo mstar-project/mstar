@@ -1,16 +1,9 @@
-"""Praxis-1 compute nodes.
+"""Praxis-1 compute nodes over the native component ports and declared state.
 
-mstar owns the graph: the walks, the loop, the state a session carries and the
-batching. The heavy forwards here call the reference ``praxis`` modules, the
-way the OmniVoice node reuses its reference package, so the first landing is
-numerically the published policy rather than a re-derivation of it. The native
-port of the backbone and the expert follows as its own change, with a
-reference-equivalence test in the shape of ``test_pi05_reference_equivalence``.
-
-Two parts do not come from the reference package. The Wan2.2 VAE is the one
-mstar already serves for Wan2.2-TI2V, so the observation is encoded through
-that rather than through a second copy, and the text encoder is mstar's
-Qwen3.5 reading the hidden layer the checkpoint asks for.
+The Wan2.2 VAE and Qwen3.5 text encoder are loaded from their public
+checkpoints. The encoder, decoder and action expert use the ported modules;
+their attention runs through the engine's declared within-step resources.
+The production weight loader is still required before serving is enabled.
 """
 
 from __future__ import annotations
@@ -24,6 +17,7 @@ from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.state import ArrayStep, Segment, SubmoduleStep
 from mstar.model.components.diffusion.decode_utils import latent_affine
+from mstar.model.praxis1.components.action_expert import expert_resource_attend
 from mstar.model.praxis1.components.action_rows import (
     GRIP_DIMS,
     Q99_DIMS,
@@ -31,12 +25,20 @@ from mstar.model.praxis1.components.action_rows import (
     denormalize_rows,
     unpack_action_tokens,
 )
+from mstar.model.praxis1.components.attention import resource_attend
 from mstar.model.praxis1.components.canvas import (
     build_canvas,
     tile_view_single_arm,
     tile_views_bimanual,
 )
+from mstar.model.praxis1.components.expert_inputs import (
+    TapGeometry,
+    assemble_expert_inputs,
+    pack_tap_features,
+    unpack_tap_features,
+)
 from mstar.model.praxis1.components.proprio import normalized_proprio
+from mstar.model.praxis1.components.sampler import ACTION_SALT, VIDEO_SALT, seeded_normal, window_time_grid
 from mstar.model.praxis1.config import Praxis1Config
 from mstar.model.praxis1.episode_history import (
     BOUNDARY_STATE_NAME,
@@ -47,6 +49,22 @@ from mstar.model.praxis1.episode_history import (
 from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
 
 logger = logging.getLogger(__name__)
+
+ENCODER_COND_KV = "praxis_encoder_cond_kv"
+ENCODER_BLANK_KV = "praxis_encoder_blank_kv"
+DECODER_COND_KV = "praxis_decoder_cond_kv"
+DECODER_BLANK_KV = "praxis_decoder_blank_kv"
+EXPERT_QUERIES = "praxis_expert_queries"
+EXPERT_TRUNK_KEYS = "praxis_expert_trunk_keys"
+
+ATTN_READS = {
+    ENCODER_COND_KV: "praxis_encoder_cond_attn",
+    ENCODER_BLANK_KV: "praxis_encoder_blank_attn",
+    DECODER_COND_KV: "praxis_decoder_cond_attn",
+    DECODER_BLANK_KV: "praxis_decoder_blank_attn",
+    EXPERT_QUERIES: "praxis_expert_self_attn",
+    EXPERT_TRUNK_KEYS: "praxis_expert_cross_attn",
+}
 
 
 class _Praxis1Node(NodeSubmodule):
@@ -345,10 +363,12 @@ class Praxis1BackboneSubmodule(_Praxis1Node):
     so nothing holds a step's hidden states past the step.
     """
 
-    def __init__(self, config: Praxis1Config, backbone: nn.Module, *, episode_text: bool = False) -> None:
+    def __init__(self, config: Praxis1Config, backbone: nn.Module, *, episode_text: bool = False,
+                 attention_resources: bool = True) -> None:
         super().__init__(config)
         self.backbone = backbone
         self.episode_text = episode_text
+        self.attention_resources = attention_resources
 
     def prepare_inputs(
         self,
@@ -388,16 +408,36 @@ class Praxis1BackboneSubmodule(_Praxis1Node):
         if write_text and (int(metadata.get("text_tokens", 0)) < 1 or
                            int(metadata.get("blank_tokens", 0)) < 1):
             raise ValueError("cold Praxis text episode needs tokenized stream lengths")
+        f = self.config.latents_per_chunk
+        clean_frames = int(tensors["clean_latents"].shape[2]) if "clean_latents" in tensors else 0
+        if clean_frames % f:
+            raise ValueError("Praxis clean latent window must hold complete chunks")
+        k = 1 + clean_frames // f
+        p = tensors["obs_latents"].shape[-2] * tensors["obs_latents"].shape[-1]
+        g = self.config.num_registers + p
+        cond_t = int(metadata.get("text_tokens", 0))
+        blank_t = int(metadata.get("blank_tokens", 0))
+        decoder_len = self.config.num_registers + k * f * p * self.config.patch_size[1] * self.config.patch_size[2]
+        lengths = {
+            ENCODER_COND_KV: g + cond_t + (2 * k - 1) * f * p,
+            ENCODER_BLANK_KV: g + blank_t + (2 * k - 1) * f * p,
+            DECODER_COND_KV: decoder_len,
+            DECODER_BLANK_KV: decoder_len,
+        }
         return NodeInputs(
             tensor_inputs=tensors,
+            resource_step_info=lengths,
             kwargs={"write_text": write_text,
                     "text_tokens": int(metadata.get("text_tokens", 0)),
-                    "blank_tokens": int(metadata.get("blank_tokens", 0))},
+                    "blank_tokens": int(metadata.get("blank_tokens", 0)),
+                    "seed": fwd_info.random_seed,
+                    "step_index": fwd_info.dynamic_loop_iter_counts.get("praxis_denoise", 0),
+                    "num_steps": int(metadata.get("num_steps", 1)),
+                    "t_shift": float(metadata.get("t_shift", 1.0)),
+                    "cfg_video_scale": float(metadata.get("cfg_video_scale", 1.0))},
         )
 
     def declare_step(self, graph_walk, request_ids, inputs, **kwargs) -> SubmoduleStep | None:
-        if not self.episode_text:
-            return None
         segments = []
         for rid, inp in zip(request_ids, inputs, strict=True):
             write = inp.kwargs["write_text"]
@@ -405,7 +445,20 @@ class Praxis1BackboneSubmodule(_Praxis1Node):
                 Segment(rid, "cond", inp.kwargs["text_tokens"] if write else 0),
                 Segment(rid, "blank", inp.kwargs["blank_tokens"] if write else 0),
             ))
-        return SubmoduleStep(state={"text_embeds": ArrayStep(segments=tuple(segments))})
+        guided = any(inp.kwargs["cfg_video_scale"] != 1.0 for inp in inputs)
+        if guided and any(inp.kwargs["cfg_video_scale"] == 1.0 for inp in inputs):
+            raise ValueError("Praxis backbone cannot batch different video guidance modes")
+        names = (ENCODER_COND_KV, DECODER_COND_KV) + (
+            (ENCODER_BLANK_KV, DECODER_BLANK_KV) if guided else ()
+        )
+        state = {name: ArrayStep(segments=tuple(
+            Segment(rid, name, int(inp.resource_step_info[name]))
+            for rid, inp in zip(request_ids, inputs, strict=True)
+        )) for name in names
+            } if self.attention_resources else {}
+        if self.episode_text:
+            state["text_embeds"] = ArrayStep(segments=tuple(segments))
+        return SubmoduleStep(state=state)
 
     def episode_text_embeddings(
         self, text_embeds: torch.Tensor | None, text_embeds_blank: torch.Tensor | None,
@@ -442,15 +495,81 @@ class Praxis1BackboneSubmodule(_Praxis1Node):
         write_text: bool = False,
         text_tokens: int = 0,
         blank_tokens: int = 0,
+        seed: int = 0,
+        step_index: int = 0,
+        num_steps: int = 1,
+        t_shift: float = 1.0,
+        cfg_video_scale: float = 1.0,
         **kwargs,
     ) -> NameToTensorList:
+        if not self.attention_resources:
+            raise RuntimeError("Praxis backbone computation requires declared attention resources")
         text_embeds, text_embeds_blank = self.episode_text_embeddings(
             text_embeds, text_embeds_blank, write_text=write_text,
             text_tokens=text_tokens, blank_tokens=blank_tokens,
         )
-        raise NotImplementedError(
-            "Praxis-1 backbone step: wires praxis.model.PraxisPolicy's encoder pass"
+        times = window_time_grid(num_steps, t_shift)
+        if step_index < 0 or step_index >= num_steps:
+            raise ValueError("Praxis Euler step is outside the request's time grid")
+        f = self.config.latents_per_chunk
+        clean = clean_latents if clean_latents is not None and clean_latents.shape[2] else None
+        if clean is not None and clean.shape[2] % f:
+            raise ValueError("Praxis clean latent window must hold complete chunks")
+        k = 1 if clean is None else 1 + clean.shape[2] // f
+        anchor = obs_latents if anchor_latents is None else anchor_latents
+        if anchor.shape[2] != 1 or anchor.shape[0] != 1:
+            raise ValueError("Praxis anchor must contain one latent frame")
+        if video_latents is None:
+            if step_index:
+                raise ValueError("a later Praxis Euler step needs carried video latents")
+            video_latents = seeded_normal(
+                (1, obs_latents.shape[1], k * f, *obs_latents.shape[-2:]), seed, VIDEO_SALT,
+            ).to(obs_latents.device)
+        if action_latents is None:
+            if step_index:
+                raise ValueError("a later Praxis Euler step needs carried action latents")
+            action_latents = seeded_normal(
+                (1, k * f, self.config.action_patch_dim), seed, ACTION_SALT,
+            ).to(obs_latents.device)
+        if video_latents.shape != (1, obs_latents.shape[1], k * f, *obs_latents.shape[-2:]):
+            raise ValueError("Praxis carried video does not match the clean window")
+        if action_latents.shape != (1, k * f, self.config.action_patch_dim):
+            raise ValueError("Praxis carried actions do not match the clean window")
+        encoder, decoder = self.backbone.encoder, self.backbone.decoder
+        try:
+            model_dtype = next(encoder.parameters()).dtype
+        except StopIteration:
+            model_dtype = obs_latents.dtype
+        t_cur, t_next = times[step_index:step_index + 2]
+        timestep = torch.full((1, k), t_cur, dtype=model_dtype, device=obs_latents.device)
+
+        def branch(text: torch.Tensor, encoder_state, decoder_state):
+            cond, features = encoder.forward_chunk_causal(
+                text.to(model_dtype), anchor.to(model_dtype),
+                None if clean is None else clean.to(model_dtype),
+                video_latents.to(model_dtype), timestep,
+                attend_for_layer=lambda layer: resource_attend(encoder_state, layer),
+            )
+            velocity = decoder.forward_chunk_causal(
+                video_latents.to(model_dtype), cond, timestep,
+                attend_for_layer=lambda layer: resource_attend(decoder_state, layer),
+            )
+            return velocity, features
+
+        velocity, features = branch(
+            text_embeds, self.state_handles[ENCODER_COND_KV], self.state_handles[DECODER_COND_KV],
         )
+        if cfg_video_scale != 1.0:
+            blank_velocity, _ = branch(
+                text_embeds_blank, self.state_handles[ENCODER_BLANK_KV],
+                self.state_handles[DECODER_BLANK_KV],
+            )
+            velocity = blank_velocity.float() + cfg_video_scale * (velocity.float() - blank_velocity.float())
+        video_latents = video_latents + (t_next - t_cur) * velocity.float()
+        packed = dict(zip(("taps", "tap_embeddings", "tap_rope_ids", "tap_geometry"),
+                          pack_tap_features(features), strict=True))
+        return {**{name: [value] for name, value in packed.items()},
+                "video_latents": [video_latents], "action_latents": [action_latents]}
 
 
 class Praxis1ActionExpertSubmodule(_Praxis1Node):
@@ -478,7 +597,25 @@ class Praxis1ActionExpertSubmodule(_Praxis1Node):
         }
         if proprio_all := inputs.get("proprio_all"):
             tensors["proprio_all"] = proprio_all[0]
-        return NodeInputs(tensor_inputs=tensors)
+        metadata = fwd_info.step_metadata
+        geometry = TapGeometry.decode(tensors["tap_geometry"])
+        geometry.validate(tensors["tap_embeddings"].shape[1])
+        q = geometry.n_chunks * (1 + self.expert.num_future_per_chunk + geometry.frames_per_chunk)
+        kv = geometry.register[1] + geometry.anchor[1] + geometry.text[1]
+        kv += geometry.noised[1] + geometry.clean[1]
+        return NodeInputs(tensor_inputs=tensors, resource_step_info={
+            EXPERT_QUERIES: q, EXPERT_TRUNK_KEYS: kv,
+        }, kwargs={
+            "step_index": fwd_info.dynamic_loop_iter_counts.get("praxis_denoise", 0),
+            "num_steps": int(metadata.get("num_steps", 1)), "t_shift": float(metadata.get("t_shift", 1.0)),
+            "cfg_scale": float(metadata.get("cfg_scale", 1.0)),
+        })
+
+    def declare_step(self, graph_walk, request_ids, inputs, **kwargs) -> SubmoduleStep:
+        return SubmoduleStep(state={name: ArrayStep(segments=tuple(
+            Segment(rid, name, int(inp.resource_step_info[name]))
+            for rid, inp in zip(request_ids, inputs, strict=True)
+        )) for name in (EXPERT_QUERIES, EXPERT_TRUNK_KEYS)})
 
     def forward(
         self,
@@ -492,15 +629,42 @@ class Praxis1ActionExpertSubmodule(_Praxis1Node):
         action_latents: torch.Tensor,
         proprio: torch.Tensor,
         proprio_all: torch.Tensor | None = None,
+        step_index: int = 0,
+        num_steps: int = 1,
+        t_shift: float = 1.0,
+        cfg_scale: float = 1.0,
         **kwargs,
     ) -> NameToTensorList:
-        raise NotImplementedError(
-            "Praxis-1 expert step: wires praxis.action_expert.run_expert_on_taps_k"
+        if cfg_scale != 1.0:
+            raise ValueError("Praxis expert CFG needs the blank tap stream, which this graph has not declared")
+        times = window_time_grid(num_steps, t_shift)
+        if step_index < 0 or step_index >= num_steps:
+            raise ValueError("Praxis Euler step is outside the request's time grid")
+        features = unpack_tap_features(taps, tap_embeddings, tap_rope_ids, tap_geometry)
+        k = features.n_chunks
+        p = proprio if proprio_all is None else proprio_all
+        if p.shape != (1, k, self.config.proprio_patch_dim):
+            raise ValueError("Praxis proprio does not match the clean window")
+        if action_latents.shape != (1, k * features.frames_per_chunk, self.config.action_patch_dim):
+            raise ValueError("Praxis actions do not match the tap window")
+        t_cur, t_next = times[step_index:step_index + 2]
+        assembled = assemble_expert_inputs(
+            features, action_latents,
+            torch.full((1, k), t_cur, device=action_latents.device), p,
+            global_order=self.expert.global_order,
         )
+        velocity = self.expert.forward_trunk_rope(
+            **vars(assembled), cross_mask=None, self_mask=None,
+            attend_for_layer=lambda layer, is_cross: expert_resource_attend(
+                self.state_handles[EXPERT_TRUNK_KEYS if is_cross else EXPERT_QUERIES], layer
+            ),
+        )
+        return {"video_latents": [video_latents],
+                "action_latents": [action_latents + (t_next - t_cur) * velocity.float()]}
 
 
 class Praxis1ActionHeadSubmodule(_Praxis1Node):
-    """The settled action tokens as relative rows for cold openpi calls.
+    """The settled final chunk as relative rows for cold or warm calls.
 
     The Positronic session wire composes these relative rows with the current
     pose into absolute commands in its own serving adapter. The openpi action
@@ -546,22 +710,33 @@ class Praxis1ActionHeadSubmodule(_Praxis1Node):
         inputs: NameToTensorList,
         **kwargs,
     ) -> NodeInputs:
-        return NodeInputs(tensor_inputs={"action_latents": inputs["action_latents"][0]})
+        return NodeInputs(
+            tensor_inputs={"action_latents": inputs["action_latents"][0]},
+            kwargs={"action_format": getattr(fwd_info, "step_metadata", {}).get("action_format", "openpi")},
+        )
 
     def forward(
         self,
         graph_walk: str,
         engine_inputs: ModelInputsFromEngine,
         action_latents: torch.Tensor,
+        action_format: str = "openpi",
         **kwargs,
     ) -> NameToTensorList:
+        f = self.config.latents_per_chunk
+        if action_latents.ndim != 3 or action_latents.shape[0] != 1 or action_latents.shape[1] % f:
+            raise ValueError("settled Praxis actions must hold whole latent chunks")
+        depth = action_latents.shape[1] // f - 1
+        if depth > 0 and action_format != "positronic":
+            raise ValueError("warm Praxis actions require the Positronic session reply")
         rows = unpack_action_tokens(
-            action_latents, depth=0, action_dim=self.config.action_dim,
+            action_latents[:, -f:], depth=depth, action_dim=self.config.action_dim,
             frames_per_token=self.config.action_frames_per_token,
         )
-        if rows.shape[0] != self.config.action_horizon:
+        expected = self.config.action_horizon if depth == 0 else self.config.action_chunk
+        if rows.shape[0] != expected:
             raise ValueError(
-                f"cold Praxis-1 action head expected {self.config.action_horizon} rows, got {rows.shape[0]}"
+                f"Praxis-1 action head expected {expected} rows, got {rows.shape[0]}"
             )
         relative = denormalize_rows(rows, self.action_q01, self.action_q99, self.q99_dims)
         return {"actions": [clip_grip(relative, self.grip_dims)]}

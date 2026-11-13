@@ -55,7 +55,10 @@ def _pose():
 
 def test_declared_window_is_paired_and_bounded_by_reference_geometry():
     model = _model()
-    array, boundaries, text = model.declare_state()
+    declared = {array.name: array for array in model.declare_state()}
+    array, boundaries, text = (
+        declared[STATE_NAME], declared[BOUNDARY_STATE_NAME], declared[TEXT_STATE_NAME],
+    )
     assert array.name == STATE_NAME
     assert array.lifetime == "episode" and array.max_len is None
     assert array.reads["history"].mask.size == window_size(3) == 69
@@ -65,7 +68,7 @@ def test_declared_window_is_paired_and_bounded_by_reference_geometry():
     assert boundaries.name == BOUNDARY_STATE_NAME
     assert boundaries.reads["recent"].mask.size == 4
     assert text.name == TEXT_STATE_NAME and text.labels == frozenset({"cond", "blank"})
-    assert text.reads["history"].mask.size == 256
+    assert text.reads["praxis_text_history"].mask.size == 256
 
 
 def test_episode_text_key_and_walk_follow_cold_warm_changed_prompt_and_reset():
@@ -127,6 +130,32 @@ def test_append_plan_tracks_cold_warm_reset_and_eviction():
         plan(1, LATER_ROWS)
     with pytest.raises(ValueError, match="later warm"):
         plan(21, FIRST_ROWS)
+
+
+def test_attention_layout_uses_episode_depth_after_append() -> None:
+    from mstar.engine.state.adapters import CHUNK_CAUSAL_LAYOUT_KWARG, EXPERT_LAYOUT_KWARG
+    from mstar.model.praxis1.submodules import ATTN_READS, ENCODER_COND_KV, EXPERT_TRUNK_KEYS
+
+    model = _model()
+    p = (model.config.latent_height // model.config.patch_size[1]) * (
+        model.config.latent_width // model.config.patch_size[2]
+    )
+    g = model.config.num_registers + p + 3
+
+    def layout(held: int, rows: int):
+        episode = EpisodeView("session", 0, {STATE_NAME: held} if held else {})
+        walk = model.walk_plan(
+            "", ["image"], ["action"], {"image_inputs": [object()]},
+            {"executed_rows": rows, "text_tokens": 3, "blank_tokens": 2}, episode,
+        )[-1]
+        return walk.step_metadata
+
+    cold, warm, reset = layout(0, 0), layout(1, FIRST_ROWS), layout(0, 0)
+    for metadata, k, d in ((cold, 1, 0), (warm, 2, 1), (reset, 1, 0)):
+        encoder = metadata[CHUNK_CAUSAL_LAYOUT_KWARG][ENCODER_COND_KV][ENCODER_COND_KV][ATTN_READS[ENCODER_COND_KV]]
+        cross = metadata[EXPERT_LAYOUT_KWARG][EXPERT_TRUNK_KEYS][EXPERT_TRUNK_KEYS][ATTN_READS[EXPERT_TRUNK_KEYS]]
+        assert encoder == [g, k * 6 * p, d * 6 * p]
+        assert cross == [k, g, d * 6, k * 6]
 
 
 def test_prompt_pairs_full_camera_stack_with_poses_and_drops_duplicate_signal():
