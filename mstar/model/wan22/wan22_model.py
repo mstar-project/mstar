@@ -119,6 +119,8 @@ class Wan22Model(Model):
         sampler: str = SAMPLER_UNIPC,
         dmd_timesteps: tuple[int, ...] | None = None,
         dmd_shift: float | None = None,
+        fused_loop: bool = False,
+        capture_dit: bool = False,
         **kwargs,
     ):
         refuse_attention_backend_kwarg(kwargs)
@@ -131,6 +133,7 @@ class Wan22Model(Model):
             max_video_pixels=self._require_positive_int("max_video_pixels", max_video_pixels),
             vae_decode_fast=vae_decode_fast, vae_decode_fast_sizes=vae_decode_fast_sizes, step_cache=step_cache,
             sampler=sampler, dmd_timesteps=dmd_timesteps, dmd_shift=dmd_shift,
+            fused_loop=bool(fused_loop), capture_dit=bool(capture_dit),
         )
         self.config.compile_dit_grids()  # a malformed list fails at startup
         step_cache_policy(step_cache, MAG_RATIOS)  # and so does a malformed step cache
@@ -554,6 +557,8 @@ class Wan22Model(Model):
     def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
         # the loop ends on the request's own step count, and is never speculated past it;
         # past the loop's max_iters the conductor refuses the request
+        if self.config.fused_loop:
+            return {DENOISE_LOOP_NAME: 1}  # the dit runs the whole schedule in its one step
         steps = self._get(model_kwargs, "num_inference_steps", self.config.default_num_inference_steps)
         if isinstance(steps, int) and not isinstance(steps, bool) and steps >= 1:
             return {DENOISE_LOOP_NAME: steps}

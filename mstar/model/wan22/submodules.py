@@ -329,6 +329,7 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
     # Mirrors Wan22Model.VIDEO_GEN_I2V_WALK; importing the model here would be a
     # circular import.
     _I2V_WALK = "video_gen_i2v"
+    _T2V_WALK = "video_gen"
 
     # the [cond, uncond] stack a guided step forwards (the CFG axis splits it)
     CFG_BRANCHES = 2
@@ -339,6 +340,12 @@ class Wan22DitSubmodule(_Fp32IslandMixin, UniPCDenoiseLoopSubmodule):
         super().__init__(
             loop_name=DENOISE_LOOP_NAME, max_batch_size=config.dit_max_batch_size,
             step_cache=step_cache_policy(config.step_cache, MAG_RATIOS),
+            # unguided text-to-video at each compiled shape (the dmd sampler's; Wan22Config refuses the rest)
+            capture_buckets=[
+                (self._T2V_WALK, WanStepKey(*grid, guidance=1.0, i2v=False))
+                for grid in sorted(config.compile_dit_grids())
+            ] if config.capture_dit else (),
+            capture_batch_sizes=(1,), fused_steps=config.fused_loop,
         )
         if config.is_moe and transformer is not None and transformer_2 is None:
             raise ValueError("Wan2.2 A14B needs both experts: transformer_2 is missing.")
@@ -653,6 +660,18 @@ class Wan22DmdDitSubmodule(Wan22DitSubmodule):
         noise = [torch.randn(shape, generator=generator, dtype=dtype) for _ in self.config.dmd_timesteps[1:]]
         noise = torch.cat(noise) if noise else torch.empty((0, *shape[1:]), dtype=dtype)
         return {self.LATENTS: latents.transpose(1, 2).contiguous(), DMD_NOISE: noise.transpose(1, 2).contiguous()}
+
+    def capture_request_inputs(self, bucket_key: WanStepKey, device) -> dict[str, torch.Tensor]:
+        c = self.config
+        grid = (bucket_key.frames, bucket_key.height, bucket_key.width)
+        dtype = self.transformer.dtype
+        text = torch.zeros(1, c.text_max_seq_len, c.text_dim, dtype=torch.bfloat16, device=device)
+        return {
+            self.LATENTS: torch.zeros(1, c.in_channels, *grid, dtype=torch.float32, device=device),
+            DMD_NOISE: torch.zeros(len(c.dmd_timesteps) - 1, c.in_channels, *grid, dtype=dtype, device=device),
+            # the unguided text node's outputs: the prompt's rows, and a placeholder for the negative
+            "text_embeds_pos": text, "text_embeds_neg": torch.zeros(1, dtype=torch.bfloat16, device=device),
+        }
 
     def denoise(
         self, engine_inputs: ModelInputsFromEngine, bucket_key: WanStepKey, latents: torch.Tensor,

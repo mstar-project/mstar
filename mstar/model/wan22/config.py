@@ -174,6 +174,12 @@ class Wan22Config:
     # size cost a compile on the shared worker.
     vae_decode_fast_sizes: tuple[str, ...] | None = None
 
+    # Prototype (lane edge-devloop): a fixed few-step sampler's (DMD's) whole schedule in one dit step, so the engine's
+    # loop runs one iteration; with ``capture_dit`` the dit's step replays a CUDA graph per ``compile_dit_sizes`` shape
+    # (the whole loop under ``fused_loop``, one step without).
+    fused_loop: bool = False
+    capture_dit: bool = False
+
     # Opt-in step caching, lossy (``components/diffusion/step_cache.py``); None runs every step. E.g.
     # ``{method: magcache, threshold: 0.06, max_skip_steps: 2, retention_ratio: 0.2}`` reuses the block residual on
     # the steps MagCache picks from the calibrated table in ``MAG_RATIOS`` (or a ``mag_ratios`` list given here);
@@ -219,6 +225,11 @@ class Wan22Config:
         if self.sampler in _DISTILL_DEFAULTS and self.step_cache is not None:
             # MAG_RATIOS is calibrated on the UniPC schedule; a distilled sampler's few steps have no table
             raise ValueError(f"Wan2.2 step_cache runs with the unipc sampler only, not {self.sampler!r}.")
+        if (self.fused_loop or self.capture_dit) and self.sampler != SAMPLER_DMD:
+            raise ValueError("Wan2.2 fused_loop / capture_dit run the dmd sampler's fixed schedule only.")
+        if self.capture_dit and not self.fused_loop:
+            # a dmd step picks its re-noise row and its last-step branch by its host step index
+            raise ValueError("Wan2.2 capture_dit needs fused_loop: a captured dmd step would replay one step's index.")
         if self.sampler in _DISTILL_DEFAULTS:
             default_steps, default_shift = _DISTILL_DEFAULTS[self.sampler]
             steps = default_steps if self.dmd_timesteps is None else self.dmd_timesteps
