@@ -92,6 +92,10 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
    * - ``orpheus``
      - ``canopylabs/orpheus-3b-0.1-ft``
      - TTS: Llama 3.2 3B LLM emitting audio tokens + SNAC 24 kHz decoder.
+   * - ``personaplex`` *(Beta)*
+     - ``nvidia/personaplex-7b-v1`` (gated)
+     - Full-duplex speech LM (Moshi architecture), served as an offline replay of a
+       preloaded user WAV: temporal transformer + depformer + Mimi codec.
    * - ``pi05``
      - ``lerobot/pi05_base``
      - Pi0.5 vision-language-action robotics model (ViT encoder + LLM + flow action expert).
@@ -2625,3 +2629,134 @@ own scaling follows PEFT: an ``alpha`` key in the weights, else the ``lora_alpha
 fused result — M* merges in fp32 with one rounding, PEFT fuses in bf16).
 A DoRA adapter (PEFT's ``lora_magnitude_vector`` or Kohya's ``dora_scale``) is refused,
 since its magnitudes would be dropped from the merge.
+
+
+PersonaPlex (``personaplex``) *(Beta)*
+---------------------------------------
+
+NVIDIA PersonaPlex-7B is a frame-synchronous, full-duplex speech model. M*
+serves it as an **offline, preloaded-input replay**: the whole user WAV arrives
+with the request, the model advances once per 80 ms frame across all of it, and
+the response is an agent audio track time-aligned to the input (plus the
+agent's text stream). It is not turn-based: the agent may speak while the user
+speaks. The reply streams back while the model works through the clip: text
+every frame, audio in chunks. Live ingress (feeding audio into a running
+request), barge-in and tensor parallelism are out of scope.
+
+.. code-block:: bash
+
+   pip install -e ".[personaplex]"
+   # Accept NVIDIA's license on Hugging Face and use a token with access, then:
+   mstar serve personaplex
+   # Voice presets come from the repo's voices.tgz, fetched and extracted into
+   # the Hugging Face cache on first use; set model_kwargs.voice_dir in a copy
+   # of configs/personaplex.yaml to use a local directory instead.
+
+``torchcodec`` must match the torch build, or every request fails decoding its
+audio. With a torch from a PyTorch CUDA index, install ``torchcodec`` from the same
+index (on ``2.10.0+cu129``, ``torchcodec==0.10.0+cu129``).
+
+Concurrent requests share LM and decoder steps, up to
+``model_kwargs.max_batch_size`` (default 8) and the YAML's
+``max_concurrent_requests``. A batched step rounds differently from a request
+run alone, so a greedy response can depend on what else is being served;
+``max_batch_size: 1`` runs every request alone.
+
+Each request's delayed token cache lives in the ``lm_cache`` recurrent state pool,
+so the generate step reads and updates it inside its captured graph.
+``resources: {lm_cache: {max_slots: N}}`` sizes the pool for N - 1 requests (one
+slot is the pool's sink); 255 requests by default.
+
+The agent's audio streams from the LM to a codec partition one frame at a
+time. The first chunk holds 4 frames (320 ms of audio), then 8, 16 and 25
+frames (2 s) each, a ramp like Qwen3-TTS's for its 12 Hz codec, so a running
+stream needs few decodes. Each chunk decodes only its new frames, from the
+stream's decoder state: every causal conv's last inputs, each transposed conv's
+last input, the transformer's last 249 keys and values per layer, and its step
+count. Mimi's decoder is causal throughout, so that state is all a later chunk
+needs: in exact arithmetic a stream equals one whole-track decode, whatever its
+length and however the stream groups its frames. In floating point the two
+round differently. Measured on the released weights, a 2,999-frame track decoded
+in the stream's chunks (4, 8, 16, then 25 frames) differed from its whole decode
+by at most 1.1e-6 in fp32 on CPU, and by at most 1.0e-3 (RMS 3.0e-5) on a GH200
+with TF32; these are single measurements, not bounds. The state lives in the
+``mimi_state`` recurrent state pool, about 8 MB per stream;
+``resources: {mimi_state: {max_slots: N}}`` sizes it for N - 1 requests, 64 by
+default, and startup refuses a ``max_concurrent_requests`` it cannot hold.
+
+Request: ``/generate`` with one audio input (decoded at 24 kHz; **channel 0** is
+used, not a downmix) and output modalities ``audio`` or ``audio`` + ``text``.
+``model_kwargs``:
+
+- ``voice`` (required, as in NVIDIA's ``offline.py``): a preset name such as
+  ``NATF2`` or ``NATF2.pt``; ``GET /v1/audio/voices`` lists them once fetched.
+  Presets are loaded with ``torch.load(weights_only=True)`` and validated;
+  raw-WAV voice prompts are not supported yet.
+- ``text_prompt``: the persona, wrapped in ``<system>`` tags as NVIDIA does;
+  defaults to NVIDIA's offline default. The request prompt may carry it instead.
+- ``temp_text`` / ``topk_text`` (0.7 / 25), ``temp_audio`` / ``topk_audio``
+  (0.8 / 250), ``greedy``. Seeded sampled output does not reproduce NVIDIA's,
+  whose RNG stream differs; parity is defined on greedy and forced paths. M*
+  also stops the depformer after the last codebook it samples (8 of 16 steps
+  per frame, since the user's codebooks are given), which leaves greedy output
+  unchanged but draws fewer random numbers than NVIDIA does. A request served alone
+  repeated its own output byte for byte with the same ``seed``.
+
+Uploads longer than 2999 × 80 ms (239.9 s) are rejected from the file header,
+or after at most that much decoding, before the exact budget below is checked.
+
+Limits: voice embeddings + 12 silence frames + persona tokens + user frames must
+not exceed **2999** temporal forwards, so user audio is capped at
+(2999 − conditioning frames) × 80 ms, just under 4 minutes. NVIDIA's 3000-slot
+ring KV equals dense causal attention only up to that point. Output audio is
+trimmed to the input's sample count and lags it by one frame, as in NVIDIA's
+``offline.py``; the input fixes the output length, so ``max_output_tokens`` is
+ignored. Text frames that are padding or special tokens produce empty chunks.
+
+Status, checked with the released checkpoint against NVIDIA's reference
+implementation on H100 and GH200 GPUs:
+
+- With dense attention, M* reproduces NVIDIA's greedy tokens exactly and its
+  audio to within 5.7e-7 on the measured clips. The served path uses FlashInfer paged attention, whose
+  different rounding flips near-tied token choices (first flips at logit
+  margins of 0 to 0.0625, at most one bfloat16 step), so a long greedy
+  trajectory departs from NVIDIA's after some frames. NVIDIA's own code departs
+  comparably when only PyTorch's attention kernel changes, first flipping at the
+  same decision: on a 222-frame clip, 762 agent codes differed between M* and
+  NVIDIA and 779 between NVIDIA's default and math SDPA kernels on an H100, and
+  216 and 130 on a GH200. Batching changes rounding the same way.
+- Cancellation, recovery and malformed inputs (rejected with 400) are checked
+  on a live server; a 20-minute mixed-load soak kept
+  GPU memory flat.
+- The LM's generate step runs from CUDA graphs captured at batch sizes up to
+  ``max_batch_size`` (conditioning frames run eagerly). On one GH200 with N
+  simultaneous streamed requests of a 17.7 s clip and ``max_batch_size`` N,
+  three waves per N, M* delivered 3.6 seconds of audio per second at one
+  request, 21 at 8, 53 at 32 and 93 at 128. Every request stayed under 10 ms
+  of total stall up to 32 requests; at 128, 372 of 384 did, and the worst
+  stalled 2.1 s. Time to first audio was 2.5 s at one request and 16 s at
+  128, since conditioning runs before the first frame, so no request met a
+  200 ms limit. On an 18 s clip, one wave per N, setup (upload, Mimi encode,
+  conditioning and the first generated frame) took 2.4, 3.4 and 5.8 s at 1,
+  8 and 32 requests, and the first audio came 53, 145 and 174 ms after it.
+- In an Nsight Systems profile of one wave of 32 requests, the GPU was busy
+  for 32% of the wave. About 272,000 kernels per wave are launched eagerly,
+  outside the captured graphs. The numbers above were measured with async
+  scheduling off. The LM now runs with it on: in an A/B on one GH200 (four rounds each,
+  alternated), that gave about 5% more throughput at 1, 8 and 32 requests
+  and earlier first audio after setup, with byte-identical greedy output at
+  batch 1; setup took 0.3 to 0.5 s longer at 8 and 32 requests.
+- Audio is checked by transcription and by ear. Whisper transcripts of M*'s
+  and NVIDIA's responses matched on an English clip (word error rate 0) and
+  differed on a second clip, after their tokens diverge. Listening to matched
+  pairs, dense attention's output is indistinguishable from NVIDIA's; on the
+  paged path the replies start the same, then differ in wording, and both stay
+  coherent.
+
+Reference fixtures are generated outside Git by
+``test/personaplex/reference_oracle.py`` (see
+``test/modular/fixtures/personaplex/README.rst``). Their tests skip when fixtures
+are unavailable. The 80 ms frame is model timing, not an achieved
+processing latency.
+``test/personaplex/`` has a launch script and a request client for trying a
+server by hand (``launch_server.sh``, ``request.py --audio user.wav``).
