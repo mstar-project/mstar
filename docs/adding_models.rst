@@ -21,7 +21,9 @@ A model in ``mstar`` has several separate responsibilities:
   and its layers reach it through handles. The engine builds the resources
   (``mstar/engine/resources/``) that hold each declaration and binds a handle into the
   submodule and its layers. A node that declares no state was called a "stateless" node
-  in earlier versions.
+  in earlier versions. Per-request LoRA adapters stand outside it: they are weights that
+  no request writes, and a model declares them in ``lora_roots()`` (see
+  `Per-request LoRA adapters`_).
 - **The engine** (``mstar/engine/engine.py``) is a single class that runs every node. It
   compiles forwards, captures CUDA graphs, batches requests, and runs each step's
   resource lifecycle (admit, plan, forward, commit). You never write an engine. Earlier
@@ -1168,12 +1170,13 @@ The spec types are:
        ValueError at load. The torch reference's prefill can't be captured
        (``KDAManager.prefill_capturable`` is False), so the resource refuses a prefill
        bucket on it and the model leaves those buckets out.
-   * - ``LoraSpec`` (built by ``module_lora_spec``)
+   * - ``LoraSpec`` (built from ``lora_roots``)
      - Per-request LoRA adapters on the node's LoRA-capable linears: a pool of device
        slots, a pinned host tier, and the per-step addressing a LoRA kernel reads.
-       Opt-in (``NodeResourceSpec.opt_in``): declared in this list, built only when
-       the serving YAML has a ``resources: lora:`` block. One spec spans every node
-       adapters reach, with a pool per node. See `Per-request LoRA adapters`_.
+       Opt-in (``NodeResourceSpec.opt_in``): built from the model's ``lora_roots()``
+       rather than this list, and only when the serving YAML has a ``resources: lora:``
+       block. One spec spans every node adapters reach, with a pool per node. See
+       `Per-request LoRA adapters`_.
 
 **Lean captures.** A resource whose kernels can be left out of a step whose rows all
 allow it sets ``Resource.lean_capture``, answers ``lean_for(request_ids)`` from state
@@ -1568,31 +1571,41 @@ one batch can run different adapters, or none. The engine owns the adapter weigh
 model declares which linears adapters may touch; it never indexes the pool itself.
 
 A model declares LoRA from its own modules: the shared linears add the delta
-themselves once bound, and ``module_lora_spec`` builds the spec by walking each node's
-weights root. The spec is opt-in (``NodeResourceSpec.opt_in``), declared in
-``get_node_resources`` beside the model's other resources and built only when the
-serving YAML has a ``resources: lora:`` block. Orpheus is the reference
-(``OrpheusModel.get_node_resources``):
+themselves once bound, and the bridge builds the spec by walking each node's weights
+root. LoRA stands outside the state contract, as weights do: no request writes an
+adapter, a request picks one by its kwargs, and each step's rows come from its segments,
+so nothing per request is left for ``declare_state`` to hold. A model declares a
+``LoraRoot`` for each node adapters reach in ``lora_roots()``, and ``declared_lora_spec``
+builds the one spec from them. The spec is opt-in (``NodeResourceSpec.opt_in``), built
+only when the serving YAML has a ``resources: lora:`` block. Orpheus is the reference
+(``OrpheusModel.lora_roots``):
 
 .. code-block:: python
 
-   from mstar.model.components.lora.modules import PER_SEGMENT, module_lora_spec
+   from mstar.model.components.lora.modules import PER_SEGMENT, LoraRoot
 
-   def get_node_resources(self) -> list[NodeResourceSpec]:
-       return [
-           ...,  # KV, attention, positions, sampler
-           module_lora_spec(
-               # builds the module the node's weight loader fills, at one rank, on the
-               # meta device: only once the spec is read, which a deployment without
-               # a `lora:` block never does
-               lambda group: OrpheusForCausalLM(self.config, comm_group=group),
-               nodes={"LLM"},
-               root_path="model",               # the root's attribute path in the node submodule
-               adapter_roots=[("", "model.")],  # adapters saved on the bare LlamaModel
-               rows={"lm_head": PER_SEGMENT},    # rows that are not the step's tokens
-               embeddings=True,                  # every embedding call is in the forward
-           ),
-       ]
+   def lora_roots(self) -> tuple[LoraRoot, ...]:
+       return (LoraRoot(
+           node="LLM",
+           # builds the module the node's weight loader fills, at one rank, on the
+           # meta device: only once the spec is read, which a deployment without
+           # a `lora:` block never does
+           build=lambda group: OrpheusForCausalLM(self.config, comm_group=group),
+           adapter_roots=[("", "model.")],  # adapters saved on the bare LlamaModel
+           rows={"lm_head": PER_SEGMENT},    # rows that are not the step's tokens
+           embeddings=True,                  # every embedding call is in the forward
+       ),)
+
+``root_path`` is the root's attribute path in the node submodule (``"model"`` by
+default), and ``adapters`` names the adapters a checkpoint ships for the root
+(Phi-4-multimodal's ``vision`` and ``speech``). No model builds a ``LoraSpec`` itself.
+The state lint (``test/modular/test_state_lint.py``) refuses ``get_node_resources`` in a
+ported model, and any import in a ported model from ``mstar.model.components.lora`` or
+below but ``LoraRoot``, ``AdapterRoot`` and ``PER_SEGMENT``. It also refuses, in any model
+file outside the bridge (``mstar/model/base.py`` and
+``mstar/model/components/lora/modules.py``, with ``tests`` folders skipped), a call to
+``declared_lora_spec``, ``module_lora_spec`` or ``join_lora_specs`` and a built
+``LoraSpec``.
 
 The weights root states how the checkpoint lands on it once
 (``checkpoint_rules() -> CheckpointRules``: a prefix, a remap, the stacked-shard
@@ -1642,8 +1655,8 @@ placed exactly as weights are.
   split projections adapters write, rewritten to the checkpoint's before the
   root's rules place them. ``ignore``: modules an adapter may carry that never run.
 - **Several nodes.** A model whose adapters reach several nodes (an LLM and its vision
-  encoder, which a TP config may put on different ranks) builds a spec per node with
-  ``module_lora_spec`` and declares one, ``join_lora_specs(llm, vision)``: its targets
+  encoder, which a TP config may put on different ranks) declares a root on each, and
+  the bridge joins their specs into one (``join_lora_specs``): its targets
   name their nodes, a checkpoint module belongs to the node that places it (the one whose
   ``adapter_roots`` claim it most specifically, when several do), so one adapter file
   serves both, and each node gets a pool of its own (``LoraSpec.per_node``, keyed
@@ -1675,7 +1688,7 @@ placed exactly as weights are.
   names the pool) and leases it only for a step none of whose rows runs an adapter; a
   step with one runs the region eagerly under the node's step.
 
-``module_lora_spec`` produces an ordinary ``LoraSpec``, whose parts follow.
+``declared_lora_spec`` produces an ordinary ``LoraSpec``, whose parts follow.
 
 - **Targets.** ``LoraTarget`` gives the unsharded linear's shape and how the base layer is
   split under tensor parallelism. For a column-parallel linear, A is replicated and B is
