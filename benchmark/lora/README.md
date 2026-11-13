@@ -2,7 +2,7 @@
 
 Nothing here runs in CI. Sections 1-3 fit on one GPU box with Qwen3.5-0.8B
 (an H100 is plenty; any CUDA GPU with Triton works) and the HF cache warm; section
-4 needs two GPUs.
+4 needs two GPUs, and section 8 no weights.
 
 `peft` must be installed for the HF reference in section 2.
 
@@ -36,6 +36,10 @@ pytest test/integration/test_lora_triton_gpu.py -v
 * `test_a_tiled_rank_inside_a_captured_graph`: `lora_apply_` at max rank 128
   captured once and replayed for changing slot mixes and ranks, bit for bit against
   eager.
+
+`pytest test/integration/test_lora_triton_high_rank.py -v` covers the kernels' other launch
+configs: prefill tiles, ranks up to 320, bf16, fp16 and fp32, the configs picked under smaller
+GPUs' shared-memory limits, and the finite `b` the expand needs past a slot's rank.
 
 The CPU tests the GPU box should also run (they need no GPU, but a laptop may be too
 slow for the 27B meta-device build):
@@ -352,6 +356,21 @@ TTFT p50, TPOT p50 and its overhead against its own `e_off`; which modules of ea
 all-linear adapter each engine applied; then every metric (req/s, p99s, failed), the
 correctness tables, what was not supported or excluded, mstar's worker phases
 and the versions. Copy `~/lora_compare` off the box after each stage.
+
+## 8. Kernels against cuBLAS (minutes, one GPU, no weights)
+
+```
+python -m benchmark.lora.kernels                  # 32/64/128/2048 rows, ranks 16-320, 1 and 8 adapters
+python -m benchmark.lora.kernels --rows 32 --ranks 320 --adapters 1 --per-target
+```
+
+Times `mstar::lora_apply_` (the Triton kernels) against the same delta in cuBLAS (one
+shrink GEMM and one expand GEMM per slice and adapter) over Phi-4-mini's qkv, o, gate_up
+and down shapes, and prints their sum, one decoder layer's LoRA, per rank, row count and
+adapter count. With 8 adapters the rows are split evenly over 8 slots. Each number is the
+median of three timings of a CUDA graph that cycles through enough copies of the weights
+to exceed twice the L2 cache, so the weights come from HBM as they do in a decode step.
+Run it on an otherwise idle GPU: concurrent work on it moves these numbers by up to 2x.
 
 ## Behaviour changes for non-LoRA deployments
 
