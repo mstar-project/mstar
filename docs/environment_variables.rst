@@ -41,6 +41,11 @@ Communication
        could not be captured, instead of serving that bucket eagerly at
        10-20x the latency. Off by default: a failed capture is logged at
        ERROR with a per-runner summary and the rest keeps running.
+   * - ``MSTAR_TORCH_DIR``
+     - the build interpreter's torch
+     - Build time only: where ``rust/build.rs`` finds torch's ``include/`` and
+       ``lib/`` to compile the torch ABI shim, for a build isolated from the
+       environment's torch (a wheel build, ``pip install ./rust``).
    * - ``MSTAR_DEPLOYMENT_TOKEN``
      - random per launch
      - Mixed into the namespace of the SHM tensor files and arena segments,
@@ -143,14 +148,16 @@ Communication
      - ``16384``
      - Largest item (bytes) a consumer gathers with others of the same
        shape, dtype and segment into one pinned buffer and one H2D copy,
-       instead of a copy per item (``_read_many_from_arena``). The default
-       is the crossover measured on an H200 host; ``0`` disables the
-       gather. Read in ``ArenaShmCommunicationManager.__init__``.
+       instead of a copy per item (``rust/src/arena_copy.rs`` on CUDA,
+       ``_read_many_from_arena`` elsewhere). The default is the crossover
+       measured on an H200 host; ``0`` disables the gather. Read in
+       ``ArenaShmCommunicationManager.__init__``.
    * - ``MSTAR_SHM_ARENA_GATHER_WORDS_MAX_BYTES``
      - ``512``
      - Up to this item size (bytes, 8-byte aligned) the gather indexes
        8-byte words in one pass; larger items are copied one slice each.
-       Measured on an H200 host. Read in
+       Measured on an H200 host. Only the torch-call read path (ROCm, XPU)
+       uses it: the Rust path does one memcpy per item. Read in
        ``ArenaShmCommunicationManager.__init__``.
    * - ``MSTAR_SHM_ARENA_SLOT_TTL_S``
      - ``0``

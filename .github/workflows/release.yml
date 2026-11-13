@@ -78,10 +78,17 @@ jobs:
             rust/about.hbs -o LICENSES-THIRD-PARTY-mstar-server.txt
       - uses: pypa/cibuildwheel@v4.2.1
         env:
+          # The extension embeds a shim compiled against torch's headers, and the
+          # wheel build is isolated from any torch, so it gets one from here. The
+          # oldest supported torch: test/modular/test_torch_abi.py holds the shim
+          # to the others.
           CIBW_BEFORE_ALL_LINUX: >-
             curl -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain none &&
-            cd {project} && $HOME/.cargo/bin/rustup toolchain install
-          CIBW_ENVIRONMENT_LINUX: PATH="$HOME/.cargo/bin:$PATH"
+            cd {project} && $HOME/.cargo/bin/rustup toolchain install &&
+            /opt/python/cp312-cp312/bin/python -m pip download -q --no-deps --only-binary :all:
+            --index-url https://download.pytorch.org/whl/cpu -d /tmp/torch-wheel torch==2.10.0 &&
+            /opt/python/cp312-cp312/bin/python -m zipfile -e /tmp/torch-wheel/*.whl /opt/mstar-torch
+          CIBW_ENVIRONMENT_LINUX: PATH="$HOME/.cargo/bin:$PATH" MSTAR_TORCH_DIR=/opt/mstar-torch/torch
         with:
           output-dir: wheelhouse
       - uses: actions/setup-python@v5
@@ -105,6 +112,7 @@ jobs:
           check = """
           import importlib.metadata as md, mstar_rust, os, pathlib, subprocess, sys, sysconfig
           assert mstar_rust.__version__ == sys.argv[1], mstar_rust.__version__
+          assert mstar_rust.torch_abi_embedded()
           shipped = {f.name for f in md.files('mstar-ai')}
           for licenses in ('LICENSES-THIRD-PARTY-mstar_rust.txt', 'LICENSES-THIRD-PARTY-mstar-server.txt'):
               assert licenses in shipped, licenses

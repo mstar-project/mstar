@@ -500,6 +500,24 @@ impl SegmentedShmArena {
         Ok((idx, off))
     }
 
+    /// `reserve` among the first `limit` segments only, never growing or waiting
+    /// on one. `None` sends the caller to `reserve`, whose growth the embedder has
+    /// to follow up on (see [`SegmentedShmArena`]). Returns
+    /// `(segment, offset, segment_base)`.
+    pub fn reserve_existing(
+        &self,
+        nbytes: usize,
+        limit: usize,
+    ) -> Option<(usize, usize, *mut u8)> {
+        // A growth holds this lock across an mmap, and a caller on this path may
+        // hold the GIL.
+        let segments = self.segments.try_lock().ok()?;
+        segments.iter().take(limit).enumerate().find_map(|(i, seg)| {
+            let off = seg.alloc.lock().expect("alloc lock").alloc(nbytes)?;
+            Some((i, off, seg.as_mut_ptr()))
+        })
+    }
+
     /// Release one offset (embedder-tracked descriptors). Idempotent.
     pub fn free(&self, segment: usize, offset: usize) -> bool {
         self.segments
@@ -589,6 +607,20 @@ mod tests {
 
         prod.free(off);
         assert_eq!(prod.bytes_free(), 4096);
+    }
+
+    #[test]
+    fn reserve_existing_never_grows_and_keeps_to_its_limit() {
+        let a = SegmentedShmArena::create(&name("noexist"), 1024, 4).unwrap();
+        let (seg, off, base) = a.reserve_existing(512, 1).unwrap();
+        assert_eq!((seg, off), (0, 0));
+        assert_eq!(base, a.segment_ptr_len(0).unwrap().0);
+        assert!(a.reserve_existing(600, 1).is_none());
+        assert_eq!(a.num_segments(), 1);
+        a.reserve(600).unwrap(); // grows
+        assert_eq!(a.num_segments(), 2);
+        assert!(a.reserve_existing(600, 1).is_none(), "the new segment is past the limit");
+        assert_eq!(a.reserve_existing(200, 2).unwrap().0, 0, "first fit still");
     }
 
     #[test]
