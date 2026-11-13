@@ -14,7 +14,7 @@ import torch
 import triton
 import triton.language as tl
 
-from mstar.engine.resources.kv.bounded.layout import NUM_READS, NUM_WRITES, ROW_HEAD, ROW_INTS
+from mstar.engine.resources.kv.bounded.layout import NUM_READS, NUM_WRITES, ROW_HEAD, ROW_INTS, tiles_head_dim
 
 
 @triton.jit
@@ -220,7 +220,7 @@ def bounded_attention(
     ``R = window + 1``. Returns ``[B * rows, T, H, D]``."""
     n, h, t, d = q.shape
     rows = cache.shape[1]
-    if d < 16 or d & (d - 1):
+    if not tiles_head_dim(d):
         raise ValueError(f"the kernel tiles head_dim, so it must be a power of two >= 16, got {d}")
     if not q.dtype == k.dtype == v.dtype == cache.dtype:
         raise ValueError(f"the cache holds {cache.dtype}; q, k, v are {q.dtype}, {k.dtype}, {v.dtype}")

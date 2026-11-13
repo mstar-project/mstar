@@ -17,15 +17,15 @@ sys.path.insert(0, ".")
 import pytest
 
 from mstar.engine import state
-from mstar.engine.state.adapters import PagedArrayHandle, RingHandle, ValueHandle, WithinStepHandle
+from mstar.engine.state.adapters import BoundedHandle, PagedArrayHandle, RingHandle, ValueHandle, WithinStepHandle
 from mstar.engine.state.calls import ArrayHandle
 
 # Today's types the surface re-exports, and a NamedTuple, whose fields stay positional.
 _POSITIONAL = {"PagedNHDTarget", "Segment", "SlotLease", "Span"}
 # The calls take the handle first, then what every call names, and only then keywords.
 _CALLS = {
-    "add_read", "at_last_token", "causal_conv", "gated_delta_net", "gather", "host", "last_sampled", "position",
-    "positions", "rope", "sample", "scatter", "split_range",
+    "add_read", "at_last_token", "causal_conv", "gated_delta_net", "gather", "host", "last_sampled", "mamba2",
+    "position", "positions", "rope", "sample", "scatter", "split_range",
 }
 # Each public name's parameters as ``[name, kind, default]``. A dataclass's parameters are its fields.
 SNAPSHOT = {
@@ -98,6 +98,10 @@ SNAPSHOT = {
         ["growth", "KEYWORD_ONLY", '()'],
         ["scratch", "KEYWORD_ONLY", '0'],
         ["kept_windows", "KEYWORD_ONLY", '{}'],
+        ["max_growth", "KEYWORD_ONLY", 'None'],
+    ],
+    "Mamba2": [
+        ["time_step_limit", "KEYWORD_ONLY", '(0.0, inf)'],
     ],
     "PagedNHD": [
         ["dtypes", "KEYWORD_ONLY", 'None'],
@@ -253,6 +257,17 @@ SNAPSHOT = {
     "last_sampled": [
         ["s", "POSITIONAL_OR_KEYWORD", None],
     ],
+    "mamba2": [
+        ["h", "POSITIONAL_OR_KEYWORD", None],
+        ["layer", "POSITIONAL_OR_KEYWORD", None],
+        ["x", "POSITIONAL_OR_KEYWORD", None],
+        ["dt", "POSITIONAL_OR_KEYWORD", None],
+        ["b", "POSITIONAL_OR_KEYWORD", None],
+        ["c", "POSITIONAL_OR_KEYWORD", None],
+        ["a_log", "POSITIONAL_OR_KEYWORD", None],
+        ["d", "POSITIONAL_OR_KEYWORD", None],
+        ["dt_bias", "POSITIONAL_OR_KEYWORD", None],
+    ],
     "position": [
         ["h", "POSITIONAL_OR_KEYWORD", None],
         ["rid_handle", "POSITIONAL_OR_KEYWORD", None],
@@ -336,7 +351,9 @@ def test_the_surface_equals_the_snapshot():
     assert _surface() == SNAPSHOT, "an addition updates SNAPSHOT, and a change in meaning comes as a new name"
 
 
-@pytest.mark.parametrize("handle", [ArrayHandle, PagedArrayHandle, ValueHandle, WithinStepHandle, RingHandle])
+@pytest.mark.parametrize(
+    "handle", [ArrayHandle, PagedArrayHandle, ValueHandle, WithinStepHandle, RingHandle, BoundedHandle],
+)
 def test_a_handles_calls_equal_the_snapshot(handle):
     surface = {
         name: [[p.name, p.kind.name, _default(p)] for p in inspect.signature(getattr(handle, name)).parameters.values()]

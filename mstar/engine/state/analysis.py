@@ -129,13 +129,13 @@ def _array_problems(array: Array) -> list[str]:
     where = f"Array {array.name!r}"
     problems: list[str] = []
     for key, read in array.reads.items():
-        if isinstance(read.mask, Block) and array.max_len:
+        if isinstance(read.mask, Block) and array.max_len != 0:
             problems.append(f"{where}.reads[{key!r}].mask: Block needs max_len 0, and max_len is {array.max_len}")
-        elif not isinstance(read.mask, Block | BlockCausal) and not array.max_len:
+        elif not isinstance(read.mask, Block | BlockCausal) and array.max_len == 0:
             problems.append(f"{where}.reads[{key!r}].mask: every read of an array with max_len 0 is a Block or "
                             f"BlockCausal read, and this one is {type(read.mask).__name__}")
     if array.positions is not None:
-        if array.rewritable or not array.max_len:
+        if array.rewritable or array.max_len == 0:
             problems.append(f"{where}.positions: positions sit only on an append-only array that keeps entries")
         rope = array.positions.rope
         llama31 = () if rope is None else (rope.low_freq_factor, rope.high_freq_factor, rope.old_context_len)
@@ -164,7 +164,7 @@ def _cross_read_problems(arrays: Sequence[Array]) -> list[str]:
     named = {read.queries for array in arrays for read in array.reads.values()}
     problems: list[str] = []
     for array in arrays:
-        if not array.max_len and not array.reads and array.name not in named:
+        if array.max_len == 0 and not array.reads and array.name not in named:
             problems.append(f"Array {array.name!r}.reads: with max_len 0 and no reads, the array only lays out another "
                             f"read's queries, and no read's queries names {array.name!r}")
         for key, read in array.reads.items():
@@ -404,7 +404,7 @@ def split_read_problems(
     arrays = {declared.name: declared for declared in declarations if isinstance(declared, Array)}
     problems = []
     for array in arrays.values():
-        if array.max_len:
+        if array.max_len != 0:
             continue
         nodes = [node for node in sorted(array.nodes) if array.labels & set(split.get(node, ()))]
         if not nodes:
