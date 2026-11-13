@@ -1832,31 +1832,47 @@ class Conductor:
         slot = self._episode_slots.reserve(owner, workers)
         if slot is not None:
             return slot
-        for old_id, old in self._episode_records.idle():
-            if old.workers.isdisjoint(workers):
-                continue
+        queued = {request.episode for request in self.waiting_queue}
+        eligible = {
+            self._episode_owner(episode_id, ""): (episode_id, record)
+            for episode_id, record in self._episode_records.idle()
+            if episode_id not in queued and self._episode_owner(episode_id, "") != owner
+        }
+        candidates = []
+        for candidate_slot in range(self._episode_slots.capacity):
+            occupants = self._episode_slots.occupants(workers, candidate_slot)
+            if occupants <= eligible.keys():
+                victims = [eligible[occupant] for occupant in occupants]
+                candidates.append((len(victims), min(old.last_end for _, old in victims), candidate_slot, victims))
+        if not candidates:
+            raise EpisodeCapacityError
+        _, _, _, victims = min(candidates)
+        for old_id, old in victims:
             old_slot, old_workers = old.slot, old.workers
             self._send_end_episode(old_id, old_slot, old_workers)
             self._episode_records.evict(old_id)
             self._episode_evictions.inc(("pressure",))
             self._episode_slots.release(self._episode_owner(old_id, ""), old_workers, old_slot)
-            slot = self._episode_slots.reserve(owner, workers)
-            if slot is not None:
-                return slot
-        raise EpisodeCapacityError
+        slot = self._episode_slots.reserve(owner, workers)
+        if slot is None:
+            raise AssertionError("planned episode victims did not free their common slot")
+        return slot
 
     def _expire_episode_slots(self, now: float) -> bool:
         freed = False
+        queued = {request.episode for request in self.waiting_queue}
         for episode_id, record in self._episode_records.idle():
             if now - record.last_end < self._episode_idle_timeout_s:
                 break
+            if episode_id in queued:
+                continue
             slot, workers = record.slot, record.workers
             self._send_end_episode(episode_id, slot, workers)
             self._episode_records.evict(episode_id, "idle")
             self._episode_evictions.inc(("idle",))
             self._episode_slots.release(self._episode_owner(episode_id, ""), workers, slot)
             freed = True
-        self._episode_records.forget_expired_cold(now, self._episode_idle_timeout_s)
+        self._episode_records.forget_expired_closed(now, self._episode_idle_timeout_s)
         return freed
 
     def _drop_request(self, request_id: str) -> None:

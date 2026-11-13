@@ -242,11 +242,8 @@ class EpisodeRecords:
             counts[state] += 1
         return counts
 
-    def forget_expired_cold(self, now: float, ttl: float) -> None:
-        """Bound records after their slot and frontend connection are gone."""
-        for name, record in list(self._records.items()):
-            if record.slot is None and record.in_flight is None and now - record.last_end >= 2 * ttl:
-                del self._records[name]
+    def forget_expired_closed(self, now: float, ttl: float) -> None:
+        """Bound close tombstones after the frontend connection is gone."""
         for name, ended_at in list(self._closed.items()):
             if now - ended_at >= 2 * ttl:
                 del self._closed[name]
@@ -282,6 +279,13 @@ class EpisodeSlots:
         for worker, _ in self._owners:
             counts[worker] = counts.get(worker, 0) + 1
         return counts
+
+    def occupants(self, workers: set[str], slot: int) -> set[str]:
+        """Owners blocking one common slot on the requested workers."""
+        return {
+            owner for worker in workers
+            if (owner := self._owners.get((worker, slot))) is not None
+        }
 
     def release(self, owner: str, workers: set[str], slot: int) -> None:
         if any(self._owners.get((worker, slot)) != owner for worker in workers):
