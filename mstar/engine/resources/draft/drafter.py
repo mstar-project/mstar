@@ -258,6 +258,7 @@ def draft_mixed_step(
     target: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
     drafter: Drafter,
     resources: dict[str, Any],
+    resident: CapturedResidentStep | None = None,
 ) -> VerifyResult:
     """`draft_verify_step` for a mixed prompt-plus-verify step: ``ids`` ``[tokens]`` the step's ids (a verify
     row's last emitted token at its block's first place), ``rows`` its layout, and ``target`` maps the ids
@@ -279,6 +280,10 @@ def draft_mixed_step(
     result = sampler.verify(request_ids, logits.view(n, k + 1, -1), drafts, refuse=rows.prompt)
     block = torch.cat([anchors.reshape(n, 1).long(), drafts], dim=1)
     drafter.observe(ObserveInputs(block, result, mixed=rows, ids=block_ids))
+    if resident is not None and resident.buffers.advance is not None:
+        # an asynchronous mixed step's verify rows advance their KV length cells by what each keeps, as a
+        # verify step's do; its prompt rows' entries land on the trash row, which the advance skips
+        resident.buffers.advance[:n].copy_(result.accepted + 1)
     return result
 
 

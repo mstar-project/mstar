@@ -68,10 +68,13 @@ def _scatter_cells_kernel(cells_ptr, values_ptr, store_ptr):
 @triton.jit
 def _gather_column_kernel(
     slots_ptr, store_ptr, out_ptr, plus_ptr,
-    STRIDE: tl.constexpr, COL: tl.constexpr, PLUS: tl.constexpr, SPAN: tl.constexpr,
+    STRIDE: tl.constexpr, COL: tl.constexpr, PLUS: tl.constexpr, SPAN: tl.constexpr, SKIP_TRASH: tl.constexpr = 0,
 ):
     t = tl.program_id(0)
     i = t // SPAN
+    if SKIP_TRASH:
+        if tl.load(slots_ptr + i) == 0:
+            return
     value = tl.load(store_ptr + tl.load(slots_ptr + i) * STRIDE + COL) + t % SPAN
     if PLUS:
         value += tl.load(plus_ptr + i)
@@ -102,20 +105,26 @@ def scatter_cells(store: torch.Tensor, cells: torch.Tensor) -> None:
 
 def gather_column(
     store: torch.Tensor, slots: torch.Tensor, stride: int, col: int, out: torch.Tensor,
-    plus: torch.Tensor | None = None, span: int = 1,
+    plus: torch.Tensor | None = None, span: int = 1, skip_trash: bool = False,
 ) -> None:
     """``out[i * span + j] = store[slots[i], col] + plus[i] + j`` for ``j < span``:
-    a row's value, and with ``span`` above 1 the run of its next ``span`` tokens."""
+    a row's value, and with ``span`` above 1 the run of its next ``span`` tokens. With ``skip_trash``, a row
+    on the trash row keeps what ``out`` holds (a mixed step's prompt rows, `ResidentBuffers.mixed`)."""
     n = slots.numel()
     if store.is_cuda:
         _gather_column_kernel[(n * span,)](
             slots, store, out, plus if plus is not None else slots,
-            STRIDE=stride, COL=col, PLUS=plus is not None, SPAN=span, num_warps=1,
+            STRIDE=stride, COL=col, PLUS=plus is not None, SPAN=span, SKIP_TRASH=int(skip_trash), num_warps=1,
         )
         return
     value = store.index_select(0, slots * stride + col)
     if plus is not None:
         value = value + plus
+    if skip_trash:
+        runs = (value[:, None] + torch.arange(span, device=value.device)).reshape(-1)
+        keep = (slots == TRASH_SLOT).repeat_interleave(span)
+        out[: n * span].copy_(torch.where(keep, out[: n * span], runs.to(out.dtype)))
+        return
     if span == 1:
         out[:n].copy_(value)
         return
@@ -220,6 +229,9 @@ class ResidentBuffers:
     # the host row ``slots`` holds: a steady batch keeps one array, so no H2D and no compare
     staged: np.ndarray | None = None
     dirty: bool = False
+    # A verifying node's mixed step (`ResidentPlanner.mixed_walks`): its rows on the trash slot are prompt
+    # rows, which the host plan addresses, so no gather writes their tokens.
+    mixed: bool = False
 
 
 @dataclass(slots=True)
@@ -296,6 +308,10 @@ class ResidentPlanner:
         # results applied before it next runs.
         self.pending: Callable[[int], bool] | None = None
         self.unrecorded: Callable[[int], bool] | None = None
+        # Set by the engine on a node whose verify steps take prompt rows (`VerifyNode.mixed_walk`); empty
+        # elsewhere. A step of such a walk is resident in its leading verify rows alone: its prompt rows hold no
+        # slot, sit on the trash row as padding does, and keep the host plan's addressing (`ResidentBuffers.mixed`).
+        self.mixed_walks: frozenset[str] = frozenset()
         # request rows plus the trash row
         self.max_slots = 2 * max_bs + 1
         self._keys = tuple(resources)
@@ -393,7 +409,21 @@ class ResidentPlanner:
         return self._store
 
     def covers(self, bucket: BucketKey) -> bool:
-        return bucket.graph_walk in self.walks
+        return bucket.graph_walk in self.walks or bucket.graph_walk in self.mixed_walks
+
+    def _resident_rows(self, ctx) -> tuple[int, ...]:
+        """The step's rows that hold slots: all of them, or a mixed step's leading verify rows, which the engine
+        orders ahead of its prompt rows (`Engine.order_split_rows`)."""
+        rids = tuple(ctx.request_ids)
+        if ctx.graph_walk not in self.mixed_walks:
+            return rids
+        n = 0
+        while n < len(rids) and ctx.walk_of(rids[n]) in self.walks:
+            n += 1
+        if any(ctx.walk_of(rid) in self.walks for rid in rids[n:]):
+            raise RuntimeError(f"resident planning on {self.node}: a mixed step's verify rows are not all ahead "
+                               f"of its prompt rows: {[ctx.walk_of(rid) for rid in rids]}")
+        return rids[:n]
 
     # Slots
 
@@ -499,7 +529,7 @@ class ResidentPlanner:
         """Stage this step's rows; on the plan thread for a pre-plan. Its admit
         has run, so every page the step writes is on its stream."""
         lease = ctx.slot_lease
-        rids = tuple(ctx.request_ids)
+        rids = self._resident_rows(ctx)
         key = (rids, lease.bucket, lease.slot)
         staged = self._staged
         if staged is not None:
@@ -692,6 +722,7 @@ class ResidentPlanner:
             raise ValueError(f"resident walk {bucket.graph_walk!r} on {self.node} declares no step")
         # once per bucket: each of its captures, and every step it replays, reads these
         streams = self._streams.get(bucket) or self._declared_streams(bucket, step)
+        mixed = bucket.graph_walk in self.mixed_walks
         span = max(stream.span for stream in streams.values()) if streams else 1
         if span > self.max_span:
             raise ValueError(
@@ -714,6 +745,7 @@ class ResidentPlanner:
                 )
         self._streams[bucket] = streams
         buffers = self.buffers(bucket, slot)
+        buffers.mixed = mixed
         self.captured_steps[bucket.graph_walk] = step
         if span > 1 and buffers.advance is None:
             # zero until a verify writes it, so a forward that never does leaves lengths visibly stuck
@@ -726,9 +758,13 @@ class ResidentPlanner:
         the same number of tokens to every row (span 1, or a verify step's
         k + 1) or only reads (span 0)."""
         streams = {}
+        mixed = bucket.graph_walk in self.mixed_walks
         for key in self._keys:
             resource_step = step.steps.get(key)
             segments = (resource_step.segments if resource_step is not None else None) or step.segments or ()
+            if mixed:
+                # a mixed capture's verify rows, a block each; its prompt row is the host plan's
+                segments = [seg for seg in segments if seg.span == self.max_span]
             labels = {seg.label for seg in segments}
             spans = {seg.span for seg in segments}
             if len(labels) != 1 or len(spans) != 1 or not 0 <= next(iter(spans)) <= self.max_span:

@@ -1284,6 +1284,9 @@ class Engine:
                 # and one with unrecorded results keeps its slot
                 submodule_mgmt.resident.pending = draft.ledger.pending
                 submodule_mgmt.resident.unrecorded = draft.ledger.unrecorded
+                if draft.asynchronous and draft.decl.mixed_walk is not None:
+                    # a mixed step's verify rows run on the tables, its prompt rows on the host plan
+                    submodule_mgmt.resident.mixed_walks = frozenset({draft.decl.mixed_walk})
         runner.bind_resident(submodule_mgmt.resident)
 
     def _bind_foreign_planners(self) -> None:
@@ -2695,9 +2698,13 @@ class Engine:
                 # its rows would commit k + 1 tokens no ledger entry ever takes back
                 raise RuntimeError(f"{batch.node_name}: verify walk {draft.walk!r} rows inside a combined step")
             if draft is not None and draft.verifies(ctx.graph_walk) and ctx.graph_walk != draft.walk:
-                if draft.asynchronous:
-                    # its verify rows' lengths are on the device until their results are recorded
-                    raise RuntimeError(f"{batch.node_name}: a mixed prompt-plus-verify step in asynchronous mode")
+                if draft.asynchronous and (ctx.resident is None or ctx.graph_walk not in ctx.resident.mixed_walks):
+                    # its verify rows' lengths are on the device until their results are recorded, so only a
+                    # capture whose verify rows read the resident tables (`ResidentPlanner.mixed_walks`) runs it
+                    raise RuntimeError(
+                        f"{batch.node_name}: an asynchronous mixed prompt-plus-verify step of {len(request_ids)} "
+                        "rows found no resident capture"
+                    )
                 draft.refuse_step(step, frozenset(draft.verify_rids(ctx)))
             elif draft is not None and ctx.graph_walk == draft.walk:
                 if draft.asynchronous and ctx.resident is None:

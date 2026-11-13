@@ -1995,7 +1995,8 @@ What the model writes, and nothing more:
   too: a prompt row's drafts go unread, and what the drafter writes there before the target is
   rewritten after it (``draft_mixed_step``). A prompt row tests no draft and samples its first
   token from its last position's logits, leaving with accepted 0; the verify rows alone enter the
-  ledger. Such a node verifies synchronously.
+  ledger. Such a node verifies in either mode: an asynchronous mixed step's verify rows run on
+  the resident tables (``ResidentPlanner.mixed_walks``), and its prompt rows on the host plan.
 
 **Drafter resources.** A drafter is declared from config alone (``DrafterDecl``): its
 ``needs`` and ``node_resources(nodes)``, the resources it adds to the node (DSpark's attention

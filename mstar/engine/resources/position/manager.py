@@ -379,8 +379,10 @@ class RopeManager(PositionManager):
             "position preplan is already pending; clear_preplan before "
             "planning a different step ahead"
         )
-        if ctx.resident is not None:
-            # the replay fills the slot's buffer from the tables itself
+        mixed_walks = getattr(ctx.resident, "mixed_walks", ())
+        if ctx.resident is not None and ctx.slot_lease.bucket.graph_walk not in mixed_walks:
+            # the replay fills the slot's buffer from the tables itself; a verifying node's mixed step stages
+            # every row, and the replay rewrites its verify rows' (`ResidentBuffers.mixed`)
             return self._current_pos_ids
         if self._preplanned:
             # staged a step early against this same step's KV plan
@@ -514,7 +516,7 @@ class RopeManager(PositionManager):
         gather_column(
             self._resident_store.store, step.slots, table.stride, table.col,
             out, plus=step.buffers.kv_len[self._kv_cache_name],
-            span=step.streams[self._resident_key].span,
+            span=step.streams[self._resident_key].span, skip_trash=getattr(step.buffers, "mixed", False),
         )
 
     def commit(self, step: PositionStep, ctx: StepContext):

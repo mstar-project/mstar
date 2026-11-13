@@ -3043,7 +3043,9 @@ class KVManager(AttentionResource):
             later_groups=tuple(outputs[1:]),
         )
         laps.lap("full")
-        if ctx.resident is None:
+        # a verifying node's mixed step stages its whole host addressing: the graph rewrites its verify rows'
+        # from the resident tables, and its prompt rows keep these (`ResidentBuffers.mixed`)
+        if ctx.resident is None or ctx.slot_lease.bucket.graph_walk in getattr(ctx.resident, "mixed_walks", ()):
             for g, outputs in enumerate(res.groups):
                 self._setup_plan_states(outputs, ctx, ctx.slot_lease, g, eager_write=step.eager_write)
         else:

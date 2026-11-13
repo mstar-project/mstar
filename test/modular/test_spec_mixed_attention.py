@@ -116,6 +116,7 @@ def _stub_manager(verify_fa3: bool):
     manager._kv_cache_name, manager._verify_fa3, manager._verify_walk = "kv", verify_fa3, "decode"
     manager._current_plan_states, manager._preplan_states, manager._step_qo = {}, {}, {}
     manager._verify_wrappers, manager._dtype, manager._device = {}, torch.bfloat16, CPU
+    manager._mixed_cg, manager._verify_block = {}, BLOCK
     manager._kv_config = PagedKVConfig(num_layers=1, num_kv_heads=1, head_dim=64, num_qo_heads=2, max_seq_len=64,
                                        max_num_pages=40, page_size=PAGE)
     manager._group = SimpleNamespace(page_size=PAGE)
@@ -144,6 +145,8 @@ def test_a_mixed_step_plans_on_fa3s_ragged_wrapper_with_its_verify_rows_keys_hid
     drafter's non-causal, last-row-hidden binding too; its verify row's last keys come off its arrays."""
     wrapper = _plan_mixed(_stub_manager(True), AttentionStep(verify=True, causal=causal, hide_last=hide))
     assert isinstance(wrapper, FA3RaggedWrapper) and wrapper.causal is causal
+    # what a resident gather of a captured mixed step's verify rows attends past each row's length
+    assert wrapper.verify_extent == BLOCK - hide
     assert wrapper._seqused.tolist() == [5 + BLOCK - hide, 5]
     assert wrapper._qo_indptr_buf.tolist() == [0, 4, 7]
 

@@ -198,11 +198,9 @@ def resolve_mode(
     wanted = decl.config.mode
     if wanted == DraftMode.SYNCHRONOUS:
         return DraftMode.SYNCHRONOUS, "configured"
+    # a mixed step (`VerifyNode.mixed_walk`) runs asynchronously as a verify step does: its verify rows on the
+    # resident tables, its prompt rows on the host plan (`ResidentPlanner.mixed_walks`)
     blockers = list(blockers)
-    if decl.mixed_walk is not None:
-        # a verify row's length is on the device until its result is recorded, and a mixed step's
-        # prompt rows plan on the host
-        blockers.append(f"it runs mixed prompt-plus-verify steps ({decl.mixed_walk!r}), which verify synchronously")
     if not async_scheduling:
         blockers.append(why_not_async or "async scheduling is off for the node")
     if not resident_planning:

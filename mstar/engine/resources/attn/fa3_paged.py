@@ -199,11 +199,13 @@ class FA3RaggedWrapper:
     def __init__(
         self, *, page_size: int, table_width: int, device: torch.device, batch_size: int | None = None,
         max_tokens: int | None = None, accelerator_graph: bool = False, dtype: torch.dtype = torch.bfloat16,
-        causal: bool = True,
+        causal: bool = True, verify_extent: int = 0,
     ):
         from mstar.utils.h2d import PinnedStager
 
         self.causal = causal
+        # the keys a verify row attends past its stored length, ``k + 1 - hide_last``, for `gather_resident`
+        self.verify_extent = verify_extent
         self.device = device
         self.page_size = page_size
         self.width = table_width
@@ -261,6 +263,19 @@ class FA3RaggedWrapper:
         self._page_table = to_device_nonblocking(torch.from_numpy(host), self.device)
         self._seqused = to_device_nonblocking(torch.from_numpy(lens.astype(np.int32)), self.device)
         self._qo_indptr_buf = to_device_nonblocking(torch.from_numpy(qo), self.device)
+
+    def gather_resident(
+        self, store: torch.Tensor, slots: torch.Tensor, kv_len: torch.Tensor, stride: int, col: int,
+    ) -> None:
+        """A mixed step's verify rows off the resident tables, in the graph: each row with a slot reads its block
+        table, ``table_width`` columns from ``col``, and attends to its device length plus ``verify_extent``. A row
+        on the trash row (a prompt row, or padding) keeps its host plan. The host plan's query offsets stand:
+        the step's rows are the host's to choose."""
+        live = slots != 0
+        rows = store.view(-1, stride)[:, col: col + self.width].index_select(0, slots)
+        self._page_table.copy_(torch.where(live[:, None], rows.to(torch.int32), self._page_table))
+        lens = (kv_len + self.verify_extent).to(torch.int32)
+        self._seqused.copy_(torch.where(live, lens, self._seqused))
 
     @torch.compiler.disable
     def run(self, q: torch.Tensor, kv_cache_layer) -> torch.Tensor:

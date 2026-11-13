@@ -117,6 +117,10 @@ class FlashInferManager(PlacedAttention):
         self._verify_fa3 = False
         self._verify_walk: str | None = None
         self._verify_wrappers: dict = {}
+        # (bucket, slot) -> a captured mixed step's ragged wrapper, whose verify rows the resident gather fills
+        self._mixed_cg: dict = {}
+        # the verify walk's block (k + 1), from `bind_verify_walk`
+        self._verify_block = 0
 
     def bind_dependencies(self, resources) -> None:
         # the pool, built, has paged its groups for its placement (`PagedKVConfig.placed_groups`)
@@ -217,8 +221,9 @@ class FlashInferManager(PlacedAttention):
         )
 
     def bind_verify_walk(self, walk: str, block: int, slack: int) -> None:
-        del block, slack
+        del slack
         self._verify_walk = walk
+        self._verify_block = block
         self._verify_fa3 = self._verify_backend is not VerifyBackend.FLASHINFER and self._fa3_reason is None
 
     def resident_refusal(self) -> str | None:
@@ -229,6 +234,15 @@ class FlashInferManager(PlacedAttention):
     def resident_gather(self, step: "CapturedResidentStep") -> None:
         # planned per label of its KV cache's plan, so its wrapper is under that stream's label
         pool, stream = self._kv_cache_name, step.streams[self._kv_cache_name]
+        if getattr(step.buffers, "mixed", False):
+            # a verifying node's mixed step: the host plans its prompt rows, and FA3's ragged wrapper reads its
+            # verify rows' pages and lengths off the tables in the graph
+            mixed = self._mixed_cg.get((step.bucket, step.slot))
+            if mixed is not None and not stream.reads:
+                table = step.block_tables[pool]
+                mixed.gather_resident(step.store, step.slots, step.buffers.kv_len[pool], table.stride, table.col)
+            step.host_planned = True
+            return
         wrapper = self._cg_plan_states.get(CGSlotKey(bucket=step.bucket, slot=step.slot, label=stream.label))
         if wrapper is not None and wrapper.plans_in_graph and not stream.reads:
             table = step.block_tables[pool]
@@ -263,10 +277,16 @@ class FlashInferManager(PlacedAttention):
         # the window and scale shape every later layer's K/V
         return fingerprint(type(self).__name__, self._window_left, self._sm_scale)
 
-    def _mixed_wrapper(self, label: str, num_rows: int, lease: SlotLease | None, slot: int, causal: bool):
+    def _mixed_wrapper(
+        self, label: str, num_rows: int, lease: SlotLease | None, slot: int, causal: bool, hide_last: int = 0,
+    ):
         """FA3's ragged wrapper for a mixed step's rows (`FA3RaggedWrapper`), persistent per (bucket, slot, label)
-        under a lease, sized to the bucket's rows and tokens, and per (label, slot) eager."""
-        key = ("mixed", label, causal, slot) if lease is None else ("mixed", label, causal, lease.bucket, lease.slot)
+        under a lease, sized to the bucket's rows and tokens, and per (label, slot) eager. Under a lease it is
+        the one a resident gather of the bucket fills (`resident_gather`)."""
+        key = (
+            ("mixed", label, causal, hide_last, slot) if lease is None
+            else ("mixed", label, causal, hide_last, lease.bucket, lease.slot)
+        )
         wrapper = self._verify_wrappers.get(key)
         if wrapper is None:
             from mstar.engine.resources.attn.fa3_paged import FA3RaggedWrapper
@@ -277,7 +297,10 @@ class FlashInferManager(PlacedAttention):
                 batch_size=num_rows if lease is not None else None,
                 max_tokens=lease.bucket.num_tokens if lease is not None else None,
                 accelerator_graph=lease is not None, dtype=self._dtype, causal=causal,
+                verify_extent=self._verify_block - hide_last,
             )
+            if lease is not None:
+                self._mixed_cg[(lease.bucket, lease.slot)] = wrapper
         return wrapper
 
     def _verify_wrapper(self, step: AttentionStep, num_rows: int, num_tokens: int, lease: SlotLease | None):
@@ -553,7 +576,9 @@ class FlashInferManager(PlacedAttention):
                     hide_tail_views(kv_out.views, step.hide_last, self._group.page_size, rows), self._group.page_size,
                 )
             if mixed_fa3:
-                wrapper = self._mixed_wrapper(label, indptrs.qo_indptr.shape[0] - 1, lease, ctx.slot, step.causal)
+                wrapper = self._mixed_wrapper(
+                    label, indptrs.qo_indptr.shape[0] - 1, lease, ctx.slot, step.causal, step.hide_last,
+                )
                 wrapper.plan(dtype=self._dtype, window_left=self._window_left, **indptrs.to_kwargs_dict())
                 plan_states[label] = wrapper
                 continue

@@ -22,10 +22,14 @@ _NO_INDICES = torch.empty(0, dtype=torch.int32)
 @triton.jit
 def _gather_write_slots_kernel(
     slots_ptr, kv_len_ptr, store_ptr, page_ptr, offset_ptr,
-    STRIDE: tl.constexpr, BLOCK: tl.constexpr, PAGE: tl.constexpr, SPAN: tl.constexpr,
+    STRIDE: tl.constexpr, BLOCK: tl.constexpr, PAGE: tl.constexpr, SPAN: tl.constexpr, SKIP_TRASH: tl.constexpr = 0,
 ):
     t = tl.program_id(0)
     i = t // SPAN
+    if SKIP_TRASH:
+        # a mixed step's prompt rows sit on the trash row, and the host plan addresses their tokens
+        if tl.load(slots_ptr + i) == 0:
+            return
     n = tl.load(kv_len_ptr + i) + t % SPAN
     tl.store(page_ptr + t, tl.load(store_ptr + tl.load(slots_ptr + i) * STRIDE + BLOCK + n // PAGE))
     tl.store(offset_ptr + t, n % PAGE)
@@ -191,18 +195,26 @@ class KVResidentTables:
         if step.streams[self.key].reads:
             return
         span, bs = step.streams[self.key].span, step.bucket.bs
+        # a mixed step's rows on the trash row are its prompt rows: the host plan's addressing stays
+        mixed = getattr(step.buffers, "mixed", False)
         if store.is_cuda:
             _gather_write_slots_kernel[(bs * span,)](
                 step.slots, kv_len, store, token_to_page, token_to_cache,
-                STRIDE=stride, BLOCK=table.col, PAGE=page_size, SPAN=span, num_warps=1,
+                STRIDE=stride, BLOCK=table.col, PAGE=page_size, SPAN=span, SKIP_TRASH=int(mixed), num_warps=1,
             )
             return
         # token j of row i writes at the row's length + j
         at = (kv_len[:, None] + torch.arange(span, device=kv_len.device)).reshape(-1)
         col = torch.div(at, page_size, rounding_mode="floor")
         slots = step.slots.repeat_interleave(span) if span > 1 else step.slots
-        torch.index_select(store, 0, slots * stride + col + table.col, out=token_to_page[: bs * span])
-        token_to_cache[: bs * span].copy_(at - col * page_size)
+        if not mixed:
+            torch.index_select(store, 0, slots * stride + col + table.col, out=token_to_page[: bs * span])
+            token_to_cache[: bs * span].copy_(at - col * page_size)
+            return
+        keep = slots == 0
+        pages = torch.index_select(store, 0, slots * stride + col + table.col)
+        token_to_page[: bs * span].copy_(torch.where(keep, token_to_page[: bs * span], pages))
+        token_to_cache[: bs * span].copy_(torch.where(keep, token_to_cache[: bs * span], at - col * page_size))
 
     def commit(self, step: CapturedResidentStep) -> None:
         stream = step.streams[self.key]

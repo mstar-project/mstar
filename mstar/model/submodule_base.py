@@ -1739,7 +1739,7 @@ class ARNodeSubmodule(NodeSubmodule):
             raise RuntimeError(f"{type(self).__name__}: a mixed step on a node bound no mixed walk (bind_draft)")
         return draft_mixed_step(
             engine_inputs.resources[share.sampler_key], engine_inputs.request_ids, ids, rows, target,
-            self.drafter, engine_inputs.resources,
+            self.drafter, engine_inputs.resources, resident=engine_inputs.resident,
         )
 
     def verify_output(self, result: "VerifyResult", **row_outputs: torch.Tensor) -> "BatchedModelOutput":

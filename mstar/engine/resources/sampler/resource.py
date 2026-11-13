@@ -518,7 +518,8 @@ class SamplerResource(Resource):
         self._cells.stage(plan)
 
     def resident_gather(self, step: CapturedResidentStep) -> None:
-        if self._cells is None or self._cg_buffers is None:
+        if self._cells is None or self._cg_buffers is None or getattr(step.buffers, "mixed", False):
+            # a verifying node's mixed step stages its rows on the host (`_resident_rows`)
             return
         self._cells.gather(step)
         # what the capture's sample reads
@@ -536,6 +537,10 @@ class SamplerResource(Resource):
     def _resident_rows(self, ctx: StepContext) -> tuple | None:
         """(bucket, cg slot) of a resident step, which reads its scalars off the cells."""
         if self._cells is None or ctx.resident is None:
+            return None
+        if ctx.slot_lease.bucket.graph_walk in getattr(ctx.resident, "mixed_walks", ()):
+            # a verifying node's mixed step: its prompt rows hold no slot, and every row's scalars,
+            # offset and loop-back slot are the host's to stage
             return None
         return ctx.slot_lease.bucket, ctx.slot_lease.slot
 

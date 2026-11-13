@@ -233,13 +233,15 @@ def test_startup_takes_a_combined_walk_with_the_verify_walk_only_as_the_named_mi
     assert "DrafterNeeds.mixed" in combined_problem(decl, combined)
 
 
-def test_a_mixed_node_verifies_synchronously():
+def test_a_mixed_node_verifies_asynchronously_as_a_verify_node_does():
+    """Its mixed steps are resident in their verify rows (`ResidentPlanner.mixed_walks`), so the mixed walk holds
+    nothing back: the mode follows the node's resources and scheduling alone."""
+    for mode in ("auto", "asynchronous"):
+        decl, _ = _decl(mode=mode)
+        assert resolve_mode(decl, {}, True)[0] == DraftMode.ASYNCHRONOUS
     decl, _ = _decl(mode="auto")
-    mode, reason = resolve_mode(decl, {}, True)
-    assert mode == DraftMode.SYNCHRONOUS and "verify synchronously" in reason
-    decl, _ = _decl(mode="asynchronous")
-    with pytest.raises(ValueError, match="verify synchronously"):
-        resolve_mode(decl, {}, True)
+    mode, reason = resolve_mode(decl, {}, False)
+    assert mode == DraftMode.SYNCHRONOUS and "async scheduling" in reason
 
 
 def test_verify_rows_in_a_combined_step_the_node_doesnt_run_mixed_are_refused():
@@ -276,3 +278,35 @@ def test_a_lean_mixed_step_verifies_by_the_argmax_and_replies_as_a_full_one(monk
         driver.run([rid for rid in [*PROMPTS, *LATE] if not stopped[rid]])
         outs[lean] = driver.out
     assert outs[True] == outs[False]
+
+
+def test_a_mixed_step_advances_its_verify_rows_resident_lengths_by_what_each_keeps(monkeypatch):
+    """Under a resident capture the graph advances each verify row's KV length cell by the advance buffer, which
+    the step's verify writes (accepted + 1), as a verify step's does: a mixed step that left it zero held its
+    verify rows' device lengths back by what they kept, and their next steps re-verified tokens already
+    emitted. Its prompt rows' entries land on the trash row, which the advance skips."""
+    from types import SimpleNamespace
+
+    import mstar.engine.resources.draft.drafter as drafter_mod
+
+    real, seen = drafter_mod.draft_mixed_step, []
+
+    def resident(*args, **kwargs):
+        advance = torch.zeros(8, dtype=torch.long)
+        kwargs["resident"] = SimpleNamespace(buffers=SimpleNamespace(advance=advance))
+        result = real(*args, **kwargs)
+        seen.append((advance.clone(), result.accepted.clone()))
+        return result
+
+    monkeypatch.setattr(drafter_mod, "draft_mixed_step", resident)
+    driver = Driver(engine(K, every(2), mixed=True))
+    for rid, prompt in PROMPTS.items():
+        driver.add(rid, prompt, MAX)
+    for _ in range(2):
+        driver.step(list(PROMPTS))
+    for rid in LATE:
+        driver.add(rid, None, MAX)
+    driver.mixed_step(list(PROMPTS), LATE)
+    ((advance, accepted),) = seen
+    n = accepted.shape[0]
+    assert advance[:n].tolist() == (accepted + 1).tolist() and advance[n:].eq(0).all()
