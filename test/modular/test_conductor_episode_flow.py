@@ -61,6 +61,14 @@ class _AttentionEpisodeModel(_EpisodeModel):
             CHUNK_CAUSAL_LAYOUT_KWARG: {"within_step": {"main": {"attn": lengths}}},
         })]
 
+class _TwoLabelEpisodeModel(_EpisodeModel):
+    def declare_state(self):
+        return [Array(
+            "frames", nodes={"llm"}, layers={0}, labels={"cond", "blank"},
+            entry=Entry({"frame": TensorType((1,), dtype=torch.uint8)}),
+            max_len=None, reads={"context": Read(mask=Window(4))}, lifetime="episode",
+        )]
+
 
 class _Comm:
     def __init__(self):
@@ -210,6 +218,15 @@ def test_changed_content_key_clears_just_its_array_before_planning(tmp_path, mon
 def test_startup_refuses_more_episode_slots_than_the_dense_pool_has(tmp_path, monkeypatch):
     with pytest.raises(ValueError, match="has 1 usable slots; episodes.max_episodes needs 2"):
         _conductor(tmp_path, monkeypatch, capacity=2, pool_slots=2)
+
+
+def test_startup_counts_each_label_of_an_episode_array(tmp_path, monkeypatch):
+    with pytest.raises(ValueError, match="8 slots"):
+        _conductor(tmp_path, monkeypatch, capacity=4, pool_slots=5,
+                   model_type=_TwoLabelEpisodeModel)
+    conductor, _, _ = _conductor(tmp_path, monkeypatch, capacity=4, pool_slots=9,
+                                model_type=_TwoLabelEpisodeModel)
+    assert conductor._episode_slots.capacity == 4
 
 
 def test_call_budget_refuses_after_the_first_admitted_call(tmp_path, monkeypatch):
