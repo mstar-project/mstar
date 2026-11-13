@@ -13,6 +13,7 @@ against diffusers' pipeline.
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 
 import torch
@@ -145,9 +146,15 @@ class H3ImageDenoiseSubmodule(H3PackedDenoise):
     stepped. The references arrive as noise (seed_loop_back), are noised to t = 0.999 on the
     first step and carried unchanged after.
 
+    The step's layout travels as inputs (``LAYOUT_FROM_INPUTS``), so the prompts of one row
+    bucket share a captured graph (:meth:`graph_key`): ``capture_buckets`` lists text-to-image
+    graph keys. An edit's first step differs from the rest on the host, so edits run eager.
+
     Every request walks the same grid, so each step's AdaLN rows (13B of the DiT's weights
     read for one or two rows) are computed once a process, for text-to-image and for edits,
     and a step reads its own by its head, which is its index on the grid."""
+
+    LAYOUT_FROM_INPUTS = True
 
     STEP_SCALARS = {
         "sigma": StepScalar("sigmas"),
@@ -159,13 +166,20 @@ class H3ImageDenoiseSubmodule(H3PackedDenoise):
 
     def __init__(self, transformer: nn.Module, config: H3ImageConfig, **kwargs):
         super().__init__(transformer, config, **kwargs)
+        edits = [key for _, key in self.capture_buckets if key.references]
+        if edits:
+            raise ValueError(f"MiniMax-H3-Image captures text-to-image steps only; got edit buckets {edits}")
         # timesteps a step embeds (1: text-to-image; 2: an edit's, with the references') -> the grid's rows
         self._modulation: dict[int, StepModulation] = {}
 
     def step_modulation(self, timesteps: int, device) -> StepModulation:
-        """The grid's AdaLN rows for steps that embed ``timesteps`` timesteps, built on first use."""
+        """The grid's AdaLN rows for steps that embed ``timesteps`` timesteps, built on first use,
+        which for a captured step is :meth:`capture_request_inputs`, before the capture."""
         modulation = self._modulation.get(timesteps)
         if modulation is None:
+            if torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+                # a capture records the GEMMs rather than running them: the rows would hold nothing
+                raise RuntimeError("MiniMax-H3-Image builds its AdaLN rows before a capture, not in it")
             schedule = h3_image_schedule(self.config.sigmas)
             grid = schedule.timesteps.view(-1, 1)
             if timesteps == 2:
@@ -175,6 +189,11 @@ class H3ImageDenoiseSubmodule(H3PackedDenoise):
 
     def bucket_key_for(self, fwd_info: CurrentForwardPassInfo) -> H3ImageLayout:
         return layout_from_metadata(fwd_info.step_metadata)
+
+    def graph_key(self, bucket_key: H3ImageLayout) -> H3ImageLayout:
+        # the key at the longest prompt its row bucket holds; the prompt's vision spans are in its tags
+        capacity = self.padded_rows(bucket_key) - bucket_key.total_rows + bucket_key.text_len
+        return dataclasses.replace(bucket_key, text_len=capacity, text_image_spans=())
 
     def schedule_settings(self, fwd_info: CurrentForwardPassInfo) -> None:
         return None  # the checkpoint's fixed grid
@@ -201,19 +220,24 @@ class H3ImageDenoiseSubmodule(H3PackedDenoise):
 
     def request_inputs(self, fwd_info, inputs: NameToTensorList, bucket_key: H3ImageLayout) -> dict[str, torch.Tensor]:
         # host-side, so whether this is the first step is known without a sync
-        tensors = {TEXT_EMBEDS: inputs[TEXT_EMBEDS][0], FIRST_STEP: torch.tensor(self.step_index(fwd_info) == 0)}
+        text = inputs[TEXT_EMBEDS][0]
+        tensors = {TEXT_EMBEDS: self.padded_prompt(text, bucket_key),
+                   FIRST_STEP: torch.tensor(self.step_index(fwd_info) == 0),
+                   **self.layout_inputs(bucket_key, text.device)}
         if bucket_key.num_condition_rows:
             tensors[COND_LATENTS] = inputs[COND_LATENTS][0]
         return tensors
 
     def capture_request_inputs(self, bucket_key: H3ImageLayout, device) -> dict[str, torch.Tensor]:
         cfg = self.config.transformer
+        self.step_modulation(1, device)  # the rows a captured step reads, outside its capture
         return {
             LATENTS: torch.zeros(bucket_key.num_condition_rows + bucket_key.num_video_rows, cfg.patch_dim,
                                  device=device),
             TEXT_EMBEDS: torch.zeros(bucket_key.text_len, cfg.hidden_size, dtype=self.transformer.dtype,
                                      device=device),
             FIRST_STEP: torch.tensor(False),
+            **self.layout_inputs(bucket_key, device),
             **({COND_LATENTS: torch.zeros(bucket_key.num_condition_rows, cfg.patch_dim, device=device)}
                if bucket_key.num_condition_rows else {}),
         }
@@ -224,7 +248,7 @@ class H3ImageDenoiseSubmodule(H3PackedDenoise):
 
     def denoise(self, engine_inputs, bucket_key: H3ImageLayout, latents, timestep, sigma, sigma_next,
                 reference_timestep, head, text_embeds, first_step, cond_latents=None, **cond):
-        layout = self.layout(bucket_key, latents.device)
+        layout = self.staged_layout(bucket_key, cond, latents.device)
         n = layout.num_condition_rows
         if n and bool(first_step.all()):  # a CPU tensor: no sync
             t = torch.full((), REFERENCE_NOISE_AUG, dtype=torch.float32, device=latents.device)

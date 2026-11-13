@@ -15,6 +15,7 @@ denoise loop and the decoder. Request knobs: docs/models.rst.
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 
 import numpy as np
@@ -115,6 +116,8 @@ class H3ImageModel(Model):
         vae_tile_batch: int = 1,
         vae_compile: bool = False,
         text_cache_entries: int = 0,
+        capture_sizes: list[list[int]] | None = None,
+        capture_text_rows: int = 512,
         **kwargs,
     ):
         refuse_attention_backend_kwarg(kwargs)
@@ -137,6 +140,17 @@ class H3ImageModel(Model):
         self.row_bucket = (256 if self.compile else 1) if row_bucket is None else int(row_bucket)
         if self.row_bucket < 1:
             raise ValueError(f"row_bucket must be a positive int, got {row_bucket!r}")
+        # Generated canvases (height, width) whose text-to-image DiT step replays a CUDA graph, one per
+        # row bucket of a prompt up to capture_text_rows tokens; longer prompts, other sizes and edits
+        # run eager. For a host-bound step (1024² on 2 H200s); a big image's step is GPU-bound.
+        self.capture_sizes = [tuple(int(v) for v in size) for size in (capture_sizes or ())]
+        self.capture_text_rows = int(capture_text_rows)
+        if self.capture_sizes and self.row_bucket < 64:
+            raise ValueError(f"capture_sizes needs a row_bucket of at least 64 (compile's 256), one graph per bucket; "
+                             f"got {self.row_bucket}")
+        for height, width in self.capture_sizes:
+            if height % (2 * VAE_RATIO) or width % (2 * VAE_RATIO):
+                raise ValueError(f"capture_sizes: a canvas is whole {2 * VAE_RATIO}-px patches; got {height}x{width}")
         self.vae_tile_batch = int(vae_tile_batch)  # 1 decodes one tile a call, as the reference
         self.vae_compile = bool(vae_compile)
         # the text node keeps this many prompts' text rows (0: none), as SGLang's conditioning
@@ -452,6 +466,20 @@ class H3ImageModel(Model):
         # tensor parallelism.
         return ShardingConfig(groups=[], tp_enabled_nodes=set(), shard_dim={})
 
+    def capture_buckets(self) -> list[tuple[str, H3ImageLayout]]:
+        """The text-to-image DiT graph keys of ``capture_sizes``: each row bucket a prompt of 1 to
+        ``capture_text_rows`` tokens pads into, at its longest prompt (``graph_key``). The SP size
+        divides ``row_bucket`` (a power of two), so the buckets are the same at any SP size."""
+        buckets = []
+        for height, width in self.capture_sizes:
+            image = H3ImageLayout(0, height // VAE_RATIO, width // VAE_RATIO)
+            bucket = self.row_bucket
+            first = (image.total_rows + 1 + bucket - 1) // bucket * bucket
+            last = (image.total_rows + self.capture_text_rows + bucket - 1) // bucket * bucket
+            buckets += [(GENERATE_WALK, dataclasses.replace(image, text_len=rows - image.total_rows))
+                        for rows in range(first, last + 1, bucket)]
+        return buckets
+
     def get_submodule(self, node_name: str, device="cpu", tp_group=None, autocast_dtype=None):
         if node_name in self._submodule_cache:
             return self._submodule_cache[node_name]
@@ -480,7 +508,7 @@ class H3ImageModel(Model):
             return H3ImageDenoiseSubmodule(
                 weight_loader.build_transformer(config, snapshot, device, comm_group=tp_group),
                 config, loop_name=DENOISE_LOOP, max_batch_size=1, compile_blocks=self.compile,
-                row_bucket=self.row_bucket,
+                row_bucket=self.row_bucket, capture_buckets=self.capture_buckets(),
             )
         if node_name == VAE_DECODER_NODE:
             return H3ImageDecoderSubmodule(weight_loader.build_image_decoder(config, snapshot, device), config,

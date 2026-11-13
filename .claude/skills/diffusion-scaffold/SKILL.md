@@ -50,6 +50,7 @@ Every attention in the DiT should go through the read of an array with `max_len=
 
 - The engine's blanket compile is off for the node (`disable_torch_compile = True`); the model compiles its transformer region with `compile_utils.compile_transformer_forward`, which keeps the exact-op exclusions that preserve eager rounding. Compiling the DiT mostly buys the memory-bound elementwise work (modulation, fp32 norms, RoPE, gating), which on LTX-2.5 was ~45% of an eager step.
 - `capture_buckets` lists `(graph_walk, bucket_key)` pairs to capture; `capture_request_inputs` supplies one placeholder row per bucket. A bucket is captured per batch size in `capture_batch_sizes`, and each one costs startup, so capture the shapes you serve, not every shape you accept. `replay_walks` lets another walk reuse a captured bucket.
+- A key that holds a per-prompt length (H3-Image's unpadded prompt) would need a graph per length. Set `LAYOUT_FROM_INPUTS`, pass the layout (rope tables, row indices, the prompt padded to its bucket) as step inputs the engine stages, and map keys to a coarser `graph_key`; `capture_buckets` then lists graph keys, and the step's attention plans each replay's spans (`fixed_layout` off).
 - The captured graph removes the launch gaps of a compiled-but-eager step. Ragged attention breaks that compiled graph per layer unless the resource sets `compile_op=True` (then `run` traces as the `mstar::ragged_attention` custom op), so measure both before deciding a model needs capture.
 
 ## Ending the loop

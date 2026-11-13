@@ -45,6 +45,10 @@ Conventions the base fixes:
 * Every span a forward attends over is a segment of a declared array: a model
   whose layers also attend over a sub-span (a refiner over the image tokens
   alone, say) declares an array for it and lists it in :meth:`attention_segments`.
+* A captured graph is keyed by :meth:`graph_key` of the bucket key, the key itself
+  by default. A model whose ``denoise`` reads each request's layout off its step
+  inputs (``LAYOUT_FROM_INPUTS``) maps every key one graph can replay to one key,
+  and its graphs then plan each replay's attention spans.
 * A step schedule (``step_dtypes``, a model's ``linear_dtype_steps``) is the
   base's alone: a step's key is then a :class:`StepBucket` (:meth:`step_key`),
   so rows batch and capture per dtype, the scheduler batches each dtype apart,
@@ -150,6 +154,12 @@ class DenoiseLoopSubmodule(NodeSubmodule):
     # iteration 0 only stages them. Drawn at iteration 0, a CPU randn of a 1024^2
     # latent holds the GPU thread for milliseconds per joining row.
     PREFETCH_SEEDS = False
+
+    # True when ``denoise`` reads everything that varies between the bucket keys one graph
+    # replays (positions, prompt rows, ...) off its step inputs (``request_inputs``), so a
+    # replay reads it from the graph's staged buffers rather than from the capture's key.
+    # Only then may :meth:`graph_key` be coarser than the bucket key.
+    LAYOUT_FROM_INPUTS = False
 
     def __init__(
         self,
@@ -304,6 +314,11 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         every loop-back edge instead of the new sample alone."""
         raise NotImplementedError
 
+    def graph_key(self, bucket_key: Hashable) -> Hashable:
+        """The captured graph a step of ``bucket_key`` replays: the key itself by default.
+        Coarser only under ``LAYOUT_FROM_INPUTS``; ``capture_buckets`` then lists graph keys."""
+        return bucket_key
+
     def build_layout(self, bucket_key: Hashable, device: torch.device) -> Any:
         """Derived per-key state (e.g. rotary tables); cached by :meth:`layout`."""
         return None
@@ -351,6 +366,12 @@ class DenoiseLoopSubmodule(NodeSubmodule):
 
     def _bucket_of(self, step_key: Hashable) -> Hashable:
         return step_key.bucket if isinstance(step_key, StepBucket) else step_key
+
+    def _graph_step_key(self, step_key: Hashable) -> Hashable:
+        """``step_key`` with its bucket replaced by that bucket's :meth:`graph_key`."""
+        if isinstance(step_key, StepBucket):
+            return StepBucket(self.graph_key(step_key.bucket), step_key.dtype)
+        return self.graph_key(step_key)
 
     # --------------------------------------------------------- engine contract
     def prepare_inputs(
@@ -500,7 +521,8 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         # Padding rows (a captured bucket's dummy requests) carry no step metadata; the
         # real rows decide the bucket.
         keys = [
-            self.step_key(info, self.bucket_key_for(info), self._step_of(rid, per_request_input_metadata))
+            self._graph_step_key(
+                self.step_key(info, self.bucket_key_for(info), self._step_of(rid, per_request_input_metadata)))
             for rid, info in per_request_info.items() if info.step_metadata
         ]
         return self._uniform_key(keys) if keys else None
@@ -521,12 +543,12 @@ class DenoiseLoopSubmodule(NodeSubmodule):
 
     def declare_step(
         self, graph_walk: str, request_ids: list[str], inputs: list[NodeInputs],
-        slot_lease: SlotLease | None = None, piecewise_leases=None, **kwargs,
+        slot_lease: SlotLease | None = None, piecewise_leases=None, per_request_info=None, **kwargs,
     ) -> SubmoduleStep | None:
         # every row (padding rows included) carries its bucket key, so the spans are
         # identical between a bucket's capture and its replays
         rows = [
-            (rid, self.attention_segments(self._bucket_of(inp.resource_step_info)))
+            (rid, self.attention_segments(self._row_bucket(rid, inp, per_request_info)))
             for rid, inp in zip(request_ids, inputs, strict=True)
         ]
         if not rows[0][1]:
@@ -540,17 +562,30 @@ class DenoiseLoopSubmodule(NodeSubmodule):
                 name: ArrayStep(segments=tuple(
                     Segment(request_id=rid, label=label, span=span)
                     for rid, arrays in rows for label, span in arrays[name]
-                ), fixed_layout=True)
+                ), fixed_layout=not self.LAYOUT_FROM_INPUTS)
                 for name in rows[0][1]
             },
-            cg_key_info=self._uniform_key(inp.resource_step_info for inp in inputs),
+            cg_key_info=self._uniform_key(self._graph_step_key(inp.resource_step_info) for inp in inputs),
         )
+
+    def _row_bucket(self, rid, inp: NodeInputs, per_request_info) -> Hashable:
+        """A step row's bucket key. A pre-plan declares a graph's step over its template rows, whose
+        spans are the request's only where the graph's key is the request's: under
+        ``LAYOUT_FROM_INPUTS`` a real row takes its key from its request info."""
+        info = per_request_info.get(rid) if self.LAYOUT_FROM_INPUTS and per_request_info else None
+        if info is not None and info.step_metadata:
+            return self.bucket_key_for(info)
+        return self._bucket_of(inp.resource_step_info)
 
     def get_accelerator_graph_configs(self, device: torch.device, tp_world_size: int = 1):
         from mstar.engine.accelerator_graph_config import BatchedAcceleratorGraphConfig
 
         configs = []
         for walk, bucket_key in self.capture_buckets:
+            if self.graph_key(bucket_key) != bucket_key:
+                # the capture runs this key's own layout, so it has to be the graph's key
+                raise ValueError(f"{type(self).__name__}: capture bucket {bucket_key!r} is not its own graph key "
+                                 f"{self.graph_key(bucket_key)!r}")
             step_keys = (
                 [bucket_key] if self.step_dtypes is None
                 else [StepBucket(bucket_key, dtype) for dtype in self.step_dtypes.dtypes]
@@ -568,7 +603,7 @@ class DenoiseLoopSubmodule(NodeSubmodule):
                     capture_graph_walk=walk,
                     replay_graph_walks=[walk, *self.replay_walks.get(walk, ())],
                     single_request_inputs=single,
-                    additional_key_info=step_key,
+                    additional_key_info=self._graph_step_key(step_key),
                     # the model compiles its own transformer region; the graph records those kernels
                     compile=False,
                     capture_batch_sizes=list(self.capture_batch_sizes),
