@@ -1,0 +1,1751 @@
+{
+ "_about": "Each LoRA model's spec as it built it by hand from get_node_resources, before Model.lora_roots: what test_lora_declarations.py holds each declared spec to.",
+ "models": {
+  "chatterbox": {
+   "adapters": {},
+   "dropped_targets": {},
+   "lora_last": true,
+   "module_maps": {
+    "T3": {
+     "adapter_roots": [],
+     "aliases": {},
+     "bindings": {
+      "backbone.layers.0.mlp.down_proj": ["down_proj", 0, null, null],
+      "backbone.layers.0.mlp.gate_up_proj": ["gate_up_proj", 0, null, null],
+      "backbone.layers.0.self_attn.o_proj": ["o_proj", 0, null, null],
+      "backbone.layers.0.self_attn.qkv_proj": ["qkv_proj", 0, null, null],
+      "backbone.layers.1.mlp.down_proj": ["down_proj", 1, null, null],
+      "backbone.layers.1.mlp.gate_up_proj": ["gate_up_proj", 1, null, null],
+      "backbone.layers.1.self_attn.o_proj": ["o_proj", 1, null, null],
+      "backbone.layers.1.self_attn.qkv_proj": ["qkv_proj", 1, null, null],
+      "speech_head": ["speech_head", 0, null, null]
+     },
+     "ignore": [],
+     "prefix": "",
+     "remap": "_remap_llama_name",
+     "root_path": "model",
+     "stacked_params": [
+      {
+       "shard_id": "q",
+       "source_suffix": ".q_proj",
+       "target_suffix": ".qkv_proj"
+      },
+      {
+       "shard_id": "k",
+       "source_suffix": ".k_proj",
+       "target_suffix": ".qkv_proj"
+      },
+      {
+       "shard_id": "v",
+       "source_suffix": ".v_proj",
+       "target_suffix": ".qkv_proj"
+      },
+      {
+       "shard_id": 0,
+       "source_suffix": ".gate_proj",
+       "target_suffix": ".gate_up_proj"
+      },
+      {
+       "shard_id": 1,
+       "source_suffix": ".up_proj",
+       "target_suffix": ".gate_up_proj"
+      }
+     ],
+     "unservable": {
+      "cond_enc.emotion_adv_fc": "the conditioning encoder runs in prepare_inputs, outside the planned step",
+      "cond_enc.perceiver": "the conditioning encoder runs in prepare_inputs, outside the planned step",
+      "cond_enc.perceiver.attn.proj_out": "the conditioning encoder runs in prepare_inputs, outside the planned step",
+      "cond_enc.perceiver.attn.to_k": "the conditioning encoder runs in prepare_inputs, outside the planned step",
+      "cond_enc.perceiver.attn.to_q": "the conditioning encoder runs in prepare_inputs, outside the planned step",
+      "cond_enc.perceiver.attn.to_v": "the conditioning encoder runs in prepare_inputs, outside the planned step",
+      "cond_enc.spkr_enc": "the conditioning encoder runs in prepare_inputs, outside the planned step",
+      "speech_emb": "nn.Embedding: a lookup whose rows need not be the step's tokens (positions, codebooks); token embeddings take LoRA as VocabParallelEmbedding",
+      "speech_pos_emb": "nn.Embedding: a lookup whose rows need not be the step's tokens (positions, codebooks); token embeddings take LoRA as VocabParallelEmbedding",
+      "text_emb": "nn.Embedding: a lookup whose rows need not be the step's tokens (positions, codebooks); token embeddings take LoRA as VocabParallelEmbedding",
+      "text_pos_emb": "nn.Embedding: a lookup whose rows need not be the step's tokens (positions, codebooks); token embeddings take LoRA as VocabParallelEmbedding"
+     }
+    }
+   },
+   "nodes": ["T3"],
+   "num_layers": 2,
+   "placed": {
+    "backbone.layers.0.mlp.down_proj": ["down_proj", 0, null, null],
+    "backbone.layers.0.mlp.gate_up_proj": ["gate_up_proj", 0, null, null],
+    "backbone.layers.0.self_attn.o_proj": ["o_proj", 0, null, null],
+    "backbone.layers.0.self_attn.qkv_proj": ["qkv_proj", 0, null, null],
+    "speech_head": ["speech_head", 0, null, null]
+   },
+   "pools": {
+    "T3": {
+     "dropped_targets": [],
+     "ignored": [],
+     "resource_key": "lora@T3",
+     "targets": ["down_proj", "gate_up_proj", "o_proj", "qkv_proj", "speech_head"]
+    }
+   },
+   "resource_key": "lora",
+   "targets": {
+    "down_proj": {
+     "expert_split": null,
+     "experts": 1,
+     "in_features": 32,
+     "kind": "linear",
+     "layers": null,
+     "node": null,
+     "out_slices": [16],
+     "parallel": "row",
+     "per_segment": false,
+     "slice_align": null,
+     "slice_names": [],
+     "slice_packs": null,
+     "slice_units": null,
+     "token_fold": 1
+    },
+    "gate_up_proj": {
+     "expert_split": null,
+     "experts": 1,
+     "in_features": 16,
+     "kind": "linear",
+     "layers": null,
+     "node": null,
+     "out_slices": [32, 32],
+     "parallel": "column",
+     "per_segment": false,
+     "slice_align": null,
+     "slice_names": [0, 1],
+     "slice_packs": [
+      [
+       null,
+       [0, 1]
+      ]
+     ],
+     "slice_units": null,
+     "token_fold": 1
+    },
+    "o_proj": {
+     "expert_split": null,
+     "experts": 1,
+     "in_features": 16,
+     "kind": "linear",
+     "layers": null,
+     "node": null,
+     "out_slices": [16],
+     "parallel": "row",
+     "per_segment": false,
+     "slice_align": null,
+     "slice_names": [],
+     "slice_packs": null,
+     "slice_units": null,
+     "token_fold": 1
+    },
+    "qkv_proj": {
+     "expert_split": null,
+     "experts": 1,
+     "in_features": 16,
+     "kind": "linear",
+     "layers": null,
+     "node": null,
+     "out_slices": [16, 8, 8],
+     "parallel": "column",
+     "per_segment": false,
+     "slice_align": null,
+     "slice_names": ["q", "k", "v"],
+     "slice_packs": [
+      [
+       null,
+       ["q", "k", "v"]
+      ]
+     ],
+     "slice_units": [4, 2, 2],
+     "token_fold": 1
+    },
+    "speech_head": {
+     "expert_split": null,
+     "experts": 1,
+     "in_features": 16,
+     "kind": "linear",
+     "layers": [0],
+     "node": null,
+     "out_slices": [40],
+     "parallel": "none",
+     "per_segment": true,
+     "slice_align": null,
+     "slice_names": [],
+     "slice_packs": null,
+     "slice_units": null,
+     "token_fold": 1
+    }
+   }
+  },
+  "higgs_audio": {
+   "adapters": {},
+   "dropped_targets": {},
+   "lora_last": true,
+   "module_maps": {
+    "LLM": {
+     "adapter_roots": [
+      ["model.", ""]
+     ],
+     "aliases": {},
+     "bindings": {
+      "layers.0.mlp.down_proj": ["down_proj", 0, null, null],
+      "layers.0.mlp.gate_up_proj": ["gate_up_proj", 0, null, null],
+      "layers.0.self_attn.o_proj": ["o_proj", 0, null, null],
+      "layers.0.self_attn.qkv_proj": ["qkv_proj", 0, null, null],
+      "layers.1.mlp.down_proj": ["down_proj", 1, null, null],
+      "layers.1.mlp.gate_up_proj": ["gate_up_proj", 1, null, null],
+      "layers.1.self_attn.o_proj": ["o_proj", 1, null, null],
+      "layers.1.self_attn.qkv_proj": ["qkv_proj", 1, null, null],
+      "lm_head": ["lm_head", 0, null, null]
+     },
+     "ignore": [],
+     "prefix": "",
+     "remap": "HiggsAudioModel._llm_remap",
+     "root_path": "model",
+     "stacked_params": [
+      {
+       "shard_id": "q",
+       "source_suffix": ".q_proj",
+       "target_suffix": ".qkv_proj"
+      },
+      {
+       "shard_id": "k",
+       "source_suffix": ".k_proj",
+       "target_suffix": ".qkv_proj"
+      },
+      {
+       "shard_id": "v",
+       "source_suffix": ".v_proj",
+       "target_suffix": ".qkv_proj"
+      },
+      {
+       "shard_id": 0,
+       "source_suffix": ".gate_proj",
+       "target_suffix": ".gate_up_proj"
+      },
+      {
+       "shard_id": 1,
+       "source_suffix": ".up_proj",
+       "target_suffix": ".gate_up_proj"
+      }
+     ],
+     "unservable": {
+      "embed_tokens": "a token embedding, which this node does not serve LoRA on"
+     }
+    }
+   },
+   "nodes": ["LLM"],
+   "num_layers": 2,
+   "placed": {
+    "layers.0.mlp.down_proj": ["down_proj", 0, null, null],
+    "layers.0.mlp.gate_up_proj": ["gate_up_proj", 0, null, null],
+    "layers.0.self_attn.o_proj": ["o_proj", 0, null, null],
+    "layers.0.self_attn.qkv_proj": ["qkv_proj", 0, null, null],
+    "lm_head": ["lm_head", 0, null, null],
+    "model.layers.0.mlp.down_proj": ["down_proj", 0, null, null],
+    "model.layers.0.mlp.gate_up_proj": ["gate_up_proj", 0, null, null],
+    "model.layers.0.self_attn.o_proj": ["o_proj", 0, null, null],
+    "model.layers.0.self_attn.qkv_proj": ["qkv_proj", 0, null, null],
+    "model.lm_head": ["lm_head", 0, null, null]
+   },
+   "pools": {
+    "LLM": {
+     "dropped_targets": [],
+     "ignored": [],
+     "resource_key": "lora@LLM",
+     "targets": ["down_proj", "gate_up_proj", "lm_head", "o_proj", "qkv_proj"]
+    }
+   },
+   "resource_key": "lora",
+   "targets": {
+    "down_proj": {
+     "expert_split": null,
+     "experts": 1,
+     "in_features": 32,
+     "kind": "linear",
+     "layers": null,
+     "node": null,
+     "out_slices": [16],
+     "parallel": "row",
+     "per_segment": false,
+     "slice_align": null,
+     "slice_names": [],
+     "slice_packs": null,
+     "slice_units": null,
+     "token_fold": 1
+    },
+    "gate_up_proj": {
+     "expert_split": null,
+     "experts": 1,
+     "in_features": 16,
+     "kind": "linear",
+     "layers": null,
+     "node": null,
+     "out_slices": [32, 32],
+     "parallel": "column",
+     "per_segment": false,
+     "slice_align": null,
+     "slice_names": [0, 1],
+     "slice_packs": [
+      [
+       null,
+       [0, 1]
+      ]
+     ],
+     "slice_units": null,
+     "token_fold": 1
+    },
+    "lm_head": {
+     "expert_split": null,
+     "experts": 1,
+     "in_features": 16,
+     "kind": "linear",
+     "layers": [0],
+     "node": null,
+     "out_slices": [64],
+     "parallel": "column",
+     "per_segment": true,
+     "slice_align": null,
+     "slice_names": [],
+     "slice_packs": null,
+     "slice_units": null,
+     "token_fold": 1
+    },
+    "o_proj": {
+     "expert_split": null,
+     "experts": 1,
+     "in_features": 16,
+     "kind": "linear",
+     "layers": null,
+     "node": null,
+     "out_slices": [16],
+     "parallel": "row",
+     "per_segment": false,
+     "slice_align": null,
+     "slice_names": [],
+     "slice_packs": null,
+     "slice_units": null,
+     "token_fold": 1
+    },
+    "qkv_proj": {
+     "expert_split": null,
+     "experts": 1,
+     "in_features": 16,
+     "kind": "linear",
+     "layers": null,
+     "node": null,
+     "out_slices": [16, 8, 8],
+     "parallel": "column",
+     "per_segment": false,
+     "slice_align": null,
+     "slice_names": ["q", "k", "v"],
+     "slice_packs": [
+      [
+       null,
+       ["q", "k", "v"]
+      ]
+     ],
+     "slice_units": [4, 2, 2],
+     "token_fold": 1
+    }
+   }
+  },
+  "orpheus": {
+   "adapters": {},
+   "dropped_targets": {},
+   "lora_last": true,
+   "module_maps": {
+    "LLM": {
+     "adapter_roots": [
+      ["", "model."]
+     ],
+     "aliases": {},
+     "bindings": {
+      "lm_head": ["lm_head", 0, null, null],
+      "model.embed_tokens": ["embed_tokens", 0, null, null],
+      "model.layers.0.mlp.down_proj": ["down_proj", 0, null, null],
+      "model.layers.0.mlp.gate_up_proj": ["gate_up_proj", 0, null, null],
+      "model.layers.0.self_attn.o_proj": ["o_proj", 0, null, null],
+      "model.layers.0.self_attn.qkv_proj": ["qkv_proj", 0, null, null],
+      "model.layers.1.mlp.down_proj": ["down_proj", 1, null, null],
+      "model.layers.1.mlp.gate_up_proj": ["gate_up_proj", 1, null, null],
+      "model.layers.1.self_attn.o_proj": ["o_proj", 1, null, null],
+      "model.layers.1.self_attn.qkv_proj": ["qkv_proj", 1, null, null]
+     },
+     "ignore": [],
+     "prefix": "",
+     "remap": null,
+     "root_path": "model",
+     "stacked_params": [
+      {
+       "shard_id": "q",
+       "source_suffix": ".q_proj",
+       "target_suffix": ".qkv_proj"
+      },
+      {
+       "shard_id": "k",
+       "source_suffix": ".k_proj",
+       "target_suffix": ".qkv_proj"
+      },
+      {
+       "shard_id": "v",
+       "source_suffix": ".v_proj",
+       "target_suffix": ".qkv_proj"
+      },
+      {
+       "shard_id": 0,
+       "source_suffix": ".gate_proj",
+       "target_suffix": ".gate_up_proj"
+      },
+      {
+       "shard_id": 1,
+       "source_suffix": ".up_proj",
+       "target_suffix": ".gate_up_proj"
+      }
+     ],
+     "unservable": {}
+    }
+   },
+   "nodes": ["LLM"],
+   "num_layers": 2,
+   "placed": {
+    "lm_head": ["lm_head", 0, null, null],
+    "model.embed_tokens": ["embed_tokens", 0, null, null],
+    "model.layers.0.mlp.down_proj": ["down_proj", 0, null, null],
+    "model.layers.0.mlp.gate_up_proj": ["gate_up_proj", 0, null, null],
+    "model.layers.0.self_attn.o_proj": ["o_proj", 0, null, null],
+    "model.layers.0.self_attn.qkv_proj": ["qkv_proj", 0, null, null]
+   },
+   "pools": {
+    "LLM": {
+     "dropped_targets": [],
+     "ignored": [],
+     "resource_key": "lora@LLM",
+     "targets": ["down_proj", "embed_tokens", "gate_up_proj", "lm_head", "o_proj", "qkv_proj"]
+    }
+   },
+   "resource_key": "lora",
+   "targets": {
+    "down_proj": {
+     "expert_split": null,
+     "experts": 1,
+     "in_features": 32,
+     "kind": "linear",
+     "layers": null,
+     "node": null,
+     "out_slices": [16],
+     "parallel": "row",
+     "per_segment": false,
+     "slice_align": null,
+     "slice_names": [],
+     "slice_packs": null,
+     "slice_units": null,
+     "token_fold": 1
+    },
+    "embed_tokens": {
+     "expert_split": null,
+     "experts": 1,
+     "in_features": 64,
+     "kind": "embedding",
+     "layers": [0],
+     "node": null,
+     "out_slices": [16],
+     "parallel": "none",
+     "per_segment": false,
+     "slice_align": null,
+     "slice_names": [],
+     "slice_packs": null,
+     "slice_units": null,
+     "token_fold": 1
+    },
+    "gate_up_proj": {
+     "expert_split": null,
+     "experts": 1,
+     "in_features": 16,
+     "kind": "linear",
+     "layers": null,
+     "node": null,
+     "out_slices": [32, 32],
+     "parallel": "column",
+     "per_segment": false,
+     "slice_align": null,
+     "slice_names": [0, 1],
+     "slice_packs": [
+      [
+       null,
+       [0, 1]
+      ]
+     ],
+     "slice_units": null,
+     "token_fold": 1
+    },
+    "lm_head": {
+     "expert_split": null,
+     "experts": 1,
+     "in_features": 16,
+     "kind": "linear",
+     "layers": [0],
+     "node": null,
+     "out_slices": [64],
+     "parallel": "column",
+     "per_segment": true,
+     "slice_align": null,
+     "slice_names": [],
+     "slice_packs": null,
+     "slice_units": null,
+     "token_fold": 1
+    },
+    "o_proj": {
+     "expert_split": null,
+     "experts": 1,
+     "in_features": 16,
+     "kind": "linear",
+     "layers": null,
+     "node": null,
+     "out_slices": [16],
+     "parallel": "row",
+     "per_segment": false,
+     "slice_align": null,
+     "slice_names": [],
+     "slice_packs": null,
+     "slice_units": null,
+     "token_fold": 1
+    },
+    "qkv_proj": {
+     "expert_split": null,
+     "experts": 1,
+     "in_features": 16,
+     "kind": "linear",
+     "layers": null,
+     "node": null,
+     "out_slices": [16, 8, 8],
+     "parallel": "column",
+     "per_segment": false,
+     "slice_align": null,
+     "slice_names": ["q", "k", "v"],
+     "slice_packs": [
+      [
+       null,
+       ["q", "k", "v"]
+      ]
+     ],
+     "slice_units": [4, 2, 2],
+     "token_fold": 1
+    }
+   }
+  },
+  "phi4mm": {
+   "adapters": {
+    "speech": "speech-lora/adapter_model.safetensors",
+    "vision": "vision-lora/adapter_model.safetensors"
+   },
+   "dropped_targets": {},
+   "lora_last": true,
+   "module_maps": {
+    "LLM": {
+     "adapter_roots": [
+      ["model.", "model."],
+      ["", "model."]
+     ],
+     "aliases": {},
+     "bindings": {
+      "embed_tokens": ["embed_tokens", 0, null, null],
+      "layers.0.mlp.down_proj": ["down_proj", 0, null, null],
+      "layers.0.mlp.gate_up_proj": ["gate_up_proj", 0, null, null],
+      "layers.0.self_attn.o_proj": ["o_proj", 0, null, null],
+      "layers.0.self_attn.qkv_proj": ["qkv_proj", 0, null, null],
+      "layers.1.mlp.down_proj": ["down_proj", 1, null, null],
+      "layers.1.mlp.gate_up_proj": ["gate_up_proj", 1, null, null],
+      "layers.1.self_attn.o_proj": ["o_proj", 1, null, null],
+      "layers.1.self_attn.qkv_proj": ["qkv_proj", 1, null, null],
+      "layers.10.mlp.down_proj": ["down_proj", 10, null, null],
+      "layers.10.mlp.gate_up_proj": ["gate_up_proj", 10, null, null],
+      "layers.10.self_attn.o_proj": ["o_proj", 10, null, null],
+      "layers.10.self_attn.qkv_proj": ["qkv_proj", 10, null, null],
+      "layers.11.mlp.down_proj": ["down_proj", 11, null, null],
+      "layers.11.mlp.gate_up_proj": ["gate_up_proj", 11, null, null],
+      "layers.11.self_attn.o_proj": ["o_proj", 11, null, null],
+      "layers.11.self_attn.qkv_proj": ["qkv_proj", 11, null, null],
+      "layers.12.mlp.down_proj": ["down_proj", 12, null, null],
+      "layers.12.mlp.gate_up_proj": ["gate_up_proj", 12, null, null],
+      "layers.12.self_attn.o_proj": ["o_proj", 12, null, null],
+      "layers.12.self_attn.qkv_proj": ["qkv_proj", 12, null, null],
+      "layers.13.mlp.down_proj": ["down_proj", 13, null, null],
+      "layers.13.mlp.gate_up_proj": ["gate_up_proj", 13, null, null],
+      "layers.13.self_attn.o_proj": ["o_proj", 13, null, null],
+      "layers.13.self_attn.qkv_proj": ["qkv_proj", 13, null, null],
+      "layers.14.mlp.down_proj": ["down_proj", 14, null, null],
+      "layers.14.mlp.gate_up_proj": ["gate_up_proj", 14, null, null],
+      "layers.14.self_attn.o_proj": ["o_proj", 14, null, null],
+      "layers.14.self_attn.qkv_proj": ["qkv_proj", 14, null, null],
+      "layers.15.mlp.down_proj": ["down_proj", 15, null, null],
+      "layers.15.mlp.gate_up_proj": ["gate_up_proj", 15, null, null],
+      "layers.15.self_attn.o_proj": ["o_proj", 15, null, null],
+      "layers.15.self_attn.qkv_proj": ["qkv_proj", 15, null, null],
+      "layers.16.mlp.down_proj": ["down_proj", 16, null, null],
+      "layers.16.mlp.gate_up_proj": ["gate_up_proj", 16, null, null],
+      "layers.16.self_attn.o_proj": ["o_proj", 16, null, null],
+      "layers.16.self_attn.qkv_proj": ["qkv_proj", 16, null, null],
+      "layers.17.mlp.down_proj": ["down_proj", 17, null, null],
+      "layers.17.mlp.gate_up_proj": ["gate_up_proj", 17, null, null],
+      "layers.17.self_attn.o_proj": ["o_proj", 17, null, null],
+      "layers.17.self_attn.qkv_proj": ["qkv_proj", 17, null, null],
+      "layers.18.mlp.down_proj": ["down_proj", 18, null, null],
+      "layers.18.mlp.gate_up_proj": ["gate_up_proj", 18, null, null],
+      "layers.18.self_attn.o_proj": ["o_proj", 18, null, null],
+      "layers.18.self_attn.qkv_proj": ["qkv_proj", 18, null, null],
+      "layers.19.mlp.down_proj": ["down_proj", 19, null, null],
+      "layers.19.mlp.gate_up_proj": ["gate_up_proj", 19, null, null],
+      "layers.19.self_attn.o_proj": ["o_proj", 19, null, null],
+      "layers.19.self_attn.qkv_proj": ["qkv_proj", 19, null, null],
+      "layers.2.mlp.down_proj": ["down_proj", 2, null, null],
+      "layers.2.mlp.gate_up_proj": ["gate_up_proj", 2, null, null],
+      "layers.2.self_attn.o_proj": ["o_proj", 2, null, null],
+      "layers.2.self_attn.qkv_proj": ["qkv_proj", 2, null, null],
+      "layers.20.mlp.down_proj": ["down_proj", 20, null, null],
+      "layers.20.mlp.gate_up_proj": ["gate_up_proj", 20, null, null],
+      "layers.20.self_attn.o_proj": ["o_proj", 20, null, null],
+      "layers.20.self_attn.qkv_proj": ["qkv_proj", 20, null, null],
+      "layers.21.mlp.down_proj": ["down_proj", 21, null, null],
+      "layers.21.mlp.gate_up_proj": ["gate_up_proj", 21, null, null],
+      "layers.21.self_attn.o_proj": ["o_proj", 21, null, null],
+      "layers.21.self_attn.qkv_proj": ["qkv_proj", 21, null, null],
+      "layers.22.mlp.down_proj": ["down_proj", 22, null, null],
+      "layers.22.mlp.gate_up_proj": ["gate_up_proj", 22, null, null],
+      "layers.22.self_attn.o_proj": ["o_proj", 22, null, null],
+      "layers.22.self_attn.qkv_proj": ["qkv_proj", 22, null, null],
+      "layers.23.mlp.down_proj": ["down_proj", 23, null, null],
+      "layers.23.mlp.gate_up_proj": ["gate_up_proj", 23, null, null],
+      "layers.23.self_attn.o_proj": ["o_proj", 23, null, null],
+      "layers.23.self_attn.qkv_proj": ["qkv_proj", 23, null, null],
+      "layers.24.mlp.down_proj": ["down_proj", 24, null, null],
+      "layers.24.mlp.gate_up_proj": ["gate_up_proj", 24, null, null],
+      "layers.24.self_attn.o_proj": ["o_proj", 24, null, null],
+      "layers.24.self_attn.qkv_proj": ["qkv_proj", 24, null, null],
+      "layers.25.mlp.down_proj": ["down_proj", 25, null, null],
+      "layers.25.mlp.gate_up_proj": ["gate_up_proj", 25, null, null],
+      "layers.25.self_attn.o_proj": ["o_proj", 25, null, null],
+      "layers.25.self_attn.qkv_proj": ["qkv_proj", 25, null, null],
+      "layers.26.mlp.down_proj": ["down_proj", 26, null, null],
+      "layers.26.mlp.gate_up_proj": ["gate_up_proj", 26, null, null],
+      "layers.26.self_attn.o_proj": ["o_proj", 26, null, null],
+      "layers.26.self_attn.qkv_proj": ["qkv_proj", 26, null, null],
+      "layers.27.mlp.down_proj": ["down_proj", 27, null, null],
+      "layers.27.mlp.gate_up_proj": ["gate_up_proj", 27, null, null],
+      "layers.27.self_attn.o_proj": ["o_proj", 27, null, null],
+      "layers.27.self_attn.qkv_proj": ["qkv_proj", 27, null, null],
+      "layers.28.mlp.down_proj": ["down_proj", 28, null, null],
+      "layers.28.mlp.gate_up_proj": ["gate_up_proj", 28, null, null],
+      "layers.28.self_attn.o_proj": ["o_proj", 28, null, null],
+      "layers.28.self_attn.qkv_proj": ["qkv_proj", 28, null, null],
+      "layers.29.mlp.down_proj": ["down_proj", 29, null, null],
+      "layers.29.mlp.gate_up_proj": ["gate_up_proj", 29, null, null],
+      "layers.29.self_attn.o_proj": ["o_proj", 29, null, null],
+      "layers.29.self_attn.qkv_proj": ["qkv_proj", 29, null, null],
+      "layers.3.mlp.down_proj": ["down_proj", 3, null, null],
+      "layers.3.mlp.gate_up_proj": ["gate_up_proj", 3, null, null],
+      "layers.3.self_attn.o_proj": ["o_proj", 3, null, null],
+      "layers.3.self_attn.qkv_proj": ["qkv_proj", 3, null, null],
+      "layers.30.mlp.down_proj": ["down_proj", 30, null, null],
+      "layers.30.mlp.gate_up_proj": ["gate_up_proj", 30, null, null],
+      "layers.30.self_attn.o_proj": ["o_proj", 30, null, null],
+      "layers.30.self_attn.qkv_proj": ["qkv_proj", 30, null, null],
+      "layers.31.mlp.down_proj": ["down_proj", 31, null, null],
+      "layers.31.mlp.gate_up_proj": ["gate_up_proj", 31, null, null],
+      "layers.31.self_attn.o_proj": ["o_proj", 31, null, null],
+      "layers.31.self_attn.qkv_proj": ["qkv_proj", 31, null, null],
+      "layers.4.mlp.down_proj": ["down_proj", 4, null, null],
+      "layers.4.mlp.gate_up_proj": ["gate_up_proj", 4, null, null],
+      "layers.4.self_attn.o_proj": ["o_proj", 4, null, null],
+      "layers.4.self_attn.qkv_proj": ["qkv_proj", 4, null, null],
+      "layers.5.mlp.down_proj": ["down_proj", 5, null, null],
+      "layers.5.mlp.gate_up_proj": ["gate_up_proj", 5, null, null],
+      "layers.5.self_attn.o_proj": ["o_proj", 5, null, null],
+      "layers.5.self_attn.qkv_proj": ["qkv_proj", 5, null, null],
+      "layers.6.mlp.down_proj": ["down_proj", 6, null, null],
+      "layers.6.mlp.gate_up_proj": ["gate_up_proj", 6, null, null],
+      "layers.6.self_attn.o_proj": ["o_proj", 6, null, null],
+      "layers.6.self_attn.qkv_proj": ["qkv_proj", 6, null, null],
+      "layers.7.mlp.down_proj": ["down_proj", 7, null, null],
+      "layers.7.mlp.gate_up_proj": ["gate_up_proj", 7, null, null],
+      "layers.7.self_attn.o_proj": ["o_proj", 7, null, null],
+      "layers.7.self_attn.qkv_proj": ["qkv_proj", 7, null, null],
+      "layers.8.mlp.down_proj": ["down_proj", 8, null, null],
+      "layers.8.mlp.gate_up_proj": ["gate_up_proj", 8, null, null],
+      "layers.8.self_attn.o_proj": ["o_proj", 8, null, null],
+      "layers.8.self_attn.qkv_proj": ["qkv_proj", 8, null, null],
+      "layers.9.mlp.down_proj": ["down_proj", 9, null, null],
+      "layers.9.mlp.gate_up_proj": ["gate_up_proj", 9, null, null],
+      "layers.9.self_attn.o_proj": ["o_proj", 9, null, null],
+      "layers.9.self_attn.qkv_proj": ["qkv_proj", 9, null, null],
+      "lm_head": ["lm_head", 0, null, null]
+     },
+     "ignore": [],
+     "prefix": "model.",
+     "remap": "_checkpoint_name",
+     "root_path": "model",
+     "stacked_params": [],
+     "unservable": {}
+    }
+   },
+   "nodes": ["LLM"],
+   "num_layers": 32,
+   "placed": {
+    "embed_tokens": ["embed_tokens", 0, null, null],
+    "layers.0.mlp.down_proj": ["down_proj", 0, null, null],
+    "layers.0.mlp.gate_up_proj": ["gate_up_proj", 0, null, null],
+    "layers.0.self_attn.o_proj": ["o_proj", 0, null, null],
+    "layers.0.self_attn.qkv_proj": ["qkv_proj", 0, null, null],
+    "lm_head": ["lm_head", 0, null, null],
+    "model.embed_tokens": ["embed_tokens", 0, null, null],
+    "model.layers.0.mlp.down_proj": ["down_proj", 0, null, null],
+    "model.layers.0.mlp.gate_up_proj": ["gate_up_proj", 0, null, null],
+    "model.layers.0.self_attn.o_proj": ["o_proj", 0, null, null],
+    "model.layers.0.self_attn.qkv_proj": ["qkv_proj", 0, null, null],
+    "model.lm_head": ["lm_head", 0, null, null]
+   },
+   "pools": {
+    "LLM": {
+     "dropped_targets": [],
+     "ignored": [],
+     "resource_key": "lora@LLM",
+     "targets": ["down_proj", "embed_tokens", "gate_up_proj", "lm_head", "o_proj", "qkv_proj"]
+    }
+   },
+   "resource_key": "lora",
+   "targets": {
+    "down_proj": {
+     "expert_split": null,
+     "experts": 1,
+     "in_features": 8192,
+     "kind": "linear",
+     "layers": null,
+     "node": null,
+     "out_slices": [3072],
+     "parallel": "row",
+     "per_segment": false,
+     "slice_align": null,
+     "slice_names": [],
+     "slice_packs": null,
+     "slice_units": null,
+     "token_fold": 1
+    },
+    "embed_tokens": {
+     "expert_split": null,
+     "experts": 1,
+     "in_features": 200064,
+     "kind": "embedding",
+     "layers": [0],
+     "node": null,
+     "out_slices": [3072],
+     "parallel": "none",
+     "per_segment": false,
+     "slice_align": null,
+     "slice_names": [],
+     "slice_packs": null,
+     "slice_units": null,
+     "token_fold": 1
+    },
+    "gate_up_proj": {
+     "expert_split": null,
+     "experts": 1,
+     "in_features": 3072,
+     "kind": "linear",
+     "layers": null,
+     "node": null,
+     "out_slices": [8192, 8192],
+     "parallel": "column",
+     "per_segment": false,
+     "slice_align": null,
+     "slice_names": [0, 1],
+     "slice_packs": [
+      [
+       null,
+       [0, 1]
+      ]
+     ],
+     "slice_units": null,
+     "token_fold": 1
+    },
+    "lm_head": {
+     "expert_split": null,
+     "experts": 1,
+     "in_features": 3072,
+     "kind": "linear",
+     "layers": [0],
+     "node": null,
+     "out_slices": [200064],
+     "parallel": "column",
+     "per_segment": true,
+     "slice_align": null,
+     "slice_names": [],
+     "slice_packs": null,
+     "slice_units": null,
+     "token_fold": 1
+    },
+    "o_proj": {
+     "expert_split": null,
+     "experts": 1,
+     "in_features": 3072,
+     "kind": "linear",
+     "layers": null,
+     "node": null,
+     "out_slices": [3072],
+     "parallel": "row",
+     "per_segment": false,
+     "slice_align": null,
+     "slice_names": [],
+     "slice_packs": null,
+     "slice_units": null,
+     "token_fold": 1
+    },
+    "qkv_proj": {
+     "expert_split": null,
+     "experts": 1,
+     "in_features": 3072,
+     "kind": "linear",
+     "layers": null,
+     "node": null,
+     "out_slices": [3072, 1024, 1024],
+     "parallel": "column",
+     "per_segment": false,
+     "slice_align": null,
+     "slice_names": ["q", "k", "v"],
+     "slice_packs": [
+      [
+       null,
+       ["q", "k", "v"]
+      ]
+     ],
+     "slice_units": [24, 8, 8],
+     "token_fold": 1
+    }
+   }
+  },
+  "qwen3_5": {
+   "adapters": {},
+   "dropped_targets": {},
+   "lora_last": true,
+   "module_maps": {
+    "LLM": {
+     "adapter_roots": [
+      ["model.language_model.", "model.language_model."],
+      ["language_model.", "model.language_model."],
+      ["model.", "model.language_model."],
+      ["", "model.language_model."]
+     ],
+     "aliases": {
+      "model.language_model.unembed_tokens": "lm_head"
+     },
+     "bindings": {
+      "lm_head": ["lm_head", 0, null, null],
+      "model.embed_tokens": ["embed_tokens", 0, null, null],
+      "model.layers.0.mlp.down_proj": ["down_proj", 0, null, null],
+      "model.layers.0.mlp.gate_up_proj": ["gate_up_proj", 0, null, null],
+      "model.layers.0.self_attn.in_proj_fused": ["in_proj_fused", 0, null, null],
+      "model.layers.0.self_attn.out_proj": ["out_proj", 0, null, null],
+      "model.layers.1.mlp.down_proj": ["down_proj", 1, null, null],
+      "model.layers.1.mlp.gate_up_proj": ["gate_up_proj", 1, null, null],
+      "model.layers.1.self_attn.o_proj": ["o_proj", 1, null, null],
+      "model.layers.1.self_attn.qkv_proj": ["qkv_proj", 1, null, null],
+      "model.layers.2.mlp.down_proj": ["down_proj", 2, null, null],
+      "model.layers.2.mlp.gate_up_proj": ["gate_up_proj", 2, null, null],
+      "model.layers.2.self_attn.in_proj_fused": ["in_proj_fused", 2, null, null],
+      "model.layers.2.self_attn.out_proj": ["out_proj", 2, null, null],
+      "model.layers.3.mlp.down_proj": ["down_proj", 3, null, null],
+      "model.layers.3.mlp.gate_up_proj": ["gate_up_proj", 3, null, null],
+      "model.layers.3.self_attn.o_proj": ["o_proj", 3, null, null],
+      "model.layers.3.self_attn.qkv_proj": ["qkv_proj", 3, null, null]
+     },
+     "ignore": ["mtp.*", "model.mtp.*"],
+     "prefix": "",
+     "remap": "qwen3_5_name_remapper",
+     "root_path": "model",
+     "stacked_params": [
+      {
+       "shard_id": "q",
+       "source_suffix": ".q_proj",
+       "target_suffix": ".qkv_proj"
+      },
+      {
+       "shard_id": "k",
+       "source_suffix": ".k_proj",
+       "target_suffix": ".qkv_proj"
+      },
+      {
+       "shard_id": "v",
+       "source_suffix": ".v_proj",
+       "target_suffix": ".qkv_proj"
+      },
+      {
+       "shard_id": 0,
+       "source_suffix": ".gate_proj",
+       "target_suffix": ".gate_up_proj"
+      },
+      {
+       "shard_id": 1,
+       "source_suffix": ".up_proj",
+       "target_suffix": ".gate_up_proj"
+      },
+      {
+       "shard_id": "qkv",
+       "source_suffix": ".in_proj_qkv",
+       "target_suffix": ".in_proj_fused"
+      },
+      {
+       "shard_id": "z",
+       "source_suffix": ".in_proj_z",
+       "target_suffix": ".in_proj_fused"
+      },
+      {
+       "shard_id": "a",
+       "source_suffix": ".in_proj_a",
+       "target_suffix": ".in_proj_fused"
+      },
+      {
+       "shard_id": "b",
+       "source_suffix": ".in_proj_b",
+       "target_suffix": ".in_proj_fused"
+      },
+      {
+       "shard_id": "q",
+       "source_suffix": ".in_proj_q.",
+       "target_suffix": ".in_proj_fused."
+      },
+      {
+       "shard_id": "k",
+       "source_suffix": ".in_proj_k.",
+       "target_suffix": ".in_proj_fused."
+      },
+      {
+       "shard_id": "v",
+       "source_suffix": ".in_proj_v.",
+       "target_suffix": ".in_proj_fused."
+      }
+     ],
+     "unservable": {
+      "model.layers.0.self_attn.conv1d": "Conv1d with kernel (4,), stride (1,), groups 128: only a patch projection (kernel == stride, no padding, groups 1) is a linear per row",
+      "model.layers.2.self_attn.conv1d": "Conv1d with kernel (4,), stride (1,), groups 128: only a patch projection (kernel == stride, no padding, groups 1) is a linear per row"
+     }
+    },
+    "vision_encoder": {
+     "adapter_roots": [
+      ["model.visual.", "model.visual."],
+      ["visual.", "model.visual."]
+     ],
+     "aliases": {},
+     "bindings": {
+      "blocks.0.attn.proj": ["attn_proj", 0, null, null],
+      "blocks.0.attn.qkv": ["qkv", 0, null, null],
+      "blocks.0.mlp.linear_fc1": ["mlp_linear_fc1", 0, null, null],
+      "blocks.0.mlp.linear_fc2": ["mlp_linear_fc2", 0, null, null],
+      "blocks.1.attn.proj": ["attn_proj", 1, null, null],
+      "blocks.1.attn.qkv": ["qkv", 1, null, null],
+      "blocks.1.mlp.linear_fc1": ["mlp_linear_fc1", 1, null, null],
+      "blocks.1.mlp.linear_fc2": ["mlp_linear_fc2", 1, null, null],
+      "merger.linear_fc1": ["merger_linear_fc1", 0, null, null],
+      "merger.linear_fc2": ["merger_linear_fc2", 0, null, null],
+      "patch_embed.proj": ["patch_embed_proj", 0, null, null]
+     },
+     "ignore": [],
+     "prefix": "",
+     "remap": "qwen3_5_vision_name_remapper",
+     "root_path": "model",
+     "stacked_params": [],
+     "unservable": {
+      "pos_embed": "nn.Embedding: a lookup whose rows need not be the step's tokens (positions, codebooks); token embeddings take LoRA as VocabParallelEmbedding"
+     }
+    }
+   },
+   "nodes": ["LLM", "vision_encoder"],
+   "num_layers": 4,
+   "placed": {
+    "blocks.0.attn.proj": null,
+    "blocks.0.attn.qkv": null,
+    "blocks.0.mlp.linear_fc1": null,
+    "blocks.0.mlp.linear_fc2": null,
+    "language_model.lm_head": null,
+    "language_model.model.embed_tokens": null,
+    "language_model.model.layers.0.mlp.down_proj": null,
+    "language_model.model.layers.0.mlp.gate_up_proj": null,
+    "language_model.model.layers.0.self_attn.in_proj_fused": null,
+    "language_model.model.layers.0.self_attn.out_proj": null,
+    "language_model.model.layers.1.self_attn.o_proj": null,
+    "language_model.model.layers.1.self_attn.qkv_proj": null,
+    "lm_head": ["lm_head", 0, null, null],
+    "merger.linear_fc1": null,
+    "merger.linear_fc2": null,
+    "model.embed_tokens": ["embed_tokens", 0, null, null],
+    "model.language_model.lm_head": null,
+    "model.language_model.model.embed_tokens": null,
+    "model.language_model.model.layers.0.mlp.down_proj": null,
+    "model.language_model.model.layers.0.mlp.gate_up_proj": null,
+    "model.language_model.model.layers.0.self_attn.in_proj_fused": null,
+    "model.language_model.model.layers.0.self_attn.out_proj": null,
+    "model.language_model.model.layers.1.self_attn.o_proj": null,
+    "model.language_model.model.layers.1.self_attn.qkv_proj": null,
+    "model.language_model.unembed_tokens": ["lm_head", 0, null, null],
+    "model.layers.0.mlp.down_proj": ["down_proj", 0, null, null],
+    "model.layers.0.mlp.gate_up_proj": ["gate_up_proj", 0, null, null],
+    "model.layers.0.self_attn.in_proj_fused": ["in_proj_fused", 0, null, null],
+    "model.layers.0.self_attn.out_proj": ["out_proj", 0, null, null],
+    "model.layers.1.self_attn.o_proj": ["o_proj", 1, null, null],
+    "model.layers.1.self_attn.qkv_proj": ["qkv_proj", 1, null, null],
+    "model.lm_head": null,
+    "model.model.embed_tokens": null,
+    "model.model.layers.0.mlp.down_proj": null,
+    "model.model.layers.0.mlp.gate_up_proj": null,
+    "model.model.layers.0.self_attn.in_proj_fused": null,
+    "model.model.layers.0.self_attn.out_proj": null,
+    "model.model.layers.1.self_attn.o_proj": null,
+    "model.model.layers.1.self_attn.qkv_proj": null,
+    "model.visual.blocks.0.attn.proj": ["attn_proj", 0, null, null],
+    "model.visual.blocks.0.attn.qkv": ["qkv", 0, null, null],
+    "model.visual.blocks.0.mlp.linear_fc1": ["mlp_linear_fc1", 0, null, null],
+    "model.visual.blocks.0.mlp.linear_fc2": ["mlp_linear_fc2", 0, null, null],
+    "model.visual.merger.linear_fc1": ["merger_linear_fc1", 0, null, null],
+    "model.visual.merger.linear_fc2": ["merger_linear_fc2", 0, null, null],
+    "model.visual.patch_embed.proj": ["patch_embed_proj", 0, null, null],
+    "patch_embed.proj": null,
+    "visual.blocks.0.attn.proj": ["attn_proj", 0, null, null],
+    "visual.blocks.0.attn.qkv": ["qkv", 0, null, null],
+    "visual.blocks.0.mlp.linear_fc1": ["mlp_linear_fc1", 0, null, null],
+    "visual.blocks.0.mlp.linear_fc2": ["mlp_linear_fc2", 0, null, null],
+    "visual.merger.linear_fc1": ["merger_linear_fc1", 0, null, null],
+    "visual.merger.linear_fc2": ["merger_linear_fc2", 0, null, null],
+    "visual.patch_embed.proj": ["patch_embed_proj", 0, null, null]
+   },
+   "pools": {
+    "LLM": {
+     "dropped_targets": [],
+     "ignored": ["model.visual.blocks.0.attn.proj", "model.visual.blocks.0.attn.qkv", "model.visual.blocks.0.mlp.linear_fc1", "model.visual.blocks.0.mlp.linear_fc2", "model.visual.merger.linear_fc1", "model.visual.merger.linear_fc2", "model.visual.patch_embed.proj", "visual.blocks.0.attn.proj", "visual.blocks.0.attn.qkv", "visual.blocks.0.mlp.linear_fc1", "visual.blocks.0.mlp.linear_fc2", "visual.merger.linear_fc1", "visual.merger.linear_fc2", "visual.patch_embed.proj"],
+     "resource_key": "lora@LLM",
+     "targets": ["down_proj", "embed_tokens", "gate_up_proj", "in_proj_fused", "lm_head", "o_proj", "out_proj", "qkv_proj"]
+    },
+    "vision_encoder": {
+     "dropped_targets": [],
+     "ignored": ["lm_head", "model.embed_tokens", "model.language_model.unembed_tokens", "model.layers.0.mlp.down_proj", "model.layers.0.mlp.gate_up_proj", "model.layers.0.self_attn.in_proj_fused", "model.layers.0.self_attn.out_proj", "model.layers.1.self_attn.o_proj", "model.layers.1.self_attn.qkv_proj"],
+     "resource_key": "lora@vision_encoder",
+     "targets": ["attn_proj", "merger_linear_fc1", "merger_linear_fc2", "mlp_linear_fc1", "mlp_linear_fc2", "patch_embed_proj", "qkv"]
+    }
+   },
+   "resource_key": "lora",
+   "targets": {
+    "attn_proj": {
+     "expert_split": null,
+     "experts": 1,
+     "in_features": 8,
+     "kind": "linear",
+     "layers": [0, 1],
+     "node": "vision_encoder",
+     "out_slices": [8],
+     "parallel": "none",
+     "per_segment": false,
+     "slice_align": null,
+     "slice_names": [],
+     "slice_packs": null,
+     "slice_units": null,
+     "token_fold": 1
+    },
+    "down_proj": {
+     "expert_split": null,
+     "experts": 1,
+     "in_features": 48,
+     "kind": "linear",
+     "layers": [0, 1, 2, 3],
+     "node": "LLM",
+     "out_slices": [32],
+     "parallel": "row",
+     "per_segment": false,
+     "slice_align": null,
+     "slice_names": [],
+     "slice_packs": null,
+     "slice_units": null,
+     "token_fold": 1
+    },
+    "embed_tokens": {
+     "expert_split": null,
+     "experts": 1,
+     "in_features": 64,
+     "kind": "embedding",
+     "layers": [0],
+     "node": "LLM",
+     "out_slices": [32],
+     "parallel": "none",
+     "per_segment": false,
+     "slice_align": null,
+     "slice_names": [],
+     "slice_packs": null,
+     "slice_units": null,
+     "token_fold": 1
+    },
+    "gate_up_proj": {
+     "expert_split": null,
+     "experts": 1,
+     "in_features": 32,
+     "kind": "linear",
+     "layers": [0, 1, 2, 3],
+     "node": "LLM",
+     "out_slices": [48, 48],
+     "parallel": "column",
+     "per_segment": false,
+     "slice_align": null,
+     "slice_names": [0, 1],
+     "slice_packs": [
+      [
+       null,
+       [0, 1]
+      ]
+     ],
+     "slice_units": null,
+     "token_fold": 1
+    },
+    "in_proj_fused": {
+     "expert_split": null,
+     "experts": 1,
+     "in_features": 32,
+     "kind": "linear",
+     "layers": [0, 2],
+     "node": "LLM",
+     "out_slices": [32, 32, 64, 64, 8, 8],
+     "parallel": "column",
+     "per_segment": false,
+     "slice_align": [1, 1, 1, 1, 16, 1],
+     "slice_names": ["q", "k", "v", "z", "a", "b"],
+     "slice_packs": [
+      [
+       "qkv",
+       ["q", "k", "v"]
+      ]
+     ],
+     "slice_units": null,
+     "token_fold": 1
+    },
+    "lm_head": {
+     "expert_split": null,
+     "experts": 1,
+     "in_features": 32,
+     "kind": "linear",
+     "layers": [0],
+     "node": "LLM",
+     "out_slices": [64],
+     "parallel": "column",
+     "per_segment": true,
+     "slice_align": null,
+     "slice_names": [],
+     "slice_packs": null,
+     "slice_units": null,
+     "token_fold": 1
+    },
+    "merger_linear_fc1": {
+     "expert_split": null,
+     "experts": 1,
+     "in_features": 32,
+     "kind": "linear",
+     "layers": [0],
+     "node": "vision_encoder",
+     "out_slices": [32],
+     "parallel": "none",
+     "per_segment": false,
+     "slice_align": null,
+     "slice_names": [],
+     "slice_packs": null,
+     "slice_units": null,
+     "token_fold": 4
+    },
+    "merger_linear_fc2": {
+     "expert_split": null,
+     "experts": 1,
+     "in_features": 32,
+     "kind": "linear",
+     "layers": [0],
+     "node": "vision_encoder",
+     "out_slices": [32],
+     "parallel": "none",
+     "per_segment": false,
+     "slice_align": null,
+     "slice_names": [],
+     "slice_packs": null,
+     "slice_units": null,
+     "token_fold": 4
+    },
+    "mlp_linear_fc1": {
+     "expert_split": null,
+     "experts": 1,
+     "in_features": 8,
+     "kind": "linear",
+     "layers": [0, 1],
+     "node": "vision_encoder",
+     "out_slices": [16],
+     "parallel": "none",
+     "per_segment": false,
+     "slice_align": null,
+     "slice_names": [],
+     "slice_packs": null,
+     "slice_units": null,
+     "token_fold": 1
+    },
+    "mlp_linear_fc2": {
+     "expert_split": null,
+     "experts": 1,
+     "in_features": 16,
+     "kind": "linear",
+     "layers": [0, 1],
+     "node": "vision_encoder",
+     "out_slices": [8],
+     "parallel": "none",
+     "per_segment": false,
+     "slice_align": null,
+     "slice_names": [],
+     "slice_packs": null,
+     "slice_units": null,
+     "token_fold": 1
+    },
+    "o_proj": {
+     "expert_split": null,
+     "experts": 1,
+     "in_features": 32,
+     "kind": "linear",
+     "layers": [1, 3],
+     "node": "LLM",
+     "out_slices": [32],
+     "parallel": "row",
+     "per_segment": false,
+     "slice_align": null,
+     "slice_names": [],
+     "slice_packs": null,
+     "slice_units": null,
+     "token_fold": 1
+    },
+    "out_proj": {
+     "expert_split": null,
+     "experts": 1,
+     "in_features": 64,
+     "kind": "linear",
+     "layers": [0, 2],
+     "node": "LLM",
+     "out_slices": [32],
+     "parallel": "row",
+     "per_segment": false,
+     "slice_align": null,
+     "slice_names": [],
+     "slice_packs": null,
+     "slice_units": null,
+     "token_fold": 1
+    },
+    "patch_embed_proj": {
+     "expert_split": null,
+     "experts": 1,
+     "in_features": 24,
+     "kind": "linear",
+     "layers": [0],
+     "node": "vision_encoder",
+     "out_slices": [8],
+     "parallel": "none",
+     "per_segment": false,
+     "slice_align": null,
+     "slice_names": [],
+     "slice_packs": null,
+     "slice_units": null,
+     "token_fold": 1
+    },
+    "qkv": {
+     "expert_split": null,
+     "experts": 1,
+     "in_features": 8,
+     "kind": "linear",
+     "layers": [0, 1],
+     "node": "vision_encoder",
+     "out_slices": [8, 8, 8],
+     "parallel": "none",
+     "per_segment": false,
+     "slice_align": null,
+     "slice_names": ["q", "k", "v"],
+     "slice_packs": [
+      [
+       null,
+       ["q", "k", "v"]
+      ]
+     ],
+     "slice_units": null,
+     "token_fold": 1
+    },
+    "qkv_proj": {
+     "expert_split": null,
+     "experts": 1,
+     "in_features": 32,
+     "kind": "linear",
+     "layers": [1, 3],
+     "node": "LLM",
+     "out_slices": [64, 16, 16],
+     "parallel": "column",
+     "per_segment": false,
+     "slice_align": null,
+     "slice_names": ["q", "k", "v"],
+     "slice_packs": [
+      [
+       null,
+       ["q", "k", "v"]
+      ]
+     ],
+     "slice_units": [8, 2, 2],
+     "token_fold": 1
+    }
+   }
+  },
+  "qwen3_omni": {
+   "adapters": {},
+   "dropped_targets": {
+    "experts_down_proj": {
+     "expert_split": null,
+     "experts": 4,
+     "in_features": 8,
+     "kind": "linear",
+     "layers": [0, 2],
+     "node": null,
+     "out_slices": [16],
+     "parallel": "row",
+     "per_segment": false,
+     "slice_align": null,
+     "slice_names": ["down"],
+     "slice_packs": null,
+     "slice_units": null,
+     "token_fold": 1
+    },
+    "experts_gate_up_proj": {
+     "expert_split": null,
+     "experts": 4,
+     "in_features": 16,
+     "kind": "linear",
+     "layers": [0, 2],
+     "node": null,
+     "out_slices": [8, 8],
+     "parallel": "column",
+     "per_segment": false,
+     "slice_align": null,
+     "slice_names": ["gate", "up"],
+     "slice_packs": null,
+     "slice_units": null,
+     "token_fold": 1
+    }
+   },
+   "lora_last": true,
+   "module_maps": {
+    "Thinker": {
+     "adapter_roots": [
+      ["thinker.", "thinker."],
+      ["", "thinker."]
+     ],
+     "aliases": {},
+     "bindings": {
+      "lm_head": ["lm_head", 0, null, null],
+      "model.layers.0.mlp.experts.down_proj": ["experts_down_proj", 0, null, "down_proj"],
+      "model.layers.0.mlp.experts.gate_up_proj": ["experts_gate_up_proj", 0, null, "gate_up_proj"],
+      "model.layers.0.self_attn.o_proj": ["o_proj", 0, null, null],
+      "model.layers.0.self_attn.qkv_proj": ["qkv_proj", 0, null, null],
+      "model.layers.1.mlp.down_proj": ["down_proj", 1, null, null],
+      "model.layers.1.mlp.gate_up_proj": ["gate_up_proj", 1, null, null],
+      "model.layers.1.self_attn.o_proj": ["o_proj", 1, null, null],
+      "model.layers.1.self_attn.qkv_proj": ["qkv_proj", 1, null, null],
+      "model.layers.2.mlp.experts.down_proj": ["experts_down_proj", 2, null, "down_proj"],
+      "model.layers.2.mlp.experts.gate_up_proj": ["experts_gate_up_proj", 2, null, "gate_up_proj"],
+      "model.layers.2.self_attn.o_proj": ["o_proj", 2, null, null],
+      "model.layers.2.self_attn.qkv_proj": ["qkv_proj", 2, null, null]
+     },
+     "ignore": [],
+     "prefix": "thinker.",
+     "remap": "thinker_remap",
+     "root_path": "model",
+     "stacked_params": [
+      {
+       "shard_id": "gate:0",
+       "source_suffix": ".experts.gate_proj.__expert0__.weight",
+       "target_suffix": ".experts.gate_up_proj"
+      },
+      {
+       "shard_id": "up:0",
+       "source_suffix": ".experts.up_proj.__expert0__.weight",
+       "target_suffix": ".experts.gate_up_proj"
+      },
+      {
+       "shard_id": "down:0",
+       "source_suffix": ".experts.down_proj.__expert0__.weight",
+       "target_suffix": ".experts.down_proj"
+      },
+      {
+       "shard_id": "gate:1",
+       "source_suffix": ".experts.gate_proj.__expert1__.weight",
+       "target_suffix": ".experts.gate_up_proj"
+      },
+      {
+       "shard_id": "up:1",
+       "source_suffix": ".experts.up_proj.__expert1__.weight",
+       "target_suffix": ".experts.gate_up_proj"
+      },
+      {
+       "shard_id": "down:1",
+       "source_suffix": ".experts.down_proj.__expert1__.weight",
+       "target_suffix": ".experts.down_proj"
+      },
+      {
+       "shard_id": "gate:2",
+       "source_suffix": ".experts.gate_proj.__expert2__.weight",
+       "target_suffix": ".experts.gate_up_proj"
+      },
+      {
+       "shard_id": "up:2",
+       "source_suffix": ".experts.up_proj.__expert2__.weight",
+       "target_suffix": ".experts.gate_up_proj"
+      },
+      {
+       "shard_id": "down:2",
+       "source_suffix": ".experts.down_proj.__expert2__.weight",
+       "target_suffix": ".experts.down_proj"
+      },
+      {
+       "shard_id": "gate:3",
+       "source_suffix": ".experts.gate_proj.__expert3__.weight",
+       "target_suffix": ".experts.gate_up_proj"
+      },
+      {
+       "shard_id": "up:3",
+       "source_suffix": ".experts.up_proj.__expert3__.weight",
+       "target_suffix": ".experts.gate_up_proj"
+      },
+      {
+       "shard_id": "down:3",
+       "source_suffix": ".experts.down_proj.__expert3__.weight",
+       "target_suffix": ".experts.down_proj"
+      },
+      {
+       "shard_id": 0,
+       "source_suffix": ".gate_proj",
+       "target_suffix": ".gate_up_proj"
+      },
+      {
+       "shard_id": 1,
+       "source_suffix": ".up_proj",
+       "target_suffix": ".gate_up_proj"
+      },
+      {
+       "shard_id": "q",
+       "source_suffix": ".q_proj",
+       "target_suffix": ".qkv_proj"
+      },
+      {
+       "shard_id": "k",
+       "source_suffix": ".k_proj",
+       "target_suffix": ".qkv_proj"
+      },
+      {
+       "shard_id": "v",
+       "source_suffix": ".v_proj",
+       "target_suffix": ".qkv_proj"
+      }
+     ],
+     "unservable": {
+      "model.embed_tokens": "nn.Embedding: a lookup whose rows need not be the step's tokens (positions, codebooks); token embeddings take LoRA as VocabParallelEmbedding",
+      "model.layers.0.mlp.gate": "TopKRouter holds weight matrices but is not a LoRA-capable linear",
+      "model.layers.2.mlp.gate": "TopKRouter holds weight matrices but is not a LoRA-capable linear"
+     }
+    }
+   },
+   "nodes": ["Thinker"],
+   "num_layers": 3,
+   "placed": {
+    "lm_head": ["lm_head", 0, null, null],
+    "model.layers.0.mlp.experts.down_proj": ["experts_down_proj", 0, null, "down_proj"],
+    "model.layers.0.mlp.experts.gate_up_proj": ["experts_gate_up_proj", 0, null, "gate_up_proj"],
+    "model.layers.0.self_attn.o_proj": ["o_proj", 0, null, null],
+    "model.layers.0.self_attn.qkv_proj": ["qkv_proj", 0, null, null],
+    "model.layers.1.mlp.down_proj": ["down_proj", 1, null, null],
+    "model.layers.1.mlp.gate_up_proj": ["gate_up_proj", 1, null, null],
+    "thinker.lm_head": ["lm_head", 0, null, null],
+    "thinker.model.layers.0.mlp.experts.down_proj": ["experts_down_proj", 0, null, "down_proj"],
+    "thinker.model.layers.0.mlp.experts.gate_up_proj": ["experts_gate_up_proj", 0, null, "gate_up_proj"],
+    "thinker.model.layers.0.self_attn.o_proj": ["o_proj", 0, null, null],
+    "thinker.model.layers.0.self_attn.qkv_proj": ["qkv_proj", 0, null, null],
+    "thinker.model.layers.1.mlp.down_proj": ["down_proj", 1, null, null],
+    "thinker.model.layers.1.mlp.gate_up_proj": ["gate_up_proj", 1, null, null]
+   },
+   "pools": {
+    "Thinker": {
+     "dropped_targets": ["experts_down_proj", "experts_gate_up_proj"],
+     "ignored": [],
+     "resource_key": "lora@Thinker",
+     "targets": ["down_proj", "gate_up_proj", "lm_head", "o_proj", "qkv_proj"]
+    }
+   },
+   "resource_key": "lora",
+   "targets": {
+    "down_proj": {
+     "expert_split": null,
+     "experts": 1,
+     "in_features": 32,
+     "kind": "linear",
+     "layers": [1],
+     "node": null,
+     "out_slices": [16],
+     "parallel": "row",
+     "per_segment": false,
+     "slice_align": null,
+     "slice_names": [],
+     "slice_packs": null,
+     "slice_units": null,
+     "token_fold": 1
+    },
+    "gate_up_proj": {
+     "expert_split": null,
+     "experts": 1,
+     "in_features": 16,
+     "kind": "linear",
+     "layers": [1],
+     "node": null,
+     "out_slices": [32, 32],
+     "parallel": "column",
+     "per_segment": false,
+     "slice_align": null,
+     "slice_names": [0, 1],
+     "slice_packs": [
+      [
+       null,
+       [0, 1]
+      ]
+     ],
+     "slice_units": null,
+     "token_fold": 1
+    },
+    "lm_head": {
+     "expert_split": null,
+     "experts": 1,
+     "in_features": 16,
+     "kind": "linear",
+     "layers": [0],
+     "node": null,
+     "out_slices": [64],
+     "parallel": "none",
+     "per_segment": true,
+     "slice_align": null,
+     "slice_names": [],
+     "slice_packs": null,
+     "slice_units": null,
+     "token_fold": 1
+    },
+    "o_proj": {
+     "expert_split": null,
+     "experts": 1,
+     "in_features": 16,
+     "kind": "linear",
+     "layers": null,
+     "node": null,
+     "out_slices": [16],
+     "parallel": "row",
+     "per_segment": false,
+     "slice_align": null,
+     "slice_names": [],
+     "slice_packs": null,
+     "slice_units": null,
+     "token_fold": 1
+    },
+    "qkv_proj": {
+     "expert_split": null,
+     "experts": 1,
+     "in_features": 16,
+     "kind": "linear",
+     "layers": null,
+     "node": null,
+     "out_slices": [16, 8, 8],
+     "parallel": "column",
+     "per_segment": false,
+     "slice_align": null,
+     "slice_names": ["q", "k", "v"],
+     "slice_packs": [
+      [
+       null,
+       ["q", "k", "v"]
+      ]
+     ],
+     "slice_units": [4, 2, 2],
+     "token_fold": 1
+    }
+   }
+  },
+  "qwen3_tts": {
+   "adapters": {},
+   "dropped_targets": {},
+   "lora_last": true,
+   "module_maps": {
+    "Talker": {
+     "adapter_roots": [
+      ["talker.", "talker."],
+      ["", "talker."]
+     ],
+     "aliases": {},
+     "bindings": {
+      "codec_head": ["codec_head", 0, null, null],
+      "model.layers.0.mlp.down_proj": ["down_proj", 0, null, null],
+      "model.layers.0.mlp.gate_up_proj": ["gate_up_proj", 0, null, null],
+      "model.layers.0.self_attn.o_proj": ["o_proj", 0, null, null],
+      "model.layers.0.self_attn.qkv_proj": ["qkv_proj", 0, null, null],
+      "model.layers.1.mlp.down_proj": ["down_proj", 1, null, null],
+      "model.layers.1.mlp.gate_up_proj": ["gate_up_proj", 1, null, null],
+      "model.layers.1.self_attn.o_proj": ["o_proj", 1, null, null],
+      "model.layers.1.self_attn.qkv_proj": ["qkv_proj", 1, null, null]
+     },
+     "ignore": [],
+     "prefix": "talker.",
+     "remap": "_not_code_predictor",
+     "root_path": "model",
+     "stacked_params": [
+      {
+       "shard_id": "q",
+       "source_suffix": ".q_proj",
+       "target_suffix": ".qkv_proj"
+      },
+      {
+       "shard_id": "k",
+       "source_suffix": ".k_proj",
+       "target_suffix": ".qkv_proj"
+      },
+      {
+       "shard_id": "v",
+       "source_suffix": ".v_proj",
+       "target_suffix": ".qkv_proj"
+      },
+      {
+       "shard_id": 0,
+       "source_suffix": ".gate_proj",
+       "target_suffix": ".gate_up_proj"
+      },
+      {
+       "shard_id": 1,
+       "source_suffix": ".up_proj",
+       "target_suffix": ".gate_up_proj"
+      }
+     ],
+     "unservable": {
+      "model.codec_embedding": "nn.Embedding: a lookup whose rows need not be the step's tokens (positions, codebooks); token embeddings take LoRA as VocabParallelEmbedding",
+      "model.text_embedding": "nn.Embedding: a lookup whose rows need not be the step's tokens (positions, codebooks); token embeddings take LoRA as VocabParallelEmbedding",
+      "text_projection.linear_fc1": "the prefill projects it in prepare_inputs, outside the planned step",
+      "text_projection.linear_fc2": "the prefill projects it in prepare_inputs, outside the planned step"
+     }
+    }
+   },
+   "nodes": ["Talker"],
+   "num_layers": 2,
+   "placed": {
+    "codec_head": ["codec_head", 0, null, null],
+    "model.layers.0.mlp.down_proj": ["down_proj", 0, null, null],
+    "model.layers.0.mlp.gate_up_proj": ["gate_up_proj", 0, null, null],
+    "model.layers.0.self_attn.o_proj": ["o_proj", 0, null, null],
+    "model.layers.0.self_attn.qkv_proj": ["qkv_proj", 0, null, null],
+    "talker.codec_head": ["codec_head", 0, null, null],
+    "talker.model.layers.0.mlp.down_proj": ["down_proj", 0, null, null],
+    "talker.model.layers.0.mlp.gate_up_proj": ["gate_up_proj", 0, null, null],
+    "talker.model.layers.0.self_attn.o_proj": ["o_proj", 0, null, null],
+    "talker.model.layers.0.self_attn.qkv_proj": ["qkv_proj", 0, null, null]
+   },
+   "pools": {
+    "Talker": {
+     "dropped_targets": [],
+     "ignored": [],
+     "resource_key": "lora@Talker",
+     "targets": ["codec_head", "down_proj", "gate_up_proj", "o_proj", "qkv_proj"]
+    }
+   },
+   "resource_key": "lora",
+   "targets": {
+    "codec_head": {
+     "expert_split": null,
+     "experts": 1,
+     "in_features": 16,
+     "kind": "linear",
+     "layers": [0],
+     "node": null,
+     "out_slices": [64],
+     "parallel": "none",
+     "per_segment": true,
+     "slice_align": null,
+     "slice_names": [],
+     "slice_packs": null,
+     "slice_units": null,
+     "token_fold": 1
+    },
+    "down_proj": {
+     "expert_split": null,
+     "experts": 1,
+     "in_features": 32,
+     "kind": "linear",
+     "layers": null,
+     "node": null,
+     "out_slices": [16],
+     "parallel": "row",
+     "per_segment": false,
+     "slice_align": null,
+     "slice_names": [],
+     "slice_packs": null,
+     "slice_units": null,
+     "token_fold": 1
+    },
+    "gate_up_proj": {
+     "expert_split": null,
+     "experts": 1,
+     "in_features": 16,
+     "kind": "linear",
+     "layers": null,
+     "node": null,
+     "out_slices": [32, 32],
+     "parallel": "column",
+     "per_segment": false,
+     "slice_align": null,
+     "slice_names": [0, 1],
+     "slice_packs": [
+      [
+       null,
+       [0, 1]
+      ]
+     ],
+     "slice_units": null,
+     "token_fold": 1
+    },
+    "o_proj": {
+     "expert_split": null,
+     "experts": 1,
+     "in_features": 16,
+     "kind": "linear",
+     "layers": null,
+     "node": null,
+     "out_slices": [16],
+     "parallel": "row",
+     "per_segment": false,
+     "slice_align": null,
+     "slice_names": [],
+     "slice_packs": null,
+     "slice_units": null,
+     "token_fold": 1
+    },
+    "qkv_proj": {
+     "expert_split": null,
+     "experts": 1,
+     "in_features": 16,
+     "kind": "linear",
+     "layers": null,
+     "node": null,
+     "out_slices": [16, 8, 8],
+     "parallel": "column",
+     "per_segment": false,
+     "slice_align": null,
+     "slice_names": ["q", "k", "v"],
+     "slice_packs": [
+      [
+       null,
+       ["q", "k", "v"]
+      ]
+     ],
+     "slice_units": [4, 2, 2],
+     "token_fold": 1
+    }
+   }
+  }
+ }
+}
