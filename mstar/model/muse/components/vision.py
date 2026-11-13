@@ -9,8 +9,8 @@ dim and projects to the LLM's width.
 Every grid-derived index is built on the host, on the CPU (``tower_inputs``),
 so the forward is tensor-in, tensor-out and the worker's main thread never
 waits on the device. The two attention
-layouts are two labels of one ragged attention resource, declared as step
-segments: one per window, and one per frame.
+layouts are two arrays on one ragged resource, each under its own label: a
+segment per window, and one per frame.
 """
 from __future__ import annotations
 
@@ -28,8 +28,8 @@ from mstar.model.components.qwen3_vit import (
 )
 from mstar.model.keys import VISION_ATTN
 from mstar.model.muse.config import (
-    VISION_FULL,
-    VISION_WINDOW,
+    VISION_FRAME_TOKENS,
+    VISION_WINDOW_TOKENS,
     WINDOW_ATTENTION,
     MuseGlimmerVisionConfig,
 )
@@ -153,13 +153,14 @@ class MuseGlimmerVisionModel(nn.Module):
         # the reference keeps the frequencies fp32 and rounds only cos / sin
         self.rotary_emb = VisionRotaryEmbedding(config, keep_fp32=True)
         self.ln_pre = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-        # Qwen3-VL's block, attending within each window or each frame (its
-        # label); the norms' eps is hard-coded in the reference, not `layer_norm_eps`
+        # Qwen3-VL's block, attending within each window or each frame (the
+        # array it adds to); the norms' eps is hard-coded in the reference, not `layer_norm_eps`
         self.layers = nn.ModuleList(
             VisionBlock(
-                config, VISION_ATTN, VISION_WINDOW if kind == WINDOW_ATTENTION else VISION_FULL, eps=1e-5,
+                config, VISION_ATTN, eps=1e-5, layer=i,
+                array=VISION_WINDOW_TOKENS if kind == WINDOW_ATTENTION else VISION_FRAME_TOKENS,
             )
-            for kind in config.layer_types
+            for i, kind in enumerate(config.layer_types)
         )
         self.ln_post = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         merged = config.hidden_size * config.merge_size ** 2
