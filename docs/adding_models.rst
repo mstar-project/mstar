@@ -1078,6 +1078,22 @@ The spec types are:
        ValueError at load. The torch reference's prefill can't be captured
        (``KDAManager.prefill_capturable`` is False), so the resource refuses a prefill
        bucket on it and the model leaves those buckets out.
+   * - ``HostTableSpec(config=HostTableConfig(checkpoint=..., tables=...))``
+     - Tables of fixed-width rows kept in host memory, for a table too large for the device
+       of which a step reads a few rows by id (DeepSeek-V4.1's Engram tables under
+       ``engram_tables: host``). ``tables`` names each table's row count and its parts
+       (``HostTable``, ``HostTablePart``): the checkpoint tensors ``[rows, ...]`` that hold a
+       row, and the bytes a row takes in each. The resource maps those tensors read-only from
+       the checkpoint's safetensors files, so every process that maps them shares one copy
+       through the page cache, and each rank of a TP node reads whole rows with nothing to
+       sum. A step declares ``HostTableStep()``. Inside the forward the model calls
+       ``fetch({table: ids})`` once, for every table the step reads, then ``rows(table)``
+       where it uses them: per part, uint8 ``(*ids.shape, width)`` in the step's own device
+       buffers. ``fetch`` copies the ids to the host, gathers the rows there and copies them
+       back, so it is a host sync inside the forward and waits for the device to produce the
+       ids (for a decode step, for the step before): its steps run eager only, with no
+       captured graphs. An id outside a table raises. A deployment sets ``staging_bytes``
+       and ``prefault`` under ``resources:``.
    * - ``LoraSpec`` (built by ``module_lora_spec``)
      - Per-request LoRA adapters on the node's LoRA-capable linears: a pool of device
        slots, a pinned host tier, and the per-step addressing a LoRA kernel reads.
@@ -3044,6 +3060,11 @@ that a misspelled setting is never silently ignored:
        per rank from which a prefill's selection splits across TP ranks); each a positive
        integer. The defaults (128 MiB, 256 MiB, 64) are what
        ``configs/glm5_next_tp8_longctx.yaml`` serves with.
+   * - ``HostTableSpec``
+     - ``staging_bytes`` (bytes of rows one copy to the device stages, 4 MiB by default; the
+       pinned arena is eight of them), ``prefault`` (``true`` / ``false``, on by default:
+       read and map every page of the tables at startup, without which a row's first read
+       is a page fault, from the disk when the file is not in the page cache).
    * - ``LoraSpec``
      - ``max_slots`` (adapters resident on the device at once, beside the zero adapter),
        ``max_rank`` (the largest rank served; slots are sized to it), ``cpu_capacity``
