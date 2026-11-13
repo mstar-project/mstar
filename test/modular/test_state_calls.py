@@ -1883,12 +1883,11 @@ def test_a_bounded_step_sets_no_advance_or_position_ids():
 
 
 @pytest.mark.parametrize("declared, refusal", [
-    (ArrayStep(keep=False), "no layout yet: keep=False on an unbounded array"),
     (ArrayStep(forks=(Fork(src="main", dst="main", at="start"),)), "no layout yet: a fork of an unbounded array"),
     (ArrayStep(placeholders=frozenset({(1, "main")})), "a step sets placeholders or eager_add"),
     (ArrayStep(eager_add=True), "a step sets placeholders or eager_add"),
-], ids=["keep=False", "fork", "placeholders", "eager_add"])
-def test_a_bounded_step_keeps_its_adds_and_forks_nothing(declared, refusal):
+], ids=["fork", "placeholders", "eager_add"])
+def test_a_bounded_step_forks_nothing(declared, refusal):
     h, _ = _bounded()
     _refused(rf"Array 'enc_kv': {refusal}", lambda: _begin(h, enc_kv=declared))
 

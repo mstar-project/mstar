@@ -2086,8 +2086,6 @@ class BoundedHandle(ArrayHandle):
             if rows:
                 raise self._refusal(f"rows {rows} begin from no start: neither the step nor the open step names one "
                                     "(ArrayStep.starts)")
-        if not declared.keep:
-            raise self._no_layout("keep=False on an unbounded array, whose kernel stores the step's keys as it attends")
         if declared.forks:
             raise self._no_layout("a fork of an unbounded array, which the bounded KV doesn't fork")
         super()._check_storage(declared, segments, ctx)
@@ -2095,7 +2093,7 @@ class BoundedHandle(ArrayHandle):
     @torch.compiler.disable
     def add(self, layer: int | torch.Tensor, *, keep: bool | None = None, **fields: torch.Tensor) -> None:
         layer = self._layer_id(layer)
-        if keep is False:
+        if keep is False and self._keep:
             raise self._no_layout(f"keep=False on layer {layer} of an unbounded array, whose kernel stores the add it "
                                   "reads")
         self._record_add(layer, keep)
@@ -2704,6 +2702,9 @@ class BoundedStorage(Storage):
     def steps(
         self, handle: BoundedHandle, declared: ArrayStep, step: SubmoduleStep, segments, steps: dict[str, Any],
     ) -> None:
+        if not declared.keep:
+            # the kernel attends all of a span-0 row's adds and stores none
+            segments = [segment._replace(span=0) for segment in segments]
         positions = {}
         for segment in segments:
             rid = segment.request_id
