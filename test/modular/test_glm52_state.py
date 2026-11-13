@@ -219,6 +219,21 @@ def test_a_captured_and_padded_prefill_reads_no_prompt_length():
     assert sub.preprocess("prefill", engine_inputs, inputs)["input_ids"].shape == (8,)
 
 
+@pytest.mark.parametrize("k", [0, 3])
+def test_only_a_decode_step_is_input_free(k):
+    """Under async scheduling the pre-plan declares and admits each decode step over the capture's template rows. The
+    GPU thread runs that step when the model says the step reads nothing else, rather than declaring and admitting it
+    again before the launch."""
+    sub = _submodule(k)
+    template = ARNodeInputs(input_ids=torch.zeros(1, dtype=torch.long), input_seq_len=k + 1)
+    row = ARNodeInputs(input_ids=torch.tensor([7]), input_seq_len=k + 1, kwargs={"count": 5})
+    declared, real = (sub.declare_step("decode", ["a", "b"], [one, one]) for one in (template, row))
+    assert (declared.segments, declared.state) == (real.segments, real.state)
+    assert sub.step_is_input_free("decode") and not sub.step_is_input_free("prefill"), (
+        "the GPU thread would declare and admit every decode step again before its launch"
+    )
+
+
 def _reduced(monkeypatch, **fields) -> None:
     """``config_variant: reduced`` building a config with ``fields`` set."""
     cfg = Glm52ModelConfig.reduced()
