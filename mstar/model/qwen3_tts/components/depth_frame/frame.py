@@ -17,6 +17,11 @@ MAX_ROWS, GROUPS = 64, 16
 KERNEL_TALKER_WIDTH = 2048
 
 
+def _aligned(t: torch.Tensor) -> torch.Tensor:
+    """``t``, or a 16-byte-aligned copy of it."""
+    return t if t.data_ptr() % 16 == 0 else t.clone()
+
+
 class DepthFrame:
     """Stacked copies of a `Qwen3TTSCodePredictor`'s weights, the kernel's scratch and task lists, and its launch.
 
@@ -166,6 +171,9 @@ class DepthFrame:
             # typed placeholders: the draw's loads are compiled out
             z = torch.zeros(1, device=last_hidden.device)
             draw = FusedDrawArgs(z, z.int(), z, z.long(), z.long())
+        # the kernel only reads these, so an input a caller hands in at an offset is copied to an aligned one
+        codes_in = _aligned(codes_in)
+        draw = FusedDrawArgs(*(_aligned(t) for t in draw))
         args = self._args(last_hidden, codes_in, kv_cache, positions, partials, all_codes, codec_embed_sum, draw,
                           rows, sampled)
         if sampled not in self._compiled:
@@ -179,9 +187,12 @@ class DepthFrame:
 
     def _args(self, last_hidden, codes_in, kv_cache, positions, partials, all_codes, codec_embed_sum, draw, rows,
               sampled):
-        tensors = (last_hidden, codes_in, kv_cache, positions, partials, all_codes, codec_embed_sum, *draw)
+        tensors = dict(last_hidden=last_hidden, codes_in=codes_in, kv_cache=kv_cache, positions=positions,
+                       partials=partials, all_codes=all_codes, codec_embed_sum=codec_embed_sum,
+                       **{f"draw.{name}": t for name, t in zip(draw._fields, draw, strict=True)})
         # The kernel was specialized on the first call's pointers being 16-byte aligned.
-        assert all(t.data_ptr() % 16 == 0 for t in tensors), "the frame kernel's tensors must be 16-byte aligned"
+        misaligned = [name for name, t in tensors.items() if t.data_ptr() % 16]
+        assert not misaligned, f"the frame kernel's tensors must be 16-byte aligned, not {misaligned}"
         return dict(
             TASKS=self.tasks, NTASKS=self.ntasks, CTRS=self.ctrs,
             x_desc=self.xd[0], att_desc=self.xd[1], act_desc=self.xd[2],
