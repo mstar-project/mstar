@@ -218,6 +218,16 @@ def test_each_mask_says_whether_it_uses_the_query_position_and_sees_a_step_whole
     assert (mask.uses_query_position, mask.sees_step_whole) == (uses_query_position, sees_step_whole)
 
 
+@pytest.mark.parametrize("mask, change", [
+    (Block(), "Block sees each step's adds as a whole"),
+    (Bidirectional(), "Bidirectional sees each step's adds as a whole"),
+    (FrameWindow(4, frames=2), "A step boundary inside a frame cuts what the frame's queries see"),
+])
+def test_each_mask_that_sees_a_step_whole_says_what_a_split_step_changes(mask, change):
+    """The refusal of a regrouped walk gives the sentence of the read's mask."""
+    assert mask.split_step_change() == change
+
+
 @dataclass(frozen=True)
 class _Decay(Op):
     """An update kernel the contract doesn't define yet, on a state of rank 3."""
