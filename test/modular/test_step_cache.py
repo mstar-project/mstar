@@ -157,11 +157,12 @@ def _run_loop(sub: Wan22DitSubmodule, rids=("r0",)) -> list[dict[str, torch.Tens
 
 
 class _BlockCounter:
-    """Counts the block stack's runs (the first block's forward calls)."""
+    """Counts the block stack's runs (the first block's self-attention calls: the stack runs a block's ``stream``,
+    which a hook on the block doesn't see)."""
 
     def __init__(self, dit: Wan22DiT):
         self.calls = 0
-        dit.blocks[0].register_forward_hook(lambda *_: setattr(self, "calls", self.calls + 1))
+        dit.blocks[0].self_attn.register_forward_hook(lambda *_: setattr(self, "calls", self.calls + 1))
 
 
 def test_without_a_step_cache_the_step_key_is_the_bucket_key():
@@ -246,6 +247,24 @@ def test_the_dit_returns_the_residual_its_blocks_added_and_reuses_it():
     assert torch.equal(out, plain) and residual.dtype == torch.float32 and residual.shape == (2, 32, 24)
     # the same inputs with their own residual give the same output, up to the fp32 round trip of the add
     torch.testing.assert_close(reused, plain)
+
+
+def test_the_cached_residual_is_what_the_blocks_own_forwards_add():
+    """The stack hands each block's FFN residual to the next norm and the last block's to the output norm; the
+    residual the cache keeps still has it: the stream after the blocks' own forwards, minus the stream before."""
+    dit = _tiny_dit()
+    gen = torch.Generator().manual_seed(3)
+    x, t, text = torch.randn(2, 4, 2, 8, 8, generator=gen), torch.rand(2, 2, generator=gen) * 999, torch.randn(
+        2, 5, 8, generator=gen)
+    with torch.no_grad():
+        _, residual = dit(x, t, text, return_residual=True)
+        rotary = tuple(table.contiguous() for table in dit.rope((2, 4, 4), x.device))
+        before = dit.patch_embedding(x).flatten(2).transpose(1, 2)
+        _, timestep_proj, projected = dit.condition_embedder(t, text)
+        after = before
+        for block in dit.blocks:
+            after = block(after, projected, timestep_proj, rotary)
+    assert torch.equal(residual, after.float() - before.float())
 
 
 class _FakeCfgGroup:

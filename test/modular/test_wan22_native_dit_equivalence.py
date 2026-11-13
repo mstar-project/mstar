@@ -201,13 +201,33 @@ def test_per_layer_outputs_bitwise_identical(wrapped, native, inputs):
     hooks.append(native.condition_embedder.register_forward_hook(keep_native_rows))
     hooks.append(wrapped.condition_embedder.register_forward_hook(use_native_rows))
 
+    def capture_stream(block):
+        """A native block in the stack runs ``stream``, which leaves its FFN residual to the next norm: record
+        the stream with it added, as the block's own ``forward`` adds it (bit for bit, the residual-stream test)."""
+        stream = block.stream
+
+        def recorded(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb, carry=None):
+            out, (ff, gate) = stream(hidden_states, encoder_hidden_states, timestep_proj, rotary_emb, carry)
+            groups = timestep_proj.shape[1]
+            stages["native"].append((
+                out.unflatten(1, (groups, -1)).float() + ff.unflatten(1, (groups, -1)).float() * gate.unsqueeze(2)
+            ).type_as(out).flatten(1, 2))
+            return out, (ff, gate)
+
+        block.stream = recorded
+        restore.append(lambda: delattr(block, "stream"))
+
     # Identical capture order on both sides: patchify, blocks 0..29 (execution
     # order), then the forward return as the head.
+    restore = []
     for side, model in (("wrapped", wrapped), ("native", native)):
         capture(side, model.patch_embedding)
         assert len(model.blocks) == 30
         for block in model.blocks:
-            capture(side, block)
+            if side == "native":
+                capture_stream(block)
+            else:
+                capture(side, block)
 
     try:
         with torch.no_grad():
@@ -219,6 +239,8 @@ def test_per_layer_outputs_bitwise_identical(wrapped, native, inputs):
     finally:
         for hook in hooks:
             hook.remove()
+        for undo in restore:
+            undo()
 
     stages["wrapped"].append(wrapped_out)
     stages["native"].append(native_out)
