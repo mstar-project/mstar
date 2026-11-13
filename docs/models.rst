@@ -2236,6 +2236,14 @@ tiles only when free VRAM at decode time is short of the untiled estimate
 32 GiB card. No CUDA-graph capture, no continuous batching (one request per
 step) and no component offload.
 
+**Streamed decode.** ``stream_decode`` (on in ``wan22.yaml`` and ``wan22_fastwan.yaml``)
+runs the VAE decoder as a loop, ``stream_decode_latents`` (default 3) latent frames an
+iteration, and the API server encodes each piece's frames while the next one decodes, so
+only the last piece's encode is left after the decode: 0.09-0.10 s where the whole clip's
+took 0.46-0.53 s at 1280x704x81 on one B300. The mp4 is the same, bit for bit (same frames,
+CRF 18 ultrafast). On that GPU a FastWan video takes 2.50 s (2.90 s without; SGLang 3.5 s)
+and a 50-step TI2V-5B video 22.8 s (23.2 s; SGLang 23.4 s).
+
 **Step caching (opt-in, lossy).** ``step_cache`` under the yaml's ``model_kwargs``
 skips the DiT's 30 blocks on the steps MagCache picks and adds back the residual
 they produced at the last step that ran them
