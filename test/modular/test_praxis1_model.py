@@ -12,6 +12,7 @@ import json
 from dataclasses import replace
 from pathlib import Path
 
+import diffusers
 import huggingface_hub
 import numpy as np
 import pytest
@@ -523,6 +524,32 @@ def test_the_config_read_fetches_config_json_only(tmp_path, monkeypatch):
     monkeypatch.setattr(praxis1_model, "_SERVABLE", True)
     Praxis1Model(model_path_hf="runwayml/praxis-1-droid", skip_weight_loading=False)
     assert [call["allow_patterns"] for call in calls] == [["config.json"]]
+
+
+@pytest.mark.parametrize("name", ["praxis1_droid", "praxis1_yam"])
+def test_shipped_vae_config_selects_diffusers_subfolder(tmp_path, monkeypatch, name):
+    """The original Wan repo lacks vae/; the Diffusers repo supplies it."""
+    shipped = yaml.safe_load((ROOT / "configs" / f"{name}.yaml").read_text())
+    vae_repo = "Wan-AI/Wan2.2-TI2V-5B-Diffusers"
+    assert shipped["model_kwargs"]["vae_weights_hf"] == vae_repo
+    config = DROID_CONFIG if name == "praxis1_droid" else _yam_config()
+    model_kwargs = {k: v for k, v in shipped["model_kwargs"].items() if k != "model_path_hf"}
+    model = _model(tmp_path, config, monkeypatch, **model_kwargs)
+    calls = []
+
+    class FakeVae(torch.nn.Module):
+        config = type("Config", (), {"z_dim": 48})()
+
+    def from_pretrained(repo, **kwargs):
+        calls.append((repo, kwargs))
+        return FakeVae()
+
+    monkeypatch.setattr(diffusers.AutoencoderKLWan, "from_pretrained", from_pretrained)
+    model._create_submodule("vae_encoder", "cpu")
+    assert len(calls) == 1
+    assert calls[0][0] == vae_repo
+    assert calls[0][1]["subfolder"] == "vae"
+    assert calls[0][1]["torch_dtype"] == torch.bfloat16
 
 
 @pytest.mark.parametrize("name", ["praxis1_droid", "praxis1_yam"])

@@ -136,7 +136,7 @@ class Praxis1Model(Model):
         self.skip_weight_loading = skip_weight_loading
         # The checkpoint needs two public components beside it, neither of
         # which it ships: the Wan2.2 VAE and the Qwen3.5-2B text encoder.
-        self.vae_weights_hf: str = kwargs.pop("vae_weights_hf", "Wan-AI/Wan2.2-TI2V-5B")
+        self.vae_weights_hf: str = kwargs.pop("vae_weights_hf", "Wan-AI/Wan2.2-TI2V-5B-Diffusers")
         self.text_encoder_hf: str = kwargs.pop("text_encoder_hf", "Qwen/Qwen3.5-2B")
         # Sampler defaults of the deployment; a request may ask for fewer
         # steps than num_steps, never for more (get_loop_caps).

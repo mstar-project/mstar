@@ -27,7 +27,7 @@ max_seq_len: 32768
 model_kwargs:
   model_path_hf: "runwayml/praxis-1-yam"
   # Public components the checkpoint expects beside it. Neither ships with it.
-  vae_weights_hf: "Wan-AI/Wan2.2-TI2V-5B"
+  vae_weights_hf: "Wan-AI/Wan2.2-TI2V-5B-Diffusers"
   text_encoder_hf: "Qwen/Qwen3.5-2B"
   # The recommended recipe of this checkpoint (Runway's serve_yam.yaml): two Euler
   # steps, no flow shift and no text guidance on either the actions or the video.

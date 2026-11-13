@@ -30,7 +30,7 @@ max_seq_len: 16384
 model_kwargs:
   model_path_hf: "runwayml/praxis-1-droid"
   # Public components the checkpoint expects beside it. Neither ships with it.
-  vae_weights_hf: "Wan-AI/Wan2.2-TI2V-5B"
+  vae_weights_hf: "Wan-AI/Wan2.2-TI2V-5B-Diffusers"
   text_encoder_hf: "Qwen/Qwen3.5-2B"
   # The recommended recipe of this checkpoint: two Euler steps, text guidance on
   # the video only. A request may ask for fewer steps, never more.
