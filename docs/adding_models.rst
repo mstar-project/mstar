@@ -589,14 +589,15 @@ the pool's ``resources:`` key. Each snapshot slot costs as much as a request slo
   so the slots hold about one prompt each. A decode snapshot that a later prompt restores
   is kept like a prompt's from then on.
 
-Snapshots stay off without ``prefix_slots``, without a named KV cache, when that cache isn't
-on every node of the pool, or when its ``prefix_cache`` is off or can't open at the pool's
-world size (above one rank, unless it sets ``prefix_cache_tp``); in those cases the pool
-allocates no snapshot slots. Above one rank, rank 0 leases a request's snapshot as it sends
-the step, as it does the KV pages, and the other ranks restore the same slot. Neither does a
-pool whose cache the engine keeps shut for another reason, such as a model that names no
-checkpoint and sets no salt. Every cache on the node of a pool without snapshots stays shut,
-and the engine logs which pool kept it shut.
+Snapshots stay off without ``prefix_slots``, and also without a named KV cache, when that
+cache isn't on every node of the pool, or when its ``prefix_cache`` is off or can't open at
+the pool's world size (above one rank, only with ``prefix_cache_tp``); in those cases the
+pool allocates no snapshot slots. Neither does a pool whose cache the engine keeps shut for
+another reason, such as a model that names no checkpoint and sets no salt. Every cache on
+the node of a pool without snapshots stays shut, and the engine logs which pool kept it shut.
+Above one rank rank 0 leases a request's snapshot as it sends the step, as it does the KV
+pages, and the other ranks restore the same slot. A prompt cut into chunks is leased as rank 0
+measures it, so every chunk starts past the hit, and only its first chunk carries the lease.
 ``opening_prefix_caches`` in ``mstar/engine/resources/kv/config.py`` is that rule over the
 specs. The engine evaluates it once, before it builds any resource, and opens exactly the
 caches it returns of those it holds; the conductor's routing and the API server's prompt

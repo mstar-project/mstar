@@ -3,7 +3,8 @@ slots, and a later prompt that shares the pages before one restores it and runs 
 
 The KV cache, the recurrent pool and the KDA resource run under a real runner, with the torch
 kernel bundle doing one KDA layer's math over a fixed table of token projections. Above one
-rank, rank 0 leases the snapshot as it sends the step and the other ranks adopt the same slot.
+rank, rank 0 leases the snapshot as it sends the step and the other ranks adopt the same slot;
+a GDN node (Qwen3.5) runs the same lease under chunked prefill, without the forward.
 
 CPU-only.
 """
@@ -16,12 +17,15 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+import mstar.communication.wire_types  # noqa: F401  (registers the tags)
 from mstar.api_server.data_worker import PreprocessWorkerThread
+from mstar.communication.wire import decode, encode
 from mstar.distributed.communication import CommGroup, JointGroups
+from mstar.engine.chunking import ChunkingManagement, ChunkRange
 from mstar.engine.engine import Engine
-from mstar.engine.resources.base import EngineResourceInfo, KeyedWalks, build_resource
+from mstar.engine.resources.base import CachedSnapshot, EngineResourceInfo, KeyedWalks, build_resource
 from mstar.engine.resources.kv import manager as manager_mod
-from mstar.engine.resources.kv.config import KVReqConfig, KVSpec, KVStep, PagedKVConfig
+from mstar.engine.resources.kv.config import KVReqConfig, KVSpec, KVStep, PagedKVConfig, opening_prefix_caches
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.linear_attn.config import (
     LinearAttnConfig,
@@ -41,9 +45,10 @@ from mstar.engine.resources.recurrent.pool import RecurrentStatePool
 from mstar.engine.resources.runner import StepRunner
 from mstar.engine.resources.step import Segment, StepContext, SubmoduleStep
 from mstar.model.base import KVLabel, LabelLayout, PrefixKeys, Span
-from mstar.model.submodule_base import ARNodeInputs, ARNodeSubmodule
+from mstar.model.submodule_base import ARNodeInputs, ARNodeSubmodule, ChunkingPolicy, InputSeqLenInfo
 from mstar.testing_utils.worker import make_scheduler
-from mstar.utils.ipc_format import ScheduleTPNode
+from mstar.utils.ipc_format import ScheduleTPNode, WorkerMessage, WorkerMessageType
+from mstar.worker.batch_builder import fill_token_budget_in_start_order
 
 NODE, WALK, ROOT = "LLM", "prefill", b"a root"
 # a page is the KDA prefill's 64-token chunk, so snapshots sit on chunk ends
@@ -79,10 +84,12 @@ def _tokens(n: int, seed: int) -> list[int]:
 
 class _Node:
     """One rank's KV cache, KDA pool and KDA resource under a real runner. A token's KDA inputs
-    are its row of a fixed table, so a prompt's state depends on its tokens alone."""
+    are its row of a fixed table, so a prompt's state depends on its tokens alone. ``gdn``: the
+    pool as a GDN node binds it, and no forward (FlashInfer's kernels need a GPU)."""
 
     def __init__(self, rank: int = 0, world_size: int = 1, prefix_slots: int = 3,
-                 speculative_tokens: int = 0, page: int = PAGE):
+                 speculative_tokens: int = 0, page: int = PAGE, gdn: bool = False):
+        self.rank, self.gdn = rank, gdn
         tp = CommGroup(my_global_rank=rank, my_group_rank=rank, group_members=list(range(world_size)))
         group = JointGroups(tp_group=tp, sp_group=CommGroup.trivial(), instance=tp) if world_size > 1 else None
         kv_spec = KVSpec("kv", {NODE}, PagedKVConfig(
@@ -100,21 +107,25 @@ class _Node:
             num_layers=1, max_slots=5, prefix_slots=prefix_slots, kv_cache="kv",
             blocks=geometry.to_blocks(conv_dtype=torch.float32, speculative_tokens=speculative_tokens),
         ))
-        # the engine opens the pool's snapshots where `opening_prefix_caches` does: here, always
-        self.pool = RecurrentStatePool.build(pool_spec, EngineResourceInfo(
-            device=CPU, joint_comm_group=group, dependencies={"kv": self.kv},
-            prefix_caches=frozenset({"state"} if prefix_slots else ()),
+        kda_spec = LinearAttnSpec("kda", {NODE}, LinearAttnConfig(
+            recurrent_state="state", variant=LinearAttnVariant.GDN if gdn else LinearAttnVariant.KDA,
         ))
+        # as the engine decides it: above one rank the snapshots open with the KV cache's prefix_cache_tp
+        opened = opening_prefix_caches([kv_spec, pool_spec, kda_spec], {NODE: world_size}, checkpoint_named=False)
+        assert opened == ({"kv", "state"} if prefix_slots else set())
+        self.pool = RecurrentStatePool.build(pool_spec, EngineResourceInfo(
+            device=CPU, joint_comm_group=group, dependencies={"kv": kv_spec}, prefix_caches=opened,
+        ))
+        if gdn:
+            self.pool.bind_dependencies({"kv": self.kv})
+            self.runner = StepRunner({"kv": self.kv, "state": self.pool}, node_resources={NODE: ["kv", "state"]})
+            return
         self.kda = build_resource(
-            LinearAttnSpec("kda", {NODE}, LinearAttnConfig(
-                recurrent_state="state", variant=LinearAttnVariant.KDA,
-            )),
-            EngineResourceInfo(device=CPU, joint_comm_group=group, dependencies={"state": pool_spec}),
+            kda_spec, EngineResourceInfo(device=CPU, joint_comm_group=group, dependencies={"state": pool_spec}),
         )
+        self.kda.bind_layer(lower_bound=-5.0)
         self.pool.bind_dependencies({"kv": self.kv})
         self.kda.bind_dependencies({"state": self.pool})
-        self.kda.bind_layer(lower_bound=-5.0)
-        self.pool.enable_prefix_cache(ROOT)
         assert (self.pool._kv is not None) == bool(prefix_slots)
         self.runner = StepRunner(
             {"kv": self.kv, "state": self.pool, "kda": self.kda}, node_resources={NODE: ["kv", "state", "kda"]},
@@ -140,17 +151,26 @@ class _Node:
         self.runner.apply_cached_prefix(rid, NODE, WALK, inputs, prefix)
         return prefix.tokens if prefix is not None else 0
 
-    def run(self, rows: dict[str, list[int]], windows: list[int] | None = None,
-            ) -> tuple[torch.Tensor, Callable[[], None]]:
-        """One prefill step over ``rows`` (rid -> the tokens it runs), admitted, planned and run;
-        its outputs and its commit. ``windows``: the packed offsets the forward cuts windows at."""
+    def declare(self, rows: dict[str, list[int]], after: dict[str, int] | None = None) -> SubmoduleStep:
+        """A prefill step over ``rows``, with the context the engine binds to it."""
         segments = [Segment(rid, "main", len(tokens)) for rid, tokens in rows.items()]
-        step = SubmoduleStep(
-            steps={"kv": KVStep(), "state": RecurrentStep(), "kda": LinearAttnStep()}, segments=segments,
-        )
-        step.set_ctx(StepContext(request_ids=tuple(rows), graph_walk=WALK, slot=0, capture=False))
+        steps = {"kv": KVStep(), "state": RecurrentStep()} | ({} if self.gdn else {"kda": LinearAttnStep()})
+        step = SubmoduleStep(steps=steps, segments=segments)
+        step.set_ctx(StepContext(
+            request_ids=tuple(rows), graph_walk=WALK, slot=0, capture=False, chunk_tokens_after=after or {},
+        ))
+        return step
+
+    def run(self, rows: dict[str, list[int]], windows: list[int] | None = None,
+            after: dict[str, int] | None = None) -> tuple[torch.Tensor, Callable[[], None]]:
+        """One prefill step over ``rows`` (rid -> the tokens it runs), admitted, planned and run;
+        its outputs and its commit. ``windows``: the packed offsets the forward cuts windows at.
+        ``after``: the tokens a chunked row runs after this step, as the engine stamps them."""
+        step = self.declare(rows, after)
         assert self.runner.admit(step).ok
         self.runner.plan(step)
+        if self.gdn:
+            return None, lambda: self.runner.commit(step)
         out = self._forward([t for tokens in rows.values() for t in tokens], [len(t) for t in rows.values()], windows)
         return out, lambda: self.runner.commit(step)
 
@@ -250,38 +270,29 @@ def test_windows_that_cut_a_row_inside_a_chunk_compute_what_the_whole_step_does(
                 torch.testing.assert_close(x, y, rtol=1e-5, atol=1e-5)
 
 
-def _chunked(node: _Node, rid: str, tokens: list[int], cut: int) -> None:
-    """``tokens`` prefilled in two steps, the second starting at ``cut``, as a chunked prefill runs."""
-    node.ingest(rid, tokens)
-    assert node.probe(rid, tokens) == 0
-    node.step({rid: tokens[:cut]})
-    node.step({rid: tokens[cut:]})
+def test_a_window_cut_with_no_snapshot_in_it_runs_its_row_as_one_piece():
+    """With no snapshot to place, a row a window boundary cuts runs in one launch, chunked from
+    the cut, and still computes what the whole step does."""
+    rows = {"a": _tokens(100, seed=3), "b": _tokens(90, seed=4)}
+    whole, cut = _Node(prefix_slots=0), _Node(prefix_slots=0)
+    for node in (whole, cut):
+        for rid, tokens in rows.items():
+            node.ingest(rid, tokens)
+    heads = []
+    run = cut.kda.run
 
+    def recording(*args, **kwargs):
+        heads.append(cut.kda.current_plan("main").head)
+        return run(*args, **kwargs)
 
-def test_a_prompts_later_chunk_keeps_its_last_page_boundary_and_a_resend_restores_it():
-    """The second chunk starts on a page, so it keeps the state at its own last boundary, 3 pages
-    in: a prompt sharing those pages skips all three, not only the first chunk's."""
-    x = _tokens(3 * PAGE + 10, seed=6)
-    node, cut, cold = _Node(), _Node(), _Node(prefix_slots=0)
-    _chunked(node, "x", x, PAGE)
-    cut.prefill("cut", x[:3 * PAGE])
-    for kept, ref in zip(node.state(node.snapshot("x", 3 * PAGE)), cut.state(cut.slot("cut")), strict=True):
-        torch.testing.assert_close(kept, ref, rtol=1e-5, atol=1e-5)
-    y = x[:3 * PAGE] + _tokens(20, seed=7)
-    out, held = node.prefill("y", y)
-    assert held == 3 * PAGE, "y restored less than the later chunk kept"
-    ref, _ = cold.prefill("y", y)
-    torch.testing.assert_close(out, ref[held:], rtol=1e-5, atol=1e-5)
-
-
-def test_a_later_chunk_starting_inside_a_kda_chunk_keeps_no_snapshot():
-    """Its page boundaries fall inside the kernels' chunks, where they store no state."""
-    x = _tokens(3 * PAGE + 10, seed=6)
-    node = _Node()
-    _chunked(node, "x", x, PAGE + 10)
-    assert node.kv.chain_key("x", "main", 3) not in node.pool._snap_by_key
-    node.ingest("y", x[:3 * PAGE] + [1])
-    assert node.probe("y", x[:3 * PAGE] + [1]) == PAGE, "only the first chunk's boundary is kept"
+    cut.kda.run = recording
+    ref = whole.step(rows)
+    out = cut.step(rows, windows=[120])
+    assert heads == [None, None], "a window split a row that keeps no snapshot"
+    torch.testing.assert_close(out, ref, rtol=1e-5, atol=1e-5)
+    for rid in rows:
+        for x, y in zip(whole.state(whole.slot(rid)), cut.state(cut.slot(rid)), strict=True):
+            torch.testing.assert_close(x, y, rtol=1e-5, atol=1e-5)
 
 
 def test_a_page_off_the_kda_chunk_is_refused_at_load():
@@ -314,7 +325,7 @@ class _Submodule:
 
 def _engine(node: _Node) -> Engine:
     engine = Engine.__new__(Engine)
-    engine._resources = {"kv": node.kv, "state": node.pool, "kda": node.kda}
+    engine._resources = dict(node.runner._resources)
     engine._runner = node.runner
     engine._submodules = {NODE: SimpleNamespace(submodule=_Submodule())}
     engine._keyed_walks = {NODE: {WALK}}
@@ -325,23 +336,27 @@ def _engine(node: _Node) -> Engine:
     return engine
 
 
-def _send(leader: _Node, rid: str) -> ScheduleTPNode:
-    engine = _engine(leader)
+def _send(leader: _Node, rid: str, chunk: ChunkRange | None = None, engine: Engine | None = None) -> ScheduleTPNode:
+    engine = engine or _engine(leader)
     batch = SimpleNamespace(
-        node_name=NODE, request_ids=(rid,),
+        node_name=NODE, request_ids=(rid,), chunk_ranges={rid: chunk} if chunk else {},
         step_context=StepContext(request_ids=(rid,), graph_walk=WALK, slot=0, capture=False),
     )
-    return ScheduleTPNode(
+    head = ScheduleTPNode(
         NODE, WALK, [f"wire-{rid}"], prefix_hits=engine.decide_cached_prefix(batch),
         page_trails=engine.page_trails(NODE),
     )
+    # the followers read rank 0's leases off the wire
+    return decode(encode(WorkerMessage(message_type=WorkerMessageType.SCHEDULE_TP, body=head))).body
 
 
 def _follow(follower: _Node, head: ScheduleTPNode, caught_up: bool = True) -> bool:
     engine = _engine(follower)
-    lockstep = make_scheduler(SimpleNamespace(get_engine=lambda node: engine), parallel_leader_nodes=set()).lockstep
-    lockstep.enqueue_follow(head)
-    return lockstep.settle_delta(caught_up)
+    scheduler = make_scheduler(
+        engine_manager=SimpleNamespace(get_engine=lambda node: engine), parallel_leader_nodes=set(),
+    )
+    scheduler.lockstep.enqueue_follow(head)
+    return scheduler.lockstep.settle_delta(caught_up)
 
 
 @pytest.fixture
@@ -362,7 +377,7 @@ def test_a_follower_restores_the_snapshot_rank_0_leased_and_never_looks_one_up(_
     assert follower.runner.resolve_cached_prefix("b", NODE, WALK, inputs).tokens == 0
     assert not follower.pool._leases, "the follower looked a snapshot up for itself"
     head = _send(leader, "b")
-    assert head.prefix_hits["wire-b"]["state"] == [leader.snapshot("a", 2 * PAGE), 2 * PAGE, 2 * PAGE]
+    assert head.prefix_hits["wire-b"]["state"] == CachedSnapshot(leader.snapshot("a", 2 * PAGE), 2 * PAGE, 2 * PAGE)
     assert _follow(follower, head)
     for node in _ranks:
         assert node.probe("b", b) == 2 * PAGE
@@ -384,7 +399,7 @@ def test_a_follower_waits_for_its_own_commit_to_file_the_snapshot(_ranks):
     for node in _ranks:
         node.ingest("b", b)
     head = _send(leader, "b")
-    assert head.prefix_hits["wire-b"]["state"][0] >= 0
+    assert head.prefix_hits["wire-b"]["state"].slot >= 0
     assert not _follow(follower, head, caught_up=False), "the follower took a snapshot it hasn't filed"
     commits[follower]()
     assert _follow(follower, head, caught_up=False)
@@ -396,7 +411,7 @@ def test_a_follower_missing_the_snapshot_rank_0_leased_stops():
     leader.prefill("a", A)
     b = A[:2 * PAGE] + _tokens(7, seed=9)
     follower.ingest("b", b)
-    lease = [leader.snapshot("a", 2 * PAGE), 2 * PAGE, 2 * PAGE]
+    lease = CachedSnapshot(leader.snapshot("a", 2 * PAGE), 2 * PAGE, 2 * PAGE)
     assert not follower.pool.adopt_cached_prefix("b", NODE, WALK, lease, caught_up=False)
     with pytest.raises(RuntimeError, match="rank 0 leased snapshot slot"):
         follower.pool.adopt_cached_prefix("b", NODE, WALK, lease, caught_up=True)
@@ -416,3 +431,265 @@ def test_a_step_that_wont_run_gives_its_snapshot_back_on_every_rank(_ranks):
             step_context=StepContext(request_ids=("b",), graph_walk=WALK, slot=0, capture=False),
         ))
         assert not node.pool._snap_refs and not node.pool._leases, "the snapshot stays held for good"
+
+
+# a chunk's token budget: Qwen3.5's 2048, scaled to the page
+BUDGET = 3 * PAGE
+
+
+class _ChunkedPrompt(_Submodule):
+    """A chunkable prefill as the engine sees it: measured, prepared whole once, cut per chunk."""
+
+    def __init__(self, tokens: list[int]):
+        self.tokens = tokens
+
+    def get_input_sequence_len(self, graph_walk, fwd_info, inputs):
+        return InputSeqLenInfo(len(self.tokens))
+
+    def prepare_inputs(self, **kwargs):
+        return ARNodeInputs(input_ids=torch.tensor(self.tokens), input_seq_len=len(self.tokens))
+
+
+def _chunking_engine(node: _Node, tokens: list[int]) -> Engine:
+    engine = _engine(node)
+    engine._submodules[NODE] = SimpleNamespace(
+        submodule=_ChunkedPrompt(tokens), resources=dict(node.runner._resources),
+    )
+    engine._chunking = ChunkingManagement(engine._submodules)
+    engine._chunking.set_policies({(NODE, WALK): ChunkingPolicy(walks=(WALK,), chunkable=True)})
+    engine._chunk_alignment = {}
+    engine._tp_leader_nodes = {NODE} if node.rank == 0 else set()
+    return engine
+
+
+def _prepare(engine: Engine, rid: str, chunk: ChunkRange) -> dict[str, int]:
+    """Prepare one chunk of ``rid``'s prompt; the tokens it runs after it, as `Engine` stamps a
+    chunked step's context."""
+    batch = SimpleNamespace(
+        node_name=NODE, per_request_info_wrapped={rid: None}, per_request_input_tensors={},
+        final_stream_rids=set(), per_request_input_metadata={}, first_chunk_rids=set(),
+    )
+    part = engine._prepare_chunk(batch, rid, WALK, chunk)
+    assert (part.chunk_start, part.input_seq_len) == (chunk.start, chunk.end - chunk.start)
+    return {} if part.is_final_chunk else {rid: part.chunk_total - part.chunk_start - part.input_seq_len}
+
+
+def _run_chunk(node: _Node, engine: Engine, rid: str, tokens: list[int], chunk: ChunkRange) -> Callable[[], None]:
+    """Prepare and run one chunk of ``rid``'s prompt; its commit."""
+    after = _prepare(engine, rid, chunk)
+    _, commit = node.run({rid: tokens[chunk.start:chunk.end]}, after=after)
+    return commit
+
+
+def _chunks(engine: Engine, rid: str, total: int, budget: int = BUDGET) -> tuple[ChunkRange, ChunkRange]:
+    """Rank 0's measure of ``rid`` cut into two chunks by the scheduler's cut, on the node's alignment."""
+    info = engine.input_sequence_len(NODE, WALK, None, {}, rid=rid)
+    align = engine.chunk_alignment(NODE)
+    take, _ = fill_token_budget_in_start_order(
+        [rid], {rid: info.seq_len}, {rid}, budget, engine.min_chunk_tokens(budget, align), {}, align,
+    )
+    end = info.cached_prefix + take[rid]
+    return ChunkRange(info.cached_prefix, end, total, end), ChunkRange(end, total, total, total - end)
+
+
+def _prefill_in_chunks(ranks: tuple[_Node, _Node], engines: dict, rid: str, tokens: list[int],
+                       chunks: tuple[ChunkRange, ChunkRange]) -> None:
+    """Both chunks on both ranks, in TP async's order: rank 0 sends the second while the first
+    runs, and the follower takes it once its own first chunk has committed."""
+    leader, follower = ranks
+    first, second = chunks
+    assert _follow(follower, _send(leader, rid, first, engines[leader]))
+    commits = {node: _run_chunk(node, engines[node], rid, tokens, first) for node in ranks}
+    head = _send(leader, rid, second, engines[leader])
+    for node in ranks:
+        commits[node]()
+    assert _follow(follower, head)
+    assert not head.prefix_hits, "the second chunk carries a lease again"
+    for node in ranks:
+        _run_chunk(node, engines[node], rid, tokens, second)()
+
+
+def _agree(ranks: tuple[_Node, _Node], rid: str) -> None:
+    leader, follower = ranks
+    assert leader.slot(rid) == follower.slot(rid)
+    assert leader.pool._snap_by_key == follower.pool._snap_by_key
+    assert leader.kv._streams[rid]["main"].page_indices == follower.kv._streams[rid]["main"].page_indices
+    assert not leader.pool._snap_refs and not follower.pool._snap_refs
+
+
+@pytest.fixture
+def _gdn_ranks(monkeypatch):
+    monkeypatch.setattr(pool_mod, "_DEBUG_ASSERTS", True)
+    return _Node(rank=0, world_size=2, gdn=True), _Node(rank=1, world_size=2, gdn=True)
+
+
+def test_a_chunked_resend_starts_past_rank_0s_snapshot_on_every_rank(_gdn_ranks):
+    """A GDN prompt longer than the budget, resent at TP2: rank 0 leases the snapshot as it
+    measures the row, so its chunks start past it on every rank, and the lease goes out once."""
+    ranks = leader, _ = _gdn_ranks
+    for node in ranks:
+        node.prefill("a", A)
+    b = A[:2 * PAGE] + _tokens(350 - 2 * PAGE, seed=10)
+    for node in ranks:
+        node.ingest("b", b)
+    engines = {node: _chunking_engine(node, b) for node in ranks}
+    chunks = _chunks(engines[leader], "b", len(b))
+
+    _prefill_in_chunks(ranks, engines, "b", b, chunks)
+
+    assert chunks[0].start == 2 * PAGE, "b ran a's pages again"
+    _agree(ranks, "b")
+
+
+def test_a_later_chunk_takes_no_lease_after_its_first_declined_one(_gdn_ranks):
+    """Measured with nothing cached, then a's pages landed while b waited: b's first chunk
+    starts at 0 and declines the hit its lease finds, on every rank. Its second chunk, sent
+    before the first commits, must not lease the hit again."""
+    ranks = leader, _ = _gdn_ranks
+    b = A[:2 * PAGE] + _tokens(350 - 2 * PAGE, seed=11)
+    for node in ranks:
+        node.ingest("b", b)
+    engines = {node: _chunking_engine(node, b) for node in ranks}
+    chunks = _chunks(engines[leader], "b", len(b))
+    for node in ranks:
+        node.prefill("a", A)
+
+    _prefill_in_chunks(ranks, engines, "b", b, chunks)
+
+    assert chunks[0].start == 0
+    _agree(ranks, "b")
+
+
+def _held(node: _Node) -> tuple:
+    """What a rank's eviction reads: each page's owners, and the snapshots a lease holds."""
+    arena = node.kv._arena
+    return arena.owners_of(range(arena.max_num_pages)), dict(node.pool._snap_refs), set(node.pool._leases)
+
+
+def test_each_chunks_end_is_kept_alike_on_every_rank_and_a_resend_restores_the_last(_gdn_ranks):
+    """Above one rank the pool keeps snapshots, so it declares its page as the chunk alignment
+    there too: rank 0 cuts whole pages, every rank keeps each chunk's end, and the later chunk's
+    makes the earlier one's the first to evict. A resend is leased at the later chunk's end."""
+    ranks = leader, follower = _gdn_ranks
+    b = _tokens(5 * PAGE + 10, seed=12)
+    for node in ranks:
+        node.ingest("b", b)
+    engines = {node: _chunking_engine(node, b) for node in ranks}
+    chunks = _chunks(engines[leader], "b", len(b), budget=3 * PAGE + 20)
+    assert chunks[0].end == 3 * PAGE, "rank 0 cut b off a page"
+
+    _prefill_in_chunks(ranks, engines, "b", b, chunks)
+
+    _agree(ranks, "b")
+    for node in ranks:
+        ends = node.snapshot("b", 3 * PAGE), node.snapshot("b", 5 * PAGE)
+        assert [node.pool._snap_meta[snap][1] for snap in ends] == [True, False]
+    # in eviction order
+    assert list(leader.pool._snap_meta.items()) == list(follower.pool._snap_meta.items())
+
+    c = b[:5 * PAGE] + _tokens(20, seed=13)
+    for node in ranks:
+        node.ingest("c", c)
+    head = _send(leader, "c")
+    assert head.prefix_hits["wire-c"]["state"] == CachedSnapshot(leader.snapshot("b", 5 * PAGE), 5 * PAGE, 5 * PAGE)
+    assert _follow(follower, head)
+    for node in ranks:
+        assert node.probe("c", c) == 5 * PAGE
+        node.step({"c": c[5 * PAGE:]})
+    _agree(ranks, "c")
+
+
+def test_rank_0_gives_back_what_it_leased_for_a_row_its_step_leaves_out(_gdn_ranks):
+    """Rank 0 leases a chunkable row's prefix as it measures the row. Left out of the step, the
+    row waits holding nothing the other ranks don't, and the step that takes it leases again."""
+    ranks = leader, follower = _gdn_ranks
+    for node in ranks:
+        node.prefill("a", A)
+    b = A[:2 * PAGE] + _tokens(350 - 2 * PAGE, seed=14)
+    for node in ranks:
+        node.ingest("b", b)
+    engines = {node: _chunking_engine(node, b) for node in ranks}
+    assert engines[leader].input_sequence_len(NODE, WALK, None, {}, rid="b").cached_prefix == 2 * PAGE
+    assert _held(leader) != _held(follower)
+
+    assert engines[leader].give_back_cached_prefix(NODE, "b", WALK)
+
+    assert _held(leader) == _held(follower)
+    assert not engines[follower].give_back_cached_prefix(NODE, "b", WALK), "a follower measured a row"
+    chunks = _chunks(engines[leader], "b", len(b))
+    assert chunks[0].start == 2 * PAGE
+    _prefill_in_chunks(ranks, engines, "b", b, chunks)
+    _agree(ranks, "b")
+
+
+def test_a_rebuilds_probe_on_rank_0_holds_nothing_the_other_ranks_dont(_gdn_ranks):
+    """A rebuild row is measured through `Engine.unserved_len`, and nothing gives back what that
+    probe would lease, so rank 0 takes no lease there: the rebuild's step leases as it is sent."""
+    ranks = leader, follower = _gdn_ranks
+    for node in ranks:
+        node.prefill("a", A)
+    b = A[:2 * PAGE] + _tokens(350 - 2 * PAGE, seed=16)
+    for node in ranks:
+        node.ingest("b", b)
+    engines = {node: _chunking_engine(node, b) for node in ranks}
+    # as MicroScheduler._measure_unstarted measures a rebuild row that has run no chunk
+    engines[leader].unserved_len(NODE, WALK, None, "b", len(b), len(b))
+    assert _held(leader) == _held(follower)
+
+
+def test_a_row_measured_past_pages_no_snapshot_ends_on_waits_holding_nothing(_gdn_ranks):
+    """b shares a's first page, where no snapshot sits, so the pool cuts the hit to nothing: rank 0
+    measures b from 0 and holds no page for it until its step is sent. That send leases the page
+    on every rank, and each keeps the state at the hit's end for the next prompt."""
+    ranks = leader, follower = _gdn_ranks
+    for node in ranks:
+        node.prefill("a", A)
+    b = A[:PAGE] + _tokens(350 - PAGE, seed=15)
+    for node in ranks:
+        node.ingest("b", b)
+    engines = {node: _chunking_engine(node, b) for node in ranks}
+    chunks = _chunks(engines[leader], "b", len(b))
+    assert chunks[0].start == 0
+    assert _held(leader) == _held(follower), "rank 0 holds a's page while b waits"
+
+    _prefill_in_chunks(ranks, engines, "b", b, chunks)
+
+    _agree(ranks, "b")
+    assert leader.snapshot("b", PAGE) == follower.snapshot("b", PAGE)
+
+
+def test_a_refused_steps_lease_waits_with_its_row_on_every_rank(_gdn_ranks):
+    """A step refused at admit keeps its hit on every rank: the KV pages are its stream's by
+    then. Measured again for the retry and left out, the row gives nothing back on rank 0, and
+    the step that takes it runs on from the restored snapshot on every rank."""
+    ranks = leader, follower = _gdn_ranks
+    for node in ranks:
+        node.prefill("a", A)
+        for i in range(node.pool.num_free_slots):
+            node.prefill(f"x{i}", _tokens(9, seed=30 + i))
+    b = A[:2 * PAGE] + _tokens(350 - 2 * PAGE, seed=16)
+    for node in ranks:
+        node.ingest("b", b)
+    engines = {node: _chunking_engine(node, b) for node in ranks}
+    chunks = _chunks(engines[leader], "b", len(b))
+    assert _follow(follower, _send(leader, "b", chunks[0], engines[leader]))
+    for node in ranks:
+        # no slot is free, so the pool refuses the step once the KV cache has taken the hit;
+        # the engine then drops the prepared input, and the retry probes again
+        step = node.declare({"b": b[chunks[0].start:chunks[0].end]}, _prepare(engines[node], "b", chunks[0]))
+        assert not node.runner.admit(step).ok
+        engines[node]._chunking.release("b", NODE)
+    held = _held(follower)
+    assert _held(leader) == held
+
+    assert engines[leader].input_sequence_len(NODE, WALK, None, {}, rid="b").cached_prefix == 2 * PAGE
+    engines[leader].give_back_cached_prefix(NODE, "b", WALK)
+
+    assert _held(leader) == held, "rank 0 gave back a hit the other ranks hold"
+    for node in ranks:
+        node.pool.remove_request("x0")
+    assert _chunks(engines[leader], "b", len(b)) == chunks
+    _prefill_in_chunks(ranks, engines, "b", b, chunks)
+    _agree(ranks, "b")
+    for node in ranks:
+        assert node.kv.stored_len("b") == len(b), "b's cached pages are in its stream twice"

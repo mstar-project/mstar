@@ -87,16 +87,16 @@ class KDAPlan:
     # every row is a verify block of `block` tokens (LinearAttnStep.speculative)
     is_verify: bool = False
     block: int = 1
-    # the verify step's accepted count went to the pool (`KDAManager.settle_verify`)
-    settled: bool = False
-    # the bucket slot a captured verify step records, so its replays know it settles
-    capture_key: CGSlotKey | None = None
     # (row, offset into the row, slot): the states this prefill keeps for prefix reuse, and
     # whether `layout` carries their section (a captured step's always does, on a keyed walk)
     snapshots: tuple[tuple[int, int, int], ...] = ()
     snapshot_section: bool = False
     # a window's first tokens, run on their own first (`KDAManager.token_window`)
     head: KDAPlan | None = None
+    # the verify step's accepted count went to the pool (`KDAManager.settle_verify`)
+    settled: bool = False
+    # the bucket slot a captured verify step records, so its replays know it settles
+    capture_key: CGSlotKey | None = None
     _cache: dict = field(default_factory=dict, repr=False)
 
     @property
@@ -207,6 +207,7 @@ class KDAManager(LinearAttnManager):
             self._pool.bind_snapshot_writer(
                 buffered=False, blocks=("state", "conv"), chunk=getattr(self.kernels, "chunk", 1),
             )
+
     # Step lifecycle
 
     @property
@@ -362,9 +363,10 @@ class KDAManager(LinearAttnManager):
         in packed order, each the next run of that row's tokens. A row's state carries over in
         its slot, so windows run in order compute what the whole step would.
 
-        A piece that starts inside one of its row's chunks (the row a window boundary cut) runs
-        its tokens up to the chunk's end first, on their own, so the rest of the row chunks as
-        the whole row would and each snapshot lands on a chunk end."""
+        A piece that starts inside one of its row's chunks (the row a window boundary cut) and
+        keeps a snapshot runs its tokens up to the chunk's end first, on their own, so the rest
+        of the row chunks as the whole row would and the snapshot lands on a chunk end. With no
+        snapshot in it, the piece runs as one, chunked from where it starts."""
         if label is None:
             label = self._default_label
         full = self.current_plan(label)
@@ -373,11 +375,13 @@ class KDAManager(LinearAttnManager):
         chunk = getattr(self.kernels, "chunk", 1)
         heads, rest = [], []
         for row, n in pieces:
-            first = min(-done[row] % chunk, n)
+            at = done[row]
+            keeps = any(kept == row and at < offset <= at + n for kept, offset, _ in full.snapshots)
+            first = min(-at % chunk, n) if keeps else 0
             if first:
-                heads.append((row, done[row], first))
+                heads.append((row, at, first))
             if n > first:
-                rest.append((row, done[row] + first, n - first))
+                rest.append((row, at + first, n - first))
             done[row] += n
         if heads and (len(heads) > 1 or heads[0][0] != pieces[0][0]):
             raise NotImplementedError(
@@ -392,21 +396,6 @@ class KDAManager(LinearAttnManager):
             yield
         finally:
             self._current[label] = full
-
-    def commit(self, step: LinearAttnStep, ctx: StepContext) -> None:
-        if not step.speculative or ctx.capture:
-            return
-        if ctx.slot_lease is None:
-            # an eager forward ran this step's Python, which had to settle it
-            for label, plan in self._current.items():
-                if not plan.settled:
-                    raise RuntimeError(
-                        f"kda: a verify step under {label!r} ended without set_prefix_len"
-                    )
-        self._verifying.update(ctx.request_ids)
-
-    def remove_request(self, rid: str) -> None:
-        self._verifying.discard(rid)
 
     def _window_plan(self, full: KDAPlan, pieces: list[tuple[int, int, int]]) -> KDAPlan:
         """``full`` cut to ``pieces``, (row, first token, tokens) in packed order, with the
@@ -431,6 +420,21 @@ class KDAManager(LinearAttnManager):
                 plan.layout = torch.empty(len(host), dtype=torch.int32, device=self._device)
                 self._layout_stager.copy_(plan.layout, host)
         return plan
+
+    def commit(self, step: LinearAttnStep, ctx: StepContext) -> None:
+        if not step.speculative or ctx.capture:
+            return
+        if ctx.slot_lease is None:
+            # an eager forward ran this step's Python, which had to settle it
+            for label, plan in self._current.items():
+                if not plan.settled:
+                    raise RuntimeError(
+                        f"kda: a verify step under {label!r} ended without set_prefix_len"
+                    )
+        self._verifying.update(ctx.request_ids)
+
+    def remove_request(self, rid: str) -> None:
+        self._verifying.discard(rid)
 
     # Submodule-level functionality
 
@@ -480,17 +484,18 @@ class KDAManager(LinearAttnManager):
                 qkv, g, beta, plan, conv_layer, state_layer, spec, params, gate=gate,
             )
         if plan.head is not None:
-            # a window's head runs first, on its own (`token_window`)
+            # a window's head runs first, on its own (`token_window`); both write one output
             n = plan.head.num_tokens
-            first = self.kernels.run_paged(
+            out = qkv.new_empty(qkv.shape[0], qkv.shape[1] // 3)
+            self.kernels.run_paged(
                 qkv[:n], g[:n], beta[:n], plan.head, conv_layer, state_layer, params,
-                gate=None if gate is None else gate[:n],
+                gate=None if gate is None else gate[:n], out=out[:n],
             )
             rest = self.kernels.run_paged(
                 qkv[n:], g[n:], beta[n:], plan, conv_layer, state_layer, params,
-                gate=None if gate is None else gate[n:],
+                gate=None if gate is None else gate[n:], out=out[n:],
             )
-            return torch.cat([first, rest])
+            return out.view(qkv.shape[0], *rest.shape[1:])
         return self.kernels.run_paged(
             qkv, g, beta, plan, conv_layer, state_layer, params, gate=gate,
         )
