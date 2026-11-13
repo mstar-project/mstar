@@ -25,12 +25,14 @@ from mstar.engine.resources.attn.config import (
 )
 from mstar.engine.resources.attn.ragged.config import (
     ChunkCausalAttentionStep,
+    ExpertAttentionStep,
     KeptWindowAttentionSpec,
     RaggedAttentionConfig,
     RaggedAttentionSpec,
     RaggedChunkCausalAttentionSpec,
     RaggedCrossAttentionSpec,
     RaggedCrossAttentionStep,
+    RaggedExpertAttentionSpec,
     cross_label,
 )
 from mstar.engine.resources.attn.ragged.config import (
@@ -537,6 +539,7 @@ class WithinStepSteps(StepBuilder):
         # a resource's layout is fixed only if every read on it declares it so
         self._fixed: dict[str, bool] = {}
         self._chunk_layouts: dict[str, dict[str, tuple[ResourceChunkCausalLayout, ...]]] = {}
+        self._expert_layouts: dict[str, tuple[tuple[int, int, int, int], ...]] = {}
         self._per_request_info = per_request_info or {}
         self._info: dict[str | int, Any] | None = None
 
@@ -562,6 +565,19 @@ class WithinStepSteps(StepBuilder):
                     f"Array {handle.array.name!r}: reads sharing {key!r}/{handle._plan_label!r} "
                     "use different chunk layouts"
                 )
+        if isinstance(handle.queries, (ExpertSelfQueries, ExpertCrossQueries)):
+            read = handle._bindings[0].declared
+            query_segments = (
+                handle.queries.segments(handle, step)
+                if isinstance(handle.queries, ExpertCrossQueries) else segments
+            )
+            layouts = tuple(
+                self._expert_layout(handle.array, read, segment, query_segment)
+                for segment, query_segment in zip(segments, query_segments, strict=True)
+            )
+            prior = self._expert_layouts.setdefault(key, layouts)
+            if prior != layouts:
+                raise ValueError(f"Array {handle.array.name!r}: conflicting expert layouts on {key!r}")
 
     def _chunk_layout(self, array: Array, read: Read, segment: Segment) -> ResourceChunkCausalLayout:
         if self._info is None:
@@ -593,6 +609,43 @@ class WithinStepSteps(StepBuilder):
             )
         return chunk_causal_resource_layout(read.mask, layout)
 
+    def _expert_layout(
+        self, array: Array, read: Read, segment: Segment, query_segment: Segment,
+    ) -> tuple[int, int, int, int]:
+        if self._info is None:
+            self._info = {}
+            for rid, info in self._per_request_info.items():
+                self._info[rid] = info
+                self._info[info.request_id] = info
+        info = self._info.get(segment.request_id)
+        if info is None:
+            if type(segment.request_id) is int and segment.request_id < -1:
+                # A capture bucket's dummy row has no request. Zero chunks is
+                # an internal padding layout: its next two fields are the Q
+                # and KV spans. Real queries can never take this layout.
+                return (0, query_segment.span, segment.span, 0)
+            raise ValueError(f"Array {array.name!r}: no request info for expert layout")
+        raw = info.step_metadata.get(EXPERT_LAYOUT_KWARG, {})
+        lengths = raw.get(array.name, {}).get(segment.label, {}).get(next(iter(array.reads)))
+        if lengths is None:
+            raise ValueError(f"Array {array.name!r}: request {segment.request_id!r} has no expert state_layout")
+        if isinstance(read.mask, ExpertSelf):
+            if not isinstance(lengths, (list, tuple)) or len(lengths) != 1:
+                raise ValueError(f"Array {array.name!r}: invalid expert self lengths")
+            layout = ExpertSelfLayout(lengths[0])
+            result = (layout.num_chunks, 0, 0, layout.num_chunks * read.mask.chunk_len)
+            span = layout.num_chunks * (1 + read.mask.future_per_chunk + read.mask.chunk_len)
+        else:
+            if not isinstance(lengths, (list, tuple)) or len(lengths) != 4:
+                raise ValueError(f"Array {array.name!r}: invalid expert cross lengths")
+            layout = ExpertCrossLayout(*lengths)
+            _check_expert_layout(array, segment.label, Layout(expert_cross={next(iter(array.reads)): layout}))
+            result = (layout.num_chunks, layout.global_len, layout.clean_frames, layout.noised_frames)
+            span = layout.global_len + (layout.clean_frames + layout.noised_frames) * read.mask.tokens_per_frame
+        if span != segment.span:
+            raise ValueError(f"Array {array.name!r}: expert layout spans {span}, segment spans {segment.span}")
+        return result
+
     def _label(self, key: str, array: Array, segments: Sequence[Segment]) -> str:
         """Hold ``segments``, ``array``'s in this step, under its label on the resource ``key``, and give the label."""
         if not segments:
@@ -619,6 +672,11 @@ class WithinStepSteps(StepBuilder):
                 if len(layouts) != len(segments):
                     raise ValueError(f"chunk resource {key!r} has {len(layouts)} layouts for {len(segments)} segments")
                 steps[key] = ChunkCausalAttentionStep(segments=tuple(segments), layouts=layouts)
+            elif isinstance(self._queries[key], (ExpertSelfQueries, ExpertCrossQueries)):
+                steps[key] = ExpertAttentionStep(
+                    segments=tuple(segments), pairs=tuple(self._pairs.get(key, ())),
+                    layouts=self._expert_layouts[key],
+                )
             else:
                 steps[key] = self._queries[key].step(segments, self._pairs.get(key, ()), self._fixed[key])
         return steps
@@ -1150,7 +1208,11 @@ class RaggedAttend(WithinStepAttend):
     plans = True
 
     def for_mask(self, mask: Mask) -> OpBinding:
-        return CHUNK_CAUSAL_ATTEND if isinstance(mask, ChunkCausal) else super().for_mask(mask)
+        if isinstance(mask, ChunkCausal):
+            return CHUNK_CAUSAL_ATTEND
+        if isinstance(mask, (ExpertCross, ExpertSelf)):
+            return EXPERT_ATTEND
+        return super().for_mask(mask)
 
     def attend(self, run: Any, label: str, rows: "RowLayout") -> Callable[..., torch.Tensor]:
         return functools.partial(joint_attention, ragged=functools.partial(run.run, label=label))
@@ -1167,6 +1229,19 @@ class ChunkCausalAttend(RaggedAttend):
 
 
 CHUNK_CAUSAL_ATTEND = ChunkCausalAttend()
+
+
+class ExpertAttend(RaggedAttend):
+    """Expert cross and self masks through the declared cacheless Attend op."""
+
+    def check(self, array: Array, key: str, read: Read) -> None:
+        if not isinstance(read.mask, (ExpertCross, ExpertSelf)):
+            raise _no_layout(array, f"reads[{key!r}] has no expert mask")
+        if read.walks is not None or (isinstance(read.mask, ExpertCross) != (read.queries is not None)):
+            raise _no_layout(array, f"reads[{key!r}] needs cross queries exactly for ExpertCross")
+
+
+EXPERT_ATTEND = ExpertAttend()
 
 
 def chunk_causal_resource_layout(mask: ChunkCausal, layout: ChunkCausalLayout) -> ResourceChunkCausalLayout:
@@ -2028,6 +2103,10 @@ class ChunkCausalQueries(OwnQueries):
         )
 
 
+class ExpertSelfQueries(OwnQueries):
+    spec_class = RaggedExpertAttentionSpec
+
+
 class CrossQueries(OtherArrayQueries, Queries):
     """A read within a step whose queries are another array's, on a ragged cross resource."""
 
@@ -2044,6 +2123,10 @@ class CrossQueries(OtherArrayQueries, Queries):
 
     def step(self, segments, pairs: Sequence[tuple[str, str]], fixed: bool) -> Any:
         return RaggedCrossAttentionStep(segments=tuple(segments), pairs=tuple(pairs))
+
+
+class ExpertCrossQueries(CrossQueries):
+    spec_class = RaggedExpertAttentionSpec
 
 
 class WithinStepHandle(ArrayHandle):
@@ -2537,6 +2620,8 @@ class WithinStepStorage(Storage):
             key, read = bound.key, bound.declared
             query_kind = (
                 ChunkCausalQueries if isinstance(read.mask, ChunkCausal) else
+                ExpertCrossQueries if isinstance(read.mask, ExpertCross) else
+                ExpertSelfQueries if isinstance(read.mask, ExpertSelf) else
                 OwnQueries if read.queries is None else CrossQueries
             )
             queries = resolved.queries[key] = query_kind(
@@ -2547,9 +2632,19 @@ class WithinStepStorage(Storage):
             config = RaggedAttentionConfig(
                 num_qo_heads=read.op.q_heads, num_kv_heads=heads, head_dim=head_dim, dtype=dtype,
             )
-            spec = queries.spec_class(resource_key=key, nodes=array.nodes, config=config)
+            expert = isinstance(read.mask, (ExpertCross, ExpertSelf))
+            extra = ({
+                "mode": "cross" if isinstance(read.mask, ExpertCross) else "self",
+                "chunk_len": read.mask.chunk_len,
+                "future_per_chunk": read.mask.future_per_chunk,
+                "tokens_per_frame": getattr(read.mask, "tokens_per_frame", 1),
+                "window_frames": getattr(read.mask, "window_frames", 1),
+                "include_noised": getattr(read.mask, "include_noised", True),
+            } if expert else {})
+            spec = queries.spec_class(resource_key=key, nodes=array.nodes, config=config, **extra)
             mask_size = read.mask.chunk_len if isinstance(read.mask, ChunkCausal) else None
-            spec = shared.setdefault((queries.spec_class, array.nodes, astuple(config), mask_size), spec)
+            spec = shared.setdefault((queries.spec_class, array.nodes, astuple(config), mask_size,
+                                      read.mask if expert else None), spec)
             resolved.resource_of[key] = spec.resource_key
             if bound.binding.plans and isinstance(spec, RaggedAttentionSpec):
                 # the labels the node's sequence shard may split (`RaggedAttentionSpec.derive`)

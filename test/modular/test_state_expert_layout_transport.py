@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import msgpack
 import pytest
 
 from mstar.conductor.conductor import _with_expert_layout
@@ -51,6 +52,7 @@ def test_expert_layout_transport_is_read_keyed_and_small() -> None:
         "expert_queries": {"main": {"self_attn": [2]}},
         "trunk_keys": {"main": {"cross_attn": [2, 2, 2, 4]}},
     }
+    assert msgpack.unpackb(msgpack.packb(layout, use_bin_type=True), raw=False) == layout
     (walk,) = _with_expert_layout([WalkStep("chunk")], layout)
     assert walk.step_metadata[EXPERT_LAYOUT_KWARG] == layout
     assert kv_layouts(arrays, _layouts(), {}) == {}
