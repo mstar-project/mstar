@@ -553,8 +553,10 @@ def test_text_streamed_a_token_at_a_time_reassembles(model):
 
 @needs_ckpt
 def test_every_node_gets_only_its_resources(model):
+    from mstar.engine.state.adapters import node_resources
+
     by_node: dict[str, set[str]] = {}
-    for spec in model.get_node_resources():
+    for spec in node_resources(model):
         for node in spec.nodes:
             by_node.setdefault(node, set()).add(spec.resource_key)
     assert by_node == {
@@ -562,7 +564,7 @@ def test_every_node_gets_only_its_resources(model):
         "vision_encoder": {"vision_attn", "resampler_attn"},
         "audio_encoder": {"audio_attn"},
         "TTS": {"tts_kv", "tts_attn", "tts_pos", "tts_sampler"},
-        "Token2Wav": {"t2w_state", "t2w_enc1_kv", "t2w_enc2_kv", "t2w_dit_kv"},
+        "Token2Wav": {"t2w_state_flow", "t2w_state_hift", "t2w_state_tail", "t2w_enc1_kv", "t2w_enc2_kv", "t2w_dit_kv"},
     }
 
 
@@ -609,22 +611,24 @@ def a_deployment(cap: int | None = 32, tts_pages: int = 32 * 32 + 1, **resources
 
 
 def test_vocoder_slot_counts_must_agree():
-    """A spoken reply holds a slot of each t2w resource, so one count sizes all four:
-    t2w_state has one more (its sink). A YAML that sets them apart is refused."""
+    """A spoken reply holds a slot of each t2w resource, so one count sizes all six: each
+    t2w_state_* Value has one more (its sink). A YAML that sets them apart is refused."""
     from mstar.model.minicpm_o.components.tts import TTSConfig
-    from mstar.model.minicpm_o.config import T2W_KV, T2W_STATE
+    from mstar.model.minicpm_o.config import T2W_KV
+    from mstar.model.minicpm_o.minicpm_o_model import T2W_KEYS
 
     model = a_bare_model(tts_config=TTSConfig())
 
     def yaml(state, kv):
-        return a_deployment(**{T2W_STATE: {"max_slots": state}, **{key: {"max_slots": kv} for key in T2W_KV.values()}})
+        return a_deployment(**{key: {"max_slots": state} for key in T2W_KEYS.values},
+                            **{key: {"max_slots": kv} for key in T2W_KV.values()})
 
     model.validate_config_yaml(yaml(33, 32), "minicpm_o.yaml")
     model.validate_config_yaml(a_deployment(), "minicpm_o.yaml")
-    with pytest.raises(ValueError, match="t2w_state"):
+    with pytest.raises(ValueError, match="t2w_state_flow"):
         model.validate_config_yaml(yaml(33, 33), "minicpm_o.yaml")
-    with pytest.raises(ValueError, match="t2w_state"):
-        model.validate_config_yaml(a_deployment(**{T2W_STATE: {"max_slots": 33}}), "minicpm_o.yaml")
+    with pytest.raises(ValueError, match="t2w_state_flow"):
+        model.validate_config_yaml(a_deployment(**{T2W_KEYS.flow: {"max_slots": 33}}), "minicpm_o.yaml")
 
 
 def test_tts_kv_must_hold_every_admitted_spoken_reply():

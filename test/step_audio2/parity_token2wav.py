@@ -39,7 +39,6 @@ from _common import ASSETS, CKPT, DEVICE, Verdict, oracle, setup_torch
 from mstar.engine.resources import Segment, StepContext, StepRunner, SubmoduleStep
 from mstar.engine.resources.base import EngineResourceInfo, build_resource
 from mstar.engine.resources.kv.bounded import BoundedKVStep, StreamPosition
-from mstar.engine.resources.recurrent.config import RecurrentStep
 from mstar.model.components.token2wav.keys import Token2WavKeys
 from mstar.model.components.token2wav.model import (
     DIT_COMPUTE_DTYPE,
@@ -47,7 +46,7 @@ from mstar.model.components.token2wav.model import (
     HIFT_TAIL,
     KEEP_RECENT,
     AttentionCache,
-    SlotRows,
+    CacheCapacity,
     Token2Wav,
     Token2WavState,
     Token2WavStreaming,
@@ -56,6 +55,7 @@ from mstar.model.components.token2wav.model import (
     WindowCaches,
     fade_in_out,
     load_token2wav,
+    slot_layout,
     window_tokens,
 )
 from mstar.model.components.token2wav.resources import token2wav_resources
@@ -173,7 +173,10 @@ def served(model: Token2Wav, voice: Token2WavVoice, windows, vocode_mels=None) -
     bank = VoiceBank.build({"v": voice}, dit_dtype=DIT_COMPUTE_DTYPE)
     rid = "r0"
     runner.ingest_request(rid, {})
-    gen = torch.Generator(DEVICE).manual_seed(0)
+    # the request's Value fields, as its regions read and write them; it starts with none
+    fields: dict[str, torch.Tensor] = {"started": torch.zeros(1, dtype=torch.bool, device=DEVICE)}
+    for name, block in slot_layout(CacheCapacity(1), dit_dtype=DIT_COMPUTE_DTYPE).items():
+        fields[name] = torch.zeros(1, *block.shape, dtype=block.dtype, device=DEVICE)
     mels, out, written = [], [], 0
     with torch.inference_mode():
         for k, (codes, last) in enumerate(windows):
@@ -181,7 +184,6 @@ def served(model: Token2Wav, voice: Token2WavVoice, windows, vocode_mels=None) -
             step = SubmoduleStep(
                 segments=[Segment(request_id=rid, label="main", span=1)],
                 steps={
-                    KEYS.state: RecurrentStep(),
                     **{KEYS.kv[name]: BoundedKVStep(
                         segments=[Segment(request_id=rid, label="main", span=fam.span(n, last))],
                         positions={rid: StreamPosition(*fam.position(p, written), source=0)},
@@ -191,22 +193,24 @@ def served(model: Token2Wav, voice: Token2WavVoice, windows, vocode_mels=None) -
             step.set_ctx(StepContext(request_ids=(rid,), graph_walk="t2w", slot=0, capture=False))
             assert runner.admit(step).ok
             runner.plan(step)
-            pool = resources[KEYS.state]
-            rows = SlotRows(pool, pool.addressing("main"))
             caches = WindowCaches(**{
                 name: AttentionCache(resources[KEYS.kv[name]], bank.sources[name]) for name in families
             })
             tokens = torch.tensor([codes], dtype=torch.int32, device=DEVICE)
             voices = torch.zeros(1, dtype=torch.long, device=DEVICE)
-            mel = model.window_flow(rows, bank, voices, tokens, caches, last)
+            mel, conv = model.window_flow(fields, bank, voices, tokens, caches, last)
+            fields.update(conv)
             if vocode_mels is not None:
                 mels.append(mel.cpu())
                 mel = vocode_mels[k].to(DEVICE)
             else:
                 mels.append(mel.cpu())
-            noise = model.window_noise(mel.shape[-1], first, [gen])
-            spec = model.window_vocode(rows, mel, first, last, noise)
-            speech = model.window_finish(rows.head(1), spec["magnitude"], spec["phase"], first, last)
+            # the request's seed is 0, as the one-request reference's generator
+            noise = model.window_noise(mel.shape[-1], first, [(0, k)])
+            spec, held = model.window_vocode(fields, mel, first, noise)
+            fields.update(held)
+            speech, held = model.window_finish(fields, spec["magnitude"], spec["phase"], first, last)
+            fields.update(held)
             runner.commit(step)
             written += window_tokens(n, last)
             out.append(pcm_bytes(speech))

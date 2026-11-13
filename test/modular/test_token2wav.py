@@ -144,17 +144,55 @@ def stream(model: Token2Wav, state: Token2WavState, voice: Token2WavVoice, token
     return vocode_chunk(model, state, mel, last, generator=generator)
 
 
+class _Slots:
+    """A window's rows of token2wav's Values: each request's fields as its regions read and write them, kept here per
+    request, a fresh row reading zeros and not started, as a Value's start does."""
+
+    def __init__(self, steps: "_CacheSteps", rids):
+        self.steps, self.rids = steps, list(rids)
+
+    def read(self) -> dict[str, torch.Tensor]:
+        steps, device = self.steps, self.steps.bank.spk.device
+        fields = {
+            name: torch.stack([
+                steps.slots.get(rid, {}).get(name, torch.zeros(block.shape, dtype=block.dtype, device=device))
+                for rid in self.rids
+            ])
+            for name, block in steps.layout.items()
+        }
+        fields["started"] = torch.tensor([rid in steps.slots for rid in self.rids], device=device)
+        return fields
+
+    def write(self, fields: dict[str, torch.Tensor]) -> None:
+        for i, rid in enumerate(self.rids):
+            self.steps.slots.setdefault(rid, {}).update(
+                {name: value[i].clone() for name, value in fields.items() if name != "started"})
+
+    def flow(self, model, *args):
+        mel, conv = model.window_flow(self.read(), *args)
+        self.write(conv)
+        return mel
+
+    def vocode(self, model, mel, first, noise):
+        spectrum, held = model.window_vocode(self.read(), mel, first, noise)
+        self.write(held)
+        return spectrum
+
+    def finish(self, model, magnitude, phase, first, last):
+        speech, held = model.window_finish(self.read(), magnitude, phase, first, last)
+        self.write(held)
+        return speech
+
+
 class _CacheSteps:
-    """Token2wav's resources (its state pool and its three attention caches) for requests
-    in the voices of ``bank``, driven through admit / plan / commit one window at a time,
-    as the engine does. ``dit_dtype``: the DiT caches' dtype, which it computes in (the
-    bank's must match)."""
+    """Token2wav's three attention caches for requests in the voices of ``bank``, driven through
+    admit / plan / commit one window at a time, as the engine does, and each request's Value
+    fields (``_Slots``). ``dit_dtype``: the DiT caches' dtype, which it computes in (the bank's
+    must match)."""
 
     def __init__(self, bank, slots: int, device, dit_dtype: torch.dtype | None = None):
         from mstar.engine.resources.kv.bounded.config import BoundedKVConfig
         from mstar.engine.resources.kv.bounded.manager import BoundedKVManager
-        from mstar.engine.resources.recurrent.config import RecurrentBlockConfig, RecurrentStateConfig
-        from mstar.engine.resources.recurrent.pool import RecurrentStatePool
         from mstar.model.components.token2wav.model import CACHE_FAMILIES, CacheCapacity
 
         self.bank = bank
@@ -169,37 +207,29 @@ class _CacheSteps:
             ), device)
             for name, f in CACHE_FAMILIES.items()
         }
-        self.pool = RecurrentStatePool(device, RecurrentStateConfig(
-            num_layers=1, max_slots=slots + 1,
-            blocks={n: RecurrentBlockConfig(shape=b.shape, dtype=b.dtype)
-                    for n, b in slot_layout(CacheCapacity(p), dit_dtype=dit_dtype).items()},
-        ))
+        self.layout = slot_layout(CacheCapacity(p), dit_dtype=dit_dtype)
+        self.slots: dict = {}
         self.written: dict[str, int] = {}
         self.voice: dict[str, int] = {}
 
     def slot(self, rid) -> dict[str, torch.Tensor]:
-        """``rid``'s slot of the state pool, block by block."""
-        index = self.pool._slots[rid]["main"].index
-        return {name: self.pool.block(name, 0)[index] for name in self.pool.config.blocks}
+        """``rid``'s Value fields, field by field."""
+        return dict(self.slots[rid])
 
     def position(self, family, rid):
         voice = self.voice[rid]
         return family.position(self.bank.prompt_tokens[voice], self.written.get(rid, 0)), voice
 
     def window(self, rids, num_tokens: int, last: bool, voices: list[int] | None = None):
-        """The state rows, caches and per-row voice ids for one window of ``rids`` (each in
+        """The Value rows, caches and per-row voice ids for one window of ``rids`` (each in
         ``voices``, the bank's first by default), and a commit to call after it."""
         from mstar.engine.resources.kv.bounded import BoundedKVStep, StreamPosition
-        from mstar.engine.resources.recurrent.config import RecurrentStep
         from mstar.engine.resources.step import Segment, StepContext
-        from mstar.model.components.token2wav.model import AttentionCache, SlotRows, WindowCaches, window_tokens
+        from mstar.model.components.token2wav.model import AttentionCache, WindowCaches, window_tokens
 
         for r, v in zip(rids, voices or [0] * len(rids), strict=True):
             self.voice.setdefault(r, v)
         ctx = StepContext(request_ids=list(rids), graph_walk="t2w", slot=0, capture=False)
-        state_step = RecurrentStep(segments=[Segment(request_id=r, label="main", span=1) for r in rids])
-        assert self.pool.admit(state_step, ctx).ok
-        state = SlotRows(self.pool, self.pool.plan(state_step, ctx)["main"])
         caches, steps = {}, {}
         for name, family in self.families.items():
             positions = {}
@@ -216,13 +246,12 @@ class _CacheSteps:
             caches[name] = AttentionCache(resource, self.bank.sources[name])
 
         def commit():
-            self.pool.commit(state_step, ctx)
             for name, step in steps.items():
                 self.resources[name].commit(step, ctx)
             for r in rids:
                 self.written[r] = self.written.get(r, 0) + window_tokens(num_tokens, last)
         ids = torch.tensor([self.voice[r] for r in rids], device=self.bank.spk.device)
-        return state, WindowCaches(**caches), ids, commit
+        return _Slots(self, rids), WindowCaches(**caches), ids, commit
 
     def retained(self, name: str, rid) -> torch.Tensor:
         """The keys|values ``rid`` would attend next in ``name``'s caches, ``[layers, rows, H, n, 2d]``."""
@@ -238,6 +267,15 @@ class _CacheSteps:
             buf = self.bank.sources[name][voice] if from_source else resource._cache[:, slot]
             parts.append(buf[..., start:start + count, :])
         return torch.cat(parts, dim=-2)
+
+
+class _OneVoice:
+    """A bank of one voice, for a node's host bookkeeping."""
+
+    prompt_tokens = (10,)
+
+    def index(self, name):
+        return 0
 
 
 CKPT = os.environ.get("MINICPM_O_CKPT")
@@ -466,9 +504,9 @@ def test_batched_windows_on_pool(random_token2wav, device):
         want = vocode_chunk(model, ref, mel, last, noise=row0)
         tokens = torch.tensor([win], dtype=torch.int32, device=device)
         state, kv, ids, commit = kv_steps.window(["r0"], len(win), last)
-        got_mel = model.window_flow(state, bank, ids, tokens, kv, last)
-        out = model.window_vocode(state, got_mel, first, last, row0)
-        got = model.window_finish(state, out["magnitude"], out["phase"], first, last)
+        got_mel = state.flow(model, bank, ids, tokens, kv, last)
+        out = state.vocode(model, got_mel, first, row0)
+        got = state.finish(model, out["magnitude"], out["phase"], first, last)
         commit()
         torch.testing.assert_close(got_mel, mel, **tol)
         torch.testing.assert_close(got, want, **tol)
@@ -486,7 +524,7 @@ def test_batched_windows_on_pool(random_token2wav, device):
         kv16 = _CacheSteps(bank16, 3, device, dit_dtype=DIT_COMPUTE_DTYPE)
         for (win, last), want in zip(wins[0], mels, strict=True):
             state, kv, ids, commit = kv16.window(["r0"], len(win), last)
-            got = model.window_flow(state, bank16, ids, torch.tensor([win], dtype=torch.int32, device=device), kv, last)
+            got = state.flow(model, bank16, ids, torch.tensor([win], dtype=torch.int32, device=device), kv, last)
             commit()
             rel = ((got.float() - want).norm() / want.norm()).item()
             assert rel < 1e-3, rel  # 1.4e-4 measured; a broken kernel is far past it
@@ -503,7 +541,7 @@ def test_batched_windows_on_pool(random_token2wav, device):
         rids = [r for r, _ in rows]
         tokens = torch.tensor([full[w] for _, w in rows], dtype=torch.int32, device=device)
         state, kv, ids, commit = kv_steps.window(rids, len(full[0]), False)
-        mel = model.window_flow(state, bank, ids, tokens, kv)
+        mel = state.flow(model, bank, ids, tokens, kv)
         commit()
         for i, (_, w) in enumerate(rows):
             torch.testing.assert_close(mel[i:i + 1], mels[w], **tol)
@@ -541,7 +579,7 @@ def test_batched_relative_positions_match_the_dense_path(random_token2wav):
             tokens = torch.tensor([win], dtype=torch.int32)
             flow_chunk(model, ref, voice, tokens, last)
             state, kv, ids, commit = kv_steps.window(["r0"], len(win), last)
-            model.window_flow(state, bank, ids, tokens, kv, last)
+            state.flow(model, bank, ids, tokens, kv, last)
             commit()
             want, got = encoded[-2:]
             torch.testing.assert_close(got, want, rtol=1e-4, atol=1e-4)
@@ -597,7 +635,7 @@ def test_the_served_float16_dit_tracks_float32_on_the_checkpoint():
                 last = wins[0][w][1]
                 tokens = torch.tensor([ws[w][0] for ws in wins], dtype=torch.int32, device="cuda")
                 state, kv, ids, commit = kv_steps.window(rids, tokens.shape[1], last)
-                mels[dtype].append(model.window_flow(state, bank, ids, tokens, kv, last).float())
+                mels[dtype].append(state.flow(model, bank, ids, tokens, kv, last).float())
                 commit()
     for w, (want, got) in enumerate(zip(mels[None], mels[DIT_COMPUTE_DTYPE], strict=True)):
         rel = ((got - want).norm(dim=(1, 2)) / want.norm(dim=(1, 2))).max().item()
@@ -626,7 +664,7 @@ def test_batched_flow_matches_the_driver_on_the_real_weights():
             tokens = torch.tensor([win], dtype=torch.int32, device="cuda")
             want = flow_chunk(model, ref, voice, tokens, last)
             state, kv, ids, commit = kv_steps.window(["r0"], len(win), last)
-            got = model.window_flow(state, bank, ids, tokens, kv, last)
+            got = state.flow(model, bank, ids, tokens, kv, last)
             commit()
             # TF32 in the served attention kernel; a misplaced position term moves mels by > 1
             assert (got.float() - want.float()).abs().max().item() < 0.15
@@ -651,14 +689,16 @@ def test_served_windows_are_upstreams(n, stop):
     from mstar.model.submodule_base import InputMetadata
     from mstar.streaming.chunk_policy import LeftContextChunkPolicy
     from mstar.streaming.stream_buffer import StreamBuffer
+    from mstar.testing_utils.state import StubHostFields
 
     eos = 6561
     node = Token2WavSubmodule.__new__(Token2WavSubmodule)
     torch.nn.Module.__init__(node)
-    node.request_states, node.eos_code = {}, eos
-    node.keys = T2W_KEYS
+    node.eos_code, node.keys = eos, T2W_KEYS
     node._lead_silence = torch.full((LEAD_SILENCE,), SILENCE_CODE, dtype=torch.int32)
     node.model = torch.nn.Linear(1, 1)  # its device
+    node.bank, node._rows = _OneVoice(), {}
+    node.request = ended = StubHostFields(T2W_KEYS.request, {"ended": False})
     info = SimpleNamespace(rid_handle=0, step_metadata={"voice": "v"}, random_seed=0)
     codes = torch.randint(0, eos, (n,)).tolist()
 
@@ -680,17 +720,18 @@ def test_served_windows_are_upstreams(n, stop):
                 input_metadata=InputMetadata(stream_chunks={"tts_code": chunk.info} if data is not None else {}),
             )
             assert got is not None
+            step = node.declare_step("t2w_chunk", [0], [got])
+            ended.commit(step)
             if got.tensor_inputs["codes"].numel():
                 served.append((got.tensor_inputs["codes"][0].tolist(), got.kwargs["last"]))
                 # each window's caches hold what the windows before it wrote
-                assert node.request_state(0)["written"] == sum(window_tokens(len(w), last) for w, last in served[:-1])
+                assert got.kwargs["written"] == sum(window_tokens(len(w), last) for w, last in served[:-1])
     assert got.kwargs["last"]
     if n:
         assert served == reference_windows(codes)
     else:
-        assert served == [] and node.request_states == {}
-        step = node.declare_step("t2w_chunk", [0], [got])
-        assert all(not s.segments for s in step.steps.values())
+        assert served == [] and not ended.fields
+        assert all(not s.segments for s in step.steps.values()) and not step.state
 
 
 @pytest.mark.parametrize("device", [
@@ -725,77 +766,77 @@ def test_rows_of_different_voices_share_a_batch(random_token2wav, device):
         tokens = torch.tensor([full[w] for _, w in rows], dtype=torch.int32, device=device)
         state, kv, ids, commit = kv_steps.window(
             [name for name, _ in rows], len(full[0]), False, [bank.index(name) for name, _ in rows])
-        mel = model.window_flow(state, bank, ids, tokens, kv)
+        mel = state.flow(model, bank, ids, tokens, kv)
         commit()
         for i, (name, w) in enumerate(rows):
             torch.testing.assert_close(mel[i:i + 1], want[name][w], **tol)
 
 
 def test_hift_noise_is_the_requests_own(random_token2wav):
-    """A spoken reply's HiFT excitation comes from its own seed: a window vocodes the same
-    alone and beside another request, whatever the global RNG drew in between."""
-    from types import SimpleNamespace
-
-    from mstar.engine.accelerator_graph_config import PiecewiseCallInputs
-    from mstar.model.components.token2wav.submodule import Token2WavSubmodule
-    from mstar.model.submodule_base import InputMetadata, ModelInputsFromEngine
-
-    model = random_token2wav
-    torch.manual_seed(5)
-    voice = model.prepare_voice(VoicePrompt(
-        tokens=torch.randint(0, 6561, (1, 6), dtype=torch.int32), spk_emb=torch.randn(1, 192),
-        mel=torch.randn(1, 12, 80),
-    ))
-    node = Token2WavSubmodule(model, T2W_KEYS, {"v": voice}, eos_code=6561, dit_dtype=torch.float32)
-    frames = window_frames(28, False)
-    region = node.get_piecewise_accelerator_graph_configs(torch.device("cpu"), torch.float32)[
-        node.hift_region(True, frames, False)]
-    kv_steps = _CacheSteps(node.bank, 3, "cpu")
-    mel = torch.randn(1, 80, frames)
-    chunk = InputMetadata(stream_chunks={"tts_code": SimpleNamespace(start_offset=0, context_items=0, num_items=25)})
-
-    def first_window(seeds: dict[str, int]) -> torch.Tensor:
-        rids = list(seeds)
-        for rid, seed in seeds.items():
-            info = SimpleNamespace(rid_handle=rid, step_metadata={"voice": "v"}, random_seed=seed)
-            node.prepare_inputs("t2w_chunk", info, {"tts_code": [torch.arange(25)]}, input_metadata=chunk)
-        _, _, _, commit = kv_steps.window(rids, 28, False)
-        resources = {T2W_STATE: kv_steps.pool, **{T2W_KV[n]: kv_steps.resources[n] for n in T2W_KV}}
-        engine_inputs = ModelInputsFromEngine(request_ids=rids, per_request_info={}, resources=resources)
-
-        class Runner:  # the region, run eagerly on the rows the step planned
-            def run(self, static_inputs, **kwargs):
-                out = region.capture_fn(PiecewiseCallInputs(static_inputs=static_inputs, engine_inputs=engine_inputs))
-                return SimpleNamespace(get_view=out.__getitem__)
-
-        # the node draws the noise itself
-        node._run_hift(engine_inputs, Runner(), rids, mel.expand(len(rids), -1, -1), True, False)
-        commit()
-        # the excitation it held back for the next window: the noise, nearly alone
-        return torch.stack([kv_steps.slot(r)["hift_source"] for r in rids])
-
-    alone = first_window({"a": 7})
+    """A spoken reply's HiFT excitation comes from its own seed: a window draws the same alone and
+    beside another request, whatever the global RNG drew in between."""
+    model, frames = random_token2wav, window_frames(28, False)
+    alone = model.window_noise(frames, True, [(7, 0)])
     torch.randn(1000)
-    batched = first_window({"b": 8, "c": 7})
-    scale = alone.abs().max()
-    assert (batched[1:] - alone).abs().max() < 1e-4 * scale
-    assert (batched[:1] - alone).abs().max() > 0.1 * scale
+    batched = model.window_noise(frames, True, [(8, 0), (7, 0)])
+    assert torch.equal(batched.phase[1:], alone.phase) and torch.equal(batched.harmonic[1:], alone.harmonic)
+    assert not torch.equal(batched.harmonic[:1], alone.harmonic)
 
 
-def test_resources_declare_one_state_pool_and_a_cache_per_family():
-    """Every cache family gets its bounded KV under the model's key, one slot short of
-    the state pool, which also keeps its sink slot."""
+@pytest.mark.parametrize("device", [
+    "cpu", pytest.param("cuda", marks=pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")),
+])
+def test_a_windows_noise_is_the_draw_its_requests_generator_makes_for_it(random_token2wav, device):
+    """Window ``k`` draws what a generator seeded with the request's seed draws for it after the
+    request's earlier windows, so a step prepared again draws the same, and no generator is kept per
+    request. On CUDA that moves the generator's offset; on CPU it draws the earlier windows."""
+    model = random_token2wav.to(device)
+    full = window_frames(28, False)
+    reference = torch.Generator(device).manual_seed(11)
+    for window in range(4):
+        first = window == 0
+        want = model.hift.m_source.draw_noise(1, model.noise_length(full, first), torch.float32, device, reference)
+        got = model.window_noise(full, first, [(11, window)])
+        assert torch.equal(got.phase, want.phase) and torch.equal(got.harmonic, want.harmonic), window
+    # a last window, shorter, after three full ones
+    want = model.hift.m_source.draw_noise(1, model.noise_length(30, False), torch.float32, device, reference)
+    got = model.window_noise(30, False, [(11, 4)])
+    assert torch.equal(got.harmonic, want.harmonic)
+
+
+def test_the_caches_are_a_bounded_kv_per_family_one_slot_short_of_each_value():
+    """Every cache family gets its bounded KV under the model's key, one slot short of each
+    Value, which also keeps its sink slot."""
     from mstar.engine.resources.kv.bounded import BoundedKVSpec
-    from mstar.engine.resources.recurrent.config import RecurrentStateSpec
     from mstar.model.components.token2wav.model import CACHE_FAMILIES
-    from mstar.model.components.token2wav.resources import token2wav_resources
+    from mstar.model.components.token2wav.resources import token2wav_kernel_settings, token2wav_resources
 
     specs = token2wav_resources(T2W_KEYS, "Token2Wav", (3.0, 10.0), max_slots=9)
-    state = [s for s in specs if isinstance(s, RecurrentStateSpec)]
-    kv = {s.resource_key: s for s in specs if isinstance(s, BoundedKVSpec)}
-    assert [s.resource_key for s in state] == [T2W_STATE] and state[0].config.max_slots == 9
-    assert set(kv) == {T2W_KV[name] for name in CACHE_FAMILIES}
+    kv = {s.resource_key: s for s in specs}
+    assert all(isinstance(s, BoundedKVSpec) for s in specs) and set(kv) == {T2W_KV[name] for name in CACHE_FAMILIES}
     assert all(s.config.max_slots == 8 and s.nodes == {"Token2Wav"} for s in kv.values())
+    assert token2wav_kernel_settings(T2W_KEYS, 9) == {key: {"max_slots": 9} for key in T2W_KEYS.values}
+
+
+def test_the_state_is_a_plain_value_per_region_that_writes_it_and_a_host_field():
+    """Each region's step writes every field of the Value it lists, so the flow's conv caches,
+    HiFT's held-back frames and the held-back samples are a Value each, and whether a request's
+    last window ran is a host field of the node's own step."""
+    from mstar.engine.resources.recurrent.config import RecurrentStateSpec
+    from mstar.engine.state.adapters import build_specs
+    from mstar.model.components.token2wav.resources import token2wav_state
+
+    state = token2wav_state(T2W_KEYS, "Token2Wav")
+    fields = {array.name: (set(array.entry.tensors), set(array.entry.host)) for array in state}
+    assert fields == {
+        T2W_KEYS.flow: ({"enc_cnn", "dit_cnn", "started"}, set()),
+        T2W_KEYS.hift: ({"hift_mel", "hift_source"}, set()),
+        T2W_KEYS.tail: ({"hift_speech"}, set()),
+        T2W_KEYS.request: (set(), {"ended"}),
+    }
+    specs = build_specs(state)
+    assert sorted(s.resource_key for s in specs) == sorted(T2W_KEYS.values)
+    assert all(isinstance(s, RecurrentStateSpec) and s.config.kv_cache is None for s in specs)
 
 
 @pytest.mark.parametrize("t", [1, 25, 54])
@@ -829,18 +870,20 @@ def test_cut_conformer_caches_fit_the_position_table_for_any_served_voice():
 
 
 @pytest.mark.parametrize(
-    ("state", "kv", "ok"), [(None, None, True), (17, 16, True), (16, 16, False), (17, None, False)],
+    ("values", "kv", "ok"),
+    [(None, None, True), ((17, 17, 17), 16, True), ((16, 16, 16), 16, False), ((17, 17, 16), 16, False),
+     ((17, 17, 17), None, False)],
 )
-def test_slot_check_wants_one_more_state_slot_than_each_cache(state, kv, ok):
+def test_slot_check_wants_one_count_for_the_values_one_more_than_each_cache(values, kv, ok):
     from mstar.model.components.token2wav.resources import check_token2wav_slots
 
     resources = {}
-    if state is not None:
-        resources[T2W_STATE] = {"max_slots": state}
+    if values is not None:
+        resources.update({key: {"max_slots": n} for key, n in zip(T2W_KEYS.values, values, strict=True)})
     if kv is not None:
         resources.update({key: {"max_slots": kv} for key in T2W_KV.values()})
     if ok:
         check_token2wav_slots(T2W_KEYS, resources, 9, "cfg.yaml")
     else:
-        with pytest.raises(ValueError, match="must be one more than"):
+        with pytest.raises(ValueError, match="must be one count, one more than each of"):
             check_token2wav_slots(T2W_KEYS, resources, 9, "cfg.yaml")
