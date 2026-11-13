@@ -1,5 +1,5 @@
-"""The DSA resource on CPU: its key store, the rows it plans from the KV plan, IndexShare's
-shared pick, and sparse attention against an independent masked reference."""
+"""The DSA resource on CPU: its key store, the rows it plans from the KV plan, and sparse attention
+against an independent masked reference."""
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -113,17 +113,15 @@ def test_plan_selects_once_a_row_sees_more_than_topk_keys():
     assert dsa.needs_selection() is False
     _plan(dsa, [SequenceView("r0", "main", [0, 1], length=5, to_compute=1)])
     assert dsa.needs_selection() is True
-    assert dsa._plans["main"].last_selection is None  # a fresh pick every forward
 
 
 # ---------------------------------------------------------------------------
-# select / shared_selection
+# select
 # ---------------------------------------------------------------------------
 
 
 def test_select_scores_each_request_over_its_own_keys():
-    """Two decode rows of different requests each pick from their own keys, and SHARED layers
-    get that very pick."""
+    """Two decode rows of different requests each pick from their own keys."""
     torch.manual_seed(0)
     topk, heads, d = 4, 2, 8
     dsa = _manager(topk=topk)
@@ -140,16 +138,6 @@ def test_select_scores_each_request_over_its_own_keys():
         n = k.shape[0]
         want = index_topk(q[row:row + 1], w[row:row + 1], k, torch.tensor([n - 1]), topk)
         assert torch.equal(picked[row], want[0])
-    assert dsa.shared_selection(1) is picked
-
-
-def test_shared_layer_without_a_full_pick_raises():
-    """A SHARED layer reached in selection mode with no published rows is a threading bug and
-    must fail loudly, not attend densely off-spec."""
-    dsa = _manager(topk=4)
-    _plan(dsa, [SequenceView("r0", "main", [0, 1], length=7, to_compute=1)])
-    with pytest.raises(RuntimeError, match="no FULL layer ran"):
-        dsa.shared_selection(1)
 
 
 @pytest.mark.parametrize("autocast", [False, True])
@@ -266,3 +254,4 @@ def test_plan_refuses_a_prefill_past_topk():
     dsa = _manager(topk=4)
     with pytest.raises(RuntimeError, match="decode-only"):
         _plan(dsa, [SequenceView("r0", "main", [1, 2], length=7, to_compute=2)])
+

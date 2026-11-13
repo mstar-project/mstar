@@ -943,21 +943,40 @@ def test_a_walk_with_no_token_ladder_to_set_is_refused():
         _orpheus_prefill_buckets({"decode": [64]})
 
 
-def test_a_walk_a_node_captures_nothing_for_at_runtime_is_skipped(caplog):
-    """GLM-5.2 captures nothing under ``dsa_long_context``, and serves eagerly
-    whatever the ladder."""
+def test_a_walk_a_node_captures_nothing_for_at_runtime_is_skipped(caplog, monkeypatch):
+    """GLM-5.2 offers a prefill capture under ``dsa_long_context``, which its runner drops, since the
+    index keys can't be captured, and logs at error, and the walk serves eagerly whatever the ladder."""
+    import functools
     import logging
+    from unittest.mock import Mock
 
-    from mstar.model.glm52.config import Glm52ModelConfig
+    from mstar.engine.accelerator_graph_runner import AcceleratorGraphRunner
+    from mstar.model.glm52.config import INDEX_KEYS, Glm52ModelConfig
     from mstar.model.glm52.submodules import Glm52LLMSubmodule
+    from mstar.model.glm52.tests.testing import bind_cpu_state, build_cpu_resources
 
+    cfg = Glm52ModelConfig.reduced()
+    cfg.mla_absorb = cfg.dsa_long_context = True
     language_model = torch.nn.Module()
     language_model.lm_head = torch.nn.Identity()
-    glm = Glm52LLMSubmodule(language_model, Glm52ModelConfig(dsa_long_context=True, mla_absorb=True))
+    glm = Glm52LLMSubmodule(language_model, cfg)
+    resources, _ = build_cpu_resources(cfg)
+    bind_cpu_state(glm, cfg, resources)
+    for key, resource in resources.items():
+        if key != INDEX_KEYS:
+            monkeypatch.setattr(resource, "can_capture", lambda: True)
     engine = _budgeted_engine()
-    with caplog.at_level(logging.WARNING):
-        assert _captured_buckets(glm, "prefill", {"prefill": [64]}, engine) == []
-    assert any(r.levelno == logging.WARNING for r in caplog.records)
+    runner = AcceleratorGraphRunner(
+        submodule_name="LLM", submodule=glm, resources=resources, step_runner=Mock(),
+        device=torch.device("cpu"), autocast_dtype=None, joint_comm_group=SimpleNamespace(world_size=1),
+        num_slots=1, head_shards=1, token_ladders={"prefill": [64]},
+        step_tokens=functools.partial(engine._chunking.max_step_tokens, "LLM"),
+    )
+    with caplog.at_level(logging.ERROR):
+        specs = runner.prepare_for_capture()
+    assert not [spec for spec in specs if spec.bucket.graph_walk == "prefill"]
+    assert not runner.captures_walk("prefill")
+    assert any(r.levelno == logging.ERROR and INDEX_KEYS in r.getMessage() for r in caplog.records)
 
 
 def _graph_model():

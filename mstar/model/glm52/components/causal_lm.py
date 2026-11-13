@@ -5,6 +5,7 @@ import torch
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
+from mstar.model.glm52.components.attention import CarriedPick
 from mstar.model.glm52.components.decoder_layer import Glm52DecoderLayer
 from mstar.model.glm52.components.language_model import (
     build_embedding,
@@ -24,9 +25,10 @@ class Glm52LanguageModel(nn.Module):
         # returns (FFN partial, residual), and the last norm reduces
         self.fused_add_rmsnorm = config.tuned_kernels
         self.embed_tokens = build_embedding(config, comm_group=comm_group)
+        carried = CarriedPick()
         self.layers = nn.ModuleList(
             [
-                Glm52DecoderLayer(config, layer_idx, comm_group=comm_group)
+                Glm52DecoderLayer(config, layer_idx, comm_group=comm_group, carried=carried)
                 for layer_idx in range(config.num_hidden_layers)
             ]
         )
@@ -40,8 +42,8 @@ class Glm52LanguageModel(nn.Module):
     ) -> torch.Tensor:
         """Layer order IS the IndexShare order under dsa_long_context: each FULL
         layer's pick is the one the SHARED layers after it reuse, until the next
-        FULL layer (the DSA resource keeps it for the forward). ``rows``: the
-        only rows the caller reads; the last layer's FFN runs on them alone.
+        FULL layer (the layers carry it). ``rows``: the only rows the caller
+        reads; the last layer's FFN runs on them alone.
         """
         hidden_states = self.embed_tokens(input_ids)
         last = len(self.layers) - 1

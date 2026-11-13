@@ -11,36 +11,44 @@ from jinja2 import TemplateError
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import FINAL_PREFILL
-from mstar.engine.resources import (
-    AttentionConfig,
-    AttentionSpec,
-    AttnBackend,
-    DSAConfig,
-    DSASpec,
-    KVLayout,
-    KVSpec,
-    NodeResourceSpec,
-    PagedKVConfig,
-    PositionSpec,
-    ResourceReqConfig,
-    SamplerSpec,
-    SamplingReqConfig,
+from mstar.engine.state import (
+    Array,
+    Attend,
+    Causal,
+    Entry,
+    KVEntry,
+    LatentAttend,
+    LatentEntry,
+    Layout,
+    Positions,
+    Read,
+    Rope,
+    Sampler,
+    SampleSettings,
+    Selected,
+    Span,
+    TensorType,
+    TopK,
+    Value,
 )
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
-from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, WalkStep
+from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
+from mstar.model.base import KVLabel, Model, ProcessPromptOutput, WalkStep
 from mstar.model.components.request_kwargs import (
     SAMPLING_KEYS,
     generation_config_dir,
     sampling_defaults,
 )
+from mstar.model.glm52.components.indexer import is_full_indexer_layer
 from mstar.model.glm52.config import (
-    ATTN_RESOURCE,
-    DSA_RESOURCE,
+    ATTN,
+    INDEX_KEYS,
     KERNELS,
-    KV_RESOURCE,
-    POS_RESOURCE,
-    SAMPLER_RESOURCE,
+    KV,
+    MTP_SEED,
+    PROMPT_LEN,
+    SAMPLER,
+    TOPK,
     Glm52ModelConfig,
 )
 from mstar.model.multimodal import TEXT, PromptPart, chat_turns
@@ -48,6 +56,7 @@ from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.utils import (
     ByteLevelTextOutput,
     capture_ladder,
+    check_kv_pools_fit,
     load_snapshot_tokenizer,
     read_fp8_block_quant_config,
     resolve_checkpoint,
@@ -76,6 +85,7 @@ class Glm52Model(ByteLevelTextOutput, Model):
     """GLM-5.2: 753B MoE causal LM (MLA + DSA), text in / text out."""
 
     DECODE_LOOP = "decode_loop"
+    INTERNAL_KWARGS = (PROMPT_LEN,)
 
     # the conductor builds the fused-MoE align op before spawning the workers
     prebuild_fused_moe = True
@@ -139,6 +149,17 @@ class Glm52Model(ByteLevelTextOutput, Model):
             self.config.mtp_num_draft_tokens = k
         if self.config.mtp_num_draft_tokens > 0:
             self._check_mtp(kwargs)
+        if self.config.rope_interleave != self.config.indexer_rope_interleave:
+            # the index keys rotate through the latent array's Rope
+            raise ValueError(
+                f"rope_interleave={self.config.rope_interleave} and indexer_rope_interleave="
+                f"{self.config.indexer_rope_interleave}: GLM-5.2's indexer rotates as its MLA does")
+        if self.config.dsa_long_context and not is_full_indexer_layer(self.config, 0):
+            # a SHARED layer takes the pick of the FULL layer before it
+            raise ValueError(
+                "dsa_long_context needs layer 0 to be a FULL indexer layer, and the index schedule "
+                f"(index_skip_topk_offset={self.config.index_skip_topk_offset}, index_topk_freq="
+                f"{self.config.index_topk_freq}) makes it SHARED")
         # "byte" maps UTF-8 bytes to token ids for reduced serve (no HF IO).
         self._tokenizer_mode = kwargs.get("tokenizer_mode", "hf")
         self._tokenizer = None
@@ -147,16 +168,7 @@ class Glm52Model(ByteLevelTextOutput, Model):
             generation_config_dir(self.model_path_hf, cache_dir), DEFAULT_SAMPLING)
 
     def _check_mtp(self, kwargs: dict) -> None:
-        if self.config.dsa_long_context:
-            # the draft loop stays in the short-context regime; k-store sync
-            # and rewind for the sparse path are not written
-            raise ValueError(
-                "mtp_num_draft_tokens and dsa_long_context are mutually "
-                "exclusive: MTP drafting is short-context only"
-            )
         if self._config_variant in ("reduced", "reduced_fp8"):
-            from mstar.model.glm52.components.indexer import is_full_indexer_layer
-
             # reduced() has 2 trunk layers, which puts the MTP layer on a SHARED indexer
             # slot; grow the trunk so it lands FULL, as layer 78 does in the real geometry
             if not is_full_indexer_layer(self.config, self.config.num_hidden_layers):
@@ -195,79 +207,50 @@ class Glm52Model(ByteLevelTextOutput, Model):
         return self._tokenizer
 
     # -------------------------------------------------------------------
-    # Model ABC: resources
+    # Model ABC: state
     # -------------------------------------------------------------------
 
-    def get_node_resources(self) -> list[NodeResourceSpec]:
-        # Absorbed MLA caches one latent row per token per layer
-        # (kv_lora_rank + rope dims = 576) shared by all 64 query heads. No
-        # Yarn -> the softmax scale is plain qk_head_dim**-0.5. With MTP on,
-        # the layer-78 draft module keeps its KV in one extra layer plane at
-        # index num_hidden_layers, on the trunk's page table (draft-tail rows
-        # are overwritten as the verified stream advances into them).
-        num_kv_layers = self.config.num_hidden_layers + (
-            1 if self.config.mtp_num_draft_tokens > 0 else 0
-        )
-        nodes = {"LLM"}
-        if self.config.mla_absorb:
-            kv = PagedKVConfig(
-                num_layers=num_kv_layers,
-                num_kv_heads=1,
-                head_dim=self.config.cache_latent_dim,
-                max_seq_len=self.context_limit(),
-                num_qo_heads=self.config.num_attention_heads,
-                layout=KVLayout.MLA,
-                kv_lora_rank=self.config.kv_lora_rank,
-                qk_rope_head_dim=self.config.qk_rope_head_dim,
-            )
-            attn = AttentionSpec(
-                resource_key=ATTN_RESOURCE, nodes=nodes,
-                config=AttentionConfig(
-                    kv_cache=KV_RESOURCE,
-                    backend=AttnBackend.FLASHINFER_MLA,
-                    sm_scale=self.config.softmax_scale,
-                ),
-            )
+    def declare_state(self) -> list[Array | Sampler]:
+        cfg, k = self.config, self.config.mtp_num_draft_tokens
+        nodes = frozenset({"LLM"})
+        # the MTP layer's plane last
+        layers = frozenset(range(cfg.num_hidden_layers + (1 if k else 0)))
+        if cfg.mla_absorb:
+            entry = LatentEntry(rank=cfg.kv_lora_rank, rope_dim=cfg.qk_rope_head_dim)
+            op = LatentAttend(q_heads=cfg.num_attention_heads, scale=cfg.softmax_scale)
+            mask = Selected(of=INDEX_KEYS) if cfg.dsa_long_context else Causal()
         else:
-            # Naive fallback (reduced-test parity): full K/V padded to the
-            # FlashInfer head size, one KV head per query head.
-            kv = PagedKVConfig(
-                num_layers=num_kv_layers,
-                num_kv_heads=self.config.num_attention_heads,
-                head_dim=self.config.padded_head_dim,
-                max_seq_len=self.context_limit(),
-                num_qo_heads=self.config.num_attention_heads,
-            )
-            attn = AttentionSpec(
-                resource_key=ATTN_RESOURCE, nodes=nodes,
-                config=AttentionConfig(kv_cache=KV_RESOURCE),
-            )
-        specs = [
-            KVSpec(resource_key=KV_RESOURCE, nodes=nodes, config=kv),
-            attn,
-            # the layers and the indexer rotate q_pe / k_pe with it (apply_qk)
-            PositionSpec(
-                resource_key=POS_RESOURCE, nodes=nodes,
-                config=self.config.position_config(),
-            ),
-            # min-p only where the checkpoint defaults it; elsewhere a request's
-            # min_p > 0 is refused at admission
-            SamplerSpec(
-                resource_key=SAMPLER_RESOURCE, nodes=nodes,
-                vocab_size=self.config.vocab_size,
-                enable_min_p=bool(self.sampling_defaults.get("min_p")),
-            ),
+            # the naive path, at reduced sizes in the CPU tests
+            entry = KVEntry(heads=cfg.num_attention_heads, head_dim=cfg.padded_head_dim)
+            op, mask = Attend(q_heads=cfg.num_attention_heads), Causal()
+        rope = Rope(theta=cfg.rope_theta, rotary_dim=cfg.qk_rope_head_dim, interleave=cfg.rope_interleave,
+                    table_dtype=torch.float32)
+        state = [
+            Array(KV, nodes=nodes, layers=layers, entry=entry, max_len=self.context_limit(), verify_span=k + 1,
+                  reads={ATTN: Read(mask=mask, op=op)}, positions=Positions(rope=rope)),
+            # min-p only where the checkpoint defaults it; elsewhere a request's min_p > 0 is refused at admission
+            Sampler(SAMPLER, nodes=nodes, vocab_size=cfg.vocab_size, min_p=bool(self.sampling_defaults.get("min_p"))),
         ]
-        if self.config.dsa_long_context:
-            # past index_topk each query attends its indexer's top index_topk latents
-            specs.append(DSASpec(
-                resource_key=DSA_RESOURCE, nodes=nodes,
-                config=DSAConfig(kv_cache=KV_RESOURCE, topk=self.config.index_topk),
+        if cfg.dsa_long_context:
+            full = frozenset(i for i in range(cfg.num_hidden_layers) if is_full_indexer_layer(cfg, i))
+            state.append(Array(
+                INDEX_KEYS, nodes=nodes, layers=full, max_len=self.context_limit(),
+                entry=Entry({"k": TensorType((cfg.index_head_dim,), dtype=None)}),
+                reads={TOPK: Read(mask=Causal(), op=TopK(count=cfg.index_topk, heads=cfg.index_n_heads))},
             ))
-        return specs
+        if k:
+            # the state the next verify step drafts from, and its first draft
+            state.append(Value(MTP_SEED, nodes=nodes, layers=frozenset({0}), entry=Entry({
+                "hidden": TensorType((cfg.hidden_size,), dtype=None), "draft": TensorType((), dtype=torch.long),
+            })))
+        return state
+
+    def validate_config_yaml(self, config: dict, config_path: str) -> None:
+        super().validate_config_yaml(config, config_path)
+        check_kv_pools_fit(self, config, config_path, logger)
 
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
-        return {KV_RESOURCE: {"main": KVLabel(growth=(("decode", "decode_loop"),))}}
+        return {KV: {"main": KVLabel(growth=(("decode", "decode_loop"),))}}
 
     # -------------------------------------------------------------------
     # Model ABC: graph walk definitions
@@ -283,6 +266,11 @@ class Glm52Model(ByteLevelTextOutput, Model):
                 persist=True,
             ),
         ]
+        decode_outputs = [GraphEdge(next_node="LLM", name="text_inputs")]
+        if self.config.mtp_num_draft_tokens > 0:
+            # the tokens emitted so far, which a verify step cuts its verdict and checks its stop by
+            prefill_outputs.append(GraphEdge(next_node=EMPTY_DESTINATION, name="count", persist=True))
+            decode_outputs.append(GraphEdge(next_node="LLM", name="count"))
         prefill = GraphNode(
             name="LLM",
             input_names=["text_inputs"],
@@ -293,12 +281,9 @@ class Glm52Model(ByteLevelTextOutput, Model):
             name="decode_loop",
             section=GraphNode(
                 name="LLM",
-                input_names=["text_inputs"],
+                input_names=[edge.name for edge in decode_outputs],
                 outputs=[
-                    GraphEdge(
-                        next_node="LLM",
-                        name="text_inputs",
-                    ),
+                    *decode_outputs,
                     GraphEdge(
                         next_node=EMIT_TO_CLIENT,
                         name="new_token",
@@ -325,10 +310,12 @@ class Glm52Model(ByteLevelTextOutput, Model):
         input_signals: dict[str, list[TensorPointerInfo]],
         model_kwargs: dict,
     ) -> list[WalkStep]:
-        # one prefill over the prompt, then decode until the stop check ends it
+        # one prefill over the prompt, then decode until the stop check ends it. A verify step's stop reads the
+        # prompt's length, and the prefill's under MTP too.
+        prompt = {PROMPT_LEN: model_kwargs[PROMPT_LEN]} if self.config.mtp_num_draft_tokens > 0 else {}
         return [
-            WalkStep("prefill", step_metadata={FINAL_PREFILL: True}),
-            WalkStep("decode", bind={"text_inputs": "new_token"}),
+            WalkStep("prefill", step_metadata={FINAL_PREFILL: True, **prompt}),
+            WalkStep("decode", bind={"text_inputs": "new_token"}, step_metadata=prompt),
         ]
 
     # -------------------------------------------------------------------
@@ -347,7 +334,7 @@ class Glm52Model(ByteLevelTextOutput, Model):
         if prompt is None:
             return {}
         # read here, in the data worker: a bad knob is the client's 400 before any work
-        sampling = self.get_request_resource_configs([], [], kwargs)[SAMPLER_RESOURCE]
+        sampling = self.get_request_resource_configs([], [], kwargs)[SAMPLER]
         if self.config.mtp_num_draft_tokens > 0:
             # refused here as a 400; prepare_inputs would refuse it as a 500
             if sampling.temperature != 0 or sampling.repetition_penalty != 1:
@@ -372,9 +359,12 @@ class Glm52Model(ByteLevelTextOutput, Model):
                 f"at most {self.config.max_prompt_tokens}"
             )
         n = input_ids.numel()
-        layout = LabelLayout(spans=(Span("ids", "prefill", n, n, "text_inputs"),), growth=(("decode_loop", 1),))
+        kv = Layout(spans=(Span("ids", "prefill", n, n, "text_inputs"),), growth=(("decode_loop", 1),))
+        layouts = {KV: {"main": kv}}
+        if self.config.mtp_num_draft_tokens > 0:
+            layouts[MTP_SEED] = {"main": Layout()}
         return ProcessPromptOutput(
-            {"text_inputs": [input_ids.to(torch.long)]}, {"kv_layout": {KV_RESOURCE: {"main": layout}}},
+            {"text_inputs": [input_ids.to(torch.long)]}, {"state_layout": layouts, PROMPT_LEN: n},
         )
 
     def _render_chat(self, prompt: str, prompt_parts: list[PromptPart] | None) -> torch.Tensor:
@@ -403,7 +393,7 @@ class Glm52Model(ByteLevelTextOutput, Model):
 
     def get_request_resource_configs(
         self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
-    ) -> dict[str, ResourceReqConfig]:
+    ) -> dict[str, SampleSettings]:
         del input_modalities, output_modalities
         model_kwargs = normalize_generation_kwargs(model_kwargs)
         params = {
@@ -414,7 +404,7 @@ class Glm52Model(ByteLevelTextOutput, Model):
             # greedy by default under MTP, so a request that names no temperature serves
             # rather than being refused; an explicit temperature > 0 still is
             params["temperature"] = 0.0
-        return {SAMPLER_RESOURCE: SamplingReqConfig(**params)}
+        return {SAMPLER: SampleSettings(**params)}
 
     def request_kwargs(self) -> frozenset[str]:
         return frozenset({"max_output_tokens", *SAMPLING_KEYS})
