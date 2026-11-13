@@ -325,7 +325,7 @@ def test_every_published_config_of_the_five_is_covered():
     assert stems == {
         "canary_qwen", "qwen3_asr", "qwen3_asr_split", "qwen3_asr_realtime", "qwen3_asr_realtime_split", "parakeet",
         "nemotron_asr", "fish_s2_pro", "qwen3tts", "qwen3tts_split", "qwen3tts_1p7b", "qwen3tts_1p7b_split",
-        "qwen3tts_base", "qwen3tts_voicedesign",
+        "qwen3tts_base", "qwen3tts_base_split", "qwen3tts_voicedesign",
     }, "a config here that the port never compares would change with no test noticing"
 
 

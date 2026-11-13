@@ -105,13 +105,27 @@ impl PlanShape {
             frame_seconds: policy.window_frame_seconds.unwrap_or(super::CUT_FRAME_SECONDS),
         }
     }
+
+    /// Whether `WindowPlanner` answers an upload of `seconds` by its header
+    /// with one window and nothing decoded: within the 30 minute cap, and with
+    /// no clip bound or no longer than the whole window (`WindowPlanner.single`).
+    fn plans_whole(&self, seconds: f64) -> bool {
+        seconds <= MAX_DURATION_SECONDS
+            && match self.max_seconds {
+                None => true,
+                Some(max) => seconds <= self.whole_seconds.unwrap_or(max),
+            }
+    }
 }
 
 /// The API server's `WindowPlanner` for one upload, over the bridge: it
 /// decodes the upload with the model's loader and writes each window as a
 /// WAV beside it. Dropping it has the planner delete the upload and its
-/// windows (`cleanup`).
+/// windows (`cleanup`). A PCM WAV of one window is planned here from its
+/// header instead, with no bridge, and dropping it deletes the upload.
 pub struct Planner {
+    /// None when no planner in the API server holds the upload (mock mode, or
+    /// planned here from its header): dropping this deletes it.
     bridge: Option<Arc<crate::bridge::Bridge>>,
     id: String,
     timeout: Duration,
@@ -125,8 +139,13 @@ pub struct Planner {
 impl Planner {
     /// Plan an upload: the planner refuses one past the 30 minute cap, and
     /// decodes one that will be windowed (or has no length in its header), so a
-    /// file its decoder refuses fails before any window runs.
-    pub async fn open(st: &AppState, audio_path: String, shape: PlanShape) -> Result<Planner, OpError> {
+    /// file its decoder refuses fails before any window runs. `wav_seconds` is
+    /// the upload's length from its WAV header (`wav_header_seconds`), where it
+    /// has one: an upload that is one window by it gets the planner's answer
+    /// here, as one window with nothing decoded, and no message to the planner.
+    pub async fn open(
+        st: &AppState, audio_path: String, shape: PlanShape, wav_seconds: Option<f64>,
+    ) -> Result<Planner, OpError> {
         let mut planner = Planner {
             bridge: st.bridge.clone(),
             id: uuid::Uuid::new_v4().simple().to_string(),
@@ -137,6 +156,12 @@ impl Planner {
         };
         if planner.bridge.is_none() {
             return Ok(planner); // mock mode: the whole file, of unknown length
+        }
+        if let Some(seconds) = wav_seconds.filter(|&seconds| shape.plans_whole(seconds)) {
+            planner.duration = Some(seconds);
+            planner.bridge = None;
+            LOCAL_UPLOADS.lock().expect("local uploads lock").insert(planner.audio_path.clone());
+            return Ok(planner);
         }
         let op = json!({
             "op": "plan", "path": planner.audio_path, "max_seconds": shape.max_seconds,
@@ -213,10 +238,97 @@ impl Drop for Planner {
             // made (the plan was refused, or never answered) the upload alone
             Some(bridge) => bridge.close_windows(&self.id, &self.audio_path),
             None => {
-                let _ = std::fs::remove_file(&self.audio_path);
+                let path = std::mem::take(&mut self.audio_path);
+                let remove = move || {
+                    let _ = std::fs::remove_file(&path);
+                    LOCAL_UPLOADS.lock().expect("local uploads lock").remove(&path);
+                };
+                // an unlink can stall on a slow volume: off the async workers, as the save is
+                match tokio::runtime::Handle::try_current() {
+                    Ok(runtime) => drop(runtime.spawn_blocking(remove)),
+                    Err(_) => remove(),
+                }
             }
         }
     }
+}
+
+/// The planner's cap on an upload's length (`MAX_DURATION_SECONDS`).
+const MAX_DURATION_SECONDS: f64 = 30.0 * 60.0;
+
+/// Uploads planned here and not yet deleted. An exit that skips their `Drop`
+/// (the drain deadline), or a shutdown that drops it after the runtime's
+/// blocking pool has stopped, deletes them with `remove_local_uploads`.
+static LOCAL_UPLOADS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Delete the uploads planned here that are still held (`LOCAL_UPLOADS`).
+pub fn remove_local_uploads() {
+    for path in LOCAL_UPLOADS.lock().expect("local uploads lock").drain() {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// The length in seconds of a WAV upload as libsndfile reads it (`sf.info`):
+/// whole frames of the data chunk, cut to the bytes the upload holds. Only for
+/// headers whose length libsndfile reads the same way: 8 to 32-bit PCM or
+/// 32/64-bit float (or EXTENSIBLE carrying one), packed frames, at most 1,024
+/// channels, one `fmt ` chunk, a sized data chunk, both in the first 4 KiB.
+/// None for anything else, which the planner then reads.
+pub fn wav_header_seconds(audio: &[u8]) -> Option<f64> {
+    // subformat GUIDs of KSDATAFORMAT_SUBTYPE_PCM / _IEEE_FLOAT past their first two bytes
+    const GUID_TAIL: [u8; 14] = [0, 0, 0, 0, 0x10, 0, 0x80, 0, 0, 0xAA, 0, 0x38, 0x9B, 0x71];
+    let head = &audio[..audio.len().min(4096)];
+    if head.len() < 12 || &head[0..4] != b"RIFF" || &head[8..12] != b"WAVE" {
+        return None;
+    }
+    let u16_at = |at: usize| Some(u16::from_le_bytes(head.get(at..at + 2)?.try_into().ok()?));
+    let u32_at = |at: usize| Some(u32::from_le_bytes(head.get(at..at + 4)?.try_into().ok()?));
+    let (mut at, mut fmt) = (12usize, None);
+    while at + 8 <= head.len() {
+        let size = u32_at(at + 4)? as usize;
+        match &head[at..at + 4] {
+            b"fmt " => {
+                let mut code = u16_at(at + 8)?;
+                if fmt.is_some() || size < 16 || (code == 0xFFFE && size < 40) {
+                    return None;
+                }
+                if code == 0xFFFE {
+                    if head.get(at + 34..at + 48)? != GUID_TAIL {
+                        return None;
+                    }
+                    code = u16_at(at + 32)?;
+                }
+                let (channels, rate) = (u16_at(at + 10)? as usize, u32_at(at + 12)?);
+                let (block, bits) = (u16_at(at + 20)? as usize, u16_at(at + 22)? as usize);
+                let widths_libsndfile_reads = match code {
+                    1 => matches!(bits, 8 | 16 | 24 | 32),
+                    3 => matches!(bits, 32 | 64),
+                    _ => false,
+                };
+                // libsndfile counts frames of channels x whole bytes per sample
+                if !widths_libsndfile_reads || !(1..=1024).contains(&channels)
+                    || !(1..=768_000).contains(&rate) || block != channels * bits / 8
+                {
+                    return None;
+                }
+                fmt = Some((rate, block));
+            }
+            b"data" => {
+                let (rate, block) = fmt?;
+                // a streamed or unclosed header leaves the size unknown, and
+                // libsndfile reads to the end of the file
+                if size == 0 || size == 0xFFFF_FFFF {
+                    return None;
+                }
+                let bytes = size.min(audio.len() - (at + 8).min(audio.len()));
+                return Some((bytes / block) as f64 / rate as f64);
+            }
+            _ => {}
+        }
+        at = at.checked_add(8 + size + (size & 1))?;
+    }
+    None
 }
 
 /// `WindowShare`: the windows one upload cut in parallel keeps on the engine.
@@ -643,6 +755,125 @@ mod tests {
         assert_eq!(ladder.iter().map(|(t, _)| *t).collect::<Vec<_>>(), vec![0.0, 0.0, 0.2, 0.4, 0.6, 0.8, 1.0]);
         let pinned = TranscriptionRequest { temperature: Some(0.3), ..TranscriptionRequest::default() };
         assert_eq!(attempts(&pinned, None), vec![(0.3, None)]);
+    }
+
+    /// A WAV header with a 16-byte fmt chunk of `code`, then `data` bytes.
+    fn wav(code: u16, channels: u16, rate: u32, block: u16, bits: u16, data: usize) -> Vec<u8> {
+        let mut out = b"RIFF\0\0\0\0WAVEfmt \x10\0\0\0".to_vec();
+        out.extend_from_slice(&code.to_le_bytes());
+        out.extend_from_slice(&channels.to_le_bytes());
+        out.extend_from_slice(&rate.to_le_bytes());
+        out.extend_from_slice(&(rate * block as u32).to_le_bytes());
+        out.extend_from_slice(&block.to_le_bytes());
+        out.extend_from_slice(&bits.to_le_bytes());
+        out.extend_from_slice(b"data");
+        out.extend_from_slice(&(data as u32).to_le_bytes());
+        out.resize(out.len() + data, 0);
+        out
+    }
+
+    /// `wav` with `chunk` inserted before the `data` chunk.
+    fn with_chunk_before_data(wav: &[u8], chunk: &[u8]) -> Vec<u8> {
+        let data = wav.windows(4).position(|w| w == b"data").unwrap();
+        [&wav[..data], chunk, &wav[data..]].concat()
+    }
+
+    /// An EXTENSIBLE header carrying `code`: a 40-byte fmt chunk, then `data` bytes.
+    fn extensible(code: u16, data: usize) -> Vec<u8> {
+        let mut out = wav(0xFFFE, 1, 16_000, 4, 32, data);
+        let mut ext = vec![22u8, 0, 32, 0, 4, 0, 0, 0];
+        ext.extend_from_slice(&code.to_le_bytes());
+        ext.extend_from_slice(&[0, 0, 0, 0, 0x10, 0, 0x80, 0, 0, 0xAA, 0, 0x38, 0x9B, 0x71]);
+        out[16..20].copy_from_slice(&40u32.to_le_bytes());
+        let data_at = out.windows(4).position(|w| w == b"data").unwrap();
+        out.splice(data_at..data_at, ext);
+        out
+    }
+
+    #[test]
+    fn a_wav_header_gives_libsndfiles_length() {
+        // 16-bit mono, 16-bit stereo, 24-bit mono, 8-bit mono, float mono
+        assert_eq!(wav_header_seconds(&wav(1, 1, 16_000, 2, 16, 48_000)), Some(1.5));
+        assert_eq!(wav_header_seconds(&wav(1, 2, 48_000, 4, 16, 48_000)), Some(0.25));
+        assert_eq!(wav_header_seconds(&wav(1, 1, 16_000, 3, 24, 48_000)), Some(1.0));
+        assert_eq!(wav_header_seconds(&wav(1, 1, 8_000, 1, 8, 4_000)), Some(0.5));
+        assert_eq!(wav_header_seconds(&wav(3, 1, 16_000, 4, 32, 64_000)), Some(1.0));
+        assert_eq!(wav_header_seconds(&extensible(3, 64_000)), Some(1.0));
+        assert_eq!(wav_header_seconds(&extensible(1, 64_000)), Some(1.0));
+        // an odd-sized chunk before the data, padded to even
+        let listed = with_chunk_before_data(&wav(1, 1, 16_000, 2, 16, 48_000), b"LIST\x03\0\0\0abc\0");
+        assert_eq!(wav_header_seconds(&listed), Some(1.5));
+        // a data chunk claiming more than the upload holds is cut to the upload,
+        // and a part frame is not counted
+        let cut = wav(1, 1, 16_000, 2, 16, 48_000);
+        assert_eq!(wav_header_seconds(&cut[..cut.len() - 16_001]), Some(1.0 - 1.0 / 16_000.0));
+    }
+
+    #[test]
+    fn a_header_libsndfile_may_read_differently_is_left_to_the_planner() {
+        let none = |audio: &[u8]| assert_eq!(wav_header_seconds(audio), None);
+        // frames padded past whole bytes per sample (libsndfile counts them unpadded)
+        none(&wav(1, 1, 16_000, 4, 16, 32_000));
+        none(&wav(1, 1, 16_000, 4, 24, 32_000));
+        // compressed, or no channels or bits
+        none(&wav(0x55, 1, 16_000, 2, 16, 32_000));
+        none(&wav(1, 0, 16_000, 2, 16, 32_000));
+        none(&wav(1, 1, 16_000, 2, 0, 32_000));
+        // a short fmt chunk, a second fmt chunk, an EXTENSIBLE one with a foreign GUID
+        let mut short = wav(1, 1, 16_000, 2, 16, 32_000);
+        short[16..20].copy_from_slice(&14u32.to_le_bytes());
+        none(&short);
+        let fmt = wav(1, 1, 16_000, 2, 16, 0)[12..36].to_vec();
+        none(&with_chunk_before_data(&wav(1, 1, 16_000, 2, 16, 32_000), &fmt));
+        let mut foreign = extensible(1, 32_000);
+        foreign[50] ^= 0xFF;
+        none(&foreign);
+        // widths, channel counts and rates libsndfile refuses
+        none(&wav(3, 1, 16_000, 2, 16, 32_000));
+        none(&wav(3, 1, 16_000, 3, 24, 48_000));
+        none(&wav(1, 1, 16_000, 5, 40, 80_000));
+        none(&wav(1, 2000, 16_000, 4000, 16, 4000));
+        none(&wav(1, 1, 4_000_000_000, 2, 16, 32_000));
+        // an unclosed header's empty data chunk, which libsndfile reads to the end
+        let mut unclosed = wav(1, 1, 16_000, 2, 16, 32_000);
+        unclosed[40..44].copy_from_slice(&0u32.to_le_bytes());
+        none(&unclosed);
+        // data before fmt, a streamed size, data past the first 4 KiB, not a WAV
+        let wav16 = wav(1, 1, 16_000, 2, 16, 32_000);
+        none(&[&wav16[..12], &wav16[36..], &wav16[12..36]].concat());
+        let mut streamed = wav16.clone();
+        streamed[40..44].copy_from_slice(&u32::MAX.to_le_bytes());
+        none(&streamed);
+        let junk = [b"JUNK".as_slice(), &5000u32.to_le_bytes(), &[0u8; 5000]].concat();
+        none(&with_chunk_before_data(&wav16, &junk));
+        none(b"fLaC\0\0\0\x22");
+        none(b"");
+    }
+
+    #[test]
+    fn local_uploads_left_at_exit_are_deleted() {
+        let path = std::env::temp_dir().join(format!("local-upload-{}.wav", std::process::id()));
+        std::fs::write(&path, b"RIFF").unwrap();
+        let path = path.to_string_lossy().into_owned();
+        LOCAL_UPLOADS.lock().unwrap().insert(path.clone());
+        remove_local_uploads();
+        assert!(!std::path::Path::new(&path).exists());
+        assert!(!LOCAL_UPLOADS.lock().unwrap().contains(&path));
+    }
+
+    #[test]
+    fn a_header_plans_one_window_as_the_planner_would() {
+        let shape = |max_seconds, whole_seconds| PlanShape {
+            max_seconds, whole_seconds, balanced: false, search_seconds: 2.0, frame_seconds: 0.1,
+        };
+        // a clip bound: up to the whole window, which defaults to the bound
+        assert!(shape(Some(30.0), None).plans_whole(30.0));
+        assert!(!shape(Some(30.0), None).plans_whole(30.01));
+        assert!(shape(Some(30.0), Some(40.0)).plans_whole(40.0));
+        assert!(!shape(Some(30.0), Some(20.0)).plans_whole(25.0));
+        // no bound: any length within the 30 minute cap
+        assert!(shape(None, Some(10.0)).plans_whole(1800.0));
+        assert!(!shape(None, None).plans_whole(1800.01));
     }
 
     #[test]
