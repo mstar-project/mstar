@@ -88,14 +88,16 @@ ALLOWED_IN_FUNCTION = {
 # what a module defines to be handed the node's built resources, rather than its handles (`bind_state`)
 RESOURCE_BINDS = {"bind_resources", "bind_node_resources"}
 _LORA = "the opt-in LoRA spec, which the contract doesn't declare"
-# The ported files that still write a spec by hand in `get_node_resources`.
+# The ported files that still write a spec by hand in `get_node_resources`, each with the one call its override
+# returns: a listed file can't return a second spec, which a shared module the lint doesn't read could build.
 ALLOWED_NODE_RESOURCES = {
-    "mstar/model/qwen3_5/qwen3_5_model.py": _LORA,
-    "mstar/model/qwen3_omni/qwen3_omni_model.py": _LORA,
-    "mstar/model/orpheus/orpheus_model.py": _LORA,
-    "mstar/model/qwen3_tts/qwen3_tts_model.py": _LORA,
+    "mstar/model/qwen3_5/qwen3_5_model.py": ("qwen3_5_lora_spec", _LORA),
+    "mstar/model/qwen3_omni/qwen3_omni_model.py": ("self._lora_spec", _LORA),
+    "mstar/model/orpheus/orpheus_model.py": ("self._lora_spec", _LORA),
+    "mstar/model/qwen3_tts/qwen3_tts_model.py": ("self._lora_spec", _LORA),
     "mstar/model/minimax_h3/minimax_h3_model.py": (
-        "the video decoder's sequence shard, which a contract SeqShard can't declare since the decoder has no arrays"
+        "SeqShardSpec",
+        "the video decoder's sequence shard, which a contract SeqShard can't declare since the decoder has no arrays",
     ),
 }
 ADAPTERS = "mstar.engine.state.adapters"
@@ -137,6 +139,16 @@ def _in_functions(node: ast.AST, prefix: str = "", function: str | None = None):
             yield from _in_functions(child, prefix, function)
 
 
+def _returns_one(function: ast.FunctionDef, call: str) -> bool:
+    """Whether every return of ``function`` is a list of one call to ``call``."""
+    returns = [node.value for node in ast.walk(function) if isinstance(node, ast.Return)]
+    return bool(returns) and all(
+        isinstance(value, ast.List) and len(value.elts) == 1 and isinstance(value.elts[0], ast.Call)
+        and ast.unparse(value.elts[0].func) == call
+        for value in returns
+    )
+
+
 def _violations(source: str, path: str = "") -> tuple[list[str], set[tuple[str, ...]]]:
     """What ``source``, the file at ``path``, does that the lint refuses, and the exceptions it used."""
     found, used = [], set()
@@ -160,8 +172,11 @@ def _violations(source: str, path: str = "") -> tuple[list[str], set[tuple[str, 
         elif isinstance(node, ast.FunctionDef) and node.name in RESOURCE_BINDS:
             found.append(f"def {node.name} at line {node.lineno}, which takes the built resources")
         elif isinstance(node, ast.FunctionDef) and node.name == "get_node_resources":
-            if path in ALLOWED_NODE_RESOURCES:
+            call = ALLOWED_NODE_RESOURCES.get(path, ("",))[0]
+            if call and _returns_one(node, call):
                 used.add(path)
+            elif call:
+                found.append(f"def get_node_resources at line {node.lineno}, which returns more than its one `{call}`")
             else:
                 found.append(f"def get_node_resources at line {node.lineno}, where `declare_state` declares the state")
         elif isinstance(node, ast.Attribute) and node.attr in FORBIDDEN_ATTRIBUTES:
@@ -245,7 +260,7 @@ def test_a_ported_package_reaches_the_engine_only_through_the_contract(path):
     assert not found, (
         f"{path} reaches past the contract: {found}. Reach the engine through `mstar.engine.state`. An import a model "
         "can't avoid goes in ALLOWED with its reason, and state the contract can't declare yet needs its mask or op "
-        "and binding in adapters.py first."
+        "and binding in adapters.py first, not a spec returned from `get_node_resources`."
     )
 
 
