@@ -440,7 +440,7 @@ def checklist(review, pages, stacked, extra=(), approving=False):
     fixes (merge together), then `extra` (what the live-test job's rule found), the design decisions, questions,
     open P2s and skipped files. P3s and latent bugs aren't decisions. Past ten lines the rest fold away, so a
     question or decision, whose only home this is, is never lost. `approving`: the bot may approve over them, which
-    the closing line says unless the review's risk is high, security-relevant or has an untestable part."""
+    the closing line says."""
     found = open_findings(review, pages, stacked)
     review = inert(judged(review, stacked))
 
@@ -468,12 +468,8 @@ def checklist(review, pages, stacked, extra=(), approving=False):
     if lines[10:]:
         rest = "\n".join(lines[10:])
         text += f"\n\n<details><summary>and {len(lines) - 10} more</summary>\n\n{rest}\n\n</details>"
-    risk = review.get("risk") or {}
-    # The review's own fields only; the paths the bot never approves (gpu_review.file_gate) it reads from GitHub.
-    can_approve = risk.get("level") != "high" and not risk.get("security") \
-        and not (review.get("live_test") or {}).get("untestable")
-    return text + ("\n\nApprove if you're OK with these. The bot approves over open questions and a medium design "
-                   "risk, so object on the PR if you aren't." if approving and can_approve else "")
+    return text + ("\n\nApprove if you're OK with these. If the bot approves, it does so over open questions "
+                   "and a medium design risk, so object on the PR if you aren't." if approving else "")
 
 
 def render(review, pages, head, mode, stacked, salvaged=False, team=False):
