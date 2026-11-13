@@ -592,7 +592,8 @@ class RopeManager(PositionManager):
         counters = self._counters
         pos_ids: list[int] = []
         append, extend = pos_ids.append, pos_ids.extend
-        for rid, label, to_compute in rows:
+        for row in rows:
+            rid, label, to_compute = row[0], row[1], row[2]  # a Segment may carry more
             labels = counters.get(rid)
             start = labels.get(label, 0) if labels is not None else 0
             if to_compute == 1:
@@ -942,7 +943,8 @@ class LongRopeManager(RopeManager):
         table_ids: list[int] = []
         pos_append, pos_extend = pos_ids.append, pos_ids.extend
         table_append, table_extend = table_ids.append, table_ids.extend
-        for rid, label, to_compute in rows:
+        for row in rows:
+            rid, label, to_compute = row[0], row[1], row[2]  # a Segment may carry more
             labels = counters.get(rid)
             start = labels.get(label, 0) if labels is not None else 0
             row = start + offset if rid in long_rids else start
