@@ -1,0 +1,917 @@
+{
+ "about": "Replies as a model writes them, per tool-call format, and what the parser makes of them: reasoning_content, content, each call's name and arguments (exact text), finish_reason. tools names a set in toolsets; forced_call is the call a forced tool_choice opened in the prompt (a name, or \"\" for the model to name one): the reply starts after the format's forced prefix for it; single_call is parallel_tool_calls: false. test_chat_reply_corpus.py feeds each reply whole and split at every byte. A case taken from a reference engine names it in source (engine@commit and file::test, or a parity fixture's case, whose text the real model wrote); where this parser reads it otherwise, note says how and why.",
+ "toolsets": {
+  "weather": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer"
+       }
+      }
+     }
+    }
+   }
+  ],
+  "lookup": [
+   {
+    "type": "function",
+    "function": {
+     "name": "lookup",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "zip": {
+        "type": "string"
+       },
+       "n": {
+        "type": "integer"
+       },
+       "exact": {
+        "type": "boolean"
+       },
+       "opts": {
+        "type": "object"
+       },
+       "tags": {
+        "type": "array"
+       },
+       "note": {
+        "type": [
+         "string",
+         "null"
+        ]
+       }
+      }
+     }
+    }
+   }
+  ],
+  "files": [
+   {
+    "type": "function",
+    "function": {
+     "name": "read_file",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "ls",
+     "parameters": {
+      "type": "object",
+      "properties": {}
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "write_file",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "path": {
+        "type": "string"
+       },
+       "content": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   }
+  ],
+  "vllm_glm47": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_current_date",
+     "parameters": {}
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "date": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   }
+  ],
+  "sglang_glm47": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "date": {
+        "type": "string"
+       }
+      },
+      "required": [
+       "city",
+       "date"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "todo_write",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "todos": {
+        "type": "array"
+       }
+      },
+      "required": [
+       "todos"
+      ]
+     }
+    }
+   }
+  ]
+ },
+ "cases": [
+  {
+   "format": "glm47",
+   "id": "reasoning-then-answer",
+   "thinking": true,
+   "tools": null,
+   "forced_call": null,
+   "single_call": false,
+   "text": "The user wants 2 + 2. That is 4.</think>The answer is 4.",
+   "expect": {
+    "reasoning_content": "The user wants 2 + 2. That is 4.",
+    "content": "The answer is 4.",
+    "tool_calls": [],
+    "finish_reason": "stop"
+   }
+  },
+  {
+   "format": "glm47",
+   "id": "thinking-off-answer",
+   "thinking": false,
+   "tools": "weather",
+   "forced_call": null,
+   "single_call": false,
+   "text": "Hello there!",
+   "expect": {
+    "reasoning_content": "",
+    "content": "Hello there!",
+    "tool_calls": [],
+    "finish_reason": "stop"
+   }
+  },
+  {
+   "format": "glm47",
+   "id": "answer-stripped-at-both-ends",
+   "thinking": true,
+   "tools": null,
+   "forced_call": null,
+   "single_call": false,
+   "text": "ok</think>\n\n  Paris.  \n",
+   "expect": {
+    "reasoning_content": "ok",
+    "content": "Paris.",
+    "tool_calls": [],
+    "finish_reason": "stop"
+   }
+  },
+  {
+   "format": "glm47",
+   "id": "one-call-after-content",
+   "thinking": true,
+   "tools": "weather",
+   "forced_call": null,
+   "single_call": false,
+   "text": "Need the weather tool.</think>Checking.<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value><arg_key>days</arg_key><arg_value>3</arg_value></tool_call>",
+   "expect": {
+    "reasoning_content": "Need the weather tool.",
+    "content": "Checking.",
+    "tool_calls": [
+     {
+      "name": "get_weather",
+      "arguments": "{\"city\": \"Paris\", \"days\": 3}"
+     }
+    ],
+    "finish_reason": "tool_calls"
+   }
+  },
+  {
+   "format": "glm47",
+   "id": "two-calls",
+   "thinking": true,
+   "tools": "weather",
+   "forced_call": null,
+   "single_call": false,
+   "text": "Two cities.</think><tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>\n<tool_call>get_weather<arg_key>city</arg_key><arg_value>Rome</arg_value><arg_key>days</arg_key><arg_value>2</arg_value></tool_call>",
+   "expect": {
+    "reasoning_content": "Two cities.",
+    "content": "",
+    "tool_calls": [
+     {
+      "name": "get_weather",
+      "arguments": "{\"city\": \"Paris\"}"
+     },
+     {
+      "name": "get_weather",
+      "arguments": "{\"city\": \"Rome\", \"days\": 2}"
+     }
+    ],
+    "finish_reason": "tool_calls"
+   }
+  },
+  {
+   "format": "glm47",
+   "id": "call-ends-reasoning-without-close",
+   "thinking": true,
+   "tools": "weather",
+   "forced_call": null,
+   "single_call": false,
+   "text": "Look it up <tool_call>get_weather<arg_key>city</arg_key><arg_value>Oslo</arg_value></tool_call>",
+   "expect": {
+    "reasoning_content": "Look it up ",
+    "content": "",
+    "tool_calls": [
+     {
+      "name": "get_weather",
+      "arguments": "{\"city\": \"Oslo\"}"
+     }
+    ],
+    "finish_reason": "tool_calls"
+   },
+   "note": "a call may end the reasoning without </think>, as vLLM's glm47 parser reads it"
+  },
+  {
+   "format": "glm47",
+   "id": "think-reopens-in-answer",
+   "thinking": true,
+   "tools": null,
+   "forced_call": null,
+   "single_call": false,
+   "text": "a</think>b<think>c</think>d",
+   "expect": {
+    "reasoning_content": "ac",
+    "content": "bd",
+    "tool_calls": [],
+    "finish_reason": "stop"
+   }
+  },
+  {
+   "format": "glm47",
+   "id": "stray-think-close-in-answer-drops",
+   "thinking": true,
+   "tools": null,
+   "forced_call": null,
+   "single_call": false,
+   "text": "a</think>b</think>c",
+   "expect": {
+    "reasoning_content": "a",
+    "content": "bc",
+    "tool_calls": [],
+    "finish_reason": "stop"
+   }
+  },
+  {
+   "format": "glm47",
+   "id": "typed-values-by-schema",
+   "thinking": false,
+   "tools": "lookup",
+   "forced_call": null,
+   "single_call": false,
+   "text": "<tool_call>lookup<arg_key>zip</arg_key><arg_value>94110</arg_value><arg_key>n</arg_key><arg_value>3.0</arg_value><arg_key>exact</arg_key><arg_value>true</arg_value><arg_key>opts</arg_key><arg_value>{\"a\": [1, \"<\"]}</arg_value><arg_key>tags</arg_key><arg_value>[\"x\", \"y\"]</arg_value><arg_key>note</arg_key><arg_value>null</arg_value></tool_call>",
+   "expect": {
+    "reasoning_content": "",
+    "content": "",
+    "tool_calls": [
+     {
+      "name": "lookup",
+      "arguments": "{\"zip\": \"94110\", \"n\": 3, \"exact\": true, \"opts\": {\"a\": [1, \"<\"]}, \"tags\": [\"x\", \"y\"], \"note\": \"null\"}"
+     }
+    ],
+    "finish_reason": "tool_calls"
+   },
+   "note": "a value the schema allows only as a string stays one; an integer written 3.0 is 3"
+  },
+  {
+   "format": "glm47",
+   "id": "overflowing-number-stays-text",
+   "thinking": false,
+   "tools": "lookup",
+   "forced_call": null,
+   "single_call": false,
+   "text": "<tool_call>lookup<arg_key>n</arg_key><arg_value>1e400</arg_value></tool_call>",
+   "expect": {
+    "reasoning_content": "",
+    "content": "",
+    "tool_calls": [
+     {
+      "name": "lookup",
+      "arguments": "{\"n\": \"1e400\"}"
+     }
+    ],
+    "finish_reason": "tool_calls"
+   }
+  },
+  {
+   "format": "glm47",
+   "id": "markup-inside-a-value",
+   "thinking": false,
+   "tools": "files",
+   "forced_call": null,
+   "single_call": false,
+   "text": "<tool_call>write_file<arg_key>path</arg_key><arg_value>a.html</arg_value><arg_key>content</arg_key><arg_value><div>\n  <p>x</p>\n</div></arg_value></tool_call>",
+   "expect": {
+    "reasoning_content": "",
+    "content": "",
+    "tool_calls": [
+     {
+      "name": "write_file",
+      "arguments": "{\"path\": \"a.html\", \"content\": \"<div>\\n  <p>x</p>\\n</div>\"}"
+     }
+    ],
+    "finish_reason": "tool_calls"
+   }
+  },
+  {
+   "format": "glm47",
+   "id": "unicode-everywhere",
+   "thinking": true,
+   "tools": "weather",
+   "forced_call": null,
+   "single_call": false,
+   "text": "思考中 😀</think>天气 ✓ <tool_call>get_weather<arg_key>city</arg_key><arg_value>東京</arg_value></tool_call>",
+   "expect": {
+    "reasoning_content": "思考中 😀",
+    "content": "天气 ✓",
+    "tool_calls": [
+     {
+      "name": "get_weather",
+      "arguments": "{\"city\": \"東京\"}"
+     }
+    ],
+    "finish_reason": "tool_calls"
+   }
+  },
+  {
+   "format": "glm47",
+   "id": "unoffered-function-stays-text",
+   "thinking": false,
+   "tools": "weather",
+   "forced_call": null,
+   "single_call": false,
+   "text": "ok <tool_call>rm_rf<arg_key>path</arg_key><arg_value>/</arg_value></tool_call>",
+   "expect": {
+    "reasoning_content": "",
+    "content": "ok <tool_call>rm_rf<arg_key>path</arg_key><arg_value>/</arg_value></tool_call>",
+    "tool_calls": [],
+    "finish_reason": "stop"
+   }
+  },
+  {
+   "format": "glm47",
+   "id": "no-tools-call-tag-is-text",
+   "thinking": false,
+   "tools": null,
+   "forced_call": null,
+   "single_call": false,
+   "text": "x <tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>",
+   "expect": {
+    "reasoning_content": "",
+    "content": "x <tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>",
+    "tool_calls": [],
+    "finish_reason": "stop"
+   }
+  },
+  {
+   "format": "glm47",
+   "id": "key-without-value-drops",
+   "thinking": false,
+   "tools": "weather",
+   "forced_call": null,
+   "single_call": false,
+   "text": "<tool_call>get_weather<arg_key>city</arg_key> stray <arg_key>days</arg_key><arg_value>2</arg_value></tool_call>",
+   "expect": {
+    "reasoning_content": "",
+    "content": "",
+    "tool_calls": [
+     {
+      "name": "get_weather",
+      "arguments": "{\"days\": 2}"
+     }
+    ],
+    "finish_reason": "tool_calls"
+   }
+  },
+  {
+   "format": "glm47",
+   "id": "cut-inside-a-string-value",
+   "thinking": false,
+   "tools": "weather",
+   "forced_call": null,
+   "single_call": false,
+   "text": "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Par",
+   "expect": {
+    "reasoning_content": "",
+    "content": "",
+    "tool_calls": [
+     {
+      "name": "get_weather",
+      "arguments": "{\"city\": \"Par"
+     }
+    ],
+    "finish_reason": "stop"
+   },
+   "note": "the call keeps what it got (arguments not JSON) and the reply does not finish as tool_calls"
+  },
+  {
+   "format": "glm47",
+   "id": "cut-before-the-name-ends",
+   "thinking": false,
+   "tools": "weather",
+   "forced_call": null,
+   "single_call": false,
+   "text": "<tool_call>get_wea",
+   "expect": {
+    "reasoning_content": "",
+    "content": "<tool_call>get_wea",
+    "tool_calls": [],
+    "finish_reason": "stop"
+   }
+  },
+  {
+   "format": "glm47",
+   "id": "forced-named-call",
+   "thinking": false,
+   "tools": "weather",
+   "forced_call": "get_weather",
+   "single_call": false,
+   "text": "<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call>",
+   "expect": {
+    "reasoning_content": "",
+    "content": "",
+    "tool_calls": [
+     {
+      "name": "get_weather",
+      "arguments": "{\"city\": \"Paris\"}"
+     }
+    ],
+    "finish_reason": "tool_calls"
+   },
+   "note": "the prompt ended in <tool_call>get_weather"
+  },
+  {
+   "format": "glm47",
+   "id": "forced-any-call",
+   "thinking": false,
+   "tools": "weather",
+   "forced_call": "",
+   "single_call": false,
+   "text": "get_weather<arg_key>city</arg_key><arg_value>Lima</arg_value></tool_call>",
+   "expect": {
+    "reasoning_content": "",
+    "content": "",
+    "tool_calls": [
+     {
+      "name": "get_weather",
+      "arguments": "{\"city\": \"Lima\"}"
+     }
+    ],
+    "finish_reason": "tool_calls"
+   }
+  },
+  {
+   "format": "glm47",
+   "id": "single-call-ends-the-reply",
+   "thinking": false,
+   "tools": "weather",
+   "forced_call": null,
+   "single_call": true,
+   "text": "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Paris</arg_value></tool_call><tool_call>get_weather<arg_key>city</arg_key><arg_value>Rome</arg_value></tool_call>",
+   "expect": {
+    "reasoning_content": "",
+    "content": "",
+    "tool_calls": [
+     {
+      "name": "get_weather",
+      "arguments": "{\"city\": \"Paris\"}"
+     }
+    ],
+    "finish_reason": "tool_calls"
+   },
+   "note": "parallel_tool_calls: false"
+  },
+  {
+   "format": "glm47",
+   "id": "vllm-no-tool-call",
+   "thinking": false,
+   "tools": "vllm_glm47",
+   "forced_call": null,
+   "single_call": false,
+   "text": "This is a plain response.",
+   "expect": {
+    "reasoning_content": "",
+    "content": "This is a plain response.",
+    "tool_calls": [],
+    "finish_reason": "stop"
+   },
+   "source": "vllm@d90e35cff tests/tool_parsers/test_glm47_moe_tool_parser.py::TestGlm47ExtractToolCalls::test_no_tool_call"
+  },
+  {
+   "format": "glm47",
+   "id": "vllm-zero-arg-inline",
+   "thinking": false,
+   "tools": "vllm_glm47",
+   "forced_call": null,
+   "single_call": false,
+   "text": "<tool_call>get_current_date</tool_call>",
+   "expect": {
+    "reasoning_content": "",
+    "content": "",
+    "tool_calls": [
+     {
+      "name": "get_current_date",
+      "arguments": "{}"
+     }
+    ],
+    "finish_reason": "tool_calls"
+   },
+   "source": "vllm@d90e35cff tests/tool_parsers/test_glm47_moe_tool_parser.py::TestGlm47ExtractToolCalls::test_zero_arg_inline"
+  },
+  {
+   "format": "glm47",
+   "id": "vllm-zero-arg-newline",
+   "thinking": false,
+   "tools": "vllm_glm47",
+   "forced_call": null,
+   "single_call": false,
+   "text": "<tool_call>get_current_date\n</tool_call>",
+   "expect": {
+    "reasoning_content": "",
+    "content": "",
+    "tool_calls": [
+     {
+      "name": "get_current_date",
+      "arguments": "{}"
+     }
+    ],
+    "finish_reason": "tool_calls"
+   },
+   "source": "vllm@d90e35cff tests/tool_parsers/test_glm47_moe_tool_parser.py::TestGlm47ExtractToolCalls::test_zero_arg_newline"
+  },
+  {
+   "format": "glm47",
+   "id": "vllm-args-with-newlines",
+   "thinking": false,
+   "tools": "vllm_glm47",
+   "forced_call": null,
+   "single_call": false,
+   "text": "<tool_call>get_weather\n<arg_key>city</arg_key>\n<arg_value>Beijing</arg_value>\n</tool_call>",
+   "expect": {
+    "reasoning_content": "",
+    "content": "",
+    "tool_calls": [
+     {
+      "name": "get_weather",
+      "arguments": "{\"city\": \"Beijing\"}"
+     }
+    ],
+    "finish_reason": "tool_calls"
+   },
+   "source": "vllm@d90e35cff tests/tool_parsers/test_glm47_moe_tool_parser.py::TestGlm47ExtractToolCalls::test_args_with_newlines"
+  },
+  {
+   "format": "glm47",
+   "id": "vllm-whitespace-kept-in-values",
+   "thinking": false,
+   "tools": "vllm_glm47",
+   "forced_call": null,
+   "single_call": false,
+   "text": "<tool_call>get_weather<arg_key>city</arg_key><arg_value>  Beijing  </arg_value></tool_call>",
+   "expect": {
+    "reasoning_content": "",
+    "content": "",
+    "tool_calls": [
+     {
+      "name": "get_weather",
+      "arguments": "{\"city\": \"  Beijing  \"}"
+     }
+    ],
+    "finish_reason": "tool_calls"
+   },
+   "source": "vllm@d90e35cff tests/tool_parsers/test_glm47_moe_tool_parser.py::TestGlm47ExtractToolCalls::test_whitespace_preserved_in_arg_values"
+  },
+  {
+   "format": "glm47",
+   "id": "vllm-content-before",
+   "thinking": false,
+   "tools": "vllm_glm47",
+   "forced_call": null,
+   "single_call": false,
+   "text": "Checking.<tool_call>get_current_date</tool_call>",
+   "expect": {
+    "reasoning_content": "",
+    "content": "Checking.",
+    "tool_calls": [
+     {
+      "name": "get_current_date",
+      "arguments": "{}"
+     }
+    ],
+    "finish_reason": "tool_calls"
+   },
+   "source": "vllm@d90e35cff tests/tool_parsers/test_glm47_moe_tool_parser.py::TestGlm47ExtractToolCalls::test_content_before"
+  },
+  {
+   "format": "glm47",
+   "id": "vllm-whitespace-only-content",
+   "thinking": false,
+   "tools": "vllm_glm47",
+   "forced_call": null,
+   "single_call": false,
+   "text": "  \n  <tool_call>get_current_date</tool_call>",
+   "expect": {
+    "reasoning_content": "",
+    "content": "",
+    "tool_calls": [
+     {
+      "name": "get_current_date",
+      "arguments": "{}"
+     }
+    ],
+    "finish_reason": "tool_calls"
+   },
+   "source": "vllm@d90e35cff tests/tool_parsers/test_glm47_moe_tool_parser.py::TestGlm47ExtractToolCalls::test_whitespace_content_none"
+  },
+  {
+   "format": "glm47",
+   "id": "vllm-two-calls",
+   "thinking": false,
+   "tools": "vllm_glm47",
+   "forced_call": null,
+   "single_call": false,
+   "text": "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Beijing</arg_value></tool_call><tool_call>get_weather<arg_key>city</arg_key><arg_value>Shanghai</arg_value></tool_call>",
+   "expect": {
+    "reasoning_content": "",
+    "content": "",
+    "tool_calls": [
+     {
+      "name": "get_weather",
+      "arguments": "{\"city\": \"Beijing\"}"
+     },
+     {
+      "name": "get_weather",
+      "arguments": "{\"city\": \"Shanghai\"}"
+     }
+    ],
+    "finish_reason": "tool_calls"
+   },
+   "source": "vllm@d90e35cff tests/tool_parsers/test_glm47_moe_tool_parser.py::TestGlm47ExtractToolCalls::test_multiple"
+  },
+  {
+   "format": "glm47",
+   "id": "sglang-two-calls-two-args",
+   "thinking": false,
+   "tools": "sglang_glm47",
+   "forced_call": null,
+   "single_call": false,
+   "text": "<tool_call>get_weather<arg_key>city</arg_key><arg_value>Beijing</arg_value><arg_key>date</arg_key><arg_value>2024-06-27</arg_value></tool_call><tool_call>get_weather<arg_key>city</arg_key><arg_value>Shanghai</arg_value><arg_key>date</arg_key><arg_value>2024-06-28</arg_value></tool_call>",
+   "expect": {
+    "reasoning_content": "",
+    "content": "",
+    "tool_calls": [
+     {
+      "name": "get_weather",
+      "arguments": "{\"city\": \"Beijing\", \"date\": \"2024-06-27\"}"
+     },
+     {
+      "name": "get_weather",
+      "arguments": "{\"city\": \"Shanghai\", \"date\": \"2024-06-28\"}"
+     }
+    ],
+    "finish_reason": "tool_calls"
+   },
+   "source": "sglang@4df3895bd test/registered/unit/function_call/test_function_call_parser.py::TestGlm47MoeDetector::test_multiple_tool_calls"
+  },
+  {
+   "format": "glm47",
+   "id": "sglang-unknown-function",
+   "thinking": false,
+   "tools": "sglang_glm47",
+   "forced_call": null,
+   "single_call": false,
+   "text": "<tool_call>invalid_func<arg_key>city</arg_key><arg_value>Beijing</arg_value></tool_call>",
+   "expect": {
+    "reasoning_content": "",
+    "content": "<tool_call>invalid_func<arg_key>city</arg_key><arg_value>Beijing</arg_value></tool_call>",
+    "tool_calls": [],
+    "finish_reason": "stop"
+   },
+   "source": "sglang@4df3895bd test/registered/unit/function_call/test_function_call_parser.py::TestGlm47MoeDetector::test_invalid_tool_call"
+  },
+  {
+   "format": "glm47",
+   "id": "sglang-array-of-objects",
+   "thinking": false,
+   "tools": "sglang_glm47",
+   "forced_call": null,
+   "single_call": false,
+   "text": "<tool_call>todo_write<arg_key>todos</arg_key><arg_value>[{\"id\": \"1\", \"task\": \"Check for hard-coded issues in the backend code\", \"status\": \"in_progress\"}, {\"id\": \"2\", \"task\": \"Generate a rectification proposal report\", \"status\": \"pending\"}]</arg_value>\n</tool_call>",
+   "expect": {
+    "reasoning_content": "",
+    "content": "",
+    "tool_calls": [
+     {
+      "name": "todo_write",
+      "arguments": "{\"todos\": [{\"id\": \"1\", \"task\": \"Check for hard-coded issues in the backend code\", \"status\": \"in_progress\"}, {\"id\": \"2\", \"task\": \"Generate a rectification proposal report\", \"status\": \"pending\"}]}"
+     }
+    ],
+    "finish_reason": "tool_calls"
+   },
+   "source": "sglang@4df3895bd test/registered/unit/function_call/test_function_call_parser.py::TestGlm47MoeDetector::test_array_argument_with_escaped_json"
+  },
+  {
+   "format": "glm47",
+   "id": "sglang-backslash-escaped-json",
+   "thinking": false,
+   "tools": "sglang_glm47",
+   "forced_call": null,
+   "single_call": false,
+   "text": "<tool_call>todo_write<arg_key>todos</arg_key><arg_value>[{\\\"id\\\": \\\"1\\\", \\\"task\\\": \\\"Check\\\", \\\"status\\\": \\\"pending\\\"}]</arg_value>\n</tool_call>",
+   "expect": {
+    "reasoning_content": "",
+    "content": "",
+    "tool_calls": [
+     {
+      "name": "todo_write",
+      "arguments": "{\"todos\": \"[{\\\\\\\"id\\\\\\\": \\\\\\\"1\\\\\\\", \\\\\\\"task\\\\\\\": \\\\\\\"Check\\\\\\\", \\\\\\\"status\\\\\\\": \\\\\\\"pending\\\\\\\"}]\"}"
+     }
+    ],
+    "finish_reason": "tool_calls"
+   },
+   "source": "sglang@4df3895bd test/registered/unit/function_call/test_function_call_parser.py::TestGlm47MoeDetector::test_array_argument_with_escaped_json",
+   "note": "SGLang unescapes the backslash-escaped JSON GLM-4.6 wrote into the array. Here a value that is not JSON stays the string the model wrote."
+  },
+  {
+   "format": "glm47",
+   "id": "vllm-reasoning-with-think",
+   "thinking": true,
+   "tools": null,
+   "forced_call": null,
+   "single_call": false,
+   "text": "<think>This is a reasoning section</think>This is the rest",
+   "expect": {
+    "reasoning_content": "This is a reasoning section",
+    "content": "This is the rest",
+    "tool_calls": [],
+    "finish_reason": "stop"
+   },
+   "source": "vllm@d90e35cff tests/reasoning/test_glm4_moe_reasoning_parser.py::with_think"
+  },
+  {
+   "format": "glm47",
+   "id": "vllm-reasoning-without-think",
+   "thinking": true,
+   "tools": null,
+   "forced_call": null,
+   "single_call": false,
+   "text": "This is the rest",
+   "expect": {
+    "reasoning_content": "This is the rest",
+    "content": "",
+    "tool_calls": [],
+    "finish_reason": "stop"
+   },
+   "source": "vllm@d90e35cff tests/reasoning/test_glm4_moe_reasoning_parser.py::without_think"
+  },
+  {
+   "format": "glm47",
+   "id": "vllm-reasoning-without-open-think",
+   "thinking": true,
+   "tools": null,
+   "forced_call": null,
+   "single_call": false,
+   "text": "This is a reasoning section</think>This is the rest",
+   "expect": {
+    "reasoning_content": "This is a reasoning section",
+    "content": "This is the rest",
+    "tool_calls": [],
+    "finish_reason": "stop"
+   },
+   "source": "vllm@d90e35cff tests/reasoning/test_glm4_moe_reasoning_parser.py::without_open_think"
+  },
+  {
+   "format": "glm47",
+   "id": "vllm-reasoning-complete",
+   "thinking": true,
+   "tools": null,
+   "forced_call": null,
+   "single_call": false,
+   "text": "<think>This is a reasoning section</think>",
+   "expect": {
+    "reasoning_content": "This is a reasoning section",
+    "content": "",
+    "tool_calls": [],
+    "finish_reason": "stop"
+   },
+   "source": "vllm@d90e35cff tests/reasoning/test_glm4_moe_reasoning_parser.py::complete_reasoning"
+  },
+  {
+   "format": "glm47",
+   "id": "vllm-reasoning-multiline",
+   "thinking": true,
+   "tools": null,
+   "forced_call": null,
+   "single_call": false,
+   "text": "<think>This is a reasoning\nsection</think>This is the rest\nThat",
+   "expect": {
+    "reasoning_content": "This is a reasoning\nsection",
+    "content": "This is the rest\nThat",
+    "tool_calls": [],
+    "finish_reason": "stop"
+   },
+   "source": "vllm@d90e35cff tests/reasoning/test_glm4_moe_reasoning_parser.py::multiline_reasoning"
+  },
+  {
+   "format": "glm47",
+   "id": "vllm-reasoning-only-open-tag",
+   "thinking": true,
+   "tools": null,
+   "forced_call": null,
+   "single_call": false,
+   "text": "<think>This is a reasoning section",
+   "expect": {
+    "reasoning_content": "This is a reasoning section",
+    "content": "",
+    "tool_calls": [],
+    "finish_reason": "stop"
+   },
+   "source": "vllm@d90e35cff tests/reasoning/test_glm4_moe_reasoning_parser.py::only_open_tag"
+  },
+  {
+   "format": "glm47",
+   "id": "glm53-reasoning-then-answer",
+   "thinking": true,
+   "tools": null,
+   "forced_call": null,
+   "single_call": false,
+   "text": "Greet back.</think>Hello!",
+   "expect": {
+    "reasoning_content": "Greet back.",
+    "content": "Hello!",
+    "tool_calls": [],
+    "finish_reason": "stop"
+   },
+   "source": "sglang@4df3895bd rust/sglang-processor/tests/fixtures/openai_parity/glm-5.3.json case chat"
+  },
+  {
+   "format": "glm47",
+   "id": "glm53-cut-in-reasoning",
+   "thinking": true,
+   "tools": null,
+   "forced_call": null,
+   "single_call": false,
+   "text": "Greet back",
+   "expect": {
+    "reasoning_content": "Greet back",
+    "content": "",
+    "tool_calls": [],
+    "finish_reason": "stop"
+   },
+   "source": "sglang@4df3895bd rust/sglang-processor/tests/fixtures/openai_parity/glm-5.3.json case chat_thinking_cut"
+  }
+ ]
+}
