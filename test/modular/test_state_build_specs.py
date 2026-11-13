@@ -479,6 +479,14 @@ def test_a_hook_page_count_builds_the_spec_the_same_key_under_resources_builds()
     assert hooked[0].config == written[0].config and hooked[0].config.max_num_pages == 256
 
 
+def test_a_hook_page_size_builds_the_spec_the_same_key_under_resources_builds():
+    hooked = build_specs([_kv()], kernel_settings={"kv": {"page_size": 64}})
+    written = build_specs([_kv()])
+    apply_yaml_overrides(written, {"resources": {"kv": {"page_size": 64}}})
+    apply_yaml_overrides(hooked, {})
+    assert hooked[0].config == written[0].config and hooked[0].config.page_size == 64
+
+
 def test_a_hook_slot_count_builds_the_spec_the_same_key_under_resources_builds():
     hooked = build_specs([_kv(), _gdn()], kernel_settings={"gdn": {"max_slots": 64}})
     written = build_specs([_kv(), _gdn()])
