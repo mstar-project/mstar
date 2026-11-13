@@ -6,8 +6,8 @@ would notice, so this reads each package's source. The base classes are the brid
 says why it stands or which PR deletes it, and an exception nothing uses any more fails too, so the list only shrinks.
 
 A package that isn't ported has to be on the frozen list of those that predate this rule, so a new model arrives on
-the contract. Only the engine and the tests import the adapters that bind a declaration to a resource, so the adapters
-can be replaced without touching a model.
+the contract. Only the engine and the tests import the adapters that bind a declaration to a resource, and
+``contract.py`` imports nothing new from the resources, so the adapters can be replaced without touching a model.
 """
 
 from __future__ import annotations
@@ -92,6 +92,13 @@ ADAPTER_IMPORTERS = {
 }
 # the source directories, apart from test/
 SOURCE_ROOTS = ("mstar", "mstar_sim", "benchmark", "examples", "scripts")
+CONTRACT = "mstar/engine/state/contract.py"
+# every name the contract imports from `mstar.engine.resources`
+CONTRACT_RESOURCE_IMPORTS = {
+    ("mstar.engine.resources.attn.config", "SP_EXCHANGES"),
+    ("mstar.engine.resources.kv.config", "Span"),
+    ("mstar.engine.resources.step", "Segment"),
+}
 
 
 def _violations(source: str, path: str = "") -> tuple[list[str], set[tuple[str, str]]]:
@@ -173,6 +180,20 @@ def _adapter_importers() -> set[str]:
     }
 
 
+def _resource_imports(source: str) -> set[tuple[str, str]]:
+    """The module and name of each import ``source`` makes from `mstar.engine.resources`."""
+    found = set()
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.ImportFrom):
+            found |= {
+                (node.module, alias.name) for alias in node.names
+                if f"{node.module}.{alias.name}".startswith("mstar.engine.resources")
+            }
+        elif isinstance(node, ast.Import):
+            found |= {(alias.name, "") for alias in node.names if alias.name.startswith("mstar.engine.resources")}
+    return found
+
+
 @pytest.mark.parametrize("path", _sources(), ids=str)
 def test_a_ported_package_reaches_the_engine_only_through_the_contract(path):
     found, _ = _violations(path.read_text(), str(path))
@@ -180,10 +201,13 @@ def test_a_ported_package_reaches_the_engine_only_through_the_contract(path):
 
 
 def test_every_exception_is_still_used():
-    used = _adapter_importers()
+    used = _adapter_importers() | _resource_imports(Path(CONTRACT).read_text())
     for path in _sources():
         used |= _violations(path.read_text(), str(path))[1]
-    excepted = ALLOWED.keys() | ALLOWED_BREAKS.keys() | ALLOWED_SHARD_READS.keys() | ADAPTER_IMPORTERS.keys()
+    excepted = (
+        ALLOWED.keys() | ALLOWED_BREAKS.keys() | ALLOWED_SHARD_READS.keys() | ADAPTER_IMPORTERS.keys()
+        | CONTRACT_RESOURCE_IMPORTS
+    )
     assert excepted <= used, f"delete these exceptions: {sorted(excepted - used, key=str)}"
 
 
@@ -266,3 +290,21 @@ def test_only_the_engine_and_the_tests_import_the_adapters():
 ])
 def test_the_lint_tells_the_state_adapters_from_other_imports(source, expected):
     assert _imports_adapters(source) is expected, source
+
+
+def test_the_contract_imports_nothing_new_from_the_resources():
+    added = sorted(_resource_imports(Path(CONTRACT).read_text()) - CONTRACT_RESOURCE_IMPORTS)
+    assert not added, (
+        f"{CONTRACT} now imports {added} from `mstar.engine.resources`. The contract holds declarations only, so what "
+        "binds a declaration to a resource belongs in adapters.py."
+    )
+
+
+@pytest.mark.parametrize("source, expected", [
+    ("from mstar.engine.resources.kv.config import KVSpec", {("mstar.engine.resources.kv.config", "KVSpec")}),
+    ("from mstar.engine import resources", {("mstar.engine", "resources")}),
+    ("import mstar.engine.resources.kv", {("mstar.engine.resources.kv", "")}),
+    ("from mstar.engine.state.calls import ArrayHandle", set()),
+])
+def test_the_lint_sees_each_way_to_import_from_the_resources(source, expected):
+    assert _resource_imports(source) == expected
