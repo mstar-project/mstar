@@ -91,6 +91,7 @@ def _read(mask, **fields) -> Read:
     (lambda: Bidirectional(kept_window=1), "Bidirectional.kept_window must be a bool, got 1"),
     (lambda: KeptWindow(-1, window=4), "KeptWindow.sink must be an int >= 0, got -1"),
     (lambda: KeptWindow(2, window=-1), "KeptWindow.window must be an int >= 1, got -1"),
+    (lambda: KeptWindow(2, window=0), "KeptWindow.window must be an int >= 1, got 0"),
     (lambda: KeptWindow(2.0, window=4), "KeptWindow.sink must be an int >= 0, got 2.0"),
     (lambda: KeptWindow(True, window=4), "KeptWindow.sink must be an int >= 0, got True"),
     (lambda: FrameWindow(0, frames=16), "FrameWindow.tokens must be a positive int, got 0"),
@@ -98,8 +99,8 @@ def _read(mask, **fields) -> Read:
     (lambda: FrameWindow(512, frames=16, stride=0), "FrameWindow.stride must be a positive int, got 0"),
     (lambda: FrameWindow(512, frames=12, stride=8), "FrameWindow.frames must be a multiple of stride 8, got 12"),
 ], ids=[
-    "kept_window_int", "sink_negative", "window_negative", "sink_float", "sink_bool", "tokens_zero", "frames_zero",
-    "stride_zero", "frames_off_stride",
+    "kept_window_int", "sink_negative", "window_negative", "window_zero", "sink_float", "sink_bool", "tokens_zero",
+    "frames_zero", "stride_zero", "frames_off_stride",
 ])
 def test_a_window_refuses_its_own_bad_fields(make, message):
     with pytest.raises(ValueError, match=f"^{message}$"):
