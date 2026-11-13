@@ -297,6 +297,18 @@ class ArrayHandle(StepHandle):
         """Whether ``op``'s fused kernel writes this array itself, in place of its reference running the calls."""
         return False
 
+    def fused_target(self, layer: int) -> Any:
+        """Record ``layer``'s add, which a fused op makes, and give where its kernel writes the step's entries."""
+        raise self._unsupported("fused_target")
+
+    def _pages(self) -> torch.Tensor:
+        """The whole pool a fused op writes into, which the debug check and `conformance_problems` copy."""
+        raise self._unsupported("_pages")
+
+    def _slots(self, layer: int) -> tuple:
+        """An index of this step's slots on ``layer`` into any tensor shaped as `_pages`."""
+        raise self._unsupported("_slots")
+
     def _check_capture(self, walks: Collection[str]) -> None:
         """Raise if a capture replayed on ``walks`` would plan this array's reads differently on some of them."""
 

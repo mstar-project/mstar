@@ -16,7 +16,7 @@ from typing import Any
 import torch
 
 from mstar.engine.state.calls import ArrayHandle
-from mstar.engine.state.contract import PagedNHD, PagedNHDTarget
+from mstar.engine.state.contract import PagedFormat, PagedLatent, PagedNHD
 
 # Off by default: each eager call of a fused op copies the whole array to the host to check what it wrote.
 _DEBUG_ASSERTS = os.environ.get("MSTAR_KV_DEBUG_ASSERTS", "0") == "1"
@@ -31,7 +31,7 @@ class StateOp:
     writes: tuple[str, ...]
     reads: tuple[str, ...]
     mutates: tuple[str, ...]
-    formats: tuple[PagedNHD, ...]
+    formats: tuple[PagedFormat, ...]
     # where a call's arguments sit: the handles, the handle the kernel's target addresses, and the layer
     handle_at: Mapping[str, int]
     target_at: int
@@ -44,7 +44,7 @@ STATE_OPS: dict[str, StateOp] = {}
 
 def state_op(
     *, adds: Sequence[str] = (), writes: Sequence[str] = (), reads: Sequence[str] = (), mutates: Sequence[str] = (),
-    formats: Sequence[PagedNHD], reference: Callable[..., Any],
+    formats: Sequence[PagedFormat], reference: Callable[..., Any],
 ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
     """Make a kernel a state op: ``adds``, ``writes`` and ``reads`` name the handle parameters it touches, and
     ``mutates`` names its own arguments it changes in place. The kernel takes those, a ``layer``, and a keyword-only
@@ -90,8 +90,10 @@ def _state_op(fused, adds, writes, reads, mutates, formats, reference) -> StateO
         raise refusal(f"no layout yet: a target addresses one array, and it adds {adds} and writes {writes}")
     if reads and reads != adds:
         raise refusal(f"no layout yet: an op reads only the array it adds to, and it adds {adds} and reads {reads}")
-    if not all(isinstance(fmt, PagedNHD) for fmt in formats):
-        raise refusal(f"formats must be PagedNHD, the one storage format a kernel can address; got {formats}")
+    kinds = {type(fmt) for fmt in formats}
+    if len(kinds) > 1 or not kinds <= {PagedNHD, PagedLatent}:
+        raise refusal(f"formats must be PagedFormats of one class, PagedNHD or PagedLatent, since a kernel takes one "
+                      f"kind of target; got {formats}")
 
     def shape(of):
         return [(p.name, p.kind, p.default) for p in of]
@@ -132,18 +134,18 @@ def _call(op: StateOp, args: Sequence[Any]) -> Any:
     # A capture records its launches, so the check's host sync can't run in one.
     if not _DEBUG_ASSERTS or handle._capturing:
         return op.fused(*args, target=target)
-    array = handle._kv.kv_cache.tensor
+    array = handle._pages()
     before = array.to("cpu", copy=True)
     result = op.fused(*args, target=target)
-    _check_only_slots_changed(op, handle, array.to("cpu"), before, handle._pool_layer[layer], target)
+    _check_only_slots_changed(op, handle, array.to("cpu"), before, layer)
     return result
 
 
 def _check_only_slots_changed(
-    op: StateOp, handle: ArrayHandle, array: torch.Tensor, before: torch.Tensor, layer: int, target: PagedNHDTarget,
+    op: StateOp, handle: ArrayHandle, array: torch.Tensor, before: torch.Tensor, layer: int,
 ) -> None:
     changed = array.ne(before) & ~(array.isnan() & before.isnan())
-    changed[layer][target.page_of_token[:target.count].cpu(), :, target.slot_of_token[:target.count].cpu()] = False
+    changed[tuple(i.cpu() if isinstance(i, torch.Tensor) else i for i in handle._slots(layer))] = False
     if changed.any():
         raise handle._refusal(f"state op {op.name!r} changed {int(changed.sum())} elements outside this step's slots")
 
@@ -158,10 +160,9 @@ def conformance_problems(call: Callable[..., Any], args: Sequence[Any], toleranc
     if not handle.takes_fused(op):
         return [f"the handle takes no fused kernel of {op.name!r}, so a call runs the reference either way"]
     layer_id = handle._layer_id(args[op.layer_at])
-    layer = handle._pool_layer[layer_id]
     names = list(inspect.signature(op.reference).parameters)
     mutated = [names.index(name) for name in op.mutates]
-    array = handle._kv.kv_cache.tensor
+    array = handle._pages()
     start = array.clone()
     others = {
         names[i]: (arg, arg.clone()) for i, arg in enumerate(args) if i not in mutated and isinstance(arg, torch.Tensor)
@@ -192,13 +193,12 @@ def conformance_problems(call: Callable[..., Any], args: Sequence[Any], toleranc
     for what, expected, actual in compared:
         if not torch.allclose(actual.float(), expected.float(), atol=tolerance, rtol=tolerance):
             problems.append(f"{what}: largest difference {(actual.float() - expected.float()).abs().max()}")
-    target = PagedNHDTarget(*handle._kv.write_target(layer_idx=layer, label=handle.label))
-    pages, slots = target.page_of_token[:target.count], target.slot_of_token[:target.count]
-    written, expected = fused_array[layer][pages, :, slots].float(), reference_array[layer][pages, :, slots].float()
+    slots = handle._slots(layer_id)
+    written, expected = fused_array[slots].float(), reference_array[slots].float()
     if not torch.allclose(written, expected, atol=tolerance, rtol=tolerance):
         problems.append(f"the step's slots: largest difference {(written - expected).abs().max()}")
     outside = fused_array.clone()
-    outside[layer][pages, :, slots] = start[layer][pages, :, slots]
+    outside[slots] = start[slots]
     if not torch.equal(outside, start):
         problems.append("the array outside the step's slots changed")
     problems += [f"argument {name} changed, and the op doesn't list it" for name, (arg, was) in others.items()

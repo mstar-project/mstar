@@ -140,7 +140,7 @@ def _tensors():
     ({"mutates": ("nope",)}, r"parameters \['nope'\] aren't in its signature"),
     ({"adds": ()}, "a target addresses one array"),
     ({"adds": ("kv",), "writes": ("kv",)}, "a target addresses one array"),
-    ({"formats": ("NHD",)}, "formats must be PagedNHD"),
+    ({"formats": ("NHD",)}, "formats must be PagedFormats of one class"),
     ({"reference": lambda kv, layer, q, k: None}, "must take its signature without target"),
     ({"reference": lambda kv, layer, q, k, x: None}, "must take its signature without target"),
     ({"reads": ("q",)}, "no layout yet: an op reads only the array it adds to"),

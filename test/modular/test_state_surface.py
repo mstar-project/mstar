@@ -21,7 +21,7 @@ from mstar.engine.state.adapters import LatentHandle, PagedArrayHandle, RingHand
 from mstar.engine.state.calls import ArrayHandle
 
 # Today's types the surface re-exports, and a NamedTuple, whose fields stay positional.
-_POSITIONAL = {"PagedNHDTarget", "Segment", "SlotLease", "Span"}
+_POSITIONAL = {"PagedLatentTarget", "PagedNHDTarget", "Segment", "SlotLease", "Span"}
 # The calls take the handle first, then what every call names, and only then keywords.
 _CALLS = {
     "add_read", "at_last_token", "causal_conv", "gated_delta_net", "gather", "host", "last_sampled", "position",
@@ -105,6 +105,22 @@ SNAPSHOT = {
         ["growth", "KEYWORD_ONLY", '()'],
         ["scratch", "KEYWORD_ONLY", '0'],
         ["kept_windows", "KEYWORD_ONLY", '{}'],
+    ],
+    "PagedFormat": [
+        ["dtypes", "KEYWORD_ONLY", 'None'],
+        ["devices", "KEYWORD_ONLY", 'None'],
+    ],
+    "PagedLatent": [
+        ["dtypes", "KEYWORD_ONLY", 'None'],
+        ["devices", "KEYWORD_ONLY", 'None'],
+        ["rope_table", "KEYWORD_ONLY", 'False'],
+    ],
+    "PagedLatentTarget": [
+        ["cache", "POSITIONAL_OR_KEYWORD", None],
+        ["page_of_token", "POSITIONAL_OR_KEYWORD", None],
+        ["slot_of_token", "POSITIONAL_OR_KEYWORD", None],
+        ["count", "POSITIONAL_OR_KEYWORD", None],
+        ["rope_table", "POSITIONAL_OR_KEYWORD", None],
     ],
     "PagedNHD": [
         ["dtypes", "KEYWORD_ONLY", 'None'],

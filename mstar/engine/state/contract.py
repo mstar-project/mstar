@@ -580,8 +580,8 @@ class Layout:
 
 
 @dataclass(frozen=True, kw_only=True)
-class PagedNHD:
-    """A storage format a state op can address: pages of (tokens, heads, head_dim)."""
+class PagedFormat:
+    """A storage format a state op can address, by the dtypes and devices its kernel takes."""
 
     dtypes: frozenset[torch.dtype] | None = None    # None: any
     devices: frozenset[str] | None = None           # None: any
@@ -591,6 +591,21 @@ class PagedNHD:
             if getattr(self, name) is not None:
                 object.__setattr__(self, name, frozenset(getattr(self, name)))
 
+    def matches(self, dtype: torch.dtype, device: str) -> bool:
+        """Whether the kernel takes pages of ``dtype`` on a device of type ``device``."""
+        return (self.dtypes is None or dtype in self.dtypes) and (self.devices is None or device in self.devices)
+
+
+class PagedNHD(PagedFormat):
+    """Pages of (tokens, heads, head_dim)."""
+
+
+@dataclass(frozen=True, kw_only=True)
+class PagedLatent(PagedFormat):
+    """Pages of MLA latents, (tokens, rank + rope_dim)."""
+
+    rope_table: bool = False    # the kernel rotates with the table of the array's `Rope`, which must declare one
+
 
 class PagedNHDTarget(NamedTuple):
     """Where a state op writes this step's entries on one layer of a `PagedNHD` array."""
@@ -599,6 +614,16 @@ class PagedNHDTarget(NamedTuple):
     page_of_token: torch.Tensor
     slot_of_token: torch.Tensor
     count: int    # tokens to write
+
+
+class PagedLatentTarget(NamedTuple):
+    """Where a state op writes this step's entries on one layer of a `PagedLatent` array."""
+
+    cache: torch.Tensor                 # the layer's pages, (pages, page_size, rank + rope_dim)
+    page_of_token: torch.Tensor
+    slot_of_token: torch.Tensor
+    count: int                          # tokens to write
+    rope_table: torch.Tensor | None     # the positions' cos and sin rows, where the array's `Rope` has a table
 
 
 @dataclass(frozen=True)

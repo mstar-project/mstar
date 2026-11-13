@@ -90,6 +90,10 @@ from mstar.engine.state.contract import (
     Layout,
     Mask,
     Op,
+    PagedFormat,
+    PagedLatent,
+    PagedLatentTarget,
+    PagedNHD,
     PagedNHDTarget,
     Positions,
     Reached,
@@ -1352,6 +1356,9 @@ class PagedArrayHandle(ArrayHandle):
     `Resolved` gives it."""
 
     _write_refused = "write on an append-only array"
+    # the one class of formats a state op's kernel addresses these pages in, and the pool layout it takes
+    page_format: ClassVar[type[PagedFormat]] = PagedNHD
+    page_layout: ClassVar[KVLayout] = KVLayout.NHD
 
     def __init__(
         self, array: Array, resources: Mapping[str, Any], bindings: tuple[BoundOp, ...], resolved: "Resolved",
@@ -1562,16 +1569,19 @@ class PagedArrayHandle(ArrayHandle):
         return self._ops
 
     def takes_fused(self, op: "StateOp") -> bool:
-        """An op that adds to the array, on a pool in one of its formats, while no layer's read takes k and v at its
-        kernel, which would never see the pages the op writes. A step whose reads attend its own k and v also runs
-        the reference (``fused_ops``)."""
+        """An op that adds to the array, in a format of the handle's one class that takes the pool's pages, while no
+        layer's read takes k and v at its kernel, which would never see the pages the op writes. A step whose reads
+        attend its own k and v also runs the reference (``fused_ops``)."""
         cache = self._kv.kv_cache
-        dtype, device = cache.dtype, cache.device.type
         dense = any(not attn.requires_kv_write for attn in self._attn.values())
-        return bool(op.adds) and cache.layout is KVLayout.NHD and not dense and any(
-            (fmt.dtypes is None or dtype in fmt.dtypes) and (fmt.devices is None or device in fmt.devices)
+        return bool(op.adds) and cache.layout is self.page_layout and not dense and any(
+            type(fmt) is self.page_format and fmt.matches(cache.dtype, cache.device.type) and self._takes_format(fmt)
             for fmt in op.formats
         )
+
+    def _takes_format(self, fmt: PagedFormat) -> bool:
+        """Whether the handle has what ``fmt`` asks for past its pages' dtype and device."""
+        return True
 
     @property
     def fused_ops(self) -> frozenset[str]:
@@ -1590,6 +1600,14 @@ class PagedArrayHandle(ArrayHandle):
         """Record ``layer``'s add, which a fused op makes, and give where it writes the step's entries."""
         self._record_add(layer, None)
         return PagedNHDTarget(*self._kv.write_target(layer_idx=self._pool_layer[layer], label=self.label))
+
+    def _pages(self) -> torch.Tensor:
+        return self._kv.kv_cache.tensor
+
+    def _slots(self, layer: int) -> tuple:
+        target = PagedNHDTarget(*self._kv.write_target(layer_idx=self._pool_layer[layer], label=self.label))
+        pages, slots = target.page_of_token[:target.count], target.slot_of_token[:target.count]
+        return self._pool_layer[layer], pages, slice(None), slots
 
 
 class PagedByWalkHandle(PagedArrayHandle):
@@ -1690,6 +1708,9 @@ class LatentHandle(PagedArrayHandle):
     """Adds and reads through the MLA pages of a latent array. An add joins ``ckv`` and ``kpe`` into one row and
     writes it, and a read attends the pages with ``q`` and ``q_pe``, so the handle holds nothing between them."""
 
+    page_format = PagedLatent
+    page_layout = KVLayout.MLA
+
     def __init__(
         self, array: Array, resources: Mapping[str, Any], bindings: tuple[BoundOp, ...], resolved: "Resolved",
     ):
@@ -1703,6 +1724,23 @@ class LatentHandle(PagedArrayHandle):
     def _needs_step_kv(self, attn: Any) -> bool:
         """Never: the absorbed read attends the pages alone."""
         return False
+
+    def _takes_format(self, fmt: PagedLatent) -> bool:
+        # the fused prep turns interleaved pairs from the position resource's own table
+        positions = self.positions
+        return not fmt.rope_table or (
+            positions is not None and positions.cos_sin_table is not None and positions.interleave
+        )
+
+    def fused_target(self, layer: int) -> PagedLatentTarget:
+        self._record_add(layer, None)
+        pages, slots = self._kv.write_slots(label=self.label)
+        table = None if self.positions is None else self.positions.cos_sin_table
+        return PagedLatentTarget(self._views[layer], pages, slots, pages.shape[0], table)
+
+    def _slots(self, layer: int) -> tuple:
+        pages, slots = self._kv.write_slots(label=self.label)
+        return self._pool_layer[layer], pages, slots
 
     @torch.compiler.disable
     def add(self, layer: int | torch.Tensor, *, keep: bool | None = None, **fields: torch.Tensor) -> None:
