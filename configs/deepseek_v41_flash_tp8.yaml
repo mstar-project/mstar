@@ -1,0 +1,29 @@
+model: "deepseek_v41"
+# DeepSeek-V4.1-Flash, text only, on one 8-GPU node (TP8): 8x H200 or larger. The 510 GB
+# checkpoint is 67 GB a rank as stored; with the routed experts upcast from fp4 to fp8
+# (moe_fp8_resident, the default) and the dense linears in bf16 it is about 100 GB a rank.
+# Resolve the checkpoint through the HF cache (HF_HOME) or pass model_kwargs.checkpoint_path
+# (the -1017 refresh has the same layout).
+#
+# This serves the checkpoint's reference arithmetic in torch, eager: the numerics anchor,
+# not a fast path. Not yet run on GPUs: docs/models.rst says what is and is not served.
+max_seq_len: 65536
+max_concurrent_requests: 8
+model_kwargs:
+  max_seq_len: 65536
+  # requests that hold state at once: the pool below holds one more slot, its sink
+  max_requests: 8
+resources:
+  kv_cache:
+    # pages = requests x max_seq_len / page_size + the sink: 8 x 65536 / 128 + 1.
+    # 4 latent planes of 512 and 4 index planes of 128, bf16: 5.1 KB/token, 2.7 GB/rank.
+    max_num_pages: 4097
+    page_size: 128
+  state:
+    # max_requests + the sink; 40 windows of 128 x 512 bf16 and the open groups: 5.6 MB/slot
+    max_slots: 9
+node_groups:
+  - node_names: [LLM]
+    ranks: [0, 1, 2, 3, 4, 5, 6, 7]
+    tp_size: 8
+    graph_walks: [prefill, decode]

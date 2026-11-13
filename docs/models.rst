@@ -56,6 +56,12 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
      - Zero-shot voice-cloning TTS: Qwen2-0.5B speech-token LM with RAS sampling,
        DiT flow-matching decoder and causal HiFT vocoder, streamed in chunks.
        Clones from a preset or an uploaded clip. 24 kHz.
+   * - ``deepseek_v41``
+     - ``deepseek-ai/DeepSeek-V4.1-Flash``
+     - *(Beta)* DeepSeek-V4.1-Flash (763B stored, 384 experts top-6): sliding-window plus
+       compressed sparse attention over hyper-connected MoE blocks with Engram lookups, text in /
+       text out, fp8 linears and fp4 experts. The reference numerics in torch, served eager;
+       the vision tower and the DSpark draft layers are not loaded. See `DeepSeek-V4.1-Flash`_.
    * - ``glm5_next``
      - ``zai-org/GLM-5.3-Flash``
      - GLM-5.3-Flash (320B/18B): hybrid KDA linear-attention + MLA MoE causal
@@ -989,6 +995,25 @@ On 4x GB200 it decodes about 290 tok/s for one request and 3700 tok/s across
 kept only their window); ``validate_checkpoint.py``
 there checks parity against Hugging Face, with ``--images`` for image prompts.
 Not supported yet: FP8 weights and prefill CUDA graphs.
+
+DeepSeek-V4.1-Flash
+-------------------
+
+``configs/deepseek_v41_flash_tp8.yaml`` serves the text backbone on one 8-GPU node (TP8).
+What is served is the checkpoint's reference arithmetic, op by op in torch: every linear
+reads its input rounded to FP8, the caches hold values rounded to the FP8 and FP4 grids the
+model was trained with, and the attention, the indexer and the experts run eager, with no
+captured graphs. It is the numerics anchor that kernels are held to, not a fast path.
+
+Each layer attends its last 128 tokens, and layers 2 to 39 also the 512 rows an indexer picks
+from a compressed cache (three caches pool two tokens per row, one keeps every token). The
+engine holds that state: the compressed latents and their index keys on the paged cache
+(``kv_cache``, one row per token, 5.1 KB a token per rank in bf16), and each request's
+windows in the recurrent pool (``state``, 5.6 MB a request per rank). ``model_kwargs``:
+``max_seq_len`` (the context served, 65536), ``max_requests`` (requests holding state at
+once), ``moe_fp8_resident`` (the routed experts as an exact fp8 upcast of their fp4, on by
+default: 68 GB per GPU at TP8; off holds them in bf16, twice that). The ``-1017`` refresh has
+the same layout: pass it as ``model_kwargs.checkpoint_path``.
 
 GLM-5.3-Flash and GLM-5.2
 -------------------------

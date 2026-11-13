@@ -1,0 +1,102 @@
+"""Microscaling (MX) rounding in torch: values rounded to a block-scaled FP8 or FP4 grid.
+
+DeepSeek-V4.1's reference keeps activations and cache rows in bf16 but rounds them to these
+grids first: E4M3 values with a power-of-two scale per block, or E2M1 values with a power-of-two
+(E8M0) or an E4M3 scale per block. bf16 holds every rounded value exactly, so a packed FP8/FP4
+store or kernel reproduces them bit for bit. This module is that rounding op by op, on any
+device; ``pack_e2m1`` / ``unpack_e2m1`` are the checkpoint's packing of E2M1 weights.
+"""
+from __future__ import annotations
+
+import torch
+
+FP8_MAX = 448.0
+FP4_MAX = 6.0
+# E2M1 magnitudes by code (sign in bit 3)
+_E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+
+
+def pow2_ceil(v: torch.Tensor) -> torch.Tensor:
+    """``2 ** ceil(log2(v))`` of positive fp32 ``v``, exact at powers of two."""
+    mantissa, exponent = torch.frexp(v)  # v = mantissa * 2 ** exponent, mantissa in [0.5, 1)
+    return torch.ldexp(torch.ones_like(v), torch.where(mantissa == 0.5, exponent - 1, exponent))
+
+
+def round_e2m1(v: torch.Tensor) -> torch.Tensor:
+    """fp32 ``v`` in [-6, 6] to the nearest E2M1 value, a tie to the even code."""
+    grid = torch.tensor(_E2M1, dtype=torch.float32, device=v.device)
+    a = v.abs()
+    hi = torch.bucketize(a, grid).clamp(max=len(_E2M1) - 1)
+    lo = (hi - 1).clamp(min=0)
+    d_lo, d_hi = a - grid[lo], grid[hi] - a
+    up = (d_hi < d_lo) | ((d_hi == d_lo) & (hi % 2 == 0))
+    return torch.copysign(torch.where(up, grid[hi], grid[lo]), v)
+
+
+def pack_e2m1(q: torch.Tensor) -> torch.Tensor:
+    """E2M1 values ``[..., K]`` as uint8 ``[..., K // 2]``, element ``2i`` in the low nibble."""
+    grid = torch.tensor(_E2M1, dtype=torch.float32, device=q.device)
+    code = torch.bucketize(q.abs(), grid).to(torch.uint8) | (torch.signbit(q).to(torch.uint8) << 3)
+    code = code.unflatten(-1, (-1, 2))
+    return (code[..., 0] | (code[..., 1] << 4)).contiguous()
+
+
+def unpack_e2m1(packed: torch.Tensor) -> torch.Tensor:
+    """``pack_e2m1``'s bytes (any one-byte dtype) as fp32 values ``[..., K]``."""
+    byte = packed.contiguous().view(torch.uint8)
+    table = torch.tensor(_E2M1 + tuple(-x for x in _E2M1), dtype=torch.float32, device=packed.device)
+    return torch.stack([table[(byte & 0x0F).long()], table[(byte >> 4).long()]], dim=-1).flatten(-2)
+
+
+def quant_fp8(x: torch.Tensor, block: int = 32, pow2_scale: bool = True) -> tuple[torch.Tensor, torch.Tensor]:
+    """``x [..., N]`` in ``block``-wide groups: E4M3 values ``[..., N]`` and each group's fp32
+    scale ``[..., N // block]`` (``amax / 448``, at least ``1e-4 / 448``, rounded up to a power of
+    two with ``pow2_scale``)."""
+    groups = x.float().unflatten(-1, (-1, block))
+    scale = groups.abs().amax(-1, keepdim=True).clamp_min(1e-4) * torch.tensor(
+        1 / FP8_MAX, dtype=torch.float32, device=x.device)
+    if pow2_scale:
+        scale = pow2_ceil(scale)
+    q = (groups / scale).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn)
+    return q.flatten(-2), scale.squeeze(-1)
+
+
+def round_fp8(x: torch.Tensor, block: int = 32) -> torch.Tensor:
+    """``x`` rounded to the FP8 grid of ``quant_fp8`` (power-of-two scales), in ``x``'s dtype."""
+    q, scale = quant_fp8(x, block)
+    return (q.float().unflatten(-1, (-1, block)) * scale.unsqueeze(-1)).flatten(-2).to(x.dtype)
+
+
+def quant_fp4(x: torch.Tensor, block: int = 32, e4m3_scale: bool = False) -> tuple[torch.Tensor, torch.Tensor]:
+    """``x [..., N]`` in ``block``-wide groups: E2M1 values (fp32) and each group's fp32 scale,
+    ``amax / 6`` rounded up to a power of two (E8M0), or with ``e4m3_scale`` rounded to E4M3."""
+    groups = x.float().unflatten(-1, (-1, block))
+    amax = groups.abs().amax(-1, keepdim=True)
+    if e4m3_scale:
+        scale = (amax.clamp_min(FP4_MAX * 2.0 ** -9) / FP4_MAX).to(torch.float8_e4m3fn).float()
+    else:
+        scale = pow2_ceil(amax.clamp_min(FP4_MAX * 2.0 ** -126) * torch.tensor(
+            1 / FP4_MAX, dtype=torch.float32, device=x.device))
+    q = round_e2m1((groups / scale).clamp(-FP4_MAX, FP4_MAX))
+    return q.flatten(-2), scale.squeeze(-1)
+
+
+def round_fp4(x: torch.Tensor, block: int = 32, e4m3_scale: bool = False) -> torch.Tensor:
+    """``x`` rounded to the FP4 grid of ``quant_fp4``, in ``x``'s dtype."""
+    q, scale = quant_fp4(x, block, e4m3_scale)
+    return (q.unflatten(-1, (-1, block)) * scale.unsqueeze(-1)).flatten(-2).to(x.dtype)
+
+
+def dequant_block_fp8(weight: torch.Tensor, scale: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """An E4M3 ``[out, in]`` weight with one scale per ``[out / scale.rows, in / scale.cols]``
+    block, as ``dtype`` (exact in bf16 for power-of-two scales)."""
+    rows, cols = weight.shape[0] // scale.shape[0], weight.shape[1] // scale.shape[1]
+    wide = scale.float().repeat_interleave(rows, dim=0).repeat_interleave(cols, dim=1)
+    return (weight.float() * wide).to(dtype)
+
+
+def dequant_row_fp4(packed: torch.Tensor, scale: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """A packed E2M1 ``[out, in // 2]`` weight with one scale per row and ``in / scale.cols``
+    inputs, as ``dtype`` ``[out, in]``."""
+    values = unpack_e2m1(packed)
+    return (values * scale.float().repeat_interleave(values.shape[1] // scale.shape[1], dim=1)).to(dtype)

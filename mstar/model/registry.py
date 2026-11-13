@@ -18,6 +18,7 @@ MODEL_REGISTRY: dict[str, tuple[str, str]] = {
     "cosmos3_super_i2v_4step": ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
     "cosmos3_super_t2i_4step": ("mstar.model.cosmos3.cosmos3_model", "Cosmos3Model"),
     "cosyvoice3": ("mstar.model.cosyvoice3.cosyvoice3_model", "CosyVoice3Model"),
+    "deepseek_v41": ("mstar.model.deepseek_v41.deepseek_v41_model", "DeepseekV41Model"),
     "flux2_klein": ("mstar.model.flux2_klein.flux2_klein_model", "Flux2KleinModel"),
     "flux2_klein_9b": ("mstar.model.flux2_klein.flux2_klein_model", "Flux2KleinModel"),
     "fish_s2_pro": ("mstar.model.fish_s2_pro.fish_s2_pro_model", "FishS2ProModel"),
@@ -104,6 +105,10 @@ HF_MODELS: dict[str, dict] = {
     # causal HiFT, zero-shot voice cloning; the speech tokenizer and speaker
     # encoder are Chatterbox's, loaded from the checkpoint's ONNX files.
     "cosyvoice3": {"model_path_hf": "FunAudioLLM/Fun-CosyVoice3-0.5B-2512"},
+    # DeepSeek-V4.1-Flash: sliding-window + compressed sparse attention with hyper-connections
+    # and Engram, fp8 linears and fp4 experts, text only for now. The -1017 refresh has the
+    # same layout: pass it as model_kwargs.checkpoint_path.
+    "deepseek_v41": {"model_path_hf": "deepseek-ai/DeepSeek-V4.1-Flash"},
     # FLUX.2 [klein]: step-distilled rectified-flow text-to-image + multi-reference
     # editing (Qwen3 hidden-state text encoder, FLUX.2 VAE). 4B is Apache-2.0; 9B is
     # under the FLUX Non-Commercial License. Same class, all dims from the checkpoint.

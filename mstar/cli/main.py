@@ -39,6 +39,7 @@ DEFAULT_CONFIGS: dict[str, str] = {
     "chatterbox_multilingual": "chatterbox_multilingual.yaml",
     "chatterbox_turbo": "chatterbox_turbo.yaml",
     "cosyvoice3": "cosyvoice3.yaml",
+    "deepseek_v41": "deepseek_v41_flash_tp8.yaml",
     "voxcpm2": "voxcpm2.yaml",
     "orpheus": "orpheus_colocated.yaml",
     "qwen3_omni": "qwen3omni_2gpu.yaml",
