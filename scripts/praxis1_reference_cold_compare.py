@@ -51,7 +51,7 @@ def main() -> None:
     )
     session = pipeline.session(
         "pick up the marker", seed=17, max_context_chunks=0,
-        control_mode="none", exec_horizon=21, sampler=settings, skip_last_video=True,
+        control_mode="none", exec_horizon=None, sampler=settings, skip_last_video=True,
     )
     with torch.inference_mode():
         result = session.step(observation)
