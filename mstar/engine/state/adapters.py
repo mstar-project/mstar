@@ -9,7 +9,7 @@ from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import asdict, astuple, dataclass, replace
 from functools import partial
 from itertools import groupby
-from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
+from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple, Protocol
 
 import numpy as np
 import torch
@@ -864,7 +864,27 @@ class PagedNoOp(OpBinding):
 PAGED_REACH = PagedReach()
 
 
-class ReachRead:
+class PagedRead(Protocol):
+    """What a paged handle asks of whatever runs a layer's read: an attention resource, or what a binding puts in
+    its place."""
+
+    @property
+    @abstractmethod
+    def requires_kv_write(self) -> bool: ...
+
+    @abstractmethod
+    def reads_step_kv(self, label: str | None = None) -> bool: ...
+
+    @abstractmethod
+    def run(
+        self, q: torch.Tensor | None, label: str, kv_cache_layer: torch.Tensor, k=None, v=None, layer_idx: int = 0,
+    ) -> torch.Tensor | Reached: ...
+
+    @abstractmethod
+    def select_last_hidden(self, x: torch.Tensor, label: str = "main") -> torch.Tensor: ...
+
+
+class ReachRead(PagedRead):
     """What a read with no op runs: each row's reach on one layer, gathered from the pages as `Reached`. Every add
     writes the pages, so the reach holds this step's adds too."""
 
@@ -1101,7 +1121,7 @@ class PagedArrayHandle(ArrayHandle):
             run = bound.binding.bind(array, resolved.resource_of[bound.key], resources)
             bound.binding.attach(self, bound.key, run)
         self.first_read = next(iter(self.reads.values()))
-        self._attn = {
+        self._attn: dict[int, PagedRead] = {
             layer: self.reads[key]
             for key, read in array.reads.items() for layer in read_layers(array, read)
         }
