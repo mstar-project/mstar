@@ -221,17 +221,31 @@ class ClipWalk(NamedTuple):
     def assemble(self, clips: list[torch.Tensor], num_latents: int) -> torch.Tensor:
         """The clips' temporal cross-fade, then the frames the padding added cut off again
         (``num_latents`` before padding)."""
-        chunk_frames = self.chunk * self.temporal
         decoded, overlap = [], None
-        for clip in clips:
-            for j in range(int(self.token_drop > 0) + 1):
-                piece = clip[:, :, j * chunk_frames: (j + 1) * chunk_frames][:, :, self.frame_pre_padding:]
-                if j == 0:
-                    if overlap is not None:
-                        piece = blend(overlap, piece, self.frame_overlap, dim=-3)
-                    decoded.append(piece)
-                else:
-                    overlap = piece
+        for i, clip in enumerate(clips):
+            piece, overlap = self.assemble_clip(clip, overlap, num_latents if i == len(clips) - 1 else None)
+            decoded.append(piece)
+        return torch.cat(decoded, dim=2)
+
+    def assemble_clip(
+        self, clip: torch.Tensor, overlap: torch.Tensor | None, num_latents: int | None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        """One step of :meth:`assemble`: the frames that ``clip`` finishes (its first piece,
+        cross-faded with the previous clip's ``overlap``) and the overlap it leaves the next
+        clip. The last clip (``num_latents`` given, before padding) also finishes its overlap
+        and cuts the padding's frames."""
+        chunk_frames = self.chunk * self.temporal
+        decoded = []
+        for j in range(int(self.token_drop > 0) + 1):
+            piece = clip[:, :, j * chunk_frames: (j + 1) * chunk_frames][:, :, self.frame_pre_padding:]
+            if j == 0:
+                if overlap is not None:
+                    piece = blend(overlap, piece, self.frame_overlap, dim=-3)
+                decoded.append(piece)
+            else:
+                overlap = piece
+        if num_latents is None:
+            return decoded[0], overlap
         if overlap is not None:
             decoded.append(overlap)
         out = torch.cat(decoded, dim=2)
@@ -241,8 +255,10 @@ class ClipWalk(NamedTuple):
             pad_frames = sum(
                 tail if tail and (num_latents + k) % self.chunk == 0 else self.temporal for k in range(pad_tokens)
             )
+            if pad_frames >= out.shape[2]:
+                raise ValueError(f"{pad_frames} padding frames to cut from a last clip of {out.shape[2]}")
             out = out[:, :, :-pad_frames]
-        return out
+        return out, None
 
 
 class TiledViTDecoder(nn.Module):
