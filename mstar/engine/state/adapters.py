@@ -2110,9 +2110,8 @@ class PagedStorage(Storage):
     def layouts(
         self, array: Array, by_label: Mapping[str, Layout], keyed_spans: Mapping[str, int],
     ) -> "dict[str, LabelLayout]":
-        """Each read's default binding gives the retention its pages keep, and a binding a deployment picks keeps a
-        window where the default does. The bindings' checks ran when the specs were built, so none runs again on a
-        request."""
+        """Each read's default binding gives the retention its pages keep, since a request has no setup. The
+        bindings' checks ran when the specs were built, so none runs again on a request."""
         from mstar.model.base import LabelLayout
 
         kept = [
