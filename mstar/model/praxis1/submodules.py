@@ -573,14 +573,19 @@ class Praxis1BackboneSubmodule(_Praxis1Node):
                 video_latents.to(model_dtype), timestep,
                 attend_for_layer=lambda layer: resource_attend(encoder_state, layer),
             )
-            velocity = (decoder.forward_chunk_causal(
-                video_latents.to(model_dtype), cond, timestep,
-                attend_for_layer=lambda layer: resource_attend(decoder_state, layer),
-            ) if decode else None)
+            velocity = None
+            if decode:
+                if decoder_state is None:
+                    raise ValueError("Praxis video decode needs a declared decoder resource")
+                velocity = decoder.forward_chunk_causal(
+                    video_latents.to(model_dtype), cond, timestep,
+                    attend_for_layer=lambda layer: resource_attend(decoder_state, layer),
+                )
             return velocity, features
 
         velocity, features = branch(
-            text_embeds, self.state_handles[ENCODER_COND_KV], self.state_handles[DECODER_COND_KV],
+            text_embeds, self.state_handles[ENCODER_COND_KV],
+            None if final_step else self.state_handles[DECODER_COND_KV],
             decode=not final_step,
         )
         if cfg_video_scale != 1.0 and not final_step:

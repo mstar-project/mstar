@@ -153,6 +153,10 @@ def test_cold_and_warm_node_flow_matches_reference_sampler(depth: int) -> None:
             ENCODER_COND_KV, ENCODER_BLANK_KV, DECODER_COND_KV, DECODER_BLANK_KV,
         })
         assert set(backbone.declare_step("chunk", ["r"], [prepared]).state) == expected_resources
+        if step == 1:
+            # The final forward must not even look up a decoder handle that
+            # its resource declaration omitted.
+            backbone.state_handles = {ENCODER_COND_KV: states[ENCODER_COND_KV]}
         out = backbone.forward("chunk", None, **prepared.tensor_inputs, **prepared.kwargs)
         expert_inputs = {name: value for name, value in out.items()}
         expert_inputs["proprio"] = [proprio[:, -1:]]
