@@ -1984,6 +1984,8 @@ reports every config-level problem before a worker spawns; what only the built r
 is refused when the engine loads. After capture, an asynchronous node also fails startup if any
 captured verify bucket was planned on the host (an attention without ``AttentionStep(verify=True)``
 on the verify walk), since that plan could attend over the reserved lengths.
+A context-parallel KV pool, a sequence shard (``SeqShardSpec``, which keeps the base refusal)
+and repeated decode on the verify walk (``Engine.repeat_refusal``) are refused for now.
 A verifying node never drops a request: ``Engine.rebuild_policies`` leaves it out of the model's
 rebuild policies, which the engine's checks and the worker's rebuilds both read, so a model needs
 no drafting case in ``rebuild_policies``. With no host pool (``cpu_offload_pages`` 0) every request on the

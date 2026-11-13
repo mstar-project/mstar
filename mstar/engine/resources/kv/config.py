@@ -1009,6 +1009,11 @@ class KVSpec(NodeResourceSpec):
             verify = "multi-head latent attention's pool is not supported with speculative decoding yet"
         elif len(self.config.groups) > 1:
             verify = "a pool that keeps a sliding window per group can't take tokens back"
+        elif self.config.context_parallel:
+            verify = (
+                "a context-parallel pool stores K/V by position across GPUs, which verify attention and "
+                "drafter layer sets don't address"
+            )
         elif len(self.nodes) > 1 and ctx.node in self.nodes:
             # another node reading this pool (a prefill/decode split, a reader) would see the
             # reserved length, with rejected drafts in it
