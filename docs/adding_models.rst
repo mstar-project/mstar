@@ -2020,7 +2020,10 @@ What the model writes, and nothing more:
   its hidden states set only then.
 - A node that prefills prompts in chunks needs a drafter that declares its rule at a chunk
   boundary (``DrafterNeeds.chunk_boundary``): ``NONE`` when its state at a row depends on that
-  row alone (DSpark).
+  row and the rows before it alone (DSpark, a draft model); ``FOLLOWING`` when it also reads the
+  next prompt token (EAGLE-3). A scaffold node then gives its prompt step each row's following
+  token (``DRAFT_FOLLOWING``, cut with the ids, -1 at a prompt's last row, which follows with the
+  sampled token), so a chunk's last row reads the next chunk's first.
 - A node may run its prompts inside its verify steps (mixed prompt-plus-verify steps): the model
   names the combined walk (``VerifyNode.mixed_walk``), and the drafter's passes run over such a
   step's tokens (``DrafterNeeds.mixed``). The verify rows lead, ``k + 1`` tokens each, then the
