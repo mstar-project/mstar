@@ -788,8 +788,10 @@ deployment YAML tunes them under ``resources:`` (see :ref:`Step 6 <config-yaml>`
   ``KimiDelta(lower_bound=)`` both, ``conv`` of shape ``(3 * h * d, kernel - 1)`` and a float32
   ``state`` of shape ``(h, d, d)``, as one update a layer runs through ``kimi_delta``. A
   ``verify_span`` above 1 lets the ``Value`` take verify steps through the one update that keeps
-  verify blocks, ``KimiDelta`` so far. The step's ``settle`` comes after that update, and the
+  verify blocks, ``KimiDelta``. The step's ``settle`` comes after that update, and the
   ``Value`` can't be read whole, since part of its entry lives in those blocks between steps.
+  ``openable`` gives how many more requests can open a label on the ``Value``, which at bind is
+  its capacity.
 - ``max_len=0``: the array keeps nothing between steps, for attention within this step only.
   Its one read uses ``Block()``, which sees only the entries of the token's own segment. See
   `Cacheless attention (encoder towers)`_.
