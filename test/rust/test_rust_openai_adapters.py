@@ -92,6 +92,7 @@ def _post(port, path, body, timeout=15):
 def test_the_launcher_names_the_registry_s_adapter_class():
     assert openai_adapter_class("qwen3_5_0.8b") == "Qwen3_5Adapter"
     assert openai_adapter_class("qwen3_8_27b") == "Qwen3_5Adapter"
+    assert openai_adapter_class("ministral3_3b") == "Ministral3Adapter"
     assert openai_adapter_class("cosmos3_edge_droid") == "Cosmos3EdgeAdapter"
     assert openai_adapter_class("pi05") == ""
 
@@ -199,7 +200,8 @@ CHAT_CLASSES = [c for c in _chat_classes() if c not in TEXT_ONLY_CHAT]
 
 def test_the_chat_classes_are_the_ones_this_pr_ports():
     assert _chat_classes() == [
-        "BagelAdapter", "Cosmos3EdgeAdapter", "Qwen3OmniAdapter", "Qwen3_5Adapter", "TextChatAdapter",
+        "BagelAdapter", "Cosmos3EdgeAdapter", "Ministral3Adapter", "Qwen3OmniAdapter", "Qwen3_5Adapter",
+        "TextChatAdapter",
     ]
 
 
@@ -225,6 +227,9 @@ def test_a_chat_reaches_the_backend_as_the_python_adapter_builds_it(cls, fields,
     model = _model_of(cls)
     stub = _StubAPIServer()
     body = {**CHAT, **fields}
+    if cls == "Ministral3Adapter":
+        body.update(modalities=["text"], audio=None)
+        body.pop("chat_template_kwargs")
     with _model_stack(model, stub) as (port, _upload):
         status, data = _post(port, ROUTES["chat"][0], body, timeout=30)
         assert status == 200, data
@@ -347,8 +352,24 @@ PARITY_CASES = {
 }
 
 
-@pytest.mark.parametrize("case", sorted(PARITY_CASES))
-@pytest.mark.parametrize("model", ["qwen3_5_0.8b", "cosmos3_edge", "pi05"])
+MINISTRAL_CASES = {
+    "image": (_image_chat(f"data:image/png;base64,{PNG}"), False),
+    "one-token": ({"messages": [{"role": "user", "content": "Hello"}], "max_tokens": 1}, False),
+    "two-tokens-stream": ({"messages": [{"role": "user", "content": "Hello"}],
+                           "max_tokens": 2, "stream": True}, True),
+    "audio-output": ({"messages": [{"role": "user", "content": "Hello"}], "modalities": ["audio"]}, False),
+    "video-input": ({"messages": [{"role": "user", "content": [{"type": "video_url",
+                     "video_url": {"url": "https://example.com/video.mp4"}}]}]}, False),
+    "audio-input": ({"messages": [{"role": "user", "content": [{"type": "input_audio",
+                     "input_audio": {"data": "invalid", "format": "wav"}}]}]}, False),
+}
+
+
+@pytest.mark.parametrize("model,case", [
+    (model, case)
+    for model in ("qwen3_5_0.8b", "cosmos3_edge", "pi05", "ministral3_3b")
+    for case in sorted(PARITY_CASES | MINISTRAL_CASES if model == "ministral3_3b" else PARITY_CASES)
+])
 def test_both_frontends_answer_a_chat_with_the_same_status_and_body(case, model, tmp_path, monkeypatch):
     pytest.importorskip("fastapi")
     from fastapi.testclient import TestClient
@@ -356,7 +377,7 @@ def test_both_frontends_answer_a_chat_with_the_same_status_and_body(case, model,
     from mstar.api_server import entrypoint
 
     monkeypatch.delenv("MSTAR_ALLOW_REMOTE", raising=False)
-    body, stream = PARITY_CASES[case]
+    body, stream = (PARITY_CASES | MINISTRAL_CASES)[case]
     monkeypatch.setattr(entrypoint, "api_server", _PythonServer(model, tmp_path))
     py = TestClient(entrypoint.app).post("/v1/chat/completions", json=body)
     with _model_stack(model, _StubAPIServer()) as (port, _upload):

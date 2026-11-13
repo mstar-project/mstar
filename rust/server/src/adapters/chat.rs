@@ -75,3 +75,32 @@ impl OpenAIAdapter for TextChat {
         text_only_chat(req, upload_dir)
     }
 }
+
+/// Ministral 3 Instruct: text/image chat, text output, no audio or video inputs.
+pub struct Ministral3;
+
+impl OpenAIAdapter for Ministral3 {
+    fn supports_chat(&self) -> bool {
+        true
+    }
+    fn chat_args(&self, req: &ChatCompletionRequest, upload_dir: &Path, allow_remote: bool) -> Result<SubmitArgs, String> {
+        if req.modalities.as_ref().is_some_and(|m| m.as_slice() != ["text"]) || req.audio.is_some() {
+            return Err("Ministral 3 supports text output only".to_string());
+        }
+        for message in &req.messages {
+            if let Some(Content::Parts(parts)) = &message.content {
+                if parts.iter().any(|p| !matches!(p.get("type").and_then(Value::as_str), Some("text" | "image_url"))) {
+                    return Err("Ministral 3 accepts only text and image_url content parts".to_string());
+                }
+            }
+        }
+        let args = text_chat(req, upload_dir, allow_remote)?;
+        if args.input_modalities.iter().any(|m| m != "text" && m != "image") {
+            for path in args.file_paths.values().flatten() {
+                let _ = std::fs::remove_file(path);
+            }
+            return Err("Ministral 3 supports text and image inputs only".to_string());
+        }
+        Ok(args)
+    }
+}

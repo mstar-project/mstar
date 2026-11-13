@@ -266,7 +266,7 @@ class Benchmark:
             return {"mean": stats.mean, "p50": stats.p50, "p95": stats.p95, "p99": stats.p99}
 
         payload = {
-            "system": "ours",
+            "system": self.config.inference_system.value,
             "model": getattr(self.config.model, "__class__", type(self.config.model)).__name__,
             "request_type": self.config.request_type.value,
             "profiling_type": self.config.profiling_type.value,

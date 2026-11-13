@@ -1051,8 +1051,18 @@ The spec types are:
        a cos/sin table built once (GLM-5.2 uses float32); ``cos_sin_table`` hands it to a
        kernel that rotates inside a larger fusion, and ``interleave`` says which pairs that
        kernel must turn. A model with learned position
-       embeddings also declares this spec, because it needs the position counter. Such a
-       model never applies RoPE.
+       embeddings also declares this spec, because it needs the position counter;
+       that model never applies RoPE.
+       For YaRN, set ``yarn=YaRNConfig(factor=16,
+       original_max_position_embeddings=16384)`` (imported from
+       ``mstar.engine.resources.position.config``), with optional ``beta_fast``,
+       ``beta_slow``, ``mscale``, ``mscale_all_dim``, ``attention_factor`` and
+       ``truncate``. This builds an engine-owned fp32 cos/sin table, optionally
+       rounded by ``rope_table_dtype``, and disables plain fused RoPE. YaRN
+       cannot be combined with LongRoPE, linear or Llama-3.1 scaling; XPU is currently
+       unsupported. Model-specific query scaling stays in the model, using
+       the resource's ``pos_ids(label)``. YaRN fields participate in the
+       position fingerprint for prefix reuse.
        ``longrope=LongRoPE.from_hf(config)`` (Phi-3, Phi-4-mini) builds a short and a long
        table, each with its per-dimension factors and attention scale (``LongRopeManager``).
        A request whose ``MAX_POSITION_KWARG`` (set by ``process_prompt``; the data worker

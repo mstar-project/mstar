@@ -346,6 +346,7 @@ pub static ADAPTERS: &[(&str, &dyn OpenAIAdapter)] = &[
     ("BagelAdapter", &Bagel),
     ("Qwen3OmniAdapter", &Qwen3Omni),
     ("Qwen3_5Adapter", &Qwen3_5),
+    ("Ministral3Adapter", &Ministral3),
     ("OrpheusAdapter", &Orpheus),
     ("Cosmos3Adapter", &Cosmos3),
     ("Cosmos3EdgeAdapter", &Cosmos3Edge),
