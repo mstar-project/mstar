@@ -203,19 +203,20 @@ def _talker_steps():
     sub.state_handles = node_handles(model, "eartts_talker", resources)
     first = sub.prepare_inputs("talker_decode", _fwd("a"), {"new_token": [torch.tensor([5])]})
     later = sub.prepare_inputs("talker_decode", _fwd("b", 3), {"new_token": [torch.tensor([7])]})
+    joined, cfg = {("main", "uncond"): "main+uncond"}, {("main", "uncond"): "_cfg"}
     for rids, inputs, key in ((["a", "b"], [first, later], None), (["b"], [later], sub.DECODE_KEY)):
         step = engine_step(sub, graph_walk="talker_decode", request_ids=rids, inputs=inputs)
         prev = step.steps.pop(TALKER_PREV)
-        assert prev == RecurrentStep(segments=tuple(Segment(rid, "main", 1) for rid in rids)), \
+        assert prev == RecurrentStep(segments=tuple(Segment(rid, "main", 1) for rid in rids), combined_labels=joined), \
             "the previous codes, a Value read and written on the main rows, which main kept in request state"
-        kv = step.steps[TALKER_KV]
-        assert kv.combined_labels == {("main", "uncond"): "main+uncond"}, \
+        assert all(built.combined_labels == joined for built in step.steps.values()), \
             "the combined label is the layer's labels joined, where main named it _cfg"
-        step.steps[TALKER_KV] = replace(kv, combined_labels={("main", "uncond"): "_cfg"})
+        # main's name on each resource's step, which carries the SubmoduleStep's combined labels
+        step.steps.update({name: replace(built, combined_labels=cfg) for name, built in step.steps.items()})
         main = SubmoduleStep(segments=[Segment(request_id=rid, label=label, span=inp.input_seq_len)
                                        for label in ("main", "uncond") for rid, inp in zip(rids, inputs, strict=True)],
-                             cg_key_info=key, steps={
-            TALKER_KV: KVStep(combined_labels={("main", "uncond"): "_cfg"}), TALKER_ATTN: AttentionStep(causal=True),
+                             combined_labels=cfg, cg_key_info=key, steps={
+            TALKER_KV: KVStep(), TALKER_ATTN: AttentionStep(causal=True),
             TALKER_POS: PositionStep(),
             CODEC_STATE: RecurrentStep(segments=tuple(Segment(rid, "main", 1) for rid in rids)),
         })
