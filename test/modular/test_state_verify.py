@@ -55,6 +55,8 @@ ATTEND = Attend(q_heads=HEADS)
 class _StubKV:
     """Holds pages per layer and records the counts it is handed instead of applying them."""
 
+    tp_group = None
+
     def __init__(self):
         self.pages = torch.zeros(LAYERS, SLOTS, 2, HEADS, DIM)
         self.deferred = []

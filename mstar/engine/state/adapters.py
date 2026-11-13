@@ -1062,11 +1062,12 @@ class Rewind(OpBinding):
 
 class _CountTable:
     """A verify step's counts on the host, row 0 the step's number and row r the count of its row r, copied there
-    from ``staging`` on the device by a copy a capture records."""
+    from ``staging`` on the device by a copy a capture records. Past its rows it holds every one of ``ranks`` TP
+    ranks' counts, where the debug compare gathers them."""
 
-    def __init__(self, rows: int, device: torch.device):
-        self.rows = rows
-        self.host = torch.zeros(rows + 1, dtype=torch.int64, pin_memory=device.type == "cuda")
+    def __init__(self, rows: int, ranks: int, device: torch.device):
+        self.rows, self.ranks = rows, ranks
+        self.host = torch.zeros(1 + rows * (1 + ranks), dtype=torch.int64, pin_memory=device.type == "cuda")
         self.staging = torch.zeros(rows, dtype=torch.int64, device=device)
 
 
@@ -1086,7 +1087,18 @@ class _Counts:
                 raise RuntimeError(f"the count table of verify step {self._number} was overwritten by step {number} "
                                    "before its counts were applied")
             self._kept = self._table.host[1:len(self._spans) + 1].tolist()
+            self._compare_ranks()
         return self._kept[row] - self._spans[row]
+
+    def _compare_ranks(self) -> None:
+        table = self._table
+        if not table.ranks:
+            return
+        start = 1 + table.rows
+        ranks = table.host[start:start + table.ranks * len(self._spans)].view(table.ranks, -1).tolist()
+        if any(counts != self._kept for counts in ranks):
+            raise RuntimeError(f"the TP ranks settled verify step {self._number} differently, {ranks}, and each "
+                               "would move its own pages by its own counts")
 
 
 class _RowCount(NamedTuple):
@@ -1107,6 +1119,9 @@ class RewindRun(VerifyRun):
         super().__init__(handle)
         self._kv = kv
         self._device = kv.layer_view(0).device
+        # under MSTAR_KV_DEBUG_ASSERTS, the pool's TP group, whose ranks must settle the same counts
+        self._group = kv.tp_group if _DEBUG_ASSERTS else None
+        self._ranks = 0 if self._group is None or self._group.world_size == 1 else self._group.world_size
         self._tables: dict[tuple, _CountTable] = {}
         self._number = 0
         # this step's table while it verifies, its segments and its context
@@ -1130,7 +1145,7 @@ class RewindRun(VerifyRun):
         key = (lease.slot, lease.bucket) if captured else ("eager", (self._number + 1) % 2)
         table = self._tables.get(key)
         if table is None or (not captured and table.rows < len(segments)):
-            table = self._tables[key] = _CountTable(len(segments), self._device)
+            table = self._tables[key] = _CountTable(len(segments), self._ranks, self._device)
         elif table.rows < len(segments):
             raise refusal(f"a verify step of {len(segments)} rows on capture slot {lease.slot}, and its slot's count "
                           f"table holds {table.rows}")
@@ -1168,6 +1183,11 @@ class RewindRun(VerifyRun):
         self._settled = True
         self._table.staging[:rows].copy_(kept[:rows])
         self._table.host[1:rows + 1].copy_(self._table.staging[:rows], non_blocking=True)
+        if self._ranks:
+            # on the forward's stream, where every rank reaches it between the model's own collectives
+            gathered = self._group.all_gather(self._table.staging[:rows], dim=0)
+            start = 1 + self._table.rows
+            self._table.host[start:start + gathered.numel()].copy_(gathered, non_blocking=True)
 
     def end(self, ctx) -> None:
         if self._table is not None and not self._settled:
