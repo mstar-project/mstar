@@ -36,11 +36,11 @@ class _NullCommunicator:
         return []
 
 
-def _manager(entity, tmp_path, copy_workers=1):
+def _manager(entity, tmp_path, copy_workers=1, device="cpu"):
     os.environ["MSTAR_SHM_ARENA_SEGMENT_MB"] = "1"
     os.environ["MSTAR_SHM_ARENA_MAX_SEGMENTS"] = "4"
     return ArenaShmCommunicationManager(
-        my_entity_id=entity, hostname="localhost", device="cpu",
+        my_entity_id=entity, hostname="localhost", device=device,
         communicator=_NullCommunicator(), shm_dir=str(tmp_path),
         copy_workers=copy_workers,
     )
@@ -1302,9 +1302,11 @@ def test_a_host_source_is_staged_without_tensor_copy(tmp_path, monkeypatch, make
     assert got.dtype == src.dtype and got.shape == src.shape and torch.equal(got, src)
 
 
+# the API server names its device "cpu", a worker torch.device("cpu")
+@pytest.mark.parametrize("device", ["cpu", torch.device("cpu")], ids=["str", "torch_device"])
 @pytest.mark.parametrize("parallel", [False, True])
 @pytest.mark.parametrize("dtype", [torch.uint8, torch.bfloat16, torch.float32, torch.bool])
-def test_a_cpu_read_owns_its_bytes_past_reclaim(tmp_path, monkeypatch, dtype, parallel):
+def test_a_cpu_read_owns_its_bytes_past_reclaim(tmp_path, monkeypatch, dtype, parallel, device):
     """A CPU consumer's tensor is a copy: the producer reclaiming the slot and
     staging another tensor into it must not change what was read. ``parallel``
     takes the copier's sliced path, which a video read uses."""
@@ -1312,7 +1314,7 @@ def test_a_cpu_read_owns_its_bytes_past_reclaim(tmp_path, monkeypatch, dtype, pa
 
     monkeypatch.setattr(host_copy, "MIN_SLICE_BYTES", 1)
     prod = _manager("w0", tmp_path)
-    cons = _manager("w1", tmp_path, copy_workers=4 if parallel else 1)
+    cons = _manager("w1", tmp_path, copy_workers=4 if parallel else 1, device=device)
     assert cons._host_copier.slices(1152) == (4 if parallel else 1)
     original = (torch.arange(3 * 16 * 24) % 7 == 3) if dtype == torch.bool else (
         torch.arange(3 * 16 * 24) % 251).to(dtype)

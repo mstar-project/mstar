@@ -1179,7 +1179,7 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
     # copy per item.
     def _read_many_from_arena(self, infos: list[TensorPointerInfo]) -> list[torch.Tensor]:
         out: list[torch.Tensor | None] = [None] * len(infos)
-        if self.device != "cpu":
+        if self.device.type != "cpu":
             groups: dict[tuple, list[int]] = {}
             for k, info in enumerate(infos):
                 if 0 < info.nbytes <= self._gather_item_bytes:
@@ -1203,10 +1203,10 @@ class ArenaShmCommunicationManager(SharedMemoryCommunicationManager):
         if info.nbytes == 0:
             t = torch.empty(
                 info.dims, dtype=info.dtype)
-            return t.to(self.device) if self.device != "cpu" else t
+            return t.to(self.device) if self.device.type != "cpu" else t
         view = self._peer_view(info.shm_segment)
         start = info.shm_offset + info.offset  # offset = TP-shard read offset
-        if self.device == "cpu":
+        if self.device.type == "cpu":
             # A CPU consumer owns a copy past reclaim. clone() would split it
             # over torch's intra-op pool, sized for small ops; the copier keeps
             # an image one memcpy and slices a video over threads of its own.

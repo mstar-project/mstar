@@ -712,7 +712,7 @@ class TensorCommunicationManager(ABC):
         self,
         my_entity_id: str,
         my_session_id: str,
-        device: str,
+        device: str | torch.device,
         communicator: BaseCommunicator,
         transfer_engine: TensorTransferEngine,
         enable_prof: bool=False
@@ -720,7 +720,9 @@ class TensorCommunicationManager(ABC):
         self.my_entity_id = my_entity_id
         self.my_session_id = my_session_id
         self.enable_prof = enable_prof
-        self.device = device
+        # The worker passes a torch.device and the API server a string. Check
+        # self.device.type: torch.device("cpu") == "cpu" is False.
+        self.device = torch.device(device)
         # by the manager's device, not torch.cuda.is_available() alone: a host manager holds only host tensors,
         # and its first sync would create a CUDA context on a GPU that other processes may have filled
         self._on_cuda = torch.cuda.is_available() and torch.device(device).type == "cuda"
@@ -2458,7 +2460,7 @@ def _serialize_tensor(tensor: torch.Tensor) -> bytes:
 
 
 def _deserialize_tensor(
-    data: bytes | memoryview, device: str,
+    data: bytes | memoryview, device: str | torch.device,
     tensor_info: TensorPointerInfo
 ) -> torch.Tensor:
     """Reconstruct a tensor from bytes produced by ``_serialize_tensor``."""
@@ -2470,7 +2472,7 @@ def _deserialize_tensor(
         t = torch.empty(shape, dtype=dtype)
     else:
         t = torch.frombuffer(bytearray(data), dtype=torch.uint8).view(dtype).reshape(shape)
-    if device != "cpu":
+    if torch.device(device).type != "cpu":
         t = t.to(device)
     return t
 
