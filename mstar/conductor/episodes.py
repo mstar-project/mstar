@@ -12,6 +12,7 @@ from types import MappingProxyType
 
 from mstar.conductor.routing import Placement
 from mstar.model.base import EpisodeView
+from mstar.utils.generation_kwargs import check_seed, offset_seed
 
 
 class EpisodeCapacityError(Exception):
@@ -27,6 +28,7 @@ class EpisodeRecord:
     calls: int
     placement: Placement | None
     slot: int | None
+    seed_base: int | None = None
     held: dict[str, int] = field(default_factory=dict)
     keys: dict[str, str] = field(default_factory=dict)
     in_flight: str | None = None
@@ -99,6 +101,20 @@ class EpisodeRecords:
         record = self._records.get(episode_id) if episode_id is not None else None
         return record.slot if record is not None else None
 
+    def seed_for(self, episode_id: str | None, base: int | None) -> int | None:
+        """Use the admitted call count for a session's next sampling seed."""
+        check_seed(base)
+        record = self._records.get(episode_id) if episode_id is not None else None
+        if base is None:
+            if record is not None and record.seed_base is not None:
+                raise ValueError("episode_seed must stay set for the episode")
+            return None
+        if episode_id is None:
+            raise ValueError("episode_seed needs an episode id")
+        if record is not None and record.seed_base != base:
+            raise ValueError("episode_seed cannot change during an episode")
+        return offset_seed(base, record.calls if record is not None else 0)
+
     def mark_ending(self, episode_id: str) -> bool:
         """Mark a close while a call drains; return whether it is in flight."""
         record = self._records.get(episode_id)
@@ -131,7 +147,7 @@ class EpisodeRecords:
         self, episode_id: str | None, request_id: str, slot: int,
         placement: Placement, *, keys: Mapping[str, str] | None = None,
         reset: bool = False, max_calls: int | None = None,
-        workers: set[str] | None = None,
+        workers: set[str] | None = None, seed_base: int | None = None,
     ) -> EpisodeView:
         """Record an admission decision made elsewhere, before worker dispatch.
 
@@ -148,10 +164,11 @@ class EpisodeRecords:
             raise ValueError(f"episode id must be a non-empty str or None, got {episode_id!r}")
 
         self.can_admit(episode_id, max_calls)
+        self.seed_for(episode_id, seed_base)
         record = self._records.get(episode_id)
         before = self.view(episode_id, keys, reset)
         if record is None:
-            record = EpisodeRecord(0, Placement(placement.replicas.copy(), {}), slot)
+            record = EpisodeRecord(0, Placement(placement.replicas.copy(), {}), slot, seed_base=seed_base)
             self._records[episode_id] = record
         elif record.slot is None:
             record.placement = Placement(placement.replicas.copy(), {})

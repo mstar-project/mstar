@@ -61,6 +61,37 @@ def test_reset_keeps_call_count_and_end_releases_the_logical_owner():
     assert episodes.view("robot-a").calls == 0
 
 
+def test_session_seed_uses_the_existing_call_count_through_reset_and_eviction():
+    episodes = EpisodeRecords()
+    assert episodes.seed_for("robot-a", 17) == 17
+    episodes.admit("robot-a", "call-1", 3, _placement(0), seed_base=17)
+    episodes.finish("robot-a", "call-1", {"frames": 21})
+    assert episodes.seed_for("robot-a", 17) == 18
+    episodes.reset("robot-a")
+    assert episodes.seed_for("robot-a", 17) == 18
+    with pytest.raises(ValueError, match="cannot change"):
+        episodes.seed_for("robot-a", 19)
+    with pytest.raises(ValueError, match="must stay set"):
+        episodes.seed_for("robot-a", None)
+    assert episodes.evict("robot-a") == (3, set())
+    assert episodes.seed_for("robot-a", 17) == 18
+    episodes.admit("robot-a", "call-2", 4, _placement(1), seed_base=17)
+    episodes.finish("robot-a", "call-2", {"frames": 21})
+    assert episodes.seed_for("robot-a", 17) == 19
+    assert episodes.end("robot-a") == (4, set())
+    assert episodes.seed_for("robot-b", 17) == 17
+
+
+def test_episode_seed_refuses_idless_and_wraps_at_int64_boundary():
+    episodes = EpisodeRecords()
+    with pytest.raises(ValueError, match="episode id"):
+        episodes.seed_for(None, 1)
+    assert episodes.seed_for("robot-a", 2**63 - 1) == 2**63 - 1
+    episodes.admit("robot-a", "call-1", 3, _placement(0), seed_base=2**63 - 1)
+    episodes.finish("robot-a", "call-1", {})
+    assert episodes.seed_for("robot-a", 2**63 - 1) == -(2**63)
+
+
 def test_live_and_wrong_owner_calls_are_refused_before_record_mutation():
     episodes = EpisodeRecords()
     episodes.admit("robot-a", "call-1", 3, _placement(0))

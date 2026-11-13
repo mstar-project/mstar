@@ -142,9 +142,9 @@ def _normalise(messages):
     return messages
 
 
-def python_session(stub, make_frame=frame, requests=3, reset_last=True):
+def python_session(stub, make_frame=frame, requests=3, reset_last=True, query=""):
     entrypoint.api_server = stub
-    with TestClient(entrypoint.app).websocket_connect("/api/v1/session") as ws:
+    with TestClient(entrypoint.app).websocket_connect(f"/api/v1/session{query}") as ws:
         messages = [msgpack.unpackb(ws.receive_bytes()) for _ in range(2)]
         id = messages[1]["session_id"]
         for call_index in range(requests):
@@ -157,8 +157,8 @@ def python_session(stub, make_frame=frame, requests=3, reset_last=True):
     return messages
 
 
-def rust_session(port, make_frame=frame, requests=3, reset_last=True):
-    with websockets.sync.client.connect(f"ws://127.0.0.1:{port}/api/v1/session", compression=None) as ws:
+def rust_session(port, make_frame=frame, requests=3, reset_last=True, query=""):
+    with websockets.sync.client.connect(f"ws://127.0.0.1:{port}/api/v1/session{query}", compression=None) as ws:
         messages = [msgpack.unpackb(ws.recv()) for _ in range(2)]
         id = messages[1]["session_id"]
         for call_index in range(requests):
@@ -207,17 +207,21 @@ def test_praxis_mode_sends_same_original_observation_to_shared_data_worker():
         )
 
     with rust(stub) as port:
-        python_session(stub, stacked_frame, requests=4)
+        py_messages = python_session(stub, stacked_frame, requests=4, query="?sample_seed=17")
         py_submissions = list(stub.submissions)
         stub.submissions.clear()
-        rust_session(port, stacked_frame, requests=4)
+        rust_messages = rust_session(port, stacked_frame, requests=4, query="?sample_seed=17")
         rs_submissions = list(stub.submissions)
+    assert py_messages[1]["meta"]["sample_seed_base"] == 17
+    assert rust_messages[1]["meta"]["sample_seed_base"] == 17
+    assert py_messages[1]["meta"]["seed_source"] == rust_messages[1]["meta"]["seed_source"] == "session_param"
     assert len(py_submissions) == len(rs_submissions) == 4
     for py, rs in zip(py_submissions, rs_submissions, strict=True):
         for submission in (py, rs):
             assert submission["input_modalities"] == ["image", "text"]
             assert submission["model_kwargs"]["control_mode"] == "droid_impedance"
             assert submission["model_kwargs"]["executed_rows"] in (0, 21, 24)
+            assert submission["model_kwargs"]["episode_seed"] == 17
             parsed = msgpack.unpackb(submission["positronic_frame"], raw=False)
             assert parsed["session_id"] == submission["episode"]
             assert parsed["observation"]["prompt"] == "go"
@@ -256,10 +260,10 @@ def test_short_stack_cold_reply_resynchronizes_both_frontends():
     stub = WindowStub()
     stub.positronic_policy = PositronicPolicy({"robot": "stub"}, observation_format="praxis1")
     with rust(stub) as port:
-        py = python_session(stub, window_frame, requests=4, reset_last=False)
+        py = python_session(stub, window_frame, requests=4, reset_last=False, query="?sample_seed=17")
         py_submissions = list(stub.submissions)
         stub.submissions.clear()
-        rs = rust_session(port, window_frame, requests=4, reset_last=False)
+        rs = rust_session(port, window_frame, requests=4, reset_last=False, query="?sample_seed=17")
         rs_submissions = list(stub.submissions)
     assert _normalise(py) == _normalise(rs)
     assert [len(m["result"]) for m in py[2:6]] == [21, 24, 21, 24]
@@ -270,6 +274,27 @@ def test_short_stack_cold_reply_resynchronizes_both_frontends():
             for s in submissions
         ]
         assert resets == [False, False, True, False]
+
+
+def test_bad_session_seed_is_refused_by_both_frontends():
+    stub = Stub()
+    stub.positronic_policy = PositronicPolicy({"robot": "stub"}, observation_format="praxis1")
+    with rust(stub) as port:
+        entrypoint.api_server = stub
+        with TestClient(entrypoint.app).websocket_connect("/api/v1/session?sample_seed=bad") as ws:
+            py = msgpack.unpackb(ws.receive_bytes())
+            with pytest.raises(WebSocketDisconnect) as close:
+                ws.receive_bytes()
+            assert close.value.code == 1008
+        with websockets.sync.client.connect(
+            f"ws://127.0.0.1:{port}/api/v1/session?sample_seed=bad", compression=None,
+        ) as ws:
+            rs = msgpack.unpackb(ws.recv())
+            with pytest.raises(websockets.exceptions.ConnectionClosed) as close:
+                ws.recv()
+            assert close.value.rcvd.code == 1008
+    assert py == rs == {"status": "error", "error": "sample_seed must be a signed 64-bit integer"}
+    assert stub.submissions == []
 
 
 def test_wrong_session_id_fails_and_ends_once():

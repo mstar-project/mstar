@@ -8,7 +8,21 @@ import pytest
 from PIL import Image
 
 from mstar.api_server.openpi import pack
+from mstar.api_server.positronic import _session_seed
 from mstar.api_server.positronic_input import decode_praxis_frame
+
+
+def test_session_seed_prefers_query_then_deployment_and_validates_int64(monkeypatch):
+    monkeypatch.setenv("PRAXIS_SAMPLE_SEED", "23")
+    assert _session_seed("17") == (17, "session_param")
+    assert _session_seed(" +17 ") == (17, "session_param")
+    assert _session_seed(None) == (23, "env")
+    monkeypatch.delenv("PRAXIS_SAMPLE_SEED")
+    base, source = _session_seed(None)
+    assert 0 <= base < 2**31 and source == "rotated"
+    for bad in ("1.5", "nan", "1_7", str(2**63)):
+        with pytest.raises(ValueError, match="signed 64-bit"):
+            _session_seed(bad)
 
 
 def test_single_arm_uses_the_last_executed_frame_and_raw_client_pose():

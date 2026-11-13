@@ -1443,7 +1443,11 @@ class Conductor:
             )
             return
         try:
-            _request_seed(body.model_kwargs or {}, _seed_id(body))
+            model_kwargs = body.model_kwargs or {}
+            _request_seed(model_kwargs, _seed_id(body))
+            check_seed(model_kwargs.get("episode_seed"))
+            if model_kwargs.get("seed") is not None and model_kwargs.get("episode_seed") is not None:
+                raise ValueError("seed and episode_seed cannot both be set")
         except ValueError as exc:
             self._reject_request(body.request_id, str(exc), status=400)
             return
@@ -1575,9 +1579,8 @@ class Conductor:
         model_kwargs = body.model_kwargs or {}
         max_output_tokens = self._max_output_tokens(model_kwargs)
         loop_caps = self._loop_caps(model_kwargs)
-        # Honor an explicit per-request seed (e.g. OpenAI ``seed``) when given;
-        # otherwise derive a stable seed from the request id. ``_ingest_request``
-        # already rejected a bad one.
+        # Use an episode's existing call count for session sampling. Ordinary
+        # requests keep their explicit seed or the request-id-derived seed.
         seed = _request_seed(model_kwargs, _seed_id(body))
 
         episode_active = bool(self._episode_array_names)
@@ -1597,6 +1600,11 @@ class Conductor:
                     not self._episode_slots.has_free_on_any(self.worker_ids)):
                 raise EpisodeCapacityError
             episode_view = self._episode_records.view(body.episode, episode_keys, body.reset_episode)
+            episode_seed = self._episode_records.seed_for(body.episode, model_kwargs.get("episode_seed"))
+            if episode_seed is not None:
+                seed = episode_seed
+        elif model_kwargs.get("episode_seed") is not None:
+            raise ValueError("episode_seed requires declared episode state")
 
         partitions = self.model.get_partitions()
         topology = self.model.get_partition_topology()
@@ -1780,6 +1788,7 @@ class Conductor:
                     body.episode, body.request_id, slot, placement,
                     keys=episode_keys, reset=body.reset_episode,
                     max_calls=self._episode_max_calls, workers=workers,
+                    seed_base=model_kwargs.get("episode_seed"),
                 )
             except Exception:
                 if new_slot:

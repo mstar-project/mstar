@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import re
 import secrets
 import time
 from dataclasses import dataclass
@@ -18,6 +20,7 @@ from fastapi import WebSocket, WebSocketDisconnect
 from mstar.api_server.openpi import pack as _pack_numpy
 from mstar.api_server.openpi import unpack as _unpack_numpy
 from mstar.utils.client_errors import client_error_text
+from mstar.utils.generation_kwargs import check_seed
 
 logger = logging.getLogger(__name__)
 
@@ -82,8 +85,27 @@ def _prompt(obs: dict, policy: PositronicPolicy) -> str:
     return prompt
 
 
+def _session_seed(raw: str | None) -> tuple[int, str]:
+    """Choose one base seed for the connection; the conductor counts calls."""
+    source = "session_param"
+    if raw is None or raw.strip().lower() in ("", "none", "null"):
+        raw = os.environ.get("PRAXIS_SAMPLE_SEED")
+        source = "env"
+    if raw is None or raw.strip() == "":
+        return secrets.randbits(31), "rotated"
+    try:
+        if re.fullmatch(r"[+-]?[0-9]+", raw.strip()) is None:
+            raise ValueError
+        seed = int(raw)
+        check_seed(seed)
+    except ValueError:
+        raise ValueError("sample_seed must be a signed 64-bit integer") from None
+    return seed, source
+
+
 async def _infer(
     api, obs: dict, policy: PositronicPolicy, session_id: str, reset: bool, frame: bytes, prior_rows: int,
+    seed_base: int | None,
 ) -> list[dict]:
     prompt = _prompt(obs, policy)
     request_id = api.submit_request(
@@ -93,6 +115,7 @@ async def _infer(
         streaming=True, episode=session_id, reset_episode=reset,
         **({"positronic_frame": frame, "model_kwargs": {
             "control_mode": policy.control_mode, "executed_rows": 0 if reset else prior_rows,
+            "episode_seed": seed_base,
         }}
            if policy.observation_format == "praxis1" else {}),
     )
@@ -124,9 +147,21 @@ async def serve_connection(websocket: WebSocket, api) -> None:
     ended = False
     prior_rows = 0
     try:
+        seed_base = None
+        seed_source = None
+        if policy.observation_format == "praxis1":
+            try:
+                seed_base, seed_source = _session_seed(websocket.query_params.get("sample_seed"))
+            except ValueError as exc:
+                await websocket.send_bytes(_pack({"status": "error", "error": str(exc)}))
+                await websocket.close(code=1008)
+                return
         await websocket.send_bytes(_pack({"status": "loading", "message": "Loading policy..."}))
         await websocket.send_bytes(_pack({
-            "status": "ready", "meta": policy.meta, "protocol_version": 2,
+            "status": "ready", "meta": {
+                **policy.meta, **({"sample_seed_base": seed_base, "seed_source": seed_source}
+                                if seed_base is not None else {}),
+            }, "protocol_version": 2,
             "session_id": session_id, "max_in_flight": 1,
         }))
         while True:
@@ -155,7 +190,7 @@ async def serve_connection(websocket: WebSocket, api) -> None:
                 if reset:
                     prior_rows = 0
                 infer_started = time.monotonic()
-                rows = await _infer(api, obs, policy, session_id, reset, data, prior_rows)
+                rows = await _infer(api, obs, policy, session_id, reset, data, prior_rows, seed_base)
                 prior_rows = len(rows)
                 elapsed = (time.monotonic() - started) * 1000
                 infer_ms = (time.monotonic() - infer_started) * 1000

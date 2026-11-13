@@ -187,6 +187,21 @@ def test_reset_and_close_clear_owner_after_teardown(tmp_path, monkeypatch):
     assert _new_requests(comm, "third") == []
 
 
+def test_session_base_seed_reaches_worker_and_advances_across_reset(tmp_path, monkeypatch):
+    conductor, _, comm = _conductor(tmp_path, monkeypatch)
+    first = _request("first", "robot-a")
+    first.model_kwargs["episode_seed"] = 17
+    conductor._ingest_request(first)
+    assert _new_requests(comm, "first")[0][1].request_info.random_seed == 17
+    _complete(conductor, "first", {"frames": 4})
+
+    second = _request("second", "robot-a", reset=True)
+    second.model_kwargs["episode_seed"] = 17
+    conductor._ingest_request(second)
+    assert _new_requests(comm, "second")[0][1].request_info.random_seed == 18
+    assert conductor._episode_records.view("robot-a").calls == 2
+
+
 def test_warm_episode_stays_on_first_replica_when_router_would_rotate(tmp_path, monkeypatch):
     conductor, model, comm = _conductor(tmp_path, monkeypatch, replicas=2)
     conductor._ingest_request(_request("first", "robot-a"))

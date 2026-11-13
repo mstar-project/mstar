@@ -1,11 +1,12 @@
 //! Positronic protocol v2 session wire. The model emits command dictionaries
 //! as a msgpack `action` chunk; the Praxis adapter supplies their contents.
 
+use std::collections::HashMap;
 use std::sync::OnceLock;
 use std::time::Instant;
 
 use axum::extract::ws::{CloseFrame, Message, WebSocket};
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use futures::StreamExt;
@@ -75,12 +76,27 @@ fn prompt(obs: &Mp, policy: &Policy) -> Result<String, String> {
     }.ok_or_else(|| format!("the observation needs a {} string", policy.prompt_key))
 }
 
-async fn infer(st: &AppState, policy: &Policy, obs: &Mp, session_id: &str, reset: bool, frame: &[u8], prior_rows: usize) -> Result<(Mp, String), String> {
+fn session_seed(raw: Option<&str>) -> Result<(i64, &'static str), String> {
+    let provided = raw.filter(|s| !matches!(s.trim().to_ascii_lowercase().as_str(), "" | "none" | "null"));
+    let (value, source) = if let Some(value) = provided {
+        (Some(value.to_string()), "session_param")
+    } else {
+        (std::env::var("PRAXIS_SAMPLE_SEED").ok().filter(|s| !s.trim().is_empty()), "env")
+    };
+    let Some(value) = value else {
+        return Ok(((uuid::Uuid::new_v4().as_u128() & ((1 << 31) - 1)) as i64, "rotated"));
+    };
+    value.trim().parse::<i64>().map(|seed| (seed, source))
+        .map_err(|_| "sample_seed must be a signed 64-bit integer".into())
+}
+
+async fn infer(st: &AppState, policy: &Policy, obs: &Mp, session_id: &str, reset: bool, frame: &[u8], prior_rows: usize, seed_base: Option<i64>) -> Result<(Mp, String), String> {
     let prompt = prompt(obs, policy)?;
     let mut model_kwargs = serde_json::Map::new();
     if policy.observation_format == "praxis1" {
         model_kwargs.insert("control_mode".into(), Value::String(policy.control_mode.clone()));
         model_kwargs.insert("executed_rows".into(), Value::from(if reset { 0 } else { prior_rows }));
+        model_kwargs.insert("episode_seed".into(), Value::from(seed_base.expect("Praxis session seed")));
     }
     let args = SubmitArgs {
         text: Some(prompt.clone()),
@@ -113,14 +129,17 @@ async fn infer(st: &AppState, policy: &Policy, obs: &Mp, session_id: &str, reset
     Ok((rows, prompt))
 }
 
-pub async fn positronic_ws(State(st): State<AppState>, ws: super::Upgrade) -> Response {
+pub async fn positronic_ws(State(st): State<AppState>, Query(query): Query<HashMap<String, String>>, ws: super::Upgrade) -> Response {
     let ws = match super::upgrade(ws) {
         Ok(ws) => ws,
         Err(not_found) => return not_found,
     };
     let Some(policy) = policy() else { return StatusCode::FORBIDDEN.into_response(); };
+    let seed_base = if policy.observation_format == "praxis1" {
+        session_seed(query.get("sample_seed").map(String::as_str)).map(Some)
+    } else { Ok(None) };
     let limit = super::max_message_bytes();
-    ws.max_message_size(limit).max_frame_size(limit).on_upgrade(move |socket| serve(socket, st, policy))
+    ws.max_message_size(limit).max_frame_size(limit).on_upgrade(move |socket| serve(socket, st, policy, seed_base))
 }
 
 async fn end(st: &AppState, id: &str) -> Result<(), String> {
@@ -130,12 +149,26 @@ async fn end(st: &AppState, id: &str) -> Result<(), String> {
     Ok(())
 }
 
-async fn serve(mut socket: WebSocket, st: AppState, policy: &'static Policy) {
+async fn serve(mut socket: WebSocket, st: AppState, policy: &'static Policy, seed_base: Result<Option<(i64, &'static str)>, String>) {
     let id = uuid::Uuid::new_v4().simple().to_string();
     let mut prior_rows = 0;
+    let seed_base = match seed_base {
+        Ok(seed) => seed,
+        Err(reason) => {
+            let _ = socket.send(Message::Binary(error(&reason))).await;
+            let _ = socket.send(Message::Close(Some(CloseFrame { code: 1008, reason: reason.into() }))).await;
+            if let Err(e) = end(&st, &id).await { eprintln!("positronic episode cleanup failed: {e}"); }
+            return;
+        }
+    };
+    let mut meta = policy.meta.clone();
+    if let Some((seed, source)) = seed_base {
+        meta.insert("sample_seed_base".into(), Value::from(seed));
+        meta.insert("seed_source".into(), Value::from(source));
+    }
     let loading = pack(&json!({"status": "loading", "message": "Loading policy..."}));
     let ready = pack(&json!({
-        "status": "ready", "meta": policy.meta, "protocol_version": 2,
+        "status": "ready", "meta": meta, "protocol_version": 2,
         "session_id": id, "max_in_flight": 1,
     }));
     if socket.send(Message::Binary(loading)).await.is_err() || socket.send(Message::Binary(ready)).await.is_err() {
@@ -179,7 +212,7 @@ async fn serve(mut socket: WebSocket, st: AppState, policy: &'static Policy) {
         if reset { prior_rows = 0; }
         let decode_ms = started.elapsed().as_secs_f64() * 1000.0;
         let infer_started = Instant::now();
-        let (rows, effective_prompt) = match infer(&st, policy, &obs, &id, reset, &data, prior_rows).await {
+        let (rows, effective_prompt) = match infer(&st, policy, &obs, &id, reset, &data, prior_rows, seed_base.map(|(seed, _)| seed)).await {
             Ok(rows) => rows,
             Err(e) => { failed(&mut socket, &e).await; break; }
         };
@@ -221,5 +254,14 @@ mod tests {
         assert_eq!(request(&call, "other").unwrap_err(), "The session ID does not belong to this connection");
         let end = pack(&json!({"session_id": id, "end_session": true}));
         assert_eq!(request(&end, id).unwrap(), None);
+    }
+
+    #[test]
+    fn session_seed_parses_a_signed_base_and_rejects_invalid_input() {
+        assert_eq!(session_seed(Some("17")).unwrap(), (17, "session_param"));
+        assert_eq!(session_seed(Some(" +17 ")).unwrap(), (17, "session_param"));
+        assert_eq!(session_seed(Some("-1")).unwrap(), (-1, "session_param"));
+        assert!(session_seed(Some("1.5")).unwrap_err().contains("signed 64-bit"));
+        assert!(session_seed(Some("9223372036854775808")).unwrap_err().contains("signed 64-bit"));
     }
 }

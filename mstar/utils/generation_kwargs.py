@@ -106,7 +106,7 @@ def normalize_generation_kwargs(model_kwargs: dict | None) -> dict:
         if value is not None:
             kwargs.setdefault("max_output_tokens", value)
     for key, value in kwargs.items():
-        if key == "seed":
+        if key in ("seed", "episode_seed"):
             kwargs[key] = value = _coerce_int(value)
             check_seed(value)
         elif (name := _knob(key, _REAL_RULES)) is not None:
