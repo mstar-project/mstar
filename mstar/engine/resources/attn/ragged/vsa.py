@@ -151,15 +151,16 @@ def _block_sparse_kernel():
 
 
 @triton.jit
-def _pack_kernel(src_ptr, row_of_slot_ptr, tiled_ptr, pooled_ptr, inv_size_ptr, heads, slots, n_tiles,
+def _pack_kernel(src_ptr, src_row, src_head, row_of_slot_ptr, tiled_ptr, pooled_ptr, inv_size_ptr, slots, n_tiles,
                  TILE: tl.constexpr, D: tl.constexpr):
-    """One (tile, head): gather the tile's packed ``[rows, H, D]`` rows into head-major ``tiled``
-    ``[H, slots, D]`` (zeros in pad slots), and their fp32 mean into ``pooled`` ``[H, n_tiles, D]``."""
+    """One (tile, head): gather the tile's packed ``[rows, H, D]`` rows (any row / head strides, unit last) into
+    head-major ``tiled`` ``[H, slots, D]`` (zeros in pad slots), and their fp32 mean into ``pooled``
+    ``[H, n_tiles, D]``."""
     tile, h = tl.program_id(0), tl.program_id(1)
     slot = tile * TILE + tl.arange(0, TILE)
     cols = tl.arange(0, D)
     row = tl.load(row_of_slot_ptr + slot)
-    x = tl.load(src_ptr + (row.to(tl.int64)[:, None] * heads + h) * D + cols[None, :],
+    x = tl.load(src_ptr + row.to(tl.int64)[:, None] * src_row + h.to(tl.int64) * src_head + cols[None, :],
                 mask=(row >= 0)[:, None], other=0.0)
     tl.store(tiled_ptr + (h.to(tl.int64) * slots + slot[:, None]) * D + cols[None, :], x)
     if tile < n_tiles:
@@ -239,8 +240,11 @@ def video_sparse_attention(
     slots = tiled.shape[2]
     if q.is_cuda:
         for i, x in enumerate((q, k, v)):
+            # q / k / v are often views of one fused projection: read them strided rather than copy them
+            if x.stride(-1) != 1:
+                x = x.contiguous()
             _pack_kernel[(geometry.tiles_padded, heads)](
-                x.contiguous(), geometry.row_of_slot, tiled[i], pooled[i], workspace.inv_size, heads, slots, n,
+                x, x.stride(0), x.stride(1), geometry.row_of_slot, tiled[i], pooled[i], workspace.inv_size, slots, n,
                 TILE=VSA_TILE_ELEMS, D=d,
             )
     else:  # the same in torch, for CPU tests
