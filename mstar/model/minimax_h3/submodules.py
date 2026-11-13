@@ -25,7 +25,7 @@ from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.state import ArrayStep, Segment, SubmoduleStep
+from mstar.engine.state import ArrayStep, Segment, SubmoduleStep, VideoSparseLayout
 from mstar.model.components.batched_rows import BatchedRows
 from mstar.model.components.diffusion.attention import FrameSDPA, sdpa_attention
 from mstar.model.components.diffusion.compile_utils import compile_blocks as compile_blocks_
@@ -437,6 +437,18 @@ class H3DenoiseSubmodule(H3PackedDenoise):
         if bucket_key.num_condition_rows:
             tensors[COND_LATENTS] = inputs[COND_LATENTS][0]
         return tensors
+
+    def attention_segments(self, bucket_key: H3Layout) -> dict[str, tuple[tuple, ...]]:
+        """The request's rows, laid out for video sparse attention (``VideoSparseLayout``: text, keyframe and audio
+        rows dense, then the generated video's token grid), and its padding rows. Only the ``vsa`` backend reads the
+        layout."""
+        rows, pad = bucket_key.total_rows, self.padded_rows(bucket_key) - bucket_key.total_rows
+        ph, pw = bucket_key.patch
+        layout = VideoSparseLayout((
+            bucket_key.text_len, bucket_key.num_condition_rows, bucket_key.num_audio_rows,
+            (bucket_key.latent_frames, bucket_key.latent_height // ph, bucket_key.latent_width // pw),
+        ))
+        return {DIT_ROWS: ((self.MAIN_SPAN, rows, layout),) + (((self.MAIN_SPAN, pad),) if pad else ())}
 
     def capture_request_inputs(self, bucket_key: H3Layout, device) -> dict[str, torch.Tensor]:
         cfg = self.config.transformer

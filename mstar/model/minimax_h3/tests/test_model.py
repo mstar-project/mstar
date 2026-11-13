@@ -703,7 +703,8 @@ def test_the_padded_rows_split_evenly_over_the_sp_ranks_at_every_prompt_length(w
         assert padded % multiple == 0 and rows <= padded < rows + multiple
         assert len(set(sp_seq_split(padded, world))) == 1
         segments = node.attention_segments(layout)[DIT_ROWS]
-        assert segments == (("main", rows), ("main", padded - rows))[:1 + (padded > rows)]
+        assert [seg[:2] for seg in segments] == [("main", rows), ("main", padded - rows)][:1 + (padded > rows)]
+        assert segments[0][2].rows == rows  # the request's rows carry their VSA layout, the padding none
         if text_len % 97 == 0:
             step_layout = node.build_layout(layout, "cpu")
             assert step_layout.num_rows == padded and step_layout.num_pad_rows == padded - rows

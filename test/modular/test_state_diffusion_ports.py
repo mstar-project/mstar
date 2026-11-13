@@ -26,6 +26,7 @@ from mstar.engine.resources.attn.ragged.config import (
     RaggedAttentionSpec,
     RaggedCrossAttentionSpec,
     RaggedCrossAttentionStep,
+    VideoSparseLayout,
 )
 from mstar.engine.resources.sequence_shard import SeqShardSpec, SequenceShard, sequence_parallel_refusals
 from mstar.engine.resources.spec import apply_yaml_overrides, resolve_spec_dependencies
@@ -648,8 +649,14 @@ def test_h3_steps_equal_the_hand_written_one_on_every_rank(world):
     rows, padded = layout.total_rows, sub.num_tokens(layout)
     assert (padded > rows) == (world > 1)
     segments = [Segment(request_id=0, label="main", span=span) for span in (rows, padded - rows) if span]
+    # the attention reads how the request's rows are arranged: text, keyframe and audio rows, then the video grid
+    grid = (layout.latent_frames, layout.latent_height // layout.patch[0], layout.latent_width // layout.patch[1])
+    arranged = VideoSparseLayout((layout.text_len, layout.num_condition_rows, layout.num_audio_rows, grid))
     reference = SubmoduleStep(
-        segments=segments, steps={H3_ATTN: AttentionStep(causal=False, fixed_layout=True)}, cg_key_info=layout,
+        segments=segments, cg_key_info=layout,
+        steps={H3_ATTN: AttentionStep(
+            segments=[segments[0]._replace(layout=arranged), *segments[1:]], causal=False, fixed_layout=True,
+        )},
     )
     handles = node_handles(model, "dit", {**_one_rank_shards(model), H3_ATTN: _StubRagged()})
     _assert_plans_equal(state_steps(sub.declare_step("gen", [0], [_inputs(layout)]), handles), reference, H3_ATTN)

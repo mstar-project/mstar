@@ -4,8 +4,11 @@ model: "minimax_h3"
 max_seq_len: 8192
 
 # FastVideo's FastH3 8-Step V2: MiniMax-H3's DiT distilled with DMD2 to 8 unguided steps, text to
-# audio+video only, in place of FL2VA's DiT and token refiner (dense attention; it was trained with
-# VSA). The conditioner, the VAEs and everything else are FL2VA's. One GPU with room for the DiT
+# audio+video only, in place of FL2VA's DiT and token refiner, on the video sparse attention (VSA,
+# sparsity 0.8, with its trained compression gates) it was distilled with. The conditioner, the VAEs
+# and everything else are FL2VA's. VSA runs FastVideo's block-sparse kernel: install fastvideo-kernel
+# built for the GPU (docs/models.rst, MiniMax-H3); `backend: auto` here runs dense attention instead.
+# One GPU with room for the DiT
 # (66 GB), the Qwen3-VL conditioner (~53 GB) and the decode, e.g. a B300; on 141 GB GPUs, add
 # distilled_checkpoint to minimax_h3.yaml's SP layout instead.
 model_kwargs:
@@ -17,3 +20,7 @@ model_kwargs:
 node_groups:
   - node_names: [dit, text_encoder, vae_encoder, vae_decoder, audio_decoder]
     ranks: [0]
+
+resources:
+  dit_attn:
+    backend: vsa
