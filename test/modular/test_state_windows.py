@@ -37,6 +37,7 @@ from mstar.engine.resources.kv.ring import RingKVManager
 from mstar.engine.resources.kv.rolling import RollingKVConfig, RollingKVReqConfig, RollingKVStep, RollingPosition
 from mstar.engine.resources.kv.rolling.manager import RollingKVManager
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
+from mstar.engine.resources.sequence_shard import sequence_parallel_refusals
 from mstar.engine.resources.step import Segment, StepContext, SubmoduleStep
 from mstar.engine.state import (
     Array,
@@ -328,8 +329,7 @@ def test_a_compiled_region_traces_the_ring_calls_once():
      "entry must be a KVEntry"),
     ({"labels": {"main", "cfg"}}, r"labels \['cfg', 'main'\], and a ring holds one session per request"),
     ({"max_len": TPF - 1}, "max_len 127 holds no frame of 128 entries"),
-    ({"seq_sharded": True}, "seq_sharded takes max_len 0"),
-], ids=["frame_sizes", "uncovered_layer", "q_heads", "entry", "labels", "max_len", "seq_sharded"])
+], ids=["frame_sizes", "uncovered_layer", "q_heads", "entry", "labels", "max_len"])
 def test_the_ring_refuses_what_it_cannot_size(change, message):
     with pytest.raises(ValueError, match=f"Array 'kv': no layout yet: {message}"):
         build_specs([_ring_array(**change)])
@@ -341,6 +341,14 @@ def test_a_ring_takes_no_kernel_settings():
         build_specs([_ring_array()], kernel_settings={"kv": {"max_num_pages": 8}})
     with pytest.raises(ValueError, match=r"kernel_settings\['local'\] names no read or update"):
         build_specs([_ring_array()], kernel_settings={"local": {"splits": (1,)}})
+
+
+def test_the_engine_refuses_a_ring_on_sp_ranks():
+    """A ring declares nothing about sequence parallelism and refuses nothing about it. The engine's check refuses its
+    node on SP ranks, and where a shard splits the node's steps the engine refuses the ring at build."""
+    (refusal,) = sequence_parallel_refusals(build_specs([_ring_array()]), "dit", tp=1, sp=2)
+    assert refusal.startswith("node 'dit' runs on 2 SP ranks but neither splits tokens"), refusal
+    assert not RingKVManager.supports_split_steps, "a ring that took split steps would pass the engine's build check"
 
 
 @pytest.mark.parametrize(("read", "message"), [
