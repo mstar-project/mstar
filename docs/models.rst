@@ -220,10 +220,11 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
        A request carries the whole camera trajectory as JSON in ``model_kwargs``, which the API
        server caps at 1 MiB: about 3,900 frames of ``[4, 4]`` float32 poses; send ``[F, 3, 4]``
        rows for up to the 4,077-frame maximum. One rollout at a time: the model refuses any
-       other ``max_concurrent_requests``, since each rollout's VAE caches go from chunk to chunk
-       on the rollout loop's edges, outside the K/V pool. The pool holds one rollout's sink,
-       latest window and chunk at 720x1280 (``resources: dit_kv: pool_tokens``, 64,800 tokens a
-       layer), and a deployment that serves only 464x832 can set 27144. The DiT's attention runs
+       other ``max_concurrent_requests``. The pool holds one rollout's sink, latest window and
+       chunk at 720x1280 (``resources: dit_kv: pool_tokens``, 64,800 tokens a layer), and the
+       engine keeps 9.5 GB free for that rollout's VAE caches (``resources: vae_caches:
+       max_bytes``); a deployment that serves only 464x832 can set 27144 and 3994438656. The VAE
+       decode needs cuDNN 9.16 or later for bf16. The DiT's attention runs
        through the engine's ragged attention resource, its blocks are compiled (Inductor's
        deterministic mode), the condition encode runs channels-last, and the VAE decode is
        channels-last, compiled and bf16 where cuDNN >= 9.16 (frames 51 dB from the fp32 decode).

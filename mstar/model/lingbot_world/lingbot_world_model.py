@@ -1,6 +1,6 @@
 """LingBotWorldModel: LingBot-World-V2 causal-fast, camera-controlled image-to-world.
 
-Architecture (2 nodes; the dit declares its K/V, its text K/V and its draws' state):
+Architecture (2 nodes; the dit declares its K/V, its text K/V, its draws' state and its VAE caches):
     text_encoder - UMT5-XXL prompt encoder (wan22's submodule, reused)
     dit          - the 1.3B causal DiT. One rollout iteration is one chunk of
                    4 latent frames: the chunk's I2V condition (a warm-cache
@@ -12,9 +12,8 @@ Architecture (2 nodes; the dit declares its K/V, its text K/V and its draws' sta
 
 Graph walks (2), run in order:
     encode_text  - text_encoder; persists text_embeds_pos
-    rollout      - Loop("rollout_loop") over dit with self loop-backs ("clock" and
-                   the VAE encoder's and decoder's caches); each iteration
-                   emits its chunk's frames (``video_frame``)
+    rollout      - Loop("rollout_loop") over dit with a self loop-back ("clock");
+                   each iteration emits its chunk's frames (``video_frame``)
 
 The camera trajectory is the action input: per-frame OpenCV c2w poses plus
 intrinsics, as in the reference's ``poses.npy`` / ``intrinsics.npy``. The
@@ -46,16 +45,16 @@ from mstar.model.lingbot_world.config import (
 )
 from mstar.model.lingbot_world.submodules import (
     CHUNK_OUTPUTS,
-    DECODER_CACHE,
     DIT_KV,
-    ENCODER_CACHE,
     PROGRESS,
     ROLLOUT_LOOP_NAME,
     ROLLOUT_WALK,
     SELF_ATTN,
     TEXT,
     TEXT_ATTN,
+    VAE_CACHES,
     LingBotDitSubmodule,
+    vae_cache_entry,
 )
 from mstar.model.media_limits import PILLOW_IMAGE_FORMATS, check_image_size, decoding_upload, open_upright_image
 from mstar.model.submodule_base import NodeSubmodule
@@ -70,7 +69,7 @@ _CONFIG_KWARGS = ("reference_numerics", "dit_compile_autotune", "keep_chunk_outp
 REFERENCE_MODEL_KWARGS = {"reference_numerics": True}
 
 ENCODE_TEXT_WALK = "encode_text"
-_DIT_INPUTS = ("text_embeds_pos", "image_inputs", "camera_poses", "intrinsics", "clock", ENCODER_CACHE, DECODER_CACHE)
+_DIT_INPUTS = ("text_embeds_pos", "image_inputs", "camera_poses", "intrinsics", "clock")
 
 
 class LingBotWorldModel(Model):
@@ -108,8 +107,9 @@ class LingBotWorldModel(Model):
 
     def declare_state(self) -> list[Array]:
         """Each chunk's self-attention K/V, of which a chunk reads the sink and the latest window; where the
-        request's draws stand; and, unless ``reference_numerics`` attends with the reference's FA2, each chunk's text
-        K/V, whose queries are the chunk's."""
+        request's draws stand; the VAE encoder's and decoder's causal-conv caches, at the request's latent size; and,
+        unless ``reference_numerics`` attends with the reference's FA2, each chunk's text K/V, whose queries are the
+        chunk's."""
         cfg = self.config
         blocks = frozenset(range(cfg.num_layers))
         entry = KVEntry(heads=cfg.num_heads, head_dim=cfg.head_dim)
@@ -118,6 +118,8 @@ class LingBotWorldModel(Model):
             Array(DIT_KV, nodes={"dit"}, layers=blocks, entry=entry, max_len=cfg.max_rollout_tokens(),
                   reads={SELF_ATTN: Read(mask=Bidirectional(kept_window=True), op=op)}),
             Value(PROGRESS, nodes={"dit"}, layers=frozenset({0}), entry=Entry({}, host={"rng": bytes})),
+            Value(VAE_CACHES, nodes={"dit"}, layers=frozenset({0}), entry=vae_cache_entry(cfg),
+                  largest=cfg.largest_latent()),
         ]
         if not cfg.reference_numerics:
             arrays.append(Array(
@@ -133,26 +135,28 @@ class LingBotWorldModel(Model):
 
     def state_layout(self, lat_h: int, lat_w: int) -> dict[str, dict[str, Layout]]:
         """What a rollout at a ``lat_h`` by ``lat_w`` latent writes: a chunk's tokens an iteration of the rollout loop,
-        of which the pool keeps the sink and the latest window."""
+        of which the pool keeps the sink and the latest window, and the VAE caches at that latent."""
         cfg = self.config
         frame = cfg.frame_tokens(lat_h, lat_w)
-        return {DIT_KV: {"main": Layout(
-            growth=((ROLLOUT_LOOP_NAME, cfg.chunk_size * frame),), kept_windows={SELF_ATTN: cfg.kept_window(frame)},
-        )}}
+        return {
+            DIT_KV: {"main": Layout(
+                growth=((ROLLOUT_LOOP_NAME, cfg.chunk_size * frame),), kept_windows={SELF_ATTN: cfg.kept_window(frame)},
+            )},
+            VAE_CACHES: {"main": Layout(sizes={"lat_h": lat_h, "lat_w": lat_w})},
+        }
 
     def validate_config_yaml(self, config: dict, config_path: str) -> None:
         """Refuse to serve more than one rollout at a time.
 
-        The pool admits a rollout's K/V, and at small output sizes it admits many. Each one's VAE caches go from
-        chunk to chunk on the rollout loop's edges, outside admission, so the conductor's admit queue, which exists
-        only when ``max_concurrent_requests`` is set, has to hold them to one rollout.
+        The K/V pool and the VAE caches' budget each hold one rollout at the largest size by default, and the dit
+        steps one row, so a deployment serves one rollout and the conductor queues the rest.
         """
         limit = config.get("max_concurrent_requests")
         if not (type(limit) is int and limit == 1):
             raise ValueError(
                 f"LingBot-World requires `max_concurrent_requests: 1` in {config_path}; got {limit!r}. "
-                "The K/V pool admits each rollout's K/V, not its VAE caches, which go from chunk to chunk on the "
-                "rollout loop's edges, so the admit queue that this key enables is the only bound on them."
+                "Its K/V pool and its VAE caches' budget each hold one rollout at the largest size, and the "
+                "conductor queues the rest."
             )
         if "autocast_dtype" in config and parse_autocast_dtype(config["autocast_dtype"]) is not torch.bfloat16:
             raise ValueError(
@@ -176,8 +180,6 @@ class LingBotWorldModel(Model):
                 input_names=list(_DIT_INPUTS),
                 outputs=[
                     GraphEdge(next_node="dit", name="clock"),
-                    GraphEdge(next_node="dit", name=ENCODER_CACHE),
-                    GraphEdge(next_node="dit", name=DECODER_CACHE),
                     GraphEdge(next_node=EMIT_TO_CLIENT, name="video_output", output_modality="video_frame"),
                     *(GraphEdge(next_node=EMPTY_DESTINATION, name=name)
                       for name in CHUNK_OUTPUTS if self.config.keep_chunk_outputs),

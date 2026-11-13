@@ -3,7 +3,7 @@
 `main` declared LingBot's rolling store and one ragged resource for both pairs, and held the text K/V, the generator,
 the noise and the VAE caches in the submodule's per-request state. Now the dit declares an array whose kept-window read
 reaches the sink and the latest window, which the engine keeps in that rolling store, a text array whose queries are the
-chunk's, and a Value of the draws' state, and the VAE caches ride the rollout loop's edges. The hand-written specs and
+chunk's, and a Value of the draws' state, and a sized Value of the VAE caches. The hand-written specs and
 draws below are `main`'s, copied from the model as it stood before the port.
 """
 
@@ -27,9 +27,11 @@ from mstar.engine.resources.attn.ragged.config import RaggedCrossAttentionSpec
 from mstar.engine.resources.kv.config import RetentionPolicy, refuse_undeclared_labels
 from mstar.engine.resources.kv.rolling import RollingKVReqConfig, RollingKVSpec
 from mstar.engine.resources.kv.rolling.manager import RollingKVManager
+from mstar.engine.resources.sized import SizedValueSpec
+from mstar.engine.resources.sized.store import SizedValueStore
 from mstar.engine.resources.step import StepContext
 from mstar.engine.state import Bidirectional
-from mstar.engine.state.adapters import StateSetup, build_specs, kv_layouts, node_handles, state_steps
+from mstar.engine.state.adapters import StateSetup, build_specs, kv_layouts, node_handles, state_sizes, state_steps
 from mstar.model.base import serving_resources
 from mstar.model.components import wan_vae
 from mstar.model.lingbot_world.components.dit import LingBotCausalDiT
@@ -43,10 +45,9 @@ from mstar.model.lingbot_world.submodules import (
     SELF_ATTN,
     TEXT,
     TEXT_ATTN,
+    VAE_CACHES,
     EncoderStream,
     LingBotDitSubmodule,
-    decoder_cache,
-    to_edge,
 )
 
 # `main`'s ragged attention over both pairs, and its labels (`submodules.py` at the port's base)
@@ -92,7 +93,8 @@ class _Sdpa:
 
 class _Rollout:
     """The dit node on the CPU over its declared state: the rolling store, the kept-window read and the text read on
-    SDPA stand-ins for the ragged kernel, and the engine's host fields. A chunk runs as the engine steps it."""
+    SDPA stand-ins for the ragged kernel, the VAE caches' store and the engine's host fields. A chunk runs as the engine
+    steps it."""
 
     LAT = (4, 4)
 
@@ -107,10 +109,14 @@ class _Rollout:
         if pool_tokens is not None:
             self.spec.config.pool_tokens = pool_tokens
         self.pool = RollingKVManager(self.spec.config, torch.device("cpu"), name=DIT_KV)
+        self.cache_spec = next(spec for spec in specs if spec.resource_key == VAE_CACHES)
+        self.caches = SizedValueStore(self.cache_spec.config, torch.device("cpu"), name=VAE_CACHES)
         self.window, self.text = _Sdpa(), _Sdpa()
         # reference numerics build the store alone
         self.planned = {} if cfg.reference_numerics else {SELF_ATTN: self.window, TEXT_ATTN: self.text}
-        self.handles = node_handles(model, "dit", {DIT_KV: self.pool, **self.planned}, setup=self.setup)
+        self.handles = node_handles(
+            model, "dit", {DIT_KV: self.pool, VAE_CACHES: self.caches, **self.planned}, setup=self.setup,
+        )
         torch.manual_seed(0)
         self.dit = LingBotCausalDiT(cfg).eval()
         self.sub = LingBotDitSubmodule(None, None, cfg)
@@ -123,6 +129,9 @@ class _Rollout:
         it waits on."""
         (row,) = kv_layouts(self.model.declare_state(), self.model.state_layout(*self.LAT), {})[DIT_KV].values()
         self.pool.ingest_request(rid, overrides=self.spec.request_config({"kv_layout": {DIT_KV: {"main": row.row()}}}))
+        sizes = state_sizes(self.model.declare_state(), self.model.state_layout(*self.LAT))
+        self.caches.ingest_request(rid, overrides=self.cache_spec.request_config({"state_sizes": sizes}))
+        assert self.caches.reserve(rid, "dit", ROLLOUT_WALK, None) is None
         self.setup.host_fields.open(rid)
         self.chunks[rid] = 0
         self.pool.ask(rid, "dit", ROLLOUT_WALK)
@@ -184,9 +193,11 @@ def test_the_specs_are_main_s_resources_but_three():
     """`main` built a rolling store and one ragged resource for both pairs. The declaration builds the same store under
     the same key, of the same size, a ragged resource for the chunk's pair over it, and a second for the text pair, each
     with `main`'s attention geometry. `main` set each spec's dtype to bf16. Here the specs leave it unset, and the build
-    takes the model's, which is bf16."""
+    takes the model's, which is bf16. The fourth is the store of the VAE caches, which `main` kept in the request's
+    state, outside any resource."""
     model = _model()
-    kv, window, text = serving_resources(model, {"resources": {}})
+    kv, window, caches, text = serving_resources(model, {"resources": {}})
+    assert isinstance(caches, SizedValueSpec) and (caches.resource_key, caches.nodes) == (VAE_CACHES, {"dit"})
     assert isinstance(kv, RollingKVSpec) and (kv.resource_key, kv.nodes) == (DIT_KV, {"dit"})
     assert (kv.config.num_layers, kv.config.num_heads, kv.config.head_dim, kv.config.dtype) == (30, 12, 128, None)
     assert kv.config.pool_tokens == 64800, "the pool should hold one rollout's window at 720x1280, as main's did"
@@ -223,13 +234,14 @@ def test_a_config_can_t_change_the_pool_s_dtype(dtype):
 
 
 def test_the_reference_numerics_read_with_no_op_and_declare_no_text():
-    """FA2 attends what the read reaches and the step's own text K/V, so the pool is the only resource."""
+    """FA2 attends what the read reaches and the step's own text K/V, so the pool and the VAE caches' store are the only
+    resources."""
     model = _model(**REFERENCE_MODEL_KWARGS)
-    kv, progress = model.declare_state()
-    assert {a.name for a in model.declare_state()} == {DIT_KV, PROGRESS}
+    kv, progress, caches = model.declare_state()
+    assert {a.name for a in model.declare_state()} == {DIT_KV, PROGRESS, VAE_CACHES}
     (read,) = kv.reads.values()
     assert read.op is None and read.mask == Bidirectional(kept_window=True)
-    assert [spec.resource_key for spec in serving_resources(model, {"resources": {}})] == [DIT_KV]
+    assert [spec.resource_key for spec in serving_resources(model, {"resources": {}})] == [DIT_KV, VAE_CACHES]
 
 
 @pytest.mark.parametrize(("image_hw", "frame"), [((464, 832), 1508), ((720, 1280), 3600)])
@@ -334,7 +346,7 @@ def test_a_chunk_s_step_declares_its_tokens_its_text_and_its_draws():
     assert [(s.label, s.span) for s in declared.state[TEXT].segments] == [("text", 8)]
     assert set(declared.state[PROGRESS].host[(1, "main", 0)]) == {"rng"}
     step = state_steps(declared, rollout.handles, graph_walk=ROLLOUT_WALK)
-    assert set(step.steps) == {DIT_KV, SELF_ATTN, TEXT_ATTN}
+    assert set(step.steps) == {DIT_KV, SELF_ATTN, TEXT_ATTN, VAE_CACHES}
     assert step.steps[TEXT_ATTN].pairs == (("main", "text"),)
     reference = _Rollout(_tiny(reference_numerics=True))
     assert TEXT not in reference.sub.declare_step(ROLLOUT_WALK, [1], [inputs]).state
@@ -452,23 +464,22 @@ def test_a_chunk_prepared_again_draws_the_same_noise():
     assert first.kwargs["rng"] == again.kwargs["rng"]
 
 
-def test_a_decoder_cache_comes_back_from_its_edge_a_feat_cache():
-    """The compiled decode guards on the cache's type, and diffusers' markers come back as they went."""
-    slots = wan_vae.FeatCache([None, "Rep", torch.arange(6.0).view(1, 2, 3)])
-    back = decoder_cache(None, to_edge(slots, torch.device("cpu")))
-    assert type(back) is wan_vae.FeatCache
-    assert back[0] is None and back[1] == "Rep" and torch.equal(back[2], slots[2])
+def test_a_decoder_cache_comes_back_from_its_fields_slot_for_slot():
+    """The compiled decode guards on each slot's strides, so the tensors come back themselves, where they were."""
+    slots = wan_vae.FeatCache([None, torch.arange(6.0).view(1, 2, 3), None])
+    back = wan_vae.cache_from_fields(3, wan_vae.cache_fields(slots, "dec"), "dec")
+    assert back[0] is None and back[1] is slots[1] and back[2] is None
 
 
-def test_the_encoder_stream_comes_back_from_its_edge():
+def test_the_encoder_stream_comes_back_from_its_fields():
     vae = SimpleNamespace(_cached_conv_counts={"encoder": 3})
     stream = EncoderStream(vae)
     stream.cache = [None, torch.ones(2), torch.zeros(1, 2)]
-    back = EncoderStream(vae, stream.edge(torch.device("cpu")))
-    assert back.cache[0] is None and torch.equal(back.cache[1], stream.cache[1]) and back.steady is None
+    back = EncoderStream(vae, stream.fields())
+    assert back.cache[0] is None and back.cache[1] is stream.cache[1] and back.steady is None
     stream.cache, stream.steady = None, torch.full((1, 4), 2.0)
-    settled = EncoderStream(vae, stream.edge(torch.device("cpu")))
-    assert settled.cache is None and torch.equal(settled.steady, stream.steady)
+    settled = EncoderStream(vae, stream.fields())
+    assert settled.cache is None and settled.steady is stream.steady
 
 
 # Compile

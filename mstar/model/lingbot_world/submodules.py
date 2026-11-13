@@ -20,10 +20,9 @@ The dit declares its state (``LingBotWorldModel.declare_state``): the
 self-attention K/V of each chunk in ``DIT_KV``, of which the engine's rolling
 store keeps the sink and the latest window; each chunk's text K/V in ``TEXT``, which
 no step keeps; and where the request's draws stand in ``PROGRESS``. The VAE
-encoder's and decoder's causal-conv caches go from one chunk to the next on
-the rollout loop's edges, outside admission, so the model refuses a config
-that runs more than one rollout at a time
-(``LingBotWorldModel.validate_config_yaml``).
+encoder's and decoder's causal-conv caches are ``VAE_CACHES``, a sized Value:
+the engine admits a rollout by their bytes at its latent size and holds them
+from one chunk to the next.
 
 Numerics are the model's, not the engine's: ``LingBotWorldModel.get_autocast_dtype``
 is bf16, which sizes the K/V pool and the attention kernels, and no node runs
@@ -41,7 +40,7 @@ from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.state import ArrayStep, Segment, SubmoduleStep, host
+from mstar.engine.state import ArrayStep, Entry, Segment, Size, SubmoduleStep, TensorType, host
 from mstar.model.components import wan_vae
 from mstar.model.components.diffusion.decode_utils import latent_affine, wan_vae_decode_dtype
 from mstar.model.components.diffusion.image_io import truncate_to_uint8
@@ -56,38 +55,32 @@ logger = logging.getLogger(__name__)
 ROLLOUT_LOOP_NAME = "rollout_loop"
 ROLLOUT_WALK = "rollout"
 
-# the declared state beside the blocks' arrays: where the request's draws stand
-PROGRESS = "progress"
+# the declared state beside the blocks' arrays: where the request's draws stand, and the VAE's causal-conv caches
+PROGRESS, VAE_CACHES = "progress", "vae_caches"
+# VAE_CACHES' fields: the encoder's slots and its steady output, and the decoder's slots
+ENCODER, STEADY, DECODER = "enc", "enc_steady", "dec"
 # the reads of DIT_KV and TEXT
 SELF_ATTN, TEXT_ATTN = "self_attn", "text_attn"
-# the rollout loop's loop-back edges: the VAE encoder's and decoder's causal-conv caches
-ENCODER_CACHE, DECODER_CACHE = "encoder_cache", "decoder_cache"
 # what a chunk adds to its outputs under keep_chunk_outputs
 CHUNK_OUTPUTS = ("chunk_latents", "chunk_pixels", "chunk_condition")
-# diffusers' marker in a temporal upsample's slot on a stream's first call
-_REPEAT = "Rep"
 
 
-def to_edge(cache: list, device: torch.device) -> list[torch.Tensor]:
-    """A causal-conv cache as an edge carries it: an empty slot as a 0-element tensor and diffusers' ``"Rep"`` as one
-    ``int8``, since an edge holds tensors only."""
-    return [
-        slot if torch.is_tensor(slot)
-        else torch.zeros(1, dtype=torch.int8, device=device) if slot == _REPEAT
-        else torch.empty(0, device=device)
-        for slot in cache
-    ]
-
-
-def from_edge(signal: list[torch.Tensor]) -> list:
-    """The cache `to_edge` carried, its markers back to ``None`` and ``"Rep"``."""
-    return [None if t.numel() == 0 else _REPEAT if t.dtype == torch.int8 else t for t in signal]
-
-
-def decoder_cache(vae: nn.Module, signal: list[torch.Tensor]) -> wan_vae.FeatCache:
-    """The decoder's cache from ``DECODER_CACHE``, empty at a stream's first chunk. A compiled decode guards on the
-    cache's type, so it comes back a ``FeatCache``."""
-    return wan_vae.FeatCache(from_edge(signal)) if signal else wan_vae.new_feat_cache(vae)
+def vae_cache_entry(config: LingBotWorldConfig) -> Entry:
+    """``VAE_CACHES``' fields at a request's latent size: the encoder's cache and its steady output, which the encode
+    runs in fp32, and the decoder's cache in the decode's dtype."""
+    if config.chunk_size < 2:
+        raise ValueError(
+            f"LingBotWorldConfig.chunk_size is {config.chunk_size}, and a chunk of one latent ends with diffusers' "
+            f"'Rep' marker in the decoder's temporal upsamples, which {VAE_CACHES!r} has no field for; make it at "
+            "least 2")
+    decode = torch.float32 if config.reference_numerics else torch.bfloat16
+    return Entry({
+        **wan_vae.stream_cache_fields("encoder", torch.float32, ENCODER),
+        STEADY: TensorType(
+            (1, 2 * config.vae_z_dim, 1, Size(wan_vae.LAT_H), Size(wan_vae.LAT_W)), dtype=torch.float32,
+        ),
+        **wan_vae.stream_cache_fields("decoder", decode, DECODER),
+    })
 
 
 def first_frame_mask(num_latent_frames: int, lat_h: int, lat_w: int, device) -> torch.Tensor:
@@ -106,25 +99,28 @@ class EncoderStream:
     cache, then, once the black frames have driven that cache to a fixed
     point, the one encoder output every later call would return.
 
-    It goes from one chunk to the next on ``ENCODER_CACHE``: the cache's slots
-    (`to_edge`), or the one steady output in their place."""
+    It goes from one chunk to the next in ``VAE_CACHES``: the cache's slots,
+    or the one steady output in their place. ``held`` is what the last chunk
+    left there, nothing at a stream's first."""
 
-    def __init__(self, vae: nn.Module, signal: list[torch.Tensor] = ()):
+    def __init__(self, vae: nn.Module, held: Mapping[str, torch.Tensor | None] | None = None):
+        held = held or {}
         counts = getattr(vae, "_cached_conv_counts", None)
         if counts is not None:
             num_convs = counts["encoder"]
         else:
             num_convs = sum(isinstance(m, wan_vae.WanCausalConv3d) for m in vae.encoder.modules())
+        self.steady: torch.Tensor | None = held.get(STEADY)
         # One slot per causal conv, as ``AutoencoderKLWan.clear_cache`` builds it.
-        self.cache: list | None = [None] * num_convs
-        self.steady: torch.Tensor | None = None
-        if len(signal) == 1:
-            self.cache, self.steady = None, signal[0]
-        elif signal:
-            self.cache = from_edge(signal)
+        self.cache: list | None = None
+        if self.steady is None:
+            self.cache = wan_vae.cache_from_fields(num_convs, held, ENCODER)
+        # whether a call on this stream object reached the steady output, so the slots it was given go
+        self.settled = False
 
-    def edge(self, device: torch.device) -> list[torch.Tensor]:
-        return [self.steady] if self.steady is not None else to_edge(self.cache, device)
+    def fields(self) -> dict[str, torch.Tensor]:
+        """What the next chunk continues from, by ``VAE_CACHES``' field names."""
+        return {STEADY: self.steady} if self.steady is not None else wan_vae.cache_fields(self.cache, ENCODER)
 
     def encode_black(self, vae: nn.Module, x: torch.Tensor) -> torch.Tensor:
         """One encoder call on black frames. When a call leaves every cache
@@ -138,7 +134,7 @@ class EncoderStream:
         before = list(self.cache)
         out = vae.encoder(x, feat_cache=self.cache, feat_idx=[0])
         if all(_same_slot(a, b) for a, b in zip(before, self.cache, strict=True)):
-            self.steady, self.cache = out, None
+            self.steady, self.cache, self.settled = out, None, True
         return out
 
 
@@ -229,27 +225,30 @@ class LingBotDitSubmodule(NodeSubmodule):
             wan_vae.encoder_to_channels_last(encoder_vae)
         if vae is not None and fast:
             self._decode_dtype = wan_vae_decode_dtype()
-            if self._decode_dtype == torch.bfloat16:
-                vae.to(torch.bfloat16)
-            else:
-                logger.info("LingBot-World: decoding fp32, cuDNN %s has no fast bf16 conv3d (9.16 does)",
-                            torch.backends.cudnn.version())
+            if self._decode_dtype != torch.bfloat16:
+                raise RuntimeError(
+                    f"LingBot-World decodes in bf16, the dtype {VAE_CACHES!r} declares its decoder cache in, and "
+                    f"cuDNN {torch.backends.cudnn.version()} has no fast bf16 conv3d; serve it with cuDNN 9.16 or "
+                    "later, or with `reference_numerics`, which decodes in fp32")
+            vae.to(torch.bfloat16)
         self._decoder = wan_vae.FastDecoder(vae, channels_last=fast, compile=fast) if vae is not None else None
         if vae is not None:
             # the de-normalize's constants, fp32 on the decoder's device
             device = next(vae.parameters()).device
             self._latents_mean, self._latents_inv_std = latent_affine(vae, torch.float32, device)
             if fast:
+                fields = wan_vae.stream_cache_fields("decoder", self._decode_dtype, DECODER)
                 for lat_hw in warmup_latent_sizes:
-                    cache = self.warmup_decode(lat_hw)
-                    logger.info("LingBot-World: a %dx%d latent's decoder cache rides the rollout loop's edge, "
-                                "%.0f MiB", *lat_hw, wan_vae.feat_cache_bytes(cache) / 2**20)
+                    wan_vae.check_stream_cache(self.warmup_decode(lat_hw), fields, DECODER, lat_hw)
         if dit is not None and fast:
             dit.compile_blocks(autotune=config.dit_compile_autotune)
-        self.progress = None
+        self._encoder_fields = tuple(wan_vae.stream_cache_fields("encoder", torch.float32, ENCODER))
+        self._decoder_slots = len(wan_vae.new_feat_cache(vae)) if vae is not None else 0
+        self.progress = self.vae_caches = None
 
     def bind_state(self, handles: Mapping[str, Any]) -> None:
         self.progress = handles[PROGRESS]
+        self.vae_caches = handles[VAE_CACHES]
 
     def step_order(self, graph_walk: str) -> StepOrder:
         """Every rollout chunk emits frames to the client, so a session's
@@ -279,11 +278,7 @@ class LingBotDitSubmodule(NodeSubmodule):
                 "intrinsics": inputs["intrinsics"][0],
                 "latent": latent,
             },
-            kwargs={
-                "chunk": chunk, "renoise": renoise, "rng": rng,
-                # chunk 0 finds neither cache and starts each empty
-                "encoder_signal": inputs.get(ENCODER_CACHE) or [], "decoder_signal": inputs.get(DECODER_CACHE) or [],
-            },
+            kwargs={"chunk": chunk, "renoise": renoise, "rng": rng},
             resource_step_info=cfg.chunk_size * cfg.frame_tokens(lat_h, lat_w),
         )
 
@@ -311,9 +306,11 @@ class LingBotDitSubmodule(NodeSubmodule):
         return latent, renoise, generator.get_state().numpy().tobytes()
 
     def declare_step(self, graph_walk, request_ids, inputs, **kwargs) -> SubmoduleStep:
-        """A segment of the chunk's tokens a row, the text's under ``TEXT``, and the draws' state under ``PROGRESS``."""
+        """A segment of the chunk's tokens a row, the text's under ``TEXT``, the draws' state under ``PROGRESS``, and
+        the row's VAE caches."""
         state = {
             DIT_KV: ArrayStep(),
+            VAE_CACHES: ArrayStep(),
             PROGRESS: ArrayStep(host={
                 (rid, "main", 0): {"rng": inp.kwargs["rng"]} for rid, inp in zip(request_ids, inputs, strict=True)
             }),
@@ -325,7 +322,7 @@ class LingBotDitSubmodule(NodeSubmodule):
 
     def forward(
         self, graph_walk, engine_inputs: ModelInputsFromEngine, text_embeds, image, camera_poses, intrinsics,
-        latent, chunk, renoise, encoder_signal, decoder_signal, **kwargs,
+        latent, chunk, renoise, **kwargs,
     ) -> NameToTensorList:
         cfg = self.config
         device = self.get_device()
@@ -334,7 +331,7 @@ class LingBotDitSubmodule(NodeSubmodule):
         context = context[0] if context.dim() == 3 else context
         cs = cfg.chunk_size
         frames = slice(chunk * cs, (chunk + 1) * cs)
-        stream = EncoderStream(self.encoder_vae, encoder_signal)
+        stream, feat_cache = self._take_caches(chunk)
         y = encode_condition_chunk(self.encoder_vae, image, stream, chunk * cs, cs, cfg)
         _, height, width = image.shape
         plucker = plucker_embedding(
@@ -357,20 +354,31 @@ class LingBotDitSubmodule(NodeSubmodule):
             commit_t = torch.stack([steps[-1] * 0.0]).to(device)
             self.dit(x0, commit_t, text_kv, y, conditioning, keep=True)
             del conditioning, text_kv
-            feat_cache = decoder_cache(self.vae, decoder_signal)
             pixels = self._decode(x0, feat_cache, clip_start=chunk == 0)
+        self.vae_caches.write(0, **stream.fields(), **wan_vae.cache_fields(feat_cache, DECODER))
+        if stream.settled:
+            self.vae_caches.clear(0, *self._encoder_fields)
 
         # quantize from fp32; a bf16 decode's frames round once, here
         frames_u8 = truncate_to_uint8(pixels[0].float()).permute(1, 2, 3, 0).contiguous()
         outputs = {
             "clock": [torch.full((1,), chunk + 1, dtype=torch.int64, device=device)],
             "video_output": [frames_u8],
-            ENCODER_CACHE: stream.edge(device),
-            DECODER_CACHE: to_edge(feat_cache, device),
         }
         if cfg.keep_chunk_outputs:
             outputs.update(chunk_latents=[x0], chunk_pixels=[pixels], chunk_condition=[y])
         return outputs
+
+    def _take_caches(self, chunk: int) -> tuple[EncoderStream, wan_vae.FeatCache]:
+        """The request's encoder stream and decoder cache from ``VAE_CACHES``, each empty at chunk 0. The read hands
+        the tensors over and nothing here keeps them, so a slot is freed where the encode or the decode replaces it."""
+        held = self.vae_caches.read(0).fields
+        # built whole, so `FeatCache`'s compaction doesn't run again on the slots it wrote
+        feat_cache = wan_vae.FeatCache(wan_vae.cache_from_fields(self._decoder_slots, held, DECODER))
+        if chunk and not any(torch.is_tensor(slot) for slot in feat_cache):
+            raise RuntimeError(f"LingBot dit: chunk {chunk} found no decoder cache in {VAE_CACHES!r}, where chunk "
+                               f"{chunk - 1} left it")
+        return EncoderStream(self.encoder_vae, held), feat_cache
 
     def warmup_decode(self, lat_hw: tuple[int, int]) -> wan_vae.FeatCache:
         """Decode two chunks of zero latents through a fresh stream at

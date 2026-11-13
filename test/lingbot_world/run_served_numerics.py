@@ -32,18 +32,15 @@ from run_parity import DEVICE, drive  # noqa: E402
 
 from mstar.communication.tensors import LocalTransferEngine  # noqa: E402
 from mstar.conductor.request_info import CurrentForwardPassInfo  # noqa: E402
-from mstar.engine.resources import KVReqConfig, StepRunner  # noqa: E402
+from mstar.engine.resources import StepRunner  # noqa: E402
 from mstar.engine.resources.base import EngineResourceInfo, build_resource  # noqa: E402
 from mstar.engine.resources.kv.transfer import TransferEngineInfo  # noqa: E402
 from mstar.engine.resources.step import StepContext  # noqa: E402
-from mstar.engine.state.adapters import StateSetup, kv_layouts, node_handles  # noqa: E402
+from mstar.engine.state.adapters import StateSetup, kv_layouts, node_handles, state_sizes  # noqa: E402
 from mstar.engine.state.state_op import bind_state_ops  # noqa: E402
 from mstar.model.base import ProcessPromptOutput, deployment_setup, serving_resources  # noqa: E402
 from mstar.model.lingbot_world.lingbot_world_model import REFERENCE_MODEL_KWARGS, LingBotWorldModel  # noqa: E402
 from mstar.model.lingbot_world.submodules import (  # noqa: E402
-    DECODER_CACHE,
-    DIT_KV,
-    ENCODER_CACHE,
     ROLLOUT_LOOP_NAME,
     ROLLOUT_WALK,
 )
@@ -79,8 +76,6 @@ def bind(model: LingBotWorldModel, sub, overrides: dict) -> tuple[StepRunner, St
     }
     for key, spec in specs.items():
         resources[key].bind_dependencies({dep: resources[dep] for dep in spec.depends_on()})
-    # as the worker sets it from the dit's writes, so admission counts a rollout's chunks
-    resources[DIT_KV].local_loops = {ROLLOUT_LOOP_NAME}
     handles = node_handles(model, "dit", resources, setup=setup)
     bind_state_ops(handles)
     sub.bind_node_state(handles)
@@ -112,15 +107,16 @@ class Session:
         return len(self.latents) >= self.num_chunks
 
     def open(self, model: LingBotWorldModel, runner: StepRunner, setup: StateSetup) -> None:
-        """Open the rollout with the pool config the conductor builds from its layout, and admit it through the
-        engine's queue."""
-        rows = {label: layout.row()
-                for label, layout in kv_layouts(model.declare_state(), self.state_layout, {})[DIT_KV].items()}
-        request = KVReqConfig(needed_labels=list(rows))
-        request.apply_conductor_config(kv_layout=rows, loop_caps={ROLLOUT_LOOP_NAME: self.num_chunks})
-        # the worker finds no rebuild for the dit, so the pool guarantees a rollout its footprint
-        request.rebuildable = False
-        runner.ingest_request(self.rid, {DIT_KV: request})
+        """Open the rollout with the configs the conductor builds from its layout, each resource's own, and admit it
+        through the engine's queue."""
+        declared = model.declare_state()
+        kwargs = {
+            "kv_layout": {key: {label: layout.row() for label, layout in rows.items()}
+                          for key, rows in kv_layouts(declared, self.state_layout, {}).items()},
+            "state_sizes": state_sizes(declared, self.state_layout),
+        }
+        configs = {spec.resource_key: spec.request_config(kwargs) for spec in serving_resources(model, {})}
+        runner.ingest_request(self.rid, {key: config for key, config in configs.items() if config is not None})
         setup.host_fields.open(self.rid)
         admitted = runner.admit_retrieve(self.rid, "dit", ROLLOUT_WALK)
         if not (admitted.ok and admitted.ready):
@@ -151,8 +147,8 @@ def step_chunk(sub, runner: StepRunner, s: Session) -> None:
     s.latents.append(out["chunk_latents"][0].cpu())
     s.frames.append(out["video_output"][0].cpu())
     s.info.dynamic_loop_iter_counts[ROLLOUT_LOOP_NAME] = len(s.latents)
-    # the rollout loop's loop-back edges, which the engine feeds to the next chunk
-    s.inputs.update({name: out[name] for name in ("clock", ENCODER_CACHE, DECODER_CACHE)})
+    # the rollout loop's loop-back edge, which the engine feeds to the next chunk
+    s.inputs["clock"] = out["clock"]
 
 
 def finish(runner: StepRunner, setup: StateSetup, s: Session) -> None:

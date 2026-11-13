@@ -131,6 +131,11 @@ class LingBotWorldConfig:
         kept = self.kept_window(frame_tokens)
         return kept.sink + kept.window + self.chunk_size * frame_tokens
 
+    def largest_latent(self) -> dict[str, int]:
+        """The sizes of the request whose VAE caches take the most bytes: every cache scales with the latent's area,
+        and ``max_area`` holds that many latent pixels at any aspect."""
+        return {"lat_h": 1, "lat_w": self.max_area // (self.vae_stride[1] * self.vae_stride[2])}
+
     def max_rollout_tokens(self) -> int:
         """The self-attention entries of the longest rollout at the largest area."""
         return self.max_chunks * self.chunk_size * self.max_frame_tokens

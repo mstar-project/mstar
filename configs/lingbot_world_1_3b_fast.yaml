@@ -13,15 +13,15 @@ model_kwargs:
 # text length; the dit's K/V live in their own pool (resources below).
 max_seq_len: 512
 
-# One rollout at a time; the model refuses any other value. Each rollout's VAE
-# caches go from chunk to chunk on the rollout loop's edges, outside the K/V
-# pool, so this is their only bound.
+# One rollout at a time; the model refuses any other value.
 max_concurrent_requests: 1
 
 # The DiT's K/V pool, reserved at startup, holds one rollout's sink, latest
 # window and chunk at the largest size (720x1280): 64,800 tokens a layer,
 # 11.9 GB. A deployment that serves only the default size (464x832) can set
-# resources: {dit_kv: {pool_tokens: 27144}}, 5.0 GB.
+# resources: {dit_kv: {pool_tokens: 27144}}, 5.0 GB. The engine also keeps
+# 9.5 GB free for that rollout's VAE caches, which it holds between chunks
+# (resources: {vae_caches: {max_bytes: ...}}; 3994438656, 4.0 GB, at 464x832).
 
 # A two-chunk rollout at the default size before the server binds, so the first
 # client doesn't pay the DiT blocks' compiles (one per kind of pass) at that
