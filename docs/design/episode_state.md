@@ -65,7 +65,7 @@ Two facts here shape the design. The context is the **executed real frames**, wh
 
 ## 2. The contract
 
-An episode is named by the frontend, owned by the conductor, and held by the engines of the workers its arrays live on. A model declares what it retains as arrays with `lifetime="episode"` in `declare_state`. The engine keeps those arrays across the episode's requests in a fixed slot per episode, a request's steps read what earlier requests kept and append their own, and `walk_plan` sees how much each array holds, so it can skip work whose result is retained. Requests with no episode behave exactly as today.
+An episode is named by the frontend, owned by the conductor, and held by the engines of the workers its arrays live on. A model declares what it retains as arrays with `lifetime="episode"` in `declare_state`. The engine keeps those arrays across the episode's requests in a fixed slot per episode, a request's steps read what earlier requests kept and append their own, and `walk_plan` sees how much each array holds, so it can skip work whose result is retained. A request without an episode id uses a temporary slot for any episode arrays its model declares; its data is released on `REMOVE_REQUEST`, so it starts cold on every call. Models with no episode arrays take the existing path without a slot.
 
 ```python
 # mstar/engine/state/contract.py
@@ -73,6 +73,7 @@ An episode is named by the frontend, owned by the conductor, and held by the eng
 class Array:
     ...
     lifetime: Literal["request", "episode"] = "request"   # episode: kept across the episode's requests
+    retention: Literal["bounded", "sliding"] = "bounded"   # sliding: episode arrays only
 
 # what walk_plan and step_metadata see; built by the conductor, not by the model
 class EpisodeView(NamedTuple):
@@ -97,11 +98,26 @@ episodes:
   max_queued_calls: 1     # calls of one episode waiting behind the one in flight
 ```
 
+The id follows a connection; the retained tensors stay on workers. A later call
+uses the same placement and slot, while an idless call borrows a slot only for
+its own request:
+
+```mermaid
+flowchart LR
+    C[openpi connection] -->|episode id on each call| F[Frontend]
+    F --> R[Conductor: record and pinned placement]
+    R -->|bind request to slot| W[Worker engines: episode arrays]
+    W -->|held counts after call| R
+    R -->|warm view for next call| P[Model walk plan]
+    I[Other route: no episode id] -->|cold request| R
+    R -->|temporary slot, freed on request end| W
+```
+
 ---
 
 ## 3. Episode identity
 
-**Proposal.** The frontend mints an episode id for each openpi connection when the socket opens (`ep-<uuid4>`), and every call on that socket carries it. It goes to `submit_request` as a system field beside `request_id` (`episode=`; `SubmitArgs.episode` in Rust), not in `model_kwargs`, through the data worker to `NewRequestConductor.episode`. A request with no episode (every HTTP route, and any model that declares no episode arrays) runs as today.
+**Proposal.** The frontend mints an episode id for each openpi connection when the socket opens (`ep-<uuid4>`), and every call on that socket carries it. It goes to `submit_request` as a system field beside `request_id` (`episode=`; `SubmitArgs.episode` in Rust), not in `model_kwargs`, through the data worker to `NewRequestConductor.episode`. A model with no episode arrays runs as today. An idless request to a model with episode arrays gets a temporary slot and a cold `EpisodeView` (§5), without creating an episode record.
 
 The conductor keeps one record per episode:
 
@@ -163,20 +179,24 @@ Rejected:
 
 **Proposal.** A model declares each retained thing as an `Array` with `lifetime="episode"`:
 
-- `max_len` bounds the episode, not the request.
+- `max_len` is the maximum number of resident entries in one episode slot, not
+  the number of entries the whole episode may append. `retention="bounded"`
+  (the default) refuses an append past that capacity. `retention="sliding"`
+  discards the oldest entries before appending new ones. Sliding is valid only
+  for episode arrays; request arrays keep today's absolute-log-position rule.
 - `nodes` say which node reads and writes it; the array lives on the workers that run that node, inside their engines, one slot per episode on every rank of the node's lockstep instance (replicated, or split where a `TensorType.shard` says).
-- A step appends with `handle.add` ([calls.py](../../mstar/engine/state/calls.py) line 194) and reads with `handle.read` (line 201). An empty `reads` reads the whole array (`contract.py` line 228); a `Window` read says what stays reachable, and the engine frees what falls out of it, as `Read`'s docstring already promises (lines 158-161).
+- A step appends with `handle.add` ([calls.py](../../mstar/engine/state/calls.py) line 194) and reads with `handle.read` (line 201). For a sliding episode array, storage tracks a monotonically increasing logical position and a bounded physical ring, returning retained entries in chronological order. An add larger than `max_len` is refused. An empty `reads` reads all *resident* entries; a `Window` read narrows visibility within them. `Window` by itself only specifies visibility ([contract.py](../../mstar/engine/state/contract.py) lines 88-92); it cannot recycle today's absolute log positions (`contract.py` lines 205-219).
 - A no-op read returns `Reached`, each field's entries packed by row (`contract.py` lines 470-474).
 
 The conductor holds only the record (§3). The model object holds nothing: the calls count reaches a step as `step_metadata["episode_calls"]`, and everything else is in the arrays.
 
-For Praxis-1 (§9) that is two arrays: `text_embeds` on the backbone, entry `{"h": TensorType((2048,), dtype=bf16)}` with labels `cond` and `blank`, and `executed` on the VAE encoder, entry `{"frame": TensorType((3, 256, 832), dtype=uint8), "pose": TensorType((8,), dtype=float32)}`, `max_len` 69.
+For Praxis-1 (§9) that is two arrays: `text_embeds` on the backbone, entry `{"h": TensorType((2048,), dtype=bf16)}` with labels `cond` and `blank`, bounded by the model's maximum prompt length; and `executed` on the VAE encoder, entry `{"frame": TensorType((3, 256, 832), dtype=uint8), "pose": TensorType((8,), dtype=float32)}`, `max_len` 69 and `retention="sliding"`. At three context chunks the resident window grows to 69 frames, then each new 24-frame chunk replaces the oldest 24. The fourth such addition has 93 logical frames but still 69 resident frames. `EpisodeView.held["executed"]` is the resident count, not the lifetime append count.
 
 **Does it fit `declare_state`?** The description fits: `Entry` takes any named tensors with a dtype and a shard, and `max_len`, `labels`, masks and the no-op `Read` say the rest. Five things are missing:
 
-1. **A lifetime.** Arrays are per request today (`contract.py` line 213). `lifetime` is the only new field on the declaration.
-2. **A storage.** No storage holds an append-only array that is not K/V or serves a no-op read. `PagedStorage` takes only a `KVEntry` with an `Attend` read ([adapters.py](../../mstar/engine/state/adapters.py) lines 194-199 and 1256), `storage_of` sends every other append-only array with a nonzero `max_len` there (lines 1391-1397), and nothing outside `contract.py` returns `Reached`. This needs an `EpisodeStorage`: a dense buffer of `max_episodes x max_len` entries per layer, a row addressed through its slot index, staged in `plan` with `force_double_buffer` (invariant 7), so eager and captured steps address it alike.
-3. **Binding a request to an episode.** The engine registers a request's state on `NEW_REQUEST` and purges it on removal (`engine.py` lines 3906 and 3937-3954). An episode array instead attaches the request to the episode's slot on `NEW_REQUEST` (clearing it on a reset or a key change), detaches it on `REMOVE_REQUEST` without freeing it, and frees the slot on `END_EPISODE`. The slot is keyed by the episode, not the request handle, so `rid_table.py`'s purge rule doesn't apply to it; the binding from handle to slot is handle-keyed and is listed there.
+1. **A lifetime and retention.** Arrays are per request today (`contract.py` line 213). `lifetime` and `retention` are the new declaration fields. Only episode arrays may slide; bounded arrays keep the current append limit.
+2. **A storage.** No storage holds an append-only array that is not K/V or serves a no-op read. `PagedStorage` takes only a `KVEntry` with an `Attend` read ([adapters.py](../../mstar/engine/state/adapters.py) lines 194-199 and 1256), `storage_of` sends every other append-only array with a nonzero `max_len` there (lines 1391-1397), and nothing outside `contract.py` returns `Reached`. This needs an `EpisodeStorage`: a dense buffer of `max_episodes x max_len` entries per layer, with a ring head and resident length for sliding arrays and a bounded length for others. It maps logical positions to physical offsets when planning reads and writes, stages addresses in `plan` with `force_double_buffer` (invariant 7), and returns resident rows in chronological order. Eager and captured steps address the same rows.
+3. **Binding a request to an episode.** The engine registers a request's state on `NEW_REQUEST` and purges it on removal (`engine.py` lines 3906 and 3937-3954). A named episode attaches the request to its slot on `NEW_REQUEST` (clearing it on a reset or key change), detaches on `REMOVE_REQUEST` without freeing the slot, and frees it on `END_EPISODE`. A request without an episode id borrows a slot from the same pool on `NEW_REQUEST` and frees it on `REMOVE_REQUEST`. It receives `EpisodeView(id=None, calls=0, held={...: 0}, cold=None)` and every such request starts cold. Both named and temporary slots count against admission (§6); neither can overwrite a slot held by a live call. The episode's slot is keyed by episode, while the temporary slot and the request-to-slot binding are keyed by request handle and included in `rid_table.py`'s purge rule.
 4. **What the plan sees.** `walk_plan` gets only this request's signals (`base.py` lines 999-1006). It gains an `episode: EpisodeView` keyword, passed only to a model that declares episode arrays, so no existing override changes. `held` comes from the workers' `WORKER_GRAPHS_DONE`, as persisted signals already do (`conductor.py` line 1977).
 5. **Keys.** `ProcessPromptOutput.episode_keys` (§4), since a retained value made from a prompt is only valid for that prompt.
 
@@ -184,7 +204,7 @@ Why this shape:
 
 - **Where the reader is.** The arrays sit on the node that reads them, so a warm call moves no retained bytes between GPUs. A persisted tensor stays with its producer and is read over the transport on each call.
 - **The engine owns the memory.** A slot pool sized at startup is something admission can count (§6); state a model allocated itself would turn a full pool into an OOM (invariant 1, heuristic 4).
-- **One contract for per-request and per-episode state.** The same `add` and `read` serve both, so a model moves an array between lifetimes by changing one field.
+- **One call interface for per-request and per-episode state.** Both use `add` and `read`; rolling retention is an explicit second choice because a request array's absolute log positions cannot silently become a ring.
 
 Rejected:
 
@@ -199,13 +219,28 @@ Rejected:
 
 **Proposal.**
 
-- **Per episode.** An episode's footprint is fixed by its declarations: the sum over its episode arrays of `max_len` x entry bytes x layers, per rank. For Praxis-1 at three context chunks it is 69 x 0.61 MiB of frames plus a few MiB of text, about 44 MiB; at one chunk, about 15 MiB. Per-deployment `max_len` goes in `resources:` as today (invariant 2).
+- **Per slot.** A named episode and a temporary idless request have the same declared footprint: the sum over its episode arrays of `max_len` x entry bytes x layers, per rank. For Praxis-1 at three context chunks it is 69 x 0.61 MiB of frames plus a few MiB of text, about 44 MiB; at one chunk, about 15 MiB. A sliding array's logical append count can exceed `max_len`, but its resident count and physical allocation cannot. Per-deployment `max_len` goes in `resources:` as today (invariant 2).
 - **Per replica.** `episodes.max_episodes` slots, allocated at startup on each worker that holds an episode array. A worker whose slots don't fit refuses to start, naming the array and the size.
-- **Admission.** A call for a new episode, or for one whose slot was taken, needs a slot on the replica the router picks. It takes a free slot, or evicts the least recently used idle episode there (no call in flight or queued). When every slot holds an episode with a call in flight or queued, the call waits in the conductor's queue, in arrival order, as a request over `max_concurrent_requests` waits today (`conductor.py` lines 1288-1305). A call of an episode that has its slot never waits for one.
+- **Admission.** A call for a new episode, one whose slot was taken, or an idless call to a model with episode arrays needs a slot on the replica the router picks. It takes a free slot, or evicts the least recently used idle named episode there (no call in flight or queued). A temporary slot belongs to its live request and cannot be evicted. When every slot holds a busy episode or temporary request, the call waits in the conductor's queue, in arrival order, as a request over `max_concurrent_requests` waits today (`conductor.py` lines 1288-1305). A call of an episode that has its slot never waits for one.
 - **Eviction.** The conductor chooses, LRU by `last_end` over idle episodes on that replica, and sends `END_EPISODE` to the episode's workers before the new episode's `NEW_REQUEST`. An episode with a call in flight or queued is never evicted.
+- **Temporary slot release.** An idless request frees its slot on `REMOVE_REQUEST`; no `END_EPISODE`, record, idle timer or later warm call is involved.
 - **What the client sees.** The evicted episode's next call starts cold: `held` is empty, so `walk_plan` runs every producer again, and the call is otherwise correct. Its reply says so (§10): `"episode": {"calls": n, "cold": "evicted"}`. A metric counts evictions and cold starts by reason.
 
 Relation to [admission_and_preemption.md](admission_and_preemption.md): an episode slot is a fixed-size slot like the recurrent state pool and the sampler's rows there (§3: a request waits at admission until a slot is free, and never runs short after), except that it outlives its requests, so its idle time is what eviction takes back. Slots are not KV pages, so KV preemption never touches them, and a KV victim keeps its episode. A node with a rebuild policy needs every resource to support a drop (that doc's §4 table); `EpisodeStorage` supports one by keeping its entries, as attention does.
+
+The two lifetimes share the same slot pool. Sliding retention replaces *entries*
+inside a slot; eviction releases an *idle episode's entire slot*:
+
+```mermaid
+flowchart LR
+    Free[Free slot] -->|named episode starts| Named[Named episode slot]
+    Named -->|append; slide oldest entries at capacity| Named
+    Named -->|idle eviction or close| Free
+    Free -->|idless request starts| Temp[Temporary request slot]
+    Temp -->|REMOVE_REQUEST| Free
+    Named -->|after eviction, a later call| Cold[Cold start]
+    Cold -->|admit into a slot| Named
+```
 
 Why this shape:
 
@@ -290,17 +325,17 @@ Until this lands, Praxis-1 (once its preprocessing and submodules are in) can se
 - **openpi wire.** No new required key. `reset_context` is optional, and today's parsers already ignore keys they don't name (`OpenpiPolicy.request`, `openpi.py` lines 193-215; `request`, `openpi.rs` lines 449-496). The reply gains an optional `"episode"` map; `openpi_client`'s `infer` returns the unpacked reply, so a client that doesn't read it is unaffected. The metadata frame is unchanged.
 - **Both frontends change together** (invariant 15): the id per connection, `reset_context`, `END_EPISODE` on close and the reply field land in `api_server/openpi.py` and `rust/server/src/ws/openpi.rs` in one PR, with a case in `test/rust/test_rust_openpi.py` that runs one episode against both and compares what reaches `submit_request` and what the client gets back.
 - **Models that declare no episode array are untouched.** The conductor knows at startup whether the model declares any. If not, it makes no record, routes as today and never passes `episode` to `walk_plan`, so the request path and its per-request cost are today's (invariant 6). The frontends' minted id is a string on the submission, dropped at the conductor.
-- **Routes other than openpi** pass no episode in this design.
+- **Routes other than openpi** pass no episode id. A model with episode arrays still runs: each such request borrows a slot, receives an empty `EpisodeView`, and releases the slot at request teardown. It waits at slot admission under the same rules as a new named episode (§6). Two idless calls cannot share state, even when they run on the same worker.
 
-Staging, each step useful alone:
+Staging, each step independently reviewable and testable. This is five PRs because the engine's storage, the conductor's request routing, bounded admission, the two frontends' wire behavior, and Praxis's model wiring have different owners and regression surfaces. E1 and E2 provide internal contracts; they do not expose episode serving on their own. The feature reaches clients only after the lifecycle and frontend work. Praxis's integration waits for those pieces, while independent model component ports can proceed:
 
 | Step | Contents |
 |---|---|
-| E1 | `lifetime`, `EpisodeStorage`, bind and detach in the engine, `END_EPISODE`; a modular test drives two requests through one slot |
-| E2 | The conductor's record, pinned placement, `EpisodeView` to `walk_plan`, per-episode queue, `max_calls`, keys |
-| E3 | Slots, eviction, idle timeout, cleanup on failure and worker loss, metrics |
-| E4 | Both openpi frontends: the id, `reset_context`, close, the reply field |
-| E5 | Praxis-1 on episodes |
+| E1 | `lifetime`, `retention`, `EpisodeStorage`, bind and detach in the engine, `END_EPISODE`; modular tests append 21 + 24 + 24 + 24 frames into a 69-frame sliding slot, check chronological reads and bounded memory across many calls, and check a temporary slot is freed on `REMOVE_REQUEST` |
+| E2 | The conductor's record, pinned placement, `EpisodeView` to `walk_plan`, per-episode queue, `max_calls`, keys; tests show a named episode resumes warm and separate idless requests start cold |
+| E3 | Shared-slot admission for named and temporary calls, eviction, idle timeout, cleanup on failure and worker loss, metrics; pressure tests cover a full pool and an in-flight temporary request |
+| E4 | Both openpi frontends: the id, `reset_context`, close, the reply field; parity tests check each frontend's request lifecycle and response |
+| E5 | Praxis-1 on episodes; an integration test checks executed-frame history and text reuse across calls, reset and eviction |
 
 ---
 
