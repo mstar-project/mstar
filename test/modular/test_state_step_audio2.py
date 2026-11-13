@@ -23,6 +23,7 @@ from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec, A
 from mstar.engine.resources.kv.bounded import BoundedKVSpec
 from mstar.engine.resources.kv.config import KVSpec, KVStep, PagedKVConfig
 from mstar.engine.resources.position.config import PositionConfig, PositionSpec, PositionStep
+from mstar.engine.resources.recurrent.config import RecurrentBlockConfig, RecurrentStateConfig, RecurrentStateSpec
 from mstar.engine.resources.sampler.config import SamplerSpec, SamplerStep, SamplingReqConfig
 from mstar.engine.resources.spec import apply_yaml_overrides
 from mstar.engine.resources.step import Segment, SubmoduleStep
@@ -30,6 +31,7 @@ from mstar.engine.state import Layout, Span
 from mstar.engine.state.adapters import StateSetup, kv_layouts, sampling_configs, state_steps
 from mstar.engine.state.analysis import state_declaration_problems
 from mstar.model.base import LabelLayout, enabled_resources, serving_resources
+from mstar.model.components.token2wav.model import DIT_COMPUTE_DTYPE, CacheCapacity, slot_layout
 from mstar.model.components.token2wav.resources import token2wav_resources
 from mstar.model.step_audio2.components.audio import request_layout
 from mstar.model.step_audio2.config import (
@@ -80,6 +82,29 @@ def _reference(model) -> list:
             ),
         ),
         *token2wav_resources(T2W_KEYS, TOKEN2WAV, model._voice_seconds(), T2W_DEFAULT_SLOTS, T2W_STREAMING),
+        *_token2wav_values(),
+    ]
+
+
+def _token2wav_values() -> list:
+    """Token2wav's conv caches, HiFT's held-back frames and its held-back samples: a slot pool per region that writes
+    them, of the default slot count, where one pool held them all before."""
+    blocks = slot_layout(CacheCapacity(1), dit_dtype=DIT_COMPUTE_DTYPE)
+    fields = {
+        T2W_KEYS.flow: {"enc_cnn": blocks["enc_cnn"], "dit_cnn": blocks["dit_cnn"], "started": ((), torch.bool)},
+        T2W_KEYS.hift: {"hift_mel": blocks["hift_mel"], "hift_source": blocks["hift_source"]},
+        T2W_KEYS.tail: {"hift_speech": blocks["hift_speech"]},
+    }
+    return [
+        RecurrentStateSpec(
+            resource_key=key, nodes={TOKEN2WAV},
+            config=RecurrentStateConfig(
+                num_layers=1, max_slots=T2W_DEFAULT_SLOTS, labels=("main",),
+                blocks={name: RecurrentBlockConfig(shape=tuple(shape), dtype=dtype) for name, (shape, dtype) in
+                        each.items()},
+            ),
+        )
+        for key, each in fields.items()
     ]
 
 

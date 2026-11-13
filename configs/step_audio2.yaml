@@ -28,10 +28,14 @@ resources:
   # being voiced at once; a reply waits for slots before its first audio. A slot is 284 MiB
   # of t2w_dit_kv (with the bundled voices; it grows with the longest), 64 MiB of
   # t2w_enc2_kv and 48 MiB of t2w_enc1_kv (the conformer's caches hold the whole reply) and
-  # 1.3 MiB of t2w_state, about 0.39 GiB. 32 slots, one per concurrent request, are 12.5 GiB:
+  # 1.3 MiB of the t2w_state_* Values, about 0.39 GiB. 32 slots, one per concurrent request, are 12.5 GiB:
   # at 16, spoken replies at c=32 waited 2.3 s (p50) for their first audio, at 32 0.9 s
-  # (H200). t2w_state has one more, its sink; startup refuses counts that disagree.
-  t2w_state:
+  # (H200). Each t2w_state_* Value has one more, its sink; startup refuses counts that disagree.
+  t2w_state_flow:
+    max_slots: 33
+  t2w_state_hift:
+    max_slots: 33
+  t2w_state_tail:
     max_slots: 33
   t2w_enc1_kv:
     max_slots: 32
