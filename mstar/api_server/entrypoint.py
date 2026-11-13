@@ -3307,7 +3307,7 @@ def main(argv: list[str] | None = None):
             bridge = RustFrontendBridge(api_server, bridge_dir)
             api_server.set_on_fatal(bridge.stop)
             Thread(target=_stop_with, args=(rust_proc, bridge), name="mstar-server-watch", daemon=True).start()
-            bridge.run()
+            bridge.run(frontend=rust_proc)
             if (code := rust_proc.poll()) not in (None, 0):
                 # it exits 0 when a signal stops it, so this is a crash, a kill or a lost port
                 logger.error("mstar-server exited with code %d; stopping the deployment", code)
@@ -3337,8 +3337,9 @@ def main(argv: list[str] | None = None):
         exit_code = 1
     finally:
         if rust_proc is not None:
-            # so that once mstar serve has exited, the frontend has too. With the
-            # bridge stopped, what mstar-server has left to drain can't finish.
+            # so that once mstar serve has exited, the frontend has too. After a
+            # signal it has drained and exited already; otherwise, with the
+            # bridge stopped, what it has left to drain can't finish.
             rust_proc.terminate()
             try:
                 rust_proc.wait(timeout=5)

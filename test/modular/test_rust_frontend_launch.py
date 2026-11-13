@@ -1,4 +1,7 @@
 """What ``launch_rust_server`` hands ``mstar-server`` in its environment."""
+import os
+import time
+
 import pytest
 
 from mstar.api_server import rust_frontend
@@ -130,6 +133,22 @@ def test_realtime_facts_carry_what_a_conversation_reads_off_the_model(tmp_path):
     assert rust_frontend.realtime_facts(SimpleNamespace(model=_Duplex(), client_audio=[]), None, str(tmp_path)) is None
 
 
+def _wait_until_caught(pid: int, signum: int, timeout: float = 30) -> None:
+    """Waits until ``pid`` has a handler installed for ``signum`` (``SigCgt``
+    in /proc/<pid>/status), so a test signals it only once it is listening."""
+
+    if not os.path.exists("/proc/self/status"):
+        pytest.skip("no /proc to tell when a signal handler is in place")
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        with open(f"/proc/{pid}/status") as status:
+            caught = next(int(line.split()[1], 16) for line in status if line.startswith("SigCgt:"))
+        if caught >> (signum - 1) & 1:
+            return
+        time.sleep(0.01)
+    raise AssertionError(f"pid {pid} never installed a handler for signal {signum}")
+
+
 @pytest.mark.parametrize("signame", ["SIGINT", "SIGTERM"])
 def test_the_bridge_stops_on_a_signal_even_with_sigint_ignored(tmp_path, signame):
     """As uvicorn stops on either: a server started as a background job inherits
@@ -137,7 +156,6 @@ def test_the_bridge_stops_on_a_signal_even_with_sigint_ignored(tmp_path, signame
     import signal
     import subprocess
     import sys
-    import time
 
     pytest.importorskip("mstar_rust")
     script = (
@@ -146,16 +164,69 @@ def test_the_bridge_stops_on_a_signal_even_with_sigint_ignored(tmp_path, signame
         "signal.signal(signal.SIGINT, signal.SIG_IGN)\n"
         "from mstar.api_server.rust_frontend import RustFrontendBridge\n"
         f"bridge = RustFrontendBridge(types.SimpleNamespace(), {str(tmp_path)!r})\n"
-        "print('serving', flush=True)\n"
         "bridge.run()\n"
         "print('stopped', flush=True)\n"
     )
     proc = subprocess.Popen([sys.executable, "-c", script], stdout=subprocess.PIPE, text=True)
     try:
-        assert proc.stdout.readline().strip() == "serving"
-        time.sleep(0.5)  # the loop is running
+        # the bridge installs SIGINT's handler, then SIGTERM's
+        _wait_until_caught(proc.pid, signal.SIGTERM)
         proc.send_signal(getattr(signal, signame))
         out, _ = proc.communicate(timeout=10)
     finally:
         proc.kill()
     assert "stopped" in out and proc.returncode == 0
+
+
+@pytest.mark.parametrize("signals", [1, 2], ids=["drains", "second-signal"])
+def test_a_signal_lets_mstar_server_drain_before_the_bridge_stops(tmp_path, signals):
+    """The first SIGINT goes on to mstar-server, and the bridge keeps relaying
+    while it drains, so in-flight streams can finish; mstar-server's exit then
+    stops the bridge. A second stops the bridge at once, as a second Ctrl-C
+    stops uvicorn."""
+    import signal
+    import subprocess
+    import sys
+
+    pytest.importorskip("mstar_rust")
+    events = tmp_path / "events"
+    log = f"def log(event): open({str(events)!r}, 'a').write(event + '\\n')\n"
+    frontend = (  # mstar-server's stand-in: draining takes 1 s, or longer than the test with a second signal coming
+        "import signal, sys, time\n" + log +
+        "def drain(signum, frame):\n"
+        "    log('drain ' + signal.Signals(signum).name)\n"
+        f"    time.sleep({60 if signals == 2 else 1})\n"
+        "    log('frontend exited')\n"
+        "    sys.exit(0)\n"
+        "signal.signal(signal.SIGINT, drain)\n"
+        "print(flush=True)\n"
+        "time.sleep(60)\n"
+    )
+    script = (
+        "import subprocess, sys, threading, types\n" + log +
+        "from mstar.api_server.entrypoint import _stop_with\n"
+        "from mstar.api_server.rust_frontend import RustFrontendBridge\n"
+        f"frontend = subprocess.Popen([sys.executable, '-c', {frontend!r}], stdout=subprocess.PIPE)\n"
+        "frontend.stdout.readline()  # its handler is in place\n"
+        f"bridge = RustFrontendBridge(types.SimpleNamespace(), {str(tmp_path)!r})\n"
+        "threading.Thread(target=_stop_with, args=(frontend, bridge), daemon=True).start()\n"
+        "bridge.run(frontend=frontend)\n"
+        "log('bridge stopped')\n"
+        "frontend.kill()\n"
+    )
+    proc = subprocess.Popen([sys.executable, "-c", script])
+    try:
+        _wait_until_caught(proc.pid, signal.SIGTERM)
+        proc.send_signal(signal.SIGINT)
+        if signals == 2:
+            deadline = time.monotonic() + 30
+            while not (events.exists() and "drain" in events.read_text()):
+                assert time.monotonic() < deadline, "mstar-server was never told to stop"
+                time.sleep(0.01)
+            proc.send_signal(signal.SIGINT)
+        proc.wait(timeout=30)
+    finally:
+        proc.kill()
+    drained = ["frontend exited"] if signals == 1 else []  # with a second signal it was still draining
+    assert events.read_text().splitlines() == ["drain SIGINT", *drained, "bridge stopped"]
+    assert proc.returncode == 0

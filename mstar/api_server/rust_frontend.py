@@ -937,18 +937,33 @@ class RustFrontendBridge:
                     logger.exception("bridge: dropping a message that raised (%r)",
                                      msg.get("t"))
 
-    def run(self) -> None:
-        """Blocking serve loop (the ``uvicorn.run`` replacement)."""
+    def run(self, frontend: subprocess.Popen | None = None) -> None:
+        """Blocking serve loop (the ``uvicorn.run`` replacement). The first
+        SIGINT or SIGTERM goes on to ``frontend`` (mstar-server), and the loop
+        keeps relaying tokens while it drains its in-flight requests, as
+        uvicorn does on a graceful shutdown; its exit then stops the loop
+        (``_stop_with`` in ``entrypoint.py``). A second signal, or one with no
+        frontend running, stops the loop at once."""
         # with the message thread: tokens pass from it to this loop. The Rust
         # process is already running, so it keeps the process mask. Test doubles
         # stand in for the server without the pin.
         pin = getattr(self.server, "pin_result_thread", None)
         if pin is not None:
             pin()
-        # SIGINT and SIGTERM end the loop, as uvicorn's handlers end its server:
-        # asyncio.run installs a SIGINT handler only over Python's default one,
-        # and a server started as a background job inherits SIGINT ignored
-        stop = lambda signum, frame: setattr(self, "running", False)  # noqa: E731
+        # The bridge installs its own handlers: asyncio.run installs a SIGINT
+        # handler only over Python's default one, and a server started as a
+        # background job inherits SIGINT ignored (tokio's handlers in
+        # mstar-server replace an inherited SIG_IGN)
+        signals = 0
+
+        def stop(signum, frame):
+            nonlocal signals
+            signals += 1
+            if signals == 1 and frontend is not None and frontend.poll() is None:
+                frontend.send_signal(signum)
+            else:
+                self.running = False
+
         handled = (signal.SIGINT, signal.SIGTERM)
         on_main = threading.current_thread() is threading.main_thread()
         previous = {sig: signal.signal(sig, stop) for sig in handled} if on_main else {}

@@ -1491,7 +1491,7 @@ def _serve_against(monkeypatch, tmp_path, server_code: str, bridge_runs: bool):
         def __init__(self, server, bridge_dir):
             self.stopped = threading.Event()
 
-        def run(self):
+        def run(self, frontend=None):
             if bridge_runs:
                 assert self.stopped.wait(timeout=30), "the bridge was never stopped"
 
