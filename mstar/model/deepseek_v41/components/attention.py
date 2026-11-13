@@ -15,8 +15,7 @@ from torch import nn
 
 from mstar.distributed.communication import CommGroup
 from mstar.distributed.utils import divide
-from mstar.model.components import RMSNorm
-from mstar.model.deepseek_v41.components.linear import COLUMN, ROW, RoundedLinear
+from mstar.model.deepseek_v41.components.linear import COLUMN, ROW, RMSNorm, RoundedLinear
 from mstar.model.deepseek_v41.components.rope import Rope, rotate_tail
 from mstar.model.deepseek_v41.config import (
     CSA,

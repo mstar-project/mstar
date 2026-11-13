@@ -38,6 +38,9 @@ class DeepseekV41LLMSubmodule(ARNodeSubmodule):
     # autocast and a compile of the eager forward would both undo
     disable_torch_compile: bool = True
     disable_autocast: bool = True
+    # and those fp32 sums are full fp32: under TF32, the process default on CUDA, a sum lands on
+    # the other side of a rounding step and the logits move by their own spread
+    float32_matmul_precision = "highest"
 
     def __init__(self, language_model: nn.Module, config: DeepseekV41Config) -> None:
         super().__init__()

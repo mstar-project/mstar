@@ -1,4 +1,4 @@
-"""DeepSeek-V4.1's linears as the reference's block-scaled GEMMs compute them.
+"""DeepSeek-V4.1's linears as the reference's block-scaled GEMMs compute them, and its RMSNorm.
 
 The checkpoint stores most linears as E4M3 with a power-of-two scale per 32 x 32 block, and the
 reference's GEMM for them reads its input rounded to FP8 in 32-wide groups, sums in fp32 and
@@ -19,6 +19,22 @@ from mstar.utils.mx_round import round_fp8
 
 COLUMN = "column"  # this rank's rows of the output
 ROW = "row"        # this rank's columns of the input, the ranks' partial outputs summed
+
+
+class RMSNorm(nn.Module):
+    """RMSNorm as the checkpoint's reference computes it: in fp32, rounded to the input's dtype
+    once. The shared ``components.RMSNorm`` rounds between its products in the input's dtype,
+    and on CUDA runs a kernel that takes fp32 inputs in bf16."""
+
+    def __init__(self, dim: int, eps: float) -> None:
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = x.float()
+        h = h * torch.rsqrt(h.square().mean(-1, keepdim=True) + self.eps)
+        return (self.weight * h).to(x.dtype)
 
 
 def fp32_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:

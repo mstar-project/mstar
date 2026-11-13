@@ -6,10 +6,10 @@ import torch.nn.functional as F
 from torch import nn
 
 from mstar.distributed.communication import CommGroup
-from mstar.model.components import RMSNorm
 from mstar.model.components.distributed import ColumnParallelLinear, VocabParallelEmbedding
 from mstar.model.deepseek_v41.components.attention import DeepseekV41Attention, SharedSelection
 from mstar.model.deepseek_v41.components.engram import Engram, NgramHasher
+from mstar.model.deepseek_v41.components.linear import RMSNorm
 from mstar.model.deepseek_v41.components.moe import DeepseekV41MoE
 from mstar.model.deepseek_v41.components.rope import Rope
 from mstar.model.deepseek_v41.config import ENGRAM, DeepseekV41Config

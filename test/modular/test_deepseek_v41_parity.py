@@ -157,6 +157,20 @@ class TestParity:
         assert _gap(got[None], want[:1]) < FP32_TOL
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_the_norm_is_the_references_bit_for_bit(reference, dtype):
+    """Summed and scaled in fp32, rounded to the input's dtype once: in bf16 a norm that rounds
+    between its products is a bit off on most rows."""
+    from mstar.model.deepseek_v41.components.linear import RMSNorm
+
+    torch.manual_seed(0)
+    ours, theirs = RMSNorm(64, eps=1e-20), reference.model.RMSNorm(64, 1e-20)
+    weight = (1 + 0.1 * torch.randn(64)).to(dtype)
+    ours.weight.data, theirs.weight.data = weight.clone(), weight.clone()
+    x = (torch.randn(200, 64) * torch.exp(torch.linspace(-4, 4, 200))[:, None]).to(dtype)
+    assert torch.equal(ours(x), theirs(x))
+
+
 @pytest.mark.parametrize("geometry", [
     # the checkpoint's Engram shape: two layers, 2- to 4-grams
     dict(engram_layer_ids=(0, 5), engram_num_embeddings=(0, 0), engram_max_ngram_size=4, engram_n_heads=3),

@@ -548,6 +548,12 @@ class TestEngineCpu:
             whole = self._solo(snapshot, ids[:self.PROMPT + step], self.PROMPT + step)[0]
             assert logit_gap(stepped[step][None], whole[None]) < 1e-5
 
+    def test_the_node_runs_its_matmuls_in_full_fp32(self, snapshot):
+        """The engine's process default is TF32 on CUDA, where an fp32 sum would land on the other
+        side of a rounding step: the node declares full fp32, and the engine holds it for its forward."""
+        engine, _, _ = cpu_engine(snapshot[0], torch.float32)
+        assert engine._submodules["LLM"].fp32_precision.matmul == "highest"
+
     def test_the_launch_sizes_a_deployment_sets_change_no_logit(self, snapshot):
         """``score_bytes`` and ``attend_bytes`` cut a step's scoring and attention into
         launches: a few rows a launch give what one launch gives, on prefill and decode rows."""
