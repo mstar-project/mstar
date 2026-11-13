@@ -829,22 +829,28 @@ def test_the_reach_equals_the_store_s_view_on_cuda():
 # A read with no op
 
 
-def _reach_handle(sink=18, window=24, chunk=12):
-    """A no-op kept-window read through `node_handles` over a CPU pool of pages of 8, with request ``a`` laid out."""
+def _reach_handle(sink=18, window=24, chunk=12, *, op=None, state_layout=None):
+    """A kept-window read through `node_handles` over a CPU pool of pages of 8, with request ``a`` laid out: by
+    ``state_layout`` where one is given, and otherwise with the window's sizes. The read has no op unless ``op``
+    gives one, which runs on a kept-window resource over a stub kernel."""
     array = Array("dit_kv", nodes={"dit"}, layers={0}, entry=KVEntry(heads=1, head_dim=1), max_len=4096,
-                  reads={"self_attn": Read(mask=Bidirectional(kept_window=True))})
-    (kv_spec,) = build_specs([array], kernel_settings={"dit_kv": {"max_num_pages": 64}})
+                  reads={"self_attn": Read(mask=Bidirectional(kept_window=True), op=op)})
+    kv_spec, *attention = build_specs([array], kernel_settings={"dit_kv": {"max_num_pages": 64}})
     pool = KVManager(
         cfg=replace(kv_spec.config, page_size=8), name="dit_kv", joint_comm_group=None,
         transfer_engine_info=TransferEngineInfo("h", "h", LocalTransferEngine("h")), device=torch.device("cpu"),
         dtype=torch.float32,
     )
-    handle = node_handles(SimpleNamespace(declare_state=lambda: [array]), "dit", {"dit_kv": pool})["dit_kv"]
-    (row,) = kv_layouts([array], {"dit_kv": {"main": Layout(
-        growth=(("rollout", chunk),), kept_windows={"self_attn": KeptWindow(sink, window=window)},
-    )}}, {})["dit_kv"].values()
+    kernels = {spec.resource_key: KeptWindowAttention(_StubInner(), "dit_kv") for spec in attention}
+    handle = node_handles(SimpleNamespace(declare_state=lambda: [array]), "dit", {"dit_kv": pool, **kernels})["dit_kv"]
+    if state_layout is None:
+        state_layout = {"dit_kv": {"main": Layout(
+            growth=(("rollout", chunk),), kept_windows={"self_attn": KeptWindow(sink, window=window)},
+        )}}
+    rows = kv_layouts([array], state_layout, {}).get("dit_kv", {})
     request = KVReqConfig(needed_labels=["main"])
-    request.apply_conductor_config(kv_layout={"main": row.row()}, loop_caps={"rollout": 100})
+    request.apply_conductor_config(kv_layout={label: row.row() for label, row in rows.items()},
+                                   loop_caps={"rollout": 100})
     pool.ingest_request("a", overrides=request)
     return handle, pool
 
@@ -939,6 +945,21 @@ def test_a_reach_is_refused_under_capture():
     handle, pool = _reach_handle()
     step = _reach_step(handle, pool, 12, capture=True)
     with pytest.raises(ValueError, match="Array 'dit_kv': no layout yet: a read with no op in a captured step"):
+        step.begin_calls()
+
+
+@pytest.mark.parametrize("op", [None, Attend(q_heads=1)], ids=["no_op", "attend"])
+@pytest.mark.parametrize("state_layout", [{}, {"dit_kv": {}}], ids=["no_array", "no_label"])
+def test_a_kept_window_read_refuses_a_row_whose_request_sized_no_window(op, state_layout):
+    """A request that gives no `Layout` for a label keeps every entry of it, and the read would reach them all with
+    no error: 72 entries by the sixth chunk of 12, where a sink of 18 and a window of 24 reach 54. The step that
+    lists the row refuses before its forward, for a read with an op and for one without."""
+    handle, pool = _reach_handle(op=op, state_layout=state_layout)
+    step = _reach_step(handle, pool, 12)
+    with pytest.raises(ValueError, match=r"Array 'dit_kv': request a keeps no window on label 'main', so "
+                                         r"reads\['self_attn'\] would reach every entry; "
+                                         r"state_layout\['dit_kv'\]\['main'\] must be a Layout that gives "
+                                         r"kept_windows\['self_attn'\]"):
         step.begin_calls()
 
 
