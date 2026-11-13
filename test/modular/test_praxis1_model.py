@@ -222,6 +222,13 @@ def test_droid_session_config_is_sized_and_gated(tmp_path, monkeypatch):
     assert policy.meta["checkpoint"] == "runwayml/praxis-1-droid"
     assert policy.meta["max_context_chunks"] == defaults["max_context_chunks"] == 1
     assert openpi_policy.metadata["max_context_chunks"] == 0
+    for key in ("num_steps", "t_shift", "cfg_scale", "cfg_video_scale"):
+        assert policy.meta[key] == openpi_policy.metadata[key] == defaults[key]
+    assert policy.meta["checkpoint"] == openpi_policy.metadata["checkpoint"] == defaults["model_path_hf"]
+    assert policy.meta["rig"] == openpi_policy.metadata["rig"] == model.config.embodiment
+    assert policy.meta["skip_video_decoder"] is openpi_policy.metadata["skip_video_decoder"] is True
+    assert policy.meta["attention_backend"] == openpi_policy.metadata["attention_backend"] == "triton"
+    assert openpi_policy.action_horizon == 21
     # Both Python and Rust send this same packed first WebSocket frame.
     assert unpack(base64.b64decode(openpi_facts(openpi_policy)["metadata"])) == openpi_policy.metadata
 
