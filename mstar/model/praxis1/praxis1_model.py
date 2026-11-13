@@ -8,9 +8,9 @@ asks again.
 
 The graph follows that shape:
 
-* ``encode_text`` runs once per episode. The task text is fixed for the run,
-  so its embedding (and the blank-caption embedding the video guidance needs)
-  persists at the conductor rather than being recomputed per chunk.
+* ``encode_text`` produces the task and blank-caption embeddings for a
+  request. Its output persists between walks of that request, but a later
+  policy call re-encodes the text until episode state can retain it.
 * ``chunk`` is one policy call: VAE-encode the observation, run the denoise
   loop, emit the action rows. The loop carries the video and action latents;
   the expert reads the backbone's taps inside the same iteration, so the two
@@ -189,9 +189,8 @@ class Praxis1Model(Model):
     # ------------------------------------------------------------------
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
-        # The task text is constant for an episode and the blank caption is
-        # constant for the checkpoint, so both embeddings persist and no
-        # policy call pays for the text encoder.
+        # Both embeddings persist between walks of this request. A later
+        # policy call re-encodes them until episode state can retain them.
         encode_text = GraphNode(
             name="text_encoder",
             input_names=["text_inputs"],
@@ -279,8 +278,8 @@ class Praxis1Model(Model):
         The denoise loop carries the video and action latents on its own
         loop-back edges, as Wan2.2's UniPC state does, and those are ordinary
         tensors rather than state the engine admits. The text embeddings
-        persist for the episode on ``persist`` edges at the conductor, which
-        is a signal's lifetime and not a resource either.
+        persist between walks of this request on ``persist`` edges at the
+        conductor; that does not retain them across policy calls.
 
         The one thing that will be declared state is the context cache: the
         backbone's K/V held across the Euler steps of one call, which the
@@ -404,7 +403,7 @@ class Praxis1Model(Model):
         input_signals: dict[str, list[TensorPointerInfo]],
         model_kwargs: dict,
     ) -> list[WalkStep]:
-        """Encode the text once per episode, then one walk per policy call."""
+        """Encode text if this request lacks embeddings, then run its chunk."""
         if not input_signals.get("image_inputs"):
             raise ValueError("Praxis-1 requires camera images (image_inputs)")
         steps: list[WalkStep] = []

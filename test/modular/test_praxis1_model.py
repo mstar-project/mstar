@@ -197,7 +197,7 @@ def test_robot_io_matches_the_checkpoint(tmp_path, monkeypatch):
 
 
 def test_the_text_walk_persists_what_the_chunk_walk_reads(tmp_path, monkeypatch):
-    """The task text is constant for an episode, so no policy call re-encodes it."""
+    """Persisted text is available to later walks of the same request."""
     model = _model(tmp_path, DROID_CONFIG, monkeypatch)
     walks = model.get_graph_walk_graphs()
     assert set(walks) == {model.ENCODE_TEXT_WALK, model.CHUNK_WALK}
