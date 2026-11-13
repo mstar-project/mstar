@@ -559,6 +559,14 @@ class Conductor:
             raise ValueError("episodes must be a mapping")
         self._episode_records = EpisodeRecords()
         self._episode_slots = EpisodeSlots(episode_config.get("max_episodes", 16))
+        for spec in self._node_resources():
+            if spec.resource_key in self._episode_array_names:
+                usable = getattr(spec.config, "usable_slots", None)
+                if usable is None or usable < self._episode_slots.capacity:
+                    raise ValueError(
+                        f"episode array {spec.resource_key!r} has {usable} usable slots; "
+                        f"episodes.max_episodes needs {self._episode_slots.capacity}"
+                    )
         self._episode_max_calls = episode_config.get("max_calls")
         self._episode_max_queued_calls = episode_config.get("max_queued_calls", 1)
         self._episode_idle_timeout_s = episode_config.get("idle_timeout_s", 600)
@@ -1330,6 +1338,8 @@ class Conductor:
         except ValueError as exc:
             self._reject_request(body.request_id, str(exc), status=400)
             return
+        if self._episode_array_names:
+            self._expire_episode_slots(time.monotonic())
         if self._episode_array_names and body.episode is not None and (
             type(body.episode) is not str or not body.episode
         ):
@@ -1383,6 +1393,9 @@ class Conductor:
         try:
             self._do_ingest_request(body)
         except EpisodeCapacityError:
+            # Planning registered the request before slot reservation. It sent
+            # nothing to workers, so keep the preprocess inputs for the retry.
+            self._drop_request(body.request_id)
             self.waiting_queue.append(body)
             if self._status_interval_s is not None:
                 self._queued_since.setdefault(body.request_id, time.perf_counter())
@@ -1780,6 +1793,18 @@ class Conductor:
                 return slot
         raise EpisodeCapacityError
 
+    def _expire_episode_slots(self, now: float) -> bool:
+        freed = False
+        for episode_id, record in self._episode_records.idle():
+            if now - record.last_end < self._episode_idle_timeout_s:
+                break
+            slot, workers = self._episode_records.evict(episode_id, "idle")
+            self._send_end_episode(episode_id, slot, workers)
+            self._episode_slots.release(self._episode_owner(episode_id, ""), workers, slot)
+            freed = True
+        self._episode_records.forget_expired_cold(now, self._episode_idle_timeout_s)
+        return freed
+
     def _drop_request(self, request_id: str) -> None:
         """The one way a request leaves ``self.requests``, so what the replica pick recorded cannot leak."""
         request_data = self.requests.pop(request_id, None)
@@ -1911,18 +1936,8 @@ class Conductor:
         a stalled drain barrier through, and drop stale early-message entries so
         they can't accumulate for requests that never come back."""
         now = time.perf_counter()
-        if self._episode_array_names:
-            freed = False
-            for episode_id, record in self._episode_records.idle():
-                if now - record.last_end < self._episode_idle_timeout_s:
-                    break
-                slot, workers = self._episode_records.evict(episode_id, "idle")
-                self._send_end_episode(episode_id, slot, workers)
-                self._episode_slots.release(self._episode_owner(episode_id, ""), workers, slot)
-                freed = True
-            self._episode_records.forget_expired_cold(now, self._episode_idle_timeout_s)
-            if freed:
-                self._try_admit_waiting()
+        if self._episode_array_names and self._expire_episode_slots(time.monotonic()):
+            self._try_admit_waiting()
         for request_id in self._pop_expired(self._draining_deadlines, now):
             dr = self.draining.get(request_id)
             if dr is None:

@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from mstar.conductor.conductor import Conductor
-from mstar.conductor.episodes import EpisodeRecords, EpisodeSlots
+from mstar.conductor.episodes import EpisodeCapacityError, EpisodeRecords, EpisodeSlots
 from mstar.conductor.routing import Placement
 from mstar.utils.ipc_format import NewRequestConductor, WorkerGraphsDone
 
@@ -160,3 +160,41 @@ def test_global_waiting_queue_skips_a_busy_episode_until_its_teardown():
     conductor._episode_records.finish("robot-a", "call-1", {"frames": 21})
     conductor._try_admit_waiting()
     assert admitted == ["other", "call-2"]
+
+
+def test_idle_timeout_sends_end_before_releasing_slot():
+    conductor = object.__new__(Conductor)
+    conductor._episode_records = EpisodeRecords()
+    conductor._episode_slots = EpisodeSlots(1)
+    conductor._episode_idle_timeout_s = 10
+    workers = {"w0"}
+    assert conductor._episode_slots.reserve("episode:robot-a", workers) == 0
+    conductor._episode_records.admit("robot-a", "call-1", 0, _placement(0), workers=workers)
+    conductor._episode_records.finish("robot-a", "call-1", {"frames": 21})
+    sent = []
+    conductor.communicator = SimpleNamespace(send=lambda worker, msg: sent.append((worker, msg)))
+    last_end = conductor._episode_records._records["robot-a"].last_end
+
+    assert conductor._expire_episode_slots(last_end + 11)
+    assert [(worker, msg.body.episode_id, msg.body.episode_slot) for worker, msg in sent] == [
+        ("w0", "robot-a", 0),
+    ]
+    assert conductor._episode_records.view("robot-a").cold == "idle"
+    assert conductor._episode_slots.reserve("request:r", workers) == 0
+
+
+def test_slot_pressure_requeues_without_leaking_a_registered_request():
+    conductor = object.__new__(Conductor)
+    conductor.requests = {}
+    conductor.waiting_queue = []
+    conductor._status_interval_s = None
+    body = NewRequestConductor("call-1", {}, [], [], {}, {}, episode="robot-a")
+
+    def plan(_body):
+        conductor.requests[_body.request_id] = SimpleNamespace(routing=None, episode_admitted=False)
+        raise EpisodeCapacityError
+
+    conductor._do_ingest_request = plan
+    assert conductor._admit_request(body) is False
+    assert conductor.requests == {}
+    assert conductor.waiting_queue == [body]
