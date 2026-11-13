@@ -768,8 +768,9 @@ deployment YAML tunes them under ``resources:`` (see :ref:`Step 6 <config-yaml>`
   in place: ``CausalConv()`` needs a field ``conv`` of shape ``(channels, kernel - 1)``, and
   ``GatedDeltaNet()`` a field ``state`` of shape ``(h_v, d_k, d_v)``.
 - ``max_len=0``: the array keeps nothing between steps, for attention within this step only.
-  Its one read uses ``Block()``, which sees only the entries of the token's own segment. See
-  `Cacheless attention (encoder towers)`_.
+  Its one read uses ``Block()``, which sees only the entries of the token's own segment, or
+  ``BlockCausal(size)``, which sees the segment's blocks of ``size`` entries up to the token's
+  own, as an audio tower that attends in chunks does. See `Cacheless attention (encoder towers)`_.
 - ``Positions(rope=)``: a position counter per request and label, on an append-only array
   that keeps entries. ``rope=None`` is a counter only. ``Rope`` carries ``theta``,
   ``rotary_dim``, ``interleave``, ``scale``, the Llama 3.1 factors (all three or none), the

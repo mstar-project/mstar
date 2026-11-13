@@ -27,6 +27,7 @@ from mstar.engine.resources.attn.ragged.config import (
     KeptWindowAttentionSpec,
     RaggedAttentionConfig,
     RaggedAttentionSpec,
+    RaggedBlockCausalAttentionSpec,
     RaggedCrossAttentionSpec,
     RaggedCrossAttentionStep,
     cross_label,
@@ -78,6 +79,7 @@ from mstar.engine.state.contract import (
     Attend,
     Bidirectional,
     Block,
+    BlockCausal,
     Causal,
     CausalConv,
     Entry,
@@ -976,12 +978,21 @@ class WithinStepAttend(OpBinding, ABC):
     kernel_settings = frozenset({"max_segments_per_request", "max_segments_per_step", "compile_op", "workspace_mb"})
     # whether the read runs a plan its step builds, so its resource has a spec and its calls need the step open
     plans: ClassVar[bool]
+    # the one mask the binding runs
+    mask: ClassVar[type[Mask]] = Block
 
     def check(self, array: Array, key: str, read: Read) -> None:
-        if not isinstance(read.mask, Block):
-            raise _no_layout(array, f"reads[{key!r}].mask must be Block, the only mask a read within a step takes")
+        if not isinstance(read.mask, self.mask):
+            raise _no_layout(array, f"reads[{key!r}].mask must be {self.mask.__name__}, the mask "
+                                    f"{type(self).__name__} runs within a step")
         if read.walks is not None:
             raise _no_layout(array, f"reads[{key!r}].walks must be None, since a read within a step has no walk")
+
+    def ragged_spec(
+        self, queries: "Queries", read: Read, key: str, nodes: frozenset[str], config: RaggedAttentionConfig,
+    ) -> NodeResourceSpec:
+        """The spec of the ragged resource ``read`` plans on under ``key``, of the kind its queries take."""
+        return queries.spec_class(resource_key=key, nodes=nodes, config=config)
 
     @abstractmethod
     def attend(self, run: Any, label: str, rows: "RowLayout") -> Callable[..., torch.Tensor]:
@@ -994,8 +1005,25 @@ class RaggedAttend(WithinStepAttend):
     read_back = frozenset({"max_segments_per_request", "max_segments_per_step"})
     plans = True
 
+    def for_mask(self, mask: Mask) -> OpBinding:
+        return RAGGED_BLOCK_CAUSAL_ATTEND if isinstance(mask, BlockCausal) else super().for_mask(mask)
+
     def attend(self, run: Any, label: str, rows: "RowLayout") -> Callable[..., torch.Tensor]:
         return functools.partial(joint_attention, ragged=functools.partial(run.run, label=label))
+
+
+class RaggedBlockCausalAttend(RaggedAttend):
+    """`Attend` within a step through `BlockCausal`, on a `RaggedBlockCausalAttentionSpec` of the mask's size."""
+
+    mask = BlockCausal
+
+    def ragged_spec(
+        self, queries: "Queries", read: Read, key: str, nodes: frozenset[str], config: RaggedAttentionConfig,
+    ) -> NodeResourceSpec:
+        return RaggedBlockCausalAttentionSpec(resource_key=key, nodes=nodes, config=config, block_size=read.mask.size)
+
+
+RAGGED_BLOCK_CAUSAL_ATTEND = RaggedBlockCausalAttend()
 
 
 class SdpaAttend(WithinStepAttend):
@@ -2349,9 +2377,9 @@ class WithinStepStorage(Storage):
         return WithinStepSteps()
 
     def resolve(self, arrays: Sequence[Array], declared: Sequence[Array], setup: "StateSetup") -> Resolved:
-        """A ragged spec per read, a `RaggedCrossAttentionSpec` for a read with ``queries``. Reads of one kind, on one
-        node set and with one config share the spec of the first of them, under its key, so each read is a plan on that
-        resource rather than a resource of its own."""
+        """A ragged spec per read, which its binding builds: a `RaggedCrossAttentionSpec` for a read with ``queries``.
+        Reads of one kind and mask, on one node set and with one config share the spec of the first of them, under its
+        key, so each read is a plan on that resource rather than a resource of its own."""
         by_name = {array.name: array for array in declared}
         resolved = Resolved({}, {}, {}, {})
         shared: dict[tuple, NodeResourceSpec] = {}
@@ -2367,8 +2395,8 @@ class WithinStepStorage(Storage):
             config = RaggedAttentionConfig(
                 num_qo_heads=read.op.q_heads, num_kv_heads=heads, head_dim=head_dim, dtype=dtype,
             )
-            spec = queries.spec_class(resource_key=key, nodes=array.nodes, config=config)
-            spec = shared.setdefault((queries.spec_class, array.nodes, astuple(config)), spec)
+            spec = bound.binding.ragged_spec(queries, read, key, array.nodes, config)
+            spec = shared.setdefault((type(spec), read.mask, array.nodes, astuple(config)), spec)
             resolved.resource_of[key] = spec.resource_key
             if bound.binding.plans and isinstance(spec, RaggedAttentionSpec):
                 # the labels the node's sequence shard may split (`RaggedAttentionSpec.derive`)
