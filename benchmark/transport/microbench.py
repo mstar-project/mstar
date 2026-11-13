@@ -211,10 +211,11 @@ def make_manager(path: str, my_id: str, device: str, comm, args):
     from mstar.communication.tensors import create_tensor_communication_manager
     host = args.sender_host if my_id == SENDER else args.receiver_host
     if path == "shm":
-        from mstar.communication.tensors import SharedMemoryCommunicationManager
-        return SharedMemoryCommunicationManager(
+        from mstar.communication.arena import ArenaShmCommunicationManager
+        return ArenaShmCommunicationManager(
             my_entity_id=my_id, hostname=host, device=device, communicator=comm,
             shm_dir=args.shm_dir,
+            use_arena=False,
         )
     if path == "arena":
         return create_tensor_communication_manager(

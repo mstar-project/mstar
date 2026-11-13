@@ -11,8 +11,8 @@ import tempfile
 
 import torch
 
+from mstar.communication.arena import ArenaShmCommunicationManager
 from mstar.communication.communicator import BaseCommunicator, CommProtocol
-from mstar.communication.tensors import SharedMemoryCommunicationManager
 from mstar.distributed.base import ShardingConfig
 from mstar.graph.base import GraphEdge
 
@@ -40,9 +40,10 @@ class _Communicator(BaseCommunicator):
 
 
 def _manager(shm_dir, entity_id="worker_0", prefix="/tmp/mstar/"):
-    mgr = SharedMemoryCommunicationManager(
+    mgr = ArenaShmCommunicationManager(
         my_entity_id=entity_id, hostname="localhost", device="cpu",
         communicator=_Communicator(prefix), shm_dir=shm_dir,
+        use_arena=False,
     )
     cfg = ShardingConfig(tp_enabled_nodes=set(), groups=[], shard_dim={})
     cfg.setup({})

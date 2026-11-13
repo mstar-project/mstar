@@ -33,7 +33,6 @@ from mstar.communication.tensor_store import (  # noqa: E402
     RustTensorBookkeeping,
     TensorStore,
 )
-from mstar.communication.tensors import SharedMemoryCommunicationManager  # noqa: E402
 from mstar.graph.base import GraphEdge  # noqa: E402
 from mstar.observability.recorders import EdgeTransfers  # noqa: E402
 from mstar.utils.containers import ParallelList  # noqa: E402
@@ -48,12 +47,12 @@ ME = "worker_0"
 REMOTE = [{"wg_id": 1, "graph_walks": [WALK], "nodes": ["remote"], "dyn_loops": []}]
 
 
-def _manager(cls, entity, shm_dir, bookkeeping):
-    if cls is ArenaShmCommunicationManager:
-        os.environ.setdefault("MSTAR_SHM_ARENA_SEGMENT_MB", "1")
-        os.environ.setdefault("MSTAR_SHM_ARENA_MAX_SEGMENTS", "4")
-    mgr = cls(my_entity_id=entity, hostname="localhost", device="cpu",
-              communicator=_Sink(), shm_dir=str(shm_dir))
+def _manager(use_arena, entity, shm_dir, bookkeeping):
+    os.environ.setdefault("MSTAR_SHM_ARENA_SEGMENT_MB", "1")
+    os.environ.setdefault("MSTAR_SHM_ARENA_MAX_SEGMENTS", "4")
+    mgr = ArenaShmCommunicationManager(
+        my_entity_id=entity, hostname="localhost", device="cpu",
+        communicator=_Sink(), shm_dir=str(shm_dir), use_arena=use_arena)
     mgr.tensor_store = TensorStore(bookkeeping=bookkeeping)
     return mgr
 
@@ -70,12 +69,12 @@ def _store_and_stage(producer, rid, tensors):
     return stored.flat_uuids
 
 
-def _rust_frame(tmp_path, cls, tensors):
+def _rust_frame(tmp_path, use_arena, tensors):
     """The descriptors as the Rust runtime sends them: stored by the Rust
     bookkeeper, routed and framed in Rust, read off the peer's inbox."""
     (tmp_path / "zmq").mkdir()
     mesh = _Mesh(tmp_path / "zmq", outs=[("out", "remote", False)], remote=REMOTE)
-    producer = _manager(cls, ME, tmp_path, mesh.book)
+    producer = _manager(use_arena, ME, tmp_path, mesh.book)
     rid = mesh.admit(wgs=(0, 1), workers=(ME, PEER))
     uuids = _store_and_stage(producer, rid, tensors)
     (frame,) = mesh.run(rid, uuids=uuids)[PEER]
@@ -83,21 +82,20 @@ def _rust_frame(tmp_path, cls, tensors):
     return producer, frame.body.inputs
 
 
-def _consume(cls, tmp_path, edges):
-    consumer = _manager(cls, PEER, tmp_path, PythonTensorBookkeeping())
+def _consume(use_arena, tmp_path, edges):
+    consumer = _manager(use_arena, PEER, tmp_path, PythonTensorBookkeeping())
     stats = consumer.enable_transfer_metrics()
     _read(consumer, "r1", edges)
     return consumer, stats
 
 
-@pytest.mark.parametrize("cls", [SharedMemoryCommunicationManager, ArenaShmCommunicationManager],
-                         ids=["files", "arena"])
-def test_a_sent_edge_counts_on_its_source_node(tmp_path, cls):
+@pytest.mark.parametrize("use_arena", [False, True], ids=["files", "arena"])
+def test_a_sent_edge_counts_on_its_source_node(tmp_path, use_arena):
     tensors = [torch.randn(4, 8), torch.arange(3)]
     nbytes = sum(t.nbytes for t in tensors)
-    producer, edges = _rust_frame(tmp_path, cls, [t.clone() for t in tensors])
+    producer, edges = _rust_frame(tmp_path, use_arena, [t.clone() for t in tensors])
     assert all(info._source_node_name == "only" for info in edges[0].tensor_info)
-    consumer, stats = _consume(cls, tmp_path, edges)
+    consumer, stats = _consume(use_arena, tmp_path, edges)
     assert torch.equal(consumer.get_tensor(edges[0].tensor_info[0].uuid), tensors[0])
     ((labels, (b, n, reads, seconds)),) = _series(stats.snapshot()).items()
     assert seconds > 0
@@ -109,7 +107,7 @@ def test_an_arena_spill_is_still_one_shm_read(tmp_path, monkeypatch):
     transfer on the same series."""
     monkeypatch.setenv("MSTAR_SHM_ARENA_SEGMENT_MB", "1")
     monkeypatch.setenv("MSTAR_SHM_ARENA_MAX_SEGMENTS", "1")
-    producer = _manager(ArenaShmCommunicationManager, ME, tmp_path, RustTensorBookkeeping())
+    producer = _manager(True, ME, tmp_path, RustTensorBookkeeping())
     big = [torch.zeros(200_000, dtype=torch.float32) for _ in range(2)]  # 1.6 MB > one 1 MiB segment
     uuids = _store_and_stage(producer, 1, big)
     infos = [producer.tensor_store.get_info(u) for u in uuids]

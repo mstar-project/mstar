@@ -10,7 +10,7 @@ import pytest
 import torch
 from rust_runtime import Inboxes, build_runtime
 
-from mstar.communication.tensors import SharedMemoryCommunicationManager
+from mstar.communication.arena import ArenaShmCommunicationManager
 from mstar.distributed.base import ShardingConfig, ShardingGroup
 from mstar.graph.base import GraphEdge, GraphNode, Loop, Sequential
 from mstar.graph.runtime.base import ColumnarEdgeSpecs, RouteInput, SendInput
@@ -52,9 +52,10 @@ def _send(runtime, inboxes, rid, result) -> _Sent:
 def _runtime(
     tmp_path, *, accumulated, nested, readers, persist, limit, tail=False, remote=False, inner_accumulated=False,
 ):
-    manager = SharedMemoryCommunicationManager(
+    manager = ArenaShmCommunicationManager(
         my_entity_id="worker0", hostname="localhost", device="cpu",
         communicator=SimpleNamespace(send=lambda *a, **kw: None), shm_dir=str(tmp_path),
+        use_arena=False,
     )
     node = GraphNode(name="producer", input_names=["token"],
                      outputs=[GraphEdge(name="token", next_node="producer")])

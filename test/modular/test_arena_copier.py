@@ -12,12 +12,13 @@ import torch
 from mstar.communication import arena as arena_mod
 from mstar.communication.arena import ArenaShmCommunicationManager
 from mstar.communication.tensor_store import PythonTensorBookkeeping, TensorStore
+from mstar.distributed.base import ShardingConfig
 from mstar.graph.base import GraphEdge
 from mstar.utils.containers import ParallelList
 
 rs = pytest.importorskip("mstar_rust")
 
-if not hasattr(rs, "ArenaCopier") or not rs.torch_abi_embedded():
+if not hasattr(rs, "ArenaTransport") or not rs.torch_abi_embedded():
     pytest.skip("this mstar_rust has no arena copier", allow_module_level=True)
 
 needs_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
@@ -60,6 +61,18 @@ def _edge(infos):
     return GraphEdge(next_node="B", name="x", tensor_info=infos)
 
 
+def _pin_callbacks(pin, unpin):
+    """Addresses of (register, unregister, get_last_error) that call ``pin(ptr,
+    nbytes)`` and ``unpin(ptr)``, and the ctypes objects to keep alive."""
+    callbacks = (
+        ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_uint)(
+            lambda ptr, nbytes, _flags: 0 if pin(ptr, nbytes) else 1),
+        ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p)(lambda ptr: 0 if unpin(ptr) else 1),
+        ctypes.CFUNCTYPE(ctypes.c_int)(lambda: 0),
+    )
+    return tuple(ctypes.cast(c, ctypes.c_void_p).value for c in callbacks), callbacks
+
+
 def _free_bytes(m):
     return m.stats_summary()["free_bytes"]
 
@@ -90,7 +103,7 @@ def test_a_roundtrip_touches_no_python_copy(make, monkeypatch, original):
     infos = _stage(prod, "r", [original])
     assert infos[0].shm_segment is not None, "the caller's descriptor is stamped in place"
     assert prod.tensor_store.get_info(infos[0].uuid).shm_segment == infos[0].shm_segment
-    assert infos[0].uuid in prod._arena_locs
+    assert prod._transport.has_slot(infos[0].uuid)
     assert prod.tensor_store.is_registered(infos[0].uuid)
     cons.start_read_tensors("r", [_edge(infos)])
     got = cons.tensor_store.get_tensor(infos[0].uuid)
@@ -109,7 +122,7 @@ def test_register_for_send_uuids_publishes_to_the_store_alone(make, monkeypatch)
     prod.register_for_send_uuids(ParallelList(["r", "s"], [uuids[:2], uuids[2:]]))
     assert all(i.shm_segment is None for i in infos), "nothing asked for the stamp in place"
     read = [prod.tensor_store.get_info(u) for u in uuids]
-    assert all(i.shm_segment == prod._seg_names[0] for i in read)
+    assert all(i.shm_segment == prod._arena.segment_name(0) for i in read)
     cons.start_read_tensors("r", [_edge(read)])
     for u, t in zip(uuids, tensors, strict=True):
         assert torch.equal(cons.tensor_store.get_tensor(u), t)
@@ -136,40 +149,38 @@ def test_a_tensor_whose_bytes_are_not_its_values_never_reaches_a_raw_copy(make):
     with pytest.raises(RuntimeError):
         # The Python path's refusal, unchanged: it never copied raw bytes either.
         _stage(prod, "r", [t])
-    assert not prod._arena_locs
+    assert prod._transport.live()[0] == 0
 
 
 def test_growth_is_pinned_and_named_before_rust_uses_the_segment(make, monkeypatch):
     prod, cons = make("w0"), make("w1")
     pins = []
-    monkeypatch.setattr(arena_mod, "_pin", lambda p, n: pins.append(p) or True)
-    monkeypatch.setattr(arena_mod, "_unpin", lambda p: True)
-    prod._pin_segments = True
+    fns, keep = _pin_callbacks(lambda p, n: pins.append(p) or True, lambda p: True)
+    prod._transport.set_pins(fns, 1 << 30)
+    pins.clear()  # the first segment
     tensors = [torch.full((700_000,), i, dtype=torch.uint8) for i in range(3)]
     infos = _stage(prod, "r", tensors)
     assert prod._arena.num_segments == 2 and len(pins) == 1, "the arena grew once, pinned"
-    assert {i.shm_segment for i in infos} == set(prod._seg_names)
+    names = [prod._arena.segment_name(i) for i in range(2)]
+    assert {i.shm_segment for i in infos} == set(names)
     more = _stage(prod, "s", [torch.full((700_000,), 9, dtype=torch.uint8)])
-    assert more[0].shm_segment == prod._seg_names[1], "Rust reserves in the grown segment now"
+    assert more[0].shm_segment == names[1], "Rust reserves in the grown segment now"
     cons.start_read_tensors("r", [_edge(infos), _edge(more)])
     for i, t in zip([*infos, *more], [*tensors, torch.full((700_000,), 9, dtype=torch.uint8)], strict=True):
         assert torch.equal(cons.tensor_store.get_tensor(i.uuid), t)
+    del keep
 
 
-def test_a_segment_mid_growth_is_not_used_until_the_manager_has_followed_up(make):
-    """Between a growth and its naming and pinning, another thread's Rust reserve
-    must stay out: the store could not name the segment."""
+def test_a_segment_grown_behind_the_transport_is_adopted_before_use(make):
+    """A reserve keeps to adopted segments; the next growth path adopts this one,
+    names it to the store and lands there."""
     prod = make("w0")
     prod._arena.reserve(prod._segment_bytes)  # the first segment is full
-    prod._arena.reserve(16)  # grows, with no _sync_segments after it yet
+    prod._arena.reserve(16)  # grows, with nothing told about it
     assert prod._arena.num_segments == 2
     infos = prod.store_and_return_tensor_info("r", {"x": [torch.ones(4)]})["x"]
-    store = prod.tensor_store
-    out = prod._copier.stage(store._rust, [infos[0].uuid], 0.0, True)
-    assert out.deferred == [0] and not prod.tensor_store.is_registered(infos[0].uuid)
-    assert infos[0].uuid not in prod._arena_locs, "the claim went with the row"
-    prod.register_for_send("r", infos)  # the Python path follows the growth up
-    assert infos[0].shm_segment == prod._seg_names[1]
+    prod.register_for_send("r", infos)
+    assert infos[0].shm_segment == prod._arena.segment_name(1)
 
 
 def test_arena_saturation_spills_the_rest(make):
@@ -177,7 +188,7 @@ def test_arena_saturation_spills_the_rest(make):
     tensors = [torch.full((1_500_000,), i, dtype=torch.uint8) for i in range(6)]
     infos = _stage(prod, "r", tensors)
     spilled = [i for i in infos if i.shm_segment is None]
-    assert spilled and all(i.uuid in prod._shm_files for i in spilled)
+    assert spilled and all(prod._transport.spilled_path("w0", i.uuid) for i in spilled)
     cons.start_read_tensors("r", [_edge(infos)])
     for i, t in zip(infos, tensors, strict=True):
         assert torch.equal(cons.tensor_store.get_tensor(i.uuid), t)
@@ -217,7 +228,49 @@ def test_concurrent_duplicates_leave_no_orphaned_slot(make):
         assert before - _free_bytes(prod) == 200_192, "one 256-aligned slot of 200 KB"
         prod._cleanup_by_uuid(uuid)
         assert _free_bytes(prod) == before, "a slot was orphaned"
-    assert not prod._arena_locs
+    assert prod._transport.live()[0] == 0
+
+
+def _mixed_reads(prod, cons):
+    """A batch with every kind of row a read meets: a plain one, one met twice in
+    the batch, one the store already holds, two slices of one tensor, and one of
+    this entity's own. Returns the tensors the descriptors should read."""
+    a, b, c, d = torch.arange(4.0), torch.arange(4.0) + 10, torch.arange(4.0) + 20, torch.arange(8.0).reshape(4, 2)
+    ia, ib, ic, id_ = _stage(prod, "r", [a, b, c, d])
+    cons.start_read_tensors("r", [_edge([ic.clone()])])  # already in the store below
+    first, second = id_.clone(), id_.clone()
+    first.dims, first.nbytes = [1, 2], 8
+    second.dims, second.nbytes, second.offset = [3, 2], 24, 8
+    (own,) = cons.store_and_return_tensor_info("r", {"y": [torch.ones(2)]})["y"]
+    cons.increment_ref(own.uuid, 1)
+    cons.register_request("r", ShardingConfig(tp_enabled_nodes=set(), groups=[], shard_dim={}))
+    rows = [ia.clone(), ib.clone(), ib.clone(), ic.clone(), first, second, own.clone()]
+    want = [a, b, b, c, d[:1], d[1:], torch.ones(2)]
+    return rows, want
+
+
+def test_a_batch_reads_the_same_through_rust_as_through_the_python_walk(make):
+    """Transfer metrics keep the Python walk over the descriptors, so one manager
+    of each compares them: same tensors, same references, same pending edges."""
+    prod = make("w0")
+    results = []
+    for name, metrics in (("c0", False), ("c1", True)):
+        cons = make(name)
+        if metrics:
+            cons.enable_transfer_metrics()
+        rows, want = _mixed_reads(prod, cons)
+        edges = [_edge(rows[:2]), _edge(rows[2:4]), _edge(rows[4:6]), _edge(rows[6:])]
+        cons.start_read_tensors("r", edges)
+        for info, tensor in zip(rows, want, strict=True):
+            assert torch.equal(cons.tensor_store.get_tensor(info.uuid), tensor)
+        rust = cons.tensor_store._rust
+        relabel = {u: i for i, u in enumerate(dict.fromkeys(i.uuid for i in rows))}
+        results.append((
+            [relabel[i.uuid] for i in rows],
+            [rust.ref_count(i.uuid) for i in rows],
+            [len(fp.graph_edges[0].tensor_info) for fp in cons.pending],
+        ))
+    assert results[0] == results[1]
 
 
 def test_a_large_host_copy_releases_the_gil(make, monkeypatch):
@@ -236,7 +289,7 @@ def test_a_large_host_copy_releases_the_gil(make, monkeypatch):
     try:
         store = prod.tensor_store
         before = ticks[0]
-        prod._copier.stage(store._rust, [infos[0].uuid], 0.0, False)
+        prod._transport.stage(store._rust, [infos[0].uuid], False)
         assert ticks[0] != before, "no other thread ran during the copy"
     finally:
         stop.set()
@@ -266,15 +319,16 @@ def test_a_dead_peer_is_forgotten_by_rust_too(make, tmp_path):
     infos = _stage(prod, "r", [torch.ones(4)])
     cons.start_read_tensors("r", [_edge(infos)])
     seg = infos[0].shm_segment
-    assert seg in cons._peer_segments
+    assert cons._transport.has_peer(seg)
     os.unlink(f"/dev/shm/{seg}")
     cons._peer_evict_last = 0.0
     cons.pending.clear()
     cons._evict_dead_peers()
-    assert seg not in cons._peer_segments
+    assert not cons._transport.has_peer(seg)
     info = infos[0].clone()
     info.uuid += 1
-    assert cons._copier.read(cons.tensor_store._rust, ["r"], [info], 2, 0).missing == [seg]
+    with pytest.raises(RuntimeError, match=seg):
+        cons._transport.read(cons.tensor_store._rust, ["r"], [info], 2, 0, {})
 
 
 def test_the_ttl_backstop_reclaims_rust_staged_slots(make, monkeypatch):
@@ -282,10 +336,10 @@ def test_the_ttl_backstop_reclaims_rust_staged_slots(make, monkeypatch):
     prod = make("w0")
     before = _free_bytes(prod)
     infos = _stage(prod, "r", [torch.ones(4)])
-    assert infos[0].uuid in prod._arena_locs
+    assert prod._transport.has_slot(infos[0].uuid)
     time.sleep(0.01)
-    assert prod._reclaim_expired() == 1
-    assert infos[0].uuid not in prod._arena_locs and _free_bytes(prod) == before
+    assert prod._transport.reclaim_expired() == 1
+    assert not prod._transport.has_slot(infos[0].uuid) and _free_bytes(prod) == before
 
 
 def test_profiling_records_what_rust_staged(make):
@@ -304,17 +358,17 @@ def test_the_python_paths_still_work_alone(make, monkeypatch, backend):
         monkeypatch.setattr(arena_mod, "require_torch_abi", lambda device: False)
     prod, cons = make("w0"), make("w1")
     if backend == "no-wrapper":
-        assert prod._copier is None
+        assert prod._read_device_type is None
     else:
         prod.tensor_store = TensorStore(PythonTensorBookkeeping())
         cons.tensor_store = TensorStore(PythonTensorBookkeeping())
     t = torch.arange(16.0)
     infos = _stage(prod, "r", [t])
-    assert infos[0].uuid in prod._arena_locs
+    assert prod._transport.has_slot(infos[0].uuid)
     cons.start_read_tensors("r", [_edge(infos)])
     assert torch.equal(cons.tensor_store.get_tensor(infos[0].uuid), t)
     prod._cleanup_by_uuid(infos[0].uuid)
-    assert not prod._arena_locs
+    assert prod._transport.live()[0] == 0
 
 
 # ---- on a device -------------------------------------------------------------
@@ -335,8 +389,8 @@ def test_a_device_source_is_in_the_segment_when_registration_returns(make, monke
     torch.cuda.default_stream().synchronize()
     infos = prod.store_and_return_tensor_info("r", {"x": [t]})["x"]
     prod.register_for_send_uuids(ParallelList(["r"], [[infos[0].uuid]]), skip_cuda_sync=True)
-    seg, off = prod._arena_locs[infos[0].uuid]
-    in_segment = bytes(prod._seg_views[seg][off:off + nbytes])
+    seg, off = prod._transport.slot(infos[0].uuid)
+    in_segment = bytes(prod._segment_view(seg)[off:off + nbytes])
     assert in_segment == bytes(t.cpu().numpy().tobytes())
 
 
@@ -421,12 +475,35 @@ def _failing_memcpy(prod, on_copy=None):
     callback = proto(copy)
     fns = list(arena_mod._cudart_copy_fns())
     fns[0] = ctypes.cast(callback, ctypes.c_void_p).value
-    prod._copier = rs.ArenaCopier(
-        prod._arena_locs, len(prod._seg_views), torch.cuda.current_device(), 16384,
+    prod._transport = rs.ArenaTransport(
+        prod._arena, prod.shm_dir, "mstar_", prod.my_entity_id, True, 0.0, 30.0, 0.0,
+        device_index=torch.cuda.current_device(), gather_item_bytes=16384,
         cuda=tuple(fns), d2h_stream=prod._d2h_stream.cuda_stream,
         h2d_stream=prod._h2d_stream.cuda_stream,
     )
     return callback
+
+
+@needs_cuda
+@pytest.mark.parametrize("nbytes", [64, 1 << 20])
+def test_a_device_tensor_spills_and_reads_back_onto_a_device(make, monkeypatch, nbytes):
+    """No arena has room: the D2H lands in its own file before the send returns,
+    and the read queues its H2D behind the event, from a buffer held until then."""
+    prod = make("w0", device=_device(), use_arena=False)
+    cons = make("w1", device=_device())
+    t = torch.randint(0, 255, (nbytes,), dtype=torch.uint8, device=_device())
+    torch.cuda.default_stream().synchronize()
+    infos = prod.store_and_return_tensor_info("r", {"x": [t]}, skip_cuda_sync=True)["x"]
+    prod.register_for_send("r", infos, skip_cuda_sync=True)
+    assert infos[0].shm_segment is None
+    path = prod._transport.spilled_path("w0", infos[0].uuid)
+    with open(path, "rb") as f:
+        assert f.read() == bytes(t.cpu().numpy().tobytes())
+    futures = cons.start_read_tensors("r", [_edge(infos)])
+    futures[0].result(timeout=30)
+    assert torch.equal(cons.tensor_store.get_tensor(infos[0].uuid), t)
+    prod._cleanup_by_uuid(infos[0].uuid)
+    assert not os.path.exists(path)
 
 
 @needs_cuda
@@ -438,7 +515,7 @@ def test_a_failed_device_copy_frees_its_slot_and_stays_quiet_for_torch(make):
     infos = prod.store_and_return_tensor_info("r", {"x": [t, t.clone()]}, skip_cuda_sync=True)["x"]
     with pytest.raises(RuntimeError, match="cudaMemcpyAsync"):
         prod.register_for_send_uuids(ParallelList(["r"], [[i.uuid for i in infos]]))
-    assert _free_bytes(prod) == before and not prod._arena_locs
+    assert _free_bytes(prod) == before and prod._transport.live()[0] == 0
     assert not any(prod.tensor_store.is_registered(i.uuid) for i in infos)
     # A kernel launch would raise an error left set on the thread.
     assert torch.equal((t + 1).cpu(), torch.full((16,), 2.0))
@@ -456,7 +533,7 @@ def test_a_teardown_during_the_copy_returns_the_slot(make):
     t = torch.ones(16, device=_device())
     infos.extend(prod.store_and_return_tensor_info("r", {"x": [t]}, skip_cuda_sync=True)["x"])
     prod.register_for_send_uuids(ParallelList(["r"], [[infos[0].uuid]]))
-    assert _free_bytes(prod) == before and not prod._arena_locs
+    assert _free_bytes(prod) == before and prod._transport.live()[0] == 0
     del keep
 
 
@@ -470,8 +547,28 @@ def test_a_store_that_frees_in_place_during_the_copy_returns_the_slot(make):
     t = torch.ones(16, device=_device())
     infos = prod.store_and_return_tensor_info("r", {"x": [t]}, skip_cuda_sync=True)["x"]
     prod.register_for_send_uuids(ParallelList(["r"], [[infos[0].uuid]]))
-    assert _free_bytes(prod) == before and not prod._arena_locs
+    assert _free_bytes(prod) == before and prod._transport.live()[0] == 0
     del keep
+
+
+@needs_cuda
+def test_a_row_that_fails_after_copies_are_queued_waits_for_them(make, monkeypatch):
+    """Rust queues what it can before the rest are settled, so an error in those
+    must not drop the host buffers under the copies."""
+    prod, cons = make("w0"), make("w1", device=_device())
+    infos = _stage(prod, "r", [torch.ones(4), torch.zeros(4)])
+    (own,) = cons.store_and_return_tensor_info("r", {"y": [torch.ones(2)]})["y"]
+    monkeypatch.setattr(cons, "_slice_existing_tensor", lambda **_: 1 / 0)
+    synced, real = [], torch.cuda.Stream.synchronize
+
+    def synchronize(stream):
+        synced.append(stream)
+        real(stream)
+
+    monkeypatch.setattr(torch.cuda.Stream, "synchronize", synchronize)
+    with pytest.raises(ZeroDivisionError):
+        cons.start_read_tensors("r", [_edge([*infos, own])])
+    assert synced == [cons._h2d_stream]
 
 
 @needs_cuda
@@ -497,7 +594,7 @@ def test_a_device_on_another_platform_keeps_its_torch_paths(make, monkeypatch):
     monkeypatch.setattr(arena_mod, "_cudart_copy_fns",
                         lambda: pytest.fail("cudart on a platform that is not CUDA"))
     prod, cons = make("w0", device=_device()), make("w1", device=_device())
-    assert prod._copier is None and cons._copier is None
+    assert prod._read_device_type is None and cons._read_device_type is None
     t = torch.arange(32.0, device=_device())
     infos = prod.store_and_return_tensor_info("r", {"x": [t]})["x"]
     prod.register_for_send("r", infos)

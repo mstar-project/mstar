@@ -506,20 +506,23 @@ impl Bookkeeping {
     }
 
     /// A staged tensor is registered and its descriptor names its slot, in one
-    /// step. Fails only for a segment the store was never told about.
-    pub fn publish_staged(&mut self, uuid: u64, segment: usize, offset: i64) -> Result<(), String> {
-        let sym = self
-            .shm_segments
-            .get(segment)
-            .copied()
-            .filter(|&s| s != Sym::MAX)
-            .ok_or_else(|| format!("segment {segment} was never registered with the store"))?;
+    /// step. `name` names a segment this store has not met.
+    pub fn publish_staged(
+        &mut self,
+        uuid: u64,
+        segment: usize,
+        offset: i64,
+        name: impl FnOnce() -> String,
+    ) {
+        if self.shm_segments.get(segment).is_none_or(|&s| s == Sym::MAX) {
+            self.register_shm_segment(segment, &name());
+        }
+        let sym = self.shm_segments[segment];
         if let Some(info) = self.tensor_info.get_mut(&uuid) {
             info.shm_segment = Some(sym);
             info.shm_offset = offset;
         }
         self.set_mem_registered(uuid, true);
-        Ok(())
     }
 
     /// A tensor just read: its record, its object and its first references, as
@@ -1005,6 +1008,24 @@ impl TensorBookkeeping {
     fn remove_tensor(&self, uuid: u64) {
         let removed = self.inner.lock().unwrap().remove_tensor(uuid);
         drop(removed);
+    }
+
+    /// `remove_tensor` for a batch. Returns the uuids not held. The objects drop
+    /// after the lock, since a finalizer must not find it.
+    fn remove_tensors(&self, uuids: Vec<u64>) -> Vec<u64> {
+        let mut missing = Vec::new();
+        let mut removed = Vec::with_capacity(uuids.len());
+        {
+            let mut bk = self.inner.lock().unwrap();
+            for uuid in uuids {
+                match bk.remove_tensor(uuid) {
+                    Some(stored) => removed.push(stored),
+                    None => missing.push(uuid),
+                }
+            }
+        }
+        drop(removed);
+        missing
     }
 
     fn rid_uuids(&self, rid: RidKey) -> Vec<u64> {

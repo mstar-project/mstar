@@ -16,9 +16,9 @@ import torch
 import mstar.communication.wire_types  # noqa: F401 (registers message tags)
 from mstar.api_server.data_worker import PreprocessWorkerThread
 from mstar.api_server.request_types import PreprocessInput
+from mstar.communication.arena import ArenaShmCommunicationManager
 from mstar.communication.codec import WireCodec
 from mstar.communication.communicator import BaseCommunicator
-from mstar.communication.tensors import SharedMemoryCommunicationManager
 from mstar.distributed.base import ShardingConfig
 from mstar.graph.base import GraphEdge, WorkerGraphStateRegistry
 from mstar.model.cosmos3.cosmos3_model import Cosmos3Model
@@ -50,8 +50,9 @@ class _Tokenizer:
 
 
 def _manager(tmp_path, entity, device, communicator):
-    manager = SharedMemoryCommunicationManager(
+    manager = ArenaShmCommunicationManager(
         entity, "localhost", device, communicator, shm_dir=str(tmp_path),
+        use_arena=False,
     )
     sharding = ShardingConfig(tp_enabled_nodes=set(), groups=[], shard_dim={})
     sharding.setup({})

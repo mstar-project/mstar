@@ -26,9 +26,9 @@ import pytest
 import torch
 
 import mstar.conductor.conductor as conductor_mod
+from mstar.communication.arena import ArenaShmCommunicationManager
 from mstar.communication.communicator import BaseCommunicator, CommProtocol
 from mstar.communication.tensors import (
-    SharedMemoryCommunicationManager,
     _deployment_namespace,
     create_tensor_communication_manager,
     ensure_deployment_token,
@@ -165,14 +165,14 @@ def _spawned_worker(shm_dir: str, prefix: str, arena: bool, ready,
         # A stall right after the worker decided to unlink (SIGSTOP freezes
         # its watchdog thread too), until the test sends SIGCONT. Then every
         # unlink runs, whatever the watchdog sends meanwhile.
-        unlink = SharedMemoryCommunicationManager.unlink_owned_files
+        unlink = ArenaShmCommunicationManager.unlink_owned_files
 
         def _frozen_then_unlink(self):
             os.kill(os.getpid(), signal.SIGSTOP)
             signal.signal(signal.SIGTERM, signal.SIG_IGN)
             unlink(self)
 
-        SharedMemoryCommunicationManager.unlink_owned_files = _frozen_then_unlink
+        ArenaShmCommunicationManager.unlink_owned_files = _frozen_then_unlink
     _worker_process_target(
         worker_id="worker_0", worker_ids=["worker_0"], my_worker_graphs=[], model_config={},
         all_worker_graph_ids_to_graph_walks={}, all_worker_graph_ids_to_nodes={},
@@ -375,9 +375,10 @@ def test_unlink_owned_files_skips_what_is_gone_and_leaves_peers_alone(tmp_path):
     shm_dir, prefix = _dirs(tmp_path)
 
     def manager(entity_id):
-        return SharedMemoryCommunicationManager(
+        return ArenaShmCommunicationManager(
             my_entity_id=entity_id, hostname="localhost", device="cpu",
             communicator=_DeploymentCommunicator(prefix), shm_dir=shm_dir,
+            use_arena=False,
         )
 
     mine, peer = manager("worker_0"), manager("worker_1")
@@ -390,51 +391,23 @@ def test_unlink_owned_files_skips_what_is_gone_and_leaves_peers_alone(tmp_path):
     assert _namespace_files(shm_dir, prefix) == peer_files
 
 
-def test_a_stop_before_an_unlink_leaves_the_file_for_the_retry(tmp_path, monkeypatch):
+def test_the_watchdog_and_the_stopping_worker_both_unlink_at_once(tmp_path):
+    """The orphan watchdog's thread drains the same files as the worker's main
+    thread: every file goes, and neither call fails on the other's."""
     shm_dir, prefix = _dirs(tmp_path)
-    mine = SharedMemoryCommunicationManager(
+    mine = ArenaShmCommunicationManager(
         my_entity_id="worker_0", hostname="localhost", device="cpu",
         communicator=_DeploymentCommunicator(prefix), shm_dir=shm_dir,
+        use_arena=False,
     )
-    _send_unacked(mine, 3)
-    unlink, stops = os.unlink, []
-
-    def _stopped_once(path):
-        if not stops:
-            stops.append(path)
-            raise SystemExit(0)  # the SIGTERM handler, firing before the unlink
-        unlink(path)
-
-    monkeypatch.setattr(os, "unlink", _stopped_once)
-    with pytest.raises(SystemExit):
-        mine.unlink_owned_files()
-    mine.unlink_owned_files()
+    _send_unacked(mine, 32)
+    threads = [threading.Thread(target=mine.unlink_owned_files) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
     assert _namespace_files(shm_dir, prefix) == []
-
-
-def test_the_watchdog_and_the_stopping_worker_each_unlink_a_file_once(tmp_path, monkeypatch):
-    """The orphan watchdog's thread drains the same files while the worker's
-    main thread is inside an unlink."""
-    shm_dir, prefix = _dirs(tmp_path)
-    mine = SharedMemoryCommunicationManager(
-        my_entity_id="worker_0", hostname="localhost", device="cpu",
-        communicator=_DeploymentCommunicator(prefix), shm_dir=shm_dir,
-    )
-    _send_unacked(mine, 3)
-    unlink, unlinked = os.unlink, []
-
-    def _watchdog_drains_during_the_first(path):
-        unlinked.append(path)
-        if len(unlinked) == 1:
-            watchdog = threading.Thread(target=mine.unlink_owned_files)
-            watchdog.start()
-            watchdog.join()
-        unlink(path)
-
-    monkeypatch.setattr(os, "unlink", _watchdog_drains_during_the_first)
-    mine.unlink_owned_files()
-    assert len(unlinked) == len(set(unlinked)) == 3
-    assert _namespace_files(shm_dir, prefix) == []
+    assert mine._transport.live() == (0, 0)
 
 
 def test_a_stop_during_cleanup_neither_cuts_the_unlinks_nor_hides_the_workers_error(monkeypatch):

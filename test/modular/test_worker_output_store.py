@@ -2,7 +2,7 @@
 node's edges carry."""
 import torch
 
-from mstar.communication.tensors import SharedMemoryCommunicationManager
+from mstar.communication.arena import ArenaShmCommunicationManager
 from mstar.testing_utils.worker import make_worker
 
 
@@ -13,9 +13,10 @@ class _NullCommunicator:
 
 def _worker(tmp_path):
     w = make_worker(
-        tensor_manager=SharedMemoryCommunicationManager(
+        tensor_manager=ArenaShmCommunicationManager(
         my_entity_id="worker_0", hostname="localhost", device="cpu",
         communicator=_NullCommunicator(), shm_dir=str(tmp_path),
+        use_arena=False,
     ),
     )
     return w

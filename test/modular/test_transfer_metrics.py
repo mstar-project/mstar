@@ -23,12 +23,12 @@ torch = pytest.importorskip("torch")
 from mstar.api_server import data_worker as data_worker_mod  # noqa: E402
 from mstar.api_server.data_worker import PreprocessWorkerThread, ResultQueue  # noqa: E402
 from mstar.api_server.request_types import ResultTensors  # noqa: E402
+from mstar.communication.arena import ArenaShmCommunicationManager  # noqa: E402
 from mstar.communication.communicator import CommProtocol  # noqa: E402
 from mstar.communication.event import EventWakeup  # noqa: E402
 from mstar.communication.tensors import (  # noqa: E402
     AsyncMooncakeReader,
     MooncakeCommunicationManager,
-    SharedMemoryCommunicationManager,
     TensorCommunicationManager,
 )
 from mstar.distributed.base import ShardingConfig  # noqa: E402
@@ -70,9 +70,10 @@ class _Sink:
 
 
 def _shm(entity, tmp_path):
-    return SharedMemoryCommunicationManager(
+    return ArenaShmCommunicationManager(
         my_entity_id=entity, hostname="localhost", device="cpu",
         communicator=_Sink(), shm_dir=str(tmp_path),
+        use_arena=False,
     )
 
 
