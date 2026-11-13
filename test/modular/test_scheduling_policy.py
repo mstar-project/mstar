@@ -84,6 +84,27 @@ def test_at_its_first_step_a_chain_yields_to_a_key_past_its_bound_too():
     assert policy.chain_yields(P, 0, False, peek) is False and peek.asked == []
 
 
+
+def test_past_its_first_step_a_listed_chain_gives_way_only_to_its_level_and_above():
+    """A decode loop over a video's clips, listed above the denoise, runs its clips back to
+    back: its own next clip is still in flight when the chain asks, so a yield to any ready
+    key handed every other step to another request's denoise."""
+    policy = Priority({VAE: 1, P: 1, O: 2}, {})
+    peek = _Peek()
+    assert policy.chain_yields(VAE, 1, False, peek) is True and peek.asked == [(VAE, frozenset({P, O}))]
+    # nothing at or above it but itself: it keeps the step and asks nothing
+    peek = _Peek()
+    assert Priority({VAE: 1}, {}).chain_yields(VAE, 3, False, peek) is False and peek.asked == []
+    # an unlisted chain still yields to any ready key, and so does a prompt cut into chunks
+    peek = _Peek()
+    assert policy.chain_yields(D, 1, False, peek) is True and peek.asked == [(D, None)]
+    peek = _Peek()
+    assert policy.chain_yields(VAE, 0, True, peek) is True and peek.asked == [(VAE, None)]
+    # a key past its bound still takes the step
+    peek = _Peek(now=10, last={VAE: 10, D: 5})
+    assert Priority({VAE: 1}, {D: 3}).chain_yields(VAE, 2, False, peek) is True
+    assert peek.asked == [(VAE, frozenset({D}))]
+
 # -- resolving entries --------------------------------------------------------------------
 
 WALKS = {PREFILL: {NODE, "Encoder"}, DECODE: {NODE}, OTHER: {NODE}}
