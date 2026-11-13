@@ -33,7 +33,7 @@ def shape_problems(decl: VerifyNode, token_stop, specs: Mapping[str, NodeResourc
     if not token_stop.stops_on(decl.walk) or decl.walk in token_stop.prefill_walks:
         problems.append(f"{where}: its TokenStop doesn't stop the decode loop on this walk")
     loopback = decl.device_loopback
-    if loopback is None or loopback.walk != decl.walk or loopback.sampler != token_stop.sampler:
+    if loopback is None or not loopback.covers(decl.walk) or loopback.sampler != token_stop.sampler:
         problems.append(
             f"{where}: a verify walk declares DeviceLoopback on itself, with the TokenStop's sampler: "
             "its next step reads each row's token off the sampler's loop-back slot"
