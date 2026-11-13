@@ -4323,8 +4323,9 @@ A tower builds on the pieces in ``mstar/model/components/qwen3_vit.py``:
 ``bilinear_table_taps`` (the learned position table resampled onto a patch grid),
 ``VisionRotaryEmbedding`` (axial 2D rope; ``keep_fp32`` keeps its frequencies fp32
 through the node's dtype cast) and ``VisionBlock``, whose attention runs over the packed
-patches through the ragged resource under the block's ``label`` (Qwen3.5's frames;
-Muse Glimmer's windows and frames), q, k and v as one projection a split checkpoint
+patches, adding to the block's ``array`` at its ``layer`` and reading it there (Qwen3.5's
+frames; Muse Glimmer's windows and frames, two arrays on one ragged resource), q, k and v
+as one projection a split checkpoint
 loads by stacked-param rules. An encoder of another medium need only send its ``MediaEncoder.output``,
 a row per pad in prompt order: Higgs-Audio's audio tower and Qwen3-ASR's packed AuT
 encoder are plain ``NodeSubmodule`` s on the audio walk. That walk is ``prefill_audio``
