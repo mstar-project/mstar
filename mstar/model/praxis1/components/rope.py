@@ -21,9 +21,11 @@ the table keeps the full head width and the rotation touches everything
 uniformly. With the shipped config that is 32 of 64 pairs.
 
 The frequency tensor is a plain attribute rather than a buffer, matching the
-reference: ``module.to(device)`` deliberately does not move it, because it
-is built once on the CPU in float32 and the device copy is cached per
-device.
+reference: ``module.to(device)`` deliberately does not move it, because a
+buffer would be cast along with the module and the float32 frequencies
+would silently become bfloat16. It is moved to the positions' device on
+each call; the reference additionally caches that copy per device, which is
+a performance change and lands with the tower rather than here.
 """
 
 from __future__ import annotations
@@ -119,6 +121,13 @@ def apply_rope(
     k0, k1 = k.float().chunk(2, dim=-1)
     seq_len, half = q0.shape[2], q0.shape[3]
     cos, sin = table.float().chunk(2, dim=-1)
+    # The reference asserts this. Without it a table built for a different
+    # layout still reshapes and rotates with misread positions.
+    if not (cos.shape[1] == seq_len and cos.shape[2] == half and cos.shape[3] == 1):
+        raise ValueError(
+            f"a rope table of {tuple(table.shape)} does not match q/k with "
+            f"seq_len {seq_len} and half-width {half}"
+        )
     cos = cos.reshape(-1, 1, seq_len, half)
     sin = sin.reshape(-1, 1, seq_len, half)
     q_out = torch.stack([q0 * cos - q1 * sin, q1 * cos + q0 * sin], dim=-2)

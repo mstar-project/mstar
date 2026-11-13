@@ -18,8 +18,9 @@ a GLU and not part of the MLP.
 
 Q, K and V come from three separate bias-free projections rather than one
 fused matrix, which matters for the weight loader: the checkpoint stores
-``q_weight``, ``k_weight`` and ``v_weight`` apart, and fusing them here
-would need a split on load that the reference never does.
+``q_weight``, ``k_weight`` and ``v_weight`` apart, so a fused matrix here
+would have to concatenate them on load and split the result again to match
+the reference's three separate GEMMs.
 
 Attention itself is left to the caller. The served path wants the engine's
 kernel under the chunk-causal mask, which is the resource M* does not have

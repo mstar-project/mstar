@@ -563,3 +563,40 @@ def test_attention_gate_is_applied_per_head():
     head1 = out[..., head_dim : 2 * head_dim]
     assert head0.abs().max() < 1e-3
     assert head1.abs().max() > head0.abs().max()
+
+
+def test_float32_rms_norm_with_a_bfloat16_weight():
+    """The cast must precede the ``1 +``, which only a bf16 weight shows.
+
+    The reference casts the weight to float32 and then forms ``1 + w``.
+    Doing ``(1 + w).float()`` rounds the sum in bfloat16 first. With a
+    float32 weight the two agree exactly, so the earlier test cannot tell
+    them apart; this one can.
+    """
+    torch.manual_seed(0)
+    dim = 64
+    ref = ref_layers.RMSNorm(dim)
+    got = port_nt.Float32RMSNorm(dim)
+    w = (torch.randn(dim) * 0.1).to(torch.bfloat16)
+    with torch.no_grad():
+        ref.weight.data = w.clone()
+        got.weight.data = w.clone()
+    x = torch.randn(2, 7, dim, dtype=torch.bfloat16)
+    assert torch.equal(got(x), ref(x))
+
+
+def test_control_the_two_cast_orders_differ_in_bf16():
+    """Control: if the orders agreed, the test above would prove nothing."""
+    w = (torch.randn(64) * 0.1).to(torch.bfloat16)
+    cast_then_add = 1 + w.to(torch.float32)
+    add_then_cast = (1 + w).to(torch.float32)
+    assert not torch.equal(cast_then_add, add_then_cast)
+
+
+def test_apply_rope_rejects_a_mismatched_table():
+    """A table built for another layout must raise, not silently rotate."""
+    torch.manual_seed(0)
+    q = torch.randn(1, 2, 8, 64)
+    wrong = port_rope.RotaryEmbedding(dim=64)(torch.arange(3)[None])
+    with pytest.raises(ValueError, match="does not match"):
+        port_rope.apply_rope(q, q.clone(), wrong)

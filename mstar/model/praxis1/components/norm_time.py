@@ -32,8 +32,9 @@ class ZeroCenteredRMSNorm(nn.Module):
     """RMS norm scaled by ``1 + weight``, computed in the input's dtype.
 
     The reference uses this for the text projection's tail and the decoder
-    output projection's head. It does not upcast, so the accumulation
-    happens at whatever dtype arrives.
+    output projection's head. Unlike :class:`Float32RMSNorm` it does not
+    cast the input or the weight, so it hands ``F.rms_norm`` whatever dtype
+    arrives and leaves the internal accumulation to the kernel.
     """
 
     def __init__(self, dim: int, eps: float = 1e-6) -> None:
@@ -64,8 +65,12 @@ class Float32RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.zeros(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Cast first, then add. The reference casts the weight to float32
+        # and only then forms 1 + w, so a bfloat16 weight gains the 1 in
+        # float32. Doing (1 + w).float() instead rounds the sum in bfloat16
+        # before the cast, which is a different number and still runs.
         out = torch.nn.functional.rms_norm(
-            x.float(), (self.dim,), weight=(1 + self.weight).float(), eps=self.eps
+            x.float(), (self.dim,), weight=1 + self.weight.to(torch.float32), eps=self.eps
         )
         return out.to(x.dtype)
 
