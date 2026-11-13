@@ -11,6 +11,7 @@ import argparse
 import hashlib
 import json
 import time
+from pathlib import Path
 
 import numpy as np
 from websockets.sync.client import connect
@@ -23,6 +24,7 @@ def main() -> None:
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8123)
     parser.add_argument("--timeout", type=float, default=600)
+    parser.add_argument("--output", type=Path, help="save raw actions for a later reference comparison")
     args = parser.parse_args()
     random = np.random.default_rng(71)
     observation = {
@@ -53,9 +55,13 @@ def main() -> None:
     assert actions.shape == (21, 10), f"expected cold DROID rows [21,10], got {actions.shape}"
     assert actions.dtype == np.float32, f"expected float32 rows, got {actions.dtype}"
     assert np.isfinite(actions).all(), "the policy returned a non-finite action"
+    assert (0 <= actions[:, 9]).all() and (actions[:, 9] <= 1).all(), "gripper must be clipped to [0,1]"
+    if args.output is not None:
+        np.save(args.output, actions)
     print(json.dumps({
         "phase": "actions", "shape": list(actions.shape), "dtype": str(actions.dtype),
         "min": float(actions.min()), "max": float(actions.max()),
+        "grip_min": float(actions[:, 9].min()), "grip_max": float(actions[:, 9].max()),
         "sha256": hashlib.sha256(actions.tobytes()).hexdigest(),
         "seconds": round(time.perf_counter() - started, 2),
     }), flush=True)
