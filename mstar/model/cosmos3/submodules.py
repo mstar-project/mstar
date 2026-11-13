@@ -2900,7 +2900,7 @@ class Cosmos3VAEDecoderSubmodule(NodeSubmodule):
     # One-shot decode per request; CUDA-graph capture (not torch.compile) is the
     # speedup path.
     disable_torch_compile = True
-    def __init__(self, vae, config, channels_last: bool = False, fast: bool = False):
+    def __init__(self, vae, config, channels_last: bool = False, fast: bool = False, tp_group=None):
         super().__init__()
         self.vae = vae
         self.config = config
@@ -2908,6 +2908,11 @@ class Cosmos3VAEDecoderSubmodule(NodeSubmodule):
         # ``fast`` (config.vae_decode_fast, whole-clip node only): clips decode
         # through the shared Wan VAE decoder, always channels-last.
         fast = vae is not None and fast
+        # Placed on several ranks with ``tp_size``, the node splits every decode
+        # by rows over them (``HeightShardedDecoder``), images included.
+        sharded = vae is not None and tp_group is not None and tp_group.world_size > 1
+        if sharded and not fast:
+            raise ValueError("A Cosmos3 vae_decoder on several ranks needs vae_decode_fast")
         if fast:
             # Cast before the layout switch and the compile trace, so both see
             # the weights the decode runs with.
@@ -2924,21 +2929,27 @@ class Cosmos3VAEDecoderSubmodule(NodeSubmodule):
         # images) at the cost of one trace per new shape. fullgraph=False
         # breaks around the VAE's causal-conv feature cache.
         # COSMOS3_COMPILE_VAE=0 disables.
-        self._decode = vae.decode if vae is not None else None
-        self._decode_compiled = False
-        self._warmed_decode_shapes: set[tuple[int, ...]] = set()
-        if vae is not None and os.environ.get("COSMOS3_COMPILE_VAE", "1").lower() not in (
+        compile_vae = vae is not None and os.environ.get("COSMOS3_COMPILE_VAE", "1").lower() not in (
             "0", "false", "no", "off",
-        ):
+        )
+        self._decode_compiled = compile_vae
+        self._warmed_decode_shapes: set[tuple[int, ...]] = set()
+        # Sharded, the VAE's layers take row bands: there is no stock decode of it.
+        self._decode = None
+        if vae is not None and not sharded:
             # with ``fast``, only images (one latent) decode through this
-            self._decode = _wan_vae().compile_decode(vae.decode)
-            self._decode_compiled = True
+            self._decode = _wan_vae().compile_decode(vae.decode) if compile_vae else vae.decode
+        if compile_vae:
             logger.info("Cosmos3 VAE decode torch.compile enabled")
         # Resolve + log the decode dtype now (a cheap cuDNN-version read) so the
         # choice is fixed at startup, not on the first request.
         self._decode_dtype()
         self._fast = None
-        if fast:
+        self._sharded = sharded
+        if sharded:
+            self._fast = _wan_vae().HeightShardedDecoder(vae, tp_group, compile=self._decode_compiled)
+            logger.info("Cosmos3 VAE decode: every clip split by rows over %d ranks", tp_group.world_size)
+        elif fast:
             self._fast = _wan_vae().FastDecoder(vae, compile=self._decode_compiled)
             logger.info("Cosmos3 VAE decode: video clips on the shared Wan VAE decoder (channels-last), "
                         "images through the stock decode")
@@ -2984,9 +2995,11 @@ class Cosmos3VAEDecoderSubmodule(NodeSubmodule):
         """Latents -> uint8 pixel frames ``[1, 3, T, H, W]``."""
         vae_dtype = self._decode_dtype()
         z = self._vae_input(latents)
-        # one latent (an image) is faster through the stock decode (24 vs 36 ms on an H200)
-        if self._fast is not None and z.shape[2] > 1:
-            return self._to_uint8(self._fast.decode(z))
+        # One latent (an image) is faster through the stock decode (24 vs 36 ms on
+        # an H200), which a sharded decoder doesn't have. The gather (a no-op on
+        # one rank) takes uint8, a quarter of fp32's bytes.
+        if self._sharded or (self._fast is not None and z.shape[2] > 1):
+            return self._fast.gather(self._to_uint8(self._fast.decode(z)))
         with torch.autocast(device_type="cuda", enabled=False):
             if (
                 self._decode_compiled

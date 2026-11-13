@@ -1979,6 +1979,19 @@ image (one latent) keeps the compiled stock ``vae.decode`` on that copy, which
 is faster for a single frame. False decodes everything with the compiled stock
 ``vae.decode`` on the shared instance.
 
+Placed on several ranks with ``tp_size`` (``configs/cosmos3_super_i2v_4step_tp2.yaml``
+puts it on both GPUs), the ``vae_decoder`` node splits every decode by rows over them
+(``HeightShardedDecoder`` in ``mstar/model/components/wan_vae.py``), images included:
+each rank decodes a band of every frame, a 3-row conv takes one row of each neighbour's
+band, the mid-block attention gathers the frame, and the uint8 frames are gathered at
+the end. On Super I2V at 832x480x121 (2x H200) the decode takes 0.95 s instead of 1.56 s.
+The frames match a one-rank decode up to conv-algorithm rounding: a few uint8 levels on
+a minority of pixels, since cuDNN picks its bf16 algorithms per shape. It needs
+``vae_decode_fast``.
+The decode runs in lockstep on the node's ranks, so a rank that fails mid-decode
+(an out-of-memory error, say) leaves the others waiting in a collective: at 1280x720x121 each
+rank peaks about 10 GB above its idle use on an H200, with about 60 GB to spare.
+
 Two or more requests at the same denoise step run one cross-request forward
 (``max_gen_batch_size``, default 8) for video, image, sound and action. With
 ``compile_denoise_batched`` (default on) the layer stack these steps share is
