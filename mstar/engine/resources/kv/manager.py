@@ -5853,6 +5853,11 @@ class KVManager(AttentionResource):
         del walk, block
         self._verify_slack = max(self._verify_slack, slack)
 
+    @property
+    def verify_slack(self) -> int:
+        """The slack a verifying node of this pool reserves (`bind_verify_walk`); 0 on a pool no node verifies on."""
+        return self._verify_slack
+
     def take_back(self, rids: Sequence[int], counts: Sequence[int], label: str) -> None:
         """Lower each of ``rids``' ``label`` stream by ``counts`` tokens, the
         rejected drafts of a verify step it committed whole. A length, never

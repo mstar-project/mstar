@@ -204,7 +204,8 @@ class Preemption:
         one that gave back its allotment, as ``kv`` decided for ``owner``. A backlogged row goes back to the runtime
         first, so it doesn't run on pages the move gave up."""
         nodes = [node for node in kv.nodes if node in self._rebuilds.nodes]
-        if kv_manager._DEBUG_ASSERTS:
+        # a stand-in cache (main's preemption tests' stubs) has no verify slack, and no node verifies on it
+        if kv_manager._DEBUG_ASSERTS and getattr(kv.cache, "verify_slack", 0):
             self._check_verify_victims(kv, victims)
         for rid in (*victims.to_host, *victims.to_drop, *victims.to_ask):
             record = self._preempted.setdefault(rid, Preempted())

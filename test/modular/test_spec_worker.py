@@ -249,6 +249,14 @@ def test_a_synchronous_verify_node_off_lockstep_builds_no_speculation(synchronou
         assert speculation is chain_step and len(tried) == 1
 
 
+def _bare_speculator() -> Speculator:
+    """`Speculator.thread_outputs` alone, which reads nothing else of the speculator but the runtime it logs
+    request ids through."""
+    spec = Speculator.__new__(Speculator)
+    spec._graph_runtime = SimpleNamespace(get_rid_string=str)
+    return spec
+
+
 @pytest.mark.parametrize("verify", [True, False])
 def test_a_verify_steps_uncut_outputs_never_reach_the_speculated_step(verify):
     """The next step of a verify walk reads each row's token off the
@@ -264,7 +272,7 @@ def test_a_verify_steps_uncut_outputs_never_reach_the_speculated_step(verify):
         continuing_rids={1}, consumed_edges=[("ids", None)],
         scheduled_batch=SimpleNamespace(chunk_ranges={}),
     )
-    Speculator.thread_outputs(Speculator.__new__(Speculator), speculation, outputs)
+    Speculator.thread_outputs(_bare_speculator(), speculation, outputs)
     assert inputs[1]["ids"] == ([] if verify else [block])
     assert speculation.continuing_rids == {1}
 
@@ -287,7 +295,7 @@ def test_a_row_the_verify_step_skipped_is_not_read_off_its_loop_back_slot():
         continuing_rids={1, 2}, consumed_edges=[("ids", None)],
         scheduled_batch=SimpleNamespace(chunk_ranges={}, discard_rid=dropped_from.append),
     )
-    Speculator.thread_outputs(Speculator.__new__(Speculator), speculation, outputs)
+    Speculator.thread_outputs(_bare_speculator(), speculation, outputs)
     assert inputs[1]["ids"] == [] and 2 not in inputs
     assert speculation.continuing_rids == {1} and speculation.dropped == {2} and dropped_from == [2]
 

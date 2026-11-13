@@ -53,6 +53,8 @@ def test_a_guaranteed_verifying_request_grows_to_its_cap_inside_its_reservation(
     # the reserved pages stay free in the arena but out of the room; another request takes the rest
     _running(kv, "x", kv._room(), arrival=1)
     assert kv._room() == 0, "room left, which a grant past the reservation could take"
+    if scratch:
+        _verifies(kv)
 
     refused, pending = [], []
     for step in range(decodes):
@@ -66,6 +68,13 @@ def test_a_guaranteed_verifying_request_grows_to_its_cap_inside_its_reservation(
         assert not refused, f"a grant inside the reservation was refused at step {refused}"
     else:
         assert refused and refused[0] >= decodes - 2 * K - 1, refused
+
+
+def _verifies(kv) -> None:
+    """Bind the pool's verify walk, so main's debug bound on committed slots counts the scratch. Bound once the
+    other requests are in: they stand for plain ones, and a verifying pool's ingest wants the slack's scratch of
+    every request."""
+    kv.bind_verify_walk(WALK, K + 1, 2 * (K + 1))
 
 
 def _guaranteed(kv, rid: str, prompt: int, decodes: int) -> None:
@@ -101,6 +110,7 @@ def test_a_guaranteed_verifying_request_that_lent_its_slack_takes_back_its_token
     while kv._room() >= 0 and _step(kv, "o", PAGE_SIZE).ok:
         pass
     assert kv._room() < 0, "o borrowed nothing of what g lends"
+    _verifies(kv)
 
     runner, ledger, taken = _runner(kv), VerifyLedger(WALK, synchronous=True), []
     take_back = kv.take_back
