@@ -69,6 +69,8 @@ class FA3PagedWrapper:
 
     plans_in_graph = True
     supports_gather_resident = False
+    # a verify walk never repeats within a launch (`Engine.repeat_refusal`)
+    supports_repeats = False
 
     def __init__(
         self, *, page_size: int, table_width: int, device: torch.device, span: int, kv_extent: int | None = None,

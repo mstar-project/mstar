@@ -3464,6 +3464,15 @@ class Engine:
         """Why no step of this walk can replay with no host work between, or
         None. After capture: its node must run the walk on resident tables,
         carry every loop-back signal, and every resource must allow it."""
+        draft = self._drafts.get(node_name)
+        if draft is not None and graph_walk == draft.walk:
+            # the ledger numbers a verify step by the node's commit and records one accepted count a
+            # row (`VerifyLedger.record`): a launch of several replays commits once, so its take-back
+            # would undo one block's rejected tokens of every replay's. From config, alike on every rank.
+            return (
+                "it verifies drafts: the verify ledger takes back one block a row per commit, and a "
+                "repeated step commits several blocks at once"
+            )
         mgmt = self._submodules[node_name]
         if mgmt.resident is None or graph_walk not in mgmt.resident.walks:
             return "it doesn't run on resident tables (resident_walks, resident_planning)"
