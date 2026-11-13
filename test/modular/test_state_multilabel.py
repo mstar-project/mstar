@@ -445,6 +445,33 @@ def test_an_add_while_another_layers_scratch_add_waits_for_its_read_is_refused(a
     _refused(r"Array 'kv': an add on layer 1 while layer 0's scratch add waits for its read", lambda: _add(h, 1))
 
 
+@pytest.mark.parametrize("attn", [_StubDense, _DenseExchange], ids=["direct", "exchange"])
+def test_a_kept_add_reaches_the_pages_on_a_kernel_that_takes_k_and_v_at_the_read(attn):
+    kv = _StubKV()
+    h = _kv_handle(kv=kv, attn=attn())
+    step = _begin(h)
+    q, _, _ = _tensors()
+    for layer in range(4):
+        _add(h, layer)
+        if layer < 3:
+            h.read(layer, q)
+    h.check_step(step)
+    assert kv.writes == [(layer, "main") for layer in range(4)], "a kept add no page holds is lost to later steps"
+
+
+@pytest.mark.parametrize("attn", [_StubDense, _DenseExchange], ids=["direct", "exchange"])
+def test_a_scratch_add_on_a_kernel_that_takes_k_and_v_at_the_read_writes_no_page(attn):
+    kv = _StubKV()
+    h = _kv_handle(kv=kv, attn=attn())
+    step = _begin(h, kv=ArrayStep(keep=False))
+    q, _, _ = _tensors()
+    for layer in range(4):
+        _add(h, layer)
+        h.read(layer, q)
+    h.check_step(step)
+    assert kv.writes == [], "the kernel attends a scratch add from k and v, so writing it only costs a copy"
+
+
 # Keyed spans on a walk read as a whole
 
 
