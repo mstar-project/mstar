@@ -93,6 +93,7 @@ from mstar.model.minimax_h3.submodules import (
 )
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.utils.hf_snapshot import resolve_snapshot_dir
+from mstar.worker.scheduling_policy import WalkPriority
 
 logger = logging.getLogger(__name__)
 
@@ -367,6 +368,15 @@ class H3Model(Model):
             outputs=loop_outputs,
         )
         return Sequential([loop, decoders[0] if len(decoders) == 1 else Parallel(decoders)])
+
+    def get_walk_priorities(self) -> list[WalkPriority]:
+        # A streamed decode is a loop of clip steps. Unlisted, each clip took turns with another
+        # request's denoise, so a finished video waited out that request's DiT: at 8 in flight on
+        # a B300, p99 180 s against 139 s, at the same throughput. Listed above the denoise, a
+        # request's clips and its audio run back to back.
+        if not self.stream_decode:
+            return []
+        return [WalkPriority(node=VAE_DECODER_NODE, priority=1), WalkPriority(node=AUDIO_DECODER_NODE, priority=1)]
 
     # ---------------------------------------------------------------- inputs
     def _ensure_tokenizer(self):

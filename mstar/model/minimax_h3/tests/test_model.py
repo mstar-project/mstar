@@ -549,6 +549,23 @@ def test_stream_decode_makes_the_video_decoder_a_loop_over_its_clips():
     assert model.mp4_encoding() == _model().mp4_encoding()
 
 
+
+def test_a_streamed_decode_goes_ahead_of_the_denoise():
+    """Its clips run back to back at concurrency instead of taking turns with another request's
+    DiT steps; the whole-clip decode keeps round robin."""
+    from mstar.worker.services import walk_priorities_of
+
+    model = _model(stream_decode=True)
+    walks = model.get_graph_walk_graphs()
+    listed = {pair for pair, entry in walk_priorities_of(model, walks).items() if entry.priority == 1}
+    assert listed == {
+        (node, walk) for walk, section in walks.items() for node in section.get_nodes()
+        if node in ("vae_decoder", "audio_decoder")
+    }
+    assert len(listed) == 8
+    assert _model().get_walk_priorities() == []
+
+
 def _sp_resources(model: H3Model, keys, group) -> dict:
     """``keys``' resources from the model's own declaration on SP ranks ``group``, built and bound
     as the engine does, the ragged attention in fp32 over FlashInfer's CPU math."""

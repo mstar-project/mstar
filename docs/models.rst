@@ -2485,7 +2485,10 @@ Deployment knobs (``model_kwargs``; the SP configs set ``compile``, ``vae_tile_b
   the whole clip's took 0.72-0.83 s, FastH3 on one B300). The H.264 stream is the same
   (same frames and settings), as long as a clip's tiles are a multiple of
   ``vae_tile_batch``, as at 768p. One rank: refused when the decoder's clips are split
-  over SP ranks.
+  over SP ranks. The two decoders go ahead of the denoise (``get_walk_priorities``), so at
+  concurrency a request's clips run back to back instead of taking turns with another
+  request's denoise: with 8 FastH3 requests in flight on one B300, p99 139 s where taking
+  turns gave 180 s, at the same 3.56 videos/min.
 - ``step_cache`` (off by default; lossy): the DiT's step cache, as for Wan2.2. With the
   table calibrated at 832x480x124 (``MAG_RATIOS["default"]``), on the 2-GPU layout at
   that size and 50 points, ``{threshold: 0.015, max_skip_steps: 2}`` computes 30 of 49
