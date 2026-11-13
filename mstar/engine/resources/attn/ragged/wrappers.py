@@ -337,6 +337,10 @@ class _FlashInferRaggedPrefillBase(_RaggedPrefillBase):
     softmax scale stays the true head dim's.
     """
 
+    # a second plan for a head group's heads: (q heads, kv heads, its workspace, its
+    # FlashInfer wrapper), or None (`FlashInferRaggedPrefillWrapper`'s ``group_heads``)
+    _group: tuple | None = None
+
     def __init__(
         self,
         workspace_buffer: Workspace,
@@ -352,6 +356,7 @@ class _FlashInferRaggedPrefillBase(_RaggedPrefillBase):
         super().__init__(num_qo_heads, num_kv_heads, head_dim, **kwargs)
         self.padded_head_dim = padded_head_dim(head_dim)
         self._workspace = workspace_buffer
+        self._kv_layout, self._backend = kv_layout, backend
 
         import flashinfer
 
@@ -410,6 +415,14 @@ class _FlashInferRaggedPrefillBase(_RaggedPrefillBase):
             sm_scale=self.sm_scale,
             q_data_type=self.q_data_type,
         )
+        if self._group is not None:
+            qo, kv, workspace, wrapper = self._group
+            workspace.plan(wrapper.plan, cu, kv_cu, qo, kv, self.padded_head_dim, causal=causal,
+                           sm_scale=self.sm_scale, q_data_type=self.q_data_type)
+
+    def _eager_attn(self, heads: int):
+        """The FlashInfer wrapper planned for ``heads`` query heads."""
+        return self.attn_wrapper
 
     def _pad_head_dim(self, t: torch.Tensor) -> torch.Tensor:
         if t.shape[-1] == self.padded_head_dim:
@@ -428,7 +441,7 @@ class _FlashInferRaggedPrefillBase(_RaggedPrefillBase):
         qp, kp, vp = (self._pad_head_dim(t.to(self.q_data_type)) for t in (q, k, v))
         lse_kwargs = dict(return_lse=True, lse_base="ln") if return_lse else {}
         if not self.accelerator_graph:
-            out = self.attn_wrapper.run(qp, kp, vp, **lse_kwargs)
+            out = self._eager_attn(qp.shape[1]).run(qp, kp, vp, **lse_kwargs)
         else:
             n = qp.shape[0]
             self._check_rows(n)
@@ -451,7 +464,38 @@ class _FlashInferRaggedPrefillBase(_RaggedPrefillBase):
 
 
 class FlashInferRaggedPrefillWrapper(_FlashInferRaggedPrefillBase, RaggedPrefillWrapper):
-    """Ragged self-attention through FlashInfer."""
+    """Ragged self-attention through FlashInfer.
+
+    ``group_heads`` (eager only): also plan each layout for that many query heads, on
+    ``group_workspace``, so ``run`` takes q / k / v of either head count (``any_heads``). A
+    pipelined Ulysses exchange attends one head group at a time
+    (``RaggedAttentionConfig.ulysses_head_groups``); FlashInfer's plan is per head count."""
+
+    def __init__(self, *args, group_heads: int | None = None, group_workspace: Workspace | None = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        if group_heads is None or group_heads == self.num_qo_heads:
+            return
+        if self.accelerator_graph:
+            raise ValueError(f"{type(self).__name__}: group_heads is for an eager wrapper (a pipelined exchange "
+                             "doesn't run under capture)")
+        if group_workspace is None or group_heads <= 0 or self.num_qo_heads % group_heads \
+                or (self.num_kv_heads * group_heads) % self.num_qo_heads:
+            raise ValueError(f"{type(self).__name__}: group_heads {group_heads} must divide {self.num_qo_heads} q "
+                             f"heads (and the kv heads in proportion), with a group_workspace")
+        import flashinfer
+
+        self._group = (group_heads, self.num_kv_heads * group_heads // self.num_qo_heads, group_workspace,
+                       flashinfer.BatchPrefillWithRaggedKVCacheWrapper(group_workspace.tensor, self._kv_layout,
+                                                                       backend=self._backend))
+        self.any_heads = True
+
+    def _eager_attn(self, heads: int):
+        if heads == self.num_qo_heads:
+            return self.attn_wrapper
+        if self._group is not None and heads == self._group[0]:
+            return self._group[3]
+        raise ValueError(f"{type(self).__name__}: planned for {self.num_qo_heads}"
+                         f"{'' if self._group is None else f' or {self._group[0]}'} q heads, got {heads}")
 
 
 class FlashInferRaggedCrossPrefillWrapper(_FlashInferRaggedPrefillBase, RaggedCrossPrefillWrapper):
