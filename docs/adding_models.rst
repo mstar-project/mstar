@@ -1005,7 +1005,13 @@ The spec types are:
        pass to dense attention.
        ``kpool`` above 1 scores one pooled key per ``kpool`` tokens (GLM-5.3);
        ``dense_below_topk`` attends densely while no row sees more than ``topk`` keys
-       (GLM-5.2); ``sm_scale`` is the absorbed MLA's softmax scale for the sparse plans.
+       (GLM-5.2); ``sm_scale`` is the absorbed MLA's softmax scale, which every sparse
+       attention runs at. The build refuses a cache it cannot use: a page size that is not
+       a power-of-two multiple of ``kpool``, and on CUDA a cache that is not bf16 or a
+       FlashInfer before 0.6.18. A deployment sizes the resource under ``resources:``:
+       ``workspace_mb`` (the floor of each FlashInfer workspace), ``prefill_score_bytes``
+       (an eager prefill's scores per launch) and ``shard_min_rows`` (the rows per rank
+       from which a prefill's selection splits across TP ranks).
    * - ``CrossAttentionSpec(config=CrossAttentionConfig(...))``
      - Attention over a paged context that is written once and never extended.
        ``backend`` defaults to ``AttnBackend.AUTO``. Only FlashInfer is implemented.
@@ -3146,6 +3152,13 @@ that a misspelled setting is never silently ignored:
    * - ``SeqShardSpec``
      - ``min_tokens``, ``exchange`` (``auto`` / ``none`` / ``ulysses`` / ``all_gather`` /
        ``ring``; see **Sequence and context parallelism** below)
+   * - ``DSASpec``
+     - ``workspace_mb`` (MiB each FlashInfer workspace of its sparse plans starts at; one per
+       walk and capture slot, one for eager steps), ``prefill_score_bytes`` (bytes of fp32
+       scores an eager prefill's selection holds per launch), ``shard_min_rows`` (the rows
+       per rank from which a prefill's selection splits across TP ranks); each a positive
+       integer. The defaults (128 MiB, 256 MiB, 64) are what
+       ``configs/glm5_next_tp8_longctx.yaml`` serves with.
    * - ``LoraSpec``
      - ``max_slots`` (adapters resident on the device at once, beside the zero adapter),
        ``max_rank`` (the largest rank served; slots are sized to it), ``cpu_capacity``

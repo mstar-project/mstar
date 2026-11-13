@@ -411,7 +411,7 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        (on a node whose model declares no region, every name that is no walk), and on a
        region captured by batch size alone; a walk or region the node captures nothing
        for at this deployment (a model that turns its captures off, such as GLM-5.2's prefill
-       under ``dsa_long_context`` with MTP) is logged and skipped. Loading also fails where a model
+       with ``dsa_long_context`` and MTP) is logged and skipped. Loading also fails where a model
        refuses a region whose buckets it uses elsewhere: CosyVoice3's
        ``flow/solve_new_frames`` takes ``model_kwargs.flow_new_frame_buckets``. The
        key replaces ``model_kwargs.prefill_token_buckets``,
