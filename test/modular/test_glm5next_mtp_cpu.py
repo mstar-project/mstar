@@ -28,6 +28,8 @@ from mstar.model.glm5_next.glm5_next_model import Glm5NextModel, process_weights
 from mstar.model.glm5_next.submodules import Glm5NextLLMSubmodule
 from mstar.model.submodule_base import ARNodeInputs, InputMetadata
 from mstar.testing_utils.resource import StubResource
+from mstar.utils.device import DeviceCapability
+from mstar.worker.host_copies import HostCopies
 
 
 def _batch(**kwargs) -> ExecutingBatch:
@@ -158,7 +160,12 @@ def _step(engine, walk, inputs, max_tokens, decode_iter=0, cached=None, ignore_e
     outputs = engine.exec_and_postprocess(batch)
     assert batch.admit_error is None, batch.admit_error
     engine.finalize_batch(batch)
-    stops = engine.check_stop_for_batch(batch, outputs)
+    # as the worker hands the stop check a step's outputs: its stop buffers where the forward set them
+    cpu = torch.device("cpu")
+    copies = HostCopies(device=cpu, device_capability=DeviceCapability.of(cpu))
+    host, rows = copies.prematerialize_for_check_stop(outputs, None, request_ids=batch.request_ids)
+    stops = engine.check_stop_for_batch(batch, host, host_rows=rows)
+    assert not batch.failed_requests, batch.failed_requests
     return outputs.per_rid_outputs, stops
 
 
@@ -450,6 +457,17 @@ def test_a_stop_token_from_the_prefill_ends_the_reply(k, caplog):
     assert _serve(engine, PROMPTS["a"], MAX_TOKENS, walks=walks) == [eos]
     assert walks == ["prefill"]
     assert _errors(caplog) == []
+
+
+@pytest.mark.parametrize("k", [0, 3])
+def test_a_prefill_stop_check_needs_only_the_rows_the_worker_copies(k):
+    """The worker hands a prefill's stop check the step's stop buffers, its sampled tokens alone, and not the count
+    the prefill persists for the decode loop. A check that read the count failed every request at its prefill, an
+    HTTP 500 under ``mstar serve`` at TP2, where handing check_stop the engine's own outputs passed."""
+    engine, _, _ = _build_engine(k)
+    engine.add_request("r", {SAMPLER: SamplingReqConfig(temperature=0.0)})
+    out, _ = _step(engine, "prefill", {"r": {"text_inputs": [PROMPTS["a"]]}}, MAX_TOKENS)
+    assert out["r"]["new_token"][0].numel() == 1, "the prefill emits one token"
 
 
 @pytest.mark.parametrize("k", [0, 3])
