@@ -49,7 +49,7 @@ import math
 import os
 import time
 from collections import OrderedDict
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Hashable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, NamedTuple
 
@@ -83,6 +83,7 @@ from mstar.model.cosmos3.components.packing import (
     action_start_frame_offset,
     build_action_static_inputs,
     build_static_inputs,
+    build_text_segment,
     vision_condition_frame_indexes,
 )
 from mstar.model.cosmos3.constants import (
@@ -330,6 +331,44 @@ def _guided(cond_v: torch.Tensor, uncond_v: torch.Tensor, gs: float, dtype: torc
     return uncond_v + gs * (cond_v - uncond_v)
 
 
+def _nbytes(value) -> int:
+    if isinstance(value, torch.Tensor):
+        return value.numel() * value.element_size()
+    if isinstance(value, Mapping):
+        return sum(_nbytes(v) for v in value.values())
+    if isinstance(value, (list, tuple)):
+        return sum(_nbytes(v) for v in value)
+    return 0
+
+
+class _Memo:
+    """Device tensors kept by the key that builds them, the least recently used dropped first past ``max_bytes``.
+    A value over an eighth of the budget is built per call and not kept."""
+
+    def __init__(self, max_bytes: int):
+        self.max_bytes = max_bytes
+        self.entries: OrderedDict[Hashable, Any] = OrderedDict()
+        self.num_bytes = 0
+        self._sizes: dict[Hashable, int] = {}
+
+    def get(self, key: Hashable, build: Callable[[], Any]) -> Any:
+        value = self.entries.get(key)
+        if value is not None:
+            self.entries.move_to_end(key)
+            return value
+        value = build()
+        size = _nbytes(value)
+        if size > self.max_bytes // 8:
+            return value
+        self.entries[key] = value
+        self._sizes[key] = size
+        self.num_bytes += size
+        while self.num_bytes > self.max_bytes:
+            dropped, _ = self.entries.popitem(last=False)
+            self.num_bytes -= self._sizes.pop(dropped)
+        return value
+
+
 @dataclass(frozen=True)
 class GenStepInfo:
     """What a denoise step's declaration needs and cannot read off the batch.
@@ -415,6 +454,10 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
     prefill_capture_token_buckets: tuple[int, ...] = (16, 32, 64, 128, 256)
     prefill_capture_batch_sizes: tuple[int, ...] = (1,)
 
+    # Statics, layout masks and pin masks by what builds them, shared by requests of one shape. A label's statics
+    # are ~6.4 MB at 480x832 and 121 frames.
+    STATICS_BYTES = 256 << 20
+
     def __init__(self, transformer, config, scheduler=None, head_decode_vae=None, head_encode_vae=None):
         super().__init__()
         warn_retired_ladder_env("COSMOS3_PREFILL_CAPTURE_TOKENS", "prefill_token_buckets: {dit: {prefill: [...]}}")
@@ -430,6 +473,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         # Template scheduler; a fresh instance (with its own multistep state) is
         # built per request from this one's config.
         self._scheduler_template = scheduler
+        self._statics = _Memo(self.STATICS_BYTES)
         # Per-request denoise state lives in the engine-managed
         # ``request_states`` store from the NodeSubmodule base.
         # Windowed sessions: the last window's clean latents per session id;
@@ -636,6 +680,73 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         if tf is not None:
             static["rotary"] = tf._rotary(static["gen_position_ids"], device, tf.proj_in.weight.dtype)
 
+    def _static(
+        self, ids: list[int], height: int, width: int, num_frames: int, fps: float, has_image_condition: bool,
+        device, sound_latent_frames: int | None = None, noisy_frames: list[int] | None = None,
+        start_frame_offset: int = 0,
+    ) -> dict:
+        """`_build_static`'s statics, slimmed and with their layout masks, from the memo. Past the prompt's length
+        they don't depend on its tokens."""
+        key = (
+            "static", len(ids), height, width, num_frames, fps, has_image_condition, sound_latent_frames,
+            None if noisy_frames is None else tuple(noisy_frames), start_frame_offset,
+        )
+
+        def build() -> dict:
+            static = self._build_static(
+                ids, height, width, num_frames, fps, has_image_condition, device,
+                sound_latent_frames=sound_latent_frames, noisy_frames=noisy_frames,
+                start_frame_offset=start_frame_offset,
+            )
+            self._slim_statics(static, None)
+            self._add_layout_masks(static, device)
+            return static
+
+        return self._statics.get(key, build)
+
+    def _action_static(
+        self, ids: list[int], height: int, width: int, num_frames: int, action_chunk: int, mode: str, fps: float,
+        action_fps: float, action_offset: int, device, state_rows: int,
+    ) -> dict:
+        """`_build_action_static`'s statics, slimmed, from the memo."""
+        key = (
+            "action", len(ids), height, width, num_frames, action_chunk, mode, fps, action_fps, action_offset,
+            state_rows,
+        )
+
+        def build() -> dict:
+            static = self._build_action_static(
+                ids, height, width, num_frames, action_chunk, mode, fps, action_fps, action_offset, device,
+                state_rows,
+            )
+            self._slim_statics(static, None)
+            return static
+
+        return self._statics.get(key, build)
+
+    @staticmethod
+    def _add_layout_masks(static: dict, device) -> None:
+        """The static's clean/noisy layout as data for a captured graph: a per-token mask (``noisy_token_mask``,
+        ``[num_vision_tokens]``, 1 on noisy frames' tokens) and the same per frame (``noisy_frame_mask``,
+        ``[1, T, 1, 1]``)."""
+        ((t_frames, patch_h, patch_w),) = static["vision_token_shapes"]
+        frame_mask = torch.zeros(t_frames, device=device, dtype=torch.float32)
+        frame_mask[static["vision_noisy_frame_indexes"][0].to(device)] = 1.0
+        static["noisy_token_mask"] = frame_mask.repeat_interleave(patch_h * patch_w).contiguous()
+        static["noisy_frame_mask"] = frame_mask.view(1, t_frames, 1, 1)
+
+    def _pin_mask(self, frames: int, pinned: Sequence[int], device, dtype) -> torch.Tensor:
+        """``[1, 1, frames, 1, 1]``, 1 on the ``pinned`` latent frames, which every step re-pins to their clean
+        latents."""
+        pinned = tuple(pinned)
+
+        def build() -> torch.Tensor:
+            mask = torch.zeros((1, 1, frames, 1, 1), device=device, dtype=dtype)
+            mask[:, :, list(pinned)] = 1.0
+            return mask
+
+        return self._statics.get(("pin", frames, pinned, dtype), build)
+
     def _new_scheduler(self, num_inference_steps: int, device, use_karras_sigma=None, flow_shift=None):
         if self.config.distilled_sigmas:
             return self._new_distilled_scheduler(device)
@@ -787,19 +898,18 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                 raise ValueError("Cosmos3 sound generation requires a video request (num_frames > 1)")
             _, num_sound = sound_frames(md, self.config)
 
-        cond = self._build_static(
+        cond = self._static(
             cond_ids, height, width, num_frames, fps, has_image_condition, device,
             sound_latent_frames=num_sound, noisy_frames=noisy_frames,
         )
         uncond = None
         if uncond_ids is not None:
-            uncond = self._build_static(
+            uncond = self._static(
                 uncond_ids, height, width, num_frames, fps, has_image_condition, device,
                 sound_latent_frames=num_sound, noisy_frames=noisy_frames,
             )
 
-        node_inputs = self._get_prefill_node_inputs(cond, uncond)
-        self._slim_statics(cond, uncond)
+        node_inputs = self._get_prefill_node_inputs(cond_ids, uncond_ids, device)
         st = self.request_state(fwd_info.rid_handle)
         st.add_all(
             cond=cond,
@@ -818,12 +928,8 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         # VAE-encoded by the parallel vae_encoder node and reach the denoise
         # loop as its ``cond_latents`` input edge (see ``_ingest_cond_latents``).
         if condition_indexes:
-            latent_shape = st["latent_shape"]
             dtype = self.transformer.proj_in.weight.dtype
-            vmask = torch.zeros((1, 1, latent_shape[2], 1, 1), device=device, dtype=dtype)
-            for f in condition_indexes:
-                vmask[:, :, f] = 1.0
-            st.add("vmask", vmask)
+            st.add("vmask", self._pin_mask(st["latent_shape"][2], condition_indexes, device, dtype))
 
         return node_inputs
 
@@ -864,6 +970,29 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             )
         return cond, uncond
 
+    def _window_statics(
+        self, cond_ids, uncond_ids, height, width, units, fps, has_image_condition, cond_units, device,
+        first_window=True, start_unit=0,
+    ):
+        """`_build_window_statics`, slimmed and with their layout masks, from the memo."""
+        key = (
+            "window", len(cond_ids), None if uncond_ids is None else len(uncond_ids), height, width, units, fps,
+            has_image_condition and first_window, cond_units, start_unit,
+        )
+
+        def build():
+            statics = self._build_window_statics(
+                cond_ids, uncond_ids, height, width, units, fps, has_image_condition, cond_units, device,
+                first_window=first_window, start_unit=start_unit,
+            )
+            for static in statics:
+                if static is not None:
+                    self._slim_statics(static, None)
+                    self._add_layout_masks(static, device)
+            return statics
+
+        return self._statics.get(key, build)
+
     def _prepare_windowed_prefill(
         self, fwd_info, md, cond_ids, uncond_ids, height, width, fps, gs, steps, device,
     ) -> ARNodeInputs:
@@ -892,20 +1021,18 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         resume_tail = None
         if resume_units:
             resume_tail = self._session_tail(str(session_id), resume_units, height, width)
-        cond, uncond = self._build_window_statics(
+        cond, uncond = self._window_statics(
             cond_ids, uncond_ids, height, width, w0.units, fps,
             has_image_condition=has_image_condition, cond_units=resume_units, device=device,
         )
-        node_inputs = self._get_prefill_node_inputs(cond, uncond)
+        node_inputs = self._get_prefill_node_inputs(cond_ids, uncond_ids, device)
         tokens_per_unit = cond["num_vision_tokens"] // w0.units
-        self._slim_statics(cond, uncond)
         iters_per_window = steps + 1 if is_kv else steps
         st = self.request_state(fwd_info.rid_handle)
         if resume_tail is not None:
             shape = self._window_latent_shape(height, width, w0.units)
             dtype = self.transformer.proj_in.weight.dtype
-            vmask = torch.zeros((1, 1, w0.units, 1, 1), device=device, dtype=dtype)
-            vmask[:, :, :resume_units] = 1.0
+            vmask = self._pin_mask(w0.units, range(resume_units), device, dtype)
             cond_video = torch.zeros(shape, device=device, dtype=dtype)
             cond_video[:, :, :resume_units] = resume_tail.to(device=device, dtype=dtype)
             st.add_all(vmask=vmask, cond_video_latents=cond_video)
@@ -937,10 +1064,6 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             ar_karras=md.get("use_karras_sigma"),
             ar_size=(int(height), int(width)),
             ar_fps=fps,
-            # WindowPlan-keyed slimmed (cond, uncond) cache; chained windows
-            # share entries across boundaries (their positions restart at 0),
-            # kv windows are position-distinct and each get their own.
-            ar_statics={},
         )
         return node_inputs
 
@@ -981,27 +1104,16 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         super().cleanup_request(request_id)
 
     def _window_statics_for(self, st, plan, device):
-        # Chained windows restart their positions at 0, so every window past
-        # the first shares one statics entry (cached). kv windows carry
-        # absolute positions and are each used once, so they are built on
-        # demand and never cached: a long rollout's state stays flat.
-        kv = bool(st.get("ar_kv_mode"))
-        start_unit = plan.start if kv else 0
-        key = (plan.units, plan.cond_units, start_unit, plan.index == 0)
-        cached = None if kv else st["ar_statics"].get(key)
-        if cached is not None:
-            return cached
+        # Chained windows restart their positions at 0, so every window past the first has the same statics. kv
+        # windows carry absolute positions.
+        start_unit = plan.start if st.get("ar_kv_mode") else 0
         height, width = st["ar_size"]
-        cond, uncond = self._build_window_statics(
+        return self._window_statics(
             st["ar_cond_ids"], st["ar_uncond_ids"], height, width, plan.units,
             st["ar_fps"], has_image_condition=st["ar_has_image_condition"],
             cond_units=plan.cond_units, device=device,
             first_window=plan.index == 0, start_unit=start_unit,
         )
-        self._slim_statics(cond, uncond)
-        if not kv:
-            st["ar_statics"][key] = (cond, uncond)
-        return cond, uncond
 
     @staticmethod
     def _window_step(st, step_index: int) -> tuple[int, int, bool]:
@@ -1143,8 +1255,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         )
         if plan.cond_units > 0:
             tail = self._window_head(window_latents, plan.cond_units).to(dtype)
-            vmask = torch.zeros((1, 1, plan.units, 1, 1), device=device, dtype=dtype)
-            vmask[:, :, :plan.cond_units] = 1.0
+            vmask = self._pin_mask(plan.units, range(plan.cond_units), device, dtype)
             cond_video = torch.zeros(shape, device=device, dtype=dtype)
             cond_video[:, :, :plan.cond_units] = tail
             st.add("vmask", vmask)
@@ -1180,10 +1291,10 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             ):
                 s.pop(key, None)
 
-    def _get_prefill_node_inputs(self, cond, uncond):
-        statics = {COND_LABEL: cond}
-        if uncond is not None:
-            statics[UNCOND_LABEL] = uncond
+    def _get_prefill_node_inputs(self, cond_ids, uncond_ids, device):
+        statics = {COND_LABEL: build_text_segment(cond_ids, self.config, device)}
+        if uncond_ids is not None:
+            statics[UNCOND_LABEL] = build_text_segment(uncond_ids, self.config, device)
         tensor_inputs = {}
         for label, s in statics.items():
             tensor_inputs[f"input_ids_{label}"] = s["input_ids"]
@@ -1192,7 +1303,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             input_seq_len=sum(s["und_len"] for s in statics.values()),
             tensor_inputs=tensor_inputs,
             kwargs=dict(
-                cfg=uncond is not None,
+                cfg=uncond_ids is not None,
                 seq_lens={label: s["und_len"] for label, s in statics.items()},
             ),
         )
@@ -1240,13 +1351,13 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         action_fps = float(md.get("action_fps", fps))
         action_offset = action_start_frame_offset(action_chunk, num_frames)
 
-        cond = self._build_action_static(
+        cond = self._action_static(
             cond_ids, height, width, num_frames, action_chunk, mode, fps, action_fps, action_offset, device,
             state_rows,
         )
         uncond = None
         if uncond_ids is not None:
-            uncond = self._build_action_static(
+            uncond = self._action_static(
                 uncond_ids, height, width, num_frames, action_chunk, mode, fps, action_fps, action_offset, device,
                 state_rows,
             )
@@ -1255,9 +1366,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         t_lat = latent_shape[2]
         dtype = self.transformer.proj_in.weight.dtype
         action_dim = self.transformer.action_dim
-        vmask = torch.zeros((1, 1, t_lat, 1, 1), device=device, dtype=dtype)
-        for f in vision_condition_frame_indexes(mode, t_lat):
-            vmask[:, :, f] = 1.0
+        vmask = self._pin_mask(t_lat, vision_condition_frame_indexes(mode, t_lat), device, dtype)
         action_clean = torch.zeros((1, action_chunk, 1), device=device, dtype=dtype)
         if mode == "forward_dynamics":
             action_clean[:] = 1.0
@@ -1290,8 +1399,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             act = torch.as_tensor(raw_act, device=device, dtype=dtype).reshape(state_rows, -1)
             clean_action[:, :state_rows, :raw_action_dim] = act[:, :raw_action_dim]
 
-        node_inputs = self._get_prefill_node_inputs(cond, uncond)
-        self._slim_statics(cond, uncond)
+        node_inputs = self._get_prefill_node_inputs(cond_ids, uncond_ids, device)
         self.request_state(fwd_info.rid_handle).add_all(
             cond=cond,
             uncond=uncond,
@@ -1344,8 +1452,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                 # mask re-injection video-to-video uses.
                 st.add("sde_generator", gen)
                 if cond_latents is not None and st.get("vmask") is None:
-                    vmask = torch.zeros((1, 1, latents.shape[2], 1, 1), device=device, dtype=latents.dtype)
-                    vmask[:, :, 0] = 1.0
+                    vmask = self._pin_mask(latents.shape[2], (0,), device, latents.dtype)
                     cond_video = torch.zeros_like(latents)
                     cond_video[:, :, 0] = cond_latents[:, :, 0].to(latents.dtype)
                     st.add_all(vmask=vmask, cond_video_latents=cond_video)
@@ -1381,29 +1488,12 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             tensors["vision_timesteps"] = t.reshape(1).expand(st["cond"]["num_vision_tokens"]).contiguous()
             tensors["cos_cond"], tensors["sin_cond"] = st["cond"]["rotary"]
             tensors["cos_uncond"], tensors["sin_uncond"] = st["uncond"]["rotary"]
-            tensors["noisy_token_mask"] = self._noisy_masks(st, device)[0]
+            tensors["noisy_token_mask"] = st["cond"]["noisy_token_mask"]
         return ARNodeInputs(
             input_seq_len=st["cond"]["num_vision_tokens"],
             tensor_inputs=tensors,
             resource_step_info=self._step_info(graph_walk, st, step_index),
         )
-
-    def _noisy_masks(self, st, device) -> tuple[torch.Tensor, torch.Tensor]:
-        """The request's current clean/noisy layout as data for a captured
-        graph: a per-token mask (``[num_vision_tokens]``, 1 on noisy frames'
-        tokens) and the same per frame (``[1, T, 1, 1]``). Cached per
-        statics object, so a windowed request refreshes it at each window."""
-        cond = st["cond"]
-        cache = st.get("noisy_masks")
-        if cache is not None and cache[0] is cond:
-            return cache[1], cache[2]
-        ((t_frames, patch_h, patch_w),) = cond["vision_token_shapes"]
-        frame_mask = torch.zeros(t_frames, device=device, dtype=torch.float32)
-        frame_mask[cond["vision_noisy_frame_indexes"][0].to(device)] = 1.0
-        token_mask = frame_mask.repeat_interleave(patch_h * patch_w).contiguous()
-        frame_mask = frame_mask.view(1, t_frames, 1, 1)
-        st.add("noisy_masks", (cond, token_mask, frame_mask))
-        return token_mask, frame_mask
 
     def _prepare_video_sound_gen(self, fwd_info, inputs, device) -> ARNodeInputs:
         st = self.request_states[fwd_info.rid_handle]
@@ -2545,7 +2635,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         outputs.clear()
         # The graph predicts every frame; clean frames (i2v anchor, chained
         # overlap) get the zero velocity the eager unpatchify gives them.
-        velocity = velocity * self._noisy_masks(st, velocity.device)[1].to(velocity.dtype)
+        velocity = velocity * st["cond"]["noisy_frame_mask"].to(velocity.dtype)
         new_latents, solver = self._scheduler_step(st, velocity, latents, step_index, solver)
         if st.get("vmask") is not None:
             new_latents = (1.0 - st["vmask"]) * new_latents + st["vmask"] * st["cond_video_latents"]
@@ -3151,10 +3241,9 @@ class Cosmos3VisionEncoderSubmodule(PackedBlockLoopEncoder):
     # fp32 either way).
     disable_autocast = True
     BLOCK_LOOP_DTYPE = torch.bfloat16
-    # Resized position tables kept on the device, least recently used dropped
-    # first, within a byte budget: one is h*w x hidden, ~151 MB at the processor's
-    # largest frame, so a count alone could hold gigabytes. A table over an
-    # eighth of the budget is built per call and not kept.
+    # Resized position tables kept on the device within a byte budget: one is
+    # h*w x hidden, ~151 MB at the processor's largest frame, so a count alone
+    # could hold gigabytes.
     POSITION_TABLE_BYTES = 256 << 20
 
     def __init__(self, vision_model, config):
@@ -3164,25 +3253,11 @@ class Cosmos3VisionEncoderSubmodule(PackedBlockLoopEncoder):
         )
         super().__init__(vision_model, node_config, output="vision_embeds")
         self.model_config = config
-        self._position_tables: OrderedDict[tuple[int, int], torch.Tensor] = OrderedDict()
-        self._position_table_bytes = 0
+        self._position_tables = _Memo(self.POSITION_TABLE_BYTES)
 
     def _position_table(self, h: int, w: int) -> torch.Tensor:
         """The frame's resized position grid, built on the device once per (h, w)."""
-        table = self._position_tables.get((h, w))
-        if table is not None:
-            self._position_tables.move_to_end((h, w))
-            return table
-        table = self.model.position_table(h, w)
-        size = table.numel() * table.element_size()
-        if size > self.POSITION_TABLE_BYTES // 8:
-            return table
-        self._position_tables[h, w] = table
-        self._position_table_bytes += size
-        while self._position_table_bytes > self.POSITION_TABLE_BYTES:
-            _, dropped = self._position_tables.popitem(last=False)
-            self._position_table_bytes -= dropped.numel() * dropped.element_size()
-        return table
+        return self._position_tables.get((h, w), lambda: self.model.position_table(h, w))
 
     def prepare_inputs(self, graph_walk, fwd_info, inputs, **kwargs) -> NodeInputs:
         frames = [(h, w) for t, h, w in self.grids(fwd_info) for _ in range(t)]

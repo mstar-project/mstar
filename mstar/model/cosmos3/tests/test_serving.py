@@ -634,9 +634,11 @@ def test_postprocess_finishes_captured_step() -> None:
 
     # One all-noisy latent frame of 2x2 patches (the layout the captured
     # graph's velocity mask is derived from).
+    cond = {"vision_token_shapes": [(1, 2, 2)], "vision_noisy_frame_indexes": [torch.tensor([0])]}
+    dit._add_layout_masks(cond, "cpu")
     dit.request_state("r").add_all(
         gs=2.0, scheduler=StubSampler(torch.tensor([900.0, 500.0, 100.0]), lambda lat, v: lat + v),
-        cond={"vision_token_shapes": [(1, 2, 2)], "vision_noisy_frame_indexes": [torch.tensor([0])]},
+        cond=cond,
         uncond={},
     )
     info = types.SimpleNamespace(graph_walk="image_gen", dynamic_loop_iter_counts={IMAGE_GEN_LOOP: 1})
@@ -683,11 +685,13 @@ def test_a_step_outside_the_guidance_interval_keeps_the_conditional_branch(path)
     dit._solver_state = ()
     dit.node_resources = {"attn": None}
     # the step at t=100 is outside the t2i default interval [400, 1000]
+    cond = {"vision_token_shapes": [(1, 2, 2)], "vision_noisy_frame_indexes": [torch.tensor([0])],
+            "num_noisy_vision_tokens": 1, "rotary": None}
+    dit._add_layout_masks(cond, "cpu")
     dit.request_state("r").add_all(
         gs=2.0, guidance_interval=(400.0, 1000.0),
         scheduler=StubSampler(torch.tensor([900.0, 500.0, 100.0]), lambda lat, v: lat + v),
-        cond={"vision_token_shapes": [(1, 2, 2)], "vision_noisy_frame_indexes": [torch.tensor([0])],
-              "num_noisy_vision_tokens": 1, "rotary": None},
+        cond=cond,
         uncond={"rotary": None}, num_sound=1,
     )
     walk, loop = ("image_gen", IMAGE_GEN_LOOP) if path != "sound" else (VIDEO_SOUND_GEN_WALK, VIDEO_SOUND_GEN_LOOP)

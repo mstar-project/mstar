@@ -401,7 +401,7 @@ def test_cosmos3_windowed_captured_step_prep_reads_no_tensor(monkeypatch):
     maps to the within-window step and the staged graph inputs match."""
     sub = _cosmos3(monkeypatch, capture=True)
     ch = sub.config.latent_channel
-    cond, uncond = sub._build_window_statics(
+    cond, uncond = sub._window_statics(
         list(range(7)), list(range(9)), 64, 64, 3, 24.0,
         has_image_condition=False, cond_units=1, device="cpu", first_window=False,
     )

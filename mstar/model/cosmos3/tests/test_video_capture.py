@@ -84,7 +84,7 @@ def test_windowed_captured_inputs_carry_the_window_layout(monkeypatch) -> None:
     sub, _ = _dit_with_buckets(monkeypatch)
     monkeypatch.setattr(sub, "get_device", lambda: torch.device("cpu"))
     ch = sub.config.latent_channel
-    cond, uncond = sub._build_window_statics(
+    cond, uncond = sub._window_statics(
         list(range(7)), list(range(9)), 64, 64, 3, 24.0,
         has_image_condition=False, cond_units=1, device="cpu", first_window=False,
     )
@@ -104,8 +104,8 @@ def test_windowed_captured_inputs_carry_the_window_layout(monkeypatch) -> None:
     assert torch.equal(t["noisy_token_mask"], torch.tensor([0.0] * 4 + [1.0] * 8))
     assert t["vision_timesteps"].shape == (12,) and torch.all(t["vision_timesteps"] == 500.0)  # window 1, step 1
     assert ni.resource_step_info.capture_key == (1, ch, 3, 4, 4)
-    # The per-frame mask is cached alongside, keyed on the window's statics.
-    assert torch.equal(sub._noisy_masks(st, "cpu")[1].flatten(), torch.tensor([0.0, 1.0, 1.0]))
+    # The per-frame mask rides alongside, in the window's statics.
+    assert torch.equal(st["cond"]["noisy_frame_mask"].flatten(), torch.tensor([0.0, 1.0, 1.0]))
     # A kv request at the same shape stages no captured inputs (it never leases).
     st.add("ar_kv_mode", True)
     counts["video_gen_ar_loop"] = 1
@@ -127,6 +127,7 @@ def test_postprocess_captured_video_step(monkeypatch) -> None:
     monkeypatch.setattr(sub, "_window_statics_for", lambda st, plan, dev: (st["cond"], st["uncond"]))
     cond = {"vision_token_shapes": [(3, 2, 2)], "vision_noisy_frame_indexes": [torch.tensor([1, 2])],
             "num_vision_tokens": 12}
+    sub._add_layout_masks(cond, "cpu")
     st = sub.request_state("r")
     pinned = torch.full((1, ch, 3, 4, 4), 7.0)
     vmask = torch.zeros(1, 1, 3, 1, 1)

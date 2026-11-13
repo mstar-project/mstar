@@ -106,11 +106,13 @@ def _dit() -> Cosmos3DiTSubmodule:
 def _static(shape, **extra) -> dict:
     t = shape[2]
     tokens = t * (shape[3] // 2) * (shape[4] // 2)
-    return {
+    static = {
         "num_vision_tokens": tokens, "num_noisy_vision_tokens": tokens, "rotary": (None, None),
         "vision_token_shapes": [(t, shape[3] // 2, shape[4] // 2)],
         "vision_noisy_frame_indexes": [torch.arange(t)], "mse_gen_indexes": None, **extra,
     }
+    Cosmos3DiTSubmodule._add_layout_masks(static, "cpu")
+    return static
 
 
 def _gen_request(sub, rid, shape, num_sound=None):

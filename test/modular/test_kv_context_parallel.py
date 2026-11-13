@@ -1467,7 +1467,7 @@ def _cosmos3_steps(sub, resources, statics, latents, timesteps) -> tuple[list[to
     runner = StepRunner(resources)
     runner.ingest_request("r0", {"kv": KVReqConfig(needed_labels=[COND_LABEL, UNCOND_LABEL])})
     cond, uncond = statics
-    prefill = sub._get_prefill_node_inputs(cond, uncond)
+    prefill = sub._get_prefill_node_inputs(cond["input_ids"].tolist(), uncond["input_ids"].tolist(), CPU)
     step = engine_step(sub, C.PREFILL_WALK, ["r0"], [prefill])
     _run_step(runner, step, C.PREFILL_WALK)
     labels = (COND_LABEL, UNCOND_LABEL)

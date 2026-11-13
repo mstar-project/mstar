@@ -78,7 +78,7 @@ def test_the_node_plans_a_segment_per_layout_run():
         inp.tensor_inputs["pos_embeds"], torch.cat([model.position_table(4, 6), model.position_table(4, 4)]),
     )
     # the second (4, 4) frame of a step reuses its table
-    assert set(node._position_tables) == {(4, 6), (4, 4)}
+    assert set(node._position_tables.entries) == {(4, 6), (4, 4)}
     try:
         node.prepare_inputs("prefill_vision", info, {"pixel_values": [pixels[:-1]]})
     except ValueError as e:
@@ -134,14 +134,14 @@ def test_position_tables_are_kept_within_a_byte_budget():
     node = Cosmos3VisionEncoderSubmodule(model, SimpleNamespace(reasoner=config))
     one = model.position_table(1, 1)
     patch = one.numel() * one.element_size()
-    node.POSITION_TABLE_BYTES = 64 * patch  # an eighth: 8 patches
+    node._position_tables.max_bytes = 64 * patch  # an eighth: 8 patches
     with torch.no_grad():
         for hw in ((2, 2), (2, 4), (4, 2), (2, 2)):  # 4, 8 and 8 patches; (2, 2) used again
             node._position_table(*hw)
-        assert list(node._position_tables) == [(2, 4), (4, 2), (2, 2)]
+        assert list(node._position_tables.entries) == [(2, 4), (4, 2), (2, 2)]
         node._position_table(6, 4)  # 24 patches, over an eighth: built, not kept
-        assert (6, 4) not in node._position_tables
-        node.POSITION_TABLE_BYTES = 16 * patch  # an eighth: 2 patches
+        assert (6, 4) not in node._position_tables.entries
+        node._position_tables.max_bytes = 16 * patch  # an eighth: 2 patches
         node._position_table(1, 1)  # 21 patches held: the least recent, (2, 4), goes
-        assert list(node._position_tables) == [(4, 2), (2, 2), (1, 1)]
-        assert node._position_table_bytes == 13 * patch
+        assert list(node._position_tables.entries) == [(4, 2), (2, 2), (1, 1)]
+        assert node._position_tables.num_bytes == 13 * patch

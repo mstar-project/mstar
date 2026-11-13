@@ -110,7 +110,6 @@ def test_window_tables_slice_with_the_window(monkeypatch) -> None:
         assert _equal(cond["rotary"], (full["rotary"][0][rows], full["rotary"][1][rows]))
         assert uncond["rotary"][0].shape == cond["rotary"][0].shape
         assert not set(POSITION_FIELDS) & set(cond)
-    assert st["ar_statics"] == {}  # kv windows are built on demand, never cached
 
     st.add("ar_kv_mode", False)
     chained = WindowSchedule(total_units=13, window_units=4, overlap_units=1)  # four full windows
@@ -320,9 +319,8 @@ def test_captured_inputs_stack_the_tables(monkeypatch) -> None:
     rids, inputs = ["a", "b"], []
     x = torch.zeros(1, cfg.latent_channel, 3, 4, 4, dtype=torch.bfloat16)
     for i, rid in enumerate(rids):
-        cond = sub._build_static(list(range(5 + i)), 64, 64, 9, 24.0, True, "cpu")
-        uncond = sub._build_static(list(range(9 + 2 * i)), 64, 64, 9, 24.0, True, "cpu")
-        sub._slim_statics(cond, uncond)
+        cond = sub._static(list(range(5 + i)), 64, 64, 9, 24.0, True, "cpu")
+        uncond = sub._static(list(range(9 + 2 * i)), 64, 64, 9, 24.0, True, "cpu")
         sub.request_state(rid).add_all(
             cond=cond, uncond=uncond, gs=6.0, guidance_interval=None, scheduler=sched,
             latent_shape=(1, cfg.latent_channel, 3, 4, 4),
