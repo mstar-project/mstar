@@ -353,7 +353,7 @@ class Praxis1Model(Model):
         raise ValueError(f"Unsupported modality for Praxis-1: {modality!r}")
 
     def process_prompt(self, prompt: str | None, *args, **kwargs) -> ProcessPromptOutput:
-        """Tokenize the task text and the blank caption, once per episode.
+        """Tokenize the task text and the blank caption, once per request.
 
         Both are tokenized here rather than in the node, so the node's
         forward stays tensor in and tensor out. The padding is the
