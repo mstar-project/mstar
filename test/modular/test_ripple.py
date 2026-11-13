@@ -12,6 +12,9 @@ import torch.nn.functional as F
 from safetensors.torch import save_file
 
 from mstar.distributed.communication import CommGroup
+from mstar.engine.resources.step import StepContext
+from mstar.engine.state import Array, ArrayStep, Segment, SubmoduleStep
+from mstar.engine.state.adapters import StateSetup, _resolve, build_handle, node_resources
 from mstar.model.components.distributed import RowParallelLinear
 from mstar.model.registry import get_model_class
 from mstar.model.ripple.config import ATTN_FULL, ATTN_SLIDING, KV_CACHE, ROPE, RippleConfig
@@ -57,36 +60,32 @@ def _attend(q, k, v, window):
 
 
 class _Attn:
+    """Attends the step's own k and v, which a kernel that takes them at the read is handed."""
+
     requires_kv_write = False
 
     def __init__(self, window):
         self.window = window
 
-    def set_default_label(self, label):
-        pass
-
-    def set_default_layer_idx(self, idx):
-        pass
-
-    def run(self, q, kv_cache_layer=None, k=None, v=None):
+    def run(self, q, label=None, kv_cache_layer=None, k=None, v=None, layer_idx=None):
         return _attend(q, k, v, self.window)
 
 
-class _KV(_Attn):
-    default_label = "main"
+class _KV:
+    """Holds no pages: the reads take k and v at the read."""
 
-    def __init__(self):
-        super().__init__(None)
-
-    def layer_view(self):
+    def layer_view(self, i):
         return None
+
+    def opens_label(self, rid, label):
+        return True
 
 
 class _Pos:
     def __init__(self, theta):
         self.theta = theta
 
-    def apply_qk(self, q, k, label):
+    def apply_qk(self, q, k, label, rope_dtype=None):
         return _rope(q, self.theta), _rope(k, self.theta)
 
 
@@ -154,18 +153,23 @@ def test_the_text_stack_matches_the_reference_layer(model_dir, tp):
                 m.comm_group, m.tp_size = group, group.world_size
     # the stand-ins take the window and theta the model declares, so a wrong one fails against the reference
     ripple = get_model_class("ripple_65b")(str(model_dir))
-    specs = {spec.resource_key: spec for spec in ripple.get_node_resources()}
+    specs = {spec.resource_key: spec for spec in node_resources(ripple)}
     for p in model.parameters():
         torch.nn.init.normal_(p, std=0.2)
     resources = {
         KV_CACHE: _KV(), ATTN_SLIDING: _Attn(specs[ATTN_SLIDING].config.sliding_window),
         ATTN_FULL: _Attn(specs[ATTN_FULL].config.sliding_window), ROPE: _Pos(specs[ROPE].config.rope_theta),
     }
+    (array,) = [declared for declared in ripple.declare_state() if isinstance(declared, Array)]
+    kv = build_handle(array, resources, _resolve([array], StateSetup()))
     for module in model.modules():
-        if hasattr(module, "bind_resources"):
-            module.bind_resources(resources)
+        if hasattr(module, "bind_state"):
+            module.bind_state({KV_CACHE: kv})
     # long enough that the 5-token window cuts the sliding layers off
     ids = torch.randint(0, cfg.vocab_size, (13,))
+    step = SubmoduleStep(segments=[Segment(1, "main", len(ids))], state={KV_CACHE: ArrayStep()})
+    step.set_ctx(StepContext((1,), "prefill_text", 0, False))
+    kv.begin_step(step)
     ours = model.logits(model(model.embed(ids), label="main"))
     ref = _reference_logits(model, ids, cfg)
     # the gate's sigmoid and the norms compute in fp32; the rest is fp64

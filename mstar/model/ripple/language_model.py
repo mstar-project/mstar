@@ -8,8 +8,8 @@ RMS-normed before RoPE, which only the sliding layers apply; the full layers
 are NoPE.
 
 All layers write one paged KV cache, which keeps only the window of the sliding
-layers' K/V; they attend it through a windowed attention resource, the full
-ones through an unwindowed one.
+layers' K/V; they read it through a windowed read, the full ones through a
+causal one.
 
 TP shards by head. The post-norms sit between each row-parallel projection and
 its residual add, so each reduces its projection's partial sums in one fused
@@ -22,7 +22,7 @@ from torch import nn
 
 from mstar.distributed.communication import CommGroup
 from mstar.distributed.utils import divide
-from mstar.engine.resources.convenience import AttentionCallable
+from mstar.engine.state import add_read, rope
 from mstar.model.components import RMSNorm
 from mstar.model.components.distributed import (
     ColumnParallelLinear,
@@ -31,7 +31,7 @@ from mstar.model.components.distributed import (
     VocabParallelEmbedding,
 )
 from mstar.model.components.distributed.mlp import ParallelGatedMLP
-from mstar.model.ripple.config import ATTN_FULL, ATTN_SLIDING, KV_CACHE, ROPE, RippleConfig
+from mstar.model.ripple.config import KV_CACHE, RippleConfig
 
 
 class RippleMLP(ParallelGatedMLP):
@@ -50,7 +50,7 @@ class RippleMLP(ParallelGatedMLP):
 
 
 class RippleAttention(nn.Module):
-    def __init__(self, config: RippleConfig, sliding: bool, comm_group: CommGroup):
+    def __init__(self, config: RippleConfig, sliding: bool, comm_group: CommGroup, layer: int):
         super().__init__()
         tp = comm_group.world_size
         self.head_dim = config.head_dim
@@ -73,16 +73,11 @@ class RippleAttention(nn.Module):
         self.k_norm = RMSNorm(config.head_dim, eps=config.rms_norm_eps)
         self.value_res_lambda = nn.Parameter(torch.zeros(1))
         self.sliding = sliding
-        self._attn_key = ATTN_SLIDING if sliding else ATTN_FULL
-        self.attn = self.kv = self.pos = None
-        self.attend: AttentionCallable | None = None
+        self.layer = torch.tensor(layer, device="cpu")
+        self.kv = None
 
-    def bind_resources(self, resources: dict) -> None:
-        self.attn = resources.get(self._attn_key)
-        self.kv = resources.get(KV_CACHE)
-        # NoPE: the full layers never rotate
-        self.pos = resources.get(ROPE) if self.sliding else None
-        self.attend = AttentionCallable(kv=self.kv, attn=self.attn)
+    def bind_state(self, handles: dict) -> None:
+        self.kv = handles[KV_CACHE]
 
     def forward(self, hidden_states: torch.Tensor, value_residual: torch.Tensor) -> torch.Tensor:
         n = hidden_states.shape[0]
@@ -94,17 +89,18 @@ class RippleAttention(nn.Module):
         q = self.q_norm(q.reshape(-1, self.head_dim)).view(n, self.num_heads, self.head_dim)
         k = self.k_norm(k.reshape(-1, self.head_dim)).view(n, self.num_kv_heads, self.head_dim)
         v = v.view(n, self.num_kv_heads, self.head_dim)
-        if self.pos is not None:
-            q, k = self.pos.apply_qk(q, k, label=self.attend.label)
-        out = self.attend(q, k, v).reshape(n, q_dim)
+        # NoPE: the full layers never rotate
+        if self.sliding:
+            q, k = rope(self.kv, q, k)
+        out = add_read(self.kv, self.layer, q, k=k, v=v).reshape(n, q_dim)
         return self.o_proj(out * torch.sigmoid(gate.float()).to(out.dtype))
 
 
 class RippleDecoderLayer(nn.Module):
-    def __init__(self, config: RippleConfig, sliding: bool, comm_group: CommGroup):
+    def __init__(self, config: RippleConfig, sliding: bool, comm_group: CommGroup, layer: int):
         super().__init__()
         hidden, eps = config.hidden_size, config.rms_norm_eps
-        self.self_attn = RippleAttention(config, sliding, comm_group)
+        self.self_attn = RippleAttention(config, sliding, comm_group, layer)
         self.mlp = RippleMLP(config, comm_group)
         self.input_layernorm = RMSNorm(hidden, eps=eps)
         self.post_attention_layernorm = RMSNorm(hidden, eps=eps)
@@ -121,32 +117,27 @@ class RippleTextModel(nn.Module):
         self.comm_group = comm_group
         self.embed_scale = config.embed_scale
         self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size, comm_group=comm_group)
-        self.layers = nn.ModuleList(RippleDecoderLayer(config, s, comm_group) for s in sliding)
+        self.layers = nn.ModuleList(RippleDecoderLayer(config, s, comm_group, i) for i, s in enumerate(sliding))
         # `forward` reduces both row-parallel projections in their post-norms,
         # one fused all-reduce + norm kernel each, so they return partial sums
         for layer in self.layers:
             layer.self_attn.o_proj.reduce_results = False
             layer.mlp.down_proj.reduce_results = False
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        # a layer of each kind, to bind the step's label on both attention resources
-        self._bind_through = (sliding.index(True), sliding.index(False))
 
     def embed(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids) * self.embed_scale
 
     def forward(self, embeds: torch.Tensor, *, label: str) -> torch.Tensor:
-        for idx in self._bind_through:
-            self.layers[idx].self_attn.attend.bind_step(label)
+        """Each row's label comes from the step's segments, so ``label`` goes unread."""
         cg = self.comm_group
         # every layer's values read ``embeds``, and the residual stream is updated in place
         residual = embeds.clone()
         h = self.layers[0].input_layernorm(embeds)
         out = None
-        for i, layer in enumerate(self.layers):
+        for layer in self.layers:
             if out is not None:
                 h, residual = layer.input_layernorm.forward_residual(out, residual)
-            # every layer is a layer of the one cache, so its stack index
-            layer.self_attn.attend.set_layer_idx(i)
             a = layer.post_attention_layernorm(layer.self_attn(h, embeds), cg)
             h, residual = layer.pre_feedforward_layernorm.forward_residual(a, residual)
             out = layer.post_feedforward_layernorm(layer.mlp(h), cg)
