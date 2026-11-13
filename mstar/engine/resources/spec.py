@@ -219,10 +219,11 @@ class NodeResourceSpec(ABC):
         return None
 
     def capacity_problem(
-        self, requests: int, request: "ResourceReqConfig | None", node_groups: Sequence[Mapping] = (),
+        self, requests: int, request: "ResourceReqConfig | None", axis_sizes: Sequence[Mapping[str, int]] = (),
     ) -> str | None:
-        """Why this resource can't hold ``requests`` requests at once, each opened with ``request``, on the
-        deployment's ``node_groups``, or None. None by default: a resource that requests don't size holds any number."""
+        """Why this resource can't hold ``requests`` requests at once, each opened with ``request``, or None.
+        ``axis_sizes`` holds the size on every mesh axis of each node group that runs its nodes. None by default: a
+        resource that requests don't size holds any number."""
         return None
 
     def prefix_variant(self, model_kwargs: dict) -> bytes | None:

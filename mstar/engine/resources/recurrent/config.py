@@ -369,7 +369,7 @@ class RecurrentStateSpec(NodeResourceSpec):
         return True
 
     def capacity_problem(
-        self, requests: int, request: ResourceReqConfig | None, node_groups: Sequence[Mapping] = (),
+        self, requests: int, request: ResourceReqConfig | None, axis_sizes: Sequence[Mapping[str, int]] = (),
     ) -> str | None:
         """A request keeps a slot for each label until it is torn down, and offloading frees none."""
         state = self.config
