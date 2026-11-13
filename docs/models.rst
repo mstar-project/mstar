@@ -1326,9 +1326,11 @@ Qwen3-TTS notes
   accumulates in the model dtype, rounding after every add (the reference sums
   in fp32 and rounds once), and Qwen3-Omni in fp32, rounded once. With
   ``depth_kernel: true`` in ``model_kwargs`` on a Hopper GPU with 128 or more
-  SMs, a step of up to 64 rows whose residual draws the graph sampler can hand
+  SMs, a step of 2 to 64 rows whose residual draws the graph sampler can hand
   over runs the whole loop, sampling included, as one persistent kernel
-  (``mstar.model.qwen3_tts.components.depth_frame``). The kernel needs Triton
+  (``mstar.model.qwen3_tts.components.depth_frame``), on the 0.6B and the
+  1.7B; the 0.6B's 1024-wide Talker runs it zero-padded to the 1.7B's width.
+  A one-row step runs the loop, which is faster there. The kernel needs Triton
   3.7, which comes with torch 2.12. Under torch 2.11's Triton 3.6, startup logs
   why and runs the loop.
 - The Codec does not run beside the Talker on a side stream (``side_stream``,
