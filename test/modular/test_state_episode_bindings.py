@@ -216,6 +216,150 @@ def test_failed_warm_step_keeps_the_previous_episode_window():
     resumed.end_calls()
 
 
+def _text_embeds():
+    return Array(
+        "text_embeds", nodes={"backbone"}, layers={0}, labels={"cond", "blank"},
+        entry=Entry({"h": TensorType((2,), dtype=torch.float32)}),
+        max_len=None, reads={"history": Read(mask=Window(3))}, lifetime="episode",
+    )
+
+
+def test_dense_episode_step_keeps_two_labels_separate_across_calls_and_rollback():
+    embeds = _text_embeds()
+    (spec,) = build_specs([embeds])
+    assert spec.config.usable_slots == 2
+    pool = DenseWindowPool.build(spec, EngineResourceInfo(device=torch.device("cpu")))
+    owners = EpisodeRowBindings()
+    handle = node_handles(SimpleNamespace(declare_state=lambda: [embeds]), "backbone",
+                          {"text_embeds": pool})["text_embeds"]
+
+    def open_request(rid):
+        pool.ingest_request(rid)
+        binding = owners.bind(rid, 0, "episode-a")
+        pool.bind_episode(rid, 0, "episode-a", cold=binding.cold, reset=False)
+
+    def start(rid, cond_span, blank_span):
+        step = state_steps(SubmoduleStep(
+            segments=[Segment(rid, "cond", cond_span), Segment(rid, "blank", blank_span)],
+            state={"text_embeds": ArrayStep()},
+        ), {"text_embeds": handle}, graph_walk="backbone")
+        step.set_ctx(StepContext(request_ids=[rid], graph_walk="backbone", slot=0, capture=False))
+        assert pool.admit(step.steps["text_embeds"], step.ctx).ok
+        pool.plan(step.steps["text_embeds"], step.ctx)
+        step.begin_calls()
+        return step
+
+    def commit(step):
+        step.check_calls()
+        pool.commit(step.steps["text_embeds"], step.ctx)
+        step.commit_calls()
+        step.end_calls()
+
+    cond = torch.tensor([[1., 1.], [2., 2.]])
+    blank = torch.tensor([[8., 8.]])
+    open_request(1)
+    first = start(1, 2, 1)
+    handle.add(0, h=torch.cat((cond, blank)))
+    reached = handle.read(0)
+    assert reached.row_offsets.tolist() == [0, 2, 3]
+    assert torch.equal(reached.fields["h"], torch.cat((cond, blank)))
+    commit(first)
+    assert (pool.logical_length(1, "cond"), pool.logical_length(1, "blank"), pool.held(1)) == (2, 1, 3)
+    pool.remove_request(1)
+    owners.unbind(1)
+
+    open_request(2)
+    warm = start(2, 0, 0)
+    reached = handle.read(0)
+    assert reached.row_offsets.tolist() == [0, 2, 3]
+    assert torch.equal(reached.fields["h"], torch.cat((cond, blank)))
+    commit(warm)
+
+    failed = start(2, 2, 1)
+    changed = torch.tensor([[9., 9.], [10., 10.], [11., 11.]])
+    handle.add(0, h=changed)
+    assert handle.read(0).row_offsets.tolist() == [0, 3, 5]
+    pool.rollback_admit(failed.steps["text_embeds"], failed.ctx)
+    failed.end_calls()
+    pool.remove_request(2)
+    owners.unbind(2)
+
+    open_request(3)
+    resumed = start(3, 0, 0)
+    reached = handle.read(0)
+    assert reached.row_offsets.tolist() == [0, 2, 3]
+    assert torch.equal(reached.fields["h"], torch.cat((cond, blank)))
+    commit(resumed)
+
+    newest = torch.tensor([[3., 3.], [4., 4.], [5., 5.]])
+    wrapped = start(3, 3, 0)
+    handle.add(0, h=newest)
+    reached = handle.read(0)
+    assert reached.row_offsets.tolist() == [0, 3, 4]
+    assert torch.equal(reached.fields["h"], torch.cat((newest, blank)))
+    commit(wrapped)
+    assert (pool.logical_length(3, "cond"), pool.logical_length(3, "blank"), pool.held(3)) == (5, 1, 4)
+
+
+def test_dense_episode_multilabel_packs_mixed_requests_and_enforces_slot_pressure():
+    embeds = _text_embeds()
+    (spec,) = build_specs([embeds], kernel_settings={"text_embeds": {"max_slots": 5}})
+    pool = DenseWindowPool.build(spec, EngineResourceInfo(device=torch.device("cpu")))
+    for rid in (1, 2, 3):
+        pool.ingest_request(rid)
+    handle = node_handles(SimpleNamespace(declare_state=lambda: [embeds]), "backbone",
+                          {"text_embeds": pool})["text_embeds"]
+    segments = [Segment(1, "cond", 2), Segment(2, "cond", 1),
+                Segment(1, "blank", 1), Segment(2, "blank", 2)]
+    step = state_steps(SubmoduleStep(segments=segments, state={"text_embeds": ArrayStep()}),
+                       {"text_embeds": handle}, graph_walk="backbone")
+    step.set_ctx(StepContext(request_ids=[1, 2], graph_walk="backbone", slot=0, capture=False))
+    assert pool.admit(step.steps["text_embeds"], step.ctx).ok
+    pool.plan(step.steps["text_embeds"], step.ctx)
+    step.begin_calls()
+    values = torch.arange(6, dtype=torch.float32)[:, None].expand(-1, 2).clone()
+    handle.add(0, h=values)
+    reached = handle.read(0)
+    assert reached.row_offsets.tolist() == [0, 2, 3, 4, 6]
+    assert torch.equal(reached.fields["h"], values)
+    step.check_calls()
+    pool.commit(step.steps["text_embeds"], step.ctx)
+    step.commit_calls()
+    step.end_calls()
+    assert pool.held(1) == pool.held(2) == 3
+
+    pressure = state_steps(SubmoduleStep(
+        segments=[Segment(3, "cond", 1), Segment(3, "blank", 1)],
+        state={"text_embeds": ArrayStep()},
+    ), {"text_embeds": handle}, graph_walk="backbone")
+    pressure.set_ctx(StepContext(request_ids=[3], graph_walk="backbone", slot=0, capture=False))
+    assert not pool.admit(pressure.steps["text_embeds"], pressure.ctx).ok
+    pool.rollback_admit(pressure.steps["text_embeds"], pressure.ctx)
+
+    warm = state_steps(SubmoduleStep(
+        segments=[Segment(1, "cond", 0), Segment(2, "cond", 0),
+                  Segment(1, "blank", 0), Segment(2, "blank", 0)],
+        state={"text_embeds": ArrayStep()},
+    ), {"text_embeds": handle}, graph_walk="backbone")
+    warm.set_ctx(StepContext(request_ids=[1, 2], graph_walk="backbone", slot=0, capture=False))
+    assert pool.admit(warm.steps["text_embeds"], warm.ctx).ok
+    pool.plan(warm.steps["text_embeds"], warm.ctx)
+    warm.begin_calls()
+    assert torch.equal(handle.read(0).fields["h"], values)
+    warm.check_calls()
+    pool.commit(warm.steps["text_embeds"], warm.ctx)
+    warm.commit_calls()
+    warm.end_calls()
+
+    captured = state_steps(SubmoduleStep(
+        segments=[Segment(1, "cond", 0), Segment(1, "blank", 0)],
+        state={"text_embeds": ArrayStep()},
+    ), {"text_embeds": handle}, graph_walk="backbone")
+    captured.set_ctx(StepContext(request_ids=[1], graph_walk="backbone", slot=0, capture=True))
+    with pytest.raises(ValueError, match="cannot replay a capture"):
+        captured.begin_calls()
+
+
 def test_dense_window_refuses_rebuild_drop_without_mutating_history():
     frames = _frames(reads={"context": Read(mask=Window(4))})
     (spec,) = build_specs([frames])

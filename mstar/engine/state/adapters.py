@@ -2539,8 +2539,8 @@ class DenseWindowHandle(ArrayHandle):
         super().__init__(array, resources)
         self._pool = resources[array.name]
         self._capacity = self._pool.window_size
-        self._pending: dict[int, dict[str, torch.Tensor]] = {}
-        self._added: dict[int, int] = {}
+        self._pending: dict[str, dict[int, dict[str, torch.Tensor]]] = {}
+        self._added: set[int] = set()
 
     def begin_step(self, step) -> None:
         self._pending.clear()
@@ -2550,9 +2550,10 @@ class DenseWindowHandle(ArrayHandle):
     def commit_step(self, step) -> None:
         # The forward may fail after add. Keep its writes private until the
         # engine has committed the step, so rollback leaves an episode intact.
-        for layer, fields in self._pending.items():
-            for field, rows in fields.items():
-                self._pool.scatter_(field, rows, self._pool_layer[layer], label=self.label)
+        for label, layers in self._pending.items():
+            for layer, fields in layers.items():
+                for field, rows in fields.items():
+                    self._pool.scatter_(field, rows, self._pool_layer[layer], label=label)
 
     def end_step(self, step) -> None:
         self._pending.clear()
@@ -2565,6 +2566,11 @@ class DenseWindowHandle(ArrayHandle):
             raise self._refusal(f"a kept dense window step must add every layer {sorted(self.array.layers)}, "
                                 f"but added {sorted(self._kept)}")
 
+    def _check_labels(self, labels: set[str], segments) -> None:
+        runs = [label for label, _ in groupby(segment.label for segment in segments)]
+        if len(runs) > len(labels):
+            raise self._refusal("dense window segments must group each label's rows together")
+
     def _check_storage(self, declared: ArrayStep, segments, ctx) -> None:
         super()._check_storage(declared, segments, ctx)
         if ctx.capture or ctx.replays:
@@ -2573,8 +2579,11 @@ class DenseWindowHandle(ArrayHandle):
             raise self._refusal("dense windows need kept adds and do not yet support forks")
         if ctx.repeats != 1:
             raise self._refusal("dense window steps run once before their logical lengths commit")
-        if len({segment.label for segment in segments}) > 1:
-            raise self._refusal("a dense window step has one label")
+        twice = [key for key, count in Counter((seg.request_id, seg.label) for seg in segments).items()
+                 if count > 1]
+        if twice:
+            rid, label = twice[0]
+            raise self._refusal(f"request {rid!r} has two segments on label {label!r} in one step")
 
     @torch.compiler.disable
     def add(self, layer: int | torch.Tensor, *, keep: bool | None = None, **fields: torch.Tensor) -> None:
@@ -2586,7 +2595,6 @@ class DenseWindowHandle(ArrayHandle):
             raise self._refusal(f"add fields {sorted(fields)} differ from {sorted(self.array.entry.tensors)}")
         total = sum(segment.span for segment in self._segments)
         cap = self._capacity
-        updated = {}
         for field, value in fields.items():
             block = self._pool.block(field, self._pool_layer[layer])
             if value.shape[0] != total or tuple(value.shape[1:]) != tuple(block.shape[2:]):
@@ -2595,19 +2603,26 @@ class DenseWindowHandle(ArrayHandle):
             if value.dtype != block.dtype or value.device != block.device:
                 raise self._refusal(f"field {field!r} has {value.dtype} on {value.device}, expected "
                                     f"{block.dtype} on {block.device}")
-            rows = self._pool.gather(field, self._pool_layer[layer], label=self.label)
-            offset = 0
-            for row, segment in enumerate(self._segments):
-                end = offset + segment.span
-                first = max(offset, end - cap)
-                if first < end:
-                    old = self._pool.logical_length(segment.request_id, segment.label)
-                    positions = torch.arange(old + first - offset, old + segment.span, device=value.device) % cap
-                    rows[row].index_copy_(0, positions, value[first:end])
-                offset = end
-            updated[field] = rows
-        self._pending[layer] = updated
-        self._added[layer] = 1
+        offset = 0
+        for label, grouped in groupby(self._segments, key=lambda segment: segment.label):
+            label_segments = list(grouped)
+            updated = {}
+            for field, value in fields.items():
+                rows = self._pool.gather(field, self._pool_layer[layer], label=label)
+                local_offset = offset
+                for row, segment in enumerate(label_segments):
+                    end = local_offset + segment.span
+                    first = max(local_offset, end - cap)
+                    if first < end:
+                        old = self._pool.logical_length(segment.request_id, label)
+                        positions = torch.arange(old + first - local_offset, old + segment.span,
+                                                 device=value.device) % cap
+                        rows[row].index_copy_(0, positions, value[first:end])
+                    local_offset = end
+                updated[field] = rows
+            self._pending.setdefault(label, {})[layer] = updated
+            offset += sum(segment.span for segment in label_segments)
+        self._added.add(layer)
 
     @torch.compiler.disable
     def read(self, layer: int | torch.Tensor, q: torch.Tensor | None = None, **mask_args: Any) -> Reached:
@@ -2622,17 +2637,24 @@ class DenseWindowHandle(ArrayHandle):
         for length in lengths:
             offsets.append(offsets[-1] + length)
         for field in self.array.entry.tensors:
-            rows = self._pending.get(layer, {}).get(field)
-            if rows is None:
-                rows = self._pool.gather(field, self._pool_layer[layer], label=self.label)
             packed = []
-            for row, (segment, length) in enumerate(zip(self._segments, lengths, strict=True)):
-                end = self._pool.logical_length(segment.request_id, segment.label)
-                if layer in self._added:
-                    end += segment.span
-                indices = torch.arange(end - length, end, device=rows.device) % self._capacity
-                packed.append(rows[row].index_select(0, indices))
-            fields[field] = torch.cat(packed) if packed else rows.new_empty((0, *rows.shape[2:]))
+            for label, grouped in groupby(enumerate(self._segments), key=lambda pair: pair[1].label):
+                label_segments = list(grouped)
+                rows = self._pending.get(label, {}).get(layer, {}).get(field)
+                if rows is None:
+                    rows = self._pool.gather(field, self._pool_layer[layer], label=label)
+                for row, (index, segment) in enumerate(label_segments):
+                    length = lengths[index]
+                    end = self._pool.logical_length(segment.request_id, label)
+                    if layer in self._added:
+                        end += segment.span
+                    indices = torch.arange(end - length, end, device=rows.device) % self._capacity
+                    packed.append(rows[row].index_select(0, indices))
+            if packed:
+                fields[field] = torch.cat(packed)
+            else:
+                block = self._pool.block(field, self._pool_layer[layer])
+                fields[field] = block.new_empty((0, *block.shape[2:]))
         device = next(iter(fields.values())).device
         return Reached(fields, row_offsets=torch.tensor(offsets, dtype=torch.int32, device=device))
 
@@ -2648,8 +2670,6 @@ class DenseWindowStorage(Storage):
         for array in arrays:
             if len(array.reads) != 1:
                 raise _no_layout(array, "dense window storage needs exactly one read per array")
-            if len(array.labels) != 1:
-                raise _no_layout(array, "dense window storage currently holds one label per array")
             key, read = next(iter(array.reads.items()))
             if read.layers is not None and read.layers != array.layers:
                 raise _no_layout(array, "dense window read must cover all layers")
@@ -2664,7 +2684,7 @@ class DenseWindowStorage(Storage):
                 resource_key=array.name, nodes=array.nodes,
                 episode_lifetime=array.lifetime == "episode",
                 config=RecurrentStateConfig(num_layers=len(array.layers), blocks=blocks,
-                                            max_slots=2, labels=tuple(sorted(array.labels))),
+                                            max_slots=len(array.labels) + 1, labels=tuple(sorted(array.labels))),
             )]
             resolved.bound[array.name] = ()
             resolved.resource_of[key] = array.name
