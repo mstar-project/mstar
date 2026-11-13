@@ -2328,9 +2328,12 @@ plan, named by joining the labels with ``+``, which a declared label can't hold.
 covers every segment in segment order: ``at_last_token(h, x)`` gives each (row, label)'s last
 token in that order, and ``at_last_token(h, x, label=L)`` label ``L``'s rows in row order. On
 an array that keeps entries a row has one segment per label a step. A Value takes one label a
-step, and a cross read's queries come from one label. Chatterbox's guided T3 steps and BAGEL's
-guided text steps and denoise are the examples: Chatterbox combines its guidance from every
-(row, label)'s last token, and BAGEL samples from ``label="main"``.
+step, and a cross read's queries come from one label. The one plan is for every array on KV
+pages, so a step that packs labels on one paged array lists the node's other paged arrays on
+the same labels, and the engine refuses a step that lists one on other labels. Chatterbox's
+guided T3 steps and BAGEL's guided text steps and denoise are the examples: Chatterbox
+combines its guidance from every (row, label)'s last token, and BAGEL samples from
+``label="main"``.
 
 **Writing K/V yourself.** A layer that hasn't moved and writes its K/V inside a fused kernel
 of its own, rather than through ``write_kv``, asks the KV resource where the step's tokens go:
