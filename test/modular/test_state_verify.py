@@ -15,15 +15,22 @@ sys.path.insert(0, ".")
 sys.path.insert(0, "test/modular")
 
 import pytest
+import test_kv_host_index as host
 import torch
+from test_kv_preemption import _offload, _preempt, _running
+from test_kv_preemption import _pool as _preemption_pool
+from test_kv_preemption import _step as _pool_step
+from test_kv_prefix_lease import NODE, PAGE_SIZE
+from test_resident_delta import _admits, _ingest, _pool_rank, _rebuilds_none
 from test_state_declaration_checks import _StubModel
 
-from mstar.engine.resources import Segment, StepContext
+from mstar.engine.resources import Residency, Segment, StepContext
 from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.config import KVStep, PagedKVConfig
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.position.config import PositionConfig, PositionStep
 from mstar.engine.resources.position.manager import RopeManager
+from mstar.engine.resources.runner import StepRunner
 from mstar.engine.resources.step import BucketKey, SlotLease, SubmoduleStep
 from mstar.engine.state import (
     Array,
@@ -403,6 +410,11 @@ def _stored(kv, rid="a"):
     return kv._streams[rid]["main"].stored_len
 
 
+def _hosted(kv, rid="a"):
+    (group,) = kv._cpu_pool.offloaded[rid]["main"].groups
+    return group.stored_len
+
+
 def test_a_count_is_applied_at_the_next_admit(_kv):
     _grow(_kv, SPAN)
     _kv.defer_correct_len("a", "main", _Count(-2))
@@ -430,6 +442,69 @@ def test_a_victim_s_count_is_applied_before_its_offload_or_drop(_kv):
     assert _stored(_kv, "a") == SPAN, "an offload copies the stream at its settled length"
     _kv.check_drop("b", SPAN + 1)
     assert _stored(_kv, "b") == SPAN + 1, "a drop is checked against the settled length"
+
+
+def _runner_step(*spans, preplan=False) -> SubmoduleStep:
+    segments = tuple(Segment(rid, "main", span) for rid, span in zip("ab", spans, strict=False))
+    step = SubmoduleStep(
+        segments=list(segments), steps={"kv": KVStep(segments=segments), "rope": PositionStep(segments=segments)},
+    )
+    step.set_ctx(StepContext(
+        request_ids=tuple("ab"[:len(spans)]), graph_walk="decode", slot=0, capture=False, is_preplan=preplan,
+    ))
+    return step
+
+
+@pytest.mark.parametrize("admit", ["admit", "pre_admit"])
+def test_a_count_is_applied_at_the_runner_s_admit_and_pre_admit(_kv, admit):
+    rope = RopeManager(PositionConfig(kv_cache="kv"), torch.device("cpu"))
+    runner = StepRunner({"kv": _kv, "rope": rope})
+    for rid in "ab":
+        rope.ingest_request(rid)
+    step = _runner_step(SPAN, SPAN)
+    assert runner.admit(step).ok
+    runner.plan(step)
+    runner.commit(step)
+    for resource in (_kv, rope):
+        resource.defer_correct_len("a", "main", _Count(-2))
+    assert getattr(runner, admit)(_runner_step(1, preplan=admit == "pre_admit")).ok
+    assert (_stored(_kv), rope._counters["a"]["main"]) == (SPAN - 2, SPAN - 2), (
+        "the next step would be planned past the tokens the verify step rejected"
+    )
+
+
+def test_a_tp_follower_applies_the_count_before_it_replays_rank_0_s_offload(monkeypatch):
+    """A follower moves a request to the host only when it replays rank 0's journal, in `apply_resident_delta`."""
+    (leader, lead), (follower, follow) = _pool_rank(monkeypatch, 0), _pool_rank(monkeypatch, 1)
+    leader._cpu_pool, follower._cpu_pool = host._HostPool(64), host._HostPool(64)
+    _ingest((leader, follower), "a", 2, arrival=1)
+    assert _admits(leader, "a")
+    assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
+    for kv in (leader, follower):
+        assert _pool_step(kv, "a", 2 * PAGE_SIZE).ok and _pool_step(kv, "a", SPAN).ok
+        kv.defer_correct_len("a", "main", _Count(-2))
+    lead.offload_request(NODE, "a")
+    assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
+    assert follower.residency("a") is Residency.ON_HOST
+    assert _hosted(follower) == _hosted(leader) == 2 * PAGE_SIZE + SPAN - 2, (
+        "the follower's host copy would keep the rejected tokens rank 0's dropped"
+    )
+
+
+def test_a_guaranteed_request_s_victim_gets_its_count_before_it_moves_to_the_host(monkeypatch):
+    """A guaranteed request takes back the pages it lent by moving the preemptible request that borrowed them, older
+    or not."""
+    monkeypatch.setattr(manager_mod, "KVTransferManager", _StubTransferManager)
+    kv = _preemption_pool()
+    kv._cpu_pool = host._HostPool(64)
+    _running(kv, "o", 3, arrival=0)
+    _running(kv, "g", 1, arrival=1, guaranteed=True)
+    assert _pool_step(kv, "o", 3 * PAGE_SIZE).ok
+    short = _pool_step(kv, "g", 4 * PAGE_SIZE).reason.pages_short
+    kv.defer_correct_len("o", "main", _Count(-2))
+    assert _preempt(kv, "g", short, droppable=lambda rid: True).to_host == ["o"]
+    _offload(kv, "o")
+    assert _hosted(kv, "o") == 6 * PAGE_SIZE - 2, "the take-back moved o to the host with its rejected tokens"
 
 
 def test_a_removed_or_reset_request_leaves_no_count(_kv):
