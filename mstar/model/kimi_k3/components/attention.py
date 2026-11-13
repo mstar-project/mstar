@@ -203,4 +203,4 @@ class KimiMLAAttention(MLAAttention):
         """Write this step's latents, then sparse absorbed MLA over the selected slots."""
         layer = self.cache_layer_idx
         self._kv.write_kv(latent, None, layer_idx=layer, **self._label)
-        return self._dsa.attend(layer, q_nope, q_pe, selection, self.softmax_scale, label=LABEL)
+        return self._dsa.attend(layer, q_nope, q_pe, selection, label=LABEL)

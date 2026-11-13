@@ -46,3 +46,20 @@ class KimiK3Tokenizer:
         as ``skip_special_tokens`` would."""
         ids = [i for i in ids if i < _FIRST_SPECIAL_ID or i in self._kept]
         return self._tok.model.decode_bytes(ids)
+
+
+class KimiK3Detokenizer:
+    """``Model.text_output``'s detokenizer over ``KimiK3Tokenizer.decode_bytes``: bytes per token."""
+
+    def __init__(self, tokenizer: KimiK3Tokenizer):
+        self._tokenizer = tokenizer
+        self._token_bytes: dict[int, bytes] = {}
+
+    def to_bytes(self, token_ids: list[int]) -> bytes:
+        return self._tokenizer.decode_bytes(token_ids)
+
+    def token_bytes(self, token_id: int) -> bytes:
+        data = self._token_bytes.get(token_id)
+        if data is None:
+            data = self._token_bytes[token_id] = self._tokenizer.decode_bytes([token_id])
+        return data

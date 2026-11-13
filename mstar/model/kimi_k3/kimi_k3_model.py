@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+from functools import cached_property
 from pathlib import Path
 
 import torch
@@ -57,7 +58,7 @@ from mstar.model.kimi_k3.config import (
 )
 from mstar.model.multimodal import TEXT, PromptPart, chat_turns
 from mstar.model.submodule_base import NodeSubmodule
-from mstar.model.utils import check_loaded, process_weights_after_loading
+from mstar.model.utils import ByteIdDetokenizer, TextOutput, check_loaded, process_weights_after_loading
 from mstar.utils.generation_kwargs import normalize_generation_kwargs
 
 logger = logging.getLogger(__name__)
@@ -429,14 +430,20 @@ class KimiK3Model(Model):
             return self.max_decode_steps() + 1
         return min(budget, self.config.context_limit)
 
-    def postprocess(self, output: torch.Tensor, modality: str, **kwargs) -> bytes:
-        if modality != "text":
-            raise ValueError(f"Kimi K3 emits text only, got {modality!r}")
-        token_ids = [int(t) for t in output.flatten().tolist()]
+    @cached_property
+    def _text_output(self) -> TextOutput:
         if self._tokenizer_mode == "byte":
-            return bytes(t & 0xFF for t in token_ids)
-        # raw bytes: a character split across tokens reaches the client whole
-        return self.tokenizer.decode_bytes(token_ids)
+            detokenizer = ByteIdDetokenizer()
+        else:
+            from mstar.model.kimi_k3.tokenizer import KimiK3Detokenizer
+
+            detokenizer = KimiK3Detokenizer(self.tokenizer)
+        return TextOutput(detokenizer, frozenset(self.config.eos_token_ids))
+
+    def text_output(self) -> TextOutput:
+        """Each token's raw bytes, so a character split across tokens reaches the client whole; the
+        config's stop ids end a reply."""
+        return self._text_output
 
     # -- sharding, quantization, submodules ------------------------------------------------
 
@@ -464,7 +471,7 @@ class KimiK3Model(Model):
 
     def get_submodule(
         self, node_name: str, device: str = "cpu", tp_group=None,
-        autocast_dtype: torch.dtype | None = None, sp_group=None,
+        autocast_dtype: torch.dtype | None = None,
     ) -> NodeSubmodule | None:
         if node_name not in self._submodule_cache:
             self._submodule_cache[node_name] = self._create_submodule(
