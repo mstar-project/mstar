@@ -117,15 +117,15 @@ def reference_kernels() -> types.ModuleType:
 _REFERENCE_MODULES = ("engram", "image_processor", "vision", "model", "convert")
 
 
-def load_reference(snapshot_dir: str | Path) -> types.SimpleNamespace:
+def load_reference(snapshot_dir: str | Path, kernels: types.ModuleType | None = None) -> types.SimpleNamespace:
     """The checkpoint snapshot's ``inference/`` modules (``model``, ``engram``, ``convert``...),
-    with ``kernel`` replaced by ``reference_kernels``. They import each other by bare names
-    (``kernel``, ``vision``...) that other packages in one test process may own, so those names
-    are put back once the imports are done."""
+    with ``kernel`` replaced by ``reference_kernels``, or by ``kernels`` (the reference's own,
+    on a GPU). They import each other by bare names (``kernel``, ``vision``...) that other
+    packages in one test process may own, so those names are put back once the imports are done."""
     inference = Path(snapshot_dir) / "inference"
     names = ("kernel", *_REFERENCE_MODULES)
     saved = {name: sys.modules.get(name) for name in names}
-    loaded: dict[str, types.ModuleType] = {"kernel": reference_kernels()}
+    loaded: dict[str, types.ModuleType] = {"kernel": kernels or reference_kernels()}
     try:
         sys.modules["kernel"] = loaded["kernel"]
         for name in _REFERENCE_MODULES:
@@ -381,9 +381,11 @@ def patch_cpu_engine(monkeypatch) -> None:
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
 
 
-def cpu_engine(path: str | Path, dtype: torch.dtype, **model_kwargs):
-    """M*'s model on the snapshot ``path``, loaded as a server loads it, in a CPU ``Engine``
-    whose sampler is a ``RecordingSampler``. Returns ``(engine, sampler, model)``."""
+def build_engine(path: str | Path, dtype: torch.dtype, device: str = "cpu", tp_group=None,
+                 parallel_groups=None, **model_kwargs):
+    """M*'s model on the snapshot ``path``, loaded as a server loads it, in an ``Engine`` on
+    ``device`` whose sampler is a ``RecordingSampler``. ``tp_group`` and ``parallel_groups``
+    make it one rank of a tensor-parallel node. Returns ``(engine, sampler, model)``."""
     from mstar.communication.tensors import LocalTransferEngine
     from mstar.distributed.communication import WorkerParallelGroups
     from mstar.engine.engine import Engine
@@ -394,14 +396,17 @@ def cpu_engine(path: str | Path, dtype: torch.dtype, **model_kwargs):
 
     model_kwargs = {"max_seq_len": 256, "max_requests": 4, "moe_fp8_resident": False, **model_kwargs}
     model = DeepseekV41Model(str(path), **model_kwargs)
-    sub = model.get_submodule("LLM", device="cpu", autocast_dtype=dtype)
+    sub = model.get_submodule("LLM", device=device, tp_group=tp_group, autocast_dtype=dtype)
     engine = Engine(None, autocast_dtype=None)
+    if parallel_groups is None:
+        parallel_groups = WorkerParallelGroups(num_workers=1, global_rank=0)
     engine.load_model(
         {"LLM": sub}, model.get_node_resources(),
-        parallel_groups=WorkerParallelGroups(num_workers=1, global_rank=0),
-        device=torch.device("cpu"),
+        parallel_groups=parallel_groups,
+        device=torch.device(device),
         transfer_engine_info=TransferEngineInfo(
-            my_entity_id="e", my_session_id="s", transfer_engine=LocalTransferEngine("localhost")),
+            my_entity_id=f"e{parallel_groups.global_rank}", my_session_id="s",
+            transfer_engine=LocalTransferEngine("localhost")),
         kv_cache_type=dtype,
     )
     sampler = type("Sampler", (RecordingSampler, StubResource), {})()
@@ -410,6 +415,47 @@ def cpu_engine(path: str | Path, dtype: torch.dtype, **model_kwargs):
     sub.node_resources[SAMPLER] = sampler
     engine.warmup()
     return engine, sampler, model
+
+
+def cpu_engine(path: str | Path, dtype: torch.dtype, **model_kwargs):
+    """``build_engine`` on CPU, one rank."""
+    return build_engine(path, dtype, **model_kwargs)
+
+
+def gloo_tp_rank(rank: int, world_size: int, store: str):
+    """This process as rank ``rank`` of a ``world_size``-rank tensor-parallel "LLM" node over
+    gloo, for a CPU test that spawns the ranks: ``(tp_group, parallel_groups)`` for
+    ``build_engine``. The caller ends with ``close_gloo_tp_rank``."""
+    import datetime
+
+    import torch.distributed as dist
+
+    from mstar.distributed.all_reduce import AllReduce
+    from mstar.distributed.communication import CommGroup, WorkerParallelGroups
+    from mstar.engine.resources.kv import manager as kv_manager
+
+    dist.init_process_group("gloo", init_method=f"file://{store}", rank=rank, world_size=world_size,
+                            timeout=datetime.timedelta(seconds=120))
+    kv_manager.KVTransferManager = StubTransfer
+    torch.cuda.is_available = lambda: False
+    members = list(range(world_size))
+    group = CommGroup(my_global_rank=rank, my_group_rank=rank, group_members=members)
+    group.device_group = group.cpu_group = dist.new_group(members)
+    group.initialized = True
+    group._all_reduce = AllReduce()
+    groups = WorkerParallelGroups(num_workers=world_size, global_rank=rank, any_parallelism=True)
+    groups.add("LLM", group, "tp")
+    groups.node_to_instance_comm["LLM"] = group
+    return group, groups
+
+
+def close_gloo_tp_rank(group) -> None:
+    """Drop the group's collectives before the process ends: gloo's threads release a
+    collective's tensors under the GIL."""
+    import torch.distributed as dist
+
+    group.device_group = group.cpu_group = group._all_reduce = None
+    dist.destroy_process_group()
 
 
 def add_request(engine, rid: str) -> None:
