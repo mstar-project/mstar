@@ -45,6 +45,7 @@ from mstar.model.minimax_h3.components.layout import (
 from mstar.model.minimax_h3.components.transformer import (
     H3Inputs,
     H3StepLayout,
+    RopeTable,
     rope_inv_freq,
     rope_table,
 )
@@ -272,13 +273,14 @@ class H3PackedDenoise(DenoiseLoopSubmodule):
     float32_matmul_precision = "highest"
 
     def __init__(self, transformer: nn.Module, config, *, loop_name: str, max_batch_size: int = 1,
-                 compile_blocks: bool = False, row_bucket: int = 1):
+                 compile_blocks: bool = False, row_bucket: int = 1, capture_buckets=()):
         if max_batch_size != 1:
             # a batch's rows would have to agree on the step's first-step decisions (denoise)
             raise ValueError(f"the MiniMax-H3 dit runs one request per step; got max_batch_size={max_batch_size}")
         if int(row_bucket) < 1:
             raise ValueError(f"row_bucket must be a positive int; got {row_bucket!r}")
-        super().__init__(loop_name=loop_name, max_batch_size=1)
+        super().__init__(loop_name=loop_name, max_batch_size=1, capture_buckets=capture_buckets,
+                         capture_batch_sizes=(1,))
         self.transformer = transformer
         self.config = config
         self.compiled = bool(compile_blocks)
@@ -317,8 +319,17 @@ class H3PackedDenoise(DenoiseLoopSubmodule):
     def step_layout(self, bucket_key, positions: torch.Tensor, classes: torch.Tensor, tags: torch.Tensor,
                     device) -> H3StepLayout:
         """The bucket's per-row tensors on ``device`` from its rows' ``[S, 3]`` float64 positions,
-        timestep classes and modality tags, padded to :meth:`padded_rows`."""
+        timestep classes and modality tags, padded to :meth:`padded_rows`; under
+        ``LAYOUT_FROM_INPUTS`` also each row's source (``H3StepLayout.row_source``), the prompt
+        padded to the row bucket's capacity (:meth:`padded_prompt`)."""
         pad = self.padded_rows(bucket_key) - bucket_key.total_rows
+        sources = video_rows = None
+        if self.LAYOUT_FROM_INPUTS:
+            text, video = bucket_key.text_len, bucket_key.total_rows - bucket_key.text_len
+            # a padding row reads the prompt's first zero row, there whenever there is padding
+            sources = torch.cat([torch.arange(text), torch.arange(text + pad, text + pad + video),
+                                 torch.full((pad,), text)]).to(device)
+            video_rows = torch.arange(text, text + video).to(device)
 
         def padded(rows: torch.Tensor) -> torch.Tensor:
             # a padding row sits at position 0 (rope cos 1, sin 0) on AdaLN table row 0
@@ -333,8 +344,32 @@ class H3PackedDenoise(DenoiseLoopSubmodule):
             rope=rope, row_index=(classes * NUM_MODALITIES + tags).to(device), row_class=classes.to(device),
             no_class=torch.zeros_like(classes).to(device), tags=tags.to(device), text_len=bucket_key.text_len,
             num_condition_rows=bucket_key.num_condition_rows, num_audio_rows=bucket_key.num_audio_rows,
-            num_pad_rows=pad,
+            num_pad_rows=pad, row_source=sources, video_rows=video_rows,
         )
+
+    # ``LAYOUT_FROM_INPUTS``: the H3StepLayout tensors a step carries as inputs, so a graph that
+    # replays several prompt lengths reads each step's own from its staged buffers
+    LAYOUT_INPUTS = ("row_index", "row_class", "no_class", "tags", "row_source", "video_rows")
+
+    def padded_prompt(self, text: torch.Tensor, bucket_key) -> torch.Tensor:
+        """The prompt's rows ``[L, hidden]`` padded with zero rows to the row bucket's capacity,
+        one shape for every prompt length the bucket holds."""
+        pad = self.padded_rows(bucket_key) - bucket_key.total_rows
+        return torch.nn.functional.pad(text, (0, 0, 0, pad))
+
+    def layout_inputs(self, bucket_key, device) -> dict[str, torch.Tensor]:
+        """The bucket's layout as step inputs (:meth:`staged_layout` reads them back)."""
+        layout = self.layout(bucket_key, device)
+        return {"layout_rope_cos": layout.rope.cos, "layout_rope_sin": layout.rope.sin,
+                **{f"layout_{name}": getattr(layout, name) for name in self.LAYOUT_INPUTS}}
+
+    def staged_layout(self, bucket_key, inputs: dict[str, torch.Tensor], device) -> H3StepLayout:
+        """The step's layout from the inputs :meth:`layout_inputs` gave it, removed from ``inputs``
+        (a batch shares one key, so its first row's). Captured, these are the replay's own;
+        the key's layout only supplies what every key of the graph shares."""
+        shared = self.layout(bucket_key, device)
+        rope = RopeTable(inputs.pop("layout_rope_cos")[0], inputs.pop("layout_rope_sin")[0], shared.rope.rotary_dim)
+        return shared._replace(rope=rope, **{name: inputs.pop(f"layout_{name}")[0] for name in self.LAYOUT_INPUTS})
 
 
 class H3DenoiseSubmodule(H3PackedDenoise):

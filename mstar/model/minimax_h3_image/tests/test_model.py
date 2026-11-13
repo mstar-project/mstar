@@ -10,11 +10,12 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
+from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.graph.base import GraphNode, Loop, Parallel, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.minimax_h3.components.layout import patchify_video
 from mstar.model.minimax_h3.components.transformer import H3DiT, H3Inputs
-from mstar.model.minimax_h3.config import DENOISE_LOOP, TEXT_TAG, VIDEO_TAG
+from mstar.model.minimax_h3.config import DENOISE_LOOP, DIT_ROWS, TEXT_TAG, VIDEO_TAG
 from mstar.model.minimax_h3.submodules import (
     COND_LATENTS,
     LATENTS,
@@ -49,6 +50,7 @@ from mstar.model.minimax_h3_image.submodules import (
     h3_image_schedule,
     layout_from_metadata,
 )
+from mstar.model.submodule_base import NodeInputs
 
 TINY = H3ImageConfig(transformer=dataclasses.replace(CFG, audio_enabled=False, num_output_heads=3),
                      sigmas=(1.0, 0.75, 0.5, 0.0))
@@ -174,6 +176,70 @@ def test_dit_without_audio_runs_the_step_head():
         heads.weight.data, heads.bias.data = swapped
         again = dit(inputs, step, head=torch.tensor([0]))[0]
     assert torch.equal(again, outs[1]) and not torch.equal(outs[0], outs[1])
+
+
+# an 8 x 12 latent is 24 image rows: at a 32-row bucket, prompts of 9 to 40 rows pad to 64 rows
+ROW_BUCKET_KEY = H3ImageLayout(text_len=40, latent_height=8, latent_width=12)
+
+
+def test_a_row_bucket_is_one_graph_key_and_the_capture_lists_each_bucket():
+    sub = H3ImageDenoiseSubmodule(None, TINY, loop_name=DENOISE_LOOP, row_bucket=32)
+    keys = {sub.graph_key(dataclasses.replace(ROW_BUCKET_KEY, text_len=n)) for n in range(9, 41)}
+    assert keys == {ROW_BUCKET_KEY}
+    assert sub.graph_key(dataclasses.replace(ROW_BUCKET_KEY, text_len=41)).text_len == 72
+    # 1024² at compile's 256-row bucket: one graph a bucket of prompts up to 512 rows, each its own key
+    model = _model(compile=True, capture_sizes=[[1024, 1024]])
+    captured = model.capture_buckets()
+    assert captured == [(GENERATE_WALK, H3ImageLayout(256, 64, 64)), (GENERATE_WALK, H3ImageLayout(512, 64, 64))]
+    at_256 = H3ImageDenoiseSubmodule(None, TINY, loop_name=DENOISE_LOOP, row_bucket=256)
+    assert all(at_256.graph_key(key) == key for _, key in captured)
+    with pytest.raises(ValueError, match="row_bucket"):
+        _model(capture_sizes=[[1024, 1024]])  # eager: one bucket a prompt length
+    edit = dataclasses.replace(ROW_BUCKET_KEY, references=((8, 12),))
+    with pytest.raises(ValueError, match="text-to-image"):
+        H3ImageDenoiseSubmodule(None, TINY, loop_name=DENOISE_LOOP, capture_buckets=[(GENERATE_EDIT_WALK, edit)])
+
+
+def test_a_steps_spans_are_its_requests_own_under_a_graph_of_its_row_bucket():
+    """A pre-plan declares over the graph's template row (the bucket's longest prompt): the step still lays out
+    the request's rows and their padding, keys its graph by the row bucket, and leaves the attention's layout
+    to each replay."""
+    sub = H3ImageDenoiseSubmodule(None, TINY, loop_name=DENOISE_LOOP, row_bucket=32)
+    meta = {"text_len": 13, "latent_height": 8, "latent_width": 12}
+    info = CurrentForwardPassInfo(request_id="r", graph_walk=GENERATE_WALK, fwd_index=0, random_seed=0,
+                                  max_tokens=1, rid_handle=0, step_metadata=meta)
+    template = NodeInputs(resource_step_info=ROW_BUCKET_KEY)
+    for per_request_info in ({0: info}, None):
+        step = sub.declare_step(GENERATE_WALK, [0], [template], per_request_info=per_request_info)
+        spans = [seg.span for seg in step.state[DIT_ROWS].segments]
+        assert spans == ([37, 27] if per_request_info else [64])
+        assert step.cg_key_info == ROW_BUCKET_KEY and not step.state[DIT_ROWS].fixed_layout
+    assert sub.cg_key_info(GENERATE_WALK, {0: info}) == ROW_BUCKET_KEY
+
+
+def test_rows_read_by_source_are_the_packed_rows_bit_for_bit():
+    """The step's rows built from the padded prompt and each row's source, and its velocity read from the video
+    rows' packed rows, at every prompt length of one row bucket (the bucket filled too): the packed forward's."""
+    torch.manual_seed(0)
+    cfg = TINY.transformer
+    dit = H3DiT(cfg).float()
+    for p in dit.parameters():
+        torch.nn.init.normal_(p, std=0.1)
+    sub = H3ImageDenoiseSubmodule(dit, TINY, loop_name=DENOISE_LOOP, row_bucket=32)
+    for text_len in (9, 13, 40):
+        key = dataclasses.replace(ROW_BUCKET_KEY, text_len=text_len)
+        sourced = sub.build_layout(key, "cpu")
+        assert sourced.num_rows == 64
+        packed = sourced._replace(row_source=None, video_rows=None)
+        text = torch.randn(text_len, cfg.hidden_size)
+        video = torch.randn(1, key.num_video_rows, cfg.patch_dim)
+        timesteps = torch.tensor([[0.25]])
+        with torch.no_grad():
+            want, _ = dit(H3Inputs(video=video, audio=None, text=text[None], timesteps=timesteps), packed,
+                          head=torch.tensor([1]))
+            got, _ = dit(H3Inputs(video=video, audio=None, text=sub.padded_prompt(text, key)[None],
+                                  timesteps=timesteps), sourced, head=torch.tensor([1]))
+        assert torch.equal(got, want), text_len
 
 
 def test_the_dits_attention_settings():
