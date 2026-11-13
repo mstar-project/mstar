@@ -919,6 +919,9 @@ class KVSpec(NodeResourceSpec):
         # stored by position, a split step's packed tokens are gathered or passed round; stored by
         # head, they trade for heads over every TP and SP rank (Ulysses)
         cfg = self.config
+        if isinstance(cfg, RingKVConfig):
+            return [f"KV {self.resource_key!r} is a ring, which takes no split steps, so node {node!r} can't split "
+                    "them: run it on TP ranks alone"]
         if not isinstance(cfg, PagedKVConfig):
             return []
         if cfg.context_parallel:

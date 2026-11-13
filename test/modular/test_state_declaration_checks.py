@@ -228,12 +228,6 @@ def test_a_sequence_shard_lists_rows_walks_and_labels_its_arrays_open(shard, pro
     assert _one_problem(_array(), declared, combined={"LLM": {"mixed": {"prefill", "decode"}}}).startswith(problem)
 
 
-def test_a_sequence_shard_lists_one_label_since_its_handle_brackets_one():
-    declared = SeqShard("shard", nodes={"LLM"}, labels={"main", "cfg"})
-    problem = _one_problem(_array(labels={"main", "cfg"}), declared)
-    assert problem.startswith("SeqShard 'shard'.labels: ['cfg', 'main'] are several")
-
-
 def test_a_sequence_shard_cuts_its_label_on_one_axis():
     # rows of one span split each row alike (axis 1), packed tokens contiguously (axis 0): one tensor can't take both
     rows = _array("rows", max_len=0, reads={"rows_attn": _read(mask=Block(), packed=False)})

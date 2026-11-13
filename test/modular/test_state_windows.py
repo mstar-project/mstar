@@ -384,13 +384,13 @@ def _text_pool(**config) -> KVSpec:
 def test_the_engine_refuses_a_ring_on_sp_ranks():
     """A ring declares nothing about sequence parallelism and refuses nothing about it. Alone on SP ranks, its node
     is refused as any node that neither splits its steps nor places a pool. Beside a pool whose attention takes
-    split steps, a shard splits the node's steps, and the engine's build refuses the ring by name."""
+    split steps, a shard splits the node's steps, and the ring's spec refuses them by name."""
     with pytest.raises(ValueError, match="node 'dit' runs on 2 SP ranks but neither splits tokens"):
         _load_on_sp_ranks([build_specs([_ring_array()])[0]])
     attention = AttentionSpec(resource_key="text_attn", nodes={"dit"},
                               config=AttentionConfig("text_kv", backend=AttnBackend.FLASHINFER))
-    with pytest.raises(ValueError, match=r"resource 'kv' \(RingKVManager\) does not support steps split over SP "
-                                         r"ranks, and node 'dit' splits them"):
+    with pytest.raises(ValueError, match=r"KV 'kv' is a ring, which takes no split steps, so node 'dit' can't split "
+                                         r"them"):
         _load_on_sp_ranks([
             build_specs([_ring_array()])[0], _text_pool(), attention, SeqShardSpec("shard", {"dit"}, ("main",), 0),
         ])

@@ -20,6 +20,7 @@ from mstar.engine.resources.step import ResourceStep
 
 if TYPE_CHECKING:
     from mstar.engine.resources.base import Resource
+    from mstar.engine.resources.sequence_shard import SeqShardSpec
 
 
 class SinkWindow(NamedTuple):
@@ -116,6 +117,12 @@ class BoundedKVSpec(NodeResourceSpec):
         from mstar.engine.resources.kv.bounded.manager import BoundedKVManager
 
         return BoundedKVManager
+
+    def split_step_refusals(
+        self, node: str, shard: "SeqShardSpec", tp: int, sp: int, specs: Mapping[str, NodeResourceSpec],
+    ) -> list[str]:
+        return [f"bounded KV {self.resource_key!r} takes no split steps, so node {node!r} can't split them: run it on "
+                "TP ranks alone"]
 
     def apply_yaml_overrides(self, max_slots: int | None = None):
         if max_slots is not None:

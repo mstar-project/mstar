@@ -340,7 +340,8 @@ class SamplerHandle(StepHandle):
 class ShardHandle(StepHandle):
     """A node's calls on its declared `SeqShard`. Its step is the node's segments, so the engine opens it on every
     step of the node, with no entry in ``state``. It takes the label it brackets from the step's segments, as the
-    array handles do, and the walk from the step, so a compiled frame of a walk the shard never splits traces the
+    array handles do: the one of its labels they open, or the step's combined label over several. The walk comes from
+    the step, so a compiled frame of a walk the shard never splits traces the
     bracket straight through. Closed, it holds neither, and the bracket is the resource's outside a step: the
     identity."""
 
@@ -363,8 +364,14 @@ class ShardHandle(StepHandle):
         return self.resource.can_split
 
     def begin_step(self, step) -> None:
-        (label,) = self.shard.labels  # analysis refuses a shard of several
-        self.label = label if any(segment.label == label for segment in step.segments or ()) else None
+        opened = list(dict.fromkeys(s.label for s in step.segments or () if s.label in self.shard.labels))
+        self.label = opened[0] if opened else None
+        if len(opened) > 1:
+            combined = step.combined_labels.items()
+            self.label = next((name for labels, name in combined if set(opened) <= set(labels)), None)
+            if self.label is None:
+                raise ValueError(f"SeqShard {self.name!r}: no layout yet: a step opens its labels {opened} in plans of "
+                                 "their own, and the shard brackets one plan a step")
         self.walk = step.ctx.graph_walk
 
     def check_step(self, step) -> None:

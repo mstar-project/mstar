@@ -271,11 +271,9 @@ def _shard_problems(
     shard: SeqShard, arrays: Sequence[Array], walks: Mapping[str, set[str]], combined: set[str],
 ) -> list[str]:
     """``walks`` are rows' walks, as a read's are, and ``labels`` those an array on the shard's nodes opens: a label
-    nothing opens would never split, and nothing would say so. The shard's handle brackets one label."""
+    nothing opens would never split, and nothing would say so."""
     where = f"SeqShard {shard.name!r}"
     problems: list[str] = []
-    if len(shard.labels) > 1:
-        problems.append(f"{where}.labels: {sorted(shard.labels)} are several, and the handle brackets one")
     for walk in sorted(shard.walks or ()):
         if walk in combined:
             problems.append(f"{where}.walks: {walk!r} is a combined walk; list the walks it combines, and it splits "
@@ -394,15 +392,22 @@ def split_read_problems(
     """What a read within a step asks of a node on SP ranks that no exchange serves, where ``split`` gives, per such
     node, the labels its sequence shard lists: SDPA (``sdpa_reads``, the reads a ``backend: sdpa`` block binds) over
     split keys, which runs outside the engine's resources and so would attend one rank's share, and a cross read whose
-    queries split as well as its keys. The engine refuses these at load and ``validate_deployment`` reports them, both
-    from the declarations, so neither waits for a step that splits."""
+    queries split as well as its keys, and a kept array's read with no op, which gathers its reach from this rank's
+    pages. The engine refuses these at load and ``validate_deployment`` reports them, both from the declarations, so
+    none waits for a step that splits."""
     arrays = {declared.name: declared for declared in declarations if isinstance(declared, Array)}
     problems = []
     for array in arrays.values():
-        if array.max_len:
-            continue
         nodes = [node for node in sorted(array.nodes) if array.labels & set(split.get(node, ()))]
         if not nodes:
+            continue
+        if array.max_len:
+            problems += [
+                f"Array {array.name!r}.reads[{key!r}]: a read with no op gathers its reach from this rank's pages, "
+                f"which hold one rank's share of labels {sorted(array.labels)} where the sequence shard of {nodes} "
+                "splits them over SP ranks; run the node on one SP rank"
+                for key, read in array.reads.items() if read.op is None
+            ]
             continue
         for key, read in array.reads.items():
             queries = query_array(array, read, arrays)
