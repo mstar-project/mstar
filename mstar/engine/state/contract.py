@@ -121,16 +121,25 @@ class ChunkCausal(Mask):
 
     Every query sees the global prefix. Global queries see nothing else. A clean query in chunk ``c`` sees clean
     chunks through ``c``; a noised query sees its own noised chunk and clean chunks before ``c``. A query sees no
-    tokens from another request. The stream lengths and chunk size come from the step, not this declaration.
+    tokens from another request. The fixed chunk size is declared here; the request gives each read's stream lengths
+    in ``Layout.chunk_causal``.
     """
+
+    uses_query_position = True
+    sees_step_whole = True
+
+    chunk_len: int
+
+    def __post_init__(self):
+        if not _is_positive(self.chunk_len):
+            raise ValueError(f"ChunkCausal.chunk_len must be a positive int, got {self.chunk_len!r}")
 
 
 @dataclass(frozen=True, kw_only=True)
 class ChunkCausalLayout:
-    """One request's token lengths for a ``ChunkCausal`` read in this step."""
+    """One request's stream lengths for one ``ChunkCausal`` read."""
 
     global_len: int
-    chunk_len: int
     noised_len: int
     clean_len: int = 0
 
@@ -139,23 +148,10 @@ class ChunkCausalLayout:
             value = getattr(self, name)
             if type(value) is not int or value < 0:
                 raise ValueError(f"ChunkCausalLayout.{name} must be an int >= 0, got {value!r}")
-        if not _is_positive(self.chunk_len):
-            raise ValueError(f"ChunkCausalLayout.chunk_len must be a positive int, got {self.chunk_len!r}")
 
     @property
     def span(self) -> int:
         return self.global_len + self.noised_len + self.clean_len
-
-
-@dataclass(frozen=True, kw_only=True)
-class ChunkCausalStep:
-    """One layout per request segment, in the same order as the step's segments."""
-
-    layouts: tuple[ChunkCausalLayout, ...]
-
-    def __post_init__(self):
-        if not isinstance(self.layouts, tuple) or not all(isinstance(lay, ChunkCausalLayout) for lay in self.layouts):
-            raise ValueError("ChunkCausalStep.layouts must be a tuple of ChunkCausalLayout values")
 
 
 @dataclass(frozen=True)
@@ -538,21 +534,6 @@ class ArrayStep:
     advance: tuple[int, ...] | None = None         # positions per row; None: the span
     position_ids: torch.Tensor | None = None       # explicit ids, (tokens,) in segment order
     host: Mapping[tuple[int, str, int], Mapping[str, object]] = EMPTY    # (row, label, layer) -> fields, at commit
-    mask_step: ChunkCausalStep | None = None
-
-    def __post_init__(self):
-        if self.mask_step is None:
-            return
-        if not isinstance(self.mask_step, ChunkCausalStep):
-            raise ValueError(f"ArrayStep.mask_step must be a ChunkCausalStep, got {self.mask_step!r}")
-        if self.segments is not None:
-            if len(self.mask_step.layouts) != len(self.segments):
-                raise ValueError(f"ArrayStep.mask_step has {len(self.mask_step.layouts)} layouts for "
-                                 f"{len(self.segments)} segments")
-            for i, (layout, segment) in enumerate(zip(self.mask_step.layouts, self.segments, strict=True)):
-                if layout.span != segment.span:
-                    raise ValueError(f"ArrayStep.mask_step.layouts[{i}].span is {layout.span}, but segment span is "
-                                     f"{segment.span}")
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -588,6 +569,7 @@ class Layout:
     growth: tuple[tuple[str, int], ...] = ()    # (loop, entries per iteration)
     scratch: int = 0                            # most one scratch step writes past the kept length
     kept_windows: Mapping[str, KeptWindow] = EMPTY    # by read key, each kept-window read's sizes
+    chunk_causal: Mapping[str, ChunkCausalLayout] = EMPTY    # by read key, this request's stream lengths
 
 
 @dataclass(frozen=True, kw_only=True)

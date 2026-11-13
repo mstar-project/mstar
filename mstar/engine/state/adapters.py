@@ -24,11 +24,13 @@ from mstar.engine.resources.attn.config import (
     CrossAttentionSpec,
 )
 from mstar.engine.resources.attn.ragged.config import (
+    ChunkCausalLayout as ResourceChunkCausalLayout,
     KeptWindowAttentionSpec,
     RaggedAttentionConfig,
     RaggedAttentionSpec,
     RaggedCrossAttentionSpec,
     RaggedCrossAttentionStep,
+    RaggedChunkCausalAttentionSpec,
     cross_label,
 )
 from mstar.engine.resources.kv.config import (
@@ -80,6 +82,8 @@ from mstar.engine.state.contract import (
     Block,
     Causal,
     CausalConv,
+    ChunkCausal,
+    ChunkCausalLayout,
     Entry,
     FrameWindow,
     GatedDeltaNet,
@@ -581,6 +585,8 @@ def kv_layouts(
                 raise RuntimeError(f"{where}[{name!r}]: labels {sorted(undeclared)} aren't in Array {name!r}.labels")
     converted = {}
     for name, by_label in state_layout.items():
+        for label, layout in by_label.items():
+            _check_chunk_causal_layout(arrays[name], label, layout)
         layouts = storage_of(arrays[name]).layouts(arrays[name], by_label, keyed_spans.get(name, EMPTY))
         if layouts is not None:
             converted[name] = layouts
@@ -589,6 +595,24 @@ def kv_layouts(
         if unlaid:
             raise RuntimeError(f"keyed_spans[{name!r}]: labels {sorted(unlaid)} have no paged layout in state_layout")
     return converted
+
+
+def _check_chunk_causal_layout(array: Array, label: str, layout: Layout) -> None:
+    """Check the read keys in a request's mask layout before within-step layouts leave the KV conversion path."""
+    if not isinstance(layout, Layout):
+        raise RuntimeError(f"state_layout[{array.name!r}][{label!r}] must be a Layout, got {layout!r}")
+    for key, lengths in layout.chunk_causal.items():
+        read = array.reads.get(key)
+        if read is None or not isinstance(read.mask, ChunkCausal):
+            raise RuntimeError(
+                f"state_layout[{array.name!r}][{label!r}].chunk_causal[{key!r}] "
+                "names no ChunkCausal read"
+            )
+        if not isinstance(lengths, ChunkCausalLayout):
+            raise RuntimeError(
+                f"state_layout[{array.name!r}][{label!r}].chunk_causal[{key!r}] "
+                f"must be a ChunkCausalLayout, got {lengths!r}"
+            )
 
 
 def sampling_configs(
@@ -993,8 +1017,29 @@ class RaggedAttend(WithinStepAttend):
     read_back = frozenset({"max_segments_per_request", "max_segments_per_step"})
     plans = True
 
+    def for_mask(self, mask: Mask) -> OpBinding:
+        return CHUNK_CAUSAL_ATTEND if isinstance(mask, ChunkCausal) else super().for_mask(mask)
+
     def attend(self, run: Any, label: str, rows: "RowLayout") -> Callable[..., torch.Tensor]:
         return functools.partial(joint_attention, ragged=functools.partial(run.run, label=label))
+
+
+class ChunkCausalAttend(RaggedAttend):
+    """The cacheless chunk mask on the existing within-step Attend operation."""
+
+    def check(self, array: Array, key: str, read: Read) -> None:
+        if not isinstance(read.mask, ChunkCausal):
+            raise _no_layout(array, f"reads[{key!r}].mask must be ChunkCausal")
+        if read.walks is not None or read.queries is not None:
+            raise _no_layout(array, f"reads[{key!r}] needs own queries in one within-step walk")
+
+
+CHUNK_CAUSAL_ATTEND = ChunkCausalAttend()
+
+
+def chunk_causal_resource_layout(mask: ChunkCausal, layout: ChunkCausalLayout) -> ResourceChunkCausalLayout:
+    """Complete one request's read-keyed stream lengths with the declaration's fixed chunk size."""
+    return ResourceChunkCausalLayout(layout.global_len, mask.chunk_len, layout.noised_len, layout.clean_len)
 
 
 class SdpaAttend(WithinStepAttend):
@@ -1840,6 +1885,18 @@ class OwnQueries(Queries):
         return AttentionStep(segments=segments, causal=False, fixed_layout=fixed)
 
 
+class ChunkCausalQueries(OwnQueries):
+    """The chunk mask's read uses its own queries and a chunk-causal resource."""
+
+    spec_class = RaggedChunkCausalAttentionSpec
+
+    def step(self, segments, pairs: Sequence[tuple[str, str]], fixed: bool) -> Any:
+        raise RuntimeError(
+            "chunk-causal step planning needs each request's read-keyed state_layout; "
+            "the within-step request-layout transport is not bound yet"
+        )
+
+
 class CrossQueries(OtherArrayQueries, Queries):
     """A read within a step whose queries are another array's, on a ragged cross resource."""
 
@@ -2347,7 +2404,11 @@ class WithinStepStorage(Storage):
             bound, heads, head_dim, dtype = _within_step_read(array, setup)
             resolved.bound[array.name] = (bound,)
             key, read = bound.key, bound.declared
-            queries = resolved.queries[key] = (OwnQueries if read.queries is None else CrossQueries)(
+            query_kind = (
+                ChunkCausalQueries if isinstance(read.mask, ChunkCausal) else
+                OwnQueries if read.queries is None else CrossQueries
+            )
+            queries = resolved.queries[key] = query_kind(
                 query_array(array, read, by_name),
             )
             # refuses either side's second label at resolve, which validation and `build_specs` run before any handle
