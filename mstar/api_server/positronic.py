@@ -6,6 +6,7 @@ Praxis observation decoding and pose composition belong to its model adapter.
 
 from __future__ import annotations
 
+import json
 import logging
 import secrets
 import time
@@ -34,7 +35,10 @@ class PositronicPolicy:
         prompt_key = block.get("prompt_key", "prompt")
         if not isinstance(meta, dict) or not isinstance(prompt_key, str) or not prompt_key:
             raise ValueError("positronic: meta must be a map and prompt_key a nonempty string")
-        msgpack.packb(meta, use_bin_type=True)
+        try:
+            json.dumps(meta, allow_nan=False)
+        except (TypeError, ValueError):
+            raise ValueError("positronic: meta must be JSON serializable") from None
         return cls(meta, prompt_key)
 
 

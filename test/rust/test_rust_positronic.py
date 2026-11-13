@@ -27,6 +27,12 @@ from mstar.api_server.rust_frontend import RustFrontendBridge, positronic_facts
 pytestmark = pytest.mark.skipif(BINARY is None, reason="mstar-server binary not built")
 
 
+@pytest.mark.parametrize("meta", [{"bytes": b"x"}, {"nan": float("nan")}])
+def test_policy_metadata_must_pass_the_rust_launcher_json(meta):
+    with pytest.raises(ValueError, match="meta must be JSON serializable"):
+        PositronicPolicy.from_config({"meta": meta})
+
+
 class Stub:
     positronic_policy = PositronicPolicy({"robot": "stub"})
     metrics = None
