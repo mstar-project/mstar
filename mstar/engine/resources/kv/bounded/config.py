@@ -9,7 +9,7 @@ holds only the written part of the sink and a ring for the window, and source
 entries are read where they live.
 """
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, NamedTuple
 
@@ -117,7 +117,9 @@ class BoundedKVSpec(NodeResourceSpec):
 
         return BoundedKVManager
 
-    def capacity_problem(self, requests: int, request: ResourceReqConfig | None) -> str | None:
+    def capacity_problem(
+        self, requests: int, request: ResourceReqConfig | None, axis_sizes: Sequence[Mapping[str, int]] = (),
+    ) -> str | None:
         """A request keeps a slot from its first step until it is torn down, and every slot is a request's."""
         if requests <= self.config.max_slots:
             return None
