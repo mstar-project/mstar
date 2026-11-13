@@ -4,6 +4,8 @@ from __future__ import annotations
 import dataclasses
 from dataclasses import dataclass
 
+from mstar.engine.resources.csa.config import Fp4Rows
+
 # Resource keys the model declares in get_node_resources and the layers bind by; the serving
 # YAML tunes them under ``resources:``.
 KV_CACHE = "kv_cache"    # paged latents of the compressed sources, a cache per pooling ratio (kv_cache_key)
@@ -205,6 +207,24 @@ class DeepseekV41Config:
 
     def uses_candidates(self, layer: int) -> bool:
         return 0 <= self.candidate_source_layer_id < layer
+
+    # --- the compressed caches' rows: the FP4 grids the checkpoint was trained with ---
+
+    @property
+    def latent_rows(self) -> Fp4Rows:
+        """A compressed latent: an E4M3 scale per 16 values."""
+        return Fp4Rows(block=16, e4m3_scale=True)
+
+    @property
+    def key_rows(self) -> Fp4Rows:
+        """An index key (and query): a power-of-two scale per scale block."""
+        return Fp4Rows(block=self.fp8_block)
+
+    def cache_widths(self) -> tuple[int, int]:
+        """A latent row's and a key row's widths as their cache declares them: the FP4 bytes in
+        the two-byte values a cache is typed in as served (890 bytes a token over the
+        checkpoint's four sources, against 3,200 unpacked)."""
+        return -(-self.latent_rows.nbytes(self.head_dim) // 2), -(-self.key_rows.nbytes(self.index_head_dim) // 2)
 
     @property
     def softmax_scale(self) -> float:

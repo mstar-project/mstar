@@ -125,23 +125,24 @@ class DeepseekV41Model(ByteLevelTextOutput, Model):
             shape = (cfg.max_ratio, cfg.head_dim)
             blocks[POOL_KV] = RecurrentBlockConfig(shape=shape, dtype=torch.float32)
             blocks[POOL_SCORE] = RecurrentBlockConfig(shape=shape, dtype=torch.float32)
+        latent_width, key_width = cfg.cache_widths()
         caches = [
             # the latents of the sources that pool ``ratio`` tokens, a plane each, with their
-            # index keys beside them: a row per group, so ``max_seq_len`` over-counts its rows
+            # index keys beside them: a row per group (so ``max_seq_len`` over-counts its rows),
+            # each row its FP4 bytes
             KVSpec(
                 resource_key=kv_cache_key(ratio),
                 nodes={"LLM"},
                 config=PagedKVConfig(
                     num_layers=len(cfg.sources_of(ratio)),
                     num_kv_heads=1,
-                    head_dim=cfg.head_dim,
+                    head_dim=latent_width,
                     max_seq_len=cfg.max_seq_len,
                     num_qo_heads=cfg.num_attention_heads,
                     layout=KVLayout.MLA,
-                    kv_lora_rank=cfg.head_dim,
+                    kv_lora_rank=latent_width,
                     qk_rope_head_dim=0,
-                    aux_planes={INDEX_PLANES: AuxPlanes(
-                        num_layers=len(cfg.sources_of(ratio)), width=cfg.index_head_dim)},
+                    aux_planes={INDEX_PLANES: AuxPlanes(num_layers=len(cfg.sources_of(ratio)), width=key_width)},
                 ),
             )
             for ratio in cfg.source_ratios
@@ -154,6 +155,7 @@ class DeepseekV41Model(ByteLevelTextOutput, Model):
                 config=CSAConfig(
                     caches={ratio: kv_cache_key(ratio) for ratio in cfg.source_ratios},
                     topk=cfg.index_topk, sm_scale=cfg.softmax_scale, index_head_dim=cfg.index_head_dim,
+                    latent_dim=cfg.head_dim, latent_rows=cfg.latent_rows, key_rows=cfg.key_rows,
                 ),
             ),
             RecurrentStateSpec(

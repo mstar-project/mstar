@@ -71,6 +71,14 @@ class TestCheckpointConfig:
         assert [config.plane_of(i) for i in (2, 7, 8, 14, 19, 20, 39)] == [0, 0, 1, 2, 2, 0, 0]
         assert [config.uses_candidates(i) for i in (20, 24)] == [False, True]
 
+    def test_the_caches_take_890_bytes_a_token(self):
+        """A latent and an index key per source, a row per pooled group, in their FP4 bytes."""
+        config = DeepseekV41Config()
+        latent, key = config.cache_widths()
+        assert (2 * latent, 2 * key) == (288, 68)
+        per_token = sum(len(config.sources_of(r)) * 2 * (latent + key) / r for r in config.source_ratios)
+        assert per_token == 890
+
     def test_engram_tables_hold_their_bucket_primes_end_to_end(self):
         """The checkpoint's table sizes are the sums of the primes this layout derives."""
         config = DeepseekV41Config()

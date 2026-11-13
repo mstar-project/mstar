@@ -20,6 +20,7 @@ import pytest
 import torch
 
 from mstar.engine.resources.csa import manager as csa_manager
+from mstar.engine.resources.csa.config import Fp4Rows
 from mstar.model.deepseek_v41 import _testing
 from mstar.model.deepseek_v41._testing import add_request, cpu_engine, run_request, run_step
 from mstar.model.deepseek_v41._testing import logit_gap as _gap
@@ -192,7 +193,12 @@ class TestTheGateCanFail:
                             lambda scores, *a, **k: torch.ones_like(scores, dtype=torch.bool))
         assert self._gap_with(snapshot, fp32_reference) > 10 * FP32_TOL
 
-    def test_without_the_fp4_rounding_of_the_cache(self, monkeypatch, snapshot, fp32_reference):
+    def test_with_the_caches_latents_on_another_fp4_grid(self, monkeypatch, snapshot, fp32_reference):
+        # power-of-two scales where the checkpoint's are E4M3: the same bytes, other values
+        monkeypatch.setattr(DeepseekV41Config, "latent_rows", property(lambda self: Fp4Rows(block=16)))
+        assert self._gap_with(snapshot, fp32_reference) > 10 * FP32_TOL
+
+    def test_without_the_fp4_rounding_of_the_index_queries(self, monkeypatch, snapshot, fp32_reference):
         monkeypatch.setattr(attention, "round_fp4", lambda x, *a, **k: x)
         assert self._gap_with(snapshot, fp32_reference) > 10 * FP32_TOL
 

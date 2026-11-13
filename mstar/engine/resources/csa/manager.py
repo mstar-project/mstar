@@ -22,9 +22,10 @@ import torch
 import torch.nn.functional as F
 
 from mstar.engine.resources.base import EngineResourceInfo, Resource
-from mstar.engine.resources.csa.config import INDEX_PLANES, CSAConfig, CSASpec, CSAStep
+from mstar.engine.resources.csa.config import INDEX_PLANES, CSAConfig, CSASpec, CSAStep, Fp4Rows
 from mstar.engine.resources.step import Segment, StepContext
 from mstar.utils.h2d import PinnedStager
+from mstar.utils.mx_round import pack_fp4_rows, unpack_fp4_rows
 
 _MAIN = "main"
 
@@ -99,24 +100,54 @@ def candidate_blocks(scores: torch.Tensor, groups: torch.Tensor, topk_blocks: in
     return keep.repeat_interleave(block_size, dim=-1)[..., :width]
 
 
+def _store(values: torch.Tensor, fmt: Fp4Rows | None, like: torch.Tensor) -> torch.Tensor:
+    """``values [n, width]`` as rows of the cache plane ``like`` (``[..., row width]`` in the
+    cache's dtype): as they are, or with ``fmt`` rounded to its grid, as FP4 bytes, the row's
+    spare bytes zero."""
+    if fmt is None:
+        return values
+    packed = pack_fp4_rows(values, fmt.block, fmt.e4m3_scale)
+    rows = packed.new_zeros(values.shape[0], like.shape[-1] * like.dtype.itemsize)
+    rows[:, :packed.shape[1]] = packed
+    return rows.view(like.dtype)
+
+
+def _load(rows: torch.Tensor, fmt: Fp4Rows | None, width: int) -> torch.Tensor:
+    """Gathered cache rows ``[..., row width]`` as fp32 values ``[..., width]``."""
+    if fmt is None:
+        return rows[..., :width].float()
+    return unpack_fp4_rows(rows.contiguous().view(torch.uint8), width, fmt.block, fmt.e4m3_scale)
+
+
 class CSAManager(Resource):
     """CSA for one node's layers over their compressed caches (``config.caches``)."""
 
     @classmethod
     def build(cls, spec: CSASpec, info: EngineResourceInfo):
-        page_sizes = {}
-        for ratio, key in spec.config.caches.items():
+        config, page_sizes = spec.config, {}
+        itemsize = info.kv_dtype.itemsize
+        latent_bytes, key_bytes = config.row_bytes(itemsize)
+
+        def holds(width: int, nbytes: int, fmt: Fp4Rows | None) -> bool:
+            # values fill their row exactly; packed bytes may leave part of a last element spare
+            return width * itemsize == nbytes if fmt is None else width * itemsize >= nbytes
+
+        for ratio, key in config.caches.items():
             kv_config = info.dependency(key).config
             planes = kv_config.aux_planes.get(INDEX_PLANES)
-            if planes is None or planes.width != spec.config.index_head_dim:
+            if planes is None or not holds(planes.width, key_bytes, config.key_rows):
                 raise ValueError(
-                    f"CSA keeps its {spec.config.index_head_dim}-wide index keys on {key}'s pages: "
-                    f"declare its aux_planes[{INDEX_PLANES!r}] that wide")
+                    f"CSA keeps its index keys, {key_bytes} bytes a row, on {key}'s pages: declare its "
+                    f"aux_planes[{INDEX_PLANES!r}] {-(-key_bytes // itemsize)} {info.kv_dtype} values wide")
             if kv_config.qk_rope_head_dim:
                 raise ValueError(f"CSA attends whole latents: {key} must declare no rope slot, "
                                  f"not qk_rope_head_dim={kv_config.qk_rope_head_dim}")
+            if not holds(kv_config.kv_lora_rank, latent_bytes, config.latent_rows):
+                raise ValueError(
+                    f"CSA keeps its latents, {latent_bytes} bytes a row, on {key}: declare its "
+                    f"kv_lora_rank as {-(-latent_bytes // itemsize)} {info.kv_dtype} values")
             page_sizes[ratio] = kv_config.tokens_per_page
-        return cls(spec.config, page_sizes, info.device)
+        return cls(config, page_sizes, info.device)
 
     def __init__(self, config: CSAConfig, page_sizes: Mapping[int, int], device: torch.device):
         self.config = config
@@ -231,18 +262,20 @@ class CSAManager(Resource):
 
     def write(self, ratio: int, plane: int, latent: torch.Tensor | None = None,
               keys: torch.Tensor | None = None, label: str | None = None) -> None:
-        """Write the step's ``latent`` rows ``[rows, width]`` and its index ``keys`` ``[rows,
-        index_head_dim]`` (either may be left for a later call) to ``plane`` of the ``ratio``
-        cache: the rows that complete a group, at the slots the cache's step planned. The other
-        rows' are dropped."""
+        """Write the step's ``latent`` rows ``[rows, latent_dim]`` and its index ``keys``
+        ``[rows, index_head_dim]`` (either may be left for a later call) to ``plane`` of the
+        ``ratio`` cache: the rows that complete a group, at the slots the cache's step planned.
+        The other rows' are dropped. A cache of ``Fp4Rows`` rounds them to its grid."""
         written = self.current(label).caches[ratio].written
         if not written.numel():
             return
         kv = self._cache(ratio)
         if latent is not None:
-            kv.write_kv(latent.index_select(0, written), None, layer_idx=plane, label=label)
+            rows = _store(latent.index_select(0, written), self.config.latent_rows, kv.layer_view(plane))
+            kv.write_kv(rows, None, layer_idx=plane, label=label)
         if keys is not None:
-            kv.write_aux(INDEX_PLANES, keys.index_select(0, written), layer_idx=plane, label=label)
+            rows = _store(keys.index_select(0, written), self.config.key_rows, kv.aux_view(INDEX_PLANES, plane))
+            kv.write_aux(INDEX_PLANES, rows, layer_idx=plane, label=label)
 
     def scores(self, ratio: int, plane: int, q: torch.Tensor, w: torch.Tensor,
                label: str | None = None) -> torch.Tensor:
@@ -264,7 +297,7 @@ class CSAManager(Resource):
                 if count == 0:
                     continue
                 req_ids = torch.full((count,), req, dtype=torch.long, device=q.device)
-                keys = flat[rows.slots(ratio, req_ids, group[:count])].float()
+                keys = _load(flat[rows.slots(ratio, req_ids, group[:count])], self.config.key_rows, q.shape[-1])
                 chunk = max(1, self.config.score_bytes // (4 * heads * count))
                 for c0 in range(r0, r0 + n, chunk):
                     c1 = min(c0 + chunk, r0 + n)
@@ -313,7 +346,8 @@ class CSAManager(Resource):
                 rows, valid = window[idx.clamp_min(0)].float(), idx >= 0
                 if latent is not None:
                     picked = slots[c0:c1]
-                    rows = torch.cat([rows, latent[picked.clamp_min(0)][..., :width].float()], dim=1)
+                    rows = torch.cat(
+                        [rows, _load(latent[picked.clamp_min(0)], self.config.latent_rows, width)], dim=1)
                     valid = torch.cat([valid, picked >= 0], dim=1)
                 logits = torch.einsum("rhd,rkd->rhk", q[c0:c1].float(), rows) * self.config.sm_scale
                 logits = logits.masked_fill(~valid[:, None, :], -torch.inf)

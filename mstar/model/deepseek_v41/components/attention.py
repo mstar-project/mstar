@@ -59,12 +59,12 @@ class Compressor(nn.Module):
     def bind_resources(self, resources: dict) -> None:
         self._state = resources[STATE]
 
-    def forward(self, x: torch.Tensor, rows) -> tuple[torch.Tensor, torch.Tensor]:
-        """``x (T, hidden)`` -> the unrotated latent of the group each row completes ``(T,
-        head_dim)``, zeros where it completes none, and that mask ``(T,)``."""
+    def forward(self, x: torch.Tensor, rows) -> torch.Tensor:
+        """``x (T, hidden)`` -> ``(T, head_dim)``: for a row that ends a group, the group's
+        unrotated latent. The other rows' are of no group, and the cache drops them."""
         ratio = self.ratio
         if ratio == 1:
-            return self.norm(self.wkv(x)), torch.ones_like(rows.pos, dtype=torch.bool)
+            return self.norm(self.wkv(x))
         kv, score = self.wkv(x.float()), self.wgate(x.float())
         held_kv = self._state.gather(POOL_KV, self.layer, label=LABEL)  # (requests, ratio, D)
         held_score = self._state.gather(POOL_SCORE, self.layer, label=LABEL)
@@ -79,8 +79,6 @@ class Compressor(nn.Module):
             members_score.append(torch.where(here, score[src], held_score[rows.row_req, slot]))
         members_kv, members_score = torch.stack(members_kv, 1), torch.stack(members_score, 1)
         pooled = (members_kv * members_score.softmax(dim=1)).sum(dim=1)
-        done = (rows.pos + 1) % ratio == 0
-        latent = self.norm(pooled.to(x.dtype)) * done[:, None]
         # the step's last tokens are the next step's open group
         tail = rows.pos >= rows.end - ratio
         req, slot = rows.row_req[tail], rows.pos[tail] % ratio
@@ -88,13 +86,14 @@ class Compressor(nn.Module):
         held_score[req, slot] = score[tail]
         self._state.scatter_(POOL_KV, held_kv, self.layer, label=LABEL)
         self._state.scatter_(POOL_SCORE, held_score, self.layer, label=LABEL)
-        return latent, done
+        return self.norm(pooled.to(x.dtype))
 
 
 class Indexer(nn.Module):
     """One index source's projections: the key each compressed latent stores (on the layers
-    that write a cache), and each query row's index heads and head weights. Keys and queries
-    are rounded to FP4, as the checkpoint was trained."""
+    that write a cache), and each query row's index heads and head weights. The checkpoint was
+    trained with keys and queries rounded to FP4: the cache rounds the keys, the queries are
+    rounded here to the same grid."""
 
     def __init__(self, config: DeepseekV41Config, layer: int, comm_group: CommGroup) -> None:
         super().__init__()
@@ -102,7 +101,7 @@ class Indexer(nn.Module):
         self.owns_keys = layer in config.kv_source_layer_ids
         self.n_heads = divide(config.index_n_heads, comm_group.world_size)
         self.head_dim = config.index_head_dim
-        self.block = config.fp8_block
+        self.key_rows = config.key_rows
         self.wq_b = RoundedLinear(
             config.q_lora_rank, config.index_n_heads * config.index_head_dim, comm_group, COLUMN)
         self.weights_proj = RoundedLinear(
@@ -113,13 +112,13 @@ class Indexer(nn.Module):
         # the score's softmax scale and its mean over heads, folded into the head weights
         self.weight_scale = config.index_head_dim ** -0.5 * config.index_n_heads ** -0.5
 
-    def keys(self, latent: torch.Tensor, angles, done: torch.Tensor) -> torch.Tensor:
-        k = rotate_tail(self.k_norm(self.wk(latent)), angles)
-        return round_fp4(k, self.block) * done[:, None]
+    def keys(self, latent: torch.Tensor, angles) -> torch.Tensor:
+        """The keys of the groups ``latent``'s rows complete, which their cache rounds to FP4."""
+        return rotate_tail(self.k_norm(self.wk(latent)), angles)
 
     def query(self, x: torch.Tensor, q_latent: torch.Tensor, angles) -> tuple[torch.Tensor, torch.Tensor]:
         q = self.wq_b(q_latent).unflatten(-1, (self.n_heads, self.head_dim))
-        q = round_fp4(rotate_tail(q, angles), self.block)
+        q = round_fp4(rotate_tail(q, angles), self.key_rows.block, self.key_rows.e4m3_scale)
         return q, self.weights_proj(x) * self.weight_scale
 
 
@@ -185,14 +184,14 @@ class DeepseekV41Attention(nn.Module):
         self._state.scatter_(WINDOW, ring, self.layer, label=LABEL)
         return source, idx
 
-    def _select(self, x, q_latent, latent, done, rows, rope: Rope, angles, shared: SharedSelection):
+    def _select(self, x, q_latent, latent, rows, rope: Rope, angles, shared: SharedSelection):
         """This layer's pick of the compressed cache: its own indexer's, or the last one's."""
         if self.indexer is None:
             return shared.slots
         ratio = self.ratio
         if self.indexer.owns_keys:
             # a latent stands at its group's first token
-            keys = self.indexer.keys(latent, rope.angles(rows.pos + 1 - ratio, True), done)
+            keys = self.indexer.keys(latent, rope.angles(rows.pos + 1 - ratio, True))
             self._csa.write(ratio, self.plane, keys=keys, label=LABEL)
         q, w = self.indexer.query(x, q_latent, angles)
         scores = self._csa.scores(ratio, self.plane, q, w, label=LABEL)
@@ -219,15 +218,11 @@ class DeepseekV41Attention(nn.Module):
 
         slots = None
         if compressed:
-            latent = done = None
-            if self.compressor is not None:
-                latent, done = self.compressor(x, rows)
-            slots = self._select(x, q_latent, latent, done, rows, rope, angles, shared)
+            latent = self.compressor(x, rows) if self.compressor is not None else None
+            slots = self._select(x, q_latent, latent, rows, rope, angles, shared)
             if latent is not None:
                 latent = rotate_tail(latent, rope.angles(rows.pos + 1 - self.ratio, True))
-                # the compressed cache's FP4 has an E4M3 scale per 16 values
-                self._csa.write(
-                    self.ratio, self.plane, latent=round_fp4(latent, 16, e4m3_scale=True), label=LABEL)
+                self._csa.write(self.ratio, self.plane, latent=latent, label=LABEL)
         out = self._csa.attend(q, self.attn_sink, window, window_idx, self.ratio, self.plane, slots)
         # the cache holds rotated latents, so the output carries the query's rotation
         out = rotate_tail(out, angles, inverse=True)

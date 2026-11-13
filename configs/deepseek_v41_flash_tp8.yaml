@@ -15,7 +15,7 @@ model_kwargs:
   max_requests: 8
 resources:
   # A cache per pooling ratio, a row per pooled group, each a latent of 512 and an index key
-  # of 128 per source, bf16: 3.2 KB/token and 1.7 GB/rank together.
+  # of 128 per source in their FP4 bytes (288 + 68): 890 bytes/token and 0.47 GB/rank together.
   # pages = requests x max_seq_len / ratio / page_size + the sink.
   kv_cache_x1:
     # the source that keeps every token: 8 x 65536 / 128 + 1

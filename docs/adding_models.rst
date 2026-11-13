@@ -938,7 +938,11 @@ The spec types are:
        (the groups the step's tokens complete, none on most decode steps of a pooled cache);
        ``plan`` lays the token positions over the caches' page tables and ``commit`` advances
        the count. The layers write latents and keys, score, select and attend through the
-       resource (``write``, ``scores``, ``candidates``, ``select``, ``attend``). ``select``
+       resource (``write``, ``scores``, ``candidates``, ``select``, ``attend``). With
+       ``latent_rows`` / ``key_rows`` (``Fp4Rows``: E2M1 values and a scale byte per block) the
+       resource rounds what the layers write to that FP4 grid and keeps the bytes, 288 for a
+       512-wide latent where bf16 takes 1,024, reading the rounded values back; the cache then
+       declares its row widths as those bytes in its own elements (checked at build). ``select``
        takes each row's top ``topk`` groups, equal scores to the earlier one, optionally
        inside a ``candidates`` mask of best blocks (a two-level selection); ``attend`` takes
        the window rows from the model, which keeps them wherever it likes (a recurrent pool

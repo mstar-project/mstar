@@ -42,3 +42,25 @@ class TestMxRounding:
         dense = q.float().unflatten(-1, (-1, 32)) * scale.unsqueeze(-1)
         # E4M3 keeps 4 significant bits: a relative error of at most 1/16, plus the subnormals' step
         assert ((dense.flatten(-2) - x).abs() <= x.abs() / 16 + scale.repeat_interleave(32, -1) * 2.0 ** -10).all()
+
+
+class TestFp4RowStore:
+    """A row's FP4 bytes read back as the row rounded, bit for bit."""
+
+    # the scale formats' ranges: any power of two as E8M0; E4M3 from 2 ** -9 to 448
+    @pytest.mark.parametrize("block, e4m3_scale, span", [(32, False, 20.0), (16, True, 6.0)],
+                             ids=["e8m0-per-32", "e4m3-per-16"])
+    def test_the_bytes_hold_the_rounded_row(self, block, e4m3_scale, span):
+        torch.manual_seed(0)
+        x = torch.randn(4000, 64) * torch.exp(torch.linspace(-span, span, 4000))[:, None]
+        # blocks whose largest value rounds down, all-zero blocks, exact grid values and midpoints
+        x[::7, :32] = x[::7, :32].clamp(-3.2, 3.2)
+        x[::11, 32:] = 0
+        x[::13, :8] = torch.tensor([0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -6.0])
+        x[::17, 8:16] = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0, -5.0])
+        for dtype in (torch.float32, torch.bfloat16):
+            packed = mx_round.pack_fp4_rows(x.to(dtype), block, e4m3_scale)
+            assert packed.dtype == torch.uint8 and packed.shape == (4000, 32 + 64 // block)
+            want = mx_round.round_fp4(x.to(dtype), block, e4m3_scale).float()
+            assert torch.isfinite(want).all()
+            assert torch.equal(mx_round.unpack_fp4_rows(packed, 64, block, e4m3_scale), want)

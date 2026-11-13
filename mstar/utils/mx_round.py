@@ -4,7 +4,8 @@ DeepSeek-V4.1's reference keeps activations and cache rows in bf16 but rounds th
 grids first: E4M3 values with a power-of-two scale per block, or E2M1 values with a power-of-two
 (E8M0) or an E4M3 scale per block. bf16 holds every rounded value exactly, so a packed FP8/FP4
 store or kernel reproduces them bit for bit. This module is that rounding op by op, on any
-device; ``pack_e2m1`` / ``unpack_e2m1`` are the checkpoint's packing of E2M1 weights.
+device; ``pack_e2m1`` / ``unpack_e2m1`` are the checkpoint's packing of E2M1 weights, and
+``pack_fp4_rows`` / ``unpack_fp4_rows`` a store of FP4-rounded rows in those bytes.
 """
 from __future__ import annotations
 
@@ -85,6 +86,26 @@ def round_fp4(x: torch.Tensor, block: int = 32, e4m3_scale: bool = False) -> tor
     """``x`` rounded to the FP4 grid of ``quant_fp4``, in ``x``'s dtype."""
     q, scale = quant_fp4(x, block, e4m3_scale)
     return (q.unflatten(-1, (-1, block)) * scale.unsqueeze(-1)).flatten(-2).to(x.dtype)
+
+
+def pack_fp4_rows(x: torch.Tensor, block: int = 32, e4m3_scale: bool = False) -> torch.Tensor:
+    """``x [..., N]`` quantized as ``quant_fp4`` does, as bytes ``[..., N // 2 + N // block]``: the
+    E2M1 values two to a byte, then each block's scale (E4M3, or the power of two as E8M0).
+    ``unpack_fp4_rows`` of them is ``round_fp4(x)`` bit for bit. Takes ``x`` before rounding: a
+    rounded block does not always quantize back to itself (an E4M3 scale below ``2 ** -6`` is
+    too coarse to)."""
+    q, scale = quant_fp4(x, block, e4m3_scale)
+    scale = scale.to(torch.float8_e4m3fn if e4m3_scale else torch.float8_e8m0fnu)
+    return torch.cat([pack_e2m1(q), scale.view(torch.uint8)], dim=-1)
+
+
+def unpack_fp4_rows(rows: torch.Tensor, width: int, block: int = 32, e4m3_scale: bool = False) -> torch.Tensor:
+    """``pack_fp4_rows``' bytes (the first ``width // 2 + width // block`` of each row) as fp32
+    values ``[..., width]``."""
+    values = unpack_e2m1(rows[..., :width // 2])
+    scale = rows[..., width // 2:width // 2 + width // block].contiguous()
+    scale = scale.view(torch.float8_e4m3fn if e4m3_scale else torch.float8_e8m0fnu).float()
+    return (values.unflatten(-1, (-1, block)) * scale.unsqueeze(-1)).flatten(-2)
 
 
 def dequant_block_fp8(weight: torch.Tensor, scale: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:

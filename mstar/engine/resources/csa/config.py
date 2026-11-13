@@ -17,6 +17,24 @@ if TYPE_CHECKING:
 INDEX_PLANES = "csa_index"
 
 
+@dataclass(frozen=True)
+class Fp4Rows:
+    """Rows of a cache plane rounded to FP4 and stored in its bytes: E2M1 values two to a
+    byte, then a scale byte per ``block`` values (E4M3 with ``e4m3_scale``, else a power of two
+    as E8M0), the grid of ``mx_round.round_fp4`` with the same arguments. A model trained with
+    FP4 caches declares it and writes its rows unrounded: the resource rounds them as it
+    stores them, in ``nbytes(width)`` bytes a row where bf16 takes two a value, and reads back
+    the rounded values."""
+
+    block: int
+    e4m3_scale: bool = False
+
+    def nbytes(self, width: int) -> int:
+        if width % self.block or width % 2:
+            raise ValueError(f"FP4 rows of {width} values are not whole bytes and {self.block}-value scale blocks")
+        return width // 2 + width // self.block
+
+
 @dataclass
 class CSAConfig:
     # the paged latent caches by pooling ratio. A cache of ratio r keeps one row per r tokens,
@@ -29,6 +47,14 @@ class CSAConfig:
     sm_scale: float
     # the indexer's key width, one INDEX_PLANES row
     index_head_dim: int
+    # the latent's width, which the queries share
+    latent_dim: int
+    # the caches' rows rounded to FP4 and kept in its bytes (``Fp4Rows``); None keeps what the
+    # layers write, in the cache's dtype. A cache is typed by its node's dtype, so an FP4 cache
+    # declares its row widths in those elements (``kv_lora_rank``, the aux planes' ``width``)
+    # and the resource reads them as bytes.
+    latent_rows: Fp4Rows | None = None
+    key_rows: Fp4Rows | None = None
     # bytes of fp32 scores one selection launch holds, and of gathered rows one attention launch
     score_bytes: int = 256 << 20
     attend_bytes: int = 256 << 20
@@ -39,6 +65,13 @@ class CSAConfig:
             raise ValueError(f"CSAConfig.caches maps pooling ratios (>= 1) to caches, got {self.caches!r}")
         if len(set(self.caches.values())) != len(self.caches):
             raise ValueError(f"CSAConfig.caches names one cache for two ratios: {self.caches!r}")
+
+    def row_bytes(self, itemsize: int) -> tuple[int, int]:
+        """Bytes a latent row and an index key row take, in a cache of ``itemsize``-byte values."""
+        latent = self.latent_dim * itemsize if self.latent_rows is None else self.latent_rows.nbytes(self.latent_dim)
+        key = (self.index_head_dim * itemsize if self.key_rows is None
+               else self.key_rows.nbytes(self.index_head_dim))
+        return latent, key
 
 
 @dataclass
