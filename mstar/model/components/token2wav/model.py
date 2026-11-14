@@ -29,6 +29,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from mstar.engine.resources.kv.bounded import SinkWindow
+from mstar.engine.state import Retained
 from mstar.model.chatterbox.components.s3gen_hift import HiFTGenerator, HiFTNoise
 from mstar.model.chatterbox.config import S3GenHiFTConfig
 from mstar.model.components.token2wav.flow import (
@@ -196,16 +197,10 @@ def slot_layout(capacity: CacheCapacity, dit_dtype: torch.dtype | None = None) -
 # and each window last-first, which makes upstream's "first 2P" a window.
 
 
-def _enc1_retention(source_len: int) -> SinkWindow:
-    return SinkWindow(source_len + KEEP_RECENT // UP_RATE, 0)
-
-
-def _enc2_retention(source_len: int) -> SinkWindow:
-    return SinkWindow(source_len, KEEP_RECENT)
-
-
-def _dit_retention(source_len: int) -> SinkWindow:
-    return SinkWindow(KEEP_RECENT, source_len)
+# MiniCPM-o's cut conformer caches, and the DiT's of both models
+_ENC1_CUT = Retained(sink=KEEP_RECENT // UP_RATE, source_in_sink=True)
+_ENC2_CUT = Retained(window=KEEP_RECENT, source_in_sink=True)
+_DIT = Retained(sink=KEEP_RECENT, source_in_window=True, reverse_steps=True)
 
 
 def _enc1_source(voice: Token2WavVoice) -> torch.Tensor:
@@ -225,21 +220,37 @@ def _dit_source(voice: Token2WavVoice) -> torch.Tensor:
 
 
 class CacheFamily(NamedTuple):
-    """One kind of token2wav attention cache, as a bounded KV resource declares it."""
+    """One kind of token2wav attention cache, as its array declares it (``token2wav_caches``)."""
 
     num_layers: int
-    rows: int  # 2 for the DiT's guidance rows
+    rows: int  # 2 for the DiT's guidance rows, its array's entry rows
     num_heads: int
     head_dim: int
     # stream entries per token: 1 at 25 Hz, 2 at 50 Hz
     rate: int
-    retention: Callable[[int], SinkWindow]
+    # what a row keeps of its stream, which starts with its voice's own cache (its source)
+    mask: Retained
     # the voice's cache in stream order, ``[layers, rows, H, L, 2d]``
     source: Callable[[Token2WavVoice], torch.Tensor]
-    reverse_step_order: bool = False
     # whether its attention has relative positions (the conformer's): a step's retained
     # keys then have to fit the position table (``flow.band_fits``)
     positional: bool = False
+
+    def retention(self, source_len: int) -> SinkWindow:
+        """What a row with a source of ``source_len`` entries keeps of its stream."""
+        mask = self.mask
+        return SinkWindow(
+            mask.sink + source_len * mask.source_in_sink, mask.window + source_len * mask.source_in_window,
+        )
+
+    def max_keys(self, max_source_len: int) -> int:
+        """The most entries a row's read sees before its step's, for sources of up to ``max_source_len``."""
+        kept = self.retention(max_source_len)
+        return kept.sink + kept.window
+
+    @property
+    def reverse_step_order(self) -> bool:
+        return self.mask.reverse_steps
 
     def position(self, voice_tokens: int, written_tokens: int) -> tuple[int, int]:
         """``(source_len, written)`` once a request's windows have added ``written_tokens``
@@ -256,23 +267,22 @@ def window_tokens(num_tokens: int, last: bool) -> int:
     return 0 if last else num_tokens - PRE_LOOKAHEAD
 
 
-def _whole_stream(written: int) -> Callable[[int], SinkWindow]:
+def _whole_stream(written: int) -> Retained:
     """Keep the source and the first ``written`` entries after it: a cache never cut, up to a cap."""
-    return lambda source_len: SinkWindow(source_len + written, 0)
+    return Retained(sink=written, source_in_sink=True)
 
 
-def _families(enc1: Callable[[int], SinkWindow], enc2: Callable[[int], SinkWindow]) -> dict[str, CacheFamily]:
+def _families(enc1: Retained, enc2: Retained) -> dict[str, CacheFamily]:
     return {
         "enc1": CacheFamily(ENC_BLOCKS, 1, ENC_HEADS, ENC_HEAD_DIM, 1, enc1, _enc1_source, positional=True),
         "enc2": CacheFamily(ENC_UP_BLOCKS, 1, ENC_HEADS, ENC_HEAD_DIM, UP_RATE, enc2, _enc2_source, positional=True),
-        "dit": CacheFamily(N_TIMESTEPS * DIT_DEPTH, 2, DIT_HEADS, DIT_HEAD_DIM, UP_RATE, _dit_retention,
-                           _dit_source, reverse_step_order=True),
+        "dit": CacheFamily(N_TIMESTEPS * DIT_DEPTH, 2, DIT_HEADS, DIT_HEAD_DIM, UP_RATE, _DIT, _dit_source),
     }
 
 
 # MiniCPM-o's: every cache cut. Which caches a model's reference cuts is
 # ``Token2WavStreaming.cache_families``; the family names (and so the resource keys) are fixed.
-CACHE_FAMILIES = _families(_enc1_retention, _enc2_retention)
+CACHE_FAMILIES = _families(_ENC1_CUT, _ENC2_CUT)
 
 
 @dataclass(frozen=True)
@@ -351,28 +361,39 @@ class VoiceBank(NamedTuple):
     def index(self, name: str) -> int:
         return self.names.index(name)
 
-
-class AttentionCache(NamedTuple):
-    """Where a batch's caches of one family are: the bounded KV resource (whose step
-    planned the batch's rows) and the model's voices' sources (``VoiceBank.sources``)."""
-
-    resource: object
-    sources: torch.Tensor
-
-    def layer(self, idx: int) -> BoundedLayerKV:
-        return BoundedLayerKV(self.resource, idx, self.sources[:, idx])
+    def source_fields(self, family: str, head_dim: int) -> dict[str, torch.Tensor]:
+        """``family``'s sources as its array takes them (``set_sources``): k and v, each
+        ``[voices, layers, len, *entry]``, the entry ``(rows, H, head_dim)`` for the DiT's guidance
+        pair and ``(H, head_dim)`` for a family of one row."""
+        stacked = self.sources[family].permute(0, 1, 4, 2, 3, 5)
+        if stacked.shape[3] == 1:
+            stacked = stacked.squeeze(3)
+        return {"k": stacked[..., :head_dim], "v": stacked[..., head_dim:]}
 
 
 class WindowCaches(NamedTuple):
-    enc1: AttentionCache
-    enc2: AttentionCache
-    dit: AttentionCache
+    """Each family's layers, on its array's handle (``token2wav_caches``)."""
+
+    enc1: list[BoundedLayerKV]
+    enc2: list[BoundedLayerKV]
+    dit: list[BoundedLayerKV]
+
+    @classmethod
+    def bind(
+        cls, handles: Mapping[str, object], kv: Mapping[str, str], families: Mapping[str, CacheFamily],
+        max_source_lens: Mapping[str, int],
+    ) -> WindowCaches:
+        """Over the node's ``handles``, each family's under ``kv[family]``, with sources of up to
+        ``max_source_lens[family]`` entries."""
+        return cls(**{
+            name: [BoundedLayerKV(handles[kv[name]], layer, family.max_keys(max_source_lens[name]))
+                   for layer in range(family.num_layers)]
+            for name, family in families.items()
+        })
 
     def flow_kv(self) -> FlowKV:
         return FlowKV(
-            [self.enc1.layer(i) for i in range(ENC_BLOCKS)],
-            [self.enc2.layer(i) for i in range(ENC_UP_BLOCKS)],
-            [[self.dit.layer(step * DIT_DEPTH + i) for i in range(DIT_DEPTH)] for step in range(N_TIMESTEPS)],
+            self.enc1, self.enc2, [self.dit[step * DIT_DEPTH:(step + 1) * DIT_DEPTH] for step in range(N_TIMESTEPS)],
         )
 
 

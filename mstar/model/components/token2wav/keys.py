@@ -13,7 +13,7 @@ class Token2WavKeys(NamedTuple):
     # (``hift``) and samples (``tail``), each a plain Value the region that writes it lists, and its host fields
     # (``request``)
     state: str
-    # cache family (``CACHE_FAMILIES``) -> its ``BoundedKVSpec`` resource key
+    # cache family (``CACHE_FAMILIES``) -> its array, whose one read is under ``read(family)``
     kv: Mapping[str, str]
     # the output edge carrying each window's audio
     audio: str = "audio_chunk"
@@ -40,3 +40,7 @@ class Token2WavKeys(NamedTuple):
     def values(self) -> tuple[str, str, str]:
         """The Values that hold a slot per request, each one more than a cache's (its sink)."""
         return self.flow, self.hift, self.tail
+
+    def read(self, family: str) -> str:
+        """The key of the ``family`` cache's read: ``t2w_dit_attn`` for ``t2w_dit_kv``."""
+        return f"{self.kv[family].removesuffix('_kv')}_attn"

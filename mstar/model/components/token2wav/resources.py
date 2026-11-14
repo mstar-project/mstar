@@ -1,8 +1,7 @@
-"""What a token2wav node keeps per request: its attention caches, and its conv caches, HiFT tails and host fields.
-
-The caches are bounded KV resources, written by hand. The rest is declared state (`token2wav_state`): a plain Value per
-region that writes it, so each region's step writes every field it lists, and the host fields the node's own step
-writes.
+"""What a token2wav node keeps per request, as declared state: its attention caches (`token2wav_caches`), an array per
+family whose read keeps a sink and a window of a stream starting with the voice's own caches, and its conv caches,
+HiFT tails and host fields (`token2wav_state`), a plain Value per region that writes it, so each region's step writes
+every field it lists, and the host fields the node's own step writes.
 """
 
 from __future__ import annotations
@@ -11,9 +10,7 @@ from collections.abc import Mapping
 
 import torch
 
-from mstar.engine.resources import NodeResourceSpec
-from mstar.engine.resources.kv.bounded import BoundedKVConfig, BoundedKVSpec
-from mstar.engine.state import Array, Entry, TensorType, Value
+from mstar.engine.state import Array, Attend, Entry, Read, Source, TensorType, Value
 from mstar.model.components.token2wav.flow import PRE_LOOKAHEAD, REL_POS_MAX_LEN, band_fits
 from mstar.model.components.token2wav.keys import Token2WavKeys
 from mstar.model.components.token2wav.model import (
@@ -53,43 +50,55 @@ def token2wav_state(keys: Token2WavKeys, node: str) -> list[Array]:
 
 
 def token2wav_kernel_settings(keys: Token2WavKeys, max_slots: int) -> dict[str, dict[str, int]]:
-    """Each Value's default slots: ``max_slots``, one more than each cache's (`token2wav_resources`), its sink."""
-    return {name: {"max_slots": max_slots} for name in keys.values}
+    """Each Value's default slots, ``max_slots``, and each cache's, one fewer: a Value also keeps its sink."""
+    return {
+        **{name: {"max_slots": max_slots} for name in keys.values},
+        **{name: {"max_slots": max_slots - 1} for name in keys.kv.values()},
+    }
 
 
-def token2wav_resources(
-    keys: Token2WavKeys, node: str, voice_seconds: tuple[float, float], max_slots: int,
+def token2wav_caches(
+    keys: Token2WavKeys, node: str, voice_seconds: tuple[float, float], reply_tokens: int,
     streaming: Token2WavStreaming | None = None,
-) -> list[NodeResourceSpec]:
-    """The bounded KV caches of ``node``, sized for voices of ``voice_seconds`` (shortest, longest) and retained as
-    ``streaming`` (the model's ``Token2Wav.streaming``; MiniCPM-o's by default). Each has ``max_slots - 1``: one fewer
-    than each Value (`token2wav_kernel_settings`), which also keeps its sink slot."""
+) -> list[Array]:
+    """The attention caches of ``node`` (`cache_arrays`), for voices of ``voice_seconds`` (shortest, longest) and
+    replies of up to ``reply_tokens`` codes; retained as ``streaming`` (the model's ``Token2Wav.streaming``; MiniCPM-o's
+    by default) says. Refuses a voice too long for the conformer's position table."""
     streaming = streaming or Token2WavStreaming()
     # one token of slack for rounding, each way
-    capacity = streaming.capacity(int(voice_seconds[1] * _TOKENS_PER_SECOND) + 1)
-    min_tokens = max(0, int(voice_seconds[0] * _TOKENS_PER_SECOND) - 1)
-    caches = [
-        BoundedKVSpec(
-            resource_key=keys.kv[name], nodes={node},
-            config=BoundedKVConfig(
-                num_layers=family.num_layers,
-                num_heads=family.num_heads,
-                head_dim=family.head_dim,
-                rows_per_request=family.rows,
-                max_source_len=family.rate * capacity.prompt_tokens,
-                min_source_len=family.rate * min_tokens,
-                retention=family.retention,
-                max_slots=max_slots - 1,
-                reverse_step_order=family.reverse_step_order,
-                dtype=DIT_COMPUTE_DTYPE if name == "dit" else torch.float32,
-            ),
-        )
-        for name, family in streaming.cache_families().items()
-    ]
-    for spec, (name, family) in zip(caches, streaming.cache_families().items(), strict=True):
+    tokens = (max(0, int(voice_seconds[0] * _TOKENS_PER_SECOND) - 1), int(voice_seconds[1] * _TOKENS_PER_SECOND) + 1)
+    arrays = cache_arrays(keys, node, tokens, reply_tokens, streaming)
+    for array, (name, family) in zip(arrays, streaming.cache_families().items(), strict=True):
         if family.positional:
-            _check_positions(name, spec.config.max_retained, family.rate * _STEP_TOKENS, voice_seconds[1], family.rate)
-    return caches
+            _check_positions(name, family.max_keys(array.source.max_len), family.rate * _STEP_TOKENS,
+                             voice_seconds[1], family.rate)
+    return arrays
+
+
+def cache_arrays(
+    keys: Token2WavKeys, node: str, voice_tokens: tuple[int, int], reply_tokens: int,
+    streaming: Token2WavStreaming | None = None, dit_dtype: torch.dtype = DIT_COMPUTE_DTYPE,
+) -> list[Array]:
+    """An array per cache family, for voices of ``voice_tokens`` (shortest, longest) codes, each voice's own caches
+    the source a row starts from, and replies of up to ``reply_tokens`` codes. The DiT's entries hold its two guidance
+    rows (a rows axis) in ``dit_dtype``; the conformer's are float32."""
+    streaming = streaming or Token2WavStreaming()
+    longest = streaming.capacity(voice_tokens[1]).prompt_tokens
+    arrays = []
+    for name, family in streaming.cache_families().items():
+        heads = family.num_heads
+        # the DiT's guidance pair is a rows axis: each row attends its own keys under its own queries
+        shape = (heads, family.head_dim) if family.rows == 1 else (family.rows, heads, family.head_dim)
+        kv = TensorType(shape, dtype=dit_dtype if name == "dit" else torch.float32)
+        source = Source(min_len=family.rate * voice_tokens[0], max_len=family.rate * longest)
+        arrays.append(Array(
+            keys.kv[name], nodes={node}, layers=frozenset(range(family.num_layers)), entry=Entry({"k": kv, "v": kv}),
+            max_len=source.max_len + family.rate * reply_tokens, source=source,
+            reads={keys.read(name): Read(
+                mask=family.mask, op=Attend(q_heads=heads, distance_bias=family.positional), packed=False,
+            )},
+        ))
+    return arrays
 
 
 def _check_positions(family: str, max_keys: int, step: int, voice_seconds: float, rate: int) -> None:
@@ -108,8 +117,8 @@ def _check_positions(family: str, max_keys: int, step: int, voice_seconds: float
 
 
 def check_token2wav_slots(keys: Token2WavKeys, resources: Mapping, default_slots: int, config_path: str) -> None:
-    """Refuse a serving config whose ``resources:`` give a Value anything but one more slot than each cache
-    (``token2wav_resources``), or the Values different counts."""
+    """Refuse a serving config whose ``resources:`` give a Value anything but one more slot than each cache, or the
+    Values different counts (``token2wav_kernel_settings``)."""
 
     def slots(key: str, default: int) -> int:
         return int((resources.get(key) or {}).get("max_slots", default))

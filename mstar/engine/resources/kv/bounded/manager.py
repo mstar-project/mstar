@@ -14,7 +14,7 @@ from typing import NamedTuple
 import torch
 
 from mstar.engine.resources.base import CGSlotKey, CGSlotSpec, EngineResourceInfo, Resource
-from mstar.engine.resources.kv.bounded.config import BoundedKVConfig, BoundedKVSpec, BoundedKVStep
+from mstar.engine.resources.kv.bounded.config import BoundedKVConfig, BoundedKVSpec, BoundedKVStep, StreamPosition
 from mstar.engine.resources.kv.bounded.layout import (
     EMPTY_ROW,
     NUM_READS,
@@ -74,6 +74,8 @@ class BoundedKVManager(Resource):
             2 * c.head_dim, dtype=dtype, device=self._device,
         )
         self._requests: dict[str, _Request] = {}
+        # rid -> the position admit fixed for a row its step names by source alone (``BoundedKVStep.sources``)
+        self._admitted: dict[str, StreamPosition] = {}
         self._free = list(reversed(range(c.max_slots)))
         self._lock = threading.RLock()
         # rid -> slot the live admit took fresh, for ``rollback_admit``
@@ -214,6 +216,7 @@ class BoundedKVManager(Resource):
             if free:
                 del self._requests[rid]
                 self._admit_taken.pop(rid, None)
+                self._admitted.pop(rid, None)
                 self._free.append(req.slot)
             else:
                 req.written = 0
@@ -231,10 +234,14 @@ class BoundedKVManager(Resource):
                 if ctx.is_padding_row(seg.request_id):
                     continue
                 pos = step.positions.get(seg.request_id)
-                if pos is None:
+                named = step.sources.get(seg.request_id)
+                if pos is None and named is None:
                     return AdmitOutcome(ok=False, ready=False, reason=AdmitRuntimeError(
                         f"bounded KV step declares no position for {seg.request_id!r}",
                         request_ids=frozenset({seg.request_id})))
+                if pos is None:
+                    held = self._requests.get(seg.request_id)
+                    pos = StreamPosition(named[0], 0 if held is None else held.written, source=named[1])
                 if not self.config.min_source_len <= pos.source_len <= self.config.max_source_len:
                     return AdmitOutcome(ok=False, ready=False, reason=AdmitRuntimeError(
                         f"{seg.request_id!r} has a {pos.source_len}-token source; the slots "
@@ -252,7 +259,16 @@ class BoundedKVManager(Resource):
                     return AdmitOutcome(ok=False, ready=False, reason=AdmitRuntimeError(
                         f"{seg.request_id!r} declares {pos.written} written tokens; "
                         f"{req.written} were committed", request_ids=frozenset({seg.request_id})))
+                if named is not None and seg.request_id not in step.positions:
+                    self._admitted[seg.request_id] = pos
         return ADMIT_OK
+
+    def _position(self, step: BoundedKVStep, rid: str) -> StreamPosition | None:
+        """The row's position: the step's, or the one admit fixed for a row it names by source."""
+        pos = step.positions.get(rid)
+        if pos is None and rid in step.sources:
+            pos = self._admitted.get(rid)
+        return pos
 
     def rollback_admit(self, step: BoundedKVStep, ctx: StepContext) -> None:
         """Free the slots this step's admit took fresh; a slot a request already
@@ -282,7 +298,7 @@ class BoundedKVManager(Resource):
                 # padding rows read and write nothing
                 rows.append((0, EMPTY_ROW, 0))
             else:
-                pos = step.positions[seg.request_id]
+                pos = self._position(step, seg.request_id)
                 layout = row_layout(pos.source_len, pos.written, seg.span, c.retention_for(pos.source_len),
                                     c.sink_capacity, c.reverse_step_order)
                 rows.append((req.slot, layout, pos.source))
@@ -310,7 +326,7 @@ class BoundedKVManager(Resource):
                     # (an outer step whose region writes it) can't undo the write
                     continue
                 req = self._requests.get(seg.request_id)
-                pos = step.positions.get(seg.request_id)
+                pos = self._position(step, seg.request_id)
                 if req is not None and pos is not None and not ctx.is_padding_row(seg.request_id):
                     # from the declared position, so committing a step twice is harmless
                     req.written = pos.written + seg.span

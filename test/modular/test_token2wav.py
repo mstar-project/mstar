@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import dataclasses
 import os
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -184,29 +185,47 @@ class _Slots:
         return speech
 
 
+def _cache_handles(voice_tokens: tuple[int, int], dit_dtype: torch.dtype, slots: int = 3, device="cpu"):
+    """Token2wav's caches, as declared (``cache_arrays``), built on ``device`` with ``slots`` each, and the node's
+    handles of them, with no sources set."""
+    from mstar.engine.resources.base import EngineResourceInfo, build_resource
+    from mstar.engine.state.adapters import build_specs, node_handles
+    from mstar.model.components.token2wav.resources import cache_arrays
+
+    arrays = cache_arrays(_CacheSteps.KEYS, "t2w", voice_tokens, 1024, dit_dtype=dit_dtype)
+    specs = build_specs(arrays, kernel_settings={array.name: {"max_slots": slots} for array in arrays})
+    resources = {
+        spec.resource_key: build_resource(spec, EngineResourceInfo(device=torch.device(device), kv_dtype=None))
+        for spec in specs
+    }
+    return resources, node_handles(SimpleNamespace(declare_state=lambda: arrays), "t2w", resources)
+
+
 class _CacheSteps:
-    """Token2wav's three attention caches for requests in the voices of ``bank``, driven through
-    admit / plan / commit one window at a time, as the engine does, and each request's Value
-    fields (``_Slots``). ``dit_dtype``: the DiT caches' dtype, which it computes in (the bank's
-    must match)."""
+    """Token2wav's three attention caches, as declared (``cache_arrays``), for requests in the
+    voices of ``bank``, through the state contract's handles: each window's step expanded,
+    admitted, planned, its calls opened, and committed, as the engine runs it; and each
+    request's Value fields (``_Slots``). ``dit_dtype``: the DiT caches' dtype, which it
+    computes in (the bank's must match)."""
+
+    KEYS = Token2WavKeys(codes="tts_code", state="t2w", kv={"enc1": "e1_kv", "enc2": "e2_kv", "dit": "dit_kv"})
 
     def __init__(self, bank, slots: int, device, dit_dtype: torch.dtype | None = None):
-        from mstar.engine.resources.kv.bounded.config import BoundedKVConfig
-        from mstar.engine.resources.kv.bounded.manager import BoundedKVManager
-        from mstar.model.components.token2wav.model import CACHE_FAMILIES, CacheCapacity
+        from mstar.engine.resources import StepRunner
+        from mstar.model.components.token2wav.model import CACHE_FAMILIES, CacheCapacity, WindowCaches
 
         self.bank = bank
         self.families = CACHE_FAMILIES
         p = max(bank.prompt_tokens)
-        self.resources = {
-            name: BoundedKVManager(BoundedKVConfig(
-                num_layers=f.num_layers, num_heads=f.num_heads, head_dim=f.head_dim, rows_per_request=f.rows,
-                max_source_len=f.rate * p, retention=f.retention, max_slots=slots,
-                reverse_step_order=f.reverse_step_order,
-                dtype=dit_dtype if name == "dit" and dit_dtype else torch.float32,
-            ), device)
-            for name, f in CACHE_FAMILIES.items()
-        }
+        self.resources, self.handles = _cache_handles(
+            (min(bank.prompt_tokens), p), dit_dtype or torch.float32, slots, device)
+        for name, family in self.families.items():
+            self.handles[self.KEYS.kv[name]].set_sources(
+                bank.source_fields(name, family.head_dim), [family.rate * n for n in bank.prompt_tokens])
+        self.caches = WindowCaches.bind(self.handles, self.KEYS.kv, self.families, {
+            name: self.handles[self.KEYS.kv[name]].array.source.max_len for name in self.families
+        })
+        self.runner = StepRunner(self.resources)
         self.layout = slot_layout(CacheCapacity(p), dit_dtype=dit_dtype)
         self.slots: dict = {}
         self.written: dict[str, int] = {}
@@ -222,49 +241,51 @@ class _CacheSteps:
 
     def window(self, rids, num_tokens: int, last: bool, voices: list[int] | None = None):
         """The Value rows, caches and per-row voice ids for one window of ``rids`` (each in
-        ``voices``, the bank's first by default), and a commit to call after it."""
-        from mstar.engine.resources.kv.bounded import BoundedKVStep, StreamPosition
-        from mstar.engine.resources.step import Segment, StepContext
-        from mstar.model.components.token2wav.model import AttentionCache, WindowCaches, window_tokens
+        ``voices``, the bank's first by default), with the window's step open; and a commit
+        to call after it, which checks and closes it."""
+        from mstar.engine.resources.step import Segment, StepContext, SubmoduleStep
+        from mstar.engine.state import ArrayStep
+        from mstar.engine.state.adapters import state_steps
+        from mstar.model.components.token2wav.model import window_tokens
 
         for r, v in zip(rids, voices or [0] * len(rids), strict=True):
             self.voice.setdefault(r, v)
-        ctx = StepContext(request_ids=list(rids), graph_walk="t2w", slot=0, capture=False)
-        caches, steps = {}, {}
-        for name, family in self.families.items():
-            positions = {}
-            for r in rids:
-                (source_len, written), voice = self.position(family, r)
-                positions[r] = StreamPosition(source_len, written, source=voice)
-            step = steps[name] = BoundedKVStep(
-                segments=[Segment(request_id=r, label="main", span=family.span(num_tokens, last)) for r in rids],
-                positions=positions,
+        step = state_steps(SubmoduleStep(state={
+            self.KEYS.kv[name]: ArrayStep(
+                segments=tuple(Segment(request_id=r, label="main", span=family.span(num_tokens, last)) for r in rids),
+                sources={r: self.voice[r] for r in rids},
             )
-            resource = self.resources[name]
-            assert resource.admit(step, ctx).ok
-            resource.plan(step, ctx)
-            caches[name] = AttentionCache(resource, self.bank.sources[name])
+            for name, family in self.families.items()
+        }), self.handles)
+        step.set_ctx(StepContext(request_ids=list(rids), graph_walk="t2w", slot=0, capture=False))
+        assert self.runner.admit(step).ok
+        self.runner.plan(step)
+        step.begin_calls()
 
         def commit():
-            for name, step in steps.items():
-                self.resources[name].commit(step, ctx)
+            try:
+                step.check_calls()
+            finally:
+                step.end_calls()
+            self.runner.commit(step)
             for r in rids:
                 self.written[r] = self.written.get(r, 0) + window_tokens(num_tokens, last)
         ids = torch.tensor([self.voice[r] for r in rids], device=self.bank.spk.device)
-        return _Slots(self, rids), WindowCaches(**caches), ids, commit
+        return _Slots(self, rids), self.caches, ids, commit
 
     def retained(self, name: str, rid) -> torch.Tensor:
         """The keys|values ``rid`` would attend next in ``name``'s caches, ``[layers, rows, H, n, 2d]``."""
         from mstar.engine.resources.kv.bounded.layout import READ_FROM_SOURCE, row_layout
 
-        family, resource = self.families[name], self.resources[name]
+        family, resource = self.families[name], self.resources[self.KEYS.kv[name]]
         (source_len, written), voice = self.position(family, rid)
         layout = row_layout(source_len, written, 0, family.retention(source_len),
                             resource.config.sink_capacity, family.reverse_step_order)
         slot = resource._requests[rid].slot
+        cache = resource._cache[:, slot]
         parts = []
         for from_source, (start, count) in zip(READ_FROM_SOURCE, layout.reads, strict=True):
-            buf = self.bank.sources[name][voice] if from_source else resource._cache[:, slot]
+            buf = self.bank.sources[name][voice] if from_source else cache
             parts.append(buf[..., start:start + count, :])
         return torch.cat(parts, dim=-2)
 
@@ -360,18 +381,18 @@ def test_truncation_matches_reference_bookkeeping(p):
         assert s.enc_len1 <= cap.enc_25hz and s.enc_len2 <= cap.frames_50hz and s.dit_len <= cap.frames_50hz
 
 
-def test_the_dit_refuses_voice_sources_in_another_dtype_than_its_caches():
-    """The fused DiT computes in its caches' dtype; a voice bank built in another one
-    is refused rather than attended in mixed precision."""
-    from types import SimpleNamespace
+def test_a_cache_refuses_voice_sources_in_another_dtype_than_it_holds():
+    """The DiT computes in its caches' dtype; a voice bank built in another one is refused when
+    the node hands it over, rather than attended in mixed precision."""
+    from mstar.model.components.token2wav.model import CACHE_FAMILIES
 
-    pytest.importorskip("triton")
-    from mstar.model.components.token2wav.kernels import dit_forward
+    fam = CACHE_FAMILIES["dit"]
+    p = 4
+    fields = {f: torch.zeros(1, fam.num_layers, fam.rate * p, fam.rows, fam.num_heads, fam.head_dim) for f in "kv"}
+    _, handles = _cache_handles((p, p), torch.float16)
+    with pytest.raises(ValueError, match="the array holds torch.float16"):
+        handles[_CacheSteps.KEYS.kv["dit"]].set_sources(fields, [fam.rate * p])
 
-    cnn_cache = torch.zeros(1, 1, 4, 2, dtype=torch.float16)
-    kv = [SimpleNamespace(source=torch.zeros(1, 1, dtype=torch.float32))]
-    with pytest.raises(ValueError, match="build the VoiceBank in the caches' dtype"):
-        dit_forward(None, torch.zeros(1, 80, 4), None, None, None, None, None, cnn_cache, kv)
 
 def test_sine_source_draw_order():
     """The excitation's draws come in the reference's order (phase, noise laid out
@@ -804,18 +825,29 @@ def test_a_windows_noise_is_the_draw_its_requests_generator_makes_for_it(random_
     assert torch.equal(got.harmonic, want.harmonic)
 
 
-def test_the_caches_are_a_bounded_kv_per_family_one_slot_short_of_each_value():
-    """Every cache family gets its bounded KV under the model's key, one slot short of each
-    Value, which also keeps its sink slot."""
+def test_the_caches_are_an_array_per_family_one_slot_short_of_each_value():
+    """Every cache family is an array under the model's key, whose one read keeps the family's
+    sink and window of a stream that starts with the voice's caches, a bounded KV resource one
+    slot short of each Value, which also keeps its sink slot."""
     from mstar.engine.resources.kv.bounded import BoundedKVSpec
+    from mstar.engine.state.adapters import build_specs
     from mstar.model.components.token2wav.model import CACHE_FAMILIES
-    from mstar.model.components.token2wav.resources import token2wav_kernel_settings, token2wav_resources
+    from mstar.model.components.token2wav.resources import token2wav_caches, token2wav_kernel_settings
 
-    specs = token2wav_resources(T2W_KEYS, "Token2Wav", (3.0, 10.0), max_slots=9)
-    kv = {s.resource_key: s for s in specs}
-    assert all(isinstance(s, BoundedKVSpec) for s in specs) and set(kv) == {T2W_KV[name] for name in CACHE_FAMILIES}
-    assert all(s.config.max_slots == 8 and s.nodes == {"Token2Wav"} for s in kv.values())
-    assert token2wav_kernel_settings(T2W_KEYS, 9) == {key: {"max_slots": 9} for key in T2W_KEYS.values}
+    arrays = token2wav_caches(T2W_KEYS, "Token2Wav", (3.0, 10.0), 2050)
+    assert [array.name for array in arrays] == [T2W_KV[name] for name in CACHE_FAMILIES]
+    for array, family in zip(arrays, CACHE_FAMILIES.values(), strict=True):
+        (read,) = array.reads.values()
+        assert read.mask == family.mask and read.op.distance_bias == family.positional
+        assert array.source.max_len == family.rate * (10 * 25 + 1)
+    settings = token2wav_kernel_settings(T2W_KEYS, 9)
+    assert settings == {**{key: {"max_slots": 9} for key in T2W_KEYS.values},
+                        **{key: {"max_slots": 8} for key in T2W_KV.values()}}
+    specs = build_specs(arrays, kernel_settings={key: settings[key] for key in T2W_KV.values()})
+    assert all(isinstance(s, BoundedKVSpec) and s.config.max_slots == 8 and s.nodes == {"Token2Wav"} for s in specs)
+    # the DiT's guidance pair is its entry's rows axis, which the bounded resource holds as rows of a request
+    assert {s.resource_key: s.config.rows_per_request for s in specs} == {
+        T2W_KV[name]: family.rows for name, family in CACHE_FAMILIES.items()}
 
 
 def test_the_state_is_a_plain_value_per_region_that_writes_it_and_a_host_field():
@@ -862,11 +894,11 @@ def test_band_fits_says_whether_the_band_stays_inside_the_position_table(t):
 def test_cut_conformer_caches_fit_the_position_table_for_any_served_voice():
     """MiniCPM-o's caches are cut, so a voice longer than any served passes the check; one
     of minutes, which the dense voice set-up could not hold either, does not."""
-    from mstar.model.components.token2wav.resources import token2wav_resources
+    from mstar.model.components.token2wav.resources import token2wav_caches
 
-    token2wav_resources(T2W_KEYS, "Token2Wav", (3.0, 60.0), max_slots=9)
+    token2wav_caches(T2W_KEYS, "Token2Wav", (3.0, 60.0), 2050)
     with pytest.raises(ValueError, match="too long"):
-        token2wav_resources(T2W_KEYS, "Token2Wav", (3.0, 150.0), max_slots=9)
+        token2wav_caches(T2W_KEYS, "Token2Wav", (3.0, 150.0), 2050)
 
 
 @pytest.mark.parametrize(

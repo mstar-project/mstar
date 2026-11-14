@@ -67,8 +67,8 @@ from mstar.model.components.token2wav.model import (
 )
 from mstar.model.components.token2wav.resources import (
     check_token2wav_slots,
+    token2wav_caches,
     token2wav_kernel_settings,
-    token2wav_resources,
     token2wav_state,
 )
 from mstar.model.components.token2wav.submodule import Token2WavSubmodule
@@ -251,8 +251,12 @@ class MiniCPMOModel(Model):
     # ------------------------------------------------------------------
 
     def declare_state(self) -> list[Array]:
-        # the vocoder's per-request state; the rest of the model still declares its specs by hand
-        return token2wav_state(T2W_KEYS, TOKEN2WAV)
+        # The vocoder's state, ~0.4 GB a slot (one speaking request) for the bundled voices; the rest of the model
+        # still declares its specs by hand. A reply's codes: the TTS's budget, led by its silence.
+        return [
+            *token2wav_state(T2W_KEYS, TOKEN2WAV),
+            *token2wav_caches(T2W_KEYS, TOKEN2WAV, self._voice_seconds(), TTS_SAMPLING.max_new_tokens + LEAD_SILENCE),
+        ]
 
     def kernel_settings(self) -> dict[str, dict[str, Any]]:
         return token2wav_kernel_settings(T2W_KEYS, T2W_DEFAULT_SLOTS)
@@ -313,9 +317,6 @@ class MiniCPMOModel(Model):
                 ),
             ),
             *self._tts_resources(),
-            # ~0.4 GB a slot (one speaking request) for the bundled voices;
-            # `t2w_state.max_slots` in the yaml sizes it
-            *token2wav_resources(T2W_KEYS, TOKEN2WAV, self._voice_seconds(), T2W_DEFAULT_SLOTS),
         ]
 
     def _voice_seconds(self) -> tuple[float, float]:

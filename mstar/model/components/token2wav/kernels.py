@@ -214,11 +214,6 @@ def dit_forward(dit, x, mu, mods, final_mod, spks, cond, cnn_cache, kv) -> torch
     and the returned velocity stay in ``x``'s dtype."""
     t = x.shape[-1]
     low = cnn_cache.dtype
-    if kv[0].source.dtype != low:
-        raise ValueError(
-            f"the DiT's voice sources are {kv[0].source.dtype} but its caches are {low}: "
-            "build the VoiceBank in the caches' dtype"
-        )
     h = torch.cat([x, mu, spks.unsqueeze(-1).expand(-1, -1, t), cond], dim=1).to(low)
     x = _linear(dit.in_proj, h.transpose(1, 2)).to(x.dtype).contiguous()
     pending = (None, None)
