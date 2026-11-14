@@ -1034,7 +1034,8 @@ The spec types are:
        ``max_tokens_per_request``, ``compile_op`` and ``workspace_mb``. ``CUDNN`` runs torch's
        cuDNN SDPA over equal-length segments (see `Cacheless attention (encoder towers)`_).
        ``DENSE`` runs FA3
-       ``flash_attn_varlen`` (AITER on ROCm) and falls back to FlashInfer if that kernel is
+       ``flash_attn_varlen`` (AITER on ROCm), or FA3's fixed-length kernel for an eager
+       plan of one non-causal segment, and falls back to FlashInfer if that kernel is
        missing. The heads are split across the node's TP ranks (TP × SP over
        a label the node's shard lists, on a node whose shard splits, below).
        ``workspace_mb`` is the floor of each label's FlashInfer workspace per slot (default
