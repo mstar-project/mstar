@@ -2699,8 +2699,9 @@ by precision, eager vs. CUDA graph; <code class="docutils literal notranslate"><
 prefill, the captured CUDA graphs, and multi-request batches.</p></li>
 <li><p>The default denoise attention backend is <code class="docutils literal notranslate"><span class="pre">dense_gen</span></code>
 (<code class="docutils literal notranslate"><span class="pre">Cosmos3Config.attention_backend</span></code>), which runs bs=1 eager generation
-attention as one FlashAttention-3 varlen kernel from the <code class="docutils literal notranslate"><span class="pre">fa3-fwd</span></code> wheel
-(AITER’s varlen kernel on ROCm).
+attention as one FlashAttention-3 kernel from the <code class="docutils literal notranslate"><span class="pre">fa3-fwd</span></code> wheel: varlen,
+or the fixed-length kernel for a single non-causal segment such as a
+guidance-off step (AITER’s varlen kernel on ROCm).
 That wheel is ABI-tied to the installed torch/CUDA build (Hopper builds
 exist for at least torch 2.9 + cu12.8 and torch 2.11 + cu13.0); install the
 one matching your environment. It ships kernels for sm_80 and sm_90a only.
