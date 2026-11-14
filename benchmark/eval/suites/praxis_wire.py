@@ -150,12 +150,12 @@ def _commands(reply: Any, expected: int) -> np.ndarray:
         raise ProtocolError(f"Positronic returned {count} commands, not {expected}")
     values = []
     for row in rows:
+        if not isinstance(row, dict) or set(row) != {"robot_command", "target_grip"}:
+            raise ProtocolError("Positronic v2 command needs only robot_command and target_grip")
         command = row.get("robot_command") if isinstance(row, dict) else None
         pose = np.asarray(command.get("pose"), dtype=np.float32) if isinstance(command, dict) else np.empty(0)
         if not isinstance(command, dict) or command.get("type") != "cartesian_pos" or pose.shape != (12,):
             raise ProtocolError("Positronic command needs a Cartesian pose of 12 floats")
-        if "timestamp" in row:
-            raise ProtocolError("Positronic v2 command contains an unsupported timestamp")
         try:
             grip = float(row["target_grip"])
         except (KeyError, TypeError, ValueError) as exc:

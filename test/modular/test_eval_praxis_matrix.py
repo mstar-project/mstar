@@ -66,7 +66,7 @@ def test_positronic_probe_refuses_missing_stack_or_wrong_warm_rows():
                "target_grip": 0.5}
     with pytest.raises(ProtocolError, match="not 24"):
         _commands({"result": [command] * 21}, 24)
-    with pytest.raises(ProtocolError, match="unsupported timestamp"):
+    with pytest.raises(ProtocolError, match="only robot_command and target_grip"):
         _commands({"result": [{**command, "timestamp": 0.0}] * 24}, 24)
 
 
