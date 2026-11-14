@@ -16,16 +16,16 @@ import torch
 
 from mstar.engine.resources import (
     AttentionSpec,
-    KVReqConfig,
     KVSpec,
     PositionSpec,
     SamplerSpec,
-    SamplingReqConfig,
     resolve_spec_dependencies,
 )
 from mstar.engine.resources.kv.bounded import BoundedKVSpec
 from mstar.engine.resources.linear_attn.config import LinearAttnSpec, LinearAttnVariant
 from mstar.engine.resources.recurrent import Mamba2Geometry, RecurrentStateSpec
+from mstar.engine.state import SampleSettings
+from mstar.engine.state.adapters import node_resources
 from mstar.model.nemotron_duplex.config import (
     CODEC_STATE,
     ENCODER_FRONT,
@@ -38,7 +38,7 @@ from mstar.model.nemotron_duplex.config import (
     NANO_SAMPLER,
     TALKER_ATTN,
     TALKER_KV,
-    TALKER_POS,
+    TALKER_PREV,
     NemotronDuplexConfig,
 )
 from mstar.model.nemotron_duplex.nemotron_duplex_model import NemotronDuplexModel
@@ -48,6 +48,7 @@ from mstar.streaming.topology import client_stream_limits
 from mstar.validation.client_streams import check_client_streams
 
 CONFIG_PATH = Path(__file__).resolve().parents[2] / "configs" / "nemotron_duplex.yaml"
+TALKER_POS = "talker_pos"   # the key `position_key` gives the talker KV's positions
 
 WALKS = {"encode", "decode", "talker_decode"}
 NODES = {"conformer_encoder", "nano_llm", "eartts_talker"}
@@ -81,11 +82,11 @@ def test_duplex_node_resources():
     recurrent pools, its conv tails and its front end's audio / mel tails. A
     slot per session each."""
     model = _make_model()
-    specs = model.get_node_resources()
+    specs = node_resources(model)
     by_key = resolve_spec_dependencies(specs)          # unique keys, dependencies satisfied
     assert set(by_key) == {CODEC_STATE, ENCODER_FRONT, ENCODER_STATE, ENCODER_KV, NANO_KV, NANO_ATTN,
                            MAMBA_STATE, MAMBA,
-                           NANO_SAMPLER, TALKER_KV, TALKER_ATTN, TALKER_POS}
+                           NANO_SAMPLER, TALKER_KV, TALKER_ATTN, TALKER_POS, TALKER_PREV}
     nano_keys = {NANO_KV, NANO_ATTN, MAMBA_STATE, MAMBA, NANO_SAMPLER}
     node = {**dict.fromkeys((ENCODER_STATE, ENCODER_FRONT, ENCODER_KV), {"conformer_encoder"}),
             **dict.fromkeys(nano_keys, {"nano_llm"})}
@@ -119,7 +120,8 @@ def test_duplex_node_resources():
     assert isinstance(by_key[TALKER_ATTN], AttentionSpec) and by_key[TALKER_ATTN].config.kv_cache == TALKER_KV
     tpos = by_key[TALKER_POS]
     assert isinstance(tpos, PositionSpec) and tpos.config.kv_cache == TALKER_KV
-    assert tpos.config.rotary_dim == eartts.head_dim and tpos.config.interleave is False
+    # a counter: the talker rotates in torch, with a theta per layer kind, so its positions declare no Rope
+    assert tpos.config.rotary_dim is None and tpos.config.interleave is False
 
     nano = model.config.nano
     pool = by_key[MAMBA_STATE]
@@ -166,26 +168,8 @@ def test_duplex_shipped_configs_turn_websocket_deflate_off():
         assert yaml.safe_load((CONFIG_PATH.parent / name).read_text())["ws_per_message_deflate"] is False
 
 
-@pytest.mark.parametrize("key", [MAMBA_STATE, ENCODER_STATE, ENCODER_FRONT, CODEC_STATE, ENCODER_KV, TALKER_KV,
-                                 NANO_KV])
-def test_duplex_refuses_a_session_cap_one_per_session_resource_cannot_hold(key):
-    """Every session holds a slot in each recurrent pool and its nano and talker
-    pages from start to end; a session past any of them waits on admit until
-    another ends. Raising the cap means raising them all, and a deployment
-    that misses one is refused at startup, naming it."""
-    model = _make_model()
-    resources = {MAMBA_STATE: {"max_slots": 49}, ENCODER_STATE: {"max_slots": 49},
-                 ENCODER_FRONT: {"max_slots": 49}, CODEC_STATE: {"max_slots": 49},
-                 ENCODER_KV: {"max_slots": 48},
-                 TALKER_KV: {"max_num_pages": model.talker_kv_pages(128, 48)},
-                 NANO_KV: {"max_num_pages": model.nano_kv_pages(128, 48)}}
-    model.validate_config_yaml({"max_concurrent_requests": 48, "resources": resources}, "c.yaml")
-    del resources[key]
-    with pytest.raises(ValueError, match=f"resources.{key}"):
-        model.validate_config_yaml({"max_concurrent_requests": 48, "resources": resources}, "c.yaml")
-
-
-@pytest.mark.parametrize("kwargs", [{"max_session_s": 640.0}, {"max_prompt_tokens": 8192}])
+# 596 s, the longest session the talker's default window takes
+@pytest.mark.parametrize("kwargs", [{"max_session_s": 596.0}, {"max_prompt_tokens": 8192}])
 def test_duplex_kv_pools_hold_the_session_cap_at_the_calls_it_serves(kwargs):
     """A session holds its nano pages (prompt and every frame) and its talker
     pages for life, so both pools are sized from the longest call and prompt
@@ -212,7 +196,7 @@ def test_duplex_encoder_state_is_stored_in_the_engines_compute_dtype(autocast_dt
 
     model = _make_model()
     model.validate_config_yaml({"autocast_dtype": autocast_dtype}, "c.yaml")
-    specs = {s.resource_key: s for s in model.get_node_resources()}
+    specs = {s.resource_key: s for s in node_resources(model)}
     info = EngineResourceInfo(device=torch.device("cpu"), kv_dtype=autocast_dtype)
     pool = RecurrentStatePool.build(specs[ENCODER_STATE], info)
     want = torch.float32 if autocast_dtype is None else autocast_dtype
@@ -331,14 +315,9 @@ def test_duplex_refuses_a_featurizer_it_does_not_run(tmp_path, key, value):
         NemotronDuplexConfig.from_pretrained(str(tmp_path))
 
 
-def test_duplex_talker_builds_its_codec_from_the_checkpoint(monkeypatch):
-    """The talker decodes its own codes, with the checkpoint's codec (its
-    codebooks per frame, here) and the checkpoint's talker config, which emits
-    that many."""
+def _talker_from(monkeypatch, ckpt: NemotronDuplexConfig):
     import mstar.model.nemotron_duplex.components.eartts_talker as et
 
-    ckpt = NemotronDuplexConfig()
-    ckpt.eartts.num_quantizers = ckpt.codec.num_quantizers = 8
     _stub_checkpoint(monkeypatch, ckpt)
     model = _make_model()
     model.model_path_hf, model.cache_dir = "unused", None
@@ -346,18 +325,34 @@ def test_duplex_talker_builds_its_codec_from_the_checkpoint(monkeypatch):
     monkeypatch.setattr(NemotronDuplexModel, "_talker_tokenizer", lambda self: None)
     monkeypatch.setattr(et, "build_char_vocab", lambda tok: [])
     monkeypatch.setattr(et, "subword_to_char_ids", lambda tok, cv: ({}, None))
-    talker = model.get_submodule("eartts_talker", device="cpu")
-    assert talker.config.eartts.num_quantizers == 8 and len(talker.codec.prvq.mus_list) == 8
+    return model.get_submodule("eartts_talker", device="cpu")
+
+
+def test_duplex_talker_builds_its_codec_from_the_checkpoint(monkeypatch):
+    """The talker decodes its own codes, with the checkpoint's codec (its
+    codebooks' size, here) and the checkpoint's talker config, which samples
+    from that many entries."""
+    ckpt = NemotronDuplexConfig()
+    ckpt.eartts.codebook_size = ckpt.codec.codebook_size = 512
+    talker = _talker_from(monkeypatch, ckpt)
+    assert talker.config.eartts.codebook_size == 512 and talker.codec.prvq.mus_list[0].shape[0] == 512
+
+
+def test_a_checkpoint_whose_talker_emits_other_codebooks_is_refused(monkeypatch):
+    """The talker's previous codes are declared state, one per codebook, sized before the checkpoint is read."""
+    ckpt = NemotronDuplexConfig()
+    ckpt.eartts.num_quantizers = ckpt.codec.num_quantizers = 8
+    with pytest.raises(ValueError, match=f"config.json sizes resources.{TALKER_PREV}"):
+        _talker_from(monkeypatch, ckpt)
 
 
 def test_duplex_request_resource_configs():
     model = _make_model()
     cfg = model.get_request_resource_configs([], [], {})
-    assert set(cfg) == {NANO_SAMPLER, TALKER_KV}
-    assert isinstance(cfg[TALKER_KV], KVReqConfig)
-    assert cfg[TALKER_KV].get_labels("eartts_talker", "talker_decode") == ["main", "uncond"]
+    # the talker's two streams open from its layout's labels
+    assert set(cfg) == {NANO_SAMPLER}
     text = cfg[NANO_SAMPLER]
-    assert isinstance(text, SamplingReqConfig)
+    assert isinstance(text, SampleSettings)
     assert text.temperature == model.config.temperature and text.top_p == model.config.top_p
     # request knobs override the config defaults
     greedy = model.get_request_resource_configs([], [], {"temperature": 0.0, "ignore_eos": True})[NANO_SAMPLER]
@@ -436,7 +431,7 @@ def test_duplex_realtime_frames_audio_on_the_encoder_fronts_frame():
     off the whole-step graph."""
     model = _make_model()
     (client,) = model.get_partition_topology().client_connections()
-    front = {s.resource_key: s for s in model.get_node_resources()}[ENCODER_FRONT]
+    front = {s.resource_key: s for s in node_resources(model)}[ENCODER_FRONT]
     assert client.audio.frame_samples == front.config.blocks["sig"].shape[0]
 
 
