@@ -329,7 +329,7 @@ fn response_format_request(v: &Value) -> Result<Option<Value>, String> {
     let obj = match v {
         Value::Null => return Ok(None),
         Value::Object(o) => o,
-        _ => return Err(format!("response_format must be an object; got {v}")),
+        _ => return Err(format!("response_format must be an object; got {}", py_value_repr(v))),
     };
     match obj.get("type").and_then(Value::as_str) {
         Some("text") => Ok(None),
@@ -338,9 +338,9 @@ fn response_format_request(v: &Value) -> Result<Option<Value>, String> {
             Some(schema) if !schema.is_null() => Ok(Some(serde_json::json!({"json": schema}))),
             _ => Err("response_format json_schema needs json_schema.schema".to_string()),
         },
-        other => Err(format!(
+        _ => Err(format!(
             "response_format type must be text, json_object or json_schema; got {}",
-            other.map_or("none".to_string(), |t| format!("'{t}'"))
+            py_value_repr(obj.get("type").unwrap_or(&Value::Null))
         )),
     }
 }

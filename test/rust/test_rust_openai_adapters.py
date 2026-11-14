@@ -473,6 +473,48 @@ def test_a_text_only_chat_is_refused_or_submitted_as_python_does(case, tmp_path)
     assert not sub["files"]
 
 
+# ── response_format and structured_outputs ───────────────────────────────────
+
+SCHEMA = {"type": "object", "properties": {"a": {"type": "integer"}}, "required": ["a"]}
+STRUCTURED_CASES = {
+    "json-object": {"response_format": {"type": "json_object"}},
+    "json-schema": {"response_format": {"type": "json_schema",
+                                        "json_schema": {"name": "n", "strict": True, "schema": SCHEMA}}},
+    "text": {"response_format": {"type": "text"}},
+    "null": {"response_format": None},
+    "unknown-type": {"response_format": {"type": "yaml"}},
+    "no-type": {"response_format": {}},
+    "numeric-type": {"response_format": {"type": 5}},
+    "schema-missing": {"response_format": {"type": "json_schema", "json_schema": {"name": "n"}}},
+    "not-an-object": {"response_format": "json_object"},
+    "both": {"response_format": {"type": "json_object"}, "structured_outputs": {"regex": "a+"}},
+    "structured-outputs": {"structured_outputs": {"choice": ["yes", "no"]}},
+}
+
+
+@pytest.mark.parametrize("case", sorted(STRUCTURED_CASES))
+@pytest.mark.parametrize("model", ["qwen3_5_0.8b", "glm52"])
+def test_both_frontends_turn_a_response_format_into_the_same_structured_outputs(model, case, tmp_path):
+    """A JSON ``response_format`` reaches the backend as the same ``structured_outputs``
+    from either frontend, and a bad one is the same 400, word for word."""
+    body = {"model": model, "messages": [{"role": "user", "content": "Reply in JSON."}], **STRUCTURED_CASES[case]}
+    try:
+        want, refusal = ADAPTER_REGISTRY[model].chat_to_request(_python_request(body), tmp_path), None
+    except ValueError as e:
+        want, refusal = None, str(e)
+    stub = _StubAPIServer()
+    with _model_stack(model, stub) as (port, _upload):
+        status, data = _post(port, ROUTES["chat"][0], body, timeout=30)
+    if refusal is not None:
+        assert (status, json.loads(data)["error"]["message"]) == (400, refusal)
+        assert not stub.submitted
+        return
+    assert status == 200, data
+    (sub,) = stub.submitted
+    assert sub["mk"].get("structured_outputs") == want.model_kwargs.get("structured_outputs")
+    assert "response_format" not in sub["mk"] and "response_format" not in want.model_kwargs
+
+
 # ── an image request reaches the backend as the Python adapter builds it ────
 
 IMAGE_CASES = {
