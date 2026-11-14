@@ -198,8 +198,9 @@ def test_a_request_whose_grammar_compiles_holds_back_no_other(ranks):
 @pytest.mark.parametrize("failure", ["compile", "start", "refused draw", "two rows"])
 def test_a_grammar_that_can_no_longer_hold_fails_its_request(monkeypatch, failure):
     """A grammar that fails to compile is the request's error at its next admit;
-    a matcher that fails to start, the same; a draw it refuses, at the admit after the step that accepts it, and past it
-    the row may only stop; two rows of one step (a draft's), at that step's admit.
+    a matcher that fails to start, the same; a draw it refuses, at the admit after the step that accepts it, and that
+    step's draw may be anything but a stop, so the reply can't end as a 200 before the error lands; two rows of one
+    step (a draft's), at that step's admit.
     A pre-admit gives the same answer as a full admit, as a pre-admitted step
     skips its full admit on one TP rank and not another."""
     res = _resource(graph=True)
@@ -225,8 +226,8 @@ def test_a_grammar_that_can_no_longer_hold_fails_its_request(monkeypatch, failur
         assert res.admit(step, pre).ok and res.admit(step, ctx).ok, "ranks would disagree on this step"
         res.plan(step, ctx)
         logits = torch.zeros(4, V)
-        logits[:, VOCAB.index(b"x")] = 1.0
-        assert res.sample([0], logits)[0].item() == EOS, "the reply went on past its grammar"
+        logits[:, EOS] = 1.0  # the model's own pick is its stop
+        assert res.sample([0], logits)[0].item() != EOS, "the reply ended before its error"
     rows = (0, 1, 0) if failure == "two rows" else (0, 1)
     ctx = StepContext(request_ids=rows, graph_walk="w", slot=0, capture=False, slot_lease=lease)
     outcome = res.admit(step, ctx)

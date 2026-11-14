@@ -806,10 +806,9 @@ anything but a stop that once, and the next step's
 admit reports the error (unless the reply reaches its length limit at that draw; one row's own
 fill failing fails only that row). Under tensor parallelism only the first rank fills, so the
 row may only stop there, and the reply ends at that stop. A drawn token the grammar refuses
-(only a mask that failed to cover the draw lets one through) fails its request at the step after
-the next, and meanwhile the reply may only draw
-one of the model's stop tokens; when the reply finishes first (a stop or its length limit;
-always without async scheduling), it ends normally with the refused token in it. The stops here
+(only a mask that failed to cover the draw lets one through) fails its request with an error at
+the step after the next; the draw between may be anything but a stop, so the reply can't end
+first (unless it reaches its length limit at the refused draw or the one after). The stops here
 are the ones the model's ``text_output()`` declares, else, for a Hugging Face tokenizer, the
 stops xgrammar finds for it (its EOS); a model with neither gets none, and its row is left
 unmasked, so a model whose loop stops on tokens of its own should declare them there (a loop that stops

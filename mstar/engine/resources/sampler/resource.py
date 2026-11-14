@@ -974,8 +974,8 @@ class GrammarSamplerResource(SamplerResource):
         accept the same tokens, each as its next draw begins (`_fill_grammar`).
 
         A refused draw is found where the next step accepts it, so it fails its
-        request at the admit after that; meanwhile its row may draw only a stop
-        token. Admit accepts no draws itself: a pre-admitted step skips its full
+        request at the admit after that; meanwhile its row may draw anything but a
+        stop, so the reply can't end first. Admit accepts no draws itself: a pre-admitted step skips its full
         admit on one rank and not another, and the ranks would disagree."""
         if not self._grammar.any_of(ctx.request_ids):
             return ADMIT_OK

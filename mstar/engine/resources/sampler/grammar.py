@@ -264,8 +264,8 @@ class GrammarRows:
         self.vocab_size = size
         self._decides = decides
         self.words = math.ceil(size / 32)
-        # the mask of a row whose grammar failed, until its request fails: only a stop. The
-        # stops are the ids xgrammar resolved: the model's, else its tokenizer's EOS
+        # the ids xgrammar resolved as stops (the model's, else its tokenizer's EOS), which a
+        # failed row is kept from (`fill`)
         stop = sorted(self.info.stop_token_ids)
         bits = torch.zeros(self.words * 32, dtype=torch.int64)
         bits[stop] = 1
@@ -353,13 +353,13 @@ class GrammarRows:
                     row.error = f"structured_outputs grammar failed to accept drawn token {drawn[i]}: {exc}"
 
     def fill(self, rids) -> torch.Tensor:
-        """The host bitmask for a step's rows: all ones for a free row, and only the stop
-        ids for a row whose grammar failed earlier. A row whose own fill raises fails its
-        request when this rank serves alone, and draws anything but a stop that once (a stop
-        would end the reply before the error lands); otherwise (under several ranks, where an
-        error set on rank 0 alone would split the admits) it may only stop. A model that
-        resolves no stop gets all ones either way. If the batched call raises, its rows fill
-        one by one, so only the bad row fails."""
+        """The host bitmask for a step's rows: all ones for a free row. A row whose grammar
+        failed (in this step's accepts, alike on every rank) draws anything but a stop, so its
+        request reaches the next admit and fails there with the error instead of ending as a
+        200. A row whose own fill raises does the same when this rank serves alone; under
+        several ranks it may only stop, since only rank 0 fills and an error set there would
+        split the admits. A model that resolves no stop gets all ones. If the batched call
+        raises, its rows fill one by one, so only the bad row fails."""
         mask = torch.full((len(rids), self.words), -1, dtype=torch.int32)
         matchers, index = [], []
         for i, rid in enumerate(rids):
@@ -370,7 +370,7 @@ class GrammarRows:
                 matcher = row.matcher
                 if matcher is None:
                     if self._stops is not None:
-                        mask[i] = self._stops
+                        mask[i] = ~self._stops
                 elif not matcher.is_terminated():
                     matchers.append(matcher)
                     index.append(i)
