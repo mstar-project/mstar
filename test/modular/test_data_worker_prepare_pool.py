@@ -8,6 +8,7 @@ import queue
 import threading
 import time
 import wave
+from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
@@ -332,6 +333,52 @@ def test_positronic_observation_reaches_model_as_raw_pose_and_image_inputs(monke
     assert len(sent) == 1 and sent[0].episode == "episode"
     assert "robot_state" not in sent[0].model_kwargs
     assert sent[0].model_kwargs["action_format"] == "positronic"
+
+
+@pytest.mark.parametrize(("executed_rows", "frame_count"), [(0, 1), (21, 22)])
+def test_praxis_real_model_defers_mask_layout_until_episode_walk(
+    monkeypatch, executed_rows, frame_count,
+):
+    from mstar.api_server.openpi import pack
+    from mstar.model.praxis1.praxis1_model import Praxis1Model
+
+    model = Praxis1Model(
+        "runwayml/praxis-1-droid", skip_weight_loading=True,
+        max_context_chunks=1, max_text_tokens=256,
+    )
+    model.config = replace(model.config, normalization={
+        "proprio_mean": [0.0] * 10, "proprio_std": [1.0] * 10,
+    })
+
+    class Tokenizer:
+        def __call__(self, **kwargs):
+            return {"input_ids": torch.tensor([[1]]), "attention_mask": torch.tensor([[1]])}
+
+    monkeypatch.setattr(model, "_tokenizer", Tokenizer)
+    monkeypatch.setattr(cpus, "_plan", cpus.CpuPlan(frozenset(range(8)), usable=8))
+    worker = _thread(model)
+    image = np.zeros((4, 6, 3), np.uint8)
+    images = image if frame_count == 1 else np.stack([image] * frame_count)
+    pose = [0, 0, 0.6, 1, 0, 0, 0]
+    poses = pose if frame_count == 1 else np.asarray([pose] * frame_count, np.float32)
+    grip = 0.25 if frame_count == 1 else np.full(frame_count, 0.25, np.float32)
+    request = PreprocessInput(
+        request_id=f"praxis-{frame_count}", text="move", file_paths=None,
+        input_modalities=["image", "text"], output_modalities=["action"],
+        model_kwargs={"executed_rows": executed_rows}, episode="episode",
+        positronic_frame=pack({"session_id": "episode", "observation": {
+            "task": "move", "image.exterior": images, "image.wrist": images,
+            "robot_state.ee_pose": poses, "grip": grip,
+        }}),
+    )
+    prepared = worker._prepare_input(request)
+    assert [tuple(view.shape) for view in prepared.tensors["image_inputs"]] == [
+        (frame_count, 3, 4, 6),
+    ] * 2
+    assert prepared.tensors["executed_pose_inputs"][0].shape == (frame_count, 8)
+    assert prepared.model_kwargs["action_format"] == "positronic"
+    assert "__state_chunk_causal_layout__" not in prepared.model_kwargs
+    assert "__state_expert_layout__" not in prepared.model_kwargs
 
 
 @pytest.mark.parametrize(
