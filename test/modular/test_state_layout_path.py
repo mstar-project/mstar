@@ -275,6 +275,11 @@ def test_chunk_layout_can_be_supplied_by_walk_plan_after_intake():
             del output.metadata["state_layout"]
             return output
 
+        def walk_plan(self, *args, **kwargs):
+            return [WalkStep("prefill", step_metadata={
+                CHUNK_CAUSAL_LAYOUT_KWARG: {"chunk": {"main": {"chunk_attn": [12, 8, 8]}}},
+            })]
+
     kwargs = _run(_worker(PlannedChunk(), _deployment()))
     assert CHUNK_CAUSAL_LAYOUT_KWARG not in kwargs
 
@@ -284,9 +289,9 @@ def test_chunk_layout_can_be_supplied_by_walk_plan_after_intake():
         _check_mask_layouts([WalkStep("prefill")], required)
 
     request_layout = {"chunk": {"main": {"chunk_attn": [4, 16, 8]}}}
-    planned_layout = {"chunk": {"main": {"chunk_attn": [12, 8, 8]}}}
+    planned_layout = model.walk_plan("main", [], [], {}, kwargs)[0].step_metadata[CHUNK_CAUSAL_LAYOUT_KWARG]
     plan = _with_chunk_causal_layout(
-        [WalkStep("prefill", step_metadata={CHUNK_CAUSAL_LAYOUT_KWARG: planned_layout})], request_layout,
+        model.walk_plan("main", [], [], {}, kwargs), request_layout,
     )
     _check_mask_layouts(plan, required)
     assert plan[0].step_metadata[CHUNK_CAUSAL_LAYOUT_KWARG] == planned_layout
