@@ -1815,8 +1815,9 @@ for a <code class="docutils literal notranslate"><span class="pre">one_row_per_s
 cuDNN SDPA over equal-length segments (see <a class="reference internal" href="#cacheless-attention-encoder-towers">Cacheless attention (encoder towers)</a>).
 <code class="docutils literal notranslate"><span class="pre">DENSE</span></code> runs FA3
 <code class="docutils literal notranslate"><span class="pre">flash_attn_varlen</span></code> (AITER on ROCm), or FA3’s fixed-length kernel for an eager
-plan of one non-causal segment, and falls back to FlashInfer if that kernel is
-missing. The heads are split across the node’s TP ranks (TP × SP over
+plan of one non-causal segment on Hopper (and, at head dim 128, once per segment
+for a plan whose segments are all at least 1536 rows), and falls back to FlashInfer
+if that kernel is missing. The heads are split across the node’s TP ranks (TP × SP over
 a label the node’s shard lists, on a node whose shard splits, below).
 <code class="docutils literal notranslate"><span class="pre">workspace_mb</span></code> is the floor of each label’s FlashInfer workspace per slot (default
 <code class="docutils literal notranslate"><span class="pre">MSTAR_WORKSPACE_BUFFER_MB</span></code>, 512, which doesn’t apply once it is declared): a plan that
