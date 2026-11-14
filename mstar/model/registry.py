@@ -41,6 +41,8 @@ MODEL_REGISTRY: dict[str, tuple[str, str]] = {
     "orpheus": ("mstar.model.orpheus.orpheus_model", "OrpheusModel"),
     "parakeet": ("mstar.model.parakeet.parakeet_model", "ParakeetModel"),
     "pi05": ("mstar.model.pi05.pi05_model", "Pi05Model"),
+    "praxis1_droid": ("mstar.model.praxis1.praxis1_model", "Praxis1Model"),
+    "praxis1_yam": ("mstar.model.praxis1.praxis1_model", "Praxis1Model"),
     "qwen3_omni": ("mstar.model.qwen3_omni.qwen3_omni_model", "Qwen3OmniModel"),
     "qwen3_asr": ("mstar.model.qwen3_asr.qwen3_asr_model", "Qwen3ASRModel"),
     "qwen3_asr_realtime": ("mstar.model.qwen3_asr.qwen3_asr_model", "Qwen3ASRModel"),
@@ -163,6 +165,12 @@ HF_MODELS: dict[str, dict] = {
     # (~14 GB). mstar/model/pi05/weight_loader.py handles the lerobot->mstar
     # state-dict remap inside Pi05Model.get_submodule().
     "pi05": {"model_path_hf": "lerobot/pi05_base"},
+    # Praxis-1, Runway's video-action policy. One class, the rig comes from
+    # the checkpoint: ``droid`` is the single-arm DROID wire, ``yam`` the
+    # bimanual one. Both need the public Wan2.2 VAE and Qwen3.5-2B beside
+    # the checkpoint; neither ships with it.
+    "praxis1_droid": {"model_path_hf": "runwayml/praxis-1-droid"},
+    "praxis1_yam": {"model_path_hf": "runwayml/praxis-1-yam"},
     "qwen3_omni": {"model_path_hf": "Qwen/Qwen3-Omni-30B-A3B-Instruct"},
     # Qwen3-ASR: AuT audio encoder + dense Qwen3 decoder. ``qwen3_asr`` is
     # the 1.7B transcription model, ``qwen3_asr_realtime`` the 0.6B variant
