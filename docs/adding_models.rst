@@ -472,8 +472,8 @@ node skips the read on one walk: ``Array.nodes`` does not identify which walks
 use it. The conductor refuses missing or malformed lengths before dispatch.
 
 Within-step expert attention uses the same array and walk rule with
-``ExpertSelf(chunk_len, future_per_chunk)`` or
-``ExpertCross(chunk_len, future_per_chunk, tokens_per_frame, window_frames)``.
+``ExpertSelf(chunk_len, future_per_chunk=...)`` or
+``ExpertCross(chunk_len, future_per_chunk=..., tokens_per_frame=..., window_frames=..., include_noised=True)``.
 The typed prompt layouts are ``Layout(expert_self={read: ExpertSelfLayout(num_chunks=)})``
 and ``Layout(expert_cross={read: ExpertCrossLayout(num_chunks=, global_len=,
 clean_frames=, noised_frames=)})``. A walk can instead set
@@ -481,7 +481,13 @@ clean_frames=, noised_frames=)})``. A walk can instead set
 ``{array: {label: {read: [num_chunks]}}}`` for self attention or
 ``{array: {label: {read: [num_chunks, global_len, clean_frames, noised_frames]}}}``
 for cross attention. The walk's read-keyed value overrides the prompt's value;
-the conductor checks the names and lengths before dispatch.
+the conductor checks the names and frame counts before dispatch. For cross
+attention, ``noised_frames`` equals ``num_chunks * chunk_len``. With
+``clean_frames > 0``, it must also be ``1``, ``chunk_len``,
+``clean_frames + 1``, or ``clean_frames + chunk_len``. The engine checks the
+segment span: ``global_len + (clean_frames + noised_frames) * tokens_per_frame``
+for cross attention, and ``num_chunks * (1 + future_per_chunk + chunk_len)``
+for self attention. A span mismatch fails when the engine plans the step.
 
 The footprint adds the spans, the growth at each loop's iterations (up to a ``LabelLayout``'s
 ``max_growth``) and the scratch, and rounds up to whole pages per label. A span's own scratch counts only with the spans before
