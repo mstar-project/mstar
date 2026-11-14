@@ -21,9 +21,9 @@ logger = logging.getLogger(__name__)
 
 # imported here, not per `run`: the wheel may be absent, so keep the failure
 try:
-    from fa3_fwd_interface import flash_attn_varlen_func
+    from fa3_fwd_interface import flash_attn_func, flash_attn_varlen_func
 except Exception as _fa3_exc:  # noqa: BLE001
-    flash_attn_varlen_func = None
+    flash_attn_func = flash_attn_varlen_func = None
     _VARLEN_IMPORT_ERROR: str | None = f"{type(_fa3_exc).__name__}: {_fa3_exc}"
 else:
     _VARLEN_IMPORT_ERROR = None

@@ -117,6 +117,67 @@ def test_eager_causal_matches_reference():
     close(w.run(q, k, v), ref(q, k, v, layout, causal=True))
 
 
+def _count_fixed_length_calls(monkeypatch):
+    import mstar.engine.resources.attn.ragged.dense_wrappers as dw
+
+    if dw.flash_attn_func is None:
+        pytest.skip("no FA3 fixed-length kernel (AITER)")
+    calls, fixed = [], dw.flash_attn_func
+    monkeypatch.setattr(dw, "flash_attn_func", lambda *a, **kw: calls.append(1) or fixed(*a, **kw))
+    return dw, calls
+
+
+def _varlen(dw, q, k, v, q_len, kv_len, causal, scale):
+    out = dw.flash_attn_varlen_func(
+        q, k, v, cu([q_len]).to(DEVICE), cu([kv_len]).to(DEVICE), q_len, kv_len, causal=causal, softmax_scale=scale,
+    )
+    return out[0] if isinstance(out, tuple) else out
+
+
+# the test file's 4 heads at 72, and Cosmos3's GQA geometry at an even and an odd count of 128-row blocks
+@pytest.mark.parametrize("heads,kv_heads,head_dim,q_len,kv_len", [
+    (HEADS, HEADS, HEAD_DIM, 300, 300),
+    (32, 8, 128, 256, 256),
+    (32, 8, 128, 384, 475),
+])
+def test_one_segment_runs_the_fixed_length_kernel_bit_exactly(monkeypatch, heads, kv_heads, head_dim, q_len, kv_len):
+    """A lone non-causal eager segment runs on FA3's fixed-length kernel, with the
+    varlen kernel's output bit for bit; rows past the plan keep it on varlen."""
+    dw, calls = _count_fixed_length_calls(monkeypatch)
+    geometry = dict(num_qo_heads=heads, num_kv_heads=kv_heads, head_dim=head_dim)
+    gen = torch.Generator(device=DEVICE).manual_seed(3)
+    q = torch.randn(q_len, heads, head_dim, dtype=DTYPE, device=DEVICE, generator=gen)
+    k, v = (torch.randn(kv_len, kv_heads, head_dim, dtype=DTYPE, device=DEVICE, generator=gen) for _ in range(2))
+    if q_len == kv_len:
+        w = wrapper(**geometry)
+        w.plan(cu([q_len]))
+    else:
+        w = cross_wrapper(**geometry)
+        w.plan(cu([q_len]), cu([kv_len]))
+    got = w.run(q, k, v)
+    assert calls, "a one-segment eager plan should take the fixed-length kernel"
+    assert torch.equal(got, _varlen(dw, q, k, v, q_len, kv_len, False, w.sm_scale))
+    calls.clear()
+    pad = torch.zeros(10, heads, head_dim, dtype=DTYPE, device=DEVICE)
+    w.run(torch.cat([q, pad]), k, v)  # rows the plan doesn't cover
+    assert not calls
+
+
+def test_causal_and_captured_single_segments_stay_on_varlen(monkeypatch):
+    """The fixed-length kernel is slower on short causal segments, and a graph
+    replays its bucket's kernel, so neither takes it."""
+    _, calls = _count_fixed_length_calls(monkeypatch)
+    w, layout = wrapper(), cu([300])
+    q, k, v = qkv(300)
+    w.plan(layout, causal=True)
+    close(w.run(q, k, v), ref(q, k, v, layout, causal=True))
+    g = graph_wrapper()
+    g.plan(cu([MAX_TOKENS]))
+    q, k, v = qkv(MAX_TOKENS)
+    g.run(q, k, v)
+    assert not calls
+
+
 def capture_wrapper(w):
     static = tuple(
         torch.zeros(MAX_TOKENS, HEADS, HEAD_DIM, dtype=DTYPE, device=DEVICE) for _ in range(3)
