@@ -616,6 +616,10 @@ class WithinStepSteps(StepBuilder):
     def _expert_layout(
         self, array: Array, read: Read, segment: Segment, query_segment: Segment,
     ) -> tuple[int, int, int, int]:
+        if type(segment.request_id) is int and segment.request_id < -1:
+            # Capture supplies dummy metadata; replay may omit it. Both use
+            # the same internal zero-chunk padding layout.
+            return (0, query_segment.span, segment.span, 0)
         if self._info is None:
             self._info = {}
             for rid, info in self._per_request_info.items():
@@ -623,11 +627,6 @@ class WithinStepSteps(StepBuilder):
                 self._info[info.request_id] = info
         info = self._info.get(segment.request_id)
         if info is None:
-            if type(segment.request_id) is int and segment.request_id < -1:
-                # A capture bucket's dummy row has no request. Zero chunks is
-                # an internal padding layout: its next two fields are the Q
-                # and KV spans. Real queries can never take this layout.
-                return (0, query_segment.span, segment.span, 0)
             raise ValueError(f"Array {array.name!r}: no request info for expert layout")
         raw = info.step_metadata.get(EXPERT_LAYOUT_KWARG, {})
         lengths = raw.get(array.name, {}).get(segment.label, {}).get(next(iter(array.reads)))
