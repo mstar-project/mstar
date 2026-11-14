@@ -37,10 +37,11 @@ def test_cross_and_self_match_reference(
     ki = torch.arange(kv_len)[None, :]
     expected_cross = cross(None, None, qi, ki)
     expected_self = self_(None, None, qi, torch.arange(q_len)[None, :])
-    mask = ExpertCrossMask(c, f, t, window_frames, include_noised)
-    layout = ExpertCrossLayout(num_chunks, g, clean_frames, n)
+    mask = ExpertCrossMask(c, future_per_chunk=f, tokens_per_frame=t,
+                           window_frames=window_frames, include_noised=include_noised)
+    layout = ExpertCrossLayout(num_chunks, global_len=g, clean_frames=clean_frames, noised_frames=n)
     actual_cross = cross_visibility(mask, layout)
-    actual_self = self_visibility(ExpertSelfMask(c, f), ExpertSelfLayout(num_chunks))
+    actual_self = self_visibility(ExpertSelfMask(c, future_per_chunk=f), ExpertSelfLayout(num_chunks))
     assert actual_cross.shape == (q_len, kv_len)
     assert torch.equal(actual_cross, expected_cross)
     assert torch.equal(actual_self, expected_self)
@@ -48,9 +49,10 @@ def test_cross_and_self_match_reference(
 
 def test_two_chunk_hand_matrix_and_cold_case() -> None:
     cross = cross_visibility(
-        ExpertCrossMask(2, 1, 1, 2), ExpertCrossLayout(2, 2, 2, 4)
+        ExpertCrossMask(2, future_per_chunk=1, tokens_per_frame=1, window_frames=2),
+        ExpertCrossLayout(2, global_len=2, clean_frames=2, noised_frames=4),
     )
-    same = self_visibility(ExpertSelfMask(2, 1), ExpertSelfLayout(2))
+    same = self_visibility(ExpertSelfMask(2, future_per_chunk=1), ExpertSelfLayout(2))
     assert cross.shape == (8, 8)
     for qi in (0, 2, 4, 5):
         assert cross[qi].nonzero().flatten().tolist() == [0, 1, 4, 5]
@@ -59,17 +61,20 @@ def test_two_chunk_hand_matrix_and_cold_case() -> None:
         assert cross[qi].nonzero().flatten().tolist() == [0, 1, 2, 3, 6, 7]
         assert same[qi].nonzero().flatten().tolist() == [1, 3, 6, 7]
 
-    cold = cross_visibility(ExpertCrossMask(2, 1, 1, 2), ExpertCrossLayout(1, 2, 0, 2))
+    cold = cross_visibility(
+        ExpertCrossMask(2, future_per_chunk=1, tokens_per_frame=1, window_frames=2),
+        ExpertCrossLayout(1, global_len=2, clean_frames=0, noised_frames=2),
+    )
     assert cold.shape == (4, 4)
     assert bool(cold.all())
-    assert bool(self_visibility(ExpertSelfMask(2, 1), ExpertSelfLayout(1)).all())
+    assert bool(self_visibility(ExpertSelfMask(2, future_per_chunk=1), ExpertSelfLayout(1)).all())
 
 
 def test_rejects_misaligned_or_unsupported_layout() -> None:
-    mask = ExpertCrossMask(2, 1, 1, 2)
+    mask = ExpertCrossMask(2, future_per_chunk=1, tokens_per_frame=1, window_frames=2)
     with pytest.raises(ValueError, match="num_chunks"):
-        cross_visibility(mask, ExpertCrossLayout(2, 2, 0, 2))
+        cross_visibility(mask, ExpertCrossLayout(2, global_len=2, clean_frames=0, noised_frames=2))
     with pytest.raises(ValueError, match="unsupported expert frame layout"):
-        cross_visibility(mask, ExpertCrossLayout(2, 2, 1, 4))
+        cross_visibility(mask, ExpertCrossLayout(2, global_len=2, clean_frames=1, noised_frames=4))
     with pytest.raises(ValueError, match="include_noised"):
-        ExpertCrossMask(2, 1, 1, 2, 1)
+        ExpertCrossMask(2, future_per_chunk=1, tokens_per_frame=1, window_frames=2, include_noised=1)

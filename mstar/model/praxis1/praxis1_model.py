@@ -413,13 +413,14 @@ class Praxis1Model(Model):
             Array(EXPERT_QUERIES, nodes={"action_expert"}, labels={EXPERT_QUERIES},
                   layers=set(range(1, c.expert_layers, 2)),
                   entry=KVEntry(heads=c.expert_heads, head_dim=c.expert_head_dim), max_len=0,
-                  reads={ATTN_READS[EXPERT_QUERIES]: Read(mask=ExpertSelf(f, future),
+                  reads={ATTN_READS[EXPERT_QUERIES]: Read(mask=ExpertSelf(f, future_per_chunk=future),
                                                         op=Attend(q_heads=c.expert_heads))}),
             Array(EXPERT_TRUNK_KEYS, nodes={"action_expert"}, labels={EXPERT_TRUNK_KEYS},
                   layers=set(range(0, c.expert_layers, 2)),
                   entry=KVEntry(heads=c.expert_heads, head_dim=c.expert_head_dim), max_len=0,
                   reads={ATTN_READS[EXPERT_TRUNK_KEYS]: Read(
-                      mask=ExpertCross(f, future, p, c.window_frames, include_noised=not clean_only),
+                      mask=ExpertCross(f, future_per_chunk=future, tokens_per_frame=p,
+                                       window_frames=c.window_frames, include_noised=not clean_only),
                       op=Attend(q_heads=c.expert_heads), queries=EXPERT_QUERIES)}),
         ]
         if depth == 0:
@@ -744,7 +745,8 @@ class Praxis1Model(Model):
                 ATTN_READS[EXPERT_QUERIES]: ExpertSelfLayout(k),
             })},
             EXPERT_TRUNK_KEYS: {EXPERT_TRUNK_KEYS: Layout(expert_cross={
-                ATTN_READS[EXPERT_TRUNK_KEYS]: ExpertCrossLayout(k, g + text, depth * f, k * f),
+                ATTN_READS[EXPERT_TRUNK_KEYS]: ExpertCrossLayout(
+                    k, global_len=g + text, clean_frames=depth * f, noised_frames=k * f),
             })},
         }
         metadata["state_layout"] = layout

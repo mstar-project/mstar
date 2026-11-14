@@ -124,9 +124,10 @@ def _run_case(k: int, engine_autocast: bool, declared_resources: bool, video_sca
     enc_u = dense_chunk_causal_mask(4, tpf, blank.shape[1], f * tpf, k, k - 1)
     dec = visible(encoder_codes(4, 0, 0, f * tpf * 4, k, 0))
     cross = cross_visibility(
-        ExpertCross(f, 2, tpf, (2 * k - 1) * f), ExpertCrossLayout(k, g + text.shape[1], nclean, nnoised)
+        ExpertCross(f, future_per_chunk=2, tokens_per_frame=tpf, window_frames=(2 * k - 1) * f),
+        ExpertCrossLayout(k, global_len=g + text.shape[1], clean_frames=nclean, noised_frames=nnoised),
     )
-    selfm = self_visibility(ExpertSelf(f, 2), ExpertSelfLayout(k))
+    selfm = self_visibility(ExpertSelf(f, future_per_chunk=2), ExpertSelfLayout(k))
     handles = {
         ENCODER_COND_KV: _DenseReferenceHandle(enc_c),
         ENCODER_BLANK_KV: _DenseReferenceHandle(enc_u),
