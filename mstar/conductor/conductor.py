@@ -47,7 +47,7 @@ from mstar.engine.resources.kv.config import (
 )
 from mstar.engine.resources.lora.config import LoraSpec
 from mstar.engine.state import Array, ChunkCausal, SampleSettings
-from mstar.engine.state.adapters import CHUNK_CAUSAL_LAYOUT_KWARG, sampling_configs
+from mstar.engine.state.adapters import CHUNK_CAUSAL_LAYOUT_KWARG, check_wire_chunk_layouts, sampling_configs
 from mstar.engine.state.analysis import declaration_digests
 from mstar.graph.base import GraphEdge, NodeAndGraphWalk, TensorPointerInfo
 from mstar.model.base import Model, WorkerGraph, serving_resources, streamed_inputs
@@ -121,10 +121,13 @@ def _required_chunk_layouts(model: Model, declarations: list) -> dict[str, tuple
     return result
 
 
-def _check_chunk_layouts(plan: list[WalkStep], required: dict[str, tuple[tuple[str, str, str], ...]]) -> None:
+def _check_chunk_layouts(
+    plan: list[WalkStep], required: dict[str, tuple[tuple[str, str, str], ...]], declarations: list,
+) -> None:
     """Refuse a missing per-request mask before it can fail a batched engine step."""
     for step in plan:
         given = step.step_metadata.get(CHUNK_CAUSAL_LAYOUT_KWARG, {})
+        check_wire_chunk_layouts(declarations, given)
         for name, label, key in required.get(step.walk, ()):
             if given.get(name, {}).get(label, {}).get(key) is None:
                 raise RuntimeError(
@@ -1470,7 +1473,7 @@ class Conductor:
                 body.initial_signals, model_kwargs,
             )
             pstate.plan = _with_chunk_causal_layout(pstate.plan, model_kwargs.get(CHUNK_CAUSAL_LAYOUT_KWARG))
-            _check_chunk_layouts(pstate.plan, self._chunk_layout_reads())
+            _check_chunk_layouts(pstate.plan, self._chunk_layout_reads(), self._declarations())
             stream_moved = p.name in self.producer_triggered_partitions
             # refuse a plan the conductor can't run: a step whose walk isn't one of the
             # partition's (which startup checked are the model's), or a ``bind`` key

@@ -584,9 +584,7 @@ class WithinStepSteps(StepBuilder):
                     f"Array {array.name!r}: request {segment.request_id!r} has no "
                     f"state_layout chunk lengths for read {next(iter(array.reads))!r}"
                 )
-        if not isinstance(lengths, (list, tuple)) or len(lengths) != 3:
-            raise ValueError(f"Array {array.name!r}: request {segment.request_id!r} has invalid chunk lengths")
-        layout = ChunkCausalLayout(global_len=lengths[0], noised_len=lengths[1], clean_len=lengths[2])
+        layout = parse_chunk_causal_layout(array, segment.label, next(iter(array.reads)), lengths)
         if layout.span != segment.span:
             raise ValueError(
                 f"Array {array.name!r}: request {segment.request_id!r}'s chunk layout spans {layout.span}, "
@@ -716,6 +714,37 @@ def _check_chunk_causal_layout(array: Array, label: str, layout: Layout, *, requ
             raise RuntimeError(
                 f"state_layout[{array.name!r}][{label!r}].chunk_causal is missing reads {sorted(missing)}"
             )
+
+
+def parse_chunk_causal_layout(array: Array, label: str, key: str, lengths: object) -> ChunkCausalLayout:
+    """One wire row, checked by the same typed-layout contract as a prompt layout."""
+    if label not in array.labels:
+        raise RuntimeError(f"Array {array.name!r} has no label {label!r}")
+    if not isinstance(lengths, (list, tuple)) or len(lengths) != 3:
+        raise ValueError(f"Array {array.name!r}: invalid chunk lengths for {key!r}")
+    layout = ChunkCausalLayout(global_len=lengths[0], noised_len=lengths[1], clean_len=lengths[2])
+    _check_chunk_causal_layout(array, label, Layout(chunk_causal={key: layout}), require_all=False)
+    return layout
+
+
+def check_wire_chunk_layouts(declarations: Sequence[Array | Sampler | SeqShard], raw: Mapping) -> None:
+    """Check every supplied walk-plan row, including names the engine would otherwise ignore."""
+    arrays = {array.name: array for array in declarations if isinstance(array, Array)}
+    if not isinstance(raw, Mapping):
+        raise RuntimeError("chunk-causal layout must map array names to labels")
+    for name, labels in raw.items():
+        array = arrays.get(name)
+        if array is None:
+            raise RuntimeError(f"chunk-causal layout names no declared array {name!r}")
+        if not isinstance(labels, Mapping):
+            raise RuntimeError(f"chunk-causal layout {name!r} must map labels to reads")
+        for label, reads in labels.items():
+            if not isinstance(reads, Mapping):
+                raise RuntimeError(f"chunk-causal layout {name!r}/{label!r} must map reads to lengths")
+            if label not in array.labels:
+                raise RuntimeError(f"Array {name!r} has no label {label!r}")
+            for key, lengths in reads.items():
+                parse_chunk_causal_layout(array, label, key, lengths)
 
 
 def sampling_configs(

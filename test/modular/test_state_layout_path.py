@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import sys
 from dataclasses import replace
+from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, ".")
@@ -178,15 +179,41 @@ def test_chunk_layout_can_be_supplied_by_walk_plan_after_intake():
     model = PlannedChunk()
     required = _required_chunk_layouts(model, model.declare_state())
     with pytest.raises(RuntimeError, match="has no chunk-causal layout"):
-        _check_chunk_layouts([WalkStep("prefill")], required)
+        _check_chunk_layouts([WalkStep("prefill")], required, model.declare_state())
 
     request_layout = {"chunk": {"main": {"chunk_attn": [4, 16, 8]}}}
     planned_layout = model.walk_plan("main", [], [], {}, kwargs)[0].step_metadata[CHUNK_CAUSAL_LAYOUT_KWARG]
     plan = _with_chunk_causal_layout(
         model.walk_plan("main", [], [], {}, kwargs), request_layout,
     )
-    _check_chunk_layouts(plan, required)
+    _check_chunk_layouts(plan, required, model.declare_state())
     assert plan[0].step_metadata[CHUNK_CAUSAL_LAYOUT_KWARG] == planned_layout
+
+
+@pytest.mark.parametrize("planned, error", [
+    ({"chunk": {"main": {"chunk_attn": [4, 16]}}}, "invalid chunk lengths"),
+    ({"chunk": {"main": {"chunk_attn": [-4, 24, 8]}}}, "global_len must be an int"),
+    ({"chunk": {"main": {"chunk_atn": [4, 16, 8]}}}, "names no ChunkCausal read"),
+    ({"chunk": {"other": {"chunk_attn": [4, 16, 8]}}}, "has no label"),
+    ({"chun": {"main": {"chunk_attn": [4, 16, 8]}}}, "names no declared array"),
+])
+def test_bad_walk_mask_is_refused_at_conductor_ingest(planned, error):
+    class BadWalk(_ChunkDeclaring):
+        def walk_plan(self, *args, **kwargs):
+            return [WalkStep("prefill", step_metadata={CHUNK_CAUSAL_LAYOUT_KWARG: planned})]
+
+    conductor = object.__new__(Conductor)
+    conductor.model = BadWalk()
+    conductor._status_interval_s = None
+    conductor._max_output_tokens = lambda kwargs: 1
+    conductor._loop_caps = lambda kwargs: {}
+    request_layout = {"chunk": {"main": {"chunk_attn": [12, 8, 8]}}}
+    body = SimpleNamespace(
+        request_id="bad-mask", client_request_id=None, model_kwargs={CHUNK_CAUSAL_LAYOUT_KWARG: request_layout},
+        initial_input_modalities=[], initial_output_modalities=[], initial_signals={},
+    )
+    with pytest.raises((RuntimeError, ValueError), match=error):
+        conductor._do_ingest_request(body)
 
 
 def test_a_prompt_with_no_keyed_spans_keys_no_page():
