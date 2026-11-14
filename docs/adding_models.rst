@@ -1331,8 +1331,9 @@ ragged prefill wrapper. For a self-attention whose config names neither a backen
 geometry on the GPU. An eager plan runs the row its layout's longest query segment falls in, so
 one slot can run a different kernel from one layout to the next; a captured bucket runs the row of
 the layout that first plans it. On ``sm_103`` the table names torch's cuDNN SDPA (``RaggedAttnBackend.CUDNN``) for
-klein 4B / 9B and Z-Image's geometries (24, 32 and 30 heads of 128; Wan2.2-TI2V-5B's 24 heads read
-klein 4B's entry, LTX-2.5's 32-head video self-attention klein 9B's): under a CUDA graph FlashInfer's
+klein 4B / 9B and Z-Image's geometries (24, 32 and 30 heads of 128; LTX-2.5's 32-head video self-attention reads
+klein 9B's entry; past klein 4B's 4,608 tokens the 24-head entry names FlashAttention 4, ``fa4``, for
+Wan2.2-TI2V-5B's video self-attention): under a CUDA graph FlashInfer's
 ``auto`` stays on FA2 there (its cutlass plan can't be replanned in graph mode, and its cuDNN path needs
 cuDNN 9.24), which is 3.5-5x slower from 1k to 64k tokens. An entry whose larger sizes no served model
 has run bounds them with a numeric last row and a ``"*"`` row naming ``flashinfer``, the resource's own

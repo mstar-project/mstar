@@ -48,6 +48,12 @@ GB300 = DeviceKey("NVIDIA GB300", "sm_103")
 H100 = DeviceKey("NVIDIA H100 80GB HBM3", "sm_90")
 # (heads, head_dim) of klein 4B, Z-Image Turbo and klein 9B's dit attention
 DIT_GEOMETRIES = ((24, 128), (30, 128), (32, 128))
+# their shipped sm_103 rows; past klein 4B's 4608 tokens the 24-head entry is Wan2.2-TI2V-5B's video self-attention
+SM_103_ROWS = {
+    24: ((4608, Choice("cudnn")), (None, Choice("fa4"))),
+    30: ((None, Choice("cudnn")),),
+    32: ((None, Choice("cudnn")),),
+}
 
 
 class _FakeCuda:
@@ -102,19 +108,29 @@ def test_sm_103_table_names_cudnn_for_the_dit_geometries(heads, head_dim):
     for key in (B300, GB300):
         entry = next(find_entries("ragged_attention", key, "bfloat16", shape))
         assert entry.source.endswith("ragged_attention/sm_103.json")
-        assert entry.rows == ((None, Choice("cudnn")),)
+        assert entry.rows == SM_103_ROWS[heads]
         # what it was chosen over, by the harness that wrote it
         assert all(m["cudnn_us"] < m["flashinfer_fa2_us"] for m in entry.measured.values())
 
 
-@pytest.mark.parametrize(("heads", "head_dim"), DIT_GEOMETRIES)
-@pytest.mark.parametrize("seq_len", [96, 4096, 4192, 4608, 8160])
+@pytest.mark.parametrize(("heads", "head_dim", "seq_len"), [
+    *((h, d, n) for h, d in DIT_GEOMETRIES for n in (96, 4096, 4192, 4608)),
+    (30, 128, 8160), (32, 128, 8160),
+])
 def test_sm_103_picks_cudnn_for_the_dit_sizes(gpu, heads, head_dim, seq_len):
     """The image DiTs' sizes, and past the last swept one, LTX-2.5's 8160-token video self-attention."""
     gpu(B300)
     manager = build(spec(heads, head_dim))
     assert type(manager) is FlashInferRaggedManager
     assert kernels_module.RAGGED_ATTENTION.row_for(manager._kernel_rows, seq_len) == Choice("cudnn")
+
+
+@pytest.mark.parametrize(("seq_len", "impl"), [(3510, "cudnn"), (4608, "cudnn"), (8190, "fa4"), (18480, "fa4")])
+def test_sm_103_runs_fa4_for_wan_ti2v_5b_sizes(gpu, seq_len, impl):
+    """Wan2.2-TI2V-5B's 24 heads: FA4 at its 832x480x81 and 1280x704x81 self-attention, cuDNN up to klein 4B's size."""
+    gpu(B300)
+    manager = build(spec(24, 128))
+    assert kernels_module.RAGGED_ATTENTION.row_for(manager._kernel_rows, seq_len) == Choice(impl)
 
 
 @pytest.mark.parametrize(("seq_len", "impl"), [(4608, "cudnn"), (16384, "cudnn"), (32760, "fa4"), (75600, "fa4")])
@@ -146,7 +162,7 @@ def test_the_table_is_read_for_the_ranks_heads(gpu):
     two_ranks = SimpleNamespace(tp_group=SimpleNamespace(world_size=2), sp_group=SimpleNamespace(world_size=1))
     manager = build_resource(s, EngineResourceInfo(device=GPU, kv_dtype=torch.bfloat16, joint_comm_group=two_ranks))
     assert manager._config.num_qo_heads == 24
-    assert [c.impl for _, c in manager._kernel_rows] == ["cudnn"]
+    assert [c.impl for _, c in manager._kernel_rows] == ["cudnn", "fa4"]
 
 
 def test_rows_that_cant_run_here_keep_flashinfer(gpu, monkeypatch, caplog):
