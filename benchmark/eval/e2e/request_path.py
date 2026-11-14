@@ -237,7 +237,7 @@ def omni(url: str, inputs: Path, scratch: Path) -> dict:  # noqa: ARG001
                                            {"text": "Describe the image and the audio."}))
     call("gen_nonstream", r, lambda: gen(data={"streaming": "false", "text": "Name three colors."}))
     call("gen_unknown_ext", r, lambda: gen([("files", ("x.xyz", b"abc", "application/octet-stream"))]))
-    # urlencoded (no files): starlette's form parser
+    # urlencoded (no files): the form parser, not the multipart one
     call("urlenc_small", r, lambda: summarize(requests.post(g, data={"text": "Name three colors.", "model_kwargs": mk},
                                                              timeout=300)))
     call("urlenc_1_5mb_field", r, lambda: summarize(requests.post(g, data={"text": "hi " * 500000, "model_kwargs": mk},
