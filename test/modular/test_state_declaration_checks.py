@@ -353,7 +353,10 @@ def test_a_kept_cross_read_over_an_array_that_keeps_entries_has_no_problems():
 
 def test_a_bidirectional_read_needs_an_array_that_keeps_entries():
     problem = _one_problem(_within("vision", reads={"r": _read(mask=Bidirectional())}))
-    assert "every read of an array with max_len 0 is a Block read, and this one is Bidirectional" in problem
+    assert (
+        "every read of an array with max_len 0 is a Block, ChunkCausal, ExpertCross, or ExpertSelf read, "
+        "and this one is Bidirectional"
+    ) in problem
 
 
 def _chunked(*arrays, chunkable=True) -> _StubModel:
