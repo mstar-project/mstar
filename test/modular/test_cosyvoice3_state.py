@@ -23,7 +23,7 @@ from test_state_ports import _assert_equal_per_key, _assert_steps_equal, _publis
 from mstar.engine.resources import BlockCausalAttentionSpec
 from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec, AttentionStep
 from mstar.engine.resources.base import EngineResourceInfo, build_resource
-from mstar.engine.resources.kv.config import KVSpec, KVStep, PagedKVConfig
+from mstar.engine.resources.kv.config import KVSpec, KVStep, PagedKVConfig, opening_prefix_caches
 from mstar.engine.resources.position.config import PositionConfig, PositionSpec, PositionStep
 from mstar.engine.resources.recurrent.config import (
     RecurrentBlockConfig,
@@ -106,8 +106,8 @@ def _reference_specs(model: CosyVoice3Model) -> list:
                 max_seq_len=cfg.flow_cache_frames,
                 max_num_pages=model._flow_kv_pages(DEFAULT_FLOW_REQUESTS),
                 page_size=FLOW_KV_PAGE_FRAMES,
-                # Named: main set False, and the pool keeps its default. No label is keyed for prefix reuse, so
-                # the engine never opens this cache (test_no_label_is_keyed_for_prefix_reuse).
+                # Named: main set False, and the pool keeps its default. The engine opens no cache on the flow's
+                # node (test_the_flow_pool_opens_no_prefix_index).
                 prefix_cache=True,
             )),
             BlockCausalAttentionSpec(
@@ -184,6 +184,20 @@ def test_each_value_pool_takes_mains_bytes(key):
 def test_no_label_is_keyed_for_prefix_reuse():
     model = _bare(CosyVoice3Model, config=CosyVoice3Config())
     assert keyed_labels(model) == {}, "a keyed label asks for prefix reuse, which main gave no CosyVoice3 pool"
+
+
+def test_the_flow_pool_opens_no_prefix_index():
+    """An open index takes every commit of its pool off the fast path in `KVManager.commit`, which main's
+    ``prefix_cache=False`` kept the flow's commits on. The flow's conv tails can't restore what a hit skips, so no
+    cache on their node opens, even for a deployment that salts the pool and a model that names its checkpoint."""
+    model = _bare(CosyVoice3Model, config=CosyVoice3Config())
+    specs = enabled_resources(model, {}, StateSetup())
+    for spec in specs:
+        if isinstance(spec, KVSpec):
+            spec.config.prefix_cache_salt = "salt"
+    nodes = dict.fromkeys({node for spec in specs for node in spec.nodes}, 1)
+    assert opening_prefix_caches(specs, nodes, checkpoint_named=True) == frozenset(), "a pool would open its index"
+    assert model.checkpoint_path() is None, "and with no checkpoint named, an unsalted pool keeps none of its own"
 
 
 # Steps
