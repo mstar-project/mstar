@@ -61,7 +61,7 @@ from mstar.engine.state.adapters import (
     sized_values,
     state_sizes,
 )
-from mstar.engine.state.contract import Array, ChunkCausal
+from mstar.engine.state.contract import Array, ChunkCausal, ExpertCross, ExpertSelf
 from mstar.model.base import (
     KEEP_ADAPTER,
     ClientChunk,
@@ -1043,6 +1043,7 @@ class PreprocessWorkerThread:
             keyed_spans = model_kwargs.pop("keyed_spans", {})
             if state_layout is None and self._needs_mask_layout:
                 chunk_causal_layouts(self._declarations, {})
+                expert_layouts(self._declarations, {})
             layouts = (
                 model_kwargs.pop("kv_layout", {}) if state_layout is None
                 else kv_layouts(self._declarations, state_layout, keyed_spans)
@@ -1399,7 +1400,7 @@ class PreprocessWorkerThread:
     def _needs_mask_layout(self) -> bool:
         """Whether a request must supply lengths for a declared within-step mask."""
         return any(
-            isinstance(read.mask, ChunkCausal)
+            isinstance(read.mask, (ChunkCausal, ExpertCross, ExpertSelf))
             for array in self._declarations if isinstance(array, Array)
             for read in array.reads.values()
         )

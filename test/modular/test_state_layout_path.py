@@ -187,6 +187,17 @@ def test_missing_expert_layout_fails_at_data_worker_intake():
         _run(_worker(MissingExpert(), _deployment()))
 
 
+def test_missing_expert_array_fails_at_data_worker_intake():
+    class MissingExpert(_CombinedDeclaring):
+        def process_prompt(self, *args, **kwargs):
+            output = super().process_prompt(*args, **kwargs)
+            del output.metadata["state_layout"]["expert"]
+            return output
+
+    with pytest.raises(RuntimeError, match="missing expert labels \\['main'\\]"):
+        _run(_worker(MissingExpert(), _deployment()))
+
+
 def test_missing_chunk_lengths_fail_at_data_worker_intake():
     class MissingChunk(_ChunkDeclaring):
         def process_prompt(self, *args, **kwargs):
