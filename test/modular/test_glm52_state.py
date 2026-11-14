@@ -210,6 +210,76 @@ def test_an_mtp_prefill_at_the_context_limit_stops_after_its_token(room):
     assert sub.check_stop("r", info, out) == ({END_PARTITION} if room <= 1 else set())
 
 
+class _Reads(dict):
+    """A request's outputs that note each name read, where the worker's host row copies each name read."""
+
+    def __init__(self, outputs):
+        super().__init__(outputs)
+        self.read = []
+
+    def __getitem__(self, name):
+        self.read.append(name)
+        return super().__getitem__(name)
+
+
+def _verify_step(rows: int, emitted: int = 5) -> tuple[Glm52LLMSubmodule, dict]:
+    """A k=3 verify step's unpacked outputs for ``rows`` requests, where row i accepted ``i % 4`` drafts. Each
+    request's info holds its walk and nothing else."""
+    k = 3
+    sub = _submodule(k)
+    rids = [f"r{i}" for i in range(rows)]
+    verdicts = torch.tensor([[11, 12, 13, 14, i % 4] for i in range(rows)])
+    sub._mailboxes = {None: (verdicts, torch.ones(1, dtype=torch.long))}
+    sub._verdicts = None, {rid: i for i, rid in enumerate(rids)}
+    inp = ARNodeInputs(input_ids=torch.tensor([11]), input_seq_len=k + 1,
+                       kwargs={"emitted": emitted, "budget": 64, "ignore_eos": True})
+    return sub, sub.unpack_packed_outputs(
+        static_output={}, request_ids=rids, real_seq_lens=[k + 1] * rows, inputs=[inp] * rows,
+        per_request_info={rid: SimpleNamespace(graph_walk="decode") for rid in rids},
+    )
+
+
+def test_a_verify_step_cuts_by_the_budget_its_count_edge_carries():
+    """A request's budget and ignore_eos hold for its whole life. Read through the request info for every row of
+    every step, on the GPU thread as the verdict lands, they cost a 32-row step a third of a millisecond."""
+    sub = _submodule(3)
+    sampling = SimpleNamespace(temperature=0, repetition_penalty=1)
+    info = SimpleNamespace(request_id="r", resource_configs={SAMPLER: sampling})
+    signals = {"text_inputs": [torch.tensor([7])], "count": [torch.tensor([5, 7, 6, 1])]}
+    row = sub.prepare_inputs("decode", info, signals)
+    assert row.kwargs == {"emitted": 5, "budget": 6, "ignore_eos": 1}
+    sub._mailboxes = {None: (torch.tensor([[11, 12, 13, 14, 3]]), torch.ones(1, dtype=torch.long))}
+    sub._verdicts = None, {"r": 0}
+    out = sub.unpack_packed_outputs(static_output={}, request_ids=["r"], real_seq_lens=[4], inputs=[row],
+                                    per_request_info={"r": SimpleNamespace(graph_walk="decode")})["r"]
+    assert (out["new_token"][0].tolist(), out["count"][0].tolist()) == ([11], [6, 11, 6, 1]), (
+        "the step would cut by a budget other than the one the prefill read"
+    )
+
+
+def test_a_32_row_verify_step_builds_one_tensor_of_tokens_and_one_of_counts():
+    """A tensor per row for each output is 64 host tensors built on the GPU thread every step."""
+    _, out = _verify_step(32)
+    for i, row in enumerate(out.values()):
+        want = [11, 12, 13, 14][:i % 4 + 1]
+        assert (row["new_token"][0].tolist(), row["count"][0].tolist()) == (want, [5 + len(want), want[-1], 64, 1])
+    for name in ("new_token", "count"):
+        assert len({row[name][0].untyped_storage().data_ptr() for row in out.values()}) == 1, (
+            f"each row's {name} is a tensor of its own"
+        )
+
+
+def test_a_verify_step_s_stop_check_reads_one_output():
+    """The worker hands `check_stop` a row that copies an output to the host when its name is first read. A second
+    name is a second copy a step and a second lookup a row, on the worker's main thread."""
+    sub, out = _verify_step(1)
+    row = _Reads(out["r0"])
+    assert sub.check_stop("r0", _info("decode", 64, 5), row) == set()
+    assert row.read == ["count"], "the stop check reads a second output for every row of every step"
+    sub, out = _verify_step(1, emitted=63)
+    assert sub.check_stop("r0", _info("decode", 64, 5), out["r0"]), "a row that reached its budget keeps running"
+
+
 def test_a_captured_and_padded_prefill_reads_no_prompt_length():
     """A capture's and a padded replay's dummy rows carry no step metadata, and preprocess reads none."""
     sub = _submodule(3)
