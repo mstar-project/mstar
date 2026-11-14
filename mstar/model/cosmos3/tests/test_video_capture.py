@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 from mstar.engine.windowing import WindowSchedule
@@ -343,3 +344,14 @@ def test_prefill_capture_inputs_follow_the_regime(monkeypatch) -> None:
         step = sub.declare_step(C.PREFILL_WALK, ["r"], [row])
         assert {seg.label for seg in step.segments} == labels
         assert step.cg_key_info == prefill.additional_key_info
+
+
+@pytest.mark.parametrize("mode", ["deterministic", "default", "level"])
+def test_a_compiled_prefill_takes_the_denoise_steps_compile_mode(monkeypatch, mode) -> None:
+    monkeypatch.setenv("COSMOS3_GEN_CAPTURE_RES", "64x64")
+    monkeypatch.delenv("COSMOS3_DISABLE_PREFILL_ACCELERATOR_GRAPH", raising=False)
+    monkeypatch.delenv("COSMOS3_DISABLE_ACCELERATOR_GRAPH", raising=False)
+    cfg = Cosmos3Config(compile_denoise=False, compile_prefill=True, denoise_compile_mode=mode)
+    sub = Cosmos3DiTSubmodule(transformer=_fake_transformer(cfg), config=cfg, scheduler=None)
+    prefill = next(c for c in sub.get_accelerator_graph_configs("cpu") if c.capture_graph_walk == C.PREFILL_WALK)
+    assert prefill.compile and prefill.compile_mode == (None if mode == "level" else mode)

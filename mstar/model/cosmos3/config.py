@@ -545,11 +545,16 @@ class Cosmos3Config:
     # forward) too, with the same mode: the video, image, sound and action
     # steps share one compiled layer stack. Eager, the norms, rotary and
     # residuals cost about 80 ms of GPU per extra row at
-    # 832x480x121 on a B300. Only its layer stack compiles, once, at startup,
-    # with the pack length dynamic, so no batch size or mix of resolutions
+    # 832x480x121 on a B300. Only its layer stack compiles, at startup, with
+    # only the pack length dynamic, so no batch size or mix of resolutions
     # compiles mid-traffic; the per-request patchify, rotary tables and
     # unpatchify run eager.
     compile_denoise_batched: bool = True
+    # torch.compile the captured understanding-tower prefill (one compile per
+    # token bucket), in ``denoise_compile_mode``. Its eager norms, rotary and
+    # copies are about a third of the prefill's GPU time on Super; off by
+    # default, since it changes the prefix K/V's low bits.
+    compile_prefill: bool = False
     # Which attention backends the DiT node declares (see
     # Cosmos3Model.get_node_resources). "dense_gen" (the default) declares the
     # paged FlashInfer backend the understanding prefill and the captured
@@ -603,7 +608,7 @@ class Cosmos3Config:
     def check_compile(self) -> None:
         """Reject compile settings that would be read as something else: a
         non-boolean switch (a yaml ``"false"`` is truthy) or an unknown mode."""
-        for name in ("compile_denoise", "compile_denoise_batched"):
+        for name in ("compile_denoise", "compile_denoise_batched", "compile_prefill"):
             value = getattr(self, name)
             if not isinstance(value, bool):
                 raise ValueError(f"Cosmos3 {name} must be true or false, got {value!r}.")
