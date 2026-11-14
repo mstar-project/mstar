@@ -64,6 +64,8 @@ def test_the_wait_for_messages_ends_at_the_summary():
 def _serving_conductor(max_concurrent=None) -> Conductor:
     """Enough state for the real ingest and done paths, sending into a list."""
     c = _conductor()
+    c._episode_array_names = frozenset()
+    c._queued_since = {}
     c.sent = []
     c.communicator = types.SimpleNamespace(send=lambda entity_id, msg: c.sent.append((entity_id, msg)))
     c.max_concurrent_requests = max_concurrent
