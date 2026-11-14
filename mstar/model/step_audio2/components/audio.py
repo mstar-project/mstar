@@ -12,8 +12,8 @@ post-conv frame ``j`` of a clip of ``M`` mel frames is a valid key iff
 ``2 j + (T_pad + 1) % 2 < M - 2`` (``modeling_step_audio_2.py:251-252``, fed
 ``wav_lens = M - 2`` by ``utils.py:84``). Masked frames still run as queries and feed the
 kept tokens through the pool and the adapter's conv, so they cannot be dropped: here every
-clip is one segment of the ``RaggedKeyPrefixAttentionSpec`` resource, each of its frames a
-query, attending its first ``key_len`` frames. ``clip_layout`` computes both on the host.
+clip is one segment of the tower's ``BlockPrefix`` read, each of its frames a query,
+attending its first ``key_len`` frames. ``clip_layout`` computes both on the host.
 """
 from __future__ import annotations
 
@@ -91,7 +91,7 @@ class WhisperEncoder(nn.Module):
     """``AudioEncoder``; parameter paths mirror the checkpoint's ``encoder.*`` but for each
     block's internals, which are ``AuTEncoderLayer``'s."""
 
-    def __init__(self, config: AudioEncoderConfig, attn_key: str | None):
+    def __init__(self, config: AudioEncoderConfig, attn_key: str | None, array: str | None = None):
         super().__init__()
         self.config = config
         d = config.n_audio_state
@@ -106,7 +106,8 @@ class WhisperEncoder(nn.Module):
             activation_function="gelu",
         )
         self.blocks = nn.ModuleList(
-            AuTEncoderLayer(layer_config, attn_key=attn_key) for _ in range(config.n_audio_layer)
+            AuTEncoderLayer(layer_config, attn_key=attn_key, array=array, layer=layer)
+            for layer in range(config.n_audio_layer)
         )
         self.after_norm = nn.LayerNorm(d)
 
@@ -129,12 +130,13 @@ class WhisperEncoder(nn.Module):
         return torch.cat(out)
 
     def encode(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """The block stack over packed frames, through the bound key-prefix resource.
+        """The block stack over packed frames, through the bound key-prefix attention.
         Shape-only in the frame count."""
-        if self.blocks[0].self_attn.ragged is None:
+        attn = self.blocks[0].self_attn
+        if attn.state is None and attn.ragged is None:
             raise RuntimeError(
-                "Step-Audio2's audio encoder has no attention resource bound; it needs a "
-                "RaggedKeyPrefixAttentionSpec (a key padding mask), which unbound SDPA would drop"
+                "Step-Audio2's audio encoder has no attention bound; it needs a key padding mask, its "
+                "BlockPrefix read (a RaggedKeyPrefixAttentionSpec off the contract), which unbound SDPA would drop"
             )
         for block in self.blocks:
             # cu_seqlens is only read without a bound resource
@@ -186,12 +188,13 @@ class Adapter(nn.Module):
 
 
 class StepAudio2Audio(nn.Module):
-    """Mel clips -> LLM embeddings. ``attn_key`` names the encoder's key-prefix attention."""
+    """Mel clips -> LLM embeddings. The encoder's key-prefix attention is ``array``'s read on the state
+    contract, or the resource ``attn_key`` names."""
 
-    def __init__(self, config: AudioEncoderConfig, attn_key: str | None):
+    def __init__(self, config: AudioEncoderConfig, attn_key: str | None, array: str | None = None):
         super().__init__()
         self.config = config
-        self.encoder = WhisperEncoder(config, attn_key)
+        self.encoder = WhisperEncoder(config, attn_key, array)
         self.adapter = Adapter(config)
 
     def zero_missing_biases(self) -> None:

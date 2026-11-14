@@ -51,6 +51,8 @@ LLM_ATTN = "llm_attn"
 LLM_POS = "llm_pos"
 LLM_SAMPLER = "llm_sampler"
 AUDIO_ATTN = "audio_attn"
+# the audio tower's within-step array, which its key-prefix read (AUDIO_ATTN) attends
+AUDIO_TOKENS = "audio_tokens"
 T2W_STATE = "t2w_state"
 # token2wav's attention caches, one resource per ``token2wav.CACHE_FAMILIES`` entry
 T2W_KV = {"enc1": "t2w_enc1_kv", "enc2": "t2w_enc2_kv", "dit": "t2w_dit_kv"}

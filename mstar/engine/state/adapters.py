@@ -22,10 +22,12 @@ from mstar.engine.resources.attn.config import (
     CrossAttentionSpec,
 )
 from mstar.engine.resources.attn.ragged.config import (
+    KeyPrefixAttentionStep,
     RaggedAttentionConfig,
     RaggedAttentionSpec,
     RaggedCrossAttentionSpec,
     RaggedCrossAttentionStep,
+    RaggedKeyPrefixAttentionSpec,
     cross_label,
 )
 from mstar.engine.resources.kv.config import KVLayout, KVSpec, KVStep, PagedKVConfig
@@ -64,6 +66,7 @@ from mstar.engine.state.contract import (
     Attend,
     Bidirectional,
     Block,
+    BlockPrefix,
     Causal,
     CausalConv,
     Entry,
@@ -499,6 +502,8 @@ class WithinStepSteps(StepBuilder):
         self._queries: dict[str, Queries] = {}
         # a resource's layout is fixed only if every read on it declares it so
         self._fixed: dict[str, bool] = {}
+        # each key-prefix resource's prefix lengths, parallel to its segments
+        self._prefix_lens: dict[str, tuple[int, ...]] = {}
 
     def add(
         self, handle: "WithinStepHandle", declared: ArrayStep, step: SubmoduleStep, walk: str | None = None,
@@ -533,7 +538,9 @@ class WithinStepSteps(StepBuilder):
             segments = tuple(s for each in by_label.values() for s in each) if len(by_label) > 1 else (
                 next(iter(by_label.values()))
             )
-            steps[key] = self._queries[key].step(segments, self._pairs.get(key, ()), self._fixed[key])
+            steps[key] = self._queries[key].step(
+                segments, self._pairs.get(key, ()), self._fixed[key], self._prefix_lens.get(key),
+            )
         return steps
 
 
@@ -765,6 +772,8 @@ class SdpaAttend(WithinStepAttend):
 
     def check(self, array: Array, key: str, read: Read) -> None:
         super().check(array, key, read)
+        if isinstance(read.mask, BlockPrefix):
+            raise _no_layout(array, f"reads[{key!r}] is a BlockPrefix read, which SDPA doesn't run")
         if read.packed:
             raise _no_layout(array, f"reads[{key!r}] runs SDPA, which can't tell one segment of packed queries from "
                                     "the next, and a read of rows of one length declares packed=False")
@@ -1500,7 +1509,9 @@ class Queries(QuerySide, ABC):
         """Lay out ``handle``'s read in ``steps``, over ``segments``, its own array's in ``step``."""
 
     @abstractmethod
-    def step(self, segments, pairs: Sequence[tuple[str, str]], fixed: bool) -> Any:
+    def step(
+        self, segments, pairs: Sequence[tuple[str, str]], fixed: bool, prefix_lens: tuple[int, ...] | None,
+    ) -> Any:
         """The step of a resource whose reads lay out their queries this way."""
 
 
@@ -1515,8 +1526,35 @@ class OwnQueries(Queries):
     def plan(self, steps: WithinStepSteps, handle: "WithinStepHandle", segments, step: SubmoduleStep) -> None:
         steps._label(handle.resource_key, handle.array, segments)
 
-    def step(self, segments, pairs: Sequence[tuple[str, str]], fixed: bool) -> Any:
+    def step(
+        self, segments, pairs: Sequence[tuple[str, str]], fixed: bool, prefix_lens: tuple[int, ...] | None,
+    ) -> Any:
         return AttentionStep(segments=segments, causal=False, fixed_layout=fixed)
+
+
+class PrefixQueries(OwnQueries):
+    """A read whose queries are its own array's, each seeing a prefix of its segment's entries (`BlockPrefix`), as
+    many as the step's ``prefix_lens`` gives the segment."""
+
+    spec_class = RaggedKeyPrefixAttentionSpec
+
+    def plan(self, steps: WithinStepSteps, handle: "WithinStepHandle", segments, step: SubmoduleStep) -> None:
+        lens = step.state[handle.name].prefix_lens
+        if lens is None or len(lens) != len(segments):
+            raise ValueError(f"Array {handle.name!r}: its BlockPrefix read needs prefix_lens, one per segment of its "
+                             f"{len(segments)}, and the step gives {lens!r}")
+        bad = [(s.span, n) for s, n in zip(segments, lens, strict=True) if not (0 < n <= s.span or n == s.span == 0)]
+        if bad:
+            raise ValueError(f"Array {handle.name!r}: prefix_lens must be within each segment's span, and above 0 "
+                             f"unless the span is; got (span, prefix) {bad}")
+        if steps._prefix_lens.setdefault(handle.resource_key, tuple(lens)) != tuple(lens):
+            raise ValueError(f"Array {handle.name!r}: its resource already holds other prefix_lens this step")
+        super().plan(steps, handle, segments, step)
+
+    def step(
+        self, segments, pairs: Sequence[tuple[str, str]], fixed: bool, prefix_lens: tuple[int, ...] | None,
+    ) -> Any:
+        return KeyPrefixAttentionStep(segments=tuple(segments), key_lens=prefix_lens)
 
 
 class CrossQueries(OtherArrayQueries, Queries):
@@ -1533,7 +1571,9 @@ class CrossQueries(OtherArrayQueries, Queries):
         q_label = steps._label(key, self.array, self.segments(handle, step))
         steps._pairs.setdefault(key, []).append((q_label, steps._label(key, handle.array, segments)))
 
-    def step(self, segments, pairs: Sequence[tuple[str, str]], fixed: bool) -> Any:
+    def step(
+        self, segments, pairs: Sequence[tuple[str, str]], fixed: bool, prefix_lens: tuple[int, ...] | None,
+    ) -> Any:
         return RaggedCrossAttentionStep(segments=tuple(segments), pairs=tuple(pairs))
 
 
@@ -1948,9 +1988,10 @@ class WithinStepStorage(Storage):
             bound, heads, head_dim, dtype = _within_step_read(array, setup)
             resolved.bound[array.name] = (bound,)
             key, read = bound.key, bound.declared
-            queries = resolved.queries[key] = (OwnQueries if read.queries is None else CrossQueries)(
-                query_array(array, read, by_name),
+            kind = CrossQueries if read.queries is not None else (
+                PrefixQueries if isinstance(read.mask, BlockPrefix) else OwnQueries
             )
+            queries = resolved.queries[key] = kind(query_array(array, read, by_name))
             # refuses either side's second label at resolve, which validation and `build_specs` run before any handle
             queries.plan_label(array)
             config = RaggedAttentionConfig(
