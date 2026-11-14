@@ -500,6 +500,7 @@ exclude = ["tests*", "benchmark*", "examples*", "mstar_sim*"]
 # configs/ into mstar/default_configs/ at build time; see setup.py) so
 # `mstar serve <model>` works from a pip install.
 [tool.setuptools.package-data]
+"mstar.utils.voxcpm2_solve" = ["csrc/*.cu", "csrc/*.cuh", "csrc/*.cpp", "csrc/*LICENSE.txt"]
 "mstar.utils.fused_moe" = ["csrc/*.cu", "csrc/*.cuh", "csrc/*.h", "csrc/*.cpp"]
 "mstar.kernels" = ["tables/*/*.json"]
 "mstar.default_configs" = ["*.yaml"]
