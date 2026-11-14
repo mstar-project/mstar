@@ -127,16 +127,17 @@ def test_sm_103_runs_fa4_for_wan_a14b_sizes(gpu, seq_len, impl):
 
 
 RUNS = Choice("cudnn", {"segments": "runs"})
+FA4_RUNS = Choice("fa4", {"segments": "runs"})
 
 
-def test_sm_103_runs_minimax_h3_on_cudnn_in_runs(gpu):
-    """MiniMax-H3's 56 heads: cuDNN at every size, taking its request rows then its padding rows eagerly."""
+def test_sm_103_runs_minimax_h3_on_fa4_in_runs(gpu):
+    """MiniMax-H3's 56 heads: FA4 at every size, taking its request rows then its padding rows eagerly."""
     shape = (("head_dim", 128), ("num_kv_heads", 56), ("num_qo_heads", 56))
     entry = next(find_entries("ragged_attention", B300, "bfloat16", shape))
-    assert entry.rows == ((None, RUNS),)
+    assert entry.rows == ((None, FA4_RUNS),)
     gpu(B300)
     manager = build(spec(56))
-    assert kernels_module.RAGGED_ATTENTION.row_for(manager._kernel_rows, 37985) == RUNS
+    assert kernels_module.RAGGED_ATTENTION.row_for(manager._kernel_rows, 37985) == FA4_RUNS
 
 
 @pytest.mark.parametrize("key", [H100, DeviceKey("NVIDIA B200", "sm_100")], ids=["sm_90", "sm_100"])
@@ -338,6 +339,14 @@ def test_a_runs_row_takes_unequal_segments_eagerly(stub_flashinfer):
     m = manager_with(((None, RUNS),))
     w = planned(m, 37985, 159)
     assert type(w) is CudnnRaggedPrefillWrapper and w._runs == [(1, 37985), (1, 159)]
+    assert planned(m, 4608, 4608) is w and w._runs == [(2, 4608)]
+
+
+def test_an_fa4_runs_row_takes_unequal_segments_eagerly(stub_flashinfer):
+    """H3's shipped row: FA4 in two dense calls (request rows, then padding rows), one batch for equal segments."""
+    m = manager_with(((None, FA4_RUNS),))
+    w = planned(m, 37985, 159)
+    assert type(w) is Fa4UniformPrefillWrapper and w._runs == [(1, 37985), (1, 159)]
     assert planned(m, 4608, 4608) is w and w._runs == [(2, 4608)]
 
 
