@@ -161,6 +161,8 @@ class ArrayHandle(StepHandle):
             isinstance(read.mask, BlockPrefix) for read in self.array.reads.values()
         ):
             raise self._refusal("a step sets prefix_lens, and the array has no BlockPrefix read")
+        if declared.sources and self.array.source is None:
+            raise self._refusal("a step names sources, and the array declares no source")
         self._check_storage(declared, segments, ctx)
 
     @abstractmethod
@@ -239,6 +241,15 @@ class ArrayHandle(StepHandle):
 
     def at_last_token(self, x: torch.Tensor) -> torch.Tensor:
         raise self._unsupported("at_last_token")
+
+    def set_sources(self, fields: Mapping[str, torch.Tensor], lengths: Sequence[int]) -> None:
+        """Hand over the read-only prefixes rows start from (`Array.source`), once, before the handle's first step:
+        each field ``[sources, layers, max_len, *entry shape]`` over the array's layers in order, and each source's
+        length."""
+        raise self._unsupported("set_sources")
+
+    def _retained(self) -> torch.Tensor:
+        raise self._unsupported("retained")
 
     def takes_fused(self, op: "StateOp") -> bool:
         """Whether ``op``'s fused kernel writes this array itself, in place of its reference running the calls."""
@@ -462,6 +473,14 @@ def last_sampled(s: SamplerHandle) -> torch.Tensor:
     if not s._open:
         raise s._refusal("last_sampled in a step that doesn't list the sampler")
     return s.resource.loopback_tokens(s.rows)
+
+
+@torch.compiler.disable
+def retained(h: ArrayHandle) -> torch.Tensor:
+    """Each row's entries its reads see before its step's own, on the device: on a `Retained` read, the source's and
+    the kept ones'."""
+    h._check_open("retained")
+    return h._retained()
 
 
 def kernel_setting(h: ArrayHandle, read: str, field: str) -> Any:

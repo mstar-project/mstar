@@ -14,8 +14,8 @@ x-vector, mel) and the flow's recorded noise buffer.
   Mels are bit-exact; PCM is held to ``HIFT_NONDET_LSB``, since the vocoder (the reference's
   too) is not deterministic run to run, and under deterministic cuDNN on both sides (the reference's
   replay, ``hift_float.py``) the vocoder is bit-exact too.
-* **served path**: ``window_flow`` / ``window_vocode`` / ``window_finish`` on the bounded KV
-  and state-pool resources built from ``token2wav_resources`` with Step-Audio2's
+* **served path**: ``window_flow`` / ``window_vocode`` / ``window_finish`` on the caches as
+  declared (``cache_arrays``), through their state handles, with Step-Audio2's
   ``Token2WavStreaming``, the DiT in float16 as served. The yardstick is the reference's own
   float16 token2wav (``record_t2w_fp16.py``): the flow's mels must be no further from the
   fp32 oracle than its, the audio's log-spectral distance within ``SPREAD`` times its
@@ -31,6 +31,7 @@ Run: ``python test/step_audio2/parity_token2wav.py``; exits nonzero on any faile
 from __future__ import annotations
 
 import dataclasses
+from types import SimpleNamespace
 
 import numpy as np
 import torch
@@ -38,14 +39,14 @@ from _common import ASSETS, CKPT, DEVICE, Verdict, oracle, setup_torch
 
 from mstar.engine.resources import Segment, StepContext, StepRunner, SubmoduleStep
 from mstar.engine.resources.base import EngineResourceInfo, build_resource
-from mstar.engine.resources.kv.bounded import BoundedKVStep, StreamPosition
+from mstar.engine.state import ArrayStep
+from mstar.engine.state.adapters import build_specs, node_handles, state_steps
 from mstar.model.components.token2wav.keys import Token2WavKeys
 from mstar.model.components.token2wav.model import (
     DIT_COMPUTE_DTYPE,
     HIFT_MEL_CACHE,
     HIFT_TAIL,
     KEEP_RECENT,
-    AttentionCache,
     CacheCapacity,
     Token2Wav,
     Token2WavState,
@@ -56,11 +57,10 @@ from mstar.model.components.token2wav.model import (
     fade_in_out,
     load_token2wav,
     slot_layout,
-    window_tokens,
 )
-from mstar.model.components.token2wav.resources import token2wav_resources
+from mstar.model.components.token2wav.resources import cache_arrays
 from mstar.model.components.token2wav.voice_prompt import VoicePrompt
-from mstar.model.step_audio2.token2wav import T2W_STREAMING
+from mstar.model.step_audio2.token2wav import CONFORMER_REPLY_TOKENS, T2W_STREAMING
 
 KEYS = Token2WavKeys(codes="speech_codes", state="t2w_state",
                      kv={"enc1": "t2w_enc1_kv", "enc2": "t2w_enc2_kv", "dit": "t2w_dit_kv"})
@@ -165,37 +165,38 @@ def served(model: Token2Wav, voice: Token2WavVoice, windows, vocode_mels=None) -
     """Each window's flow mel and PCM; with ``vocode_mels``, HiFT vocodes those (the
     reference's) in place of the flow's, to check the vocoder stage alone."""
     p = voice.prompt.tokens.shape[1]
-    specs = token2wav_resources(KEYS, "token2wav", (p / 25, p / 25), max_slots=3, streaming=model.streaming)
+    arrays = cache_arrays(KEYS, "token2wav", (p, p), CONFORMER_REPLY_TOKENS, streaming=model.streaming)
+    specs = build_specs(arrays, kernel_settings={array.name: {"max_slots": 2} for array in arrays})
     resources = {s.resource_key: build_resource(s, EngineResourceInfo(device=DEVICE, kv_dtype=torch.float32))
                  for s in specs}
+    handles = node_handles(SimpleNamespace(declare_state=lambda: arrays), "token2wav", resources)
     runner = StepRunner(resources)
     families = model.streaming.cache_families()
     bank = VoiceBank.build({"v": voice}, dit_dtype=DIT_COMPUTE_DTYPE)
+    for name, fam in families.items():
+        handles[KEYS.kv[name]].set_sources(bank.source_fields(name, fam.head_dim), [fam.rate * p])
+    caches = WindowCaches.bind(handles, KEYS.kv, families, {
+        name: handles[KEYS.kv[name]].array.source.max_len for name in families
+    })
     rid = "r0"
     runner.ingest_request(rid, {})
     # the request's Value fields, as its regions read and write them; it starts with none
     fields: dict[str, torch.Tensor] = {"started": torch.zeros(1, dtype=torch.bool, device=DEVICE)}
     for name, block in slot_layout(CacheCapacity(1), dit_dtype=DIT_COMPUTE_DTYPE).items():
         fields[name] = torch.zeros(1, *block.shape, dtype=block.dtype, device=DEVICE)
-    mels, out, written = [], [], 0
+    mels, out = [], []
     with torch.inference_mode():
         for k, (codes, last) in enumerate(windows):
             n, first = len(codes), k == 0
-            step = SubmoduleStep(
-                segments=[Segment(request_id=rid, label="main", span=1)],
-                steps={
-                    **{KEYS.kv[name]: BoundedKVStep(
-                        segments=[Segment(request_id=rid, label="main", span=fam.span(n, last))],
-                        positions={rid: StreamPosition(*fam.position(p, written), source=0)},
-                    ) for name, fam in families.items()},
-                },
-            )
+            step = state_steps(SubmoduleStep(state={
+                KEYS.kv[name]: ArrayStep(segments=(Segment(request_id=rid, label="main", span=fam.span(n, last)),),
+                                         sources={rid: 0})
+                for name, fam in families.items()
+            }), handles)
             step.set_ctx(StepContext(request_ids=(rid,), graph_walk="t2w", slot=0, capture=False))
             assert runner.admit(step).ok
             runner.plan(step)
-            caches = WindowCaches(**{
-                name: AttentionCache(resources[KEYS.kv[name]], bank.sources[name]) for name in families
-            })
+            step.begin_calls()
             tokens = torch.tensor([codes], dtype=torch.int32, device=DEVICE)
             voices = torch.zeros(1, dtype=torch.long, device=DEVICE)
             mel, conv = model.window_flow(fields, bank, voices, tokens, caches, last)
@@ -211,8 +212,9 @@ def served(model: Token2Wav, voice: Token2WavVoice, windows, vocode_mels=None) -
             fields.update(held)
             speech, held = model.window_finish(fields, spec["magnitude"], spec["phase"], first, last)
             fields.update(held)
+            step.check_calls()
+            step.end_calls()
             runner.commit(step)
-            written += window_tokens(n, last)
             out.append(pcm_bytes(speech))
     runner.remove_request(rid)
     return mels, out

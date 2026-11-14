@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, get_origin
 
 import torch
 
-from mstar.engine.state.contract import Array, Block, Read, Sampler, SeqShard, is_value, read_layers
+from mstar.engine.state.contract import Array, Block, Read, Retained, Sampler, SeqShard, is_value, read_layers
 
 if TYPE_CHECKING:
     from mstar.model.base import Model
@@ -105,6 +105,8 @@ def _array_problems(array: Array) -> list[str]:
         elif not isinstance(read.mask, Block) and not array.max_len:
             problems.append(f"{where}.reads[{key!r}].mask: every read of an array with max_len 0 is a Block read, "
                             f"and this one is {type(read.mask).__name__}")
+    if array.source is not None and not any(isinstance(read.mask, Retained) for read in array.reads.values()):
+        problems.append(f"{where}.source: only a Retained read reads a source, and the array has none")
     if array.positions is not None:
         if array.rewritable or not array.max_len:
             problems.append(f"{where}.positions: positions sit only on an append-only array that keeps entries")

@@ -141,7 +141,12 @@ class BoundedKVStep(ResourceStep):
 
     The positions come from the model, not the resource, so a plan never waits
     on the previous step's commit and planning the same step twice (a piecewise
-    region inside a forward that declared it too) is harmless.
+    region inside a forward that declared it too) is harmless. Or a row names only
+    its source (``sources``), and admit fixes its position from what was committed,
+    which the step's plan and commit then use.
     """
 
     positions: Mapping[str, StreamPosition] = field(default_factory=dict)
+    # A row with no position names (source_len, source) here, and its written count is what the resource committed,
+    # read at admit: the state contract's step, which knows each row's source but not where its stream stands.
+    sources: Mapping[str, tuple[int, int]] = field(default_factory=dict)

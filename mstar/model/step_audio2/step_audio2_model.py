@@ -36,7 +36,6 @@ import torch
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import FINAL_PREFILL, PartitionDefinition
 from mstar.distributed.base import ShardingConfig
-from mstar.engine.resources import NodeResourceSpec
 from mstar.engine.state import (
     Array,
     Attend,
@@ -58,8 +57,8 @@ from mstar.model.components.token2wav.keys import Token2WavKeys
 from mstar.model.components.token2wav.model import DIT_COMPUTE_DTYPE, HOP, WINDOW, load_token2wav
 from mstar.model.components.token2wav.resources import (
     check_token2wav_slots,
+    token2wav_caches,
     token2wav_kernel_settings,
-    token2wav_resources,
     token2wav_state,
 )
 from mstar.model.components.token2wav.submodule import Token2WavSubmodule
@@ -291,16 +290,12 @@ class StepAudio2Model(Model):
                 reads={AUDIO_ATTN: Read(mask=BlockPrefix(), op=Attend(q_heads=audio.n_audio_head))},
             ),
             *token2wav_state(T2W_KEYS, TOKEN2WAV),
+            *token2wav_caches(T2W_KEYS, TOKEN2WAV, self._voice_seconds(), CONFORMER_REPLY_TOKENS, T2W_STREAMING),
         ]
 
     def kernel_settings(self) -> dict[str, dict[str, Any]]:
         # a request's 25 s clips; more run eagerly once the tower captures
         return {AUDIO_ATTN: {"max_segments_per_request": 8}, **token2wav_kernel_settings(T2W_KEYS, T2W_DEFAULT_SLOTS)}
-
-    def get_node_resources(self) -> list[NodeResourceSpec]:
-        return [
-            *token2wav_resources(T2W_KEYS, TOKEN2WAV, self._voice_seconds(), T2W_DEFAULT_SLOTS, T2W_STREAMING),
-        ]
 
     def _voice_seconds(self) -> tuple[float, float]:
         """The shortest and longest voice clip."""

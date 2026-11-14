@@ -28,12 +28,17 @@ from mstar.engine.accelerator_graph_config import (
     PiecewisePackedConfig,
 )
 from mstar.engine.engine import ExecutingBatch
-from mstar.engine.resources import (
+from mstar.engine.state import (
+    ArrayStep,
+    SampleStep,
     Segment,
     SlotLease,
     SubmoduleStep,
+    at_last_token,
+    kernel_setting,
+    last_sampled,
+    sample,
 )
-from mstar.engine.state import ArrayStep, SampleStep, at_last_token, kernel_setting, last_sampled, sample
 from mstar.model.components.qwen3_lm import Qwen3DenseLM
 from mstar.model.components.sampled_token_decoder import splice_row_ids
 from mstar.model.multimodal import splice_media
@@ -373,7 +378,6 @@ class AudioEncoderSubmodule(NodeSubmodule):
         per_request = kernel_setting(self.tokens, AUDIO_ATTN, "max_segments_per_request")
         return sum(len(inp.kwargs["layout"]) for inp in inputs) <= per_request * len(inputs)
 
-    @torch.compiler.disable
     def _replay_block_loop(
         self, engine_inputs: ModelInputsFromEngine, hidden: torch.Tensor, layout: list,
     ) -> torch.Tensor | None:

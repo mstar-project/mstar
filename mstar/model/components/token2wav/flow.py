@@ -24,6 +24,8 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from mstar.engine.state import retained
+
 TOKEN_VOCAB = 6561
 TOKEN_DIM = 512
 MEL_BINS = 80
@@ -72,29 +74,33 @@ class DenseKV:
 
 
 class BoundedLayerKV:
-    """One layer's cache on the engine's bounded KV resource, for the rows its step
-    planned (at any positions): ``source [voices, rows, H, L, 2d]`` the layer's voices in
-    stream order (``token2wav.CACHE_FAMILIES``)."""
+    """One layer's cache, on the state contract's handle of its family's array (``token2wav_caches``), for the rows the
+    step planned (at any positions). A layer's ``[N, H, T, d]`` rows are the array's query rows, a request's guidance
+    pair (the DiT's entry rows) consecutive ones."""
 
-    def __init__(self, resource, layer_idx: int, source: torch.Tensor):
-        self.resource = resource
-        self.layer_idx = layer_idx
-        self.source = source
+    def __init__(self, handle, layer: int, max_keys: int):
+        self.handle = handle
+        # 0-d int64 on the CPU: the layer id as the contract takes it
+        self.layer = torch.tensor(layer)
+        self._max_keys = max_keys
 
     def retained(self) -> torch.Tensor:
-        """``[rows]`` each row's retained entries, which is also its noise offset."""
-        return self.resource.current.retained()
+        """``[requests]`` each request's retained entries, which is also its noise offset."""
+        return retained(self.handle)
 
     @property
     def max_keys(self) -> int:
         """The most keys a row retains (before this step's own)."""
-        return self.resource.config.max_retained
+        return self._max_keys
 
     def attend(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, rel_bias: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """``q, k, v [N, H, T, d]`` -> ``[N, T, H, d]``."""
-        return self.resource.attend(self.layer_idx, q, k, v, self.source, rel_bias=rel_bias)
+        self.handle.add(self.layer, k=k.transpose(1, 2), v=v.transpose(1, 2))
+        return self.handle.read(
+            self.layer, q.transpose(1, 2), **({} if rel_bias is None else {"distance_bias": rel_bias}),
+        )
 
 
 # what an attention layer is handed
