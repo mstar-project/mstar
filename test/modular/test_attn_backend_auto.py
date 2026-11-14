@@ -25,6 +25,7 @@ from mstar.engine.resources import (
     apply_yaml_overrides,
 )
 from mstar.engine.resources.attn import dense as dense_module
+from mstar.engine.resources.attn import fa3 as fa3_module
 from mstar.engine.resources.attn.base import AttentionManager, resolve_attn_backend
 from mstar.engine.resources.attn.cross import CrossAttentionManager, FlashInferCrossManager
 from mstar.engine.resources.attn.flashinfer import FlashInferManager
@@ -121,14 +122,14 @@ def test_auto_is_resolved_before_the_kv_config_check():
 
 
 def test_dense_without_a_varlen_kernel_falls_back_to_autos_backend(monkeypatch, caplog):
-    monkeypatch.setattr(dense_module, "_VARLEN_IMPORT_ERROR", "ImportError: not installed")
-    dense_module._fa3_unavailable_reason.cache_clear()
+    monkeypatch.setattr(fa3_module, "_VARLEN_IMPORT_ERROR", "ImportError: not installed")
+    fa3_module._fa3_unavailable_reason.cache_clear()
     dense_module._warn_dense_fallback.cache_clear()
     try:
         with caplog.at_level(logging.WARNING, logger=dense_module.logger.name):
             manager = AttentionManager.build(attention_spec(backend=AttnBackend.DENSE), kv_info(paged_config()))
     finally:
-        dense_module._fa3_unavailable_reason.cache_clear()
+        fa3_module._fa3_unavailable_reason.cache_clear()
         dense_module._warn_dense_fallback.cache_clear()
     assert type(manager) is FlashInferManager
     assert "using the paged 'flashinfer' backend" in caplog.text
@@ -150,13 +151,13 @@ class _FakeCudaPlatform:
 )
 def test_dense_needs_a_kernel_for_the_gpus_capability(capability, has_kernel, monkeypatch):
     """fa3-fwd imports on any NVIDIA GPU but has kernels only for sm_80 and sm_90a."""
-    monkeypatch.setattr(dense_module, "_VARLEN_IMPORT_ERROR", None)
-    monkeypatch.setattr(dense_module, "current_platform", _FakeCudaPlatform(capability))
-    dense_module._fa3_unavailable_reason.cache_clear()
+    monkeypatch.setattr(fa3_module, "_VARLEN_IMPORT_ERROR", None)
+    monkeypatch.setattr(fa3_module, "current_platform", _FakeCudaPlatform(capability))
+    fa3_module._fa3_unavailable_reason.cache_clear()
     try:
-        reason = dense_module._fa3_unavailable_reason(torch.device("cuda", 0))
+        reason = fa3_module._fa3_unavailable_reason(torch.device("cuda", 0))
     finally:
-        dense_module._fa3_unavailable_reason.cache_clear()
+        fa3_module._fa3_unavailable_reason.cache_clear()
     if has_kernel:
         assert reason is None
     else:
@@ -189,7 +190,7 @@ def test_ragged_attention_builds_flashinfer(spec_class, manager_class, backend):
 
 
 def _clear_fa3_caches():
-    dense_module._fa3_unavailable_reason.cache_clear()
+    fa3_module._fa3_unavailable_reason.cache_clear()
     from mstar.engine.resources.attn.ragged import dense as ragged_dense
 
     ragged_dense._warn_ragged_dense_fallback.cache_clear()
@@ -204,7 +205,7 @@ def _clear_fa3_caches():
     ],
 )
 def test_explicit_ragged_dense_builds_when_the_kernel_is_present(spec_class, manager_class, monkeypatch):
-    monkeypatch.setattr(dense_module, "_VARLEN_IMPORT_ERROR", None)
+    monkeypatch.setattr(fa3_module, "_VARLEN_IMPORT_ERROR", None)
     _clear_fa3_caches()
     try:
         spec = spec_class(
@@ -227,7 +228,7 @@ def test_explicit_ragged_dense_builds_when_the_kernel_is_present(spec_class, man
 def test_explicit_ragged_dense_falls_back_when_the_kernel_is_missing(
     spec_class, manager_class, monkeypatch, caplog,
 ):
-    monkeypatch.setattr(dense_module, "_VARLEN_IMPORT_ERROR", "ImportError: not installed")
+    monkeypatch.setattr(fa3_module, "_VARLEN_IMPORT_ERROR", "ImportError: not installed")
     _clear_fa3_caches()
     try:
         spec = spec_class(
@@ -243,7 +244,7 @@ def test_explicit_ragged_dense_falls_back_when_the_kernel_is_missing(
 
 
 def test_block_causal_dense_falls_back_even_with_the_kernel_present(monkeypatch, caplog):
-    monkeypatch.setattr(dense_module, "_VARLEN_IMPORT_ERROR", None)
+    monkeypatch.setattr(fa3_module, "_VARLEN_IMPORT_ERROR", None)
     _clear_fa3_caches()
     try:
         spec = RaggedBlockCausalAttentionSpec(

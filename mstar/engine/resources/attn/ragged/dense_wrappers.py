@@ -5,7 +5,7 @@ Same layouts as the FlashInfer wrappers, without a workspace or head-dim padding
 
 import torch
 
-from mstar.engine.resources.attn.dense import flash_attn_varlen_func
+from mstar.engine.resources.attn.fa3 import flash_attn_varlen_func
 from mstar.engine.resources.attn.ragged.wrappers import (
     PrefixedPrefillWrapper,
     RaggedCrossPrefillWrapper,

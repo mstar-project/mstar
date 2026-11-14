@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 
 import torch
 
+from mstar.engine.resources.attn import fa3
 from mstar.engine.resources.attn.base import AttentionManager, EagerSlotKey
 from mstar.engine.resources.attn.config import AttentionStep, AttnBackend, refuse_context_only
 from mstar.engine.resources.attn.ragged.wrappers import PrefixedPrefillWrapper, _FlashInferRaggedPrefillBase
@@ -18,44 +19,6 @@ from mstar.engine.resources.step import StepContext
 from mstar.platforms import current_platform
 
 logger = logging.getLogger(__name__)
-
-# imported here, not per `run`: the wheel may be absent, so keep the failure
-try:
-    from fa3_fwd_interface import flash_attn_varlen_func
-except Exception as _fa3_exc:  # noqa: BLE001
-    flash_attn_varlen_func = None
-    _VARLEN_IMPORT_ERROR: str | None = f"{type(_fa3_exc).__name__}: {_fa3_exc}"
-else:
-    _VARLEN_IMPORT_ERROR = None
-
-# ROCm has no FA3; AITER's varlen FMHA takes the same call, so dense runs on it
-# there instead of degrading to the paged backend
-if flash_attn_varlen_func is None and current_platform.is_rocm():
-    try:
-        from aiter import flash_attn_varlen_func
-    except Exception as _aiter_exc:  # noqa: BLE001
-        _VARLEN_IMPORT_ERROR = f"{_VARLEN_IMPORT_ERROR}; aiter: {type(_aiter_exc).__name__}: {_aiter_exc}"
-    else:
-        _VARLEN_IMPORT_ERROR = None
-
-
-def _fa3_has_kernel(capability: tuple[int, int]) -> bool:
-    # fa3-fwd ships sm_90a and sm_80 kernels and no PTX, so a GPU of any other
-    # architecture, Blackwell's among them, has no image to launch
-    return capability == (9, 0) or capability[0] == 8
-
-
-@functools.cache
-def _fa3_unavailable_reason(device: torch.device | None = None) -> str | None:
-    """why no varlen kernel can run on ``device`` (the current GPU if None): none
-    imported (fa3-fwd, and AITER on ROCm), or fa3-fwd has none for its capability"""
-    if _VARLEN_IMPORT_ERROR is not None:
-        return _VARLEN_IMPORT_ERROR
-    capability = current_platform.cuda_capability(device)
-    if capability is not None and not _fa3_has_kernel(capability):
-        return f"fa3-fwd has no kernel for compute capability {capability[0]}.{capability[1]}"
-    return None
-
 
 @functools.cache
 def _warn_dense_fallback(reason: str, fallback: AttnBackend) -> None:
@@ -92,11 +55,11 @@ def _flashinfer_version() -> str:
 def _dense_unavailable_reason(device: torch.device | None = None) -> str | None:
     """why neither FA3 (AITER on ROCm) nor FlashInfer can run the dense pass on
     ``device``; None if either can"""
-    fa3 = _fa3_unavailable_reason(device)
-    if fa3 is None:
+    reason = fa3._fa3_unavailable_reason(device)
+    if reason is None:
         return None
     flashinfer = _flashinfer_ragged_unavailable_reason(device)
-    return None if flashinfer is None else f"{fa3}; {flashinfer}"
+    return None if flashinfer is None else f"{reason}; {flashinfer}"
 
 
 @dataclass(frozen=True)
