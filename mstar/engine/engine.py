@@ -1231,6 +1231,26 @@ class Engine:
 
         for resource in self._resources.values():
             resource.post_warmup_validate()
+        self._check_deferred_room()
+
+    def _check_deferred_room(self) -> None:
+        """Raise when the resources defer more of the device's memory together than load left free.
+
+        Each can fit by its own budget while their sum doesn't, and a forward would then run out of memory.
+        """
+        deferred = {key: resource.deferred_bytes for key, resource in self._resources.items()}
+        deferred = {key: nbytes for key, nbytes in deferred.items() if nbytes}
+        if not deferred or self._device is None or self._device.type != "cuda":
+            return
+        # the tensors come from the caching allocator, so what it holds free counts as room
+        free = torch.cuda.mem_get_info(self._device)[0]
+        room = free + torch.cuda.memory_reserved(self._device) - torch.cuda.memory_allocated(self._device)
+        if sum(deferred.values()) > room:
+            kept = ", ".join(f"{key} {nbytes / 2**20:.0f} MiB" for key, nbytes in deferred.items())
+            raise RuntimeError(
+                f"resources keep {sum(deferred.values()) / 2**20:.0f} MiB of {self._device} for tensors they hold "
+                f"none of at load ({kept}), and it has {room / 2**20:.0f} MiB left after load; lower one of them "
+                "under the deployment's resources:, as a sized Value's max_bytes")
 
     def _plan_captures(
         self, ag_runners: dict[str, AcceleratorGraphRunner],
@@ -1271,6 +1291,7 @@ class Engine:
                 # doesn't, so the plan counts graphs as reusing that memory only up to the gap between them.
                 reusable = max(capped - free, 0)
                 free = min(free, capped)
+            free = max(free - sum(resource.deferred_bytes for resource in self._resources.values()), 0)
             return pools, free, plan_captures(pools, free, reusable)
 
         pools, free, plan = planned(lambda runner: runner.size_captures())

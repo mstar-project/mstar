@@ -201,28 +201,6 @@ b200:qwen3_omni_mooncake/text/tok_per_s@c8:
   deltas: [5.327]
 b200:qwen3_omni_mooncake/text/ttft_p50_s@c1:
   deltas: [0.896]
-b200:qwen3_omni_rustfe/image_in/correct:
-  kind: text_match
-  swings: [0.0, 0.5]
-b200:qwen3_omni_rustfe/image_in/lat_p50_s@c1:
-  deltas: [-0.421, 0.725]
-b200:qwen3_omni_rustfe/image_in/req_per_s@c8:
-  deltas: [-0.75]
-b200:qwen3_omni_rustfe/image_in/tok_per_s@c8:
-  deltas: [0.12]
-b200:qwen3_omni_rustfe/image_in/ttft_p50_s@c1:
-  deltas: [-0.531, 0.406]
-b200:qwen3_omni_rustfe/text/correct:
-  kind: text_match
-  swings: [0.0, 0.5]
-b200:qwen3_omni_rustfe/text/lat_p50_s@c1:
-  deltas: [-0.725, 0.594]
-b200:qwen3_omni_rustfe/text/req_per_s@c8:
-  deltas: [5.987]
-b200:qwen3_omni_rustfe/text/tok_per_s@c8:
-  deltas: [1.633]
-b200:qwen3_omni_rustfe/text/ttft_p50_s@c1:
-  deltas: [0.499, -3.849]
 b200:qwen3_tts/tts/audio_s_per_s@c8:
   deltas: [-1.548]
 b200:qwen3_tts/tts/correct:

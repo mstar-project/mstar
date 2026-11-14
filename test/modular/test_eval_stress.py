@@ -15,11 +15,13 @@ sys.path.insert(0, ".")
 
 pytest.importorskip("aiohttp")
 
+from test_eval_compare import fake_cargo  # noqa: E402,F401
+
 from benchmark.eval.e2e import compare, hosts, stress, trees  # noqa: E402
 from benchmark.eval.e2e import manifest as mf  # noqa: E402
 from benchmark.eval.e2e.stress import Arm, Refs, Reply  # noqa: E402
 
-pytestmark = pytest.mark.usefixtures("no_host_gpus")
+pytestmark = pytest.mark.usefixtures("no_host_gpus", "fake_cargo")
 
 RUN = {"id": "r", "base": {"label": "main", "sha": "a" * 40}, "head": {"label": "PR #1", "sha": "b" * 40},
        "gpu": "h200", "models": ["fake"]}
@@ -234,6 +236,7 @@ def fake_tree(d: Path, mode: str) -> Path:
     of another deployment in the shared shm dir; tokened and tokened_leak (good, leak) name their files under a
     launch token their spawned worker carries, and grow arena segments they never give back."""
     (d / "mstar" / "cli").mkdir(parents=True)
+    (d / "rust" / "server").mkdir(parents=True)   # for fake_cargo to build
     (d / "mstar" / "__init__.py").write_text("")
     (d / "mstar" / "cli" / "__init__.py").write_text("")
     answers = dict(zip(stress.PROMPTS, (

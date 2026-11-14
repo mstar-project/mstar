@@ -40,6 +40,7 @@ SNAPSHOT = {
         ["rewritable", "KEYWORD_ONLY", 'False'],
         ["labels", "KEYWORD_ONLY", "frozenset({'main'})"],
         ["positions", "KEYWORD_ONLY", 'None'],
+        ["largest", "KEYWORD_ONLY", '{}'],
     ],
     "ArrayStep": [
         ["segments", "KEYWORD_ONLY", 'None'],
@@ -104,6 +105,7 @@ SNAPSHOT = {
         ["scratch", "KEYWORD_ONLY", '0'],
         ["kept_windows", "KEYWORD_ONLY", '{}'],
         ["chunk_causal", "KEYWORD_ONLY", '{}'],
+        ["sizes", "KEYWORD_ONLY", '{}'],
     ],
     "PagedNHD": [
         ["dtypes", "KEYWORD_ONLY", 'None'],
@@ -141,6 +143,9 @@ SNAPSHOT = {
         ["old_context_len", "KEYWORD_ONLY", 'None'],
         ["dtype", "KEYWORD_ONLY", 'None'],
         ["table_dtype", "KEYWORD_ONLY", 'None'],
+    ],
+    "RowTensors": [
+        ["fields", "POSITIONAL_OR_KEYWORD", None],
     ],
     "SampleSettings": [
         ["temperature", "KEYWORD_ONLY", '0.6'],
@@ -184,6 +189,10 @@ SNAPSHOT = {
         ["walks", "KEYWORD_ONLY", 'None'],
         ["exchange", "KEYWORD_ONLY", "'auto'"],
     ],
+    "Size": [
+        ["name", "POSITIONAL_OR_KEYWORD", None],
+        ["scale", "KEYWORD_ONLY", '1'],
+    ],
     "SlotLease": [
         ["slot", "POSITIONAL_OR_KEYWORD", None],
         ["bucket", "POSITIONAL_OR_KEYWORD", None],
@@ -209,6 +218,7 @@ SNAPSHOT = {
         ["layers", "KEYWORD_ONLY", None],
         ["entry", "KEYWORD_ONLY", None],
         ["updates", "KEYWORD_ONLY", '{}'],
+        ["largest", "KEYWORD_ONLY", '{}'],
     ],
     "Window": [
         ["size", "POSITIONAL_OR_KEYWORD", None],

@@ -218,6 +218,12 @@ class Resource(ResidentHooks, ABC):
     def can_capture(self) -> bool:
         return True
 
+    @property
+    def deferred_bytes(self) -> int:
+        """Device memory this resource keeps free for tensors it holds none of at load, which the capture plan
+        leaves out of what it gives graphs."""
+        return 0
+
     # this resource's key among the engine's resources, set by `build_resource`
     resource_key: str | None = None
 

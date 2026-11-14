@@ -311,13 +311,13 @@ def build_rust_server(arm: dict) -> str | None:
     with host_lock(f"rust-server-{tree}"):
         if not binary.exists():
             if not shutil.which("cargo"):
-                return "the Rust frontend needs cargo on the host"
+                return "mstar-server needs cargo on the host"
             target = binary.parent / "target-server"
             r = subprocess.run(["cargo", "build", "-q", "--release"], cwd=f"{arm['src']}/rust/server",
                                env={**os.environ, "PYO3_PYTHON": job["python"], "CARGO_TARGET_DIR": str(target)},
                                capture_output=True, text=True, check=False)
             if r.returncode != 0:
-                return f"Rust frontend build failed: {r.stderr.strip()[-300:]}"
+                return f"mstar-server build failed: {r.stderr.strip()[-300:]}"
             shutil.copy(target / "release" / "mstar-server", binary)
     arm["rust_server"] = str(binary)
     return None
@@ -377,7 +377,12 @@ def case_cmds(case: dict, url: str, label: str, d: Path) -> list[list[str]]:
 
 
 def serve_args(arm: dict) -> list[str]:
-    return [a.replace("{rust_server_bin}", arm.get("rust_server") or "") for a in job["model"].get("serve_args", [])]
+    """The model's ``serve_args``, and the arm's own mstar-server build (which an arm from before
+    mstar-server was the only frontend reads as choosing it)."""
+    args = [a.replace("{rust_server_bin}", arm.get("rust_server") or "") for a in job["model"].get("serve_args", [])]
+    if "--rust-frontend-bin" not in args:
+        args += ["--rust-frontend-bin", arm["rust_server"]]
+    return args
 
 
 def timeout_server(arm: dict, d: Path, timeout_s: float, scratch: str) -> ManagedServer:
@@ -562,13 +567,13 @@ def run() -> None:
         bad = [f"{a}: {p}" for a, p in problems.items() if p]
         return done("error", reason="base and head have different rust/ trees and one did not build: " + "; ".join(bad),
                     **_broken(problems))
-    if any("{rust_server_bin}" in a for a in model.get("serve_args", [])):
-        if not shutil.which("cargo"):
-            return done("skipped", reason="the Rust frontend needs cargo on the host")
-        problems = {a: build_rust_server(arm) for a, arm in arms.items()}
-        if any(problems.values()):
-            bad = [f"{a}: {p}" for a, p in problems.items() if p]
-            return done("error", reason="; ".join(bad), **_broken(problems))
+    # mstar-server is mstar serve's HTTP frontend: every arm serves through its own build
+    if not shutil.which("cargo"):
+        return done("skipped", reason="mstar-server needs cargo on the host")
+    problems = {a: build_rust_server(arm) for a, arm in arms.items()}
+    if any(problems.values()):
+        bad = [f"{a}: {p}" for a, p in problems.items() if p]
+        return done("error", reason="; ".join(bad), **_broken(problems))
     missing = {a: requirements_problem(arm) for a, arm in arms.items()}
     if all(missing.values()):
         return done("skipped", reason=f"environment lacks: {missing['base']}")
