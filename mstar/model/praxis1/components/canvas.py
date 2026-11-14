@@ -101,6 +101,19 @@ def single_arm_fit_size(tile_w: int, native: tuple[int, int]) -> tuple[int, int]
     return min(nh, tile_w, nh * tile_w // nw), min(nw, tile_w)
 
 
+def single_arm_needs_fit_resize(
+    src_h: int,
+    src_w: int,
+    tile_w: int,
+    native: tuple[int, int] = (720, 1280),
+    tol: float = ASPECT_TOL,
+) -> bool:
+    """Whether the fit-rule crop still needs antialiased resampling."""
+    rh, rw = single_arm_fit_size(tile_w, native)
+    y0, y1, x0, x1 = aspect_crop_box(src_h, src_w, *native, tol)
+    return (y1 - y0, x1 - x0) != (rh, rw)
+
+
 def _fit_view_single_arm(
     frames: torch.Tensor,
     tile_h: int,

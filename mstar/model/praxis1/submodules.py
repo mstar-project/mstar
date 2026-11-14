@@ -29,6 +29,7 @@ from mstar.model.praxis1.components.action_rows import (
 from mstar.model.praxis1.components.attention import resource_attend
 from mstar.model.praxis1.components.canvas import (
     build_canvas,
+    single_arm_needs_fit_resize,
     tile_view_single_arm,
     tile_views_bimanual,
 )
@@ -338,7 +339,7 @@ class Praxis1VaeEncoderSubmodule(_Praxis1Node):
     ) -> NameToTensorList:
         device = self.get_device()
         with torch.inference_mode():
-            tiles = [views[f"view_{i}"].to(device) for i in range(self.config.num_cameras)]
+            tiles = [views[f"view_{i}"] for i in range(self.config.num_cameras)]
             if self.episode_history:
                 assert history_pose is not None and history_pose_valid is not None
                 if any(view.shape[0] != tiles[0].shape[0] for view in tiles):
@@ -418,12 +419,22 @@ class Praxis1VaeEncoderSubmodule(_Praxis1Node):
         view that does not land on the tile.
         """
         tile_h, tile_w = self.config.tile_height, self.config.tile_width
+        device = self.get_device()
         if self.config.embodiment == "bimanual":
-            return tile_views_bimanual(views, tile_h, tile_w)
-        return [
-            tile_view_single_arm(v, tile_h, tile_w, antialias=self.config.antialias)
-            for v in views
-        ]
+            return tile_views_bimanual([v.to(device) for v in views], tile_h, tile_w)
+        out = []
+        for view in views:
+            needs_host_resize = self.config.antialias and view.dim() in (3, 4) and single_arm_needs_fit_resize(
+                view.shape[-2], view.shape[-1], tile_w
+            )
+            # The reference keeps antialiased resampling on CPU. A GPU
+            # interpolate can round a few uint8 pixels differently.
+            source = view.cpu() if needs_host_resize else view.to(device)
+            tile = tile_view_single_arm(
+                source, tile_h, tile_w, antialias=self.config.antialias
+            )
+            out.append(tile.to(device))
+        return out
 
 
 class Praxis1BackboneSubmodule(_Praxis1Node):
