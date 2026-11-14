@@ -14,6 +14,9 @@ from mstar.engine.state.contract import (
     Array,
     Bidirectional,
     Block,
+    ChunkCausal,
+    ExpertCross,
+    ExpertSelf,
     Read,
     Sampler,
     SeqShard,
@@ -128,13 +131,15 @@ def _array_problems(array: Array) -> list[str]:
     where = f"Array {array.name!r}"
     problems: list[str] = []
     for key, read in array.reads.items():
-        if isinstance(read.mask, Block) and array.max_len:
-            problems.append(f"{where}.reads[{key!r}].mask: Block needs max_len 0, and max_len is {array.max_len}")
-        elif not isinstance(read.mask, Block) and not array.max_len:
-            problems.append(f"{where}.reads[{key!r}].mask: every read of an array with max_len 0 is a Block read, "
+        if isinstance(read.mask, Block | ChunkCausal | ExpertCross | ExpertSelf) and array.max_len:
+            problems.append(f"{where}.reads[{key!r}].mask: {type(read.mask).__name__} needs max_len 0, "
+                            f"and max_len is {array.max_len}")
+        elif not isinstance(read.mask, Block | ChunkCausal | ExpertCross | ExpertSelf) and array.max_len == 0:
+            problems.append(f"{where}.reads[{key!r}].mask: every read of an array with max_len 0 is a Block, "
+                            "ChunkCausal, ExpertCross, or ExpertSelf read, "
                             f"and this one is {type(read.mask).__name__}")
     if array.positions is not None:
-        if array.rewritable or not array.max_len:
+        if array.rewritable or array.max_len == 0:
             problems.append(f"{where}.positions: positions sit only on an append-only array that keeps entries")
         rope = array.positions.rope
         llama31 = () if rope is None else (rope.low_freq_factor, rope.high_freq_factor, rope.old_context_len)
@@ -399,7 +404,7 @@ def split_read_problems(
     arrays = {declared.name: declared for declared in declarations if isinstance(declared, Array)}
     problems = []
     for array in arrays.values():
-        if array.max_len:
+        if array.max_len != 0:
             continue
         nodes = [node for node in sorted(array.nodes) if array.labels & set(split.get(node, ()))]
         if not nodes:

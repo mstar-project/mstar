@@ -104,6 +104,31 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
        (see :doc:`clients`).
        ``LLM`` and ``action_expert`` share a KV cache, so ``node_groups`` must list them in
        one entry; the server refuses to start otherwise.
+   * - ``praxis1_{droid,yam}`` *(Not served yet)*
+     - ``runwayml/praxis-1-{droid,yam}``
+     - **Not served yet.** This build has the graph and native towers, but serving
+       remains gated while the full session path is checked. ``mstar serve praxis1_droid``
+       (or ``praxis1_yam``) refuses to start before it downloads anything.
+       Praxis-1 video-action policy: one call answers one chunk of the future, 6 video
+       latents and 6 action tokens. Both rigs have a cold openpi adapter returning 21
+       denormalized relative Cartesian action rows at 15 Hz. DROID also has a
+       Positronic session adapter that retains executed frames and returns 24
+       pose-composed command rows after the first call, with the DROID impedance
+       control mode. The cold openpi parity target
+       is the reference's ``context_mode=stateless``, which it documents for debugging.
+       The backbone denoises the video over a few Euler steps and the action expert denoises the
+       actions from its hidden states each step.
+       ``praxis1_droid`` is the single-arm DROID rig (exterior and wrist views, rows of
+       10), ``praxis1_yam`` the bimanual YAM rig (top and two wrists, rows of 20). The
+       rig, the canvas and every width come from the checkpoint's ``config.json``; a
+       variant this build has not ported is refused at load rather than served.
+       Both need the public Wan2.2 VAE and Qwen3.5-2B beside the checkpoint, which it
+       does not ship. Both use a Praxis-specific schema over openpi's policy
+       WebSocket (see :doc:`clients`). The stock openpi DROID client expects 10x8
+       joint-velocity actions and cannot connect unchanged. The DROID Positronic
+       endpoint uses a separate command-dictionary wire.
+       ``backbone``, ``action_expert`` and ``action_head`` run in one ``node_groups``
+       entry: the expert reads the backbone's hidden states inside each Euler step.
    * - ``qwen3_5_{0.8,2,4,9,27}b``
      - ``Qwen/Qwen3.5-4B``
      - Hybrid-attention VLM (text + image in, text out): gated DeltaNet linear

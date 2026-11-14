@@ -21,7 +21,10 @@ from mstar.engine.state.adapters import PagedArrayHandle, RingHandle, ValueHandl
 from mstar.engine.state.calls import ArrayHandle
 
 # Today's types the surface re-exports, and a NamedTuple, whose fields stay positional.
-_POSITIONAL = {"PagedNHDTarget", "Segment", "SlotLease", "Span"}
+_POSITIONAL = {
+    "ExpertCross", "ExpertCrossLayout", "ExpertSelf", "ExpertSelfLayout",
+    "PagedNHDTarget", "Segment", "SlotLease", "Span",
+}
 # The calls take the handle first, then what every call names, and only then keywords.
 _CALLS = {
     "add_read", "at_last_token", "causal_conv", "gated_delta_net", "gather", "host", "last_sampled", "position",
@@ -40,6 +43,7 @@ SNAPSHOT = {
         ["rewritable", "KEYWORD_ONLY", 'False'],
         ["labels", "KEYWORD_ONLY", "frozenset({'main'})"],
         ["positions", "KEYWORD_ONLY", 'None'],
+        ["lifetime", "KEYWORD_ONLY", "'request'"],
     ],
     "ArrayStep": [
         ["segments", "KEYWORD_ONLY", 'None'],
@@ -63,9 +67,37 @@ SNAPSHOT = {
     "CausalConv": [
         ["activation", "KEYWORD_ONLY", "'silu'"],
     ],
+    "ChunkCausal": [
+        ["chunk_len", "POSITIONAL_OR_KEYWORD", None],
+    ],
+    "ChunkCausalLayout": [
+        ["global_len", "KEYWORD_ONLY", None],
+        ["noised_len", "KEYWORD_ONLY", None],
+        ["clean_len", "KEYWORD_ONLY", '0'],
+    ],
     "Entry": [
         ["tensors", "POSITIONAL_OR_KEYWORD", None],
         ["host", "KEYWORD_ONLY", '{}'],
+    ],
+    "ExpertCross": [
+        ["chunk_len", "POSITIONAL_OR_KEYWORD", None],
+        ["future_per_chunk", "POSITIONAL_OR_KEYWORD", None],
+        ["tokens_per_frame", "POSITIONAL_OR_KEYWORD", None],
+        ["window_frames", "POSITIONAL_OR_KEYWORD", None],
+        ["include_noised", "POSITIONAL_OR_KEYWORD", 'True'],
+    ],
+    "ExpertCrossLayout": [
+        ["num_chunks", "POSITIONAL_OR_KEYWORD", None],
+        ["global_len", "POSITIONAL_OR_KEYWORD", None],
+        ["clean_frames", "POSITIONAL_OR_KEYWORD", None],
+        ["noised_frames", "POSITIONAL_OR_KEYWORD", None],
+    ],
+    "ExpertSelf": [
+        ["chunk_len", "POSITIONAL_OR_KEYWORD", None],
+        ["future_per_chunk", "POSITIONAL_OR_KEYWORD", None],
+    ],
+    "ExpertSelfLayout": [
+        ["num_chunks", "POSITIONAL_OR_KEYWORD", None],
     ],
     "Fork": [
         ["src", "KEYWORD_ONLY", None],
@@ -95,6 +127,9 @@ SNAPSHOT = {
         ["growth", "KEYWORD_ONLY", '()'],
         ["scratch", "KEYWORD_ONLY", '0'],
         ["kept_windows", "KEYWORD_ONLY", '{}'],
+        ["chunk_causal", "KEYWORD_ONLY", '{}'],
+        ["expert_cross", "KEYWORD_ONLY", '{}'],
+        ["expert_self", "KEYWORD_ONLY", '{}'],
     ],
     "PagedNHD": [
         ["dtypes", "KEYWORD_ONLY", 'None'],

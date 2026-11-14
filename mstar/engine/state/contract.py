@@ -116,6 +116,115 @@ class Block(Mask):
 
 
 @dataclass(frozen=True)
+class ChunkCausal(Mask):
+    """Within one step, attention over ``[global | noised | clean]`` tokens.
+
+    Every query sees the global prefix. Global queries see nothing else. A clean query in chunk ``c`` sees clean
+    chunks through ``c``; a noised query sees its own noised chunk and clean chunks before ``c``. A query sees no
+    tokens from another request. The fixed chunk size is declared here; the request gives each read's stream lengths
+    in ``Layout.chunk_causal``.
+    """
+
+    uses_query_position = True
+    sees_step_whole = True
+
+    chunk_len: int
+
+    def __post_init__(self):
+        if not _is_positive(self.chunk_len):
+            raise ValueError(f"ChunkCausal.chunk_len must be a positive int, got {self.chunk_len!r}")
+
+
+@dataclass(frozen=True, kw_only=True)
+class ChunkCausalLayout:
+    """One request's stream lengths for one ``ChunkCausal`` read."""
+
+    global_len: int
+    noised_len: int
+    clean_len: int = 0
+
+    def __post_init__(self):
+        for name in ("global_len", "noised_len", "clean_len"):
+            value = getattr(self, name)
+            if type(value) is not int or value < 0:
+                raise ValueError(f"ChunkCausalLayout.{name} must be an int >= 0, got {value!r}")
+
+    @property
+    def span(self) -> int:
+        return self.global_len + self.noised_len + self.clean_len
+
+
+@dataclass(frozen=True)
+class ExpertCross(Mask):
+    """Expert Q rows attend `[global | clean frames | noised frames]` KV rows.
+
+    The fixed fields are checkpoint policy. Request lengths live in
+    `Layout.expert_cross`, keyed by this read, and are checked at planning.
+    """
+
+    uses_query_position = True
+    sees_step_whole = True
+
+    chunk_len: int
+    future_per_chunk: int
+    tokens_per_frame: int
+    window_frames: int
+    include_noised: bool = True
+
+    def __post_init__(self):
+        for name in ("chunk_len", "future_per_chunk", "tokens_per_frame", "window_frames"):
+            if not _is_positive(getattr(self, name)):
+                raise ValueError(f"ExpertCross.{name} must be a positive int")
+        if type(self.include_noised) is not bool:
+            raise ValueError("ExpertCross.include_noised must be bool")
+
+
+@dataclass(frozen=True)
+class ExpertSelf(Mask):
+    """Expert queries in the same chunk see each other, across token kinds."""
+
+    uses_query_position = True
+    sees_step_whole = True
+
+    chunk_len: int
+    future_per_chunk: int
+
+    def __post_init__(self):
+        for name in ("chunk_len", "future_per_chunk"):
+            if not _is_positive(getattr(self, name)):
+                raise ValueError(f"ExpertSelf.{name} must be a positive int")
+
+
+@dataclass(frozen=True)
+class ExpertCrossLayout:
+    """Per-request expert cross row geometry; frame counts are latent frames."""
+
+    num_chunks: int
+    global_len: int
+    clean_frames: int
+    noised_frames: int
+
+    def __post_init__(self):
+        if not _is_positive(self.num_chunks):
+            raise ValueError("ExpertCrossLayout.num_chunks must be a positive int")
+        for name in ("global_len", "clean_frames", "noised_frames"):
+            value = getattr(self, name)
+            if type(value) is not int or value < 0:
+                raise ValueError(f"ExpertCrossLayout.{name} must be an int >= 0")
+
+
+@dataclass(frozen=True)
+class ExpertSelfLayout:
+    """Per-request expert self row geometry."""
+
+    num_chunks: int
+
+    def __post_init__(self):
+        if not _is_positive(self.num_chunks):
+            raise ValueError("ExpertSelfLayout.num_chunks must be a positive int")
+
+
+@dataclass(frozen=True)
 class Bidirectional(Mask):
     """Sees {k : k < n}, where n is the length of q's row on this array after this layer's latest add: every entry the
     row keeps and every entry this step adds for it. For a read with ``queries``, q's row is the row paired with q's
@@ -276,13 +385,14 @@ class Positions:
 
 @dataclass(frozen=True)
 class Array:
-    """Per request, per label and per declared layer, entries at log positions 0 to n - 1, with n <= ``max_len``.
+    """Per owner, per label and per declared layer, entries at log positions 0 to n - 1.
 
     An append-only array only grows, and a rewritable one also takes writes in place. All layers of an array have
     the same length at the end of every step. ``nodes`` lists who may touch the array, and the engine places it.
     ``updates`` are kernels that replace a Value's entry with its next version. The version they overwrite is gone,
     so prefix caching and undo save a copy before one runs.
-    With ``max_len`` 0 an array keeps nothing between steps, so every add is scratch.
+    With ``max_len`` 0 an array keeps nothing between steps, so every add is scratch. ``None`` gives an unbounded
+    logical log only when all reads are no-op dense windows; storage can then keep their largest window size.
     """
 
     name: str
@@ -290,12 +400,13 @@ class Array:
     nodes: frozenset[str]
     layers: frozenset[int]
     entry: Entry
-    max_len: int
+    max_len: int | None
     reads: Mapping[str, Read] = EMPTY    # empty: read whole
     updates: Mapping[str, Op] = EMPTY
     rewritable: bool = False
     labels: frozenset[str] = frozenset({"main"})
     positions: Positions | None = None
+    lifetime: Literal["request", "episode"] = "request"
 
     def __post_init__(self):
         object.__setattr__(self, "nodes", frozenset(self.nodes))
@@ -312,13 +423,29 @@ class Array:
             raise ValueError(f"{where}.layers is empty, and only a Value may declare no layers")
         if not self.labels:
             raise ValueError(f"{where}.labels must be non-empty")
-        if not (type(self.max_len) is int and self.max_len >= 0):
-            raise ValueError(f"{where}.max_len must be an int >= 0, got {self.max_len!r}")
+        if self.max_len is not None and not (type(self.max_len) is int and self.max_len >= 0):
+            raise ValueError(f"{where}.max_len must be an int >= 0 or None, got {self.max_len!r}")
+        if self.lifetime not in ("request", "episode") or type(self.lifetime) is not str:
+            raise ValueError(f"{where}.lifetime must be 'request' or 'episode', got {self.lifetime!r}")
         self._check_entry()
         for key, read in self.reads.items():
             self._check_read(key, read)
         for key, update in self.updates.items():
             self._check_update(key, update)
+        if self.max_len is None:
+            self._check_unbounded()
+
+    def _check_unbounded(self) -> None:
+        """Only a finite, read-derived dense window can bound an unbounded logical log."""
+        where = f"Array {self.name!r}"
+        if self.rewritable or self.positions is not None or self.entry.host or self.updates or not self.entry.tensors:
+            raise ValueError(f"{where}.max_len=None needs an append-only tensor log without positions or updates")
+        if not self.reads:
+            raise ValueError(f"{where}.max_len=None needs at least one dense Window read")
+        for key, read in self.reads.items():
+            if not isinstance(read.mask, Window) or read.op is not None or read.queries is not None:
+                raise ValueError(f"{where}.reads[{key!r}]: max_len=None supports only a no-op Window read of this "
+                                 "array; no finite retention bound is known for this read")
 
     def _check_entry(self) -> None:
         # a layer reads nothing from an array with no layers and no reads, so an axis may be 0
@@ -349,7 +476,7 @@ class Array:
             raise ValueError(f"{where}.layers has {sorted(read.layers - self.layers)}, outside the array's layers")
         if isinstance(read.mask, Window) and not _is_positive(read.mask.size):
             raise ValueError(f"{where}.mask.size must be a positive int, got {read.mask.size!r}")
-        if read.queries is not None and read.mask.uses_query_position:
+        if read.queries is not None and read.mask.uses_query_position and not isinstance(read.mask, ExpertCross):
             raise ValueError(f"{where}.queries: a read of another array's queries takes a mask that uses no query "
                              f"position, and {type(read.mask).__name__} does")
         if read.queries is not None and read.op is None:
@@ -524,12 +651,18 @@ class KeptWindow:
 
 @dataclass(frozen=True, kw_only=True)
 class Layout:
-    """What a request writes to one label of one array, from `process_prompt`'s ``state_layout``."""
+    """What a request writes to one label of one array, from ``process_prompt`` or a planned mask read.
+
+    A walk plan can supply only mask lengths; the conductor rejects other fields before transport.
+    """
 
     spans: tuple[Span, ...] = ()
     growth: tuple[tuple[str, int], ...] = ()    # (loop, entries per iteration)
     scratch: int = 0                            # most one scratch step writes past the kept length
     kept_windows: Mapping[str, KeptWindow] = EMPTY    # by read key, each kept-window read's sizes
+    chunk_causal: Mapping[str, ChunkCausalLayout] = EMPTY    # by read key, this request's stream lengths
+    expert_cross: Mapping[str, ExpertCrossLayout] = EMPTY
+    expert_self: Mapping[str, ExpertSelfLayout] = EMPTY
 
 
 @dataclass(frozen=True, kw_only=True)

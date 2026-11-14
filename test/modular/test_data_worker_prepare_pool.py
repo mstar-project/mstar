@@ -255,6 +255,144 @@ def test_a_model_without_the_declaration_runs_on_the_thread(monkeypatch):
     assert _sent(wt) == ["a"]
 
 
+def test_episode_identity_and_client_or_model_reset_reach_conductor(monkeypatch):
+    class ResetOne(_Serial):
+        def process_prompt(self, text, input_modalities, output_modalities, **kwargs):
+            prepared = super().process_prompt(text, input_modalities, output_modalities, **kwargs)
+            return prepared._replace(reset_episode=text == "b")
+
+    monkeypatch.setattr(cpus, "_plan", cpus.CpuPlan(frozenset(range(8)), usable=8))
+    wt = _thread(ResetOne())
+    for rid, client_reset in (("a", True), ("b", False), ("c", False)):
+        wt.model.gate(rid).set()
+        request = _input(rid)
+        request.episode = "robot-episode"
+        request.reset_episode = client_reset
+        wt._process_waiting_input(request)
+    sent = [msg.body for msg in wt.communicator.sent
+            if msg.message_type == ConductorMessageType.NEW_REQUEST]
+    assert [body.episode for body in sent] == ["robot-episode"] * 3
+    assert [body.reset_episode for body in sent] == [True, True, False]
+
+
+def test_frontend_close_sends_end_episode_to_the_conductor():
+    from mstar.api_server.entrypoint import APIServer
+
+    sent = []
+    api = object.__new__(APIServer)
+    api.preprocess_worker = SimpleNamespace(send_to_conductor=sent.append)
+    api.end_episode("robot-episode")
+    assert len(sent) == 1
+    assert sent[0].message_type == ConductorMessageType.END_EPISODE
+    assert sent[0].body.episode_id == "robot-episode"
+
+
+def test_positronic_observation_reaches_model_as_raw_pose_and_image_inputs(monkeypatch):
+    from mstar.api_server.openpi import pack
+    from mstar.model.base import TensorAndMetadata
+    from mstar.model.praxis1.praxis1_model import Praxis1Model
+
+    class PraxisStub(_Serial):
+        config = SimpleNamespace(embodiment="single_arm")
+        PREPROCESS_ONLY_KWARGS = Praxis1Model.PREPROCESS_ONLY_KWARGS
+
+        def load_decoded_image(self, image, device):
+            return TensorAndMetadata(image.to(device))
+
+        def process_prompt(self, text, input_modalities, output_modalities, **kwargs):
+            self.seen = kwargs
+            return ProcessPromptOutput({"text_inputs": [torch.tensor([1])]}, {})
+
+    monkeypatch.setattr(cpus, "_plan", cpus.CpuPlan(frozenset(range(8)), usable=8))
+    model = PraxisStub()
+    wt = _thread(model)
+    obs = {
+        "prompt": "move", "image.exterior": np.zeros((4, 6, 3), np.uint8),
+        "image.wrist": np.ones((4, 6, 3), np.uint8),
+        "robot_state.ee_pose": [0, 0, 0.6, 1, 0, 0, 0],
+        "grip": 0.25, "descriptor": "remote.robolab.droid",
+    }
+    request = PreprocessInput(
+        request_id="pose", text="move", file_paths=None,
+        input_modalities=["image", "text"], output_modalities=["action"],
+        model_kwargs={"control_mode": "droid_impedance"},
+        positronic_frame=pack({"session_id": "episode", "observation": obs}),
+        episode="episode",
+    )
+    wt._process_waiting_input(request)
+    assert [tuple(t.shape) for t in model.seen["tensors"]["image_inputs"]] == [(3, 4, 6)] * 2
+    assert [tuple(t.shape) for t in model.seen["tensors"]["executed_frame_inputs"]] == [(0, 3, 4, 6)] * 2
+    assert model.seen["tensors"]["executed_pose_inputs"][0].shape == (0, 8)
+    assert model.seen["robot_state"] == [0, 0, pytest.approx(0.6), 1, 0, 0, 0, 0.25]
+    assert model.seen["pose_descriptor"] == "remote.robolab.droid"
+    assert model.seen["control_mode"] == "droid_impedance"
+    assert model.seen["action_format"] == "positronic"
+    assert wt.request_model_kwargs["pose"]["robot_state"] == model.seen["robot_state"]
+    sent = [m.body for m in wt.communicator.sent if m.message_type == ConductorMessageType.NEW_REQUEST]
+    assert len(sent) == 1 and sent[0].episode == "episode"
+    assert "robot_state" not in sent[0].model_kwargs
+    assert sent[0].model_kwargs["action_format"] == "positronic"
+
+
+@pytest.mark.parametrize(
+    ("frames", "expected_rows", "reset", "pose_stack"),
+    [(22, 21, False, True), (21, 21, True, True), (22, 21, False, False)],
+)
+def test_positronic_warm_window_sets_conductor_reset_before_admission(
+    monkeypatch, frames, expected_rows, reset, pose_stack,
+):
+    from mstar.api_server.openpi import pack
+    from mstar.model.base import EpisodeView, TensorAndMetadata
+    from mstar.model.praxis1.episode_history import STATE_NAME
+    from mstar.model.praxis1.praxis1_model import Praxis1Model
+
+    class WarmStub(_Serial):
+        config = SimpleNamespace(embodiment="single_arm")
+        PREPROCESS_ONLY_KWARGS = Praxis1Model.PREPROCESS_ONLY_KWARGS
+
+        def load_decoded_image(self, image, device):
+            return TensorAndMetadata(image.to(device))
+
+        def process_prompt(self, text, input_modalities, output_modalities, **kwargs):
+            self.seen = kwargs
+            return ProcessPromptOutput({"text_inputs": [torch.tensor([1])]}, {})
+
+    monkeypatch.setattr(cpus, "_plan", cpus.CpuPlan(frozenset(range(8)), usable=8))
+    model = WarmStub()
+    wt = _thread(model)
+    image = np.stack([np.full((4, 6, 3), n, np.uint8) for n in range(frames)])
+    obs = {
+        "image.exterior": image, "image.wrist": image,
+        "robot_state.ee_pose": np.array([[n, 0, 0.6, 1, 0, 0, 0] for n in range(frames)], np.float32)
+        if pose_stack else [0, 0, 0.6, 1, 0, 0, 0],
+        "grip": np.zeros(frames, np.float32) if pose_stack else 0.25,
+    }
+    wt._process_waiting_input(PreprocessInput(
+        request_id="warm", text="move", file_paths=None,
+        input_modalities=["image", "text"], output_modalities=["action"],
+        model_kwargs={"executed_rows": expected_rows},
+        positronic_frame=pack({"session_id": "episode", "observation": obs}), episode="episode",
+    ))
+    window = model.seen["tensors"]
+    assert [t.shape[0] for t in window["executed_frame_inputs"]] == [0 if reset else 21] * 2
+    assert window["executed_pose_inputs"][0].shape == (0 if reset or not pose_stack else 21, 8)
+    sent = [m.body for m in wt.communicator.sent if m.message_type == ConductorMessageType.NEW_REQUEST]
+    assert len(sent) == 1
+    assert sent[0].reset_episode is reset
+    assert sent[0].model_kwargs["executed_rows"] == (0 if reset else expected_rows)
+    assert sent[0].model_kwargs["action_format"] == "positronic"
+    if not reset:
+        planner = Praxis1Model(
+            "runwayml/praxis-1-droid", skip_weight_loading=True,
+            max_context_chunks=3, max_text_tokens=256,
+        )
+        plan = planner.walk_plan(
+            "", ["image"], ["action"], {"image_inputs": [object()]},
+            sent[0].model_kwargs, EpisodeView("episode", 1, {STATE_NAME: 1}),
+        )
+        assert plan[-1].step_metadata["action_format"] == "positronic"
+
+
 def test_requests_overlap_and_reach_the_conductor_in_arrival_order(worker):
     worker._process_waiting_input(_input("a"))
     worker._process_waiting_input(_input("b"))

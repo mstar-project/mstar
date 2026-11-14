@@ -3,7 +3,7 @@ import functools
 import itertools
 import math
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, replace
 from fractions import Fraction
 from typing import TYPE_CHECKING, Any, NamedTuple, Type
@@ -49,6 +49,19 @@ from mstar.model.submodule_base import (
     chunk_tick_name,
 )
 from mstar.model.utils import TextChunkDetokenizer, TextOutput, drop_stop_tokens
+
+
+class EpisodeView(NamedTuple):
+    """The conductor's snapshot of state held before a request's first walk.
+
+    Models receive this only when they declare an episode-lifetime array.
+    ``held`` counts resident entries, not the total appended over the episode.
+    """
+
+    id: str | None
+    calls: int
+    held: Mapping[str, int]
+    cold: str | None = None
 
 
 def _wrap_node_in_loop(
@@ -190,6 +203,8 @@ class ProcessPromptOutput(NamedTuple):
     new_input_tensors: NameToTensorList
     metadata: dict
     lora_adapter: str | None | KeepAdapter = KEEP_ADAPTER
+    episode_keys: Mapping[str, str] | None = None
+    reset_episode: bool = False
 
 
 class ClientChunk(NamedTuple):
@@ -655,7 +670,9 @@ class Model(ABC):
     LENGTH_KWARGS: tuple[str, ...] = ("max_output_tokens",)
     # Request keys the conductor or data worker reads for every model, never logged as ignored.
     ENGINE_KWARGS: tuple[str, ...] = (
-        "seed", "prefix_cache", "return_token_ids", "return_logprobs", LORA_ADAPTER_KWARG, LORA_DIGEST_KWARG,
+        "seed", "episode_seed", "prefix_cache", "return_token_ids", "return_logprobs",
+        LORA_ADAPTER_KWARG, LORA_DIGEST_KWARG,
+        "__state_chunk_causal_layout__",
     )
     # Output modalities a client plays as they stream, where a pause is a gap. A streamed request with one of
     # them reserves its whole KV footprint and is never preempted. ``unpausable_outputs`` in the serving config
@@ -1009,6 +1026,8 @@ class Model(ABC):
         output_modalities: list[str],
         input_signals: dict[str, list[TensorPointerInfo]],
         model_kwargs: dict,
+        *,
+        episode: EpisodeView | None = None,
     ) -> list[WalkStep]:
         """The walks ``partition_name`` runs for this request, in order, decided
         at ingest; ``[]`` when the request doesn't use the partition.

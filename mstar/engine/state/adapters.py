@@ -24,12 +24,19 @@ from mstar.engine.resources.attn.config import (
     CrossAttentionSpec,
 )
 from mstar.engine.resources.attn.ragged.config import (
+    ChunkCausalAttentionStep,
+    ExpertAttentionStep,
     KeptWindowAttentionSpec,
     RaggedAttentionConfig,
     RaggedAttentionSpec,
+    RaggedChunkCausalAttentionSpec,
     RaggedCrossAttentionSpec,
     RaggedCrossAttentionStep,
+    RaggedExpertAttentionSpec,
     cross_label,
+)
+from mstar.engine.resources.attn.ragged.config import (
+    ChunkCausalLayout as ResourceChunkCausalLayout,
 )
 from mstar.engine.resources.kv.config import (
     KVLayout,
@@ -57,6 +64,7 @@ from mstar.engine.resources.recurrent.config import (
     RecurrentStateSpec,
     RecurrentStep,
 )
+from mstar.engine.resources.recurrent.dense_window import DenseWindowSpec, DenseWindowStep
 from mstar.engine.resources.sampler.config import SamplerSpec, SamplerStep, SamplingReqConfig
 from mstar.engine.resources.sequence_shard import SeqShardSpec
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
@@ -80,7 +88,13 @@ from mstar.engine.state.contract import (
     Block,
     Causal,
     CausalConv,
+    ChunkCausal,
+    ChunkCausalLayout,
     Entry,
+    ExpertCross,
+    ExpertCrossLayout,
+    ExpertSelf,
+    ExpertSelfLayout,
     FrameWindow,
     GatedDeltaNet,
     KVEntry,
@@ -159,6 +173,9 @@ def _resolve(arrays: Sequence[Array], setup: "StateSetup") -> "Resolved":
     """``arrays`` resolved by their storages, all of one storage's arrays in one call."""
     by_storage: dict[Storage, list[Array]] = {}
     for array in arrays:
+        if array.lifetime == "episode" and storage_of(array) is not DENSE_WINDOW:
+            raise _no_layout(array, "episode lifetime needs row binding and storage teardown, which this E1 slice "
+                                    "does not yet wire into the engine")
         storage = storage_of(array)
         by_storage.setdefault(storage, []).append(array)
     specs: dict[str, list[NodeResourceSpec]] = {}
@@ -386,7 +403,7 @@ def build_handle(
 
 def state_steps(
     step: SubmoduleStep | None, handles: Mapping[str, ArrayHandle | SamplerHandle | ShardHandle], *,
-    graph_walk: str | None = None,
+    graph_walk: str | None = None, per_request_info: Mapping | None = None,
 ) -> SubmoduleStep | None:
     """``step`` on ``graph_walk`` as a new step, with what its ``state`` declares expanded into today's step objects by
     each storage's builder, afresh for each step, since each carries the step's segments. The handles it opens are
@@ -410,7 +427,10 @@ def state_steps(
                 raise ValueError(f"Array {name!r}: a step lists it with no segments, its own or the step's")
             builder = builders.get(handle.storage)
             if builder is None:
-                builder = builders[handle.storage] = handle.storage.step_builder()
+                builder = builders[handle.storage] = (
+                    WithinStepSteps(per_request_info) if handle.storage is WITHIN_STEP
+                    else handle.storage.step_builder()
+                )
             builder.add(handle, declared, step, graph_walk)
         elif isinstance(declared, SampleStep) and isinstance(handle, SamplerHandle):
             steps[name] = SamplerStep(
@@ -515,13 +535,17 @@ class WithinStepSteps(StepBuilder):
     """The step of each ragged resource, from the reads that share it: each label's segments, and the cross reads'
     pairs. A label is one layout on the resource, so two arrays with one label have to mean the same tokens."""
 
-    def __init__(self):
+    def __init__(self, per_request_info: Mapping | None = None):
         self._labels: dict[str, dict[str, Sequence[Segment]]] = {}
         self._pairs: dict[str, list[tuple[str, str]]] = {}
         # how the reads on each resource lay out their queries, which is one way per resource
         self._queries: dict[str, Queries] = {}
         # a resource's layout is fixed only if every read on it declares it so
         self._fixed: dict[str, bool] = {}
+        self._chunk_layouts: dict[str, dict[str, tuple[ResourceChunkCausalLayout, ...]]] = {}
+        self._expert_layouts: dict[str, tuple[tuple[int, int, int, int], ...]] = {}
+        self._per_request_info = per_request_info or {}
+        self._info: dict[str | int, Any] | None = None
 
     def add(
         self, handle: "WithinStepHandle", declared: ArrayStep, step: SubmoduleStep, walk: str | None = None,
@@ -533,7 +557,97 @@ class WithinStepSteps(StepBuilder):
         key = handle.resource_key
         self._fixed[key] = self._fixed.get(key, True) and declared.fixed_layout
         self._queries[key] = handle.queries
-        handle.queries.plan(self, handle, segments_of(declared, step), step)
+        segments = segments_of(declared, step)
+        handle.queries.plan(self, handle, segments, step)
+        if isinstance(handle.queries, ChunkCausalQueries):
+            read = handle._bindings[0].declared
+            layouts = tuple(self._chunk_layout(handle.array, read, segment) for segment in segments)
+            by_label = self._chunk_layouts.setdefault(key, {})
+            prior = by_label.setdefault(handle._plan_label, layouts)
+            if prior != layouts:
+                raise ValueError(
+                    f"Array {handle.array.name!r}: reads sharing {key!r}/{handle._plan_label!r} "
+                    "use different chunk layouts"
+                )
+        if isinstance(handle.queries, (ExpertSelfQueries, ExpertCrossQueries)):
+            read = handle._bindings[0].declared
+            query_segments = (
+                handle.queries.segments(handle, step)
+                if isinstance(handle.queries, ExpertCrossQueries) else segments
+            )
+            layouts = tuple(
+                self._expert_layout(handle.array, read, segment, query_segment)
+                for segment, query_segment in zip(segments, query_segments, strict=True)
+            )
+            prior = self._expert_layouts.setdefault(key, layouts)
+            if prior != layouts:
+                raise ValueError(f"Array {handle.array.name!r}: conflicting expert layouts on {key!r}")
+
+    def _chunk_layout(self, array: Array, read: Read, segment: Segment) -> ResourceChunkCausalLayout:
+        if type(segment.request_id) is int and segment.request_id < -1:
+            # Capture and replay padding has no request layout.
+            lengths = [segment.span, 0, 0]
+        else:
+            if self._info is None:
+                self._info = {}
+                for rid, info in self._per_request_info.items():
+                    self._info[rid] = info
+                    self._info[info.request_id] = info
+            info = self._info.get(segment.request_id)
+            if info is None:
+                raise ValueError(f"Array {array.name!r}: no request info for chunk layout of {segment.request_id!r}")
+            raw = info.step_metadata.get(CHUNK_CAUSAL_LAYOUT_KWARG, {})
+            lengths = raw.get(array.name, {}).get(segment.label, {}).get(next(iter(array.reads)))
+            if lengths is None:
+                raise ValueError(
+                    f"Array {array.name!r}: request {segment.request_id!r} has no "
+                    f"state_layout chunk lengths for read {next(iter(array.reads))!r}"
+                )
+        if not isinstance(lengths, (list, tuple)) or len(lengths) != 3:
+            raise ValueError(f"Array {array.name!r}: request {segment.request_id!r} has invalid chunk lengths")
+        layout = ChunkCausalLayout(global_len=lengths[0], noised_len=lengths[1], clean_len=lengths[2])
+        if layout.span != segment.span:
+            raise ValueError(
+                f"Array {array.name!r}: request {segment.request_id!r}'s chunk layout spans {layout.span}, "
+                f"but its segment spans {segment.span}"
+            )
+        return chunk_causal_resource_layout(read.mask, layout)
+
+    def _expert_layout(
+        self, array: Array, read: Read, segment: Segment, query_segment: Segment,
+    ) -> tuple[int, int, int, int]:
+        if type(segment.request_id) is int and segment.request_id < -1:
+            # Capture supplies dummy metadata; replay may omit it. Both use
+            # the same internal zero-chunk padding layout.
+            return (0, query_segment.span, segment.span, 0)
+        if self._info is None:
+            self._info = {}
+            for rid, info in self._per_request_info.items():
+                self._info[rid] = info
+                self._info[info.request_id] = info
+        info = self._info.get(segment.request_id)
+        if info is None:
+            raise ValueError(f"Array {array.name!r}: no request info for expert layout")
+        raw = info.step_metadata.get(EXPERT_LAYOUT_KWARG, {})
+        lengths = raw.get(array.name, {}).get(segment.label, {}).get(next(iter(array.reads)))
+        if lengths is None:
+            raise ValueError(f"Array {array.name!r}: request {segment.request_id!r} has no expert state_layout")
+        if isinstance(read.mask, ExpertSelf):
+            if not isinstance(lengths, (list, tuple)) or len(lengths) != 1:
+                raise ValueError(f"Array {array.name!r}: invalid expert self lengths")
+            layout = ExpertSelfLayout(lengths[0])
+            result = (layout.num_chunks, 0, 0, layout.num_chunks * read.mask.chunk_len)
+            span = layout.num_chunks * (1 + read.mask.future_per_chunk + read.mask.chunk_len)
+        else:
+            if not isinstance(lengths, (list, tuple)) or len(lengths) != 4:
+                raise ValueError(f"Array {array.name!r}: invalid expert cross lengths")
+            layout = ExpertCrossLayout(*lengths)
+            _check_expert_layout(array, segment.label, Layout(expert_cross={next(iter(array.reads)): layout}))
+            result = (layout.num_chunks, layout.global_len, layout.clean_frames, layout.noised_frames)
+            span = layout.global_len + (layout.clean_frames + layout.noised_frames) * read.mask.tokens_per_frame
+        if span != segment.span:
+            raise ValueError(f"Array {array.name!r}: expert layout spans {span}, segment spans {segment.span}")
+        return result
 
     def _label(self, key: str, array: Array, segments: Sequence[Segment]) -> str:
         """Hold ``segments``, ``array``'s in this step, under its label on the resource ``key``, and give the label."""
@@ -556,8 +670,141 @@ class WithinStepSteps(StepBuilder):
             segments = tuple(s for each in by_label.values() for s in each) if len(by_label) > 1 else (
                 next(iter(by_label.values()))
             )
-            steps[key] = self._queries[key].step(segments, self._pairs.get(key, ()), self._fixed[key])
+            if isinstance(self._queries[key], ChunkCausalQueries):
+                layouts = tuple(layout for label in by_label for layout in self._chunk_layouts[key][label])
+                if len(layouts) != len(segments):
+                    raise ValueError(f"chunk resource {key!r} has {len(layouts)} layouts for {len(segments)} segments")
+                steps[key] = ChunkCausalAttentionStep(segments=tuple(segments), layouts=layouts)
+            elif isinstance(self._queries[key], (ExpertSelfQueries, ExpertCrossQueries)):
+                steps[key] = ExpertAttentionStep(
+                    segments=tuple(segments), pairs=tuple(self._pairs.get(key, ())),
+                    layouts=self._expert_layouts[key],
+                )
+            else:
+                steps[key] = self._queries[key].step(segments, self._pairs.get(key, ()), self._fixed[key])
         return steps
+
+
+CHUNK_CAUSAL_LAYOUT_KWARG = "__state_chunk_causal_layout__"
+EXPERT_LAYOUT_KWARG = "__state_expert_layout__"
+
+
+def chunk_causal_layouts(
+    declarations: Sequence[Array | Sampler | SeqShard], state_layout: Mapping[str, Mapping[str, Layout]],
+) -> dict[str, dict[str, dict[str, list[int]]]]:
+    """The read-keyed lengths of within-step arrays, as wire-safe request data."""
+    arrays = {declared.name: declared for declared in declarations if isinstance(declared, Array)}
+    rows = {}
+    for name, by_label in state_layout.items():
+        array = arrays.get(name)
+        if array is None:
+            raise RuntimeError(f"state_layout[{name!r}]: it names no declared array, of {sorted(arrays)}")
+        for label, layout in by_label.items():
+            _check_chunk_causal_layout(array, label, layout)
+            if layout.chunk_causal:
+                rows.setdefault(name, {})[label] = {
+                    key: [lengths.global_len, lengths.noised_len, lengths.clean_len]
+                    for key, lengths in layout.chunk_causal.items()
+                }
+    return rows
+
+
+def expert_layouts(
+    declarations: Sequence[Array | Sampler | SeqShard], state_layout: Mapping[str, Mapping[str, Layout]],
+) -> dict[str, dict[str, dict[str, list[int]]]]:
+    """Read-keyed expert geometry as small wire-safe integers, never tensors."""
+    arrays = {declared.name: declared for declared in declarations if isinstance(declared, Array)}
+    rows = {}
+    for name, by_label in state_layout.items():
+        array = arrays.get(name)
+        if array is None:
+            raise RuntimeError(f"state_layout[{name!r}]: it names no declared array, of {sorted(arrays)}")
+        for label, layout in by_label.items():
+            _check_expert_layout(array, label, layout)
+            if layout.expert_cross or layout.expert_self:
+                by_read = {
+                    key: [value.num_chunks, value.global_len, value.clean_frames, value.noised_frames]
+                    for key, value in layout.expert_cross.items()
+                }
+                by_read.update({key: [value.num_chunks] for key, value in layout.expert_self.items()})
+                rows.setdefault(name, {})[label] = by_read
+    return rows
+
+
+def checked_step_mask_layouts(
+    declarations: Sequence[Array | Sampler | SeqShard], wire: Mapping, *, expert: bool,
+) -> dict[str, dict[str, dict[str, list[int]]]]:
+    """Check a walk_plan mask layout against the declared reads and normalize its wire values.
+
+    The data worker checks ``state_layout`` before sending its layout. A walk plan
+    can add episode-dependent lengths later, so the conductor must check that
+    overlay at the same boundary before sending it to workers.
+    """
+    kind = "expert" if expert else "chunk-causal"
+    if not isinstance(wire, Mapping):
+        raise RuntimeError(f"planned {kind} layout must map array names to labels")
+    arrays = {declared.name: declared for declared in declarations if isinstance(declared, Array)}
+    typed: dict[str, dict[str, Layout]] = {}
+    for name, by_label in wire.items():
+        array = arrays.get(name) if type(name) is str else None
+        if array is None:
+            raise RuntimeError(f"planned {kind} layout names undeclared array {name!r}")
+        if not isinstance(by_label, Mapping):
+            raise RuntimeError(f"planned {kind} layout[{name!r}] must map labels to reads")
+        for label, by_read in by_label.items():
+            if type(label) is not str or label not in array.labels:
+                raise RuntimeError(f"planned {kind} layout[{name!r}] names undeclared label {label!r}")
+            if not isinstance(by_read, Mapping):
+                raise RuntimeError(f"planned {kind} layout[{name!r}][{label!r}] must map reads to lengths")
+            chunk: dict[str, ChunkCausalLayout] = {}
+            cross: dict[str, ExpertCrossLayout] = {}
+            self_attn: dict[str, ExpertSelfLayout] = {}
+            for key, lengths in by_read.items():
+                read = array.reads.get(key) if type(key) is str else None
+                where = f"planned {kind} layout[{name!r}][{label!r}][{key!r}]"
+                if not isinstance(lengths, (list, tuple)):
+                    raise RuntimeError(f"{where} must be a list of lengths")
+                if expert and read is not None and isinstance(read.mask, ExpertCross) and len(lengths) == 4:
+                    cross[key] = ExpertCrossLayout(*lengths)
+                elif expert and read is not None and isinstance(read.mask, ExpertSelf) and len(lengths) == 1:
+                    self_attn[key] = ExpertSelfLayout(*lengths)
+                elif not expert and read is not None and isinstance(read.mask, ChunkCausal) and len(lengths) == 3:
+                    chunk[key] = ChunkCausalLayout(
+                        global_len=lengths[0], noised_len=lengths[1], clean_len=lengths[2],
+                    )
+                else:
+                    raise RuntimeError(f"{where} names no matching read or has the wrong number of lengths")
+            typed.setdefault(name, {})[label] = Layout(
+                chunk_causal=chunk, expert_cross=cross, expert_self=self_attn,
+            )
+    # Reuse the declaration validators, including the expert frame offset rule.
+    return expert_layouts(declarations, typed) if expert else chunk_causal_layouts(declarations, typed)
+
+
+def _check_expert_layout(array: Array, label: str, layout: Layout) -> None:
+    from mstar.engine.resources.attn.ragged.expert_mask import noised_frame_offset
+
+    if not isinstance(layout, Layout):
+        raise RuntimeError(f"state_layout[{array.name!r}][{label!r}] must be a Layout")
+    for field, kind, shape in (
+        ("expert_cross", ExpertCross, ExpertCrossLayout),
+        ("expert_self", ExpertSelf, ExpertSelfLayout),
+    ):
+        for key, lengths in getattr(layout, field).items():
+            read = array.reads.get(key)
+            where = f"state_layout[{array.name!r}][{label!r}].{field}[{key!r}]"
+            if read is None or not isinstance(read.mask, kind):
+                raise RuntimeError(f"{where} names no {kind.__name__} read")
+            if not isinstance(lengths, shape):
+                raise RuntimeError(f"{where} must be a {shape.__name__}")
+            if field == "expert_cross":
+                mask = read.mask
+                if lengths.noised_frames != lengths.num_chunks * mask.chunk_len:
+                    raise RuntimeError(f"{where}: noised frames do not match the declared chunks")
+                try:
+                    noised_frame_offset(lengths.noised_frames, lengths.clean_frames, mask.chunk_len)
+                except ValueError as exc:
+                    raise RuntimeError(f"{where}: {exc}") from exc
 
 
 def kv_layouts(
@@ -580,6 +827,8 @@ def kv_layouts(
             if undeclared:
                 raise RuntimeError(f"{where}[{name!r}]: labels {sorted(undeclared)} aren't in Array {name!r}.labels")
     converted = {}
+    chunk_causal_layouts(declarations, state_layout)
+    expert_layouts(declarations, state_layout)
     for name, by_label in state_layout.items():
         layouts = storage_of(arrays[name]).layouts(arrays[name], by_label, keyed_spans.get(name, EMPTY))
         if layouts is not None:
@@ -589,6 +838,24 @@ def kv_layouts(
         if unlaid:
             raise RuntimeError(f"keyed_spans[{name!r}]: labels {sorted(unlaid)} have no paged layout in state_layout")
     return converted
+
+
+def _check_chunk_causal_layout(array: Array, label: str, layout: Layout) -> None:
+    """Check the read keys in a request's mask layout before within-step layouts leave the KV conversion path."""
+    if not isinstance(layout, Layout):
+        raise RuntimeError(f"state_layout[{array.name!r}][{label!r}] must be a Layout, got {layout!r}")
+    for key, lengths in layout.chunk_causal.items():
+        read = array.reads.get(key)
+        if read is None or not isinstance(read.mask, ChunkCausal):
+            raise RuntimeError(
+                f"state_layout[{array.name!r}][{label!r}].chunk_causal[{key!r}] "
+                "names no ChunkCausal read"
+            )
+        if not isinstance(lengths, ChunkCausalLayout):
+            raise RuntimeError(
+                f"state_layout[{array.name!r}][{label!r}].chunk_causal[{key!r}] "
+                f"must be a ChunkCausalLayout, got {lengths!r}"
+            )
 
 
 def sampling_configs(
@@ -993,8 +1260,46 @@ class RaggedAttend(WithinStepAttend):
     read_back = frozenset({"max_segments_per_request", "max_segments_per_step"})
     plans = True
 
+    def for_mask(self, mask: Mask) -> OpBinding:
+        if isinstance(mask, ChunkCausal):
+            return CHUNK_CAUSAL_ATTEND
+        if isinstance(mask, (ExpertCross, ExpertSelf)):
+            return EXPERT_ATTEND
+        return super().for_mask(mask)
+
     def attend(self, run: Any, label: str, rows: "RowLayout") -> Callable[..., torch.Tensor]:
         return functools.partial(joint_attention, ragged=functools.partial(run.run, label=label))
+
+
+class ChunkCausalAttend(RaggedAttend):
+    """The cacheless chunk mask on the existing within-step Attend operation."""
+
+    def check(self, array: Array, key: str, read: Read) -> None:
+        if not isinstance(read.mask, ChunkCausal):
+            raise _no_layout(array, f"reads[{key!r}].mask must be ChunkCausal")
+        if read.walks is not None or read.queries is not None:
+            raise _no_layout(array, f"reads[{key!r}] needs own queries in one within-step walk")
+
+
+CHUNK_CAUSAL_ATTEND = ChunkCausalAttend()
+
+
+class ExpertAttend(RaggedAttend):
+    """Expert cross and self masks through the declared cacheless Attend op."""
+
+    def check(self, array: Array, key: str, read: Read) -> None:
+        if not isinstance(read.mask, (ExpertCross, ExpertSelf)):
+            raise _no_layout(array, f"reads[{key!r}] has no expert mask")
+        if read.walks is not None or (isinstance(read.mask, ExpertCross) != (read.queries is not None)):
+            raise _no_layout(array, f"reads[{key!r}] needs cross queries exactly for ExpertCross")
+
+
+EXPERT_ATTEND = ExpertAttend()
+
+
+def chunk_causal_resource_layout(mask: ChunkCausal, layout: ChunkCausalLayout) -> ResourceChunkCausalLayout:
+    """Complete one request's read-keyed stream lengths with the declaration's fixed chunk size."""
+    return ResourceChunkCausalLayout(layout.global_len, mask.chunk_len, layout.noised_len, layout.clean_len)
 
 
 class SdpaAttend(WithinStepAttend):
@@ -1840,6 +2145,21 @@ class OwnQueries(Queries):
         return AttentionStep(segments=segments, causal=False, fixed_layout=fixed)
 
 
+class ChunkCausalQueries(OwnQueries):
+    """The chunk mask's read uses its own queries and a chunk-causal resource."""
+
+    spec_class = RaggedChunkCausalAttentionSpec
+
+    def step(self, segments, pairs: Sequence[tuple[str, str]], fixed: bool) -> Any:
+        raise RuntimeError(
+            "chunk-causal step planning needs request layouts; use WithinStepSteps to resolve them"
+        )
+
+
+class ExpertSelfQueries(OwnQueries):
+    spec_class = RaggedExpertAttentionSpec
+
+
 class CrossQueries(OtherArrayQueries, Queries):
     """A read within a step whose queries are another array's, on a ragged cross resource."""
 
@@ -1856,6 +2176,10 @@ class CrossQueries(OtherArrayQueries, Queries):
 
     def step(self, segments, pairs: Sequence[tuple[str, str]], fixed: bool) -> Any:
         return RaggedCrossAttentionStep(segments=tuple(segments), pairs=tuple(pairs))
+
+
+class ExpertCrossQueries(CrossQueries):
+    spec_class = RaggedExpertAttentionSpec
 
 
 class WithinStepHandle(ArrayHandle):
@@ -2257,6 +2581,173 @@ class RingStorage(Storage):
         steps[handle.flex_key] = AttentionStep(segments=segments)
 
 
+class DenseWindowHandle(ArrayHandle):
+    """Packed whole reads from a bounded dense ring, with unbounded logical positions."""
+
+    def __init__(self, array: Array, resources: Mapping[str, Any], bindings, resolved):
+        super().__init__(array, resources)
+        self._pool = resources[array.name]
+        self._capacity = self._pool.window_size
+        self._pending: dict[str, dict[int, dict[str, torch.Tensor]]] = {}
+        self._added: set[int] = set()
+
+    def begin_step(self, step) -> None:
+        self._pending.clear()
+        self._added.clear()
+        super().begin_step(step)
+
+    def commit_step(self, step) -> None:
+        # The forward may fail after add. Keep its writes private until the
+        # engine has committed the step, so rollback leaves an episode intact.
+        for label, layers in self._pending.items():
+            for layer, fields in layers.items():
+                for field, rows in fields.items():
+                    self._pool.scatter_(field, rows, self._pool_layer[layer], label=label)
+
+    def end_step(self, step) -> None:
+        self._pending.clear()
+        self._added.clear()
+        super().end_step(step)
+
+    def check_step(self, step) -> None:
+        super().check_step(step)
+        if any(seg.span > 0 for seg in self._segments) and self._kept != self.array.layers:
+            raise self._refusal(f"a kept dense window step must add every layer {sorted(self.array.layers)}, "
+                                f"but added {sorted(self._kept)}")
+
+    def _check_labels(self, labels: set[str], segments) -> None:
+        runs = [label for label, _ in groupby(segment.label for segment in segments)]
+        if len(runs) > len(labels):
+            raise self._refusal("dense window segments must group each label's rows together")
+
+    def _check_storage(self, declared: ArrayStep, segments, ctx) -> None:
+        super()._check_storage(declared, segments, ctx)
+        if ctx.capture or ctx.replays:
+            raise self._refusal("dense whole reads have variable packed lengths and cannot replay a capture")
+        if not declared.keep or declared.forks:
+            raise self._refusal("dense windows need kept adds and do not yet support forks")
+        if ctx.repeats != 1:
+            raise self._refusal("dense window steps run once before their logical lengths commit")
+        twice = [key for key, count in Counter((seg.request_id, seg.label) for seg in segments).items()
+                 if count > 1]
+        if twice:
+            rid, label = twice[0]
+            raise self._refusal(f"request {rid!r} has two segments on label {label!r} in one step")
+
+    @torch.compiler.disable
+    def add(self, layer: int | torch.Tensor, *, keep: bool | None = None, **fields: torch.Tensor) -> None:
+        layer = self._layer_id(layer)
+        self._record_add(layer, keep)
+        if keep is False:
+            raise self._refusal("a dense window add must be kept")
+        if set(fields) != set(self.array.entry.tensors):
+            raise self._refusal(f"add fields {sorted(fields)} differ from {sorted(self.array.entry.tensors)}")
+        total = sum(segment.span for segment in self._segments)
+        cap = self._capacity
+        for field, value in fields.items():
+            block = self._pool.block(field, self._pool_layer[layer])
+            if value.shape[0] != total or tuple(value.shape[1:]) != tuple(block.shape[2:]):
+                raise self._refusal(f"field {field!r} has shape {tuple(value.shape)}, expected "
+                                    f"({total}, {', '.join(map(str, block.shape[2:]))})")
+            if value.dtype != block.dtype or value.device != block.device:
+                raise self._refusal(f"field {field!r} has {value.dtype} on {value.device}, expected "
+                                    f"{block.dtype} on {block.device}")
+        offset = 0
+        for label, grouped in groupby(self._segments, key=lambda segment: segment.label):
+            label_segments = list(grouped)
+            updated = {}
+            for field, value in fields.items():
+                rows = self._pool.gather(field, self._pool_layer[layer], label=label)
+                local_offset = offset
+                for row, segment in enumerate(label_segments):
+                    end = local_offset + segment.span
+                    first = max(local_offset, end - cap)
+                    if first < end:
+                        old = self._pool.logical_length(segment.request_id, label)
+                        positions = torch.arange(old + first - local_offset, old + segment.span,
+                                                 device=value.device) % cap
+                        rows[row].index_copy_(0, positions, value[first:end])
+                    local_offset = end
+                updated[field] = rows
+            self._pending.setdefault(label, {})[layer] = updated
+            offset += sum(segment.span for segment in label_segments)
+        self._added.add(layer)
+
+    @torch.compiler.disable
+    def read(self, layer: int | torch.Tensor, q: torch.Tensor | None = None, **mask_args: Any) -> Reached:
+        layer = self._layer_id(layer)
+        if q is not None or mask_args:
+            raise self._refusal("a dense Window read takes no q or mask arguments")
+        self._record_read(layer)
+        fields = {}
+        lengths = [min(self._capacity, self._pool.logical_length(seg.request_id, seg.label)
+                       + (seg.span if layer in self._added else 0)) for seg in self._segments]
+        offsets = [0]
+        for length in lengths:
+            offsets.append(offsets[-1] + length)
+        for field in self.array.entry.tensors:
+            packed = []
+            for label, grouped in groupby(enumerate(self._segments), key=lambda pair: pair[1].label):
+                label_segments = list(grouped)
+                rows = self._pending.get(label, {}).get(layer, {}).get(field)
+                if rows is None:
+                    rows = self._pool.gather(field, self._pool_layer[layer], label=label)
+                for row, (index, segment) in enumerate(label_segments):
+                    length = lengths[index]
+                    end = self._pool.logical_length(segment.request_id, label)
+                    if layer in self._added:
+                        end += segment.span
+                    indices = torch.arange(end - length, end, device=rows.device) % self._capacity
+                    packed.append(rows[row].index_select(0, indices))
+            if packed:
+                fields[field] = torch.cat(packed)
+            else:
+                block = self._pool.block(field, self._pool_layer[layer])
+                fields[field] = block.new_empty((0, *block.shape[2:]))
+        device = next(iter(fields.values())).device
+        return Reached(fields, row_offsets=torch.tensor(offsets, dtype=torch.int32, device=device))
+
+
+class DenseWindowStorage(Storage):
+    """A no-op whole read whose declared Window bounds a dense resident ring."""
+
+    handle_class = DenseWindowHandle
+    kernel_settings = frozenset({"max_slots"})
+
+    def resolve(self, arrays: Sequence[Array], declared: Sequence[Array], setup: "StateSetup") -> Resolved:
+        resolved = Resolved({}, {}, {}, {})
+        for array in arrays:
+            if len(array.reads) != 1:
+                raise _no_layout(array, "dense window storage needs exactly one read per array")
+            key, read = next(iter(array.reads.items()))
+            if read.layers is not None and read.layers != array.layers:
+                raise _no_layout(array, "dense window read must cover all layers")
+            size = read.mask.size
+            blocks = {
+                field: RecurrentBlockConfig(
+                    shape=(size, *tensor.shape), dtype=tensor.dtype,
+                    shard_dims=() if tensor.shard is None else (tensor.shard + 1,),
+                ) for field, tensor in array.entry.tensors.items()
+            }
+            resolved.specs[array.name] = [DenseWindowSpec(
+                resource_key=array.name, nodes=array.nodes,
+                episode_lifetime=array.lifetime == "episode",
+                config=RecurrentStateConfig(num_layers=len(array.layers), blocks=blocks,
+                                            max_slots=len(array.labels) + 1, labels=tuple(sorted(array.labels))),
+            )]
+            resolved.bound[array.name] = ()
+            resolved.resource_of[key] = array.name
+        return resolved
+
+    def steps(
+        self, handle: ArrayHandle, declared: ArrayStep, step: SubmoduleStep, segments, steps: dict[str, Any],
+    ) -> None:
+        # A zero-append read still addresses the request's saved slot. The
+        # recurrent allocator otherwise sends span-zero rows to its sink.
+        addressed = tuple(Segment(seg.request_id, seg.label, max(seg.span, 1)) for seg in segments)
+        steps[handle.name] = DenseWindowStep(segments=addressed, logical_segments=tuple(segments))
+
+
 class ValueStorage(Storage):
     """A rewritable array of one entry, in a recurrent state pool."""
 
@@ -2347,7 +2838,13 @@ class WithinStepStorage(Storage):
             bound, heads, head_dim, dtype = _within_step_read(array, setup)
             resolved.bound[array.name] = (bound,)
             key, read = bound.key, bound.declared
-            queries = resolved.queries[key] = (OwnQueries if read.queries is None else CrossQueries)(
+            query_kind = (
+                ChunkCausalQueries if isinstance(read.mask, ChunkCausal) else
+                ExpertCrossQueries if isinstance(read.mask, ExpertCross) else
+                ExpertSelfQueries if isinstance(read.mask, ExpertSelf) else
+                OwnQueries if read.queries is None else CrossQueries
+            )
+            queries = resolved.queries[key] = query_kind(
                 query_array(array, read, by_name),
             )
             # refuses either side's second label at resolve, which validation and `build_specs` run before any handle
@@ -2355,8 +2852,19 @@ class WithinStepStorage(Storage):
             config = RaggedAttentionConfig(
                 num_qo_heads=read.op.q_heads, num_kv_heads=heads, head_dim=head_dim, dtype=dtype,
             )
-            spec = queries.spec_class(resource_key=key, nodes=array.nodes, config=config)
-            spec = shared.setdefault((queries.spec_class, array.nodes, astuple(config)), spec)
+            expert = isinstance(read.mask, (ExpertCross, ExpertSelf))
+            extra = ({
+                "mode": "cross" if isinstance(read.mask, ExpertCross) else "self",
+                "chunk_len": read.mask.chunk_len,
+                "future_per_chunk": read.mask.future_per_chunk,
+                "tokens_per_frame": getattr(read.mask, "tokens_per_frame", 1),
+                "window_frames": getattr(read.mask, "window_frames", 1),
+                "include_noised": getattr(read.mask, "include_noised", True),
+            } if expert else {})
+            spec = queries.spec_class(resource_key=key, nodes=array.nodes, config=config, **extra)
+            mask_size = read.mask.chunk_len if isinstance(read.mask, ChunkCausal) else None
+            spec = shared.setdefault((queries.spec_class, array.nodes, astuple(config), mask_size,
+                                      read.mask if expert else None), spec)
             resolved.resource_of[key] = spec.resource_key
             if bound.binding.plans and isinstance(spec, RaggedAttentionSpec):
                 # the labels the node's sequence shard may split (`RaggedAttentionSpec.derive`)
@@ -2378,10 +2886,13 @@ VALUE = ValueStorage()
 VALUE_WITH_HOST = ValueWithHostStorage()
 HOST_VALUE = HostValueStorage()
 WITHIN_STEP = WithinStepStorage()
+DENSE_WINDOW = DenseWindowStorage()
 
 
 def storage_of(array: Array) -> Storage:
     """The storage today's resources keep ``array`` in."""
+    if array.max_len is None:
+        return DENSE_WINDOW
     if is_value(array):
         if not array.entry.tensors:
             return HOST_VALUE

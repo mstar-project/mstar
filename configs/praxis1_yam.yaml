@@ -1,0 +1,73 @@
+model: "praxis1_yam"
+
+# Serving remains gated until the published checkpoint and session path are
+# validated. This config can be checked without downloading model weights.
+
+# Every praxis1 node is stateless (no KV cache); max_seq_len only satisfies the
+# conductor's config check. The value is the backbone's widest encoder sequence:
+# 4 registers + the anchor and the window's video tokens after the (1,2,2) patch
+# + the padded task text, rounded up.
+max_seq_len: 32768
+
+
+# Praxis-1 on the bimanual YAM rig (runwayml/praxis-1-yam). This is a
+# cold-only openpi bring-up mode, not Runway's stateful Positronic session wire.
+# Compare it with reference context_mode=stateless, which is for debugging.
+#
+# A request carries three camera frames, the top view then the two wrist views, the
+# task text, and robot_state = both arm poses, each [xyz(3) quat_wxyz(4) grip(1)]. The
+# reply is [21, 20] denormalized relative Cartesian action rows at 15 Hz,
+# two arms of [xyz(3) rot6d(6) grip(1)]. Grippers are clipped to [0, 1].
+# Every request starts at depth 0, with no executed-frame history.
+#
+# The canvas, the pose frame and the rig all come from the checkpoint's config.json,
+# so none of them is a knob here. num_cameras follows the rig's views and is baked
+# into the CUDA-graph captures. The 21-row cold reply horizon is separate from
+# the checkpoint's 24-row action chunk.
+model_kwargs:
+  model_path_hf: "runwayml/praxis-1-yam"
+  # Public components the checkpoint expects beside it. Neither ships with it.
+  vae_weights_hf: "Wan-AI/Wan2.2-TI2V-5B-Diffusers"
+  text_encoder_hf: "Qwen/Qwen3.5-2B"
+  # The recommended recipe of this checkpoint (Runway's serve_yam.yaml): two Euler
+  # steps, no flow shift and no text guidance on either the actions or the video.
+  # It is not the DROID recipe. A request may ask for fewer steps, never more.
+  num_steps: 2
+  t_shift: 1.0
+  cfg_scale: 1.0
+  cfg_video_scale: 1.0
+  max_context_chunks: 0
+
+# The last Euler step still computes encoder taps for actions. It skips the
+# video decoder because the reply contains no predicted video and no next
+# step reads it.
+
+# A Praxis-specific openpi schema at ws://<host>:<port>/: the three cameras in
+# view order (top, left wrist, right wrist), both arm poses as state, and 21x20
+# relative action rows. It is not the reference Positronic command-dict wire.
+openpi:
+  images: [observation/top_image, observation/wrist_image_left, observation/wrist_image_right]
+  state: [observation/cartesian_position_left, observation/gripper_position_left,
+          observation/cartesian_position_right, observation/gripper_position_right]
+  action_dims: 20
+
+node_groups:
+  - node_names:
+      - text_encoder
+    ranks:
+      - 0
+
+  - node_names:
+      - vae_encoder
+    ranks:
+      - 0
+
+  # The expert reads the backbone's taps inside the loop body, so the two run in
+  # one group: a group on another rank would ship every tap across the wire once
+  # per Euler step.
+  - node_names:
+      - backbone
+      - action_expert
+      - action_head
+    ranks:
+      - 0

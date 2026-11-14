@@ -258,10 +258,13 @@ model, so they are named for it.
        model code does not run on transformers 5). Unset under transformers 5,
        the SDK comparison skips.
 
-Serving (Python frontend)
--------------------------
+Serving (API server)
+--------------------
 
-Read by ``mstar-serve`` / ``mstar.api_server.entrypoint``.
+Read by ``mstar-serve`` / ``mstar.api_server.entrypoint``, whichever frontend
+serves HTTP. Where a row describes how a route answers, it is the Python
+frontend's (``--python-frontend``); ``mstar-server``'s rows are under
+`Serving (Rust frontend)`_.
 
 .. list-table::
    :header-rows: 1
@@ -282,6 +285,14 @@ Read by ``mstar-serve`` / ``mstar.api_server.entrypoint``.
        gets the 413 before it sends the body. It also caps one
        message on every WebSocket route unless the config sets
        ``ws_max_message_mb``; a larger one closes the socket (1009).
+   * - ``MSTAR_LOG_REQUESTS``
+     - unset
+     - ``1`` logs each request's lifecycle (submitted, queued at capacity,
+       admitted, done, torn down) whatever ``--log-level`` is, on either
+       frontend (:func:`mstar.utils.logging_config.configure_request_log`).
+       The lines are DEBUG, on the ``mstar.requests`` logger; turning on all
+       of DEBUG for them also logs every transport message and tensor, which
+       slows a server. Without it, the conductor logs a summary once a minute.
    * - ``MSTAR_ROOT_PATH``
      - ``""``
      - Mount the app under a URL sub-path. Set it when an ingress routes the
@@ -329,8 +340,8 @@ Read by ``mstar-serve`` / ``mstar.api_server.entrypoint``.
 Serving (Rust frontend)
 -----------------------
 
-Read by the ``mstar-server`` binary and its bridge
-(``mstar-serve --rust-frontend``; see :doc:`installation`).
+Read by the ``mstar-server`` binary, ``mstar serve``'s default HTTP frontend,
+and its bridge (see :doc:`installation`).
 
 .. list-table::
    :header-rows: 1
@@ -351,19 +362,19 @@ Read by the ``mstar-server`` binary and its bridge
      - unset
      - Same rule as the Python server (``rust/server/src/auth.rs``, read
        once at startup): every route except ``/health`` and ``/metrics`` needs
-       ``Authorization: Bearer <key>``. ``mstar-serve --rust-frontend``
+       ``Authorization: Bearer <key>``. ``mstar-serve``
        sets it from ``--api-key`` / its own environment.
    * - ``MSTAR_REQUEST_TIMEOUT_S``
      - ``600``
      - Per-request budget in the Rust frontend, in seconds; on expiry the
        client gets an error and the request is aborted in the backend. ``0``
        times every request out; a negative, non-finite or unreadable value is
-       the default. ``mstar serve --rust-frontend`` sets it from ``--timeout``
+       the default. ``mstar serve`` sets it from ``--timeout``
        (``launch_rust_server``).
    * - ``MSTAR_SAMPLE_RATE``
      - ``24000``
      - Sample rate stamped on the Rust frontend's WAV output.
-       ``mstar serve --rust-frontend`` sets it to the model's
+       ``mstar serve`` sets it to the model's
        ``get_output_sample_rate("audio")``, as the Python frontend reads it.
    * - ``MSTAR_LIBSNDFILE``
      - unset
@@ -398,6 +409,11 @@ Read by the ``mstar-server`` binary and its bridge
        checked it, the metadata frame packed), as JSON; unset serves no socket
        at ``/``. Not for deployments to set: ``launch_rust_server`` sets it from
        ``openpi_facts``.
+   * - ``MSTAR_POSITRONIC``
+     - unset
+     - The deployment's ``positronic:`` session policy, as JSON; unset serves
+       no ``/api/v1/session`` socket. Not for deployments to set:
+       ``launch_rust_server`` sets it from ``positronic_facts``.
    * - ``MSTAR_WS_MAX_BYTES``
      - the body limit
      - The largest WebSocket message the Rust frontend reads, in bytes: the
@@ -468,7 +484,7 @@ Read by the ``mstar-server`` binary and its bridge
      - The class name of the model's adapter in ``ADAPTER_REGISTRY``
        (``openai_adapter_class`` in ``mstar/api_server/rust_frontend.py``), which
        picks the OpenAI translation ``mstar-server`` uses
-       (``adapters::from_python``, which looks it up in ``ADAPTERS``). ``mstar-serve --rust-frontend`` always sets it;
+       (``adapters::from_python``, which looks it up in ``ADAPTERS``). ``mstar-serve`` always sets it;
        a ``mstar-server`` started by hand without it answers 404 on ``/v1/*``.
    * - ``MSTAR_TOKENIZER``
      - unset
