@@ -17,7 +17,16 @@ import pytest
 import torch
 from test_kv_prefix_request_keys import PROMPT, _deployment, _Model, _run, _worker
 
-from mstar.conductor.conductor import Conductor
+from mstar.conductor.conductor import (
+    Conductor,
+    _check_chunk_layouts,
+    _check_expert_layouts,
+    _required_chunk_layouts,
+    _required_expert_layouts,
+    _with_chunk_causal_layout,
+    _with_expert_layout,
+)
+from mstar.conductor.request_info import WalkStep
 from mstar.engine.resources.sampler.config import SamplingReqConfig
 from mstar.engine.state import (
     Array,
@@ -187,15 +196,60 @@ def test_missing_expert_layout_fails_at_data_worker_intake():
         _run(_worker(MissingExpert(), _deployment()))
 
 
-def test_missing_expert_array_fails_at_data_worker_intake():
+def test_expert_array_can_be_planned_after_data_worker_intake():
     class MissingExpert(_CombinedDeclaring):
         def process_prompt(self, *args, **kwargs):
             output = super().process_prompt(*args, **kwargs)
             del output.metadata["state_layout"]["expert"]
             return output
 
-    with pytest.raises(RuntimeError, match="missing expert labels \\['main'\\]"):
-        _run(_worker(MissingExpert(), _deployment()))
+    kwargs = _run(_worker(MissingExpert(), _deployment()))
+    assert kwargs["state_sizes"] == {"sized": {"main": {"n": 2}}}
+    assert EXPERT_LAYOUT_KWARG not in kwargs
+
+
+def test_chunk_and_expert_masks_can_follow_kv_and_sizes_at_walk_plan():
+    class Hybrid(_CombinedDeclaring):
+        def process_prompt(self, *args, **kwargs):
+            output = super().process_prompt(*args, **kwargs)
+            del output.metadata["state_layout"]["chunk"]
+            del output.metadata["state_layout"]["expert"]
+            return output
+
+    model = Hybrid()
+    kwargs = _run(_worker(model, _deployment()))
+    assert "kv" in kwargs["kv_layout"]
+    assert kwargs["state_sizes"] == {"sized": {"main": {"n": 2}}}
+    assert CHUNK_CAUSAL_LAYOUT_KWARG not in kwargs
+    assert EXPERT_LAYOUT_KWARG not in kwargs
+
+    chunk_required = _required_chunk_layouts(model, model.declare_state())
+    expert_required = _required_expert_layouts(model, model.declare_state())
+    with pytest.raises(RuntimeError, match="has no chunk-causal layout"):
+        _check_chunk_layouts([WalkStep("prefill")], chunk_required)
+    with pytest.raises(RuntimeError, match="has no expert layout"):
+        _check_expert_layouts([WalkStep("prefill")], expert_required)
+
+    chunk = {"chunk": {"main": {"chunk_attn": [4, 16, 8]}}}
+    expert = {"expert": {"main": {"expert_attn": [2]}}}
+    steps = [WalkStep("prefill", step_metadata={
+        CHUNK_CAUSAL_LAYOUT_KWARG: chunk, EXPERT_LAYOUT_KWARG: expert,
+    })]
+    declarations = model.declare_state()
+    steps = _with_chunk_causal_layout(steps, kwargs.get(CHUNK_CAUSAL_LAYOUT_KWARG), declarations)
+    steps = _with_expert_layout(steps, kwargs.get(EXPERT_LAYOUT_KWARG), declarations)
+    _check_chunk_layouts(steps, chunk_required)
+    _check_expert_layouts(steps, expert_required)
+    assert steps[0].step_metadata[CHUNK_CAUSAL_LAYOUT_KWARG] == chunk
+    assert steps[0].step_metadata[EXPERT_LAYOUT_KWARG] == expert
+
+    prompt_chunk = {"chunk": {"main": {"chunk_attn": [12, 8, 8]}}}
+    prompt_expert = {"expert": {"main": {"expert_attn": [1]}}}
+    overlaid = _with_expert_layout(
+        _with_chunk_causal_layout(steps, prompt_chunk, declarations), prompt_expert, declarations,
+    )
+    assert overlaid[0].step_metadata[CHUNK_CAUSAL_LAYOUT_KWARG] == chunk
+    assert overlaid[0].step_metadata[EXPERT_LAYOUT_KWARG] == expert
 
 
 def test_missing_chunk_lengths_fail_at_data_worker_intake():
@@ -209,15 +263,16 @@ def test_missing_chunk_lengths_fail_at_data_worker_intake():
         _run(_worker(MissingChunk(), _deployment()))
 
 
-def test_missing_chunk_array_fails_at_data_worker_intake():
+def test_missing_chunk_array_can_be_planned_after_data_worker_intake():
     class MissingChunk(_ChunkDeclaring):
         def process_prompt(self, *args, **kwargs):
             output = super().process_prompt(*args, **kwargs)
             del output.metadata["state_layout"]["chunk"]
             return output
 
-    with pytest.raises(RuntimeError, match="missing chunk-causal labels \\['main'\\]"):
-        _run(_worker(MissingChunk(), _deployment()))
+    kwargs = _run(_worker(MissingChunk(), _deployment()))
+    assert "kv" in kwargs["kv_layout"]
+    assert CHUNK_CAUSAL_LAYOUT_KWARG not in kwargs
 
 
 def test_chunk_layout_can_be_supplied_by_walk_plan_after_intake():
@@ -229,6 +284,20 @@ def test_chunk_layout_can_be_supplied_by_walk_plan_after_intake():
 
     kwargs = _run(_worker(PlannedChunk(), _deployment()))
     assert CHUNK_CAUSAL_LAYOUT_KWARG not in kwargs
+
+    model = PlannedChunk()
+    required = _required_chunk_layouts(model, model.declare_state())
+    with pytest.raises(RuntimeError, match="has no chunk-causal layout"):
+        _check_chunk_layouts([WalkStep("prefill")], required)
+
+    request_layout = {"chunk": {"main": {"chunk_attn": [4, 16, 8]}}}
+    planned_layout = {"chunk": {"main": {"chunk_attn": [12, 8, 8]}}}
+    plan = _with_chunk_causal_layout(
+        [WalkStep("prefill", step_metadata={CHUNK_CAUSAL_LAYOUT_KWARG: planned_layout})], request_layout,
+        model.declare_state(),
+    )
+    _check_chunk_layouts(plan, required)
+    assert plan[0].step_metadata[CHUNK_CAUSAL_LAYOUT_KWARG] == planned_layout
 
 
 def test_a_prompt_with_no_keyed_spans_keys_no_page():

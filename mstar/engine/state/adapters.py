@@ -701,7 +701,7 @@ EXPERT_LAYOUT_KWARG = "__state_expert_layout__"
 
 def chunk_causal_layouts(
     declarations: Sequence[Array | Sampler | SeqShard], state_layout: Mapping[str, Mapping[str, Layout]],
-    *, require_all: bool = True,
+    *, require_all: bool = True, allow_missing_arrays: bool = False,
 ) -> dict[str, dict[str, dict[str, list[int]]]]:
     """The read-keyed lengths of within-step arrays, as wire-safe request data.
 
@@ -712,6 +712,8 @@ def chunk_causal_layouts(
     if require_all:
         for array in arrays.values():
             if not any(isinstance(read.mask, ChunkCausal) for read in array.reads.values()):
+                continue
+            if allow_missing_arrays and array.name not in state_layout:
                 continue
             if missing := array.labels - state_layout.get(array.name, {}).keys():
                 raise RuntimeError(f"state_layout[{array.name!r}] is missing chunk-causal labels {sorted(missing)}")
@@ -732,7 +734,7 @@ def chunk_causal_layouts(
 
 def expert_layouts(
     declarations: Sequence[Array | Sampler | SeqShard], state_layout: Mapping[str, Mapping[str, Layout]],
-    *, require_all: bool = True,
+    *, require_all: bool = True, allow_missing_arrays: bool = False,
 ) -> dict[str, dict[str, dict[str, list[int]]]]:
     """Read-keyed expert geometry as small wire-safe integers, never tensors.
 
@@ -742,6 +744,8 @@ def expert_layouts(
     if require_all:
         for array in arrays.values():
             if not any(isinstance(read.mask, (ExpertCross, ExpertSelf)) for read in array.reads.values()):
+                continue
+            if allow_missing_arrays and array.name not in state_layout:
                 continue
             if missing := array.labels - state_layout.get(array.name, {}).keys():
                 raise RuntimeError(f"state_layout[{array.name!r}] is missing expert labels {sorted(missing)}")
@@ -870,8 +874,8 @@ def kv_layouts(
             if undeclared:
                 raise RuntimeError(f"{where}[{name!r}]: labels {sorted(undeclared)} aren't in Array {name!r}.labels")
     converted = {}
-    chunk_causal_layouts(declarations, state_layout)
-    expert_layouts(declarations, state_layout)
+    chunk_causal_layouts(declarations, state_layout, allow_missing_arrays=True)
+    expert_layouts(declarations, state_layout, allow_missing_arrays=True)
     for name, by_label in state_layout.items():
         layouts = storage_of(arrays[name]).layouts(arrays[name], by_label, keyed_spans.get(name, EMPTY))
         if layouts is not None:
