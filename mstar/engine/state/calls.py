@@ -107,6 +107,7 @@ class ArrayHandle(StepHandle):
         if self._open:
             raise self._refusal("a step began while another is open")
         self._open = True
+        self.open_step = step
         declared: ArrayStep = step.state[self.name]
         self._segments = segments_of(declared, step) or ()
         if self._segments:
@@ -139,6 +140,7 @@ class ArrayHandle(StepHandle):
 
     def end_step(self, step) -> None:
         self._open = False
+        self.open_step = None
         self._held = self._held_layer = None
 
     def _check_host_writes(self, declared: ArrayStep, ctx) -> None:
@@ -312,6 +314,7 @@ class SamplerHandle(StepHandle):
         if self._open:
             raise self._refusal("a step began while another is open")
         self._open = True
+        self.open_step = step
         self.rows = step.ctx.padded_request_ids
         self._drawn = 0
         self._fused = False
@@ -330,6 +333,7 @@ class SamplerHandle(StepHandle):
 
     def end_step(self, step) -> None:
         self._open = False
+        self.open_step = None
         self._fused = False
 
 

@@ -419,12 +419,15 @@ def test_the_vocoder_voices_the_streams_windows_as_the_reference_client_does(tmp
     from mstar.model.step_audio2.step_audio2_model import T2W_KEYS
     from mstar.model.submodule_base import InputMetadata
     from mstar.streaming.stream_buffer import StreamBuffer
+    from mstar.testing_utils.state import StubHostFields
 
     node = Token2WavSubmodule.__new__(Token2WavSubmodule)
     torch.nn.Module.__init__(node)
-    node.request_states, node.eos_code, node.code_offset, node.keys = {}, None, SPEECH_BASE, T2W_KEYS
+    node.eos_code, node.code_offset, node.keys = None, SPEECH_BASE, T2W_KEYS
     node._lead_silence = torch.zeros(0, dtype=torch.int32)
     node.model = torch.nn.Linear(1, 1)  # its device
+    node.bank, node._rows = SimpleNamespace(index=lambda name: 0, prompt_tokens=(10,)), {}
+    node.request = ended = StubHostFields(T2W_KEYS.request, {"ended": False})
     info = SimpleNamespace(rid_handle=0, step_metadata={"voice": "default_female"}, random_seed=0)
     codes = torch.randint(0, NUM_SPEECH_CODES, (n,)).tolist()
     model = a_model(tmp_path)
@@ -445,11 +448,12 @@ def test_the_vocoder_voices_the_streams_windows_as_the_reference_client_does(tmp
                 is_final_stream_chunk=chunk.is_final,
                 input_metadata=InputMetadata(stream_chunks={SPEECH_IDS: chunk.info} if data is not None else {}),
             )
+            ended.commit(node.declare_step(T2W_CHUNK, [0], [got]))
             if got.tensor_inputs["codes"].numel():
                 prepared.append(got)
                 served.append((
                     [t - SPEECH_BASE for t in got.tensor_inputs["codes"][0].tolist()], got.kwargs["last"]))
-                assert node.request_state(0)["written"] == sum(window_tokens(len(w), last) for w, last in served[:-1])
+                assert got.kwargs["written"] == sum(window_tokens(len(w), last) for w, last in served[:-1])
     assert served == reference_windows(codes)
     rows = node.preprocess(T2W_CHUNK, None, prepared)["rows"]
     assert [r[0][0].tolist() for r in rows] == [w for w, _ in served]

@@ -950,8 +950,8 @@ false``, which uses the request's ``system_prompt`` instead, as vllm-omni does.
 ``configs/minicpm_o.yaml`` runs three workers on one GPU (LLM and encoders, TTS, vocoder);
 it sets ``mps: true``, so their kernels overlap (see *Several workers on one GPU* in :doc:`serving`). Each spoken
 reply holds a slot of each ``t2w_*`` resource (~0.4 GiB in all) while it speaks, so their
-``max_slots`` cap the replies being voiced at once. ``t2w_state`` has one more than each of the
-three ``t2w_*_kv`` (its sink); startup refuses counts that disagree. The slots don't hold
+``max_slots`` cap the replies being voiced at once. Each of the ``t2w_state_*`` Values has one more
+than each of the three ``t2w_*_kv`` (its sink); startup refuses counts that disagree. The slots don't hold
 back the TTS, which keeps a spoken reply's ``tts_kv`` pages (up to 32) until its last code,
 so ``max_concurrent_requests`` caps the requests in flight and startup refuses a ``tts_kv``
 that can't hold that many full replies: overfilled, the TTS would stall. A reply's LLM
@@ -993,8 +993,8 @@ video input are not supported.
 LLM, and the vocoder). Each spoken reply holds a slot of each ``t2w_*`` resource while it
 speaks, so their ``max_slots`` cap the replies being voiced at once. With the default
 voices a slot is 284 MiB of ``t2w_dit_kv`` (more for a longer voice), 64 MiB of
-``t2w_enc2_kv``, 48 MiB of ``t2w_enc1_kv`` and 1.3 MiB of ``t2w_state``, about 0.39 GiB a
-reply. ``t2w_state`` has one more slot than each ``t2w_*_kv`` (its sink), and startup
+``t2w_enc2_kv``, 48 MiB of ``t2w_enc1_kv`` and 1.3 MiB of the ``t2w_state_*`` Values, about 0.39 GiB a
+reply. Each ``t2w_state_*`` Value has one more slot than each ``t2w_*_kv`` (its sink), and startup
 refuses counts that disagree. The conformer's caches hold a whole reply, so a voice of 17 s
 or more does not fit the flow's relative position table at the reply cap, and startup
 refuses one. The LLM's decode and prefill run on CUDA graphs (decode at batch sizes up to

@@ -18,9 +18,8 @@ excitation draws are an input (``window_noise``), from each request's own genera
 
 from __future__ import annotations
 
-import dataclasses
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, fields
 from typing import NamedTuple
 
@@ -30,7 +29,6 @@ import torch.nn.functional as F
 from torch import nn
 
 from mstar.engine.resources.kv.bounded import SinkWindow
-from mstar.engine.resources.recurrent.pool import RecurrentAddressing, RecurrentStatePool
 from mstar.model.chatterbox.components.s3gen_hift import HiFTGenerator, HiFTNoise
 from mstar.model.chatterbox.config import S3GenHiFTConfig
 from mstar.model.components.token2wav.flow import (
@@ -314,36 +312,6 @@ class Token2WavStreaming:
         return CacheCapacity(prompt_tokens, self.conformer_reply_tokens)
 
 
-class SlotRows(NamedTuple):
-    """A batch's rows of the vocoder's state pool (``slot_layout``): the pool and the step's
-    addressing of them, the same in a captured and an eager forward. Reads and writes go
-    through the pool's ``gather`` / ``scatter_``, which cover every row the step declared;
-    ``head`` keeps the first of them."""
-
-    pool: RecurrentStatePool
-    rows: RecurrentAddressing
-
-    def get(self, name: str) -> torch.Tensor:
-        # a row with no state yet reads zeros; callers pick their initial state for those
-        return self.pool.gather(name)[: self.rows.num_rows]
-
-    def set(self, name: str, value: torch.Tensor) -> None:
-        declared = self.pool.addressing().num_rows
-        if value.shape[0] < declared:
-            # the rows past ``head``: a replay's padding, whose writes land on the sink
-            value = torch.cat([value, value.new_zeros(declared - value.shape[0], *value.shape[1:])])
-        self.pool.scatter_(name, value)
-
-    def head(self, n: int) -> SlotRows:
-        """The step's first ``n`` rows: its real ones, a captured replay's padding after."""
-        return SlotRows(self.pool, dataclasses.replace(self.rows, num_rows=n))
-
-    @property
-    def fresh(self) -> torch.Tensor:
-        """``[B]`` rows whose slot holds no state yet: their request's first window."""
-        return ~self.rows.has_state[: self.rows.num_rows]
-
-
 class VoiceBank(NamedTuple):
     """The model's fixed voices, stacked so that rows of a batch can each have their own
     and one captured graph serves them all. Each row's voice is an index into it."""
@@ -507,6 +475,19 @@ class Token2Wav(nn.Module):
         self.hift = StepAudioHiFT()
         self.voice_encoder = VoicePromptEncoder()
         self.register_buffer("speech_window", torch.from_numpy(np.hamming(2 * HIFT_TAIL)), persistent=False)
+        # scratch: seeded before every window's draws (``window_noise``), so no draw reads what another left
+        self._noise_rng = torch.Generator()
+        # noise samples a window draws -> how far its draws move a CUDA generator's offset
+        self._draw_offsets: dict[int, int] = {}
+
+    def _apply(self, fn, recurse=True):
+        # the scratch generator follows the module's device, as its draws do
+        out = super()._apply(fn, recurse)
+        device = self.speech_window.device
+        if self._noise_rng.device != device:
+            self._noise_rng = torch.Generator(device)
+            self._draw_offsets = {}
+        return out
 
     @torch.inference_mode()
     def prepare_voice(self, prompt: VoicePrompt) -> Token2WavVoice:
@@ -536,90 +517,129 @@ class Token2Wav(nn.Module):
     @torch.inference_mode()
     def window_flow(
         self,
-        state: SlotRows,
+        conv: Mapping[str, torch.Tensor],
         bank: VoiceBank,
         voices: torch.Tensor,
         tokens: torch.Tensor,
         caches: WindowCaches,
         last: bool = False,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         """The flow for ``B`` windows at any positions, each in its own voice: ``tokens [B, n]``
-        -> mel ``[B, 80, frames]``. ``voices [B]`` indexes ``bank``. ``caches`` know each
-        row's position; rows on their first window (``state.fresh``) read their voice's conv
-        state rather than their slot's. A last window writes no caches. Capturable."""
+        -> mel ``[B, 80, frames]``, and the rows' next conv caches. ``voices [B]`` indexes ``bank``.
+        ``conv`` holds the rows' conv caches and whether each has run a window
+        (``token2wav_state``'s flow Value); a fresh row reads its voice's conv caches instead.
+        ``caches`` know each row's position. A last window writes no attention caches, and its
+        next conv caches are its request's last. Capturable."""
         b = tokens.shape[0]
-        fresh = state.fresh
+        fresh = ~conv["started"][:b]
 
         def per_row(name: str, stacked: torch.Tensor) -> torch.Tensor:
             """Each row's voice's ``name``."""
             return stacked.index_select(0, voices)
 
         def conv_cache(name: str, init: torch.Tensor) -> torch.Tensor:
-            current = state.get(name)
+            current = conv[name][:b]
             return torch.where(fresh.view(-1, *([1] * (current.dim() - 1))), per_row(name, init), current)
 
         enc_cnn = conv_cache("enc_cnn", bank.enc_cnn)
         # guidance rows of a request side by side, as the flow runs them
         dit_cnn = conv_cache("dit_cnn", bank.dit_cnn).permute(1, 2, 0, 3, 4, 5).contiguous().flatten(2, 3)
         mel = self.flow(tokens, per_row("spk", bank.spk), None, last, enc_cnn, dit_cnn, caches.flow_kv())
-        if not last:
-            state.set("enc_cnn", enc_cnn)
-            state.set("dit_cnn", dit_cnn.unflatten(2, (b, 2)).permute(2, 0, 1, 3, 4, 5))
-        return mel
+        return mel, {
+            "enc_cnn": enc_cnn,
+            "dit_cnn": dit_cnn.unflatten(2, (b, 2)).permute(2, 0, 1, 3, 4, 5),
+            "started": torch.ones_like(fresh),
+        }
 
     @torch.inference_mode()
     def window_vocode(
         self,
-        state: SlotRows,
+        hift: Mapping[str, torch.Tensor],
         mel: torch.Tensor,
         first: bool,
-        last: bool,
         noise: HiFTNoise,
-    ) -> dict[str, torch.Tensor]:
-        """HiFT up to its output spectrum for ``B`` windows' mel, prefixed by the slot's
-        held-back frames unless they are their requests' ``first`` (a shorter input, so the
-        two do not batch), on ``noise`` (``window_noise``). Finish with ``window_finish``."""
+    ) -> tuple[dict[str, torch.Tensor], dict[str, torch.Tensor]]:
+        """HiFT up to its output spectrum for ``B`` windows' mel, prefixed by the rows' held-back
+        frames (``hift``, the hift Value's) unless they are their requests' ``first`` (a shorter
+        input, so the two do not batch), on ``noise`` (``window_noise``): the spectrum, and the
+        rows' next held-back frames. Finish with ``window_finish``."""
+        b = mel.shape[0]
         if first:
             hift_mel, cache_source = mel, None
         else:
-            hift_mel = torch.cat([state.get("hift_mel"), mel], dim=2)
-            cache_source = state.get("hift_source")
+            hift_mel = torch.cat([hift["hift_mel"][:b], mel], dim=2)
+            cache_source = hift["hift_source"][:b]
         magnitude, phase, source = self.hift.spectrum(hift_mel, noise.phase, noise.harmonic, cache_source)
-        if not last:
-            state.set("hift_mel", hift_mel[..., -HIFT_MEL_CACHE:])
-            state.set("hift_source", source[:, :, -HIFT_TAIL:])
-        return {"magnitude": magnitude, "phase": phase}
+        held = {"hift_mel": hift_mel[..., -HIFT_MEL_CACHE:], "hift_source": source[:, :, -HIFT_TAIL:]}
+        return {"magnitude": magnitude, "phase": phase}, held
 
-    def window_noise(self, frames: int, first: bool, generators: list[torch.Generator | None]) -> HiFTNoise:
-        """HiFT's excitation draws for windows of ``frames`` mel frames, a row from each
-        generator, each drawn as a one-request ``stream`` call draws it: a request's audio
-        then depends on its own seed alone, not on its batch."""
-        length = (frames + (0 if first else HIFT_MEL_CACHE)) * SAMPLES_PER_FRAME
+    def noise_length(self, frames: int, first: bool) -> int:
+        """HiFT's excitation samples for a window of ``frames`` mel frames: its held-back frames' too, but on its
+        request's first."""
+        return (frames + (0 if first else HIFT_MEL_CACHE)) * SAMPLES_PER_FRAME
+
+    def window_noise(self, frames: int, first: bool, rows: list[tuple[int, int]]) -> HiFTNoise:
+        """HiFT's excitation draws for windows of ``frames`` mel frames, a row for each ``(seed, window)``: what the
+        request's own generator, seeded with ``seed``, draws for its ``window``-th window, as one-request ``stream``
+        calls draw them. A request's audio then depends on its own seed alone, not on its batch, and a step drawn
+        again draws the same."""
         device = self.speech_window.device
-        rows = [self.hift.m_source.draw_noise(1, length, torch.float32, device, g) for g in generators]
-        return HiFTNoise(phase=torch.cat([r.phase for r in rows]), harmonic=torch.cat([r.harmonic for r in rows]))
+        length = self.noise_length(frames, first)
+        drawn = []
+        for seed, window in rows:
+            self._seek(seed, window)
+            drawn.append(self.hift.m_source.draw_noise(1, length, torch.float32, device, self._noise_rng))
+        return HiFTNoise(phase=torch.cat([r.phase for r in drawn]), harmonic=torch.cat([r.harmonic for r in drawn]))
+
+    def _seek(self, seed: int, window: int) -> None:
+        """Seed the scratch generator, and move it past the draws of the request's first ``window`` windows, all full:
+        a first one, then later ones. (A first window is ``WINDOW`` codes for both models: MiniCPM-o's leads its 25
+        with its silence.) Each draw of one length moves a CUDA generator's offset by the same amount, so setting the
+        offset reaches any window; a CPU generator has no offset and draws the earlier windows."""
+        rng = self._noise_rng
+        rng.manual_seed(seed)
+        if not window:
+            return
+        first = self.noise_length(window_frames(WINDOW, False), True)
+        later = self.noise_length(window_frames(WINDOW, False), False)
+        if rng.device.type != "cuda":
+            for n in [first] + [later] * (window - 1):
+                self.hift.m_source.draw_noise(1, n, torch.float32, rng.device, rng)
+            return
+        rng.set_offset(self._draw_offset(first) + (window - 1) * self._draw_offset(later))
+
+    def _draw_offset(self, length: int) -> int:
+        """How far one window's draws of ``length`` samples move a CUDA generator's offset, measured once."""
+        offset = self._draw_offsets.get(length)
+        if offset is None:
+            probe = torch.Generator(self._noise_rng.device)
+            before = probe.get_offset()
+            self.hift.m_source.draw_noise(1, length, torch.float32, probe.device, probe)
+            offset = self._draw_offsets[length] = probe.get_offset() - before
+        return offset
 
     @torch.inference_mode()
     def window_finish(
         self,
-        state: SlotRows,
+        tail: Mapping[str, torch.Tensor],
         magnitude: torch.Tensor,
         phase: torch.Tensor,
         first: bool,
         last: bool = False,
-    ) -> torch.Tensor:
-        """``window_vocode``'s spectrum -> each row's samples: the inverse STFT (kept out of
-        the capture: it syncs), the cross-fade with the slot's held-back tail, and the new
-        tail, as the reference's ``stream`` does them."""
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """``window_vocode``'s spectrum -> each row's samples, and the rows' next held-back
+        samples: the inverse STFT (kept out of the capture: it syncs), the cross-fade with the
+        rows' held-back tail (``tail``, the tail Value's), and the new tail, as the reference's
+        ``stream`` does them. A last window returns all its samples."""
         speech = self.hift.waveform(magnitude, phase)
         if not first:
-            speech = fade_in_out(speech, state.get("hift_speech"), self.speech_window)
+            speech = fade_in_out(speech, tail["hift_speech"][: speech.shape[0]], self.speech_window)
+        held = {"hift_speech": speech[:, -HIFT_TAIL:]}
         if last:
-            return speech
-        state.set("hift_speech", speech[:, -HIFT_TAIL:])
+            return speech, held
         if first and self.streaming.first_window_zeros:
-            return torch.cat([speech.new_zeros(speech.shape[0], HIFT_TAIL), speech[:, :-HIFT_TAIL]], dim=1)
-        return speech[:, :-HIFT_TAIL]
+            return torch.cat([speech.new_zeros(speech.shape[0], HIFT_TAIL), speech[:, :-HIFT_TAIL]], dim=1), held
+        return speech[:, :-HIFT_TAIL], held
 
 # The token counts a last window after a full one can have: the left context plus 0 to
 # HOP - 1 new codes (a full window's worth would have made a full window).
