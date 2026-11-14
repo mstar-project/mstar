@@ -315,6 +315,28 @@ def test_wait_queues_tp_heads_before_acking_drains():
     assert not _reads_done(w), "READS_DONE must wait for the queued TP step"
 
 
+@pytest.mark.parametrize("previous_wait", [None, 0.001, 0.01, 0.02], ids=["unknown", "short", "threshold", "long"])
+def test_serial_gpu_wait_stays_on_main_thread(previous_wait):
+    w = _worker(device=torch.device("cuda"))
+    w.executor._serial_steps = True
+    if previous_wait is not None:
+        w.executor._gpu_wait_s[("Encoder", "encode")] = previous_wait
+    threads = []
+    step = SimpleNamespace(
+        node_name="Encoder", graph_walk="encode",
+        node_batch=SimpleNamespace(completion_event=SimpleNamespace(
+            query=lambda: False, synchronize=lambda: threads.append(get_ident()),
+        )),
+    )
+    try:
+        w.executor.wait_for_step(step, while_waiting=lambda: pytest.fail("serial wait serviced teardown"))
+        assert threads == [get_ident()]
+        assert w.executor._wait_pool is None
+    finally:
+        if w.executor._wait_pool is not None:
+            w.executor._wait_pool.shutdown()
+
+
 def test_short_gpu_waits_stay_on_main_thread_and_relearn_long_waits(monkeypatch):
     """Each walk learns independently, and a slower step restores callbacks."""
     w = _worker(device=torch.device("cuda"))

@@ -60,7 +60,8 @@ or end a stream, and peer loop stops can change routing; none may land halfway t
 or REMOVE also holds later teardowns, preserving admission/removal order. TP heads still enter their queue so a
 drain cannot ACK before a queued step.
 
-GPU completion waits use a helper thread when the preceding incomplete-event wait for that node/walk was at least
+`step_threads: serial` always synchronizes directly on the main thread without teardown callbacks.
+Otherwise, GPU completion waits use a helper thread when the preceding incomplete-event wait for that node/walk was at least
 10 ms, or is unknown. Shorter waits synchronize directly; a newly slow direct wait can defer cleanup once before
 its timing restores the helper path.
 

@@ -704,7 +704,8 @@ class StepExecutor:
         if batch_N.node_batch.completion_event is not None:
             with self.timer.span("worker.postprocess.event_sync"):
                 event = batch_N.node_batch.completion_event
-                if while_waiting is None:
+                # Serial steps keep their completion wait on the main thread too.
+                if self._serial_steps or while_waiting is None:
                     event.synchronize()
                 elif not event.query():
                     key = (batch_N.node_name, batch_N.graph_walk)
