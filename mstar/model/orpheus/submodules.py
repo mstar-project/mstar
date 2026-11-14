@@ -9,9 +9,8 @@ from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.accelerator_graph_config import AcceleratorGraphConfig, BatchedAcceleratorGraphConfig
 from mstar.engine.engine import ExecutingBatch
-from mstar.engine.state import ArrayStep, SampleStep, Segment, SubmoduleStep, at_last_token, sample
-from mstar.model.components.sampled_token_decoder import SampledTokenDecoder
-from mstar.model.orpheus.config import KV_CACHE, SAMPLER, SNAC_LEFT_REACH_FRAMES, OrpheusModelConfig
+from mstar.model.components.sampled_token_decoder import DeclaredTokenDecoder
+from mstar.model.orpheus.config import SNAC_LEFT_REACH_FRAMES, OrpheusModelConfig
 from mstar.model.submodule_base import (
     EMPTY_INPUT_METADATA,
     ARNodeInputs,
@@ -24,7 +23,7 @@ from mstar.streaming.stream_buffer import StreamChunkInfo
 logger = logging.getLogger(__name__)
 
 
-class OrpheusLLMSubmodule(SampledTokenDecoder):
+class OrpheusLLMSubmodule(DeclaredTokenDecoder):
     """Llama 3.2 3B for Orpheus TTS: samples the audio tokens the SNAC node decodes."""
 
     PREFILL_WALK = "prefill"
@@ -49,24 +48,6 @@ class OrpheusLLMSubmodule(SampledTokenDecoder):
     def capture_compile_mode(self, graph_walk: str) -> str | None:
         # max-autotune until the default compile level (mstar serve -O) is measured on this model
         return "max-autotune-no-cudagraphs"
-
-    def bind_state(self, handles: Mapping[str, Any]) -> None:
-        self.kv = handles[KV_CACHE]
-        self.sampler = handles[SAMPLER]
-
-    def node_step(
-        self, segments: list[Segment], prefill_tokens: Mapping[int, torch.Tensor], advance: tuple[int, ...] | None,
-    ) -> SubmoduleStep:
-        return SubmoduleStep(
-            segments=segments,
-            state={KV_CACHE: ArrayStep(advance=advance), SAMPLER: SampleStep(prompt_tokens=prefill_tokens)},
-        )
-
-    def last_token_hidden(self, engine_inputs: ModelInputsFromEngine, hidden: torch.Tensor) -> torch.Tensor:
-        return at_last_token(self.kv, hidden)
-
-    def sample_tokens(self, engine_inputs: ModelInputsFromEngine, logits: torch.Tensor) -> torch.Tensor:
-        return sample(self.sampler, logits)
 
 
 class SNACDecoderSubmodule(NodeSubmodule):

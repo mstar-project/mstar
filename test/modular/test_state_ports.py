@@ -78,9 +78,10 @@ from mstar.model.command_a_plus.command_a_plus_model import CommandAPlusModel
 from mstar.model.command_a_plus.submodules import CommandAPlusLLMSubmodule
 from mstar.model.components.block_loop_encoder import VISION_BLOCK_LOOP
 from mstar.model.components.request_kwargs import sampler_capabilities
+from mstar.model.components.sampled_token_decoder import DeclaredTokenDecoder
 from mstar.model.keys import MIXED, PREFILL_TEXT, ROPE
 from mstar.model.multimodal import media_walk_names, vision_encoder
-from mstar.model.multimodal_decoder import MultimodalDecoderModel
+from mstar.model.multimodal_decoder import DeclaredDecoderModel, MultimodalDecoderModel
 from mstar.model.qwen3_5.components.language_model import Qwen3_5ForCausalLM, Qwen3_5LanguageModel
 from mstar.model.qwen3_5.config import (
     ATTN,
@@ -611,6 +612,24 @@ def test_qwen3_5_hands_on_the_scaffolds_keyed_spans(monkeypatch):
     assert converted == {KV_CACHE: {"main": scaffold}}, "the leading text span would be keyed"
 
 
+@pytest.mark.parametrize("keyed", [None, 0], ids=["text", "media"])
+def test_a_decoder_model_on_the_contract_returns_its_layout_under_state_layout(monkeypatch, keyed):
+    span = Span("ids", "prefill_text", 3, 3, "text_inputs")
+    scaffold = LabelLayout(spans=(span,), growth=(("decode_loop", 1),), scratch=2, keyed_spans=keyed)
+    monkeypatch.setattr(
+        MultimodalDecoderModel, "process_prompt",
+        lambda *args, **kwargs: ProcessPromptOutput({}, {"kv_layout": {KV_CACHE: {"main": scaffold}}}),
+    )
+    metadata = object.__new__(DeclaredDecoderModel).process_prompt("hello", ["text"], ["text"]).metadata
+    assert metadata["state_layout"] == {
+        KV_CACHE: {"main": Layout(spans=(span,), growth=(("decode_loop", 1),), scratch=2)},
+    }, "the scaffold's layout would reach the data worker changed"
+    assert "kv_layout" not in metadata, "the data worker would read the scaffold's layout and not the state layout"
+    assert metadata.get("keyed_spans") == (None if keyed is None else {KV_CACHE: {"main": keyed}}), (
+        "a label that keys every span would carry a count, or one that keys none would lose it"
+    )
+
+
 def test_qwen3_5_request_settings_equal_the_hand_written_config():
     model = _qwen3_5(**QWEN3_5["9B"])
     kwargs = {"temperature": 0.0, "top_p": 0.5, "top_k": 3, "repetition_penalty": 1.3, "ignore_eos": True, "seed": 9}
@@ -792,8 +811,10 @@ def test_qwen3_5_takes_each_rows_last_token_on_a_prefill_only(monkeypatch, walk,
     llm.kv, llm.sampler = object(), object()
     monkeypatch.setattr(LLMSubmodule, "_rope_in_graph", lambda *args: False)
     taken = []
-    monkeypatch.setattr("mstar.model.qwen3_5.submodules.at_last_token", lambda h, x: taken.append(h) or x[-1:])
-    monkeypatch.setattr("mstar.model.qwen3_5.submodules.sample", lambda s, logits: logits)
+    monkeypatch.setattr(
+        "mstar.model.components.sampled_token_decoder.at_last_token", lambda h, x: taken.append(h) or x[-1:],
+    )
+    monkeypatch.setattr("mstar.model.components.sampled_token_decoder.sample", lambda s, logits: logits)
     logits = llm._forward(walk, None, torch.tensor([1, 2, 3]), cos_3d=torch.ones(1), sin_3d=torch.ones(1))
     assert (taken == [llm.kv]) is last_token
     assert logits.shape[0] == (1 if last_token else 3)
@@ -823,6 +844,18 @@ def test_a_qwen3_5_step_counts_the_scaffolds_draw_through_its_handle():
     llm.sampler.check_step(step)
     assert llm.sampler._drawn == 1, "the scaffold's forward should sample through the handle"
     step.end_calls()
+
+
+def test_the_handle_path_binds_and_steps_the_array_its_class_names():
+    class _Node(DeclaredTokenDecoder):
+        KV_CACHE = "kv"
+
+    node = _Node(None, SimpleNamespace(stop_token_ids=frozenset()))
+    kv, sampler = object(), object()
+    node.bind_state({"kv": kv, SAMPLER: sampler})
+    assert node.kv is kv and node.sampler is sampler, "the node would bind another array than its class names"
+    step = node.node_step([Segment(1, "main", 1)], {}, None)
+    assert step.state.keys() == {"kv", SAMPLER}, "the node would step another array than the one it binds"
 
 
 _FIXTURE = Path("mstar/model/command_a_plus/tests/fixtures/tiny_config.json")
@@ -974,6 +1007,40 @@ def test_command_a_plus_steps_equal_the_hand_written_ones(tmp_path, walk, length
     inputs = [ARNodeInputs(input_ids=torch.arange(n), input_seq_len=n) for n in lengths]
     step = engine_step(node, graph_walk=walk, request_ids=rids, inputs=inputs)
     _assert_steps_equal(step, _command_a_plus_reference_step(walk, rids, inputs))
+
+
+class _StubMasters:
+    """Each request's last sampled token, as a sampler's slot masters hold it."""
+
+    has_slot_masters = True
+
+    def __init__(self, tokens: dict[int, int]):
+        self.tokens = tokens
+
+    def loopback_tokens(self, rids):
+        return torch.tensor([self.tokens[rid] for rid in rids])
+
+
+def test_a_node_given_a_loop_back_by_step_repeats_reads_its_token_through_the_samplers_handle(tmp_path):
+    """Command A+ reads the routed token until a deployment's ``step_repeats:`` gives its decode walk a loop-back.
+    Its decode step then reads each row's token through the sampler's handle, where `SampledTokenDecoder` reads it
+    off the engine's inputs."""
+    model = _command_a_plus(tmp_path)
+    node = _bind(CommandAPlusLLMSubmodule(torch.nn.Module(), model.config, (model.image_encoder,)), model)
+    masters = _StubMasters({3: 41, 5: 43})
+    node.sampler.resource = masters
+    node.node_resources = {SAMPLER: masters}
+    assert node.uniform_row_inputs(node.DECODE_WALK, has_loopback=True) is None, "the node would loop back unasked"
+    node.enable_repeats({node.DECODE_WALK})
+    rids, inputs = [5, 3], [node.uniform_row_inputs(node.DECODE_WALK, has_loopback=True)] * 2
+    step = engine_step(node, graph_walk=node.DECODE_WALK, request_ids=rids, inputs=inputs)
+    step.set_ctx(StepContext(tuple(rids), node.DECODE_WALK, 0, True))
+    step.begin_calls()
+    # The engine's inputs carry another sampler, so a read past the handle returns that sampler's tokens.
+    engine_inputs = SimpleNamespace(request_ids=rids, resources={SAMPLER: _StubMasters({3: 7, 5: 9})})
+    ids = node.preprocess(node.DECODE_WALK, engine_inputs, inputs)["input_ids"]
+    step.end_calls()
+    assert ids.tolist() == [43, 41], "a repeated decode step would read its token past the sampler's handle"
 
 
 def test_command_a_plus_layout_converts_to_the_hand_written_one(tmp_path):

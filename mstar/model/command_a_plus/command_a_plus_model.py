@@ -19,7 +19,6 @@ from mstar.engine.state import (
     Read,
     Rope,
     Sampler,
-    SampleSettings,
     Span,
     Window,
 )
@@ -36,7 +35,8 @@ from mstar.model.command_a_plus.config import (
 )
 from mstar.model.components.request_kwargs import (
     SAMPLING_KEYS,
-    sampler_capabilities,
+    sample_settings,
+    sampler_flags,
     sampling_config,
     sampling_defaults,
 )
@@ -132,7 +132,6 @@ class CommandAPlusModel(Model):
         every = frozenset(range(config.num_hidden_layers))
         local = frozenset(i for i, kind in enumerate(config.layer_types) if kind == "sliding_attention")
         attend = Attend(q_heads=config.num_attention_heads)
-        capabilities = sampler_capabilities(self.sampling_defaults)
         return [
             Array(
                 KV_CACHE, nodes={"LLM"}, layers=every,
@@ -146,13 +145,12 @@ class CommandAPlusModel(Model):
             ),
             Sampler(
                 SAMPLER, nodes={"LLM"}, vocab_size=config.vocab_size,
-                penalty=capabilities["enable_repetition_penalty"], min_p=capabilities["enable_min_p"],
+                **sampler_flags(self.sampling_defaults),
             ),
         ]
 
     def get_request_resource_configs(self, input_modalities, output_modalities, model_kwargs):
-        config = sampling_config(self.sampling_defaults, model_kwargs)
-        return {SAMPLER: SampleSettings(**{key: getattr(config, key) for key in SAMPLING_KEYS})}
+        return {SAMPLER: sample_settings(sampling_config(self.sampling_defaults, model_kwargs))}
 
     def request_kwargs(self):
         return frozenset({"messages", "max_output_tokens", *SAMPLING_KEYS})

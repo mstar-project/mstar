@@ -24,6 +24,17 @@ def _talker(config, weights):
     return TalkerSubmodule(H._loaded(Qwen3TTSTalkerModel(config).to(H.DTYPE), weights), predictor.to(H.DTYPE), config)
 
 
+def _higgs(config, weights):
+    """Higgs's LLM node as the model builds it for the benchmark: weights loaded, no handles bound."""
+    from mstar.model.higgs_audio.higgs_audio_model import HiggsAudioModel, audio_encoder
+    from mstar.model.higgs_audio.submodules import HiggsAudioLLMSubmodule
+
+    model = H.model_object(HiggsAudioModel, config)
+    llm = model.build_llm(None).to(H.DTYPE)
+    llm.load_weights((name, w) for k, w in weights.items() if (name := model._llm_remap(k)) is not None)
+    return HiggsAudioLLMSubmodule(llm.eval(), config, (audio_encoder(),), text_prompts=False)
+
+
 def _thinker(config, weights):
     """The Thinker node as the model builds it for the benchmark: weights loaded, no handles bound."""
     from mstar.model.qwen3_omni.components.thinker import Qwen3OmniThinkerModel
@@ -34,6 +45,7 @@ def _thinker(config, weights):
 
 @pytest.mark.parametrize("model, stack, build", [
     ("qwen3_tts", "qwen3_tts_talker", _talker), ("qwen3_omni", "qwen3_omni_thinker", _thinker),
+    ("higgs", "higgs_audio", _higgs),
 ])
 def test_a_contract_nodes_entry_declares_and_runs_its_step(model, stack, build):
     entry, harness = getattr(module_parity, f"_{model}")(), H.STACKS[stack]()

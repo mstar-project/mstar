@@ -184,11 +184,11 @@ def _higgs_model(defaults=None) -> HiggsAudioModel:
 
 
 def _higgs_sampler(model, **kw) -> SamplingReqConfig:
-    return model.get_request_resource_configs([], [], kw)[HIGGS_SAMPLER]
+    return sampling_configs(model.get_request_resource_configs([], [], kw), model.declare_state())[HIGGS_SAMPLER]
 
 
 def _higgs_spec(model):
-    return next(s for s in model.get_node_resources() if s.resource_key == HIGGS_SAMPLER)
+    return next(s for s in node_resources(model) if s.resource_key == HIGGS_SAMPLER)
 
 
 def test_higgs_request_kwargs_are_the_keys_it_reads():

@@ -1,17 +1,14 @@
 """Packed prefill, one-token-per-request decode, and the image encoder for Command A+."""
 
-from collections.abc import Mapping
 from typing import Any
 
 import torch
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.engine.accelerator_graph_config import AcceleratorGraphConfig
-from mstar.engine.state import ArrayStep, SampleStep, Segment, SubmoduleStep, at_last_token, position, sample
 from mstar.model.command_a_plus.components.vision import CommandAPlusVisionEncoder
-from mstar.model.command_a_plus.config import KV_CACHE, SAMPLER
-from mstar.model.components.sampled_token_decoder import SampledTokenDecoder
-from mstar.model.submodule_base import ModelInputsFromEngine, NodeInputs, NodeSubmodule
+from mstar.model.components.sampled_token_decoder import DeclaredTokenDecoder
+from mstar.model.submodule_base import NodeInputs, NodeSubmodule
 
 
 class CommandAPlusVisionSubmodule(NodeSubmodule):
@@ -53,7 +50,7 @@ class CommandAPlusVisionSubmodule(NodeSubmodule):
         }
 
 
-class CommandAPlusLLMSubmodule(SampledTokenDecoder):
+class CommandAPlusLLMSubmodule(DeclaredTokenDecoder):
     """The Command A+ text stack; image rows are spliced in at their pads."""
 
     # Decode replays CUDA graphs of the same eager kernels; torch.compile stays
@@ -72,27 +69,6 @@ class CommandAPlusLLMSubmodule(SampledTokenDecoder):
     def max_batch_size(self, graph_walk: str) -> int | None:
         # no prefill is captured, so nothing sizes an image step: uncapped, as before
         return None
-
-    def bind_state(self, handles: Mapping[str, Any]) -> None:
-        self.kv = handles[KV_CACHE]
-        self.sampler = handles[SAMPLER]
-
-    def node_step(
-        self, segments: list[Segment], prefill_tokens: Mapping[int, torch.Tensor], advance: tuple[int, ...] | None,
-    ) -> SubmoduleStep:
-        return SubmoduleStep(
-            segments=segments,
-            state={KV_CACHE: ArrayStep(advance=advance), SAMPLER: SampleStep(prompt_tokens=prefill_tokens)},
-        )
-
-    def next_position(self, rid_handle: int) -> int:
-        return position(self.kv, rid_handle, "main")
-
-    def last_token_hidden(self, engine_inputs: ModelInputsFromEngine, hidden: torch.Tensor) -> torch.Tensor:
-        return at_last_token(self.kv, hidden)
-
-    def sample_tokens(self, engine_inputs: ModelInputsFromEngine, logits: torch.Tensor) -> torch.Tensor:
-        return sample(self.sampler, logits)
 
     def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,

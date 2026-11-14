@@ -11,7 +11,8 @@ files come from. A model sets `NAME` and
 setting ``config``, with ``max_position_embeddings`` and ``stop_token_ids``,
 ``tokenizer`` and ``media``, a `MediaIntake` per attachment modality),
 resources (the LLM's sampler from `_sampler_spec`), ``_prompt_ids`` (render
-and tokenize) and ``_create_submodule``.
+and tokenize) and ``_create_submodule``. A model on the state contract
+subclasses `DeclaredDecoderModel` instead.
 
 Not in ``multimodal.py``: ``mstar.model.base`` imports that module, so a
 `Model` subclass there would be a circular import.
@@ -22,7 +23,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import torch
 
@@ -30,8 +31,19 @@ from mstar.communication.tensors import NameToTensorList
 from mstar.distributed.base import ShardingConfig
 from mstar.engine.resources.sampler.config import SamplerSpec, SamplingReqConfig
 from mstar.engine.resources.spec import CombinedSplit, ResourceReqConfig
+from mstar.engine.state import SampleSettings
 from mstar.graph.base import GraphSection, TensorPointerInfo
-from mstar.model.base import KVLabel, LabelLayout, Model, PrefixKeys, ProcessPromptOutput, Span, WalkStep
+from mstar.model.base import (
+    KVLabel,
+    LabelLayout,
+    Model,
+    PrefixKeys,
+    ProcessPromptOutput,
+    Span,
+    WalkStep,
+    state_layouts,
+)
+from mstar.model.components.request_kwargs import sample_settings
 from mstar.model.keys import KV_CACHE, MIXED, PREFILL_TEXT, SAMPLER
 from mstar.model.multimodal import (
     MEDIA_LAYOUT,
@@ -482,3 +494,23 @@ class MultimodalDecoderModel(Model):
             return make().to(device)
         finally:
             torch.set_default_dtype(torch.float32)
+
+
+class DeclaredDecoderModel(MultimodalDecoderModel):
+    """A `MultimodalDecoderModel` on the state contract: it returns the layout as ``state_layout`` and a request's
+    sampler settings as `SampleSettings`. It folds into `MultimodalDecoderModel` once no subclass is left on
+    resources."""
+
+    def process_prompt(self, *args: Any, **kwargs: Any) -> ProcessPromptOutput:
+        out = super().process_prompt(*args, **kwargs)
+        layouts = state_layouts(out.metadata.pop("kv_layout"))
+        out.metadata["state_layout"] = layouts.state_layout
+        if layouts.keyed_spans:
+            out.metadata["keyed_spans"] = layouts.keyed_spans
+        return out
+
+    def get_request_resource_configs(
+        self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
+    ) -> dict[str, SampleSettings]:
+        config = super().get_request_resource_configs(input_modalities, output_modalities, model_kwargs)[SAMPLER]
+        return {SAMPLER: sample_settings(config)}

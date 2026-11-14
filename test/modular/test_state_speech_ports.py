@@ -57,7 +57,11 @@ from mstar.engine.state.adapters import (
 )
 from mstar.engine.state.analysis import state_declaration_problems
 from mstar.model.base import LabelLayout, enabled_resources, keyed_labels, serving_resources
+from mstar.model.higgs_audio.config import HiggsAudioModelConfig
+from mstar.model.higgs_audio.higgs_audio_model import HiggsAudioModel, audio_encoder
+from mstar.model.higgs_audio.submodules import HiggsAudioLLMSubmodule
 from mstar.model.kokoro.kokoro_model import KokoroModel
+from mstar.model.multimodal_decoder import MultimodalDecoderModel
 from mstar.model.omnilingual_asr.config import ctc_config
 from mstar.model.omnilingual_asr.omnilingual_asr_model import OmnilingualASRModel
 from mstar.model.omnilingual_asr.submodules import ENCODER_LOOP, OmniASRCTCSubmodule
@@ -84,6 +88,10 @@ PROMPT = Span("ids", "prefill", 7, 7, "text_inputs")
 
 def _orpheus() -> OrpheusModel:
     return _bare(OrpheusModel, config=OrpheusModelConfig())
+
+
+def _higgs() -> HiggsAudioModel:
+    return _bare(HiggsAudioModel, config=HiggsAudioModelConfig())
 
 
 def _omnilingual(dtype: torch.dtype = torch.bfloat16, size: str = "300m") -> OmnilingualASRModel:
@@ -120,6 +128,28 @@ def _orpheus_reference(model) -> list:
                 low_freq_factor=c.rope_scaling["low_freq_factor"], high_freq_factor=c.rope_scaling["high_freq_factor"],
                 old_context_len=c.rope_scaling["original_max_position_embeddings"],
             ),
+        ),
+    ]
+
+
+def _higgs_reference(model) -> list:
+    c = model.config
+    return [
+        KVSpec(
+            resource_key=KV_CACHE, nodes={"LLM"},
+            config=PagedKVConfig(
+                num_layers=c.num_hidden_layers, num_kv_heads=c.num_key_value_heads, head_dim=c.head_dim,
+                max_seq_len=c.max_position_embeddings, num_qo_heads=c.num_attention_heads, max_num_pages=256,
+            ),
+        ),
+        AttentionSpec(resource_key=ATTN, nodes={"LLM"}, config=AttentionConfig(kv_cache=KV_CACHE)),
+        PositionSpec(
+            resource_key=ROPE, nodes={"LLM"}, config=PositionConfig(kv_cache=KV_CACHE, rope_theta=c.rope_theta),
+        ),
+        # greedy defaults, so neither capability
+        SamplerSpec(
+            resource_key=SAMPLER, nodes={"LLM"}, vocab_size=c.vocab_size, enable_repetition_penalty=False,
+            enable_min_p=False,
         ),
     ]
 
@@ -170,19 +200,20 @@ def _voxcpm2_reference(model) -> list:
 _PAGES = {"page_size": 64, "max_num_pages": 512}
 MODELS = {
     "orpheus": (_orpheus, _orpheus_reference, {KV_CACHE: _PAGES}),
+    "higgs": (_higgs, _higgs_reference, {KV_CACHE: _PAGES}),
     "omnivoice": (_omnivoice, _omnivoice_reference, {BACKBONE_ATTN: {"max_segments_per_request": 4}}),
     "omnilingual": (_omnilingual, _omnilingual_reference, {ENCODER_ATTN: {"max_segments_per_step": 8}}),
     "voxcpm2": (_voxcpm2, _voxcpm2_reference, {BASE_KV: _PAGES, RES_KV: _PAGES}),
 }
 _COMPARED = {
-    "OrpheusModel": "orpheus", "OmniVoiceModel": "omnivoice",
+    "OrpheusModel": "orpheus", "HiggsAudioModel": "higgs", "OmniVoiceModel": "omnivoice",
     "OmnilingualASRModel": "omnilingual", "VoxCPM2Model": "voxcpm2",
 }
 _PUBLISHED = [(path, name) for cls, name in _COMPARED.items() for path in _published(cls)]
 
 
 def test_the_published_configs_are_found():
-    assert [sum(name == other for _, name in _PUBLISHED) for other in MODELS] == [4, 2, 4, 1]
+    assert [sum(name == other for _, name in _PUBLISHED) for other in MODELS] == [4, 1, 2, 4, 1]
     assert len(_published("KokoroModel")) == 2, "an empty list would skip their tests"
 
 
@@ -263,6 +294,24 @@ def test_orpheus_steps_equal_the_hand_written_ones(walk):
     ]
     tokens = {rid: inp.input_ids for rid, inp, (own, _) in zip(rids, inputs, rows, strict=True) if own == "prefill"}
     step = engine_step(_orpheus_llm(), graph_walk=walk, request_ids=rids, inputs=inputs)
+    _assert_steps_equal(step, _orpheus_reference_step(rids, inputs, tokens))
+
+
+def _higgs_llm() -> HiggsAudioLLMSubmodule:
+    node = HiggsAudioLLMSubmodule(None, HiggsAudioModelConfig(), (audio_encoder(),), text_prompts=False)
+    return _bind(node, _higgs())
+
+
+@pytest.mark.parametrize("walk", ["prefill_audio", "decode"])
+def test_higgs_steps_equal_the_hand_written_ones(walk):
+    rids = [1, 2]
+    if walk == "decode":
+        inputs, tokens = [ARNodeInputs(input_seq_len=1), ARNodeInputs(input_seq_len=1)], {}
+    else:
+        inputs = [ARNodeInputs(input_ids=torch.arange(n), input_seq_len=n) for n in (5, 3)]
+        tokens = {rid: inp.input_ids for rid, inp in zip(rids, inputs, strict=True)}
+    step = engine_step(_higgs_llm(), graph_walk=walk, request_ids=rids, inputs=inputs)
+    # main's scaffold stepped Higgs's KV, attention, sampler and positions as it stepped Orpheus's
     _assert_steps_equal(step, _orpheus_reference_step(rids, inputs, tokens))
 
 
@@ -401,6 +450,20 @@ def test_orpheus_layout_converts_to_the_hand_written_one_with_its_keys():
     assert keys.tensor == "text_inputs" and keys.walks == ("prefill",)
 
 
+def test_higgs_layout_converts_to_the_scaffolds_with_no_keys():
+    """The scaffold keys none of an audio prompt's spans. The state layout holds no count, so it rides beside it."""
+    from test_model_kv_layouts import _higgs as _higgs_with_a_processor
+
+    model = _higgs_with_a_processor()
+    args = ("transcribe", ["audio"], ["text"], {"audio_inputs": [torch.zeros(16000)]})
+    scaffold = MultimodalDecoderModel.process_prompt(model, *args).metadata["kv_layout"]
+    metadata = model.process_prompt(*args).metadata
+    assert "kv_layout" not in metadata, "a ported model returns its layout under state_layout"
+    converted = kv_layouts(model.declare_state(), metadata["state_layout"], metadata.get("keyed_spans", {}))
+    assert converted == scaffold and converted[KV_CACHE]["main"].row() == scaffold[KV_CACHE]["main"].row()
+    assert converted[KV_CACHE]["main"].keyed_count() == 0, "the text before the clip would be keyed"
+
+
 @pytest.fixture
 def tiny_voxcpm2(tmp_path, monkeypatch) -> VoxCPM2Model:
     (tmp_path / "config.json").write_text(json.dumps(TINY))
@@ -431,13 +494,38 @@ def test_request_settings_equal_the_hand_written_config(build, kwargs, reference
     assert configs == {SAMPLER: reference}
 
 
-@pytest.mark.parametrize("build", [_orpheus, _omnivoice, _omnilingual], ids=lambda build: build.__name__)
+@pytest.mark.parametrize("kwargs", [
+    {"temperature": 0.3, "top_p": 0.9, "top_k": 8, "min_p": 0.05, "repetition_penalty": 1.1, "penalize_prompt": False,
+     "ignore_eos": True, "return_logprobs": True, "logprobs_mode": "processed"},
+    {},
+], ids=["knobs", "greedy"])
+def test_higgs_request_settings_equal_the_scaffolds_config(kwargs):
+    model = _higgs()
+    configs = sampling_configs(model.get_request_resource_configs([], [], kwargs), model.declare_state())
+    assert configs == {SAMPLER: MultimodalDecoderModel.get_request_resource_configs(model, [], [], kwargs)[SAMPLER]}
+
+
+@pytest.mark.parametrize("build", [_orpheus, _higgs, _omnivoice, _omnilingual], ids=lambda build: build.__name__)
 def test_declarations_have_no_problems(build):
     assert state_declaration_problems(build()) == []
 
 
 def test_voxcpm2_declarations_have_no_problems_with_host_fields_on_a_node_with_no_prefix_keys(tiny_voxcpm2):
     assert state_declaration_problems(tiny_voxcpm2) == []
+
+
+def test_higgs_layers_take_the_fused_call_on_its_declared_rope():
+    """Each layer calls `qk_norm_rope_attend`; whether the kernel or its reference runs is the handle's choice."""
+    model = _higgs()
+    with torch.device("meta"):
+        llm = model.build_llm(None)
+    (array,) = [declared for declared in model.declare_state() if isinstance(declared, Array)]
+    resources = {KV_CACHE: _StubResource(), ATTN: _StubResource(), ROPE: SimpleNamespace()}
+    handle = build_handle(array, resources, _resolve([array], StateSetup()))
+    for module in llm.modules():
+        if hasattr(module, "bind_state"):
+            module.bind_state({KV_CACHE: handle})
+    assert all(layer.self_attn._fuse for layer in llm.layers), "a layer would norm, rotate and write K/V apart"
 
 
 @pytest.mark.parametrize("build, config, read", [

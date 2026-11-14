@@ -41,25 +41,24 @@ from mstar.engine.state import (
     Block,
     Causal,
     KVEntry,
-    Layout,
     Positions,
     Read,
     Rope,
     Sampler,
     SampleSettings,
 )
-from mstar.model.base import ProcessPromptOutput
 from mstar.model.components.audio_features import LogMelSpectrogram
 from mstar.model.components.request_kwargs import (
     GREEDY_SAMPLING,
     SAMPLING_KEYS,
     checked_request_kwargs,
-    sampler_capabilities,
+    sample_settings,
+    sampler_flags,
     sampling_config,
     sampling_defaults,
 )
 from mstar.model.multimodal import TEXT, MediaEncoder, PromptPart
-from mstar.model.multimodal_decoder import MediaIntake, MultimodalDecoderModel, PreparedMedia
+from mstar.model.multimodal_decoder import DeclaredDecoderModel, MediaIntake, PreparedMedia
 from mstar.model.qwen3_asr.config import (
     ASR_TEXT_TAG,
     ATTN,
@@ -85,7 +84,7 @@ def audio_encoder() -> MediaEncoder:
     return MediaEncoder("audio", ENCODER_NODE, ("audio",), "audio_embeds", walk="prefill")
 
 
-class Qwen3ASRModel(MultimodalDecoderModel):
+class Qwen3ASRModel(DeclaredDecoderModel):
     """Qwen3-ASR: AuT encoder + dense Qwen3 decoder."""
 
     NAME = "Qwen3-ASR"
@@ -149,7 +148,6 @@ class Qwen3ASRModel(MultimodalDecoderModel):
 
     def declare_state(self) -> list[Array | Sampler]:
         text, audio = self.config.text, self.config.audio
-        capabilities = sampler_capabilities(self.sampling_defaults)
         return [
             Array(
                 AUT_TOKENS, nodes={ENCODER_NODE}, layers=frozenset(range(audio.encoder_layers)), max_len=0,
@@ -164,7 +162,7 @@ class Qwen3ASRModel(MultimodalDecoderModel):
             ),
             Sampler(
                 SAMPLER, nodes={LLM_NODE}, vocab_size=text.vocab_size,
-                penalty=capabilities["enable_repetition_penalty"], min_p=capabilities["enable_min_p"],
+                **sampler_flags(self.sampling_defaults),
             ),
         ]
 
@@ -184,16 +182,7 @@ class Qwen3ASRModel(MultimodalDecoderModel):
         self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
     ) -> dict[str, SampleSettings]:
         del input_modalities, output_modalities
-        config = sampling_config(self.sampling_defaults, model_kwargs)
-        return {SAMPLER: SampleSettings(**{key: getattr(config, key) for key in SAMPLING_KEYS})}
-
-    def process_prompt(self, *args: Any, **kwargs: Any) -> ProcessPromptOutput:
-        out = super().process_prompt(*args, **kwargs)
-        kv = out.metadata.pop("kv_layout")[KV_CACHE]["main"]
-        out.metadata["state_layout"] = {KV_CACHE: {"main": Layout(spans=kv.spans, growth=kv.growth)}}
-        if kv.keyed_spans is not None:
-            out.metadata["keyed_spans"] = {KV_CACHE: {"main": kv.keyed_spans}}
-        return out
+        return {SAMPLER: sample_settings(sampling_config(self.sampling_defaults, model_kwargs))}
 
     # -------------------------------------------------------------------
     # Serving config and budget
