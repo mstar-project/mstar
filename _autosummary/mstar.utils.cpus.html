@@ -750,6 +750,8 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.CpuPlan.sets"><code class="docutils literal notranslate"><span class="pre">CpuPlan.sets</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.CpuPlan.slot"><code class="docutils literal notranslate"><span class="pre">CpuPlan.slot</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.CpuPlan.usable"><code class="docutils literal notranslate"><span class="pre">CpuPlan.usable</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.CpuPlan.video_chunks"><code class="docutils literal notranslate"><span class="pre">CpuPlan.video_chunks</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.CpuPlan.video_encode_threads"><code class="docutils literal notranslate"><span class="pre">CpuPlan.video_encode_threads</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.CpuPlan.why"><code class="docutils literal notranslate"><span class="pre">CpuPlan.why</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.CpuPlan.workers"><code class="docutils literal notranslate"><span class="pre">CpuPlan.workers</span></code></a></li>
 </ul>
@@ -1060,6 +1062,27 @@ MB.</p>
 <dt class="sig sig-object py" id="mstar.utils.cpus.CpuPlan.usable">
 <span class="sig-name descname"><span class="pre">usable</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.utils.cpus.CpuPlan.usable" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
+
+<dl class="py property">
+<dt class="sig sig-object py" id="mstar.utils.cpus.CpuPlan.video_chunks">
+<span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">video_chunks</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.utils.cpus.CpuPlan.video_chunks" title="Link to this definition">#</a></dt>
+<dd><p>Pieces one H.264 clip encodes in parallel (<code class="docutils literal notranslate"><span class="pre">video_encode.encode_mp4_chunked</span></code>).
+Each piece restarts x264’s reference chain, which lowers quality for a
+few frames after it; 8 pieces were about 20 ms faster on a 121-frame clip.</p>
+</dd></dl>
+
+<dl class="py property">
+<dt class="sig sig-object py" id="mstar.utils.cpus.CpuPlan.video_encode_threads">
+<span class="property"><span class="k"><span class="pre">property</span></span><span class="w"> </span></span><span class="sig-name descname"><span class="pre">video_encode_threads</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><span class="pre">int</span></a></span><a class="headerlink" href="#mstar.utils.cpus.CpuPlan.video_encode_threads" title="Link to this definition">#</a></dt>
+<dd><p>enough
+for <code class="docutils literal notranslate"><span class="pre">encode_workers</span></code> clips finishing together to encode all their
+pieces at once, as <code class="docutils literal notranslate"><span class="pre">deflate_threads</span></code> is for PNGs.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Type<span class="colon">:</span></dt>
+<dd class="field-odd"><p>Workers of the pool every chunked clip of the process shares</p>
+</dd>
+</dl>
+</dd></dl>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.utils.cpus.CpuPlan.why">
@@ -1555,6 +1578,8 @@ by the cgroup quota rounded down. At least 1.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.CpuPlan.sets"><code class="docutils literal notranslate"><span class="pre">CpuPlan.sets</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.CpuPlan.slot"><code class="docutils literal notranslate"><span class="pre">CpuPlan.slot</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.CpuPlan.usable"><code class="docutils literal notranslate"><span class="pre">CpuPlan.usable</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.CpuPlan.video_chunks"><code class="docutils literal notranslate"><span class="pre">CpuPlan.video_chunks</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.CpuPlan.video_encode_threads"><code class="docutils literal notranslate"><span class="pre">CpuPlan.video_encode_threads</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.CpuPlan.why"><code class="docutils literal notranslate"><span class="pre">CpuPlan.why</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.utils.cpus.CpuPlan.workers"><code class="docutils literal notranslate"><span class="pre">CpuPlan.workers</span></code></a></li>
 </ul>

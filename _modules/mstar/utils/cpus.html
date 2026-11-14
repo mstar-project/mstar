@@ -1273,6 +1273,20 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="nb">min</span><span class="p">(</span><span class="mi">8</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">left</span><span class="p">)</span>
 
     <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">video_chunks</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Pieces one H.264 clip encodes in parallel (``video_encode.encode_mp4_chunked``).</span>
+<span class="sd">        Each piece restarts x264's reference chain, which lowers quality for a</span>
+<span class="sd">        few frames after it; 8 pieces were about 20 ms faster on a 121-frame clip."""</span>
+        <span class="k">return</span> <span class="nb">min</span><span class="p">(</span><span class="mi">4</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">left</span><span class="p">)</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">video_encode_threads</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Workers of the pool every chunked clip of the process shares: enough</span>
+<span class="sd">        for ``encode_workers`` clips finishing together to encode all their</span>
+<span class="sd">        pieces at once, as ``deflate_threads`` is for PNGs."""</span>
+        <span class="k">return</span> <span class="nb">min</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">left</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">encode_workers</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">video_chunks</span><span class="p">)</span>
+
+    <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">encode_workers</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""Outputs the data worker encodes at once. A PNG deflates</span>
 <span class="sd">        ``png_threads`` blocks at once, so the pool times that stays within the</span>

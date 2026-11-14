@@ -1883,7 +1883,10 @@ Cosmos3 environment requirements
 - Generated video containers are written with ``torchcodec``'s ``VideoEncoder``
   when available (torchcodec >= 0.9), otherwise directly with PyAV (``av``,
   ``video_encode.encode_mp4``), whose wheel bundles FFmpeg with libx264; that also
-  covers a torchcodec that cannot load FFmpeg.
+  covers a torchcodec that cannot load FFmpeg. With torchcodec a clip of 48 frames or
+  more encodes in parallel pieces (``video_encode.encode_mp4_chunked``, up to 4, without
+  B-frames), joined into one stream: a keyframe starts each piece, and the file is a few
+  percent larger. A 121-frame 832x480 clip encodes in about half the time of one encode.
 - Sound-enabled video responses mux the AAC track with the ``ffmpeg`` and
   ``ffprobe`` binaries, which must be on ``PATH`` (system packages, not
   pip-installable).
@@ -2011,7 +2014,8 @@ Super checkpoints force. A request in the other regime runs eager.
 ``gen_capture_image`` lists the (height, width) image tiers to capture
 (default 192x320, 480x832 and 720x1280, each still bounded by
 ``graph_max_latent_area``); the Super T2I config captures its 1024x1024
-default.
+default. ``compile_prefill`` (default off) compiles the captured text prefill
+in ``denoise_compile_mode``; the Super T2I config turns it on.
 
 The action policy (``cosmos3_edge_droid``, or ``cosmos3_edge`` with an action
 ``domain_name``) predicts a chunk of robot actions from the current observation:

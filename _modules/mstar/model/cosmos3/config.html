@@ -1608,6 +1608,11 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># compiles mid-traffic; the per-request patchify, rotary tables and</span>
     <span class="c1"># unpatchify run eager.</span>
     <span class="n">compile_denoise_batched</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
+    <span class="c1"># torch.compile the captured understanding-tower prefill (one compile per</span>
+    <span class="c1"># token bucket), in ``denoise_compile_mode``. Its eager norms, rotary and</span>
+    <span class="c1"># copies are about a third of the prefill's GPU time on Super; off by</span>
+    <span class="c1"># default, since it changes the prefix K/V's low bits.</span>
+    <span class="n">compile_prefill</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
     <span class="c1"># Which attention backends the DiT node declares (see</span>
     <span class="c1"># Cosmos3Model.get_node_resources). "dense_gen" (the default) declares the</span>
     <span class="c1"># paged FlashInfer backend the understanding prefill and the captured</span>
@@ -1666,7 +1671,7 @@ window.runMermaid = runMermaid;</script>
     <span class="k">def</span><span class="w"> </span><span class="nf">check_compile</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">"""Reject compile settings that would be read as something else: a</span>
 <span class="sd">        non-boolean switch (a yaml ``"false"`` is truthy) or an unknown mode."""</span>
-        <span class="k">for</span> <span class="n">name</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">"compile_denoise"</span><span class="p">,</span> <span class="s2">"compile_denoise_batched"</span><span class="p">):</span>
+        <span class="k">for</span> <span class="n">name</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">"compile_denoise"</span><span class="p">,</span> <span class="s2">"compile_denoise_batched"</span><span class="p">,</span> <span class="s2">"compile_prefill"</span><span class="p">):</span>
             <span class="n">value</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">)</span>
             <span class="k">if</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">value</span><span class="p">,</span> <span class="nb">bool</span><span class="p">):</span>
                 <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Cosmos3 </span><span class="si">{</span><span class="n">name</span><span class="si">}</span><span class="s2"> must be true or false, got </span><span class="si">{</span><span class="n">value</span><span class="si">!r}</span><span class="s2">."</span><span class="p">)</span>
