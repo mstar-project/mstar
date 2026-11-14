@@ -46,6 +46,26 @@ fn get<'a>(value: &'a Mp, key: &str) -> Option<&'a Mp> {
     pairs.iter().rev().find(|(k, _)| k.as_str() == Some(key)).map(|(_, v)| v)
 }
 
+fn truthy(value: Option<&Mp>) -> bool {
+    match value {
+        None | Some(Mp::Nil) | Some(Mp::Boolean(false)) => false,
+        Some(Mp::Boolean(true)) => true,
+        Some(Mp::Integer(n)) => n.as_i64().is_some_and(|n| n != 0)
+            || n.as_u64().is_some_and(|n| n != 0),
+        Some(Mp::F32(n)) => *n != 0.0,
+        Some(Mp::F64(n)) => *n != 0.0,
+        Some(Mp::String(s)) => !s.as_bytes().is_empty(),
+        Some(Mp::Binary(b)) => !b.is_empty(),
+        Some(Mp::Array(items)) => !items.is_empty(),
+        Some(Mp::Map(items)) => !items.is_empty(),
+        Some(Mp::Ext(..)) => true,
+    }
+}
+
+fn reset_requested(obs: &Mp) -> bool {
+    truthy(get(obs, "reset_context")) || truthy(get(obs, "__reset_context__"))
+}
+
 fn request(data: &[u8], session_id: &str) -> Result<Option<Mp>, String> {
     rmp_serde::from_slice::<serde::de::IgnoredAny>(data)
         .map_err(|_| "invalid msgpack request".to_string())?;
@@ -207,8 +227,7 @@ async fn serve(mut socket: WebSocket, st: AppState, policy: &'static Policy, see
             }
             Err(e) => { failed(&mut socket, &e).await; break; }
         };
-        let reset = get(&obs, "reset_context") == Some(&Mp::Boolean(true))
-            || get(&obs, "__reset_context__") == Some(&Mp::Boolean(true));
+        let reset = reset_requested(&obs);
         if reset { prior_rows = 0; }
         let decode_ms = started.elapsed().as_secs_f64() * 1000.0;
         let infer_started = Instant::now();
@@ -263,5 +282,23 @@ mod tests {
         assert_eq!(session_seed(Some("-1")).unwrap(), (-1, "session_param"));
         assert!(session_seed(Some("1.5")).unwrap_err().contains("signed 64-bit"));
         assert!(session_seed(Some("9223372036854775808")).unwrap_err().contains("signed 64-bit"));
+    }
+
+    #[test]
+    fn reset_flags_follow_observation_truthiness() {
+        for (flag, expected) in [
+            (Mp::Nil, false), (Mp::Boolean(false), false), (Mp::Boolean(true), true),
+            (Mp::from(0), false), (Mp::from(1), true), (Mp::from(-1), true),
+            (Mp::from(""), false), (Mp::from("false"), true),
+            (Mp::Array(vec![]), false), (Mp::Array(vec![Mp::Nil]), true),
+        ] {
+            let obs = Mp::Map(vec![(Mp::from("reset_context"), flag)]);
+            assert_eq!(reset_requested(&obs), expected);
+        }
+        let obs = Mp::Map(vec![
+            (Mp::from("reset_context"), Mp::from(0)),
+            (Mp::from("__reset_context__"), Mp::from(1)),
+        ]);
+        assert!(reset_requested(&obs));
     }
 }

@@ -85,6 +85,10 @@ def _prompt(obs: dict, policy: PositronicPolicy) -> str:
     return prompt
 
 
+def _reset_requested(obs: dict) -> bool:
+    return bool(obs.get("reset_context") or obs.get("__reset_context__"))
+
+
 def _session_seed(raw: str | None) -> tuple[int, str]:
     """Choose one base seed for the connection; the conductor counts calls."""
     source = "session_param"
@@ -186,7 +190,7 @@ async def serve_connection(websocket: WebSocket, api) -> None:
                     await websocket.send_bytes(_pack({"session_id": session_id, "end_session": True}))
                     return
                 assert obs is not None
-                reset = obs.get("reset_context") is True or obs.get("__reset_context__") is True
+                reset = _reset_requested(obs)
                 if reset:
                     prior_rows = 0
                 infer_started = time.monotonic()

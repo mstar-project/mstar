@@ -189,6 +189,24 @@ def test_cold_warm_reset_and_end_match_in_both_frontends():
     assert set(py[2]) == {"result", "effective_prompt", "prompt_original", "timing"}
 
 
+def test_truthy_integer_reset_flags_match_in_both_frontends():
+    def with_reset(session_id, call_index, **extra):
+        flags = {2: {"reset_context": 1}, 4: {"__reset_context__": 1}}
+        return frame(session_id, **flags.get(call_index, {}), **extra)
+
+    stub = Stub()
+    with rust(stub) as port:
+        py = python_session(stub, with_reset, requests=5, reset_last=False)
+        py_calls = list(stub.calls)
+        stub.calls.clear()
+        rs = rust_session(port, with_reset, requests=5, reset_last=False)
+        rs_calls = list(stub.calls)
+    assert _normalise(py) == _normalise(rs)
+    assert [len(m["result"]) for m in py[2:7]] == [21, 24, 21, 24, 21]
+    assert [call[2] for call in py_calls] == [False, False, True, False, True]
+    assert [call[2] for call in rs_calls] == [False, False, True, False, True]
+
+
 def test_praxis_mode_sends_same_original_observation_to_shared_data_worker():
     stub = Stub()
     stub.positronic_policy = PositronicPolicy(
