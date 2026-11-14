@@ -50,6 +50,7 @@ READS = {
 
 
 def _sampler(model, **kw):
+    # Canary's settings are its declared sampler's, which convert to the resource's config
     return sampling_configs(model.get_request_resource_configs([], [], kw), model.declare_state())[SAMPLER]
 
 

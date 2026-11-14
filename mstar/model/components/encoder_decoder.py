@@ -1,8 +1,9 @@
 """The decoder node of an encoder-decoder speech model (Canary): the
-encoder's output written once into a cross-attention context at prefill, then
+encoder's output added once to a cross-attention context at prefill, then
 one token per decode step."""
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import replace
 from typing import Any
 
@@ -15,7 +16,17 @@ from mstar.engine.accelerator_graph_config import (
     PackedAcceleratorGraphConfig,
     geometric_batch_sizes,
 )
-from mstar.engine.resources import AttentionStep, KVStep, Segment, SubmoduleStep
+from mstar.engine.state import (
+    ArrayStep,
+    SampleStep,
+    Segment,
+    SubmoduleStep,
+    at_last_token,
+    last_sampled,
+    position,
+    positions,
+    sample,
+)
 from mstar.model.components.sampled_token_decoder import SampledTokenDecoder
 from mstar.model.submodule_base import ARNodeInputs, ModelInputsFromEngine
 
@@ -25,26 +36,25 @@ class EncoderDecoderNode(SampledTokenDecoder):
     output, ``encoder_states``, and whose decoder cross-attends to it.
 
     It adds the cross-attention part only: the prefill row carries the
-    encoder output, each step declares the context stream's segments (the
-    encoder output's rows on the prefill that writes them, zero after; the
+    encoder output, each step lists the context array's segments (the
+    encoder output's rows on the prefill that adds them, zero after; the
     commit turns that reservation into resident pages), and the decoder gets
-    the absolute positions as a forward argument. The context gets a KV cache
-    of its own, so the self-attention resource never plans over it. The
-    prefill writes the context eagerly in ``preprocess`` (`KVStep.eager_write`),
-    so its graph is sized by the prompt alone: one packed capture per prefill
-    batch size up to ``MAX_PREFILL_BATCH_SIZE``, of ``PREFILL_PROMPT_TOKENS`` a
-    row.
+    the absolute positions as a forward argument. The context is an array of
+    its own, so the self-attention resource never plans over it. The prefill
+    adds the context eagerly in ``preprocess`` (`ArrayStep.eager_add`), so its
+    graph is sized by the prompt alone: one packed capture per prefill batch
+    size up to ``MAX_PREFILL_BATCH_SIZE``, of ``PREFILL_PROMPT_TOKENS`` a row.
 
-    A subclass declares the cross-attention keys below, its self-attention
-    `layer_steps`, ``ATTN_KEY``, ``PREFILL_PROMPT_TOKENS`` and
-    ``MAX_PREFILL_BATCH_SIZE``, which bounds a prefill step's context
-    reservation and its captures. The decoder module provides ``embed(ids)``, ``logits(hidden)``,
-    ``write_cross_kv(encoder_states)``, which writes the context stream, and
-    ``forward(input_embeds, *, label, position_ids)``.
+    A subclass names its self-attention array, its context array and the
+    context's label, ``PREFILL_PROMPT_TOKENS`` and ``MAX_PREFILL_BATCH_SIZE``,
+    which bounds a prefill step's context reservation and its captures. The
+    decoder module provides ``embed(ids)``, ``logits(hidden)``,
+    ``add_context(encoder_states)``, which adds the encoder output to the
+    context array, and ``forward(input_embeds, *, label, position_ids)``.
     """
 
+    KV_CACHE: str
     CROSS_KV_CACHE: str
-    CROSS_ATTN: str
     CONTEXT_LABEL: str
     # the scaffold's text-prefill and mixed captures; this node captures its own prefill
     CAPTURE_PREFILL = False
@@ -91,6 +101,29 @@ class EncoderDecoderNode(SampledTokenDecoder):
             ),
         ]
 
+    def bind_state(self, handles: Mapping[str, Any]) -> None:
+        self.kv, self.sampler = handles[self.KV_CACHE], handles[self.SAMPLER]
+
+    def node_step(
+        self, segments: list[Segment], prefill_tokens: Mapping[int, torch.Tensor], advance: tuple[int, ...] | None,
+    ) -> SubmoduleStep:
+        return SubmoduleStep(
+            segments=segments,
+            state={self.KV_CACHE: ArrayStep(advance=advance), self.SAMPLER: SampleStep(prompt_tokens=prefill_tokens)},
+        )
+
+    def next_position(self, rid_handle: int) -> int:
+        return position(self.kv, rid_handle, "main")
+
+    def loopback_tokens(self, engine_inputs: ModelInputsFromEngine) -> torch.Tensor:
+        return last_sampled(self.sampler)
+
+    def last_token_hidden(self, engine_inputs: ModelInputsFromEngine, hidden: torch.Tensor) -> torch.Tensor:
+        return at_last_token(self.kv, hidden)
+
+    def sample_tokens(self, engine_inputs: ModelInputsFromEngine, logits: torch.Tensor) -> torch.Tensor:
+        return sample(self.sampler, logits)
+
     def max_batch_size(self, graph_walk: str) -> int | None:
         if graph_walk == self.PREFILL_WALK:
             return self.MAX_PREFILL_BATCH_SIZE
@@ -125,10 +158,9 @@ class EncoderDecoderNode(SampledTokenDecoder):
             Segment(request_id=rid, label=self.CONTEXT_LABEL, span=self._context_span(inp))
             for rid, inp in zip(request_ids, inputs, strict=True)
         )
-        return replace(step, steps={
-            **step.steps,
-            self.CROSS_KV_CACHE: KVStep(segments=context, eager_write=graph_walk == self.PREFILL_WALK),
-            self.CROSS_ATTN: AttentionStep(segments=context, causal=False),
+        return replace(step, state={
+            **step.state,
+            self.CROSS_KV_CACHE: ArrayStep(segments=context, eager_add=graph_walk == self.PREFILL_WALK),
         })
 
     def preprocess(
@@ -141,12 +173,12 @@ class EncoderDecoderNode(SampledTokenDecoder):
         if graph_walk == self.PREFILL_WALK:
             # outside the graph; in segment order, which is how the context
             # plan laid out the pages
-            self.model.write_cross_kv(torch.cat([inp.tensor_inputs["encoder_states"] for inp in inputs], dim=0))
+            self.model.add_context(torch.cat([inp.tensor_inputs["encoder_states"] for inp in inputs], dim=0))
         return out
 
     def decoder_kwargs(
         self, graph_walk: str, engine_inputs: ModelInputsFromEngine,
         num_tokens: int, **tensors: torch.Tensor,
     ) -> dict[str, Any]:
-        # the position resource's planned ids (a slot buffer when captured)
-        return {"position_ids": engine_inputs.resources[self.POS_KEY].pos_ids("main")[:num_tokens], **tensors}
+        # the array's planned position ids (a slot buffer when captured)
+        return {"position_ids": positions(self.kv)[:num_tokens], **tensors}

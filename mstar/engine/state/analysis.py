@@ -39,6 +39,7 @@ def state_declaration_problems(model: "Model") -> list[str]:
         problems += _array_problems(array)
     problems += _kv_label_problems(model.kv_labels(), arrays)
     problems += _cross_read_problems(arrays)
+    problems += _regrouping_problems(model, arrays)
     problems += _value_problems(arrays, model.kv_labels())
     for declared in declarations:
         if isinstance(declared, Sampler):
@@ -144,10 +145,31 @@ def _cross_read_problems(arrays: Sequence[Array]) -> list[str]:
             elif not array.nodes <= queried.nodes:
                 problems.append(f"{where}: {read.queries!r} isn't on nodes {sorted(array.nodes - queried.nodes)}, so a "
                                 "step there has no segments to lay the queries out by")
-            elif queried.max_len:
-                problems.append(f"{where}: {read.queries!r} keeps entries, and queries are laid out by the segments "
-                                "of an array with max_len 0")
     return problems
+
+
+def _regrouping_problems(model: "Model", arrays: Sequence[Array]) -> list[str]:
+    regrouped = [
+        *((node, walk, "a chunking policy splits across steps", "leave it out of the policy")
+          for node, policies in model.get_chunking_policies().items() for policy in policies if policy.chunkable
+          for walk in policy.walks),
+        *((node, walk, f"kv_labels()[{array.name!r}][{label!r}] keys for prefix reuse, and a hit can end inside a "
+                       "step", "leave it out of the label's keys")
+          for array in arrays for label, kv_label in model.kv_labels().get(array.name, {}).items()
+          if kv_label.keys is not None for node in array.nodes
+          for walk in (*kv_label.keys.walks, *(grown for grown, _ in kv_label.growth if kv_label.keys.growth))),
+        *((node, walk, f"{node}'s rebuild policy runs it again with the ids sampled after the prompt",
+           "drop the rebuild policy")
+          for node, policy in model.rebuild_policies().items() for walk in policy.walks),
+    ]
+    return [
+        f"Array {array.name!r}.reads[{key!r}]: {type(read.mask).__name__} on walk {walk!r}, which {cause}. "
+        f"{type(read.mask).__name__} sees each step's adds as a whole, so {fix}"
+        for node, walk, cause, fix in regrouped
+        for array in arrays if node in array.nodes
+        for key, read in array.reads.items()
+        if read.mask.sees_step_whole and (read.walks is None or walk in read.walks)
+    ]
 
 
 def _value_problems(arrays: Sequence[Array], kv_labels: Mapping[str, Mapping[str, object]]) -> list[str]:

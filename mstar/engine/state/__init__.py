@@ -8,6 +8,7 @@ from mstar.engine.resources.step import (
     SubmoduleStep,  # noqa: F401
 )
 from mstar.engine.state.calls import (
+    add_read,
     at_last_token,
     causal_conv,
     drew,  # noqa: F401
@@ -28,6 +29,7 @@ from mstar.engine.state.contract import (
     Array,
     ArrayStep,
     Attend,
+    Bidirectional,
     Block,
     Causal,
     CausalConv,
@@ -61,6 +63,7 @@ __all__ = [
     "Array",
     "ArrayStep",
     "Attend",
+    "Bidirectional",
     "Block",
     "Causal",
     "CausalConv",
@@ -85,6 +88,7 @@ __all__ = [
     "TensorType",
     "Value",
     "Window",
+    "add_read",
     "at_last_token",
     "causal_conv",
     "gated_delta_net",
