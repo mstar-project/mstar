@@ -359,6 +359,24 @@ def test_seed_only_session_keeps_call_index_after_idle_expiry(tmp_path, monkeypa
     _complete(conductor, "again")
 
 
+def test_seed_only_call_limit_closes_later_queued_calls(tmp_path, monkeypatch):
+    conductor, _, comm = _conductor(
+        tmp_path, monkeypatch, model_type=_SeedOnlyModel, max_calls=1, max_queued_calls=2,
+    )
+    for rid in ("first", "second", "third"):
+        request = _request(rid, "robot-a")
+        request.model_kwargs["episode_seed"] = 17
+        conductor._ingest_request(request)
+
+    _complete(conductor, "first")
+    failures = {
+        msg.body.request_id: msg.body for _, msg in comm.sent
+        if msg.message_type == "request_failed"
+    }
+    assert failures["second"].status == 400
+    assert failures["third"].status == 410
+
+
 def test_warm_episode_stays_on_first_replica_when_router_would_rotate(tmp_path, monkeypatch):
     conductor, model, comm = _conductor(tmp_path, monkeypatch, replicas=2)
     conductor._ingest_request(_request("first", "robot-a"))
@@ -462,6 +480,22 @@ def test_call_budget_refuses_after_the_first_admitted_call(tmp_path, monkeypatch
     failures = [msg.body for _, msg in comm.sent if msg.message_type == "request_failed"]
     assert any("max_calls=1" in failure.error_message for failure in failures)
     assert any(msg.message_type == WorkerMessageType.END_EPISODE for _, msg in comm.sent)
+
+
+def test_call_budget_closes_later_calls_in_the_waiting_batch(tmp_path, monkeypatch):
+    conductor, _, comm = _conductor(tmp_path, monkeypatch, max_calls=1, max_queued_calls=2)
+    conductor._ingest_request(_request("first", "robot-a"))
+    conductor._ingest_request(_request("second", "robot-a"))
+    conductor._ingest_request(_request("third", "robot-a"))
+
+    _complete(conductor, "first", {"frames": 4})
+    failures = {
+        msg.body.request_id: msg.body for _, msg in comm.sent
+        if msg.message_type == "request_failed"
+    }
+    assert failures["second"].status == 400
+    assert failures["third"].status == 410
+    assert conductor.waiting_queue == []
 
 
 def test_only_one_overlapping_call_is_queued_for_an_episode(tmp_path, monkeypatch):
