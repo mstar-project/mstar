@@ -69,8 +69,9 @@ def _dit(config: Cosmos3Config) -> Cosmos3DiTSubmodule:
 def test_the_declared_specs_are_mains_but_for_the_nodes_the_kv_array_spans():
     specs = _specs(_edge())
     assert set(specs) == {C.KV_CACHE, ATTN, ATTN_GEN, ROPE, C.SEQ_SHARD, SAMPLER, VISION_ATTN}
-    # main bound the generation attention to the DiT alone and the positions to the reasoner alone
-    assert specs[ATTN_GEN].nodes == specs[ROPE].nodes == specs[C.KV_CACHE].nodes == {DIT_NODE, REASONER_NODE}
+    assert specs[ATTN_GEN].nodes == {DIT_NODE}, "the reasoner runs no generation walk"
+    # main bound the positions to the reasoner alone
+    assert specs[ROPE].nodes == specs[C.KV_CACHE].nodes == {DIT_NODE, REASONER_NODE}
     # main listed the windowed and sound walks whether or not the deployment served them
     assert set(specs[C.SEQ_SHARD].walks) == {C.IMAGE_GEN_WALK, C.VIDEO_GEN_WALK, C.ACTION_GEN_WALK,
                                              C.ACTION_VIDEO_GEN_WALK}

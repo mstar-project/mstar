@@ -376,7 +376,8 @@ def node_handles(
     model: "Model", node: str, resources: Mapping[str, Any], *, setup: "StateSetup | None" = None,
     built: dict[str, ArrayHandle | SamplerHandle | ShardHandle] | None = None,
 ) -> dict[str, ArrayHandle | SamplerHandle | ShardHandle]:
-    """``node``'s handles, by declared name, over its built ``resources``, each read bound as ``setup`` binds it.
+    """``node``'s handles, by declared name, over the engine's built ``resources``, each read bound as ``setup`` binds
+    it.
 
     ``built`` maps declared names to the handles this process's other nodes built, and this call adds the ones it
     builds. A node shares the handle another node built for a declaration: nodes can share layers, as BAGEL's LLM
@@ -2154,7 +2155,7 @@ class PagedStorage(Storage):
             if len(windows) > 1:
                 raise _no_layout(array, f"reads {windows} each keep a window, and the pool keeps one a label")
             others = [each for each in bound if each.key not in array.reads]
-            specs, resource_of = self._read_specs(array, reads)
+            specs, resource_of = self._read_specs(array, reads, setup.walks)
             resolved.specs[array.name] = [self._pool(array, setup.walks), *specs, *_op_specs(array, others)]
             resolved.resource_of.update(resource_of | _resources_of(array, others))
         return resolved
@@ -2183,11 +2184,14 @@ class PagedStorage(Storage):
             ),
         )
 
-    def _read_specs(self, array: Array, bound: Sequence[BoundOp]) -> tuple[list[NodeResourceSpec], dict[str, str]]:
+    def _read_specs(
+        self, array: Array, bound: Sequence[BoundOp], walks: "Walks",
+    ) -> tuple[list[NodeResourceSpec], dict[str, str]]:
         """The specs ``array``'s reads build, and the resource key each read runs on.
 
         Raises ``ValueError`` on two specs over one layer, since a layer reads through one resource on every walk. A
-        read's first spec is the one it groups by, and any other is a spec of its own (`OpBinding.leg`), under its key.
+        read's first spec is the one it groups by, and any other is a spec of its own (`OpBinding.leg`), under its key,
+        on the nodes that run one of the read's walks.
         """
         specs: dict[str, NodeResourceSpec] = {}
         legs: list[NodeResourceSpec] = []
@@ -2208,7 +2212,7 @@ class PagedStorage(Storage):
                 raise _no_layout(array, f"reads[{key!r}] builds a second spec under its own key, and its paged spec, "
                                         "which no earlier read shares, would take that key too")
             specs.setdefault(resource_of[key], spec)
-            legs += own
+            legs += [replace(leg, nodes=_running(array, read, walks)) for leg in own]
         reader: dict[int, str] = {}
         for key, read in array.reads.items():
             for layer in sorted(read_layers(array, read)):
@@ -2275,6 +2279,13 @@ def _check_sink(array: Array, label: str, key: str, policy: RetentionPolicy, lay
             raise RuntimeError(f"{where}: a span of walk {span.walk!r} ends at entry {end}, past the "
                                f"{policy.protected_prefix} entries reads[{key!r}]'s kept window never releases, so the "
                                "reads on that walk would reach released entries")
+
+
+def _running(array: Array, read: Read, walks: "Walks") -> frozenset[str]:
+    """The nodes of ``array`` that run one of ``read``'s walks, or all of them where ``walks`` names none."""
+    if not walks.nodes:
+        return array.nodes
+    return array.nodes & frozenset().union(*(nodes for walk, nodes in walks.nodes.items() if runs_on_walk(read, walk)))
 
 
 def _leader(array: Array, walks: "Walks") -> str | None:

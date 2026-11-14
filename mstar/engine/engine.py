@@ -915,7 +915,8 @@ class Engine:
             )
             submodule.bind_node_resources(resources)
             handles = {} if model is None else node_handles(
-                model, node_name, resources, setup=self._state_setup, built=shared,
+                # the engine's: a node shares the handle another built, and can hold a resource that one doesn't
+                model, node_name, self._resources, setup=self._state_setup, built=shared,
             )
             if handles:
                 bind_state_ops(handles)
