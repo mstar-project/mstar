@@ -262,6 +262,21 @@ def test_a_step_with_nothing_to_emit_replays_nothing(monkeypatch):
     assert got.numel() == 0 and got.dtype == torch.int16 and seen == []
 
 
+def test_a_stream_puts_a_tensor_on_its_mel_edge_only_while_frames_are_pending(monkeypatch):
+    cfg = _config()
+    hift = _hift(cfg)
+    rig = _rig(cfg, hift, monkeypatch)
+    _open(rig, 4)
+    mel = _mel(65, 11)
+    pieces, carried = [], []
+    with torch.no_grad():
+        for start, end in ((0, 5), (5, 35), (35, 65)):
+            pieces += _step(rig.node, rig.streams, [4], [mel[:, start:end]], [end == 65], rig.runners)
+            carried.append([tuple(pending.shape) for pending in rig.streams[4][1]])
+        _close(torch.cat(pieces), _eager(cfg, hift, mel, [5, 30, 30]))
+    assert carried == [[(mel.shape[0], 5)], [], []], "a chunk that leaves nothing pending would copy a placeholder"
+
+
 def test_a_replays_samples_outlive_the_next_replay(monkeypatch):
     cfg = _config()
     rig = _rig(cfg, _hift(cfg), monkeypatch)
