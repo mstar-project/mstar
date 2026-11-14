@@ -2542,13 +2542,16 @@ teacher-forced DiT step is 1.4-3.8% rel L2 off, where the base port on the same 
 The attention kernel is a resource's setting: ``backend: sdpa`` on the ``dit_attn`` and
 ``refiner_attn`` resources runs the reference's kernel. Without it the GPU's ``ragged_attention``
 table picks the kernel, and FlashInfer runs where no table covers the GPU. On a B300 (``sm_103``)
-the table runs H3's 56 heads on torch's cuDNN SDPA, eagerly one call for the request rows and one
-for the padding rows: the same mp4 as FlashInfer's cuDNN path, from a cuDNN engine that draws
-less power. The B300 holds its power cap through the DiT, so every kernel clocks higher
-(1,308-1,312 MHz against 1,282): 50 points take 123.2-123.3 s instead of 125.0-125.1 s, where
-SGLang takes 122.8-123.1 s (one B300, ``configs/minimax_h3_1gpu.yaml``, 1344x768x124, same
-window). SDPA on ``dit_attn`` is refused on SP ranks, which every shipped config but
-``minimax_h3_2gpu.yaml`` is.
+the table runs H3's 56 heads on FlashAttention 4's dense forward, eagerly one call for the request
+rows and one for the padding rows, which keeps FA4's 2-CTA tile at head dim 128 (its varlen call,
+``backend: fa4``, drops it). Against torch's cuDNN SDPA in the same two calls, with the cuDNN that
+torch 2.12.1 pins (9.20), 50 points take 117.3-117.4 s instead of 122.1-122.6 s, where SGLang
+takes 117.9-120.5 s, and FastH3's 8 forwards 20.9 s instead of 21.7 s (one B300,
+``configs/minimax_h3_1gpu.yaml``, 1344x768x124, same window). With cuDNN 9.24 FastH3 takes 20.9 s
+instead of 21.1 s. The clip is not the cuDNN one bit for bit: both kernels are as far from an fp64
+attention (2.3e-3 rel L2), and 49 steps carry the difference to 27.7 dB, inside the spread of
+FlashInfer's FA2 against its FA3 (22-30 dB). SDPA on ``dit_attn`` is refused on SP
+ranks, which every shipped config but ``minimax_h3_2gpu.yaml`` is.
 
 Async scheduling is on for the DiT and the decoder, the default for parallel nodes
 (``tp_async_sched: false`` turns it off); on and off measured within noise. Runtime needs:
