@@ -765,6 +765,9 @@ class Wan22VaeDecoderSubmodule(_Fp32IslandMixin, NodeSubmodule):
     still never wraps the forward; only the decoder's steady-state call is
     compiled.
 
+    With ``config.vae_decode_fast_math`` (opt-in, near-lossless) the fast decode runs
+    ``wan_vae.rewrite_decoder``'s decoder, every call compiled.
+
     With ``config.vae_decode_kernel`` (opt-in, near-lossless) every untiled decode
     runs on the Wan2.2-VAE kernels (``mstar.model.components.wan22_vae_kernel``, Hopper and Blackwell)
     where they can run, at any size and with nothing compiled; elsewhere the knob is
@@ -805,11 +808,12 @@ class Wan22VaeDecoderSubmodule(_Fp32IslandMixin, NodeSubmodule):
             from mstar.model.components import wan_vae
 
             # this VAE instance is the decoder node's own
-            self._fast = wan_vae.FastDecoder(self.vae)
+            self._fast = wan_vae.FastDecoder(self.vae, rewrite=config.vae_decode_fast_math)
             logger.info(
-                "Wan2.2 VAE decode: untiled %s on the shared Wan VAE decoder (channels-last, compiled); "
+                "Wan2.2 VAE decode: untiled %s on the shared Wan VAE decoder (channels-last, compiled%s); "
                 "other sizes decode stock",
                 ", ".join(f"{w}x{h}" for w, h in sorted(self._fast_sizes)),
+                ", rewritten: vae_decode_fast_math" if config.vae_decode_fast_math else "",
             )
 
     def max_batch_size(self, graph_walk: str):

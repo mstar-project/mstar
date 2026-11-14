@@ -2290,6 +2290,16 @@ tiles only when free VRAM at decode time is short of the untiled estimate
 32 GiB card. No CUDA-graph capture, no continuous batching (one request per
 step) and no component offload.
 
+**Rewritten fast decode (opt-in, near-lossless).** ``vae_decode_fast_math: true`` (both variants;
+needs ``vae_decode_fast``) runs the shared Wan VAE decoder with three rewrites
+(``wan_vae.rewrite_decoder``): every decoder call compiled (diffusers marks a clip's start with a
+``"Rep"`` string in the cache, which kept a clip's first two calls eager; the rewrite stores the two
+zero frames it stands for), nearest-x2 + 3x3 conv as one stride-2 transposed conv (4 taps an output
+pixel instead of 9, no 2x-upsampled tensor), and the mid-block attention as two GEMMs around an fp32
+softmax. On one B300 the A14B (Wan2.1 VAE) decode takes 0.83 s instead of 1.02 s at 1280x720x81, and
+0.37 s instead of 0.44 s at 832x480x81. Same math, rounded differently: 55.2 / 55.0 dB from an fp32
+decode where the default is 55.0 / 54.8 dB, LPIPS unchanged.
+
 **VAE kernels (opt-in, near-lossless).** ``vae_decode_kernel: true`` (TI2V-5B and
 FastWan only) decodes on the Wan2.2-VAE kernels in ``components/wan22_vae_kernel``: FastVideo's
 decoder (Winograd 3x3 convolutions, phase-split upsampling, fused norms; Apache-2.0), generalized

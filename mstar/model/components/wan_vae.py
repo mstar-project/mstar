@@ -9,6 +9,10 @@ conv keeps the last frames of its input, and the next call continues from them
 exactly as one decode of the whole stream would. ``to_channels_last`` switches
 the decode path to channels-last weights and activations, the layout cuDNN's
 conv3d kernels run in, so no conv pays a layout conversion on the way in or out.
+``rewrite_decoder`` (opt-in, near-lossless) changes how three pieces of the decode
+are computed: the temporal upsamplers leave zero frames for the clip start instead
+of diffusers' "Rep" marker, so every call can run compiled; nearest-x2 + 3x3 conv
+runs as one stride-2 transposed conv; the mid-block attention runs as two GEMMs.
 """
 
 from __future__ import annotations
@@ -78,6 +82,100 @@ class ChannelsLastUpsample(WanUpsample):
         return super().forward(x.contiguous(memory_format=torch.channels_last))
 
 
+# frames a temporal upsampler's causal conv keeps between calls (diffusers' CACHE_T)
+_CACHE_T = 2
+
+# Per axis, the taps of nearest-x2 then a 3x3 conv (pad 1) as a stride-2 transposed conv with a 4-tap kernel
+# (padding 1): output row 2i takes input rows i-1, i with taps (W0, W1 + W2), row 2i + 1 rows i, i + 1 with
+# (W0 + W1, W2), which is the transposed conv's K = [W2, W1 + W2, W0 + W1, W0]. Row k of this matrix is K[k].
+_PHASE_TAPS = ((0.0, 0.0, 1.0), (0.0, 1.0, 1.0), (1.0, 1.0, 0.0), (1.0, 0.0, 0.0))
+
+
+def phase_upsample_weight(conv: nn.Conv2d) -> torch.Tensor:
+    """``conv``'s 3x3 weight ``[co, ci, 3, 3]`` as the ``[ci, co, 4, 4]`` weight of the stride-2 transposed conv
+    that equals nearest-x2 then ``conv``: the taps summed in fp64, rounded once to ``conv``'s dtype."""
+    taps = torch.tensor(_PHASE_TAPS, dtype=torch.float64, device=conv.weight.device)
+    weight = torch.einsum("hr,oirs,ks->iohk", taps, conv.weight.detach().double(), taps)
+    return weight.to(conv.weight.dtype).contiguous(memory_format=torch.channels_last)
+
+
+class RewrittenResample(WanResample):
+    """``WanResample`` for ``rewrite_decoder``, same math up to rounding.
+
+    At the clip start a temporal upsampler stores two zero frames where diffusers stores
+    "Rep". "Rep" makes the next call pad its causal conv with zeros, and these frames are
+    that padding (bit for bit in eager), but the next call is now a steady-state call that
+    reuses the steady-state compiled graph. Nearest-x2 then the 3x3 conv runs as one
+    stride-2 transposed conv (``phase_weight``): 4 taps an output pixel instead of 9, and
+    no 2x-upsampled tensor."""
+
+    def forward(self, x, feat_cache=None, feat_idx=[0]):  # noqa: B006 (diffusers' signature)
+        if self.mode not in ("upsample2d", "upsample3d"):
+            return super().forward(x, feat_cache, feat_idx)
+        if self.mode == "upsample3d" and feat_cache is not None:
+            x = self._upsample_time(x, feat_cache, feat_idx)
+        b, c, t, h, w = x.size()
+        x = self._upsample_space(x.permute(0, 2, 1, 3, 4).reshape(b * t, c, h, w))
+        return x.view(b, t, x.size(1), x.size(2), x.size(3)).permute(0, 2, 1, 3, 4)
+
+    def _upsample_time(self, x: torch.Tensor, feat_cache: list, feat_idx: list) -> torch.Tensor:
+        b, c, t, h, w = x.size()
+        idx = feat_idx[0]
+        feat_idx[0] += 1
+        if feat_cache[idx] is None:
+            feat_cache[idx] = x.new_zeros(b, c, _CACHE_T, h, w).contiguous(memory_format=torch.channels_last_3d)
+            return x
+        cache_x = x[:, :, -_CACHE_T:].clone()
+        if cache_x.shape[2] < _CACHE_T:
+            cache_x = torch.cat([feat_cache[idx][:, :, -1:].to(cache_x.device), cache_x], dim=2)
+        x = self.time_conv(x, feat_cache[idx])
+        feat_cache[idx] = cache_x
+        x = x.reshape(b, 2, c, t, h, w)
+        return torch.stack((x[:, 0], x[:, 1]), 3).reshape(b, c, t * 2, h, w)
+
+    def _upsample_space(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.contiguous(memory_format=torch.channels_last)
+        return F.conv_transpose2d(x, self.phase_weight, self.resample[1].bias, stride=2, padding=1)
+
+
+class RewrittenAttentionBlock(WanAttentionBlock):
+    """``WanAttentionBlock`` for ``rewrite_decoder``: the single-head attention (head dim 384
+    on the Wan2.1 VAE, 1024 on Wan2.2's, past every flash kernel) as fp32 scores from one
+    GEMM, a softmax and a second GEMM, instead of SDPA's memory-efficient kernel."""
+
+    def forward(self, x):
+        identity = x
+        b, c, t, h, w = x.size()
+        x = x.permute(0, 2, 1, 3, 4).reshape(b * t, c, h, w)
+        x = self.norm(x)
+        q, k, v = self.to_qkv(x).reshape(b * t, c * 3, h * w).permute(0, 2, 1).chunk(3, dim=-1)
+        if q.dtype not in (torch.float16, torch.bfloat16):
+            scores = torch.bmm(q, k.transpose(1, 2))
+        elif q.is_cuda:
+            scores = torch.bmm(q, k.transpose(1, 2), out_dtype=torch.float32)
+        else:
+            scores = torch.bmm(q.float(), k.float().transpose(1, 2))
+        p = torch.softmax(scores * c**-0.5, dim=-1).to(v.dtype)
+        x = torch.bmm(p, v).permute(0, 2, 1).reshape(b * t, c, h, w)
+        x = self.proj(x)
+        return x.view(b, t, c, h, w).permute(0, 2, 1, 3, 4) + identity
+
+
+def rewrite_decoder(vae: nn.Module) -> None:
+    """Switch ``vae``'s decoder to ``RewrittenResample`` / ``RewrittenAttentionBlock``, in
+    place; idempotent. ``to_default_layout`` switches it back."""
+    for module in vae.decoder.modules():
+        if type(module) is WanResample and module.mode in ("upsample2d", "upsample3d"):
+            module.register_buffer("phase_weight", phase_upsample_weight(module.resample[1]), persistent=False)
+            module.__class__ = RewrittenResample
+        elif type(module) is WanAttentionBlock:
+            module.__class__ = RewrittenAttentionBlock
+
+
+def is_rewritten(vae: nn.Module) -> bool:
+    return any(isinstance(m, (RewrittenResample, RewrittenAttentionBlock)) for m in vae.decoder.modules())
+
+
 def to_channels_last(vae: nn.Module) -> None:
     """Channels-last weights and activations for ``vae``'s decode path
     (``post_quant_conv`` and ``decoder``), in place; idempotent. The encoder
@@ -113,14 +211,16 @@ _DEFAULT_LAYOUT_CLASS = {
     ChannelsLastCausalConv3d: WanCausalConv3d,
     ChannelsLastConv2d: nn.Conv2d,
     ChannelsLastUpsample: WanUpsample,
+    RewrittenResample: WanResample,
+    RewrittenAttentionBlock: WanAttentionBlock,
 }
 
 
 def to_default_layout(vae: nn.Module) -> None:
-    """Undo ``to_channels_last``, in place; idempotent. The weights become
-    contiguous again (the layout they load in) and the modules their diffusers
-    classes, so ``vae.decode`` is stock ``vae.decode`` bit for bit."""
-    if not is_channels_last(vae):
+    """Undo ``to_channels_last`` (and ``rewrite_decoder``), in place; idempotent. The
+    weights become contiguous again (the layout they load in) and the modules their
+    diffusers classes, so ``vae.decode`` is stock ``vae.decode`` bit for bit."""
+    if not is_channels_last(vae) and not is_rewritten(vae):
         return
     if is_height_sharded(vae):
         # its layers expect a row shard; a stock decode would hand them whole frames
@@ -263,8 +363,12 @@ class DecoderStep:
     a few uint8 levels apart.
     """
 
-    def __init__(self, vae: nn.Module, compile: bool, deterministic: bool = False):
+    def __init__(self, vae: nn.Module, compile: bool, deterministic: bool = False, compile_clip_start: bool = False):
         self.compiled = compile
+        # The clip-start call compiled too, as its own graph: for a decoder whose temporal
+        # upsamplers leave no "Rep" marker (``rewrite_decoder``), so the second call is a
+        # steady-state one and every call runs compiled.
+        self.compile_clip_start = compile_clip_start
         self._decoder = vae.decoder
         self._fn = compile_decode(self._decoder.forward, deterministic=deterministic) if compile else None
         self._warmed: set[tuple] = set()
@@ -275,18 +379,19 @@ class DecoderStep:
         self.key_extra: Callable[[], tuple] = tuple
 
     def __call__(self, x: torch.Tensor, feat_cache: list, first_chunk: bool = False) -> torch.Tensor:
-        if not self.compiled or first_chunk or any(isinstance(t, str) for t in feat_cache):
+        if (not self.compiled or (first_chunk and not self.compile_clip_start)
+                or any(isinstance(t, str) for t in feat_cache)):
             return self._decoder(x, feat_cache=feat_cache, feat_idx=[0], first_chunk=first_chunk)
         # A slice of a clip keeps the clip's batch stride, which the compiled
         # graph guards on: without this, every new clip length recompiles.
         x = _compact(x)
         if x.dtype == torch.bfloat16:
-            key = (tuple(x.shape), x.stride(), _cache_signature(feat_cache), self.key_extra())
+            key = (tuple(x.shape), x.stride(), _cache_signature(feat_cache), self.key_extra(), first_chunk)
             if key not in self._warmed:
                 scratch = type(feat_cache)(t.clone() if torch.is_tensor(t) else t for t in feat_cache)
-                self._fn(x, feat_cache=scratch, feat_idx=[0])
+                self._fn(x, feat_cache=scratch, feat_idx=[0], first_chunk=first_chunk)
                 self._warmed.add(key)
-        out = self._fn(x, feat_cache=feat_cache, feat_idx=[0])
+        out = self._fn(x, feat_cache=feat_cache, feat_idx=[0], first_chunk=first_chunk)
         compact_feat_cache(feat_cache)
         return out
 
@@ -344,17 +449,25 @@ class FastDecoder:
     made in it is an inference tensor, whose dispatch keys the compiled graph's
     parameter guards reject (a recompile)."""
 
-    def __init__(self, vae: nn.Module, *, channels_last: bool = True, compile: bool = True, deterministic: bool = True):
+    def __init__(self, vae: nn.Module, *, channels_last: bool = True, compile: bool = True, deterministic: bool = True,
+                 rewrite: bool = False):
         self.vae = vae
         self.channels_last = channels_last
-        if channels_last:
-            self._use_layout(True)
-        self.step = DecoderStep(vae, compile=compile, deterministic=deterministic)
+        # ``rewrite_decoder`` (opt-in, near-lossless), with every call compiled
+        self.rewrite = rewrite
+        self._use_layout(True)
+        self.step = DecoderStep(vae, compile=compile, deterministic=deterministic, compile_clip_start=rewrite)
 
-    def _use_layout(self, channels_last: bool) -> None:
-        if channels_last != is_channels_last(self.vae):
+    def _use_layout(self, decode_layout: bool) -> None:
+        """``decode_layout``: this decode's (channels-last if set, rewritten if set), else stock."""
+        want = (self.channels_last, self.rewrite) if decode_layout else (False, False)
+        if want != (is_channels_last(self.vae), is_rewritten(self.vae)):
             with torch.inference_mode(False):
-                (to_channels_last if channels_last else to_default_layout)(self.vae)
+                to_default_layout(self.vae)
+                if want[0]:
+                    to_channels_last(self.vae)
+                if want[1]:
+                    rewrite_decoder(self.vae)
 
     def use_stock_layout(self) -> None:
         """Switch the VAE to the layout it loaded in, for a stock ``vae.decode``."""
@@ -372,7 +485,7 @@ class FastDecoder:
         self, z: torch.Tensor, feat_cache: list, *, clip_start: bool, latents_per_call: int = 1,
     ) -> torch.Tensor:
         """``decode_causal`` continuing the stream whose cache is ``feat_cache``."""
-        self._use_layout(self.channels_last)
+        self._use_layout(True)
         with torch.autocast(device_type=z.device.type, enabled=False):
             return decode_causal(
                 self.vae, z, feat_cache, self.step, clip_start=clip_start, latents_per_call=latents_per_call,
