@@ -14,7 +14,7 @@ import torch
 
 from mstar.conductor.conductor import Conductor, _with_chunk_causal_layout, _with_planned_state_layout
 from mstar.conductor.request_info import CurrentForwardPassInfo, WalkStep
-from mstar.engine.accelerator_graph_runner import PiecewiseAcceleratorGraphRunner
+from mstar.engine.accelerator_graph_runner import PiecewiseAcceleratorGraphRunner, dummy_metadata
 from mstar.engine.resources.attn.ragged.chunk_causal import dense_visibility
 from mstar.engine.resources.attn.ragged.config import RaggedChunkCausalAttentionSpec
 from mstar.engine.resources.base import EngineResourceInfo, build_resource
@@ -210,6 +210,35 @@ def test_two_request_layouts_reach_binding_and_plan_without_cross_request_visibi
     assert torch.equal(actual, expected)
     assert not actual[:segments[0].span, segments[0].span:].any()
     assert not actual[segments[0].span:, :segments[0].span].any()
+
+
+@pytest.mark.parametrize("capture_info", [False, True])
+def test_padded_chunk_layout_with_capture_or_replay_metadata(capture_info):
+    array = _array()
+    handles = node_handles(
+        SimpleNamespace(declare_state=lambda: [array]), "dit",
+        {"attn": SimpleNamespace(run=lambda *args, **kwargs: None)},
+    )
+    info = CurrentForwardPassInfo(
+        request_id="r0", graph_walk="encode", fwd_index=0, random_seed=0, max_tokens=1,
+        step_metadata={CHUNK_CAUSAL_LAYOUT_KWARG: {"tokens": {"main": {"attn": [4, 16, 8]}}}},
+    )
+    segments = (Segment("r0", "main", 28), Segment(-2, "main", 8))
+    infos = {"r0": info}
+    if capture_info:
+        infos.update(dummy_metadata([-2], "encode"))
+    expanded = state_steps(
+        SubmoduleStep(segments=segments, state={"tokens": ArrayStep()}),
+        handles, per_request_info=infos,
+    )
+    layouts = expanded.steps["attn"].layouts
+    assert layouts == (
+        chunk_causal_resource_layout(array.reads["attn"].mask, _lengths()),
+        chunk_causal_resource_layout(array.reads["attn"].mask, ChunkCausalLayout(global_len=8, noised_len=0)),
+    )
+    visibility = dense_visibility(layouts)
+    assert not visibility[:28, 28:].any()
+    assert not visibility[28:, :28].any()
 
 
 def test_missing_or_misaligned_real_request_layout_is_refused():
