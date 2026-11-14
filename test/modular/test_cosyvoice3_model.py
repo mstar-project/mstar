@@ -25,12 +25,15 @@ from types import SimpleNamespace
 import pytest
 import torch
 import yaml
+from test_graph_runtime import _ingest, _store_outputs
+from test_streaming_consumer_loop import _Rust
 
 from mstar.api_server.openai import adapters
 from mstar.api_server.openai.protocol import SpeechRequest
 from mstar.engine.resources.position.config import PositionConfig
 from mstar.engine.resources.step import StepContext
 from mstar.engine.state.adapters import node_handles, node_resources
+from mstar.graph.base import GraphEdge, TensorPointerInfo
 from mstar.model.base import TensorAndMetadata
 from mstar.model.chatterbox.chatterbox_model import voice_key_for
 from mstar.model.cosyvoice3.components.dit import _SinusEmbedding, chunk_attention_mask
@@ -47,6 +50,8 @@ from mstar.model.cosyvoice3.components.sampling import hashed_uniform, ras_sampl
 from mstar.model.cosyvoice3.config import (
     END_OF_PROMPT,
     END_OF_PROMPT_ID,
+    FLOW_NODE,
+    HIFT_NODE,
     LM_ATTN,
     LM_KV,
     LM_LABEL,
@@ -1616,6 +1621,75 @@ def test_flow_estimator_is_bfloat16_unless_the_deployment_asks_for_float32(tmp_p
     assert mel.dtype == torch.float32 and torch.isfinite(mel).all()
     with pytest.raises(ValueError, match="Unknown dtype"):
         CosyVoice3Model(model_path_hf=str(tmp_path), flow_estimator_dtype="int8")
+
+
+class _StubEncoder:
+    """Hands out one voice and counts the clips it conditions."""
+
+    def __init__(self, made: ReferenceVoice):
+        self.made, self.clips = made, 0
+
+    def voice(self, wav: torch.Tensor) -> ReferenceVoice:
+        self.clips += 1
+        return self.made
+
+
+def _flow_chunk(node, key: int, tokens: torch.Tensor, edges: dict, final: bool = False) -> dict:
+    """One chunk of a stream through the flow node, its clip beside what its last chunk looped back."""
+    info = SimpleNamespace(rid_handle=key, request_id=key, step_metadata={"n_cfm_timesteps": 3, VOICE_KEY: key})
+    inputs = {SPEECH_TOKENS: [tokens], "ref_audio": [_clip()], **edges}
+    p = node.prepare_inputs("token2wav", info, inputs, is_final_stream_chunk=final)
+    out = node.forward("token2wav", None, **node.preprocess("token2wav", None, [p]))
+    return {name: value for name, value in out.items() if name not in (MEL, MEL_FINAL)}
+
+
+def test_a_stream_conditions_its_voice_once_and_loops_back_only_its_counts_and_tokens():
+    cfg = _tiny_config()
+    encoder = _StubEncoder(_voice(cfg, 10))
+    node = FlowSubmodule(_random_flow(cfg), encoder, cfg)
+    tokens = torch.randint(3, 40, (60,), generator=torch.Generator().manual_seed(0))
+    with torch.no_grad():
+        edges = _flow_chunk(node, 7, tokens[:30], {})
+        assert set(edges) == {FLOW_COUNTS, RAW_TOKENS}, "a voice on an edge is copied on every chunk"
+        _flow_chunk(node, 7, tokens, edges, final=True)
+    assert encoder.clips == 1, "the second chunk should read the cached voice"
+
+
+def test_a_voice_the_cache_dropped_mid_stream_is_conditioned_again_from_the_clip():
+    cfg = _tiny_config(voice_cache_size=1)
+    encoder = _StubEncoder(_voice(cfg, 10))
+    node = FlowSubmodule(_random_flow(cfg), encoder, cfg)
+    tokens = torch.randint(3, 40, (60,), generator=torch.Generator().manual_seed(0))
+    with torch.no_grad():
+        edges = _flow_chunk(node, 7, tokens[:30], {})
+        _flow_chunk(node, 8, tokens[:30], {})
+        _flow_chunk(node, 7, tokens, edges, final=True)
+    assert encoder.clips == 3, "the stream's second chunk has only its clip to get the voice from"
+
+
+def test_the_token2wav_loop_hands_the_flow_its_clip_on_every_chunk(model, tmp_path):
+    (loop,) = [wg.section for wg in model.get_worker_graphs(str(CONFIG_PATH)) if "token2wav" in wg.graph_walks]
+    graph = _Rust(loop, set(loop.get_nodes()), tmp_path)
+    clip = _clip()
+    stored = _store_outputs(graph.tm.tensor_store, graph.tm._uuid_minter, graph.rid, {"ref_audio": [clip]})
+    info = TensorPointerInfo(
+        dims=tuple(clip.shape), dtype=clip.dtype, stride=clip.stride(), nbytes=clip.nbytes, address=clip.data_ptr(),
+        uuid=stored["ref_audio"][0], source_session_id="s", source_entity="worker_0",
+    )
+    entry = GraphEdge(name="ref_audio", next_node=FLOW_NODE, tensor_info=[info])
+    assert _ingest(graph.runtime, graph.rid, [entry]) == []
+    for name in (FLOW_COUNTS, RAW_TOKENS):
+        graph.ingest(name, FLOW_NODE)
+    for name in (HIFT_COUNTS, HIFT_MEL):
+        graph.ingest(name, HIFT_NODE)
+    for _ in range(3):
+        graph.chunk(SPEECH_TOKENS, FLOW_NODE)
+        inputs = graph.inputs(FLOW_NODE)
+        assert set(inputs) == {SPEECH_TOKENS, "ref_audio", FLOW_COUNTS, RAW_TOKENS}
+        (held,) = inputs["ref_audio"]
+        assert torch.equal(graph.tm.tensor_store.get_tensor(held), clip), "a chunk after the first would have no clip"
+        graph.complete(FLOW_NODE, {name: [torch.ones(1)] for name in (MEL, MEL_FINAL, FLOW_COUNTS, RAW_TOKENS)})
+        graph.complete(HIFT_NODE, {AUDIO_CHUNK: [torch.ones(1)], HIFT_COUNTS: [torch.ones(1)], HIFT_MEL: []})
 
 
 # -- HiFT -----------------------------------------------------------------------------
