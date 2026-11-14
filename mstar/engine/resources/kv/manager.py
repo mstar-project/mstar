@@ -2718,7 +2718,7 @@ class KVManager(AttentionResource):
 
     def _exact(self, rid: str, label: str) -> RetentionPolicy | None:
         """The exact retention ``rid``'s layout keeps on ``label``, which a kept-window read reaches through. None
-        under a retention of whole pages too, since a read reaches every entry those leave."""
+        for a retention of whole pages, under which a read reaches every entry the stream holds."""
         policy = self._retentions.get(rid, {}).get(label)
         return policy if policy is not None and policy.exact else None
 

@@ -990,7 +990,7 @@ class RetentionPolicy:
     generation): once the committed tokens behind ``protected_prefix`` exceed
     ``context_budget``, the oldest unprotected pages are released.
 
-    ``KVManager.commit`` applies it, a request layout's exact one to its
+    ``KVManager.commit`` applies it, a request layout's to its
     stream (``LabelLayout.retention``) and a window group's to the group's
     layers, so the release happens between steps as far as every planner is
     concerned: a pre-plan of the next step gates on

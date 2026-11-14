@@ -712,7 +712,7 @@ def test_an_exact_window_on_a_pool_with_window_groups_is_refused_at_intake():
         request.validate(spec)
 
 
-def test_a_removed_request_leaves_the_exact_set():
+def test_a_removed_request_leaves_its_retention_behind():
     """A handle comes back for another request, which would inherit the policy."""
     pool = _pool()
     _open_exact(pool, "a", sink=3, window=8)

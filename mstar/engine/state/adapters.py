@@ -1036,7 +1036,7 @@ PAGE_WINDOW_ATTEND = PageWindowAttend()
 
 
 class PageWindowEagerDense(PageWindowAttend, EagerDenseAttend):
-    """`EagerDenseAttend` through a kept window cut on the pool's pages."""
+    """`PageWindowAttend` with the dense kernel on its eager steps, whose prefix is every entry the row holds."""
 
 
 class PagedReach(KeptWindowBinding):

@@ -146,7 +146,8 @@ class Bidirectional(Mask):
 
     With ``whole_pages`` too, the cut falls on the pages the array is stored in. The row loses whole pages from the
     first one past ``sink``, while more than ``window`` entries would stay behind ``sink``, and sees every entry it
-    still holds: those that share the last page of ``sink``, and under a page more than ``window`` in all."""
+    still holds: under a page more than ``window`` in all. The entries that share the last page of ``sink`` are never
+    lost and count among them, so the latest entries it sees can fall that many short of ``window``."""
 
     uses_query_position = False
     sees_step_whole = True
