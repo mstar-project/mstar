@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+from dataclasses import replace
 from types import SimpleNamespace
 
 sys.path.insert(0, ".")
@@ -100,6 +101,17 @@ def test_request_layout_checks_read_key_before_dropping_within_step_kv_layout():
         kv_layouts([array], {"tokens": {"main": Layout(chunk_causal={"other": _lengths()})}}, {})
     with pytest.raises(RuntimeError, match="must be a ChunkCausalLayout"):
         kv_layouts([array], {"tokens": {"main": Layout(chunk_causal={"attn": "bad"})}}, {})
+
+
+def test_walk_overlay_can_replace_one_read_without_omitting_request_lengths():
+    base = _array()
+    array = replace(base, reads={**base.reads, "other": base.reads["attn"]})
+    partial = {"tokens": {"main": Layout(chunk_causal={"attn": _lengths()})}}
+    with pytest.raises(RuntimeError, match="missing reads \\['other'\\]"):
+        chunk_causal_layouts([array], partial)
+    assert chunk_causal_layouts([array], partial, require_all=False) == {
+        "tokens": {"main": {"attn": [4, 16, 8]}},
+    }
 
 
 def test_two_request_layouts_reach_binding_and_plan_without_cross_request_visibility():
