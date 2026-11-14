@@ -355,7 +355,7 @@ _COSMOS3_LOOPS = {
 
 
 def _cosmos3_prefilled(tmp_path, prompt, outputs, kwargs):
-    """A Cosmos3 request through ``process_prompt``, its plan and the DiT's prefill."""
+    """A Cosmos3 request through ``process_prompt`` and its plan, and the DiT's settings for its first denoise step."""
     from test_cosmos3_edge_model import _model
 
     from mstar.model.cosmos3.submodules import Cosmos3DiTSubmodule
@@ -367,11 +367,9 @@ def _cosmos3_prefilled(tmp_path, prompt, outputs, kwargs):
     dit._new_scheduler = lambda steps, *args, **kw: SimpleNamespace(timesteps=torch.arange(steps))
 
     output = model.process_prompt(prompt, ["text"], outputs, tensors={}, **kwargs)
-    plan = model.walk_plan("default", ["text"], outputs, {"text_inputs": []}, kwargs)
-    info = CurrentForwardPassInfo(request_id="r", graph_walk=plan[0].walk, fwd_index=0, random_seed=0, max_tokens=1,
-                                  rid_handle="r", step_metadata=dict(plan[0].step_metadata))
-    dit.prepare_inputs(plan[0].walk, info, {"text_inputs": output.new_input_tensors.get("text_inputs", [])})
-    return model, dit, output, plan
+    plan = model.walk_plan("default", ["text"], outputs, {"text_inputs": []}, {**kwargs, **output.metadata})
+    settings = dit._settings(dict(plan[1].step_metadata), 0, {}, torch.device("cpu"))
+    return model, settings, output, plan
 
 
 @pytest.mark.parametrize(("prompt", "outputs", "kwargs"), _COSMOS3_LOOPS.values(), ids=_COSMOS3_LOOPS)
@@ -380,38 +378,45 @@ def test_cosmos3_caps_its_denoise_loop_at_the_iterations_its_dit_runs(tmp_path, 
     every window's for a windowed request, plus a commit per kv window."""
     from mstar.model.cosmos3.submodules import DENOISE_LOOP_FOR_WALK, IMAGE_GEN_LOOP
 
-    model, dit, output, plan = _cosmos3_prefilled(tmp_path, prompt, outputs, kwargs)
+    model, st, output, plan = _cosmos3_prefilled(tmp_path, prompt, outputs, kwargs)
 
-    state = dit.request_states["r"]
-    iters = state["ar_total_iters"] if "ar_schedule" in state else len(state["scheduler"].timesteps)
+    windowed = "ar_schedule" in st
+    iters = st["ar_schedule"].num_windows * st["ar_iters_per_window"] if windowed else len(st["scheduler"].timesteps)
     loop = DENOISE_LOOP_FOR_WALK.get(plan[1].walk, IMAGE_GEN_LOOP)
     assert model.get_loop_caps(**kwargs, **output.metadata)[loop] == iters
 
 
 @pytest.mark.parametrize(("prompt", "outputs", "kwargs"), _COSMOS3_COMMITS.values(), ids=_COSMOS3_COMMITS)
 def test_cosmos3_lays_out_what_its_dit_commits(tmp_path, prompt, outputs, kwargs):
+    from mstar.engine.state.adapters import kv_layouts
     from mstar.model.cosmos3.submodules import COND_LABEL, UNCOND_LABEL
 
-    _, dit, output, plan = _cosmos3_prefilled(tmp_path, prompt, outputs, kwargs)
+    model, st, output, plan = _cosmos3_prefilled(tmp_path, prompt, outputs, kwargs)
     walk = plan[0].walk
 
-    state, layout = dit.request_states["r"], output.metadata["kv_layout"]["kv"]
-    for label, static in ((COND_LABEL, state["cond"]), (UNCOND_LABEL, state["uncond"])):
+    layout = kv_layouts(model.declare_state(), output.metadata["state_layout"], {})["kv"]
+    for label, static in ((COND_LABEL, st["cond"]), (UNCOND_LABEL, st["uncond"])):
         laid_out = layout[label]
         if static is None:
-            assert laid_out == LabelLayout(), f"{label} is laid out for a branch the DiT doesn't run"
+            assert not laid_out.spans and not laid_out.scratch, f"{label} is laid out for a branch the DiT doesn't run"
             continue
         assert (laid_out.spans[0].walk, laid_out.spans[0].length) == (walk, static["und_len"]), label
-        if state.get("ar_schedule") is None:
-            step = static["num_vision_tokens"] + static.get("num_action_tokens", 0) + (state.get("num_sound") or 0)
+        if st.get("ar_schedule") is None:
+            step = static["num_vision_tokens"] + static.get("num_action_tokens", 0) + (st.get("num_sound") or 0)
             assert laid_out.scratch == step, f"{label}'s scratch isn't one denoise step"
             continue
-        schedule, per_unit = state["ar_schedule"], state["ar_tokens_per_unit"]
+        schedule, per_unit = st["ar_schedule"], st["ar_tokens_per_unit"]
         commits = [(plan.commit_end - plan.commit_start) * per_unit for plan in schedule.windows()]
         assert [span.length for span in laid_out.spans[1:]] == commits, f"{label}'s windows aren't the commits"
         assert [span.scratch for span in laid_out.spans[1:]] == [plan.units * per_unit for plan in schedule.windows()]
         assert laid_out.scratch == 0, f"{label}'s denoise is counted on top of its last window"
-        assert laid_out.retention == dit._window_retention(state).get(label), f"{label}'s retention isn't the DiT's"
+        # a schedule that keeps every window keeps every entry the array holds
+        horizon = schedule.retention(per_unit, static["und_len"])
+        whole = (model.config.max_position_embeddings, 0)
+        kept = (horizon.context_budget, horizon.protected_prefix) if horizon else whole
+        retention = laid_out.retention
+        assert (retention.context_budget, retention.protected_prefix) == kept and retention.exact, (
+            f"{label} keeps another window than its schedule's context behind its prompt")
 
 
 @pytest.mark.parametrize("clone", [False, True])

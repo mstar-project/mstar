@@ -320,9 +320,13 @@ impl RequestState {
         tensors: &[TensorRef], can_buffer: bool, final_chunk: bool,
     ) -> bool {
         let name = g.node(node).inputs[slot as usize];
+        // What reaches a loop member after it ran this iteration is for the next one. Its
+        // current slot looks free once the worker clears the consumed inputs, but the loop
+        // drops that slot when it advances.
+        let ran = g.node(node).loop_id.is_some() && self.nodes[node as usize].completed;
         {
             let st = &mut self.nodes[node as usize];
-            if !st.cur.has(slot) {
+            if !st.cur.has(slot) && !ran {
                 st.cur.set(slot, tensors.to_vec(), final_chunk);
             } else if can_buffer && !st.next.has(slot) {
                 st.next.set(slot, tensors.to_vec(), final_chunk);
@@ -721,6 +725,8 @@ impl RequestState {
             }
             self.refresh_ready(n);
             self.reseed_streaming_ready(n);
+            // what it took while the last iteration ran may leave only its stream missing
+            self.note_ingested_for_streaming(n);
         }
         for &c in &lspec.child_loops {
             self.reset_subtree_for_iter(g, c);

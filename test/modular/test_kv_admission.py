@@ -918,13 +918,12 @@ def test_an_allotment_covers_only_the_labels_its_workers_nodes_open():
     assert _ready(kv, "a") and kv._allotments["a"].pages == 3, "the leader counted a label only another worker opens"
 
 
-def _run(kv, rng, rid: str, span: int, walk: str, policy: RetentionPolicy | None, preplan: bool = False) -> str:
+def _run(kv, rng, rid: str, span: int, walk: str, preplan: bool = False) -> str:
     """Admit one step of ``rid``, then commit the step, roll it back as a later resource's refusal
     would, or drop the step if it was staged ahead."""
     step = KVStep(
         segments=(Segment(rid, "main", span),),
         post_forks=(("main", "fork"),) if rng.random() < 0.2 else (),
-        retention={(rid, "main"): policy} if policy else {},
     )
     ctx = StepContext(request_ids=(rid,), graph_walk=walk, slot=0, capture=False, is_preplan=preplan)
     if not kv.admit(step, ctx).ok:
@@ -968,7 +967,7 @@ def _drive(kv, rng: random.Random, ops: int) -> list[str]:
             tokens = rng.choice(prompts)[:rng.randrange(20, 90)] + [i] * rng.randrange(0, 20)
             # a window that keeps one page releases prompt pages as the request decodes, which leaves it
             # holding fewer pages than it was allotted
-            policy = RetentionPolicy(1, PAGE_SIZE) if rng.random() < 0.3 else None
+            policy = RetentionPolicy(1, PAGE_SIZE, exact=True) if rng.random() < 0.3 else None
             n = len(tokens)
             kv.ingest_request(rid, KVReqConfig(
                 prefix_keys={"main": _keys(tokens)} if rng.random() < 0.7 else None, loop_caps={"decode_loop": 40},
@@ -986,10 +985,10 @@ def _drive(kv, rng: random.Random, ops: int) -> list[str]:
             if prefix and prefix.tokens >= PAGE_SIZE and not kv._streams[rid]["main"].stored_len and rng.random() < 0.3:
                 prefix = CachedPrefix("main", PAGE_SIZE, PAGE_SIZE)
             kv.apply_cached_prefix(rid, NODE, WALK, inputs, prefix)
-            op = _run(kv, rng, rid, n - (0 if prefix is None else prefix.tokens), WALK, policy)
+            op = _run(kv, rng, rid, n - (0 if prefix is None else prefix.tokens), WALK)
             live[rid][0] = "running" if op == "committed" else state
         elif op in ("decode", "preplan") and decoded < 40:
-            op = _run(kv, rng, rid, 1, "decode", policy, preplan=op == "preplan")
+            op = _run(kv, rng, rid, 1, "decode", preplan=op == "preplan")
             live[rid][3] += op == "committed"
         elif op == "reset":
             kv.reset_request(rid, free=rng.random() < 0.5)

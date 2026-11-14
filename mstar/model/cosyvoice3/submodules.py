@@ -53,22 +53,14 @@ from mstar.engine.accelerator_graph_config import (
     PiecewisePackedConfig,
 )
 from mstar.engine.engine import ExecutingBatch
-from mstar.engine.resources import (
-    AttentionStep,
-    KVStep,
-    PositionStep,
-    Segment,
-    SlotLease,
-    SubmoduleStep,
-)
-from mstar.engine.resources.convenience import AttentionCallable
-from mstar.engine.resources.recurrent.config import RecurrentStep
+from mstar.engine.state import ArrayStep, Segment, SlotLease, SubmoduleStep, at_last_token
 from mstar.model.chatterbox.components.audio_frontend import kaldi_fbank_80, resample
 from mstar.model.chatterbox.submodules import VoiceCache
 from mstar.model.components.audio_features import MatchaLogMel
 from mstar.model.cosyvoice3.components.dit import PackedRows
 from mstar.model.cosyvoice3.components.flow import (
     CosyVoice3FlowRow,
+    FlowCounts,
     NewFramesInputs,
     ReferenceVoice,
     SolveInputs,
@@ -85,8 +77,6 @@ from mstar.model.cosyvoice3.components.hift import (
 )
 from mstar.model.cosyvoice3.components.sampling import ras_sample
 from mstar.model.cosyvoice3.config import (
-    FLOW_ATTN,
-    FLOW_CFG_LABEL,
     FLOW_COND_LABEL,
     FLOW_KV,
     FLOW_TAILS,
@@ -94,10 +84,9 @@ from mstar.model.cosyvoice3.config import (
     FLOW_UNCOND_LABEL,
     HIFT_STATE,
     HIFT_STATE_LABEL,
-    LM_ATTN,
     LM_KV,
     LM_LABEL,
-    LM_POS,
+    RAS_HISTORY,
     SAMPLE_RATE,
     TOKENIZER_SR,
     CosyVoice3Config,
@@ -125,6 +114,14 @@ MEL = "mel"  # newly settled mel frames
 MEL_FINAL = "mel_final"  # [1] bool: the stream has ended
 AUDIO_CHUNK = "audio_chunk"
 DECODE_LOOP = "decode_loop"
+# The token2wav loop runs once per chunk of the stream, and its loop-back edges carry a stream's flow and vocoder
+# state from one chunk to the next.
+TOKEN2WAV_LOOP = "token2wav_loop"
+VOICE = "voice"  # the reference voice (`ReferenceVoice.edge`)
+FLOW_COUNTS = "flow_counts"  # how far the flow's solves have got (`FlowCounts`)
+RAW_TOKENS = "raw_tokens"  # every token the stream has delivered, on the host
+HIFT_COUNTS = "hift_counts"  # the vocoder stream's counts, on the host
+HIFT_MEL = "hift_mel"  # its mel window and phase carry, or its pending mel when captured
 
 # Request facts process_prompt settles, carried in step_metadata
 MIN_SPEECH_TOKENS = "min_speech_tokens"
@@ -221,7 +218,7 @@ class SpeakerEncoderSubmodule(NodeSubmodule):
             tokens = self.encoder.tokens(ref_audio)
             assert tokens.numel() == reference_tokens(ref_audio.numel(), self.config), (
                 f"the speech tokenizer made {tokens.numel()} prompt tokens of a {ref_audio.numel()}-sample clip, "
-                "not the count `reference_tokens` gives the LM's kv_layout"
+                "not the count `reference_tokens` gives the LM's state_layout"
             )
             self.cache.put(voice_key, tokens)
         return {PROMPT_TOKENS: [tokens]}
@@ -231,7 +228,6 @@ class SpeakerEncoderSubmodule(NodeSubmodule):
 # 2. LM: text (+ prompt speech) -> speech tokens
 # ===========================================================================
 
-HISTORY = "history"
 KNOBS = "knobs"
 STEP = "step"
 EOS_FLAG = "eos_flag"
@@ -239,7 +235,7 @@ EOS_FLAG = "eos_flag"
 
 @dataclass(frozen=True, slots=True)
 class LMRequestKnobs:
-    """A request's sampling settings, resolved once at prefill."""
+    """A request's sampling settings, as its step metadata and seed set them."""
 
     seed: int
     temperature: float
@@ -292,6 +288,9 @@ class LMSubmodule(ARNodeSubmodule):
         self._bool_stager = PinnedStager(torch.bool, numel=2 * self.MAX_BATCH_SIZE)
         self._eos_flags: dict[bool, torch.Tensor] = {}
 
+    def bind_state(self, handles: Mapping[str, Any]) -> None:
+        self.kv, self.history = handles[LM_KV], handles[RAS_HISTORY]
+
     # -- request knobs -------------------------------------------------------
 
     def _knob(self, step_metadata: Mapping[str, Any] | None, key: str):
@@ -324,7 +323,7 @@ class LMSubmodule(ARNodeSubmodule):
     def prepare_inputs(self, graph_walk, fwd_info, inputs: NameToTensorList, **kwargs) -> ARNodeInputs:
         del kwargs
         device = self.get_device()
-        state = self.request_state(_rid(fwd_info))
+        knobs = self._resolve_knobs(fwd_info)
         if graph_walk in PREFILL_WALKS:
             text_ids = inputs[TEXT_INPUTS][0].to(device, torch.long).reshape(-1)
             prompt = (
@@ -333,47 +332,39 @@ class LMSubmodule(ARNodeSubmodule):
                 else torch.zeros(0, dtype=torch.long, device=device)
             )
             embeds = self.model.build_prefill_embeds(text_ids, prompt)
-            state.add_all(
-                generated=0,
-                knobs=self._resolve_knobs(fwd_info),
-                history=torch.full((max(self.window, 1),), -1, dtype=torch.long, device=device),
-            )
-            state.remove(EOS_FLAG)
-            history = state[HISTORY]
-            eos_flag = None
+            tensor_inputs, step, eos_flag = {}, 0, None
         elif graph_walk == "decode":
             token = inputs[PREV_TOKEN][0].to(device, torch.long).reshape(-1)[:1]
             embeds = self.model.embed_speech(token)
-            # committed in postprocess, so a re-driven step does not add the token twice
-            history = torch.cat([state[HISTORY][1:], token])
-            eos_flag = self._ended_at_prefill(state, token)
+            # the prefill's token is the first of the budget, so decode iteration i samples step i + 1
+            count = int(fwd_info.dynamic_loop_iter_counts[DECODE_LOOP])
+            tensor_inputs, step = {PREV_TOKEN: token}, count + 1
+            eos_flag = self._ended_at_prefill(knobs, token) if count == 0 else None
         else:
             raise ValueError(f"Unknown LM walk {graph_walk!r}")
         return ARNodeInputs(
             input_embeds=embeds,
             input_seq_len=embeds.shape[0],
-            tensor_inputs={HISTORY: history},
-            kwargs={KNOBS: state[KNOBS], STEP: int(state["generated"]), EOS_FLAG: eos_flag},
+            tensor_inputs=tensor_inputs,
+            kwargs={KNOBS: knobs, STEP: step, EOS_FLAG: eos_flag},
         )
 
-    def _ended_at_prefill(self, state, token: torch.Tensor) -> torch.Tensor | None:
+    def _ended_at_prefill(self, knobs: LMRequestKnobs, token: torch.Tensor) -> torch.Tensor | None:
         """Whether the prefill token already ended the request: a control id,
         or the whole token budget. The prefill walk has no decode loop for
-        ``check_stop`` to end, so every decode step of such a request is made
-        to sample EOS, which the flow drops and which ends the loop on the
-        first one. Decided on the first decode step, whose input is the prefill
-        token, and kept, so a re-prepared or speculated step agrees. A ``[1]``
-        bool on the device (the token is never read back), or None for never."""
-        if EOS_FLAG not in state:
-            knobs: LMRequestKnobs = state[KNOBS]
-            if int(state["generated"]) >= knobs.max_len:
-                flag = self._eos_flag(True)
-            elif knobs.ignore_eos:
-                flag = None
-            else:
-                flag = token >= self.lm.speech_token_size
-            state.add(EOS_FLAG, flag)
-        return state[EOS_FLAG]
+        ``check_stop`` to end, so the first decode step, whose input is the
+        prefill token, is made to sample EOS, which the flow drops and which
+        ends the loop. A ``[1]`` bool on the device (the token is never read
+        back), or None for never.
+
+        Only the first decode step asks. Where it ends the loop, a later step
+        runs only if it was prepared ahead of that EOS, and the worker drops
+        that step's outputs because the loop's stop is pending."""
+        if knobs.max_len <= 1:
+            return self._eos_flag(True)
+        if knobs.ignore_eos:
+            return None
+        return token >= self.lm.speech_token_size
 
     def _stage_columns(self, inputs: list[ARNodeInputs]) -> dict[str, torch.Tensor]:
         """The batch's per-row sampling inputs, ``[B, 1]`` each, from three
@@ -406,14 +397,15 @@ class LMSubmodule(ARNodeSubmodule):
         return columns
 
     def preprocess(self, graph_walk, engine_inputs, inputs: list[ARNodeInputs]) -> dict[str, Any]:
-        del graph_walk, engine_inputs
+        del engine_inputs
         never = self._eos_flag(False)
         flags = [inp.kwargs[EOS_FLAG] for inp in inputs]
         packed: dict[str, Any] = {
             "input_embeds": torch.cat([inp.input_embeds for inp in inputs], dim=0),
-            HISTORY: torch.stack([inp.tensor_inputs[HISTORY] for inp in inputs]),
             "force_eos": torch.stack([never if flag is None else flag for flag in flags]),
         }
+        if graph_walk == "decode":
+            packed[PREV_TOKEN] = torch.cat([inp.tensor_inputs[PREV_TOKEN] for inp in inputs])
         packed.update(self._stage_columns(inputs))
         return packed
 
@@ -432,7 +424,7 @@ class LMSubmodule(ARNodeSubmodule):
                 Segment(request_id=rid, label=LM_LABEL, span=inp.input_seq_len)
                 for rid, inp in zip(request_ids, inputs, strict=True)
             ],
-            steps={LM_KV: KVStep(), LM_ATTN: AttentionStep(causal=True), LM_POS: PositionStep()},
+            state={LM_KV: ArrayStep(), RAS_HISTORY: ArrayStep()},
         )
 
     def _forward(
@@ -440,7 +432,6 @@ class LMSubmodule(ARNodeSubmodule):
         graph_walk,
         engine_inputs,
         input_embeds,
-        history,
         seed,
         step,
         temperature,
@@ -451,10 +442,12 @@ class LMSubmodule(ARNodeSubmodule):
         block_sos,
         block_stop,
         force_eos,
+        prev_token=None,
     ) -> torch.Tensor:
-        hidden = self.model.hidden(input_embeds, label=LM_LABEL)
+        del engine_inputs
+        hidden = self.model.hidden(input_embeds)
         if graph_walk in PREFILL_WALKS:
-            hidden = engine_inputs.resources[LM_ATTN].select_last_hidden(hidden, label=LM_LABEL)
+            hidden = at_last_token(self.kv, hidden)
         logits = self.model.logits(hidden)
         ids = torch.arange(logits.shape[-1], device=logits.device)[None, :]
         blocked = (block_sos & (ids == self.lm.sos_token)) | (block_stop & (ids >= self.lm.speech_token_size))
@@ -468,7 +461,7 @@ class LMSubmodule(ARNodeSubmodule):
             logits,
             seed=seed.reshape(-1),
             step=step.reshape(-1),
-            history=history,
+            history=self._history(graph_walk, step, prev_token),
             temperature=temperature.reshape(-1),
             top_p=top_p.reshape(-1),
             top_k=top_k.reshape(-1),
@@ -476,6 +469,22 @@ class LMSubmodule(ARNodeSubmodule):
             repeat_threshold=threshold.reshape(-1),
             blocked=blocked,
         )
+
+    def _history(self, graph_walk, step: torch.Tensor, prev_token: torch.Tensor | None) -> torch.Tensor:
+        """Each row's last tokens, oldest first and -1 before its first, this step's input token included. Decode
+        iteration i keeps its input token in slot ``i % W`` of the ring in ``RAS_HISTORY``, so a step run twice
+        writes the same ring."""
+        width = max(self.window, 1)
+        if graph_walk in PREFILL_WALKS:
+            # The ring starts full of -1, written here: a start set on the Value would keep the resident decode
+            # planned on the host.
+            ring = torch.full((step.shape[0], width), -1, dtype=torch.long, device=step.device)
+            self.history.write(0, tokens=ring)
+            return ring
+        slot = (step - 1).remainder(width)
+        ring = self.history.read(0).fields["tokens"].scatter(1, slot, prev_token[:, None])
+        self.history.write(0, tokens=ring)
+        return ring.gather(1, (slot + 1 + torch.arange(width, device=ring.device)).remainder(width))
 
     def forward(self, graph_walk, engine_inputs, **kwargs) -> NameToTensorList:
         return {SPEECH_TOKENS: [self._forward(graph_walk, engine_inputs, **kwargs).reshape(-1)[:1]]}
@@ -486,14 +495,9 @@ class LMSubmodule(ARNodeSubmodule):
         return BatchedModelOutput(row_outputs={SPEECH_TOKENS: tokens}, check_stop_buffers={SPEECH_TOKENS: tokens})
 
     def postprocess(self, request_id, request_info, outputs, inputs: NodeInputs | None = None, **kwargs) -> None:
-        del request_info, kwargs
-        if SPEECH_TOKENS not in outputs:
-            return
-        outputs[PREV_TOKEN] = outputs[SPEECH_TOKENS]
-        state = self.request_state(request_id)
-        state.add("generated", int(state.get("generated", 0)) + 1)
-        if inputs is not None and HISTORY in inputs.tensor_inputs:
-            state.add(HISTORY, inputs.tensor_inputs[HISTORY])
+        del request_id, request_info, inputs, kwargs
+        if SPEECH_TOKENS in outputs:
+            outputs[PREV_TOKEN] = outputs[SPEECH_TOKENS]
 
     def get_stop_policies(self, graph_walk: str) -> dict[str, StopPolicy] | None:
         if graph_walk != "decode":
@@ -512,7 +516,7 @@ class LMSubmodule(ARNodeSubmodule):
         if SPEECH_TOKENS not in outputs:
             return set()
         token = int(outputs[SPEECH_TOKENS][0].reshape(-1)[0].item())
-        knobs: LMRequestKnobs = self.request_state(request_id)[KNOBS]
+        knobs = self._resolve_knobs(request_info)
         if not knobs.ignore_eos and token >= self.lm.speech_token_size:
             return {DECODE_LOOP}
         # the prefill's token is the first of the budget; decode's cap covers the rest
@@ -534,8 +538,6 @@ class LMSubmodule(ARNodeSubmodule):
     ) -> list[AcceleratorGraphConfig]:
         del tp_world_size
         dtype = self.model.speech_embedding.weight.dtype
-        width = max(self.window, 1)
-        tensor_inputs = {HISTORY: torch.full((width,), -1, dtype=torch.long, device=device)}
         kwargs = {KNOBS: CAPTURE_KNOBS, STEP: 0, EOS_FLAG: None}
         configs: list[AcceleratorGraphConfig] = [
             BatchedAcceleratorGraphConfig(
@@ -543,7 +545,7 @@ class LMSubmodule(ARNodeSubmodule):
                 single_request_inputs=ARNodeInputs(
                     input_embeds=torch.zeros(1, self.lm.hidden_size, dtype=dtype, device=device),
                     input_seq_len=1,
-                    tensor_inputs=tensor_inputs,
+                    tensor_inputs={PREV_TOKEN: torch.zeros(1, dtype=torch.long, device=device)},
                     kwargs=kwargs,
                 ),
                 capture_batch_sizes=self.DECODE_CAPTURE_BATCH_SIZES,
@@ -559,7 +561,7 @@ class LMSubmodule(ARNodeSubmodule):
                     make_node_input=lambda n: ARNodeInputs(
                         input_embeds=torch.zeros(n, self.lm.hidden_size, dtype=dtype, device=device),
                         input_seq_len=n,
-                        tensor_inputs=tensor_inputs,
+                        tensor_inputs={},
                         kwargs=kwargs,
                     ),
                     capture_batch_sizes=list(self.config.lm_prefill_batch_sizes),
@@ -619,7 +621,6 @@ def flow_region(frames: int) -> str:
 
 
 FLOW_NEW_FRAMES_REGION = "solve_new_frames"
-TAILS_BLOCK = "tails"
 
 
 class _NewFramesRow(NamedTuple):
@@ -635,10 +636,10 @@ class FlowSubmodule(NodeSubmodule):
     """Settles the stream's tokens in whole attention chunks and emits their mel.
 
     Every chunk of the stream carries the whole token history (the edge's
-    policy keeps all of it as left context), so the node holds only how far it
+    policy keeps all of it as left context), so the node carries only how far it
     has settled and where its hop schedule is. A request's reference voice is
     conditioned from the clip that rides with its first chunk (per-voice cache)
-    and kept in its state for the chunks that follow.
+    and carried to the chunks that follow.
 
     Attention is block-causal, so frames a row has solved never change. A row
     keeps their K/V (``FLOW_KV``) and conv tails (``FLOW_TAILS``) and each hop
@@ -659,7 +660,6 @@ class FlowSubmodule(NodeSubmodule):
         super().__init__()
         self.flow = flow
         self.encoder = encoder
-        self._attend: AttentionCallable | None = None
         self.config = config
         self.cache = VoiceCache(config.voice_cache_size)
         self.ratio = config.flow.token_mel_ratio
@@ -673,25 +673,23 @@ class FlowSubmodule(NodeSubmodule):
         frames, rows = max(config.flow_new_frame_buckets, default=0), config.flow_max_batch_size
         self._index_stager = PinnedStager(torch.long, numel=2 * frames + 2 * config.flow.dit.conv_pos_kernel * rows)
 
-    def _voice(self, fwd_info: CurrentForwardPassInfo, inputs: NameToTensorList, state) -> ReferenceVoice:
-        if inputs.get(REF_AUDIO):
-            key = _voice_key(fwd_info)
-            voice = self.cache.get(key)
-            if voice is None:
-                wav = inputs[REF_AUDIO][0].to(self.get_device(), torch.float32).reshape(-1)
-                voice = self.encoder.voice(wav)
-                self.cache.put(key, voice)
-            if state.get("voice") is None:
-                state.add("voice", voice)
-            return voice
-        if state.get("voice") is None:
+    def _voice(self, fwd_info: CurrentForwardPassInfo, inputs: NameToTensorList) -> ReferenceVoice:
+        """The voice the last chunk carried, or at a stream's first chunk the one its clip conditions."""
+        if inputs.get(VOICE):
+            return ReferenceVoice(*inputs[VOICE])
+        if not inputs.get(REF_AUDIO):
             raise ValueError("CosyVoice3 needs a reference voice; none reached the flow node")
-        return state["voice"]
+        key = _voice_key(fwd_info)
+        voice = self.cache.get(key)
+        if voice is None:
+            wav = inputs[REF_AUDIO][0].to(self.get_device(), torch.float32).reshape(-1)
+            voice = self.encoder.voice(wav)
+            self.cache.put(key, voice)
+        return voice
 
-    def bind_node_resources(self, resources: dict) -> None:
-        super().bind_node_resources(resources)
-        kv, attn = resources.get(FLOW_KV), resources.get(FLOW_ATTN)
-        self._attend = None if kv is None or attn is None else AttentionCallable(kv=kv, attn=attn)
+    def bind_state(self, handles: Mapping[str, Any]) -> None:
+        # None when flow_cache_frames is 0, which declares neither
+        self.kv, self.tails = handles.get(FLOW_KV), handles.get(FLOW_TAILS)
 
     def hop_size(self, k: int, prompt_tokens: int) -> int:
         """Tokens hop ``k`` settles: 25, 50, 100, 100, ... (reference
@@ -704,13 +702,13 @@ class FlowSubmodule(NodeSubmodule):
             hop += -(-prompt_tokens // self.chunk_tokens) * self.chunk_tokens - prompt_tokens
         return hop
 
-    def plan(self, state, voice: ReferenceVoice, tokens: torch.Tensor, final: bool) -> CosyVoice3FlowRow | None:
+    def plan(self, counts, voice: ReferenceVoice, tokens: torch.Tensor, final: bool) -> CosyVoice3FlowRow | None:
         """The row this request needs solved now, or None (nothing settles yet).
 
         A stream settles every hop whose end and three look-ahead tokens have
         arrived, in one solve; the final chunk settles the rest."""
         n = int(tokens.numel())
-        offset = int(state.get("settled", 0))
+        offset = counts.settled
         streaming = self.config.stream_hop_tokens > 0
         if final:
             if n == 0 or n <= offset:
@@ -718,10 +716,10 @@ class FlowSubmodule(NodeSubmodule):
             return CosyVoice3FlowRow(voice=voice, tokens=tokens, settle=n, final=True, streaming=streaming)
         if not streaming:
             return None
-        target, hops = offset, int(state.get("hops", 0))
+        target, hops = offset, counts.hops
         while (nxt := target + self.hop_size(hops, voice.num_prompt_tokens)) + self.lookahead <= n:
             target, hops = nxt, hops + 1
-        state.add("hops", hops)
+        counts.hops = hops
         if target == offset:
             return None
         return CosyVoice3FlowRow(voice=voice, tokens=tokens, settle=target, final=False, streaming=True)
@@ -729,18 +727,15 @@ class FlowSubmodule(NodeSubmodule):
     def prepare_inputs(self, graph_walk, fwd_info, inputs: NameToTensorList, **kwargs) -> NodeInputs:
         del graph_walk
         device = self.get_device()
-        rid = _rid(fwd_info)
-        state = self.request_state(rid)
         chunks = inputs.get(SPEECH_TOKENS) or []
         raw = chunks[0] if chunks and chunks[0] is not None else None
         if raw is None or raw.numel() == 0:
-            raw = state.get("raw", torch.zeros(0, dtype=torch.long))
+            raw = inputs[RAW_TOKENS][0] if inputs.get(RAW_TOKENS) else torch.zeros(0, dtype=torch.long)
         else:
             # The one host sync of a flow step: the stream delivers the tokens
             # on the device, and how many settle depends on their values.
             raw = raw.reshape(-1).to("cpu", torch.long)
-        state.add("raw", raw)
-        voice = self._voice(fwd_info, inputs, state)
+        voice = self._voice(fwd_info, inputs)
         final = bool(kwargs.get("is_final_stream_chunk", False))
         kept = filter_tokens(raw, self.config)
         tokens = torch.empty(kept.shape, dtype=torch.long, device=device)
@@ -749,8 +744,10 @@ class FlowSubmodule(NodeSubmodule):
         return NodeInputs(
             tensor_inputs={SPEECH_TOKENS: tokens},
             kwargs={
-                "rid": rid,
+                "rid": _rid(fwd_info),
                 "voice": voice,
+                "raw": raw,
+                "counts": FlowCounts.from_edge(inputs.get(FLOW_COUNTS) or []),
                 "final": final,
                 "n_timesteps": int(meta.get("n_cfm_timesteps", self.config.flow.cfm.n_timesteps)),
             },
@@ -770,17 +767,18 @@ class FlowSubmodule(NodeSubmodule):
         mel = runner.run(static_inputs=inputs._asdict(), real_bs=len(rows))["mel"]
         return self.flow.row_mels(rows, mel)
 
-    def _new_frames_row(self, i: int, rid: int, row: CosyVoice3FlowRow, steps: int, runner) -> _NewFramesRow | None:
+    def _new_frames_row(
+        self, i: int, row: CosyVoice3FlowRow, counts: FlowCounts, steps: int, runner,
+    ) -> _NewFramesRow | None:
         """``row`` as an incremental solve, or None to re-solve all of it."""
         if runner is None or steps != self.config.flow.cfm.n_timesteps or not row.streaming:
             return None
-        state = self.request_state(rid)
         end = self.flow.valid_frames(row)
-        if state.get("resolving") or end > self.config.flow_cache_frames:
+        if counts.resolving or end > self.config.flow_cache_frames:
             # for good: its K/V stops short of the frames it now solves
-            state.add("resolving", True)
+            counts.resolving = True
             return None
-        return _NewFramesRow(i, row, int(state.get("cached_frames", 0)), end)
+        return _NewFramesRow(i, row, counts.cached_frames, end)
 
     def _pack_new_frames(self, batch: list[_NewFramesRow]) -> NewFramesInputs:
         """The batch's new frames, packed in row order; see ``PackedRows``."""
@@ -806,7 +804,7 @@ class FlowSubmodule(NodeSubmodule):
         at_device = torch.empty(indices.shape[0], dtype=torch.long, device=device)
         self._index_stager.copy_(at_device, indices)
         rows = PackedRows(
-            positions=at_device[:total],
+            frame_at=at_device[:total],
             seq_at=at_device[total : 2 * total],
             tail_at=at_device[2 * total : 2 * total + len(batch) * width].view(len(batch), width),
             last_at=at_device[2 * total + len(batch) * width :].view(len(batch), width),
@@ -854,12 +852,13 @@ class FlowSubmodule(NodeSubmodule):
             frames += n
         return [*batches, current] if current else batches
 
-    def _run(self, rids, tokens_list, voices, finals, n_timesteps, runners=None) -> list[NameToTensorList]:
+    def _run(
+        self, rids, tokens_list, voices, raws, counts, finals, n_timesteps, runners=None,
+    ) -> list[NameToTensorList]:
         runners = runners or {}
         rows: list[tuple[int, CosyVoice3FlowRow]] = []
-        for i, (rid, tokens, voice, final) in enumerate(zip(rids, tokens_list, voices, finals, strict=True)):
-            state = self.request_state(rid)
-            row = None if state.get("done") else self.plan(state, voice, tokens, final)
+        for i, (tokens, voice, final) in enumerate(zip(tokens_list, voices, finals, strict=True)):
+            row = None if counts[i].done else self.plan(counts[i], voice, tokens, final)
             if row is not None:
                 rows.append((i, row))
         mels: dict[int, torch.Tensor] = {}
@@ -868,18 +867,18 @@ class FlowSubmodule(NodeSubmodule):
         with _without_tf32():
             incremental = []
             for i, row in rows:
-                item = self._new_frames_row(i, rids[i], row, n_timesteps[i], region)
+                item = self._new_frames_row(i, row, counts[i], n_timesteps[i], region)
                 if item is not None:
                     incremental.append(item)
             for batch in self._new_frames_batches(incremental):
                 if not region.can_run(len(batch), 2 * sum(item.end - item.first for item in batch)):
                     # a capture left out for memory: re-solving needs no K/V
                     for item in batch:
-                        self.request_state(rids[item.index]).add("resolving", True)
+                        counts[item.index].resolving = True
                     continue
                 for item, mel in zip(batch, self._solve_new_frames(batch, rids, region), strict=True):
                     new_frames[item.index] = (item, mel)
-                    self.request_state(rids[item.index]).add("cached_frames", item.end)
+                    counts[item.index].cached_frames = item.end
             rows = [(i, row) for i, row in rows if i not in new_frames]
             for steps in sorted({n_timesteps[i] for i, _ in rows}):
                 group = [(i, row) for i, row in rows if n_timesteps[i] == steps]
@@ -888,24 +887,27 @@ class FlowSubmodule(NodeSubmodule):
                     mels[i] = mel
         out = []
         n_mel = self.config.flow.output_size
-        for i, (rid, final) in enumerate(zip(rids, finals, strict=True)):
-            state = self.request_state(rid)
+        for i, final in enumerate(finals):
+            row_counts = counts[i]
             new = torch.zeros(n_mel, 0, device=self.get_device())
-            offset = int(state.get("settled", 0))
+            offset = row_counts.settled
             if i in mels:
                 new = mels[i][:, offset * self.ratio :].float()
-                state.add("settled", dict(rows)[i].settle)
+                row_counts.settled = dict(rows)[i].settle
             elif i in new_frames:
                 item, mel = new_frames[i]
                 # the first solve's frames start at the prompt's
                 first_generated = (item.row.voice.num_prompt_tokens + offset) * self.ratio
                 new = mel[:, first_generated - item.first :].float()
-                state.add("settled", item.row.settle)
+                row_counts.settled = item.row.settle
             if final:
-                state.add("done", True)
+                row_counts.done = True
             # on the host: HiFT reads it to plan its emit, and a colocated HiFT
             # gets this very tensor
-            out.append({MEL: [new], MEL_FINAL: [torch.tensor([final])]})
+            out.append({
+                MEL: [new], MEL_FINAL: [torch.tensor([final])],
+                VOICE: voices[i].edge(), FLOW_COUNTS: row_counts.edge(), RAW_TOKENS: [raws[i]],
+            })
         return out
 
     def can_batch(self, batch, model_inputs: list[NodeInputs]) -> bool:
@@ -923,16 +925,18 @@ class FlowSubmodule(NodeSubmodule):
         return packed
 
     @staticmethod
-    def _runners(engine_inputs) -> Mapping[str, Any]:
+    def _regions(engine_inputs) -> Mapping[str, Any]:
         return engine_inputs.piecewise_runners if engine_inputs is not None else {}
 
-    def forward(self, graph_walk, engine_inputs, speech_tokens, rid, voice, final, n_timesteps, **kwargs):
+    def forward(self, graph_walk, engine_inputs, speech_tokens, rid, voice, raw, counts, final, n_timesteps, **kwargs):
         del graph_walk, kwargs
-        return self._run(rid, speech_tokens, voice, final, n_timesteps, self._runners(engine_inputs))[0]
+        return self._run(rid, speech_tokens, voice, raw, counts, final, n_timesteps, self._regions(engine_inputs))[0]
 
-    def forward_batched(self, graph_walk, engine_inputs, speech_tokens, rid, voice, final, n_timesteps, **kwargs):
+    def forward_batched(
+        self, graph_walk, engine_inputs, speech_tokens, rid, voice, raw, counts, final, n_timesteps, **kwargs,
+    ):
         del graph_walk, kwargs
-        out = self._run(rid, speech_tokens, voice, final, n_timesteps, self._runners(engine_inputs))
+        out = self._run(rid, speech_tokens, voice, raw, counts, final, n_timesteps, self._regions(engine_inputs))
         return dict(zip(rid, out, strict=True))
 
     # -- captured solve ---------------------------------------------------------
@@ -973,13 +977,10 @@ class FlowSubmodule(NodeSubmodule):
         si = inp.static_inputs
         rows = PackedRows(*(si[name] for name in PackedRows._fields))
         inputs = NewFramesInputs(noise=si["noise"], mu=si["mu"], cond=si["cond"], spks=si["spks"], rows=rows)
-        attend = self._attend
-        attend.bind_step(FLOW_CFG_LABEL)
-        pool = inp.resources[FLOW_TAILS]
-        tails = pool.gather(TAILS_BLOCK, None, label=FLOW_TAILS_LABEL)
+        tails = self.tails.read(0).fields["tails"]
         with _without_tf32():
-            mel, tails = self.flow.solve_new_frames(inputs, tails, attend, self.config.flow.cfm.n_timesteps)
-        pool.scatter_(TAILS_BLOCK, tails, None, label=FLOW_TAILS_LABEL)
+            mel, tails = self.flow.solve_new_frames(inputs, tails, self.kv, self.config.flow.cfm.n_timesteps)
+        self.tails.write(0, tails=tails)
         return {"mel": mel}
 
     def _new_frames_static_inputs(self, shape: PiecewiseCaptureShape, device) -> dict[str, torch.Tensor]:
@@ -992,7 +993,7 @@ class FlowSubmodule(NodeSubmodule):
         }
         return {
             **tokens,
-            "positions": torch.zeros(total, dtype=torch.long, device=device),
+            "frame_at": torch.zeros(total, dtype=torch.long, device=device),
             "seq_at": torch.zeros(total, dtype=torch.long, device=device),
             "tail_at": torch.zeros(shape.bs, width, dtype=torch.long, device=device),
             "last_at": torch.zeros(shape.bs, width, dtype=torch.long, device=device),
@@ -1004,24 +1005,13 @@ class FlowSubmodule(NodeSubmodule):
         """Two KV streams a row, conditional rows first as the forward packs them; a
         padding row's zero span reads the sink and adds nothing."""
         spans = [n // 2 for n in seq_lens]
-        labels = (FLOW_COND_LABEL, FLOW_UNCOND_LABEL)
         kv_segments = tuple(
             Segment(rid, label, span)
-            for label in labels
+            for label in (FLOW_COND_LABEL, FLOW_UNCOND_LABEL)
             for rid, span in zip(request_ids, spans, strict=True)
         )
-        return SubmoduleStep(
-            combined_labels={labels: FLOW_CFG_LABEL},
-            steps={
-                FLOW_KV: KVStep(segments=kv_segments, commit=True),
-                FLOW_ATTN: AttentionStep(segments=kv_segments, causal=False),
-                FLOW_TAILS: RecurrentStep(
-                    segments=tuple(
-                        Segment(rid, FLOW_TAILS_LABEL, span) for rid, span in zip(request_ids, spans, strict=True)
-                    )
-                ),
-            },
-        )
+        tails = tuple(Segment(rid, FLOW_TAILS_LABEL, span) for rid, span in zip(request_ids, spans, strict=True))
+        return SubmoduleStep(state={FLOW_KV: ArrayStep(segments=kv_segments), FLOW_TAILS: ArrayStep(segments=tails)})
 
     def get_piecewise_accelerator_graph_configs(
         self, device: torch.device, autocast_dtype: torch.dtype, tp_world_size: int = 1, **kwargs: Any
@@ -1066,8 +1056,6 @@ def vocode_region(frames: int) -> str:
     return f"vocode_F{frames}"
 
 
-MEL_TAIL_BLOCK = "mel_tail"
-PHASE_CARRY_BLOCK = "phase_carry"
 _VOCODE_COUNTS = ("new_frames", "skip", "history", "frames", "start", "carry_at", "advance")
 
 
@@ -1091,6 +1079,10 @@ class HiFTSubmodule(NodeSubmodule):
         batch = config.hift_max_batch_size
         self._counts = PinnedStager(torch.long, numel=len(_VOCODE_COUNTS) * batch)
 
+    def bind_state(self, handles: Mapping[str, Any]) -> None:
+        # a stream's mel tail and phase carry, kept only where the vocoder is captured
+        self.hift_state = handles.get(HIFT_STATE)
+
     def prepare_inputs(self, graph_walk, fwd_info, inputs: NameToTensorList, **kwargs) -> NodeInputs:
         del graph_walk, kwargs
         device = self.get_device()
@@ -1098,18 +1090,15 @@ class HiFTSubmodule(NodeSubmodule):
         # a host tensor when the flow node shares this worker; a device read
         # only when the two are placed apart
         final = bool(inputs[MEL_FINAL][0].reshape(-1)[0])
-        return NodeInputs(tensor_inputs={MEL: mel}, kwargs={"rid": _rid(fwd_info), "final": final})
+        counts = inputs.get(HIFT_COUNTS)
+        stream = (counts[0].tolist() if counts else None, inputs.get(HIFT_MEL) or [])
+        return NodeInputs(tensor_inputs={MEL: mel}, kwargs={"rid": _rid(fwd_info), "final": final, "stream": stream})
 
     @staticmethod
     def _pcm(wav: torch.Tensor) -> torch.Tensor:
         return (wav.float().clamp(-1, 1) * 32767).to(torch.int16)
 
-    def _vocode(self, rid: int, mel: torch.Tensor, final: bool) -> torch.Tensor:
-        state = self.request_state(rid)
-        stream = state.get("stream")
-        if stream is None:
-            stream = HiftStreamState(mel=mel.new_zeros(mel.shape[0], 0))
-            state.add("stream", stream)
+    def _vocode(self, stream: HiftStreamState, mel: torch.Tensor, final: bool) -> torch.Tensor:
         if mel.shape[-1] == 0 and not final:
             wav = mel.new_zeros(0)
         else:
@@ -1118,20 +1107,15 @@ class HiFTSubmodule(NodeSubmodule):
 
     # -- captured steps ---------------------------------------------------------
 
-    def _pieces(self, rid: int, mel: torch.Tensor, final: bool) -> list[tuple[int, torch.Tensor, bool]]:
+    def _pieces(self, mel: torch.Tensor, final: bool) -> list[tuple[torch.Tensor, bool]]:
         """``mel`` in chunks a window of the largest bucket holds beside a stream's tail."""
         cfg = self.config
         # the holdback again for frames still pending from a chunk too short to emit
         room = max(cfg.hift_capture_frame_buckets) - cfg.hift_tail_frames - cfg.hift.stream_holdback_frames
         chunks = list(mel.split(room, dim=-1)) if mel.shape[-1] else [mel]
-        return [(rid, c, final and i == len(chunks) - 1) for i, c in enumerate(chunks)]
+        return [(c, final and i == len(chunks) - 1) for i, c in enumerate(chunks)]
 
-    def _plan_row(self, rid: int, mel: torch.Tensor, final: bool) -> StreamRow | None:
-        state = self.request_state(rid)
-        stream = state.get("stream")
-        if stream is None:
-            stream = CapturedStream()
-            state.add("stream", stream)
+    def _plan_row(self, stream: CapturedStream, mel: torch.Tensor, final: bool) -> StreamRow | None:
         if mel.shape[-1] == 0 and not final:
             return None
         cfg = self.config
@@ -1170,13 +1154,13 @@ class HiFTSubmodule(NodeSubmodule):
         return runner.run(static_inputs=statics, request_ids=[rid for rid, _ in rows], real_bs=len(rows))["pcm"]
 
     @torch.no_grad()
-    def _run_captured(self, rids, mels, finals, runners: Mapping[str, Any]) -> list[torch.Tensor]:
+    def _run_captured(self, rids, mels, finals, streams, runners: Mapping[str, Any]) -> list[torch.Tensor]:
         """Each row's new PCM16, a round of replays per chunk of its longest row."""
-        pieces = [self._pieces(r, m, f) for r, m, f in zip(rids, mels, finals, strict=True)]
+        pieces = [self._pieces(m, f) for m, f in zip(mels, finals, strict=True)]
         out: list[list[torch.Tensor]] = [[] for _ in rids]
         for piece in range(max(len(p) for p in pieces)):
             planned = [
-                (i, self._plan_row(*p[piece])) for i, p in enumerate(pieces) if piece < len(p)
+                (i, self._plan_row(streams[i], *p[piece])) for i, p in enumerate(pieces) if piece < len(p)
             ]
             rows = [(i, row) for i, row in planned if row is not None]
             if not rows:
@@ -1187,11 +1171,25 @@ class HiFTSubmodule(NodeSubmodule):
         empty = mels[0].new_zeros(0, dtype=torch.int16)
         return [torch.cat(o) if len(o) > 1 else (o[0] if o else empty) for o in out]
 
-    def _run(self, rids, mels, finals, runners: Mapping[str, Any]) -> list[torch.Tensor]:
+    def _run(self, rids, mels, finals, streams, runners: Mapping[str, Any]) -> list[NameToTensorList]:
+        """Each row's new PCM16 and its stream for the next chunk. ``streams`` holds each row's counts, as ints, and
+        mel from the last chunk, ``(None, [])`` at a stream's first."""
         # no regions: a device with no captures, or none fit in memory
         if self.config.hift_captured and runners:
-            return self._run_captured(rids, mels, finals, runners)
-        return [self._vocode(r, m, f) for r, m, f in zip(rids, mels, finals, strict=True)]
+            captured = [CapturedStream() if s[0] is None else CapturedStream.from_edges(*s) for s in streams]
+            pcm = self._run_captured(rids, mels, finals, captured, runners)
+            edges = [stream.edges(self.get_device()) for stream in captured]
+        else:
+            eager = [
+                HiftStreamState(mel=m.new_zeros(m.shape[0], 0)) if s[0] is None else HiftStreamState.from_edges(*s)
+                for s, m in zip(streams, mels, strict=True)
+            ]
+            pcm = [self._vocode(s, m, f) for s, m, f in zip(eager, mels, finals, strict=True)]
+            edges = [stream.edges() for stream in eager]
+        return [
+            {AUDIO_CHUNK: [p], HIFT_COUNTS: [counts], HIFT_MEL: mel}
+            for p, (counts, mel) in zip(pcm, edges, strict=True)
+        ]
 
     def can_batch(self, batch, model_inputs: list[NodeInputs]) -> bool:
         del batch
@@ -1207,32 +1205,31 @@ class HiFTSubmodule(NodeSubmodule):
             MEL: [inp.tensor_inputs[MEL] for inp in inputs],
             "rid": [inp.kwargs["rid"] for inp in inputs],
             "final": [inp.kwargs["final"] for inp in inputs],
+            "stream": [inp.kwargs["stream"] for inp in inputs],
         }
 
     @staticmethod
-    def _runners(engine_inputs) -> Mapping[str, Any]:
+    def _regions(engine_inputs) -> Mapping[str, Any]:
         return engine_inputs.piecewise_runners if engine_inputs is not None else {}
 
     @torch.no_grad()
-    def forward(self, graph_walk, engine_inputs, mel, rid, final, **kwargs) -> NameToTensorList:
+    def forward(self, graph_walk, engine_inputs, mel, rid, final, stream, **kwargs) -> NameToTensorList:
         del graph_walk, kwargs
-        return {AUDIO_CHUNK: [self._run(rid, mel, final, self._runners(engine_inputs))[0]]}
+        return self._run(rid, mel, final, stream, self._regions(engine_inputs))[0]
 
     @torch.no_grad()
-    def forward_batched(self, graph_walk, engine_inputs, mel, rid, final, **kwargs) -> dict[int, NameToTensorList]:
+    def forward_batched(
+        self, graph_walk, engine_inputs, mel, rid, final, stream, **kwargs,
+    ) -> dict[int, NameToTensorList]:
         del graph_walk, kwargs
-        pcm = self._run(rid, mel, final, self._runners(engine_inputs))
-        return {r: {AUDIO_CHUNK: [p]} for r, p in zip(rid, pcm, strict=True)}
+        return dict(zip(rid, self._run(rid, mel, final, stream, self._regions(engine_inputs)), strict=True))
 
     # -- captured vocode --------------------------------------------------------
 
     def _vocode_capture(self, inp: PiecewiseCallInputs) -> dict[str, torch.Tensor]:
-        pool = inp.resources[HIFT_STATE]
-        tail = pool.gather(MEL_TAIL_BLOCK, None, label=HIFT_STATE_LABEL)
-        carry = pool.gather(PHASE_CARRY_BLOCK, None, label=HIFT_STATE_LABEL)
-        output = self.hift.vocode_stream(VocodeInputs(**inp.static_inputs), tail, carry)
-        pool.scatter_(MEL_TAIL_BLOCK, output.tail, None, label=HIFT_STATE_LABEL)
-        pool.scatter_(PHASE_CARRY_BLOCK, output.phase_carry, None, label=HIFT_STATE_LABEL)
+        state = self.hift_state.read(0).fields
+        output = self.hift.vocode_stream(VocodeInputs(**inp.static_inputs), state["mel_tail"], state["phase_carry"])
+        self.hift_state.write(0, mel_tail=output.tail, phase_carry=output.phase_carry)
         return {"pcm": self._pcm(output.wav)}
 
     def _vocode_static_inputs(self, shape: PiecewiseCaptureShape, frames: int, device) -> dict[str, torch.Tensor]:
@@ -1247,13 +1244,8 @@ class HiFTSubmodule(NodeSubmodule):
     def _vocode_step(request_ids, seq_lens) -> SubmoduleStep:
         """A row addresses its stream's slot; a padding row the sink."""
         del seq_lens
-        return SubmoduleStep(
-            steps={
-                HIFT_STATE: RecurrentStep(
-                    segments=tuple(Segment(rid, HIFT_STATE_LABEL, 1) for rid in request_ids)
-                )
-            },
-        )
+        segments = tuple(Segment(rid, HIFT_STATE_LABEL, 1) for rid in request_ids)
+        return SubmoduleStep(state={HIFT_STATE: ArrayStep(segments=segments)})
 
     def get_piecewise_accelerator_graph_configs(
         self, device: torch.device, autocast_dtype: torch.dtype, tp_world_size: int = 1, **kwargs: Any

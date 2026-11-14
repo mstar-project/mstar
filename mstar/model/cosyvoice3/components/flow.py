@@ -94,6 +94,35 @@ class ReferenceVoice:
     def num_prompt_tokens(self) -> int:
         return int(self.prompt_tokens.shape[0])
 
+    def edge(self) -> list[torch.Tensor]:
+        """The voice as an edge carries it, whose tensors build it again in order."""
+        return [self.prompt_tokens, self.prompt_feat, self.embedding]
+
+
+@dataclass(slots=True)
+class FlowCounts:
+    """How far a stream's solves have got: the hops it has planned and the tokens it has settled, the frames whose K/V
+    and convolution tails the flow cache keeps, whether it re-solves every hop from now on, and whether its last chunk
+    has run. It goes from one chunk to the next as one host int64 tensor."""
+
+    hops: int = 0
+    settled: int = 0
+    cached_frames: int = 0
+    resolving: bool = False
+    done: bool = False
+
+    @classmethod
+    def from_edge(cls, signal: Sequence[torch.Tensor]) -> FlowCounts:
+        """The counts `edge` carried; a stream's first chunk has none."""
+        if not signal:
+            return cls()
+        hops, settled, cached_frames, resolving, done = signal[0].tolist()
+        return cls(hops, settled, cached_frames, bool(resolving), bool(done))
+
+    def edge(self) -> list[torch.Tensor]:
+        counts = [self.hops, self.settled, self.cached_frames, self.resolving, self.done]
+        return [torch.tensor(counts, dtype=torch.int64)]
+
 
 @dataclass
 class CosyVoice3FlowRow:
@@ -258,10 +287,10 @@ class CosyVoice3Flow(nn.Module):
 
     @torch.no_grad()
     def solve_new_frames(
-        self, inputs: NewFramesInputs, tails: torch.Tensor, attend, n_timesteps: int
+        self, inputs: NewFramesInputs, tails: torch.Tensor, kv, n_timesteps: int
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """The Euler solve of a batch's new frames, with the K/V of every frame before
-        them in the cache ``attend`` reads: ``[T, 80]`` mel and the rows' next tails.
+        them kept on ``kv``: ``[T, 80]`` mel and the rows' next tails.
         ``tails`` is ``[B, S * 4, K-1, D]``: Euler step, CFG branch, convolution."""
         estimator, rate = self.decoder.estimator, self.decoder.config.inference_cfg_rate
         x = inputs.noise
@@ -273,7 +302,7 @@ class CosyVoice3Flow(nn.Module):
         next_state = []
         for i, (t, r) in enumerate(zip(t_span[:-1], t_span[1:], strict=True)):
             v, tail = estimator.forward_new_frames(
-                x, inputs.cond, inputs.mu, inputs.spks, t, state[i], inputs.rows, attend, i * depth,
+                x, inputs.cond, inputs.mu, inputs.spks, t, state[i], inputs.rows, kv, i * depth,
             )
             next_state.append(tail)
             v = v.to(x.dtype)

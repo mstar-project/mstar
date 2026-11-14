@@ -1,5 +1,5 @@
-"""Partial KV release on a live request: the retention a committing step
-declares (``KVStep.retention``) and the explicit ``KVManager.protect_prefix``
+"""Partial KV release on a live request: the exact retention a request's
+layout keeps (``LabelLayout.retention``) and the explicit ``KVManager.protect_prefix``
 / ``release_oldest`` pair (ported from #198's allocator-level tests onto the
 pool).
 
@@ -24,6 +24,7 @@ from mstar.engine.resources.kv import manager as manager_mod
 from mstar.engine.resources.kv.arena import new_page_arena
 from mstar.engine.resources.kv.cache import KVCache
 from mstar.engine.resources.kv.config import (
+    KVReqConfig,
     KVSpec,
     KVStep,
     PagedKVConfig,
@@ -38,6 +39,7 @@ from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.spec import apply_yaml_overrides, resolve_spec_dependencies
 from mstar.engine.resources.step import Segment, StepContext
 from mstar.engine.windowing import WindowSchedule
+from mstar.model.base import LabelLayout
 
 PS = 8  # page size used throughout
 
@@ -58,16 +60,17 @@ def _ctx(*rids: str) -> StepContext:
     return StepContext(request_ids=tuple(rids), graph_walk="walk", slot=0, capture=False)
 
 
-def _grow(
-    mgr: KVManager, rid: str, label: str, span: int, commit: bool = True,
-    retention: RetentionPolicy | None = None,
-):
-    """Admit, plan and commit one step extending ``label`` by ``span`` tokens,
-    declaring ``retention`` for the stream when given (as a window commit does)."""
-    step = KVStep(
-        segments=(Segment(rid, label, span),), commit=commit,
-        retention={} if retention is None else {(rid, label): retention},
-    )
+def _open(mgr: KVManager, rid: str, policy: RetentionPolicy) -> None:
+    """Ingest ``rid`` with a layout whose exact retention on ``main`` is ``policy``, through the wire's rows."""
+    request = KVReqConfig(needed_labels=["main"])
+    layout = LabelLayout(growth=(("walk", 1),), retention=policy)
+    request.apply_conductor_config(kv_layout={"main": layout.row()}, loop_caps={"walk": 10_000})
+    mgr.ingest_request(rid, overrides=request)
+
+
+def _grow(mgr: KVManager, rid: str, label: str, span: int, commit: bool = True):
+    """Admit, plan and commit one step extending ``label`` by ``span`` tokens."""
+    step = KVStep(segments=(Segment(rid, label, span),), commit=commit)
     ctx = _ctx(rid)
     outcome = mgr.admit(step, ctx)
     assert outcome.ok, outcome.reason
@@ -237,56 +240,51 @@ class _FakePool(CPUPagePool):
 
 
 def test_retention_releases_at_commit() -> None:
-    """A committing step that declares a retention for its stream sheds the
-    oldest unprotected pages as part of the commit that pushes it past the
-    budget: the prefix stays, ``stored_len`` drops by whole pages, the
-    generation moves, pages return to the arena. The policy rides on the step;
-    a step that declares none releases nothing."""
+    """A request whose layout keeps an exact retention sheds the oldest
+    unprotected pages as part of the commit that pushes it past the budget:
+    the prefix stays, ``stored_len`` drops by whole pages, the generation
+    moves, pages return to the arena. The commit that reaches the prefix
+    adopts the policy; a step that commits nothing releases nothing."""
     m = _make_manager(max_num_pages=64)
-    m.ingest_request("r")
     prefix = 3 * PS
+    policy = RetentionPolicy(context_budget=4 * PS, protected_prefix=prefix, exact=True)
+    _open(m, "r", policy)
     _grow(m, "r", "main", prefix)
-    policy = RetentionPolicy(context_budget=4 * PS, protected_prefix=prefix)
     st = _stream(m, "r")
-    assert st.retention is None and st.protected_prefix == 0
+    assert st.retention == policy and st.protected_prefix == prefix
     free0 = m._arena.num_free
     # Four pages of generation fit the budget exactly: nothing released.
     for _ in range(4):
-        _grow(m, "r", "main", PS, retention=policy)
-    assert st.protected_prefix == prefix and st.retention is policy
+        _grow(m, "r", "main", PS)
     assert st.released == 0 and st.stored_len == prefix + 4 * PS
     gen = st.generation
     # The fifth page is one over budget: one page (the oldest) goes.
-    _grow(m, "r", "main", PS, retention=policy)
+    _grow(m, "r", "main", PS)
     assert st.released == PS and st.stored_len == prefix + 4 * PS
     assert st.generation > gen
     assert len(st.page_indices) == 7 and m._arena.num_free == free0 - 4
     # Committing two pages at once releases two.
-    _grow(m, "r", "main", 2 * PS, retention=policy)
+    _grow(m, "r", "main", 2 * PS)
     assert st.released == 3 * PS and st.stored_len == prefix + 4 * PS
     _assert_coherent(st)
     _assert_pages_conserved(m)
     # A non-committing step (a denoise read) never triggers a release.
-    _grow(m, "r", "main", PS, commit=False, retention=policy)
+    _grow(m, "r", "main", PS, commit=False)
     assert st.released == 3 * PS
-    # Neither does a commit that declares no retention.
-    _grow(m, "r", "main", PS)
-    assert st.released == 3 * PS and st.stored_len == prefix + 5 * PS
 
 
 def test_retention_shortfall_carries_over() -> None:
     """Sub-page commits accumulate until a whole page is over budget; the
     realized context never exceeds the budget by a full page."""
     m = _make_manager(max_num_pages=64)
-    m.ingest_request("r")
     prefix = PS
-    _grow(m, "r", "main", prefix)
     budget = 3 * PS
-    policy = RetentionPolicy(context_budget=budget, protected_prefix=prefix)
+    _open(m, "r", RetentionPolicy(context_budget=budget, protected_prefix=prefix, exact=True))
+    _grow(m, "r", "main", prefix)
     st = _stream(m, "r")
     unit = 3  # tokens per unit, not page aligned
     for _ in range(40):
-        _grow(m, "r", "main", unit, retention=policy)
+        _grow(m, "r", "main", unit)
         assert st.stored_len - prefix <= budget + PS - 1
         _assert_coherent(st)
     assert st.released > 0
@@ -301,20 +299,12 @@ def test_retention_validation() -> None:
     with pytest.raises(ValueError):
         RetentionPolicy(context_budget=PS, protected_prefix=-1)
     m = _make_manager()
-    m.ingest_request("r")
+    _open(m, "r", RetentionPolicy(context_budget=PS, protected_prefix=PS, exact=True))
     _grow(m, "r", "main", 2 * PS)
-    # A prefix that has not committed yet is a declaration error.
-    with pytest.raises(ValueError, match="protects"):
-        _grow(m, "r", "main", PS, retention=RetentionPolicy(context_budget=PS, protected_prefix=4 * PS))
     # 32 committed against an 8-token prefix + 8-token budget: two pages go.
-    _grow(m, "r", "main", PS, retention=RetentionPolicy(context_budget=PS, protected_prefix=PS))
+    _grow(m, "r", "main", 2 * PS)
     st = _stream(m, "r")
     assert st.protected_prefix == PS and st.released == 2 * PS
-    # The prefix cannot move afterwards; the budget can.
-    with pytest.raises(ValueError, match="already"):
-        _grow(m, "r", "main", PS, retention=RetentionPolicy(context_budget=PS, protected_prefix=2 * PS))
-    _grow(m, "r", "main", PS, retention=RetentionPolicy(context_budget=3 * PS, protected_prefix=PS))
-    assert st.released == 2 * PS
     # Reset clears the policy with the rest of the stream state.
     m.reset_request("r", free=True)
     st = _stream(m, "r")
@@ -322,18 +312,17 @@ def test_retention_validation() -> None:
 
 
 def test_retention_survives_offload_and_reload() -> None:
-    """The policy rides on each committing step, so an offloaded stream comes
+    """The policy lives on the request's layout, so an offloaded stream comes
     back with nothing to re-install: its next window commit releases per the
     budget as before. The explicit protected prefix and the released count
     travel with the host copy."""
     m = _make_manager(max_num_pages=64)
     m._cpu_pool = _FakePool()
-    m.ingest_request("r")
     prefix = 2 * PS
+    _open(m, "r", RetentionPolicy(context_budget=2 * PS, protected_prefix=prefix, exact=True))
     _grow(m, "r", "main", prefix)
-    policy = RetentionPolicy(context_budget=2 * PS, protected_prefix=prefix)
     for _ in range(4):
-        _grow(m, "r", "main", PS, retention=policy)
+        _grow(m, "r", "main", PS)
     st = _stream(m, "r")
     assert st.released == 2 * PS and st.stored_len == prefix + 2 * PS
     assert m.offload("r") == 4
@@ -341,8 +330,7 @@ def test_retention_survives_offload_and_reload() -> None:
     assert m.reload("r")
     st = _stream(m, "r")
     assert (st.stored_len, st.released, st.protected_prefix) == (prefix + 2 * PS, 2 * PS, prefix)
-    assert st.retention is None
-    _grow(m, "r", "main", PS, retention=policy)
+    _grow(m, "r", "main", PS)
     assert st.released == 3 * PS and st.stored_len == prefix + 2 * PS
     _assert_coherent(st)
     _assert_pages_conserved(m)
@@ -362,19 +350,19 @@ def test_protected_prefix_survives_offload_and_reload() -> None:
 
 
 def test_window_schedule_drives_the_manager() -> None:
-    """The schedule's budget, declared on every window commit and applied by
-    the real pool: the retained context never exceeds the horizon plus one
-    page."""
+    """The schedule's budget, kept by the request's layout and applied by the
+    real pool at every window commit: the retained context never exceeds the
+    horizon plus one page."""
     m = _make_manager(max_num_pages=128)
-    m.ingest_request("r")
     prefix = 3 * PS
-    _grow(m, "r", "main", prefix)
     schedule = WindowSchedule(total_units=48, window_units=8, context_units=16)
     tpu = PS // 2
     policy = schedule.retention(tpu, prefix)
     assert policy.context_budget == 16 * tpu and policy.protected_prefix == prefix
+    _open(m, "r", dataclasses.replace(policy, exact=True))
+    _grow(m, "r", "main", prefix)
     for w in schedule.windows():
-        _grow(m, "r", "main", (w.commit_end - w.commit_start) * tpu, retention=policy)
+        _grow(m, "r", "main", (w.commit_end - w.commit_start) * tpu)
         st = _stream(m, "r")
         retained_units = (st.stored_len - prefix) // tpu
         # Never more than the context horizon plus one page's worth of slack.

@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import math
 import os
+from contextlib import contextmanager
+from types import SimpleNamespace
 
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
@@ -28,10 +30,27 @@ import torch.nn.functional as F
 
 from mstar.distributed.communication import CommGroup
 from mstar.engine.resources import AdmitOutcome, StepContext, StepRunner
-from mstar.engine.resources.base import AttentionResource
+from mstar.engine.resources.base import AttentionResource, Resource
+from mstar.engine.resources.kv.config import KVReqConfig
 from mstar.engine.resources.kv.plan import group_by_plan_label
 from mstar.engine.resources.sequence_shard import SequenceShard
-from mstar.model.cosmos3.submodules import ATTN, COND_LABEL, KV_CACHE, LATENT_DTYPE, SEQ_SHARD, UNCOND_LABEL
+from mstar.engine.resources.step import Segment, SubmoduleStep
+from mstar.engine.state import ArrayStep
+from mstar.engine.state.adapters import kv_layouts, node_handles, state_setup, state_steps
+from mstar.model.cosmos3.constants import KV_CACHE, SEQ_SHARD
+from mstar.model.cosmos3.cosmos3_model import DIT_NODE, Cosmos3Model
+from mstar.model.cosmos3.submodules import (
+    ATTN,
+    ATTN_GEN,
+    COND_LABEL,
+    IMAGE_GEN_LOOP,
+    LATENT_DTYPE,
+    SESSION_TAIL,
+    UNCOND_LABEL,
+    VIDEO_GEN_AR_LOOP,
+    WINDOW_COND,
+)
+from mstar.model.keys import ROPE
 from mstar.model.submodule_base import ModelInputsFromEngine, engine_step
 
 PROMPT = "A red cube resting on a polished wooden table, soft daylight."
@@ -48,53 +67,85 @@ SEED = 42
 VIDEO_FRAMES = 17  # latent T = 1 + (17 - 1) // 4 = 5
 
 
-class _SdpaResources:
-    """In-process reference resources with the step surface the DiT calls,
-    backed by stored tensors + sdpa (the same kernel as the fused pipeline).
+def declaring(config) -> Cosmos3Model:
+    """A model that declares the state a deployment of ``config`` serves, with nothing loaded."""
+    model = object.__new__(Cosmos3Model)
+    model.config, model.skip_weight_loading = config, True
+    return model
 
-    Two objects, matching what the node declares: a ``kv`` that holds each
-    layer's understanding K/V and a ``attn`` that attends over it (and the
-    node's sequence shard, on one rank, which every step declares). Prefill
+
+class _SdpaResources:
+    """In-process reference resources behind the DiT's handles, backed by stored
+    tensors + sdpa (the same kernel as the fused pipeline).
+
+    Matching what the node declares: a ``kv`` that holds each layer's
+    understanding K/V, an attention that attends over it, which both of the
+    array's reads run on, the array's positions where a reasoner declares them,
+    and the node's sequence shard on one rank. Prefill
     writes its K/V pending; the runner's ``commit`` promotes it, and every
     denoise step re-reads it.
 
-    Also models the batched classifier-free-guidance plan: under a combined
-    plan label the packed sequence carries both branches, so the plan output
-    records where each branch's block starts and ``run`` routes each block to
-    its own label's cached prefix. That makes the batched result equal to
-    running the branches sequentially.
+    Under the combined plan of a step over both guidance branches the packed
+    sequence carries both, so the plan output records where each branch's block
+    starts and ``run`` routes each block to its own label's cached prefix.
     """
 
     def __init__(self):
         self.kv = _SdpaKV()
         self.attn = _SdpaAttention(self.kv)
+        self.positions = _UnreadPositions()
         self.shard = SequenceShard((COND_LABEL, UNCOND_LABEL), 0, None, 0, CommGroup.trivial())
 
     def as_dict(self):
-        return {KV_CACHE: self.kv, ATTN: self.attn, SEQ_SHARD: self.shard}
+        return {KV_CACHE: self.kv, ATTN: self.attn, ATTN_GEN: self.attn, ROPE: self.positions, SEQ_SHARD: self.shard}
 
-    def bind(self, module):
-        """Bind these into a bare transformer, the way
-        ``NodeSubmodule.bind_node_resources`` does for a served node.
-
-        Unlike that walk, the root is bound too: there the root is the
-        submodule, which takes its resources separately, but here it is the
-        transformer, which binds the shared attend callable."""
-        resources = self.as_dict()
+    def bind(self, model, module):
+        """Bind the DiT's handles over these into ``module``'s layers, as
+        ``NodeSubmodule.bind_node_state`` does for a served node, for the tests
+        that drive a bare transformer. ``model`` declares the state."""
+        self.handles = dit_handles(model, self.as_dict())[0]
         for child in module.modules():
-            bind = getattr(child, "bind_resources", None)
+            bind = getattr(child, "bind_state", None)
             if bind is not None:
-                bind(resources)
+                bind(self.handles)
 
-    def plan(self, plan_label, groups, causal):
-        """Stand in for a step declaration, for the tests that call the
-        transformer directly instead of going through the submodule.
+    def step(self, walk, segments, fn, keep=True):
+        """Run ``fn`` inside one step over ``segments``, ``[(request id, label,
+        span)]`` in packed order, as the engine opens a node's handles around
+        its forward, and commit it: what it adds is kept, or with ``keep``
+        False dropped."""
+        step = state_steps(
+            SubmoduleStep(segments=[Segment(*s) for s in segments], state={KV_CACHE: ArrayStep(keep=keep)}),
+            self.handles, graph_walk=walk,
+        )
+        step.set_ctx(StepContext(tuple(dict.fromkeys(s[0] for s in segments)), walk, 0, False))
+        runner = StepRunner(self.as_dict())
+        assert runner.admit(step).ok
+        runner.plan(step)
+        step.begin_calls()
+        try:
+            out = fn()
+            step.check_calls()
+            runner.commit(step)
+        finally:
+            step.end_calls()
+        return out
 
-        ``groups`` is ``[(cache label, span)]`` in packed order — what the KV
-        resource's plan output carries and every other resource reads.
-        """
-        self.kv.groups = {plan_label: list(groups)}
-        self.attn.causal = causal
+
+def dit_handles(model, resources):
+    """The DiT node's handles over ``resources``, built as the engine builds
+    them at load, and the setup whose host fields its ``PROGRESS`` keeps."""
+    setup, problems = state_setup({}, model.declare_state(), model.kernel_settings())
+    assert not problems, problems
+    return node_handles(model, DIT_NODE, resources, setup=setup), setup
+
+
+def kv_config(model, state_layout, loop_caps) -> KVReqConfig:
+    """The ``kv`` config a request opens with, from what its ``process_prompt`` laid out, as the conductor builds it."""
+    layout = kv_layouts(model.declare_state(), state_layout, {})[KV_CACHE]
+    config = KVReqConfig(needed_labels=list(layout))
+    config.apply_conductor_config(kv_layout={label: each.row() for label, each in layout.items()}, loop_caps=loop_caps)
+    return config
 
 
 class _SdpaKV(AttentionResource):
@@ -102,7 +153,7 @@ class _SdpaKV(AttentionResource):
     other resource reads off ``ctx.plan_results``.
 
     An AttentionResource so it carries the same label/layer cursors the real
-    one does — that is what layers reach it through."""
+    one does."""
 
     @classmethod
     def build(cls, *args, **kwargs):
@@ -113,39 +164,49 @@ class _SdpaKV(AttentionResource):
         self.pending: dict[tuple[str, int], tuple[torch.Tensor, torch.Tensor]] = {}
         # plan label -> [(source label, span)], in packed order
         self.groups: dict[str, list[tuple[str, int]]] = {}
-        # Windowed kv mode: the retention the commit step declares for each
-        # label, applied at commit like the pool does (whole pages from the
-        # first page past the protected prefix; see KVManager._apply_retention).
+        self.planned: dict[str, tuple] = {}
+        # Windowed kv mode: the exact retention a request's layout keeps on
+        # each label, applied at commit like the pool does (whole pages from
+        # the first page past the protected prefix; see KVManager._apply_retention).
         self.page_size = page_size
-        self.retention: dict[str, tuple[int, int]] = {}  # label -> (prefix, budget)
+        self.retention: dict[str, object] = {}  # label -> RetentionPolicy
         self.released: dict[str, int] = {}
 
     def depends_on(self):
         return set()
 
     def ingest_request(self, rid, overrides=None):
-        return
+        for label, layout in (getattr(overrides, "kv_layout", None) or {}).items():
+            if layout.retention is not None and layout.retention.exact:
+                self.retention[label] = layout.retention
 
     def remove_request(self, rid):
         return
+
+    def opens_label(self, rid, label):
+        return True
+
+    def views(self, label):
+        """The streams the step plans under ``label``, each with the retention
+        its layout keeps, which a kept-window read checks."""
+        return [
+            SimpleNamespace(request_id=seg.request_id, label=seg.label, retention=self.retention.get(seg.label))
+            for seg in self.planned.get(label, ())
+        ]
 
     def admit(self, step, ctx):
         return AdmitOutcome(ok=True)
 
     def plan(self, step, ctx):
+        self.planned = group_by_plan_label(tuple(step.segments), step.combined_labels)
         self.groups = {
-            plan_label: [(seg.label, seg.span) for seg in segments]
-            for plan_label, segments in group_by_plan_label(
-                tuple(step.segments), step.combined_labels
-            ).items()
+            plan_label: [(seg.label, seg.span) for seg in segments] for plan_label, segments in self.planned.items()
         }
         return self.groups
 
     def commit(self, step, ctx):
         if step.commit:
             self.promote()
-            for (_rid, label), policy in step.retention.items():
-                self.retention[label] = (policy.protected_prefix, policy.context_budget)
             for label in {seg.label for seg in step.segments}:
                 self._apply_retention(label)
         else:
@@ -166,12 +227,11 @@ class _SdpaKV(AttentionResource):
         self.pending = {}
 
     def _apply_retention(self, label):
-        if label not in self.retention:
-            return
-        prefix, budget = self.retention[label]
+        policy = self.retention.get(label)
         keys = [key for key in self.committed if key[0] == label]
-        if not keys:
+        if policy is None or not keys:
             return
+        prefix, budget = policy.protected_prefix, policy.context_budget
         ps = self.page_size
         stream_len = self.committed[keys[0]][0].shape[0]
         first = -(-prefix // ps)
@@ -190,7 +250,7 @@ class _SdpaKV(AttentionResource):
             layer_idx = self._default_layer_idx
         return layer_idx
 
-    def write_kv(self, k, v, layer_idx=None, label=None):
+    def write_kv(self, k, v, layer_idx=None, label=None, tokens=None):
         if layer_idx is None:
             layer_idx = self._default_layer_idx
         if label is None:
@@ -207,7 +267,7 @@ class _SdpaKV(AttentionResource):
 
 
 class _SdpaAttention(AttentionResource):
-    """The ``attn`` half: sdpa over [committed prefix | this step's K/V]."""
+    """The attention half: sdpa over [committed prefix | this step's K/V]."""
 
     requires_kv_write = True
 
@@ -268,22 +328,55 @@ class _SdpaAttention(AttentionResource):
         return torch.cat(outs, 0)
 
 
+class _UnreadPositions(Resource):
+    """The ``kv`` array's positions, which the DiT's steps plan and never read."""
+
+    @classmethod
+    def build(cls, *args, **kwargs):
+        raise NotImplementedError("test stub")
+
+    def depends_on(self):
+        return set()
+
+    def ingest_request(self, rid, overrides=None):
+        return
+
+    def remove_request(self, rid):
+        return
+
+    def admit(self, step, ctx):
+        return AdmitOutcome(ok=True)
+
+    def plan(self, step, ctx):
+        return
+
+    def commit(self, step, ctx):
+        return
+
+
 def _forward_step(
-    dit, walk, resources, rids, fwds, inputs, batched=False, cg_runner=None,
+    model, dit, walk, resources, rids, fwds, inputs, batched=False, cg_runner=None,
 ):
     """Drive one step the way the v1 engine does: lease, declare, admit, plan,
-    preprocess, forward, commit — a trimmed ``Engine.exec``.
+    preprocess, forward, commit, with the step's handles open around preprocess
+    and forward — a trimmed ``Engine.exec``.
 
     With ``cg_runner`` the step takes a capture slot when one matches, which
     pads the batch to the slot's shape and replays instead of running the
     eager forward. Everything above the launch is the same either way.
     """
     runner = StepRunner(resources)
-    # The engine binds a node's resources into its layers at load; the harness
-    # drives the bare submodule, so bind (or re-bind, when a test swaps the
-    # resource set) here.
-    if dit.node_resources is not resources:
-        dit.bind_node_resources(resources)
+    # The engine binds a node's handles into its layers at load and opens a
+    # request's host fields at its ingest; the harness drives the bare
+    # submodule, so it binds here (again, when a test swaps the resource set).
+    bound = getattr(dit, "_harness_bound", None)
+    if bound is None or bound[0] is not resources:
+        handles, setup = dit_handles(model, resources)
+        dit.bind_node_state(handles)
+        dit._harness_bound = bound = (resources, setup)
+    for rid in rids:
+        if not bound[1].host_fields.is_open(rid):
+            bound[1].host_fields.open(rid)
     real_ids = list(rids)
     step_ids, step_fwds = real_ids, dict(fwds)
     lease = None
@@ -300,7 +393,7 @@ def _forward_step(
         step_fwds = cg_runner.step_metadata(lease, real_ids, step_fwds)
         step_ids = cg_runner.step_ids(lease, real_ids)
 
-    step = engine_step(dit, walk, step_ids, inputs, slot_lease=lease)
+    step = engine_step(dit, graph_walk=walk, request_ids=step_ids, inputs=inputs, slot_lease=lease)
     if step is not None:
         step.set_ctx(StepContext(
             request_ids=tuple(step_ids), graph_walk=walk,
@@ -310,16 +403,16 @@ def _forward_step(
         outcome = runner.admit(step)
         assert outcome.ok, f"admit failed: {outcome.reason}"
         runner.plan(step)
+        step.begin_calls()
     ei = ModelInputsFromEngine(
         request_ids=list(step_ids),
         per_request_info=step_fwds,
         resources=dict(resources),
-        per_request_states={rid: dit.request_state(rid) for rid in step_ids},
         step=step,
         captured=lease is not None,
     )
-    pre = dit.preprocess(walk, ei, inputs)
     try:
+        pre = dit.preprocess(walk, ei, inputs)
         if lease is not None:
             raw = cg_runner.run_forward(lease, pre).per_rid_outputs
             # A captured forward emits its entries under the slot's padding
@@ -337,28 +430,43 @@ def _forward_step(
             forward = dit.forward_batched if batched else dit.forward
             out = forward(walk, ei, **pre)
         if step is not None:
+            step.check_calls()
             runner.commit(step)
+            step.commit_calls()
     finally:
+        if step is not None:
+            step.end_calls()
         if lease is not None:
             cg_runner.release(lease, len(real_ids))
     return out
 
 
-def _engine_resources(model, rids, device, dtype, max_num_pages=64, backend=None):
+@contextmanager
+def _backend(model, backend):
+    """Serve ``model`` on attention ``backend`` inside the block: the resources
+    and handles built there both follow it."""
+    prev = model.config.attention_backend
+    model.config.attention_backend = backend
+    try:
+        yield
+    finally:
+        model.config.attention_backend = prev
+
+
+def _engine_resources(model, rids, device, dtype, max_num_pages=64, configs=None):
     """The node's resources, built from the model's own declaration — the same
-    path the engine takes, minus the worker around it."""
+    path the engine takes, minus the worker around it. Each of ``rids`` is
+    ingested with its config in ``configs``, by default the one the conductor
+    gives a request that lays nothing out."""
     from mstar.communication.tensors import LocalTransferEngine
     from mstar.distributed.communication import CommGroup, JointGroups
     from mstar.engine.resources.base import EngineResourceInfo, build_resource
     from mstar.engine.resources.kv.transfer import TransferEngineInfo
+    from mstar.engine.state.adapters import node_resources
 
-    prev_backend = model.config.attention_backend
-    if backend is not None:
-        model.config.attention_backend = backend
-    try:
-        specs = model.get_node_resources()
-    finally:
-        model.config.attention_backend = prev_backend
+    setup, problems = state_setup({}, model.declare_state(), model.kernel_settings())
+    assert not problems, problems
+    specs = node_resources(model, setup=setup)
     for spec in specs:
         if spec.resource_key == KV_CACHE:
             spec.apply_yaml_overrides(max_num_pages=max_num_pages)
@@ -381,11 +489,30 @@ def _engine_resources(model, rids, device, dtype, max_num_pages=64, backend=None
         )
         for spec in specs
     }
-    overrides = model.get_request_resource_configs([], [], {})
+    labels = list(model.kv_labels()[KV_CACHE])
     runner = StepRunner(resources)
     for rid in rids:
-        runner.ingest_request(rid, overrides)
+        runner.ingest_request(rid, (configs or {}).get(rid) or {KV_CACHE: KVReqConfig(needed_labels=labels)})
     return resources
+
+
+def _gen_inputs(dit, md, latents, device):
+    """A denoise loop's first loop-back inputs, starting from ``latents``
+    rather than the request's own draw: the latents and the solver state the
+    request's sampler starts from."""
+    st = dit._settings(md, 0, {}, device)
+    solver = dit._first_solver_state(st, latents)
+    return {"latents": [latents], **{name: [tensor] for name, tensor in solver.items()}}
+
+
+def _carried(dit, out):
+    """The loop-back edges a denoise step's outputs carry to the next."""
+    return {name: out[name] for name in ("latents", *dit._solver_state)}
+
+
+def _prompt_md(model, cond_ids, uncond_ids, **md):
+    """A generation request's step metadata, as its walk plan gives it."""
+    return {**md, model.PROMPT_LENGTHS: (len(cond_ids), len(uncond_ids))}
 
 
 @torch.no_grad()
@@ -393,8 +520,10 @@ def _run_cache_once(model, dit, resources, init, cond_ids, uncond_ids, device, n
     from mstar.conductor.request_info import CurrentForwardPassInfo
 
     rid = "r0"
-    md = {"height": H, "width": W, "num_frames": num_frames, "fps": 24.0,
-          "guidance_scale": GS, "num_inference_steps": STEPS}
+    md = _prompt_md(
+        model, cond_ids, uncond_ids, height=H, width=W, num_frames=num_frames, fps=24.0,
+        guidance_scale=GS, num_inference_steps=STEPS,
+    )
     fwd = CurrentForwardPassInfo(
         request_id=rid, rid_handle=rid, graph_walk="prefill",
         fwd_index=0, random_seed=SEED, max_tokens=0, step_metadata=md,
@@ -404,17 +533,16 @@ def _run_cache_once(model, dit, resources, init, cond_ids, uncond_ids, device, n
         torch.tensor(uncond_ids, dtype=torch.long, device=device),
     ]
     ni = dit.prepare_inputs("prefill", fwd, {"text_inputs": text_inputs})
-    _forward_step(dit, "prefill", resources, [rid], {rid: fwd}, [ni])
+    _forward_step(model, dit, "prefill", resources, [rid], {rid: fwd}, [ni])
 
-    latents = init.clone()
-    time_index = torch.zeros(1, dtype=torch.long, device=device)
+    edges = _gen_inputs(dit, md, init.clone(), device)
     fwd.graph_walk = "image_gen"
-    for _ in range(STEPS):
-        ni = dit.prepare_inputs("image_gen", fwd, {"latents": [latents], "time_index": [time_index]})
-        out = _forward_step(dit, "image_gen", resources, [rid], {rid: fwd}, [ni])
-        latents, time_index = out["latents"][0], out["time_index"][0]
+    for k in range(STEPS):
+        fwd.dynamic_loop_iter_counts[IMAGE_GEN_LOOP] = k
+        ni = dit.prepare_inputs("image_gen", fwd, edges)
+        edges = _carried(dit, _forward_step(model, dit, "image_gen", resources, [rid], {rid: fwd}, [ni]))
     dit.cleanup_request(rid)
-    return latents
+    return edges["latents"][0]
 
 
 @torch.no_grad()
@@ -428,10 +556,12 @@ def _run_batched(model, dit, resources, init, conds, unconds, device, rids):
     """
     from mstar.conductor.request_info import CurrentForwardPassInfo
 
-    md = {"height": H, "width": W, "num_frames": 1, "fps": 24.0,
-          "guidance_scale": GS, "num_inference_steps": STEPS}
-    fwds = {}
+    fwds, edges = {}, {}
     for i, rid in enumerate(rids):
+        md = _prompt_md(
+            model, conds[i], unconds[i], height=H, width=W, num_frames=1, fps=24.0,
+            guidance_scale=GS, num_inference_steps=STEPS,
+        )
         fwd = CurrentForwardPassInfo(
             request_id=rid, rid_handle=rid, graph_walk="prefill", fwd_index=0,
             random_seed=SEED, max_tokens=0, step_metadata=md,
@@ -440,26 +570,21 @@ def _run_batched(model, dit, resources, init, conds, unconds, device, rids):
         ti = [torch.tensor(conds[i], dtype=torch.long, device=device),
               torch.tensor(unconds[i], dtype=torch.long, device=device)]
         ni = dit.prepare_inputs("prefill", fwd, {"text_inputs": ti})
-        _forward_step(dit, "prefill", resources, [rid], {rid: fwd}, [ni])
+        _forward_step(model, dit, "prefill", resources, [rid], {rid: fwd}, [ni])
+        edges[rid] = _gen_inputs(dit, md, init.clone(), device)
 
     for rid in rids:
         fwds[rid].graph_walk = "image_gen"
-    latents = {rid: init.clone() for rid in rids}
-    time_index = {rid: torch.zeros(1, dtype=torch.long, device=device) for rid in rids}
-    for _ in range(STEPS):
-        inputs = [
-            dit.prepare_inputs("image_gen", fwds[rid],
-                               {"latents": [latents[rid]], "time_index": [time_index[rid]]})
-            for rid in rids
-        ]
-        out = _forward_step(
-            dit, "image_gen", resources, rids, fwds, inputs, batched=True,
-        )
+    for k in range(STEPS):
+        inputs = []
         for rid in rids:
-            latents[rid], time_index[rid] = out[rid]["latents"][0], out[rid]["time_index"][0]
+            fwds[rid].dynamic_loop_iter_counts[IMAGE_GEN_LOOP] = k
+            inputs.append(dit.prepare_inputs("image_gen", fwds[rid], edges[rid]))
+        out = _forward_step(model, dit, "image_gen", resources, rids, fwds, inputs, batched=True)
+        edges = {rid: _carried(dit, out[rid]) for rid in rids}
     for rid in rids:
         dit.cleanup_request(rid)
-    return latents
+    return {rid: edges[rid]["latents"][0] for rid in rids}
 
 
 _SETUP_CACHE: dict = {}
@@ -521,26 +646,24 @@ def _scenario(num_frames):
     return ctx
 
 
-def _check_cache_once_exact(num_frames, tag):
+def _check_cache_once(num_frames, tag):
+    """The cache-once path on the sdpa resources, the fused pipeline's kernel. Both guidance branches run in one
+    step, whose GEMMs round in bf16 apart from the fused pipeline's branch at a time, so the bar is the engine
+    path's decoded PSNR."""
     ctx = _scenario(num_frames)
     if ctx is None:
         print(f"  (skipped {tag} cache-once parity: needs COSMOS3_NANO_DIR + CUDA)")
         return
-    dit = ctx["dit"]
-    prev = dit.batched_cfg
-    # The sequential guidance path matches the fused pipeline bit-for-bit; the
-    # batched path differs only in bf16 GEMM rounding (covered by the PSNR checks).
-    dit.batched_cfg = False
-    try:
-        lat = _run_cache_once(
-            ctx["model"], dit, _SdpaResources().as_dict(), ctx["init"], ctx["cond"], ctx["uncond"],
-            ctx["device"], num_frames,
-        )
-    finally:
-        dit.batched_cfg = prev
-    diff = (ctx["lat_fused"].float() - lat.reshape(ctx["lat_fused"].shape).float()).abs().max().item()
-    assert diff <= 1e-3, f"{tag} cache-once latents differ from fused by {diff:.3e} (> 1e-3)"
-    print(f"  {tag} cache-once (sdpa) latent abs-max diff = {diff:.3e}")
+    lat = _run_cache_once(
+        ctx["model"], ctx["dit"], _SdpaResources().as_dict(), ctx["init"], ctx["cond"], ctx["uncond"],
+        ctx["device"], num_frames,
+    )
+    img_fused = ctx["mpipe"]._decode(ctx["lat_fused"]).squeeze().float().cpu()
+    img_sdpa = ctx["mpipe"]._decode(lat.reshape(ctx["lat_fused"].shape)).squeeze().float().cpu()
+    mse = (img_fused - img_sdpa).pow(2).mean().item()
+    psnr = float("inf") if mse == 0 else -10 * math.log10(mse)
+    assert psnr >= 30, f"{tag} cache-once PSNR {psnr:.2f} < 30 (MSE {mse:.3e})"
+    print(f"  {tag} cache-once (sdpa) PSNR = {psnr:.2f} dB")
 
 
 def _check_engine_psnr(num_frames, tag):
@@ -579,20 +702,15 @@ def _check_dense_fa3(num_frames, tag):
     try:
         # Paged baseline vs the dense backend (cosmos3 config defaults dense on):
         # the same submodule code runs against each backend class.
-        cm = _engine_resources(
-            ctx["model"], ["r0"], ctx["device"], ctx["dtype"], backend="flashinfer",
-        )
-        lat_paged = _run_cache_once(
-            ctx["model"], ctx["dit"], cm, ctx["init"], ctx["cond"], ctx["uncond"],
-            ctx["device"], num_frames,
-        )
-        cm2 = _engine_resources(
-            ctx["model"], ["r0"], ctx["device"], ctx["dtype"], backend="dense_gen",
-        )
-        lat_dense = _run_cache_once(
-            ctx["model"], ctx["dit"], cm2, ctx["init"], ctx["cond"], ctx["uncond"],
-            ctx["device"], num_frames,
-        )
+        lat = {}
+        for backend in ("flashinfer", "dense_gen"):
+            with _backend(ctx["model"], backend):
+                cm = _engine_resources(ctx["model"], ["r0"], ctx["device"], ctx["dtype"])
+                lat[backend] = _run_cache_once(
+                    ctx["model"], ctx["dit"], cm, ctx["init"], ctx["cond"], ctx["uncond"],
+                    ctx["device"], num_frames,
+                )
+        lat_paged, lat_dense = lat["flashinfer"], lat["dense_gen"]
     except Exception as exc:  # noqa: BLE001
         print(f"  (skipped {tag} dense-FA3 parity: FA3/FlashInfer unavailable: {exc})")
         return
@@ -721,46 +839,16 @@ def test_compile_vae_matches_eager_t2v() -> None:
     _check_compile_vae(VIDEO_FRAMES, "t2v")
 
 
-@torch.no_grad()
-def test_batched_cfg_matches_sequential() -> None:
-    """Running both guidance branches in one batched forward must match running
-    them sequentially. The two paths differ only in bf16 GEMM rounding (a batched
-    matmul tiles differently), so compare the decoded images by PSNR."""
-    ctx = _scenario(1)
-    if ctx is None:
-        print("  (skipped batched-CFG vs sequential: needs COSMOS3_NANO_DIR + CUDA)")
-        return
-    dit, prev, decoded = ctx["dit"], ctx["dit"].batched_cfg, {}
-    try:
-        for flag in (False, True):
-            dit.batched_cfg = flag
-            try:
-                cm = _engine_resources(ctx["model"], ["r0"], ctx["device"], ctx["dtype"])
-            except Exception as exc:  # noqa: BLE001
-                print(f"  (skipped batched-CFG vs sequential: FlashInfer unavailable: {exc})")
-                return
-            lat = _run_cache_once(
-                ctx["model"], dit, cm, ctx["init"], ctx["cond"], ctx["uncond"], ctx["device"], 1
-            )
-            decoded[flag] = ctx["mpipe"]._decode(lat.reshape(ctx["lat_fused"].shape)).squeeze().float().cpu()
-    finally:
-        dit.batched_cfg = prev
-    mse = (decoded[False] - decoded[True]).pow(2).mean().item()
-    psnr = float("inf") if mse == 0 else -10 * math.log10(mse)
-    assert psnr >= 35, f"batched vs sequential PSNR {psnr:.2f} < 35 (MSE {mse:.3e})"
-    print(f"  batched-CFG vs sequential decoded PSNR = {psnr:.2f} dB")
-
-
-def test_cache_once_matches_fused_exact() -> None:
-    _check_cache_once_exact(1, "t2i")
+def test_cache_once_matches_fused() -> None:
+    _check_cache_once(1, "t2i")
 
 
 def test_engine_cache_path_image_psnr() -> None:
     _check_engine_psnr(1, "t2i")
 
 
-def test_cache_once_matches_fused_exact_t2v() -> None:
-    _check_cache_once_exact(VIDEO_FRAMES, "t2v")
+def test_cache_once_matches_fused_t2v() -> None:
+    _check_cache_once(VIDEO_FRAMES, "t2v")
 
 
 def test_engine_cache_path_video_psnr() -> None:
@@ -906,14 +994,20 @@ def _windowed_scenario():
     return ctx
 
 
+def _windowed_config(model, md, cond_ids, uncond_ids) -> KVReqConfig:
+    """The ``kv`` config a windowed request opens with: its layout keeps the schedule's context behind each prompt."""
+    return kv_config(model, {KV_CACHE: model._gen_layout(md, cond_ids, uncond_ids, [], {})}, model.get_loop_caps(**md))
+
+
 @torch.no_grad()
-def _run_windowed_kv_served(dit, resources, md, cond_ids, uncond_ids, device):
+def _run_windowed_kv_served(model, dit, resources, md, cond_ids, uncond_ids, device):
     """Drive the served kv path — prefill, then every loop iteration of the
     AR walk (denoise steps + commit passes) through the engine's step cycle —
     collecting the streamed per-window latents."""
     from mstar.conductor.request_info import CurrentForwardPassInfo
 
     rid = "r0"
+    md = _prompt_md(model, cond_ids, uncond_ids, **md)
     fwd = CurrentForwardPassInfo(
         request_id=rid, rid_handle=rid, graph_walk="prefill",
         fwd_index=0, random_seed=SEED, max_tokens=0, step_metadata=md,
@@ -923,17 +1017,20 @@ def _run_windowed_kv_served(dit, resources, md, cond_ids, uncond_ids, device):
         torch.tensor(uncond_ids, dtype=torch.long, device=device),
     ]
     ni = dit.prepare_inputs("prefill", fwd, {"text_inputs": text_inputs})
-    _forward_step(dit, "prefill", resources, [rid], {rid: fwd}, [ni])
+    _forward_step(model, dit, "prefill", resources, [rid], {rid: fwd}, [ni])
 
     fwd.graph_walk = "video_gen_ar"
     windows = []
-    inputs = {}
-    for _ in range(md["num_windows"] * (md["num_inference_steps"] + 1)):
+    # the conductor's empty edges before iteration 0
+    empty = torch.zeros(0, device=device)
+    inputs = {WINDOW_COND: [empty], SESSION_TAIL: [empty]}
+    for k in range(md["num_windows"] * (md["num_inference_steps"] + 1)):
+        fwd.dynamic_loop_iter_counts[VIDEO_GEN_AR_LOOP] = k
         ni = dit.prepare_inputs("video_gen_ar", fwd, inputs)
-        out = _forward_step(dit, "video_gen_ar", resources, [rid], {rid: fwd}, [ni])
+        out = _forward_step(model, dit, "video_gen_ar", resources, [rid], {rid: fwd}, [ni])
         if "window_latents" in out:
             windows.append(out["window_latents"][0].clone())
-        inputs = {"latents": [out["latents"][0]], "time_index": [out["time_index"][0]]}
+        inputs = {**_carried(dit, out), WINDOW_COND: out[WINDOW_COND], SESSION_TAIL: out[SESSION_TAIL]}
     dit.cleanup_request(rid)
     return windows
 
@@ -941,22 +1038,17 @@ def _run_windowed_kv_served(dit, resources, md, cond_ids, uncond_ids, device):
 def test_windowed_kv_matches_reference() -> None:
     """The served kv path — block-causal denoise over committed context,
     commit passes, page-floor release — must reproduce the hand-rolled
-    reference bit-tightly on the sdpa resources (sequential guidance, the
-    bit-exact regime), window by window."""
+    reference bit-tightly on the sdpa resources, window by window. The
+    reference packs the guidance branches as the served step does."""
     ctx = _windowed_scenario()
     if ctx is None:
         print("  (skipped windowed-kv reference parity: needs COSMOS3_NANO_DIR + CUDA)")
         return
-    dit, prev = ctx["dit"], ctx["dit"].batched_cfg
-    dit.batched_cfg = False
     sdpa = _SdpaResources()
-    sdpa.bind(dit.transformer)
-    try:
-        wins = _run_windowed_kv_served(
-            dit, sdpa.as_dict(), ctx["md"], ctx["cond"], ctx["uncond"], ctx["device"],
-        )
-    finally:
-        dit.batched_cfg = prev
+    sdpa.kv.ingest_request("r0", _windowed_config(ctx["model"], ctx["md"], ctx["cond"], ctx["uncond"]))
+    wins = _run_windowed_kv_served(
+        ctx["model"], ctx["dit"], sdpa.as_dict(), ctx["md"], ctx["cond"], ctx["uncond"], ctx["device"],
+    )
     assert len(wins) == len(ctx["ref"]) == ctx["md"]["num_windows"]
     # 12 units committed against a 6-unit horizon -> 6 units (384 tokens,
     # 3 whole pages) released per label.
@@ -983,18 +1075,18 @@ def test_windowed_kv_engine_release_and_psnr() -> None:
     if ctx is None:
         print("  (skipped windowed-kv engine parity: needs COSMOS3_NANO_DIR + CUDA)")
         return
-    try:
-        resources = _engine_resources(
-            ctx["model"], ["r0"], ctx["device"], ctx["dtype"], backend="flashinfer",
+    config = {KV_CACHE: _windowed_config(ctx["model"], ctx["md"], ctx["cond"], ctx["uncond"])}
+    with _backend(ctx["model"], "flashinfer"):
+        try:
+            resources = _engine_resources(ctx["model"], ["r0"], ctx["device"], ctx["dtype"], configs={"r0": config})
+        except Exception as exc:  # noqa: BLE001
+            print(f"  (skipped windowed-kv engine parity: FlashInfer unavailable: {exc})")
+            return
+        kv = resources[KV_CACHE]
+        free0 = kv._arena.num_free
+        wins = _run_windowed_kv_served(
+            ctx["model"], ctx["dit"], resources, ctx["md"], ctx["cond"], ctx["uncond"], ctx["device"],
         )
-    except Exception as exc:  # noqa: BLE001
-        print(f"  (skipped windowed-kv engine parity: FlashInfer unavailable: {exc})")
-        return
-    kv = resources[KV_CACHE]
-    free0 = kv._arena.num_free
-    wins = _run_windowed_kv_served(
-        ctx["dit"], resources, ctx["md"], ctx["cond"], ctx["uncond"], ctx["device"],
-    )
 
     page_size = kv.config.tokens_per_page
     frame_tokens = ctx["md"]["total_latent_units"] * 64  # 64 tokens/unit at 256p
@@ -1040,13 +1132,15 @@ def test_windowed_kv_dense_matches_paged() -> None:
         return
     try:
         outs = {}
+        config = {KV_CACHE: _windowed_config(ctx["model"], ctx["md"], ctx["cond"], ctx["uncond"])}
         for backend in ("flashinfer", "dense_gen"):
-            resources = _engine_resources(
-                ctx["model"], ["r0"], ctx["device"], ctx["dtype"], backend=backend,
-            )
-            outs[backend] = _run_windowed_kv_served(
-                ctx["dit"], resources, ctx["md"], ctx["cond"], ctx["uncond"], ctx["device"],
-            )
+            with _backend(ctx["model"], backend):
+                resources = _engine_resources(
+                    ctx["model"], ["r0"], ctx["device"], ctx["dtype"], configs={"r0": config},
+                )
+                outs[backend] = _run_windowed_kv_served(
+                    ctx["model"], ctx["dit"], resources, ctx["md"], ctx["cond"], ctx["uncond"], ctx["device"],
+                )
             resources[KV_CACHE].remove_request("r0")
     except Exception as exc:  # noqa: BLE001
         print(f"  (skipped windowed-kv dense-vs-paged: FA3/FlashInfer unavailable: {exc})")
@@ -1085,8 +1179,10 @@ def _run_accelerator_graph_denoise(ctx):
     dit.gen_capture_resolutions = ((H, W),)
     rid = "cgr0"
     resources = _engine_resources(model, [rid], device, dtype, max_num_pages=256)
-    md = {"height": H, "width": W, "num_frames": 1, "fps": 24.0,
-          "guidance_scale": GS, "num_inference_steps": STEPS}
+    md = _prompt_md(
+        model, ctx["cond"], ctx["uncond"], height=H, width=W, num_frames=1, fps=24.0,
+        guidance_scale=GS, num_inference_steps=STEPS,
+    )
     fwd = CurrentForwardPassInfo(
         request_id=rid, rid_handle=rid, graph_walk="prefill", fwd_index=0,
         random_seed=SEED, max_tokens=0, step_metadata=md,
@@ -1094,7 +1190,7 @@ def _run_accelerator_graph_denoise(ctx):
     ti = [torch.tensor(ctx["cond"], dtype=torch.long, device=device),
           torch.tensor(ctx["uncond"], dtype=torch.long, device=device)]
     ni = dit.prepare_inputs("prefill", fwd, {"text_inputs": ti})
-    _forward_step(dit, "prefill", resources, [rid], {rid: fwd}, [ni])
+    _forward_step(model, dit, "prefill", resources, [rid], {rid: fwd}, [ni])
 
     groups = JointGroups(
         tp_group=CommGroup.trivial(), sp_group=CommGroup.trivial(), instance=CommGroup.trivial(),
@@ -1111,20 +1207,20 @@ def _run_accelerator_graph_denoise(ctx):
     assert cg_runner.any_graphs, "no CUDA graph captured for cosmos3 image_gen"
 
     fwd.graph_walk = "image_gen"
-    latents = ctx["init"].clone()
-    time_index = torch.zeros(1, dtype=torch.long, device=device)
-    for _ in range(STEPS):
-        ni = dit.prepare_inputs("image_gen", fwd, {"latents": [latents], "time_index": [time_index]})
+    edges = _gen_inputs(dit, md, ctx["init"].clone(), device)
+    for k in range(STEPS):
+        fwd.dynamic_loop_iter_counts[IMAGE_GEN_LOOP] = k
+        ni = dit.prepare_inputs("image_gen", fwd, edges)
         out = _forward_step(
-            dit, "image_gen", resources, [rid], {rid: fwd}, [ni],
+            model, dit, "image_gen", resources, [rid], {rid: fwd}, [ni],
             cg_runner=cg_runner,
         )
         # The engine finishes the captured step (CFG combine + scheduler) in
         # the submodule's postprocess right after replay; mirror it here.
         dit.postprocess(rid, fwd, out[rid], inputs=ni)
-        latents, time_index = out[rid]["latents"][0], out[rid]["time_index"][0]
+        edges = _carried(dit, out[rid])
     dit.cleanup_request(rid)
-    return latents
+    return edges["latents"][0]
 
 
 @torch.no_grad()
@@ -1155,10 +1251,9 @@ def test_accelerator_graph_matches_eager() -> None:
 def _main() -> None:
     failures = []
     for name, fn in [
-        ("batched_cfg_matches_sequential", test_batched_cfg_matches_sequential),
-        ("cache_once_matches_fused_exact", test_cache_once_matches_fused_exact),
+        ("cache_once_matches_fused", test_cache_once_matches_fused),
         ("engine_cache_path_image_psnr", test_engine_cache_path_image_psnr),
-        ("cache_once_matches_fused_exact_t2v", test_cache_once_matches_fused_exact_t2v),
+        ("cache_once_matches_fused_t2v", test_cache_once_matches_fused_t2v),
         ("engine_cache_path_video_psnr", test_engine_cache_path_video_psnr),
         ("dense_fa3_image_psnr", test_dense_fa3_image_psnr),
         ("dense_fa3_video_psnr", test_dense_fa3_video_psnr),

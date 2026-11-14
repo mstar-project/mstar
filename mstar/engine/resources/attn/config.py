@@ -278,6 +278,12 @@ class CrossAttentionSpec(NodeResourceSpec):
 
         return CrossAttentionManager
 
+    def split_step_refusals(
+        self, node: str, shard: "SeqShardSpec", tp: int, sp: int, specs: Mapping[str, NodeResourceSpec],
+    ) -> list[str]:
+        return [f"cross attention {self.resource_key!r} takes no split steps, so node {node!r} can't split them: run "
+                "it on TP ranks alone"]
+
     def apply_yaml_overrides(
         self,
         backend: str | AttnBackend | None = None,
@@ -346,6 +352,16 @@ class BlockCausalAttentionSpec(AttentionSpec):
             raise ValueError(f"block_size must be positive, got {self.block_size}")
         if self.config.backend not in (AttnBackend.AUTO, AttnBackend.FLASHINFER):
             raise ValueError(f"block-causal attention runs on flashinfer, not {self.config.backend!r}")
+
+    def split_step_refusals(
+        self, node: str, shard: "SeqShardSpec", tp: int, sp: int, specs: Mapping[str, NodeResourceSpec],
+    ) -> list[str]:
+        # FlashInferBlockCausalManager sets no supports_split_steps, which the engine refuses at build; this says so
+        # from the spec, at validation
+        return [
+            f"block-causal attention {self.resource_key!r} takes no split steps, since its builder sets no sequence "
+            f"shard, so node {node!r} can't split them: run it on TP ranks alone"
+        ]
 
     @property
     def resource_class(self) -> "type[Resource]":

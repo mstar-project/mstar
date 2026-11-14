@@ -8,6 +8,7 @@ by running the region eagerly. The CUDA test captures for real.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -18,6 +19,8 @@ from mstar.engine.accelerator_graph_backend import get_accelerator_graph_backend
 from mstar.engine.accelerator_graph_runner import PiecewiseAcceleratorGraphRunner
 from mstar.engine.resources.base import EngineResourceInfo, build_resource
 from mstar.engine.resources.runner import StepRunner
+from mstar.engine.state import Entry
+from mstar.engine.state.adapters import build_specs, node_handles
 from mstar.model.cosyvoice3.components.hift import (
     CapturedStream,
     CausalHiFTGenerator,
@@ -25,9 +28,9 @@ from mstar.model.cosyvoice3.components.hift import (
     plan_stream_row,
     stream_vocode,
 )
-from mstar.model.cosyvoice3.config import HIFT_STATE, CausalHiFTConfig, CosyVoice3Config
-from mstar.model.cosyvoice3.cosyvoice3_model import CosyVoice3Model, hift_state_specs
-from mstar.model.cosyvoice3.submodules import HiFTSubmodule, vocode_region
+from mstar.model.cosyvoice3.config import HIFT_NODE, HIFT_STATE, CausalHiFTConfig, CosyVoice3Config
+from mstar.model.cosyvoice3.cosyvoice3_model import CosyVoice3Model
+from mstar.model.cosyvoice3.submodules import AUDIO_CHUNK, HIFT_COUNTS, HIFT_MEL, HiFTSubmodule, vocode_region
 
 CONTEXT = 12
 
@@ -72,6 +75,27 @@ def _mel(frames: int, seed: int, device="cpu", dtype=torch.float64) -> torch.Ten
     return (torch.randn(80, frames, generator=gen, dtype=torch.float64) * 0.5).to(device, dtype)
 
 
+def _declaring(cfg) -> CosyVoice3Model:
+    """A model that declares ``cfg``'s state, loading nothing."""
+    model = object.__new__(CosyVoice3Model)
+    model.config = cfg
+    return model
+
+
+def _state(cfg, dtype):
+    """The vocoder's Value as the model declares it, its fields in ``dtype``, which the CPU tests run in."""
+    (value,) = [array for array in _declaring(cfg).declare_state() if array.name == HIFT_STATE]
+    return replace(value, entry=Entry({name: replace(t, dtype=dtype) for name, t in value.entry.tensors.items()}))
+
+
+def _step(node, streams, rids, mels, finals, runners) -> list[torch.Tensor]:
+    """One node step, each row's stream carried in ``streams`` from its last step; each row's PCM16."""
+    out = node._run(rids, mels, finals, [streams.get(rid, (None, [])) for rid in rids], runners)
+    for rid, row in zip(rids, out, strict=True):
+        streams[rid] = (row[HIFT_COUNTS][0].tolist(), row[HIFT_MEL])
+    return [row[AUDIO_CHUNK][0] for row in out]
+
+
 class _NoGraph:
     def __init__(self, run):
         self.replay = run
@@ -87,18 +111,20 @@ def _rig(cfg, hift, monkeypatch=None, device=torch.device("cpu"), dtype=torch.fl
         monkeypatch.setattr(torch.cuda, "synchronize", lambda *args, **kwargs: None)
         for name in ("memory_allocated", "max_memory_allocated", "reset_peak_memory_stats", "empty_cache"):
             monkeypatch.setattr(torch.accelerator, name, lambda *args, **kwargs: 0)
-    spec = hift_state_specs(cfg, dtype=dtype)[0]
+    value = _state(cfg, dtype)
+    (spec,) = build_specs([value], kernel_settings={HIFT_STATE: _declaring(cfg).kernel_settings()[HIFT_STATE]})
     pool = build_resource(spec, EngineResourceInfo(device=device, kv_dtype=dtype))
     resources = {HIFT_STATE: pool}
     steps = StepRunner(resources, node_resources={"hift": [HIFT_STATE]})
     node = HiFTSubmodule(hift, cfg)
-    node.bind_node_resources(resources)
+    handles = node_handles(SimpleNamespace(declare_state=lambda: [value]), HIFT_NODE, resources)
+    node.bind_node_state(handles)
     runners = {}
     memory_pool = None if monkeypatch is not None else get_accelerator_graph_backend(device).graph_pool_handle()
     for label, config in node.get_piecewise_accelerator_graph_configs(device, torch.float32).items():
         runner = PiecewiseAcceleratorGraphRunner(
             label=label, config=config, resources=resources, step_runner=steps, device=device,
-            autocast_dtype=None, num_slots=1, memory_pool=memory_pool,
+            autocast_dtype=None, num_slots=1, memory_pool=memory_pool, state_handles=handles,
         )
         if monkeypatch is not None:
             runner._graph_backend = SimpleNamespace(synchronize=lambda: None)
@@ -108,12 +134,11 @@ def _rig(cfg, hift, monkeypatch=None, device=torch.device("cpu"), dtype=torch.fl
             runner.warmup_and_capture(None)
             assert runner.any_graphs and not runner.dropped_shapes
         runners[label] = runner
-    return SimpleNamespace(node=node, runners=runners, steps=steps, pool=pool)
+    return SimpleNamespace(node=node, runners=runners, steps=steps, pool=pool, streams={})
 
 
 def _open(rig, *rids):
     for rid in rids:
-        rig.node.request_state(rid)
         rig.steps.ingest_request(rid, {})
 
 
@@ -184,7 +209,7 @@ def test_a_captured_stream_equals_the_eager_one(monkeypatch, sizes):
     pieces, at = [], 0
     with torch.no_grad():
         for n in sizes:
-            pieces += rig.node._run([1], [mel[:, at : at + n]], [at + n == 120], rig.runners)
+            pieces += _step(rig.node, rig.streams, [1], [mel[:, at : at + n]], [at + n == 120], rig.runners)
             at += n
         want = _eager(cfg, hift, mel, sizes)
     _close(torch.cat(pieces), want)
@@ -206,7 +231,7 @@ def test_rows_at_different_points_batch_without_touching_each_other(monkeypatch)
     out: dict[int, list[torch.Tensor]] = {1: [], 2: []}
     with torch.no_grad():
         for rids, chunks, finals in steps:
-            for rid, pcm in zip(rids, rig.node._run(rids, chunks, finals, rig.runners), strict=True):
+            for rid, pcm in zip(rids, _step(rig.node, rig.streams, rids, chunks, finals, rig.runners), strict=True):
                 out[rid].append(pcm)
         _close(torch.cat(out[1]), _eager(cfg, hift, mels[1], [30, 30, 20]))
         _close(torch.cat(out[2]), _eager(cfg, hift, mels[2], [30, 15]))
@@ -222,7 +247,7 @@ def test_a_chunk_past_every_bucket_runs_as_several_steps(monkeypatch):
     seen = _spy(rig.runners, monkeypatch)
     mel = _mel(200, 10)
     with torch.no_grad():
-        got = rig.node._run([3], [mel], [True], rig.runners)[0]
+        got = _step(rig.node, rig.streams, [3], [mel], [True], rig.runners)[0]
         want = _eager(cfg, hift, mel, [200])
     assert len(seen) > 1
     _close(got, want)
@@ -233,7 +258,7 @@ def test_a_step_with_nothing_to_emit_replays_nothing(monkeypatch):
     rig = _rig(cfg, _hift(cfg), monkeypatch)
     _open(rig, 4)
     seen = _spy(rig.runners, monkeypatch)
-    got = rig.node._run([4], [_mel(0, 11)], [False], rig.runners)[0]
+    got = _step(rig.node, rig.streams, [4], [_mel(0, 11)], [False], rig.runners)[0]
     assert got.numel() == 0 and got.dtype == torch.int16 and seen == []
 
 
@@ -242,9 +267,9 @@ def test_a_replays_samples_outlive_the_next_replay(monkeypatch):
     rig = _rig(cfg, _hift(cfg), monkeypatch)
     _open(rig, 5, 6)
     with torch.no_grad():
-        first = rig.node._run([5], [_mel(30, 12)], [True], rig.runners)[0]
+        first = _step(rig.node, rig.streams, [5], [_mel(30, 12)], [True], rig.runners)[0]
         kept = first.clone()
-        rig.node._run([6], [_mel(30, 13)], [True], rig.runners)
+        _step(rig.node, rig.streams, [6], [_mel(30, 13)], [True], rig.runners)
     assert torch.equal(first, kept)
 
 
@@ -255,10 +280,10 @@ def test_a_released_slot_starts_the_next_stream_fresh(monkeypatch):
     mel = _mel(60, 14)
     with torch.no_grad():
         _open(rig, 7)
-        rig.node._run([7], [_mel(40, 15)], [False], rig.runners)
+        _step(rig.node, rig.streams, [7], [_mel(40, 15)], [False], rig.runners)
         rig.steps.remove_request(7)
         _open(rig, 8)
-        got = rig.node._run([8], [mel], [True], rig.runners)[0]
+        got = _step(rig.node, rig.streams, [8], [mel], [True], rig.runners)[0]
         _close(got, _eager(cfg, hift, mel, [60]))
 
 
@@ -266,10 +291,9 @@ def test_no_regions_runs_eagerly_on_python_state():
     cfg = _config()
     hift = _hift(cfg)
     node = HiFTSubmodule(hift, cfg)
-    node.request_state(9)
     mel = _mel(30, 16)
     with torch.no_grad():
-        got = node._run([9], [mel], [True], {})[0]
+        got = _step(node, {}, [9], [mel], [True], {})[0]
         _close(got, _eager(cfg, hift, mel, [30]), tol=0)
 
 
@@ -279,7 +303,7 @@ def test_a_bucket_left_out_for_memory_says_so(monkeypatch):
     _open(rig, 10)
     runners = {vocode_region(48): rig.runners[vocode_region(48)]}
     with pytest.raises(RuntimeError, match="left out for memory"):
-        rig.node._run([10], [_mel(90, 17)], [False], runners)
+        _step(rig.node, rig.streams, [10], [_mel(90, 17)], [False], runners)
 
 
 # -- the declaration -----------------------------------------------------------------------
@@ -308,7 +332,7 @@ def test_what_cant_be_captured_declares_no_state(overrides):
     cfg = _config(**overrides)
     node = HiFTSubmodule(_hift(cfg), cfg)
     assert node.get_piecewise_accelerator_graph_configs(torch.device("cpu"), torch.float32) == {}
-    assert hift_state_specs(cfg) == []
+    assert HIFT_STATE not in {array.name for array in _declaring(cfg).declare_state()}
 
 
 def test_a_bucket_too_short_for_the_tail_is_refused(tmp_path, monkeypatch):
@@ -337,15 +361,15 @@ def test_a_captured_stream_on_cuda_equals_the_eager_one():
     out: dict[int, list[torch.Tensor]] = {1: [], 2: [], 3: []}
     with torch.no_grad():
         # padded to batch 4, then batch 2, then 1, moving between the regions
-        for rid, pcm in zip((1, 2, 3), rig.node._run(
+        for rid, pcm in zip((1, 2, 3), _step(rig.node, rig.streams,
             [1, 2, 3], [mels[1][:, :25], mels[2][:, :25], mels[3]], [False, False, True], rig.runners,
         ), strict=True):
             out[rid].append(pcm)
-        for rid, pcm in zip((1, 2), rig.node._run(
+        for rid, pcm in zip((1, 2), _step(rig.node, rig.streams,
             [1, 2], [mels[1][:, 25:55], mels[2][:, 25:]], [False, True], rig.runners,
         ), strict=True):
             out[rid].append(pcm)
-        out[1] += rig.node._run([1], [mels[1][:, 55:]], [True], rig.runners)
+        out[1] += _step(rig.node, rig.streams, [1], [mels[1][:, 55:]], [True], rig.runners)
         eager = {
             1: _eager(cfg, hift, mels[1], [25, 30, 15]),
             2: _eager(cfg, hift, mels[2], [25, 15]),

@@ -19,6 +19,7 @@ import torch
 import torch.nn.functional as F
 
 from mstar.model.components.mrope import layout_position_ids
+from mstar.model.cosmos3 import constants as C
 from mstar.model.cosmos3.components.reasoner import (
     MediaGrid,
     patchify,
@@ -40,6 +41,8 @@ from mstar.model.cosmos3.config import (
     Cosmos3ReasonerConfig,
     Cosmos3VisionEncoderConfig,
 )
+from mstar.model.cosmos3.submodules import COND_LABEL
+from mstar.model.cosmos3.tests.test_engine_cache import _SdpaResources, declaring
 
 
 def _edge_dir() -> Path | None:
@@ -186,52 +189,6 @@ def test_fused_gen_attends_to_normed_und_k() -> None:
     assert not torch.allclose(out_g, wrong_g, atol=1e-3)
 
 
-class _OverwriteKV:
-    """A CPU stand-in for the kv + attn resources over one request: the
-    UND prefill writes K/V, attends with the K it passed, and the GEN-facing
-    re-write replaces what the cache holds. Denoise steps then read the
-    committed prefix."""
-
-    requires_kv_write = True
-
-    def __init__(self):
-        self._label = "main"
-        self._layer = 0
-        self.committed: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
-        self.pending: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
-        self.causal = True
-
-    @property
-    def default_label(self):
-        return self._label
-
-    def set_default_label(self, label):
-        self._label = label
-
-    def set_default_layer_idx(self, i):
-        self._layer = i
-
-    def layer_view(self, layer_idx=None):
-        return self._layer if layer_idx is None else layer_idx
-
-    def write_kv(self, k, v, layer_idx=None, label=None):
-        self.pending[self._layer if layer_idx is None else layer_idx] = (k, v)
-
-    def commit(self):
-        self.committed.update(self.pending)
-        self.pending = {}
-
-    def run(self, q, label=None, kv_cache_layer=None, k=None, v=None, layer_idx=None):
-        prefix = self.committed.get(kv_cache_layer)
-        if prefix is not None:
-            k = torch.cat([prefix[0], k])
-            v = torch.cat([prefix[1], v])
-        out = F.scaled_dot_product_attention(
-            q.unsqueeze(0).transpose(1, 2), k.unsqueeze(0).transpose(1, 2), v.unsqueeze(0).transpose(1, 2),
-            is_causal=self.causal, enable_gqa=True,
-        )
-        return out.transpose(1, 2).squeeze(0)
-
 
 def test_cached_prefill_writes_gen_facing_k() -> None:
     """Cache-once path == fused reference on Edge: the prefill must leave the
@@ -241,11 +198,8 @@ def test_cached_prefill_writes_gen_facing_k() -> None:
     cfg = _tiny_edge_config()
     model = Cosmos3OmniTransformer(cfg).eval()
     _init_all(model)
-    res = _OverwriteKV()
-    for child in model.modules():
-        bind = getattr(child, "bind_resources", None)
-        if bind is not None:
-            bind({"kv": res, "attn": res})
+    res = _SdpaResources()
+    res.bind(declaring(cfg), model)
 
     ids = [3, 5, 7, 11, 13]
     latent = torch.randn(1, cfg.latent_channel, 1, 4, 4)
@@ -255,16 +209,14 @@ def test_cached_prefill_writes_gen_facing_k() -> None:
     ts = torch.full((static["num_noisy_vision_tokens"],), 500.0)
     with torch.no_grad():
         fused, _ = model(vision_tokens=[latent], vision_timesteps=ts, **{k: static[k] for k in fields})
-        res.causal = True
-        model.prefill_und(static["input_ids"], static["text_mrope_ids"], "main")
-        res.commit()
-        res.causal = False
+        res.step(C.PREFILL_WALK, [("r", COND_LABEL, static["und_len"])],
+                 lambda: model.prefill_und(static["input_ids"], static["text_mrope_ids"]))
         rotary = model._rotary(static["gen_position_ids"], latent.device, latent.dtype)
-        cached = model.denoise_step(
+        gen = [("r", COND_LABEL, static["num_vision_tokens"])]
+        cached = res.step(C.IMAGE_GEN_WALK, gen, lambda: model.denoise_step(
             latent, ts, rotary, static["vision_token_shapes"],
             static["vision_noisy_frame_indexes"], static["vision_mse_loss_indexes"] - static["und_len"],
-            "main", res,
-        )
+        ), keep=False)
     assert torch.allclose(fused[0], cached, atol=1e-4), (fused[0] - cached).abs().max()
     # The committed prefix K is the normed one, not the raw K.
     attn0 = model.layers[0].self_attn
@@ -272,7 +224,7 @@ def test_cached_prefill_writes_gen_facing_k() -> None:
     cos, sin = model._rotary(static["text_mrope_ids"], und_norm.device, und_norm.dtype)
     _, k_raw, _ = attn0._und_qkv(und_norm)
     expected = attn0._apply_rope(attn0.k_norm_und_for_gen(k_raw), cos, sin)
-    assert torch.allclose(res.committed[0][0], expected, atol=1e-5)
+    assert torch.allclose(res.kv.committed[(COND_LABEL, 0)][0], expected, atol=1e-5)
 
 
 def test_text_forward_keeps_raw_k() -> None:
@@ -280,24 +232,20 @@ def test_text_forward_keeps_raw_k() -> None:
     cfg = _tiny_edge_config()
     model = Cosmos3OmniTransformer(cfg).eval()
     _init_all(model)
-    res = _OverwriteKV()
-    for child in model.modules():
-        bind = getattr(child, "bind_resources", None)
-        if bind is not None:
-            bind({"kv": res, "attn": res})
+    res = _SdpaResources()
+    res.bind(declaring(cfg), model)
     ids = torch.tensor([1, 2, 3, 4])
     pos = torch.arange(4).view(1, -1).expand(3, -1)
     with torch.no_grad():
         embeds = model.embed_tokens(ids)
-        hidden = model.text_forward(embeds, pos, "main")
-        res.commit()
+        hidden = res.step(C.PREFILL_WALK, [("r", COND_LABEL, 4)], lambda: model.text_forward(embeds, pos))
         logits = model.lm_head(hidden)
     assert hidden.shape == (4, cfg.hidden_size) and logits.shape == (4, cfg.vocab_size)
     attn0 = model.layers[0].self_attn
     und_norm = model.layers[0].input_layernorm(embeds)
     cos, sin = model._rotary(pos, embeds.device, embeds.dtype)
     k_raw = attn0._apply_rope(attn0._und_qkv(und_norm)[1], cos, sin)
-    assert torch.allclose(res.committed[0][0], k_raw, atol=1e-6)
+    assert torch.allclose(res.kv.committed[(COND_LABEL, 0)][0], k_raw, atol=1e-6)
 
 
 def test_native_flow_sigmas() -> None:

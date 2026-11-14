@@ -4,9 +4,9 @@ CPU-safe unit tests cover the sound segment packing (mrope band, indexes,
 position ids), the duration -> latent-frame math, the request-level validation
 and walk selection, a tiny AVAE decoder shape check, and the decoder-subset
 checkpoint load. GPU tests (gated on ``COSMOS3_NANO_DIR`` + CUDA) check the
-engine cache-once [video | sound] loop against the fused reference pipeline —
-bit-tight with the sdpa handle, PSNR-level with FlashInfer — and smoke the
-real checkpoint sound tokenizer.
+engine cache-once [video | sound] loop against the fused reference pipeline,
+by decoded-video PSNR and sound-latent SNR, with the sdpa handle and with
+FlashInfer, and smoke the real checkpoint sound tokenizer.
 
 Run CPU only:  python3 test_sound.py
 Run with GPU:  COSMOS3_NANO_DIR=<snap> python3 test_sound.py
@@ -29,6 +29,7 @@ from mstar.model.cosmos3.tests.test_engine_cache import (
     _engine_resources,
     _forward_step,
     _load,
+    _prompt_md,
     _SdpaResources,
 )
 
@@ -230,8 +231,8 @@ def test_sound_tokenizer_load_ignores_encoder_keys() -> None:
 
 # ---------------------------------------------------------------------------
 # GPU parity (gated on COSMOS3_NANO_DIR + CUDA). Reuses the engine-cache test
-# harness: same prompt/seed discipline, sdpa handle for bit-tight bounds,
-# FlashInfer for the served path.
+# harness: same prompt/seed discipline, sdpa handle for the fused pipeline's
+# kernel, FlashInfer for the served path.
 # ---------------------------------------------------------------------------
 
 os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
@@ -246,8 +247,10 @@ def _run_cache_once_sound(model, dit, resources, init, sound_init, cond_ids, unc
     from mstar.conductor.request_info import CurrentForwardPassInfo
 
     rid = "rs0"
-    md = {"height": H, "width": W, "num_frames": FRAMES, "fps": 24.0,
-          "guidance_scale": GS, "num_inference_steps": STEPS, "generate_sound": True}
+    md = _prompt_md(
+        model, cond_ids, uncond_ids, height=H, width=W, num_frames=FRAMES, fps=24.0, guidance_scale=GS,
+        num_inference_steps=STEPS, generate_sound=True,
+    )
     fwd = CurrentForwardPassInfo(
         request_id=rid, rid_handle=rid, graph_walk="prefill",
         fwd_index=0, random_seed=SEED, max_tokens=0, step_metadata=md,
@@ -257,7 +260,7 @@ def _run_cache_once_sound(model, dit, resources, init, sound_init, cond_ids, unc
         torch.tensor(uncond_ids, dtype=torch.long, device=device),
     ]
     ni = dit.prepare_inputs("prefill", fwd, {"text_inputs": text_inputs})
-    _forward_step(dit, "prefill", resources, [rid], {rid: fwd}, [ni])
+    _forward_step(model, dit, "prefill", resources, [rid], {rid: fwd}, [ni])
 
     latents, sound_latents = init.clone(), sound_init.clone()
     solver = initial_state(dit._packed(latents, sound_latents))
@@ -267,9 +270,7 @@ def _run_cache_once_sound(model, dit, resources, init, sound_init, cond_ids, unc
         ni = dit.prepare_inputs(VIDEO_SOUND_GEN_WALK, fwd, {
             "latents": [latents], "sound_latents": [sound_latents], **{n: [t] for n, t in solver.items()},
         })
-        out = _forward_step(
-            dit, VIDEO_SOUND_GEN_WALK, resources, [rid], {rid: fwd}, [ni],
-        )
+        out = _forward_step(model, dit, VIDEO_SOUND_GEN_WALK, resources, [rid], {rid: fwd}, [ni])
         latents = out["latents"][0]
         sound_latents = out["sound_latents"][0]
         solver = {n: out[n][0] for n in solver}
@@ -317,26 +318,33 @@ def _sound_scenario():
     return ctx
 
 
-def test_sound_cache_once_matches_fused_exact() -> None:
+def _against_fused(ctx, lat, snd) -> tuple[float, float]:
+    """The decoded video's PSNR and the sound latents' SNR against the fused pipeline's, in dB."""
+    img_fused = ctx["mpipe"]._decode(ctx["lat_fused"]).squeeze().float().cpu()
+    img = ctx["mpipe"]._decode(lat.reshape(ctx["lat_fused"].shape)).squeeze().float().cpu()
+    mse = (img_fused - img).pow(2).mean().item()
+    s_ref = ctx["sound_fused"].float()
+    s_mse = (s_ref - snd.reshape(s_ref.shape).float()).pow(2).mean().item()
+    psnr = float("inf") if mse == 0 else -10 * math.log10(mse)
+    return psnr, float("inf") if s_mse == 0 else 10 * math.log10(s_ref.pow(2).mean().item() / s_mse)
+
+
+def test_sound_cache_once_matches_fused() -> None:
+    """The sound walk's cache-once path on the sdpa resources, the fused pipeline's kernel. Both guidance branches
+    run in one step, whose GEMMs round in bf16 apart from the fused pipeline's branch at a time, so the bars are the
+    engine path's."""
     ctx = _sound_scenario()
     if ctx is None:
         print("  (skipped sound cache-once parity: needs COSMOS3_NANO_DIR + CUDA)")
         return
-    dit = ctx["dit"]
-    prev = dit.batched_cfg
-    dit.batched_cfg = False
-    try:
-        lat, snd = _run_cache_once_sound(
-            ctx["model"], dit, _SdpaResources().as_dict(), ctx["init"], ctx["sound_init"],
-            ctx["cond"], ctx["uncond"], ctx["device"],
-        )
-    finally:
-        dit.batched_cfg = prev
-    vdiff = (ctx["lat_fused"].float() - lat.reshape(ctx["lat_fused"].shape).float()).abs().max().item()
-    sdiff = (ctx["sound_fused"].float() - snd.reshape(ctx["sound_fused"].shape).float()).abs().max().item()
-    assert vdiff <= 1e-3, f"sound-walk video latents differ from fused by {vdiff:.3e} (> 1e-3)"
-    assert sdiff <= 1e-3, f"sound latents differ from fused by {sdiff:.3e} (> 1e-3)"
-    print(f"  sound cache-once (sdpa) abs-max diff: video={vdiff:.3e} sound={sdiff:.3e}")
+    lat, snd = _run_cache_once_sound(
+        ctx["model"], ctx["dit"], _SdpaResources().as_dict(), ctx["init"], ctx["sound_init"],
+        ctx["cond"], ctx["uncond"], ctx["device"],
+    )
+    psnr, s_snr = _against_fused(ctx, lat, snd)
+    assert psnr >= 30, f"sound-walk cache-once video PSNR {psnr:.2f} < 30"
+    assert s_snr >= 30, f"sound-walk cache-once sound latent SNR {s_snr:.2f} < 30 dB"
+    print(f"  sound cache-once (sdpa): video PSNR={psnr:.2f} dB, sound latent SNR={s_snr:.2f} dB")
 
 
 def test_sound_engine_path_flashinfer() -> None:
@@ -353,15 +361,9 @@ def test_sound_engine_path_flashinfer() -> None:
         ctx["model"], ctx["dit"], cm, ctx["init"], ctx["sound_init"],
         ctx["cond"], ctx["uncond"], ctx["device"],
     )
-    img_fused = ctx["mpipe"]._decode(ctx["lat_fused"]).squeeze().float().cpu()
-    img_engine = ctx["mpipe"]._decode(lat.reshape(ctx["lat_fused"].shape)).squeeze().float().cpu()
-    mse = (img_fused - img_engine).pow(2).mean().item()
-    psnr = float("inf") if mse == 0 else -10 * math.log10(mse)
-    s_ref = ctx["sound_fused"].float()
-    s_mse = (s_ref - snd.reshape(s_ref.shape).float()).pow(2).mean().item()
-    s_snr = float("inf") if s_mse == 0 else 10 * math.log10(s_ref.pow(2).mean().item() / s_mse)
-    assert psnr >= 30, f"sound-walk video PSNR {psnr:.2f} < 30 (MSE {mse:.3e})"
-    assert s_snr >= 30, f"sound latent SNR {s_snr:.2f} < 30 dB (MSE {s_mse:.3e})"
+    psnr, s_snr = _against_fused(ctx, lat, snd)
+    assert psnr >= 30, f"sound-walk video PSNR {psnr:.2f} < 30"
+    assert s_snr >= 30, f"sound latent SNR {s_snr:.2f} < 30 dB"
     print(f"  sound engine path (flashinfer): video PSNR={psnr:.2f} dB, sound latent SNR={s_snr:.2f} dB")
 
 
@@ -398,7 +400,7 @@ def _main() -> None:
         ("sound_forward_smoke_cpu", test_sound_forward_smoke_cpu),
         ("sound_tokenizer_tiny_decode", test_sound_tokenizer_tiny_decode),
         ("sound_tokenizer_load_ignores_encoder_keys", test_sound_tokenizer_load_ignores_encoder_keys),
-        ("sound_cache_once_matches_fused_exact", test_sound_cache_once_matches_fused_exact),
+        ("sound_cache_once_matches_fused", test_sound_cache_once_matches_fused),
         ("sound_engine_path_flashinfer", test_sound_engine_path_flashinfer),
         ("sound_tokenizer_decode_real", test_sound_tokenizer_decode_real),
     ]

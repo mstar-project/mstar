@@ -20,6 +20,7 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 
+from mstar.engine.resources.attn.ragged.config import RaggedAttnBackend
 from mstar.engine.state import (
     Array,
     Attend,
@@ -228,12 +229,6 @@ def test_a_sequence_shard_lists_rows_walks_and_labels_its_arrays_open(shard, pro
     assert _one_problem(_array(), declared, combined={"LLM": {"mixed": {"prefill", "decode"}}}).startswith(problem)
 
 
-def test_a_sequence_shard_lists_one_label_since_its_handle_brackets_one():
-    declared = SeqShard("shard", nodes={"LLM"}, labels={"main", "cfg"})
-    problem = _one_problem(_array(labels={"main", "cfg"}), declared)
-    assert problem.startswith("SeqShard 'shard'.labels: ['cfg', 'main'] are several")
-
-
 def test_a_sequence_shard_cuts_its_label_on_one_axis():
     # rows of one span split each row alike (axis 1), packed tokens contiguously (axis 0): one tensor can't take both
     rows = _array("rows", max_len=0, reads={"rows_attn": _read(mask=Block(), packed=False)})
@@ -293,6 +288,33 @@ def test_kv_labels_may_name_only_declared_labels():
 def test_kv_labels_may_name_only_declared_arrays():
     problem = _one_problem(_array(), kv_labels={"other": {"main": None}})
     assert problem.startswith("kv_labels()['other']") and "no declared array" in problem
+
+
+def _kept(**overrides) -> Array:
+    return _array(reads={"gen": _read(mask=Bidirectional(kept_window=True))}, **overrides)
+
+
+@pytest.mark.parametrize("labels, kv_labels, missing", [
+    ({"main"}, {}, "['main']"),
+    ({"main", "cfg"}, {"kv": {"main": KVLabel()}}, "['cfg']"),
+], ids=["no pool", "a label left out"])
+def test_every_label_of_a_kept_window_array_must_be_in_kv_labels(labels, kv_labels, missing):
+    """Only a request's layout sizes a kept window, and the conductor refuses a request that opens a label with no
+    layout only on the pools ``kv_labels`` names. A label left out could open with no window, and the read would
+    reach every entry the request ever wrote, with no error."""
+    problem = _one_problem(_kept(labels=labels), kv_labels=kv_labels)
+    assert problem == (
+        f"Array 'kv'.reads['gen'] keeps a window, and labels {missing} aren't in kv_labels()['kv'], so a request "
+        "could open them with no layout and reads['gen'] would reach every entry; add them to kv_labels()['kv']"
+    )
+
+
+def test_a_kept_window_array_with_every_label_in_kv_labels_has_no_problem():
+    assert state_declaration_problems(_StubModel(_kept(), kv_labels={"kv": {"main": KVLabel()}})) == []
+
+
+def test_an_array_that_keeps_no_window_may_stay_out_of_kv_labels():
+    assert state_declaration_problems(_StubModel(_array(reads={"gen": _read(mask=Bidirectional())}))) == []
 
 
 def test_a_sampler_node_must_be_in_the_model():
@@ -584,6 +606,13 @@ def test_the_digests_cover_the_kernel_settings_since_a_pool_size_can_follow_the_
     theirs = declaration_digests([a, b], {"kv": {"max_num_pages": 128}})
     message = digest_mismatch(ours, theirs, here="API server", there="conductor")
     assert message is not None and "declare different state: kernel_settings()." in message, message
+
+
+def test_the_digests_take_a_ragged_backend_among_the_kernel_settings():
+    a, b = _declarations()
+    dense = declaration_digests([a, b], {"attn": {"backend": RaggedAttnBackend.DENSE}})
+    auto = declaration_digests([a, b], {"attn": {"backend": RaggedAttnBackend.AUTO}})
+    assert dense != auto, "a worker running another attention kernel would match the conductor"
 
 
 def test_a_worker_whose_declarations_differ_from_the_conductors_fails_before_it_builds(monkeypatch):

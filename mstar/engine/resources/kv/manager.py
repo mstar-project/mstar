@@ -240,8 +240,8 @@ class CacheStream:
     # the first `protected_prefix` committed tokens (a text prefix, say) are
     # never released; set once, after they commit (`protect_prefix`)
     protected_prefix: int = 0
-    # the policy the last committing step declared for this stream
-    # (`KVStep.retention`): the index caps at its prefix, `reset` clears it
+    # the exact policy the stream's layout keeps, from the commit that reaches
+    # its prefix: the index caps at its prefix, `reset` clears it
     retention: RetentionPolicy | None = None
     read_pending: bool = False
     read_future: Future | None = None
@@ -2702,6 +2702,20 @@ class KVManager(AttentionResource):
         return KVPlanOutput(
             cpu_indptrs=build_paged_indptrs(views, page_size, ring=ring),
             views=views,
+            beyond_reach=bool(self._exact) and any(
+                view.retention is not None and view.retention.can_release(view.length - view.to_compute)
+                for view in views
+            ),
+        )
+
+    def _beyond_reach(self, segments: list[Segment], group: int) -> bool:
+        """`KVPlanOutput.beyond_reach` of ``segments`` in group ``group``, False at once while no request holds an exact
+        retention."""
+        exact = self._exact
+        return bool(exact) and any(
+            (policy := exact.get(s.request_id, {}).get(s.label)) is not None
+            and policy.can_release(self._streams[s.request_id][s.label].group(group).stored_len)
+            for s in segments
         )
 
     def _plan_label(
@@ -2782,6 +2796,7 @@ class KVManager(AttentionResource):
             rows=segments,
             view_builder=build_views,
             columns=cols,
+            beyond_reach=self._beyond_reach(segments, group),
         )
 
     def _plan_label_rows(
@@ -2827,6 +2842,7 @@ class KVManager(AttentionResource):
             rows=segments,
             view_builder=build_views,
             columns=cols,
+            beyond_reach=self._beyond_reach(segments, 0),
         )
 
     @staticmethod
@@ -3190,7 +3206,6 @@ class KVManager(AttentionResource):
     def commit(self, step: KVStep, ctx: StepContext):
         self._live_outputs = None
         streams = self._streams
-        retention = step.retention
         exact = self._exact
         if not step.commit:
             self._readonly_epoch += 1
@@ -3218,7 +3233,7 @@ class KVManager(AttentionResource):
                 # a repeated step's stored spans are `repeats` of what it declared (see `_run_lag`)
                 self._run_lag = max(self._run_lag, 2 * (repeats - 1))
             if (
-                rows and repeats == 1 and self._index is None and not retention and not windows and not _DEBUG_ASSERTS
+                rows and repeats == 1 and self._index is None and not windows and not _DEBUG_ASSERTS
                 and not (exact and any(segment.request_id in exact for segment in rows))
             ):
                 # nothing to index, adopt, retain or check: the arena moves
@@ -3254,11 +3269,8 @@ class KVManager(AttentionResource):
                         self._index.touch(stream.page_indices[:stream.chain.cursor])
                     # committed, so there is no refused admit left for a re-probe to answer
                     stream.converted = False
-                    policy = (
-                        retention.get((segment.request_id, segment.label))
-                        if retention else None
-                    )
-                    if policy is None and exact and segment.request_id in exact:
+                    policy = None
+                    if exact and segment.request_id in exact:
                         policy = exact[segment.request_id].get(segment.label)
                         # adopted at the first commit that reaches the prefix, before which nothing past it exists
                         if policy is not None and stream.stored_len < policy.protected_prefix:
@@ -3270,7 +3282,7 @@ class KVManager(AttentionResource):
                         written = stream.stored_len + stream.released
                         touched = stream.span_cursor.advance(written - span, written)
                         if _DEBUG_ASSERTS:
-                            self._assert_layout(segment, stream, touched, ctx, policy)
+                            self._assert_layout(segment, stream, touched, ctx)
                     if index_on and stream.chain is not None:
                         self._index_filled_pages(segment, stream, ctx, touched, span)
                     # so a claim taken in a window the mark misses still fails
@@ -3286,7 +3298,7 @@ class KVManager(AttentionResource):
                         self._apply_retention(segment.request_id, stream, group.retention, g, touch=False)
                     if windows and segment.request_id in self._allotments:
                         self._settle_window_allotment(segment, stream)
-                    # The step's retention, if it declared one: drop what aged
+                    # The layout's exact retention, if it keeps one: drop what aged
                     # past the context budget now that this step's tokens
                     # count. Here, under the lock and before `commit_done`
                     # lets the next step pre-plan, so no admitted plan
@@ -3305,8 +3317,7 @@ class KVManager(AttentionResource):
                 self.assert_pages_conserved()
 
     def _assert_layout(
-        self, segment: Segment, stream: CacheStream, touched: list[tuple[int, int]],
-        ctx: StepContext, policy: RetentionPolicy | None,
+        self, segment: Segment, stream: CacheStream, touched: list[tuple[int, int]], ctx: StepContext,
     ) -> None:
         """Debug only, since it looks the layout up per segment."""
         overrides = self._overrides[segment.request_id]
@@ -3320,16 +3331,13 @@ class KVManager(AttentionResource):
             )
         written, bound = stream.stored_len + stream.released, layout.slots(overrides.loop_caps)
         assert written <= bound, f"{where}: committed {written} slots, past its layout's spans and growth ({bound})"
-        assert policy is None or policy == layout.retention, (
-            f"{where}: a step declares {policy}, where its layout declares {layout.retention}"
-        )
 
     # Partial release behind a protected prefix (windowed generation): a
     # request that generates in windows commits each window's K/V and, once
     # its context horizon fills, drops the oldest generated pages while the
     # prompt prefix stays. Two routes to the same page-floored front release:
-    # a `RetentionPolicy` the committing step declares (`KVStep.retention`),
-    # applied inside that commit — the served route, safe under pre-planning —
+    # a request layout's exact `RetentionPolicy`, applied inside the commit
+    # that reaches its prefix — the served route, safe under pre-planning —
     # and the explicit `protect_prefix` / `release_oldest` pair for a driver
     # that runs between steps. Ported from #198's PagedAllocationManager
     # (merceod) onto the pool's streams.
@@ -3365,10 +3373,9 @@ class KVManager(AttentionResource):
     def _adopt_retention(
         self, stream: CacheStream, policy: RetentionPolicy, segment: Segment,
     ) -> None:
-        """Take the policy a committing step declares for its stream: the
-        protected prefix must be committed and agree with any earlier one
-        (`protect_prefix`, or the previous window's). The budget may change
-        between windows. Under the lock."""
+        """Take the exact policy the stream's layout keeps: the protected prefix
+        must be committed and agree with any earlier one (`protect_prefix`).
+        Under the lock."""
         if policy.protected_prefix > stream.stored_len:
             raise ValueError(
                 f"retention for request {segment.request_id!r} label {segment.label!r} "
@@ -3388,7 +3395,7 @@ class KVManager(AttentionResource):
         self, rid: str, stream: CacheStream, policy: RetentionPolicy, group: int = 0, touch: bool = True,
     ) -> int:
         """Release what ``policy`` no longer keeps of the stream's pages in group ``group``: the
-        step's policy, or a group's. ``touch`` runs `_touch_plan_cache`. Under the lock."""
+        layout's policy, or a group's. ``touch`` runs `_touch_plan_cache`. Under the lock."""
         kept = policy.kept_prefix(self._groups[group].page_size)
         excess = stream.group(group).stored_len - kept - policy.context_budget
         if excess <= 0:

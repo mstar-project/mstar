@@ -1,8 +1,8 @@
 """Per-session world state for windowed rollouts.
 
 A ``session_id`` on a windowed request names a world the client may come back
-to (``resume_session``). The DiT node keeps the rollout's last window under
-it and the streaming decoder its decode context, each in a ``SessionStore``.
+to (``resume_session``). The DiT node keeps the rollout's last window and the
+stream's decode context under it, in a ``SessionStore``.
 The store is bounded and LRU-ordered, and it knows which sessions have a
 request in flight: those are never evicted and refuse a second request, so
 two rollouts cannot write the same world at once. Idle sessions expire after
@@ -31,12 +31,12 @@ class SessionStore:
 
     A request that names a session ``begin``s it, which pins it for the
     request's duration (a second request on a live session is refused),
-    reads the stored state with ``get`` (which promotes it, so every node's
-    store ages the same way), and either ``put``s the new state when it is
-    done or ``end``s the session. ``release`` unpins whatever a removed
-    request held. Only idle sessions count against ``capacity`` and can be
-    evicted (expired ones first, then the oldest); live ones never are, so
-    the store holds at most ``capacity`` idle plus the in-flight sessions.
+    reads the stored state with ``get`` (which promotes it), and either
+    ``put``s the new state when it is done or ``end``s the session.
+    ``release`` unpins whatever a removed request held. Only idle sessions
+    count against ``capacity`` and can be evicted (expired ones first, then
+    the oldest); live ones never are, so the store holds at most
+    ``capacity`` idle plus the in-flight sessions.
     """
 
     def __init__(

@@ -9,8 +9,7 @@ and attended with causal SDPA, which is what the paged kernel computes.
 and applies Llama-3 RoPE the way HF does (rotate-half, smoothed inverse
 frequencies), which is the convention FlashInfer's ``llama31`` kernel
 implements. Both take the step layout from ``plan(seq_lens)``, and serve a
-stack through its state handles (``FakeT3State``) or through the resource
-cursors of a stack still on them (CosyVoice3's LM, ``FakeT3Resources``).
+stack through its state handles (``FakeT3State``).
 ``FakeS3GenStream`` holds S3Gen's stream Value.
 """
 
@@ -231,13 +230,6 @@ class FakeT3Resources:
     def __init__(self):
         self.kv_attn = FakeKVAttention()
         self.pos = FakePositionManager()
-
-    def bind(self, module: torch.nn.Module, attn_key: str, kv_key: str, pos_key: str) -> None:
-        resources = {attn_key: self.kv_attn, kv_key: self.kv_attn, pos_key: self.pos}
-        for sub in module.modules():
-            bind = getattr(sub, "bind_resources", None)
-            if bind is not None and sub is not module:
-                bind(resources)
 
     def plan(self, seq_lens: list[int]) -> torch.Tensor:
         self.kv_attn.plan(seq_lens)

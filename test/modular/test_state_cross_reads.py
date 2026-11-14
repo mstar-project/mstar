@@ -22,6 +22,7 @@ from mstar.distributed.communication import WorkerParallelGroups
 from mstar.engine.resources.attn.config import AttentionStep
 from mstar.engine.resources.attn.ragged.config import (
     RaggedAttentionSpec,
+    RaggedAttnBackend,
     RaggedCrossAttentionSpec,
     RaggedCrossAttentionStep,
 )
@@ -189,6 +190,16 @@ def test_the_new_settings_reach_the_shared_spec_from_any_of_its_reads():
     assert by_key["audio_text"].config.workspace_mb == 128
     assert by_key["audio_self"].config.max_segments_per_request == 3
     assert by_key["video_self"].config.compile_op
+
+
+def test_a_within_step_read_takes_its_ragged_backend_from_the_kernel_settings():
+    by_key = {
+        spec.resource_key: spec
+        for spec in build_specs(_av(), kernel_settings={"video_self": {"backend": RaggedAttnBackend.DENSE}})
+    }
+    assert by_key["video_self"].config.backend is RaggedAttnBackend.DENSE, "FlashInfer would pad a head dim of 72"
+    on_sdpa = build_specs([_array("a")], setup=_on_sdpa("a_read"), kernel_settings={"a_read": {"backend": "dense"}})
+    assert on_sdpa == [], "SDPA builds no resource, so the setting goes nowhere"
 
 
 @pytest.mark.parametrize("array, cause", [
@@ -425,7 +436,7 @@ def test_a_resource_on_sdpa_builds_no_spec():
 def test_kernel_settings_on_a_resource_on_sdpa_set_nothing_and_still_refuse_a_bad_field():
     assert build_specs([_array("a")], setup=_on_sdpa("a_read"), kernel_settings={"a_read": {"workspace_mb": 1}}) == []
     with pytest.raises(ValueError, match="it may set only"):
-        build_specs([_array("a")], setup=_on_sdpa("a_read"), kernel_settings={"a_read": {"backend": "dense"}})
+        build_specs([_array("a")], setup=_on_sdpa("a_read"), kernel_settings={"a_read": {"num_qo_heads": 4}})
 
 
 def test_sdpa_on_a_resource_no_read_runs_on_is_refused_and_left_out():

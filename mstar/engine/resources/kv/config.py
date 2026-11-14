@@ -663,7 +663,7 @@ class KVReqConfig(ResourceReqConfig):
             return {}
         caps, room = self.loop_caps or {}, {}
         for layout in (self.kv_layout or {}).values():
-            if layout.retention is not None:
+            if layout.retention is not None and layout.retention.can_release(spec.config.max_seq_len):
                 continue
             for loop, slots in layout.growth:
                 n = (spec.config.max_seq_len - layout.positions(caps) + slots * caps[loop]) // slots
@@ -684,22 +684,31 @@ class KVReqConfig(ResourceReqConfig):
 
     def validate(self, spec: "KVSpec | None" = None) -> None:
         """``ValueError`` (a 400) when a label would hold more positions at the request's caps
-        than its pool's ``max_seq_len``. A label under retention is left out, since Cosmos3,
-        the one model that declares one, computes its positions in each forward.
+        than its pool's ``max_seq_len``. A label whose retention can release entries is left out,
+        since its positions outrun what it keeps.
 
         Also when the labels ``spec.nodes`` open would hold more pages at the caps than the pool
         has for requests. The pool admits a preemptible request on its prompt alone, so a request this
-        large would be admitted and then could not finish even alone in an empty pool."""
+        large would be admitted and then could not finish even alone in an empty pool.
+
+        ``RuntimeError`` (the model's fault, a 500) when ``spec`` keeps a window and a label's layout has no
+        retention."""
         if spec is None or not isinstance(spec.config, PagedKVConfig):
             return
         for label, layout in (self.kv_layout or {}).items():
+            if spec.kept_window and layout.retention is None:
+                raise RuntimeError(
+                    f"{spec.resource_key!r}: label {label!r} is read through a kept window and its layout sizes none, "
+                    "so the read would reach every entry; lay the array out through `state_layout`"
+                )
             # the release keeps an exact window in the first group alone, and a kept-window read is its array's only one
             if layout.retention is not None and layout.retention.exact and len(spec.config.groups) > 1:
                 raise ValueError(
                     f"{spec.resource_key!r}: label {label!r} keeps an exact window, and the pool has window groups"
                 )
             positions = layout.positions(self.loop_caps or {})
-            if layout.retention is None and positions > spec.config.max_seq_len:
+            releases = layout.retention is not None and layout.retention.can_release(spec.config.max_seq_len)
+            if not releases and positions > spec.config.max_seq_len:
                 raise ValueError(
                     f"this request needs {positions} positions of {label!r}, "
                     f"past the model's context of {spec.config.max_seq_len}"
@@ -893,6 +902,8 @@ class KVSpec(NodeResourceSpec):
     # Under CFG parallel, the node whose pool admits each request. The other nodes' pools hold no
     # more pages per request than the leader's, as long as the leader offloads nothing.
     leader: str | None = None
+    # A read attends through a window the pool keeps, which only a retention on each label's layout sizes.
+    kept_window: bool = False
 
     @property
     def resource_class(self) -> "type[Resource]":
@@ -919,6 +930,9 @@ class KVSpec(NodeResourceSpec):
         # stored by position, a split step's packed tokens are gathered or passed round; stored by
         # head, they trade for heads over every TP and SP rank (Ulysses)
         cfg = self.config
+        if isinstance(cfg, RingKVConfig):
+            return [f"KV {self.resource_key!r} is a ring, which takes no split steps, so node {node!r} can't split "
+                    "them: run it on TP ranks alone"]
         if not isinstance(cfg, PagedKVConfig):
             return []
         if cfg.context_parallel:
@@ -973,9 +987,10 @@ class RetentionPolicy:
     generation): once the committed tokens behind ``protected_prefix`` exceed
     ``context_budget``, the oldest unprotected pages are released.
 
-    A committing step declares it for its stream on ``KVStep.retention`` and
-    ``KVManager.commit`` applies it, so the release happens between steps as
-    far as every planner is concerned: a pre-plan of the next step gates on
+    ``KVManager.commit`` applies it, a request layout's exact one to its
+    stream (``LabelLayout.retention``) and a window group's to the group's
+    layers, so the release happens between steps as far as every planner is
+    concerned: a pre-plan of the next step gates on
     this commit and sees the compacted stream. Whole pages only (the page
     straddling the prefix boundary and a partial tail page stay), so the
     realized context can run over the budget by up to a page; the excess is
@@ -1002,6 +1017,10 @@ class RetentionPolicy:
         """The tokens at the head the release counts as the prefix: ``protected_prefix``, rounded up to a page of
         ``page_size`` when ``exact``."""
         return -(-self.protected_prefix // page_size) * page_size if self.exact else self.protected_prefix
+
+    def can_release(self, length: int) -> bool:
+        """Whether a stream of ``length`` entries holds some the window no longer reaches, which a release frees."""
+        return self.protected_prefix + self.context_budget < length
 
     def max_pages(self, page_size: int, step: int = 0) -> int:
         """The most pages of ``page_size`` a stream under this policy holds, with a step of
@@ -1105,10 +1124,6 @@ class KVStep(ResourceStep):
     fork_rids: frozenset | None = None
     # (request_id, label) pairs that run against SINK_PAGE and hold no pages
     sink: frozenset[tuple[str, str]] = frozenset()
-    # (request_id, label) -> the retention a committing stream declares for
-    # itself this step, applied at commit. It rides with the step rather than
-    # living on the stream, so an offload has nothing to lose.
-    retention: Mapping[tuple[str, str], RetentionPolicy] = field(default_factory=dict)
     # Set by the manager when the step commits, while copies to the host are on: its count of commits so far.
     # The submodule doesn't declare it, as it doesn't declare `SubmoduleStep`'s context.
     commits: int = field(default=0, init=False, compare=False, repr=False)

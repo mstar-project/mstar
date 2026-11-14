@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 import torch
 
+from mstar.model.base import declared_resources
 from mstar.model.cosmos3.components.transformer import Cosmos3OmniTransformer
 from mstar.model.cosmos3.config import Cosmos3Config
 from mstar.model.cosmos3.cosmos3_model import Cosmos3Model
@@ -158,12 +159,12 @@ def test_droid_sound_pathway_disabled() -> None:
     assert constants.VIDEO_SOUND_GEN_WALK not in walks
     assert constants.ACTION_GEN_WALK in walks and constants.ACTION_VIDEO_GEN_WALK in walks
     # v1: the graph walks declare which nodes are served, and the DiT's paged
-    # K/V shows up as a KVSpec in get_node_resources rather than an engine type.
+    # K/V shows up as a KVSpec among the declared resources rather than an engine type.
     served = {n for g in walks.values() for n in g.get_nodes()}
     assert "audio_decoder" not in served
     assert "dit" in served
     assert any(
-        isinstance(s, KVSpec) and "dit" in s.nodes for s in model.get_node_resources()
+        isinstance(s, KVSpec) and "dit" in s.nodes for s in declared_resources(model, {})
     )
 
     # A sound-requesting video request is rejected up front.

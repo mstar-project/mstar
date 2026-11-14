@@ -1,6 +1,12 @@
 """What a model declares about the state it keeps between steps.
 
 Declarations are values: mappings are read-only, sets are frozensets, and everything hashes.
+
+A node may also keep a session store: values one request leaves for a later request that names the same session. It is
+keyed by the client's session id, held in the node's process, bounded by count and by idle time, and an entry is pinned
+while a request uses it. Nothing else outlives a request. A lost entry is refused once, at the resuming request's first
+step, and a request that names a session is refused at submission when the node runs more than one replica
+(`Model.session_node`).
 """
 
 from collections.abc import Iterator, Mapping
@@ -158,6 +164,24 @@ class FrameWindow(Mask):
 
     def split_step_change(self) -> str:
         return "A step boundary inside a frame cuts what the frame's queries see"
+
+
+@dataclass(frozen=True)
+class BlockCausal(Mask):
+    """Blocks are runs of ``size`` entries from the row's first, and q is in block b = q // ``size``. Sees every entry
+    of blocks 0 to b. On an array with ``max_len`` 0, q's row is its segment in this step."""
+
+    uses_query_position = True
+    sees_step_whole = True
+
+    size: int
+
+    def __post_init__(self):
+        if not _is_positive(self.size):
+            raise ValueError(f"BlockCausal.size must be a positive int, got {self.size!r}")
+
+    def split_step_change(self) -> str:
+        return "A step boundary inside a block cuts what the block's queries see"
 
 
 class Op:
@@ -417,10 +441,11 @@ class SeqShard:
     `scatter` before and `gather` after; at one SP rank, and on a copied step, both pass their inputs through. Reads
     and updates of the node's arrays exchange what a split step needs by themselves.
 
-    ``labels`` lists one label, which an array on ``nodes`` opens, since the shard's handle brackets one; a node with
-    no arrays declares a `SeqShardSpec` itself. The shard cuts the label's tensors as the node's reads take queries on
-    it: rows of one span (``Read.packed`` False, not ``segmented``) each row alike, packed tokens or a request's
-    segments in one row contiguously; the reads take one of the two. ``walks`` are the walks whose steps may split,
+    ``labels`` are labels an array on ``nodes`` opens, and a step that opens several of them plans them as one
+    combined label, which the shard's handle brackets; a node with no arrays declares a `SeqShardSpec` itself. The
+    shard cuts a label's tensors as the node's reads take queries on it: rows of one span (``Read.packed`` False, not
+    ``segmented``) each row alike, packed tokens or a request's segments in one row contiguously; the reads take one
+    of the two. ``walks`` are the walks whose steps may split,
     as a row's walk (a combined walk splits where a walk it combines is listed); None: every walk. ``exchange`` is the
     author's default for how a split step reaches the node's paged attentions, which the deployment's ``resources:``
     block overrides under the shard's name: ``auto`` (Ulysses over KV stored by head, copied over KV stored by

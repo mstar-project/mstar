@@ -10,7 +10,6 @@ Import by module name (``from lora_module_helpers import ...``).
 from __future__ import annotations
 
 import math
-import threading
 from collections.abc import Callable, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -30,68 +29,9 @@ from mstar.engine.resources.step import ResourceStep, Segment, StepContext, Subm
 from mstar.engine.state import ArrayStep
 from mstar.model.qwen3_5.config import FULL_ATTENTION, LINEAR_ATTENTION, Qwen3_5Config
 from mstar.model.submodule_base import ARNodeInputs, engine_step, with_segment_steps
+from mstar.testing_utils.comm import ThreadGroup, run_ranks  # noqa: F401  (re-exported)
 
 DTYPE = torch.float64
-
-
-class _Exchange:
-    def __init__(self, world: int):
-        self.barrier = threading.Barrier(world)
-        self.slots: list = [None] * world
-
-    def share(self, rank: int, value):
-        self.slots[rank] = value
-        self.barrier.wait()
-        out = list(self.slots)
-        self.barrier.wait()
-        return out
-
-
-class ThreadGroup(CommGroup):
-    """One rank of a simulated group: collectives across the ranks' threads, summed in
-    rank order (deterministic)."""
-
-    def __init__(self, rank: int, world: int, exchange: _Exchange):
-        super().__init__(my_global_rank=rank, my_group_rank=rank, group_members=list(range(world)))
-        self._exchange = exchange
-
-    def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
-        if self.world_size == 1:
-            return input_
-        parts = self._exchange.share(self.rank, input_)
-        out = parts[0].clone()
-        for p in parts[1:]:
-            out += p
-        return out
-
-    def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
-        if self.world_size == 1:
-            return input_
-        return torch.cat(self._exchange.share(self.rank, input_), dim=dim)
-
-
-def run_ranks(world: int, fn: Callable[[int, CommGroup], object]) -> list:
-    """``fn(rank, group)`` on every rank of a simulated group, concurrently; the results
-    in rank order. A rank's exception aborts the others' collectives and is raised."""
-    exchange = _Exchange(world)
-    results: list = [None] * world
-    errors: list = []
-
-    def body(rank: int):
-        try:
-            results[rank] = fn(rank, ThreadGroup(rank, world, exchange))
-        except BaseException as exc:  # noqa: BLE001 - re-raised below
-            errors.append(exc)
-            exchange.barrier.abort()
-
-    threads = [threading.Thread(target=body, args=(r,)) for r in range(world)]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-    if errors:
-        raise errors[0]
-    return results
 
 
 def rand(*shape, seed: int, scale: float = 1.0) -> torch.Tensor:
@@ -328,6 +268,9 @@ class _Unread:
 
     def opens_label(self, rid, label):
         return True
+
+    def write_kv(self, k, v, layer_idx=None, label=None, tokens=None):
+        """Nothing: a kept add reaches the pages whatever core reads it, and no stubbed core reads them."""
 
 
 # -- Llama-shaped checkpoints -------------------------------------------------------------------

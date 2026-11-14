@@ -21,6 +21,7 @@ from mstar.engine.state import (
     Attend,
     Bidirectional,
     Block,
+    BlockCausal,
     Causal,
     CausalConv,
     Entry,
@@ -210,6 +211,7 @@ def test_a_bad_mask_or_op_is_refused_when_the_read_is_built(build, where):
 @pytest.mark.parametrize("mask, uses_query_position, sees_step_whole", [
     (Causal(), True, False), (Window(4), True, False), (Block(), False, True), (Bidirectional(), False, True),
     (FrameWindow(4, frames=2), True, True),
+    (BlockCausal(4), True, True),
 ])
 def test_each_mask_says_whether_it_uses_the_query_position_and_sees_a_step_whole(
     mask, uses_query_position, sees_step_whole,
@@ -226,6 +228,12 @@ def test_each_mask_says_whether_it_uses_the_query_position_and_sees_a_step_whole
 def test_each_mask_that_sees_a_step_whole_says_what_a_split_step_changes(mask, change):
     """The refusal of a regrouped walk gives the sentence of the read's mask."""
     assert mask.split_step_change() == change
+
+
+@pytest.mark.parametrize("size", [0, -1, 2.0, True])
+def test_block_causal_refuses_a_bad_size(size):
+    with pytest.raises(ValueError, match=re.escape(f"BlockCausal.size must be a positive int, got {size!r}")):
+        BlockCausal(size)
 
 
 @dataclass(frozen=True)

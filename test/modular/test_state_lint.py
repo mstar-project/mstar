@@ -25,7 +25,7 @@ PORTED = (
     "mstar/model/qwen3_tts",
     "mstar/model/pi05", "mstar/model/vjepa2", "mstar/model/canary", "mstar/model/components/encoder_decoder.py",
     "mstar/model/bagel", "mstar/model/chatterbox", "mstar/model/whisper",
-    "mstar/model/waypoint", "mstar/model/lingbot_world",
+    "mstar/model/waypoint", "mstar/model/lingbot_world", "mstar/model/cosyvoice3", "mstar/model/cosmos3",
 )
 FORBIDDEN_ATTRIBUTES = {
     "node_resources", "resources", "request_state", "request_states", "per_request_states", "sequence_shard",
@@ -40,8 +40,8 @@ ALLOWED = {
     for name in (
         "AcceleratorGraphConfig", "BatchedAcceleratorGraphConfig", "DETERMINISTIC_COMPILE_MODE",
         "PackedAcceleratorGraphConfig", "PiecewiseAcceleratorGraphConfig", "PiecewiseBatchedConfig",
-        "PiecewiseCallInputs", "PiecewiseCaptureShape", "PiecewisePackedConfig", "decode_rows_then_prompt",
-        "geometric_batch_sizes",
+        "PiecewiseCallInputs", "PiecewiseCaptureShape", "PiecewisePackedConfig", "check_inductor_options",
+        "decode_rows_then_prompt", "geometric_batch_sizes",
     )
 } | {
     ("mstar.engine.accelerator_graph_runner", "compile_kwargs"): _CAPTURE,
@@ -54,6 +54,7 @@ ALLOWED = {
         "MiniMax-H3's video decoder's sequence shard, written by hand: a contract SeqShard brackets a label an array "
         "opens, and the decoder has no arrays"
     ),
+    ("mstar.engine.windowing", "WindowSchedule"): "a windowed rollout's window arithmetic, which holds no state",
 }
 # Where an allowed import may stand: the one file whose text says why. Any other ported file importing it fails.
 ALLOWED_ONLY_IN = {("mstar.engine.resources", "SeqShardSpec"): "mstar/model/minimax_h3/minimax_h3_model.py"}
@@ -61,6 +62,12 @@ ALLOWED_ONLY_IN = {("mstar.engine.resources", "SeqShardSpec"): "mstar/model/mini
 ALLOWED_IN: dict[tuple[str, str, str], str] = {
     ("mstar/model/bagel/bagel_model.py", "mstar.engine.resources", "KVReqConfig"):
         "per-node and publish labels under CFG parallel and P/D, until P/D labels",
+    ("mstar/model/cosmos3/cosmos3_model.py", "mstar.engine.resources.attn.ragged.config", "RaggedAttnBackend"):
+        "the vision tower's FA3 kernel among its kernel settings, which goes when the engine picks kernels itself",
+    ("mstar/model/cosmos3/cosmos3_model.py", "mstar.engine.resources.spec", "CombinedSplit"):
+        "the reasoner's mixed-step split among its kernel settings, which the contract doesn't type yet",
+    ("mstar/model/cosmos3/submodules.py", "mstar.engine.fp32_precision", "cudnn_benchmark"):
+        "the VAE decode's cuDNN autotune switch, which holds no state",
 } | {
     ("mstar/model/chatterbox/components/s3gen_graphs.py", module, name):
         "S3Gen's own captures per shape, which hold no state"

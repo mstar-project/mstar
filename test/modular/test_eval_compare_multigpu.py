@@ -22,12 +22,12 @@ sys.path.insert(0, ".")
 
 pytest.importorskip("aiohttp")
 
-from test_eval_compare import RUN, chat_model, fake_tree, finish, procs_under, write_arm  # noqa: E402
+from test_eval_compare import RUN, chat_model, fake_cargo, fake_tree, finish, procs_under, write_arm  # noqa: E402,F401
 
 from benchmark.eval.e2e import arm, compare, hosts, report, trees  # noqa: E402
 from benchmark.eval.e2e import manifest as mf  # noqa: E402
 
-pytestmark = pytest.mark.usefixtures("no_host_gpus")
+pytestmark = pytest.mark.usefixtures("no_host_gpus", "fake_cargo")
 
 SIX = {"whisper_large_tp2": 2, "qwen3omni_thinker_tp2": 3, "cosmos3_nano_sp2": 2, "qwen3tts_1p7b_split": 1,
        "orpheus_pd_disaggregated": 2, "qwen3omni_pd_disaggregated": 3}

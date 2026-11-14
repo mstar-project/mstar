@@ -1,8 +1,8 @@
 """The Cosmos3-Edge vision tower served on `PackedBlockLoopEncoder`: `embed`,
-then `encode` over the frames the step planned on the ragged attention
-resource, then `project`, must be the reference `forward` (attention within
-each frame of the packed patches), for a step packing several requests'
-images and video frames; and the node plans one segment per layout run."""
+then `encode` over the frames the step planned on its vision tokens' array,
+then `project`, must be the reference `forward` (attention within each frame
+of the packed patches), for a step packing several requests' images and video
+frames; and the node plans one segment per layout run."""
 
 from __future__ import annotations
 
@@ -12,19 +12,23 @@ import torch
 
 from mstar.model.cosmos3.components.vision import Cosmos3VisionModel, frame_attention
 from mstar.model.cosmos3.config import Cosmos3ReasonerConfig, Cosmos3VisionEncoderConfig
+from mstar.model.cosmos3.constants import VISION_TOKENS
 from mstar.model.keys import VISION_ATTN
 from mstar.model.multimodal import MEDIA_LAYOUT
 
 
 class _PlannedFrames:
-    """The ragged attention resource as the encoder blocks see it: attention
-    within each planned segment."""
+    """The vision tokens' handle as the encoder blocks see it: a layer's add, then
+    its read, attention within each planned segment."""
 
     def __init__(self, lengths: list[int]):
         self.lengths = lengths
 
-    def run(self, q, k, v, label=None):
-        return frame_attention(q, k, v, self.lengths)
+    def add(self, layer, k, v):
+        self.k, self.v = k, v
+
+    def read(self, layer, q):
+        return frame_attention(q, self.k, self.v, self.lengths)
 
 
 def _tower() -> Cosmos3VisionModel:
@@ -53,7 +57,7 @@ def test_the_served_path_is_the_reference_forward():
         pos = torch.cat([model.position_table(h, w) for _, h, w in frames])
         plan = _PlannedFrames([h * w for _, h, w in frames])
         for layer in model.visual.encoder.layers:
-            layer.self_attn.bind_resources({VISION_ATTN: plan})
+            layer.self_attn.bind_state({VISION_TOKENS: plan})
         hidden, cos, sin = model.embed(pixels, pos)
         served = model.project(model.encode(hidden, cos, sin))
     assert served.shape == ref.shape == (patches // 4, 24)
@@ -78,7 +82,7 @@ def test_the_node_plans_a_segment_per_layout_run():
         inp.tensor_inputs["pos_embeds"], torch.cat([model.position_table(4, 6), model.position_table(4, 4)]),
     )
     # the second (4, 4) frame of a step reuses its table
-    assert set(node._position_tables) == {(4, 6), (4, 4)}
+    assert set(node._position_tables.entries) == {(4, 6), (4, 4)}
     try:
         node.prepare_inputs("prefill_vision", info, {"pixel_values": [pixels[:-1]]})
     except ValueError as e:
@@ -104,21 +108,17 @@ def test_the_block_loop_runs_in_bf16_without_autocast():
     assert {t.dtype for t in buffers.values()} == {torch.bfloat16}
 
 
-def test_the_vision_attention_declares_fa3():
+def test_the_vision_attention_declares_fa3(tmp_path):
     """head_dim 72 runs unpadded on FA3 varlen; FlashInfer would pad it to 128."""
-    from mstar.engine.resources.attn.ragged.config import RaggedAttnBackend
-    from mstar.model.cosmos3.cosmos3_model import Cosmos3Model
+    from test_cosmos3_edge_model import _model, _specs
 
-    model = Cosmos3Model.__new__(Cosmos3Model)
-    model.config = SimpleNamespace(reasoner=SimpleNamespace(
-        vision=SimpleNamespace(num_attention_heads=16, hidden_size=1152, patch_size=16),
-        image_processor=SimpleNamespace(min_pixels=65536), video_processor=SimpleNamespace(min_pixels=4096),
-    ))
-    spec = model._vision_attention_spec()
+    from mstar.engine.resources.attn.ragged.config import RaggedAttnBackend
+
+    (spec,) = [spec for spec in _specs(_model(tmp_path)) if spec.resource_key == VISION_ATTN]
     assert spec.config.head_dim == 72 and spec.config.backend is RaggedAttnBackend.DENSE
 
 
-def test_position_tables_are_kept_within_a_byte_budget():
+def test_position_tables_are_kept_within_a_byte_budget(monkeypatch):
     """The node keeps resized position tables up to its byte budget, least
     recently used dropped first, and doesn't keep one over an eighth of it."""
     from mstar.model.cosmos3.submodules import Cosmos3VisionEncoderSubmodule
@@ -131,17 +131,17 @@ def test_position_tables_are_kept_within_a_byte_budget():
         projector_input_hidden_size=32, projector_hidden_size=48, projector_out_hidden_size=24,
     )
     model = Cosmos3VisionModel(config).eval()
-    node = Cosmos3VisionEncoderSubmodule(model, SimpleNamespace(reasoner=config))
     one = model.position_table(1, 1)
     patch = one.numel() * one.element_size()
-    node.POSITION_TABLE_BYTES = 64 * patch  # an eighth: 8 patches
+    monkeypatch.setattr(Cosmos3VisionEncoderSubmodule, "POSITION_TABLE_BYTES", 64 * patch)  # an eighth: 8 patches
+    node = Cosmos3VisionEncoderSubmodule(model, SimpleNamespace(reasoner=config))
     with torch.no_grad():
         for hw in ((2, 2), (2, 4), (4, 2), (2, 2)):  # 4, 8 and 8 patches; (2, 2) used again
             node._position_table(*hw)
-        assert list(node._position_tables) == [(2, 4), (4, 2), (2, 2)]
+        assert list(node._position_tables.entries) == [(2, 4), (4, 2), (2, 2)]
         node._position_table(6, 4)  # 24 patches, over an eighth: built, not kept
-        assert (6, 4) not in node._position_tables
-        node.POSITION_TABLE_BYTES = 16 * patch  # an eighth: 2 patches
+        assert (6, 4) not in node._position_tables.entries
+        node._position_tables.max_bytes = 16 * patch
         node._position_table(1, 1)  # 21 patches held: the least recent, (2, 4), goes
-        assert list(node._position_tables) == [(4, 2), (2, 2), (1, 1)]
-        assert node._position_table_bytes == 13 * patch
+        assert list(node._position_tables.entries) == [(4, 2), (2, 2), (1, 1)]
+        assert node._position_tables.num_bytes == 13 * patch

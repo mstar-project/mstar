@@ -116,8 +116,8 @@ is **not** the only wiring step. A model also needs:
   only through ``POST /generate`` needs none. The adapter is ported to the Rust frontend in the
   same change (a type implementing ``OpenAIAdapter`` in ``rust/server/src/adapters/`` and its
   row in ``ADAPTERS``, tested by
-  ``test/rust/test_rust_openai_adapters.py``): the Python HTTP frontend is being retired, and a
-  surface only it serves is unfinished.
+  ``test/rust/test_rust_openai_adapters.py``): ``mstar serve`` serves HTTP from ``mstar-server``,
+  the Python HTTP frontend is deprecated, and a surface only it serves is unfinished.
 - the client-example tuples further down ``mstar/cli/main.py``, so ``mstar serve`` prints a
   usage snippet. Cosmetic, but user-visible.
 
@@ -2308,8 +2308,8 @@ example above already does this.
 It is ``None`` for an eager step. If a submodule's declaration differs between the
 captured case and the eager case, it must check the lease, not its own capture key. The
 capture key only says that the batch could be captured. The lease says that the batch was
-captured. For example, Cosmos3 packs both guidance branches into a single plan for the
-captured shape, and uses the dense backend otherwise.
+captured. For example, Cosmos3's captured denoise step declares both guidance branches,
+inside a request's guidance interval or not, and its eager step only the branches it runs.
 
 ``piecewise_leases`` names the inner regions of this node that hold their own slot for
 this step. Such a region declares, plans and commits its own work. Any resource that the

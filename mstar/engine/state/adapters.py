@@ -20,6 +20,7 @@ from mstar.engine.resources.attn.config import (
     AttentionSpec,
     AttentionStep,
     AttnBackend,
+    BlockCausalAttentionSpec,
     CrossAttentionConfig,
     CrossAttentionSpec,
 )
@@ -78,6 +79,7 @@ from mstar.engine.state.contract import (
     Attend,
     Bidirectional,
     Block,
+    BlockCausal,
     Causal,
     CausalConv,
     Entry,
@@ -174,9 +176,13 @@ def _resolve(arrays: Sequence[Array], setup: "StateSetup") -> "Resolved":
     return Resolved(specs, bound, resource_of, queries)
 
 
-def state_setup(config: Mapping[str, Any], declarations: Sequence[Array | Sampler]) -> tuple["StateSetup", list[str]]:
-    """The setup ``config`` asks for ``declarations``, and the problems with what it asks, each left out of the setup.
-    A ``backend: sdpa`` block binds every read on its resource to SDPA."""
+def state_setup(
+    config: Mapping[str, Any], declarations: Sequence[Array | Sampler],
+    kernel_settings: Mapping[str, Mapping[str, Any]] = EMPTY,
+) -> tuple["StateSetup", list[str]]:
+    """The setup ``config`` and the model's ``kernel_settings`` ask for ``declarations``, and the problems with what
+    they ask, each left out of the setup. A ``backend: sdpa`` block binds every read on its resource to SDPA, and
+    ``eager_backend: dense`` binds its read to the default's pair in `EAGER_DENSE`."""
     # a config that still asks for SDPA on a node group would otherwise run the ragged kernel
     problems = [
         f"node_groups[{i}].attention_backend: the backend is a resource's setting, as "
@@ -184,10 +190,27 @@ def state_setup(config: Mapping[str, Any], declarations: Sequence[Array | Sample
         for i, group in enumerate(config.get("node_groups") or ()) if "attention_backend" in group
     ]
     arrays = [declared for declared in declarations if isinstance(declared, Array)]
-    resolved = _resolve(arrays, StateSetup())
-    resource_of = {read: resolved.resource_of[read] for array in arrays for read in array.reads}
-    replaced = {each.key: each.binding for array in arrays for each in resolved.bound[array.name]}
+    replaced = {
+        read: _default_binding(storage_of(array), array.reads[read]) for array in arrays for read in array.reads
+    }
     by_read: dict[str, OpBinding] = {}
+    for array in arrays:
+        for read in array.reads:
+            binding = EAGER_DENSE.get(type(replaced[read]))
+            if binding is None or kernel_settings.get(read, EMPTY).get("eager_backend") != "dense":
+                continue
+            swapped = _swap_problem(array, read, binding, replaced[read])
+            if swapped is not None:
+                problems.append(f"kernel_settings[{read!r}]: eager_backend dense {swapped}")
+                continue
+            try:
+                binding.check(array, read, array.reads[read])
+                by_read[read] = binding
+            except ValueError as e:
+                problems.append(f"kernel_settings[{read!r}]: eager_backend dense: {e}")
+    # resolved with the eager choices, since a default they replace may not resolve beside its neighbours
+    resolved = _resolve(arrays, StateSetup(dict(by_read)))
+    resource_of = {read: resolved.resource_of[read] for array in arrays for read in array.reads}
     for key, block in _sdpa_blocks(config).items():
         reads = [(array, read) for array in arrays for read in array.reads if resource_of[read] == key]
         if block.keys() != {"backend"}:
@@ -206,11 +229,9 @@ def state_setup(config: Mapping[str, Any], declarations: Sequence[Array | Sample
                 refused.append(f"resources.{key}: backend sdpa runs only an Attend read within a step, and Array "
                                f"{array.name!r}.reads[{read!r}] isn't one")
                 continue
-            if binding.keeps_window != replaced[read].keeps_window:
-                refused.append(f"resources.{key}: backend sdpa binds Array {array.name!r}.reads[{read!r}] through "
-                               f"{type(binding).__name__} in place of {type(replaced[read]).__name__}, and only one "
-                               "of them keeps a window, which a request's layout sizes the read's pages by; set no "
-                               "backend on this read")
+            swapped = _swap_problem(array, read, binding, replaced[read])
+            if swapped is not None:
+                refused.append(f"resources.{key}: backend sdpa {swapped}; set no backend on this read")
                 continue
             try:
                 binding.check(array, read, array.reads[read])
@@ -222,6 +243,15 @@ def state_setup(config: Mapping[str, Any], declarations: Sequence[Array | Sample
             for _, read in reads:
                 by_read.pop(read, None)
     return StateSetup(by_read), problems
+
+
+def _swap_problem(array: Array, read: str, binding: "OpBinding", default: "OpBinding") -> str | None:
+    """Why ``binding`` can't take the place of ``default`` on ``array``'s read ``read``, or None."""
+    if binding.keeps_window == default.keeps_window:
+        return None
+    return (f"binds Array {array.name!r}.reads[{read!r}] through {type(binding).__name__} in place of "
+            f"{type(default).__name__}, and only one of them keeps a window, which a request's layout sizes the read's "
+            "pages by")
 
 
 def _sdpa_blocks(config: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
@@ -346,7 +376,8 @@ def node_handles(
     model: "Model", node: str, resources: Mapping[str, Any], *, setup: "StateSetup | None" = None,
     built: dict[str, ArrayHandle | SamplerHandle | ShardHandle] | None = None,
 ) -> dict[str, ArrayHandle | SamplerHandle | ShardHandle]:
-    """``node``'s handles, by declared name, over its built ``resources``, each read bound as ``setup`` binds it.
+    """``node``'s handles, by declared name, over the engine's built ``resources``, each read bound as ``setup`` binds
+    it.
 
     ``built`` maps declared names to the handles this process's other nodes built, and this call adds the ones it
     builds. A node shares the handle another node built for a declaration: nodes can share layers, as BAGEL's LLM
@@ -386,10 +417,11 @@ def build_handle(
 
 def state_steps(
     step: SubmoduleStep | None, handles: Mapping[str, ArrayHandle | SamplerHandle | ShardHandle], *,
-    graph_walk: str | None = None,
+    graph_walk: str | None = None, leased: bool = False,
 ) -> SubmoduleStep | None:
     """``step`` on ``graph_walk`` as a new step, with what its ``state`` declares expanded into today's step objects by
-    each storage's builder, afresh for each step, since each carries the step's segments. The handles it opens are
+    each storage's builder, afresh for each step, since each carries the step's segments. ``leased``: whether the step
+    holds a slot lease, an input to the kernel of a read with two (`OpBinding.leg`). The handles it opens are
     those of what ``state`` lists, then the node's sequence shard's, whose step is the node's segments. None when no
     array or sampler it lists needs it, nor a shard that can split, and it holds no other resource's step, so the step
     skips its resources' admit, plan and commit."""
@@ -411,7 +443,7 @@ def state_steps(
             builder = builders.get(handle.storage)
             if builder is None:
                 builder = builders[handle.storage] = handle.storage.step_builder()
-            builder.add(handle, declared, step, graph_walk)
+            builder.add(handle, declared, step, graph_walk, leased)
         elif isinstance(declared, SampleStep) and isinstance(handle, SamplerHandle):
             steps[name] = SamplerStep(
                 apply_penalty=declared.apply_penalty, apply_filters=declared.apply_filters,
@@ -486,8 +518,12 @@ class StepBuilder(ABC):
     """Today's steps of one storage's arrays in one step."""
 
     @abstractmethod
-    def add(self, handle: ArrayHandle, declared: ArrayStep, step: SubmoduleStep, walk: str | None = None) -> None:
-        """``declared`` is what ``step``, on ``walk``, lists for ``handle``'s array."""
+    def add(
+        self, handle: ArrayHandle, declared: ArrayStep, step: SubmoduleStep, walk: str | None = None,
+        leased: bool = False,
+    ) -> None:
+        """``declared`` is what ``step``, on ``walk``, lists for ``handle``'s array. ``leased``: whether the step holds
+        a slot lease."""
 
     @abstractmethod
     def steps(self) -> dict[str, Any]:
@@ -501,10 +537,14 @@ class ArraySteps(StepBuilder):
         self._storage = storage
         self._steps: dict[str, Any] = {}
 
-    def add(self, handle: ArrayHandle, declared: ArrayStep, step: SubmoduleStep, walk: str | None = None) -> None:
+    def add(
+        self, handle: ArrayHandle, declared: ArrayStep, step: SubmoduleStep, walk: str | None = None,
+        leased: bool = False,
+    ) -> None:
         segments = segments_of(declared, step)
         self._storage.steps(handle, declared, step, segments, self._steps)
         for key, bound in handle._step_ops(walk):
+            key = bound.binding.leg(bound, leased, declared.keep) or key
             bound.binding.steps(handle.array, key, bound.declared, declared, segments, self._steps)
 
     def steps(self) -> dict[str, Any]:
@@ -525,6 +565,7 @@ class WithinStepSteps(StepBuilder):
 
     def add(
         self, handle: "WithinStepHandle", declared: ArrayStep, step: SubmoduleStep, walk: str | None = None,
+        leased: bool = False,
     ) -> None:
         """Plan ``handle``'s read over the step's whole segments: on a step the node's sequence shard splits, the
         resource narrows a split side to this rank's share itself."""
@@ -633,6 +674,8 @@ class OpBinding:
     takes_queries: ClassVar[bool] = True
     # whether `retention` gives a policy, so a request's layout sizes the pages under the read
     keeps_window: ClassVar[bool] = False
+    # whether the read runs a plan its step builds, so its resource has a spec and its calls need the step open
+    plans: ClassVar[bool] = True
 
     @property
     def kept_window_binding(self) -> "OpBinding | None":
@@ -645,7 +688,7 @@ class OpBinding:
 
     def for_mask(self, mask: Mask) -> "OpBinding":
         """The binding that runs the op through ``mask``: `kept_window_binding` through a kept window, and this one
-        through any other mask. The one place a field of the mask picks a binding."""
+        through any other mask. The one place a mask picks a binding, by its type or a field."""
         kept = self.kept_window_binding if isinstance(mask, Bidirectional) and mask.kept_window else None
         return self if kept is None else kept
 
@@ -678,6 +721,12 @@ class OpBinding:
         """The key of the resource the op under ``key`` runs on."""
         return key
 
+    def leg(self, bound: BoundOp, leased: bool, keeps: bool) -> str | None:
+        """The key ``bound`` runs under on a step with or without a slot lease (``leased``) that keeps its adds or not
+        (``keeps``), where the binding builds a second kernel under the read's own key; None where it runs on the
+        paged spec its read is grouped into."""
+        return None
+
     def apply(self, spec: NodeResourceSpec | None, settings: Mapping[str, Any]) -> None:
         """Set ``settings``, the op's `kernel_settings`, on ``spec``, its resource's."""
         for field, value in settings.items():
@@ -706,6 +755,9 @@ class PagedAttend(OpBinding):
     def kept_window_binding(self) -> OpBinding:
         return KEPT_WINDOW_ATTEND
 
+    def for_mask(self, mask: Mask) -> OpBinding:
+        return BLOCK_CAUSAL_ATTEND if isinstance(mask, BlockCausal) else super().for_mask(mask)
+
     def specs(self, array: Array, key: str, read: Read) -> list[NodeResourceSpec]:
         windowed = isinstance(read.mask, Window)
         # AttentionConfig.layers counts among the pool's layers
@@ -733,6 +785,58 @@ class PagedAttend(OpBinding):
 
     def attach(self, handle: "PagedArrayHandle", key: str, run: Any) -> None:
         handle.reads[key] = run
+
+
+class EagerDenseAttend(PagedAttend):
+    """`Attend` on a paged array that runs the dense kernel on a step with no slot lease that keeps nothing, and the
+    paged one on a leased step, whose graph replays, and on a step that keeps its adds, so every entry the pages keep
+    comes from one kernel. The dense kernel is a spec under the read's own key, beside the paged spec of its group."""
+
+    kernel_settings = PagedAttend.kernel_settings | {"eager_backend"}
+
+    def check(self, array: Array, key: str, read: Read) -> None:
+        if not isinstance(read.mask, Bidirectional):
+            raise _no_layout(array, f"reads[{key!r}].mask must be Bidirectional to take eager_backend dense, since the "
+                                    "dense kernel has no causal plan and no window")
+
+    def specs(self, array: Array, key: str, read: Read) -> list[NodeResourceSpec]:
+        dense = AttentionSpec(
+            resource_key=key, nodes=array.nodes, config=AttentionConfig(kv_cache=array.name, backend=AttnBackend.DENSE),
+        )
+        return [*super().specs(array, key, read), dense]
+
+    def leg(self, bound: BoundOp, leased: bool, keeps: bool) -> str | None:
+        return None if leased or keeps else bound.key
+
+    def apply(self, spec: NodeResourceSpec | None, settings: Mapping[str, Any]) -> None:
+        super().apply(spec, {field: value for field, value in settings.items() if field != "eager_backend"})
+
+
+class PagedBlockCausal(PagedAttend):
+    """`Attend` through `BlockCausal` on a paged array: a `BlockCausalAttentionSpec` over the array's pool."""
+
+    kernel_settings = frozenset()
+
+    def check(self, array: Array, key: str, read: Read) -> None:
+        if not read.packed:
+            raise _no_layout(array, f"reads[{key!r}] declares packed=False, and the block-causal kernel takes packed "
+                                    "rows")
+        if read.walks is not None:
+            raise _no_layout(array, f"reads[{key!r}].walks must be None: a block-causal read is its array's read on "
+                                    "every walk")
+
+    def specs(self, array: Array, key: str, read: Read) -> list[NodeResourceSpec]:
+        return [BlockCausalAttentionSpec(
+            resource_key=key, nodes=array.nodes, config=AttentionConfig(kv_cache=array.name), block_size=read.mask.size,
+        )]
+
+    def steps(
+        self, array: Array, key: str, read: Read, declared: ArrayStep, segments, steps: dict[str, Any],
+    ) -> None:
+        steps[key] = AttentionStep(segments=segments, causal=False)
+
+
+BLOCK_CAUSAL_ATTEND = PagedBlockCausal()
 
 
 class PagedCrossAttend(PagedAttend):
@@ -780,18 +884,16 @@ class FlexAttend(OpBinding):
 
 
 class KeptWindowBinding(OpBinding):
-    """A read through a kept window on a paged array. The pool releases what the window no longer reaches, so the read
-    is its array's only one, and each request's layout sizes it."""
+    """A read through a kept window on a paged array. The pool releases what the window no longer reaches, so the
+    array's other reads run on other walks, and each request's layout sizes it."""
 
     keeps_window = True
 
     def check(self, array: Array, key: str, read: Read) -> None:
-        others = sorted(set(array.reads) - {key})
-        if others:
-            raise _no_layout(array, f"reads[{key!r}] keeps a window beside reads {others}, which would reach entries "
-                                    "the window releases")
-        if read.walks is not None:
-            raise _no_layout(array, f"reads[{key!r}].walks must be None, since the pool keeps one window a label")
+        shared = sorted(other for other, each in array.reads.items() if other != key and _share_a_walk(read, each))
+        if shared:
+            raise _no_layout(array, f"reads[{key!r}] keeps a window beside reads {shared}, which share one of its "
+                                    "walks or name none, so they would reach entries the window releases")
         if read.queries is not None:
             raise _no_layout(array, f"reads[{key!r}].queries must be None, since the window is cut per row of its "
                                     "own array")
@@ -831,6 +933,14 @@ class KeptWindowAttend(KeptWindowBinding):
 
 
 KEPT_WINDOW_ATTEND = KeptWindowAttend()
+
+
+class KeptWindowEagerDense(KeptWindowBinding, EagerDenseAttend):
+    """`EagerDenseAttend` through a kept window: the dense kernel's prefix is each row's reach."""
+
+    def check(self, array: Array, key: str, read: Read) -> None:
+        KeptWindowBinding.check(self, array, key, read)
+        EagerDenseAttend.check(self, array, key, read)
 
 
 class PagedReach(KeptWindowBinding):
@@ -972,9 +1082,9 @@ class WithinStepAttend(OpBinding, ABC):
     """`Attend` within a step, over the step's own adds."""
 
     # the model's settings are for the ragged kernel, whichever binding the deployment picks
-    kernel_settings = frozenset({"max_segments_per_request", "max_segments_per_step", "compile_op", "workspace_mb"})
-    # whether the read runs a plan its step builds, so its resource has a spec and its calls need the step open
-    plans: ClassVar[bool]
+    kernel_settings = frozenset({
+        "max_segments_per_request", "max_segments_per_step", "compile_op", "workspace_mb", "backend",
+    })
 
     def check(self, array: Array, key: str, read: Read) -> None:
         if not isinstance(read.mask, Block):
@@ -991,7 +1101,6 @@ class RaggedAttend(WithinStepAttend):
     """`Attend` within a step, on a ragged resource that the reads of one kind, nodes and config share."""
 
     read_back = frozenset({"max_segments_per_request", "max_segments_per_step"})
-    plans = True
 
     def attend(self, run: Any, label: str, rows: "RowLayout") -> Callable[..., torch.Tensor]:
         return functools.partial(joint_attention, ragged=functools.partial(run.run, label=label))
@@ -1120,6 +1229,12 @@ class PagedArrayHandle(ArrayHandle):
         for bound in bindings:
             run = bound.binding.bind(array, resolved.resource_of[bound.key], resources)
             bound.binding.attach(self, bound.key, run)
+        # each read with a second kernel: its layers, its paged run and the other, which `begin_step` points it at
+        self._legs = [
+            (bound.key, read_layers(array, bound.declared), self.reads[bound.key],
+             bound.binding.bind(array, leg, resources))
+            for bound in bindings if (leg := bound.binding.leg(bound, False, False)) is not None
+        ]
         self.first_read = next(iter(self.reads.values()))
         self._attn: dict[int, PagedRead] = {
             layer: self.reads[key]
@@ -1132,12 +1247,12 @@ class PagedArrayHandle(ArrayHandle):
             layer for bound in bindings if not bound.binding.takes_queries
             for layer in read_layers(array, bound.declared)
         )
-        # the reads through a kept window, which each request's layout sizes for the labels it opens
-        self._windowed = [bound.key for bound in bindings if bound.binding.keeps_window]
         # each op with its resource, built once since `state_steps` runs on every step, replays too
         self._ops = [(resolved.resource_of[bound.key], bound) for bound in bindings]
         # whether `check_step` needs an add, for a step that lists a row on the pages at span above 0
         self._grows = False
+        # whether the add in `_held` is kept
+        self._held_kept = False
 
     def _check_labels(self, labels: set[str], segments) -> None:
         runs = [label for label, _ in groupby(segment.label for segment in segments)]
@@ -1169,6 +1284,11 @@ class PagedArrayHandle(ArrayHandle):
 
     def begin_step(self, step) -> None:
         super().begin_step(step)
+        # a step plans a read's second kernel under the read's own key, which only `OpBinding.leg` gives a step
+        for key, layers, paged, leg in self._legs:
+            self.reads[key] = run = leg if key in step.steps else paged
+            for layer in layers:
+                self._attn[layer] = run
         # adds that run before the reads, outside the captured graph, which the reads find in the pages
         self._eager = step.state[self.name].eager_add
         # the one plan `PagedStorage.steps` names for a step over several labels
@@ -1176,16 +1296,6 @@ class PagedArrayHandle(ArrayHandle):
         self._combined = bool(combined)
         if combined:
             self.label = next(iter(combined.values()))
-        if not self._windowed or not self._segments or step.ctx.replays:
-            return
-        placeholders = step.state[self.name].placeholders
-        for view in self._kv.views(self.label):
-            if view.retention is None and (view.request_id, view.label) not in placeholders:
-                key = self._windowed[0]
-                raise self._refusal(
-                    f"request {view.request_id} keeps no window on label {view.label!r}, so reads[{key!r}] would "
-                    f"reach every entry; state_layout[{self.name!r}][{view.label!r}] must be a Layout that gives "
-                    f"kept_windows[{key!r}]")
 
     def check_step(self, step) -> None:
         # in the step's forward, before its commit: the last add, if its layer went unread
@@ -1193,9 +1303,6 @@ class PagedArrayHandle(ArrayHandle):
         super().check_step(step)
         if not self._keep or step.ctx.replays:
             return
-        if self._unwritten():
-            raise self._refusal(f"the step ends with layer {self._held_layer}'s add unread, on a kernel that takes k "
-                                "and v at the read, so no page holds it")
         if self._grows and not self._kept:
             raise self._refusal("a step that keeps lists rows at span above 0 and adds nothing, so the pages "
                                 "would keep entries no add wrote; list those rows at span 0")
@@ -1205,10 +1312,11 @@ class PagedArrayHandle(ArrayHandle):
         layer = self._layer_id(layer)
         self._record_add(layer, keep)
         if self._held_layer != layer and self._unwritten():
-            raise self._refusal(f"an add on layer {layer} while layer {self._held_layer}'s add waits for its read, on "
-                                "a kernel that takes k and v at the read")
+            raise self._refusal(f"an add on layer {layer} while layer {self._held_layer}'s scratch add waits for its "
+                                "read, on a kernel that takes k and v at the read")
         self._write_unread()
         k, v = fields["k"], fields["v"]
+        kept = layer in self._kept
         attn = self._attn.get(layer)
         if self._eager and attn is not None and self._needs_step_kv(attn):
             raise self._refusal(
@@ -1216,35 +1324,43 @@ class PagedArrayHandle(ArrayHandle):
                 "needs the step's own k and v (an exchange, a context-parallel pool on a multi-token step, or the "
                 "dense backend)")
         if attn is None or self._eager:
-            self._write(layer, k, v)
+            self._write(layer, k, v, kept)
             return
         # held for the read, which passes them on as a layer calls attention (`requires_kv_write`): a kernel may
         # attend the step's own k and v rather than the pages (`reads_step_kv`), and an exchange writes them
-        self._held, self._held_layer = (k, v), layer
+        self._held, self._held_layer, self._held_kept = (k, v), layer, kept
         if not _exchanges(attn, self.label):
-            self._write(layer, k, v)
+            self._write(layer, k, v, kept)
 
-    def _write(self, layer: int, k: torch.Tensor, v: torch.Tensor) -> None:
-        """``layer``'s write alone, where its kernel reads the pages: through the exchange where the attention
+    @staticmethod
+    def _reaches_pages(attn: PagedRead, kept: bool) -> bool:
+        """Whether an add read through ``attn`` is written to the pages: a kept add always is, since later steps read
+        it there whatever kernel this step runs, and a scratch add where ``attn``'s kernel reads the pages."""
+        return kept or attn.requires_kv_write
+
+    def _write(self, layer: int, k: torch.Tensor, v: torch.Tensor, kept: bool) -> None:
+        """``layer``'s write alone, where the add reaches the pages: through the exchange where the attention
         exchanges, as `AttentionCallable.write` makes it."""
         attn = self._attn.get(layer)
         if attn is not None and _exchanges(attn, self.label):
-            attn.exchange(partial(self._attend, layer), None, k, v, label=self.label)
-        elif attn is None or attn.requires_kv_write:
+            attn.exchange(partial(self._attend, layer, kept), None, k, v, label=self.label)
+        elif attn is None or self._reaches_pages(attn, kept):
             self._kv.write_kv(k, v, layer_idx=self._pool_layer[layer], label=self.label)
 
     def _write_unread(self) -> None:
         """Write the held add of a layer the step didn't read where its write waits for the read's exchange, so
-        each add is written once: when the next add or the step's check finds it still held. A kernel that takes k
-        and v at the read has no write to make, so its add stays held."""
-        layer = self._held_layer
-        if layer is not None and _exchanges(self._attn[layer], self.label) and self._attn[layer].requires_kv_write:
-            self._write(layer, *self._take_hold(layer))
+        each add is written once: when the next add or the step's check finds it still held. A scratch add on a
+        kernel that takes k and v at the read has no write to make, so it stays held."""
+        layer, kept = self._held_layer, self._held_kept
+        if layer is not None and _exchanges(self._attn[layer], self.label) and self._reaches_pages(
+            self._attn[layer], kept,
+        ):
+            self._write(layer, *self._take_hold(layer), kept)
 
     def _unwritten(self) -> bool:
-        """Whether no page holds the held add: its kernel takes k and v at the read."""
+        """Whether no page holds the held add: a scratch add whose kernel takes k and v at the read."""
         attn = self._attn.get(self._held_layer)
-        return attn is not None and not attn.requires_kv_write
+        return attn is not None and not self._reaches_pages(attn, self._held_kept)
 
     def _needs_step_kv(self, attn: Any) -> bool:
         """Whether a read through ``attn`` attends the step's own k and v rather than only the pages, or goes through
@@ -1272,7 +1388,9 @@ class PagedArrayHandle(ArrayHandle):
         attn = self._attn[layer]
         if _exchanges(attn, self.label):
             # the add's write and the attention as one call, on the tokens and heads this rank stores
-            return attn.exchange(partial(self._attend, layer), q, *self._take_hold(layer), label=self.label)
+            return attn.exchange(
+                partial(self._attend, layer, self._held_kept), q, *self._take_hold(layer), label=self.label,
+            )
         # a read with no add before it attends the pages alone, which a kernel that takes no writes can't
         k, v = self._take_hold(layer) if self._held is not None or not attn.requires_kv_write else (None, None)
         return attn.run(
@@ -1280,13 +1398,14 @@ class PagedArrayHandle(ArrayHandle):
         )
 
     def _attend(
-        self, layer: int, q: torch.Tensor | None, k: torch.Tensor, v: torch.Tensor, tokens: torch.Tensor | None = None,
+        self, layer: int, kept: bool, q: torch.Tensor | None, k: torch.Tensor, v: torch.Tensor,
+        tokens: torch.Tensor | None = None,
     ) -> torch.Tensor | None:
-        """An exchange's ``run``: this layer's write where the kernel reads the pages, then its attention (``q``
+        """An exchange's ``run``: this layer's write where the add reaches the pages, then its attention (``q``
         None: the write alone), as `AttentionCallable` makes the call. ``tokens``: which of the step's tokens k and v
         are, named by the ring's exchange alone (`sequence_shard.ring`)."""
         attn, i = self._attn[layer], self._pool_layer[layer]
-        if attn.requires_kv_write:
+        if self._reaches_pages(attn, kept):
             self._kv.write_kv(k, v, layer_idx=i, label=self.label, tokens=tokens)
         if q is None:
             return None
@@ -2025,7 +2144,7 @@ class PagedStorage(Storage):
     plans them as one combined plan."""
 
     handle_class = PagedArrayHandle
-    kernel_settings = frozenset({"max_num_pages"})
+    kernel_settings = frozenset({"max_num_pages", "page_size"})
     holds_row_entries = True
 
     def resolve(self, arrays: Sequence[Array], declared: Sequence[Array], setup: "StateSetup") -> Resolved:
@@ -2033,16 +2152,20 @@ class PagedStorage(Storage):
         for array in arrays:
             bound = resolved.bound[array.name] = _bindings(self, array, setup.by_read)
             reads = [each for each in bound if each.key in array.reads]
+            windows = [each.key for each in reads if each.binding.keeps_window]
+            if len(windows) > 1:
+                raise _no_layout(array, f"reads {windows} each keep a window, and the pool keeps one a label")
             others = [each for each in bound if each.key not in array.reads]
-            specs, resource_of = self._read_specs(array, reads)
-            resolved.specs[array.name] = [self._pool(array, setup.walks), *specs, *_op_specs(array, others)]
+            specs, resource_of = self._read_specs(array, reads, setup.walks)
+            pool = self._pool(array, setup.walks, bool(windows))
+            resolved.specs[array.name] = [pool, *specs, *_op_specs(array, others)]
             resolved.resource_of.update(resource_of | _resources_of(array, others))
         return resolved
 
     def takes_leader(self, array: Array) -> bool:
         return len(array.nodes) > 1
 
-    def _pool(self, array: Array, walks: "Walks") -> KVSpec:
+    def _pool(self, array: Array, walks: "Walks", kept_window: bool) -> KVSpec:
         heads, head_dim = _kv_shape(array)
         if not array.reads:
             raise _no_layout(array, "reads is empty, and PagedKVConfig needs num_qo_heads from an Attend read")
@@ -2056,33 +2179,42 @@ class PagedStorage(Storage):
             raise _no_layout(array, f"reads have q_heads {sorted(q_heads)}, and PagedKVConfig has one num_qo_heads")
         return KVSpec(
             resource_key=array.name, nodes=array.nodes,
-            leader=_leader(array, walks) if self.takes_leader(array) else None,
+            leader=_leader(array, walks) if self.takes_leader(array) else None, kept_window=kept_window,
             config=PagedKVConfig(
                 num_layers=len(array.layers), num_qo_heads=q_heads.pop() if q_heads else None,
                 num_kv_heads=heads, head_dim=head_dim, max_seq_len=array.max_len,
             ),
         )
 
-    def _read_specs(self, array: Array, bound: Sequence[BoundOp]) -> tuple[list[NodeResourceSpec], dict[str, str]]:
+    def _read_specs(
+        self, array: Array, bound: Sequence[BoundOp], walks: "Walks",
+    ) -> tuple[list[NodeResourceSpec], dict[str, str]]:
         """The specs ``array``'s reads build, and the resource key each read runs on.
 
-        Raises ``ValueError`` on two specs over one layer, since a layer reads through one resource on every walk.
+        Raises ``ValueError`` on two specs over one layer, since a layer reads through one resource on every walk. A
+        read's first spec is the one it groups by, and any other is a spec of its own (`OpBinding.leg`), under its key,
+        on the nodes that run one of the read's walks.
         """
         specs: dict[str, NodeResourceSpec] = {}
+        legs: list[NodeResourceSpec] = []
         resource_of: dict[str, str] = {}
         for key, read, binding in bound:
             built = binding.specs(array, key, read)
             if not built:
                 resource_of[key] = binding.resource(array, key)
                 continue
-            (spec,) = built
+            spec, *own = built
             resource_of[key] = next((
                 first for first, shared in specs.items() if shared.config == spec.config and not any(
                     array.reads[member].mask != read.mask and _share_a_walk(array.reads[member], read)
                     for member, resource in resource_of.items() if resource == first
                 )
             ), key)
+            if own and resource_of[key] == key:
+                raise _no_layout(array, f"reads[{key!r}] builds a second spec under its own key, and its paged spec, "
+                                        "which no earlier read shares, would take that key too")
             specs.setdefault(resource_of[key], spec)
+            legs += [replace(leg, nodes=_running(array, read, walks)) for leg in own]
         reader: dict[int, str] = {}
         for key, read in array.reads.items():
             for layer in sorted(read_layers(array, read)):
@@ -2090,7 +2222,7 @@ class PagedStorage(Storage):
                 if resource_of[other] != resource_of[key]:
                     raise _no_layout(array, f"reads[{other!r}] and reads[{key!r}] build different specs and both cover "
                                             f"layer {layer}, which reads through one resource on every walk")
-        return list(specs.values()), resource_of
+        return [*specs.values(), *legs], resource_of
 
     def steps(
         self, handle: ArrayHandle, declared: ArrayStep, step: SubmoduleStep, segments, steps: dict[str, Any],
@@ -2108,7 +2240,8 @@ class PagedStorage(Storage):
         self, array: Array, by_label: Mapping[str, Layout], keyed_spans: Mapping[str, int],
     ) -> "dict[str, LabelLayout]":
         """Each read's default binding gives the retention its pages keep, since a request has no setup. The
-        bindings' checks ran when the specs were built, so none runs again on a request."""
+        bindings' checks ran when the specs were built. Under a window that releases, a request's layout is checked
+        to keep the array's other reads inside the window's sink."""
         from mstar.model.base import LabelLayout
 
         kept = [
@@ -2124,12 +2257,37 @@ class PagedStorage(Storage):
                 if unread:
                     raise RuntimeError(f"state_layout[{array.name!r}][{label!r}].kept_windows: {unread} name no "
                                        "kept-window read of the array")
+                for key, policy in policies.items():
+                    if len(array.reads) > 1 and policy.can_release(array.max_len):
+                        _check_sink(array, label, key, policy, layout)
                 retention = next(iter(policies.values()), None)
             layouts[label] = LabelLayout(
                 spans=layout.spans, growth=layout.growth, scratch=layout.scratch, keyed_spans=keyed_spans.get(label),
                 retention=retention,
             )
         return layouts
+
+
+def _check_sink(array: Array, label: str, key: str, policy: RetentionPolicy, layout: Layout) -> None:
+    """Raise ``RuntimeError`` where ``layout`` lets a read beside the kept window ``key`` reach past its sink."""
+    where = f"state_layout[{array.name!r}][{label!r}]"
+    if layout.growth:
+        raise RuntimeError(f"{where}.growth: a loop's entries name no walk, and reads[{key!r}]'s kept window releases "
+                           "entries the array's other reads could then reach")
+    end = 0
+    for span in layout.spans:
+        end += span.length
+        if end > policy.protected_prefix and not runs_on_walk(array.reads[key], span.walk):
+            raise RuntimeError(f"{where}: a span of walk {span.walk!r} ends at entry {end}, past the "
+                               f"{policy.protected_prefix} entries reads[{key!r}]'s kept window never releases, so the "
+                               "reads on that walk would reach released entries")
+
+
+def _running(array: Array, read: Read, walks: "Walks") -> frozenset[str]:
+    """The nodes of ``array`` that run one of ``read``'s walks, or all of them where ``walks`` names none."""
+    if not walks.nodes:
+        return array.nodes
+    return array.nodes & frozenset().union(*(nodes for walk, nodes in walks.nodes.items() if runs_on_walk(read, walk)))
 
 
 def _leader(array: Array, walks: "Walks") -> str | None:
@@ -2398,8 +2556,9 @@ def storage_of(array: Array) -> Storage:
 
 
 # `Attend` is an `AttentionSpec` on a paged array, a `CrossAttentionSpec` on one read with another array's queries and a
-# `RaggedAttentionSpec` within a step, so a binding is per storage and op type. A field of a read's mask can still swap
-# the binding, through `OpBinding.for_mask`, as a kept window does, and the `SDPA` table below is the deployment's swap.
+# `RaggedAttentionSpec` within a step, so a binding is per storage and op type. A read's mask can still swap the
+# binding, through `OpBinding.for_mask`, by its type (`BlockCausal`) or a field (a kept window). The `SDPA` table below
+# is the deployment's swap, and `EAGER_DENSE` the model's, through its kernel settings.
 BINDINGS: dict[tuple[Storage, type[Op | Positions | None]], OpBinding] = {
     (PAGED, Attend): PagedAttend(),
     (PAGED, type(None)): PagedNoOp(),
@@ -2416,6 +2575,11 @@ BINDINGS: dict[tuple[Storage, type[Op | Positions | None]], OpBinding] = {
 }
 # What `backend: sdpa` binds in place of the default, for each storage and op type SDPA can run.
 SDPA: dict[tuple[Storage, type[Op]], OpBinding] = {(WITHIN_STEP, Attend): SdpaAttend()}
+# What `eager_backend: dense` binds in place of each default, by the default's type: the paged kernel on leased steps,
+# the dense one on the rest.
+EAGER_DENSE: dict[type[OpBinding], OpBinding] = {
+    PagedAttend: EagerDenseAttend(), KeptWindowAttend: KeptWindowEagerDense(),
+}
 
 
 class Walks(NamedTuple):
@@ -2427,8 +2591,8 @@ class Walks(NamedTuple):
 
 @dataclass(frozen=True)
 class StateSetup:
-    """What a deployment sets up for the declared state: the binding it picks for each read whose resource doesn't take
-    the default, the store of the Values' host fields, and the walks its nodes run."""
+    """What a deployment sets up for the declared state: the binding it or the model's kernel settings pick for each
+    read that doesn't take the default, the store of the Values' host fields, and the walks its nodes run."""
 
     by_read: Mapping[str, OpBinding] = EMPTY
     host_fields: HostFields = dataclasses.field(default_factory=HostFields)

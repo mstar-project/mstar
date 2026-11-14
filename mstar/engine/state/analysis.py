@@ -4,6 +4,7 @@ import hashlib
 import json
 from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import fields, is_dataclass
+from enum import Enum
 from itertools import product
 from typing import TYPE_CHECKING, get_origin
 
@@ -51,6 +52,7 @@ def state_declaration_problems(model: "Model") -> list[str]:
         problems += _combined_walk_problems(array, combined_walks(array, combined_by_node))
         problems += _array_problems(array)
     problems += _kv_label_problems(model.kv_labels(), arrays)
+    problems += _kept_window_label_problems(model.kv_labels(), arrays)
     problems += _cross_read_problems(arrays)
     problems += _regrouping_problems(model, arrays, graphs)
     problems += _value_problems(arrays, model.kv_labels())
@@ -155,6 +157,21 @@ def _kv_label_problems(kv_labels: Mapping[str, Mapping[str, object]], arrays: Se
             f"kv_labels()[{key!r}][{label!r}]: it is not in Array {key!r}.labels, {sorted(by_name[key].labels)}"
             for label in sorted(labels.keys() - by_name[key].labels)
         ]
+    return problems
+
+
+def _kept_window_label_problems(kv_labels: Mapping[str, Mapping[str, object]], arrays: Sequence[Array]) -> list[str]:
+    """A kept window is sized by each request's layout, and the conductor refuses a request that opens a label with
+    no layout only on the pools ``kv_labels`` names."""
+    problems: list[str] = []
+    for array in arrays:
+        kept = [key for key, read in array.reads.items() if isinstance(read.mask, Bidirectional)
+                and read.mask.kept_window]
+        missing = sorted(array.labels - kv_labels.get(array.name, EMPTY).keys())
+        if kept and missing:
+            problems.append(f"Array {array.name!r}.reads[{kept[0]!r}] keeps a window, and labels {missing} aren't in "
+                            f"kv_labels()[{array.name!r}], so a request could open them with no layout and reads"
+                            f"[{kept[0]!r}] would reach every entry; add them to kv_labels()[{array.name!r}]")
     return problems
 
 
@@ -271,11 +288,9 @@ def _shard_problems(
     shard: SeqShard, arrays: Sequence[Array], walks: Mapping[str, set[str]], combined: set[str],
 ) -> list[str]:
     """``walks`` are rows' walks, as a read's are, and ``labels`` those an array on the shard's nodes opens: a label
-    nothing opens would never split, and nothing would say so. The shard's handle brackets one label."""
+    nothing opens would never split, and nothing would say so."""
     where = f"SeqShard {shard.name!r}"
     problems: list[str] = []
-    if len(shard.labels) > 1:
-        problems.append(f"{where}.labels: {sorted(shard.labels)} are several, and the handle brackets one")
     for walk in sorted(shard.walks or ()):
         if walk in combined:
             problems.append(f"{where}.walks: {walk!r} is a combined walk; list the walks it combines, and it splits "
@@ -367,8 +382,8 @@ def _combined_walk_problems(array: Array, combined: Mapping[str, Collection[str]
 
 
 def deployment_problems(model: "Model", resources: Mapping[str, Mapping[str, object]]) -> list[str]:
-    """What a deployment's ``resources:`` block asks of the declarations that they can't do: of a sampler, and of an
-    array whose step writes its state itself."""
+    """What a deployment's ``resources:`` block asks of the declarations that they can't do: of a sampler, of an
+    array whose step writes its state itself, and of an array a kept window reads."""
     declarations = model.declare_state()
     problems = [
         f"Sampler {declared.name!r}.draws: enable_logprobs, and draws is {declared.draws}; log-probs take one token "
@@ -384,6 +399,12 @@ def deployment_problems(model: "Model", resources: Mapping[str, Mapping[str, obj
         if "state_dtype" in resources.get(array.name, {}) and "state" in written_by_step(array):
             problems.append(f"Array {array.name!r}: resources.{array.name}.state_dtype, and its step writes state "
                             "itself, where only a field an update op writes takes a stored dtype")
+        longer = resources.get(array.name, {}).get("max_seq_len")
+        if longer is not None and longer > array.max_len and any(
+            isinstance(read.mask, Bidirectional) and read.mask.kept_window for read in array.reads.values()
+        ):
+            problems.append(f"Array {array.name!r}: resources.{array.name}.max_seq_len is {longer}, past its max_len "
+                            f"of {array.max_len}, which its kept window's requests are checked against; raise max_len")
     return problems
 
 
@@ -394,15 +415,22 @@ def split_read_problems(
     """What a read within a step asks of a node on SP ranks that no exchange serves, where ``split`` gives, per such
     node, the labels its sequence shard lists: SDPA (``sdpa_reads``, the reads a ``backend: sdpa`` block binds) over
     split keys, which runs outside the engine's resources and so would attend one rank's share, and a cross read whose
-    queries split as well as its keys. The engine refuses these at load and ``validate_deployment`` reports them, both
-    from the declarations, so neither waits for a step that splits."""
+    queries split as well as its keys, and a kept array's read with no op, which gathers its reach from this rank's
+    pages. The engine refuses these at load and ``validate_deployment`` reports them, both from the declarations, so
+    none waits for a step that splits."""
     arrays = {declared.name: declared for declared in declarations if isinstance(declared, Array)}
     problems = []
     for array in arrays.values():
-        if array.max_len:
-            continue
         nodes = [node for node in sorted(array.nodes) if array.labels & set(split.get(node, ()))]
         if not nodes:
+            continue
+        if array.max_len:
+            problems += [
+                f"Array {array.name!r}.reads[{key!r}]: a read with no op gathers its reach from this rank's pages, "
+                f"which hold one rank's share of labels {sorted(array.labels)} where the sequence shard of {nodes} "
+                "splits them over SP ranks; run the node on one SP rank"
+                for key, read in array.reads.items() if read.op is None
+            ]
             continue
         for key, read in array.reads.items():
             queries = query_array(array, read, arrays)
@@ -427,7 +455,7 @@ def declaration_digests(
     ``kernel_settings()``, since a pool size can follow the deployment too. A SHA-256 matches across processes, as
     Python's `hash` doesn't, since it randomizes strings per process.
 
-    Every field goes in, with keys sorted and dtypes and classes by name.
+    Every field goes in, with keys sorted and dtypes, enums and classes by name.
     """
     digests = {declared.name: _sha256(declared) for declared in declarations}
     if kernel_settings:
@@ -460,7 +488,7 @@ def _canonical(value):
         return sorted(value)
     if isinstance(value, list | tuple):
         return [_canonical(item) for item in value]
-    if isinstance(value, torch.dtype) or get_origin(value) is tuple:
+    if isinstance(value, torch.dtype | Enum) or get_origin(value) is tuple:
         return str(value)
     if isinstance(value, type):
         return value.__name__

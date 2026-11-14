@@ -22,6 +22,7 @@ from mstar.distributed.communication import CommGroup, JointGroups, WorkerParall
 from mstar.engine.engine import Engine
 from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec, AttentionStep, AttnBackend
 from mstar.engine.resources.attn.kept_window import KeptWindowAttention
+from mstar.engine.resources.attn.ragged.config import KeptWindowAttentionSpec
 from mstar.engine.resources.base import EngineResourceInfo
 from mstar.engine.resources.kv.config import (
     KVReqConfig,
@@ -146,7 +147,7 @@ def test_a_rebuild_refuses_a_kept_window_on_its_decode_walks():
     """A rebuild recomputes the decode steps in prefill rows, where a kept window cuts other entries than each step
     saw. Only the kept window takes the loop's walks."""
     kept = _array(reads={"attn": _read(Bidirectional(kept_window=True), walks={"decode"})})
-    assert state_declaration_problems(_Model(kept, rebuilt=True)) == [
+    assert state_declaration_problems(_Model(kept, rebuilt=True, kv_labels={"kv": {"main": KVLabel()}})) == [
         "Array 'kv'.reads['attn']: Bidirectional on walk 'decode', which dit's rebuild policy replaces with its "
         "prefill rows. A kept window cuts other entries from a prefill row than from the steps it replaces, so drop "
         "the rebuild policy"
@@ -384,13 +385,13 @@ def _text_pool(**config) -> KVSpec:
 def test_the_engine_refuses_a_ring_on_sp_ranks():
     """A ring declares nothing about sequence parallelism and refuses nothing about it. Alone on SP ranks, its node
     is refused as any node that neither splits its steps nor places a pool. Beside a pool whose attention takes
-    split steps, a shard splits the node's steps, and the engine's build refuses the ring by name."""
+    split steps, a shard splits the node's steps, and the ring's spec refuses them by name."""
     with pytest.raises(ValueError, match="node 'dit' runs on 2 SP ranks but neither splits tokens"):
         _load_on_sp_ranks([build_specs([_ring_array()])[0]])
     attention = AttentionSpec(resource_key="text_attn", nodes={"dit"},
                               config=AttentionConfig("text_kv", backend=AttnBackend.FLASHINFER))
-    with pytest.raises(ValueError, match=r"resource 'kv' \(RingKVManager\) does not support steps split over SP "
-                                         r"ranks, and node 'dit' splits them"):
+    with pytest.raises(ValueError, match=r"KV 'kv' is a ring, which takes no split steps, so node 'dit' can't split "
+                                         r"them"):
         _load_on_sp_ranks([
             build_specs([_ring_array()])[0], _text_pool(), attention, SeqShardSpec("shard", {"dit"}, ("main",), 0),
         ])
@@ -718,34 +719,38 @@ def _kept_array(**fields) -> Array:
     return _array("dit_kv", reads={"self_attn": _read(Bidirectional(kept_window=True))}, max_len=4096, **fields)
 
 
-@pytest.mark.parametrize("arrays", [
-    [_array("dit_kv", reads={"self_attn": _read(Bidirectional(kept_window=True), layers={0}),
-                             "attn": _read(Causal(), layers={1})}, max_len=4096)],
-    [_array("dit_kv", reads={"self_attn": _read(Bidirectional(kept_window=True), layers={0}),
-                             "other": _read(Bidirectional(kept_window=True), layers={1})}, max_len=4096)],
-    [_array("dit_kv", reads={"self_attn": _read(Bidirectional(kept_window=True), layers={0}),
-                             "reach": Read(mask=Bidirectional(kept_window=True), layers={1})}, max_len=4096)],
-], ids=["beside_causal", "beside_kept_window", "beside_a_read_with_no_op"])
-def test_a_kept_window_read_is_its_array_s_only_read(arrays):
-    """The pool releases what one read's window no longer reaches, which any other read of the array may reach."""
-    with pytest.raises(ValueError, match=r"Array 'dit_kv': no layout yet: reads\['\w+'\] keeps a window beside"):
-        build_specs(arrays)
+@pytest.mark.parametrize(("reads", "message"), [
+    ({"self_attn": _read(Bidirectional(kept_window=True), layers={0}), "attn": _read(Causal(), layers={1})},
+     r"reads\['self_attn'\] keeps a window beside reads \['attn'\], which share one of its walks or name none"),
+    ({"self_attn": _read(Bidirectional(kept_window=True), layers={0}, walks={"rollout"}),
+      "attn": _read(Causal(), layers={1}, walks={"rollout", "prefill"})},
+     r"reads\['self_attn'\] keeps a window beside reads \['attn'\]"),
+    ({"self_attn": _read(Bidirectional(kept_window=True), layers={0}, walks={"rollout"}),
+      "other": _read(Bidirectional(kept_window=True), layers={1}, walks={"prefill"})},
+     r"reads \['self_attn', 'other'\] each keep a window, and the pool keeps one a label"),
+    ({"self_attn": _read(Bidirectional(kept_window=True), layers={0}),
+      "reach": Read(mask=Bidirectional(kept_window=True), layers={1})},
+     r"reads\['self_attn'\] keeps a window beside reads \['reach'\]"),
+], ids=["beside_a_read_on_every_walk", "beside_a_read_on_its_walk", "beside_kept_window", "beside_a_read_with_no_op"])
+def test_a_kept_window_read_shares_no_walk_with_a_neighbour(reads, message):
+    """The pool releases what one read's window no longer reaches, which a read on one of its walks may reach, and it
+    keeps one window a label."""
+    with pytest.raises(ValueError, match=f"Array 'dit_kv': no layout yet: {message}"):
+        build_specs([_array("dit_kv", reads=reads, max_len=4096)])
 
 
-@pytest.mark.parametrize(("arrays", "message"), [
-    ([_array("dit_kv", reads={"self_attn": _read(Bidirectional(kept_window=True), walks={"rollout"}),
-                              "attn": _read(Causal(), walks={"prefill"})}, max_len=4096)],
-     "keeps a window beside reads"),
-    ([_array("dit_kv", reads={"self_attn": _read(Bidirectional(kept_window=True), walks={"rollout"})}, max_len=4096)],
-     r"reads\['self_attn'\].walks must be None"),
-    ([_array("q", reads={"own": _read(Causal())}),
-      _array("dit_kv", reads={"self_attn": _read(Bidirectional(kept_window=True), queries="q")}, max_len=4096)],
-     r"reads\['self_attn'\].queries must be None"),
-], ids=["walks_beside", "walks", "queries"])
-def test_a_kept_window_read_takes_no_queries_or_walks(arrays, message):
-    """A read with walks lands on the by-walk storage and one with queries on the cross storage, and the kept window
-    swaps the binding on each."""
-    with pytest.raises(ValueError, match=f"Array 'dit_kv': no layout yet: .*{message}"):
+def test_a_kept_window_read_may_name_its_walks():
+    _, attn = build_specs([_array("dit_kv", reads={
+        "self_attn": _read(Bidirectional(kept_window=True), walks={"rollout"}),
+    }, max_len=4096)])
+    assert isinstance(attn, KeptWindowAttentionSpec), "a read on its own walks would lose its window"
+
+
+def test_a_kept_window_read_takes_no_queries():
+    """A read with queries lands on the cross storage, and the kept window swaps the binding there too."""
+    arrays = [_array("q", reads={"own": _read(Causal())}),
+              _array("dit_kv", reads={"self_attn": _read(Bidirectional(kept_window=True), queries="q")}, max_len=4096)]
+    with pytest.raises(ValueError, match=r"Array 'dit_kv': no layout yet: .*reads\['self_attn'\].queries must be None"):
         build_specs(arrays)
 
 
@@ -998,21 +1003,6 @@ def test_a_reach_is_refused_under_capture():
     handle, pool = _reach_handle()
     step = _reach_step(handle, pool, 12, capture=True)
     with pytest.raises(ValueError, match="Array 'dit_kv': no layout yet: a read with no op in a captured step"):
-        step.begin_calls()
-
-
-@pytest.mark.parametrize("op", [None, Attend(q_heads=1)], ids=["no_op", "attend"])
-@pytest.mark.parametrize("state_layout", [{}, {"dit_kv": {}}], ids=["no_array", "no_label"])
-def test_a_kept_window_read_refuses_a_row_whose_request_sized_no_window(op, state_layout):
-    """A request that gives no `Layout` for a label keeps every entry of it, and the read would reach them all with
-    no error: 72 entries by the sixth chunk of 12, where a sink of 18 and a window of 24 reach 54. The step that
-    lists the row refuses before its forward, for a read with an op and for one without."""
-    handle, pool = _reach_handle(op=op, state_layout=state_layout)
-    step = _reach_step(handle, pool, 12)
-    with pytest.raises(ValueError, match=r"Array 'dit_kv': request a keeps no window on label 'main', so "
-                                         r"reads\['self_attn'\] would reach every entry; "
-                                         r"state_layout\['dit_kv'\]\['main'\] must be a Layout that gives "
-                                         r"kept_windows\['self_attn'\]"):
         step.begin_calls()
 
 

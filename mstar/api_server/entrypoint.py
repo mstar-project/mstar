@@ -12,6 +12,7 @@ import multiprocessing as mp
 import os
 import re
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -20,6 +21,7 @@ from collections.abc import Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from functools import cached_property
 from pathlib import Path
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, NamedTuple, Optional, Protocol
 
 import msgpack
@@ -80,7 +82,7 @@ from mstar.utils.client_errors import client_error_text, scrub_paths
 from mstar.utils.exitcode import describe_exitcode
 from mstar.utils.gc_freeze import freeze_after_setup
 from mstar.utils.generation_kwargs import normalize_generation_kwargs
-from mstar.utils.logging_config import log_off_thread, quiet_noisy_loggers
+from mstar.utils.logging_config import REQUEST_LOGGER, configure_request_log, log_off_thread, quiet_noisy_loggers
 from mstar.utils.orphan import watch_parent
 from mstar.utils.socket_prefix import per_port_socket_prefix
 from mstar.utils.threads import Thread, pin_thread
@@ -90,6 +92,32 @@ if TYPE_CHECKING:
     import numpy as np
 
 logger = logging.getLogger(__name__)
+request_log = logging.getLogger(REQUEST_LOGGER)
+
+# The sets of ignored keys already reported, as digests: a client that sends a
+# key every request (a benchmark's ``temperature`` to a greedy model) is
+# reported once, not once per request. A digest rather than the names, and a
+# fixed number of them, so what a client sends never stays in memory; a
+# collision only skips one warning. Least recently seen go first.
+_REPORTED_IGNORED: collections.OrderedDict[int, None] = collections.OrderedDict()
+_REPORTED_IGNORED_MAX = 256
+_REPORTED_IGNORED_LOCK = threading.Lock()
+# what the warning names of a set: a client's keys can be as large as its body
+_REPORTED_NAMES_MAX = 20
+_REPORTED_NAME_CHARS = 64
+
+
+def _first_report(keys: tuple[str, ...]) -> bool:
+    """Whether ``keys`` is not among the recently reported sets; remembers it."""
+    digest = hash(keys)
+    with _REPORTED_IGNORED_LOCK:
+        if digest in _REPORTED_IGNORED:
+            _REPORTED_IGNORED.move_to_end(digest)
+            return False
+        _REPORTED_IGNORED[digest] = None
+        if len(_REPORTED_IGNORED) > _REPORTED_IGNORED_MAX:
+            _REPORTED_IGNORED.popitem(last=False)
+        return True
 
 STREAMING_ONLY_MODALITIES = frozenset({"video_frame"})
 
@@ -175,6 +203,7 @@ def _conductor_process_target(
         force=True,
     )
     quiet_noisy_loggers()
+    configure_request_log()
     log_off_thread()
     # A server started as a background job of a non-interactive shell inherits
     # SIGINT ignored, and Python keeps an inherited ignore, so the graceful stop
@@ -511,6 +540,9 @@ class APIServer:
     _process_cpus: frozenset[int] = frozenset()
     # set in __init__; None until then, which a server built without it (a test's) keeps
     lora_admin: LoraAdmin | None = None
+    # each node's data-parallel replicas, which the serve entrypoint counts at start; a server without them refuses no
+    # session (`Model.session_node`)
+    node_replicas: Mapping[str, int] = MappingProxyType({})
 
     def __init__(
         self,
@@ -790,14 +822,17 @@ class APIServer:
     # ----------------------------------------------------------
 
     def _report_ignored_params(self, model_kwargs: dict) -> None:
-        """Log the keys the model does not read; the request is served regardless."""
+        """Log the keys the model does not read, once per set of keys; the
+        request is served regardless."""
         model = getattr(self, "model", None)
         declared = model.request_kwargs() if model is not None else None
         if declared is None:
             return
         ignored = sorted(set(model_kwargs) - declared - set(model.ENGINE_KWARGS) - set(model.LENGTH_KWARGS))
-        if ignored:
-            logger.warning("Ignoring model_kwargs this model does not read: %s", ignored)
+        if ignored and _first_report(tuple(ignored)):
+            names = [name[:_REPORTED_NAME_CHARS] for name in ignored[:_REPORTED_NAMES_MAX]]
+            more = f" and {len(ignored) - len(names)} more" if len(ignored) > len(names) else ""
+            logger.warning("Ignoring model_kwargs this model does not read: %s%s", names, more)
 
     def submit_request(
         self,
@@ -876,6 +911,13 @@ class APIServer:
         model_kwargs = normalize_generation_kwargs(model_kwargs)
         model_kwargs, prefix_root = self.lora_kwargs(model, model_kwargs)
         self._report_ignored_params(model_kwargs)
+        session = self.model.session_node(model_kwargs) if self.node_replicas else None
+        if session is not None and self.node_replicas.get(session, 1) > 1:
+            raise HTTPException(status_code=400, detail=(
+                f"this request names a session, and node {session!r}, which keeps sessions in its own process, runs on "
+                f"{self.node_replicas[session]} replicas here; no request is routed to a replica by its session, so "
+                "serve that node on one replica"
+            ))
 
         if file_streams:
             try:
@@ -933,7 +975,7 @@ class APIServer:
             raw_inputs=raw_inputs,
         ))
 
-        logger.info(
+        request_log.debug(
             "Request %s submitted as %s  in=%s  out=%s",
             request_id, key, input_modalities, output_modalities,
         )
@@ -1298,7 +1340,7 @@ class APIServer:
                                 # release it once the client lets go.
                                 self.recently_completed[rid] = time.time()
                             elif message.message_type == "request_complete":
-                                logger.info("API server received %s done", rid)
+                                request_log.debug("API server received %s done", rid)
                                 self.recently_completed[rid] = time.time()
 
                                 if not message.body.output_chunk_counts:
@@ -1634,7 +1676,7 @@ class APIServer:
                     yield new_chunks
 
                 if done:
-                    logger.info("Async stream results received finish for %s", request_id)
+                    request_log.debug("Async stream results received finish for %s", request_id)
                     # flush remaining
                     remaining: list[ResultChunk] = []
                     finished_req: PendingRequest | None = None
@@ -2096,6 +2138,16 @@ def _data_parallel_replicas(model, config_path: str) -> DataParallelReplicas:
     except Exception as exc:  # noqa: BLE001
         logger.warning("warmup: could not count data-parallel replicas (%s); sending one copy", exc)
         return DataParallelReplicas(1, 1)
+
+
+def _node_replicas(model, config_path: str) -> dict[str, int]:
+    """Each node's data-parallel replicas, the most any worker graph that runs it has. A deployment it can't count
+    fails here, unlike `_data_parallel_replicas`, since a count of one would turn the session refusal off."""
+    replicas: dict[str, int] = {}
+    for wg in model.get_worker_graphs(config_path):
+        for node in wg.section.get_nodes():
+            replicas[node] = max(replicas.get(node, 1), len(wg.replica_ranks))
+    return replicas
 
 
 def _run_warmup_requests(
@@ -3029,6 +3081,13 @@ def deployment_cpu_plan(config: dict) -> cpus.CpuPlan:
     return cpus.CpuPlan(plan.mask, plan.usable, why=f"not pinned: {refused}")
 
 
+def _stop_with(proc, bridge) -> None:
+    """Stops the bridge once ``proc`` (mstar-server) exits, so the deployment
+    does not outlive its HTTP frontend."""
+    proc.wait()
+    bridge.stop()
+
+
 def install_deployment_cpus(config: dict) -> None:
     """Install the deployment's CPU plan for this process, and take the PM QoS
     hold ``knobs: idle_hold: qos`` asks for. Run once, by the process that
@@ -3152,11 +3211,12 @@ def main(argv: list[str] | None = None):
         help="Serve Prometheus metrics at /metrics (needs mstar-ai[metrics])",
     )
     parser.add_argument(
-        "--rust-frontend", action="store_true",
-        help="Serve HTTP from the Rust mstar-server binary instead of "
-             "uvicorn/FastAPI; the Python process keeps preprocessing "
-             "and the conductor protocol",
+        "--python-frontend", action="store_true",
+        help="Serve HTTP from the deprecated uvicorn/FastAPI frontend instead "
+             "of mstar-server, the default",
     )
+    # the default since mstar-server became it; kept so existing commands run
+    parser.add_argument("--rust-frontend", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument(
         "--rust-frontend-bin", type=str, default=None,
         help="Path to the mstar-server binary (default: MSTAR_SERVER_BIN, "
@@ -3164,6 +3224,8 @@ def main(argv: list[str] | None = None):
              "rust/server/target/release)",
     )
     args = parser.parse_args(argv)
+    if args.python_frontend and (args.rust_frontend or args.rust_frontend_bin):
+        parser.error("--python-frontend serves without mstar-server, so it takes no --rust-frontend(-bin)")
     if args.enable_metrics and MISSING_DEPENDENCY is not None:
         parser.error(INSTALL_HINT)
     if args.socket_path_prefix is None:
@@ -3174,6 +3236,7 @@ def main(argv: list[str] | None = None):
         format="%(asctime)s %(levelname)s [api_server] %(name)s: %(message)s",
     )
     quiet_noisy_loggers()
+    configure_request_log()
     log_off_thread()
     api_key = resolve_api_key(args.api_key)
     api_key_guard.set(api_key)
@@ -3187,11 +3250,14 @@ def main(argv: list[str] | None = None):
         _ws_max_size(config)  # here, not at the bind after the workers' compile
     except ValueError as e:
         raise SystemExit(f"mstar: {e}") from None
-    if args.rust_frontend:
+    if not args.python_frontend:
         from mstar.api_server.rust_frontend import find_server_binary
 
         # Before anything loads, so a missing or stale binary fails fast.
-        rust_frontend_bin = find_server_binary(args.rust_frontend_bin)
+        try:
+            rust_frontend_bin = find_server_binary(args.rust_frontend_bin)
+        except (FileNotFoundError, RuntimeError) as e:
+            raise SystemExit(f"mstar: {e}\n(--python-frontend serves from uvicorn instead)") from None
 
     model_name = config.get("model", "dummy")
     # Forward yaml-level model_kwargs to the API-server-side lightweight
@@ -3264,7 +3330,7 @@ def main(argv: list[str] | None = None):
         ready = api_server.finalize_setup()
         # A declaration may follow the placement, which only get_worker_graphs reads. The data worker declares at its
         # first prompt, after this.
-        model.get_worker_graphs(args.config)
+        api_server.node_replicas = _node_replicas(model, args.config)
         mismatch = digest_mismatch(
             declaration_digests(model.declare_state(), model.kernel_settings()), ready.declaration_digests,
             here="API server", there="conductor",
@@ -3283,7 +3349,7 @@ def main(argv: list[str] | None = None):
             _run_warmup_requests(api_server, warmups, replicas, cache_dir=args.cache_dir)
         if args.enable_metrics:
             api_server.enable_metrics()
-        if args.rust_frontend:
+        if not args.python_frontend:
             import tempfile
 
             from mstar.api_server.openai.adapters import get_adapter
@@ -3311,13 +3377,20 @@ def main(argv: list[str] | None = None):
                 ws_max_bytes=_ws_max_size(config),
                 client_streams=api_server.client_streams,
                 realtime=realtime_facts(api_server, get_adapter(model_name), bridge_dir))
-            logger.info("Starting mstar API server (Rust frontend) on port %s",
+            logger.info("Starting mstar API server (mstar-server) on port %s",
                         args.port)
             bridge = RustFrontendBridge(api_server, bridge_dir)
             api_server.set_on_fatal(bridge.stop)
-            bridge.run()
+            Thread(target=_stop_with, args=(rust_proc, bridge), name="mstar-server-watch", daemon=True).start()
+            bridge.run(frontend=rust_proc)
+            if (code := rust_proc.poll()) not in (None, 0):
+                # it exits 0 when a signal stops it, so this is a crash, a kill or a lost port
+                logger.error("mstar-server exited with code %d; stopping the deployment", code)
+                exit_code = 3
         else:
-            # (mstar-server logs the same warning for the Rust frontend.)
+            logger.warning("--python-frontend: the uvicorn/FastAPI frontend is deprecated and will be removed; "
+                           "mstar-server is the default")
+            # (mstar-server logs the same warning for itself.)
             warn_if_no_api_key(api_key, args.host, args.port)
             logger.info("Starting mstar API server on %s:%s", args.host, args.port)
             # uvicorn.run() inlined so the server object is reachable. The
@@ -3339,7 +3412,15 @@ def main(argv: list[str] | None = None):
         exit_code = 1
     finally:
         if rust_proc is not None:
+            # so that once mstar serve has exited, the frontend has too. After a
+            # signal it has drained and exited already; otherwise, with the
+            # bridge stopped, what it has left to drain can't finish.
             rust_proc.terminate()
+            try:
+                rust_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                rust_proc.kill()
+                rust_proc.wait()
         if bridge_dir is not None:
             import shutil
             shutil.rmtree(bridge_dir, ignore_errors=True)
