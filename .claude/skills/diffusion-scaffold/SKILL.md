@@ -58,7 +58,7 @@ The loop ends on its iteration count. A model whose request picks its step count
 
 ## State
 
-The latents and the solver's values ride loop-back edges, which pass a tensor without a copy and carry any shape. The schedule and the seeds are memos of the base, recomputed from their inputs. Anything else per request lives in `self.request_state(fwd_info.rid_handle)`, which the engine frees with the request. It is keyed by the integer handle (the key cleanup receives), not by the `request_id` string; see invariant 14.
+The latents and the solver's values ride loop-back edges, which pass a tensor without a copy and carry any shape. The schedule is a memo of the base, recomputed from its inputs. A prefetched seed draw and anything else per request live in `self.request_state(fwd_info.rid_handle)`, which the engine frees with the request. It is keyed by the integer handle (the key cleanup receives), not by the `request_id` string; see invariant 14.
 
 ## Validating
 

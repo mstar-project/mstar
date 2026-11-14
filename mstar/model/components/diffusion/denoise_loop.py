@@ -31,7 +31,9 @@ Conventions the base fixes:
   worker before each batch — no host sync per step.
 * A schedule and its device-resident ``sigmas`` / ``timesteps`` are a memo of the hook's
   inputs, so requests with the same settings share one on the device, and losing an
-  entry costs a rebuild and changes no output. So are the seeds drawn at ingest.
+  entry costs a rebuild and changes no output. A seed draw is not a memo: it is one
+  request's noise, so it lives in that request's engine-owned state (``request_state``)
+  and goes when the request does, taken or not.
 * Per-step per-request scalars (``STEP_SCALARS``: ``sigma``, ``sigma_next``,
   ``timestep``) are sliced out of the schedule ``schedule_for`` returns and
   travel as ``[1]`` device tensors, so a batch of requests at different steps
@@ -55,10 +57,8 @@ Conventions the base fixes:
 from __future__ import annotations
 
 import functools
-import threading
-from collections import OrderedDict, deque
+from collections import OrderedDict
 from collections.abc import Hashable, Mapping, Sequence
-from concurrent.futures import Future
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, NamedTuple
 
@@ -83,10 +83,12 @@ from mstar.utils.threads import ThreadPool
 if TYPE_CHECKING:
     from mstar.model.components.quant_linear import StepDtypes
 
-# Entries in each memo. A schedule is a few floats per step and a seed entry a latent, and a miss only rebuilds it.
+# Entries in each schedule memo. A schedule is a few floats per step, and a miss only rebuilds it.
 _MEMO_ENTRIES = 256
 # What a request's step count is called in its step metadata. A walk whose schedule fixes it has no such key.
 NUM_STEPS = "num_inference_steps"
+# A request's ingest-time noise draw in its ``PerRequestState``: ``(bucket key, Future)``.
+SEED_DRAW = "seed_draw"
 
 
 class StepScalar(NamedTuple):
@@ -180,10 +182,6 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         self.max_uncaptured_layouts = int(max_uncaptured_layouts)
         # Draws seeds ahead under PREFETCH_SEEDS; built on first use.
         self._seed_pool: ThreadPool | None = None
-        # One draw per request, as ((bucket key, seed), future), oldest first. An entry goes when taken or evicted.
-        # Under a lock, since a request's arrival adds to it on the main thread and iteration 0 takes on the GPU's.
-        self._seed_draws: deque[tuple[tuple[Hashable, int], Future]] = deque(maxlen=_MEMO_ENTRIES)
-        self._seed_lock = threading.Lock()
         # Keyed by `schedule_for`'s inputs: the schedule, and the tensors `prepare_inputs` and the solver read on the
         # device.
         self._schedules = functools.lru_cache(_MEMO_ENTRIES)(self.schedule_for)
@@ -241,7 +239,7 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         starts from given latents instead (a refinement stage, image-to-image) overrides
         this and reads them from ``inputs``, the edges the walk routed to this node."""
         del inputs
-        drawn = self._take_drawn_seeds(bucket_key, fwd_info.random_seed)
+        drawn = self._take_drawn_seeds(fwd_info.rid_handle, bucket_key)
         if drawn is not None:
             return drawn
         return self.seed_loop_back(bucket_key, generator)
@@ -254,8 +252,16 @@ class DenoiseLoopSubmodule(NodeSubmodule):
             # a CPU randn is single-threaded and releases the GIL
             self._seed_pool = ThreadPool(max_workers=2, thread_name_prefix="mstar-seed")
         draw = self._seed_pool.submit(self._draw_seeds, bucket_key, seed)
-        with self._seed_lock:
-            self._seed_draws.append(((bucket_key, seed), draw))
+        self.request_state(request_id).add(SEED_DRAW, (bucket_key, draw))
+
+    def cleanup_request(self, request_id) -> None:
+        # The engine frees the request's state, draw and all. Cancelling first keeps the pool from drawing
+        # for a request that is gone (one cancelled before iteration 0 never took it) ahead of a live one's.
+        state = self.request_states.get(request_id)
+        entry = None if state is None else state.get(SEED_DRAW)
+        if entry is not None:
+            entry[1].cancel()
+        super().cleanup_request(request_id)
 
     def _draw_seeds(self, bucket_key: Hashable, seed: int) -> dict[str, torch.Tensor]:
         """:meth:`seed_loop_back` as iteration 0 would draw it, made contiguous here so
@@ -263,14 +269,19 @@ class DenoiseLoopSubmodule(NodeSubmodule):
         generator = torch.Generator(device="cpu").manual_seed(seed)
         return {name: tensor.contiguous() for name, tensor in self.seed_loop_back(bucket_key, generator).items()}
 
-    def _take_drawn_seeds(self, bucket_key: Hashable, seed: int) -> dict[str, torch.Tensor] | None:
-        """A draw made at ingest for these inputs, once. None when there is none, and iteration 0 then draws inline."""
-        with self._seed_lock:
-            at = next((i for i, (key, _) in enumerate(self._seed_draws) if key == (bucket_key, seed)), None)
-            if at is None:
-                return None
-            draw = self._seed_draws[at][1]
-            del self._seed_draws[at]
+    def _take_drawn_seeds(self, request_id: int, bucket_key: Hashable) -> dict[str, torch.Tensor] | None:
+        """The request's draw from ingest, once. None when there is none, or it was drawn for another bucket key
+        (a later stage's geometry), and iteration 0 then draws inline."""
+        state = self.request_states.get(request_id)
+        entry = None if state is None else state.get(SEED_DRAW)
+        if entry is None:
+            return None
+        state.remove(SEED_DRAW)
+        drawn_key, draw = entry
+        if drawn_key != bucket_key:
+            # a draw still queued would only delay a live request's
+            draw.cancel()
+            return None
         # usually done long before; waiting releases the GIL and syncs no device
         return draw.result()
 
