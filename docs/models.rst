@@ -2310,31 +2310,53 @@ against the dense output on 8 VBench prompts:
      - LPIPS
    * - none
      - 50
-     - 49.8
+     - 50.1
      -
      -
      -
+   * - ``{threshold: 0.06, max_skip_steps: 2, retention_ratio: 0.32}``
+     - 30
+     - 31.1
+     - 35.1
+     - 0.953
+     - 0.033
    * - ``{threshold: 0.04, max_skip_steps: 2}``
      - 30
-     - 31.6
-     - 31.0
-     - 0.938
-     - 0.056
+     - 31.2
+     - 31.1
+     - 0.935
+     - 0.055
+   * - ``{threshold: 0.12, max_skip_steps: 3, retention_ratio: 0.28}``
+     - 25
+     - 26.4
+     - 31.9
+     - 0.935
+     - 0.051
    * - ``{threshold: 0.06, max_skip_steps: 3}``
      - 25
-     - 26.9
+     - 26.4
      - 30.0
-     - 0.928
-     - 0.066
+     - 0.925
+     - 0.065
+   * - ``{threshold: 0.3, max_skip_steps: 5, retention_ratio: 0.28}``
+     - 21
+     - 22.6
+     - 29.5
+     - 0.910
+     - 0.075
    * - ``{threshold: 0.12, max_skip_steps: 4}``
      - 21
-     - 23.2
+     - 22.6
      - 28.8
-     - 0.915
-     - 0.081
+     - 0.911
+     - 0.080
 
-The first 20% of the steps and the last always compute, and a reusing step
-runs a compiled graph of its own (one more compile per listed shape and
+Keep the first 28-32% of the steps (``retention_ratio``; MagCache's default is 20%)
+and raise ``threshold`` until the same number of steps compute: at the same speed
+that is +4.0 dB at 30 steps (better on 8 of 8 prompts) and +1.9 dB at 25 (7 of 8);
+at 21 steps, with runs of four and five reusing steps, it is +0.6 dB, within the
+spread across prompts. The last step always computes, and a reusing step runs a
+compiled graph of its own (one more compile per listed shape and
 guidance setting). Another shape or step
 count reuses the table resampled; ``{method: magcache_calibrate}`` logs one
 from a dense run instead, to pass as ``mag_ratios``.
