@@ -142,3 +142,63 @@ class TestFp4Rows:
         self._build(512, 128)
         with pytest.raises(ValueError, match="kv_lora_rank as 512"):
             self._build(144, 128)
+
+
+class _Planes:
+    """A cache's latent plane, as the resource reads it."""
+
+    def __init__(self, latents: torch.Tensor):
+        self.latents = latents
+
+    def layer_view(self, plane: int) -> torch.Tensor:
+        return self.latents
+
+
+class TestAttend:
+    """The softmax over a row's window rows and picks is the arithmetic of the kernel
+    DeepSeek-V4.1 is served with: 64 entries at a time against the running maximum, each block's
+    probabilities rounded to the queries' dtype, a sink in the denominator."""
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
+    # entries a row: part of a block, exactly one, and several with the last one partly filled
+    @pytest.mark.parametrize("window, picks", [(5, 0), (16, 48), (8, 70), (60, 150)])
+    def test_it_is_the_reference_kernels_block_loop_bit_for_bit(self, dtype, window, picks):
+        from mstar.model.deepseek_v41._testing import sparse_attn
+
+        torch.manual_seed(0)
+        rows, heads, dim, slots_total = 6, 4, 32, 160
+        fmt = Fp4Rows(block=16, e4m3_scale=True)
+        config = CSAConfig(caches={1: "kv"}, topk=max(picks, 1), sm_scale=dim ** -0.5, index_head_dim=32,
+                           latent_dim=dim, latent_rows=fmt)
+        manager = CSAManager(config, {1: 16}, torch.device("cpu"))
+        plane = torch.empty(slots_total // 16, 16, fmt.nbytes(dim) // dtype.itemsize + 1, dtype=dtype)
+        latents = torch.randn(slots_total, dim) * 2
+        plane.view(-1, plane.shape[-1])[:] = _store(latents, fmt, plane)
+        manager._kv = {1: _Planes(plane)}
+        q = torch.randn(rows, heads, dim).to(dtype)
+        sink = torch.randn(heads)
+        source = torch.randn(rows * window, dim).to(dtype)
+        cols = torch.tensor([window, window - 1, 1, 0, window, 2][:rows]).clamp(0, window)
+        window_idx = torch.arange(rows)[:, None] * window + torch.arange(window)[None, :]
+        window_idx = torch.where(torch.arange(window)[None, :] < cols[:, None], window_idx, -1)
+        slots = None
+        if picks:
+            slots = torch.stack([torch.randperm(slots_total)[:picks].sort().values for _ in range(rows)])
+            live = torch.tensor([picks, picks // 2, 0, 0, 1, picks][:rows])
+            slots = torch.where(torch.arange(picks)[None, :] < live[:, None], slots, -1)
+        got = manager.attend(q, sink, source, window_idx, cols, 1 if picks else None, 0 if picks else None, slots)
+
+        # the same entries, dense, through the kernel's loop: a row's window columns, then its picks
+        entries = source[window_idx.clamp_min(0)]
+        idx = torch.where(window_idx >= 0, torch.arange(window)[None, :], -1)
+        if picks:
+            picked = _load(plane.view(-1, plane.shape[-1])[slots.clamp_min(0)], fmt, dim, dtype)
+            entries = torch.cat([entries, picked], dim=1)
+            idx = torch.cat([idx, torch.where(slots >= 0, window + torch.arange(picks)[None, :], -1)], dim=1)
+        # packed as the resource packs a row: its live window columns first
+        order = (idx < 0).sort(dim=1, stable=True).indices
+        entries, idx = entries.gather(1, order[..., None].expand_as(entries)), idx.gather(1, order)
+        idx = torch.where(idx >= 0, torch.arange(idx.shape[1])[None, :], -1).int()
+        want = sparse_attn(q[:, None], entries, sink, idx[:, None], dim ** -0.5)[:, 0]
+        assert got.dtype == dtype and torch.equal(got, want)
+        assert not got[3].any()  # a row with nothing to attend

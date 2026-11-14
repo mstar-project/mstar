@@ -110,11 +110,13 @@ def _store(values: torch.Tensor, fmt: Fp4Rows | None, like: torch.Tensor) -> tor
     return rows.view(like.dtype)
 
 
-def _load(rows: torch.Tensor, fmt: Fp4Rows | None, width: int) -> torch.Tensor:
-    """Gathered cache rows ``[..., row width]`` as fp32 values ``[..., width]``."""
+def _load(rows: torch.Tensor, fmt: Fp4Rows | None, width: int,
+          dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    """Gathered cache rows ``[..., row width]`` as ``dtype`` values ``[..., width]``: fp32, or
+    bf16, which holds every FP4 value exactly."""
     if fmt is None:
-        return rows[..., :width].float()
-    return unpack_fp4_rows(rows.contiguous().view(torch.uint8), width, fmt.block, fmt.e4m3_scale)
+        return rows[..., :width].to(dtype)
+    return unpack_fp4_rows(rows.contiguous().view(torch.uint8), width, fmt.block, fmt.e4m3_scale, dtype)
 
 
 class CSAManager(Resource):
@@ -292,7 +294,7 @@ class CSAManager(Resource):
                 for c0 in range(0, q.shape[0], chunk):
                     c1 = min(c0 + chunk, q.shape[0])
                     slots = rows.slots(ratio, rows.row_req[c0:c1, None], group[None, :])
-                    keys = _load(flat[slots], self.config.key_rows, q.shape[-1]).to(q.dtype)
+                    keys = _load(flat[slots], self.config.key_rows, q.shape[-1], q.dtype)
                     dots = torch.einsum("rhd,rjd->rhj", q[c0:c1], keys).relu_()
                     out[c0:c1] = (dots * w[c0:c1].unsqueeze(-1)).sum(dim=1)
                 return out.masked_fill_(group[None, :] >= seen[:, None], -torch.inf)
@@ -301,8 +303,8 @@ class CSAManager(Resource):
                 if count == 0:
                     continue
                 req_ids = torch.full((count,), req, dtype=torch.long, device=q.device)
-                keys = _load(flat[rows.slots(ratio, req_ids, group[:count])], self.config.key_rows, q.shape[-1])
-                keys = keys.to(q.dtype)
+                keys = _load(flat[rows.slots(ratio, req_ids, group[:count])], self.config.key_rows, q.shape[-1],
+                             q.dtype)
                 chunk = max(1, self.config.score_bytes // (4 * heads * count))
                 for c0 in range(r0, r0 + n, chunk):
                     c1 = min(c0 + chunk, r0 + n)
@@ -353,33 +355,52 @@ class CSAManager(Resource):
         if slots is not None:
             pick = col - window_cols[:, None]
             from_cache = torch.where((pick >= 0) & (pick < picks), slots.gather(1, pick.clamp(0, picks - 1)), -1)
+        # the softmax runs a block of entries at a time: each block's scores against the running
+        # maximum, its probabilities rounded to the queries' dtype, the sums so far rescaled. The
+        # whole blocks' scores and weighted entries are computed at once, a last partial block at
+        # its own width (a GEMM over zero padding sums in another order), then folded in block order.
         block = self.config.softmax_block
-        chunk = max(1, self.config.attend_bytes // (8 * block * width))
+        whole = col.shape[1] // block
+        full = whole * block
+        blocks = whole + (full < col.shape[1])
+        chunk = max(1, self.config.attend_bytes // (8 * width * (col.shape[1] + blocks * heads)))
         out = torch.empty_like(q)
         sink = sink.float()[None, :]
         with torch.autocast(q.device.type, enabled=False):
             for c0 in range(0, count, chunk):
                 c1 = min(c0 + chunk, count)
                 query = q[c0:c1].float()
+                idx = from_window[c0:c1]
+                valid = idx >= 0
+                entries = window[idx.clamp_min(0)].float() * valid[..., None]
+                if from_cache is not None:
+                    picked = from_cache[c0:c1]
+                    live = picked >= 0
+                    entries = entries + _load(
+                        latent[picked.clamp_min(0)], self.config.latent_rows, width) * live[..., None]
+                    valid = valid | live
+                scores = torch.einsum("rhd,rkd->rhk", query, entries) * self.config.sm_scale
+                scores = scores.masked_fill(~valid[:, None, :], -torch.inf)
+                # (rows, heads, blocks, block) for the whole blocks, (rows, heads, 1, rest) for the last
+                parts = []
+                if whole:
+                    parts.append((scores[..., :full].unflatten(-1, (whole, block)),
+                                  entries[:, :full].unflatten(1, (whole, block))))
+                if blocks > whole:
+                    parts.append((scores[..., None, full:], entries[:, None, full:]))
+                peak = torch.cat([part.amax(-1) for part, _ in parts], dim=-1).cummax(-1).values.clamp_min(-1e30)
+                decay = torch.exp(F.pad(peak[..., :-1], (1, 0), value=-1e30) - peak)
+                mass, weighted, at = [], [], 0
+                for part, rows_ in parts:
+                    prob = torch.exp(part - peak[..., at:at + part.shape[2], None])
+                    mass.append(prob.sum(-1))
+                    weighted.append(torch.einsum("rhbk,rbkd->rhbd", prob.to(q.dtype).float(), rows_))
+                    at += part.shape[2]
+                mass, weighted = torch.cat(mass, dim=-1), torch.cat(weighted, dim=2)
                 acc = torch.zeros(c1 - c0, heads, width, dtype=torch.float32, device=q.device)
                 total = torch.zeros(c1 - c0, heads, dtype=torch.float32, device=q.device)
-                peak = torch.full_like(total, -1e30)
-                for b0 in range(0, col.shape[1], block):
-                    idx = from_window[c0:c1, b0:b0 + block]
-                    valid = idx >= 0
-                    entries = window[idx.clamp_min(0)].float() * valid[..., None]
-                    if from_cache is not None:
-                        picked = from_cache[c0:c1, b0:b0 + block]
-                        live = picked >= 0
-                        entries = entries + _load(
-                            latent[picked.clamp_min(0)], self.config.latent_rows, width) * live[..., None]
-                        valid = valid | live
-                    scores = torch.einsum("rhd,rkd->rhk", query, entries) * self.config.sm_scale
-                    scores = scores.masked_fill(~valid[:, None, :], -torch.inf)
-                    last, peak = peak, torch.maximum(peak, scores.amax(-1))
-                    decay = torch.exp(last - peak)
-                    prob = torch.exp(scores - peak[..., None])
-                    total = total * decay + prob.sum(-1)
-                    acc = acc * decay[..., None] + torch.einsum("rhk,rkd->rhd", prob.to(q.dtype).float(), entries)
-                out[c0:c1] = (acc / (total + torch.exp(sink - peak))[..., None]).to(out.dtype)
+                for b in range(blocks):
+                    total = total * decay[..., b] + mass[..., b]
+                    acc = acc * decay[..., b, None] + weighted[:, :, b]
+                out[c0:c1] = (acc / (total + torch.exp(sink - peak[..., -1]))[..., None]).to(out.dtype)
         return out
