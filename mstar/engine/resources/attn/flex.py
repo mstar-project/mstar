@@ -96,7 +96,7 @@ _MASK_MOD = _flash_mask_mod if _FLEX_BACKEND == "FLASH" else None
 _FLASH_KERNEL_OPTIONS = {"BACKEND": "FLASH"}
 
 
-def _flash_flex_attention(q, k, v, *, block_mask, enable_gqa):
+def _flash_flex_attention(q, k, v, *, block_mask, enable_gqa, scale=None):
     # Batching hands this a ring k/v at batch 1 alongside q (and the
     # BlockMask) at batch B. TRITON broadcasts Bkv=1 over Bq natively
     # but FLASH's flash_attn.cute path does not.
@@ -104,7 +104,7 @@ def _flash_flex_attention(q, k, v, *, block_mask, enable_gqa):
         k = k.expand(q.size(0), *k.shape[1:])
         v = v.expand(q.size(0), *v.shape[1:])
     return flex_attention(
-        q, k, v, block_mask=block_mask, enable_gqa=enable_gqa,
+        q, k, v, block_mask=block_mask, scale=scale, enable_gqa=enable_gqa,
         kernel_options=_FLASH_KERNEL_OPTIONS,
     )
 
