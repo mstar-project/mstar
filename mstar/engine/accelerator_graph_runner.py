@@ -2454,7 +2454,7 @@ class PiecewiseAcceleratorGraphRunner:
         handles = {name: h for name, h in self._state_handles.items() if not isinstance(h, ShardHandle)}
         request_mask = next((
             type(read.mask).__name__
-            for name in (() if step is None else step.state)
+            for name in (() if step is None else step.state or ())
             if isinstance(handle := handles.get(name), ArrayHandle)
             for read in handle.array.reads.values()
             if isinstance(read.mask, (ChunkCausal, ExpertCross, ExpertSelf))
