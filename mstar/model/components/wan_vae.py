@@ -13,14 +13,32 @@ conv3d kernels run in, so no conv pays a layout conversion on the way in or out.
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F
-from diffusers.models.autoencoders.autoencoder_kl_wan import WanCausalConv3d, WanUpsample, unpatchify
+from diffusers.models.autoencoders.autoencoder_kl_wan import (
+    DupUp3D,
+    WanAttentionBlock,
+    WanCausalConv3d,
+    WanDecoder3d,
+    WanMidBlock,
+    WanResample,
+    WanResidualBlock,
+    WanResidualUpBlock,
+    WanRMS_norm,
+    WanUpBlock,
+    WanUpsample,
+    unpatchify,
+)
 from torch import nn
 
 from mstar.engine.state import Size, TensorType
+
+if TYPE_CHECKING:
+    from mstar.distributed.communication import CommGroup
 
 # the sizes a stream's cache fields scale with: its latent's height and width
 LAT_H, LAT_W = "lat_h", "lat_w"
@@ -109,6 +127,9 @@ def to_default_layout(vae: nn.Module) -> None:
     classes, so ``vae.decode`` is stock ``vae.decode`` bit for bit."""
     if not is_channels_last(vae):
         return
+    if is_height_sharded(vae):
+        # its layers expect a row shard; a stock decode would hand them whole frames
+        raise ValueError("A height-sharded Wan VAE decodes only through its HeightShardedDecoder")
     for root in (getattr(vae, "post_quant_conv", None), getattr(vae, "decoder", None)):
         if root is None:
             continue
@@ -343,6 +364,11 @@ class DecoderStep:
         self._decoder = vae.decoder
         self._fn = compile_decode(self._decoder.forward, deterministic=deterministic) if compile else None
         self._warmed: set[tuple] = set()
+        # Joins every warm-up key. A height-sharded decode returns the clip's row
+        # split, which all its ranks share: the warm-up runs collectives, so
+        # whether a call is new has to be decided alike on every rank, and a
+        # rank's own shapes alone can repeat on one rank but not the other.
+        self.key_extra: Callable[[], tuple] = tuple
 
     def __call__(self, x: torch.Tensor, feat_cache: list, first_chunk: bool = False) -> torch.Tensor:
         if not self.compiled or first_chunk or any(isinstance(t, str) for t in feat_cache):
@@ -351,7 +377,7 @@ class DecoderStep:
         # graph guards on: without this, every new clip length recompiles.
         x = _compact(x)
         if x.dtype == torch.bfloat16:
-            key = (tuple(x.shape), x.stride(), _cache_signature(feat_cache))
+            key = (tuple(x.shape), x.stride(), _cache_signature(feat_cache), self.key_extra())
             if key not in self._warmed:
                 scratch = type(feat_cache)(t.clone() if torch.is_tensor(t) else t for t in feat_cache)
                 self._fn(x, feat_cache=scratch, feat_idx=[0])
@@ -434,6 +460,10 @@ class FastDecoder:
         """``decode_causal`` of a whole clip: ``vae.decode(z)``, call for call."""
         return self.decode_stream(z, new_feat_cache(self.vae), clip_start=True)
 
+    def gather(self, frames: torch.Tensor) -> torch.Tensor:
+        """The whole frames of the last decode: here, its output as it is."""
+        return frames
+
     def decode_stream(
         self, z: torch.Tensor, feat_cache: list, *, clip_start: bool, latents_per_call: int = 1,
     ) -> torch.Tensor:
@@ -443,3 +473,240 @@ class FastDecoder:
             return decode_causal(
                 self.vae, z, feat_cache, self.step, clip_start=clip_start, latents_per_call=latents_per_call,
             )
+
+
+# ---------------------------------------------------------------------------
+# Height-sharded decode
+#
+# Each rank of a decoder node's TP group decodes its own band of rows of every
+# frame, and the frames are gathered at the end. Only three kinds of decoder
+# layer see across rows: a conv with a 3-row kernel needs one row of each
+# neighbour's band (a halo, zeros at the frame's edges, as the conv's own zero
+# padding), and the mid-block attention needs the whole frame (gathered, then
+# each rank keeps its rows). Everything else (RMS norms, the 2x nearest
+# upsample, ``DupUp3D``, unpatchify) works per pixel, and a band stays aligned
+# through every 2x upsample. So the output is the whole-clip decode's, up to
+# the rounding of conv algorithms that cuDNN picks per shape.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(slots=True)
+class HeightShard:
+    """The row split a sharded decoder's layers share: the group, and the
+    latent rows each rank holds for the clip being decoded (``None`` for a
+    clip too short to split, which every rank then decodes whole)."""
+    group: CommGroup
+    rows: tuple[int, ...] | None = None
+
+    def level_rows(self, local_rows: int) -> list[int]:
+        """Every rank's rows at the resolution of an activation that has
+        ``local_rows`` rows here: the latent split, scaled."""
+        scale, rest = divmod(local_rows, self.rows[self.group.rank])
+        assert rest == 0, (local_rows, self.rows)
+        return [r * scale for r in self.rows]
+
+
+def split_rows(height: int, world: int) -> tuple[int, ...]:
+    """Bands as even as rows allow, the last ``height % world`` one row taller:
+    rank 0 also leads the instance and holds more beside the decode, so it gets
+    the smaller band. Every rank must agree; a band that runs one rank out of
+    memory mid-decode leaves the others in a collective."""
+    base, extra = divmod(height, world)
+    return tuple(base + (r >= world - extra) for r in range(world))
+
+
+def gather_rows(shard: HeightShard, x: torch.Tensor, dim: int) -> torch.Tensor:
+    """Every rank's band of ``x`` along ``dim``, in rank order. Uneven bands are
+    padded to the tallest for the all-gather and trimmed after."""
+    sizes = shard.level_rows(x.shape[dim])
+    tallest = max(sizes)
+    if x.shape[dim] < tallest:
+        pad = x.new_zeros(*x.shape[:dim], tallest - x.shape[dim], *x.shape[dim + 1:])
+        x = torch.cat([x, pad], dim=dim)
+    bands = shard.group.all_gather(x.contiguous(), dim=dim).split(tallest, dim=dim)
+    return torch.cat([band.narrow(dim, 0, n) for band, n in zip(bands, sizes, strict=True)], dim=dim)
+
+
+def _neighbour_rows(shard: HeightShard, top: torch.Tensor, bottom: torch.Tensor, dim: int):
+    """The row above this band (the previous rank's last) and the row below it
+    (the next rank's first): one all-gather of every band's two edge rows."""
+    group = shard.group
+    edges = group.all_gather(torch.cat([top, bottom], dim=dim).contiguous(), dim=dim).split(1, dim=dim)
+    above = edges[2 * group.rank - 1] if group.rank > 0 else torch.zeros_like(top)
+    below = edges[2 * group.rank + 2] if group.rank < group.world_size - 1 else torch.zeros_like(bottom)
+    return above, below
+
+
+def _with_halo(
+    shard: HeightShard, x: torch.Tensor, row_dim: int, layout: torch.memory_format,
+    cached: torch.Tensor | None = None, zero_frames: int = 0,
+) -> torch.Tensor:
+    """A conv's input in its one ``layout`` copy, as the unsharded conv makes it:
+    ``zero_frames`` zero frames, then ``cached``, then ``x`` (frames on dim 2),
+    with a neighbour row above and below along ``row_dim``."""
+    lead = zero_frames + (cached.shape[2] if cached is not None else 0)
+    shape = list(x.shape)
+    rows = shape[row_dim]
+    shape[row_dim] = rows + 2
+    if lead:
+        shape[2] += lead
+    out = torch.empty(shape, dtype=x.dtype, device=x.device, memory_format=layout)
+    body = out.narrow(row_dim, 1, rows)
+    if zero_frames:
+        body.narrow(2, 0, zero_frames).zero_()
+    if cached is not None:
+        body.narrow(2, zero_frames, cached.shape[2]).copy_(cached)
+    (body.narrow(2, lead, x.shape[2]) if lead else body).copy_(x)
+    above, below = _neighbour_rows(shard, out.narrow(row_dim, 1, 1), out.narrow(row_dim, rows, 1), row_dim)
+    out.narrow(row_dim, 0, 1).copy_(above)
+    out.narrow(row_dim, rows + 1, 1).copy_(below)
+    return out
+
+
+def _check_rows(conv: nn.Module, kernel: int, padding: int, stride: int, dilation: int) -> None:
+    """A band is exact under a zero-padded row kernel that pads one row each side (or none)."""
+    if (stride != 1 or dilation != 1 or padding not in (0, 1) or kernel != 2 * padding + 1
+            or conv.padding_mode != "zeros"):
+        raise ValueError(
+            f"Can't split {type(conv).__name__} by rows: kernel {kernel}, padding {padding} ({conv.padding_mode}), "
+            f"stride {stride}, dilation {dilation}"
+        )
+
+
+class HeightShardedCausalConv3d(ChannelsLastCausalConv3d):
+    """A causal conv on a row band: the cached frames, the band and its halo
+    built in one channels-last copy, then the conv with no row padding."""
+    shard: HeightShard
+
+    @classmethod
+    def adopt(cls, module: ChannelsLastCausalConv3d) -> bool:
+        _check_rows(module, module.kernel_size[1], module._padding[2], module.stride[1], module.dilation[1])
+        return True
+
+    def forward(self, x, cache_x=None):
+        pad_w, _, pad_h, _, pad_t, _ = self._padding
+        if pad_h == 0 or self.shard.rows is None:
+            return super().forward(x, cache_x)
+        cached = None
+        if pad_t > 0 and cache_x is not None:
+            cached = cache_x.to(x.device)
+            pad_t -= cached.shape[2]
+        x = _with_halo(self.shard, x, 3, torch.channels_last_3d, cached=cached, zero_frames=max(pad_t, 0))
+        return F.conv3d(x, self.weight, self.bias, self.stride, (0, 0, pad_w), self.dilation, self.groups)
+
+
+class HeightShardedConv2d(ChannelsLastConv2d):
+    """The per-frame 3x3 conv after a spatial upsample, on a row band."""
+    shard: HeightShard
+
+    @classmethod
+    def adopt(cls, module: ChannelsLastConv2d) -> bool:
+        if module.kernel_size == (1, 1):
+            return False  # the attention's projections, per pixel
+        _check_rows(module, module.kernel_size[0], module.padding[0], module.stride[0], module.dilation[0])
+        return module.padding[0] == 1
+
+    def forward(self, x):
+        if self.shard.rows is None:
+            return super().forward(x)
+        x = _with_halo(self.shard, x, 2, torch.channels_last)
+        return F.conv2d(x, self.weight, self.bias, self.stride, (0, self.padding[1]), self.dilation, self.groups)
+
+
+class HeightShardedAttentionBlock(WanAttentionBlock):
+    """The mid-block attention over the whole frame, each rank keeping its rows."""
+    shard: HeightShard
+
+    @classmethod
+    def adopt(cls, module: WanAttentionBlock) -> bool:
+        return True
+
+    def forward(self, x):
+        if self.shard.rows is None:
+            return super().forward(x)
+        sizes = self.shard.level_rows(x.shape[3])
+        rank = self.shard.group.rank
+        full = super().forward(gather_rows(self.shard, x, dim=3))
+        return full.narrow(3, sum(sizes[:rank]), sizes[rank])
+
+
+# The decoder's layers that see across rows, by exact class.
+_SHARDED_CLASS = {
+    ChannelsLastCausalConv3d: HeightShardedCausalConv3d,
+    ChannelsLastConv2d: HeightShardedConv2d,
+    WanAttentionBlock: HeightShardedAttentionBlock,
+}
+# Every other layer of the two Wan decoders, by exact class: each works per pixel
+# (RMS norms over channels, activations, the 2x nearest upsample, DupUp3D's
+# channel-to-pixel shuffle) or only holds layers that are checked themselves. A
+# band passes through them as the whole frame would. A class outside both sets,
+# a subclass included (it may override ``forward``), refuses the conversion.
+_PER_PIXEL = frozenset({
+    WanDecoder3d, WanMidBlock, WanResidualBlock, WanUpBlock, WanResidualUpBlock, WanResample,
+    WanRMS_norm, DupUp3D, ChannelsLastUpsample, nn.SiLU, nn.Dropout, nn.Identity, nn.ModuleList, nn.Sequential,
+})
+
+
+def is_height_sharded(vae: nn.Module) -> bool:
+    return any(isinstance(m, HeightShardedCausalConv3d) for m in vae.decoder.modules())
+
+
+def to_height_sharded(vae: nn.Module, group: CommGroup) -> HeightShard:
+    """Switch a channels-last decoder's row-crossing layers to their sharded
+    classes, in place, all sharing one ``HeightShard``. Refuses the conversion
+    for a conv it can't split exactly (only one-row-padded 3-row kernels can be)
+    and for any layer it doesn't know to work per pixel (``_PER_PIXEL``)."""
+    if not is_channels_last(vae):
+        raise ValueError("Shard a Wan VAE decoder after switching it to channels-last")
+    shard = HeightShard(group)
+    for module in vae.decoder.modules():
+        kind = type(module)
+        sharded = _SHARDED_CLASS.get(kind)
+        if sharded is not None:
+            if sharded.adopt(module):
+                module.__class__ = sharded
+                module.shard = shard
+            continue  # adopt refuses what it can't split; False is a per-pixel kernel (1x1)
+        if kind not in _PER_PIXEL:
+            raise ValueError(f"Can't split a Wan VAE decoder by rows: {kind.__name__} isn't known to work per pixel")
+        if kind is ChannelsLastUpsample and module.mode not in ("nearest", "nearest-exact"):
+            raise ValueError(f"Can't split a Wan VAE decoder by rows: a {module.mode} upsample blends rows")
+    return shard
+
+
+class HeightShardedDecoder(FastDecoder):
+    """A ``FastDecoder`` whose ranks each decode a band of rows, over ``group``.
+
+    Every rank of the group calls ``decode`` with the same latents, in the same
+    order (a lockstep node's steps), and gets back its band;
+    ``gather`` assembles the frames (after any per-pixel conversion, e.g. to
+    uint8, which is cheaper to gather). Collective: every rank makes the same
+    calls. A clip with fewer latent rows than ranks decodes whole on each.
+    """
+
+    def __init__(self, vae: nn.Module, group: CommGroup, *, compile: bool = True, deterministic: bool = True):
+        super().__init__(vae, channels_last=True, compile=compile, deterministic=deterministic)
+        self.shard = to_height_sharded(vae, group)
+        self.step.key_extra = lambda: (self.shard.rows,)
+
+    def use_stock_layout(self) -> None:
+        raise ValueError("A height-sharded decoder has no stock layout")
+
+    def decode_stream(
+        self, z: torch.Tensor, feat_cache: list, *, clip_start: bool, latents_per_call: int = 1,
+    ) -> torch.Tensor:
+        """This rank's band of the decode of ``z`` (every rank's whole latents)."""
+        group = self.shard.group
+        rows = split_rows(z.shape[3], group.world_size)
+        if min(rows) == 0:
+            self.shard.rows = None
+        else:
+            self.shard.rows = rows
+            z = z.narrow(3, sum(rows[:group.rank]), rows[group.rank])
+        return super().decode_stream(z, feat_cache, clip_start=clip_start, latents_per_call=latents_per_call)
+
+    def gather(self, band: torch.Tensor) -> torch.Tensor:
+        """The whole frames from every rank's band of the last decode (rows on dim 3)."""
+        if self.shard.rows is None:
+            return band
+        return gather_rows(self.shard, band, dim=3)

@@ -7,7 +7,7 @@ description: "Understand graph walks, workers, engines, and resource ownership."
 
 `mstar` is organized as a set of cooperating processes:
 
-- **API server** (`mstar/api_server/`): FastAPI layer that accepts `POST /generate`, tokenizes/loads media, dispatches the request, and streams results back to the client. Entry point: `mstar.api_server.entrypoint:main` (the `mstar-serve` console script).
+- **API server** (`mstar/api_server/`): accepts `POST /generate` and the OpenAI routes, tokenizes/loads media, dispatches the request, and streams results back to the client. Entry point: `mstar.api_server.entrypoint:main` (the `mstar-serve` console script). HTTP is served by `mstar-server` (`rust/server/`), which talks to the Python process over a local bridge; `--python-frontend` serves it from the deprecated FastAPI app instead.
 - **Conductor** (`mstar/conductor/`): central coordinator. It manages the request lifecycle, handles graph-walk transitions, selects workers, routes inputs, and detects completion.
 - **Workers** (`mstar/worker/`): one process per GPU. Each runs an engine manager and a micro-scheduler (continuous batching), drives eviction and offload, and routes tensors directly to downstream workers.
 - **Engine** (`mstar/engine/engine.py`): the single execution backend that runs submodules on the GPU. It compiles forwards, captures CUDA graphs, batches requests, and runs each step's resource lifecycle: admit, plan, forward, commit.
