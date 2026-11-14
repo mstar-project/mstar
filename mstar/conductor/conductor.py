@@ -1470,6 +1470,7 @@ class Conductor:
         them there, as an abort before admission does, then tell the client.
         """
         logger.info("Rejecting request %s (%d): %s", request_id, status, error)
+        self._queued_since.pop(request_id, None)
         self._early_reads_done.pop(request_id, None)
         self._send_remove_to_preprocess_worker(request_id)
         self._send_for_teardown(
