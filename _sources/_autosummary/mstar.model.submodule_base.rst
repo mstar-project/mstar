@@ -16,6 +16,7 @@ mstar.model.submodule\_base
       chunk_loop_name
       chunk_tick_name
       engine_step
+      splice_loopback_ids
       with_segment_steps
    
    

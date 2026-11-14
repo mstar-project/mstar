@@ -1130,6 +1130,18 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">        the rest raise — a paged key against a ring config is a typo, and the</span>
 <span class="sd">        spec's contract is that a typo is loud.</span>
 <span class="sd">        """</span></div>
+
+
+<div class="viewcode-block" id="KVConfig.capacity_problem">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.KVConfig.capacity_problem">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">capacity_problem</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">spec</span><span class="p">:</span> <span class="s2">"KVSpec"</span><span class="p">,</span> <span class="n">requests</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">request</span><span class="p">:</span> <span class="s2">"KVReqConfig | None"</span><span class="p">,</span>
+        <span class="n">axis_sizes</span><span class="p">:</span> <span class="n">Sequence</span><span class="p">[</span><span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="p">(),</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Why ``spec``'s pool can't hold ``requests`` requests at once, each opened with ``request``, on node groups</span>
+<span class="sd">        of ``axis_sizes`` (as `NodeResourceSpec.capacity_problem` takes them), or None. None by default, for a pool its</span>
+<span class="sd">        window sizes rather than its requests."""</span>
+        <span class="k">return</span> <span class="kc">None</span></div>
 </div>
 
 
@@ -1387,6 +1399,44 @@ window.runMermaid = runMermaid;</script>
             <span class="n">layout</span><span class="o">.</span><span class="n">pages</span><span class="p">(</span><span class="n">caps</span><span class="p">,</span> <span class="n">group</span><span class="o">.</span><span class="n">page_size</span><span class="p">,</span> <span class="n">group</span><span class="o">.</span><span class="n">retention</span><span class="p">)</span> <span class="k">for</span> <span class="n">group</span> <span class="ow">in</span> <span class="n">later</span>
         <span class="p">)</span></div>
 
+
+<div class="viewcode-block" id="PagedKVConfig.capacity_problem">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.PagedKVConfig.capacity_problem">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">capacity_problem</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">spec</span><span class="p">:</span> <span class="s2">"KVSpec"</span><span class="p">,</span> <span class="n">requests</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">request</span><span class="p">:</span> <span class="s2">"KVReqConfig | None"</span><span class="p">,</span>
+        <span class="n">axis_sizes</span><span class="p">:</span> <span class="n">Sequence</span><span class="p">[</span><span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="p">(),</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Each request holds the pages ``request`` lays out at its caps, or one stream of ``max_seq_len`` where it</span>
+<span class="sd">        lays out none, next to the sink page."""</span>
+        <span class="c1"># In arena pages. A stream of max_seq_len holds every token of every group, a window's too, since a one-step</span>
+        <span class="c1"># prefill keeps its whole prompt until it commits. A pool placed by position over a node group's ranks pages</span>
+        <span class="c1"># its window groups as `placed_groups` does.</span>
+        <span class="n">per_request</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span>
+            <span class="n">request</span><span class="o">.</span><span class="n">pages</span><span class="p">(</span><span class="n">spec</span><span class="o">.</span><span class="n">nodes</span><span class="p">,</span> <span class="n">request</span><span class="o">.</span><span class="n">loop_caps</span> <span class="ow">or</span> <span class="p">{},</span> <span class="n">pool</span><span class="p">)</span> <span class="k">if</span> <span class="n">request</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+            <span class="k">else</span> <span class="nb">sum</span><span class="p">(</span><span class="o">-</span><span class="p">(</span><span class="o">-</span><span class="bp">self</span><span class="o">.</span><span class="n">max_seq_len</span> <span class="o">//</span> <span class="n">group</span><span class="o">.</span><span class="n">page_size</span><span class="p">)</span> <span class="k">for</span> <span class="n">group</span> <span class="ow">in</span> <span class="n">pool</span><span class="o">.</span><span class="n">groups</span><span class="p">)</span>
+            <span class="k">for</span> <span class="n">pool</span> <span class="ow">in</span> <span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="o">*</span><span class="bp">self</span><span class="o">.</span><span class="n">_placed</span><span class="p">(</span><span class="n">spec</span><span class="p">,</span> <span class="n">axis_sizes</span><span class="p">))</span>
+        <span class="p">)</span>
+        <span class="n">need</span> <span class="o">=</span> <span class="mi">1</span> <span class="o">+</span> <span class="n">requests</span> <span class="o">*</span> <span class="n">per_request</span>
+        <span class="k">if</span> <span class="n">need</span> <span class="o">&lt;=</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_units</span><span class="p">:</span>
+            <span class="k">return</span> <span class="kc">None</span>
+        <span class="k">return</span> <span class="p">(</span>
+            <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">requests</span><span class="si">}</span><span class="s2"> concurrent requests (max_concurrent_requests) need </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">pages_of</span><span class="p">(</span><span class="n">need</span><span class="p">,</span><span class="w"> </span><span class="n">round_up</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span><span class="si">}</span><span class="s2"> pages "</span>
+            <span class="sa">f</span><span class="s2">"of resources.</span><span class="si">{</span><span class="n">spec</span><span class="o">.</span><span class="n">resource_key</span><span class="si">}</span><span class="s2"> (</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">pages_of</span><span class="p">(</span><span class="n">per_request</span><span class="p">,</span><span class="w"> </span><span class="n">round_up</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span><span class="si">}</span><span class="s2"> per request and the sink "</span>
+            <span class="sa">f</span><span class="s2">"page), which has </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">max_num_pages</span><span class="si">}</span><span class="s2">; raise max_num_pages, or lower max_concurrent_requests or the "</span>
+            <span class="s2">"tokens a request may hold"</span>
+        <span class="p">)</span></div>
+
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">_placed</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">spec</span><span class="p">:</span> <span class="s2">"KVSpec"</span><span class="p">,</span> <span class="n">axis_sizes</span><span class="p">:</span> <span class="n">Sequence</span><span class="p">[</span><span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">]])</span> <span class="o">-&gt;</span> <span class="s2">"list[PagedKVConfig]"</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""This config as each node group of ``axis_sizes`` pages it, where it sets ``context_parallel``.</span>
+<span class="sd">        A group it can't place on is validation's to report."""</span>
+        <span class="n">placed</span> <span class="o">=</span> <span class="p">[]</span>
+        <span class="k">for</span> <span class="n">sizes</span> <span class="ow">in</span> <span class="n">axis_sizes</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">context_parallel</span> <span class="k">else</span> <span class="p">():</span>
+            <span class="k">try</span><span class="p">:</span>
+                <span class="n">placed</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">paged_for</span><span class="p">(</span><span class="n">spec</span><span class="o">.</span><span class="n">resource_key</span><span class="p">,</span> <span class="n">sizes</span><span class="p">[</span><span class="s2">"tp"</span><span class="p">],</span> <span class="n">sizes</span><span class="p">[</span><span class="s2">"sp"</span><span class="p">]))</span>
+            <span class="k">except</span> <span class="ne">ValueError</span><span class="p">:</span>
+                <span class="k">pass</span>
+        <span class="k">return</span> <span class="n">placed</span>
 
     <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">latent_dim</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
@@ -2019,6 +2069,15 @@ window.runMermaid = runMermaid;</script>
 <span class="w">        </span><span class="sd">"""Forwarded to the config: which keys are legal is a property of the</span>
 <span class="sd">        storage strategy, so the config answers for them."""</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">apply_yaml_overrides</span><span class="p">(</span><span class="o">**</span><span class="n">kwargs</span><span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="KVSpec.capacity_problem">
+<a class="viewcode-back" href="../../../../../_autosummary/mstar.engine.resources.kv.config.html#mstar.engine.resources.KVSpec.capacity_problem">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">capacity_problem</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">requests</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">request</span><span class="p">:</span> <span class="n">ResourceReqConfig</span> <span class="o">|</span> <span class="kc">None</span><span class="p">,</span> <span class="n">axis_sizes</span><span class="p">:</span> <span class="n">Sequence</span><span class="p">[</span><span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="p">(),</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Forwarded to the config, as `apply_yaml_overrides` is: how requests fill a pool is the storage strategy's."""</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">config</span><span class="o">.</span><span class="n">capacity_problem</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">requests</span><span class="p">,</span> <span class="n">request</span><span class="p">,</span> <span class="n">axis_sizes</span><span class="p">)</span></div>
 
 
 <div class="viewcode-block" id="KVSpec.keeps_prefix_cache">

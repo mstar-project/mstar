@@ -1165,12 +1165,22 @@ window.runMermaid = runMermaid;</script>
 
 
 
-<span class="c1"># what an ``APIServerMessage`` carries; None for ``setup_done``. The decoder</span>
-<span class="c1"># tries branches in order and takes the first whose required fields are all</span>
-<span class="c1"># present, so a body must lack a required field of every branch before it.</span>
+<div class="viewcode-block" id="WorkersReady">
+<a class="viewcode-back" href="../../../_autosummary/mstar.api_server.request_types.html#mstar.api_server.request_types.WorkersReady">[docs]</a>
+<span class="nd">@dataclass</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">WorkersReady</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""The conductor's ``setup_done``: every worker is ready, and these are its declarations' digests by name</span>
+<span class="sd">    (`declaration_digests`), which the API server checks its own against."""</span>
+    <span class="n">declaration_digests</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">]</span></div>
+
+
+
+<span class="c1"># what an ``APIServerMessage`` carries. The decoder tries branches in order and</span>
+<span class="c1"># takes the first whose required fields are all present, so a body must lack a</span>
+<span class="c1"># required field of every branch before it.</span>
 <span class="n">APIServerMessageBody</span> <span class="o">=</span> <span class="p">(</span>
     <span class="n">ResultTensors</span> <span class="o">|</span> <span class="n">ResultTokens</span> <span class="o">|</span> <span class="n">RequestComplete</span> <span class="o">|</span> <span class="n">RequestFailed</span> <span class="o">|</span> <span class="n">ConductorStatus</span>
-    <span class="o">|</span> <span class="n">LoraAdapterResult</span> <span class="o">|</span> <span class="kc">None</span>
+    <span class="o">|</span> <span class="n">LoraAdapterResult</span> <span class="o">|</span> <span class="n">WorkersReady</span> <span class="o">|</span> <span class="kc">None</span>
 <span class="p">)</span>
 
 

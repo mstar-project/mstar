@@ -753,8 +753,8 @@
                   
   <section id="module-mstar.model.whisper.components.timestamps">
 <span id="mstar-model-whisper-components-timestamps"></span><h1>mstar.model.whisper.components.timestamps<a class="headerlink" href="#module-mstar.model.whisper.components.timestamps" title="Link to this heading">#</a></h1>
-<p>Whisper timestamp decoding rules as a per-request state that travels with
-the token.</p>
+<p>Whisper timestamp decoding rules as a per-request state kept in the decoder
+state.</p>
 <p>When a request asks for timestamps (no <code class="docutils literal notranslate"><span class="pre">&lt;|notimestamps|&gt;</span></code> in its prompt),
 Whisper’s decoding is constrained the way openai-whisper / HF’s
 <code class="docutils literal notranslate"><span class="pre">WhisperTimeStampLogitsProcessor</span></code> constrain it:</p>
@@ -773,8 +773,8 @@ token, a timestamp is sampled.</p></li>
 <p>Which rule applies depends on the tokens generated so far. The worker
 launches the next decode step before it has read the previous step’s token
 on the host, so that history cannot live in Python: the four integers that
-summarize it (<code class="docutils literal notranslate"><span class="pre">[active,</span> <span class="pre">phase,</span> <span class="pre">last_ts,</span> <span class="pre">ceil]</span></code>) are a tensor row that is
-routed along with the sampled token, updated by <a class="reference internal" href="#mstar.model.whisper.components.timestamps.TimestampRules.advance" title="mstar.model.whisper.components.timestamps.TimestampRules.advance"><code class="xref py py-meth docutils literal notranslate"><span class="pre">TimestampRules.advance()</span></code></a>
+summarize it (<code class="docutils literal notranslate"><span class="pre">[active,</span> <span class="pre">phase,</span> <span class="pre">last_ts,</span> <span class="pre">ceil]</span></code>) are a tensor row kept in
+each request’s decoder state, updated by <a class="reference internal" href="#mstar.model.whisper.components.timestamps.TimestampRules.advance" title="mstar.model.whisper.components.timestamps.TimestampRules.advance"><code class="xref py py-meth docutils literal notranslate"><span class="pre">TimestampRules.advance()</span></code></a>
 inside the (captured) forward, and turned into masks on the <code class="docutils literal notranslate"><span class="pre">(bs,</span> <span class="pre">vocab)</span></code>
 logits by <a class="reference internal" href="#mstar.model.whisper.components.timestamps.TimestampRules.apply" title="mstar.model.whisper.components.timestamps.TimestampRules.apply"><code class="xref py py-meth docutils literal notranslate"><span class="pre">TimestampRules.apply()</span></code></a> with no data-dependent control flow.
 <a class="reference internal" href="#mstar.model.whisper.components.timestamps.rule_state" title="mstar.model.whisper.components.timestamps.rule_state"><code class="xref py py-func docutils literal notranslate"><span class="pre">rule_state()</span></code></a> builds the same row from a token history on the host —

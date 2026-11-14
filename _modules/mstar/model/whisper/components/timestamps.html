@@ -1024,8 +1024,8 @@ window.runMermaid = runMermaid;</script>
                 <article class="bd-article">
                   
   <h1>Source code for mstar.model.whisper.components.timestamps</h1><div class="highlight"><pre>
-<span></span><span class="sd">"""Whisper timestamp decoding rules as a per-request state that travels with</span>
-<span class="sd">the token.</span>
+<span></span><span class="sd">"""Whisper timestamp decoding rules as a per-request state kept in the decoder</span>
+<span class="sd">state.</span>
 
 <span class="sd">When a request asks for timestamps (no ``&lt;|notimestamps|&gt;`` in its prompt),</span>
 <span class="sd">Whisper's decoding is constrained the way openai-whisper / HF's</span>
@@ -1043,8 +1043,8 @@ window.runMermaid = runMermaid;</script>
 <span class="sd">Which rule applies depends on the tokens generated so far. The worker</span>
 <span class="sd">launches the next decode step before it has read the previous step's token</span>
 <span class="sd">on the host, so that history cannot live in Python: the four integers that</span>
-<span class="sd">summarize it (``[active, phase, last_ts, ceil]``) are a tensor row that is</span>
-<span class="sd">routed along with the sampled token, updated by :meth:`TimestampRules.advance`</span>
+<span class="sd">summarize it (``[active, phase, last_ts, ceil]``) are a tensor row kept in</span>
+<span class="sd">each request's decoder state, updated by :meth:`TimestampRules.advance`</span>
 <span class="sd">inside the (captured) forward, and turned into masks on the ``(bs, vocab)``</span>
 <span class="sd">logits by :meth:`TimestampRules.apply` with no data-dependent control flow.</span>
 <span class="sd">:func:`rule_state` builds the same row from a token history on the host —</span>

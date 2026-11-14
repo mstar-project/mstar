@@ -1045,20 +1045,18 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span>
 
 <span class="c1"># ---------------------------------------------------------------------------</span>
-<span class="c1"># Resource keys and KV labels (T3 node)</span>
+<span class="c1"># Declared state and KV labels (T3 and S3Gen nodes)</span>
 <span class="c1"># ---------------------------------------------------------------------------</span>
 <span class="n">T3_KV</span> <span class="o">=</span> <span class="s2">"t3_kv"</span>
 <span class="n">T3_ATTN</span> <span class="o">=</span> <span class="s2">"t3_attn"</span>
 <span class="n">T3_POS</span> <span class="o">=</span> <span class="s2">"t3_pos"</span>
 <span class="n">T3_SAMPLER</span> <span class="o">=</span> <span class="s2">"t3_sampler"</span>
+<span class="n">S3GEN_STREAM</span> <span class="o">=</span> <span class="s2">"s3gen_stream"</span>
 
-<span class="c1"># The conditional stream, the unconditional (text-less) stream classifier-free</span>
-<span class="c1"># guidance reads beside it, and the plan label the two are packed under when a</span>
-<span class="c1"># step runs both through one attention call (label-major: all ``main`` rows,</span>
-<span class="c1"># then all ``uncond`` rows).</span>
+<span class="c1"># The conditional stream and the unconditional (text-less) stream</span>
+<span class="c1"># classifier-free guidance reads beside it.</span>
 <span class="n">COND_LABEL</span> <span class="o">=</span> <span class="s2">"main"</span>
 <span class="n">UNCOND_LABEL</span> <span class="o">=</span> <span class="s2">"uncond"</span>
-<span class="n">CFG_LABEL</span> <span class="o">=</span> <span class="s2">"cfg"</span>
 
 <span class="c1"># Node names</span>
 <span class="n">VOICE_ENCODER_NODE</span> <span class="o">=</span> <span class="s2">"voice_encoder"</span>

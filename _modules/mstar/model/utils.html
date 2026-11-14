@@ -1029,13 +1029,16 @@ window.runMermaid = runMermaid;</script>
 <span class="kn">import</span><span class="w"> </span><span class="nn">logging</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">os</span>
 <span class="kn">import</span><span class="w"> </span><span class="nn">re</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Container</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">collections.abc</span><span class="w"> </span><span class="kn">import</span> <span class="n">Container</span><span class="p">,</span> <span class="n">Mapping</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">dataclasses</span><span class="w"> </span><span class="kn">import</span> <span class="n">dataclass</span><span class="p">,</span> <span class="n">field</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">functools</span><span class="w"> </span><span class="kn">import</span> <span class="n">cached_property</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">pathlib</span><span class="w"> </span><span class="kn">import</span> <span class="n">Path</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">Any</span><span class="p">,</span> <span class="n">NamedTuple</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">TYPE_CHECKING</span><span class="p">,</span> <span class="n">Any</span><span class="p">,</span> <span class="n">NamedTuple</span>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">torch</span>
+
+<span class="k">if</span> <span class="n">TYPE_CHECKING</span><span class="p">:</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.state.contract</span><span class="w"> </span><span class="kn">import</span> <span class="n">Layout</span>
 
 <span class="c1"># safetensors is imported where it is used: mstar.model.base imports this</span>
 <span class="c1"># module, and safetensors is not a core dependency.</span>
@@ -1845,17 +1848,26 @@ window.runMermaid = runMermaid;</script>
 
 <div class="viewcode-block" id="check_kv_pools_fit">
 <a class="viewcode-back" href="../../../_autosummary/mstar.model.utils.html#mstar.model.utils.check_kv_pools_fit">[docs]</a>
-<span class="k">def</span><span class="w"> </span><span class="nf">check_kv_pools_fit</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="nb">dict</span><span class="p">,</span> <span class="n">config_path</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">log</span><span class="p">:</span> <span class="n">logging</span><span class="o">.</span><span class="n">Logger</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">"""Refuse a ``max_concurrent_requests`` the model's KV caches cannot hold.</span>
+<span class="k">def</span><span class="w"> </span><span class="nf">check_kv_pools_fit</span><span class="p">(</span>
+    <span class="n">model</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="nb">dict</span><span class="p">,</span> <span class="n">config_path</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">log</span><span class="p">:</span> <span class="n">logging</span><span class="o">.</span><span class="n">Logger</span><span class="p">,</span>
+    <span class="n">request_layouts</span><span class="p">:</span> <span class="s2">"Mapping[str, Mapping[str, Layout]] | None"</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span> <span class="n">loop_caps</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">]</span> <span class="o">|</span> <span class="kc">None</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+<span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""Refuse a ``max_concurrent_requests`` a resource the model builds cannot hold, as its</span>
+<span class="sd">    spec's `capacity_problem` answers: the first problem raises.</span>
 
 <span class="sd">    A request keeps its pages from prefill to its last token. Past a pool, a</span>
 <span class="sd">    prefill batch is refused. With host pages (``cpu_offload_pages``) the worker</span>
 <span class="sd">    offloads decoding requests to admit it, which costs far more than queueing</span>
 <span class="sd">    would. Without them it retries until requests time out. So the cap's requests</span>
 <span class="sd">    at full length must fit each cache next to its sink page; the conductor</span>
-<span class="sd">    queues the rest. Warnings go to the model's ``log``.</span>
+<span class="sd">    queues the rest. Warnings go to the model's ``log``. ``request_layouts``</span>
+<span class="sd">    gives the `Layout` per array and label of the request the deployment is</span>
+<span class="sd">    sized for, with its loops at ``loop_caps``, and a pool it doesn't name</span>
+<span class="sd">    holds one stream of its ``max_seq_len``.</span>
 <span class="sd">    """</span>
-    <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources</span><span class="w"> </span><span class="kn">import</span> <span class="n">KVSpec</span><span class="p">,</span> <span class="n">PagedKVConfig</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.distributed.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">node_group_axis_sizes</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.resources</span><span class="w"> </span><span class="kn">import</span> <span class="n">KVReqConfig</span>
+    <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.state.adapters</span><span class="w"> </span><span class="kn">import</span> <span class="n">kv_layouts</span>
     <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.model.base</span><span class="w"> </span><span class="kn">import</span> <span class="n">serving_resources</span>
 
     <span class="n">cap</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"max_concurrent_requests"</span><span class="p">)</span>
@@ -1874,42 +1886,24 @@ window.runMermaid = runMermaid;</script>
         <span class="n">specs</span> <span class="o">=</span> <span class="n">serving_resources</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">config</span><span class="p">)</span>
     <span class="k">except</span> <span class="ne">ValueError</span><span class="p">:</span>
         <span class="k">return</span>  <span class="c1"># a `resources:` block the validation's resource checks report</span>
+    <span class="c1"># each pool's config as the conductor opens the request, from the rows the data worker sends</span>
+    <span class="n">requests</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">KVReqConfig</span><span class="p">]</span> <span class="o">=</span> <span class="p">{}</span>
+    <span class="k">for</span> <span class="n">key</span><span class="p">,</span> <span class="n">by_label</span> <span class="ow">in</span> <span class="p">(</span><span class="n">kv_layouts</span><span class="p">(</span><span class="n">model</span><span class="o">.</span><span class="n">declare_state</span><span class="p">(),</span> <span class="n">request_layouts</span><span class="p">,</span> <span class="p">{})</span> <span class="k">if</span> <span class="n">request_layouts</span> <span class="k">else</span> <span class="p">{})</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
+        <span class="n">uncapped</span> <span class="o">=</span> <span class="p">{</span><span class="n">loop</span> <span class="k">for</span> <span class="n">layout</span> <span class="ow">in</span> <span class="n">by_label</span><span class="o">.</span><span class="n">values</span><span class="p">()</span> <span class="k">for</span> <span class="n">loop</span><span class="p">,</span> <span class="n">_</span> <span class="ow">in</span> <span class="n">layout</span><span class="o">.</span><span class="n">growth</span><span class="p">}</span> <span class="o">-</span> <span class="p">(</span><span class="n">loop_caps</span> <span class="ow">or</span> <span class="p">{})</span><span class="o">.</span><span class="n">keys</span><span class="p">()</span>
+        <span class="k">if</span> <span class="n">uncapped</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">config_path</span><span class="si">}</span><span class="s2">: request_layouts[</span><span class="si">{</span><span class="n">key</span><span class="si">!r}</span><span class="s2">] grows loops </span><span class="si">{</span><span class="nb">sorted</span><span class="p">(</span><span class="n">uncapped</span><span class="p">)</span><span class="si">}</span><span class="s2">, which loop_caps "</span>
+                             <span class="s2">"doesn't cap"</span><span class="p">)</span>
+        <span class="n">rows</span> <span class="o">=</span> <span class="p">{</span><span class="n">label</span><span class="p">:</span> <span class="n">layout</span><span class="o">.</span><span class="n">row</span><span class="p">()</span> <span class="k">for</span> <span class="n">label</span><span class="p">,</span> <span class="n">layout</span> <span class="ow">in</span> <span class="n">by_label</span><span class="o">.</span><span class="n">items</span><span class="p">()}</span>
+        <span class="n">requests</span><span class="p">[</span><span class="n">key</span><span class="p">]</span> <span class="o">=</span> <span class="n">KVReqConfig</span><span class="p">(</span><span class="n">needed_labels</span><span class="o">=</span><span class="nb">list</span><span class="p">(</span><span class="n">rows</span><span class="p">))</span>
+        <span class="n">requests</span><span class="p">[</span><span class="n">key</span><span class="p">]</span><span class="o">.</span><span class="n">apply_conductor_config</span><span class="p">(</span><span class="n">kv_layout</span><span class="o">=</span><span class="n">rows</span><span class="p">,</span> <span class="n">loop_caps</span><span class="o">=</span><span class="n">loop_caps</span><span class="p">)</span>
+    <span class="n">node_groups</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"node_groups"</span><span class="p">)</span> <span class="ow">or</span> <span class="p">()</span>
     <span class="k">for</span> <span class="n">spec</span> <span class="ow">in</span> <span class="n">specs</span><span class="p">:</span>
-        <span class="c1"># paged caches only: a ring buffer is sized by its window, not by requests</span>
-        <span class="k">if</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">spec</span><span class="p">,</span> <span class="n">KVSpec</span><span class="p">)</span> <span class="ow">or</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="p">,</span> <span class="n">PagedKVConfig</span><span class="p">):</span>
-            <span class="k">continue</span>
-        <span class="n">kv</span> <span class="o">=</span> <span class="n">spec</span><span class="o">.</span><span class="n">config</span>
-        <span class="c1"># in arena pages: a request at full length holds every token of every group, a window's</span>
-        <span class="c1"># too, since a one-step prefill keeps its whole prompt until it commits. A pool placed by</span>
-        <span class="c1"># position over a node group's ranks pages its window groups as `placed_groups` does</span>
-        <span class="n">per_request</span> <span class="o">=</span> <span class="nb">max</span><span class="p">(</span>
-            <span class="nb">sum</span><span class="p">(</span><span class="o">-</span><span class="p">(</span><span class="o">-</span><span class="n">kv</span><span class="o">.</span><span class="n">max_seq_len</span> <span class="o">//</span> <span class="n">group</span><span class="o">.</span><span class="n">page_size</span><span class="p">)</span> <span class="k">for</span> <span class="n">group</span> <span class="ow">in</span> <span class="n">groups</span><span class="p">)</span>
-            <span class="k">for</span> <span class="n">groups</span> <span class="ow">in</span> <span class="p">(</span><span class="n">kv</span><span class="o">.</span><span class="n">groups</span><span class="p">,</span> <span class="o">*</span><span class="n">_placed_groups</span><span class="p">(</span><span class="n">spec</span><span class="p">,</span> <span class="n">config</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"node_groups"</span><span class="p">)</span> <span class="ow">or</span> <span class="p">()))</span>
-        <span class="p">)</span>
-        <span class="n">need</span> <span class="o">=</span> <span class="mi">1</span> <span class="o">+</span> <span class="n">cap</span> <span class="o">*</span> <span class="n">per_request</span>
-        <span class="k">if</span> <span class="n">need</span> <span class="o">&gt;</span> <span class="n">kv</span><span class="o">.</span><span class="n">num_units</span><span class="p">:</span>
-            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
-                <span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">config_path</span><span class="si">}</span><span class="s2">: </span><span class="si">{</span><span class="n">cap</span><span class="si">}</span><span class="s2"> concurrent requests (max_concurrent_requests) "</span>
-                <span class="sa">f</span><span class="s2">"need </span><span class="si">{</span><span class="n">kv</span><span class="o">.</span><span class="n">pages_of</span><span class="p">(</span><span class="n">need</span><span class="p">,</span><span class="w"> </span><span class="n">round_up</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span><span class="si">}</span><span class="s2"> pages of resources.</span><span class="si">{</span><span class="n">spec</span><span class="o">.</span><span class="n">resource_key</span><span class="si">}</span><span class="s2"> "</span>
-                <span class="sa">f</span><span class="s2">"(</span><span class="si">{</span><span class="n">kv</span><span class="o">.</span><span class="n">pages_of</span><span class="p">(</span><span class="n">per_request</span><span class="p">,</span><span class="w"> </span><span class="n">round_up</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span><span class="si">}</span><span class="s2"> per request and the sink page), "</span>
-                <span class="sa">f</span><span class="s2">"which has </span><span class="si">{</span><span class="n">kv</span><span class="o">.</span><span class="n">max_num_pages</span><span class="si">}</span><span class="s2">; raise max_num_pages or lower "</span>
-                <span class="s2">"max_concurrent_requests"</span>
-            <span class="p">)</span></div>
-
-
-
-<span class="k">def</span><span class="w"> </span><span class="nf">_placed_groups</span><span class="p">(</span><span class="n">spec</span><span class="p">,</span> <span class="n">node_groups</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">list</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">"""The groups of ``spec``'s pool placed over each node group of ``node_groups`` it runs on,</span>
-<span class="sd">    where it sets ``context_parallel``; a group it can't place on is validation's to report."""</span>
-    <span class="n">kv</span><span class="p">,</span> <span class="n">placed</span> <span class="o">=</span> <span class="n">spec</span><span class="o">.</span><span class="n">config</span><span class="p">,</span> <span class="p">[]</span>
-    <span class="k">for</span> <span class="n">group</span> <span class="ow">in</span> <span class="n">node_groups</span> <span class="k">if</span> <span class="n">kv</span><span class="o">.</span><span class="n">context_parallel</span> <span class="k">else</span> <span class="p">():</span>
-        <span class="k">if</span> <span class="ow">not</span> <span class="n">spec</span><span class="o">.</span><span class="n">nodes</span> <span class="o">&amp;</span> <span class="nb">set</span><span class="p">(</span><span class="n">group</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"node_names"</span><span class="p">,</span> <span class="p">())):</span>
-            <span class="k">continue</span>
-        <span class="k">try</span><span class="p">:</span>
-            <span class="n">placed</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">kv</span><span class="o">.</span><span class="n">paged_for</span><span class="p">(</span><span class="n">spec</span><span class="o">.</span><span class="n">resource_key</span><span class="p">,</span> <span class="n">group</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"tp_size"</span><span class="p">,</span> <span class="mi">1</span><span class="p">),</span> <span class="n">group</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"sp_size"</span><span class="p">,</span> <span class="mi">1</span><span class="p">))</span><span class="o">.</span><span class="n">groups</span><span class="p">)</span>
-        <span class="k">except</span> <span class="ne">ValueError</span><span class="p">:</span>
-            <span class="k">pass</span>
-    <span class="k">return</span> <span class="n">placed</span>
+        <span class="n">axis_sizes</span> <span class="o">=</span> <span class="p">[</span>
+            <span class="n">node_group_axis_sizes</span><span class="p">(</span><span class="n">group</span><span class="p">)</span> <span class="k">for</span> <span class="n">group</span> <span class="ow">in</span> <span class="n">node_groups</span> <span class="k">if</span> <span class="n">spec</span><span class="o">.</span><span class="n">nodes</span> <span class="o">&amp;</span> <span class="nb">set</span><span class="p">(</span><span class="n">group</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"node_names"</span><span class="p">,</span> <span class="p">()))</span>
+        <span class="p">]</span>
+        <span class="n">problem</span> <span class="o">=</span> <span class="n">spec</span><span class="o">.</span><span class="n">capacity_problem</span><span class="p">(</span><span class="n">cap</span><span class="p">,</span> <span class="n">requests</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">spec</span><span class="o">.</span><span class="n">resource_key</span><span class="p">),</span> <span class="n">axis_sizes</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">problem</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">"</span><span class="si">{</span><span class="n">config_path</span><span class="si">}</span><span class="s2">: </span><span class="si">{</span><span class="n">problem</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span></div>
 
 </pre></div>
 

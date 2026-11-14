@@ -2889,7 +2889,36 @@ window.runMermaid = runMermaid;</script>
     <span class="c1"># Imported here because the adapters load the resources' Triton kernels, which importing mstar.model must not need.</span>
     <span class="kn">from</span><span class="w"> </span><span class="nn">mstar.engine.state.adapters</span><span class="w"> </span><span class="kn">import</span> <span class="n">state_steps</span>
 
-    <span class="k">return</span> <span class="n">state_steps</span><span class="p">(</span><span class="n">step</span><span class="p">,</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">submodule</span><span class="p">,</span> <span class="s2">"state_handles"</span><span class="p">,</span> <span class="p">{}))</span></div>
+    <span class="k">return</span> <span class="n">state_steps</span><span class="p">(</span><span class="n">step</span><span class="p">,</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">submodule</span><span class="p">,</span> <span class="s2">"state_handles"</span><span class="p">,</span> <span class="p">{}),</span> <span class="n">graph_walk</span><span class="o">=</span><span class="n">kwargs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"graph_walk"</span><span class="p">))</span></div>
+
+
+
+<div class="viewcode-block" id="splice_loopback_ids">
+<a class="viewcode-back" href="../../../_autosummary/mstar.model.submodule_base.html#mstar.model.submodule_base.splice_loopback_ids">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">splice_loopback_ids</span><span class="p">(</span><span class="n">ids</span><span class="p">:</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">,</span> <span class="n">inputs</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">ARNodeInputs</span><span class="p">],</span> <span class="n">decode</span><span class="p">:</span> <span class="nb">bool</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""``ids`` (one loop-back token per row) with each row that brought</span>
+<span class="sd">    its own ids taking them instead, in row order: a mixed step's prompt</span>
+<span class="sd">    rows, or a decode row whose last step ran elsewhere. Runs of loop-back</span>
+<span class="sd">    rows go in as one slice each, and the splice is device ops only: an</span>
+<span class="sd">    index built from a host list would be a synchronous copy behind the</span>
+<span class="sd">    step in flight. A decode step keeps the slot's padding rows past</span>
+<span class="sd">    ``inputs``, so its length stays the captured one."""</span>
+    <span class="n">pieces</span><span class="p">:</span> <span class="nb">list</span><span class="p">[</span><span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]</span> <span class="o">=</span> <span class="p">[]</span>
+    <span class="n">run</span> <span class="o">=</span> <span class="kc">None</span>
+    <span class="k">for</span> <span class="n">i</span><span class="p">,</span> <span class="n">inp</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">inputs</span><span class="p">):</span>
+        <span class="k">if</span> <span class="n">inp</span><span class="o">.</span><span class="n">input_ids</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="p">(</span><span class="n">decode</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">inp</span><span class="o">.</span><span class="n">input_seq_len</span><span class="p">):</span>
+            <span class="k">if</span> <span class="n">run</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+                <span class="n">run</span> <span class="o">=</span> <span class="n">i</span>
+            <span class="k">continue</span>
+        <span class="k">if</span> <span class="n">run</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">pieces</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">ids</span><span class="p">[</span><span class="n">run</span><span class="p">:</span><span class="n">i</span><span class="p">])</span>
+            <span class="n">run</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="n">pieces</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">inp</span><span class="o">.</span><span class="n">input_ids</span><span class="o">.</span><span class="n">to</span><span class="p">(</span><span class="n">ids</span><span class="o">.</span><span class="n">dtype</span><span class="p">))</span>
+    <span class="k">if</span> <span class="n">run</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+        <span class="n">pieces</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">ids</span><span class="p">[</span><span class="n">run</span><span class="p">:</span><span class="nb">len</span><span class="p">(</span><span class="n">inputs</span><span class="p">)])</span>
+    <span class="k">if</span> <span class="n">decode</span> <span class="ow">and</span> <span class="n">ids</span><span class="o">.</span><span class="n">shape</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">&gt;</span> <span class="nb">len</span><span class="p">(</span><span class="n">inputs</span><span class="p">):</span>
+        <span class="n">pieces</span><span class="o">.</span><span class="n">append</span><span class="p">(</span><span class="n">ids</span><span class="p">[</span><span class="nb">len</span><span class="p">(</span><span class="n">inputs</span><span class="p">):])</span>
+    <span class="k">return</span> <span class="n">torch</span><span class="o">.</span><span class="n">cat</span><span class="p">(</span><span class="n">pieces</span><span class="p">)</span> <span class="k">if</span> <span class="nb">len</span><span class="p">(</span><span class="n">pieces</span><span class="p">)</span> <span class="o">&gt;</span> <span class="mi">1</span> <span class="k">else</span> <span class="n">pieces</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span></div>
 
 
 

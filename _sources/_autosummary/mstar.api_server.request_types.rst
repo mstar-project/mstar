@@ -28,6 +28,7 @@ mstar.api\_server.request\_types
       ResultChunk
       ResultTensors
       ResultTokens
+      WorkersReady
    
    
 

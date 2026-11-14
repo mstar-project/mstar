@@ -832,6 +832,10 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.request_types.ResultTokens.values"><code class="docutils literal notranslate"><span class="pre">ResultTokens.values</span></code></a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.request_types.WorkersReady"><code class="docutils literal notranslate"><span class="pre">WorkersReady</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.request_types.WorkersReady.declaration_digests"><code class="docutils literal notranslate"><span class="pre">WorkersReady.declaration_digests</span></code></a></li>
+</ul>
+</li>
 </ul>
             </nav>
         </div>
@@ -881,6 +885,9 @@
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.api_server.request_types.ResultTokens" title="mstar.api_server.request_types.ResultTokens"><code class="xref py py-obj docutils literal notranslate"><span class="pre">ResultTokens</span></code></a>(request_ids, values, ...[, ...])</p></td>
 <td><p>One step's client-facing scalars (sampled tokens), every request in one frame.</p></td>
 </tr>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.api_server.request_types.WorkersReady" title="mstar.api_server.request_types.WorkersReady"><code class="xref py py-obj docutils literal notranslate"><span class="pre">WorkersReady</span></code></a>(declaration_digests)</p></td>
+<td><p>The conductor's <code class="docutils literal notranslate"><span class="pre">setup_done</span></code>: every worker is ready, and these are its declarations' digests by name (<cite>declaration_digests</cite>), which the API server checks its own against.</p></td>
+</tr>
 </tbody>
 </table>
 </div>
@@ -893,13 +900,13 @@
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>message_type</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
-<li><p><strong>body</strong> (<a class="reference internal" href="#mstar.api_server.request_types.ResultTensors" title="mstar.api_server.request_types.ResultTensors"><em>ResultTensors</em></a><em> | </em><a class="reference internal" href="#mstar.api_server.request_types.ResultTokens" title="mstar.api_server.request_types.ResultTokens"><em>ResultTokens</em></a><em> | </em><a class="reference internal" href="#mstar.api_server.request_types.RequestComplete" title="mstar.api_server.request_types.RequestComplete"><em>RequestComplete</em></a><em> | </em><a class="reference internal" href="#mstar.api_server.request_types.RequestFailed" title="mstar.api_server.request_types.RequestFailed"><em>RequestFailed</em></a><em> | </em><a class="reference internal" href="#mstar.api_server.request_types.ConductorStatus" title="mstar.api_server.request_types.ConductorStatus"><em>ConductorStatus</em></a><em> | </em><a class="reference internal" href="#mstar.api_server.request_types.LoraAdapterResult" title="mstar.api_server.request_types.LoraAdapterResult"><em>LoraAdapterResult</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>body</strong> (<a class="reference internal" href="#mstar.api_server.request_types.ResultTensors" title="mstar.api_server.request_types.ResultTensors"><em>ResultTensors</em></a><em> | </em><a class="reference internal" href="#mstar.api_server.request_types.ResultTokens" title="mstar.api_server.request_types.ResultTokens"><em>ResultTokens</em></a><em> | </em><a class="reference internal" href="#mstar.api_server.request_types.RequestComplete" title="mstar.api_server.request_types.RequestComplete"><em>RequestComplete</em></a><em> | </em><a class="reference internal" href="#mstar.api_server.request_types.RequestFailed" title="mstar.api_server.request_types.RequestFailed"><em>RequestFailed</em></a><em> | </em><a class="reference internal" href="#mstar.api_server.request_types.ConductorStatus" title="mstar.api_server.request_types.ConductorStatus"><em>ConductorStatus</em></a><em> | </em><a class="reference internal" href="#mstar.api_server.request_types.LoraAdapterResult" title="mstar.api_server.request_types.LoraAdapterResult"><em>LoraAdapterResult</em></a><em> | </em><a class="reference internal" href="#mstar.api_server.request_types.WorkersReady" title="mstar.api_server.request_types.WorkersReady"><em>WorkersReady</em></a><em> | </em><em>None</em>)</p></li>
 </ul>
 </dd>
 </dl>
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.api_server.request_types.APIServerMessage.body">
-<span class="sig-name descname"><span class="pre">body</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference internal" href="#mstar.api_server.request_types.ResultTensors" title="mstar.api_server.request_types.ResultTensors"><span class="pre">ResultTensors</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference internal" href="#mstar.api_server.request_types.ResultTokens" title="mstar.api_server.request_types.ResultTokens"><span class="pre">ResultTokens</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference internal" href="#mstar.api_server.request_types.RequestComplete" title="mstar.api_server.request_types.RequestComplete"><span class="pre">RequestComplete</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference internal" href="#mstar.api_server.request_types.RequestFailed" title="mstar.api_server.request_types.RequestFailed"><span class="pre">RequestFailed</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference internal" href="#mstar.api_server.request_types.ConductorStatus" title="mstar.api_server.request_types.ConductorStatus"><span class="pre">ConductorStatus</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference internal" href="#mstar.api_server.request_types.LoraAdapterResult" title="mstar.api_server.request_types.LoraAdapterResult"><span class="pre">LoraAdapterResult</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.api_server.request_types.APIServerMessage.body" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">body</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference internal" href="#mstar.api_server.request_types.ResultTensors" title="mstar.api_server.request_types.ResultTensors"><span class="pre">ResultTensors</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference internal" href="#mstar.api_server.request_types.ResultTokens" title="mstar.api_server.request_types.ResultTokens"><span class="pre">ResultTokens</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference internal" href="#mstar.api_server.request_types.RequestComplete" title="mstar.api_server.request_types.RequestComplete"><span class="pre">RequestComplete</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference internal" href="#mstar.api_server.request_types.RequestFailed" title="mstar.api_server.request_types.RequestFailed"><span class="pre">RequestFailed</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference internal" href="#mstar.api_server.request_types.ConductorStatus" title="mstar.api_server.request_types.ConductorStatus"><span class="pre">ConductorStatus</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference internal" href="#mstar.api_server.request_types.LoraAdapterResult" title="mstar.api_server.request_types.LoraAdapterResult"><span class="pre">LoraAdapterResult</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference internal" href="#mstar.api_server.request_types.WorkersReady" title="mstar.api_server.request_types.WorkersReady"><span class="pre">WorkersReady</span></a><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/constants.html#None" title="(in Python v3.12)"><span class="pre">None</span></a></span><span class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">None</span></span><a class="headerlink" href="#mstar.api_server.request_types.APIServerMessage.body" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
@@ -1434,6 +1441,24 @@ the worker already holds on the host: no transport tensor, no ack.</p>
 
 </dd></dl>
 
+<dl class="py class">
+<dt class="sig sig-object py" id="mstar.api_server.request_types.WorkersReady">
+<span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.api_server.request_types.</span></span><span class="sig-name descname"><span class="pre">WorkersReady</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">declaration_digests</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/api_server/request_types.html#WorkersReady"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.api_server.request_types.WorkersReady" title="Link to this definition">#</a></dt>
+<dd><p>Bases: <a class="reference external" href="https://docs.python.org/3.12/library/functions.html#object" title="(in Python v3.12)"><code class="xref py py-class docutils literal notranslate"><span class="pre">object</span></code></a></p>
+<p>The conductor’s <code class="docutils literal notranslate"><span class="pre">setup_done</span></code>: every worker is ready, and these are its declarations’ digests by name
+(<cite>declaration_digests</cite>), which the API server checks its own against.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>declaration_digests</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>]</em>)</p>
+</dd>
+</dl>
+<dl class="py attribute">
+<dt class="sig sig-object py" id="mstar.api_server.request_types.WorkersReady.declaration_digests">
+<span class="sig-name descname"><span class="pre">declaration_digests</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><span class="pre">dict</span></a><span class="p"><span class="pre">[</span></span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">,</span></span><span class="w"> </span><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><span class="pre">str</span></a><span class="p"><span class="pre">]</span></span></span><a class="headerlink" href="#mstar.api_server.request_types.WorkersReady.declaration_digests" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
+</dd></dl>
+
 </section>
 
 
@@ -1580,6 +1605,10 @@ the worker already holds on the host: no transport tensor, no ack.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.request_types.ResultTokens.request_ids"><code class="docutils literal notranslate"><span class="pre">ResultTokens.request_ids</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.request_types.ResultTokens.signal"><code class="docutils literal notranslate"><span class="pre">ResultTokens.signal</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.request_types.ResultTokens.values"><code class="docutils literal notranslate"><span class="pre">ResultTokens.values</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.request_types.WorkersReady"><code class="docutils literal notranslate"><span class="pre">WorkersReady</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.api_server.request_types.WorkersReady.declaration_digests"><code class="docutils literal notranslate"><span class="pre">WorkersReady.declaration_digests</span></code></a></li>
 </ul>
 </li>
 </ul>

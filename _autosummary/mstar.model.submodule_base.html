@@ -972,6 +972,7 @@
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.chunk_loop_name"><code class="docutils literal notranslate"><span class="pre">chunk_loop_name()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.chunk_tick_name"><code class="docutils literal notranslate"><span class="pre">chunk_tick_name()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.engine_step"><code class="docutils literal notranslate"><span class="pre">engine_step()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.splice_loopback_ids"><code class="docutils literal notranslate"><span class="pre">splice_loopback_ids()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.with_segment_steps"><code class="docutils literal notranslate"><span class="pre">with_segment_steps()</span></code></a></li>
 </ul>
             </nav>
@@ -998,7 +999,10 @@
 <tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.submodule_base.engine_step" title="mstar.model.submodule_base.engine_step"><code class="xref py py-obj docutils literal notranslate"><span class="pre">engine_step</span></code></a>(submodule, *args, **kwargs)</p></td>
 <td><p>What the engine calls for a node's step: its <code class="docutils literal notranslate"><span class="pre">declare_step</span></code>, with a step of its segments under each resource that takes them as they are (<code class="docutils literal notranslate"><span class="pre">with_segment_steps</span></code>), so a model declares nothing for such a resource (a LoRA pool), and what it declares about its state expanded (<code class="docutils literal notranslate"><span class="pre">state_steps</span></code>).</p></td>
 </tr>
-<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.submodule_base.with_segment_steps" title="mstar.model.submodule_base.with_segment_steps"><code class="xref py py-obj docutils literal notranslate"><span class="pre">with_segment_steps</span></code></a>(step, keys)</p></td>
+<tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.submodule_base.splice_loopback_ids" title="mstar.model.submodule_base.splice_loopback_ids"><code class="xref py py-obj docutils literal notranslate"><span class="pre">splice_loopback_ids</span></code></a>(ids, inputs, decode)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">ids</span></code> (one loop-back token per row) with each row that brought its own ids taking them instead, in row order: a mixed step's prompt rows, or a decode row whose last step ran elsewhere.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.submodule_base.with_segment_steps" title="mstar.model.submodule_base.with_segment_steps"><code class="xref py py-obj docutils literal notranslate"><span class="pre">with_segment_steps</span></code></a>(step, keys)</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">step</span></code> with a <code class="docutils literal notranslate"><span class="pre">ResourceStep</span></code> of its segments under each of <code class="docutils literal notranslate"><span class="pre">keys</span></code> (the resources whose step is the segments, <code class="docutils literal notranslate"><span class="pre">Resource.steps_from_segments</span></code>) that it does not declare itself, as a new step carrying its <code class="docutils literal notranslate"><span class="pre">combined_labels</span></code> (a declaration reused across calls keeps its own).</p></td>
 </tr>
 </tbody>
@@ -3524,6 +3528,30 @@ about its state expanded (<code class="docutils literal notranslate"><span class
 </dd></dl>
 
 <dl class="py function">
+<dt class="sig sig-object py" id="mstar.model.submodule_base.splice_loopback_ids">
+<span class="sig-prename descclassname"><span class="pre">mstar.model.submodule_base.</span></span><span class="sig-name descname"><span class="pre">splice_loopback_ids</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">ids</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">inputs</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">decode</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#splice_loopback_ids"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.splice_loopback_ids" title="Link to this definition">#</a></dt>
+<dd><p><code class="docutils literal notranslate"><span class="pre">ids</span></code> (one loop-back token per row) with each row that brought
+its own ids taking them instead, in row order: a mixed step’s prompt
+rows, or a decode row whose last step ran elsewhere. Runs of loop-back
+rows go in as one slice each, and the splice is device ops only: an
+index built from a host list would be a synchronous copy behind the
+step in flight. A decode step keeps the slot’s padding rows past
+<code class="docutils literal notranslate"><span class="pre">inputs</span></code>, so its length stays the captured one.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>ids</strong> (<a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a>)</p></li>
+<li><p><strong>inputs</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#list" title="(in Python v3.12)"><em>list</em></a><em>[</em><a class="reference internal" href="#mstar.model.submodule_base.ARNodeInputs" title="mstar.model.submodule_base.ARNodeInputs"><em>ARNodeInputs</em></a><em>]</em>)</p></li>
+<li><p><strong>decode</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)"><em>bool</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.pytorch.org/docs/stable/tensors.html#torch.Tensor" title="(in PyTorch v2.15)"><em>Tensor</em></a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py function">
 <dt class="sig sig-object py" id="mstar.model.submodule_base.with_segment_steps">
 <span class="sig-prename descclassname"><span class="pre">mstar.model.submodule_base.</span></span><span class="sig-name descname"><span class="pre">with_segment_steps</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">step</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">keys</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/submodule_base.html#with_segment_steps"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.submodule_base.with_segment_steps" title="Link to this definition">#</a></dt>
 <dd><p><code class="docutils literal notranslate"><span class="pre">step</span></code> with a <code class="docutils literal notranslate"><span class="pre">ResourceStep</span></code> of its segments under each of <code class="docutils literal notranslate"><span class="pre">keys</span></code> (the
@@ -3832,6 +3860,7 @@ refuses for want of a plan (<code class="docutils literal notranslate"><span cla
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.chunk_loop_name"><code class="docutils literal notranslate"><span class="pre">chunk_loop_name()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.chunk_tick_name"><code class="docutils literal notranslate"><span class="pre">chunk_tick_name()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.engine_step"><code class="docutils literal notranslate"><span class="pre">engine_step()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.splice_loopback_ids"><code class="docutils literal notranslate"><span class="pre">splice_loopback_ids()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.model.submodule_base.with_segment_steps"><code class="docutils literal notranslate"><span class="pre">with_segment_steps()</span></code></a></li>
 </ul>
   </nav></div>

@@ -1300,6 +1300,17 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="kc">None</span></div>
 
 
+<div class="viewcode-block" id="NodeResourceSpec.capacity_problem">
+<a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.spec.html#mstar.engine.resources.NodeResourceSpec.capacity_problem">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">capacity_problem</span><span class="p">(</span>
+        <span class="bp">self</span><span class="p">,</span> <span class="n">requests</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">request</span><span class="p">:</span> <span class="s2">"ResourceReqConfig | None"</span><span class="p">,</span> <span class="n">axis_sizes</span><span class="p">:</span> <span class="n">Sequence</span><span class="p">[</span><span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">]]</span> <span class="o">=</span> <span class="p">(),</span>
+    <span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Why this resource can't hold ``requests`` requests at once, each opened with ``request``, or None.</span>
+<span class="sd">        ``axis_sizes`` holds the size on every mesh axis of each node group that runs its nodes. None by default: a</span>
+<span class="sd">        resource that requests don't size holds any number."""</span>
+        <span class="k">return</span> <span class="kc">None</span></div>
+
+
 <div class="viewcode-block" id="NodeResourceSpec.prefix_variant">
 <a class="viewcode-back" href="../../../../_autosummary/mstar.engine.resources.spec.html#mstar.engine.resources.NodeResourceSpec.prefix_variant">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">prefix_variant</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">model_kwargs</span><span class="p">:</span> <span class="nb">dict</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bytes</span> <span class="o">|</span> <span class="kc">None</span><span class="p">:</span>

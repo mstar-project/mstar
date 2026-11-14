@@ -825,8 +825,8 @@
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.utils.capture_ladder" title="mstar.model.utils.capture_ladder"><code class="xref py py-obj docutils literal notranslate"><span class="pre">capture_ladder</span></code></a>(key, value)</p></td>
 <td><p>A capture ladder (token buckets or batch sizes) from model_kwargs: a 0, negative or repeated entry would go into the capture build, and an empty one would quietly mean the default.</p></td>
 </tr>
-<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.utils.check_kv_pools_fit" title="mstar.model.utils.check_kv_pools_fit"><code class="xref py py-obj docutils literal notranslate"><span class="pre">check_kv_pools_fit</span></code></a>(model, config, ...)</p></td>
-<td><p>Refuse a <code class="docutils literal notranslate"><span class="pre">max_concurrent_requests</span></code> the model's KV caches cannot hold.</p></td>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.model.utils.check_kv_pools_fit" title="mstar.model.utils.check_kv_pools_fit"><code class="xref py py-obj docutils literal notranslate"><span class="pre">check_kv_pools_fit</span></code></a>(model, config, ...[, ...])</p></td>
+<td><p>Refuse a <code class="docutils literal notranslate"><span class="pre">max_concurrent_requests</span></code> a resource the model builds cannot hold, as its spec's <cite>capacity_problem</cite> answers: the first problem raises.</p></td>
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.model.utils.check_loaded" title="mstar.model.utils.check_loaded"><code class="xref py py-obj docutils literal notranslate"><span class="pre">check_loaded</span></code></a>(module, loaded, what)</p></td>
 <td><p>Raise unless <code class="docutils literal notranslate"><span class="pre">loaded</span></code> names every parameter of <code class="docutils literal notranslate"><span class="pre">module</span></code>: one built on <code class="docutils literal notranslate"><span class="pre">meta</span></code> and filled by a loader would otherwise serve uninitialized memory.</p></td>
@@ -1283,20 +1283,26 @@ default.</p>
 
 <dl class="py function">
 <dt class="sig sig-object py" id="mstar.model.utils.check_kv_pools_fit">
-<span class="sig-prename descclassname"><span class="pre">mstar.model.utils.</span></span><span class="sig-name descname"><span class="pre">check_kv_pools_fit</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">model</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">config</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">config_path</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">log</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/utils.html#check_kv_pools_fit"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.utils.check_kv_pools_fit" title="Link to this definition">#</a></dt>
-<dd><p>Refuse a <code class="docutils literal notranslate"><span class="pre">max_concurrent_requests</span></code> the model’s KV caches cannot hold.</p>
+<span class="sig-prename descclassname"><span class="pre">mstar.model.utils.</span></span><span class="sig-name descname"><span class="pre">check_kv_pools_fit</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">model</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">config</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">config_path</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">log</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">request_layouts</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">loop_caps</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/model/utils.html#check_kv_pools_fit"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.model.utils.check_kv_pools_fit" title="Link to this definition">#</a></dt>
+<dd><p>Refuse a <code class="docutils literal notranslate"><span class="pre">max_concurrent_requests</span></code> a resource the model builds cannot hold, as its
+spec’s <cite>capacity_problem</cite> answers: the first problem raises.</p>
 <p>A request keeps its pages from prefill to its last token. Past a pool, a
 prefill batch is refused. With host pages (<code class="docutils literal notranslate"><span class="pre">cpu_offload_pages</span></code>) the worker
 offloads decoding requests to admit it, which costs far more than queueing
 would. Without them it retries until requests time out. So the cap’s requests
 at full length must fit each cache next to its sink page; the conductor
-queues the rest. Warnings go to the model’s <code class="docutils literal notranslate"><span class="pre">log</span></code>.</p>
+queues the rest. Warnings go to the model’s <code class="docutils literal notranslate"><span class="pre">log</span></code>. <code class="docutils literal notranslate"><span class="pre">request_layouts</span></code>
+gives the <cite>Layout</cite> per array and label of the request the deployment is
+sized for, with its loops at <code class="docutils literal notranslate"><span class="pre">loop_caps</span></code>, and a pool it doesn’t name
+holds one stream of its <code class="docutils literal notranslate"><span class="pre">max_seq_len</span></code>.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
 <li><p><strong>config</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#dict" title="(in Python v3.12)"><em>dict</em></a>)</p></li>
 <li><p><strong>config_path</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
 <li><p><strong>log</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/logging.html#logging.Logger" title="(in Python v3.12)"><em>Logger</em></a>)</p></li>
+<li><p><strong>request_layouts</strong> (<em>Mapping</em><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><em>Mapping</em><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><em>Layout</em><em>]</em><em>] </em><em>| </em><em>None</em>)</p></li>
+<li><p><strong>loop_caps</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Mapping" title="(in Python v3.12)"><em>Mapping</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>] </em><em>| </em><em>None</em>)</p></li>
 </ul>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>

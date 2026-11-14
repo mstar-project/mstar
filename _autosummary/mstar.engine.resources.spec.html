@@ -741,6 +741,7 @@
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.NodeResourceSpec"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.NodeResourceSpec.apply_yaml_overrides"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.apply_yaml_overrides()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.NodeResourceSpec.capacity_problem"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.capacity_problem()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.NodeResourceSpec.combined_splits"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.combined_splits()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.NodeResourceSpec.depends_on"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.depends_on()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.NodeResourceSpec.derive"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.derive()</span></code></a></li>
@@ -940,6 +941,26 @@ subclasses name exactly what they accept and let the rest raise.</p>
 config’s) dataclass fields would remove these per-resource
 implementations, at the cost of silently accepting anything named
 alike.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.spec.NodeResourceSpec.capacity_problem">
+<span class="sig-name descname"><span class="pre">capacity_problem</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">requests</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">request</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">axis_sizes</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">()</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/spec.html#NodeResourceSpec.capacity_problem"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.spec.NodeResourceSpec.capacity_problem" title="Link to this definition">#</a></dt>
+<dd><p>Why this resource can’t hold <code class="docutils literal notranslate"><span class="pre">requests</span></code> requests at once, each opened with <code class="docutils literal notranslate"><span class="pre">request</span></code>, or None.
+<code class="docutils literal notranslate"><span class="pre">axis_sizes</span></code> holds the size on every mesh axis of each node group that runs its nodes. None by default: a
+resource that requests don’t size holds any number.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>requests</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>request</strong> (<a class="reference internal" href="#mstar.engine.resources.spec.ResourceReqConfig" title="mstar.engine.resources.spec.ResourceReqConfig"><em>ResourceReqConfig</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>axis_sizes</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Sequence" title="(in Python v3.12)"><em>Sequence</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Mapping" title="(in Python v3.12)"><em>Mapping</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em><em>]</em>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a> | None</p>
+</dd>
+</dl>
 </dd></dl>
 
 <dl class="py method">
@@ -1543,6 +1564,7 @@ takes from the others (<cite>NodeResourceSpec.derive</cite>).</p>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.NodeResourceSpec"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.NodeResourceSpec.apply_yaml_overrides"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.apply_yaml_overrides()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.NodeResourceSpec.capacity_problem"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.capacity_problem()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.NodeResourceSpec.combined_splits"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.combined_splits()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.NodeResourceSpec.depends_on"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.depends_on()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.spec.NodeResourceSpec.derive"><code class="docutils literal notranslate"><span class="pre">NodeResourceSpec.derive()</span></code></a></li>
