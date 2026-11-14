@@ -742,11 +742,11 @@ class Praxis1Model(Model):
                 ),
             })},
             EXPERT_QUERIES: {EXPERT_QUERIES: Layout(expert_self={
-                ATTN_READS[EXPERT_QUERIES]: ExpertSelfLayout(k),
+                ATTN_READS[EXPERT_QUERIES]: ExpertSelfLayout(num_chunks=k),
             })},
             EXPERT_TRUNK_KEYS: {EXPERT_TRUNK_KEYS: Layout(expert_cross={
                 ATTN_READS[EXPERT_TRUNK_KEYS]: ExpertCrossLayout(
-                    k, global_len=g + text, clean_frames=depth * f, noised_frames=k * f),
+                    num_chunks=k, global_len=g + text, clean_frames=depth * f, noised_frames=k * f),
             })},
         }
         metadata["state_layout"] = layout

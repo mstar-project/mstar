@@ -35,7 +35,8 @@ def test_declared_expert_reads_match_reference(chunks: int, clean: int) -> None:
     c, f, g, t, window = 2, 1, 2, 1, 2
     noised = chunks * c
     q_len, kv_len = chunks * (1 + f + c), g + clean + noised
-    q_mask, kv_mask = ExpertSelf(c, f), ExpertCross(c, f, t, window)
+    q_mask = ExpertSelf(c, future_per_chunk=f)
+    kv_mask = ExpertCross(c, future_per_chunk=f, tokens_per_frame=t, window_frames=window)
     arrays = [
         Array(
             "expert_q", nodes={"expert"}, labels={"q"}, layers={0},
@@ -95,8 +96,10 @@ def test_declared_expert_reads_match_reference(chunks: int, clean: int) -> None:
     qi, ki = torch.arange(q_len)[:, None], torch.arange(kv_len)[None, :]
     cross = cross_mod(None, None, qi, ki)
     same = self_mod(None, None, qi, torch.arange(q_len)[None, :])
-    assert torch.equal(cross, cross_visibility(kv_mask, ExpertCrossLayout(chunks, g, clean, noised)))
-    assert torch.equal(same, self_visibility(q_mask, ExpertSelfLayout(chunks)))
+    assert torch.equal(cross, cross_visibility(
+        kv_mask, ExpertCrossLayout(num_chunks=chunks, global_len=g, clean_frames=clean, noised_frames=noised),
+    ))
+    assert torch.equal(same, self_visibility(q_mask, ExpertSelfLayout(num_chunks=chunks)))
 
     def sdpa(keys, vals, visibility):
         return F.scaled_dot_product_attention(
@@ -116,13 +119,14 @@ def test_capture_padding_has_no_request_layout_and_uses_zero_chunk_sentinel(
         Array(
             "expert_q", nodes={"expert"}, labels={"q"}, layers={0},
             entry=KVEntry(heads=2, head_dim=32), max_len=0,
-            reads={"self_attn": Read(mask=ExpertSelf(2, 1), op=Attend(q_heads=2))},
+            reads={"self_attn": Read(mask=ExpertSelf(2, future_per_chunk=1), op=Attend(q_heads=2))},
         ),
         Array(
             "trunk_kv", nodes={"expert"}, labels={"kv"}, layers={0},
             entry=KVEntry(heads=2, head_dim=32), max_len=0,
             reads={"cross_attn": Read(
-                mask=ExpertCross(2, 1, 1, 2), op=Attend(q_heads=2), queries="expert_q",
+                mask=ExpertCross(2, future_per_chunk=1, tokens_per_frame=1, window_frames=2),
+                op=Attend(q_heads=2), queries="expert_q",
             )},
         ),
     ]
@@ -153,13 +157,14 @@ def test_two_request_cross_plan_keeps_labels_and_lengths_separate() -> None:
     query = Array(
         "expert_q", nodes={"expert"}, labels={"q"}, layers={0},
         entry=KVEntry(heads=2, head_dim=32), max_len=0,
-        reads={"self_attn": Read(mask=ExpertSelf(2, 1), op=Attend(q_heads=2))},
+        reads={"self_attn": Read(mask=ExpertSelf(2, future_per_chunk=1), op=Attend(q_heads=2))},
     )
     keys = Array(
         "trunk_kv", nodes={"expert"}, labels={"kv"}, layers={0},
         entry=KVEntry(heads=2, head_dim=32), max_len=0,
         reads={"cross_attn": Read(
-            mask=ExpertCross(2, 1, 1, 2), op=Attend(q_heads=2), queries="expert_q",
+            mask=ExpertCross(2, future_per_chunk=1, tokens_per_frame=1, window_frames=2),
+            op=Attend(q_heads=2), queries="expert_q",
         )},
     )
     arrays = [query, keys]
@@ -191,7 +196,13 @@ def test_two_request_cross_plan_keeps_labels_and_lengths_separate() -> None:
     assert planned.steps["cross_attn"].pairs == (("q", "kv"),)
     cross = _dense(resources["cross_attn"]._wrapper("q<-kv").block_mask, 12, 12)
     want = torch.block_diag(*(
-        cross_visibility(ExpertCross(2, 1, 1, 2), ExpertCrossLayout(*values))
+        cross_visibility(
+            ExpertCross(2, future_per_chunk=1, tokens_per_frame=1, window_frames=2),
+            ExpertCrossLayout(
+                num_chunks=values[0], global_len=values[1],
+                clean_frames=values[2], noised_frames=values[3],
+            ),
+        )
         for values in layouts.values()
     ))
     assert torch.equal(cross, want)
@@ -201,7 +212,7 @@ def test_missing_expert_layout_is_refused() -> None:
     array = Array(
         "expert_q", nodes={"expert"}, labels={"q"}, layers={0},
         entry=KVEntry(heads=2, head_dim=32), max_len=0,
-        reads={"self_attn": Read(mask=ExpertSelf(2, 1), op=Attend(q_heads=2))},
+        reads={"self_attn": Read(mask=ExpertSelf(2, future_per_chunk=1), op=Attend(q_heads=2))},
     )
     handles = node_handles(
         SimpleNamespace(declare_state=lambda: [array]), "expert",
@@ -221,14 +232,15 @@ def test_piecewise_expert_mask_refuses_without_request_layout_transport(cross: b
         "expert_q", nodes={"expert"}, labels={"q"}, layers={0},
         entry=KVEntry(heads=2, head_dim=32), max_len=0,
         reads={"self_attn": Read(
-            mask=Block() if cross else ExpertSelf(2, 1), op=Attend(q_heads=2),
+            mask=Block() if cross else ExpertSelf(2, future_per_chunk=1), op=Attend(q_heads=2),
         )},
     )
     keys = Array(
         "trunk_kv", nodes={"expert"}, labels={"kv"}, layers={0},
         entry=KVEntry(heads=2, head_dim=32), max_len=0,
         reads={"cross_attn": Read(
-            mask=ExpertCross(2, 1, 1, 2), op=Attend(q_heads=2), queries="expert_q",
+            mask=ExpertCross(2, future_per_chunk=1, tokens_per_frame=1, window_frames=2),
+            op=Attend(q_heads=2), queries="expert_q",
         )},
     )
     array = keys if cross else query

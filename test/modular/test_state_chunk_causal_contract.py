@@ -96,6 +96,8 @@ def test_ordinary_attend_binding_selects_chunk_resource():
 def test_request_layout_checks_read_key_before_dropping_within_step_kv_layout():
     array = _array()
     assert kv_layouts([array], {"tokens": {"main": Layout(chunk_causal={"attn": _lengths()})}}, {}) == {}
+    with pytest.raises(RuntimeError, match="chunk_causal is missing reads \\['attn'\\]"):
+        kv_layouts([array], {"tokens": {"main": Layout()}}, {})
     with pytest.raises(RuntimeError, match="names no ChunkCausal read"):
         kv_layouts([array], {"tokens": {"main": Layout(chunk_causal={"other": _lengths()})}}, {})
     with pytest.raises(RuntimeError, match="must be a ChunkCausalLayout"):

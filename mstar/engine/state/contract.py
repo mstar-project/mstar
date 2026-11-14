@@ -179,6 +179,7 @@ class ExpertCross(Mask):
     sees_step_whole = True
 
     chunk_len: int
+    _: KW_ONLY
     future_per_chunk: int
     tokens_per_frame: int
     window_frames: int
@@ -200,6 +201,7 @@ class ExpertSelf(Mask):
     sees_step_whole = True
 
     chunk_len: int
+    _: KW_ONLY
     future_per_chunk: int
 
     def __post_init__(self):
@@ -208,7 +210,7 @@ class ExpertSelf(Mask):
                 raise ValueError(f"ExpertSelf.{name} must be a positive int")
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class ExpertCrossLayout:
     """Per-request expert cross row geometry; frame counts are latent frames."""
 
@@ -226,7 +228,7 @@ class ExpertCrossLayout:
                 raise ValueError(f"ExpertCrossLayout.{name} must be an int >= 0")
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class ExpertSelfLayout:
     """Per-request expert self row geometry."""
 

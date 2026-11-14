@@ -58,9 +58,10 @@ def test_planned_block_mask_matches_oracle(mode: str, layouts) -> None:
                 for q, (_, g, clean, n) in zip(q_spans, layouts, strict=True)]
     actual = _dense(wrapper.block_mask, sum(q_spans), sum(kv_spans))
     expected = torch.block_diag(*(
-        self_visibility(ExpertSelfMask(2, 1), ExpertSelfLayout(k))
+        self_visibility(ExpertSelfMask(2, future_per_chunk=1), ExpertSelfLayout(num_chunks=k))
         if mode == "self" else cross_visibility(
-            ExpertCrossMask(2, 1, 1, 2), ExpertCrossLayout(k, g, clean, n),
+            ExpertCrossMask(2, future_per_chunk=1, tokens_per_frame=1, window_frames=2),
+            ExpertCrossLayout(num_chunks=k, global_len=g, clean_frames=clean, noised_frames=n),
         ) for k, g, clean, n in layouts
     ))
     assert torch.equal(actual, expected)
@@ -77,7 +78,10 @@ def test_graph_mode_padding_and_replan_do_not_expose_other_request() -> None:
     wrapper.plan(first)
     assert torch.equal(
         _dense(wrapper.block_mask, 32, 32)[:8, :8],
-        cross_visibility(ExpertCrossMask(2, 1, 1, 2), ExpertCrossLayout(2, 2, 2, 4)),
+        cross_visibility(
+            ExpertCrossMask(2, future_per_chunk=1, tokens_per_frame=1, window_frames=2),
+            ExpertCrossLayout(num_chunks=2, global_len=2, clean_frames=2, noised_frames=4),
+        ),
     )
     wrapper.plan(second)
     dense = _dense(wrapper.block_mask, 32, 32)
@@ -100,7 +104,10 @@ def test_capture_dummy_segment_is_isolated_from_real_queries() -> None:
     wrapper.plan(((1, 2, 0, 2), (0, 4, 5, 0)))
     dense = _dense(wrapper.block_mask, 8, 9)
     assert torch.equal(
-        dense[:4, :4], cross_visibility(ExpertCrossMask(2, 1, 1, 2), ExpertCrossLayout(1, 2, 0, 2)),
+        dense[:4, :4], cross_visibility(
+            ExpertCrossMask(2, future_per_chunk=1, tokens_per_frame=1, window_frames=2),
+            ExpertCrossLayout(num_chunks=1, global_len=2, clean_frames=0, noised_frames=2),
+        ),
     )
     assert not dense[:4, 4:].any()
 

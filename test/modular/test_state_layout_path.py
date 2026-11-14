@@ -25,16 +25,22 @@ from mstar.engine.state import (
     Causal,
     ChunkCausal,
     ChunkCausalLayout,
+    Entry,
+    ExpertSelf,
+    ExpertSelfLayout,
     KVEntry,
     Layout,
     Read,
     Sampler,
     SampleSettings,
+    Size,
     Span,
+    TensorType,
+    Value,
 )
-from mstar.engine.state.adapters import CHUNK_CAUSAL_LAYOUT_KWARG
+from mstar.engine.state.adapters import CHUNK_CAUSAL_LAYOUT_KWARG, EXPERT_LAYOUT_KWARG
 from mstar.graph.base import GraphNode
-from mstar.model.base import LabelLayout, ProcessPromptOutput
+from mstar.model.base import KVLabel, LabelLayout, ProcessPromptOutput
 
 _SPAN = Span("ids", "prefill", len(PROMPT), len(PROMPT), "text_inputs")
 _ARRAY = Array("kv", nodes={"LLM"}, layers={0}, entry=KVEntry(heads=1, head_dim=8), max_len=4096,
@@ -103,6 +109,31 @@ class _ChunkDeclaring(_Declaring):
         return output
 
 
+class _CombinedDeclaring(_ChunkDeclaring):
+    def kv_labels(self):
+        # A step-written Value cannot be restored by a KV prefix hit.
+        return {"kv": {"main": KVLabel()}}
+
+    def declare_state(self):
+        return [*super().declare_state(),
+                Array(
+                    "expert", nodes={"LLM"}, layers={0}, entry=KVEntry(heads=1, head_dim=8), max_len=0,
+                    reads={"expert_attn": Read(mask=ExpertSelf(2, future_per_chunk=1), op=Attend(q_heads=1))},
+                ),
+                Value(
+                    "sized", nodes={"LLM"}, layers={0},
+                    entry=Entry({"buf": TensorType((Size("n"),), dtype=torch.float32)}), largest={"n": 4},
+                )]
+
+    def process_prompt(self, *args, **kwargs):
+        output = super().process_prompt(*args, **kwargs)
+        output.metadata["state_layout"]["expert"] = {
+            "main": Layout(expert_self={"expert_attn": ExpertSelfLayout(num_chunks=2)})
+        }
+        output.metadata["state_layout"]["sized"] = {"main": Layout(sizes={"n": 2})}
+        return output
+
+
 @pytest.mark.parametrize("keyed, extra", [(None, {}), (0, {"keyed_spans": {"kv": {"main": 0}}})],
                          ids=["every_span_keyed", "no_keyed_spans"])
 def test_a_declared_layout_gives_the_keys_and_rows_of_a_hand_written_one(keyed, extra):
@@ -131,13 +162,51 @@ def test_chunk_lengths_cross_the_data_worker_as_wire_safe_rows():
     assert "state_layout" not in kwargs
 
 
+def test_expert_chunk_and_sized_layouts_cross_the_data_worker_together():
+    model = _CombinedDeclaring()
+    planted = {
+        CHUNK_CAUSAL_LAYOUT_KWARG: {"chunk": {"main": "client"}},
+        EXPERT_LAYOUT_KWARG: {"expert": {"main": "client"}},
+        "state_sizes": {"sized": {"main": "client"}},
+    }
+    kwargs = _run(_worker(model, _deployment()), planted)
+    assert not planted.keys() & model.handed.keys()
+    assert kwargs[CHUNK_CAUSAL_LAYOUT_KWARG] == {"chunk": {"main": {"chunk_attn": [4, 16, 8]}}}
+    assert kwargs[EXPERT_LAYOUT_KWARG] == {"expert": {"main": {"expert_attn": [2]}}}
+    assert kwargs["state_sizes"] == {"sized": {"main": {"n": 2}}}
+
+
+def test_missing_expert_layout_fails_at_data_worker_intake():
+    class MissingExpert(_CombinedDeclaring):
+        def process_prompt(self, *args, **kwargs):
+            output = super().process_prompt(*args, **kwargs)
+            output.metadata["state_layout"]["expert"]["main"] = Layout()
+            return output
+
+    with pytest.raises(RuntimeError, match="expert_self is missing reads"):
+        _run(_worker(MissingExpert(), _deployment()))
+
+
+def test_missing_chunk_lengths_fail_at_data_worker_intake():
+    class MissingChunk(_ChunkDeclaring):
+        def process_prompt(self, *args, **kwargs):
+            output = super().process_prompt(*args, **kwargs)
+            output.metadata["state_layout"]["chunk"]["main"] = Layout()
+            return output
+
+    with pytest.raises(RuntimeError, match="chunk_causal is missing reads \\['chunk_attn'\\]"):
+        _run(_worker(MissingChunk(), _deployment()))
+
+
 def test_a_prompt_with_no_keyed_spans_keys_no_page():
     kwargs = _run(_worker(_Declaring({"keyed_spans": {"kv": {"main": 0}}}), _deployment()))
     assert kwargs["kv_layout"]["kv"]["main"][4] == 0
     assert not (kwargs.get("prefix_keys") or {}).get("kv", {}).get("main"), "a vision prompt keys nothing"
 
 
-@pytest.mark.parametrize("name", ["state_layout", "keyed_spans", "state_sizes"])
+@pytest.mark.parametrize("name", [
+    "state_layout", "keyed_spans", "state_sizes", EXPERT_LAYOUT_KWARG, CHUNK_CAUSAL_LAYOUT_KWARG,
+])
 def test_a_client_cannot_plant_a_layout_key(name):
     model = _Declaring()
     kwargs = _run(_worker(model, _deployment()), {name: {"kv": {"main": 99}}})

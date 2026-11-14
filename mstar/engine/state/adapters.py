@@ -640,14 +640,19 @@ class WithinStepSteps(StepBuilder):
         if isinstance(read.mask, ExpertSelf):
             if not isinstance(lengths, (list, tuple)) or len(lengths) != 1:
                 raise ValueError(f"Array {array.name!r}: invalid expert self lengths")
-            layout = ExpertSelfLayout(lengths[0])
+            layout = ExpertSelfLayout(num_chunks=lengths[0])
             result = (layout.num_chunks, 0, 0, layout.num_chunks * read.mask.chunk_len)
             span = layout.num_chunks * (1 + read.mask.future_per_chunk + read.mask.chunk_len)
         else:
             if not isinstance(lengths, (list, tuple)) or len(lengths) != 4:
                 raise ValueError(f"Array {array.name!r}: invalid expert cross lengths")
-            layout = ExpertCrossLayout(*lengths)
-            _check_expert_layout(array, segment.label, Layout(expert_cross={next(iter(array.reads)): layout}))
+            layout = ExpertCrossLayout(
+                num_chunks=lengths[0], global_len=lengths[1],
+                clean_frames=lengths[2], noised_frames=lengths[3],
+            )
+            _check_expert_layout(
+                array, segment.label, Layout(expert_cross={next(iter(array.reads)): layout}), require_all=False,
+            )
             result = (layout.num_chunks, layout.global_len, layout.clean_frames, layout.noised_frames)
             span = layout.global_len + (layout.clean_frames + layout.noised_frames) * read.mask.tokens_per_frame
         if span != segment.span:
@@ -770,9 +775,12 @@ def checked_step_mask_layouts(
                 if not isinstance(lengths, (list, tuple)):
                     raise RuntimeError(f"{where} must be a list of lengths")
                 if expert and read is not None and isinstance(read.mask, ExpertCross) and len(lengths) == 4:
-                    cross[key] = ExpertCrossLayout(*lengths)
+                    cross[key] = ExpertCrossLayout(
+                        num_chunks=lengths[0], global_len=lengths[1],
+                        clean_frames=lengths[2], noised_frames=lengths[3],
+                    )
                 elif expert and read is not None and isinstance(read.mask, ExpertSelf) and len(lengths) == 1:
-                    self_attn[key] = ExpertSelfLayout(*lengths)
+                    self_attn[key] = ExpertSelfLayout(num_chunks=lengths[0])
                 elif not expert and read is not None and isinstance(read.mask, ChunkCausal) and len(lengths) == 3:
                     chunk[key] = ChunkCausalLayout(
                         global_len=lengths[0], noised_len=lengths[1], clean_len=lengths[2],
@@ -786,7 +794,7 @@ def checked_step_mask_layouts(
     return expert_layouts(declarations, typed) if expert else chunk_causal_layouts(declarations, typed)
 
 
-def _check_expert_layout(array: Array, label: str, layout: Layout) -> None:
+def _check_expert_layout(array: Array, label: str, layout: Layout, *, require_all: bool = True) -> None:
     from mstar.engine.resources.attn.ragged.expert_mask import noised_frame_offset
 
     if not isinstance(layout, Layout):
@@ -810,6 +818,13 @@ def _check_expert_layout(array: Array, label: str, layout: Layout) -> None:
                     noised_frame_offset(lengths.noised_frames, lengths.clean_frames, mask.chunk_len)
                 except ValueError as exc:
                     raise RuntimeError(f"{where}: {exc}") from exc
+    if require_all:
+        for field, kind in (("expert_cross", ExpertCross), ("expert_self", ExpertSelf)):
+            required = {key for key, read in array.reads.items() if isinstance(read.mask, kind)}
+            if missing := required - getattr(layout, field).keys():
+                raise RuntimeError(
+                    f"state_layout[{array.name!r}][{label!r}].{field} is missing reads {sorted(missing)}"
+                )
 
 
 def kv_layouts(
@@ -862,6 +877,11 @@ def _check_chunk_causal_layout(array: Array, label: str, layout: Layout) -> None
                 f"state_layout[{array.name!r}][{label!r}].chunk_causal[{key!r}] "
                 f"must be a ChunkCausalLayout, got {lengths!r}"
             )
+    required = {key for key, read in array.reads.items() if isinstance(read.mask, ChunkCausal)}
+    if missing := required - layout.chunk_causal.keys():
+        raise RuntimeError(
+            f"state_layout[{array.name!r}][{label!r}].chunk_causal is missing reads {sorted(missing)}"
+        )
 
 
 def sampling_configs(

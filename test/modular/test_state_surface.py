@@ -20,11 +20,8 @@ from mstar.engine import state
 from mstar.engine.state.adapters import PagedArrayHandle, RingHandle, ValueHandle, WithinStepHandle
 from mstar.engine.state.calls import ArrayHandle
 
-# The public expert masks/layouts and tuple records take multiple positional fields.
-_POSITIONAL = {
-    "ExpertCross", "ExpertCrossLayout", "ExpertSelf", "ExpertSelfLayout",
-    "PagedNHDTarget", "Segment", "SlotLease", "Span",
-}
+# Today's types the surface re-exports, and a NamedTuple, whose fields stay positional.
+_POSITIONAL = {"PagedNHDTarget", "Segment", "SlotLease", "Span"}
 # The calls take the handle first, then what every call names, and only then keywords.
 _CALLS = {
     "add_read", "at_last_token", "causal_conv", "gated_delta_net", "gather", "host", "last_sampled", "position",
@@ -82,23 +79,23 @@ SNAPSHOT = {
     ],
     "ExpertCross": [
         ["chunk_len", "POSITIONAL_OR_KEYWORD", None],
-        ["future_per_chunk", "POSITIONAL_OR_KEYWORD", None],
-        ["tokens_per_frame", "POSITIONAL_OR_KEYWORD", None],
-        ["window_frames", "POSITIONAL_OR_KEYWORD", None],
-        ["include_noised", "POSITIONAL_OR_KEYWORD", 'True'],
+        ["future_per_chunk", "KEYWORD_ONLY", None],
+        ["tokens_per_frame", "KEYWORD_ONLY", None],
+        ["window_frames", "KEYWORD_ONLY", None],
+        ["include_noised", "KEYWORD_ONLY", 'True'],
     ],
     "ExpertCrossLayout": [
-        ["num_chunks", "POSITIONAL_OR_KEYWORD", None],
-        ["global_len", "POSITIONAL_OR_KEYWORD", None],
-        ["clean_frames", "POSITIONAL_OR_KEYWORD", None],
-        ["noised_frames", "POSITIONAL_OR_KEYWORD", None],
+        ["num_chunks", "KEYWORD_ONLY", None],
+        ["global_len", "KEYWORD_ONLY", None],
+        ["clean_frames", "KEYWORD_ONLY", None],
+        ["noised_frames", "KEYWORD_ONLY", None],
     ],
     "ExpertSelf": [
         ["chunk_len", "POSITIONAL_OR_KEYWORD", None],
-        ["future_per_chunk", "POSITIONAL_OR_KEYWORD", None],
+        ["future_per_chunk", "KEYWORD_ONLY", None],
     ],
     "ExpertSelfLayout": [
-        ["num_chunks", "POSITIONAL_OR_KEYWORD", None],
+        ["num_chunks", "KEYWORD_ONLY", None],
     ],
     "Fork": [
         ["src", "KEYWORD_ONLY", None],
