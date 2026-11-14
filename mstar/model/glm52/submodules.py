@@ -4,7 +4,7 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import Mapping
-from typing import Any
+from typing import Any, NamedTuple
 
 import torch
 from torch import nn
@@ -48,6 +48,17 @@ _MAIN = "main"
 _VERDICT_DEADLINE_S = 300.0
 # the MTP seed's one layer
 _SEED = 0
+
+
+class _Count(NamedTuple):
+    """A request's row of the count edge under MTP, which the prefill starts and each verify step moves on."""
+
+    emitted: int
+    # the last token emitted, or -1 from the prefill, whose token is the forward's own output
+    last: int
+    # `_budget` and the sampler's ignore_eos, read once at the prefill
+    budget: int
+    ignore_eos: int
 
 
 class _PackedPrefillConfig(PackedAcceleratorGraphConfig):
@@ -285,8 +296,10 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
                 )
             if graph_walk == "decode":
                 # one id in, the last emitted token: the step verifies it and k drafts
+                count = _Count(*inputs["count"][0].tolist())
                 return ARNodeInputs(
-                    input_ids=text_inputs, input_seq_len=self.mtp_block, kwargs={"count": int(inputs["count"][0])},
+                    input_ids=text_inputs, input_seq_len=self.mtp_block,
+                    kwargs={"emitted": count.emitted, "budget": count.budget, "ignore_eos": count.ignore_eos},
                 )
         return ARNodeInputs(
             input_ids=text_inputs,
@@ -555,35 +568,45 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
         per_request_info: dict[str, CurrentForwardPassInfo],
     ) -> dict[str, dict[str, list[torch.Tensor]]]:
         """A verify step's emitted tokens per request: the accepted drafts and the token after
-        them, cut at max_tokens and at a stop token (always the last element, which check_stop
-        relies on), and the tokens emitted so far, which the prefill starts at one. Waits for the
-        device to stage the verdict; the seed pass is still running."""
+        them, cut at the request's budget and at a stop token (always the last element), and its
+        `_Count` row, which the prefill starts at one token. Waits for the device to stage the
+        verdict; the seed pass is still running."""
         if self.mtp_k == 0 or not request_ids:
             return {}
+        counts: list[int] = []
         if per_request_info[request_ids[0]].graph_walk != "decode":
-            return {rid: {"count": [torch.ones(1, dtype=torch.long)]} for rid in request_ids}
+            for rid in request_ids:
+                info = per_request_info[rid]
+                counts += _Count(1, -1, self._budget(info), info.resource_configs[SAMPLER].ignore_eos)
+            return {rid: {"count": [count]} for rid, count in zip(request_ids, self._count_rows(counts), strict=True)}
         eos_ids = self.config.eos_token_ids
-        out = {}
-        for rid, inp, (target, accepted) in zip(
-            request_ids, inputs, self._read_verdicts(request_ids), strict=True,
-        ):
-            info = per_request_info[rid]
+        tokens, lengths = [], []
+        for inp, (target, accepted) in zip(inputs, self._read_verdicts(request_ids), strict=True):
             self._mtp_stat_steps += 1
             self._mtp_stat_emitted += accepted + 1
             self._mtp_stat_acc_hist[accepted] += 1
-            count = inp.kwargs["count"]
-            emitted = target[: min(accepted + 1, max(self._budget(info) - count, 1))]
-            if not info.resource_configs[SAMPLER].ignore_eos:
+            row = inp.kwargs
+            emitted = target[: min(accepted + 1, max(row["budget"] - row["emitted"], 1))]
+            if not row["ignore_eos"]:
                 for j, token in enumerate(emitted):
                     if token in eos_ids:
                         emitted = emitted[: j + 1]
                         break
-            out[rid] = {
-                "new_token": [torch.tensor(emitted, dtype=torch.long)],
-                "count": [torch.tensor([count + len(emitted)], dtype=torch.long)],
-            }
+            tokens += emitted
+            lengths.append(len(emitted))
+            counts += _Count(row["emitted"] + len(emitted), emitted[-1], row["budget"], row["ignore_eos"])
         self._maybe_log_mtp_acceptance()
-        return out
+        # one tensor a step for the tokens and one for the counts, and a view of each per row
+        tokens = torch.tensor(tokens, dtype=torch.long).split(lengths)
+        return {
+            rid: {"new_token": [new], "count": [count]}
+            for rid, new, count in zip(request_ids, tokens, self._count_rows(counts), strict=True)
+        }
+
+    @staticmethod
+    def _count_rows(counts: list[int]) -> tuple[torch.Tensor, ...]:
+        """The requests' `_Count` rows, flat in ``counts``, as the rows of one tensor."""
+        return torch.tensor(counts, dtype=torch.long).view(-1, len(_Count._fields)).unbind(0)
 
     _MTP_STAT_LOG_EVERY = 512  # request-steps between acceptance log lines
 
@@ -631,12 +654,12 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
     ) -> set[str]:
         if not self.mtp_k:
             return super().check_stop(request_id, request_info, outputs)
-        if "new_token" not in outputs:
+        if "count" not in outputs:
             return set()
+        count = _Count(*outputs["count"][0].tolist())
         # in-step truncation leaves a stop id only as the LAST element
-        last = outputs["new_token"][0].reshape(-1).tolist()[-1]
-        emitted = outputs["count"][0].item()
-        if emitted >= self._budget(request_info) or self._token_stops(request_id, last, request_info):
+        last = count.last if count.last >= 0 else outputs["new_token"][0].reshape(-1).tolist()[-1]
+        if count.emitted >= count.budget or self._token_stops(request_id, last, request_info):
             return self._stop_names(request_info)
         return set()
 
