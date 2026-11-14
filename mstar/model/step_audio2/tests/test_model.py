@@ -15,6 +15,7 @@ import torch
 import yaml
 
 from mstar.conductor.request_info import FINAL_PREFILL
+from mstar.engine.state.adapters import node_resources
 from mstar.model.components.qwen3_lm import Qwen3LMConfig
 from mstar.model.step_audio2.config import (
     AUDIO_ATTN,
@@ -260,10 +261,10 @@ def test_a_prefill_tracks_its_prompt_for_the_penalty_and_a_decode_does_not():
     ids = torch.tensor([5, 6, 7])
     step = llm.declare_step(PREFILL_TEXT, ["a"], [ARNodeInputs(input_ids=ids, input_seq_len=3)])
     assert [s.span for s in step.segments] == [3]
-    assert step.steps[LLM_SAMPLER].prefill_tracked_tokens["a"] is ids
-    assert LLM_KV in step.steps
+    assert step.state[LLM_SAMPLER].prompt_tokens["a"] is ids
+    assert LLM_KV in step.state
     step = llm.declare_step(DECODE_SPOKEN, ["a", "b"], [ARNodeInputs(input_seq_len=1)] * 2)
-    assert [s.span for s in step.segments] == [1, 1] and not step.steps[LLM_SAMPLER].prefill_tracked_tokens
+    assert [s.span for s in step.segments] == [1, 1] and not step.state[LLM_SAMPLER].prompt_tokens
 
 
 def test_an_audio_prefill_refuses_tower_rows_that_miss_its_placeholders():
@@ -539,7 +540,7 @@ def test_an_audio_with_no_window_of_rows_is_served_as_its_empty_run(tmp_path):
     assert AUDIO_MELS not in alone.new_input_tensors and AUDIO_MEL_FRAMES not in alone.metadata
     ids = alone.new_input_tensors["text_inputs"][0].tolist()
     assert ids[ids.index(AUDIO_START) + 1] == AUDIO_END
-    (layout,) = alone.metadata["kv_layout"].values()
+    (layout,) = alone.metadata["state_layout"].values()
     assert layout["main"].spans[0].walk == PREFILL_TEXT
     # and the plan follows what was sent: no mels, the text prefill
     from mstar.model.step_audio2.step_audio2_model import MAIN
@@ -581,7 +582,7 @@ def test_a_prompts_kv_layout_is_its_rows_then_a_row_per_decode_step(tmp_path):
     model = a_model(tmp_path)
     out = model.process_prompt("hello", ["text"], ["text"])
     (ids,) = out.new_input_tensors["text_inputs"]
-    layout = out.metadata["kv_layout"][LLM_KV]["main"]
+    layout = out.metadata["state_layout"][LLM_KV]["main"]
     assert [(s.walk, s.length) for s in layout.spans] == [(PREFILL_TEXT, ids.numel())]
     assert layout.growth == ((DECODE_LOOP, 1),)
     assert set(model.kv_labels()[LLM_KV]["main"].growth) == {(DECODE, DECODE_LOOP), (DECODE_SPOKEN, DECODE_LOOP)}
@@ -597,7 +598,7 @@ def test_the_serving_config_places_every_node_once_and_sizes_the_vocoders_slots_
     bad = {**config, "resources": {**config["resources"], "t2w_dit_kv": {"max_slots": 3}}}
     with pytest.raises(ValueError, match="one more than"):
         model.validate_config_yaml(bad, str(path))
-    keys = {spec.resource_key for spec in model.get_node_resources()}
+    keys = {spec.resource_key for spec in node_resources(model)}
     assert set(config["resources"]) <= keys
 
 
