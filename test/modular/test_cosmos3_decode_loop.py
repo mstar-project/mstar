@@ -14,6 +14,8 @@ from test_streaming_consumer_loop_served import CASES, _Served
 
 pytest.importorskip("diffusers")
 
+from mstar.engine.state import Layout  # noqa: E402
+from mstar.engine.state.adapters import state_sizes  # noqa: E402
 from mstar.graph.base import Loop  # noqa: E402
 from mstar.model.cosmos3 import constants as C  # noqa: E402
 from mstar.model.cosmos3.cosmos3_model import VAE_DECODER_AR_NODE, Cosmos3Model  # noqa: E402
@@ -72,6 +74,16 @@ def test_the_decoder_cache_is_a_sized_value_off_the_loop_s_edges():
         model_path_hf="unused", skip_weight_loading=True, enable_windowed_video=True, windowed_decode_warm_cache=False,
     )
     assert DECODE_CACHE not in {declared.name for declared in cold.declare_state()}
+
+
+def test_a_request_that_decodes_no_window_holds_none_of_the_decoder_cache():
+    """A windowed deployment serves images, whole clips and text too. Their layouts name no decoder cache, so intake
+    gives them no sizes, where a missing size would fail every one of them."""
+    model = Cosmos3Model(model_path_hf="unused", skip_weight_loading=True, enable_windowed_video=True)
+    plain = {C.KV_CACHE: {"main": Layout()}}
+    assert state_sizes(model.declare_state(), plain) == {}
+    windowed = {**plain, DECODE_CACHE: {"main": Layout(sizes={"lat_h": 30, "lat_w": 52})}}
+    assert state_sizes(model.declare_state(), windowed) == {DECODE_CACHE: {"main": {"lat_h": 30, "lat_w": 52}}}
 
 
 def test_a_windowed_request_sizes_its_decoder_cache_and_one_past_the_largest_is_refused():
