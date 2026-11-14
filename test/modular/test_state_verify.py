@@ -9,6 +9,7 @@ its table would leave the pages and the positions apart, and no kernel would not
 
 from __future__ import annotations
 
+import gc
 import sys
 from typing import Any, NamedTuple
 
@@ -317,6 +318,48 @@ def test_the_rewind_hands_each_real_row_its_settled_count():
     )
 
 
+def _left_alive(call) -> int:
+    """The container objects ``call`` leaves alive, by the collector's own count of its youngest generation."""
+    gc.collect()
+    gc.disable()
+    try:
+        before = gc.get_count()[0]
+        call()
+        return gc.get_count()[0] - before
+    finally:
+        gc.enable()
+
+
+def test_a_32_row_verify_step_defers_one_correction():
+    """CPython collects its youngest generation once 700 more containers are alive than at its last collection. A
+    count object per row, held in a dict per row on each of the two resources until the next admit, took a 32-row
+    GLM-5.2 step past 700 on most steps, and every collection ran on the worker's main thread."""
+    kv, positions = _StubKV(), _StubPositions()
+    h = _handle(kv=kv, positions=positions)
+    step = _step(h, spans=(1,) * 32)
+    h.begin_step(step)
+    k = torch.randn(32, HEADS, DIM)
+    for layer in range(LAYERS):
+        h.add(layer, k=k, v=k)
+    settle(h, torch.ones(32, dtype=torch.long))
+    h.check_step(step)
+    alive = _left_alive(lambda: h.commit_step(step))
+    h.end_step(step)
+    assert len(kv.corrections) == 1 and positions.corrections == kv.corrections, (
+        "the two resources each hold a correction of their own"
+    )
+    assert alive < 16, f"the commit left {alive} objects alive, and the step's rows are 32"
+
+
+def test_a_verify_step_takes_one_row_per_request():
+    h = _handle()
+    step = SubmoduleStep(segments=[Segment(1, "main", SPAN), Segment(1, "main", SPAN)],
+                         state={"kv": ArrayStep(verify=True)})
+    step.set_ctx(_ctx(rows=(1,)))
+    with pytest.raises(AssertionError, match="two rows of request 1"):
+        _verify(h, [2, 3], step)
+
+
 def test_two_eager_steps_keep_two_tables():
     kv = _StubKV()
     h = _handle(kv=kv)
@@ -564,6 +607,27 @@ def test_a_victim_s_count_is_applied_before_its_offload_or_drop(_kv):
     assert _stored(_kv, "a") == SPAN, "an offload copies the stream at its settled length"
     _kv.check_drop("b", SPAN + 1)
     assert _stored(_kv, "b") == SPAN + 1, "a drop is checked against the settled length"
+
+
+def test_a_32_row_correction_is_held_with_no_object_per_row(_kv):
+    rope = RopeManager(PositionConfig(kv_cache="kv"), torch.device("cpu"))
+    count = _Count(-1, *(f"r{i}" for i in range(32)))
+    for resource in (_kv, rope):
+        alive = _left_alive(lambda resource=resource: resource.defer_correct_len(count))
+        assert alive < 4, f"holding one step's correction left {alive} objects alive"
+        assert set(resource._deferred.values()) == {count} and len(resource._deferred) == 32
+
+
+def test_one_request_s_count_is_applied_without_the_rest_of_its_step_s(_kv):
+    """A drop check or an offload of one request waits for its own verify step's counts and applies its own."""
+    _grow(_kv, SPAN + 2, SPAN + 2)
+    count = _Count(-2, "a", "b")
+    _kv.defer_correct_len(count)
+    _kv.check_drop("a", SPAN)
+    assert (_stored(_kv, "a"), _stored(_kv, "b")) == (SPAN, SPAN + 2), "the drop check moved a stream it wasn't asked"
+    assert _kv._deferred == {"b": count}
+    _grow(_kv, 1)
+    assert _stored(_kv, "b") == SPAN, "the next admit applies what the step still holds"
 
 
 def _runner_step(*spans, preplan=False) -> SubmoduleStep:
