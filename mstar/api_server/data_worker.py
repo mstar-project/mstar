@@ -1044,7 +1044,7 @@ class PreprocessWorkerThread:
                 else kv_layouts(self._declarations, state_layout, keyed_spans)
             )
             if state_layout is not None:
-                chunk_layout = chunk_causal_layouts(self._declarations, state_layout)
+                chunk_layout = chunk_causal_layouts(self._declarations, state_layout, allow_missing_arrays=True)
                 if chunk_layout:
                     model_kwargs[CHUNK_CAUSAL_LAYOUT_KWARG] = chunk_layout
             if self._sized:
