@@ -1,0 +1,1646 @@
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>Episode state across requests (design, not implemented) &#8212; M* v0.2.1 Documentation</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../_static/styles/theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=90905a2f556bf617f1a9" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="../_static/styles/sphinx-book-theme.css?v=4418a689" />
+    <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
+  
+  <!-- So that users can add custom icons -->
+  <script defer src="../_static/scripts/fontawesome.js?digest=90905a2f556bf617f1a9"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9" />
+
+    <script src="../_static/documentation_options.js?v=c480a563"></script>
+    <script src="../_static/doctools.js?v=fd6eb6e6"></script>
+    <script src="../_static/sphinx_highlight.js?v=6ffebe34"></script>
+    <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../_static/copybutton.js?v=ccdb6887"></script>
+    <script src="../_static/scripts/sphinx-book-theme.js?v=fab101a9"></script>
+    <script type="module">import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11.12.1/dist/mermaid.esm.min.mjs";
+
+
+
+
+
+const initStyles = () => {
+    const defaultStyle = document.createElement('style');
+    defaultStyle.textContent = "pre.mermaid {\n    /* Same as .mermaid-container > pre */\n    display: block;\n    width: 100%;\n}\n\npre.mermaid > svg {\n    /* Same as .mermaid-container > pre > svg */\n    height: 500px;\n    width: 100%;\n    max-width: 100% !important;\n}";
+    document.head.appendChild(defaultStyle);
+
+    const fullscreenStyle = document.createElement('style');
+    fullscreenStyle.textContent = ".mermaid-container {\n    position: relative;\n    display: flex;\n    flex-direction: row;\n    width: 100%;\n}\n\n.mermaid-container > pre {\n    display: block;\n    width: 100%;\n}\n\n.mermaid-container > pre > svg {\n    height: 500px;\n    width: 100%;\n    max-width: 100% !important;\n}\n\n.mermaid-fullscreen-btn {\n    position: absolute;\n    width: 28px;\n    height: 28px;\n    background: rgba(255, 255, 255, 0.95);\n    border: 1px solid rgba(0, 0, 0, 0.3);\n    border-radius: 4px;\n    cursor: pointer;\n    display: flex;\n    align-items: center;\n    justify-content: center;\n    transition: all 0.2s;\n    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.2);\n    font-size: 14px;\n    line-height: 1;\n    padding: 0;\n    color: #333;\n}\n\n.mermaid-fullscreen-btn:hover {\n    opacity: 100% !important;\n    background: rgba(255, 255, 255, 1);\n    box-shadow: 0 3px 10px rgba(0, 0, 0, 0.3);\n    transform: scale(1.1);\n}\n\n.mermaid-fullscreen-btn.dark-theme {\n    background: rgba(50, 50, 50, 0.95);\n    border: 1px solid rgba(255, 255, 255, 0.3);\n    color: #e0e0e0;\n}\n\n.mermaid-fullscreen-btn.dark-theme:hover {\n    background: rgba(60, 60, 60, 1);\n    box-shadow: 0 3px 10px rgba(255, 255, 255, 0.2);\n}\n\n.mermaid-fullscreen-modal {\n    display: none;\n    position: fixed !important;\n    top: 0 !important;\n    left: 0 !important;\n    width: 95vw;\n    height: 100vh;\n    background: rgba(255, 255, 255, 0.98);\n    z-index: 9999;\n    padding: 20px;\n    overflow: auto;\n}\n\n.mermaid-fullscreen-modal.dark-theme {\n    background: rgba(0, 0, 0, 0.98);\n}\n\n.mermaid-fullscreen-modal.active {\n    display: flex;\n    align-items: center;\n    justify-content: center;\n}\n\n.mermaid-container-fullscreen {\n    position: relative;\n    width: 95vw;\n    height: 90vh;\n    max-width: 95vw;\n    max-height: 90vh;\n    background: white;\n    border-radius: 8px;\n    padding: 20px;\n    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.3);\n    overflow: auto;\n    display: flex;\n    align-items: center;\n    justify-content: center;\n}\n\n.mermaid-container-fullscreen.dark-theme {\n    background: #1a1a1a;\n    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.8);\n}\n\n.mermaid-container-fullscreen pre.mermaid {\n    width: 100%;\n    height: 100%;\n    display: flex;\n    align-items: center;\n    justify-content: center;\n}\n\n.mermaid-container-fullscreen .mermaid svg {\n    height: 100% !important;\n    width: 100% !important;\n    cursor: grab;\n}\n\n.mermaid-fullscreen-close {\n    position: fixed !important;\n    top: 20px !important;\n    right: 20px !important;\n    width: 40px;\n    height: 40px;\n    background: rgba(255, 255, 255, 0.95);\n    border: 1px solid rgba(0, 0, 0, 0.2);\n    border-radius: 50%;\n    cursor: pointer;\n    z-index: 10000;\n    display: flex;\n    align-items: center;\n    justify-content: center;\n    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);\n    transition: all 0.2s;\n    font-size: 24px;\n    line-height: 1;\n    color: #333;\n}\n\n.mermaid-fullscreen-close:hover {\n    background: white;\n    box-shadow: 0 6px 16px rgba(0, 0, 0, 0.4);\n    transform: scale(1.1);\n}\n\n.mermaid-fullscreen-close.dark-theme {\n    background: rgba(50, 50, 50, 0.95);\n    border: 1px solid rgba(255, 255, 255, 0.2);\n    color: #e0e0e0;\n}\n\n.mermaid-fullscreen-close.dark-theme:hover {\n    background: rgba(60, 60, 60, 1);\n    box-shadow: 0 6px 16px rgba(255, 255, 255, 0.2);\n}\n\n.mermaid-fullscreen-modal .mermaid-fullscreen-btn {\n    display: none !important;\n}";
+    document.head.appendChild(fullscreenStyle);
+}
+
+// Detect if page has dark background
+const isDarkTheme = () => {
+    // We use a set of heuristics:
+    // 1. Check for common dark mode classes or attributes
+    // 2. Check computed background color brightness
+    if (document.documentElement.classList.contains('dark') ||
+        document.documentElement.getAttribute('data-theme') === 'dark' ||
+        document.body.classList.contains('dark') ||
+        document.body.getAttribute('data-theme') === 'dark') {
+        // console.log("Dark theme detected via class/attribute");
+        return true;
+    }
+    if (document.documentElement.classList.contains('light') ||
+        document.documentElement.getAttribute('data-theme') === 'light' ||
+        document.body.classList.contains('light') ||
+        document.body.getAttribute('data-theme') === 'light') {
+        // console.log("Light theme detected via class/attribute");
+        return false;
+    }
+    if (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) {
+        // console.log("Dark theme detected via prefers-color-scheme");
+        return true;
+    }
+    const bgColor = window.getComputedStyle(document.body).backgroundColor;
+    const match = bgColor.match(/rgb\((\d+),\s*(\d+),\s*(\d+)/);
+    if (match) {
+        const r = parseInt(match[1]);
+        const g = parseInt(match[2]);
+        const b = parseInt(match[3]);
+        const brightness = (r * 299 + g * 587 + b * 114) / 1000;
+        // console.log("Background color brightness:", brightness);
+        return brightness < 128;
+    }
+    // console.log("No dark or light theme detected, defaulting to light theme");
+    return false;
+};
+
+let darkTheme = isDarkTheme();
+let modal = null;
+let modalContent = null;
+let previousScrollOffset = [window.scrollX, window.scrollY];
+let _lazyObserver = null;
+let _renderQueue = Promise.resolve();
+let closeModal = () => {};
+
+document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape' && modal?.classList.contains('active')) {
+        closeModal();
+    }
+});
+
+// Apply d3 zoom to each SVG. Idempotent: an SVG already wrapped is skipped,
+// so this is safe to call both for the initial batch and for diagrams that
+// render lazily once they become visible.
+const addZoomToSvgs = (svgs) => {
+    svgs.each(function() {
+        if (this.getAttribute('data-zoom-applied') === 'true') return;
+        var svg = d3.select(this);
+        svg.html("<g class='wrapper'>" + svg.html() + "</g>");
+        var inner = svg.select("g");
+        var zoom = d3.zoom().on("zoom", function(event) {
+            inner.attr("transform", event.transform);
+        });
+        svg.call(zoom);
+        this.setAttribute('data-zoom-applied', 'true');
+    });
+};
+
+const runMermaid = async (rerun) => {
+    console.log("Running mermaid diagrams, rerun =", rerun);
+    // clear all existing mermaid charts
+    let all_mermaids = document.querySelectorAll(".mermaid");
+
+    if (rerun) {
+        // Disconnect any previous lazy rendering observer
+        if (_lazyObserver) {
+            _lazyObserver.disconnect();
+            _lazyObserver = null;
+        }
+
+        all_mermaids.forEach((el) => {
+            el.removeAttribute('data-mermaid-deferred');
+            el.removeAttribute('data-mermaid-render-failed');
+            if(!el.hasAttribute("data-original-code")) {
+                // store original code
+                // console.log(`Storing original code for first run: `, el.innerHTML);
+                el.setAttribute('data-original-code', el.innerHTML);
+            }
+            if(el.getAttribute("data-processed") === "true") {
+                // remove and restore original
+                el.removeAttribute("data-processed");
+                // console.log(`Restoring original code for re-run: `, el.getAttribute('data-original-code'));
+                el.innerHTML = el.getAttribute('data-original-code');
+            } else {
+                // store original code
+                // console.log(`Storing original code for re-run: `, el.innerHTML);
+                el.setAttribute('data-original-code', el.innerHTML);
+            }
+        });
+
+        // Separate visible and hidden elements. Mermaid's layout engine measures
+        // text dimensions via the DOM, which fails for elements hidden by a parent
+        // (e.g., Reveal.js non-active slides, sphinx-design unopened tabs),
+        // producing broken SVGs. Render visible elements now, defer hidden ones.
+        const visible = [];
+        const hidden = [];
+        all_mermaids.forEach((el) => {
+            // offsetParent is null for display:none ancestors.
+            // getClientRects().length > 0 catches position:fixed elements
+            // (which also have null offsetParent but are still visible).
+            if (el.offsetParent !== null || el.getClientRects().length > 0) {
+                visible.push(el);
+            } else {
+                hidden.push(el);
+                el.setAttribute('data-mermaid-deferred', 'true');
+            }
+        });
+
+        if (visible.length > 0) {
+            try {
+                await mermaid.run({ nodes: visible });
+            } catch (e) {
+                console.error("Mermaid rendering failed:", e);
+            }
+        }
+
+        // Lazily render hidden elements when they become visible.
+        // Uses a promise chain (_renderQueue) to serialize rendering,
+        // since IntersectionObserver may report multiple entries at once
+        // and mermaid.run() is not safe to call concurrently.
+        if (hidden.length > 0) {
+            if (typeof IntersectionObserver === 'undefined') {
+                console.warn("IntersectionObserver not available; hidden mermaid diagrams will not render.");
+            } else {
+                _renderQueue = Promise.resolve();
+                _lazyObserver = new IntersectionObserver((entries) => {
+                    for (const entry of entries) {
+                        if (entry.isIntersecting && entry.target.getAttribute("data-processed") !== "true") {
+                            _lazyObserver.unobserve(entry.target);
+                            const el = entry.target;
+                            _renderQueue = _renderQueue.then(async () => {
+                                try {
+                                    await mermaid.run({ nodes: [el] });
+                                    el.removeAttribute('data-mermaid-deferred');
+                                    // Apply zoom to the now-rendered diagram, matching
+                                    // the decoration visible diagrams receive.
+                                    if (false) {
+                                        addZoomToSvgs(d3.selectAll("").select(function() {
+                                            return this.querySelector("svg");
+                                        }));
+                                    }
+                                } catch (e) {
+                                    console.error("Mermaid deferred rendering failed:", e);
+                                    el.removeAttribute('data-mermaid-deferred');
+                                    el.setAttribute('data-mermaid-render-failed', 'true');
+                                }
+                            });
+                        }
+                    }
+                });
+                hidden.forEach((el) => _lazyObserver.observe(el));
+            }
+        }
+    }
+
+    all_mermaids = document.querySelectorAll(".mermaid");
+    // Exclude deferred (hidden) and render-failed elements from completion checks
+    const mermaids_active = document.querySelectorAll(".mermaid:not([data-mermaid-deferred]):not([data-mermaid-render-failed])");
+    const mermaids_processed = document.querySelectorAll(".mermaid:not([data-mermaid-deferred]):not([data-mermaid-render-failed])[data-processed='true']");
+
+    if (false) {
+        const mermaids_to_add_zoom = 0 === -1 ? mermaids_active.length : 0;
+        if(mermaids_to_add_zoom > 0) {
+            var svgs = d3.selectAll("").select(function() {
+                return this.querySelector("svg");
+            });
+            // Wait until every active (visible) diagram has rendered. Deferred
+            // diagrams are excluded, so a fixed d3_node_count that counts a
+            // hidden diagram no longer loops forever waiting for its SVG.
+            if(mermaids_active.length !== mermaids_processed.length) {
+                setTimeout(() => runMermaid(false), 200);
+                return;
+            }
+            addZoomToSvgs(svgs);
+        }
+    } else if(mermaids_active.length !== mermaids_processed.length) {
+        // Wait for mermaid to process all diagrams
+        setTimeout(() => runMermaid(false), 200);
+        return;
+    }
+
+    // Stop here if not adding fullscreen capability
+    if (!true) return;
+
+    if (modal !== null ) {
+        // Destroy existing modal
+        modal.remove();
+        modal = null;
+        modalContent = null;
+    }
+
+    modal = document.createElement('div');
+    modal.className = 'mermaid-fullscreen-modal' + (darkTheme ? ' dark-theme' : '');
+    modal.setAttribute('role', 'dialog');
+    modal.setAttribute('aria-modal', 'true');
+    modal.setAttribute('aria-label', 'Fullscreen diagram viewer');
+    modal.innerHTML = `
+        <button class="mermaid-fullscreen-close${darkTheme ? ' dark-theme' : ''}" aria-label="Close fullscreen">✕</button>
+        <div class="mermaid-container-fullscreen${darkTheme ? ' dark-theme' : ''}"></div>
+    `;
+    document.body.appendChild(modal);
+
+    modalContent = modal.querySelector('.mermaid-container-fullscreen');
+    const closeBtn = modal.querySelector('.mermaid-fullscreen-close');
+
+    closeModal = () => {
+        modal.classList.remove('active');
+        modalContent.innerHTML = '';
+        document.body.style.overflow = ''
+        window.scrollTo({left: previousScrollOffset[0], top: previousScrollOffset[1], behavior: 'instant'});
+    };
+
+    closeBtn.addEventListener('click', closeModal);
+    modal.addEventListener('click', (e) => {
+        if (e.target === modal) closeModal();
+    });
+    document.querySelectorAll('.mermaid').forEach((mermaidDiv) => {
+        if (mermaidDiv.parentNode.classList.contains('mermaid-container') ||
+            mermaidDiv.closest('.mermaid-fullscreen-modal')) {
+            // Already processed, adjust button class if needed
+            const existingBtn = mermaidDiv.parentNode.querySelector('.mermaid-fullscreen-btn');
+            if (existingBtn) {
+                existingBtn.className = 'mermaid-fullscreen-btn' + (darkTheme ? ' dark-theme' : '');
+            }
+            return;
+        }
+
+        const container = document.createElement('div');
+        container.className = 'mermaid-container';
+        mermaidDiv.parentNode.insertBefore(container, mermaidDiv);
+        container.appendChild(mermaidDiv);
+
+        const fullscreenBtn = document.createElement('button');
+        fullscreenBtn.className = 'mermaid-fullscreen-btn' + (darkTheme ? ' dark-theme' : '');
+        fullscreenBtn.setAttribute('aria-label', 'View diagram in fullscreen');
+        fullscreenBtn.textContent = "\u26f6";
+        fullscreenBtn.style.opacity = "50%";
+
+        // Calculate dynamic position based on diagram's margin and padding
+        const diagramStyle = window.getComputedStyle(mermaidDiv);
+        const marginTop = parseFloat(diagramStyle.marginTop) || 0;
+        const marginRight = parseFloat(diagramStyle.marginRight) || 0;
+        const paddingTop = parseFloat(diagramStyle.paddingTop) || 0;
+        const paddingRight = parseFloat(diagramStyle.paddingRight) || 0;
+        fullscreenBtn.style.top = `${marginTop + paddingTop + 4}px`;
+        fullscreenBtn.style.right = `${marginRight + paddingRight + 4}px`;
+
+        fullscreenBtn.addEventListener('click', () => {
+            previousScrollOffset = [window.scrollX, window.scrollY];
+            const clone = mermaidDiv.cloneNode(true);
+            modalContent.innerHTML = '';
+            modalContent.appendChild(clone);
+
+            const svg = clone.querySelector('svg');
+            if (svg) {
+                svg.removeAttribute('width');
+                svg.removeAttribute('height');
+                svg.style.width = '100%';
+                svg.style.height = 'auto';
+                svg.style.maxWidth = '100%';
+                svg.style.display = 'block';
+
+                if (false) {
+                    setTimeout(() => {
+                        const g = svg.querySelector('g');
+                        if (g) {
+                            var svgD3 = d3.select(svg);
+                            svgD3.html("<g class='wrapper'>" + svgD3.html() + "</g>");
+                            var inner = svgD3.select("g");
+                            var zoom = d3.zoom().on("zoom", function(event) {
+                                inner.attr("transform", event.transform);
+                            });
+                            svgD3.call(zoom);
+                        }
+                    }, 100);
+                }
+            }
+
+            modal.classList.add('active');
+            document.body.style.overflow = 'hidden';
+        });
+        container.appendChild(fullscreenBtn);
+    });
+};
+
+
+
+const load = async () => {
+    initStyles();
+
+
+    await runMermaid(true);
+
+    const reRunIfThemeChanges = async () => {
+        const newDarkTheme = isDarkTheme();
+        if (newDarkTheme !== darkTheme) {
+            darkTheme = newDarkTheme;
+            console.log("Theme change detected, re-running mermaid with", darkTheme ? "dark" : "default", "theme");
+            await mermaid.initialize(
+                {...{"startOnLoad": false},
+                ...{ darkMode: darkTheme, theme: darkTheme ? "dark" : "default" },
+                }
+            );
+            await runMermaid(true);
+        }
+    };
+
+    // Update theme classes when theme changes
+    const themeObserver = new MutationObserver(reRunIfThemeChanges);
+    themeObserver.observe(document.documentElement, {
+        attributes: true,
+        attributeFilter: ['class', 'style', 'data-theme']
+    });
+    themeObserver.observe(document.body, {
+        attributes: true,
+        attributeFilter: ['class', 'style', 'data-theme']
+    });
+};
+
+
+
+
+
+console.log("Initializing mermaid with", darkTheme ? "dark" : "default", "theme");
+mermaid.initialize(
+    {...{"startOnLoad": false},
+    ...{ darkMode: darkTheme, theme: darkTheme ? "dark" : "default" },
+    }
+);
+
+window.addEventListener("load", load);
+window.runMermaid = runMermaid;</script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'design/episode_state';</script>
+    <script>DOCUMENTATION_OPTIONS.search_as_you_type = false;</script>
+    <link rel="index" title="Index" href="../genindex.html" />
+    <link rel="search" title="Search" href="../search.html" />
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="0.2.1" />
+    <meta name="docbuild:last-update" content="Nov 14, 2026"/>
+  
+    
+    <script src="../_static/searchtools.js"></script>
+    <script src="../_static/language_data.js"></script>
+    <script src="../searchindex.js"></script>
+  
+  </head>
+  <body data-default-mode="">
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+  
+  
+  
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search..."
+         aria-label="Search..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header id="pst-header" class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+    <button class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+        
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+    
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../index.html">
+  
+  
+  
+  
+  
+  
+    <p class="title logo__title">M* v0.2.1 Documentation</p>
+  
+</a></div>
+        <div class="sidebar-primary-item">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button></div>
+        <div class="sidebar-primary-item"><nav class="bd-links bd-docs-nav" aria-label="Main">
+    <div class="bd-toc-item navbar-nav active">
+        <p aria-level="2" class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../installation.html">Installation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../quickstart.html">Quickstart</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">User Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../serving.html">Serving</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../metrics.html">Metrics reference</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../clients.html">Using a Server</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../evaluation.html">Evaluation and Benchmarks</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../architecture.html">Architecture</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../models.html">Supported Models</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../asr.html">Speech recognition: Whisper and Qwen3-ASR</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../api.html">API Reference</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../_autosummary/mstar.api_server.html">mstar.api_server</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.api_server.auth.html">mstar.api_server.auth</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.api_server.media_io.html">mstar.api_server.media_io</a></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../_autosummary/mstar.api_server.openai.html">mstar.api_server.openai</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.api_server.openai.protocol.html">mstar.api_server.openai.protocol</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.api_server.openai.realtime_vad.html">mstar.api_server.openai.realtime_vad</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.api_server.openai.serving_chat.html">mstar.api_server.openai.serving_chat</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.api_server.openai.serving_images.html">mstar.api_server.openai.serving_images</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.api_server.openai.serving_realtime.html">mstar.api_server.openai.serving_realtime</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.api_server.openai.serving_speech.html">mstar.api_server.openai.serving_speech</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.api_server.openai.serving_videos.html">mstar.api_server.openai.serving_videos</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.api_server.openai.speech_chunking.html">mstar.api_server.openai.speech_chunking</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.api_server.request_types.html">mstar.api_server.request_types</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.api_server.rust_frontend.html">mstar.api_server.rust_frontend</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.api_server.streaming_response.html">mstar.api_server.streaming_response</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.api_server.ws_frames.html">mstar.api_server.ws_frames</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../_autosummary/mstar.communication.html">mstar.communication</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.communication.arena.html">mstar.communication.arena</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.communication.codec.html">mstar.communication.codec</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.communication.communicator.html">mstar.communication.communicator</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.communication.edge_items.html">mstar.communication.edge_items</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.communication.event.html">mstar.communication.event</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.communication.rust_communicator.html">mstar.communication.rust_communicator</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.communication.tensor_store.html">mstar.communication.tensor_store</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.communication.tensor_uuid.html">mstar.communication.tensor_uuid</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.communication.tensors.html">mstar.communication.tensors</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.communication.wire.html">mstar.communication.wire</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../_autosummary/mstar.conductor.html">mstar.conductor</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.conductor.lora_ops.html">mstar.conductor.lora_ops</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.conductor.mps.html">mstar.conductor.mps</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.conductor.request_info.html">mstar.conductor.request_info</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.conductor.workers.html">mstar.conductor.workers</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../_autosummary/mstar.engine.html">mstar.engine</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.engine.accelerator_graph_backend.html">mstar.engine.accelerator_graph_backend</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.engine.chunking.html">mstar.engine.chunking</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.engine.fp32_precision.html">mstar.engine.fp32_precision</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.engine.node_dtype.html">mstar.engine.node_dtype</a></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../_autosummary/mstar.engine.resources.html">mstar.engine.resources</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.engine.resources.admission.html">mstar.engine.resources.admission</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.engine.resources.attn.html">mstar.engine.resources.attn</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.engine.resources.base.html">mstar.engine.resources.base</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.engine.resources.context_parallel.html">mstar.engine.resources.context_parallel</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.engine.resources.dsa.html">mstar.engine.resources.dsa</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.engine.resources.kv.html">mstar.engine.resources.kv</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.engine.resources.lora.html">mstar.engine.resources.lora</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.engine.resources.position.html">mstar.engine.resources.position</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.engine.resources.resident_hooks.html">mstar.engine.resources.resident_hooks</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.engine.resources.rms_norm.html">mstar.engine.resources.rms_norm</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.engine.resources.runner.html">mstar.engine.resources.runner</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.engine.resources.sampler.html">mstar.engine.resources.sampler</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.engine.resources.sequence_shard.html">mstar.engine.resources.sequence_shard</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.engine.resources.spec.html">mstar.engine.resources.spec</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.engine.resources.step.html">mstar.engine.resources.step</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.engine.windowing.html">mstar.engine.windowing</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../_autosummary/mstar.graph.html">mstar.graph</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.graph.base.html">mstar.graph.base</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.graph.graph_io.html">mstar.graph.graph_io</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.graph.loop_indices.html">mstar.graph.loop_indices</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.graph.special_destinations.html">mstar.graph.special_destinations</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../_autosummary/mstar.model.html">mstar.model</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.model.audio_watermark.html">mstar.model.audio_watermark</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.model.canary.html">mstar.model.canary</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.model.canary_qwen.html">mstar.model.canary_qwen</a></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../_autosummary/mstar.model.chatterbox.html">mstar.model.chatterbox</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.chatterbox.config.html">mstar.model.chatterbox.config</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../_autosummary/mstar.model.command_a_plus.html">mstar.model.command_a_plus</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.command_a_plus.assets.html">mstar.model.command_a_plus.assets</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.command_a_plus.components.html">mstar.model.command_a_plus.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.command_a_plus.config.html">mstar.model.command_a_plus.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.command_a_plus.tests.html">mstar.model.command_a_plus.tests</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../_autosummary/mstar.model.cosmos3.html">mstar.model.cosmos3</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.cosmos3.components.html">mstar.model.cosmos3.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.cosmos3.config.html">mstar.model.cosmos3.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.cosmos3.constants.html">mstar.model.cosmos3.constants</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.cosmos3.loader.html">mstar.model.cosmos3.loader</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.cosmos3.sessions.html">mstar.model.cosmos3.sessions</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.cosmos3.tests.html">mstar.model.cosmos3.tests</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../_autosummary/mstar.model.cosyvoice3.html">mstar.model.cosyvoice3</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.cosyvoice3.components.html">mstar.model.cosyvoice3.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.cosyvoice3.config.html">mstar.model.cosyvoice3.config</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../_autosummary/mstar.model.flux2_klein.html">mstar.model.flux2_klein</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.flux2_klein.components.html">mstar.model.flux2_klein.components</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../_autosummary/mstar.model.glm52.html">mstar.model.glm52</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.glm52.components.html">mstar.model.glm52.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.glm52.config.html">mstar.model.glm52.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.glm52.weight_loader.html">mstar.model.glm52.weight_loader</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../_autosummary/mstar.model.glm5_next.html">mstar.model.glm5_next</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.glm5_next.components.html">mstar.model.glm5_next.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.glm5_next.config.html">mstar.model.glm5_next.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.glm5_next.fused_decode.html">mstar.model.glm5_next.fused_decode</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.glm5_next.mhc.html">mstar.model.glm5_next.mhc</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.glm5_next.sinkhorn_kernel.html">mstar.model.glm5_next.sinkhorn_kernel</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.glm5_next.weight_loader.html">mstar.model.glm5_next.weight_loader</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../_autosummary/mstar.model.higgs_audio.html">mstar.model.higgs_audio</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.higgs_audio.components.html">mstar.model.higgs_audio.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.higgs_audio.config.html">mstar.model.higgs_audio.config</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.model.keys.html">mstar.model.keys</a></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../_autosummary/mstar.model.kokoro.html">mstar.model.kokoro</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.kokoro.config.html">mstar.model.kokoro.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.kokoro.g2p.html">mstar.model.kokoro.g2p</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.kokoro.voices.html">mstar.model.kokoro.voices</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../_autosummary/mstar.model.lingbot_world.html">mstar.model.lingbot_world</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.lingbot_world.components.html">mstar.model.lingbot_world.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.lingbot_world.config.html">mstar.model.lingbot_world.config</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../_autosummary/mstar.model.ltx2_5.html">mstar.model.ltx2_5</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.ltx2_5.components.html">mstar.model.ltx2_5.components</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.model.media_limits.html">mstar.model.media_limits</a></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../_autosummary/mstar.model.minicpm_o.html">mstar.model.minicpm_o</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.minicpm_o.components.html">mstar.model.minicpm_o.components</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../_autosummary/mstar.model.minimax_h3.html">mstar.model.minimax_h3</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.minimax_h3.components.html">mstar.model.minimax_h3.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.minimax_h3.tests.html">mstar.model.minimax_h3.tests</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.model.multimodal.html">mstar.model.multimodal</a></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../_autosummary/mstar.model.muse.html">mstar.model.muse</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.muse.components.html">mstar.model.muse.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.muse.config.html">mstar.model.muse.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.muse.processing.html">mstar.model.muse.processing</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../_autosummary/mstar.model.nemotron_duplex.html">mstar.model.nemotron_duplex</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.nemotron_duplex.components.html">mstar.model.nemotron_duplex.components</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../_autosummary/mstar.model.omnilingual_asr.html">mstar.model.omnilingual_asr</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.omnilingual_asr.audio.html">mstar.model.omnilingual_asr.audio</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.omnilingual_asr.components.html">mstar.model.omnilingual_asr.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.omnilingual_asr.config.html">mstar.model.omnilingual_asr.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.omnilingual_asr.tokenizer.html">mstar.model.omnilingual_asr.tokenizer</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.omnilingual_asr.weight_loader.html">mstar.model.omnilingual_asr.weight_loader</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../_autosummary/mstar.model.omnivoice.html">mstar.model.omnivoice</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.omnivoice.components.html">mstar.model.omnivoice.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.omnivoice.config.html">mstar.model.omnivoice.config</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../_autosummary/mstar.model.orpheus.html">mstar.model.orpheus</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.orpheus.components.html">mstar.model.orpheus.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.orpheus.config.html">mstar.model.orpheus.config</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.model.parakeet.html">mstar.model.parakeet</a></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../_autosummary/mstar.model.phi4mm.html">mstar.model.phi4mm</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.phi4mm.components.html">mstar.model.phi4mm.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.phi4mm.config.html">mstar.model.phi4mm.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.phi4mm.tests.html">mstar.model.phi4mm.tests</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../_autosummary/mstar.model.pi05.html">mstar.model.pi05</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.pi05.components.html">mstar.model.pi05.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.pi05.config.html">mstar.model.pi05.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.pi05.kernels.html">mstar.model.pi05.kernels</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../_autosummary/mstar.model.qwen3_5.html">mstar.model.qwen3_5</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.qwen3_5.components.html">mstar.model.qwen3_5.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.qwen3_5.video.html">mstar.model.qwen3_5.video</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../_autosummary/mstar.model.qwen3_asr.html">mstar.model.qwen3_asr</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.qwen3_asr.constants.html">mstar.model.qwen3_asr.constants</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.qwen3_asr.repetition.html">mstar.model.qwen3_asr.repetition</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.model.rebuild.html">mstar.model.rebuild</a></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../_autosummary/mstar.model.ripple.html">mstar.model.ripple</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.ripple.config.html">mstar.model.ripple.config</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.model.submodule_base.html">mstar.model.submodule_base</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.model.utils.html">mstar.model.utils</a></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../_autosummary/mstar.model.vjepa2.html">mstar.model.vjepa2</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.vjepa2.components.html">mstar.model.vjepa2.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.vjepa2.config.html">mstar.model.vjepa2.config</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../_autosummary/mstar.model.voxcpm2.html">mstar.model.voxcpm2</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.voxcpm2.components.html">mstar.model.voxcpm2.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.voxcpm2.config.html">mstar.model.voxcpm2.config</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../_autosummary/mstar.model.wan22.html">mstar.model.wan22</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.wan22.config.html">mstar.model.wan22.config</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../_autosummary/mstar.model.waypoint.html">mstar.model.waypoint</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.waypoint.checkpoint.html">mstar.model.waypoint.checkpoint</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.waypoint.components.html">mstar.model.waypoint.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.waypoint.config.html">mstar.model.waypoint.config</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.waypoint.ring_geometry.html">mstar.model.waypoint.ring_geometry</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../_autosummary/mstar.model.whisper.html">mstar.model.whisper</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.whisper.components.html">mstar.model.whisper.components</a></li>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.whisper.config.html">mstar.model.whisper.config</a></li>
+</ul>
+</details></li>
+<li class="toctree-l3 has-children"><a class="reference internal" href="../_autosummary/mstar.model.z_image.html">mstar.model.z_image</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l4"><a class="reference internal" href="../_autosummary/mstar.model.z_image.components.html">mstar.model.z_image.components</a></li>
+</ul>
+</details></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../_autosummary/mstar.observability.html">mstar.observability</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.observability.catalog.html">mstar.observability.catalog</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.observability.metrics.html">mstar.observability.metrics</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.observability.recorders.html">mstar.observability.recorders</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../_autosummary/mstar.streaming.html">mstar.streaming</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.streaming.chunk_policy.html">mstar.streaming.chunk_policy</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.streaming.stream_buffer.html">mstar.streaming.stream_buffer</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.streaming.topology.html">mstar.streaming.topology</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../_autosummary/mstar.utils.html">mstar.utils</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.utils.adarms_norm.html">mstar.utils.adarms_norm</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.utils.cache_home.html">mstar.utils.cache_home</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.utils.client_errors.html">mstar.utils.client_errors</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.utils.containers.html">mstar.utils.containers</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.utils.cpus.html">mstar.utils.cpus</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.utils.device.html">mstar.utils.device</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.utils.exitcode.html">mstar.utils.exitcode</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.utils.fast_tokenize.html">mstar.utils.fast_tokenize</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.utils.fp8_block.html">mstar.utils.fp8_block</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.utils.gc_freeze.html">mstar.utils.gc_freeze</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.utils.generation_kwargs.html">mstar.utils.generation_kwargs</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.utils.h2d.html">mstar.utils.h2d</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.utils.hf_snapshot.html">mstar.utils.hf_snapshot</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.utils.host_copy.html">mstar.utils.host_copy</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.utils.ipc_format.html">mstar.utils.ipc_format</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.utils.knobs.html">mstar.utils.knobs</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.utils.logging_config.html">mstar.utils.logging_config</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.utils.mla_latent_norm.html">mstar.utils.mla_latent_norm</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.utils.orphan.html">mstar.utils.orphan</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.utils.profiler.html">mstar.utils.profiler</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.utils.socket_prefix.html">mstar.utils.socket_prefix</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.utils.streams.html">mstar.utils.streams</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.utils.threads.html">mstar.utils.threads</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.utils.utf8_stream.html">mstar.utils.utf8_stream</a></li>
+</ul>
+</details></li>
+<li class="toctree-l2 has-children"><a class="reference internal" href="../_autosummary/mstar.worker.html">mstar.worker</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.worker.batch_builder.html">mstar.worker.batch_builder</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.worker.chunk_loops.html">mstar.worker.chunk_loops</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.worker.host_copies.html">mstar.worker.host_copies</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.worker.host_pool.html">mstar.worker.host_pool</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.worker.lora_loads.html">mstar.worker.lora_loads</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.worker.node_manager_utils.html">mstar.worker.node_manager_utils</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.worker.phase_timer.html">mstar.worker.phase_timer</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.worker.preemption.html">mstar.worker.preemption</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.worker.rebuild.html">mstar.worker.rebuild</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.worker.rid_table.html">mstar.worker.rid_table</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.worker.scheduled_batch.html">mstar.worker.scheduled_batch</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.worker.scheduling_policy.html">mstar.worker.scheduling_policy</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.worker.spec_rows.html">mstar.worker.spec_rows</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.worker.stream_buffers.html">mstar.worker.stream_buffers</a></li>
+<li class="toctree-l3"><a class="reference internal" href="../_autosummary/mstar.worker.worker_metrics.html">mstar.worker.worker_metrics</a></li>
+</ul>
+</details></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../environment_variables.html">Environment variables</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Contributing</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../adding_models.html">Adding a New Model</a></li>
+</ul>
+
+    </div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+      <div class="sidebar-primary-item">
+<div id="ethical-ad-placement"
+      class="flat"
+      data-ea-publisher="readthedocs"
+      data-ea-type="readthedocs-sidebar"
+      data-ea-manual="true">
+</div></div>
+  </div>
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+
+<div class="sbt-scroll-pixel-helper"></div>
+
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item"><button class="sidebar-toggle primary-toggle btn btn-sm" title="Toggle primary sidebar" data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <span class="fa-solid fa-bars"></span>
+</button></div>
+      
+    </div>
+  
+  
+    <div class="header-article-items__end">
+      
+        <div class="header-article-item">
+
+<div class="article-header-buttons">
+
+
+
+
+
+<div class="dropdown dropdown-source-buttons">
+  <button class="btn dropdown-toggle" type="button" data-bs-toggle="dropdown" aria-expanded="false" aria-label="Source repositories">
+    <i class="fab fa-github"></i>
+  </button>
+  <ul class="dropdown-menu">
+      
+      
+      
+      <li><a href="https://github.com/mstar-project/mstar" target="_blank"
+   class="btn btn-sm btn-source-repository-button dropdown-item"
+   title="Source repository"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fab fa-github"></i>
+  </span>
+<span class="btn__text-container">Repository</span>
+</a>
+</li>
+      
+      
+      
+      
+      <li><a href="https://github.com/mstar-project/mstar/blob/main/docs/design/episode_state.md?plain=1" target="_blank"
+   class="btn btn-sm btn-source-file-button dropdown-item"
+   title="Show source"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-code"></i>
+  </span>
+<span class="btn__text-container">Show source</span>
+</a>
+</li>
+      
+      
+      
+      
+      <li><a href="https://github.com/mstar-project/mstar/issues/new?title=Issue%20on%20page%20%2Fdesign/episode_state.html&body=Your%20issue%20content%20here." target="_blank"
+   class="btn btn-sm btn-source-issues-button dropdown-item"
+   title="Open an issue"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-lightbulb"></i>
+  </span>
+<span class="btn__text-container">Open issue</span>
+</a>
+</li>
+      
+  </ul>
+</div>
+
+
+
+
+
+
+<div class="dropdown dropdown-download-buttons">
+  <button class="btn dropdown-toggle" type="button" data-bs-toggle="dropdown" aria-expanded="false" aria-label="Download this page">
+    <i class="fas fa-download"></i>
+  </button>
+  <ul class="dropdown-menu">
+      
+      
+      
+      <li><a href="../_sources/design/episode_state.md" target="_blank"
+   class="btn btn-sm btn-download-source-button dropdown-item"
+   title="Download source file"
+   data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-file"></i>
+  </span>
+<span class="btn__text-container">.md</span>
+</a>
+</li>
+      
+      
+      
+      
+      <li>
+<button onclick="window.print()"
+  class="btn btn-sm btn-download-pdf-button dropdown-item"
+  title="Print to PDF"
+  data-bs-placement="left" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-file-pdf"></i>
+  </span>
+<span class="btn__text-container">.pdf</span>
+</button>
+</li>
+      
+  </ul>
+</div>
+
+
+
+
+<button onclick="toggleFullScreen()"
+  class="btn btn-sm btn-fullscreen-button pst-navbar-icon"
+  title="Fullscreen mode"
+  data-bs-placement="bottom" data-bs-toggle="tooltip"
+>
+  
+
+<span class="btn__icon-container">
+  <i class="fas fa-expand"></i>
+  </span>
+
+</button>
+
+
+
+<div class="theme-switch-container dropdown pst-js-only" data-bs-toggle="tooltip" data-bs-placement="bottom" title="Color mode">
+  <button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button dropdown-toggle" aria-label="Color mode" data-bs-toggle="dropdown">
+    <i class="theme-switch fa-solid fa-sun fa-lg fa-fw" data-mode="light" title="Light"></i>
+    <i class="theme-switch fa-solid fa-moon fa-lg fa-fw" data-mode="dark" title="Dark"></i>
+    <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg fa-fw" data-mode="auto" title="System Settings"></i>
+  </button>
+  <ul class="dropdown-menu dropdown-menu-end">
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="auto"><i class="fa-solid fa-circle-half-stroke fa-lg fa-fw me-1"></i>System Settings</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="light"><i class="fa-solid fa-sun fa-lg fa-fw me-1"></i>Light</button></li>
+    <li><button class="dropdown-item d-flex align-items-center theme-change-button" data-mode="dark"><i class="fa-solid fa-moon fa-lg fa-fw me-1"></i>Dark</button></li>
+  </ul>
+</div>
+
+
+<button class="btn btn-sm pst-navbar-icon search-button search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <i class="fa-solid fa-magnifying-glass fa-lg"></i>
+</button>
+<button class="sidebar-toggle secondary-toggle btn btn-sm pst-navbar-icon" title="Toggle secondary sidebar" data-bs-placement="bottom" data-bs-toggle="tooltip">
+    <span class="fa-solid fa-list"></span>
+</button>
+</div></div>
+      
+    </div>
+  
+</div>
+</div>
+              
+              
+
+<div id="jb-print-docs-body" class="onlyprint">
+    <h1>Episode state across requests (design, not implemented)</h1>
+    <!-- Table of contents -->
+    <div id="print-main-content">
+        <div id="jb-print-toc">
+            
+            <div>
+                <h2> Contents </h2>
+            </div>
+            <nav aria-label="Page">
+                <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#what-happens-today">0. What happens today</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#what-the-reference-keeps-per-episode">1. What the reference keeps per episode</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#the-contract">2. The contract</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#episode-identity">3. Episode identity</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#reset">4. Reset</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#what-is-retained-and-where">5. What is retained, and where</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#memory-limits">6. Memory limits</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#cleanup">7. Cleanup</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#concurrent-requests">8. Concurrent requests</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#praxis-1-and-other-users">9. Praxis-1 and other users</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#migration-and-compatibility">10. Migration and compatibility</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#open-questions">11. Open questions</a></li>
+</ul>
+            </nav>
+        </div>
+    </div>
+</div>
+
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <section class="tex2jax_ignore mathjax_ignore" id="episode-state-across-requests-design-not-implemented">
+<h1>Episode state across requests (design, not implemented)<a class="headerlink" href="#episode-state-across-requests-design-not-implemented" title="Link to this heading">#</a></h1>
+<p>Status: proposed, for agreement on the contract before any code. The motivating case is Praxis-1 (#1460), a robot policy whose next call is conditioned on what the robot did since its last call.</p>
+<p>M* has content-keyed caches across requests (the prefix cache, Chatterbox’s voice conditioning), but nothing keyed by a client. A robot client over openpi’s WebSocket (#1204) sends one request per observation, so anything a policy wants to carry from one call to the next (text embeddings computed once per task, the executed past that conditions the next chunk) is gone when each call ends. <a class="reference external" href="http://AGENTS.md">AGENTS.md</a> invariant 1 puts session state in the system, not the model. This design adds that state as a system concept, an <strong>episode</strong>: a sequence of requests from one client that share retained arrays, which the model declares and the engine holds, so the model object keeps no mutable per-session state.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Part</p></th>
+<th class="head"><p>Section</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>What happens today</p></td>
+<td><p>§0</p></td>
+</tr>
+<tr class="row-odd"><td><p>What the reference keeps</p></td>
+<td><p>§1</p></td>
+</tr>
+<tr class="row-even"><td><p>The contract</p></td>
+<td><p>§2</p></td>
+</tr>
+<tr class="row-odd"><td><p>Identity</p></td>
+<td><p>§3</p></td>
+</tr>
+<tr class="row-even"><td><p>Reset</p></td>
+<td><p>§4</p></td>
+</tr>
+<tr class="row-odd"><td><p>What is retained, and where</p></td>
+<td><p>§5</p></td>
+</tr>
+<tr class="row-even"><td><p>Memory limits</p></td>
+<td><p>§6</p></td>
+</tr>
+<tr class="row-odd"><td><p>Cleanup</p></td>
+<td><p>§7</p></td>
+</tr>
+<tr class="row-even"><td><p>Concurrent requests</p></td>
+<td><p>§8</p></td>
+</tr>
+<tr class="row-odd"><td><p>Praxis-1 and other users</p></td>
+<td><p>§9</p></td>
+</tr>
+<tr class="row-even"><td><p>Migration and compatibility</p></td>
+<td><p>§10</p></td>
+</tr>
+<tr class="row-odd"><td><p>Open questions</p></td>
+<td><p>§11</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<hr class="docutils" />
+<section id="what-happens-today">
+<span id="0-what-happens-today"></span><h2>0. What happens today<a class="headerlink" href="#what-happens-today" title="Link to this heading">#</a></h2>
+<p>The baseline code observations in this section and §5 were checked at <a class="reference external" href="https://github.com/mstar-project/mstar/tree/9668497eeaf5dd42bf99e3ce0141d8d0a9c70d76">main 9668497</a>; file links there are pinned to that snapshot.</p>
+<ul class="simple">
+<li><p><strong>A call is a request.</strong> The Python openpi handler submits one request per observation with no request id (<a class="reference external" href="https://github.com/mstar-project/mstar/blob/9668497eeaf5dd42bf99e3ce0141d8d0a9c70d76/mstar/api_server/openpi.py">openpi.py</a> <code class="docutils literal notranslate"><span class="pre">_infer</span></code>), so <code class="docutils literal notranslate"><span class="pre">submit_request</span></code> mints a fresh uuid4 (<a class="reference external" href="https://github.com/mstar-project/mstar/blob/9668497eeaf5dd42bf99e3ce0141d8d0a9c70d76/mstar/api_server/entrypoint.py">entrypoint.py</a>). The Rust handler does the same with <code class="docutils literal notranslate"><span class="pre">rid(&quot;openpi&quot;)</span></code> (<a class="reference external" href="https://github.com/mstar-project/mstar/blob/9668497eeaf5dd42bf99e3ce0141d8d0a9c70d76/rust/server/src/ws/openpi.rs">ws/openpi.rs</a>, <a class="reference external" href="https://github.com/mstar-project/mstar/blob/9668497eeaf5dd42bf99e3ce0141d8d0a9c70d76/rust/server/src/serving.rs">serving.rs</a>). Both send the prompt on every call (<code class="docutils literal notranslate"><span class="pre">openpi.py</span></code>, <code class="docutils literal notranslate"><span class="pre">openpi.rs</span></code>).</p></li>
+<li><p><strong>A socket runs one call at a time.</strong> Both loops receive, wait for the reply and send it before reading again (<code class="docutils literal notranslate"><span class="pre">openpi.py</span></code>, <code class="docutils literal notranslate"><span class="pre">openpi.rs</span></code>). Any failure answers with the error as text and closes the socket (<code class="docutils literal notranslate"><span class="pre">openpi.py</span></code>, <code class="docutils literal notranslate"><span class="pre">openpi.rs</span></code>).</p></li>
+<li><p><strong>A persist edge lasts one request.</strong> Persisted signals live on the request’s <code class="docutils literal notranslate"><span class="pre">RequestData</span></code> (<code class="docutils literal notranslate"><span class="pre">persist_signals</span></code>, <a class="reference external" href="https://github.com/mstar-project/mstar/blob/9668497eeaf5dd42bf99e3ce0141d8d0a9c70d76/mstar/conductor/conductor.py">conductor.py</a>), seeded from what the data worker stored for this request (<a class="reference external" href="https://github.com/mstar-project/mstar/blob/9668497eeaf5dd42bf99e3ce0141d8d0a9c70d76/mstar/api_server/data_worker.py">data_worker.py</a>). A later pass replaces what an earlier pass held under a name. When the request is done, the conductor unpersists everything still held with <code class="docutils literal notranslate"><span class="pre">UNPERSIST_TENSORS</span></code>, the producer clears the flag (<a class="reference external" href="https://github.com/mstar-project/mstar/blob/9668497eeaf5dd42bf99e3ce0141d8d0a9c70d76/mstar/worker/input_ingest.py">input_ingest.py</a>), and the tensor store frees the tensor once its references drop (<a class="reference external" href="https://github.com/mstar-project/mstar/blob/9668497eeaf5dd42bf99e3ce0141d8d0a9c70d76/rust/src/tensors.rs">rust/src/tensors.rs</a>).</p></li>
+<li><p><strong>The plan is decided at ingest, from this request’s signals only.</strong> The conductor calls <code class="docutils literal notranslate"><span class="pre">walk_plan</span></code> with <code class="docutils literal notranslate"><span class="pre">body.initial_signals</span></code> (<code class="docutils literal notranslate"><span class="pre">conductor.py</span></code>; the contract is <a class="reference external" href="https://github.com/mstar-project/mstar/blob/9668497eeaf5dd42bf99e3ce0141d8d0a9c70d76/mstar/model/base.py">base.py</a>). A walk input with no persisted signal gets an empty edge (<a class="reference external" href="https://github.com/mstar-project/mstar/blob/9668497eeaf5dd42bf99e3ce0141d8d0a9c70d76/mstar/conductor/request_info.py">request_info.py</a>).</p></li>
+<li><p><strong>Engine state is per request.</strong> A declared array is “per request, per label and per declared layer” (<a class="reference external" href="https://github.com/mstar-project/mstar/blob/9668497eeaf5dd42bf99e3ce0141d8d0a9c70d76/mstar/engine/state/contract.py">contract.py</a>). The engine registers a request’s state on its first <code class="docutils literal notranslate"><span class="pre">NEW_REQUEST</span></code> (<a class="reference external" href="https://github.com/mstar-project/mstar/blob/9668497eeaf5dd42bf99e3ce0141d8d0a9c70d76/mstar/worker/input_ingest.py">input_ingest.py</a>, <code class="docutils literal notranslate"><span class="pre">Engine.add_request</span></code> in <a class="reference external" href="https://github.com/mstar-project/mstar/blob/9668497eeaf5dd42bf99e3ce0141d8d0a9c70d76/mstar/engine/engine.py">engine.py</a>), every resource keys it by the worker’s request handle, and all of it is purged on <code class="docutils literal notranslate"><span class="pre">REMOVE_REQUEST</span></code> (<a class="reference external" href="https://github.com/mstar-project/mstar/blob/9668497eeaf5dd42bf99e3ce0141d8d0a9c70d76/mstar/worker/rid_table.py">rid_table.py</a>, <code class="docutils literal notranslate"><span class="pre">Engine.remove_request</span></code>, <code class="docutils literal notranslate"><span class="pre">engine.py</span></code>).</p></li>
+<li><p><strong>The only cross-request reuse is content-keyed.</strong> The prefix cache keeps a finished request’s KV pages under a hash of what they depend on (<code class="docutils literal notranslate"><span class="pre">Model.kv_labels</span></code>, <code class="docutils literal notranslate"><span class="pre">base.py</span></code>, and <code class="docutils literal notranslate"><span class="pre">.claude/skills/prefix-caching/SKILL.md</span></code>), and Chatterbox keeps an LRU of voice conditioning by the clip’s hash (<a class="reference external" href="https://github.com/mstar-project/mstar/blob/9668497eeaf5dd42bf99e3ce0141d8d0a9c70d76/mstar/model/chatterbox/submodules.py">chatterbox/submodules.py</a>). The replica router places each request on its own (<code class="docutils literal notranslate"><span class="pre">ReplicaRouter.pick</span></code>, <a class="reference external" href="https://github.com/mstar-project/mstar/blob/9668497eeaf5dd42bf99e3ce0141d8d0a9c70d76/mstar/conductor/routing.py">routing.py</a>). Nothing is keyed by a client.</p></li>
+<li><p><strong>The one long-lived call is a request with open client input</strong> (client streams, <a class="reference external" href="https://github.com/mstar-project/mstar/blob/9668497eeaf5dd42bf99e3ce0141d8d0a9c70d76/mstar/streaming/topology.py">topology.py</a>; the realtime conversation, <a class="reference external" href="https://github.com/mstar-project/mstar/blob/9668497eeaf5dd42bf99e3ce0141d8d0a9c70d76/rust/server/src/realtime/conversation.rs">realtime/conversation.rs</a>). At capacity the conductor refuses such a call rather than queueing it (<code class="docutils literal notranslate"><span class="pre">conductor.py</span></code>).</p></li>
+</ul>
+<p>So for #1460 as written: <code class="docutils literal notranslate"><span class="pre">walk_plan</span></code> never finds <code class="docutils literal notranslate"><span class="pre">text_embeds</span></code> from a prior call, and <code class="docutils literal notranslate"><span class="pre">encode_text</span></code> runs on every call. Predicted video latents end at the denoise loop; they do not become context for a later call.</p>
+</section>
+<hr class="docutils" />
+<section id="what-the-reference-keeps-per-episode">
+<span id="1-what-the-reference-keeps-per-episode"></span><h2>1. What the reference keeps per episode<a class="headerlink" href="#what-the-reference-keeps-per-episode" title="Link to this heading">#</a></h2>
+<p>The reference server (<code class="docutils literal notranslate"><span class="pre">praxis-1-oss</span></code>) keeps one session per WebSocket connection (<code class="docutils literal notranslate"><span class="pre">praxis/serve/server.py</span></code> lines 9-11), built when the socket opens and dropped in a <code class="docutils literal notranslate"><span class="pre">finally</span></code> when it closes (lines 134-167). Its protocol v2 also mints a <code class="docutils literal notranslate"><span class="pre">session_id</span></code> per connection (lines 148-154) and takes <code class="docutils literal notranslate"><span class="pre">end_session</span></code> (lines 199-205). The table describes a chunked session, where each call answers one chunk; a real-time session (<code class="docutils literal notranslate"><span class="pre">schedule=rtc</span></code>) gets one sample per call and also keeps a sample history and precomputed work (<code class="docutils literal notranslate"><span class="pre">policy.py</span></code> lines 605-711), which this design does not try to cover.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>State</p></th>
+<th class="head"><p>Size</p></th>
+<th class="head"><p>Lifetime</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Executed frame window (<code class="docutils literal notranslate"><span class="pre">ContiguousStreamContext</span></code>, <code class="docutils literal notranslate"><span class="pre">praxis/robot_io.py</span></code> lines 298-336)</p></td>
+<td><p>float32 clips <code class="docutils literal notranslate"><span class="pre">(1,</span> <span class="pre">3,</span> <span class="pre">T,</span> <span class="pre">H,</span> <span class="pre">W)</span></code> on the GPU. The <code class="docutils literal notranslate"><span class="pre">praxis-1-droid</span></code> checkpoint uses 224x832 (two 224x416 tiles); YAM uses 256x1248 (three 256x416 tiles), from their <code class="docutils literal notranslate"><span class="pre">video</span></code> configs. The earlier DROID-K checkpoint uses 256x832. <code class="docutils literal notranslate"><span class="pre">T</span> <span class="pre">&lt;=</span> <span class="pre">21</span> <span class="pre">+</span> <span class="pre">24</span> <span class="pre">(d</span> <span class="pre">-</span> <span class="pre">1)</span></code>: at the server default of one context chunk (<code class="docutils literal notranslate"><span class="pre">policy.py</span></code> line 64), 21 frames use about 45 MiB (DROID) or 77 MiB (YAM); at three chunks, 69 frames use about 147 or 252 MiB. These are logical windows; the slice keeps a larger concatenated buffer under them (<code class="docutils literal notranslate"><span class="pre">robot_io.py</span></code> lines 403-419). The proposed uint8 store uses a quarter of the float32 frame bytes.</p></td>
+<td><p>Grows by the executed chunk each call, drops the oldest 24 frames past the cap; cleared by a context restart</p></td>
+</tr>
+<tr class="row-odd"><td><p>Boundary latents and poses (<code class="docutils literal notranslate"><span class="pre">single_arm.py</span></code> lines 1094-1097, 1185-1191)</p></td>
+<td><p>the last <code class="docutils literal notranslate"><span class="pre">d</span> <span class="pre">+</span> <span class="pre">1</span></code> single-frame latents and 8-float poses for DROID, or 16-float poses for YAM; small beside the frame window</p></td>
+<td><p>as the window</p></td>
+</tr>
+<tr class="row-even"><td><p>Text embeddings (<code class="docutils literal notranslate"><span class="pre">praxis/pipeline.py</span></code> lines 121, 145-148)</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">(1,</span> <span class="pre">S,</span> <span class="pre">2048)</span></code> bf16 (<code class="docutils literal notranslate"><span class="pre">text_encoder.py</span></code> line 169), 4 KiB a token, plus the blank caption</p></td>
+<td><p>memoized for the whole process by prompt string, not per session</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">chunk_index</span></code> (<code class="docutils literal notranslate"><span class="pre">single_arm.py</span></code> lines 1093, 1290)</p></td>
+<td><p>an int</p></td>
+<td><p>counts completed chunks: seeds chunk k with <code class="docutils literal notranslate"><span class="pre">base</span> <span class="pre">+</span> <span class="pre">k</span></code> (<code class="docutils literal notranslate"><span class="pre">pipeline.py</span></code> line 469) and counts the budget; reset only at session end</p></td>
+</tr>
+<tr class="row-even"><td><p>Prompt (<code class="docutils literal notranslate"><span class="pre">single_arm.py</span></code> lines 1139-1144)</p></td>
+<td><p>a string</p></td>
+<td><p>an observation’s <code class="docutils literal notranslate"><span class="pre">prompt</span></code> replaces it without restarting the context</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>How it resets and ends:</p>
+<ul class="simple">
+<li><p><strong>Context restart.</strong> An observation’s <code class="docutils literal notranslate"><span class="pre">reset_context</span></code> (or <code class="docutils literal notranslate"><span class="pre">__reset_context__</span></code>) drops the window and the boundary state, but keeps <code class="docutils literal notranslate"><span class="pre">chunk_index</span></code> (<code class="docutils literal notranslate"><span class="pre">single_arm.py</span></code> lines 1105-1115 and 1137-1138). The session also restarts by itself when the frame stack is missing or too short (line 1173), when a real-time gap is off the frame grid (<code class="docutils literal notranslate"><span class="pre">policy.py</span></code> lines 678-691), and on every call in stateless mode (lines 571-572).</p></li>
+<li><p><strong>Episode end.</strong> Closing the socket or <code class="docutils literal notranslate"><span class="pre">end_session</span></code> calls <code class="docutils literal notranslate"><span class="pre">close</span></code>, which drops the context and resets <code class="docutils literal notranslate"><span class="pre">chunk_index</span></code> (<code class="docutils literal notranslate"><span class="pre">policy.py</span></code> lines 769-780); the session object is then discarded. The process-wide text memo survives.</p></li>
+<li><p><strong>Budget.</strong> <code class="docutils literal notranslate"><span class="pre">max_chunks_per_episode</span></code> (default unset, <code class="docutils literal notranslate"><span class="pre">policy.py</span></code> line 72) is checked at the start of a call (lines 567-570). Past it the server sends the error and stops reading (<code class="docutils literal notranslate"><span class="pre">server.py</span></code> lines 267-271).</p></li>
+<li><p><strong>A failed call ends the session</strong>, since it may have changed the context (<code class="docutils literal notranslate"><span class="pre">server.py</span></code> lines 272-279).</p></li>
+<li><p><strong>Concurrency.</strong> All calls of all sessions run one after another on one thread (<code class="docutils literal notranslate"><span class="pre">server.py</span></code> lines 44-45), so there is no batching across sessions. Real-time sessions may have 16 calls in flight (<code class="docutils literal notranslate"><span class="pre">periodic.py</span></code> line 66), and they are served in order.</p></li>
+</ul>
+<p>Two facts here shape the design. The context is the <strong>executed real frames</strong>, which a chunked client sends as a frame stack of up to 25 frames each call; conditioning on the model’s own predicted video (“rolling”) is refused because the model trained on real frames only (<code class="docutils literal notranslate"><span class="pre">policy.py</span></code> lines 271-276). And the server retains frames only because a context of more than one chunk spans more frames than one observation carries.</p>
+</section>
+<hr class="docutils" />
+<section id="the-contract">
+<span id="2-the-contract"></span><h2>2. The contract<a class="headerlink" href="#the-contract" title="Link to this heading">#</a></h2>
+<p>An episode is named by the frontend, owned by the conductor, and held by the engines of the workers its arrays live on. A model declares what it retains as arrays with <code class="docutils literal notranslate"><span class="pre">lifetime=&quot;episode&quot;</span></code> in <code class="docutils literal notranslate"><span class="pre">declare_state</span></code>. The conductor gives each episode one logical slot identity for admission and ownership; each storage maps that identity to its own dense, paged or ring allocation. A request’s steps read what earlier requests kept and append their own, and <code class="docutils literal notranslate"><span class="pre">walk_plan</span></code> sees how much each array holds, so it can skip work whose result is retained. A request without an episode id uses a temporary identity for any episode arrays its model declares; its data is released on <code class="docutils literal notranslate"><span class="pre">REMOVE_REQUEST</span></code>, so it starts cold on every call. Models with no episode arrays take the existing path without a slot.</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="c1"># mstar/engine/state/contract.py</span>
+<span class="nd">@dataclass</span><span class="p">(</span><span class="n">frozen</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">Array</span><span class="p">:</span>
+    <span class="o">...</span>
+    <span class="n">max_len</span><span class="p">:</span> <span class="nb">int</span> <span class="o">|</span> <span class="kc">None</span>           <span class="c1"># None: unbounded logical log with a provable resident bound</span>
+    <span class="n">lifetime</span><span class="p">:</span> <span class="n">Literal</span><span class="p">[</span><span class="s2">"request"</span><span class="p">,</span> <span class="s2">"episode"</span><span class="p">]</span> <span class="o">=</span> <span class="s2">"request"</span>   <span class="c1"># episode: kept across the episode's requests</span>
+
+<span class="c1"># what walk_plan and step_metadata see; built by the conductor, not by the model</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">EpisodeView</span><span class="p">(</span><span class="n">NamedTuple</span><span class="p">):</span>
+    <span class="nb">id</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span>              <span class="c1"># None: a request with no episode, which starts cold every call</span>
+    <span class="n">calls</span><span class="p">:</span> <span class="nb">int</span>                  <span class="c1"># calls of this episode admitted before this one</span>
+    <span class="n">held</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">]</span>     <span class="c1"># episode array -&gt; entries it holds now (0 after a reset, expiry, loss or identity change)</span>
+    <span class="n">cold</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span>            <span class="c1"># why held is empty when calls &gt; 0: "reset", "idle", "lost", "identity"</span>
+
+<span class="c1"># mstar/model/base.py</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">ProcessPromptOutput</span><span class="p">(</span><span class="n">NamedTuple</span><span class="p">):</span>
+    <span class="o">...</span>
+    <span class="n">episode_keys</span><span class="p">:</span> <span class="n">Mapping</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">MappingProxyType</span><span class="p">({})</span>   <span class="c1"># episode array -&gt; what its entries were made from</span>
+    <span class="n">reset_episode</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>                              <span class="c1"># a context restart, asked from this request's inputs</span>
+</pre></div>
+</div>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="c1"># serving config</span>
+<span class="nt">episodes</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">max_episodes</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">16</span><span class="w">        </span><span class="c1"># episode identities per replica; capacity follows declarations and read bounds</span>
+<span class="w">  </span><span class="nt">idle_timeout_s</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">600</span><span class="w">     </span><span class="c1"># free a connected episode after this much time since call teardown</span>
+<span class="w">  </span><span class="nt">max_calls</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">null</span><span class="w">         </span><span class="c1"># the reference's max_chunks_per_episode; null is unbounded</span>
+<span class="w">  </span><span class="nt">max_queued_calls</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1</span><span class="w">     </span><span class="c1"># calls of one episode waiting behind the one in flight</span>
+</pre></div>
+</div>
+<p>The id follows a connection; the retained tensors stay on workers. A later call
+uses the same placement and slot, while an idless call borrows a slot only for
+its own request:</p>
+<pre  class="mermaid">
+        flowchart LR
+    C[Positronic session connection] --&gt;|session id on each call| F[Frontend]
+    F --&gt; R[Conductor: record and pinned placement]
+    R --&gt;|bind request to slot| W[Worker engines: episode arrays]
+    W --&gt;|held counts after call| R
+    R --&gt;|warm view for next call| P[Model walk plan]
+    I[Other route: no episode id] --&gt;|cold request| R
+    R --&gt;|temporary slot, freed on request end| W
+    </pre></section>
+<hr class="docutils" />
+<section id="episode-identity">
+<span id="3-episode-identity"></span><h2>3. Episode identity<a class="headerlink" href="#episode-identity" title="Link to this heading">#</a></h2>
+<p><strong>Proposal.</strong> Once E4 lands, the Positronic frontend mints an episode id for each <code class="docutils literal notranslate"><span class="pre">/api/v1/session</span></code> WebSocket connection when it opens, and every call on that socket carries it. Positronic protocol v2 sends a 32-hex <code class="docutils literal notranslate"><span class="pre">session_id</span></code> in its ready frame, requires that same value in every request and rejects a mismatch (<code class="docutils literal notranslate"><span class="pre">server.py</span></code> lines 148-154 and 199-208); that connection-bound value is also its internal episode id. The id goes to <code class="docutils literal notranslate"><span class="pre">submit_request</span></code> as a system field beside <code class="docutils literal notranslate"><span class="pre">request_id</span></code> (<code class="docutils literal notranslate"><span class="pre">episode=</span></code>; <code class="docutils literal notranslate"><span class="pre">SubmitArgs.episode</span></code> in Rust), not in <code class="docutils literal notranslate"><span class="pre">model_kwargs</span></code>, through the data worker to <code class="docutils literal notranslate"><span class="pre">NewRequestConductor.episode</span></code>. A model with no episode arrays runs as today. An idless request to a model with episode arrays gets a temporary slot and a cold <code class="docutils literal notranslate"><span class="pre">EpisodeView</span></code> (§5), without creating an episode record.</p>
+<p>The conductor keeps one record per episode:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="nd">@dataclass</span><span class="p">(</span><span class="n">slots</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">EpisodeRecord</span><span class="p">:</span>
+    <span class="n">calls</span><span class="p">:</span> <span class="nb">int</span>                  <span class="c1"># admitted calls</span>
+    <span class="n">placement</span><span class="p">:</span> <span class="n">Placement</span>        <span class="c1"># the replica of each node group, fixed by the first call</span>
+    <span class="n">slot</span><span class="p">:</span> <span class="nb">int</span>                   <span class="c1"># logical ownership/admission id, the same on every lockstep rank</span>
+    <span class="n">held</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">int</span><span class="p">]</span>        <span class="c1"># entries per array, from the workers' WORKER_GRAPHS_DONE</span>
+    <span class="n">identity</span><span class="p">:</span> <span class="nb">tuple</span><span class="p">[</span><span class="nb">bytes</span><span class="p">,</span> <span class="nb">bytes</span> <span class="o">|</span> <span class="kc">None</span><span class="p">]</span>  <span class="c1"># startup weight epoch and final selected adapter digest</span>
+    <span class="n">keys</span><span class="p">:</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">]</span>        <span class="c1"># model input dependencies for individual arrays</span>
+    <span class="n">in_flight</span><span class="p">:</span> <span class="nb">str</span> <span class="o">|</span> <span class="kc">None</span>       <span class="c1"># the request running now</span>
+    <span class="n">queued</span><span class="p">:</span> <span class="n">deque</span>               <span class="c1"># calls waiting behind it (§8)</span>
+    <span class="n">last_end</span><span class="p">:</span> <span class="nb">float</span>             <span class="c1"># last completed call teardown, for the idle timeout (§6, §7)</span>
+</pre></div>
+</div>
+<p>Why this shape:</p>
+<ul class="simple">
+<li><p><strong>The Positronic connection is the episode.</strong> The reference opens one session per connection and ends it when the connection closes. A connection-scoped id follows that lifecycle.</p></li>
+<li><p><strong>Minted by the system, never chosen by the client.</strong> A client-chosen id can collide with or guess another client’s, so it needs scoping to the caller’s credentials, and its only cleanup is a timeout. It also survives a reconnect, which the reference does not attempt: a new connection starts cold there. This is left as an open question (§11), and the field is shaped so it can be added.</p></li>
+<li><p><strong>The conductor owns the record.</strong> It already owns the request lifecycle and the replica pick, and it must decide idle expiry and slot assignment so every rank of a lockstep instance agrees (invariant 11). A record on a worker would need rank 0 to journal its choices.</p></li>
+<li><p><strong>The placement is pinned.</strong> The retained arrays live on the replica the first call ran on, so later calls skip <code class="docutils literal notranslate"><span class="pre">ReplicaRouter.pick</span></code> and go there.</p></li>
+</ul>
+<p>Rejected:</p>
+<ul class="simple">
+<li><p><strong>A derived id</strong> (a hash of the prompt, the robot’s state keys or the client address): two robots on one task, or behind one NAT, would share an episode.</p></li>
+<li><p><strong>No id, the client sends its context back.</strong> The client already sends the last executed chunk, but a context of more than one chunk needs more frames than an observation carries (69 against 25 at three chunks), and every call would ship and re-check them. It also leaves text embeddings recomputed every call. The maintainers’ question was this choice, and the decision was system-owned state.</p></li>
+</ul>
+</section>
+<hr class="docutils" />
+<section id="reset">
+<span id="4-reset"></span><h2>4. Reset<a class="headerlink" href="#reset" title="Link to this heading">#</a></h2>
+<p><strong>Proposal.</strong> Three ways a context restarts, and one way an episode ends early:</p>
+<ol class="arabic simple">
+<li><p><strong>Explicit.</strong> A truthy <code class="docutils literal notranslate"><span class="pre">reset_context</span></code> or <code class="docutils literal notranslate"><span class="pre">__reset_context__</span></code> in an observation sets <code class="docutils literal notranslate"><span class="pre">episode.reset</span></code> on its request, matching the reference. Both frontends’ Positronic handlers read the keys; integer <code class="docutils literal notranslate"><span class="pre">1</span></code> resets and <code class="docutils literal notranslate"><span class="pre">0</span></code> does not.</p></li>
+<li><p><strong>Model-requested.</strong> <code class="docutils literal notranslate"><span class="pre">process_prompt</span></code> sets <code class="docutils literal notranslate"><span class="pre">reset_episode</span></code> when this request’s inputs can’t continue the context: the reference’s missing or short frame stack is the case. The data worker ORs it with the client’s flag.</p></li>
+<li><p><strong>System.</strong> An idle-ended or lost episode starts its next call cold (§6, §7). A weight or selected adapter identity change also starts a cold call (§4). <code class="docutils literal notranslate"><span class="pre">EpisodeView.cold</span></code> gives the internal reason; whether the wire exposes it is open (§11).</p></li>
+<li><p><strong>Budget.</strong> <code class="docutils literal notranslate"><span class="pre">episodes.max_calls</span></code> refuses the call past it with a 400, <code class="docutils literal notranslate"><span class="pre">episode</span> <span class="pre">reached</span> <span class="pre">max_calls=N</span></code>. Both frontends answer a failure with its text and close the socket, which ends the episode (§7).</p></li>
+</ol>
+<p>A restart clears every episode array of the episode before the request’s first step: the conductor marks the request’s <code class="docutils literal notranslate"><span class="pre">NEW_REQUEST</span></code> to the episode’s workers, and each engine empties the slot when it binds the request. <code class="docutils literal notranslate"><span class="pre">calls</span></code> keeps counting, as the reference’s <code class="docutils literal notranslate"><span class="pre">chunk_index</span></code> does, so the seed sequence and the budget run over the whole connection.</p>
+<p>Before planning a request, the conductor compares its system identity with the episode record’s. E2 represents it as <code class="docutils literal notranslate"><span class="pre">(startup_weight_epoch,</span> <span class="pre">final_selected_adapter_digest)</span></code>, with <code class="docutils literal notranslate"><span class="pre">None</span></code> for the base model. The data worker settles the adapter after <code class="docutils literal notranslate"><span class="pre">process_prompt</span></code>, including a model-chosen adapter, and forwards its raw weight digest independently of prefix caching. This is the same adapter digest used to make the domain-separated prefix root (<a class="reference download internal" download="" href="../_downloads/f22a51dbec3e59a6f584d43c44164266/identity.py"><span class="xref download myst">lora/identity.py</span></a>); the conductor compares the tuple rather than the root. On a mismatch, it marks <strong>every</strong> held episode array empty before <code class="docutils literal notranslate"><span class="pre">walk_plan</span></code>, sets <code class="docutils literal notranslate"><span class="pre">cold=&quot;identity&quot;</span></code>, and the engine clears all those arrays when it binds the request. An array without a model-provided key therefore cannot retain values derived from old weights or an old adapter. The episode’s <code class="docutils literal notranslate"><span class="pre">calls</span></code> count continues across this restart.</p>
+<p>Separately, a request’s <code class="docutils literal notranslate"><span class="pre">episode_keys</span></code> names the input dependencies of individual arrays (for text embeddings, a digest of the prompt’s token ids, which the data worker has). A changed key clears only that array before planning and on bind. A prompt change can therefore re-encode text without dropping the executed-frame window, as the reference allows. These model keys do not replace the system identity on the whole record.</p>
+<p>The weight epoch is a system value, not a model-chosen <code class="docutils literal notranslate"><span class="pre">episode_key</span></code>. Base weights do not hot reload today, so E2 uses a fresh conductor startup epoch and keeps a whole-record identity. The engine’s prefix cache has separate checkpoint, preprocessing and resource fingerprints (<a class="reference download internal" download="" href="../_downloads/9e177f3aaf1655ef46b95b9e376dd554/engine.py"><span class="xref download myst">engine.py</span></a> <code class="docutils literal notranslate"><span class="pre">_open_prefix_caches</span></code>); its per-resource root is not available to the conductor. E2 adds an unconditional adapter digest on the data-worker-to-conductor wire, even when prefix caching is off. A future base-weight reload must drain old calls and rotate the epoch, or end all affected episodes before admitting new calls. <code class="docutils literal notranslate"><span class="pre">checkpoint_identity</span></code> reads the index or shard names and sizes, so it alone cannot detect an in-place shard edit of the same size.</p>
+<p>Why this shape:</p>
+<ul class="simple">
+<li><p><strong>A restart is not an episode end.</strong> The reference keeps <code class="docutils literal notranslate"><span class="pre">chunk_index</span></code> across <code class="docutils literal notranslate"><span class="pre">reset_context</span></code>, and a client that reuses one socket for many episodes would otherwise have to reconnect to reset its budget.</p></li>
+<li><p><strong>Applied on bind, not by a separate message.</strong> The flag rides the request it belongs to, so it is ordered with that request on every rank and can’t race the previous call’s commit.</p></li>
+<li><p><strong>The model asks; the engine clears.</strong> The model can see that a stack is too short, but holds nothing it could clear.</p></li>
+</ul>
+<p>Rejected:</p>
+<ul class="simple">
+<li><p><strong>Implicit reset on a prompt change.</strong> The reference changes the prompt without restarting the context, and the key rule covers the one array that depends on the prompt.</p></li>
+<li><p><strong>Resetting silently at <code class="docutils literal notranslate"><span class="pre">max_calls</span></code>.</strong> The robot would keep moving on a cold context; the reference stops the session.</p></li>
+<li><p><strong>Keeping some arrays across a restart.</strong> Clearing everything is the initial rule, and re-encoding a prompt costs one text-encoder pass. A different scope needs a concrete model use case.</p></li>
+</ul>
+</section>
+<hr class="docutils" />
+<section id="what-is-retained-and-where">
+<span id="5-what-is-retained-and-where"></span><h2>5. What is retained, and where<a class="headerlink" href="#what-is-retained-and-where" title="Link to this heading">#</a></h2>
+<p><strong>Proposal.</strong> A model declares each retained thing as an <code class="docutils literal notranslate"><span class="pre">Array</span></code> with <code class="docutils literal notranslate"><span class="pre">lifetime=&quot;episode&quot;</span></code>:</p>
+<ul class="simple">
+<li><p>An integer <code class="docutils literal notranslate"><span class="pre">max_len</span></code> keeps its current meaning: the maximum logical log length, with zero still meaning scratch within a step. <code class="docutils literal notranslate"><span class="pre">max_len=None</span></code> declares an unbounded logical log, initially only for append-only dense arrays with no positions and only no-op <code class="docutils literal notranslate"><span class="pre">Window</span></code> reads. Every read is from the current tail; arbitrary or backward queries are refused. The largest declared window bounds resident entries, plus room for an in-flight append and staging. There is no separate retention field.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">nodes</span></code> say which node reads and writes it; the array lives on the workers that run that node, inside their engines, with one episode identity on every rank of the node’s lockstep instance (replicated, or split where a <code class="docutils literal notranslate"><span class="pre">TensorType.shard</span></code> says). A paged store need not put that identity in one contiguous physical allocation.</p></li>
+<li><p>A step appends with <code class="docutils literal notranslate"><span class="pre">handle.add</span></code> and reads with <code class="docutils literal notranslate"><span class="pre">handle.read</span></code> (<a class="reference external" href="https://github.com/mstar-project/mstar/blob/9668497eeaf5dd42bf99e3ce0141d8d0a9c70d76/mstar/engine/state/calls.py">calls.py</a>). A <code class="docutils literal notranslate"><span class="pre">Read(mask=Window(size=69))</span></code> describes which executed frames a Praxis step can reach (<a class="reference external" href="https://github.com/mstar-project/mstar/blob/9668497eeaf5dd42bf99e3ce0141d8d0a9c70d76/mstar/engine/state/contract.py">contract.py</a>). The dense store keeps logical positions monotonic across calls, frees entries outside every declared tail window, and returns retained entries in chronological order. This initial unbounded form rejects mixed or unbounded masks and any position rule that could reach back. <a class="reference external" href="https://github.com/mstar-project/mstar/pull/1503">#1503</a> derives ring retention for K/V frame windows; it does not provide this dense whole-read store. E1 adds that path without changing the K/V storage.</p></li>
+<li><p>A no-op read returns <code class="docutils literal notranslate"><span class="pre">Reached</span></code>, each field’s entries packed by row (<code class="docutils literal notranslate"><span class="pre">contract.py</span></code>).</p></li>
+</ul>
+<p>The conductor holds only the record (§3). The model object holds nothing: the calls count reaches a step as <code class="docutils literal notranslate"><span class="pre">step_metadata[&quot;episode_calls&quot;]</span></code>, and everything else is in the arrays.</p>
+<p>For Praxis-1 (§9) this is three arrays. <code class="docutils literal notranslate"><span class="pre">text_embeds</span></code> lives on the backbone with <code class="docutils literal notranslate"><span class="pre">cond</span></code> and <code class="docutils literal notranslate"><span class="pre">blank</span></code> labels and an <code class="docutils literal notranslate"><span class="pre">h</span></code> entry of the checkpoint’s text hidden width (2048 in the published configs, bf16). A required positive deployment <code class="docutils literal notranslate"><span class="pre">max_text_tokens</span></code> bounds its <code class="docutils literal notranslate"><span class="pre">Window</span></code> read; <code class="docutils literal notranslate"><span class="pre">process_prompt</span></code> refuses when either stream’s unpadded token count exceeds it. The reference tokenization path has no application-level cap (<code class="docutils literal notranslate"><span class="pre">truncation=False</span></code>), so this is an explicit serving limit. <code class="docutils literal notranslate"><span class="pre">executed</span></code> lives on the VAE encoder, with <code class="docutils literal notranslate"><span class="pre">frame:</span> <span class="pre">TensorType((3,</span> <span class="pre">tile_height,</span> <span class="pre">tile_width</span> <span class="pre">*</span> <span class="pre">num_cameras),</span> <span class="pre">dtype=uint8)</span></code> and <code class="docutils literal notranslate"><span class="pre">pose:</span> <span class="pre">TensorType((8</span> <span class="pre">or</span> <span class="pre">16,),</span> <span class="pre">dtype=float32)</span></code> plus pose validity. <code class="docutils literal notranslate"><span class="pre">praxis-1-droid</span></code> uses 224x832 with an 8-float model-frame pose; YAM uses 256x1248 with a 16-float rig-frame pose. A separate boundary array keeps the recent poses and history validity needed when the executed-frame ring wraps. At three context chunks <code class="docutils literal notranslate"><span class="pre">executed</span></code> has <code class="docutils literal notranslate"><span class="pre">max_len=None</span></code> and a 69-frame <code class="docutils literal notranslate"><span class="pre">Window</span></code> read. Each new 24-frame chunk makes the oldest 24 unreachable; the fourth addition reaches 93 logical frames but retains at most the latest 69 after it completes. Storage must also budget an in-flight append and staging. <code class="docutils literal notranslate"><span class="pre">EpisodeView.held[&quot;executed&quot;]</span></code> is the resident count, not the lifetime append count.</p>
+<p><strong>Does it fit <code class="docutils literal notranslate"><span class="pre">declare_state</span></code>?</strong> <code class="docutils literal notranslate"><span class="pre">Entry</span></code> takes named tensors with a dtype and a shard, and <code class="docutils literal notranslate"><span class="pre">labels</span></code>, masks and no-op <code class="docutils literal notranslate"><span class="pre">Read</span></code> say how a step uses them. Five things are missing:</p>
+<ol class="arabic simple">
+<li><p><strong>A lifetime and unbounded logical log.</strong> Arrays are per request and require integer <code class="docutils literal notranslate"><span class="pre">max_len</span></code> today (<code class="docutils literal notranslate"><span class="pre">contract.py</span></code>). <code class="docutils literal notranslate"><span class="pre">lifetime=&quot;episode&quot;</span></code> changes who owns the rows and when they are released. <code class="docutils literal notranslate"><span class="pre">max_len=None</span></code> adds an unbounded logical append count for the restricted dense window form above; finite integer arrays keep their append limit, including the scratch meaning of zero. There is no separate retention mode.</p></li>
+<li><p><strong>A dense storage, independent of lifetime.</strong> No current storage holds an append-only non-K/V array with a no-op read. <code class="docutils literal notranslate"><span class="pre">PagedStorage</span></code> takes only a <code class="docutils literal notranslate"><span class="pre">KVEntry</span></code> with an <code class="docutils literal notranslate"><span class="pre">Attend</span></code> read, and <code class="docutils literal notranslate"><span class="pre">storage_of</span></code> sends every other append-only array with nonzero <code class="docutils literal notranslate"><span class="pre">max_len</span></code> there (<a class="reference external" href="https://github.com/mstar-project/mstar/blob/9668497eeaf5dd42bf99e3ce0141d8d0a9c70d76/mstar/engine/state/adapters.py">adapters.py</a>). A dense storage can serve bounded request arrays as well as episode arrays. For an unbounded windowed log it needs a ring and a validated read-derived resident bound, with logical-to-physical mapping in <code class="docutils literal notranslate"><span class="pre">plan</span></code> and safe staging under invariant 7. Storage selection stays about entry and operation type, not lifetime; paged and ring K/V storages can use the same episode binding. E1 builds this dense path on <a class="reference external" href="https://github.com/mstar-project/mstar/pull/1503">#1503</a>, whose ring is K/V-specific.</p></li>
+<li><p><strong>Binding a request to an episode across storages.</strong> The engine registers a request’s state on <code class="docutils literal notranslate"><span class="pre">NEW_REQUEST</span></code> and purges it on removal (<code class="docutils literal notranslate"><span class="pre">engine.py</span></code>). A named episode binds its request handle to the episode’s rows on <code class="docutils literal notranslate"><span class="pre">NEW_REQUEST</span></code> (clearing all of them on a reset or system identity change, or selected arrays on a model key change), unbinds on <code class="docutils literal notranslate"><span class="pre">REMOVE_REQUEST</span></code> without freeing the rows, and frees them on <code class="docutils literal notranslate"><span class="pre">END_EPISODE</span></code>. A request without an episode id borrows a temporary slot and frees it on <code class="docutils literal notranslate"><span class="pre">REMOVE_REQUEST</span></code>. It receives <code class="docutils literal notranslate"><span class="pre">EpisodeView(id=None,</span> <span class="pre">calls=0,</span> <span class="pre">held={...:</span> <span class="pre">0},</span> <span class="pre">cold=None)</span></code> and every such request starts cold. The binding and its cleanup are common to dense, paged and ring storage. Both named and temporary slots count against admission (§6); neither can overwrite rows held by a live call. The temporary binding is keyed by request handle and included in <code class="docutils literal notranslate"><span class="pre">rid_table.py</span></code>’s purge rule.</p></li>
+<li><p><strong>What the plan sees.</strong> <code class="docutils literal notranslate"><span class="pre">walk_plan</span></code> gets only this request’s signals (<code class="docutils literal notranslate"><span class="pre">base.py</span></code>). It gains an <code class="docutils literal notranslate"><span class="pre">episode:</span> <span class="pre">EpisodeView</span></code> keyword, passed only to a model that declares episode arrays, so no existing override changes. <code class="docutils literal notranslate"><span class="pre">held</span></code> comes from the workers’ <code class="docutils literal notranslate"><span class="pre">WORKER_GRAPHS_DONE</span></code>, as persisted signals already do (<code class="docutils literal notranslate"><span class="pre">conductor.py</span></code>).</p></li>
+<li><p><strong>Keys and system identity.</strong> <code class="docutils literal notranslate"><span class="pre">ProcessPromptOutput.episode_keys</span></code> (§4) names per-array model input dependencies. A separate <code class="docutils literal notranslate"><span class="pre">(startup_weight_epoch,</span> <span class="pre">final_selected_adapter_digest)</span></code> identity covers the whole episode record and clears every held array when it changes. E2 adds the adapter digest to the wire and the tuple to the record; future reload work must rotate the epoch or end affected episodes.</p></li>
+</ol>
+<p>Why this shape:</p>
+<ul class="simple">
+<li><p><strong>Where the reader is.</strong> The arrays sit on the node that reads them, so a warm call moves no retained bytes between GPUs. A persisted tensor stays with its producer and is read over the transport on each call.</p></li>
+<li><p><strong>The engine owns the memory.</strong> A slot pool sized at startup is something admission can count (§6); state a model allocated itself would turn a full pool into an OOM (invariant 1, heuristic 4).</p></li>
+<li><p><strong>One call interface for per-request and per-episode state.</strong> Both use <code class="docutils literal notranslate"><span class="pre">add</span></code> and <code class="docutils literal notranslate"><span class="pre">read</span></code>; lifetime changes the owner of a row, while read masks determine which old entries remain reachable. The storage format follows the entry and operation, so an episode does not introduce a parallel K/V mechanism.</p></li>
+</ul>
+<p>Rejected:</p>
+<ul class="simple">
+<li><p><strong>Episode-lifetime persist edges.</strong> It is the smallest change to #1460: keep <code class="docutils literal notranslate"><span class="pre">persist_signals</span></code> on an episode record instead of the request. But the tensors would stay in the producer’s tensor store, which admission doesn’t count and nothing evicts under pressure (a persisted tensor is collected once the conductor unpersists it, <code class="docutils literal notranslate"><span class="pre">tensors.rs</span></code>, or at the request’s hard teardown, <a class="reference external" href="https://github.com/mstar-project/mstar/blob/9668497eeaf5dd42bf99e3ce0141d8d0a9c70d76/mstar/communication/tensors.py">communication/tensors.py</a>), their descriptors would go through the conductor every call, and a window that slides needs the model to re-emit the whole window each call, since a pass replaces a name (<code class="docutils literal notranslate"><span class="pre">conductor.py</span></code>).</p></li>
+<li><p><strong>One long-lived request with open client input</strong>, as realtime conversations run. A request’s walks are planned once at ingest (<code class="docutils literal notranslate"><span class="pre">base.py</span></code>), where an episode is an unbounded run of calls each with its own plan. A long request stays live while the robot is idle, holding what it opened (only some resources can be offloaded under pressure), and the conductor refuses one at capacity (<code class="docutils literal notranslate"><span class="pre">conductor.py</span></code>). Per-call timeouts, metrics and errors would also blur into one request.</p></li>
+<li><p><strong>Holding it in the frontend or the API server.</strong> Retained tensors would cross into and out of the GPU workers every call, which is the client-sends-it-back design with one more hop.</p></li>
+<li><p><strong>A content-keyed cache for text embeddings</strong>, as the reference memoizes them for the process (<code class="docutils literal notranslate"><span class="pre">pipeline.py</span></code>). It would share embeddings across robots on one task, but it is a separate feature (an encoder-output cache, with its own eviction across tenants), and an episode already reuses the embeddings for as long as its prompt stays the same, which in a robot episode is usually every call. A content cache would add reuse across episodes, or after a prompt switches away and back. §11 asks whether to build it too.</p></li>
+</ul>
+</section>
+<hr class="docutils" />
+<section id="memory-limits">
+<span id="6-memory-limits"></span><h2>6. Memory limits<a class="headerlink" href="#memory-limits" title="Link to this heading">#</a></h2>
+<p><strong>Proposal.</strong></p>
+<ul class="simple">
+<li><p><strong>Per slot.</strong> A named episode and a temporary idless request need the same capacity. A bounded array contributes its declared <code class="docutils literal notranslate"><span class="pre">max_len</span></code>; an unbounded logical log contributes a resident bound derived from all reads, position rules, maximum in-flight append and capture scratch. If the bound cannot be proved, the declaration is refused before serving. Praxis-1’s proposed uint8 69-frame window is about 37 MiB for DROID or 63 MiB for YAM, plus poses, text and storage overhead; this is not the whole slot reservation. Per-deployment sizing still belongs under <code class="docutils literal notranslate"><span class="pre">resources:</span></code> (invariant 2).</p></li>
+<li><p><strong>Per replica.</strong> <code class="docutils literal notranslate"><span class="pre">episodes.max_episodes</span></code> episode identities have capacity reserved or budgeted at startup in each storage that holds an episode array. A worker whose declared capacity cannot fit refuses to start, naming the array and the size.</p></li>
+<li><p><strong>Admission.</strong> A new named episode or an idless call to a model with episode arrays needs a free slot on the replica the router picks. A connected named episode keeps its slot between calls, including while the robot executes its 24 rows. Pressure alone never takes that slot. If no slot is free, either kind of arriving call waits in the conductor’s admission queue, in arrival order; an idless cold openpi call does not displace a robot. The idle sweeper frees an eligible slot after <code class="docutils literal notranslate"><span class="pre">episodes.idle_timeout_s</span></code>, then admission retries. A call of an episode that still has its slot never waits for slot admission. E3 must enforce the request deadline while a call waits.</p></li>
+<li><p><strong>Idle expiry.</strong> <code class="docutils literal notranslate"><span class="pre">last_end</span></code> is set only after the call’s teardown barrier completes (§8). The sweeper sends <code class="docutils literal notranslate"><span class="pre">END_EPISODE</span></code> only when no call is in flight or queued and at least <code class="docutils literal notranslate"><span class="pre">idle_timeout_s</span></code> has elapsed since <code class="docutils literal notranslate"><span class="pre">last_end</span></code>. A connected episode that has been inactive that long loses its retained state; its next call starts cold. A temporary slot belongs to its live request and cannot expire before that request is removed.</p></li>
+<li><p><strong>Temporary slot release.</strong> An idless request frees its slot on <code class="docutils literal notranslate"><span class="pre">REMOVE_REQUEST</span></code>; no <code class="docutils literal notranslate"><span class="pre">END_EPISODE</span></code>, record, idle timer or later warm call is involved.</p></li>
+<li><p><strong>What the client sees.</strong> An idle-expired episode’s next call starts cold: <code class="docutils literal notranslate"><span class="pre">held</span></code> is empty, so <code class="docutils literal notranslate"><span class="pre">walk_plan</span></code> runs every producer again. <code class="docutils literal notranslate"><span class="pre">EpisodeView.cold</span></code> gives the model the reason, and a metric counts idle expiry and cold starts by reason. A wire notice is an open question (§11).</p></li>
+</ul>
+<p>Relation to <a class="reference internal" href="admission_and_preemption.html"><span class="std std-doc">admission_and_preemption.md</span></a>: an episode slot is an ownership key that outlives its requests. Admission must budget each underlying dense, paged or ring storage before a call runs (§3), and idle expiry returns that episode’s allocations. It is not a second KV mechanism: KV pages retain their existing storage and preemption rules. A node with a rebuild policy needs every resource to support a drop (that doc’s §4 table); each storage with episode rows must support that lifecycle.</p>
+<p>The two lifetimes share the same episode identity pool. A read mask can make old
+entries unreachable within an episode; idle expiry releases an episode’s
+entire identity and its allocations:</p>
+<pre  class="mermaid">
+        flowchart LR
+    Free[Free slot] --&gt;|named episode starts| Named[Named episode slot]
+    Named --&gt;|append; release entries no read can reach| Named
+    Named --&gt;|idle expiry or close| Free
+    Free --&gt;|idless request starts| Temp[Temporary request slot]
+    Temp --&gt;|REMOVE_REQUEST| Free
+    Named --&gt;|after idle expiry, a later call| Cold[Cold start]
+    Cold --&gt;|admit into a slot| Named
+    </pre><p>Why this shape:</p>
+<ul class="simple">
+<li><p><strong>One identity across storages.</strong> The conductor admits and expires an episode as a unit, while each storage keeps its own layout. A finite resident bound is known from declarations before startup; the ring KV manager already hands out fixed sessions (<a class="reference download internal" download="" href="../_downloads/d2c73f1f9b17d13a56fdbac2fb15e365/manager.py"><span class="xref download myst">ring/manager.py</span></a> lines 344-349).</p></li>
+<li><p><strong>Keep a connected robot’s state.</strong> A robot between calls is idle in the scheduler but still executing its task. Admission waits rather than making that robot’s next call cold under pressure.</p></li>
+<li><p><strong>The conductor decides.</strong> It is the only process that sees every episode’s state on a replica, and its choice reaches every rank in the same order (invariant 11).</p></li>
+</ul>
+<p>Rejected:</p>
+<ul class="simple">
+<li><p><strong>One global pool across dense and KV storages.</strong> It would let unrelated resources trade memory, but it ties this design to preemption’s classes before those storages have been measured together. §9 of the admission doc lists one pool per GPU as later work; episode ownership can use each storage’s existing capacity rules meanwhile.</p></li>
+<li><p><strong>Refusing a new episode when full.</strong> A waiting call can run after a close or idle expiry without forcing an immediate failure.</p></li>
+<li><p><strong>Pressure eviction of a connected episode.</strong> A robot executing its 24 rows is between calls, so this would discard its context and make the next call cold. The existing <code class="docutils literal notranslate"><span class="pre">idle_timeout_s</span></code> is the only time-based release of a connected slot.</p></li>
+<li><p><strong>Moving idle episodes to the host.</strong> Worth it if cold starts turn out expensive, and left for later (§11).</p></li>
+</ul>
+</section>
+<hr class="docutils" />
+<section id="cleanup">
+<span id="7-cleanup"></span><h2>7. Cleanup<a class="headerlink" href="#cleanup" title="Link to this heading">#</a></h2>
+<p><strong>Proposal.</strong> An episode ends, and its slot frees, on the first of:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Event</p></th>
+<th class="head"><p>Who sends <code class="docutils literal notranslate"><span class="pre">END_EPISODE</span></code></p></th>
+<th class="head"><p>Notes</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Connection close</p></td>
+<td><p>the Positronic frontend, in the handler’s <code class="docutils literal notranslate"><span class="pre">finally</span></code> (Python) or when <code class="docutils literal notranslate"><span class="pre">serve</span></code> returns (Rust)</p></td>
+<td><p>a call in flight runs to its end first; the end is applied after the call’s teardown</p></td>
+</tr>
+<tr class="row-odd"><td><p>Positronic <code class="docutils literal notranslate"><span class="pre">end_session</span></code></p></td>
+<td><p>the frontend, after validating the session id and answering the end request</p></td>
+<td><p>the reference replies with <code class="docutils literal notranslate"><span class="pre">{session_id,</span> <span class="pre">end_session:</span> <span class="pre">true}</span></code> and closes the session (<code class="docutils literal notranslate"><span class="pre">server.py</span></code> lines 199-208); E4 tests the acknowledgement and exactly one <code class="docutils literal notranslate"><span class="pre">END_EPISODE</span></code> in both frontends</p></td>
+</tr>
+<tr class="row-even"><td><p>A failed or aborted call</p></td>
+<td><p>the conductor, at the request’s teardown</p></td>
+<td><p>its arrays may hold a partial write, as the reference assumes (<code class="docutils literal notranslate"><span class="pre">server.py</span></code> lines 272-279); the Positronic handler closes the session</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">max_calls</span></code> reached</p></td>
+<td><p>the conductor</p></td>
+<td><p>the refused call fails, and the socket closes (§4)</p></td>
+</tr>
+<tr class="row-even"><td><p>Idle for <code class="docutils literal notranslate"><span class="pre">idle_timeout_s</span></code> after teardown</p></td>
+<td><p>the conductor’s periodic sweep</p></td>
+<td><p>the record stays with <code class="docutils literal notranslate"><span class="pre">cold=&quot;idle&quot;</span></code> until the connection closes, so the next call’s internal view says why it is cold</p></td>
+</tr>
+<tr class="row-odd"><td><p>A worker holding it is lost</p></td>
+<td><p>the conductor ends every episode placed there</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">cold=&quot;lost&quot;</span></code> on the next call, if the conductor outlives the worker</p></td>
+</tr>
+<tr class="row-even"><td><p>Process restart</p></td>
+<td><p>nothing to send</p></td>
+<td><p>every episode is in memory and is gone; connection-scoped ids die with their sockets, so no client can name a stale one</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Leaked episodes are bounded three ways: the slot count and per-storage admission budgets cap retained memory; the idle timeout returns any slot a lost close left behind; and a record without a slot holds no tensors and lives only as long as its connection.</p>
+<p>Why this shape:</p>
+<ul class="simple">
+<li><p><strong>Close is the normal end.</strong> It follows the reference’s connection-scoped session lifecycle.</p></li>
+<li><p><strong>A failure ends the episode rather than rolling back.</strong> Undoing a partial write needs a copy of every array before every call; ending it costs one cold start in a case where the client has closed the socket anyway.</p></li>
+<li><p><strong>The timeout is a backstop, not the main path.</strong> With connection-scoped ids it fires for a frontend that died without closing, or a robot paused longer than the timeout, whose next call then starts cold. The reference’s hosted deployment caps a session at an hour (<code class="docutils literal notranslate"><span class="pre">modal_app.py</span></code> line 94).</p></li>
+</ul>
+</section>
+<hr class="docutils" />
+<section id="concurrent-requests">
+<span id="8-concurrent-requests"></span><h2>8. Concurrent requests<a class="headerlink" href="#concurrent-requests" title="Link to this heading">#</a></h2>
+<p><strong>Proposal.</strong></p>
+<ul class="simple">
+<li><p><strong>One call per episode at a time.</strong> The conductor admits an episode’s call only when none of its calls is in flight. A call stays in flight after the reply until the <code class="docutils literal notranslate"><span class="pre">READS_DONE</span></code> teardown barrier completes, <code class="docutils literal notranslate"><span class="pre">REMOVE_REQUEST</span></code> goes to participants and <code class="docutils literal notranslate"><span class="pre">_drop_request</span></code> clears the request. A teardown timeout can force that barrier to finish if a reader never answers. A call that arrives meanwhile waits in the episode’s queue, in arrival order, up to <code class="docutils literal notranslate"><span class="pre">max_queued_calls</span></code>; past that it is refused with a 429. A queued call is planned when it is admitted, not when it arrives, so its <code class="docutils literal notranslate"><span class="pre">walk_plan</span></code> sees what the call before it kept. The DRAIN/READS_DONE round trip may delay a call sent immediately after the reply, especially on a busy worker; a robot executing 24 rows at 15 Hz usually hides it, but a simulation or back-to-back test may not.</p></li>
+<li><p><strong>Many episodes on one worker.</strong> Each call is an ordinary request. The micro-scheduler batches calls of different episodes as it batches any requests, through <code class="docutils literal notranslate"><span class="pre">can_batch</span></code> and <code class="docutils literal notranslate"><span class="pre">forward_batched</span></code>; each row reads and writes only its own slot, which the plan addresses per row. Nothing reads across episodes.</p></li>
+<li><p><strong>Speculation.</strong> The async worker speculates within a request (invariant 7). Two calls of one episode are never in flight together, so nothing speculates across the boundary between them.</p></li>
+</ul>
+<p>Why this shape:</p>
+<ul class="simple">
+<li><p><strong>Calls are ordered by their state.</strong> Each call reads the history and appends to it. Two at once would read the same history and both append, so the second’s context would miss the first’s chunk. The reference serializes every call (<code class="docutils literal notranslate"><span class="pre">server.py</span></code> lines 44-45).</p></li>
+<li><p><strong>Queue, not refuse.</strong> The chunked Positronic session handles one call at a time, so its queue is normally empty. A pipelining client, as the real-time reference (16 in flight) and the Cosmos3 example over <code class="docutils literal notranslate"><span class="pre">/generate/ws</span></code> (<code class="docutils literal notranslate"><span class="pre">examples/cosmos3_action_ws_client.py</span></code>) are, would see a refusal as a dropped observation. A bound keeps a runaway client from building a queue.</p></li>
+</ul>
+<p>Rejected:</p>
+<ul class="simple">
+<li><p><strong>Running them concurrently on a snapshot.</strong> Last writer wins, and which call wins depends on timing.</p></li>
+<li><p><strong>Serializing on the worker.</strong> The worker would hold a ready request back by state only the conductor has, and every rank would have to agree on it.</p></li>
+</ul>
+</section>
+<hr class="docutils" />
+<section id="praxis-1-and-other-users">
+<span id="9-praxis-1-and-other-users"></span><h2>9. Praxis-1 and other users<a class="headerlink" href="#praxis-1-and-other-users" title="Link to this heading">#</a></h2>
+<p><strong>Praxis-1 on episodes.</strong></p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">walk_plan</span></code> runs <code class="docutils literal notranslate"><span class="pre">encode_text</span></code> only when <code class="docutils literal notranslate"><span class="pre">episode.held[&quot;text_embeds&quot;]</span> <span class="pre">==</span> <span class="pre">0</span></code> (a new episode, a restart, idle expiry, a weight or adapter change, or a new prompt), then the chunk walk. On a cold call the text embeddings reach the backbone as request edges, and its first step adds them to <code class="docutils literal notranslate"><span class="pre">text_embeds</span></code>. On a warm call the backbone reads the held array. E5 must make that warm graph schedulable without the absent encoder edges and test readiness at the graph boundary; an empty tensor inside a node does not satisfy a required graph input.</p></li>
+<li><p>The cold call leaves <code class="docutils literal notranslate"><span class="pre">executed</span></code> empty because no chunk has run yet. The first warm call appends all 21 executed frames supplied by the client, even if its earlier cold observation differed from the oldest executed frame. Later warm calls append 24 rows. The VAE encoder reads that window and encodes it into clean context as the reference does each call.</p></li>
+<li><p>The seed of call k is the episode’s seed plus <code class="docutils literal notranslate"><span class="pre">episode_calls</span></code>, the reference’s <code class="docutils literal notranslate"><span class="pre">base</span> <span class="pre">+</span> <span class="pre">k</span></code>.</p></li>
+<li><p><strong>Executed frames, not predicted video.</strong> #1460 now leaves predicted video latents inside the denoise loop. The reference conditions on executed real frames and refuses its own predictions as context (<code class="docutils literal notranslate"><span class="pre">policy.py</span></code> lines 271-276; <code class="docutils literal notranslate"><span class="pre">robot_io.py</span></code> lines 298-317). The proposed episode array retains the executed frame window.</p></li>
+</ul>
+<p><strong>Stage 1, before episode state.</strong> A cold-only openpi bring-up mode starts every call at depth 0, matching the reference’s <code class="docutils literal notranslate"><span class="pre">context_mode=&quot;stateless&quot;</span></code> (<code class="docutils literal notranslate"><span class="pre">policy.py</span></code> lines 571-573). The reference documents that mode as debugging (<code class="docutils literal notranslate"><span class="pre">policy.py</span></code> lines 271-276); it is not production-faithful serving. Predicted video is never carried into the next call.</p>
+<p>The parity gate compares model output and <code class="docutils literal notranslate"><span class="pre">decode_actions</span></code> relative rows with the reference’s stateless mode, not response bytes. The <a class="reference external" href="https://github.com/runwayml/praxis-1-oss/blob/68f4d7a254b4bf41951d2e97f44b07f6cac2bf69/tests/serve/test_serve_protocol.py#L832-L848">reference’s protocol test</a> confirms that repeated calls stay at depth 0 and each returns 21 commands. A separate openpi wire test checks the array shape and values. The reference still advances <code class="docutils literal notranslate"><span class="pre">chunk_index</span></code> and seeds call <code class="docutils literal notranslate"><span class="pre">k</span></code> with <code class="docutils literal notranslate"><span class="pre">base</span> <span class="pre">+</span> <span class="pre">k</span></code>, so each parity call supplies that same explicit seed to M*.</p>
+<p>The proposed openpi <code class="docutils literal notranslate"><span class="pre">RobotIO.action_horizon</span></code> is 21 in this mode, so the existing fixed-size check holds. DROID openpi <code class="docutils literal notranslate"><span class="pre">robot_state</span></code> uses the reference’s default FR3 hand frame and is converted to the checkpoint’s flange frame before proprio; YAM uses its rig world frame. The model’s general request path accepts an explicit <code class="docutils literal notranslate"><span class="pre">pose_descriptor</span></code>, but this stage’s openpi WebSocket does not expose it. DROID returns a 21x10 array and YAM a 21x20 array of denormalized relative Cartesian rows in the model frame, including clipped gripper values. These are Praxis-specific openpi schemas: the <a class="reference external" href="https://github.com/Physical-Intelligence/openpi/blob/main/examples/droid/main.py#L778-L866">stock openpi DROID client</a> expects 10x8 joint-velocity/gripper actions and cannot connect unchanged.</p>
+<p><strong>Stage 2, with episode state:</strong> the new Positronic <code class="docutils literal notranslate"><span class="pre">/api/v1/session</span></code> route follows the reference’s session behavior, including pose-composed command dictionaries and 21 rows at depth 0 versus 24 at warm depth above 0. A reset or idle expiry can make a later call cold again, returning 21 rows. M* uses protocol v2 for connection-bound session ids, while the reference’s chunked deployment uses v1; E5 must advertise a client stack that the stock v2 client can build and send only actuator command fields. The E4 frontends carry the session and episode lifecycle; E5 supplies Praxis-specific pose composition and executed-frame context. This route waits for agreement on the episode contract. The cold-only openpi mode remains an explicitly separate bring-up path.</p>
+<p><strong>Other users.</strong> Candidates, not checked against their references:</p>
+<ul class="simple">
+<li><p>Any robot policy that conditions on more history than one observation carries. pi0.5 conditions on the current observation only and is unaffected.</p></li>
+<li><p>Interactive world models. Waypoint keeps a ring KV per request today (<code class="docutils literal notranslate"><span class="pre">ring/manager.py</span></code>); an episode-lifetime declaration should let the same storage keep a session’s KV across requests. A concrete Waypoint session still needs its own integration check.</p></li>
+<li><p>Multi-turn agent and chat sessions, which today rely on content-keyed prefix reuse. Episode-lifetime K/V should use the same ownership binding rather than a new KV storage. Their admission and model integration remain later work.</p></li>
+<li><p>Full-duplex models already run a call as one long request (§0) and don’t need this.</p></li>
+</ul>
+</section>
+<hr class="docutils" />
+<section id="migration-and-compatibility">
+<span id="10-migration-and-compatibility"></span><h2>10. Migration and compatibility<a class="headerlink" href="#migration-and-compatibility" title="Link to this heading">#</a></h2>
+<ul class="simple">
+<li><p><strong>Stage 1 openpi bring-up.</strong> Before E1-E5, a cold-only Praxis adapter declares a fixed 21-row horizon and returns relative rows in the openpi <code class="docutils literal notranslate"><span class="pre">&quot;actions&quot;</span></code> array. It carries no episode id or history. Its tests compare repeated calls with the reference’s stateless mode; this is not Positronic wire parity. The two existing openpi frontends already require a fixed horizon (<code class="docutils literal notranslate"><span class="pre">openpi.py</span></code> lines 217-225; <code class="docutils literal notranslate"><span class="pre">openpi.rs</span></code> lines 532-540), so neither needs a variable-length exception for this stage.</p></li>
+<li><p><strong>Positronic session wire.</strong> <code class="docutils literal notranslate"><span class="pre">/api/v1/session</span></code> is a new WebSocket API in both frontends, rather than an extension of the openpi reply. It sends a connection-bound <code class="docutils literal notranslate"><span class="pre">session_id</span></code>, checks it on every request, carries reset, <code class="docutils literal notranslate"><span class="pre">end_session</span></code> acknowledgement and errors, and returns pose-composed command dictionaries (<code class="docutils literal notranslate"><span class="pre">praxis/serve/server.py</span></code>, <code class="docutils literal notranslate"><span class="pre">praxis/single_arm.py</span></code> <code class="docutils literal notranslate"><span class="pre">finish</span></code>). E4 adds the route and episode plumbing in Python and Rust together; E5 supplies the model-specific command conversion. Its protocol v2 ready frame uses versioned client-stack components and a 15 Hz chunked schedule. The reply omits the legacy <code class="docutils literal notranslate"><span class="pre">timestamp</span></code> key, which the reference’s v1 client strips before giving commands to the robot.</p></li>
+<li><p><strong>Both frontends change together</strong> (invariant 15): the episode id, <code class="docutils literal notranslate"><span class="pre">reset_context</span></code>, <code class="docutils literal notranslate"><span class="pre">END_EPISODE</span></code> on close and reply behavior land in the Python and Rust Positronic handlers in E4. A <code class="docutils literal notranslate"><span class="pre">test/rust</span></code> Positronic parity case uses a stub model reply to compare cold 21-row and warm 24-row protocol behavior across both frontends; E5 tests the real model and pose composition. The cold-only Praxis openpi mode still returns 21 rows on every call.</p></li>
+<li><p><strong>Models that declare no episode array are untouched.</strong> The conductor knows at startup whether the model declares any. If not, it makes no record, routes as today and never passes <code class="docutils literal notranslate"><span class="pre">episode</span></code> to <code class="docutils literal notranslate"><span class="pre">walk_plan</span></code>, so the request path and its per-request cost are today’s (invariant 6). The frontends’ minted id is a string on the submission, dropped at the conductor.</p></li>
+<li><p><strong>Routes other than episode-capable WebSockets</strong> pass no episode id. A model with episode arrays still runs: each such request borrows a slot, receives an empty <code class="docutils literal notranslate"><span class="pre">EpisodeView</span></code>, and releases the slot at request teardown. It waits at slot admission under the same rules as a new named episode (§6). Two idless calls cannot share state, even when they run on the same worker.</p></li>
+</ul>
+<p>Staging, each step independently reviewable and testable. The cold-only openpi bring-up mode is separate and precedes E1-E5. The episode feature has five work stages because the engine’s storage, the conductor’s request routing, bounded admission, the two frontends’ wire behavior, and Praxis’s model wiring have different owners and regression surfaces. A stage may need more than one PR, especially E4’s new API. E1 and E2 provide internal contracts; they do not expose episode serving on their own. The episode feature reaches clients only after the lifecycle and frontend work. Praxis’s integration waits for those pieces, while independent model component ports can proceed:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Step</p></th>
+<th class="head"><p>Contents</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>E1</p></td>
+<td><p>Stack on #1503; add <code class="docutils literal notranslate"><span class="pre">lifetime=&quot;episode&quot;</span></code>, the restricted <code class="docutils literal notranslate"><span class="pre">max_len=None</span></code> dense window, a generic request-handle-to-episode-row binding across storages, and <code class="docutils literal notranslate"><span class="pre">END_EPISODE</span></code>. Modular tests append 21 + 24 + 24 + 24 frames through a 69-frame window, check chronological reads and bounded resident memory, reject unsupported unbounded or backward-reaching reads, and free a temporary slot on <code class="docutils literal notranslate"><span class="pre">REMOVE_REQUEST</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p>E2</p></td>
+<td><p>The conductor’s record, pinned placement, <code class="docutils literal notranslate"><span class="pre">EpisodeView</span></code> to <code class="docutils literal notranslate"><span class="pre">walk_plan</span></code>, per-episode queue, <code class="docutils literal notranslate"><span class="pre">max_calls</span></code>, final adapter digest on the wire, startup weight epoch in the conductor, whole-record identity and per-array model keys; tests show a named episode resumes warm, a changed epoch or adapter digest clears every held array even without model keys, a prompt key change clears only its array, and separate idless requests start cold</p></td>
+</tr>
+<tr class="row-even"><td><p>E3</p></td>
+<td><p>Shared-slot admission for named and temporary calls, idle expiry, cleanup on failure and worker loss, and metrics; pressure tests show an idless or new named call waits behind connected episodes instead of displacing them, then runs after a close or expiry, with cases on both sides of <code class="docutils literal notranslate"><span class="pre">idle_timeout_s</span></code>. A future base-weight reload must coordinate invalidation or end affected episodes</p></td>
+</tr>
+<tr class="row-odd"><td><p>E4</p></td>
+<td><p>Both Python and Rust frontends: the new Positronic <code class="docutils literal notranslate"><span class="pre">/api/v1/session</span></code> API, including connection id, reset, close and reply behavior; <code class="docutils literal notranslate"><span class="pre">test/rust</span></code> checks a stubbed Positronic cold/warm session across both frontends</p></td>
+</tr>
+<tr class="row-even"><td><p>E5</p></td>
+<td><p>Praxis-1 on episodes, including pose-composed Positronic commands; an integration test checks executed-frame history and text reuse across calls, reset, idle expiry, and 21 rows at cold depth 0 versus 24 when warm</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<hr class="docutils" />
+<section id="open-questions">
+<span id="11-open-questions"></span><h2>11. Open questions<a class="headerlink" href="#open-questions" title="Link to this heading">#</a></h2>
+<ol class="arabic simple">
+<li><p><strong>Client-supplied ids.</strong> Should a client be able to name its episode, to survive a reconnect or to drive episodes over <code class="docutils literal notranslate"><span class="pre">/generate/ws</span></code>? If so, scoped to its API key, and is the idle timeout then the only cleanup?</p></li>
+<li><p><strong>The cold-start notice.</strong> Should a Positronic reply report when a previously warm session expired idle, so the client can tell why its next call is cold? If so, where in the wire reply?</p></li>
+<li><p><strong>Text embeddings across episodes.</strong> A content-keyed encoder-output cache is separate from episode state. If built, should it include Chatterbox’s voice LRU so both share one cache policy?</p></li>
+<li><p><strong>Idle episodes to host memory</strong> instead of dropping them, once cold-start cost is measured?</p></li>
+<li><p><strong>Per-connection settings.</strong> The reference takes <code class="docutils literal notranslate"><span class="pre">max_chunks_per_episode</span></code> and sampler settings per session from the URL query. Should the Positronic route accept the same settings, or is the deployment config enough?</p></li>
+<li><p><strong>Defaults.</strong> <code class="docutils literal notranslate"><span class="pre">max_episodes</span></code> 16 and <code class="docutils literal notranslate"><span class="pre">idle_timeout_s</span></code> 600 are guesses until measured on a robot workload.</p></li>
+</ol>
+</section>
+</section>
+
+
+                </article>
+              
+
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+</div>
+                </footer>
+              
+            </div>
+            
+            
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item"><div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> Contents
+  </div>
+  <nav id="pst-page-toc-nav" class="page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="pst-show_toc_level nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#what-happens-today">0. What happens today</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#what-the-reference-keeps-per-episode">1. What the reference keeps per episode</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#the-contract">2. The contract</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#episode-identity">3. Episode identity</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#reset">4. Reset</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#what-is-retained-and-where">5. What is retained, and where</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#memory-limits">6. Memory limits</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#cleanup">7. Cleanup</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#concurrent-requests">8. Concurrent requests</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#praxis-1-and-other-users">9. Praxis-1 and other users</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#migration-and-compatibility">10. Migration and compatibility</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#open-questions">11. Open questions</a></li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+          </div>
+          <footer class="bd-footer-content">
+            
+<div class="bd-footer-content__inner container">
+  
+  <div class="footer-item">
+    
+<p class="component-author">
+By M* Team
+</p>
+
+  </div>
+  
+  <div class="footer-item">
+    
+
+  <p class="copyright">
+    
+      © Copyright 2025-2026, M* Team.
+      <br/>
+    
+  </p>
+
+  </div>
+  
+  <div class="footer-item">
+    <p class="last-updated">
+  Last updated on Nov 14, 2026.
+  <br/>
+</p>
+  </div>
+  
+  <div class="footer-item">
+    
+  </div>
+  
+</div>
+          </footer>
+        
+
+      </main>
+    </div>
+  </div>
+  
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../_static/scripts/bootstrap.js?digest=90905a2f556bf617f1a9"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=90905a2f556bf617f1a9"></script>
+
+  <footer class="bd-footer">
+  </footer>
+  </body>
+</html>
