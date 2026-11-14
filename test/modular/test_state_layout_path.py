@@ -131,13 +131,24 @@ def test_chunk_lengths_cross_the_data_worker_as_wire_safe_rows():
     assert "state_layout" not in kwargs
 
 
+def test_missing_chunk_lengths_fail_at_data_worker_intake():
+    class MissingChunk(_ChunkDeclaring):
+        def process_prompt(self, *args, **kwargs):
+            output = super().process_prompt(*args, **kwargs)
+            output.metadata["state_layout"]["chunk"]["main"] = Layout()
+            return output
+
+    with pytest.raises(RuntimeError, match="chunk_causal is missing reads \\['chunk_attn'\\]"):
+        _run(_worker(MissingChunk(), _deployment()))
+
+
 def test_a_prompt_with_no_keyed_spans_keys_no_page():
     kwargs = _run(_worker(_Declaring({"keyed_spans": {"kv": {"main": 0}}}), _deployment()))
     assert kwargs["kv_layout"]["kv"]["main"][4] == 0
     assert not (kwargs.get("prefix_keys") or {}).get("kv", {}).get("main"), "a vision prompt keys nothing"
 
 
-@pytest.mark.parametrize("name", ["state_layout", "keyed_spans", "state_sizes"])
+@pytest.mark.parametrize("name", ["state_layout", "keyed_spans", "state_sizes", CHUNK_CAUSAL_LAYOUT_KWARG])
 def test_a_client_cannot_plant_a_layout_key(name):
     model = _Declaring()
     kwargs = _run(_worker(model, _deployment()), {name: {"kv": {"main": 99}}})

@@ -697,6 +697,11 @@ def _check_chunk_causal_layout(array: Array, label: str, layout: Layout) -> None
                 f"state_layout[{array.name!r}][{label!r}].chunk_causal[{key!r}] "
                 f"must be a ChunkCausalLayout, got {lengths!r}"
             )
+    required = {key for key, read in array.reads.items() if isinstance(read.mask, ChunkCausal)}
+    if missing := required - layout.chunk_causal.keys():
+        raise RuntimeError(
+            f"state_layout[{array.name!r}][{label!r}].chunk_causal is missing reads {sorted(missing)}"
+        )
 
 
 def sampling_configs(
