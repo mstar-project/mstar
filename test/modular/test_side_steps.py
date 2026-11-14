@@ -514,14 +514,11 @@ def test_capture_runs_on_the_stream_it_is_given(monkeypatch):
         def __exit__(self, *exc):
             return False
 
-        def graph(self):
-            return "graph"
-
     backend = SimpleNamespace(
         device_type="cpu",
         current_stream=lambda: None,
         create_graph=lambda keep_graph: "graph",
-        capture=lambda graph, pool, stream, keep_graph: seen.update(stream=stream) or Capture(),
+        capture=lambda graph, pool, stream: seen.update(stream=stream) or Capture(),
         synchronize=lambda: None,
     )
     monkeypatch.setattr(runner_module.DeviceCapability, "of", lambda device: SimpleNamespace(graph_backend=backend))

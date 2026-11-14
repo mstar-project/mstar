@@ -75,6 +75,7 @@ class _StubMeasuredRunner:
         self._submodule_name = "Thinker"
         self._resident = None
         self._num_slots = 2
+        self._resources = {}
         self._capture_costs = {}
         self._lent = set()
         self._executables = {}

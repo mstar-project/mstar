@@ -11,7 +11,6 @@ from mstar.engine.accelerator_graph_backend import (
     AcceleratorGraphBackend,
     AcceleratorGraphPool,
     CUDAGraphBackend,
-    GraphCapture,
     SplitGraph,
     XPUGraphBackend,
     get_accelerator_graph_backend,
@@ -82,9 +81,7 @@ def test_runner_retains_failed_graphs_only_for_xpu(monkeypatch, device_type):
     stream = object()
     monkeypatch.setattr(backend, "create_graph", create_graph)
     monkeypatch.setattr(backend, "current_stream", lambda: stream)
-    monkeypatch.setattr(
-        backend, "capture", lambda graph, **kwargs: nullcontext(GraphCapture(backend, [graph], False)),
-    )
+    monkeypatch.setattr(backend, "capture", lambda *args, **kwargs: nullcontext())
     monkeypatch.setattr(backend, "synchronize", lambda: None)
     recovery = Mock()
     monkeypatch.setattr(backend, "recover_failed_capture", recovery)
@@ -155,7 +152,9 @@ def test_a_split_capture_replays_its_host_call_between_its_graphs(monkeypatch):
         log.append("draw")
         return 7
 
-    graph, output = capture_into_graph(run, AcceleratorGraphPool(object()), torch.device("cuda", 0), None)
+    graph, output = capture_into_graph(
+        run, AcceleratorGraphPool(object()), torch.device("cuda", 0), None, splittable=True,
+    )
     assert output == 7 and isinstance(graph, SplitGraph)
     assert log == ["begin A", "forward", "end A", "begin B", "draw", "end B"]
     log.clear()
@@ -173,7 +172,7 @@ def test_a_split_capture_replays_its_host_call_between_its_graphs(monkeypatch):
 def test_a_capture_splits_once_and_hands_every_piece_to_its_failure(monkeypatch, device_type):
     """Two splits in one forward would replay a host call that its graph's second
     piece never waits for; the capture fails, and XPU's pool holds both pieces."""
-    with pytest.raises(ValueError, match="only inside a graph capture"):
+    with pytest.raises(ValueError, match="only inside a splittable graph capture"):
         split_capture(lambda: None)
     log = []
     backend = _logged_backend(monkeypatch, device_type, log)
@@ -185,11 +184,42 @@ def test_a_capture_splits_once_and_hands_every_piece_to_its_failure(monkeypatch,
         split_capture(lambda: None)
 
     with pytest.raises(ValueError, match="splits once"):
-        capture_into_graph(run, pool, backend.device, None)
+        capture_into_graph(run, pool, backend.device, None, splittable=True)
     assert log == ["begin A", "end A", "begin B", "end B"]
     backend.recover_failed_capture.assert_called_once()
     if device_type == "xpu":
         assert [graph.name for graph in pool.failed_graph.graphs] == ["A", "B"]
+
+
+@pytest.mark.parametrize("device_type", ["cuda", "xpu"])
+def test_a_capture_that_may_not_split_is_the_runtimes_own(monkeypatch, device_type):
+    """A node without a splitting resource records with the runtime's own graph context,
+    as before split captures existed, and a split inside it is refused."""
+    log = []
+    backend = _logged_backend(monkeypatch, device_type, log)
+    entered = []
+
+    class _RuntimeGraph:
+        def __init__(self, graph, **kwargs):
+            entered.append(kwargs)
+
+        def __enter__(self):
+            return None
+
+        def __exit__(self, *exc):
+            return False
+
+    monkeypatch.setattr(backend._runtime, "graph", _RuntimeGraph, raising=False)
+    monkeypatch.setattr(backend._runtime, "graph_pool_handle", object, raising=False)
+    pool = backend.graph_pool_handle()
+    graph, output = capture_into_graph(lambda: 7, pool, backend.device, None)
+    assert output == 7 and not isinstance(graph, SplitGraph) and entered == [{"pool": pool.handle}]
+
+    def run():
+        split_capture(lambda: None)
+
+    with pytest.raises(ValueError, match="only inside a splittable graph capture"):
+        capture_into_graph(run, pool, backend.device, None)
 
 
 @pytest.mark.parametrize("backend_type", [CUDAGraphBackend, XPUGraphBackend])

@@ -81,7 +81,9 @@ def split_capture(fn: Callable[[], None]) -> None:
     a ``ValueError``."""
     capture: GraphCapture | None = getattr(_capturing, "capture", None)
     if capture is None or not capture.backend.is_current_stream_capturing():
-        raise ValueError("split_capture runs only inside a graph capture (AcceleratorGraphBackend.capture)")
+        raise ValueError(
+            "split_capture runs only inside a splittable graph capture (AcceleratorGraphBackend.capture_split)"
+        )
     if capture.fn is not None:
         raise ValueError("a graph capture splits once, and this one already split")
     capture.backend.split(capture)
@@ -150,8 +152,18 @@ class AcceleratorGraphBackend(ABC):
         *,
         pool: AcceleratorGraphPool | None = None,
         stream: Any = None,
+    ) -> AbstractContextManager: ...
+
+    @abstractmethod
+    def capture_split(
+        self,
+        graph: CapturedGraph,
+        *,
+        pool: AcceleratorGraphPool | None = None,
+        stream: Any = None,
         keep_graph: bool = False,
-    ) -> AbstractContextManager[GraphCapture]: ...
+    ) -> AbstractContextManager[GraphCapture]:
+        """`capture` for a node whose capture may `split_capture`; every other capture uses `capture`."""
 
     @abstractmethod
     def split(self, capture: GraphCapture) -> None:
@@ -208,8 +220,22 @@ class _TorchGraphBackend(AcceleratorGraphBackend):
     def graph_pool_handle(self) -> AcceleratorGraphPool:
         return AcceleratorGraphPool(self._runtime.graph_pool_handle())
 
-    @contextmanager
     def capture(
+        self,
+        graph: CapturedGraph,
+        *,
+        pool: AcceleratorGraphPool | None = None,
+        stream: Any = None,
+    ) -> AbstractContextManager:
+        kwargs: dict[str, Any] = {
+            "pool": None if pool is None else pool.handle,
+        }
+        if stream is not None:
+            kwargs["stream"] = stream
+        return self._runtime.graph(graph, **kwargs)
+
+    @contextmanager
+    def capture_split(
         self,
         graph: CapturedGraph,
         *,
@@ -218,7 +244,8 @@ class _TorchGraphBackend(AcceleratorGraphBackend):
         keep_graph: bool = False,
     ) -> Iterator[GraphCapture]:
         """What the runtime's own ``graph`` context does, which ends only the graph it began: after
-        a `split_capture` the capture ends in another."""
+        a `split_capture` the capture ends in another. Only for a node whose resources split their
+        capture (``Resource.splits_capture``); every other capture is the runtime's own (`capture`)."""
         # free as much memory as can be for the graph; a collect only on request, as torch's own
         # context does, since it is slow and a capture comes many to a boot
         self.synchronize()

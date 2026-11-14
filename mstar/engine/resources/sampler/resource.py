@@ -913,6 +913,10 @@ class GrammarSamplerResource(SamplerResource):
     """The sampler of a spec with ``enable_grammar``: it serves ``structured_outputs``
     (`sampler/grammar.py`), masking each constrained row's logits before the draw."""
 
+    # its draw splits its node's captures (`split_capture`), so the runner records them with the
+    # backend's capture_split; every other node keeps the runtime's own capture
+    splits_capture = True
+
     def __init__(self, vocab_size: int | None, enable_repetition_penalty: bool, device: torch.device, *,
                  text_output, grammar_cache_mb: int, **kwargs):
         if text_output is None:

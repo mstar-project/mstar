@@ -189,11 +189,13 @@ def capture_into_graph(
     run, pool: AcceleratorGraphPool, device, autocast_dtype, keep_graph: bool = False,
     node_name: str | None = None,
     stream: Any = None,
+    splittable: bool = False,
 ):
     """Capture ``run`` into a new CUDA graph allocated from ``pool``.
 
-    Returns the graph and what ``run`` returned. The graph is a `SplitGraph`
-    if ``run`` called `split_capture`. A capture that fails part
+    Returns the graph and what ``run`` returned. With ``splittable`` the capture
+    is the backend's `capture_split`, and the graph is a `SplitGraph` if ``run``
+    called `split_capture`; otherwise it is the runtime's own. A capture that fails part
     way leaves two things behind that would sink every later capture on the
     same pool: the caching allocator keeps routing this thread's allocations
     into the pool (the next capture_begin fails with "already recording to
@@ -220,8 +222,12 @@ def capture_into_graph(
     try:
         with torch.compiler.set_stance("fail_on_recompile"), \
                 autocast_scope(autocast_dtype, backend.device_type, node_name):
-            with backend.capture(graph, pool=pool, stream=stream, keep_graph=keep_graph) as capture:
-                output = run()
+            if splittable:
+                with backend.capture_split(graph, pool=pool, stream=stream, keep_graph=keep_graph) as capture:
+                    output = run()
+            else:
+                with backend.capture(graph, pool=pool, stream=stream):
+                    output = run()
     except BaseException:
         # every piece of a split capture
         pool.on_failure(graph if capture is None else capture.graph())
@@ -231,7 +237,7 @@ def capture_into_graph(
         torch.backends.cudnn.benchmark = benchmark
     backend.synchronize()
     pool.on_success()
-    return capture.graph(), output
+    return (graph if capture is None else capture.graph()), output
 
 
 def capture_with_static_outputs(
@@ -1271,6 +1277,8 @@ class AcceleratorGraphRunner:
             graph, output = capture_into_graph(
                 warmed.run, self._memory_pool, self._device, self._autocast_dtype,
                 node_name=self._submodule_name, stream=self._capture_stream,
+                # only a node with a resource that splits its capture (the grammar sampler)
+                splittable=any(getattr(r, "splits_capture", False) for r in self._resources.values()),
             )
             return self._build_slot_from_capture(
                 output=BatchedModelOutput.coerce(output),
@@ -1833,19 +1841,23 @@ class AcceleratorGraphRunner:
         buffers on another stream, so the replay has to wait for those writes
         before it reads them.
 
-        ``launch_started_event`` releases the submitting thread. It is set just
-        before the replay's last launch rather than before the forward: staging
-        copies each preprocessed tensor into its static buffer, and a
-        `SplitGraph`'s host call runs between its launches, both holding the GIL
-        for stretches, so releasing earlier hands the main thread a GIL the GPU
-        thread still needs before the step is fully launched.
+        ``launch_started_event`` releases the submitting thread. It is set HERE
+        rather than before the forward: staging copies each preprocessed tensor
+        into its static buffer and holds the GIL while doing so, so releasing
+        earlier hands the main thread a GIL the GPU thread still needs. Only
+        `graph.replay()` below drops it in C++. A `SplitGraph`'s host call holds
+        the GIL between its launches too, so a split step sets it just before its
+        last launch instead.
         """
         laps = profiler.PhaseLaps("engine.forward.")
         self._stage(lease, preprocessed)
         if plan_done_event is not None:
             self._graph_backend.current_stream().wait_event(plan_done_event)
+        split = launch_started_event is not None and isinstance(self.slot_for(lease).graph, SplitGraph)
+        if launch_started_event is not None and not split:
+            launch_started_event.set()
         laps.lap("stage")
-        out = self._replay(lease, None if launch_started_event is None else launch_started_event.set)
+        out = self._replay(lease, launch_started_event.set if split else None)
         laps.lap("replay")
         return out
 

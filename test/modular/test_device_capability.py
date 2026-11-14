@@ -55,11 +55,11 @@ def test_another_runtime_reports_capabilities_without_creating_streams_or_events
 
 @pytest.mark.parametrize("device_type", ["cuda", "xpu"])
 def test_graph_backend_unwraps_pool_only_at_runtime_boundary(monkeypatch, device_type):
-    backend = DeviceCapability(torch.device(device_type, 0)).graph_backend
-    monkeypatch.setattr(backend, "synchronize", lambda: None)
-    monkeypatch.setattr(backend, "stream_context", lambda stream: nullcontext())
-    pool, graph = AcceleratorGraphPool(object()), Mock()
-    with backend.capture(graph, pool=pool, stream=object()):
+    capability = DeviceCapability(torch.device(device_type, 0))
+    runtime = getattr(torch, device_type)
+    capture = Mock(return_value=nullcontext())
+    monkeypatch.setattr(runtime, "graph", capture, raising=False)
+    pool, graph = AcceleratorGraphPool(object()), object()
+    with capability.graph_backend.capture(graph, pool=pool):
         pass
-    graph.capture_begin.assert_called_once_with(pool.handle)
-    graph.capture_end.assert_called_once_with()
+    capture.assert_called_once_with(graph, pool=pool.handle)
