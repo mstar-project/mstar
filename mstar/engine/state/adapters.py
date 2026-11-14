@@ -2156,14 +2156,15 @@ class PagedStorage(Storage):
                 raise _no_layout(array, f"reads {windows} each keep a window, and the pool keeps one a label")
             others = [each for each in bound if each.key not in array.reads]
             specs, resource_of = self._read_specs(array, reads, setup.walks)
-            resolved.specs[array.name] = [self._pool(array, setup.walks), *specs, *_op_specs(array, others)]
+            pool = self._pool(array, setup.walks, bool(windows))
+            resolved.specs[array.name] = [pool, *specs, *_op_specs(array, others)]
             resolved.resource_of.update(resource_of | _resources_of(array, others))
         return resolved
 
     def takes_leader(self, array: Array) -> bool:
         return len(array.nodes) > 1
 
-    def _pool(self, array: Array, walks: "Walks") -> KVSpec:
+    def _pool(self, array: Array, walks: "Walks", kept_window: bool) -> KVSpec:
         heads, head_dim = _kv_shape(array)
         if not array.reads:
             raise _no_layout(array, "reads is empty, and PagedKVConfig needs num_qo_heads from an Attend read")
@@ -2177,7 +2178,7 @@ class PagedStorage(Storage):
             raise _no_layout(array, f"reads have q_heads {sorted(q_heads)}, and PagedKVConfig has one num_qo_heads")
         return KVSpec(
             resource_key=array.name, nodes=array.nodes,
-            leader=_leader(array, walks) if self.takes_leader(array) else None,
+            leader=_leader(array, walks) if self.takes_leader(array) else None, kept_window=kept_window,
             config=PagedKVConfig(
                 num_layers=len(array.layers), num_qo_heads=q_heads.pop() if q_heads else None,
                 num_kv_heads=heads, head_dim=head_dim, max_seq_len=array.max_len,

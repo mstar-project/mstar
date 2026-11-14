@@ -122,6 +122,8 @@ def test_the_edge_deployments_reasoner_holds_the_specs_main_gave_it():
     assert set(held) == set(main), "the reasoner holds a resource main didn't give it"
     # the positions span the kv array's nodes, where main bound them to the reasoner alone
     main[ROPE] = replace(main[ROPE], nodes={DIT_NODE, REASONER_NODE})
+    # the pool says a read keeps a window, which main's steps carried
+    main[C.KV_CACHE] = replace(main[C.KV_CACHE], kept_window=True)
     for key, spec in main.items():
         assert held[key] == spec, f"{key} isn't the spec main gave the reasoner"
 

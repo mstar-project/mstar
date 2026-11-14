@@ -689,10 +689,18 @@ class KVReqConfig(ResourceReqConfig):
 
         Also when the labels ``spec.nodes`` open would hold more pages at the caps than the pool
         has for requests. The pool admits a preemptible request on its prompt alone, so a request this
-        large would be admitted and then could not finish even alone in an empty pool."""
+        large would be admitted and then could not finish even alone in an empty pool.
+
+        ``RuntimeError`` (the model's fault, a 500) when ``spec`` keeps a window and a label's layout has no
+        retention."""
         if spec is None or not isinstance(spec.config, PagedKVConfig):
             return
         for label, layout in (self.kv_layout or {}).items():
+            if spec.kept_window and layout.retention is None:
+                raise RuntimeError(
+                    f"{spec.resource_key!r}: label {label!r} is read through a kept window and its layout sizes none, "
+                    "so the read would reach every entry; lay the array out through `state_layout`"
+                )
             # the release keeps an exact window in the first group alone, and a kept-window read is its array's only one
             if layout.retention is not None and layout.retention.exact and len(spec.config.groups) > 1:
                 raise ValueError(
@@ -894,6 +902,8 @@ class KVSpec(NodeResourceSpec):
     # Under CFG parallel, the node whose pool admits each request. The other nodes' pools hold no
     # more pages per request than the leader's, as long as the leader offloads nothing.
     leader: str | None = None
+    # A read attends through a window the pool keeps, which only a retention on each label's layout sizes.
+    kept_window: bool = False
 
     @property
     def resource_class(self) -> "type[Resource]":
