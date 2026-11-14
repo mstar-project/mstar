@@ -1,4 +1,4 @@
-"""The Wan2.2-VAE decoder (TI2V-5B: 48 latent channels, 16x spatial and 4x temporal) as Blackwell kernels.
+"""The Wan2.2-VAE decoder (TI2V-5B: 48 latent channels, 16x spatial and 4x temporal) as Blackwell and Hopper kernels.
 
 Vendored from FastVideo (hao-ai-lab/FastVideo ``fastvideo-kernel/wan22_vae_decode``, ec9145a, Apache-2.0; ``csrc/``
 keeps its sources and comments). Upstream decodes one grid, latents 44x78 (704x1248); here the C++ driver takes the grid
@@ -17,9 +17,11 @@ It is not bit-exact with ``vae.decode``: Winograd's transforms and the fused nor
 opt-in near-lossless path (``Wan22Config.vae_decode_kernel``) with a quality table in its PR, never a default. The
 video does not depend on ``frames_per_pass`` or on how a stream is cut into calls.
 
-Runs on compute capability 10.0 and 10.3 (B200, GB200, B300): tcgen05 MMA, TMA, 2-CTA clusters. The extension is
-built on first use (about a minute, then cached under torch's extensions root) against FlashInfer's bundled CUTLASS
-headers, or ``$CUTLASS_DIR``.
+Runs on compute capability 10.0 and 10.3 (B200, GB200, B300: tcgen05 MMA, TMA, 2-CTA clusters) and 9.0 (H100, H200:
+wgmma, TMA; ``csrc/arch.h`` holds each architecture's CUTLASS configuration). Both builds compute the same arithmetic
+outside the GEMMs, whose accumulation order differs between the two MMA units. The extension is built on first use
+(about a minute, then cached under torch's extensions root) against FlashInfer's bundled CUTLASS headers, or
+``$CUTLASS_DIR``.
 """
 
 from __future__ import annotations
@@ -38,6 +40,8 @@ logger = logging.getLogger(__name__)
 _CSRC = os.path.join(os.path.dirname(__file__), "csrc")
 _SOURCES = (".cu", ".cpp")
 LATENT_CHANNELS = 48
+# compute capability -> the architecture the extension is built for
+ARCHS = {(9, 0): "sm_90a", (10, 0): "sm_100a", (10, 3): "sm_103a"}
 
 
 def _weight_shapes() -> tuple[tuple[str, tuple[int, ...]], ...]:
@@ -91,10 +95,13 @@ def unsupported_reason(device: torch.device | None = None, vae: nn.Module | None
     from mstar.platforms import current_platform
 
     if current_platform.is_rocm():
-        return "the kernels are CUDA (tcgen05) only"
+        return "the kernels are CUDA (tcgen05 / wgmma) only"
     major, minor = torch.cuda.get_device_capability(device)
-    if (major, minor) not in ((10, 0), (10, 3)):
-        return f"the kernels need compute capability 10.0 or 10.3 (B200 / GB200 / B300), not {major}.{minor}"
+    if (major, minor) not in ARCHS:
+        return (
+            f"the kernels need compute capability 9.0, 10.0 or 10.3 (H100 / H200, B200 / GB200 / B300), "
+            f"not {major}.{minor}"
+        )
     if _cutlass_dir() is None:
         return "no CUTLASS headers (FlashInfer's bundled copy, or $CUTLASS_DIR)"
     if shutil.which("nvcc") is None and not os.environ.get("CUDA_HOME"):
@@ -116,7 +123,7 @@ def _cutlass_dir() -> str | None:
 
 @functools.lru_cache(maxsize=None)
 def extension(arch: str):
-    """The built extension for ``arch`` (``sm_100a`` / ``sm_103a``), once per process.
+    """The built extension for ``arch`` (``sm_90a`` / ``sm_100a`` / ``sm_103a``), once per process.
 
     The sources are copied under torch's extensions root into a directory named by their content, so every checkout
     of one version shares a build and each version gets its own (``mstar.utils.fused_moe.align`` does the same)."""
@@ -149,16 +156,22 @@ def extension(arch: str):
         extra_include_paths=[
             src_dir, os.path.join(cutlass, "include"), os.path.join(cutlass, "tools", "util", "include"),
         ],
-        extra_cflags=["-O3", "-std=c++17"],
-        extra_cuda_cflags=[f"-gencode=arch=compute_{arch[3:]},code={arch}", "-O3", "-std=c++17"],
+        extra_cflags=build_flags(arch)[0],
+        extra_cuda_cflags=build_flags(arch)[1],
         extra_ldflags=["-lcuda"],
         verbose=False,
     )
 
 
+def build_flags(arch: str) -> tuple[list[str], list[str]]:
+    """(C++ flags, nvcc flags) for ``arch``: that architecture alone, and on ``sm_90a`` Hopper's configuration,
+    ``WAN22_VAE_SM90`` (``csrc/arch.h``'s CUTLASS tiles, ``csrc/binding.cpp``'s one-frame cuDNN calls)."""
+    common = ["-O3", "-std=c++17", *(["-DWAN22_VAE_SM90"] if arch == "sm_90a" else [])]
+    return common, [f"-gencode=arch=compute_{arch[3:]},code={arch}", *common]
+
+
 def _arch(device: torch.device) -> str:
-    major, minor = torch.cuda.get_device_capability(device)
-    return f"sm_{major}{minor}a"
+    return ARCHS[torch.cuda.get_device_capability(device)]
 
 
 def decoder_weights(vae: nn.Module, device: torch.device) -> list[torch.Tensor]:

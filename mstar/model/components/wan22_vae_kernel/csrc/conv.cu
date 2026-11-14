@@ -1,5 +1,7 @@
 // Vendored from FastVideo (Apache-2.0): hao-ai-lab/FastVideo @ ec9145a,
-//   fastvideo-kernel/wan22_vae_decode/solution/conv.cu. Unchanged.
+//   fastvideo-kernel/wan22_vae_decode/solution/conv.cu
+// Local changes (M*): the architecture, tiles and epilogue schedule come from arch.h (upstream's on Blackwell; an
+// sm_90a build runs CUTLASS's SM90 implicit GEMM, wgmma and TMA im2col loads, with Hopper's tiles).
 // SPDX-License-Identifier: Apache-2.0
 // CUTLASS 4.2 Blackwell implicit convolution: 2-CTA 256x256x64 tiles,
 // TMA im2col loads, tcgen05 MMA, fp32 accumulation, bf16 epilogue.
@@ -17,10 +19,10 @@
 #include "cutlass/epilogue/collective/collective_builder.hpp"
 #include "cutlass/conv/device/conv_universal_adapter.hpp"
 #include "cutlass/conv/kernel/conv_universal.hpp"
+#include "arch.h"
 using namespace cute;
 using ElementBF16=cutlass::bfloat16_t;
 using LayoutNDHWC=cutlass::layout::TensorNDHWC;
-using ArchTag=cutlass::arch::Sm100;
 using OperatorClass=cutlass::arch::OpClassTensorOp;
 constexpr auto Fprop=cutlass::conv::Operator::kFprop;
 
@@ -31,7 +33,7 @@ at::Tensor launch(const at::Tensor& x,const at::Tensor& w,int ph,int pw,int phu=
   using Cluster=Shape<Int<CL>,_1,_1>;
   using Epilogue=typename cutlass::epilogue::collective::CollectiveBuilder<
     ArchTag,OperatorClass,Tile,Cluster,cutlass::epilogue::collective::EpilogueTileAuto,
-    float,float,ElementBF16,LayoutNDHWC,8,ElementBF16,LayoutNDHWC,8,cutlass::epilogue::collective::EpilogueScheduleAuto>::CollectiveOp;
+    float,float,ElementBF16,LayoutNDHWC,8,ElementBF16,LayoutNDHWC,8,ConvEpilogueSchedule>::CollectiveOp;
   using Mainloop=typename cutlass::conv::collective::CollectiveBuilder<
     ArchTag,OperatorClass,Fprop,ElementBF16,LayoutNDHWC,8,ElementBF16,LayoutNDHWC,8,float,Tile,Cluster,
     cutlass::conv::collective::StageCountAutoCarveout<static_cast<int>(sizeof(typename Epilogue::SharedStorage))>,
@@ -64,7 +66,7 @@ at::Tensor launch(const at::Tensor& x,const at::Tensor& w,int ph,int pw,int phu=
   return y;
 }
 at::Tensor custom_conv(const at::Tensor& x,const at::Tensor& w,int64_t ph,int64_t pw,int64_t variant) {
-  return launch<256,256,2>(x,w,ph,pw);
+  return launch<kTileConv.m,kTileConv.n,kTileConv.cl>(x,w,ph,pw);
 }
 
 // The output head's 3x1x1 convolution: N=128 because the head has 112 output channels, and a
@@ -72,10 +74,10 @@ at::Tensor custom_conv(const at::Tensor& x,const at::Tensor& w,int64_t ph,int64_
 // MHz, both arms in J1044 and J1343): N=128 is 0.83 PFLOP/s = 34% of peak, N=256 is 0.69 = 28%.
 // The time is what decides it and it is not close: 6.30 ms against 15.2 ms.
 at::Tensor conv_n128(const at::Tensor& x,const at::Tensor& w) {
-  return launch<256,128,2>(x,w,0,0);
+  return launch<kTileHead.m,kTileHead.n,kTileHead.cl>(x,w,0,0);
 }
 
 at::Tensor phase_conv(const at::Tensor& x,const at::Tensor& w,int a,int b,bool halo) {
   at::Tensor v=halo?x.narrow(3,a,x.size(3)-1):x;
-  return launch<256,256,2>(v,w,halo?0:1-a,1-b,halo?0:a,b);
+  return launch<kTilePhase.m,kTilePhase.n,kTilePhase.cl>(v,w,halo?0:1-a,1-b,halo?0:a,b);
 }

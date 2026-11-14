@@ -1,5 +1,6 @@
 // Vendored from FastVideo (Apache-2.0): hao-ai-lab/FastVideo @ ec9145a,
-//   fastvideo-kernel/wan22_vae_decode/solution/attn.cu. Unchanged.
+//   fastvideo-kernel/wan22_vae_decode/solution/attn.cu
+// Local changes (M*): the architecture, tile and epilogue schedule come from arch.h, as in conv.cu.
 // SPDX-License-Identifier: Apache-2.0
 // Mid-block self-attention with our own kernels, replacing ATen's
 // scaled_dot_product_attention (fmha_cutlassF, 8.5 ms of f121x1's 954 ms).
@@ -39,11 +40,11 @@
 #include "cutlass/epilogue/collective/collective_builder.hpp"
 #include "cutlass/conv/device/conv_universal_adapter.hpp"
 #include "cutlass/conv/kernel/conv_universal.hpp"
+#include "arch.h"
 
 using namespace cute;
 using ElementBF16 = cutlass::bfloat16_t;
 using LayoutNDHWC = cutlass::layout::TensorNDHWC;
-using ArchTag = cutlass::arch::Sm100;
 using OperatorClass = cutlass::arch::OpClassTensorOp;
 constexpr auto Fprop = cutlass::conv::Operator::kFprop;
 
@@ -57,7 +58,7 @@ static void gemm1x1(const at::Tensor& x, const at::Tensor& w, const at::Tensor& 
   using Epilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
       ArchTag, OperatorClass, Tile, Cluster, cutlass::epilogue::collective::EpilogueTileAuto,
       float, float, ElementD, LayoutNDHWC, 8, ElementD, LayoutNDHWC, 8,
-      cutlass::epilogue::collective::EpilogueScheduleAuto>::CollectiveOp;
+      ConvEpilogueSchedule>::CollectiveOp;
   using Mainloop = typename cutlass::conv::collective::CollectiveBuilder<
       ArchTag, OperatorClass, Fprop, ElementBF16, LayoutNDHWC, 8, ElementBF16, LayoutNDHWC, 8, float,
       Tile, Cluster,
@@ -201,7 +202,7 @@ at::Tensor attn_forward(const at::Tensor& qkv) {
     auto x = qv.narrow(1, 0, C).as_strided({1, C, HW, 1, 1}, {(int64_t)3 * C * HW, 1, 3 * C, 3 * C, 3 * C});
     auto w = qv.narrow(1, C, C).as_strided({HW, C, 1, 1, 1}, {3 * C, 1, 3 * C, 3 * C, 3 * C});
     auto y = nhwc_out(s.select(0, t), HW, HW);
-    gemm1x1<float, 256, 256, 2>(x, w, y);
+    gemm1x1<float, kTileAttn.m, kTileAttn.n, kTileAttn.cl>(x, w, y);
   }
 
   float* s_p = (float*)s.data_ptr();
@@ -214,7 +215,7 @@ at::Tensor attn_forward(const at::Tensor& qkv) {
     auto x = nhwc_in(p.select(0, t), PAD, HW);
     auto w = nhwc_w(vt.select(0, t), C, PAD);
     auto y = nhwc_out(o.select(0, t).select(0, 0), C, HW);
-    gemm1x1<ElementBF16, 256, 256, 2>(x, w, y);
+    gemm1x1<ElementBF16, kTileAttn.m, kTileAttn.n, kTileAttn.cl>(x, w, y);
   }
   return o;
 }

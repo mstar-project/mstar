@@ -768,7 +768,7 @@ class Wan22VaeDecoderSubmodule(_Fp32IslandMixin, NodeSubmodule):
     compiled.
 
     With ``config.vae_decode_kernel`` (opt-in, near-lossless) every untiled decode
-    runs on the Wan2.2-VAE Blackwell kernels (``mstar.model.components.wan22_vae_kernel``)
+    runs on the Wan2.2-VAE kernels (``mstar.model.components.wan22_vae_kernel``, Hopper and Blackwell)
     where they can run, at any size and with nothing compiled; elsewhere the knob is
     ignored with one log line.
 
