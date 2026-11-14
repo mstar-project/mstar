@@ -101,6 +101,33 @@ def _complete(conductor, rid, held=None):
     conductor._handle_reads_done(ReadsDone(rid, conductor.PREPROCESS_WORKER))
 
 
+def test_idle_expiry_admits_an_older_waiter_before_a_new_call(tmp_path, monkeypatch):
+    conductor, _, comm = _conductor(tmp_path, monkeypatch, idle_timeout_s=10)
+    conductor._ingest_request(_request("first", "robot-a"))
+    _complete(conductor, "first", {"frames": 4})
+
+    conductor._ingest_request(_request("waiting"))
+    assert _new_requests(comm, "waiting") == []
+    conductor._episode_records._records["robot-a"].last_end -= 11
+
+    conductor._ingest_request(_request("new", "robot-b"))
+    assert len(_new_requests(comm, "waiting")) == 1
+    assert _new_requests(comm, "new") == []
+    assert [body.request_id for body in conductor.waiting_queue] == ["new"]
+
+
+def test_close_admits_a_waiter_after_releasing_its_slot(tmp_path, monkeypatch):
+    conductor, _, comm = _conductor(tmp_path, monkeypatch)
+    conductor._ingest_request(_request("first", "robot-a"))
+    _complete(conductor, "first", {"frames": 4})
+
+    conductor._ingest_request(_request("waiting", "robot-b"))
+    assert _new_requests(comm, "waiting") == []
+    conductor._end_episode(EndEpisodeConductor("robot-a"))
+    assert len(_new_requests(comm, "waiting")) == 1
+    assert conductor.waiting_queue == []
+
+
 def test_named_calls_wait_for_teardown_then_plan_from_worker_counts(tmp_path, monkeypatch):
     conductor, model, comm = _conductor(tmp_path, monkeypatch)
     conductor._ingest_request(_request("first", "robot-a"))
