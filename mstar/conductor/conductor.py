@@ -1407,6 +1407,16 @@ class Conductor:
 
     def _try_admit_waiting(self):
         """Scan the queue up to the concurrency cap, preserving survivor order."""
+        if not self._episode_array_names:
+            while self.waiting_queue and (self.max_concurrent_requests is None or
+                                          len(self.requests) < self.max_concurrent_requests):
+                body = self.waiting_queue.pop(0)
+                request_log.debug(
+                    "Admitting queued request %s (%d/%s in-flight)", body.request_id,
+                    len(self.requests), str(self.max_concurrent_requests),
+                )
+                self._admit_request(body)
+            return
         blocked_episodes: set[str] = set()
         waiting, self.waiting_queue = self.waiting_queue, []
         for body in waiting:
@@ -1528,6 +1538,12 @@ class Conductor:
             # Planning registered the request before slot reservation. It sent
             # nothing to workers, so keep the preprocess inputs for the retry.
             self._drop_request(body.request_id)
+            if body.input_open:
+                self._reject_request(
+                    body.request_id, "server at capacity: a call with open input can't wait for a slot",
+                    status=503,
+                )
+                return True
             self.waiting_queue.append(body)
             if self._status_interval_s is not None:
                 self._queued_since.setdefault(body.request_id, time.perf_counter())
@@ -1584,7 +1600,7 @@ class Conductor:
         # A request admitted on arrival never waited.
         arrival_time = (
             None if self._status_interval_s is None
-            else self._queued_since.pop(body.request_id, ingest_time)
+            else self._queued_since.get(body.request_id, ingest_time)
         )
         model_kwargs = body.model_kwargs or {}
         max_output_tokens = self._max_output_tokens(model_kwargs)
@@ -1742,7 +1758,7 @@ class Conductor:
         )
         placement = (
             self._episode_records.placement_for(
-                body.episode, lambda: self._router.pick(resource_configs, groups_run),
+                body.episode, lambda: self._pick_episode_placement(resource_configs, groups_run),
             ) if episode_active else self._router.pick(resource_configs, groups_run)
         )
         worker_graph_to_workers = self._assign_worker_graphs_to_workers(placement.replicas)
@@ -1822,6 +1838,7 @@ class Conductor:
 
         # only now: a request refused before this leaves nothing in the mirrors
         request_data.routing = self._router.add(placement, resource_configs, groups_run)
+        self._queued_since.pop(body.request_id, None)
 
         # Send NewRequest to each worker with the appropriate partition's inputs
         request_data.dispatched = True
@@ -1978,6 +1995,28 @@ class Conductor:
         if slot is None:
             raise EpisodeCapacityError
         return slot
+
+    def _pick_episode_placement(self, configs: dict[str, ResourceReqConfig], groups_run: frozenset[int]):
+        """Use the normal replica pick when it has a slot; constrain it only when full."""
+        def workers_for(placement) -> set[str]:
+            return {
+                worker for worker_ids in self._assign_worker_graphs_to_workers(placement.replicas).values()
+                for worker in worker_ids
+            }
+
+        preferred = self._router.pick(configs, groups_run)
+        if self._episode_slots.free_slot(workers_for(preferred)) is not None:
+            return preferred
+        for slot in range(self._episode_slots.capacity):
+            placement = self._router.pick(
+                configs, groups_run,
+                eligible=lambda instance, slot=slot: self._episode_slots.available(
+                    {f"worker_{rank}" for rank in instance}, slot,
+                ),
+            )
+            if placement is not None and self._episode_slots.available(workers_for(placement), slot):
+                return placement
+        raise EpisodeCapacityError
 
     def _expire_episode_slots(self, now: float) -> bool:
         freed = False

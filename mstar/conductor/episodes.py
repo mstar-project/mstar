@@ -295,12 +295,17 @@ class EpisodeSlots:
     def reserve(self, owner: str, workers: set[str]) -> int | None:
         if not workers:
             raise ValueError("an episode needs at least one worker")
-        for slot in range(self.capacity):
-            if all((worker, slot) not in self._owners for worker in workers):
-                for worker in workers:
-                    self._owners[worker, slot] = owner
-                return slot
-        return None
+        slot = self.free_slot(workers)
+        if slot is not None:
+            for worker in workers:
+                self._owners[worker, slot] = owner
+        return slot
+
+    def available(self, workers: set[str], slot: int) -> bool:
+        return all((worker, slot) not in self._owners for worker in workers)
+
+    def free_slot(self, workers: set[str]) -> int | None:
+        return next((slot for slot in range(self.capacity) if self.available(workers, slot)), None)
 
     def has_free_on_any(self, workers: list[str]) -> bool:
         return any(

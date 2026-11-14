@@ -15,6 +15,7 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from mstar.conductor.conductor import Conductor  # noqa: E402
+from mstar.conductor.episodes import EpisodeCapacityError, EpisodeSlots  # noqa: E402
 from mstar.conductor.request_info import WalkStep  # noqa: E402
 from mstar.conductor.routing import ReplicaRouter, RoutingWeights, routing_cost  # noqa: E402
 from mstar.engine.resources.kv import manager as manager_mod  # noqa: E402
@@ -91,6 +92,8 @@ def _conductor(worker_graphs, specs=(), weights=None, model=None):
     conductor = object.__new__(Conductor)
     conductor.worker_graphs = worker_graphs
     conductor.requests = {}
+    conductor._episode_array_names = frozenset()
+    conductor._queued_since = {}
     conductor._router = ReplicaRouter(model or _Model(), worker_graphs.values(), specs=specs, weights=weights)
     return conductor
 
@@ -116,8 +119,71 @@ def _admit(conductor, rid, model_kwargs=None, passes=1):
     conductor._register_request(rid, SimpleNamespace(
         routing=router.add(placement, configs, groups_run),
         partition_states={"default": SimpleNamespace(fwd_pass_number=passes)},
+        episode_admitted=False,
     ))
     return conductor._assign_worker_graphs_to_workers(placement.replicas)
+
+
+def test_an_idle_episode_on_one_replica_does_not_block_a_free_replica():
+    conductor = _conductor({0: _wg(0, [0, 1])})
+    conductor._episode_slots = EpisodeSlots(1)
+    conductor._episode_slots.reserve("idle", {"worker_0"})
+    conductor._router._last_pick[(0, 0)] = -2
+    conductor._router._last_pick[(0, 1)] = 0
+
+    placement = conductor._pick_episode_placement({}, conductor._router.groups_run(["default"]))
+    assert conductor._assign_worker_graphs_to_workers(placement.replicas) == {0: ["worker_1"]}
+
+
+def test_episode_pick_keeps_the_normal_replica_when_it_has_a_slot():
+    conductor = _conductor({0: _wg(0, [0, 1])})
+    conductor._episode_slots = EpisodeSlots(1)
+    groups_run = conductor._router.groups_run(["default"])
+    preferred = conductor._router.pick({}, groups_run)
+
+    assert conductor._pick_episode_placement({}, groups_run) == preferred
+
+
+def test_episode_replica_pick_finds_one_slot_shared_across_units():
+    conductor = _conductor({
+        0: _wg(0, [0, 1], nodes=("a",)),
+        1: _wg(1, [2, 3], nodes=("b",)),
+    })
+    conductor._episode_slots = EpisodeSlots(2)
+    conductor._episode_slots.reserve("idle-a", {"worker_0"})  # slot 0
+    conductor._episode_slots.reserve("temporary", {"worker_2"})
+    conductor._episode_slots.reserve("idle-b", {"worker_2"})  # slot 1
+    conductor._episode_slots.release("temporary", {"worker_2"}, 0)
+    for unit in range(2):
+        conductor._router._last_pick[(unit, 0)] = -2
+        conductor._router._last_pick[(unit, 1)] = 0
+
+    groups_run = conductor._router.groups_run(["default"])
+    preferred = conductor._router.pick({}, groups_run)
+    assert preferred.replicas == {0: 0, 1: 0}
+    assert conductor._episode_slots.free_slot({"worker_0", "worker_2"}) is None
+
+    placement = conductor._pick_episode_placement({}, groups_run)
+    workers = {
+        worker for ids in conductor._assign_worker_graphs_to_workers(placement.replicas).values()
+        for worker in ids
+    }
+    assert placement.replicas != preferred.replicas
+    assert conductor._episode_slots.free_slot(workers) is not None
+
+
+def test_episode_pick_refuses_when_one_unit_has_no_free_replica():
+    conductor = _conductor({
+        0: _wg(0, [0, 1], nodes=("a",)),
+        1: _wg(1, [2, 3], nodes=("b",)),
+    })
+    conductor._episode_slots = EpisodeSlots(1)
+    conductor._episode_slots.reserve("idle-a", {"worker_0"})
+    conductor._episode_slots.reserve("idle-b", {"worker_1"})
+    assert conductor._episode_slots.has_free_on_any(["worker_0", "worker_1", "worker_2", "worker_3"])
+
+    with pytest.raises(EpisodeCapacityError):
+        conductor._pick_episode_placement({}, conductor._router.groups_run(["default"]))
 
 
 def test_requests_alternate_over_dp_replicas():
@@ -419,6 +485,7 @@ def test_a_request_refused_at_ingest_leaves_nothing_in_the_mirrors(plan):
         # 80 prompt positions, past the pool's max_seq_len of 64: a 400 in validate
         request_id="a", client_request_id=None, model_kwargs=_prompt("P", unkeyed=64), initial_signals={},
         initial_input_modalities=["text"], initial_output_modalities=["text"], streaming=False,
+        episode=None, episode_keys=None, reset_episode=False, episode_adapter_digest=None, input_open=False,
     ))
     assert refused == [400] and not conductor.requests
     (mirror,) = _mirrors(conductor._router)

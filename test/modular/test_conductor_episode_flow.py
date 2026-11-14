@@ -10,8 +10,8 @@ from mstar.api_server import entrypoint, openpi
 from mstar.api_server.positronic import PositronicPolicy
 from mstar.api_server.request_types import ResultChunk
 from mstar.conductor.conductor import Conductor
+from mstar.conductor.episodes import EpisodeCapacityError
 from mstar.conductor.request_info import WalkStep
-from mstar.conductor.routing import Placement
 from mstar.engine.state import Array, Attend, ChunkCausal, Entry, KVEntry, Read, TensorType, Window
 from mstar.engine.state.adapters import CHUNK_CAUSAL_LAYOUT_KWARG
 from mstar.graph.base import GraphEdge, GraphNode
@@ -107,11 +107,11 @@ def _conductor(tmp_path, monkeypatch, *, replicas=1, capacity=1, pool_slots=None
     return conductor, model, comm
 
 
-def _request(rid, episode=None, *, reset=False, keys=None):
+def _request(rid, episode=None, *, reset=False, keys=None, input_open=False):
     return NewRequestConductor(
         request_id=rid, initial_signals={}, initial_input_modalities=["text"],
         initial_output_modalities=["text"], input_metadata={}, model_kwargs={},
-        episode=episode, episode_keys=keys, reset_episode=reset,
+        episode=episode, episode_keys=keys, reset_episode=reset, input_open=input_open,
     )
 
 
@@ -156,11 +156,9 @@ def test_close_admits_a_waiter_after_releasing_its_slot(tmp_path, monkeypatch):
     assert conductor.waiting_queue == []
 
 
-def test_capacity_retry_keeps_older_waiters_ahead_of_later_calls(tmp_path, monkeypatch):
+def test_a_free_replica_admits_the_oldest_waiter(tmp_path, monkeypatch):
     conductor, _, comm = _conductor(tmp_path, monkeypatch, replicas=2, capacity=1)
     conductor.max_concurrent_requests = 1
-    picks = iter([0, 1, 0, 1, 1])
-    monkeypatch.setattr(conductor._router, "pick", lambda *_: Placement({0: next(picks)}, {}))
 
     conductor._ingest_request(_request("robot", "robot-a"))
     _complete(conductor, "robot", {"frames": 4})
@@ -170,12 +168,69 @@ def test_capacity_retry_keeps_older_waiters_ahead_of_later_calls(tmp_path, monke
     assert [body.request_id for body in conductor.waiting_queue] == ["older", "middle", "later"]
 
     _complete(conductor, "runner", {"frames": 4})
+    assert len(_new_requests(comm, "older")) == 1
+    assert [body.request_id for body in conductor.waiting_queue] == ["middle", "later"]
+
+    _complete(conductor, "older", {"frames": 4})
     assert len(_new_requests(comm, "middle")) == 1
+    assert _new_requests(comm, "later") == []
+
+
+def test_capacity_retry_keeps_older_waiters_ahead_of_later_calls(tmp_path, monkeypatch):
+    conductor, _, comm = _conductor(tmp_path, monkeypatch, replicas=2, capacity=1)
+    conductor.max_concurrent_requests = 1
+    conductor._ingest_request(_request("robot", "robot-a"))
+    _complete(conductor, "robot", {"frames": 4})
+    conductor._ingest_request(_request("runner"))
+    for rid in ("older", "middle", "later"):
+        conductor._ingest_request(_request(rid))
+
+    reserve = conductor._reserve_episode_slot
+    failed = False
+
+    def fail_first_reservation(owner, workers):
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise EpisodeCapacityError
+        return reserve(owner, workers)
+
+    monkeypatch.setattr(conductor, "_reserve_episode_slot", fail_first_reservation)
+    _complete(conductor, "runner", {"frames": 4})
+    assert failed and len(_new_requests(comm, "middle")) == 1
     assert [body.request_id for body in conductor.waiting_queue] == ["older", "later"]
 
     _complete(conductor, "middle", {"frames": 4})
     assert len(_new_requests(comm, "older")) == 1
     assert _new_requests(comm, "later") == []
+
+
+def test_open_input_is_refused_when_episode_slots_are_full(tmp_path, monkeypatch):
+    conductor, _, comm = _conductor(tmp_path, monkeypatch)
+    conductor._ingest_request(_request("robot", "robot-a"))
+    _complete(conductor, "robot", {"frames": 4})
+
+    conductor._ingest_request(_request("live", input_open=True))
+    assert "live" not in conductor.requests
+    assert conductor.waiting_queue == []
+    failures = [msg.body for _, msg in comm.sent
+                if msg.message_type == "request_failed" and msg.body.request_id == "live"]
+    assert len(failures) == 1 and failures[0].status == 503
+
+
+def test_capacity_retry_keeps_its_original_queue_time(tmp_path, monkeypatch):
+    conductor, _, _ = _conductor(tmp_path, monkeypatch)
+    conductor._status_interval_s = 1.0
+    conductor._ingest_request(_request("robot", "robot-a"))
+    _complete(conductor, "robot", {"frames": 4})
+
+    conductor._ingest_request(_request("waiting"))
+    queued_at = conductor._queued_since["waiting"]
+    conductor._try_admit_waiting()
+    assert conductor._queued_since["waiting"] == queued_at
+
+    conductor._end_episode(EndEpisodeConductor("robot-a"))
+    assert conductor.requests["waiting"].conductor_arrival_time == queued_at
 
 
 def test_named_calls_wait_for_teardown_then_plan_from_worker_counts(tmp_path, monkeypatch):
@@ -515,10 +570,11 @@ def test_only_one_overlapping_call_is_queued_for_an_episode(tmp_path, monkeypatc
 def test_slot_pressure_after_planning_drops_registered_request(tmp_path, monkeypatch):
     conductor, model, comm = _conductor(tmp_path, monkeypatch, replicas=2)
     conductor._ingest_request(_request("busy"))
-    busy_worker = _new_requests(comm, "busy")[0][0]
-    # A free slot exists on the other replica, so the cheap precheck passes.
-    # Force this candidate onto the busy replica to exercise late admission.
-    conductor._router.pick = lambda _configs, _groups: Placement({0: int(busy_worker[-1])}, {})
+    # Simulate the slot becoming unavailable after the replica pick.
+    def refuse_slot(*_):
+        raise EpisodeCapacityError
+
+    monkeypatch.setattr(conductor, "_reserve_episode_slot", refuse_slot)
     conductor._ingest_request(_request("waiting"))
     assert len(model.views) == 2
     assert [request.request_id for request in conductor.waiting_queue] == ["waiting"]
