@@ -686,9 +686,11 @@ class TalkerSubmodule(ARNodeSubmodule):
     def _run_depth(
         self, last_hidden: torch.Tensor, layer0_codes: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """`_depth_loop`'s outputs, from the frame kernel when it holds the rows and can draw as the sampler would."""
+        """`_depth_loop`'s outputs, from the frame kernel when the step's rows are in its range and it can draw as
+        the sampler would."""
         frame, batch_size = self._depth_frame, layer0_codes.shape[0]
-        draw = fused_draw_args(self.cp_sampler) if frame is not None and batch_size <= frame.max_rows else None
+        takes = frame is not None and frame.min_rows <= batch_size <= frame.max_rows
+        draw = fused_draw_args(self.cp_sampler) if takes else None
         if draw is None:
             return self._depth_loop(last_hidden, layer0_codes, lambda cp_logits: sample(self.cp_sampler, cp_logits))
         talker_table = self.model.model.codec_embedding.weight

@@ -93,7 +93,7 @@ from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, WalkStep
 from mstar.model.components.diffusion.unipc import SOLVER_STATE
 from mstar.model.components.mrope import layout_extent
-from mstar.model.components.video_encode import encode_mp4
+from mstar.model.components.video_encode import encode_mp4, encode_mp4_chunked
 from mstar.model.cosmos3 import constants
 from mstar.model.cosmos3.components.packing import (
     ACTION_MODE_FORWARD_DYNAMICS,
@@ -636,8 +636,9 @@ class Cosmos3Model(Model):
         # the MLP intermediate dim shard across ranks, the residual stream stays
         # full, and the row-parallel out/down projections all-reduce. Signals
         # between nodes stay replicated (empty shard_dim) — the sharding is
-        # in-module, Megatron-style. The VAE decoder runs un-sharded on one rank.
-        return ShardingConfig(groups=[], tp_enabled_nodes={DIT_NODE}, shard_dim={})
+        # in-module, Megatron-style. The VAE decoder can split its decode by
+        # rows over a TP group too (``HeightShardedDecoder``).
+        return ShardingConfig(groups=[], tp_enabled_nodes={DIT_NODE, VAE_DECODER_NODE}, shard_dim={})
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         # prefill: the understanding tower runs over the text prompt and writes
@@ -1341,26 +1342,21 @@ class Cosmos3Model(Model):
             fps = float((request_kwargs or {}).get("fps", self.config.fps))
             preset = os.environ.get("COSMOS3_X264_PRESET", "ultrafast")
             try:
-                # Preferred: torchcodec (torchvision >= 0.27 removed write_video).
-                from torchcodec.encoders import VideoEncoder
-
-                encoded = VideoEncoder(frames, frame_rate=fps).to_tensor(
-                    "mp4",
-                    codec="libx264",
-                    crf=18,
-                    preset=preset,
-                    extra_options={"threads": "0"},
-                )
-                data = encoded.numpy().tobytes()
+                # Preferred: torchcodec (torchvision >= 0.27 removed write_video),
+                # the clip's frames in parallel pieces, a keyframe at each.
+                data = encode_mp4_chunked(frames, fps, crf=18, preset=preset)
             except Exception as exc:  # noqa: BLE001 — torchcodec raises RuntimeError/OSError without FFmpeg
                 # Fallback for environments without a loadable torchcodec (no
                 # FFmpeg shared libraries on the host, or the older
-                # decode-only build that lacks VideoEncoder): PyAV, whose
-                # wheel bundles FFmpeg with libx264, at the same CRF/preset.
-                if not isinstance(exc, ImportError):
+                # decode-only build that lacks VideoEncoder), or a failed
+                # chunked encode: PyAV, whose wheel bundles FFmpeg with
+                # libx264, at the same CRF/preset, in one piece.
+                # torchcodec simply not installed is the expected fallback; any
+                # other failure (PyAV missing for the chunked mux included) says so
+                if not (isinstance(exc, ImportError) and (exc.name or "").startswith("torchcodec")):
                     logger.warning(
-                        "Cosmos3 video encode: torchcodec unavailable (%s); encoding with PyAV",
-                        str(exc).splitlines()[0][:160],
+                        "Cosmos3 video encode: the torchcodec encode failed (%s: %s); encoding with PyAV",
+                        type(exc).__name__, str(exc).splitlines()[0][:160] if str(exc) else "",
                     )
                 # NTSC rates exactly (encode_mp4's denominator is 1001)
                 data = encode_mp4(
@@ -1952,13 +1948,21 @@ class Cosmos3Model(Model):
             )
         if node_name == VAE_DECODER_NODE:
             # The fast decode converts its VAE to channels-last in place, so it
-            # takes the decoder-only copy rather than the shared instance.
-            vae = (
-                self._build_decoder_only_vae(device)
-                if self.config.vae_decode_fast
-                else self._build_vae(device)
+            # takes the decoder-only copy rather than the shared instance. A
+            # decode split over several ranks also switches its layers to their
+            # row-band classes, which no other node on the device may see (a
+            # windowed decoder or the DiT's chained head would hand them whole
+            # frames), so it loads a copy of its own.
+            sharded = tp_group is not None and tp_group.world_size > 1
+            if sharded:
+                vae = self._load_decoder_only_vae(device)
+            elif self.config.vae_decode_fast:
+                vae = self._build_decoder_only_vae(device)
+            else:
+                vae = self._build_vae(device)
+            return Cosmos3VAEDecoderSubmodule(
+                vae=vae, config=self.config, fast=self.config.vae_decode_fast, tp_group=tp_group,
             )
-            return Cosmos3VAEDecoderSubmodule(vae=vae, config=self.config, fast=self.config.vae_decode_fast)
         if node_name == VAE_DECODER_AR_NODE:
             return Cosmos3VAEDecoderARSubmodule(vae=self._build_streaming_decode_vae(device), config=self.config)
         if node_name == AUDIO_DECODER_NODE:
@@ -2061,12 +2065,18 @@ class Cosmos3Model(Model):
         if self.skip_weight_loading:
             return None
         if device not in self._decoder_only_vaes:
-            from diffusers import AutoencoderKLWan
-
-            vae = AutoencoderKLWan.from_pretrained(str(self._ensure_repo() / "vae"))
-            vae.encoder = None
-            self._decoder_only_vaes[device] = vae.to(device).eval()
+            self._decoder_only_vaes[device] = self._load_decoder_only_vae(device)
         return self._decoder_only_vaes[device]
+
+    def _load_decoder_only_vae(self, device: str):
+        """A new decoder-only instance on ``device``, shared with nothing."""
+        if self.skip_weight_loading:
+            return None
+        from diffusers import AutoencoderKLWan
+
+        vae = AutoencoderKLWan.from_pretrained(str(self._ensure_repo() / "vae"))
+        vae.encoder = None
+        return vae.to(device).eval()
 
     def _build_encode_vae(self, device: str):
         # The encoder node keeps its own instance instead of sharing the

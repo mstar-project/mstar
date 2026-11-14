@@ -118,8 +118,8 @@ is **not** the only wiring step. A model also needs:
   only through ``POST /generate`` needs none. The adapter is ported to the Rust frontend in the
   same change (a type implementing ``OpenAIAdapter`` in ``rust/server/src/adapters/`` and its
   row in ``ADAPTERS``, tested by
-  ``test/rust/test_rust_openai_adapters.py``): the Python HTTP frontend is being retired, and a
-  surface only it serves is unfinished.
+  ``test/rust/test_rust_openai_adapters.py``): ``mstar serve`` serves HTTP from ``mstar-server``,
+  the Python HTTP frontend is deprecated, and a surface only it serves is unfinished.
 - the client-example tuples further down ``mstar/cli/main.py``, so ``mstar serve`` prints a
   usage snippet. Cosmetic, but user-visible.
 
@@ -1063,8 +1063,10 @@ The spec types are:
        ``max_tokens_per_request``, ``compile_op`` and ``workspace_mb``. ``CUDNN`` runs torch's
        cuDNN SDPA over equal-length segments (see `Cacheless attention (encoder towers)`_).
        ``DENSE`` runs FA3
-       ``flash_attn_varlen`` (AITER on ROCm) and falls back to FlashInfer if that kernel is
-       missing. The heads are split across the node's TP ranks (TP × SP over
+       ``flash_attn_varlen`` (AITER on ROCm), or FA3's fixed-length kernel for an eager
+       plan of one non-causal segment on Hopper (and, at head dim 128, once per segment
+       for a plan whose segments are all at least 1536 rows), and falls back to FlashInfer
+       if that kernel is missing. The heads are split across the node's TP ranks (TP × SP over
        a label the node's shard lists, on a node whose shard splits, below).
        ``workspace_mb`` is the floor of each label's FlashInfer workspace per slot (default
        ``MSTAR_WORKSPACE_BUFFER_MB``, 512, which doesn't apply once it is declared): a plan that
@@ -3612,7 +3614,10 @@ frame inside PyAV. A PyAV mp4 should be written with
 ``mstar.model.components.video_encode.encode_mp4``, which takes the model's x264 options,
 rate and padding, and converts the frames to the encoder's pixel format on a thread a few
 frames ahead of the encoder, so x264 gets the frames the plain ``stream.encode`` loop
-would hand it without waiting on the conversion between them. The SHM arena's CPU read of an
+would hand it without waiting on the conversion between them. A torchcodec mp4 of a long
+clip can be written with ``video_encode.encode_mp4_chunked``, which encodes it in parallel
+pieces on the CPU plan's threads and joins them into one stream (a keyframe per piece). The
+SHM arena's CPU read of an
 output slices a large copy over threads of its own
 (``mstar.utils.host_copy.HostCopier``), one encode's share of the CPUs.
 

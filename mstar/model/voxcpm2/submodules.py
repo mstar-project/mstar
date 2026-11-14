@@ -221,9 +221,10 @@ class TalkerSubmodule(ARNodeSubmodule):
     Per-request CFM noise comes from a CUDA generator seeded with the
     request's seed and drawn one ``[1, feat, patch]`` tensor per step, which is
     the reference's own sequence of ``torch.randn`` calls after
-    ``torch.manual_seed(seed)``. The generator's state is a host field between
-    steps. The noise rides into the step as an input, so batching and graph
-    replay leave it alone.
+    ``torch.manual_seed(seed)``. A step takes draw ``generated``, the request's
+    count of committed patches, so a refused step draws the same noise when it
+    is prepared again. The noise rides into the step as an input, so batching
+    and graph replay leave it alone.
     """
 
     disable_torch_compile = True
@@ -250,8 +251,14 @@ class TalkerSubmodule(ARNodeSubmodule):
         self.inference_timesteps = inference_timesteps
         self.compile_decode = compile_decode
         self._t_span: torch.Tensor | None = None
-        # scratch: seeded or set before every draw, so no draw reads what another left
+        # scratch: seeded before every draw, so no draw reads what another left
         self._rng = torch.Generator(device=self.get_device())
+        # How far one draw moves a CUDA generator's offset. A CPU generator has no offset.
+        self._draw_offset: int | None = None
+        if self._rng.device.type == "cuda":
+            before = self._rng.get_offset()
+            self._noise()
+            self._draw_offset = self._rng.get_offset() - before
         self._index_stager = PinnedStager(torch.long, numel=self.MAX_BATCH_SIZE)
         self._cfg_stager = PinnedStager(torch.float32, numel=self.MAX_BATCH_SIZE)
 
@@ -268,23 +275,28 @@ class TalkerSubmodule(ARNodeSubmodule):
 
     # -- per-request noise -------------------------------------------------
 
-    def _draw(self, rng: bytes, seed: int) -> tuple[torch.Tensor, bytes]:
-        """The request's next CFM noise, and its generator's state after it. A
-        request draws in order, so a draw comes from the state the last one
-        left, and the first from the seed. One launch per row (no host sync):
-        each request has its own seeded stream, which one batched draw could
-        not reproduce."""
-        if rng:
-            self._rng.set_state(torch.frombuffer(bytearray(rng), dtype=torch.uint8))
-        else:
-            self._rng.manual_seed(seed)
-        noise = torch.randn(
+    def _noise(self) -> torch.Tensor:
+        return torch.randn(
             (1, self.config.feat_dim, self.config.patch_size),
             generator=self._rng,
             device=self.get_device(),
             dtype=self._dtype(),
-        )[0]
-        return noise, self._rng.get_state().numpy().tobytes()
+        )
+
+    def _draw(self, generated: int, seed: int) -> torch.Tensor:
+        """The request's CFM noise for the patch after ``generated`` committed
+        ones: draw ``generated`` of the stream ``seed`` starts. Each draw moves
+        a CUDA generator's offset by the same amount, so setting the offset
+        reaches any draw. A CPU generator has no offset and draws the earlier
+        ones first. One launch per row (no host sync): each request has its own
+        seeded stream, which one batched draw could not reproduce."""
+        self._rng.manual_seed(seed)
+        if self._draw_offset is None:
+            for _ in range(generated):
+                self._noise()
+        else:
+            self._rng.set_offset(generated * self._draw_offset)
+        return self._noise()[0]
 
     # -- prepare / preprocess ----------------------------------------------
 
@@ -312,7 +324,7 @@ class TalkerSubmodule(ARNodeSubmodule):
             )
             if audio is not None:
                 patches.index_copy_(0, audio_pos, audio)
-            noise, rng = self._draw(b"", int(fwd_info.random_seed))
+            noise = self._draw(0, int(fwd_info.random_seed))
             return ARNodeInputs(
                 input_ids=token_ids,
                 input_seq_len=token_ids.shape[0],
@@ -324,7 +336,7 @@ class TalkerSubmodule(ARNodeSubmodule):
                 },
                 kwargs={
                     "step": 0,
-                    "rng": rng,
+                    "from_request": True,
                     "cfg": float(meta[CFG_KEY]),
                     "prompt_patches": ref[1][-self.config.prompt_context_patches :]
                     if mode == MODE_REF_CONTINUATION
@@ -335,26 +347,24 @@ class TalkerSubmodule(ARNodeSubmodule):
             raise ValueError(f"Unknown VoxCPM2 Talker walk: {graph_walk!r}")
         # What the last committed step left: a step whose admit was refused
         # committed nothing, so it prepares the same index and noise again.
-        progress = host(self.progress, fwd_info.rid_handle, "main", 0)
-        if not progress["rng"]:
-            # seeding here would draw the prefill's noise again
+        step = host(self.progress, fwd_info.rid_handle, "main", 0)["generated"]
+        if step == 0:
             raise KeyError(
                 f"VoxCPM2 talker {fwd_info.request_id}: a decode step ran with no prefill committed, "
-                f"so {TALKER_STEP!r} holds no generator state to draw its noise from"
+                f"so {TALKER_STEP!r} counts no patch and the step would draw the prefill's noise"
             )
-        step = progress["generated"]
         if step >= int(meta[PATCH_BUDGET_KEY]):
             logger.debug("VoxCPM2 talker %s: skipping overshoot step %d", fwd_info.request_id, step)
             return None
         prev = inputs["latent_patch"][0].to(device=device, dtype=self._dtype())
-        noise, rng = self._draw(progress["rng"], int(fwd_info.random_seed))
+        noise = self._draw(step, int(fwd_info.random_seed))
         return ARNodeInputs(
             input_seq_len=1,
             tensor_inputs={
                 "prev_patch": prev.reshape(self.config.patch_size, self.config.feat_dim),
                 "noise": noise,
             },
-            kwargs={"step": step, "rng": rng, "cfg": float(meta[CFG_KEY])},
+            kwargs={"step": step, "from_request": True, "cfg": float(meta[CFG_KEY])},
         )
 
     def _to_device(self, stager: PinnedStager, values: list) -> torch.Tensor:
@@ -398,13 +408,13 @@ class TalkerSubmodule(ARNodeSubmodule):
         """One causal step over the packed batch, the same span in both LMs, and
         each row's progress written at commit.
 
-        The writes come from the draw in the row's inputs. The capture templates carry
-        no ``rng``, so a capture's rows and a replay's padding rows write nothing.
+        Only the rows ``prepare_inputs`` builds carry ``from_request``. Capture
+        templates and a replay's padding rows lack it, so they write nothing.
         """
         del graph_walk, slot_lease, piecewise_leases, kwargs
         progress = {
-            (rid, "main", 0): {"generated": inp.kwargs["step"] + 1, "rng": inp.kwargs["rng"]}
-            for rid, inp in zip(request_ids, inputs, strict=True) if "rng" in inp.kwargs
+            (rid, "main", 0): {"generated": inp.kwargs["step"] + 1}
+            for rid, inp in zip(request_ids, inputs, strict=True) if inp.kwargs.get("from_request")
         }
         state = {BASE_KV: ArrayStep(), RES_KV: ArrayStep()}
         if progress:
