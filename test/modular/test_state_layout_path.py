@@ -19,10 +19,8 @@ from test_kv_prefix_request_keys import PROMPT, _deployment, _Model, _run, _work
 
 from mstar.conductor.conductor import (
     Conductor,
-    _check_chunk_layouts,
-    _check_expert_layouts,
-    _required_chunk_layouts,
-    _required_expert_layouts,
+    _check_mask_layouts,
+    _required_mask_layouts,
     _with_chunk_causal_layout,
     _with_expert_layout,
 )
@@ -223,14 +221,13 @@ def test_chunk_and_expert_masks_can_follow_kv_and_sizes_at_walk_plan():
     assert CHUNK_CAUSAL_LAYOUT_KWARG not in kwargs
     assert EXPERT_LAYOUT_KWARG not in kwargs
 
-    chunk_required = _required_chunk_layouts(model, model.declare_state())
-    expert_required = _required_expert_layouts(model, model.declare_state())
+    required = _required_mask_layouts(model, model.declare_state())
     with pytest.raises(RuntimeError, match="has no chunk-causal layout"):
-        _check_chunk_layouts([WalkStep("prefill")], chunk_required)
-    with pytest.raises(RuntimeError, match="has no expert layout"):
-        _check_expert_layouts([WalkStep("prefill")], expert_required)
-
+        _check_mask_layouts([WalkStep("prefill")], required)
     chunk = {"chunk": {"main": {"chunk_attn": [4, 16, 8]}}}
+    with pytest.raises(RuntimeError, match="has no expert layout"):
+        _check_mask_layouts([WalkStep("prefill", step_metadata={CHUNK_CAUSAL_LAYOUT_KWARG: chunk})], required)
+
     expert = {"expert": {"main": {"expert_attn": [2]}}}
     steps = [WalkStep("prefill", step_metadata={
         CHUNK_CAUSAL_LAYOUT_KWARG: chunk, EXPERT_LAYOUT_KWARG: expert,
@@ -238,8 +235,7 @@ def test_chunk_and_expert_masks_can_follow_kv_and_sizes_at_walk_plan():
     declarations = model.declare_state()
     steps = _with_chunk_causal_layout(steps, kwargs.get(CHUNK_CAUSAL_LAYOUT_KWARG), declarations)
     steps = _with_expert_layout(steps, kwargs.get(EXPERT_LAYOUT_KWARG), declarations)
-    _check_chunk_layouts(steps, chunk_required)
-    _check_expert_layouts(steps, expert_required)
+    _check_mask_layouts(steps, required)
     assert steps[0].step_metadata[CHUNK_CAUSAL_LAYOUT_KWARG] == chunk
     assert steps[0].step_metadata[EXPERT_LAYOUT_KWARG] == expert
 
@@ -282,21 +278,25 @@ def test_chunk_layout_can_be_supplied_by_walk_plan_after_intake():
             del output.metadata["state_layout"]
             return output
 
+        def walk_plan(self, *args, **kwargs):
+            return [WalkStep("prefill", step_metadata={
+                CHUNK_CAUSAL_LAYOUT_KWARG: {"chunk": {"main": {"chunk_attn": [12, 8, 8]}}},
+            })]
+
     kwargs = _run(_worker(PlannedChunk(), _deployment()))
     assert CHUNK_CAUSAL_LAYOUT_KWARG not in kwargs
 
     model = PlannedChunk()
-    required = _required_chunk_layouts(model, model.declare_state())
+    required = _required_mask_layouts(model, model.declare_state())
     with pytest.raises(RuntimeError, match="has no chunk-causal layout"):
-        _check_chunk_layouts([WalkStep("prefill")], required)
+        _check_mask_layouts([WalkStep("prefill")], required)
 
     request_layout = {"chunk": {"main": {"chunk_attn": [4, 16, 8]}}}
-    planned_layout = {"chunk": {"main": {"chunk_attn": [12, 8, 8]}}}
+    planned_layout = model.walk_plan("main", [], [], {}, kwargs)[0].step_metadata[CHUNK_CAUSAL_LAYOUT_KWARG]
     plan = _with_chunk_causal_layout(
-        [WalkStep("prefill", step_metadata={CHUNK_CAUSAL_LAYOUT_KWARG: planned_layout})], request_layout,
-        model.declare_state(),
+        model.walk_plan("main", [], [], {}, kwargs), request_layout, model.declare_state(),
     )
-    _check_chunk_layouts(plan, required)
+    _check_mask_layouts(plan, required)
     assert plan[0].step_metadata[CHUNK_CAUSAL_LAYOUT_KWARG] == planned_layout
 
 
