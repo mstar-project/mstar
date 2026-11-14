@@ -14,6 +14,8 @@ from aiohttp import web
 from benchmark.eval.datasets import Item
 from benchmark.eval.e2e import arm, checks
 from benchmark.eval.e2e.manifest import load
+from benchmark.eval.suites import praxis_wire
+from benchmark.eval.suites.base import exception_row
 from benchmark.eval.suites.e2e import E2ESuite
 from benchmark.eval.suites.praxis_wire import (
     ProtocolError,
@@ -68,6 +70,31 @@ def test_positronic_probe_refuses_missing_stack_or_wrong_warm_rows():
         _commands({"result": [command] * 21}, 24)
     with pytest.raises(ProtocolError, match="only robot_command and target_grip"):
         _commands({"result": [{**command, "timestamp": 0.0}] * 24}, 24)
+    with pytest.raises(ProtocolError, match="Positronic error: bad robot state") as error:
+        _commands({"status": "error", "error": "bad robot state"}, 21)
+    failed = exception_row(Item(id="000"), error.value)
+    assert failed["error"] == "ProtocolError" and "bad robot state" in failed["_detail"]
+
+
+def test_positronic_jpeg_cache_reuses_the_same_color(monkeypatch):
+    from PIL import Image
+
+    for maker in (praxis_wire._camera, getattr(praxis_wire, "_jpeg_color", None)):
+        if maker is not None and hasattr(maker, "cache_clear"):
+            maker.cache_clear()
+    saved = 0
+    original = Image.Image.save
+
+    def save(image, *args, **kwargs):
+        nonlocal saved
+        saved += 1
+        return original(image, *args, **kwargs)
+
+    monkeypatch.setattr(Image.Image, "save", save)
+    first = praxis_wire._camera(0, 0, 0, 20)
+    second = praxis_wire._camera(0, 3, 1, 0)
+    assert first == second
+    assert saved == 1
 
 
 def test_cold_openpi_payload_passes_the_real_policy_parser():
@@ -99,8 +126,9 @@ def test_warm_positronic_payload_passes_the_real_e5_decoder_and_ready_config():
     meta = yaml.safe_load(config_path.read_text())["positronic"]["meta"]
     _ready({"status": "ready", "protocol_version": 2, "session_id": "a" * 32,
             "meta": {**meta, "sample_seed_base": 1234}}, 0)
-    for call, prior, reset in ((0, 0, False), (1, 21, False), (2, 24, False), (3, 0, True)):
-        frame = pack({"session_id": "a" * 32, "observation": _positronic_observation(0, call, reset)})
+    for call, prior, reset, frames in ((0, 0, False, 1), (1, 21, False, 22),
+                                       (2, 24, False, 25), (3, 0, True, 1)):
+        frame = pack({"session_id": "a" * 32, "observation": _positronic_observation(0, call, reset, frames)})
         parsed = decoder.decode_praxis_frame(frame, "single_arm", prior)
         assert not parsed.reset_episode and parsed.executed_rows == prior
         assert [tuple(x.shape) for x in parsed.executed_frames] == [(prior, 3, 234, 416)] * 2
@@ -189,8 +217,9 @@ def test_positronic_probe_checks_warm_reset_and_phase_latency(tmp_path):
     row = asyncio.run(run())
     assert row["ok"] and row["n_chunks"] == 90 and len(row["_blob"]) == 90 * 13 * 4
     assert [obs.get("reset_context", 0) for obs in seen] == [0, 0, 0, 1]
-    assert all(obs["robot_state.ee_pose"].shape == (25, 7) for obs in seen)
-    assert all(len(obs["image.exterior"][b"frames"]) == 25 for obs in seen)
+    assert [obs["robot_state.ee_pose"].shape for obs in seen] == [(n, 7) for n in (1, 22, 25, 1)]
+    assert [len(obs["image.exterior"][b"frames"]) for obs in seen] == [1, 22, 25, 1]
+    assert [len(obs["image.wrist"][b"frames"]) for obs in seen] == [1, 22, 25, 1]
     metrics = _suite("praxis_positronic").score([Item(id="000")], [row], 2.0, tmp_path / "saved")
     assert all(metrics[f"{phase}_p50_s"] > 0 for phase in ("cold", "warm1", "warm2", "reset"))
     assert metrics["call_per_s"] == 2.0

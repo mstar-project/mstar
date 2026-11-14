@@ -20,7 +20,12 @@ import numpy as np
 
 from benchmark.eval.datasets import Item
 
-PHASES = (("cold", 21, False), ("warm1", 24, False), ("warm2", 24, False), ("reset", 21, True))
+PHASES = (
+    ("cold", 21, False, 1),
+    ("warm1", 24, False, 22),
+    ("warm2", 24, False, 25),
+    ("reset", 21, True, 1),
+)
 OPENPI_ROWS = (21, 10)
 CAMERA_SIZE = (234, 416)
 
@@ -73,16 +78,20 @@ async def _recv(ws, timeout_s: float) -> Any:
 
 
 @lru_cache(maxsize=256)
-def _camera(index: int, call: int, view: int, frame: int) -> bytes:
+def _jpeg_color(color: int) -> bytes:
     from PIL import Image
 
     h, w = CAMERA_SIZE
-    color = (17 * index + 29 * call + 7 * frame + 53 * view) % 256
     pixels = np.full((h, w, 3), color, dtype=np.uint8)
     pixels[:, ::16, 1] = (color + 40) % 256
     buf = io.BytesIO()
     Image.fromarray(pixels).save(buf, format="JPEG", quality=85)
     return buf.getvalue()
+
+
+def _camera(index: int, call: int, view: int, frame: int) -> bytes:
+    color = (17 * index + 29 * call + 7 * frame + 53 * view) % 256
+    return _jpeg_color(color)
 
 
 @lru_cache(maxsize=16)
@@ -99,15 +108,15 @@ def _openpi_observation(index: int) -> bytes:
     })
 
 
-def _positronic_observation(index: int, call: int, reset: bool) -> dict:
+def _positronic_observation(index: int, call: int, reset: bool, frames: int) -> dict:
     images = {
-        name: {b"__jpeg__": True, b"frames": [_camera(index, call, view, frame) for frame in range(25)],
+        name: {b"__jpeg__": True, b"frames": [_camera(index, call, view, frame) for frame in range(frames)],
                b"ndim": 4}
         for view, name in enumerate(("image.exterior", "image.wrist"))
     }
-    poses = np.tile(np.array([0, 0, 0.6, 1, 0, 0, 0], np.float32), (25, 1))
-    poses[:, 0] = index * 0.01 + call * 0.1 + np.arange(25, dtype=np.float32) * 0.001
-    return {**images, "robot_state.ee_pose": poses, "grip": np.full(25, 0.5, np.float32),
+    poses = np.tile(np.array([0, 0, 0.6, 1, 0, 0, 0], np.float32), (frames, 1))
+    poses[:, 0] = index * 0.01 + call * 0.1 + np.arange(frames, dtype=np.float32) * 0.001
+    return {**images, "robot_state.ee_pose": poses, "grip": np.full(frames, 0.5, np.float32),
             "descriptor": "remote.robolab.droid", "task": "pick up the red block",
             **({"reset_context": 1} if reset else {})}
 
@@ -144,6 +153,9 @@ def _ready(value: Any, index: int) -> str:
 
 
 def _commands(reply: Any, expected: int) -> np.ndarray:
+    if isinstance(reply, dict) and reply.get("status") == "error":
+        detail = reply.get("error")
+        raise ProtocolError(f"Positronic error: {detail}" if detail else "Positronic returned an error")
     rows = reply.get("result") if isinstance(reply, dict) else None
     if not isinstance(rows, list) or len(rows) != expected:
         count = len(rows) if isinstance(rows, list) else "no"
@@ -203,8 +215,8 @@ async def run_positronic(_session, url: str, index: int, item: Item, t0: float, 
             raise ProtocolError("Positronic did not send a loading frame")
         sid = _ready(await _recv(ws, timeout.total), index)
         outputs, times = [], {}
-        for call, (phase, expected, reset) in enumerate(PHASES):
-            frame = pack({"session_id": sid, "observation": _positronic_observation(index, call, reset)})
+        for call, (phase, expected, reset, frames) in enumerate(PHASES):
+            frame = pack({"session_id": sid, "observation": _positronic_observation(index, call, reset, frames)})
             started = time.perf_counter()
             await ws.send(frame)
             outputs.append(_commands(await _recv(ws, timeout.total), expected))
