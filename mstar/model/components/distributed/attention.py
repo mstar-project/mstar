@@ -27,7 +27,7 @@ from torch import nn
 from mstar.distributed.communication import CommGroup
 from mstar.distributed.utils import divide, kv_head_replicas
 from mstar.engine.resources.convenience import AttentionCallable
-from mstar.engine.state import rope
+from mstar.engine.state import add_read, rope
 from mstar.model.components.distributed.linear import (
     ColumnParallelLinear,
     KVColumnParallelLinear,
@@ -159,8 +159,7 @@ class ParallelAttention(nn.Module):
         # which passes q and k as views of one projection with no QK norm, and is safe only because the model sets
         # `disable_torch_compile`.
         q, k = self._rotate_state(q, k)
-        self.state.add(self.layer, k=k, v=v)
-        return self.state.read(self.layer, q)
+        return add_read(self.state, self.layer, q, k=k, v=v)
 
     def _apply_rope(
         self,
@@ -189,12 +188,11 @@ class ParallelAttention(nn.Module):
         q, k, v = self._project_qkv(hidden_states)
         q, k = self._apply_qk_norm(q, k)
         if self.state is not None:
-            # Rotate here rather than in `_attend_state`: the break in the handle's `add` compiles that method as a
-            # frame of its own, whose inputs q and k are views of one projection, and rotating those aliased inputs in
-            # place fails Inductor's `assert_size_stride` at boot.
+            # Rotate here rather than in `_attend_state`: the break in `add_read` compiles that method as a frame of
+            # its own, whose inputs q and k are views of one projection, and rotating those aliased inputs in place
+            # fails Inductor's `assert_size_stride` at boot.
             q, k = self._rotate_state(q, k)
-            self.state.add(self.layer, k=k, v=v)
-            attn_output = self.state.read(self.layer, q)
+            attn_output = add_read(self.state, self.layer, q, k=k, v=v)
         else:
             q, k = self._apply_rope(q, k, self.attend.label)
             attn_output = self.attend(q, k, v)

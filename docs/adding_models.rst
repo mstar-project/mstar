@@ -2386,6 +2386,7 @@ The rest are free functions in ``mstar.engine.state``:
 
 .. code-block:: python
 
+   out  = add_read(self.kv, layer, q, k=k, v=v)                            # add, then read, behind one break
    qkv  = causal_conv(self.gdn, layer, qkv, weight=w, bias=b)              # reads and writes `conv`
    core = gated_delta_net(self.gdn, layer, q, k, v, a, b, A_log, dt_bias)  # reads and writes `state`
    p    = position(self.kv, fwd_info.rid_handle, label)                    # a request's next position, on the host
@@ -2403,6 +2404,11 @@ The shard's handle is opened on every step of its node and takes the label it br
 step's segments and the walk from the step, so the calls name neither. Both are the identity on a
 copied step, at one SP rank and outside a step.
 
+A layer with nothing traced between its ``add`` and its ``read`` calls ``add_read``, since two breaks
+compile a frame for the gap on every shape. It runs both calls' checks in their order, and refuses an
+array with ``max_len=0``, whose calls a compiled block traces. Call it from the frame the layer
+compiles: a break inside a method that frame calls compiles that method as a frame of its own.
+
 On an array that keeps entries, every call that touches state breaks the compiled graph and runs
 eagerly, so model code adds no ``torch.compiler.disable`` of its own. A layer stack calls
 ``run_layers(..., no_cursor)``, which runs its loop eagerly and compiles each layer's frame once,
@@ -2419,16 +2425,20 @@ calls, which any other format runs:
 
 .. code-block:: python
 
-   @state_op(adds=("kv",), mutates=("q",), formats=(PagedNHD(devices={"cuda"}),), reference=_reference)
-   def write(kv, layer, q, k, v, *, target: PagedNHDTarget): ...
+   @state_op(adds=("kv",), reads=("kv",), mutates=("q",), formats=(PagedNHD(devices={"cuda"}),),
+             reference=_reference)
+   def attend(kv, layer, q, k, v, *, target: PagedNHDTarget):
+       ...                                      # write k and v at target, and change q in place
+       return kv.read(layer, q)
 
-   write(self.kv, self.layer, q, k, v)      # counts as the layer's add, and breaks the graph as add does
-   out = self.kv.read(self.layer, q)
+   out = attend(self.kv, self.layer, q, k, v)  # the layer's add, then its read, behind one break
 
-The engine picks the kernel or the reference at bind, and a step whose reads attend its own ``k`` and ``v``
-(a context-parallel pool's multi-token step) runs the reference. ``target`` says where this step's entries go
-on the layer. A conformance test holds each kernel to its reference on each listed format, and
-``MSTAR_KV_DEBUG_ASSERTS=1`` checks that an eager call writes nothing outside the step's slots.
+``reads`` may name only the array in ``adds``, and the call refuses an array with ``max_len=0``,
+as ``add_read`` does. The engine picks the kernel or the reference at bind, and a step whose reads
+attend its own ``k`` and ``v`` (a context-parallel pool's multi-token step) runs the reference.
+``target`` says where this step's entries go on the layer. A conformance test holds each kernel to
+its reference on each listed format, what it returns included, and ``MSTAR_KV_DEBUG_ASSERTS=1``
+checks that an eager call writes nothing outside the step's slots.
 
 Between steps, a model may keep a memo of a pure function of request inputs, whose loss costs time
 and changes no output, and scratch buffers that it makes at load and that no step reads before
@@ -3273,7 +3283,7 @@ Splitting is declared in four places:
   through ``write_target`` or calls ``attn.run`` itself raises on a split label, since it would
   treat this rank's share as the whole step, and on any step over KV stored by head, since it would
   pass the TP heads where the pool holds this rank's slice. A state op that fuses the K/V write
-  into its norm/RoPE kernel (Qwen3-Omni's ``qk_norm_rope_table_kv_write``) runs its reference,
+  into its norm/RoPE kernel (Qwen3-Omni's ``qk_norm_rope_table_attend``) runs its reference,
   through ``add`` and the exchange, wherever the step's read exchanges
   (``AttentionManager.step_exchanges(label)``): a label the step splits, and every step over KV
   stored by head, copied steps too (each rank's head slice). A cacheless self-attention over a

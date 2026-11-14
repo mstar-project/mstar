@@ -327,10 +327,10 @@ def state_steps(
     step: SubmoduleStep | None, handles: Mapping[str, ArrayHandle | SamplerHandle | ShardHandle],
 ) -> SubmoduleStep | None:
     """``step`` as a new step, with what its ``state`` declares expanded into today's step objects by each storage's
-    builder, built afresh for each step because `SubmoduleStep` writes the segments onto them. The handles it opens
-    are those of what ``state`` lists, then the node's sequence shard's, whose step is the node's segments. None when
-    no array or sampler it lists needs it, nor a shard that can split, and it holds no other resource's step, so the
-    step skips its resources' admit, plan and commit."""
+    builder, afresh for each step, since each carries the step's segments. The handles it opens are those of what
+    ``state`` lists, then the node's sequence shard's, whose step is the node's segments. None when no array or
+    sampler it lists needs it, nor a shard that can split, and it holds no other resource's step, so the step skips
+    its resources' admit, plan and commit."""
     shards = tuple(handle for handle in handles.values() if isinstance(handle, ShardHandle))
     if step is None or not (step.state or shards):
         return step
@@ -892,6 +892,9 @@ class PagedArrayHandle(ArrayHandle):
         self._record_read(layer)
         return self._run(layer, q)
 
+    def _check_add_read(self, call: str) -> None:
+        """Nothing: a paged add and read run outside the graph already."""
+
     def _run(self, layer: int, q: torch.Tensor) -> torch.Tensor:
         attn = self._attn[layer]
         if _exchanges(attn, self.label):
@@ -1406,6 +1409,10 @@ class WithinStepHandle(ArrayHandle):
                 raise self._refusal("packed queries on a read declared packed=False")
             return self.first_read.run(q, k, v, label=self._plan_label)
         return self._attend(q, k, v)
+
+    def _check_add_read(self, call: str) -> None:
+        raise self._refusal(f"{call} with max_len 0, whose read a compiled block traces: a break here takes the read "
+                            "out of that graph")
 
 
 # Storages
