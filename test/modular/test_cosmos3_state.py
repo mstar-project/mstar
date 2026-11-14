@@ -7,18 +7,23 @@ over both guidance branches plans under the contract's combined label; a windowe
 noise main's kept generator drew; and the DiT alone keeps a session, the decoder taking its context from the DiT.
 """
 
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
 import torch
 
-from mstar.engine.resources.attn.config import AttnBackend
+from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec, AttnBackend
 from mstar.engine.resources.attn.ragged.config import RaggedAttnBackend
+from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
+from mstar.engine.resources.position.config import PositionConfig, PositionSpec
+from mstar.engine.resources.sampler.config import SamplerSpec
+from mstar.engine.resources.sequence_shard import SeqShardSpec
 from mstar.engine.resources.step import StepContext
 from mstar.engine.state.adapters import node_resources, state_setup
 from mstar.model.cosmos3 import constants as C
 from mstar.model.cosmos3.config import Cosmos3Config
-from mstar.model.cosmos3.cosmos3_model import DIT_NODE, REASONER_NODE, Cosmos3Model
+from mstar.model.cosmos3.cosmos3_model import DIT_NODE, REASONER_MIXED_SPLIT, REASONER_NODE, Cosmos3Model
 from mstar.model.cosmos3.submodules import (
     ATTN,
     ATTN_GEN,
@@ -82,6 +87,43 @@ def test_the_windowed_edge_config_resolves_on_dense_gen():
     specs = _specs(_edge(attention_backend="dense_gen", enable_windowed_video=True))
     assert C.VIDEO_GEN_AR_WALK in specs[C.SEQ_SHARD].walks
     assert specs[ATTN_GEN].config.backend is AttnBackend.DENSE, "an uncaptured denoise step would run the paged kernel"
+
+
+def _mains_reasoner_specs(model: Cosmos3Model, walks) -> dict:
+    """What main's ``get_node_resources`` bound to the reasoner, copied as it stood before the port, with the shard over
+    ``walks``."""
+    c = model.config
+    kv_nodes = {DIT_NODE, REASONER_NODE}
+    return {
+        C.KV_CACHE: KVSpec(resource_key=C.KV_CACHE, nodes=kv_nodes, config=PagedKVConfig(
+            num_layers=c.num_hidden_layers, num_kv_heads=c.num_key_value_heads, head_dim=c.head_dim,
+            max_seq_len=c.max_position_embeddings, num_qo_heads=c.num_attention_heads,
+        )),
+        ATTN: AttentionSpec(resource_key=ATTN, nodes=kv_nodes, config=AttentionConfig(
+            kv_cache=C.KV_CACHE, backend=AttnBackend.AUTO, splits=(REASONER_MIXED_SPLIT,),
+        )),
+        C.SEQ_SHARD: SeqShardSpec(
+            resource_key=C.SEQ_SHARD, nodes=kv_nodes, labels=(COND_LABEL, UNCOND_LABEL), axis=0, walks=walks,
+        ),
+        SAMPLER: SamplerSpec(
+            resource_key=SAMPLER, nodes={REASONER_NODE}, vocab_size=c.vocab_size, enable_repetition_penalty=True,
+            enable_min_p=False,
+        ),
+        ROPE: PositionSpec(resource_key=ROPE, nodes={REASONER_NODE}, config=PositionConfig(kv_cache=C.KV_CACHE)),
+    }
+
+
+def test_the_edge_deployments_reasoner_holds_the_specs_main_gave_it():
+    """The dense generation attention keeps no resident table, so the reasoner holding it turned the reasoner's resident
+    planning off, which main's Edge deployment runs its decode on."""
+    model = _edge(enable_windowed_video=True)
+    held = {key: spec for key, spec in _specs(model).items() if REASONER_NODE in spec.nodes}
+    main = _mains_reasoner_specs(model, held[C.SEQ_SHARD].walks)
+    assert set(held) == set(main), "the reasoner holds a resource main didn't give it"
+    # the positions span the kv array's nodes, where main bound them to the reasoner alone
+    main[ROPE] = replace(main[ROPE], nodes={DIT_NODE, REASONER_NODE})
+    for key, spec in main.items():
+        assert held[key] == spec, f"{key} isn't the spec main gave the reasoner"
 
 
 def test_a_guided_denoise_step_plans_both_branches_under_one_combined_label():
