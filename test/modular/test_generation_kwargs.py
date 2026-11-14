@@ -5,6 +5,7 @@ ranges are checked once for every endpoint, length aliases fold into
 status before a stream opens."""
 
 import asyncio
+import collections
 import types
 
 import pytest
@@ -171,7 +172,7 @@ def test_generate_logs_keys_the_model_does_not_read(monkeypatch, caplog):
     assert response.status_code == 200
     # seed is the server's own; the typo is logged, the request still served
     [record] = [r for r in caplog.records if "does not read" in r.getMessage()]
-    assert record.args == (["temprature"],)
+    assert record.args == (["temprature"], "")
 
 
 def test_generate_rejects_bad_knob_with_400(monkeypatch):
@@ -194,18 +195,72 @@ def test_a_refused_stream_gets_its_status_not_a_200(monkeypatch):
     assert "min_p" in response.json()["detail"]
 
 
-def test_an_unread_key_warns_on_every_request(caplog):
+@pytest.fixture(autouse=True)
+def _fresh_ignored_reports(monkeypatch):
+    """Each test starts with no ignored keys reported in this process."""
+    monkeypatch.setattr(entrypoint, "_REPORTED_IGNORED", collections.OrderedDict())
+
+
+def _reported(caplog) -> list:
+    return [r.args[0] for r in caplog.records if "does not read" in r.getMessage()]
+
+
+def test_an_unread_key_warns_once_per_set_of_keys(caplog):
     server = _RecordingServer()
     with caplog.at_level("DEBUG", logger=entrypoint.logger.name):
         for _ in range(3):
             server._report_ignored_params({"initial_prompt": "x"})
+        server._report_ignored_params({"initial_prompt": "x", "temprature": 1})
+        server._report_ignored_params({"initial_prompt": "x"})
         server._report_ignored_params(
             {"seed": 1, "prefix_cache": True, "lora_adapter": "a", "lora_digest": "d", "max_output_tokens": 4,
              "return_token_ids": True, "return_logprobs": True},
         )
-    levels = [r.levelname for r in caplog.records if "does not read" in r.getMessage()]
     # keys the conductor reads are never reported
-    assert levels == ["WARNING"] * 3
+    assert _reported(caplog) == [["initial_prompt"], ["initial_prompt", "temprature"]]
+    assert {r.levelname for r in caplog.records if "does not read" in r.getMessage()} == {"WARNING"}
+
+
+def test_the_reported_sets_hold_digests_and_stay_bounded(caplog):
+    server = _RecordingServer()
+    with caplog.at_level("WARNING", logger=entrypoint.logger.name):
+        server._report_ignored_params({"first": 1})
+        server._report_ignored_params({"x" * 100_000: 1})
+        for i in range(entrypoint._REPORTED_IGNORED_MAX):
+            server._report_ignored_params({f"name{i}": 1})
+        # a fixed number of digests: none of what a client sent stays in memory
+        assert len(entrypoint._REPORTED_IGNORED) == entrypoint._REPORTED_IGNORED_MAX
+        assert all(isinstance(digest, int) for digest in entrypoint._REPORTED_IGNORED)
+        # the oldest set was let go, so it is reported again
+        server._report_ignored_params({"first": 1})
+    assert _reported(caplog).count(["first"]) == 2
+
+
+def test_a_set_seen_again_outlives_older_ones(caplog):
+    server = _RecordingServer()
+    with caplog.at_level("WARNING", logger=entrypoint.logger.name):
+        server._report_ignored_params({"kept": 1})
+        server._report_ignored_params({"dropped": 1})
+        for i in range(entrypoint._REPORTED_IGNORED_MAX - 2):
+            server._report_ignored_params({f"name{i}": 1})
+            server._report_ignored_params({"kept": 1})
+        server._report_ignored_params({"pushes-out-the-oldest": 1})
+        server._report_ignored_params({"kept": 1})
+        server._report_ignored_params({"dropped": 1})
+    assert _reported(caplog).count(["kept"]) == 1
+    assert _reported(caplog).count(["dropped"]) == 2
+
+
+def test_the_warning_names_a_bounded_part_of_a_large_set(caplog):
+    server = _RecordingServer()
+    keys = {f"{i:03d}" + "k" * 1000: 1 for i in range(50)}
+    with caplog.at_level("WARNING", logger=entrypoint.logger.name):
+        server._report_ignored_params(keys)
+    [record] = [r for r in caplog.records if "does not read" in r.getMessage()]
+    names, more = record.args
+    assert len(names) == entrypoint._REPORTED_NAMES_MAX
+    assert all(len(name) == entrypoint._REPORTED_NAME_CHARS for name in names)
+    assert more == " and 30 more"
 
 
 def test_a_client_gone_before_the_first_chunk_is_aborted():

@@ -29,6 +29,7 @@ import websockets.exceptions
 import websockets.sync.client
 from fastapi.testclient import TestClient
 from test_rust_frontend import BINARY, _Chunk, _free_port, _wait_healthy
+from test_rust_release import IN_USE, _until
 
 from mstar.api_server import entrypoint
 from mstar.api_server.rust_frontend import RustFrontendBridge
@@ -40,7 +41,9 @@ STREAMS = ("audio", "text")
 
 class _Server:
     """A submission answers with what it and its appends carried; a live call
-    answers once its input has ended, or with the error that rejected it."""
+    answers once its input has ended, or with the error that rejected it. A
+    text of ``hold`` sends one chunk, then holds until ``release`` is set; an
+    aborted submission ends at once."""
 
     def __init__(self, upload_dir: Path, streams=()):
         self.upload_dir = upload_dir
@@ -54,6 +57,8 @@ class _Server:
         self.submitted: list[dict] = []
         self.appended: list[dict] = []
         self.calls: dict[str, dict] = {}
+        self.aborted: list[str] = []
+        self.release = threading.Event()
 
     def cleanup(self):
         pass
@@ -92,7 +97,8 @@ class _Server:
         pass
 
     def abort_submission(self, key):
-        pass
+        if key is not None:
+            self.aborted.append(key)
 
     def taking_input(self, key):
         call = self.calls.get(key)
@@ -130,7 +136,15 @@ class _Server:
         call = self.calls[request_id]
         deadline = time.monotonic() + 10
         while call["open"] and call["error"] is None and time.monotonic() < deadline:
+            if request_id in self.aborted:
+                return
             await asyncio.sleep(0.002)
+        if call["text"] == "hold":
+            yield _Chunk("text", b"first")
+            while not self.release.is_set():
+                if request_id in self.aborted:
+                    return
+                await asyncio.sleep(0.002)
         if call["error"] is not None:
             error, status = call["error"]
             yield _Chunk("error", error.encode(), {"status": status})
@@ -153,7 +167,7 @@ def _rust(server: _Server, **extra_env):
     threading.Thread(target=bridge.run, daemon=True).start()
     try:
         assert _wait_healthy(port)
-        yield port
+        yield port, bridge
     finally:
         bridge.stop()
         proc.terminate()
@@ -168,7 +182,7 @@ def stacks():
         def get(live: bool):
             if live not in made:
                 server = _Server(Path(tempfile.mkdtemp(prefix="mstar_genws_up_")), STREAMS if live else ())
-                made[live] = (server, exits.enter_context(_rust(server)))
+                made[live] = (server, exits.enter_context(_rust(server))[0])
             return made[live]
         yield get
 
@@ -377,10 +391,135 @@ TOO_BIG = (1009, "frame with 2000 bytes exceeds limit of 1000 bytes")
 
 
 def test_a_message_past_the_limit_closes_the_socket_as_uvicorn_does():
-    with _rust(_Server(Path(tempfile.mkdtemp(prefix="mstar_genws_up_")), ()), MSTAR_WS_MAX_BYTES="1000") as port:
+    with _rust(_Server(Path(tempfile.mkdtemp(prefix="mstar_genws_up_")), ()), MSTAR_WS_MAX_BYTES="1000") as (port, _):
         url = f"ws://127.0.0.1:{port}/generate/ws"
         with websockets.sync.client.connect(url, compression=None, max_size=None) as ws:
             ws.send("x" * 2000)
             with pytest.raises(websockets.exceptions.ConnectionClosed) as closed:
                 ws.recv(timeout=10)
     assert (closed.value.rcvd.code, closed.value.rcvd.reason) == TOO_BIG
+
+
+# ── a socket's calls: release, isolation and order (mstar-server's own) ─────
+
+def _fresh(live: bool):
+    """A stack of its own, for a case that reads the server's aborts."""
+    return _rust(_Server(Path(tempfile.mkdtemp(prefix="mstar_genws_up_")), STREAMS if live else ()))
+
+
+def _connect(port):
+    return websockets.sync.client.connect(f"ws://127.0.0.1:{port}/generate/ws", compression=None, max_size=None)
+
+
+def _recv(ws):
+    return _decode(ws.recv(timeout=10))
+
+
+def _text(rid, data: bytes):
+    return {"request_id": rid, "modality": "text", "data": base64.b64encode(data).decode(), "metadata": {}}
+
+
+def _until_finished(ws, rid):
+    """The replies up to ``rid``'s finish."""
+    replies = [_recv(ws)]
+    while replies[-1] != {"request_id": rid, "finish": True}:
+        assert "error" not in replies[-1], replies
+        replies.append(_recv(ws))
+    return replies
+
+
+def test_closing_the_socket_aborts_its_live_calls_and_one_shots():
+    with _fresh(live=True) as (port, bridge):
+        server = bridge.server
+        with _connect(port) as ws:
+            ws.send(json.dumps({"request_id": "call", "text": "start", "end_input": False}))
+            ws.send(json.dumps({"request_id": "shot", "text": "hold"}))
+            assert _recv(ws) == _text("shot", b"first")
+            assert server.calls.keys() == {"call", "shot"}
+        _until(lambda: sorted(server.aborted) == ["call", "shot"], what="the aborts")
+        _until(lambda: not bridge._keys, what="the bridge to forget the calls")
+
+
+def test_another_socket_cannot_append_to_or_take_over_a_live_call():
+    """Its append is refused as not its own, and opening the call's id there
+    is refused as an id in flight; the call goes on, its owner's to end."""
+    with _fresh(live=True) as (port, bridge):
+        server = bridge.server
+        with _connect(port) as owner:
+            owner.send(json.dumps({"request_id": "call", "text": "start", "end_input": False}))
+            _until(lambda: "call" in server.calls, what="the call's submission")
+            with _connect(port) as other:
+                other.send(json.dumps({"request_id": "call", "append": {"text": "theirs"}}))
+                assert _recv(other) == {"request_id": "call", "append": True,
+                                        "error": "request 'call' is not taking input on this socket"}
+                other.send(json.dumps({"request_id": "call", "text": "mine now", "end_input": False}))
+                assert _recv(other) == {"request_id": "call", "error": IN_USE.format("call"), "status": 409}
+            owner.send(json.dumps({"request_id": "call", "append": {"text": "mine"}, "end_input": True}))
+            replies = _until_finished(owner, "call")
+    assert replies[0] == _text("call", json.dumps({"inputs": ["mine"]}).encode())
+    assert [a["text"] for a in server.appended] == ["mine"]
+    assert len(server.submitted) == 1 and server.aborted == []
+
+
+def test_appends_reach_only_the_calls_this_socket_opened():
+    with _fresh(live=True) as (port, bridge):
+        server = bridge.server
+        with _connect(port) as ws:
+            ws.send(json.dumps({"request_id": "mine", "text": "start", "end_input": False}))
+            wav = {"name": "a.wav", "data": base64.b64encode(b"RIFF").decode()}
+            ws.send(json.dumps({"request_id": "elsewhere", "append": [wav]}))
+            assert _recv(ws) == {"request_id": "elsewhere", "append": True,
+                                 "error": "request 'elsewhere' is not taking input on this socket"}
+            ws.send(json.dumps({"request_id": "mine", "append": {"text": "more"}, "end_input": True}))
+            replies = _until_finished(ws, "mine")
+    assert replies[0] == _text("mine", json.dumps({"inputs": ["more"]}).encode())
+    assert [a["key"] for a in server.appended] == ["mine"]
+    assert list(server.upload_dir.iterdir()) == [], "the refused append left its file"
+
+
+def test_pipelined_messages_are_submitted_in_the_order_sent():
+    """The first message's large file decodes while the others, with none, are
+    ready at once: they still go out behind it."""
+    big = {"name": "big.png", "data": PNG + bytes(8 << 20)}
+    messages = [{"request_id": "m0", "text": "m0", "files": [big]}]
+    messages += [{"request_id": f"m{i}", "text": f"m{i}"} for i in range(1, 5)]
+    with _fresh(live=False) as (port, bridge):
+        with _connect(port) as ws:
+            for m in messages:
+                ws.send(msgpack.packb(m, use_bin_type=True))
+            finished = set()
+            while len(finished) < len(messages):
+                reply = _recv(ws)
+                assert "error" not in reply, reply
+                if reply.get("finish"):
+                    finished.add(reply["request_id"])
+        assert [s["text"] for s in bridge.server.submitted] == [m["text"] for m in messages]
+
+
+def test_a_long_stream_does_not_hold_up_the_next_request():
+    with _fresh(live=False) as (port, bridge):
+        server = bridge.server
+        with _connect(port) as ws:
+            ws.send(json.dumps({"request_id": "long", "text": "hold"}))
+            assert _recv(ws) == _text("long", b"first")
+            ws.send(json.dumps({"request_id": "quick", "text": "q"}))
+            replies = _until_finished(ws, "quick")
+            assert {"request_id": "long", "finish": True} not in replies
+            server.release.set()
+            _until_finished(ws, "long")
+    assert server.aborted == []
+
+
+def test_an_id_in_flight_on_the_socket_is_refused_in_band():
+    """The second message under X is answered with the 409 and X runs on."""
+    with _fresh(live=False) as (port, bridge):
+        server = bridge.server
+        with _connect(port) as ws:
+            ws.send(json.dumps({"request_id": "X", "text": "hold"}))
+            assert _recv(ws) == _text("X", b"first")
+            ws.send(json.dumps({"request_id": "X", "text": "second"}))
+            assert _recv(ws) == {"request_id": "X", "error": IN_USE.format("X"), "status": 409}
+            server.release.set()
+            replies = _until_finished(ws, "X")
+    assert replies[0] == _text("X", json.dumps({"inputs": []}).encode())
+    assert [s["text"] for s in server.submitted] == ["hold"] and server.aborted == []

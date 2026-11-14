@@ -1326,9 +1326,11 @@ Qwen3-TTS notes
   accumulates in the model dtype, rounding after every add (the reference sums
   in fp32 and rounds once), and Qwen3-Omni in fp32, rounded once. With
   ``depth_kernel: true`` in ``model_kwargs`` on a Hopper GPU with 128 or more
-  SMs, a step of up to 64 rows whose residual draws the graph sampler can hand
+  SMs, a step of 2 to 64 rows whose residual draws the graph sampler can hand
   over runs the whole loop, sampling included, as one persistent kernel
-  (``mstar.model.qwen3_tts.components.depth_frame``). The kernel needs Triton
+  (``mstar.model.qwen3_tts.components.depth_frame``), on the 0.6B and the
+  1.7B; the 0.6B's 1024-wide Talker runs it zero-padded to the 1.7B's width.
+  A one-row step runs the loop, which is faster there. The kernel needs Triton
   3.7, which comes with torch 2.12. Under torch 2.11's Triton 3.6, startup logs
   why and runs the loop.
 - The Codec does not run beside the Talker on a side stream (``side_stream``,
@@ -1863,8 +1865,10 @@ Cosmos3 environment requirements
   prefill, the captured CUDA graphs, and multi-request batches.
 - The default denoise attention backend is ``dense_gen``
   (``Cosmos3Config.attention_backend``), which runs bs=1 eager generation
-  attention as one FlashAttention-3 varlen kernel from the ``fa3-fwd`` wheel
-  (AITER's varlen kernel on ROCm).
+  attention as FlashAttention-3 kernels from the ``fa3-fwd`` wheel: varlen, or
+  on Hopper the fixed-length kernel for a single non-causal segment such as a
+  guidance-off step, and once per segment when every segment is at least 1536
+  rows, such as the guidance pair (AITER's varlen kernel on ROCm).
   That wheel is ABI-tied to the installed torch/CUDA build (Hopper builds
   exist for at least torch 2.9 + cu12.8 and torch 2.11 + cu13.0); install the
   one matching your environment. It ships kernels for sm_80 and sm_90a only.
@@ -1888,7 +1892,10 @@ Cosmos3 environment requirements
 - Generated video containers are written with ``torchcodec``'s ``VideoEncoder``
   when available (torchcodec >= 0.9), otherwise directly with PyAV (``av``,
   ``video_encode.encode_mp4``), whose wheel bundles FFmpeg with libx264; that also
-  covers a torchcodec that cannot load FFmpeg.
+  covers a torchcodec that cannot load FFmpeg. With torchcodec a clip of 48 frames or
+  more encodes in parallel pieces (``video_encode.encode_mp4_chunked``, up to 4, without
+  B-frames), joined into one stream: a keyframe starts each piece, and the file is a few
+  percent larger. A 121-frame 832x480 clip encodes in about half the time of one encode.
 - Sound-enabled video responses mux the AAC track with the ``ffmpeg`` and
   ``ffprobe`` binaries, which must be on ``PATH`` (system packages, not
   pip-installable).
@@ -1984,10 +1991,23 @@ image (one latent) keeps the compiled stock ``vae.decode`` on that copy, which
 is faster for a single frame. False decodes everything with the compiled stock
 ``vae.decode`` on the shared instance.
 
+Placed on several ranks with ``tp_size`` (``configs/cosmos3_super_i2v_4step_tp2.yaml``
+puts it on both GPUs), the ``vae_decoder`` node splits every decode by rows over them
+(``HeightShardedDecoder`` in ``mstar/model/components/wan_vae.py``), images included:
+each rank decodes a band of every frame, a 3-row conv takes one row of each neighbour's
+band, the mid-block attention gathers the frame, and the uint8 frames are gathered at
+the end. On Super I2V at 832x480x121 (2x H200) the decode takes 0.95 s instead of 1.56 s.
+The frames match a one-rank decode up to conv-algorithm rounding: a few uint8 levels on
+a minority of pixels, since cuDNN picks its bf16 algorithms per shape. It needs
+``vae_decode_fast``.
+The decode runs in lockstep on the node's ranks, so a rank that fails mid-decode
+(an out-of-memory error, say) leaves the others waiting in a collective: at 1280x720x121 each
+rank peaks about 10 GB above its idle use on an H200, with about 60 GB to spare.
+
 Two or more requests at the same denoise step run one cross-request forward
 (``max_gen_batch_size``, default 8) for video, image, sound and action. With
 ``compile_denoise_batched`` (default on) the layer stack these steps share is
-compiled with the same mode, once, while the server starts, with the packed
+compiled with the same mode while the server starts, with only the packed
 length dynamic: no batch size or mix of resolutions compiles mid-traffic. The
 per-request patchify, rotary tables and unpatchify around it run eager.
 Compiled, a batched action step's outputs differ from the eager stack's at the
@@ -1995,6 +2015,16 @@ kernel-drift level. At 832x480x121 one request's guidance pair is 24k tokens,
 which already fills the GPU's GEMM and attention throughput, so a batch of N
 costs about N single steps: batching keeps requests in step rather than adding
 throughput.
+
+Captures (the text prefill and the denoise steps) are built for the guidance
+regime the deployment's default ``guidance_scale`` runs: both branches when it
+is not 1, the conditional branch alone when it is 1, which the distilled 4-step
+Super checkpoints force. A request in the other regime runs eager.
+``gen_capture_image`` lists the (height, width) image tiers to capture
+(default 192x320, 480x832 and 720x1280, each still bounded by
+``graph_max_latent_area``); the Super T2I config captures its 1024x1024
+default. ``compile_prefill`` (default off) compiles the captured text prefill
+in ``denoise_compile_mode``; the Super T2I config turns it on.
 
 The action policy (``cosmos3_edge_droid``, or ``cosmos3_edge`` with an action
 ``domain_name``) predicts a chunk of robot actions from the current observation:
