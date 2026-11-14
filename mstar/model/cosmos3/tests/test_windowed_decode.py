@@ -18,6 +18,7 @@ from mstar.engine.resources.sized.store import SizedValueStore  # noqa: E402
 from mstar.engine.resources.step import StepContext  # noqa: E402
 from mstar.engine.state import Layout, Value  # noqa: E402
 from mstar.engine.state.adapters import build_specs, node_handles, state_sizes, state_steps  # noqa: E402
+from mstar.model.components import wan_vae  # noqa: E402
 from mstar.model.components.wan_vae import is_channels_last  # noqa: E402
 from mstar.model.cosmos3 import constants as C  # noqa: E402
 from mstar.model.cosmos3 import submodules as cosmos3_submodules  # noqa: E402
@@ -28,6 +29,7 @@ from mstar.model.cosmos3.submodules import (  # noqa: E402
     DECODE_LABEL,
     DECODE_SENT,
     DECODE_TAIL,
+    DECODER,
     Cosmos3VAEDecoderARSubmodule,
     Cosmos3VAEDecoderSubmodule,
     decode_cache_entry,
@@ -174,6 +176,66 @@ def test_warm_windows_are_the_whole_stream_decode(monkeypatch, vae) -> None:
     # Context covering the whole stream makes the re-decode path exact too.
     exact = torch.cat(_run(_decoder(monkeypatch, vae, warm=False, ctx=20), "r", _windows(stream), 77), dim=2)
     assert torch.equal(exact, whole)
+
+
+def test_the_cache_goes_from_window_to_window_through_its_value(monkeypatch, vae) -> None:
+    """A warm window leaves its decoder cache in ``DECODE_CACHE`` and on no output, which an edge would copy to the
+    host every window. The next window decodes from the tensors it left, and the last one gives their bytes back."""
+    sub = _decoder(monkeypatch, vae)
+    windows = _windows(_stream(20))
+    _run(sub, "r", windows[:1], 77, num_windows=3)
+    left = sub.caches.held("r")
+    assert left and DECODE_CACHE not in sub._loops["r"]["edges"]
+    seen = []
+    decode = sub._decode_stream
+    sub._decode_stream = lambda new, cache, clip_start: seen.append(list(cache)) or decode(new, cache, clip_start)
+    _run(sub, "r", windows[1:2], 77, num_windows=3)
+    slots = {f"{DECODER}_{i:02d}": slot for i, slot in enumerate(seen[0]) if torch.is_tensor(slot)}
+    assert slots.keys() == left.keys() and all(slots[name] is left[name] for name in left), "a slot was copied"
+    held = sub.caches.store._used
+    _run(sub, "r", windows[2:], 77, num_windows=3)
+    assert held and not sub.caches.store._used and not sub.caches.held("r"), "the ended stream holds its bytes"
+
+
+def test_a_window_past_the_first_refuses_an_empty_cache(monkeypatch, vae) -> None:
+    """A window whose forward failed after its read leaves nothing behind, which is what a stream's first finds."""
+    sub = _decoder(monkeypatch, vae)
+    windows = _windows(_stream(20))
+    _run(sub, "r", windows[:1], 77, num_windows=3)
+    sub.caches.store._requests["r"].tensors.clear()
+    with pytest.raises(RuntimeError, match="window 1 found no decoder cache in 'decode_cache'"):
+        _run(sub, "r", windows[1:2], 77, num_windows=3)
+
+
+@pytest.mark.parametrize("lat_hw", [(2, 3), (3, 5)])
+def test_the_declared_cache_is_the_vae_s_at_any_latent_size(vae, lat_hw) -> None:
+    """Every process declares the cache from the VAE's config, without loading it. Against a residual Wan VAE at
+    random weights: each slot a stream holds between windows has its field's shape, and owns its bytes."""
+    cfg = Cosmos3Config()
+    cfg.vae = Cosmos3VAEConfig(z_dim=8, decoder_base_dim=16, dim_mult=[1, 2, 2, 2], num_res_blocks=1)
+    fields = decode_cache_entry(cfg, torch.float32).tensors
+    cache = wan_vae.new_feat_cache(vae)
+    with torch.inference_mode():
+        wan_vae.FastDecoder(vae, channels_last=False, compile=False).decode_stream(
+            torch.zeros(1, 8, 2, *lat_hw), cache, clip_start=True,
+        )
+    wan_vae.check_stream_cache(cache, fields, DECODER, lat_hw)
+    held = [slot for slot in cache if torch.is_tensor(slot)]
+    assert len(held) == len(fields) and all(
+        slot.untyped_storage().nbytes() == slot.numel() * slot.element_size() for slot in held
+    ), "a slot that is a view of a larger buffer would be refused at its write"
+
+
+def test_the_cosmos3_vae_s_cache_takes_913600_bytes_a_latent_pixel_in_bf16() -> None:
+    """1.33 GiB at 832x480, which the default budget holds twice: one stream at 1280x720."""
+    cfg = Cosmos3Config()
+    value = Value(
+        DECODE_CACHE, nodes={NODE}, layers=frozenset({0}), entry=decode_cache_entry(cfg, torch.bfloat16),
+        largest={"lat_h": 1, "lat_w": cfg.windowed_decode_max_latent_area},
+    )
+    (spec,) = build_specs([value])
+    assert spec.config.bytes_at({"lat_h": 30, "lat_w": 52}) == 913600 * 30 * 52
+    assert spec.config.budget == 913600 * 45 * 80
 
 
 # Request 2 of a session whose request 1 covered units [0, 14): it resumes at

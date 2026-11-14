@@ -16,8 +16,9 @@ pytest.importorskip("diffusers")
 
 from mstar.graph.base import Loop  # noqa: E402
 from mstar.model.cosmos3 import constants as C  # noqa: E402
-from mstar.model.cosmos3.cosmos3_model import Cosmos3Model  # noqa: E402
+from mstar.model.cosmos3.cosmos3_model import VAE_DECODER_AR_NODE, Cosmos3Model  # noqa: E402
 from mstar.model.cosmos3.submodules import (  # noqa: E402
+    DECODE_CACHE,
     DECODE_FRAMES,
     DECODE_SENT,
     DECODE_TAIL,
@@ -58,6 +59,26 @@ def test_the_decoder_loops_over_its_window_stream():
     assert isinstance(loop, Loop) and loop.name == VIDEO_DECODE_AR_LOOP
     back = {edge.name for edge in loop.section.outputs if edge.next_node == loop.section.name}
     assert back == set(EDGES), "a decoder that kept its tail itself would hold it per request"
+
+
+def test_the_decoder_cache_is_a_sized_value_off_the_loop_s_edges():
+    """An edge's tensors are copied every window, and peak memory holds both copies. The cache is the decoder node's
+    sized Value, as LingBot-World's VAE caches are, declared only where the warm cache is on."""
+    model = Cosmos3Model(model_path_hf="unused", skip_weight_loading=True, enable_windowed_video=True)
+    (cache,) = [declared for declared in model.declare_state() if declared.name == DECODE_CACHE]
+    assert cache.nodes == {VAE_DECODER_AR_NODE} and cache.largest == {"lat_h": 1, "lat_w": 3600}
+    assert DECODE_CACHE not in _decode_walk().section.input_names
+    cold = Cosmos3Model(
+        model_path_hf="unused", skip_weight_loading=True, enable_windowed_video=True, windowed_decode_warm_cache=False,
+    )
+    assert DECODE_CACHE not in {declared.name for declared in cold.declare_state()}
+
+
+def test_a_windowed_request_sizes_its_decoder_cache_and_one_past_the_largest_is_refused():
+    model = Cosmos3Model(model_path_hf="unused", skip_weight_loading=True, enable_windowed_video=True)
+    assert model._decode_sizes({"height": 480, "width": 832}) == {"lat_h": 30, "lat_w": 52}
+    with pytest.raises(ValueError, match="a latent of 8160 pixels, past the 3600 its decoder cache is declared for"):
+        model._decode_sizes({"height": 1088, "width": 1920})
 
 
 @pytest.mark.parametrize("frames", [77, 70])
