@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import sys
 from dataclasses import replace
+from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, ".")
@@ -223,10 +224,13 @@ def test_chunk_and_expert_masks_can_follow_kv_and_sizes_at_walk_plan():
 
     required = _required_mask_layouts(model, model.declare_state())
     with pytest.raises(RuntimeError, match="has no chunk-causal layout"):
-        _check_mask_layouts([WalkStep("prefill")], required)
+        _check_mask_layouts([WalkStep("prefill")], required, model.declare_state())
     chunk = {"chunk": {"main": {"chunk_attn": [4, 16, 8]}}}
     with pytest.raises(RuntimeError, match="has no expert layout"):
-        _check_mask_layouts([WalkStep("prefill", step_metadata={CHUNK_CAUSAL_LAYOUT_KWARG: chunk})], required)
+        _check_mask_layouts(
+            [WalkStep("prefill", step_metadata={CHUNK_CAUSAL_LAYOUT_KWARG: chunk})],
+            required, model.declare_state(),
+        )
 
     expert = {"expert": {"main": {"expert_attn": [2]}}}
     steps = [WalkStep("prefill", step_metadata={
@@ -235,7 +239,7 @@ def test_chunk_and_expert_masks_can_follow_kv_and_sizes_at_walk_plan():
     declarations = model.declare_state()
     steps = _with_chunk_causal_layout(steps, kwargs.get(CHUNK_CAUSAL_LAYOUT_KWARG), declarations)
     steps = _with_expert_layout(steps, kwargs.get(EXPERT_LAYOUT_KWARG), declarations)
-    _check_mask_layouts(steps, required)
+    _check_mask_layouts(steps, required, declarations)
     assert steps[0].step_metadata[CHUNK_CAUSAL_LAYOUT_KWARG] == chunk
     assert steps[0].step_metadata[EXPERT_LAYOUT_KWARG] == expert
 
@@ -289,15 +293,101 @@ def test_chunk_layout_can_be_supplied_by_walk_plan_after_intake():
     model = PlannedChunk()
     required = _required_mask_layouts(model, model.declare_state())
     with pytest.raises(RuntimeError, match="has no chunk-causal layout"):
-        _check_mask_layouts([WalkStep("prefill")], required)
+        _check_mask_layouts([WalkStep("prefill")], required, model.declare_state())
 
     request_layout = {"chunk": {"main": {"chunk_attn": [4, 16, 8]}}}
     planned_layout = model.walk_plan("main", [], [], {}, kwargs)[0].step_metadata[CHUNK_CAUSAL_LAYOUT_KWARG]
     plan = _with_chunk_causal_layout(
         model.walk_plan("main", [], [], {}, kwargs), request_layout, model.declare_state(),
     )
-    _check_mask_layouts(plan, required)
+    _check_mask_layouts(plan, required, model.declare_state())
     assert plan[0].step_metadata[CHUNK_CAUSAL_LAYOUT_KWARG] == planned_layout
+
+
+@pytest.mark.parametrize("planned, error", [
+    ({"chunk": {"main": {"chunk_attn": [4, 16]}}}, "wrong number of lengths"),
+    ({"chunk": {"main": {"chunk_attn": [-4, 24, 8]}}}, "global_len must be an int"),
+    ({"chunk": {"main": {"chunk_atn": [4, 16, 8]}}}, "names no matching read"),
+    ({"chunk": {"other": {"chunk_attn": [4, 16, 8]}}}, "names undeclared label"),
+    ({"chun": {"main": {"chunk_attn": [4, 16, 8]}}}, "names undeclared array"),
+])
+def test_bad_walk_mask_is_refused_at_conductor_ingest(planned, error):
+    class BadWalk(_ChunkDeclaring):
+        def walk_plan(self, *args, **kwargs):
+            return [WalkStep("prefill", step_metadata={CHUNK_CAUSAL_LAYOUT_KWARG: planned})]
+
+    conductor = object.__new__(Conductor)
+    conductor.model = BadWalk()
+    conductor._episode_array_names = frozenset()
+    conductor._status_interval_s = None
+    conductor._max_output_tokens = lambda kwargs: 1
+    conductor._loop_caps = lambda kwargs: {}
+    request_layout = {"chunk": {"main": {"chunk_attn": [12, 8, 8]}}}
+    body = SimpleNamespace(
+        request_id="bad-mask", client_request_id=None, model_kwargs={CHUNK_CAUSAL_LAYOUT_KWARG: request_layout},
+        initial_input_modalities=[], initial_output_modalities=[], initial_signals={}, episode=None,
+        episode_keys=None,
+    )
+    with pytest.raises((RuntimeError, ValueError), match=error):
+        conductor._do_ingest_request(body)
+
+
+@pytest.mark.parametrize("planned, error", [
+    ({"expert": {"main": {"expert_attn": [1, 2]}}}, "wrong number of lengths"),
+    ({"expert": {"main": {"expert_attn": [-1]}}}, "num_chunks must be a positive int"),
+    ({"expert": {"main": {"expert_atn": [2]}}}, "names no matching read"),
+    ({"expert": {"other": {"expert_attn": [2]}}}, "names undeclared label"),
+    ({"expret": {"main": {"expert_attn": [2]}}}, "names undeclared array"),
+])
+def test_bad_expert_walk_mask_is_refused_at_conductor_ingest(planned, error):
+    class BadWalk(_CombinedDeclaring):
+        def walk_plan(self, *args, **kwargs):
+            return [WalkStep("prefill", step_metadata={EXPERT_LAYOUT_KWARG: planned})]
+
+    conductor = object.__new__(Conductor)
+    conductor.model = BadWalk()
+    conductor._episode_array_names = frozenset()
+    conductor._status_interval_s = None
+    conductor._max_output_tokens = lambda kwargs: 1
+    conductor._loop_caps = lambda kwargs: {}
+    body = SimpleNamespace(
+        request_id="bad-expert", client_request_id=None,
+        model_kwargs={
+            CHUNK_CAUSAL_LAYOUT_KWARG: {"chunk": {"main": {"chunk_attn": [4, 16, 8]}}},
+            EXPERT_LAYOUT_KWARG: {"expert": {"main": {"expert_attn": [2]}}},
+        },
+        initial_input_modalities=[], initial_output_modalities=[], initial_signals={}, episode=None,
+        episode_keys=None,
+    )
+    with pytest.raises((RuntimeError, ValueError), match=error):
+        conductor._do_ingest_request(body)
+
+
+@pytest.mark.parametrize("model, error", [
+    (_ChunkDeclaring, "has no chunk-causal layout"),
+    (_CombinedDeclaring, "has no expert layout"),
+])
+def test_missing_walk_mask_is_refused_before_conductor_dispatch(model, error):
+    class MissingWalk(model):
+        def walk_plan(self, *args, **kwargs):
+            return [WalkStep("prefill")]
+
+    conductor = object.__new__(Conductor)
+    conductor.model = MissingWalk()
+    conductor._episode_array_names = frozenset()
+    conductor._status_interval_s = None
+    conductor._max_output_tokens = lambda kwargs: 1
+    conductor._loop_caps = lambda kwargs: {}
+    kwargs = {}
+    if model is _CombinedDeclaring:
+        kwargs[CHUNK_CAUSAL_LAYOUT_KWARG] = {"chunk": {"main": {"chunk_attn": [4, 16, 8]}}}
+    body = SimpleNamespace(
+        request_id="missing-mask", client_request_id=None, model_kwargs=kwargs,
+        initial_input_modalities=[], initial_output_modalities=[], initial_signals={}, episode=None,
+        episode_keys=None,
+    )
+    with pytest.raises(RuntimeError, match=error):
+        conductor._do_ingest_request(body)
 
 
 def test_a_prompt_with_no_keyed_spans_keys_no_page():

@@ -51,6 +51,8 @@ from mstar.engine.state import Array, ChunkCausal, ExpertCross, ExpertSelf, Layo
 from mstar.engine.state.adapters import (
     CHUNK_CAUSAL_LAYOUT_KWARG,
     EXPERT_LAYOUT_KWARG,
+    check_wire_chunk_layouts,
+    check_wire_expert_layouts,
     checked_step_mask_layouts,
     chunk_causal_layouts,
     expert_layouts,
@@ -188,9 +190,13 @@ def _required_mask_layouts(model: Model, declarations: list) -> dict[str, tuple[
     return result
 
 
-def _check_mask_layouts(plan: list[WalkStep], required: dict[str, tuple[tuple[str, str, str, str], ...]]) -> None:
+def _check_mask_layouts(
+    plan: list[WalkStep], required: dict[str, tuple[tuple[str, str, str, str], ...]], declarations: list,
+) -> None:
     """Refuse a missing per-request mask before it can fail a batched engine step."""
     for step in plan:
+        check_wire_chunk_layouts(declarations, step.step_metadata.get(CHUNK_CAUSAL_LAYOUT_KWARG, {}))
+        check_wire_expert_layouts(declarations, step.step_metadata.get(EXPERT_LAYOUT_KWARG, {}))
         for wire_key, name, label, key in required.get(step.walk, ()):
             given = step.step_metadata.get(wire_key, {})
             if given.get(name, {}).get(label, {}).get(key) is None:
@@ -1707,7 +1713,7 @@ class Conductor:
             pstate.plan = _with_expert_layout(
                 pstate.plan, model_kwargs.get(EXPERT_LAYOUT_KWARG), self._declarations(),
             )
-            _check_mask_layouts(pstate.plan, self._mask_layout_reads())
+            _check_mask_layouts(pstate.plan, self._mask_layout_reads(), self._declarations())
             stream_moved = p.name in self.producer_triggered_partitions
             # refuse a plan the conductor can't run: a step whose walk isn't one of the
             # partition's (which startup checked are the model's), or a ``bind`` key

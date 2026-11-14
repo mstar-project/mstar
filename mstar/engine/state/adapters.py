@@ -608,9 +608,7 @@ class WithinStepSteps(StepBuilder):
                     f"Array {array.name!r}: request {segment.request_id!r} has no "
                     f"state_layout chunk lengths for read {next(iter(array.reads))!r}"
                 )
-        if not isinstance(lengths, (list, tuple)) or len(lengths) != 3:
-            raise ValueError(f"Array {array.name!r}: request {segment.request_id!r} has invalid chunk lengths")
-        layout = ChunkCausalLayout(global_len=lengths[0], noised_len=lengths[1], clean_len=lengths[2])
+        layout = parse_chunk_causal_layout(array, segment.label, next(iter(array.reads)), lengths)
         if layout.span != segment.span:
             raise ValueError(
                 f"Array {array.name!r}: request {segment.request_id!r}'s chunk layout spans {layout.span}, "
@@ -637,22 +635,11 @@ class WithinStepSteps(StepBuilder):
         lengths = raw.get(array.name, {}).get(segment.label, {}).get(next(iter(array.reads)))
         if lengths is None:
             raise ValueError(f"Array {array.name!r}: request {segment.request_id!r} has no expert state_layout")
-        if isinstance(read.mask, ExpertSelf):
-            if not isinstance(lengths, (list, tuple)) or len(lengths) != 1:
-                raise ValueError(f"Array {array.name!r}: invalid expert self lengths")
-            layout = ExpertSelfLayout(num_chunks=lengths[0])
+        layout = parse_expert_layout(array, segment.label, next(iter(array.reads)), lengths)
+        if isinstance(layout, ExpertSelfLayout):
             result = (layout.num_chunks, 0, 0, layout.num_chunks * read.mask.chunk_len)
             span = layout.num_chunks * (1 + read.mask.future_per_chunk + read.mask.chunk_len)
         else:
-            if not isinstance(lengths, (list, tuple)) or len(lengths) != 4:
-                raise ValueError(f"Array {array.name!r}: invalid expert cross lengths")
-            layout = ExpertCrossLayout(
-                num_chunks=lengths[0], global_len=lengths[1],
-                clean_frames=lengths[2], noised_frames=lengths[3],
-            )
-            _check_expert_layout(
-                array, segment.label, Layout(expert_cross={next(iter(array.reads)): layout}), require_all=False,
-            )
             result = (layout.num_chunks, layout.global_len, layout.clean_frames, layout.noised_frames)
             span = layout.global_len + (layout.clean_frames + layout.noised_frames) * read.mask.tokens_per_frame
         if span != segment.span:
@@ -853,6 +840,49 @@ def _check_expert_layout(array: Array, label: str, layout: Layout, *, require_al
                 )
 
 
+def parse_expert_layout(array: Array, label: str, key: str, lengths: object) -> ExpertCrossLayout | ExpertSelfLayout:
+    """One expert wire row, checked by the typed prompt-layout contract."""
+    if label not in array.labels:
+        raise RuntimeError(f"Array {array.name!r} has no label {label!r}")
+    read = array.reads.get(key)
+    if read is None or not isinstance(read.mask, (ExpertCross, ExpertSelf)):
+        raise RuntimeError(f"Array {array.name!r}: {key!r} names no expert read")
+    if isinstance(read.mask, ExpertSelf):
+        if not isinstance(lengths, (list, tuple)) or len(lengths) != 1:
+            raise ValueError(f"Array {array.name!r}: invalid expert self lengths")
+        layout = ExpertSelfLayout(num_chunks=lengths[0])
+        _check_expert_layout(array, label, Layout(expert_self={key: layout}), require_all=False)
+    else:
+        if not isinstance(lengths, (list, tuple)) or len(lengths) != 4:
+            raise ValueError(f"Array {array.name!r}: invalid expert cross lengths")
+        layout = ExpertCrossLayout(
+            num_chunks=lengths[0], global_len=lengths[1],
+            clean_frames=lengths[2], noised_frames=lengths[3],
+        )
+        _check_expert_layout(array, label, Layout(expert_cross={key: layout}), require_all=False)
+    return layout
+
+
+def check_wire_expert_layouts(declarations: Sequence[Array | Sampler | SeqShard], raw: Mapping) -> None:
+    """Check every supplied expert walk-plan row, including unused misspelled names."""
+    arrays = {array.name: array for array in declarations if isinstance(array, Array)}
+    if not isinstance(raw, Mapping):
+        raise RuntimeError("expert layout must map array names to labels")
+    for name, labels in raw.items():
+        array = arrays.get(name)
+        if array is None:
+            raise RuntimeError(f"expert layout names no declared array {name!r}")
+        if not isinstance(labels, Mapping):
+            raise RuntimeError(f"expert layout {name!r} must map labels to reads")
+        for label, reads in labels.items():
+            if not isinstance(reads, Mapping):
+                raise RuntimeError(f"expert layout {name!r}/{label!r} must map reads to lengths")
+            if label not in array.labels:
+                raise RuntimeError(f"Array {name!r} has no label {label!r}")
+            for key, lengths in reads.items():
+                parse_expert_layout(array, label, key, lengths)
+
+
 def kv_layouts(
     declarations: Sequence[Array | Sampler | SeqShard],
     state_layout: Mapping[str, Mapping[str, Layout]],
@@ -909,6 +939,37 @@ def _check_chunk_causal_layout(array: Array, label: str, layout: Layout, *, requ
             raise RuntimeError(
                 f"state_layout[{array.name!r}][{label!r}].chunk_causal is missing reads {sorted(missing)}"
             )
+
+
+def parse_chunk_causal_layout(array: Array, label: str, key: str, lengths: object) -> ChunkCausalLayout:
+    """One wire row, checked by the same typed-layout contract as a prompt layout."""
+    if label not in array.labels:
+        raise RuntimeError(f"Array {array.name!r} has no label {label!r}")
+    if not isinstance(lengths, (list, tuple)) or len(lengths) != 3:
+        raise ValueError(f"Array {array.name!r}: invalid chunk lengths for {key!r}")
+    layout = ChunkCausalLayout(global_len=lengths[0], noised_len=lengths[1], clean_len=lengths[2])
+    _check_chunk_causal_layout(array, label, Layout(chunk_causal={key: layout}), require_all=False)
+    return layout
+
+
+def check_wire_chunk_layouts(declarations: Sequence[Array | Sampler | SeqShard], raw: Mapping) -> None:
+    """Check every supplied walk-plan row, including names the engine would otherwise ignore."""
+    arrays = {array.name: array for array in declarations if isinstance(array, Array)}
+    if not isinstance(raw, Mapping):
+        raise RuntimeError("chunk-causal layout must map array names to labels")
+    for name, labels in raw.items():
+        array = arrays.get(name)
+        if array is None:
+            raise RuntimeError(f"chunk-causal layout names no declared array {name!r}")
+        if not isinstance(labels, Mapping):
+            raise RuntimeError(f"chunk-causal layout {name!r} must map labels to reads")
+        for label, reads in labels.items():
+            if not isinstance(reads, Mapping):
+                raise RuntimeError(f"chunk-causal layout {name!r}/{label!r} must map reads to lengths")
+            if label not in array.labels:
+                raise RuntimeError(f"Array {name!r} has no label {label!r}")
+            for key, lengths in reads.items():
+                parse_chunk_causal_layout(array, label, key, lengths)
 
 
 def sampling_configs(
