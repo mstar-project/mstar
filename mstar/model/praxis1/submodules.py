@@ -43,6 +43,7 @@ from mstar.model.praxis1.components.sampler import ACTION_SALT, VIDEO_SALT, seed
 from mstar.model.praxis1.config import Praxis1Config
 from mstar.model.praxis1.episode_history import (
     BOUNDARY_STATE_NAME,
+    FIRST_ROWS,
     STATE_NAME,
     boundary_offsets,
     clean_depth,
@@ -350,6 +351,9 @@ class Praxis1VaeEncoderSubmodule(_Praxis1Node):
                 boundary = self.state_handles[BOUNDARY_STATE_NAME]
                 previous = boundary.read(0).fields
                 previously_valid = bool(previous["history_valid"][-1, 0]) if len(previous["pose"]) else True
+                # The cold boundary is outside the first executed window.
+                if history_append == FIRST_ROWS:
+                    previously_valid = True
                 # Only rows appended to the retained window can invalidate it.
                 # Older client stack rows are ignored. Once an appended pose
                 # is missing, the reference keeps using boundary fallback.

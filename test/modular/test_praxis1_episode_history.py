@@ -375,6 +375,36 @@ def test_cold_seed_ignores_unretained_missing_pose_rows():
     assert boundaries.added[-1][1]["history_valid"].tolist() == [[0]]
 
 
+def test_first_warm_valid_history_does_not_inherit_invalid_cold_pose():
+    model = _model()
+    node = Praxis1VaeEncoderSubmodule(model.config, _Vae(), max_context_chunks=3)
+    node._tiles = lambda views: views
+    node.vae_encode = lambda canvas: canvas[:, :, ::4]
+    frames, boundaries = _Handle(), _Handle()
+    node.state_handles = {STATE_NAME: frames, BOUNDARY_STATE_NAME: boundaries}
+    cold_images = torch.zeros((1, 3, 2, 2), dtype=torch.uint8)
+    cold_pose = torch.tensor(_pose()).reshape(1, 8)
+    node.forward(
+        "chunk", SimpleNamespace(), history_append=0,
+        history_pose=cold_pose, history_pose_valid=torch.zeros((1, 1), dtype=torch.uint8),
+        **{f"view_{i}": cold_images for i in range(model.config.num_cameras)},
+    )
+    assert boundaries.added[-1][1]["history_valid"].tolist() == [[0]]
+    frames.commit()
+    boundaries.commit()
+
+    warm_pose = cold_pose.repeat(22, 1)
+    warm_pose[:21, 0] = torch.arange(21)
+    node.forward(
+        "chunk", SimpleNamespace(), history_append=21,
+        history_pose=warm_pose, history_pose_valid=torch.ones((22, 1), dtype=torch.uint8),
+        **{f"view_{i}": torch.zeros((22, 3, 2, 2), dtype=torch.uint8)
+           for i in range(model.config.num_cameras)},
+    )
+    assert frames.added[-1][1]["pose"][:, 0].tolist() == list(range(21))
+    assert boundaries.added[-1][1]["history_valid"].tolist() == [[1]]
+
+
 def test_missing_pose_fallback_matches_reference_over_three_calls():
     reference = pytest.importorskip("praxis.robot_io", reason="reference checkout not on PYTHONPATH")
     single_arm = pytest.importorskip("praxis.single_arm", reason="reference checkout not on PYTHONPATH")
