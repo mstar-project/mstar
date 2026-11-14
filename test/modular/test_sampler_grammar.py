@@ -16,7 +16,8 @@ from test_byte_level_text_chunks import fast_tokenizer  # noqa: E402, F401
 
 from mstar.api_server.openai.adapters import _refuse_unserved_chat  # noqa: E402
 from mstar.conductor.conductor import Conductor  # noqa: E402
-from mstar.engine.accelerator_graph_backend import SplitGraph  # noqa: E402
+from mstar.engine.accelerator_graph_backend import SplitGraph, get_accelerator_graph_backend  # noqa: E402
+from mstar.engine.accelerator_graph_runner import capture_into_graph  # noqa: E402
 from mstar.engine.resources import StepRunner  # noqa: E402
 from mstar.engine.resources.sampler import grammar, utils  # noqa: E402
 from mstar.engine.resources.sampler.config import SamplerSpec, SamplerStep, SamplingReqConfig  # noqa: E402
@@ -35,13 +36,17 @@ SCHEMA = {"type": "object", "properties": {"a": {"type": "integer"}}, "required"
           "additionalProperties": False}
 
 
+_REAL_DRAWS = {"sample_tokens": utils.sample_tokens,
+               "sample_accelerator_graphable_gpu": utils.sample_accelerator_graphable_gpu}
+
+
 @pytest.fixture(autouse=True)
 def _argmax_draw(monkeypatch):
     monkeypatch.setattr(utils, "sample_tokens", lambda logits, **kw: logits.argmax(-1))
     monkeypatch.setattr(utils, "sample_accelerator_graphable_gpu", lambda logits, *a, **kw: logits.argmax(-1))
 
 
-def _resource(graph: bool, comm_group=None, tokenizer_eos: bool = False) -> GrammarSamplerResource:
+def _resource(graph: bool, comm_group=None, tokenizer_eos: bool = False, device="cpu") -> GrammarSamplerResource:
     """``tokenizer_eos``: the model declares no stop and its HF tokenizer's EOS is the only one."""
     detok = SimpleNamespace(token_bytes=lambda i: VOCAB[i] if i < len(VOCAB) else b"")
     if tokenizer_eos:
@@ -53,7 +58,7 @@ def _resource(graph: bool, comm_group=None, tokenizer_eos: bool = False) -> Gram
             tokenizer_object=Tokenizer(models.WordLevel(words, unk_token="{")), eos_token="<eos>")
     text_output = SimpleNamespace(detokenizer=detok, stop_token_ids=frozenset() if tokenizer_eos else frozenset({EOS}))
     res = GrammarSamplerResource(
-        vocab_size=V, enable_repetition_penalty=False, device=torch.device("cpu"),
+        vocab_size=V, enable_repetition_penalty=False, device=torch.device(device),
         text_output=text_output, grammar_cache_mb=16, comm_group=comm_group,
     )
     if graph:
@@ -99,6 +104,54 @@ def test_a_constrained_row_draws_its_grammar_beside_a_free_row(graph):
     assert out["json"][-1] == EOS and isinstance(json.loads(_text(out["json"]))["a"], int)
     assert out["choice"][-1] == EOS and _text(out["choice"]) in ("ab", "ba")
     assert any(t >= len(VOCAB) for t in out["free"]), "the free row was masked too"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA")
+@pytest.mark.parametrize("draw", ["argmax", "sampled"])
+def test_a_captured_split_graph_masks_each_replay_by_the_rows_last_draws(monkeypatch, draw):
+    """On a real CUDA graph: the sampler's draw splits the capture, and each replay
+    fills the mask between the forward and the draw from the step before's tokens,
+    so the constrained row follows its schema though its logits favour a token the
+    grammar never allows, and the free row beside it keeps drawing that token."""
+    if draw == "sampled":
+        for name, fn in _REAL_DRAWS.items():
+            monkeypatch.setattr(utils, name, fn)
+    device = torch.device("cuda", torch.cuda.current_device())
+    res = _resource(graph=True, device=device)
+    res.ingest_request("json", SamplingReqConfig(grammar=grammar_request({"json": SCHEMA})))
+    res.ingest_request("free", SamplingReqConfig())
+    res._grammar._rows["json"].compiled.result()
+    lease = SlotLease(slot=0, bucket=SimpleNamespace(bs=4))
+    step = SamplerStep(apply_penalty=False)
+    ctx = StepContext(request_ids=("json", "free"), graph_walk="w", slot=0, capture=False, slot_lease=lease)
+    hidden = torch.zeros(4, V, device=device)  # the forward's input, written before each replay
+    head = torch.eye(V, device=device)
+
+    def forward_and_draw():
+        return res.sample(["json", "free"], hidden @ head)
+
+    res.plan(step, ctx)
+    forward_and_draw()  # warm-up: the mask kernel and the sampler compile outside the capture
+    backend = get_accelerator_graph_backend(device)
+    graph, _ = capture_into_graph(forward_and_draw, backend.graph_pool_handle(), device, None, splittable=True)
+    assert isinstance(graph, SplitGraph)
+
+    gen = torch.Generator().manual_seed(0)
+    drawn = []
+    for _ in range(40):
+        logits = torch.randn(4, V, generator=gen)
+        logits[:, VOCAB.index(b"x")] += 20.0  # the model's own pick, which JSON never allows
+        hidden.copy_(logits)
+        res.plan(step, ctx)
+        graph.replay()
+        res.commit(step, ctx)
+        constrained, free = res._cg_sampler.last_token_buf.reshape(-1)[:2].tolist()
+        drawn.append(constrained)
+        assert free == VOCAB.index(b"x"), "the free row was masked"
+        if constrained == EOS:
+            break
+    assert drawn[-1] == EOS and isinstance(json.loads(_text(drawn))["a"], int), _text(drawn)
+    assert not res._grammar.failures(["json"])
 
 
 def test_a_request_given_a_finished_one_s_handle_starts_its_grammar_afresh():
