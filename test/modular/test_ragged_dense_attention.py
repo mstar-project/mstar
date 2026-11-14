@@ -121,8 +121,8 @@ def test_eager_causal_matches_reference():
 def _count_fixed_length_calls(monkeypatch):
     import mstar.engine.resources.attn.ragged.dense_wrappers as dw
 
-    if dw.flash_attn_func is None:
-        pytest.skip("no FA3 fixed-length kernel (AITER)")
+    if not dw.fixed_one_segment(DEVICE):
+        pytest.skip(f"no FA3 fixed-length kernel, or none measured for {dw.current_platform.arch(DEVICE)}")
     calls, fixed = [], dw.flash_attn_func
     monkeypatch.setattr(dw, "flash_attn_func", lambda *a, **kw: calls.append(1) or fixed(*a, **kw))
     return dw, calls
@@ -184,7 +184,7 @@ def _count_fixed_segment_calls(monkeypatch):
 
     if dw.fa3_fixed_into is None:
         pytest.skip("no FA3 fixed-length entry point that writes into an output (fa3-fwd 0.0.2)")
-    if dw.fixed_segment_min_rows(DEVICE) is None:
+    if dw.fixed_segment_min_rows(DEVICE, 128) is None:
         pytest.skip(f"no per-segment threshold measured for {dw.current_platform.arch(DEVICE)}")
     calls, into = [], dw.fa3_fixed_into
     monkeypatch.setattr(dw, "fa3_fixed_into", lambda *a: calls.append(a[0].shape[1]) or into(*a))
@@ -233,28 +233,47 @@ def test_short_or_causal_segments_stay_on_varlen(monkeypatch):
     """One segment under the threshold keeps the whole plan on varlen, where the
     launches would cost more than they save; so does a causal plan."""
     dw, calls = _count_fixed_segment_calls(monkeypatch)
-    short = dw.fixed_segment_min_rows(DEVICE) - 1
+    short = dw.fixed_segment_min_rows(DEVICE, 128) - 1
+    gen = torch.Generator(device=DEVICE).manual_seed(6)
     for q_lens, causal in (([2048, short], False), ([2048, 2048], True)):
-        q, k, v = (t.repeat(1, 8, 1) for t in qkv(sum(q_lens)))
-        w = wrapper(num_qo_heads=HEADS * 8, num_kv_heads=HEADS * 8)
+        q, k, v = (torch.randn(sum(q_lens), 32, 128, dtype=DTYPE, device=DEVICE, generator=gen) for _ in range(3))
+        w = wrapper(num_qo_heads=32, num_kv_heads=32, head_dim=128)
         w.plan(cu(q_lens), causal=causal)
         w.run(q, k, v)
     assert not calls
 
 
-def test_an_unmeasured_architecture_keeps_several_segments_on_varlen(monkeypatch):
-    """The per-segment threshold is looked up per architecture; one with no
-    measurement, or a build without the entry point, gets none."""
+def test_a_head_dim_not_measured_keeps_long_segments_on_varlen(monkeypatch):
+    """The split is measured at head dim 128 only; at the vision towers' 72 it
+    loses, so long segments there stay on one varlen call."""
+    dw, calls = _count_fixed_segment_calls(monkeypatch)
+    q_lens = [2048, 2048]
+    q, k, v = (t.repeat(1, 4, 1) for t in qkv(sum(q_lens)))
+    w = wrapper(num_qo_heads=HEADS * 4, num_kv_heads=HEADS * 4)
+    w.plan(cu(q_lens))
+    w.run(q, k, v)
+    assert not calls
+
+
+def test_an_unmeasured_architecture_or_head_dim_keeps_varlen(monkeypatch):
+    """Both fixed-length cases are looked up per architecture, and the split per
+    head dim too; one with no measurement, or a build without the entry point,
+    gets none."""
     import mstar.engine.resources.attn.ragged.dense_wrappers as dw
 
+    monkeypatch.setattr(dw, "flash_attn_func", lambda *a, **kw: None)
     monkeypatch.setattr(dw, "fa3_fixed_into", lambda *a: None)
     monkeypatch.setattr(dw.current_platform, "arch", lambda device=None: "sm_90")
-    assert dw.fixed_segment_min_rows(DEVICE) == 1536
-    monkeypatch.setattr(dw.current_platform, "arch", lambda device=None: "sm_100")
-    assert dw.fixed_segment_min_rows(DEVICE) is None
+    assert dw.fixed_one_segment(DEVICE)
+    assert dw.fixed_segment_min_rows(DEVICE, 128) == 1536
+    assert dw.fixed_segment_min_rows(DEVICE, 72) is None
+    for arch in ("sm_80", "sm_100"):
+        monkeypatch.setattr(dw.current_platform, "arch", lambda device=None, arch=arch: arch)
+        assert not dw.fixed_one_segment(DEVICE)
+        assert dw.fixed_segment_min_rows(DEVICE, 128) is None
     monkeypatch.setattr(dw, "fa3_fixed_into", None)
     monkeypatch.setattr(dw.current_platform, "arch", lambda device=None: "sm_90")
-    assert dw.fixed_segment_min_rows(DEVICE) is None
+    assert dw.fixed_segment_min_rows(DEVICE, 128) is None
 
 
 def capture_wrapper(w):
