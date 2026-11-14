@@ -10,6 +10,7 @@ blocks; and on ``reduced`` the latent pool keeps ``64 * (k + 1)`` rows where the
 from __future__ import annotations
 
 import sys
+from types import SimpleNamespace
 
 sys.path.insert(0, ".")
 sys.path.insert(0, "test/modular")
@@ -44,7 +45,7 @@ from mstar.engine.state.adapters import StateSetup, kv_layouts, node_handles, no
 from mstar.engine.state.analysis import state_declaration_problems
 from mstar.model.base import LabelLayout, enabled_resources, parse_autocast_dtype, serving_resources
 from mstar.model.glm5_next.components.causal_lm import Glm5NextForCausalLM
-from mstar.model.glm5_next.config import ATTN, KDA, KDA_STATE, KV_CACHE, MTP_SEED, PROMPT_LEN, SAMPLER
+from mstar.model.glm5_next.config import ATTN, COUNT, KDA, KDA_STATE, KV_CACHE, MTP_SEED, PROMPT_LEN, SAMPLER
 from mstar.model.glm5_next.glm5_next_model import Glm5NextModel
 from mstar.model.glm5_next.submodules import Glm5NextLLMSubmodule
 from mstar.model.submodule_base import ARNodeInputs, engine_step
@@ -214,3 +215,23 @@ def test_only_a_decode_step_is_input_free(k):
     assert node.step_is_input_free("decode") and not node.step_is_input_free("prefill"), (
         "the GPU thread would declare and admit every decode step again before its launch"
     )
+
+
+@pytest.mark.parametrize("k", [0, 3])
+def test_a_decode_row_from_prepare_inputs_has_the_template_row_s_span(k):
+    """The engine runs the step a pre-plan declared over the capture's template rows on the model's word that every
+    real decode row has the template's span. Without MTP the span is the number of ids the row is fed, so a decode
+    row fed two would run a step declared and admitted for one, and nothing would refuse it."""
+    node = _node(_model("reduced", k, kda_conv_dtype=torch.float32))
+    template = node.get_accelerator_graph_configs(torch.device("cpu"))[0].single_request_inputs
+    info = SimpleNamespace(
+        request_id="r", resource_configs={}, dynamic_loop_iter_counts={}, step_metadata={PROMPT_LEN: 5},
+    )
+    signals = {"text_inputs": [torch.tensor([7])], COUNT: [torch.tensor(5)]}
+    row = node.prepare_inputs("decode", info, signals)
+    declared, real = (node.declare_step("decode", ["a"], [one]) for one in (template, row))
+    assert (declared.segments, declared.state) == (real.segments, real.state), (
+        "the pre-plan's step is not the one the forward would declare for this row"
+    )
+    with pytest.raises(RuntimeError, match="a decode row of 2 ids"):
+        node.prepare_inputs("decode", info, {**signals, "text_inputs": [torch.tensor([7, 8])]})
