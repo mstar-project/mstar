@@ -130,6 +130,25 @@ def test_a_windowed_label_opened_with_no_layout_fails_with_a_500(tmp_path, monke
     )
 
 
+def test_a_kv_layout_the_model_wrote_itself_on_a_kept_window_array_fails_with_a_500(tmp_path, monkeypatch, caplog):
+    """Only ``state_layout`` sizes the window a label keeps. A ``kv_layout`` the model wrote itself lays the label out
+    with none, so the conductor saw nothing missing and the read reached every entry with no error."""
+    model = _Windowed(layout=LAYOUT)
+    assert state_declaration_problems(model) == [], "the model was refused at load, before any request"
+    kwargs = _preprocess(model, {"max_output_tokens": 30})
+
+    sent = _conduct(model, kwargs, tmp_path, monkeypatch).sent
+
+    [failure] = [msg.body for msg in sent if getattr(msg, "message_type", None) == "request_failed"]
+    match = re.fullmatch(r"Ingest failed: internal error \(error id ([0-9a-f]{12})\)", failure.error_message)
+    assert failure.status == 500 and match, f"the request failed with {failure.status}: {failure.error_message}"
+    [logged] = [r.getMessage() for r in caplog.records if f"[error id {match.group(1)}]" in r.getMessage()]
+    assert "its layout sizes none, so the read would reach every entry; lay the array out through" in logged
+    assert not [msg for msg in sent if getattr(msg.message_type, "name", "") == "NEW_REQUEST"], (
+        "a worker heard of a request that keeps no window"
+    )
+
+
 def _one_loop() -> _Model:
     """main takes 100 slots plus one per decode_loop iteration, and uncond takes 2 pages and grows
     on no loop here. So only decode_loop decides whether a footprint fits the pool."""
