@@ -183,11 +183,12 @@ class ReplicaRouter:
         replicas: dict[int, int] = {}
         picked: dict[int, RoutingFacts] = {}
         for u, unit in enumerate(self._units):
-            choices = (range(len(unit.instances)) if eligible is None else
-                       [i for i, instance in enumerate(unit.instances) if eligible(instance)])
-            if not choices:
+            choices = None if eligible is None else [
+                i for i, instance in enumerate(unit.instances) if eligible(instance)
+            ]
+            if choices is not None and not choices:
                 return None
-            choice = choices[0]
+            choice = 0 if choices is None else choices[0]
             if len(unit.instances) > 1:
                 # the facts on each replica, every mirror's fields added
                 row: list[RoutingFacts] | None = None
@@ -200,9 +201,11 @@ class ReplicaRouter:
                     + (0.0 if row is None else routing_cost(row[i], self._weights))
                     for i in range(len(unit.instances))
                 ]
-                least = min(cost[i] for i in choices)
+                least = min(cost) if choices is None else min(cost[i] for i in choices)
                 choice = min(
-                    (i for i in choices if cost[i] == least), key=lambda i: self._last_pick[(u, i)],
+                    ((i for i, c in enumerate(cost) if c == least) if choices is None else
+                     (i for i in choices if cost[i] == least)),
+                    key=lambda i: self._last_pick[(u, i)],
                 )
                 if row is not None:
                     picked[u] = row[choice]
