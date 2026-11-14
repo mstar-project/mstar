@@ -152,7 +152,7 @@ Rejected:
 
 **Proposal.** Three ways a context restarts, and one way an episode ends early:
 
-1. **Explicit.** An observation with `reset_context: true` (or `__reset_context__`, as the reference reads it) sets `episode.reset` on its request. Both frontends' Positronic handlers read the key.
+1. **Explicit.** A truthy `reset_context` or `__reset_context__` in an observation sets `episode.reset` on its request, matching the reference. Both frontends' Positronic handlers read the keys; integer `1` resets and `0` does not.
 2. **Model-requested.** `process_prompt` sets `reset_episode` when this request's inputs can't continue the context: the reference's missing or short frame stack is the case. The data worker ORs it with the client's flag.
 3. **System.** An evicted, idle-ended or lost episode starts its next call cold (§6, §7), with `EpisodeView.cold` giving the internal reason. Whether the wire exposes it is open (§11).
 4. **Budget.** `episodes.max_calls` refuses the call past it with a 400, `episode reached max_calls=N`. Both frontends answer a failure with its text and close the socket, which ends the episode (§7).
@@ -303,7 +303,7 @@ Rejected:
 **Praxis-1 on episodes.**
 
 - `walk_plan` runs `encode_text` only when `episode.held["text_embeds"] == 0` (a new episode, a restart, an eviction or a new prompt), then the chunk walk. On a cold call the text embeddings reach the backbone as request edges, and its first step adds them to `text_embeds`. On a warm call the backbone reads the held array. E5 must make that warm graph schedulable without the absent encoder edges and test readiness at the graph boundary; an empty tensor inside a node does not satisfy a required graph input.
-- The VAE encoder appends the newly executed rows of the observation's frame stack to `executed` (the whole chunk on the chunk grid, `executed_rows` in real time) and reads the window, which it encodes into the clean context as the reference does each call.
+- The cold call leaves `executed` empty because no chunk has run yet. The first warm call appends all 21 executed frames supplied by the client, even if its earlier cold observation differed from the oldest executed frame. Later warm calls append 24 rows. The VAE encoder reads that window and encodes it into clean context as the reference does each call.
 - The seed of call k is the episode's seed plus `episode_calls`, the reference's `base + k`.
 - **Executed frames, not predicted video.** #1460 now leaves predicted video latents inside the denoise loop. The reference conditions on executed real frames and refuses its own predictions as context (`policy.py` lines 271-276; `robot_io.py` lines 298-317). The proposed episode array retains the executed frame window.
 
