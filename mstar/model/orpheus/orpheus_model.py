@@ -29,7 +29,6 @@ from transformers import AutoTokenizer
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import FINAL_PREFILL, PartitionDefinition
-from mstar.engine.resources.lora import LoraSpec
 from mstar.engine.state import (
     Array,
     Attend,
@@ -46,6 +45,7 @@ from mstar.engine.state import (
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import KVLabel, Model, PrefixKeys, ProcessPromptOutput, WalkStep
+from mstar.model.components.lora.modules import PER_SEGMENT, LoraRoot
 from mstar.model.keys import MIXED
 from mstar.model.orpheus.config import ATTN, KV_CACHE, SAMPLER, OrpheusModelConfig
 from mstar.model.rebuild import RebuildPolicy
@@ -338,23 +338,16 @@ class OrpheusModel(Model):
             self.model_path_hf, cache_dir=self.cache_dir, allow_patterns=LLM_FILES,
         )
 
-    def _lora_spec(self) -> LoraSpec:
+    def lora_roots(self) -> tuple[LoraRoot, ...]:
         """Per-request adapters on the LLM (opt-in): every linear of the Llama stack, the
         LM head (one row per request: the last token's) and the token embedding, placed as
         the weight loader places the checkpoint's own tensors. Adapters saved on the bare
         ``LlamaModel`` (``layers.*``) are read under ``model.``."""
-        from mstar.model.components.lora.modules import PER_SEGMENT, module_lora_spec
         from mstar.model.orpheus.components.language_model import OrpheusForCausalLM
-        return module_lora_spec(
-            lambda group: OrpheusForCausalLM(self.config, comm_group=group),
-            nodes={"LLM"}, root_path="model",
-            adapter_roots=[("", "model.")],
-            rows={"lm_head": PER_SEGMENT},
-            embeddings=True,
-        )
-
-    def get_node_resources(self):
-        return [self._lora_spec()]
+        return (LoraRoot(
+            node="LLM", build=lambda group: OrpheusForCausalLM(self.config, comm_group=group),
+            adapter_roots=[("", "model.")], rows={"lm_head": PER_SEGMENT}, embeddings=True,
+        ),)
 
     def declare_state(self) -> list[Array | Sampler]:
         c, scaling = self.config, self.config.rope_scaling

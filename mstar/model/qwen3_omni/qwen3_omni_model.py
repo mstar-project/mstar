@@ -40,7 +40,6 @@ from transformers import AutoTokenizer
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import FINAL_PREFILL, PartitionDefinition
-from mstar.engine.resources.lora import LoraSpec
 from mstar.engine.state import (
     Array,
     Attend,
@@ -72,6 +71,7 @@ from mstar.model.base import (
 )
 from mstar.model.components import MoeParallelConfig
 from mstar.model.components.code_predictor_kernels import ResidualCodePredictor
+from mstar.model.components.lora.modules import PER_SEGMENT, LoraRoot
 from mstar.model.media_limits import VideoBudget, probe_video
 from mstar.model.multimodal import (
     TEXT,
@@ -347,7 +347,7 @@ class Qwen3OmniModel(Model):
             SeqShard(THINKER_SHARD, nodes={"Thinker"}, exchange="none"),
         ]
 
-    def _lora_spec(self) -> LoraSpec:
+    def lora_roots(self) -> tuple[LoraRoot, ...]:
         """Per-request adapters on the Thinker: its attention, any dense MLP layers, the
         LM head (one row per request: the last token's), and the routed experts when the
         YAML's ``targets:`` names them (``experts_gate_up_proj`` / ``experts_down_proj``,
@@ -355,16 +355,11 @@ class Qwen3OmniModel(Model):
         reason; so is one touching the Talker or the encoders, which are other nodes.
         Modules are named as the full model's checkpoint names them (``thinker.*``) or as
         the Thinker alone does."""
-        from mstar.model.components.lora.modules import PER_SEGMENT, module_lora_spec
         from mstar.model.qwen3_omni.components.thinker import Qwen3OmniThinkerModel
-        return module_lora_spec(
-            lambda group: Qwen3OmniThinkerModel(self.config, comm_group=group),
-            nodes={"Thinker"}, root_path="model",
+        return (LoraRoot(
+            node="Thinker", build=lambda group: Qwen3OmniThinkerModel(self.config, comm_group=group),
             rows={"lm_head": PER_SEGMENT},
-        )
-
-    def get_node_resources(self):
-        return [self._lora_spec()]
+        ),)
 
     def kernel_settings(self) -> dict[str, dict[str, Any]]:
         from mstar.model.components.aut_submodule import AuTEncoderSubmodule

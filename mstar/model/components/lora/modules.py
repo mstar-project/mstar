@@ -17,6 +17,9 @@ forward (``lora_unservable``), which the walk refuses.
 ``join_lora_specs`` makes one spec of several nodes' (an LLM's and its vision tower's),
 each node's pool holding its own targets (``LoraSpec.for_node``).
 
+A model declares its roots as ``LoraRoot``s (`Model.lora_roots`), one per node, and
+``declared_lora_spec`` builds its one spec from them.
+
 ``bind_module_lora`` binds each placed module to its delta when the node's resources
 include its pool (``NodeSubmodule.bind_node_resources`` calls it), checking the real,
 possibly sharded, module against the declaration first. A deployment without a ``lora:``
@@ -507,6 +510,56 @@ def join_lora_specs(*specs: LoraSpec) -> LoraSpec:
         resource_key=specs[0].resource_key, nodes=set().union(*(spec.nodes for spec in specs)),
         convert_keys=convert_keys, declare=declare,
     )
+
+
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class LoraRoot:
+    """One node's weights root that per-request adapters may reach, and what the model states about it that its
+    modules can't, as `module_lora_spec` takes them. ``adapters`` are the ones the checkpoint ships for it, name to
+    file, served unless a deployment's ``lora:`` block names its own."""
+
+    node: str
+    build: Callable[[CommGroup], nn.Module]
+    root_path: str = "model"
+    rows: Mapping[str, RowSpec] = dataclasses.field(default_factory=dict)
+    exclude: Sequence[str] | Mapping[str, str] = ()
+    embeddings: bool = False
+    adapter_roots: Sequence[AdapterRoot | tuple[str, str]] = ()
+    aliases: Mapping[str, str] = dataclasses.field(default_factory=dict)
+    adapter_stacked_params: Sequence[StackedParamRule] = ()
+    ignore: Sequence[str] = ()
+    names: Mapping[str, str] = dataclasses.field(default_factory=dict)
+    rules: CheckpointRules | None = None
+    adapters: Mapping[str, str] = dataclasses.field(default_factory=dict)
+
+
+def declared_lora_spec(roots: Sequence[LoraRoot]) -> LoraSpec | None:
+    """The spec of a model's ``roots``, with a pool per node, or None when it declares none."""
+    strays = [type(root).__name__ for root in roots if not isinstance(root, LoraRoot)]
+    if strays:
+        raise TypeError(f"lora_roots() returns LoraRoots, from which the bridge builds the spec, not {strays}")
+    twice = sorted(node for node, n in Counter(root.node for root in roots).items() if n > 1)
+    if twice:
+        raise ValueError(f"LoRA roots name nodes {twice} twice, and a node's pool binds one weights root")
+    adapters: dict[str, str] = {}
+    for root in roots:
+        for name, path in root.adapters.items():
+            if adapters.setdefault(name, path) != path:
+                raise ValueError(f"LoRA roots ship adapter {name!r} as two files, {adapters[name]} and {path}")
+    specs = [
+        module_lora_spec(
+            root.build, nodes={root.node}, root_path=root.root_path, rules=root.rules,
+            adapter_stacked_params=root.adapter_stacked_params, adapter_roots=root.adapter_roots,
+            aliases=root.aliases, rows=root.rows, names=root.names, exclude=root.exclude, ignore=root.ignore,
+            embeddings=root.embeddings,
+        )
+        for root in roots
+    ]
+    if not specs:
+        return None
+    spec = specs[0] if len(specs) == 1 else join_lora_specs(*specs)
+    spec.adapters = adapters
+    return spec
 
 
 # -- binding ------------------------------------------------------------------------------

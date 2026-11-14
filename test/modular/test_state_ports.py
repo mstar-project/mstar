@@ -38,7 +38,6 @@ from mstar.engine.resources.linear_attn.config import (
     LinearAttnStep,
     LinearAttnVariant,
 )
-from mstar.engine.resources.lora.config import LORA_RESOURCE_KEY
 from mstar.engine.resources.position.config import PositionConfig, PositionSpec, PositionStep
 from mstar.engine.resources.recurrent.config import (
     DeltaNetGeometry,
@@ -349,9 +348,8 @@ def test_qwen3_5_refuses_a_shape_that_cant_run(overrides, where):
         _qwen3_5(**{**QWEN3_5["9B"], **overrides}).declare_state()
 
 
-def test_qwen3_5_writes_only_lora_by_hand():
-    model = _qwen3_5(**QWEN3_5["9B"])
-    assert {spec.resource_key for spec in model.get_node_resources()} == {LORA_RESOURCE_KEY}
+def test_qwen3_5_writes_no_spec_by_hand():
+    assert _qwen3_5(**QWEN3_5["9B"]).get_node_resources() == []
 
 
 # The tower of Qwen/Qwen3.5-9B's `config.json`
