@@ -76,7 +76,6 @@ from mstar.model.cosyvoice3.submodules import (
     SPEECH_TOKENS,
     TEXT_INPUTS,
     TOKEN2WAV_LOOP,
-    VOICE,
     VOICE_KEY,
     FlowSubmodule,
     HiFTSubmodule,
@@ -1691,12 +1690,13 @@ def test_hift_node_final_flush_without_new_frames_releases_the_tail():
 def _stream_token2wav(flow_node, hift_node, policy, voice, tokens: list[int]) -> list[torch.Tensor]:
     """Feed tokens one at a time through a real StreamBuffer and the two
     Token2Wav nodes, as the worker does, each node getting back the loop-back
-    edges of its last chunk, and ``voice`` on the first chunk's voice edge;
-    return the emitted audio chunks."""
+    edges of its last chunk, with ``voice`` in the flow's cache; return the
+    emitted audio chunks."""
     buffer = StreamBuffer(request_id=0, edge_name=SPEECH_TOKENS, from_partition=LM_PARTITION, policy=policy)
-    info = SimpleNamespace(rid_handle=0, request_id=0, step_metadata={"n_cfm_timesteps": 3})
+    info = SimpleNamespace(rid_handle=0, request_id=0, step_metadata={"n_cfm_timesteps": 3, VOICE_KEY: 7})
+    flow_node.cache.put(7, voice)
     chunks: list[torch.Tensor] = []
-    flow_edges, hift_edges = {VOICE: voice.edge()}, {}
+    flow_edges, hift_edges = {}, {}
 
     def drain():
         while buffer.has_chunk_ready():
@@ -1706,7 +1706,7 @@ def _stream_token2wav(flow_node, hift_node, policy, voice, tokens: list[int]) ->
                 is_final_stream_chunk=chunk.is_final,
             )
             mel = flow_node.forward("token2wav", None, **flow_node.preprocess("token2wav", None, [p]))
-            flow_edges.update((name, mel[name]) for name in (VOICE, FLOW_COUNTS, RAW_TOKENS))
+            flow_edges.update((name, mel[name]) for name in (FLOW_COUNTS, RAW_TOKENS))
             h = hift_node.prepare_inputs("token2wav", info, {MEL: mel[MEL], MEL_FINAL: mel[MEL_FINAL], **hift_edges})
             audio = hift_node.forward("token2wav", None, **hift_node.preprocess("token2wav", None, [h]))
             hift_edges.update((name, audio[name]) for name in (HIFT_COUNTS, HIFT_MEL))

@@ -94,10 +94,6 @@ class ReferenceVoice:
     def num_prompt_tokens(self) -> int:
         return int(self.prompt_tokens.shape[0])
 
-    def edge(self) -> list[torch.Tensor]:
-        """The voice as an edge carries it, whose tensors build it again in order."""
-        return [self.prompt_tokens, self.prompt_feat, self.embedding]
-
 
 @dataclass(slots=True)
 class FlowCounts:

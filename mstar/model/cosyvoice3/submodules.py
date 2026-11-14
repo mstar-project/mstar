@@ -117,7 +117,6 @@ DECODE_LOOP = "decode_loop"
 # The token2wav loop runs once per chunk of the stream, and its loop-back edges carry a stream's flow and vocoder
 # state from one chunk to the next.
 TOKEN2WAV_LOOP = "token2wav_loop"
-VOICE = "voice"  # the reference voice (`ReferenceVoice.edge`)
 FLOW_COUNTS = "flow_counts"  # how far the flow's solves have got (`FlowCounts`)
 RAW_TOKENS = "raw_tokens"  # every token the stream has delivered, on the host
 HIFT_COUNTS = "hift_counts"  # the vocoder stream's counts, on the host
@@ -638,8 +637,8 @@ class FlowSubmodule(NodeSubmodule):
     Every chunk of the stream carries the whole token history (the edge's
     policy keeps all of it as left context), so the node carries only how far it
     has settled and where its hop schedule is. A request's reference voice is
-    conditioned from the clip that rides with its first chunk (per-voice cache)
-    and carried to the chunks that follow.
+    conditioned from its clip once and kept in the per-voice cache, which every
+    chunk of the stream reads.
 
     Attention is block-causal, so frames a row has solved never change. A row
     keeps their K/V (``FLOW_KV``) and conv tails (``FLOW_TAILS``) and each hop
@@ -674,14 +673,13 @@ class FlowSubmodule(NodeSubmodule):
         self._index_stager = PinnedStager(torch.long, numel=2 * frames + 2 * config.flow.dit.conv_pos_kernel * rows)
 
     def _voice(self, fwd_info: CurrentForwardPassInfo, inputs: NameToTensorList) -> ReferenceVoice:
-        """The voice the last chunk carried, or at a stream's first chunk the one its clip conditions."""
-        if inputs.get(VOICE):
-            return ReferenceVoice(*inputs[VOICE])
-        if not inputs.get(REF_AUDIO):
-            raise ValueError("CosyVoice3 needs a reference voice; none reached the flow node")
+        """The voice the request's clip conditions, from the per-voice cache. The token2wav loop hands the clip to
+        every chunk, so a voice the cache dropped mid-stream is conditioned again."""
         key = _voice_key(fwd_info)
         voice = self.cache.get(key)
         if voice is None:
+            if not inputs.get(REF_AUDIO):
+                raise ValueError("CosyVoice3 needs a reference voice; none reached the flow node")
             wav = inputs[REF_AUDIO][0].to(self.get_device(), torch.float32).reshape(-1)
             voice = self.encoder.voice(wav)
             self.cache.put(key, voice)
@@ -905,8 +903,7 @@ class FlowSubmodule(NodeSubmodule):
             # on the host: HiFT reads it to plan its emit, and a colocated HiFT
             # gets this very tensor
             out.append({
-                MEL: [new], MEL_FINAL: [torch.tensor([final])],
-                VOICE: voices[i].edge(), FLOW_COUNTS: row_counts.edge(), RAW_TOKENS: [raws[i]],
+                MEL: [new], MEL_FINAL: [torch.tensor([final])], FLOW_COUNTS: row_counts.edge(), RAW_TOKENS: [raws[i]],
             })
         return out
 

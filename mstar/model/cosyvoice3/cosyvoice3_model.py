@@ -117,7 +117,6 @@ from mstar.model.cosyvoice3.submodules import (
     SPEECH_TOKENS,
     TEXT_INPUTS,
     TOKEN2WAV_LOOP,
-    VOICE,
     VOICE_KEY,
     reference_tokens,
 )
@@ -531,11 +530,11 @@ class CosyVoice3Model(Model):
                 [
                     GraphNode(
                         name=FLOW_NODE,
-                        input_names=[SPEECH_TOKENS, REF_AUDIO, VOICE, FLOW_COUNTS, RAW_TOKENS],
+                        input_names=[SPEECH_TOKENS, REF_AUDIO, FLOW_COUNTS, RAW_TOKENS],
                         outputs=[
                             GraphEdge(next_node=HIFT_NODE, name=MEL),
                             GraphEdge(next_node=HIFT_NODE, name=MEL_FINAL),
-                            *(GraphEdge(next_node=FLOW_NODE, name=name) for name in (VOICE, FLOW_COUNTS, RAW_TOKENS)),
+                            *(GraphEdge(next_node=FLOW_NODE, name=name) for name in (FLOW_COUNTS, RAW_TOKENS)),
                         ],
                     ),
                     GraphNode(
