@@ -1,12 +1,14 @@
 """Cacheless varlen prefill through FA3 ``flash_attn_varlen`` (AITER on ROCm), or FA3's
-fixed-length kernel for an eager plan of one non-causal segment.
+fixed-length kernel per segment for an eager non-causal plan of one segment or of long ones.
 
 Same layouts as the FlashInfer wrappers, without a workspace or head-dim padding.
 """
 
+from typing import NamedTuple
+
 import torch
 
-from mstar.engine.resources.attn.dense import flash_attn_func, flash_attn_varlen_func
+from mstar.engine.resources.attn.dense import fa3_fixed_into, flash_attn_func, flash_attn_varlen_func
 from mstar.engine.resources.attn.ragged.wrappers import (
     PrefixedPrefillWrapper,
     RaggedCrossPrefillWrapper,
@@ -25,9 +27,32 @@ def _max_span(cu_seqlens: torch.Tensor) -> int:
     return int((cu_seqlens[1:] - cu_seqlens[:-1]).max())
 
 
+# Per GPU architecture, the query rows from which every segment of a plan runs its own
+# fixed-length call. Measured on an H200 (sm_90) at 32/8 heads of 128: 2.7-9.4% under one
+# varlen call for two to eight segments of 1536-3552 rows, but 3-13% over it at 1280, and
+# mixed below. An architecture not listed keeps varlen for several segments until measured.
+_FIXED_SEGMENT_MIN_ROWS: dict[str, int] = {"sm_90": 1536}
+
+
+def fixed_segment_min_rows(device) -> int | None:
+    """The shortest segment, in query rows, for which a plan of several runs FA3's
+    fixed-length kernel once per segment on ``device``; None where that isn't available
+    or hasn't been measured to win."""
+    if fa3_fixed_into is None:
+        return None
+    return _FIXED_SEGMENT_MIN_ROWS.get(current_platform.arch(device))
+
+
+class _FixedSegments(NamedTuple):
+    """A plan's segment boundaries (host ``cu_seqlens``) for FA3's fixed-length kernel."""
+    q: tuple[int, ...]
+    k: tuple[int, ...]
+
+
 class _DenseRaggedPrefillBase(_RaggedPrefillBase):
-    """FA3 varlen over packed q/k/v; an eager plan of one non-causal segment runs
-    FA3's fixed-length kernel instead, with the same output bit for bit.
+    """FA3 varlen over packed q/k/v. An eager non-causal plan of one segment, or
+    of segments all at least ``fixed_segment_min_rows`` long, runs FA3's
+    fixed-length kernel once per segment instead, with the same output bit for bit.
 
     Graph mode reads the layout from the static buffers and launches at the
     bucket ceiling, so every replay of that bucket runs the same kernel.
@@ -40,8 +65,10 @@ class _DenseRaggedPrefillBase(_RaggedPrefillBase):
         self._cu_k: torch.Tensor | None = None
         self._max_q = 0
         self._max_k = 0
-        # (q rows, kv rows) of a plan that is one segment, for FA3's fixed-length kernel; else None
-        self._one_segment: tuple[int, int] | None = None
+        # the segments of a plan FA3's fixed-length kernel runs, else None
+        self._fixed: _FixedSegments | None = None
+        # several segments only where the split was measured to win
+        self._split_min_rows = fixed_segment_min_rows(self.device)
 
     def _plan_kernel(
         self, cu: torch.Tensor, kv_cu: torch.Tensor, total_tokens: int, causal: bool,
@@ -56,16 +83,22 @@ class _DenseRaggedPrefillBase(_RaggedPrefillBase):
                 self._kv_indptr_buf.copy_(kv_cu, non_blocking=True)
                 self._cu_k = self._kv_indptr_buf
             self._max_q, self._max_k = self.max_total_tokens, self.max_total_kv_tokens
-            self._one_segment = None
+            self._fixed = None
             return
         self._cu_q = cu.to(self.device, non_blocking=True)
         self._cu_k = self._cu_q if kv_cu is cu else kv_cu.to(self.device, non_blocking=True)
         cu_host, kv_host = cu.cpu(), kv_cu.cpu()
         self._max_q, self._max_k = _max_span(cu_host), _max_span(kv_host)
         # FA3's fixed-length kernel beats varlen on one non-causal segment (H200: 1-12%
-        # at Cosmos3's and the vision towers' shapes) but loses on short causal ones
-        one = flash_attn_func is not None and not causal and cu_host.numel() == 2 and kv_host.numel() == 2
-        self._one_segment = (self._max_q, self._max_k) if one else None
+        # at Cosmos3's and the vision towers' shapes) and on each of several long ones,
+        # but loses on short causal ones
+        self._fixed = None
+        if flash_attn_func is not None and not causal and cu_host.numel() == kv_host.numel() >= 2:
+            if cu_host.numel() == 2 or (
+                self._split_min_rows is not None
+                and int((cu_host[1:] - cu_host[:-1]).min()) >= self._split_min_rows
+            ):
+                self._fixed = _FixedSegments(tuple(cu_host.tolist()), tuple(kv_host.tolist()))
 
     @torch.compiler.disable
     def run(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, return_lse: bool = False) -> torch.Tensor:
@@ -79,9 +112,17 @@ class _DenseRaggedPrefillBase(_RaggedPrefillBase):
             for t in (t.to(self.q_data_type) for t in (q, k, v))
         )
         # the fixed-length kernel reads every row it is given, so only where the plan covers them all
-        if self._one_segment is not None and self._one_segment == (q.shape[0], k.shape[0]):
-            out = flash_attn_func(q[None], k[None], v[None], causal=self._causal, softmax_scale=self.sm_scale)
-            out = (out[0] if isinstance(out, tuple) else out)[0]
+        fixed = self._fixed
+        if fixed is not None and (fixed.q[-1], fixed.k[-1]) == (q.shape[0], k.shape[0]):
+            if len(fixed.q) == 2:
+                out = flash_attn_func(q[None], k[None], v[None], causal=False, softmax_scale=self.sm_scale)
+                out = (out[0] if isinstance(out, tuple) else out)[0]
+            else:
+                # each segment writes its rows of one output, so nothing is concatenated after
+                out = q.new_empty(q.shape[0], q.shape[1], v.shape[-1])
+                for i in range(len(fixed.q) - 1):
+                    q0, q1, k0, k1 = fixed.q[i], fixed.q[i + 1], fixed.k[i], fixed.k[i + 1]
+                    fa3_fixed_into(q[None, q0:q1], k[None, k0:k1], v[None, k0:k1], out[None, q0:q1], self.sm_scale)
         else:
             out = flash_attn_varlen_func(
                 q, k, v, self._cu_q, self._cu_k, self._max_q, self._max_k,
