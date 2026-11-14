@@ -11,6 +11,7 @@ from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.engine import ForwardPassInfoWrapper
 from mstar.engine.resources import SamplingReqConfig
 from mstar.engine.resources.kv.manager import SpanCursor
+from mstar.engine.state import Layout
 from mstar.model.base import LabelLayout, Span
 from mstar.model.submodule_base import InputMetadata
 
@@ -658,8 +659,8 @@ def test_vjepa2_lays_out_a_frame_per_rollout_iteration(extrinsics):
     if extrinsics:
         kwargs["extrinsics"] = [[0.3] * 6] * 5
 
-    rollout = model.process_prompt(None, ["video"], ["video"], rollout_horizon=5, **kwargs).metadata["kv_layout"]
-    once = model.process_prompt(None, ["video"], ["video"], **kwargs).metadata["kv_layout"]
+    rollout = model.process_prompt(None, ["video"], ["video"], rollout_horizon=5, **kwargs).metadata["state_layout"]
+    once = model.process_prompt(None, ["video"], ["video"], **kwargs).metadata["state_layout"]
 
     step = VJepa2ACRolloutPredictorSubmodule(None, model.config).prepare_inputs(
         "prefill_video_rollout", SimpleNamespace(dynamic_loop_iter_counts={"rollout_loop": 0}), {
@@ -668,8 +669,8 @@ def test_vjepa2_lays_out_a_frame_per_rollout_iteration(extrinsics):
         },
     )
     assert rollout[KV_CACHE]["main"].growth == (("rollout_loop", step.input_seq_len),)
-    assert once[KV_CACHE]["main"] == LabelLayout(), "a walk that never runs the rollout is laid out"
-    assert _vjepa2("masked").process_prompt(None, ["video"], ["video"]).metadata["kv_layout"] == {}
+    assert once[KV_CACHE]["main"] == Layout(), "a walk that never runs the rollout is laid out"
+    assert _vjepa2("masked").process_prompt(None, ["video"], ["video"]).metadata["state_layout"] == {}
 
 
 

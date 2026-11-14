@@ -1,9 +1,9 @@
 """PaliGemma transformer expert for Pi0.5 (prefix processing).
 
-A Gemma-style transformer that writes the paged KV cache through the node's
-KV/attention/position resources. Used for the prefill graph walk where it
-processes the prefix tokens (image + language + state) and writes the KV cache
-that the action expert later reads during action generation.
+A Gemma-style transformer that adds to the node's declared array. Used for the
+prefill graph walk where it processes the prefix tokens (image + language +
+state) and keeps the K/V that the action expert later reads during action
+generation.
 
 Composed entirely from ``mstar.model.components`` — Gemma RMSNorm
 (``gemma_mode=True``), GELU-tanh ``ParallelGatedMLP``, and a standard
@@ -17,11 +17,12 @@ from torch import nn
 
 from mstar.model.components import DecoderLayer, RMSNorm
 from mstar.model.components.distributed import ParallelAttention, ParallelGatedMLP
-from mstar.model.pi05.config import LLM_ATTN, LLM_KV, LLM_POS, Pi05Config
+from mstar.model.pi05.config import LLM_KV, LLM_POS, Pi05Config
 
 
 def _build_paligemma_layer(
     config: Pi05Config,
+    layer: int,
     input_hidden_size: int | None = None,
     intermediate_size: int | None = None,
 ) -> DecoderLayer:
@@ -40,10 +41,9 @@ def _build_paligemma_layer(
             num_kv_heads=config.num_kv_heads,
             head_dim=config.head_dim,
             input_hidden_size=h,
-            rope_theta=config.rope_theta,
-            attn_key=LLM_ATTN,
             kv_key=LLM_KV,
             pos_key=LLM_POS,
+            layer=layer,
         ),
         mlp=ParallelGatedMLP(
             hidden_size=h,
@@ -68,24 +68,11 @@ class Pi05PaliGemmaExpert(nn.Module):
         super().__init__()
         self.config = config
         self.layers = nn.ModuleList(
-            [_build_paligemma_layer(config) for _ in range(config.num_layers)]
+            [_build_paligemma_layer(config, layer) for layer in range(config.num_layers)]
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps, gemma_mode=True)
 
-    def forward(
-        self,
-        query_sequence: torch.Tensor,
-        *,
-        label: str,
-    ) -> torch.Tensor:
-        # The label and layer index are cursors on the shared resources: bind
-        # the label once, advance the index per layer. Passing them as
-        # arguments instead would make inductor specialize on the int.
-        self.layers[0].self_attn.attend.bind_step(label)
-        for layer_idx, layer in enumerate(self.layers):
-            layer.self_attn.attend.set_layer_idx(layer_idx)
+    def forward(self, query_sequence: torch.Tensor) -> torch.Tensor:
+        for layer in self.layers:
             query_sequence = layer(hidden_states=query_sequence)
-
-        # `write_cache` and the advance that followed it are the step
-        # declaration's now: the runner commits the step after the forward.
         return self.norm(query_sequence)

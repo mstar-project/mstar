@@ -562,13 +562,25 @@ def test_an_add_after_a_kept_add_raises():
     _refused(r"Array 'kv': an add on layer 0 after its kept add", lambda: h.add(0, k=k, v=v))
 
 
-def test_an_add_after_a_read_in_the_same_layer_raises():
+def test_a_kept_add_after_a_read_in_the_same_layer_raises():
     h = _kv_handle()
     _begin(h)
     q, k, v = _tensors()
     h.add(0, keep=False, k=k, v=v)
     h.read(0, q)
-    _refused(r"Array 'kv': an add on layer 0 after a read in the same layer", lambda: h.add(0, keep=False, k=k, v=v))
+    _refused(r"Array 'kv': a kept add on layer 0 after a read in the same layer", lambda: h.add(0, k=k, v=v))
+
+
+def test_a_scratch_add_after_a_read_starts_another_pass():
+    """Pi0.5's action step runs every Euler step in one engine step: each adds the action tokens again and reads."""
+    h = _kv_handle()
+    step = _begin(h, kv=ArrayStep(keep=False))
+    q, k, v = _tensors()
+    for _ in range(2):
+        for layer in range(LAYERS):
+            h.add(layer, k=k, v=v)
+            h.read(layer, q)
+    h.check_step(step)
 
 
 def test_write_on_an_append_only_array_raises():
@@ -842,7 +854,31 @@ def test_a_step_that_keeps_adds_on_only_some_layers_is_refused():
 
 def test_a_step_that_adds_on_no_layer_only_reads_and_passes():
     h = _kv_handle()
-    h.check_step(_begin(h))
+    h.check_step(_begin(h, segments=[Segment(1, "main", 0)]))
+
+
+def test_a_step_that_keeps_rows_at_span_above_0_and_adds_nothing_is_refused():
+    """The pages keep a step's span whether or not an add wrote it, and later reads would see those entries."""
+    h = _kv_handle()
+    step = _begin(h)
+    _refused(r"Array 'kv': a step that keeps lists rows at span above 0 and adds nothing",
+             lambda: h.check_step(step))
+
+
+def test_a_placeholder_row_needs_no_add():
+    h = _kv_handle()
+    h.check_step(_begin(h, kv=ArrayStep(placeholders=frozenset({(1, "main")}))))
+
+
+def test_a_captured_step_with_eager_adds_needs_no_add_in_its_forward():
+    h = _kv_handle()
+    h.check_step(_begin(h, ctx=_ctx(capture=True, leased=True), kv=ArrayStep(eager_add=True)))
+
+
+def test_an_eager_step_with_eager_adds_still_needs_its_adds():
+    h = _kv_handle()
+    step = _begin(h, kv=ArrayStep(eager_add=True))
+    _refused(r"Array 'kv': a step that keeps lists rows at span above 0 and adds nothing", lambda: h.check_step(step))
 
 
 def test_a_layer_ending_on_a_scratch_add_in_a_step_that_keeps_is_refused():

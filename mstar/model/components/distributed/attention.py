@@ -226,8 +226,12 @@ class ParallelCrossAttention(nn.Module):
         source: str = "default",
         cross_key: str | None = None,
         context_kv_key: str | None = None,
+        layer: int | None = None,
     ):
         super().__init__()
+        if layer is not None and context_kv_key is None:
+            raise ValueError("ParallelCrossAttention: a layer id picks the handle path, which reads the array "
+                             "context_kv_key names, and context_kv_key is None")
 
         if comm_group is None:
             comm_group = CommGroup.trivial()
@@ -290,6 +294,8 @@ class ParallelCrossAttention(nn.Module):
         self._context_kv_key = context_kv_key
         self.cross = None
         self.context_kv = None
+        self.layer = None if layer is None else torch.tensor(layer, device="cpu")
+        self.context = None
 
     def compute_kv(
         self, encoder_states: torch.Tensor,
@@ -307,12 +313,38 @@ class ParallelCrossAttention(nn.Module):
     def bind_resources(self, resources: dict) -> None:
         """Resolve this source's cross-attention resource and the cache
         holding its context. See ``NodeSubmodule.bind_node_resources``."""
+        # a layer id selects the handle path, which binds through `bind_state`
+        if self.layer is not None:
+            return
         self.cross = resources[self._cross_key]
         key = self._context_kv_key
         if key is None:
             # the resource already names the cache it attends
             key = self.cross.context_cache_key
         self.context_kv = resources[key]
+
+    def bind_state(self, handles: dict) -> None:
+        """The context array's handle, on the handle path, which a layer id picks."""
+        if self.layer is None:
+            return
+        self.context = handles.get(self._context_kv_key)
+        if self.context is None:
+            raise self._no_context()
+
+    def _no_context(self) -> ValueError:
+        # A node with no handles never calls `bind_state`, so the handle path refuses again at its first call.
+        return ValueError(f"ParallelCrossAttention: layer {int(self.layer)} reads the array {self._context_kv_key!r}, "
+                          "which this node doesn't declare")
+
+    def add_context(self, encoder_states: torch.Tensor) -> None:
+        """Add this layer's K/V of the encoder output to the context array, on the walk that carries it."""
+        if self.layer is None:
+            raise ValueError("ParallelCrossAttention: a layer id picks the handle path, which add_context runs on, and "
+                             "this layer has none")
+        if self.context is None:
+            raise self._no_context()
+        k, v = self.compute_kv(encoder_states)
+        self.context.add(self.layer, k=k, v=v)
 
     # Same cursor API as AttentionCallable, so a layer loop drives self- and
     # cross-attention the same way. Not an AttentionCallable itself: nothing is
@@ -324,11 +356,16 @@ class ParallelCrossAttention(nn.Module):
         self.context_kv.set_default_layer_idx(layer_idx)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """Label and layer index come off the resources' cursors; see
-        ``Attention.forward``."""
+        """On the resource path, label and layer index come off the resources'
+        cursors; see ``Attention.forward``."""
         num_tokens = hidden_states.shape[0]
         q = self.q_proj(hidden_states).view(num_tokens, self.num_heads, self.head_dim)
-        # nothing is written here: the context was written once at encode time
-        attn = self.cross.run(q, kv_cache_layer=self.context_kv.layer_view())
+        if self.layer is not None:
+            if self.context is None:
+                raise self._no_context()
+            attn = self.context.read(self.layer, q)
+        else:
+            # nothing is written here: the context was written once at encode time
+            attn = self.cross.run(q, kv_cache_layer=self.context_kv.layer_view())
         attn = attn.reshape(num_tokens, self.num_heads * self.head_dim)
         return self.out_proj(attn)

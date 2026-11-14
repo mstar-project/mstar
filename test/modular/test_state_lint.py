@@ -24,11 +24,12 @@ PORTED = (
     "mstar/model/higgs_audio", "mstar/model/voxcpm2",
     "mstar/model/canary_qwen", "mstar/model/qwen3_asr", "mstar/model/parakeet", "mstar/model/fish_s2_pro",
     "mstar/model/qwen3_tts",
+    "mstar/model/pi05", "mstar/model/vjepa2", "mstar/model/canary", "mstar/model/components/encoder_decoder.py",
 )
 FORBIDDEN_ATTRIBUTES = {
     "node_resources", "resources", "request_state", "request_states", "per_request_states", "sequence_shard",
     # what a handle holds
-    "resource", "positions", "reads", "first_read", "_kv", "_attn", "_pool", "_runners", "_views", "_blocks",
+    "resource", "positions", "reads", "first_read", "_kv", "_attn", "_cross", "_pool", "_runners", "_views", "_blocks",
     "_bindings", "_layouts", "_update",
 }
 
@@ -144,10 +145,13 @@ def _hook_violations(source: str, path: str) -> tuple[list[str], set[tuple[str, 
     return found, used
 
 
+def _entry_sources(entry: str) -> list[Path]:
+    path = Path(entry)
+    return [path] if path.is_file() else [p for p in sorted(path.rglob("*.py")) if "tests" not in p.parts]
+
+
 def _sources() -> list[Path]:
-    return [
-        path for package in PORTED for path in sorted(Path(package).rglob("*.py")) if "tests" not in path.parts
-    ]
+    return [path for entry in PORTED for path in _entry_sources(entry)]
 
 
 @pytest.mark.parametrize("path", _sources(), ids=str)
@@ -164,6 +168,11 @@ def test_a_ported_scaffold_node_writes_no_handle_hook_itself():
         used |= used_in_file
     assert not found, f"these repeat DeclaredTokenDecoder's handle calls: {found}"
     assert OWN_HOOKS.keys() <= used, f"delete these exceptions: {sorted(OWN_HOOKS.keys() - used)}"
+
+
+@pytest.mark.parametrize("entry", PORTED)
+def test_every_ported_entry_yields_a_source(entry):
+    assert _entry_sources(entry), f"{entry} yields no source, so the lint would pass it unread"
 
 
 def test_every_exception_is_still_used():

@@ -38,13 +38,7 @@ import torch
 from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.engine.resources import (
-    AttentionConfig,
-    AttentionSpec,
-    KVSpec,
-    NodeResourceSpec,
-    PagedKVConfig,
-)
+from mstar.engine.state import Array, Attend, Bidirectional, KVEntry, Layout, Read
 from mstar.graph.base import (
     GraphEdge,
     GraphNode,
@@ -56,7 +50,6 @@ from mstar.graph.base import (
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import (
     KVLabel,
-    LabelLayout,
     Model,
     ProcessPromptOutput,
     TensorAndMetadata,
@@ -360,32 +353,20 @@ class VJepa2Model(Model):
     # Model ABC: structure
     # ------------------------------------------------------------------
 
-    def get_node_resources(self) -> list[NodeResourceSpec]:
-        # only the AC predictor caches K/V across steps; the masked one is
-        # a one-shot forward with nothing for the engine to build
+    def declare_state(self) -> list[Array]:
+        """The AC rollout keeps each frame it adds. A step adds one frame, its action and state tokens then its spatial
+        tokens, and they read every earlier frame and each other: the frame-causal mask at one frame a step. The masked
+        predictor keeps nothing."""
         if self.config.predictor_kind != "ac":
             return []
-        kv = PagedKVConfig(
-            num_layers=self.config.ac_predictor.depth,
-            num_kv_heads=self.config.ac_predictor.num_heads,
-            head_dim=self.config.ac_predictor.predictor_embed_dim // self.config.ac_predictor.num_heads,
-            max_seq_len=16384, # TODO: actually compute this
-            num_qo_heads=self.config.ac_predictor.num_heads,
-        )
-        return [
-            KVSpec(
-                resource_key=KV_CACHE,
-                nodes={"rollout_predictor"},
-                config=kv
-            ),
-            AttentionSpec(
-                resource_key=ATTN,
-                nodes={"rollout_predictor"},
-                config=AttentionConfig(
-                    kv_cache=KV_CACHE
-                ),
-            ),
-        ]
+        ac = self.config.ac_predictor
+        return [Array(
+            KV_CACHE, nodes={"rollout_predictor"}, layers=frozenset(range(ac.depth)),
+            entry=KVEntry(heads=ac.num_heads, head_dim=ac.predictor_embed_dim // ac.num_heads),
+            # past the 4128 tokens a default rollout reaches. A tighter bound would resize the pool.
+            max_len=16384,
+            reads={ATTN: Read(mask=Bidirectional(), op=Attend(q_heads=ac.num_heads))},
+        )]
 
     def get_graph_walk_graphs(self) -> dict[str, GraphSection]:
         predictor_inputs: list[str] = ["encoder_hidden"]
@@ -852,12 +833,12 @@ class VJepa2Model(Model):
                     )
                 out[mask_name] = [m.long()]
 
-        kv_layout = {}
+        state_layout = {}
         if self.config.predictor_kind == "ac":
             # a rollout frame is its action and state tokens, an extrinsics token if used, then its spatial tokens
             frame = (3 if self.config.ac_predictor.use_extrinsics else 2) + self.config.grid_size ** 2
-            kv_layout[KV_CACHE] = {"main": LabelLayout(growth=((self.ROLLOUT_LOOP_NAME, frame),) if rollout else ())}
-        return ProcessPromptOutput(out, {"kv_layout": kv_layout})
+            state_layout[KV_CACHE] = {"main": Layout(growth=((self.ROLLOUT_LOOP_NAME, frame),) if rollout else ())}
+        return ProcessPromptOutput(out, {"state_layout": state_layout})
 
     def get_loop_caps(self, **model_kwargs) -> dict[str, int]:
         # a loop runs at least once

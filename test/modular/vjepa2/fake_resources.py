@@ -1,8 +1,9 @@
-"""A CPU stand-in for the KV + attention resources a block attends through.
+"""A CPU stand-in for the array handle a block attends through.
 
 Lets the AC predictor's paged path run without FlashInfer or a GPU: the
 accumulated K/V history is what the real path holds in a request's pages,
-and F.scaled_dot_product_attention over it is what the kernel computes.
+and F.scaled_dot_product_attention over it is what the kernel computes, with no
+mask since the array's read is ``Bidirectional``.
 """
 
 from __future__ import annotations
@@ -10,45 +11,24 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
+from mstar.model.vjepa2.config import KV_CACHE
+
 
 class FakeKVAttention:
-    """Stands in for the KV and attention resources a block attends through.
-
-    One object serves as both: ``AttentionCallable`` writes K/V through the KV
-    resource and then calls the attention one, and the accumulated history is
-    the same state either way. Per layer and per request we keep the K/V tokens
-    seen across time steps, which is what the real paged path holds in that
-    request's pages.
+    """Stands in for the array handle every block holds. Per layer and per
+    request we keep the K/V tokens seen across time steps, which is what the
+    real paged path holds in that request's pages.
 
     ``plan`` mirrors what preprocess does in production: it says how to split
     the flattened ``[sum(seq_lens), H, D]`` batch back into per-request slices.
     """
 
-    requires_kv_write = True
-
     def __init__(self):
-        self._label = "main"
-        self._layer_idx = 0
         self._seq_lens: list[int] = []
         # layer -> per-request (list[k], list[v])
         self._kv: dict[int, list[tuple[list[torch.Tensor], list[torch.Tensor]]]] = {}
-        # this step's writes, consumed by the next `run`
+        # this step's add, consumed by the next `read`
         self._pending: tuple[torch.Tensor, torch.Tensor] | None = None
-
-    # --- resource cursors (see AttentionCallable)
-
-    @property
-    def default_label(self) -> str:
-        return self._label
-
-    def set_default_label(self, label: str) -> None:
-        self._label = label
-
-    def set_default_layer_idx(self, layer_idx: int) -> None:
-        self._layer_idx = layer_idx
-
-    def layer_view(self):
-        return self._layer_idx
 
     # --- planning
 
@@ -62,13 +42,12 @@ class FakeKVAttention:
 
     # --- the two calls a block makes
 
-    def write_kv(self, k: torch.Tensor, v: torch.Tensor) -> None:
+    def add(self, layer: torch.Tensor, *, k: torch.Tensor, v: torch.Tensor) -> None:
         self._pending = (k, v)
 
-    def run(self, q: torch.Tensor, kv_cache_layer, k=None, v=None) -> torch.Tensor:
-        del k, v  # taken from the write above, as the paged backends do
-        layer = kv_cache_layer
-        assert self._pending is not None, "run without a preceding write_kv"
+    def read(self, layer: torch.Tensor, q: torch.Tensor) -> torch.Tensor:
+        layer = int(layer)
+        assert self._pending is not None, "read without a preceding add"
         k_all, v_all = self._pending
         self._pending = None
 
@@ -103,9 +82,9 @@ class FakeKVAttention:
 
 
 def bind_fake_resources(model) -> FakeKVAttention:
-    """Give every block the same fake pair, as the engine does with the real
-    resources; the layer cursor is what keeps their histories apart."""
-    resources = FakeKVAttention()
+    """Give every block the same fake handle, as the engine does with the real
+    one; the layer id is what keeps their histories apart."""
+    handle = FakeKVAttention()
     for block in model.predictor_blocks:
-        block.attn.bind_resources({"attn": resources, "kv": resources})
-    return resources
+        block.attn.bind_state({KV_CACHE: handle})
+    return handle
