@@ -1321,11 +1321,15 @@ class Conductor:
         """Scan the queue up to the concurrency cap, preserving survivor order."""
         blocked_episodes: set[str] = set()
         waiting, self.waiting_queue = self.waiting_queue, []
-        for index, body in enumerate(waiting):
+        for body in waiting:
+            if (self._episode_array_names and body.episode is not None and
+                    self._episode_records.closed_or_ending(body.episode)):
+                self._reject_request(body.request_id, "episode ended", status=410)
+                continue
             if (self.max_concurrent_requests is not None
                     and len(self.requests) >= self.max_concurrent_requests):
-                self.waiting_queue.extend(waiting[index:])
-                break
+                self.waiting_queue.append(body)
+                continue
             if (self._episode_array_names and body.episode is not None and
                     (body.episode in blocked_episodes or self._episode_records.busy(body.episode))):
                 blocked_episodes.add(body.episode)

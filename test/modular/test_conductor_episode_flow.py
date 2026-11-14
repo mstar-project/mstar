@@ -306,6 +306,22 @@ def test_call_budget_refuses_after_the_first_admitted_call(tmp_path, monkeypatch
     assert any(msg.message_type == WorkerMessageType.END_EPISODE for _, msg in comm.sent)
 
 
+def test_call_budget_closes_later_calls_in_the_waiting_batch(tmp_path, monkeypatch):
+    conductor, _, comm = _conductor(tmp_path, monkeypatch, max_calls=1, max_queued_calls=2)
+    conductor._ingest_request(_request("first", "robot-a"))
+    conductor._ingest_request(_request("second", "robot-a"))
+    conductor._ingest_request(_request("third", "robot-a"))
+
+    _complete(conductor, "first", {"frames": 4})
+    failures = {
+        msg.body.request_id: msg.body for _, msg in comm.sent
+        if msg.message_type == "request_failed"
+    }
+    assert failures["second"].status == 400
+    assert failures["third"].status == 410
+    assert conductor.waiting_queue == []
+
+
 def test_only_one_overlapping_call_is_queued_for_an_episode(tmp_path, monkeypatch):
     conductor, _, comm = _conductor(tmp_path, monkeypatch, max_queued_calls=1)
     conductor._ingest_request(_request("first", "robot-a"))
