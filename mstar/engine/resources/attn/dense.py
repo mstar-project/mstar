@@ -28,6 +28,40 @@ except Exception as _fa3_exc:  # noqa: BLE001
 else:
     _VARLEN_IMPORT_ERROR = None
 
+
+# What a fixed-length forward into a given output passes the fa3-fwd extension op, by
+# name, beyond q / k / v: everything else keeps the op's own default, which is the
+# feature's off value (no window, softcap, rotary, paging or FP8 scales). num_splits=1
+# is what flash_attn_func and flash_attn_varlen_func pass; the op's default, 0, picks a
+# split by heuristic, which can change the output from varlen's.
+_FA3_FIXED_KWARGS = {"is_causal": False, "num_splits": 1}
+
+
+def _fa3_fixed_into():
+    """FA3's fixed-length forward writing into a given output, or None. The
+    interface's own entry point allocates its output and refuses one passed in
+    (a custom op may not return an input), so this calls the extension op behind
+    it by its arguments' names. The op isn't a public API, so a build whose op
+    doesn't name them gets None, and its callers keep to the varlen kernel."""
+    try:
+        op = torch.ops.fa3_fwd.fwd
+        names = {a.name for a in op.default._schema.arguments}
+    except Exception:  # noqa: BLE001
+        return None
+    missing = {"out", "softmax_scale", *_FA3_FIXED_KWARGS} - names
+    if missing:
+        logger.info("fa3-fwd's forward op lacks %s; long segments run on the varlen kernel", sorted(missing))
+        return None
+
+    def run(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, out: torch.Tensor, softmax_scale: float) -> None:
+        # q [1, Sq, H, D], k / v [1, Sk, Hkv, D], out [1, Sq, H, Dv]
+        op(q, k, v, out=out, softmax_scale=softmax_scale, **_FA3_FIXED_KWARGS)
+
+    return run
+
+
+fa3_fixed_into = _fa3_fixed_into() if flash_attn_func is not None else None
+
 # ROCm has no FA3; AITER's varlen FMHA takes the same call, so dense runs on it
 # there instead of degrading to the paged backend
 if flash_attn_varlen_func is None and current_platform.is_rocm():

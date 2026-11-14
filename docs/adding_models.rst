@@ -1062,8 +1062,9 @@ The spec types are:
        cuDNN SDPA over equal-length segments (see `Cacheless attention (encoder towers)`_).
        ``DENSE`` runs FA3
        ``flash_attn_varlen`` (AITER on ROCm), or FA3's fixed-length kernel for an eager
-       plan of one non-causal segment, and falls back to FlashInfer if that kernel is
-       missing. The heads are split across the node's TP ranks (TP × SP over
+       plan of one non-causal segment on Hopper (and, at head dim 128, once per segment
+       for a plan whose segments are all at least 1536 rows), and falls back to FlashInfer
+       if that kernel is missing. The heads are split across the node's TP ranks (TP × SP over
        a label the node's shard lists, on a node whose shard splits, below).
        ``workspace_mb`` is the floor of each label's FlashInfer workspace per slot (default
        ``MSTAR_WORKSPACE_BUFFER_MB``, 512, which doesn't apply once it is declared): a plan that
