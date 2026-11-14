@@ -194,6 +194,11 @@ class Wan22Config:
     # (1280x704). Requests choose their size, so an open list would let each new
     # size cost a compile on the shared worker.
     vae_decode_fast_sizes: tuple[str, ...] | None = None
+    # Opt-in, near-lossless: decode on the Wan2.2-VAE Blackwell kernels (``components/wan22_vae_kernel``, FastVideo's
+    # Winograd decoder generalized to any size) instead of the paths above, on compute capability 10.0 / 10.3 and the
+    # TI2V-5B VAE. Not bit-exact with ``vae.decode`` (Winograd and fused norms round differently); about 2x faster.
+    # Any untiled size, no compile. A GPU it cannot run on decodes as if it were off (logged once).
+    vae_decode_kernel: bool = False
 
     # Opt-in step caching, lossy (``components/diffusion/step_cache.py``); None runs every step. E.g.
     # ``{method: magcache, threshold: 0.06, max_skip_steps: 2, retention_ratio: 0.2}`` reuses the block residual on
@@ -227,6 +232,10 @@ class Wan22Config:
         if not isinstance(self.vae_decode_fast, bool):
             raise ValueError(f"Wan2.2 vae_decode_fast must be true or false, got {self.vae_decode_fast!r}.")
         self.fast_decode_sizes()
+        if not isinstance(self.vae_decode_kernel, bool):
+            raise ValueError(f"Wan2.2 vae_decode_kernel must be true or false, got {self.vae_decode_kernel!r}.")
+        if self.vae_decode_kernel and self.is_moe:
+            raise ValueError("Wan2.2 vae_decode_kernel decodes the TI2V-5B VAE; A14B decodes with the Wan2.1 VAE.")
         samplers = (SAMPLER_UNIPC, *_DISTILL_DEFAULTS)
         if self.sampler not in samplers:
             raise ValueError(f"Wan2.2 sampler must be one of {samplers}, got {self.sampler!r}.")

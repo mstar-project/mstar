@@ -764,6 +764,11 @@ class Wan22VaeDecoderSubmodule(_Fp32IslandMixin, NodeSubmodule):
     stock ``vae.decode`` / ``tiled_decode`` and compiles nothing. The engine
     still never wraps the forward; only the decoder's steady-state call is
     compiled.
+
+    With ``config.vae_decode_kernel`` (opt-in, near-lossless) every untiled decode
+    runs on the Wan2.2-VAE Blackwell kernels (``mstar.model.components.wan22_vae_kernel``)
+    where they can run, at any size and with nothing compiled; elsewhere the knob is
+    ignored with one log line.
     """
 
     disable_torch_compile = True
@@ -783,6 +788,9 @@ class Wan22VaeDecoderSubmodule(_Fp32IslandMixin, NodeSubmodule):
         self._record_fp32_islands()
         self._fast = None
         self._fast_sizes = config.fast_decode_sizes()
+        # built on the first decode, on the device it runs on; None after a refusal is logged
+        self._kernel = None
+        self._kernel_refused = not config.vae_decode_kernel
         if config.vae_decode_fast:
             from mstar.model.components import wan_vae
 
@@ -862,6 +870,21 @@ class Wan22VaeDecoderSubmodule(_Fp32IslandMixin, NodeSubmodule):
             )
         return mode
 
+    def _kernel_decoder(self, device: torch.device):
+        """The Wan2.2-VAE kernels for this node's VAE (``config.vae_decode_kernel``), built
+        on first use; None when off or when they cannot run here."""
+        if self._kernel is None and not self._kernel_refused:
+            from mstar.model.components import wan22_vae_kernel
+
+            reason = wan22_vae_kernel.unsupported_reason(device, self.vae)
+            if reason is None:
+                self._kernel = wan22_vae_kernel.Wan22VaeKernel(self.vae, device)
+                logger.info("Wan2.2 VAE decode: untiled decodes on the Wan2.2-VAE kernels (vae_decode_kernel)")
+            else:
+                self._kernel_refused = True
+                logger.warning("Wan2.2 VAE decode: vae_decode_kernel is on but ignored: %s", reason)
+        return self._kernel
+
     def forward(
         self,
         graph_walk: str,
@@ -892,13 +915,16 @@ class Wan22VaeDecoderSubmodule(_Fp32IslandMixin, NodeSubmodule):
                 "tiled" if tiled else "untiled", height, width, num_frames,
                 estimate / 2**30, free_bytes / 2**30, _DECODE_UNTILED_SAFETY_MARGIN, mode,
             )
-            fast = self._fast is not None and not tiled and (width, height) in self._fast_sizes
-            if self._fast is not None and not fast:
+            kernel = None if tiled else self._kernel_decoder(device)
+            fast = kernel is None and self._fast is not None and not tiled and (width, height) in self._fast_sizes
+            if self._fast is not None and not fast and kernel is None:
                 # One request per step, so nothing else decodes on this VAE
                 # while its layout switches; the fast decode switches it back.
                 self._fast.use_stock_layout()
             if tiled:
                 video = vae.tiled_decode(latents, return_dict=False)[0]
+            elif kernel is not None:
+                video = kernel.decode(latents)
             elif fast:
                 video = self._fast.decode(latents)
             else:
