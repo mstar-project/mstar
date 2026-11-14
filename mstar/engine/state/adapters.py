@@ -1131,14 +1131,16 @@ class _CountTable:
 
 
 class _Counts:
-    """A verify step's counts, read from its table when the first of its rows is applied. A read that raises keeps
-    nothing, so every later read of the step's rows raises too."""
+    """A verify step's `Correction`: each request of ``rows`` moves back by the entries of its row's verify block it
+    didn't keep. The counts are read from the step's table when the first request is applied. A read that raises
+    keeps nothing, so every later read of the step's rows raises too."""
 
-    def __init__(self, table: _CountTable, number: int, spans: tuple[int, ...], done: torch.cuda.Event | None):
-        self._table, self._number, self._spans, self._done = table, number, spans, done
+    def __init__(self, table: _CountTable, number: int, label: str, spans: tuple[int, ...], rows: dict[Any, int]):
+        self._table, self._number, self._spans, self._done = table, number, spans, table.landed
+        self.label, self.rids, self._rows = label, rows.keys(), rows
         self._kept: list[int] | None = None
 
-    def delta(self, row: int) -> int:
+    def delta(self, rid: Any) -> int:
         if self._kept is None:
             if self._done is not None:
                 self._done.synchronize()
@@ -1149,6 +1151,7 @@ class _Counts:
             kept = self._table.host[1:len(self._spans) + 1].tolist()
             self._compare_ranks(kept)
             self._kept = kept
+        row = self._rows[rid]
         return self._kept[row] - self._spans[row]
 
     def _compare_ranks(self, kept: list[int]) -> None:
@@ -1160,16 +1163,6 @@ class _Counts:
         if any(counts != kept for counts in ranks):
             raise RuntimeError(f"the TP ranks settled verify step {self._number} differently, {ranks}, and each "
                                "would move its own pages by its own counts")
-
-
-class _RowCount(NamedTuple):
-    """One row's `Correction`: minus the entries of its verify block it didn't keep."""
-
-    counts: _Counts
-    row: int
-
-    def delta(self) -> int:
-        return self.counts.delta(self.row)
 
 
 class RewindRun(VerifyRun):
@@ -1259,15 +1252,22 @@ class RewindRun(VerifyRun):
     def commit(self, ctx) -> None:
         if self._table is None or ctx.capture:
             return
-        spans = tuple(segment.span for segment in self._segments)
-        counts = _Counts(self._table, self._number, spans, self._table.landed)
-        positions = self.handle.positions
+        rows: dict[Any, int] = {}
         for row, segment in enumerate(self._segments):
             if ctx.is_real_row(segment.request_id):
-                count = _RowCount(counts, row)
-                self._kv.defer_correct_len(segment.request_id, segment.label, count)
-                if positions is not None:
-                    positions.defer_correct_len(segment.request_id, segment.label, count)
+                assert segment.request_id not in rows, (
+                    f"a verify step with two rows of request {segment.request_id}, and its count table holds one row "
+                    "per request"
+                )
+                rows[segment.request_id] = row
+        if not rows:
+            return
+        spans = tuple(segment.span for segment in self._segments)
+        # one object for the step, which both resources hold until they apply it
+        counts = _Counts(self._table, self._number, self._segments[0].label, spans, rows)
+        self._kv.defer_correct_len(counts)
+        if self.handle.positions is not None:
+            self.handle.positions.defer_correct_len(counts)
 
 
 class WithinStepAttend(OpBinding, ABC):
