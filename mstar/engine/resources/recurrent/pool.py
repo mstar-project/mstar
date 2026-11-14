@@ -231,7 +231,8 @@ class RecurrentStatePool(Resource):
         # Bumped by every change to which slot a (rid, label) holds or to its
         # `has_state`: a step's addressing depends on nothing else, so the
         # last one built is reused while this and the step's rows are unchanged
-        # (a steady decode batch). See `_build_addressing`.
+        # (a steady decode batch), and an eager step then stages nothing. See
+        # `_build_addressing`.
         self._version = 0
         self._addressing_memo: dict[str, tuple] = {}
 
@@ -1160,7 +1161,14 @@ class RecurrentStatePool(Resource):
             )
             memo = self._addressing_memo.get(label)
             if memo is not None and memo[0] == memo_key:
-                return self._stage_addressing(label, segments, ctx, memo[1], memo[2])
+                if self._holds_staged(label, memo[3], ctx):
+                    # a capture records its own cast of the index (`scatter_`)
+                    memo[3].scatter_index.pop(True, None)
+                    return memo[3]
+                return self._stage_memoized(label, segments, ctx, *memo[:3])
+        else:
+            # staged over the memo's buffers with the forks pending, which is no later step's addressing
+            self._addressing_memo.pop(label, None)
         pending_forks = pending_forks or {}
         indices = []
         has_state = []
@@ -1179,9 +1187,27 @@ class RecurrentStatePool(Resource):
                 has_state.append(
                     pending_forks.get((seg.request_id, label), slot.has_state)
                 )
-        if memo_key is not None:
-            self._addressing_memo[label] = (memo_key, indices, has_state)
-        return self._stage_addressing(label, segments, ctx, indices, has_state)
+        if memo_key is None:
+            return self._stage_addressing(label, segments, ctx, indices, has_state)
+        return self._stage_memoized(label, segments, ctx, memo_key, indices, has_state)
+
+    def _stage_memoized(
+        self, label: str, segments: list[Segment], ctx: StepContext, memo_key: tuple,
+        indices: list[int], has_state: list[bool],
+    ) -> RecurrentAddressing:
+        """Stage the addressing and keep it with its memo, for the next step addressed the same way."""
+        staged = self._stage_addressing(label, segments, ctx, indices, has_state)
+        # Only an eager buffer holds what its last staging wrote: a resident replay fills a captured one itself.
+        kept = staged if ctx.slot_lease is None and not ctx.capture and not staged.snapshots else None
+        self._addressing_memo[label] = (memo_key, indices, has_state, kept)
+        return staged
+
+    def _holds_staged(self, label: str, staged: RecurrentAddressing | None, ctx: StepContext) -> bool:
+        """Whether this step's buffers are ``staged``'s, as the memo's staging left them, with no snapshot to add."""
+        if staged is None or ctx.slot_lease is not None or self._snap_writes:
+            return False
+        held = self._eager_addressing.get(label)
+        return held is not None and held.slot_indices is staged.slot_indices
 
     def _stage_addressing(
         self, label: str, segments: list[Segment], ctx: StepContext,
