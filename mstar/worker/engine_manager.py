@@ -1,5 +1,5 @@
 import logging
-from collections.abc import Collection, Mapping
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import NamedTuple
 
@@ -552,15 +552,28 @@ class EngineManager:
         self, request_id: str,
         resource_configs: dict[str, ResourceReqConfig] | None = None,
         request_info: CurrentForwardPassInfo | None = None,
+        *, episode_id: str | None = None, episode_slot: int | None = None, reset_episode: bool = False,
+        episode_clear: Sequence[str] = (),
     ) -> None:
         """Open resource state for a request, on the per-resource configs the
         conductor resolved for it (``Model.get_request_resource_configs``),
         and hand the submodules its ``request_info``."""
-        self.engine.add_request(request_id, resource_configs, request_info)
+        self.engine.add_request(request_id, resource_configs, request_info,
+                                episode_id=episode_id, episode_slot=episode_slot, reset_episode=reset_episode,
+                                episode_clear=episode_clear)
 
     def remove_request(self, request_id: str) -> set[str]:
         """Tear the request down; returns the resources it handed pages back to."""
         return self.engine.remove_request(request_id)
+
+    def end_episode(self, episode_id: str, episode_slot: int) -> bool:
+        return self.engine.end_episode(episode_id, episode_slot)
+
+    def episode_slot_busy(self, slot: int) -> bool:
+        return self.engine.episode_slot_busy(slot)
+
+    def episode_slot_available(self, slot: int, episode_id: str | None) -> bool:
+        return self.engine.episode_slot_available(slot, episode_id)
 
     def shutdown(self) -> None:
         self.engine.shutdown()

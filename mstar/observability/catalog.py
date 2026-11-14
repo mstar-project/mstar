@@ -44,6 +44,21 @@ COMPONENT_IN_FLIGHT = Family(
     "dispatched and whose completion it has not received yet.",
     ("component",),
 )
+EPISODES = Family(
+    "mstar_episodes", GAUGE,
+    "Named episodes by conductor state.",
+    ("state",),
+)
+EPISODE_SLOTS_USED = Family(
+    "mstar_episode_slots_used", GAUGE,
+    "Logical episode slots reserved on each worker, including temporary calls.",
+    ("worker",),
+)
+EPISODE_EVICTIONS = Family(
+    "mstar_episode_evictions_total", COUNTER,
+    "Idle episodes whose rows the conductor released to free a slot or after a timeout.",
+    ("reason",),
+)
 ROUTING_PREDICTED_SAVING = Family(
     "mstar_routing_predicted_saving_total", COUNTER,
     "Per term of the data-parallel replica cost, the saving the mirrors "
@@ -219,5 +234,8 @@ WORKER_FAMILIES: dict[str, Family] = {
 #: Families the conductor's status message carries, exported from the latest
 #: message.
 STATUS_FAMILIES: dict[str, Family] = {
-    f.name: f for f in (CONDUCTOR_REQUESTS, COMPONENT_IN_FLIGHT, ROUTING_PREDICTED_SAVING)
+    f.name: f for f in (
+        CONDUCTOR_REQUESTS, COMPONENT_IN_FLIGHT, EPISODES, EPISODE_SLOTS_USED,
+        EPISODE_EVICTIONS, ROUTING_PREDICTED_SAVING,
+    )
 } | WORKER_FAMILIES

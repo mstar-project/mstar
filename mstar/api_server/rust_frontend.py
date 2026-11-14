@@ -9,7 +9,8 @@ protocol are untouched):
 
     frontend -> bridge:  {t:"submit", rid, sub, text, file_paths,
                           input_modalities, output_modalities, model_kwargs,
-                          prompt_parts, streaming, accepts_chunks, report_usage}
+                          prompt_parts, streaming, accepts_chunks, report_usage,
+                          episode?, reset_episode?}
                        | {t:"abort", rid, sub}
                        | {t:"ping", rid, sub}
                        | {t:"metrics", rid, sub, refusals:{route, status, count}}
@@ -18,6 +19,7 @@ protocol are untouched):
                        | {t:"windows", rid, sub, op, plan, ...}
                        | {t:"live", rid, sub, op, call, ..., stream?, audio?(bin)}
                        | {t:"end_of_turn", rid, sub, audio(bin)}
+                       | {t:"end_episode", rid, sub, episode}
                        | {t:"lora", rid, sub, op, lora_name, lora_path?}
     bridge -> frontend:  {t:"chunk", rid, sub, modality, data(bin), metadata}
                        | {t:"chunks", subs, modalities, payloads(bin), metadatas}
@@ -207,6 +209,8 @@ SERVED_MODELS_ENV = "MSTAR_SERVED_MODELS"
 TRANSCRIPTION_ENV = "MSTAR_TRANSCRIPTION"
 #: The deployment's openpi policy, as JSON (``openpi_facts``); unset serves no openpi socket.
 OPENPI_ENV = "MSTAR_OPENPI"
+#: Positronic protocol v2's opt-in session policy.
+POSITRONIC_ENV = "MSTAR_POSITRONIC"
 #: The largest WebSocket message, in bytes (the config's ``ws_max_message_mb``).
 WS_MAX_BYTES_ENV = "MSTAR_WS_MAX_BYTES"
 #: The model's client streams, as JSON: a request to a model with any is a live call.
@@ -308,6 +312,12 @@ def openpi_facts(policy) -> dict | None:
     }
 
 
+def positronic_facts(policy) -> dict | None:
+    if policy is None:
+        return None
+    return {"meta": policy.meta, "prompt_key": policy.prompt_key}
+
+
 def onnxruntime_library() -> str | None:
     """The ONNX Runtime library the ``onnxruntime`` package loads, for mstar-server
     to score turn detection with the same runtime; ``None`` without it."""
@@ -383,6 +393,7 @@ def launch_rust_server(binary: str, model_name: str, port: int,
                        api_key: str | None = None, timeout_s: float | None = None,
                        sample_rate: int | None = None, served_models=None,
                        transcription: dict | None = None, openpi: dict | None = None,
+                       positronic: dict | None = None,
                        ws_max_bytes: int | None = None, client_streams=(),
                        realtime: dict | None = None) -> subprocess.Popen:
     """``timeout_s`` is ``--timeout`` and ``sample_rate`` the model's audio output rate
@@ -415,6 +426,9 @@ def launch_rust_server(binary: str, model_name: str, port: int,
     env.pop(OPENPI_ENV, None)
     if openpi is not None:
         env[OPENPI_ENV] = json.dumps(openpi)
+    env.pop(POSITRONIC_ENV, None)
+    if positronic is not None:
+        env[POSITRONIC_ENV] = json.dumps(positronic)
     env.pop(WS_MAX_BYTES_ENV, None)
     if ws_max_bytes is not None:
         env[WS_MAX_BYTES_ENV] = str(int(ws_max_bytes))
@@ -544,6 +558,8 @@ class RustFrontendBridge:
                 streaming=bool(msg.get("streaming", True)),
                 request_id=rid,
                 report_usage=bool(msg.get("report_usage")),
+                **({"episode": msg["episode"], "reset_episode": bool(msg.get("reset_episode"))}
+                   if msg.get("episode") is not None else {}),
                 **_stream_and_raw_inputs(msg),
             )
         except (ValueError, TypeError) as e:
@@ -881,6 +897,14 @@ class RustFrontendBridge:
             self._submit(msg)
         elif t == "abort":
             self._abort(msg)
+        elif t == "end_episode":
+            try:
+                self.server.end_episode(msg["episode"])
+            except Exception as exc:
+                text, _ = client_error_text(exc, "episode cleanup failed", log=logger, type_name=False)
+                self._send({"t": "err", "rid": msg["rid"], "sub": msg.get("sub"), "msg": text})
+            else:
+                self._send({"t": "done", "rid": msg["rid"], "sub": msg.get("sub")})
         elif t == "ping":
             # Deep-health liveness: the frontend's /health goes red
             # unless this loop answers.

@@ -255,6 +255,38 @@ def test_a_model_without_the_declaration_runs_on_the_thread(monkeypatch):
     assert _sent(wt) == ["a"]
 
 
+def test_episode_identity_and_client_or_model_reset_reach_conductor(monkeypatch):
+    class ResetOne(_Serial):
+        def process_prompt(self, text, input_modalities, output_modalities, **kwargs):
+            prepared = super().process_prompt(text, input_modalities, output_modalities, **kwargs)
+            return prepared._replace(reset_episode=text == "b")
+
+    monkeypatch.setattr(cpus, "_plan", cpus.CpuPlan(frozenset(range(8)), usable=8))
+    wt = _thread(ResetOne())
+    for rid, client_reset in (("a", True), ("b", False), ("c", False)):
+        wt.model.gate(rid).set()
+        request = _input(rid)
+        request.episode = "robot-episode"
+        request.reset_episode = client_reset
+        wt._process_waiting_input(request)
+    sent = [msg.body for msg in wt.communicator.sent
+            if msg.message_type == ConductorMessageType.NEW_REQUEST]
+    assert [body.episode for body in sent] == ["robot-episode"] * 3
+    assert [body.reset_episode for body in sent] == [True, True, False]
+
+
+def test_frontend_close_sends_end_episode_to_the_conductor():
+    from mstar.api_server.entrypoint import APIServer
+
+    sent = []
+    api = object.__new__(APIServer)
+    api.preprocess_worker = SimpleNamespace(send_to_conductor=sent.append)
+    api.end_episode("robot-episode")
+    assert len(sent) == 1
+    assert sent[0].message_type == ConductorMessageType.END_EPISODE
+    assert sent[0].body.episode_id == "robot-episode"
+
+
 def test_requests_overlap_and_reach_the_conductor_in_arrival_order(worker):
     worker._process_waiting_input(_input("a"))
     worker._process_waiting_input(_input("b"))

@@ -65,6 +65,9 @@ pub struct Part {
 #[derive(Debug, Clone)]
 pub struct SubmitArgs {
     pub text: Option<String>,
+    /// Connection-owned episode id; separate from model kwargs.
+    pub episode: Option<String>,
+    pub reset_episode: bool,
     /// Pre-tokenized prompt (the frontend-tokenizes fast path): when set, the
     /// model side skips tokenization and the response text streams back as
     /// raw token ids for the frontend to detokenize off the GIL.
@@ -100,6 +103,8 @@ impl Default for SubmitArgs {
     fn default() -> Self {
         Self {
             text: None,
+            episode: None,
+            reset_episode: false,
             tokens: None,
             report_usage: false,
             file_paths: BTreeMap::new(),
