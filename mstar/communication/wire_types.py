@@ -36,6 +36,7 @@ from mstar.engine.resources.kv.transfer import (
 from mstar.engine.resources.lora.config import LoraReqConfig
 from mstar.engine.resources.position.manager import PublishedPositionInfo
 from mstar.engine.resources.sampler.config import SamplingReqConfig
+from mstar.engine.resources.sized.config import SizedValueReqConfig
 from mstar.engine.resources.spec import ResourceReqConfig
 from mstar.utils.ipc_format import (
     AbortRequest,
@@ -125,6 +126,7 @@ _TYPES: dict[str, type] = {
     "sampling_req_config": SamplingReqConfig,
     "lora_req_config": LoraReqConfig,
     "rolling_kv_req_config": RollingKVReqConfig,
+    "sized_value_req_config": SizedValueReqConfig,
 }
 
 for _tag, _cls in _TYPES.items():

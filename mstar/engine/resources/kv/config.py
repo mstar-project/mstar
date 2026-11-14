@@ -768,6 +768,9 @@ def refuse_undeclared_labels(
 ) -> None:
     """The model is at fault and not the client, so this raises RuntimeError, which fails the request with a 500."""
     for key in declared.keys() | kv_layout.keys():
+        if key in configs and not isinstance(configs[key], KVReqConfig):
+            # a pool of no pages, which reads its own row (`RollingKVSpec.request_config`)
+            continue
         laid_out = set(kv_layout.get(key, ()))
         if extra := sorted(laid_out - set(declared.get(key, ()))):
             raise RuntimeError(f"{model} returned a kv_layout for {key!r}/{extra[0]!r}, which it does not declare")
