@@ -54,7 +54,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
   <meta name="docsearch:version" content="0.2.1" />
-    <meta name="docbuild:last-update" content="Nov 13, 2026"/>
+    <meta name="docbuild:last-update" content="Nov 14, 2026"/>
   
     
     <script src="_static/searchtools.js"></script>
@@ -1471,8 +1471,12 @@ the axis split across TP ranks, <code class="docutils literal notranslate"><span
 <li><p><code class="docutils literal notranslate"><span class="pre">Read(mask=,</span> <span class="pre">op=,</span> <span class="pre">layers=,</span> <span class="pre">walks=)</span></code>: how a layer reads the array. Each row reads through
 the one read declared for its layer and walk, and loading refuses two reads over one
 layer and walk. <code class="docutils literal notranslate"><span class="pre">Causal()</span></code> sees every entry up to the query’s own, <code class="docutils literal notranslate"><span class="pre">Window(size)</span></code> the
-last <code class="docutils literal notranslate"><span class="pre">size</span></code> of them, its own included. <code class="docutils literal notranslate"><span class="pre">Attend(q_heads=)</span></code> is attention with the model’s
-query heads, a multiple of the entry’s heads.</p></li>
+last <code class="docutils literal notranslate"><span class="pre">size</span></code> of them, its own included, and <code class="docutils literal notranslate"><span class="pre">Bidirectional()</span></code> every entry the row keeps and
+every entry this step adds for it. A walk can’t read through <code class="docutils literal notranslate"><span class="pre">Bidirectional()</span></code> or <code class="docutils literal notranslate"><span class="pre">Block()</span></code>
+on a node where a chunking policy splits it, a label’s <code class="docutils literal notranslate"><span class="pre">PrefixKeys</span></code> key it, or a rebuild
+policy runs it again, since each regroups a row’s adds across steps and would change what its
+tokens see. <code class="docutils literal notranslate"><span class="pre">Attend(q_heads=)</span></code> is attention with the model’s query heads, a multiple of
+the entry’s heads.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">Value(name,</span> <span class="pre">nodes=,</span> <span class="pre">layers=,</span> <span class="pre">entry=,</span> <span class="pre">updates=)</span></code>: a rewritable array of one entry, such
 as a recurrent state. <code class="docutils literal notranslate"><span class="pre">updates</span></code> names the kernels that read and write one of its fields
 in place: <code class="docutils literal notranslate"><span class="pre">CausalConv()</span></code> needs a field <code class="docutils literal notranslate"><span class="pre">conv</span></code> of shape <code class="docutils literal notranslate"><span class="pre">(channels,</span> <span class="pre">kernel</span> <span class="pre">-</span> <span class="pre">1)</span></code>, and
@@ -1543,9 +1547,15 @@ MiniMax-H3’s video decoder does.</p></li>
 missing. Every refusal names the declaration and the field.</p>
 <p>A read with <code class="docutils literal notranslate"><span class="pre">queries=ARRAY</span></code> is cross-attention: its queries are laid out by that array’s
 segments in this step, and each request’s k-th segment on one pairs with its k-th on the other.
-It takes <code class="docutils literal notranslate"><span class="pre">Block()</span></code>, since no query position decides what it sees. Separate token sets are
-separate arrays, and arrays of one kind and geometry on one node share one resource, each under
-its own label.</p>
+It takes a mask that uses no query position: <code class="docutils literal notranslate"><span class="pre">Block()</span></code> on an array with <code class="docutils literal notranslate"><span class="pre">max_len=0</span></code>, and
+<code class="docutils literal notranslate"><span class="pre">Bidirectional()</span></code> on one that keeps entries, whose context is added on the walk that carries it
+and listed at span 0 afterwards. A cross read on an array that keeps entries is that array’s one
+read, over one label, and its queries come from an append-only array that keeps entries. It is
+refused at load on a node that splits its steps over SP ranks, and where its pool or the queried
+array’s pool is stored by position (<code class="docutils literal notranslate"><span class="pre">context_parallel</span></code>). A <code class="docutils literal notranslate"><span class="pre">max_len=0</span></code> cross read’s queries
+come from an array of one label, and <code class="docutils literal notranslate"><span class="pre">queries</span></code> never names the
+read’s own array. Separate token sets are separate arrays, and arrays of one kind and geometry on one node share one resource,
+each under its own label.</p>
 <p>Under sequence parallelism an array declares nothing: the node’s sequence shard
 (the <code class="docutils literal notranslate"><span class="pre">SeqShard</span></code> in <code class="docutils literal notranslate"><span class="pre">declare_state</span></code>) lists the labels whose tokens split, and an array
 is split on a step when the shard lists its label and splits that step. Segments always cover
@@ -1583,7 +1593,8 @@ node with prefix keys. Parakeet’s transducer state and both speech codecs are 
 <code class="docutils literal notranslate"><span class="pre">splits</span></code> on a <code class="docutils literal notranslate"><span class="pre">GatedDeltaNet</span></code>, and <code class="docutils literal notranslate"><span class="pre">max_segments_per_request</span></code>, <code class="docutils literal notranslate"><span class="pre">max_segments_per_step</span></code>,
 <code class="docutils literal notranslate"><span class="pre">compile_op</span></code> and <code class="docutils literal notranslate"><span class="pre">workspace_mb</span></code> on a <code class="docutils literal notranslate"><span class="pre">Block</span></code> read. Under an array’s name it sets the default size of the array’s pool, <code class="docutils literal notranslate"><span class="pre">max_num_pages</span></code>
 on a paged array and <code class="docutils literal notranslate"><span class="pre">max_slots</span></code> on a <code class="docutils literal notranslate"><span class="pre">Value</span></code> with tensor fields, which a deployment’s
-<code class="docutils literal notranslate"><span class="pre">resources:</span></code> block overrides. It refuses anything else.</p>
+<code class="docutils literal notranslate"><span class="pre">resources:</span></code> block overrides. A cross read on an array that keeps entries takes no setting yet. It
+refuses anything else.</p>
 <section id="resource-specs">
 <h3>Resource specs<a class="headerlink" href="#resource-specs" title="Link to this heading">#</a></h3>
 <p>The engine builds these specs from <code class="docutils literal notranslate"><span class="pre">declare_state</span></code>, and a deployment tunes them under the
@@ -3044,14 +3055,15 @@ and each row’s label comes from the step’s segments, so there are no cursors
 per layer per step, and it is the layer’s last add. Scratch adds can repeat, and last until
 the next add or the end of the step. <code class="docutils literal notranslate"><span class="pre">keep=None</span></code> takes the step’s <code class="docutils literal notranslate"><span class="pre">keep</span></code>. The resources keep
 or drop a step’s adds as a whole, so a step that keeps needs each layer to end on a kept add,
-and a step with <code class="docutils literal notranslate"><span class="pre">keep=False</span></code> refuses <code class="docutils literal notranslate"><span class="pre">keep=True</span></code>.</p></li>
+unless every row it lists has span 0 or is a placeholder, and a step with <code class="docutils literal notranslate"><span class="pre">keep=False</span></code>
+refuses <code class="docutils literal notranslate"><span class="pre">keep=True</span></code>.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">read</span></code> sees kept entries from earlier steps, plus this layer’s latest add, at the
 positions its mask reaches. It runs the op the declaration names for the layer.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">write</span></code> sets the step’s rows’ entries in place where the forward runs it, not at the step’s commit.</p></li>
 </ul>
 <p>These raise, naming the array and the cause: a call on an array the step doesn’t list or on
-a layer it doesn’t declare, an add after a kept add, an add after a read in the same layer,
-and <code class="docutils literal notranslate"><span class="pre">write</span></code> on an append-only array. The checks run in eager steps and at capture, so
+a layer it doesn’t declare, an add after a kept add, a kept add after a read in the same
+layer, and <code class="docutils literal notranslate"><span class="pre">write</span></code> on an append-only array. The checks run in eager steps and at capture, so
 graph replays skip them. On an array with <code class="docutils literal notranslate"><span class="pre">max_len=0</span></code> a compiled block skips them too, since a
 check there would guard on the layer.</p>
 <p>The rest are free functions in <code class="docutils literal notranslate"><span class="pre">mstar.engine.state</span></code>:</p>
@@ -3599,7 +3611,7 @@ otherwise, which covers the eager fallback path:</p>
             <span class="n">Segment</span><span class="p">(</span><span class="n">request_id</span><span class="o">=</span><span class="n">rid</span><span class="p">,</span> <span class="n">label</span><span class="o">=</span><span class="s2">"main"</span><span class="p">,</span> <span class="n">span</span><span class="o">=</span><span class="n">inp</span><span class="o">.</span><span class="n">input_seq_len</span><span class="p">)</span>
             <span class="k">for</span> <span class="n">rid</span><span class="p">,</span> <span class="n">inp</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span><span class="n">request_ids</span><span class="p">,</span> <span class="n">inputs</span><span class="p">,</span> <span class="n">strict</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
         <span class="p">],</span>
-        <span class="n">steps</span><span class="o">=</span><span class="p">{</span><span class="n">KV_CACHE</span><span class="p">:</span> <span class="n">KVStep</span><span class="p">(),</span> <span class="n">ATTN</span><span class="p">:</span> <span class="n">AttentionStep</span><span class="p">(</span><span class="n">causal</span><span class="o">=</span><span class="kc">False</span><span class="p">)},</span>
+        <span class="n">state</span><span class="o">=</span><span class="p">{</span><span class="n">KV_CACHE</span><span class="p">:</span> <span class="n">ArrayStep</span><span class="p">()},</span>
     <span class="p">)</span>
 </pre></div>
 </div>
@@ -3641,7 +3653,7 @@ sequence, and an eager section after the region.</p>
 <span class="k">def</span><span class="w"> </span><span class="nf">_block_loop_capture</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">inp</span><span class="p">:</span> <span class="n">PiecewiseCallInputs</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">torch</span><span class="o">.</span><span class="n">Tensor</span><span class="p">]:</span>
     <span class="c1"># READ out of inp.static_inputs; never reassign its entries</span>
     <span class="n">cond_tokens</span> <span class="o">=</span> <span class="n">inp</span><span class="o">.</span><span class="n">kwargs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s2">"cond_tokens"</span><span class="p">)</span>
-    <span class="n">fn</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">predictor</span><span class="o">.</span><span class="n">make_block_loop_fn</span><span class="p">(</span><span class="s2">"main"</span><span class="p">,</span> <span class="n">inp</span><span class="o">.</span><span class="n">static_inputs</span><span class="p">,</span> <span class="n">cond_tokens</span><span class="p">)</span>
+    <span class="n">fn</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">predictor</span><span class="o">.</span><span class="n">make_block_loop_fn</span><span class="p">(</span><span class="n">cached</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">static_pos_bufs</span><span class="o">=</span><span class="n">inp</span><span class="o">.</span><span class="n">static_inputs</span><span class="p">,</span> <span class="n">cond_tokens</span><span class="o">=</span><span class="n">cond_tokens</span><span class="p">)</span>
     <span class="k">return</span> <span class="p">{</span><span class="s2">"x"</span><span class="p">:</span> <span class="n">fn</span><span class="p">(</span><span class="n">inp</span><span class="o">.</span><span class="n">static_inputs</span><span class="p">[</span><span class="s2">"x"</span><span class="p">])}</span>
 
 <span class="c1"># --- declare the region ---</span>
@@ -3662,7 +3674,7 @@ sequence, and an eager section after the region.</p>
                 <span class="n">Segment</span><span class="p">(</span><span class="n">request_id</span><span class="o">=</span><span class="n">rid</span><span class="p">,</span> <span class="n">label</span><span class="o">=</span><span class="s2">"main"</span><span class="p">,</span> <span class="n">span</span><span class="o">=</span><span class="n">seq_len</span><span class="p">)</span>
                 <span class="k">for</span> <span class="n">rid</span><span class="p">,</span> <span class="n">seq_len</span> <span class="ow">in</span> <span class="nb">zip</span><span class="p">(</span><span class="n">request_ids</span><span class="p">,</span> <span class="n">seq_lens</span><span class="p">,</span> <span class="n">strict</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
             <span class="p">],</span>
-            <span class="n">steps</span><span class="o">=</span><span class="p">{</span><span class="n">KV_CACHE</span><span class="p">:</span> <span class="n">KVStep</span><span class="p">(),</span> <span class="n">ATTN</span><span class="p">:</span> <span class="n">AttentionStep</span><span class="p">(</span><span class="n">causal</span><span class="o">=</span><span class="kc">False</span><span class="p">)},</span>
+            <span class="n">state</span><span class="o">=</span><span class="p">{</span><span class="n">KV_CACHE</span><span class="p">:</span> <span class="n">ArrayStep</span><span class="p">()},</span>
         <span class="p">)</span>
 
     <span class="k">return</span> <span class="p">{</span>
@@ -4688,12 +4700,13 @@ overrides, through <code class="docutils literal notranslate"><span class="pre">
 can call the same way.</p>
 <p>The decoder node’s <code class="docutils literal notranslate"><span class="pre">declare_step</span></code> shows how a write-once context is expressed with spans.
 Canary’s comes from <code class="docutils literal notranslate"><span class="pre">EncoderDecoderNode</span></code> (<code class="docutils literal notranslate"><span class="pre">mstar/model/components/encoder_decoder.py</span></code>),
-a <code class="docutils literal notranslate"><span class="pre">SampledTokenDecoder</span></code> that adds only the cross-attention part: the context segments,
-and the encoder output on the prefill row, which <code class="docutils literal notranslate"><span class="pre">preprocess</span></code> writes into the context
-(<code class="docutils literal notranslate"><span class="pre">KVStep.eager_write</span></code>) so the prefill replays a graph sized by its prompt. Whisper’s
-declares its own and writes its context the same way. The context segments have a non-zero span in the prefill step that
-writes them, and a span of 0 in every later step. The <code class="docutils literal notranslate"><span class="pre">commit</span></code> in the prefill step
-converts the reservation into resident pages that the later steps read.</p>
+a <code class="docutils literal notranslate"><span class="pre">SampledTokenDecoder</span></code> that adds only the cross-attention part: the context, an array with a
+<code class="docutils literal notranslate"><span class="pre">Bidirectional()</span></code> read and <code class="docutils literal notranslate"><span class="pre">queries=</span></code>, and the encoder output on the prefill row, which
+<code class="docutils literal notranslate"><span class="pre">preprocess</span></code> adds to the context (<code class="docutils literal notranslate"><span class="pre">ArrayStep(eager_add=True)</span></code>) so the prefill replays a
+graph sized by its prompt. Whisper’s declares its own and writes its context the same way. The
+context segments have a non-zero span in the prefill step that writes them, and a span of 0 in
+every later step. The <code class="docutils literal notranslate"><span class="pre">commit</span></code> in the prefill step converts the reservation into resident pages
+that the later steps read.</p>
 </section>
 <section id="worked-example-an-image-dit-on-the-diffusion-scaffold">
 <h2>Worked example: an image DiT on the diffusion scaffold<a class="headerlink" href="#worked-example-an-image-dit-on-the-diffusion-scaffold" title="Link to this heading">#</a></h2>
@@ -5144,7 +5157,7 @@ easy to get wrong, and they run on CPU:</p>
 <td><p>The admit, plan and commit lifecycle driven by <code class="docutils literal notranslate"><span class="pre">declare_step</span></code>.</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">test/modular/vjepa2/fake_resources.py</span></code></p></td>
-<td><p>Stub resources for testing a submodule’s step declaration without a GPU.</p></td>
+<td><p>A stub array handle for running a submodule’s layers without a GPU.</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">test/modular/test_cuda_graph_capture.py</span></code></p></td>
 <td><p>Capture-bucket keys, including <code class="docutils literal notranslate"><span class="pre">cg_key_info</span></code> and <code class="docutils literal notranslate"><span class="pre">additional_key_info</span></code>.</p></td>
@@ -5298,7 +5311,7 @@ By M* Team
   
   <div class="footer-item">
     <p class="last-updated">
-  Last updated on Nov 13, 2026.
+  Last updated on Nov 14, 2026.
   <br/>
 </p>
   </div>
