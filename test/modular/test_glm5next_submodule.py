@@ -352,12 +352,13 @@ class TestPreprocess:
         holders_before = _holders(h.pool)
         free_before = h.pool.num_free_slots
 
-        # boundary: 4 committed + (limit - 4) new == limit passes
-        out = h.prepare("decode", "r", torch.zeros(limit - 4, dtype=torch.long))
-        assert out.input_seq_len == limit - 4
+        one = {"text_inputs": [torch.zeros(1, dtype=torch.long)]}
+        # boundary: the prompt's 4, the limit - 5 tokens emitted since and this step's one == limit passes
+        out = h.sub.prepare_inputs("decode", _info("r", decode_iters=limit - 5), one)
+        assert out.input_seq_len == 1
         # one past it is refused
         with pytest.raises(RuntimeError, match=rf"context {limit + 1} exceeds {limit}"):
-            h.prepare("decode", "r", torch.zeros(limit - 3, dtype=torch.long))
+            h.sub.prepare_inputs("decode", _info("r", decode_iters=limit - 4), one)
         # another request with no history still gets the full budget
         assert h.prepare("prefill", "other", torch.zeros(limit, dtype=torch.long)).input_seq_len == limit
 

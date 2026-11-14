@@ -254,6 +254,11 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
     ) -> ARNodeInputs:
         text_inputs = inputs["text_inputs"][0]
         seq_len = text_inputs.shape[0]
+        if graph_walk == "decode" and seq_len != 1:
+            raise RuntimeError(
+                f"request {fwd_info.request_id}: a decode row of {seq_len} ids, and a decode step is declared and "
+                "captured over rows of one id"
+            )
         if self.mtp_k > 0:
             self._check_mtp_sampling(fwd_info)
             if graph_walk == "decode":
