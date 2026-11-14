@@ -16,7 +16,7 @@ from mstar.utils.generation_kwargs import check_seed, offset_seed
 
 
 class EpisodeCapacityError(Exception):
-    """All candidate rows are occupied by calls that cannot be evicted yet."""
+    """No slot is free for this call's worker placement."""
 
 
 class EpisodeCallLimitError(ValueError):
@@ -29,6 +29,7 @@ class EpisodeRecord:
     placement: Placement | None
     slot: int | None
     seed_base: int | None = None
+    identity: tuple[bytes, bytes | None] | None = None
     held: dict[str, int] = field(default_factory=dict)
     keys: dict[str, str] = field(default_factory=dict)
     in_flight: str | None = None
@@ -60,21 +61,25 @@ class EpisodeRecords:
 
     def view(
         self, episode_id: str | None, keys: Mapping[str, str] | None = None,
-        reset: bool = False,
+        reset: bool = False, identity: tuple[bytes, bytes | None] | None = None,
     ) -> EpisodeView:
-        """Snapshot state before a call; changed keys read as empty."""
+        """Snapshot state before a call; changed identity or keys read as empty."""
         record = self._records.get(episode_id) if episode_id is not None else None
         view = _snapshot(record, episode_id, self._array_names)
-        if record is None or (not reset and not keys):
+        if record is None:
             return view
-        held = {} if reset else dict(view.held)
-        if not reset:
+        changed = record.identity != identity
+        if not reset and not changed and not keys:
+            return view
+        held = {} if reset or changed else dict(view.held)
+        if not reset and not changed:
             for name, key in keys.items():
                 if record.keys.get(name) != key:
                     held.pop(name, None)
         for name in self._array_names:
             held.setdefault(name, 0)
-        return EpisodeView(episode_id, view.calls, MappingProxyType(held), "reset" if reset else view.cold)
+        cold = "reset" if reset else "identity" if changed else view.cold
+        return EpisodeView(episode_id, view.calls, MappingProxyType(held), cold)
 
     def clear_arrays(self, episode_id: str | None, keys: Mapping[str, str] | None) -> list[str]:
         """Arrays whose content key changed since the previous call."""
@@ -152,7 +157,9 @@ class EpisodeRecords:
         self, episode_id: str | None, request_id: str, slot: int,
         placement: Placement, *, keys: Mapping[str, str] | None = None,
         reset: bool = False, max_calls: int | None = None,
-        workers: set[str] | None = None, seed_base: int | None = None,
+        workers: set[str] | None = None,
+        seed_base: int | None = None,
+        identity: tuple[bytes, bytes | None] | None = None,
     ) -> EpisodeView:
         """Record an admission decision made elsewhere, before worker dispatch.
 
@@ -171,24 +178,29 @@ class EpisodeRecords:
         self.can_admit(episode_id, max_calls)
         self.seed_for(episode_id, seed_base)
         record = self._records.get(episode_id)
-        before = self.view(episode_id, keys, reset)
+        before = self.view(episode_id, keys, reset, identity)
+        changed = record is not None and record.identity != identity
         if record is None:
-            record = EpisodeRecord(0, Placement(placement.replicas.copy(), {}), slot, seed_base=seed_base)
+            record = EpisodeRecord(
+                0, Placement(placement.replicas.copy(), {}), slot,
+                seed_base=seed_base, identity=identity,
+            )
             self._records[episode_id] = record
         elif record.slot is None:
             record.placement = Placement(placement.replicas.copy(), {})
             record.slot = slot
         elif record.slot != slot or record.placement.replicas != placement.replicas:
             raise ValueError(f"episode {episode_id!r} must keep its slot and replica")
-        if reset:
+        if reset or changed:
             record.held.clear()
             record.keys.clear()
-            record.cold = "reset"
+            record.cold = "reset" if reset else "identity"
         else:
             for name in self.clear_arrays(episode_id, keys):
                 record.held.pop(name, None)
         if keys:
             record.keys.update(keys)
+        record.identity = identity
         if workers:
             record.workers.update(workers)
         record.in_flight = request_id

@@ -179,7 +179,7 @@ class InputIngest:
         wire_rid = body.request_id
         episode_slot = getattr(body, "episode_slot", None)
         if (episode_slot is not None and self._runtime.get_rid_handle(wire_rid) is None
-                and self._engines.episode_slot_busy(episode_slot)):
+                and not self._engines.episode_slot_available(episode_slot, getattr(body, "episode_id", None))):
             self._pending_episode_requests.setdefault(episode_slot, []).append(body)
             return
         lifecycle = self._lifecycle
@@ -290,7 +290,7 @@ class InputIngest:
     def retry_episode_requests(self) -> None:
         """Admit queued calls only after the prior request's drained teardown."""
         for slot, pending in list(self._pending_episode_requests.items()):
-            if self._engines.episode_slot_busy(slot):
+            if not self._engines.episode_slot_available(slot, getattr(pending[0], "episode_id", None)):
                 continue
             body = pending.pop(0)
             wire_rid = body.request_id

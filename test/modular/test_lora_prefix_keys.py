@@ -317,6 +317,29 @@ def test_a_model_chosen_adapter_is_keyed_as_a_named_one(adapters):
     assert len({_keys(chosen)[0], _keys(on_b)[0], _keys(base)[0]}) == 3
 
 
+def test_final_adapter_digest_reaches_conductor_without_prefix_caching(adapters):
+    config = _deployment(adapters)
+    served = _served(config)
+    worker = _worker(_Choosing("a"), config, served)
+    kwargs = _run(worker, None, served, prefix_cache=False)
+    body = worker.communicator.sent[-1].body
+    assert "prefix_root" not in kwargs
+    assert body.episode_adapter_digest == served.check("a")
+
+    named_worker = _worker(_Model(), config, served)
+    named_kwargs = _run(named_worker, "a", served, prefix_cache=False)
+    assert "prefix_root" not in named_kwargs
+    assert named_worker.communicator.sent[-1].body.episode_adapter_digest == served.check("a")
+
+    base_worker = _worker(_Choosing(None), config, served)
+    _run(base_worker, None, served, prefix_cache=False)
+    assert base_worker.communicator.sent[-1].body.episode_adapter_digest is None
+
+    served.add("a", b"\x99" * 32)
+    _run(worker, None, served, prefix_cache=False)
+    assert worker.communicator.sent[-1].body.episode_adapter_digest == b"\x99" * 32
+
+
 def test_a_model_chosen_adapter_follows_runtime_unloads(adapters):
     """The data worker reads the API server's ``ServedModels``, so an adapter is checked
     against what is served now: one unloaded since startup is refused, as a client's is."""

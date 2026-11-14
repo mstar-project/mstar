@@ -46,7 +46,7 @@ from mstar.engine.resources.kv.config import (
     refuse_undeclared_labels,
     without_layouts,
 )
-from mstar.engine.resources.lora.config import LoraSpec
+from mstar.engine.resources.lora.config import LORA_ADAPTER_KWARG, LORA_DIGEST_KWARG, LoraSpec
 from mstar.engine.state import Layout, SampleSettings
 from mstar.engine.state.adapters import (
     CHUNK_CAUSAL_LAYOUT_KWARG,
@@ -648,6 +648,9 @@ class Conductor:
         if not isinstance(episode_config, dict):
             raise ValueError("episodes must be a mapping")
         self._episode_records = EpisodeRecords(self._episode_array_names)
+        # Workers load base weights once at process startup. A future hot-reload
+        # path must end affected episodes before replacing those weights.
+        self._episode_weight_epoch = os.urandom(16)
         self._episode_slots = EpisodeSlots(episode_config.get("max_episodes", 16))
         for spec in self._node_resources():
             if spec.resource_key in self._episode_array_names:
@@ -1586,6 +1589,7 @@ class Conductor:
 
         episode_active = self._uses_episode_records(body)
         episode_keys = {} if body.episode_keys is None else body.episode_keys
+        episode_reset = False
         if episode_active:
             if type(body.reset_episode) is not bool:
                 raise ValueError("reset_episode must be a bool")
@@ -1595,12 +1599,24 @@ class Conductor:
                 raise ValueError("episode_keys must map array names to strings")
             if unknown := sorted(episode_keys.keys() - self._episode_array_names):
                 raise ValueError(f"episode_keys names undeclared episode arrays {unknown}")
+            digest = body.episode_adapter_digest
+            if digest is not None and type(digest) is not bytes:
+                raise ValueError("episode_adapter_digest must be bytes or None")
+            selected_adapter = model_kwargs.get(LORA_ADAPTER_KWARG)
+            if selected_adapter is None:
+                if digest is not None:
+                    raise ValueError("base-model episode must not have an adapter digest")
+            elif digest is None or digest != model_kwargs.get(LORA_DIGEST_KWARG):
+                raise ValueError("episode adapter digest does not match the selected adapter")
+            episode_identity = (self._episode_weight_epoch, digest)
             self._episode_records.can_admit(body.episode, self._episode_max_calls)
             if (self._episode_records.slot_for(body.episode) is None and
-                    not self._episode_records.idle() and
                     not self._episode_slots.has_free_on_any(self.worker_ids)):
                 raise EpisodeCapacityError
-            episode_view = self._episode_records.view(body.episode, episode_keys, body.reset_episode)
+            episode_view = self._episode_records.view(
+                body.episode, episode_keys, body.reset_episode, episode_identity,
+            )
+            episode_reset = body.reset_episode or episode_view.cold == "identity"
             episode_seed = self._episode_records.seed_for(body.episode, model_kwargs.get("episode_seed"))
             if episode_seed is not None:
                 seed = episode_seed
@@ -1781,13 +1797,14 @@ class Conductor:
             if new_slot:
                 slot = self._reserve_episode_slot(owner, workers)
             try:
-                if not body.reset_episode:
+                if not episode_reset:
                     episode_clear = self._episode_records.clear_arrays(body.episode, episode_keys)
                 self._episode_records.admit(
                     body.episode, body.request_id, slot, placement,
                     keys=episode_keys, reset=body.reset_episode,
                     max_calls=self._episode_max_calls, workers=workers,
                     seed_base=model_kwargs.get("episode_seed"),
+                    identity=episode_identity,
                 )
             except Exception:
                 if new_slot:
@@ -1826,7 +1843,7 @@ class Conductor:
                     loop_caps=loop_caps,
                     episode_id=request_data.episode_id,
                     episode_slot=request_data.episode_slot,
-                    reset_episode=body.reset_episode if episode_active else False,
+                    reset_episode=episode_reset,
                     episode_clear=episode_clear,
                     request_info=CurrentForwardPassInfo(
                         request_id=body.request_id,
@@ -1951,32 +1968,8 @@ class Conductor:
 
     def _reserve_episode_slot(self, owner: str, workers: set[str]) -> int:
         slot = self._episode_slots.reserve(owner, workers)
-        if slot is not None:
-            return slot
-        queued = {request.episode for request in self.waiting_queue}
-        eligible = {
-            self._episode_owner(episode_id, ""): (episode_id, record)
-            for episode_id, record in self._episode_records.idle()
-            if episode_id not in queued and self._episode_owner(episode_id, "") != owner
-        }
-        candidates = []
-        for candidate_slot in range(self._episode_slots.capacity):
-            occupants = self._episode_slots.occupants(workers, candidate_slot)
-            if occupants <= eligible.keys():
-                victims = [eligible[occupant] for occupant in occupants]
-                candidates.append((len(victims), min(old.last_end for _, old in victims), candidate_slot, victims))
-        if not candidates:
-            raise EpisodeCapacityError
-        _, _, _, victims = min(candidates)
-        for old_id, old in victims:
-            old_slot, old_workers = old.slot, old.workers
-            self._send_end_episode(old_id, old_slot, old_workers)
-            self._episode_records.evict(old_id)
-            self._episode_evictions.inc(("pressure",))
-            self._episode_slots.release(self._episode_owner(old_id, ""), old_workers, old_slot)
-        slot = self._episode_slots.reserve(owner, workers)
         if slot is None:
-            raise AssertionError("planned episode victims did not free their common slot")
+            raise EpisodeCapacityError
         return slot
 
     def _expire_episode_slots(self, now: float) -> bool:

@@ -280,18 +280,34 @@ def test_cold_positronic_session_reaches_conductor_with_advanced_seed(tmp_path, 
     assert not conductor._episode_records.has(ready["session_id"])
 
 
-def test_seed_only_session_keeps_call_index_after_slot_eviction(tmp_path, monkeypatch):
+def test_seed_only_session_keeps_call_index_after_idle_expiry(tmp_path, monkeypatch):
     conductor, _, comm = _conductor(tmp_path, monkeypatch, model_type=_SeedOnlyModel, capacity=1)
-    for rid, episode, base, expected in (
-        ("first", "robot-a", 17, 17),
-        ("other", "robot-b", 99, 99),
-        ("again", "robot-a", 17, 18),
-    ):
+
+    def send(rid, episode, base):
         request = _request(rid, episode)
         request.model_kwargs["episode_seed"] = base
         conductor._ingest_request(request)
-        assert _new_requests(comm, rid)[0][1].request_info.random_seed == expected
-        _complete(conductor, rid)
+
+    def expire(episode):
+        last_end = conductor._episode_records._records[episode].last_end
+        assert conductor._expire_episode_slots(last_end + conductor._episode_idle_timeout_s + 1)
+        conductor._try_admit_waiting()
+
+    send("first", "robot-a", 17)
+    assert _new_requests(comm, "first")[0][1].request_info.random_seed == 17
+    _complete(conductor, "first")
+
+    send("other", "robot-b", 99)
+    assert _new_requests(comm, "other") == []
+    expire("robot-a")
+    assert _new_requests(comm, "other")[0][1].request_info.random_seed == 99
+    _complete(conductor, "other")
+
+    send("again", "robot-a", 17)
+    assert _new_requests(comm, "again") == []
+    expire("robot-b")
+    assert _new_requests(comm, "again")[0][1].request_info.random_seed == 18
+    _complete(conductor, "again")
 
 
 def test_warm_episode_stays_on_first_replica_when_router_would_rotate(tmp_path, monkeypatch):
@@ -320,6 +336,58 @@ def test_changed_content_key_clears_just_its_array_before_planning(tmp_path, mon
     assert model.views[-1].calls == 1
     assert dict(model.views[-1].held) == {"frames": 0}
     assert _new_requests(comm, "second")[0][1].episode_clear == ["frames"]
+
+
+def test_weight_epoch_change_resets_worker_rows_before_a_warm_plan(tmp_path, monkeypatch):
+    conductor, model, comm = _conductor(tmp_path, monkeypatch)
+    conductor._ingest_request(_request("first", "robot-a", keys={"frames": "prompt"}))
+    _complete(conductor, "first", {"frames": 4})
+    conductor._episode_weight_epoch = b"new-weight-epoch"
+
+    conductor._ingest_request(_request("second", "robot-a", keys={"frames": "prompt"}))
+    assert (model.views[-1].calls, model.views[-1].cold, model.views[-1].held["frames"]) == (
+        1, "identity", 0,
+    )
+    assert _new_requests(comm, "second")[0][1].reset_episode is True
+    assert conductor._episode_records._records["robot-a"].held == {}
+
+
+def test_same_adapter_name_with_new_digest_resets_unkeyed_rows(tmp_path, monkeypatch):
+    conductor, model, comm = _conductor(tmp_path, monkeypatch)
+    first = _request("first", "robot-a")
+    first.model_kwargs = {"lora_adapter": "same", "lora_digest": b"a" * 32}
+    first.episode_adapter_digest = b"a" * 32
+    conductor._ingest_request(first)
+    _complete(conductor, "first", {"frames": 4})
+
+    second = _request("second", "robot-a")
+    second.model_kwargs = {"lora_adapter": "same", "lora_digest": b"b" * 32}
+    second.episode_adapter_digest = b"b" * 32
+    conductor._ingest_request(second)
+    assert (model.views[-1].calls, model.views[-1].held["frames"], model.views[-1].cold) == (
+        1, 0, "identity",
+    )
+    assert _new_requests(comm, "second")[0][1].reset_episode is True
+    _complete(conductor, "second", {"frames": 7})
+
+    third = _request("third", "robot-a")
+    third.model_kwargs = {"lora_adapter": "same", "lora_digest": b"b" * 32}
+    third.episode_adapter_digest = b"b" * 32
+    conductor._ingest_request(third)
+    assert (model.views[-1].calls, model.views[-1].held["frames"], model.views[-1].cold) == (
+        2, 7, None,
+    )
+    assert _new_requests(comm, "third")[0][1].reset_episode is False
+
+
+def test_episode_adapter_without_selected_digest_is_refused(tmp_path, monkeypatch):
+    conductor, _, comm = _conductor(tmp_path, monkeypatch)
+    request = _request("first", "robot-a")
+    request.model_kwargs = {"lora_adapter": "same", "lora_digest": b"a" * 32}
+    conductor._ingest_request(request)
+    failures = [msg.body for _, msg in comm.sent if msg.message_type == "request_failed"]
+    assert [(failure.status, failure.request_id) for failure in failures] == [(400, "first")]
+    assert not conductor._episode_records.has("robot-a")
 
 
 def test_startup_refuses_more_episode_slots_than_the_dense_pool_has(tmp_path, monkeypatch):
@@ -370,3 +438,16 @@ def test_slot_pressure_after_planning_drops_registered_request(tmp_path, monkeyp
     assert [request.request_id for request in conductor.waiting_queue] == ["waiting"]
     assert "waiting" not in conductor.requests
     assert _new_requests(comm, "waiting") == []
+
+
+def test_full_episode_pool_queues_until_idle_expiry_then_retries(tmp_path, monkeypatch):
+    conductor, _, comm = _conductor(tmp_path, monkeypatch, idle_timeout_s=1)
+    conductor._ingest_request(_request("first", "robot-a"))
+    _complete(conductor, "first", {"frames": 4})
+    conductor._ingest_request(_request("second", "robot-b"))
+    assert [request.request_id for request in conductor.waiting_queue] == ["second"]
+    assert _new_requests(comm, "second") == []
+    conductor._episode_records._records["robot-a"].last_end -= 2
+    conductor._sweep_expiry()
+    assert [request.request_id for request in conductor.waiting_queue] == []
+    assert _new_requests(comm, "second")[0][1].episode_id == "robot-b"

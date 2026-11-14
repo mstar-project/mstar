@@ -399,6 +399,8 @@ class NewRequestConductor(MessageBody):
     episode: str | None = None
     episode_keys: dict[str, str] | None = None
     reset_episode: bool = False
+    # Final adapter digest selected by the data worker, independent of prefix caching.
+    episode_adapter_digest: bytes | None = None
 
 
 @dataclass

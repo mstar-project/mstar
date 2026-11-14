@@ -572,5 +572,8 @@ class EngineManager:
     def episode_slot_busy(self, slot: int) -> bool:
         return self.engine.episode_slot_busy(slot)
 
+    def episode_slot_available(self, slot: int, episode_id: str | None) -> bool:
+        return self.engine.episode_slot_available(slot, episode_id)
+
     def shutdown(self) -> None:
         self.engine.shutdown()
