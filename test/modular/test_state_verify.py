@@ -64,6 +64,8 @@ from mstar.engine.state.calls import VerifyRun
 from mstar.engine.state.contract import Op
 from mstar.model.base import KVLabel, PrefixKeys
 
+requires_cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="a count event in a graph needs a GPU")
+
 LAYERS, SLOTS, HEADS, DIM, SPAN = 2, 64, 2, 8, 4
 ATTEND = Attend(q_heads=HEADS)
 
@@ -372,6 +374,46 @@ def test_a_captured_step_numbers_its_table_on_replay_only():
     _verify(h, [], _step(h, ctx=_ctx(lease=lease)))
     assert table.host[0] == 2, "the host numbers the slot's table before each replay"
     assert [count.delta() for *_, count in kv.deferred] == [-1, -2], "a replay's counts are what its graph copied"
+
+
+@requires_cuda
+def test_a_replay_s_counts_are_read_after_its_own_copy_lands():
+    """A replay records the count event inside its graph, and the host numbers the table before the launch. A read
+    that got ahead of the replay's copy would pass the number check and take the counts the table held from the
+    replay before. So each replay here settles counts that differ from the table's last, behind enough work that the
+    copy has not landed when the launch returns."""
+    kv = _StubKV()
+    kv.pages = kv.pages.cuda()
+    h = _handle(kv=kv)
+    lease = SlotLease(slot=0, bucket=BucketKey("decode", 2, 2 * SPAN))
+    kept = torch.zeros(2, dtype=torch.int64, device="cuda")
+    k = torch.randn(2 * SPAN, HEADS, DIM, device="cuda")
+    work = torch.randn(4096, 4096, device="cuda")
+    step = _step(h, ctx=_ctx(lease=lease, capture=True))
+    h.begin_step(step)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        for _ in range(8):
+            work = torch.mm(work, work)
+        for layer in range(LAYERS):
+            h.add(layer, k=k, v=k)
+        settle(h, kept)
+    h.check_step(step)
+    h.commit_step(step)
+    h.end_step(step)
+    (table,) = h.verify._tables.values()
+    for counts in ([3, 2], [1, 4], [4, 1], [2, 3]):
+        assert table.host[1:3].tolist() != counts, "the table already holds these counts, so a stale read would pass"
+        kept.copy_(torch.tensor(counts))
+        replay = _step(h, ctx=_ctx(lease=lease))
+        h.begin_step(replay)
+        graph.replay()
+        h.check_step(replay)
+        h.commit_step(replay)
+        h.end_step(replay)
+        assert [count.delta() for *_, count in kv.deferred[-2:]] == [count - SPAN for count in counts], (
+            "the read took the table's previous counts, ahead of this replay's copy"
+        )
 
 
 def test_the_eager_tables_grow_outside_capture():
