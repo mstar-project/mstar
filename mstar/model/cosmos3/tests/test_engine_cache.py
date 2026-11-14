@@ -165,7 +165,7 @@ class _SdpaKV(AttentionResource):
         # plan label -> [(source label, span)], in packed order
         self.groups: dict[str, list[tuple[str, int]]] = {}
         self.planned: dict[str, tuple] = {}
-        # Windowed kv mode: the exact retention a request's layout keeps on
+        # Windowed kv mode: the retention a request's layout keeps on
         # each label, applied at commit like the pool does (whole pages from
         # the first page past the protected prefix; see KVManager._apply_retention).
         self.page_size = page_size
@@ -177,7 +177,7 @@ class _SdpaKV(AttentionResource):
 
     def ingest_request(self, rid, overrides=None):
         for label, layout in (getattr(overrides, "kv_layout", None) or {}).items():
-            if layout.retention is not None and layout.retention.exact:
+            if layout.retention is not None:
                 self.retention[label] = layout.retention
 
     def remove_request(self, rid):

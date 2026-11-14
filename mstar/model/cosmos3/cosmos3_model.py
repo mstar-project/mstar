@@ -414,8 +414,9 @@ class Cosmos3Model(Model):
     def declare_state(self) -> list[Array | Sampler | SeqShard]:
         """One pool holds every guidance branch's text K/V under its own label, and the reasoner's beside them: the
         reasoner is the DiT's understanding pathway run as a text model. Prefills and the reasoner read it causally,
-        generation steps bidirectionally, through the window a windowed deployment keeps. ``PROGRESS`` holds where a
-        request's draws stand between steps.
+        generation steps bidirectionally, through the window a windowed deployment keeps. The window is cut on whole
+        pages, so a window's denoise steps and its commit attend the same entries on either kernel. ``PROGRESS`` holds
+        where a request's draws stand between steps.
 
         On SP ranks the sequence shard splits a generation step's tokens over them. Prefills and the reasoner's steps
         run whole on each rank."""
@@ -426,7 +427,8 @@ class Cosmos3Model(Model):
         gen_walks = {self.IMAGE_GEN_WALK, self.VIDEO_GEN_WALK, *ACTION_WALKS}
         if self._sound_serving_enabled():
             gen_walks.update(SOUND_WALKS)
-        if self._windowed_serving_enabled():
+        windowed = self._windowed_serving_enabled()
+        if windowed:
             gen_walks.add(self.VIDEO_GEN_AR_WALK)
         attend = Attend(q_heads=c.num_attention_heads)
         state: list[Array | Sampler | SeqShard] = [
@@ -436,9 +438,8 @@ class Cosmos3Model(Model):
                 labels={COND_LABEL, UNCOND_LABEL},
                 reads={
                     ATTN: Read(mask=Causal(), op=attend, walks=und_walks),
-                    ATTN_GEN: Read(
-                        mask=Bidirectional(kept_window=self._windowed_serving_enabled()), op=attend, walks=gen_walks,
-                    ),
+                    ATTN_GEN: Read(mask=Bidirectional(kept_window=windowed, whole_pages=windowed), op=attend,
+                                   walks=gen_walks),
                 },
                 # the reasoner's counter, which its layers turn into 3D mRoPE themselves
                 positions=Positions() if reasoner else None,
