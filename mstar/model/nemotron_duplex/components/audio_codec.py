@@ -29,7 +29,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from mstar.engine.resources.recurrent import RecurrentBlockConfig
+from mstar.engine.state import Entry, TensorType
 from mstar.model.components.dft import irfft_dim1
 from mstar.model.nemotron_duplex.components._util import RawWeight, param
 from mstar.model.nemotron_duplex.config import CodecConfig
@@ -261,17 +261,17 @@ class CodecStreamAudio(NamedTuple):
     end_after: torch.Tensor    # [B, stream_edge]
 
 
-def codec_state_blocks(config: CodecConfig, dtype: torch.dtype | None = None) -> dict[str, RecurrentBlockConfig]:
-    """A decode stream's state as recurrent-pool blocks: per decoder stage, its
-    blocks' conv tails ``(num_blocks, channels, kernel - 1)`` (by default in the
-    engine's compute dtype, which the blocks compute in), and the inverse STFT's
-    overlap (``CodecStreamState.overlap``, float32)."""
-    blocks = {
-        f"stage{i}": RecurrentBlockConfig(shape=(config.num_blocks, ch, config.kernel_size - 1), dtype=dtype)
+def codec_entry(config: CodecConfig) -> Entry:
+    """A decode stream's state as one entry: per decoder stage, its blocks' conv
+    tails ``(num_blocks, channels, kernel - 1)`` in the engine's compute dtype,
+    which the blocks compute in, and the inverse STFT's overlap
+    (``CodecStreamState.overlap``, float32)."""
+    tensors = {
+        f"stage{i}": TensorType((config.num_blocks, ch, config.kernel_size - 1), dtype=None)
         for i, ch in enumerate(reversed(config.channels))
     }
-    blocks["overlap"] = RecurrentBlockConfig(shape=(2, config.n_fft - config.hop_length), dtype=torch.float32)
-    return blocks
+    tensors["overlap"] = TensorType((2, config.n_fft - config.hop_length), dtype=torch.float32)
+    return Entry(tensors)
 
 
 def _overlap_add_stream(

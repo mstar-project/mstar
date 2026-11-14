@@ -25,6 +25,8 @@ PORTED = (
     "mstar/model/qwen3_tts",
     "mstar/model/pi05", "mstar/model/vjepa2", "mstar/model/canary", "mstar/model/components/encoder_decoder.py",
     "mstar/model/bagel", "mstar/model/chatterbox", "mstar/model/whisper",
+    "mstar/model/nemotron_duplex", "mstar/model/components/fastconformer.py",
+    "mstar/model/components/fastconformer_stream.py",
 )
 FORBIDDEN_ATTRIBUTES = {
     "node_resources", "resources", "request_state", "request_states", "per_request_states", "sequence_shard",
@@ -46,6 +48,8 @@ ALLOWED = {
     ("mstar.engine.engine", "ExecutingBatch"): "the annotation of `NodeSubmodule.can_batch`, a base class's hook",
     ("mstar.engine.resources.lora.checkpoint", "LoraFile"): "a model's static LoRA merge at load, which holds no state",
     ("mstar.engine.resources.lora", "LoraSpec"): "the opt-in LoRA spec, written by hand: the contract declares no LoRA",
+    ("mstar.engine.resources.kv.config", "DEFAULT_PAGE_SIZE"):
+        "the page size a model's default pool sizes count in, until the pool sizes itself",
     ("mstar.engine.resources", "SeqShardSpec"): (
         "MiniMax-H3's video decoder's sequence shard, written by hand: a contract SeqShard brackets a label an array "
         "opens, and the decoder has no arrays"
