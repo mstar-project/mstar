@@ -630,6 +630,7 @@ CHUNK_CAUSAL_LAYOUT_KWARG = "__state_chunk_causal_layout__"
 
 def chunk_causal_layouts(
     declarations: Sequence[Array | Sampler | SeqShard], state_layout: Mapping[str, Mapping[str, Layout]],
+    *, require_all: bool = True,
 ) -> dict[str, dict[str, dict[str, list[int]]]]:
     """The read-keyed lengths of within-step arrays, as wire-safe request data."""
     arrays = {declared.name: declared for declared in declarations if isinstance(declared, Array)}
@@ -639,7 +640,7 @@ def chunk_causal_layouts(
         if array is None:
             raise RuntimeError(f"state_layout[{name!r}]: it names no declared array, of {sorted(arrays)}")
         for label, layout in by_label.items():
-            _check_chunk_causal_layout(array, label, layout)
+            _check_chunk_causal_layout(array, label, layout, require_all=require_all)
             if layout.chunk_causal:
                 rows.setdefault(name, {})[label] = {
                     key: [lengths.global_len, lengths.noised_len, lengths.clean_len]
@@ -681,7 +682,7 @@ def kv_layouts(
     return converted
 
 
-def _check_chunk_causal_layout(array: Array, label: str, layout: Layout) -> None:
+def _check_chunk_causal_layout(array: Array, label: str, layout: Layout, *, require_all: bool = True) -> None:
     """Check the read keys in a request's mask layout before within-step layouts leave the KV conversion path."""
     if not isinstance(layout, Layout):
         raise RuntimeError(f"state_layout[{array.name!r}][{label!r}] must be a Layout, got {layout!r}")
@@ -697,11 +698,12 @@ def _check_chunk_causal_layout(array: Array, label: str, layout: Layout) -> None
                 f"state_layout[{array.name!r}][{label!r}].chunk_causal[{key!r}] "
                 f"must be a ChunkCausalLayout, got {lengths!r}"
             )
-    required = {key for key, read in array.reads.items() if isinstance(read.mask, ChunkCausal)}
-    if missing := required - layout.chunk_causal.keys():
-        raise RuntimeError(
-            f"state_layout[{array.name!r}][{label!r}].chunk_causal is missing reads {sorted(missing)}"
-        )
+    if require_all:
+        required = {key for key, read in array.reads.items() if isinstance(read.mask, ChunkCausal)}
+        if missing := required - layout.chunk_causal.keys():
+            raise RuntimeError(
+                f"state_layout[{array.name!r}][{label!r}].chunk_causal is missing reads {sorted(missing)}"
+            )
 
 
 def sampling_configs(
