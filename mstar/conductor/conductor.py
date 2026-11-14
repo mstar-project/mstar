@@ -48,7 +48,7 @@ from mstar.engine.resources.lora.config import LoraSpec
 from mstar.engine.state import SampleSettings
 from mstar.engine.state.adapters import sampling_configs
 from mstar.graph.base import GraphEdge, NodeAndGraphWalk, TensorPointerInfo
-from mstar.model.base import Model, WorkerGraph, serving_resources, streamed_inputs
+from mstar.model.base import Model, WorkerGraph, continuing_streams, serving_resources, streamed_inputs, walk_partition
 from mstar.model.submodule_base import chunk_loop_name
 from mstar.observability import catalog
 from mstar.observability.recorders import Gauge, MetricSnapshot, merge
@@ -111,6 +111,12 @@ def _walk_io(model: Model) -> tuple[dict[str, tuple[tuple[str, str], ...]], dict
         edges += [edge for loop in loops.values() for edge in loop.outputs + loop.accumulated_outputs]
         persists[walk] = frozenset(edge.name for edge in edges if edge.persist)
         if streamed and set(loops) <= {chunk_loop_name(node, walk) for node in graph.get_nodes()}:
+            if continuing := continuing_streams(model, walk) & {name for name, _ in streamed}:
+                # a continuing stream's final chunk ends nothing, so the re-sent step would wait on it forever
+                raise ValueError(
+                    f"graph walk {walk!r} runs once per chunk (no Loop) but its stream "
+                    f"{sorted(continuing)[0]!r} continues past its end; give the walk a Loop"
+                )
             repeating.add(walk)
     return inputs, persists, frozenset(repeating)
 
@@ -625,6 +631,9 @@ class Conductor:
         )
         if topology:
             topology.check_walk_driving_connections()
+            topology.check_walk_scoped_continuation(
+                {walk: walk_partition(model, walk) for walk in model.get_graph_walk_graphs()}
+            )
 
         for group in self.default_sharding_config.groups:
             group_graph_walks = group.graph_walks or graph_walks
@@ -2098,9 +2107,9 @@ class Conductor:
             for conn in request_data.streaming_connections.values():
                 if conn.from_partition == partition_name:
                     conn.producer_done = True
-                    # A finished consumer takes no more input; told its
-                    # producer is done, a continue_after_done stream would
-                    # keep feeding it empty chunks
+                    # A finished consumer takes no more input: its
+                    # stream's final chunk would be refused, and offered
+                    # again on every poll
                     if request_data.partition_states[conn.to_partition].is_done:
                         continue
                     if conn.to_partition not in consumers:

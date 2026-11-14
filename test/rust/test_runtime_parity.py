@@ -1031,7 +1031,7 @@ def split_loop(request):
     )
     wgs = _divide_into_worker_graphs(
         loop, graph_walk=WALK, node_to_group_idx={"combine": 0, "step": 1},
-        node_groups=[{"ranks": [0]}, {"ranks": [1]}], input_streams=set(),
+        node_groups=[{"ranks": [0]}, {"ranks": [1]}], input_streams={},
     )
     for wg in wgs:
         wg.worker_graph_id = wg.ranks[0]

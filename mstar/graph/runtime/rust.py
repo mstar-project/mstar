@@ -136,6 +136,7 @@ def worker_graph_args(worker_graph: WorkerGraph) -> dict:
                 # on ReadySignals. Populated during worker-graph construction
                 # by _register_streaming, so it is set by the time we compile.
                 "streaming_inputs": sorted(node._streaming_inputs),
+                "continuing_inputs": sorted(node._continuing_inputs),
                 "outputs": [_edge_args(section, e) for e in node.outputs],
             }
             for name, node in nodes.items()

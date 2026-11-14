@@ -125,17 +125,18 @@ class SpeculationPreparer:
     """Finds the continuing rows of a speculation and the inputs they already
     hold, in one runtime call.
 
-    As columns (``prep_spec_rows``) whenever no streams are open, since then
-    there are no chunks to poll and ingest; otherwise per row, with the
-    stream buffers polled first (``prep_spec_rids``). A TP follower never comes
-    here: it rebuilds whatever rows the leader's head names.
+    As columns (``prep_spec_rows``) whenever none of the rows has a stream
+    into the node still open, since then there are no chunks to poll and
+    ingest; otherwise per row, with the open rows' stream buffers polled first
+    (``prep_spec_rids``). A TP follower never comes here: it rebuilds
+    whatever rows the leader's head names.
     """
 
     def __init__(self, ctx: SpeculationContext):
         self._ctx = ctx
 
-    def rows_eligible(self) -> bool:
-        return not self._ctx.streams.possible()
+    def rows_eligible(self, spec_node_name: str, candidates: list[int]) -> bool:
+        return self._ctx.streams.open_into(spec_node_name).isdisjoint(candidates)
 
     def prepare(
         self, batch_N: ScheduledBatch, spec_node_name: str, graph_walk: str,
@@ -144,7 +145,7 @@ class SpeculationPreparer:
     ) -> PreparedSpeculation:
         """``loop_strides``: ``candidates``' in N (``RouteInput.loop_strides``),
         which decide whose loop N ends."""
-        if self.rows_eligible():
+        if self.rows_eligible(spec_node_name, candidates):
             return self._prepare_rows(
                 batch_N, spec_node_name, graph_walk, candidates, max_continuing, laps,
                 loop_strides,
@@ -186,13 +187,11 @@ class SpeculationPreparer:
         streams = ctx.streams
         polled: list[tuple[int, StreamingEdge]] = []
         per_rid_counts: list[int] = []
-        if streams.possible():
-            for r in candidates:
-                edges = streams.poll_for(r, spec_node_name)
-                polled.extend((r, e) for e in edges)
-                per_rid_counts.append(len(edges))
-        else:
-            per_rid_counts = [0] * len(candidates)
+        open_rids = streams.open_into(spec_node_name)
+        for r in candidates:
+            edges = streams.poll_for(r, spec_node_name) if r in open_rids else ()
+            polled.extend((r, e) for e in edges)
+            per_rid_counts.append(len(edges))
 
         out = ctx.graph_runtime.prep_spec_rids(SpeculationPrepInput(
             spec_node_name=spec_node_name,
@@ -256,10 +255,13 @@ class SpeculationBuilder:
         if (
             prep.rows_wg_id is not None and not other_walks and not fresh_final_edges
             and not chunk_ranges and not rebuild_rids
+            and self._ctx.streams.open_into(spec_target.node_name).isdisjoint(
+                prep.per_request_inputs)
         ):
-            # the dicts hold only the fresh rows here; a fresh row's final
-            # stream chunk, a cut chunk, or a rebuild row's inputs from the log
-            # take the general assembly, which carries them
+            # the dicts hold only the fresh rows here; a fresh row's stream
+            # chunk (an open stream's, or a final one), a cut chunk, or a
+            # rebuild row's inputs from the log take the general assembly,
+            # which carries them
             return self.assemble_rows(
                 pending, spec_target, prep.ready_rids, prep.rows_wg_id,
                 fresh_request_to_worker_graph=prep.request_to_worker_graph,
@@ -268,8 +270,9 @@ class SpeculationBuilder:
         per_request_inputs = prep.per_request_inputs
         request_to_worker_graph = prep.request_to_worker_graph
         if prep.rows_wg_id is not None:
-            # a mixing chain took fresh rows of another walk: the general
-            # assembly, with the continuing rows ahead of the fresh ones
+            # a fresh row brought what the columns can't carry (above), or runs
+            # another walk: the general assembly, with the continuing rows
+            # ahead of the fresh ones
             per_request_inputs = {**{r: {} for r in prep.ready_rids}, **per_request_inputs}
             request_to_worker_graph = {
                 **dict.fromkeys(prep.ready_rids, prep.rows_wg_id), **request_to_worker_graph,

@@ -42,6 +42,9 @@ def consumer_nodes(
     return cache
 
 
+_NONE_OPEN: frozenset[int] = frozenset()
+
+
 class StreamBufferManager:
     """The stream buffers of this worker's requests, for the connections whose
     consumer runs here, and the walk-driver tables this worker stamps its sends
@@ -83,13 +86,21 @@ class StreamBufferManager:
         )
         # edge name -> the partition the stream feeds
         self._partition: dict[str, str] = {c.edge_name: c.to_partition for c in connections}
-        # the rids that own a buffer; empty for a text model, so a speculation
-        # skips its per-row stream polls
-        self._rids: set[int] = set()
+        # consumer node -> the rids with a stream into it still open (one
+        # whose final chunk is not out, or was handed back); a speculation
+        # polls only these, and takes the columns when none of its rows is
+        self._open: dict[str, set[int]] = {}
 
-    def possible(self) -> bool:
-        """Whether any live request owns a stream buffer."""
-        return bool(self._rids)
+    def open_into(self, node_name: str) -> set[int]:
+        """The rids with a stream into ``node_name`` that can still yield a
+        chunk. Not to be mutated."""
+        return self._open.get(node_name, _NONE_OPEN)
+
+    def consumes_stream(self, node_name: str) -> bool:
+        """Whether a stream into this worker feeds ``node_name``, so its steps
+        may carry stream chunks. One entry per stream: a scan, not a table
+        that would go stale when ``consumer_node`` is set."""
+        return node_name in self.consumer_node.values()
 
     # -- request lifecycle ----------------------------------------------------
 
@@ -116,7 +127,7 @@ class StreamBufferManager:
                 req_info.stream_buffers[conn.edge_name] = sbuf
                 consumer = self.consumer_node.get(conn.edge_name, "")
                 req_info.stream_buffers_by_consumer.setdefault(consumer, {})[conn.edge_name] = sbuf
-                self._rids.add(request_id)
+                self._open.setdefault(consumer, set()).add(request_id)
             if conn.to_partition == request_info.partition_name:
                 lead = request_info.stream_lead_items.get(conn.edge_name)
                 if lead:
@@ -139,7 +150,8 @@ class StreamBufferManager:
         return info.uuid
 
     def remove_request(self, request_id: int) -> None:
-        self._rids.discard(request_id)
+        for rids in self._open.values():
+            rids.discard(request_id)
 
     def assign_consumer_walks(self, batch_N) -> None:
         """Decide the consumer walk of this pass's streamed items, per rid and
@@ -234,6 +246,7 @@ class StreamBufferManager:
         consumer_node = self.consumer_node.get(edge_name, "")
         waiting = sbuf.pop_waiting_edge()
         if waiting is not None:
+            self._close_if_ended(sbuf, waiting, request_id)
             return waiting
         partition = self.walk_driven_edges.get(edge_name)
         consumer_walk = (
@@ -247,7 +260,8 @@ class StreamBufferManager:
             return None
         if not self._enter_chunk_walk(sbuf, edge_name, request_id, allow_walk_change):
             return None
-        chunk = sbuf.pop_chunk()
+        # an empty chunk drives no walk change, so ``consumer_walk`` is its walk
+        chunk = sbuf.pop_chunk(consumer_walk)
         # The chunk's items as the buffer holds them: their uuids, or none for
         # an empty chunk (producer done, nothing left). The edge carries every
         # item; ``input_tensors`` stacks them when the consuming batch is built.
@@ -267,7 +281,24 @@ class StreamBufferManager:
             # the buffer's references to the items it advanced past; after
             # the increment, so an item in both stays alive
             tm.dereference_batch_uniform(released)
-        return StreamingEdge(edge_name, consumer_node, uuids, chunk.info)
+        edge = StreamingEdge(edge_name, consumer_node, uuids, chunk.info)
+        self._close_if_ended(sbuf, edge, request_id)
+        return edge
+
+    def _close_if_ended(self, sbuf: StreamBuffer, edge: StreamingEdge, request_id: int) -> None:
+        """After a pop, popped fresh or handed back earlier: a buffer whose
+        final chunk is out is closed, walk-driven or not, and the rid leaves
+        ``_open`` once every stream into the node is. Only a final chunk
+        handed back (``return_edge``) reopens them."""
+        if not (edge.chunk.is_final and sbuf.closed):
+            return
+        sbuf.maybe_ready = False
+        open_rids = self._open.get(edge.next_node, _NONE_OPEN)
+        if request_id in open_rids and all(
+            b.closed for b in self._request_state.per_request_info[request_id]
+            .stream_buffers_by_consumer[edge.next_node].values()
+        ):
+            open_rids.discard(request_id)
 
     def _pack_window(self, request_id: int, edge_name: str, items: list) -> int:
         """A window that holds inline items, as one stored CPU int64 tensor ``[n]``
@@ -313,6 +344,8 @@ class StreamBufferManager:
             return []
         result = []
         for edge_name, sbuf in req_info.stream_buffers_by_consumer.get(node_name, {}).items():
+            if not sbuf.maybe_ready:
+                continue
             edge = self.pop_edge(sbuf, edge_name, request_id, allow_walk_change=False)
             if edge is not None:
                 result.append(edge)
@@ -331,6 +364,7 @@ class StreamBufferManager:
         # The step that took the final chunk will not run; the stream is live again.
         if streaming_edge.chunk.is_final:
             req_info.ended_streams.discard(streaming_edge.name)
+            self._open.setdefault(streaming_edge.next_node, set()).add(request_id)
 
     def mark_ingested(self, request_id: int, streaming_edge: StreamingEdge) -> None:
         """Remember the chunk the graph accepted, for the batch that consumes it.
@@ -413,8 +447,9 @@ class StreamBufferManager:
         the rids whose streams into the partition have. The second is a
         subset of the first. Streams end in any order and over several
         steps, so one final chunk alone means only that its own stream ended. A
-        ``continue_after_producer_done`` stream never sends a final chunk;
-        it holds neither back.
+        ``continue_after_producer_done`` stream's end ends nothing (its
+        consumer keeps running, reading the input as absent), and it holds
+        neither back.
         """
         node_done: set[int] = set()
         partition_done: set[int] = set()
@@ -423,6 +458,13 @@ class StreamBufferManager:
             if req_info is None:
                 node_done.add(rid)
                 partition_done.add(rid)
+                continue
+            sbufs = req_info.stream_buffers
+            edges = {
+                e for e in edges
+                if e not in sbufs or not sbufs[e].policy.continue_after_producer_done()
+            }
+            if not edges:
                 continue
             req_info.ended_streams |= edges
             partition = self._partition.get(next(iter(edges)))
