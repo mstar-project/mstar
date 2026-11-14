@@ -194,6 +194,11 @@ class Wan22Config:
     # (1280x704). Requests choose their size, so an open list would let each new
     # size cost a compile on the shared worker.
     vae_decode_fast_sizes: tuple[str, ...] | None = None
+    # Opt-in, near-lossless: the fast decode with three rewrites (``wan_vae.rewrite_decoder``): every decoder call
+    # compiled (the clip start's two calls ran eager), nearest-x2 + 3x3 conv as one stride-2 transposed conv, and the
+    # mid-block attention as two GEMMs around an fp32 softmax. Same math, rounded differently, so the frames are not
+    # the default fast decode's. Both variants; needs ``vae_decode_fast``.
+    vae_decode_fast_math: bool = False
     # Opt-in, near-lossless: decode on the Wan2.2-VAE kernels (``components/wan22_vae_kernel``, FastVideo's Winograd
     # decoder generalized to any size) instead of the paths above, on compute capability 9.0 / 10.0 / 10.3 (Hopper,
     # Blackwell) and the TI2V-5B VAE. Not bit-exact with ``vae.decode`` (Winograd and fused norms round differently);
@@ -242,6 +247,10 @@ class Wan22Config:
         if not isinstance(self.vae_decode_fast, bool):
             raise ValueError(f"Wan2.2 vae_decode_fast must be true or false, got {self.vae_decode_fast!r}.")
         self.fast_decode_sizes()
+        if not isinstance(self.vae_decode_fast_math, bool):
+            raise ValueError(f"Wan2.2 vae_decode_fast_math must be true or false, got {self.vae_decode_fast_math!r}.")
+        if self.vae_decode_fast_math and not self.vae_decode_fast:
+            raise ValueError("Wan2.2 vae_decode_fast_math rewrites the fast decode: set vae_decode_fast too.")
         if not isinstance(self.vae_decode_kernel, bool):
             raise ValueError(f"Wan2.2 vae_decode_kernel must be true or false, got {self.vae_decode_kernel!r}.")
         if self.vae_decode_kernel and self.is_moe:
