@@ -63,9 +63,11 @@ def test_positronic_probe_refuses_missing_stack_or_wrong_warm_rows():
                 "meta": {"sample_seed_base": 1234, "chunk_rows": 24, "action_fps": 15.0,
                          "image_codecs": ["h264", "jpeg"], "compress_images": True}}, 0)
     command = {"robot_command": {"type": "cartesian_pos", "pose": np.arange(12, dtype=np.float32)},
-               "target_grip": 0.5, "timestamp": 0.0}
+               "target_grip": 0.5}
     with pytest.raises(ProtocolError, match="not 24"):
         _commands({"result": [command] * 21}, 24)
+    with pytest.raises(ProtocolError, match="unsupported timestamp"):
+        _commands({"result": [{**command, "timestamp": 0.0}] * 24}, 24)
 
 
 def test_cold_openpi_payload_passes_the_real_policy_parser():
@@ -170,7 +172,7 @@ def test_positronic_probe_checks_warm_reset_and_phase_latency(tmp_path):
             seen.append(obs)
             count = 21 if len(seen) in (1, 4) else 24
             command = {"robot_command": {"type": "cartesian_pos", "pose": np.arange(12, dtype=np.float32)},
-                       "target_grip": 0.5, "timestamp": 0.0}
+                       "target_grip": 0.5}
             await ws.send_bytes(pack({"result": [command] * count}))
         return ws
 
@@ -185,7 +187,7 @@ def test_positronic_probe_checks_warm_reset_and_phase_latency(tmp_path):
             await runner.cleanup()
 
     row = asyncio.run(run())
-    assert row["ok"] and row["n_chunks"] == 90 and len(row["_blob"]) == 90 * 14 * 4
+    assert row["ok"] and row["n_chunks"] == 90 and len(row["_blob"]) == 90 * 13 * 4
     assert [obs.get("reset_context", 0) for obs in seen] == [0, 0, 0, 1]
     assert all(obs["robot_state.ee_pose"].shape == (25, 7) for obs in seen)
     assert all(len(obs["image.exterior"][b"frames"]) == 25 for obs in seen)

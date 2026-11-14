@@ -152,11 +152,13 @@ def _commands(reply: Any, expected: int) -> np.ndarray:
         pose = np.asarray(command.get("pose"), dtype=np.float32) if isinstance(command, dict) else np.empty(0)
         if not isinstance(command, dict) or command.get("type") != "cartesian_pos" or pose.shape != (12,):
             raise ProtocolError("Positronic command needs a Cartesian pose of 12 floats")
+        if "timestamp" in row:
+            raise ProtocolError("Positronic v2 command contains an unsupported timestamp")
         try:
-            grip, timestamp = float(row["target_grip"]), float(row["timestamp"])
+            grip = float(row["target_grip"])
         except (KeyError, TypeError, ValueError) as exc:
-            raise ProtocolError("Positronic command needs grip and timestamp") from exc
-        vals = np.concatenate((pose, np.array([grip, timestamp], np.float32)))
+            raise ProtocolError("Positronic command needs grip") from exc
+        vals = np.concatenate((pose, np.array([grip], np.float32)))
         if not np.isfinite(vals).all():
             raise ProtocolError("Positronic command contains nonfinite values")
         values.append(vals)
