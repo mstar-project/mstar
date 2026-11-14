@@ -14,6 +14,7 @@ import torch
 from torch import nn
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
+from mstar.distributed.communication import CommGroup
 from mstar.model.components import quant_linear
 from mstar.model.components.block_scaled import MXFP8, NVFP4, Mxfp8Format, Nvfp4Format
 from mstar.model.components.diffusion.denoise_loop import DenoiseLoopSubmodule, StepBucket
@@ -34,6 +35,11 @@ from mstar.model.components.quant_linear import (
 from mstar.model.flux2_klein.components.transformer import QUANTIZABLE_LINEARS, Flux2DiT
 from mstar.model.flux2_klein.config import Flux2KleinConfig, Flux2TransformerConfig
 from mstar.model.flux2_klein.flux2_klein_model import Flux2KleinModel
+from mstar.model.minimax_h3.components.transformer import QUANTIZABLE_LINEARS as H3_QUANTIZABLE_LINEARS
+from mstar.model.minimax_h3.components.transformer import H3DiT
+from mstar.model.minimax_h3.config import H3TransformerConfig
+from mstar.model.minimax_h3.minimax_h3_model import H3Model
+from mstar.model.minimax_h3_image.minimax_h3_image_model import H3ImageModel
 from mstar.model.submodule_base import ModelInputsFromEngine
 from mstar.model.z_image.components.transformer import QUANTIZABLE_LINEARS as Z_QUANTIZABLE_LINEARS
 from mstar.model.z_image.components.transformer import ZImageDiT
@@ -229,6 +235,17 @@ def test_quant_linear_reads_a_strided_input_as_its_values(fmt):
     assert (out.float() - ref).norm() / ref.norm() < (0.05 if fmt is MXFP8 else 0.25)
 
 
+@pytest.mark.parametrize("kind", [ColumnParallelLinear, RowParallelLinear])
+def test_a_one_rank_parallel_linear_quantizes_to_its_own_product(kind):
+    torch.manual_seed(0)
+    linear = kind(CommGroup.trivial(), 256, 128, bias=False, dtype=torch.bfloat16)
+    nn.init.normal_(linear.weight, std=0.05)
+    x = torch.randn(70, 256, dtype=torch.bfloat16)
+    ref = linear(x).float()
+    out = QuantLinear.from_linear(linear, MXFP8)(x).float()
+    assert (out - ref).norm() / ref.norm() < 0.05
+
+
 def test_quant_linear_is_lora_capable_with_the_replaced_linears_target():
     fused = FusedColumnLinear(128, {"q": 128, "k": 128}, dtype=torch.bfloat16)
     nn.init.normal_(fused.weight, std=0.05)
@@ -257,10 +274,15 @@ def test_linear_kinds_declare_whether_they_take_a_format():
     replaced = nn.Linear(8, 8)
     replaced.forward = lambda x: x
     assert "replaced on the instance" in quant_capability(replaced).reason
-    # a TP linear says why not; the declaration reads no state
+    # a tensor-parallel linear says why not; on one rank (a sequence-parallel model's) the forward is the whole GEMM
+    one, two = CommGroup.trivial(), SimpleNamespace(rank=0, world_size=2)
     for kind in (ColumnParallelLinear, RowParallelLinear):
-        capability = quant_capability(kind.__new__(kind))
+        assert quant_capability(kind(one, 128, 256, bias=True)) == QuantCapability(True)
+        capability = quant_capability(kind(two, 128, 256, bias=True))
         assert capability.capable is False and "tensor-parallel" in capability.reason
+    # a column linear that hands its bias back, or computes a window of its rows, is more than its GEMM
+    assert not quant_capability(ColumnParallelLinear(one, 128, 256, bias=True, skip_bias_add=True)).capable
+    assert not quant_capability(ColumnParallelLinear(one, 128, 256, output_start=128)).capable
     assert quant_capability(QuantLinear(torch.zeros(16, 128, dtype=torch.bfloat16), None, MXFP8)).reason == (
         "already mxfp8"
     )
@@ -439,9 +461,35 @@ def test_z_image_declaration_classifies_every_linear_and_its_widths_pass_the_gua
     assert set(Z_QUANTIZABLE_LINEARS.input_amax) <= set(selected), "every amax entry names a candidate"
 
 
+@pytest.mark.parametrize(("variant", "overrides", "kinds"), [
+    ("MiniMax-H3", {}, ("attn.qkv_proj", "attn.out_proj", "mlp.fc1", "mlp.fc2")),
+    ("FastH3", {"vsa_gate": True}, ("attn.qkv_proj", "attn.out_proj", "attn.gate_compress", "mlp.fc1", "mlp.fc2")),
+    ("MiniMax-H3-Image", {"audio_enabled": False, "num_output_heads": 6},
+     ("attn.qkv_proj", "attn.out_proj", "mlp.fc1", "mlp.fc2")),
+], ids=["h3", "fasth3", "h3_image"])
+def test_h3_declaration_classifies_every_linear_and_its_widths_pass_the_guards(variant, overrides, kinds):
+    with torch.device("meta"):
+        dit = H3DiT(H3TransformerConfig(num_layers=2, **overrides))
+    linears = {name: m for name, m in dit.named_modules() if quant_capability(m) is not None}
+    selected = [name for name in linears if H3_QUANTIZABLE_LINEARS.selected(name)]
+    assert sorted(selected) == sorted(f"blocks.{i}.{kind}" for i in range(2) for kind in kinds)
+    # the AdaLN projections (a table per process) and the fp32 patch, time and output layers stay
+    assert {name.split(".")[0] for name in set(linears) - set(selected)} <= {
+        "blocks", "video_patch_proj", "audio_patch_proj", "time_embedder", "final_layer",
+    }
+    assert all(name.endswith("adaln_proj.linear") for name in set(linears) - set(selected) if name.startswith("blocks"))
+    for name in selected:
+        for fmt in (MXFP8, NVFP4):
+            fmt.check(*linears[name].weight.shape, torch.bfloat16)
+
+
 def test_knobs_default_to_bf16_and_refuse_a_typo():
     assert Flux2KleinModel(skip_weight_loading=True).linear_dtype == "bf16"
     assert ZImageModel(skip_weight_loading=True).linear_dtype == "bf16"
+    assert H3Model(skip_weight_loading=True).linear_dtype == "bf16"
+    assert H3ImageModel(skip_weight_loading=True).linear_dtype == "bf16"
+    with pytest.raises(ValueError, match="linear_dtype must be one of"):
+        H3Model(skip_weight_loading=True, linear_dtype="fp4")
     with pytest.raises(ValueError, match="linear_dtype must be one of"):
         Flux2KleinModel(skip_weight_loading=True, linear_dtype="mxfp4")
 

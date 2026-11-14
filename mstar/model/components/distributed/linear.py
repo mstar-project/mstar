@@ -152,6 +152,9 @@ class ColumnParallelLinear(nn.Module, LoraCapable):
         return output_parallel
 
     def quant_capability(self) -> QuantCapability:
+        if self.tp_size == 1 and not self.skip_bias_add and not self._local_output_start:
+            # one rank holds the whole weight and the forward is its GEMM (a sequence-parallel model)
+            return QuantCapability(True)
         return QuantCapability(False, (
             "a tensor-parallel linear gathers or splits around its own GEMM; a format would apply per shard "
             "([N / tp, K] here) inside that forward, which takes no format yet"
@@ -520,6 +523,9 @@ class RowParallelLinear(nn.Module, LoraCapable):
         return output
 
     def quant_capability(self) -> QuantCapability:
+        if self.tp_size == 1 and not self.skip_bias_add:
+            # one rank holds the whole weight and the forward is its GEMM (a sequence-parallel model)
+            return QuantCapability(True)
         return QuantCapability(False, (
             "a tensor-parallel linear all-reduces its partial GEMM; a format would apply per shard ([N, K / tp] "
             "here, K / tp meeting the format's K alignment) inside that forward, which takes no format yet"

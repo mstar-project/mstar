@@ -30,6 +30,7 @@ from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import Model, ProcessPromptOutput, TensorAndMetadata, WalkStep
 from mstar.model.components.diffusion.attention import refuse_attention_backend_kwarg
 from mstar.model.components.diffusion.image_io import OUTPUT_FORMAT_KWARGS, encode_image, image_output_format
+from mstar.model.components.quant_linear import apply_linear_dtype, check_linear_dtype, check_linear_keep
 from mstar.model.media_limits import PILLOW_IMAGE_FORMATS, check_image_size, decoding_upload, open_upright_image
 from mstar.model.minimax_h3.config import (
     DENOISE_LOOP,
@@ -118,6 +119,8 @@ class H3ImageModel(Model):
         text_cache_entries: int = 0,
         capture_sizes: list[list[int]] | None = None,
         capture_text_rows: int = 512,
+        linear_dtype: str = "bf16",
+        linear_keep_bf16: list[str] | None = None,
         **kwargs,
     ):
         refuse_attention_backend_kwarg(kwargs)
@@ -158,6 +161,9 @@ class H3ImageModel(Model):
         if isinstance(text_cache_entries, bool) or not isinstance(text_cache_entries, int) or text_cache_entries < 0:
             raise ValueError(f"text_cache_entries must be a non-negative int, got {text_cache_entries!r}")
         self.text_cache_entries = text_cache_entries
+        # opt-in, lossy: the DiT blocks' GEMMs in a low-precision format (as MiniMax-H3's)
+        self.linear_dtype = check_linear_dtype(linear_dtype)
+        self.linear_keep_bf16 = check_linear_keep(linear_keep_bf16)
         self._snapshot = None
         self._config: H3ImageConfig | None = None
         self.tokenizer = None
@@ -505,8 +511,13 @@ class H3ImageModel(Model):
         if node_name == VAE_ENCODER_NODE:
             return H3ImageEncoderSubmodule(weight_loader.build_image_encoder(config, snapshot, device))
         if node_name == DIT_NODE:
+            from mstar.model.minimax_h3.components.transformer import QUANTIZABLE_LINEARS
+
+            transformer = weight_loader.build_transformer(config, snapshot, device, comm_group=tp_group)
+            apply_linear_dtype(transformer, self.linear_dtype, QUANTIZABLE_LINEARS, self.linear_keep_bf16,
+                               "MiniMax-H3-Image transformer")
             return H3ImageDenoiseSubmodule(
-                weight_loader.build_transformer(config, snapshot, device, comm_group=tp_group),
+                transformer,
                 config, loop_name=DENOISE_LOOP, max_batch_size=1, compile_blocks=self.compile,
                 row_bucket=self.row_bucket, capture_buckets=self.capture_buckets(),
             )

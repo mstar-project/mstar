@@ -34,8 +34,19 @@ from mstar.model.components.distributed.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
+from mstar.model.components.quant_linear import QuantizableLinears
 from mstar.model.minimax_h3.components.qk_norm_rope import qk_norm_rope
 from mstar.model.minimax_h3.config import DIT_ROWS, NUM_MODALITIES, PROMPT_ROWS, H3TransformerConfig
+
+# ``linear_dtype``: the blocks' GEMMs (fused q/k/v, the output projection, both feed-forward linears and a VSA
+# checkpoint's compression gate) may go low precision. The AdaLN projections (computed once a process from the
+# step grid) and the fp32 patch, time and output layers stay as the checkpoint has them.
+QUANTIZABLE_LINEARS = QuantizableLinears(
+    candidates=("blocks.*.attn.qkv_proj", "blocks.*.attn.out_proj", "blocks.*.attn.gate_compress",
+                "blocks.*.mlp.fc1", "blocks.*.mlp.fc2"),
+    keep_bf16=("blocks.*.adaln_proj.linear", "video_patch_proj", "audio_patch_proj", "time_embedder.*",
+               "final_layer.*", "final_layer.adaln_proj.linear"),
+)
 
 
 class RopeTable(NamedTuple):

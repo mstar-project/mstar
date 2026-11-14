@@ -36,6 +36,7 @@ from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import Model, TensorAndMetadata, WalkStep
 from mstar.model.components.diffusion.attention import dit_entry, refuse_attention_backend_kwarg
 from mstar.model.components.diffusion.step_cache import step_cache_policy
+from mstar.model.components.quant_linear import apply_linear_dtype, check_linear_dtype, check_linear_keep
 from mstar.model.components.video_encode import Mp4Encoding, encode_mp4
 from mstar.model.media_limits import PILLOW_IMAGE_FORMATS, check_image_size
 from mstar.model.minimax_h3.components.layout import H3Layout
@@ -220,6 +221,8 @@ class H3Model(Model):
         step_cache: dict | None = None,
         distilled_checkpoint: str | None = None,
         stream_decode: bool = False,
+        linear_dtype: str = "bf16",
+        linear_keep_bf16: list[str] | None = None,
         **kwargs,
     ):
         refuse_attention_backend_kwarg(kwargs)
@@ -255,6 +258,10 @@ class H3Model(Model):
         self.step_cache = step_cache_policy(step_cache, MAG_RATIOS)
         # a few-step distilled release (hub id or path) whose DiT replaces FL2VA's (H3Distilled)
         self.distilled_checkpoint = distilled_checkpoint
+        # opt-in, lossy: the DiT blocks' GEMMs in a low-precision format (mxfp8 / nvfp4 on Blackwell; see
+        # docs/models.rst), with linear_keep_bf16 keeping more of them bf16
+        self.linear_dtype = check_linear_dtype(linear_dtype)
+        self.linear_keep_bf16 = check_linear_keep(linear_keep_bf16)
         if distilled_checkpoint is not None and self.step_cache is not None:
             raise ValueError("MiniMax-H3 step_cache's tables are a 50-point dense run's; not for a distilled DiT")
         self._snapshot = None
@@ -727,9 +734,14 @@ class H3Model(Model):
         if node_name == VAE_ENCODER_NODE:
             return H3VaeEncoderSubmodule(weight_loader.build_keyframe_encoder(config, snapshot, device))
         if node_name == DIT_NODE:
+            from mstar.model.minimax_h3.components.transformer import QUANTIZABLE_LINEARS
+
+            transformer = weight_loader.build_transformer(config, snapshot, device, comm_group=tp_group,
+                                                          dit_source=config.dit_source)
+            apply_linear_dtype(transformer, self.linear_dtype, QUANTIZABLE_LINEARS, self.linear_keep_bf16,
+                               "MiniMax-H3 transformer")
             return H3DenoiseSubmodule(
-                weight_loader.build_transformer(config, snapshot, device, comm_group=tp_group,
-                                                dit_source=config.dit_source),
+                transformer,
                 config, loop_name=DENOISE_LOOP,
                 max_batch_size=1, compile_blocks=self.compile, row_bucket=self.row_bucket,
                 step_cache=self.step_cache,

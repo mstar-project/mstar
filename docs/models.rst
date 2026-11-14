@@ -2564,6 +2564,77 @@ timesteps and the conditioner (FastH3's token refiner) are bit-identical, and ea
 teacher-forced DiT step is 1.4-3.8% rel L2 off, where the base port on the same B300 and tree is
 1.1-3.4% off (so not bit-identical on that GPU either).
 
+**Low-precision linears (opt-in, lossy).** ``linear_dtype: mxfp8`` or ``nvfp4`` runs the DiT blocks'
+GEMMs (fused q/k/v, output projection, both feed-forward linears and FastH3's VSA gates) in that format
+on Blackwell (see FLUX.2 klein's ``linear_dtype`` below for the formats). The AdaLN projections (one
+table per process) and the fp32 patch, time and output layers stay; ``linear_keep_bf16`` keeps more.
+The DiT's linears take a format only where one rank holds the whole weight (every shipped config: SP
+splits rows, not weights); a tensor-parallel linear is refused at load. On one B300 (1344x768x124;
+quality against the bf16 clips of the same seeds, which are bit-identical across boots; FastH3 two
+rounds on 8 prompts, the base two rounds, quality on 4):
+
+.. list-table::
+   :header-rows: 1
+
+   * - model
+     - ``linear_dtype``
+     - s/clip, 1 at a time
+     - clips/min, 4 at a time
+     - PSNR (dB) / SSIM / LPIPS / audio SNR (dB) against bf16
+   * - FastH3 + VSA
+     - bf16
+     - 17.5 / 17.8
+     - 3.55
+     - another seed: 9.9 / 0.28 / 0.70 / -4.9
+   * -
+     - ``mxfp8``
+     - 13.7 / 13.5 (-22%)
+     - 4.61 (+30%)
+     - 14.2 / 0.43 / 0.45 / 1.6
+   * -
+     - ``nvfp4``
+     - 11.8 / 11.7 (-33%)
+     - 5.43 (+53%)
+     - 11.9 / 0.33 / 0.61 / -1.0
+   * -
+     - SGLang bf16 (same GPU and seeds)
+     - 17.8
+     - 3.37
+     - 15.4 / 0.47 / 0.41 / -5.8
+   * -
+     - SGLang ``--quantization mxfp8``
+     - 14.4
+     - 4.21
+     - 13.7 / 0.42 / 0.48 / 3.0 (against its bf16)
+   * - base (FL2VA, 50 points)
+     - bf16
+     - 119.9 / 120.1
+     - 0.50
+     - another seed: 11.1 / 0.42 / 0.66 / -2.7
+   * -
+     - ``mxfp8``
+     - 98.5 / 99.5 (-18%)
+     - 0.61 (+21%)
+     - 18.4 / 0.71 / 0.27 / 6.0
+   * -
+     - ``nvfp4``
+     - 88.4 / 88.4 (-26%)
+     -
+     - 13.9 / 0.54 / 0.52 / 1.1
+   * -
+     - SGLang bf16 / ``--quantization fp8``
+     - 120.6 / 109.8
+     -
+     - bf16 against M*'s: 20.3 / 0.76 / 0.25 / -6.6; fp8 against its bf16: 18.6 / 0.72 / 0.28 / 4.8
+
+The distilled 8 steps amplify any rounding: FastH3's bf16 DiT run eagerly is already 17.3 dB / 0.54 /
+0.30 / 7.6 from the compiled one. MXFP8 keeps the clip with its details moved (on FastH3 as far from
+M*'s bf16 clip as SGLang's own bf16 clip is); NVFP4 changes more of it. Keeping the attention linears
+bf16 under MXFP8 gains FastH3 0.9 dB at 15.4 s a clip, keeping ``mlp.fc2`` 0.3 dB at 14.4 s. NVFP4's
+``mlp.fc2`` inputs reach 303k on FastH3 (above the 2688 a unit input scale holds, in 38 of 50
+blocks), but declaring the measured range per block (``input_amax``) moved its clips by 0.1 dB, so
+the declaration has none.
+
 The attention kernel is a resource's setting: ``backend: sdpa`` on the ``dit_attn`` and
 ``refiner_attn`` resources runs the reference's kernel. Without it the GPU's ``ragged_attention``
 table picks the kernel, and FlashInfer runs where no table covers the GPU. On a B300 (``sm_103``)
@@ -2677,6 +2748,39 @@ text-to-image at 1024², 2048² and 4096² and edits with one and four reference
 H200s, images are 19.9-36.8 dB from diffusers', where diffusers on another SDPA kernel moves
 21.3 dB (the four-reference edit, which M* serves 1.4 dB under that) to 38.5 dB (a
 one-reference edit) from itself: the six-step sampler amplifies kernel differences.
+
+**Low-precision linears (opt-in, lossy):** ``linear_dtype`` as ``minimax_h3``'s, on the same DiT. On
+one B300 (quality on 8 prompts against the bf16 images of the same seeds; another seed is 9.6 dB /
+0.26 / 0.72):
+
+.. list-table::
+   :header-rows: 1
+
+   * - size, config
+     - ``linear_dtype``
+     - s/image, 1 at a time
+     - images/s, 4 at a time
+     - PSNR (dB) / SSIM / LPIPS against bf16
+   * - 2048² (the default), ``minimax_h3_image_1gpu.yaml``
+     - bf16 / ``mxfp8``
+     - 1.11-1.14 / 0.79 (-30%)
+     -
+     - 17.8 / 0.79 / 0.25 (4 prompts)
+   * - 1024², ``capture_sizes: [[1024, 1024]]``
+     - bf16 / ``mxfp8`` / ``nvfp4``
+     - 0.35 / 0.26 (-25%) / 0.24 (-30%)
+     - 3.37 / 4.71 / 5.34
+     - 19.8 / 0.78 / 0.18; 15.1 / 0.58 / 0.38
+   * - 1024², eager step
+     - bf16 / ``mxfp8`` / ``nvfp4``
+     - 0.33-0.34 / 0.43-0.44 / 0.49-0.50
+     - 3.36-3.48 / 2.53-2.56 / 2.18-2.24
+     -
+
+At 1024² the step's GEMMs are small (1,408 rows) and an eager step issues each linear's quantizer and
+GEMM from Python, which costs more than the faster GEMM saves: capture the size (the SP2 config's
+``capture_sizes``) before choosing a format there. SGLang's ``--quantization mxfp8`` on the same GPU
+takes 0.85 s an image at 2048² (its bf16 1.18 s).
 
 Seconds per image, one request at a time, each engine on the same H200s (M* on torch
 2.11.0+cu128 and FlashInfer 0.7.2; text-to-image, seed 42, median of 3 after 2 warmups;
