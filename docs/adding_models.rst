@@ -472,8 +472,8 @@ node skips the read on one walk: ``Array.nodes`` does not identify which walks
 use it. The conductor refuses missing or malformed lengths before dispatch.
 
 Within-step expert attention uses the same array and walk rule with
-``ExpertSelf(chunk_len, future_per_chunk)`` or
-``ExpertCross(chunk_len, future_per_chunk, tokens_per_frame, window_frames)``.
+``ExpertSelf(chunk_len, future_per_chunk=...)`` or
+``ExpertCross(chunk_len, future_per_chunk=..., tokens_per_frame=..., window_frames=...)``.
 The typed prompt layouts are ``Layout(expert_self={read: ExpertSelfLayout(num_chunks=)})``
 and ``Layout(expert_cross={read: ExpertCrossLayout(num_chunks=, global_len=,
 clean_frames=, noised_frames=)})``. A walk can instead set
