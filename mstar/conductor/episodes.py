@@ -15,7 +15,7 @@ from mstar.model.base import EpisodeView
 
 
 class EpisodeCapacityError(Exception):
-    """All candidate rows are occupied by calls that cannot be evicted yet."""
+    """No slot is free for this call's worker placement."""
 
 
 class EpisodeCallLimitError(ValueError):

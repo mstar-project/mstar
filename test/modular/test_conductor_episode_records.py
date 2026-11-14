@@ -263,11 +263,12 @@ def test_close_before_preprocessing_finishes_rejects_late_admission():
         episodes.can_admit("robot-a")
 
 
-def test_eviction_sends_end_before_reusing_a_workers_slot():
+def test_recent_robot_keeps_its_slot_until_idle_timeout_even_for_idless_calls():
     conductor = object.__new__(Conductor)
     conductor._episode_records = EpisodeRecords()
     conductor._episode_slots = EpisodeSlots(1)
     conductor._episode_evictions = MetricCounter(catalog.EPISODE_EVICTIONS)
+    conductor._episode_idle_timeout_s = 10
     conductor.waiting_queue = []
     workers = {"w0"}
     conductor._episode_slots.reserve("episode:old", workers)
@@ -276,13 +277,22 @@ def test_eviction_sends_end_before_reusing_a_workers_slot():
     sent = []
     conductor.communicator = SimpleNamespace(send=lambda worker, msg: sent.append((worker, msg)))
 
-    assert conductor._reserve_episode_slot("episode:new", workers) == 0
+    with pytest.raises(EpisodeCapacityError):
+        conductor._reserve_episode_slot("request:cold-openpi", workers)
+    with pytest.raises(EpisodeCapacityError):
+        conductor._reserve_episode_slot("episode:new", workers)
+    assert sent == []
+    assert conductor._episode_records.view("old").held["frames"] == 21
+    last_end = conductor._episode_records._records["old"].last_end
+    assert not conductor._expire_episode_slots(last_end + 9)
+    assert conductor._expire_episode_slots(last_end + 11)
+    assert conductor._reserve_episode_slot("request:cold-openpi", workers) == 0
     sent.append(("w0", "next NEW_REQUEST"))
     assert sent[0][1].body.episode_id == "old"
     assert sent[0][1].body.episode_slot == 0
     assert sent[1][1] == "next NEW_REQUEST"
-    assert conductor._episode_records.view("old").cold == "evicted"
-    assert conductor._episode_evictions.snapshot().label_values == [["pressure"]]
+    assert conductor._episode_records.view("old").cold == "idle"
+    assert conductor._episode_evictions.snapshot().label_values == [["idle"]]
     assert conductor._episode_evictions.snapshot().values == [1.0]
 
 
@@ -290,6 +300,7 @@ def test_failed_end_send_does_not_reassign_a_live_row():
     conductor = object.__new__(Conductor)
     conductor._episode_records = EpisodeRecords()
     conductor._episode_slots = EpisodeSlots(1)
+    conductor._episode_idle_timeout_s = 10
     conductor.waiting_queue = []
     workers = {"w0"}
     conductor._episode_slots.reserve("episode:old", workers)
@@ -300,8 +311,9 @@ def test_failed_end_send_does_not_reassign_a_live_row():
         raise OSError("outbox closed")
 
     conductor.communicator = SimpleNamespace(send=fail_send)
+    last_end = conductor._episode_records._records["old"].last_end
     with pytest.raises(OSError, match="outbox closed"):
-        conductor._reserve_episode_slot("episode:new", workers)
+        conductor._expire_episode_slots(last_end + 11)
     assert conductor._episode_slots.reserve("episode:new", workers) is None
     assert conductor._episode_records.view("old").held["frames"] == 21
 
@@ -378,11 +390,12 @@ def test_multireplica_pressure_has_no_partial_eviction_without_a_common_slot():
     assert conductor._episode_records.view("idle").held["frames"] == 21
 
 
-def test_multireplica_pressure_evicts_all_blockers_of_a_common_slot():
+def test_multireplica_slots_reuse_only_after_both_idle_timeouts():
     conductor = object.__new__(Conductor)
     conductor._episode_records = EpisodeRecords()
     conductor._episode_slots = EpisodeSlots(1)
     conductor._episode_evictions = MetricCounter(catalog.EPISODE_EVICTIONS)
+    conductor._episode_idle_timeout_s = 10
     conductor.waiting_queue = []
     for episode_id, worker in (("old-a", "w0"), ("old-b", "w1")):
         conductor._episode_slots.reserve(f"episode:{episode_id}", {worker})
@@ -391,6 +404,11 @@ def test_multireplica_pressure_evicts_all_blockers_of_a_common_slot():
     sent = []
     conductor.communicator = SimpleNamespace(send=lambda worker, msg: sent.append((worker, msg)))
 
+    with pytest.raises(EpisodeCapacityError):
+        conductor._reserve_episode_slot("episode:new", {"w0", "w1"})
+    assert sent == []
+    last_end = max(record.last_end for _, record in conductor._episode_records.idle())
+    assert conductor._expire_episode_slots(last_end + 11)
     assert conductor._reserve_episode_slot("episode:new", {"w0", "w1"}) == 0
     assert {(worker, msg.body.episode_id) for worker, msg in sent} == {
         ("w0", "old-a"), ("w1", "old-b"),
