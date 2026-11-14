@@ -89,15 +89,23 @@ def window_frames(num_tokens: int, last: bool) -> int:
 
 @dataclass(frozen=True)
 class CacheCapacity:
-    """Slot sizes for voice prompts of up to ``prompt_tokens`` tokens (``P``). The 50 Hz
-    caches peak at ``2P + KEEP_RECENT`` plus a last window of ``2 * 27`` frames; the 25 Hz
-    one at half the kept frames plus 27 tokens."""
+    """Slot sizes for voice prompts of up to ``prompt_tokens`` tokens (``P``). The DiT's
+    caches peak at ``2P + KEEP_RECENT`` plus a last window of ``2 * 27`` frames. The
+    conformer's are cut the same way (the 25 Hz one at half the kept frames plus 27 tokens),
+    or, with ``reply_tokens`` (``Token2WavStreaming.conformer_reply_tokens``), hold that
+    many 25 Hz tokens of reply after the prompt."""
 
     prompt_tokens: int
+    reply_tokens: int | None = None
 
     @property
     def enc_25hz(self) -> int:
-        return self.prompt_tokens + KEEP_RECENT // UP_RATE + MAX_LAST_TOKENS
+        kept = KEEP_RECENT // UP_RATE if self.reply_tokens is None else self.reply_tokens
+        return self.prompt_tokens + kept + MAX_LAST_TOKENS
+
+    @property
+    def enc_frames_50hz(self) -> int:
+        return UP_RATE * self.enc_25hz
 
     @property
     def frames_50hz(self) -> int:
@@ -138,7 +146,7 @@ class Token2WavState:
         return cls(
             enc_cnn=z(1, TOKEN_DIM, 2 + 2 * UP_RATE),
             enc_kv1=z(ENC_BLOCKS, 1, ENC_HEADS, c1, 2 * ENC_HEAD_DIM),
-            enc_kv2=z(ENC_UP_BLOCKS, 1, ENC_HEADS, c2, 2 * ENC_HEAD_DIM),
+            enc_kv2=z(ENC_UP_BLOCKS, 1, ENC_HEADS, capacity.enc_frames_50hz, 2 * ENC_HEAD_DIM),
             dit_cnn=z(N_TIMESTEPS, DIT_DEPTH, 2, 2 * DIT_HIDDEN, 2),
             dit_kv=z(N_TIMESTEPS, DIT_DEPTH, 2, DIT_HEADS, c2, 2 * DIT_HEAD_DIM),
             hift_mel=z(1, MEL_BINS, HIFT_MEL_CACHE),
@@ -231,6 +239,9 @@ class CacheFamily(NamedTuple):
     # the voice's cache in stream order, ``[layers, rows, H, L, 2d]``
     source: Callable[[Token2WavVoice], torch.Tensor]
     reverse_step_order: bool = False
+    # whether its attention has relative positions (the conformer's): a step's retained
+    # keys then have to fit the position table (``flow.band_fits``)
+    positional: bool = False
 
     def position(self, voice_tokens: int, written_tokens: int) -> tuple[int, int]:
         """``(source_len, written)`` once a request's windows have added ``written_tokens``
@@ -247,12 +258,60 @@ def window_tokens(num_tokens: int, last: bool) -> int:
     return 0 if last else num_tokens - PRE_LOOKAHEAD
 
 
-CACHE_FAMILIES = {
-    "enc1": CacheFamily(ENC_BLOCKS, 1, ENC_HEADS, ENC_HEAD_DIM, 1, _enc1_retention, _enc1_source),
-    "enc2": CacheFamily(ENC_UP_BLOCKS, 1, ENC_HEADS, ENC_HEAD_DIM, UP_RATE, _enc2_retention, _enc2_source),
-    "dit": CacheFamily(N_TIMESTEPS * DIT_DEPTH, 2, DIT_HEADS, DIT_HEAD_DIM, UP_RATE, _dit_retention,
-                       _dit_source, reverse_step_order=True),
-}
+def _whole_stream(written: int) -> Callable[[int], SinkWindow]:
+    """Keep the source and the first ``written`` entries after it: a cache never cut, up to a cap."""
+    return lambda source_len: SinkWindow(source_len + written, 0)
+
+
+def _families(enc1: Callable[[int], SinkWindow], enc2: Callable[[int], SinkWindow]) -> dict[str, CacheFamily]:
+    return {
+        "enc1": CacheFamily(ENC_BLOCKS, 1, ENC_HEADS, ENC_HEAD_DIM, 1, enc1, _enc1_source, positional=True),
+        "enc2": CacheFamily(ENC_UP_BLOCKS, 1, ENC_HEADS, ENC_HEAD_DIM, UP_RATE, enc2, _enc2_source, positional=True),
+        "dit": CacheFamily(N_TIMESTEPS * DIT_DEPTH, 2, DIT_HEADS, DIT_HEAD_DIM, UP_RATE, _dit_retention,
+                           _dit_source, reverse_step_order=True),
+    }
+
+
+# MiniCPM-o's: every cache cut. Which caches a model's reference cuts is
+# ``Token2WavStreaming.cache_families``; the family names (and so the resource keys) are fixed.
+CACHE_FAMILIES = _families(_enc1_retention, _enc2_retention)
+
+
+@dataclass(frozen=True)
+class Token2WavStreaming:
+    """How a model's reference streams speech codes through token2wav: the knobs on which
+    MiniCPM-o's (``minicpmo-utils``) and Step-Audio2's (``token2wav.py``,
+    ``examples-vllm-stream.py``) streaming differ. The defaults are MiniCPM-o's."""
+
+    # The codes after a voice's prompt tokens when its caches are set up, which the flow's
+    # lookahead reads: 3 silence codes, or the prompt's own first 3 (Step-Audio2's
+    # ``set_stream_cache``, ``token2wav.py:106-108``).
+    prompt_lookahead: bool = False
+    # Silence codes before a reply's first window (MiniCPM-o's ``streaming_generate``);
+    # Step-Audio2 starts on the reply's own codes.
+    lead_silence: int = LEAD_SILENCE
+    # Whether a first window's samples start with ``HIFT_TAIL`` zeros where a later
+    # window's cross-faded tail would be (MiniCPM-o). Step-Audio2's first window returns
+    # its own samples less the held-back tail (``token2wav.py:152-162``).
+    first_window_zeros: bool = True
+    # None: the conformer's caches are cut as the DiT's are (MiniCPM-o). Set, they are never
+    # cut, as Step-Audio2's ``stream`` cuts only ``estimator_att_cache``
+    # (``token2wav.py:137-141``), and hold up to this many 25 Hz tokens of a reply: a reply
+    # past it attends only its first that-many tokens there, so the model caps replies below.
+    conformer_reply_tokens: int | None = None
+
+    def __post_init__(self):
+        if self.conformer_reply_tokens is not None and self.conformer_reply_tokens <= 0:
+            raise ValueError(f"conformer_reply_tokens must be positive, got {self.conformer_reply_tokens}")
+
+    def cache_families(self) -> dict[str, CacheFamily]:
+        n = self.conformer_reply_tokens
+        if n is None:
+            return CACHE_FAMILIES
+        return _families(_whole_stream(n), _whole_stream(UP_RATE * n))
+
+    def capacity(self, prompt_tokens: int) -> CacheCapacity:
+        return CacheCapacity(prompt_tokens, self.conformer_reply_tokens)
 
 
 class SlotRows(NamedTuple):
@@ -441,8 +500,9 @@ def fade_in_out(fade_in: torch.Tensor, fade_out: torch.Tensor, window: torch.Ten
 
 
 class Token2Wav(nn.Module):
-    def __init__(self):
+    def __init__(self, streaming: Token2WavStreaming | None = None):
         super().__init__()
+        self.streaming = streaming or Token2WavStreaming()
         self.flow = Token2WavFlow()
         self.hift = StepAudioHiFT()
         self.voice_encoder = VoicePromptEncoder()
@@ -450,18 +510,22 @@ class Token2Wav(nn.Module):
 
     @torch.inference_mode()
     def prepare_voice(self, prompt: VoicePrompt) -> Token2WavVoice:
-        """``set_stream_cache``: the flow over the prompt tokens + 3 silence tokens with the
-        prompt mel as condition, keeping only the caches. Runs once per bundled voice at
-        load, on ``DenseKV`` (see there for why that is not a resource)."""
+        """``set_stream_cache``: the flow over the prompt tokens and a lookahead
+        (``Token2WavStreaming.prompt_lookahead``) with the prompt mel as condition, keeping only
+        the caches. Runs once per bundled voice at load, on ``DenseKV`` (see there for why that
+        is not a resource)."""
         device = self.speech_window.device
         tokens = prompt.tokens.to(device)
         p = tokens.shape[1]
         spk = self.flow.project_speaker(prompt.spk_emb.to(device))
-        state = Token2WavState.allocate(CacheCapacity(p), device)
+        state = Token2WavState.allocate(self.streaming.capacity(p), device)
         state.prompt_frames = UP_RATE * p
-        silence = torch.full((1, LEAD_SILENCE), SILENCE_CODE, dtype=tokens.dtype, device=device)
+        if self.streaming.prompt_lookahead:
+            lookahead = tokens[:, :PRE_LOOKAHEAD]
+        else:
+            lookahead = torch.full((1, PRE_LOOKAHEAD), SILENCE_CODE, dtype=tokens.dtype, device=device)
         self.flow(
-            torch.cat([tokens, silence], dim=1), spk, prompt.mel.to(device).transpose(1, 2).contiguous(), False,
+            torch.cat([tokens, lookahead], dim=1), spk, prompt.mel.to(device).transpose(1, 2).contiguous(), False,
             state.enc_cnn, state.dit_cnn, state.kv_caches(),
         )
         state.enc_len1, state.enc_len2, state.dit_len = p, UP_RATE * p, UP_RATE * p
@@ -553,7 +617,7 @@ class Token2Wav(nn.Module):
         if last:
             return speech
         state.set("hift_speech", speech[:, -HIFT_TAIL:])
-        if first:
+        if first and self.streaming.first_window_zeros:
             return torch.cat([speech.new_zeros(speech.shape[0], HIFT_TAIL), speech[:, :-HIFT_TAIL]], dim=1)
         return speech[:, :-HIFT_TAIL]
 
@@ -607,13 +671,17 @@ def _fold_weight_norm_on(state: dict[str, torch.Tensor], device: torch.device) -
     return out
 
 
-def load_token2wav(asset_dir: str, device: torch.device | str = "cuda", noise: torch.Tensor | None = None) -> Token2Wav:
+def load_token2wav(
+    asset_dir: str, device: torch.device | str = "cuda", noise: torch.Tensor | None = None,
+    streaming: Token2WavStreaming | None = None,
+) -> Token2Wav:
     """Build ``Token2Wav`` from MiniCPM-o's ``assets/token2wav`` (``flow.pt``, ``hift.pt``,
     ``speech_tokenizer_v2_25hz.onnx``, ``campplus.onnx``); raises if any parameter is left
     unfilled. ``noise`` is the flow's ``[1, 80, 30000]`` noise buffer; without it one is
-    drawn from a fixed seed (the reference draws it from the global RNG at construction)."""
+    drawn from a fixed seed (the reference draws it from the global RNG at construction).
+    ``streaming``: the model's reference's streaming knobs (MiniCPM-o's by default)."""
     device = torch.device(device)
-    model = Token2Wav()
+    model = Token2Wav(streaming)
     flow = torch.load(f"{asset_dir}/flow.pt", map_location="cpu", weights_only=True)
     _load_exact(model.flow, {_remap_flow(k): v for k, v in flow.items()}, "flow.pt")
     model.to(device)

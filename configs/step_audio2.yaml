@@ -1,0 +1,40 @@
+model: "step_audio2"
+# The checkpoint's 16384 positions; a spoken reply is capped far below (2048 tokens).
+max_seq_len: 16384
+model_kwargs:
+  # Reference clips a spoken reply's `voice` names, by file stem: the GitHub repo's
+  # assets/default_female.wav and default_male.wav (Apache-2.0), fetched at a pinned commit at
+  # first start when the directory is empty (not with HF_HUB_OFFLINE set).
+  voices_dir: ~/.cache/mstar/step_audio2_voices
+# One GPU (the checkpoint is ~17 GB in bf16), two workers: the audio tower runs once per
+# request and then idles, so it shares the LLM's worker; the vocoder gets its own loop, as
+# its windows take tens of milliseconds and would hold up the LLM's decode steps. Their
+# kernels overlap as clients of one MPS daemon, rather than time-slicing the GPU.
+rank_devices: {0: 0, 1: 0}
+mps: true
+max_concurrent_requests: 32
+# Text and spoken replies decode in one step (`decode_mixed`) rather than taking turns.
+speculation_mixes_walks: {LLM: true}
+node_groups:
+  - node_names: [audio_encoder, LLM]
+    ranks: [0]
+  - node_names: [Token2Wav]
+    ranks: [1]
+resources:
+  # 128-token pages; the LLM's 56 KiB/token: 1024 pages (131k tokens) are 7 GiB.
+  llm_kv:
+    max_num_pages: 1024
+  # The vocoder holds a slot in each of these per spoken reply, so they cap the replies
+  # being voiced at once; a reply waits for slots before its first audio. A slot is 284 MiB
+  # of t2w_dit_kv (with the bundled voices; it grows with the longest), 64 MiB of
+  # t2w_enc2_kv and 48 MiB of t2w_enc1_kv (the conformer's caches hold the whole reply) and
+  # 1.3 MiB of t2w_state, about 0.39 GiB. t2w_state has one more, its sink; startup refuses
+  # counts that disagree.
+  t2w_state:
+    max_slots: 17
+  t2w_enc1_kv:
+    max_slots: 16
+  t2w_enc2_kv:
+    max_slots: 16
+  t2w_dit_kv:
+    max_slots: 16

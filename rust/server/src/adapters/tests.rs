@@ -100,6 +100,7 @@ fn each_ported_python_adapter_class_is_found_by_its_name_once() {
     // the surfaces of a few classes, as their Python attributes declare them
     assert_eq!(surfaces(&Bagel), [true, false, true, false, false]);
     assert_eq!(surfaces(&Qwen3Omni), [true, true, false, false, false]);
+    assert_eq!(surfaces(&StepAudio2), [true, false, false, false, false]);
     assert_eq!(surfaces(&Qwen3_5), [true, false, false, false, false]);
     assert_eq!(surfaces(&Cosmos3), [false, false, true, true, false]);
     assert_eq!(surfaces(&Cosmos3Edge), [true, false, true, true, false]);
@@ -210,6 +211,29 @@ fn a_qwen3_5_chat_maps_the_standard_fields_and_passes_the_rest_through() {
         "temperature": 0.7, "top_p": 0.9, "seed": 5, "enable_thinking": false,
         "repetition_penalty": 1.1, "max_output_tokens": 8,
     }), "an explicit extra_body max_output_tokens wins over max_tokens");
+}
+
+#[test]
+fn a_step_audio2_chat_samples_with_the_plain_keys_and_refuses_a_clip_to_clone() {
+    let req: ChatCompletionRequest = serde_json::from_str(
+        r#"{"messages":[{"role":"user","content":"Hi."}],"modalities":["text","audio"],
+            "audio":{"voice":"default_male"},"temperature":0.7,"top_p":0.9,"max_tokens":32,"seed":5,
+            "repetition_penalty":1.05}"#,
+    )
+    .unwrap();
+    let args = StepAudio2.chat_to_request(&req, Path::new("/unused"), false).unwrap();
+    assert_eq!(args.output_modalities, ["text", "audio"]);
+    assert_eq!(Value::Object(args.model_kwargs), serde_json::json!({
+        "temperature": 0.7, "top_p": 0.9, "seed": 5, "max_output_tokens": 32, "repetition_penalty": 1.05,
+        "voice": "default_male",
+    }));
+    for clip in [r#""data:audio/wav;base64,AAAA""#, r#"{"url":"x"}"#] {
+        let req: ChatCompletionRequest =
+            serde_json::from_str(&format!(r#"{{"messages":[{{"role":"user","content":"Hi."}}],"ref_audio":{clip}}}"#)).unwrap();
+        assert_eq!(StepAudio2.chat_to_request(&req, Path::new("/unused"), false).unwrap_err(), STEP_AUDIO2_REF_AUDIO_REFUSAL);
+    }
+    let req: ChatCompletionRequest = serde_json::from_str(r#"{"messages":[{"role":"user","content":"Hi."}],"ref_audio":""}"#).unwrap();
+    assert!(StepAudio2.chat_to_request(&req, Path::new("/unused"), false).is_ok(), "an empty clip is no clip");
 }
 
 #[test]

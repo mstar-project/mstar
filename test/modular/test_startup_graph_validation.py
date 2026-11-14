@@ -724,6 +724,17 @@ def _minicpm_o(name, model_kwargs, tmp_path, monkeypatch):
     return _bare(MiniCPMOModel, max_seq_len=64, config=config, tts_config=TTSConfig(), _voice_seconds=lambda: voice)
 
 
+def _step_audio2(name, model_kwargs, tmp_path, monkeypatch):
+    from mstar.model.components.qwen3_lm import Qwen3LMConfig
+    from mstar.model.step_audio2.config import AudioEncoderConfig, StepAudio2Config
+    from mstar.model.step_audio2.step_audio2_model import StepAudio2Model
+    config = StepAudio2Config(llm=Qwen3LMConfig(), audio=AudioEncoderConfig())
+    # the default voices' lengths, read from the configured clips in a real boot
+    voice = (7.7, 9.04225)
+    return _bare(StepAudio2Model, max_seq_len=64, config=config, voices={"default_female": None},
+                 _voice_seconds=lambda: voice)
+
+
 def _orpheus(name, model_kwargs, tmp_path, monkeypatch):
     from mstar.model.orpheus.orpheus_model import OrpheusModel, OrpheusModelConfig
     return _bare(OrpheusModel, config=OrpheusModelConfig())
@@ -942,6 +953,7 @@ _FACTORIES = {
     "HiggsAudioModel": _higgs,
     "KokoroModel": _kokoro,
     "MiniCPMOModel": _minicpm_o,
+    "StepAudio2Model": _step_audio2,
     "LTX25Model": _ltx2_5,
     "H3Model": _minimax_h3,
     "MuseGlimmerModel": _muse_glimmer,
