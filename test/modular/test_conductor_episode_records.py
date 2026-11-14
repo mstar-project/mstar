@@ -73,6 +73,47 @@ def test_planning_view_names_empty_episode_arrays_without_storing_zero_counts():
     assert dict(episodes.view("robot-a").held) == zero
 
 
+def test_system_identity_clears_keyed_and_unkeyed_arrays_before_planning():
+    episodes = EpisodeRecords({"keyed", "unkeyed"})
+    first = (b"weights", b"adapter-a")
+    changed = (b"weights", b"adapter-b")
+    episodes.admit("robot-a", "call-1", 3, _placement(0),
+                   keys={"keyed": "prompt"}, identity=first)
+    episodes.finish("robot-a", "call-1", {"keyed": 8, "unkeyed": 21})
+
+    warm = episodes.view("robot-a", {"keyed": "prompt"}, identity=first)
+    assert (warm.calls, dict(warm.held), warm.cold) == (
+        1, {"keyed": 8, "unkeyed": 21}, None,
+    )
+    cold = episodes.view("robot-a", {"keyed": "prompt"}, identity=changed)
+    assert (cold.calls, dict(cold.held), cold.cold) == (
+        1, {"keyed": 0, "unkeyed": 0}, "identity",
+    )
+    assert episodes._records["robot-a"].held == {"keyed": 8, "unkeyed": 21}
+    episodes.admit("robot-a", "call-2", 3, _placement(0),
+                   keys={"keyed": "prompt"}, identity=changed)
+    assert episodes._records["robot-a"].held == {}
+    assert episodes._records["robot-a"].keys == {"keyed": "prompt"}
+    episodes.finish("robot-a", "call-2", {"keyed": 4, "unkeyed": 7})
+    assert dict(episodes.view("robot-a", {"keyed": "prompt"}, identity=changed).held) == {
+        "keyed": 4, "unkeyed": 7,
+    }
+
+
+def test_explicit_reset_precedes_identity_change_and_base_identity_is_stable():
+    episodes = EpisodeRecords({"frames"})
+    base = (b"weights", None)
+    episodes.admit("robot-a", "call-1", 3, _placement(0), identity=base)
+    episodes.finish("robot-a", "call-1", {"frames": 21})
+    assert episodes.view("robot-a", identity=base).held["frames"] == 21
+    changed_weights = (b"new-weights", None)
+    reset = episodes.view("robot-a", reset=True, identity=changed_weights)
+    assert (reset.calls, reset.held["frames"], reset.cold) == (1, 0, "reset")
+    episodes.admit("robot-a", "call-2", 3, _placement(0),
+                   reset=True, identity=changed_weights)
+    assert episodes._records["robot-a"].held == {}
+
+
 def test_reset_keeps_call_count_and_end_releases_the_logical_owner():
     episodes = EpisodeRecords()
     episodes.admit("robot-a", "call-1", 3, _placement(0))
