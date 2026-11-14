@@ -1341,7 +1341,12 @@ from PyTorch's index for torch's CUDA build) for MiniMax-H3's 28 heads a rank un
 tokens. An eager plan of a few segments runs FA3's dense kernel once per segment, the varlen call's bits, ~3%
 faster than FlashInfer's FA3 backend at the GPU's power cap; it reads the head count off q / k / v, so the Ulysses
 head-group pipeline runs over it. Where ``flash_attn_3`` doesn't import, the entry is refused with a warning and
-FlashInfer runs. A GPU of the architecture reads the file
+FlashInfer runs. Where the ``kernels`` package loads SGLang's build of FlashAttention-3
+(``kernels-community/sgl-flash-attn3`` on the Hugging Face hub, one build per torch and CUDA
+version; the package checks the publisher online, so an offline host keeps ``flash_attn_3``), the
+dense calls run it: ``flash_attn_3`` 3.0.1's bits on MiniMax-H3's shapes, 1.7% faster at the H200's
+power cap, and MiniMax-H3 SP2 0.9% faster a clip (141.0 -> 139.8 s, the same clip).
+A GPU of the architecture reads the file
 whichever model it is, and the build-time log names the GPU the row was swept on. The cuDNN wrapper runs a layout of equal-length
 segments, a DiT batch's, as one dense ``[segments, S, H, D]`` call. A captured one replays only
 the layout it was planned with, so a captured bucket takes it only when the step that plans it

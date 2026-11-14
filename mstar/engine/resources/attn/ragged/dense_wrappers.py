@@ -5,6 +5,9 @@ the ``ragged_attention`` table names ``fa3``.
 Same layouts as the FlashInfer wrappers, without a workspace or head-dim padding.
 """
 
+import functools
+import logging
+
 import torch
 
 from mstar.engine.resources.attn.dense import flash_attn_varlen_func
@@ -17,6 +20,8 @@ from mstar.engine.resources.attn.ragged.wrappers import (
     zero_unplanned_rows,
 )
 from mstar.platforms import current_platform
+
+logger = logging.getLogger(__name__)
 
 
 def _max_span(cu_seqlens: torch.Tensor) -> int:
@@ -153,9 +158,31 @@ def _fa4_dense_into(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, out: torc
         out.copy_(result[0] if isinstance(result, tuple) else result)
 
 
+# SGLang's build of FlashAttention-3 (its sgl-flash-attn fork) on the Hugging Face kernels hub, one per torch and CUDA
+# build. On MiniMax-H3's SP2 shapes it gives flash_attn_3 3.0.1's bits, ~1.7% faster at an H200's 690 W cap.
+SGL_FA3_REPO, SGL_FA3_REVISION = "kernels-community/sgl-flash-attn3", "v1"
+
+
+@functools.cache
+def sgl_fa3_forward():
+    """SGLang's FA3 forward op, loaded once through the ``kernels`` package; None where the package, the hub (or
+    its cache) or a build for this torch is missing, and the ``fa3`` rows run ``flash_attn_3``."""
+    try:
+        from kernels import get_kernel
+
+        forward = get_kernel(SGL_FA3_REPO, revision=SGL_FA3_REVISION)._ops.ops.fwd
+    except Exception as exc:  # noqa: BLE001  # no package, no network, an untrusted cache, no build: not here
+        logger.info("fa3: SGLang's FlashAttention-3 build not loaded (%s: %s); dense calls run flash_attn_3",
+                    type(exc).__name__, exc)
+        return None
+    logger.info("fa3: dense calls run SGLang's FlashAttention-3 build (%s, %s)", SGL_FA3_REPO, SGL_FA3_REVISION)
+    return forward
+
+
 class _Fa3RaggedPrefillBase(_PerSegmentDenseBase):
     """Dao's FlashAttention-3 (``flash_attn_3``, the PyTorch index's wheel for torch's CUDA build), the
-    ``ragged_attention`` table's ``fa3``. Its dense kernel runs a long segment ~3% faster than its varlen one or
+    ``ragged_attention`` table's ``fa3``; its dense calls run SGLang's build where that loads
+    (:func:`sgl_fa3_forward`). Its dense kernel runs a long segment ~3% faster than its varlen one or
     FlashInfer's FA3 backend (MiniMax-H3's 28 heads over 38K rows on an H200 at its power cap). It reads the head
     count off q / k / v, so a Ulysses pipeline attends a head group through the full call's plan, those heads'
     bits unchanged."""
@@ -172,6 +199,12 @@ class _Fa3RaggedPrefillBase(_PerSegmentDenseBase):
         )
 
     def _dense_into(self, q, k, v, out) -> None:
+        sgl = sgl_fa3_forward()
+        if sgl is not None:
+            # the same op as flash_attn_3's, every argument by position (none has a default)
+            sgl(q, k, v, None, None, None, out, None, None, None, None, None, q.shape[1], k.shape[1], None, None, None,
+                None, None, None, None, None, None, self.sm_scale, False, -1, -1, 0, 0.0, False, None, 1, None, 0, None)
+            return
         import flash_attn_interface  # noqa: F401  # registers torch.ops.flash_attn_3
 
         # the kernel op itself: the public wrapper is a custom op, which refuses an output it didn't allocate.

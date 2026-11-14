@@ -85,6 +85,37 @@ def test_fa3_dense_per_segment_is_its_varlen_call_and_a_head_group_is_those_head
     assert torch.equal(w.run(q, k, v), dense)
 
 
+def test_without_the_kernels_package_the_dense_calls_run_flash_attn_3(monkeypatch):
+    import sys
+
+    from mstar.engine.resources.attn.ragged import dense_wrappers
+
+    monkeypatch.setitem(sys.modules, "kernels", None)  # ``import kernels`` raises
+    dense_wrappers.sgl_fa3_forward.cache_clear()
+    try:
+        assert dense_wrappers.sgl_fa3_forward() is None
+    finally:
+        dense_wrappers.sgl_fa3_forward.cache_clear()
+
+
+@needs_fa3
+def test_sglangs_fa3_build_gives_flash_attn_3s_bits_where_it_loads(monkeypatch):
+    """Where the ``kernels`` package loads SGLang's FA3 build, the dense calls run it, flash_attn_3's bits:
+    MiniMax-H3's layout (a long segment and a padding row), all heads and a head group."""
+    from mstar.engine.resources.attn.ragged import dense_wrappers
+
+    if dense_wrappers.sgl_fa3_forward() is None:
+        pytest.skip("SGLang's FA3 build doesn't load here (the kernels package, the Hugging Face hub or its cache)")
+    heads, lens = 8, [3000, 1]
+    w = _wrapper(heads)
+    w.plan(_cu(lens))
+    q, k, v = _qkv(sum(lens), heads, 3)
+    group = [t[:, : heads // 2].contiguous() for t in (q, k, v)]
+    sgl, sgl_group = w.run(q, k, v), w.run(*group)
+    monkeypatch.setattr(dense_wrappers, "sgl_fa3_forward", lambda: None)
+    assert torch.equal(sgl, w.run(q, k, v)) and torch.equal(sgl_group, w.run(*group))
+
+
 @needs_fa3
 def test_fa3_graph_wrapper_zeroes_rows_past_its_plan():
     w = _wrapper(4, accelerator_graph=True, max_num_segments=2, max_total_tokens=512)

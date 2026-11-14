@@ -119,7 +119,8 @@ RAGGED_ATTENTION = register(KernelOp(
         Impl("fa4", check=_fa4_unavailable, tolerance=Tolerance(2e-2),
              doc="FlashAttention 4's dense forward over equal-length segments (Blackwell)"),
         Impl("fa3", check=_fa3_unavailable, tolerance=Tolerance(2e-2),
-             doc="Dao's FlashAttention-3 (flash_attn_3) over any layout (Hopper)"),
+             doc="Dao's FlashAttention-3 (flash_attn_3) over any layout (Hopper); dense calls on SGLang's build "
+                 "where the kernels package loads it"),
     ),
     doc="cacheless self-attention's kernel by one rank's head geometry and the longest query segment",
 ))
