@@ -89,8 +89,8 @@ logger = logging.getLogger(__name__)
 request_log = logging.getLogger(REQUEST_LOGGER)
 
 
-def _with_chunk_causal_layout(plan: list[WalkStep], layout: dict | None) -> list[WalkStep]:
-    """Carry request mask lengths with each planned walk, including later passes of a partition."""
+def _with_mask_layout(plan: list[WalkStep], layout: dict | None, key: str) -> list[WalkStep]:
+    """Merge request lengths with each walk's lengths; the walk decides its current step."""
     if not layout:
         return plan
     result = []
@@ -99,78 +99,48 @@ def _with_chunk_causal_layout(plan: list[WalkStep], layout: dict | None) -> list
             name: {label: dict(reads) for label, reads in by_label.items()}
             for name, by_label in layout.items()
         }
-        for name, by_label in step.step_metadata.get(CHUNK_CAUSAL_LAYOUT_KWARG, {}).items():
+        for name, by_label in step.step_metadata.get(key, {}).items():
             for label, reads in by_label.items():
                 merged.setdefault(name, {}).setdefault(label, {}).update(reads)
-        result.append(replace(step, step_metadata={**step.step_metadata, CHUNK_CAUSAL_LAYOUT_KWARG: merged}))
+        result.append(replace(step, step_metadata={**step.step_metadata, key: merged}))
     return result
 
 
-def _required_chunk_layouts(model: Model, declarations: list) -> dict[str, tuple[tuple[str, str, str], ...]]:
-    """Mask reads whose declared nodes run in each graph walk."""
-    result = {}
-    for walk, graph in model.get_graph_walk_graphs().items():
-        nodes = graph.get_nodes().keys()
-        result[walk] = tuple(
-            (array.name, label, key)
-            for array in declarations if isinstance(array, Array) and not array.nodes.isdisjoint(nodes)
-            for label in array.labels
-            for key, read in array.reads.items()
-            if isinstance(read.mask, ChunkCausal) and (read.walks is None or walk in read.walks)
-        )
-    return result
-
-
-def _check_chunk_layouts(plan: list[WalkStep], required: dict[str, tuple[tuple[str, str, str], ...]]) -> None:
-    """Refuse a missing per-request mask before it can fail a batched engine step."""
-    for step in plan:
-        given = step.step_metadata.get(CHUNK_CAUSAL_LAYOUT_KWARG, {})
-        for name, label, key in required.get(step.walk, ()):
-            if given.get(name, {}).get(label, {}).get(key) is None:
-                raise RuntimeError(
-                    f"walk {step.walk!r} has no chunk-causal layout for {name!r}/{label!r}/{key!r}"
-                )
+def _with_chunk_causal_layout(plan: list[WalkStep], layout: dict | None) -> list[WalkStep]:
+    return _with_mask_layout(plan, layout, CHUNK_CAUSAL_LAYOUT_KWARG)
 
 
 def _with_expert_layout(plan: list[WalkStep], layout: dict | None) -> list[WalkStep]:
-    """Carry small expert row geometry on every walk of the request."""
-    if not layout:
-        return plan
-    result = []
-    for step in plan:
-        merged = {
-            name: {label: dict(reads) for label, reads in by_label.items()}
-            for name, by_label in layout.items()
-        }
-        for name, by_label in step.step_metadata.get(EXPERT_LAYOUT_KWARG, {}).items():
-            for label, reads in by_label.items():
-                merged.setdefault(name, {}).setdefault(label, {}).update(reads)
-        result.append(replace(step, step_metadata={**step.step_metadata, EXPERT_LAYOUT_KWARG: merged}))
-    return result
+    return _with_mask_layout(plan, layout, EXPERT_LAYOUT_KWARG)
 
 
-def _required_expert_layouts(model: Model, declarations: list) -> dict[str, tuple[tuple[str, str, str], ...]]:
-    """Expert reads whose declared nodes run in each graph walk."""
+def _required_mask_layouts(model: Model, declarations: list) -> dict[str, tuple[tuple[str, str, str, str], ...]]:
+    """Within-step mask reads whose declared nodes run in each graph walk."""
     result = {}
     for walk, graph in model.get_graph_walk_graphs().items():
         nodes = graph.get_nodes().keys()
         result[walk] = tuple(
-            (array.name, label, key)
+            (CHUNK_CAUSAL_LAYOUT_KWARG if isinstance(read.mask, ChunkCausal) else EXPERT_LAYOUT_KWARG,
+             array.name, label, key)
             for array in declarations if isinstance(array, Array) and not array.nodes.isdisjoint(nodes)
             for label in array.labels
             for key, read in array.reads.items()
-            if isinstance(read.mask, (ExpertCross, ExpertSelf)) and (read.walks is None or walk in read.walks)
+            if isinstance(read.mask, (ChunkCausal, ExpertCross, ExpertSelf))
+            and (read.walks is None or walk in read.walks)
         )
     return result
 
 
-def _check_expert_layouts(plan: list[WalkStep], required: dict[str, tuple[tuple[str, str, str], ...]]) -> None:
-    """Refuse a missing per-request expert mask before it joins an engine batch."""
+def _check_mask_layouts(plan: list[WalkStep], required: dict[str, tuple[tuple[str, str, str, str], ...]]) -> None:
+    """Refuse a missing per-request mask before it can fail a batched engine step."""
     for step in plan:
-        given = step.step_metadata.get(EXPERT_LAYOUT_KWARG, {})
-        for name, label, key in required.get(step.walk, ()):
+        for wire_key, name, label, key in required.get(step.walk, ()):
+            given = step.step_metadata.get(wire_key, {})
             if given.get(name, {}).get(label, {}).get(key) is None:
-                raise RuntimeError(f"walk {step.walk!r} has no expert layout for {name!r}/{label!r}/{key!r}")
+                kind = "chunk-causal" if wire_key == CHUNK_CAUSAL_LAYOUT_KWARG else "expert"
+                raise RuntimeError(
+                    f"walk {step.walk!r} has no {kind} layout for {name!r}/{label!r}/{key!r}"
+                )
 
 
 def _walk_io(model: Model) -> tuple[dict[str, tuple[tuple[str, str], ...]], dict[str, frozenset[str]], frozenset[str]]:
@@ -850,16 +820,10 @@ class Conductor:
             built = self._declarations_cache = self.model.declare_state()
         return built
 
-    def _chunk_layout_reads(self) -> dict[str, tuple[tuple[str, str, str], ...]]:
-        built = getattr(self, "_chunk_layout_reads_cache", None)
+    def _mask_layout_reads(self) -> dict[str, tuple[tuple[str, str, str, str], ...]]:
+        built = getattr(self, "_mask_layout_reads_cache", None)
         if built is None:
-            built = self._chunk_layout_reads_cache = _required_chunk_layouts(self.model, self._declarations())
-        return built
-
-    def _expert_layout_reads(self) -> dict[str, tuple[tuple[str, str, str], ...]]:
-        built = getattr(self, "_expert_layout_reads_cache", None)
-        if built is None:
-            built = self._expert_layout_reads_cache = _required_expert_layouts(self.model, self._declarations())
+            built = self._mask_layout_reads_cache = _required_mask_layouts(self.model, self._declarations())
         return built
 
     def _streamed_partitions(self) -> frozenset[str]:
@@ -1518,8 +1482,7 @@ class Conductor:
             )
             pstate.plan = _with_chunk_causal_layout(pstate.plan, model_kwargs.get(CHUNK_CAUSAL_LAYOUT_KWARG))
             pstate.plan = _with_expert_layout(pstate.plan, model_kwargs.get(EXPERT_LAYOUT_KWARG))
-            _check_chunk_layouts(pstate.plan, self._chunk_layout_reads())
-            _check_expert_layouts(pstate.plan, self._expert_layout_reads())
+            _check_mask_layouts(pstate.plan, self._mask_layout_reads())
             stream_moved = p.name in self.producer_triggered_partitions
             # refuse a plan the conductor can't run: a step whose walk isn't one of the
             # partition's (which startup checked are the model's), or a ``bind`` key
