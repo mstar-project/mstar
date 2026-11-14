@@ -1178,7 +1178,7 @@ class HiFTSubmodule(NodeSubmodule):
         if self.config.hift_captured and runners:
             captured = [CapturedStream() if s[0] is None else CapturedStream.from_edges(*s) for s in streams]
             pcm = self._run_captured(rids, mels, finals, captured, runners)
-            edges = [stream.edges(self.get_device()) for stream in captured]
+            edges = [stream.edges() for stream in captured]
         else:
             eager = [
                 HiftStreamState(mel=m.new_zeros(m.shape[0], 0)) if s[0] is None else HiftStreamState.from_edges(*s)
