@@ -76,7 +76,7 @@ omnivoice = []
 command_a_plus = [
     "flashinfer-python==0.7.2",
     "huggingface-hub>=1.5",
-    "mooncake-transfer-engine>=0.3.13.post1",
+    "mooncake-transfer-engine>=0.3.14",
     "ninja",
     "safetensors",
     "transformers>=5.17",
@@ -160,7 +160,7 @@ bagel = [
     "einops",
     "flashinfer-python==0.7.2",
     "huggingface-hub",
-    "mooncake-transfer-engine>=0.3.13.post1",
+    "mooncake-transfer-engine>=0.3.14",
     "Pillow>=12.3.0",
     "regex",
     "safetensors",
@@ -173,7 +173,7 @@ bagel = [
 bagel_xpu = [
     "einops",
     "huggingface-hub",
-    "mooncake-transfer-engine>=0.3.13.post1",
+    "mooncake-transfer-engine>=0.3.14",
     "Pillow>=12.3.0",
     "regex",
     "safetensors",
@@ -197,7 +197,7 @@ cosmos3 = [
     "fa3-fwd",
     "flashinfer-python==0.7.2",
     "huggingface-hub",
-    "mooncake-transfer-engine>=0.3.13.post1",
+    "mooncake-transfer-engine>=0.3.14",
     "Pillow>=12.3.0",
     "safetensors",
     "torchvision",
@@ -209,7 +209,7 @@ qwen3_omni = [
     "einops",
     "flashinfer-python==0.7.2",
     "huggingface-hub",
-    "mooncake-transfer-engine>=0.3.13.post1",
+    "mooncake-transfer-engine>=0.3.14",
     "Pillow>=12.3.0",
     "regex",
     "qwen-omni-utils",
@@ -235,7 +235,7 @@ qwen3_tts = [
     "einops",
     "flashinfer-python==0.7.2",
     "huggingface-hub",
-    "mooncake-transfer-engine>=0.3.13.post1",
+    "mooncake-transfer-engine>=0.3.14",
     "safetensors",
     "soundfile",  # reference-audio decoding for Base voice cloning
     "transformers>=4.57.3",
@@ -244,7 +244,7 @@ qwen3_tts = [
 fish_s2_pro = [
     "flashinfer-python==0.7.2",
     "huggingface-hub",
-    "mooncake-transfer-engine>=0.3.13.post1",
+    "mooncake-transfer-engine>=0.3.14",
     "safetensors",
     "soundfile",  # reference-audio decoding for voice cloning
     "transformers",
@@ -270,7 +270,7 @@ chatterbox = [
     "flashinfer-python==0.7.2",
     "huggingface-hub",
     "librosa",
-    "mooncake-transfer-engine>=0.3.13.post1",
+    "mooncake-transfer-engine>=0.3.14",
     "pyloudnorm",
     "resemble-perth",
     "safetensors",
@@ -291,7 +291,7 @@ chatterbox_multilingual = [
 cosyvoice3 = [
     "flashinfer-python>=0.6.14",
     "huggingface-hub",
-    "mooncake-transfer-engine>=0.3.13.post1",
+    "mooncake-transfer-engine>=0.3.14",
     "safetensors",
     "soundfile",
     "torchcodec",
@@ -303,7 +303,7 @@ cosyvoice3 = [
 voxcpm2 = [
     "flashinfer-python>=0.6.14",
     "huggingface-hub",
-    "mooncake-transfer-engine>=0.3.13.post1",
+    "mooncake-transfer-engine>=0.3.14",
     "safetensors",
     "soundfile",
     "soxr",
@@ -314,7 +314,7 @@ orpheus = [
     "einops",
     "flashinfer-python==0.7.2",
     "huggingface-hub",
-    "mooncake-transfer-engine>=0.3.13.post1",
+    "mooncake-transfer-engine>=0.3.14",
     "safetensors",
     "transformers",
 ]
@@ -322,14 +322,14 @@ orpheus = [
 pi05 = [
     "flashinfer-python==0.7.2",
     "huggingface-hub",
-    "mooncake-transfer-engine>=0.3.13.post1",
+    "mooncake-transfer-engine>=0.3.14",
     "safetensors",
     "transformers",
 ]
 
 vjepa2 = [
     "huggingface-hub",
-    "mooncake-transfer-engine>=0.3.13.post1",
+    "mooncake-transfer-engine>=0.3.14",
     "safetensors",
     "torchcodec",
 ]
@@ -401,7 +401,7 @@ flux2_klein = [
 vjepa2_ac = [
     "flashinfer-python==0.7.2",
     "huggingface-hub",
-    "mooncake-transfer-engine>=0.3.13.post1",
+    "mooncake-transfer-engine>=0.3.14",
     "safetensors",
     "torchcodec",
 ]
@@ -411,7 +411,7 @@ asr = [
     "einops",
     "flashinfer-python==0.7.2",
     "huggingface-hub",
-    "mooncake-transfer-engine>=0.3.13.post1",
+    "mooncake-transfer-engine>=0.3.14",
     "safetensors",
     # decodes WAV / FLAC / OGG / MP3 uploads without FFmpeg (torchcodec takes the rest)
     "soundfile",
@@ -431,7 +431,7 @@ asr = [
 glm = [
     "flashinfer-python==0.7.2",
     "huggingface-hub",
-    "mooncake-transfer-engine>=0.3.13.post1",
+    "mooncake-transfer-engine>=0.3.14",
     "ninja",  # speeds up the first-use JIT build of the vendored MoE align kernel
     "safetensors",
     "transformers",
@@ -449,7 +449,7 @@ all = [
     "einops",
     "flashinfer-python==0.7.2",
     "huggingface-hub",
-    "mooncake-transfer-engine>=0.3.13.post1",
+    "mooncake-transfer-engine>=0.3.14",
     "Pillow>=12.3.0",
     "regex",
     "safetensors",
