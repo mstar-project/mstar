@@ -79,7 +79,7 @@ class Compressor(nn.Module):
         members_kv, members_score = torch.stack(members_kv, 1), torch.stack(members_score, 1)
         pooled = (members_kv * members_score.softmax(dim=1)).sum(dim=1)
         # the step's last tokens are the next step's open group
-        tail = rows.pos >= rows.end - ratio
+        tail = rows.tail(ratio)
         req, slot = rows.row_req[tail], rows.pos[tail] % ratio
         held_kv[req, slot] = kv[tail]
         held_score[req, slot] = score[tail]
@@ -186,7 +186,7 @@ class DeepseekV41Attention(nn.Module):
         in_ring = rows.row_req[:, None] * win + pos % win
         idx = torch.where(held, torch.where(pos >= start[:, None], in_step, in_ring), -1)
         source = torch.cat([ring.flatten(0, 1), kv], dim=0)
-        tail = rows.pos >= rows.end - win
+        tail = rows.tail(win)
         ring[rows.row_req[tail], rows.pos[tail] % win] = kv[tail].to(ring.dtype)
         self._state.scatter_(WINDOW, ring, self.layer, label=LABEL)
         return source, idx, columns

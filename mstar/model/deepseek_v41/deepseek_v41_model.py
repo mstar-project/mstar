@@ -95,6 +95,8 @@ class DeepseekV41Model(ByteLevelTextOutput, Model):
         if "engram_tables" in kwargs:
             # rebuilt, so the config refuses a placement it does not know
             self.config = dataclasses.replace(self.config, engram_tables=kwargs["engram_tables"])
+        if kwargs.get("capture_contexts") is not None:
+            self.config = dataclasses.replace(self.config, capture_contexts=tuple(kwargs["capture_contexts"]))
         # requests that may hold state at once; the pool holds one more slot, its sink, and a
         # serve YAML sizes it under ``resources: state: {max_slots: N}``
         self.max_requests = _positive_int("max_requests", kwargs.get("max_requests", 32))
@@ -357,7 +359,8 @@ class DeepseekV41Model(ByteLevelTextOutput, Model):
             return
         with open(path) as f:
             read = DeepseekV41Config.from_hf_config(json.load(f))
-        for knob in ("max_seq_len", "max_output_tokens", "moe_experts", "moe_kernel", "engram_tables"):
+        for knob in ("max_seq_len", "max_output_tokens", "moe_experts", "moe_kernel", "engram_tables",
+                     "capture_contexts"):
             setattr(read, knob, getattr(self.config, knob))
         self.config, self._config_from_checkpoint = read, True
 

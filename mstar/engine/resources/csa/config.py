@@ -105,3 +105,7 @@ class CSASpec(NodeResourceSpec):
 class CSAStep(ResourceStep):
     """The step's segments are its tokens (the submodule's own). The caches advance by the
     rows ``CSAManager.kv_segments`` derives from them."""
+
+    # a captured step's rows score each cache over this many tokens of context, the width its
+    # graph was recorded at, which every request of the step must fit; None: all a cache holds
+    context: int | None = None

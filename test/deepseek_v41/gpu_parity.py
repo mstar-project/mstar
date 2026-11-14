@@ -4,6 +4,8 @@ checkpoint repo's ``inference/`` code and, for the kernels, ``tilelang`` (the re
     python test/deepseek_v41/gpu_parity.py --reference <snapshot dir> --mode kernels --out k.json
     python test/deepseek_v41/gpu_parity.py --reference <snapshot dir> --mode tp1 --out tp1.json
     python test/deepseek_v41/gpu_parity.py --reference <snapshot dir> --mode tp2 --out tp2.json
+    python test/deepseek_v41/gpu_parity.py --mode capture --out capture.json
+    python test/deepseek_v41/gpu_parity.py --mode capture2 --out capture2.json
 
 ``kernels``: ``inference/kernel.py`` against the torch stand-ins the CPU parity tests run the
 reference on (``_testing.reference_kernels``), on random and on tie inputs: the roundings bit for
@@ -15,6 +17,10 @@ against itself on the stand-ins and against M*, next to the reference's own spre
 attention kernel is swapped for an exact softmax.
 ``tp2``: two ranks (NCCL on cuda:0 and cuda:1; gloo with ``--engine-device cpu``) against one:
 a slice of every expert a rank, whole experts a rank, and the Engram tables on the host.
+``capture``: the reduced model's decode steps replayed from their captured graphs against the
+same steps run eagerly on the same engine: one request and several at once (a bucket filled, and
+one with a padding row), each over ``--seeds`` seeds and ``--steps`` decode steps, fp32 and bf16.
+``capture2``: the same on two ranks over NCCL, each rank's replays against its own eager steps.
 """
 from __future__ import annotations
 
@@ -23,6 +29,7 @@ import json
 import socket
 import sys
 import tempfile
+import time
 import types
 from pathlib import Path
 
@@ -255,6 +262,94 @@ def _kernel_rows(args, rows: dict[str, dict], device: str) -> None:
             "argmax_equal_steps": int((got16.argmax(-1) == other16.argmax(-1)).sum()), "steps": got16.shape[0]})
 
 
+def _capture_rows(args, rows: dict[str, dict], device: str, prefix: str = "", **build) -> None:
+    """Eager against replayed decode steps on one engine a (dtype, seed): the logits of every
+    step, which must be equal bit for bit where the replay's rows are the eager step's rows."""
+    from mstar.model.deepseek_v41 import _testing as T
+    from mstar.model.deepseek_v41.config import DeepseekV41Config
+
+    config = DeepseekV41Config.reduced(**build.pop("config", {}))
+    for dtype in ("float32", "bfloat16"):
+        for seed in range(args.seeds):
+            with tempfile.TemporaryDirectory() as tmp:
+                T.write_snapshot(tmp, config, seed=seed)
+                engine, sampler, _ = T.build_engine(tmp, getattr(torch, dtype), device=device, **build,
+                                                    **({"capture_contexts": args.contexts} if args.contexts else {}))
+                buckets = T.captured_buckets(engine)
+                if not buckets:
+                    _emit(rows, f"{prefix}{dtype}/seed{seed}", {"error": "no decode graph was captured"})
+                    continue
+                # requests at once -> their bucket: 1 and 2 fill theirs, 3 replays 4 with a padding row
+                for requests in (1, 2, 3):
+                    ids = {f"r{i}": T.random_ids(config, PROMPT + args.steps, seed=100 * seed + i).to(device)
+                           for i in range(requests)}
+                    before = sampler.replayed
+                    t0 = time.perf_counter()
+                    with T.eager_steps(engine):
+                        eager = T.run_requests(engine, sampler, ids, PROMPT)
+                    t1 = time.perf_counter()
+                    assert sampler.replayed == before, "a step replayed a graph inside eager_steps"
+                    replay = T.run_requests(engine, sampler, ids, PROMPT)
+                    t2 = time.perf_counter()
+                    gaps = [T.logit_gap(replay[rid].float().cpu(), eager[rid].float().cpu()) for rid in ids]
+                    _emit(rows, f"{prefix}{dtype}/seed{seed}/requests{requests}", {
+                        "equal": all(torch.equal(replay[rid], eager[rid]) for rid in ids),
+                        "steps_equal": int(sum((replay[rid] == eager[rid]).flatten(1).all(1).sum() for rid in ids)),
+                        "steps": int(sum(eager[rid].shape[0] for rid in ids)), "gap": max(gaps),
+                        "argmax_equal": all(torch.equal(replay[rid].argmax(-1), eager[rid].argmax(-1)) for rid in ids),
+                        "decode_steps": args.steps, "replayed_steps": sampler.replayed - before,
+                        "buckets": len(buckets),
+                        # the request's whole run, its prefills included: a scale, not a benchmark
+                        "eager_s": round(t1 - t0, 3), "replay_s": round(t2 - t1, 3)})
+                del engine, sampler
+                torch.cuda.empty_cache()
+
+
+def mode_capture(args) -> dict:
+    rows: dict[str, dict] = {}
+    _capture_rows(args, rows, args.engine_device)
+    return rows
+
+
+def _capture2_rank(rank: int, args, port: int) -> None:
+    from mstar.distributed.communication import CommGroup, WorkerParallelGroups
+    from mstar.engine.resources.kv import manager as kv_manager
+    from mstar.model.deepseek_v41 import _testing as T
+
+    kv_manager.KVTransferManager = T.StubTransfer
+    group = CommGroup(my_global_rank=rank, my_group_rank=rank, group_members=[0, 1])
+    groups = WorkerParallelGroups(num_workers=2, global_rank=rank, any_parallelism=True,
+                                  world_parallel_groups=[(0, 1)], dist_timeout_s=600)
+    groups.add("LLM", group, "tp")
+    groups.node_to_instance_comm["LLM"] = group
+    groups.init_dist(init_method=f"tcp://127.0.0.1:{port}", device=torch.device("cuda", rank))
+    import os
+    import traceback
+
+    code, rows = 0, {}
+    try:
+        _capture_rows(args, rows, f"cuda:{rank}", prefix="tp2/", config=TP2, tp_group=group, parallel_groups=groups)
+    except BaseException:
+        traceback.print_exc()
+        code = 1
+    Path(f"{args.out}.rank{rank}").write_text(json.dumps(rows))
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(code)  # no NCCL teardown: ranks that have saved their results can hang in it
+
+
+def mode_capture2(args) -> dict:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    mp.spawn(_capture2_rank, args=(args, port), nprocs=2)
+    rows: dict[str, dict] = {}
+    for rank in (0, 1):
+        for name, row in json.loads(Path(f"{args.out}.rank{rank}").read_text()).items():
+            rows[f"rank{rank}/{name}"] = row
+    return rows
+
+
 def _tp2_rank(rank: int, args, port: int, snapshot: str, run: str) -> None:
     from mstar.distributed.communication import CommGroup, WorkerParallelGroups
     from mstar.model.components.moe_parallel import MoeParallelConfig
@@ -323,13 +418,25 @@ def mode_tp2(args) -> dict:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--reference", required=True, help="a snapshot directory holding inference/")
-    ap.add_argument("--mode", choices=("kernels", "tp1", "tp2"), required=True)
+    ap.add_argument("--reference", help="a snapshot directory holding inference/ (kernels, tp1, tp2)")
+    ap.add_argument("--mode", choices=("kernels", "tp1", "tp2", "capture", "capture2"), required=True)
+    ap.add_argument("--seeds", type=int, default=3, help="capture: snapshots, each with its own prompts")
+    ap.add_argument("--steps", type=int, default=32, help="capture: decode steps a request")
+    ap.add_argument("--contexts", type=lambda s: tuple(int(c) for c in s.split(",")), default=None,
+                    help="capture: the contexts decode graphs are captured for (the model's ladder otherwise)")
     ap.add_argument("--engine-device", default="cuda:0")
     ap.add_argument("--no-kernels", action="store_true", help="tp1 without tilelang: the fp32 row only")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
-    rows = {"kernels": mode_kernels, "tp1": mode_tp1, "tp2": mode_tp2}[args.mode](args)
+    if args.mode in ("kernels", "tp1", "tp2") and not args.reference:
+        ap.error(f"--mode {args.mode} needs --reference")
+    if args.mode.startswith("capture"):
+        from mstar.engine.resources.kv import manager as kv_manager
+        from mstar.model.deepseek_v41 import _testing as T
+
+        kv_manager.KVTransferManager = T.StubTransfer  # one engine a rank, nothing to transfer
+    rows = {"kernels": mode_kernels, "tp1": mode_tp1, "tp2": mode_tp2, "capture": mode_capture,
+            "capture2": mode_capture2}[args.mode](args)
     meta = {"torch": torch.__version__, "cuda": torch.version.cuda, "device": args.engine_device,
             "gpu": torch.cuda.get_device_name(0) if args.engine_device.startswith("cuda") else None}
     Path(args.out).write_text(json.dumps({"mode": args.mode, "meta": meta, "rows": rows}, indent=1))

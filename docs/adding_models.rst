@@ -951,7 +951,12 @@ The spec types are:
        block, for one), and how many of their columns each row has; its softmax accumulates
        over a row's entries (the window columns, then the picks) ``softmax_block`` at a time,
        each block's probabilities rounded to the queries' dtype, the arithmetic of the kernel
-       DeepSeek-V4.1 was served with. The torch reference: eager only, no captured graphs.
+       DeepSeek-V4.1 was served with. It is that arithmetic in torch. A decode step (one row
+       a request) can be captured: under a capture lease ``plan`` lays the bucket's rows, its
+       padding rows at token 0, into the (bucket, slot)'s own buffers, and every row scores
+       each cache at one width, ``CSAStep(context=...)`` tokens (all the cache holds when
+       unset), so a replay's shapes follow from its bucket alone; a step of another shape
+       under a lease, or a request past the step's context, is refused.
    * - ``DSASpec(config=DSAConfig(kv_cache=..., topk=...))``
      - DeepSeek sparse attention (DSA) over the named ``KVLayout.MLA`` cache: past ``topk``
        keys, each query row attends only the ``topk`` tokens its indexer scores highest.

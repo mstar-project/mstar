@@ -19,6 +19,9 @@ model_kwargs:
   # what runs them: auto (the default) is a Triton grouped GEMM over the fp4 bytes on a GPU with
   # bf16 tensor cores; torch is the dispatch expert by expert, the arithmetic it is held to
   # moe_kernel: auto
+  # the contexts, in tokens, a decode graph is captured for (a step replays the smallest that
+  # holds its longest request); unset: 4096, 16384 and max_seq_len
+  # capture_contexts: [4096, 16384, 65536]
   # The two Engram tables (203 GB) from host memory instead of 25.3 GB a rank on the GPUs:
   # one read-only mapping of the checkpoint's bytes for all ranks, each step's rows fetched
   # through the host. Same values; its cost per step is not measured on GPUs yet. The host

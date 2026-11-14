@@ -10,7 +10,11 @@ from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.accelerator_graph_config import AcceleratorGraphConfig
+from mstar.engine.accelerator_graph_config import (
+    DEFAULT_CAPTURE_BATCH_SIZES,
+    AcceleratorGraphConfig,
+    BatchedAcceleratorGraphConfig,
+)
 from mstar.engine.engine import ExecutingBatch
 from mstar.engine.resources import KVStep, SamplerStep, Segment, SlotLease, SubmoduleStep
 from mstar.engine.resources.csa.config import CSAStep
@@ -41,6 +45,9 @@ class DeepseekV41LLMSubmodule(ARNodeSubmodule):
     # and those fp32 sums are full fp32: under TF32, the process default on CUDA, a sum lands on
     # the other side of a rounding step and the logits move by their own spread
     float32_matmul_precision = "highest"
+    # tokens of headroom a decode step's capture is keyed with: the key is taken a step or two
+    # before the request's context is final
+    capture_slack = 16
 
     def __init__(self, language_model: nn.Module, config: DeepseekV41Config) -> None:
         super().__init__()
@@ -48,11 +55,48 @@ class DeepseekV41LLMSubmodule(ARNodeSubmodule):
         self.config = config
         self._long_stager = PinnedStager(torch.long)
 
+    def capture_blocked(self) -> str | None:
+        """Why a decode step cannot be captured, or None. A captured forward's shapes follow
+        from its bucket and nothing in it reads the host."""
+        if self.config.engram_on_host:
+            return "the Engram tables are in host memory, and a step fetches its rows through the host"
+        for layer in self.language_model.model.layers:
+            if not layer.ffn.capturable:
+                return "the routed experts run the reference dispatch, a launch per expert the step hit"
+        return None
+
     def get_accelerator_graph_configs(
         self, device: torch.device, tp_world_size: int = 1,
     ) -> list[AcceleratorGraphConfig]:
-        # the CSA resource is the torch reference, which cannot be captured: every step is eager
-        return []
+        # decode only: a prompt's rows score against one request's keys at the prompt's own width
+        blocked = self.capture_blocked()
+        if blocked is not None:
+            logger.warning("deepseek_v41: decode runs eager: %s", blocked)
+            return []
+        pool = self.node_resources.get(STATE) if self.node_resources else None
+        slots = None if pool is None else pool.config.usable_slots
+        # a graph per context of the ladder: its rows score their caches at that width
+        return [BatchedAcceleratorGraphConfig(
+            capture_graph_walk="decode",
+            single_request_inputs=ARNodeInputs(
+                input_ids=torch.zeros(1, dtype=torch.long, device=device), input_seq_len=1),
+            additional_key_info=context,
+            capture_batch_sizes=[b for b in DEFAULT_CAPTURE_BATCH_SIZES if slots is None or b <= slots],
+            # the forward is the reference's arithmetic as written; a compile would reorder it
+            compile=False,
+        ) for context in self.config.capture_ladder]
+
+    def cg_key_info(self, graph_walk: str, per_request_info, per_request_input_metadata=None, **kwargs):
+        """The captured context a decode batch replays: the smallest that holds its longest
+        request with ``capture_slack`` to spare; None (no graph: the step runs eagerly) past the
+        ladder's last."""
+        if graph_walk != "decode":
+            return None
+        longest = 0
+        for info in per_request_info.values():
+            state = self.request_states.get(info.rid_handle)
+            longest = max(longest, state.get("context", 0) if state is not None else 0)
+        return next((c for c in self.config.capture_ladder if longest + self.capture_slack <= c), None)
 
     def max_batch_size(self, graph_walk: str) -> int | None:
         # one STATE slot per request: the scheduler splits a larger step rather than fail its admit
@@ -110,11 +154,14 @@ class DeepseekV41LLMSubmodule(ARNodeSubmodule):
         ]
         # a cache advances by the groups the step's tokens complete, which the CSA resource counts
         caches = self.node_resources[CSA].kv_segments(segments)
+        # a leased step scores at the context its graph was captured for
+        context = slot_lease.bucket.cg_key_info if slot_lease is not None and slot_lease.bucket is not None else None
         return SubmoduleStep(
             segments=segments,
+            cg_key_info=context,
             steps={
                 **{key: KVStep(segments=rows) for key, rows in caches.items()},
-                CSA: CSAStep(),
+                CSA: CSAStep(context=context),
                 STATE: RecurrentStep(),
                 SAMPLER: SamplerStep(apply_penalty=True, prefill_tracked_tokens=prefill_tokens),
                 **({ENGRAM: HostTableStep()} if self.config.engram_on_host else {}),

@@ -14,6 +14,7 @@ import math
 import re
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 sys.path.insert(0, ".")
 
@@ -619,6 +620,110 @@ class TestEngineCpu:
             run_step(engine, sampler, "prefill", {
                 "long": random_ids(snapshot[1], 65, seed=6), "short": random_ids(snapshot[1], 8, seed=7)})
         assert "'short'" not in str(failed.value)
+
+
+@pytest.mark.usefixtures("cpu")
+class TestCaptureBucket:
+    """A decode step laid out as a captured graph replays it (the bucket's own plan buffers,
+    padding rows, every cache scored at its full width) is the eager step: what a graph records
+    is then the eager forward."""
+
+    PROMPT, STEPS = 21, 8
+
+    def _run(self, snapshot, dtype, requests: int, rows: int, context: int | None = None):
+        engine, sampler, _ = cpu_engine(snapshot[0], dtype)
+        ids = {f"r{i}": random_ids(snapshot[1], self.PROMPT + self.STEPS, seed=20 + i) for i in range(requests)}
+        eager = _testing.run_requests(engine, sampler, {f"e{rid}": t for rid, t in ids.items()}, self.PROMPT)
+        bucket = _testing.open_bucket(engine, rows, context=context)
+        got = {rid: [] for rid in ids}
+        for rid, tokens in ids.items():
+            add_request(engine, rid)
+            got[rid].append(run_step(engine, sampler, "prefill", {rid: tokens[:self.PROMPT]})[rid])
+        for step in range(self.STEPS):
+            out = _testing.bucket_step(engine, sampler, bucket, step % 2, {
+                rid: tokens[self.PROMPT + step].view(1) for rid, tokens in ids.items()})
+            for rid in ids:
+                got[rid].append(out[rid])
+        return {rid: torch.stack(rows_) for rid, rows_ in got.items()}, {rid: eager[f"e{rid}"] for rid in ids}
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16], ids=["fp32", "bf16"])
+    @pytest.mark.parametrize("requests, rows", [(1, 1), (2, 2), (3, 4)], ids=["1-in-1", "2-in-2", "3-in-4"])
+    def test_a_step_in_a_buckets_shape_gives_the_eager_logits_bit_for_bit(self, snapshot, dtype, requests, rows):
+        got, eager = self._run(snapshot, dtype, requests, rows)
+        for rid in got:
+            assert torch.isfinite(got[rid]).all() and torch.equal(got[rid], eager[rid])
+
+    def test_a_bucket_captured_for_a_shorter_context_scores_less_and_gives_the_same(self, snapshot):
+        # 29 tokens of context in a graph that scores 32 (the caches hold 256)
+        got, eager = self._run(snapshot, torch.float32, 2, 2, context=32)
+        for rid in got:
+            assert torch.equal(got[rid], eager[rid])
+
+    def test_a_request_past_its_buckets_context_is_refused(self, snapshot):
+        with pytest.raises(RuntimeError, match="past the 24 tokens of context"):
+            self._run(snapshot, torch.float32, 1, 1, context=24)
+
+    def test_a_decode_batch_replays_the_smallest_context_that_holds_it(self, snapshot):
+        engine, sampler, _ = cpu_engine(snapshot[0], torch.float32, capture_contexts=(64, 128))
+        sub = engine._submodules["LLM"].submodule
+        assert sub.config.capture_ladder == (64, 128)
+
+        def key(*rids):
+            infos = {rid: SimpleNamespace(rid_handle=rid) for rid in rids}
+            return sub.cg_key_info("decode", infos)
+
+        tokens = random_ids(snapshot[1], 120, seed=3)
+        for rid, prompt in (("a", 40), ("b", 60)):
+            add_request(engine, rid)
+            run_step(engine, sampler, "prefill", {rid: tokens[:prompt]})
+        # with capture_slack tokens to spare: 40 fits 64, 60 does not, and the longest decides
+        assert (key("a"), key("b"), key("a", "b")) == (64, 128, 128)
+        for step in range(9):  # a: 40 -> 49 tokens, past 64 less the slack
+            run_step(engine, sampler, "decode", {"a": tokens[40 + step].view(1)})
+        assert key("a") == 128
+        run_step(engine, sampler, "prefill", {"b": tokens[60:115]})
+        assert key("b") is None and sub.cg_key_info("prefill", {}) is None  # past the ladder: eager
+
+    def test_the_ladder_of_contexts(self):
+        assert DeepseekV41Config().capture_ladder == (4096, 16384, 65536)
+        assert DeepseekV41Config.reduced().capture_ladder == (256,)
+        assert DeepseekV41Config.reduced(capture_contexts=(64, 4096)).capture_ladder == (64, 256)
+        for bad in ((), (64, 32), (0, 8), (16, 16)):
+            with pytest.raises(ValueError, match="capture_contexts"):
+                DeepseekV41Config.reduced(capture_contexts=bad)
+
+    def test_padding_rows_beside_one_request_leave_its_logits(self, snapshot):
+        # three padding rows: the row count moves the CPU's GEMM kernels, not the request
+        got, eager = self._run(snapshot, torch.float32, 1, 4)
+        assert logit_gap(got["r0"], eager["r0"]) < 1e-5
+
+    def test_a_step_of_another_shape_than_its_bucket_is_refused(self, snapshot):
+        engine, sampler, _ = cpu_engine(snapshot[0], torch.float32)
+        bucket = _testing.open_bucket(engine, 1)
+        for rid in "ab":
+            add_request(engine, rid)
+            run_step(engine, sampler, "prefill", {rid: random_ids(snapshot[1], 9, seed=1)})
+        # the first resource to plan it refuses: a cache here, the CSA resource for its own rows
+        with pytest.raises((RuntimeError, ValueError), match="bucket"):
+            _testing.bucket_step(engine, sampler, bucket, 0, {"a": torch.tensor([5]), "b": torch.tensor([6])})
+
+    def test_decode_graphs_are_declared_only_for_a_forward_that_can_be_recorded(self, snapshot, monkeypatch):
+        def configs(**kwargs):
+            engine, _, _ = cpu_engine(snapshot[0], torch.float32, **kwargs)
+            sub = engine._submodules["LLM"].submodule
+            return sub.capture_blocked(), sub.get_accelerator_graph_configs(torch.device("cpu"))
+
+        blocked, declared = configs()
+        assert "reference dispatch" in blocked and declared == []  # no expert kernel on a CPU
+        monkeypatch.setattr(DeepseekV41MoE, "capturable", property(lambda self: True))
+        blocked, declared = configs()
+        # a graph per context of the ladder (one here: the 256 tokens served)
+        assert blocked is None and [(c.capture_graph_walk, c.additional_key_info) for c in declared] == [
+            ("decode", 256)]
+        # a bucket per power of two up to the requests that can hold state at once (4 here)
+        assert declared[0].capture_batch_sizes == [1, 2, 4] and not declared[0].compile
+        blocked, declared = configs(engram_tables="host")
+        assert "host" in blocked and declared == []
 
 
 @pytest.fixture(scope="module")

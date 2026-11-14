@@ -8,6 +8,7 @@ writes random weights in the checkpoint's own names, dtypes and packing, which b
 """
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import importlib.util
 import json
@@ -170,8 +171,8 @@ def synthetic_tokenizer(vocab_size: int):
 def to_hf_config(config: DeepseekV41Config) -> dict:
     """``config`` as the checkpoint's config.json spells it (``from_hf_config``'s inverse)."""
     text = {f.name: getattr(config, f.name) for f in dataclasses.fields(config)}
-    for knob in ("max_seq_len", "max_output_tokens", "moe_experts", "moe_kernel", "engram_tables", "fp8_block",
-                 "bos_token_id", "eos_token_ids", "pad_token_id"):
+    for knob in ("max_seq_len", "max_output_tokens", "moe_experts", "moe_kernel", "engram_tables",
+                 "capture_contexts", "fp8_block", "bos_token_id", "eos_token_ids", "pad_token_id"):
         text.pop(knob)
     text["rope_scaling"] = {
         "rope_type": "yarn", "factor": text.pop("rope_factor"), "beta_fast": text.pop("rope_beta_fast"),
@@ -347,12 +348,20 @@ def reference_model(ref: types.SimpleNamespace, snapshot: str | Path, config: De
 
 class RecordingSampler:
     """Argmax in place of the kernel sampler, keeping the step's logits. Built on
-    ``StubResource`` by ``cpu_engine``."""
+    ``StubResource`` by ``cpu_engine``. A forward recorded into a graph leaves its logits
+    tensor in ``captured`` under its rows' ids: a replay of that graph refreshes it. ``replayed``
+    counts the steps ``run_step`` read from one."""
 
     logits: torch.Tensor | None = None
+    captured: dict | None = None
+    replayed: int = 0
 
     def sample(self, request_ids, logits, **kwargs):
         self.logits = logits.detach().float().clone()
+        if logits.is_cuda and torch.cuda.is_current_stream_capturing():
+            if self.captured is None:
+                self.captured = {}
+            self.captured[tuple(request_ids)] = self.logits
         return logits.argmax(-1)
 
 
@@ -500,7 +509,120 @@ def run_step(engine, sampler, walk: str, inputs: dict[str, torch.Tensor]) -> dic
     engine.exec_and_postprocess(batch)
     assert batch.admit_error is None, batch.admit_error
     engine.finalize_batch(batch)
-    return {rid: sampler.logits[i] for i, rid in enumerate(rids)}
+    logits = sampler.logits
+    lease = batch.step_context.slot_lease
+    if lease is not None and lease.bucket is not None:
+        # the step replayed a graph, whose logits are the tensor its capture left
+        runner = engine._submodules["LLM"].accelerator_graph_runner
+        torch.cuda.synchronize()
+        logits = sampler.captured[tuple(runner.slot_for(lease).dummy_rids)]
+        sampler.replayed += 1
+    return {rid: logits[i].clone() for i, rid in enumerate(rids)}
+
+
+@contextlib.contextmanager
+def eager_steps(engine):
+    """Run the engine's steps eagerly inside the block, whatever graphs it captured."""
+    mgmt = engine._submodules["LLM"]
+    runner, mgmt.accelerator_graph_runner = mgmt.accelerator_graph_runner, None
+    try:
+        yield
+    finally:
+        mgmt.accelerator_graph_runner = runner
+
+
+def captured_buckets(engine) -> list[str]:
+    """The decode buckets the engine captured, as strings."""
+    runner = engine._submodules["LLM"].accelerator_graph_runner
+    return [] if runner is None else sorted(str(bucket) for bucket in runner._buckets)
+
+
+@dataclasses.dataclass
+class Bucket:
+    """A decode capture bucket opened on an engine without a graph (``open_bucket``)."""
+
+    key: object
+    padding: list[int]
+
+
+def open_bucket(engine, rows: int, slots: int = 2, context: int | None = None) -> Bucket:
+    """Size the resources for a ``rows``-row decode bucket (captured for ``context`` tokens) and
+    run it once a slot as its capture does, every row a padding row: what ``bucket_step`` then
+    steps in, on any device."""
+    from mstar.engine.accelerator_graph_config import BatchedAcceleratorGraphConfig
+    from mstar.engine.accelerator_graph_runner import dummy_rid_handle
+    from mstar.engine.resources.base import CGSlotSpec
+    from mstar.engine.resources.step import BucketKey
+    from mstar.model.submodule_base import ARNodeInputs
+
+    config = BatchedAcceleratorGraphConfig(
+        capture_graph_walk="decode", compile=False,
+        single_request_inputs=ARNodeInputs(input_ids=torch.zeros(1, dtype=torch.long), input_seq_len=1))
+    key = BucketKey("decode", bs=rows, num_tokens=rows, cg_key_info=context)
+    engine._runner.build_accelerator_graph_buffers(
+        [CGSlotSpec(bucket=key, slot=slot, config=config, config_idx=0) for slot in range(slots)],
+        max_bs=rows, max_seq_len=rows, node_name="LLM")
+    padding = [dummy_rid_handle(f"__cg_dsv41_bucket{rows}_{context}_{i}__") for i in range(rows)]
+    for rid in padding:
+        engine._runner.ingest_capture_row(rid)
+    bucket = Bucket(key, padding)
+    for slot in range(slots):
+        bucket_step(engine, None, bucket, slot, {}, capture=True)
+    return bucket
+
+
+def bucket_step(engine, sampler, bucket: Bucket, slot: int, inputs: dict[str, torch.Tensor],
+                capture: bool = False) -> dict[str, torch.Tensor]:
+    """One decode step of ``inputs`` (a token id per request) laid out as a replay of
+    ``bucket`` lays it: under the bucket's lease, the rows past the requests its padding rows,
+    the forward run in Python. Each request's logits."""
+    from mstar.engine.accelerator_graph_runner import dummy_metadata
+    from mstar.engine.resources.step import SlotLease, StepContext
+    from mstar.model.submodule_base import ARNodeInputs, ModelInputsFromEngine, engine_step
+
+    mgmt = engine._submodules["LLM"]
+    sub, runner = mgmt.submodule, engine._runner
+    rids = list(inputs)
+    padded = [*rids, *bucket.padding[len(rids):bucket.key.bs]]
+    lease = SlotLease(slot=slot, bucket=bucket.key)
+    device = next(sub.language_model.parameters()).device
+    rows = [ARNodeInputs(input_ids=inputs[rid], input_seq_len=1) for rid in rids]
+    rows += [ARNodeInputs(input_ids=torch.zeros(1, dtype=torch.long, device=device), input_seq_len=1)
+             for _ in padded[len(rids):]]
+    infos = dummy_metadata(padded, "decode")
+    ctx = StepContext(request_ids=tuple(padded if capture else rids), graph_walk="decode", slot=slot,
+                      capture=capture, slot_lease=lease)
+    if not capture:
+        ctx.set_padded_rids(padded)
+    step = engine_step(sub, "decode", padded, rows, slot_lease=lease, per_request_info=infos)
+    step.set_ctx(ctx)
+    outcome = runner.admit(step)
+    assert outcome.ok, outcome
+    runner.plan(step)
+    engine_inputs = ModelInputsFromEngine(
+        request_ids=padded, per_request_info=infos, resources=dict(mgmt.resources), captured=True, step=step)
+    with torch.no_grad():
+        sub.forward_batched("decode", engine_inputs, **sub.preprocess("decode", engine_inputs, rows))
+    runner.commit(step)
+    return {} if sampler is None else {rid: sampler.logits[i].clone() for i, rid in enumerate(rids)}
+
+
+def run_requests(engine, sampler, ids: dict[str, torch.Tensor], prompt: int) -> dict[str, torch.Tensor]:
+    """Several requests at once: each prefilled with its first ``prompt`` ids alone, then all
+    of them decoded together a step at a time, each fed its own next id. Per request, the
+    logits after its prefill and after each decode step."""
+    out: dict[str, list[torch.Tensor]] = {}
+    for rid, tokens in ids.items():
+        add_request(engine, rid)
+        out[rid] = [run_step(engine, sampler, "prefill", {rid: tokens[:prompt]})[rid]]
+    steps = min(tokens.numel() for tokens in ids.values()) - prompt
+    for i in range(steps):
+        got = run_step(engine, sampler, "decode", {rid: tokens[prompt + i].view(1) for rid, tokens in ids.items()})
+        for rid, logits in got.items():
+            out[rid].append(logits)
+    for rid in ids:
+        engine.remove_request(rid)
+    return {rid: torch.stack(rows) for rid, rows in out.items()}
 
 
 def run_request(engine, sampler, ids: torch.Tensor, prompt: int, rid: str = "r") -> torch.Tensor:

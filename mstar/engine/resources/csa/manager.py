@@ -11,8 +11,12 @@ The caches count rows, so the resource keeps each request's token count: a step 
 ``CSAStep()`` over its tokens, ``kv_segments`` gives the rows each cache advances by, ``plan``
 lays the step's token positions over the caches' page tables (``CSARows``) and ``commit``
 advances the count. The layers write latents and keys, score, select and attend through the
-resource. This is the reference in torch: eager only (``can_capture`` is False), every row
-scored against its request's keys.
+resource. This is the reference in torch, every row scored against its request's keys.
+
+A decode step can be captured: under a capture lease ``plan`` lays the bucket's rows, its padding
+rows among them, into the (bucket, slot)'s own buffers, and every row scores each cache at one
+width (``CSAStep.context`` tokens, else all the cache holds), so the forward's shapes follow from
+the bucket alone and its values from the buffers a later plan refills.
 """
 
 from collections.abc import Mapping, Sequence
@@ -21,9 +25,9 @@ from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 
-from mstar.engine.resources.base import EngineResourceInfo, Resource
+from mstar.engine.resources.base import CGSlotSpec, EngineResourceInfo, Resource
 from mstar.engine.resources.csa.config import INDEX_PLANES, CSAConfig, CSASpec, CSAStep, Fp4Rows
-from mstar.engine.resources.step import Segment, StepContext
+from mstar.engine.resources.step import BucketKey, Segment, StepContext
 from mstar.utils.h2d import PinnedStager
 from mstar.utils.mx_round import pack_fp4_rows, unpack_fp4_rows
 
@@ -32,13 +36,15 @@ _MAIN = "main"
 
 @dataclass
 class CSACache:
-    """One cache's addressing for a step. Device: ``pages``, the flat page list of the step's
-    requests and one spare entry (a request may hold no page yet), and ``page_start``, each
-    request's first entry in it."""
+    """One cache's addressing for a step. Device: ``pages``, the flat page lists of the step's
+    requests in every cache, and ``page_start``, each request's first entry of this cache in it.
+    ``num_pages`` is the cache's size: an entry read past a request's own pages (a group it does
+    not hold, which the caller masks) is held inside the cache."""
 
     pages: torch.Tensor
     page_start: torch.Tensor
     page_size: int
+    num_pages: int
 
 
 @dataclass
@@ -47,7 +53,9 @@ class CSARows:
     its request (the step's order), ``first`` the step row its request starts at, ``end`` the
     position after its request's last row. Per request: ``req_first`` and ``req_rows`` (its
     rows in the step). ``caches`` by pooling ratio. Host: ``spans``, each request's ``(first
-    row, rows, first position)``."""
+    row, rows, first position)``; ``one_row_each``, whether every request runs one row (a decode
+    step); and under a capture lease ``widths``, the groups every row scores each cache at (the
+    most a request can hold), by ratio."""
 
     pos: torch.Tensor
     row_req: torch.Tensor
@@ -57,6 +65,8 @@ class CSARows:
     req_rows: torch.Tensor
     caches: dict[int, CSACache]
     spans: list[tuple[int, int, int]]
+    one_row_each: bool = False
+    widths: dict[int, int] | None = None
 
     def slots(self, ratio: int, req: torch.Tensor, groups: torch.Tensor) -> torch.Tensor:
         """Slots (``page * page_size + offset``) of ``groups`` of requests ``req`` in the cache
@@ -64,8 +74,23 @@ class CSARows:
         caller to mask."""
         cache = self.caches[ratio]
         entry = cache.page_start[req] + groups // cache.page_size
-        page = cache.pages[entry.clamp_max(cache.pages.numel() - 1)]
+        page = cache.pages[entry.clamp(0, cache.pages.numel() - 1)].clamp_max(cache.num_pages - 1)
         return page * cache.page_size + groups % cache.page_size
+
+    def score_width(self, ratio: int) -> int:
+        """The groups a step's rows score the ``ratio`` cache at: its requests' most, or a
+        captured step's fixed width."""
+        if self.widths is not None:
+            return max(1, self.widths[ratio])
+        return max(1, max(start + n for _, n, start in self.spans) // ratio)
+
+    def tail(self, count: int):
+        """An index of the step's rows that are among their request's last ``count``: every row
+        of a step that runs one row a request, as a slice, so that what a layer keeps of a
+        captured step for the next has a shape that does not follow from the rows' positions."""
+        if self.one_row_each:
+            return slice(None)
+        return self.pos >= self.end - count
 
     def groups(self, ratio: int) -> torch.Tensor:
         """Per row, the groups of a ``ratio`` cache it sees: those whose last token is at or
@@ -124,7 +149,7 @@ class CSAManager(Resource):
 
     @classmethod
     def build(cls, spec: CSASpec, info: EngineResourceInfo):
-        config, page_sizes = spec.config, {}
+        config, page_sizes, capacity = spec.config, {}, {}
         itemsize = info.kv_dtype.itemsize
         latent_bytes, key_bytes = config.row_bytes(itemsize)
 
@@ -147,17 +172,24 @@ class CSAManager(Resource):
                     f"CSA keeps its latents, {latent_bytes} bytes a row, on {key}: declare its "
                     f"kv_lora_rank as {-(-latent_bytes // itemsize)} {info.kv_dtype} values")
             page_sizes[ratio] = kv_config.tokens_per_page
-        return cls(config, page_sizes, info.device)
+            # a cache is sized in the node's tokens, of which a group takes ``ratio``
+            capacity[ratio] = kv_config.max_seq_len // ratio
+        return cls(config, page_sizes, info.device, capacity)
 
-    def __init__(self, config: CSAConfig, page_sizes: Mapping[int, int], device: torch.device):
+    def __init__(self, config: CSAConfig, page_sizes: Mapping[int, int], device: torch.device,
+                 capacity: Mapping[int, int] | None = None):
         self.config = config
         self.page_sizes = dict(page_sizes)
+        # by ratio, the groups a request's cache can hold: a captured step's score width
+        self.capacity = dict(capacity or {})
         self._device = device
         self._kv: dict[int, Resource] = {}  # by ratio, the caches it reads (`bind_dependencies`)
         self._current: dict[str, CSARows] = {}
         # request -> the tokens its committed steps ran: where its next step's rows stand
         self._tokens: dict = {}
         self._stager = PinnedStager(torch.long)
+        # (bucket, slot) -> the rows a captured graph reads, which every plan under that lease refills
+        self._cg_rows: dict[tuple[BucketKey, int], torch.Tensor] = {}
 
     def depends_on(self) -> set[str]:
         return set(self.config.caches.values())
@@ -165,9 +197,43 @@ class CSAManager(Resource):
     def bind_dependencies(self, resources: Mapping[str, Resource]) -> None:
         self._kv = {ratio: resources[key] for ratio, key in self.config.caches.items()}
 
-    def can_capture(self) -> bool:
-        # the torch reference sizes its launches on the host
-        return False
+    @property
+    def force_double_buffer(self) -> bool:
+        # a captured slot's rows are refilled in `plan` from pinned memory, which the replay
+        # before it may still be reading
+        return True
+
+    # -- capture buffers ---------------------------------------------------------------------
+
+    def _layout(self, rows: int, requests: int, pages: int) -> tuple[list[int], int]:
+        """The sizes of a step's staged parts, in order, and their sum: four values a row, two
+        a request, each cache's first page entry a request, then ``pages`` page entries and a
+        spare one."""
+        sizes = [rows] * 4 + [requests] * (2 + len(self.config.caches)) + [pages + 1]
+        return sizes, sum(sizes)
+
+    def _bucket_pages(self, bucket: BucketKey) -> int:
+        """Page entries a captured bucket's requests can hold over every cache."""
+        return bucket.bs * sum(-(-self._capacity(ratio) // size) for ratio, size in self.page_sizes.items())
+
+    def _capacity(self, ratio: int) -> int:
+        if ratio not in self.capacity:
+            raise RuntimeError(f"csa: no capacity known for the cache of ratio {ratio}: a capture needs "
+                               "the groups a request can hold (CSAManager.build)")
+        return self.capacity[ratio]
+
+    def _cg_buffer(self, bucket: BucketKey, slot: int) -> torch.Tensor:
+        key = (bucket, slot)
+        buf = self._cg_rows.get(key)
+        if buf is None:
+            _, total = self._layout(bucket.num_tokens, bucket.bs, self._bucket_pages(bucket))
+            buf = self._cg_rows[key] = torch.zeros(total, dtype=torch.long, device=self._device)
+        return buf
+
+    def build_accelerator_graph_buffers(self, slots: list[CGSlotSpec], max_bs: int,
+                                        max_seq_len: int) -> None:
+        for spec in slots:
+            self._cg_buffer(spec.bucket, spec.slot)
 
     # -- the request and the step ------------------------------------------------------------
 
@@ -193,27 +259,48 @@ class CSAManager(Resource):
         labels: dict[str, list[Segment]] = {}
         for segment in step.segments:
             labels.setdefault(segment.label, []).append(segment)
-        self._current = {label: self._rows(label, segments, ctx) for label, segments in labels.items()}
+        self._current = {
+            label: self._rows(label, segments, ctx, step.context) for label, segments in labels.items()}
         return self._current
 
-    def _rows(self, label: str, segments: list[Segment], ctx: StepContext) -> CSARows:
+    def _rows(self, label: str, segments: list[Segment], ctx: StepContext,
+              context: int | None = None) -> CSARows:
+        lease = ctx.slot_lease
+        graph = lease is not None and lease.bucket is not None
+        tokens = self._tokens
         pos: list[int] = []
         row_req: list[int] = []
         first: list[int] = []
         end: list[int] = []
         spans: list[tuple[int, int, int]] = []
         for i, (rid, _, n) in enumerate(segments):
-            row0, start = len(pos), self._tokens.get(rid, 0)
+            # a capture's rows and a replay's padding rows hold nothing: they stand at token 0
+            start = 0 if ctx.capture or ctx.is_padding_row(rid) else tokens.get(rid, 0)
+            row0 = len(pos)
             spans.append((row0, n, start))
             pos.extend(range(start, start + n))
             row_req.extend([i] * n)
             first.extend([row0] * n)
             end.extend([start + n] * n)
+        one_row_each = all(n == 1 for _, n, _ in spans)
+        if graph:
+            bucket = lease.bucket
+            if not one_row_each or (len(pos), len(spans)) != (bucket.num_tokens, bucket.bs):
+                raise RuntimeError(
+                    f"csa: a captured step runs one row a request at its bucket's shape; {bucket} got "
+                    f"{len(pos)} rows of {len(spans)} requests")
+            if context is not None and max(end) > context:
+                raise RuntimeError(
+                    f"csa: a request reaches token {max(end)}, past the {context} tokens of context "
+                    f"the {bucket} capture scores")
 
         def host(values) -> torch.Tensor:
             return torch.as_tensor(values, dtype=torch.long)
 
         parts = [host(p) for p in (pos, row_req, first, end, [s for s, _, _ in spans], [n for _, n, _ in spans])]
+        # every cache's page lists end to end in one list, each request's first entry by cache
+        page_lists: list[torch.Tensor] = []
+        entries = 0
         for ratio, key in self.config.caches.items():
             kv_out = ctx.plan_results[key][label]
             for view, (_, n, start) in zip(kv_out.views, spans, strict=True):
@@ -225,18 +312,44 @@ class CSAManager(Resource):
                         f"({have - start // ratio} to {have})")
             indptr = kv_out.cpu_indptrs
             # the page lists stay tensors: a long context's are the bulk of the plan
-            parts += [torch.cat([host(indptr.paged_kv_indices), host([0])]), host(indptr.paged_kv_indptr[:-1])]
+            parts.append(host(indptr.paged_kv_indptr[:-1]) + entries)
+            page_lists.append(host(indptr.paged_kv_indices))
+            entries += page_lists[-1].numel()
+        parts += [*page_lists, host([0])]
 
+        used = sum(p.numel() for p in parts)
+        if graph:
+            # the slot's buffer, laid out for the most pages its requests can hold: the graph
+            # recorded these addresses, and what lies past this step's page lists is not read
+            sizes, _ = self._layout(len(pos), len(spans), self._bucket_pages(lease.bucket))
+            if entries + 1 > sizes[-1]:
+                raise RuntimeError(f"csa: {entries} pages overflow the {lease.bucket} capture's buffers")
+            staged = self._cg_buffer(lease.bucket, lease.slot)
+        else:
+            sizes, _ = self._layout(len(pos), len(spans), entries)
+            staged = torch.empty(used, dtype=torch.long, device=self._device)
         # one copy from pinned memory, which waits for nothing on the stream
-        staged = torch.empty(sum(p.numel() for p in parts), dtype=torch.long, device=self._device)
-        self._stager.copy_(staged, torch.cat(parts).numpy())
-        cuts = iter(staged.split([p.numel() for p in parts]))
-        rows = CSARows(*(next(cuts) for _ in range(6)), caches={}, spans=spans)
-        for ratio in self.config.caches:
-            rows.caches[ratio] = CSACache(next(cuts), next(cuts), self.page_sizes[ratio])
+        self._stager.copy_(staged[:used], torch.cat(parts).numpy())
+        cuts = iter(staged.split(sizes))
+        widths = None
+        if graph:
+            widths = {ratio: self._capacity(ratio) if context is None else min(self._capacity(ratio), context // ratio)
+                      for ratio in self.config.caches}
+        rows = CSARows(*(next(cuts) for _ in range(6)), caches={}, spans=spans, one_row_each=one_row_each,
+                       widths=widths)
+        starts = [next(cuts) for _ in self.config.caches]
+        pages = next(cuts)
+        for (ratio, page_start) in zip(self.config.caches, starts, strict=True):
+            rows.caches[ratio] = CSACache(pages, page_start, self.page_sizes[ratio], self._num_pages(ratio))
         return rows
 
+    def _num_pages(self, ratio: int) -> int:
+        """The pages the ``ratio`` cache was built with."""
+        return self._cache(ratio).layer_view(0).shape[0]
+
     def commit(self, step: CSAStep, ctx: StepContext) -> None:
+        if ctx.capture:
+            return  # a capture's rows are padding rows, which stay at token 0
         tokens = self._tokens
         for rid, _, span in step.segments:
             if span and not ctx.is_padding_row(rid):
@@ -282,12 +395,12 @@ class CSAManager(Resource):
         view = self._cache(ratio).aux_view(INDEX_PLANES, plane)
         flat = view.view(-1, view.shape[-1])
         seen = rows.groups(ratio)
-        width = max(1, max(start + n for _, n, start in rows.spans) // ratio)
+        width = rows.score_width(ratio)
         out = torch.full((q.shape[0], width), -torch.inf, dtype=torch.float32, device=q.device)
         group = torch.arange(width, device=q.device)
         heads = q.shape[1]
         with torch.autocast(q.device.type, enabled=False):
-            if all(n == 1 for _, n, _ in rows.spans):
+            if rows.one_row_each:
                 # a decode step: every row against its own request's keys, a launch per chunk
                 # of rows instead of one per request
                 chunk = max(1, self.config.score_bytes // (4 * width * max(heads, q.shape[-1])))

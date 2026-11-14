@@ -135,6 +135,11 @@ class DeepseekV41Config:
     # with bf16 tensor cores, Triton), else torch; "torch" the dispatch expert by expert, the
     # arithmetic the kernel is held to, eager only
     moe_kernel: str = "auto"
+    # the contexts, in tokens, a decode graph is captured for: a step replays the smallest that
+    # holds its longest request, whose rows score their caches at that width. None: 4,096 and
+    # each four times it below ``max_seq_len``, then ``max_seq_len``. A request past the last
+    # decodes eagerly.
+    capture_contexts: tuple[int, ...] | None = None
     # where the Engram tables are held: "device" shards them by rows across the TP ranks, which
     # sum their lookups; "host" maps the checkpoint's bytes once for every rank (ENGRAM), and a
     # step fetches its rows through the host
@@ -190,6 +195,13 @@ class DeepseekV41Config:
                 raise ValueError("candidate_topk_blocks x candidate_block_size must cover index_topk")
         if len(self.engram_num_embeddings) != len(self.engram_layer_ids):
             raise ValueError("engram_num_embeddings needs one table size per engram layer")
+        contexts = self.capture_contexts
+        if contexts is not None:
+            contexts = tuple(contexts)
+            if not contexts or any(isinstance(c, bool) or not isinstance(c, int) or c < 1 for c in contexts) \
+                    or list(contexts) != sorted(set(contexts)):
+                raise ValueError(f"capture_contexts must be ascending positive token counts, got {contexts!r}")
+            self.capture_contexts = contexts
         if self.engram_tables not in ("device", "host"):
             raise ValueError(f"engram_tables must be 'device' or 'host', got {self.engram_tables!r}")
 
@@ -244,6 +256,17 @@ class DeepseekV41Config:
         the two-byte values a cache is typed in as served (890 bytes a token over the
         checkpoint's four sources, against 3,200 unpacked)."""
         return -(-self.latent_rows.nbytes(self.head_dim) // 2), -(-self.key_rows.nbytes(self.index_head_dim) // 2)
+
+    @property
+    def capture_ladder(self) -> tuple[int, ...]:
+        """The contexts decode graphs are captured for, ascending, none past ``max_seq_len``."""
+        if self.capture_contexts is not None:
+            return tuple(sorted({min(c, self.max_seq_len) for c in self.capture_contexts}))
+        ladder, context = [], 4096
+        while context < self.max_seq_len:
+            ladder.append(context)
+            context *= 4
+        return (*ladder, self.max_seq_len)
 
     @property
     def softmax_scale(self) -> float:

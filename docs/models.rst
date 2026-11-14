@@ -60,8 +60,9 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
      - ``deepseek-ai/DeepSeek-V4.1-Flash``
      - *(Beta)* DeepSeek-V4.1-Flash (763B stored, 384 experts top-6): sliding-window plus
        compressed sparse attention over hyper-connected MoE blocks with Engram lookups, text in /
-       text out, fp8 linears and fp4 experts. The reference numerics in torch, served eager;
-       the vision tower and the DSpark draft layers are not loaded. See `DeepSeek-V4.1-Flash`_.
+       text out, fp8 linears and fp4 experts. The reference numerics in torch, decode steps
+       captured where the expert kernel runs; the vision tower and the DSpark draft layers are
+       not loaded. See `DeepSeek-V4.1-Flash`_.
    * - ``glm5_next``
      - ``zai-org/GLM-5.3-Flash``
      - GLM-5.3-Flash (320B/18B): hybrid KDA linear-attention + MLA MoE causal
@@ -1002,9 +1003,12 @@ DeepSeek-V4.1-Flash
 ``configs/deepseek_v41_flash_tp8.yaml`` serves the text backbone on one 8-GPU node (TP8).
 What is served is the checkpoint's reference arithmetic, op by op in torch: every linear
 reads its input rounded to FP8, the caches hold values rounded to the FP8 and FP4 grids the
-model was trained with, and the attention and the indexer run eager, with no captured
-graphs. It is the numerics anchor that kernels are held to, not a fast path; the routed
-experts are the first piece on a kernel (``moe_kernel`` below).
+model was trained with, and the attention and the indexer run in torch. It is the numerics
+anchor that kernels are held to, not a fast path; the routed experts are the first piece on a
+kernel (``moe_kernel`` below). Where that kernel runs, a decode step (one row a request)
+replays a captured graph, one per context of ``capture_contexts`` and per power-of-two batch
+up to ``max_requests``; a prompt's step runs eager, and so does every step with
+``moe_kernel: torch`` or ``engram_tables: host``.
 
 Each layer attends its last 128 tokens, and layers 2 to 39 also the 512 rows an indexer picks
 from a compressed cache (three caches pool two tokens per row, one keeps every token). The
@@ -1022,8 +1026,12 @@ the checkpoint's bytes, one launch per GEMM for a step's rows, with the referenc
 routing weight and FP8 rounding between the two in torch, which an accelerator graph can
 record; a GEMM's fp32 sum then runs in another order than torch's, so the logits agree to that
 rounding and not bit for bit; ``torch``: the dispatch expert by expert, the arithmetic the
-kernel is held to, eager only, and what the other layouts and CPUs run), ``engram_tables``
-(``device``, the default, or ``host``). The ``-1017`` refresh has the same layout: pass it as
+kernel is held to, eager only, and what the other layouts and CPUs run), ``capture_contexts``
+(the contexts, in tokens, a decode graph is captured for: a step replays the smallest that
+holds its longest request with 16 tokens to spare, its rows scoring their caches at that
+width, the same logits as the eager step; unset, 4096 and each four times it below
+``max_seq_len``, then ``max_seq_len``; a request past the last decodes eagerly),
+``engram_tables`` (``device``, the default, or ``host``). The ``-1017`` refresh has the same layout: pass it as
 ``model_kwargs.checkpoint_path``. An ``ep_config: {parallel: ep}`` on the node group gives each
 rank whole routed experts (48 of the 384 at TP8, 2304 wide) instead of a slice of every one;
 its other keys are refused.
