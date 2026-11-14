@@ -14,6 +14,7 @@ against diffusers' pipeline.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import logging
 import math
@@ -22,6 +23,7 @@ from typing import NamedTuple
 
 import torch
 from torch import nn
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import CurrentForwardPassInfo
@@ -120,6 +122,16 @@ def text_cache_key(ids: torch.Tensor, pixels: list[torch.Tensor] = ()) -> str:
     return digest.hexdigest()
 
 
+def prompt_attention(device: torch.device):
+    """The SDPA kernels the text node's language model attends with: FlashAttention-2 first. A prompt is encoded at
+    its own length, and torch's default for this call on an H200 (torch 2.11) is cuDNN's attention, which builds a
+    graph per sequence length: the first prompt of each new length cost ~0.5 s, where FlashAttention-2 has no
+    per-shape setup."""
+    if device.type != "cuda":
+        return contextlib.nullcontext()
+    return sdpa_kernel([SDPBackend.FLASH_ATTENTION, SDPBackend.CUDNN_ATTENTION, SDPBackend.MATH], set_priority=True)
+
+
 class H3TextEncoderSubmodule(NodeSubmodule):
     """Prompt token ids ``[L]`` -> the DiT's text rows ``[L, hidden]`` bf16: Qwen3-VL-32B
     through layer 50, then the DiT's ``condition_proj`` and token refiner. The refiner's
@@ -188,9 +200,11 @@ class H3TextEncoderSubmodule(NodeSubmodule):
         device = self.get_device()
         ids = text_inputs.to(device=device, dtype=torch.long)
         if vision_pixels is None:
-            hidden = self.encoder(ids[None], torch.ones_like(ids[None]), padded=False)
+            with prompt_attention(device):
+                hidden = self.encoder(ids[None], torch.ones_like(ids[None]), padded=False)
         else:
-            hidden = self._encode_with_images(ids, vision_pixels.flatten(0, -2).to(device), list(step.grids))
+            hidden = self._encode_with_images(ids, vision_pixels.flatten(0, -2).to(device), list(step.grids),
+                                              serving=True)
         rows = self.conditioner(hidden)[0]
         if step.cache_key is not None:
             self._cache[step.cache_key] = rows
@@ -198,7 +212,10 @@ class H3TextEncoderSubmodule(NodeSubmodule):
                 self._cache.popitem(last=False)
         return {TEXT_EMBEDS: [rows]}
 
-    def _encode_with_images(self, ids: torch.Tensor, pixels: torch.Tensor, grids: list) -> torch.Tensor:
+    def _encode_with_images(self, ids: torch.Tensor, pixels: torch.Tensor, grids: list,
+                            serving: bool = False) -> torch.Tensor:
+        """``serving``: the language model attends as :func:`prompt_attention` picks (the parity scripts call
+        this with torch's default, the reference's kernel)."""
         vision, device = self.vision, ids.device
         merge = vision.config.spatial_merge_size
         self._frames.lengths = vision_seq_lengths(grids)
@@ -213,8 +230,9 @@ class H3TextEncoderSubmodule(NodeSubmodule):
             self.mrope_inv_freq, list(self.h3_config.mrope_section),
         )
         ones = torch.ones_like(ids[None])
-        return self.encoder(ids[None], ones, padded=False, inputs_embeds=prompt.inputs_embeds,
-                            rotary=prompt.rotary, deepstack=prompt.deepstack)
+        with prompt_attention(device) if serving else contextlib.nullcontext():
+            return self.encoder(ids[None], ones, padded=False, inputs_embeds=prompt.inputs_embeds,
+                                rotary=prompt.rotary, deepstack=prompt.deepstack)
 
     def declare_step(self, graph_walk, request_ids, inputs: list[NodeInputs], slot_lease=None, piecewise_leases=None,
                      **kwargs) -> SubmoduleStep:

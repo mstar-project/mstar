@@ -2585,6 +2585,11 @@ in use once loaded), so they need 141 GB GPUs (H200); no config has been run on 
 On SDPA the nodes' modules, driven by ``test/minimax_h3/parity.py`` (fp32 matmuls at
 "highest"), were bit-identical to diffusers' MiniMax-H3 pipeline end to end (latents, frames,
 waveform), measured at ``f6260f2677``; with ``--exact`` the script exits nonzero when one isn't.
+The served text node attends with FlashAttention-2 rather than torch's default on Hopper, cuDNN's
+attention, which builds a graph for each sequence length it hasn't seen: ~0.5 s for every prompt
+length new to the process on an H200, which doubled MiniMax-H3-Image's 1024² latency on distinct
+prompts (0.87 s against 0.39 s on two H200s). The parity scripts keep torch's default, the
+reference's kernel.
 FA3 and the compiled DiT are not bit-exact. Served at 768p (50 steps, SP2 on H200, three
 seeds), measured on main's earlier SP path, before the DiT and the decoder moved onto the sequence
 shard, clips are 23.7-32.8 dB (video) and 17.8-22.3 dB (audio) from diffusers', where the
@@ -2669,14 +2674,18 @@ configs: ``minimax_h3_image.yaml`` (2 GPUs, the DiT alone on one), ``minimax_h3_
 the conditioner and the VAE encoder on rank 1) and
 ``minimax_h3_image_1gpu.yaml`` (~119 GiB in use on one H200 at 16 MP).
 
-At ``backend: sdpa`` the nodes' modules, driven by ``test/minimax_h3_image/parity.py``
-(fp32 matmuls at "highest"), are bit-identical to diffusers' pipeline end to end on a B300 (the
-packed layout, the seeded noise, the references' latents, every step and the decoded image) for
-text-to-image at 1024², 2048² and 4096² and edits with one and four references; a server at
-``sdpa`` returns the same pixels. FlashInfer and the compiled DiT are not bit-exact: served on two
-H200s, images are 19.9-36.8 dB from diffusers', where diffusers on another SDPA kernel moves
-21.3 dB (the four-reference edit, which M* serves 1.4 dB under that) to 38.5 dB (a
-one-reference edit) from itself: the six-step sampler amplifies kernel differences.
+At ``backend: sdpa`` the nodes' modules, driven by ``test/minimax_h3_image/parity.py`` (fp32 matmuls
+at "highest"), are bit-identical to diffusers' pipeline end to end on a B300 (the packed layout, the
+seeded noise, the references' latents, every step and the decoded image) for text-to-image at 1024²,
+2048² and 4096² and edits with one and four references; a server at ``sdpa`` returned the same
+pixels while its text node attended on torch's default kernel. The node now attends with
+FlashAttention-2 (see MiniMax-H3), as far from an fp64 attention as cuDNN's: on two H200s that moves
+images 21.0-23.0 dB (mean per size; 14.5 dB at worst) from the default kernel's, about what the
+DiT's FlashInfer FA2 kernel in place of its FA3 one does (21.8-24.3 dB; 14.5 dB). FlashInfer and the
+compiled DiT are not bit-exact: served on two H200s, images are 19.9-36.8 dB from diffusers', where
+diffusers on another SDPA kernel moves 21.3 dB (the four-reference edit, which M* serves 1.4 dB
+under that) to 38.5 dB (a one-reference edit) from itself: the six-step sampler amplifies kernel
+differences.
 
 Seconds per image, one request at a time, each engine on the same H200s (M* on torch
 2.11.0+cu128 and FlashInfer 0.7.2; text-to-image, seed 42, median of 3 after 2 warmups;
