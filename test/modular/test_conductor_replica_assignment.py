@@ -137,10 +137,15 @@ def test_an_idle_episode_on_one_replica_does_not_block_a_free_replica():
 
 def test_episode_pick_keeps_the_normal_replica_when_it_has_a_slot():
     conductor = _conductor({0: _wg(0, [0, 1])})
-    conductor._episode_slots = EpisodeSlots(1)
+    conductor._episode_slots = EpisodeSlots(2)
+    conductor._episode_slots.reserve("idle", {"worker_0"})  # slot 0; slot 1 is still free
+    conductor._router._last_pick[(0, 0)] = -2
+    conductor._router._last_pick[(0, 1)] = 0
     groups_run = conductor._router.groups_run(["default"])
     preferred = conductor._router.pick({}, groups_run)
 
+    assert preferred.replicas == {0: 0}
+    assert conductor._episode_slots.free_slot({"worker_0"}) == 1
     assert conductor._pick_episode_placement({}, groups_run) == preferred
 
 
