@@ -32,6 +32,7 @@ REDACT = [re.compile(p) for p in (
     r"sk-ant-[A-Za-z0-9_-]+",
     r"(gh[opsur]_|github_pat_)[A-Za-z0-9_]{20,}",
     r"hf_[A-Za-z0-9]{20,}",
+    r"rpa_[A-Za-z0-9]{20,}",  # RunPod's pod-scoped key, which RunPod puts in every pod's environment
     r"AKIA[0-9A-Z]{16}",
     r"eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+",
 )]

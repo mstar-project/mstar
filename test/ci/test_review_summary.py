@@ -115,6 +115,14 @@ class TestReviewSummary(unittest.TestCase):
                          "the model could say a question was answered when nobody commented")
         self.assertEqual(carried(review(), earlier, True, [])["risk"]["level"], "low",
                          "a maintainer's answer would leave the earlier risk standing")
+        secure = carried({**review(), "risk": {**review()["risk"], "security": False}},
+                         {"risk": {**earlier["risk"], "security": True}}, False, [])
+        self.assertTrue(secure["risk"]["security"], "a small fix commit could clear the security flag and approve")
+        self.assertTrue(read_state(render(secure, [], "0123456789", "full", []))["risk"]["security"],
+                        "the next re-review would not know the flag")
+        commented = carried({**review(), "risk": {**review()["risk"], "security": False}},
+                            {"risk": {**earlier["risk"], "security": True}}, True, [])
+        self.assertTrue(commented["risk"]["security"], "a maintainer's comment is not an approval of security code")
         decision = {"location": "a.py:1", "why": "new lifecycle state"}
         floored = carried(review(), {"risk": {**earlier["risk"], "look_at": [decision]}}, False, [])
         self.assertEqual(floored["risk"]["look_at"], [decision], "the checklist wouldn't name the decision kept")
@@ -251,7 +259,11 @@ class TestReviewSummary(unittest.TestCase):
                                 "- [ ] **[P2]** `outside the diff, b.py:9`: a p2 claim",
                                 "- [ ] Not reviewed: `vendored.py`"],
                          "the checklist's ranking would drift from what a human must decide first")
-        self.assertIn("Approve if you're OK with these.", text)
+        self.assertNotIn("Approve if you're OK", text, "a list shown with no approval in view would ask for one")
+        self.assertIn("Approve if you're OK with these.", SUMMARY["checklist"](r, pages, [], approving=True))
+        self.assertNotIn("Approve if you're OK", render(r, pages, "0123456789", "light", []),
+                         "an advisory review would ask for an approval")
+        self.assertIn("Approve if you're OK", render(r, pages, "0123456789", "full", []))
         full = render(r, pages, "0123456789", "light", [])
         self.assertEqual(full.count("a design call"), 1, "the design decisions would be said twice")
         self.assertLess(full.index("Latent bugs"), full.index("What's left for you"),
