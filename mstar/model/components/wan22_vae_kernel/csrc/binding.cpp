@@ -2,7 +2,7 @@
 //   fastvideo-kernel/wan22_vae_decode/solution/binding.cpp
 // Local changes (M*): the latent grid comes from the latents (Decoder::LH/LW) instead of upstream's fixed
 // 44x78 (704x1248) literals; prepare_local / decode_local (one GPU, no process group) and StreamDecoder
-// (the causal history kept between calls) at the end of the file.
+// (the causal history kept between calls) at the end of the file; on Hopper, cudnn_conv below.
 // SPDX-License-Identifier: Apache-2.0
 // Wan2.2 VAE decoder seed. Derived from the reference architecture and
 // indexing in diffusers' AutoencoderKLWan (Wan Team / Hugging Face Team,
@@ -33,6 +33,23 @@ at::Tensor time_upsample(const at::Tensor&,const at::Tensor&,const at::Tensor&,c
 using PG = c10::intrusive_ptr<c10d::ProcessGroup>;
 using at::Tensor;
 using Weights = std::vector<Tensor>;
+
+// M*: the convolutions cuDNN runs (post_quant, conv_in, the attention's 1x1s). cuDNN picks a kernel per shape, and on an
+// H200 (cuDNN 9.19, 832x480) a pass of 4 latent frames got kernels that round differently from passes of 1 to 3, so
+// a clip's frames depended on how it was cut into passes. On Hopper each output frame is its own call: every call has
+// the same shape at any pass size, hence the same kernel.
+static Tensor cudnn_conv(const Tensor& p,const Tensor& w,const std::vector<int64_t>& padding) {
+#ifdef WAN22_VAE_SM90
+  const int kt=w.size(2), frames=p.size(2)-kt+1;
+  if(frames>1) {
+    std::vector<Tensor> out;
+    for(int t=0;t<frames;t++)
+      out.push_back(at::cudnn_convolution(p.narrow(2,t,kt),w,padding,{1,1,1},{1,1,1},1,false,false,false));
+    return at::cat(out,2).contiguous(at::MemoryFormat::ChannelsLast3d);
+  }
+#endif
+  return at::cudnn_convolution(p,w,padding,{1,1,1},{1,1,1},1,false,false,false);
+}
 
 Weights prepare(const Weights& weights,int64_t rank,int64_t world,const PG& pg) {
   TORCH_CHECK(weights.size()==110,"Expected the 110 decoder tensors");
@@ -221,7 +238,7 @@ struct Decoder {
       y=out.y;
       if(fuse) { prepared=out.n; prepared_for=fnext; prepared_sharded=sharded;
                  if(!write_y) y_suppressed_for=fnext; }
-    } else y=use_custom?custom_conv(p,w[idx],padding[1],padding[2],3):at::cudnn_convolution(p,w[idx],padding,{1,1,1},{1,1,1},1,false,false,false);
+    } else y=use_custom?custom_conv(p,w[idx],padding[1],padding[2],3):cudnn_conv(p,w[idx],padding);
     if(add_bias && wi<0) finish(y,w[idx+1],residual);
     return y;
   }

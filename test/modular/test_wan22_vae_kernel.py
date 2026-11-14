@@ -1,11 +1,12 @@
 """Wan2.2's opt-in ``vae_decode_kernel`` (``mstar.model.components.wan22_vae_kernel``).
 
 CPU: the kernels read the decoder's tensors by position, so their order and shapes are pinned against diffusers'
-TI2V-5B ``AutoencoderKLWan`` (built on the meta device); the knob is refused where it cannot apply, and a node that
-cannot run the kernels (no sm_100 / sm_103 GPU, or not the TI2V-5B VAE) decodes exactly as with the knob off.
+TI2V-5B ``AutoencoderKLWan`` (built on the meta device); the knob is refused where it cannot apply, the kernels build
+for Hopper and Blackwell only, and a node that cannot run them (no sm_90 / sm_100 / sm_103 GPU, or not the TI2V-5B VAE)
+decodes exactly as with the knob off.
 
-GPU (compute capability 10.0 / 10.3 and the Wan2.2-TI2V-5B VAE in the HF cache): the kernels' video against an fp32
-decode of the same latents, and a stream cut into pieces against the whole decode, bit for bit."""
+GPU (compute capability 9.0 / 10.0 / 10.3 and the Wan2.2-TI2V-5B VAE in the HF cache): the kernels' video against an
+fp32 decode of the same latents, and a stream cut into pieces against the whole decode, bit for bit."""
 
 from __future__ import annotations
 
@@ -73,6 +74,27 @@ def _tiny_vae() -> AutoencoderKLWan:
     return vae
 
 
+@pytest.mark.parametrize(
+    ("capability", "arch"),
+    [((9, 0), "sm_90a"), ((10, 0), "sm_100a"), ((10, 3), "sm_103a"), ((8, 0), None), ((12, 0), None)],
+)
+def test_the_kernels_build_for_hopper_and_blackwell_only(monkeypatch, capability, arch):
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device=None: capability)
+    monkeypatch.setattr(wan22_vae_kernel, "_cutlass_dir", lambda: "/cutlass")
+    monkeypatch.setattr(wan22_vae_kernel.shutil, "which", lambda name: f"/usr/bin/{name}")
+    reason = wan22_vae_kernel.unsupported_reason()
+    if arch is None:
+        assert reason is not None and f"not {capability[0]}.{capability[1]}" in reason
+        return
+    assert reason is None
+    assert wan22_vae_kernel._arch(torch.device("cuda")) == arch
+    cflags, cuda_flags = wan22_vae_kernel.build_flags(arch)
+    assert f"-gencode=arch=compute_{arch[3:]},code={arch}" in cuda_flags
+    # Hopper's configuration (csrc/arch.h, csrc/binding.cpp) is chosen at build time, and only for sm_90a
+    assert ("-DWAN22_VAE_SM90" in cflags) == ("-DWAN22_VAE_SM90" in cuda_flags) == (arch == "sm_90a")
+
+
 def test_a_vae_the_kernels_do_not_fit_is_named():
     reason = wan22_vae_kernel.unsupported_reason(vae=_tiny_vae())
     assert reason is not None and "TI2V-5B" in reason
@@ -102,8 +124,8 @@ def test_where_the_kernels_cannot_run_the_knob_changes_nothing(monkeypatch, capl
 
 
 def _gpu_vae():
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in ((10, 0), (10, 3)):
-        pytest.skip("needs a compute capability 10.0 / 10.3 GPU")
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() not in wan22_vae_kernel.ARCHS:
+        pytest.skip("needs a compute capability 9.0 / 10.0 / 10.3 GPU")
     if wan22_vae_kernel.unsupported_reason() is not None:
         pytest.skip(wan22_vae_kernel.unsupported_reason())
     try:

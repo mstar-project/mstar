@@ -2290,15 +2290,15 @@ tiles only when free VRAM at decode time is short of the untiled estimate
 32 GiB card. No CUDA-graph capture, no continuous batching (one request per
 step) and no component offload.
 
-**Blackwell VAE kernels (opt-in, near-lossless).** ``vae_decode_kernel: true`` (TI2V-5B and
+**VAE kernels (opt-in, near-lossless).** ``vae_decode_kernel: true`` (TI2V-5B and
 FastWan only) decodes on the Wan2.2-VAE kernels in ``components/wan22_vae_kernel``: FastVideo's
 decoder (Winograd 3x3 convolutions, phase-split upsampling, fused norms; Apache-2.0), generalized
 from its fixed 704x1248 to any size. They run on compute capability 10.0 / 10.3 (B200, GB200,
-B300), build on first use against FlashInfer's CUTLASS headers (about a minute, then cached),
-and take any untiled size without a compile. On one B300 a 1280x704x81 decode takes 0.52 s
-instead of 1.15 s. The frames are not the default decode's: 54.6 dB from an fp32 decode where
-the default bf16 decode is 55.3 dB, LPIPS 0.0003 for both. On another GPU the knob is ignored,
-with one warning.
+B300) and 9.0 (H100, H200), build on first use against FlashInfer's CUTLASS headers (about a
+minute, then cached), and take any untiled size without a compile. A 1280x704x81 decode takes
+0.52 s instead of 1.15 s on one B300, and 1.36 s instead of 2.36 s on one H200. The frames are not
+the default decode's: 54.6 dB from an fp32 decode where the default bf16 decode is 55.3 dB, LPIPS
+0.0003 for both, on either GPU. On another GPU the knob is ignored, with one warning.
 
 **Tiny VAE (opt-in, lossy).** ``vae_decode_tiny: <path>`` (TI2V-5B and FastWan only) decodes with
 the decoder of madebyollin/taehv's ``taew2_2.pth`` or ``taew2_2_super.pth`` (MIT; download the file and give its

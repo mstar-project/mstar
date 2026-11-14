@@ -1,5 +1,6 @@
 // Vendored from FastVideo (Apache-2.0): hao-ai-lab/FastVideo @ ec9145a,
-//   fastvideo-kernel/wan22_vae_decode/solution/wino_epilogue.cu. Unchanged.
+//   fastvideo-kernel/wan22_vae_decode/solution/wino_epilogue.cu
+// Local changes (M*): below sm_100 (an sm_90a build) vadd / vsub / vfmas run as two scalar instructions each.
 // SPDX-License-Identifier: Apache-2.0
 // Fused F(4x4,3x3) inverse transform for the causal 3x3x3 Winograd convolutions.
 // One pass over the 36 component tensors M produces BOTH
@@ -60,6 +61,13 @@ __device__ __forceinline__ unsigned long long pk(V2 a){
 __device__ __forceinline__ V2 upk(unsigned long long u){
   V2 r; r.x=__uint_as_float((unsigned)u); r.y=__uint_as_float((unsigned)(u>>32)); return r;
 }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 1000
+// M*: sm_90 has no f32x2 instructions. Each lane of one is the IEEE round-to-nearest scalar operation, so the same
+// two scalar ones give the same bits.
+__device__ __forceinline__ V2 vadd(V2 a,V2 b){ return V2(__fadd_rn(a.x,b.x),__fadd_rn(a.y,b.y)); }
+__device__ __forceinline__ V2 vsub(V2 a,V2 b){ return V2(__fsub_rn(a.x,b.x),__fsub_rn(a.y,b.y)); }
+__device__ __forceinline__ V2 vfmas(V2 a,float c,V2 acc){ return V2(__fmaf_rn(a.x,c,acc.x),__fmaf_rn(a.y,c,acc.y)); }
+#else
 __device__ __forceinline__ V2 vadd(V2 a,V2 b){
   unsigned long long r; asm("add.rn.f32x2 %0,%1,%2;":"=l"(r):"l"(pk(a)),"l"(pk(b))); return upk(r);
 }
@@ -70,6 +78,7 @@ __device__ __forceinline__ V2 vfmas(V2 a,float c,V2 acc){
   V2 k; k.x=k.y=c; unsigned long long r;
   asm("fma.rn.f32x2 %0,%1,%2,%3;":"=l"(r):"l"(pk(a)),"l"(pk(k)),"l"(pk(acc))); return upk(r);
 }
+#endif
 __device__ __forceinline__ V2 b2v(uint32_t w){
   V2 r; r.x=__uint_as_float(w<<16); r.y=__uint_as_float(w&0xffff0000u); return r;
 }

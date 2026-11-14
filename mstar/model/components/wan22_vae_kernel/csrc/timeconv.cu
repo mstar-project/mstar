@@ -1,5 +1,6 @@
 // Vendored from FastVideo (Apache-2.0): hao-ai-lab/FastVideo @ ec9145a,
-//   fastvideo-kernel/wan22_vae_decode/solution/timeconv.cu. Unchanged.
+//   fastvideo-kernel/wan22_vae_decode/solution/timeconv.cu
+// Local changes (M*): the architecture, tile and epilogue schedule come from arch.h, as in conv.cu.
 // SPDX-License-Identifier: Apache-2.0
 // w11: a CUTLASS implicit convolution whose epilogue stores into a caller-given destination with arbitrary
 // (N,D,H,W) strides, and can accumulate on what the destination already holds (beta=1, source == destination).
@@ -21,12 +22,12 @@
 #include "cutlass/epilogue/collective/collective_builder.hpp"
 #include "cutlass/conv/device/conv_universal_adapter.hpp"
 #include "cutlass/conv/kernel/conv_universal.hpp"
+#include "arch.h"
 at::Tensor nhwc_empty(int64_t c, int64_t t, int64_t h, int64_t w, const at::Tensor& like);
 using namespace cute;
 using B = __nv_bfloat16;
 using ElementBF16 = cutlass::bfloat16_t;
 using LayoutNDHWC = cutlass::layout::TensorNDHWC;
-using ArchTag = cutlass::arch::Sm100;
 using OperatorClass = cutlass::arch::OpClassTensorOp;
 constexpr auto Fprop = cutlass::conv::Operator::kFprop;
 
@@ -41,7 +42,7 @@ static void launch_into(const at::Tensor& x, const at::Tensor& w, at::Tensor& y,
   using Epilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
       ArchTag, OperatorClass, Tile, Cluster, cutlass::epilogue::collective::EpilogueTileAuto, float, float,
       ElementBF16, LayoutNDHWC, 8, ElementBF16, LayoutNDHWC, 8,
-      cutlass::epilogue::collective::EpilogueScheduleAuto>::CollectiveOp;
+      TimeEpilogueSchedule>::CollectiveOp;
   using Mainloop = typename cutlass::conv::collective::CollectiveBuilder<
       ArchTag, OperatorClass, Fprop, ElementBF16, LayoutNDHWC, 8, ElementBF16, LayoutNDHWC, 8, float, Tile, Cluster,
       cutlass::conv::collective::StageCountAutoCarveout<static_cast<int>(sizeof(typename Epilogue::SharedStorage))>,
@@ -118,7 +119,7 @@ at::Tensor time_upsample(const at::Tensor& p, const at::Tensor& head, const at::
     for (int par = 0; par < 2; par++) {
       auto yv = y.as_strided({1, (int64_t)C, nf, (int64_t)H, (int64_t)W}, {sN, 1, sD, sH, sW},
                              (int64_t)(off + par) * y.stride(2));
-      launch_into<256, 256, 2>(p, w.narrow(0, (int64_t)par * C, C), yv, 0, 0, 1.f);
+      launch_into<kTileTime.m, kTileTime.n, kTileTime.cl>(p, w.narrow(0, (int64_t)par * C, C), yv, 0, 0, 1.f);
     }
   }
   return y;

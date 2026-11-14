@@ -194,10 +194,10 @@ class Wan22Config:
     # (1280x704). Requests choose their size, so an open list would let each new
     # size cost a compile on the shared worker.
     vae_decode_fast_sizes: tuple[str, ...] | None = None
-    # Opt-in, near-lossless: decode on the Wan2.2-VAE Blackwell kernels (``components/wan22_vae_kernel``, FastVideo's
-    # Winograd decoder generalized to any size) instead of the paths above, on compute capability 10.0 / 10.3 and the
-    # TI2V-5B VAE. Not bit-exact with ``vae.decode`` (Winograd and fused norms round differently); about 2x faster.
-    # Any untiled size, no compile. A GPU it cannot run on decodes as if it were off (logged once).
+    # Opt-in, near-lossless: decode on the Wan2.2-VAE kernels (``components/wan22_vae_kernel``, FastVideo's Winograd
+    # decoder generalized to any size) instead of the paths above, on compute capability 9.0 / 10.0 / 10.3 (Hopper,
+    # Blackwell) and the TI2V-5B VAE. Not bit-exact with ``vae.decode`` (Winograd and fused norms round differently);
+    # about 2x faster. Any untiled size, no compile. A GPU it cannot run on decodes as if it were off (logged once).
     vae_decode_kernel: bool = False
     # Opt-in, lossy: decode with a tiny VAE instead (``components/taehv_decoder``), the path to madebyollin/taehv's
     # ``taew2_2.pth`` or ``taew2_2_super.pth`` (MIT). 31 / 113 ms for a 1280x704x81 clip on a B300 against 1.15 s,
