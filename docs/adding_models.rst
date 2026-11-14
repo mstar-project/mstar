@@ -2443,9 +2443,9 @@ checks that an eager call writes nothing outside the step's slots.
 Between steps, a model may keep a memo of a pure function of request inputs, whose loss costs time
 and changes no output, and scratch buffers that it makes at load and that no step reads before
 writing. Anything else it keeps between steps is declared state or an edge. This rests on the
-engine running a node's forwards one at a time, in stream order. The diffusion loop's schedule and
-prefetched seeds are memos, its latents and solver state are loop-back edges, and a code
-predictor's frame-local KV is scratch.
+engine running a node's forwards one at a time, in stream order. The diffusion loop's schedule is a
+memo, a request's prefetched noise is its own state in ``request_state``, its latents and solver
+state are loop-back edges, and a code predictor's frame-local KV is scratch.
 
 A model on the contract reads no ``node_resources``, ``engine_inputs.resources``,
 ``request_state`` or ``per_request_states``, imports the engine only through
@@ -4147,7 +4147,8 @@ A model whose ``seed_loop_back`` depends on nothing but the bucket key and the r
 seed sets ``PREFETCH_SEEDS = True`` (klein and Z-Image do): the base then draws the noise
 when the request reaches the worker, on a thread of its own, and iteration 0 only copies
 it to the device. Otherwise the CPU draw runs on the GPU thread at iteration 0, once per
-joining row.
+joining row. The draw waits in the request's own state, so a request removed before
+iteration 0 -- a client cancel while it queues -- drops it, taken or not.
 
 Every span a layer attends over is a segment of a declared array with ``max_len`` 0, listed
 in ``attention_segments`` per request. A layer calls ``attend(self.state, self.layer, q, k, v)``

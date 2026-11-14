@@ -10,7 +10,7 @@ from __future__ import annotations
 import dataclasses
 import sys
 import threading
-from collections import deque
+import weakref
 
 import pytest
 import torch
@@ -20,6 +20,7 @@ sys.path.insert(0, ".")
 from mstar.conductor.request_info import CurrentForwardPassInfo  # noqa: E402
 from mstar.model.components.diffusion.denoise_loop import (  # noqa: E402
     LATENTS,
+    SEED_DRAW,
     DenoiseLoopSubmodule,
     StepScalar,
 )
@@ -462,13 +463,13 @@ def test_requests_with_the_same_settings_share_one_schedule_on_the_device():
     assert sub._staged_schedules.cache_info().misses == 1
 
 
-def test_a_seed_memo_hit_equals_a_recompute():
+def test_a_request_with_no_draw_of_its_own_seeds_to_the_same_values_inline():
     sub = PrefetchingToy()
     _added(sub, "p0", seed=11).result()
-    hit = sub.prepare_inputs(WALK, _info("p0", 0, seed=11), _inputs())
-    miss = sub.prepare_inputs(WALK, _info("p1", 0, seed=11), _inputs())
-    assert torch.equal(hit.tensor_inputs[LATENTS], miss.tensor_inputs[LATENTS])
-    assert sub.drawn_on == ["mstar-seed_0", "MainThread"], "the draw is taken once, and the second request misses"
+    prefetched = sub.prepare_inputs(WALK, _info("p0", 0, seed=11), _inputs())
+    inline = sub.prepare_inputs(WALK, _info("p1", 0, seed=11), _inputs())
+    assert torch.equal(prefetched.tensor_inputs[LATENTS], inline.tensor_inputs[LATENTS])
+    assert sub.drawn_on == ["mstar-seed_0", "MainThread"], "p1 has no draw of its own and does not take p0's"
 
 
 def test_requests_with_one_seed_each_take_a_draw_of_their_own():
@@ -478,17 +479,22 @@ def test_requests_with_one_seed_each_take_a_draw_of_their_own():
     for rid in ("p0", "p1"):
         sub.prepare_inputs(WALK, _info(rid, 0, seed=11), _inputs())
     assert threading.current_thread().name not in sub.drawn_on, "one shared draw would have the second draw inline"
-    assert not sub._seed_draws
+    assert not _draws(sub)
 
 
-def test_a_draw_nothing_takes_is_evicted_and_only_costs_a_redraw():
+def test_a_request_removed_before_iteration_zero_drops_its_draw():
+    """A client cancel removes the request before iteration 0 takes its noise. The draw has to go with the
+    request: held instead until newer draws pushed it out, it grew MiniMax-H3-Image's workers by ~550 MB."""
     sub = PrefetchingToy()
-    sub._seed_draws = deque(maxlen=1)
-    _added(sub, "p0", seed=1).result()
-    _added(sub, "p1", seed=2).result()
-    assert [key for key, _ in sub._seed_draws] == [((8, 3), 2)]
-    sub.prepare_inputs(WALK, _info("p0", 0, seed=1), _inputs())
-    assert sub.drawn_on[-1] == threading.current_thread().name, "the evicted draw redraws inline"
+    draw = _added(sub, "p0", seed=1)
+    noise = weakref.ref(draw.result()[LATENTS])
+    kept = _added(sub, "p1", seed=2)
+    del draw
+    sub.cleanup_request(_handle("p0"))
+    assert noise() is None, "the removed request's noise is still held in the worker"
+    assert [key for key, _ in _draws(sub)] == [(8, 3)], "only the removed request's draw goes"
+    sub.cleanup_request(_handle("p1"))
+    assert not _draws(sub) and (kept.cancelled() or kept.done())
 
 
 class ToyRefine(ToyDenoise):
@@ -548,7 +554,12 @@ def _added(sub, rid, **info):
     """``on_request_added`` as the engine calls it at ingest, with the first walk's info."""
     ingest = dataclasses.replace(_info(rid, 0, **info), graph_walk="encode_text")
     sub.on_request_added(_handle(rid), ingest)
-    return sub._seed_draws[-1][1]
+    return sub.request_state(_handle(rid))[SEED_DRAW][1]
+
+
+def _draws(sub):
+    """Every request's pending draw, as ``(bucket key, future)``."""
+    return [state[SEED_DRAW] for state in sub.request_states.values() if SEED_DRAW in state]
 
 
 def test_prefetched_seeds_are_drawn_off_the_calling_thread_and_match_an_inline_draw():
@@ -557,17 +568,18 @@ def test_prefetched_seeds_are_drawn_off_the_calling_thread_and_match_an_inline_d
     assert future.result()[LATENTS].is_contiguous()
     got = sub.prepare_inputs(WALK, _info("p0", 0, seed=11), _inputs())
     assert sub.drawn_on == ["mstar-seed_0"]
-    assert not sub._seed_draws, "the draw is taken once"
+    assert not _draws(sub), "the draw is taken once"
     inline = PrefetchingToy().prepare_inputs(WALK, _info("p1", 0, seed=11), _inputs())
     assert torch.equal(got.tensor_inputs[LATENTS], inline.tensor_inputs[LATENTS])
 
 
-def test_a_draw_for_another_bucket_key_is_left_and_iteration_zero_draws_inline():
+def test_a_draw_for_another_bucket_key_is_dropped_and_iteration_zero_draws_inline():
     sub = PrefetchingToy()
     _added(sub, "p2", tokens=8, seed=3).result()
     got = sub.prepare_inputs(WALK, _info("p2", 0, tokens=16, seed=3), _inputs())
     assert got.tensor_inputs[LATENTS].shape == (16, 4)
     assert sub.drawn_on == ["mstar-seed_0", "MainThread"]
+    assert not _draws(sub), "a draw a later stage's geometry cannot use is not kept for the request's life"
 
 
 def test_seeds_are_drawn_once_per_request_and_only_when_asked():
@@ -576,7 +588,7 @@ def test_seeds_are_drawn_once_per_request_and_only_when_asked():
     assert sub.drawn_on == ["mstar-seed_0"]
     plain = ToyDenoise()
     plain.on_request_added(_handle("p4"), _info("p4", 0))
-    assert not plain._seed_draws
+    assert not _draws(plain)
 
 
 def test_an_initial_loop_back_of_its_own_is_not_handed_the_draw():

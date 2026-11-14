@@ -326,6 +326,7 @@ def test_stopping_data_worker_drops_tracked_requests():
     wt._draining_rids = {"r1"}
     wt._reads_done_sent = set()
     wt._live_requests = {}
+    wt.request_output_state = {}
 
     wt.run()
 

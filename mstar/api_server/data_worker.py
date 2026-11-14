@@ -65,6 +65,7 @@ from mstar.model.base import (
     names_checkpoint,
     serving_resources,
 )
+from mstar.model.components.video_encode import AudioFormat, Mp4Stream
 from mstar.model.media_limits import (
     RAW_INPUT_CHARGES,
     RequestMediaBudget,
@@ -108,6 +109,10 @@ logger = logging.getLogger(__name__)
 # an mp4 mux hundreds) run on the encode pool, so reads, streamed chunks and
 # prompt preprocessing do not wait behind them.
 ARTIFACT_MODALITIES = frozenset({"image", "video"})
+# A piece of a request's video that a loop emits as it is decoded (``Model.mp4_encoding``):
+# the pieces are written into one mp4 as they come, which leaves in the last one's
+# output slot; the others' slots are answered by a chunk the API side drops.
+VIDEO_PART = "video_part"
 
 
 def pooled_output(modality: str, loop_indices: NestedLoopIndices | None) -> bool:
@@ -548,6 +553,8 @@ class PreprocessWorker:
                 "Data worker reading queue for request %s decreased to length %d",
                 result.request_id,  self.per_request_reading_tensors[result.request_id]
             )
+            if result.modality == VIDEO_PART:
+                continue  # a piece of an mp4 that leaves with its last piece: counted, not delivered
             results.append(result)
         return results
 
@@ -623,6 +630,14 @@ class RequestOutputState:
     # A video_frame chunk can carry several frames, so this advances by
     # frame_count rather than chunks.
     frame_index: int = 0
+    # The request's audio goes into its mp4 here, in the pass that writes the video,
+    # rather than by the API layer's mux afterwards (``_mux_audio``).
+    mux_audio: bool = False
+    # The mp4 being written from its pieces (VIDEO_PART), or from the video and the
+    # audio; the pieces handed to it so far; the audio, until the mp4 exists.
+    mp4: Mp4Stream | None = None
+    mp4_parts_fed: int = 0
+    held_pcm: bytes | None = None
 
 
 class EncodedOutput(NamedTuple):
@@ -633,7 +648,7 @@ class EncodedOutput(NamedTuple):
     sequence: int
     modality: str
     metadata: dict
-    uuid: int
+    uuid: int | None  # the tensor the transport holds until the encode is done; None: already released
     read_time: float | None  # with ``enable_prof``: when the tensor's read began
 
 
@@ -836,6 +851,9 @@ class PreprocessWorkerThread:
         # Finished encodes, appended by the pool's done callbacks and released
         # by this thread, which alone touches the per-request output state.
         self._encoded: deque[EncodedOutput] = deque()
+        # Tensors an mp4 writer has finished reading (Mp4Stream.add_part), for this
+        # thread to hand back to the transport.
+        self._written_parts: deque[int] = deque()
         self._prepare_workers = None
         # Requests on the prepare pool, oldest first. They reach the conductor
         # in this order, whichever finishes first.
@@ -882,6 +900,7 @@ class PreprocessWorkerThread:
         never reached the conductor (no remote reader will ever drain it); the
         default drain-gated path leaves the unlink to the tensor manager.
         """
+        self._stop_mp4(request_id)  # before the buffers it reads are let go
         try:
             if force:
                 self.tensor_manager.force_cleanup_request(request_id)
@@ -895,6 +914,12 @@ class PreprocessWorkerThread:
         teardown paths so a new dict cannot be dropped by one and leaked by the
         other; a held reorder chunk can be a full 11 MiB 720p frame."""
         self.in_flight_requests.discard(request_id)
+        self._cancel_mp4(request_id)
+        output = self.request_output_state.get(request_id)
+        if output is not None:
+            # The mp4's done-callbacks hold this state, so the reference back to the mp4 is a cycle, and the
+            # writer (its encoder and the mp4, ~40 MB at 1280x704) would wait for a full collection.
+            output.mp4 = None
         for state_name in (
             "tensor_uuid_to_metadata_per_request",
             "request_model_kwargs",
@@ -1114,7 +1139,9 @@ class PreprocessWorkerThread:
             call.held.append(HeldItems(self._store_held(input.request_id, stream_items), None))
 
         self.request_model_kwargs[input.request_id] = model_kwargs
-        self.request_output_state[input.request_id] = RequestOutputState()
+        self.request_output_state[input.request_id] = RequestOutputState(
+            mux_audio=self._muxes_audio(input.output_modalities, model_kwargs),
+        )
         preprocess_only = getattr(self.model, "PREPROCESS_ONLY_KWARGS", ())
         conductor_kwargs = {k: v for k, v in model_kwargs.items() if k not in preprocess_only}
         msg = ConductorMessage(
@@ -1884,6 +1911,8 @@ class PreprocessWorkerThread:
             )
 
         chunk_metadata = self.tensor_uuid_to_metadata_per_request[request_id][uuid] or {}
+        if modality == "audio":
+            self._mux_audio(request_id, postprocessed)
         if modality in ("text", "audio") and self._turn_tokens:
             ids = tensor.flatten().tolist() if modality == "text" else []
             chunk_metadata = {**chunk_metadata, **self._turn_metadata(ids, loop_indices)}
@@ -1945,6 +1974,127 @@ class PreprocessWorkerThread:
         if self.enable_nvtx:
             profiler.range_pop()
 
+    def _muxes_audio(self, output_modalities: Collection[str] | None, model_kwargs: dict) -> bool:
+        """Whether a request's audio goes into its mp4 here: it asks for video and audio, its
+        model writes its mp4s plainly (``Model.mp4_encoding``), and the mp4 plays at the
+        request's ``fps``, which the API layer's mux would otherwise rescale it to."""
+        if self.model is None or not {"video", "audio"} <= set(output_modalities or ()):
+            return False
+        try:
+            encoding = self.model.mp4_encoding(model_kwargs)
+            fps = model_kwargs.get("fps")
+            return encoding is not None and (not fps or abs(float(fps) - float(encoding.fps)) <= 1e-3)
+        except (TypeError, ValueError):  # left to postprocess and the API layer's mux, as before
+            return False
+
+    def _writes_mp4(self, request_id: str, modality: str, loop_indices: NestedLoopIndices | None) -> bool:
+        """A piece of the request's video, or its video when its audio goes in the same pass."""
+        if modality == VIDEO_PART:
+            return True
+        state = self.request_output_state.get(request_id)
+        streamed = loop_indices is not None and bool(loop_indices.loop_name_order)
+        return modality == "video" and not streamed and state is not None and state.mux_audio
+
+    def _feed_mp4(
+        self, request_id: str, sequence: int, modality: str, uuid: int, tensor: torch.Tensor,
+        loop_indices: NestedLoopIndices | None, read_time: float | None,
+    ) -> None:
+        """Hand the request's mp4 writer this piece of its video (all of it, for ``video``).
+        The writer reads the transport's buffer in place, which goes back once the piece is
+        written (``_written_parts``); nothing after the hand-over raises, so a failure
+        before it leaves the buffer to the caller. The mp4 takes the slot of the piece that
+        completes it; every other piece's slot gets a VIDEO_PART chunk."""
+        state = self.request_output_state[request_id]
+        kwargs = self.request_model_kwargs.get(request_id) or {}
+        if state.mp4 is None:
+            encoding = self.model.mp4_encoding(kwargs)
+            if encoding is None:
+                raise ValueError(f"a {modality!r} output from a model that writes no mp4s (Model.mp4_encoding)")
+            parts = 1 if modality == "video" else self._video_parts(kwargs, loop_indices)
+            audio = None
+            if state.mux_audio:
+                audio = AudioFormat(
+                    self.model.get_output_sample_rate("audio"), self.model.get_output_audio_channels("audio"),
+                )
+            state.mp4 = Mp4Stream(encoding, parts, audio)
+            if state.held_pcm is not None:
+                state.mp4.add_audio(state.held_pcm)
+                state.held_pcm = None
+        mp4 = state.mp4
+        frames = (tensor[0] if tensor.ndim == 5 else tensor).numpy()
+        index = state.mp4_parts_fed
+        if index + 1 < mp4.parts:
+            self._queue_completed_output(
+                request_id, sequence, ResultChunk(request_id=request_id, modality=VIDEO_PART, data=b""),
+            )
+            self._hand_over(mp4, index, frames, uuid)
+            state.mp4_parts_fed += 1
+            return
+        metadata = dict(self.tensor_uuid_to_metadata_per_request[request_id][uuid] or {})
+        if mp4.audio:
+            metadata["audio_muxed"] = True
+        start = time.perf_counter()
+        done: Future = Future()
+
+        def relay(written: Future) -> None:
+            if written.cancelled():
+                done.cancel()
+            elif written.exception() is not None:
+                done.set_exception(written.exception())
+            else:
+                # the encode overlapped the decode: this is the wait after the last piece
+                done.set_result((written.result(), time.perf_counter() - start))
+
+        # registered before the wakeup's, so the entry is queued when the thread wakes
+        done.add_done_callback(lambda finished: self._encoded.append(
+            EncodedOutput(finished, request_id, state, sequence, "video", metadata, None, read_time),
+        ))
+        mp4.future.add_done_callback(relay)
+        if self.wakeup is not None:
+            self.wakeup.register_future(done)
+        self._hand_over(mp4, index, frames, uuid)
+        state.mp4_parts_fed += 1
+
+    def _hand_over(self, mp4: Mp4Stream, index: int, frames, uuid: int) -> None:
+        written = mp4.add_part(index, frames)
+        # registered before the wakeup's, so the uuid is queued when the thread wakes
+        written.add_done_callback(lambda _: self._written_parts.append(uuid))
+        if self.wakeup is not None:
+            self.wakeup.register_future(written)
+
+    def _video_parts(self, kwargs: dict, loop_indices: NestedLoopIndices | None) -> int:
+        """How many pieces a request's video comes in: the iterations of the loop that emits them."""
+        if loop_indices is None or not loop_indices.loop_name_order:
+            raise ValueError(f"{VIDEO_PART!r} is emitted by a loop, one piece per iteration")
+        loop = loop_indices.loop_name_order[-1]
+        caps = self.model.get_loop_caps(**kwargs)
+        if loop not in caps:
+            raise ValueError(f"{VIDEO_PART!r} from loop {loop!r}, which Model.get_loop_caps gives no count")
+        return int(caps[loop])
+
+    def _mux_audio(self, request_id: str, pcm: bytes) -> None:
+        """The request's audio, for its mp4 (held until the mp4 exists)."""
+        state = self.request_output_state.get(request_id)
+        if state is None or not state.mux_audio:
+            return
+        if state.mp4 is not None:
+            state.mp4.add_audio(pcm)
+        else:
+            state.held_pcm = pcm
+
+    def _cancel_mp4(self, request_id: str) -> None:
+        state = self.request_output_state.get(request_id)
+        if state is not None and state.mp4 is not None:
+            state.mp4.cancel()
+
+    def _stop_mp4(self, request_id: str) -> None:
+        """Cancel the request's mp4 writer and wait for it to let go of the pieces it
+        reads in place (it stops at its next frame)."""
+        state = self.request_output_state.get(request_id)
+        if state is not None and state.mp4 is not None:
+            state.mp4.cancel()
+            state.mp4.join(timeout=30)
+
     def _submit_encode(
         self, request_id: str, sequence: int, modality: str, uuid: int, tensor: torch.Tensor,
         read_time: float | None = None,
@@ -1978,13 +2128,19 @@ class PreprocessWorkerThread:
         return data, time.perf_counter() - start
 
     def _release_encoded(self) -> bool:
-        """Queue each finished encode's chunk in its request's output order."""
+        """Queue each finished encode's chunk in its request's output order, and hand
+        back the tensors the mp4 writers are done reading."""
+        written = getattr(self, "_written_parts", None)
+        released = bool(written)
+        while written:
+            self.tensor_manager.dereference(written.popleft())
         encoded = getattr(self, "_encoded", None)
         if not encoded:
-            return False
+            return released
         while encoded:
             out = encoded.popleft()
-            self.tensor_manager.dereference(out.uuid)
+            if out.uuid is not None:
+                self.tensor_manager.dereference(out.uuid)
             # The request was torn down while this encoded, or its rid reused since.
             if self.request_output_state.get(out.request_id) is not out.state:
                 continue
@@ -2041,7 +2197,12 @@ class PreprocessWorkerThread:
                         tensor = self.tensor_manager.get_tensor(tensor_info.uuid)
                         if self.enable_nvtx:
                             profiler.range_pop()
-                        if self._encode_pool is not None and pooled_output(modality, loop_indices):
+                        if self._writes_mp4(request_id, modality, loop_indices):
+                            self._feed_mp4(
+                                request_id, sequence, modality, tensor_info.uuid, tensor, loop_indices, read_time,
+                            )
+                            pooled = True
+                        elif self._encode_pool is not None and pooled_output(modality, loop_indices):
                             self._submit_encode(request_id, sequence, modality, tensor_info.uuid, tensor, read_time)
                             pooled = True
                         else:
@@ -2131,6 +2292,7 @@ class PreprocessWorkerThread:
         """Stop reading this rid; ACK READS_DONE once in-flight reads finish.
         Idempotent — abort self-initiates while the conductor may also drive it."""
         self._draining_rids.add(request_id)
+        self._cancel_mp4(request_id)
         self._complete_drain_if_ready(request_id)
 
     def _complete_drain_if_ready(self, request_id: str) -> None:
@@ -2161,6 +2323,7 @@ class PreprocessWorkerThread:
         """Phase-2 teardown: unconditionally drop all tensor state for the rid
         (unlink the input-signal SHM). Safe now that every reader has drained."""
         self._removed(request_id)
+        self._stop_mp4(request_id)  # before the buffers it reads are let go
         self.tensor_manager.force_cleanup_request(request_id)
         self._drop_request_state(request_id)
 

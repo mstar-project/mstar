@@ -439,7 +439,9 @@ def test_unipc_port_matches_reference_scheduler_bitwise(t2v_trajectory):
 # ---------------------------------------------------------------------------
 
 
-def _sequential_noise_prediction(self, model_input, temp_ts, text_embeds_pos, text_embeds_neg, guidance_scale):
+def _sequential_noise_prediction(
+    self, model_input, temp_ts, text_embeds_pos, text_embeds_neg, guidance_scale, block_cache=None,
+):
     """Reference CFG semantics: two batch-1 forwards + the same combine."""
     timestep = temp_ts.unsqueeze(0).expand(1, -1)
     cond = self.transformer(

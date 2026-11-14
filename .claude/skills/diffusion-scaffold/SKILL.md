@@ -52,13 +52,21 @@ Every attention in the DiT should go through the read of an array with `max_len=
 - `capture_buckets` lists `(graph_walk, bucket_key)` pairs to capture; `capture_request_inputs` supplies one placeholder row per bucket. A bucket is captured per batch size in `capture_batch_sizes`, and each one costs startup, so capture the shapes you serve, not every shape you accept. `replay_walks` lets another walk reuse a captured bucket.
 - The captured graph removes the launch gaps of a compiled-but-eager step. Ragged attention breaks that compiled graph per layer unless the resource sets `compile_op=True` (then `run` traces as the `mstar::ragged_attention` custom op), so measure both before deciding a model needs capture.
 
+## Step caching
+
+`DenoiseLoopSubmodule(step_cache=...)` takes a `StepCachePolicy` (`components/diffusion/step_cache.py`; today MagCache) that says which steps skip the block stack and add back the residual of the last step that ran it. The decision joins the step key, so rows batch per decision, and the residuals are `request_state`, one per rank.
+
+- A model opts in by giving its transformer `cached_residual=` / `return_residual=` around the block loop (embed and head still run) and calling `self.block_cache(engine_inputs)` in `denoise`; `wan22` and `minimax_h3` are the references. Keep the residual row-leading and fp32.
+- The policy decides from host values only (the step index, the step count, a calibrated table), so it needs no sync and every CFG/SP rank agrees. A rule that reads a device value (TeaCache, DBCache) would need a reduce and a host read per step.
+- Calibrate per model (`{method: magcache_calibrate}` logs the table) and ship a quality table against dense: it is lossy. Captured buckets are refused for now (the residual has no fixed address).
+
 ## Ending the loop
 
 The loop ends on its iteration count. A model whose request picks its step count declares it as the loop's cap in `get_loop_caps` (z_image, flux2_klein); the loop then completes after that iteration and neither graph runtime speculates past it. A model whose stage always runs its graph `max_iters` declares no cap (ltx2_5: caps are keyed by loop name, and its two stages share one). The conductor refuses a cap below 1 or above the loop's `max_iters`.
 
 ## State
 
-The latents and the solver's values ride loop-back edges, which pass a tensor without a copy and carry any shape. The schedule and the seeds are memos of the base, recomputed from their inputs. Anything else per request lives in `self.request_state(fwd_info.rid_handle)`, which the engine frees with the request. It is keyed by the integer handle (the key cleanup receives), not by the `request_id` string; see invariant 14.
+The latents and the solver's values ride loop-back edges, which pass a tensor without a copy and carry any shape. The schedule is a memo of the base, recomputed from its inputs. A prefetched seed draw and anything else per request live in `self.request_state(fwd_info.rid_handle)`, which the engine frees with the request. It is keyed by the integer handle (the key cleanup receives), not by the `request_id` string; see invariant 14.
 
 ## Validating
 

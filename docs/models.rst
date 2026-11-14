@@ -2293,6 +2293,55 @@ tiles only when free VRAM at decode time is short of the untiled estimate
 32 GiB card. No CUDA-graph capture, no continuous batching (one request per
 step) and no component offload.
 
+**Step caching (opt-in, lossy).** ``step_cache`` under the yaml's ``model_kwargs``
+skips the DiT's 30 blocks on the steps MagCache picks and adds back the residual
+they produced at the last step that ran them
+(``components/diffusion/step_cache.py``); off by default. The pick comes from a
+per-step table calibrated on this model (``MAG_RATIOS["default"]``: TI2V-5B at
+1280x704x81, 50 steps) and the step index alone, so it costs no host sync and
+every CFG and SP rank makes the same one. On one H200 at 1280x704x81, 50 steps,
+against the dense output on 8 VBench prompts:
+
+.. list-table::
+   :header-rows: 1
+
+   * - ``step_cache``
+     - steps computed
+     - s/video
+     - PSNR (dB)
+     - SSIM
+     - LPIPS
+   * - none
+     - 50
+     - 49.8
+     -
+     -
+     -
+   * - ``{threshold: 0.04, max_skip_steps: 2}``
+     - 30
+     - 31.6
+     - 31.0
+     - 0.938
+     - 0.056
+   * - ``{threshold: 0.06, max_skip_steps: 3}``
+     - 25
+     - 26.9
+     - 30.0
+     - 0.928
+     - 0.066
+   * - ``{threshold: 0.12, max_skip_steps: 4}``
+     - 21
+     - 23.2
+     - 28.8
+     - 0.915
+     - 0.081
+
+The first 20% of the steps and the last always compute, and a reusing step
+runs a compiled graph of its own (one more compile per listed shape and
+guidance setting). Another shape or step
+count reuses the table resampled; ``{method: magcache_calibrate}`` logs one
+from a dense run instead, to pass as ``mag_ratios``.
+
 **Two GPUs.** ``configs/wan22_cfg_parallel_2gpu.yaml`` is CFG-parallel: it runs
 the dit over two ranks (``cfg_size: 2``) that split the classifier-free guidance
 batch: each rank runs one branch over the batch's rows and the two noise
