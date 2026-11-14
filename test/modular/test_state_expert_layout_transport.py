@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import msgpack
 import pytest
 
@@ -91,3 +93,14 @@ def test_missing_expert_layout_fails_before_transport(array_name, field, read) -
     layouts[array_name]["main"] = Layout()
     with pytest.raises(RuntimeError, match=f"{field} is missing reads \\['{read}'\\]"):
         expert_layouts(_arrays(), layouts)
+
+
+def test_walk_overlay_can_replace_one_expert_read_without_omitting_request_lengths():
+    queries, keys = _arrays()
+    keys = replace(keys, reads={**keys.reads, "other": keys.reads["cross_attn"]})
+    partial = {"trunk_keys": _layouts()["trunk_keys"]}
+    with pytest.raises(RuntimeError, match="missing reads \\['other'\\]"):
+        expert_layouts([queries, keys], partial)
+    assert expert_layouts([queries, keys], partial, require_all=False) == {
+        "trunk_keys": {"main": {"cross_attn": [2, 2, 2, 4]}},
+    }

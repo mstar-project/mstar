@@ -718,6 +718,7 @@ def chunk_causal_layouts(
 
 def expert_layouts(
     declarations: Sequence[Array | Sampler | SeqShard], state_layout: Mapping[str, Mapping[str, Layout]],
+    *, require_all: bool = True,
 ) -> dict[str, dict[str, dict[str, list[int]]]]:
     """Read-keyed expert geometry as small wire-safe integers, never tensors."""
     arrays = {declared.name: declared for declared in declarations if isinstance(declared, Array)}
@@ -727,7 +728,7 @@ def expert_layouts(
         if array is None:
             raise RuntimeError(f"state_layout[{name!r}]: it names no declared array, of {sorted(arrays)}")
         for label, layout in by_label.items():
-            _check_expert_layout(array, label, layout)
+            _check_expert_layout(array, label, layout, require_all=require_all)
             if layout.expert_cross or layout.expert_self:
                 by_read = {
                     key: [value.num_chunks, value.global_len, value.clean_frames, value.noised_frames]
