@@ -1606,7 +1606,10 @@ def engine_step(submodule, *args, **kwargs) -> SubmoduleStep | None:
     # Imported here because the adapters load the resources' Triton kernels, which importing mstar.model must not need.
     from mstar.engine.state.adapters import state_steps
 
-    return state_steps(step, getattr(submodule, "state_handles", {}), graph_walk=kwargs.get("graph_walk"))
+    return state_steps(
+        step, getattr(submodule, "state_handles", {}), graph_walk=kwargs.get("graph_walk"),
+        per_request_info=kwargs.get("per_request_info"),
+    )
 
 
 def splice_loopback_ids(ids: torch.Tensor, inputs: list[ARNodeInputs], decode: bool) -> torch.Tensor:

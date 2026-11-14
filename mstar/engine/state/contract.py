@@ -116,6 +116,115 @@ class Block(Mask):
 
 
 @dataclass(frozen=True)
+class ChunkCausal(Mask):
+    """Within one step, attention over ``[global | noised | clean]`` tokens.
+
+    Every query sees the global prefix. Global queries see nothing else. A clean query in chunk ``c`` sees clean
+    chunks through ``c``; a noised query sees its own noised chunk and clean chunks before ``c``. A query sees no
+    tokens from another request. The fixed chunk size is declared here; the request gives each read's stream lengths
+    in ``Layout.chunk_causal``.
+    """
+
+    uses_query_position = True
+    sees_step_whole = True
+
+    chunk_len: int
+
+    def __post_init__(self):
+        if not _is_positive(self.chunk_len):
+            raise ValueError(f"ChunkCausal.chunk_len must be a positive int, got {self.chunk_len!r}")
+
+
+@dataclass(frozen=True, kw_only=True)
+class ChunkCausalLayout:
+    """One request's stream lengths for one ``ChunkCausal`` read."""
+
+    global_len: int
+    noised_len: int
+    clean_len: int = 0
+
+    def __post_init__(self):
+        for name in ("global_len", "noised_len", "clean_len"):
+            value = getattr(self, name)
+            if type(value) is not int or value < 0:
+                raise ValueError(f"ChunkCausalLayout.{name} must be an int >= 0, got {value!r}")
+
+    @property
+    def span(self) -> int:
+        return self.global_len + self.noised_len + self.clean_len
+
+
+@dataclass(frozen=True)
+class ExpertCross(Mask):
+    """Expert Q rows attend `[global | clean frames | noised frames]` KV rows.
+
+    The fixed fields are checkpoint policy. Request lengths live in
+    `Layout.expert_cross`, keyed by this read, and are checked at planning.
+    """
+
+    uses_query_position = True
+    sees_step_whole = True
+
+    chunk_len: int
+    future_per_chunk: int
+    tokens_per_frame: int
+    window_frames: int
+    include_noised: bool = True
+
+    def __post_init__(self):
+        for name in ("chunk_len", "future_per_chunk", "tokens_per_frame", "window_frames"):
+            if not _is_positive(getattr(self, name)):
+                raise ValueError(f"ExpertCross.{name} must be a positive int")
+        if type(self.include_noised) is not bool:
+            raise ValueError("ExpertCross.include_noised must be bool")
+
+
+@dataclass(frozen=True)
+class ExpertSelf(Mask):
+    """Expert queries in the same chunk see each other, across token kinds."""
+
+    uses_query_position = True
+    sees_step_whole = True
+
+    chunk_len: int
+    future_per_chunk: int
+
+    def __post_init__(self):
+        for name in ("chunk_len", "future_per_chunk"):
+            if not _is_positive(getattr(self, name)):
+                raise ValueError(f"ExpertSelf.{name} must be a positive int")
+
+
+@dataclass(frozen=True)
+class ExpertCrossLayout:
+    """Per-request expert cross row geometry; frame counts are latent frames."""
+
+    num_chunks: int
+    global_len: int
+    clean_frames: int
+    noised_frames: int
+
+    def __post_init__(self):
+        if not _is_positive(self.num_chunks):
+            raise ValueError("ExpertCrossLayout.num_chunks must be a positive int")
+        for name in ("global_len", "clean_frames", "noised_frames"):
+            value = getattr(self, name)
+            if type(value) is not int or value < 0:
+                raise ValueError(f"ExpertCrossLayout.{name} must be an int >= 0")
+
+
+@dataclass(frozen=True)
+class ExpertSelfLayout:
+    """Per-request expert self row geometry."""
+
+    num_chunks: int
+
+    def __post_init__(self):
+        if not _is_positive(self.num_chunks):
+            raise ValueError("ExpertSelfLayout.num_chunks must be a positive int")
+
+
+@dataclass(frozen=True)
 class Bidirectional(Mask):
     """Sees {k : k < n}, where n is the length of q's row on this array after this layer's latest add: every entry the
     row keeps and every entry this step adds for it. For a read with ``queries``, q's row is the row paired with q's
@@ -349,7 +458,7 @@ class Array:
             raise ValueError(f"{where}.layers has {sorted(read.layers - self.layers)}, outside the array's layers")
         if isinstance(read.mask, Window) and not _is_positive(read.mask.size):
             raise ValueError(f"{where}.mask.size must be a positive int, got {read.mask.size!r}")
-        if read.queries is not None and read.mask.uses_query_position:
+        if read.queries is not None and read.mask.uses_query_position and not isinstance(read.mask, ExpertCross):
             raise ValueError(f"{where}.queries: a read of another array's queries takes a mask that uses no query "
                              f"position, and {type(read.mask).__name__} does")
         if read.queries is not None and read.op is None:
@@ -530,6 +639,9 @@ class Layout:
     growth: tuple[tuple[str, int], ...] = ()    # (loop, entries per iteration)
     scratch: int = 0                            # most one scratch step writes past the kept length
     kept_windows: Mapping[str, KeptWindow] = EMPTY    # by read key, each kept-window read's sizes
+    chunk_causal: Mapping[str, ChunkCausalLayout] = EMPTY    # by read key, this request's stream lengths
+    expert_cross: Mapping[str, ExpertCrossLayout] = EMPTY
+    expert_self: Mapping[str, ExpertSelfLayout] = EMPTY
 
 
 @dataclass(frozen=True, kw_only=True)

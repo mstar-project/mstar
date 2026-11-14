@@ -19,7 +19,20 @@ from test_kv_prefix_request_keys import PROMPT, _deployment, _Model, _run, _work
 
 from mstar.conductor.conductor import Conductor
 from mstar.engine.resources.sampler.config import SamplingReqConfig
-from mstar.engine.state import Array, Attend, Causal, KVEntry, Layout, Read, Sampler, SampleSettings, Span
+from mstar.engine.state import (
+    Array,
+    Attend,
+    Causal,
+    ChunkCausal,
+    ChunkCausalLayout,
+    KVEntry,
+    Layout,
+    Read,
+    Sampler,
+    SampleSettings,
+    Span,
+)
+from mstar.engine.state.adapters import CHUNK_CAUSAL_LAYOUT_KWARG
 from mstar.graph.base import GraphNode
 from mstar.model.base import LabelLayout, ProcessPromptOutput
 
@@ -75,6 +88,21 @@ class _HandWritten(_Model):
         return ProcessPromptOutput(tensors, {"kv_layout": {"kv": {"main": layout}}})
 
 
+class _ChunkDeclaring(_Declaring):
+    def declare_state(self):
+        return [*_Declaring.declare_state(self), Array(
+            "chunk", nodes={"LLM"}, layers={0}, entry=KVEntry(heads=1, head_dim=8), max_len=0,
+            reads={"chunk_attn": Read(mask=ChunkCausal(8), op=Attend(q_heads=1))},
+        )]
+
+    def process_prompt(self, *args, **kwargs):
+        output = super().process_prompt(*args, **kwargs)
+        output.metadata["state_layout"]["chunk"] = {
+            "main": Layout(chunk_causal={"chunk_attn": ChunkCausalLayout(global_len=4, noised_len=16, clean_len=8)})
+        }
+        return output
+
+
 @pytest.mark.parametrize("keyed, extra", [(None, {}), (0, {"keyed_spans": {"kv": {"main": 0}}})],
                          ids=["every_span_keyed", "no_keyed_spans"])
 def test_a_declared_layout_gives_the_keys_and_rows_of_a_hand_written_one(keyed, extra):
@@ -93,6 +121,14 @@ def test_a_data_worker_builds_the_declarations_once():
         _run(worker)
         _run(worker)
     declare_state.assert_called_once()
+
+
+def test_chunk_lengths_cross_the_data_worker_as_wire_safe_rows():
+    model = _ChunkDeclaring()
+    kwargs = _run(_worker(model, _deployment()), {CHUNK_CAUSAL_LAYOUT_KWARG: {"chunk": {"main": "client"}}})
+    assert CHUNK_CAUSAL_LAYOUT_KWARG not in model.handed
+    assert kwargs[CHUNK_CAUSAL_LAYOUT_KWARG] == {"chunk": {"main": {"chunk_attn": [4, 16, 8]}}}
+    assert "state_layout" not in kwargs
 
 
 def test_a_prompt_with_no_keyed_spans_keys_no_page():

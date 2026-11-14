@@ -33,8 +33,8 @@ from mstar.engine.resources import BucketKey, CGSlotSpec, KVStep, Resource, Slot
 from mstar.engine.resources.resident import ResidentPlanner
 from mstar.engine.resources.step import PIECEWISE_WALK, lean_subsets
 from mstar.engine.state.adapters import check_capture, state_steps
-from mstar.engine.state.calls import ShardHandle
-from mstar.engine.state.contract import EMPTY
+from mstar.engine.state.calls import ArrayHandle, ShardHandle
+from mstar.engine.state.contract import EMPTY, ChunkCausal, ExpertCross, ExpertSelf
 from mstar.model.submodule_base import (
     BatchedModelOutput,
     ModelInputsFromEngine,
@@ -2452,6 +2452,18 @@ class PiecewiseAcceleratorGraphRunner:
             self._segment_keys,
         )
         handles = {name: h for name, h in self._state_handles.items() if not isinstance(h, ShardHandle)}
+        request_mask = next((
+            type(read.mask).__name__
+            for name in (() if step is None else step.state)
+            if isinstance(handle := handles.get(name), ArrayHandle)
+            for read in handle.array.reads.values()
+            if isinstance(read.mask, (ChunkCausal, ExpertCross, ExpertSelf))
+        ), None)
+        if request_mask is not None:
+            raise ValueError(
+                f"piecewise {self._label!r}: {request_mask} needs per-request state_layout lengths, "
+                "which a region step does not receive"
+            )
         return state_steps(step, handles)
 
     def _plan(self, step, shape: PiecewiseCaptureShape) -> None:
