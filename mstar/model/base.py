@@ -1049,6 +1049,13 @@ class Model(ABC):
         moves, the conductor moves past a step on its first report when it is
         the last step or the next step takes inputs it sends, so such a step
         must run once.
+
+        A node with a declared within-step attention mask needs mask lengths on
+        every planned walk that contains it. The conductor checks those lengths
+        before dispatch, even if the node skips that read on one walk, since
+        ``Array.nodes`` does not say which walks use the read. A step may give
+        read-keyed lengths in ``step_metadata``; these override the same read's
+        request-level lengths returned by ``process_prompt``.
         """
 
     @abstractmethod

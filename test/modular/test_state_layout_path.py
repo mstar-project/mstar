@@ -390,6 +390,35 @@ def test_missing_walk_mask_is_refused_before_conductor_dispatch(model, error):
         conductor._do_ingest_request(body)
 
 
+def test_shared_mask_node_requires_layout_on_each_planned_walk():
+    class TwoWalks(_ChunkDeclaring):
+        def get_graph_walk_graphs(self):
+            return {
+                walk: GraphNode(name="LLM", input_names=[], outputs=[])
+                for walk in ("prefill", "decode")
+            }
+
+        def walk_plan(self, *args, **kwargs):
+            return [
+                WalkStep("prefill", step_metadata={CHUNK_CAUSAL_LAYOUT_KWARG: {
+                    "chunk": {"main": {"chunk_attn": [4, 16, 8]}},
+                }}),
+                WalkStep("decode"),
+            ]
+
+    conductor = object.__new__(Conductor)
+    conductor.model = TwoWalks()
+    conductor._status_interval_s = None
+    conductor._max_output_tokens = lambda kwargs: 1
+    conductor._loop_caps = lambda kwargs: {}
+    body = SimpleNamespace(
+        request_id="second-walk", client_request_id=None, model_kwargs={},
+        initial_input_modalities=[], initial_output_modalities=[], initial_signals={},
+    )
+    with pytest.raises(RuntimeError, match="walk 'decode' has no chunk-causal layout"):
+        conductor._do_ingest_request(body)
+
+
 def test_a_prompt_with_no_keyed_spans_keys_no_page():
     kwargs = _run(_worker(_Declaring({"keyed_spans": {"kv": {"main": 0}}}), _deployment()))
     assert kwargs["kv_layout"]["kv"]["main"][4] == 0
