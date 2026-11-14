@@ -14,7 +14,17 @@ import torch
 
 from mstar.engine.resources.sampler.utils import FUSED_DRAW_MAX_VOCAB, FusedDrawArgs
 from mstar.engine.resources.step import Segment, StepHandle
-from mstar.engine.state.contract import EMPTY, Array, ArrayStep, CausalConv, GatedDeltaNet, Op, Sampler, SeqShard
+from mstar.engine.state.contract import (
+    EMPTY,
+    Array,
+    ArrayStep,
+    BlockPrefix,
+    CausalConv,
+    GatedDeltaNet,
+    Op,
+    Sampler,
+    SeqShard,
+)
 
 if TYPE_CHECKING:
     from mstar.engine.state.state_op import StateOp
@@ -145,6 +155,10 @@ class ArrayHandle(StepHandle):
                                 f"{sorted(declared_labels)}")
         if declared.advance is not None or declared.position_ids is not None:
             _positions(self, "a step sets advance or position_ids, and the array declares no positions")
+        if declared.prefix_lens is not None and not any(
+            isinstance(read.mask, BlockPrefix) for read in self.array.reads.values()
+        ):
+            raise self._refusal("a step sets prefix_lens, and the array has no BlockPrefix read")
         self._check_storage(declared, segments, ctx)
 
     @abstractmethod

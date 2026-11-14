@@ -726,7 +726,10 @@ deployment YAML tunes them under ``resources:`` (see :ref:`Step 6 <config-yaml>`
   ``GatedDeltaNet()`` a field ``state`` of shape ``(h_v, d_k, d_v)``.
 - ``max_len=0``: the array keeps nothing between steps, for attention within this step only.
   Its one read uses ``Block()``, which sees only the entries of the token's own segment. See
-  `Cacheless attention (encoder towers)`_.
+  `Cacheless attention (encoder towers)`_. ``BlockPrefix()`` sees only the first entries of the
+  segment, as many as ``ArrayStep(prefix_lens=)`` gives it: a key padding mask, whose entries
+  past the prefix still query (Step-Audio2's Whisper tower, whose clips pad to a request's
+  longest). It takes no ``queries`` and no ``segmented`` rows, and SDPA doesn't run it.
 - ``Positions(rope=)``: a position counter per request and label, on an append-only array
   that keeps entries. ``rope=None`` is a counter only. ``Rope`` carries ``theta``,
   ``rotary_dim``, ``interleave``, ``scale``, the Llama 3.1 factors (all three or none), the
@@ -2235,12 +2238,14 @@ step does to each array and sampler it touches. The engine expands ``state`` int
   branches through one attention call. Every ``ResourceStep`` gets the mapping, so the KV
   plan and a sequence shard read the same grouping; positions take their packing from the
   KV plan, and ``PositionStep`` keys its ``pos_ids`` by the combined label.
-- ``ArrayStep(segments=, keep=, forks=, placeholders=, eager_add=, fixed_layout=, advance=, position_ids=)``.
+- ``ArrayStep(segments=, keep=, forks=, placeholders=, eager_add=, fixed_layout=, advance=, position_ids=,
+  prefix_lens=)``.
   A step lists every array it touches, and a call on one it doesn't list raises. ``segments``
   gives one array its own spans, ``None`` being the step's. ``keep=False`` makes every add
   this step scratch. ``advance`` moves each row's position counter by something other than
   its span, for a prompt whose grid covers fewer positions than tokens, and ``position_ids``
-  passes explicit ids.
+  passes explicit ids. ``prefix_lens`` gives each segment the entries a ``BlockPrefix`` read
+  sees, one per segment, above 0 and within its span.
 - ``SampleStep(apply_penalty=, apply_filters=, prompt_tokens=, kept_rows=)``.
   ``prompt_tokens`` initializes the repetition-penalty mask with the prompt tokens. Only the
   prefill step passes them, because the sampler tracks every token it samples afterwards.
