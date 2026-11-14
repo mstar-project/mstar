@@ -183,7 +183,8 @@ class ReplicaRouter:
         replicas: dict[int, int] = {}
         picked: dict[int, RoutingFacts] = {}
         for u, unit in enumerate(self._units):
-            choices = [i for i, instance in enumerate(unit.instances) if eligible is None or eligible(instance)]
+            choices = (range(len(unit.instances)) if eligible is None else
+                       [i for i, instance in enumerate(unit.instances) if eligible(instance)])
             if not choices:
                 return None
             choice = choices[0]

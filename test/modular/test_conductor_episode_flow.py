@@ -148,6 +148,35 @@ def test_a_free_replica_admits_the_oldest_waiter(tmp_path, monkeypatch):
     assert _new_requests(comm, "later") == []
 
 
+def test_capacity_retry_keeps_older_waiters_ahead_of_later_calls(tmp_path, monkeypatch):
+    conductor, _, comm = _conductor(tmp_path, monkeypatch, replicas=2, capacity=1)
+    conductor.max_concurrent_requests = 1
+    conductor._ingest_request(_request("robot", "robot-a"))
+    _complete(conductor, "robot", {"frames": 4})
+    conductor._ingest_request(_request("runner"))
+    for rid in ("older", "middle", "later"):
+        conductor._ingest_request(_request(rid))
+
+    reserve = conductor._reserve_episode_slot
+    failed = False
+
+    def fail_first_reservation(owner, workers):
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise EpisodeCapacityError
+        return reserve(owner, workers)
+
+    monkeypatch.setattr(conductor, "_reserve_episode_slot", fail_first_reservation)
+    _complete(conductor, "runner", {"frames": 4})
+    assert failed and len(_new_requests(comm, "middle")) == 1
+    assert [body.request_id for body in conductor.waiting_queue] == ["older", "later"]
+
+    _complete(conductor, "middle", {"frames": 4})
+    assert len(_new_requests(comm, "older")) == 1
+    assert _new_requests(comm, "later") == []
+
+
 def test_open_input_is_refused_when_episode_slots_are_full(tmp_path, monkeypatch):
     conductor, _, comm = _conductor(tmp_path, monkeypatch)
     conductor._ingest_request(_request("robot", "robot-a"))
