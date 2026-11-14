@@ -524,6 +524,11 @@ class Cosmos3Config:
     # Empty = no video capture. COSMOS3_GEN_CAPTURE_VIDEO ("480x832x29,...",
     # height x width x frames) overrides.
     gen_capture_video: tuple[tuple[int, int, int], ...] = ()
+    # Image denoise steps to capture, as (height, width) pixel tiers. None
+    # keeps the submodule's defaults (192x320, 480x832, 720x1280); a tier
+    # above graph_max_latent_area is still skipped. COSMOS3_GEN_CAPTURE_RES
+    # ("1024x1024,...", height x width) overrides.
+    gen_capture_image: tuple[tuple[int, int], ...] | None = None
     # torch.compile the denoise compute (the generation-layer stack around the
     # attention op). Always a win in serving; the parity tests set False to keep
     # their bit-exact bounds on the eager step.

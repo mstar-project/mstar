@@ -1,5 +1,6 @@
 import atexit
 import logging
+import os
 import queue
 from collections.abc import Callable
 from logging.handlers import QueueHandler
@@ -17,6 +18,19 @@ _NOISY_LOGGERS = (
     "huggingface_hub",
     "filelock",
 )
+
+
+# Each request's lifecycle lines (submitted, queued, admitted, done, torn down)
+# log at DEBUG to this logger, so they can be turned on without the rest of
+# DEBUG, which logs per transport message and per tensor.
+REQUEST_LOGGER = "mstar.requests"
+
+
+def configure_request_log() -> None:
+    """With ``MSTAR_LOG_REQUESTS=1``, log the request lifecycle lines whatever
+    the process's level. Call once after ``logging.basicConfig`` in each process."""
+    if os.environ.get("MSTAR_LOG_REQUESTS") == "1":
+        logging.getLogger(REQUEST_LOGGER).setLevel(logging.DEBUG)
 
 
 def quiet_noisy_loggers(level: int = logging.WARNING) -> None:

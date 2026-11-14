@@ -23,8 +23,6 @@ from mstar.model.lingbot_world.lingbot_world_model import (  # noqa: E402
 )
 from mstar.model.lingbot_world.submodules import (  # noqa: E402
     CHUNK_OUTPUTS,
-    DECODER_CACHE,
-    ENCODER_CACHE,
     ROLLOUT_LOOP_NAME,
     ROLLOUT_WALK,
     EncoderStream,
@@ -71,7 +69,7 @@ def test_walks_run_text_then_a_chunk_loop_that_emits_frames(model):
     emits = [e for e in node.outputs if e.next_node == EMIT_TO_CLIENT]
     assert [(e.name, e.output_modality) for e in emits] == [("video_output", "video_frame")]
     loop_backs = [e.name for e in node.outputs if e.next_node == "dit"]
-    assert loop_backs == ["clock", ENCODER_CACHE, DECODER_CACHE]
+    assert loop_backs == ["clock"]
     assert set(loop_backs) <= set(node.input_names), "each loop-back should feed the next chunk"
     assert not any(e.next_node == EMPTY_DESTINATION for e in node.outputs)
 
@@ -503,21 +501,14 @@ def test_the_fast_config_only_adds_the_autotuned_compile():
 
 
 def test_a_config_must_run_one_rollout_at_a_time(model):
-    """The pool doesn't admit the rollouts' VAE caches, which ride the rollout
-    loop's edges, so the conductor runs one rollout at a time."""
+    """The K/V pool and the VAE caches' budget each hold one rollout at the
+    largest size, so the conductor runs one rollout at a time."""
     model.validate_config_yaml({"max_concurrent_requests": 1}, "lingbot.yaml")
     for limit in (None, 0, 2, 16, True, "1", 1.0):
         config = {"max_concurrent_requests": limit} if limit is not None else {}
         with pytest.raises(ValueError, match="requires `max_concurrent_requests: 1`") as err:
             model.validate_config_yaml(config, "lingbot.yaml")
-    assert "VAE caches, which go from chunk to chunk on the rollout loop's edges" in str(err.value)
-
-
-def test_a_pool_short_of_one_rollout_at_the_default_size_is_refused(model):
-    """A rollout of a 480x832 image, 464x832, at the loop's cap holds 214 pages beside the pool's sink page."""
-    model.validate_config_yaml({"max_concurrent_requests": 1, "resources": {"dit_kv": {"max_num_pages": 215}}}, "x")
-    with pytest.raises(ValueError, match="need 215 pages of resources.dit_kv"):
-        model.validate_config_yaml({"max_concurrent_requests": 1, "resources": {"dit_kv": {"max_num_pages": 214}}}, "x")
+    assert "each hold one rollout at the largest size" in str(err.value)
 
 
 def test_the_shipped_config_runs_one_rollout_at_a_time_over_a_pool_for_the_largest(model):
@@ -534,4 +525,4 @@ def test_the_shipped_config_runs_one_rollout_at_a_time_over_a_pool_for_the_large
     assert config["max_concurrent_requests"] == 1 and "resources" not in config
     model.validate_config_yaml(config, str(path))
     (kv, *_) = serving_resources(model, config)
-    assert kv.config.max_num_pages == 509
+    assert kv.config.pool_tokens == 64800
