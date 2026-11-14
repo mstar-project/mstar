@@ -125,8 +125,9 @@ class FailedRead:
 
 @dataclass
 class _KeptRead:
-    """The local buffers of a read that failed or was torn down mid-transfer,
-    kept until every transfer into them has reported that it stopped.
+    """A failed or interrupted read and any local destination buffers, kept
+    until every transfer has reported that it stopped. An unresolved read
+    holds the drain even when it has no listed destination buffers.
 
     ``future`` is set while the read still runs in the reader thread, which
     owns its batch ids until it finishes. ``running`` holds the ids handed
@@ -140,6 +141,8 @@ class _KeptRead:
     nbytes: int
     future: Future | None = None
     running: dict[int, int] = field(default_factory=dict)
+    # Unknown transfer status blocks READS_DONE until forced removal.
+    unresolved: bool = False
 
 
 #: Earlier Mooncake releases let any host that reaches the TCP data port read
@@ -1743,8 +1746,8 @@ class TensorCommunicationManager(ABC):
             self.uuid_to_shard_dim.pop(uuid, None)
             self.uuid_to_edge_name.pop(uuid, None)
             self.tensor_store.remove_tensor(uuid)
-        if not buffers:
-            return
+        # The read may still touch its source when this transport lists no
+        # destination buffers (arena event futures), or they were already kept.
         kept = _KeptRead(
             ep.request_id, self.rid_to_str(ep.request_id), buffers, registered,
             sum(b.nbytes for b in buffers),
@@ -1756,8 +1759,8 @@ class TensorCommunicationManager(ABC):
         if error is None and ep.future is not None:
             # unfinished when polled: how it ends is read from the future later
             kept.future = ep.future
-        elif not self._take_over(kept, error):
-            return
+        else:
+            self._take_over(kept, error)
         self._kept_reads.append(kept)
 
     def _take_over(self, kept: _KeptRead, error: BaseException | None) -> bool:
@@ -1775,7 +1778,8 @@ class TensorCommunicationManager(ABC):
         kept.running = {ptr: batch_id for ptr, batch_id in error.running.items() if ptr in ptrs}
         return True
 
-    def _never_free(self, kept: _KeptRead, why: str) -> bool:
+    def _never_free(self, kept: _KeptRead, why: str, *, unresolved: bool = True) -> bool:
+        kept.unresolved = unresolved
         self._unreleasable_buffers.extend(kept.buffers)
         logger.warning(
             "Read buffers of request %s (%d bytes) stay allocated for the life of "
@@ -1788,6 +1792,10 @@ class TensorCommunicationManager(ABC):
         FAILED. Never blocks; any other status keeps the buffers."""
         still_kept = []
         for kept in self._kept_reads:
+            if kept.unresolved:
+                if kept.rid is not None:
+                    still_kept.append(kept)
+                continue
             if kept.future is not None:
                 if not kept.future.done():
                     still_kept.append(kept)
@@ -1795,6 +1803,8 @@ class TensorCommunicationManager(ABC):
                 future, kept.future = kept.future, None
                 error = _read_error(future)
                 if not self._take_over(kept, error):
+                    if kept.rid is not None:
+                        still_kept.append(kept)
                     continue
             for ptr, batch_id in list(kept.running.items()):
                 status = self._transfer_status(batch_id)
@@ -1804,6 +1814,8 @@ class TensorCommunicationManager(ABC):
                 elif status not in _TRANSFER_RUNNING:
                     kept.running.clear()
                     self._never_free(kept, f"its transfer returned unknown status {status}")
+                    if kept.rid is not None:
+                        still_kept.append(kept)
                     break
             else:
                 if not kept.running:
@@ -1818,7 +1830,7 @@ class TensorCommunicationManager(ABC):
                 continue
             ret_value = self.transfer_engine.unregister_memory(buffer.data_ptr())
             if ret_value != 0:
-                self._never_free(kept, f"unregistering its buffers failed ({ret_value})")
+                self._never_free(kept, f"unregistering its buffers failed ({ret_value})", unresolved=False)
                 return
         logger.info(
             "Freed %d bytes of read buffers kept for request %s: its transfers "
@@ -2112,19 +2124,16 @@ class TensorCommunicationManager(ABC):
         self.tensor_store.increment_ref_batch_uniform(uuids, n)
 
     def has_inflight_reads(self, request_id: Rid) -> bool:
-        """Whether any async read for this request is still touching a remote
-        segment. Synchronous (SHM) reads complete inside ``start_read_tensors``
-        with ``future=None``, so they never count here; only outstanding
-        async (RDMA) futures do. Gates the READS_DONE ACK during a drain.
-        So does a failed read whose transfers have not all stopped: they may
-        still be reading the producer's memory.
+        """Whether a read may still touch this request's remote source memory.
+        Unfinished transfer/event futures and unresolved failures hold READS_DONE;
+        synchronous reads have no future.
         """
         return any(
             ep.request_id == request_id
             and ep.future is not None and _may_be_reading(ep.future)
             for ep in self.pending
         ) or any(
-            kept.rid == request_id and (kept.future is not None or kept.running)
+            kept.rid == request_id and (kept.future is not None or kept.running or kept.unresolved)
             for kept in self._kept_reads
         )
 

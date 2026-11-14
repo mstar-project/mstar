@@ -67,9 +67,9 @@ class RequestLifecycle:
         # has consumed it, since rank 0 released their pages between two steps.
         self._removes_awaiting_step: dict[int, list[int]] = {}
 
-        # Drains (abort/fail). Waiting for no step to hold the rid; taking no new
-        # work until the remove; and having sent READS_DONE, after which no read
-        # starts. Keyed by the wire string: a drain can precede the NEW_REQUEST.
+        # Drains on completion, abort or failure: no new work once begun,
+        # and no reads after READS_DONE. Wire-keyed because a drain can
+        # precede NEW_REQUEST.
         self.pending_drains: set[str] = set()
         self.draining: set[str] = set()
         self._reads_done_sent: set[str] = set()
@@ -193,10 +193,12 @@ class RequestLifecycle:
     # -- drains --------------------------------------------------------------
 
     def drain(self, body: DrainRequest) -> None:
-        """A DRAIN. A follower honors only the leader's forward, like a remove,
-        but for a request never admitted here: the conductor sends a NEW_REQUEST
-        ahead of its drain on one FIFO socket, so the leader has no handle either
-        and forwards nothing."""
+        """Followers honor the leader's forward, except for never-admitted
+        requests: NEW_REQUEST precedes DRAIN on the conductor's FIFO socket,
+        so the leader has no handle either and forwards nothing."""
+        # A drain on another socket can arrive after the request's removal.
+        if body.request_id in self._removed:
+            return
         if (
             not self._is_tp_follower or body.source == MessageSource.TP_RANK_0
             or self._handle(body.request_id) is None
@@ -272,10 +274,12 @@ class RequestLifecycle:
         speculation chain keeps holding it every step, so a drain the chain does
         not see would never fire and the rollout would run to ``max_iters`` for
         a client that has gone."""
-        wire = None
-        if (self.pending_drains or self.draining) and rid in self.arrivals:
-            wire = self._runtime.get_rid_string(rid)
-        return self.closing(rid, wire)
+        if rid in self.pending_removes or rid in self.failed_rids:
+            return True
+        # Begun drains mark admitted rids failed, including late arrivals.
+        if self.pending_drains and rid in self.arrivals:
+            return self._runtime.get_rid_string(rid) in self.pending_drains
+        return False
 
     def publishable(self, batch) -> list[int]:
         """The rows of a landed step that may publish: no late KV snapshot for a
