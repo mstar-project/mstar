@@ -50,6 +50,29 @@ def test_idless_calls_stay_cold_and_never_get_an_episode_record():
     assert episodes._records == {}
 
 
+def test_planning_view_names_empty_episode_arrays_without_storing_zero_counts():
+    episodes = EpisodeRecords({"frames", "text"})
+    zero = {"frames": 0, "text": 0}
+    assert dict(episodes.view(None).held) == zero
+    assert dict(episodes.admit(None, "idless", 4, _placement(0)).held) == zero
+    assert dict(episodes.admit("robot-a", "call-1", 3, _placement(0), keys={"text": "a"}).held) == zero
+
+    episodes.finish("robot-a", "call-1", {"frames": 21, "text": 8})
+    assert dict(episodes.view("robot-a", {"text": "b"}).held) == {"frames": 21, "text": 0}
+    assert episodes._records["robot-a"].held == {"frames": 21, "text": 8}
+
+    episodes.admit("robot-a", "call-2", 3, _placement(0), keys={"text": "b"})
+    episodes.finish("robot-a", "call-2", {})
+    assert episodes._records["robot-a"].held == {"frames": 21}
+    assert dict(episodes.view("robot-a").held) == {"frames": 21, "text": 0}
+
+    assert dict(episodes.view("robot-a", reset=True).held) == zero
+    episodes.reset("robot-a")
+    assert dict(episodes.view("robot-a").held) == zero
+    episodes.evict("robot-a")
+    assert dict(episodes.view("robot-a").held) == zero
+
+
 def test_reset_keeps_call_count_and_end_releases_the_logical_owner():
     episodes = EpisodeRecords()
     episodes.admit("robot-a", "call-1", 3, _placement(0))
