@@ -1682,14 +1682,18 @@ def test_the_token2wav_loop_hands_the_flow_its_clip_on_every_chunk(model, tmp_pa
         graph.ingest(name, FLOW_NODE)
     for name in (HIFT_COUNTS, HIFT_MEL):
         graph.ingest(name, HIFT_NODE)
-    for _ in range(3):
+    for chunk in range(3):
         graph.chunk(SPEECH_TOKENS, FLOW_NODE)
         inputs = graph.inputs(FLOW_NODE)
         assert set(inputs) == {SPEECH_TOKENS, "ref_audio", FLOW_COUNTS, RAW_TOKENS}
         (held,) = inputs["ref_audio"]
         assert torch.equal(graph.tm.tensor_store.get_tensor(held), clip), "a chunk after the first would have no clip"
         graph.complete(FLOW_NODE, {name: [torch.ones(1)] for name in (MEL, MEL_FINAL, FLOW_COUNTS, RAW_TOKENS)})
-        graph.complete(HIFT_NODE, {AUDIO_CHUNK: [torch.ones(1)], HIFT_COUNTS: [torch.ones(1)], HIFT_MEL: []})
+        assert graph.ready() == {HIFT_NODE}
+        pending = graph.inputs(HIFT_NODE)[HIFT_MEL]
+        assert len(pending) == chunk % 2, "a chunk that left no pending mel would hand on an older one"
+        mel = [] if chunk % 2 else [torch.ones(1)]
+        graph.complete(HIFT_NODE, {AUDIO_CHUNK: [torch.ones(1)], HIFT_COUNTS: [torch.ones(1)], HIFT_MEL: mel})
 
 
 # -- HiFT -----------------------------------------------------------------------------
