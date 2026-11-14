@@ -772,6 +772,9 @@ class Wan22VaeDecoderSubmodule(_Fp32IslandMixin, NodeSubmodule):
     where they can run, at any size and with nothing compiled; elsewhere the knob is
     ignored with one log line.
 
+    With ``config.vae_decode_tiny`` (opt-in, lossy) every decode runs a tiny VAE
+    (``mstar.model.components.taehv_decoder``) on the DiT's latents instead.
+
     With ``config.stream_decode`` the node runs as the ``vae_decode_loop``, one
     piece of the clip an iteration (``_decode_part``), and each piece's frames go
     to the API server's mp4 writer while the next piece decodes.
@@ -797,6 +800,13 @@ class Wan22VaeDecoderSubmodule(_Fp32IslandMixin, NodeSubmodule):
         # built on the first decode, on the device it runs on; None after a refusal is logged
         self._kernel = None
         self._kernel_refused = not config.vae_decode_kernel
+        self._tiny = None
+        if config.vae_decode_tiny:
+            from mstar.model.components.taehv_decoder import TinyWanDecoder
+
+            # a submodule, so it moves to the node's device with the VAE; bf16, as its quality was measured
+            self._tiny = TinyWanDecoder.load(config.vae_decode_tiny).to(torch.bfloat16)
+            logger.info("Wan2.2 VAE decode: the tiny VAE %s (vae_decode_tiny, lossy)", config.vae_decode_tiny)
         if config.vae_decode_fast:
             from mstar.model.components import wan_vae
 
@@ -955,6 +965,8 @@ class Wan22VaeDecoderSubmodule(_Fp32IslandMixin, NodeSubmodule):
         with _inference_ctx():
             if part is not None:
                 return {"video_output": [self._decode_part(engine_inputs.request_ids[0], latents, part)]}
+            if self._tiny is not None:
+                return {"video_output": [self._frames(self._tiny(latents.to(self.get_device())))]}
             vae, latents = self._vae_latents(latents)
             frames = self._frames(self._decode(vae, latents, self._decode_path(vae, latents)))
         return {"video_output": [frames]}
@@ -972,7 +984,9 @@ class Wan22VaeDecoderSubmodule(_Fp32IslandMixin, NodeSubmodule):
         start, stop = part * per_part, min((part + 1) * per_part, num_latents)
         if not 0 <= start < num_latents or (part > 0) != ("stream_cache" in state):
             raise ValueError(f"piece {part} of a streamed decode of {num_latents} latent frames is out of order")
-        if part == 0:
+        if part == 0 and self._tiny is not None:  # tens of ms for a whole clip: decoded whole, cut
+            state.add("stream_cache", self._frames(self._tiny(latents.to(self.get_device()))))
+        elif part == 0:
             vae, latents = self._vae_latents(latents)
             path = self._decode_path(vae, latents)
             if path == "fast":

@@ -199,6 +199,10 @@ class Wan22Config:
     # TI2V-5B VAE. Not bit-exact with ``vae.decode`` (Winograd and fused norms round differently); about 2x faster.
     # Any untiled size, no compile. A GPU it cannot run on decodes as if it were off (logged once).
     vae_decode_kernel: bool = False
+    # Opt-in, lossy: decode with a tiny VAE instead (``components/taehv_decoder``), the path to madebyollin/taehv's
+    # ``taew2_2.pth`` or ``taew2_2_super.pth`` (MIT). 31 / 113 ms for a 1280x704x81 clip on a B300 against 1.15 s,
+    # at 35.0 / 38.4 dB from an fp32 full decode (LPIPS 0.027 / 0.014). A preview / draft model choice. TI2V-5B only.
+    vae_decode_tiny: str | None = None
 
     # The VAE decoder as a loop over the clip's latent frames, ``stream_decode_latents`` an
     # iteration, each iteration's frames encoded by the API server while the next decodes
@@ -242,6 +246,13 @@ class Wan22Config:
             raise ValueError(f"Wan2.2 vae_decode_kernel must be true or false, got {self.vae_decode_kernel!r}.")
         if self.vae_decode_kernel and self.is_moe:
             raise ValueError("Wan2.2 vae_decode_kernel decodes the TI2V-5B VAE; A14B decodes with the Wan2.1 VAE.")
+        if self.vae_decode_tiny is not None:
+            if not isinstance(self.vae_decode_tiny, str) or not self.vae_decode_tiny:
+                raise ValueError(f"Wan2.2 vae_decode_tiny must be a checkpoint path, got {self.vae_decode_tiny!r}.")
+            if self.is_moe:
+                raise ValueError("Wan2.2 vae_decode_tiny takes a TI2V-5B (taew2_2) decoder, not A14B's.")
+            if self.vae_decode_kernel:
+                raise ValueError("Wan2.2 vae_decode_tiny and vae_decode_kernel are two decoders: set one.")
         if not isinstance(self.stream_decode, bool):
             raise ValueError(f"Wan2.2 stream_decode must be true or false, got {self.stream_decode!r}.")
         latents = self.stream_decode_latents
