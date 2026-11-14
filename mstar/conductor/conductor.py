@@ -1455,8 +1455,8 @@ class Conductor:
             self._reject_request(body.request_id, str(exc), status=400)
             return
         episode_active = self._uses_episode_records(body)
-        if episode_active:
-            self._expire_episode_slots(time.monotonic())
+        if episode_active and self._expire_episode_slots(time.monotonic()):
+            self._try_admit_waiting()
         if episode_active and body.episode is not None and (
             type(body.episode) is not str or not body.episode
         ):
@@ -1965,6 +1965,7 @@ class Conductor:
             self._reject_request(request.request_id, "episode ended", status=410)
         if not self._episode_records.mark_ending(episode_id):
             self._close_episode(episode_id)
+            self._try_admit_waiting()
 
     def _reserve_episode_slot(self, owner: str, workers: set[str]) -> int:
         slot = self._episode_slots.reserve(owner, workers)
