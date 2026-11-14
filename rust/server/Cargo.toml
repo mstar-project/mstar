@@ -32,8 +32,10 @@ libc = "0.2"
 http-body-util = "0.1"
 # Rewrites MSTAR_ROOT_PATH before routing; already in the tree through axum.
 tower = { version = "0.5", features = ["util"] }
-rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
-webpki-roots = "0.26"
+# The remote media fetch. Pinned to a minor: the `Resolver` that holds the
+# fetch to its vetted addresses lives in ureq's `unversioned` module, which the
+# crate may change in a minor release.
+ureq = { version = "~3.5", default-features = false, features = ["rustls"] }
 url = "2"
 # Constant-time API key compare; already in the tree through rustls.
 subtle = "2"
