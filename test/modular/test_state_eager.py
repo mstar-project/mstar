@@ -54,6 +54,7 @@ from mstar.engine.resources.step import Segment, StepContext, SubmoduleStep
 from mstar.engine.state import Array, ArrayStep, Attend, Bidirectional, Block, Causal, KeptWindow, Layout, Read
 from mstar.engine.state.adapters import (
     KeptWindowEagerDense,
+    PageWindowEagerDense,
     build_specs,
     kv_layouts,
     node_handles,
@@ -195,9 +196,9 @@ def test_an_eager_kernel_runs_only_a_bidirectional_read():
     assert "attn_gen" not in setup.by_read, "a causal read would attend past its mask on the dense kernel"
 
 
-def _windowed_pool(page_size: int, sink: int, window: int) -> KVManager:
+def _windowed_pool(page_size: int, sink: int, window: int, exact: bool = True) -> KVManager:
     """A CPU pool of one layer of one head of one value, whose entries hold their log positions, with request ``a``
-    under an exact retention of ``sink`` and ``window``."""
+    under a retention of ``sink`` and ``window``, exact or of whole pages."""
     cfg = PagedKVConfig(
         num_layers=1, num_qo_heads=1, num_kv_heads=1, head_dim=1, max_seq_len=64 * page_size, max_num_pages=64,
         page_size=page_size,
@@ -207,11 +208,21 @@ def _windowed_pool(page_size: int, sink: int, window: int) -> KVManager:
         transfer_engine_info=TransferEngineInfo("h", "h", LocalTransferEngine("h")), device=torch.device("cpu"),
         dtype=torch.float32,
     )
-    layout = LabelLayout(growth=(("rollout", 1),), retention=RetentionPolicy(window, sink, exact=True))
+    layout = LabelLayout(growth=(("rollout", 1),), retention=RetentionPolicy(window, sink, exact=exact))
     request = KVReqConfig(needed_labels=["main"])
     request.apply_conductor_config(kv_layout={"main": layout.row()}, loop_caps={"rollout": 10_000})
     pool.ingest_request("a", overrides=request)
     return pool
+
+
+def _commit(pool: KVManager, ctx: StepContext, start: int, span: int) -> None:
+    """Keep ``span`` entries holding the log positions from ``start``."""
+    step = KVStep(segments=(Segment("a", "main", span),))
+    assert pool.admit(step, ctx).ok
+    pool.plan(step, ctx)
+    pool.write_kv(*([torch.arange(start, start + span, dtype=torch.float32)[:, None, None]] * 2), layer_idx=0,
+                  label="main")
+    pool.commit(step, ctx)
 
 
 @pytest.mark.parametrize("page_size", [16, 128])
@@ -246,15 +257,62 @@ def test_the_dense_prefix_is_the_kept_reach(page_size):
         assert k.flatten().long().tolist() == expected, f"the denoise after commit {commit} attends other entries"
 
 
+def _reference_context(sink: int, window: int, page_size: int, committed: int, released: int) -> tuple[list[int], int]:
+    """What Cosmos3's block-causal reference attends after a commit, and what it has released by then: the ``sink``
+    prompt entries, the frames that share the prompt's last page, and the frames past those it released
+    (``Cosmos3Pipeline.windowed_kv``'s ``_release`` and ``_ctx``, mstar/model/cosmos3/tests/pipeline.py)."""
+    first = -(-sink // page_size)
+    stream = committed - released
+    pages = min(max(stream - sink - window, 0) // page_size, stream // page_size - first)
+    released += max(pages, 0) * page_size
+    keep = first * page_size - sink
+    frames = list(range(sink, committed))
+    return [*range(sink), *frames[:keep], *frames[keep + released:]], released
+
+
+@pytest.mark.parametrize("page_size", [16, 128])
+def test_a_window_of_whole_pages_attends_what_the_reference_keeps(page_size):
+    """After a prompt that ends inside a page and each of 30 window commits, a denoise step on the dense kernel and a
+    commit on the paged one both attend every entry the stream holds, which is the reference's context. The exact
+    window drops the frames beside the prompt and up to a page of the oldest window, on the dense kernel alone."""
+    sink, window, frame = 2 * page_size + 5, 3 * page_size + 7, page_size // 2 + 3
+    pool = _windowed_pool(page_size, sink, window, exact=False)
+    dense = DenseAttentionManager(
+        kv_cache="kv", device=torch.device("cpu"), dtype=torch.float32, kv_config=pool.config,
+        wrapper_class=_CpuVarlenSdpa,
+    )
+    ctx = StepContext(request_ids=("a",), graph_walk="rollout", slot=0, capture=False)
+    _commit(pool, ctx, 0, sink)
+    start, released = sink, 0
+    for commit in range(30):
+        _commit(pool, ctx, start, frame)
+        start += frame
+        expected, released = _reference_context(sink, window, page_size, start, released)
+        denoise = KVStep(segments=(Segment("a", "main", 4),), commit=False)
+        assert pool.admit(denoise, ctx).ok
+        planned = pool.plan(denoise, ctx)["main"]
+        plan = dense._build_plan(planned, False, EagerSlotKey(label="main", slot=0))
+        k, _ = dense._prefix_kv(plan.segments[0], 0, pool.layer_view(0))
+        pool.commit(denoise, ctx)
+        (view,) = planned.views
+        held = pool.layer_view(0)[view.page_idxs, 0].flatten()[:view.length - view.to_compute]
+        assert k.flatten().long().tolist() == expected, f"the denoise after commit {commit} left the reference"
+        assert held.long().tolist() == expected, f"the pages after commit {commit} hold other entries than it attends"
+        assert not planned.beyond_reach, "a captured denoise step would be refused the paged kernel"
+    assert released > 2 * window, "the stream never released, so the window was never cut"
+
+
 # Cosmos3's windowed generation read beside its prefill read
 
 
-def _windowed() -> Array:
-    """Cosmos3's windowed array: read causally on its prefill walk and through a kept window on its generation walk."""
+def _windowed(whole_pages: bool = False) -> Array:
+    """A windowed array read as Cosmos3's: causally on its prefill walk and through a kept window on its generation
+    walk, cut by entry or, as Cosmos3 cuts it, on whole pages."""
     attend = Attend(q_heads=HEADS)
+    window = Bidirectional(kept_window=True, whole_pages=whole_pages)
     return _array(reads={
         "attn": Read(mask=Causal(), op=attend, walks=frozenset({"prefill"})),
-        "attn_gen": Read(mask=Bidirectional(kept_window=True), op=attend, walks=frozenset({"gen"})),
+        "attn_gen": Read(mask=window, op=attend, walks=frozenset({"gen"})),
     })
 
 
@@ -277,6 +335,18 @@ def test_a_windowed_deployment_without_its_eager_kernel_has_no_layout():
     """The gathered kept-window kernel is a spec of its own, over the layers the prefill read's paged spec covers."""
     _refused(r"Array 'kv': no layout yet: reads\['attn'\] and reads\['attn_gen'\] build different specs and both "
              "cover layer 0", lambda: build_specs([_windowed()]))
+
+
+def test_a_window_of_whole_pages_runs_the_kernels_of_a_read_with_no_window():
+    """The paged kernel attends every entry the pages hold, so the read shares the prefill read's paged spec, with or
+    without its eager kernel, and its layout keeps a retention that releases whole pages."""
+    array = _windowed(whole_pages=True)
+    setup, problems = state_setup({}, [array], EAGER)
+    assert not problems and type(setup.by_read["attn_gen"]) is PageWindowEagerDense
+    assert [type(spec) for spec in build_specs([array])] == [KVSpec, AttentionSpec]
+    layout = Layout(spans=(_span("prefill", 4), _span("gen", 20)), kept_windows={"attn_gen": KeptWindow(4, window=8)})
+    retention = kv_layouts([array], {"kv": {"main": layout}}, {})["kv"]["main"].retention
+    assert retention == RetentionPolicy(8, 4), "an exact retention would release other pages than the reference"
 
 
 def test_a_neighbour_read_stays_inside_the_sink():

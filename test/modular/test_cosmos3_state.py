@@ -15,12 +15,13 @@ import torch
 
 from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec, AttnBackend
 from mstar.engine.resources.attn.ragged.config import RaggedAttnBackend
-from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
+from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig, RetentionPolicy
 from mstar.engine.resources.position.config import PositionConfig, PositionSpec
 from mstar.engine.resources.sampler.config import SamplerSpec
 from mstar.engine.resources.sequence_shard import SeqShardSpec
 from mstar.engine.resources.step import StepContext
-from mstar.engine.state.adapters import node_resources, state_setup
+from mstar.engine.state import Bidirectional, KeptWindow, Layout
+from mstar.engine.state.adapters import kv_layouts, node_resources, state_setup
 from mstar.model.cosmos3 import constants as C
 from mstar.model.cosmos3.config import Cosmos3Config
 from mstar.model.cosmos3.cosmos3_model import DIT_NODE, REASONER_MIXED_SPLIT, REASONER_NODE, Cosmos3Model
@@ -152,6 +153,17 @@ def test_a_kv_window_commits_on_the_kernel_main_committed_it_on():
         step = engine_step(dit, graph_walk=C.VIDEO_GEN_AR_WALK, request_ids=["r"], inputs=inputs)
         planned[commit] = {key: step.steps[key].causal for key in (ATTN, ATTN_GEN) if key in step.steps}
     assert planned == {False: {ATTN_GEN: False}, True: {ATTN: False}}, "main denoised on ATTN_GEN and committed on ATTN"
+
+
+def test_a_kv_window_is_cut_on_whole_pages_as_the_reference_cuts_it():
+    """The reference's denoise steps and its commit attend one context, whole pages behind the prompt
+    (``Cosmos3Pipeline.windowed_kv``). An exact window would cut the denoise steps' read inside a page."""
+    model = _edge(attention_backend="dense_gen", enable_windowed_video=True)
+    (kv,) = [array for array in model.declare_state() if array.name == C.KV_CACHE]
+    assert kv.reads[ATTN_GEN].mask == Bidirectional(kept_window=True, whole_pages=True)
+    layouts = {COND_LABEL: Layout(kept_windows={ATTN_GEN: KeptWindow(37, window=512)})}
+    retention = kv_layouts([kv], {C.KV_CACHE: layouts}, {})[C.KV_CACHE][COND_LABEL].retention
+    assert retention == RetentionPolicy(512, 37) and not retention.exact
 
 
 def test_a_windowed_request_draws_each_window_from_where_progress_left_its_generator(monkeypatch):

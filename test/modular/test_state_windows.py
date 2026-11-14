@@ -100,6 +100,8 @@ def _read(mask, **fields) -> Read:
 
 @pytest.mark.parametrize(("make", "message"), [
     (lambda: Bidirectional(kept_window=1), "Bidirectional.kept_window must be a bool, got 1"),
+    (lambda: Bidirectional(kept_window=True, whole_pages=1), "Bidirectional.whole_pages must be a bool, got 1"),
+    (lambda: Bidirectional(whole_pages=True), "Bidirectional.whole_pages cuts a kept window, and kept_window is False"),
     (lambda: KeptWindow(-1, window=4), "KeptWindow.sink must be an int >= 0, got -1"),
     (lambda: KeptWindow(2, window=-1), "KeptWindow.window must be an int >= 1, got -1"),
     (lambda: KeptWindow(2, window=0), "KeptWindow.window must be an int >= 1, got 0"),
@@ -110,8 +112,8 @@ def _read(mask, **fields) -> Read:
     (lambda: FrameWindow(512, frames=16, stride=0), "FrameWindow.stride must be a positive int, got 0"),
     (lambda: FrameWindow(512, frames=12, stride=8), "FrameWindow.frames must be a multiple of stride 8, got 12"),
 ], ids=[
-    "kept_window_int", "sink_negative", "window_negative", "window_zero", "sink_float", "sink_bool", "tokens_zero",
-    "frames_zero", "stride_zero", "frames_off_stride",
+    "kept_window_int", "whole_pages_int", "whole_pages_alone", "sink_negative", "window_negative", "window_zero",
+    "sink_float", "sink_bool", "tokens_zero", "frames_zero", "stride_zero", "frames_off_stride",
 ])
 def test_a_window_refuses_its_own_bad_fields(make, message):
     with pytest.raises(ValueError, match=f"^{message}$"):
@@ -759,6 +761,20 @@ def test_a_kept_window_read_may_name_its_walks():
         "self_attn": _read(Bidirectional(kept_window=True), walks={"rollout"}),
     }, max_len=4096)])
     assert isinstance(attn, KeptWindowAttentionSpec), "a read on its own walks would lose its window"
+
+
+def test_a_window_of_whole_pages_stays_in_pages():
+    """The rolling store keeps a window by entry, so one cut on pages is a paged pool's, on the paged kernel's spec."""
+    whole = Bidirectional(kept_window=True, whole_pages=True)
+    pool, attn = build_specs([_array("dit_kv", reads={"self_attn": _read(whole)}, max_len=4096)])
+    assert isinstance(pool, KVSpec) and pool.kept_window and type(attn) is AttentionSpec
+
+
+def test_a_read_with_no_op_keeps_no_window_of_whole_pages():
+    """Its binding gathers a window by entry, which would return other entries than the pages keep."""
+    reach = Read(mask=Bidirectional(kept_window=True, whole_pages=True))
+    with pytest.raises(ValueError, match=r"Array 'dit_kv'.*reads\['reach'\]\.op"):
+        build_specs([_array("dit_kv", reads={"reach": reach}, max_len=4096, labels=PAGED_LABELS)])
 
 
 def test_a_kept_window_read_takes_no_queries():
