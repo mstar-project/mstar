@@ -52,6 +52,7 @@ from mstar.model.rebuild import RebuildPolicy
 from mstar.model.submodule_base import ChunkingPolicy, NodeSubmodule
 from mstar.model.utils import load_generation_defaults
 from mstar.streaming.topology import Connection, PartitionTopology, StreamingGraphEdge
+from mstar.utils.hf_snapshot import resolve_snapshot_dir
 
 logger = logging.getLogger(__name__)
 
@@ -92,24 +93,6 @@ LLM_FILES = ["*.json", "*.safetensors"]
 TOKENIZER_FILES = ["*.json"]
 
 
-def _resolve_local_hf_snapshot(
-    repo_id: str, cache_dir: str | None = None, allow_patterns: list[str] | None = None,
-) -> str:
-    from huggingface_hub import snapshot_download
-
-    try:
-        local_dir = snapshot_download(
-            repo_id=repo_id,
-            cache_dir=cache_dir,
-            local_files_only=False,
-            allow_patterns=allow_patterns,
-        )
-    except Exception as e:
-        logger.warning("Error downloading from huggingface: %s", str(e))
-        return repo_id
-    return str(Path(local_dir))
-
-
 class OrpheusModel(Model):
     """Orpheus TTS model: Llama 3.2 3B + SNAC 24kHz decoder."""
 
@@ -138,11 +121,11 @@ class OrpheusModel(Model):
             **_checkpoint_sampling_defaults(model_path_hf, cache_dir),
         )
 
-        tokenizer_source = _resolve_local_hf_snapshot(
+        tokenizer_source = str(resolve_snapshot_dir(
             "canopylabs/orpheus-3b-0.1-pretrained",
             cache_dir=cache_dir,
             allow_patterns=TOKENIZER_FILES,
-        )
+        ))
         self.tokenizer = AutoTokenizer.from_pretrained(
             tokenizer_source,
             cache_dir=cache_dir,
@@ -334,9 +317,7 @@ class OrpheusModel(Model):
         )}}
 
     def checkpoint_path(self) -> str:
-        return _resolve_local_hf_snapshot(
-            self.model_path_hf, cache_dir=self.cache_dir, allow_patterns=LLM_FILES,
-        )
+        return str(resolve_snapshot_dir(self.model_path_hf, cache_dir=self.cache_dir, allow_patterns=LLM_FILES))
 
     def _lora_spec(self) -> LoraSpec:
         """Per-request adapters on the LLM (opt-in): every linear of the Llama stack, the
@@ -450,11 +431,7 @@ class OrpheusModel(Model):
         from mstar.model.orpheus.components.language_model import OrpheusForCausalLM
         from mstar.model.orpheus.submodules import OrpheusLLMSubmodule
 
-        local_dir = _resolve_local_hf_snapshot(
-            self.model_path_hf,
-            cache_dir=self.cache_dir,
-            allow_patterns=LLM_FILES,
-        )
+        local_dir = str(resolve_snapshot_dir(self.model_path_hf, cache_dir=self.cache_dir, allow_patterns=LLM_FILES))
 
         with torch.device("meta"):
             language_model = OrpheusForCausalLM(self.config, comm_group=tp_group)
@@ -473,10 +450,7 @@ class OrpheusModel(Model):
         from mstar.model.orpheus.components.snac import SNAC
         from mstar.model.orpheus.submodules import SNACDecoderSubmodule
 
-        snac_source = _resolve_local_hf_snapshot(
-            self.config.snac_model_id,
-            cache_dir=self.cache_dir,
-        )
+        snac_source = str(resolve_snapshot_dir(self.config.snac_model_id, cache_dir=self.cache_dir))
         snac_model = SNAC.from_pretrained(snac_source).eval().to(device)
         return SNACDecoderSubmodule(
             snac_model=snac_model,

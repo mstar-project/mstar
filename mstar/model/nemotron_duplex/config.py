@@ -361,8 +361,16 @@ class NemotronDuplexConfig:
         import json
         import os
 
-        with open(os.path.join(ckpt_dir, "config.json")) as f:
+        path = os.path.join(ckpt_dir, "config.json")
+        with open(path) as f:
             raw = json.load(f)
+        try:
+            return cls._from_voicechat(raw)
+        except KeyError as e:
+            raise ValueError(f"{path} is not a NeMo VoiceChat config: it has no {e} entry") from e
+
+    @classmethod
+    def _from_voicechat(cls, raw: dict) -> NemotronDuplexConfig:
         cfg = cls()
 
         perception = raw["model"]["stt"]["model"]["perception"]

@@ -229,7 +229,7 @@ def _stub_checkpoint(monkeypatch, config=None):
     config.json, and each node's modules returned as built."""
     import mstar.model.nemotron_duplex.nemotron_duplex_model as ndm
 
-    monkeypatch.setattr(ndm, "_resolve_local_hf_snapshot", lambda *a, **k: "/nonexistent")
+    monkeypatch.setattr(ndm, "resolve_snapshot_dir", lambda *a, **k: "/nonexistent")
     monkeypatch.setattr(NemotronDuplexConfig, "from_pretrained", classmethod(lambda cls, d: config or cls()))
 
 
@@ -288,6 +288,19 @@ def test_duplex_refuses_a_checkpoint_its_resources_were_not_sized_for(monkeypatc
     _stub_checkpoint(monkeypatch, ckpt)
     with pytest.raises(ValueError, match=f"resources.{ENCODER_STATE}"):
         _make_model()._json_config("/nonexistent")
+
+
+def test_duplex_refuses_a_checkpoint_dir_with_no_config(tmp_path):
+    """Serving the dataclass defaults in place of a missing config.json hid a
+    broken checkpoint, and left the resources nothing to be checked against."""
+    with pytest.raises(FileNotFoundError):
+        _make_model()._json_config(str(tmp_path))
+
+
+def test_duplex_names_a_config_json_of_another_layout(tmp_path):
+    (tmp_path / "config.json").write_text('{"foo": 1}')
+    with pytest.raises(ValueError, match="config.json is not a NeMo VoiceChat config"):
+        _make_model()._json_config(str(tmp_path))
 
 
 def test_duplex_checks_the_encoder_kv_against_the_checkpoint(monkeypatch):

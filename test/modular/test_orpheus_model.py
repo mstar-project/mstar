@@ -137,7 +137,7 @@ def test_no_checkpoint_download_fetches_the_training_state(monkeypatch):
     from mstar.model.orpheus import orpheus_model
 
     calls = []
-    monkeypatch.setattr(huggingface_hub, "snapshot_download", lambda **kw: calls.append(kw) or "/snap")
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", lambda *a, **kw: calls.append(kw) or "/snap")
     monkeypatch.setattr(orpheus_model.AutoTokenizer, "from_pretrained", lambda *a, **k: None)
     monkeypatch.setattr(loader, "load_weights", lambda *a, **k: None)
     model = OrpheusModel("canopylabs/orpheus-3b-0.1-ft")
