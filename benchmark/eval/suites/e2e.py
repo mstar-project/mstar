@@ -25,9 +25,10 @@ import aiohttp
 from benchmark.eval import stats
 from benchmark.eval.datasets import Item
 from benchmark.eval.suites.base import Suite, error_row, exception_row, parse_extra
+from benchmark.eval.suites.praxis_wire import run_openpi, run_positronic
 
 KINDS = ("chat_text", "chat_image", "chat_audio", "chat_video", "chat_count", "image", "video", "video_i2v",
-         "gen_clone", "pi05", "frames", "world")
+         "gen_clone", "pi05", "frames", "world", "praxis_openpi", "praxis_positronic")
 MEDIA_KINDS = {"chat_image", "chat_audio", "chat_video", "video_i2v", "pi05", "frames", "world"}
 PROMPTS = [
     "Describe this in two sentences.",
@@ -58,7 +59,8 @@ PI05_TASKS = ["pick up the red block", "open the drawer", "push the cup left", "
 WORLD_PROMPT = "a quiet street at dusk, the camera moving slowly forward"
 WORLD_FRAMES = 29                         # two 4-latent-frame chunks at a temporal VAE stride of 4
 WORLD_INTRINSICS = [500.0, 500.0, 416.0, 240.0]   # fx, fy, cx, cy at 832x480
-EXT = {"image": "png", "video": "mp4", "video_i2v": "mp4", "pi05": "f32", "frames": "u8", "world": "u8"}
+EXT = {"image": "png", "video": "mp4", "video_i2v": "mp4", "pi05": "f32", "frames": "u8", "world": "u8",
+       "praxis_openpi": "f32", "praxis_positronic": "f32"}
 DEFAULT_ITEMS = 16
 
 
@@ -199,6 +201,10 @@ class E2ESuite(Suite):
                 first.append(time.perf_counter() - t0)
 
         try:
+            if a.kind == "praxis_openpi":
+                return await run_openpi(session, url, index, item, t0, timeout)
+            if a.kind == "praxis_positronic":
+                return await run_positronic(session, url, index, item, t0, timeout)
             if a.kind.startswith("chat_"):
                 async with session.post(f"{url}/v1/chat/completions", json=self._chat_body(index),
                                         timeout=timeout) as r:
@@ -268,7 +274,7 @@ class E2ESuite(Suite):
         ok = [r for r in rows if r["ok"]]
         if audio_dir is not None:
             save_outputs(ok, audio_dir, self.args.kind)
-        return {
+        result = {
             "requests": len(rows),
             "errors": len(rows) - len(ok),
             "lat_p50_s": stats.percentile([r["e2e_s"] for r in ok], 50),
@@ -278,6 +284,11 @@ class E2ESuite(Suite):
             "req_per_s": len(ok) / wall_s if wall_s > 0 else None,
             "audio_s_total": sum(r["audio_s"] for r in ok),
         }
+        if self.args.kind == "praxis_positronic":
+            for phase in ("cold", "warm1", "warm2", "reset"):
+                result[f"{phase}_p50_s"] = stats.percentile([r[f"_{phase}_s"] for r in ok], 50)
+            result["call_per_s"] = 4 * len(ok) / wall_s if wall_s > 0 else None
+        return result
 
 
 async def _lines(resp: aiohttp.ClientResponse, prefix: bytes = b""):

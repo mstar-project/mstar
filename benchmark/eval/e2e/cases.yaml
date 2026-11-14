@@ -8,7 +8,8 @@
 #   suite: tts | asr | duplex    the eval suites (`python -m benchmark.eval run <suite>`), on a dataset below
 #   client: <kind>               the `e2e` suite (`run e2e --kind <kind>`): chat_text, chat_image, chat_audio,
 #                                chat_video, chat_count, image, video, video_i2v, gen_clone, pi05, frames,
-#                                world (image to world video along a seeded camera path)
+#                                world (image to world video along a seeded camera path),
+#                                praxis_openpi, praxis_positronic (DROID WebSocket calls)
 #   rp: whisper | omni           request-path cases (status codes per request), `--rp` only
 #   rp: cancel_* | timeout_*     cancels mid-transfer (worker-to-worker transport models); a case with
 #                                `server_timeout_s: N` runs on a second server started with `--timeout N`
@@ -923,3 +924,42 @@ models:
         n: 16
         check: {kind: action_diff, tol: 0.05}
         perf: {latency: lat_p50_s, throughput: req_per_s}
+
+  # Optional until #1520 can start with its serving gate enabled. A base and
+  # head both need the same DROID config and checkpoint before compare can run.
+  # Calibrate H200 A/A noise before using these rows for a perf verdict.
+  praxis1_droid:
+    serve: praxis1_droid
+    family: VLA
+    optional: true
+    tags: [praxis, vla, image-in, actions, websocket]
+    est_min: 10
+    health: true
+    cases: &praxis_droid_cases
+      - id: cold_openpi
+        modality: Praxis DROID cold actions
+        client: praxis_openpi
+        conc: [1, 2]
+        n: 8
+        warmup: 1
+        check: {kind: action_diff, tol: 0.05}
+        perf: {latency: lat_p50_s, throughput: req_per_s}
+      - id: warm_positronic
+        modality: Praxis DROID session commands
+        client: praxis_positronic
+        conc: [1, 2]
+        n: 8
+        warmup: 1
+        check: {kind: action_diff, tol: 0.05}
+        perf: {latency: warm1_p50_s, throughput: call_per_s,
+               extra: [cold_p50_s, warm2_p50_s, reset_p50_s]}
+
+  praxis1_droid_python:
+    serve: praxis1_droid
+    family: VLA
+    optional: true
+    serve_args: [--python-frontend]
+    tags: [praxis, vla, image-in, actions, websocket, python-frontend]
+    est_min: 10
+    health: true
+    cases: *praxis_droid_cases

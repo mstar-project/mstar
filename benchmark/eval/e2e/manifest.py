@@ -15,7 +15,7 @@ DRIVERS = ("suite", "client", "rp", "invariants")
 SUITES = ("tts", "asr", "duplex")
 RP_SUITES = ("whisper", "omni", "cancel_speech", "cancel_chat", "timeout_speech", "timeout_chat")
 CLIENT_KINDS = ("chat_text", "chat_image", "chat_audio", "chat_video", "chat_count", "image", "video", "video_i2v",
-                "gen_clone", "pi05", "frames", "world")
+                "gen_clone", "pi05", "frames", "world", "praxis_openpi", "praxis_positronic")
 CHECKS = {
     "text_match": {"min_match"},
     "wer": {"max_increase"},

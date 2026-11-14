@@ -377,10 +377,9 @@ def case_cmds(case: dict, url: str, label: str, d: Path) -> list[list[str]]:
 
 
 def serve_args(arm: dict) -> list[str]:
-    """The model's ``serve_args``, and the arm's own mstar-server build (which an arm from before
-    mstar-server was the only frontend reads as choosing it)."""
+    """The model's ``serve_args`` and its Rust binary unless Python is selected."""
     args = [a.replace("{rust_server_bin}", arm.get("rust_server") or "") for a in job["model"].get("serve_args", [])]
-    if "--rust-frontend-bin" not in args:
+    if "--python-frontend" not in args and "--rust-frontend-bin" not in args:
         args += ["--rust-frontend-bin", arm["rust_server"]]
     return args
 
