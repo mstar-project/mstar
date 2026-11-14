@@ -2,7 +2,9 @@
 
 ``block`` values along K share one scale; the scales sit in the GEMM's 32x4x4 swizzled layout
 (``utils.fp8_block``). Weights are quantized once at load by the host-side quantizer (``quantize``),
-activations per call by a Triton kernel (``utils.quant_fp8``), and the product is ``torch._scaled_mm``.
+activations per call by a Triton kernel (``utils.quant_fp8``), and the product is ``torch._scaled_mm``, which adds
+the bias in its epilogue (cuBLASLt takes a bf16 bias with block scales; a separate add is one more pass over the output,
+which on a Wan2.2-TI2V-5B projection at 720p, 18,480 x 3,072 x 3,072, took the GEMM from 0.11 to 0.23 ms eager).
 Each format is one op, ``mstar::mxfp8_linear`` / ``mstar::nvfp4_linear``, with a fake implementation,
 so a compiled forward holds one node per linear. Off a GPU with the GEMM (``Platform.has_block_scaled_gemm``)
 the op runs its reference, the product of what the operands stand for in fp32; a deployment never does
@@ -86,8 +88,9 @@ class BlockScaledFormat(LinearFormat):
         rows, stored = q.data.shape
         return unswizzle_block_scales(q.scale, rows, stored * self.packing // self.block).float()
 
-    def reference_linear(self, x: BlockQuant, weight: BlockQuant) -> torch.Tensor:
-        return (self.dequantize(x) @ self.dequantize(weight).t()).to(torch.bfloat16)
+    def reference_linear(self, x: BlockQuant, weight: BlockQuant, bias: torch.Tensor | None = None) -> torch.Tensor:
+        out = self.dequantize(x) @ self.dequantize(weight).t()
+        return (out if bias is None else out + bias.float()).to(torch.bfloat16)
 
 
 class Mxfp8Format(BlockScaledFormat):
@@ -95,6 +98,7 @@ class Mxfp8Format(BlockScaledFormat):
 
     name = "mxfp8"
     buffers = ("weight", "weight_scale")
+    takes_bias = True
     data_dtype, scale_dtype, block, packing, data_max = FP8_DTYPE, E8M0_DTYPE, 32, 1, 448.0
 
     def quantize(self, x, tensor_scale=None) -> BlockQuant:
@@ -116,8 +120,8 @@ class Mxfp8Format(BlockScaledFormat):
         q = self.quantize(weight)
         return {"weight": q.data, "weight_scale": q.scale}
 
-    def linear(self, x, weight, weight_scale):
-        return torch.ops.mstar.mxfp8_linear(x, weight, weight_scale)
+    def linear(self, x, weight, weight_scale, bias=None):
+        return torch.ops.mstar.mxfp8_linear(x, weight, weight_scale, bias)
 
 
 _FP4_TABLE = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
@@ -129,6 +133,7 @@ class Nvfp4Format(BlockScaledFormat):
 
     name = "nvfp4"
     buffers = ("weight", "weight_scale", "weight_tensor_scale", "input_scale")
+    takes_bias = True
     data_dtype, scale_dtype, block, packing, data_max = FP4_DTYPE, FP8_DTYPE, 16, 2, 6.0
     # a 16-block's largest magnitude a unit tensor scale holds: e4m3's top code times e2m1's top
     UNIT_RANGE = 6.0 * 448.0
@@ -183,8 +188,8 @@ class Nvfp4Format(BlockScaledFormat):
         scale = torch.full((1,), self.input_scale(input_amax), dtype=torch.float32, device=weight.device)
         return {"weight": q.data, "weight_scale": q.scale, "weight_tensor_scale": q.tensor_scale, "input_scale": scale}
 
-    def linear(self, x, weight, weight_scale, weight_tensor_scale, input_scale):
-        return torch.ops.mstar.nvfp4_linear(x, weight, weight_scale, weight_tensor_scale, input_scale)
+    def linear(self, x, weight, weight_scale, weight_tensor_scale, input_scale, bias=None):
+        return torch.ops.mstar.nvfp4_linear(x, weight, weight_scale, weight_tensor_scale, input_scale, bias)
 
 
 MXFP8 = register_format(Mxfp8Format())
@@ -197,43 +202,48 @@ def _out(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
 
 # The ops' default implementation is the reference (CPU tensors, tests); CUDA tensors take the kernels.
 @torch.library.custom_op("mstar::mxfp8_linear", mutates_args=())
-def mxfp8_linear(x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor) -> torch.Tensor:
-    """``x [M, K]`` bf16 times an MXFP8 weight ``[N, K]``: ``[M, N]`` bf16."""
-    return MXFP8.reference_linear(MXFP8.quantize(x), BlockQuant(weight, weight_scale))
+def mxfp8_linear(
+    x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor, bias: torch.Tensor | None,
+) -> torch.Tensor:
+    """``x [M, K]`` bf16 times an MXFP8 weight ``[N, K]``, plus ``bias``: ``[M, N]`` bf16."""
+    return MXFP8.reference_linear(MXFP8.quantize(x), BlockQuant(weight, weight_scale), bias)
 
 
 @mxfp8_linear.register_fake
-def _(x, weight, weight_scale):
+def _(x, weight, weight_scale, bias):
     return _out(x, weight)
 
 
 @mxfp8_linear.register_kernel("cuda")
-def _(x, weight, weight_scale):
+def _(x, weight, weight_scale, bias):
     from mstar.utils.quant_fp8 import quant_mxfp8
 
     q = quant_mxfp8(x)
     # ``weight`` is row-major [N, K], as nn.Linear keeps it: its transpose is the col-major [K, N] the GEMM reads
-    return torch._scaled_mm(q.data, weight.t(), scale_a=q.scale, scale_b=weight_scale, out_dtype=torch.bfloat16)
+    return torch._scaled_mm(
+        q.data, weight.t(), scale_a=q.scale, scale_b=weight_scale, bias=bias, out_dtype=torch.bfloat16,
+    )
 
 
 @torch.library.custom_op("mstar::nvfp4_linear", mutates_args=())
 def nvfp4_linear(
     x: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor, weight_tensor_scale: torch.Tensor,
-    input_scale: torch.Tensor,
+    input_scale: torch.Tensor, bias: torch.Tensor | None,
 ) -> torch.Tensor:
-    """``x [M, K]`` bf16 times an NVFP4 weight ``[N, K // 2]``, ``x`` quantized in units of ``input_scale``."""
+    """``x [M, K]`` bf16 times an NVFP4 weight ``[N, K // 2]``, ``x`` quantized in units of ``input_scale``, plus
+    ``bias``."""
     return NVFP4.reference_linear(
-        NVFP4.quantize(x, input_scale), BlockQuant(weight, weight_scale, weight_tensor_scale),
+        NVFP4.quantize(x, input_scale), BlockQuant(weight, weight_scale, weight_tensor_scale), bias,
     )
 
 
 @nvfp4_linear.register_fake
-def _(x, weight, weight_scale, weight_tensor_scale, input_scale):
+def _(x, weight, weight_scale, weight_tensor_scale, input_scale, bias):
     return _out(x, weight)
 
 
 @nvfp4_linear.register_kernel("cuda")
-def _(x, weight, weight_scale, weight_tensor_scale, input_scale):
+def _(x, weight, weight_scale, weight_tensor_scale, input_scale, bias):
     from mstar.utils.quant_fp8 import quant_nvfp4
 
     q = quant_nvfp4(x, input_scale)
@@ -242,5 +252,5 @@ def _(x, weight, weight_scale, weight_tensor_scale, input_scale):
     swizzle = [ops.SwizzleType.SWIZZLE_32_4_4.value, ops.SwizzleType.NO_SWIZZLE.value]
     return torch._scaled_mm_v2(
         q.data, weight.t(), [q.scale, q.tensor_scale], recipe, swizzle,
-        [weight_scale, weight_tensor_scale], recipe, swizzle, None, torch.bfloat16,
+        [weight_scale, weight_tensor_scale], recipe, swizzle, bias, torch.bfloat16,
     )

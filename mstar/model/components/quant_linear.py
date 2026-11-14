@@ -54,6 +54,8 @@ class LinearFormat:
     name: ClassVar[str]
     # the QuantLinear buffers ``linear`` takes after the activation, in order
     buffers: ClassVar[tuple[str, ...]]
+    # ``linear`` takes the bias after the buffers (None for none) and adds it in the GEMM's epilogue
+    takes_bias: ClassVar[bool] = False
 
     def unavailable_reason(self, device: torch.device) -> str | None:
         """None when this process runs the format's GEMM on ``device``; otherwise why not."""
@@ -179,9 +181,13 @@ class QuantLinear(nn.Module, LoraCapable):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # the kernels index rows as ``row * K``
         rows = x.reshape(-1, self.in_features).contiguous()
-        out = self.fmt.linear(rows, *(getattr(self, name) for name in self.fmt.buffers))
-        if self.bias is not None:
-            out = out + self.bias
+        buffers = [getattr(self, name) for name in self.fmt.buffers]
+        if self.fmt.takes_bias:
+            out = self.fmt.linear(rows, *buffers, self.bias)
+        else:
+            out = self.fmt.linear(rows, *buffers)
+            if self.bias is not None:
+                out = out + self.bias
         return out.reshape(*x.shape[:-1], self.out_features)
 
     def lora_target(self) -> LoraTarget:

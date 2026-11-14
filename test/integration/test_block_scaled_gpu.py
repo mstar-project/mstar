@@ -57,18 +57,24 @@ def test_nvfp4_quant_matches_the_host_reference_within_fp32_ties(rows, k, tensor
     torch.testing.assert_close(NVFP4.dequantize(q), NVFP4.dequantize(ref), rtol=0.5, atol=2 ** -8 * tensor_scale)
 
 
+@pytest.mark.parametrize("bias", [False, True], ids=["no_bias", "bias"])
 @pytest.mark.parametrize("name", ["mxfp8", "nvfp4"])
 @pytest.mark.parametrize(("m", "n", "k"), [(4096, 9216, 3072), (512, 3072, 9216), (70, 3072, 3072)])
-def test_op_against_fp32(monkeypatch, name, m, n, k):
+def test_op_against_fp32(monkeypatch, name, m, n, k, bias):
     fmt = linear_format(name)
     x, w = _matrix(m, k, seed=1), _matrix(n, k, seed=2, std=0.03)
+    b = _matrix(1, n, seed=3)[0] if bias else None
     weights = fmt.quantize_weight(w, input_amax=None)
-    out = fmt.linear(x, *(weights[buffer] for buffer in fmt.buffers))
+    out = fmt.linear(x, *(weights[buffer] for buffer in fmt.buffers), b)
     assert out.dtype == torch.bfloat16 and out.shape == (m, n)
     monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
-    ref = x.float() @ w.float().t()
+    ref = x.float() @ w.float().t() + (0 if b is None else b.float())
     rel = ((out.float() - ref).norm() / ref.norm()).item()
     assert 0 < rel < LIMITS[name]
+    if b is not None:
+        # the epilogue's sum, rounded once: within one bf16 rounding of the product plus the bias
+        plain = fmt.linear(x, *(weights[buffer] for buffer in fmt.buffers))
+        torch.testing.assert_close(out, plain + b, rtol=2 ** -7, atol=2 ** -6)
 
 
 def test_nvfp4_keeps_an_input_past_the_unit_range_with_its_declared_amax(monkeypatch):

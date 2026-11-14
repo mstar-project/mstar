@@ -41,7 +41,13 @@ from mstar.model.z_image.config import ZImageTransformerConfig
 from mstar.model.z_image.z_image_model import ZImageModel
 from mstar.platforms.interface import CudaPlatform, Platform, RocmPlatform
 from mstar.utils import quant_fp8
-from mstar.utils.fp8_block import FP8_DTYPE, swizzle_block_scales, swizzled_scale_elements, unswizzle_block_scales
+from mstar.utils.fp8_block import (
+    FP8_DTYPE,
+    BlockQuant,
+    swizzle_block_scales,
+    swizzled_scale_elements,
+    unswizzle_block_scales,
+)
 
 # ---------------------------------------------------------------- the scale layout and the formats' numerics
 
@@ -155,14 +161,17 @@ def test_guards_accept_klein_and_z_image_widths():
             fmt.check(3072, k, torch.bfloat16)
 
 
+@pytest.mark.parametrize("bias", [False, True], ids=["no_bias", "bias"])
 @pytest.mark.parametrize("fmt", [MXFP8, NVFP4], ids=["mxfp8", "nvfp4"])
-def test_the_ops_fakes_agree_with_the_reference(fmt):
+def test_the_ops_fakes_agree_with_the_reference(fmt, bias):
     weights = fmt.quantize_weight(_activation(48, 256, seed=3), input_amax=None)
     x = _activation(70, 256, seed=4)
+    b = _activation(1, 48, seed=5)[0] if bias else None
     op = torch.ops.mstar.mxfp8_linear if fmt is MXFP8 else torch.ops.mstar.nvfp4_linear
     # the schema test compares outputs with allclose, which has no fp8 kernel on CPU
     result = torch.library.opcheck(
-        op, (x, *(weights[name] for name in fmt.buffers)), test_utils=("test_faketensor", "test_aot_dispatch_static"),
+        op, (x, *(weights[name] for name in fmt.buffers), b),
+        test_utils=("test_faketensor", "test_aot_dispatch_static"),
     )
     assert set(result.values()) == {"SUCCESS"}
 
@@ -227,6 +236,27 @@ def test_quant_linear_reads_a_strided_input_as_its_values(fmt):
     assert torch.equal(out, quantized(x.contiguous()))
     ref = linear(x).float()
     assert (out.float() - ref).norm() / ref.norm() < (0.05 if fmt is MXFP8 else 0.25)
+
+
+@pytest.mark.parametrize("fmt", [MXFP8, NVFP4], ids=["mxfp8", "nvfp4"])
+def test_quant_linear_hands_its_bias_to_the_op_for_one_rounding(fmt):
+    """The block-scaled ops add the bias in the GEMM's epilogue: the product plus bias in fp32, rounded to bf16
+    once, not the bf16 product plus the bias rounded again."""
+    torch.manual_seed(0)
+    linear = nn.Linear(256, 128, bias=True, dtype=torch.bfloat16)
+    nn.init.normal_(linear.bias, std=4.0)
+    quantized = QuantLinear.from_linear(linear, fmt)
+    assert fmt.takes_bias
+    x = torch.randn(3, 70, 256, dtype=torch.bfloat16)
+    weight = BlockQuant(*(getattr(quantized, name) for name in ("weight", "weight_scale")),
+                        getattr(quantized, "weight_tensor_scale", None))
+    rows = x.reshape(-1, 256)
+    activation = fmt.quantize(rows) if fmt is MXFP8 else fmt.quantize(rows, quantized.input_scale)
+    once = fmt.reference_linear(activation, weight, linear.bias).reshape(3, 70, 128)
+    assert torch.equal(quantized(x), once)
+    twice = fmt.reference_linear(activation, weight).reshape(3, 70, 128) + linear.bias
+    assert not torch.equal(once, twice)
+    torch.testing.assert_close(once, twice, rtol=2 ** -7, atol=2 ** -6)
 
 
 def test_quant_linear_is_lora_capable_with_the_replaced_linears_target():
