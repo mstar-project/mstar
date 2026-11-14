@@ -10,7 +10,8 @@ from mstar.engine.resources.csa.config import Fp4Rows
 # YAML tunes them under ``resources:``.
 KV_CACHE = "kv_cache"    # paged latents of the compressed sources, a cache per pooling ratio (kv_cache_key)
 CSA = "csa"              # compressed sparse attention over those caches and each layer's window
-STATE = "state"          # recurrent pool: each layer's window, the compressors' open groups, the n-gram tail
+STATE = "state"          # recurrent pool: each layer's window, the compressors' open groups, the n-gram tail,
+                         # and with the draft head each draft block's window of projected main rows
 SAMPLER = "sampler"
 ENGRAM = "engram"        # the Engram tables in host memory, declared only when engram_tables is "host"
 LABEL = "main"
@@ -42,6 +43,8 @@ _TEXT_KEYS = (
     "candidate_block_size", "hc_mult", "hc_sinkhorn_iters", "hc_eps", "engram_max_ngram_size",
     "engram_vocab_size", "engram_n_heads", "engram_head_dim", "engram_pad_token_id",
     "engram_compressed_vocab_size", "num_nextn_predict_layers",
+    "dspark_block_size", "dspark_noise_token_id", "dspark_markov_rank", "dspark_n_routed_experts",
+    "dspark_num_experts_per_tok",
 )
 
 
@@ -113,8 +116,19 @@ class DeepseekV41Config:
     engram_pad_token_id: int = 2
     engram_compressed_vocab_size: int = 99092
 
-    # --- not served yet: the DSpark draft layers and the vision tower stay unloaded ---
+    # --- the draft head (DSpark, ``mtp.*`` in the checkpoint): window-only blocks after the
+    # backbone over a block of draft rows, loaded with ``draft_head`` ---
     num_nextn_predict_layers: int = 3
+    # the rows of a draft block: the token to continue from, then a noise token per further row
+    dspark_block_size: int = 5
+    dspark_noise_token_id: int = 128799
+    # the backbone layers whose input streams (their mean) the head reads
+    dspark_target_layer_ids: tuple[int, ...] = (37, 38, 39)
+    # the Markov head: a low-rank correction of each row's logits from the token before it
+    dspark_markov_rank: int = 256
+    # the draft blocks' routed experts
+    dspark_n_routed_experts: int = 128
+    dspark_num_experts_per_tok: int = 3
 
     # --- tokens ---
     bos_token_id: int = 0
@@ -144,6 +158,10 @@ class DeepseekV41Config:
     # sum their lookups; "host" maps the checkpoint's bytes once for every rank (ENGRAM), and a
     # step fetches its rows through the host
     engram_tables: str = "device"
+    # load the draft head and run it after each step: a block of drafts for every request,
+    # from its last token and the backbone's hidden states (no speculative path is served yet,
+    # so nothing reads the drafts). Off, its tensors stay in the checkpoint.
+    draft_head: bool = False
 
     def __post_init__(self):
         self.compress_ratios = tuple(self.compress_ratios)
@@ -151,6 +169,7 @@ class DeepseekV41Config:
         self.index_source_layer_ids = tuple(self.index_source_layer_ids)
         self.engram_layer_ids = tuple(self.engram_layer_ids)
         self.engram_num_embeddings = tuple(self.engram_num_embeddings)
+        self.dspark_target_layer_ids = tuple(self.dspark_target_layer_ids)
         self.eos_token_ids = tuple(self.eos_token_ids)
         self._validate()
 
@@ -204,6 +223,27 @@ class DeepseekV41Config:
             self.capture_contexts = contexts
         if self.engram_tables not in ("device", "host"):
             raise ValueError(f"engram_tables must be 'device' or 'host', got {self.engram_tables!r}")
+        if not isinstance(self.draft_head, bool):
+            raise ValueError(f"draft_head must be true or false, got {self.draft_head!r}")
+        if self.draft_head:
+            self._validate_draft_head()
+
+    def _validate_draft_head(self) -> None:
+        n, stages = self.num_hidden_layers, self.num_nextn_predict_layers
+        if stages < 1 or self.dspark_block_size < 1 or self.dspark_markov_rank < 1:
+            raise ValueError("draft_head: the checkpoint's config names no draft layers "
+                             "(num_nextn_predict_layers, dspark_block_size, dspark_markov_rank)")
+        ratios = self.compress_ratios[n:n + stages]
+        if len(ratios) < stages or any(ratios):
+            raise ValueError(f"draft_head: the {stages} draft layers attend a window only, and "
+                             f"compress_ratios gives them {ratios}")
+        targets = self.dspark_target_layer_ids
+        if not targets or any(not 0 <= layer < n for layer in targets) or list(targets) != sorted(set(targets)):
+            raise ValueError(f"draft_head: dspark_target_layer_ids {targets} are not backbone layers in order")
+        if not 0 <= self.dspark_noise_token_id < self.vocab_size:
+            raise ValueError(f"draft_head: dspark_noise_token_id {self.dspark_noise_token_id} is not a token")
+        if not 0 < self.dspark_num_experts_per_tok <= self.dspark_n_routed_experts:
+            raise ValueError("draft_head: dspark_num_experts_per_tok must be within dspark_n_routed_experts")
 
     # --- the compressed sources ---
 
@@ -272,6 +312,23 @@ class DeepseekV41Config:
     def softmax_scale(self) -> float:
         return self.head_dim ** -0.5
 
+    # --- the draft head ---
+
+    @property
+    def draft_layers(self) -> tuple[int, ...]:
+        """The draft blocks' layer ids, after the backbone's: where each keeps its window in
+        ``STATE``. Empty without ``draft_head``."""
+        if not self.draft_head:
+            return ()
+        return tuple(range(self.num_hidden_layers, self.num_hidden_layers + self.num_nextn_predict_layers))
+
+    def draft_block_config(self) -> "DeepseekV41Config":
+        """The config a draft block's layers are built from: the backbone's, with the draft
+        blocks' own expert counts."""
+        return dataclasses.replace(
+            self, n_routed_experts=self.dspark_n_routed_experts,
+            num_experts_per_tok=self.dspark_num_experts_per_tok)
+
     @property
     def engram_hash_cols(self) -> int:
         return (self.engram_max_ngram_size - 1) * self.engram_n_heads
@@ -319,6 +376,7 @@ class DeepseekV41Config:
             rope_original_max_position_embeddings=int(rope["original_max_position_embeddings"]),
             engram_layer_ids=tuple(text["engram_layer_ids"]),
             engram_num_embeddings=tuple(text["engram_num_embeddings"]),
+            dspark_target_layer_ids=tuple(text.get("dspark_target_layer_ids", ())),
             bos_token_id=hf_config.get("bos_token_id", 0),
             eos_token_ids=tuple(eos) if isinstance(eos, list) else (eos,),
             pad_token_id=hf_config.get("pad_token_id", 2),
@@ -329,12 +387,13 @@ class DeepseekV41Config:
     def reduced(cls, **overrides) -> "DeepseekV41Config":
         """Tiny-dim variant for CPU tests: every mechanism of the checkpoint at small sizes,
         random weights. Two pooled sources, a ratio-1 source that is also the candidate
-        source, an indexer that picks inside its candidates, and one Engram layer."""
+        source, an indexer that picks inside its candidates, one Engram layer, and three
+        draft layers that read the last three backbone layers."""
         base = dict(
             vocab_size=512, hidden_size=64, num_hidden_layers=7, num_attention_heads=4,
             head_dim=32, qk_rope_head_dim=8, q_lora_rank=32, o_lora_rank=16, o_groups=2,
             sliding_window=8,
-            compress_ratios=(0, 2, 2, 2, 1, 1, 1, 0),
+            compress_ratios=(0, 2, 2, 2, 1, 1, 1, 0, 0, 0),
             kv_source_layer_ids=(1, 3, 4), index_source_layer_ids=(1, 3, 4, 6),
             # 16 index heads: with few, many scores rectify to exactly 0 and ties pick the top-k
             index_n_heads=16, index_head_dim=32, index_topk=8,
@@ -343,7 +402,9 @@ class DeepseekV41Config:
             moe_intermediate_size=32, n_routed_experts=8, num_experts_per_tok=2,
             engram_layer_ids=(1,), engram_num_embeddings=(0,), engram_max_ngram_size=3,
             engram_vocab_size=50, engram_n_heads=2, engram_head_dim=32,
-            engram_compressed_vocab_size=512, num_nextn_predict_layers=1,
+            engram_compressed_vocab_size=512, num_nextn_predict_layers=3,
+            dspark_block_size=5, dspark_noise_token_id=500, dspark_target_layer_ids=(4, 5, 6),
+            dspark_markov_rank=16, dspark_n_routed_experts=4, dspark_num_experts_per_tok=2,
             max_position_embeddings=512, max_seq_len=256,
         )
         base.update(overrides)

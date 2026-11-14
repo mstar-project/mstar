@@ -1,4 +1,5 @@
-"""The assembled DeepSeek-V4.1 text backbone: hyper-connected blocks, Engram, the LM head."""
+"""The assembled DeepSeek-V4.1 text backbone: hyper-connected blocks, Engram, the LM head,
+and with ``draft_head`` the draft layers after them."""
 from __future__ import annotations
 
 import torch
@@ -58,28 +59,39 @@ def update(streams: torch.Tensor, out: torch.Tensor, post: torch.Tensor, comb: t
     return (post.unsqueeze(-1) * out.unsqueeze(-2) + mixed).to(out.dtype)
 
 
+def vocab_logits(hidden: torch.Tensor, weight: torch.Tensor, comm_group: CommGroup) -> torch.Tensor:
+    """fp32 logits over the vocabulary, summed in fp32 from a head's stored ``weight``: this
+    rank's shard of it, the ranks' logits gathered."""
+    local = F.linear(hidden.float(), weight.float())
+    if comm_group.world_size > 1:
+        local = comm_group.all_gather(local, dim=-1)
+    return local
+
+
 class DeepseekV41Block(nn.Module):
     """Attention and MoE between hyper-connection sites. A site's collapse weights are used
     one sublayer later: the attention collapses with the weights the block before it made at
     its MoE site, the MoE with the ones this block's attention site made."""
 
+    attention_cls = DeepseekV41Attention
+
     def __init__(self, config: DeepseekV41Config, layer: int, comm_group: CommGroup | None = None,
                  moe_parallel=None) -> None:
         super().__init__()
         self.engram = Engram(config, layer, comm_group) if layer in config.engram_layer_ids else None
-        self.attn = DeepseekV41Attention(config, layer, comm_group)
+        self.attn = self.attention_cls(config, layer, comm_group)
         self.ffn = DeepseekV41MoE(config, comm_group, moe_parallel)
         self.attn_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.ffn_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.hc_attn = HyperConnection(config)
         self.hc_ffn = HyperConnection(config)
 
-    def forward(self, streams: torch.Tensor, pre: torch.Tensor, rope: Rope,
-                shared: SharedSelection) -> tuple[torch.Tensor, torch.Tensor]:
-        """``streams (T, hc, hidden)`` and the collapse weights for this block's attention;
-        returns the streams and the weights for the next block's."""
+    def forward(self, streams: torch.Tensor, pre: torch.Tensor, *attn_args) -> tuple[torch.Tensor, torch.Tensor]:
+        """``streams (T, hc, hidden)`` and the collapse weights for this block's attention,
+        then what its attention takes beside its input; returns the streams and the weights
+        for the next block's."""
         attn_pre, post, comb = self.hc_attn.weights(streams)
-        out = self.attn(self.attn_norm(collapse(streams, pre)), rope, shared)
+        out = self.attn(self.attn_norm(collapse(streams, pre)), *attn_args)
         streams = update(streams, out, post, comb)
         ffn_pre, post, comb = self.hc_ffn.weights(streams)
         out = self.ffn(self.ffn_norm(collapse(streams, attn_pre)))
@@ -97,6 +109,13 @@ class DeepseekV41LanguageModel(nn.Module):
             DeepseekV41Block(config, layer, comm_group, moe_parallel) for layer in range(config.num_hidden_layers))
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rope = Rope(config)
+        # the layers whose input the draft head reads
+        self.tap_layers: tuple[int, ...] = ()
+        if config.draft_head:
+            from mstar.model.deepseek_v41.components.draft import DraftHead
+
+            self.tap_layers = config.dspark_target_layer_ids
+            self.mtp = DraftHead(config, comm_group, moe_parallel)
         self.hasher = None
         if config.engram_layer_ids:
             if token_map is None:
@@ -108,8 +127,11 @@ class DeepseekV41LanguageModel(nn.Module):
     def bind_resources(self, resources: dict) -> None:
         self._host_tables = resources.get(ENGRAM)
 
-    def forward(self, input_ids: torch.Tensor, rows: torch.Tensor | None = None) -> torch.Tensor:
-        """``input_ids (T,)`` flat batch -> the final hidden ``(T, hidden)``, or only ``rows``."""
+    def forward(self, input_ids: torch.Tensor, rows: torch.Tensor | None = None,
+                taps: list[torch.Tensor] | None = None) -> torch.Tensor:
+        """``input_ids (T,)`` flat batch -> the final hidden ``(T, hidden)``, or only ``rows``.
+        ``taps`` takes what the draft head reads: per target layer, the mean ``(T, hidden)``
+        of the streams entering it."""
         hashes = self.hasher(input_ids) if self.hasher is not None else None
         if self._host_tables is not None:
             # every Engram layer's rows in one trip to the host, before the first layer is queued
@@ -122,9 +144,11 @@ class DeepseekV41LanguageModel(nn.Module):
         pre = torch.zeros(hidden.shape[0], self.hc_mult, dtype=torch.float32, device=hidden.device)
         pre[:, 0] = 1.0
         shared = SharedSelection()
-        for layer in self.layers:
+        for index, layer in enumerate(self.layers):
             if layer.engram is not None:
                 streams = layer.engram(streams, hashes[:, layer.engram.index])
+            if taps is not None and index in self.tap_layers:
+                taps.append(streams.mean(dim=1))
             streams, pre = layer(streams, pre, self.rope, shared)
         hidden = collapse(streams, pre)
         if rows is not None:
@@ -143,14 +167,16 @@ class DeepseekV41ForCausalLM(nn.Module):
             self.comm_group, input_size=config.hidden_size, output_size=config.vocab_size, bias=False)
 
     def logits(self, hidden: torch.Tensor) -> torch.Tensor:
-        """fp32 logits, summed in fp32 from the head's stored weight."""
-        local = F.linear(hidden.float(), self.lm_head.weight.float())
-        if self.comm_group.world_size > 1:
-            local = self.comm_group.all_gather(local, dim=-1)
-        return local
+        return vocab_logits(hidden, self.lm_head.weight, self.comm_group)
 
-    def forward(self, input_ids: torch.Tensor, rows: torch.Tensor | None = None) -> torch.Tensor:
-        return self.logits(self.model(input_ids, rows))
+    def forward(self, input_ids: torch.Tensor, rows: torch.Tensor | None = None,
+                taps: list[torch.Tensor] | None = None) -> torch.Tensor:
+        return self.logits(self.model(input_ids, rows, taps))
+
+    def draft(self, tokens: torch.Tensor, taps: list[torch.Tensor]):
+        """The draft head's block for each request (``Draft``), continuing from ``tokens``
+        (requests,), after a ``forward`` of the step that filled ``taps``."""
+        return self.model.mtp(tokens, torch.cat(taps, dim=-1), self.model.embed, self.logits, self.model.rope)
 
     def load_weights(self, weights, sliced: bool = False, **kwargs) -> set[str]:
         from mstar.model.deepseek_v41.weight_loader import load_deepseek_v41_weights

@@ -61,8 +61,8 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
      - *(Beta)* DeepSeek-V4.1-Flash (763B stored, 384 experts top-6): sliding-window plus
        compressed sparse attention over hyper-connected MoE blocks with Engram lookups, text in /
        text out, fp8 linears and fp4 experts. The reference numerics in torch, decode steps
-       captured where the expert kernel runs; the vision tower and the DSpark draft layers are
-       not loaded. See `DeepSeek-V4.1-Flash`_.
+       captured where the expert kernel runs; the vision tower is not loaded, nor the DSpark
+       draft layers unless ``draft_head`` asks. See `DeepSeek-V4.1-Flash`_.
    * - ``glm5_next``
      - ``zai-org/GLM-5.3-Flash``
      - GLM-5.3-Flash (320B/18B): hybrid KDA linear-attention + MLA MoE causal
@@ -1008,7 +1008,7 @@ anchor that kernels are held to, not a fast path; the routed experts are the fir
 kernel (``moe_kernel`` below). Where that kernel runs, a decode step (one row a request)
 replays a captured graph, one per context of ``capture_contexts`` and per power-of-two batch
 up to ``max_requests``; a prompt's step runs eager, and so does every step with
-``moe_kernel: torch`` or ``engram_tables: host``.
+``moe_kernel: torch``, ``engram_tables: host`` or ``draft_head``.
 
 Each layer attends its last 128 tokens, and layers 2 to 39 also the 512 rows an indexer picks
 from a compressed cache (three caches pool two tokens per row, one keeps every token). The
@@ -1045,6 +1045,17 @@ that 203 GB of memory free for it), and each step copies its hash ids to the hos
 its rows there and copies them back, which makes the step wait for the one before it. The
 logits are the same; what it costs in tokens per second has not been measured on GPUs, so
 it is off by default.
+
+``draft_head: true`` also loads the checkpoint's draft head (DSpark, the ``mtp.0`` to ``mtp.2``
+tensors: 7.9 GB as stored, 1.3 GB per GPU at TP8 with ``moe_experts: fp4``). Three window-only
+blocks with their own 128 experts (top 3) draft a block of 5 tokens for each request after
+every step, from the token the step sampled and the backbone's hidden states entering layers
+37 to 39; a low-rank Markov head corrects each row's logits from the token drafted before it,
+and a confidence head scores each row. Each draft block keeps a window of those hidden states
+per request in ``state`` (0.4 MB more a request). The head is held to the checkpoint's
+reference (``forward_spec``), but no speculative path is served yet: nothing reads the
+drafts, so the knob is for parity and measurement, at the cost of a draft pass per step. Off
+(the default), its tensors stay in the checkpoint and nothing is allocated.
 
 Chat renders each message in its role through the checkpoint's chat template (``developer``
 as ``system``; tool results fold into the next user turn, as the checkpoint's encoder writes

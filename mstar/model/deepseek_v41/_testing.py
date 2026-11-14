@@ -172,7 +172,7 @@ def to_hf_config(config: DeepseekV41Config) -> dict:
     """``config`` as the checkpoint's config.json spells it (``from_hf_config``'s inverse)."""
     text = {f.name: getattr(config, f.name) for f in dataclasses.fields(config)}
     for knob in ("max_seq_len", "max_output_tokens", "moe_experts", "moe_kernel", "engram_tables",
-                 "capture_contexts", "fp8_block", "bos_token_id", "eos_token_ids", "pad_token_id"):
+                 "capture_contexts", "draft_head", "fp8_block", "bos_token_id", "eos_token_ids", "pad_token_id"):
         text.pop(knob)
     text["rope_scaling"] = {
         "rope_type": "yarn", "factor": text.pop("rope_factor"), "beta_fast": text.pop("rope_beta_fast"),
@@ -207,8 +207,9 @@ def _fp4_pair(w: torch.Tensor, block: int) -> dict[str, torch.Tensor]:
     return {"weight": pack_e2m1(q).view(torch.int8), "scale": scale.to(E8M0)}
 
 
-def random_checkpoint(config: DeepseekV41Config, seed: int = 0) -> dict[str, torch.Tensor]:
-    """Random weights under the checkpoint's own names, dtypes and packing (text backbone)."""
+def random_checkpoint(config: DeepseekV41Config, seed: int = 0, draft_head: bool = False) -> dict[str, torch.Tensor]:
+    """Random weights under the checkpoint's own names, dtypes and packing: the text backbone,
+    and with ``draft_head`` the draft layers (``mtp.*``) after it."""
     g = torch.Generator().manual_seed(seed)
     c, bf16, b = config, torch.bfloat16, config.fp8_block
     hidden, width, inter, hc = c.hidden_size, c.head_dim, c.moe_intermediate_size, c.hc_mult
@@ -236,8 +237,14 @@ def random_checkpoint(config: DeepseekV41Config, seed: int = 0) -> dict[str, tor
     out["head.weight"] = linear(c.vocab_size, hidden, 4.0).to(bf16)
     out["norm.weight"] = norm(hidden)
     mix = (2 + hc) * hc
-    for i in range(c.num_hidden_layers):
-        p, heads = f"layers.{i}", c.num_attention_heads
+    # the backbone's layers, then the draft layers: drawn after it, so the backbone's weights
+    # are the same with and without them
+    blocks = [(f"layers.{i}", i, c.n_routed_experts) for i in range(c.num_hidden_layers)]
+    if draft_head:
+        blocks += [(f"mtp.{stage}", c.num_hidden_layers + stage, c.dspark_n_routed_experts)
+                   for stage in range(c.num_nextn_predict_layers)]
+    for p, i, experts in blocks:
+        heads = c.num_attention_heads
         for site in ("attn", "ffn"):
             out[f"{p}.hc_{site}_fn"] = randn(mix, hc * hidden, std=0.5 * (hc * hidden) ** -0.5)
             out[f"{p}.hc_{site}_base"] = randn(mix, std=0.5)
@@ -262,9 +269,9 @@ def random_checkpoint(config: DeepseekV41Config, seed: int = 0) -> dict[str, tor
             fp8(f"{a}.indexer.wq_b", linear(c.index_n_heads * c.index_head_dim, c.q_lora_rank))
             out[f"{a}.indexer.weights_proj.weight"] = linear(c.index_n_heads, hidden).to(bf16)
         f = f"{p}.ffn"
-        out[f"{f}.gate.weight"] = linear(c.n_routed_experts, hidden, 2.0).to(bf16)
-        out[f"{f}.gate.bias"] = randn(c.n_routed_experts, std=0.1)
-        for e in [*range(c.n_routed_experts), None]:
+        out[f"{f}.gate.weight"] = linear(experts, hidden, 2.0).to(bf16)
+        out[f"{f}.gate.bias"] = randn(experts, std=0.1)
+        for e in [*range(experts), None]:
             quant, name = (fp4, f"{f}.experts.{e}") if e is not None else (fp8, f"{f}.shared_experts")
             quant(f"{name}.w1", linear(inter, hidden, 2.0))
             quant(f"{name}.w3", linear(inter, hidden, 2.0))
@@ -276,13 +283,22 @@ def random_checkpoint(config: DeepseekV41Config, seed: int = 0) -> dict[str, tor
             fp8(f"{e}.wkv", linear(hidden * (hc + 1), c.engram_hash_cols * c.engram_head_dim))
             out[f"{e}.q_weight"] = (1 + randn(hc, hidden, std=0.1)).to(bf16)
             out[f"{e}.k_weight"] = (1 + randn(hc, hidden, std=0.1)).to(bf16)
+        if i == c.num_hidden_layers:  # the first draft layer projects the backbone's hidden states
+            fp8(f"{p}.main_proj", linear(hidden, hidden * len(c.dspark_target_layer_ids)))
+            out[f"{p}.main_norm.weight"] = norm(hidden)
+        if i == c.num_hidden_layers + c.num_nextn_predict_layers - 1:  # the last holds the heads
+            rank = c.dspark_markov_rank
+            out[f"{p}.norm.weight"] = norm(hidden)
+            out[f"{p}.markov_head.embed.weight"] = randn(c.vocab_size, rank).to(bf16)
+            out[f"{p}.markov_head.head.weight"] = linear(c.vocab_size, rank, 2.0).to(bf16)
+            out[f"{p}.confidence_head.proj.weight"] = linear(1, hidden + rank).to(bf16)
     return out
 
 
-def write_snapshot(path: str | Path, config: DeepseekV41Config, seed: int = 0):
+def write_snapshot(path: str | Path, config: DeepseekV41Config, seed: int = 0, draft_head: bool = False):
     """A checkpoint directory M* and the reference both load: config.json, a tokenizer, and
-    ``random_checkpoint`` as one safetensors file. Returns the config with the tokenizer's
-    compressed vocabulary size, and the tokenizer."""
+    ``random_checkpoint`` as one safetensors file (with ``draft_head``, the draft layers too).
+    Returns the config with the tokenizer's compressed vocabulary size, and the tokenizer."""
     from safetensors.torch import save_file
 
     from mstar.model.deepseek_v41.components.engram import compressed_token_map
@@ -294,15 +310,16 @@ def write_snapshot(path: str | Path, config: DeepseekV41Config, seed: int = 0):
         config, engram_compressed_vocab_size=compressed_token_map(tokenizer)[1])
     tokenizer.save_pretrained(str(path))
     (path / "config.json").write_text(json.dumps(to_hf_config(config)))
-    save_file(random_checkpoint(config, seed), str(path / "model.safetensors"))
+    save_file(random_checkpoint(config, seed, draft_head), str(path / "model.safetensors"))
     return config, tokenizer
 
 
 def reference_model(ref: types.SimpleNamespace, snapshot: str | Path, config: DeepseekV41Config,
-                    tokenizer, workdir: str | Path, max_batch_size: int = 1):
+                    tokenizer, workdir: str | Path, max_batch_size: int = 1, draft_head: bool = False):
     """The reference ``Transformer`` on ``snapshot``'s weights, loaded through its own
-    ``convert.py``. It is built in torch's current default dtype, as the reference runs
-    (bf16 as shipped). Under another default, its bf16-declared weights are widened to it."""
+    ``convert.py``, with its draft layers when the snapshot has them (``draft_head``). It is
+    built in torch's current default dtype, as the reference runs (bf16 as shipped). Under
+    another default, its bf16-declared weights are widened to it."""
     from safetensors.torch import load_model
 
     c = config
@@ -330,6 +347,12 @@ def reference_model(ref: types.SimpleNamespace, snapshot: str | Path, config: De
         engram_pad_id=c.engram_pad_token_id,
         engram_compressed_vocab_size=c.engram_compressed_vocab_size,
     )
+    if draft_head:
+        args = dataclasses.replace(
+            args, dspark_block_size=c.dspark_block_size, dspark_noise_token_id=c.dspark_noise_token_id,
+            dspark_target_layer_ids=c.dspark_target_layer_ids, dspark_markov_rank=c.dspark_markov_rank,
+            dspark_n_routed_experts=c.dspark_n_routed_experts,
+            dspark_n_activated_experts=c.dspark_num_experts_per_tok)
     threads = torch.get_num_threads()
     try:
         ref.convert.main(str(snapshot), str(workdir), 1, "fp4")  # sets torch's thread count
@@ -443,6 +466,15 @@ def build_engine(path: str | Path, dtype: torch.dtype, device: str = "cpu", tp_g
 def cpu_engine(path: str | Path, dtype: torch.dtype, **model_kwargs):
     """``build_engine`` on CPU, one rank."""
     return build_engine(path, dtype, **model_kwargs)
+
+
+def record_drafts(model) -> list:
+    """The draft head's output (``Draft``) of every step ``model``'s LLM node runs from here
+    on, in order: a model built with ``draft_head``."""
+    drafts: list = []
+    head = model.get_submodule("LLM").language_model.model.mtp
+    head.register_forward_hook(lambda module, args, out: drafts.append(out))
+    return drafts
 
 
 def gloo_tp_rank(rank: int, world_size: int, store: str):

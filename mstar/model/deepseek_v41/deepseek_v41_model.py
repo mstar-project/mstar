@@ -70,7 +70,8 @@ QUANT_METHODS = ("fp8",)
 
 class DeepseekV41Model(ByteLevelTextOutput, Model):
     """DeepSeek-V4.1-Flash: sliding-window plus compressed sparse attention, hyper-connected
-    MoE causal LM. Text only: the vision tower and the DSpark draft layers are not served."""
+    MoE causal LM. Text only: the vision tower is not served, and the draft head
+    (``draft_head``) is loaded and run but no speculative path reads its drafts yet."""
 
     DECODE_LOOP = "decode_loop"
     # read only by process_prompt's template, and kept off the conductor's wire
@@ -97,6 +98,8 @@ class DeepseekV41Model(ByteLevelTextOutput, Model):
             self.config = dataclasses.replace(self.config, engram_tables=kwargs["engram_tables"])
         if kwargs.get("capture_contexts") is not None:
             self.config = dataclasses.replace(self.config, capture_contexts=tuple(kwargs["capture_contexts"]))
+        if "draft_head" in kwargs:
+            self.config = dataclasses.replace(self.config, draft_head=kwargs["draft_head"])
         # requests that may hold state at once; the pool holds one more slot, its sink, and a
         # serve YAML sizes it under ``resources: state: {max_slots: N}``
         self.max_requests = _positive_int("max_requests", kwargs.get("max_requests", 32))
@@ -121,7 +124,8 @@ class DeepseekV41Model(ByteLevelTextOutput, Model):
     def get_node_resources(self) -> list[NodeResourceSpec]:
         cfg = self.config
         blocks = {
-            # each layer's last sliding_window latents, a ring by position
+            # each layer's last sliding_window latents, a ring by position; a draft layer's
+            # holds the backbone's projected hidden states of those positions
             WINDOW: RecurrentBlockConfig(shape=(cfg.sliding_window, cfg.head_dim), dtype=None),
             # the n-gram hashes read a request's last ids
             NGRAM: RecurrentBlockConfig(
@@ -170,7 +174,7 @@ class DeepseekV41Model(ByteLevelTextOutput, Model):
                 resource_key=STATE,
                 nodes={"LLM"},
                 config=RecurrentStateConfig(
-                    num_layers=cfg.num_hidden_layers, blocks=blocks,
+                    num_layers=cfg.num_hidden_layers + len(cfg.draft_layers), blocks=blocks,
                     max_slots=self.max_requests + 1,  # + the sink
                 ),
             ),
@@ -362,6 +366,8 @@ class DeepseekV41Model(ByteLevelTextOutput, Model):
         for knob in ("max_seq_len", "max_output_tokens", "moe_experts", "moe_kernel", "engram_tables",
                      "capture_contexts"):
             setattr(read, knob, getattr(self.config, knob))
+        # rebuilt, so the checkpoint's draft geometry is checked when the head is asked for
+        read = dataclasses.replace(read, draft_head=self.config.draft_head)
         self.config, self._config_from_checkpoint = read, True
 
     def _create_submodule(
@@ -395,6 +401,9 @@ class DeepseekV41Model(ByteLevelTextOutput, Model):
         if autocast_dtype is not None:
             language_model = _cast_floating(language_model, autocast_dtype)
         language_model.to_empty(device=device)
+        if self.config.draft_head:
+            logger.info("DeepseekV41Model: draft_head: the draft layers are loaded and run after each step; "
+                        "no speculative path is served yet, so nothing reads their drafts")
         # a rank reads its own slice of each tensor, and nothing of a table the engine maps
         # from the host or of the parts not served
         weights = iter_safetensors_shards(

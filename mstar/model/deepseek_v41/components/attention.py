@@ -162,6 +162,25 @@ class DeepseekV41Attention(nn.Module):
     def bind_resources(self, resources: dict) -> None:
         self._csa, self._state = resources[CSA], resources[STATE]
 
+    def _query(self, x: torch.Tensor, angles) -> tuple[torch.Tensor, torch.Tensor]:
+        """A row's low-rank query latent, and its heads' rotated queries."""
+        q_latent = self.q_norm(self.wq_a(x))
+        return q_latent, rotate_tail(self.wq_b(q_latent).unflatten(-1, (self.num_heads, self.head_dim)), angles)
+
+    def _latent(self, x: torch.Tensor, angles) -> torch.Tensor:
+        """A row's window latent: rotated, then rounded to FP8 as the checkpoint keeps it."""
+        return round_fp8(rotate_tail(self.kv_norm(self.wkv(x)), angles), self.block)
+
+    def _output(self, out: torch.Tensor, angles) -> torch.Tensor:
+        """The attended latents ``(rows, heads, D)`` projected back to the hidden size."""
+        # the cache holds rotated latents, so the output carries the query's rotation
+        out = rotate_tail(out, angles, inverse=True)
+        dtype = out.dtype
+        out = round_fp8(out.reshape(out.shape[0], self.num_groups, -1), self.block)
+        wo_a = self.wo_a.weight.view(self.num_groups, self.o_lora_rank, -1)
+        out = torch.einsum("sgd,grd->sgr", out.float(), wo_a.float()).to(dtype)
+        return self.wo_b(out.flatten(1))
+
     def _window(self, kv: torch.Tensor, rows) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """The rows each query's window holds, as ``(rows, idx, columns)`` for the CSA resource:
         the step's own ``kv`` and, for positions before the step, the request's ring in ``STATE``
@@ -219,10 +238,8 @@ class DeepseekV41Attention(nn.Module):
         compressed = self.ratio > 0
         angles = rope.angles(rows.pos, compressed)
 
-        q_latent = self.q_norm(self.wq_a(x))
-        q = rotate_tail(self.wq_b(q_latent).unflatten(-1, (self.num_heads, self.head_dim)), angles)
-        kv = round_fp8(rotate_tail(self.kv_norm(self.wkv(x)), angles), self.block)
-        window, window_idx, window_cols = self._window(kv, rows)
+        q_latent, q = self._query(x, angles)
+        window, window_idx, window_cols = self._window(self._latent(x, angles), rows)
 
         slots = None
         if compressed:
@@ -232,10 +249,4 @@ class DeepseekV41Attention(nn.Module):
                 latent = rotate_tail(latent, rope.angles(rows.pos + 1 - self.ratio, True))
                 self._csa.write(self.ratio, self.plane, latent=latent, label=LABEL)
         out = self._csa.attend(q, self.attn_sink, window, window_idx, window_cols, self.ratio, self.plane, slots)
-        # the cache holds rotated latents, so the output carries the query's rotation
-        out = rotate_tail(out, angles, inverse=True)
-
-        out = round_fp8(out.reshape(x.shape[0], self.num_groups, -1), self.block)
-        wo_a = self.wo_a.weight.view(self.num_groups, self.o_lora_rank, -1)
-        out = torch.einsum("sgd,grd->sgr", out.float(), wo_a.float()).to(x.dtype)
-        return self.wo_b(out.flatten(1))
+        return self._output(out, angles)

@@ -128,17 +128,21 @@ class TestCheckpointConfig:
 class TestCheckpointLayout:
     """Every checkpoint tensor has a parameter of its shape or is named as not served, and
     every parameter is filled: the full-size model on ``meta``, the tensors too. At TP8, the
-    last rank's shard of each."""
+    last rank's shard of each. With ``draft_head`` the draft layers' tensors are served too,
+    their experts in each layout the backbone's take (the checkpoint packs both alike)."""
 
-    @pytest.mark.parametrize("moe_experts, tp", [*((layout, 1) for layout in MOE_EXPERTS), ("fp4", 8)])
-    def test_full_size_model_loads_every_tensor_by_name_and_shape(self, moe_experts, tp):
-        config = dataclasses.replace(_checkpoint_config(), moe_experts=moe_experts)
+    @pytest.mark.parametrize("draft_head", [False, True], ids=["backbone", "draft-head"])
+    @pytest.mark.parametrize("moe_experts, tp", [*((layout, tp) for layout in MOE_EXPERTS for tp in (1, 8))])
+    def test_full_size_model_loads_every_tensor_by_name_and_shape(self, moe_experts, tp, draft_head):
+        config = dataclasses.replace(_checkpoint_config(), moe_experts=moe_experts, draft_head=draft_head)
         token_map = torch.arange(config.vocab_size) % config.engram_compressed_vocab_size
         with torch.device("meta"):
             lm = DeepseekV41ForCausalLM(config, token_map, comm_group=_rank(tp - 1, tp))
-        served = [(n, d, s) for n, d, s in _checkpoint_tensors() if not skipped(n)]
+        served = [(n, d, s) for n, d, s in _checkpoint_tensors() if not skipped(n, draft_head)]
+        assert any(n.startswith("mtp.") for n, _, _ in served) == draft_head
         weights = ((name, torch.empty(shape, dtype=dtype, device="meta")) for name, dtype, shape in served)
         check_loaded(lm, load_deepseek_v41_weights(lm, weights), "checkpoint layout")
+        assert any(name.startswith("model.mtp.") for name, _ in lm.named_parameters()) == draft_head
 
     @pytest.mark.parametrize("tp, parallel, tables, kept, read, largest", [
         (1, "tp", "device", 501.4, 501.4, 98.3),   # everything but the parts not served
@@ -211,6 +215,44 @@ class TestCheckpointLayout:
         kinds = {n.split(".")[0] for n in names if not n.endswith("gate.bias_vl")}
         assert kinds == {"mtp", "vision", "aligner", "image_start", "image_end", "image_newline"}
         assert sum(n.endswith("gate.bias_vl") and n.startswith("layers.") for n in names) == 40
+
+    def test_with_the_draft_head_what_is_skipped_is_vision_and_the_image_router_biases(self):
+        """Every ``mtp.*`` tensor then has a parameter, but the three draft layers' own image
+        router biases: a draft row is text, and the checkpoint's reference never reads them."""
+        tensors = list(_checkpoint_tensors())
+        names = [n for n, _, _ in tensors if skipped(n, draft_head=True)]
+        kinds = {n.split(".")[0] for n in names if not n.endswith("gate.bias_vl")}
+        assert kinds == {"vision", "aligner", "image_start", "image_end", "image_newline"}
+        biases = [n for n in names if n.endswith("gate.bias_vl")]
+        assert sorted(biases) == sorted(
+            [f"layers.{i}.ffn.gate.bias_vl" for i in range(40)] + [f"mtp.{i}.ffn.gate.bias_vl" for i in range(3)])
+        draft = [n for n, _, _ in tensors if n.startswith("mtp.")]
+        assert len(draft) == 2401 and len(draft) - 3 == sum(not skipped(n, draft_head=True) for n in draft)
+
+    @pytest.mark.parametrize("tp, parallel, kept, read", [
+        (1, "tp", 7.9, 7.9),
+        (8, "tp", 1.1, 3.3),    # a slice of each of the 128 experts a layer; the Markov head by vocabulary
+        (8, "ep", 1.1, 1.2),    # 16 whole experts a layer
+    ])
+    def test_what_a_rank_keeps_of_the_draft_layers(self, tp, parallel, kept, read):
+        """GB of the checkpoint's 7.9 GB of draft layers a rank keeps and reads, as stored."""
+        config = dataclasses.replace(_checkpoint_config(), draft_head=True)
+        token_map = torch.arange(config.vocab_size) % config.engram_compressed_vocab_size
+        with torch.device("meta"):
+            lm = DeepseekV41ForCausalLM(
+                config, token_map, comm_group=_rank(0, tp), moe_parallel=MoeParallelConfig(parallel=parallel))
+        cut = rank_slices(lm)
+        got = [0, 0]
+        for name, dtype, shape in _checkpoint_tensors():
+            if not name.startswith("mtp."):
+                continue
+            whole = part = math.prod(shape) * dtype.itemsize
+            piece = cut(name)
+            if piece is not None:
+                dim, start, stop = piece
+                part = whole * max(min(stop, shape[dim]) - start, 0) // shape[dim]
+            got = [got[0] + part, got[1] + (part if piece is None or piece.dim == 0 else whole)]
+        assert [round(nbytes / 1e9, 1) for nbytes in got] == [kept, read]
 
 
 @pytest.fixture(scope="module")
@@ -724,6 +766,10 @@ class TestCaptureBucket:
         assert declared[0].capture_batch_sizes == [1, 2, 4] and not declared[0].compile
         blocked, declared = configs(engram_tables="host")
         assert "host" in blocked and declared == []
+        engine, _, _ = cpu_engine(snapshot[0], torch.float32)
+        sub = engine._submodules["LLM"].submodule
+        monkeypatch.setattr(sub.config, "draft_head", True)
+        assert "draft head" in sub.capture_blocked() and sub.get_accelerator_graph_configs(torch.device("cpu")) == []
 
 
 @pytest.fixture(scope="module")
@@ -878,3 +924,19 @@ def test_the_tp8_config_starts_as_shipped_and_with_its_host_tables_switched_on(t
         path = tmp_path / f"{placement}.yaml"
         path.write_text(text)
         validate_deployment(model, cfg, str(path))
+
+
+def test_the_tp8_config_starts_with_its_draft_head_switched_on(tmp_path):
+    """The serving config carries the draft head as a comment: taken out of it, the model
+    declares a window for each draft layer, and the deployment still validates."""
+    shipped = (Path(__file__).resolve().parents[2] / "configs" / "deepseek_v41_flash_tp8.yaml").read_text()
+    switched_on, count = re.subn(r"(?m)^( *)# (draft_head: true)$", r"\1\2", shipped)
+    assert count == 1
+    cfg = yaml.safe_load(switched_on)
+    model = get_model_class(cfg["model"])(**{**model_init_kwargs(cfg["model"]), **cfg["model_kwargs"]})
+    assert model.config.draft_head and model.config.draft_layers == (40, 41, 42)
+    state = next(spec for spec in model.get_node_resources() if spec.resource_key == STATE)
+    assert state.config.num_layers == 43
+    path = tmp_path / "draft.yaml"
+    path.write_text(switched_on)
+    validate_deployment(model, cfg, str(path))

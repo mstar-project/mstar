@@ -6,8 +6,10 @@ The checkpoint names its tensors as its reference does (``layers.N.attn.wq_b.wei
 experts are packed E2M1 with a scale per row and 32 inputs: kept as those bytes, upcast to E4M3
 blocks without loss (refused where a block's row scales are too far apart), or dequantized, as
 ``moe_experts`` says. The Engram tables stay fp8, and with ``engram_tables: host`` stay in the
-checkpoint's files for the engine to map. Tensors of parts not served yet (the DSpark layers,
-the vision tower, the image router bias) are skipped by name; anything else unrecognized raises.
+checkpoint's files for the engine to map. The draft layers (``mtp.*``) load as the backbone's do
+under ``draft_head``. Tensors of parts not served (the vision tower, the image router biases,
+and without ``draft_head`` the draft layers) are skipped by name; anything else unrecognized
+raises.
 
 A TP rank holds a slice of most tensors (``slice_of``). ``rank_slices`` hands those slices to
 the shard reader, so a rank reads its rows of a 98 GB Engram table and not the table; fed whole
@@ -27,18 +29,22 @@ from mstar.model.loader.iterators import SliceSpec, TensorSlice
 from mstar.utils.fp8_block import E8M0_DTYPE, FP8_DTYPE
 from mstar.utils.mx_round import dequant_block_fp8, dequant_row_fp4, unpack_e2m1
 
-# not served yet: DSpark (``mtp.*``), the vision tower and aligner, the image delimiters and
-# the router bias for image tokens
-_SKIPPED = re.compile(r"^(mtp\.|vision\.|aligner\.|image_(start|end|newline)$)|\.gate\.bias_vl$")
-_EXPERT = re.compile(r"^(layers\.\d+\.ffn)\.(experts\.(\d+)|shared_experts)\.w([123])$")
+# not served yet: the vision tower and aligner, the image delimiters and the router bias for
+# image tokens (the draft layers carry one too, and draft rows are text)
+_SKIPPED = re.compile(r"^(vision\.|aligner\.|image_(start|end|newline)$)|\.gate\.bias_vl$")
+# the draft layers, loaded only with ``draft_head``
+_DRAFT = "mtp."
+_EXPERT = re.compile(r"^((?:layers|mtp)\.\d+\.ffn)\.(experts\.(\d+)|shared_experts)\.w([123])$")
 # E4M3's largest value over E2M1's: an upcast block may scale a row up by 2**6 at most
 _MAX_OFFSET_BITS = 6
 # the slice of a tensor no parameter of this rank holds
 _NOTHING = TensorSlice(0, 0, 0)
 
 
-def skipped(name: str) -> bool:
-    return _SKIPPED.search(name) is not None
+def skipped(name: str, draft_head: bool = False) -> bool:
+    """Whether checkpoint tensor ``name`` has no parameter in a model built with or without
+    its draft head."""
+    return _SKIPPED.search(name) is not None or (name.startswith(_DRAFT) and not draft_head)
 
 
 def upcast_fp4_block(packed: torch.Tensor, scale: torch.Tensor, block: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -84,7 +90,7 @@ class _Loader:
     def slice_of(self, name: str) -> TensorSlice | None:
         """The part of checkpoint tensor ``name`` this rank holds, as ``(dim, start, stop)`` in
         the tensor's own elements: None is all of it, and a tensor nothing here holds is empty."""
-        if skipped(name):
+        if skipped(name, self.config.draft_head):
             return _NOTHING
         stem, _, leaf = name.rpartition(".")
         if stem.endswith(".engram.embed"):
@@ -98,6 +104,8 @@ class _Loader:
         if name in ("embed.weight", "head.weight"):
             param = "model.embed.weight" if name == "embed.weight" else "lm_head.weight"
             return self._mine(0, self.params[param].shape[0])
+        if stem.endswith((".markov_head.embed", ".markov_head.head")):  # sharded by vocabulary too
+            return self._mine(0, self.params["model." + name].shape[0])
         if name.endswith(".attn.attn_sink"):
             return self._mine(0, self.params["model." + name].shape[0])
         module = self.modules.get("model." + stem)
@@ -147,7 +155,7 @@ class _Loader:
         return self.pending.pop(stem) if len(got) == 2 else None
 
     def add(self, name: str, tensor: torch.Tensor) -> None:
-        if skipped(name):
+        if skipped(name, self.config.draft_head):
             return
         if not self.sliced:
             cut = self.slice_of(name)

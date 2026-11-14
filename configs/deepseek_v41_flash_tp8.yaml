@@ -27,6 +27,9 @@ model_kwargs:
   # through the host. Same values; its cost per step is not measured on GPUs yet. The host
   # then needs 203 GB of page cache for them.
   # engram_tables: host
+  # The checkpoint's draft head (mtp.0-2, 1.3 GB a rank): a block of 5 draft tokens for each
+  # request after every step. Nothing reads the drafts yet (no speculative path is served).
+  # draft_head: true
 resources:
   # A cache per pooling ratio, a row per pooled group, each a latent of 512 and an index key
   # of 128 per source in their FP4 bytes (288 + 68): 890 bytes/token and 0.47 GB/rank together.

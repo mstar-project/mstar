@@ -36,7 +36,8 @@ logger = logging.getLogger(__name__)
 
 
 class DeepseekV41LLMSubmodule(ARNodeSubmodule):
-    """Embed, the hyper-connected blocks and the LM head, one TP node."""
+    """Embed, the hyper-connected blocks and the LM head, one TP node; with ``draft_head`` the
+    draft layers too, which draft a block for each request after every step."""
 
     # the reference numerics run in fp32 on purpose in many places, which the engine's bf16
     # autocast and a compile of the eager forward would both undo
@@ -60,6 +61,8 @@ class DeepseekV41LLMSubmodule(ARNodeSubmodule):
         from its bucket and nothing in it reads the host."""
         if self.config.engram_on_host:
             return "the Engram tables are in host memory, and a step fetches its rows through the host"
+        if self.config.draft_head:
+            return "the draft head runs after every step, and no decode graph with it is held to the eager step"
         for layer in self.language_model.model.layers:
             if not layer.ffn.capturable:
                 return "the routed experts run the reference dispatch, a launch per expert the step hit"
@@ -190,8 +193,13 @@ class DeepseekV41LLMSubmodule(ARNodeSubmodule):
         self, engine_inputs: ModelInputsFromEngine, input_ids: torch.Tensor,
         last_rows: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        logits = self.language_model(input_ids, last_rows)
-        return engine_inputs.resources[SAMPLER].sample(engine_inputs.request_ids, logits=logits)
+        taps = [] if self.config.draft_head else None
+        logits = self.language_model(input_ids, last_rows, taps)
+        new_tokens = engine_inputs.resources[SAMPLER].sample(engine_inputs.request_ids, logits=logits)
+        if taps is not None:
+            # the draft layers' windows follow every step; nothing reads the drafts yet
+            self.language_model.draft(new_tokens, taps)
+        return new_tokens
 
     def forward(
         self,
