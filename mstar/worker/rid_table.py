@@ -15,17 +15,16 @@ cached_prefix} (purged by clear_rid), Admission.{held_until, parked} (purged by 
 Lockstep.read_failed_rids (purged by clear), Rebuilds.{_kept, _keeps_ids, _prefilling,
 _writes, _cursors}, Preemption._preempted, RequestStateManager.{per_request_info,
 _fwd_by_partition} and StreamBufferManager._rids (purged by remove_request), the
-engine's and tensor manager's per-request state (including ChunkingManagement.prepared,
-Glm52LLMSubmodule's MTP maps, cleared by its cleanup_request, and the tensor store's rid
+engine's and tensor manager's per-request state (including ChunkingManagement.prepared, and the tensor store's rid
 -> uuids ownership, held in the Rust bookkeeper under RustTensorStore; purged by
 force_cleanup_request), RecurrentStatePool.{_keyed, _leases, _restores, _snap_writes,
 _decode, _unkeyed, _chunk_ends, _admit_restores, _admit_snaps, _admit_taken,
-_preplan_taken, _reserved}, KDAManager._verifying, KVManager._exact, RingKVManager._committed_frames and
+_preplan_taken, _reserved}, KDAManager._verifying, KVManager.{_exact, _deferred}, RingKVManager._committed_frames and
 RollingKVManager.{_requests, _admit_taken, _wants, _reserved}
 (purged by remove_request), ResidentPlanner.{_slot_of, _stale, _moved} (purged by
 release), SamplerCells._cells and SamplerResource._sampled_rids (purged by the
 sampler's remove_request), HostFields._fields (purged by the engine's
-remove_request), RopeManager._counters and LongRopeManager._long_rids (purged by their
+remove_request), RopeManager.{_counters, _deferred} and LongRopeManager._long_rids (purged by their
 remove_request), and WorkerProfileInfo.
 
 Lockstep's follow count is the one deliberate exception: a

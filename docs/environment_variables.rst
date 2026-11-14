@@ -824,7 +824,9 @@ Worker scheduling
        footprint at removal. Above one rank, each follower stops if the reservations it
        admits a step from differ from rank 0's. Around each state op that runs its fused
        kernel in an eager step, checks that the array changed only at the step's slots,
-       through a host copy of the array. Tests and debugging only.
+       through a host copy of the array. Checks each verify step's settled counts against
+       its blocks, waiting for an eager step to finish, and across the TP ranks, and that a
+       selected read picks no entry twice. Tests and debugging only.
 
 Compilation
 -----------

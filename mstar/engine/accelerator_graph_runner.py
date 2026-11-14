@@ -800,6 +800,8 @@ class AcceleratorGraphRunner:
         # buckets that failed to capture (here or on a peer rank) and run eagerly
         self.dropped_buckets: list[BucketKey] = []
         self._blocked_buckets: list[BucketKey] = []
+        # the configs a resource blocked, which capture nothing, so they neither replay a walk nor cap its batch
+        self._blocked_configs: frozenset[int] = frozenset()
         # set by prepare_for_capture; capture reuses it rather than re-deriving
         self._prepared_slot_specs: list[CGSlotSpec] | None = None
         # bucket -> what it costs, from size_captures
@@ -980,6 +982,7 @@ class AcceleratorGraphRunner:
                 spec.bucket for spec in slot_specs if spec.config_idx in blocked_configs and not spec.bucket.lean
             ))
             self.dropped_buckets = list(self._blocked_buckets)
+            self._blocked_configs = frozenset(blocked_configs)
             slot_specs = [
                 spec for spec in slot_specs
                 if spec.config_idx not in blocked_configs and spec.bucket.lean <= driven[spec.config_idx]
@@ -1570,7 +1573,7 @@ class AcceleratorGraphRunner:
         """Whether any capture replays this walk."""
         return any(
             graph_walk in config.replay_graph_walks
-            for config in self._capture_configs
+            for i, config in enumerate(self._capture_configs) if i not in self._blocked_configs
         )
 
     def max_batch_size_for(self, graph_walk: str) -> int | None:
@@ -1579,11 +1582,12 @@ class AcceleratorGraphRunner:
         A config that opts out of capping captures only an acceleration subset
         of batch sizes — larger batches run eager rather than being split — so
         it does not constrain the batch. With every config for the walk opting
-        out, nothing here caps it.
+        out, nothing here caps it. A config a resource blocked captured nothing,
+        and caps nothing either.
         """
         capped = [
-            max(self._batch_sizes(config)) for config in self._capture_configs
-            if graph_walk in config.replay_graph_walks
+            max(self._batch_sizes(config)) for i, config in enumerate(self._capture_configs)
+            if i not in self._blocked_configs and graph_walk in config.replay_graph_walks
             and config.caps_eager_batch_size and self._batch_sizes(config)
         ]
         return max(capped) if capped else None

@@ -14,12 +14,15 @@ from mstar.engine.resources import (
 )
 from mstar.engine.resources.base import EngineResourceInfo, build_resource
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
-from mstar.model.glm52._testing import fake_quantize_fp8_block, per_request_outputs
+from mstar.engine.state import sample
+from mstar.engine.state.adapters import node_handles, node_resources
+from mstar.engine.state.state_op import bind_state_ops
 from mstar.model.glm52.components.causal_lm import Glm52ForCausalLM
 from mstar.model.glm52.components.moe import Glm52SparseMoeBlock
-from mstar.model.glm52.config import KV_RESOURCE, Glm52ModelConfig
+from mstar.model.glm52.config import KV, Glm52ModelConfig
 from mstar.model.glm52.submodules import Glm52LLMSubmodule
-from mstar.model.submodule_base import END_PARTITION, ModelInputsFromEngine
+from mstar.model.glm52.tests.testing import close_step, fake_quantize_fp8_block, open_step, per_request_outputs
+from mstar.model.submodule_base import END_PARTITION, ModelInputsFromEngine, engine_step
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(),
@@ -32,7 +35,7 @@ NODE = "LLM"
 BLOCK = (16, 16)  # reduced_fp8 default block size
 # The deployment's ``resources: kv:`` block (what configs/glm52*.yaml carry),
 # applied to the declared specs exactly as the worker applies a YAML.
-KV_YAML = {"resources": {KV_RESOURCE: {"max_num_pages": 8, "page_size": 128}}}
+KV_YAML = {"resources": {KV: {"max_num_pages": 8, "page_size": 128}}}
 
 
 def _fill_layer(layer, cfg):
@@ -159,7 +162,7 @@ class _Serve:
                  kv_yaml: dict = KV_YAML, **model_kwargs):
         self.submodule = submodule
         self.rid = rid
-        specs = model.get_node_resources()
+        specs = node_resources(model)
         apply_yaml_overrides(specs, kv_yaml)
         by_key = resolve_spec_dependencies(specs)
         groups = JointGroups(tp_group=CommGroup.trivial(), sp_group=CommGroup.trivial(), instance=CommGroup.trivial())
@@ -180,7 +183,9 @@ class _Serve:
         }
         self.runner = StepRunner(self.resources, node_resources={NODE: list(self.resources)})
         submodule.requires_grad_(False)
-        submodule.bind_node_resources(self.resources)
+        handles = node_handles(model, NODE, self.resources)
+        bind_state_ops(handles)
+        submodule.bind_node_state(handles)
         # ignore_eos: glm52's reduced EOS ids (250-252) sit inside the byte
         # vocab, so greedy decode on random weights can hit one and stop
         # early — which would break the exact-length assertions below.
@@ -201,14 +206,12 @@ class _Serve:
         (``can_batch`` is True), the unbatched ``forward`` returns logits."""
         rid = self.rid
         inputs = [self.submodule.prepare_inputs(walk, info, {"text_inputs": [text]})]
-        step = self.submodule.declare_step(walk, [rid], inputs)
+        step = engine_step(self.submodule, graph_walk=walk, request_ids=[rid], inputs=inputs)
         ctx = StepContext(request_ids=(rid,), graph_walk=walk, slot=0, capture=False)
         with torch.no_grad(), autocast_scope(DTYPE, device_type=DEVICE.type):
             if step is not None:
-                step.set_ctx(ctx)
-                outcome = self.runner.admit(step)
+                outcome = open_step(self.runner, step, ctx)
                 assert outcome.ok, outcome
-                self.runner.plan(step)
             engine_inputs = ModelInputsFromEngine(
                 request_ids=[rid], per_request_info={rid: info},
                 resources=self.resources, step=step,
@@ -219,13 +222,14 @@ class _Serve:
                 out = per_request_outputs(raw, [rid])[rid]
             else:
                 out = self.submodule.forward(walk, engine_inputs, **kw)
+                # the step's one draw, which forward_batched takes and the logits forward leaves
+                sample(self.submodule.sampler, out["logits"][0])
             if step is not None:
-                self.runner.commit(step)
+                close_step(self.runner, step)
         return out
 
     def close(self):
         self.runner.remove_request(self.rid)
-        self.submodule.cleanup_request(self.rid)
         for resource in self.resources.values():
             resource.cleanup()
 
@@ -297,8 +301,8 @@ def test_serve_path_prefill_decode_loop_fp8(tmp_path):
 
     # The model's declaration is what the engine builds from: naive MLA at
     # reduced dims (mla_absorb=False) -> the paged K/V cache + FlashInfer.
-    specs = model.get_node_resources()
-    assert [spec.resource_key for spec in specs] == ["kv", "attn", "pos", "sampler"]
+    specs = node_resources(model)
+    assert {spec.resource_key for spec in specs} == {KV, "attn", "rope", "sampler"}
 
     logits = _prefill_logits(model, submodule, prompt_ids)
     assert logits.shape == (1, cfg.vocab_size)
@@ -335,7 +339,7 @@ def test_kv_cache_yaml_key_is_rejected(tmp_path):
     old top-level key is an error, not a silently ignored setting. (No
     checkpoint: the declaration is read off the config, nothing loads.)"""
     model = _load_model(tmp_path)
-    specs = model.get_node_resources()
+    specs = node_resources(model)
     with pytest.raises(ValueError, match="resources"):
         apply_yaml_overrides(specs, {"kv_cache": {"max_num_pages": 8}})
     with pytest.raises(ValueError, match="unknown resource"):

@@ -37,21 +37,25 @@ def _force_cpu_flashinfer(monkeypatch):
 from request_walks import run_walks  # noqa: E402
 
 from mstar.engine.resources import AllocationFailed, StepContext  # noqa: E402
-from mstar.model.glm52._testing import (  # noqa: E402
-    build_cpu_resources,
-    install_cpu_rope,
-    per_request_outputs,
-)
+from mstar.engine.state import position  # noqa: E402
 from mstar.model.glm52.components.causal_lm import Glm52ForCausalLM  # noqa: E402
 from mstar.model.glm52.config import (  # noqa: E402
-    KV_RESOURCE,
-    POS_RESOURCE,
-    SAMPLER_RESOURCE,
+    KV,
+    PROMPT_LEN,
+    SAMPLER,
     Glm52ModelConfig,
 )
 from mstar.model.glm52.glm52_model import Glm52Model  # noqa: E402
 from mstar.model.glm52.submodules import Glm52LLMSubmodule  # noqa: E402
-from mstar.model.submodule_base import ModelInputsFromEngine  # noqa: E402
+from mstar.model.glm52.tests.testing import (  # noqa: E402
+    bind_cpu_state,
+    build_cpu_resources,
+    close_step,
+    install_cpu_rope,
+    open_step,
+    per_request_outputs,
+)
+from mstar.model.submodule_base import ModelInputsFromEngine, engine_step  # noqa: E402
 from mstar.model.utils import process_weights_after_loading  # noqa: E402
 
 # small enough that two requests run it out mid-decode, big enough for one
@@ -66,54 +70,54 @@ def _cfg(k: int, mla_absorb: bool) -> Glm52ModelConfig:
     return cfg
 
 
-def _fwd_info(rid, max_tokens: int, ignore_eos: bool, wire: str | None = None) -> SimpleNamespace:
+def _fwd_info(rid, max_tokens: int, ignore_eos: bool, wire: str | None = None, prompt_len: int = 5) -> SimpleNamespace:
     # the worker keys a request by its handle; request_id is the wire id
     return SimpleNamespace(
         request_id=rid if wire is None else wire,
         rid_handle=rid,
         max_tokens=max_tokens,
-        resource_configs={SAMPLER_RESOURCE: SimpleNamespace(
+        resource_configs={SAMPLER: SimpleNamespace(
             ignore_eos=ignore_eos, temperature=0.0, repetition_penalty=1,
         )},
         dynamic_loop_iter_counts={},
+        step_metadata={PROMPT_LEN: prompt_len},
     )
 
 
+def _next(out: dict) -> dict:
+    """The signals a decode step takes from the step before it: its next input and, under MTP, the count."""
+    return {name: out[name] for name in ("text_inputs", "count") if name in out}
+
+
 class _Driver:
-    """The engine's per-step cycle for one node, over real resources: declare, admit,
-    plan, preprocess, forward, commit, the host's cut of packed outputs, postprocess."""
+    """The engine's per-step cycle for one node, over real resources and the node's handles: declare,
+    admit, plan, open, preprocess, forward, commit, close, the host's cut of packed outputs, postprocess."""
 
     def __init__(self, sub: Glm52LLMSubmodule, cfg: Glm52ModelConfig, rids: list[str], **pool):
         self.sub = sub
         self.resources, self.runner = build_cpu_resources(cfg, rids, **pool)
-        sub.bind_node_resources(self.resources)
+        bind_cpu_state(sub, cfg, self.resources)
 
-    def step(self, walk: str, batch: dict[str, tuple[SimpleNamespace, torch.Tensor]],
-             refusable: bool = False):
-        """``refusable``: a refused admit comes back as its outcome, as the
-        engine hands it to the worker, and the forward never runs."""
+    def step(self, walk: str, batch: dict[str, tuple[SimpleNamespace, dict]], refusable: bool = False):
+        """``batch``: each request's info and signals. ``refusable``: a refused admit comes back as its
+        outcome, as the engine hands it to the worker, and the forward never runs."""
         rids = list(batch)
         for info, _ in batch.values():
             info.graph_walk = walk
-        inputs = [
-            self.sub.prepare_inputs(walk, info, {"text_inputs": [text]})
-            for info, text in batch.values()
-        ]
-        step = self.sub.declare_step(walk, rids, inputs)
+        inputs = [self.sub.prepare_inputs(walk, info, signals) for info, signals in batch.values()]
+        step = engine_step(self.sub, graph_walk=walk, request_ids=rids, inputs=inputs)
         ctx = StepContext(request_ids=tuple(rids), graph_walk=walk, slot=0, capture=False)
-        step.set_ctx(ctx)
-        outcome = self.runner.admit(step)
+        outcome = open_step(self.runner, step, ctx)
         if refusable and not outcome.ok:
             return outcome
         assert outcome.ok
-        self.runner.plan(step)
         infos = {rid: info for rid, (info, _) in batch.items()}
         engine_inputs = ModelInputsFromEngine(
             request_ids=rids, per_request_info=infos, resources=self.resources, step=step,
         )
         kw = self.sub.preprocess(walk, engine_inputs, inputs)
         raw = self.sub.forward_batched(walk, engine_inputs, **kw)
-        self.runner.commit(step)
+        close_step(self.runner, step)
         outs = per_request_outputs(raw, rids)
         unpacked = self.sub.unpack_packed_outputs(
             static_output=raw, request_ids=rids,
@@ -133,11 +137,15 @@ def _drive(driver: _Driver, prompt: torch.Tensor, info, max_steps=64) -> torch.T
 
     def step(walk, inputs, iteration):
         info.dynamic_loop_iter_counts = {"decode_loop": iteration} if walk == "decode" else {}
-        out = driver.step(walk, {rid: (info, inputs["text_inputs"][0])})[rid]
+        out = driver.step(walk, {rid: (info, inputs)})[rid]
         return out, driver.sub.check_stop(rid, info, out)
 
+    # the walks this submodule's k serves, and the prompt length its process_prompt would return
     model = Glm52Model(model_path_hf="", tokenizer_mode="byte")
-    return torch.tensor(run_walks(model, step, prompt, info.max_tokens, max_steps))
+    model.config.mtp_num_draft_tokens = driver.sub.mtp_k
+    info.step_metadata = {PROMPT_LEN: prompt.numel()}
+    return torch.tensor(run_walks(model, step, prompt, info.max_tokens, max_steps,
+                                  model_kwargs={PROMPT_LEN: prompt.numel()}))
 
 
 def _model(cfg: Glm52ModelConfig, seed: int = 0) -> Glm52ForCausalLM:
@@ -186,7 +194,8 @@ def _oracle(sub: Glm52LLMSubmodule, reference: dict, wrong_every: int):
     calls = {"n": 0}
     where: dict = {}
     given: dict = {}  # each request's drafts for its current step, d1 first
-    real_prefill, real_decode = sub._mtp_prefill, sub._mtp_decode
+    emitted: dict = {}  # each request's count, as its decode step's inputs carry it
+    real_prepare, real_prefill, real_decode = sub.prepare_inputs, sub._mtp_prefill, sub._mtp_decode
 
     def at(rid, pos):
         seq = reference[rid]
@@ -200,6 +209,11 @@ def _oracle(sub: Glm52LLMSubmodule, reference: dict, wrong_every: int):
             given[rid] = [t] if fresh else [*given[rid], t]
         return torch.tensor(tokens, dtype=torch.long)
 
+    def prepare(walk, info, inputs, **kwargs):
+        if walk == "decode":
+            emitted[info.rid_handle] = int(inputs["count"][0][0])
+        return real_prepare(walk, info, inputs, **kwargs)
+
     def prefill(engine_inputs, *args):
         where.update(rids=list(engine_inputs.request_ids), row=None)
         return real_prefill(engine_inputs, *args)
@@ -207,7 +221,7 @@ def _oracle(sub: Glm52LLMSubmodule, reference: dict, wrong_every: int):
     def decode(engine_inputs, *args):
         rids = list(engine_inputs.request_ids)
         # tokens emitted before this step: its first draft is the one at that position
-        where.update(rids=rids, row=0, done={rid: sub._mtp_emitted[rid] for rid in rids})
+        where.update(rids=rids, row=0, done={rid: emitted[rid] for rid in rids})
         return real_decode(engine_inputs, *args)
 
     def draft(h_head, prev):
@@ -227,20 +241,7 @@ def _oracle(sub: Glm52LLMSubmodule, reference: dict, wrong_every: int):
             nxt.append(at(rid, done[rid] + accepted + 1))
         return emit(rids, nxt, fresh=True)
 
-    sub._mtp_prefill, sub._mtp_decode, sub._draft_tokens = prefill, decode, draft
-
-
-def test_mtp_keys_request_state_by_handle():
-    cfg = _cfg(2, True)
-    model = _model(cfg)
-    prompt = torch.arange(5, dtype=torch.long) + 3
-    streams = []
-    for wire in (None, "req-a"):
-        sub = Glm52LLMSubmodule(model, cfg)
-        streams.append(_drive(_Driver(sub, cfg, [7]), prompt, _fwd_info(7, 14, True, wire)))
-        sub.cleanup_request(7)
-        assert not sub._mtp_max_tokens and not sub._mtp_ignore_eos
-    assert torch.equal(streams[0], streams[1])
+    sub.prepare_inputs, sub._mtp_prefill, sub._mtp_decode, sub._draft_tokens = prepare, prefill, decode, draft
 
 
 @pytest.mark.parametrize("k", [2, 3])
@@ -272,10 +273,10 @@ def test_oracle_drafts_are_all_accepted():
     _oracle(sub, {"r0": base.tolist()}, 0)
     driver = _Driver(sub, cfg, ["r0"])
     info = _fwd_info("r0", 16, True)
-    out = driver.step("prefill", {"r0": (info, torch.arange(5, dtype=torch.long) + 3)})["r0"]
+    out = driver.step("prefill", {"r0": (info, {"text_inputs": [torch.arange(5, dtype=torch.long) + 3]})})["r0"]
     got = out["new_token"][0].tolist()
     for _ in range(2):
-        out = driver.step("decode", {"r0": (info, out["text_inputs"][0])})["r0"]
+        out = driver.step("decode", {"r0": (info, _next(out))})["r0"]
         emitted = out["new_token"][0].tolist()
         assert len(emitted) == k + 1
         got += emitted
@@ -312,8 +313,8 @@ def test_mtp_eos_truncation_matches_baseline():
 
 @pytest.mark.parametrize("wrong_every", [None, 0], ids=["mtp", "oracle"])
 def test_kv_length_tracks_the_verified_stream(wrong_every):
-    """The next declare takes the rejected rows back from the KV length and the position, so
-    each step starts at the prompt plus the emitted tokens but the last."""
+    """A verify step writes its whole block, and the next step's admit takes the rejected rows back from
+    the KV length and the position, so each step starts at the prompt plus the emitted tokens but the last."""
     k = 2
     (base, _), _ = _run_pair(k=k, max_tokens=20, ignore_eos=True, mla_absorb=True)
     cfg = _cfg(k, True)
@@ -322,25 +323,29 @@ def test_kv_length_tracks_the_verified_stream(wrong_every):
         _oracle(sub, {"r0": base.tolist()}, wrong_every)
     driver = _Driver(sub, cfg, ["r0"])
     info = _fwd_info("r0", 20, True)
-    kv, pos = driver.resources[KV_RESOURCE], driver.resources[POS_RESOURCE]
+    kv = driver.resources[KV]
 
     def length():
-        n = kv._streams["r0"]["main"].stored_len
-        assert pos.position("r0", "main") == n
-        return n
+        return kv._streams["r0"]["main"].stored_len
 
+    starts = []
+    preprocess = sub.preprocess
+
+    def started(walk, engine_inputs, inputs):
+        starts.append((length(), position(sub.kv, "r0", "main")))
+        return preprocess(walk, engine_inputs, inputs)
+
+    sub.preprocess = started
     prompt = torch.arange(5, dtype=torch.long) + 3
-    out = driver.step("prefill", {"r0": (info, prompt)})["r0"]
+    out = driver.step("prefill", {"r0": (info, {"text_inputs": [prompt]})})["r0"]
     total = prompt.numel() + 1
     assert length() == prompt.numel()
     for _ in range(4):
-        inputs = [sub.prepare_inputs("decode", info, {"text_inputs": out["text_inputs"]})]
-        sub.declare_step("decode", ["r0"], inputs)  # the trim; idempotent at the real declare
-        assert length() == total - 1
-        out = driver.step("decode", {"r0": (info, out["text_inputs"][0])})["r0"]
-        _, _, accepted = sub._mtp_verdict["r0"]
-        assert out["new_token"][0].numel() == accepted + 1
+        out = driver.step("decode", {"r0": (info, _next(out))})["r0"]
+        assert starts[-1] == (total - 1, total - 1)
         assert length() == total - 1 + k + 1
+        accepted = out["new_token"][0].numel() - 1
+        assert int(out["count"][0][0]) == total + accepted + 1 - prompt.numel()
         assert out["text_inputs"][0].numel() == 1
         total += accepted + 1
 
@@ -382,14 +387,14 @@ def test_batch_of_two_matches_single_streams():
 
     sub = Glm52LLMSubmodule(model, cfg)
     driver = _Driver(sub, cfg, list(prompts))
-    infos = {rid: _fwd_info(rid, 14, True) for rid in prompts}
+    infos = {rid: _fwd_info(rid, 14, True, prompt_len=prompts[rid].numel()) for rid in prompts}
     emitted = {rid: [] for rid in prompts}
     texts = {}
     for rid, prompt in prompts.items():
-        out = driver.step("prefill", {rid: (infos[rid], prompt)})[rid]
+        out = driver.step("prefill", {rid: (infos[rid], {"text_inputs": [prompt]})})[rid]
         emitted[rid].append(out["new_token"][0])
         assert not sub.check_stop(rid, infos[rid], out)
-        texts[rid] = out["text_inputs"][0]
+        texts[rid] = _next(out)
     live = set(prompts)
     for _ in range(20):
         if not live:
@@ -397,7 +402,7 @@ def test_batch_of_two_matches_single_streams():
         outs = driver.step("decode", {rid: (infos[rid], texts[rid]) for rid in sorted(live)})
         for rid in sorted(live):
             emitted[rid].append(outs[rid]["new_token"][0])
-            texts[rid] = outs[rid]["text_inputs"][0]
+            texts[rid] = _next(outs[rid])
             if sub.check_stop(rid, infos[rid], outs[rid]):
                 live.discard(rid)
     for rid in prompts:
@@ -409,22 +414,9 @@ def test_non_greedy_request_is_refused_under_mtp():
     cfg = _cfg(2, True)
     sub = Glm52LLMSubmodule(_model(cfg), cfg)
     info = _fwd_info("r0", 8, True)
-    info.resource_configs[SAMPLER_RESOURCE].temperature = 0.7
+    info.resource_configs[SAMPLER].temperature = 0.7
     with pytest.raises(RuntimeError, match="greedy-only"):
         sub.prepare_inputs("prefill", info, {"text_inputs": [torch.tensor([1, 2, 3])]})
-
-
-def test_seed_slots_are_reused():
-    cfg = _cfg(2, True)
-    model = _model(cfg)
-    sub = Glm52LLMSubmodule(model, cfg)
-    driver = _Driver(sub, cfg, ["a", "b"])
-    free = len(sub._mtp_free_slots)
-    prompt = torch.arange(5, dtype=torch.long) + 3
-    _drive(driver, prompt, _fwd_info("a", 6, True))
-    assert sub._mtp_slot["a"] != 0 and len(sub._mtp_free_slots) == free - 1
-    sub.cleanup_request("a")
-    assert len(sub._mtp_free_slots) == free and not sub._mtp_pending
 
 
 # ── the context limit ────────────────────────────────────────────────────
@@ -439,37 +431,34 @@ def _window_cfg(k: int, limit: int) -> Glm52ModelConfig:
 
 
 def _window_stream(model, cfg, mode_k: int, prompt_len: int, max_tokens: int):
-    """One arm at the window: the stream, the capped budget (None: uncapped), and the KV
-    stream's final length and page high-water mark."""
+    """One arm at the window: the stream, and the KV stream's final length and page high-water mark."""
     k = cfg.mtp_num_draft_tokens
     cfg.mtp_num_draft_tokens = mode_k
     try:
         sub = Glm52LLMSubmodule(model, cfg)
         driver = _Driver(sub, cfg, ["r0"])
         prompt = torch.arange(prompt_len, dtype=torch.long) + 3
-        stream = _drive(driver, prompt, _fwd_info("r0", max_tokens, True))
-        kv = driver.resources[KV_RESOURCE]
+        stream = _drive(driver, prompt, _fwd_info("r0", max_tokens, True, prompt_len=prompt_len))
+        kv = driver.resources[KV]
         pages = len(kv._streams["r0"]["main"].page_indices)
-        budget = sub.request_state("r0").get("token_budget")
-        return stream, budget, kv._streams["r0"]["main"].stored_len, pages
+        return stream, kv._streams["r0"]["main"].stored_len, pages
     finally:
         cfg.mtp_num_draft_tokens = k
 
 
 @pytest.mark.parametrize("k", [2, 3])
 def test_stream_stops_cleanly_at_the_context_limit(k):
-    """A request sized to the window: MTP caps its budget two verify blocks short, so no step
-    writes past the limit, and the stream is plain decode's cut there."""
+    """A request sized to the window: MTP's count stops it two verify blocks short, so no step writes
+    past the limit, and the stream is plain decode's cut there."""
     limit, prompt_len = 24, 5
     fits = limit - prompt_len + 1
     cfg = _window_cfg(k, limit)
     model = _model(cfg)
-    baseline, budget, stored, pages = _window_stream(model, cfg, 0, prompt_len, fits)
-    assert budget is None, "without MTP the conductor sizes the request; nothing caps it"
-    assert baseline.numel() == fits
+    baseline, stored, pages = _window_stream(model, cfg, 0, prompt_len, fits)
+    assert baseline.numel() == fits, "without MTP the conductor sizes the request; nothing caps it"
     assert stored == limit and pages == limit // 8
-    stream, budget, stored, pages = _window_stream(model, cfg, k, prompt_len, fits)
-    assert budget == limit - prompt_len - 2 * (k + 1)
+    stream, stored, pages = _window_stream(model, cfg, k, prompt_len, fits)
+    budget = limit - prompt_len - 2 * (k + 1)
     assert torch.equal(stream, baseline[:budget]), (stream.tolist(), baseline.tolist())
     assert stored <= limit and pages <= limit // 8, (stored, pages)
 
@@ -485,7 +474,7 @@ def test_the_forward_allocates_no_pages():
     cfg = _cfg(k, True)
     sub = Glm52LLMSubmodule(_model(cfg), cfg)
     driver = _Driver(sub, cfg, ["r0"])
-    kv = driver.resources[KV_RESOURCE]
+    kv = driver.resources[KV]
     arena = kv._arena
     forward = sub.forward_batched
 
@@ -511,67 +500,61 @@ def test_the_forward_allocates_no_pages():
 
 
 def test_exhaustion_refuses_the_step_and_the_pool_recovers():
-    """A pool too small for two: admission refuses with ``AllocationFailed`` and moves nothing;
-    with the second request removed, the first completes as alone and the pool recovers."""
+    """A pool too small for two: admission refuses with ``AllocationFailed`` and moves nothing past the
+    rewind of the last verdicts; with the second request removed, the first completes as alone and the
+    pool recovers."""
     k, max_tokens = 2, 14
     cfg = _cfg(k, True)
     model = _model(cfg)
     prompts = {"a": torch.arange(5, dtype=torch.long) + 3, "b": torch.arange(3, dtype=torch.long) + 9}
     singles = {
         rid: _drive(_Driver(Glm52LLMSubmodule(model, cfg), cfg, [rid]), p,
-                    _fwd_info(rid, max_tokens, True))
+                    _fwd_info(rid, max_tokens, True, prompt_len=p.numel()))
         for rid, p in prompts.items()
     }
 
     sub = Glm52LLMSubmodule(model, cfg)
     driver = _Driver(sub, cfg, list(prompts), max_num_pages=POOL_PAGES, page_size=4)
-    kv = driver.resources[KV_RESOURCE]
+    kv = driver.resources[KV]
     free = kv._arena.num_free
-    infos = {rid: _fwd_info(rid, max_tokens, True) for rid in prompts}
+    infos = {rid: _fwd_info(rid, max_tokens, True, prompt_len=p.numel()) for rid, p in prompts.items()}
     emitted = {rid: [] for rid in prompts}
-    texts = {}
-
-    def remove(rid):
-        driver.runner.remove_request(rid)
-        sub.cleanup_request(rid)
-
+    signals = {}
     for rid, prompt in prompts.items():
-        out = driver.step("prefill", {rid: (infos[rid], prompt)})[rid]
+        out = driver.step("prefill", {rid: (infos[rid], {"text_inputs": [prompt]})})[rid]
         emitted[rid].append(out["new_token"][0])
         assert not sub.check_stop(rid, infos[rid], out)
-        texts[rid] = out["text_inputs"][0]
+        signals[rid] = _next(out)
     live, refused = set(prompts), 0
     for _ in range(64):
         if not live:
             break
-        # the last verdict's trim lands at declare, refused or not, and only once
-        for rid in live:
-            sub._apply_verdict(rid)
-        before = {rid: kv._streams[rid]["main"].stored_len for rid in live}
-        outs = driver.step("decode", {rid: (infos[rid], texts[rid]) for rid in sorted(live)},
+        # a refused admit still takes each request's rejected rows back, and only once
+        rewound = {rid: prompts[rid].numel() + int(signals[rid]["count"][0][0]) - 1 for rid in live}
+        outs = driver.step("decode", {rid: (infos[rid], signals[rid]) for rid in sorted(live)},
                            refusable=True)
         if not isinstance(outs, dict):
             assert isinstance(outs.reason, AllocationFailed), outs
-            assert {rid: kv._streams[rid]["main"].stored_len for rid in live} == before
+            assert {rid: kv._streams[rid]["main"].stored_len for rid in live} == rewound
             assert live == set(prompts)
             refused += 1
             live.discard("b")
-            remove("b")
+            driver.runner.remove_request("b")
             continue
         for rid in sorted(live):
             emitted[rid].append(outs[rid]["new_token"][0])
-            texts[rid] = outs[rid]["text_inputs"][0]
+            signals[rid] = _next(outs[rid])
             if sub.check_stop(rid, infos[rid], outs[rid]):
                 live.discard(rid)
-                remove(rid)
+                driver.runner.remove_request(rid)
     assert refused == 1
     assert torch.equal(torch.cat(emitted["a"]), singles["a"])
     assert kv._arena.num_free == free
 
     driver.runner.ingest_request("c")
-    again = _drive(driver, prompts["b"], _fwd_info("c", max_tokens, True))
+    again = _drive(driver, prompts["b"], _fwd_info("c", max_tokens, True, prompt_len=prompts["b"].numel()))
     assert torch.equal(again, singles["b"])
-    remove("c")
+    driver.runner.remove_request("c")
     assert kv._arena.num_free == free
 
 
@@ -583,12 +566,12 @@ def test_stop_counts_what_the_checked_steps_delivered():
         sub = Glm52LLMSubmodule(model, cfg)
         driver = _Driver(sub, cfg, [7])
         info = _fwd_info(7, budget, True)
-        out = driver.step("prefill", {7: (info, torch.arange(5, dtype=torch.long) + 3)})[7]
+        out = driver.step("prefill", {7: (info, {"text_inputs": [torch.arange(5, dtype=torch.long) + 3]})})[7]
         delivered = out["new_token"][0].numel()
         assert not sub.check_stop(7, info, out)
-        cur = driver.step("decode", {7: (info, out["text_inputs"][0])})[7]
+        cur = driver.step("decode", {7: (info, _next(out))})[7]
         for _ in range(40):
-            nxt = driver.step("decode", {7: (info, cur["text_inputs"][0])})[7]
+            nxt = driver.step("decode", {7: (info, _next(cur))})[7]
             delivered += cur["new_token"][0].numel()
             if sub.check_stop(7, info, cur):
                 break
@@ -609,7 +592,7 @@ def test_a_stop_token_from_the_prefill_ends_the_reply(k, caplog):
     cfg = _cfg(k, True)
     eos = cfg.eos_token_ids[0]
     driver = _Driver(Glm52LLMSubmodule(_model(cfg), cfg), cfg, ["r0"])
-    sampler = driver.resources[SAMPLER_RESOURCE]
+    sampler = driver.resources[SAMPLER]
     greedy = sampler.sample
 
     def eos_once(rids, logits, **kw):
@@ -625,15 +608,15 @@ def test_a_stop_token_from_the_prefill_ends_the_reply(k, caplog):
 # ── a verdict that never lands ──────────────────────────────────────────
 
 
-def _verdict_reader(monkeypatch, pending):
-    """A submodule whose eager mailbox never stages a verdict (step -1), as after a failed replay."""
+def _verdict_reader(monkeypatch):
+    """A submodule whose eager mailbox flag is never set, as after a device fault past the launch."""
     from mstar.model.glm52 import submodules
 
-    monkeypatch.setattr(submodules, "_VERDICT_DEADLINE_S", 0.2, raising=False)
+    monkeypatch.setattr(submodules, "_VERDICT_DEADLINE_S", 0.2)
     sub = Glm52LLMSubmodule.__new__(Glm52LLMSubmodule)
     sub.__dict__.update(
-        config=SimpleNamespace(mtp_num_draft_tokens=3), _mtp_pending=pending, _mtp_verdict={},
-        _mailboxes={None: (torch.zeros(4, 5, dtype=torch.long), torch.full((1,), -1, dtype=torch.long))})
+        config=SimpleNamespace(mtp_num_draft_tokens=3), _verdicts=(None, {"a": 0}),
+        _mailboxes={None: (torch.zeros(4, 5, dtype=torch.long), torch.zeros(1, dtype=torch.long))})
     return sub
 
 
@@ -655,13 +638,8 @@ def _raised(fn, seconds=20.0):
 
 
 def test_a_verdict_that_never_lands_exits_the_process(monkeypatch):
-    """A step that failed after it was numbered: the plan thread's read exits the process at its
-    deadline instead of holding the worker forever."""
-    sub = _verdict_reader(monkeypatch, {"a": (1, None, 0)})
+    """A verify step whose graph never set its flag: the read exits the process at its deadline instead of
+    holding the worker forever."""
+    sub = _verdict_reader(monkeypatch)
     exc = _raised(lambda: sub._read_verdicts(["a"]))
     assert isinstance(exc, SystemExit) and "never staged" in str(exc)
-
-
-def test_a_read_across_two_steps_exits_the_process(monkeypatch):
-    sub = _verdict_reader(monkeypatch, {"a": (1, None, 0), "b": (2, None, 1)})
-    assert isinstance(_raised(lambda: sub._read_verdicts(["a", "b"])), SystemExit)

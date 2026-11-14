@@ -1,19 +1,14 @@
-"""GLM-5.2 MLA attention: the shared MLA (components/mla.py) and its DSA indexer, whose keys and
-queries the DSA resource (mstar/engine/resources/dsa) selects and attends with."""
+"""GLM-5.2 MLA attention: the shared MLA (components/mla.py) and its DSA indexer, whose keys the index key array
+holds and picks each query's positions from."""
 from __future__ import annotations
 
 import torch
 
 from mstar.distributed.communication import CommGroup
+from mstar.engine.state import selects
 from mstar.model.components.mla import MLAAttention
 from mstar.model.glm52.components.indexer import Glm52Indexer, is_full_indexer_layer
-from mstar.model.glm52.config import (
-    ATTN_RESOURCE,
-    DSA_RESOURCE,
-    KV_RESOURCE,
-    POS_RESOURCE,
-    Glm52ModelConfig,
-)
+from mstar.model.glm52.config import INDEX_KEYS, KV, Glm52ModelConfig
 
 
 def dsa_selection_to_mask(
@@ -39,26 +34,33 @@ def masked_reference_attention(
     return torch.einsum("hqk,khd->qhd", scores.softmax(dim=-1), v)
 
 
+class CarriedPick:
+    """The pick of the last FULL layer this forward, which the SHARED layers after it attend. Layer 0 is FULL
+    (`Glm52Model.__init__`), so each forward writes it before a SHARED layer reads it."""
+
+    picks: torch.Tensor | None = None
+
+
 class Glm52MLAAttention(MLAAttention):
     """The shared MLA with GLM-5.2's DSA: on FULL layers an indexer projects each token's index
-    key and each query's heads, and the DSA resource picks each query's top ``index_topk`` keys;
-    SHARED layers reuse the last FULL layer's pick, and the absorbed path attends just those
-    latents. ``dsa_selection`` is the naive path's reference hook: given rows, the mask over
-    the current batch."""
+    key into the key array, and each query's heads, which pick its top ``index_topk`` positions;
+    SHARED layers attend the last FULL layer's pick, which ``carried`` holds, and the latent read
+    attends just those positions. ``dsa_selection`` is the naive path's reference hook: given
+    rows, the mask over the current batch."""
 
     def __init__(
         self,
         config: Glm52ModelConfig,
         comm_group: CommGroup | None = None,
         layer_idx: int | None = None,
+        carried: CarriedPick | None = None,
     ) -> None:
-        super().__init__(config, comm_group, layer_idx, kv_key=KV_RESOURCE,
-                         attn_key=ATTN_RESOURCE, pos_key=POS_RESOURCE)
+        super().__init__(config, comm_group, layer_idx, kv_key=KV, attn_key=None, pos_key=None)
         # DSA indexer only on FULL layers — SHARED layers carry no indexer
         # weights in the checkpoint (they reuse the last FULL selection),
         # and a dormant module would sit uninitialized after ``to_empty``.
-        # And only under dsa_long_context, the one mode that declares the DSA
-        # resource: off it, a FULL layer's indexer (replicated, not TP-sharded)
+        # And only under dsa_long_context, the one mode that declares the key
+        # array: off it, a FULL layer's indexer (replicated, not TP-sharded)
         # would be read and held for nothing; the loader skips its keys to match
         # (Glm52ForCausalLM.load_weights).
         self.dsa_long_context = config.dsa_long_context
@@ -69,26 +71,12 @@ class Glm52MLAAttention(MLAAttention):
             and is_full_indexer_layer(config, layer_idx)
             else None
         )
-        self._dsa = None
+        self._carried = carried if carried is not None else CarriedPick()
+        self.index = None
 
-    def bind_resources(self, resources: dict) -> None:
-        super().bind_resources(resources)
-        self._dsa = resources.get(DSA_RESOURCE)
-        if self._dsa is not None and not self.dsa_long_context:
-            # built flag-off: no indexer was constructed and its weights were
-            # never loaded, so a FULL layer here would pass for SHARED
-            raise RuntimeError(
-                "the DSA resource is declared but this attention layer was built with "
-                "dsa_long_context off: its indexer does not exist"
-            )
-        if self._dsa is not None and not self.mla_absorb:
-            # The sparse path reads the paged 576-dim latent cache; the naive
-            # backend stores padded per-head K/V instead. The naive path stays
-            # what it is: the reduced-test parity fallback.
-            raise RuntimeError(
-                "dsa_long_context requires mla_absorb: sparse attention reads the paged "
-                "MLA latent cache, which only the absorbed backend maintains"
-            )
+    def bind_state(self, handles: dict) -> None:
+        super().bind_state(handles)
+        self.index = handles.get(INDEX_KEYS)
 
     def forward(
         self,
@@ -101,7 +89,7 @@ class Glm52MLAAttention(MLAAttention):
         if self.mla_absorb and dsa_selection is not None:
             raise NotImplementedError(
                 "dsa_selection is the naive-path reference hook; the "
-                "absorbed path selects through the DSA resource instead"
+                "absorbed path picks through the key array instead"
             )
         return super().forward(hidden_states, position_ids, dsa_selection=dsa_selection)
 
@@ -115,43 +103,27 @@ class Glm52MLAAttention(MLAAttention):
         return masked_reference_attention(q, k, v, mask)
 
     def _selects(self, dsa_selection=None) -> bool:
-        return self._dsa is not None
+        return self.index is not None
 
     def _select(self, hidden_states, q_c, position_ids, dsa_selection=None):
-        # None-guarded here (not just inside _dsa_select) so the default
-        # flag-off path never crosses the compiler.disable boundary — dynamo
-        # specializes on the unbound resource and folds the branch away.
-        if self._dsa is None:
+        # None-guarded here, not just inside _index_pass, so a step without DSA never crosses its graph break
+        if self.index is None:
             return None
-        return self._dsa_select(hidden_states, q_c, position_ids)
+        return self._index_pass(hidden_states, q_c, position_ids)
 
-    # The layer index and the resource's host state are read only here, outside dynamo.
+    # The branch on `selects` and the indexer's query stay out of the compiled frame, and DSA steps run eager.
     @torch.compiler.disable
-    def _dsa_select(
+    def _index_pass(
         self, hidden_states: torch.Tensor, q_c: torch.Tensor, position_ids: torch.Tensor,
     ) -> torch.Tensor | None:
-        """Hand the DSA resource this FULL layer's keys and return the pick to attend, or None
-        while every row sees at most ``index_topk`` keys; a SHARED layer reuses the last pick."""
-        dsa = self._dsa
+        """Add this FULL layer's index keys and return the positions each row attends, or None while no row reaches
+        more than ``index_topk`` positions. A SHARED layer takes the last FULL layer's pick."""
         if self.indexer is None:
-            return dsa.shared_selection(self.layer_idx) if dsa.needs_selection() else None
-        dsa.store_keys(self.layer_idx, self.indexer.compute_k(hidden_states, position_ids))
-        if not dsa.needs_selection():
-            return None
-        q, weights = self.indexer.compute_query(q_c, hidden_states, position_ids)
-        return dsa.select(self.layer_idx, q, weights)
-
-    @torch.compiler.disable
-    def _attend_selected(
-        self,
-        selection: torch.Tensor,
-        q_nope: torch.Tensor,
-        q_pe: torch.Tensor,
-        latent: torch.Tensor,
-        dsa_selection: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Write this step's latents, then sparse absorbed MLA over the picked ones."""
-        layer_idx = self.cache_layer_idx
-        self._kv.write_kv(latent, None, layer_idx=layer_idx)
-        return self._dsa.attend(
-            selection, q_nope, q_pe, self._kv.layer_view(layer_idx), self.softmax_scale)
+            return self._carried.picks
+        self.index.add(self.layer, k=self.indexer.compute_k(hidden_states, position_ids))
+        picks = None
+        if selects(self.index):
+            q, weights = self.indexer.compute_query(q_c, hidden_states, position_ids)
+            picks = self.index.read(self.layer, q, weights=weights)
+        self._carried.picks = picks
+        return picks

@@ -930,7 +930,7 @@ def test_a_position_call_on_an_array_that_declares_no_positions_is_refused_by_na
 
 
 def test_positions_on_an_array_with_no_pool_are_refused_by_name():
-    with pytest.raises(ValueError, match="Array 'vision': no layout yet: positions, which only an append-only array "
-                                         "that keeps entries holds"):
+    with pytest.raises(ValueError, match="Array 'vision': no layout yet: positions, which today's resources don't keep "
+                                         "on WithinStepStorage"):
         build_specs([replace(_within(), positions=Positions())])
 

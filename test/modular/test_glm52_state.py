@@ -1,0 +1,360 @@
+"""GLM-5.2 on the state contract, against ``main``'s hand-written resources: the specs its declarations
+build are ``main``'s but for three named differences, ``process_prompt`` lays out the latent array and the
+seed, the prompt length rides the walk's step metadata, and a verify step's count edge cuts the verdict as
+``main``'s per-request counters did and reaches the step speculated after it."""
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+import pytest
+import torch
+from request_walks import walk_runtime
+
+from mstar.engine.engine import ExecutingBatch
+from mstar.engine.resources import (
+    AttentionConfig,
+    AttentionSpec,
+    AttnBackend,
+    DSAConfig,
+    DSASpec,
+    KVLayout,
+    KVSpec,
+    PagedKVConfig,
+    PositionSpec,
+    SamplerSpec,
+)
+from mstar.engine.resources.position.config import PositionConfig
+from mstar.engine.resources.step import StepContext
+from mstar.engine.state.adapters import node_resources
+from mstar.model.glm52.config import INDEX_KEYS, KV, MTP_SEED, PROMPT_LEN, SAMPLER, Glm52ModelConfig
+from mstar.model.glm52.glm52_model import Glm52Model
+from mstar.model.glm52.submodules import Glm52LLMSubmodule
+from mstar.model.submodule_base import END_PARTITION, ARNodeInputs
+from mstar.testing_utils.worker import make_worker
+from mstar.worker.micro_scheduler import ScheduledBatch
+from mstar.worker.speculation import Speculation
+
+# main's resource keys that the declarations name otherwise: the positions take the latent array's
+# position key, and the DSA resource the index key array's name
+RENAMED = {"pos": "rope", "dsa": INDEX_KEYS}
+
+
+def _model(**kwargs) -> Glm52Model:
+    model = object.__new__(Glm52Model)
+    model.config = Glm52ModelConfig(**kwargs)
+    return model
+
+
+def _main_specs(model: Glm52Model) -> list:
+    """``main``'s ``Glm52Model.get_node_resources`` and ``Glm52ModelConfig.position_config``, as they stood
+    before the port."""
+    cfg, nodes = model.config, {"LLM"}
+    num_kv_layers = cfg.num_hidden_layers + (1 if cfg.mtp_num_draft_tokens > 0 else 0)
+    if cfg.mla_absorb:
+        kv = PagedKVConfig(
+            num_layers=num_kv_layers, num_kv_heads=1, head_dim=cfg.cache_latent_dim,
+            max_seq_len=model.context_limit(), num_qo_heads=cfg.num_attention_heads, layout=KVLayout.MLA,
+            kv_lora_rank=cfg.kv_lora_rank, qk_rope_head_dim=cfg.qk_rope_head_dim,
+        )
+        attn = AttentionConfig(kv_cache="kv", backend=AttnBackend.FLASHINFER_MLA, sm_scale=cfg.softmax_scale)
+    else:
+        kv = PagedKVConfig(
+            num_layers=num_kv_layers, num_kv_heads=cfg.num_attention_heads, head_dim=cfg.padded_head_dim,
+            max_seq_len=model.context_limit(), num_qo_heads=cfg.num_attention_heads,
+        )
+        attn = AttentionConfig(kv_cache="kv")
+    specs = [
+        KVSpec(resource_key="kv", nodes=nodes, config=kv),
+        AttentionSpec(resource_key="attn", nodes=nodes, config=attn),
+        PositionSpec(resource_key="pos", nodes=nodes, config=PositionConfig(
+            kv_cache="kv", rotary_dim=cfg.qk_rope_head_dim, interleave=cfg.rope_interleave,
+            rope_theta=cfg.rope_theta, rope_table_dtype=torch.float32,
+        )),
+        SamplerSpec(resource_key="sampler", nodes=nodes, vocab_size=cfg.vocab_size,
+                    enable_min_p=bool(model.sampling_defaults.get("min_p"))),
+    ]
+    if cfg.dsa_long_context:
+        specs.append(DSASpec(resource_key="dsa", nodes=nodes, config=DSAConfig(kv_cache="kv", topk=cfg.index_topk)))
+    return specs
+
+
+@pytest.mark.parametrize("kwargs", [
+    {}, {"mla_absorb": False}, {"dsa_long_context": True}, {"mtp_num_draft_tokens": 3},
+], ids=["absorbed", "naive", "dsa", "mtp"])
+def test_the_declarations_build_main_s_specs_but_for_three_named_differences(kwargs):
+    model = _model(**kwargs)
+    built = {spec.resource_key: spec for spec in node_resources(model)}
+    for spec in _main_specs(model):
+        got = built.pop(RENAMED.get(spec.resource_key, spec.resource_key))
+        assert type(got) is type(spec) and got.nodes == spec.nodes, spec.resource_key
+        if isinstance(spec, SamplerSpec):
+            assert (got.vocab_size, got.enable_min_p) == (spec.vocab_size, spec.enable_min_p)
+        else:
+            assert got.config == spec.config, f"{spec.resource_key}: the engine would build another resource"
+    # the third: the seed's pool, where main kept fixed buffers on the submodule
+    assert set(built) == ({MTP_SEED} if model.config.mtp_num_draft_tokens else set())
+
+
+@pytest.mark.parametrize("k", [0, 3])
+def test_process_prompt_lays_out_the_latent_array_and_the_seed(k):
+    model = _model(mtp_num_draft_tokens=k, vocab_size=256)
+    model._tokenizer_mode, model._tokenizer = "byte", None
+    out = model.process_prompt("Hi", ["text"], ["text"])
+    assert set(out.metadata["state_layout"]) == ({KV, MTP_SEED} if k else {KV})
+    assert set(out.metadata["state_layout"][KV]) == {"main"}
+    assert out.metadata[PROMPT_LEN] == 2
+    assert PROMPT_LEN in model.INTERNAL_KWARGS, "a client's prompt_len would reach walk_plan"
+
+
+def test_the_prompt_length_rides_the_walk_s_step_metadata():
+    """Under MTP both steps of the walk carry the prompt length, and the stop check reads it there."""
+    model = _model(mtp_num_draft_tokens=3)
+    prefill, decode = model.walk_plan("default", ["text"], ["text"], {}, {PROMPT_LEN: 7})
+    assert prefill.step_metadata[PROMPT_LEN] == decode.step_metadata[PROMPT_LEN] == 7
+    plain, _ = _model().walk_plan("default", ["text"], ["text"], {}, {})
+    assert PROMPT_LEN not in plain.step_metadata, "without MTP no step reads it"
+
+
+def _submodule(k: int, **cfg) -> Glm52LLMSubmodule:
+    language_model = torch.nn.Module()
+    language_model.lm_head = torch.nn.Identity()
+    return Glm52LLMSubmodule(language_model, Glm52ModelConfig(mtp_num_draft_tokens=k, **cfg))
+
+
+def _info(walk: str, max_tokens: int, prompt_len: int, ignore_eos: bool = True) -> SimpleNamespace:
+    return SimpleNamespace(
+        request_id="r", graph_walk=walk, max_tokens=max_tokens, step_metadata={PROMPT_LEN: prompt_len},
+        resource_configs={SAMPLER: SimpleNamespace(ignore_eos=ignore_eos)}, dynamic_loop_iter_counts={},
+    )
+
+
+def _main_cut(target, accepted, budget, emitted, eos, ignore_eos):
+    """``main``'s cut of a verify step's verdict, from its per-request counters."""
+    out = target[:min(accepted + 1, max(budget - emitted, 1))]
+    if not ignore_eos:
+        for j, token in enumerate(out):
+            if token in eos:
+                return out[:j + 1]
+    return out
+
+
+@pytest.mark.parametrize("ignore_eos", [True, False])
+@pytest.mark.parametrize("accepted", [0, 2, 3])
+@pytest.mark.parametrize("count", [1, 5, 9])
+@pytest.mark.parametrize("max_tokens", [6, 10, 64])
+def test_the_count_edge_cuts_a_verdict_as_main_did(max_tokens, count, accepted, ignore_eos):
+    k, prompt_len = 3, 5
+    sub = _submodule(k)
+    eos = sub.config.eos_token_ids[0]
+    target = [11, eos, 13, 14] if not ignore_eos else [11, 12, 13, 14]
+    sub._mailboxes = {None: (torch.tensor([[*target, accepted]]), torch.ones(1, dtype=torch.long))}
+    sub._verdicts = None, {"r": 0}
+    info = _info("decode", max_tokens, prompt_len, ignore_eos)
+    budget = min(max_tokens, sub._context_limit() - prompt_len - 2 * (k + 1))
+    inp = ARNodeInputs(input_ids=torch.tensor([11]), input_seq_len=k + 1,
+                       kwargs={"emitted": count, "budget": budget, "ignore_eos": ignore_eos})
+    out = sub.unpack_packed_outputs(static_output={}, request_ids=["r"], real_seq_lens=[k + 1], inputs=[inp],
+                                    per_request_info={"r": info})["r"]
+    want = _main_cut(target, accepted, budget, count, sub.config.eos_token_ids, ignore_eos)
+    assert out["new_token"][0].tolist() == want
+    assert out["count"][0].tolist() == [count + len(want), want[-1], budget, ignore_eos]
+    stops = sub.check_stop("r", info, out)
+    assert bool(stops) == (count + len(want) >= budget or (not ignore_eos and want[-1] == eos))
+
+
+def test_a_speculated_step_takes_the_count_its_verify_step_unpacked():
+    """Under async scheduling step N+1 is built before N's outputs reach the conductor, and `thread_outputs` hands
+    it N's outputs on the edges the runtime says the decode loop consumes. A row missing one of them leaves the
+    speculated step."""
+    k = 3
+    consumed = walk_runtime(_model(mtp_num_draft_tokens=k).get_graph_walk_graphs()).get_consumed_edges(
+        "LLM", "LLM", "decode")
+    sub = _submodule(k)
+    sub._mailboxes = {None: (torch.tensor([[11, 12, 13, 14, 2]]), torch.ones(1, dtype=torch.long))}
+    sub._verdicts = None, {"r": 0}
+    inp = ARNodeInputs(input_ids=torch.tensor([11]), input_seq_len=k + 1,
+                       kwargs={"emitted": 5, "budget": 64, "ignore_eos": True})
+    # the forward's next input, then what the engine's unpack adds
+    outputs = {"r": {"text_inputs": [torch.tensor([13])]}}
+    outputs["r"].update(sub.unpack_packed_outputs(
+        static_output={}, request_ids=["r"], real_seq_lens=[k + 1], inputs=[inp],
+        per_request_info={"r": _info("decode", 64, 5)},
+    )["r"])
+    spec = Speculation(
+        scheduled_batch=ScheduledBatch(node_name="LLM", graph_walk="decode", request_to_worker_graph={"r": "wg"}),
+        node_batch=ExecutingBatch(
+            node_name="LLM", per_request_input_tensors={"r": {}}, per_request_info={"r": object()},
+            per_request_input_metadata={"r": None}, final_stream_rids={"r"}, partition_done_rids={"r"},
+            step_context=StepContext(request_ids=("r",), graph_walk="decode", slot=0, capture=False),
+        ),
+        consumed_edges=consumed, continuing_rids={"r"}, partition="default", is_new_iter=True, is_same_node=True,
+        consumed_streaming_edges={},
+    )
+    make_worker().speculator.thread_outputs(spec, outputs)
+    assert spec.continuing_rids == {"r"}, "the verify step's row would leave the speculated step"
+    threaded = spec.node_batch.per_request_input_tensors["r"]
+    assert [int(t[0]) for t in threaded.get("count", [])] == [5 + 3], "the speculated step would cut by a stale count"
+
+
+@pytest.mark.parametrize("room", [0, 1, 2])
+def test_an_mtp_prefill_at_the_context_limit_stops_after_its_token(room):
+    """``main`` clamped the budget in the prefill's preprocess and stopped the prefill row at a budget of 1."""
+    k = 3
+    sub = _submodule(k)
+    prompt_len = sub._context_limit() - 2 * (k + 1) - room
+    info = _info("prefill", 64, prompt_len)
+    out = {"new_token": [torch.tensor([42])], **sub.unpack_packed_outputs(
+        static_output={}, request_ids=["r"], real_seq_lens=[prompt_len], inputs=[], per_request_info={"r": info},
+    )["r"]}
+    assert out["count"][0].tolist() == [1, -1, room, True], "the prefill reads the budget once for the request"
+    assert sub.check_stop("r", info, out) == ({END_PARTITION} if room <= 1 else set())
+
+
+class _Reads(dict):
+    """A request's outputs that note each name read, where the worker's host row copies each name read."""
+
+    def __init__(self, outputs):
+        super().__init__(outputs)
+        self.read = []
+
+    def __getitem__(self, name):
+        self.read.append(name)
+        return super().__getitem__(name)
+
+
+def _verify_step(rows: int, emitted: int = 5) -> tuple[Glm52LLMSubmodule, dict]:
+    """A k=3 verify step's unpacked outputs for ``rows`` requests, where row i accepted ``i % 4`` drafts. Each
+    request's info holds its walk and nothing else."""
+    k = 3
+    sub = _submodule(k)
+    rids = [f"r{i}" for i in range(rows)]
+    verdicts = torch.tensor([[11, 12, 13, 14, i % 4] for i in range(rows)])
+    sub._mailboxes = {None: (verdicts, torch.ones(1, dtype=torch.long))}
+    sub._verdicts = None, {rid: i for i, rid in enumerate(rids)}
+    inp = ARNodeInputs(input_ids=torch.tensor([11]), input_seq_len=k + 1,
+                       kwargs={"emitted": emitted, "budget": 64, "ignore_eos": True})
+    return sub, sub.unpack_packed_outputs(
+        static_output={}, request_ids=rids, real_seq_lens=[k + 1] * rows, inputs=[inp] * rows,
+        per_request_info={rid: SimpleNamespace(graph_walk="decode") for rid in rids},
+    )
+
+
+def test_a_verify_step_cuts_by_the_budget_its_count_edge_carries():
+    """A request's budget and ignore_eos hold for its whole life. Read through the request info for every row of
+    every step, on the GPU thread as the verdict lands, they cost a 32-row step a third of a millisecond."""
+    sub = _submodule(3)
+    sampling = SimpleNamespace(temperature=0, repetition_penalty=1)
+    info = SimpleNamespace(request_id="r", resource_configs={SAMPLER: sampling})
+    signals = {"text_inputs": [torch.tensor([7])], "count": [torch.tensor([5, 7, 6, 1])]}
+    row = sub.prepare_inputs("decode", info, signals)
+    assert row.kwargs == {"emitted": 5, "budget": 6, "ignore_eos": 1}
+    sub._mailboxes = {None: (torch.tensor([[11, 12, 13, 14, 3]]), torch.ones(1, dtype=torch.long))}
+    sub._verdicts = None, {"r": 0}
+    out = sub.unpack_packed_outputs(static_output={}, request_ids=["r"], real_seq_lens=[4], inputs=[row],
+                                    per_request_info={"r": SimpleNamespace(graph_walk="decode")})["r"]
+    assert (out["new_token"][0].tolist(), out["count"][0].tolist()) == ([11], [6, 11, 6, 1]), (
+        "the step would cut by a budget other than the one the prefill read"
+    )
+
+
+def test_a_32_row_verify_step_builds_one_tensor_of_tokens_and_one_of_counts():
+    """A tensor per row for each output is 64 host tensors built on the GPU thread every step."""
+    _, out = _verify_step(32)
+    for i, row in enumerate(out.values()):
+        want = [11, 12, 13, 14][:i % 4 + 1]
+        assert (row["new_token"][0].tolist(), row["count"][0].tolist()) == (want, [5 + len(want), want[-1], 64, 1])
+    for name in ("new_token", "count"):
+        assert len({row[name][0].untyped_storage().data_ptr() for row in out.values()}) == 1, (
+            f"each row's {name} is a tensor of its own"
+        )
+
+
+def test_a_verify_step_s_stop_check_reads_one_output():
+    """The worker hands `check_stop` a row that copies an output to the host when its name is first read. A second
+    name is a second copy a step and a second lookup a row, on the worker's main thread."""
+    sub, out = _verify_step(1)
+    row = _Reads(out["r0"])
+    assert sub.check_stop("r0", _info("decode", 64, 5), row) == set()
+    assert row.read == ["count"], "the stop check reads a second output for every row of every step"
+    sub, out = _verify_step(1, emitted=63)
+    assert sub.check_stop("r0", _info("decode", 64, 5), out["r0"]), "a row that reached its budget keeps running"
+
+
+def test_a_captured_and_padded_prefill_reads_no_prompt_length():
+    """A capture's and a padded replay's dummy rows carry no step metadata, and preprocess reads none."""
+    sub = _submodule(3)
+    sub.get_device = lambda: torch.device("cpu")
+    sub.kv = SimpleNamespace(positions=SimpleNamespace(position=lambda rid, label: 0))
+    engine_inputs = SimpleNamespace(request_ids=["pad0", "pad1"], per_request_info={
+        "pad0": SimpleNamespace(step_metadata={}), "pad1": SimpleNamespace(step_metadata={})})
+    inputs = [ARNodeInputs(input_ids=torch.zeros(4, dtype=torch.long), input_seq_len=4) for _ in range(2)]
+    assert sub.preprocess("prefill", engine_inputs, inputs)["input_ids"].shape == (8,)
+
+
+@pytest.mark.parametrize("k", [0, 3])
+def test_only_a_decode_step_is_input_free(k):
+    """Under async scheduling the pre-plan declares and admits each decode step over the capture's template rows. The
+    GPU thread runs that step when the model says the step reads nothing else, rather than declaring and admitting it
+    again before the launch."""
+    sub = _submodule(k)
+    template = ARNodeInputs(input_ids=torch.zeros(1, dtype=torch.long), input_seq_len=k + 1)
+    row = ARNodeInputs(input_ids=torch.tensor([7]), input_seq_len=k + 1,
+                       kwargs={"emitted": 5, "budget": 64, "ignore_eos": True})
+    declared, real = (sub.declare_step("decode", ["a", "b"], [one, one]) for one in (template, row))
+    assert (declared.segments, declared.state) == (real.segments, real.state)
+    assert sub.step_is_input_free("decode") and not sub.step_is_input_free("prefill"), (
+        "the GPU thread would declare and admit every decode step again before its launch"
+    )
+
+
+@pytest.mark.parametrize("k", [0, 3])
+def test_a_decode_row_from_prepare_inputs_has_the_template_row_s_span(k):
+    """The engine runs the step a pre-plan declared over the capture's template rows on the model's word that every
+    real decode row has the template's span. Without MTP the span is the number of ids the row is fed, so a decode
+    row fed two would run a step declared and admitted for one, and nothing would refuse it."""
+    sub = _submodule(k)
+    template = sub.get_accelerator_graph_configs(torch.device("cpu"))[0].single_request_inputs
+    info = _info("decode", 16, 5)
+    info.resource_configs[SAMPLER].temperature, info.resource_configs[SAMPLER].repetition_penalty = 0, 1
+    signals = {"text_inputs": [torch.tensor([7])], "count": [torch.tensor([5, 7, 16, 1])]}
+    row = sub.prepare_inputs("decode", info, signals)
+    declared, real = (sub.declare_step("decode", ["a"], [one]) for one in (template, row))
+    assert (declared.segments, declared.state) == (real.segments, real.state), (
+        "the pre-plan's step is not the one the forward would declare for this row"
+    )
+    with pytest.raises(RuntimeError, match="a decode row of 2 ids"):
+        sub.prepare_inputs("decode", info, {**signals, "text_inputs": [torch.tensor([7, 8])]})
+
+
+def _reduced(monkeypatch, **fields) -> None:
+    """``config_variant: reduced`` building a config with ``fields`` set."""
+    cfg = Glm52ModelConfig.reduced()
+    for name, value in fields.items():
+        setattr(cfg, name, value)
+    monkeypatch.setattr(Glm52ModelConfig, "reduced", staticmethod(lambda: cfg))
+
+
+def test_glm52_refuses_an_indexer_that_rotates_its_own_way(monkeypatch):
+    """The index keys rotate through the latent array's Rope, which holds the MLA's pairing."""
+    _reduced(monkeypatch, mla_absorb=True, indexer_rope_interleave=not Glm52ModelConfig.reduced().rope_interleave)
+    with pytest.raises(ValueError, match="indexer rotates as its MLA does"):
+        Glm52Model(model_path_hf="", config_variant="reduced", tokenizer_mode="byte", dsa_long_context=True)
+
+
+def test_glm52_without_long_context_loads_whatever_its_indexer_pairing(monkeypatch):
+    """Only dsa_long_context builds an indexer, so without it the indexer's pairing refuses nothing."""
+    _reduced(monkeypatch, indexer_rope_interleave=not Glm52ModelConfig.reduced().rope_interleave)
+    model = Glm52Model(model_path_hf="", config_variant="reduced", tokenizer_mode="byte")
+    assert model.config.indexer_rope_interleave != model.config.rope_interleave, (
+        "a config that builds no indexer would be refused for the pairing its indexer would rotate by"
+    )
+
+
+def test_glm52_refuses_dsa_whose_first_layer_reuses_a_pick(monkeypatch):
+    """A SHARED layer attends the pick of the FULL layer before it, and a SHARED layer 0 has none."""
+    from mstar.model.glm52.components.indexer import is_full_indexer_layer
+
+    _reduced(monkeypatch, mla_absorb=True, index_skip_topk_offset=0, index_topk_freq=2)
+    assert not is_full_indexer_layer(Glm52ModelConfig.reduced(), 0)
+    with pytest.raises(ValueError, match="layer 0 to be a FULL indexer layer"):
+        Glm52Model(model_path_hf="", config_variant="reduced", tokenizer_mode="byte", dsa_long_context=True)

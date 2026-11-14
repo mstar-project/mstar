@@ -9,7 +9,8 @@ import pytest
 from mstar.conductor.conductor import Conductor
 from mstar.engine.resources import SamplerSpec, SamplingReqConfig
 from mstar.engine.resources.sampler.config import BOOL_KNOBS, INT_KNOB_RULES, REAL_KNOB_RULES
-from mstar.model.glm52.config import SAMPLER_RESOURCE
+from mstar.engine.state.adapters import node_resources, sampling_configs
+from mstar.model.glm52.config import SAMPLER
 from mstar.model.glm52.glm52_model import SAMPLING_KEYS, Glm52Model, generation_config_dir
 
 # zai-org/GLM-5.2(-FP8)'s generation_config.json, as published
@@ -53,8 +54,8 @@ def _intake(model: Glm52Model, kwargs: dict) -> int:
 ])
 def test_a_null_kwarg_is_unset(kwargs):
     m = _model()
-    sampling = m.get_request_resource_configs([], [], kwargs)[SAMPLER_RESOURCE]
-    default = m.get_request_resource_configs([], [], {})[SAMPLER_RESOURCE]
+    sampling = m.get_request_resource_configs([], [], kwargs)[SAMPLER]
+    default = m.get_request_resource_configs([], [], {})[SAMPLER]
     assert sampling == default
     assert _intake(m, kwargs) == _intake(m, {}) == m.get_max_output_tokens()
     out = m.process_prompt("Hi", ["text"], ["text"], **kwargs)
@@ -71,7 +72,7 @@ def test_a_sampler_knob_is_honored_or_refused(knob):
         _intake(m, {knob: value})
     except ValueError:
         return
-    assert getattr(m.get_request_resource_configs([], [], {knob: value})[SAMPLER_RESOURCE], knob) == value
+    assert getattr(m.get_request_resource_configs([], [], {knob: value})[SAMPLER], knob) == value
 
 
 @pytest.mark.parametrize("kwargs", [
@@ -105,7 +106,7 @@ def test_return_logprobs_is_refused_where_the_sampler_never_sees_it():
 
 
 def _spec(m: Glm52Model) -> SamplerSpec:
-    [spec] = [s for s in m.get_node_resources() if isinstance(s, SamplerSpec)]
+    [spec] = [s for s in node_resources(m) if isinstance(s, SamplerSpec)]
     return spec
 
 
@@ -127,12 +128,12 @@ def test_request_kwargs_are_the_keys_it_reads():
 
 
 def test_without_a_generation_config_the_published_recipe_applies():
-    cfg = _model().get_request_resource_configs([], [], {})[SAMPLER_RESOURCE]
+    cfg = _model().get_request_resource_configs([], [], {})[SAMPLER]
     assert (cfg.temperature, cfg.top_p, cfg.top_k, cfg.min_p, cfg.repetition_penalty) == (1.0, 0.95, 0, 0, 1)
     # built without __init__, as other tests do
     bare = object.__new__(Glm52Model)
     bare.config = _model().config
-    assert bare.get_request_resource_configs([], [], {})[SAMPLER_RESOURCE] == cfg
+    assert bare.get_request_resource_configs([], [], {})[SAMPLER] == cfg
 
 
 def test_the_checkpoint_generation_config_sets_the_defaults(tmp_path):
@@ -141,11 +142,11 @@ def test_the_checkpoint_generation_config_sets_the_defaults(tmp_path):
     (tmp_path / "generation_config.json").write_text(json.dumps(
         {**PUBLISHED, "top_k": 40, "min_p": 0.05, "repetition_penalty": 1.1, "max_new_tokens": 9}))
     m = _model(checkpoint_path=str(tmp_path))
-    cfg = m.get_request_resource_configs([], [], {})[SAMPLER_RESOURCE]
+    cfg = m.get_request_resource_configs([], [], {})[SAMPLER]
     assert (cfg.temperature, cfg.top_p, cfg.top_k, cfg.min_p, cfg.repetition_penalty) == (1.0, 0.95, 40, 0.05, 1.1)
     # a checkpoint min_p turns the filter on, so its own default is not refused
     assert _spec(m).enable_min_p
-    cfg.validate(_spec(m))
+    sampling_configs({SAMPLER: cfg}, m.declare_state())[SAMPLER].validate(_spec(m))
     # the length is the window's, not the file's
     assert m.get_max_output_tokens() == m.context_limit()
     (tmp_path / "generation_config.json").write_text(json.dumps({**PUBLISHED, "do_sample": False}))
@@ -168,7 +169,7 @@ def test_every_knob_reaches_the_sampler():
     sent = {"temperature": 0.3, "top_p": 0.5, "top_k": 7, "min_p": 0.1,
             "repetition_penalty": 1.2, "penalize_prompt": False, "ignore_eos": True}
     assert set(sent) == set(SAMPLING_KEYS)
-    cfg = _model().get_request_resource_configs([], [], sent)[SAMPLER_RESOURCE]
+    cfg = _model().get_request_resource_configs([], [], sent)[SAMPLER]
     assert {k: getattr(cfg, k) for k in sent} == sent
 
 
@@ -209,4 +210,4 @@ def test_mtp_refuses_sampling_it_cannot_serve_in_process_prompt(kwargs):
 def test_mtp_serves_greedy(kwargs):
     m = _model(mtp_num_draft_tokens=2)
     assert m.process_prompt("Hi", ["text"], ["text"], **kwargs).new_input_tensors["text_inputs"][0].numel() == 2
-    assert m.get_request_resource_configs([], [], kwargs)[SAMPLER_RESOURCE].temperature == 0
+    assert m.get_request_resource_configs([], [], kwargs)[SAMPLER].temperature == 0

@@ -3,6 +3,7 @@
 has ownership of per-(request,label) position counter"""
 
 import dataclasses
+import threading
 from collections.abc import Sequence
 from dataclasses import dataclass, field, fields
 from typing import TYPE_CHECKING
@@ -41,6 +42,7 @@ from mstar.engine.resources.step import ADMIT_OK, AdmitOutcome, StepContext
 _TABLE_IDS = "#longrope"
 
 if TYPE_CHECKING:
+    from mstar.engine.resources.kv.manager import Correction
     from mstar.engine.resources.resident import (
         CapturedResidentStep,
         ResidentPlanner,
@@ -185,6 +187,11 @@ class RopeManager(PositionManager):
 
         # rid -> label -> next pos of stream
         self._counters: dict[str, dict[str, int]] = {}
+        # rid -> label -> a verify step's correction of the counter, which waits for the next admit or position read.
+        # `admit` runs on the plan thread and `position` in model code, so the lock keeps a correction from applying
+        # twice.
+        self._deferred: dict[str, Correction] = {}
+        self._lock = threading.Lock()
 
         self._static_pos_ids: dict[CGSlotKey, torch.Tensor] = {}
         # Host side of the same addressing, keyed the same way; see
@@ -253,9 +260,11 @@ class RopeManager(PositionManager):
 
     def remove_request(self, rid: str):
         self._counters.pop(rid, None)
+        self._deferred.pop(rid, None)
 
     def reset_request(self, rid: str, free: bool=False):
         self._counters[rid].clear()
+        self._deferred.pop(rid, None)
 
     supports_drop = True
 
@@ -269,6 +278,29 @@ class RopeManager(PositionManager):
         length after a speculative verify step."""
         counters = self._counters.setdefault(rid, {})
         counters[label] = max(0, counters.get(label, 0) + delta)
+
+    def defer_correct_len(self, correction: "Correction") -> None:
+        """Move each of the correction's counters through `correct_len` at the next `admit` or `position`, as
+        `KVManager.defer_correct_len` moves the streams' KV."""
+        with self._lock:
+            for rid in correction.rids:
+                assert rid not in self._deferred, f"a second correction of {rid} before the first applied"
+                self._deferred[rid] = correction
+
+    def _apply_deferred(self, rids: Sequence[str] | None = None) -> None:
+        """Apply the held corrections of ``rids``, or every one, as `KVManager._apply_deferred` does."""
+        with self._lock:
+            for rid in list(self._deferred) if rids is None else rids:
+                correction = self._deferred.get(rid)
+                if correction is not None:
+                    delta = correction.delta(rid)
+                    del self._deferred[rid]
+                    self.correct_len(rid, correction.label, delta)
+
+    def admit(self, step: PositionStep, ctx: StepContext) -> AdmitOutcome:
+        if self._deferred:
+            self._apply_deferred()
+        return super().admit(step, ctx)
 
     def apply_cached_prefix(
         self, rid: str, node_name: str, graph_walk: str, inputs,
@@ -644,6 +676,8 @@ class RopeManager(PositionManager):
 
     def position(self, rid: str, label: str) -> int:
         # by the worker's handle (AGENTS.md invariant 14): the wire id raises
+        if self._deferred:
+            self._apply_deferred((rid,))
         return self._counters[rid].get(label, 0)
 
     def pos_ids(self, label: str) -> torch.Tensor | None:

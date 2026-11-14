@@ -720,13 +720,18 @@ share one namespace. Existing models define them as module-level constants in ``
 deployment YAML tunes them under ``resources:`` (see :ref:`Step 6 <config-yaml>`).
 
 - ``Array(name, nodes=, layers=, entry=, max_len=, reads=, updates=, rewritable=, labels=,
-  positions=)``. ``nodes`` lists who may touch the array, and ``layers`` holds the model's
+  positions=, verify_span=)``. ``nodes`` lists who may touch the array, and ``layers`` holds the model's
   own layer ids. Layer sets of different arrays may overlap. ``labels`` names the streams a
   request may open, ``{"main"}`` by default.
+  ``verify_span``, 1 by default, is the most entries one verify step adds per row (see
+  ``ArrayStep``).
 - ``Entry({field: TensorType(shape, dtype=, shard=)})``: what one entry holds. Shapes are
   global, before sharding. ``dtype=None`` is the engine's compute dtype, and ``shard`` is
   the axis split across TP ranks, ``None`` when every GPU holds all of it.
   ``KVEntry(heads=, head_dim=)`` builds an entry of ``k`` and ``v`` sharded on their heads.
+  ``LatentEntry(rank=, rope_dim=)`` builds an MLA latent: ``ckv`` of ``rank`` and, with
+  ``rope_dim`` above 0, the decoupled RoPE key ``kpe``, neither sharded, since every query head
+  reads both.
   A paged array's pool is held in the model's ``get_autocast_dtype``. A model that runs
   without the engine's autocast returns its K/V dtype there and sets ``disable_autocast`` on
   each node, as Waypoint and LingBot-World do.
@@ -763,6 +768,15 @@ deployment YAML tunes them under ``resources:`` (see :ref:`Step 6 <config-yaml>`
   step, on such a walk fails the request.
   ``Attend(q_heads=)`` is attention with the model's query heads, a multiple of
   the entry's heads.
+  ``LatentAttend(q_heads=, scale=)`` is absorbed MLA over a ``LatentEntry``. The model folds
+  the key up-projection into ``q``, passes each head's RoPE part as ``q_pe``, and applies the
+  value up-projection to what the read returns. ``scale`` is the original query-key head dim's,
+  which the absorbed width doesn't give. ``TopK(count=, heads=)`` is DSA's indexer over an
+  entry of one unsharded ``k``: the read takes the indexer's ``q`` and ``weights`` and returns
+  each query's ``count`` best positions. ``Selected(of=)`` sees only the positions passed as
+  ``selected``, which the ``TopK`` read of array ``of`` picked, and with ``selected=None`` what
+  ``Causal()`` sees. The two arrays hold an entry at the same positions, so analysis refuses
+  them with different ``verify_span``.
 - ``Value(name, nodes=, layers=, entry=, updates=)``: a rewritable array of one entry, such
   as a recurrent state. ``updates`` names the kernels that read and write one of its fields
   in place: ``CausalConv()`` needs a field ``conv`` of shape ``(channels, kernel - 1)``, and
@@ -1049,18 +1063,21 @@ The spec types are:
        (replicas included) or hand out
        ``write_slots`` yet either; each of these is refused.
    * - ``DSASpec(config=DSAConfig(kv_cache=..., topk=...))``
-     - DeepSeek sparse attention (DSA) over the named ``KVLayout.MLA`` cache. A step
-       declares ``DSAStep()``, and the resource takes each request's rows from the KV plan.
-       The model's indexer layers store their index keys (``store_keys``) and pick each
-       query's top ``topk`` positions by the indexer's score (``select``); a layer that
-       reuses an earlier layer's pick reads it with ``shared_selection``. ``attend`` runs
-       absorbed MLA over just the picked latents. The keys sit in per-request buffers
-       outside the paged pool and the selection runs per request on the host, so the
-       resource is eager only, a prompt must fit in ``topk`` and past ``topk`` a request
-       decodes one row per step. Once one row of a batch passes ``topk``, every row of it
-       attends its pick. GLM-5.2 declares it under ``dsa_long_context``. Planned: the keys
-       move onto the MLA cache's pages under its page table, so the allocator, eviction and
-       prefix caching cover them, and selection gets fixed-shape buffers so decode captures.
+     - DeepSeek sparse attention (DSA) over the named ``KVLayout.MLA`` cache. A step declares
+       ``DSAStep()``, and the resource takes each request's rows from the KV plan. The
+       model's indexer layers store their index keys (``store_keys``) and pick each query's
+       top ``topk`` positions by the indexer's score (``select``); a layer that reuses an
+       earlier layer's pick takes the last full pick, which the model carries. ``attend``
+       runs absorbed MLA over just the picked latents. The keys sit in per-request buffers
+       outside the paged pool and the selection runs per request on the host, so the resource
+       can't capture: the runner drops each graph config whose step reaches it and logs the
+       drop at error. A prompt must fit in ``topk`` and past ``topk`` a request decodes one
+       row per step. Once one row of a batch passes ``topk``, every row of it attends its
+       pick. On the state contract the engine builds it for a key ``Array`` with a ``TopK``
+       read that a latent ``Array``'s ``Selected(of=)`` mask names, as GLM-5.2 declares under
+       ``dsa_long_context``. Planned: the keys move onto the MLA cache's pages under its page
+       table, so the allocator, eviction and prefix caching cover them, and selection gets
+       fixed-shape buffers so decode captures.
    * - ``CrossAttentionSpec(config=CrossAttentionConfig(...))``
      - Attention over a paged context that is written once and never extended.
        ``backend`` defaults to ``AttnBackend.AUTO``. Only FlashInfer is implemented.
@@ -1256,8 +1273,9 @@ The rows below name specs where a declaration doesn't reach them yet.
        ``Bidirectional()`` read whose ``queries`` names the first; see `Cross-attention
        (encoder-decoder models)`_.
    * - An LLM with DeepSeek sparse attention (GLM-5.2)
-     - The specs above over an MLA cache (``KVLayout.MLA``, ``AttnBackend.FLASHINFER_MLA``),
-       plus a ``DSASpec`` over the same cache.
+     - An ``Array`` with a ``LatentEntry``, ``Positions`` and a ``LatentAttend`` read. Under
+       DSA its mask is ``Selected(of=...)``, naming a key ``Array`` of ``k`` with a ``TopK``
+       read. With MTP, ``verify_span`` is ``k + 1`` and a ``Value`` carries the draft's seed.
    * - A node that carries per-request state between steps of a loop (an RNN-T
        decoder, recurrent attention)
      - A ``Value`` with tensor fields, read and written whole, and for a linear-attention
@@ -2258,12 +2276,18 @@ step does to each array and sampler it touches. The engine expands ``state`` int
   branches through one attention call. Every ``ResourceStep`` gets the mapping, so the KV
   plan and a sequence shard read the same grouping; positions take their packing from the
   KV plan, and ``PositionStep`` keys its ``pos_ids`` by the combined label.
-- ``ArrayStep(segments=, keep=, forks=, placeholders=, eager_add=, fixed_layout=, advance=, position_ids=)``.
+- ``ArrayStep(segments=, keep=, forks=, placeholders=, eager_add=, fixed_layout=, advance=, position_ids=, verify=)``.
   A step lists every array it touches, and a call on one it doesn't list raises. ``segments``
   gives one array its own spans, ``None`` being the step's. ``keep=False`` makes every add
   this step scratch. ``advance`` moves each row's position counter by something other than
   its span, for a prompt whose grid covers fewer positions than tokens, and ``position_ids``
   passes explicit ids.
+  ``verify=True`` makes each row's adds a verify block of 1 to ``verify_span`` entries, on one
+  label, kept, with no forks or placeholders. The forward calls ``settle(h, kept)`` once, and
+  row r keeps the first ``kept[r]`` entries of its block, the rest being as if never added. A
+  verify step that ends without a ``settle`` raises. The pool and the position counter apply
+  the counts at their next admit, or sooner where an offload, a drop or ``position()`` needs
+  them.
 - ``SampleStep(apply_penalty=, apply_filters=, prompt_tokens=, kept_rows=)``.
   ``prompt_tokens`` initializes the repetition-penalty mask with the prompt tokens. Only the
   prefill step passes them, because the sampler tracks every token it samples afterwards.
@@ -2421,6 +2445,9 @@ The rest are free functions in ``mstar.engine.state``:
    p    = position(self.kv, fwd_info.rid_handle, label)                    # a request's next position, on the host
    ids  = positions(self.kv)                  # this step's ids, on the device
    q, k = rope(self.kv, q, k)                 # rotate at this step's ids with the declared Rope
+   q, _ = rope(self.kv, q, None, at=ids)      # rotate q alone, at ids the model passes
+   needed = selects(self.index)               # whether some row reaches more than TopK picks
+   settle(self.kv, kept)                      # end a verify step: row r keeps kept[r] adds
    tokens = sample(self.sampler, logits)      # one token per row, each a fresh draw
    last = at_last_token(self.kv, hidden)      # each row's last token in this step
    ids  = last_sampled(self.sampler)          # each row's last sampled token, for a DeviceLoopback
@@ -2468,6 +2495,13 @@ attend its own ``k`` and ``v`` (a context-parallel pool's multi-token step) runs
 ``target`` says where this step's entries go on the layer. A conformance test holds each kernel to
 its reference on each listed format, what it returns included, and ``MSTAR_KV_DEBUG_ASSERTS=1``
 checks that an eager call writes nothing outside the step's slots.
+
+A latent array's state op takes ``PagedLatent`` and writes at a ``PagedLatentTarget``: the layer's
+pages of ``rank + rope_dim`` and, with ``rope_table=True``, the cos and sin rows of the step's
+positions. The handle takes that format only where the array's ``Rope`` declares a ``table_dtype``
+and interleaves, and the reference runs otherwise. GLM-5.2's ``mla_prep_attend``
+(``mstar/model/components/mla.py``) normalizes, rotates and writes its latents in one launch this
+way.
 
 Between steps, a model may keep a memo of a pure function of request inputs, whose loss costs time
 and changes no output, and scratch buffers that it makes at load and that no step reads before

@@ -17,15 +17,15 @@ sys.path.insert(0, ".")
 import pytest
 
 from mstar.engine import state
-from mstar.engine.state.adapters import PagedArrayHandle, RingHandle, ValueHandle, WithinStepHandle
+from mstar.engine.state.adapters import LatentHandle, PagedArrayHandle, RingHandle, ValueHandle, WithinStepHandle
 from mstar.engine.state.calls import ArrayHandle
 
 # Today's types the surface re-exports, and a NamedTuple, whose fields stay positional.
-_POSITIONAL = {"PagedNHDTarget", "Segment", "SlotLease", "Span"}
+_POSITIONAL = {"PagedLatentTarget", "PagedNHDTarget", "Segment", "SlotLease", "Span"}
 # The calls take the handle first, then what every call names, and only then keywords.
 _CALLS = {
     "add_read", "at_last_token", "causal_conv", "gated_delta_net", "gather", "host", "last_sampled", "position",
-    "positions", "rope", "sample", "scatter", "split_range",
+    "positions", "rope", "sample", "scatter", "settle", "split_range",
 }
 # Each public name's parameters as ``[name, kind, default]``. A dataclass's parameters are its fields.
 SNAPSHOT = {
@@ -40,6 +40,7 @@ SNAPSHOT = {
         ["rewritable", "KEYWORD_ONLY", 'False'],
         ["labels", "KEYWORD_ONLY", "frozenset({'main'})"],
         ["positions", "KEYWORD_ONLY", 'None'],
+        ["verify_span", "KEYWORD_ONLY", '1'],
     ],
     "ArrayStep": [
         ["segments", "KEYWORD_ONLY", 'None'],
@@ -51,6 +52,7 @@ SNAPSHOT = {
         ["advance", "KEYWORD_ONLY", 'None'],
         ["position_ids", "KEYWORD_ONLY", 'None'],
         ["host", "KEYWORD_ONLY", '{}'],
+        ["verify", "KEYWORD_ONLY", 'False'],
     ],
     "Attend": [
         ["q_heads", "POSITIONAL_OR_KEYWORD", None],
@@ -90,11 +92,35 @@ SNAPSHOT = {
         ["sink", "POSITIONAL_OR_KEYWORD", None],
         ["window", "KEYWORD_ONLY", None],
     ],
+    "LatentAttend": [
+        ["q_heads", "POSITIONAL_OR_KEYWORD", None],
+        ["scale", "KEYWORD_ONLY", None],
+    ],
+    "LatentEntry": [
+        ["rank", "KEYWORD_ONLY", None],
+        ["rope_dim", "KEYWORD_ONLY", None],
+    ],
     "Layout": [
         ["spans", "KEYWORD_ONLY", '()'],
         ["growth", "KEYWORD_ONLY", '()'],
         ["scratch", "KEYWORD_ONLY", '0'],
         ["kept_windows", "KEYWORD_ONLY", '{}'],
+    ],
+    "PagedFormat": [
+        ["dtypes", "KEYWORD_ONLY", 'None'],
+        ["devices", "KEYWORD_ONLY", 'None'],
+    ],
+    "PagedLatent": [
+        ["dtypes", "KEYWORD_ONLY", 'None'],
+        ["devices", "KEYWORD_ONLY", 'None'],
+        ["rope_table", "KEYWORD_ONLY", 'False'],
+    ],
+    "PagedLatentTarget": [
+        ["cache", "POSITIONAL_OR_KEYWORD", None],
+        ["page_of_token", "POSITIONAL_OR_KEYWORD", None],
+        ["slot_of_token", "POSITIONAL_OR_KEYWORD", None],
+        ["count", "POSITIONAL_OR_KEYWORD", None],
+        ["rope_table", "POSITIONAL_OR_KEYWORD", None],
     ],
     "PagedNHD": [
         ["dtypes", "KEYWORD_ONLY", 'None'],
@@ -168,6 +194,9 @@ SNAPSHOT = {
         ["label", "POSITIONAL_OR_KEYWORD", None],
         ["span", "POSITIONAL_OR_KEYWORD", None],
     ],
+    "Selected": [
+        ["of", "POSITIONAL_OR_KEYWORD", None],
+    ],
     "SeqShard": [
         ["name", "POSITIONAL_OR_KEYWORD", None],
         ["nodes", "KEYWORD_ONLY", None],
@@ -193,6 +222,10 @@ SNAPSHOT = {
         ["shape", "POSITIONAL_OR_KEYWORD", None],
         ["dtype", "KEYWORD_ONLY", None],
         ["shard", "KEYWORD_ONLY", 'None'],
+    ],
+    "TopK": [
+        ["count", "POSITIONAL_OR_KEYWORD", None],
+        ["heads", "KEYWORD_ONLY", None],
     ],
     "Value": [
         ["name", "POSITIONAL_OR_KEYWORD", None],
@@ -260,6 +293,7 @@ SNAPSHOT = {
         ["h", "POSITIONAL_OR_KEYWORD", None],
         ["q", "POSITIONAL_OR_KEYWORD", None],
         ["k", "POSITIONAL_OR_KEYWORD", None],
+        ["at", "KEYWORD_ONLY", "None"],
     ],
     "state_op": [
         ["adds", "KEYWORD_ONLY", "()"],
@@ -277,6 +311,13 @@ SNAPSHOT = {
         ["h", "POSITIONAL_OR_KEYWORD", None],
         ["xs", "VAR_POSITIONAL", None],
         ["dim", "KEYWORD_ONLY", "None"],
+    ],
+    "selects": [
+        ["h", "POSITIONAL_OR_KEYWORD", None],
+    ],
+    "settle": [
+        ["h", "POSITIONAL_OR_KEYWORD", None],
+        ["kept", "POSITIONAL_OR_KEYWORD", None],
     ],
     "split_range": [
         ["h", "POSITIONAL_OR_KEYWORD", None],
@@ -331,7 +372,9 @@ def test_the_surface_equals_the_snapshot():
     assert _surface() == SNAPSHOT, "an addition updates SNAPSHOT, and a change in meaning comes as a new name"
 
 
-@pytest.mark.parametrize("handle", [ArrayHandle, PagedArrayHandle, ValueHandle, WithinStepHandle, RingHandle])
+@pytest.mark.parametrize(
+    "handle", [ArrayHandle, PagedArrayHandle, ValueHandle, WithinStepHandle, RingHandle, LatentHandle],
+)
 def test_a_handles_calls_equal_the_snapshot(handle):
     surface = {
         name: [[p.name, p.kind.name, _default(p)] for p in inspect.signature(getattr(handle, name)).parameters.values()]

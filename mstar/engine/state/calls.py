@@ -40,6 +40,28 @@ def pool_layers(array: Array) -> dict[int, int]:
     return {layer: i for i, layer in enumerate(sorted(array.layers))}
 
 
+class VerifyRun:
+    """What runs an array's verify steps, which the handle opens and closes with each step. This base is the run of an
+    array whose storage binds no verify entry, and it refuses a verify step and `settle`."""
+
+    def __init__(self, handle: "ArrayHandle"):
+        self.handle = handle
+
+    def begin(self, declared: ArrayStep, segments: Sequence[Segment], ctx) -> None:
+        """Refuse what ``declared`` asks of a verify step that this run can't settle, replays aside."""
+        if declared.verify:
+            raise self.handle._refusal("a verify step, and the array declares no verify span")
+
+    def settle(self, kept: torch.Tensor) -> None:
+        raise self.handle._refusal("settle, and the array declares no verify span")
+
+    def end(self, ctx) -> None:
+        """Refuse a verify step whose calls didn't settle it, in an eager step or at capture."""
+
+    def commit(self, ctx) -> None:
+        """Hand the resources what a committed verify step kept."""
+
+
 class ArrayHandle(StepHandle):
     """The calls on one declared array. Each kind of storage has a handle that implements the calls it runs, and
     this class refuses the rest as having no layout yet.
@@ -69,6 +91,8 @@ class ArrayHandle(StepHandle):
         self.label = "main"
 
         self._pool_layer = pool_layers(array)
+        # replaced by the run of the array's verify entry, where its storage binds one
+        self.verify = VerifyRun(self)
 
         # This step's segments, and its calls, checked in eager steps and at capture.
         # `_held` is the k and v an add left for `_held_layer`'s read, on a kernel that takes them there.
@@ -119,12 +143,16 @@ class ArrayHandle(StepHandle):
         # before the replay's return, since a captured step's writes reach this on a replay
         if declared.host:
             self._check_host_writes(declared, step.ctx)
+        self.verify.begin(declared, self._segments, step.ctx)
         if step.ctx.replays:
             return
         self._check_step(declared, self._segments, step.ctx)
 
     def check_step(self, step) -> None:
-        if step.ctx.replays or not self._keep:
+        if step.ctx.replays:
+            return
+        self.verify.end(step.ctx)
+        if not self._keep:
             return
         only_scratch = self._scratch - self._kept
         if only_scratch:
@@ -135,7 +163,7 @@ class ArrayHandle(StepHandle):
                                 "adds on others, and every layer stays the same length")
 
     def commit_step(self, step) -> None:
-        """Nothing: the resources hold what a step keeps of the array."""
+        self.verify.commit(step.ctx)
 
     def end_step(self, step) -> None:
         self._open = False
@@ -269,6 +297,18 @@ class ArrayHandle(StepHandle):
         """Whether ``op``'s fused kernel writes this array itself, in place of its reference running the calls."""
         return False
 
+    def fused_target(self, layer: int) -> Any:
+        """Record ``layer``'s add, which a fused op makes, and give where its kernel writes the step's entries."""
+        raise self._unsupported("fused_target")
+
+    def _pages(self) -> torch.Tensor:
+        """The whole pool a fused op writes into, which the debug check and `conformance_problems` copy."""
+        raise self._unsupported("_pages")
+
+    def _slots(self, layer: int) -> tuple:
+        """An index of this step's slots on ``layer`` into any tensor shaped as `_pages`."""
+        raise self._unsupported("_slots")
+
     def _check_capture(self, walks: Collection[str]) -> None:
         """Raise if a capture replayed on ``walks`` would plan this array's reads differently on some of them."""
 
@@ -295,6 +335,9 @@ class ArrayHandle(StepHandle):
 
     def _host(self, request: int, label: str, layer: int) -> Mapping[str, object]:
         raise self._unsupported("host")
+
+    def _selects(self) -> bool:
+        raise self._unsupported("selects")
 
 
 class SamplerHandle(StepHandle):
@@ -461,10 +504,31 @@ def positions(h: ArrayHandle) -> torch.Tensor:
     return _positions(h).pos_ids(h.label)
 
 
-def rope(h: ArrayHandle, q: torch.Tensor, k: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """``q`` and ``k`` rotated at this step's positions with the declared `Rope`."""
+def rope(
+    h: ArrayHandle, q: torch.Tensor, k: torch.Tensor | None, *, at: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """``q`` and ``k`` rotated with the declared `Rope`, at this step's positions, or at ``at``, (tokens,) on the
+    device, for a pass that sits elsewhere. ``k`` None rotates ``q`` alone."""
     h._check_open("rope")
-    return _positions(h).apply_qk(q, k, label=h.label, rope_dtype=h.rope_dtype or q.dtype)
+    rope_dtype = h.rope_dtype or q.dtype
+    if at is None:
+        return _positions(h).apply_qk(q, k, label=h.label, rope_dtype=rope_dtype)
+    return _positions(h).apply_qk(q, k, label=h.label, rope_dtype=rope_dtype, pos_ids=at)
+
+
+def selects(h: ArrayHandle) -> bool:
+    """Whether some row of this step reaches more entries than ``h``'s `TopK` read picks, on the host. When none does,
+    each row's pick is its `Causal` reach, and the read can be skipped."""
+    h._check_open("selects")
+    return h._selects()
+
+
+@torch.compiler.disable
+def settle(h: ArrayHandle, kept: torch.Tensor) -> None:
+    """End this verify step's block on ``h``'s array: row r keeps the first ``kept[r]`` entries its adds wrote this
+    step, and the rest are as if never added. ``kept`` is (rows,) int on the device, padding rows included."""
+    h._check_open("settle")
+    h.verify.settle(kept)
 
 
 @torch.compiler.disable
