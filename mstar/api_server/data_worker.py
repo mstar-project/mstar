@@ -52,7 +52,7 @@ from mstar.engine.resources.kv.keys import PageItem, chain, end_key, fingerprint
 from mstar.engine.resources.lora.config import LORA_ADAPTER_KWARG, LORA_DIGEST_KWARG
 from mstar.engine.resources.position.config import MAX_POSITION_KWARG
 from mstar.engine.resources.spec import NodeResourceSpec
-from mstar.engine.state.adapters import kv_layouts
+from mstar.engine.state.adapters import CHUNK_CAUSAL_LAYOUT_KWARG, chunk_causal_layouts, kv_layouts
 from mstar.engine.state.contract import Array
 from mstar.model.base import (
     KEEP_ADAPTER,
@@ -1003,7 +1003,7 @@ class PreprocessWorkerThread:
         internal = getattr(self.model, "INTERNAL_KWARGS", ())
         for name in (
             "prefix_keys", "prefix_tail", "prefix_decode", "kv_layout", "state_layout", "keyed_spans", "prefix_root",
-            "stream_lead_items", "open_streams", MAX_POSITION_KWARG, *internal,
+            "stream_lead_items", "open_streams", MAX_POSITION_KWARG, CHUNK_CAUSAL_LAYOUT_KWARG, *internal,
         ):
             model_kwargs.pop(name, None)
         open_streams = self._client_edges - input.ends
@@ -1036,6 +1036,10 @@ class PreprocessWorkerThread:
                 model_kwargs.pop("kv_layout", {}) if state_layout is None
                 else kv_layouts(self._declarations, state_layout, keyed_spans)
             )
+            if state_layout is not None:
+                chunk_layout = chunk_causal_layouts(self._declarations, state_layout)
+                if chunk_layout:
+                    model_kwargs[CHUNK_CAUSAL_LAYOUT_KWARG] = chunk_layout
             num_prompt_tokens = self.model.prompt_tokens(tensors, layouts)
             rows = {
                 key: {label: layout.row() for label, layout in by_label.items()}
