@@ -271,7 +271,8 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
        across calls until close or idle expiry. Size each episode array's
        ``resources: <array>: max_slots`` for ``max_episodes`` times its label count,
        plus one sink slot. For example, 16 episodes with one label need
-       ``max_slots: 17``; the dense pool's own default is 2, so startup refuses
+       ``max_slots: 17``; the dense pool's own default is one per label plus
+       one sink slot (2 for one label), so startup refuses
        the default episode count until the resource override is set.
    * - ``unpausable_outputs``
      - *(optional)* The output modalities a pause would break, such as ``[audio]``. A request
