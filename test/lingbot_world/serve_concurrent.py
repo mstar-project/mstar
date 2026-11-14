@@ -1,7 +1,7 @@
 """Concurrent LingBot-World rollouts through the served path.
 
 Starts the API server on a LingBot config (``--max-concurrent`` sets its
-``max_concurrent_requests``, ``--max-num-pages`` its ``resources: dit_kv: max_num_pages``), streams each distinct
+``max_concurrent_requests``, ``--pool-tokens`` its ``resources: dit_kv: pool_tokens``), streams each distinct
 rollout alone, then all the sessions at once (``--sessions`` of the same rollout, or one per ``--session HxW:CHUNKS``,
 started ``--stagger`` seconds apart in that order), and checks:
 
@@ -23,7 +23,7 @@ so the cases below that pass ``--max-concurrent`` above 1 need that check lifted
     python test/lingbot_world/serve_concurrent.py --out /tmp/lingbot/conc1
     python test/lingbot_world/serve_concurrent.py --out /tmp/lingbot/conc2 --max-concurrent 2
     python test/lingbot_world/serve_concurrent.py --out /tmp/lingbot/pool --max-concurrent 2 \
-        --max-num-pages 217 --expect-waits 1
+        --pool-tokens 40000 --expect-waits 1
     python test/lingbot_world/serve_concurrent.py --out /tmp/lingbot/sizes --max-concurrent 3 \
         --session 480x832:4 --session 240x416:24 --session 576x1024:6 --stagger 1
 """
@@ -75,11 +75,10 @@ def parse_session(text: str) -> Session:
     return Session(int(height), int(width), int(chunks))
 
 
-def rollout_pages(image: str, session: Session) -> int:
-    """The pages of the dit's K/V pool the session's rollout holds, as the model counts them."""
+def rollout_tokens(image: str, session: Session) -> int:
+    """The tokens a layer of the dit's K/V pool the session's rollout holds, as the model counts them."""
     from PIL import Image
 
-    from mstar.engine.resources.kv.config import DEFAULT_PAGE_SIZE
     from mstar.model.lingbot_world.lingbot_world_model import LingBotWorldModel
 
     model = LingBotWorldModel(skip_weight_loading=True)
@@ -87,7 +86,7 @@ def rollout_pages(image: str, session: Session) -> int:
     width, height = Image.open(image).size
     lat_h, lat_w = model.geometry((height, width), session.height or cfg.default_height,
                                   session.width or cfg.default_width)
-    return cfg.window_pages(cfg.frame_tokens(lat_h, lat_w), DEFAULT_PAGE_SIZE)
+    return cfg.window_tokens(cfg.frame_tokens(lat_h, lat_w))
 
 
 def rollout(client: MStarClient, image: str, request_id: str, session: Session, t0: float) -> dict:
@@ -110,7 +109,7 @@ def main() -> int:
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--config", type=Path, default=REPO / "configs/lingbot_world_1_3b.yaml")
     ap.add_argument("--max-concurrent", type=int, help="the YAML's max_concurrent_requests")
-    ap.add_argument("--max-num-pages", type=int, help="the YAML's resources: dit_kv: max_num_pages")
+    ap.add_argument("--pool-tokens", type=int, help="the YAML's resources: dit_kv: pool_tokens")
     ap.add_argument("--expect-waits", type=int,
                     help="rollouts that must wait for an earlier one; default: sessions - max_concurrent_requests")
     ap.add_argument("--sessions", type=int, default=2, help="concurrent copies of the default rollout")
@@ -130,8 +129,8 @@ def main() -> int:
     config = yaml.safe_load(args.config.read_text())
     if args.max_concurrent is not None:
         config["max_concurrent_requests"] = args.max_concurrent
-    if args.max_num_pages is not None:
-        config.setdefault("resources", {}).setdefault("dit_kv", {})["max_num_pages"] = args.max_num_pages
+    if args.pool_tokens is not None:
+        config.setdefault("resources", {}).setdefault("dit_kv", {})["pool_tokens"] = args.pool_tokens
     sessions = args.specs or [Session(None, None, args.chunks)] * args.sessions
     concurrent = config.get("max_concurrent_requests", len(sessions))
     expected_waits = args.expect_waits if args.expect_waits is not None else max(0, len(sessions) - concurrent)
@@ -150,7 +149,7 @@ def main() -> int:
     client = MStarClient(f"http://127.0.0.1:{args.port}", timeout=900)
     report: dict = {"max_concurrent": concurrent, "dit_kv": (config.get("resources") or {}).get("dit_kv", {}),
                     "sessions": [s._asdict() for s in sessions], "expected_waits": expected_waits,
-                    "rollout_pages": [rollout_pages(args.image, s) for s in sessions]}
+                    "rollout_tokens": [rollout_tokens(args.image, s) for s in sessions]}
     try:
         deadline = time.time() + 1200
         while not client.health():
