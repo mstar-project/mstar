@@ -31,6 +31,7 @@ PORTED = (
     "mstar/model/voxcpm2",
     "mstar/model/canary_qwen", "mstar/model/qwen3_asr", "mstar/model/parakeet", "mstar/model/fish_s2_pro",
     "mstar/model/qwen3_tts",
+    "mstar/model/pi05", "mstar/model/vjepa2", "mstar/model/canary", "mstar/model/components/encoder_decoder.py",
 )
 # The list only shrinks: a package leaves it when its port lands, and nothing is added to it.
 UNPORTED = (
@@ -45,7 +46,7 @@ SHARED = ("mstar/model/components", "mstar/model/loader")
 FORBIDDEN_ATTRIBUTES = {
     "node_resources", "resources", "request_state", "request_states", "per_request_states", "sequence_shard",
     # what a handle holds
-    "resource", "positions", "reads", "first_read", "_kv", "_attn", "_pool", "_runners", "_views", "_blocks",
+    "resource", "positions", "reads", "first_read", "_kv", "_attn", "_cross", "_pool", "_runners", "_views", "_blocks",
     "_bindings", "_layouts", "_update",
 }
 
@@ -186,10 +187,13 @@ def _violations(source: str, path: str = "") -> tuple[list[str], set[tuple[str, 
     return found, used
 
 
+def _entry_sources(entry: str) -> list[Path]:
+    path = Path(entry)
+    return [path] if path.is_file() else [p for p in sorted(path.rglob("*.py")) if "tests" not in p.parts]
+
+
 def _sources() -> list[Path]:
-    return [
-        path for package in PORTED for path in sorted(Path(package).rglob("*.py")) if "tests" not in path.parts
-    ]
+    return [path for entry in PORTED for path in _entry_sources(entry)]
 
 
 def _model_packages() -> list[str]:
@@ -262,6 +266,11 @@ def test_a_ported_package_reaches_the_engine_only_through_the_contract(path):
         "can't avoid goes in ALLOWED with its reason, and state the contract can't declare yet needs its mask or op "
         "and binding in adapters.py first, not a spec returned from `get_node_resources`."
     )
+
+
+@pytest.mark.parametrize("entry", PORTED)
+def test_every_ported_entry_yields_a_source(entry):
+    assert _entry_sources(entry), f"{entry} yields no source, so the lint would pass it unread"
 
 
 def test_every_exception_is_still_used():
