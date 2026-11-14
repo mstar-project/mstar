@@ -1,15 +1,41 @@
 """Positronic input fields as the pinned Praxis single-arm and YAM rigs read them."""
 
 import io
+from pathlib import Path
+from types import SimpleNamespace
 
 import msgpack
 import numpy as np
 import pytest
+import yaml
 from PIL import Image
 
 from mstar.api_server.openpi import pack
-from mstar.api_server.positronic import _session_seed
+from mstar.api_server.positronic import PositronicPolicy, _session_seed
 from mstar.api_server.positronic_input import decode_praxis_frame
+from mstar.api_server.rust_frontend import positronic_facts
+
+
+def test_droid_ready_metadata_declares_the_reference_client_stack():
+    config = yaml.safe_load((Path(__file__).parents[2] / "configs/praxis1_droid.yaml").read_text())
+    policy = PositronicPolicy.from_config(config["positronic"], SimpleNamespace(POSITRONIC_SESSION_READY=True))
+    meta = policy.meta
+    assert meta["chunk_rows"] == 24
+    assert meta["action_fps"] == 15.0
+    assert meta["image_codecs"] == ["h264", "jpeg"]
+    stack = meta["local_stack"]["seq"]
+    assert [step["name"] for step in stack] == [
+        "stop_on_fault", "restrict_image_size", "temporal_stack", "chunked_schedule",
+    ]
+    assert stack[1]["args"] == {"width": 416, "height": 234}
+    assert stack[2]["args"]["keys"] == [
+        "image.wrist", "image.exterior", "robot_state.ee_pose", "grip",
+    ]
+    assert stack[2]["args"]["offsets_sec"] == pytest.approx(
+        [0.0 if frame == 0 else -frame / 15 + 0.5 / 15 for frame in range(24, -1, -1)]
+    )
+    assert stack[2]["args"]["pad_start"] is False
+    assert positronic_facts(policy)["meta"] == meta
 
 
 def test_session_seed_prefers_query_then_deployment_and_validates_int64(monkeypatch):
