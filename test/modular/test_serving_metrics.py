@@ -1350,7 +1350,7 @@ def test_metrics_start_after_the_warmup_requests_and_before_the_bind(monkeypatch
         fatal_error = None
         model_config: dict = {}
         model = None
-        served_models = openpi_policy = None
+        served_models = openpi_policy = positronic_policy = None
         client_streams = frozenset()
 
         def __init__(self, **kwargs):
@@ -1484,7 +1484,7 @@ def _serve_against(monkeypatch, tmp_path, server_code: str, bridge_runs: bool):
         fatal_error = None
         model_config: dict = {}
         model = None
-        served_models = openpi_policy = None
+        served_models = openpi_policy = positronic_policy = None
         client_streams = frozenset()
 
         def __init__(self, **kwargs):
