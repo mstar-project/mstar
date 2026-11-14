@@ -471,6 +471,18 @@ containing a node that declares this mask must receive lengths, even if that
 node skips the read on one walk: ``Array.nodes`` does not identify which walks
 use it. The conductor refuses missing or malformed lengths before dispatch.
 
+Within-step expert attention uses the same array and walk rule with
+``ExpertSelf(chunk_len, future_per_chunk)`` or
+``ExpertCross(chunk_len, future_per_chunk, tokens_per_frame, window_frames)``.
+The typed prompt layouts are ``Layout(expert_self={read: ExpertSelfLayout(num_chunks=)})``
+and ``Layout(expert_cross={read: ExpertCrossLayout(num_chunks=, global_len=,
+clean_frames=, noised_frames=)})``. A walk can instead set
+``step_metadata["__state_expert_layout__"]`` with
+``{array: {label: {read: [num_chunks]}}}`` for self attention or
+``{array: {label: {read: [num_chunks, global_len, clean_frames, noised_frames]}}}``
+for cross attention. The walk's read-keyed value overrides the prompt's value;
+the conductor checks the names and lengths before dispatch.
+
 The footprint adds the spans, the growth at each loop's iterations (up to a ``LabelLayout``'s
 ``max_growth``) and the scratch, and rounds up to whole pages per label. A span's own scratch counts only with the spans before
 it, so a window's denoise steps and its commit count once. Under a ``RetentionPolicy`` it
