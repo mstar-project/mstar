@@ -184,7 +184,7 @@ def _port_prime(port, session, clip, ctx):
     with torch.inference_mode():
         # WaypointVaeEncoderSubmodule.prepare_inputs: cast, then divide.
         latent = session.encode(clip.to(device=DEVICE, dtype=DTYPE).div(255)).unsqueeze(1)
-        _admit(port, 0)
+        _admit(port)
         x0 = port["dit"].append_frame(
             latent,
             torch.full((latent.size(0),), 0, dtype=torch.int64, device=DEVICE),
@@ -192,7 +192,7 @@ def _port_prime(port, session, clip, ctx):
             button=ctx["button"],
             scroll=ctx["scroll"],
         )
-        _commit(port, 0)
+        _commit(port)
         return x0, session.decode(x0.squeeze(1))
 
 

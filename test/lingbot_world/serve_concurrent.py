@@ -12,28 +12,20 @@ started ``--stagger`` seconds apart in that order), and checks:
     earlier rollout's last) and still finish, instead of running the GPU out of
     memory
   * with room for every session, the rollouts' chunks interleave
-  * ``--expect-rearranges``: the pool rearranged at least that often (the
-    server log's count, at INFO), which sizes like these force: D takes the front of
-    the pool, S the room after it, and L fits only once D has ended and S has
-    slid left into D's gap, with S's K/V moved under it while it runs
 
 The trajectory is synthetic and the image one of Cosmos3-Edge's assets, as in
 ``run_served_numerics.py``.
 
 LingBot-World refuses any ``max_concurrent_requests`` but 1 until the rollouts'
-text K/V and VAE caches are engine resources (``LingBotWorldModel.validate_config_yaml``),
+VAE caches are engine resources (``LingBotWorldModel.validate_config_yaml``),
 so the cases below that pass ``--max-concurrent`` above 1 need that check lifted locally.
 
     python test/lingbot_world/serve_concurrent.py --out /tmp/lingbot/conc1
     python test/lingbot_world/serve_concurrent.py --out /tmp/lingbot/conc2 --max-concurrent 2
     python test/lingbot_world/serve_concurrent.py --out /tmp/lingbot/pool --max-concurrent 2 \
-        --pool-tokens 28080 --expect-waits 1
-    python test/lingbot_world/serve_concurrent.py --out /tmp/lingbot/rearrange --max-concurrent 3 \
-        --session 480x832:4 --session 240x416:24 --session 576x1024:6 --stagger 1 --expect-rearranges 1
-    # a 72-token D: S slides across a gap short enough to be staged
-    python test/lingbot_world/serve_concurrent.py --out /tmp/lingbot/short_gap --max-concurrent 3 \
-        --pool-tokens 46440 --session 32x64:8 --session 240x416:24 --session 576x1024:6 --stagger 0.5 \
-        --expect-rearranges 1
+        --pool-tokens 40000 --expect-waits 1
+    python test/lingbot_world/serve_concurrent.py --out /tmp/lingbot/sizes --max-concurrent 3 \
+        --session 480x832:4 --session 240x416:24 --session 576x1024:6 --stagger 1
 """
 
 from __future__ import annotations
@@ -83,19 +75,18 @@ def parse_session(text: str) -> Session:
     return Session(int(height), int(width), int(chunks))
 
 
-def kept_tokens(image: str, session: Session) -> int:
-    """The rolling K/V tokens a layer the session's rollout declares, as the model computes them."""
+def rollout_tokens(image: str, session: Session) -> int:
+    """The tokens a layer of the dit's K/V pool the session's rollout holds, as the model counts them."""
     from PIL import Image
 
     from mstar.model.lingbot_world.lingbot_world_model import LingBotWorldModel
-    from mstar.model.lingbot_world.submodules import rolling_extent
 
     model = LingBotWorldModel(skip_weight_loading=True)
     cfg = model.config
     width, height = Image.open(image).size
     lat_h, lat_w = model.geometry((height, width), session.height or cfg.default_height,
                                   session.width or cfg.default_width)
-    return sum(rolling_extent(cfg, (lat_h * cfg.vae_stride[1], lat_w * cfg.vae_stride[2])))
+    return cfg.window_tokens(cfg.frame_tokens(lat_h, lat_w))
 
 
 def rollout(client: MStarClient, image: str, request_id: str, session: Session, t0: float) -> dict:
@@ -126,7 +117,6 @@ def main() -> int:
     ap.add_argument("--session", type=parse_session, action="append", dest="specs",
                     help="HxW:CHUNKS, once per concurrent rollout (instead of --sessions)")
     ap.add_argument("--stagger", type=float, default=0.0, help="seconds between the concurrent rollouts' starts")
-    ap.add_argument("--expect-rearranges", type=int, default=0)
     ap.add_argument("--image")
     ap.add_argument("--port", type=int, default=18432)
     args = ap.parse_args()
@@ -157,9 +147,9 @@ def main() -> int:
         stdout=log, stderr=subprocess.STDOUT, cwd=REPO,
     )
     client = MStarClient(f"http://127.0.0.1:{args.port}", timeout=900)
-    report: dict = {"max_concurrent": concurrent, "pool_tokens": (config.get("resources") or {}).get("dit_kv", {}),
+    report: dict = {"max_concurrent": concurrent, "dit_kv": (config.get("resources") or {}).get("dit_kv", {}),
                     "sessions": [s._asdict() for s in sessions], "expected_waits": expected_waits,
-                    "kept_tokens": [kept_tokens(args.image, s) for s in sessions]}
+                    "rollout_tokens": [rollout_tokens(args.image, s) for s in sessions]}
     try:
         deadline = time.time() + 1200
         while not client.health():
@@ -173,8 +163,6 @@ def main() -> int:
             np.save(args.out / f"solo{tag}_frames.npy",
                     np.stack([np.frombuffer(c, dtype=np.uint8) for c in solo["chunks"][1:]]))
             np.save(args.out / f"solo{tag}_first_chunk.npy", np.frombuffer(solo["chunks"][0], dtype=np.uint8))
-        log.flush()
-        rearranges_alone = (args.out / "server.log").read_text().count("rearranged the pool")
         results: dict[int, dict] = {}
         errors: dict[int, str] = {}
         t0 = time.perf_counter()
@@ -214,12 +202,11 @@ def main() -> int:
         except subprocess.TimeoutExpired:
             proc.kill()
         log.close()
-    report["rearranges"] = (args.out / "server.log").read_text().count("rearranged the pool") - rearranges_alone
     (args.out / "concurrent.json").write_text(json.dumps(report, indent=2, default=str))
     print(json.dumps(report, indent=2, default=str))
     ok = not report.get("errors") and all(report.get("identical_to_solo", {0: False}).values()) \
         and len(report.get("chunks_each", {})) == len(sessions)
-    if ok and (report["waited"] < expected_waits or report["rearranges"] < args.expect_rearranges):
+    if ok and report["waited"] < expected_waits:
         ok = False
     print("concurrent rollouts", "OK" if ok else "FAILED")
     return 0 if ok else 1

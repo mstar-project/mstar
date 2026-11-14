@@ -5,6 +5,7 @@ without pulling FlashInfer in behind it.
 """
 
 import copy
+import logging
 import math
 from abc import ABC, abstractmethod
 from collections.abc import Collection, Iterable, Mapping, Sequence
@@ -21,6 +22,8 @@ if TYPE_CHECKING:
     from mstar.engine.resources.context_parallel import ContextParallel
     from mstar.engine.resources.sequence_shard import SeqShardSpec
     from mstar.engine.resources.spec import Storage
+
+logger = logging.getLogger(__name__)
 
 
 class KVLayout(Enum):
@@ -424,6 +427,8 @@ class RingKVConfig(KVConfig):
     layers: tuple[RingKVLayerConfig, ...]
     # How many sessions are resident at once. NOT a batch.
     num_sessions: int = 1
+    # the most frames a request commits, which admit holds it to; None for no cap
+    max_frames: int | None = None
 
     @property
     def total_sessions(self) -> int:
@@ -453,6 +458,27 @@ class RingKVConfig(KVConfig):
                 f"num_sessions must be a positive int; got {self.num_sessions!r}. A node serving "
                 "zero sessions refuses every request at admit."
             )
+        if self.max_frames is not None and not (type(self.max_frames) is int and self.max_frames >= 1):
+            raise ValueError(f"max_frames must be None or a positive int; got {self.max_frames!r}")
+
+    def capacity_problem(
+        self, spec: "KVSpec", requests: int, request: "KVReqConfig | None",
+        axis_sizes: Sequence[Mapping[str, int]] = (),
+    ) -> str | None:
+        """A request holds a session from its first step until it is torn down. Sessions past the cap are allocated
+        and never filled, which is only a warning."""
+        if requests > self.num_sessions:
+            return (
+                f"{requests} concurrent requests (max_concurrent_requests) need {requests} sessions of "
+                f"resources.{spec.resource_key}, which has {self.num_sessions}; raise num_sessions or lower "
+                "max_concurrent_requests"
+            )
+        if requests < self.num_sessions:
+            logger.warning(
+                "resources.%s holds %d sessions and max_concurrent_requests is %d, so %d of them are allocated and "
+                "never filled", spec.resource_key, self.num_sessions, requests, self.num_sessions - requests,
+            )
+        return None
 
     def apply_yaml_overrides(self, num_sessions: int | None = None, **kwargs) -> None:
         """``num_sessions`` only. Nothing else here is a deployment knob."""
@@ -667,6 +693,11 @@ class KVReqConfig(ResourceReqConfig):
         if spec is None or not isinstance(spec.config, PagedKVConfig):
             return
         for label, layout in (self.kv_layout or {}).items():
+            # the release keeps an exact window in the first group alone, and a kept-window read is its array's only one
+            if layout.retention is not None and layout.retention.exact and len(spec.config.groups) > 1:
+                raise ValueError(
+                    f"{spec.resource_key!r}: label {label!r} keeps an exact window, and the pool has window groups"
+                )
             positions = layout.positions(self.loop_caps or {})
             if layout.retention is None and positions > spec.config.max_seq_len:
                 raise ValueError(
@@ -737,6 +768,9 @@ def refuse_undeclared_labels(
 ) -> None:
     """The model is at fault and not the client, so this raises RuntimeError, which fails the request with a 500."""
     for key in declared.keys() | kv_layout.keys():
+        if key in configs and not isinstance(configs[key], KVReqConfig):
+            # a pool of no pages, which reads its own row (`RollingKVSpec.request_config`)
+            continue
         laid_out = set(kv_layout.get(key, ()))
         if extra := sorted(laid_out - set(declared.get(key, ()))):
             raise RuntimeError(f"{model} returned a kv_layout for {key!r}/{extra[0]!r}, which it does not declare")
@@ -950,10 +984,16 @@ class RetentionPolicy:
     realized context can run over the budget by up to a page; the excess is
     re-offered at the next commit. ``protected_prefix`` tokens at the head (a
     text prompt, say) are never released.
+
+    A prefix that ends inside a page keeps that whole page, so the release
+    would count the page's later tokens against the budget and could free
+    some of the latest ``context_budget`` tokens. An ``exact`` policy counts
+    the prefix to the end of its page instead, and keeps all of them.
     """
     context_budget: int
     # front tokens the window never releases; only pages within them are indexed
     protected_prefix: int = 0
+    exact: bool = False
 
     def __post_init__(self):
         if self.context_budget <= 0:
@@ -961,12 +1001,17 @@ class RetentionPolicy:
         if self.protected_prefix < 0:
             raise ValueError(f"protected_prefix must be >= 0, got {self.protected_prefix}")
 
+    def kept_prefix(self, page_size: int) -> int:
+        """The tokens at the head the release counts as the prefix: ``protected_prefix``, rounded up to a page of
+        ``page_size`` when ``exact``."""
+        return -(-self.protected_prefix // page_size) * page_size if self.exact else self.protected_prefix
+
     def max_pages(self, page_size: int, step: int = 0) -> int:
         """The most pages of ``page_size`` a stream under this policy holds, with a step of
         ``step`` tokens past its prefix. `KVManager._apply_retention` leaves less than a page over
-        the budget, so the window peaks at the protected prefix plus the budget, or at the prefix
+        the budget, so the window peaks at the kept prefix plus the budget, or at the prefix
         rounded up to a page if that is larger, plus a page of overrun and the step."""
-        prefix = self.protected_prefix
+        prefix = self.kept_prefix(page_size)
         window = max(prefix + self.context_budget, -(-prefix // page_size) * page_size)
         return -(-(window + page_size - 1 + step) // page_size)
 
@@ -1074,6 +1119,4 @@ class KVStep(ResourceStep):
 
 @dataclass(frozen=True, kw_only=True)
 class RingKVStep(ResourceStep):
-    """One ring clock per request in the step's batch."""
-
-    frames: tuple[tuple[str, int], ...]
+    """A step of a ring: one frame per row, which its commit counts."""

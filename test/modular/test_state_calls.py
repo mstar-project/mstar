@@ -1,7 +1,7 @@
 """A layer reaches declared state through a handle.
 
-The order of a step's calls is the contract: a read sees this layer's add, and an add after a read would change what an
-earlier layer read. Nothing in a kernel would notice a broken order, so each rule raises here, naming the array and the
+The order of a step's calls is the contract: a read sees this layer's latest add, and nothing adds to a layer after
+its kept add. Nothing in a kernel would notice a broken order, so each rule raises here, naming the array and the
 cause, in eager steps and at capture. A replay runs no Python, so it skips all of them.
 """
 
@@ -565,13 +565,62 @@ def test_an_add_after_a_kept_add_raises():
     _refused(r"Array 'kv': an add on layer 0 after its kept add", lambda: h.add(0, k=k, v=v))
 
 
-def test_a_kept_add_after_a_read_in_the_same_layer_raises():
+def test_the_kept_add_may_follow_a_read():
+    """A world model's chunk step runs scratch passes, each an add and a read, then one kept pass in the same layers."""
+    h = _kv_handle()
+    step = _begin(h)
+    q, k, v = _tensors()
+    for layer in range(LAYERS):
+        h.add(layer, keep=False, k=k, v=v)
+        h.read(layer, q)
+        h.add(layer, k=k, v=v)
+        h.read(layer, q)
+    h.check_step(step)
+
+
+def test_the_kept_add_still_ends_a_layer():
     h = _kv_handle()
     _begin(h)
     q, k, v = _tensors()
     h.add(0, keep=False, k=k, v=v)
     h.read(0, q)
-    _refused(r"Array 'kv': a kept add on layer 0 after a read in the same layer", lambda: h.add(0, k=k, v=v))
+    h.add(0, k=k, v=v)
+    h.read(0, q)
+    _refused(r"Array 'kv': an add on layer 0 after its kept add", lambda: h.add(0, keep=False, k=k, v=v))
+
+
+def test_a_kept_add_after_a_read_leaves_its_own_entries_on_the_pages():
+    """On a kernel that reads the pages, the scratch pass writes the step's slots and the kept add writes them again."""
+    kv = _StubKV()
+    h = _kv_handle(kv=kv)
+    _begin(h)
+    q, scratch_k, scratch_v = _tensors()
+    _, k, v = _tensors()
+    h.add(0, keep=False, k=scratch_k, v=scratch_v)
+    h.read(0, q)
+    h.add(0, k=k, v=v)
+    assert torch.equal(h.read(0, q), q + k), "the read after the kept add should see the kept add's keys"
+    assert torch.equal(kv.pages[0, :TOKENS, 0], k) and torch.equal(kv.pages[0, :TOKENS, 1], v), (
+        "the pages the step commits should hold the kept add, not the scratch pass"
+    )
+
+
+def test_a_kernel_that_takes_k_and_v_at_the_read_gets_the_kept_add_after_a_read():
+    """The dense kernel writes no add to the pages, kept or not, so its read after the kept add takes the kept add."""
+    kv, attn, taken = _StubKV(), _StubDense(), []
+    attn.run = lambda q, label=None, kv_cache_layer=None, k=None, v=None, layer_idx=None: taken.append((k, v)) or q
+    h = _kv_handle(kv=kv, attn=attn)
+    _begin(h)
+    q, scratch_k, scratch_v = _tensors()
+    _, k, v = _tensors()
+    h.add(0, keep=False, k=scratch_k, v=scratch_v)
+    h.read(0, q)
+    h.add(0, k=k, v=v)
+    h.read(0, q)
+    assert [(a is k, b is v) for a, b in taken] == [(False, False), (True, True)], (
+        "each read should take the add just before it"
+    )
+    assert kv.writes == [] and h._held is None, "the handle writes nothing to the pages here, as for a kept add alone"
 
 
 def test_a_scratch_add_after_a_read_starts_another_pass():
@@ -856,17 +905,11 @@ def _added(h, q, k, v):
     h.add(0, k=k, v=v)
 
 
-def _added_and_read(h, q, k, v):
-    h.add(0, keep=False, k=k, v=v)
-    h.read(0, q)
-
-
 @pytest.mark.parametrize(("setup", "layer", "keep", "with_q", "mask_args", "cause"), [
     (None, LAYERS + 1, None, True, {}, f"add on layer {LAYERS + 1}, which the array doesn't declare"),
     (_added, 0, None, True, {}, "an add on layer 0 after its kept add"),
     # both calls would refuse, and the add's check runs first
     (_added, 0, None, False, {}, "an add on layer 0 after its kept add"),
-    (_added_and_read, 0, None, True, {}, "a kept add on layer 0 after a read in the same layer"),
     (None, 0, None, False, {}, "no layout yet: a read with no op"),
     (None, 0, None, True, {"top_k": 3}, r"no layout yet: mask arguments \['top_k'\]"),
 ])

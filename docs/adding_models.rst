@@ -419,8 +419,12 @@ the layout names there, so the model returns no ``KVReqConfig`` for them. On one
 doesn't name, it opens the labels ``kv_labels()`` lists for it, or ``main`` where that lists
 none, and a paged array needs a layout for each label it opens, so leaving one out fails the
 request: lay out every paged array. A layout may be empty where an opened label is never
-written. A Value's layout is ``Layout()``, because a Value takes one slot per label. A layout
-has three fields:
+written. A Value's layout is ``Layout()``, because a Value takes one slot per label. A sized
+Value is the exception: ``Value(..., largest={...})`` declares fields whose shapes name sizes
+(``Size("lat_h", scale=8)``), its layout gives the request's own (``Layout(sizes={...})``), and the
+engine admits the request by its fields' bytes at those sizes. Its ``read`` hands the row's
+tensors over and ``write`` keeps the ones it is given, with no copy either way, so a step
+writes or clears every field it read. A paged layout has four fields:
 
 - ``spans``: the committed writes known at intake, in walk order. A ``Span`` has a
   ``kind``: ``"ids"`` for token ids from the tensor ``source`` names, ``"digest"`` for KV
@@ -442,6 +446,10 @@ has three fields:
   slots, as a window's denoise steps do.
 - ``growth``: ``(loop, entries)`` pairs, ``entries`` per iteration of ``loop``.
 - ``scratch``: the most entries one non-committing step writes past the kept length.
+- ``kept_windows``: by read key, the ``KeptWindow(sink, window=)`` of each kept-window read,
+  in entries (``Bidirectional(kept_window=True)``, below). The storage keeps the label's first
+  ``sink`` entries and its last ``window`` and gives back what lies between them, so the
+  footprint is the window's.
 
 ``process_prompt`` may also return ``keyed_spans``, keyed by array and then label: how many
 leading spans the label's keys cover, by default every span before the first ``rows`` span.
@@ -723,11 +731,30 @@ deployment YAML tunes them under ``resources:`` (see :ref:`Step 6 <config-yaml>`
   global, before sharding. ``dtype=None`` is the engine's compute dtype, and ``shard`` is
   the axis split across TP ranks, ``None`` when every GPU holds all of it.
   ``KVEntry(heads=, head_dim=)`` builds an entry of ``k`` and ``v`` sharded on their heads.
+  A paged array's pool is held in the model's ``get_autocast_dtype``. A model that runs
+  without the engine's autocast returns its K/V dtype there and sets ``disable_autocast`` on
+  each node, as Waypoint and LingBot-World do.
 - ``Read(mask=, op=, layers=, walks=)``: how a layer reads the array. Each row reads through
   the one read declared for its layer and walk, and loading refuses two reads over one
   layer and walk. ``Causal()`` sees every entry up to the query's own, ``Window(size)`` the
   last ``size`` of them, its own included, and ``Bidirectional()`` every entry the row keeps and
-  every entry this step adds for it. On an array that keeps entries, reads of one attention
+  every entry this step adds for it. ``Bidirectional(kept_window=True)`` sees, of what the row
+  kept before the step, the first ``sink`` entries and the last ``window`` that the request's
+  layout gives (``kept_windows``), and every entry this step adds, as LingBot-World's chunks
+  read their sink and latest window. It is its array's only read, with no ``walks`` and no
+  ``queries``, it takes packed queries, and a step that reads it is never captured. On an
+  array of one label with no positions it is held in the rolling store (`Rolling (compacted)
+  caches`_), which hands the read each row's sink, window and step as one range, and a step
+  there lists one row and keeps its adds. Otherwise the pool keeps it in pages, and each read
+  gathers it.
+  ``FrameWindow(tokens, frames=, stride=1)`` sees frames of ``tokens`` entries: every
+  ``stride``-th of the latest ``frames``, and the step's own frame. An array whose reads are
+  all frame windows is held in a ring of frames per session, which a compiled region adds to
+  and reads through FlexAttention, as Waypoint's is. Each step adds one frame a row, and
+  ``position()`` counts the frames a request has committed. A read with ``op=None`` takes no
+  queries and returns the entries it reaches as ``Reached``, which the model attends itself.
+  It needs a kept window, as LingBot-World's ``reference_numerics`` reads one for its FA2.
+  On an array that keeps entries, reads of one attention
   config share one resource, unless a walk reads through two of them with different masks, and
   each step plans ``causal`` from the read its walk resolves to:
   BAGEL reads ``kv`` through ``attn`` (``Causal()``) on ``prefill_text`` and ``decode``, and
@@ -1528,8 +1555,10 @@ Rolling (compacted) caches
 ^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 A causal video DiT that denoises chunk after chunk against a sink and a sliding window of
-earlier chunks (Self-Forcing's rolling cache; LingBot-World's ``DIT_KV``) declares a
-``RollingKVSpec``. Its chunks are thousands of queries over tens of thousands of keys, so
+earlier chunks (Self-Forcing's rolling cache) can declare a ``RollingKVSpec``. A model on
+the contract declares a kept-window read instead (``Bidirectional(kept_window=True)``): an
+array of one label and no positions whose one read it is lands in this store, sized by each
+request's layout. Its chunks are thousands of queries over tens of thousands of keys, so
 the attention kernel dominates the step, and bounded KV's Triton kernel (built for short
 streaming steps) is several times slower there than the ragged FlashInfer one. The rolling
 store therefore runs no attention: it keeps the stream's first ``sink`` tokens and its last
@@ -1545,6 +1574,8 @@ the shift, once per step even when planned twice; the model then calls ``write(l
 The K/V live in one pool reserved at startup, ``pool_tokens`` a layer. The model declares
 each request's size by returning ``RollingKVReqConfig(tokens=sink + window)`` from
 ``get_request_resource_configs``; a request it declares nothing for fails at its first step.
+On the contract the store's spec builds it from the request's layout, and the storage
+declares each step's positions.
 A request waits in the engine's admission queue, in arrival order, until the pool has its
 room, which is then set aside for it, and one larger than the whole pool is a 400 at the
 conductor. Its first step takes a contiguous region of exactly that size (first fit), given
@@ -1552,11 +1583,11 @@ back when the request ends, so requests of different sizes share the pool instea
 holding the largest. When no free gap holds a new request but the free tokens do, the
 resident regions slide left to join the gaps, a copy of what they hold, between steps; one
 that slides across a short gap is copied through a staging block of 512 tokens a layer,
-reserved with the pool (90 MiB at LingBot-World's geometry), rather than in many small
+reserved with the pool (90 MiB at 30 layers of 12 heads of 128), rather than in many small
 copies. How many requests run at once is the deployment's ``max_concurrent_requests``, not
 the store's: the pool counts tokens, so it admits many small requests, and any state a
-model keeps per request outside the store is bounded only by that limit (LingBot-World
-requires it to be 1 for this reason). A step that declares this store runs eager (no
+model keeps per request outside the store is bounded only by that limit. A step that
+declares this store runs eager (no
 capture yet), and it does not shard across ranks yet.
 
 Per-request LoRA adapters
@@ -2385,8 +2416,8 @@ and each row's label comes from the step's segments, so there are no cursors:
 - ``write`` sets the step's rows' entries in place where the forward runs it, not at the step's commit.
 
 These raise, naming the array and the cause: a call on an array the step doesn't list or on
-a layer it doesn't declare, an add after a kept add, a kept add after a read in the same
-layer, and ``write`` on an append-only array. The checks run in eager steps and at capture, so
+a layer it doesn't declare, an add after a kept add, and ``write`` on an append-only array.
+The checks run in eager steps and at capture, so
 graph replays skip them. On an array with ``max_len=0`` a compiled block skips them too, since a
 check there would guard on the layer.
 

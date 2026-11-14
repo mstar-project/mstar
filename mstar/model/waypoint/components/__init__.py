@@ -7,18 +7,13 @@ uniformly: it takes the patched **fused QKV** and keeps the unpatched
 **packed** ``MLPFusion.fc1``, since that patch splits a weight the checkpoint
 stores packed. The two forms are algebraically identical.
 
-**Nothing here owns the world state.** The ring KV cache and the FlexAttention
-kernel are engine resources (``engine/resources/kv/ring/``,
-``engine/resources/attn/flex.py``) bound onto ``WaypointDiT`` and its 24
-``WaypointAttention`` layers at load by ``NodeSubmodule.bind_node_resources``.
-That keeps the rings out of the module tree, where ``to_empty(device)``,
+**Nothing here owns the world state.** The model declares it, and the 24
+``WaypointAttention`` layers reach the engine's ring of frames through the
+state handle ``NodeSubmodule.bind_node_state`` gives them at load. That keeps
+the rings out of the module tree, where ``to_empty(device)``,
 ``state_dict()`` and the weight loader would each have a buffer of ours to
-leave holding garbage.
-
-``taehv.py`` is the exception: a streaming AE session is per-request Python
-state, held in ``PerRequestState`` by the two VAE nodes and dropped with the
-request. Its ``taehv`` imports are deferred, so this package imports without
-the upstream package installed.
+leave holding garbage. ``taehv.py``'s ``taehv`` imports are deferred, so this
+package imports without the upstream package installed.
 """
 
 from mstar.model.waypoint.components.attention import WaypointAttention

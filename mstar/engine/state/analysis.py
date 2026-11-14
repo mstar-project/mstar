@@ -9,7 +9,17 @@ from typing import TYPE_CHECKING, get_origin
 
 import torch
 
-from mstar.engine.state.contract import EMPTY, Array, Block, Read, Sampler, SeqShard, is_value, read_layers
+from mstar.engine.state.contract import (
+    EMPTY,
+    Array,
+    Bidirectional,
+    Block,
+    Read,
+    Sampler,
+    SeqShard,
+    is_value,
+    read_layers,
+)
 
 if TYPE_CHECKING:
     from mstar.model.base import Model
@@ -191,12 +201,25 @@ def _regrouping_problems(model: "Model", arrays: Sequence[Array], graphs: Mappin
           for node, policy in model.rebuild_policies().items() if any(node in array.nodes for array, _, _ in whole)
           for walk in policy.ids_walks(node, graphs)),
     ]
+    # A rebuild replaces the steps its loop runs with prefill rows, where a kept window cuts other entries than each
+    # step saw.
+    kept = [(array, key, read) for array, key, read in whole if isinstance(read.mask, Bidirectional)
+            and read.mask.kept_window]
+    replaced = [
+        (node, walk, f"{node}'s rebuild policy replaces with its prefill rows", "drop the rebuild policy")
+        for node, policy in model.rebuild_policies().items() if any(node in array.nodes for array, _, _ in kept)
+        for walk in policy.loop_walks(node, graphs)
+    ]
     # once per array, which several of its nodes may report
     return list(dict.fromkeys(
         f"Array {array.name!r}.reads[{key!r}]: {type(read.mask).__name__} on walk {walk!r}, which {cause}. "
-        f"{type(read.mask).__name__} sees each step's adds as a whole, so {fix}"
-        for node, walk, cause, fix in regrouped
-        for array, key, read in whole if node in array.nodes and runs_on_walk(read, walk)
+        + (why or read.mask.split_step_change()) + f", so {fix}"
+        for sources, reads, why in (
+            (regrouped, whole, None),
+            (replaced, kept, "A kept window cuts other entries from a prefill row than from the steps it replaces"),
+        )
+        for node, walk, cause, fix in sources
+        for array, key, read in reads if node in array.nodes and runs_on_walk(read, walk)
     ))
 
 

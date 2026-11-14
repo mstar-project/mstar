@@ -1,18 +1,18 @@
 """Contract tests for the Waypoint serving shell: the model, its node
-submodule, and the resources it declares.
+submodule, and the state it declares.
 
 Not the DiT, the ring numerics, or the weight remap -- those have their own
 suites. What's under test is the shell layer between the engine and a working
 model: ring geometry, frame_pos rank, the ``_seq_dim`` collision, noise
-statelessness, the off-by-one stop, admit-queue sizing, resource binding, and
+statelessness, the off-by-one stop, admit-queue sizing, state binding, and
 decode ordering -- each of which fails silently when it is wrong.
 
 CPU-only, checkpoint-free, no engine. Uses the real 720P config since its
-numbers are the ones that collide; the DiT is built on ``torch.device("meta")``
-and never materialized (a real 720P bf16 build is ~2.6 GB). Two exceptions read
-a value back: the noise draw takes an explicit device, and the frame-clock
-tests run over ``_HostOnlyDit``. The VAE section runs on the 360P config with a
-fake ``taehv`` package.
+numbers are the ones that collide; the DiT and the ring are built on
+``torch.device("meta")`` and never materialized (a real 720P bf16 build is
+~2.6 GB). Two exceptions read a value back: the noise draw takes an explicit
+device, and the frame-clock tests run over ``_HostOnlyDit``. The VAE section
+runs on the 360P config with a fake ``taehv`` package.
 """
 
 import dataclasses
@@ -34,9 +34,12 @@ from mstar.engine.resources import (
     AttnBackend,
     KVSpec,
     RingKVConfig,
-    RingKVStep,
+    StepContext,
 )
+from mstar.engine.resources.base import EngineResourceInfo, build_resource
+from mstar.engine.resources.recurrent.config import RecurrentStateSpec
 from mstar.engine.resources.runner import topo_sort
+from mstar.engine.state.adapters import RingHandle, ValueHandle, node_handles, node_resources
 from mstar.graph.base import (
     GraphEdge,
     Loop,
@@ -46,20 +49,21 @@ from mstar.graph.base import (
 )
 from mstar.graph.graph_io import WorkerGraphIO
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
-from mstar.model.base import ClientChunk
-from mstar.model.submodule_base import ModelInputsFromEngine
+from mstar.model.base import ClientChunk, serving_resources
+from mstar.model.submodule_base import ModelInputsFromEngine, engine_step
 from mstar.model.waypoint.components.attention import WaypointAttention
 from mstar.model.waypoint.components.dit import WaypointDiT
-from mstar.model.waypoint.components.taehv import decode_latent, initial_decoder_histories
+from mstar.model.waypoint.components.taehv import decode_latent, decoder_history_shapes
 from mstar.model.waypoint.config import (
+    WAYPOINT_VARIANT_360P,
     WaypointConfig,
     waypoint_1_5_1b_360p,
     waypoint_1_5_1b_720p,
 )
 from mstar.model.waypoint.submodules import (
     ACTIONS_STREAM,
-    ATTN_RESOURCE,
-    KV_RESOURCE,
+    DECODER,
+    KV,
     PRIME_WALK,
     ROLLOUT_LOOP_NAME,
     ROLLOUT_WALK,
@@ -71,7 +75,11 @@ from mstar.model.waypoint.waypoint_model import (
     VAE_ENCODER_NODE,
     WaypointModel,
 )
+from mstar.validation import DeploymentError, validate_deployment
 from mstar.validation.client_streams import check_client_streams
+
+# the flex attention over the ring, which takes the key of the ring's first read
+FLEX = "local_attn"
 
 
 @pytest.fixture(scope="module")
@@ -85,10 +93,11 @@ def model():
 
 
 @pytest.fixture(scope="module")
-def submodule(config):
-    """The real submodule over a meta-built DiT.
+def submodule(config, model):
+    """The real submodule over a meta-built DiT, bound to the handles the model
+    declares.
 
-    Meta, not a stub: ``bind_node_resources`` walking ``self.modules()`` and
+    Meta, not a stub: ``bind_node_state`` walking ``self.modules()`` and
     ``self.dit.dtype`` surviving ``cast_serving_dtypes`` are under test here,
     and a stub would assert them against itself. Meta also keeps
     ``prepare_inputs``' shapes/dtypes honest while allocating nothing.
@@ -99,7 +108,7 @@ def submodule(config):
     with torch.device("meta"):
         dit = WaypointDiT(config)
     dit.cast_serving_dtypes()
-    return WaypointDitSubmodule(dit, _FakeTaehv(), config)
+    return _bound(WaypointDitSubmodule(dit, _FakeTaehv(), config), model)
 
 
 class _HostOnlyDit(torch.nn.Module):
@@ -121,18 +130,49 @@ class _HostOnlyDit(torch.nn.Module):
 
 
 @pytest.fixture
-def host_submodule(config):
-    return WaypointDitSubmodule(_HostOnlyDit(), _FakeTaehv(), config)
+def host_submodule(config, model):
+    return _bound(WaypointDitSubmodule(_HostOnlyDit(), _FakeTaehv(), config), model, sessions=3)
 
 
-def _history_outputs(submodule: WaypointDitSubmodule) -> dict:
-    """A plausible ``outputs`` dict for the nine decoder histories, for tests
-    that call ``postprocess`` directly (bypassing ``forward``) to isolate the
-    clock bookkeeping it also does."""
-    return {
-        f"decoder_history_{idx}": [value]
-        for idx, value in enumerate(submodule._zero_histories(submodule.get_device()))
+def _bound(submodule: WaypointDitSubmodule, model: WaypointModel, sessions: int = 1) -> WaypointDitSubmodule:
+    """``submodule`` bound to the dit node's handles, over the ring and the
+    decoder pool ``model`` declares, sized for ``sessions`` worlds. The ring is
+    built on meta, since no test here runs the attention that reads it, and the
+    pool beside the submodule's weights."""
+    specs = {spec.resource_key: spec for spec in serving_resources(model, _sessions(sessions))}
+    resources = {
+        KV: build_resource(specs[KV], EngineResourceInfo(device=torch.device("meta"))),
+        DECODER: build_resource(specs[DECODER], EngineResourceInfo(device=submodule.get_device())),
+        FLEX: None,
     }
+    submodule.bind_node_state(node_handles(model, DIT_NODE, resources))
+    return submodule
+
+
+def _resources(submodule: WaypointDitSubmodule) -> dict:
+    """The ring and the decoder pool under ``submodule``'s handles, by key."""
+    return {KV: submodule.kv._ring, DECODER: submodule.decoder._pool}
+
+
+def _step(submodule: WaypointDitSubmodule, walk: str, request_ids: list[str]):
+    """The step ``submodule`` declares for ``request_ids``, admitted and planned
+    on its ring and decoder pool as the engine runs it."""
+    step = engine_step(submodule, graph_walk=walk, request_ids=request_ids, inputs=[])
+    step.set_ctx(StepContext(request_ids=request_ids, graph_walk=walk, slot=0, capture=False))
+    resources = _resources(submodule)
+    for rid in request_ids:
+        if rid not in resources[KV]._known_rids:
+            for resource in resources.values():
+                resource.ingest_request(rid)
+    for key, resource in resources.items():
+        assert resource.admit(step.steps[key], step.ctx).ok, f"{key} should hold every row"
+        resource.plan(step.steps[key], step.ctx)
+    return step
+
+
+def _commit(submodule: WaypointDitSubmodule, step) -> None:
+    for key, resource in _resources(submodule).items():
+        resource.commit(step.steps[key], step.ctx)
 
 
 def _fwd_info(
@@ -142,8 +182,8 @@ def _fwd_info(
 ) -> CurrentForwardPassInfo:
     return CurrentForwardPassInfo(
         request_id=request_id,
-        # prepare_inputs keys host state on the handle; postprocess and
-        # cleanup_request get the same value, so one token serves as both.
+        # prepare_inputs asks the ring for the handle's frames, and a step's
+        # rows carry the same value, so one token serves as both.
         rid_handle=request_id,
         graph_walk=graph_walk,
         fwd_index=0,
@@ -162,43 +202,47 @@ def _action(config, scroll: float = 0.0) -> dict[str, list[torch.Tensor]]:
 
 
 # ---------------------------------------------------------------------------
-# Declared resources
+# Declared state
 # ---------------------------------------------------------------------------
 
 
-def test_declares_exactly_the_ring_and_the_flex_attention_over_it(model):
-    specs = model.get_node_resources()
-    assert [type(s) for s in specs] == [KVSpec, AttentionSpec]
-    assert [s.resource_key for s in specs] == [KV_RESOURCE, ATTN_RESOURCE]
+def test_declares_exactly_the_ring_the_flex_attention_over_it_and_the_decoder_s_histories(model):
+    specs = node_resources(model)
+    assert [type(s) for s in specs] == [KVSpec, AttentionSpec, RecurrentStateSpec]
+    assert [s.resource_key for s in specs] == [KV, FLEX, DECODER]
     assert all(s.nodes == {DIT_NODE} for s in specs)
 
     assert isinstance(specs[0].config, RingKVConfig)
     # FLEX, not the FLASHINFER default: a paged kernel reassociates the
     # accumulation over KV blocks, breaking bit-exactness against the reference.
     assert specs[1].config.backend is AttnBackend.FLEX
-    assert specs[1].config.kv_cache == KV_RESOURCE
+    assert specs[1].config.kv_cache == KV
 
 
-def test_ring_geometry_is_copied_from_the_config_layer_for_layer(model, config):
-    """Waypoint's 24 layers are not alike, and none of the three per-layer
-    numbers is derivable from the others under the compacted global ring.
+def test_ring_geometry_follows_the_config_layer_for_layer(model, config):
+    """Waypoint's 24 layers are not alike: the global ones keep every 8th
+    frame of the last 128 in 16 slots, the local ones the last 16 frames.
     Asserted one layer at a time so a summarizing regression names the layer it
     broke."""
-    ring = model.get_node_resources()[0].config
+    ring = node_resources(model)[0].config
     assert ring.num_layers == config.n_layers == 24
     assert ring.num_kv_heads == config.n_kv_heads
     assert ring.num_qo_heads == config.n_heads
     assert ring.head_dim == config.d_head
     assert ring.tokens_per_frame == config.tokens_per_frame
-    # Sizing is a deployment question (`apply_yaml_overrides` runs after this
-    # hook); what's pinned here is the *default* of one session.
+    # Sizing is a deployment question (`apply_yaml_overrides` runs after the
+    # declaration); what's pinned here is the *default* of one session.
     assert ring.num_sessions == 1
+    assert ring.max_frames == 1 + config.max_frames, "the ring would refuse the seed frame or the last rollout frame"
 
     assert len(ring.layers) == config.n_layers
     for i, layer in enumerate(ring.layers):
-        assert layer.ring_frames == config.ring_frames(i), f"ring_frames, layer {i}"
-        assert layer.ring_buckets == config.ring_buckets(i), f"ring_buckets, layer {i}"
-        assert layer.pinned_dilation == config.pinned_dilation(i), f"dilation, layer {i}"
+        is_global = config.is_global_layer(i)
+        stride = config.global_pinned_dilation if is_global else 1
+        slots = (config.global_window if is_global else config.local_window) // stride
+        assert layer.ring_frames == slots, f"ring_frames, layer {i}"
+        assert layer.ring_buckets == slots, f"ring_buckets, layer {i}"
+        assert layer.pinned_dilation == stride, f"dilation, layer {i}"
 
     # The heterogeneity itself: if these two collapse to one value the loop
     # above would pass against a config that had also been flattened.
@@ -209,29 +253,14 @@ def test_ring_geometry_is_copied_from_the_config_layer_for_layer(model, config):
     assert {ring.layers[i].pinned_dilation for i in local} == {1}
 
 
-def test_ring_frames_and_buckets_are_read_as_two_separate_questions():
-    """They agree on every layer of the compacted 720P ring, which is exactly
-    what makes deriving one from the other look safe. Under the reference's
-    sizing (``full_global_ring=True``) a global layer is 128 frames indexed
-    by 16 buckets, and a derived value serves that layer a shredded history."""
-    model = WaypointModel(skip_weight_loading=True)  # fresh: mutated below
-    model.config = dataclasses.replace(model.config, full_global_ring=True)
-    ring = model.get_node_resources()[0].config
-
-    layer = ring.layers[min(model.config.global_layers)]
-    assert layer.ring_frames == model.config.global_window == 128
-    assert layer.ring_buckets == 16
-    assert layer.ring_frames != layer.ring_buckets
-
-
 def test_attention_resolves_after_the_cache_it_names(model):
-    specs = model.get_node_resources()
-    by_key = {s.resource_key: s for s in specs}
-    assert by_key[ATTN_RESOURCE].depends_on() == {KV_RESOURCE}
-    assert by_key[KV_RESOURCE].depends_on() == set()
+    by_key = {s.resource_key: s for s in node_resources(model)}
+    assert by_key[FLEX].depends_on() == {KV}
+    assert by_key[KV].depends_on() == set()
     # topo_sort only calls depends_on(), so the specs stand in for the built
     # resources here; the order it returns is the order the engine builds in.
-    assert topo_sort(by_key) == (KV_RESOURCE, ATTN_RESOURCE)
+    order = topo_sort(by_key)
+    assert order.index(KV) < order.index(FLEX), "the flex attention would build before the ring it reads"
 
 
 # ---------------------------------------------------------------------------
@@ -343,13 +372,11 @@ def test_a_rollout_step_on_the_empty_final_chunk_is_declined(submodule):
     final chunk is declined, which ends the loop with nothing committed into
     the ring. Prime takes no actions at all."""
     rid = "end"
-    submodule.request_states.pop(rid, None)
     assert submodule.prepare_inputs(
         ROLLOUT_WALK, _fwd_info(request_id=rid), {ACTIONS_STREAM: []}, is_final_stream_chunk=True,
     ) is None
     prime = {"latent": [torch.zeros((1, 1, *submodule.config.latent_shape))]}
     assert submodule.prepare_inputs(PRIME_WALK, _fwd_info(request_id=rid, graph_walk=PRIME_WALK), prime) is not None
-    submodule.cleanup_request(rid)
 
 
 # ---------------------------------------------------------------------------
@@ -482,10 +509,9 @@ def test_noise_differs_across_frames_and_across_seeds(submodule, config):
 def test_prime_is_idle_and_rollout_zero_receives_action_zero(
     host_submodule, config
 ):
-    """Prime advances the ring clock and takes no action; each rollout frame
-    takes its own chunk's row."""
+    """Prime commits the ring's first frame and takes no action; each rollout
+    frame takes its own chunk's row."""
     rid = "clock"
-    host_submodule.request_states.pop(rid, None)
 
     prime_inputs = {"latent": [torch.zeros((1, 1, *config.latent_shape), dtype=torch.float32)]}
     prime = host_submodule.prepare_inputs(
@@ -493,10 +519,7 @@ def test_prime_is_idle_and_rollout_zero_receives_action_zero(
     )
     assert int(prime.tensor_inputs["frame_pos"][0]) == 0
     assert float(prime.tensor_inputs["scroll"][0, 0, 0]) == 0.0
-    host_submodule.postprocess(
-        rid, _fwd_info(request_id=rid, graph_walk=PRIME_WALK),
-        _history_outputs(host_submodule),
-    )
+    _commit(host_submodule, _step(host_submodule, PRIME_WALK, [rid]))
 
     seen = []
     for row in range(2):
@@ -508,80 +531,31 @@ def test_prime_is_idle_and_rollout_zero_receives_action_zero(
             int(node_inputs.tensor_inputs["frame_pos"][0]),
             float(node_inputs.tensor_inputs["scroll"][0, 0, 0]),
         ))
-        host_submodule.postprocess(
-            rid, _fwd_info(request_id=rid), _history_outputs(host_submodule)
-        )
+        _commit(host_submodule, _step(host_submodule, ROLLOUT_WALK, [rid]))
 
     assert seen == [(1, 1.0), (2, 2.0)]
 
-    host_submodule.cleanup_request(rid)
-    assert rid not in host_submodule.request_states
 
+def test_declare_step_counts_a_frame_for_every_request_in_the_batch(host_submodule, config):
+    """No batch shape skips a row: a request whose frame goes uncounted writes
+    its next frame over this one and quietly rewrites its own history.
 
-def test_declare_step_carries_the_same_clock_prepare_inputs_reads(
-    host_submodule, config
-):
-    """One source for the clock, not two: `RingKVManager.admit` checks the
-    declared frame against `commit`'s last-recorded one, so a mismatch would
-    refuse valid frames and pass desynced ones -- the check inverted.
-
-    Read on the host, off `PerRequestState`, rather than off `NodeInputs`'
-    `frame_pos` (a `[1]` device tensor by then, so reading it back would sync
-    every step).
-    """
-    rid = "declare"
-    host_submodule.request_states.pop(rid, None)
-    inputs = _action(config)
-
-    for expected in range(3):
-        node_inputs = host_submodule.prepare_inputs(
-            ROLLOUT_WALK, _fwd_info(request_id=rid), inputs
-        )
-        step = host_submodule.declare_step(
-            graph_walk=ROLLOUT_WALK, request_ids=[rid], inputs=[node_inputs],
-        )
-        kv_step = step.get(KV_RESOURCE)
-
-        assert isinstance(kv_step, RingKVStep), (
-            "a KVStep here would admit and commit while silently switching the "
-            "clock check off"
-        )
-        assert kv_step.frames == ((rid, expected),)
-        assert dict(kv_step.frames)[rid] == int(
-            node_inputs.tensor_inputs["frame_pos"][0]
-        )
-
-        host_submodule.postprocess(
-            rid, _fwd_info(request_id=rid), _history_outputs(host_submodule)
-        )
-
-    host_submodule.cleanup_request(rid)
-
-
-def test_declare_step_names_a_clock_for_every_request_in_the_batch(host_submodule):
-    """No batch shape declines to answer: ``RingKVManager``'s continuity check
-    -- the only thing standing between a stalled clock and a world quietly
-    rewriting its own history -- must get a clock for every request in the
-    batch, not just batches of one.
-
-    The clocks below are genuinely different, so a declaration that broadcast
-    one request's frame across the batch fails here rather than passing on a
+    The counts below are genuinely different, so a frame read off one request
+    and broadcast across the batch fails here rather than passing on a
     coincidence.
     """
     for i, rid in enumerate(("a", "b", "c")):
-        host_submodule.request_states.pop(rid, None)
         for _ in range(i * 2):
-            host_submodule.postprocess(
-                rid, _fwd_info(request_id=rid), _history_outputs(host_submodule)
-            )
+            _commit(host_submodule, _step(host_submodule, ROLLOUT_WALK, [rid]))
 
-    step = host_submodule.declare_step(
-        graph_walk=ROLLOUT_WALK, request_ids=["a", "b", "c"], inputs=[],
-    )
+    _commit(host_submodule, _step(host_submodule, ROLLOUT_WALK, ["a", "b", "c"]))
 
-    assert step.get(KV_RESOURCE).frames == (("a", 0), ("b", 2), ("c", 4))
-    for rid in ("a", "b", "c"):
-        host_submodule.cleanup_request(rid)
+    frames = [
+        int(host_submodule.prepare_inputs(ROLLOUT_WALK, _fwd_info(request_id=rid), _action(config))
+            .tensor_inputs["frame_pos"][0])
+        for rid in ("a", "b", "c")
+    ]
+    assert frames == [1, 3, 5], "each request should read its own count, one frame past the batch step"
 
 
 # ---------------------------------------------------------------------------
@@ -609,10 +583,10 @@ def _validate(model, path: str) -> None:
 
 
 def _sessions(n: int) -> dict:
-    """The ``resources:`` block a deployment writes to size the ring — the same
-    one ``EngineManager.build`` feeds to ``apply_yaml_overrides``, which is why
-    the gate reads it here rather than inventing its own key."""
-    return {"resources": {KV_RESOURCE: {"num_sessions": n}}}
+    """The ``resources:`` block a deployment writes for ``n`` worlds: ``n``
+    ring sessions, and a decoder slot for each beside the pool's sink slot. The
+    same block ``EngineManager.build`` feeds to ``apply_yaml_overrides``."""
+    return {"resources": {KV: {"num_sessions": n}, DECODER: {"max_slots": n + 1}}}
 
 
 @pytest.mark.parametrize("limit", [None, 0, -1, True, 1.0, "2"])
@@ -640,17 +614,20 @@ def test_validate_config_yaml_refuses_a_deployment_with_no_admit_queue(
 
 
 @pytest.mark.parametrize("worlds", [0, -1, True, 1.0, 1.9, "2"])
-def test_validate_config_yaml_refuses_invalid_world_pool_size(
+def test_the_deployment_check_refuses_an_invalid_world_pool_size(
     model, tmp_path, worlds
 ):
+    """The model no longer reads ``num_sessions``: the ring's own check on the
+    ``resources:`` block refuses it at startup, with the deployment's other
+    problems."""
     path = _write_config(
         tmp_path,
         f"invalid_worlds_{worlds}.yaml",
         max_concurrent_requests=1,
-        **_sessions(worlds),
+        resources={KV: {"num_sessions": worlds}},
     )
-    with pytest.raises(ValueError, match=r"resources\.kv\.num_sessions"):
-        _validate(model, path)
+    with pytest.raises(DeploymentError, match=r"resources\.kv: num_sessions must be a positive int"):
+        validate_deployment(model, yaml.safe_load(pathlib.Path(path).read_text()), path)
 
 
 @pytest.mark.parametrize(("limit", "worlds"), [(2, 1), (8, 4), (2, None)])
@@ -671,7 +648,7 @@ def test_validate_config_yaml_refuses_more_arrivals_than_worlds(
         extra |= _sessions(worlds)
     path = _write_config(tmp_path, f"over_{limit}_{worlds}.yaml", **extra)
 
-    with pytest.raises(ValueError, match="exceeds the"):
+    with pytest.raises(ValueError, match=rf"need {limit} sessions of resources\.kv"):
         _validate(model, path)
 
 
@@ -719,12 +696,14 @@ def test_the_shipped_config_serializes_both_nodes_onto_one_rank(model, config_na
     assert set(by_walk[ROLLOUT_WALK].section.get_nodes()) == {DIT_NODE}
 
 
-def test_validate_config_yaml_refuses_a_step_wider_than_the_world_pool(tmp_path):
+def test_validate_config_yaml_refuses_a_step_wider_than_the_cap(tmp_path):
+    """A step's rows are requests, so the cap bounds it, even where the ring
+    has a session for every row."""
     model = WaypointModel(skip_weight_loading=True, step_batch_size=4)
     path = _write_config(
-        tmp_path, "wide_step.yaml", max_concurrent_requests=2, **_sessions(2)
+        tmp_path, "wide_step.yaml", max_concurrent_requests=2, **_sessions(4)
     )
-    with pytest.raises(ValueError, match="step_batch_size: 4"):
+    with pytest.raises(ValueError, match="step_batch_size: 4` exceeds `max_concurrent_requests: 2"):
         _validate(model, path)
 
 
@@ -733,65 +712,45 @@ def test_validate_config_yaml_warns_about_worlds_no_request_can_reach(
 ):
     """Legal, only wasteful -- a warning, not a refusal. Each unreachable
     world is ~816 MiB of ring at 720P allocated and never written, worth a
-    log line rather than a failed boot."""
+    log line rather than a failed boot. The ring's pool check logs it."""
     path = _write_config(
         tmp_path, "underused.yaml", max_concurrent_requests=2, **_sessions(8)
     )
 
-    with caplog.at_level(logging.WARNING):
+    with caplog.at_level(logging.WARNING, logger="mstar.engine.resources.kv.config"):
         _validate(model, path)
 
-    assert any("can never be filled" in r.getMessage() for r in caplog.records)
+    assert any(
+        r.name == "mstar.engine.resources.kv.config" and "6 of them are allocated and never filled" in r.getMessage()
+        for r in caplog.records
+    ), "the ring's six unreachable sessions should be logged"
 
 
 # ---------------------------------------------------------------------------
-# Resource binding
+# State binding
 # ---------------------------------------------------------------------------
 
 
-def test_bind_reaches_the_dit_and_all_twenty_four_attention_layers(submodule):
-    """One bind has to reach every caller: the 24 attention layers hold their
-    own references and call ``upsert``/``attend`` directly. Anything left
-    unbound raises mid-forward -- or, during warmup, poisons the capture
+def test_bind_reaches_the_submodule_and_all_twenty_four_attention_layers(submodule):
+    """One bind has to reach every caller: the submodule reads the ring's
+    frames and the decoder's histories, and the 24 attention layers hold their
+    own reference to the ring and call ``add``/``read`` directly. Anything
+    left unbound raises mid-forward -- or, during warmup, poisons the capture
     instead of failing a request."""
-    kv, attn = object(), object()
-    submodule.bind_node_resources({KV_RESOURCE: kv, ATTN_RESOURCE: attn})
-
-    assert submodule.node_resources[KV_RESOURCE] is kv
+    assert type(submodule.kv) is RingHandle and type(submodule.decoder) is ValueHandle
 
     layers = [m for m in submodule.modules() if isinstance(m, WaypointAttention)]
     assert len(layers) == 24
     for layer in layers:
-        assert layer.kv is kv, f"layer {layer.layer_idx} unbound"
-        assert layer.attn is attn, f"layer {layer.layer_idx} unbound"
+        assert layer.state is submodule.kv, f"layer {layer.layer_idx} unbound"
 
 
-def test_the_submodule_owns_the_dit_and_is_not_the_dit(submodule):
-    """The structural reason the test above can pass at all.
-
-    ``bind_node_resources`` walks ``self.modules()`` but skips ``self``; a
-    submodule that *is* the DiT would never be visited, leaving the root
-    unbound. Nothing on the root needs a resource today, so this is a guard
-    against that changing, not a live bug.
-    """
-    assert not isinstance(submodule, WaypointDiT)
-    assert isinstance(submodule.dit, WaypointDiT) and submodule.dit is not submodule
-    # The DiT must be a *child module*, not a plain attribute -- self.modules()
-    # is the only thing the walk follows.
-    assert any(m is submodule.dit for m in submodule.modules())
-    # The submodule itself must not define bind_resources: the walk skips
-    # self, so one would never run.
-    assert getattr(type(submodule), "bind_resources", None) is None
-
-
-def test_binding_without_a_declared_resource_fails_at_bind(submodule):
-    """Not mid-forward: layers resolve with ``.get`` (correct, since a layer
-    may sit on a node owning only some resources), so the node is what still
-    knows which keys it declared and can name the missing one.
-    """
-    for partial in ({ATTN_RESOURCE: object()}, {KV_RESOURCE: object()}, {}):
+def test_binding_without_a_declared_handle_fails_at_bind(submodule):
+    """Not mid-forward: the submodule and its layers take each handle by its
+    declared name, so a missing one is named when the node binds."""
+    for partial in ({DECODER: object()}, {KV: object()}, {}):
         with pytest.raises(KeyError):
-            submodule.bind_node_resources(partial)
+            submodule.bind_node_state(partial)
 
 
 # ---------------------------------------------------------------------------
@@ -939,7 +898,10 @@ class TGrow(torch.nn.Module):
 
 
 class _FakeTaehv(torch.nn.Module):
-    """Cheap tensor-only TAEHV with the released architecture facts."""
+    """Cheap tensor-only TAEHV with the released architecture facts. Its
+    decoder has the pinned one's three stages of three MemBlocks, at 256, 128
+    and 64 channels and each at twice the height and width of the one before,
+    so its histories are the ones Waypoint's state declares."""
 
     patch_size = 2
     latent_channels = 32
@@ -957,7 +919,14 @@ class _FakeTaehv(torch.nn.Module):
             *(MemBlock(32) for _ in range(9)),
         ])
         self.decoder = torch.nn.ModuleList([
-            *(MemBlock(32) for _ in range(9)),
+            torch.nn.Conv2d(32, 256, 1, bias=False),
+            *(MemBlock(256) for _ in range(3)),
+            torch.nn.Upsample(scale_factor=2),
+            torch.nn.Conv2d(256, 128, 1, bias=False),
+            *(MemBlock(128) for _ in range(3)),
+            torch.nn.Upsample(scale_factor=2),
+            torch.nn.Conv2d(128, 64, 1, bias=False),
+            *(MemBlock(64) for _ in range(3)),
             TGrow(self.t_upscale),
         ])
         self.to(torch.bfloat16)
@@ -1018,9 +987,11 @@ class _FakeDit(torch.nn.Module):
 @pytest.fixture
 def decoder(taehv_weights, ae_config):
     """A ``WaypointDitSubmodule`` over a fake dit: the fused node under test,
-    minus the denoiser. Named ``decoder`` because every test below exercises
-    the TAEHV history half of this node."""
-    return WaypointDitSubmodule(_FakeDit(ae_config), taehv_weights, ae_config)
+    minus the denoiser, bound to a decoder pool of two worlds. Named
+    ``decoder`` because every test below exercises the TAEHV history half of
+    this node."""
+    model = WaypointModel(skip_weight_loading=True, variant=WAYPOINT_VARIANT_360P)
+    return _bound(WaypointDitSubmodule(_FakeDit(ae_config), taehv_weights, ae_config), model, sessions=2)
 
 
 def _seed_clip(ae_config, value: int = 200) -> torch.Tensor:
@@ -1040,10 +1011,11 @@ def _decode(
     decoder, *, request_id="r0", graph_walk=ROLLOUT_WALK,
     seed_latent: torch.Tensor | None = None,
 ):
-    """Drive the fused submodule through one real
-    ``prepare_inputs``/``forward``/``postprocess`` cycle -- the same sequence
-    the engine runs -- rather than poking ``taehv`` directly, since several
-    tests below check that this cycle threads the nine histories correctly.
+    """Drive the fused submodule through one real step -- ``prepare_inputs``,
+    the step it declares admitted and planned, ``forward`` between the step's
+    calls, then the commit, the same sequence the engine runs -- rather than
+    poking ``taehv`` directly, since several tests below check that this cycle
+    threads the nine histories correctly.
     """
     info = _fwd_info(request_id, graph_walk=graph_walk)
     if graph_walk == PRIME_WALK:
@@ -1051,12 +1023,16 @@ def _decode(
     else:
         inputs = _action(decoder.config)
     prepared = decoder.prepare_inputs(graph_walk, info, inputs)
+    step = _step(decoder, graph_walk, [request_id])
+    step.begin_calls()
     outputs = decoder.forward(
         graph_walk,
         _engine_inputs(request_id, graph_walk),
         **prepared.tensor_inputs,
     )
-    decoder.postprocess(request_id, info, outputs, prepared)
+    step.check_calls()
+    _commit(decoder, step)
+    step.end_calls()
     return outputs
 
 
@@ -1181,7 +1157,6 @@ def test_the_fused_decode_turns_one_frame_into_one_raw_clip(decoder, ae_config):
     # forward_batched drops this leading dim per row before postprocess sees it.
     assert frames.shape == (1, ae_config.temporal_compression, 360, 640, 3)
     assert frames.dtype == torch.uint8
-    decoder.cleanup_request("r0")
 
 
 def test_forward_batched_hands_each_request_its_own_row(decoder, monkeypatch):
@@ -1192,12 +1167,8 @@ def test_forward_batched_hands_each_request_its_own_row(decoder, monkeypatch):
     ``prepare_inputs`` builds for the next step)."""
     frames = torch.arange(2 * 4 * 2 * 2 * 3, dtype=torch.uint8).reshape(2, 4, 2, 2, 3)
     clock = torch.tensor([5, 9])
-    history = torch.arange(2 * 3 * 2 * 2, dtype=torch.float32).reshape(2, 3, 2, 2)
     monkeypatch.setattr(
-        decoder, "forward",
-        lambda *a, **k: {
-            "video_output": [frames], "clock": [clock], "decoder_history_0": [history],
-        },
+        decoder, "forward", lambda *a, **k: {"video_output": [frames], "clock": [clock]},
     )
     engine_inputs = ModelInputsFromEngine(
         request_ids=["a", "b"],
@@ -1210,23 +1181,25 @@ def test_forward_batched_hands_each_request_its_own_row(decoder, monkeypatch):
     for i, rid in enumerate("ab"):
         assert torch.equal(out[rid]["video_output"][0], frames[i])
         assert torch.equal(out[rid]["clock"][0], clock[i : i + 1])
-        assert torch.equal(out[rid]["decoder_history_0"][0], history[i : i + 1])
         assert all(isinstance(v[0], torch.Tensor) for v in out[rid].values())
 
 
 def test_decode_latent_batches_rows_independently(taehv_weights, ae_config):
     """``decode_latent`` at B=2 equals two independent B=1 calls, row for row.
 
-    MemBlock and TGrow (``_FakeTaehv``'s decoder) are convs/reshapes that
-    never mix across the batch dim, so row 1 must not depend on row 0's
-    latent -- the property the batched engine path relies on."""
+    ``_FakeTaehv``'s decoder is convs, upsamples and reshapes that never mix
+    across the batch dim, so row 1 must not depend on row 0's latent -- the
+    property the batched engine path relies on."""
     latent_shape = (1, ae_config.channels, *ae_config.latent_shape[1:])
     generator = torch.Generator().manual_seed(7)
     latents = [
         torch.randn(latent_shape, generator=generator).to(torch.bfloat16)
         for _ in range(2)
     ]
-    histories = [initial_decoder_histories(taehv_weights, latent) for latent in latents]
+    histories = [
+        tuple(latent.new_zeros(1, *shape) for shape in decoder_history_shapes(*latent.shape[-2:]))
+        for latent in latents
+    ]
 
     solo = [
         decode_latent(
@@ -1250,59 +1223,49 @@ def test_decode_latent_batches_rows_independently(taehv_weights, ae_config):
             assert torch.equal(batched_state[idx][row], solo_state[idx][0])
 
 
-def test_prime_and_rollout_use_the_same_fixed_tensor_histories(decoder, ae_config):
-    latent = torch.full(
-        (1, 1, ae_config.channels, *ae_config.latent_shape[1:]), 0.125, dtype=torch.bfloat16,
-    )
-    _decode(decoder, graph_walk=PRIME_WALK, seed_latent=latent)
-    state = decoder.request_state("r0")
-    keys = [f"decoder_history_{idx}" for idx in range(9)]
-    assert set(state.tensors) == set(keys)
-    addresses = [state[key].data_ptr() for key in keys]
+def test_fused_decode_histories_are_isolated_interleaved_and_cleaned_up(decoder, ae_config, monkeypatch):
+    """Each decode reads its request's nine histories as that request's last
+    decode wrote them, however requests interleave, and a request primed again
+    after its removal starts from zeros."""
+    decodes = []
+    decode = decoder._decode_latent
 
-    _decode(decoder, graph_walk=ROLLOUT_WALK)
-    assert [state[key].data_ptr() for key in keys] == addresses
-    assert all(state[key].dtype == torch.bfloat16 for key in keys)
-    decoder.cleanup_request("r0")
+    def recording(ae_model, latent, histories, **kwargs):
+        frames, written = decode(ae_model, latent, histories, **kwargs)
+        decodes.append((histories, written))
+        return frames, written
 
-
-def test_fused_decode_histories_are_isolated_interleaved_and_cleaned_up(decoder, ae_config):
-    latent = torch.full(
-        (1, 1, ae_config.channels, *ae_config.latent_shape[1:]), 0.125, dtype=torch.bfloat16,
-    )
-    first = _decode(decoder, request_id="a", graph_walk=PRIME_WALK, seed_latent=latent)
-    second = _decode(decoder, request_id="b", graph_walk=PRIME_WALK, seed_latent=latent)
-    assert torch.equal(first["video_output"][0], second["video_output"][0])
-    before_b = {
-        key: value.clone() for key, value in decoder.request_state("b").tensors.items()
-    }
-    # what's under test is address/isolation stability across interleaved requests
-    for _ in range(20):
+    monkeypatch.setattr(decoder, "_decode_latent", recording)
+    shape = (1, 1, ae_config.channels, *ae_config.latent_shape[1:])
+    # different seed latents, so a request reading the other's histories shows
+    latents = {"a": torch.full(shape, 0.125, dtype=torch.bfloat16), "b": torch.full(shape, 0.5, dtype=torch.bfloat16)}
+    first = _decode(decoder, request_id="a", graph_walk=PRIME_WALK, seed_latent=latents["a"])
+    _decode(decoder, request_id="b", graph_walk=PRIME_WALK, seed_latent=latents["b"])
+    for _ in range(3):
         _decode(decoder, request_id="a", graph_walk=ROLLOUT_WALK)
         _decode(decoder, request_id="b", graph_walk=ROLLOUT_WALK)
-    assert all(
-        not torch.equal(before_b[key], value)
-        for key, value in decoder.request_state("b").tensors.items()
-    )
-    assert all(
-        decoder.request_state("a")[key].data_ptr()
-        != decoder.request_state("b")[key].data_ptr()
-        for key in before_b
-    )
 
-    decoder.cleanup_request("a")
-    assert "a" not in decoder.request_states
-    restarted = _decode(decoder, request_id="a", graph_walk=PRIME_WALK, seed_latent=latent)
+    written = {}
+    for rid, (read, wrote) in zip("ab" * 4, decodes, strict=True):
+        expected = written.get(rid)
+        if expected is None:
+            assert not any(history.any() for history in read), f"{rid}'s prime should read zeros"
+        else:
+            assert all(map(torch.equal, read, expected)), f"{rid} should read what its own last decode wrote"
+        written[rid] = wrote
+
+    for resource in _resources(decoder).values():
+        resource.remove_request("a")
+    restarted = _decode(decoder, request_id="a", graph_walk=PRIME_WALK, seed_latent=latents["a"])
     assert torch.equal(restarted["video_output"][0], first["video_output"][0])
-    decoder.cleanup_request("a")
-    decoder.cleanup_request("b")
+    assert not any(history.any() for history in decodes[-1][0]), "a request primed again should start from zeros"
 
 
 def test_the_encoder_and_the_fused_decode_share_only_weights(
     encoder, decoder, taehv_weights, ae_config
 ):
     """Encoder prime is stateless; only the fused decode's histories survive a
-    request."""
+    request, in its slot of the decoder pool."""
     image = encoder.prepare_inputs(
         PRIME_WALK, _fwd_info(), {"image_inputs": [_seed_clip(ae_config)]}
     ).tensor_inputs["image"]
@@ -1310,8 +1273,7 @@ def test_the_encoder_and_the_fused_decode_share_only_weights(
     _decode(decoder, graph_walk=PRIME_WALK, seed_latent=latent)
     assert encoder.taehv is decoder.taehv is taehv_weights
     assert encoder.request_states == {}
-    assert len(decoder.request_state("r0").tensors) == 9
-    decoder.cleanup_request("r0")
+    assert _resources(decoder)[DECODER]._slots["r0"]["main"].has_state, "the prime's histories should be kept"
 
 
 def test_ae_graphs_are_compiled_for_capture_but_remain_optional(encoder, decoder):
@@ -1363,7 +1325,7 @@ def test_the_shell_builds_without_the_taehv_package(monkeypatch):
     unweighted = WaypointModel(skip_weight_loading=True)
     assert set(unweighted.get_graph_walk_graphs()) == {PRIME_WALK, ROLLOUT_WALK}
     assert unweighted.nodes == [DIT_NODE, VAE_ENCODER_NODE]
-    assert unweighted.get_node_resources()
+    assert node_resources(unweighted)
     for node in (VAE_ENCODER_NODE, DIT_NODE):
         assert unweighted.get_submodule(node) is None
 
