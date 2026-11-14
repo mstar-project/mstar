@@ -1,0 +1,16 @@
+M*
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This repository includes third-party code, each part under its own license.
+
+-------------------------------------------------------------------------------
+FastVideo: the Wan2.2-VAE decoder kernels
+
+Files:   mstar/model/components/wan22_vae_kernel/csrc/
+Source:  https://github.com/hao-ai-lab/FastVideo, fastvideo-kernel/wan22_vae_decode
+         at commit ec9145a
+License: Apache License, Version 2.0 (the same text as this repository's LICENSE)
+
+Changes: binding.cpp takes the latent grid from its input instead of upstream's
+fixed 704x1248 and adds one-GPU entry points and a stream decoder; each file's
+header says whether it is changed.
