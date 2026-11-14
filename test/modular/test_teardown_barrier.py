@@ -13,6 +13,7 @@ import pytest
 import torch
 
 from mstar.conductor.conductor import Conductor, RequestData, _req_id_to_seed, _request_seed
+from mstar.conductor.episodes import EpisodeRecords
 from mstar.graph.base import TensorPointerInfo
 from mstar.utils.ipc_format import (
     FailRequests,
@@ -53,6 +54,8 @@ def _new_request(rid, model_kwargs=None):
 def _conductor(requests, drain_ttl_s=120.0):
     c = Conductor.__new__(Conductor)
     c._episode_array_names = frozenset()
+    c._episode_records = EpisodeRecords()
+    c._episode_idle_timeout_s = 600.0
     c._queued_since = {}
     c.sent = []
     c.admits = 0
