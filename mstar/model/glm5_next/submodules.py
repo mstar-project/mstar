@@ -102,6 +102,19 @@ class _Mailbox(NamedTuple):
     ready: torch.Tensor
 
 
+class _Count(NamedTuple):
+    """A request's row of the count edge under MTP, which the prefill starts and each verify step moves on."""
+
+    emitted: int
+    # whether the verify step that wrote the row ends the decode loop, or -1 from the prefill
+    stop: int
+    # the request's max_tokens and ignore_eos, read once at the prefill
+    max_tokens: int
+    ignore_eos: int
+    # the prompt's length, or -1 until the first decode step reads it
+    prompt_len: int
+
+
 class Glm5NextLLMSubmodule(ARNodeSubmodule):
     """Embed + 45 hybrid decoder layers + lm_head, one fat TP node, and with MTP the
     layer-45 draft module."""
@@ -273,12 +286,17 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         if graph_walk == "decode":
             # the tokens emitted so far, the last of which this step takes in
             if self.mtp_k > 0:
-                count = int(inputs[COUNT][0])
-                carried = {COUNT: count}
+                count = _Count(*inputs[COUNT][0].tolist())
+                emitted = count.emitted
+                # the walk plan puts the prompt's length in the decode steps' metadata alone
+                prompt_len = count.prompt_len if count.prompt_len >= 0 else fwd_info.step_metadata[PROMPT_LEN]
+                carried = {"emitted": emitted, "max_tokens": count.max_tokens, "ignore_eos": count.ignore_eos,
+                           "prompt_len": prompt_len}
             else:
-                count = fwd_info.dynamic_loop_iter_counts.get("decode_loop", 0) + 1
+                emitted = fwd_info.dynamic_loop_iter_counts.get("decode_loop", 0) + 1
+                prompt_len = fwd_info.step_metadata[PROMPT_LEN]
             # holes are cache rows, not context: the model sees the prompt and the emitted tokens
-            context = fwd_info.step_metadata[PROMPT_LEN] + count - 1 + seq_len
+            context = prompt_len + emitted - 1 + seq_len
         if context > self.config.context_limit:
             raise RuntimeError(
                 f"request {fwd_info.request_id}: context {context} exceeds {self.config.context_limit}; "
@@ -585,30 +603,46 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
         per_request_info: dict[str, CurrentForwardPassInfo],
     ) -> dict[str, NameToTensorList]:
         """A verify step's emitted tokens per request, the accepted drafts and the token after
-        them, cut at a stop token and at max_tokens, and the count of tokens emitted after it.
-        Waits for the device to stage the verdict (the MTP pass that seeds the next step is
-        still running)."""
+        them, cut at a stop token and at max_tokens, and its `_Count` row, which says whether
+        the step ends the loop. Waits for the device to stage the verdict (the MTP pass that
+        seeds the next step is still running)."""
         if self.mtp_k == 0 or not request_ids:
             return {}
+        counts: list[int] = []
         if per_request_info[request_ids[0]].graph_walk != "decode":
             # the prefill emits each request's first token
-            return {rid: {COUNT: [torch.ones(1, dtype=torch.long)]} for rid in request_ids}
-        out = {}
-        verdicts = self._read_verdict(len(request_ids))
-        for rid, inp, (target, accepted) in zip(request_ids, inputs, verdicts, strict=True):
-            info, count = per_request_info[rid], inp.kwargs[COUNT]
-            emitted = target[:accepted + 1][:max(info.max_tokens - count, 1)]
-            if not info.resource_configs[SAMPLER].ignore_eos:
+            for rid in request_ids:
+                info = per_request_info[rid]
+                counts += _Count(1, -1, info.max_tokens, info.resource_configs[SAMPLER].ignore_eos, -1)
+            return {rid: {COUNT: [count]} for rid, count in zip(request_ids, self._count_rows(counts), strict=True)}
+        eos_ids = self.config.eos_token_ids
+        tokens, lengths = [], []
+        for inp, (target, accepted) in zip(inputs, self._read_verdict(len(request_ids)), strict=True):
+            row = inp.kwargs
+            emitted = target[:accepted + 1][:max(row["max_tokens"] - row["emitted"], 1)]
+            is_eos = False
+            if not row["ignore_eos"]:
                 for i, token in enumerate(emitted):
-                    if token in self.config.eos_token_ids:
-                        emitted = emitted[:i + 1]
+                    if token in eos_ids:
+                        emitted, is_eos = emitted[:i + 1], True
                         break
             self._log_acceptance(accepted)
-            out[rid] = {
-                "new_token": [torch.tensor(emitted, dtype=torch.long)],
-                COUNT: [torch.tensor([count + len(emitted)], dtype=torch.long)],
-            }
-        return out
+            count = row["emitted"] + len(emitted)
+            stop = self._mtp_stops(is_eos, count, row["max_tokens"], row["prompt_len"])
+            tokens += emitted
+            lengths.append(len(emitted))
+            counts += _Count(count, stop, row["max_tokens"], row["ignore_eos"], row["prompt_len"])
+        # one tensor a step for the tokens and one for the counts, and a view of each per row
+        tokens = torch.tensor(tokens, dtype=torch.long).split(lengths)
+        return {
+            rid: {"new_token": [new], COUNT: [count]}
+            for rid, new, count in zip(request_ids, tokens, self._count_rows(counts), strict=True)
+        }
+
+    @staticmethod
+    def _count_rows(counts: list[int]) -> tuple[torch.Tensor, ...]:
+        """The requests' `_Count` rows, flat in ``counts``, as the rows of one tensor."""
+        return torch.tensor(counts, dtype=torch.long).view(-1, len(_Count._fields)).unbind(0)
 
     # -- slow-postprocess path (worker thread, after execute_batch) -------
 
@@ -634,8 +668,11 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
             return set()
         # A prefill's stop check gets the step's stop buffers, its sampled tokens alone, and not the count it persists
         # for the decode loop. Its one token stops as a plain step's does.
-        if self.mtp_k > 0 and request_info.graph_walk != "prefill":
-            return self._mtp_check_stop(request_info, outputs["new_token"][0], int(outputs[COUNT][0]))
+        if self.mtp_k > 0 and COUNT in outputs:
+            # a verify step decided its stop where it cut its tokens
+            stop = _Count(*outputs[COUNT][0].tolist()).stop
+            if stop >= 0:
+                return {"decode_loop"} if stop else set()
         # check_stop gets host tensors, so .item() here does not sync
         return self._stops(request_info, outputs["new_token"][0].item())
 
@@ -681,18 +718,12 @@ class Glm5NextLLMSubmodule(ARNodeSubmodule):
             return {"decode_loop"}
         return set()
 
-    def _mtp_check_stop(
-        self, request_info: CurrentForwardPassInfo, new_token: torch.Tensor, count: int,
-    ) -> set[str]:
-        """Stop on a stop token among this step's tokens, at max_tokens, or while two more
-        blocks fit in the context (the next step may already be scheduled when this stop
-        lands). ``count`` is the tokens emitted up to this step. The context is the stricter
-        bound: every verify step keeps its whole block in the cache, rejected rows as holes,
-        and the cache holds ``k + 1`` rows for each token of the context."""
-        ignore_eos = request_info.resource_configs[SAMPLER].ignore_eos
-        is_eos = not ignore_eos and any(
-            t in self.config.eos_token_ids for t in new_token.tolist())
-        full = request_info.step_metadata[PROMPT_LEN] + count + 2 * self.mtp_block > self.config.context_limit
-        if is_eos or count >= request_info.max_tokens or full:
-            return {"decode_loop"}
-        return set()
+    def _mtp_stops(self, is_eos: bool, count: int, max_tokens: int, prompt_len: int) -> bool:
+        """Whether a verify step ends the decode loop: on a stop token among its tokens
+        (``is_eos``), at max_tokens, or while two more blocks fit in the context (the next
+        step may already be scheduled when this stop lands). ``count`` is the tokens emitted
+        up to this step. The context is the stricter bound: every verify step keeps its whole
+        block in the cache, rejected rows as holes, and the cache holds ``k + 1`` rows for
+        each token of the context."""
+        full = prompt_len + count + 2 * self.mtp_block > self.config.context_limit
+        return is_eos or count >= max_tokens or full

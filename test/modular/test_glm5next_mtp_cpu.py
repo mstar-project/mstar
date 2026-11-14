@@ -316,7 +316,7 @@ def test_decode_stops_while_the_next_block_fits():
         out, stops = _step(engine, "decode", {"r": _carry(out["r"])}, 10 * limit,
                            step, ignore_eos=True, prompt_lens=lens)
         step += 1
-    real = len(prompt) + int(out["r"][COUNT][0])
+    real = len(prompt) + int(out["r"][COUNT][0][0])
     assert real + block <= limit < real + 2 * block
     _step(engine, "decode", {"r": _carry(out["r"])}, 10 * limit, step, ignore_eos=True, prompt_lens=lens)
     assert _stored(engine, "r") == len(prompt) + block * (step + 1), "the step scheduled before the stop didn't run"
@@ -324,22 +324,15 @@ def test_decode_stops_while_the_next_block_fits():
 
 
 def _stop_after(prompt_len, max_tokens, per_step, k=3, context_limit=2048):
-    """(verify steps, tokens emitted) when _mtp_check_stop ends a request that emits
+    """(verify steps, tokens emitted) when _mtp_stops ends a request that emits
     ``per_step`` tokens per step, ignore_eos."""
     sub = types.SimpleNamespace(
         mtp_block=k + 1, config=types.SimpleNamespace(eos_token_ids=(), context_limit=context_limit),
     )
-    sampler = {SAMPLER: types.SimpleNamespace(ignore_eos=True)}
-
-    def stops(walk, tokens, count):
-        info = types.SimpleNamespace(graph_walk=walk, resource_configs=sampler, max_tokens=max_tokens,
-                                     step_metadata={PROMPT_LEN: prompt_len} if walk == "decode" else {})
-        return Glm5NextLLMSubmodule._mtp_check_stop(sub, info, torch.tensor(tokens), count)
-
     generated = 1
     for step in range(1, 100_000):
         generated += per_step
-        if stops("decode", [7] * per_step, generated):
+        if Glm5NextLLMSubmodule._mtp_stops(sub, False, generated, max_tokens, prompt_len):
             return step, generated
     raise AssertionError("never stopped")
 
@@ -529,10 +522,11 @@ def test_a_verify_step_carries_its_count_to_the_stop(monkeypatch):
     decode = types.SimpleNamespace(graph_walk="decode", max_tokens=9, resource_configs=sampler,
                                    step_metadata={PROMPT_LEN: 16})
     (out,) = sub.unpack_packed_outputs({}, ["r"], [5], [ARNodeInputs(input_seq_len=5)], {"r": prefill}).values()
-    assert out[COUNT][0].tolist() == [1]
+    assert out[COUNT][0].tolist() == [1, -1, 9, True, -1]
     for count, emitted, stops in ((1, 4, set()), (5, 4, {"decode_loop"}), (7, 2, {"decode_loop"})):
-        inputs = [ARNodeInputs(input_seq_len=4, kwargs={COUNT: count})]
+        kwargs = {"emitted": count, "max_tokens": 9, "ignore_eos": True, "prompt_len": 16}
+        inputs = [ARNodeInputs(input_seq_len=4, kwargs=kwargs)]
         (out,) = sub.unpack_packed_outputs({}, ["r"], [4], inputs, {"r": decode}).values()
         assert out["new_token"][0].tolist() == [5, 6, 7, 8][:emitted]
-        assert out[COUNT][0].tolist() == [count + emitted]
+        assert out[COUNT][0].tolist() == [count + emitted, bool(stops), 9, True, 16]
         assert sub.check_stop("r", decode, out) == stops, f"a step that came in at {count}"

@@ -227,7 +227,7 @@ def test_a_decode_row_from_prepare_inputs_has_the_template_row_s_span(k):
     info = SimpleNamespace(
         request_id="r", resource_configs={}, dynamic_loop_iter_counts={}, step_metadata={PROMPT_LEN: 5},
     )
-    signals = {"text_inputs": [torch.tensor([7])], COUNT: [torch.tensor(5)]}
+    signals = {"text_inputs": [torch.tensor([7])], COUNT: [torch.tensor([5, 0, 16, 1, 5])]}
     row = node.prepare_inputs("decode", info, signals)
     declared, real = (node.declare_step("decode", ["a"], [one]) for one in (template, row))
     assert (declared.segments, declared.state) == (real.segments, real.state), (
