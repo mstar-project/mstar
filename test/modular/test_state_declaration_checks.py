@@ -11,6 +11,7 @@ import os
 import subprocess
 import sys
 from dataclasses import dataclass, replace
+from types import SimpleNamespace
 from typing import Tuple
 
 sys.path.insert(0, ".")
@@ -47,10 +48,14 @@ _ATTEND = Attend(q_heads=8)
 class _StubModel:
     """Serves declarations and walks without building anything."""
 
-    def __init__(self, *arrays, combined=None, kv_labels=None):
+    def __init__(self, *arrays, combined=None, kv_labels=None, hand_written=()):
         self.arrays = list(arrays)
         self.combined = combined or {}
         self.labels = kv_labels or {}
+        self.hand_written = hand_written
+
+    def get_node_resources(self):
+        return [SimpleNamespace(resource_key=key) for key in self.hand_written]
 
     def kv_labels(self):
         return self.labels
@@ -276,6 +281,14 @@ def test_kv_labels_may_name_only_declared_labels():
 def test_kv_labels_may_name_only_declared_arrays():
     problem = _one_problem(_array(), kv_labels={"other": {"main": None}})
     assert problem.startswith("kv_labels()['other']") and "no declared array" in problem
+
+
+def test_kv_labels_of_a_model_part_on_the_contract_may_name_a_cache_it_writes_by_hand():
+    """MiniCPM-o declares only its vocoder's state, and its LLM's and TTS's caches are still specs it writes."""
+    model = _StubModel(_array(), kv_labels={"llm_kv": {"main": None}}, hand_written=("llm_kv",))
+    assert state_declaration_problems(model) == []
+    problem = _one_problem(_array(), kv_labels={"tts_kv": {"main": None}}, hand_written=("llm_kv",))
+    assert problem.startswith("kv_labels()['tts_kv']") and "no spec the model writes by hand" in problem
 
 
 def test_a_sampler_node_must_be_in_the_model():

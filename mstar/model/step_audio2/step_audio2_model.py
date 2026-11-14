@@ -56,7 +56,12 @@ from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import KVLabel, Model, ProcessPromptOutput, WalkStep
 from mstar.model.components.token2wav.keys import Token2WavKeys
 from mstar.model.components.token2wav.model import DIT_COMPUTE_DTYPE, HOP, WINDOW, load_token2wav
-from mstar.model.components.token2wav.resources import check_token2wav_slots, token2wav_resources
+from mstar.model.components.token2wav.resources import (
+    check_token2wav_slots,
+    token2wav_kernel_settings,
+    token2wav_resources,
+    token2wav_state,
+)
 from mstar.model.components.token2wav.submodule import Token2WavSubmodule
 from mstar.model.multimodal import TEXT, PromptPart, chat_turns, check_attachments, parts_from_modalities
 from mstar.model.step_audio2 import processor
@@ -285,11 +290,12 @@ class StepAudio2Model(Model):
                 entry=KVEntry(heads=audio.n_audio_head, head_dim=audio.head_dim), max_len=0,
                 reads={AUDIO_ATTN: Read(mask=BlockPrefix(), op=Attend(q_heads=audio.n_audio_head))},
             ),
+            *token2wav_state(T2W_KEYS, TOKEN2WAV),
         ]
 
     def kernel_settings(self) -> dict[str, dict[str, Any]]:
         # a request's 25 s clips; more run eagerly once the tower captures
-        return {AUDIO_ATTN: {"max_segments_per_request": 8}}
+        return {AUDIO_ATTN: {"max_segments_per_request": 8}, **token2wav_kernel_settings(T2W_KEYS, T2W_DEFAULT_SLOTS)}
 
     def get_node_resources(self) -> list[NodeResourceSpec]:
         return [

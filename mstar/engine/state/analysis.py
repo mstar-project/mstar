@@ -37,7 +37,7 @@ def state_declaration_problems(model: "Model") -> list[str]:
     for array in arrays:
         problems += _read_problems(array, walks, combined)
         problems += _array_problems(array)
-    problems += _kv_label_problems(model.kv_labels(), arrays)
+    problems += _kv_label_problems(model.kv_labels(), arrays, model)
     problems += _cross_read_problems(arrays)
     problems += _value_problems(arrays, model.kv_labels())
     for declared in declarations:
@@ -116,12 +116,20 @@ def _array_problems(array: Array) -> list[str]:
     return problems
 
 
-def _kv_label_problems(kv_labels: Mapping[str, Mapping[str, object]], arrays: Sequence[Array]) -> list[str]:
+def _kv_label_problems(
+    kv_labels: Mapping[str, Mapping[str, object]], arrays: Sequence[Array], model: "Model",
+) -> list[str]:
     by_name = {array.name: array for array in arrays}
     problems: list[str] = []
+    hand_written: set[str] | None = None
     for key, labels in kv_labels.items():
         if key not in by_name:
-            problems.append(f"kv_labels()[{key!r}]: it names no declared array, of {sorted(by_name)}")
+            if hand_written is None:
+                # a model only part on the contract still writes its other caches' specs by hand
+                hand_written = {spec.resource_key for spec in model.get_node_resources() or ()}
+            if key not in hand_written:
+                problems.append(f"kv_labels()[{key!r}]: it names no declared array, of {sorted(by_name)}, and no "
+                                "spec the model writes by hand")
             continue
         problems += [
             f"kv_labels()[{key!r}][{label!r}]: it is not in Array {key!r}.labels, {sorted(by_name[key].labels)}"

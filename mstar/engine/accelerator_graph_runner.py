@@ -2487,16 +2487,22 @@ class PiecewiseAcceleratorGraphRunner:
                 raise RuntimeError(f"piecewise {self._label!r} eager admit failed: {outcome.reason}")
             self._step_runner.plan(step)
         ids = list(request_ids) if request_ids is not None else []
-        out = self._normalize_output(self._config.capture_fn(PiecewiseCallInputs(
+        call = PiecewiseCallInputs(
             static_inputs=static_inputs,
             engine_inputs=ModelInputsFromEngine(
                 request_ids=ids, per_request_info=dummy_metadata(ids, PIECEWISE_WALK),
                 resources=dict(self._resources),
             ),
             kwargs=self._config.forward_kwargs,
-        )))
-        if step is not None:
-            self._step_runner.commit(step)
+        )
+        if step is None:
+            return PiecewiseOutput(self._normalize_output(self._config.capture_fn(call)),
+                                   real_total_tokens if is_packed else real_bs)
+        # the region's calls answer for its own rows, nested in its node's step, as a replay's were at capture
+        with step.nested_calls():
+            out = self._normalize_output(self._config.capture_fn(call))
+        self._step_runner.commit(step)
+        step.commit_calls()
         return PiecewiseOutput(out, real_total_tokens if is_packed else real_bs)
 
     @staticmethod

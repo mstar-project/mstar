@@ -2936,7 +2936,10 @@ Both types share the base ``PiecewiseCudaGraphConfig`` fields:
   raising: the runner declares, plans and commits the region's step over the real rows
   (as a replay declares it, without padding), so the caller has one path for captured
   and uncaptured shapes. Off, the caller checks ``can_run`` first. MiniCPM-o's vocoder
-  uses it, with eager-only regions for the shapes it never captures.
+  uses it, with eager-only regions for the shapes it never captures. On the state contract
+  an eager run's calls answer for the region's own step, as a replay's did at capture,
+  nested in the node's step: two regions of one forward may each add to or write the same
+  layers, and the node's step answers again once the region ends.
 - ``compile`` runs ``torch.compile`` on ``capture_fn`` before capture. The default is
   ``False``.
 - ``compile_mode`` is that ``torch.compile``'s mode, as on ``AcceleratorGraphConfig``.

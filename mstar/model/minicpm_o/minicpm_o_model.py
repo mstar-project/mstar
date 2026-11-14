@@ -53,6 +53,7 @@ from mstar.engine.resources import (
     SamplingReqConfig,
 )
 from mstar.engine.resources.kv.config import DEFAULT_PAGE_SIZE
+from mstar.engine.state import Array
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Parallel, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import KVLabel, LabelLayout, Model, ProcessPromptOutput, Span, WalkStep
@@ -64,7 +65,12 @@ from mstar.model.components.token2wav.model import (
     LEAD_SILENCE,
     load_token2wav,
 )
-from mstar.model.components.token2wav.resources import check_token2wav_slots, token2wav_resources
+from mstar.model.components.token2wav.resources import (
+    check_token2wav_slots,
+    token2wav_kernel_settings,
+    token2wav_resources,
+    token2wav_state,
+)
 from mstar.model.components.token2wav.submodule import Token2WavSubmodule
 from mstar.model.minicpm_o import processor, weight_loader
 from mstar.model.minicpm_o.components.audio import MiniCPMOAudio
@@ -243,6 +249,13 @@ class MiniCPMOModel(Model):
     # ------------------------------------------------------------------
     # Resources
     # ------------------------------------------------------------------
+
+    def declare_state(self) -> list[Array]:
+        # the vocoder's per-request state; the rest of the model still declares its specs by hand
+        return token2wav_state(T2W_KEYS, TOKEN2WAV)
+
+    def kernel_settings(self) -> dict[str, dict[str, Any]]:
+        return token2wav_kernel_settings(T2W_KEYS, T2W_DEFAULT_SLOTS)
 
     def get_node_resources(self) -> list[NodeResourceSpec]:
         llm, vision, resampler, audio = (

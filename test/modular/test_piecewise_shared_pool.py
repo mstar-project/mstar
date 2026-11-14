@@ -72,7 +72,7 @@ def test_region_outputs_are_copied_into_buffers_outside_the_pool(monkeypatch):
 def test_run_without_a_graph_runs_the_region_eagerly_through_its_step():
     """No captured graph for the shape (here an eager-only region, ``[]`` batch sizes):
     ``run`` declares, admits, plans and commits the region's step over the real rows,
-    calls the region on the inputs as given, and returns its output."""
+    calls the region on the inputs as given with the step's calls open, and returns its output."""
     from unittest import mock
 
     from mstar.engine.accelerator_graph_config import PiecewiseBatchedConfig
@@ -86,7 +86,7 @@ def test_run_without_a_graph_runs_the_region_eagerly_through_its_step():
 
     def declare(request_ids, seq_lens):
         seen["declared"] = (list(request_ids), list(seq_lens))
-        return mock.Mock(state=None)
+        return mock.MagicMock(state=None)
 
     step_runner = mock.Mock()
     step_runner.admit.return_value = ADMIT_OK
@@ -105,6 +105,8 @@ def test_run_without_a_graph_runs_the_region_eagerly_through_its_step():
     ctx = step.set_ctx.call_args.args[0]
     assert ctx.slot_lease is None and not ctx.capture and tuple(ctx.request_ids) == (7, 8, 9)
     assert step_runner.plan.called and step_runner.commit.called
+    # the region's calls answer for its own step, nested in its node's
+    assert step.nested_calls.return_value.__enter__.called and step.commit_calls.called
 
 
 def test_run_without_a_graph_raises_unless_the_region_falls_back():
@@ -160,7 +162,7 @@ def test_run_without_a_graph_declares_each_labeled_layout():
 
     def declare(request_ids, seq_lens, label_seq_lens=None):
         seen["labels"] = label_seq_lens
-        return mock.Mock(state=None)
+        return mock.MagicMock(state=None)
 
     step_runner = mock.Mock()
     step_runner.admit.return_value = ADMIT_OK
