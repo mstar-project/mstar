@@ -22,6 +22,8 @@ NGRAM = "ngram"
 
 # how the routed experts are held (``moe_experts``)
 MOE_EXPERTS = ("fp4", "fp8", "dense")
+# what runs them (``moe_kernel``)
+MOE_KERNELS = ("auto", "torch")
 
 
 def kv_cache_key(ratio: int) -> str:
@@ -129,6 +131,10 @@ class DeepseekV41Config:
     # the routed experts: "fp4" as the checkpoint packs them, "fp8" their exact upcast to E4M3
     # blocks (twice the bytes), "dense" in the model's dtype (four times in bf16)
     moe_experts: str = "fp4"
+    # what runs them: "auto" is a grouped GEMM kernel over the fp4 bytes where it can run (a GPU
+    # with bf16 tensor cores, Triton), else torch; "torch" the dispatch expert by expert, the
+    # arithmetic the kernel is held to, eager only
+    moe_kernel: str = "auto"
     # where the Engram tables are held: "device" shards them by rows across the TP ranks, which
     # sum their lookups; "host" maps the checkpoint's bytes once for every rank (ENGRAM), and a
     # step fetches its rows through the host
@@ -153,6 +159,8 @@ class DeepseekV41Config:
             raise ValueError(f"scoring_func {self.scoring_func!r}: only sqrtsoftplus is ported")
         if self.moe_experts not in MOE_EXPERTS:
             raise ValueError(f"moe_experts must be one of {MOE_EXPERTS}, got {self.moe_experts!r}")
+        if self.moe_kernel not in MOE_KERNELS:
+            raise ValueError(f"moe_kernel must be one of {MOE_KERNELS}, got {self.moe_kernel!r}")
         if self.num_attention_heads % self.o_groups:
             raise ValueError("num_attention_heads must divide into o_groups")
         for width in (self.head_dim, self.index_head_dim, self.q_lora_rank, self.hidden_size,

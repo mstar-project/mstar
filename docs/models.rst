@@ -1002,8 +1002,9 @@ DeepSeek-V4.1-Flash
 ``configs/deepseek_v41_flash_tp8.yaml`` serves the text backbone on one 8-GPU node (TP8).
 What is served is the checkpoint's reference arithmetic, op by op in torch: every linear
 reads its input rounded to FP8, the caches hold values rounded to the FP8 and FP4 grids the
-model was trained with, and the attention, the indexer and the experts run eager, with no
-captured graphs. It is the numerics anchor that kernels are held to, not a fast path.
+model was trained with, and the attention and the indexer run eager, with no captured
+graphs. It is the numerics anchor that kernels are held to, not a fast path; the routed
+experts are the first piece on a kernel (``moe_kernel`` below).
 
 Each layer attends its last 128 tokens, and layers 2 to 39 also the 512 rows an indexer picks
 from a compressed cache (three caches pool two tokens per row, one keeps every token). The
@@ -1015,8 +1016,14 @@ rank). ``model_kwargs``:
 ``max_seq_len`` (the context served, 65536), ``max_requests`` (requests holding state at
 once), ``moe_experts`` (how the routed experts are held: ``fp4``, the default, as the
 checkpoint packs them, 36 GB per GPU at TP8; ``fp8``, their exact upcast to E4M3 blocks, 68 GB;
-``dense``, bf16, 136 GB; the logits are the same bit for bit), ``engram_tables`` (``device``,
-the default, or ``host``). The ``-1017`` refresh has the same layout: pass it as
+``dense``, bf16, 136 GB; the logits are the same bit for bit), ``moe_kernel`` (``auto``, the
+default: on a GPU with bf16 tensor cores the ``fp4`` experts run on a Triton grouped GEMM over
+the checkpoint's bytes, one launch per GEMM for a step's rows, with the reference's clamp,
+routing weight and FP8 rounding between the two in torch, which an accelerator graph can
+record; a GEMM's fp32 sum then runs in another order than torch's, so the logits agree to that
+rounding and not bit for bit; ``torch``: the dispatch expert by expert, the arithmetic the
+kernel is held to, eager only, and what the other layouts and CPUs run), ``engram_tables``
+(``device``, the default, or ``host``). The ``-1017`` refresh has the same layout: pass it as
 ``model_kwargs.checkpoint_path``. An ``ep_config: {parallel: ep}`` on the node group gives each
 rank whole routed experts (48 of the 384 at TP8, 2304 wide) instead of a slice of every one;
 its other keys are refused.

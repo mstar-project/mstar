@@ -88,9 +88,10 @@ class DeepseekV41Model(ByteLevelTextOutput, Model):
             self.config = DeepseekV41Config()
         if "max_seq_len" in kwargs:
             self.config.max_seq_len = _positive_int("max_seq_len", kwargs["max_seq_len"])
-        if "moe_experts" in kwargs:
-            # replace() reruns the config's validation on the value
-            self.config = dataclasses.replace(self.config, moe_experts=kwargs["moe_experts"])
+        for knob in ("moe_experts", "moe_kernel"):
+            if knob in kwargs:
+                # replace() reruns the config's validation on the value
+                self.config = dataclasses.replace(self.config, **{knob: kwargs[knob]})
         if "engram_tables" in kwargs:
             # rebuilt, so the config refuses a placement it does not know
             self.config = dataclasses.replace(self.config, engram_tables=kwargs["engram_tables"])
@@ -356,7 +357,7 @@ class DeepseekV41Model(ByteLevelTextOutput, Model):
             return
         with open(path) as f:
             read = DeepseekV41Config.from_hf_config(json.load(f))
-        for knob in ("max_seq_len", "max_output_tokens", "moe_experts", "engram_tables"):
+        for knob in ("max_seq_len", "max_output_tokens", "moe_experts", "moe_kernel", "engram_tables"):
             setattr(read, knob, getattr(self.config, knob))
         self.config, self._config_from_checkpoint = read, True
 

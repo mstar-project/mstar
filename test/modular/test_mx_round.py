@@ -36,6 +36,20 @@ class TestMxRounding:
         assert torch.equal(once.to(torch.bfloat16).float(), once)
         assert torch.equal(round_(once), once)
 
+    def test_an_fp8_scale_is_the_block_maximum_times_the_fp32_reciprocal_of_448_rounded_up(self):
+        """The product is taken in fp32, as the checkpoint's reference takes it: maxima on, just
+        under and just over those whose product is a power of two, over 40 binades, and around
+        the 1e-4 floor."""
+        edge = 448.0 * torch.exp2(torch.arange(-20.0, 20.0))
+        amax = torch.cat([edge, torch.nextafter(edge, edge * 0), torch.nextafter(edge, edge * 2),
+                          torch.tensor([0.0, 9e-5, 1e-4, 1.1e-4])])
+        x = torch.zeros(amax.numel(), 32)
+        x[:, 5] = -amax
+        reciprocal = torch.tensor(1 / 448.0, dtype=torch.float32)
+        for dtype in (torch.float32, torch.bfloat16):
+            held = x.to(dtype).float().abs().amax(-1)  # what the dtype holds of each maximum
+            _, scale = mx_round.quant_fp8(x.to(dtype), 32)
+            assert torch.equal(scale[:, 0], mx_round.pow2_ceil(held.clamp_min(1e-4) * reciprocal))
     def test_a_first_call_in_inference_mode_leaves_later_calls_under_autograd_working(self):
         """The helpers keep their constants a device. One made under inference mode would be an
         inference tensor, which autograd refuses to save."""

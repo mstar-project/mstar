@@ -16,6 +16,9 @@ model_kwargs:
   # the routed experts: fp4 as the checkpoint packs them (36 GB a rank), fp8 their exact
   # upcast to E4M3 blocks (68 GB), dense in bf16 (136 GB, past an H200 with the rest)
   moe_experts: fp4
+  # what runs them: auto (the default) is a Triton grouped GEMM over the fp4 bytes on a GPU with
+  # bf16 tensor cores; torch is the dispatch expert by expert, the arithmetic it is held to
+  # moe_kernel: auto
   # The two Engram tables (203 GB) from host memory instead of 25.3 GB a rank on the GPUs:
   # one read-only mapping of the checkpoint's bytes for all ranks, each step's rows fetched
   # through the host. Same values; its cost per step is not measured on GPUs yet. The host

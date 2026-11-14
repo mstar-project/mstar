@@ -14,11 +14,17 @@ scale group with the scale applied to the partial. The weights stay at 4.25-4.5 
 
 from __future__ import annotations
 
+from collections.abc import Callable
+
 import torch
 import triton
 import triton.language as tl
 
+from mstar.platforms import current_platform
+from mstar.utils.fused_moe import align
+from mstar.utils.fused_moe.align import moe_align_block_size
 from mstar.utils.fused_moe.kernels import _grid_rows, get_default_config
+from mstar.utils.fused_moe.runner import _align_ids
 
 # the weight decodes the kernel's ``KIND`` selects
 KIND_INT4_SYM, KIND_INT4_ZP, KIND_E2M1 = 0, 1, 2
@@ -167,3 +173,58 @@ def _compute_type(dtype: torch.dtype):
     if dtype == torch.float16:
         return tl.float16
     return tl.float32
+
+
+MXFP4_GROUP = 32  # MXFP4: one E8M0 scale per row and 32 inputs
+
+
+def grouped_gemm_unavailable(device: torch.device | str | None) -> str | None:
+    """Why :func:`grouped_experts_mxfp4` cannot run on ``device``, None where it can: it needs
+    bf16 tensor cores, and the alignment as the CUDA op, whose torch fallback has shapes that
+    follow the routing (no accelerator graph could record the plan)."""
+    if device is None or torch.device(device).type != "cuda" or not current_platform.has_cuda_capability(
+            8, 0, device):
+        return "the 4-bit grouped GEMM needs bf16 tensor cores (CUDA compute capability 8.0 and up)"
+    if not align._cuda_op_available():
+        return "the CUDA moe_align_block_size op did not build"
+    return None
+
+
+def grouped_experts_mxfp4(
+    hidden_states: torch.Tensor, w1: torch.Tensor, w2: torch.Tensor, s1: torch.Tensor, s2: torch.Tensor,
+    topk_ids: torch.Tensor, between: Callable[[torch.Tensor], torch.Tensor], skip_invalid: bool = False,
+) -> torch.Tensor:
+    """``(tokens, top_k, hidden)``: every slot's expert output, unweighted and unsummed, for a caller whose
+    arithmetic between and after the GEMMs is its own. ``w1`` ``(E, 2I, H/2)`` / ``w2`` ``(E, H, I/2)`` uint8 MXFP4
+    as a checkpoint packs it, ``s*`` their e8m0 bytes. ``between`` maps the gate/up GEMM's ``(tokens * top_k, 2I)``
+    output to the down GEMM's ``(tokens * top_k, I)`` input; both GEMMs sum in fp32 and store ``hidden_states``'
+    dtype. With ``skip_invalid``, slots routed to an id ``>= E`` run no GEMM and come back zero.
+
+    Shapes, grids and tiles follow from the token count alone: the launches are the same whatever the routing."""
+    assert hidden_states.is_contiguous() and hidden_states.dim() == 2
+    num_tokens, hidden = hidden_states.shape
+    E, two_inter, half_hidden = w1.shape
+    inter = two_inter // 2
+    assert half_hidden * 2 == hidden and tuple(w2.shape) == (E, hidden, inter // 2), (w1.shape, w2.shape)
+    top_k = topk_ids.shape[1]
+    topk_ids = _align_ids(topk_ids)
+
+    config = moe_config(num_tokens, E, two_inter, hidden, top_k, MXFP4_GROUP)
+    compute_type = _compute_type(hidden_states.dtype)
+    sorted_token_ids, expert_ids, num_tokens_post_padded = moe_align_block_size(topk_ids, config["BLOCK_SIZE_M"], E)
+
+    m_topk = num_tokens * top_k
+    device, dtype = hidden_states.device, hidden_states.dtype
+    # skipped slots are never written by a GEMM, so they must start at zero
+    empty = torch.zeros if skip_invalid else torch.empty
+    cache1 = empty((m_topk, two_inter), device=device, dtype=dtype)
+    cache3 = empty((num_tokens, top_k, hidden), device=device, dtype=dtype)
+
+    # no routing weight in either launch: the pointer is never read
+    _launch(hidden_states, w1, s1, None, cache1, hidden_states, sorted_token_ids, expert_ids, num_tokens_post_padded,
+            topk_ids, False, top_k, config, compute_type, KIND_E2M1, MXFP4_GROUP)
+    cache2 = between(cache1)
+    assert cache2.shape == (m_topk, inter) and cache2.dtype == dtype, (cache2.shape, cache2.dtype)
+    _launch(cache2.contiguous(), w2, s2, None, cache3.view(m_topk, hidden), hidden_states, sorted_token_ids,
+            expert_ids, num_tokens_post_padded, topk_ids, False, 1, config, compute_type, KIND_E2M1, MXFP4_GROUP)
+    return cache3
