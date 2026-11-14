@@ -36,6 +36,20 @@ class TestMxRounding:
         assert torch.equal(once.to(torch.bfloat16).float(), once)
         assert torch.equal(round_(once), once)
 
+    def test_a_first_call_in_inference_mode_leaves_later_calls_under_autograd_working(self):
+        """The helpers keep their constants a device. One made under inference mode would be an
+        inference tensor, which autograd refuses to save."""
+        for cached in (mx_round._scalar, mx_round._e2m1_grid, mx_round._e2m1_bytes):
+            cached.cache_clear()
+        x = torch.randn(4, 64, generator=torch.Generator().manual_seed(4))
+        with torch.inference_mode():
+            first = mx_round.round_fp8(x, 32), mx_round.round_fp4(x, 32)
+            rows = mx_round.pack_fp4_rows(x, 32)
+        tracked = x.clone().requires_grad_()
+        assert torch.equal(mx_round.round_fp8(tracked, 32), first[0])
+        assert torch.equal(mx_round.round_fp4(tracked, 32), first[1])
+        assert torch.equal(mx_round.unpack_fp4_rows(rows.clone(), 64, 32), first[1])
+
     def test_fp8_rounding_stays_within_half_a_step_of_the_block_scale(self):
         x = torch.randn(4, 64, generator=torch.Generator().manual_seed(2))
         q, scale = mx_round.quant_fp8(x, 32)
@@ -64,3 +78,5 @@ class TestFp4RowStore:
             want = mx_round.round_fp4(x.to(dtype), block, e4m3_scale).float()
             assert torch.isfinite(want).all()
             assert torch.equal(mx_round.unpack_fp4_rows(packed, 64, block, e4m3_scale), want)
+            # bf16 holds every FP4 value: unpacked straight into it, the same values
+            assert torch.equal(mx_round.unpack_fp4_rows(packed, 64, block, e4m3_scale, torch.bfloat16).float(), want)

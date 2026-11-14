@@ -9,12 +9,41 @@ device; ``pack_e2m1`` / ``unpack_e2m1`` are the checkpoint's packing of E2M1 wei
 """
 from __future__ import annotations
 
+import functools
+
 import torch
+import torch.nn.functional as F
 
 FP8_MAX = 448.0
 FP4_MAX = 6.0
 # E2M1 magnitudes by code (sign in bit 3)
 _E2M1 = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0)
+
+
+# The constants below are made once a device: a tensor built from host values inside a forward is
+# a copy to the device that waits for its stream, and one a captured graph cannot record. They are
+# made outside inference mode, whatever the caller runs in: an inference tensor kept here would
+# fail the first later call that autograd tracks.
+
+@functools.cache
+def _e2m1_grid(device: torch.device) -> torch.Tensor:
+    with torch.inference_mode(False):
+        return torch.tensor(_E2M1, dtype=torch.float32, device=device)
+
+
+@functools.cache
+def _e2m1_bytes(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    """``[256, 2]``: the values of a packed byte's low and high nibble."""
+    with torch.inference_mode(False):
+        values = torch.tensor(_E2M1 + tuple(-x for x in _E2M1), dtype=dtype)
+        byte = torch.arange(256)
+        return torch.stack([values[byte & 0x0F], values[byte >> 4]], dim=-1).to(device)
+
+
+@functools.cache
+def _scalar(value: float, device: torch.device) -> torch.Tensor:
+    with torch.inference_mode(False):
+        return torch.tensor(value, dtype=torch.float32, device=device)
 
 
 def pow2_ceil(v: torch.Tensor) -> torch.Tensor:
@@ -25,7 +54,7 @@ def pow2_ceil(v: torch.Tensor) -> torch.Tensor:
 
 def round_e2m1(v: torch.Tensor) -> torch.Tensor:
     """fp32 ``v`` in [-6, 6] to the nearest E2M1 value, a tie to the even code."""
-    grid = torch.tensor(_E2M1, dtype=torch.float32, device=v.device)
+    grid = _e2m1_grid(v.device)
     a = v.abs()
     hi = torch.bucketize(a, grid).clamp(max=len(_E2M1) - 1)
     lo = (hi - 1).clamp(min=0)
@@ -36,17 +65,17 @@ def round_e2m1(v: torch.Tensor) -> torch.Tensor:
 
 def pack_e2m1(q: torch.Tensor) -> torch.Tensor:
     """E2M1 values ``[..., K]`` as uint8 ``[..., K // 2]``, element ``2i`` in the low nibble."""
-    grid = torch.tensor(_E2M1, dtype=torch.float32, device=q.device)
+    grid = _e2m1_grid(q.device)
     code = torch.bucketize(q.abs(), grid).to(torch.uint8) | (torch.signbit(q).to(torch.uint8) << 3)
     code = code.unflatten(-1, (-1, 2))
     return (code[..., 0] | (code[..., 1] << 4)).contiguous()
 
 
-def unpack_e2m1(packed: torch.Tensor) -> torch.Tensor:
-    """``pack_e2m1``'s bytes (any one-byte dtype) as fp32 values ``[..., K]``."""
+def unpack_e2m1(packed: torch.Tensor, dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    """``pack_e2m1``'s bytes (any one-byte dtype) as ``dtype`` values ``[..., K]`` (every E2M1
+    value is exact in bf16 and up)."""
     byte = packed.contiguous().view(torch.uint8)
-    table = torch.tensor(_E2M1 + tuple(-x for x in _E2M1), dtype=torch.float32, device=packed.device)
-    return torch.stack([table[(byte & 0x0F).long()], table[(byte >> 4).long()]], dim=-1).flatten(-2)
+    return F.embedding(byte.int(), _e2m1_bytes(packed.device, dtype)).flatten(-2)
 
 
 def quant_fp8(x: torch.Tensor, block: int = 32, pow2_scale: bool = True) -> tuple[torch.Tensor, torch.Tensor]:
@@ -54,8 +83,7 @@ def quant_fp8(x: torch.Tensor, block: int = 32, pow2_scale: bool = True) -> tupl
     scale ``[..., N // block]`` (``amax / 448``, at least ``1e-4 / 448``, rounded up to a power of
     two with ``pow2_scale``)."""
     groups = x.float().unflatten(-1, (-1, block))
-    scale = groups.abs().amax(-1, keepdim=True).clamp_min(1e-4) * torch.tensor(
-        1 / FP8_MAX, dtype=torch.float32, device=x.device)
+    scale = groups.abs().amax(-1, keepdim=True).clamp_min(1e-4) * _scalar(1 / FP8_MAX, x.device)
     if pow2_scale:
         scale = pow2_ceil(scale)
     q = (groups / scale).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn)
@@ -76,8 +104,7 @@ def quant_fp4(x: torch.Tensor, block: int = 32, e4m3_scale: bool = False) -> tup
     if e4m3_scale:
         scale = (amax.clamp_min(FP4_MAX * 2.0 ** -9) / FP4_MAX).to(torch.float8_e4m3fn).float()
     else:
-        scale = pow2_ceil(amax.clamp_min(FP4_MAX * 2.0 ** -126) * torch.tensor(
-            1 / FP4_MAX, dtype=torch.float32, device=x.device))
+        scale = pow2_ceil(amax.clamp_min(FP4_MAX * 2.0 ** -126) * _scalar(1 / FP4_MAX, x.device))
     q = round_e2m1((groups / scale).clamp(-FP4_MAX, FP4_MAX))
     return q.flatten(-2), scale.squeeze(-1)
 
@@ -99,12 +126,13 @@ def pack_fp4_rows(x: torch.Tensor, block: int = 32, e4m3_scale: bool = False) ->
     return torch.cat([pack_e2m1(q), scale.view(torch.uint8)], dim=-1)
 
 
-def unpack_fp4_rows(rows: torch.Tensor, width: int, block: int = 32, e4m3_scale: bool = False) -> torch.Tensor:
-    """``pack_fp4_rows``' bytes (the first ``width // 2 + width // block`` of each row) as fp32
-    values ``[..., width]``."""
-    values = unpack_e2m1(rows[..., :width // 2])
+def unpack_fp4_rows(rows: torch.Tensor, width: int, block: int = 32, e4m3_scale: bool = False,
+                    dtype: torch.dtype = torch.float32) -> torch.Tensor:
+    """``pack_fp4_rows``' bytes (the first ``width // 2 + width // block`` of each row) as
+    ``dtype`` values ``[..., width]``: fp32, or bf16, which holds every such value exactly."""
+    values = unpack_e2m1(rows[..., :width // 2], dtype)
     scale = rows[..., width // 2:width // 2 + width // block].contiguous()
-    scale = scale.view(torch.float8_e4m3fn if e4m3_scale else torch.float8_e8m0fnu).float()
+    scale = scale.view(torch.float8_e4m3fn if e4m3_scale else torch.float8_e8m0fnu).to(dtype)
     return (values.unflatten(-1, (-1, block)) * scale.unsqueeze(-1)).flatten(-2)
 
 
