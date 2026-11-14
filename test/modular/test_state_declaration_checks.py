@@ -295,7 +295,7 @@ def _kept(**overrides) -> Array:
 
 
 @pytest.mark.parametrize("labels, kv_labels, missing", [
-    ({"main"}, {}, "['main']"),
+    ({"main", "cfg"}, {}, "['cfg', 'main']"),
     ({"main", "cfg"}, {"kv": {"main": KVLabel()}}, "['cfg']"),
 ], ids=["no pool", "a label left out"])
 def test_every_label_of_a_kept_window_array_must_be_in_kv_labels(labels, kv_labels, missing):
@@ -310,7 +310,14 @@ def test_every_label_of_a_kept_window_array_must_be_in_kv_labels(labels, kv_labe
 
 
 def test_a_kept_window_array_with_every_label_in_kv_labels_has_no_problem():
-    assert state_declaration_problems(_StubModel(_kept(), kv_labels={"kv": {"main": KVLabel()}})) == []
+    labels = {"main": KVLabel(), "cfg": KVLabel()}
+    assert state_declaration_problems(_StubModel(_kept(labels={"main", "cfg"}), kv_labels={"kv": labels})) == []
+
+
+def test_a_kept_window_array_in_the_rolling_store_may_stay_out_of_kv_labels():
+    """Its one read is its one label's kept window, so the rolling store holds it, and its handle refuses a request
+    that opens with no layout."""
+    assert state_declaration_problems(_StubModel(_kept())) == []
 
 
 def test_an_array_that_keeps_no_window_may_stay_out_of_kv_labels():

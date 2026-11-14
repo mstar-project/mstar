@@ -107,11 +107,14 @@ class StagedReach(NamedTuple):
 def stage_reach(views: Sequence[SequenceView], page_size: int, device: torch.device) -> StagedReach:
     """`kept_reach` of each of ``views``, staged on ``device``."""
     slots = [kept_reach(view, page_size) for view in views]
-    return StagedReach(
-        torch.from_numpy(np.concatenate([each.pages for each in slots])).to(device),
-        torch.from_numpy(np.concatenate([each.offsets for each in slots])).to(device),
-        tuple(len(each.pages) for each in slots),
-    )
+    lengths = tuple(len(each.pages) for each in slots)
+    # From a fresh pinned buffer: a copy from pageable memory waits for the last step's forward still on the stream,
+    # and the caching host allocator keeps the buffer until its copy is done.
+    host = torch.empty(2, sum(lengths), dtype=torch.int64, pin_memory=torch.cuda.is_available())
+    np.concatenate([each.pages for each in slots], out=host[0].numpy())
+    np.concatenate([each.offsets for each in slots], out=host[1].numpy())
+    staged = host.to(device, non_blocking=True)
+    return StagedReach(staged[0], staged[1], lengths)
 
 
 class PagedIndptrs(NamedTuple):

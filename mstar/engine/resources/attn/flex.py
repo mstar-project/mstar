@@ -236,7 +236,8 @@ class FlexAttentionManager(AttentionManager):
         self._visibility_tables: dict[
             tuple[int, int, int], tuple[Tensor, Tensor, int]
         ] = {}
-        self._active_slot: int | None = None
+        # each layer's mask for the step `plan` last staged
+        self._step_masks: tuple[BlockMask, ...] | None = None
 
     @property
     def requires_kv_write(self) -> bool:
@@ -386,16 +387,18 @@ class FlexAttentionManager(AttentionManager):
                 f"FlexAttention expected RingPlan from {self._kv_cache_name!r}; "
                 f"got {type(ring_plan).__name__}"
             )
-        self._active_slot = ctx.slot
         # The padded width, not the real row count: the graph baked the address
         # of the mask captured at the bucket size, and a replay padded below that
         # bucket must stage into that same buffer. `ring_plan` already carries one
         # (session, frame) per padded row, padding rows included.
         B = len(ctx.padded_request_ids)
         geometries = {self._geometry(layer) for layer in self._kv_config.layers}
+        staged = {}
         for geometry in geometries:
-            mask = self._mask_for(ctx.slot, geometry, B, create=not ctx.capture)
+            mask = staged[geometry] = self._mask_for(ctx.slot, geometry, B, create=not ctx.capture)
             self._stage(mask, geometry, ring_plan)
+        # The masks and not the slot: a compiled caller guards on a slot's value, and compiles once per slot.
+        self._step_masks = tuple(staged[self._geometry(layer)] for layer in self._kv_config.layers)
 
     def attend(self, q: Tensor, k: Tensor, v: Tensor, *, enable_gqa: bool, layer_idx: int) -> Tensor:
         """One layer's attention over the ring, through the mask `plan` staged
@@ -406,8 +409,14 @@ class FlexAttentionManager(AttentionManager):
         a query reads is not derivable from a length, which is the entire reason
         this backend exists. Returns ``[B, H_q, T, D]``.
         """
-        geometry = self._geometry(self._kv_config.layers[layer_idx])
-        block_mask = self._mask_for(self._active_slot, geometry, q.size(0))
+        if self._step_masks is None:
+            raise RuntimeError("FlexAttention has no mask staged: attend before the step's plan")
+        block_mask = self._step_masks[layer_idx]
+        if block_mask.kv_num_blocks.size(0) != q.size(0):
+            raise RuntimeError(
+                f"FlexAttention staged this step's masks for {block_mask.kv_num_blocks.size(0)} rows, and layer "
+                f"{layer_idx} attends {q.size(0)}"
+            )
         # `flex_attention_masked`, never bare `flex_attention`: with a no-op
         # `mask_mod` the eager path ignores the block mask entirely and attends
         # to unwritten ring slots. See the note at its definition.

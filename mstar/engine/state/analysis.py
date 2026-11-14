@@ -73,6 +73,16 @@ def reads_differ_by_walk(array: Array) -> bool:
     return any(read.walks is not None for read in array.reads.values())
 
 
+def keeps_one_window(array: Array) -> bool:
+    """Whether ``array``'s one read is a kept window on its one label and every walk, with no positions and no
+    queries: what the rolling store holds, in a region sized when the request opens."""
+    if len(array.reads) != 1 or len(array.labels) != 1 or array.positions is not None:
+        return False
+    (read,) = array.reads.values()
+    return (isinstance(read.mask, Bidirectional) and read.mask.kept_window and read.walks is None
+            and read.queries is None)
+
+
 def runs_on_walk(read: Read, walk: str | None) -> bool:
     """Whether ``read`` runs on ``walk``, as a read that names no walk runs on every one."""
     return read.walks is None or walk in read.walks
@@ -162,9 +172,11 @@ def _kv_label_problems(kv_labels: Mapping[str, Mapping[str, object]], arrays: Se
 
 def _kept_window_label_problems(kv_labels: Mapping[str, Mapping[str, object]], arrays: Sequence[Array]) -> list[str]:
     """A kept window is sized by each request's layout, and the conductor refuses a request that opens a label with
-    no layout only on the pools ``kv_labels`` names."""
+    no layout only on the pools ``kv_labels`` names. The rolling store refuses a request with no layout itself."""
     problems: list[str] = []
     for array in arrays:
+        if keeps_one_window(array):
+            continue
         kept = [key for key, read in array.reads.items() if isinstance(read.mask, Bidirectional)
                 and read.mask.kept_window]
         missing = sorted(array.labels - kv_labels.get(array.name, EMPTY).keys())
