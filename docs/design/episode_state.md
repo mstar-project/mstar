@@ -27,13 +27,15 @@ M* has content-keyed caches across requests (the prefix cache, Chatterbox's voic
 
 ## 0. What happens today
 
-- **A call is a request.** The Python openpi handler submits one request per observation with no request id ([openpi.py](../../mstar/api_server/openpi.py) `_infer`, lines 240-248), so `submit_request` mints a fresh uuid4 ([entrypoint.py](../../mstar/api_server/entrypoint.py) lines 855-856). The Rust handler does the same with `rid("openpi")` ([ws/openpi.rs](../../rust/server/src/ws/openpi.rs) line 521, [serving.rs](../../rust/server/src/serving.rs) lines 328-330). Both send the prompt on every call (`openpi.py` lines 202-206, `openpi.rs` lines 463-467).
-- **A socket runs one call at a time.** Both loops receive, wait for the reply and send it before reading again (`openpi.py` lines 281-303, `openpi.rs` lines 563-613). Any failure answers with the error as text and closes the socket (`openpi.py` lines 295-298, `openpi.rs` lines 593-605).
-- **A persist edge lasts one request.** Persisted signals live on the request's `RequestData` (`persist_signals`, [conductor.py](../../mstar/conductor/conductor.py) lines 372-375), seeded from what the data worker stored for this request ([data_worker.py](../../mstar/api_server/data_worker.py) lines 1112 and 1124). A later pass replaces what an earlier pass held under a name (`conductor.py` lines 1977-1993). When the request is done, the conductor unpersists everything still held (lines 1894-1902) with `UNPERSIST_TENSORS`, the producer clears the flag ([input_ingest.py](../../mstar/worker/input_ingest.py) lines 282-285), and the tensor store frees the tensor once its references drop ([rust/src/tensors.rs](../../rust/src/tensors.rs) lines 792-797).
-- **The plan is decided at ingest, from this request's signals only.** The conductor calls `walk_plan` with `body.initial_signals` (`conductor.py` lines 1397-1401; the contract is [base.py](../../mstar/model/base.py) lines 999-1027). A walk input with no persisted signal gets an empty edge ([request_info.py](../../mstar/conductor/request_info.py) lines 102-110).
-- **Engine state is per request.** A declared array is "per request, per label and per declared layer" ([contract.py](../../mstar/engine/state/contract.py) line 213). The engine registers a request's state on its first `NEW_REQUEST` ([input_ingest.py](../../mstar/worker/input_ingest.py) lines 199-216, `Engine.add_request` in [engine.py](../../mstar/engine/engine.py) line 3906), every resource keys it by the worker's request handle, and all of it is purged on `REMOVE_REQUEST` ([rid_table.py](../../mstar/worker/rid_table.py) lines 8-31, `Engine.remove_request`, `engine.py` lines 3937-3954).
-- **The only cross-request reuse is content-keyed.** The prefix cache keeps a finished request's KV pages under a hash of what they depend on (`Model.kv_labels`, `base.py` lines 885-895, and `.claude/skills/prefix-caching/SKILL.md`), and Chatterbox keeps an LRU of voice conditioning by the clip's hash ([chatterbox/submodules.py](../../mstar/model/chatterbox/submodules.py) lines 88-108). The replica router places each request on its own (`ReplicaRouter.pick`, [routing.py](../../mstar/conductor/routing.py) line 177). Nothing is keyed by a client.
-- **The one long-lived call is a request with open client input** (client streams, [topology.py](../../mstar/streaming/topology.py) lines 30-35; the realtime conversation, [realtime/conversation.rs](../../rust/server/src/realtime/conversation.rs) lines 6-8). At capacity the conductor refuses such a call rather than queueing it (`conductor.py` lines 1291-1298).
+The baseline code observations in this section and §5 were checked at [main 9668497](https://github.com/mstar-project/mstar/tree/9668497eeaf5dd42bf99e3ce0141d8d0a9c70d76); file links there are pinned to that snapshot.
+
+- **A call is a request.** The Python openpi handler submits one request per observation with no request id ([openpi.py](https://github.com/mstar-project/mstar/blob/9668497eeaf5dd42bf99e3ce0141d8d0a9c70d76/mstar/api_server/openpi.py) `_infer`), so `submit_request` mints a fresh uuid4 ([entrypoint.py](https://github.com/mstar-project/mstar/blob/9668497eeaf5dd42bf99e3ce0141d8d0a9c70d76/mstar/api_server/entrypoint.py)). The Rust handler does the same with `rid("openpi")` ([ws/openpi.rs](https://github.com/mstar-project/mstar/blob/9668497eeaf5dd42bf99e3ce0141d8d0a9c70d76/rust/server/src/ws/openpi.rs), [serving.rs](https://github.com/mstar-project/mstar/blob/9668497eeaf5dd42bf99e3ce0141d8d0a9c70d76/rust/server/src/serving.rs)). Both send the prompt on every call (`openpi.py`, `openpi.rs`).
+- **A socket runs one call at a time.** Both loops receive, wait for the reply and send it before reading again (`openpi.py`, `openpi.rs`). Any failure answers with the error as text and closes the socket (`openpi.py`, `openpi.rs`).
+- **A persist edge lasts one request.** Persisted signals live on the request's `RequestData` (`persist_signals`, [conductor.py](https://github.com/mstar-project/mstar/blob/9668497eeaf5dd42bf99e3ce0141d8d0a9c70d76/mstar/conductor/conductor.py)), seeded from what the data worker stored for this request ([data_worker.py](https://github.com/mstar-project/mstar/blob/9668497eeaf5dd42bf99e3ce0141d8d0a9c70d76/mstar/api_server/data_worker.py)). A later pass replaces what an earlier pass held under a name. When the request is done, the conductor unpersists everything still held with `UNPERSIST_TENSORS`, the producer clears the flag ([input_ingest.py](https://github.com/mstar-project/mstar/blob/9668497eeaf5dd42bf99e3ce0141d8d0a9c70d76/mstar/worker/input_ingest.py)), and the tensor store frees the tensor once its references drop ([rust/src/tensors.rs](https://github.com/mstar-project/mstar/blob/9668497eeaf5dd42bf99e3ce0141d8d0a9c70d76/rust/src/tensors.rs)).
+- **The plan is decided at ingest, from this request's signals only.** The conductor calls `walk_plan` with `body.initial_signals` (`conductor.py`; the contract is [base.py](https://github.com/mstar-project/mstar/blob/9668497eeaf5dd42bf99e3ce0141d8d0a9c70d76/mstar/model/base.py)). A walk input with no persisted signal gets an empty edge ([request_info.py](https://github.com/mstar-project/mstar/blob/9668497eeaf5dd42bf99e3ce0141d8d0a9c70d76/mstar/conductor/request_info.py)).
+- **Engine state is per request.** A declared array is "per request, per label and per declared layer" ([contract.py](https://github.com/mstar-project/mstar/blob/9668497eeaf5dd42bf99e3ce0141d8d0a9c70d76/mstar/engine/state/contract.py)). The engine registers a request's state on its first `NEW_REQUEST` ([input_ingest.py](https://github.com/mstar-project/mstar/blob/9668497eeaf5dd42bf99e3ce0141d8d0a9c70d76/mstar/worker/input_ingest.py), `Engine.add_request` in [engine.py](https://github.com/mstar-project/mstar/blob/9668497eeaf5dd42bf99e3ce0141d8d0a9c70d76/mstar/engine/engine.py)), every resource keys it by the worker's request handle, and all of it is purged on `REMOVE_REQUEST` ([rid_table.py](https://github.com/mstar-project/mstar/blob/9668497eeaf5dd42bf99e3ce0141d8d0a9c70d76/mstar/worker/rid_table.py), `Engine.remove_request`, `engine.py`).
+- **The only cross-request reuse is content-keyed.** The prefix cache keeps a finished request's KV pages under a hash of what they depend on (`Model.kv_labels`, `base.py`, and `.claude/skills/prefix-caching/SKILL.md`), and Chatterbox keeps an LRU of voice conditioning by the clip's hash ([chatterbox/submodules.py](https://github.com/mstar-project/mstar/blob/9668497eeaf5dd42bf99e3ce0141d8d0a9c70d76/mstar/model/chatterbox/submodules.py)). The replica router places each request on its own (`ReplicaRouter.pick`, [routing.py](https://github.com/mstar-project/mstar/blob/9668497eeaf5dd42bf99e3ce0141d8d0a9c70d76/mstar/conductor/routing.py)). Nothing is keyed by a client.
+- **The one long-lived call is a request with open client input** (client streams, [topology.py](https://github.com/mstar-project/mstar/blob/9668497eeaf5dd42bf99e3ce0141d8d0a9c70d76/mstar/streaming/topology.py); the realtime conversation, [realtime/conversation.rs](https://github.com/mstar-project/mstar/blob/9668497eeaf5dd42bf99e3ce0141d8d0a9c70d76/rust/server/src/realtime/conversation.rs)). At capacity the conductor refuses such a call rather than queueing it (`conductor.py`).
 
 So for #1460 as written: `walk_plan` never finds `text_embeds` from a prior call, and `encode_text` runs on every call. Predicted video latents end at the denoise loop; they do not become context for a later call.
 
@@ -79,8 +81,8 @@ class Array:
 class EpisodeView(NamedTuple):
     id: str | None              # None: a request with no episode, which starts cold every call
     calls: int                  # calls of this episode admitted before this one
-    held: Mapping[str, int]     # episode array -> entries it holds now (0 after a reset or an eviction)
-    cold: str | None            # why held is empty when calls > 0: "reset", "evicted", "idle", "lost"
+    held: Mapping[str, int]     # episode array -> entries it holds now (0 after a reset, expiry, loss or identity change)
+    cold: str | None            # why held is empty when calls > 0: "reset", "idle", "lost", "identity"
 
 # mstar/model/base.py
 class ProcessPromptOutput(NamedTuple):
@@ -93,7 +95,7 @@ class ProcessPromptOutput(NamedTuple):
 # serving config
 episodes:
   max_episodes: 16        # episode identities per replica; capacity follows declarations and read bounds
-  idle_timeout_s: 600     # an episode with no call for this long is ended
+  idle_timeout_s: 600     # free a connected episode after this much time since call teardown
   max_calls: null         # the reference's max_chunks_per_episode; null is unbounded
   max_queued_calls: 1     # calls of one episode waiting behind the one in flight
 ```
@@ -128,17 +130,18 @@ class EpisodeRecord:
     placement: Placement        # the replica of each node group, fixed by the first call
     slot: int                   # logical ownership/admission id, the same on every lockstep rank
     held: dict[str, int]        # entries per array, from the workers' WORKER_GRAPHS_DONE
-    keys: dict[str, str]        # what each array's entries were made from
+    identity: tuple[bytes, bytes | None]  # startup weight epoch and final selected adapter digest
+    keys: dict[str, str]        # model input dependencies for individual arrays
     in_flight: str | None       # the request running now
     queued: deque               # calls waiting behind it (§8)
-    last_end: float             # for the idle timeout and LRU (§6, §7)
+    last_end: float             # last completed call teardown, for the idle timeout (§6, §7)
 ```
 
 Why this shape:
 
 - **The Positronic connection is the episode.** The reference opens one session per connection and ends it when the connection closes. A connection-scoped id follows that lifecycle.
 - **Minted by the system, never chosen by the client.** A client-chosen id can collide with or guess another client's, so it needs scoping to the caller's credentials, and its only cleanup is a timeout. It also survives a reconnect, which the reference does not attempt: a new connection starts cold there. This is left as an open question (§11), and the field is shaped so it can be added.
-- **The conductor owns the record.** It already owns the request lifecycle and the replica pick, and it must decide eviction and slot assignment so every rank of a lockstep instance agrees (invariant 11). A record on a worker would need rank 0 to journal its choices.
+- **The conductor owns the record.** It already owns the request lifecycle and the replica pick, and it must decide idle expiry and slot assignment so every rank of a lockstep instance agrees (invariant 11). A record on a worker would need rank 0 to journal its choices.
 - **The placement is pinned.** The retained arrays live on the replica the first call ran on, so later calls skip `ReplicaRouter.pick` and go there.
 
 Rejected:
@@ -154,12 +157,16 @@ Rejected:
 
 1. **Explicit.** A truthy `reset_context` or `__reset_context__` in an observation sets `episode.reset` on its request, matching the reference. Both frontends' Positronic handlers read the keys; integer `1` resets and `0` does not.
 2. **Model-requested.** `process_prompt` sets `reset_episode` when this request's inputs can't continue the context: the reference's missing or short frame stack is the case. The data worker ORs it with the client's flag.
-3. **System.** An evicted, idle-ended or lost episode starts its next call cold (§6, §7), with `EpisodeView.cold` giving the internal reason. Whether the wire exposes it is open (§11).
+3. **System.** An idle-ended or lost episode starts its next call cold (§6, §7). A weight or selected adapter identity change also starts a cold call (§4). `EpisodeView.cold` gives the internal reason; whether the wire exposes it is open (§11).
 4. **Budget.** `episodes.max_calls` refuses the call past it with a 400, `episode reached max_calls=N`. Both frontends answer a failure with its text and close the socket, which ends the episode (§7).
 
 A restart clears every episode array of the episode before the request's first step: the conductor marks the request's `NEW_REQUEST` to the episode's workers, and each engine empties the slot when it binds the request. `calls` keeps counting, as the reference's `chunk_index` does, so the seed sequence and the budget run over the whole connection.
 
-An array also clears when its key changes. A request's `episode_keys` names what each array's entries are made from (for text embeddings, a digest of the prompt's token ids, which the data worker has). When the key differs from the record's, the conductor treats that array as empty for this request (`held[name] = 0`) and the engine clears it on bind, so `walk_plan` runs the producer again. This is what lets a prompt change mid-episode re-encode the text without dropping the frame window, as the reference allows.
+Before planning a request, the conductor compares its system identity with the episode record's. E2 represents it as `(startup_weight_epoch, final_selected_adapter_digest)`, with `None` for the base model. The data worker settles the adapter after `process_prompt`, including a model-chosen adapter, and forwards its raw weight digest independently of prefix caching. This is the same adapter digest used to make the domain-separated prefix root ([lora/identity.py](../../mstar/engine/resources/lora/identity.py)); the conductor compares the tuple rather than the root. On a mismatch, it marks **every** held episode array empty before `walk_plan`, sets `cold="identity"`, and the engine clears all those arrays when it binds the request. An array without a model-provided key therefore cannot retain values derived from old weights or an old adapter. The episode's `calls` count continues across this restart.
+
+Separately, a request's `episode_keys` names the input dependencies of individual arrays (for text embeddings, a digest of the prompt's token ids, which the data worker has). A changed key clears only that array before planning and on bind. A prompt change can therefore re-encode text without dropping the executed-frame window, as the reference allows. These model keys do not replace the system identity on the whole record.
+
+The weight epoch is a system value, not a model-chosen `episode_key`. Base weights do not hot reload today, so E2 uses a fresh conductor startup epoch and keeps a whole-record identity. The engine's prefix cache has separate checkpoint, preprocessing and resource fingerprints ([engine.py](../../mstar/engine/engine.py) `_open_prefix_caches`); its per-resource root is not available to the conductor. E2 adds an unconditional adapter digest on the data-worker-to-conductor wire, even when prefix caching is off. A future base-weight reload must drain old calls and rotate the epoch, or end all affected episodes before admitting new calls. `checkpoint_identity` reads the index or shard names and sizes, so it alone cannot detect an in-place shard edit of the same size.
 
 Why this shape:
 
@@ -181,8 +188,8 @@ Rejected:
 
 - An integer `max_len` keeps its current meaning: the maximum logical log length, with zero still meaning scratch within a step. `max_len=None` declares an unbounded logical log, initially only for append-only dense arrays with no positions and only no-op `Window` reads. Every read is from the current tail; arbitrary or backward queries are refused. The largest declared window bounds resident entries, plus room for an in-flight append and staging. There is no separate retention field.
 - `nodes` say which node reads and writes it; the array lives on the workers that run that node, inside their engines, with one episode identity on every rank of the node's lockstep instance (replicated, or split where a `TensorType.shard` says). A paged store need not put that identity in one contiguous physical allocation.
-- A step appends with `handle.add` ([calls.py](../../mstar/engine/state/calls.py) line 194) and reads with `handle.read` (line 201). A `Read(mask=Window(size=69))` describes which executed frames a Praxis step can reach ([contract.py](../../mstar/engine/state/contract.py) lines 88-92 and 156-165). The dense store keeps logical positions monotonic across calls, frees entries outside every declared tail window, and returns retained entries in chronological order. This initial unbounded form rejects mixed or unbounded masks and any position rule that could reach back. [#1503](https://github.com/mstar-project/mstar/pull/1503) derives ring retention for K/V frame windows; it does not provide this dense whole-read store. E1 adds that path without changing the K/V storage.
-- A no-op read returns `Reached`, each field's entries packed by row (`contract.py` lines 470-474).
+- A step appends with `handle.add` and reads with `handle.read` ([calls.py](https://github.com/mstar-project/mstar/blob/9668497eeaf5dd42bf99e3ce0141d8d0a9c70d76/mstar/engine/state/calls.py)). A `Read(mask=Window(size=69))` describes which executed frames a Praxis step can reach ([contract.py](https://github.com/mstar-project/mstar/blob/9668497eeaf5dd42bf99e3ce0141d8d0a9c70d76/mstar/engine/state/contract.py)). The dense store keeps logical positions monotonic across calls, frees entries outside every declared tail window, and returns retained entries in chronological order. This initial unbounded form rejects mixed or unbounded masks and any position rule that could reach back. [#1503](https://github.com/mstar-project/mstar/pull/1503) derives ring retention for K/V frame windows; it does not provide this dense whole-read store. E1 adds that path without changing the K/V storage.
+- A no-op read returns `Reached`, each field's entries packed by row (`contract.py`).
 
 The conductor holds only the record (§3). The model object holds nothing: the calls count reaches a step as `step_metadata["episode_calls"]`, and everything else is in the arrays.
 
@@ -190,11 +197,11 @@ For Praxis-1 (§9) this is three arrays. `text_embeds` lives on the backbone wit
 
 **Does it fit `declare_state`?** `Entry` takes named tensors with a dtype and a shard, and `labels`, masks and no-op `Read` say how a step uses them. Five things are missing:
 
-1. **A lifetime and unbounded logical log.** Arrays are per request and require integer `max_len` today (`contract.py` lines 205-219). `lifetime="episode"` changes who owns the rows and when they are released. `max_len=None` adds an unbounded logical append count for the restricted dense window form above; finite integer arrays keep their append limit, including the scratch meaning of zero. There is no separate retention mode.
-2. **A dense storage, independent of lifetime.** No current storage holds an append-only non-K/V array with a no-op read. `PagedStorage` takes only a `KVEntry` with an `Attend` read ([adapters.py](../../mstar/engine/state/adapters.py) lines 194-199 and 1256), and `storage_of` sends every other append-only array with nonzero `max_len` there (lines 1391-1397). A dense storage can serve bounded request arrays as well as episode arrays. For an unbounded windowed log it needs a ring and a validated read-derived resident bound, with logical-to-physical mapping in `plan` and safe staging under invariant 7. Storage selection stays about entry and operation type, not lifetime; paged and ring K/V storages can use the same episode binding. E1 builds this dense path on [#1503](https://github.com/mstar-project/mstar/pull/1503), whose ring is K/V-specific.
-3. **Binding a request to an episode across storages.** The engine registers a request's state on `NEW_REQUEST` and purges it on removal (`engine.py` lines 3906 and 3937-3954). A named episode binds its request handle to the episode's rows on `NEW_REQUEST` (clearing them on a reset or key change), unbinds on `REMOVE_REQUEST` without freeing the rows, and frees them on `END_EPISODE`. A request without an episode id borrows a temporary slot and frees it on `REMOVE_REQUEST`. It receives `EpisodeView(id=None, calls=0, held={...: 0}, cold=None)` and every such request starts cold. The binding and its cleanup are common to dense, paged and ring storage. Both named and temporary slots count against admission (§6); neither can overwrite rows held by a live call. The temporary binding is keyed by request handle and included in `rid_table.py`'s purge rule.
-4. **What the plan sees.** `walk_plan` gets only this request's signals (`base.py` lines 999-1006). It gains an `episode: EpisodeView` keyword, passed only to a model that declares episode arrays, so no existing override changes. `held` comes from the workers' `WORKER_GRAPHS_DONE`, as persisted signals already do (`conductor.py` line 1977).
-5. **Keys.** `ProcessPromptOutput.episode_keys` (§4), since a retained value made from a prompt is only valid for that prompt.
+1. **A lifetime and unbounded logical log.** Arrays are per request and require integer `max_len` today (`contract.py`). `lifetime="episode"` changes who owns the rows and when they are released. `max_len=None` adds an unbounded logical append count for the restricted dense window form above; finite integer arrays keep their append limit, including the scratch meaning of zero. There is no separate retention mode.
+2. **A dense storage, independent of lifetime.** No current storage holds an append-only non-K/V array with a no-op read. `PagedStorage` takes only a `KVEntry` with an `Attend` read, and `storage_of` sends every other append-only array with nonzero `max_len` there ([adapters.py](https://github.com/mstar-project/mstar/blob/9668497eeaf5dd42bf99e3ce0141d8d0a9c70d76/mstar/engine/state/adapters.py)). A dense storage can serve bounded request arrays as well as episode arrays. For an unbounded windowed log it needs a ring and a validated read-derived resident bound, with logical-to-physical mapping in `plan` and safe staging under invariant 7. Storage selection stays about entry and operation type, not lifetime; paged and ring K/V storages can use the same episode binding. E1 builds this dense path on [#1503](https://github.com/mstar-project/mstar/pull/1503), whose ring is K/V-specific.
+3. **Binding a request to an episode across storages.** The engine registers a request's state on `NEW_REQUEST` and purges it on removal (`engine.py`). A named episode binds its request handle to the episode's rows on `NEW_REQUEST` (clearing all of them on a reset or system identity change, or selected arrays on a model key change), unbinds on `REMOVE_REQUEST` without freeing the rows, and frees them on `END_EPISODE`. A request without an episode id borrows a temporary slot and frees it on `REMOVE_REQUEST`. It receives `EpisodeView(id=None, calls=0, held={...: 0}, cold=None)` and every such request starts cold. The binding and its cleanup are common to dense, paged and ring storage. Both named and temporary slots count against admission (§6); neither can overwrite rows held by a live call. The temporary binding is keyed by request handle and included in `rid_table.py`'s purge rule.
+4. **What the plan sees.** `walk_plan` gets only this request's signals (`base.py`). It gains an `episode: EpisodeView` keyword, passed only to a model that declares episode arrays, so no existing override changes. `held` comes from the workers' `WORKER_GRAPHS_DONE`, as persisted signals already do (`conductor.py`).
+5. **Keys and system identity.** `ProcessPromptOutput.episode_keys` (§4) names per-array model input dependencies. A separate `(startup_weight_epoch, final_selected_adapter_digest)` identity covers the whole episode record and clears every held array when it changes. E2 adds the adapter digest to the wire and the tuple to the record; future reload work must rotate the epoch or end affected episodes.
 
 Why this shape:
 
@@ -204,10 +211,10 @@ Why this shape:
 
 Rejected:
 
-- **Episode-lifetime persist edges.** It is the smallest change to #1460: keep `persist_signals` on an episode record instead of the request. But the tensors would stay in the producer's tensor store, which admission doesn't count and nothing evicts under pressure (a persisted tensor is collected once the conductor unpersists it, `tensors.rs` lines 792-797, or at the request's hard teardown, [communication/tensors.py](../../mstar/communication/tensors.py) lines 2191-2198), their descriptors would go through the conductor every call, and a window that slides needs the model to re-emit the whole window each call, since a pass replaces a name (`conductor.py` lines 1977-1993).
-- **One long-lived request with open client input**, as realtime conversations run. A request's walks are planned once at ingest (`base.py` lines 1007-1008), where an episode is an unbounded run of calls each with its own plan. A long request stays live while the robot is idle, holding what it opened (only some resources can be offloaded under pressure), and the conductor refuses one at capacity (`conductor.py` lines 1291-1298). Per-call timeouts, metrics and errors would also blur into one request.
+- **Episode-lifetime persist edges.** It is the smallest change to #1460: keep `persist_signals` on an episode record instead of the request. But the tensors would stay in the producer's tensor store, which admission doesn't count and nothing evicts under pressure (a persisted tensor is collected once the conductor unpersists it, `tensors.rs`, or at the request's hard teardown, [communication/tensors.py](https://github.com/mstar-project/mstar/blob/9668497eeaf5dd42bf99e3ce0141d8d0a9c70d76/mstar/communication/tensors.py)), their descriptors would go through the conductor every call, and a window that slides needs the model to re-emit the whole window each call, since a pass replaces a name (`conductor.py`).
+- **One long-lived request with open client input**, as realtime conversations run. A request's walks are planned once at ingest (`base.py`), where an episode is an unbounded run of calls each with its own plan. A long request stays live while the robot is idle, holding what it opened (only some resources can be offloaded under pressure), and the conductor refuses one at capacity (`conductor.py`). Per-call timeouts, metrics and errors would also blur into one request.
 - **Holding it in the frontend or the API server.** Retained tensors would cross into and out of the GPU workers every call, which is the client-sends-it-back design with one more hop.
-- **A content-keyed cache for text embeddings**, as the reference memoizes them for the process (`pipeline.py` line 121). It would share embeddings across robots on one task, but it is a separate feature (an encoder-output cache, with its own eviction across tenants), and an episode already reuses the embeddings for as long as its prompt stays the same, which in a robot episode is usually every call. A content cache would add reuse across episodes, or after a prompt switches away and back. §11 asks whether to build it too.
+- **A content-keyed cache for text embeddings**, as the reference memoizes them for the process (`pipeline.py`). It would share embeddings across robots on one task, but it is a separate feature (an encoder-output cache, with its own eviction across tenants), and an episode already reuses the embeddings for as long as its prompt stays the same, which in a robot episode is usually every call. A content cache would add reuse across episodes, or after a prompt switches away and back. §11 asks whether to build it too.
 
 ---
 
@@ -217,38 +224,39 @@ Rejected:
 
 - **Per slot.** A named episode and a temporary idless request need the same capacity. A bounded array contributes its declared `max_len`; an unbounded logical log contributes a resident bound derived from all reads, position rules, maximum in-flight append and capture scratch. If the bound cannot be proved, the declaration is refused before serving. Praxis-1's proposed uint8 69-frame window is about 37 MiB for DROID or 63 MiB for YAM, plus poses, text and storage overhead; this is not the whole slot reservation. Per-deployment sizing still belongs under `resources:` (invariant 2).
 - **Per replica.** `episodes.max_episodes` episode identities have capacity reserved or budgeted at startup in each storage that holds an episode array. A worker whose declared capacity cannot fit refuses to start, naming the array and the size.
-- **Admission.** A call for a new episode, one whose slot was taken, or an idless call to a model with episode arrays needs a slot on the replica the router picks. It takes a free slot, or evicts the least recently used idle named episode there (no call in flight or queued). A temporary slot belongs to its live request and cannot be evicted. When every slot holds a busy episode or temporary request, the call waits in the conductor's queue, in arrival order, as a request over `max_concurrent_requests` waits today (`conductor.py` lines 1288-1305). A call of an episode that has its slot never waits for one.
-- **Eviction.** The conductor chooses, LRU by `last_end` over idle episodes on that replica, and sends `END_EPISODE` to the episode's workers before the new episode's `NEW_REQUEST`. An episode with a call in flight or queued is never evicted.
+- **Admission.** A new named episode or an idless call to a model with episode arrays needs a free slot on the replica the router picks. A connected named episode keeps its slot between calls, including while the robot executes its 24 rows. Pressure alone never takes that slot. If no slot is free, either kind of arriving call waits in the conductor's admission queue, in arrival order; an idless cold openpi call does not displace a robot. The idle sweeper frees an eligible slot after `episodes.idle_timeout_s`, then admission retries. A call of an episode that still has its slot never waits for slot admission. E3 must enforce the request deadline while a call waits.
+- **Idle expiry.** `last_end` is set only after the call's teardown barrier completes (§8). The sweeper sends `END_EPISODE` only when no call is in flight or queued and at least `idle_timeout_s` has elapsed since `last_end`. A connected episode that has been inactive that long loses its retained state; its next call starts cold. A temporary slot belongs to its live request and cannot expire before that request is removed.
 - **Temporary slot release.** An idless request frees its slot on `REMOVE_REQUEST`; no `END_EPISODE`, record, idle timer or later warm call is involved.
-- **What the client sees.** The evicted episode's next call starts cold: `held` is empty, so `walk_plan` runs every producer again, and the call is otherwise correct. `EpisodeView.cold` gives the model the reason, and a metric counts evictions and cold starts by reason. A wire notice is an open question (§11).
+- **What the client sees.** An idle-expired episode's next call starts cold: `held` is empty, so `walk_plan` runs every producer again. `EpisodeView.cold` gives the model the reason, and a metric counts idle expiry and cold starts by reason. A wire notice is an open question (§11).
 
-Relation to [admission_and_preemption.md](admission_and_preemption.md): an episode slot is an ownership key that outlives its requests. Admission must budget each underlying dense, paged or ring storage before a call runs (§3), and idle eviction returns that episode's allocations. It is not a second KV mechanism: KV pages retain their existing storage and preemption rules. A node with a rebuild policy needs every resource to support a drop (that doc's §4 table); each storage with episode rows must support that lifecycle.
+Relation to [admission_and_preemption.md](admission_and_preemption.md): an episode slot is an ownership key that outlives its requests. Admission must budget each underlying dense, paged or ring storage before a call runs (§3), and idle expiry returns that episode's allocations. It is not a second KV mechanism: KV pages retain their existing storage and preemption rules. A node with a rebuild policy needs every resource to support a drop (that doc's §4 table); each storage with episode rows must support that lifecycle.
 
 The two lifetimes share the same episode identity pool. A read mask can make old
-entries unreachable within an episode; eviction releases an idle episode's
+entries unreachable within an episode; idle expiry releases an episode's
 entire identity and its allocations:
 
 ```mermaid
 flowchart LR
     Free[Free slot] -->|named episode starts| Named[Named episode slot]
     Named -->|append; release entries no read can reach| Named
-    Named -->|idle eviction or close| Free
+    Named -->|idle expiry or close| Free
     Free -->|idless request starts| Temp[Temporary request slot]
     Temp -->|REMOVE_REQUEST| Free
-    Named -->|after eviction, a later call| Cold[Cold start]
+    Named -->|after idle expiry, a later call| Cold[Cold start]
     Cold -->|admit into a slot| Named
 ```
 
 Why this shape:
 
-- **One identity across storages.** The conductor admits and evicts an episode as a unit, while each storage keeps its own layout. A finite resident bound is known from declarations before startup; the ring KV manager already hands out fixed sessions ([ring/manager.py](../../mstar/engine/resources/kv/ring/manager.py) lines 344-349).
-- **Idle first.** An idle episode costs a cold start when its robot comes back; a busy one would be corrupted mid-call.
+- **One identity across storages.** The conductor admits and expires an episode as a unit, while each storage keeps its own layout. A finite resident bound is known from declarations before startup; the ring KV manager already hands out fixed sessions ([ring/manager.py](../../mstar/engine/resources/kv/ring/manager.py) lines 344-349).
+- **Keep a connected robot's state.** A robot between calls is idle in the scheduler but still executing its task. Admission waits rather than making that robot's next call cold under pressure.
 - **The conductor decides.** It is the only process that sees every episode's state on a replica, and its choice reaches every rank in the same order (invariant 11).
 
 Rejected:
 
 - **One global pool across dense and KV storages.** It would let unrelated resources trade memory, but it ties this design to preemption's classes before those storages have been measured together. §9 of the admission doc lists one pool per GPU as later work; episode ownership can use each storage's existing capacity rules meanwhile.
-- **Refusing a new episode when full.** A busy server would turn away robots while idle ones held their slots.
+- **Refusing a new episode when full.** A waiting call can run after a close or idle expiry without forcing an immediate failure.
+- **Pressure eviction of a connected episode.** A robot executing its 24 rows is between calls, so this would discard its context and make the next call cold. The existing `idle_timeout_s` is the only time-based release of a connected slot.
 - **Moving idle episodes to the host.** Worth it if cold starts turn out expensive, and left for later (§11).
 
 ---
@@ -263,8 +271,7 @@ Rejected:
 | Positronic `end_session` | the frontend, after validating the session id and answering the end request | the reference replies with `{session_id, end_session: true}` and closes the session (`server.py` lines 199-208); E4 tests the acknowledgement and exactly one `END_EPISODE` in both frontends |
 | A failed or aborted call | the conductor, at the request's teardown | its arrays may hold a partial write, as the reference assumes (`server.py` lines 272-279); the Positronic handler closes the session |
 | `max_calls` reached | the conductor | the refused call fails, and the socket closes (§4) |
-| Idle for `idle_timeout_s` | the conductor's periodic sweep | the record stays with `cold="idle"` until the connection closes, so the next call's internal view says why it is cold |
-| Eviction | the conductor (§6) | as idle, with `cold="evicted"` |
+| Idle for `idle_timeout_s` after teardown | the conductor's periodic sweep | the record stays with `cold="idle"` until the connection closes, so the next call's internal view says why it is cold |
 | A worker holding it is lost | the conductor ends every episode placed there | `cold="lost"` on the next call, if the conductor outlives the worker |
 | Process restart | nothing to send | every episode is in memory and is gone; connection-scoped ids die with their sockets, so no client can name a stale one |
 
@@ -274,7 +281,7 @@ Why this shape:
 
 - **Close is the normal end.** It follows the reference's connection-scoped session lifecycle.
 - **A failure ends the episode rather than rolling back.** Undoing a partial write needs a copy of every array before every call; ending it costs one cold start in a case where the client has closed the socket anyway.
-- **The timeout is a backstop, not the main path.** With connection-scoped ids it only fires for a frontend that died without closing, or a robot paused longer than the timeout, whose next call then starts cold. The reference's hosted deployment caps a session at an hour (`modal_app.py` line 94).
+- **The timeout is a backstop, not the main path.** With connection-scoped ids it fires for a frontend that died without closing, or a robot paused longer than the timeout, whose next call then starts cold. The reference's hosted deployment caps a session at an hour (`modal_app.py` line 94).
 
 ---
 
@@ -282,7 +289,7 @@ Why this shape:
 
 **Proposal.**
 
-- **One call per episode at a time.** The conductor admits an episode's call only when none of its calls is in flight. A call that arrives meanwhile waits in the episode's queue, in arrival order, up to `max_queued_calls`; past that it is refused with a 429. A queued call is planned when it is admitted, not when it arrives, so its `walk_plan` sees what the call before it kept.
+- **One call per episode at a time.** The conductor admits an episode's call only when none of its calls is in flight. A call stays in flight after the reply until the `READS_DONE` teardown barrier completes, `REMOVE_REQUEST` goes to participants and `_drop_request` clears the request. A teardown timeout can force that barrier to finish if a reader never answers. A call that arrives meanwhile waits in the episode's queue, in arrival order, up to `max_queued_calls`; past that it is refused with a 429. A queued call is planned when it is admitted, not when it arrives, so its `walk_plan` sees what the call before it kept. The DRAIN/READS_DONE round trip may delay a call sent immediately after the reply, especially on a busy worker; a robot executing 24 rows at 15 Hz usually hides it, but a simulation or back-to-back test may not.
 - **Many episodes on one worker.** Each call is an ordinary request. The micro-scheduler batches calls of different episodes as it batches any requests, through `can_batch` and `forward_batched`; each row reads and writes only its own slot, which the plan addresses per row. Nothing reads across episodes.
 - **Speculation.** The async worker speculates within a request (invariant 7). Two calls of one episode are never in flight together, so nothing speculates across the boundary between them.
 
@@ -302,7 +309,7 @@ Rejected:
 
 **Praxis-1 on episodes.**
 
-- `walk_plan` runs `encode_text` only when `episode.held["text_embeds"] == 0` (a new episode, a restart, an eviction or a new prompt), then the chunk walk. On a cold call the text embeddings reach the backbone as request edges, and its first step adds them to `text_embeds`. On a warm call the backbone reads the held array. E5 must make that warm graph schedulable without the absent encoder edges and test readiness at the graph boundary; an empty tensor inside a node does not satisfy a required graph input.
+- `walk_plan` runs `encode_text` only when `episode.held["text_embeds"] == 0` (a new episode, a restart, idle expiry, a weight or adapter change, or a new prompt), then the chunk walk. On a cold call the text embeddings reach the backbone as request edges, and its first step adds them to `text_embeds`. On a warm call the backbone reads the held array. E5 must make that warm graph schedulable without the absent encoder edges and test readiness at the graph boundary; an empty tensor inside a node does not satisfy a required graph input.
 - The cold call leaves `executed` empty because no chunk has run yet. The first warm call appends all 21 executed frames supplied by the client, even if its earlier cold observation differed from the oldest executed frame. Later warm calls append 24 rows. The VAE encoder reads that window and encodes it into clean context as the reference does each call.
 - The seed of call k is the episode's seed plus `episode_calls`, the reference's `base + k`.
 - **Executed frames, not predicted video.** #1460 now leaves predicted video latents inside the denoise loop. The reference conditions on executed real frames and refuses its own predictions as context (`policy.py` lines 271-276; `robot_io.py` lines 298-317). The proposed episode array retains the executed frame window.
@@ -313,7 +320,7 @@ The parity gate compares model output and `decode_actions` relative rows with th
 
 The proposed openpi `RobotIO.action_horizon` is 21 in this mode, so the existing fixed-size check holds. DROID openpi `robot_state` uses the reference's default FR3 hand frame and is converted to the checkpoint's flange frame before proprio; YAM uses its rig world frame. The model's general request path accepts an explicit `pose_descriptor`, but this stage's openpi WebSocket does not expose it. DROID returns a 21x10 array and YAM a 21x20 array of denormalized relative Cartesian rows in the model frame, including clipped gripper values. These are Praxis-specific openpi schemas: the [stock openpi DROID client](https://github.com/Physical-Intelligence/openpi/blob/main/examples/droid/main.py#L778-L866) expects 10x8 joint-velocity/gripper actions and cannot connect unchanged.
 
-**Stage 2, with episode state:** the new Positronic `/api/v1/session` route follows the reference's session behavior, including pose-composed command dictionaries and 21 rows at depth 0 versus 24 at warm depth above 0. A reset or eviction can make a later call cold again, returning 21 rows. M* uses protocol v2 for connection-bound session ids, while the reference's chunked deployment uses v1; E5 must advertise a client stack that the stock v2 client can build and send only actuator command fields. The E4 frontends carry the session and episode lifecycle; E5 supplies Praxis-specific pose composition and executed-frame context. This route waits for agreement on the episode contract. The cold-only openpi mode remains an explicitly separate bring-up path.
+**Stage 2, with episode state:** the new Positronic `/api/v1/session` route follows the reference's session behavior, including pose-composed command dictionaries and 21 rows at depth 0 versus 24 at warm depth above 0. A reset or idle expiry can make a later call cold again, returning 21 rows. M* uses protocol v2 for connection-bound session ids, while the reference's chunked deployment uses v1; E5 must advertise a client stack that the stock v2 client can build and send only actuator command fields. The E4 frontends carry the session and episode lifecycle; E5 supplies Praxis-specific pose composition and executed-frame context. This route waits for agreement on the episode contract. The cold-only openpi mode remains an explicitly separate bring-up path.
 
 **Other users.** Candidates, not checked against their references:
 
@@ -337,17 +344,17 @@ Staging, each step independently reviewable and testable. The cold-only openpi b
 | Step | Contents |
 |---|---|
 | E1 | Stack on #1503; add `lifetime="episode"`, the restricted `max_len=None` dense window, a generic request-handle-to-episode-row binding across storages, and `END_EPISODE`. Modular tests append 21 + 24 + 24 + 24 frames through a 69-frame window, check chronological reads and bounded resident memory, reject unsupported unbounded or backward-reaching reads, and free a temporary slot on `REMOVE_REQUEST` |
-| E2 | The conductor's record, pinned placement, `EpisodeView` to `walk_plan`, per-episode queue, `max_calls`, keys; tests show a named episode resumes warm and separate idless requests start cold |
-| E3 | Shared-slot admission for named and temporary calls, eviction, idle timeout, cleanup on failure and worker loss, metrics; pressure tests cover a full pool and an in-flight temporary request |
+| E2 | The conductor's record, pinned placement, `EpisodeView` to `walk_plan`, per-episode queue, `max_calls`, final adapter digest on the wire, startup weight epoch in the conductor, whole-record identity and per-array model keys; tests show a named episode resumes warm, a changed epoch or adapter digest clears every held array even without model keys, a prompt key change clears only its array, and separate idless requests start cold |
+| E3 | Shared-slot admission for named and temporary calls, idle expiry, cleanup on failure and worker loss, and metrics; pressure tests show an idless or new named call waits behind connected episodes instead of displacing them, then runs after a close or expiry, with cases on both sides of `idle_timeout_s`. A future base-weight reload must coordinate invalidation or end affected episodes |
 | E4 | Both Python and Rust frontends: the new Positronic `/api/v1/session` API, including connection id, reset, close and reply behavior; `test/rust` checks a stubbed Positronic cold/warm session across both frontends |
-| E5 | Praxis-1 on episodes, including pose-composed Positronic commands; an integration test checks executed-frame history and text reuse across calls, reset, eviction, and 21 rows at cold depth 0 versus 24 when warm |
+| E5 | Praxis-1 on episodes, including pose-composed Positronic commands; an integration test checks executed-frame history and text reuse across calls, reset, idle expiry, and 21 rows at cold depth 0 versus 24 when warm |
 
 ---
 
 ## 11. Open questions
 
 1. **Client-supplied ids.** Should a client be able to name its episode, to survive a reconnect or to drive episodes over `/generate/ws`? If so, scoped to its API key, and is the idle timeout then the only cleanup?
-2. **The cold-start notice.** Should a Positronic reply report when a previously warm session was evicted or ended idle, so the client can tell why its next call is cold? If so, where in the wire reply?
+2. **The cold-start notice.** Should a Positronic reply report when a previously warm session expired idle, so the client can tell why its next call is cold? If so, where in the wire reply?
 3. **Text embeddings across episodes.** A content-keyed encoder-output cache is separate from episode state. If built, should it include Chatterbox's voice LRU so both share one cache policy?
 4. **Idle episodes to host memory** instead of dropping them, once cold-start cost is measured?
 5. **Per-connection settings.** The reference takes `max_chunks_per_episode` and sampler settings per session from the URL query. Should the Positronic route accept the same settings, or is the deployment config enough?
