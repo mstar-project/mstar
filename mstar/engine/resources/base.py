@@ -215,7 +215,8 @@ class Resource(ResidentHooks, ABC):
     def depends_on(self) -> set[str]:
         return set()
 
-    def can_capture(self) -> bool:
+    def can_capture(self, step) -> bool:
+        """Whether a graph captured over ``step``, this resource's part of a declared step, replays as it ran."""
         return True
 
     # this resource's key among the engine's resources, set by `build_resource`

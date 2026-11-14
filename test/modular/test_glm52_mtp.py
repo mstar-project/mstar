@@ -83,7 +83,7 @@ def test_mtp_forward_writes_the_plane_layer():
     handles = bind_cpu_state(module, cfg, resources)
     kv = resources[KV]
     assert kv.config.num_layers == cfg.num_hidden_layers + 1
-    assert module.transformer_layer.self_attn.cache_layer_idx == cfg.num_hidden_layers
+    assert int(module.transformer_layer.self_attn.layer) == cfg.num_hidden_layers
 
     n = 3
     step = _plane_step(runner, handles, "r0", n)

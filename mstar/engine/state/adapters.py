@@ -46,6 +46,7 @@ from mstar.engine.resources.kv.manager import _DEBUG_ASSERTS
 from mstar.engine.resources.kv.plan import stage_reach
 from mstar.engine.resources.kv.ring.cache import fits_block_mask
 from mstar.engine.resources.linear_attn.config import (
+    LinearAttnBackend,
     LinearAttnConfig,
     LinearAttnSpec,
     LinearAttnStep,
@@ -54,6 +55,7 @@ from mstar.engine.resources.linear_attn.config import (
 )
 from mstar.engine.resources.position.config import PositionConfig, PositionSpec, PositionStep
 from mstar.engine.resources.recurrent.config import (
+    DeltaNetGeometry,
     RecurrentBlockConfig,
     RecurrentStateConfig,
     RecurrentStateSpec,
@@ -85,6 +87,8 @@ from mstar.engine.state.contract import (
     Entry,
     FrameWindow,
     GatedDeltaNet,
+    KimiDelta,
+    KimiDeltaWeights,
     KVEntry,
     LatentAttend,
     LatentEntry,
@@ -116,6 +120,11 @@ from mstar.model.components.diffusion.attention import FrameSDPA, joint_attentio
 if TYPE_CHECKING:
     from mstar.engine.state.state_op import StateOp
     from mstar.model.base import LabelLayout, Model
+
+
+# A holed array writes HOLE into a rejected entry's 64-wide rope slot, the slot FlashInfer's MLA kernel takes beside
+# rank 512. Its reads pass a rope query of ones, so the entry scores 64 * HOLE and softmax takes it to zero.
+HOLE, HOLE_SLOT = -1.0e4, 64
 
 
 def node_resources(model: "Model", *, setup: "StateSetup | None" = None) -> list[NodeResourceSpec]:
@@ -697,6 +706,18 @@ class OpBinding:
         """The key of the resource the op under ``key`` runs on."""
         return key
 
+    def layout(self, field: str) -> "OpBinding":
+        """The binding whose `block`, `stored` and `from_stored` lay out ``field``, one the op writes."""
+        return self
+
+    def verify_blocks(self, array: Array) -> Mapping[str, RecurrentBlockConfig]:
+        """The pool blocks beyond ``array``'s fields that the op, a Value's update, keeps between verify steps."""
+        return EMPTY
+
+    def settle(self, run: Any, kept: torch.Tensor, label: str) -> None:
+        """Settle this verify step on ``run``, the update's: row r keeps what its first ``kept[r]`` tokens ran."""
+        raise ValueError(f"{type(self).__name__} keeps no verify blocks, so it settles no verify step")
+
     def apply(self, spec: NodeResourceSpec | None, settings: Mapping[str, Any]) -> None:
         """Set ``settings``, the op's `kernel_settings`, on ``spec``, its resource's."""
         for field, value in settings.items():
@@ -990,6 +1011,19 @@ class _LatentRead:
         return self._attn.select_last_hidden(x, label=label)
 
 
+class HoledLatentAttend(PagedLatentAttend):
+    """`LatentAttend` on a holed array."""
+
+    def check(self, array: Array, key: str, read: Read) -> None:
+        if not isinstance(read.mask, Causal):
+            raise _no_layout(array, f"reads[{key!r}].mask must be Causal, the one mask a holed array's marks are "
+                                    "written for")
+        super().check(array, key, read)
+
+    def for_mask(self, mask: Mask) -> OpBinding:
+        return self
+
+
 class SelectedLatentAttend(PagedLatentAttend):
     """`LatentAttend` through a `Selected` mask: DSA's attention over each row's picks, on the DSA resource of the array
     ``of`` names, and FlashInfer's MLA plan for a step whose rows reach no more than they pick."""
@@ -1270,6 +1304,111 @@ class RewindRun(VerifyRun):
             self.handle.positions.defer_correct_len(counts)
 
 
+class Holes(OpBinding):
+    """Verify steps on a holed array, whose pages keep each verify block whole."""
+
+    def resource(self, array: Array, key: str) -> str:
+        return array.name
+
+    def attach(self, handle: ArrayHandle, key: str, run: Any) -> None:
+        handle.verify = HolesRun(handle, run)
+
+
+class HolesRun(VerifyRun):
+    """The verify steps of a holed array. Settle marks the entries each row didn't keep as holes, on every layer added
+    so far, and an add after it marks its own layer, all in device ops a capture records, so no count reaches the
+    host and nothing is rewound."""
+
+    def __init__(self, handle: "HoledHandle", kv: Any):
+        super().__init__(handle)
+        self._kv = kv
+        # this step's verify block and, once it has settled, each entry's mark, (rows * block, 1)
+        self._block: int | None = None
+        self._marks: torch.Tensor | None = None
+
+    def begin(self, declared: ArrayStep, segments: Sequence[Segment], ctx) -> None:
+        self._block = self._marks = None
+        if not declared.verify or ctx.replays:
+            return
+        spans, span = sorted({segment.span for segment in segments}), self.handle.array.verify_span
+        if len(spans) != 1 or not 1 <= spans[0] <= span:
+            raise self.handle._refusal(f"a verify step whose rows add {spans} entries, and a holed array marks one "
+                                       f"block of 1 to verify_span {span} on every row")
+        self._block = spans[0]
+
+    def settle(self, kept: torch.Tensor) -> None:
+        h = self.handle
+        if self._block is None:
+            raise h._refusal("settle on a step that doesn't verify")
+        if self._marks is not None:
+            raise h._refusal("a second settle in one verify step")
+        keep = torch.arange(self._block, device=kept.device) < kept[:, None]
+        self._marks = torch.where(keep.reshape(-1, 1), 0.0, HOLE)
+        for layer in sorted(h._kept):
+            self.mark(layer)
+
+    def mark(self, layer: int) -> None:
+        """Write this step's marks into the rope slot of ``layer``'s entries, once the step has settled."""
+        if self._marks is None:
+            return
+        pages, offsets = self._kv.write_slots(self.handle.label)
+        cache = self._kv.layer_view(self.handle._pool_layer[layer])
+        cache[pages, offsets, self.handle._rank:] = self._marks.to(cache.dtype).expand(-1, HOLE_SLOT)
+
+    def end(self, ctx) -> None:
+        if self._block is not None and self._marks is None:
+            raise self.handle._refusal("a verify step ends with no settle, and its rejected entries stay unmarked")
+
+
+class UpdateSettle(OpBinding):
+    """Verify steps on a Value, which the update that keeps verify blocks settles in the graph."""
+
+    def check(self, array: Array, key: str, verify: Verify) -> None:
+        _settling_update(array)
+
+    def attach(self, handle: ArrayHandle, key: str, run: Any) -> None:
+        handle.verify = UpdateSettleRun(handle)
+
+
+class UpdateSettleRun(VerifyRun):
+    """The verify steps of a Value. Between them part of the entry lives in the settling update's verify blocks, so
+    the Value is never read whole."""
+
+    def __init__(self, handle: "ValueHandle"):
+        super().__init__(handle)
+        settling = _settling_update(handle.array)
+        self._binding, self._run = settling.binding, handle._runners[type(settling.declared)]
+        self._verifying = self._settled = False
+
+    def begin(self, declared: ArrayStep, segments: Sequence[Segment], ctx) -> None:
+        self._verifying, self._settled = declared.verify, False
+
+    def check_read(self) -> None:
+        raise self.handle._no_layout("a read of a Value that verifies, part of whose entry lives in its update's "
+                                     "verify blocks between verify steps")
+
+    def check_update(self) -> None:
+        if self._settled:
+            raise self.handle._refusal("an update after this verify step's settle")
+
+    def settle(self, kept: torch.Tensor) -> None:
+        h = self.handle
+        if not self._verifying:
+            raise h._refusal("settle on a step that doesn't verify")
+        if self._settled:
+            raise h._refusal("a second settle in one verify step")
+        updated = set(h.array.entry.tensors) - h._step_written
+        unrun = sorted({(field, layer) for field in updated for layer in h.array.layers} - h._updated)
+        if unrun:
+            raise h._refusal(f"settle before the updates of {unrun}, and it comes after the step's last update")
+        self._settled = True
+        self._binding.settle(self._run, kept, h.label)
+
+    def end(self, ctx) -> None:
+        if self._verifying and not self._settled:
+            raise self.handle._refusal("a verify step ends with no settle, and its update keeps every token it ran")
+
+
 class WithinStepAttend(OpBinding, ABC):
     """`Attend` within a step, over the step's own adds."""
 
@@ -1371,6 +1510,130 @@ class GDN(LinearAttnBinding):
 
     def from_stored(self, stored: torch.Tensor) -> torch.Tensor:
         return stored.transpose(-1, -2)
+
+
+class KDA(LinearAttnBinding):
+    """`KimiDelta` on a Value: one `LinearAttnSpec` whose kernels read and write ``conv`` and ``state`` together."""
+
+    kernel_settings = frozenset()
+
+    def check(self, array: Array, key: str, op: KimiDelta) -> None:
+        if set(array.entry.tensors) != set(op.writes):
+            raise _no_layout(array, "entry must be exactly conv and state, the blocks the KDA kernels read")
+        dtype = array.entry.tensors["state"].dtype
+        if dtype is not torch.float32:
+            raise _no_layout(array, f"state of dtype {dtype}, and the KDA kernels keep the recurrence in float32")
+
+    def specs(self, array: Array, key: str, op: KimiDelta) -> list[NodeResourceSpec]:
+        return [LinearAttnSpec(
+            resource_key=key, nodes=array.nodes,
+            config=LinearAttnConfig(
+                recurrent_state=array.name, variant=LinearAttnVariant.KDA, backend=LinearAttnBackend.TRITON,
+            ),
+        )]
+
+    def steps(
+        self, array: Array, key: str, op: KimiDelta, declared: ArrayStep, segments, steps: dict[str, Any],
+    ) -> None:
+        steps[key] = LinearAttnStep(segments=segments, speculative=declared.verify)
+
+    def layout(self, field: str) -> OpBinding:
+        return K_LAST_STATE if field == "state" else OpBinding()
+
+    def verify_blocks(self, array: Array) -> Mapping[str, RecurrentBlockConfig]:
+        """The last verify block's inputs and the conv window before it, on two sides, and each slot's count and side,
+        which the next step replays from."""
+        if array.verify_span == 1:
+            return EMPTY
+        conv, state = array.entry.tensors["conv"], array.entry.tensors["state"]
+        heads, head_dim = state.shape[0], state.shape[1]
+        blocks = DeltaNetGeometry(
+            num_k_heads=heads, num_v_heads=heads, head_k_dim=head_dim, head_v_dim=head_dim,
+            conv_kernel_size=conv.shape[1] + 1,
+        ).to_blocks(conv_dtype=conv.dtype, speculative_tokens=array.verify_span - 1)
+        return {name: block for name, block in blocks.items() if name.startswith("spec_")}
+
+    def settle(self, run: "_KimiDeltaRun", kept: torch.Tensor, label: str) -> None:
+        """Write each row's kept count and flip the side it replays from, at the plan's slots. Device ops, so a capture
+        records them, and padding rows write the sink."""
+        plan = run.kda.settle_verify(label)
+        slots = plan.slot_ids[:plan.num_rows].long()
+        spec_len, spec_side = run.pool.block("spec_len"), run.pool.block("spec_side")
+        spec_len.index_copy_(0, slots, kept[:plan.num_rows].to(torch.int32).unsqueeze(1))
+        spec_side.index_copy_(0, slots, 1 - spec_side.index_select(0, slots))
+
+    def bind(self, array: Array, key: str, resources: Mapping[str, Any]) -> "_KimiDeltaRun":
+        op = array.updates[key]
+        resources[key].bind_layer(lower_bound=op.lower_bound, full_rank_output_gate=op.full_rank_gate)
+        return _KimiDeltaRun(array, op, resources[key], resources[array.name])
+
+
+class KLastState(OpBinding):
+    """A delta rule's ``state``, stored K-last, (h, d_v, d_k), where the op declares (h, d_k, d_v), since the KDA
+    kernels read it that way."""
+
+    def block(self, tensor: TensorType) -> RecurrentBlockConfig:
+        h, d_k, d_v = tensor.shape
+        shard = None if tensor.shard is None else (0, 2, 1)[tensor.shard]
+        return _block(TensorType((h, d_v, d_k), dtype=tensor.dtype, shard=shard))
+
+    def stored(self, value: torch.Tensor) -> torch.Tensor:
+        return value.transpose(-1, -2)
+
+    def from_stored(self, stored: torch.Tensor) -> torch.Tensor:
+        return stored.transpose(-1, -2)
+
+
+K_LAST_STATE = KLastState()
+
+
+class _KimiDeltaRun:
+    """`KDAManager.run` for `kimi_delta`, with each layer's kernel parameters built once per `KimiDeltaWeights`
+    object, so weights rebuilt after a move rebuild them, and its verify blocks looked up once."""
+
+    def __init__(self, array: Array, op: KimiDelta, kda: Any, pool: Any):
+        self._name = array.name
+        self._op = op
+        self.kda, self.pool = kda, pool
+        # pool layer -> the weights its parameters were built from, and the parameters
+        self._params: dict[int, tuple[KimiDeltaWeights, Any]] = {}
+        self._spec: dict[int, Any] = {}
+
+    def run(
+        self, i: int, qkv: torch.Tensor, g: torch.Tensor, beta: torch.Tensor, conv: torch.Tensor, state: torch.Tensor,
+        weights: KimiDeltaWeights, *, gate: torch.Tensor | None, label: str,
+    ) -> torch.Tensor:
+        built = self._params.get(i)
+        if built is None or built[0] is not weights:
+            self._check_gate(weights, gate)
+            built = self._params[i] = (weights, self._kernel_params(weights, state))
+        spec = None
+        if self.kda.speculative_tokens:
+            spec = self._spec.get(i)
+            if spec is None:
+                from mstar.engine.resources.linear_attn.kda import SpecBlocks
+
+                spec = self._spec[i] = SpecBlocks.of(self.pool, i)
+        return self.kda.run(qkv, g, beta, conv, state, built[1], gate=gate, label=label, spec=spec)
+
+    def _check_gate(self, weights: KimiDeltaWeights, gate: torch.Tensor | None) -> None:
+        full = self._op.full_rank_gate
+        given = {"gate": gate, "g_b": weights.g_b, "norm_weight": weights.norm_weight}
+        wrong = sorted(name for name, value in given.items() if (value is not None) == full)
+        if wrong:
+            raise ValueError(f"Array {self._name!r}: kimi_delta under full_rank_gate={full} takes "
+                             f"{'no' if full else 'a'} gate, g_b and norm_weight, and got {wrong} "
+                             f"{'set' if full else 'None'}")
+
+    def _kernel_params(self, weights: KimiDeltaWeights, state: torch.Tensor) -> Any:
+        from mstar.engine.resources.linear_attn.kda import KDAParams
+
+        heads, head_dim = state.shape[1], state.shape[-1]
+        return KDAParams(
+            conv_weight=weights.conv, A_log=weights.a_log, dt_bias=weights.dt_bias, lower_bound=self._op.lower_bound,
+            num_heads=heads, head_dim=head_dim, scale=head_dim ** -0.5 if self._op.scale is None else self._op.scale,
+            f_b=weights.f_b, g_b=weights.g_b, norm_weight=weights.norm_weight, norm_eps=weights.norm_eps,
+        )
 
 
 class ConvOnLinearAttn(OpBinding):
@@ -1827,6 +2090,59 @@ class LatentHandle(PagedArrayHandle):
         return self._attn[layer].run(q, label=self.label, kv_cache_layer=self._views[layer], q_pe=q_pe, **mask_args)
 
 
+class HoledHandle(LatentHandle):
+    """Adds and reads through the MLA pages of a holed array. An add copies ``ckv`` into staging rows whose rope slot
+    stays zero, a kept entry's mark, and a read passes a rope query of ones. A captured step and an eager step each
+    have their own buffers, so an eager step that outgrows the captured ones never moves what a graph recorded."""
+
+    def __init__(
+        self, array: Array, resources: Mapping[str, Any], bindings: tuple[BoundOp, ...], resolved: "Resolved",
+    ):
+        super().__init__(array, resources, bindings, resolved)
+        # each keyed by whether the step is a capture
+        self._staging: dict[bool, torch.Tensor] = {}
+        self._ones: dict[bool, torch.Tensor] = {}
+
+    def takes_fused(self, op: "StateOp") -> bool:
+        """Never: no format names the rope slot, which a kept entry keeps at zero."""
+        return False
+
+    def _rows(self, buffers: dict[bool, torch.Tensor], rows: int, make: Callable[[int], torch.Tensor]) -> torch.Tensor:
+        held = buffers.get(self._capturing)
+        if held is None or held.shape[0] < rows:
+            if self._capturing and torch.cuda.is_available() and torch.cuda.is_current_stream_capturing():
+                raise self._refusal(f"a recording of {rows} rows past the captured buffers' "
+                                    f"{0 if held is None else held.shape[0]}, and every kept graph records them at "
+                                    "one address")
+            held = buffers[self._capturing] = make(rows)
+        return held[:rows]
+
+    @torch.compiler.disable
+    def add(self, layer: int | torch.Tensor, *, keep: bool | None = None, **fields: torch.Tensor) -> None:
+        layer = self._layer_id(layer)
+        if fields.keys() != {"ckv"}:
+            raise self._refusal(f"an add of fields {sorted(fields)}, and the latent entry holds ['ckv']")
+        self._record_add(layer, keep)
+        ckv = fields["ckv"]
+        staging = self._rows(self._staging, ckv.shape[0], lambda rows: ckv.new_zeros(rows, self._rank + HOLE_SLOT))
+        staging[:, :self._rank].copy_(ckv)
+        self._kv.write_kv(staging, None, layer_idx=self._pool_layer[layer], label=self.label)
+        if layer in self._kept:
+            self.verify.mark(layer)
+
+    @torch.compiler.disable
+    def read(self, layer: int | torch.Tensor, q: torch.Tensor | None = None, **mask_args: Any) -> torch.Tensor:
+        """Attend ``q``, (tokens, q_heads, rank), with the rope query of ones."""
+        layer = self._layer_id(layer)
+        if q is None:
+            raise self._no_layout("a read with no op")
+        if mask_args:
+            raise self._no_layout(f"read arguments {sorted(mask_args)}, which a holed array's read takes none of")
+        self._record_read(layer)
+        ones = self._rows(self._ones, q.shape[0], lambda rows: q.new_ones(rows, q.shape[1], HOLE_SLOT))
+        return self._attn[layer].run(q, label=self.label, kv_cache_layer=self._views[layer], q_pe=ones)
+
+
 class DsaKeyHandle(ArrayHandle):
     """Adds and reads DSA index keys through today's DSA resource, which keeps each request's keys in its own store
     and picks each row's top positions over them."""
@@ -1937,13 +2253,15 @@ class ValueHandle(ArrayHandle):
             field: {layer: self._pool.block(field, i) for layer, i in self._pool_layer.items()}
             for field in array.entry.tensors
         }
-        self._runners = {
-            type(bound.declared): bound.binding.bind(array, resolved.resource_of[bound.key], resources)
-            for bound in bindings
-        }
+        # the updates' runs; the verify entry, under the array's own name, attaches the run of its verify steps
+        runs = {bound.key: bound.binding.bind(array, resolved.resource_of[bound.key], resources) for bound in bindings}
+        self._runners = {type(bound.declared): runs[bound.key] for bound in bindings if bound.key != array.name}
         self._layouts = _field_layouts(array, bindings)
         # `_step_written` holds the fields a kept step writes itself, and `_written` those each layer's write set.
         self._step_written = written_by_step(array)
+        for bound in bindings:
+            if bound.key == array.name:
+                bound.binding.attach(self, bound.key, runs[bound.key])
         self._written: dict[int, set[str]] = {}
         self._stepped = False
 
@@ -1987,6 +2305,7 @@ class ValueHandle(ArrayHandle):
         if q is not None or mask_args:
             given = sorted({*mask_args, *(("q",) if q is not None else ())})
             raise self._refusal(f"a Value's read takes no q and no keyword, and got {given}")
+        self.verify.check_read()
         self._record_read(layer)
         if layer in self._written or any(updated == layer for _, updated in self._updated):
             raise self._refusal(f"a read of layer {layer} after its write or update in this step")
@@ -2043,14 +2362,18 @@ class ValueHandle(ArrayHandle):
             stored = self._stored(field, layer, value, value.shape[1:], "write")
             self._pool.scatter_(field, stored, self._pool_layer[layer], label=self.label)
 
-    def _update(self, kind: type[Op], layer: int) -> tuple[Any, torch.Tensor]:
+    def _update(self, kind: type[Op], layer: int) -> tuple[Any, tuple[torch.Tensor, ...]]:
         runner = self._runners.get(kind)
         if runner is None:
             raise self._refusal(f"an update of type {kind.__name__}, which the array doesn't declare")
-        (field,) = kind.writes
-        view = self.block(field, layer)
-        self._record_update(field, layer)
-        return runner, view
+        self.verify.check_update()
+        views = tuple(self.block(field, layer) for field in kind.writes)
+        for field in kind.writes:
+            self._record_update(field, layer)
+        return runner, views
+
+    def _openable(self) -> int:
+        return self._pool.num_free_slots
 
 
 class _OneEntryPerRow(Reached):
@@ -2657,6 +2980,22 @@ class LatentStorage(PagedStorage):
         )
 
 
+class HoledStorage(LatentStorage):
+    """A latent array with no ``kpe`` that verifies. Each verify step keeps its whole block in the pages, and the
+    entries a row didn't keep stay as holes, marked in the rope slot such a latent leaves free, so a request holds up
+    to ``max_len * verify_span`` rows."""
+
+    handle_class = HoledHandle
+
+    def _pool_config(self, array: Array, geometry: tuple[int, int], q_heads: int | None) -> PagedKVConfig:
+        rank, _ = geometry
+        return PagedKVConfig(
+            num_layers=len(array.layers), num_qo_heads=q_heads, num_kv_heads=1, head_dim=rank + HOLE_SLOT,
+            max_seq_len=array.max_len * array.verify_span, layout=KVLayout.MLA, kv_lora_rank=rank,
+            qk_rope_head_dim=HOLE_SLOT,
+        )
+
+
 class DsaKeyStorage(Storage):
     """An append-only array of DSA index keys, which today's DSA resource keeps per request in its own store, outside
     any pages, for the one latent array whose `Selected` read names it."""
@@ -2752,7 +3091,7 @@ class ValueStorage(Storage):
     """A rewritable array of one entry, in a recurrent state pool."""
 
     handle_class = ValueHandle
-    kernel_settings = frozenset({"max_slots"})
+    kernel_settings = frozenset({"max_slots", "max_slots_of"})
 
     def resolve(self, arrays: Sequence[Array], declared: Sequence[Array], setup: "StateSetup") -> Resolved:
         resolved = Resolved({}, {}, {}, {})
@@ -2773,11 +3112,14 @@ class ValueStorage(Storage):
                                         f"{[other.name for other in holders]}")
             kv_cache = holders[0].name
         layouts = _field_layouts(array, bound)
+        blocks = {field: layouts[field].block(tensor) for field, tensor in array.entry.tensors.items()}
+        for each in bound:
+            blocks.update(each.binding.verify_blocks(array))
         pool = RecurrentStateSpec(
             resource_key=array.name, nodes=array.nodes,
             config=RecurrentStateConfig(
                 num_layers=len(array.layers),
-                blocks={field: layouts[field].block(tensor) for field, tensor in array.entry.tensors.items()},
+                blocks=blocks,
                 kv_cache=kv_cache,
                 labels=tuple(sorted(array.labels)),
             ),
@@ -2865,6 +3207,7 @@ PAGED = PagedStorage()
 PAGED_BY_WALK = PagedByWalkStorage()
 PAGED_CROSS = PagedCrossStorage()
 LATENT = LatentStorage()
+HOLED = HoledStorage()
 DSA_KEYS = DsaKeyStorage()
 RING = RingStorage()
 VALUE = ValueStorage()
@@ -2888,7 +3231,7 @@ def storage_of(array: Array) -> Storage:
     if array.reads and all(isinstance(read.op, TopK) for read in array.reads.values()):
         return DSA_KEYS
     if "ckv" in array.entry.tensors:
-        return LATENT
+        return HOLED if array.verify_span > 1 and "kpe" not in array.entry.tensors else LATENT
     if any(read.queries is not None for read in array.reads.values()):
         return PAGED_CROSS
     return PAGED_BY_WALK if reads_differ_by_walk(array) else PAGED
@@ -2909,12 +3252,16 @@ BINDINGS: dict[tuple[Storage, type[Op | Positions | Verify | None]], OpBinding] 
     (LATENT, LatentAttend): PagedLatentAttend(),
     (LATENT, Positions): PositionsBinding(),
     (LATENT, Verify): Rewind(),
+    (HOLED, LatentAttend): HoledLatentAttend(),
+    (HOLED, Verify): Holes(),
     (DSA_KEYS, TopK): DsaTopK(),
     (RING, Attend): FlexAttend(),
     (RING, Positions): CounterPositions(),
     (WITHIN_STEP, Attend): RaggedAttend(),
     (VALUE, GatedDeltaNet): GDN(),
     (VALUE, CausalConv): ConvOnLinearAttn(),
+    (VALUE, KimiDelta): KDA(),
+    (VALUE, Verify): UpdateSettle(),
 }
 # What `backend: sdpa` binds in place of the default, for each storage and op type SDPA can run.
 SDPA: dict[tuple[Storage, type[Op]], OpBinding] = {(WITHIN_STEP, Attend): SdpaAttend()}
@@ -2981,6 +3328,20 @@ def _bindings(
     return tuple(bound)
 
 
+def _settling_update(array: Array) -> BoundOp:
+    """The update that settles the verify steps of ``array``, a Value: of its updates, the one whose binding keeps
+    verify blocks."""
+    storage = storage_of(array)
+    settling = [
+        BoundOp(key, op, BINDINGS[(storage, type(op))]) for key, op in array.updates.items()
+        if BINDINGS[(storage, type(op))].verify_blocks(array)
+    ]
+    if len(settling) != 1:
+        raise _no_layout(array, f"a Value verifies through one update that keeps verify blocks, and the array has "
+                                f"{[each.key for each in settling]}")
+    return settling[0]
+
+
 def _no_binding(storage: Storage, array: Array, where: str, *, update: bool) -> ValueError:
     """The refusal of ``where``, a read's op or an update ``storage`` has no binding for, naming the ops of that kind it
     binds: a read's op changes no field, and an update writes one."""
@@ -3005,5 +3366,8 @@ def _op_specs(array: Array, bound: Sequence[BoundOp]) -> list[NodeResourceSpec]:
 def _field_layouts(array: Array, bound: Sequence[BoundOp]) -> dict[str, OpBinding]:
     """Each of ``array``'s fields with the binding that lays it out in the pool: the update's that writes it, or the
     base binding's layout as declared."""
-    written = {field: each.binding for each in bound for field in each.declared.writes}
+    written = {
+        field: each.binding.layout(field) for each in bound if isinstance(each.declared, Op)
+        for field in each.declared.writes
+    }
     return {field: written.get(field, OpBinding()) for field in array.entry.tensors}

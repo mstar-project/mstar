@@ -228,7 +228,7 @@ class DenseAttentionManager(AttentionManager):
         # differ in the last bits
         return fingerprint(type(self).__name__, self._wrapper_class.__name__, self._flashinfer_backend)
 
-    def can_capture(self) -> bool:
+    def can_capture(self, step) -> bool:
         return False
 
     @property

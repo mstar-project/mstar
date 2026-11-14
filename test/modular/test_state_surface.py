@@ -24,8 +24,8 @@ from mstar.engine.state.calls import ArrayHandle
 _POSITIONAL = {"PagedLatentTarget", "PagedNHDTarget", "Segment", "SlotLease", "Span"}
 # The calls take the handle first, then what every call names, and only then keywords.
 _CALLS = {
-    "add_read", "at_last_token", "causal_conv", "gated_delta_net", "gather", "host", "last_sampled", "position",
-    "positions", "rope", "sample", "scatter", "settle", "split_range",
+    "add_read", "at_last_token", "causal_conv", "gated_delta_net", "gather", "host", "kimi_delta", "last_sampled",
+    "openable", "position", "positions", "rope", "sample", "scatter", "settle", "split_range",
 }
 # Each public name's parameters as ``[name, kind, default]``. A dataclass's parameters are its fields.
 SNAPSHOT = {
@@ -91,6 +91,20 @@ SNAPSHOT = {
     "KeptWindow": [
         ["sink", "POSITIONAL_OR_KEYWORD", None],
         ["window", "KEYWORD_ONLY", None],
+    ],
+    "KimiDelta": [
+        ["lower_bound", "KEYWORD_ONLY", None],
+        ["scale", "KEYWORD_ONLY", 'None'],
+        ["full_rank_gate", "KEYWORD_ONLY", 'False'],
+    ],
+    "KimiDeltaWeights": [
+        ["conv", "KEYWORD_ONLY", None],
+        ["a_log", "KEYWORD_ONLY", None],
+        ["dt_bias", "KEYWORD_ONLY", None],
+        ["f_b", "KEYWORD_ONLY", None],
+        ["g_b", "KEYWORD_ONLY", 'None'],
+        ["norm_weight", "KEYWORD_ONLY", 'None'],
+        ["norm_eps", "KEYWORD_ONLY", '1e-05'],
     ],
     "LatentAttend": [
         ["q_heads", "POSITIONAL_OR_KEYWORD", None],
@@ -233,6 +247,7 @@ SNAPSHOT = {
         ["layers", "KEYWORD_ONLY", None],
         ["entry", "KEYWORD_ONLY", None],
         ["updates", "KEYWORD_ONLY", '{}'],
+        ["verify_span", "KEYWORD_ONLY", '1'],
     ],
     "Window": [
         ["size", "POSITIONAL_OR_KEYWORD", None],
@@ -278,8 +293,20 @@ SNAPSHOT = {
         ["label", "POSITIONAL_OR_KEYWORD", None],
         ["layer", "POSITIONAL_OR_KEYWORD", None],
     ],
+    "kimi_delta": [
+        ["h", "POSITIONAL_OR_KEYWORD", None],
+        ["layer", "POSITIONAL_OR_KEYWORD", None],
+        ["qkv", "POSITIONAL_OR_KEYWORD", None],
+        ["g", "POSITIONAL_OR_KEYWORD", None],
+        ["beta", "POSITIONAL_OR_KEYWORD", None],
+        ["weights", "POSITIONAL_OR_KEYWORD", None],
+        ["gate", "KEYWORD_ONLY", 'None'],
+    ],
     "last_sampled": [
         ["s", "POSITIONAL_OR_KEYWORD", None],
+    ],
+    "openable": [
+        ["h", "POSITIONAL_OR_KEYWORD", None],
     ],
     "position": [
         ["h", "POSITIONAL_OR_KEYWORD", None],

@@ -55,7 +55,7 @@ class Glm52MLAAttention(MLAAttention):
         layer_idx: int | None = None,
         carried: CarriedPick | None = None,
     ) -> None:
-        super().__init__(config, comm_group, layer_idx, kv_key=KV, attn_key=None, pos_key=None)
+        super().__init__(config, comm_group, layer_idx, kv_key=KV)
         # DSA indexer only on FULL layers — SHARED layers carry no indexer
         # weights in the checkpoint (they reuse the last FULL selection),
         # and a dormant module would sit uninitialized after ``to_empty``.

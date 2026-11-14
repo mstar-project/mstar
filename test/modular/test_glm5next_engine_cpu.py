@@ -20,8 +20,9 @@ from mstar.engine.resources import SamplingReqConfig
 from mstar.engine.resources.kv import manager as kv_mod
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.step import StepContext
+from mstar.model.base import serving_resources
 from mstar.model.glm5_next.components.causal_lm import Glm5NextForCausalLM
-from mstar.model.glm5_next.config import KDA_STATE, KV_CACHE, SAMPLER, Glm5NextModelConfig
+from mstar.model.glm5_next.config import KDA_STATE, KV_CACHE, LABEL, PROMPT_LEN, SAMPLER
 from mstar.model.glm5_next.glm5_next_model import Glm5NextModel, process_weights_after_loading
 from mstar.model.glm5_next.submodules import Glm5NextLLMSubmodule
 from mstar.model.submodule_base import InputMetadata
@@ -82,8 +83,8 @@ def _stubs(monkeypatch):
 
 def _build_engine(seed: int = 0, autocast_dtype: torch.dtype | None = None):
     torch.manual_seed(seed)
-    cfg = Glm5NextModelConfig.reduced()
     model = Glm5NextModel("x", config_variant="reduced", kda_conv_dtype=torch.float32, kda_max_requests=4)
+    cfg = model.config
     lm = Glm5NextForCausalLM(cfg)
     for p in lm.parameters():
         if p.dtype.is_floating_point:
@@ -94,7 +95,7 @@ def _build_engine(seed: int = 0, autocast_dtype: torch.dtype | None = None):
 
     engine = Engine(None, autocast_dtype=autocast_dtype)  # no offload, so no runtime
     engine.load_model(
-        {"LLM": sub}, model.get_node_resources(),
+        {"LLM": sub}, serving_resources(model, {}),
         parallel_groups=WorkerParallelGroups(num_workers=1, global_rank=0),
         device=torch.device("cpu"),
         transfer_engine_info=TransferEngineInfo(
@@ -102,6 +103,7 @@ def _build_engine(seed: int = 0, autocast_dtype: torch.dtype | None = None):
             transfer_engine=LocalTransferEngine("localhost"),
         ),
         kv_cache_type=torch.float32,
+        model=model,
     )
     # swap the kernel sampler for the greedy stand-in everywhere the engine
     # handed it out
@@ -109,23 +111,38 @@ def _build_engine(seed: int = 0, autocast_dtype: torch.dtype | None = None):
     engine._resources[SAMPLER] = greedy
     engine._submodules["LLM"].resources[SAMPLER] = greedy
     sub.node_resources[SAMPLER] = greedy
+    sub.sampler.resource = greedy
     engine.warmup()  # no CUDA: captures nothing, compiles nothing (disable_torch_compile)
     return engine, sub, cfg
 
 
-def _info(rid: str, walk: str, max_tokens: int = 64) -> CurrentForwardPassInfo:
+def _info(
+    rid: str, walk: str, max_tokens: int = 64, prompt_len: int = 0, decode_iters: int = 0,
+) -> CurrentForwardPassInfo:
+    decode = walk == "decode"
     return CurrentForwardPassInfo(
         request_id=f"wire-{rid}", rid_handle=rid, graph_walk=walk, fwd_index=0, random_seed=0,
         max_tokens=max_tokens,
         resource_configs={SAMPLER: SamplingReqConfig(temperature=0.0)},
+        dynamic_loop_iter_counts={"decode_loop": decode_iters} if decode else {},
+        # the walk plan puts the prompt's length in the decode step's metadata alone
+        step_metadata={PROMPT_LEN: prompt_len} if decode else {},
     )
 
 
-def _run(engine: Engine, walk: str, inputs: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+def _run(
+    engine: Engine, walk: str, inputs: dict[str, torch.Tensor],
+    prompt_lens: dict[str, int] | None = None, decode_iters: int = 0,
+) -> dict[str, torch.Tensor]:
+    """One step of ``walk`` over ``inputs``. A decode step takes each request's prompt
+    length and the decode iterations before it, as the walk plan gives them."""
     rids = list(inputs)
     batch = _batch(
         node_name="LLM",
-        per_request_info={rid: _info(rid, walk) for rid in rids},
+        per_request_info={
+            rid: _info(rid, walk, prompt_len=(prompt_lens or {}).get(rid, 0), decode_iters=decode_iters)
+            for rid in rids
+        },
         per_request_input_tensors={rid: {"text_inputs": [ids]} for rid, ids in inputs.items()},
         step_context=StepContext(request_ids=tuple(rids), graph_walk=walk, slot=0, capture=False),
     )
@@ -137,8 +154,9 @@ def _run(engine: Engine, walk: str, inputs: dict[str, torch.Tensor]) -> dict[str
     return {rid: outputs.per_rid_outputs[rid]["new_token"][0] for rid in rids}
 
 
-def _context(sub: Glm5NextLLMSubmodule, rid: str) -> int:
-    return sub.request_state(rid).get("context", 0)
+def _stored(engine: Engine, rid: str) -> int:
+    """The request's rows in the latent pool."""
+    return engine._resources[KV_CACHE]._streams[rid][LABEL].stored_len
 
 
 def _add(engine: Engine, rid: str) -> None:
@@ -157,12 +175,11 @@ class TestEngineCpu:
         # prefill both in one batch, then three joint decode steps
         first = _run(engine, "prefill", {"a": a, "b": b})
         seq = {"a": [first["a"]], "b": [first["b"]]}
-        for _ in range(3):
-            step = _run(engine, "decode", {rid: seq[rid][-1] for rid in seq})
+        for i in range(3):
+            step = _run(engine, "decode", {rid: seq[rid][-1] for rid in seq}, {"a": len(a), "b": len(b)}, i)
             for rid, tokens in seq.items():
                 tokens.append(step[rid])
-        assert _context(sub, "a") == len(a) + 3 and _context(sub, "b") == len(b) + 3
-        assert kv._streams["a"]["main"].stored_len == len(a) + 3
+        assert _stored(engine, "a") == len(a) + 3 and _stored(engine, "b") == len(b) + 3
         assert pool.num_free_slots == pool.config.usable_slots - 2
 
         # a fresh request prefilled with the whole generated prefix must
@@ -185,7 +202,7 @@ class TestEngineCpu:
         out = _run(engine, "prefill", {"r": prompt})
         batch = _batch(
             node_name="LLM",
-            per_request_info={"r": _info("r", "decode", max_tokens=2)},
+            per_request_info={"r": _info("r", "decode", max_tokens=2, prompt_len=len(prompt))},
             step_context=StepContext(request_ids=("r",), graph_walk="decode", slot=0, capture=False),
         )
         # generated so far = 1 prefill token + (0 decode iters + 1) = 2 >= max_tokens
@@ -220,11 +237,11 @@ class TestEngineCpu:
         limit = cfg.index_topk
         _add(engine, "r")
         prompt = torch.arange(limit - 5, dtype=torch.long)
+        lens = {"r": len(prompt)}
         token = _run(engine, "prefill", {"r": prompt})["r"]
         for i in range(limit):
-            token = _run(engine, "decode", {"r": token})["r"]
-            info = _info("r", "decode", max_tokens=10 * limit)
-            info.dynamic_loop_iter_counts["decode_loop"] = i
+            token = _run(engine, "decode", {"r": token}, lens, i)["r"]
+            info = _info("r", "decode", max_tokens=10 * limit, prompt_len=len(prompt), decode_iters=i)
             batch = _batch(
                 node_name="LLM", per_request_info={"r": info},
                 step_context=StepContext(request_ids=("r",), graph_walk="decode", slot=0, capture=False),
@@ -232,10 +249,10 @@ class TestEngineCpu:
             if engine.check_stop_for_batch(batch, {"r": {"new_token": [token]}}).get("r"):
                 break
         # 1 prefill token + 4 decode steps: the context is one short of the cap
-        assert i == 3 and _context(sub, "r") == limit - 1
+        assert i == 3 and _stored(engine, "r") == limit - 1
         # the step already scheduled when the stop lands still fits
-        _run(engine, "decode", {"r": token})
-        assert _context(sub, "r") == limit
+        _run(engine, "decode", {"r": token}, lens, i + 1)
+        assert _stored(engine, "r") == limit
         engine.remove_request("r")
 
     def test_a_reply_at_the_most_tokens_the_window_holds_gets_them_all(self):
@@ -250,17 +267,16 @@ class TestEngineCpu:
         token = _run(engine, "prefill", {"r": prompt})["r"]
         emitted = 1
         for i in range(limit):
-            token = _run(engine, "decode", {"r": token})["r"]
+            token = _run(engine, "decode", {"r": token}, {"r": len(prompt)}, i)["r"]
             emitted += 1
-            info = _info("r", "decode", max_tokens=max_tokens)
-            info.dynamic_loop_iter_counts["decode_loop"] = i
+            info = _info("r", "decode", max_tokens=max_tokens, prompt_len=len(prompt), decode_iters=i)
             batch = _batch(
                 node_name="LLM", per_request_info={"r": info},
                 step_context=StepContext(request_ids=("r",), graph_walk="decode", slot=0, capture=False),
             )
             if engine.check_stop_for_batch(batch, {"r": {"new_token": [token]}}).get("r"):
                 break
-        assert emitted == max_tokens == 6 and _context(sub, "r") == limit
+        assert emitted == max_tokens == 6 and _stored(engine, "r") == limit
         engine.remove_request("r")
 
     def test_forward_runs_outside_the_engine_autocast(self):

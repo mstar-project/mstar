@@ -21,12 +21,15 @@ from mstar.engine.resources import SamplingReqConfig
 from mstar.engine.resources.kv import manager as kv_mod
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
 from mstar.engine.resources.step import StepContext
+from mstar.model.base import serving_resources
 from mstar.model.glm5_next.components.causal_lm import Glm5NextForCausalLM
-from mstar.model.glm5_next.config import KDA_STATE, KV_CACHE, SAMPLER, Glm5NextModelConfig
+from mstar.model.glm5_next.config import COUNT, KDA_STATE, KV_CACHE, LABEL, MTP_SEED, PROMPT_LEN, SAMPLER
 from mstar.model.glm5_next.glm5_next_model import Glm5NextModel, process_weights_after_loading
 from mstar.model.glm5_next.submodules import Glm5NextLLMSubmodule
-from mstar.model.submodule_base import InputMetadata
+from mstar.model.submodule_base import ARNodeInputs, InputMetadata
 from mstar.testing_utils.resource import StubResource
+from mstar.utils.device import DeviceCapability
+from mstar.worker.host_copies import HostCopies
 
 
 def _batch(**kwargs) -> ExecutingBatch:
@@ -84,10 +87,9 @@ def _stubs(monkeypatch):
 
 def _build_engine(k: int, seed: int = 0):
     torch.manual_seed(seed)
-    cfg = Glm5NextModelConfig.reduced()
-    cfg.mtp_num_draft_tokens = k
     model = Glm5NextModel("x", config_variant="reduced", kda_conv_dtype=torch.float32,
                           kda_max_requests=4, mtp_num_draft_tokens=k)
+    cfg = model.config
     lm = Glm5NextForCausalLM(cfg)
     # the trunk's parameters come first, so both engines draw the same trunk (building
     # the MTP layer draws from the generator too, hence the reseed)
@@ -100,7 +102,7 @@ def _build_engine(k: int, seed: int = 0):
     sub = Glm5NextLLMSubmodule(lm, cfg)
     engine = Engine(None)  # no offload, so no runtime
     engine.load_model(
-        {"LLM": sub}, model.get_node_resources(),
+        {"LLM": sub}, serving_resources(model, {}),
         parallel_groups=WorkerParallelGroups(num_workers=1, global_rank=0),
         device=torch.device("cpu"),
         transfer_engine_info=TransferEngineInfo(
@@ -108,70 +110,89 @@ def _build_engine(k: int, seed: int = 0):
             transfer_engine=LocalTransferEngine("localhost"),
         ),
         kv_cache_type=torch.float32,
+        model=model,
     )
     greedy = _GreedySampler()
     engine._resources[SAMPLER] = greedy
     engine._submodules["LLM"].resources[SAMPLER] = greedy
     sub.node_resources[SAMPLER] = greedy
+    sub.sampler.resource = greedy
     engine.warmup()
     return engine, sub, cfg
 
 
-def _info(rid, walk, max_tokens, decode_iter=0, ignore_eos=False):
+def _info(rid, walk, max_tokens, decode_iter=0, ignore_eos=False, prompt_len=0):
     return CurrentForwardPassInfo(
         request_id=f"wire-{rid}", rid_handle=rid, graph_walk=walk, fwd_index=0, random_seed=0, max_tokens=max_tokens,
         resource_configs={SAMPLER: SamplingReqConfig(temperature=0.0, ignore_eos=ignore_eos)},
         dynamic_loop_iter_counts={"decode_loop": decode_iter},
+        # the walk plan puts the prompt's length in the decode step's metadata alone
+        step_metadata={PROMPT_LEN: prompt_len} if walk == "decode" else {},
     )
 
 
-def _step(engine, walk, inputs, max_tokens, decode_iter=0, cached=None, ignore_eos=False):
+def _carry(out: dict) -> dict:
+    """The decode loop's inputs from a step's outputs: the next token, and under MTP the count."""
+    return {name: out[name] for name in ("text_inputs", COUNT) if name in out}
+
+
+def _stored(engine, rid: str) -> int:
+    return engine._resources[KV_CACHE]._streams[rid][LABEL].stored_len
+
+
+def _step(engine, walk, inputs, max_tokens, decode_iter=0, cached=None, ignore_eos=False, prompt_lens=None):
+    """One step of ``walk``; ``inputs`` holds each request's input tensors by name."""
     rids = list(inputs)
     batch = _batch(
         node_name="LLM",
-        per_request_info={rid: _info(rid, walk, max_tokens, decode_iter, ignore_eos)
+        per_request_info={rid: _info(rid, walk, max_tokens, decode_iter, ignore_eos, (prompt_lens or {}).get(rid, 0))
                           for rid in rids},
-        per_request_input_tensors={rid: {"text_inputs": [ids]} for rid, ids in inputs.items()},
+        per_request_input_tensors=inputs,
         step_context=StepContext(request_ids=tuple(rids), graph_walk=walk, slot=0,
                                  capture=False),
     )
     engine.prepare_inputs(batch)
     assert not batch.failed_requests, batch.failed_requests
     # The cache holds the prompt and every step's whole block, rejected rows included (holes,
-    # masked on the device), and the request's context counts them.
-    kv, sub = engine._resources[KV_CACHE], engine._submodules["LLM"].submodule
+    # masked on the device).
     for rid, want in (cached or {}).items():
-        assert kv._streams[rid]["main"].stored_len == want, (rid, want)
-        assert sub.request_state(rid).get("context") == want, (rid, want)
+        assert _stored(engine, rid) == want, (rid, want)
     outputs = engine.exec_and_postprocess(batch)
     assert batch.admit_error is None, batch.admit_error
     engine.finalize_batch(batch)
-    stops = engine.check_stop_for_batch(batch, outputs)
+    # as the worker hands the stop check a step's outputs: its stop buffers where the forward set them
+    cpu = torch.device("cpu")
+    copies = HostCopies(device=cpu, device_capability=DeviceCapability.of(cpu))
+    host, rows = copies.prematerialize_for_check_stop(outputs, None, request_ids=batch.request_ids)
+    stops = engine.check_stop_for_batch(batch, host, host_rows=rows)
+    assert not batch.failed_requests, batch.failed_requests
     return outputs.per_rid_outputs, stops
 
 
 def _generate(engine, prompts: dict[str, torch.Tensor], max_tokens: int) -> dict[str, list]:
     for rid in prompts:
         engine.add_request(rid, {SAMPLER: SamplingReqConfig(temperature=0.0)})
-    out, stops = _step(engine, "prefill", prompts, max_tokens)
+    lens = {rid: len(prompt) for rid, prompt in prompts.items()}
+    out, stops = _step(engine, "prefill", {rid: {"text_inputs": [p]} for rid, p in prompts.items()}, max_tokens)
     seqs = {rid: out[rid]["new_token"][0].tolist() for rid in prompts}
-    nxt = {rid: out[rid]["text_inputs"][0] for rid in prompts}
+    nxt = {rid: _carry(out[rid]) for rid in prompts}
     live = [rid for rid in prompts if not stops.get(rid)]
     block = engine._submodules["LLM"].submodule.mtp_block
     step = 0
     while live:
-        cached = {rid: len(prompts[rid]) + block * step for rid in live}
+        cached = {rid: lens[rid] + block * step for rid in live}
         out, stops = _step(engine, "decode", {rid: nxt[rid] for rid in live}, max_tokens,
-                           step, cached)
+                           step, cached, prompt_lens=lens)
         step += 1
         for rid in live:
             seqs[rid] += out[rid]["new_token"][0].tolist()
-            nxt[rid] = out[rid]["text_inputs"][0]
+            nxt[rid] = _carry(out[rid])
         live = [rid for rid in live if not stops.get(rid)]
     for rid in prompts:
         engine.remove_request(rid)
-    pool = engine._resources[KDA_STATE]
-    assert pool.num_free_slots == pool.config.usable_slots
+    for key in (KDA_STATE, MTP_SEED) if block > 1 else (KDA_STATE,):
+        pool = engine._resources[key]
+        assert pool.num_free_slots == pool.config.usable_slots, f"{key} kept a slot of a removed request"
     return seqs
 
 
@@ -189,11 +210,12 @@ def _oracle(sub, reference, wrong_every: int | None):
     """Drafts from the reference continuation at each request's position, wrong at every
     ``wrong_every``-th call when given. A step drafts d2..dk in its draft loop, then the next
     step's d1 once its verdict is in (the prefill: the first d1); wrapping the two passes tells
-    the oracle which call is which and how far each request is."""
+    the oracle which call is which, and the verdicts how far each request is."""
     calls = {"n": 0}
     where: dict = {}
     given: dict[str, list[int]] = {}  # each request's drafts for its current step, d1 first
-    real_prefill, real_decode = sub._mtp_prefill, sub._mtp_decode
+    done: dict[str, int] = {}  # each request's tokens emitted before its current step
+    real_forward, real_decode = sub._forward, sub._mtp_decode
 
     def at(rid, pos):
         seq = reference[rid]
@@ -207,22 +229,20 @@ def _oracle(sub, reference, wrong_every: int | None):
             given[rid] = [t] if fresh else [*given[rid], t]
         return torch.tensor(tokens, dtype=torch.long)
 
-    def prefill(engine_inputs, *args):
-        where.update(rids=list(engine_inputs.request_ids), row=None)
-        return real_prefill(engine_inputs, *args)
+    def prefill(graph_walk, engine_inputs, *args):
+        if graph_walk == "prefill":
+            where.update(rids=list(engine_inputs.request_ids), row=None)
+            done.update(dict.fromkeys(engine_inputs.request_ids, 1))
+        return real_forward(graph_walk, engine_inputs, *args)
 
     def decode(engine_inputs, *args):
-        rids = list(engine_inputs.request_ids)
-        # tokens emitted before this step: its first draft is the one at that position
-        where.update(rids=rids, row=0,
-                     done={rid: sub.request_state(rid).get("mtp_generated") for rid in rids})
+        where.update(rids=list(engine_inputs.request_ids), row=0)
         return real_decode(engine_inputs, *args)
 
     def draft(hidden, prev):
         rids = where["rids"]
         if where["row"] is None:
             return emit(rids, [at(rid, 1) for rid in rids], fresh=True)
-        done = where["done"]
         if where["row"] < sub.mtp_k - 1:
             where["row"] += 1
             return emit(rids, [at(rid, done[rid] + where["row"]) for rid in rids], fresh=False)
@@ -232,10 +252,11 @@ def _oracle(sub, reference, wrong_every: int | None):
             accepted = 0
             while accepted < sub.mtp_k and given[rid][accepted] == at(rid, done[rid] + accepted):
                 accepted += 1
-            nxt.append(at(rid, done[rid] + accepted + 1))
+            done[rid] += accepted + 1
+            nxt.append(at(rid, done[rid]))
         return emit(rids, nxt, fresh=True)
 
-    sub._mtp_prefill, sub._mtp_decode, sub._draft_tokens = prefill, decode, draft
+    sub._forward, sub._mtp_decode, sub._draft_tokens = prefill, decode, draft
 
 
 def test_reference_depends_on_context(reference):
@@ -268,10 +289,11 @@ def test_oracle_drafts_are_all_accepted():
     reference = _generate(ref_engine, {"a": PROMPTS["a"]}, MAX_TOKENS)
     _oracle(sub, reference, wrong_every=None)
     engine.add_request("a", {SAMPLER: SamplingReqConfig(temperature=0.0)})
-    out, _ = _step(engine, "prefill", {"a": PROMPTS["a"]}, MAX_TOKENS)
+    out, _ = _step(engine, "prefill", {"a": {"text_inputs": [PROMPTS["a"]]}}, MAX_TOKENS)
     first = out["a"]["new_token"][0].tolist()
     for step in range(2):
-        out, _ = _step(engine, "decode", {"a": out["a"]["text_inputs"][0]}, MAX_TOKENS, step)
+        out, _ = _step(engine, "decode", {"a": _carry(out["a"])}, MAX_TOKENS, step,
+                       prompt_lens={"a": len(PROMPTS["a"])})
         emitted = out["a"]["new_token"][0].tolist()
         assert len(emitted) == k + 1
         assert first + emitted == reference["a"][:len(first) + len(emitted)]
@@ -287,46 +309,30 @@ def test_decode_stops_while_the_next_block_fits():
     block, limit = k + 1, cfg.index_topk
     prompt = torch.arange(2, limit - 2 * block - 9)
     engine.add_request("r", {SAMPLER: SamplingReqConfig(temperature=0.0)})
-    out, stops = _step(engine, "prefill", {"r": prompt}, 10 * limit, ignore_eos=True)
+    lens = {"r": len(prompt)}
+    out, stops = _step(engine, "prefill", {"r": {"text_inputs": [prompt]}}, 10 * limit, ignore_eos=True)
     step = 0
     while not stops.get("r"):
-        out, stops = _step(engine, "decode", {"r": out["r"]["text_inputs"][0]}, 10 * limit,
-                           step, ignore_eos=True)
+        out, stops = _step(engine, "decode", {"r": _carry(out["r"])}, 10 * limit,
+                           step, ignore_eos=True, prompt_lens=lens)
         step += 1
-    real = len(prompt) + sub.request_state("r").get("mtp_generated")
+    real = len(prompt) + int(out["r"][COUNT][0][0])
     assert real + block <= limit < real + 2 * block
-    _step(engine, "decode", {"r": out["r"]["text_inputs"][0]}, 10 * limit, step,
-          ignore_eos=True)
-    assert sub.request_state("r").get("context") <= cfg.kv_rows
+    _step(engine, "decode", {"r": _carry(out["r"])}, 10 * limit, step, ignore_eos=True, prompt_lens=lens)
+    assert _stored(engine, "r") == len(prompt) + block * (step + 1), "the step scheduled before the stop didn't run"
     engine.remove_request("r")
 
 
-def _stop_after(prompt_len, max_tokens, per_step, k=3, index_topk=2048, kv_rows=4096):
-    """(verify steps, tokens emitted) when _mtp_check_stop ends a request that emits
+def _stop_after(prompt_len, max_tokens, per_step, k=3, context_limit=2048):
+    """(verify steps, tokens emitted) when _mtp_stops ends a request that emits
     ``per_step`` tokens per step, ignore_eos."""
-    from mstar.model.submodule_base import PerRequestState
-
-    state = PerRequestState()
-    state.add("prompt_len", prompt_len)
     sub = types.SimpleNamespace(
-        request_state=lambda rid: state, mtp_block=k + 1,
-        config=types.SimpleNamespace(eos_token_ids=(), index_topk=index_topk, kv_rows=kv_rows),
+        mtp_block=k + 1, config=types.SimpleNamespace(eos_token_ids=(), context_limit=context_limit),
     )
-    sampler = {SAMPLER: types.SimpleNamespace(ignore_eos=True)}
-
-    def stops(walk, steps, tokens):
-        info = types.SimpleNamespace(graph_walk=walk, resource_configs=sampler,
-                                     dynamic_loop_iter_counts={"decode_loop": steps},
-                                     max_tokens=max_tokens)
-        return Glm5NextLLMSubmodule._mtp_check_stop(sub, "r", info, torch.tensor(tokens))
-
-    if stops("prefill", 0, [7]):
-        return 0, 1
     generated = 1
     for step in range(1, 100_000):
         generated += per_step
-        state.add("mtp_generated", generated)
-        if stops("decode", step - 1, [7] * per_step):
+        if Glm5NextLLMSubmodule._mtp_stops(sub, False, generated, max_tokens, prompt_len):
             return step, generated
     raise AssertionError("never stopped")
 
@@ -337,12 +343,12 @@ def test_rejected_drafts_do_not_cut_the_output_short(per_step):
     assert _stop_after(1024, 512, per_step)[1] >= 512
 
 
-def test_rejected_drafts_stop_at_the_cache_rows():
-    # a short prompt with no draft accepted fills the cache's rows before the context
+def test_with_no_draft_accepted_the_context_stops_inside_the_holed_rows():
+    """Every verify step keeps its whole block, and the holed pool keeps k + 1 rows a token of
+    the context, so the context's stop comes first."""
     steps, generated = _stop_after(16, 100_000, 1)
-    rows = 16 + steps * 4
-    assert rows <= 4096 < rows + 2 * 4
-    assert 16 + generated < 2048
+    assert 16 + generated + 4 <= 2048 < 16 + generated + 2 * 4, "the context stops while the next block fits"
+    assert 16 + (steps + 1) * 4 <= 2048 * 4, "the steps run and the one in flight overflow the pool's rows"
 
 
 def test_vocab_parallel_argmax_equals_the_full_argmax():
@@ -400,33 +406,6 @@ def test_a_padding_row_writes_its_real_rows_token():
     assert nxt[last].tolist() == [100, 101, 102, 102]
 
 
-def test_the_stop_counts_this_steps_tokens_not_the_next_ones():
-    """The next step is in flight when this one is checked, and the GPU thread's count may
-    already include its tokens. 1 + 4 + 4 tokens reach max_tokens=9 at the second verify
-    step, not the first."""
-    from mstar.model.submodule_base import PerRequestState
-
-    state = PerRequestState()
-    state.add("prompt_len", 16)
-    sub = types.SimpleNamespace(
-        request_state=lambda rid: state, mtp_block=4,
-        config=types.SimpleNamespace(eos_token_ids=(), index_topk=2048, kv_rows=4096),
-    )
-    sampler = {SAMPLER: types.SimpleNamespace(ignore_eos=True)}
-
-    def check(walk, steps, n):
-        info = types.SimpleNamespace(graph_walk=walk, resource_configs=sampler,
-                                     dynamic_loop_iter_counts={"decode_loop": steps},
-                                     max_tokens=9)
-        return Glm5NextLLMSubmodule._mtp_check_stop(sub, "r", info, torch.tensor([7] * n))
-
-    state.add("mtp_generated", 5)  # the first verify step already unpacked
-    assert not check("prefill", 0, 1)
-    state.add("mtp_generated", 9)  # and the second
-    assert not check("decode", 0, 4)
-    assert check("decode", 1, 4)
-
-
 # -- a stop on the prefill walk -----------------------------------------------
 
 
@@ -438,19 +417,21 @@ def _serve(engine, prompt: torch.Tensor, max_tokens: int, ignore_eos=False, walk
     def step(walk, inputs, iteration):
         if walks is not None:
             walks.append(walk)
-        out, stops = _step(engine, walk, {"r": inputs["text_inputs"][0]}, max_tokens, iteration,
-                           ignore_eos=ignore_eos)
+        out, stops = _step(engine, walk, {"r": inputs}, max_tokens, iteration, ignore_eos=ignore_eos,
+                           prompt_lens={"r": len(prompt)})
         return out.get("r", {}), stops.get("r", set())
 
     k = engine._submodules["LLM"].submodule.mtp_k
     tokens = run_walks(Glm5NextModel("x", config_variant="reduced", mtp_num_draft_tokens=k),
-                       step, prompt, max_tokens)
+                       step, prompt, max_tokens, model_kwargs={PROMPT_LEN: len(prompt)})
     engine.remove_request("r")
     return tokens
 
 
 def _errors(caplog) -> list[str]:
-    return [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+    # On the CPU the MLA resource runs its fallback, which no graph replays, so the runner drops the decode capture.
+    dropped = "Dropping accelerator graph config 0 for LLM: resources cannot capture: ['attn']"
+    return [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR and r.getMessage() != dropped]
 
 
 @pytest.mark.parametrize("k", [0, 3])
@@ -472,6 +453,17 @@ def test_a_stop_token_from_the_prefill_ends_the_reply(k, caplog):
 
 
 @pytest.mark.parametrize("k", [0, 3])
+def test_a_prefill_stop_check_needs_only_the_rows_the_worker_copies(k):
+    """The worker hands a prefill's stop check the step's stop buffers, its sampled tokens alone, and not the count
+    the prefill persists for the decode loop. A check that read the count failed every request at its prefill, an
+    HTTP 500 under ``mstar serve`` at TP2, where handing check_stop the engine's own outputs passed."""
+    engine, _, _ = _build_engine(k)
+    engine.add_request("r", {SAMPLER: SamplingReqConfig(temperature=0.0)})
+    out, _ = _step(engine, "prefill", {"r": {"text_inputs": [PROMPTS["a"]]}}, MAX_TOKENS)
+    assert out["r"]["new_token"][0].numel() == 1, "the prefill emits one token"
+
+
+@pytest.mark.parametrize("k", [0, 3])
 @pytest.mark.parametrize("max_tokens", [1, 2, 3])
 def test_short_budgets_are_exact_and_name_no_missing_loop(k, max_tokens, caplog):
     engine, _, _ = _build_engine(k)
@@ -482,16 +474,16 @@ def test_short_budgets_are_exact_and_name_no_missing_loop(k, max_tokens, caplog)
 # -- a verdict that never lands -------------------------------------------------
 
 
-def _verdict_reader(monkeypatch, pending: dict):
-    """A submodule whose eager mailbox never stages a verdict (step -1), as after a failed replay."""
+def _verdict_reader(monkeypatch, verdicts=((0, 0, 0, 0, 0),), ready=0):
+    """A submodule whose verify step in flight staged ``verdicts`` and the flag ``ready``: 0 is
+    a step that never staged its verdict, as after a failed replay."""
     from mstar.model.glm5_next import submodules
 
     monkeypatch.setattr(submodules, "_VERDICT_DEADLINE_S", 0.2, raising=False)
     sub = Glm5NextLLMSubmodule.__new__(Glm5NextLLMSubmodule)
-    sub.__dict__.update(mtp_k=3, request_states={}, _mailboxes={
-        None: (torch.zeros(4, 5, dtype=torch.long), torch.full((1,), -1, dtype=torch.long))})
-    for rid, p in pending.items():
-        sub.request_state(rid).add("mtp_pending", p)
+    staged = submodules._Mailbox(torch.tensor(verdicts, dtype=torch.long), torch.tensor([ready]))
+    config = types.SimpleNamespace(eos_token_ids=(), context_limit=2048)
+    sub.__dict__.update(mtp_k=3, _staged=staged, config=config, _log_acceptance=lambda accepted: None)
     return sub
 
 
@@ -513,13 +505,73 @@ def _raised(fn, seconds: float = 20.0):
 
 
 def test_a_verdict_that_never_lands_exits_the_process(monkeypatch):
-    """A step that failed after it was numbered: the read exits the process at its deadline
+    """A step that failed before its verdict landed: the read exits the process at its deadline
     instead of holding the worker forever."""
-    sub = _verdict_reader(monkeypatch, {"a": (1, None, 0)})
-    exc = _raised(lambda: sub._read_verdicts(["a"]))
+    sub = _verdict_reader(monkeypatch)
+    exc = _raised(lambda: sub._read_verdict(1))
     assert isinstance(exc, SystemExit) and "never staged" in str(exc)
 
 
-def test_a_read_across_two_steps_exits_the_process(monkeypatch):
-    sub = _verdict_reader(monkeypatch, {"a": (1, None, 0), "b": (2, None, 1)})
-    assert isinstance(_raised(lambda: sub._read_verdicts(["a", "b"])), SystemExit)
+def test_a_verify_step_carries_its_count_to_the_stop(monkeypatch):
+    """The prefill emits a count of 1, and a verify step the count it came in with plus the
+    tokens it emits, cut at max_tokens, which its stop reads: 1 + 4 + 4 tokens reach
+    max_tokens=9 at the second verify step, and a step that comes in at 7 emits 2."""
+    sub = _verdict_reader(monkeypatch, verdicts=((5, 6, 7, 8, 3),), ready=1)
+    sampler = {SAMPLER: types.SimpleNamespace(ignore_eos=True)}
+    prefill = types.SimpleNamespace(graph_walk="prefill", max_tokens=9, resource_configs=sampler, step_metadata={})
+    decode = types.SimpleNamespace(graph_walk="decode", max_tokens=9, resource_configs=sampler,
+                                   step_metadata={PROMPT_LEN: 16})
+    (out,) = sub.unpack_packed_outputs({}, ["r"], [5], [ARNodeInputs(input_seq_len=5)], {"r": prefill}).values()
+    assert out[COUNT][0].tolist() == [1, -1, 9, True, -1]
+    for count, emitted, stops in ((1, 4, set()), (5, 4, {"decode_loop"}), (7, 2, {"decode_loop"})):
+        kwargs = {"emitted": count, "max_tokens": 9, "ignore_eos": True, "prompt_len": 16}
+        inputs = [ARNodeInputs(input_seq_len=4, kwargs=kwargs)]
+        (out,) = sub.unpack_packed_outputs({}, ["r"], [4], inputs, {"r": decode}).values()
+        assert out["new_token"][0].tolist() == [5, 6, 7, 8][:emitted]
+        assert out[COUNT][0].tolist() == [count + emitted, bool(stops), 9, True, 16]
+        assert sub.check_stop("r", decode, out) == stops, f"a step that came in at {count}"
+
+
+class _Reads(dict):
+    """A request's outputs that note each name read, where the worker's host row copies each name read."""
+
+    def __init__(self, outputs):
+        super().__init__(outputs)
+        self.read = []
+
+    def __getitem__(self, name):
+        self.read.append(name)
+        return super().__getitem__(name)
+
+
+def _verify_step(monkeypatch, rows: int) -> tuple[Glm5NextLLMSubmodule, dict]:
+    """A k=3 verify step's unpacked outputs for ``rows`` requests, where row i accepted ``i % 4`` drafts. Each
+    request's info holds its walk and nothing else."""
+    sub = _verdict_reader(monkeypatch, verdicts=tuple((5, 6, 7, 8, i % 4) for i in range(rows)), ready=1)
+    kwargs = {"emitted": 5, "max_tokens": 64, "ignore_eos": True, "prompt_len": 16}
+    rids = [f"r{i}" for i in range(rows)]
+    infos = {rid: types.SimpleNamespace(graph_walk="decode") for rid in rids}
+    return sub, sub.unpack_packed_outputs({}, rids, [4] * rows, [ARNodeInputs(input_seq_len=4, kwargs=kwargs)] * rows,
+                                          infos)
+
+
+def test_a_32_row_verify_step_builds_one_tensor_of_tokens_and_one_of_counts(monkeypatch):
+    """A tensor per row for each output is 64 host tensors built on the GPU thread every step, beside a read of the
+    request's max_tokens and ignore_eos through its info for every row."""
+    _, out = _verify_step(monkeypatch, 32)
+    for i, row in enumerate(out.values()):
+        want = [5, 6, 7, 8][:i % 4 + 1]
+        assert (row["new_token"][0].tolist(), row[COUNT][0].tolist()) == (want, [5 + len(want), 0, 64, 1, 16])
+    for name in ("new_token", COUNT):
+        assert len({row[name][0].untyped_storage().data_ptr() for row in out.values()}) == 1, (
+            f"each row's {name} is a tensor of its own"
+        )
+
+
+def test_a_verify_step_s_stop_check_reads_one_output(monkeypatch):
+    """The worker hands `check_stop` a row that copies an output to the host when its name is first read. A second
+    name is a second copy a step and a second lookup a row, on the worker's main thread."""
+    sub, out = _verify_step(monkeypatch, 1)
+    row = _Reads(out["r0"])
+    assert sub.check_stop("r0", types.SimpleNamespace(), row) == set()
+    assert row.read == [COUNT], "the stop check reads a second output, or the request's info, for every row"

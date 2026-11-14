@@ -177,7 +177,7 @@ def test_the_runner_drops_every_capture_under_long_context(monkeypatch, caplog):
     bind_cpu_state(sub, cfg, resources)
     for key, resource in resources.items():
         if key != INDEX_KEYS:
-            monkeypatch.setattr(resource, "can_capture", lambda: True)
+            monkeypatch.setattr(resource, "can_capture", lambda step: True)
     runner = AcceleratorGraphRunner(
         submodule_name="LLM", submodule=sub, resources=resources, step_runner=Mock(),
         device=torch.device("cpu"), autocast_dtype=None, joint_comm_group=SimpleNamespace(world_size=1),

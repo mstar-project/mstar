@@ -8,6 +8,7 @@ sys.path.insert(0, ".")
 import pytest
 import torch
 
+from mstar.model.base import serving_resources
 from mstar.model.components.distributed import ParallelKimiDeltaAttention
 from mstar.model.components.kda import KDAConfig, KimiDeltaAttention
 from mstar.model.glm5_next.config import KDA_STATE, Glm5NextModelConfig
@@ -151,7 +152,7 @@ def test_loaders_refuse_a_wrong_width():
 
 def test_pool_blocks_shard_the_same_axes():
     model = Glm5NextModel("x", config_variant="reduced", kda_conv_dtype=torch.float32)
-    pool = next(s for s in model.get_node_resources() if s.resource_key == KDA_STATE).config
+    pool = next(s for s in serving_resources(model, {}) if s.resource_key == KDA_STATE).config
     full_state, full_conv = pool.blocks["state"].shape, pool.blocks["conv"].shape
     pool.shard(TP)
     state, conv = pool.blocks["state"].shape, pool.blocks["conv"].shape

@@ -298,6 +298,46 @@ class TopK(Op):
 
 
 @dataclass(frozen=True, kw_only=True)
+class KimiDelta(Op):
+    """Kimi delta attention over each row's ``conv`` window, (3 * heads * head_dim, kernel - 1), and ``state``, (heads,
+    d_k, d_v) with both of head_dim, as one update: the causal conv of the step's q, k and v, the delta rule with a
+    per-channel forget gate ``lower_bound * sigmoid(...)``, and, unless ``full_rank_gate``, the output gate and its
+    RMSNorm."""
+
+    reads = ("conv", "state")
+    writes = ("conv", "state")
+    lower_bound: float
+    scale: float | None = None      # None: head_dim ** -0.5
+    full_rank_gate: bool = False    # the output gate is one full-rank projection, which the caller applies
+
+    def check(self, where: str, entry: Entry) -> None:
+        if not (type(self.lower_bound) is float and self.lower_bound < 0):
+            raise ValueError(f"{where}.lower_bound must be a negative float, got {self.lower_bound!r}")
+        if not (self.scale is None or (type(self.scale) is float and self.scale > 0)):
+            raise ValueError(f"{where}.scale must be None or a positive float, got {self.scale!r}")
+        conv, state = entry.tensors["conv"].shape, entry.tensors["state"].shape
+        if len(conv) != 2 or len(state) != 3 or state[1] != state[2]:
+            raise ValueError(f"{where}: KimiDelta needs entry fields conv (channels, kernel - 1) and state (h, d, d)")
+        if conv[0] != 3 * state[0] * state[1]:
+            raise ValueError(f"{where}: KimiDelta's conv runs over q, k and v, so its channels must be 3 * "
+                             f"{state[0]} * {state[1]}, and they are {conv[0]}")
+
+
+@dataclass(frozen=True, kw_only=True, eq=False)
+class KimiDeltaWeights:
+    """One layer's weights for `kimi_delta`, on this rank. Under ``full_rank_gate`` the caller applies the output gate
+    and its norm, and ``g_b`` and ``norm_weight`` are None."""
+
+    conv: torch.Tensor      # (3 * heads * head_dim, kernel): q | k | v
+    a_log: torch.Tensor     # (heads,) fp32
+    dt_bias: torch.Tensor   # (heads * head_dim,) fp32
+    f_b: torch.Tensor       # the forget gate's up-projection, (heads * head_dim, head_dim)
+    g_b: torch.Tensor | None = None
+    norm_weight: torch.Tensor | None = None
+    norm_eps: float = 1e-5
+
+
+@dataclass(frozen=True, kw_only=True)
 class Read:
     """A view of the entries a row has kept. ``mask`` says which entries each query can still reach, so the engine
     can free the rest and tell when two requests can share a prefix. A read leaves the entries as they were."""
@@ -471,9 +511,12 @@ def read_layers(array: Array, read: Read) -> frozenset[int]:
     return read.layers or array.layers
 
 
-def Value(name, *, nodes, layers, entry, updates=EMPTY) -> Array:
+def Value(name, *, nodes, layers, entry, updates=EMPTY, verify_span=1) -> Array:
     """A rewritable array of one entry."""
-    return Array(name, nodes=nodes, layers=layers, entry=entry, updates=updates, max_len=1, rewritable=True)
+    return Array(
+        name, nodes=nodes, layers=layers, entry=entry, updates=updates, max_len=1, rewritable=True,
+        verify_span=verify_span,
+    )
 
 
 @dataclass(frozen=True)

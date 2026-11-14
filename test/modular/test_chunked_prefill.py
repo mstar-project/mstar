@@ -964,7 +964,7 @@ def test_a_walk_a_node_captures_nothing_for_at_runtime_is_skipped(caplog, monkey
     bind_cpu_state(glm, cfg, resources)
     for key, resource in resources.items():
         if key != INDEX_KEYS:
-            monkeypatch.setattr(resource, "can_capture", lambda: True)
+            monkeypatch.setattr(resource, "can_capture", lambda step: True)
     engine = _budgeted_engine()
     runner = AcceleratorGraphRunner(
         submodule_name="LLM", submodule=glm, resources=resources, step_runner=Mock(),

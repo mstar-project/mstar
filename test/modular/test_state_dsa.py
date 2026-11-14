@@ -206,4 +206,4 @@ def test_a_selected_read_masks_a_pick_past_its_row():
 
 
 def test_the_dsa_resource_refuses_capture():
-    assert not _dsa().can_capture(), "a capture would record one step's host loop over its requests"
+    assert not _dsa().can_capture(DSAStep()), "a capture would record one step's host loop over its requests"

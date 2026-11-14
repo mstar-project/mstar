@@ -10,7 +10,9 @@ its table would leave the pages and the positions apart, and no kernel would not
 from __future__ import annotations
 
 import gc
+import re
 import sys
+from dataclasses import dataclass
 from typing import Any, NamedTuple
 
 sys.path.insert(0, ".")
@@ -32,6 +34,8 @@ from mstar.engine.resources.kv.config import KVStep, PagedKVConfig
 from mstar.engine.resources.kv.manager import KVManager
 from mstar.engine.resources.position.config import PositionConfig, PositionStep
 from mstar.engine.resources.position.manager import RopeManager
+from mstar.engine.resources.recurrent.config import RecurrentBlockConfig
+from mstar.engine.resources.recurrent.pool import RecurrentStatePool
 from mstar.engine.resources.runner import StepRunner
 from mstar.engine.resources.step import BucketKey, SlotLease, SubmoduleStep
 from mstar.engine.state import (
@@ -45,15 +49,20 @@ from mstar.engine.state import (
     Fork,
     FrameWindow,
     KVEntry,
+    LatentAttend,
+    LatentEntry,
     Positions,
     Read,
+    Selected,
     TensorType,
+    Value,
     Window,
     adapters,
     settle,
 )
 from mstar.engine.state.adapters import StateSetup, _resolve, build_handle, build_specs, state_steps
 from mstar.engine.state.analysis import state_declaration_problems
+from mstar.engine.state.calls import VerifyRun
 from mstar.engine.state.contract import Op
 from mstar.model.base import KVLabel, PrefixKeys
 
@@ -212,7 +221,6 @@ def _host_value(**entry) -> Array:
      "PagedCrossStorage"),
     ([_array(span=2, positions=None, reads={"attn": Read(mask=FrameWindow(16, frames=2), op=ATTEND, packed=False)})],
      "RingStorage"),
-    ([_host_value(tensors={"x": TensorType((4,), dtype=torch.float32)})], "ValueStorage"),
     ([_host_value(tensors={"x": TensorType((4,), dtype=torch.float32)}, host={"n": int})], "ValueWithHostStorage"),
     ([_host_value(tensors={}, host={"n": int})], "HostValueStorage"),
 ])
@@ -716,3 +724,354 @@ def test_position_waits_for_a_pending_count():
     rope.admit(PositionStep(segments=(Segment("b", "main", 1),)), StepContext(
         request_ids=("b",), graph_walk="decode", slot=0, capture=False))
     assert rope._counters["b"]["main"] == 5 and rope._deferred == {}, "the next admit applies every held count"
+
+
+# Verify on a Value
+
+
+@dataclass(frozen=True)
+class _Recurrence(Op):
+    """An update of a Value's field, bound to keep a verify block."""
+
+    reads = writes = ("x",)
+
+
+@dataclass(frozen=True)
+class _OtherRecurrence(_Recurrence):
+    """A second update type, since a Value holds one update of each type."""
+
+
+class _KeepsBlocks(adapters.OpBinding):
+    """Keeps one verify block above span 1, and records each settle instead of running a kernel."""
+
+    def __init__(self):
+        self.settled = []
+
+    def verify_blocks(self, array):
+        return {"spec_x": RecurrentBlockConfig(shape=(1,), dtype=torch.int32, per_layer=False)} if (
+            array.verify_span > 1) else {}
+
+    def settle(self, run, kept, label):
+        self.settled.append((run, kept, label))
+
+
+def _keeps_blocks(monkeypatch) -> _KeepsBlocks:
+    binding = _KeepsBlocks()
+    for kind in (_Recurrence, _OtherRecurrence):
+        monkeypatch.setitem(adapters.BINDINGS, (adapters.VALUE, kind), binding)
+    return binding
+
+
+def _value(updates, span=2) -> Array:
+    return Value("v", nodes={"LLM"}, layers={0, 1}, entry=Entry({"x": TensorType((4,), dtype=torch.float32)}),
+                 updates=updates, verify_span=span)
+
+
+def _value_handle(span=2):
+    """A Value whose one update keeps a verify block, and the run its update calls."""
+    arrays = [_array(span=1), _value({"a": _Recurrence()}, span)]
+    (config,) = (spec.config for spec in build_specs(arrays) if spec.resource_key == "v")
+    run = object()
+    resources = {"v": RecurrentStatePool(torch.device("cpu"), config, kv_dtype=torch.float32), "a": run}
+    return build_handle(arrays[1], resources, _resolve(arrays, StateSetup())), run
+
+
+def _value_step(h, verify=True) -> SubmoduleStep:
+    step = SubmoduleStep(segments=[Segment(1, "main", 2)], state={h.name: ArrayStep(verify=verify)})
+    step.set_ctx(_ctx((1,)))
+    return step
+
+
+@pytest.mark.parametrize("updates, found", [
+    ({}, "[]"), ({"a": _Recurrence(), "b": _OtherRecurrence()}, "['a', 'b']"),
+], ids=["none", "two"])
+def test_a_value_verifies_only_through_an_update_with_verify_blocks(monkeypatch, updates, found):
+    _keeps_blocks(monkeypatch)
+    _refused(re.escape(f"a Value verifies through one update that keeps verify blocks, and the array has {found}"),
+             lambda: build_specs([_array(span=1), _value(updates)]))
+
+
+def test_a_value_s_pool_holds_its_update_s_verify_blocks(monkeypatch):
+    _keeps_blocks(monkeypatch)
+    (config,) = (spec.config for spec in build_specs([_array(span=1), _value({"a": _Recurrence()})])
+                 if spec.resource_key == "v")
+    assert set(config.blocks) == {"x", "spec_x"}, "the verify block sits in the Value's pool beside its field"
+
+
+def test_a_value_handle_attaches_only_its_verify_entry(monkeypatch):
+    _keeps_blocks(monkeypatch)
+    h, _ = _value_handle()
+    assert set(h._runners) == {_Recurrence}, "the verify entry is no update the handle runs"
+    assert isinstance(h.verify, adapters.UpdateSettleRun), "the verify entry gives the handle its verify steps' run"
+    assert type(_value_handle(span=1)[0].verify) is VerifyRun, "a Value at span 1 refuses verify steps"
+
+
+def test_a_value_settles_after_its_last_update(monkeypatch):
+    binding = _keeps_blocks(monkeypatch)
+    h, run = _value_handle()
+    kept = torch.tensor([2])
+    step = _value_step(h)
+    h.begin_step(step)
+    h._update(_Recurrence, 0)
+    _refused(re.escape("settle before the updates of [('x', 1)]"), lambda: settle(h, kept))
+    _refused("a verify step ends with no settle", lambda: h.check_step(step))
+    h._update(_Recurrence, 1)
+    settle(h, kept)
+    _refused("an update after this verify step's settle", lambda: h._update(_Recurrence, 0))
+    assert binding.settled == [(run, kept, "main")], "the update's binding settles the step on the update's run"
+
+
+def test_a_value_that_verifies_is_not_read_whole(monkeypatch):
+    _keeps_blocks(monkeypatch)
+    h, _ = _value_handle()
+    h.begin_step(_value_step(h, verify=False))
+    _refused("no layout yet: a read of a Value that verifies", lambda: h.read(0))
+
+
+# Holes
+
+
+RANK, HOLE = 16, adapters.HOLE
+
+
+class _StubHoledKV:
+    """MLA pages of one row each, written from the first, so a step's slots are its first rows; records counts."""
+
+    def __init__(self):
+        self.pages = torch.zeros(LAYERS, SLOTS, 1, RANK + adapters.HOLE_SLOT)
+        self.written = 0
+        self.deferred = []
+
+    def layer_view(self, i):
+        return self.pages[i]
+
+    def write_kv(self, k, v=None, layer_idx=None, label=None, tokens=None):
+        self.pages[layer_idx, :k.shape[0], 0] = k
+        self.written = k.shape[0]
+
+    def write_slots(self, label):
+        return torch.arange(self.written), torch.zeros(self.written, dtype=torch.long)
+
+    def opens_label(self, rid, label):
+        return True
+
+    def defer_correct_len(self, correction):
+        self.deferred.append(correction)
+
+
+class _StubHoledMLA:
+    """Records the rope query each read passes instead of attending."""
+
+    requires_kv_write = True
+
+    def __init__(self):
+        self.q_pe = []
+
+    def run(self, q, label=None, kv_cache_layer=None, q_pe=None):
+        self.q_pe.append(q_pe)
+        return q
+
+
+def _holed(span=SPAN, **overrides) -> Array:
+    return Array("kv", **{
+        "nodes": {"LLM"}, "layers": frozenset(range(LAYERS)), "entry": LatentEntry(rank=RANK, rope_dim=0),
+        "max_len": SLOTS // SPAN, "reads": {"attn": Read(mask=Causal(), op=LatentAttend(HEADS, scale=0.125))},
+        "verify_span": span, **overrides,
+    })
+
+
+def _holed_handle(kv=None, attn=None):
+    array = _holed()
+    return build_handle(array, {"kv": kv or _StubHoledKV(), "attn": attn or _StubHoledMLA()},
+                        _resolve([array], StateSetup()))
+
+
+def _add_all(h, tokens, layers=range(LAYERS)) -> torch.Tensor:
+    ckv = torch.randn(tokens, RANK)
+    for layer in layers:
+        h.add(layer, ckv=ckv)
+    return ckv
+
+
+def test_the_holed_storage_binds_its_read_and_verify_entries():
+    assert adapters.storage_of(_holed()) is adapters.HOLED, "a latent with no kpe that verifies keeps holes"
+    assert adapters.storage_of(_holed(span=1)) is adapters.LATENT, "one that doesn't verify has none to keep"
+    kpe = _holed(entry=LatentEntry(rank=RANK, rope_dim=8))
+    assert adapters.storage_of(kpe) is adapters.LATENT, "a latent whose rope key fills the slot rewinds instead"
+    bound = {type(each.binding) for each in adapters._bindings(adapters.HOLED, _holed())}
+    assert bound == {adapters.HoledLatentAttend, adapters.Holes}, f"the holed storage binds {bound}"
+    _refused("positions", lambda: build_specs([_holed(positions=Positions())]))
+    _refused("must be LatentAttend", lambda: build_specs([_holed(reads={"attn": Read(mask=Causal())})]))
+
+
+@pytest.mark.parametrize("mask", [Window(8), Selected(of="keys")], ids=["window", "selected"])
+def test_a_holed_array_reads_causally(mask):
+    reads = {"attn": Read(mask=mask, op=LatentAttend(HEADS, scale=0.125))}
+    _refused("mask must be Causal, the one mask a holed array's marks are written for",
+             lambda: build_specs([_holed(reads=reads)]))
+
+
+def test_a_holed_array_keeps_no_positions():
+    _refused("positions, which today's resources don't keep on HoledStorage",
+             lambda: build_specs([_holed(positions=Positions())]))
+
+
+def test_the_holed_pool_holds_max_len_times_the_span():
+    (pool,) = (spec for spec in build_specs([_holed()]) if spec.resource_key == "kv")
+    config = pool.config
+    assert (config.max_seq_len, config.kv_lora_rank) == (SLOTS, RANK), "a row keeps every verify block whole"
+    assert (config.head_dim, config.qk_rope_head_dim) == (RANK + 64, 64), "beside a 64-wide slot for the marks"
+
+
+def test_a_holed_array_keeps_every_verify_row_and_marks_the_rejects():
+    kv = _StubHoledKV()
+    h = _holed_handle(kv)
+    step = _step(h)
+    h.begin_step(step)
+    ckv = _add_all(h, 2 * SPAN, layers=(0,))
+    settle(h, torch.tensor([1, 3]))
+    h.add(1, ckv=ckv)
+    h.check_step(step)
+    h.end_step(step)
+    marks = [0.0, HOLE, HOLE, HOLE, 0.0, 0.0, 0.0, HOLE]
+    for layer in range(LAYERS):
+        rows = kv.pages[layer, :2 * SPAN, 0]
+        assert torch.equal(rows[:, :RANK], ckv), f"layer {layer} keeps every row of each verify block"
+        assert rows[:, RANK:].eq(torch.tensor(marks)[:, None]).all(), f"layer {layer}'s rejected rows are holes"
+
+
+def test_a_holed_verify_step_defers_no_count():
+    kv = _StubHoledKV()
+    h = _holed_handle(kv)
+    assert isinstance(h.verify, adapters.HolesRun), "the holed array settles by marks, not by a count table"
+    step = _step(h)
+    h.begin_step(step)
+    _add_all(h, 2 * SPAN)
+    settle(h, torch.tensor([2, 2]))
+    h.check_step(step)
+    h.commit_step(step)
+    h.end_step(step)
+    assert kv.deferred == [], "a holed array is never rewound"
+
+
+def test_a_holed_verify_step_fits_its_span_and_settles_once():
+    h = _holed_handle()
+    _refused(re.escape("a verify step whose rows add [2, 4] entries"), lambda: h.begin_step(_step(h, spans=(SPAN, 2))))
+    h = _holed_handle()
+    step = _step(h)
+    h.begin_step(step)
+    _add_all(h, 2 * SPAN)
+    _refused("a verify step ends with no settle", lambda: h.check_step(step))
+    settle(h, torch.tensor([1, 1]))
+    _refused("a second settle in one verify step", lambda: settle(h, torch.tensor([1, 1])))
+
+
+def test_no_state_op_addresses_a_holed_array():
+    assert _holed_handle().takes_fused(None) is False, "no format names the slot a kept entry keeps at zero"
+
+
+def test_a_holed_read_passes_ones_as_the_rope_query():
+    attn = _StubHoledMLA()
+    h = _holed_handle(attn=attn)
+    h.begin_step(_step(h, verify=False, spans=(1, 1)))
+    h.read(0, torch.randn(2, HEADS, RANK))
+    (q_pe,) = attn.q_pe
+    assert q_pe.shape == (2, HEADS, 64) and q_pe.eq(1).all(), "a hole's mark scores 64 times HOLE"
+
+
+def _capture_step(h, tokens, capture):
+    step = _step(h, verify=False, spans=(tokens,), ctx=_ctx((1,), capture=capture))
+    h.begin_step(step)
+    return step
+
+
+def test_the_staging_tail_stays_zero():
+    kv = _StubHoledKV()
+    h = _holed_handle(kv)
+    for tokens, capture in ((2, False), (6, False), (4, True)):
+        step = _capture_step(h, tokens, capture)
+        _add_all(h, tokens)
+        h.end_step(step)
+        assert kv.pages[:, :tokens, 0, RANK:].eq(0).all(), f"an add of {tokens} rows (capture={capture}) marks none"
+
+
+def test_an_eager_step_past_every_bucket_leaves_the_captured_buffers():
+    h = _holed_handle()
+    step = _capture_step(h, 4, capture=True)
+    _add_all(h, 4)
+    h.read(0, torch.randn(4, HEADS, RANK))
+    h.end_step(step)
+    captured = (h._staging[True], h._ones[True])
+    step = _capture_step(h, 8, capture=False)
+    _add_all(h, 8)
+    h.read(0, torch.randn(8, HEADS, RANK))
+    h.end_step(step)
+    assert h._staging[True] is captured[0] and h._ones[True] is captured[1], "an eager step moves no captured buffer"
+
+
+def test_the_captured_holed_buffers_never_grow_in_a_recording(monkeypatch):
+    h = _holed_handle()
+    step = _capture_step(h, 2, capture=True)
+    _add_all(h, 2)
+    h.end_step(step)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: True)
+    _capture_step(h, 4, capture=True)
+    _refused("a recording of 4 rows past the captured buffers' 2", lambda: h.add(0, ckv=torch.randn(4, RANK)))
+
+
+@pytest.mark.skipif(not (torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 9),
+                    reason="needs sm90 (FlashInfer MLA)")
+@torch.no_grad()
+def test_holes_move_flashinfer_mla_by_at_most_one_bf16_ulp():
+    """A verify block's queries over a cache whose rejected rows carry HOLE in the rope
+    slot, against the same cache without those rows: the query rope part of ones scores a
+    real key +0 and a hole about -6.4e5, so only the kernel's split of the keys moves. That
+    moves about half the outputs by one bf16 ulp of their row's largest value, as a second
+    request in the batch (another split) does too."""
+    from mstar.engine.resources.attn.flashinfer_mla import FlashInferMLAWrapper
+    from mstar.engine.resources.attn.workspace import WorkspacePool
+
+    torch.manual_seed(0)
+    dev = torch.device("cuda", 0)
+    heads, latent, rope, page, block = 8, 512, adapters.HOLE_SLOT, 128, 4
+    real = 700
+    keep = torch.rand(real + 400) < real / (real + 400)  # holes spread through the context
+    keep[-block:] = True  # the query block's own rows are real
+    n_all = int(keep.numel())
+    ckv = torch.randn(n_all, latent, device=dev, dtype=torch.bfloat16)
+    kpe = torch.zeros(n_all, rope, device=dev, dtype=torch.bfloat16)
+    kpe[~keep.to(dev)] = HOLE
+    q_nope = torch.randn(block, heads, latent, device=dev, dtype=torch.bfloat16)
+    ones = torch.ones(block, heads, rope, device=dev, dtype=torch.bfloat16)
+
+    def attend(rows, q_pe):
+        n = rows.shape[0]
+        pages = -(-n // page)
+        cache = torch.zeros(pages, page, latent + rope, device=dev, dtype=torch.bfloat16)
+        cache.view(-1, latent + rope)[:n] = torch.cat([ckv, kpe], -1)[rows]
+        # main's wrappers take a pool's Workspace (#1142), not a raw buffer
+        workspace = WorkspacePool(torch.device(dev), size_mb=128).get("main")
+        wrapper = FlashInferMLAWrapper(
+            workspace, num_qo_heads=heads, kv_lora_rank=latent, qk_rope_head_dim=rope,
+            page_size=page, sm_scale=192 ** -0.5, device=dev)
+        assert not wrapper.fallback
+        wrapper.plan(
+            qo_indptr=torch.tensor([0, block], dtype=torch.int32),
+            paged_kv_indptr=torch.tensor([0, pages], dtype=torch.int32),
+            paged_kv_indices=torch.arange(pages, dtype=torch.int32),
+            paged_kv_last_page_len=torch.tensor([n - (pages - 1) * page], dtype=torch.int32),
+            causal=True, dtype=torch.bfloat16,
+        )
+        return wrapper.run(q_nope, q_pe, cache).float()
+
+    everything = torch.arange(n_all, device=dev)
+    only_real = everything[keep.to(dev)]
+    base = attend(only_real, ones)
+    # a real key's rope slot is 0, so the rope part of the query is exact
+    assert torch.equal(attend(only_real, torch.zeros_like(ones)), base)
+    holes = attend(everything, ones)
+    # one bf16 ulp of each (query, head) row's largest output
+    ulp = torch.exp2(torch.floor(torch.log2(base.abs().amax(-1, keepdim=True))) - 7)
+    diff = (holes - base).abs()
+    assert (diff <= ulp).all(), (diff / ulp).max()

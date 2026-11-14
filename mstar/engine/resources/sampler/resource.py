@@ -43,7 +43,7 @@ class SamplerResource(Resource):
     # a rebuild row's draw never commits, so a drop has nothing here to discard
     supports_drop = True
 
-    def can_capture(self) -> bool:
+    def can_capture(self, step) -> bool:
         return DeviceCapability.of(self._device).graph_backend is not None
 
     # TODO: this is  a light wrapper around mstar/engine/resources/sampler/utils.py. In the future,

@@ -1,7 +1,7 @@
 """MLAAttention's options past GLM-5.2's layout, on CPU: no decoupled dims (``mla_use_nope``,
-GLM-5.3's), whose cache rows carry a zero rope slot, against plain attention from the same
+GLM-5.3's), whose entries are the normed latent alone, against plain attention from the same
 weights, with the naive attention supplied through the class's hook and the absorbed one by a
-stub resource; and a packed KV plane and stream label reaching the resources."""
+stub handle; and the layer's own id reaching the handle's calls."""
 import sys
 import types
 from types import SimpleNamespace
@@ -50,43 +50,36 @@ class _DenseNaive(MLAAttention):
         return torch.einsum("hqk,khd->qhd", _causal_softmax(scores), v)
 
 
-class _StubDenseLatent:
-    """A KV and an MLA attention resource in one: keeps the step's latent rows and attends them densely."""
+class _StubLatentHandle:
+    """Records the layer's calls, and keeps the step's latent entries and attends them densely."""
 
     def __init__(self, m: MLAAttention):
-        self.m, self.rows = m, None
+        self.m, self.calls, self.rows = m, [], None
 
-    def write_kv(self, k, v, layer_idx=None):
-        self.rows = k
+    def add(self, layer, keep=None, **fields):
+        self.calls.append(("add", None if layer is None else int(layer), tuple(fields)))
+        self.rows = fields["ckv"]
 
-    def layer_view(self, layer_idx):
-        return self.rows
-
-    def run(self, q_nope, kv_cache_layer=None, q_pe=None):
-        kv_c, k_pe = kv_cache_layer.split([self.m.kv_lora_rank, self.m.mla_cache_kpe], dim=-1)
-        scores = (torch.einsum("qhl,kl->hqk", q_nope, kv_c)
-                  + torch.einsum("qhr,kr->hqk", q_pe, k_pe)) * self.m.softmax_scale
-        return torch.einsum("hqk,kl->qhl", _causal_softmax(scores), kv_c)
+    def read(self, layer, q_nope, **kwargs):
+        self.calls.append(("read", None if layer is None else int(layer), tuple(kwargs)))
+        scores = torch.einsum("qhl,kl->hqk", q_nope, self.rows) * self.m.softmax_scale
+        return torch.einsum("hqk,kl->qhl", _causal_softmax(scores), self.rows)
 
 
-def test_rope_dims_need_a_position_resource_and_nope_has_none():
-    MLAAttention(_config(False), kv_key="kv", attn_key="attn", pos_key="pos")
-    with pytest.raises(ValueError, match="pos_key"):
-        MLAAttention(_config(False), kv_key="kv", attn_key="attn", pos_key=None)
+def test_nope_means_no_decoupled_dims():
     with pytest.raises(ValueError, match="no decoupled dims"):
-        MLAAttention(_config(False, mla_use_nope=True), kv_key="kv", attn_key="attn", pos_key=None)
+        MLAAttention(_config(False, mla_use_nope=True), kv_key="kv")
 
 
-def test_nope_mla_binds_no_position_resource():
-    m = _DenseNaive(_latent_only_config(False, 0), kv_key="kv", attn_key="attn", pos_key=None)
-    m.bind_resources({"kv": object(), "attn": object()})
+def test_nope_mla_rotates_nothing():
+    m = _DenseNaive(_latent_only_config(False), kv_key="kv")
     q, k = torch.randn(T, HEADS, 0), torch.randn(T, 1, 0)
     q2, k2 = m._rope(torch.arange(T), q, k)
     assert q2 is q and k2 is k
 
 
-def _latent_only_config(absorb: bool, kpe: int) -> SimpleNamespace:
-    cfg = _config(absorb, mla_use_nope=True, mla_cache_kpe=kpe)
+def _latent_only_config(absorb: bool) -> SimpleNamespace:
+    cfg = _config(absorb, mla_use_nope=True)
     cfg.qk_rope_head_dim, cfg.qk_head_dim = 0, NOPE
     cfg.softmax_scale = NOPE ** -0.5
     return cfg
@@ -102,57 +95,35 @@ def _mha_reference(m, x):
     return m.o_proj(out)
 
 
-@pytest.mark.parametrize("kpe", [0, 4])
-def test_latent_only_mla_matches_plain_attention(kpe):
-    """GLM-5.3's layout: no decoupled dims, so the cache rows are the normed latent and a zero
-    rope slot ``mla_cache_kpe`` wide, and the query's rope part is ``kpe_query_fill``."""
-    naive = _DenseNaive(_latent_only_config(False, kpe), kv_key="kv", attn_key="attn", pos_key=None)
+def test_latent_only_mla_matches_plain_attention():
+    """GLM-5.3's layout: no decoupled dims, so an entry is the normed latent alone and the read
+    takes no rope query."""
+    naive = _DenseNaive(_latent_only_config(False), kv_key="kv")
     with torch.no_grad():
         for name, p in naive.named_parameters():
             p.copy_(1.0 + 0.1 * torch.randn_like(p) if "layernorm" in name
                     else 0.1 * torch.randn_like(p))
     params = {k: v.clone() for k, v in naive.state_dict().items()}
-    absorbed = MLAAttention(_latent_only_config(True, kpe), kv_key="kv", attn_key="attn", pos_key=None)
+    absorbed = MLAAttention(_latent_only_config(True), kv_key="kv")
     absorbed.load_state_dict(params, strict=False)
-    absorbed.kpe_query_fill = 1.0  # adds 0 against the zero slot
-    dense = _StubDenseLatent(absorbed)
-    absorbed.bind_resources({"kv": dense, "attn": dense})
+    handle = _StubLatentHandle(absorbed)
+    absorbed.bind_state({"kv": handle})
     x = torch.randn(T, HIDDEN)
     with torch.no_grad():
         ref = _mha_reference(naive, x)
         absorbed.process_weights_after_loading()
         torch.testing.assert_close(naive(x, None), ref, rtol=1e-5, atol=1e-6)
         torch.testing.assert_close(absorbed(x, None), ref, rtol=1e-5, atol=1e-6)
-    assert dense.rows.shape == (T, KV_LORA + kpe)
-    assert torch.equal(dense.rows[:, KV_LORA:], torch.zeros(T, kpe))
+    assert handle.rows.shape == (T, KV_LORA), "an entry with no decoupled dims is the latent alone"
 
 
-class _Recorder:
-    """A KV and an MLA attention resource that record what the layer hands them."""
-
-    def __init__(self):
-        self.calls = []
-
-    def write_kv(self, k, v, layer_idx=None, label=None):
-        self.calls.append(("write", layer_idx, label, k.shape))
-
-    def layer_view(self, layer_idx):
-        return layer_idx
-
-    def run(self, q, label=None, kv_cache_layer=None, q_pe=None):
-        self.calls.append(("run", kv_cache_layer, label, q_pe.unique().tolist()))
-        return q.new_zeros(q.shape)
-
-
-def test_a_packed_plane_and_a_label_reach_the_resources():
-    """``cache_layer`` addresses the KV layer in place of the layer's own index, and
-    ``kv_label`` names the stream every write and attention runs under."""
-    m = MLAAttention(_latent_only_config(True, 4), layer_idx=7, kv_key="kv", attn_key="attn",
-                     pos_key=None, kv_label="main", cache_layer=1)
+def test_the_layer_adds_and_reads_at_its_own_id():
+    """The absorbed path adds the step's latents and reads them at the layer's id, with no rope
+    query where there are no decoupled dims."""
+    m = MLAAttention(_latent_only_config(True), layer_idx=7, kv_key="kv")
     m.process_weights_after_loading()
-    rec = _Recorder()
-    m.bind_resources({"kv": rec, "attn": rec})
-    assert m.cache_layer_idx == 1
+    handle = _StubLatentHandle(m)
+    m.bind_state({"kv": handle})
     with torch.no_grad():
         m(torch.randn(T, HIDDEN), None)
-    assert rec.calls == [("write", 1, "main", (T, KV_LORA + 4)), ("run", 1, "main", [0.0])]
+    assert handle.calls == [("add", 7, ("ckv",)), ("read", 7, ())], handle.calls

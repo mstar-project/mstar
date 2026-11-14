@@ -185,7 +185,7 @@ class DSAManager(Resource):
     def depends_on(self) -> set[str]:
         return {self.config.kv_cache}
 
-    def can_capture(self) -> bool:
+    def can_capture(self, step) -> bool:
         # every call loops over the step's requests on the host
         return False
 

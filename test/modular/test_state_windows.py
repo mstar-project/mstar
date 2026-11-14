@@ -790,7 +790,7 @@ class _StubInner:
 def test_a_kept_window_read_is_never_captured():
     """Its reach changes length every step, so the capture leaves it out, and a plan under a lease is refused."""
     attention = KeptWindowAttention(_StubInner(), "dit_kv")
-    assert not attention.can_capture()
+    assert not attention.can_capture(None)
     leased = StepContext(request_ids=["a"], graph_walk="rollout", slot=0, capture=False,
                          slot_lease=SimpleNamespace(captured=True))
     with pytest.raises(RuntimeError, match="Array 'dit_kv': a kept-window read is eager-only"):

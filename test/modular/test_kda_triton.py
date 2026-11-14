@@ -3,18 +3,32 @@
 The prefill oracle is the layer's ``prefill`` per span in fp32; the fused path must be no less
 accurate than that reference under the engine's bf16 autocast.
 """
+import contextlib
 from dataclasses import dataclass
 
 import pytest
 import torch
 import torch.nn.functional as F
 
-from mstar.engine.resources.convenience import KDACallable
 from mstar.engine.resources.linear_attn import kda_triton
-from mstar.engine.resources.linear_attn.kda import KDAPlan, SpecBlocks
+from mstar.engine.resources.linear_attn.kda import KDAParams, KDAPlan, SpecBlocks
 from mstar.engine.resources.linear_attn.kda_torch import TorchKDAKernels
 from mstar.engine.resources.recurrent.config import DeltaNetGeometry, RecurrentStateConfig
 from mstar.engine.resources.recurrent.pool import RecurrentStatePool
+from mstar.engine.resources.step import Segment, StepContext, SubmoduleStep
+from mstar.engine.state import (
+    Array,
+    ArrayStep,
+    Attend,
+    Causal,
+    Entry,
+    KimiDelta,
+    KVEntry,
+    Read,
+    TensorType,
+    Value,
+)
+from mstar.engine.state.adapters import StateSetup, _resolve, build_handle
 from mstar.model.components.distributed import ParallelKimiDeltaAttention
 from mstar.model.components.kda import KDAConfig
 
@@ -61,11 +75,44 @@ class _Kda:
     def __init__(self, plan, kernels):
         self.plan, self.kernels = plan, kernels
 
+    def bind_layer(self, **gates):
+        return
+
     def current_plan(self, label=None):
         return self.plan
 
     def run(self, qkv, g, beta, conv, state, params, gate=None, label=None, spec=None):
         return self.kernels.run_paged(qkv, g, beta, self.plan, conv, state, params, gate=gate)
+
+
+_KV = Array("kv", nodes={"LLM"}, layers={0}, entry=KVEntry(heads=1, head_dim=8), max_len=8,
+            reads={"attn": Read(mask=Causal(), op=Attend(q_heads=1))})
+
+
+class _Value:
+    """A KDA layer's Value over one layer's pool blocks, whose steps the stub resource runs on ``plan``."""
+
+    def __init__(self, kda, rec, conv, plan, kernels):
+        h, d = kda.num_heads, kda.head_dim
+        entry = Entry({"conv": TensorType((3 * h * d, conv.shape[-1]), dtype=conv.dtype),
+                       "state": TensorType((h, d, d), dtype=torch.float32)})
+        value = Value("kda_state", nodes={"LLM"}, layers={int(kda.layer)}, entry=entry,
+                      updates={"kda": KimiDelta(lower_bound=kda.forget_gate.gate_lower_bound)})
+        self.resource = _Kda(plan, kernels)
+        self.h = build_handle(value, {"kda_state": _Pool(rec, conv), "kda": self.resource},
+                              _resolve([_KV, value], StateSetup()))
+        kda.bind_state({"kda_state": self.h})
+
+    @contextlib.contextmanager
+    def step(self):
+        """A step over the plan's rows, around the layer's calls."""
+        spans = self.resource.plan.spans
+        step = SubmoduleStep(segments=[Segment(row, "main", n) for row, n in enumerate(spans)],
+                             state={"kda_state": ArrayStep()})
+        step.set_ctx(StepContext(request_ids=tuple(range(len(spans))), graph_walk="decode", slot=0, capture=False))
+        self.h.begin_step(step)
+        yield
+        self.h.end_step(step)
 
 
 def _plan(spans) -> KDAPlan:
@@ -84,7 +131,7 @@ def _kda(seed=0, head_dim=HEAD_DIM):
     torch.manual_seed(seed)
     kda = ParallelKimiDeltaAttention(KDAConfig(
         hidden_size=HIDDEN, num_heads=HEADS, head_dim=head_dim),
-        dtype=torch.bfloat16).cuda()
+        dtype=torch.bfloat16, layer=0).cuda()
     with torch.no_grad():
         for name, p in kda.named_parameters():
             if "conv1d" in name:
@@ -134,9 +181,9 @@ def _reference(kda, x, spans, rec, conv, autocast=False):
 
 def _paged(kda, x, spans, rec, conv, kernels=None):
     """``x`` through the layer's paged path, the pool's blocks being ``rec`` and ``conv``."""
-    kda.mix = KDACallable(_Pool(rec, conv), _Kda(_plan(spans), kernels or kda_triton.TritonKDAKernels()))
-    with torch.no_grad():
-        return kda(x, 0)
+    value = _Value(kda, rec, conv, _plan(spans), kernels or kda_triton.TritonKDAKernels())
+    with torch.no_grad(), value.step():
+        return kda(x)
 
 
 def _rel(a, b):
@@ -224,10 +271,10 @@ def test_kda_prefill_continue_then_decode(fp32_matmul):
     out = torch.cat([_paged(kda, x[:100], first, rec, conv),
                      _paged(kda, x[100:300], second, rec, conv)])
     slots = torch.tensor([slot], dtype=torch.int32, device="cuda")
-    kda.mix.attn.plan = KDAPlan(slot_ids=slots, has_state=torch.ones_like(slots, dtype=torch.bool),
-                                spans=(1,), num_tokens=1, is_decode=True)
-    with torch.no_grad():
-        step = kda(x[300:], 0)
+    decode = _Value(kda, rec, conv, KDAPlan(slot_ids=slots, has_state=torch.ones_like(slots, dtype=torch.bool),
+                                            spans=(1,), num_tokens=1, is_decode=True), kda_triton.TritonKDAKernels())
+    with torch.no_grad(), decode.step():
+        step = kda(x[300:])
 
     assert _rel(out, oracle) < 1e-2
     assert _rel(step, oracle_step) < 2e-2
@@ -276,23 +323,19 @@ def _decode_plan(slots):
                    spans=(1,) * n, num_tokens=n, is_decode=True)
 
 
-def _bind(kda, rec, conv, plan, kernels):
-    kda.mix = KDACallable(_Pool(rec, conv), _Kda(plan, kernels))
-
-
 @pytest.mark.parametrize("batch", [1, 32])
 def test_kda_decode_matches_reference(batch):
     heads, head_dim, hidden, slots = 8, 128, 4096, 40
     kda = ParallelKimiDeltaAttention(KDAConfig(
         hidden_size=hidden, num_heads=heads, head_dim=head_dim),
-        dtype=torch.bfloat16).cuda()
+        dtype=torch.bfloat16, layer=0).cuda()
     _randomize(kda, 0)
     kda.process_weights_after_loading("cuda")
     # the pool is V-first, [H, V, K]; the reference step is K-first
     rec = torch.randn(slots, heads, head_dim, head_dim, device="cuda") * 0.1
     conv = torch.randn(slots, 3 * heads * head_dim, 3, device="cuda").to(torch.bfloat16)
     slot_index = torch.randperm(slots, device="cuda")[:batch]
-    _bind(kda, rec, conv, _decode_plan(slot_index), kda_triton.TritonKDAKernels())
+    value = _Value(kda, rec, conv, _decode_plan(slot_index), kda_triton.TritonKDAKernels())
     rec_ref, conv_ref = rec.clone(), conv.clone()
     with torch.no_grad():
         for step in range(3):
@@ -300,7 +343,8 @@ def test_kda_decode_matches_reference(batch):
             r, c = rec_ref[slot_index].transpose(-1, -2), conv_ref[slot_index]
             ref = kda.decode_step(x.unsqueeze(1), r, c).squeeze(1)
             rec_ref[slot_index], conv_ref[slot_index] = r.transpose(-1, -2), c
-            out = kda(x, 0)
+            with value.step():
+                out = kda(x)
             # The merged in-projection rounds like the three separate ones up to 1 bf16 ulp.
             torch.testing.assert_close(out, ref, rtol=2e-2, atol=2e-2, msg=f"step {step}")
     torch.testing.assert_close(conv, conv_ref, rtol=1e-2, atol=1e-2)
@@ -363,13 +407,23 @@ def _verify(bundle, layer, x, pool, plan):
     p, h, d = layer.qkv_dim, layer.num_heads, layer.head_dim
     return bundle.run_verify(
         proj[:, :3 * p], proj[:, 3 * p + h:3 * p + h + d], proj[:, 3 * p:3 * p + h], plan,
-        pool.block("conv", 0), pool.block("state", 0), SpecBlocks.of(pool, 0), layer.params(),
+        pool.block("conv", 0), pool.block("state", 0), SpecBlocks.of(pool, 0), _params(layer),
         gate=proj[:, 3 * p + h + d:3 * p + h + 2 * d],
     )
 
 
+def _params(layer) -> KDAParams:
+    """What `kimi_delta` hands the kernels for ``layer``, built from its weights."""
+    w = layer.weights
+    return KDAParams(
+        conv_weight=w.conv, A_log=w.a_log, dt_bias=w.dt_bias, lower_bound=layer.forget_gate.gate_lower_bound,
+        num_heads=layer.num_heads, head_dim=layer.head_dim, scale=layer.head_dim ** -0.5, f_b=w.f_b, g_b=w.g_b,
+        norm_weight=w.norm_weight, norm_eps=w.norm_eps,
+    )
+
+
 def _after_verdict(pool, slots, accepted):
-    """``KDACallable.set_prefix_len``: the accepted tokens and the token after them."""
+    """A KDA Value's settle: the accepted tokens and the token after them."""
     spec = SpecBlocks.of(pool, 0)
     spec.prefix_len[slots, 0] = (accepted + 1).to(torch.int32)
     spec.side[slots, 0] = 1 - spec.side[slots, 0]

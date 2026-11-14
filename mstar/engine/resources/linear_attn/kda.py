@@ -1,7 +1,7 @@
 """Kimi delta attention planned against the recurrent state pool.
 
 As in ``gdn.py``, the pool's addressing arrives through ``ctx.plan_results`` and a
-layer's blocks reach ``run`` as tensors, which ``convenience.KDACallable`` resolves.
+layer's blocks reach ``run`` as tensors, which a KDA Value's handle resolves.
 The math is a kernel bundle's, which the resource picks from the pool and its layers' gates:
 ``kda_triton.TritonKDAKernels`` where they run it, ``kda_torch.TorchKDAKernels``
 elsewhere. A bundle implements ``layout`` (the token layout its prefill reads, or
@@ -13,7 +13,7 @@ stages the layout into buffers that stay put under capture.
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import NamedTuple
 
@@ -196,6 +196,18 @@ class KDAManager(LinearAttnManager):
         """Whether a captured prefill replays with each step's spans on these kernels."""
         return self.kernels.prefill_capturable
 
+    def can_capture(self, step: LinearAttnStep) -> bool:
+        """False for a prefill step these kernels can't replay. A packed config whose step has one token a row reads
+        as a decode here, and still raises at capture."""
+        spans = [max(segment.span, 0) for segment in step.segments or ()]
+        return self.prefill_capturable or not self.is_prefill(spans, step.speculative, force_prefill=False)
+
+    @staticmethod
+    def is_prefill(spans: Sequence[int], speculative: bool, force_prefill: bool) -> bool:
+        """Whether a step of ``spans`` runs the prefill kernels: no verify step, and packed, empty or with a row of
+        other than one token."""
+        return not speculative and (force_prefill or not spans or any(span != 1 for span in spans))
+
     # Step lifecycle
 
     @property
@@ -251,8 +263,7 @@ class KDAManager(LinearAttnManager):
         num_tokens = lease.bucket.num_tokens if lease is not None else sum(spans)
         # as GDN: a packed capture replays uneven spans, so it always takes the prefill
         # kernels, even when it captured one token per row
-        is_decode = (not speculative and not ctx.force_prefill and rows > 0
-                     and all(s == 1 for s in spans))
+        is_decode = not speculative and not self.is_prefill(spans, speculative, ctx.force_prefill)
         plan = KDAPlan(
             slot_ids=addressing.slot_indices[:rows],
             has_state=addressing.has_state[:rows],
@@ -273,7 +284,7 @@ class KDAManager(LinearAttnManager):
                     plan.capture_key = key
                 elif key not in self._cg_settled:
                     raise RuntimeError(
-                        f"kda: the capture of {key} ran no set_prefix_len, so its replays "
+                        f"kda: the capture of {key} ran no settle, so its replays "
                         "would leave each verify step's count unsettled"
                     )
         elif not is_decode and self.kernels is not None:
@@ -281,8 +292,8 @@ class KDAManager(LinearAttnManager):
                 # its prefill slices the spans on the host, so a replay would run the capture's
                 raise RuntimeError(
                     f"kda: {type(self.kernels).__name__} can't run a captured prefill "
-                    f"({lease.bucket}); leave the node's prefill buckets out where "
-                    "KDAManager.prefill_capturable is False"
+                    f"({lease.bucket}): a packed config whose largest bucket has one token a row "
+                    "passes can_capture and still reaches here"
                 )
             host = self.kernels.layout(spans, num_tokens, lease is not None)
             if host is not None:
@@ -336,7 +347,7 @@ class KDAManager(LinearAttnManager):
             for label, plan in self._current.items():
                 if not plan.settled:
                     raise RuntimeError(
-                        f"kda: a verify step under {label!r} ended without set_prefix_len"
+                        f"kda: a verify step under {label!r} ended without a settle"
                     )
         self._verifying.update(ctx.request_ids)
 
@@ -347,13 +358,13 @@ class KDAManager(LinearAttnManager):
 
     @torch.compiler.disable
     def settle_verify(self, label: str | None = None) -> KDAPlan:
-        """This verify step's plan, for ``KDACallable.set_prefix_len`` to write its accepted
-        count; once per step."""
+        """This verify step's plan, for a KDA Value's settle to write its accepted count;
+        once per step."""
         plan = self.current_plan(label)
         if not plan.is_verify:
-            raise RuntimeError("kda: set_prefix_len after a step that didn't verify")
+            raise RuntimeError("kda: a settle after a step that didn't verify")
         if plan.settled:
-            raise RuntimeError("kda: set_prefix_len twice for one verify step")
+            raise RuntimeError("kda: a second settle in one verify step")
         plan.settled = True
         if plan.capture_key is not None:
             self._cg_settled.add(plan.capture_key)

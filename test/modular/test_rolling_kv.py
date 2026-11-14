@@ -428,7 +428,7 @@ def test_writing_more_rows_than_the_step_has_is_refused():
 def test_the_store_runs_eager_and_does_not_shard_yet():
     spec = RollingKVSpec(resource_key="kv", nodes={"dit"},
                          config=RollingKVConfig(num_layers=1, num_heads=1, head_dim=1, pool_tokens=4))
-    assert not RollingKVManager.build(spec, EngineResourceInfo(device=torch.device("cpu"))).can_capture()
+    assert not RollingKVManager.build(spec, EngineResourceInfo(device=torch.device("cpu"))).can_capture(None)
     tp2 = SimpleNamespace(world_size=2)
     with pytest.raises(NotImplementedError, match="shard"):
         RollingKVManager.build(spec, EngineResourceInfo(device=torch.device("cpu"), joint_comm_group=tp2))

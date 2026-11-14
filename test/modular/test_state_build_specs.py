@@ -421,7 +421,7 @@ def test_a_conv_needs_exactly_one_linear_attention_update_to_run_inside(monkeypa
     monkeypatch.setitem(BINDINGS, (VALUE, _OtherRecurrence), _OtherLinear())
     with pytest.raises(ValueError, match=re.escape(
         f"Array 'gdn': no layout yet: updates['conv'] is a CausalConv, which today's resources run inside one linear "
-        f"attention update (GatedDeltaNet, _OtherRecurrence), and the array has {linear}",
+        f"attention update (GatedDeltaNet, KimiDelta, _OtherRecurrence), and the array has {linear}",
     )):
         build_specs([_kv(), _gdn(updates=updates)])
 
@@ -513,8 +513,8 @@ def test_a_yaml_page_count_overrides_the_hook_as_a_server_builds_the_specs():
 @pytest.mark.parametrize("arrays, key, settings, allowed", [
     (lambda: [_kv()], "kv", {"max_slots": 8}, "['max_num_pages']"),
     (lambda: [_kv()], "kv", {"page_size": 64}, "['max_num_pages']"),
-    (lambda: [_kv(), _gdn()], "gdn", {"max_num_pages": 8}, "['max_slots']"),
-    (lambda: [_kv(), _gdn()], "gdn", {"prefix_slots": 8}, "['max_slots']"),
+    (lambda: [_kv(), _gdn()], "gdn", {"max_num_pages": 8}, "['max_slots', 'max_slots_of']"),
+    (lambda: [_kv(), _gdn()], "gdn", {"prefix_slots": 8}, "['max_slots', 'max_slots_of']"),
     (lambda: [_FLAG], "flag", {"max_slots": 8}, "[]"),
     (lambda: [_FLAG], "flag", {"max_num_pages": 8}, "[]"),
     (lambda: [_within()], "vision", {"max_slots": 8}, "[]"),
@@ -793,6 +793,21 @@ def test_kernel_settings_sizes_a_plain_value_and_yaml_overrides_it():
     assert hooked.config.max_slots == 5, "the hook's size reaches a plain Value's pool"
     apply_yaml_overrides([hooked], {"resources": {"state": {"max_slots": 9}}})
     assert hooked.config.max_slots == 9, "YAML wins over the hook"
+
+
+def test_a_value_sized_by_another_takes_its_slot_count_unless_the_yaml_sizes_it():
+    settings = {"state": {"max_slots": 5}, "seed": {"max_slots_of": "state"}}
+    specs = _by_key(_plain(), replace(_plain(), name="seed"), kernel_settings=settings)
+    apply_yaml_overrides(list(specs.values()), {"resources": {"state": {"max_slots": 9}}})
+    assert specs["seed"].config.max_slots == 9, "a YAML that sizes the pool it follows sizes it too"
+    apply_yaml_overrides(list(specs.values()), {"resources": {"seed": {"max_slots": 3}}})
+    assert specs["seed"].config.max_slots == 3, "YAML wins over the link"
+
+
+def test_a_slot_count_taken_from_anything_but_a_recurrent_pool_is_refused():
+    specs = build_specs([_kv(), _plain()], kernel_settings={"state": {"max_slots_of": "kv"}})
+    with pytest.raises(ValueError, match="max_slots_of names 'kv', which is no recurrent state pool"):
+        apply_yaml_overrides(specs, {})
 
 
 @pytest.mark.parametrize("build, cause", [

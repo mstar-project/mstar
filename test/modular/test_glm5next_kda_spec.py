@@ -7,7 +7,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from mstar.engine.resources.linear_attn.kda import KDAPlan, SpecBlocks
+from mstar.engine.resources.linear_attn.kda import KDAParams, KDAPlan, SpecBlocks
 from mstar.engine.resources.linear_attn.kda_torch import TorchKDAKernels
 from mstar.engine.resources.recurrent.config import DeltaNetGeometry, RecurrentStateConfig
 from mstar.engine.resources.recurrent.pool import SINK_SLOT, RecurrentStatePool
@@ -67,13 +67,23 @@ def _verify(bundle, layer, x, pool, plan):
     p, h, d = layer.qkv_dim, layer.num_heads, layer.head_dim
     return bundle.run_verify(
         proj[:, :3 * p], proj[:, 3 * p + h:3 * p + h + d], proj[:, 3 * p:3 * p + h], plan,
-        pool.block("conv", 0), pool.block("state", 0), SpecBlocks.of(pool, 0), layer.params(),
+        pool.block("conv", 0), pool.block("state", 0), SpecBlocks.of(pool, 0), _params(layer),
         gate=proj[:, 3 * p + h + d:3 * p + h + 2 * d],
     )
 
 
+def _params(layer) -> KDAParams:
+    """What `kimi_delta` hands the kernels for ``layer``, built from its weights."""
+    w = layer.weights
+    return KDAParams(
+        conv_weight=w.conv, A_log=w.a_log, dt_bias=w.dt_bias, lower_bound=layer.forget_gate.gate_lower_bound,
+        num_heads=layer.num_heads, head_dim=layer.head_dim, scale=layer.head_dim ** -0.5, f_b=w.f_b, g_b=w.g_b,
+        norm_weight=w.norm_weight, norm_eps=w.norm_eps,
+    )
+
+
 def _after_verdict(pool, slots, accepted):
-    """``KDACallable.set_prefix_len``: the accepted tokens and the token after them."""
+    """A KDA Value's settle: the accepted tokens and the token after them."""
     spec = SpecBlocks.of(pool, 0)
     spec.prefix_len[slots, 0] = (accepted + 1).to(torch.int32)
     spec.side[slots, 0] = 1 - spec.side[slots, 0]
