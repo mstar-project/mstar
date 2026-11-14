@@ -408,12 +408,14 @@ def test_shared_mask_node_requires_layout_on_each_planned_walk():
 
     conductor = object.__new__(Conductor)
     conductor.model = TwoWalks()
+    conductor._episode_array_names = frozenset()
     conductor._status_interval_s = None
     conductor._max_output_tokens = lambda kwargs: 1
     conductor._loop_caps = lambda kwargs: {}
     body = SimpleNamespace(
         request_id="second-walk", client_request_id=None, model_kwargs={},
         initial_input_modalities=[], initial_output_modalities=[], initial_signals={},
+        episode=None, episode_keys=None,
     )
     with pytest.raises(RuntimeError, match="walk 'decode' has no chunk-causal layout"):
         conductor._do_ingest_request(body)
