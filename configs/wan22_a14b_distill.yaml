@@ -18,6 +18,10 @@ model_kwargs:
   lora_2: ["/path/to/wan2.2_t2v_A14b_low_noise_lora_rank64_lightx2v_4step_1217.safetensors"]
   compile_dit_sizes: ["1280x720x81", "832x480x81"]
   vae_decode_fast_sizes: ["1280x720", "832x480"]
+  # opt-in, lossy: the low-noise expert's linears on NVFP4 (Blackwell), 12% less time a video at
+  # 832x480 on a B300 and the bf16 video kept; linear_dtype: mxfp8 as well is 19% less, details moved
+  # (docs/models.rst, Wan2.2 low-precision linears)
+  # linear_dtype_2: nvfp4
 
 node_groups:
   - node_names:

@@ -54,6 +54,7 @@ from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import Model, WalkStep
 from mstar.model.components.diffusion.attention import dit_entry, refuse_attention_backend_kwarg
 from mstar.model.components.diffusion.step_cache import step_cache_policy
+from mstar.model.components.quant_linear import apply_linear_dtype, check_linear_dtype, check_linear_keep
 from mstar.model.components.video_encode import encode_mp4
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.wan22.config import (
@@ -127,6 +128,9 @@ class Wan22Model(Model):
         dmd_shift: float | None = None,
         lora: list | None = None,
         lora_2: list | None = None,
+        linear_dtype: str = "bf16",
+        linear_keep_bf16: list[str] | None = None,
+        linear_dtype_2: str | None = None,
         **kwargs,
     ):
         refuse_attention_backend_kwarg(kwargs)
@@ -148,6 +152,11 @@ class Wan22Model(Model):
         # LoRA adapters folded into the DiT (A14B: each expert its own) at load, a static merge
         self.loras = [LoraFile.parse(item) for item in self.config.lora]
         self.loras_2 = [LoraFile.parse(item) for item in self.config.lora_2]
+        # opt-in, lossy: the DiT blocks' linears in a low-precision format (mxfp8 / nvfp4 on Blackwell; see
+        # docs/models.rst); A14B's low-noise expert can take its own (``linear_dtype_2``, default the same)
+        self.linear_dtype = check_linear_dtype(linear_dtype)
+        self.linear_dtype_2 = check_linear_dtype(linear_dtype if linear_dtype_2 is None else linear_dtype_2)
+        self.linear_keep_bf16 = check_linear_keep(linear_keep_bf16)
         # Dummy mode: get_submodule returns None for every node, so engines run
         # without weights, GPU or network.
         self.skip_weight_loading = skip_weight_loading
@@ -767,6 +776,13 @@ class Wan22Model(Model):
                     from mstar.model.wan22.weight_loader import apply_dit_loras
 
                     apply_dit_loras(expert, files)
+            # after the adapters: those fold into the bf16 weights this quantizes
+            from mstar.model.wan22.components.dit import QUANTIZABLE_LINEARS
+
+            for expert, name, dtype in zip(experts, ("transformer", "transformer_2"),
+                                           (self.linear_dtype, self.linear_dtype_2), strict=False):
+                apply_linear_dtype(expert, dtype, QUANTIZABLE_LINEARS, self.linear_keep_bf16, f"Wan2.2 {name}")
+                expert.unfuse_quantized_qkv()
             return self._dit_class()(
                 experts[0], self.config, cfg_group=cfg_group,
                 transformer_2=experts[1] if len(experts) > 1 else None,

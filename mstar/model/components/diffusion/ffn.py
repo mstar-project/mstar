@@ -23,8 +23,10 @@ from mstar.model.components.mlp import MLP
 def gelu_tanh_ffn(x: torch.Tensor, mlp: MLP) -> torch.Tensor:
     """``mlp(x)`` for an ``MLP`` built with ``activation="gelu_tanh"`` and a
     biased ``linear_in``."""
-    if x.is_cuda and torch.compiler.is_compiling() and not isinstance(mlp.linear_in, LoraBound):
-        lin = mlp.linear_in
+    lin = mlp.linear_in
+    # a bf16 nn.Linear only: a low-precision one (``QuantLinear``) holds no bf16 weight to hand cuBLASLt
+    plain = isinstance(lin, torch.nn.Linear) and not isinstance(lin, LoraBound)
+    if x.is_cuda and torch.compiler.is_compiling() and plain:
         hidden = torch._addmm_activation(lin.bias, x.flatten(0, -2), lin.weight.t(), use_gelu=True)
         return mlp.linear_out(hidden.unflatten(0, x.shape[:-1]))
     return mlp(x)

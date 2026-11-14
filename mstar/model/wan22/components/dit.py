@@ -48,10 +48,23 @@ from mstar.model.components.diffusion.ffn import gelu_tanh_ffn
 from mstar.model.components.diffusion.modulation import ada_layer_norm
 from mstar.model.components.diffusion.qk_norm_rope import rms_norm_rope
 from mstar.model.components.mlp import MLP
+from mstar.model.components.quant_linear import QuantizableLinears
 from mstar.model.wan22.config import DIT_TOKENS, Wan22Config
 
 # 3D RoPE base frequency (reference WanRotaryPosEmbed default `theta`).
 ROPE_THETA = 10000.0
+
+# ``linear_dtype``: the blocks' attention and feed-forward linears, nearly all of a step's GEMM FLOPs, may go low
+# precision. The cross-attention's k / v read the 512 text rows, where a low-precision GEMM is no faster (0.011 ms
+# either way on a TI2V-5B block) and only adds error, so they stay bf16 with the condition embedder (its time
+# embedder an fp32 island, its modulation projection feeding every block's adaLN) and the output projection; the
+# patch embedding is a conv.
+QUANTIZABLE_LINEARS = QuantizableLinears(
+    candidates=("blocks.*.self_attn.*_proj", "blocks.*.cross_attn.q_proj", "blocks.*.cross_attn.o_proj",
+                "blocks.*.ffn.linear_in", "blocks.*.ffn.linear_out"),
+    keep_bf16=("blocks.*.cross_attn.k_proj", "blocks.*.cross_attn.v_proj", "condition_embedder.*.*",
+               "condition_embedder.time_proj", "proj_out"),
+)
 
 
 class WanFP32LayerNorm(nn.LayerNorm):
@@ -181,6 +194,12 @@ class Wan22DiTAttention(nn.Module):
             proj.weight = nn.Parameter(w, requires_grad=False)
             proj.bias = nn.Parameter(b, requires_grad=False)
         self.qkv_weight, self.qkv_bias = weight, bias
+
+    def unfuse_quantized_qkv(self) -> None:
+        """Drop the stacked q / k / v weight once ``linear_dtype`` has replaced the three Linears: the fused GEMM
+        would run the bf16 stack, so each projection runs its own low-precision op."""
+        if self.qkv_weight is not None and not isinstance(self.q_proj, nn.Linear):
+            self.qkv_weight = self.qkv_bias = None
 
     def bind_state(self, handles: Mapping[str, Any]) -> None:
         # the cross-attention declares no array and stays on SDPA, which is faster at the text's shape
@@ -374,6 +393,13 @@ class Wan22DiT(nn.Module):
         self.norm_out = WanFP32LayerNorm(dim, config.eps, elementwise_affine=False)
         self.proj_out = nn.Linear(dim, config.out_channels * math.prod(config.patch_size))
         self.scale_shift_table = nn.Parameter(torch.empty(1, 2, dim))
+
+    def unfuse_quantized_qkv(self) -> "Wan22DiT":
+        """After ``linear_dtype``: every block whose self-attention projections went low precision runs them as
+        three ops (``Wan22DiTAttention.unfuse_quantized_qkv``)."""
+        for block in self.blocks:
+            block.self_attn.unfuse_quantized_qkv()
+        return self
 
     def fuse_qkv(self) -> "Wan22DiT":
         """Every block's self-attention projections as one GEMM (``Wan22DiTAttention.fuse_qkv``)."""

@@ -35,6 +35,10 @@ from mstar.model.flux2_klein.components.transformer import QUANTIZABLE_LINEARS, 
 from mstar.model.flux2_klein.config import Flux2KleinConfig, Flux2TransformerConfig
 from mstar.model.flux2_klein.flux2_klein_model import Flux2KleinModel
 from mstar.model.submodule_base import ModelInputsFromEngine
+from mstar.model.wan22.components.dit import QUANTIZABLE_LINEARS as WAN_QUANTIZABLE_LINEARS
+from mstar.model.wan22.components.dit import Wan22DiT
+from mstar.model.wan22.config import WAN22_VARIANT_T2V_A14B, WAN22_VARIANT_TI2V_5B, Wan22Config
+from mstar.model.wan22.wan22_model import Wan22Model
 from mstar.model.z_image.components.transformer import QUANTIZABLE_LINEARS as Z_QUANTIZABLE_LINEARS
 from mstar.model.z_image.components.transformer import ZImageDiT
 from mstar.model.z_image.config import ZImageTransformerConfig
@@ -439,9 +443,40 @@ def test_z_image_declaration_classifies_every_linear_and_its_widths_pass_the_gua
     assert set(Z_QUANTIZABLE_LINEARS.input_amax) <= set(selected), "every amax entry names a candidate"
 
 
+@pytest.mark.parametrize("variant", [WAN22_VARIANT_TI2V_5B, WAN22_VARIANT_T2V_A14B])
+def test_wan_declaration_classifies_every_linear_and_its_widths_pass_the_guards(variant):
+    with torch.device("meta"):
+        dit = Wan22DiT(Wan22Config.for_variant(variant, num_layers=2))
+    linears = {name: m for name, m in dit.named_modules() if quant_capability(m) is not None}
+    selected = [name for name in linears if WAN_QUANTIZABLE_LINEARS.selected(name)]
+    kinds = ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj", "cross_attn.q_proj",
+             "cross_attn.o_proj", "ffn.linear_in", "ffn.linear_out")
+    assert sorted(selected) == sorted(f"blocks.{i}.{kind}" for i in range(2) for kind in kinds)
+    # the text rows' k / v, the condition embedder and the output projection stay
+    assert set(linears) - set(selected) == {
+        *(f"blocks.{i}.cross_attn.{proj}" for i in range(2) for proj in ("k_proj", "v_proj")),
+        "condition_embedder.time_embedder.linear_in", "condition_embedder.time_embedder.linear_out",
+        "condition_embedder.time_proj", "condition_embedder.text_embedder.linear_in",
+        "condition_embedder.text_embedder.linear_out", "proj_out",
+    }
+    for name in selected:
+        for fmt in (MXFP8, NVFP4):
+            fmt.check(*linears[name].weight.shape, torch.bfloat16)
+
+
 def test_knobs_default_to_bf16_and_refuse_a_typo():
     assert Flux2KleinModel(skip_weight_loading=True).linear_dtype == "bf16"
     assert ZImageModel(skip_weight_loading=True).linear_dtype == "bf16"
+    wan = Wan22Model(model_path_hf="test/wan22", skip_weight_loading=True)
+    assert (wan.linear_dtype, wan.linear_dtype_2) == ("bf16", "bf16")
+    # A14B's low-noise expert takes the high-noise one's dtype unless it names its own
+    a14b = {"model_path_hf": "test/wan22", "variant": WAN22_VARIANT_T2V_A14B, "skip_weight_loading": True}
+    wan = Wan22Model(**a14b, linear_dtype="mxfp8")
+    assert (wan.linear_dtype, wan.linear_dtype_2) == ("mxfp8", "mxfp8")
+    wan = Wan22Model(**a14b, linear_dtype="nvfp4", linear_dtype_2="bf16")
+    assert (wan.linear_dtype, wan.linear_dtype_2) == ("nvfp4", "bf16")
+    with pytest.raises(ValueError, match="linear_dtype must be one of"):
+        Wan22Model(**a14b, linear_dtype_2="fp4")
     with pytest.raises(ValueError, match="linear_dtype must be one of"):
         Flux2KleinModel(skip_weight_loading=True, linear_dtype="mxfp4")
 

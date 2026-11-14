@@ -2505,6 +2505,88 @@ and kernels, M*'s steps match LightX2V's loop over the diffusers experts bit for
 guidance above 1 is a 400; a ``flow_shift`` goes unread, and a ``step_cache`` is refused
 with this sampler.
 
+**Low-precision linears (opt-in, lossy).** ``linear_dtype: mxfp8`` or ``nvfp4`` runs the DiT
+blocks' self-attention, cross-attention q / output and feed-forward linears in that format on
+Blackwell (see FLUX.2 klein's ``linear_dtype`` below for the formats). The cross-attention's k / v
+over the 512 text rows, the condition embedder and the output projection stay bf16, and A14B's
+low-noise expert takes ``linear_dtype_2`` (default: the same). Each expert is quantized at load,
+after any ``lora``; ``linear_keep_bf16`` keeps more linears bf16. On one B300 (two rounds,
+the second in reverse order; quality on 8 prompts against the bf16 videos of the same seeds; bf16
+is bit-identical across server boots):
+
+.. list-table::
+   :header-rows: 1
+
+   * - model
+     - ``linear_dtype``
+     - s/video, 1 at a time
+     - videos/s, 4 at a time
+     - PSNR (dB) / SSIM / LPIPS against bf16 (bf16 row: another seed)
+   * - TI2V-5B, 50 steps x CFG 5, 1280x704x81
+     - bf16
+     - 22.1
+     - 0.046
+     - 9.8 / 0.41 / 0.68
+   * -
+     - ``mxfp8``
+     - 19.4 (-12%)
+     - 0.052
+     - 22.7 / 0.80 / 0.18
+   * -
+     - ``nvfp4``
+     - 18.2 (-18%)
+     - 0.056
+     - 16.8 / 0.63 / 0.41
+   * - FastWan, 3 steps, 1280x704x81
+     - bf16
+     - 2.11
+     - 0.55
+     - 11.3 / 0.38 / 0.64
+   * -
+     - ``mxfp8``
+     - 2.08 (-2%)
+     - 0.57
+     - 17.9 / 0.65 / 0.28
+   * -
+     - ``nvfp4``
+     - 2.03 (-4%)
+     - 0.58
+     - 12.2 / 0.42 / 0.58
+   * - A14B 4-step, 832x480x81
+     - bf16
+     - 5.25
+     - 0.198
+     - 12.3 / 0.29 / 0.58
+   * -
+     - ``mxfp8``
+     - 4.53 (-14%)
+     - 0.229
+     - 16.6 / 0.48 / 0.32
+   * -
+     - ``nvfp4``
+     - 4.22 (-20%)
+     - 0.250
+     - 12.9 / 0.31 / 0.52
+   * -
+     - bf16, ``linear_dtype_2: nvfp4``
+     - 4.63 (-12%) †
+     -
+     - 21.3 / 0.69 / 0.16
+   * -
+     - ``mxfp8``, ``linear_dtype_2: nvfp4``
+     - 4.27 (-19%) †
+     -
+     - 16.6 / 0.47 / 0.32
+
+MXFP8 keeps the bf16 video with its details moved, the 50-step TI2V-5B's least. On the few-step
+models NVFP4 lands about as far from it as another seed does: a different, clean composition, not a
+degraded one. On A14B the high-noise expert (steps 1-2) sets the composition and the low-noise
+expert (steps 3-4) only details: the low-noise expert on NVFP4 costs nothing against MXFP8, and with
+the high-noise expert left bf16 the video stays within 21 dB of bf16. FastWan gains little because
+its VAE decode is two thirds of its GPU time. The rows were measured with the cross-attention's k / v
+quantized too, A14B's with the LoRAs folded in, TI2V-5B's with its self-attention on FA4, and the
+rows marked † with the block-scaled GEMMs adding the bias in their epilogue.
+
 LTX-2.5 (``ltx2_5``)
 --------------------
 
