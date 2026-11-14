@@ -326,6 +326,11 @@ def test_final_adapter_digest_reaches_conductor_without_prefix_caching(adapters)
     assert "prefix_root" not in kwargs
     assert body.episode_adapter_digest == served.check("a")
 
+    named_worker = _worker(_Model(), config, served)
+    named_kwargs = _run(named_worker, "a", served, prefix_cache=False)
+    assert "prefix_root" not in named_kwargs
+    assert named_worker.communicator.sent[-1].body.episode_adapter_digest == served.check("a")
+
     base_worker = _worker(_Choosing(None), config, served)
     _run(base_worker, None, served, prefix_cache=False)
     assert base_worker.communicator.sent[-1].body.episode_adapter_digest is None

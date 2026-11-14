@@ -210,6 +210,16 @@ def test_same_adapter_name_with_new_digest_resets_unkeyed_rows(tmp_path, monkeyp
         1, 0, "identity",
     )
     assert _new_requests(comm, "second")[0][1].reset_episode is True
+    _complete(conductor, "second", {"frames": 7})
+
+    third = _request("third", "robot-a")
+    third.model_kwargs = {"lora_adapter": "same", "lora_digest": b"b" * 32}
+    third.episode_adapter_digest = b"b" * 32
+    conductor._ingest_request(third)
+    assert (model.views[-1].calls, model.views[-1].held["frames"], model.views[-1].cold) == (
+        2, 7, None,
+    )
+    assert _new_requests(comm, "third")[0][1].reset_episode is False
 
 
 def test_episode_adapter_without_selected_digest_is_refused(tmp_path, monkeypatch):
