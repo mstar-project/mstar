@@ -235,3 +235,18 @@ def test_a_decode_row_from_prepare_inputs_has_the_template_row_s_span(k):
     )
     with pytest.raises(RuntimeError, match="a decode row of 2 ids"):
         node.prepare_inputs("decode", info, {**signals, "text_inputs": [torch.tensor([7, 8])]})
+
+
+def test_only_the_first_decode_step_reads_the_prompt_length():
+    """The walk plan puts the prompt's length in the decode steps' metadata, and a verify step's stop and its context
+    check both read it. The first decode step puts it on the count edge, where the steps after it read it."""
+    node = _node(_model("reduced", 3, kda_conv_dtype=torch.float32))
+    info = SimpleNamespace(
+        request_id="r", resource_configs={}, dynamic_loop_iter_counts={}, step_metadata={PROMPT_LEN: 5},
+    )
+    signals = {"text_inputs": [torch.tensor([7])], COUNT: [torch.tensor([1, -1, 16, 1, -1])]}
+    first = node.prepare_inputs("decode", info, signals)
+    assert first.kwargs == {"emitted": 1, "max_tokens": 16, "ignore_eos": 1, "prompt_len": 5}
+    info.step_metadata = {}
+    later = node.prepare_inputs("decode", info, {**signals, COUNT: [torch.tensor([4, 0, 16, 1, 5])]})
+    assert later.kwargs["prompt_len"] == 5, "a later step would read the prompt's length through its info again"

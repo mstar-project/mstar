@@ -530,3 +530,48 @@ def test_a_verify_step_carries_its_count_to_the_stop(monkeypatch):
         assert out["new_token"][0].tolist() == [5, 6, 7, 8][:emitted]
         assert out[COUNT][0].tolist() == [count + emitted, bool(stops), 9, True, 16]
         assert sub.check_stop("r", decode, out) == stops, f"a step that came in at {count}"
+
+
+class _Reads(dict):
+    """A request's outputs that note each name read, where the worker's host row copies each name read."""
+
+    def __init__(self, outputs):
+        super().__init__(outputs)
+        self.read = []
+
+    def __getitem__(self, name):
+        self.read.append(name)
+        return super().__getitem__(name)
+
+
+def _verify_step(monkeypatch, rows: int) -> tuple[Glm5NextLLMSubmodule, dict]:
+    """A k=3 verify step's unpacked outputs for ``rows`` requests, where row i accepted ``i % 4`` drafts. Each
+    request's info holds its walk and nothing else."""
+    sub = _verdict_reader(monkeypatch, verdicts=tuple((5, 6, 7, 8, i % 4) for i in range(rows)), ready=1)
+    kwargs = {"emitted": 5, "max_tokens": 64, "ignore_eos": True, "prompt_len": 16}
+    rids = [f"r{i}" for i in range(rows)]
+    infos = {rid: types.SimpleNamespace(graph_walk="decode") for rid in rids}
+    return sub, sub.unpack_packed_outputs({}, rids, [4] * rows, [ARNodeInputs(input_seq_len=4, kwargs=kwargs)] * rows,
+                                          infos)
+
+
+def test_a_32_row_verify_step_builds_one_tensor_of_tokens_and_one_of_counts(monkeypatch):
+    """A tensor per row for each output is 64 host tensors built on the GPU thread every step, beside a read of the
+    request's max_tokens and ignore_eos through its info for every row."""
+    _, out = _verify_step(monkeypatch, 32)
+    for i, row in enumerate(out.values()):
+        want = [5, 6, 7, 8][:i % 4 + 1]
+        assert (row["new_token"][0].tolist(), row[COUNT][0].tolist()) == (want, [5 + len(want), 0, 64, 1, 16])
+    for name in ("new_token", COUNT):
+        assert len({row[name][0].untyped_storage().data_ptr() for row in out.values()}) == 1, (
+            f"each row's {name} is a tensor of its own"
+        )
+
+
+def test_a_verify_step_s_stop_check_reads_one_output(monkeypatch):
+    """The worker hands `check_stop` a row that copies an output to the host when its name is first read. A second
+    name is a second copy a step and a second lookup a row, on the worker's main thread."""
+    sub, out = _verify_step(monkeypatch, 1)
+    row = _Reads(out["r0"])
+    assert sub.check_stop("r0", types.SimpleNamespace(), row) == set()
+    assert row.read == [COUNT], "the stop check reads a second output, or the request's info, for every row"
