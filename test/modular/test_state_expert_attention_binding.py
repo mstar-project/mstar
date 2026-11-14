@@ -9,7 +9,7 @@ import torch
 import torch.nn.functional as F
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
-from mstar.engine.accelerator_graph_runner import PiecewiseAcceleratorGraphRunner
+from mstar.engine.accelerator_graph_runner import PiecewiseAcceleratorGraphRunner, dummy_metadata
 from mstar.engine.resources.attn.ragged.expert_mask import cross_visibility, self_visibility
 from mstar.engine.resources.base import EngineResourceInfo, build_resource
 from mstar.engine.resources.step import Segment, StepContext, SubmoduleStep
@@ -108,7 +108,10 @@ def test_declared_expert_reads_match_reference(chunks: int, clean: int) -> None:
     assert torch.allclose(actual_cross, sdpa(k, v, cross), atol=2e-5, rtol=1e-5)
 
 
-def test_capture_padding_has_no_request_layout_and_uses_zero_chunk_sentinel() -> None:
+@pytest.mark.parametrize("dummy_info_present", [False, True], ids=["replay", "capture"])
+def test_capture_padding_has_no_request_layout_and_uses_zero_chunk_sentinel(
+    dummy_info_present: bool,
+) -> None:
     arrays = [
         Array(
             "expert_q", nodes={"expert"}, labels={"q"}, layers={0},
@@ -136,7 +139,10 @@ def test_capture_padding_has_no_request_layout_and_uses_zero_chunk_sentinel() ->
         "expert_q": ArrayStep(segments=(Segment("r0", "q", 4), Segment(-2, "q", 4))),
         "trunk_kv": ArrayStep(segments=(Segment("r0", "kv", 4), Segment(-2, "kv", 5))),
     })
-    planned = state_steps(step, handles, per_request_info={"r0": info})
+    infos = {"r0": info}
+    if dummy_info_present:
+        infos.update(dummy_metadata([-2], "chunk"))
+    planned = state_steps(step, handles, per_request_info=infos)
     assert planned.steps["self_attn"].layouts == ((1, 0, 0, 2), (0, 4, 4, 0))
     assert planned.steps["cross_attn"].layouts == ((1, 2, 0, 2), (0, 4, 5, 0))
 
