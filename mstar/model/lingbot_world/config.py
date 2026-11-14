@@ -125,13 +125,16 @@ class LingBotWorldConfig:
                 f"{self.sink_size + self.chunk_size + 1}, or -1 to attend every frame")
         return KeptWindow(self.sink_size * frame_tokens, window=frames * frame_tokens)
 
-    def window_pages(self, frame_tokens: int, page_size: int) -> int:
-        """The most pages of ``page_size`` a rollout at ``frame_tokens`` a frame holds as the pool releases them: its
-        sink in whole pages, the window, less than a page past it, and the chunk a step writes. This is
-        ``RetentionPolicy.max_pages`` of the kept window, which the model can't import."""
+    def window_tokens(self, frame_tokens: int) -> int:
+        """The tokens a layer a rollout at ``frame_tokens`` a frame keeps in the rolling store: its sink, its window and
+        the chunk a step adds, which the store sizes each request by from its layout and the model can't import."""
         kept = self.kept_window(frame_tokens)
-        sink = -(-kept.sink // page_size) * page_size
-        return -(-(sink + kept.window + page_size - 1 + self.chunk_size * frame_tokens) // page_size)
+        return kept.sink + kept.window + self.chunk_size * frame_tokens
+
+    def largest_latent(self) -> dict[str, int]:
+        """The sizes of the request whose VAE caches take the most bytes: every cache scales with the latent's area,
+        and ``max_area`` holds that many latent pixels at any aspect."""
+        return {"lat_h": 1, "lat_w": self.max_area // (self.vae_stride[1] * self.vae_stride[2])}
 
     def max_rollout_tokens(self) -> int:
         """The self-attention entries of the longest rollout at the largest area."""

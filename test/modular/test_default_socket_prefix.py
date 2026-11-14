@@ -26,7 +26,7 @@ class _StopError(Exception):
 
 def _entrypoint_prefix(monkeypatch, tmp_path, *argv) -> str:
     """The prefix ``mstar-serve`` hands the API server, without starting one."""
-    from mstar.api_server import entrypoint
+    from mstar.api_server import entrypoint, rust_frontend
     from mstar.model import registry
 
     seen = {}
@@ -46,6 +46,8 @@ def _entrypoint_prefix(monkeypatch, tmp_path, *argv) -> str:
     monkeypatch.setattr(registry, "get_model_class", lambda name: _Model)
     monkeypatch.setattr(entrypoint, "model_init_kwargs", lambda name: {})
     monkeypatch.setattr(entrypoint, "APIServer", fake_api_server)
+    # CPU Core builds the extension, not mstar-server
+    monkeypatch.setattr(rust_frontend, "find_server_binary", lambda explicit=None: "mstar-server")
     # sizing torch's pool would outlive the test in this process
     monkeypatch.setattr(entrypoint, "_set_preprocess_threads", lambda model, config: None)
     # and so would handing pytest's log handlers to a writer thread, which repeats every later record

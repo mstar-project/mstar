@@ -9,6 +9,8 @@ uv.lock
 *.sqlite
 *.prof
 *.json
+# the Python turn segmenter's recorded outputs, which mstar-server's vad tests replay
+!rust/server/src/realtime/testdata/*.json
 !docs/mintlify/docs.json
 !examples/observability/grafana/dashboards/*.json
 !mstar/kernels/tables/*/*.json

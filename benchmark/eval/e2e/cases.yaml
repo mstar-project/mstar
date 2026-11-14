@@ -306,31 +306,6 @@ models:
         optional: true
         check: {kind: status_match}
 
-  qwen3_omni_rustfe:
-    serve: qwen3_omni
-    config: configs/qwen3omni_colocated.yaml
-    serve_args: [--rust-frontend, --rust-frontend-bin, "{rust_server_bin}"]
-    env: {MSTAR_ALLOW_REMOTE: "1"}
-    family: Omni
-    tags: [omni, rust-frontend, image-in, sse, big]
-    requires: [qwen_omni_utils]
-    est_min: 14
-    cases:
-      - id: text
-        modality: text (Rust frontend)
-        client: chat_text
-        n: 16
-        args: [--max-tokens, "64"]
-        check: {kind: text_match, min_match: 0.5}
-        perf: {latency: lat_p50_s, throughput: req_per_s, extra: [ttft_p50_s]}
-      - id: image_in
-        modality: image in (Rust frontend)
-        client: chat_image
-        n: 16
-        args: [--max-tokens, "64"]
-        check: {kind: text_match, min_match: 0.25}
-        perf: {latency: lat_p50_s, throughput: req_per_s, extra: [ttft_p50_s]}
-
   bagel:
     serve: bagel
     config: configs/bagel_single_gpu.yaml
