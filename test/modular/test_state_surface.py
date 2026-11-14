@@ -20,7 +20,7 @@ from mstar.engine import state
 from mstar.engine.state.adapters import PagedArrayHandle, RingHandle, ValueHandle, WithinStepHandle
 from mstar.engine.state.calls import ArrayHandle
 
-# Today's types the surface re-exports, and a NamedTuple, whose fields stay positional.
+# The public expert masks/layouts and tuple records take multiple positional fields.
 _POSITIONAL = {
     "ExpertCross", "ExpertCrossLayout", "ExpertSelf", "ExpertSelfLayout",
     "PagedNHDTarget", "Segment", "SlotLease", "Span",
