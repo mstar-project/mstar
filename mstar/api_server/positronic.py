@@ -70,6 +70,10 @@ def _prompt(obs: dict, policy: PositronicPolicy) -> str:
     return prompt
 
 
+def _reset_requested(obs: dict) -> bool:
+    return bool(obs.get("reset_context") or obs.get("__reset_context__"))
+
+
 async def _infer(api, obs: dict, policy: PositronicPolicy, session_id: str, reset: bool) -> list[dict]:
     prompt = _prompt(obs, policy)
     request_id = api.submit_request(
@@ -130,7 +134,7 @@ async def serve_connection(websocket: WebSocket, api) -> None:
                     await websocket.send_bytes(_pack({"session_id": session_id, "end_session": True}))
                     return
                 assert obs is not None
-                reset = obs.get("reset_context") is True or obs.get("__reset_context__") is True
+                reset = _reset_requested(obs)
                 infer_started = time.monotonic()
                 rows = await _infer(api, obs, policy, session_id, reset)
                 elapsed = (time.monotonic() - started) * 1000

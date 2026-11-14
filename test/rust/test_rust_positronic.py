@@ -144,7 +144,8 @@ def python_session(stub):
     with TestClient(entrypoint.app).websocket_connect("/api/v1/session") as ws:
         messages = [msgpack.unpackb(ws.receive_bytes()) for _ in range(2)]
         id = messages[1]["session_id"]
-        for data in (frame(id), frame(id), frame(id, reset_context=True)):
+        for data in (frame(id), frame(id), frame(id, reset_context=True), frame(id),
+                     frame(id, reset_context=1), frame(id, __reset_context__=1)):
             ws.send_bytes(data)
             messages.append(msgpack.unpackb(ws.receive_bytes()))
         ws.send_bytes(msgpack.packb({"session_id": id, "end_session": True}))
@@ -156,7 +157,8 @@ def rust_session(port):
     with websockets.sync.client.connect(f"ws://127.0.0.1:{port}/api/v1/session", compression=None) as ws:
         messages = [msgpack.unpackb(ws.recv()) for _ in range(2)]
         id = messages[1]["session_id"]
-        for data in (frame(id), frame(id), frame(id, reset_context=True)):
+        for data in (frame(id), frame(id), frame(id, reset_context=True), frame(id),
+                     frame(id, reset_context=1), frame(id, __reset_context__=1)):
             ws.send(data)
             messages.append(msgpack.unpackb(ws.recv()))
         ws.send(msgpack.packb({"session_id": id, "end_session": True}))
@@ -173,8 +175,8 @@ def test_cold_warm_reset_and_end_match_in_both_frontends():
         rust_reply = rust_session(port)
         rust_calls, rust_ends = list(stub.calls), list(stub.ended[1:])
     assert _normalise(py) == _normalise(rust_reply)
-    assert [len(m["result"]) for m in py[2:5]] == [21, 24, 21]
-    assert py[5] == {"session_id": "ID", "end_session": True}
+    assert [len(m["result"]) for m in py[2:8]] == [21, 24, 21, 24, 21, 21]
+    assert py[8] == {"session_id": "ID", "end_session": True}
     assert len(py_ends) == len(rust_ends) == 1
     assert [c[:1] + c[2:] for c in py_calls] == [c[:1] + c[2:] for c in rust_calls]
     assert all(c[1] == py_ends[0] for c in py_calls)
