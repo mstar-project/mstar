@@ -934,7 +934,6 @@ models:
     optional: true
     tags: [praxis, vla, image-in, actions, websocket]
     est_min: 10
-    health: true
     cases: &praxis_droid_cases
       - id: cold_openpi
         modality: Praxis DROID cold actions
@@ -961,5 +960,4 @@ models:
     serve_args: [--python-frontend]
     tags: [praxis, vla, image-in, actions, websocket, python-frontend]
     est_min: 10
-    health: true
     cases: *praxis_droid_cases
