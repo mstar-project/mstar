@@ -1128,7 +1128,7 @@ def _layer_over_ranks(rank, world, store, split=None):
             state={KV_CACHE: ArrayStep()}, segments=tuple(
                 Segment(view.request_id, "main", new) for view, (_, new) in zip(case.views, case.rows, strict=True)
             ),
-            ctx=types.SimpleNamespace(replays=False, capture=False, graph_walk=PREFILL_TEXT),
+            ctx=types.SimpleNamespace(replays=False, capture=False, graph_walk=PREFILL_TEXT), combined_labels={},
         )
         for opened in (handle, bracket):
             opened.begin_step(step)

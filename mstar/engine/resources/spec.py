@@ -218,6 +218,14 @@ class NodeResourceSpec(ABC):
         settings."""
         return None
 
+    def capacity_problem(
+        self, requests: int, request: "ResourceReqConfig | None", axis_sizes: Sequence[Mapping[str, int]] = (),
+    ) -> str | None:
+        """Why this resource can't hold ``requests`` requests at once, each opened with ``request``, or None.
+        ``axis_sizes`` holds the size on every mesh axis of each node group that runs its nodes. None by default: a
+        resource that requests don't size holds any number."""
+        return None
+
     def prefix_variant(self, model_kwargs: dict) -> bytes | None:
         """What sets a request's KV on this resource apart from another's for the same
         tokens (a LongRoPE table picked per request), from the kwargs ``request_config``

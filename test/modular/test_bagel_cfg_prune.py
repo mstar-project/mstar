@@ -19,6 +19,7 @@ import types
 
 import pytest
 import torch
+from test_bagel_guidance_sink import _handles
 
 from mstar.conductor.request_info import DEFAULT_PARTITION, CurrentForwardPassInfo
 from mstar.engine.resources import KVStep, PositionStep
@@ -38,7 +39,7 @@ from mstar.model.bagel.submodules import (
     image_gen_phases,
     image_gen_timestep,
 )
-from mstar.model.submodule_base import ARNodeInputs
+from mstar.model.submodule_base import ARNodeInputs, engine_step
 
 IMAGE_GEN_LOOP = denoise_loop(IMAGE_GEN)
 
@@ -167,10 +168,12 @@ def test_pruned_combine_matches_the_old_combine(renorm, rmin, request_kind, dtyp
 
 
 def _llm() -> LLMSubmodule:
-    return LLMSubmodule(
+    llm = LLMSubmodule(
         language_model=types.SimpleNamespace(model=types.SimpleNamespace(embed_tokens=None), lm_head=None),
         llm2vae=None, vae2llm=None, time_embedder=None, latent_pos_embed=None, config=CONFIG,
     )
+    llm.bind_node_state(_handles(CONFIG))
+    return llm
 
 
 def _info(graph_walk: str = "image_gen", **fields) -> CurrentForwardPassInfo:
@@ -196,19 +199,18 @@ def _image_gen_row(span: int = 6) -> ARNodeInputs:
 ])
 def test_declared_step_plans_exactly_the_branches_run(walk, labels):
     span = 6
-    step = _llm().declare_step(walk, ["r0"], [_image_gen_row(span)])
+    step = engine_step(_llm(), graph_walk=walk, request_ids=["r0"], inputs=[_image_gen_row(span)])
     kv: KVStep = step.steps["kv"]
     rope: PositionStep = step.steps["rope"]
     assert tuple(seg.label for seg in kv.segments) == labels
     assert kv.commit is False
     assert rope.advance == (0,) * len(labels)
     if len(labels) > 1:
-        assert kv.combined_labels == {labels: LLMSubmodule.CFG_BATCHED_LABEL}
-        pos = rope.pos_ids[LLMSubmodule.CFG_BATCHED_LABEL]
-        assert pos.tolist() == [10 + i for i in range(len(labels)) for _ in range(span)]
+        assert kv.combined_labels == {labels: "+".join(labels)}
     else:
         assert not kv.combined_labels
-        assert rope.pos_ids["main"].tolist() == [10] * span
+    # one plan either way, so the ids are one tensor in the segments' order
+    assert rope.pos_ids.tolist() == [10 + i for i in range(len(labels)) for _ in range(span)]
     assert step.steps["attn"].causal is False
 
 

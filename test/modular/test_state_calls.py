@@ -25,6 +25,7 @@ from mstar.engine import state
 from mstar.engine.resources.attn.base import AttentionManager
 from mstar.engine.resources.recurrent.config import RecurrentStep
 from mstar.engine.resources.recurrent.pool import RecurrentStatePool
+from mstar.engine.resources.resident import build_planner
 from mstar.engine.resources.sampler import utils as sampler_utils
 from mstar.engine.resources.sampler.config import SamplerStep
 from mstar.engine.resources.sampler.resource import SamplerResource
@@ -659,10 +660,11 @@ def test_a_step_on_an_undeclared_label_raises():
              lambda: _begin(h, segments=[Segment(1, "cfg", TOKENS)]))
 
 
-def test_a_step_on_two_labels_of_one_array_has_no_layout_yet():
+def test_a_step_over_two_labels_that_isnt_label_major_has_no_layout_yet():
     h = _kv_handle(_array(labels={"main", "cfg"}))
-    _refused(r"Array 'kv': no layout yet: a step touches labels \['cfg', 'main'\]",
-             lambda: _begin(h, segments=[Segment(1, "main", TOKENS), Segment(1, "cfg", TOKENS)]))
+    segments = [Segment(1, "main", TOKENS), Segment(1, "cfg", TOKENS), Segment(2, "main", TOKENS)]
+    _refused(r"Array 'kv': no layout yet: segments name 'main', 'cfg', 'main'",
+             lambda: _begin(h, segments=segments, ctx=_ctx(rows=(1, 2))))
 
 
 def test_a_fork_on_an_undeclared_label_raises():
@@ -1365,6 +1367,13 @@ def test_a_read_on_a_value_with_only_host_fields_is_refused():
     _refused(r"Array 'host': no layout yet: read on a HostValueHandle", lambda: h.read(0))
 
 
+def test_a_write_on_a_value_with_only_host_fields_is_refused():
+    array = Value("host", nodes={"LLM"}, layers={0}, entry=Entry({}, host={"n": int}))
+    setup = StateSetup(host_fields=HostFields())
+    h = build_handle(array, {}, _resolve([array], setup), setup)
+    _refused(r"Array 'host': no layout yet: write on a HostValueHandle", lambda: h.write(0, n=torch.ones(1)))
+
+
 def test_set_start_on_an_array_that_isnt_a_value_is_refused():
     _refused(r"Array 'kv': no layout yet: set_start on a PagedArrayHandle",
              lambda: _kv_handle().set_start({"k": torch.ones(1)}))
@@ -1386,6 +1395,24 @@ def test_set_start_after_the_first_step_is_refused():
 def test_set_start_refuses_what_the_field_cant_hold(start, cause):
     h, _ = _plain_value()
     _refused(rf"Array 'state': {cause}", lambda: h.set_start(start))
+
+
+def test_a_pool_with_a_start_declines_resident_planning():
+    """A resident step reads each row's slot, which holds zeros until the row's first write, so a row with nothing
+    written would read zeros where it asked for its start."""
+    h, pool = _plain_value()
+    h.set_start({"x": torch.full((2, 3), 7.0)})
+    planner, why = build_planner("LLM", ("decode",), {"state": pool}, {}, torch.device("cpu"), 4)
+    assert planner is None and "start" in why, "the node would run resident steps that read zeros for the start"
+
+
+def test_a_second_handle_on_the_pool_can_not_change_its_start():
+    """A pool's rows all read one start, so a second handle can't change what the first one's rows read."""
+    h, pool = _plain_value()
+    h.set_start({"x": torch.full((2, 3), 7.0)})
+    other = build_handle(h.array, {"state": pool}, _resolve([h.array], StateSetup()))
+    other.set_start({"x": torch.full((2, 3), 7.0)})
+    _refused(r"a start that differs from the one it holds", lambda: other.set_start({"x": torch.full((2, 3), 8.0)}))
 
 
 def test_keep_false_on_a_plain_value_is_refused():

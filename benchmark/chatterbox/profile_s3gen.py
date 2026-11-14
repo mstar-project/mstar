@@ -266,13 +266,18 @@ def section_kernels(s3gen: S3Gen, ests: Estimators, device: str) -> list[str]:
     return lines
 
 
-def _rows_for(ref: ReferenceConditioning, n_rows: int, chunk_tokens: int, finalize: bool, device: str, seed: int):
+def _rows_for(s3gen: S3Gen, ref: ReferenceConditioning, n_rows: int, chunk_tokens: int, finalize: bool, device: str,
+              seed: int):
     g = torch.Generator(device=device).manual_seed(seed)
     vocab = 6561
+    ratio = s3gen.config.token_mel_ratio
     return [
         FlowRow(
             tokens=torch.randint(0, vocab, (chunk_tokens,), device=device, generator=g),
-            ref=ref, finalize=finalize, generator=torch.Generator(device=device).manual_seed(seed + i),
+            ref=ref, finalize=finalize, noise=s3gen.draw_noise(
+                1, ref.num_prompt_tokens * ratio, chunk_tokens * ratio,
+                torch.Generator(device=device).manual_seed(seed + i),
+            ),
         )
         for i in range(n_rows)
     ]
@@ -297,7 +302,7 @@ def section_solve(s3gen: S3Gen, ests: Estimators, ref: ReferenceConditioning, n_
              "bf16 graph ms | Δmel tf32 | Δmel bf16 | Δmel fp16 | mel corr bf16 | wav SNR bf16 dB",
              "--- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | ---"]
     for n_rows, chunk, final in plans:
-        rows = _rows_for(ref, n_rows, chunk, final, device, seed=7)
+        rows = _rows_for(s3gen, ref, n_rows, chunk, final, device, seed=7)
         set_tf32(False)
         today, _ = time_ms(functools.partial(s3gen.tokens_to_mel_rows, rows, n_timesteps=n_steps), iters=5, warmup=2)
         # the solve's inputs, built once the way tokens_to_mel_rows builds them
@@ -353,7 +358,7 @@ def _solve_inputs(s3gen: S3Gen, rows: list[FlowRow]):
         mel_prompt = ref.num_prompt_tokens * ratio
         valid = int(h_lens[i])
         cond[i, :, :mel_prompt] = ref.prompt_feat[0].transpose(0, 1)
-        noise[i, :, :valid] = s3gen._draw_noise(1, mel_prompt, valid - mel_prompt, row.generator)[0]
+        noise[i, :, :valid] = row.noise[0, :, :valid].to(noise.dtype)
     mask = length_mask(h_lens, total).unsqueeze(1).to(mu.dtype)
     return mu, mask, spk, cond, noise
 
@@ -463,7 +468,7 @@ def main() -> None:
         if "encoder" in wanted:
             report += section_encoder_vocoder(s3gen, ref, args.device, smoke=args.smoke) + [""]
         if "watermark" in wanted:
-            rows = _rows_for(ref, 1, 15 if args.smoke else 100, True, args.device, seed=3)
+            rows = _rows_for(s3gen, ref, 1, 15 if args.smoke else 100, True, args.device, seed=3)
             mel = s3gen.tokens_to_mel_rows(rows, n_timesteps=n_steps)[0]
             wav = s3gen.mel_to_wav(mel, generator=torch.Generator(device=args.device).manual_seed(0))[0]
             report += section_watermark(args.device, wav) + [""]

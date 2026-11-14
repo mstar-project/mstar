@@ -17,7 +17,7 @@ from torch import nn
 from transformers.activations import ACT2FN
 
 from mstar.distributed.communication import CommGroup
-from mstar.engine.resources.convenience import AttentionCallable
+from mstar.engine.state import add_read, rope
 from mstar.model.bagel.config import BagelModelConfig
 from mstar.model.components.distributed import (
     ColumnParallelLinear,
@@ -111,14 +111,11 @@ class BagelAttentionMoT(nn.Module):
         self.total_num_heads = config.num_attention_heads
         self.head_dim = self.hidden_size // self.total_num_heads
         self.max_position_embeddings = config.max_position_embeddings
-        self.rope_theta = config.rope_theta
         self.is_causal = config.is_causal
         self.attention_dropout = config.attention_dropout
-        # resources this layer calls, resolved at load; see
-        # components/attention.py and NodeSubmodule.bind_node_resources
-        self.attn = None
-        self.kv = None
-        self.pos = None
+        # the layer's id, a plain attribute that `.to(device)` leaves on the CPU, and its handle on the "kv" array
+        self.layer = torch.tensor(layer_idx, device="cpu")
+        self.state = None
 
         if (self.head_dim * self.total_num_heads) != self.hidden_size:
             raise ValueError(
@@ -188,12 +185,8 @@ class BagelAttentionMoT(nn.Module):
             v.view(-1, self.num_key_value_heads, self.head_dim),
         )
 
-    def bind_resources(self, resources: dict) -> None:
-        self.attn = resources["attn"]
-        self.kv = resources["kv"]
-        self.pos = resources["rope"]
-        # see Attention.bind_resources
-        self.attend = AttentionCallable(kv=self.kv, attn=self.attn)
+    def bind_state(self, handles: dict) -> None:
+        self.state = handles["kv"]
 
     def forward(
         self,
@@ -258,15 +251,8 @@ class BagelAttentionMoT(nn.Module):
                 **mot_kwargs,
             )
 
-        # RoPE: pos_ids planned from the step declaration before the LLM forward
-        query_states, key_states = self.pos.apply_qk(
-            query_states, key_states, label=self.attend.label,
-            rope_theta=self.rope_theta,
-        )
-
-        # Paged attention: the plan (page alloc, FlashInfer index tensors)
-        # was driven from the step declaration before the LLM forward
-        attn_output = self.attend(query_states, key_states, value_states)
+        query_states, key_states = rope(self.state, query_states, key_states)
+        attn_output = add_read(self.state, self.layer, query_states, k=key_states, v=value_states)
 
         attn_output = attn_output.reshape(-1, self.local_hidden_size)
 
@@ -415,7 +401,6 @@ class BagelLanguageModel(nn.Module):
     def forward(
         self,
         query_sequence: torch.Tensor,
-        label: str,
         mode="und",
         static_vae_idxs=None,
         vae_token_indexes=None,
@@ -435,12 +420,7 @@ class BagelLanguageModel(nn.Module):
                     static_vae_idxs=static_vae_idxs
                 )
 
-        # The label and layer index are cursors on the shared resources: bind
-        # the label once, advance the index per layer. Passing them as
-        # arguments instead would make inductor specialize on the int.
-        self.layers[0].self_attn.attend.bind_step(label)
-        for _layer_idx, decoder_layer in enumerate(self.layers):
-            decoder_layer.self_attn.attend.set_layer_idx(_layer_idx)
+        for decoder_layer in self.layers:
             query_sequence = decoder_layer(
                 query_sequence=query_sequence,
                 **extra_inputs,
@@ -502,7 +482,6 @@ class BagelForCausalLM(nn.Module):
     def forward(
         self,
         query_sequence: torch.Tensor,
-        label: str,
         mode="und",
         static_vae_idxs=True,
         vae_token_indexes=None,
@@ -513,7 +492,6 @@ class BagelForCausalLM(nn.Module):
         assert mode in ["und", "gen"]
         outputs = self.model(
             query_sequence=query_sequence,
-            label=label,
             mode=mode,
             vae_token_indexes=vae_token_indexes,
             text_indexes=text_indexes,

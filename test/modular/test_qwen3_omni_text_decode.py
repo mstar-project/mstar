@@ -102,7 +102,7 @@ def thinker():
     sub.bind_node_resources({THINKER_SAMPLER: SimpleNamespace(has_slot_masters=True)})
     sub.kv = SimpleNamespace(
         _check_open=lambda call: None, label="main", positions=None,
-        at_last_token=lambda h: h[-2:],
+        at_last_token=lambda h, label=None: h[-2:],
     )
     sub.sampler = _SamplerHandle()
     sub.get_device = lambda: torch.device("cpu")

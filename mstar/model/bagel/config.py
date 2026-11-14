@@ -4,6 +4,10 @@ from typing import Any
 # combined walk of the LLM's prefill_text and decode
 MIXED_TEXT = "mixed_text"
 
+# the declared state's names: the reads of the LLM's "kv" array and its sampler, and the ViT's array and its read
+ATTN, ATTN_IMAGE, SAMPLER = "attn", "attn_image", "sampler"
+VIT_TOKENS, VIT_ATTN = "vit_tokens", "vit_attn"
+
 
 @dataclass
 class BagelAutoEncoderConfig:

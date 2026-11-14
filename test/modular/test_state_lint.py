@@ -24,6 +24,7 @@ PORTED = (
     "mstar/model/canary_qwen", "mstar/model/qwen3_asr", "mstar/model/parakeet", "mstar/model/fish_s2_pro",
     "mstar/model/qwen3_tts",
     "mstar/model/pi05", "mstar/model/vjepa2", "mstar/model/canary", "mstar/model/components/encoder_decoder.py",
+    "mstar/model/bagel", "mstar/model/chatterbox", "mstar/model/whisper",
 )
 FORBIDDEN_ATTRIBUTES = {
     "node_resources", "resources", "request_state", "request_states", "per_request_states", "sequence_shard",
@@ -52,6 +53,18 @@ ALLOWED = {
 }
 # Where an allowed import may stand: the one file whose text says why. Any other ported file importing it fails.
 ALLOWED_ONLY_IN = {("mstar.engine.resources", "SeqShardSpec"): "mstar/model/minimax_h3/minimax_h3_model.py"}
+# Exceptions for one file, by file, module and name, which a later port of the same kind mustn't inherit.
+ALLOWED_IN: dict[tuple[str, str, str], str] = {
+    ("mstar/model/bagel/bagel_model.py", "mstar.engine.resources", "KVReqConfig"):
+        "per-node and publish labels under CFG parallel and P/D, until P/D labels",
+} | {
+    ("mstar/model/chatterbox/components/s3gen_graphs.py", module, name):
+        "S3Gen's own captures per shape, which hold no state"
+    for module, name in (
+        ("mstar.engine.accelerator_graph_backend", "CapturedGraph"),
+        ("mstar.engine.accelerator_graph_runner", "capture_into_graph"),
+    )
+}
 # Exceptions each scoped to one function and one attribute, by file, the function's qualified name in that file, and
 # the attribute: a graph break (`disable`) or a forbidden read the function may keep.
 ALLOWED_IN_FUNCTION = {
@@ -67,6 +80,10 @@ ALLOWED_IN_FUNCTION = {
         "the opt-in watermark's per-stream state, until it moves to a watermark node's plain Value (issue #1447)",
     ("mstar/model/wan22/components/dit.py", "_token_runs", "disable"):
         "the timestep runs of a rank's share of the tokens, read off the shard's range outside the DiT's guards",
+    ("mstar/model/bagel/components/vit_encoder.py", "BagelViTAttention.attend", "disable"):
+        "the ViT's eager varlen attention, flash-attn or a masked SDPA, which keeps no state",
+    ("mstar/model/bagel/submodules.py", "ViTEncoderSubmodule._replay_block_loop", "disable"):
+        "the ViT region's replay, which runs its captured graph; no state call sits behind it",
 }
 # what a module defines to be handed the node's built resources, rather than its handles (`bind_state`)
 RESOURCE_BINDS = {"bind_resources", "bind_node_resources"}
@@ -103,6 +120,8 @@ def _violations(source: str, path: str = "") -> tuple[list[str], set[tuple[str, 
                 key = (node.module, alias.name)
                 if key in ALLOWED and ALLOWED_ONLY_IN.get(key, path) == path:
                     used.add(key)
+                elif (path, *key) in ALLOWED_IN:
+                    used.add((path, *key))
                 else:
                     found.append(f"from {node.module} import {alias.name}")
         elif isinstance(node, ast.Import):
@@ -140,8 +159,16 @@ def test_every_exception_is_still_used():
     used = set()
     for path in _sources():
         used |= _violations(path.read_text(), str(path))[1]
-    excepted = ALLOWED.keys() | ALLOWED_IN_FUNCTION.keys()
+    excepted = ALLOWED.keys() | ALLOWED_IN.keys() | ALLOWED_IN_FUNCTION.keys()
     assert excepted <= used, f"delete these exceptions: {sorted(excepted - used)}"
+
+
+def test_an_exception_for_one_file_refuses_the_import_in_another(monkeypatch):
+    source = "from mstar.engine.resources import KVReqConfig"
+    entry = ("mstar/model/a/a.py", "mstar.engine.resources", "KVReqConfig")
+    monkeypatch.setitem(ALLOWED_IN, entry, "a's own")
+    assert _violations(source, "mstar/model/a/a.py") == ([], {entry})
+    assert _violations(source, "mstar/model/b/b.py")[0] == [source], "the exception would reach every ported package"
 
 
 @pytest.mark.parametrize("source, expected", [

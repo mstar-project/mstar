@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, get_origin
 
 import torch
 
-from mstar.engine.state.contract import Array, Block, Read, Sampler, SeqShard, is_value, read_layers
+from mstar.engine.state.contract import EMPTY, Array, Block, Read, Sampler, SeqShard, is_value, read_layers
 
 if TYPE_CHECKING:
     from mstar.model.base import Model
@@ -25,9 +25,11 @@ def state_declaration_problems(model: "Model") -> list[str]:
         return []
     arrays = [d for d in declarations if isinstance(d, Array)]
     problems = _name_problems(declarations)
-    walks = {walk: set(graph.get_nodes()) for walk, graph in model.get_graph_walk_graphs().items()}
+    graphs = model.get_graph_walk_graphs()
+    walks = {walk: set(graph.get_nodes()) for walk, graph in graphs.items()}
     nodes = sorted(set().union(*walks.values()))
-    combined = {walk for by_name in model.get_combined_graph_walks().values() for walk in by_name}
+    combined_by_node = model.get_combined_graph_walks()
+    combined = {walk for by_name in combined_by_node.values() for walk in by_name}
     for declared in declarations:
         problems += [
             f"{type(declared).__name__} {declared.name!r}.nodes: {node!r} is not a node of the model, which has "
@@ -36,10 +38,11 @@ def state_declaration_problems(model: "Model") -> list[str]:
         ]
     for array in arrays:
         problems += _read_problems(array, walks, combined)
+        problems += _combined_walk_problems(array, combined_walks(array, combined_by_node))
         problems += _array_problems(array)
     problems += _kv_label_problems(model.kv_labels(), arrays)
     problems += _cross_read_problems(arrays)
-    problems += _regrouping_problems(model, arrays)
+    problems += _regrouping_problems(model, arrays, graphs)
     problems += _value_problems(arrays, model.kv_labels())
     for declared in declarations:
         if isinstance(declared, Sampler):
@@ -52,6 +55,20 @@ def state_declaration_problems(model: "Model") -> list[str]:
 def position_key(array: Array) -> str:
     """The resource key of ``array``'s positions: ``thinker_pos`` for ``thinker_kv``, ``rope`` for any other name."""
     return f"{array.name.removesuffix('_kv')}_pos" if array.name.endswith("_kv") else "rope"
+
+
+def reads_differ_by_walk(array: Array) -> bool:
+    return any(read.walks is not None for read in array.reads.values())
+
+
+def runs_on_walk(read: Read, walk: str | None) -> bool:
+    """Whether ``read`` runs on ``walk``, as a read that names no walk runs on every one."""
+    return read.walks is None or walk in read.walks
+
+
+def combined_walks(array: Array, by_node: Mapping[str, Mapping[str, Collection[str]]]) -> dict[str, Collection[str]]:
+    """The combined walks of ``array``'s nodes, with the walks each batches, from each node's in ``by_node``."""
+    return {walk: members for node in sorted(array.nodes) for walk, members in by_node.get(node, EMPTY).items()}
 
 
 def host_field_holders(arrays: Iterable[Array]) -> list[Array]:
@@ -148,7 +165,13 @@ def _cross_read_problems(arrays: Sequence[Array]) -> list[str]:
     return problems
 
 
-def _regrouping_problems(model: "Model", arrays: Sequence[Array]) -> list[str]:
+def _regrouping_problems(model: "Model", arrays: Sequence[Array], graphs: Mapping[str, object]) -> list[str]:
+    # A keyed walk whose node reads another tensor than the keyed one is checked per request instead, before the data
+    # worker keys its spans (`PreprocessWorkerThread._check_whole_steps`).
+    whole = [
+        (array, key, read) for array in arrays for key, read in array.reads.items()
+        if read.mask.sees_step_whole
+    ]
     regrouped = [
         *((node, walk, "a chunking policy splits across steps", "leave it out of the policy")
           for node, policies in model.get_chunking_policies().items() for policy in policies if policy.chunkable
@@ -157,19 +180,30 @@ def _regrouping_problems(model: "Model", arrays: Sequence[Array]) -> list[str]:
                        "step", "leave it out of the label's keys")
           for array in arrays for label, kv_label in model.kv_labels().get(array.name, {}).items()
           if kv_label.keys is not None for node in array.nodes
-          for walk in (*kv_label.keys.walks, *(grown for grown, _ in kv_label.growth if kv_label.keys.growth))),
+          for walk in (
+              *(walk for walk in kv_label.keys.walks if _reads_input(graphs, walk, node, kv_label.keys.tensor)),
+              *(grown for grown, _ in kv_label.growth if kv_label.keys.growth),
+          )),
         *((node, walk, f"{node}'s rebuild policy runs it again with the ids sampled after the prompt",
            "drop the rebuild policy")
-          for node, policy in model.rebuild_policies().items() for walk in policy.walks),
+          # A rebuild reruns its steps as they ran, and only a walk that reads the ids input takes the ids sampled
+          # since.
+          for node, policy in model.rebuild_policies().items() if any(node in array.nodes for array, _, _ in whole)
+          for walk in policy.ids_walks(node, graphs)),
     ]
-    return [
+    # once per array, which several of its nodes may report
+    return list(dict.fromkeys(
         f"Array {array.name!r}.reads[{key!r}]: {type(read.mask).__name__} on walk {walk!r}, which {cause}. "
         f"{type(read.mask).__name__} sees each step's adds as a whole, so {fix}"
         for node, walk, cause, fix in regrouped
-        for array in arrays if node in array.nodes
-        for key, read in array.reads.items()
-        if read.mask.sees_step_whole and (read.walks is None or walk in read.walks)
-    ]
+        for array, key, read in whole if node in array.nodes and runs_on_walk(read, walk)
+    ))
+
+
+def _reads_input(graphs: Mapping[str, object], walk: str, node: str, tensor: str) -> bool:
+    """Whether ``node`` takes ``tensor`` as an input on ``walk``, or ``walk`` is no walk of the model."""
+    nodes = graphs[walk].get_nodes() if walk in graphs else {}
+    return walk not in graphs or (node in nodes and tensor in nodes[node].input_names)
 
 
 def _value_problems(arrays: Sequence[Array], kv_labels: Mapping[str, Mapping[str, object]]) -> list[str]:
@@ -277,6 +311,38 @@ def _read_problems(array: Array, walks: Mapping[str, set[str]], combined: set[st
     return problems
 
 
+def _combined_walk_problems(array: Array, combined: Mapping[str, Collection[str]]) -> list[str]:
+    """A combined walk's rows read by their own walks, and a combined step reads each layer for all its rows, with one
+    mask per resource."""
+    if not reads_differ_by_walk(array):
+        return []
+    problems: list[str] = []
+    for walk, members in sorted(combined.items()):
+        for layer in sorted(array.layers):
+            reads = [
+                (member, key, read.mask) for member in sorted(members) for key, read in array.reads.items()
+                if layer in read_layers(array, read) and runs_on_walk(read, member)
+            ]
+            clash = next(((a, b) for a in reads for b in reads if a[2] != b[2]), None)
+            if clash is not None:
+                (one, key, mask), (other, other_key, other_mask) = clash
+                problems.append(
+                    f"Array {array.name!r}: combined walk {walk!r} runs {one!r} through reads[{key!r}] "
+                    f"({type(mask).__name__}) and {other!r} through reads[{other_key!r}] ({type(other_mask).__name__}) "
+                    f"on layer {layer}; a combined step plans one mask per resource"
+                )
+                break
+            readers = {member for member, _, _ in reads}
+            if readers and readers != set(members):
+                problems.append(
+                    f"Array {array.name!r}: combined walk {walk!r} runs {min(readers)!r}, which reads layer {layer}, "
+                    f"and {min(set(members) - readers)!r}, which doesn't; a combined step reads each layer for all its "
+                    "rows"
+                )
+                break
+    return problems
+
+
 def deployment_problems(model: "Model", resources: Mapping[str, Mapping[str, object]]) -> list[str]:
     """What a deployment's ``resources:`` block asks of the declarations that they can't do: of a sampler, and of an
     array whose step writes its state itself."""
@@ -331,13 +397,35 @@ def split_read_problems(
     return problems
 
 
-def declaration_digest(declarations: Sequence[Array | Sampler | SeqShard]) -> str:
-    """A SHA-256 that matches across processes, which Python's `hash` doesn't, since it randomizes strings per process.
+def declaration_digests(
+    declarations: Sequence[Array | Sampler | SeqShard], kernel_settings: Mapping[str, Mapping[str, object]] = EMPTY,
+) -> dict[str, str]:
+    """Each declaration's SHA-256, by name, and with ``kernel_settings`` that of the hook's settings, under
+    ``kernel_settings()``, since a pool size can follow the deployment too. A SHA-256 matches across processes, as
+    Python's `hash` doesn't, since it randomizes strings per process.
 
-    Every field of every declaration goes in, with keys sorted and dtypes and classes by name.
+    Every field goes in, with keys sorted and dtypes and classes by name.
     """
-    ordered = sorted(declarations, key=lambda declared: declared.name)
-    return hashlib.sha256(json.dumps(_canonical(ordered), sort_keys=True).encode()).hexdigest()
+    digests = {declared.name: _sha256(declared) for declared in declarations}
+    if kernel_settings:
+        digests["kernel_settings()"] = _sha256(kernel_settings)
+    return digests
+
+
+def _sha256(value) -> str:
+    return hashlib.sha256(json.dumps(_canonical(value), sort_keys=True).encode()).hexdigest()
+
+
+def digest_mismatch(ours: Mapping[str, str], theirs: Mapping[str, str], *, here: str, there: str) -> str | None:
+    """None when the two processes built the same declarations, or which ones differ."""
+    differ = [
+        name if name in ours and name in theirs else f"{name} (only on the {here if name in ours else there})"
+        for name in sorted(ours.keys() | theirs.keys()) if ours.get(name) != theirs.get(name)
+    ]
+    if not differ:
+        return None
+    return (f"the {here} and the {there} declare different state: {', '.join(differ)}. A declaration that follows the "
+            "deployment reads it in get_worker_graphs, which every process calls before declare_state")
 
 
 def _canonical(value):

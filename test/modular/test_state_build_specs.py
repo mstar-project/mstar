@@ -175,6 +175,11 @@ def test_a_cross_read_array_on_the_value_nodes_does_not_stop_the_link():
     assert _by_key(_kv(), context, _gdn())["gdn"].config.kv_cache == "kv", "a context holds no row's own entries"
 
 
+def test_a_value_beside_an_array_whose_reads_differ_by_walk_links_to_its_pages():
+    by_walk = _kv(reads={"attn": _read(walks={"prefill"}), "attn_decode": _read(walks={"decode"})})
+    assert _by_key(by_walk, _gdn())["gdn"].config.kv_cache == "kv", "its pages hold each row's own entries"
+
+
 def test_a_value_specs_sit_on_the_value_nodes_not_the_pool_nodes():
     specs = _by_key(_kv(nodes={"llm", "audio"}), _gdn())
     assert specs["gdn"].nodes == specs["delta"].nodes == {"llm"}, "the state would be built where the value isn't"
@@ -277,7 +282,10 @@ _MIXED = _read(op=Attend(q_heads=4))
 # The array each refusal names, its declarations, and what the message says is missing.
 NO_LAYOUT = {
     "a read through no op": ("kv", lambda: [_kv(reads={"r": _read(op=None)})], "reads['r'].op"),
-    "a read of one walk": ("kv", lambda: [_kv(reads={"r": _read(walks={"decode"})})], "reads['r'].walks"),
+    "a cross read of one walk": ("ctx", lambda: [_kv(), Array(
+        "ctx", nodes={"llm"}, layers={2, 5, 7, 9}, entry=KVEntry(heads=4, head_dim=16), max_len=512,
+        reads={"x": _read(mask=Bidirectional(), queries="kv", walks={"decode"})},
+    )], "reads['x'].walks"),
     "a mask of no known name": ("kv", lambda: [_kv(reads={"r": _read(mask=_OtherMask())})], "reads['r'].mask"),
     "two query head counts": ("kv", lambda: [_kv(reads={"a": _read(layers={2}), "b": _MIXED})], "q_heads"),
     "no reads": ("kv", lambda: [_kv(reads={})], "reads is empty"),
@@ -323,7 +331,7 @@ NO_LAYOUT = {
                              updates={"delta": GatedDeltaNet()})],
         "entry",
     ),
-    "a value with a host field": ("gdn", lambda: [_kv(), _gdn(entry=_gdn_entry(host={"done": bool}))], "entry"),
+    "a value with a host field": ("gdn", lambda: [_kv(), _gdn(entry=_gdn_entry(host={"done": bool}))], "updates"),
     "a value with only a conv": ("gdn", lambda: [_kv(), _gdn(updates={"conv": CausalConv()})], "GatedDeltaNet"),
     "an update of another kernel": (
         "gdn", lambda: [_kv(), _gdn(updates={"delta": GatedDeltaNet(), "x": _OtherUpdate()})], "updates ['x']",

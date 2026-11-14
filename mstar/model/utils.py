@@ -3,13 +3,16 @@ import json
 import logging
 import os
 import re
-from collections.abc import Container
+from collections.abc import Container, Mapping
 from dataclasses import dataclass, field
 from functools import cached_property
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 import torch
+
+if TYPE_CHECKING:
+    from mstar.engine.state.contract import Layout
 
 # safetensors is imported where it is used: mstar.model.base imports this
 # module, and safetensors is not a core dependency.
@@ -709,17 +712,26 @@ def kv_pages(tokens: int, page_size: int, requests: int) -> int:
     return 1 + requests * -(-tokens // page_size)
 
 
-def check_kv_pools_fit(model, config: dict, config_path: str, log: logging.Logger) -> None:
-    """Refuse a ``max_concurrent_requests`` the model's KV caches cannot hold.
+def check_kv_pools_fit(
+    model, config: dict, config_path: str, log: logging.Logger,
+    request_layouts: "Mapping[str, Mapping[str, Layout]] | None" = None, loop_caps: Mapping[str, int] | None = None,
+) -> None:
+    """Refuse a ``max_concurrent_requests`` a resource the model builds cannot hold, as its
+    spec's `capacity_problem` answers: the first problem raises.
 
     A request keeps its pages from prefill to its last token. Past a pool, a
     prefill batch is refused. With host pages (``cpu_offload_pages``) the worker
     offloads decoding requests to admit it, which costs far more than queueing
     would. Without them it retries until requests time out. So the cap's requests
     at full length must fit each cache next to its sink page; the conductor
-    queues the rest. Warnings go to the model's ``log``.
+    queues the rest. Warnings go to the model's ``log``. ``request_layouts``
+    gives the `Layout` per array and label of the request the deployment is
+    sized for, with its loops at ``loop_caps``, and a pool it doesn't name
+    holds one stream of its ``max_seq_len``.
     """
-    from mstar.engine.resources import KVSpec, PagedKVConfig
+    from mstar.distributed.base import node_group_axis_sizes
+    from mstar.engine.resources import KVReqConfig
+    from mstar.engine.state.adapters import kv_layouts
     from mstar.model.base import serving_resources
 
     cap = config.get("max_concurrent_requests")
@@ -738,39 +750,21 @@ def check_kv_pools_fit(model, config: dict, config_path: str, log: logging.Logge
         specs = serving_resources(model, config)
     except ValueError:
         return  # a `resources:` block the validation's resource checks report
+    # each pool's config as the conductor opens the request, from the rows the data worker sends
+    requests: dict[str, KVReqConfig] = {}
+    for key, by_label in (kv_layouts(model.declare_state(), request_layouts, {}) if request_layouts else {}).items():
+        uncapped = {loop for layout in by_label.values() for loop, _ in layout.growth} - (loop_caps or {}).keys()
+        if uncapped:
+            raise ValueError(f"{config_path}: request_layouts[{key!r}] grows loops {sorted(uncapped)}, which loop_caps "
+                             "doesn't cap")
+        rows = {label: layout.row() for label, layout in by_label.items()}
+        requests[key] = KVReqConfig(needed_labels=list(rows))
+        requests[key].apply_conductor_config(kv_layout=rows, loop_caps=loop_caps)
+    node_groups = config.get("node_groups") or ()
     for spec in specs:
-        # paged caches only: a ring buffer is sized by its window, not by requests
-        if not isinstance(spec, KVSpec) or not isinstance(spec.config, PagedKVConfig):
-            continue
-        kv = spec.config
-        # in arena pages: a request at full length holds every token of every group, a window's
-        # too, since a one-step prefill keeps its whole prompt until it commits. A pool placed by
-        # position over a node group's ranks pages its window groups as `placed_groups` does
-        per_request = max(
-            sum(-(-kv.max_seq_len // group.page_size) for group in groups)
-            for groups in (kv.groups, *_placed_groups(spec, config.get("node_groups") or ()))
-        )
-        need = 1 + cap * per_request
-        if need > kv.num_units:
-            raise ValueError(
-                f"{config_path}: {cap} concurrent requests (max_concurrent_requests) "
-                f"need {kv.pages_of(need, round_up=True)} pages of resources.{spec.resource_key} "
-                f"({kv.pages_of(per_request, round_up=True)} per request and the sink page), "
-                f"which has {kv.max_num_pages}; raise max_num_pages or lower "
-                "max_concurrent_requests"
-            )
-
-
-def _placed_groups(spec, node_groups) -> list:
-    """The groups of ``spec``'s pool placed over each node group of ``node_groups`` it runs on,
-    where it sets ``context_parallel``; a group it can't place on is validation's to report."""
-    kv, placed = spec.config, []
-    for group in node_groups if kv.context_parallel else ():
-        if not spec.nodes & set(group.get("node_names", ())):
-            continue
-        try:
-            placed.append(kv.paged_for(spec.resource_key, group.get("tp_size", 1), group.get("sp_size", 1)).groups)
-        except ValueError:
-            pass
-    return placed
-
+        axis_sizes = [
+            node_group_axis_sizes(group) for group in node_groups if spec.nodes & set(group.get("node_names", ()))
+        ]
+        problem = spec.capacity_problem(cap, requests.get(spec.resource_key), axis_sizes)
+        if problem is not None:
+            raise ValueError(f"{config_path}: {problem}")

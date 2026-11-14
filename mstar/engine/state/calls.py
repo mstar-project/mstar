@@ -7,7 +7,7 @@ the graph: a compiled frame of a walk the shard never splits traces them straigh
 """
 
 from abc import abstractmethod
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -31,7 +31,7 @@ def pool_layers(array: Array) -> dict[int, int]:
 
 
 class ArrayHandle(StepHandle):
-    """A node's calls on one declared array. Each kind of storage has a handle that implements the calls it runs, and
+    """The calls on one declared array. Each kind of storage has a handle that implements the calls it runs, and
     this class refuses the rest as having no layout yet.
 
     ``layer`` is always the model's layer id as declared: the int, or a 0-d int64 CPU tensor holding it. A compiled
@@ -60,10 +60,11 @@ class ArrayHandle(StepHandle):
 
         self._pool_layer = pool_layers(array)
 
-        # This step's calls, checked in eager steps and at capture.
+        # This step's segments, and its calls, checked in eager steps and at capture.
         # `_held` is the k and v an add left for `_held_layer`'s read, on a kernel that takes them there.
         # `_kept` holds the layers whose kept add has run, `_scratch` those with a scratch add, `_read` those read,
         # and `_updated` the update calls run.
+        self._segments: Sequence[Segment] = ()
         self._open = False
         self._keep = True
         self._capturing = False
@@ -97,9 +98,9 @@ class ArrayHandle(StepHandle):
             raise self._refusal("a step began while another is open")
         self._open = True
         declared: ArrayStep = step.state[self.name]
-        segments = segments_of(declared, step)
-        if segments:
-            self.label = segments[0].label
+        self._segments = segments_of(declared, step) or ()
+        if self._segments:
+            self.label = self._segments[0].label
         # on a replay too, whose `eager_add` adds still run
         self._keep = declared.keep
         self._capturing = step.ctx.capture
@@ -110,7 +111,7 @@ class ArrayHandle(StepHandle):
             self._check_host_writes(declared, step.ctx)
         if step.ctx.replays:
             return
-        self._check_step(declared, segments or (), step.ctx)
+        self._check_step(declared, self._segments, step.ctx)
 
     def check_step(self, step) -> None:
         if step.ctx.replays or not self._keep:
@@ -140,7 +141,7 @@ class ArrayHandle(StepHandle):
             raise self._refusal(f"a step touches labels {sorted(labels - declared_labels)}, and the array declares "
                                 f"{sorted(declared_labels)}")
         if len(labels) > 1:
-            raise self._no_layout(f"a step touches labels {sorted(labels)}, and a plan holds one per call")
+            self._check_labels(labels, segments)
         forked = {label for fork in declared.forks for label in (fork.src, fork.dst)}
         if forked - declared_labels:
             raise self._refusal(f"a fork names labels {sorted(forked - declared_labels)}, and the array declares "
@@ -148,6 +149,10 @@ class ArrayHandle(StepHandle):
         if declared.advance is not None or declared.position_ids is not None:
             _positions(self, "a step sets advance or position_ids, and the array declares no positions")
         self._check_storage(declared, segments, ctx)
+
+    def _check_labels(self, labels: set[str], segments) -> None:
+        """Refuse a step over several ``labels`` unless this storage plans them as one."""
+        raise self._no_layout(f"a step touches labels {sorted(labels)}, and a plan holds one per call")
 
     @abstractmethod
     def _check_storage(self, declared: ArrayStep, segments, ctx) -> None:
@@ -229,20 +234,29 @@ class ArrayHandle(StepHandle):
 
     def set_start(self, start: Mapping[str, torch.Tensor]) -> None:
         """What a row of this Value reads while it has nothing written, has span 0 or pads a step: ``start``'s tensor
-        for each field it names, of one entry's shape on this rank, and zeros for the rest. The tensors are made at load
-        and never written, since a captured read keeps their address."""
+        for each field it names, of one entry's shape on this rank, and zeros for the rest. A resident step reads each
+        row's slot and not the start, so the node of a Value with a start stays host-planned
+        (`NodeSubmodule.resident_walks`). The tensors are made at load and never written, since a captured read keeps
+        their address."""
         raise self._unsupported("set_start")
 
     def block(self, field: str, layer: int) -> torch.Tensor:
         """``layer``'s view of the entry field ``field``, for an update's op."""
         raise self._unsupported("block")
 
-    def at_last_token(self, x: torch.Tensor) -> torch.Tensor:
+    def at_last_token(self, x: torch.Tensor, *, label: str | None = None) -> torch.Tensor:
         raise self._unsupported("at_last_token")
 
     def takes_fused(self, op: "StateOp") -> bool:
         """Whether ``op``'s fused kernel writes this array itself, in place of its reference running the calls."""
         return False
+
+    def _check_capture(self, walks: Collection[str]) -> None:
+        """Raise if a capture replayed on ``walks`` would plan this array's reads differently on some of them."""
+
+    def _step_ops(self, walk: str | None) -> Iterable[tuple[str, Any]]:
+        """The bound ops whose steps a step on ``walk`` builds, each with the resource key its step goes under."""
+        return ((bound.key, bound) for bound in self._bindings)
 
     def _kernel_setting(self, read: str, field: str) -> Any:
         if read not in self.reads:
@@ -266,7 +280,7 @@ class ArrayHandle(StepHandle):
 
 
 class SamplerHandle(StepHandle):
-    """A node's calls on one declared sampler. Its rows are the step's, padding included."""
+    """The calls on one declared sampler. Its rows are the step's, padding included."""
 
     def __init__(self, sampler: Sampler, resource: Any):
         self.sampler = sampler
@@ -460,9 +474,10 @@ def drew(s: SamplerHandle, n: int) -> None:
 
 # Eager as a whole, as `AttentionManager.select_last_hidden` explains.
 @torch.compiler.disable
-def at_last_token(h: ArrayHandle, x: torch.Tensor) -> torch.Tensor:
-    """``x`` at each row's last token in this step, in row order."""
-    return h.at_last_token(x)
+def at_last_token(h: ArrayHandle, x: torch.Tensor, *, label: str | None = None) -> torch.Tensor:
+    """``x`` at the last token of each (row, label) the step touches on ``h``, in segment order; with ``label``, only
+    that label's, in row order. On a step over one label both are each row's last token, in row order."""
+    return h.at_last_token(x, label=label)
 
 
 def last_sampled(s: SamplerHandle) -> torch.Tensor:

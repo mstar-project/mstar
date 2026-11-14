@@ -19,20 +19,18 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 # ---------------------------------------------------------------------------
-# Resource keys and KV labels (T3 node)
+# Declared state and KV labels (T3 and S3Gen nodes)
 # ---------------------------------------------------------------------------
 T3_KV = "t3_kv"
 T3_ATTN = "t3_attn"
 T3_POS = "t3_pos"
 T3_SAMPLER = "t3_sampler"
+S3GEN_STREAM = "s3gen_stream"
 
-# The conditional stream, the unconditional (text-less) stream classifier-free
-# guidance reads beside it, and the plan label the two are packed under when a
-# step runs both through one attention call (label-major: all ``main`` rows,
-# then all ``uncond`` rows).
+# The conditional stream and the unconditional (text-less) stream
+# classifier-free guidance reads beside it.
 COND_LABEL = "main"
 UNCOND_LABEL = "uncond"
-CFG_LABEL = "cfg"
 
 # Node names
 VOICE_ENCODER_NODE = "voice_encoder"

@@ -1,19 +1,17 @@
 """Whisper text decoder built on the shared mstar components.
 
 The decoder is a standard pre-norm transformer with three sublayers per
-block: causal self-attention (paged KV cache via the engine resources),
-cross-attention over the audio encoder's output, and a plain GELU FFN.
+block: causal self-attention over a paged KV array, cross-attention over
+the audio encoder's output, and a plain GELU FFN.
 
 Whisper has no RoPE — positions are a learned ``embed_positions`` table,
-looked up on the position ids the position resource plans for the step
-— so the self-attention layers bind no position resource
-(``pos_key=None``).
+looked up on the position ids the array plans for the step — so the
+self-attention layers rotate nothing (``pos_key=None``).
 
 Cross-attention K/V depend only on the (static) encoder output, so they
-are computed once per request at prefill (``write_cross_kv``) and written
-into the context KV stream the cross-attention resource attends. Every
-later step declares a zero-span segment on that label and runs the
-planned wrapper — nothing is recomputed or rewritten.
+are computed once per request at prefill and added to the context array
+(``add_context``). Every later step declares a zero-span segment on that
+array and reads it — nothing is recomputed or rewritten.
 
 HF checkpoint quirks handled here:
   * ``self_attn.out_proj`` → ``self_attn.o_proj`` (name_remapper in
@@ -30,18 +28,11 @@ from torch import nn
 
 from mstar.distributed.communication import CommGroup
 from mstar.model.components.distributed.attention import ParallelAttention, ParallelCrossAttention
-from mstar.model.whisper.config import (
-    ATTN,
-    CONTEXT_LABEL,
-    CROSS_ATTN,
-    CROSS_KV_CACHE,
-    KV_CACHE,
-    WhisperModelConfig,
-)
+from mstar.model.whisper.config import CROSS_KV_CACHE, KV_CACHE, WhisperModelConfig
 
 
 class WhisperDecoderLayer(nn.Module):
-    def __init__(self, config: WhisperModelConfig, comm_group: CommGroup | None = None):
+    def __init__(self, config: WhisperModelConfig, layer: int, comm_group: CommGroup | None = None):
         super().__init__()
         self.self_attn_layer_norm = nn.LayerNorm(config.d_model)
         self.self_attn = ParallelAttention(
@@ -52,10 +43,10 @@ class WhisperDecoderLayer(nn.Module):
             head_dim=config.head_dim,
             qkv_bias=True,
             o_bias=True,
-            attn_key=ATTN,
             kv_key=KV_CACHE,
             # learned absolute positions, added at embedding time
             pos_key=None,
+            layer=layer,
         )
         self.encoder_attn_layer_norm = nn.LayerNorm(config.d_model)
         # Whisper's bias layout is the shared default (q/v/o biased, k not).
@@ -64,9 +55,9 @@ class WhisperDecoderLayer(nn.Module):
             hidden_size=config.d_model,
             num_heads=config.decoder_attention_heads,
             head_dim=config.head_dim,
-            cross_key=CROSS_ATTN,
             context_kv_key=CROSS_KV_CACHE,
             num_kv_heads=config.decoder_attention_heads,
+            layer=layer,
         )
         self.final_layer_norm = nn.LayerNorm(config.d_model)
         self.fc1 = nn.Linear(config.d_model, config.decoder_ffn_dim)
@@ -96,7 +87,7 @@ class WhisperDecoderModel(nn.Module):
         self.embed_tokens = nn.Embedding(config.vocab_size, config.d_model)
         self.embed_positions = nn.Embedding(config.max_target_positions, config.d_model)
         self.layers = nn.ModuleList(
-            [WhisperDecoderLayer(config, comm_group=comm_group) for _ in range(config.decoder_layers)]
+            [WhisperDecoderLayer(config, layer, comm_group=comm_group) for layer in range(config.decoder_layers)]
         )
         self.layer_norm = nn.LayerNorm(config.d_model)
 
@@ -114,29 +105,21 @@ class WhisperDecoderModel(nn.Module):
     ) -> torch.Tensor:
         """Token + learned position embeddings.
 
-        ``position_ids`` is the position resource's plan for this step — under
-        a captured graph it is the slot's static buffer, so the lookup rides
-        inside the capture instead of being staged as an embedding.
+        ``position_ids`` is the array's plan for this step — under a captured
+        graph it is the slot's static buffer, so the lookup rides inside the
+        capture instead of being staged as an embedding.
         """
         embeds = self.embed_tokens(input_ids)
         if self.config.scale_embedding:
             embeds = embeds * (self.config.d_model ** 0.5)
         return embeds + self.embed_positions(position_ids[:input_ids.shape[0]])
 
-    def write_cross_kv(self, encoder_states: torch.Tensor) -> None:
-        """Project the encoder output to per-layer K/V and write it into the
-        context stream the cross-attention resource attends.
-
-        Called once per request, from the prefill forward, under a step that
-        declared a ``CONTEXT_LABEL`` segment spanning the encoder output. For
-        a batch, ``encoder_states`` is the requests' outputs concatenated in
-        the step's segment order.
-        """
-        for layer_idx, layer in enumerate(self.layers):
-            cross_attn = layer.encoder_attn
-            k, v = cross_attn.compute_kv(encoder_states)
-            cross_attn.context_kv.set_default_layer_idx(layer_idx)
-            cross_attn.context_kv.write_kv(k, v, label=CONTEXT_LABEL)
+    def add_context(self, encoder_states: torch.Tensor) -> None:
+        """Project the encoder output to per-layer K/V and add it to the
+        context array; for a batch, the requests' outputs concatenated in
+        the step's segment order."""
+        for layer in self.layers:
+            layer.encoder_attn.add_context(encoder_states)
 
     def lm_head(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # proj_out is tied to embed_tokens in the HF checkpoint.
@@ -153,10 +136,8 @@ class WhisperDecoderModel(nn.Module):
         resources, returning the cross-attention probabilities of the given
         ``(layer, head)`` pairs: ``(len(heads), len(tokens), enc_len)``.
 
-        The served decoder's own projections, called as modules so a LoRA
-        delta bound to one adds to the align step's rows (its one segment),
-        applied with plain causal self-attention and an explicit softmax over
-        the encoder positions.
+        The served decoder's own projections, applied with plain causal
+        self-attention and an explicit softmax over the encoder positions.
         That is the alignment signal word-level timestamps are read from
         (:mod:`.alignment`); one request at a time, so it stays eager.
         """
@@ -204,23 +185,8 @@ class WhisperDecoderModel(nn.Module):
         del enc_len
         return torch.stack(out) if out else torch.zeros(0, num_tokens, encoder_states.shape[0], device=tokens.device)
 
-    def forward(
-        self,
-        input_embeds: torch.Tensor,
-        *,
-        label: str,
-    ) -> torch.Tensor:
+    def forward(self, input_embeds: torch.Tensor) -> torch.Tensor:
         hidden_states = input_embeds
-        # The label and layer index are cursors on the shared resources: bind
-        # the label once, advance the index per layer. Passing them as
-        # arguments instead would make inductor specialize on the int. Both
-        # caches need the index: the self-attention's and the (separate)
-        # encoder-context one.
-        self.layers[0].self_attn.attend.bind_step(label)
-        self.layers[0].encoder_attn.bind_step(label)
-        for layer_idx, layer in enumerate(self.layers):
-            layer.self_attn.attend.set_layer_idx(layer_idx)
-            layer.encoder_attn.set_layer_idx(layer_idx)
+        for layer in self.layers:
             hidden_states = layer(hidden_states)
-        # the advance is the runner's now, off the step declaration
         return self.layer_norm(hidden_states)

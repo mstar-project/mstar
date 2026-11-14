@@ -41,34 +41,30 @@ adapter lifts those into ``language`` / ``segments``.
 import logging
 from collections.abc import Mapping
 from pathlib import Path
+from typing import Any
 
 import torch
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.engine.resources import (
-    AttentionConfig,
-    AttentionSpec,
-    CrossAttentionConfig,
-    CrossAttentionSpec,
-    KVSpec,
-    LoopbackState,
-    NodeResourceSpec,
-    PagedKVConfig,
-    PositionConfig,
-    PositionSpec,
-    ResourceReqConfig,
-    SamplerSpec,
+from mstar.engine.state import (
+    Array,
+    Attend,
+    Bidirectional,
+    Causal,
+    Entry,
+    KVEntry,
+    Layout,
+    Positions,
+    Read,
+    Sampler,
+    SampleSettings,
+    Span,
+    TensorType,
+    Value,
 )
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, Sequential, TensorPointerInfo
-from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
-from mstar.model.base import (
-    KVLabel,
-    LabelLayout,
-    Model,
-    ProcessPromptOutput,
-    Span,
-    WalkStep,
-)
+from mstar.graph.special_destinations import EMIT_TO_CLIENT
+from mstar.model.base import KVLabel, Model, ProcessPromptOutput, WalkStep
 from mstar.model.components.audio_features import LogMelSpectrogram
 from mstar.model.components.request_kwargs import (
     GREEDY_SAMPLING,
@@ -81,7 +77,7 @@ from mstar.model.components.request_kwargs import (
 from mstar.model.submodule_base import NodeSubmodule
 from mstar.model.utils import ByteLevelDetokenizer, TextOutput, check_kv_pools_fit, kv_pages
 from mstar.model.whisper.components import alignment
-from mstar.model.whisper.components.timestamps import inactive_state
+from mstar.model.whisper.components.timestamps import STATE_SIZE
 from mstar.model.whisper.config import (
     ALIGN_WALK,
     ATTN,
@@ -91,14 +87,14 @@ from mstar.model.whisper.config import (
     DECODE_LOOP,
     DECODE_WALK,
     DECODER_NODE,
+    DECODER_STATE,
     DETECT_LANGUAGE_WALK,
     ENCODER_NODE,
     KV_CACHE,
-    POS,
+    PAGE_TOKENS,
     PREFILL_PROMPT_WALK,
     PREFILL_WALK,
     SAMPLER,
-    TS_RULES,
     WORDS_MARKER,
     WhisperModelConfig,
 )
@@ -172,8 +168,9 @@ class WhisperModel(Model):
     # The API server decodes uploads and stages their tensors with small CPU
     # ops; a thread per core spins between them and starves its event loop.
     PREPROCESS_TORCH_THREADS = 4
-    # Mel frames that carry audio, set by ``process_prompt`` for the align walk
-    INTERNAL_KWARGS = ("audio_frames",)
+    # Set by ``process_prompt`` for the align walk: the mel frames that carry
+    # audio, and where the transcript and a detected language sit in its row
+    INTERNAL_KWARGS = ("audio_frames", "transcript_start", "language_slot")
     # Set from the deployment by validate_config_yaml: the align walk re-runs
     # the decoder unsharded, so word timestamps need tp_size 1.
     _decoder_tp_size = 1
@@ -209,91 +206,63 @@ class WhisperModel(Model):
         self._submodule_cache: dict[str, NodeSubmodule | None] = {}
 
     # -------------------------------------------------------------------
-    # Model ABC: resources
+    # Model ABC: state
     # -------------------------------------------------------------------
 
-    def get_node_resources(self) -> list[NodeResourceSpec]:
-        """Decoder self-attention KV + a separate encoder-context KV.
+    def declare_state(self) -> list[Array | Sampler]:
+        """Decoder self-attention KV, a separate encoder-context KV, and each
+        request's decoder state.
 
         Two caches rather than two labels on one: the self-attention resource
         plans a wrapper per label of the cache it names, so a shared cache
         would have it planning the 1500-token context every step for nothing.
-        ``audio_encoder`` holds no resources.
+        ``audio_encoder`` holds no state.
         """
-        page_size = 128
-        requests = self.MAX_CONCURRENT_REQUESTS
-        # Sequences cap at max_target_positions (448) = 4 pages per request.
-        kv_config = PagedKVConfig(
-            num_layers=self.config.decoder_layers,
-            num_kv_heads=self.config.decoder_attention_heads,
-            head_dim=self.config.head_dim,
-            max_seq_len=self.config.max_target_positions,
-            num_qo_heads=self.config.decoder_attention_heads,
-            page_size=page_size,
-            max_num_pages=kv_pages(
-                self.config.max_target_positions, page_size, requests,
-            ),
-        )
-        # The fixed 30 s window is max_source_positions (1500) tokens = 12
-        # pages per request, held from prefill to the last token; 769 pages at
-        # ~15 GiB for large-v3.
-        context_kv_config = PagedKVConfig(
-            num_layers=self.config.decoder_layers,
-            num_kv_heads=self.config.decoder_attention_heads,
-            head_dim=self.config.head_dim,
-            max_seq_len=self.config.max_source_positions,
-            num_qo_heads=self.config.decoder_attention_heads,
-            page_size=page_size,
-            max_num_pages=kv_pages(
-                self.config.max_source_positions, page_size, requests,
-            ),
-        )
-        nodes = {DECODER_NODE}
+        c = self.config
+        kv = KVEntry(heads=c.decoder_attention_heads, head_dim=c.head_dim)
+        attend = Attend(q_heads=c.decoder_attention_heads)
+        layers = frozenset(range(c.decoder_layers))
+        capabilities = sampler_capabilities(self.sampling_defaults)
         return [
-            KVSpec(resource_key=KV_CACHE, nodes=nodes, config=kv_config),
-            # Whisper is MHA: the CUDA-core decode kernel beats the
-            # tensor-core one, which pads one query head per KV head to a tile
-            AttentionSpec(
-                resource_key=ATTN, nodes=nodes,
-                config=AttentionConfig(kv_cache=KV_CACHE, decode_tensor_cores=False),
-            ),
-            KVSpec(
-                resource_key=CROSS_KV_CACHE, nodes=nodes,
-                config=context_kv_config,
-            ),
-            CrossAttentionSpec(
-                resource_key=CROSS_ATTN, nodes=nodes,
-                config=CrossAttentionConfig(
-                    kv_cache=CROSS_KV_CACHE,
-                    query_kv_cache=KV_CACHE,
-                    context_label=CONTEXT_LABEL,
-                    decode_tensor_cores=False,
-                ),
-            ),
-            PositionSpec(
-                resource_key=POS, nodes=nodes,
-                # No RoPE: this exists for the position counter, whose planned
-                # ids drive the learned ``embed_positions`` lookup.
-                config=PositionConfig(kv_cache=KV_CACHE),
-            ),
-            SamplerSpec(
-                resource_key=SAMPLER, nodes=nodes,
-                vocab_size=self.config.vocab_size,
-                # ASR decodes greedily; without the capability a request
-                # penalty or min_p is refused at admission.
-                **sampler_capabilities(self.sampling_defaults),
-                # the decode loop's timestamp rule state, kept by slot
-                loopback_state={TS_RULES: LoopbackState(
-                    width=len(inactive_state()), dtype=torch.long, default=tuple(inactive_state()),
-                )},
+            # No RoPE: the counter's planned ids drive the learned ``embed_positions`` lookup.
+            Array(KV_CACHE, nodes={DECODER_NODE}, layers=layers, entry=kv, max_len=c.max_target_positions,
+                  positions=Positions(), reads={ATTN: Read(mask=Causal(), op=attend)}),
+            Array(CROSS_KV_CACHE, nodes={DECODER_NODE}, layers=layers, entry=kv, max_len=c.max_source_positions,
+                  labels={CONTEXT_LABEL},
+                  reads={CROSS_ATTN: Read(mask=Bidirectional(), op=attend, queries=KV_CACHE)}),
+            # The transcript holds each sampled token at the position it is fed back at, so the token sampled at
+            # the last position sits one past it.
+            Value(DECODER_STATE, nodes={DECODER_NODE}, layers=frozenset({0}), entry=Entry({
+                "ts_rules": TensorType((STATE_SIZE,), dtype=torch.long),
+                "transcript": TensorType((c.max_target_positions + 1,), dtype=torch.long),
+            })),
+            # ASR decodes greedily; without the capability a request penalty or min_p is refused at admission.
+            Sampler(
+                SAMPLER, nodes={DECODER_NODE}, vocab_size=c.vocab_size,
+                penalty=capabilities["enable_repetition_penalty"], min_p=capabilities["enable_min_p"],
             ),
         ]
 
+    def kernel_settings(self) -> dict[str, dict[str, Any]]:
+        requests = self.MAX_CONCURRENT_REQUESTS
+        return {
+            # Whisper is MHA: the CUDA-core decode kernel beats the
+            # tensor-core one, which pads one query head per KV head to a tile
+            ATTN: {"decode_tensor_cores": False},
+            CROSS_ATTN: {"decode_tensor_cores": False},
+            # 448 positions are 4 pages a request. The 30 s window's 1500
+            # tokens are 12, held from prefill to the last token; 769 pages at
+            # ~15 GiB for large-v3.
+            KV_CACHE: {"max_num_pages": kv_pages(self.config.max_target_positions, PAGE_TOKENS, requests)},
+            CROSS_KV_CACHE: {"max_num_pages": kv_pages(self.config.max_source_positions, PAGE_TOKENS, requests)},
+        }
+
     def get_request_resource_configs(
         self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
-    ) -> dict[str, ResourceReqConfig]:
+    ) -> dict[str, SampleSettings]:
         del input_modalities, output_modalities
-        return {SAMPLER: sampling_config(self.sampling_defaults, model_kwargs)}
+        config = sampling_config(self.sampling_defaults, model_kwargs)
+        return {SAMPLER: SampleSettings(**{key: getattr(config, key) for key in SAMPLING_KEYS})}
 
     def request_kwargs(self) -> frozenset[str]:
         return frozenset({
@@ -318,9 +287,8 @@ class WhisperModel(Model):
                 if group.get("graph_walks") is None or walk in group["graph_walks"]
             ))
 
-        # the align walk reads the first token and detected language the
-        # prompt walks' stop check recorded, and the decode walk's tokens, in
-        # the decoder's worker-local request state
+        # the align walk reads the transcript the other walks wrote to their
+        # worker's decoder state, which doesn't move between workers
         walks = (PREFILL_WALK, DETECT_LANGUAGE_WALK, PREFILL_PROMPT_WALK, DECODE_WALK, ALIGN_WALK)
         served = {walk: serving(walk) for walk in walks}
         if len(set(served.values())) > 1:
@@ -352,8 +320,6 @@ class WhisperModel(Model):
                     output_modality="text",
                     persist=True,
                 ),
-                # the timestamp rule state the first decode step continues from
-                GraphEdge(next_node=EMPTY_DESTINATION, name="ts_rules", persist=True),
             ]
 
         def encoder_then_decoder() -> GraphSection:
@@ -381,17 +347,15 @@ class WhisperModel(Model):
             name=DECODE_LOOP,
             section=GraphNode(
                 name=DECODER_NODE,
-                input_names=["text_inputs", "ts_rules"],
+                input_names=["text_inputs"],
                 outputs=[
                     # The sampled token loops back as the next input and goes to
-                    # the client; the rule state it advanced loops back too. The
-                    # node keeps both on the device by sampler slot and the
-                    # worker sends the batch's tokens inline, one frame a step,
-                    # so a decode step stores no tensor per request (the client
-                    # joins the text chunks; the align walk reads the tokens the
-                    # decoder recorded, see its `_token_stops`).
+                    # the client. The node keeps it on the device by sampler
+                    # slot and the worker sends the batch's tokens inline, one
+                    # frame a step, so a decode step stores no tensor per
+                    # request (the client joins the text chunks; the align walk
+                    # reads the transcript off the decoder state).
                     GraphEdge(next_node=DECODER_NODE, name="text_inputs"),
-                    GraphEdge(next_node=DECODER_NODE, name="ts_rules"),
                     GraphEdge(next_node=EMIT_TO_CLIENT, name="text_inputs", output_modality="text"),
                 ],
             ),
@@ -437,9 +401,8 @@ class WhisperModel(Model):
             )
         # What the decoder needs about the forced prompt, read as ``process_prompt``
         # reads it: any truthy ``timestamps`` (True, "word", "segment") omits
-        # <|notimestamps|>. With word timestamps the stop check keeps a prompt walk's
-        # token for the align walk.
-        prompt = {"timestamps": bool(model_kwargs.get("timestamps", False)), "word_timestamps": word_timestamps}
+        # <|notimestamps|>.
+        prompt = {"timestamps": bool(model_kwargs.get("timestamps", False))}
         if input_signals.get("prompt_tail"):
             # ``process_prompt`` holds the prompt's tail back when the language is
             # to be detected: the detected language token leads it in the second walk
@@ -455,16 +418,19 @@ class WhisperModel(Model):
         if self.get_max_output_tokens(**model_kwargs) > 1:
             plan.append(WalkStep(DECODE_WALK, bind={"text_inputs": "new_token"}))
         if word_timestamps:
-            # The transcript the decoder recorded, aligned against the persisted encoder
+            # The transcript the decoder state keeps, aligned against the persisted encoder
             # output under the forced prompt. Its tokens are resolved here, not read off
             # the prompt tensor on the GPU thread (a D2H sync); a detected language is
-            # the decoder's own record.
+            # in the decoder state too.
             language = model_kwargs.get("language")
             plan.append(WalkStep(ALIGN_WALK, step_metadata={
                 "language": None if language is None else self.config.language_token(language),
                 "task": self.config.task_token(model_kwargs.get("task", "transcribe")),
-                # how much of the window carries audio
+                # how much of the window carries audio, and where its transcript row
+                # holds the transcript and a detected language
                 "audio_frames": model_kwargs.get("audio_frames"),
+                "transcript_start": model_kwargs.get("transcript_start"),
+                "language_slot": model_kwargs.get("language_slot"),
             }))
         return plan
 
@@ -544,19 +510,23 @@ class WhisperModel(Model):
                 Span("rows", PREFILL_PROMPT_WALK, 1 + len(tail), 1 + len(tail), "prompt_tail"),
             )
             encoder_walk = DETECT_LANGUAGE_WALK
+            language_slot, transcript_start = len(prompt_ids), len(prompt_ids) + 1 + len(tail)
         else:
             spans = (Span("ids", PREFILL_WALK, len(prompt_ids), len(prompt_ids), "text_inputs"),)
             encoder_walk = PREFILL_WALK
-        kv_layout = {
-            KV_CACHE: {"main": LabelLayout(spans=spans, growth=((DECODE_LOOP, 1),))},
-            CROSS_KV_CACHE: {CONTEXT_LABEL: LabelLayout(
+            language_slot, transcript_start = None, len(prompt_ids)
+        state_layout = {
+            KV_CACHE: {"main": Layout(spans=spans, growth=((DECODE_LOOP, 1),))},
+            CROSS_KV_CACHE: {CONTEXT_LABEL: Layout(
                 spans=(Span("rows", encoder_walk, context, context, "encoder_states"),),
             )},
         }
         return ProcessPromptOutput(out, {
-            "kv_layout": kv_layout,
+            "state_layout": state_layout,
             # mel frames that carry audio, word timestamps align within them
             "audio_frames": self.log_mel.num_frames(window.numel()),
+            "transcript_start": transcript_start,
+            "language_slot": language_slot,
         })
 
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:

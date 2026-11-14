@@ -512,16 +512,29 @@ def _qwen3_tts() -> ModelSpec:
 
 
 def _chatterbox() -> ModelSpec:
+    from mstar.engine.state.adapters import node_handles
+    from mstar.model.chatterbox.chatterbox_model import ChatterboxModel
+    from mstar.model.chatterbox.config import T3_ATTN, T3_KV, T3_NODE, T3_POS, T3_SAMPLER
     from mstar.model.submodule_base import engine_step
 
+    def bind(sub, lengths, rope=None):
+        """``sub``'s handles on T3's declared state, over the SDPA stub and ``rope``."""
+        declaring = object.__new__(ChatterboxModel)
+        declaring.config = sub.config
+        sub.bind_node_state(node_handles(declaring, T3_NODE, {
+            T3_KV: _Unread(), T3_ATTN: _AttendCore(lengths), T3_POS: _Positions(rope), T3_SAMPLER: None,
+        }))
+
     def run(sub, ids, lengths, rope=None):
-        _stub_attention(sub.model, lengths, rope)
-        hidden = sub.model.hidden(sub.model.speech_emb(ids), label="main")
+        bind(sub, lengths, rope)
+        with _step_over(sub, lengths, T3_KV):
+            hidden = sub.model.hidden(sub.model.speech_emb(ids))
         return sub.model.logits(_last(hidden, lengths)).float()
 
     def declare(sub, rids, ids):
         from mstar.model.submodule_base import ARNodeInputs
 
+        bind(sub, [len(i) for i in ids])
         # without guidance, a row per request (the CPU test covers guidance's two)
         return engine_step(sub, "prefill", rids, [
             ARNodeInputs(input_seq_len=len(i), input_embeds=sub.model.speech_emb(i), resource_step_info=False)
