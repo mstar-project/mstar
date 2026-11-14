@@ -769,6 +769,9 @@ class Wan22VaeDecoderSubmodule(_Fp32IslandMixin, NodeSubmodule):
     runs on the Wan2.2-VAE Blackwell kernels (``mstar.model.components.wan22_vae_kernel``)
     where they can run, at any size and with nothing compiled; elsewhere the knob is
     ignored with one log line.
+
+    With ``config.vae_decode_tiny`` (opt-in, lossy) every decode runs a tiny VAE
+    (``mstar.model.components.taehv_decoder``) on the DiT's latents instead.
     """
 
     disable_torch_compile = True
@@ -791,6 +794,13 @@ class Wan22VaeDecoderSubmodule(_Fp32IslandMixin, NodeSubmodule):
         # built on the first decode, on the device it runs on; None after a refusal is logged
         self._kernel = None
         self._kernel_refused = not config.vae_decode_kernel
+        self._tiny = None
+        if config.vae_decode_tiny:
+            from mstar.model.components.taehv_decoder import TinyWanDecoder
+
+            # a submodule, so it moves to the node's device with the VAE; bf16, as its quality was measured
+            self._tiny = TinyWanDecoder.load(config.vae_decode_tiny).to(torch.bfloat16)
+            logger.info("Wan2.2 VAE decode: the tiny VAE %s (vae_decode_tiny, lossy)", config.vae_decode_tiny)
         if config.vae_decode_fast:
             from mstar.model.components import wan_vae
 
@@ -885,6 +895,11 @@ class Wan22VaeDecoderSubmodule(_Fp32IslandMixin, NodeSubmodule):
                 logger.warning("Wan2.2 VAE decode: vae_decode_kernel is on but ignored: %s", reason)
         return self._kernel
 
+    @staticmethod
+    def _frames(video: torch.Tensor) -> torch.Tensor:
+        # Quantize to 8-bit at the worker boundary, as rgb24 frames (see class docstring).
+        return truncate_to_uint8(video[0]).permute(1, 2, 3, 0).contiguous()
+
     def forward(
         self,
         graph_walk: str,
@@ -893,6 +908,8 @@ class Wan22VaeDecoderSubmodule(_Fp32IslandMixin, NodeSubmodule):
         **kwargs,
     ) -> NameToTensorList:
         with _inference_ctx():
+            if self._tiny is not None:
+                return {"video_output": [self._frames(self._tiny(latents.to(self.get_device())))]}
             vae = self.vae
             vae_dtype = self._decode_dtype()
             if next(vae.parameters()).dtype != vae_dtype:
@@ -929,6 +946,5 @@ class Wan22VaeDecoderSubmodule(_Fp32IslandMixin, NodeSubmodule):
                 video = self._fast.decode(latents)
             else:
                 video = vae.decode(latents, return_dict=False)[0]
-            # Quantize to 8-bit at the worker boundary, as rgb24 frames (see class docstring).
-            frames = truncate_to_uint8(video[0]).permute(1, 2, 3, 0).contiguous()
+            frames = self._frames(video)
         return {"video_output": [frames]}

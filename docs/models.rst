@@ -2300,6 +2300,12 @@ instead of 1.15 s. The frames are not the default decode's: 54.6 dB from an fp32
 the default bf16 decode is 55.3 dB, LPIPS 0.0003 for both. On another GPU the knob is ignored,
 with one warning.
 
+**Tiny VAE (opt-in, lossy).** ``vae_decode_tiny: <path>`` (TI2V-5B and FastWan only) decodes with
+the decoder of madebyollin/taehv's ``taew2_2.pth`` or ``taew2_2_super.pth`` (MIT; download the file and give its
+path) instead of the Wan2.2 VAE (``components/taehv_decoder``): 31 / 113 ms for a 1280x704x81 clip on one B300
+instead of 1.15 s, at 35.0 / 38.4 dB from an fp32 full decode (LPIPS 0.027 / 0.014; the CRF 18 mp4 encode
+itself is ~38.6 dB). A preview or draft model choice; set at most one of it and ``vae_decode_kernel``.
+
 **Step caching (opt-in, lossy).** ``step_cache`` under the yaml's ``model_kwargs``
 skips the DiT's 30 blocks on the steps MagCache picks and adds back the residual
 they produced at the last step that ran them

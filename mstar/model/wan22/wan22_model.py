@@ -119,6 +119,7 @@ class Wan22Model(Model):
         vae_decode_fast: bool = True,
         vae_decode_fast_sizes: tuple[str, ...] | None = None,
         vae_decode_kernel: bool = False,
+        vae_decode_tiny: str | None = None,
         step_cache: dict | None = None,
         sampler: str = SAMPLER_UNIPC,
         dmd_timesteps: tuple[int, ...] | None = None,
@@ -136,7 +137,7 @@ class Wan22Model(Model):
             dit_max_batch_size=self._require_positive_int("dit_max_batch_size", dit_max_batch_size),
             max_video_pixels=self._require_positive_int("max_video_pixels", max_video_pixels),
             vae_decode_fast=vae_decode_fast, vae_decode_fast_sizes=vae_decode_fast_sizes, step_cache=step_cache,
-            vae_decode_kernel=vae_decode_kernel,
+            vae_decode_kernel=vae_decode_kernel, vae_decode_tiny=vae_decode_tiny,
             sampler=sampler, dmd_timesteps=dmd_timesteps, dmd_shift=dmd_shift,
             lora=tuple(lora or ()), lora_2=tuple(lora_2 or ()),
         )
