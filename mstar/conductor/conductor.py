@@ -1362,8 +1362,8 @@ class Conductor:
         except ValueError as exc:
             self._reject_request(body.request_id, str(exc), status=400)
             return
-        if self._episode_array_names:
-            self._expire_episode_slots(time.monotonic())
+        if self._episode_array_names and self._expire_episode_slots(time.monotonic()):
+            self._try_admit_waiting()
         if self._episode_array_names and body.episode is not None and (
             type(body.episode) is not str or not body.episode
         ):
@@ -1848,6 +1848,7 @@ class Conductor:
             self._reject_request(request.request_id, "episode ended", status=410)
         if not self._episode_records.mark_ending(episode_id):
             self._close_episode(episode_id)
+            self._try_admit_waiting()
 
     def _reserve_episode_slot(self, owner: str, workers: set[str]) -> int:
         slot = self._episode_slots.reserve(owner, workers)
