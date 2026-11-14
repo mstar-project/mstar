@@ -44,6 +44,7 @@ def test_conductor_merges_kv_publish_info_from_every_tp_rank():
     )
     request = SimpleNamespace(
         partition_states={"default": partition},
+        episode_admitted=False,
         output_chunk_counts={},
         persist_signals={},
         streaming_connections={},
