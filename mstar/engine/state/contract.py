@@ -142,17 +142,25 @@ class Bidirectional(Mask):
     within-step form.
 
     With ``kept_window``, the entries the row kept before this step are cut to the first ``sink`` and the last
-    ``window`` of them, sizes the request's layout gives per read in ``Layout.kept_windows``."""
+    ``window`` of them, sizes the request's layout gives per read in ``Layout.kept_windows``.
+
+    With ``whole_pages`` too, the cut falls on the pages the array is stored in. The row loses whole pages from the
+    first one past ``sink``, while more than ``window`` entries would stay behind ``sink``, and sees every entry it
+    still holds: those that share the last page of ``sink``, and under a page more than ``window`` in all."""
 
     uses_query_position = False
     sees_step_whole = True
 
     _: KW_ONLY
     kept_window: bool = False
+    whole_pages: bool = False
 
     def __post_init__(self):
-        if type(self.kept_window) is not bool:
-            raise ValueError(f"Bidirectional.kept_window must be a bool, got {self.kept_window!r}")
+        for name in ("kept_window", "whole_pages"):
+            if type(getattr(self, name)) is not bool:
+                raise ValueError(f"Bidirectional.{name} must be a bool, got {getattr(self, name)!r}")
+        if self.whole_pages and not self.kept_window:
+            raise ValueError("Bidirectional.whole_pages cuts a kept window, and kept_window is False")
 
 
 @dataclass(frozen=True)

@@ -715,9 +715,9 @@ def test_a_removed_request_leaves_the_exact_set():
     pool = _pool()
     _open_exact(pool, "a", sink=3, window=8)
     pool.reset_request("a")
-    assert "a" in pool._exact, "a reset keeps the request's layout, and so its policy"
+    assert "a" in pool._retentions, "a reset keeps the request's layout, and so its policy"
     pool.remove_request("a")
-    assert "a" not in pool._exact
+    assert "a" not in pool._retentions
 
 
 # A kept-window read on the paged pool

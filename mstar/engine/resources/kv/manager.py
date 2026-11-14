@@ -240,7 +240,7 @@ class CacheStream:
     # the first `protected_prefix` committed tokens (a text prefix, say) are
     # never released; set once, after they commit (`protect_prefix`)
     protected_prefix: int = 0
-    # the exact policy the stream's layout keeps, from the commit that reaches
+    # the policy the stream's layout keeps, from the commit that reaches
     # its prefix: the index caps at its prefix, `reset` clears it
     retention: RetentionPolicy | None = None
     read_pending: bool = False
@@ -666,9 +666,8 @@ class KVManager(AttentionResource):
             )
         self._streams: dict[str, LabelToStream] = {}
         self._overrides: dict[str, KVReqConfig] = {}
-        # Each request whose layout holds an exact retention, with each such label's policy. Its commit applies the
-        # policy from the layout, where other requests' come from the step.
-        self._exact: dict[str, dict[str, RetentionPolicy]] = {}
+        # Each request whose layout holds a retention, with each such label's policy, which its commit applies.
+        self._retentions: dict[str, dict[str, RetentionPolicy]] = {}
         # dropped request -> what it returns with, until its rebuild lands
         self._dropped: dict[str, Dropped] = {}
         # rebuilt request -> the tokens it had written when its rebuild landed
@@ -1876,12 +1875,12 @@ class KVManager(AttentionResource):
             if rid not in self._streams:
                 self._streams[rid] = {"main": self._new_stream()}
             self._overrides.setdefault(rid, overrides)
-            exact = {
+            kept = {
                 label: layout.retention for label, layout in (self._overrides[rid].kv_layout or {}).items()
-                if layout.retention is not None and layout.retention.exact
+                if layout.retention is not None
             }
-            if exact:
-                self._exact[rid] = exact
+            if kept:
+                self._retentions[rid] = kept
             for label, stream in self._streams[rid].items():
                 if stream.span_cursor is None:
                     self._lay_out(rid, label, stream)
@@ -2504,7 +2503,7 @@ class KVManager(AttentionResource):
                 length=length,
                 to_compute=s.span,
                 generation=generation,
-                retention=self._exact.get(s.request_id, {}).get(s.label),
+                retention=self._exact(s.request_id, s.label),
             ))
         return views
 
@@ -2702,21 +2701,26 @@ class KVManager(AttentionResource):
         return KVPlanOutput(
             cpu_indptrs=build_paged_indptrs(views, page_size, ring=ring),
             views=views,
-            beyond_reach=bool(self._exact) and any(
+            beyond_reach=bool(self._retentions) and any(
                 view.retention is not None and view.retention.can_release(view.length - view.to_compute)
                 for view in views
             ),
         )
 
     def _beyond_reach(self, segments: list[Segment], group: int) -> bool:
-        """`KVPlanOutput.beyond_reach` of ``segments`` in group ``group``, False at once while no request holds an exact
+        """`KVPlanOutput.beyond_reach` of ``segments`` in group ``group``, False at once while no request holds a
         retention."""
-        exact = self._exact
-        return bool(exact) and any(
-            (policy := exact.get(s.request_id, {}).get(s.label)) is not None
+        return bool(self._retentions) and any(
+            (policy := self._exact(s.request_id, s.label)) is not None
             and policy.can_release(self._streams[s.request_id][s.label].group(group).stored_len)
             for s in segments
         )
+
+    def _exact(self, rid: str, label: str) -> RetentionPolicy | None:
+        """The exact retention ``rid``'s layout keeps on ``label``, which a kept-window read reaches through. None
+        under a retention of whole pages too, since a read reaches every entry those leave."""
+        policy = self._retentions.get(rid, {}).get(label)
+        return policy if policy is not None and policy.exact else None
 
     def _plan_label(
         self, segments: list[Segment], pending: dict, ctx: StepContext,
@@ -2777,7 +2781,7 @@ class KVManager(AttentionResource):
             return [
                 SequenceView(
                     s.request_id, s.label, indices[bounds[i]:bounds[i + 1]].tolist(),
-                    lens[i], s.span, 0, gens[i], self._exact.get(s.request_id, {}).get(s.label),
+                    lens[i], s.span, 0, gens[i], self._exact(s.request_id, s.label),
                 )
                 for i, s in enumerate(segments)
             ]
@@ -2823,7 +2827,7 @@ class KVManager(AttentionResource):
             return [
                 SequenceView(
                     s.request_id, s.label, indices[bounds[i]:bounds[i + 1]].tolist(),
-                    lg[i], s.span, 0, lg[n + i], self._exact.get(s.request_id, {}).get(s.label),
+                    lg[i], s.span, 0, lg[n + i], self._exact(s.request_id, s.label),
                 )
                 for i, s in enumerate(segments)
             ]
@@ -3206,7 +3210,7 @@ class KVManager(AttentionResource):
     def commit(self, step: KVStep, ctx: StepContext):
         self._live_outputs = None
         streams = self._streams
-        exact = self._exact
+        kept = self._retentions
         if not step.commit:
             self._readonly_epoch += 1
         rows = self._readonly_rows
@@ -3234,7 +3238,7 @@ class KVManager(AttentionResource):
                 self._run_lag = max(self._run_lag, 2 * (repeats - 1))
             if (
                 rows and repeats == 1 and self._index is None and not windows and not _DEBUG_ASSERTS
-                and not (exact and any(segment.request_id in exact for segment in rows))
+                and not (kept and any(segment.request_id in kept for segment in rows))
             ):
                 # nothing to index, adopt, retain or check: the arena moves
                 # every row's counts in one call, and hands back the ones it can't
@@ -3270,8 +3274,8 @@ class KVManager(AttentionResource):
                     # committed, so there is no refused admit left for a re-probe to answer
                     stream.converted = False
                     policy = None
-                    if exact and segment.request_id in exact:
-                        policy = exact[segment.request_id].get(segment.label)
+                    if kept and segment.request_id in kept:
+                        policy = kept[segment.request_id].get(segment.label)
                         # adopted at the first commit that reaches the prefix, before which nothing past it exists
                         if policy is not None and stream.stored_len < policy.protected_prefix:
                             policy = None
@@ -3298,7 +3302,7 @@ class KVManager(AttentionResource):
                         self._apply_retention(segment.request_id, stream, group.retention, g, touch=False)
                     if windows and segment.request_id in self._allotments:
                         self._settle_window_allotment(segment, stream)
-                    # The layout's exact retention, if it keeps one: drop what aged
+                    # The layout's retention, if it keeps one: drop what aged
                     # past the context budget now that this step's tokens
                     # count. Here, under the lock and before `commit_done`
                     # lets the next step pre-plan, so no admitted plan
@@ -3336,7 +3340,7 @@ class KVManager(AttentionResource):
     # request that generates in windows commits each window's K/V and, once
     # its context horizon fills, drops the oldest generated pages while the
     # prompt prefix stays. Two routes to the same page-floored front release:
-    # a request layout's exact `RetentionPolicy`, applied inside the commit
+    # a request layout's `RetentionPolicy`, applied inside the commit
     # that reaches its prefix — the served route, safe under pre-planning —
     # and the explicit `protect_prefix` / `release_oldest` pair for a driver
     # that runs between steps. Ported from #198's PagedAllocationManager
@@ -3373,7 +3377,7 @@ class KVManager(AttentionResource):
     def _adopt_retention(
         self, stream: CacheStream, policy: RetentionPolicy, segment: Segment,
     ) -> None:
-        """Take the exact policy the stream's layout keeps: the protected prefix
+        """Take the policy the stream's layout keeps: the protected prefix
         must be committed and agree with any earlier one (`protect_prefix`).
         Under the lock."""
         if policy.protected_prefix > stream.stored_len:
@@ -4300,7 +4304,7 @@ class KVManager(AttentionResource):
             self._streams.pop(rid, None)
             self._looked_up.discard(rid)
             self._overrides.pop(rid, None)
-            self._exact.pop(rid, None)
+            self._retentions.pop(rid, None)
             self._classify(rid, guaranteed=False)
             self._footprints.pop(rid, None)
             self._dropped.pop(rid, None)

@@ -74,13 +74,13 @@ def reads_differ_by_walk(array: Array) -> bool:
 
 
 def keeps_one_window(array: Array) -> bool:
-    """Whether ``array``'s one read is a kept window on its one label and every walk, with no positions and no
-    queries: what the rolling store holds, in a region sized when the request opens."""
+    """Whether ``array``'s one read is a kept window cut by entry, on its one label and every walk, with no positions
+    and no queries: what the rolling store holds, in a region sized when the request opens."""
     if len(array.reads) != 1 or len(array.labels) != 1 or array.positions is not None:
         return False
     (read,) = array.reads.values()
-    return (isinstance(read.mask, Bidirectional) and read.mask.kept_window and read.walks is None
-            and read.queries is None)
+    return (isinstance(read.mask, Bidirectional) and read.mask.kept_window and not read.mask.whole_pages
+            and read.walks is None and read.queries is None)
 
 
 def runs_on_walk(read: Read, walk: str | None) -> bool:

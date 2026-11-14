@@ -746,7 +746,10 @@ deployment YAML tunes them under ``resources:`` (see :ref:`Step 6 <config-yaml>`
   array of one label with no positions it is held in the rolling store (`Rolling (compacted)
   caches`_), which hands the read each row's sink, window and step as one range, and a step
   there lists one row and keeps its adds. Otherwise the pool keeps it in pages, and each read
-  gathers it.
+  gathers it. ``Bidirectional(kept_window=True, whole_pages=True)`` cuts the window on the
+  pool's pages: the pool releases whole pages past the sink's last and the read sees every
+  entry the row still holds, so it runs on the paged kernel, and on a captured step, as
+  Cosmos3's generation steps read their windowed context beside its prefill read.
   ``FrameWindow(tokens, frames=, stride=1)`` sees frames of ``tokens`` entries: every
   ``stride``-th of the latest ``frames``, and the step's own frame. An array whose reads are
   all frame windows is held in a ring of frames per session, which a compiled region adds to

@@ -89,6 +89,7 @@ from mstar.engine.state.contract import (
     Entry,
     FrameWindow,
     GatedDeltaNet,
+    KeptWindow,
     KVEntry,
     Layout,
     Mask,
@@ -747,7 +748,7 @@ class OpBinding:
     def for_mask(self, mask: Mask) -> "OpBinding":
         """The binding that runs the op through ``mask``: `kept_window_binding` through a kept window, and this one
         through any other mask. The one place a mask picks a binding, by its type or a field."""
-        kept = self.kept_window_binding if _keeps_window(mask) else None
+        kept = self.kept_window_binding if _keeps_window(mask) and not mask.whole_pages else None
         return self if kept is None else kept
 
     def retention(self, key: str, layout: Layout) -> RetentionPolicy | None:
@@ -814,7 +815,11 @@ class PagedAttend(OpBinding):
         return KEPT_WINDOW_ATTEND
 
     def for_mask(self, mask: Mask) -> OpBinding:
-        return BLOCK_CAUSAL_ATTEND if isinstance(mask, BlockCausal) else super().for_mask(mask)
+        if isinstance(mask, BlockCausal):
+            return BLOCK_CAUSAL_ATTEND
+        if _keeps_window(mask) and mask.whole_pages:
+            return PAGE_WINDOW_ATTEND
+        return super().for_mask(mask)
 
     def specs(self, array: Array, key: str, read: Read) -> list[NodeResourceSpec]:
         windowed = isinstance(read.mask, Window)
@@ -944,6 +949,24 @@ class FlexAttend(OpBinding):
         handle.reads[key] = run
 
 
+def _check_window(array: Array, key: str, read: Read) -> None:
+    """Raise ``ValueError`` where the kept-window read ``key`` shares a walk with another read, or takes queries."""
+    shared = sorted(other for other, each in array.reads.items() if other != key and _share_a_walk(read, each))
+    if shared:
+        raise _no_layout(array, f"reads[{key!r}] keeps a window beside reads {shared}, which share one of its "
+                                "walks or name none, so they would reach entries the window releases")
+    if read.queries is not None:
+        raise _no_layout(array, f"reads[{key!r}].queries must be None, since the window is cut per row of its "
+                                "own array")
+
+
+def _window_sizes(key: str, layout: Layout) -> KeptWindow:
+    kept = layout.kept_windows.get(key)
+    if kept is None:
+        raise RuntimeError(f"state_layout: kept_windows gives no sizes for the kept-window read {key!r}")
+    return kept
+
+
 class KeptWindowBinding(OpBinding):
     """A read through a kept window. Its storage releases what the window no longer reaches, so the array's other reads
     run on other walks, and each request's layout sizes it."""
@@ -951,18 +974,10 @@ class KeptWindowBinding(OpBinding):
     keeps_window = True
 
     def check(self, array: Array, key: str, read: Read) -> None:
-        shared = sorted(other for other, each in array.reads.items() if other != key and _share_a_walk(read, each))
-        if shared:
-            raise _no_layout(array, f"reads[{key!r}] keeps a window beside reads {shared}, which share one of its "
-                                    "walks or name none, so they would reach entries the window releases")
-        if read.queries is not None:
-            raise _no_layout(array, f"reads[{key!r}].queries must be None, since the window is cut per row of its "
-                                    "own array")
+        _check_window(array, key, read)
 
     def retention(self, key: str, layout: Layout) -> RetentionPolicy:
-        kept = layout.kept_windows.get(key)
-        if kept is None:
-            raise RuntimeError(f"state_layout: kept_windows gives no sizes for the kept-window read {key!r}")
+        kept = _window_sizes(key, layout)
         return RetentionPolicy(context_budget=kept.window, protected_prefix=kept.sink, exact=True)
 
     def attach(self, handle: ArrayHandle, key: str, run: Any) -> None:
@@ -1002,6 +1017,28 @@ class KeptWindowEagerDense(KeptWindowBinding, EagerDenseAttend):
     def check(self, array: Array, key: str, read: Read) -> None:
         KeptWindowBinding.check(self, array, key, read)
         EagerDenseAttend.check(self, array, key, read)
+
+
+class PageWindowAttend(PagedAttend):
+    """`Attend` through a kept window cut on the pool's pages. The pool releases whole pages and the read attends
+    every entry the row still holds, so it runs on the kernels of a read with no window."""
+
+    keeps_window = True
+
+    def check(self, array: Array, key: str, read: Read) -> None:
+        super().check(array, key, read)
+        _check_window(array, key, read)
+
+    def retention(self, key: str, layout: Layout) -> RetentionPolicy:
+        kept = _window_sizes(key, layout)
+        return RetentionPolicy(context_budget=kept.window, protected_prefix=kept.sink)
+
+
+PAGE_WINDOW_ATTEND = PageWindowAttend()
+
+
+class PageWindowEagerDense(PageWindowAttend, EagerDenseAttend):
+    """`EagerDenseAttend` through a kept window cut on the pool's pages."""
 
 
 class PagedReach(KeptWindowBinding):
@@ -2934,6 +2971,7 @@ SDPA: dict[tuple[Storage, type[Op]], OpBinding] = {(WITHIN_STEP, Attend): SdpaAt
 # the dense one on the rest.
 EAGER_DENSE: dict[type[OpBinding], OpBinding] = {
     PagedAttend: EagerDenseAttend(), KeptWindowAttend: KeptWindowEagerDense(),
+    PageWindowAttend: PageWindowEagerDense(),
 }
 
 
