@@ -5,20 +5,19 @@ Ported from Step-Audio2's ``Token2wav`` streaming path (``set_stream_cache`` + `
 its prompt; each window of 28 codes (25 new, 3 lookahead) then becomes mel
 (``flow``) and audio (HiFT), cross-faded with the previous window's tail.
 
-A window runs in two captured stages: ``window_flow``, whose attention caches are on bounded
-KV resources (``CACHE_FAMILIES``) so windows at any position batch, and ``window_vocode``
+A window runs in two captured stages: ``window_flow``, whose attention caches are unbounded
+arrays (``CACHE_FAMILIES``) so windows at any position batch, and ``window_vocode``
 (HiFT), which batches a request's first window apart from later ones, then ``window_finish``.
 The tests drive the same modules one request at a time over a ``Token2WavState`` as the
 reference does, which is bit-exact against it at fp32; the batched path matches that to
 summation order and TF32.
 
 The flow's initial noise is a slice of a fixed buffer (``ChunkCFM.rand_noise``); HiFT's
-excitation draws are an input (``window_noise``), from each request's own generator.
+excitation draws are an input (``window_noise``), from each request's seed and the window's index.
 """
 
 from __future__ import annotations
 
-import dataclasses
 import math
 from collections.abc import Callable
 from dataclasses import dataclass, fields
@@ -29,8 +28,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from mstar.engine.resources.kv.bounded import SinkWindow
-from mstar.engine.resources.recurrent.pool import RecurrentAddressing, RecurrentStatePool
+from mstar.engine.state import KeptWindow
 from mstar.model.chatterbox.components.s3gen_hift import HiFTGenerator, HiFTNoise
 from mstar.model.chatterbox.config import S3GenHiFTConfig
 from mstar.model.components.token2wav.flow import (
@@ -47,7 +45,6 @@ from mstar.model.components.token2wav.flow import (
     PRE_LOOKAHEAD,
     TOKEN_DIM,
     UP_RATE,
-    BoundedLayerKV,
     DenseKV,
     FlowKV,
     Token2WavFlow,
@@ -108,7 +105,7 @@ class CacheCapacity:
 class Token2WavState:
     """A voice's prepared caches (and, in the tests, a request's state on the reference's
     one-request path), float32, batch dims of 1 kept. Serving keeps a request's attention
-    caches on bounded KV resources and the rest in a slot (``slot_layout``).
+    caches in its arrays and the rest in its slots (``slot_layout``).
 
     - ``enc_cnn``, ``dit_cnn``: the conformer's and DiT's conv left context;
     - ``enc_kv1`` / ``enc_kv2``: the 25 Hz / 50 Hz conformer keys|values, oldest first;
@@ -167,7 +164,7 @@ class SlotBlock(NamedTuple):
 def slot_layout(capacity: CacheCapacity, dit_dtype: torch.dtype | None = None) -> dict[str, SlotBlock]:
     """Per-request slot of the batched path, for voices of up to ``capacity.prompt_tokens``
     tokens: ``Token2WavState``'s tensors without their batch axes, except the attention
-    caches, which live in bounded KV resources (``CACHE_FAMILIES``). The DiT's conv
+    caches, which are arrays of their own (``CACHE_FAMILIES``). The DiT's conv
     caches are in ``dit_dtype`` (default float32), what its convolutions run in."""
     meta = Token2WavState.allocate(capacity, "meta")
     layout = {}
@@ -182,24 +179,17 @@ def slot_layout(capacity: CacheCapacity, dit_dtype: torch.dtype | None = None) -
     return layout
 
 
+# The slot's blocks by the region that writes them, a Value each: a region's step lists
+# the Values it reads and writes, and a step that keeps writes every field of each.
+SLOT_PARTS = {"conv": ("enc_cnn", "dit_cnn"), "vocoder": ("hift_mel", "hift_source"), "tail": ("hift_speech",)}
+
+
 # Each attention cache keeps a sink and a window of a stream that starts with the voice's
 # own cache (its source) and continues with the request's windows, as upstream's
 # truncation does: past ``2P + 100`` frames the 50 Hz caches keep their first ``2P``
 # entries and their last 100, and the 25 Hz one its first ``P + 50``. The DiT attends
 # ``[newest window, ..., voice]`` without positions, so its stream is the voice reordered
 # and each window last-first, which makes upstream's "first 2P" a window.
-
-
-def _enc1_retention(source_len: int) -> SinkWindow:
-    return SinkWindow(source_len + KEEP_RECENT // UP_RATE, 0)
-
-
-def _enc2_retention(source_len: int) -> SinkWindow:
-    return SinkWindow(source_len, KEEP_RECENT)
-
-
-def _dit_retention(source_len: int) -> SinkWindow:
-    return SinkWindow(KEEP_RECENT, source_len)
 
 
 def _enc1_source(voice: Token2WavVoice) -> torch.Tensor:
@@ -219,26 +209,36 @@ def _dit_source(voice: Token2WavVoice) -> torch.Tensor:
 
 
 class CacheFamily(NamedTuple):
-    """One kind of token2wav attention cache, as a bounded KV resource declares it."""
+    """One kind of token2wav attention cache, as its array declares it."""
 
     num_layers: int
-    rows: int  # 2 for the DiT's guidance rows
+    rows: int  # 2 for the DiT's guidance rows, which its array holds as heads
     num_heads: int
     head_dim: int
     # stream entries per token: 1 at 25 Hz, 2 at 50 Hz
     rate: int
-    retention: Callable[[int], SinkWindow]
+    # what it keeps of a stream whose voice holds n entries: this, grown by n on the side it names
+    kept_window: KeptWindow
     # the voice's cache in stream order, ``[layers, rows, H, L, 2d]``
     source: Callable[[Token2WavVoice], torch.Tensor]
+    dtype: torch.dtype = torch.float32
     reverse_step_order: bool = False
-
-    def position(self, voice_tokens: int, written_tokens: int) -> tuple[int, int]:
-        """``(source_len, written)`` once a request's windows have added ``written_tokens``
-        (``window_tokens`` each)."""
-        return self.rate * voice_tokens, self.rate * written_tokens
 
     def span(self, num_tokens: int, last: bool) -> int:
         return self.rate * window_tokens(num_tokens, last)
+
+    def kept(self, source_len: int) -> tuple[int, int]:
+        """The sink and window kept of a stream whose voice holds ``source_len`` entries."""
+        k = self.kept_window
+        return k.sink + source_len * (k.grows == "sink"), k.window + source_len * (k.grows == "window")
+
+    def retained(self, source_len: int, written: int) -> int:
+        """The entries a row keeps before a step, its voice holding ``source_len`` and its windows ``written``."""
+        return min(source_len + written, sum(self.kept(source_len)))
+
+    def max_keys(self, longest: int) -> int:
+        """The most entries a row keeps, over voices of up to ``longest`` entries."""
+        return sum(self.kept(longest))
 
 
 def window_tokens(num_tokens: int, last: bool) -> int:
@@ -248,41 +248,14 @@ def window_tokens(num_tokens: int, last: bool) -> int:
 
 
 CACHE_FAMILIES = {
-    "enc1": CacheFamily(ENC_BLOCKS, 1, ENC_HEADS, ENC_HEAD_DIM, 1, _enc1_retention, _enc1_source),
-    "enc2": CacheFamily(ENC_UP_BLOCKS, 1, ENC_HEADS, ENC_HEAD_DIM, UP_RATE, _enc2_retention, _enc2_source),
-    "dit": CacheFamily(N_TIMESTEPS * DIT_DEPTH, 2, DIT_HEADS, DIT_HEAD_DIM, UP_RATE, _dit_retention,
-                       _dit_source, reverse_step_order=True),
+    "enc1": CacheFamily(ENC_BLOCKS, 1, ENC_HEADS, ENC_HEAD_DIM, 1,
+                        KeptWindow(KEEP_RECENT // UP_RATE, window=0, grows="sink"), _enc1_source),
+    "enc2": CacheFamily(ENC_UP_BLOCKS, 1, ENC_HEADS, ENC_HEAD_DIM, UP_RATE,
+                        KeptWindow(0, window=KEEP_RECENT, grows="sink"), _enc2_source),
+    "dit": CacheFamily(N_TIMESTEPS * DIT_DEPTH, 2, DIT_HEADS, DIT_HEAD_DIM, UP_RATE,
+                       KeptWindow(KEEP_RECENT, window=0, grows="window"), _dit_source, dtype=DIT_COMPUTE_DTYPE,
+                       reverse_step_order=True),
 }
-
-
-class SlotRows(NamedTuple):
-    """A batch's rows of the vocoder's state pool (``slot_layout``): the pool and the step's
-    addressing of them, the same in a captured and an eager forward. Reads and writes go
-    through the pool's ``gather`` / ``scatter_``, which cover every row the step declared;
-    ``head`` keeps the first of them."""
-
-    pool: RecurrentStatePool
-    rows: RecurrentAddressing
-
-    def get(self, name: str) -> torch.Tensor:
-        # a row with no state yet reads zeros; callers pick their initial state for those
-        return self.pool.gather(name)[: self.rows.num_rows]
-
-    def set(self, name: str, value: torch.Tensor) -> None:
-        declared = self.pool.addressing().num_rows
-        if value.shape[0] < declared:
-            # the rows past ``head``: a replay's padding, whose writes land on the sink
-            value = torch.cat([value, value.new_zeros(declared - value.shape[0], *value.shape[1:])])
-        self.pool.scatter_(name, value)
-
-    def head(self, n: int) -> SlotRows:
-        """The step's first ``n`` rows: its real ones, a captured replay's padding after."""
-        return SlotRows(self.pool, dataclasses.replace(self.rows, num_rows=n))
-
-    @property
-    def fresh(self) -> torch.Tensor:
-        """``[B]`` rows whose slot holds no state yet: their request's first window."""
-        return ~self.rows.has_state[: self.rows.num_rows]
 
 
 class VoiceBank(NamedTuple):
@@ -291,31 +264,18 @@ class VoiceBank(NamedTuple):
 
     names: tuple[str, ...]
     prompt_tokens: tuple[int, ...]
-    # per cache family, each voice's caches in stream order, ``[voices, layers, rows, H, L, 2d]``
-    # (zero past a shorter voice's length)
-    sources: dict[str, torch.Tensor]
     spk: torch.Tensor      # [voices, 80], projected speaker embeddings
     enc_cnn: torch.Tensor  # [voices, *slot_layout] initial conv state
     dit_cnn: torch.Tensor
 
     @classmethod
     def build(cls, voices: dict[str, Token2WavVoice], dit_dtype: torch.dtype | None = None) -> VoiceBank:
-        """``dit_dtype``: the DiT caches' dtype, attention and conv (default float32, the
-        voices' own)."""
+        """``dit_dtype``: the DiT's conv caches' dtype (default float32, the voices' own)."""
         names = tuple(voices)
-
-        def stack(tensors: list[torch.Tensor]) -> torch.Tensor:
-            longest = max(t.shape[-2] for t in tensors)
-            return torch.stack([F.pad(t, (0, 0, 0, longest - t.shape[-2])) for t in tensors])
-
         init = [voice_blocks(voices[n]) for n in names]
         return cls(
             names=names,
             prompt_tokens=tuple(voices[n].prompt.tokens.shape[1] for n in names),
-            sources={
-                f: stack([fam.source(voices[n]) for n in names]).to(dit_dtype if f == "dit" and dit_dtype else None)
-                for f, fam in CACHE_FAMILIES.items()
-            },
             spk=torch.cat([voices[n].spk for n in names]),
             enc_cnn=torch.cat([i["enc_cnn"] for i in init]),
             dit_cnn=torch.cat([i["dit_cnn"] for i in init]).to(dit_dtype),
@@ -325,28 +285,12 @@ class VoiceBank(NamedTuple):
         return self.names.index(name)
 
 
-class AttentionCache(NamedTuple):
-    """Where a batch's caches of one family are: the bounded KV resource (whose step
-    planned the batch's rows) and the model's voices' sources (``VoiceBank.sources``)."""
-
-    resource: object
-    sources: torch.Tensor
-
-    def layer(self, idx: int) -> BoundedLayerKV:
-        return BoundedLayerKV(self.resource, idx, self.sources[:, idx])
-
-
-class WindowCaches(NamedTuple):
-    enc1: AttentionCache
-    enc2: AttentionCache
-    dit: AttentionCache
-
-    def flow_kv(self) -> FlowKV:
-        return FlowKV(
-            [self.enc1.layer(i) for i in range(ENC_BLOCKS)],
-            [self.enc2.layer(i) for i in range(ENC_UP_BLOCKS)],
-            [[self.dit.layer(step * DIT_DEPTH + i) for i in range(DIT_DEPTH)] for step in range(N_TIMESTEPS)],
-        )
+def voice_start(source: torch.Tensor) -> dict[str, torch.Tensor]:
+    """A voice's cache of one family in stream order, ``[layers, rows, H, L, 2d]``, as its array's start: ``k`` and
+    ``v``, each ``(layers, L, rows * H, d)``, the guidance rows as heads."""
+    layers, rows, heads, length, width = source.shape
+    k, v = source.permute(0, 3, 1, 2, 4).reshape(layers, length, rows * heads, width).chunk(2, dim=-1)
+    return {"k": k, "v": v}
 
 
 class Token2WavVoice(NamedTuple):
@@ -447,6 +391,10 @@ class Token2Wav(nn.Module):
         self.hift = StepAudioHiFT()
         self.voice_encoder = VoicePromptEncoder()
         self.register_buffer("speech_window", torch.from_numpy(np.hamming(2 * HIFT_TAIL)), persistent=False)
+        # scratch: seeded before every draw, so no draw reads what another left
+        self._noise_rng: torch.Generator | None = None
+        # how far a full first and a full later window's draws move a CUDA generator's offset, once measured
+        self._draw_steps: tuple[int, int] | None = None
 
     @torch.inference_mode()
     def prepare_voice(self, prompt: VoicePrompt) -> Token2WavVoice:
@@ -472,90 +420,123 @@ class Token2Wav(nn.Module):
     @torch.inference_mode()
     def window_flow(
         self,
-        state: SlotRows,
+        conv,
         bank: VoiceBank,
         voices: torch.Tensor,
+        fresh: torch.Tensor,
         tokens: torch.Tensor,
-        caches: WindowCaches,
+        kv: FlowKV,
+        noise_offsets: torch.Tensor,
         last: bool = False,
     ) -> torch.Tensor:
         """The flow for ``B`` windows at any positions, each in its own voice: ``tokens [B, n]``
-        -> mel ``[B, 80, frames]``. ``voices [B]`` indexes ``bank``. ``caches`` know each
-        row's position; rows on their first window (``state.fresh``) read their voice's conv
-        state rather than their slot's. A last window writes no caches. Capturable."""
+        -> mel ``[B, 80, frames]``. ``voices [B]`` indexes ``bank``. ``conv`` is the handle of the
+        rows' conv caches (``SLOT_PARTS``), which rows on their first window (``fresh [B]``) take
+        from their voice instead. ``kv`` know each row's position, and ``noise_offsets [B]`` is
+        each row's DiT kept count. Capturable."""
         b = tokens.shape[0]
-        fresh = state.fresh
-
-        def per_row(name: str, stacked: torch.Tensor) -> torch.Tensor:
-            """Each row's voice's ``name``."""
-            return stacked.index_select(0, voices)
+        held = conv.read(0).fields
 
         def conv_cache(name: str, init: torch.Tensor) -> torch.Tensor:
-            current = state.get(name)
-            return torch.where(fresh.view(-1, *([1] * (current.dim() - 1))), per_row(name, init), current)
+            current = held[name]
+            return torch.where(fresh.view(-1, *([1] * (current.dim() - 1))), init.index_select(0, voices), current)
 
         enc_cnn = conv_cache("enc_cnn", bank.enc_cnn)
         # guidance rows of a request side by side, as the flow runs them
         dit_cnn = conv_cache("dit_cnn", bank.dit_cnn).permute(1, 2, 0, 3, 4, 5).contiguous().flatten(2, 3)
-        mel = self.flow(tokens, per_row("spk", bank.spk), None, last, enc_cnn, dit_cnn, caches.flow_kv())
-        if not last:
-            state.set("enc_cnn", enc_cnn)
-            state.set("dit_cnn", dit_cnn.unflatten(2, (b, 2)).permute(2, 0, 1, 3, 4, 5))
+        mel = self.flow(tokens, bank.spk.index_select(0, voices), None, last, enc_cnn, dit_cnn, kv, noise_offsets)
+        conv.write(0, enc_cnn=enc_cnn, dit_cnn=dit_cnn.unflatten(2, (b, 2)).permute(2, 0, 1, 3, 4, 5))
         return mel
 
     @torch.inference_mode()
     def window_vocode(
         self,
-        state: SlotRows,
+        vocoder,
         mel: torch.Tensor,
         first: bool,
         last: bool,
         noise: HiFTNoise,
     ) -> dict[str, torch.Tensor]:
-        """HiFT up to its output spectrum for ``B`` windows' mel, prefixed by the slot's
-        held-back frames unless they are their requests' ``first`` (a shorter input, so the
-        two do not batch), on ``noise`` (``window_noise``). Finish with ``window_finish``."""
+        """HiFT up to its output spectrum for ``B`` windows' mel, prefixed by the frames
+        ``vocoder`` (the handle of the rows' HiFT tails) held back unless they are their
+        requests' ``first`` (a shorter input, so the two do not batch), on ``noise``
+        (``window_noise``). Finish with ``window_finish``."""
         if first:
             hift_mel, cache_source = mel, None
         else:
-            hift_mel = torch.cat([state.get("hift_mel"), mel], dim=2)
-            cache_source = state.get("hift_source")
+            held = vocoder.read(0).fields
+            hift_mel = torch.cat([held["hift_mel"], mel], dim=2)
+            cache_source = held["hift_source"]
         magnitude, phase, source = self.hift.spectrum(hift_mel, noise.phase, noise.harmonic, cache_source)
-        if not last:
-            state.set("hift_mel", hift_mel[..., -HIFT_MEL_CACHE:])
-            state.set("hift_source", source[:, :, -HIFT_TAIL:])
+        vocoder.write(0, hift_mel=hift_mel[..., -HIFT_MEL_CACHE:], hift_source=source[:, :, -HIFT_TAIL:])
         return {"magnitude": magnitude, "phase": phase}
 
-    def window_noise(self, frames: int, first: bool, generators: list[torch.Generator | None]) -> HiFTNoise:
-        """HiFT's excitation draws for windows of ``frames`` mel frames, a row from each
-        generator, each drawn as a one-request ``stream`` call draws it: a request's audio
-        then depends on its own seed alone, not on its batch."""
-        length = (frames + (0 if first else HIFT_MEL_CACHE)) * SAMPLES_PER_FRAME
-        device = self.speech_window.device
-        rows = [self.hift.m_source.draw_noise(1, length, torch.float32, device, g) for g in generators]
+    def window_noise(self, frames: int, first: bool, draws: list[tuple[int, int] | None]) -> HiFTNoise:
+        """HiFT's excitation draws for windows of ``frames`` mel frames: for each ``(seed, k)``, window k's draw
+        from the stream ``seed`` starts, as a one-request ``stream`` call draws it, so a request's audio depends on
+        its own seed alone, not on its batch. None draws from the global generator, for a capture's rows."""
+        length = excitation_samples(frames, first)
+        rows = [self._draw(length, draw) for draw in draws]
         return HiFTNoise(phase=torch.cat([r.phase for r in rows]), harmonic=torch.cat([r.harmonic for r in rows]))
+
+    def _draw(self, length: int, draw: tuple[int, int] | None) -> HiFTNoise:
+        device, source = self.speech_window.device, self.hift.m_source
+        if draw is None:
+            return source.draw_noise(1, length, torch.float32, device, None)
+        seed, k = draw
+        if self._noise_rng is None or self._noise_rng.device != device:
+            self._noise_rng = torch.Generator(device=device)
+        rng = self._noise_rng.manual_seed(seed)
+        if device.type == "cuda":
+            rng.set_offset(self._offset(k))
+        else:
+            # a CPU generator has no offset: draw the windows before it
+            for window in range(k):
+                source.draw_noise(1, excitation_samples(window_frames(WINDOW, False), window == 0), torch.float32,
+                                  device, rng)
+        return source.draw_noise(1, length, torch.float32, device, rng)
+
+    def _offset(self, k: int) -> int:
+        """Where window k's draw starts on a CUDA generator. Every window before it is full, so it is the first
+        window's step and k - 1 later ones, measured on the device: a Philox step depends on the launch grid."""
+        if self._draw_steps is None:
+            rng, steps = torch.Generator(device=self.speech_window.device), []
+            for first in (True, False):
+                before = rng.get_offset()
+                self.hift.m_source.draw_noise(1, excitation_samples(window_frames(WINDOW, False), first), torch.float32,
+                                              rng.device, rng)
+                steps.append(rng.get_offset() - before)
+            self._draw_steps = (steps[0], steps[1])
+        first, later = self._draw_steps
+        return 0 if k == 0 else first + (k - 1) * later
 
     @torch.inference_mode()
     def window_finish(
         self,
-        state: SlotRows,
+        tail,
         magnitude: torch.Tensor,
         phase: torch.Tensor,
         first: bool,
         last: bool = False,
     ) -> torch.Tensor:
         """``window_vocode``'s spectrum -> each row's samples: the inverse STFT (kept out of
-        the capture: it syncs), the cross-fade with the slot's held-back tail, and the new
-        tail, as the reference's ``stream`` does them."""
+        the capture: it syncs), the cross-fade with the samples ``tail`` (the handle of the
+        rows' last samples) held back, and the new tail, as the reference's ``stream`` does
+        them."""
         speech = self.hift.waveform(magnitude, phase)
         if not first:
-            speech = fade_in_out(speech, state.get("hift_speech"), self.speech_window)
+            speech = fade_in_out(speech, tail.read(0).fields["hift_speech"], self.speech_window)
+        tail.write(0, hift_speech=speech[:, -HIFT_TAIL:])
         if last:
             return speech
-        state.set("hift_speech", speech[:, -HIFT_TAIL:])
         if first:
             return torch.cat([speech.new_zeros(speech.shape[0], HIFT_TAIL), speech[:, :-HIFT_TAIL]], dim=1)
         return speech[:, :-HIFT_TAIL]
+
+def excitation_samples(frames: int, first: bool) -> int:
+    """HiFT's excitation length for a window of ``frames`` mel frames, its held-back frames included after the first."""
+    return (frames + (0 if first else HIFT_MEL_CACHE)) * SAMPLES_PER_FRAME
+
 
 # The token counts a last window after a full one can have: the left context plus 0 to
 # HOP - 1 new codes (a full window's worth would have made a full window).

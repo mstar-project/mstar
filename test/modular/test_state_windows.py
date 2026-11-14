@@ -91,8 +91,8 @@ def _read(mask, **fields) -> Read:
 @pytest.mark.parametrize(("make", "message"), [
     (lambda: Bidirectional(kept_window=1), "Bidirectional.kept_window must be a bool, got 1"),
     (lambda: KeptWindow(-1, window=4), "KeptWindow.sink must be an int >= 0, got -1"),
-    (lambda: KeptWindow(2, window=-1), "KeptWindow.window must be an int >= 1, got -1"),
-    (lambda: KeptWindow(2, window=0), "KeptWindow.window must be an int >= 1, got 0"),
+    (lambda: KeptWindow(2, window=-1), "KeptWindow.window must be an int >= 0, got -1"),
+    (lambda: KeptWindow(0, window=0), "KeptWindow keeps nothing: its sink and its window are both 0"),
     (lambda: KeptWindow(2.0, window=4), "KeptWindow.sink must be an int >= 0, got 2.0"),
     (lambda: KeptWindow(True, window=4), "KeptWindow.sink must be an int >= 0, got True"),
     (lambda: FrameWindow(0, frames=16), "FrameWindow.tokens must be a positive int, got 0"),
@@ -1139,3 +1139,28 @@ def test_a_frame_fits_the_block_mask_by_one_rule(tokens, fits):
         with pytest.raises(ValueError, match="must be a multiple of the sparse block size"):
             build()
 
+
+
+def test_a_paged_kept_window_still_refuses_no_window():
+    """A sink alone is an unbounded array's base; the paged pool keeps a window of at least one entry."""
+    with pytest.raises(RuntimeError, match=r"kept_windows\['self_attn'\] keeps no window"):
+        kv_layouts([_kept_array()], {"dit_kv": {"main": Layout(kept_windows={
+            "self_attn": KeptWindow(18, window=0),
+        })}}, {})
+
+
+def test_a_paged_kept_window_refuses_a_growing_base():
+    """A request's layout gives its sizes whole, so nothing grows them."""
+    with pytest.raises(RuntimeError, match=r"kept_windows\['self_attn'\]\.grows is 'sink'"):
+        kv_layouts([_kept_array()], {"dit_kv": {"main": Layout(kept_windows={
+            "self_attn": KeptWindow(18, window=24, grows="sink"),
+        })}}, {})
+
+
+def test_a_paged_kept_window_refuses_last_first():
+    """The paged pool keeps a step's adds in order, so it can't cut them last-first."""
+    with pytest.raises(ValueError, match=r"reads\['self_attn'\]\.mask\.last_first, and the paged pool keeps a step's "
+                                         r"adds in order"):
+        build_specs([_array("dit_kv", reads={
+            "self_attn": _read(Bidirectional(kept_window=True, last_first=True)),
+        }, max_len=4096)])

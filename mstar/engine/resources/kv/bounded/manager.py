@@ -47,11 +47,13 @@ class BoundedPlan(NamedTuple):
 
 
 class _Request:
-    __slots__ = ("slot", "written")
+    __slots__ = ("slot", "written", "source")
 
     def __init__(self, slot: int):
         self.slot = slot
         self.written = 0
+        # the source its stream began from, which its retained keys are read from
+        self.source = None
 
 
 class BoundedKVManager(Resource):
@@ -91,6 +93,16 @@ class BoundedKVManager(Resource):
         """One layer's slots, ``[max_slots, rows, H, cap, 2D]``."""
         return self._cache[layer_idx]
 
+    def written(self, rid: str) -> int:
+        """The entries committed for ``rid``: 0 for a rid that holds no slot, never admitted or torn down."""
+        req = self._requests.get(rid)
+        return 0 if req is None else req.written
+
+    def position(self, rid: str, label: str) -> int:
+        """Where ``rid``'s next entry goes, its count of committed entries, as a position resource answers."""
+        del label
+        return self.written(rid)
+
     @property
     def current(self) -> BoundedPlan:
         if self._current is None:
@@ -106,7 +118,7 @@ class BoundedKVManager(Resource):
         source: torch.Tensor | None = None,
         plan: BoundedPlan | None = None,
         rel_bias: torch.Tensor | None = None,
-        ieee: bool = False,
+        ieee: bool | None = None,
         row_source: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """Attention for ``q, k, v [B * rows, H, T, D]`` over each row's retained
@@ -118,8 +130,9 @@ class BoundedKVManager(Resource):
         per-query window (``BoundedKVConfig.query_window``) it is indexed by distance,
         ``[B * rows, H, T, window + 1]``. Rows whose
         source is -1 read theirs from ``row_source = (storage [slots, rows, H, L, 2D],
-        slots [>= B])``, e.g. another resource's per-request entries."""
+        slots [>= B])``, e.g. another resource's per-request entries. ``ieee`` None takes the config's."""
         plan = plan or self.current
+        ieee = self.config.ieee if ieee is None else ieee
         cache = self._cache[layer_idx]
         self._check_attend(q, k, v, cache, source, plan, rel_bias, row_source)
         if q.device.type == "cpu":
@@ -252,6 +265,11 @@ class BoundedKVManager(Resource):
                     return AdmitOutcome(ok=False, ready=False, reason=AdmitRuntimeError(
                         f"{seg.request_id!r} declares {pos.written} written tokens; "
                         f"{req.written} were committed", request_ids=frozenset({seg.request_id})))
+                if req.written and pos.source != req.source:
+                    return AdmitOutcome(ok=False, ready=False, reason=AdmitRuntimeError(
+                        f"{seg.request_id!r} began from source {req.source}; its step names source {pos.source}",
+                        request_ids=frozenset({seg.request_id})))
+                req.source = pos.source
         return ADMIT_OK
 
     def rollback_admit(self, step: BoundedKVStep, ctx: StepContext) -> None:

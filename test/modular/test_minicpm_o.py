@@ -237,10 +237,12 @@ def test_bad_request_knobs_are_refused(knob, value):
 def test_min_p_is_served(tmp_path):
     """Upstream's ``chat`` hands ``min_p`` to HF ``generate``, which honours it."""
     from mstar.engine.resources import SamplerSpec
+    from mstar.engine.state.adapters import node_resources, sampling_configs
 
     model = a_model(tmp_path)
-    [spec] = [s for s in model.get_node_resources() if isinstance(s, SamplerSpec) and s.resource_key == LLM_SAMPLER]
-    model.get_request_resource_configs(["text"], ["text"], {"min_p": 0.05})[LLM_SAMPLER].validate(spec)
+    [spec] = [s for s in node_resources(model) if isinstance(s, SamplerSpec) and s.resource_key == LLM_SAMPLER]
+    configs = model.get_request_resource_configs(["text"], ["text"], {"min_p": 0.05})
+    sampling_configs(configs, model.declare_state())[LLM_SAMPLER].validate(spec)
 
 
 def test_an_attachment_tag_in_the_users_text_is_refused():
@@ -252,11 +254,12 @@ def test_an_attachment_tag_in_the_users_text_is_refused():
 
 def test_max_seq_len_sizes_the_kv_and_the_decode_loop(tmp_path):
     from mstar.engine.resources import KVSpec
+    from mstar.engine.state.adapters import node_resources
     from mstar.model.minicpm_o.config import LLM_KV
     from mstar.model.minicpm_o.minicpm_o_model import MiniCPMOModel
 
     model = a_model(tmp_path, max_seq_len=4096)
-    (kv,) = [s for s in model.get_node_resources() if isinstance(s, KVSpec) and s.resource_key == LLM_KV]
+    (kv,) = [s for s in node_resources(model) if isinstance(s, KVSpec) and s.resource_key == LLM_KV]
     assert kv.config.max_seq_len == 4096
     assert model.get_graph_walk_graphs()["decode"].max_iters == 4096
     with pytest.raises(ValueError, match="max_seq_len"):
@@ -491,7 +494,7 @@ def test_encoders_lay_out_segments_from_the_prompts_step_metadata(model):
 def test_kv_layout_covers_the_prompt_and_each_decode_step(model):
     """The LLM's layout: one span over every prompt row (placeholders included),
     written by the prefill walk the request takes, then a row per decode step."""
-    from mstar.model.base import LabelLayout
+    from mstar.engine.state import Layout
     from mstar.model.minicpm_o.config import LLM_KV, TTS_KV
     from mstar.model.multimodal import PromptPart
 
@@ -500,16 +503,16 @@ def test_kv_layout_covers_the_prompt_and_each_decode_step(model):
         tensors={"image_inputs": [an_image()]},
         prompt_parts=[PromptPart("image"), PromptPart("text", "Describe it.")],
     )
-    (span,) = out.metadata["kv_layout"][LLM_KV]["main"].spans
+    (span,) = out.metadata["state_layout"][LLM_KV]["main"].spans
     rows = out.new_input_tensors["text_inputs"][0].numel()
     assert (span.walk, span.length, span.advance) == ("prefill_image", rows, rows)
-    assert out.metadata["kv_layout"][LLM_KV]["main"].growth == ((DECODE_LOOP, 1),)
+    assert out.metadata["state_layout"][LLM_KV]["main"].growth == ((DECODE_LOOP, 1),)
     assert set(model.kv_labels()) == {LLM_KV, TTS_KV}
     # a text reply opens the TTS's pool with nothing in it; a spoken one prefills its
     # condition (two rows and a row per LLM step) and then writes a row per code
-    assert out.metadata["kv_layout"][TTS_KV]["main"] == LabelLayout()
+    assert out.metadata["state_layout"][TTS_KV]["main"] == Layout()
     spoken = model.process_prompt(None, ["text"], ["text", "audio"], prompt_parts=[PromptPart("text", "Hi.")])
-    tts = spoken.metadata["kv_layout"][TTS_KV]["main"]
+    tts = spoken.metadata["state_layout"][TTS_KV]["main"]
     assert [(s.walk, s.length) for s in tts.spans] == [("tts_prefill", 2)]
     assert tts.growth == ((DECODE_LOOP, 1), ("tts_decode_loop", 1))
 
@@ -553,8 +556,10 @@ def test_text_streamed_a_token_at_a_time_reassembles(model):
 
 @needs_ckpt
 def test_every_node_gets_only_its_resources(model):
+    from mstar.engine.state.adapters import node_resources
+
     by_node: dict[str, set[str]] = {}
-    for spec in model.get_node_resources():
+    for spec in node_resources(model):
         for node in spec.nodes:
             by_node.setdefault(node, set()).add(spec.resource_key)
     assert by_node == {
@@ -562,20 +567,23 @@ def test_every_node_gets_only_its_resources(model):
         "vision_encoder": {"vision_attn", "resampler_attn"},
         "audio_encoder": {"audio_attn"},
         "TTS": {"tts_kv", "tts_attn", "tts_pos", "tts_sampler"},
-        "Token2Wav": {"t2w_state", "t2w_enc1_kv", "t2w_enc2_kv", "t2w_dit_kv"},
+        "Token2Wav": {"t2w_conv", "t2w_vocoder", "t2w_tail", "t2w_enc1_kv", "t2w_enc2_kv", "t2w_dit_kv"},
     }
 
 
-def test_audio_block_loop_leases_within_the_resources_segment_limit():
-    """The captured block loop's plan holds the attention resource's
-    ``max_segments_per_request`` pieces, as configured (a YAML override
-    included): a request with more gets no lease and runs eagerly."""
+def test_audio_block_loop_leases_within_the_reads_segment_limit(tmp_path):
+    """The captured block loop's plan holds the audio read's ``max_segments_per_request``
+    pieces, as configured (a YAML override included): a request with more gets no lease
+    and runs eagerly."""
+    from mstar.engine.state.adapters import StateSetup, node_handles
     from mstar.model.minicpm_o.config import AUDIO_ATTN
+    from mstar.model.minicpm_o.minicpm_o_model import AUDIO
     from mstar.model.minicpm_o.submodules import AUDIO_BLOCK_LOOP, AudioEncoderSubmodule
     from mstar.model.submodule_base import NodeInputs
 
     audio = AudioEncoderSubmodule(torch.nn.Identity(), a_config())
-    audio.bind_node_resources({AUDIO_ATTN: SimpleNamespace(max_segments_per_request=2)})
+    ragged = SimpleNamespace(run=lambda q, k, v, label: q, max_segments_per_request=2)
+    audio.bind_node_state(node_handles(a_model(tmp_path), AUDIO, {AUDIO_ATTN: ragged}, setup=StateSetup()))
     region = audio.get_piecewise_accelerator_graph_configs(torch.device("cpu"), torch.float32)[AUDIO_BLOCK_LOOP]
 
     def request(pieces):
@@ -585,19 +593,33 @@ def test_audio_block_loop_leases_within_the_resources_segment_limit():
     assert not region.can_lease(request(3))
 
 
-def test_the_audio_tower_attends_through_its_nodes_ragged_resource():
-    """The tower's layers are the AuT's, bound to the audio node's resource rather than to an array."""
+class _StubTokens:
+    """Records the audio tower's adds and reads, and gives each read its queries back."""
+
+    def __init__(self):
+        self.calls = []
+
+    def add(self, layer, *, k, v):
+        self.calls.append(("add", layer, tuple(k.shape)))
+
+    def read(self, layer, q):
+        self.calls.append(("read", layer, tuple(q.shape)))
+        return q
+
+
+def test_the_audio_tower_attends_through_its_nodes_array():
+    """The tower's layers are the AuT's, each adding to and reading the audio node's array at its own layer."""
     from mstar.model.minicpm_o.components.audio import WhisperEncoder
-    from mstar.model.minicpm_o.config import AUDIO_ATTN, AudioConfig
+    from mstar.model.minicpm_o.config import AUDIO_TOKENS, AudioConfig
 
     tower = WhisperEncoder(AudioConfig(d_model=16, encoder_layers=2, encoder_attention_heads=2, encoder_ffn_dim=32))
-    calls = []
-    ragged = SimpleNamespace(run=lambda q, k, v: calls.append(q.shape) or q)
+    tokens = _StubTokens()
     for layer in tower.layers:
-        layer.self_attn.bind_resources({AUDIO_ATTN: ragged})
+        layer.self_attn.bind_state({AUDIO_TOKENS: tokens})
     with torch.no_grad():
         out = tower.encode(torch.randn(5, 16))
-    assert out.shape == (5, 16) and calls == [(5, 2, 8)] * 2
+    assert out.shape == (5, 16)
+    assert tokens.calls == [(call, layer, (5, 2, 8)) for layer in range(2) for call in ("add", "read")], tokens.calls
 
 
 def a_deployment(cap: int | None = 32, tts_pages: int = 32 * 32 + 1, **resources) -> dict:
@@ -609,22 +631,23 @@ def a_deployment(cap: int | None = 32, tts_pages: int = 32 * 32 + 1, **resources
 
 
 def test_vocoder_slot_counts_must_agree():
-    """A spoken reply holds a slot of each t2w resource, so one count sizes all four:
-    t2w_state has one more (its sink). A YAML that sets them apart is refused."""
+    """A spoken reply holds a slot of each t2w resource, so one count sizes them all:
+    each slot Value has one more (its sink). A YAML that sets them apart is refused."""
     from mstar.model.minicpm_o.components.tts import TTSConfig
     from mstar.model.minicpm_o.config import T2W_KV, T2W_STATE
 
     model = a_bare_model(tts_config=TTSConfig())
 
     def yaml(state, kv):
-        return a_deployment(**{T2W_STATE: {"max_slots": state}, **{key: {"max_slots": kv} for key in T2W_KV.values()}})
+        return a_deployment(**{key: {"max_slots": state} for key in T2W_STATE.values()},
+                            **{key: {"max_slots": kv} for key in T2W_KV.values()})
 
     model.validate_config_yaml(yaml(33, 32), "minicpm_o.yaml")
     model.validate_config_yaml(a_deployment(), "minicpm_o.yaml")
-    with pytest.raises(ValueError, match="t2w_state"):
+    with pytest.raises(ValueError, match="t2w_conv"):
         model.validate_config_yaml(yaml(33, 33), "minicpm_o.yaml")
-    with pytest.raises(ValueError, match="t2w_state"):
-        model.validate_config_yaml(a_deployment(**{T2W_STATE: {"max_slots": 33}}), "minicpm_o.yaml")
+    with pytest.raises(ValueError, match="t2w_conv"):
+        model.validate_config_yaml(a_deployment(**{T2W_STATE["conv"]: {"max_slots": 33}}), "minicpm_o.yaml")
 
 
 def test_tts_kv_must_hold_every_admitted_spoken_reply():

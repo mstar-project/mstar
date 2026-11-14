@@ -16,22 +16,23 @@ from mstar.engine.accelerator_graph_config import (
     PiecewiseCaptureShape,
 )
 from mstar.engine.engine import ExecutingBatch
-from mstar.engine.resources import Segment, SubmoduleStep
-from mstar.engine.resources.kv.bounded import BoundedKVStep, StreamPosition
-from mstar.engine.resources.recurrent.config import RecurrentStep
+from mstar.engine.state import ArrayStep, Segment, SubmoduleStep, host
 from mstar.model.chatterbox.components.s3gen_hift import HiFTNoise
-from mstar.model.components.token2wav.flow import MEL_BINS
+from mstar.model.components.token2wav.flow import MEL_BINS, FlowKV, HandleLayerKV
 from mstar.model.components.token2wav.keys import Token2WavKeys
 from mstar.model.components.token2wav.model import (
     CACHE_FAMILIES,
+    DIT_DEPTH,
+    ENC_BLOCKS,
+    ENC_UP_BLOCKS,
+    HOP,
     LAST_WINDOW_TOKENS,
     LEAD_SILENCE,
+    N_TIMESTEPS,
     SILENCE_CODE,
     WINDOW,
-    AttentionCache,
-    SlotRows,
     VoiceBank,
-    WindowCaches,
+    voice_start,
     window_frames,
 )
 from mstar.model.submodule_base import (
@@ -51,20 +52,20 @@ class Token2WavSubmodule(NodeSubmodule):
 
     The windows are the ``LeftContextChunkPolicy(25, 3)`` stream from the TTS;
     the first window gets the silence prepended here. A request's attention caches
-    are on the ``keys.kv`` bounded KV resources, which start from its voice's
-    prepared caches; its conv caches and HiFT tails are its slot of ``keys.state``
-    (``RecurrentStatePool``). Its stream position is the chunk's offset in the
-    stream (``prepare_inputs``).
+    are the ``keys.kv`` arrays, whose rows begin from their voice's prepared caches;
+    its conv caches and HiFT tails are its slots of the ``keys.state`` Values, one per
+    region that writes them, and its voice and last window are host fields of
+    ``keys.request``.
 
     Float32, but for the DiT's GEMMs, convolutions, attention and caches, which are
-    ``DIT_COMPUTE_DTYPE``. Each window runs in two stages (``forward_batched``), each a piecewise
-    capture bucketed by batch size: the flow (``t2w/<voice>/flow28``), for windows
-    at any position, and HiFT, separately for a request's first window, whose
-    input is shorter. A last window has one of a few lengths, each a one-row
-    capture; other shapes run eagerly. The inverse STFT and cross-fade stay eager.
-    The tests' one-request driver over the same modules is bit-exact against the
-    reference at full fp32; this path attends the DiT's cache in another order and
-    runs on fused kernels, with the DiT in float16.
+    ``DIT_COMPUTE_DTYPE``. Each window runs in three stages (``forward_batched``), each a
+    piecewise region: the flow (``t2w/flow28``), for windows at any position, captured by
+    batch size; HiFT, separately for a request's first window, whose input is shorter;
+    and, eagerly since the inverse STFT syncs, the cross-fade. A last window has one of
+    a few lengths, each a one-row capture; other shapes run eagerly. The tests'
+    one-request driver over the same modules is bit-exact against the reference at full
+    fp32; this path attends the DiT's cache in another order and runs on fused kernels,
+    with the DiT in float16.
     """
 
     WINDOW_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 24, 32]
@@ -75,7 +76,7 @@ class Token2WavSubmodule(NodeSubmodule):
     disable_autocast = True
 
     def __init__(self, model, keys: Token2WavKeys, voices: dict, eos_code: int, dit_dtype: torch.dtype):
-        """``keys``: the node's input signal and resource keys. ``voices``: the model's
+        """``keys``: the node's input signal and state keys. ``voices``: the model's
         bundled ones, by name. ``dit_dtype``: the dtype of the DiT's caches, as the model
         declares them, which the DiT computes in."""
         super().__init__()
@@ -83,7 +84,21 @@ class Token2WavSubmodule(NodeSubmodule):
         self.keys = keys
         self.eos_code = eos_code
         self.bank = VoiceBank.build(voices, dit_dtype=dit_dtype)
+        # each family's voice caches in stream order, which `bind_state` hands to its array and drops
+        self._sources: dict[str, list[torch.Tensor]] | None = {
+            name: [family.source(voices[voice]) for voice in self.bank.names]
+            for name, family in CACHE_FAMILIES.items()
+        }
         self._lead_silence = torch.full((LEAD_SILENCE,), SILENCE_CODE, dtype=torch.int32)
+
+    def bind_state(self, handles: Mapping[str, Any]) -> None:
+        self.slots = {part: handles[key] for part, key in self.keys.state.items()}
+        self.per_request = handles[self.keys.request]
+        self.caches = {name: handles[key] for name, key in self.keys.kv.items()}
+        for name, sources in self._sources.items():
+            dtype = self.caches[name].array.entry.tensors["k"].dtype
+            self.caches[name].set_starts([voice_start(source.to(dtype)) for source in sources])
+        self._sources = None
 
     def compile_regions(self) -> dict[str, list[tuple]]:
         # HiFT up to its spectrum, compiled once with dynamic shapes (every region's
@@ -91,50 +106,35 @@ class Token2WavSubmodule(NodeSubmodule):
         # activations, about half its GPU time. It compiles in the captures' warm-up.
         return {"model.hift.spectrum": []}
 
-    def _caches(self, resources: Mapping) -> WindowCaches:
-        """The step's ``WindowCaches``."""
-        return WindowCaches(**{
-            name: AttentionCache(resources[self.keys.kv[name]], self.bank.sources[name]) for name in CACHE_FAMILIES
-        })
+    def _flow_kv(self) -> FlowKV:
+        """The flow's attention caches, each layer through its family's handle."""
 
-    def _voice_of(self, rid: str) -> tuple[int, int]:
-        """``rid``'s voice, an index into ``bank``, and its prompt length in tokens."""
-        voice = self.bank.index(self.request_state(rid)["voice"])
-        return voice, self.bank.prompt_tokens[voice]
+        def layer(name: str, idx: int) -> HandleLayerKV:
+            family, handle = CACHE_FAMILIES[name], self.caches[name]
+            return HandleLayerKV(handle, idx, family.rows, family.max_keys(handle.array.start_lengths[-1]))
 
-    def _voice_ids(self, rids: list[str], device: torch.device) -> torch.Tensor:
-        # pinned and queued: a pageable copy would wait out the running step
-        return to_device_nonblocking([self._voice_of(r)[0] for r in rids], device, torch.long)
+        return FlowKV(
+            [layer("enc1", i) for i in range(ENC_BLOCKS)],
+            [layer("enc2", i) for i in range(ENC_UP_BLOCKS)],
+            [[layer("dit", step * DIT_DEPTH + i) for i in range(DIT_DEPTH)] for step in range(N_TIMESTEPS)],
+        )
 
     def _cache_steps(
-        self, request_ids: list[str], num_tokens: list[int], lasts: list[bool],
-    ) -> dict[str, BoundedKVStep]:
-        """Each cache resource's step: every row's stream position (in its voice's stream)
-        and what its window adds."""
-        positions = []
-        for rid in request_ids:
-            req = self.request_states.get(rid)
-            if req is None or "voice" not in req:
-                # a capture's dummy row: the resource plans it as padding
-                positions.append(None)
-            else:
-                voice, tokens = self._voice_of(rid)
-                positions.append((tokens, req.get("written", 0), voice))
-        steps = {}
-        for name, family in CACHE_FAMILIES.items():
-            steps[self.keys.kv[name]] = BoundedKVStep(
-                segments=[
+        self, request_ids: list[str], num_tokens: list[int], lasts: list[bool], keep: bool = True,
+        voices: Mapping[str, int] | None = None,
+    ) -> dict[str, ArrayStep]:
+        """Each cache's step: what each row's window adds, and on the node's step each row's voice, whose cache its
+        stream begins with and which a region's step takes from it."""
+        return {
+            self.keys.kv[name]: ArrayStep(
+                segments=tuple(
                     Segment(request_id=rid, label="main", span=family.span(n, last))
                     for rid, n, last in zip(request_ids, num_tokens, lasts, strict=True)
-                ],
-                positions={
-                    rid: StreamPosition(*family.position(tokens, written), source=voice)
-                    for rid, (tokens, written, voice) in (
-                        (r, p) for r, p in zip(request_ids, positions, strict=True) if p is not None
-                    )
-                },
+                ),
+                keep=keep, starts=voices or {},
             )
-        return steps
+            for name, family in CACHE_FAMILIES.items()
+        }
 
     def prepare_inputs(
         self,
@@ -163,9 +163,8 @@ class Token2WavSubmodule(NodeSubmodule):
         last = is_final_stream_chunk or bool((codes == self.eos_code).any())
         codes = codes[codes != self.eos_code]
         chunk = input_metadata.stream_chunks[self.keys.codes]
-        # keyed by the worker handle, as the forward and the engine's cleanup are
-        state = self.request_state(fwd_info.rid_handle)
-        if chunk.start_offset > state.get("last_window", chunk.start_offset):
+        held = host(self.per_request, fwd_info.rid_handle, "main", 0)
+        if held["ended"] and chunk.start_offset > held["last_window"]:
             # Past the last window: the stream's final chunk after the window that held
             # the stop code, which only repeats that window's tail. It still runs,
             # voicing nothing (``forward_batched``): a skipped step never completes the
@@ -173,43 +172,57 @@ class Token2WavSubmodule(NodeSubmodule):
             # offset, not by the chunk being all look-back: a stream that ends at a
             # full window without the stop code has a last window that is all look-back.
             return NodeInputs(tensor_inputs={"codes": codes[None, :0]}, kwargs={"last": True})
-        if last:
-            state.add("last_window", chunk.start_offset)
         first = chunk.start_offset == 0
         if first:
             codes = torch.cat([self._lead_silence, codes])
-            state.add("voice", fwd_info.step_metadata.get(self.keys.voice))
-            # HiFT's excitation, window by window from the request's seed
-            state.add("noise", torch.Generator(self.get_device()).manual_seed(fwd_info.random_seed))
+        # the walk's step metadata reaches each chunk the stream triggers, not only the first
+        voice = self.bank.index(fwd_info.step_metadata.get(self.keys.voice))
+        if not last and codes.shape[0] != WINDOW:
+            raise RuntimeError(f"a window before the last holds {codes.shape[0]} codes, and HiFT's noise for window k "
+                               f"assumes every window before it held {WINDOW}")
         # Window k starts 25k codes into the silence-led stream (its look-back
-        # included), which is what its caches hold before it (``_cache_steps``).
-        state.add("written", 0 if first else chunk.start_offset + LEAD_SILENCE)
-        return NodeInputs(tensor_inputs={"codes": codes[None]}, kwargs={"last": last, "first": first})
+        # included), which is what its caches hold before it.
+        k = (chunk.start_offset + LEAD_SILENCE) // HOP
+        dit = CACHE_FAMILIES["dit"]
+        dit_written = dit.rate * HOP * k
+        noise_offset = dit.retained(dit.rate * self.bank.prompt_tokens[voice], dit_written)
+        # what a last window's commit leaves for the chunk after it: where the last window starts
+        fields = {"ended": True, "last_window": chunk.start_offset} if last else {}
+        return NodeInputs(tensor_inputs={"codes": codes[None]}, kwargs={
+            "last": last, "first": first, "voice": voice, "host": fields, "noise_offset": noise_offset,
+            "dit_written": dit_written,
+            # HiFT's excitation, from the request's seed and the window's index
+            "draw": (fwd_info.random_seed, k),
+        })
 
     def declare_step(
         self, graph_walk: str, request_ids: list[str], inputs: list[NodeInputs], **kwargs,
     ) -> SubmoduleStep:
         # This step admits the windows (slots, positions), which has to happen before
-        # the forward. Its plan goes unused: each region re-plans the rows it runs.
-        # TODO: an admit-only step would save that plan's host work.
-        # A row with no codes voices nothing (``forward_batched``), so it declares
-        # nothing: a reply that never reached the TTS takes no slot.
+        # the forward, and leaves each row's host fields. Each region's step plans the
+        # rows it runs and gives them their entries. A row with no codes voices nothing
+        # (``forward_batched``), so it declares nothing: a reply that never reached the
+        # TTS takes no slot.
         rows = [(rid, inp) for rid, inp in zip(request_ids, inputs, strict=True) if inp.tensor_inputs["codes"].shape[1]]
+        rids = [rid for rid, _ in rows]
         return SubmoduleStep(
-            segments=[Segment(request_id=rid, label="main", span=1) for rid, _ in rows],
-            steps={
-                self.keys.state: RecurrentStep(),
+            segments=[Segment(request_id=rid, label="main", span=1) for rid in rids],
+            state={
+                **{key: ArrayStep() for key in self.keys.state.values()},
+                self.keys.request: ArrayStep(host={
+                    (rid, "main", 0): inp.kwargs["host"] for rid, inp in rows if inp.kwargs["host"]
+                }),
                 **self._cache_steps(
-                    [rid for rid, _ in rows], [inp.tensor_inputs["codes"].shape[1] for _, inp in rows],
-                    [inp.kwargs["last"] for _, inp in rows],
+                    rids, [inp.tensor_inputs["codes"].shape[1] for _, inp in rows],
+                    [inp.kwargs["last"] for _, inp in rows], voices={rid: inp.kwargs["voice"] for rid, inp in rows},
                 ),
             },
         )
 
-    # Each window's flow and HiFT run through a piecewise region: replayed when a graph
-    # fits, else eagerly through the same step, so the resources always hold the plan
-    # of exactly the rows being run. Shapes that are never captured (a one-window
-    # reply's HiFT) have eager-only regions.
+    # Each window's flow, HiFT and cross-fade run through a piecewise region: replayed
+    # when a graph fits, else eagerly through the same step, so the resources always hold
+    # the plan of exactly the rows being run. Shapes that are never captured (a
+    # one-window reply's HiFT) and the cross-fade have eager-only regions.
 
     @staticmethod
     def flow_region(num_tokens: int, last: bool) -> str:
@@ -232,6 +245,10 @@ class Token2WavSubmodule(NodeSubmodule):
                     "tokens": torch.zeros(shape.bs, num_tokens, dtype=torch.int32, device=device),
                     # each row's voice, an index into ``bank``
                     "voices": torch.zeros(shape.bs, dtype=torch.long, device=device),
+                    # rows on their request's first window, which read their voice's conv state
+                    "fresh": torch.zeros(shape.bs, dtype=torch.bool, device=device),
+                    # each row's DiT kept count, where its flow noise starts
+                    "noise_offsets": torch.zeros(shape.bs, dtype=torch.long, device=device),
                 }
             return make
 
@@ -242,39 +259,48 @@ class Token2WavSubmodule(NodeSubmodule):
                         "phase": noise.phase, "harmonic": noise.harmonic}
             return make
 
-        def declare_flow(last: bool):
+        def one_value(part: str):
             def declare_step(request_ids: list[str], seq_lens: list[int]) -> SubmoduleStep:
                 return SubmoduleStep(
                     segments=[Segment(request_id=rid, label="main", span=1) for rid in request_ids],
-                    steps={
-                        self.keys.state: RecurrentStep(),
-                        **self._cache_steps(request_ids, list(seq_lens), [last] * len(request_ids)),
-                    },
+                    state={self.keys.state[part]: ArrayStep()},
                 )
             return declare_step
 
-        def declare_hift(request_ids: list[str], seq_lens: list[int]) -> SubmoduleStep:
-            return SubmoduleStep(
-                segments=[Segment(request_id=rid, label="main", span=1) for rid in request_ids],
-                steps={self.keys.state: RecurrentStep()},
-            )
+        def declare_flow(last: bool):
+            def declare_step(request_ids: list[str], seq_lens: list[int]) -> SubmoduleStep:
+                # a last window attends its own entries and keeps none
+                caches = self._cache_steps(request_ids, list(seq_lens), [last] * len(request_ids), keep=not last)
+                return SubmoduleStep(
+                    segments=[Segment(request_id=rid, label="main", span=1) for rid in request_ids],
+                    state={self.keys.state["conv"]: ArrayStep(), **caches},
+                )
+            return declare_step
 
         def flow(last: bool):
             def run(call: PiecewiseCallInputs) -> dict[str, torch.Tensor]:
-                pool = call.resources[self.keys.state]
+                inputs = call.static_inputs
                 return {"mel": self.model.window_flow(
-                    SlotRows(pool, pool.addressing("main")), self.bank, call.static_inputs["voices"],
-                    call.static_inputs["tokens"], self._caches(call.resources), last,
+                    self.slots["conv"], self.bank, inputs["voices"], inputs["fresh"], inputs["tokens"], self._flow_kv(),
+                    inputs["noise_offsets"], last,
                 )}
             return run
 
         def hift(first: bool, last: bool):
             def run(call: PiecewiseCallInputs) -> dict[str, torch.Tensor]:
-                pool, inputs = call.resources[self.keys.state], call.static_inputs
+                inputs = call.static_inputs
                 return self.model.window_vocode(
-                    SlotRows(pool, pool.addressing("main")), inputs["mel"], first, last,
+                    self.slots["vocoder"], inputs["mel"], first, last,
                     HiFTNoise(phase=inputs["phase"], harmonic=inputs["harmonic"]),
                 )
+            return run
+
+        def finish(first: bool, last: bool):
+            def run(call: PiecewiseCallInputs) -> dict[str, torch.Tensor]:
+                inputs = call.static_inputs
+                return {"speech": self.model.window_finish(
+                    self.slots["tail"], inputs["magnitude"], inputs["phase"], first, last,
+                )}
             return run
 
         def region(run, make_static_inputs, declare_step, seq_len, batch_sizes):
@@ -300,19 +326,24 @@ class Token2WavSubmodule(NodeSubmodule):
         }
         for first in (True, False):
             configs[self.hift_region(first, full, False)] = region(
-                hift(first, False), static_hift(first, full), declare_hift, full, self.WINDOW_CAPTURE_BATCH_SIZES)
+                hift(first, False), static_hift(first, full), one_value("vocoder"), full,
+                self.WINDOW_CAPTURE_BATCH_SIZES)
         for n in LAST_WINDOW_TOKENS:
             frames = window_frames(n, True)
             configs[self.flow_region(n, True)] = region(
                 flow(True), static_tokens(n), declare_flow(True), n, self.LAST_CAPTURE_BATCH_SIZES)
             configs[self.hift_region(False, frames, True)] = region(
-                hift(False, True), static_hift(False, frames), declare_hift, frames, self.LAST_CAPTURE_BATCH_SIZES)
+                hift(False, True), static_hift(False, frames), one_value("vocoder"), frames,
+                self.LAST_CAPTURE_BATCH_SIZES)
         for last in (False, True):
             configs[self.eager_region("flow", False, last)] = region(
                 flow(last), static_tokens(WINDOW), declare_flow(last), WINDOW, [])
             for first in (False, True):
                 configs[self.eager_region("hift", first, last)] = region(
-                    hift(first, last), static_hift(first, full), declare_hift, full, [])
+                    hift(first, last), static_hift(first, full), one_value("vocoder"), full, [])
+                # the inverse STFT syncs, so the cross-fade is never captured
+                configs[self.eager_region("finish", first, last)] = region(
+                    finish(first, last), lambda shape: {}, one_value("tail"), full, [])
         return configs
 
     def forward(self, graph_walk: str, engine_inputs: ModelInputsFromEngine, **kwargs) -> NameToTensorList:
@@ -325,26 +356,23 @@ class Token2WavSubmodule(NodeSubmodule):
         self, graph_walk: str, engine_inputs: ModelInputsFromEngine, inputs: list[NodeInputs],
     ) -> dict[str, Any]:
         device = self.get_device()
-        return {"rows": [
-            (inp.tensor_inputs["codes"].to(device), inp.kwargs["last"], inp.kwargs.get("first", False))
-            for inp in inputs
-        ]}
+        return {"rows": [(inp.tensor_inputs["codes"].to(device), inp.kwargs) for inp in inputs]}
 
     def forward_batched(
         self, graph_walk: str, engine_inputs: ModelInputsFromEngine, rows: list | None = None, **kwargs,
     ) -> dict[str, NameToTensorList]:
-        """Each window in two stages: the flow, batched over every row of one window length
-        whatever its voice and position, then HiFT, batched over rows that are all or none
-        their request's first window."""
+        """Each window in three stages: the flow, batched over every row of one window length
+        whatever its voice and position, then HiFT and the cross-fade, batched over rows that
+        are all or none their request's first window."""
         runners = engine_inputs.piecewise_runners
-        out, first, flows = {}, {}, {}
-        for rid, (codes, last, is_first) in zip(engine_inputs.request_ids, rows, strict=True):
+        out, row_kwargs, flows = {}, {}, {}
+        for rid, (codes, kw) in zip(engine_inputs.request_ids, rows, strict=True):
             if not codes.shape[1]:
                 # past its last window (``prepare_inputs``)
                 out[rid] = {}
                 continue
-            first[rid] = is_first
-            flows.setdefault((codes.shape[1], last), []).append((rid, codes))
+            row_kwargs[rid] = kw
+            flows.setdefault((codes.shape[1], kw["last"]), []).append((rid, codes))
 
         mels, hifts = {}, {}
         for (n, last), group in flows.items():
@@ -352,17 +380,19 @@ class Token2WavSubmodule(NodeSubmodule):
             for chunk in self._chunks(runner, group, last):
                 rids = [rid for rid, _ in chunk]
                 tokens = torch.cat([codes for _, codes in chunk])
-                mel = self._run_flow(runner, rids, tokens)
+                mel = self._run_flow(runner, rids, tokens, [row_kwargs[rid] for rid in rids])
                 for i, rid in enumerate(rids):
                     mels[rid] = mel[i]
-                    hifts.setdefault((first[rid], mel.shape[-1], last), []).append(rid)
+                    hifts.setdefault((row_kwargs[rid]["first"], mel.shape[-1], last), []).append(rid)
 
         for (is_first, frames, last), rids in hifts.items():
             runner = runners.get(self.hift_region(is_first, frames, last)) or runners[
                 self.eager_region("hift", is_first, last)]
+            finish = runners[self.eager_region("finish", is_first, last)]
             for chunk in self._chunks(runner, rids, last):
                 mel = torch.stack([mels[rid] for rid in chunk])
-                wav = self._run_hift(engine_inputs, runner, chunk, mel, is_first, last)
+                draws = [row_kwargs[rid]["draw"] for rid in chunk]
+                wav = self._run_hift(runner, finish, chunk, mel, is_first, last, draws)
                 for i, rid in enumerate(chunk):
                     out[rid] = {self.keys.audio: [wav[i]]}
         return out
@@ -374,34 +404,42 @@ class Token2WavSubmodule(NodeSubmodule):
         cap = (self.LAST_CAPTURE_BATCH_SIZES if last else self.WINDOW_CAPTURE_BATCH_SIZES)[-1]
         return [group[i:i + cap] for i in range(0, len(group), cap)]
 
-    @torch.compiler.disable
-    def _run_flow(self, runner, rids: list[str], tokens: torch.Tensor) -> torch.Tensor:
+    def _run_flow(self, runner, rids: list[str], tokens: torch.Tensor, kwargs: list[dict]) -> torch.Tensor:
         """``window_flow`` for these rows (``[B, 80, frames]``)."""
-        voices = self._voice_ids(rids, tokens.device)
+        dit = self.caches["dit"]
+        for rid, kw in zip(rids, kwargs, strict=True):
+            if dit.written(rid) != kw["dit_written"]:
+                raise RuntimeError(
+                    f"{rid!r}'s DiT cache committed {dit.written(rid)} entries and its stream offset puts "
+                    f"{kw['dit_written']} before this window: its noise offset, counted from the stream offset, "
+                    "would index another window's noise"
+                )
+        device = tokens.device
+        # pinned and queued: a pageable copy would wait out the running step
         out = runner.run(
-            static_inputs={"tokens": tokens, "voices": voices}, request_ids=rids,
-            seq_lens=[tokens.shape[1]] * len(rids), real_bs=len(rids),
+            static_inputs={
+                "tokens": tokens,
+                "voices": to_device_nonblocking([kw["voice"] for kw in kwargs], device, torch.long),
+                "fresh": to_device_nonblocking([kw["first"] for kw in kwargs], device, torch.bool),
+                "noise_offsets": to_device_nonblocking([kw["noise_offset"] for kw in kwargs], device, torch.long),
+            },
+            request_ids=rids, seq_lens=[tokens.shape[1]] * len(rids), real_bs=len(rids),
         )
         # copied out: the next replay of this region reuses the buffer
         return out.get_view("mel").clone()
 
-    @torch.compiler.disable
     def _run_hift(
-        self,
-        engine_inputs: ModelInputsFromEngine,
-        runner,
-        rids: list[str],
-        mel: torch.Tensor,
-        first: bool,
-        last: bool,
+        self, runner, finish, rids: list[str], mel: torch.Tensor, first: bool, last: bool,
+        draws: list[tuple[int, int]],
     ) -> torch.Tensor:
-        """``window_vocode`` and then (eagerly: the inverse STFT syncs) ``window_finish``,
-        on the rows the region just planned: the rows' samples."""
-        noise = self.model.window_noise(mel.shape[-1], first, [self.request_state(r)["noise"] for r in rids])
+        """``window_vocode`` and then ``window_finish``, each through its region: the rows' samples."""
+        noise = self.model.window_noise(mel.shape[-1], first, draws)
         out = runner.run(
             static_inputs={"mel": mel, "phase": noise.phase, "harmonic": noise.harmonic},
             request_ids=rids, seq_lens=[mel.shape[-1]] * len(rids), real_bs=len(rids),
         )
-        pool = engine_inputs.resources[self.keys.state]
-        state = SlotRows(pool, pool.addressing("main")).head(len(rids))
-        return self.model.window_finish(state, out.get_view("magnitude"), out.get_view("phase"), first, last)
+        spectrum = {"magnitude": out.get_view("magnitude"), "phase": out.get_view("phase")}
+        speech = finish.run(
+            static_inputs=spectrum, request_ids=rids, seq_lens=[mel.shape[-1]] * len(rids), real_bs=len(rids),
+        )
+        return speech.get_view("speech")

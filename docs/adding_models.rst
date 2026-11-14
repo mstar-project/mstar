@@ -329,9 +329,9 @@ that no sampler declares fails the request.
   greedy token scores 0 there, so a trainer sampling greedily wants ``"raw"``. It renorms
   every step's distribution again, about 0.15 ms at batch 1 and 0.5 ms at batch 128 on a
   GB200 with a 248k vocabulary, so it is a separate switch.
-- ``repetition_window``, ``top_p_first`` and ``top_p_min_keep`` stay at their defaults
-  until a port needs them: they ask the node's sampler for a capability a ``Sampler``
-  declaration doesn't name yet.
+- ``repetition_window`` needs the node's ``Sampler`` to declare at least that window
+  (``repetition_window=``), and ``top_p_first`` or a ``top_p_min_keep`` above 1 needs
+  ``top_p_first=True``.
 
 A step whose every row samples greedily (temperature 0, no repetition penalty, no
 ``min_tokens`` and no log-probs) takes each row's argmax instead of the full sampler's draw,
@@ -446,6 +446,8 @@ has four fields:
   in entries (``Bidirectional(kept_window=True)``, below). The pool keeps the label's first
   ``sink`` entries and its last ``window``, and gives back the whole pages between them, so
   the footprint is the window's.
+- ``max_growth``: the most entries the growth reserves, below what the loops' caps give, for a
+  label whose loops stop sooner than their caps say. None takes the caps.
 
 ``process_prompt`` may also return ``keyed_spans``, keyed by array and then label: how many
 leading spans the label's keys cover, by default every span before the first ``rows`` span.
@@ -453,7 +455,7 @@ A prompt on a walk the keys don't name sets 0, because the data worker refuses a
 from any other walk. This key is temporary, with ``kv_labels``.
 A name either key doesn't declare fails the request.
 
-The footprint adds the spans, the growth at each loop's iterations (up to a ``LabelLayout``'s
+The footprint adds the spans, the growth at each loop's iterations (up to the layout's
 ``max_growth``) and the scratch, and rounds up to whole pages per label. A span's own scratch counts only with the spans before
 it, so a window's denoise steps and its commit count once. Under a ``RetentionPolicy`` it
 takes the window's peak instead. ``KVReqConfig.validate`` refuses a request whose footprint
@@ -697,8 +699,8 @@ and of ``kernel_settings()`` against the conductor's at startup, and a mismatch 
 server, naming what differs.
 
 An **array** holds, per request, per label and per declared layer, entries at log positions
-``0`` to ``n - 1``, with ``n <= max_len``. An entry's index is its log position, never its
-RoPE position or a ring slot.
+``0`` to ``n - 1``, with ``n <= max_len``, or with no bound when ``max_len`` is None. An entry's
+index is its log position, never its RoPE position or a ring slot.
 
 .. code-block:: python
 
@@ -765,11 +767,30 @@ deployment YAML tunes them under ``resources:`` (see :ref:`Step 6 <config-yaml>`
   the entry's heads.
 - ``Value(name, nodes=, layers=, entry=, updates=)``: a rewritable array of one entry, such
   as a recurrent state. ``updates`` names the kernels that read and write one of its fields
-  in place: ``CausalConv()`` needs a field ``conv`` of shape ``(channels, kernel - 1)``, and
-  ``GatedDeltaNet()`` a field ``state`` of shape ``(h_v, d_k, d_v)``.
+  in place: ``CausalConv()`` needs a field ``conv`` of shape ``(channels, kernel - 1)``,
+  ``GatedDeltaNet()`` a field ``state`` of shape ``(h_v, d_k, d_v)``, and ``Mamba2()`` a field
+  ``ssm`` of shape ``(heads, head_dim, state_size)``.
 - ``max_len=0``: the array keeps nothing between steps, for attention within this step only.
-  Its one read uses ``Block()``, which sees only the entries of the token's own segment. See
-  `Cacheless attention (encoder towers)`_.
+  Its one read uses ``Block()``, which sees only the entries of the token's own segment, or
+  ``BlockCausal(size)``, which sees the segment's blocks of ``size`` entries up to the token's
+  own, as an audio tower that attends in chunks does. See `Cacheless attention (encoder towers)`_.
+- ``max_len=None``: the log has no bound, and the engine keeps what the reads can still reach.
+  Today such an array takes one label and one ``Window`` or kept-window read through ``Attend``,
+  with ``packed=False`` and as many query heads as the entry, over every layer. A bounded KV holds
+  it, one slot per request (`Bounded (sink + window) caches`_). Its read takes ``distance_bias``,
+  ``(rows, q_heads, T, size)``, whose entry ``d`` adds to the score of the key at distance ``d``,
+  and ``Positions()`` is each request's count of committed entries. A kept-window read keeps a
+  sink and a window of a stream that begins with the row's start, entries kept once and read
+  where they live, as a voice prompt every request in the voice reads. ``start_lengths`` is the
+  range of lengths a start may have, and ``kept_windows`` gives the read's base
+  ``KeptWindow(sink, window=, grows=)``, whose ``grows`` side, ``"sink"`` or ``"window"``, adds
+  the start's length; either side may be 0. ``Bidirectional(kept_window=True, last_first=True)``
+  joins each step's adds to the kept entries last-first, for attention that ignores key order, so
+  a cut keeps the entries a step adds first the longest, and a step with ``keep=False`` attends its
+  adds and keeps none. The handle takes the starts once at bind
+  (``set_starts``, each field ``(layers, n, *shape)``), and each step names each row's by index
+  (``ArrayStep.starts``), which a region's step takes from the open step. Its ``distance_bias``
+  is ``(rows, q_heads, T, R)``, whose entry ``d + T - 1`` adds to the key at distance ``d``.
 - ``Positions(rope=)``: a position counter per request and label, on an append-only array
   that keeps entries. ``rope=None`` is a counter only. ``Rope`` carries ``theta``,
   ``rotary_dim``, ``interleave``, ``scale``, the Llama 3.1 factors (all three or none), the
@@ -778,9 +799,11 @@ deployment YAML tunes them under ``resources:`` (see :ref:`Step 6 <config-yaml>`
   declares what its layer passed before. The counter is
   separate from log positions: a kept step advances it by each row's advance, a fork copies
   it, and a prefix hit advances it over the skipped spans.
-- ``Sampler(name, nodes=, vocab_size=, penalty=, min_p=, eos_ids=, draws=)``. ``penalty`` and
-  ``min_p`` declare capabilities, not intentions: each selects which kernel variant is
-  recorded into the captured graph. ``draws`` is how many draws each step that lists the
+- ``Sampler(name, nodes=, vocab_size=, penalty=, min_p=, eos_ids=, draws=, repetition_window=,
+  top_p_first=)``. ``penalty`` and ``min_p`` declare capabilities, not intentions: each selects
+  which kernel variant is recorded into the captured graph. So do ``repetition_window``, the
+  longest window a request's ``repetition_window`` may count, and ``top_p_first``, which lets a
+  request set ``top_p_first`` and ``top_p_min_keep``. ``draws`` is how many draws each step that lists the
   sampler makes, by ``sample`` or ``drew``. Each is a fresh draw that advances each kept row's
   sampling state. Log-probs and a device loop-back take one token per step, so loading refuses both
   above one draw.
@@ -839,11 +862,14 @@ segments in this step, and each request's k-th segment on one pairs with its k-t
 It takes a mask that uses no query position: ``Block()`` on an array with ``max_len=0``, and
 ``Bidirectional()`` on one that keeps entries, whose context is added on the walk that carries it
 and listed at span 0 afterwards. A cross read on an array that keeps entries is that array's one
-read, over one label, and its queries come from an append-only array that keeps entries. It is
-refused at load on a node that splits its steps over SP ranks, and where its pool or the queried
-array's pool is stored by position (``context_parallel``). A ``max_len=0`` cross read's queries
-come from an array of one label, and ``queries`` never names the
-read's own array. Separate token sets are separate arrays, and arrays of one kind and geometry on one node share one resource,
+read, over one label, and its queries come from an append-only array that keeps entries in pages.
+It is refused at load on a node that splits its steps over SP ranks, and where its pool or the
+queried array's pool is stored by position (``context_parallel``). A ``max_len=0`` cross read's
+queries come from an array of one label, and ``queries`` never names the
+read's own array. Queries that nothing on the node attends among themselves, as a resampler's
+learned queries, come from an array with ``max_len=0``, ``entry=Entry({})`` and no reads: its step
+plans nothing, it takes no add or read, and loading refuses one that no read's ``queries`` names.
+Separate token sets are separate arrays, and arrays of one kind and geometry on one node share one resource,
 each under its own label.
 
 Under sequence parallelism an array declares nothing: the node's sequence shard
@@ -857,7 +883,9 @@ refused at load.
 
 A read takes its queries packed, ``(tokens, heads, head_dim)`` over every row. A read whose layers
 pass rows of one length, ``(rows, len, heads, head_dim)``, as a DiT's do, declares
-``packed=False``, and a packed call to it is refused.
+``packed=False``, and a packed call to it is refused. A read on an array with a ``max_len`` above 0
+takes packed queries, since the paged kernels take no others. A read on an unbounded array takes
+rows, each row's span first and the rest of its length padding.
 A read whose request's segments lie end to end in one row, as a DiT's packed rows and their pad
 do, declares ``segmented=True``. It takes ``Block()``, ``packed=False`` and no ``queries``, and it
 runs one request a step. Under sequence parallelism its shard splits the whole row (``axis=0``),
@@ -879,7 +907,7 @@ takes tensors of one entry's shape, made at load, and zeros stand in for a field
 ``h.write(layer, **fields)`` writes the rows' entries in place where the forward runs it, in an eager
 step or a replay, so a step refused after a write keeps it in the slots its rows already held. In a
 step, a layer's reads come before its write, a field takes one write, and each row at span 1 or more
-gets every field from the step's own write. Such a ``Value`` takes no ``keep=False`` and sits on no
+gets every field from the step's own write or from a piecewise region whose own step lists it. Such a ``Value`` takes no ``keep=False`` and sits on no
 node with prefix keys. Parakeet's transducer state and both speech codecs are the examples.
 Chatterbox's S3Gen keeps its vocoder tail and reference in ``s3gen_stream``'s tensor fields and its
 generator state in a host field: ``prepare_inputs`` draws the chunk's noise from the state ``host``
@@ -887,10 +915,10 @@ returns, and the step declares the next one in ``ArrayStep(host=)``, so a step p
 a refused admit draws the same noise.
 
 ``kernel_settings(self)`` is a temporary hook for what the engine doesn't pick itself yet:
-``splits``, ``decode_fmha`` and ``decode_tensor_cores`` on a read of an array that keeps entries,
+``splits``, ``decode_fmha`` and ``decode_tensor_cores`` on a read of a paged array,
 ``splits`` on a ``GatedDeltaNet``, and ``max_segments_per_request``, ``max_segments_per_step``,
 ``compile_op`` and ``workspace_mb`` on a ``Block`` read. Under an array's name it sets the default size of the array's pool, ``max_num_pages``
-on a paged array and ``max_slots`` on a ``Value`` with tensor fields, which a deployment's
+on a paged array and ``max_slots`` on a ``Value`` with tensor fields or an unbounded array, which a deployment's
 ``resources:`` block overrides. A cross read on an array that keeps entries takes
 ``decode_tensor_cores`` alone, and two reads that share a resource can't set one field to two
 values. It refuses anything else.
@@ -1172,9 +1200,9 @@ The spec types are:
      - Linear attention planned against a ``RecurrentStateSpec`` pool that holds its
        state: gated DeltaNet (``LinearAttnVariant.GDN``), Kimi delta attention (``KDA``:
        fused Triton kernels on CUDA, a torch reference elsewhere) or Mamba-2. A layer
-       calls gated DeltaNet through ``causal_conv`` and ``gated_delta_net``, and the
-       others through ``KDACallable`` or ``Mamba2Callable``
-       (``mstar/engine/resources/convenience.py``), which hand the kernels the layer's
+       calls gated DeltaNet through ``causal_conv`` and ``gated_delta_net``, Mamba-2
+       through ``causal_conv`` and ``mamba2``, and KDA through ``KDACallable``
+       (``mstar/engine/resources/convenience.py``), which hands the kernels the layer's
        blocks of the pool, so the layer never names one. A KDA pool built with
        ``DeltaNetGeometry.to_blocks(speculative_tokens=k)`` also runs verify steps
        (``LinearAttnStep(speculative=True)``), and ``KDACallable.set_prefix_len``
@@ -1261,7 +1289,7 @@ The rows below name specs where a declaration doesn't reach them yet.
    * - A node that carries per-request state between steps of a loop (an RNN-T
        decoder, recurrent attention)
      - A ``Value`` with tensor fields, read and written whole, and for a linear-attention
-       layer stack a ``Value`` with a ``GatedDeltaNet``.
+       layer stack a ``Value`` with a ``GatedDeltaNet`` or a ``Mamba2``.
    * - A node that samples with two different sets of parameters
      - Two ``SamplerSpec`` objects that both name the node, under different keys.
    * - An encoder tower that attends within the segments of one packed forward
@@ -1508,7 +1536,8 @@ Bounded (sink + window) caches
 
 A streaming decoder that keeps a fixed amount of context per request (a prompt or voice
 prefix plus the last N steps, as StreamingLLM-style sinks or a streaming vocoder's chunk
-caches do) declares a ``BoundedKVSpec``. A request takes a slot when it first runs and
+caches do) declares a ``BoundedKVSpec``, or on the state contract an ``Array`` with
+``max_len=None``. A request takes a slot when it first runs and
 keeps it; the window is a ring overwritten in place, so a step reserves and releases
 nothing. A step's layout is at most five key ranges and three write ranges per row,
 computed on the host from the position the step declares, which is also what lets rows at
@@ -1521,7 +1550,10 @@ writes none), unmasked, and its writes land after. Pass
 from shared prefixes that the slots should not copy; each row reads the one its
 ``StreamPosition.source`` names, so rows of different prefixes share a batch and a graph. ``rel_bias`` adds a term that depends only on
 the query-key distance, for Transformer-XL-style relative positions. A streaming vocoder
-like MiniCPM-o's token2wav fits three of them: its two conformer caches and its DiT's.
+like MiniCPM-o's token2wav fits three of them: its two conformer caches and its DiT's. It
+declares each as an ``Array`` with ``max_len=None`` and a kept-window read
+(``token2wav_state`` in ``mstar/model/components/token2wav/state.py``): its voices' prompts
+are the arrays' starts, and the DiT's two guidance rows are heads of one entry.
 
 Two flags cover retention rules that are not quite a token FIFO.
 ``SinkWindow(window_includes_step=True)`` counts the step's own tokens toward the window.
@@ -1538,9 +1570,11 @@ within itself and matches the offline mask. ``rel_bias`` is then indexed by that
 ``[rows, H, T, left + 1]``, and passed unscaled (the kernel scales the sum by
 ``head_dim ** -0.5``). A per-query window takes no sink, and its right context is 0.
 ``retention`` may be a single ``SinkWindow`` when it does not depend on the source length.
+``BoundedKVConfig(ieee=True)`` attends a float32 cache in IEEE fp32 rather than TF32; on the
+state contract it is the read's kernel setting ``ieee``, on for a float32 entry.
 ``BoundedKVConfig(dtype=None)`` stores the cache in the engine's KV dtype, for layers that
-compute in it. The streaming FastConformer (``encoder_kv_config`` in
-``mstar/model/components/fastconformer_stream.py``, Nemotron VoiceChat's ``ENCODER_KV``) is
+compute in it. The streaming FastConformer (Nemotron VoiceChat's ``ENCODER_KV``, an ``Array``
+with ``max_len=None`` and a ``Window`` read, which the state contract holds in such a cache) is
 the per-query example.
 
 Rolling (compacted) caches
@@ -2399,8 +2433,8 @@ and each row's label comes from the step's segments, so there are no cursors:
   per layer per step, and it is the layer's last add. Scratch adds can repeat, and last until
   the next add or the end of the step. ``keep=None`` takes the step's ``keep``. The resources keep
   or drop a step's adds as a whole, so a step that keeps needs each layer to end on a kept add,
-  unless every row it lists has span 0 or is a placeholder, and a step with ``keep=False``
-  refuses ``keep=True``.
+  unless every row it lists has span 0, is a placeholder or got its adds from a piecewise region
+  whose own step lists it, and a step with ``keep=False`` refuses ``keep=True``.
 - ``read`` sees kept entries from earlier steps, plus this layer's latest add, at the
   positions its mask reaches. It runs the op the declaration names for the layer.
 - ``write`` sets the step's rows' entries in place where the forward runs it, not at the step's commit.
@@ -2418,6 +2452,7 @@ The rest are free functions in ``mstar.engine.state``:
    out  = add_read(self.kv, layer, q, k=k, v=v)                            # add, then read, behind one break
    qkv  = causal_conv(self.gdn, layer, qkv, weight=w, bias=b)              # reads and writes `conv`
    core = gated_delta_net(self.gdn, layer, q, k, v, a, b, A_log, dt_bias)  # reads and writes `state`
+   y    = mamba2(self.ssm, layer, x, dt, b, c, A_log, D, dt_bias)          # reads and writes `ssm`
    p    = position(self.kv, fwd_info.rid_handle, label)                    # a request's next position, on the host
    ids  = positions(self.kv)                  # this step's ids, on the device
    q, k = rope(self.kv, q, k)                 # rotate at this step's ids with the declared Rope

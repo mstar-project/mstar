@@ -25,10 +25,12 @@ from mstar.engine.state import (
     Attend,
     Bidirectional,
     Block,
+    BlockCausal,
     Causal,
     CausalConv,
     Entry,
     GatedDeltaNet,
+    KeptWindow,
     KVEntry,
     Positions,
     Read,
@@ -256,9 +258,15 @@ def test_a_block_read_on_max_len_zero_has_no_problem():
     assert state_declaration_problems(_StubModel(_array(max_len=0, reads={"r": _read(mask=Block())}))) == []
 
 
+def test_a_block_causal_read_on_max_len_zero_has_no_problem():
+    array = _array(max_len=0, reads={"r": _read(mask=BlockCausal(4))})
+    assert state_declaration_problems(_StubModel(array)) == []
+
+
 @pytest.mark.parametrize("array", [
     Value("kv", nodes={"LLM"}, layers={0}, entry=_gdn_entry()),
-    Array("kv", nodes={"LLM"}, layers={0}, entry=KVEntry(heads=4, head_dim=8), max_len=0),
+    Array("kv", nodes={"LLM"}, layers={0}, entry=KVEntry(heads=4, head_dim=8), max_len=0,
+          reads={"r": _read(mask=Block())}),
 ])
 def test_positions_sit_only_on_an_append_only_array_that_keeps_entries(array):
     with_positions = replace(array, positions=Positions())
@@ -353,7 +361,9 @@ def test_a_kept_cross_read_over_an_array_that_keeps_entries_has_no_problems():
 
 def test_a_bidirectional_read_needs_an_array_that_keeps_entries():
     problem = _one_problem(_within("vision", reads={"r": _read(mask=Bidirectional())}))
-    assert "every read of an array with max_len 0 is a Block read, and this one is Bidirectional" in problem
+    assert "every read of an array with max_len 0 is a Block or BlockCausal read, and this one is Bidirectional" in (
+        problem
+    )
 
 
 def _chunked(*arrays, chunkable=True) -> _StubModel:
@@ -497,6 +507,21 @@ def test_a_combined_walk_whose_walks_read_different_layers_is_refused():
 def test_a_cross_read_is_refused_naming_its_array_and_the_cause(arrays, where, cause):
     problem = _one_problem(*arrays)
     assert problem.startswith("Array 'text'.") and where in problem and cause in problem
+
+
+def _queries() -> Array:
+    return Array("video", nodes={"LLM"}, layers={0}, entry=Entry({}), max_len=0)
+
+
+def test_an_array_with_no_reads_that_lays_out_a_cross_reads_queries_has_no_problems():
+    assert state_declaration_problems(_StubModel(_cross(), _queries())) == []
+
+
+def test_an_array_with_no_reads_must_lay_out_a_reads_queries():
+    assert _one_problem(_queries()) == (
+        "Array 'video'.reads: with max_len 0 and no reads, the array only lays out another read's queries, and no "
+        "read's queries names 'video'"
+    )
 
 
 def _flag() -> Array:
@@ -762,4 +787,43 @@ def test_a_rebuild_leaves_a_whole_step_read_on_a_walk_that_takes_no_ids():
     array = _array(reads={"p": _read(walks={"prefill"}), "d": _read(mask=Bidirectional(), walks={"decode"})})
     assert state_declaration_problems(_StubModel(array, rebuild=rebuild)) == [], (
         "a walk whose rebuild rows take no sampled ids was refused"
+    )
+
+
+def test_a_block_read_needs_max_len_zero_also_when_unbounded():
+    problem = _one_problem(_array(max_len=None, reads={"r": _read(mask=Block())}))
+    assert problem.startswith("Array 'kv'.reads['r'].mask") and "max_len is None" in problem, problem
+
+
+def test_positions_are_allowed_on_an_unbounded_array():
+    unbounded = _array(max_len=None, positions=Positions(), reads={"r": _read(mask=Window(4), packed=False)})
+    assert state_declaration_problems(_StubModel(unbounded)) == [], "an unbounded array keeps entries and counts them"
+
+
+def test_an_unbounded_array_digests_alike_in_two_processes():
+    """A None that read as 0, or digested by its id, would stop every server at the digest check."""
+    script = (
+        "import sys; sys.path.insert(0, 'test/modular'); "
+        "from test_state_declaration_checks import _unbounded_digests; print(_unbounded_digests())"
+    )
+    other = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, check=True).stdout.strip()
+    assert other == str(_unbounded_digests()), "two processes digest one unbounded array differently"
+    assert _unbounded_digests() != declaration_digests([_array(max_len=0)]), "None and 0 digest alike"
+
+
+def _unbounded_digests() -> dict[str, str]:
+    return declaration_digests([_array(max_len=None, reads={"r": _read(mask=Window(4), packed=False)})])
+
+
+def test_the_digest_takes_an_unbounded_array_s_start_lengths():
+    """Two processes that take their voices' lengths apart would size their bounded KVs apart."""
+    def started(lengths: range) -> Array:
+        return Array(
+            "enc_kv", nodes={"LLM"}, layers={0}, max_len=None, entry=KVEntry(heads=2, head_dim=4),
+            reads={"enc": Read(mask=Bidirectional(kept_window=True), op=Attend(q_heads=2), packed=False)},
+            start_lengths=lengths, kept_windows={"enc": KeptWindow(1, window=2, grows="sink")},
+        )
+
+    assert declaration_digests([started(range(2, 5))]) != declaration_digests([started(range(2, 6))]), (
+        "the conductor would take a worker with other start lengths for its own"
     )

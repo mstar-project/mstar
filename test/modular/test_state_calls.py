@@ -23,6 +23,8 @@ from torch._dynamo.utils import counters
 
 from mstar.engine import state
 from mstar.engine.resources.attn.base import AttentionManager
+from mstar.engine.resources.kv.bounded.config import StreamPosition
+from mstar.engine.resources.kv.bounded.manager import BoundedKVManager
 from mstar.engine.resources.recurrent.config import RecurrentStep
 from mstar.engine.resources.recurrent.pool import RecurrentStatePool
 from mstar.engine.resources.resident import build_planner
@@ -34,13 +36,17 @@ from mstar.engine.state import (
     Array,
     ArrayStep,
     Attend,
+    Bidirectional,
     Block,
     Causal,
     CausalConv,
     Entry,
     Fork,
     GatedDeltaNet,
+    KeptWindow,
     KVEntry,
+    Layout,
+    Mamba2,
     Positions,
     Read,
     Rope,
@@ -48,6 +54,7 @@ from mstar.engine.state import (
     SampleStep,
     TensorType,
     Value,
+    Window,
     add_read,
     at_last_token,
     causal_conv,
@@ -56,12 +63,22 @@ from mstar.engine.state import (
     gated_delta_net,
     kernel_setting,
     last_sampled,
+    mamba2,
     position,
     positions,
     rope,
     sample,
 )
-from mstar.engine.state.adapters import GDN, StateSetup, WithinStepHandle, _resolve, build_handle, build_specs
+from mstar.engine.state.adapters import (
+    GDN,
+    StateSetup,
+    WithinStepHandle,
+    _resolve,
+    build_handle,
+    build_specs,
+    kv_layouts,
+    state_steps,
+)
 from mstar.engine.state.calls import ArrayHandle, SamplerHandle
 from mstar.engine.state.host_fields import HostFields
 
@@ -172,6 +189,16 @@ class _StubLinear:
         self.labels.append(label)
         state_layer[0] = 1
         return v + 1
+
+
+class _StubMamba2(_StubLinear):
+    """Records what `Mamba2Manager.run` would get, and writes the ssm block in place as its kernels do."""
+
+    def run(self, x, dt, b, c, ssm_layer, a_log, d, dt_bias, label):
+        self.labels.append(label)
+        self.ran = (x, dt, b, c, a_log, d, dt_bias)
+        ssm_layer[0] = 1
+        return x + 1
 
 
 class _StubPositions:
@@ -388,6 +415,28 @@ def test_updates_run_on_the_layers_own_field_and_write_it_in_place():
     core = gated_delta_net(h, 1, q, k, v, q, q, q, q)
     assert torch.equal(core, v + 1)
     assert h._pool.blocks["state"][0].abs().sum() > 0 and h._pool.blocks["state"][1].abs().sum() == 0
+
+
+def test_mamba2_and_causal_conv_reach_the_mamba2_manager():
+    channels = HEADS * DIM + 2 * 4
+    entry = Entry({
+        "ssm": TensorType((HEADS, DIM, 4), dtype=torch.float32, shard=0),
+        "conv": TensorType((channels, 3), dtype=None, shard=0),
+    })
+    array = Value("ssm", nodes={"LLM"}, layers={1, 5}, entry=entry, updates={"c": CausalConv(), "m": Mamba2()})
+    pool = _StubPool({"ssm": torch.zeros(2, SLOTS, HEADS, DIM, 4), "conv": torch.zeros(2, SLOTS, channels, 3)})
+    run = _StubMamba2()
+    h = build_handle(array, {"ssm": pool, "m": run}, _resolve([array], StateSetup()))
+    _begin(h)
+    xbc = torch.randn(TOKENS, channels)
+    assert torch.equal(causal_conv(h, 5, xbc, weight=torch.ones(channels, 4)), xbc * 2)
+    assert pool.blocks["conv"][1].abs().sum() > 0 and pool.blocks["conv"][0].abs().sum() == 0, "the conv ran on layer 5"
+    x, dt, b = torch.randn(TOKENS, HEADS, DIM), torch.randn(TOKENS, HEADS), torch.randn(TOKENS, 1, 4)
+    a_log, d, dt_bias = torch.randn(HEADS), torch.randn(HEADS), torch.randn(HEADS)
+    assert torch.equal(mamba2(h, 1, x, dt, b, -b, a_log, d, dt_bias), x + 1)
+    assert all(map(torch.equal, run.ran, (x, dt, b, -b, a_log, d, dt_bias))), "run takes the call's tensors as given"
+    assert pool.blocks["ssm"][0].abs().sum() > 0 and pool.blocks["ssm"][1].abs().sum() == 0, "the update ran on layer 1"
+    assert run.labels == ["main", "main"], "both kernels run on the Mamba-2 manager, under the step's label"
 
 
 def test_positions_read_the_resource_at_the_steps_label():
@@ -1474,8 +1523,8 @@ def test_a_kept_step_that_leaves_a_field_unwritten_is_refused_naming_it():
 
 
 def test_a_step_over_a_fresh_row_and_a_written_row_counts_only_its_own_write():
-    """A region's replay writes its rows' slots with no Python, so the handle never sees it. A fresh row it leaves out
-    would then commit as written, and read zeros next rather than its start."""
+    """A row counts as written by the step's own write or by a region whose own step lists it. A fresh row that
+    neither wrote would commit as written, and read zeros next rather than its start."""
     h, pool = _plain_value()
     _commit_written(h, pool)
     step, _, _ = _value_step(h, pool, [Segment(1, "main", 1), Segment(2, "main", 1)])
@@ -1705,3 +1754,452 @@ def test_the_contract_exports_the_fused_draw_outside_its_surface():
     assert draw_row is fused_draw.draw_row and draw_row_layout is fused_draw.layout
     names = {"FusedDrawArgs", "fused_draw_args", "drew", "draw_row", "draw_row_layout"}
     assert names.isdisjoint(state.__all__), "the fused draw can change until a second model draws in place"
+
+
+# An unbounded array: a bounded KV keeps each row's newest entries, and its attention stores the step's keys.
+
+BOUNDED_DIM, WINDOW = 16, 4
+
+
+def _unbounded(**overrides) -> Array:
+    return Array("enc_kv", **{
+        "nodes": {"LLM"}, "layers": {3, 6}, "entry": KVEntry(heads=HEADS, head_dim=BOUNDED_DIM), "max_len": None,
+        "reads": {"enc": Read(mask=Window(WINDOW), op=Attend(q_heads=HEADS), packed=False)}, **overrides,
+    })
+
+
+def _bounded(array=None, dtype=torch.float32, device="cpu") -> tuple[ArrayHandle, BoundedKVManager]:
+    array = array or _unbounded()
+    (spec,) = build_specs([array])
+    kv = BoundedKVManager(spec.config, torch.device(device), dtype)
+    return build_handle(array, {array.name: kv}, _resolve([array], StateSetup())), kv
+
+
+def _bounded_step(h, kv, spans=(2,), **declared) -> SubmoduleStep:
+    """A step that lists rows 1, 2, ... at ``spans``, expanded, admitted, planned and begun as the engine runs it."""
+    segments = [Segment(rid, "main", span) for rid, span in enumerate(spans, start=1)]
+    step = state_steps(_step(h, segments=segments, ctx=_ctx(rows=tuple(range(1, len(spans) + 1))), **declared),
+                       {h.name: h})
+    assert kv.admit(step.steps[h.name], step.ctx).ok
+    kv.plan(step.steps[h.name], step.ctx)
+    h.begin_step(step)
+    return step
+
+
+def _frames(rows=1, t=2, dtype=torch.float32):
+    q, k, v = (torch.randn(rows, t, HEADS, BOUNDED_DIM, dtype=dtype) for _ in range(3))
+    return q, k, v, torch.randn(rows, HEADS, t, WINDOW, dtype=dtype)
+
+
+def test_a_bounded_read_equals_the_manager_s_own_attend():
+    """Layer 6 is the pool's layer 1, so the read passes the pool's index, not the model's."""
+    h, kv = _bounded()
+    other, direct = _bounded()
+    _bounded_step(h, kv)
+    _bounded_step(other, direct)
+    q, k, v, bias = _frames()
+    h.add(6, k=k, v=v)
+    out = h.read(6, q, distance_bias=bias)
+    expected = direct.attend(1, q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), rel_bias=bias)
+    assert out.shape == (1, 2, HEADS, BOUNDED_DIM), "a read returns (rows, T, heads, head_dim)"
+    assert torch.equal(out, expected), "the binding converts only the input layout"
+    assert torch.equal(kv.layer(1), direct.layer(1)) and not kv.layer(0).any(), "the read stored layer 6's keys"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="the bounded kernels need a GPU")
+def test_a_bounded_read_on_the_device_equals_the_torch_path():
+    """The read's conversions reach the Triton kernels as they reach the torch path, over two steps of three frames
+    whose second reads what the window keeps of the first."""
+    torch.manual_seed(0)
+    arms = [_bounded(), _bounded(device="cuda")]
+    for _ in range(2):
+        q, k, v, bias = _frames(t=3)
+        outs = []
+        for (h, kv), device in zip(arms, ("cpu", "cuda"), strict=True):
+            step = _bounded_step(h, kv, spans=(3,))
+            for layer in sorted(h.array.layers):
+                h.add(layer, k=k.to(device), v=v.to(device))
+                outs.append(h.read(layer, q.to(device), distance_bias=bias.to(device)).cpu())
+            h.check_step(step)
+            kv.commit(step.steps[h.name], step.ctx)
+            h.end_step(step)
+        for host, dev in zip(outs[:2], outs[2:], strict=True):
+            torch.testing.assert_close(dev, host, atol=1e-4, rtol=1e-4)
+
+
+def test_a_bounded_read_casts_q_to_the_kv_dtype():
+    """Under bf16 autocast a parameter added to q leaves it fp32, and the kernel takes one dtype."""
+    h, kv = _bounded(dtype=torch.bfloat16)
+    _bounded_step(h, kv)
+    q, k, v, _ = _frames(dtype=torch.bfloat16)
+    h.add(3, k=k, v=v)
+    assert h.read(3, q.float()).dtype is torch.bfloat16, "q reaches the kernel in k's dtype"
+
+
+def test_position_on_a_bounded_array_is_its_committed_count():
+    h, kv = _bounded(_unbounded(positions=Positions()))
+    step = _bounded_step(h, kv, spans=(3,))
+    assert position(h, 1, "main") == 0
+    q, k, v, _ = _frames(t=3)
+    for layer in (3, 6):
+        h.add(layer, k=k, v=v)
+        h.read(layer, q)
+    h.check_step(step)
+    kv.commit(step.steps[h.name], step.ctx)
+    h.end_step(step)
+    assert position(h, 1, "main") == 3 == kv.written(1), "one record of a row's position: the manager's count"
+    assert state_steps(_step(h, segments=[Segment(1, "main", 1)]), {h.name: h}).steps[h.name].positions[1].written == 3
+
+
+def test_a_region_s_commit_inside_a_step_leaves_the_count_advanced_once():
+    """Both steps declare the count they were built at, and a commit sets the count from it."""
+    h, kv = _bounded()
+    outer = _bounded_step(h, kv, spans=(1,))
+    region = state_steps(_step(h, segments=[Segment(1, "main", 1)]), {h.name: h})
+    assert region.steps[h.name].positions[1].written == 0, "the region's step is built before either commit"
+    kv.commit(region.steps[h.name], region.ctx)
+    kv.commit(outer.steps[h.name], outer.ctx)
+    assert kv.written(1) == 1, "two commits of one frame advance the count by one"
+
+
+def test_a_bounded_array_answers_position_only_where_declared():
+    h, _ = _bounded()
+    _refused(r"Array 'enc_kv': the array declares no positions", lambda: position(h, 1, "main"))
+
+
+def test_a_bounded_array_refuses_position_ids_and_rope():
+    h, kv = _bounded(_unbounded(positions=Positions()))
+    _bounded_step(h, kv)
+    q, k, _, _ = _frames()
+    _refused(r"no layout yet: positions\(\), and its positions are a count with no ids", lambda: positions(h))
+    _refused(r"no layout yet: rope\(\), and its positions declare no Rope", lambda: rope(h, q, k))
+
+
+def test_a_bounded_step_sets_no_advance_or_position_ids():
+    h, kv = _bounded(_unbounded(positions=Positions()))
+    for field in ({"advance": (1,)}, {"position_ids": torch.arange(2)}):
+        with pytest.raises(ValueError, match=r"Array 'enc_kv': no layout yet: a step sets advance or position_ids"):
+            state_steps(_step(h, enc_kv=ArrayStep(**field)), {h.name: h})
+
+
+@pytest.mark.parametrize("declared, refusal", [
+    (ArrayStep(forks=(Fork(src="main", dst="main", at="start"),)), "no layout yet: a fork of an unbounded array"),
+    (ArrayStep(placeholders=frozenset({(1, "main")})), "a step sets placeholders or eager_add"),
+    (ArrayStep(eager_add=True), "a step sets placeholders or eager_add"),
+], ids=["fork", "placeholders", "eager_add"])
+def test_a_bounded_step_forks_nothing(declared, refusal):
+    h, _ = _bounded()
+    _refused(rf"Array 'enc_kv': {refusal}", lambda: _begin(h, enc_kv=declared))
+
+
+def test_a_bounded_add_is_kept_since_its_read_stores_it():
+    h, kv = _bounded()
+    _bounded_step(h, kv)
+    _, k, v, _ = _frames()
+    _refused(r"Array 'enc_kv': no layout yet: keep=False on layer 3 of an unbounded array",
+             lambda: h.add(3, keep=False, k=k, v=v))
+
+
+def test_a_bounded_add_while_another_layer_s_add_waits_is_refused():
+    """The kernel stores an add at its read, so a second layer's add would leave the first one's keys unstored."""
+    h, kv = _bounded()
+    _bounded_step(h, kv)
+    _, k, v, _ = _frames()
+    h.add(3, k=k, v=v)
+    _refused(r"Array 'enc_kv': an add on layer 6 while layer 3's add waits for its read", lambda: h.add(6, k=k, v=v))
+
+
+def test_a_bounded_add_left_unread_is_refused():
+    """The kernel stores an add as it attends, so an add with no read would leave a committed entry unwritten."""
+    h, kv = _bounded()
+    step = _bounded_step(h, kv)
+    q, k, v, _ = _frames()
+    h.add(3, k=k, v=v)
+    h.read(3, q)
+    h.add(6, k=k, v=v)
+    _refused(r"Array 'enc_kv': the step ends with layer 6's add unread", lambda: h.check_step(step))
+
+
+def test_a_bounded_read_takes_only_its_window_s_keyword():
+    h, kv = _bounded()
+    _bounded_step(h, kv)
+    q, k, v, _ = _frames()
+    h.add(3, k=k, v=v)
+    _refused(r"Array 'enc_kv': no layout yet: a read with no op", lambda: h.read(3))
+    _refused(r"Array 'enc_kv': no layout yet: mask arguments \['scale'\], which no mask defines",
+             lambda: h.read(3, q, scale=1.0))
+
+
+def test_a_bounded_add_and_read_take_two_calls():
+    """The encoder adds and reads in two calls, and the bounded handle runs no read in one break with its add."""
+    h, kv = _bounded()
+    _bounded_step(h, kv)
+    q, k, v, _ = _frames()
+    _refused(r"Array 'enc_kv': no layout yet: add_read on a BoundedHandle", lambda: add_read(h, 3, q, k=k, v=v))
+
+
+@pytest.mark.parametrize("handle, where", [(_kv_handle, "on a paged read"), (_within_handle, "within a step")],
+                         ids=["paged", "within a step"])
+def test_distance_bias_has_no_layout_on_paged_or_within_step_reads(handle, where):
+    h = handle()
+    _begin(h)
+    q, k, v = _tensors()
+    h.add(0, k=k, v=v)
+    _refused(rf"no layout yet: distance_bias {where}", lambda: h.read(0, q, distance_bias=q))
+
+
+# A region: a piecewise graph replayed inside the open step, whose own step commits the rows it lists.
+
+
+def _region(h, rows) -> SubmoduleStep:
+    """A region's step over ``rows`` at span 1, replayed and committed inside ``h``'s open step."""
+    region = _step(h, segments=[Segment(rid, "main", 1) for rid in rows], ctx=_ctx(leased=True, rows=tuple(rows)))
+    h.commit_step(region)
+    return region
+
+
+def test_a_row_only_a_region_wrote_passes_and_a_row_nobody_wrote_is_refused():
+    h, pool = _plain_value()
+    step, _, _ = _value_step(h, pool, [Segment(1, "main", 1), Segment(2, "main", 1)])
+    _region(h, [1])
+    _refused(r"Array 'state': layer 0's fields \['n', 'x'\] are unwritten in a kept step for rows \[2\], and no "
+             "update op writes them", lambda: h.check_step(step))
+    _region(h, [2])
+    h.check_step(step)
+    h.end_step(step)
+
+
+def test_a_bounded_row_only_a_region_added_passes_and_a_row_nobody_added_is_refused():
+    h, kv = _bounded()
+    step = _bounded_step(h, kv, spans=(1, 1))
+    _region(h, [2])
+    _refused(r"Array 'enc_kv': a step that keeps lists rows \[1\] at span above 0, which neither its adds nor a "
+             r"region's step added to; list those rows at span 0", lambda: h.check_step(step))
+    _region(h, [1])
+    h.check_step(step)
+
+
+def test_a_region_s_rows_cover_only_the_step_it_ran_in():
+    h, pool = _plain_value()
+    first, _, _ = _value_step(h, pool, [Segment(1, "main", 1)])
+    _region(h, [1])
+    h.check_step(first)
+    h.end_step(first)
+    second, _, _ = _value_step(h, pool, [Segment(1, "main", 1)])
+    _refused(r"Array 'state': layer 0's fields \['n', 'x'\] are unwritten in a kept step for rows \[1\]",
+             lambda: h.check_step(second))
+
+
+def test_a_step_s_own_replay_records_no_region_rows():
+    """A whole-forward replay replays too, and its rows got their entries at capture, not from a region."""
+    h = _kv_handle()
+    step = _begin(h, ctx=_ctx(leased=True))
+    h.commit_step(step)
+    assert not h._region_rows, "the open step's own commit is no region's"
+    h.end_step(step)
+    eager = _begin(h)
+    _refused(r"Array 'kv': a step that keeps lists rows at span above 0 and adds nothing, so the pages would keep "
+             r"entries no add wrote; list those rows at span 0", lambda: h.check_step(eager))
+
+
+def test_a_region_s_rows_reach_a_value_with_host_fields():
+    """A region's step records its rows on a Value with host fields too, since that handle's commit reaches the
+    base's."""
+    entry = Entry({"x": TensorType((2, 3), dtype=torch.float32)}, host={"n": int})
+    array = Value("state", nodes={"LLM"}, layers={0}, entry=entry)
+    (spec,) = build_specs([array], kernel_settings={"state": {"max_slots": 4}})
+    pool = RecurrentStatePool(torch.device("cpu"), spec.config)
+    pool.ingest_request(1)
+    setup = StateSetup(host_fields=HostFields())
+    h = build_handle(array, {"state": pool}, _resolve([array], setup), setup)
+    step, _, _ = _value_step(h, pool, [Segment(1, "main", 1)])
+    _region(h, [1])
+    h.check_step(step)
+    h.end_step(step)
+
+
+# An unbounded array whose rows begin from shared starts, read through a kept window.
+
+
+def _started(**overrides) -> Array:
+    return _unbounded(**{
+        "reads": {"enc": Read(mask=Bidirectional(kept_window=True), op=Attend(q_heads=HEADS), packed=False)},
+        "start_lengths": range(2, 5), "kept_windows": {"enc": KeptWindow(1, window=2, grows="sink")}, **overrides,
+    })
+
+
+def _start(n: int, dtype=torch.float32) -> dict[str, torch.Tensor]:
+    return {field: torch.randn(2, n, HEADS, BOUNDED_DIM, dtype=dtype) for field in ("k", "v")}
+
+
+def _with_starts(*lengths) -> tuple[ArrayHandle, BoundedKVManager, list[dict[str, torch.Tensor]]]:
+    h, kv = _bounded(_started())
+    starts = [_start(n) for n in lengths]
+    h.set_starts(starts)
+    return h, kv, starts
+
+
+def test_each_row_reads_the_start_its_step_names():
+    """Row 1 begins from the 3-entry start and row 2 from the 2-entry one. The read hands the manager both, laid out as
+    the layer's source, and each row's position names its own."""
+    h, kv, starts = _with_starts(2, 3)
+    step = _bounded_step(h, kv, spans=(2, 2), enc_kv=ArrayStep(starts={1: 1, 2: 0}))
+    assert step.steps[h.name].positions == {
+        1: StreamPosition(source_len=3, written=0, source=1), 2: StreamPosition(source_len=2, written=0, source=0),
+    }
+    q, k, v, _ = _frames(rows=2)
+    bias = torch.randn(2, HEADS, 2, 16)
+    h.add(6, k=k, v=v)
+    out = h.read(6, q, distance_bias=bias)
+    direct = BoundedKVManager(kv.config, torch.device("cpu"), torch.float32)
+    assert direct.admit(step.steps[h.name], step.ctx).ok
+    direct.plan(step.steps[h.name], step.ctx)
+    source = torch.zeros(2, 1, HEADS, 3, 2 * BOUNDED_DIM)
+    for i, start in enumerate(starts):
+        source[i, 0, :, :start["k"].shape[1]] = torch.cat([start["k"][1], start["v"][1]], dim=-1).transpose(0, 1)
+    expected = direct.attend(1, q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), source, rel_bias=bias)
+    assert torch.equal(out, expected), "each row attends its own start, then its step's entries"
+
+
+def test_a_region_takes_a_rows_start_from_the_open_step():
+    """The node's step names each row's start once, and a region's step inside it names none."""
+    h, kv, _ = _with_starts(2, 3)
+    _bounded_step(h, kv, spans=(2,), enc_kv=ArrayStep(starts={1: 1}))
+    region = state_steps(_step(h, segments=[Segment(1, "main", 2)]), {h.name: h})
+    assert region.steps[h.name].positions[1] == StreamPosition(source_len=3, written=0, source=1), (
+        "the region would plan row 1 as padding, with no start"
+    )
+
+
+def test_set_starts_after_the_first_step_is_refused():
+    h, kv, starts = _with_starts(2)
+    _bounded_step(h, kv, enc_kv=ArrayStep(starts={1: 0}))
+    _refused(r"Array 'enc_kv': set_starts after the handle's first step", lambda: h.set_starts(starts))
+
+
+def test_a_start_of_a_length_outside_start_lengths_is_refused():
+    h, _ = _bounded(_started())
+    _refused(rf"Array 'enc_kv': start 0's k is \(2, 5, {HEADS}, {BOUNDED_DIM}\), and a start is \(layers 2, n, heads "
+             rf"{HEADS}, head_dim {BOUNDED_DIM}\) with n in range\(2, 5\)", lambda: h.set_starts([_start(5)]))
+
+
+def test_a_start_in_another_dtype_than_the_cache_is_refused():
+    h, _ = _bounded(_started())
+    _refused(r"Array 'enc_kv': start 0's k is torch.float16, and the bounded KV holds torch.float32",
+             lambda: h.set_starts([_start(3, dtype=torch.float16)]))
+
+
+def test_a_real_row_with_no_start_is_refused():
+    """The bounded KV would plan it as padding, and it would attend none of its start."""
+    h, _, _ = _with_starts(2)
+    _refused(r"Array 'enc_kv': rows \[1\] begin from no start", lambda: _begin(h, segments=[Segment(1, "main", 2)]))
+
+
+def test_a_capture_s_rows_begin_from_no_start():
+    h, _, _ = _with_starts(2)
+    step = state_steps(_step(h, segments=[Segment("dummy", "main", 2)], ctx=_ctx(capture=True, rows=("dummy",))),
+                       {h.name: h})
+    h.begin_step(step)
+    assert step.steps[h.name].positions == {}, "a capture's rows are padding, which the bounded KV plans as such"
+
+
+def test_a_start_past_those_set_is_refused():
+    h, _, _ = _with_starts(2)
+    _refused(r"Array 'enc_kv': row 1 begins from start 1, and set_starts gave 1", lambda: state_steps(
+        _step(h, segments=[Segment(1, "main", 2)], enc_kv=ArrayStep(starts={1: 1})), {h.name: h},
+    ))
+
+
+def test_starts_on_an_array_with_no_start_lengths_are_refused():
+    h, _ = _bounded()
+    _refused(r"Array 'enc_kv': a step names starts, and the array declares no start_lengths",
+             lambda: _begin(h, enc_kv=ArrayStep(starts={1: 0})))
+
+
+def test_a_layout_that_sizes_an_unbounded_kept_window_is_refused():
+    with pytest.raises(RuntimeError, match=r"state_layout\['enc_kv'\]\['main'\]\.kept_windows: an unbounded array"):
+        kv_layouts([_started()], {"enc_kv": {"main": Layout(kept_windows={"enc": KeptWindow(1, window=2)})}}, {})
+
+
+def test_a_step_that_keeps_nothing_reads_as_a_kept_one_and_stores_none():
+    """A stream's last window attends its own entries and adds none to what the window keeps."""
+    q, k, v, bias = _frames(t=3)
+    reads = []
+    for keep in (True, False):
+        h, kv = _bounded()
+        step = _bounded_step(h, kv, spans=(3,), enc_kv=ArrayStep(keep=keep))
+        h.add(3, k=k, v=v)
+        reads.append(h.read(3, q, distance_bias=bias))
+    assert [segment.span for segment in step.steps[h.name].segments] == [0], "the bounded KV would store the adds"
+    assert torch.equal(reads[0], reads[1]), "a step's read sees its adds whether or not the step keeps them"
+    h.check_step(step)
+    kv.commit(step.steps[h.name], step.ctx)
+    assert kv.written(1) == 0 and not kv.layer(0).any(), "a step that keeps nothing would have kept its adds"
+
+
+# A region run eagerly inside the open step: its calls answer for its own step, as a replay's would.
+
+
+def _eager_value_region(h, pool, rows) -> SubmoduleStep:
+    """A region's step over ``rows`` at span 1, planned and opened on ``h`` inside its open step, as an eager run of
+    the region opens it."""
+    segments = [Segment(rid, "main", 1) for rid in rows]
+    _, ctx = _plan(pool, segments)
+    region = _step(h, segments=segments, ctx=ctx)
+    h.begin_region(region)
+    return region
+
+
+def test_two_regions_run_eagerly_in_one_step_each_answer_for_their_own_calls():
+    """Two windows' regions each read and write the Value; counted as the open step's, the second read would come
+    after the first write, and the second write would write its fields twice."""
+    h, pool = _plain_value()
+    step, _, _ = _value_step(h, pool, [Segment(1, "main", 1), Segment(2, "main", 1)])
+    for rid in (1, 2):
+        region = _eager_value_region(h, pool, [rid])
+        h.read(0)
+        h.write(0, x=torch.full((1, 2, 3), float(rid)), n=torch.tensor([rid]))
+        h.end_region(region, ran=True)
+    h.check_step(step)
+    assert h._step is step, "the handle would answer for the last region rather than the open step"
+
+
+def test_an_eager_region_that_leaves_a_field_unwritten_is_refused_at_its_end():
+    h, pool = _plain_value()
+    step, _, _ = _value_step(h, pool, [Segment(1, "main", 1)])
+    region = _eager_value_region(h, pool, [1])
+    h.write(0, x=torch.ones(1, 2, 3))
+    _refused(r"Array 'state': layer 0's fields \['n'\] are unwritten in a kept step for rows \[1\]",
+             lambda: h.end_region(region, ran=True))
+    assert h._step is step and h._open, "a refused region would leave the handle answering for it"
+
+
+def test_two_bounded_regions_run_eagerly_in_one_step_each_add_once_per_layer():
+    """A step's full windows and its last ones run in two regions, each adding to every layer once."""
+    h, kv = _bounded()
+    step = _bounded_step(h, kv, spans=(2, 2))
+    for rid in (1, 2):
+        region = state_steps(_step(h, segments=[Segment(rid, "main", 2)], ctx=_ctx(rows=(rid,))), {h.name: h})
+        kv.plan(region.steps[h.name], region.ctx)
+        h.begin_region(region)
+        q, k, v, bias = _frames()
+        for layer in (3, 6):
+            h.add(layer, k=k, v=v)
+            h.read(layer, q, distance_bias=bias)
+        h.end_region(region, ran=True)
+    h.check_step(step)
+
+
+def test_an_eager_region_takes_its_rows_starts_from_the_step_it_runs_in():
+    """The node's step names each row's start, and a region run eagerly inside it answers for its own step, whose rows
+    still begin from those starts."""
+    h, kv, _ = _with_starts(2, 3)
+    _bounded_step(h, kv, spans=(2,), enc_kv=ArrayStep(starts={1: 1}))
+    region = state_steps(_step(h, segments=[Segment(1, "main", 2)]), {h.name: h})
+    kv.plan(region.steps[h.name], region.ctx)
+    h.begin_region(region)
+    q, k, v, _ = _frames()
+    for layer in (3, 6):
+        h.add(layer, k=k, v=v)
+        h.read(layer, q, distance_bias=torch.randn(1, HEADS, 2, 16))
+    h.end_region(region, ran=True)

@@ -9,13 +9,13 @@ holds only the written part of the sink and a ring for the window, and source
 entries are read where they live.
 """
 
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, NamedTuple
 
 import torch
 
-from mstar.engine.resources.spec import NodeResourceSpec
+from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig
 from mstar.engine.resources.step import ResourceStep
 
 if TYPE_CHECKING:
@@ -50,6 +50,8 @@ class BoundedKVConfig:
     # None is the engine's KV dtype (``EngineResourceInfo.kv_dtype``), settled when
     # the resource is built
     dtype: torch.dtype | None = torch.float32
+    # attention on a float32 cache in IEEE fp32 rather than TF32, where ``attend`` is given no ``ieee``
+    ieee: bool = False
     # A step's tokens join the stream last-first. Only for attention that
     # ignores key order, where it decides which of the oldest step's tokens are
     # evicted first: Step-Audio2's flow decoder keeps the front of each chunk.
@@ -117,6 +119,18 @@ class BoundedKVSpec(NodeResourceSpec):
 
         return BoundedKVManager
 
+    def capacity_problem(
+        self, requests: int, request: ResourceReqConfig | None, axis_sizes: Sequence[Mapping[str, int]] = (),
+    ) -> str | None:
+        """A request keeps a slot from its first step until it is torn down, and every slot is a request's."""
+        if requests <= self.config.max_slots:
+            return None
+        return (
+            f"{requests} concurrent requests (max_concurrent_requests) need {requests} slots of resources."
+            f"{self.resource_key}, which holds {self.config.max_slots}; raise max_slots or lower "
+            "max_concurrent_requests"
+        )
+
     def apply_yaml_overrides(self, max_slots: int | None = None):
         if max_slots is not None:
             if max_slots < 1:
@@ -139,9 +153,10 @@ class StreamPosition(NamedTuple):
 class BoundedKVStep(ResourceStep):
     """Each segment's ``span`` is what its request writes this step (0 reads only).
 
-    The positions come from the model, not the resource, so a plan never waits
-    on the previous step's commit and planning the same step twice (a piecewise
-    region inside a forward that declared it too) is harmless.
+    ``positions`` holds each request's stream position before the step, and its
+    ``written`` must equal the count committed for the request. Fixed in the step,
+    it makes planning the step twice (a piecewise region inside a forward that
+    declared it too) harmless.
     """
 
     positions: Mapping[str, StreamPosition] = field(default_factory=dict)

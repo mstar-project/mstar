@@ -25,7 +25,9 @@ PORTED = (
     "mstar/model/qwen3_tts",
     "mstar/model/pi05", "mstar/model/vjepa2", "mstar/model/canary", "mstar/model/components/encoder_decoder.py",
     "mstar/model/bagel", "mstar/model/chatterbox", "mstar/model/whisper",
-    "mstar/model/waypoint", "mstar/model/lingbot_world",
+    "mstar/model/waypoint", "mstar/model/lingbot_world", "mstar/model/minicpm_o",
+    "mstar/model/nemotron_duplex", "mstar/model/components/fastconformer.py",
+    "mstar/model/components/fastconformer_stream.py", "mstar/model/components/token2wav",
 )
 FORBIDDEN_ATTRIBUTES = {
     "node_resources", "resources", "request_state", "request_states", "per_request_states", "sequence_shard",
@@ -47,7 +49,8 @@ ALLOWED = {
     ("mstar.engine.accelerator_graph_runner", "compile_kwargs"): _CAPTURE,
     ("mstar.engine.engine", "ExecutingBatch"): "the annotation of `NodeSubmodule.can_batch`, a base class's hook",
     ("mstar.engine.resources.kv.config", "DEFAULT_PAGE_SIZE"):
-        "the page a model's `max_num_pages` counts in, where its pool is sized per request by a layout",
+        "the page a model's pool sizes count in, its `max_num_pages` or its default pool sizes, until the pool sizes "
+        "itself",
     ("mstar.engine.resources.lora.checkpoint", "LoraFile"): "a model's static LoRA merge at load, which holds no state",
     ("mstar.engine.resources.lora", "LoraSpec"): "the opt-in LoRA spec, written by hand: the contract declares no LoRA",
     ("mstar.engine.resources", "SeqShardSpec"): (
@@ -88,6 +91,8 @@ ALLOWED_IN_FUNCTION = {
         "the ViT's eager varlen attention, flash-attn or a masked SDPA, which keeps no state",
     ("mstar/model/bagel/submodules.py", "ViTEncoderSubmodule._replay_block_loop", "disable"):
         "the ViT region's replay, which runs its captured graph; no state call sits behind it",
+    ("mstar/model/minicpm_o/submodules.py", "AudioEncoderSubmodule._replay_block_loop", "disable"):
+        "the audio block loop's replay, which runs its captured graph; no state call sits behind it",
 }
 # what a module defines to be handed the node's built resources, rather than its handles (`bind_state`)
 RESOURCE_BINDS = {"bind_resources", "bind_node_resources"}

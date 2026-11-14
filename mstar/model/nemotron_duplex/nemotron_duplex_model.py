@@ -3,17 +3,18 @@
 A full-duplex speech-to-speech model with three nodes:
 
     conformer_encoder — 16 kHz speech → per-frame LLM embeds (the shared streaming
-                        FastConformer); resources encoder_kv / encoder_state /
-                        encoder_front
+                        FastConformer); state encoder_kv / encoder_state /
+                        encoder_front / encoder_stream
     nano_llm          — Nemotron-H hybrid Mamba-2/attn/MLP backbone (9B);
-                        resources nano_kv / nano_attn (4 attention layers),
-                        mamba_state / mamba (27 Mamba-2 layers), nano_sampler
+                        state nano_kv (4 attention layers), mamba_state (27
+                        Mamba-2 layers), nano_sampler
     eartts_talker     — Gemma3 talker → 31-codebook RVQ codes, decoded in the
-                        same step by the RVQ codec → 22.05 kHz PCM; resources
-                        talker_kv / talker_attn / talker_pos (two KV labels per
-                        session: the text-conditioned and the null-conditioned
-                        stream of classifier-free guidance), codec_state (each
-                        call's codec stream state)
+                        same step by the RVQ codec → 22.05 kHz PCM; state
+                        talker_kv (two KV labels per session: the
+                        text-conditioned and the null-conditioned stream of
+                        classifier-free guidance), talker_prev (each call's
+                        previous codes), codec_state (each call's codec stream
+                        state)
 
 Full-duplex: the model consumes user speech continuously and emits agent text +
 agent speech as it generates, frame-synchronously in one backbone, so it handles
@@ -30,11 +31,8 @@ The M* serving path is the walk graphs below: three async partitions
 (Encoder → LLM → Talker) joined by ``StreamingGraphEdge``s, with the nano
 decode loop consuming one encoder frame per step. The user's audio is a client
 stream into the Encoder, so a call can stream live over ``/generate/ws`` or
-``/v1/realtime``; a one-shot upload is a stream of one chunk. ``get_node_resources`` declares
-the encoder's bounded KV (each call's attention window) and two recurrent-state
-pools (its conv tails, and its audio / mel tails), the nano's paged KV cache, attention, recurrent-state pool (Mamba-2
-conv + SSM slots), the Mamba-2 resource and the sampler, and the talker's paged
-KV cache, attention, positions and codec stream state. Both decode steps are
+``/v1/realtime``; a one-shot upload is a stream of one chunk. ``declare_state`` declares
+every node's state. Both decode steps are
 CUDA graphs (the talker's with its codec decode), and so is the encoder's live
 step (piecewise).
 
@@ -53,45 +51,47 @@ import torch.nn.functional as F
 
 from mstar.communication.tensors import NameToTensorList
 from mstar.conductor.request_info import PartitionDefinition
-from mstar.engine.resources import (
-    AttentionConfig,
-    AttentionSpec,
-    KVReqConfig,
-    KVSpec,
-    NodeResourceSpec,
-    PagedKVConfig,
-    PositionConfig,
-    PositionSpec,
-    ResourceReqConfig,
-    SamplerSpec,
-    SamplingReqConfig,
-)
-from mstar.engine.resources.kv.bounded import BoundedKVSpec
 from mstar.engine.resources.kv.config import DEFAULT_PAGE_SIZE
-from mstar.engine.resources.linear_attn.config import LinearAttnConfig, LinearAttnSpec, LinearAttnVariant
-from mstar.engine.resources.recurrent import Mamba2Geometry, RecurrentStateConfig, RecurrentStateSpec
+from mstar.engine.state import (
+    Array,
+    Attend,
+    Causal,
+    CausalConv,
+    Entry,
+    KVEntry,
+    Layout,
+    Mamba2,
+    Positions,
+    Read,
+    Sampler,
+    SampleSettings,
+    TensorType,
+    Value,
+    Window,
+)
 from mstar.graph.base import GraphEdge, GraphNode, GraphSection, Loop, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import (
     KVLabel,
-    LabelLayout,
     Model,
     ProcessPromptOutput,
     Span,
     WalkStep,
-    serving_resources,
 )
 from mstar.model.components.audio_features import NemoLogMel
-from mstar.model.components.fastconformer_stream import stream_node_resources
+from mstar.model.components.fastconformer_stream import front_entry
 from mstar.model.multimodal import PromptPart
-from mstar.model.nemotron_duplex.components.audio_codec import codec_state_blocks
+from mstar.model.nemotron_duplex.components.audio_codec import codec_entry
 from mstar.model.nemotron_duplex.config import (
     AUDIO_IN,
     CODEC_STATE,
+    ENCODER_ATTN,
     ENCODER_FRONT,
     ENCODER_KV,
     ENCODER_STATE,
+    ENCODER_STREAM,
     MAMBA,
+    MAMBA_CONV,
     MAMBA_STATE,
     NANO_ATTN,
     NANO_KV,
@@ -99,11 +99,12 @@ from mstar.model.nemotron_duplex.config import (
     SESSION_BATCH_SIZES,
     TALKER_ATTN,
     TALKER_KV,
-    TALKER_POS,
+    TALKER_PREV,
     NemotronDuplexConfig,
     session_too_long,
 )
 from mstar.model.submodule_base import NodeSubmodule
+from mstar.model.utils import check_kv_pools_fit, kv_pages
 from mstar.streaming.chunk_policy import FixedChunkPolicy
 from mstar.streaming.topology import (
     CLIENT,
@@ -224,24 +225,23 @@ class NemotronDuplexModel(Model):
         return types.SimpleNamespace(tokenizer=types.SimpleNamespace(vocab=v), vocab=v)
 
     # -------------------------------------------------------------------
-    # Resources. nano_llm: the paged KV (attention layers only) and attention
-    # plan, the recurrent-state pool holding every Mamba-2 layer's conv window
-    # and SSM state (one slot per session) with the Mamba-2 resource planned
-    # against it, and the agent-text sampler (NoPE: no position resource).
-    # eartts_talker: a paged KV over its 28 Gemma3 layers with attention and
-    # positions; each session holds two streams (labels ``main`` / ``uncond``)
-    # and RoPE runs over the full head dim with a per-layer theta the layer
-    # passes at call time. conformer_encoder: a bounded KV, each call's
-    # attention window, and two recurrent-state pools, its conv tails and its
-    # front end's audio / mel tails (one slot per session each). The talker also
-    # holds each call's codec stream state in a recurrent-state pool, codec_state
-    # (one slot per session).
+    # State and resources. nano_llm declares the KV of its attention layers,
+    # every Mamba-2 layer's conv window and SSM state as one Value (a slot per
+    # session), and the agent-text sampler (NoPE: no positions).
+    # eartts_talker declares a paged KV over its 28 Gemma3 layers with a
+    # position counter; each session holds two streams (labels ``main`` /
+    # ``uncond``) and RoPE runs in torch over the full head dim with a per-layer
+    # theta. It also declares each call's previous codes and codec stream state
+    # as Values (a slot per session). conformer_encoder declares its keys as an
+    # array read through a window, which a bounded KV holds, its conv tails and
+    # its front end's audio / mel tails as Values (one slot per session each),
+    # and each call's counts of samples and mel frames as host fields.
     # -------------------------------------------------------------------
 
     # Sessions resident at once (a slot each in mamba_state, ~137 MB in fp32 for
-    # Nemotron-H, and in encoder_state / encoder_front / codec_state / encoder_kv;
-    # pages in nano_kv and talker_kv). A deployment raising it raises all seven
-    # (see validate_config_yaml). 32 is the most one-shot calls that keep up with real
+    # Nemotron-H, and in encoder_state / encoder_front / codec_state / talker_prev /
+    # encoder_kv; pages in nano_kv and talker_kv). A deployment raising it raises
+    # all eight (see validate_config_yaml). 32 is the most one-shot calls that keep up with real
     # time on one H100 (a tick takes ~62 ms at 32, and 40+ miss the 80 ms budget).
     # Live calls paced over /generate/ws cost more per tick: 16 keep up on one
     # H200, and 32 sit at the edge (all finish, but audio can fall behind).
@@ -281,61 +281,32 @@ class NemotronDuplexModel(Model):
         mels = NemoLogMel.frames(self.max_session_samples, stt.hop_length, stt.reflect_edges)
         return int(stt.encoder.output_lengths(mels))
 
-    def talker_kv_pages(self, page_size: int, sessions: int | None = None) -> int:
-        """Pages for ``sessions`` (DEFAULT_SESSIONS) sessions of max_session_frames, both CFG streams."""
-        return self._session_kv_pages(self.TALKER_WARMUP_POSITIONS, 2, page_size, sessions)
-
-    def nano_kv_pages(self, page_size: int, sessions: int | None = None) -> int:
-        """Pages for ``sessions`` (DEFAULT_SESSIONS) sessions of the longest prompt and max_session_frames."""
-        return self._session_kv_pages(self.max_prompt_tokens, 1, page_size, sessions)
-
-    def _session_kv_pages(self, prefix: int, streams: int, page_size: int, sessions: int | None) -> int:
-        sessions = self.DEFAULT_SESSIONS if sessions is None else sessions
-        positions = prefix + self.max_session_frames + 1
-        # + 1 for the pool's sink page
-        return sessions * streams * -(-positions // page_size) + 1
+    def session_positions(self, prefix: int) -> int:
+        """A label's positions for a session of ``max_session_s`` after a prefix of ``prefix``: a row per frame
+        and one for the final PAD."""
+        return prefix + self.max_session_frames + 1
 
     def validate_config_yaml(self, config: dict, config_path: str) -> None:
-        """Refuse a session cap that a per-session resource cannot hold.
+        """Refuse a session longer than the talker's window, and a session cap
+        that a per-session resource cannot hold.
 
-        A session holds a slot in each recurrent pool (``mamba_state``,
-        ``encoder_state``, ``encoder_front``, ``codec_state``) and in
-        ``encoder_kv``, and its nano and talker pages from its first step to its
-        last, so a session past any of them waits on admit until
-        another ends, and its frames with it. So ``max_concurrent_requests``
-        sessions must fit each; the conductor queues the rest.
+        A session holds a slot in each Value's pool and in ``encoder_kv``, and
+        its nano and talker pages, from its first step to its last, so a
+        session past any of them waits on admit until another ends, and its
+        frames with it. So ``max_concurrent_requests`` sessions must fit each;
+        the conductor queues the rest.
         """
-        cap = config.get("max_concurrent_requests")
-        if cap is None:
-            logger.warning(
-                "%s sets no max_concurrent_requests: a session past the per-session "
-                "resources waits on admit until another ends", config_path,
+        talker, window = self.session_positions(self.TALKER_WARMUP_POSITIONS), self.config.eartts.sliding_window
+        # The talker reads every layer causally, which Gemma3's sliding layers match only within their window.
+        if talker > window:
+            raise ValueError(
+                f"{config_path}: max_session_s {self.max_session_s:g} gives a talker {talker} positions, past its "
+                f"{window}-position sliding window, which the talker reads causally"
             )
-            return
-        if not isinstance(cap, int) or isinstance(cap, bool) or cap < 1:
-            raise ValueError(f"{config_path}: max_concurrent_requests must be a positive int; got {cap!r}")
-        try:
-            specs = serving_resources(self, config)
-        except ValueError:
-            return  # a `resources:` block the validation's resource checks report
-        for spec in specs:
-            if isinstance(spec, RecurrentStateSpec):
-                held, knob = spec.config.usable_slots, "max_slots"
-            elif isinstance(spec, BoundedKVSpec):
-                held, knob = spec.config.max_slots, "max_slots"
-            elif spec.resource_key in (TALKER_KV, NANO_KV):
-                kv = spec.config
-                pages = self.talker_kv_pages if spec.resource_key == TALKER_KV else self.nano_kv_pages
-                per_session = pages(kv.tokens_per_page, sessions=1) - 1
-                held, knob = (kv.max_num_pages - 1) // per_session, "max_num_pages"
-            else:
-                continue
-            if held < cap:
-                raise ValueError(
-                    f"{config_path}: {cap} concurrent sessions (max_concurrent_requests) need as "
-                    f"many in resources.{spec.resource_key}, which holds {held}; raise its {knob} "
-                    "or lower max_concurrent_requests"
-                )
+        check_kv_pools_fit(
+            self, config, config_path, logger, request_layouts=self._state_layout(self.max_prompt_tokens),
+            loop_caps=dict.fromkeys(("decode_loop", "talker_decode_loop"), self.get_max_output_tokens()),
+        )
 
     def get_max_output_tokens(self, **model_kwargs) -> int:
         # One text token per audio frame, so the audio fixes the length, within
@@ -344,106 +315,85 @@ class NemotronDuplexModel(Model):
         del model_kwargs
         return self.max_session_frames + self.LOOP_ITERS_MARGIN
 
-    def get_node_resources(self) -> list[NodeResourceSpec]:
-        nano = self.config.nano
-        eartts = self.config.eartts
-        kv_config = PagedKVConfig(
-            # Only the ``*`` (attention) layers hold a KV cache; the Mamba and
-            # MLP layers do not. The backbone maps global layer -> dense
-            # attention index (``NemotronHLLM._attn_cache_idx``).
-            num_layers=nano.num_attention_layers,
-            num_kv_heads=nano.num_key_value_heads,
-            head_dim=nano.head_dim,
-            max_seq_len=nano.max_position_embeddings,
-            num_qo_heads=nano.num_attention_heads,
-            # a session holds its prompt and every frame for life (no eviction)
-            max_num_pages=self.nano_kv_pages(DEFAULT_PAGE_SIZE),
-        )
+    def declare_state(self) -> list[Array | Sampler]:
+        nano, eartts, enc = self.config.nano, self.config.eartts, self.config.stt.encoder
+        kinds = nano.layer_types
+        encoder_layers = frozenset(range(enc.num_layers))
         return [
-            *stream_node_resources(
-                self.config.stt.encoder, self.config.stt.hop_length, "conformer_encoder", self.DEFAULT_SESSIONS,
-                kv_key=ENCODER_KV, conv_key=ENCODER_STATE, front_key=ENCODER_FRONT,
+            Value(ENCODER_STATE, nodes={"conformer_encoder"}, layers=encoder_layers,
+                  entry=Entry({"conv": TensorType((enc.hidden_size, enc.conv_kernel_size - 1), dtype=None)})),
+            Value(ENCODER_FRONT, nodes={"conformer_encoder"}, layers={0},
+                  entry=front_entry(enc, self.config.stt.hop_length)),
+            # each frame attends the left_context frames before it and itself, and the count of kept entries is the
+            # stream's encoder frames
+            Array(
+                ENCODER_KV, nodes={"conformer_encoder"}, layers=encoder_layers, max_len=None,
+                entry=KVEntry(heads=enc.num_heads, head_dim=enc.head_dim), positions=Positions(),
+                reads={ENCODER_ATTN: Read(mask=Window(enc.left_context + 1), op=Attend(q_heads=enc.num_heads),
+                                          packed=False)},
             ),
-            KVSpec(resource_key=NANO_KV, nodes={"nano_llm"}, config=kv_config),
-            AttentionSpec(
-                resource_key=NANO_ATTN, nodes={"nano_llm"},
-                config=AttentionConfig(kv_cache=NANO_KV),
+            Value(ENCODER_STREAM, nodes={"conformer_encoder"}, layers={0},
+                  entry=Entry({}, host={"samples_ahead": int, "mels_ahead": int})),
+            # only the ``*`` (attention) layers hold a KV cache
+            Array(
+                NANO_KV, nodes={"nano_llm"}, layers=frozenset(i for i, k in enumerate(kinds) if k == "attention"),
+                entry=KVEntry(heads=nano.num_key_value_heads, head_dim=nano.head_dim),
+                max_len=nano.max_position_embeddings,
+                reads={NANO_ATTN: Read(mask=Causal(), op=Attend(q_heads=nano.num_attention_heads))},
             ),
-            RecurrentStateSpec(
-                resource_key=MAMBA_STATE, nodes={"nano_llm"},
-                config=RecurrentStateConfig(
-                    num_layers=nano.num_mamba_layers,
-                    blocks=Mamba2Geometry(
-                        num_heads=nano.mamba_num_heads,
-                        head_dim=nano.mamba_head_dim,
-                        state_size=nano.ssm_state_size,
-                        n_groups=nano.n_groups,
-                        conv_kernel_size=nano.conv_kernel,
-                    ).to_blocks(),
-                    # + 1 for the pool's sink slot, so DEFAULT_SESSIONS sessions fit
-                    max_slots=self.DEFAULT_SESSIONS + 1,
-                ),
+            Value(
+                MAMBA_STATE, nodes={"nano_llm"}, layers=frozenset(i for i, k in enumerate(kinds) if k == "mamba"),
+                entry=Entry({
+                    # fp32, as the reference keeps it: an exponentially decayed sum over the whole session
+                    "ssm": TensorType((nano.mamba_num_heads, nano.mamba_head_dim, nano.ssm_state_size),
+                                      dtype=torch.float32, shard=0),
+                    "conv": TensorType((nano.conv_dim, nano.conv_kernel - 1), dtype=None, shard=0),
+                }),
+                updates={MAMBA_CONV: CausalConv(), MAMBA: Mamba2(time_step_limit=nano.time_step_limit)},
             ),
-            LinearAttnSpec(
-                resource_key=MAMBA, nodes={"nano_llm"},
-                config=LinearAttnConfig(
-                    recurrent_state=MAMBA_STATE,
-                    variant=LinearAttnVariant.MAMBA2,
-                    time_step_limit=nano.time_step_limit,
-                ),
+            Sampler(NANO_SAMPLER, nodes={"nano_llm"}, vocab_size=self.config.vocab_size, penalty=True),
+            # Its positions are a counter: the talker rotates in torch, with a theta per layer kind.
+            Array(
+                TALKER_KV, nodes={"eartts_talker"}, layers=frozenset(range(eartts.num_hidden_layers)),
+                # 72 zero-padded to a FlashInfer head dim
+                entry=KVEntry(heads=eartts.num_key_value_heads, head_dim=eartts.kv_head_dim),
+                # the sliding window plus the speaker warm-up, rounded up
+                max_len=eartts.sliding_window + 512, labels=frozenset({"main", "uncond"}), positions=Positions(),
+                reads={TALKER_ATTN: Read(mask=Causal(), op=Attend(q_heads=eartts.num_attention_heads))},
             ),
-            SamplerSpec(
-                resource_key=NANO_SAMPLER, nodes={"nano_llm"},
-                vocab_size=self.config.vocab_size,
-                enable_repetition_penalty=True,
-            ),
-            RecurrentStateSpec(
-                resource_key=CODEC_STATE, nodes={"eartts_talker"},
-                config=RecurrentStateConfig(
-                    num_layers=1, blocks=codec_state_blocks(self.config.codec),
-                    max_slots=self.DEFAULT_SESSIONS + 1,
-                ),
-            ),
-            KVSpec(
-                resource_key=TALKER_KV, nodes={"eartts_talker"},
-                config=PagedKVConfig(
-                    num_layers=eartts.num_hidden_layers,
-                    num_kv_heads=eartts.num_key_value_heads,
-                    head_dim=eartts.kv_head_dim,    # 72 zero-padded to a FlashInfer head dim
-                    # the sliding window plus the speaker warm-up, rounded up
-                    max_seq_len=eartts.sliding_window + 512,
-                    num_qo_heads=eartts.num_attention_heads,
-                    max_num_pages=self.talker_kv_pages(DEFAULT_PAGE_SIZE),
-                ),
-            ),
-            AttentionSpec(
-                resource_key=TALKER_ATTN, nodes={"eartts_talker"},
-                config=AttentionConfig(kv_cache=TALKER_KV),
-            ),
-            PositionSpec(
-                resource_key=TALKER_POS, nodes={"eartts_talker"},
-                config=PositionConfig(
-                    kv_cache=TALKER_KV,
-                    rotary_dim=eartts.head_dim,     # Gemma3: RoPE over the full head
-                    interleave=False,
-                    rope_theta=eartts.rope_theta_local,   # default; full-attention layers pass 1e6
-                ),
-            ),
+            Value(TALKER_PREV, nodes={"eartts_talker"}, layers={0},
+                  entry=Entry({"codes": TensorType((eartts.num_quantizers,), dtype=torch.long)})),
+            Value(CODEC_STATE, nodes={"eartts_talker"}, layers={0}, entry=codec_entry(self.config.codec)),
         ]
+
+    def kernel_settings(self) -> dict[str, dict[str, int]]:
+        return {
+            ENCODER_KV: {"max_slots": self.DEFAULT_SESSIONS},
+            # + 1 for each Value pool's sink slot, so DEFAULT_SESSIONS sessions fit
+            ENCODER_STATE: {"max_slots": self.DEFAULT_SESSIONS + 1},
+            ENCODER_FRONT: {"max_slots": self.DEFAULT_SESSIONS + 1},
+            # a session holds its prompt and every frame for life (no eviction)
+            NANO_KV: {"max_num_pages": kv_pages(self.session_positions(self.max_prompt_tokens), DEFAULT_PAGE_SIZE,
+                                                self.DEFAULT_SESSIONS)},
+            MAMBA_STATE: {"max_slots": self.DEFAULT_SESSIONS + 1},
+            # both CFG streams
+            TALKER_KV: {"max_num_pages": kv_pages(self.session_positions(self.TALKER_WARMUP_POSITIONS),
+                                                  DEFAULT_PAGE_SIZE, 2 * self.DEFAULT_SESSIONS)},
+            TALKER_PREV: {"max_slots": self.DEFAULT_SESSIONS + 1},
+            CODEC_STATE: {"max_slots": self.DEFAULT_SESSIONS + 1},
+        }
 
     def get_request_resource_configs(
         self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
-    ) -> dict[str, ResourceReqConfig]:
+    ) -> dict[str, SampleSettings]:
         del input_modalities, output_modalities
         model_kwargs = model_kwargs or {}
         keys = SAMPLING_KEYS
         return {
-            NANO_SAMPLER: SamplingReqConfig(
+            NANO_SAMPLER: SampleSettings(
                 **{k: model_kwargs.get(k, getattr(self.config, k)) for k in keys},
                 min_p=model_kwargs.get("min_p", 0.0),
             ),
-            # every talker session reads both of its streams
-            TALKER_KV: KVReqConfig(needed_labels=["main", "uncond"]),
         }
 
     # -------------------------------------------------------------------
@@ -509,9 +459,8 @@ class NemotronDuplexModel(Model):
         # Talker: each streamed agent token -> RVQ codes -> that frame's PCM, to
         # the client. The codec decodes in the talker's step (no stream hop, no
         # step of its own), against each call's stream state in codec_state.
-        # No speculative scheduling here. The talker keeps the previous frame's
-        # codes in per-request state written by postprocess, so a step built
-        # while the previous one is still running would read the wrong frame.
+        # No speculative scheduling here: whether a speculated talker step pays
+        # is unmeasured.
         talker_decode = Loop(
             name="talker_decode_loop",
             section=GraphNode(
@@ -633,24 +582,23 @@ class NemotronDuplexModel(Model):
             out["has_prompt"] = [torch.tensor([1], dtype=torch.long)]
         else:
             out["text_inputs"] = [torch.tensor([-1], dtype=torch.long)]
-        # a session's first frame writes the prompt along with its own row, and the talker's first frame writes
-        # its speaker warm-up
-        prompt_len = ids.numel() if prompt else 0
-        # A loop writes a row per frame and one for the final PAD. Its cap adds LOOP_ITERS_MARGIN, and no session
-        # writes that margin.
-        frames = self.max_session_frames + 1
-        nano = LabelLayout(
-            spans=(Span("ids", "decode", prompt_len, prompt_len, "text_inputs"),) if prompt else (),
+        return ProcessPromptOutput(out, {"state_layout": self._state_layout(ids.numel() if prompt else 0)})
+
+    def _state_layout(self, prompt_len: int) -> dict[str, dict[str, Layout]]:
+        """A session's layouts after a system prompt of ``prompt_len`` tokens. Its first frame writes the prompt
+        along with its own row, and the talker's first frame writes its speaker warm-up."""
+        # A loop's cap adds LOOP_ITERS_MARGIN, and no session writes that margin.
+        frames = self.session_positions(0)
+        nano = Layout(
+            spans=(Span("ids", "decode", prompt_len, prompt_len, "text_inputs"),) if prompt_len else (),
             growth=(("decode_loop", 1),), max_growth=frames,
         )
         warmup = self.TALKER_WARMUP_POSITIONS
-        talker = LabelLayout(
+        talker = Layout(
             spans=(Span("rows", "talker_decode", warmup, warmup, "audio_prompt_latents"),),
             growth=(("talker_decode_loop", 1),), max_growth=frames,
         )
-        return ProcessPromptOutput(out, {"kv_layout": {
-            NANO_KV: {"main": nano}, TALKER_KV: {"main": talker, "uncond": talker},
-        }})
+        return {NANO_KV: {"main": nano}, TALKER_KV: {"main": talker, "uncond": talker}}
 
     def kv_labels(self) -> dict[str, dict[str, KVLabel]]:
         talker = KVLabel(growth=(("talker_decode", "talker_decode_loop"),))
@@ -968,16 +916,20 @@ class NemotronDuplexModel(Model):
         return self._json_config_cache
 
     def _refuse_resources_sized_otherwise(self, cfg: NemotronDuplexConfig) -> None:
-        """The resources are declared from the dataclass defaults, before the
-        checkpoint is read: refuse a config.json that sizes one otherwise,
+        """The state is declared from the dataclass defaults, before the
+        checkpoint is read: refuse a config.json that sizes it otherwise,
         rather than run its modules against pools of another shape."""
         loaded = copy.copy(self)
         loaded.config = cfg
-        for declared, needed in zip(self.get_node_resources(), loaded.get_node_resources(), strict=True):
+        settings, needed_settings = self.kernel_settings(), loaded.kernel_settings()
+        pairs = [
+            *((d.name, d, n) for d, n in zip(self.declare_state(), loaded.declare_state(), strict=True)),
+            *((key, settings[key], needed_settings[key]) for key in settings),
+        ]
+        for key, declared, needed in pairs:
             if declared != needed:
                 raise ValueError(
-                    f"the checkpoint's config.json sizes resources.{declared.resource_key} as {needed}, "
-                    f"not as declared ({declared})"
+                    f"the checkpoint's config.json sizes resources.{key} as {needed}, not as declared ({declared})"
                 )
 
     def _build_and_load(self, module: torch.nn.Module, device: str, autocast_dtype, local_dir: str):
@@ -1026,7 +978,7 @@ class NemotronDuplexModel(Model):
         )
         return FastConformerStreamSubmodule(
             encoder, log_mel, proj, input_edge=AUDIO_IN, output_edge="audio_frame",
-            front_key=ENCODER_FRONT, batch_sizes=SESSION_BATCH_SIZES,
+            front_key=ENCODER_FRONT, stream_key=ENCODER_STREAM, batch_sizes=SESSION_BATCH_SIZES,
         )
 
     def _create_talker_submodule(
@@ -1052,6 +1004,7 @@ class NemotronDuplexModel(Model):
         # checkpoint config, so the talker samples with its inference_* knobs
         submodule = EarTTSTalkerSubmodule(
             talker=talker, config=cfg, codec=codec, subword_to_char=s2c, char_pad_idx=len(cv),
+            noise_rows=self.get_max_output_tokens() + 1,
         )
         assert submodule.warmup_len == self.TALKER_WARMUP_POSITIONS, (
             f"the checkpoint's speaker warm-up is {submodule.warmup_len} positions, "

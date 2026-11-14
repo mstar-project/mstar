@@ -81,7 +81,7 @@ def test_aut_encoder_matches_hf_on_real_audio(model):
     hf = hf.to("cuda", torch.bfloat16).eval()
     sub = model.get_submodule("audio_encoder", device="cuda", autocast_dtype=torch.bfloat16)
     for layer in sub.encoder.layers:
-        layer.self_attn.ragged = None  # SDPA per window, like the oracle for <= 1 window
+        layer.self_attn.state = None  # SDPA per window, like the oracle for <= 1 window
 
     worst = 0.0
     for path in _served.utterances(4, max_seconds=7.5):

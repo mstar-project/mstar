@@ -947,8 +947,8 @@ false``, which uses the request's ``system_prompt`` instead, as vllm-omni does.
 ``configs/minicpm_o.yaml`` runs three workers on one GPU (LLM and encoders, TTS, vocoder);
 it sets ``mps: true``, so their kernels overlap (see *Several workers on one GPU* in :doc:`serving`). Each spoken
 reply holds a slot of each ``t2w_*`` resource (~0.4 GiB in all) while it speaks, so their
-``max_slots`` cap the replies being voiced at once. ``t2w_state`` has one more than each of the
-three ``t2w_*_kv`` (its sink); startup refuses counts that disagree. The slots don't hold
+``max_slots`` cap the replies being voiced at once. ``t2w_conv``, ``t2w_vocoder`` and ``t2w_tail`` each have
+one more than each of the three ``t2w_*_kv`` (their sink); startup refuses counts that disagree. The slots don't hold
 back the TTS, which keeps a spoken reply's ``tts_kv`` pages (up to 32) until its last code,
 so ``max_concurrent_requests`` caps the requests in flight and startup refuses a ``tts_kv``
 that can't hold that many full replies: overfilled, the TTS would stall. A reply's LLM
@@ -1570,29 +1570,31 @@ Nemotron VoiceChat (``nemotron_duplex``) notes
   (``mamba``) and the agent-text sampler (``nano_sampler``). Its decode step is
   captured as a CUDA graph for batch sizes 1 to 32.
 - Every per-session resource is sized for 32 sessions: a slot in each of
-  ``mamba_state``, ``encoder_state``, ``encoder_front`` and ``codec_state`` (``max_slots``, one
-  more than the sessions, for the sink) and in ``encoder_kv`` (``max_slots``,
+  ``mamba_state``, ``encoder_state``, ``encoder_front``, ``codec_state`` and ``talker_prev``
+  (``max_slots``, one more than the sessions, for the sink) and in ``encoder_kv`` (``max_slots``,
   no sink), and its pages in ``nano_kv`` and
   ``talker_kv`` (``max_num_pages``; both sized from ``max_session_s``, and the
   nano's from ``max_prompt_tokens`` too). The shipped configs set a
   conservative ``max_concurrent_requests: 16`` (below); raising it to 32 needs
-  no other change, and to serve more, raise the cap and all six with it. The server
+  no other change, and to serve more, raise the cap and all eight with it. The server
   refuses to start with a cap one of them cannot hold, since a session past
   any of them would wait on admit, and its frames with it, until another ends.
   The nano, the talker and the encoder each run at most 32 sessions
   a step, their widest CUDA graph; more are split over several steps rather
   than run eagerly.
 - ``eartts_talker`` advances every live session in one backbone pass per frame
-  through the engine's paged KV (``talker_kv`` / ``talker_attn`` /
-  ``talker_pos``): each session owns two streams, the conditional and the
+  through the engine's paged KV (``talker_kv``): each session owns two
+  streams, the conditional and the
   unconditional CFG context, planned together under one combined label, so a
   step is one packed batch of two tokens per session (a session's first step
   prefills its 38-token speaker/text warm-up instead). The pool's head dim is
   128: FlashInfer computes 64/128/256 exactly and returns wrong values for the
   talker's 72, so q/k/v are zero-padded (exact) and RoPE is applied in torch
-  from the positions the position resource planned. Sampling noise is drawn
-  per row from the request's seeded generator before the step, so a session's
-  speech does not depend on which other sessions share it. The per-frame step
+  from the step's positions. A session's sampling noise at its k-th talker
+  step is row k of a memo that one generator, seeded as every session's is,
+  fills in step order, so a session's speech does not depend on which other
+  sessions share it. The memo holds a row per step of the talker loop's cap,
+  about 0.61 MB per second of ``max_session_s`` (99 MB at 160 s). The per-frame step
   is captured as a CUDA graph for 1 to 32 sessions; a session's first step
   (its 38-token speaker warm-up) runs eager. The talker KV pool is 1025 pages
   of 128 positions (28 GiB): 32 sessions x 2 streams x 16 pages plus a sink
@@ -1652,8 +1654,11 @@ Nemotron VoiceChat (``nemotron_duplex``) notes
   any one file, past it gets a 400, as does one of more than two channels, and so
   does a live call whose appends pass it: ``audio_in`` declares the session's
   samples as its ``max_items``, which the client stream counts before the encoder
-  sees them (raise ``max_session_s``, not the stream's limit, for longer calls). A
-  call that ends with no more than 16 ms of audio, which the encoder cannot
+  sees them (raise ``max_session_s``, not the stream's limit, for longer calls).
+  The server refuses to start with a ``max_session_s`` past 596 s, where a
+  session's talker positions would pass the talker's 7500-position sliding
+  window: the talker reads every layer causally, which Gemma3's sliding layers
+  match only within it. A call that ends with no more than 16 ms of audio, which the encoder cannot
   featurize, fails with a 500 (the worker reports it without a client status).
   ``/generate/ws`` appends must be 16 kHz audio (they are neither
   resampled nor rescaled one by one, which would put a seam at every append);
@@ -1706,7 +1711,7 @@ Nemotron VoiceChat (``nemotron_duplex``) notes
   talker (with its codec) on two ranks. Launch with ``--tensor-comm-protocol SHM`` on a
   single node. Text samples at ``temperature: 0.7, top_p: 0.9`` by default;
   send ``temperature: 0`` for greedy. The talker's mixture-of-Gaussians sampling
-  is stochastic by design and seeded per request.
+  is stochastic by design, and every session draws the same seeded noise.
 - Known limitation of the checkpoint: it often answers speech that is not
   addressed to it, such as a side conversation or background speech, where it
   should keep its turn (about half of such pairs on Full-Duplex-Bench v1.5).

@@ -17,17 +17,19 @@ import triton.language as tl
 def _res_adaln_kernel(
     x_ptr, y_ptr, gate_ptr, shift_ptr, scale_ptr, x_out_ptr, h_ptr,
     T, mod_stride_n, eps,
-    HAS_RES: tl.constexpr, C: tl.constexpr,
+    HAS_RES: tl.constexpr, Y_ROWS: tl.constexpr, C: tl.constexpr,
 ):
     """One ``[C]`` row: ``x += gate * y`` (when ``HAS_RES``), then ``h = LN(x) * scale + shift``
-    (LayerNorm without affine; ``scale`` is adaLN's ``1 + scale``)."""
+    (LayerNorm without affine; ``scale`` is adaLN's ``1 + scale``). ``y`` holds ``Y_ROWS`` rows
+    of ``x`` side by side at each step."""
     row = tl.program_id(0)
     n = row // T
     offs = tl.arange(0, C)
     x = tl.load(x_ptr + row * C + offs).to(tl.float32)
     mod = n * mod_stride_n + offs
     if HAS_RES:
-        y = tl.load(y_ptr + row * C + offs).to(tl.float32)
+        y_row = ((n // Y_ROWS) * T + row % T) * Y_ROWS + n % Y_ROWS
+        y = tl.load(y_ptr + y_row * C + offs).to(tl.float32)
         x = x + tl.load(gate_ptr + mod).to(tl.float32) * y
         tl.store(x_out_ptr + row * C + offs, x)
     mean = tl.sum(x, axis=0) / C
@@ -52,22 +54,25 @@ def res_adaln(
     scale: torch.Tensor,
     eps: float = 1e-6,
     out_dtype: torch.dtype | None = None,
+    y_rows: int = 1,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """``x [N, T, C]`` (contiguous); with ``y`` returns ``(x + gate * y, adaLN(x + gate * y))``,
     else ``(x, adaLN(x))``. Modulations are ``[1 or N, 1, C]``. The arithmetic is float32;
-    the residual keeps ``x``'s dtype and the normed output is ``out_dtype`` (default ``x``'s)."""
+    the residual keeps ``x``'s dtype and the normed output is ``out_dtype`` (default ``x``'s).
+    ``y`` is ``[N, T, C]``, or ``[N / y_rows, T, y_rows, C]`` with ``y_rows`` rows of ``x`` side
+    by side at each step."""
     n, t, c = x.shape
     assert x.is_contiguous()
     shift, stride = _mod_rows(shift, n)
     scale, _ = _mod_rows(scale, n)
     h = torch.empty_like(x, dtype=out_dtype or x.dtype)
     if y is None:
-        _res_adaln_kernel[(n * t,)](x, x, x, shift, scale, x, h, t, stride, eps, HAS_RES=False, C=c)
+        _res_adaln_kernel[(n * t,)](x, x, x, shift, scale, x, h, t, stride, eps, HAS_RES=False, Y_ROWS=1, C=c)
         return x, h
     gate, _ = _mod_rows(gate, n)
     y = y.contiguous()
     x_out = torch.empty_like(x)
-    _res_adaln_kernel[(n * t,)](x, y, gate, shift, scale, x_out, h, t, stride, eps, HAS_RES=True, C=c)
+    _res_adaln_kernel[(n * t,)](x, y, gate, shift, scale, x_out, h, t, stride, eps, HAS_RES=True, Y_ROWS=y_rows, C=c)
     return x_out, h
 
 
@@ -167,14 +172,16 @@ def _linear(layer: torch.nn.Linear, x: torch.Tensor) -> torch.Tensor:
 
 
 def _attention(attn, h: torch.Tensor, kv) -> torch.Tensor:
+    """``h [N, T, C]`` -> ``[N / rows, T, rows, C]``: the projection runs on the read's rows as
+    they come, which `res_adaln` takes (``y_rows``), so nothing is copied to unfold them."""
     w, b = _fused_weights(attn, f"qkv.{h.dtype}", lambda: (
         torch.cat([attn.to_q.weight, attn.to_k.weight, attn.to_v.weight]).to(h.dtype).contiguous(),
         torch.cat([attn.to_q.bias, attn.to_k.bias, attn.to_v.bias]).to(h.dtype).contiguous(),
     ))
     n, t, _ = h.shape
     q, k, v = qk_norm_split(torch.nn.functional.linear(h, w, b), attn.num_heads, attn.q_norm, attn.k_norm)
-    out = kv.attend(q, k, v)  # [N, T, H, D]
-    return _linear(attn.proj, out.reshape(n, t, -1))
+    out = kv.attend_folded(q, k, v)  # [N / rows, T, rows * H, D]
+    return _linear(attn.proj, out.reshape(n // kv.rows, t, kv.rows, -1))
 
 
 def _causal_conv(conv: torch.nn.Conv1d, x: torch.Tensor, cache: torch.Tensor) -> torch.Tensor:
@@ -214,11 +221,6 @@ def dit_forward(dit, x, mu, mods, final_mod, spks, cond, cnn_cache, kv) -> torch
     and the returned velocity stay in ``x``'s dtype."""
     t = x.shape[-1]
     low = cnn_cache.dtype
-    if kv[0].source.dtype != low:
-        raise ValueError(
-            f"the DiT's voice sources are {kv[0].source.dtype} but its caches are {low}: "
-            "build the VoiceBank in the caches' dtype"
-        )
     h = torch.cat([x, mu, spks.unsqueeze(-1).expand(-1, -1, t), cond], dim=1).to(low)
     x = _linear(dit.in_proj, h.transpose(1, 2)).to(x.dtype).contiguous()
     pending = (None, None)
@@ -227,7 +229,7 @@ def dit_forward(dit, x, mu, mods, final_mod, spks, cond, cnn_cache, kv) -> torch
          shift_conv, scale_conv, gate_conv) = mods[i]
         x, h = res_adaln(x, *pending, shift_msa, scale_msa, block.norm1.eps, out_dtype=low)
         x, h = res_adaln(x, _attention(block.attn, h, kv[i]), gate_msa, shift_conv, scale_conv, block.norm3.eps,
-                         out_dtype=low)
+                         out_dtype=low, y_rows=kv[i].rows)
         x, h = res_adaln(x, _conv_block(block.conv, h, cnn_cache[i]), gate_conv, shift_mlp, scale_mlp,
                          block.norm2.eps, out_dtype=low)
         pending = (_mlp(block.mlp, h), gate_mlp)
