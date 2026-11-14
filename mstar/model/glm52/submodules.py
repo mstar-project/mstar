@@ -267,6 +267,11 @@ class Glm52LLMSubmodule(ARNodeSubmodule):
                 f"request {fwd_info.request_id}: a prompt of {text_inputs.shape[0]} tokens "
                 f"exceeds the {self.config.max_prompt_tokens} served"
             )
+        if graph_walk == "decode" and text_inputs.shape[0] != 1:
+            raise RuntimeError(
+                f"request {fwd_info.request_id}: a decode row of {text_inputs.shape[0]} ids, and a decode step is "
+                "declared and captured over rows of one id"
+            )
         if self.config.mtp_num_draft_tokens > 0:
             sampling = fwd_info.resource_configs[SAMPLER]
             # greedy only: the drafts and the verify bypass the sampler, so a temperature
