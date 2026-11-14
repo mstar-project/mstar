@@ -1049,6 +1049,15 @@ window.runMermaid = runMermaid;</script>
 <span class="n">ROW_INTS</span> <span class="o">=</span> <span class="n">ROW_HEAD</span> <span class="o">+</span> <span class="mi">2</span> <span class="o">*</span> <span class="n">NUM_READS</span> <span class="o">+</span> <span class="mi">3</span> <span class="o">*</span> <span class="n">NUM_WRITES</span>
 
 
+<div class="viewcode-block" id="tiles_head_dim">
+<a class="viewcode-back" href="../../../../../../_autosummary/mstar.engine.resources.kv.bounded.layout.html#mstar.engine.resources.kv.bounded.layout.tiles_head_dim">[docs]</a>
+<span class="k">def</span><span class="w"> </span><span class="nf">tiles_head_dim</span><span class="p">(</span><span class="n">head_dim</span><span class="p">:</span> <span class="nb">int</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+<span class="w">    </span><span class="sd">"""A power of two, since both kernels lay a head out as `tl.arange`, and at least 16, which the attention</span>
+<span class="sd">    kernel's `tl.dot` takes."""</span>
+    <span class="k">return</span> <span class="n">head_dim</span> <span class="o">&gt;=</span> <span class="mi">16</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">head_dim</span> <span class="o">&amp;</span> <span class="p">(</span><span class="n">head_dim</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span></div>
+
+
+
 <div class="viewcode-block" id="RowLayout">
 <a class="viewcode-back" href="../../../../../../_autosummary/mstar.engine.resources.kv.bounded.layout.html#mstar.engine.resources.kv.bounded.layout.RowLayout">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">RowLayout</span><span class="p">(</span><span class="n">NamedTuple</span><span class="p">):</span>

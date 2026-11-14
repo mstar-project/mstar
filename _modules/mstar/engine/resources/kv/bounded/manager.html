@@ -1131,6 +1131,22 @@ window.runMermaid = runMermaid;</script>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_cache</span><span class="p">[</span><span class="n">layer_idx</span><span class="p">]</span></div>
 
 
+<div class="viewcode-block" id="BoundedKVManager.written">
+<a class="viewcode-back" href="../../../../../../_autosummary/mstar.engine.resources.kv.bounded.manager.html#mstar.engine.resources.kv.bounded.manager.BoundedKVManager.written">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">written</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""The entries committed for ``rid``: 0 for a rid that holds no slot, never admitted or torn down."""</span>
+        <span class="n">req</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_requests</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span>
+        <span class="k">return</span> <span class="mi">0</span> <span class="k">if</span> <span class="n">req</span> <span class="ow">is</span> <span class="kc">None</span> <span class="k">else</span> <span class="n">req</span><span class="o">.</span><span class="n">written</span></div>
+
+
+<div class="viewcode-block" id="BoundedKVManager.position">
+<a class="viewcode-back" href="../../../../../../_autosummary/mstar.engine.resources.kv.bounded.manager.html#mstar.engine.resources.kv.bounded.manager.BoundedKVManager.position">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">position</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">rid</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">label</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">"""Where ``rid``'s next entry goes, its count of committed entries, as a position resource answers."""</span>
+        <span class="k">del</span> <span class="n">label</span>
+        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">written</span><span class="p">(</span><span class="n">rid</span><span class="p">)</span></div>
+
+
     <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">current</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">BoundedPlan</span><span class="p">:</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_current</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>

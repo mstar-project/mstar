@@ -741,6 +741,7 @@
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.bounded.layout.flatten_row"><code class="docutils literal notranslate"><span class="pre">flatten_row()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.bounded.layout.row_layout"><code class="docutils literal notranslate"><span class="pre">row_layout()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.bounded.layout.tiles_head_dim"><code class="docutils literal notranslate"><span class="pre">tiles_head_dim()</span></code></a></li>
 </ul>
             </nav>
         </div>
@@ -769,6 +770,9 @@ small integer table, and the kernels need nothing else.</p>
 </tr>
 <tr class="row-even"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.bounded.layout.row_layout" title="mstar.engine.resources.kv.bounded.layout.row_layout"><code class="xref py py-obj docutils literal notranslate"><span class="pre">row_layout</span></code></a>(source_len, written, span, ...[, ...])</p></td>
 <td><p>The reads and writes of a row whose stream holds <code class="docutils literal notranslate"><span class="pre">source_len</span> <span class="pre">+</span> <span class="pre">written</span></code> entries and gains <code class="docutils literal notranslate"><span class="pre">span</span></code> this step.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference internal" href="#mstar.engine.resources.kv.bounded.layout.tiles_head_dim" title="mstar.engine.resources.kv.bounded.layout.tiles_head_dim"><code class="xref py py-obj docutils literal notranslate"><span class="pre">tiles_head_dim</span></code></a>(head_dim)</p></td>
+<td><p>A power of two, since both kernels lay a head out as <cite>tl.arange</cite>, and at least 16, which the attention kernel's <cite>tl.dot</cite> takes.</p></td>
 </tr>
 </tbody>
 </table>
@@ -856,6 +860,21 @@ step’s tokens join the stream last-first (see <code class="docutils literal no
 </dl>
 </dd></dl>
 
+<dl class="py function">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.bounded.layout.tiles_head_dim">
+<span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.kv.bounded.layout.</span></span><span class="sig-name descname"><span class="pre">tiles_head_dim</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">head_dim</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/bounded/layout.html#tiles_head_dim"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.bounded.layout.tiles_head_dim" title="Link to this definition">#</a></dt>
+<dd><p>A power of two, since both kernels lay a head out as <cite>tl.arange</cite>, and at least 16, which the attention
+kernel’s <cite>tl.dot</cite> takes.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>head_dim</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#bool" title="(in Python v3.12)">bool</a></p>
+</dd>
+</dl>
+</dd></dl>
+
 </section>
 
 
@@ -913,6 +932,7 @@ step’s tokens join the stream last-first (see <code class="docutils literal no
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.bounded.layout.flatten_row"><code class="docutils literal notranslate"><span class="pre">flatten_row()</span></code></a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.bounded.layout.row_layout"><code class="docutils literal notranslate"><span class="pre">row_layout()</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.bounded.layout.tiles_head_dim"><code class="docutils literal notranslate"><span class="pre">tiles_head_dim()</span></code></a></li>
 </ul>
   </nav></div>
 

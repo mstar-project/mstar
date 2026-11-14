@@ -744,10 +744,12 @@
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.bounded.manager.BoundedKVManager.ingest_request"><code class="docutils literal notranslate"><span class="pre">BoundedKVManager.ingest_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.bounded.manager.BoundedKVManager.layer"><code class="docutils literal notranslate"><span class="pre">BoundedKVManager.layer()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.bounded.manager.BoundedKVManager.plan"><code class="docutils literal notranslate"><span class="pre">BoundedKVManager.plan()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.bounded.manager.BoundedKVManager.position"><code class="docutils literal notranslate"><span class="pre">BoundedKVManager.position()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.bounded.manager.BoundedKVManager.post_warmup_validate"><code class="docutils literal notranslate"><span class="pre">BoundedKVManager.post_warmup_validate()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.bounded.manager.BoundedKVManager.remove_request"><code class="docutils literal notranslate"><span class="pre">BoundedKVManager.remove_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.bounded.manager.BoundedKVManager.reset_request"><code class="docutils literal notranslate"><span class="pre">BoundedKVManager.reset_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.bounded.manager.BoundedKVManager.rollback_admit"><code class="docutils literal notranslate"><span class="pre">BoundedKVManager.rollback_admit()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.bounded.manager.BoundedKVManager.written"><code class="docutils literal notranslate"><span class="pre">BoundedKVManager.written()</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.bounded.manager.BoundedPlan"><code class="docutils literal notranslate"><span class="pre">BoundedPlan</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
@@ -967,6 +969,23 @@ its first NewRequest, though one comes per partition it serves.</p>
 </dd></dl>
 
 <dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.bounded.manager.BoundedKVManager.position">
+<span class="sig-name descname"><span class="pre">position</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">rid</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">label</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/bounded/manager.html#BoundedKVManager.position"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.bounded.manager.BoundedKVManager.position" title="Link to this definition">#</a></dt>
+<dd><p>Where <code class="docutils literal notranslate"><span class="pre">rid</span></code>’s next entry goes, its count of committed entries, as a position resource answers.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>rid</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+<li><p><strong>label</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a></p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.bounded.manager.BoundedKVManager.post_warmup_validate">
 <span class="sig-name descname"><span class="pre">post_warmup_validate</span></span><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/bounded/manager.html#BoundedKVManager.post_warmup_validate"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.bounded.manager.BoundedKVManager.post_warmup_validate" title="Link to this definition">#</a></dt>
 <dd><p>For, e.g., the KV cache to check that num_free_pages is identical
@@ -1013,6 +1032,20 @@ held stays with it.</p>
 </dd>
 <dt class="field-even">Return type<span class="colon">:</span></dt>
 <dd class="field-even"><p>None</p>
+</dd>
+</dl>
+</dd></dl>
+
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.bounded.manager.BoundedKVManager.written">
+<span class="sig-name descname"><span class="pre">written</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">rid</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/bounded/manager.html#BoundedKVManager.written"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.bounded.manager.BoundedKVManager.written" title="Link to this definition">#</a></dt>
+<dd><p>The entries committed for <code class="docutils literal notranslate"><span class="pre">rid</span></code>: 0 for a rid that holds no slot, never admitted or torn down.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><p><strong>rid</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a>)</p>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)">int</a></p>
 </dd>
 </dl>
 </dd></dl>
@@ -1144,10 +1177,12 @@ held stays with it.</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.bounded.manager.BoundedKVManager.ingest_request"><code class="docutils literal notranslate"><span class="pre">BoundedKVManager.ingest_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.bounded.manager.BoundedKVManager.layer"><code class="docutils literal notranslate"><span class="pre">BoundedKVManager.layer()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.bounded.manager.BoundedKVManager.plan"><code class="docutils literal notranslate"><span class="pre">BoundedKVManager.plan()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.bounded.manager.BoundedKVManager.position"><code class="docutils literal notranslate"><span class="pre">BoundedKVManager.position()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.bounded.manager.BoundedKVManager.post_warmup_validate"><code class="docutils literal notranslate"><span class="pre">BoundedKVManager.post_warmup_validate()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.bounded.manager.BoundedKVManager.remove_request"><code class="docutils literal notranslate"><span class="pre">BoundedKVManager.remove_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.bounded.manager.BoundedKVManager.reset_request"><code class="docutils literal notranslate"><span class="pre">BoundedKVManager.reset_request()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.bounded.manager.BoundedKVManager.rollback_admit"><code class="docutils literal notranslate"><span class="pre">BoundedKVManager.rollback_admit()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.bounded.manager.BoundedKVManager.written"><code class="docutils literal notranslate"><span class="pre">BoundedKVManager.written()</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.bounded.manager.BoundedPlan"><code class="docutils literal notranslate"><span class="pre">BoundedPlan</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">

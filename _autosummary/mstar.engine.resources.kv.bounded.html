@@ -754,6 +754,7 @@
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.bounded.BoundedKVSpec"><code class="docutils literal notranslate"><span class="pre">BoundedKVSpec</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.bounded.BoundedKVSpec.apply_yaml_overrides"><code class="docutils literal notranslate"><span class="pre">BoundedKVSpec.apply_yaml_overrides()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.bounded.BoundedKVSpec.capacity_problem"><code class="docutils literal notranslate"><span class="pre">BoundedKVSpec.capacity_problem()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.bounded.BoundedKVSpec.config"><code class="docutils literal notranslate"><span class="pre">BoundedKVSpec.config</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.bounded.BoundedKVSpec.resource_class"><code class="docutils literal notranslate"><span class="pre">BoundedKVSpec.resource_class</span></code></a></li>
 </ul>
@@ -933,6 +934,24 @@ alike.</p>
 </dl>
 </dd></dl>
 
+<dl class="py method">
+<dt class="sig sig-object py" id="mstar.engine.resources.kv.bounded.BoundedKVSpec.capacity_problem">
+<span class="sig-name descname"><span class="pre">capacity_problem</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">requests</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">request</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">axis_sizes</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">()</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/bounded/config.html#BoundedKVSpec.capacity_problem"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.bounded.BoundedKVSpec.capacity_problem" title="Link to this definition">#</a></dt>
+<dd><p>A request keeps a slot from its first step until it is torn down, and every slot is a request’s.</p>
+<dl class="field-list simple">
+<dt class="field-odd">Parameters<span class="colon">:</span></dt>
+<dd class="field-odd"><ul class="simple">
+<li><p><strong>requests</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a>)</p></li>
+<li><p><strong>request</strong> (<a class="reference internal" href="mstar.engine.resources.spec.html#mstar.engine.resources.spec.ResourceReqConfig" title="mstar.engine.resources.spec.ResourceReqConfig"><em>ResourceReqConfig</em></a><em> | </em><em>None</em>)</p></li>
+<li><p><strong>axis_sizes</strong> (<a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Sequence" title="(in Python v3.12)"><em>Sequence</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/collections.abc.html#collections.abc.Mapping" title="(in Python v3.12)"><em>Mapping</em></a><em>[</em><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)"><em>str</em></a><em>, </em><a class="reference external" href="https://docs.python.org/3.12/library/functions.html#int" title="(in Python v3.12)"><em>int</em></a><em>]</em><em>]</em>)</p></li>
+</ul>
+</dd>
+<dt class="field-even">Return type<span class="colon">:</span></dt>
+<dd class="field-even"><p><a class="reference external" href="https://docs.python.org/3.12/library/stdtypes.html#str" title="(in Python v3.12)">str</a> | None</p>
+</dd>
+</dl>
+</dd></dl>
+
 <dl class="py attribute">
 <dt class="sig sig-object py" id="mstar.engine.resources.kv.bounded.BoundedKVSpec.config">
 <span class="sig-name descname"><span class="pre">config</span></span><span class="property"><span class="p"><span class="pre">:</span></span><span class="w"> </span><a class="reference internal" href="mstar.engine.resources.kv.bounded.config.html#mstar.engine.resources.kv.bounded.config.BoundedKVConfig" title="mstar.engine.resources.kv.bounded.config.BoundedKVConfig"><span class="pre">BoundedKVConfig</span></a></span><a class="headerlink" href="#mstar.engine.resources.kv.bounded.BoundedKVSpec.config" title="Link to this definition">#</a></dt>
@@ -954,9 +973,10 @@ resource stays free of the manager and its kernels.</p>
 <span class="property"><span class="k"><span class="pre">class</span></span><span class="w"> </span></span><span class="sig-prename descclassname"><span class="pre">mstar.engine.resources.kv.bounded.</span></span><span class="sig-name descname"><span class="pre">BoundedKVStep</span></span><span class="sig-paren">(</span><em class="sig-param"><span class="n"><span class="pre">segments</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">None</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">positions</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">&lt;factory&gt;</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">*</span></span></em>, <em class="sig-param"><span class="n"><span class="pre">combined_labels</span></span><span class="o"><span class="pre">=</span></span><span class="default_value"><span class="pre">&lt;factory&gt;</span></span></em><span class="sig-paren">)</span><a class="reference internal" href="../_modules/mstar/engine/resources/kv/bounded/config.html#BoundedKVStep"><span class="viewcode-link"><span class="pre">[source]</span></span></a><a class="headerlink" href="#mstar.engine.resources.kv.bounded.BoundedKVStep" title="Link to this definition">#</a></dt>
 <dd><p>Bases: <a class="reference internal" href="mstar.engine.resources.step.html#mstar.engine.resources.step.ResourceStep" title="mstar.engine.resources.step.ResourceStep"><code class="xref py py-class docutils literal notranslate"><span class="pre">ResourceStep</span></code></a></p>
 <p>Each segment’s <code class="docutils literal notranslate"><span class="pre">span</span></code> is what its request writes this step (0 reads only).</p>
-<p>The positions come from the model, not the resource, so a plan never waits
-on the previous step’s commit and planning the same step twice (a piecewise
-region inside a forward that declared it too) is harmless.</p>
+<p><code class="docutils literal notranslate"><span class="pre">positions</span></code> holds each request’s stream position before the step, and its
+<code class="docutils literal notranslate"><span class="pre">written</span></code> must equal the count committed for the request. Fixed in the step,
+it makes planning the step twice (a piecewise region inside a forward that
+declared it too) harmless.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Parameters<span class="colon">:</span></dt>
 <dd class="field-odd"><ul class="simple">
@@ -1128,6 +1148,7 @@ that writes <code class="docutils literal notranslate"><span class="pre">span</s
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.bounded.BoundedKVSpec"><code class="docutils literal notranslate"><span class="pre">BoundedKVSpec</span></code></a><ul class="pst-show_toc_level nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.bounded.BoundedKVSpec.apply_yaml_overrides"><code class="docutils literal notranslate"><span class="pre">BoundedKVSpec.apply_yaml_overrides()</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.bounded.BoundedKVSpec.capacity_problem"><code class="docutils literal notranslate"><span class="pre">BoundedKVSpec.capacity_problem()</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.bounded.BoundedKVSpec.config"><code class="docutils literal notranslate"><span class="pre">BoundedKVSpec.config</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mstar.engine.resources.kv.bounded.BoundedKVSpec.resource_class"><code class="docutils literal notranslate"><span class="pre">BoundedKVSpec.resource_class</span></code></a></li>
 </ul>
