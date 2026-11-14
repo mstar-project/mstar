@@ -109,6 +109,10 @@ def _regex_escape(text: str) -> str:
     return "".join("\\" + c if c in r"\^$.|?*+()[]{}/" else c for c in text)
 
 
+# xgrammar is an optional dependency (the `grammar` extra), imported only where a grammar is built
+XGRAMMAR_INSTALL = "pip install 'mstar-ai[grammar]'"
+
+
 def grammar_request(value: Any) -> GrammarRequest | None:
     """The request's ``structured_outputs`` as a ``GrammarRequest``, checked; None
     when unset. ``ValueError`` (the client's 400) for a bad shape or grammar."""
@@ -143,7 +147,10 @@ def grammar_request(value: Any) -> GrammarRequest | None:
     if size > MAX_GRAMMAR_CHARS:
         raise ValueError(f"structured_outputs is {size} characters; at most {MAX_GRAMMAR_CHARS} are served")
     request = GrammarRequest(kind, raw, after)
-    request.grammar()
+    try:
+        request.grammar()
+    except ImportError as e:
+        raise ValueError(f"structured_outputs needs xgrammar on the server ({XGRAMMAR_INSTALL})") from e
     return request
 
 

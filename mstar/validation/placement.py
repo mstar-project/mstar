@@ -2,6 +2,7 @@
 they divide into, the parallel groups each worker is handed, and the weights
 that pick a request's replica among them."""
 
+import importlib.util
 import math
 from collections.abc import Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING, Any
@@ -12,6 +13,7 @@ from mstar.distributed.communication import GlobalParallelConfig
 from mstar.engine.resources.context_parallel import position_pools
 from mstar.engine.resources.kv.config import KVSpec, PagedKVConfig
 from mstar.engine.resources.sampler.config import SamplerSpec
+from mstar.engine.resources.sampler.grammar import XGRAMMAR_INSTALL
 from mstar.engine.resources.sequence_shard import sequence_parallel_refusals
 from mstar.engine.resources.spec import NodeResourceSpec
 from mstar.graph.base import GraphSection, self_triggered, top_level_entities
@@ -497,6 +499,8 @@ def _grammar_samplers(
     prefill/decode split): the grammar lives with one worker's sampler, and a draw on
     another would never reach it."""
     grammar = [spec for spec in specs if isinstance(spec, SamplerSpec) and spec.enable_grammar]
+    if grammar and importlib.util.find_spec("xgrammar") is None:
+        yield f"enable_grammar needs xgrammar, an optional dependency: {XGRAMMAR_INSTALL}"
     if grammar and not model.STRUCTURED_OUTPUTS:
         yield (
             f"enable_grammar is on, but {type(model).__name__} does not declare STRUCTURED_OUTPUTS: "

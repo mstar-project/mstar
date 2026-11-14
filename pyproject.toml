@@ -51,8 +51,6 @@ dependencies = [
     # transformers back to 5.10, which then fails to import GenerationMixin.
     # 3.0 also needs tqdm>=4.66.3.
     "datasets>=3",
-    # grammar-constrained sampling (`structured_outputs`, `response_format`)
-    "xgrammar>=0.2.9",
 ]
 
 [project.urls]
@@ -65,6 +63,8 @@ mstar = "mstar.cli.main:main"
 mstar-serve = "mstar.api_server.entrypoint:main"
 
 [project.optional-dependencies]
+# grammar-constrained sampling (`structured_outputs`, `response_format`, a sampler's enable_grammar)
+grammar = ["xgrammar>=0.2.9"]
 # OmniVoice reuses the reference package for weight loading, the rule-based
 # duration estimator, language/instruct validation and the pydub silence
 # trim; mstar owns the graph.
@@ -86,6 +86,7 @@ command_a_plus = [
 
 dev = [
     "ruff<=0.16",
+    "xgrammar>=0.2.9",  # the `grammar` extra, so the structured-output tests run
     "pytest>=9.0.3",
     "pytest-timeout",  # a per-test limit, so a stuck test is named rather than holding the suite
     "pydub",  # the OmniVoice silence trim's test oracle

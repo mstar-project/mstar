@@ -97,6 +97,7 @@ def test_a_reply_grammar_starts_where_the_prompt_leaves_the_reasoning(tmp_path, 
 def test_qwen3_5_attaches_the_requests_grammar_to_its_sampler_settings(tmp_path):
     """Qwen3.5 declares STRUCTURED_OUTPUTS, so its own sampler settings carry the request's
     grammar (the conductor then checks a sampler serves it); a bad one is the client's 400."""
+    pytest.importorskip("xgrammar")
     from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
 
     model = Qwen3_5DenseModel(str(_repo(tmp_path / "repo", None)))

@@ -191,8 +191,15 @@ Model families and some output formats need extra packages, exposed as pip *extr
      - ``prometheus-client`` for ``--enable-metrics`` (Prometheus metrics at
        ``/metrics``, see :ref:`serving-metrics`). A serving feature rather than a
        model's runtime, so not part of ``.[all]``.
+   * - ``.[grammar]``
+     - ``xgrammar`` for structured outputs (a sampler's ``enable_grammar``, serving
+       ``response_format`` and ``structured_outputs``; see **Structured output** in
+       :doc:`models`). A serving feature rather than a model's runtime, so not part of
+       ``.[all]``; a deployment that sets ``enable_grammar`` without it fails at startup
+       with this install hint.
    * - ``.[dev]``
-     - ``ruff`` + ``pytest`` for linting and the test suite.
+     - ``ruff`` + ``pytest`` for linting and the test suite, and ``xgrammar`` for the
+       structured-output tests.
    * - ``.[all]``
      - The union of the index-hosted dependencies from every model extra above.
        Convenient for a machine that serves multiple models; heavier and slower to

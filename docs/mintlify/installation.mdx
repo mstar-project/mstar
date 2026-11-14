@@ -100,7 +100,8 @@ Model families and some output formats need extra packages, exposed as pip *extr
 | `.[audio]` | `soundfile` — only needed to return **non-WAV** audio containers (mp3/flac/…) from the OpenAI/SDK audio surfaces. WAV/PCM output works without it. |
 | `.[audioseal]` | `audioseal` (`>=0.2,<0.3`, MIT code and weights) for the opt-in AudioSeal watermark on generated speech (Qwen3-TTS `audio_watermark`, see the Qwen3-TTS notes in [Supported Models](/models)). Not part of `.[all]`; a deployment that enables the watermark without it fails at startup with this install hint. The `python -m mstar.model.audio_watermark detect` CLI also needs `.[audio]`. |
 | `.[metrics]` | `prometheus-client` for `--enable-metrics` (Prometheus metrics at `/metrics`, see [Metrics](/serving#serving-metrics)). A serving feature rather than a model's runtime, so not part of `.[all]`. |
-| `.[dev]` | `ruff` + `pytest` for linting and the test suite. |
+| `.[grammar]` | `xgrammar` for structured outputs (a sampler's `enable_grammar`, serving `response_format` and `structured_outputs`; see **Structured output** in [models](/models)). A serving feature rather than a model's runtime, so not part of `.[all]`; a deployment that sets `enable_grammar` without it fails at startup with this install hint. |
+| `.[dev]` | `ruff` + `pytest` for linting and the test suite, and `xgrammar` for the structured-output tests. |
 | `.[all]` | The union of the index-hosted dependencies from every model extra above. Convenient for a machine that serves multiple models; heavier and slower to install than a single family's extra. It excludes the separately installed TAEHV, `flash-attn` and `qwen-tts` packages; see below, [flash-attn (LingBot-World)](/installation#flash-attn-lingbot-world) and [qwen-tts (Qwen3-TTS)](/installation#qwen-tts-qwen3-tts). |
 
 Combine extras as needed (keep `--torch-backend=auto` on every install):

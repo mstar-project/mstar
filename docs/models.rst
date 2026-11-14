@@ -783,7 +783,8 @@ supported yet. On any deployment,
 re-tokenize the text.
 
 **Structured output** (Qwen3.5 for now: a model declares ``STRUCTURED_OUTPUTS``, and
-``enable_grammar`` on any other model is refused at startup). With
+``enable_grammar`` on any other model is refused at startup; it needs the ``grammar`` extra,
+``pip install 'mstar-ai[grammar]'``). With
 ``resources: {sampler: {enable_grammar: true}}`` in the deployment's YAML (on the text sampler of a model with several), a request may constrain its
 reply: chat ``response_format`` (``json_object``, or ``json_schema`` with its ``schema``), or
 ``structured_outputs`` in ``model_kwargs`` / ``extra_body`` with exactly one of ``json`` (a
