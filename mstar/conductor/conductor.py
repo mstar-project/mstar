@@ -1318,13 +1318,14 @@ class Conductor:
             )
 
     def _try_admit_waiting(self):
-        """Drain the waiting queue up to the concurrency cap."""
+        """Scan the queue up to the concurrency cap, preserving survivor order."""
         blocked_episodes: set[str] = set()
-        for _ in range(len(self.waiting_queue)):
+        waiting, self.waiting_queue = self.waiting_queue, []
+        for index, body in enumerate(waiting):
             if (self.max_concurrent_requests is not None
                     and len(self.requests) >= self.max_concurrent_requests):
+                self.waiting_queue.extend(waiting[index:])
                 break
-            body = self.waiting_queue.pop(0)
             if (self._episode_array_names and body.episode is not None and
                     (body.episode in blocked_episodes or self._episode_records.busy(body.episode))):
                 blocked_episodes.add(body.episode)
