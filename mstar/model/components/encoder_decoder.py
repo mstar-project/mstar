@@ -3,7 +3,6 @@ encoder's output added once to a cross-attention context at prefill, then
 one token per decode step."""
 from __future__ import annotations
 
-from collections.abc import Mapping
 from dataclasses import replace
 from typing import Any
 
@@ -18,21 +17,16 @@ from mstar.engine.accelerator_graph_config import (
 )
 from mstar.engine.state import (
     ArrayStep,
-    SampleStep,
     Segment,
     SubmoduleStep,
-    at_last_token,
-    last_sampled,
-    position,
     positions,
-    sample,
 )
-from mstar.model.components.sampled_token_decoder import SampledTokenDecoder
+from mstar.model.components.sampled_token_decoder import DeclaredTokenDecoder
 from mstar.model.submodule_base import ARNodeInputs, ModelInputsFromEngine
 
 
-class EncoderDecoderNode(SampledTokenDecoder):
-    """A `SampledTokenDecoder` whose prefill walk also takes the encoder's
+class EncoderDecoderNode(DeclaredTokenDecoder):
+    """A `DeclaredTokenDecoder` whose prefill walk also takes the encoder's
     output, ``encoder_states``, and whose decoder cross-attends to it.
 
     It adds the cross-attention part only: the prefill row carries the
@@ -100,29 +94,6 @@ class EncoderDecoderNode(SampledTokenDecoder):
                 compile=False,
             ),
         ]
-
-    def bind_state(self, handles: Mapping[str, Any]) -> None:
-        self.kv, self.sampler = handles[self.KV_CACHE], handles[self.SAMPLER]
-
-    def node_step(
-        self, segments: list[Segment], prefill_tokens: Mapping[int, torch.Tensor], advance: tuple[int, ...] | None,
-    ) -> SubmoduleStep:
-        return SubmoduleStep(
-            segments=segments,
-            state={self.KV_CACHE: ArrayStep(advance=advance), self.SAMPLER: SampleStep(prompt_tokens=prefill_tokens)},
-        )
-
-    def next_position(self, rid_handle: int) -> int:
-        return position(self.kv, rid_handle, "main")
-
-    def loopback_tokens(self, engine_inputs: ModelInputsFromEngine) -> torch.Tensor:
-        return last_sampled(self.sampler)
-
-    def last_token_hidden(self, engine_inputs: ModelInputsFromEngine, hidden: torch.Tensor) -> torch.Tensor:
-        return at_last_token(self.kv, hidden)
-
-    def sample_tokens(self, engine_inputs: ModelInputsFromEngine, logits: torch.Tensor) -> torch.Tensor:
-        return sample(self.sampler, logits)
 
     def max_batch_size(self, graph_walk: str) -> int | None:
         if graph_walk == self.PREFILL_WALK:
