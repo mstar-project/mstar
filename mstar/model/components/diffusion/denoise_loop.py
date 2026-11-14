@@ -606,6 +606,7 @@ class DenoiseLoopSubmodule(NodeSubmodule):
                 state=self.request_state(rid), step=k,
                 sigmas=self._step_sigmas(*schedule_key) if by_sigma else None,
                 floor=max((r for r in restarts if r <= k), default=0), final=k + 1 >= num_steps,
+                num_steps=num_steps,
             ))
         return BlockCache(
             action=self._step_action, _rows=rows, _forecast=policy.forecast, _guidance=guidance,

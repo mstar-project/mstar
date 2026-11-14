@@ -16,6 +16,7 @@ from mstar.model.components.diffusion.step_cache import (
     BlockRange,
     CacheRow,
     ExplicitPlan,
+    FittedWeights,
     Forecast,
     GuidanceCache,
     Interval,
@@ -80,6 +81,11 @@ def test_the_calibration_policy_computes_every_step():
     ({"method": "interval", "every": 3, "forecast": 1}, Interval(every=3, forecast=Forecast(order=1))),
     ({"method": "plan", "computed": [3, 0, 1], "num_steps": 6, "blocks": {"front": 1}},
      ExplicitPlan(computed=(0, 1, 3), num_steps=6, blocks=BlockRange(front=1))),
+    ({"method": "plan", "computed": [0, 2, 5], "num_steps": 6,
+      "forecast": {"order": 1, "fitted": {"num_steps": 6, "weights": [[4, [2, 0], [1.2, -0.1]], [3, [2], [0.9]]]}}},
+     ExplicitPlan(computed=(0, 2, 5), num_steps=6, forecast=Forecast(
+         order=1, fitted=FittedWeights(6, ((3, (2,), (0.9,)), (4, (2, 0), (1.2, -0.1)))),
+     ))),
     ({"mag_ratios": [1.0, 0.9], "forecast": {"order": 2, "damping": 0.5, "time": "sigma"},
       "blocks": [{"until": 0.5, "front": 2}, {"back": 2}],
       "guidance": {"every": 3, "start": 0.4, "forecast": 1}},
@@ -105,6 +111,11 @@ def test_a_serving_config_names_its_policy(spec, expected):
     ({"method": "plan", "computed": [0, 9], "num_steps": 6}, "computed steps"),
     ({"method": "interval", "forecast": 3}, "order"),
     ({"method": "interval", "forecast": {"order": 1, "kind": "hermite"}}, "unknown forecast options"),
+    ({"method": "interval", "forecast": {"order": 1, "fitted": {"weights": []}}}, "num_steps"),
+    ({"method": "interval",
+      "forecast": {"order": 1, "fitted": {"num_steps": 6, "weights": [[4, [2, 1, 0], [1, 0, 0]]]}}}, "fitted entry"),
+    ({"method": "interval", "forecast": {"order": 1, "fitted": {"num_steps": 6, "weights": [[2, [3], [1.0]]]}}},
+     "fitted entry"),
     ({"method": "interval", "blocks": {"first": 1}}, "unknown blocks options"),
     ({"method": "interval", "blocks": [{"until": 0.5}, {"until": 0.5}]}, "increasing"),
     ({"method": "interval", "guidance": {"every": 0}}, "every"),
@@ -506,6 +517,37 @@ def test_a_forecast_spaced_by_sigma_reads_the_rows_schedule():
     predicted = _cache(StepAction(skip=BlockRange()), [CacheRow(state, 2, sigmas)], forecast).residual
     # 1 + (1 - 0) / (0.9 - 1.0) * (0.5 - 0.9) = 5; by step index it would be 2
     torch.testing.assert_close(predicted, torch.full((1, 2), 5.0))
+
+
+def test_a_fitted_forecast_takes_its_tables_weights_where_the_table_has_the_step():
+    """The table is for one step count and names the kept steps each entry was fitted for; anywhere else the
+    forecast's own expansion applies."""
+    fitted = FittedWeights(8, ((3, (2, 0), (1.5, -0.25)), (5, (4,), (0.5,))))
+    forecast = Forecast(order=1, fitted=fitted)
+    assert forecast.fitted_weights(8, 3, (2, 0)) == (1.5, -0.25) and forecast.fitted_weights(8, 5, (4,)) == (0.5,)
+    assert forecast.fitted_weights(6, 3, (2, 0)) is None and forecast.fitted_weights(8, 3, (2, 1)) is None
+    assert Forecast(order=1).fitted_weights(8, 3, (2, 0)) is None
+    assert forecast == Forecast(order=1, fitted=fitted) and hash(forecast) == hash(Forecast(order=1, fitted=fitted))
+    assert forecast != Forecast(order=1)
+
+    keep, skip = StepAction(keep=BlockRange()), StepAction(skip=BlockRange())
+
+    def predicted(step: int, num_steps: int, kept: list[tuple[int, float]]) -> torch.Tensor:
+        state = PerRequestState()
+        for at, value in kept:
+            _cache(keep, [CacheRow(state, at, num_steps=num_steps)], forecast).keep(torch.full((1, 2), value))
+        out = _cache(skip, [CacheRow(state, step, num_steps=num_steps)], forecast).residual
+        # predicting leaves what was kept as it was
+        assert torch.equal(state.tensors[RESIDUAL], torch.full((2,), kept[-1][1]))
+        return out
+
+    # the table's weights: 1.5 * 4 - 0.25 * 8
+    assert torch.equal(predicted(3, 8, [(0, 8.0), (2, 4.0)]), torch.full((1, 2), 4.0))
+    # another step count, or other kept steps: the line through the two kept values, 4 + (4 - 8) / 2
+    assert torch.equal(predicted(3, 6, [(0, 8.0), (2, 4.0)]), torch.full((1, 2), 2.0))
+    assert torch.equal(predicted(3, 8, [(1, 8.0), (2, 4.0)]), torch.full((1, 2), 0.0))
+    # one kept value and a fitted gain on it
+    assert torch.equal(predicted(5, 8, [(4, 6.0)]), torch.full((1, 2), 3.0))
 
 
 def test_nothing_kept_before_a_restart_is_read_or_left_allocated():

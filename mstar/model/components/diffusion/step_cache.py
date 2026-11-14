@@ -74,6 +74,16 @@ class StepAction(NamedTuple):
         return self.skip is not None
 
 
+class FittedWeights(NamedTuple):
+    """Forecast weights fitted offline on dense runs of one schedule (``benchmark/step_cache``'s calibration): for
+    a step of a ``num_steps`` schedule predicted from the values kept at ``kept`` steps (newest first), the weights
+    over those values that left the least error, in place of a Taylor expansion's."""
+
+    num_steps: int
+    # (step, kept steps newest first, weights newest first)
+    entries: tuple[tuple[int, tuple[int, ...], tuple[float, ...]], ...]
+
+
 @dataclass(frozen=True)
 class Forecast:
     """How a skipped quantity is predicted from the steps that computed it.
@@ -81,11 +91,15 @@ class Forecast:
     ``order`` 0 reuses the last value. Order 1 or 2 extrapolates through the last two or three, a Taylor expansion
     whose derivatives are divided differences (TaylorSeer, Liu et al., arXiv 2503.06923, at equal spacing), each
     derivative term scaled by ``damping`` per order. ``time`` is what the steps are spaced by: their index or the
-    schedule's sigma. A request with fewer kept values than the order needs uses the order it has."""
+    schedule's sigma. A request with fewer kept values than the order needs uses the order it has.
+
+    ``fitted`` replaces the expansion's weights wherever it lists the step and the kept steps it is predicted from,
+    on a request of the table's step count; any other step takes the expansion's."""
 
     order: int = 0
     damping: float = 1.0
     time: str = "step"
+    fitted: FittedWeights | None = None
 
     def __post_init__(self):
         if self.order not in (0, 1, 2) or not 0.0 <= self.damping <= 1.0 or self.time not in ("step", "sigma"):
@@ -93,11 +107,34 @@ class Forecast:
                 f"step cache forecast: order in (0, 1, 2), damping in [0, 1], time 'step' or 'sigma'; got "
                 f"{self.order}, {self.damping}, {self.time!r}"
             )
+        index: dict[tuple[int, tuple[int, ...]], tuple[float, ...]] = {}
+        if self.fitted is not None:
+            num_steps, entries = int(self.fitted[0]), self.fitted[1]
+            for step, kept, weights in entries:
+                kept, weights = tuple(int(k) for k in kept), tuple(float(w) for w in weights)
+                ordered = all(a > b for a, b in zip((num_steps, step, *kept), (step, *kept, -1), strict=True))
+                if not (0 < len(kept) == len(weights) <= self.depth and ordered):
+                    raise ValueError(
+                        f"step cache forecast: a fitted entry is (step, kept steps before it newest first, as many "
+                        f"weights), at most {self.depth} of them at order {self.order}; got {(step, kept, weights)}"
+                    )
+                index[int(step), kept] = weights
+            canonical = tuple((step, kept, weights) for (step, kept), weights in sorted(index.items()))
+            object.__setattr__(self, "fitted", FittedWeights(num_steps, canonical))
+        # a lookup table beside the fields: equality and the hash read ``fitted`` alone
+        object.__setattr__(self, "_fitted_index", index)
 
     @property
     def depth(self) -> int:
         """Kept values the forecast reads."""
         return self.order + 1
+
+    def fitted_weights(self, num_steps: int, step: int, kept: tuple[int, ...]) -> tuple[float, ...] | None:
+        """The fitted weights for ``step`` of a ``num_steps`` schedule predicted from the values kept at ``kept``
+        (newest first); None where the table has none, and :meth:`weights` applies."""
+        if self.fitted is None or num_steps != self.fitted.num_steps:
+            return None
+        return self._fitted_index.get((step, kept))
 
     @functools.lru_cache(maxsize=1024)  # noqa: B019 - frozen and hashable; a few schedules' worth of float tuples
     def weights(self, kept: tuple[float, ...], now: float) -> tuple[float, ...]:
@@ -348,7 +385,16 @@ def _forecast(spec: Any) -> Forecast:
     if spec is None:
         return Forecast()
     if isinstance(spec, Mapping):
-        return Forecast(**_options(spec, "forecast", {"order", "damping", "time"}))
+        spec = _options(spec, "forecast", {"order", "damping", "time", "fitted"})
+        fitted = spec.pop("fitted", None)
+        if fitted is not None:
+            fitted = _options(fitted, "fitted forecast", {"num_steps", "weights"})
+            if set(fitted) != {"num_steps", "weights"}:
+                raise ValueError("step_cache: a fitted forecast needs 'num_steps' and 'weights'")
+            fitted = FittedWeights(int(fitted["num_steps"]), tuple(
+                (int(step), tuple(kept), tuple(weights)) for step, kept, weights in fitted["weights"]
+            ))
+        return Forecast(**spec, fitted=fitted)
     return Forecast(order=int(spec))
 
 
@@ -392,7 +438,8 @@ def step_cache_policy(spec: Mapping[str, Any] | None, calibrated: Mapping[str, S
     * ``plan``: ``computed`` (the steps that compute) of a ``num_steps`` schedule;
     * ``magcache_calibrate`` logs a ``mag_ratios`` table instead.
 
-    Any of the first three also takes ``forecast`` (an order, or ``{order, damping, time}``), ``blocks``
+    Any of the first three also takes ``forecast`` (an order, or ``{order, damping, time, fitted}``, ``fitted`` a
+    calibrated ``{num_steps, weights: [[step, [kept steps], [weights]], ...]}``), ``blocks``
     (``{front, back}``, or a list of ``{until, front, back}`` stages) and ``guidance`` (``{every, start, forecast}``).
     """
     if spec is None:
@@ -484,6 +531,8 @@ class CacheRow:
     # nothing kept before this step is usable (the row's last restart)
     floor: int = 0
     final: bool = False
+    # the request's step count, which a fitted forecast's table is for
+    num_steps: int = 0
 
     def time(self, step: int, forecast: Forecast) -> float:
         return float(step) if forecast.time == "step" else self.sigmas[step]
@@ -551,11 +600,12 @@ class BlockCache:
             steps = [k for k in row.state.kwargs.get(name + "_steps", ()) if k >= row.floor]
             if not steps:
                 raise RuntimeError(f"step cache: step {row.step} found no {name}; a segment's first step must compute")
-            weights = forecast.weights(
-                tuple(row.time(k, forecast) for k in steps[: forecast.depth]), row.time(row.step, forecast),
+            kept = tuple(steps[: forecast.depth])
+            weights = forecast.fitted_weights(row.num_steps, row.step, kept) or forecast.weights(
+                tuple(row.time(k, forecast) for k in kept), row.time(row.step, forecast),
             )
             value = row.state.tensors[name]
-            if len(weights) > 1:
+            if weights != (1.0,):
                 value = weights[0] * value
                 for age in range(1, len(weights)):
                     value = value.add_(row.state.tensors[_aged(name, age)], alpha=weights[age])
