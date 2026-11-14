@@ -2455,7 +2455,7 @@ class PiecewiseAcceleratorGraphRunner:
         if step is not None and any(
             isinstance(handle := handles.get(name), ArrayHandle)
             and any(isinstance(read.mask, ChunkCausal) for read in handle.array.reads.values())
-            for name in step.state
+            for name in (step.state or ())
         ):
             raise ValueError(
                 f"piecewise {self._label!r}: ChunkCausal needs per-request state_layout lengths, "
