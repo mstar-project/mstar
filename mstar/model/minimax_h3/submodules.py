@@ -33,6 +33,7 @@ from mstar.model.components.diffusion.denoise_loop import DenoiseLoopSubmodule, 
 from mstar.model.components.diffusion.qwen3.encoder import qwen3_inv_freq
 from mstar.model.components.diffusion.qwen3.vl_prompt import qwen3_vl_prompt
 from mstar.model.components.diffusion.step_cache import StepCachePolicy
+from mstar.model.components.quant_linear import BF16, StepDtypes
 from mstar.model.components.qwen3_vit import vision_interpolation, vision_position_ids, vision_seq_lengths
 from mstar.model.components.qwen_vision import VISION_ATTN, QwenVisionModel
 from mstar.model.minimax_h3.components.layout import (
@@ -278,15 +279,18 @@ class H3PackedDenoise(DenoiseLoopSubmodule):
 
     def __init__(self, transformer: nn.Module, config, *, loop_name: str, max_batch_size: int = 1,
                  compile_blocks: bool = False, row_bucket: int = 1, capture_buckets=(),
-                 step_cache: StepCachePolicy | None = None):
+                 step_cache: StepCachePolicy | None = None, step_dtypes: StepDtypes | None = None,
+                 bf16_transformer: nn.Module | None = None):
         if max_batch_size != 1:
             # a batch's rows would have to agree on the step's first-step decisions (denoise)
             raise ValueError(f"the MiniMax-H3 dit runs one request per step; got max_batch_size={max_batch_size}")
         if int(row_bucket) < 1:
             raise ValueError(f"row_bucket must be a positive int; got {row_bucket!r}")
         super().__init__(loop_name=loop_name, max_batch_size=1, capture_buckets=capture_buckets,
-                         capture_batch_sizes=(1,), step_cache=step_cache)
+                         capture_batch_sizes=(1,), step_cache=step_cache, step_dtypes=step_dtypes)
         self.transformer = transformer
+        # a low-precision transformer's bf16 twin, for the steps a schedule (``linear_dtype_steps``) runs in bf16
+        self.bf16_transformer = bf16_transformer
         self.config = config
         self.compiled = bool(compile_blocks)
         self.row_bucket = int(row_bucket)
@@ -294,7 +298,9 @@ class H3PackedDenoise(DenoiseLoopSubmodule):
             # around the attention and the exchanges, static per row bucket: each new bucket
             # compiles once (5-8 s), and a step then runs the same kernels, at static speed, whatever
             # was served before it (dynamic-shape kernels ran 14-19% slower per step)
-            compile_blocks_(transformer.blocks, dynamic=False)
+            for module in (transformer, bf16_transformer):
+                if module is not None:
+                    compile_blocks_(module.blocks, dynamic=False)
         # the node's sequence shard, which brackets the DiT (`bind_state`)
         self.shard = None
 
@@ -491,14 +497,15 @@ class H3DenoiseSubmodule(H3PackedDenoise):
             timesteps = torch.stack([timestep, audio_timestep, cond_timestep], dim=-1).float()
         inputs = H3Inputs(video=latents, audio=audio_latents, text=text_embeds, timesteps=timesteps)
         block_cache = self.block_cache(engine_inputs)
+        transformer = self.bf16_transformer if self.step_dtype == BF16 else self.transformer
         if block_cache is None:
-            video_v, audio_v = self.transformer(inputs, layout, shard=self.shard)
+            video_v, audio_v = transformer(inputs, layout, shard=self.shard)
         elif block_cache.reuse:
-            video_v, audio_v = self.transformer(
+            video_v, audio_v = transformer(
                 inputs, layout, shard=self.shard, cached_residual=block_cache.residual,
             )
         else:
-            video_v, audio_v, residual = self.transformer(inputs, layout, shard=self.shard, return_residual=True)
+            video_v, audio_v, residual = transformer(inputs, layout, shard=self.shard, return_residual=True)
             block_cache.keep(residual)
         generated = h3_step(latents[:, n:], video_v[:, n:], timestep.view(-1, 1, 1), sigma, sigma_next)
         return {

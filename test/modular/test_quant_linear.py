@@ -37,7 +37,7 @@ from mstar.model.flux2_klein.config import Flux2KleinConfig, Flux2TransformerCon
 from mstar.model.flux2_klein.flux2_klein_model import Flux2KleinModel
 from mstar.model.minimax_h3.components.transformer import QUANTIZABLE_LINEARS as H3_QUANTIZABLE_LINEARS
 from mstar.model.minimax_h3.components.transformer import H3DiT
-from mstar.model.minimax_h3.config import H3TransformerConfig
+from mstar.model.minimax_h3.config import H3Config, H3TransformerConfig
 from mstar.model.minimax_h3.minimax_h3_model import H3Model
 from mstar.model.minimax_h3_image.minimax_h3_image_model import H3ImageModel
 from mstar.model.submodule_base import ModelInputsFromEngine
@@ -629,6 +629,39 @@ def _tiny_klein(monkeypatch, available: bool, **kwargs):
 
     monkeypatch.setattr("mstar.model.flux2_klein.flux2_klein_model.copy.deepcopy", spy)
     return model._create_submodule("dit", torch.device("cpu")), copies
+
+
+def _tiny_h3(monkeypatch, **kwargs):
+    """H3Model's real dit build on a one-block FastH3-style transformer with random bf16 weights."""
+    hidden = 128
+    tiny = H3TransformerConfig(
+        hidden_size=hidden, num_layers=1, token_refiner_num_layers=1, num_attention_heads=1, attention_head_dim=128,
+        ffn_hidden_size=256, text_dim=hidden, time_embed_hidden_size=hidden, time_embed_dim=64,
+        adaln_out_features=6 * hidden * 3, final_adaln_out_features=2 * hidden, vsa_gate=True,
+    )
+    from mstar.model.minimax_h3 import weight_loader
+
+    def build(config, snapshot, device, comm_group=None, dit_source=None):
+        torch.manual_seed(0)
+        return H3DiT(config.transformer).to(torch.bfloat16)
+
+    monkeypatch.setattr(weight_loader, "build_transformer", build)
+    monkeypatch.setattr(Mxfp8Format, "unavailable_reason", lambda self, device: None)
+    model = H3Model(compile=False, **kwargs)
+    model.set_config(H3Config(transformer=tiny))
+    model._snapshot = Path("/nonexistent")
+    return model._create_submodule("dit", torch.device("cpu"))
+
+
+def test_h3_runs_a_schedules_bf16_steps_on_a_twin_taken_before_quantizing(monkeypatch):
+    sub = _tiny_h3(monkeypatch, linear_dtype="mxfp8", linear_dtype_steps=2)
+    assert sub.step_dtypes == StepDtypes(("bf16", "bf16", "mxfp8")) and sub.split_batches_by_capture_key("gen")
+    assert any(isinstance(m, QuantLinear) for m in sub.transformer.modules())
+    assert not any(isinstance(m, QuantLinear) for m in sub.bf16_transformer.modules())
+    assert sub.bf16_transformer.blocks[0].attn.gate_compress.weight.dtype == torch.bfloat16
+    for kwargs in ({"linear_dtype": "mxfp8"}, {"linear_dtype": "bf16", "linear_dtype_steps": 1}):
+        sub = _tiny_h3(monkeypatch, **kwargs)
+        assert sub.bf16_transformer is None and sub.step_dtypes is None
 
 
 def test_the_twin_is_a_copy_taken_before_quantizing_and_only_when_something_was(monkeypatch):

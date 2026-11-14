@@ -19,6 +19,7 @@ FL2VA's, on its trained rungs; the rest of the model is FL2VA's.
 
 from __future__ import annotations
 
+import copy
 import functools
 import logging
 import math
@@ -36,7 +37,13 @@ from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import Model, TensorAndMetadata, WalkStep
 from mstar.model.components.diffusion.attention import dit_entry, refuse_attention_backend_kwarg
 from mstar.model.components.diffusion.step_cache import step_cache_policy
-from mstar.model.components.quant_linear import apply_linear_dtype, check_linear_dtype, check_linear_keep
+from mstar.model.components.quant_linear import (
+    check_linear_dtype,
+    check_linear_dtype_steps,
+    check_linear_keep,
+    quantize_linears,
+    select_linears,
+)
 from mstar.model.components.video_encode import Mp4Encoding, encode_mp4
 from mstar.model.media_limits import PILLOW_IMAGE_FORMATS, check_image_size
 from mstar.model.minimax_h3.components.layout import H3Layout
@@ -223,6 +230,7 @@ class H3Model(Model):
         stream_decode: bool = False,
         linear_dtype: str = "bf16",
         linear_keep_bf16: list[str] | None = None,
+        linear_dtype_steps: int | list[str] | None = None,
         **kwargs,
     ):
         refuse_attention_backend_kwarg(kwargs)
@@ -262,6 +270,8 @@ class H3Model(Model):
         # docs/models.rst), with linear_keep_bf16 keeping more of them bf16
         self.linear_dtype = check_linear_dtype(linear_dtype)
         self.linear_keep_bf16 = check_linear_keep(linear_keep_bf16)
+        # some denoise steps in bf16 under that format (the first ones set a distilled clip's composition)
+        self.step_dtypes = check_linear_dtype_steps(linear_dtype_steps, self.linear_dtype)
         if distilled_checkpoint is not None and self.step_cache is not None:
             raise ValueError("MiniMax-H3 step_cache's tables are a 50-point dense run's; not for a distilled DiT")
         self._snapshot = None
@@ -738,13 +748,17 @@ class H3Model(Model):
 
             transformer = weight_loader.build_transformer(config, snapshot, device, comm_group=tp_group,
                                                           dit_source=config.dit_source)
-            apply_linear_dtype(transformer, self.linear_dtype, QUANTIZABLE_LINEARS, self.linear_keep_bf16,
-                               "MiniMax-H3 transformer")
+            selection = select_linears(transformer, self.linear_dtype, QUANTIZABLE_LINEARS, self.linear_keep_bf16,
+                                       "MiniMax-H3 transformer")
+            # a schedule's bf16 steps run a copy taken before quantizing; nothing quantized, every step is bf16
+            step_dtypes = self.step_dtypes if selection.names else None
+            bf16_transformer = copy.deepcopy(transformer) if step_dtypes is not None else None
+            quantize_linears(transformer, selection)
             return H3DenoiseSubmodule(
                 transformer,
                 config, loop_name=DENOISE_LOOP,
                 max_batch_size=1, compile_blocks=self.compile, row_bucket=self.row_bucket,
-                step_cache=self.step_cache,
+                step_cache=self.step_cache, step_dtypes=step_dtypes, bf16_transformer=bf16_transformer,
             )
         if node_name == VAE_DECODER_NODE:
             return H3VideoDecoderSubmodule(weight_loader.build_video_decoder(config, snapshot, device), config,

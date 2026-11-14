@@ -18,9 +18,10 @@ model_kwargs:
   vae_compile: true
   # the decoder as a loop over its clips, each clip's frames encoded while the next decodes
   stream_decode: true
-  # opt-in, lossy: the DiT's linears on MXFP8 (Blackwell), 22% less time a clip on a B300, the clip
-  # moved about as far as SGLang's bf16 one is (docs/models.rst, MiniMax-H3)
+  # opt-in, lossy: the DiT's linears on MXFP8 (Blackwell) after two bf16 steps, 17% less time a clip on
+  # a B300, the clip as close to bf16 as a kernel swap leaves it (docs/models.rst, MiniMax-H3)
   # linear_dtype: mxfp8
+  # linear_dtype_steps: 2
 
 node_groups:
   - node_names: [dit, text_encoder, vae_encoder, vae_decoder, audio_decoder]

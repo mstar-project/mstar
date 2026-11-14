@@ -2597,6 +2597,16 @@ rounds on 8 prompts, the base two rounds, quality on 4):
      - 5.43 (+53%)
      - 11.9 / 0.33 / 0.61 / -1.0
    * -
+     - ``mxfp8``, ``linear_dtype_steps: 2``
+     - 14.6 (-17%)
+     -
+     - 19.3 / 0.63 / 0.22 / 6.0
+   * -
+     - ``nvfp4``, ``linear_dtype_steps: 2``
+     - 13.1 (-25%)
+     -
+     - 16.0 / 0.47 / 0.39 / -0.6
+   * -
      - SGLang bf16 (same GPU and seeds)
      - 17.8
      - 3.37
@@ -2628,7 +2638,12 @@ rounds on 8 prompts, the base two rounds, quality on 4):
      - bf16 against M*'s: 20.3 / 0.76 / 0.25 / -6.6; fp8 against its bf16: 18.6 / 0.72 / 0.28 / 4.8
 
 The distilled 8 steps amplify any rounding: FastH3's bf16 DiT run eagerly is already 17.3 dB / 0.54 /
-0.30 / 7.6 from the compiled one. MXFP8 keeps the clip with its details moved (on FastH3 as far from
+0.30 / 7.6 from the compiled one, and FA4 for cuDNN in the token refiner 17.5 dB. The first steps set
+the clip: ``linear_dtype_steps`` (as klein's: a count of leading steps, or a dtype per step) runs them
+on a bf16 copy of the DiT taken before quantizing, which the deployment holds too (175 GiB peak for
+FastH3 MXFP8 with two bf16 steps, against 111 and 131 GiB for MXFP8 and bf16 alone). Two of FastH3's
+eight steps in bf16 bring MXFP8 inside the kernel-swap distance (the two step rows; measured against
+the bf16 clips of their own tree). MXFP8 keeps the clip with its details moved (on FastH3 as far from
 M*'s bf16 clip as SGLang's own bf16 clip is); NVFP4 changes more of it. Keeping the attention linears
 bf16 under MXFP8 gains FastH3 0.9 dB at 15.4 s a clip, keeping ``mlp.fc2`` 0.3 dB at 14.4 s. NVFP4's
 ``mlp.fc2`` inputs reach 303k on FastH3 (above the 2688 a unit input scale holds, in 38 of 50
