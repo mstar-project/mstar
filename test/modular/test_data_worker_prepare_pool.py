@@ -388,9 +388,10 @@ def test_positronic_warm_window_sets_conductor_reset_before_admission(
         )
         plan = planner.walk_plan(
             "", ["image"], ["action"], {"image_inputs": [object()]},
-            sent[0].model_kwargs, EpisodeView("episode", 1, {STATE_NAME: 1}),
+            sent[0].model_kwargs, EpisodeView("episode", 1, {STATE_NAME: 0}),
         )
         assert plan[-1].step_metadata["action_format"] == "positronic"
+        assert plan[-1].step_metadata["history_append"] == 21
 
 
 def test_requests_overlap_and_reach_the_conductor_in_arrival_order(worker):
