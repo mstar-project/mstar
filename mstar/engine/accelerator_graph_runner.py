@@ -1116,15 +1116,20 @@ class AcceleratorGraphRunner:
             # stopped early here would leave the others waiting
             self._comm_group.instance.barrier()
 
-            try:
-                slot = self._capture_one(spec, forwards=0 if sized else self.NUM_WARMUP)
-            except Exception:
-                # a lean twin's steps replay its plain bucket instead (`_report_dropped`)
-                logger.log(
-                    logging.WARNING if spec.bucket.lean else logging.ERROR,
-                    "Failed to capture accelerator graph for %s: %s",
-                    self._submodule_name, spec, exc_info=True
-                )
+            # entered on every rank, pass or fail: finishing a capture can
+            # itself be collective (see GraphCaptureScope)
+            with self._comm_group.tp_group.graph_capture() as capture:
+                try:
+                    slot = self._capture_one(spec, forwards=0 if sized else self.NUM_WARMUP)
+                    capture.captured = True
+                except Exception:
+                    # a lean twin's steps replay its plain bucket instead (`_report_dropped`)
+                    logger.log(
+                        logging.WARNING if spec.bucket.lean else logging.ERROR,
+                        "Failed to capture accelerator graph for %s: %s",
+                        self._submodule_name, spec, exc_info=True
+                    )
+            if not capture.usable:
                 continue
 
             captured.setdefault(spec.bucket, {})[spec.slot] = (spec, slot)
@@ -2247,15 +2252,19 @@ class PiecewiseAcceleratorGraphRunner:
                 # warmup forward. Every rank walks all the slots even after a
                 # failure here, or the barrier counts diverge and they hang.
                 self._comm_group.instance.barrier()
-                try:
-                    self._capture_one(shape, slot, forwards=0 if sized else self.NUM_WARMUP)
-                except Exception:
+                with self._comm_group.tp_group.graph_capture() as capture:
+                    try:
+                        self._capture_one(shape, slot, forwards=0 if sized else self.NUM_WARMUP)
+                        capture.captured = True
+                    except Exception:
+                        logger.error(
+                            "PiecewiseAcceleratorGraphRunner[%s]: failed to capture bs=%d "
+                            "total_tokens=%d slot=%d", self._label, shape.bs,
+                            shape.total_tokens, slot, exc_info=True,
+                        )
+                # an unusable slot fails the shape, which drops it everywhere
+                if not capture.usable:
                     shape_captured = False
-                    logger.error(
-                        "PiecewiseAcceleratorGraphRunner[%s]: failed to capture bs=%d "
-                        "total_tokens=%d slot=%d", self._label, shape.bs,
-                        shape.total_tokens, slot, exc_info=True,
-                    )
             captured[i] = shape_captured
             if shape_captured:
                 logger.info(
