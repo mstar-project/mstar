@@ -24,7 +24,7 @@ slower.
 
 import logging
 from collections import Counter
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from typing import Any, NamedTuple
 
 from mstar.engine.resources.kv.config import prefix_caches_by_rank
@@ -174,13 +174,19 @@ class ReplicaRouter:
         """The node groups of these partitions: what a request whose other partitions are done runs."""
         return frozenset().union(*(self._partition_groups[p] for p in partitions))
 
-    def pick(self, configs: Mapping[str, ResourceReqConfig], groups_run: frozenset[int]) -> Placement:
+    def pick(
+        self, configs: Mapping[str, ResourceReqConfig], groups_run: frozenset[int],
+        *, eligible: Callable[[Instance], bool] | None = None,
+    ) -> Placement | None:
         """Each node group's replica for a new request that runs ``groups_run``
         and opens its resources with ``configs``. Records nothing."""
         replicas: dict[int, int] = {}
         picked: dict[int, RoutingFacts] = {}
         for u, unit in enumerate(self._units):
-            choice = 0
+            choices = [i for i, instance in enumerate(unit.instances) if eligible is None or eligible(instance)]
+            if not choices:
+                return None
+            choice = choices[0]
             if len(unit.instances) > 1:
                 # the facts on each replica, every mirror's fields added
                 row: list[RoutingFacts] | None = None
@@ -193,9 +199,9 @@ class ReplicaRouter:
                     + (0.0 if row is None else routing_cost(row[i], self._weights))
                     for i in range(len(unit.instances))
                 ]
-                least = min(cost)
+                least = min(cost[i] for i in choices)
                 choice = min(
-                    (i for i, c in enumerate(cost) if c == least), key=lambda i: self._last_pick[(u, i)],
+                    (i for i in choices if cost[i] == least), key=lambda i: self._last_pick[(u, i)],
                 )
                 if row is not None:
                     picked[u] = row[choice]

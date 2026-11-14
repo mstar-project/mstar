@@ -264,6 +264,15 @@ A config maps the model's computation-graph nodes to physical GPU ranks. The key
      - *(optional)* How many requests run at once. Requests past the cap wait in the
        conductor's queue, except a live call (open client input), which is refused with
        a 503.
+   * - ``episodes``
+     - *(optional)* For models declaring episode-lifetime arrays: ``max_episodes``
+       (default 16), ``max_calls`` (default ``null``), ``max_queued_calls`` (default 1),
+       and ``idle_timeout_s`` (default 600). A named episode keeps one worker slot
+       across calls until close or idle expiry. Size each episode array's
+       ``resources: <array>: max_slots`` for ``max_episodes`` times its label count,
+       plus one sink slot. For example, 16 episodes with one label need
+       ``max_slots: 17``; the dense pool's own default is 2, so startup refuses
+       the default episode count until the resource override is set.
    * - ``unpausable_outputs``
      - *(optional)* The output modalities a pause would break, such as ``[audio]``. A request
        that streams one of them reserves its whole KV footprint and is never preempted once it
