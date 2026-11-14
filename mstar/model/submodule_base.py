@@ -257,6 +257,24 @@ class StopPolicy:
         )
 
 
+def _clone_stop_buffer(value, clones: dict[int, torch.Tensor]):
+    """``value`` with each tensor cloned once, by identity, into ``clones``."""
+    # A module function: nested in its caller it would close over itself, and that cycle keeps the clones alive
+    # until a collection.
+    if isinstance(value, torch.Tensor):
+        if id(value) not in clones:
+            clones[id(value)] = value.clone()
+        return clones[id(value)]
+    if isinstance(value, list):
+        return [
+            x.clone() if isinstance(x, torch.Tensor) else x for x in value
+        ]
+    if isinstance(value, dict):
+        return {k: _clone_stop_buffer(v, clones) for k, v in value.items()}
+    # pass anything else through: dropping it could lose a stop signal
+    return value
+
+
 @dataclass
 class BatchedModelOutput:
     """A step's outputs, split by how they are addressed.
@@ -360,22 +378,7 @@ class BatchedModelOutput:
             id(rows[name]): clone for name, clone in (reuse or {}).items()
             if name in rows and isinstance(clone, torch.Tensor)
         }
-
-        def _clone(value):
-            if isinstance(value, torch.Tensor):
-                if id(value) not in clones:
-                    clones[id(value)] = value.clone()
-                return clones[id(value)]
-            if isinstance(value, list):
-                return [
-                    x.clone() if isinstance(x, torch.Tensor) else x for x in value
-                ]
-            if isinstance(value, dict):
-                return {k: _clone(v) for k, v in value.items()}
-            # pass anything else through: dropping it could lose a stop signal
-            return value
-
-        return {k: _clone(v) for k, v in self.check_stop_buffers.items()}
+        return {k: _clone_stop_buffer(v, clones) for k, v in self.check_stop_buffers.items()}
 
     def clone_row_outputs(self, num_rows: int) -> dict[str, torch.Tensor]:
         """One clone per row-addressed batch tensor, narrowed to the real rows
