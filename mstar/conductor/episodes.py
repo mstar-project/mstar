@@ -6,7 +6,7 @@ lifecycle still adds and removes each call from the replica router.
 """
 
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from types import MappingProxyType
 
@@ -36,10 +36,12 @@ class EpisodeRecord:
     ending: bool = False
 
 
-def _snapshot(record: EpisodeRecord | None, episode_id: str | None) -> EpisodeView:
+def _snapshot(record: EpisodeRecord | None, episode_id: str | None, array_names: frozenset[str]) -> EpisodeView:
+    held = dict.fromkeys(array_names, 0)
     if record is None:
-        return EpisodeView(episode_id, 0, MappingProxyType({}))
-    return EpisodeView(episode_id, record.calls, MappingProxyType(record.held.copy()), record.cold)
+        return EpisodeView(episode_id, 0, MappingProxyType(held))
+    held.update(record.held)
+    return EpisodeView(episode_id, record.calls, MappingProxyType(held), record.cold)
 
 
 class EpisodeRecords:
@@ -49,7 +51,8 @@ class EpisodeRecords:
     slot through NEW_REQUEST and binds the worker-local request handle to it.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, array_names: Iterable[str] = ()) -> None:
+        self._array_names = frozenset(array_names)
         self._records: dict[str, EpisodeRecord] = {}
         self._closed: dict[str, float] = {}
 
@@ -59,7 +62,7 @@ class EpisodeRecords:
     ) -> EpisodeView:
         """Snapshot state before a call; changed keys read as empty."""
         record = self._records.get(episode_id) if episode_id is not None else None
-        view = _snapshot(record, episode_id)
+        view = _snapshot(record, episode_id, self._array_names)
         if record is None or (not reset and not keys):
             return view
         held = {} if reset else dict(view.held)
@@ -67,6 +70,8 @@ class EpisodeRecords:
             for name, key in keys.items():
                 if record.keys.get(name) != key:
                     held.pop(name, None)
+        for name in self._array_names:
+            held.setdefault(name, 0)
         return EpisodeView(episode_id, view.calls, MappingProxyType(held), "reset" if reset else view.cold)
 
     def clear_arrays(self, episode_id: str | None, keys: Mapping[str, str] | None) -> list[str]:
@@ -143,7 +148,7 @@ class EpisodeRecords:
         if not request_id:
             raise ValueError("request id must be non-empty")
         if episode_id is None:
-            return _snapshot(None, None)
+            return _snapshot(None, None, self._array_names)
         if type(episode_id) is not str or not episode_id:
             raise ValueError(f"episode id must be a non-empty str or None, got {episode_id!r}")
 
