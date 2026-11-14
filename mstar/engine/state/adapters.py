@@ -691,7 +691,8 @@ def state_sizes(
 ) -> dict[str, dict[str, dict[str, int]]]:
     """Each sized Value's sizes per label, from what a model's `process_prompt` returned, as plain values for the
     wire. The model computed them, so a miss raises ``RuntimeError``, which fails the request with a 500, as
-    `kv_layouts` does."""
+    `kv_layouts` does. A request that lays out no label of a sized Value holds none of it, and a step of it there is
+    refused."""
     sized = sized_values(declarations)
     sizes: dict[str, dict[str, dict[str, int]]] = {}
     for name, by_label in state_layout.items():
@@ -714,11 +715,8 @@ def state_sizes(
             if need > most:
                 raise RuntimeError(f"{where}: the request's fields take {need} bytes at {dict(layout.sizes)}, and "
                                    f"{most} at Array {name!r}.largest")
-        sizes[name] = given
-    unsized = sorted(name for name in sized if not sizes.get(name))
-    if unsized:
-        raise RuntimeError(f"state_layout gives no sizes for {unsized}, and a sized Value's request is admitted by "
-                           "them; give each a Layout with sizes for every label the request uses")
+        if given:
+            sizes[name] = given
     return sizes
 
 

@@ -422,7 +422,8 @@ request: lay out every paged array. A layout may be empty where an opened label 
 written. A Value's layout is ``Layout()``, because a Value takes one slot per label. A sized
 Value is the exception: ``Value(..., largest={...})`` declares fields whose shapes name sizes
 (``Size("lat_h", scale=8)``), its layout gives the request's own (``Layout(sizes={...})``), and the
-engine admits the request by its fields' bytes at those sizes. Its ``read`` hands the row's
+engine admits the request by its fields' bytes at those sizes. A request that lays out no label of
+it holds none of it. Its ``read`` hands the row's
 tensors over and ``write`` keeps the ones it is given, with no copy either way, so a step
 writes or clears every field it read. A paged layout has four fields:
 
