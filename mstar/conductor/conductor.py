@@ -647,7 +647,7 @@ class Conductor:
         episode_config = self.model_config.get("episodes") or {}
         if not isinstance(episode_config, dict):
             raise ValueError("episodes must be a mapping")
-        self._episode_records = EpisodeRecords()
+        self._episode_records = EpisodeRecords(self._episode_array_names)
         self._episode_slots = EpisodeSlots(episode_config.get("max_episodes", 16))
         for spec in self._node_resources():
             if spec.resource_key in self._episode_array_names:

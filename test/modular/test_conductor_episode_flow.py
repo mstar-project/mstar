@@ -139,7 +139,7 @@ def test_named_calls_wait_for_teardown_then_plan_from_worker_counts(tmp_path, mo
     first = _new_requests(comm, "first")
     assert len(first) == 1
     assert (first[0][1].episode_id, first[0][1].episode_slot) == ("robot-a", 0)
-    assert model.views[-1].calls == 0 and dict(model.views[-1].held) == {}
+    assert model.views[-1].calls == 0 and dict(model.views[-1].held) == {"frames": 0}
 
     conductor._ingest_request(_request("second", "robot-a"))
     assert _new_requests(comm, "second") == []
@@ -179,7 +179,7 @@ def test_idless_calls_are_cold_and_share_the_same_admission_pool(tmp_path, monke
     _complete(conductor, "first", {"frames": 4})
     assert _new_requests(comm, "second")[0][1].episode_slot == 0
     assert [(view.id, view.calls, dict(view.held)) for view in model.views] == [
-        (None, 0, {}), (None, 0, {}),
+        (None, 0, {"frames": 0}), (None, 0, {"frames": 0}),
     ]
 
 
@@ -189,7 +189,7 @@ def test_reset_and_close_clear_owner_after_teardown(tmp_path, monkeypatch):
     _complete(conductor, "first", {"frames": 4})
     conductor._ingest_request(_request("second", "robot-a", reset=True))
     assert model.views[-1].cold == "reset"
-    assert dict(model.views[-1].held) == {}
+    assert dict(model.views[-1].held) == {"frames": 0}
     assert _new_requests(comm, "second")[0][1].reset_episode is True
     conductor._end_episode(EndEpisodeConductor("robot-a"))
     assert not any(msg.message_type == WorkerMessageType.END_EPISODE for _, msg in comm.sent)
@@ -318,7 +318,7 @@ def test_changed_content_key_clears_just_its_array_before_planning(tmp_path, mon
 
     conductor._ingest_request(_request("second", "robot-a", keys={"frames": "b"}))
     assert model.views[-1].calls == 1
-    assert dict(model.views[-1].held) == {}
+    assert dict(model.views[-1].held) == {"frames": 0}
     assert _new_requests(comm, "second")[0][1].episode_clear == ["frames"]
 
 
