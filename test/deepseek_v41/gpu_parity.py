@@ -273,8 +273,10 @@ def _capture_rows(args, rows: dict[str, dict], device: str, prefix: str = "", **
         for seed in range(args.seeds):
             with tempfile.TemporaryDirectory() as tmp:
                 T.write_snapshot(tmp, config, seed=seed)
-                engine, sampler, _ = T.build_engine(tmp, getattr(torch, dtype), device=device, **build,
-                                                    **({"capture_contexts": args.contexts} if args.contexts else {}))
+                engine, sampler, _ = T.build_engine(
+                    tmp, getattr(torch, dtype), device=device, **build,
+                    resources={"csa": {"attend_kernel": True}} if args.attend_kernel else None,
+                    **({"capture_contexts": args.contexts} if args.contexts else {}))
                 buckets = T.captured_buckets(engine)
                 if not buckets:
                     _emit(rows, f"{prefix}{dtype}/seed{seed}", {"error": "no decode graph was captured"})
@@ -424,6 +426,8 @@ def main() -> int:
     ap.add_argument("--steps", type=int, default=32, help="capture: decode steps a request")
     ap.add_argument("--contexts", type=lambda s: tuple(int(c) for c in s.split(",")), default=None,
                     help="capture: the contexts decode graphs are captured for (the model's ladder otherwise)")
+    ap.add_argument("--attend-kernel", action="store_true",
+                    help="capture: the attention softmax on its Triton kernel (bf16), eager and replayed")
     ap.add_argument("--engine-device", default="cuda:0")
     ap.add_argument("--no-kernels", action="store_true", help="tp1 without tilelang: the fp32 row only")
     ap.add_argument("--out", required=True)

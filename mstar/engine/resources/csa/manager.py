@@ -400,6 +400,14 @@ class CSAManager(Resource):
         group = torch.arange(width, device=q.device)
         heads = q.shape[1]
         with torch.autocast(q.device.type, enabled=False):
+            if rows.one_row_each and self._score_kernel(q):
+                # a decode step in bf16 on CUDA: one launch reads the keys' bytes in place
+                from mstar.engine.resources.csa.kernels import decode_scores
+
+                cache = rows.caches[ratio]
+                out = decode_scores(q.contiguous(), w.to(q.dtype).contiguous(), view, cache.pages,
+                                    cache.page_start, rows.row_req, seen, width)
+                return out.masked_fill_(group[None, :] >= seen[:, None], -torch.inf)
             if rows.one_row_each:
                 # a decode step: every row against its own request's keys, a launch per chunk
                 # of rows instead of one per request
@@ -424,6 +432,14 @@ class CSAManager(Resource):
                     dots = torch.einsum("rhd,jd->rhj", q[c0:c1], keys).relu_()
                     out[c0:c1, :count] = (dots * w[c0:c1].unsqueeze(-1)).sum(dim=1)
         return out.masked_fill_(group[None, :] >= seen[:, None], -torch.inf)
+
+    def _score_kernel(self, q: torch.Tensor) -> bool:
+        """Whether the Triton kernel scores these queries: bf16 on CUDA, against keys held as
+        FP4 bytes with a power-of-two scale per 32 (its arithmetic is the torch path's in bf16;
+        in fp32 the heads' sum has an order, and the torch path keeps its own)."""
+        fmt, dim = self.config.key_rows, q.shape[-1]
+        return (self.config.score_kernel and q.is_cuda and q.dtype == torch.bfloat16 and fmt is not None
+                and fmt.block == 32 and not fmt.e4m3_scale and dim >= 16 and dim & (dim - 1) == 0)
 
     def candidates(self, ratio: int, scores: torch.Tensor, topk_blocks: int, block_size: int,
                    label: str | None = None) -> torch.Tensor:
@@ -468,6 +484,9 @@ class CSAManager(Resource):
         if slots is not None:
             pick = col - window_cols[:, None]
             from_cache = torch.where((pick >= 0) & (pick < picks), slots.gather(1, pick.clamp(0, picks - 1)), -1)
+        if self.config.attend_kernel and q.is_cuda and q.dtype == torch.bfloat16 and width >= 16 \
+                and width & (width - 1) == 0:
+            return self._attend_on_kernel(q, sink, window, from_window, from_cache, latent)
         # the softmax runs a block of entries at a time: each block's scores against the running
         # maximum, its probabilities rounded to the queries' dtype, the sums so far rescaled. The
         # whole blocks' scores and weighted entries are computed at once, a last partial block at
@@ -516,4 +535,33 @@ class CSAManager(Resource):
                     total = total * decay[..., b] + mass[..., b]
                     acc = acc * decay[..., b, None] + weighted[:, :, b]
                 out[c0:c1] = (acc / (total + torch.exp(sink - peak[..., -1]))[..., None]).to(out.dtype)
+        return out
+
+    def _attend_on_kernel(self, q: torch.Tensor, sink: torch.Tensor, window: torch.Tensor,
+                          from_window: torch.Tensor, from_cache: torch.Tensor | None,
+                          latent: torch.Tensor | None) -> torch.Tensor:
+        """``attend`` with the softmax on the Triton kernel: each row's entries gathered to bf16,
+        which holds every window row and every FP4 latent exactly, in their places."""
+        from mstar.engine.resources.csa.kernels import attend
+
+        count, heads, width = q.shape
+        block = self.config.softmax_block
+        spare = -from_window.shape[1] % block
+        chunk = max(1, self.config.attend_bytes // (2 * width * (from_window.shape[1] + spare)))
+        out = torch.empty_like(q)
+        for c0 in range(0, count, chunk):
+            c1 = min(c0 + chunk, count)
+            idx = from_window[c0:c1]
+            valid = idx >= 0
+            entries = window[idx.clamp_min(0)]
+            if from_cache is not None:
+                picked = from_cache[c0:c1]
+                live = picked >= 0
+                entries = torch.where(live[..., None], _load(
+                    latent[picked.clamp_min(0)], self.config.latent_rows, width, q.dtype), entries)
+                valid = valid | live
+            if spare:
+                entries, valid = F.pad(entries, (0, 0, 0, spare)), F.pad(valid, (0, spare))
+            out[c0:c1] = attend(q[c0:c1].contiguous(), entries.contiguous(), valid.contiguous(), sink.float(),
+                                self.config.sm_scale, block)
         return out

@@ -62,6 +62,12 @@ class CSAConfig:
     # bytes of fp32 scores one selection launch holds, and of gathered rows one attention launch
     score_bytes: int = 256 << 20
     attend_bytes: int = 256 << 20
+    # score a decode step's rows with the Triton kernel that reads FP4 keys in place, where it
+    # applies (bf16 on CUDA); off, every step takes the torch path, the kernel's reference
+    score_kernel: bool = True
+    # run a step's softmax on the Triton kernel, where it applies (bf16 on CUDA). Its dots sum
+    # in another order than the torch path's, so a result can differ in its last bf16 place.
+    attend_kernel: bool = False
 
     def __post_init__(self):
         self.caches = dict(self.caches)
@@ -91,13 +97,21 @@ class CSASpec(NodeResourceSpec):
 
         return CSAManager
 
-    def apply_yaml_overrides(self, score_bytes: int | None = None, attend_bytes: int | None = None):
-        """What the box decides, not the model: the memory a launch's scores and rows may take."""
+    def apply_yaml_overrides(self, score_bytes: int | None = None, attend_bytes: int | None = None,
+                             score_kernel: bool | None = None, attend_kernel: bool | None = None):
+        """What the box decides, not the model: the memory a launch's scores and rows may take,
+        and which of the two Triton kernels run."""
         for name, value in (("score_bytes", score_bytes), ("attend_bytes", attend_bytes)):
             if value is None:
                 continue
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ValueError(f"{name} must be a positive integer, got {value!r}")
+            setattr(self.config, name, value)
+        for name, value in (("score_kernel", score_kernel), ("attend_kernel", attend_kernel)):
+            if value is None:
+                continue
+            if not isinstance(value, bool):
+                raise ValueError(f"{name} must be true or false, got {value!r}")
             setattr(self.config, name, value)
 
 

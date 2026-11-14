@@ -397,11 +397,12 @@ def patch_cpu_engine(monkeypatch) -> None:
 
 
 def build_engine(path: str | Path, dtype: torch.dtype, device: str = "cpu", tp_group=None,
-                 parallel_groups=None, moe_parallel=None, **model_kwargs):
+                 parallel_groups=None, moe_parallel=None, resources: dict | None = None, **model_kwargs):
     """M*'s model on the snapshot ``path``, loaded as a server loads it, in an ``Engine`` on
     ``device`` whose sampler is a ``RecordingSampler``. ``tp_group`` and ``parallel_groups``
     make it one rank of a tensor-parallel node, ``moe_parallel`` (a node group's ``ep_config``)
-    with whole routed experts a rank. Returns ``(engine, sampler, model)``."""
+    with whole routed experts a rank; ``resources`` is a serving config's ``resources:`` block.
+    Returns ``(engine, sampler, model)``."""
     from mstar.communication.tensors import LocalTransferEngine
     from mstar.distributed.communication import WorkerParallelGroups
     from mstar.engine.engine import Engine
@@ -417,8 +418,13 @@ def build_engine(path: str | Path, dtype: torch.dtype, device: str = "cpu", tp_g
     engine = Engine(None, autocast_dtype=None)
     if parallel_groups is None:
         parallel_groups = WorkerParallelGroups(num_workers=1, global_rank=0)
+    specs = model.get_node_resources()
+    if resources:
+        from mstar.engine.resources import apply_yaml_overrides
+
+        apply_yaml_overrides(specs, {"resources": resources})
     engine.load_model(
-        {"LLM": sub}, model.get_node_resources(),
+        {"LLM": sub}, specs,
         parallel_groups=parallel_groups,
         device=torch.device(device),
         transfer_engine_info=TransferEngineInfo(
