@@ -2,7 +2,8 @@
 
 Cosmos3 denoises on FlashInfer's paged kernel when a step holds a slot lease, since only that kernel captures, and on
 FA3's dense kernel otherwise, which is faster eager. A step planned on one kernel and run on the other attends a plan
-it never built, and the dense kernel writes no page, so a kept add it attends would be lost to every later step. Each
+it never built. A step that keeps its adds runs the paged kernel too, as main's window commit did: every later step
+attends what it keeps, so a commit on the dense kernel changed a kv request's second window from its first step. Each
 rule is checked over CPU stand-ins, and each refusal names the array and the cause.
 """
 
@@ -125,6 +126,17 @@ def test_the_handle_runs_the_kernel_its_step_planned(leased):
     h.read(0, q)
     ran, idle = (paged, dense) if leased else (dense, paged)
     assert ran.runs and not idle.runs, "the read would attend through a plan its step didn't build"
+
+
+def test_a_step_that_keeps_its_adds_runs_the_paged_kernel():
+    paged, dense = _StubAttn(), _StubDense()
+    h = _handle(paged=paged, dense=dense)
+    step = _expanded(h, leased=False, keep=True)
+    h.begin_step(step)
+    q, k, v = _tensors()
+    h.add(0, k=k, v=v)
+    h.read(0, q)
+    assert paged.runs and not dense.runs, "later steps would attend entries the dense kernel computed"
 
 
 def test_an_eager_read_runs_the_paged_leg_before_its_first_step():

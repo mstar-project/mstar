@@ -139,6 +139,21 @@ def test_a_guided_denoise_step_plans_both_branches_under_one_combined_label():
     )
 
 
+def test_a_kv_window_commits_on_the_kernel_main_committed_it_on():
+    """Main's commit step named ``ATTN``, the paged kernel, with no causal mask, and its denoise steps ``ATTN_GEN``. A
+    commit on the dense kernel keeps other K/V, and the request's second window differs from main's."""
+    model = _edge(attention_backend="dense_gen", enable_windowed_video=True)
+    dit = _dit(model.config)
+    dit.bind_node_state(dit_handles(model, _SdpaResources().as_dict())[0])
+    planned = {}
+    for commit in (False, True):
+        info = GenStepInfo(cfg=True, cfg_active=True, capture_key=None, commit=commit)
+        inputs = [ARNodeInputs(input_seq_len=8, resource_step_info=info)]
+        step = engine_step(dit, graph_walk=C.VIDEO_GEN_AR_WALK, request_ids=["r"], inputs=inputs)
+        planned[commit] = {key: step.steps[key].causal for key in (ATTN, ATTN_GEN) if key in step.steps}
+    assert planned == {False: {ATTN_GEN: False}, True: {ATTN: False}}, "main denoised on ATTN_GEN and committed on ATTN"
+
+
 def test_a_windowed_request_draws_each_window_from_where_progress_left_its_generator(monkeypatch):
     """Main kept a windowed request's generator in node state from one window to the next. A window's first step now
     records where the generator stands under ``PROGRESS``, and the next window's first step draws from there."""
