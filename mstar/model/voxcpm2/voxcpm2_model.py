@@ -210,9 +210,8 @@ class VoxCPM2Model(Model):
             # positions only: LongRoPE is applied from the model's own table
             lm(BASE_KV, self.config.lm, BASE_ATTN, Positions()),
             lm(RES_KV, self.config.residual, RES_ATTN),
-            # patches committed so far, and the noise generator's state after the last committed draw
-            Value(TALKER_STEP, nodes={"Talker"}, layers=frozenset({0}),
-                  entry=Entry({}, host={"generated": int, "rng": bytes})),
+            # patches committed so far, one noise draw each
+            Value(TALKER_STEP, nodes={"Talker"}, layers=frozenset({0}), entry=Entry({}, host={"generated": int})),
         ]
 
     def kernel_settings(self) -> dict[str, dict[str, Any]]:
