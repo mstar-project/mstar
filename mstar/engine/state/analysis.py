@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, get_origin
 
 import torch
 
-from mstar.engine.state.contract import Array, Block, Read, Sampler, SeqShard, read_layers
+from mstar.engine.state.contract import Array, Block, Read, Sampler, SeqShard, is_value, read_layers
 
 if TYPE_CHECKING:
     from mstar.model.base import Model
@@ -39,7 +39,8 @@ def state_declaration_problems(model: "Model") -> list[str]:
         problems += _array_problems(array)
     problems += _kv_label_problems(model.kv_labels(), arrays)
     problems += _cross_read_problems(arrays)
-    problems += _host_problems(arrays, model.kv_labels())
+    problems += _regrouping_problems(model, arrays)
+    problems += _value_problems(arrays, model.kv_labels())
     for declared in declarations:
         if isinstance(declared, Sampler):
             problems += _sampler_problems(declared)
@@ -56,6 +57,14 @@ def position_key(array: Array) -> str:
 def host_field_holders(arrays: Iterable[Array]) -> list[Array]:
     """The arrays of ``arrays`` that hold host fields."""
     return [array for array in arrays if array.entry.host]
+
+
+def written_by_step(array: Array) -> frozenset[str]:
+    """The fields of a Value's entry that its step writes itself, the ones no update op writes in place, and none for
+    any other array."""
+    if not is_value(array):
+        return frozenset()
+    return frozenset(array.entry.tensors.keys() - {field for op in array.updates.values() for field in op.writes})
 
 
 def query_array(array: Array, read: Read, arrays: Mapping[str, Array]) -> Array:
@@ -136,26 +145,59 @@ def _cross_read_problems(arrays: Sequence[Array]) -> list[str]:
             elif not array.nodes <= queried.nodes:
                 problems.append(f"{where}: {read.queries!r} isn't on nodes {sorted(array.nodes - queried.nodes)}, so a "
                                 "step there has no segments to lay the queries out by")
-            elif queried.max_len:
-                problems.append(f"{where}: {read.queries!r} keeps entries, and queries are laid out by the segments "
-                                "of an array with max_len 0")
     return problems
 
 
-def _host_problems(arrays: Sequence[Array], kv_labels: Mapping[str, Mapping[str, object]]) -> list[str]:
-    """A prefix hit restores a Value's snapshot, and a snapshot doesn't carry host fields yet."""
+def _regrouping_problems(model: "Model", arrays: Sequence[Array]) -> list[str]:
+    regrouped = [
+        *((node, walk, "a chunking policy splits across steps", "leave it out of the policy")
+          for node, policies in model.get_chunking_policies().items() for policy in policies if policy.chunkable
+          for walk in policy.walks),
+        *((node, walk, f"kv_labels()[{array.name!r}][{label!r}] keys for prefix reuse, and a hit can end inside a "
+                       "step", "leave it out of the label's keys")
+          for array in arrays for label, kv_label in model.kv_labels().get(array.name, {}).items()
+          if kv_label.keys is not None for node in array.nodes
+          for walk in (*kv_label.keys.walks, *(grown for grown, _ in kv_label.growth if kv_label.keys.growth))),
+        *((node, walk, f"{node}'s rebuild policy runs it again with the ids sampled after the prompt",
+           "drop the rebuild policy")
+          for node, policy in model.rebuild_policies().items() for walk in policy.walks),
+    ]
+    return [
+        f"Array {array.name!r}.reads[{key!r}]: {type(read.mask).__name__} on walk {walk!r}, which {cause}. "
+        f"{type(read.mask).__name__} sees each step's adds as a whole, so {fix}"
+        for node, walk, cause, fix in regrouped
+        for array in arrays if node in array.nodes
+        for key, read in array.reads.items()
+        if read.mask.sees_step_whole and (read.walks is None or walk in read.walks)
+    ]
+
+
+def _value_problems(arrays: Sequence[Array], kv_labels: Mapping[str, Mapping[str, object]]) -> list[str]:
+    """What a Value's entry can't hold yet. A prefix hit restores a Value's snapshot, and a snapshot carries neither its
+    host fields nor a field its step writes itself, which no kernel writes mid-prefill."""
+    plain = [array for array in arrays if written_by_step(array)]
     holders = host_field_holders(arrays)
-    if not holders:
+    if not plain and not holders:
         return []
     keyed = {
         node for array in arrays if any(label.keys is not None for label in kv_labels.get(array.name, {}).values())
         for node in array.nodes
     }
-    return [
+    problems = [
+        f"Array {array.name!r}.layers is empty, and the fields its step writes itself are read and written per layer"
+        for array in plain if not array.layers
+    ]
+    problems += [
         f"Array {array.name!r}.entry.host: nodes {sorted(array.nodes & keyed)} have prefix keys, and a prefix hit "
         "wouldn't restore host fields"
         for array in holders if array.nodes & keyed
     ]
+    problems += [
+        f"Array {array.name!r}: nodes {sorted(array.nodes & keyed)} have prefix keys, and a prefix hit wouldn't "
+        "restore its entry"
+        for array in plain if array.nodes & keyed
+    ]
+    return problems
 
 
 def _sampler_problems(sampler: Sampler) -> list[str]:
@@ -236,14 +278,24 @@ def _read_problems(array: Array, walks: Mapping[str, set[str]], combined: set[st
 
 
 def deployment_problems(model: "Model", resources: Mapping[str, Mapping[str, object]]) -> list[str]:
-    """What a deployment's ``resources:`` block asks of the declarations that they can't do: of a sampler."""
-    return [
+    """What a deployment's ``resources:`` block asks of the declarations that they can't do: of a sampler, and of an
+    array whose step writes its state itself."""
+    declarations = model.declare_state()
+    problems = [
         f"Sampler {declared.name!r}.draws: enable_logprobs, and draws is {declared.draws}; log-probs take one token "
         "per step"
-        for declared in model.declare_state()
+        for declared in declarations
         if isinstance(declared, Sampler) and declared.draws > 1
         and resources.get(declared.name, {}).get("enable_logprobs")
     ]
+    for array in declarations:
+        if not isinstance(array, Array):
+            continue
+        # a pool with no state block refuses state_dtype itself
+        if "state_dtype" in resources.get(array.name, {}) and "state" in written_by_step(array):
+            problems.append(f"Array {array.name!r}: resources.{array.name}.state_dtype, and its step writes state "
+                            "itself, where only a field an update op writes takes a stored dtype")
+    return problems
 
 
 def split_read_problems(

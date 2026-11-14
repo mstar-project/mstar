@@ -253,7 +253,7 @@ def test_each_step_gets_fresh_step_objects():
     handles = _handles(_kv())
     first = state_steps(SubmoduleStep(segments=[Segment(1, "main", 1)], state={"kv": ArrayStep()}), handles)
     second = state_steps(SubmoduleStep(segments=[Segment(2, "main", 2)], state={"kv": ArrayStep()}), handles)
-    assert first.steps["kv"].segments == [Segment(1, "main", 1)], "SubmoduleStep writes segments onto its step objects"
+    assert first.steps["kv"].segments == [Segment(1, "main", 1)], "a step's KVStep carries that step's segments"
     assert second.steps["kv"].segments == [Segment(2, "main", 2)]
 
 
@@ -832,6 +832,28 @@ def test_a_kv_manager_says_which_labels_a_request_opened(monkeypatch):
     assert kv.opens_label(2, "cfg"), "a padding row has no config"
     kv.ingest_request(3, KVReqConfig(needed_labels_per_node={"LLM": ["cfg"]}))
     assert kv.opens_label(3, "cfg"), "a label opened per node isn't in needed_labels"
+
+
+class _Declares:
+    def __init__(self, *declarations):
+        self.declarations = list(declarations)
+
+    def declare_state(self):
+        return self.declarations
+
+
+def test_state_dtype_on_a_plain_value_is_refused_by_the_deployment():
+    plain = Value("plain", nodes={"LLM"}, layers={0}, entry=Entry({"state": TensorType((2,), dtype=torch.float32)}))
+    (problem,) = deployment_problems(_Declares(plain), {"plain": {"state_dtype": "bfloat16"}})
+    assert problem.startswith("Array 'plain': resources.plain.state_dtype"), (
+        "only a field an update op writes takes a stored dtype"
+    )
+
+
+def test_state_dtype_on_a_gated_delta_net_is_the_deployments_choice():
+    entry = Entry({"state": TensorType((2, 8, 8), dtype=torch.float32, shard=0)})
+    gated = Value("gdn", nodes={"LLM"}, layers={0}, entry=entry, updates={"d": GatedDeltaNet()})
+    assert deployment_problems(_Declares(gated), {"gdn": {"state_dtype": "bfloat16"}}) == []
 
 
 # One place for each rule that more than one site reads

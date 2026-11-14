@@ -53,7 +53,7 @@ def _is_host_type(kind) -> bool:
 
 @dataclass(frozen=True)
 class TensorType:
-    shape: tuple[int, ...]       # global, before sharding
+    shape: tuple[int, ...]       # global, before sharding; () is one scalar per entry
     _: KW_ONLY
     dtype: torch.dtype | None    # math dtype, None is the engine's compute dtype
     shard: int | None = None     # axis split across TP ranks, None is replicated
@@ -79,15 +79,26 @@ def KVEntry(*, heads: int, head_dim: int) -> Entry:
 class Mask:
     """Which entries a read at log position q sees. An entry's index is its log position."""
 
+    # whether what a read sees depends on its query's log position, which another array's queries don't carry here
+    uses_query_position: ClassVar[bool]
+    # whether a read sees a row's adds of each step as a whole, so splitting them across steps changes what it sees
+    sees_step_whole: ClassVar[bool]
+
 
 @dataclass(frozen=True)
 class Causal(Mask):
     """Sees {k : k <= q}."""
 
+    uses_query_position = True
+    sees_step_whole = False
+
 
 @dataclass(frozen=True)
 class Window(Mask):
     """Sees {k : q - size < k <= q}."""
+
+    uses_query_position = True
+    sees_step_whole = False
 
     size: int
 
@@ -95,6 +106,20 @@ class Window(Mask):
 @dataclass(frozen=True)
 class Block(Mask):
     """Sees the entries of q's own segment in this step, on an array with ``max_len`` 0."""
+
+    uses_query_position = False
+    sees_step_whole = True
+
+
+@dataclass(frozen=True)
+class Bidirectional(Mask):
+    """Sees {k : k < n}, where n is the length of q's row on this array after this layer's latest add: every entry the
+    row keeps and every entry this step adds for it. For a read with ``queries``, q's row is the row paired with q's
+    segment, on this array's label. It uses no query position. On an array that keeps entries; ``Block`` is the
+    within-step form."""
+
+    uses_query_position = False
+    sees_step_whole = True
 
 
 class Op:
@@ -171,6 +196,9 @@ class Read:
     def __post_init__(self):
         if not isinstance(self.mask, Mask):
             raise ValueError(f"Read.mask must be a Mask, got {self.mask!r}")
+        unset = [name for name in Mask.__annotations__ if not hasattr(type(self.mask), name)]
+        if unset:
+            raise ValueError(f"Read.mask: {type(self.mask).__name__} leaves {unset} unset, which every mask declares")
         if not (self.op is None or isinstance(self.op, Op)):
             raise ValueError(f"Read.op must be None or an Op, got {self.op!r}")
         if self.op is not None and (self.op.writes or self.op.adds):
@@ -259,10 +287,10 @@ class Array:
         least = 1 if self.layers or self.reads else 0
         for name, tensor in self.entry.tensors.items():
             where = f"Array {self.name!r}.entry.tensors[{name!r}]"
-            if not (isinstance(tensor.shape, tuple) and tensor.shape and all(
+            if not (isinstance(tensor.shape, tuple) and all(
                 type(axis) is int and axis >= least for axis in tensor.shape
             )):
-                raise ValueError(f"{where}.shape must be a non-empty tuple of ints >= {least}, got {tensor.shape!r}")
+                raise ValueError(f"{where}.shape must be a tuple of ints >= {least}, got {tensor.shape!r}")
             if tensor.shard is not None and not (type(tensor.shard) is int and 0 <= tensor.shard < len(tensor.shape)):
                 raise ValueError(f"{where}.shard must be None or an axis of shape {tensor.shape}, got {tensor.shard!r}")
         if self.entry.host and not is_value(self):
@@ -283,9 +311,14 @@ class Array:
             raise ValueError(f"{where}.layers has {sorted(read.layers - self.layers)}, outside the array's layers")
         if isinstance(read.mask, Window) and not _is_positive(read.mask.size):
             raise ValueError(f"{where}.mask.size must be a positive int, got {read.mask.size!r}")
-        if read.queries is not None and not isinstance(read.mask, Block):
+        if read.queries is not None and read.mask.uses_query_position:
             raise ValueError(f"{where}.queries: a read of another array's queries takes a mask that uses no query "
                              f"position, and {type(read.mask).__name__} does")
+        if read.queries is not None and read.op is None:
+            raise ValueError(f"{where}.queries: a read with no op lays out no queries")
+        if read.queries == self.name:
+            raise ValueError(f"{where}.queries names this array, and a read without queries lays out its own queries; "
+                             "leave it None")
         if read.op is not None:
             self._check_op(f"{where}.op", read.op)
 
@@ -330,7 +363,7 @@ class Sampler:
     penalty: bool = True
     min_p: bool = False
     eos_ids: tuple[int, ...] = ()    # the ids min_tokens bars
-    draws: int = 1                   # calls to sample in each step that lists it
+    draws: int = 1                   # draws in each step that lists it
 
     def __post_init__(self):
         object.__setattr__(self, "nodes", frozenset(self.nodes))
@@ -467,8 +500,11 @@ class PagedNHDTarget(NamedTuple):
     count: int    # tokens to write
 
 
-class Reached(NamedTuple):
-    """What a read with no op returns: each field's reached entries packed by row, and where each row starts."""
+@dataclass(frozen=True)
+class Reached:
+    """What a read with no op returns, tensors the caller owns: writing them changes no state. Each field's reached
+    entries packed by row, and where each row starts. A Value's row r holds its one entry at index r."""
 
-    fields: Mapping[str, torch.Tensor]
-    row_offsets: torch.Tensor
+    fields: Mapping[str, torch.Tensor]    # field -> (entries, *shape on this rank), in the field's declared dtype
+    _: KW_ONLY
+    row_offsets: torch.Tensor             # (rows + 1,) int32 on the device

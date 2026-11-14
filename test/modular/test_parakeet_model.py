@@ -10,6 +10,7 @@ import torch
 from mstar.api_server.openai.adapters import TransducerAdapter
 from mstar.api_server.openai.protocol import TranscriptionRequest
 from mstar.engine.resources.recurrent import RecurrentStateSpec
+from mstar.engine.state.adapters import node_resources
 from mstar.graph.base import GraphNode, Loop, Sequential, TensorPointerInfo
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import WalkStep
@@ -94,7 +95,7 @@ def test_unsupported_checkpoint(tmp_path):
 def test_graph_and_process_prompt(tmp_path, nemotron):
     model = ParakeetModel(str(_snapshot(tmp_path, nemotron)))
     assert model.nodes == ["audio_encoder", "transducer"]
-    (pool,) = model.get_node_resources()
+    (pool,) = node_resources(model)
     assert isinstance(pool, RecurrentStateSpec) and pool.resource_key == TRANSDUCER_STATE
     assert pool.nodes == {"transducer"} and pool.config.usable_slots == model.MAX_CONCURRENT_REQUESTS
     assert pool.config.blocks.keys() == {"h", "c", "dec_out", "cursor", "symbols"}

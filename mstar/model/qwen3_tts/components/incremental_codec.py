@@ -9,9 +9,8 @@ last input sample, the transformer's last ``sliding_window - 1`` keys and
 values per layer, and the frame count (RoPE positions continue from it).
 Zeros are a fresh stream's state: the decoder's own left zero padding.
 
-``codec_state_blocks`` names that state as recurrent-state pool blocks; the
-codec node gathers its rows' blocks from the pool before the decode and
-scatters the new ones back after it.
+``codec_state_entry`` names that state as a Value's fields; the codec node
+reads its rows' fields before the decode and writes the new ones back after it.
 
 After the transformer the decode runs time-major (``[B, T, C]``, what the
 transformer emits and the ConvNeXt blocks' norm and linears read), every conv
@@ -28,29 +27,25 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from mstar.engine.resources.recurrent import RecurrentBlockConfig
+from mstar.engine.state import Entry, TensorType
 
 FRAMES = "frames"
 # the reference decoder's conv geometry (fixed in its module definitions, not its config)
 _KERNEL, _PRE_CONV_KERNEL, _DILATIONS = 7, 3, (1, 3, 9)
 
 
-def codec_state_blocks(config, dtype: torch.dtype) -> dict[str, RecurrentBlockConfig]:
-    """Pool blocks for one stream's decoder state, from ``Qwen3TTSCodecConfig``
-    (declared before any weights load). ``IncrementalDecoder`` checks them
-    against the loaded modules."""
+def codec_state_entry(config, dtype: torch.dtype) -> Entry:
+    """One stream's decoder state, from ``Qwen3TTSCodecConfig`` (declared before any weights load).
+    ``IncrementalDecoder`` checks it against the loaded modules."""
     cache = config.sliding_window - 1
-    blocks = {FRAMES: RecurrentBlockConfig(shape=(1,), dtype=torch.long)}
+    fields = {FRAMES: TensorType((1,), dtype=torch.long)}
     for layer in range(config.num_hidden_layers):
         for kv in "kv":
-            blocks[f"{kv}{layer}"] = RecurrentBlockConfig(
-                shape=(config.num_attention_heads, cache, config.head_dim), dtype=dtype,
-            )
+            fields[f"{kv}{layer}"] = TensorType((config.num_attention_heads, cache, config.head_dim), dtype=dtype)
 
     def conv(name, channels, width):
         # time-major, as the decode runs; the pre-transformer conv is channels-first
-        shape = (channels, width) if name == "pre_conv" else (width, channels)
-        blocks[name] = RecurrentBlockConfig(shape=shape, dtype=dtype)
+        fields[name] = TensorType((channels, width) if name == "pre_conv" else (width, channels), dtype=dtype)
 
     conv("pre_conv", config.codebook_dim, _PRE_CONV_KERNEL - 1)
     for i in range(len(config.upsampling_ratios)):
@@ -61,7 +56,7 @@ def codec_state_blocks(config, dtype: torch.dtype) -> dict[str, RecurrentBlockCo
         for r, dilation in enumerate(_DILATIONS):
             conv(f"dec{b}.res{r}", config.decoder_dim // 2 ** b, (_KERNEL - 1) * dilation)
     conv("final", config.decoder_dim // 2 ** len(config.upsample_rates), _KERNEL - 1)
-    return blocks
+    return Entry(fields)
 
 
 def _stateful_convs(decoder: nn.Module) -> list[tuple[str, bool, nn.Module]]:
@@ -109,20 +104,18 @@ class IncrementalDecoder(nn.Module):
             for tconv, _ in decoder.upsample:
                 _to_channels_last(tconv.conv)
 
-    def state_blocks(self) -> dict[str, RecurrentBlockConfig]:
-        """The blocks this decoder's modules read and write (``codec_state_blocks`` must match)."""
+    def state_entry(self) -> Entry:
+        """The fields this decoder's modules read and write (``codec_state_entry`` must match)."""
         dtype = next(self.decoder.parameters()).dtype
-        blocks = {FRAMES: RecurrentBlockConfig(shape=(1,), dtype=torch.long)}
+        fields = {FRAMES: TensorType((1,), dtype=torch.long)}
         for layer in range(len(self.layers)):
             for kv in "kv":
-                blocks[f"{kv}{layer}"] = RecurrentBlockConfig(
-                    shape=(self.heads, self.cache, self.head_dim), dtype=dtype,
-                )
+                fields[f"{kv}{layer}"] = TensorType((self.heads, self.cache, self.head_dim), dtype=dtype)
         for name, transposed, module in self.convs:
             width = 1 if transposed else module.padding
             shape = (module.conv.in_channels, width) if name == "pre_conv" else (width, module.conv.in_channels)
-            blocks[name] = RecurrentBlockConfig(shape=shape, dtype=dtype)
-        return blocks
+            fields[name] = TensorType(shape, dtype=dtype)
+        return Entry(fields)
 
     def _transformer(self, x, state, new, lengths):
         transformer = self.decoder.pre_transformer

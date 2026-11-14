@@ -11,6 +11,7 @@ from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.engine import ForwardPassInfoWrapper
 from mstar.engine.resources import SamplingReqConfig
 from mstar.engine.resources.kv.manager import SpanCursor
+from mstar.engine.state import Layout
 from mstar.model.base import LabelLayout, Span
 from mstar.model.submodule_base import InputMetadata
 
@@ -409,7 +410,7 @@ def test_fish_lays_out_the_rows_its_prefill_builds(clone):
 
     output = model.process_prompt("hi", ["text", "audio"] if clone else ["text"], ["audio"], tensors, ref_text="r")
 
-    layout = output.metadata["kv_layout"]
+    layout = output.metadata["state_layout"]
     [span] = layout[AR_KV]["main"].spans
     assert span.walk == ("ar_prefill_clone" if clone else "ar_prefill")
     prefix_len, frames = output.metadata[PROMPT_LAYOUT_KEY]
@@ -588,12 +589,12 @@ def test_qwen3_tts_lays_out_the_rows_its_prefill_builds(variant, text, kwargs):
         text, ["audio", "text"] if clone else ["text"], ["audio"], tensors=tensors, **kwargs,
     )
 
-    layout, metadata = output.metadata["kv_layout"], output.metadata
+    layout, metadata = output.metadata["state_layout"], output.metadata
     [span] = layout[TALKER_KV]["main"].spans
     assert span.walk == ("talker_prefill_clone" if clone else "talker_prefill")
     frames = metadata[PROMPT_LAYOUT_KEY][4]
-    prefill = _tiny_qwen3_tts_talker()._build_prefill(
-        "r", torch.zeros_like(output.new_input_tensors["text_inputs"][0]), metadata[PROMPT_LAYOUT_KEY],
+    prefill, _ = _tiny_qwen3_tts_talker()._build_prefill(
+        torch.zeros_like(output.new_input_tensors["text_inputs"][0]), metadata[PROMPT_LAYOUT_KEY],
         speaker_id=40 if metadata[SPEAKER_ID_KEY] >= 0 else -1,
         language_id=41 if metadata[LANGUAGE_ID_KEY] >= 0 else -1,
         speaker_embed=torch.randn(16) if clone else None,
@@ -655,8 +656,8 @@ def test_vjepa2_lays_out_a_frame_per_rollout_iteration(extrinsics):
     if extrinsics:
         kwargs["extrinsics"] = [[0.3] * 6] * 5
 
-    rollout = model.process_prompt(None, ["video"], ["video"], rollout_horizon=5, **kwargs).metadata["kv_layout"]
-    once = model.process_prompt(None, ["video"], ["video"], **kwargs).metadata["kv_layout"]
+    rollout = model.process_prompt(None, ["video"], ["video"], rollout_horizon=5, **kwargs).metadata["state_layout"]
+    once = model.process_prompt(None, ["video"], ["video"], **kwargs).metadata["state_layout"]
 
     step = VJepa2ACRolloutPredictorSubmodule(None, model.config).prepare_inputs(
         "prefill_video_rollout", SimpleNamespace(dynamic_loop_iter_counts={"rollout_loop": 0}), {
@@ -665,8 +666,8 @@ def test_vjepa2_lays_out_a_frame_per_rollout_iteration(extrinsics):
         },
     )
     assert rollout[KV_CACHE]["main"].growth == (("rollout_loop", step.input_seq_len),)
-    assert once[KV_CACHE]["main"] == LabelLayout(), "a walk that never runs the rollout is laid out"
-    assert _vjepa2("masked").process_prompt(None, ["video"], ["video"]).metadata["kv_layout"] == {}
+    assert once[KV_CACHE]["main"] == Layout(), "a walk that never runs the rollout is laid out"
+    assert _vjepa2("masked").process_prompt(None, ["video"], ["video"]).metadata["state_layout"] == {}
 
 
 

@@ -24,15 +24,7 @@ import torch
 from torch import nn
 
 from mstar.communication.tensors import NameToTensorList
-from mstar.engine.resources import (
-    AttentionConfig,
-    AttentionSpec,
-    KVSpec,
-    NodeResourceSpec,
-    PagedKVConfig,
-    PositionConfig,
-    PositionSpec,
-)
+from mstar.engine.state import Array, Attend, Bidirectional, KVEntry, Layout, Positions, Read, Rope, Span
 from mstar.graph.base import (
     GraphEdge,
     GraphNode,
@@ -43,11 +35,9 @@ from mstar.graph.base import (
 from mstar.graph.special_destinations import EMIT_TO_CLIENT
 from mstar.model.base import (
     KVLabel,
-    LabelLayout,
     Model,
     ProcessPromptOutput,
     RobotIO,
-    Span,
     TensorAndMetadata,
     WalkStep,
 )
@@ -64,7 +54,6 @@ from mstar.model.pi05.config import (
     LLM_ATTN,
     LLM_KV,
     LLM_NODES,
-    LLM_POS,
     Pi05Config,
     load_pi05_config,
 )
@@ -434,31 +423,20 @@ class Pi05Model(Model):
     # Model ABC: structure
     # ------------------------------------------------------------------
 
-    def get_node_resources(self) -> list[NodeResourceSpec]:
-        """LLM paged KV + attention/position. vit_encoder is stateless.
-
-        No sampler: actions come from flow matching, not token sampling. The
-        action expert shares this KV cache with PaliGemma (same head dims),
-        reading the frozen prefix via ``KVStep(commit=False)``.
-        """
-        kv_config = PagedKVConfig(
-            num_layers=self.config.num_layers,
-            num_kv_heads=self.config.num_kv_heads,
-            head_dim=self.config.head_dim,
-            max_seq_len=self.config.max_position_embeddings,
-            num_qo_heads=self.config.num_qo_heads,
-        )
-        return [
-            KVSpec(resource_key=LLM_KV, nodes=set(LLM_NODES), config=kv_config),
-            AttentionSpec(
-                resource_key=LLM_ATTN, nodes=set(LLM_NODES),
-                config=AttentionConfig(kv_cache=LLM_KV),
-            ),
-            PositionSpec(
-                resource_key=LLM_POS, nodes=set(LLM_NODES),
-                config=PositionConfig(kv_cache=LLM_KV),
-            ),
-        ]
+    def declare_state(self) -> list[Array]:
+        """One cache for both experts. PaliGemma keeps the prefix, image rows and text ids in one segment that sees
+        itself whole, and the action expert adds its tokens as scratch, which see the prefix and each other. vit_encoder
+        is stateless, and actions come from flow matching, so there is no sampler."""
+        c = self.config
+        return [Array(
+            LLM_KV, nodes=set(LLM_NODES), layers=frozenset(range(c.num_layers)),
+            entry=KVEntry(heads=c.num_kv_heads, head_dim=c.head_dim), max_len=c.max_position_embeddings,
+            # Factors of 1 scale nothing, and setting them picks flashinfer's Llama 3.1 kernel over its plain one.
+            positions=Positions(rope=Rope(
+                theta=c.rope_theta, low_freq_factor=1.0, high_freq_factor=1.0, old_context_len=8192,
+            )),
+            reads={LLM_ATTN: Read(mask=Bidirectional(), op=Attend(q_heads=c.num_qo_heads))},
+        )]
 
     def validate_config_yaml(self, config: dict, config_path: str) -> None:
         """The action step follows the prefix on the worker only inside one node group.
@@ -559,14 +537,14 @@ class Pi05Model(Model):
         if not images:
             raise ValueError("a pi0.5 request needs at least one camera image")
         image_rows = images * (cfg.vit_image_size // cfg.vit_patch_size) ** 2
-        layout = LabelLayout(
+        layout = Layout(
             spans=(
                 Span("rows", self.CHUNK_WALK, image_rows, image_rows, "img_emb"),
                 Span("ids", self.CHUNK_WALK, text_ids.numel(), text_ids.numel(), "text_inputs"),
             ),
             scratch=cfg.action_horizon,
         )
-        return ProcessPromptOutput({"text_inputs": [text_ids]}, {"kv_layout": {LLM_KV: {"main": layout}}})
+        return ProcessPromptOutput({"text_inputs": [text_ids]}, {"state_layout": {LLM_KV: {"main": layout}}})
 
     def load_image(self, filepath: str, device: str) -> TensorAndMetadata:
         """The decoded RGB camera image, left uint8 ``(C, H, W)``: the ViT step

@@ -13,17 +13,17 @@ from mstar.model import keys
 from mstar.model.components.fastconformer import FastConformerConfig
 from mstar.model.utils import GRANARY_LANGUAGES, base_language
 
-# decoder node resources; the shared decoder reads `keys`' sampler
+# the decoder node's arrays, reads and sampler; the shared decoder reads `keys`' sampler
 KV_CACHE = "kv_cache"
 ATTN = "attn"
 SAMPLER = keys.SAMPLER
-# no RoPE: declared for the position counter that drives the sinusoid lookup
-POS = "positions"
-# the encoder output, written once at prefill, in a cache of its own so the
+# the encoder output, added once at prefill, in an array of its own so the
 # self-attention resource never plans over it
 CROSS_KV_CACHE = "cross_kv_cache"
 CROSS_ATTN = "cross_attn"
 CONTEXT_LABEL = "main"
+# the engine's default page, which kv_pages counts in
+PAGE_TOKENS = 128
 
 # the HF feature extractor's settings that NemoLogMel implements
 MEL_SETTINGS = dict(sampling_rate=16_000, n_fft=512, win_length=400, hop_length=160, preemphasis=0.97)

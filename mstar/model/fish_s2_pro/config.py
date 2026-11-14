@@ -29,7 +29,6 @@ from typing import Any
 # ---------------------------------------------------------------------------
 AR_KV = "slow_ar_kv"
 AR_ATTN = "slow_ar_attn"
-AR_POS = "slow_ar_pos"
 AR_SAMPLER = "semantic_sampler"
 CODEC_STATE = "codec_state"
 

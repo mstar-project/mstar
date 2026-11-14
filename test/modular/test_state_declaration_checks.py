@@ -21,6 +21,7 @@ import torch
 from mstar.engine.state import (
     Array,
     Attend,
+    Bidirectional,
     Block,
     Causal,
     CausalConv,
@@ -40,6 +41,8 @@ from mstar.engine.state.analysis import declaration_digest, state_declaration_pr
 from mstar.engine.state.contract import Mask
 from mstar.graph.base import GraphNode
 from mstar.model.base import KVLabel, PrefixKeys
+from mstar.model.rebuild import RebuildPolicy
+from mstar.model.submodule_base import ChunkingPolicy
 
 _ATTEND = Attend(q_heads=8)
 
@@ -47,16 +50,23 @@ _ATTEND = Attend(q_heads=8)
 class _StubModel:
     """Serves declarations and walks without building anything."""
 
-    def __init__(self, *arrays, combined=None, kv_labels=None):
+    def __init__(self, *arrays, combined=None, kv_labels=None, rebuild=None):
         self.arrays = list(arrays)
         self.combined = combined or {}
         self.labels = kv_labels or {}
+        self.rebuild = rebuild or {}
 
     def kv_labels(self):
         return self.labels
 
     def declare_state(self):
         return self.arrays
+
+    def get_chunking_policies(self):
+        return {}
+
+    def rebuild_policies(self):
+        return self.rebuild
 
     def get_graph_walk_graphs(self):
         return {
@@ -269,7 +279,7 @@ def test_a_good_rope_has_no_problem(positions):
 
 
 def test_kv_labels_may_name_only_declared_labels():
-    problem = _one_problem(_array(), kv_labels={"kv": {"main": None, "cfg": None}})
+    problem = _one_problem(_array(), kv_labels={"kv": {"main": KVLabel(), "cfg": KVLabel()}})
     assert problem.startswith("kv_labels()['kv']['cfg']") and "Array 'kv'.labels" in problem
 
 
@@ -325,10 +335,104 @@ def test_a_cross_read_over_an_array_on_its_node_has_no_problems():
     assert state_declaration_problems(_StubModel(_within("video"), _cross())) == []
 
 
+def test_a_cross_read_over_an_array_that_keeps_entries_has_no_problems():
+    assert state_declaration_problems(_StubModel(_array("video", reads={"r": _read()}), _cross())) == []
+
+
+def test_a_kept_cross_read_over_an_array_that_keeps_entries_has_no_problems():
+    context = _array("context", reads={"context_attn": _read(mask=Bidirectional(), queries="kv")})
+    assert state_declaration_problems(_StubModel(_array(reads={"r": _read()}), context)) == []
+
+
+def test_a_bidirectional_read_needs_an_array_that_keeps_entries():
+    problem = _one_problem(_within("vision", reads={"r": _read(mask=Bidirectional())}))
+    assert "every read of an array with max_len 0 is a Block read, and this one is Bidirectional" in problem
+
+
+def _chunked(*arrays, chunkable=True) -> _StubModel:
+    model = _StubModel(*arrays)
+    model.get_chunking_policies = lambda: {"LLM": (ChunkingPolicy(walks=("prefill",), chunkable=chunkable),)}
+    return model
+
+
+@pytest.mark.parametrize("array, mask", [
+    (_array(reads={"r": _read(mask=Bidirectional())}), "Bidirectional"),
+    (_within("vision", reads={"r": _read(mask=Block())}), "Block"),
+], ids=["kept", "within_step"])
+def test_a_chunked_walk_cant_read_this_steps_adds_as_a_whole(array, mask):
+    """Splitting a row's adds across steps changes what they see, with no error from any kernel."""
+    problems = state_declaration_problems(_chunked(array))
+    assert len(problems) == 1
+    assert problems[0].startswith(f"Array {array.name!r}.reads['r']: {mask} on walk 'prefill'")
+    assert "which a chunking policy splits across steps" in problems[0]
+
+
+@pytest.mark.parametrize("array", [
+    _array(reads={"r": _read(mask=Bidirectional())}),
+    _within("vision", reads={"r": _read(mask=Block())}),
+], ids=["kept", "within_step"])
+def test_a_policy_that_doesnt_split_rows_can_read_this_steps_adds_as_a_whole(array):
+    assert state_declaration_problems(_chunked(array, chunkable=False)) == []
+
+
+def test_a_chunked_walk_reads_causally_and_another_nodes_reads_stay_free():
+    causal = _array(reads={"r": _read()})
+    vision = _within("vision", nodes={"vision"}, reads={"v": _read(mask=Block())})
+    assert state_declaration_problems(_chunked(causal, vision)) == []
+
+
+def test_a_chunked_walk_outside_a_reads_walks_is_free():
+    array = _array(reads={"r": _read(mask=Bidirectional(), walks={"decode"})})
+    assert state_declaration_problems(_chunked(array)) == []
+
+
+_REBUILD = {
+    "LLM": RebuildPolicy(walks=frozenset({"prefill"}), ids_input="text_inputs", sample_output="token", loop="loop"),
+}
+
+
+def _keyed(growth=False) -> dict:
+    keys = PrefixKeys("text_inputs", ("prefill",), growth=growth)
+    return {"kv": {"main": KVLabel(growth=(("decode", "loop"),), keys=keys)}}
+
+
+@pytest.mark.parametrize("kwargs, cause", [
+    ({"kv_labels": _keyed()}, "kv_labels()['kv']['main'] keys for prefix reuse"),
+    ({"rebuild": _REBUILD}, "LLM's rebuild policy runs it again with the ids sampled after the prompt"),
+], ids=["prefix_keys", "rebuild"])
+def test_a_walk_a_prefix_hit_or_a_rebuild_regroups_cant_read_this_steps_adds_as_a_whole(kwargs, cause):
+    """A hit can end inside one step's adds, and a rebuild runs the prompt again beside the ids sampled after it."""
+    problem = _one_problem(_array(reads={"r": _read(mask=Bidirectional())}), **kwargs)
+    assert problem.startswith("Array 'kv'.reads['r']: Bidirectional on walk 'prefill'") and cause in problem
+
+
+@pytest.mark.parametrize("growth, refused", [(True, 1), (False, 0)])
+def test_a_keyed_growth_walk_cant_read_this_steps_adds_as_a_whole(growth, refused):
+    """A growth step can add several entries per row, and with growth its sampled ids extend the keys."""
+    array = _array(reads={"p": _read(walks={"prefill"}), "d": _read(mask=Bidirectional(), walks={"decode"})})
+    problems = state_declaration_problems(_StubModel(array, kv_labels=_keyed(growth)))
+    assert len(problems) == refused
+    assert all(problem.startswith("Array 'kv'.reads['d']: Bidirectional on walk 'decode'") for problem in problems)
+
+
+@pytest.mark.parametrize("other, mask", [
+    (_array("image_kv", reads={"o": _read(mask=Bidirectional())}), "Bidirectional"),
+    (_within("vision", reads={"o": _read(mask=Block())}), "Block"),
+], ids=["kept", "within_step"])
+def test_another_arrays_read_on_a_keyed_node_cant_read_this_steps_adds_as_a_whole(other, mask):
+    """A hit trims the step for every array on the node, and the keyed entries came from layers that read the rest."""
+    problem = _one_problem(_array(reads={"r": _read()}), other, kv_labels=_keyed())
+    assert problem.startswith(f"Array {other.name!r}.reads['o']: {mask} on walk 'prefill'")
+
+
+def test_keyed_and_rebuilt_walks_read_causally_have_no_problems():
+    model = _StubModel(_array(reads={"r": _read()}), kv_labels=_keyed(growth=True), rebuild=_REBUILD)
+    assert state_declaration_problems(model) == []
+
+
 @pytest.mark.parametrize("arrays, where, cause", [
     ((_cross(queries="nothing"),), "reads['text_attn'].queries", "'nothing' is not a declared array"),
     ((_within("video", nodes={"vision"}), _cross()), "reads['text_attn'].queries", "isn't on nodes ['LLM']"),
-    ((_array("video", reads={"r": _read()}), _cross()), "reads['text_attn'].queries", "keeps entries"),
 ])
 def test_a_cross_read_is_refused_naming_its_array_and_the_cause(arrays, where, cause):
     problem = _one_problem(*arrays)
@@ -348,6 +452,40 @@ def test_host_fields_are_refused_on_a_node_with_prefix_keys():
     labels = {"kv": {"main": KVLabel(keys=PrefixKeys("text_inputs", ("prefill",)))}}
     problem = _one_problem(_array(reads={"r": _read()}), _flag(), kv_labels=labels)
     assert problem.startswith("Array 'flags'.entry.host") and "prefix keys" in problem
+
+
+def _plain_value(layers=frozenset({0})) -> Value:
+    return Value("plain", nodes={"LLM"}, layers=layers, entry=Entry({"x": TensorType((2,), dtype=torch.float32)}))
+
+
+def test_a_plain_value_has_no_problems_on_a_node_without_prefix_keys():
+    labels = {"kv": {"main": KVLabel()}}
+    assert state_declaration_problems(_StubModel(_array(reads={"r": _read()}), _plain_value(), kv_labels=labels)) == []
+
+
+def test_a_plain_value_is_refused_on_a_node_with_prefix_keys():
+    labels = {"kv": {"main": KVLabel(keys=PrefixKeys("text_inputs", ("prefill",)))}}
+    problem = _one_problem(_array(reads={"r": _read()}), _plain_value(), kv_labels=labels)
+    assert problem.startswith("Array 'plain': nodes ['LLM'] have prefix keys")
+    assert "wouldn't restore its entry" in problem, "a plain field has no kernel to write mid-prefill snapshots"
+
+
+def test_a_gated_delta_net_with_no_causal_conv_is_refused_on_a_node_with_prefix_keys():
+    """The rule comes from what the ops write, not the Value's kind: with no CausalConv the step writes conv itself, and
+    a prefix hit would bring conv back as zeros."""
+    labels = {"kv": {"main": KVLabel(keys=PrefixKeys("text_inputs", ("prefill",)))}}
+    entry = Entry({
+        "state": TensorType((2, 8, 8), dtype=torch.float32, shard=0),
+        "conv": TensorType((48, 3), dtype=None, shard=0),
+    })
+    gated = Value("gdn", nodes={"LLM"}, layers={0}, entry=entry, updates={"d": GatedDeltaNet()})
+    problem = _one_problem(_array(reads={"r": _read()}), gated, kv_labels=labels)
+    assert problem.startswith("Array 'gdn': nodes ['LLM'] have prefix keys"), "a snapshot holds no field a step writes"
+
+
+def test_a_plain_value_with_no_layers_is_refused():
+    problem = _one_problem(_plain_value(layers=frozenset()))
+    assert problem.startswith("Array 'plain'.layers is empty"), "nothing could read or write its fields"
 
 
 def test_a_value_with_no_layers_has_no_problems():
@@ -387,6 +525,9 @@ def test_the_digest_matches_across_processes_with_different_hash_seeds():
 @dataclass(frozen=True)
 class _OtherMask(Mask):
     """Has no fields, as `Causal` has none, so only its class tells them apart."""
+
+    uses_query_position = True
+    sees_step_whole = False
 
 
 _T = TensorType((4, 8), dtype=None, shard=0)

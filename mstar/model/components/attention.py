@@ -28,7 +28,7 @@ import torch.nn.functional as F
 from torch import nn
 
 from mstar.engine.resources.convenience import AttentionCallable
-from mstar.engine.state import rope
+from mstar.engine.state import add_read, rope
 from mstar.model.components.norm import RMSNorm
 
 
@@ -169,8 +169,7 @@ class Attention(nn.Module):
         # The declared `Rope` picks the kernel here, so this layer's ``rope_*`` arguments have no effect on this path.
         if self._pos_key is not None:
             q, k = rope(self.state, q, k)
-        self.state.add(self.layer, k=k, v=v)
-        return self.state.read(self.layer, q)
+        return add_read(self.state, self.layer, q, k=k, v=v)
 
     def _apply_rope(
         self,

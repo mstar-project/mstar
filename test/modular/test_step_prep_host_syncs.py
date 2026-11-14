@@ -425,7 +425,7 @@ def test_cosmos3_windowed_captured_step_prep_reads_no_tensor(monkeypatch):
         assert host.reads == [], f"step {k}: host reads {host.reads}"
         assert got is not None
     ni = prepare(4)
-    assert ni.resource_step_info.capture_key == (1, ch, 3, 4, 4)
+    assert ni.resource_step_info.capture_key == ((1, ch, 3, 4, 4), "cfg")
     assert torch.equal(ni.tensor_inputs["vision_timesteps"],
                        st["scheduler"].timesteps[1].to(torch.float32).expand(12))
 
@@ -701,12 +701,12 @@ def test_qwen3_omni_audio_encoder_prep_reads_no_tensor():
     from transformers.models.qwen3_omni_moe.modeling_qwen3_omni_moe import _get_feat_extract_output_lengths
 
     from mstar.model.components.aut_encoder import AuTEncoder, AuTEncoderConfig
-    from mstar.model.qwen3_omni.config import AUDIO_ATTN
+    from mstar.model.qwen3_omni.config import AUDIO_TOKENS
     from mstar.model.qwen3_omni.submodules import AudioEncoderSubmodule
 
     config = AuTEncoderConfig(d_model=16, encoder_layers=1, encoder_attention_heads=2, encoder_ffn_dim=32,
                               downsample_hidden_size=4, output_dim=8)
-    sub = AudioEncoderSubmodule(AuTEncoder(config, attn_key=AUDIO_ATTN), config=None)
+    sub = AudioEncoderSubmodule(AuTEncoder(config, array=AUDIO_TOKENS), config=None)
     for frames in (1234, 3000):
         with _HostReads() as reads:
             row = sub.prepare_inputs("prefill_audio", _fwd("r", "prefill_audio"), {

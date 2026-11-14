@@ -22,7 +22,7 @@ from torch import nn
 
 from mstar.model.components import AdaRMSNorm, GatedDecoderLayer
 from mstar.model.components.distributed import ParallelAttention, ParallelGatedMLP
-from mstar.model.pi05.config import LLM_ATTN, LLM_KV, LLM_POS, Pi05Config
+from mstar.model.pi05.config import LLM_KV, LLM_POS, Pi05Config
 
 
 class AdaRMSModulations(NamedTuple):
@@ -76,7 +76,7 @@ class Pi05AdaRMSNorm(AdaRMSNorm):
         return super().forward(x, modulations[self.slot:self.slot + 1])
 
 
-def Pi05ActionExpertLayer(config: Pi05Config) -> GatedDecoderLayer:
+def Pi05ActionExpertLayer(config: Pi05Config, layer: int) -> GatedDecoderLayer:
     """One action expert decoder layer.
 
     Operates in ``config.action_hidden_size`` (1024 for gemma_300m, 2048
@@ -91,10 +91,9 @@ def Pi05ActionExpertLayer(config: Pi05Config) -> GatedDecoderLayer:
             num_kv_heads=config.num_kv_heads,
             head_dim=config.head_dim,
             input_hidden_size=h,
-            rope_theta=config.rope_theta,
-            attn_key=LLM_ATTN,
             kv_key=LLM_KV,
             pos_key=LLM_POS,
+            layer=layer,
         ),
         mlp=ParallelGatedMLP(
             hidden_size=h,
@@ -117,7 +116,7 @@ class Pi05ActionExpert(nn.Module):
         self.config = config
         h = config.action_hidden_size
         self.layers = nn.ModuleList(
-            [Pi05ActionExpertLayer(config) for _ in range(config.num_layers)]
+            [Pi05ActionExpertLayer(config, layer) for layer in range(config.num_layers)]
         )
         self.norm = Pi05AdaRMSNorm(h, cond_dim=h, eps=config.rms_norm_eps, slot=0)
 
@@ -132,21 +131,11 @@ class Pi05ActionExpert(nn.Module):
         return AdaRMSModulations(per_layer, self.norm.dense(conds).unsqueeze(1))
 
     def forward(
-        self,
-        query_sequence: torch.Tensor,
-        layer_modulations: list[torch.Tensor],
-        final_modulation: torch.Tensor,
-        *,
-        label: str,
+        self, query_sequence: torch.Tensor, layer_modulations: list[torch.Tensor], final_modulation: torch.Tensor,
     ) -> torch.Tensor:
         """One step: ``layer_modulations[i]`` is layer ``i``'s ``[2, 3 * hidden]``
         block and ``final_modulation`` the final norm's ``[1, 3 * hidden]``."""
-        # The label and layer index are cursors on the shared resources: bind
-        # the label once, advance the index per layer. Passing them as
-        # arguments instead would make inductor specialize on the int.
-        self.layers[0].self_attn.attend.bind_step(label)
-        for layer_idx, (layer, modulation) in enumerate(zip(self.layers, layer_modulations, strict=True)):
-            layer.self_attn.attend.set_layer_idx(layer_idx)
+        for layer, modulation in zip(self.layers, layer_modulations, strict=True):
             query_sequence = layer(hidden_states=query_sequence, modulation=modulation)
         out, _ = self.norm(query_sequence, final_modulation)
         return out

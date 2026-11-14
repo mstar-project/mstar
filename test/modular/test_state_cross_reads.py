@@ -193,7 +193,7 @@ def test_the_new_settings_reach_the_shared_spec_from_any_of_its_reads():
 
 @pytest.mark.parametrize("array, cause", [
     (Array("a", nodes={"dit"}, layers={0}, entry=_entry(), max_len=0, labels={"x", "y"},
-           reads={"r": Read(mask=Block(), op=Attend(q_heads=HEADS))}), "max_len 0 takes one label"),
+           reads={"r": Read(mask=Block(), op=Attend(q_heads=HEADS))}), "a plan runs under one label, and Array 'a'"),
     (Array("a", nodes={"dit"}, layers={0}, entry=_entry(dtype=torch.bfloat16), max_len=8,
            reads={"r": Read(mask=Causal(), op=Attend(q_heads=HEADS))}), "with no dtype"),
 ])

@@ -23,6 +23,7 @@ from mstar.engine.state import (
     Array,
     ArrayStep,
     Attend,
+    Block,
     Causal,
     Entry,
     KVEntry,
@@ -107,9 +108,9 @@ class _StubAttn:
         return q
 
 
-def _kv_array(**fields) -> Array:
+def _kv_array() -> Array:
     return Array("kv", nodes={"llm"}, layers={0, 1}, entry=KVEntry(heads=HEADS, head_dim=DIM), max_len=16,
-                 reads={"attn": Read(mask=Causal(), op=Attend(q_heads=HEADS))}, **fields)
+                 reads={"attn": Read(mask=Causal(), op=Attend(q_heads=HEADS))})
 
 
 def _handle(kv=None, attn=None, array=None) -> ArrayHandle:
@@ -141,6 +142,7 @@ def _tensors():
     ({"formats": ("NHD",)}, "formats must be PagedNHD"),
     ({"reference": lambda kv, layer, q, k: None}, "must take its signature without target"),
     ({"reference": lambda kv, layer, q, k, x: None}, "must take its signature without target"),
+    ({"reads": ("q",)}, "no layout yet: an op reads only the array it adds to"),
 ])
 def test_a_bad_declaration_is_refused_at_import_naming_the_op_and_cause(overrides, cause):
     with pytest.raises(ValueError, match=f"state op 'write_q': .*{cause}"):
@@ -350,6 +352,45 @@ def test_a_compiled_caller_breaks_at_a_state_op(monkeypatch):
     assert seen == [False], "a state call runs behind a break, as `add` does"
 
 
+# An op that ends with its layer's read
+
+
+def _reference_attend(kv, layer, q, k, v):
+    _reference(kv, layer, q, k, v)
+    return kv.read(layer, q)
+
+
+def _attending_op(kernel_reads=True):
+    @state_op(adds=("kv",), reads=("kv",), mutates=("q",), formats=(PagedNHD(devices={"cpu"}),),
+              reference=_reference_attend)
+    def attend_q(kv, layer, q, k, v, *, target: PagedNHDTarget):
+        q.add_(1)
+        target.cache[target.page_of_token[:target.count], 0, target.slot_of_token[:target.count]] = k + 1
+        target.cache[target.page_of_token[:target.count], 1, target.slot_of_token[:target.count]] = v
+        return kv.read(layer, q) if kernel_reads else None
+
+    return attend_q
+
+
+def test_an_op_that_reads_an_array_with_max_len_0_is_refused():
+    array = Array("kv", nodes={"llm"}, layers={0, 1}, entry=KVEntry(heads=HEADS, head_dim=DIM), max_len=0,
+                  reads={"attn": Read(mask=Block(), op=Attend(q_heads=HEADS))})
+    h = _handle(array=array)
+    _open(h)
+    with pytest.raises(ValueError, match="state op 'attend_q' reads kv with max_len 0, whose read a compiled block"):
+        _attending_op()(h, 0, *_tensors())
+
+
+def test_a_state_op_that_only_adds_to_an_array_with_max_len_0_adds_as_a_direct_add_does():
+    array = Array("kv", nodes={"llm"}, layers={0, 1}, entry=KVEntry(heads=HEADS, head_dim=DIM), max_len=0,
+                  reads={"attn": Read(mask=Block(), op=Attend(q_heads=HEADS))})
+    h = _handle(array=array)
+    _open(h)
+    q, k, v = _tensors()
+    _fused_op()(h, 0, q, k, v)
+    assert torch.equal(h._held[0], k + 1), "the op's reference should hold k, as a direct add does"
+
+
 # The debug check
 
 
@@ -448,3 +489,45 @@ def test_conformance_finds_a_kernel_that_writes_outside_the_steps_slots():
 
     (problem,) = _conformance(spills, _handle())
     assert problem == "the array outside the step's slots changed"
+
+
+def test_conformance_finds_a_kernel_whose_return_differs():
+    @state_op(adds=("kv",), reads=("kv",), mutates=("q",), formats=(PagedNHD(),), reference=_reference_attend)
+    def wrong_out(kv, layer, q, k, v, *, target):
+        q.add_(1)
+        target.cache[target.page_of_token[:target.count], 0, target.slot_of_token[:target.count]] = k + 1
+        target.cache[target.page_of_token[:target.count], 1, target.slot_of_token[:target.count]] = v
+        return kv.read(layer, q) + 100
+
+    (problem,) = _conformance(wrong_out, _handle())
+    assert problem.startswith("the return")
+
+
+def test_conformance_finds_a_kernel_that_skips_the_read_it_declares():
+    problems = _conformance(_attending_op(kernel_reads=False), _handle())
+    assert "the kernel doesn't read the layer, and the op declares reads" in problems
+    assert "the return: the kernel returns None" in problems
+
+
+def test_conformance_reads_the_layer_by_its_id_not_its_place_in_the_pool():
+    array = Array("kv", nodes={"llm"}, layers={3, 7}, entry=KVEntry(heads=HEADS, head_dim=DIM), max_len=16,
+                  reads={"attn": Read(mask=Causal(), op=Attend(q_heads=HEADS))})
+    h = _handle(array=array)
+    state_op_module.bind_state_ops({"kv": h})
+    _open(h)
+    q, k, v = _tensors()
+    assert state_op_module.conformance_problems(_attending_op(), (h, 7, q, k, v), tolerance=1e-6) == []
+
+
+def test_conformance_finds_an_op_that_reads_without_declaring_reads():
+    @state_op(adds=("kv",), mutates=("q",), formats=(PagedNHD(),), reference=_reference_attend)
+    def reads_quietly(kv, layer, q, k, v, *, target):
+        q.add_(1)
+        target.cache[target.page_of_token[:target.count], 0, target.slot_of_token[:target.count]] = k + 1
+        target.cache[target.page_of_token[:target.count], 1, target.slot_of_token[:target.count]] = v
+        return kv.read(layer, q)
+
+    assert _conformance(reads_quietly, _handle()) == [
+        "the reference reads the layer, and the op doesn't declare reads",
+        "the kernel reads the layer, and the op doesn't declare reads",
+    ]
