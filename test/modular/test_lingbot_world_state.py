@@ -470,14 +470,6 @@ def test_a_chunk_prepared_again_draws_the_same_noise():
     assert first.kwargs["rng"] == again.kwargs["rng"]
 
 
-def test_a_decoder_cache_comes_back_from_its_edge_a_feat_cache():
-    """The compiled decode guards on the cache's type, and diffusers' markers come back as they went."""
-    slots = wan_vae.FeatCache([None, "Rep", torch.arange(6.0).view(1, 2, 3)])
-    back = wan_vae.decoder_cache(None, wan_vae.to_edge(slots, torch.device("cpu")))
-    assert type(back) is wan_vae.FeatCache
-    assert back[0] is None and back[1] == "Rep" and torch.equal(back[2], slots[2])
-
-
 def test_a_decoder_cache_comes_back_from_its_fields_slot_for_slot():
     """The compiled decode guards on each slot's strides, so the tensors come back themselves, where they were."""
     slots = wan_vae.FeatCache([None, torch.arange(6.0).view(1, 2, 3), None])

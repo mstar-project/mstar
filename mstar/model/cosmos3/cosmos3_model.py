@@ -95,6 +95,7 @@ from mstar.graph.base import (
 )
 from mstar.graph.special_destinations import EMIT_TO_CLIENT, EMPTY_DESTINATION
 from mstar.model.base import KVLabel, Model, ProcessPromptOutput, Span, WalkStep
+from mstar.model.components.diffusion.decode_utils import wan_vae_decode_dtype
 from mstar.model.components.diffusion.unipc import SOLVER_STATE
 from mstar.model.components.mrope import layout_extent
 from mstar.model.components.video_encode import encode_mp4
@@ -117,6 +118,7 @@ from mstar.model.cosmos3.submodules import (
     COND_LABEL,
     DECODE_CACHE,
     DECODE_FRAMES,
+    DECODE_LABEL,
     DECODE_SENT,
     DECODE_TAIL,
     DENOISE_LOOP_FOR_WALK,
@@ -141,6 +143,7 @@ from mstar.model.cosmos3.submodules import (
     Cosmos3VAEDecoderSubmodule,
     Cosmos3VAEEncoderSubmodule,
     Cosmos3VisionEncoderSubmodule,
+    decode_cache_entry,
     frame_tokens,
     latent_frames,
     sound_frames,
@@ -376,8 +379,8 @@ class Cosmos3Model(Model):
                 elif k == "windowed_decode_max_warm_streams":
                     raise ValueError(
                         "Cosmos3 windowed_decode_max_warm_streams is no longer read: every live stream keeps its "
-                        "decoder cache on the decode loop. Remove it, or set windowed_decode_warm_cache: false to "
-                        "decode every window without one."
+                        f"decoder cache, within the budget `resources: {DECODE_CACHE}: max_bytes`. Remove it, or set "
+                        "windowed_decode_warm_cache: false to decode every window without one."
                     )
                 else:
                     logger.warning(
@@ -416,7 +419,8 @@ class Cosmos3Model(Model):
         reasoner is the DiT's understanding pathway run as a text model. Prefills and the reasoner read it causally,
         generation steps bidirectionally, through the window a windowed deployment keeps. The window is cut on whole
         pages, so a window's denoise steps and its commit attend the same entries on either kernel. ``PROGRESS`` holds
-        where a request's draws stand between steps.
+        where a request's draws stand between steps, and ``DECODE_CACHE`` a windowed stream's VAE decoder cache
+        between windows, at the stream's latent size and in the decode's dtype.
 
         On SP ranks the sequence shard splits a generation step's tokens over them. Prefills and the reasoner's steps
         run whole on each rank."""
@@ -447,6 +451,13 @@ class Cosmos3Model(Model):
             Value(PROGRESS, nodes={DIT_NODE}, layers=frozenset({0}), entry=Entry({}, host={"rng": bytes})),
             SeqShard(SEQ_SHARD, nodes=kv_nodes, labels={COND_LABEL, UNCOND_LABEL}, walks=gen_walks),
         ]
+        if windowed and c.windowed_decode_warm_cache:
+            # every cache scales with the latent's area, so one row of that many latent pixels is the largest
+            state.append(Value(
+                DECODE_CACHE, nodes={VAE_DECODER_AR_NODE}, layers=frozenset({0}),
+                entry=decode_cache_entry(c, wan_vae_decode_dtype()),
+                largest={"lat_h": 1, "lat_w": c.windowed_decode_max_latent_area},
+            ))
         if reasoner:
             vision = c.reasoner.vision
             heads = vision.num_attention_heads
@@ -867,8 +878,6 @@ class Cosmos3Model(Model):
             ]
         )
         decode_edges = [DECODE_TAIL, DECODE_SENT, DECODE_FRAMES]
-        if self.config.windowed_decode_warm_cache:
-            decode_edges.append(DECODE_CACHE)
         video_decode_ar = Loop(
             name=VIDEO_DECODE_AR_LOOP,
             section=GraphNode(
@@ -991,15 +1000,30 @@ class Cosmos3Model(Model):
             add_duration_template=allow_templates and _bool_kwarg(kwargs, "use_duration_template"),
             max_sequence_length=p["max_sequence_length"],
         )
-        layout = self._gen_layout(p, cond_ids, uncond_ids, input_modalities, tensors or {})
+        state_layout = {KV_CACHE: self._gen_layout(p, cond_ids, uncond_ids, input_modalities, tensors or {})}
+        if p.get("window_mode") is not None and self.config.windowed_decode_warm_cache:
+            state_layout[DECODE_CACHE] = {DECODE_LABEL: Layout(sizes=self._decode_sizes(p))}
         return self._action_prompt_output({
             "text_inputs": [
                 torch.tensor(cond_ids, dtype=torch.long),
                 torch.tensor(uncond_ids, dtype=torch.long),
             ]
         }, kwargs, {
-            "state_layout": {KV_CACHE: layout}, self.PROMPT_LENGTHS: (len(cond_ids), len(uncond_ids)), **cap,
+            "state_layout": state_layout, self.PROMPT_LENGTHS: (len(cond_ids), len(uncond_ids)), **cap,
         })
+
+    def _decode_sizes(self, p: dict) -> dict[str, int]:
+        """The latent size a windowed request's decoder cache is held at. ``ValueError`` (a 400) past the largest
+        one the deployment declares, which the caches' budget holds."""
+        scale, largest = self.config.vae.scale_factor_spatial, self.config.windowed_decode_max_latent_area
+        lat_h, lat_w = p["height"] // scale, p["width"] // scale
+        if lat_h * lat_w > largest:
+            raise ValueError(
+                f"Cosmos3 windowed request is {p['width']}x{p['height']}, a latent of {lat_h * lat_w} pixels, past the "
+                f"{largest} its decoder cache is declared for (windowed_decode_max_latent_area); request a smaller "
+                "size, or serve with windowed_decode_warm_cache: false."
+            )
+        return {"lat_h": lat_h, "lat_w": lat_w}
 
     def _gen_layout(
         self, p: dict, cond_ids: list[int], uncond_ids: list[int], input_modalities: list[str], tensors: dict,

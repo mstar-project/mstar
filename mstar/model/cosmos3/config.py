@@ -57,6 +57,12 @@ class Cosmos3VAEConfig:
     z_dim: int = 48
     scale_factor_spatial: int = 16
     scale_factor_temporal: int = 4
+    # The decoder's shape, which sizes each causal conv's cache (``wan_vae.stream_cache_fields``).
+    decoder_base_dim: int = 256
+    dim_mult: list[int] = field(default_factory=lambda: [1, 2, 4, 4])
+    num_res_blocks: int = 2
+    temperal_downsample: list[bool] = field(default_factory=lambda: [False, True, True])
+    is_residual: bool = True
     # Per-channel latent normalization (length == z_dim). The pipeline maps
     # raw VAE latents x -> (x - mean) / std before denoising and inverts it
     # before decode.
@@ -361,19 +367,24 @@ class Cosmos3Config:
     # mid-stream latent is not a clip start.
     chained_head_context_latents: int = 2
     # Keep each live stream's VAE decoder cache (the last frames every causal
-    # conv saw) on its decode loop's loop-back edge, so a window decodes only
-    # its new latents.
+    # conv saw) from one window to the next, so a window decodes only its new
+    # latents. The cache is a sized Value (``DECODE_CACHE``): the engine admits
+    # a stream's decode by the cache's bytes at its latent size.
     # Without compile, at windowed_decode_latents_per_call=1 and the contiguous
     # layout, the frames are bit-identical to one decode of the whole stream
     # (the CPU tests assert it); under compile, channels-last or =0 they match
     # it to bf16 rounding. Costs the cache per live stream, freed when the
     # stream's last window is decoded or the request goes away: 1.33 GiB of
     # tensors at 832x480 in bf16 (the Wan2.2 VAE), growing with the frame
-    # area, and twice that when the decode runs in fp32 (cuDNN before 9.16),
-    # with a second copy across each window's step boundary.
+    # area, and twice that when the decode runs in fp32 (cuDNN before 9.16).
     # Sessions still store only latents. False re-decodes the context ahead
     # of every window.
     windowed_decode_warm_cache: bool = True
+    # The largest latent area (height x width in latent pixels) a windowed
+    # request may decode with the warm cache, 1280x720's by default. The
+    # caches' budget holds one stream at this size unless the deployment sets
+    # ``resources: decode_cache: max_bytes``; smaller streams share it.
+    windowed_decode_max_latent_area: int = 3600
     # Latent frames per VAE decoder call in the streaming decode. 1 issues the
     # same decoder calls as ``vae.decode`` (bit-exact against it in fp32 and
     # eagerly in the default layout). N > 1 groups N latents per call and 0
@@ -585,6 +596,9 @@ class Cosmos3Config:
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(f"Cosmos3 {name} must be an integer >= 0, got {value!r}.")
+        area = self.windowed_decode_max_latent_area
+        if isinstance(area, bool) or not isinstance(area, int) or area < 1:
+            raise ValueError(f"Cosmos3 windowed_decode_max_latent_area must be an integer >= 1, got {area!r}.")
         default_frames = min(self.window_frames_default, self.kv_window_frames_default)
         window = 1 + (default_frames - 1) // self.vae.scale_factor_temporal
         if self.windowed_decode_latents_per_call > window:

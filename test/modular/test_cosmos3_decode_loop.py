@@ -1,8 +1,8 @@
 """Cosmos3's streaming decoder runs in a loop over its window stream and keeps nothing between windows.
 
-Its VAE decoder cache, the latents behind its next window and what it has sent so far ride the loop's loop-back
-edges, so the node holds no request state. A request that doesn't stream assembles its video on an edge and gets
-it once, at the last window, as the frames a streamed request gets one window at a time.
+The latents behind its next window and what it has sent so far ride the loop's loop-back edges, and its VAE decoder
+cache is a sized Value the engine holds, so the node holds no request state. A request that doesn't stream assembles
+its video on an edge and gets it once, at the last window, as the frames a streamed request gets one window at a time.
 """
 
 from types import SimpleNamespace
@@ -18,15 +18,20 @@ from mstar.graph.base import Loop  # noqa: E402
 from mstar.model.cosmos3 import constants as C  # noqa: E402
 from mstar.model.cosmos3.cosmos3_model import Cosmos3Model  # noqa: E402
 from mstar.model.cosmos3.submodules import (  # noqa: E402
-    DECODE_CACHE,
     DECODE_FRAMES,
     DECODE_SENT,
     DECODE_TAIL,
     VIDEO_DECODE_AR_LOOP,
 )
-from mstar.model.cosmos3.tests.test_windowed_decode import _decoder, _stream, _tiny_vae, _windows  # noqa: E402
+from mstar.model.cosmos3.tests.test_windowed_decode import (  # noqa: E402
+    _decoder,
+    _forward,
+    _stream,
+    _tiny_vae,
+    _windows,
+)
 
-EDGES = (DECODE_TAIL, DECODE_SENT, DECODE_FRAMES, DECODE_CACHE)
+EDGES = (DECODE_TAIL, DECODE_SENT, DECODE_FRAMES)
 
 
 def _decode(sub, windows, **md) -> list[dict]:
@@ -38,8 +43,8 @@ def _decode(sub, windows, **md) -> list[dict]:
     for i, window in enumerate(windows):
         info.dynamic_loop_iter_counts[VIDEO_DECODE_AR_LOOP] = i
         inputs = sub.prepare_inputs(C.VIDEO_DECODE_AR_WALK, info, {"window_latents": [window], **edges})
-        outs.append(sub.forward(C.VIDEO_DECODE_AR_WALK, engine_inputs, **inputs.tensor_inputs, **inputs.kwargs))
-        edges = {name: outs[-1][name] for name in EDGES if name in outs[-1]}
+        outs.append(_forward(sub, "r", engine_inputs, **inputs.tensor_inputs, **inputs.kwargs))
+        edges = {name: outs[-1][name] for name in EDGES}
     return outs
 
 
@@ -52,7 +57,7 @@ def test_the_decoder_loops_over_its_window_stream():
     loop = _decode_walk()
     assert isinstance(loop, Loop) and loop.name == VIDEO_DECODE_AR_LOOP
     back = {edge.name for edge in loop.section.outputs if edge.next_node == loop.section.name}
-    assert back == set(EDGES), "a decoder that kept its cache or tail itself would hold them per request"
+    assert back == set(EDGES), "a decoder that kept its tail itself would hold it per request"
 
 
 @pytest.mark.parametrize("frames", [77, 70])
@@ -81,11 +86,11 @@ def test_the_first_window_decodes_on_the_request_as_the_worker_opens_it(monkeypa
     inputs = sub.prepare_inputs(C.VIDEO_DECODE_AR_WALK, info, {"window_latents": [first]})
     assert inputs.kwargs["window"] == 0
     engine_inputs = SimpleNamespace(request_ids=[served.rid], per_request_info={served.rid: info})
-    out = sub.forward(C.VIDEO_DECODE_AR_WALK, engine_inputs, **inputs.tensor_inputs, **inputs.kwargs)
+    out = _forward(sub, served.rid, engine_inputs, **inputs.tensor_inputs, **inputs.kwargs)
     assert out["video_output"][0].shape[0] > 0, "the first window would send no frame"
     served._step(served.reader)
     served.rt.update_dynamic_loop_iters({served.rid: info}, served.consumer_partition)
-    edges = {name: out[name] for name in EDGES if name in out}
+    edges = {name: out[name] for name in EDGES}
     inputs = sub.prepare_inputs(C.VIDEO_DECODE_AR_WALK, info, {"window_latents": [second], **edges})
     assert inputs.kwargs["window"] == 1, "the second window would decode as the stream's first"
 

@@ -187,32 +187,6 @@ def _compact(t: torch.Tensor) -> torch.Tensor:
     return torch.empty_strided(t.shape, strides, dtype=t.dtype, device=t.device).copy_(t)
 
 
-# diffusers' marker in a temporal upsample's slot on a stream's first call
-_REPEAT = "Rep"
-
-
-def to_edge(cache: list, device: torch.device) -> list[torch.Tensor]:
-    """A causal-conv cache as an edge carries it: an empty slot as a 0-element tensor and diffusers' ``"Rep"`` as one
-    ``int8``, since an edge holds tensors only."""
-    return [
-        slot if torch.is_tensor(slot)
-        else torch.zeros(1, dtype=torch.int8, device=device) if slot == _REPEAT
-        else torch.empty(0, device=device)
-        for slot in cache
-    ]
-
-
-def from_edge(signal: list[torch.Tensor]) -> list:
-    """The cache `to_edge` carried, its markers back to ``None`` and ``"Rep"``."""
-    return [None if t.numel() == 0 else _REPEAT if t.dtype == torch.int8 else t for t in signal]
-
-
-def decoder_cache(vae: nn.Module, signal: list[torch.Tensor]) -> FeatCache:
-    """The decoder's cache from the edge `to_edge` filled, empty at a stream's first chunk. A compiled decode
-    guards on the cache's type, so it comes back a ``FeatCache``."""
-    return FeatCache(from_edge(signal)) if signal else new_feat_cache(vae)
-
-
 def compact_feat_cache(feat_cache: list) -> None:
     """Give every slot compact storage with ``_compact_strides``, in place,
     so the cache holds only ``feat_cache_bytes``."""
@@ -253,14 +227,15 @@ def _encoder_slots(
 
 
 def _decoder_slots(
-    base_dim: int, z_dim: int, dim_mult: Sequence[int], num_res_blocks: int, temporal: Sequence[bool],
+    base_dim: int, z_dim: int, dim_mult: Sequence[int], num_res_blocks: int, temporal: Sequence[bool], residual: bool,
 ) -> list[tuple[int, int, int]]:
-    """As `_encoder_slots`, in ``WanDecoder3d``'s order."""
+    """As `_encoder_slots`, in ``WanDecoder3d``'s order. A ``residual`` decoder (the Wan2.2 VAE's) has the same
+    slots, with every upsample keeping its channels."""
     dims = [base_dim * mult for mult in (dim_mult[-1], *dim_mult[::-1])]
     # the input conv's, then the middle block's four
     slots, scale = [(z_dim, 2, 1), *[(dims[0], 2, 1)] * 4], 1
     for i, (din, dout) in enumerate(zip(dims[:-1], dims[1:], strict=True)):
-        if i:
+        if i and not residual:
             # the upsample before this block halved the channels
             din //= 2
         slots += [(din, 2, scale), *[(dout, 2, scale)] * (2 * num_res_blocks + 1)]
@@ -274,16 +249,19 @@ def _decoder_slots(
 def stream_cache_fields(
     part: str, dtype: torch.dtype, prefix: str, *, base_dim: int = 96, z_dim: int = 16,
     dim_mult: Sequence[int] = (1, 2, 4, 4), num_res_blocks: int = 2, temporal: Sequence[bool] = (False, True, True),
-    in_channels: int = 3,
+    in_channels: int = 3, residual: bool = False,
 ) -> dict[str, TensorType]:
     """The slots a stream's ``part`` (``"encoder"`` or ``"decoder"``) holds a tensor in between calls, as a sized
     Value's fields, ``{prefix}_{slot:02d}`` by the slot's index in the cache: each
     ``(1, channels, frames, scale * lat_h, scale * lat_w)``. From the VAE's config, the Wan2.1 VAE's by default,
-    so every process declares them without loading it; `check_stream_cache` holds a loaded VAE's cache to them."""
+    so every process declares them without loading it; `check_stream_cache` holds a loaded VAE's cache to them.
+    ``residual`` is the VAE's ``is_residual``, with ``base_dim`` its ``decoder_base_dim``, for its decoder alone."""
     if part == "encoder":
+        if residual:
+            raise ValueError("stream_cache_fields has no slots for a residual VAE's encoder")
         slots = _encoder_slots(base_dim, dim_mult, num_res_blocks, temporal, in_channels)
     else:
-        slots = _decoder_slots(base_dim, z_dim, dim_mult, num_res_blocks, temporal)
+        slots = _decoder_slots(base_dim, z_dim, dim_mult, num_res_blocks, temporal, residual)
     return {
         f"{prefix}_{i:02d}": TensorType((1, channels, frames, Size(LAT_H, scale=s), Size(LAT_W, scale=s)), dtype=dtype)
         for i, (channels, frames, s) in enumerate(slots)

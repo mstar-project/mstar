@@ -19,7 +19,7 @@ Nodes:
   Cosmos3VAEDecoderSubmodule  -- Wan VAE decode (STATELESS): final latents to
                                  pixels.
   Cosmos3VAEDecoderARSubmodule -- streaming Wan VAE decode (per-request
-                                 decoder cache; no engine resource) for
+                                 decoder cache, a sized Value) for
                                  windowed AR video: one committed window's
                                  latents per stream chunk, decoded from the
                                  stream's warm decoder cache (behind
@@ -67,6 +67,7 @@ from mstar.engine.accelerator_graph_config import (
 from mstar.engine.fp32_precision import cudnn_benchmark
 from mstar.engine.state import (
     ArrayStep,
+    Entry,
     SampleStep,
     Segment,
     SlotLease,
@@ -2992,10 +2993,23 @@ class Cosmos3VAEDecoderSubmodule(NodeSubmodule):
 
 
 # The streaming decoder's loop over a request's windows, and its loop-back edges: the latents behind the next
-# window's first frame, the frames sent to the client so far (a host count), the frames a request that doesn't
-# stream has decoded so far, and the VAE decoder's cache where the warm cache is on.
+# window's first frame, the frames sent to the client so far (a host count), and the frames a request that doesn't
+# stream has decoded so far.
 VIDEO_DECODE_AR_LOOP = "video_decode_ar_loop"
-DECODE_TAIL, DECODE_SENT, DECODE_FRAMES, DECODE_CACHE = "decode_tail", "decode_sent", "decode_frames", "decode_cache"
+DECODE_TAIL, DECODE_SENT, DECODE_FRAMES = "decode_tail", "decode_sent", "decode_frames"
+# The VAE decoder's causal-conv cache where the warm cache is on: a sized Value on the decoder's node, the prefix of
+# its fields, and its label.
+DECODE_CACHE, DECODER, DECODE_LABEL = "decode_cache", "dec", "main"
+
+
+def decode_cache_entry(config, dtype: torch.dtype) -> Entry:
+    """``DECODE_CACHE``'s fields at a request's latent size: the slots the decoder's cache holds between windows, in
+    the decode's ``dtype``."""
+    vae = config.vae
+    return Entry(_wan_vae().stream_cache_fields(
+        "decoder", dtype, DECODER, base_dim=vae.decoder_base_dim, z_dim=vae.z_dim, dim_mult=vae.dim_mult,
+        num_res_blocks=vae.num_res_blocks, temporal=vae.temperal_downsample, residual=vae.is_residual,
+    ))
 
 
 class Cosmos3VAEDecoderARSubmodule(Cosmos3VAEDecoderSubmodule):
@@ -3007,7 +3021,8 @@ class Cosmos3VAEDecoderARSubmodule(Cosmos3VAEDecoderSubmodule):
     or assembled on a loop-back edge and emitted once the last window lands.
 
     With ``windowed_decode_warm_cache`` the VAE decoder's causal conv cache
-    rides a loop-back edge (``DECODE_CACHE``), so each window decodes only
+    is ``DECODE_CACHE``, a sized Value the engine admits the stream by and
+    holds between windows, so each window decodes only
     its new latents, continuing the cache the previous window left: the
     frames are those of one decode of the whole stream. A stream's first
     window (fresh or resumed) is decoded behind a re-decoded left context
@@ -3032,6 +3047,19 @@ class Cosmos3VAEDecoderARSubmodule(Cosmos3VAEDecoderSubmodule):
             self._stream = _wan_vae().FastDecoder(
                 vae, channels_last=self._channels_last, compile=self._decode_compiled, deterministic=False,
             )
+            self._cache_slots = len(_wan_vae().new_feat_cache(vae))
+        self.decode_cache = None
+
+    def bind_node_state(self, handles: Mapping[str, Any]) -> None:
+        super().bind_node_state(handles)
+        self.decode_cache = handles.get(DECODE_CACHE)
+
+    def declare_step(self, graph_walk, request_ids, inputs, **kwargs) -> SubmoduleStep | None:
+        """A row of ``DECODE_CACHE`` per request where the warm cache is on, and nothing to plan where it is off."""
+        if self.decode_cache is None:
+            return None
+        segments = tuple(Segment(rid, DECODE_LABEL, 1) for rid in request_ids)
+        return SubmoduleStep(state={DECODE_CACHE: ArrayStep(segments=segments)})
 
     def step_order(self, graph_walk: str) -> StepOrder:
         """The decoder feeds the DiT's chained windows to the client, so a
@@ -3051,10 +3079,7 @@ class Cosmos3VAEDecoderARSubmodule(Cosmos3VAEDecoderSubmodule):
             kwargs={
                 # no count until a step of this partition has run, and the first window is its first
                 "window": int(fwd_info.dynamic_loop_iter_counts.get(VIDEO_DECODE_AR_LOOP, 0)),
-                "edges": {
-                    name: inputs[name] for name in (DECODE_TAIL, DECODE_SENT, DECODE_FRAMES, DECODE_CACHE)
-                    if name in inputs
-                },
+                "edges": {name: inputs[name] for name in (DECODE_TAIL, DECODE_SENT, DECODE_FRAMES) if name in inputs},
             },
         )
 
@@ -3070,12 +3095,12 @@ class Cosmos3VAEDecoderARSubmodule(Cosmos3VAEDecoderSubmodule):
             if overlap:
                 context = latents.shape[2] - min(int(md["window_latent_units"]), int(md["total_latent_units"]))
             tail, latents = (latents[:, :, :context], latents[:, :, context:]) if context else (None, latents)
-            cache, sent, frames = None, 0, None
+            sent, frames = 0, None
         else:
             overlap = int(md["overlap_latent_units"])
             (tail,), (frames,) = edges[DECODE_TAIL], edges[DECODE_FRAMES]
-            cache = _wan_vae().decoder_cache(self.vae, edges[DECODE_CACHE]) if self._warm_enabled else None
             sent = int(edges[DECODE_SENT][0])
+        cache = self._take_cache(window) if self._warm_enabled else None
         new = latents[:, :, overlap:] if overlap else latents
         # The tail is already capped at the context length, so appending the
         # window's new latents yields the [context | window] decode input and
@@ -3102,7 +3127,7 @@ class Cosmos3VAEDecoderARSubmodule(Cosmos3VAEDecoderSubmodule):
         chunk = pixels[:, :, : int(md["num_frames"]) - sent]
         outputs = {DECODE_TAIL: [tail], DECODE_SENT: [torch.tensor([sent + chunk.shape[2]])]}
         if self._warm_enabled:
-            outputs[DECODE_CACHE] = _wan_vae().to_edge(cache, latents.device)
+            self._keep_cache(cache, last)
         if md.get("stream_video"):
             # each window goes to the client as its own chunk, and nothing is kept across windows
             outputs[DECODE_FRAMES] = [chunk[:, :, :0]]
@@ -3114,6 +3139,28 @@ class Cosmos3VAEDecoderARSubmodule(Cosmos3VAEDecoderSubmodule):
         if last:
             outputs["video_output"] = [self._video_frames(frames)]
         return outputs
+
+    def _take_cache(self, window: int):
+        """The stream's decoder cache from ``DECODE_CACHE``, None at its first window. The read hands the tensors
+        over and nothing here keeps them, so a slot is freed where the decode replaces it."""
+        wan_vae = _wan_vae()
+        held = self.decode_cache.read(0).fields
+        if not window:
+            return None
+        # built whole, so `FeatCache`'s compaction doesn't run again on the slots it wrote
+        cache = wan_vae.FeatCache(wan_vae.cache_from_fields(self._cache_slots, held, DECODER))
+        if not any(torch.is_tensor(slot) for slot in cache):
+            raise RuntimeError(f"Cosmos3 decoder: window {window} found no decoder cache in {DECODE_CACHE!r}, where "
+                               f"window {window - 1} left it")
+        return cache
+
+    def _keep_cache(self, cache: list, last: bool) -> None:
+        """Write the cache for the stream's next window, or give its bytes back after the last one."""
+        fields = _wan_vae().cache_fields(cache, DECODER)
+        if last:
+            self.decode_cache.clear(0, *fields)
+        else:
+            self.decode_cache.write(0, **fields)
 
     def _decode_pixels(self, latents: torch.Tensor) -> torch.Tensor:
         if not self.config.vae_decode_cudnn_benchmark:

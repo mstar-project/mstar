@@ -536,6 +536,8 @@ curl -sN http://localhost:8000/generate \
   -F 'model_kwargs={"num_frames":241,"window_mode":"chained","stream_video":true}'
 ```
 
+The streaming decoder keeps each stream's VAE decoder cache between windows, 1.33 GiB at 832x480 in bf16, and the engine admits a stream's decode by those bytes. Its budget holds one stream at 1280x720 (3.06 GiB) by default, so two 832x480 streams decode at once and a third waits for one to end; `resources: decode_cache: max_bytes` raises it. A windowed request past `windowed_decode_max_latent_area` (3600 latent pixels, 1280x720) is a 400. `windowed_decode_warm_cache: false` keeps no cache and decodes every window behind re-decoded context.
+
 <Warning>
 
 `window_mode: kv` is experimental, and the server logs a warning at startup when windowed video is enabled. The checkpoints were not trained block-causally: committed K/V conditions the next window far more weakly than frames pinned in the sequence, so an image-conditioned kv rollout jumps away from the scene at the first window boundary and, unless the prompt describes the image, can turn to texture noise within a few windows. `chained` with Edge's 61/32 defaults holds the scene over 241 frames when the prompt describes the image; its first chunk arrives later, since window 0 is 61 frames. A prompt that contradicts the image still takes over within a few windows in every windowed mode; non-windowed clips are not affected.

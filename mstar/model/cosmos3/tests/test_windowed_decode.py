@@ -1,8 +1,8 @@
 """CPU checks for the streaming VAE decoder's warm path (Cosmos3VAEDecoderARSubmodule
 with ``windowed_decode_warm_cache``) on a tiny randomly initialized Wan VAE:
 the per-window frames equal one decode of the whole stream, the re-decode
-covers a warm stream's first window (fresh or resumed), and the cache rides
-the decode loop's loop-back edge. No GPU, no weights."""
+covers a warm stream's first window (fresh or resumed), and the cache goes
+from window to window through its sized Value. No GPU, no weights."""
 
 from __future__ import annotations
 
@@ -14,22 +14,30 @@ import torch
 pytest.importorskip("diffusers")
 from diffusers import AutoencoderKLWan  # noqa: E402
 
-from mstar.model.components import wan_vae  # noqa: E402
+from mstar.engine.resources.sized.store import SizedValueStore  # noqa: E402
+from mstar.engine.resources.step import StepContext  # noqa: E402
+from mstar.engine.state import Layout, Value  # noqa: E402
+from mstar.engine.state.adapters import build_specs, node_handles, state_sizes, state_steps  # noqa: E402
 from mstar.model.components.wan_vae import is_channels_last  # noqa: E402
 from mstar.model.cosmos3 import constants as C  # noqa: E402
 from mstar.model.cosmos3 import submodules as cosmos3_submodules  # noqa: E402
-from mstar.model.cosmos3.config import Cosmos3Config  # noqa: E402
+from mstar.model.cosmos3.config import Cosmos3Config, Cosmos3VAEConfig  # noqa: E402
 from mstar.model.cosmos3.submodules import (  # noqa: E402
     DECODE_CACHE,
     DECODE_FRAMES,
+    DECODE_LABEL,
     DECODE_SENT,
     DECODE_TAIL,
     Cosmos3VAEDecoderARSubmodule,
     Cosmos3VAEDecoderSubmodule,
+    decode_cache_entry,
 )
 
 # 8-latent windows re-pinning 2 latents, as the served default (29 / 8 frames).
 WINDOW, OVERLAP = 8, 2
+# the latent size of `_stream`, and the decoder's node
+LAT = (4, 6)
+NODE = "vae_decoder_ar"
 
 
 def _tiny_vae() -> AutoencoderKLWan:
@@ -56,14 +64,59 @@ def _decoder(monkeypatch, vae, warm=True, ctx=3, channels_last=False):
     cfg.windowed_decode_context_latents = ctx
     cfg.windowed_decode_warm_cache = warm
     cfg.vae_decode_channels_last = channels_last
+    cfg.vae = Cosmos3VAEConfig(z_dim=8, decoder_base_dim=16, dim_mult=[1, 2, 2, 2], num_res_blocks=1)
     sub = Cosmos3VAEDecoderARSubmodule(vae, cfg)
     sub._decode_dtype_cached = torch.float32
+    if warm:
+        sub.caches = _Caches(cfg)
+        sub.bind_node_state(sub.caches.handles)
     return sub
+
+
+class _Caches:
+    """``DECODE_CACHE`` as the decoder's node holds it, on the CPU: its store, and the node's handle over it."""
+
+    def __init__(self, cfg: Cosmos3Config):
+        self.declared = [Value(
+            DECODE_CACHE, nodes={NODE}, layers=frozenset({0}), entry=decode_cache_entry(cfg, torch.float32),
+            largest={"lat_h": 1, "lat_w": cfg.windowed_decode_max_latent_area},
+        )]
+        (self.spec,) = build_specs(self.declared)
+        self.store = SizedValueStore(self.spec.config, torch.device("cpu"), name=DECODE_CACHE)
+        model = SimpleNamespace(declare_state=lambda: self.declared, get_combined_graph_walks=lambda: {})
+        self.handles = node_handles(model, NODE, {DECODE_CACHE: self.store})
+
+    def open(self, rid) -> None:
+        """Take ``rid`` in at `_stream`'s latent size, as intake and the engine's admission queue do."""
+        layout = {DECODE_CACHE: {DECODE_LABEL: Layout(sizes=dict(zip(("lat_h", "lat_w"), LAT, strict=True)))}}
+        sizes = state_sizes(self.declared, layout)
+        self.store.ingest_request(rid, overrides=self.spec.request_config({"state_sizes": sizes}))
+        assert self.store.reserve(rid, NODE, C.VIDEO_DECODE_AR_WALK, None) is None
+
+    def held(self, rid) -> dict[str, torch.Tensor]:
+        return {name: tensor for (_, _, name), tensor in self.store._requests[rid].tensors.items()}
+
+
+def _forward(sub, rid, infos, latents, window, edges) -> dict:
+    """One window through the submodule's forward, stepped as the engine steps it where it declares a step."""
+    declared = sub.declare_step(C.VIDEO_DECODE_AR_WALK, [rid], [None])
+    if declared is None:
+        return sub.forward(C.VIDEO_DECODE_AR_WALK, infos, latents, window=window, edges=edges)
+    if rid not in sub.caches.store._requests:
+        sub.caches.open(rid)
+    step = state_steps(declared, sub.caches.handles, graph_walk=C.VIDEO_DECODE_AR_WALK)
+    step.set_ctx(StepContext(request_ids=(rid,), graph_walk=C.VIDEO_DECODE_AR_WALK, slot=0, capture=False))
+    step.begin_calls()
+    out = sub.forward(C.VIDEO_DECODE_AR_WALK, infos, latents, window=window, edges=edges)
+    step.check_calls()
+    step.commit_calls()
+    step.end_calls()
+    return out
 
 
 def _stream(units: int, seed: int = 1) -> torch.Tensor:
     gen = torch.Generator().manual_seed(seed)
-    return torch.randn(1, 8, units, 4, 6, generator=gen)
+    return torch.randn(1, 8, units, *LAT, generator=gen)
 
 
 def _windows(stream: torch.Tensor, start: int = 0):
@@ -87,10 +140,9 @@ def _run(sub, rid, windows, frames, **md):
     loop = sub.__dict__.setdefault("_loops", {}).setdefault(rid, {"window": 0, "edges": {}})
     emitted = []
     for w in windows:
-        out = sub.forward(C.VIDEO_DECODE_AR_WALK, infos, w, window=loop["window"], edges=loop["edges"])
+        out = _forward(sub, rid, infos, w, loop["window"], loop["edges"])
         loop["window"] += 1
-        loop["edges"] = {name: out[name] for name in (DECODE_TAIL, DECODE_SENT, DECODE_FRAMES, DECODE_CACHE)
-                         if name in out}
+        loop["edges"] = {name: out[name] for name in (DECODE_TAIL, DECODE_SENT, DECODE_FRAMES)}
         emitted.append(out["video_output"][0])
     assert all(f.is_contiguous() for f in emitted)
     return [f.transpose(0, 1)[None] for f in emitted]
@@ -122,46 +174,6 @@ def test_warm_windows_are_the_whole_stream_decode(monkeypatch, vae) -> None:
     # Context covering the whole stream makes the re-decode path exact too.
     exact = torch.cat(_run(_decoder(monkeypatch, vae, warm=False, ctx=20), "r", _windows(stream), 77), dim=2)
     assert torch.equal(exact, whole)
-
-
-def test_the_cache_rides_the_loop_back_edge(monkeypatch, vae) -> None:
-    """A warm window's decoder cache leaves on the loop's edge as tensors and
-    comes back a ``FeatCache`` holding the same slots."""
-    sub = _decoder(monkeypatch, vae)
-    _run(sub, "r", _windows(_stream(14))[:1], 53, num_windows=2)
-    edge = sub._loops["r"]["edges"][DECODE_CACHE]
-    assert edge and all(torch.is_tensor(t) for t in edge)
-    cache = wan_vae.decoder_cache(vae, edge)
-    assert isinstance(cache, wan_vae.FeatCache) and any(torch.is_tensor(t) for t in cache)
-    again = wan_vae.to_edge(cache, torch.device("cpu"))
-    assert all(torch.equal(a, b) for a, b in zip(again, edge, strict=True)), "a slot changed on its way round"
-
-
-def test_a_failed_window_decodes_again_from_its_edges(monkeypatch, vae) -> None:
-    """A decode that raises mid-window writes its cache's slots into a copy of
-    the edge's list, so a retry of the window from the same edges continues
-    the stream exactly."""
-    stream = _stream(20)
-    windows = _windows(stream)
-    sub = _decoder(monkeypatch, vae)
-    _run(sub, "r", windows[:1], 77, num_windows=3)
-    decoder, calls = sub._stream.step._decoder, []
-
-    def fail_third(x, **kw):
-        calls.append(x.shape[2])
-        if len(calls) == 3:
-            raise RuntimeError("injected")
-        return decoder(x, **kw)
-
-    sub._stream.step._decoder = fail_third
-    with pytest.raises(RuntimeError, match="injected"):
-        _run(sub, "r", windows[1:2], 77, num_windows=3)
-    assert sub._loops["r"]["window"] == 1
-    sub._stream.step._decoder = decoder
-    retried = _run(sub, "r", windows[1:2], 77, num_windows=3)
-    third = _run(sub, "r", windows[2:], 77, num_windows=3)
-    whole = sub._decode_pixels(stream)
-    assert torch.equal(retried[0], whole[:, :, 29:53]) and torch.equal(third[0], whole[:, :, 53:])
 
 
 # Request 2 of a session whose request 1 covered units [0, 14): it resumes at
@@ -267,7 +279,7 @@ def test_resumed_first_window_is_not_grouped(monkeypatch, vae) -> None:
 def test_warm_cache_switch_off_keeps_no_cache(monkeypatch, vae) -> None:
     sub = _decoder(monkeypatch, vae, warm=False)
     _run(sub, "r", _windows(_stream(14))[:1], 53, num_windows=2)
-    assert DECODE_CACHE not in sub._loops["r"]["edges"] and sub._stream is None
+    assert sub.declare_step(C.VIDEO_DECODE_AR_WALK, ["r"], [None]) is None and sub._stream is None
 
 
 def _record_cudnn_benchmark(monkeypatch) -> list:

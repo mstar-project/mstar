@@ -24,7 +24,6 @@ from mstar.model.cosmos3.cosmos3_model import Cosmos3Model
 from mstar.model.cosmos3.sessions import SessionStore
 from mstar.model.cosmos3.submodules import (
     COND_LABEL,
-    DECODE_CACHE,
     DECODE_FRAMES,
     DECODE_SENT,
     DECODE_TAIL,
@@ -514,7 +513,7 @@ def _ar_decoder(monkeypatch):
 
 
 def _loop_edges(outputs: dict) -> dict:
-    return {name: outputs[name] for name in (DECODE_TAIL, DECODE_SENT, DECODE_FRAMES, DECODE_CACHE) if name in outputs}
+    return {name: outputs[name] for name in (DECODE_TAIL, DECODE_SENT, DECODE_FRAMES)}
 
 
 def _decode(sub, engine_inputs, *windows) -> list[dict]:
