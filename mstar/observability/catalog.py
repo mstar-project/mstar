@@ -56,7 +56,7 @@ EPISODE_SLOTS_USED = Family(
 )
 EPISODE_EVICTIONS = Family(
     "mstar_episode_evictions_total", COUNTER,
-    "Idle episodes whose rows the conductor released to free a slot or after a timeout.",
+    "Idle episodes whose rows the conductor released after the idle timeout.",
     ("reason",),
 )
 ROUTING_PREDICTED_SAVING = Family(
