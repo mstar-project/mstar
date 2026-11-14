@@ -415,8 +415,8 @@ def test_cosmos3_lays_out_what_its_dit_commits(tmp_path, prompt, outputs, kwargs
         whole = (model.config.max_position_embeddings, 0)
         kept = (horizon.context_budget, horizon.protected_prefix) if horizon else whole
         retention = laid_out.retention
-        assert (retention.context_budget, retention.protected_prefix) == kept and retention.exact, (
-            f"{label} keeps another window than its schedule's context behind its prompt")
+        assert (retention.context_budget, retention.protected_prefix) == kept and not retention.exact, (
+            f"{label} keeps another window than its schedule's context behind its prompt, cut on whole pages")
 
 
 @pytest.mark.parametrize("clone", [False, True])
