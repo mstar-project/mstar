@@ -22,7 +22,7 @@ PORTED = (
     "mstar/model/kokoro", "mstar/model/omnilingual_asr", "mstar/model/omnivoice", "mstar/model/orpheus",
     "mstar/model/voxcpm2",
     "mstar/model/canary_qwen", "mstar/model/qwen3_asr", "mstar/model/parakeet", "mstar/model/fish_s2_pro",
-    "mstar/model/qwen3_tts",
+    "mstar/model/qwen3_tts", "mstar/model/step_audio2",
     "mstar/model/pi05", "mstar/model/vjepa2", "mstar/model/canary", "mstar/model/components/encoder_decoder.py",
     "mstar/model/bagel", "mstar/model/chatterbox", "mstar/model/whisper",
 )

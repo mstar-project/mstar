@@ -12,7 +12,7 @@ cannot go much further either: its relative position table has 5000 entries a si
 (``EspnetRelPositionalEncoding``, ``max_len=5000``, never extended on the chunked path). A
 50 Hz conformer step retains up to ``2 P + 2 * CONFORMER_REPLY_TOKENS`` keys for a voice of
 ``P`` tokens and adds 54 of its own, and those must fit the table (``flow.band_fits``), which
-``token2wav_resources`` checks at startup against the deployment's longest voice. With 2048
+``token2wav_caches`` checks at startup against the deployment's longest voice. With 2048
 codes (82 s of speech) that refuses a voice of 17 s or more.
 """
 from __future__ import annotations

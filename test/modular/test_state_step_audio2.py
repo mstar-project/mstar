@@ -20,7 +20,7 @@ from test_state_ports import _assert_equal_per_key, _assert_steps_equal, _bind, 
 
 from mstar.engine.resources import KeyPrefixAttentionStep, RaggedAttentionConfig, RaggedKeyPrefixAttentionSpec
 from mstar.engine.resources.attn.config import AttentionConfig, AttentionSpec, AttentionStep
-from mstar.engine.resources.kv.bounded import BoundedKVSpec
+from mstar.engine.resources.kv.bounded import BoundedKVConfig, BoundedKVSpec
 from mstar.engine.resources.kv.config import KVSpec, KVStep, PagedKVConfig
 from mstar.engine.resources.position.config import PositionConfig, PositionSpec, PositionStep
 from mstar.engine.resources.recurrent.config import RecurrentBlockConfig, RecurrentStateConfig, RecurrentStateSpec
@@ -32,7 +32,6 @@ from mstar.engine.state.adapters import StateSetup, kv_layouts, sampling_configs
 from mstar.engine.state.analysis import state_declaration_problems
 from mstar.model.base import LabelLayout, enabled_resources, serving_resources
 from mstar.model.components.token2wav.model import DIT_COMPUTE_DTYPE, CacheCapacity, slot_layout
-from mstar.model.components.token2wav.resources import token2wav_resources
 from mstar.model.step_audio2.components.audio import request_layout
 from mstar.model.step_audio2.config import (
     AUDIO_ATTN,
@@ -81,8 +80,29 @@ def _reference(model) -> list:
                 max_segments_per_request=8,
             ),
         ),
-        *token2wav_resources(T2W_KEYS, TOKEN2WAV, model._voice_seconds(), T2W_DEFAULT_SLOTS, T2W_STREAMING),
+        *_token2wav_caches(model),
         *_token2wav_values(),
+    ]
+
+
+def _token2wav_caches(model) -> list:
+    """Token2wav's caches as the model wrote them before the port."""
+    shortest, longest = model._voice_seconds()
+    longest_tokens = int(longest * 25) + 1
+    shortest_tokens = max(0, int(shortest * 25) - 1)
+    capacity = T2W_STREAMING.capacity(longest_tokens)
+    return [
+        BoundedKVSpec(
+            resource_key=T2W_KEYS.kv[name], nodes={TOKEN2WAV},
+            config=BoundedKVConfig(
+                num_layers=family.num_layers, num_heads=family.num_heads, head_dim=family.head_dim,
+                rows_per_request=family.rows, max_source_len=family.rate * capacity.prompt_tokens,
+                min_source_len=family.rate * shortest_tokens, retention=family.retention,
+                max_slots=T2W_DEFAULT_SLOTS - 1, reverse_step_order=family.reverse_step_order,
+                dtype=DIT_COMPUTE_DTYPE if name == "dit" else torch.float32,
+            ),
+        )
+        for name, family in T2W_STREAMING.cache_families().items()
     ]
 
 

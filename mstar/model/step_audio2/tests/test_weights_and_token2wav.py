@@ -158,27 +158,33 @@ def test_a_voice_too_long_for_the_whole_conformer_caches_is_refused_at_startup(s
     keys, and a step's band reads 54 positions further back: past the table's 5000 for a
     voice of 17 s or more."""
     from mstar.model.components.token2wav.keys import Token2WavKeys
-    from mstar.model.components.token2wav.resources import token2wav_resources
+    from mstar.model.components.token2wav.resources import token2wav_caches
 
-    keys = Token2WavKeys(codes="c", state="s", kv={"enc1": "e1", "enc2": "e2", "dit": "d"})
+    keys = Token2WavKeys(codes="c", state="s", kv={"enc1": "e1_kv", "enc2": "e2_kv", "dit": "d_kv"})
     if fits:
-        token2wav_resources(keys, "t2w", (1.0, seconds), 3, streaming=T2W_STREAMING)
+        token2wav_caches(keys, "t2w", (1.0, seconds), CONFORMER_REPLY_TOKENS, streaming=T2W_STREAMING)
     else:
         with pytest.raises(ValueError, match="too long for its enc2 conformer cache"):
-            token2wav_resources(keys, "t2w", (1.0, seconds), 3, streaming=T2W_STREAMING)
+            token2wav_caches(keys, "t2w", (1.0, seconds), CONFORMER_REPLY_TOKENS, streaming=T2W_STREAMING)
 
 
-def test_token2wav_resources_declare_the_conformer_caches_whole():
+def test_token2wav_caches_keep_the_conformer_caches_whole():
+    """Step-Audio2's reference never cuts its conformer's caches, so each keeps its source and the reply's first
+    ``CONFORMER_REPLY_TOKENS`` codes; MiniCPM-o's keeps the source and its last 100 frames."""
+    from mstar.engine.state import Retained
     from mstar.model.components.token2wav.keys import Token2WavKeys
-    from mstar.model.components.token2wav.resources import token2wav_resources
+    from mstar.model.components.token2wav.resources import token2wav_caches
 
-    keys = Token2WavKeys(codes="c", state="s", kv={"enc1": "e1", "enc2": "e2", "dit": "d"})
-    specs = {s.resource_key: s for s in token2wav_resources(keys, "t2w", (9.0, 9.0), 3, streaming=T2W_STREAMING)}
-    p = int(9.0 * 25) + 1
-    assert specs["e1"].config.retention_for(p).sink == p + CONFORMER_REPLY_TOKENS
-    assert specs["e2"].config.sink_capacity == 2 * CONFORMER_REPLY_TOKENS
-    default = {s.resource_key: s for s in token2wav_resources(keys, "t2w", (9.0, 9.0), 3)}
-    assert default["e2"].config.window_capacity == KEEP_RECENT
+    keys = Token2WavKeys(codes="c", state="s", kv={"enc1": "e1_kv", "enc2": "e2_kv", "dit": "d_kv"})
+
+    def masks(**streaming):
+        arrays = token2wav_caches(keys, "t2w", (9.0, 9.0), CONFORMER_REPLY_TOKENS, **streaming)
+        return {array.name: next(iter(array.reads.values())).mask for array in arrays}
+
+    whole = masks(streaming=T2W_STREAMING)
+    assert whole["e1_kv"] == Retained(sink=CONFORMER_REPLY_TOKENS, source_in_sink=True)
+    assert whole["e2_kv"] == Retained(sink=2 * CONFORMER_REPLY_TOKENS, source_in_sink=True)
+    assert masks()["e2_kv"] == Retained(window=KEEP_RECENT, source_in_sink=True)
 
 
 @pytest.mark.parametrize("lookahead", [False, True])

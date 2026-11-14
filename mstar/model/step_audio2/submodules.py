@@ -380,7 +380,6 @@ class AudioEncoderSubmodule(NodeSubmodule):
         per_request = kernel_setting(self.tokens, AUDIO_ATTN, "max_segments_per_request")
         return sum(len(inp.kwargs["layout"]) for inp in inputs) <= per_request * len(inputs)
 
-    @torch.compiler.disable
     def _replay_block_loop(
         self, engine_inputs: ModelInputsFromEngine, hidden: torch.Tensor, layout: list,
     ) -> torch.Tensor | None:
