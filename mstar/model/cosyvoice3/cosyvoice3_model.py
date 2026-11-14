@@ -774,8 +774,7 @@ class CosyVoice3Model(Model):
             flow = {**{k: knobs[k] for k in _FLOW_KNOBS}, **self._prompt_facts(model_kwargs, _FLOW_FACTS)}
             if "audio" not in output_modalities:
                 return []
-            # The reference clip rides every chunk's pass beside the stream, so
-            # the flow node is ready for it; the tensor only the first one's.
+            # One pass for the whole stream: its loop hands the reference clip to every chunk.
             return [WalkStep("token2wav", step_metadata=flow)]
         raise ValueError(f"Unknown CosyVoice3 partition {partition_name!r}")
 
