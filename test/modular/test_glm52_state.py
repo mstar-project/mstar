@@ -150,13 +150,14 @@ def test_the_count_edge_cuts_a_verdict_as_main_did(max_tokens, count, accepted, 
     sub._mailboxes = {None: (torch.tensor([[*target, accepted]]), torch.ones(1, dtype=torch.long))}
     sub._verdicts = None, {"r": 0}
     info = _info("decode", max_tokens, prompt_len, ignore_eos)
-    inp = ARNodeInputs(input_ids=torch.tensor([11]), input_seq_len=k + 1, kwargs={"count": count})
+    budget = min(max_tokens, sub._context_limit() - prompt_len - 2 * (k + 1))
+    inp = ARNodeInputs(input_ids=torch.tensor([11]), input_seq_len=k + 1,
+                       kwargs={"emitted": count, "budget": budget, "ignore_eos": ignore_eos})
     out = sub.unpack_packed_outputs(static_output={}, request_ids=["r"], real_seq_lens=[k + 1], inputs=[inp],
                                     per_request_info={"r": info})["r"]
-    budget = min(max_tokens, sub._context_limit() - prompt_len - 2 * (k + 1))
     want = _main_cut(target, accepted, budget, count, sub.config.eos_token_ids, ignore_eos)
     assert out["new_token"][0].tolist() == want
-    assert int(out["count"][0]) == count + len(want)
+    assert out["count"][0].tolist() == [count + len(want), want[-1], budget, ignore_eos]
     stops = sub.check_stop("r", info, out)
     assert bool(stops) == (count + len(want) >= budget or (not ignore_eos and want[-1] == eos))
 
@@ -171,7 +172,8 @@ def test_a_speculated_step_takes_the_count_its_verify_step_unpacked():
     sub = _submodule(k)
     sub._mailboxes = {None: (torch.tensor([[11, 12, 13, 14, 2]]), torch.ones(1, dtype=torch.long))}
     sub._verdicts = None, {"r": 0}
-    inp = ARNodeInputs(input_ids=torch.tensor([11]), input_seq_len=k + 1, kwargs={"count": 5})
+    inp = ARNodeInputs(input_ids=torch.tensor([11]), input_seq_len=k + 1,
+                       kwargs={"emitted": 5, "budget": 64, "ignore_eos": True})
     # the forward's next input, then what the engine's unpack adds
     outputs = {"r": {"text_inputs": [torch.tensor([13])]}}
     outputs["r"].update(sub.unpack_packed_outputs(
@@ -191,7 +193,7 @@ def test_a_speculated_step_takes_the_count_its_verify_step_unpacked():
     make_worker().speculator.thread_outputs(spec, outputs)
     assert spec.continuing_rids == {"r"}, "the verify step's row would leave the speculated step"
     threaded = spec.node_batch.per_request_input_tensors["r"]
-    assert [int(t) for t in threaded.get("count", [])] == [5 + 3], "the speculated step would cut by a stale count"
+    assert [int(t[0]) for t in threaded.get("count", [])] == [5 + 3], "the speculated step would cut by a stale count"
 
 
 @pytest.mark.parametrize("room", [0, 1, 2])
@@ -204,8 +206,78 @@ def test_an_mtp_prefill_at_the_context_limit_stops_after_its_token(room):
     out = {"new_token": [torch.tensor([42])], **sub.unpack_packed_outputs(
         static_output={}, request_ids=["r"], real_seq_lens=[prompt_len], inputs=[], per_request_info={"r": info},
     )["r"]}
-    assert int(out["count"][0]) == 1
+    assert out["count"][0].tolist() == [1, -1, room, True], "the prefill reads the budget once for the request"
     assert sub.check_stop("r", info, out) == ({END_PARTITION} if room <= 1 else set())
+
+
+class _Reads(dict):
+    """A request's outputs that note each name read, where the worker's host row copies each name read."""
+
+    def __init__(self, outputs):
+        super().__init__(outputs)
+        self.read = []
+
+    def __getitem__(self, name):
+        self.read.append(name)
+        return super().__getitem__(name)
+
+
+def _verify_step(rows: int, emitted: int = 5) -> tuple[Glm52LLMSubmodule, dict]:
+    """A k=3 verify step's unpacked outputs for ``rows`` requests, where row i accepted ``i % 4`` drafts. Each
+    request's info holds its walk and nothing else."""
+    k = 3
+    sub = _submodule(k)
+    rids = [f"r{i}" for i in range(rows)]
+    verdicts = torch.tensor([[11, 12, 13, 14, i % 4] for i in range(rows)])
+    sub._mailboxes = {None: (verdicts, torch.ones(1, dtype=torch.long))}
+    sub._verdicts = None, {rid: i for i, rid in enumerate(rids)}
+    inp = ARNodeInputs(input_ids=torch.tensor([11]), input_seq_len=k + 1,
+                       kwargs={"emitted": emitted, "budget": 64, "ignore_eos": True})
+    return sub, sub.unpack_packed_outputs(
+        static_output={}, request_ids=rids, real_seq_lens=[k + 1] * rows, inputs=[inp] * rows,
+        per_request_info={rid: SimpleNamespace(graph_walk="decode") for rid in rids},
+    )
+
+
+def test_a_verify_step_cuts_by_the_budget_its_count_edge_carries():
+    """A request's budget and ignore_eos hold for its whole life. Read through the request info for every row of
+    every step, on the GPU thread as the verdict lands, they cost a 32-row step a third of a millisecond."""
+    sub = _submodule(3)
+    sampling = SimpleNamespace(temperature=0, repetition_penalty=1)
+    info = SimpleNamespace(request_id="r", resource_configs={SAMPLER: sampling})
+    signals = {"text_inputs": [torch.tensor([7])], "count": [torch.tensor([5, 7, 6, 1])]}
+    row = sub.prepare_inputs("decode", info, signals)
+    assert row.kwargs == {"emitted": 5, "budget": 6, "ignore_eos": 1}
+    sub._mailboxes = {None: (torch.tensor([[11, 12, 13, 14, 3]]), torch.ones(1, dtype=torch.long))}
+    sub._verdicts = None, {"r": 0}
+    out = sub.unpack_packed_outputs(static_output={}, request_ids=["r"], real_seq_lens=[4], inputs=[row],
+                                    per_request_info={"r": SimpleNamespace(graph_walk="decode")})["r"]
+    assert (out["new_token"][0].tolist(), out["count"][0].tolist()) == ([11], [6, 11, 6, 1]), (
+        "the step would cut by a budget other than the one the prefill read"
+    )
+
+
+def test_a_32_row_verify_step_builds_one_tensor_of_tokens_and_one_of_counts():
+    """A tensor per row for each output is 64 host tensors built on the GPU thread every step."""
+    _, out = _verify_step(32)
+    for i, row in enumerate(out.values()):
+        want = [11, 12, 13, 14][:i % 4 + 1]
+        assert (row["new_token"][0].tolist(), row["count"][0].tolist()) == (want, [5 + len(want), want[-1], 64, 1])
+    for name in ("new_token", "count"):
+        assert len({row[name][0].untyped_storage().data_ptr() for row in out.values()}) == 1, (
+            f"each row's {name} is a tensor of its own"
+        )
+
+
+def test_a_verify_step_s_stop_check_reads_one_output():
+    """The worker hands `check_stop` a row that copies an output to the host when its name is first read. A second
+    name is a second copy a step and a second lookup a row, on the worker's main thread."""
+    sub, out = _verify_step(1)
+    row = _Reads(out["r0"])
+    assert sub.check_stop("r0", _info("decode", 64, 5), row) == set()
+    assert row.read == ["count"], "the stop check reads a second output for every row of every step"
+    sub, out = _verify_step(1, emitted=63)
+    assert sub.check_stop("r0", _info("decode", 64, 5), out["r0"]), "a row that reached its budget keeps running"
 
 
 def test_a_captured_and_padded_prefill_reads_no_prompt_length():
@@ -226,7 +298,8 @@ def test_only_a_decode_step_is_input_free(k):
     again before the launch."""
     sub = _submodule(k)
     template = ARNodeInputs(input_ids=torch.zeros(1, dtype=torch.long), input_seq_len=k + 1)
-    row = ARNodeInputs(input_ids=torch.tensor([7]), input_seq_len=k + 1, kwargs={"count": 5})
+    row = ARNodeInputs(input_ids=torch.tensor([7]), input_seq_len=k + 1,
+                       kwargs={"emitted": 5, "budget": 64, "ignore_eos": True})
     declared, real = (sub.declare_step("decode", ["a", "b"], [one, one]) for one in (template, row))
     assert (declared.segments, declared.state) == (real.segments, real.state)
     assert sub.step_is_input_free("decode") and not sub.step_is_input_free("prefill"), (
@@ -243,7 +316,7 @@ def test_a_decode_row_from_prepare_inputs_has_the_template_row_s_span(k):
     template = sub.get_accelerator_graph_configs(torch.device("cpu"))[0].single_request_inputs
     info = _info("decode", 16, 5)
     info.resource_configs[SAMPLER].temperature, info.resource_configs[SAMPLER].repetition_penalty = 0, 1
-    signals = {"text_inputs": [torch.tensor([7])], "count": [torch.tensor(5)]}
+    signals = {"text_inputs": [torch.tensor([7])], "count": [torch.tensor([5, 7, 16, 1])]}
     row = sub.prepare_inputs("decode", info, signals)
     declared, real = (sub.declare_step("decode", ["a"], [one]) for one in (template, row))
     assert (declared.segments, declared.state) == (real.segments, real.state), (

@@ -190,7 +190,7 @@ class RopeManager(PositionManager):
         # rid -> label -> a verify step's correction of the counter, which waits for the next admit or position read.
         # `admit` runs on the plan thread and `position` in model code, so the lock keeps a correction from applying
         # twice.
-        self._deferred: dict[str, dict[str, Correction]] = {}
+        self._deferred: dict[str, Correction] = {}
         self._lock = threading.Lock()
 
         self._static_pos_ids: dict[CGSlotKey, torch.Tensor] = {}
@@ -279,24 +279,23 @@ class RopeManager(PositionManager):
         counters = self._counters.setdefault(rid, {})
         counters[label] = max(0, counters.get(label, 0) + delta)
 
-    def defer_correct_len(self, rid: str, label: str, correction: "Correction") -> None:
-        """Move the counter by ``correction`` through `correct_len` at the next `admit` or `position`, as
-        `KVManager.defer_correct_len` moves the stream's KV."""
+    def defer_correct_len(self, correction: "Correction") -> None:
+        """Move each of the correction's counters through `correct_len` at the next `admit` or `position`, as
+        `KVManager.defer_correct_len` moves the streams' KV."""
         with self._lock:
-            held = self._deferred.setdefault(rid, {})
-            assert label not in held, f"a second correction of {rid}/{label} before the first applied"
-            held[label] = correction
+            for rid in correction.rids:
+                assert rid not in self._deferred, f"a second correction of {rid} before the first applied"
+                self._deferred[rid] = correction
 
     def _apply_deferred(self, rids: Sequence[str] | None = None) -> None:
         """Apply the held corrections of ``rids``, or every one, as `KVManager._apply_deferred` does."""
         with self._lock:
             for rid in list(self._deferred) if rids is None else rids:
-                held = self._deferred.get(rid, {})
-                for label, correction in list(held.items()):
-                    delta = correction.delta()
-                    del held[label]
-                    self.correct_len(rid, label, delta)
-                self._deferred.pop(rid, None)
+                correction = self._deferred.get(rid)
+                if correction is not None:
+                    delta = correction.delta(rid)
+                    del self._deferred[rid]
+                    self.correct_len(rid, correction.label, delta)
 
     def admit(self, step: PositionStep, ctx: StepContext) -> AdmitOutcome:
         if self._deferred:

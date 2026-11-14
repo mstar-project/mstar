@@ -211,7 +211,7 @@ def _oracle(sub: Glm52LLMSubmodule, reference: dict, wrong_every: int):
 
     def prepare(walk, info, inputs, **kwargs):
         if walk == "decode":
-            emitted[info.rid_handle] = int(inputs["count"][0])
+            emitted[info.rid_handle] = int(inputs["count"][0][0])
         return real_prepare(walk, info, inputs, **kwargs)
 
     def prefill(engine_inputs, *args):
@@ -345,7 +345,7 @@ def test_kv_length_tracks_the_verified_stream(wrong_every):
         assert starts[-1] == (total - 1, total - 1)
         assert length() == total - 1 + k + 1
         accepted = out["new_token"][0].numel() - 1
-        assert int(out["count"][0]) == total + accepted + 1 - prompt.numel()
+        assert int(out["count"][0][0]) == total + accepted + 1 - prompt.numel()
         assert out["text_inputs"][0].numel() == 1
         total += accepted + 1
 
@@ -530,7 +530,7 @@ def test_exhaustion_refuses_the_step_and_the_pool_recovers():
         if not live:
             break
         # a refused admit still takes each request's rejected rows back, and only once
-        rewound = {rid: prompts[rid].numel() + int(signals[rid]["count"][0]) - 1 for rid in live}
+        rewound = {rid: prompts[rid].numel() + int(signals[rid]["count"][0][0]) - 1 for rid in live}
         outs = driver.step("decode", {rid: (infos[rid], signals[rid]) for rid in sorted(live)},
                            refusable=True)
         if not isinstance(outs, dict):

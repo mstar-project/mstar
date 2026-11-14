@@ -9,9 +9,11 @@ its table would leave the pages and the positions apart, and no kernel would not
 
 from __future__ import annotations
 
+import gc
 import re
 import sys
 from dataclasses import dataclass
+from typing import Any, NamedTuple
 
 sys.path.insert(0, ".")
 sys.path.insert(0, "test/modular")
@@ -77,7 +79,7 @@ class _StubKV:
 
     def __init__(self):
         self.pages = torch.zeros(LAYERS, SLOTS, 2, HEADS, DIM)
-        self.deferred = []
+        self.corrections = []
 
     def layer_view(self, i):
         return self.pages[i]
@@ -88,8 +90,13 @@ class _StubKV:
     def opens_label(self, rid, label):
         return True
 
-    def defer_correct_len(self, rid, label, count):
-        self.deferred.append((rid, label, count))
+    def defer_correct_len(self, correction):
+        self.corrections.append(correction)
+
+    @property
+    def deferred(self):
+        """Each request's rid, label and count, in the order the steps deferred them."""
+        return [(rid, step.label, _Row(step, rid)) for step in self.corrections for rid in step.rids]
 
 
 class _StubAttn:
@@ -106,14 +113,26 @@ class _StubPositions(_StubKV):
     """Records the counts it is handed, as the KV stub does."""
 
 
-class _Count:
-    """A count whose step has run."""
+class _Row(NamedTuple):
+    """One request's count of a step's correction."""
 
-    def __init__(self, delta):
-        self._delta = delta
+    step: Any
+    rid: Any
 
     def delta(self):
-        return self._delta
+        return self.step.delta(self.rid)
+
+
+class _Count:
+    """A correction of ``rids`` whose step has run: ``delta`` tokens each, or what the row ``delta`` reads."""
+
+    label = "main"
+
+    def __init__(self, delta, *rids):
+        self._delta, self.rids = delta, rids
+
+    def delta(self, rid):
+        return self._delta.delta() if isinstance(self._delta, _Row) else self._delta
 
 
 def _array(span=SPAN, **overrides) -> Array:
@@ -305,6 +324,48 @@ def test_the_rewind_hands_each_real_row_its_settled_count():
     assert [count for *_, count in positions.deferred] == [count for *_, count in kv.deferred], (
         "the positions move back by the same counts"
     )
+
+
+def _left_alive(call) -> int:
+    """The container objects ``call`` leaves alive, by the collector's own count of its youngest generation."""
+    gc.collect()
+    gc.disable()
+    try:
+        before = gc.get_count()[0]
+        call()
+        return gc.get_count()[0] - before
+    finally:
+        gc.enable()
+
+
+def test_a_32_row_verify_step_defers_one_correction():
+    """CPython collects its youngest generation once 700 more containers are alive than at its last collection. A
+    count object per row, held in a dict per row on each of the two resources until the next admit, took a 32-row
+    GLM-5.2 step past 700 on most steps, and every collection ran on the worker's main thread."""
+    kv, positions = _StubKV(), _StubPositions()
+    h = _handle(kv=kv, positions=positions)
+    step = _step(h, spans=(1,) * 32)
+    h.begin_step(step)
+    k = torch.randn(32, HEADS, DIM)
+    for layer in range(LAYERS):
+        h.add(layer, k=k, v=k)
+    settle(h, torch.ones(32, dtype=torch.long))
+    h.check_step(step)
+    alive = _left_alive(lambda: h.commit_step(step))
+    h.end_step(step)
+    assert len(kv.corrections) == 1 and positions.corrections == kv.corrections, (
+        "the two resources each hold a correction of their own"
+    )
+    assert alive < 16, f"the commit left {alive} objects alive, and the step's rows are 32"
+
+
+def test_a_verify_step_takes_one_row_per_request():
+    h = _handle()
+    step = SubmoduleStep(segments=[Segment(1, "main", SPAN), Segment(1, "main", SPAN)],
+                         state={"kv": ArrayStep(verify=True)})
+    step.set_ctx(_ctx(rows=(1,)))
+    with pytest.raises(AssertionError, match="two rows of request 1"):
+        _verify(h, [2, 3], step)
 
 
 def test_two_eager_steps_keep_two_tables():
@@ -505,7 +566,7 @@ def _hosted(kv, rid="a"):
 
 def test_a_count_is_applied_at_the_next_admit(_kv):
     _grow(_kv, SPAN)
-    _kv.defer_correct_len("a", "main", _Count(-2))
+    _kv.defer_correct_len(_Count(-2, "a"))
     assert _stored(_kv) == SPAN, "a held count waits for the next admit"
     _grow(_kv, 1)
     assert _stored(_kv) == SPAN - 2 + 1, "the admit applies the count before it plans the step"
@@ -513,8 +574,8 @@ def test_a_count_is_applied_at_the_next_admit(_kv):
 
 def test_a_request_left_out_of_the_next_step_still_gets_its_count(_kv):
     _grow(_kv, SPAN, SPAN)
-    _kv.defer_correct_len("a", "main", _Count(-1))
-    _kv.defer_correct_len("b", "main", _Count(-3))
+    _kv.defer_correct_len(_Count(-1, "a"))
+    _kv.defer_correct_len(_Count(-3, "b"))
     _grow(_kv, 1)
     assert (_stored(_kv, "a"), _stored(_kv, "b")) == (SPAN, 1), (
         "every admit applies every held count, so b's can't wait until a later step reuses its table"
@@ -535,24 +596,46 @@ def test_a_count_read_that_raises_keeps_the_count_held(_kv, monkeypatch, unreada
     position_step = PositionStep(segments=(Segment("a", "main", 1),))
     ctx = StepContext(request_ids=("a",), graph_walk="decode", slot=0, capture=False)
     admits = ((_kv, lambda: _grow(_kv, 1)), (rope, lambda: rope.admit(position_step, ctx)))
+    held = _Count(count, "a")
     for resource, _ in admits:
-        resource.defer_correct_len("a", "main", count)
+        resource.defer_correct_len(held)
     for resource, admit in admits:
         for _ in range(2):
             with pytest.raises(RuntimeError):
                 admit()
-            assert resource._deferred == {"a": {"main": count}}, "a count read that raises would drop the count"
+            assert resource._deferred == {"a": held}, "a count read that raises would drop the count"
     assert (_stored(_kv), rope._counters["a"]["main"]) == (SPAN, SPAN), "the pages and the positions would move apart"
 
 
 def test_a_victim_s_count_is_applied_before_its_offload_or_drop(_kv):
     _grow(_kv, SPAN + 2, SPAN + 2)
-    _kv.defer_correct_len("a", "main", _Count(-2))
-    _kv.defer_correct_len("b", "main", _Count(-1))
+    _kv.defer_correct_len(_Count(-2, "a"))
+    _kv.defer_correct_len(_Count(-1, "b"))
     _kv.offload("a")
     assert _stored(_kv, "a") == SPAN, "an offload copies the stream at its settled length"
     _kv.check_drop("b", SPAN + 1)
     assert _stored(_kv, "b") == SPAN + 1, "a drop is checked against the settled length"
+
+
+def test_a_32_row_correction_is_held_with_no_object_per_row(_kv):
+    rope = RopeManager(PositionConfig(kv_cache="kv"), torch.device("cpu"))
+    count = _Count(-1, *(f"r{i}" for i in range(32)))
+    for resource in (_kv, rope):
+        alive = _left_alive(lambda resource=resource: resource.defer_correct_len(count))
+        assert alive < 4, f"holding one step's correction left {alive} objects alive"
+        assert set(resource._deferred.values()) == {count} and len(resource._deferred) == 32
+
+
+def test_one_request_s_count_is_applied_without_the_rest_of_its_step_s(_kv):
+    """A drop check or an offload of one request waits for its own verify step's counts and applies its own."""
+    _grow(_kv, SPAN + 2, SPAN + 2)
+    count = _Count(-2, "a", "b")
+    _kv.defer_correct_len(count)
+    _kv.check_drop("a", SPAN)
+    assert (_stored(_kv, "a"), _stored(_kv, "b")) == (SPAN, SPAN + 2), "the drop check moved a stream it wasn't asked"
+    assert _kv._deferred == {"b": count}
+    _grow(_kv, 1)
+    assert _stored(_kv, "b") == SPAN, "the next admit applies what the step still holds"
 
 
 def _runner_step(*spans, preplan=False) -> SubmoduleStep:
@@ -577,7 +660,7 @@ def test_a_count_is_applied_at_the_runner_s_admit_and_pre_admit(_kv, admit):
     runner.plan(step)
     runner.commit(step)
     for resource in (_kv, rope):
-        resource.defer_correct_len("a", "main", _Count(-2))
+        resource.defer_correct_len(_Count(-2, "a"))
     assert getattr(runner, admit)(_runner_step(1, preplan=admit == "pre_admit")).ok
     assert (_stored(_kv), rope._counters["a"]["main"]) == (SPAN - 2, SPAN - 2), (
         "the next step would be planned past the tokens the verify step rejected"
@@ -593,7 +676,7 @@ def test_a_tp_follower_applies_the_count_before_it_replays_rank_0_s_offload(monk
     assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
     for kv in (leader, follower):
         assert _pool_step(kv, "a", 2 * PAGE_SIZE).ok and _pool_step(kv, "a", SPAN).ok
-        kv.defer_correct_len("a", "main", _Count(-2))
+        kv.defer_correct_len(_Count(-2, "a"))
     lead.offload_request(NODE, "a")
     assert follow.apply_resident_delta(lead.take_resident_delta(), _rebuilds_none)
     assert follower.residency("a") is Residency.ON_HOST
@@ -612,7 +695,7 @@ def test_a_guaranteed_request_s_victim_gets_its_count_before_it_moves_to_the_hos
     _running(kv, "g", 1, arrival=1, guaranteed=True)
     assert _pool_step(kv, "o", 3 * PAGE_SIZE).ok
     short = _pool_step(kv, "g", 4 * PAGE_SIZE).reason.pages_short
-    kv.defer_correct_len("o", "main", _Count(-2))
+    kv.defer_correct_len(_Count(-2, "o"))
     assert _preempt(kv, "g", short, droppable=lambda rid: True).to_host == ["o"]
     _offload(kv, "o")
     assert _hosted(kv, "o") == 6 * PAGE_SIZE - 2, "the take-back moved o to the host with its rejected tokens"
@@ -624,7 +707,7 @@ def test_a_removed_or_reset_request_leaves_no_count(_kv):
     for rid in "ab":
         rope.ingest_request(rid)
         for resource in (_kv, rope):
-            resource.defer_correct_len(rid, "main", _Count(-1))
+            resource.defer_correct_len(_Count(-1, rid))
     for resource in (_kv, rope):
         resource.remove_request("a")
         resource.reset_request("b")
@@ -636,7 +719,7 @@ def test_position_waits_for_a_pending_count():
     for rid in "ab":
         rope.ingest_request(rid)
         rope.correct_len(rid, "main", 8)
-        rope.defer_correct_len(rid, "main", _Count(-3))
+        rope.defer_correct_len(_Count(-3, rid))
     assert rope.position("a", "main") == 5, "a position read after a verify step waits for its count"
     rope.admit(PositionStep(segments=(Segment("b", "main", 1),)), StepContext(
         request_ids=("b",), graph_walk="decode", slot=0, capture=False))
@@ -772,8 +855,8 @@ class _StubHoledKV:
     def opens_label(self, rid, label):
         return True
 
-    def defer_correct_len(self, rid, label, count):
-        self.deferred.append((rid, label, count))
+    def defer_correct_len(self, correction):
+        self.deferred.append(correction)
 
 
 class _StubHoledMLA:

@@ -573,10 +573,14 @@ class _SlotBuffer:
 
 
 class Correction(Protocol):
-    """A verify step's move of one stream, known once the step has run on the device."""
+    """A verify step's moves of the ``label`` stream of each request in ``rids``, known once the step has run on the
+    device."""
 
-    def delta(self) -> int:
-        """The tokens the stream moves by, which waits for the step's count to reach the host."""
+    label: str
+    rids: Collection[str]
+
+    def delta(self, rid: str) -> int:
+        """The tokens the request's stream moves by, which waits for the step's counts to reach the host."""
 
 
 class KVManager(AttentionResource):
@@ -677,7 +681,7 @@ class KVManager(AttentionResource):
         # policy from the layout, where other requests' come from the step.
         self._exact: dict[str, dict[str, RetentionPolicy]] = {}
         # rid -> label -> a verify step's correction of the stream, which waits for the next admit, offload or drop
-        self._deferred: dict[str, dict[str, Correction]] = {}
+        self._deferred: dict[str, Correction] = {}
         # dropped request -> what it returns with, until its rebuild lands
         self._dropped: dict[str, Dropped] = {}
         # rebuilt request -> the tokens it had written when its rebuild landed
@@ -3151,13 +3155,15 @@ class KVManager(AttentionResource):
         """The TP group of the ranks this pool spans, which hold the same requests; None on one worker."""
         return None if self._comm_group is None else self._comm_group.tp_group
 
-    def defer_correct_len(self, rid: str, label: str, correction: Correction) -> None:
-        """Move the stream by ``correction`` through `correct_len` before anything next reads its length: at the next
-        `admit`, `offload` or `check_drop`."""
+    def defer_correct_len(self, correction: Correction) -> None:
+        """Move each of the correction's streams through `correct_len` before anything next reads its length: at the
+        next `admit`, `offload` or `check_drop`. The pool holds the step's one correction under each of its requests."""
         with self._lock:
-            held = self._deferred.setdefault(rid, {})
-            assert label not in held, f"KV {self.name}: a second correction of {rid}/{label} before the first applied"
-            held[label] = correction
+            for rid in correction.rids:
+                assert rid not in self._deferred, (
+                    f"KV {self.name}: a second correction of {rid} before the first applied"
+                )
+                self._deferred[rid] = correction
 
     def _apply_deferred(self, rids: Collection[str] | None = None) -> None:
         """Apply the held corrections of ``rids``, or every one. An admit applies every one, not only its step's
@@ -3165,12 +3171,11 @@ class KVManager(AttentionResource):
         whose count read raises stays held, and the next admit raises again."""
         with self._lock:
             for rid in list(self._deferred) if rids is None else rids:
-                held = self._deferred.get(rid, {})
-                for label, correction in list(held.items()):
-                    delta = correction.delta()
-                    del held[label]
-                    self.correct_len(rid, label, delta)
-                self._deferred.pop(rid, None)
+                correction = self._deferred.get(rid)
+                if correction is not None:
+                    delta = correction.delta(rid)
+                    del self._deferred[rid]
+                    self.correct_len(rid, correction.label, delta)
 
     def correct_len(self, rid: str, label: str, delta: int) -> None:
         """Move a stream's stored length by ``delta`` tokens, pages kept: a
