@@ -70,14 +70,18 @@ def test_only_the_configured_one_frame_encode_is_compiled(monkeypatch):
     assert any(type(m) is WanCausalConv3d for m in vae.decoder.modules())
 
     torch.manual_seed(1)
-    # [width, height] 96x64 -> pixels [1, 3, 1, 64, 96]; another size and a clip run eager
-    for shape, takes_compiled in (((1, 3, 1, 64, 96), True), ((1, 3, 1, 64, 64), False), ((1, 3, 5, 64, 96), False)):
+    # [width, height] 96x64 -> pixels [1, 3, 1, 64, 96]; another size and a clip run eager.
+    # The process's first compiled encode runs twice and keeps the second result.
+    cases = (
+        ((1, 3, 1, 64, 96), 2), ((1, 3, 1, 64, 96), 1), ((1, 3, 1, 64, 64), 0), ((1, 3, 5, 64, 96), 0),
+    )
+    for shape, compiled_calls in cases:
         compiled.clear()
         x = torch.rand(shape) * 2 - 1
         with torch.no_grad():
             got = node.forward("prefill_cond", None, x)["cond_latents"][0]
             want = stock.forward("prefill_cond", None, x)["cond_latents"][0]
-        assert compiled == ([shape] if takes_compiled else []), shape
+        assert compiled == [shape] * compiled_calls, shape
         # channels-last weights compute the stock encode (both are bf16 outputs of fp32 encodes)
         torch.testing.assert_close(got, want, rtol=1e-2, atol=1e-2)
 

@@ -2692,6 +2692,7 @@ class Cosmos3VAEEncoderSubmodule(NodeSubmodule):
         # the pixel shape [1, 3, 1, H, W] whose encode is compiled, and the compiled call
         self._compiled_shape: tuple[int, ...] | None = None
         self._compiled_encode = None
+        self._compiled_encode_warmed = False
         if config.compile_vae_encode_size is not None and vae is not None:
             # Compiled, the encoder's norms and activations fuse around cuDNN's
             # channels-last convs; eager, channels-last alone is slower.
@@ -2804,6 +2805,14 @@ class Cosmos3VAEEncoderSubmodule(NodeSubmodule):
         with torch.autocast(device_type=device.type, enabled=False):
             pixels = vision.to(dtype)
             if self._compiled_encode is not None and tuple(pixels.shape) == self._compiled_shape:
+                if not self._compiled_encode_warmed:
+                    # As in ``_decode_pixels``: a process's first run of a
+                    # compiled bf16 Wan VAE graph can return wrong values on
+                    # some torch/cuDNN stacks, even from a warm Inductor cache.
+                    # Run it once and discard, so no request depends on a
+                    # startup warmup having been the first caller.
+                    self._compiled_encode(pixels)
+                    self._compiled_encode_warmed = True
                 raw_mu = self._compiled_encode(pixels)
             else:
                 raw_mu = vae.encode(pixels).latent_dist.mode()
