@@ -3,6 +3,7 @@
 import io
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import msgpack
 import numpy as np
@@ -27,6 +28,8 @@ def test_droid_ready_metadata_declares_the_reference_client_stack():
     assert [step["name"] for step in stack] == [
         "stop_on_fault", "restrict_image_size", "temporal_stack", "chunked_schedule",
     ]
+    assert [step.get("version", 1) for step in stack] == [2, 1, 2, 2]
+    assert stack[3]["args"] == {"fps": meta["action_fps"]}
     assert stack[1]["args"] == {"width": 416, "height": 234}
     assert stack[2]["args"]["keys"] == [
         "image.wrist", "image.exterior", "robot_state.ee_pose", "grip",
@@ -36,6 +39,67 @@ def test_droid_ready_metadata_declares_the_reference_client_stack():
     )
     assert stack[2]["args"]["pad_start"] is False
     assert positronic_facts(policy)["meta"] == meta
+
+
+def test_droid_ready_metadata_builds_the_stock_v2_client_stack():
+    remote = pytest.importorskip("positronic.policy.remote", reason="stock Positronic client is optional")
+    client = pytest.importorskip("positronic.offboard.client", reason="stock Positronic client is optional")
+    wire = pytest.importorskip("positronic_wire.wire", reason="stock Positronic client is optional")
+    config = yaml.safe_load((Path(__file__).parents[2] / "configs/praxis1_droid.yaml").read_text())
+    meta = config["positronic"]["meta"]
+    sid = "a" * 32
+    connection = MagicMock(spec=wire.ClientConnection)
+    connection.recv.return_value = msgpack.packb({
+        "status": "ready", "meta": meta, "protocol_version": 2,
+        "session_id": sid, "max_in_flight": 1,
+    }, use_bin_type=True)
+    session = client.InferenceSession(connection)
+    assert session.session_id == sid
+    stack = remote.declared_stack(session.metadata, session.protocol_version)
+    assert isinstance(stack, remote.Processor)
+
+
+def test_droid_v2_stack_emits_only_robot_commands():
+    remote = pytest.importorskip("positronic.policy.remote", reason="stock Positronic client is optional")
+    executor = pytest.importorskip("positronic.policy.executor", reason="stock Positronic client is optional")
+    base = pytest.importorskip("positronic.policy.base", reason="stock Positronic client is optional")
+    offboard = pytest.importorskip("positronic.offboard.protocol", reason="stock Positronic client is optional")
+    wire = pytest.importorskip("positronic_wire.wire", reason="stock Positronic client is optional")
+    from mstar.model.praxis1.components.commands import compose_commands
+
+    config = yaml.safe_load((Path(__file__).parents[2] / "configs/praxis1_droid.yaml").read_text())
+    session = MagicMock()
+    session.metadata = config["positronic"]["meta"] | {"compress_images": False}
+    session.protocol_version = pytest.importorskip("positronic_model_server.protocol").ProtocolVersion.V2
+    session.max_in_flight = 1
+    session.session_id = "a" * 32
+    relative = np.zeros((21, 10), dtype=np.float32)
+    relative[:, 3] = relative[:, 7] = 1
+    session.infer.return_value = offboard.typed_commands(compose_commands(
+        relative, np.array([0, 0, 0.6, 1, 0, 0, 0, 0.5]), "single_arm",
+        control_mode=config["positronic"]["control_mode"],
+    ))
+    policy = remote.RemotePolicy("websocket", wire.HostPortAddress("localhost", 8000, wire.SESSION_PATH, ""))
+    policy._client = MagicMock()
+    policy._client.new_session.return_value = session
+    runtime = executor.Executor(lambda: 0, simulated=True, charge_inference_time=False)
+    run = runtime.start(policy)
+    obs = {
+        "image.wrist": np.zeros((234, 416, 3), dtype=np.uint8),
+        "image.exterior": np.zeros((234, 416, 3), dtype=np.uint8),
+        "robot_state.ee_pose": np.array([0, 0, 0.6, 1, 0, 0, 0], dtype=np.float32),
+        "grip": np.float32(0.5),
+    }
+    try:
+        assert isinstance(run.send(obs), base.Step)
+        assert runtime.wait(timeout_sec=5).status is executor.WaitStatus.ANSWERS_READY
+        step = run.send(obs)
+        assert isinstance(step, base.Step)
+        assert set(step.commands) == {"robot_command", "target_grip"}
+        assert session.infer.call_count == 1
+    finally:
+        runtime.close()
+        run.close()
 
 
 def test_session_seed_prefers_query_then_deployment_and_validates_int64(monkeypatch):

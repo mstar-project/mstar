@@ -61,8 +61,7 @@ def test_single_arm_commands_match_reference_in_each_client_frame(descriptor: st
     expected = single_arm.rel10_to_wire(rows, pose, frame=single_arm.RIG_FRAMES[descriptor])
     assert len(got) == len(expected) == 21
     for actual, want in zip(got, expected, strict=True):
-        assert actual.keys() == want.keys()
-        assert actual["timestamp"] == want["timestamp"]
+        assert actual.keys() == want.keys() - {"timestamp"}
         assert actual["target_grip"] == want["target_grip"]
         assert actual["robot_command"]["type"] == want["robot_command"]["type"]
         assert np.array_equal(actual["robot_command"]["pose"], want["robot_command"]["pose"])
@@ -77,8 +76,7 @@ def test_bimanual_commands_match_reference() -> None:
     expected = bimanual.rel20_to_wire(rows, pose)
     assert len(got) == len(expected) == 21
     for actual, want in zip(got, expected, strict=True):
-        assert actual.keys() == want.keys()
-        assert actual["timestamp"] == want["timestamp"]
+        assert actual.keys() == want.keys() - {"timestamp"}
         for side in ("left", "right"):
             assert actual[f"target_grip.{side}"] == want[f"target_grip.{side}"]
             assert np.array_equal(
@@ -121,6 +119,7 @@ def test_model_postprocess_keeps_openpi_relative_rows_and_packs_positronic_comma
     packed = model.postprocess(tensor, "action", kwargs | prepared.metadata)
     commands = unpack(packed)
     assert isinstance(commands, list) and len(commands) == 21
+    assert all("timestamp" not in command for command in commands)
     assert np.array_equal(
         commands[0]["robot_command"]["pose"],
         compose_commands(rows, pose_to_model(pose, "single_arm", "praxis.sim"),

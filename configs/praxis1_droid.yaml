@@ -103,9 +103,11 @@ positronic:
     local_stack:
       seq:
         - name: stop_on_fault
+          version: 2
         - name: restrict_image_size
           args: {width: 416, height: 234}
         - name: temporal_stack
+          version: 2
           args:
             keys: [image.wrist, image.exterior, robot_state.ee_pose, grip]
             offsets_sec: [-1.5666666666666667, -1.5, -1.4333333333333331,
@@ -119,6 +121,8 @@ positronic:
                           -0.16666666666666669, -0.1, -0.03333333333333333, 0.0]
             pad_start: false
         - name: chunked_schedule
+          version: 2
+          args: {fps: 15.0}
 
 node_groups:
   - node_names:

@@ -40,7 +40,6 @@ def compose_commands(
     pose_now: np.ndarray,
     embodiment: str,
     *,
-    fps: float = 15.0,
     descriptor: str = "",
     control_mode: str = "none",
 ) -> list[dict]:
@@ -53,8 +52,6 @@ def compose_commands(
     dim = {"single_arm": 10, "bimanual": 20}.get(embodiment)
     if dim is None:
         raise ValueError(f"unsupported robot embodiment {embodiment!r}")
-    if not np.isfinite(fps) or fps <= 0:
-        raise ValueError("command fps must be finite and positive")
     try:
         rel = np.asarray(relative, dtype=np.float32)
         pose = np.asarray(pose_now, dtype=np.float64)
@@ -78,9 +75,8 @@ def compose_commands(
         (pose[i : i + 3], _quat_matrix(pose[i + 3 : i + 7]))
         for i in range(0, pose.size, 8)
     ]
-    dt = 1.0 / fps
     result = []
-    for time, row in enumerate(rel):
+    for row in rel:
         command: dict = {}
         for arm, (anchor_xyz, anchor_rot) in enumerate(anchors):
             start = arm * 10
@@ -100,6 +96,5 @@ def compose_commands(
                 side = "left" if arm == 0 else "right"
                 command[f"robot_command.{side}"] = target
                 command[f"target_grip.{side}"] = grip
-        command["timestamp"] = float(time * dt)
         result.append(command)
     return result

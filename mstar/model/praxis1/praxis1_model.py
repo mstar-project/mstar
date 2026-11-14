@@ -530,7 +530,7 @@ class Praxis1Model(Model):
                     raise ValueError("Positronic commands need a model-frame pose from process_prompt")
                 commands = compose_commands(
                     rows, model_pose, self.config.embodiment,
-                    fps=self.config.grid_hz, descriptor=kwargs.get("pose_descriptor", ""),
+                    descriptor=kwargs.get("pose_descriptor", ""),
                     control_mode=kwargs.get("control_mode", "none"),
                 )
                 return pack(commands)
