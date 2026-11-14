@@ -800,7 +800,8 @@ behind it start. The captured sampler then applies a bitmask on every step but a
 without a constrained row (the lean twin). A step holding a constrained row launches its
 forward, then waits for its rows' last draws to reach the host and fills their masks while the
 forward runs, before it launches the draw (its capture is split there). A grammar that fails to
-compile, or whose matcher fails to start or to accept a draw, fails its request with an error. A
+compile on the worker fails its request with a 400; one whose matcher fails to start or to accept
+a draw, with a 500. A
 failed mask fill fails its request with an error on a single-GPU deployment: its row draws
 anything but a stop that once, and the next step's
 admit reports the error (unless the reply reaches its length limit at that draw; one row's own

@@ -282,6 +282,9 @@ def test_fail_requests_and_empty_collections():
         body=FailRequests(errors={"r0": "oom", "r1": "admit rejected"}),
     )
     assert roundtrip(msg).body.errors == {"r0": "oom", "r1": "admit rejected"}
+    assert roundtrip(msg).body.statuses == {}
+    msg.body.statuses = {"r1": 400}
+    assert roundtrip(msg).body == FailRequests(errors={"r0": "oom", "r1": "admit rejected"}, statuses={"r1": 400})
 
     # a body where every optional collection is left at its default
     msg = ConductorMessage(

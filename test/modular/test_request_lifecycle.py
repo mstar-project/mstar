@@ -115,6 +115,21 @@ def test_removed_forgets_a_handle_that_may_be_recycled():
     assert not lifecycle.teardowns_pending()
 
 
+def test_a_failure_keeps_its_first_status_until_reported_or_removed():
+    """A failure that isn't a 500 (the request's own fault) carries its status to
+    the conductor; the handle's next request starts without it."""
+    lifecycle = _lifecycle(1, 2)
+    lifecycle.fail({1: "bad grammar"}, status=400)
+    lifecycle.fail({1: "Error in worker: internal error"})
+    lifecycle.fail({2: "boom"})
+    errors = lifecycle.take_failures()
+    assert errors == {1: "bad grammar", 2: "boom"}
+    assert lifecycle.take_statuses(errors) == {1: 400}
+    lifecycle.fail({2: "bad grammar"}, status=400)
+    lifecycle.removed(2, "r2")
+    assert lifecycle.take_statuses([2]) == {}
+
+
 def test_a_failure_for_a_request_already_gone_is_dropped():
     lifecycle = _lifecycle()
     lifecycle.fail({7: "late"})

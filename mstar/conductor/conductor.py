@@ -1831,7 +1831,9 @@ class Conductor:
                 continue
             logger.error("Request %s failed on a worker: %s", rid, error_message)
             try:
-                self._remove_request(rid, request_data, failure_error=error_message)
+                self._remove_request(
+                    rid, request_data, failure_error=error_message, failure_status=body.statuses.get(rid, 500),
+                )
             except Exception as exc:
                 # the other requests in the batch keep their own error
                 self._fail_after_error(rid, "failing it", exc)
@@ -1873,7 +1875,7 @@ class Conductor:
 
     def _remove_request(
         self, request_id: str, request_data: RequestData,
-        failure_error: str | None = None,
+        failure_error: str | None = None, failure_status: int = 500,
     ):
         """Begin teardown for an abort/fail: drain every participant's reads,
         then (on the barrier's completion) hard-remove. Shared by the abort
@@ -1893,6 +1895,7 @@ class Conductor:
             expected_acks=participants,
             participants=participants,
             failure_error=failure_error,
+            failure_status=failure_status,
         )
 
     def _process_request_done(

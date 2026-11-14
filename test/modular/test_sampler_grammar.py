@@ -232,6 +232,24 @@ def test_a_grammar_that_can_no_longer_hold_fails_its_request(monkeypatch, failur
     ctx = StepContext(request_ids=rows, graph_walk="w", slot=0, capture=False, slot_lease=lease)
     outcome = res.admit(step, ctx)
     assert not outcome.ok and outcome.reason.terminal and outcome.reason.request_ids == {0}
+    assert outcome.reason.status == (400 if failure == "compile" else 500), "only a bad grammar is the client's fault"
+
+
+def test_a_grammar_that_does_not_compile_fails_first_as_the_client_s_400():
+    """In one step with a failure of the server's, the uncompiled grammar's request
+    fails with a 400 and the other comes back failed at the next admit, with a 500."""
+    res = _resource(graph=True)
+    lease = SlotLease(slot=0, bucket=SimpleNamespace(bs=4))
+    step = SamplerStep(apply_penalty=False)
+    res.ingest_request(0, SamplingReqConfig(grammar=GrammarRequest("grammar", "root ::= undefined_rule")))
+    res.ingest_request(1, SamplingReqConfig(grammar=grammar_request({"choice": ["ab"]})))
+    res._grammar._rows[1].error = "structured_outputs grammar refused drawn token 11"
+    ctx = StepContext(request_ids=(0, 1), graph_walk="w", slot=0, capture=False, slot_lease=lease)
+    first = res.admit(step, ctx).reason
+    assert (first.request_ids, first.status) == ({0}, 400)
+    ctx = StepContext(request_ids=(1,), graph_walk="w", slot=0, capture=False, slot_lease=lease)
+    second = res.admit(step, ctx).reason
+    assert (second.request_ids, second.status) == ({1}, 500)
 
 
 @pytest.mark.parametrize("tokenizer_eos", [False, True])

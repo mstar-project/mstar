@@ -304,6 +304,11 @@ class GrammarRows:
         row = self._rows.get(rid)
         return row is not None and not row.compiled.done()
 
+    def uncompiled(self, rid) -> bool:
+        """Whether ``rid``'s grammar failed to compile: the request's own fault."""
+        row = self._rows.get(rid)
+        return row is not None and row.compiled.done() and row.compiled.exception() is not None
+
     def failures(self, rids) -> dict:
         """Why each of ``rids`` that can no longer be served can't, by rid."""
         rows = self._rows

@@ -912,7 +912,9 @@ class StepPipeline:
         errors = self.lifecycle.take_failures()
         if not errors:
             return
-        wire_errors = {self._graph_runtime.get_rid_string(rid): msg for rid, msg in errors.items()}
+        wire = self._graph_runtime.get_rid_string
+        wire_errors = {wire(rid): msg for rid, msg in errors.items()}
+        statuses = {wire(rid): status for rid, status in self.lifecycle.take_statuses(errors).items()}
         for wire_rid, msg in wire_errors.items():
             logger.error("Worker %s failing request %s: %s", self.worker_id, wire_rid, msg)
         self.scheduler.drop_backlogged(errors)
@@ -920,7 +922,7 @@ class StepPipeline:
             "conductor",
             ConductorMessage(
                 message_type=ConductorMessageType.FAIL_REQUESTS,
-                body=FailRequests(errors=wire_errors),
+                body=FailRequests(errors=wire_errors, statuses=statuses),
             ),
         )
 

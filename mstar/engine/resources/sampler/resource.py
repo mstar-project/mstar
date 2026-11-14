@@ -985,8 +985,12 @@ class GrammarSamplerResource(SamplerResource):
                 failed[rid] = "a constrained request has two rows in one step (speculative decoding is not served)"
         if not failed:
             return ADMIT_OK
+        # a grammar that doesn't compile is the client's 400; any other failure in the
+        # step stays failed and comes back at the next admit, with its 500
+        uncompiled = {rid: e for rid, e in failed.items() if self._grammar.uncompiled(rid)}
+        failed, status = (uncompiled, 400) if uncompiled else (failed, 500)
         return AdmitOutcome(ok=False, reason=AdmitRuntimeError(
-            message="; ".join(sorted(set(failed.values()))), request_ids=frozenset(failed),
+            message="; ".join(sorted(set(failed.values()))), request_ids=frozenset(failed), status=status,
         ))
 
     def lean_for(self, rids) -> bool:
