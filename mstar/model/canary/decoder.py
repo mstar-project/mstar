@@ -5,8 +5,8 @@ cross-attention over the encoder output, and a ReLU FFN. Positions are fixed
 sinusoids added to the token embeddings, followed by a LayerNorm. Every
 projection has a bias, cross-attention's K included.
 
-Cross-attention K/V depend only on the encoder output, so prefill writes them
-once into the context stream (``write_cross_kv``) and later steps read it.
+Cross-attention K/V depend only on the encoder output, so prefill adds them
+once to the context array (``add_context``) and later steps read it.
 """
 from __future__ import annotations
 
@@ -16,14 +16,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from mstar.model.canary.config import (
-    ATTN,
-    CONTEXT_LABEL,
-    CROSS_ATTN,
-    CROSS_KV_CACHE,
-    KV_CACHE,
-    CanaryModelConfig,
-)
+from mstar.model.canary.config import CROSS_KV_CACHE, KV_CACHE, CanaryModelConfig
 from mstar.model.components.distributed.attention import ParallelAttention, ParallelCrossAttention
 
 
@@ -47,7 +40,7 @@ class _MLP(nn.Module):
 
 
 class CanaryDecoderLayer(nn.Module):
-    def __init__(self, config: CanaryModelConfig):
+    def __init__(self, config: CanaryModelConfig, layer: int):
         super().__init__()
         h = config.hidden_size
         self.input_layernorm = nn.LayerNorm(h)
@@ -58,9 +51,9 @@ class CanaryDecoderLayer(nn.Module):
             head_dim=config.head_dim,
             qkv_bias=True,
             o_bias=True,
-            attn_key=ATTN,
             kv_key=KV_CACHE,
             pos_key=None,  # absolute sinusoids, added at embedding time
+            layer=layer,
         )
         self.post_attention_layernorm = nn.LayerNorm(h)
         self.encoder_attn = ParallelCrossAttention(
@@ -69,8 +62,8 @@ class CanaryDecoderLayer(nn.Module):
             num_kv_heads=config.num_heads,
             head_dim=config.head_dim,
             k_bias=True,
-            cross_key=CROSS_ATTN,
             context_kv_key=CROSS_KV_CACHE,
+            layer=layer,
         )
         self.final_layernorm = nn.LayerNorm(h)
         self.mlp = _MLP(config)
@@ -91,38 +84,32 @@ class CanaryDecoderModel(nn.Module):
         h = config.hidden_size
         self.embed_tokens = nn.Embedding(config.vocab_size, h)
         self.embedding_layernorm = nn.LayerNorm(h)
-        self.layers = nn.ModuleList(CanaryDecoderLayer(config) for _ in range(config.num_layers))
+        self.layers = nn.ModuleList(CanaryDecoderLayer(config, layer) for layer in range(config.num_layers))
         self.norm = nn.LayerNorm(h)
         self.proj_out = nn.Linear(h, config.vocab_size)
 
     def embed(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
-    def write_cross_kv(self, encoder_states: torch.Tensor) -> None:
-        """Project the encoder output to per-layer K/V and write it into the
-        context stream; for a batch, the requests' outputs concatenated in
+    def add_context(self, encoder_states: torch.Tensor) -> None:
+        """Project the encoder output to per-layer K/V and add it to the
+        context array; for a batch, the requests' outputs concatenated in
         the step's segment order."""
-        for layer_idx, layer in enumerate(self.layers):
-            k, v = layer.encoder_attn.compute_kv(encoder_states)
-            layer.encoder_attn.context_kv.set_default_layer_idx(layer_idx)
-            layer.encoder_attn.context_kv.write_kv(k, v, label=CONTEXT_LABEL)
+        for layer in self.layers:
+            layer.encoder_attn.add_context(encoder_states)
 
     def logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         return self.proj_out(hidden_states)
 
     def forward(self, input_embeds: torch.Tensor, *, label: str, position_ids: torch.Tensor) -> torch.Tensor:
         """The token embeddings plus sinusoids at ``position_ids`` (one per
-        token), through the stack and its final norm. The prefill writes the
-        context (`write_cross_kv`) before this runs."""
+        token), through the stack and its final norm. The prefill adds the
+        context (`add_context`) before this runs. ``label`` is the scaffold's
+        to pass and goes unread, since each row's label comes from the step's
+        segments."""
         pos = sinusoid_positions(position_ids, self.config.hidden_size).to(input_embeds.dtype)
         hidden_states = self.embedding_layernorm(input_embeds + pos)
-        # bind the label once and advance the layer index per layer on both
-        # caches; passing them as arguments would make inductor specialize
-        self.layers[0].self_attn.attend.bind_step(label)
-        self.layers[0].encoder_attn.bind_step(label)
-        for layer_idx, layer in enumerate(self.layers):
-            layer.self_attn.attend.set_layer_idx(layer_idx)
-            layer.encoder_attn.set_layer_idx(layer_idx)
+        for layer in self.layers:
             hidden_states = layer(hidden_states)
         return self.norm(hidden_states)
 

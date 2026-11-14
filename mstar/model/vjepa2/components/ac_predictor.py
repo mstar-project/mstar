@@ -23,14 +23,13 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from mstar.engine.resources.convenience import AttentionCallable
 from mstar.model.vjepa2.components.rope_utils import (
     RopeTables,
     apply_rope_BNHD,
     rope_tables_BNHD,
     rotate_queries_or_keys,
 )
-from mstar.model.vjepa2.config import VJepa2ACPredictorConfig
+from mstar.model.vjepa2.config import KV_CACHE, VJepa2ACPredictorConfig
 
 
 def build_action_block_causal_attention_mask(
@@ -74,6 +73,8 @@ class ACRoPEAttention(nn.Module):
         num_heads: int,
         qkv_bias: bool = True,
         grid_size: int = 16,
+        *,
+        layer: int,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -91,8 +92,9 @@ class ACRoPEAttention(nn.Module):
         self.w_dim = third
         self.grid_size = grid_size
 
-        self.kv = None
-        self.attn = None
+        # the block's id on the rollout node's array, a CPU tensor like `ParallelAttention.layer`
+        self.layer = torch.tensor(layer, device="cpu")
+        self.state = None
 
     @staticmethod
     def _separate_positions(ids: torch.Tensor, h: int, w: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -137,11 +139,11 @@ class ACRoPEAttention(nn.Module):
         w: int,
         action_tokens: int,
         t_0: int = 0,
-        label: str | None = None,
+        cached: bool = False,
         # the cached path's sin/cos, built once per step by the predictor
         rope: RopeTables | None = None,
     ) -> torch.Tensor:
-        if label is not None and self.attn is not None:
+        if cached:
             return self.forward_cached(x=x, rope=rope, action_tokens=action_tokens)
         b, n, c = x.size()
 
@@ -231,6 +233,8 @@ class ACRoPEAttention(nn.Module):
         test/modular/vjepa2/test_ac_rope_parity.py and more thoroughly in
         test/modular/vjepa2/test_ac_kv_cache_parity.py.
         """
+        if self.state is None:
+            raise ValueError(f"cached=True needs the array {KV_CACHE!r}, which only rollout_predictor declares")
         b, n, c = x.shape
         hd = self.head_dim
 
@@ -263,7 +267,8 @@ class ACRoPEAttention(nn.Module):
         k = k.reshape(b * n, self.num_heads, hd)
         v = v.reshape(b * n, self.num_heads, hd)
 
-        x = self.attend(q, k, v)
+        self.state.add(self.layer, k=k, v=v)
+        x = self.state.read(self.layer, q)
         x = x.reshape(b, n, c)
         return self.proj(x)
 
@@ -287,11 +292,9 @@ class ACRoPEAttention(nn.Module):
             time=None if time_pos is None else rope_tables_BNHD(time_pos, self.d_dim, dtype, device),
         )
 
-    def bind_resources(self, resources: dict) -> None:
-        self.attn = resources.get("attn", self.attn)
-        self.kv = resources.get("kv", self.kv)
-        # see Attention.bind_resources
-        self.attend = AttentionCallable(kv=self.kv, attn=self.attn)
+    def bind_state(self, handles: dict) -> None:
+        # one module serves three nodes, and only rollout_predictor declares the array
+        self.state = handles[KV_CACHE]
 
 
 class ACBlock(nn.Module):
@@ -303,6 +306,7 @@ class ACBlock(nn.Module):
         qkv_bias: bool,
         layer_norm_eps: float,
         grid_size: int,
+        layer: int,
     ):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim, eps=layer_norm_eps)
@@ -311,6 +315,7 @@ class ACBlock(nn.Module):
             num_heads=num_heads,
             qkv_bias=qkv_bias,
             grid_size=grid_size,
+            layer=layer,
         )
         self.norm2 = nn.LayerNorm(dim, eps=layer_norm_eps)
         self.mlp = _MLP(in_features=dim, hidden_features=int(dim * mlp_ratio))
@@ -324,12 +329,12 @@ class ACBlock(nn.Module):
         w: int,
         action_tokens: int,
         t_0: int = 0,
-        label: str | None = None,
+        cached: bool = False,
         rope: RopeTables | None = None,
     ) -> torch.Tensor:
         x = x + self.attn(
             self.norm1(x), attn_mask=attn_mask, t=t, h=h, w=w,
-            action_tokens=action_tokens, t_0=t_0, label=label, rope=rope,
+            action_tokens=action_tokens, t_0=t_0, cached=cached, rope=rope,
         )
         x = x + self.mlp(self.norm2(x))
         return x
@@ -372,8 +377,9 @@ class VisionTransformerPredictorAC(nn.Module):
                     qkv_bias=config.qkv_bias,
                     layer_norm_eps=config.layer_norm_eps,
                     grid_size=self.grid_height,
+                    layer=layer,
                 )
-                for _ in range(config.depth)
+                for layer in range(config.depth)
             ]
         )
 
@@ -474,7 +480,7 @@ class VisionTransformerPredictorAC(nn.Module):
 
     def make_block_loop_fn(
         self,
-        label: str | None,              # None runs the blocks without paged attention
+        cached: bool,                   # False runs the blocks without paged attention
         static_pos_bufs: dict,          # {"d_pos": Tensor, "h_pos": Tensor, ...}
         cond_tokens: int,
     ):
@@ -482,8 +488,8 @@ class VisionTransformerPredictorAC(nn.Module):
 
         The returned ``fn(x) -> x`` reads position tensors from
         ``static_pos_bufs`` (which the runner updates via ``.copy_()`` before
-        each replay) and attends under ``label``, whose plan the runner drives
-        outside the graph before each replay.
+        each replay) and, with ``cached``, attends over the array, whose plan
+        the runner drives outside the graph before each replay.
 
         The stream advance is NOT done inside this closure — the runner
         commits the step after ``graph.replay()``, outside the captured region.
@@ -497,19 +503,14 @@ class VisionTransformerPredictorAC(nn.Module):
                 static_pos_bufs["d_pos"], static_pos_bufs["h_pos"], static_pos_bufs["w_pos"],
                 static_pos_bufs.get("time_pos"), x.dtype,
             )
-            if label is not None:
-                # cursors on the shared resources; see AttentionCallable
-                blocks[0].attn.attend.bind_step(label)
-            for blk_num, blk in enumerate(blocks):
-                if label is not None:
-                    blk.attn.attend.set_layer_idx(blk_num)
+            for blk in blocks:
                 x = blk(
                     x,
                     attn_mask=None,
                     t=1,                   # always 1 frame per step in rollout
                     h=gh, w=gw,
                     action_tokens=cond_tokens,
-                    label=label,
+                    cached=cached,
                     rope=rope,
                 )
             return x
@@ -523,7 +524,7 @@ class VisionTransformerPredictorAC(nn.Module):
         states: torch.Tensor,
         extrinsics: torch.Tensor | None = None,
         t_0: int = 0,
-        label: str | None = None,
+        cached: bool = False,
     ) -> torch.Tensor:
         """
         Args:
@@ -540,7 +541,7 @@ class VisionTransformerPredictorAC(nn.Module):
 
         assert self.config.is_frame_causal, "non-causal AC predictor is not implemented"
 
-        if label is None:
+        if not cached:
             attn_mask = self._get_attn_mask(x.device)[: x.size(1), : x.size(1)]
             rope = None
         else:
@@ -552,12 +553,7 @@ class VisionTransformerPredictorAC(nn.Module):
             )
             rope = self.predictor_blocks[0].attn.rope_tables(*positions, x.dtype)
 
-        if label is not None:
-            # cursors on the shared resources; see AttentionCallable
-            self.predictor_blocks[0].attn.attend.bind_step(label)
-        for blk_num, blk in enumerate(self.predictor_blocks):
-            if label is not None:
-                blk.attn.attend.set_layer_idx(blk_num)
+        for blk in self.predictor_blocks:
             x = blk(
                 x,
                 attn_mask=attn_mask,
@@ -566,11 +562,9 @@ class VisionTransformerPredictorAC(nn.Module):
                 w=self.grid_width,
                 action_tokens=cond_tokens,
                 t_0=t_0,
-                label=label,
+                cached=cached,
                 rope=rope,
             )
-
-        # the advance is the runner's now, off the step declaration
 
         return self._decode_sequence(x, cond_tokens, b, t)
 

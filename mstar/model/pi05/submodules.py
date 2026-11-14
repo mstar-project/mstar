@@ -23,12 +23,12 @@ from mstar.engine.accelerator_graph_config import (
     PackedAcceleratorGraphConfig,
 )
 from mstar.engine.engine import ExecutingBatch
-from mstar.engine.resources import AttentionStep, KVStep, PositionStep, Segment, SlotLease, SubmoduleStep
+from mstar.engine.state import ArrayStep, Segment, SlotLease, SubmoduleStep
 from mstar.model.pi05.components.action_expert import Pi05ActionExpert, Pi05TimeMLP
 from mstar.model.pi05.components.flow_matching import euler_step, sincos_timestep_embedding
 from mstar.model.pi05.components.paligemma import Pi05PaliGemmaExpert
 from mstar.model.pi05.components.siglip import Pi05SiglipEncoder
-from mstar.model.pi05.config import CHUNK_WALK, LLM_ATTN, LLM_KV, LLM_POS, Pi05Config
+from mstar.model.pi05.config import CHUNK_WALK, LLM_KV, Pi05Config
 from mstar.model.pi05.kernels.image_normalize import normalize_float_images
 from mstar.model.submodule_base import ARNodeInputs, ARNodeSubmodule, ModelInputsFromEngine, NodeInputs, NodeSubmodule
 
@@ -385,19 +385,13 @@ class Pi05LLMSubmodule(_Pi05ExpertSubmodule):
         piecewise_leases: Mapping[str, SlotLease] | None = None,
         **kwargs,
     ) -> SubmoduleStep:
-        """Bidirectional (prefix-LM) attention over the packed batch; commits the
-        prefix KV and advances positions."""
-        segments = [
-            Segment(request_id=rid, label="main", span=inp.input_seq_len)
-            for rid, inp in zip(request_ids, inputs, strict=True)
-        ]
+        """Prefix-LM attention over the packed batch, which keeps the prefix."""
         return SubmoduleStep(
-            segments=segments,
-            steps={
-                LLM_KV: KVStep(commit=True),
-                LLM_ATTN: AttentionStep(causal=False),
-                LLM_POS: PositionStep(),
-            },
+            segments=[
+                Segment(request_id=rid, label="main", span=inp.input_seq_len)
+                for rid, inp in zip(request_ids, inputs, strict=True)
+            ],
+            state={LLM_KV: ArrayStep()},
         )
 
     def preprocess(
@@ -417,7 +411,7 @@ class Pi05LLMSubmodule(_Pi05ExpertSubmodule):
         **kwargs,
     ) -> NameToTensorList:
         del engine_inputs
-        self.paligemma(query_sequence=prefix_embs, label="main")
+        self.paligemma(query_sequence=prefix_embs)
         return {"prefix_done": [prefix_embs.new_zeros(1)]}
 
     def forward_batched(
@@ -428,7 +422,7 @@ class Pi05LLMSubmodule(_Pi05ExpertSubmodule):
         **kwargs,
     ) -> dict[str, NameToTensorList]:
         """One PaliGemma forward over the concatenated prefixes."""
-        self.paligemma(query_sequence=prefix_embs, label="main")
+        self.paligemma(query_sequence=prefix_embs)
         request_ids = engine_inputs.request_ids
         done = prefix_embs.new_zeros(len(request_ids))
         return {rid: {"prefix_done": [done[i:i + 1]]} for i, rid in enumerate(request_ids)}
@@ -520,20 +514,13 @@ class Pi05ActionSubmodule(_Pi05ExpertSubmodule):
         piecewise_leases: Mapping[str, SlotLease] | None = None,
         **kwargs,
     ) -> SubmoduleStep:
-        """Reads the frozen prefix: the action tokens are written to scratch pages
-        and attended, but neither the stored length nor the position counter
-        advances, so every Euler step uses the same prefix and action positions."""
-        segments = [
-            Segment(request_id=rid, label="main", span=inp.input_seq_len)
-            for rid, inp in zip(request_ids, inputs, strict=True)
-        ]
+        """Adds the action tokens as scratch, so every Euler step reads the same prefix at the same positions."""
         return SubmoduleStep(
-            segments=segments,
-            steps={
-                LLM_KV: KVStep(commit=False),
-                LLM_ATTN: AttentionStep(causal=False),
-                LLM_POS: PositionStep(advance=tuple(0 for _ in request_ids)),
-            },
+            segments=[
+                Segment(request_id=rid, label="main", span=inp.input_seq_len)
+                for rid, inp in zip(request_ids, inputs, strict=True)
+            ],
+            state={LLM_KV: ArrayStep(keep=False)},
         )
 
     def preprocess(
@@ -609,7 +596,6 @@ class Pi05ActionSubmodule(_Pi05ExpertSubmodule):
                 query_sequence=self.action_in_proj(actions),
                 layer_modulations=[mod[step] for mod in modulations.per_layer],
                 final_modulation=modulations.final[step],
-                label="main",
             )
             actions = euler_step(actions, self.action_out_proj(suffix_out), dt)
         return actions

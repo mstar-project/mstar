@@ -1,11 +1,9 @@
-"""Canary's text decoder node (KV, attention, cross-attention, positions,
-sampler); the encoder node is the shared ``FastConformerEncoderSubmodule``."""
+"""Canary's text decoder node (two arrays and a sampler); the encoder node is the
+shared ``FastConformerEncoderSubmodule``."""
 
 from __future__ import annotations
 
-from mstar.engine.resources import AttentionStep, KVStep
-from mstar.engine.resources.step import ResourceStep
-from mstar.model.canary.config import ATTN, CONTEXT_LABEL, CROSS_ATTN, CROSS_KV_CACHE, KV_CACHE, POS, PROMPT_LENGTH
+from mstar.model.canary.config import CONTEXT_LABEL, CROSS_KV_CACHE, KV_CACHE, PROMPT_LENGTH
 from mstar.model.components.encoder_decoder import EncoderDecoderNode
 
 
@@ -14,10 +12,8 @@ class CanaryDecoderSubmodule(EncoderDecoderNode):
     token per step."""
 
     PREFILL_WALK = "prefill"
-    ATTN_KEY = ATTN
-    POS_KEY = POS
+    KV_CACHE = KV_CACHE
     CROSS_KV_CACHE = CROSS_KV_CACHE
-    CROSS_ATTN = CROSS_ATTN
     CONTEXT_LABEL = CONTEXT_LABEL
     PREFILL_PROMPT_TOKENS = PROMPT_LENGTH
     # keeps one prefill's context reservation well inside the cache
@@ -27,10 +23,7 @@ class CanaryDecoderSubmodule(EncoderDecoderNode):
     # up to the 64-request cap (`configs/canary.yaml`); the scaffold's ladder runs to 128
     DECODE_CAPTURE_BATCH_SIZES = [1, 2, 4, 8, 16, 32, 64]
 
-    def layer_steps(self) -> dict[str, ResourceStep]:
-        return {KV_CACHE: KVStep(), ATTN: AttentionStep(causal=True)}
-
     def resident_walks(self) -> frozenset[str]:
-        # one token a row in the main stream; the context is read, not written,
+        # one token a row in the main stream; the context is read, not added,
         # and positions are read in the forward, not in `preprocess`
         return frozenset({self.DECODE_WALK})

@@ -48,6 +48,8 @@ class ArrayHandle(StepHandle):
     # the position resource and the dtype its `Rope` rotates in, where the array declares positions
     positions: Any = None
     rope_dtype: torch.dtype | None = None
+    # the cause `write` is refused with on an append-only array's handle; None leaves it "no layout yet"
+    _write_refused: str | None = None
 
     def __init__(self, array: Array, resources: Mapping[str, Any]):
         self.array = array
@@ -161,13 +163,14 @@ class ArrayHandle(StepHandle):
         self._check_open("add")
         if layer not in self.array.layers:
             raise self._refusal(f"add on layer {layer}, which the array doesn't declare")
-        if layer in self._read:
-            raise self._refusal(f"an add on layer {layer} after a read in the same layer")
+        kept = self._keep and keep is not False
+        if kept and layer in self._read:
+            raise self._refusal(f"a kept add on layer {layer} after a read in the same layer")
         if layer in self._kept:
             raise self._refusal(f"an add on layer {layer} after its kept add")
         if keep and not self._keep:
             raise self._refusal(f"keep=True on layer {layer} in a step with keep=False, whose commit keeps no add")
-        (self._kept if self._keep and keep is not False else self._scratch).add(layer)
+        (self._kept if kept else self._scratch).add(layer)
 
     def _record_read(self, layer: int) -> None:
         self._check_open("read")
@@ -194,9 +197,9 @@ class ArrayHandle(StepHandle):
 
     def add(self, layer: int | torch.Tensor, *, keep: bool | None = None, **fields: torch.Tensor) -> None:
         """Append each row's span at its next log positions. A kept add happens once per layer per step, as the
-        layer's last add. ``keep`` False is scratch: it can repeat, and lasts until the next add or the end of the step.
-        None takes the step's ``keep``. The resources keep or drop a step's adds as a whole, so a step that keeps needs
-        each layer to end on a kept add, and a step with ``keep`` False refuses ``keep=True``."""
+        layer's last add. ``keep`` False is scratch: it can repeat, after a read too, and lasts until the next add or
+        the end of the step. None takes the step's ``keep``. The resources keep or drop a step's adds as a whole, so a
+        step that keeps needs each layer to end on a kept add, and a step with ``keep`` False refuses ``keep=True``."""
         raise self._unsupported("add")
 
     def read(self, layer: int | torch.Tensor, q: torch.Tensor | None = None, **mask_args: Any) -> torch.Tensor:
@@ -207,8 +210,8 @@ class ArrayHandle(StepHandle):
     def write(self, layer: int | torch.Tensor, *, at: torch.Tensor | None = None, **fields: torch.Tensor) -> None:
         """Overwrite entries in place, on a rewritable array. ``at`` gives each token's log position, and is omitted
         for a Value."""
-        if not self.array.rewritable:
-            raise self._refusal("write on an append-only array")
+        if self._write_refused is not None:
+            raise self._refusal(self._write_refused)
         raise self._unsupported("write")
 
     def set_start(self, start: Mapping[str, torch.Tensor]) -> None:
