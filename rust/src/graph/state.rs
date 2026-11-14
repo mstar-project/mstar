@@ -1223,4 +1223,76 @@ mod tests {
         assert!(!st.ready_for_speculation(top, true, false));
         assert_eq!(st.input_tensors(top, true).len(), 1);
     }
+
+    /// [loop T: flow -> hift], a loop over the `tokens` stream: `flow` takes a
+    /// chunk and loops `voice` back to itself, `hift` loops `stream` back.
+    fn token2wav_loop() -> GraphRef {
+        let mut it = StrToId::default();
+        let nodes = vec![
+            node("flow", &["tokens", "voice"], &["tokens"], vec![edge("voice", "flow"), edge("mel", "hift")]),
+            node("hift", &["mel", "stream"], &[], vec![edge("stream", "hift"), edge("audio", "")]),
+        ];
+        let loops = vec![LoopArg {
+            name: "T".into(), max_iters: 8, parent: None,
+            member_nodes: vec!["flow".into(), "hift".into()],
+            outputs: vec![], accumulated: vec![],
+            loop_back: vec![("voice".into(), "flow".into()), ("stream".into(), "hift".into())],
+            external_inputs: vec![],
+        }];
+        compile_one(&mut it, &nodes, &loops).unwrap()
+    }
+
+    /// `flow`'s first iteration as the worker runs it: its consumed inputs
+    /// are released before its outputs are routed.
+    fn run_flow_once(g: &GraphRef) -> RequestState {
+        let (flow, hift) = (0, 1);
+        let mut st = RequestState::new(g.clone());
+        st.ingest(g, flow, 1, &[t(1)], true, false);
+        st.ingest(g, hift, 1, &[t(2)], true, false);
+        assert!(st.ingest(g, flow, 0, &[t(3)], false, false));
+        assert!(st.is_ready(flow));
+        assert_eq!(st.clear_consumed_inputs(g, flow), vec![3, 1]);
+        st.complete(g, flow, &[vec![t(10)], vec![t(11)]]);
+        st
+    }
+
+    #[test]
+    fn a_loop_back_to_a_member_that_ran_is_kept_for_the_next_iteration() {
+        let g = token2wav_loop();
+        let (flow, hift) = (0, 1);
+        let mut st = run_flow_once(&g);
+        // `flow` is not the loop's last member, so its loop-back arrives
+        // before the loop advances, and its current slot is empty by now.
+        assert!(st.ingest(&g, flow, 1, &[t(10)], true, false));
+        assert!(st.has_input(flow, 1, true));
+        assert!(!st.has_input(flow, 1, false), "the iteration that ran would drop it on advance");
+
+        st.ingest(&g, hift, 0, &[t(11)], true, false);
+        st.clear_consumed_inputs(&g, hift);
+        st.complete(&g, hift, &[vec![t(12)], vec![t(13)]]);
+        assert_eq!(st.loop_iter(0), 1);
+        let voice: Vec<Vec<u64>> = st.input_tensors(flow, false).into_iter()
+            .map(|(_, ts, _)| ts.iter().map(|t| t.uuid).collect()).collect();
+        assert_eq!(voice, vec![vec![10]], "the next chunk reads the voice the last one wrote");
+    }
+
+    #[test]
+    fn a_consumer_takes_its_next_chunk_only_once_its_loop_advances() {
+        let g = token2wav_loop();
+        let (flow, hift) = (0, 1);
+        let mut st = run_flow_once(&g);
+        st.ingest(&g, flow, 1, &[t(10)], true, false);
+        // A chunk is offered with nothing to buffer it in: refused, it stays
+        // in the stream buffer for the next iteration.
+        assert!(!st.ingest(&g, flow, 0, &[t(4)], false, false), "taken into the iteration that ran");
+
+        st.ingest(&g, hift, 0, &[t(11)], true, false);
+        st.clear_consumed_inputs(&g, hift);
+        st.complete(&g, hift, &[vec![t(12)], vec![t(13)]]);
+        // `flow` reads nothing from outside its loop, so only the voice it
+        // was given while the last iteration ran makes it open to a chunk.
+        assert!(st.is_ready_for_streaming(flow), "the stream would never be polled again");
+        assert!(st.ingest(&g, flow, 0, &[t(4)], false, false));
+        assert!(st.is_ready(flow));
+    }
 }
