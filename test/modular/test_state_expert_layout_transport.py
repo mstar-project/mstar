@@ -138,9 +138,23 @@ def test_missing_expert_layout_fails_before_transport(array_name, field, read) -
 def test_walk_overlay_can_replace_one_expert_read_without_omitting_request_lengths():
     queries, keys = _arrays()
     keys = replace(keys, reads={**keys.reads, "other": keys.reads["cross_attn"]})
-    partial = {"trunk_keys": _layouts()["trunk_keys"]}
+    request = _layouts()
     with pytest.raises(RuntimeError, match="missing reads \\['other'\\]"):
-        expert_layouts([queries, keys], partial)
+        expert_layouts([queries, keys], request)
+    partial = {"trunk_keys": request["trunk_keys"]}
     assert expert_layouts([queries, keys], partial, require_all=False) == {
         "trunk_keys": {"main": {"cross_attn": [2, 2, 2, 4]}},
+    }
+
+
+def test_request_must_supply_each_expert_array_label():
+    queries, keys = _arrays()
+    keys = replace(keys, labels={"main", "blank"})
+    partial = _layouts()
+    with pytest.raises(RuntimeError, match="missing expert labels \\['blank'\\]"):
+        expert_layouts([queries, keys], partial)
+    with pytest.raises(RuntimeError, match="missing expert labels \\['main'\\]"):
+        expert_layouts([queries, keys], {"trunk_keys": partial["trunk_keys"]})
+    assert expert_layouts([queries, keys], partial, require_all=False)["trunk_keys"] == {
+        "main": {"cross_attn": [2, 2, 2, 4]},
     }

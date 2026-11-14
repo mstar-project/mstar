@@ -187,6 +187,17 @@ def test_missing_expert_layout_fails_at_data_worker_intake():
         _run(_worker(MissingExpert(), _deployment()))
 
 
+def test_missing_expert_array_fails_at_data_worker_intake():
+    class MissingExpert(_CombinedDeclaring):
+        def process_prompt(self, *args, **kwargs):
+            output = super().process_prompt(*args, **kwargs)
+            del output.metadata["state_layout"]["expert"]
+            return output
+
+    with pytest.raises(RuntimeError, match="missing expert labels \\['main'\\]"):
+        _run(_worker(MissingExpert(), _deployment()))
+
+
 def test_missing_chunk_lengths_fail_at_data_worker_intake():
     class MissingChunk(_ChunkDeclaring):
         def process_prompt(self, *args, **kwargs):
@@ -195,6 +206,21 @@ def test_missing_chunk_lengths_fail_at_data_worker_intake():
             return output
 
     with pytest.raises(RuntimeError, match="chunk_causal is missing reads \\['chunk_attn'\\]"):
+        _run(_worker(MissingChunk(), _deployment()))
+
+
+@pytest.mark.parametrize("drop", ["array", "all"])
+def test_missing_chunk_array_or_state_layout_fails_at_data_worker_intake(drop):
+    class MissingChunk(_ChunkDeclaring):
+        def process_prompt(self, *args, **kwargs):
+            output = super().process_prompt(*args, **kwargs)
+            if drop == "array":
+                del output.metadata["state_layout"]["chunk"]
+            else:
+                del output.metadata["state_layout"]
+            return output
+
+    with pytest.raises(RuntimeError, match="missing chunk-causal labels \\['main'\\]"):
         _run(_worker(MissingChunk(), _deployment()))
 
 

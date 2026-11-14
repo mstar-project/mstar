@@ -703,8 +703,18 @@ def chunk_causal_layouts(
     declarations: Sequence[Array | Sampler | SeqShard], state_layout: Mapping[str, Mapping[str, Layout]],
     *, require_all: bool = True,
 ) -> dict[str, dict[str, dict[str, list[int]]]]:
-    """The read-keyed lengths of within-step arrays, as wire-safe request data."""
+    """The read-keyed lengths of within-step arrays, as wire-safe request data.
+
+    A request gives every declared label. A walk-plan overlay may update only the
+    reads and labels it changes; its caller passes ``require_all=False``.
+    """
     arrays = {declared.name: declared for declared in declarations if isinstance(declared, Array)}
+    if require_all:
+        for array in arrays.values():
+            if not any(isinstance(read.mask, ChunkCausal) for read in array.reads.values()):
+                continue
+            if missing := array.labels - state_layout.get(array.name, {}).keys():
+                raise RuntimeError(f"state_layout[{array.name!r}] is missing chunk-causal labels {sorted(missing)}")
     rows = {}
     for name, by_label in state_layout.items():
         array = arrays.get(name)
@@ -724,8 +734,17 @@ def expert_layouts(
     declarations: Sequence[Array | Sampler | SeqShard], state_layout: Mapping[str, Mapping[str, Layout]],
     *, require_all: bool = True,
 ) -> dict[str, dict[str, dict[str, list[int]]]]:
-    """Read-keyed expert geometry as small wire-safe integers, never tensors."""
+    """Read-keyed expert geometry as small wire-safe integers, never tensors.
+
+    A request gives every declared label; a walk-plan overlay may be partial.
+    """
     arrays = {declared.name: declared for declared in declarations if isinstance(declared, Array)}
+    if require_all:
+        for array in arrays.values():
+            if not any(isinstance(read.mask, (ExpertCross, ExpertSelf)) for read in array.reads.values()):
+                continue
+            if missing := array.labels - state_layout.get(array.name, {}).keys():
+                raise RuntimeError(f"state_layout[{array.name!r}] is missing expert labels {sorted(missing)}")
     rows = {}
     for name, by_label in state_layout.items():
         array = arrays.get(name)

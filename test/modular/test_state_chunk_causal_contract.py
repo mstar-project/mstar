@@ -183,6 +183,18 @@ def test_walk_overlay_can_replace_one_read_without_omitting_request_lengths():
     }
 
 
+def test_request_must_supply_each_chunk_array_label():
+    array = replace(_array(), labels={"main", "blank"})
+    layout = {"tokens": {"main": Layout(chunk_causal={"attn": _lengths()})}}
+    with pytest.raises(RuntimeError, match="missing chunk-causal labels \\['blank'\\]"):
+        chunk_causal_layouts([array], layout)
+    with pytest.raises(RuntimeError, match="missing chunk-causal labels \\['blank', 'main'\\]"):
+        chunk_causal_layouts([array], {})
+    assert chunk_causal_layouts([array], layout, require_all=False) == {
+        "tokens": {"main": {"attn": [4, 16, 8]}},
+    }
+
+
 def test_two_request_layouts_reach_binding_and_plan_without_cross_request_visibility():
     array = _array()
     requested = {
