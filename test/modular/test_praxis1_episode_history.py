@@ -113,30 +113,30 @@ def test_episode_text_reuse_requires_a_deployment_token_cap():
 def test_append_plan_tracks_cold_warm_reset_and_eviction():
     model = _model()
 
-    def plan(held, rows, cold=None):
-        episode = EpisodeView("session", 0, {STATE_NAME: held} if held else {}, cold)
+    def plan(held, rows, cold=None, calls=0):
+        episode = EpisodeView("session", calls, {STATE_NAME: held} if held else {}, cold)
         steps = model.walk_plan(
             "", ["image"], ["action"], {"image_inputs": [object()]},
             {"executed_rows": rows, "action_format": "positronic"}, episode
         )
         return steps[-1].step_metadata["history_append"]
 
-    assert plan(0, 0) == 1
-    assert plan(1, FIRST_ROWS) == 20
+    assert plan(0, 0) == 0
+    assert plan(0, FIRST_ROWS, calls=1) == FIRST_ROWS
     assert plan(21, LATER_ROWS) == 24
     assert plan(45, LATER_ROWS) == 24
     assert plan(69, LATER_ROWS) == 24
-    assert plan(0, LATER_ROWS, "evicted") == 1
-    assert plan(0, 0, "reset") == 1
+    assert plan(0, LATER_ROWS, "evicted", calls=3) == 0
+    assert plan(0, 0, "reset", calls=3) == 0
     with pytest.raises(ValueError, match="first warm"):
-        plan(1, LATER_ROWS)
+        append_count(0, LATER_ROWS, first_warm=True)
     with pytest.raises(ValueError, match="later warm"):
         plan(21, FIRST_ROWS)
 
 
 def test_warm_openpi_is_refused_before_any_graph_walk() -> None:
     model = _model()
-    episode = EpisodeView("session", 1, {STATE_NAME: 1})
+    episode = EpisodeView("session", 1, {})
     with pytest.raises(ValueError, match="warm Praxis episodes require Positronic"):
         model.walk_plan(
             "", ["image"], ["action"], {"image_inputs": [object()]},
@@ -160,8 +160,8 @@ def test_attention_layout_uses_episode_depth_after_append() -> None:
     )
     g = model.config.num_registers + p + 3
 
-    def layout(held: int, rows: int):
-        episode = EpisodeView("session", 0, {STATE_NAME: held} if held else {})
+    def layout(held: int, rows: int, calls: int = 0):
+        episode = EpisodeView("session", calls, {STATE_NAME: held} if held else {})
         walk = model.walk_plan(
             "", ["image"], ["action"], {"image_inputs": [object()]},
             {"executed_rows": rows, "text_tokens": 3, "blank_tokens": 2,
@@ -172,7 +172,7 @@ def test_attention_layout_uses_episode_depth_after_append() -> None:
         assert "state_layout" not in wire_walk.step_metadata
         return wire_walk.step_metadata
 
-    cold, warm, reset = layout(0, 0), layout(1, FIRST_ROWS), layout(0, 0)
+    cold, warm, reset = layout(0, 0), layout(0, FIRST_ROWS, 1), layout(0, 0)
     for metadata, k, d in ((cold, 1, 0), (warm, 2, 1), (reset, 1, 0)):
         encoder = metadata[CHUNK_CAUSAL_LAYOUT_KWARG][ENCODER_COND_KV][ENCODER_COND_KV][ATTN_READS[ENCODER_COND_KV]]
         cross = metadata[EXPERT_LAYOUT_KWARG][EXPERT_TRUNK_KEYS][EXPERT_TRUNK_KEYS][ATTN_READS[EXPERT_TRUNK_KEYS]]
@@ -258,18 +258,20 @@ def test_first_warm_25_row_client_stack_keeps_exact_reference_suffix(pose_histor
         ["action"],
         {"image_inputs": [object()]},
         {"executed_rows": decoded.executed_rows, "action_format": "positronic"},
-        EpisodeView("id", 1, {STATE_NAME: 1}),
+        EpisodeView("id", 1, {}),
     )
-    assert plan[-1].step_metadata["history_append"] == 20
+    assert plan[-1].step_metadata["history_append"] == FIRST_ROWS
 
     node = Praxis1VaeEncoderSubmodule(model.config, _Vae(), max_context_chunks=3)
     node._tiles = lambda views: views
     node.vae_encode = lambda canvas: canvas[:, :, ::4]
-    seed_pose = torch.tensor([[3.0, 0, 0.6, 1, 0, 0, 0, 0.5]])
+    # The prior call's observation can differ from the oldest frame in the
+    # client's executed stack; equality here hid the original bug.
+    seed_pose = torch.tensor([[77.0, 0, 0.6, 1, 0, 0, 0, 0.5]])
     handle = _Handle({
-        "frame": torch.full((1, 3, 3, 8), 3, dtype=torch.uint8),
-        "pose": seed_pose,
-        "pose_valid": torch.ones((1, 1), dtype=torch.uint8),
+        "frame": torch.empty((0, 3, 3, 8), dtype=torch.uint8),
+        "pose": torch.empty((0, 8)),
+        "pose_valid": torch.empty((0, 1), dtype=torch.uint8),
     })
     boundary = _Handle({"pose": seed_pose, "history_valid": torch.ones((1, 1), dtype=torch.uint8)})
     node.state_handles = {STATE_NAME: handle, BOUNDARY_STATE_NAME: boundary}
@@ -277,15 +279,16 @@ def test_first_warm_25_row_client_stack_keeps_exact_reference_suffix(pose_histor
     out = node.forward(
         "chunk",
         SimpleNamespace(),
-        history_append=20,
+        history_append=FIRST_ROWS,
         history_pose=prepared.new_input_tensors["executed_pose_inputs"][0],
         history_pose_valid=valid,
         **{f"view_{i}": view for i, view in enumerate(views)},
     )
     _, added = handle.added[0]
-    assert added["frame"][:, 0, 0, 0].tolist() == list(range(4, 24))
-    assert added["pose_valid"].sum() == (20 if pose_history else 0)
+    assert added["frame"][:, 0, 0, 0].tolist() == list(range(3, 24))
+    assert added["pose_valid"].sum() == (21 if pose_history else 0)
     assert out["anchor_latents"][0].shape[2] == 1
+    assert out["anchor_latents"][0][0, 0, 0, 0, 0].item() == 3
     assert out["clean_latents"][0].shape[2] == 6
     assert out["proprio_all"][0].shape == (1, 2, 10)
 
@@ -303,7 +306,9 @@ class _Handle:
         self.reads += 1
         if not self.added and not self.prior:
             return SimpleNamespace(fields={
+                "frame": torch.empty((0, 3, 1, 1), dtype=torch.uint8),
                 "pose": torch.empty((0, 8)),
+                "pose_valid": torch.empty((0, 1), dtype=torch.uint8),
                 "history_valid": torch.empty((0, 1), dtype=torch.uint8),
             })
         fields = dict(self.prior)
@@ -313,6 +318,8 @@ class _Handle:
         return SimpleNamespace(fields=fields)
 
     def commit(self):
+        if not self.added and not self.prior:
+            return
         self.prior = self.read(0).fields
         self.added.clear()
 
@@ -338,11 +345,11 @@ def test_cold_seed_ignores_unretained_missing_pose_rows():
     valid[-1] = 1
 
     node.forward(
-        "chunk", SimpleNamespace(), history_append=1,
+        "chunk", SimpleNamespace(), history_append=0,
         history_pose=poses, history_pose_valid=valid,
         **{f"view_{i}": images for i in range(model.config.num_cameras)},
     )
-    assert frames.added[-1][1]["pose_valid"].tolist() == [[1]]
+    assert not frames.added
     assert boundaries.added[-1][1]["history_valid"].tolist() == [[1]]
 
     frames.commit()
@@ -350,7 +357,7 @@ def test_cold_seed_ignores_unretained_missing_pose_rows():
     missing = torch.zeros((22, 1), dtype=torch.uint8)
     missing[-1] = 1
     node.forward(
-        "chunk", SimpleNamespace(), history_append=20,
+        "chunk", SimpleNamespace(), history_append=21,
         history_pose=torch.tensor(_pose()).repeat(22, 1), history_pose_valid=missing,
         **{f"view_{i}": images for i in range(model.config.num_cameras)},
     )
@@ -381,7 +388,7 @@ def test_missing_pose_fallback_matches_reference_over_three_calls():
     node.state_handles = {STATE_NAME: frames, BOUNDARY_STATE_NAME: boundaries}
     boundary_poses = []
 
-    for current, first, count in ((0, 0, 0), (21, 0, 21), (45, 21, 24)):
+    for call, (current, first, count) in enumerate(((0, 0, 0), (21, 0, 21), (45, 21, 24))):
         pose = [float(current) / 100, 0.0, 0.6, 1.0, 0.0, 0.0, 0.0, 0.5]
         boundary_poses.append(pose)
         prior = torch.arange(first, first + count, dtype=torch.uint8)[:, None, None, None].expand(-1, 3, 2, 2)
@@ -400,7 +407,7 @@ def test_missing_pose_fallback_matches_reference_over_three_calls():
             for row in boundary_poses[-(stream.depth + 1):]
         ]
         expected = reference.pose8_to_10d(np.asarray(model_poses, dtype=np.float32))
-        append = append_count(len(frames.prior.get("frame", [])), count)
+        append = append_count(len(frames.prior.get("frame", [])), count, first_warm=call == 1)
         out = node.forward(
             "chunk", SimpleNamespace(), history_append=append,
             history_pose=prepared.new_input_tensors["executed_pose_inputs"][0],
@@ -414,26 +421,26 @@ def test_missing_pose_fallback_matches_reference_over_three_calls():
     assert boundaries.prior["history_valid"][-1, 0].item() == 0
 
 
-@pytest.mark.parametrize("append,expected", [(1, [99]), (20, list(range(1, 21))), (24, list(range(21, 45)))])
+@pytest.mark.parametrize("append,expected", [(0, []), (21, list(range(21))), (24, list(range(21, 45)))])
 def test_vae_state_adds_only_new_executed_rows(append, expected):
     model = _model()
     node = Praxis1VaeEncoderSubmodule(model.config, _Vae(), max_context_chunks=3)
     node._tiles = lambda views: views
     node.vae_encode = lambda canvas: canvas[:, :, ::4]
-    prior_values = [] if append == 1 else ([0] if append == 20 else list(range(21)))
+    prior_values = [] if append in (0, 21) else list(range(21))
     prior_frame = torch.tensor(prior_values, dtype=torch.uint8)[:, None, None, None].expand(-1, 3, 1, 2)
     prior_pose = torch.tensor(prior_values, dtype=torch.float32)[:, None].expand(-1, 8)
     handle = _Handle({"frame": prior_frame, "pose": prior_pose,
                       "pose_valid": torch.ones((len(prior_values), 1), dtype=torch.uint8)})
-    boundary_prior = [] if append == 1 else ([0] if append == 20 else [0, 21])
+    boundary_prior = [] if append == 0 else ([0] if append == 21 else [0, 21])
     boundary = _Handle({
         "pose": torch.tensor(boundary_prior, dtype=torch.float32)[:, None].expand(-1, 8),
         "history_valid": torch.ones((len(boundary_prior), 1), dtype=torch.uint8),
     })
     node.state_handles = {STATE_NAME: handle, BOUNDARY_STATE_NAME: boundary}
-    if append == 1:
+    if append == 0:
         values = [99]
-    elif append == 20:
+    elif append == 21:
         values = list(range(21)) + [99]
     else:
         values = list(range(45)) + [99]
@@ -447,36 +454,39 @@ def test_vae_state_adds_only_new_executed_rows(append, expected):
         history_pose_valid=torch.ones((len(values), 1), dtype=torch.uint8),
         **{f"view_{i}": frames for i in range(model.config.num_cameras)},
     )
-    _, fields = handle.added[0]
-    assert fields["frame"][:, 0, 0, 0].tolist() == expected
-    assert fields["pose"][:, 0].tolist() == ([float(v) for v in expected] if append != 1 else [0.0])
+    if append:
+        _, fields = handle.added[0]
+        assert fields["frame"][:, 0, 0, 0].tolist() == expected
+        assert fields["pose"][:, 0].tolist() == [float(v) for v in expected]
+        assert fields["pose_valid"].all()
+    else:
+        assert not handle.added
     assert handle.reads == 1
-    assert fields["pose_valid"].all()
     assert out["obs_latents"][0].shape[2] == 1
 
 
 def test_reset_requires_new_stack_before_warm_append():
-    assert append_count(0, 24) == 1  # eviction makes held state authoritative
-    assert append_count(1, 21) == 20
+    assert append_count(0, 24) == 0  # eviction makes held state authoritative
+    assert append_count(0, 21, first_warm=True) == 21
     assert append_count(21, 24) == 24
 
 
 def test_executed_window_matches_pinned_reference_after_slide_and_reset():
     reference = pytest.importorskip("praxis.robot_io", reason="reference checkout not on PYTHONPATH")
     stream = reference.ContiguousStreamContext(action_chunk=24, max_context_chunks=3)
-    retained = [0]  # cold call's current real frame
+    retained = []  # cold call has not executed any rows
     for first, rows in ((0, 21), (21, 24), (45, 24), (69, 24)):
         frame = torch.arange(first, first + rows, dtype=torch.uint8).reshape(1, 1, rows, 1, 1)
         pose = np.arange(first, first + rows, dtype=np.float32).reshape(-1, 1)
         stream.append_executed(frame, pose)
-        add = append_count(len(retained), rows)
+        add = append_count(len(retained), rows, first_warm=first == 0)
         retained = (retained + list(range(first + rows - add, first + rows)))[-69:]
         assert retained == stream._clip[0, 0, :, 0, 0].tolist()
         assert retained == stream._poses[:, 0].tolist()
     stream.reset()
     retained = []
     assert stream.n_raws == 0 and retained == []
-    assert append_count(len(retained), 24) == 1  # eviction resumes cold
+    assert append_count(len(retained), 24) == 0  # eviction resumes cold
 
 
 def test_engine_keeps_paired_history_across_request_ids_then_clears_on_reset():
@@ -491,7 +501,7 @@ def test_engine_keeps_paired_history_across_request_ids_then_clears_on_reset():
     boundary = handles[BOUNDARY_STATE_NAME]
     owners = EpisodeRowBindings()
 
-    def call(rid, episode, values, reset=False):
+    def call(rid, episode, values, *, boundary_value, reset=False):
         for pool in pools.values():
             pool.ingest_request(rid)
         binding = owners.bind(rid, 0, episode)
@@ -513,19 +523,20 @@ def test_engine_keeps_paired_history_across_request_ids_then_clears_on_reset():
         step.begin_calls()
         vals = torch.tensor(values, dtype=torch.uint8)
         previous = boundary.read(0).fields
-        boundary.add(0, pose=torch.full((1, 8), float(values[-1])),
+        boundary.add(0, pose=torch.full((1, 8), float(boundary_value)),
                      history_valid=torch.ones((1, 1), dtype=torch.uint8))
-        handle.add(
-            0,
-            frame=vals[:, None, None, None].expand(-1, 3, 1, model.config.num_cameras).clone(),
-            pose=vals[:, None].expand(-1, 8).float().clone(),
-            pose_valid=torch.ones((len(values), 1), dtype=torch.uint8),
-        )
+        if values:
+            handle.add(
+                0,
+                frame=vals[:, None, None, None].expand(-1, 3, 1, model.config.num_cameras).clone(),
+                pose=vals[:, None].expand(-1, 8).float().clone(),
+                pose_valid=torch.ones((len(values), 1), dtype=torch.uint8),
+            )
         reached = handle.read(0)
         result = reached.fields["frame"][:, 0, 0, 0].tolist()
         assert reached.fields["pose"][:, 0].tolist() == [float(v) for v in result]
         saved_boundary = boundary.read(0).fields
-        assert saved_boundary["pose"][-1, 0].item() == values[-1]
+        assert saved_boundary["pose"][-1, 0].item() == boundary_value
         if not reset and rid > 1:
             assert len(previous["pose"]) >= 1
         step.check_calls()
@@ -538,9 +549,9 @@ def test_engine_keeps_paired_history_across_request_ids_then_clears_on_reset():
         owners.unbind(rid)
         return result
 
-    assert call(1, "episode-a", [0]) == [0]
-    assert call(2, "episode-a", list(range(1, 21))) == list(range(21))
-    assert call(3, "episode-a", list(range(21, 45))) == list(range(45))
-    assert call(4, "episode-a", list(range(45, 69))) == list(range(69))
-    assert call(5, "episode-a", list(range(69, 93))) == list(range(24, 93))
-    assert call(6, "episode-a", [100], reset=True) == [100]
+    assert call(1, "episode-a", [], boundary_value=77) == []
+    assert call(2, "episode-a", list(range(21)), boundary_value=21) == list(range(21))
+    assert call(3, "episode-a", list(range(21, 45)), boundary_value=45) == list(range(45))
+    assert call(4, "episode-a", list(range(45, 69)), boundary_value=69) == list(range(69))
+    assert call(5, "episode-a", list(range(69, 93)), boundary_value=93) == list(range(24, 93))
+    assert call(6, "episode-a", [], boundary_value=100, reset=True) == []

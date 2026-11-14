@@ -43,11 +43,11 @@ current row, as uint8 `(T,3,H,W)` stacks. When matching pose and grip history
 is present it passes a raw float32 `(T,8 or 16)` pose stack; otherwise that
 tensor has zero rows while the camera window stays warm. The model uses
 `EpisodeView` and `executed_rows` to select its append
-span. On the first warm call, the cold seed already holds the first real row,
-so the model appends the final 20 of the 21 prior rows. Later calls append the
-final 24. The model must encode those real frames and retain clean state in
-its declared episode resources. Reset discards that state before using the
-request's current frame. No frontend cache or frame data in `step_metadata`
+span. A cold call retains no executed frames. The first warm call appends all
+21 prior rows; later calls append the final 24. The model must encode those
+real frames and retain clean state in its declared episode resources. Reset
+discards that state before using the request's current frame. No frontend
+cache or frame data in `step_metadata`
 is needed.
 
 The parser, data-worker and binary transport tests cover cold, subsequent,

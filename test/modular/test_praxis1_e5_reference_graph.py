@@ -25,7 +25,6 @@ from mstar.model.base import EpisodeView
 from mstar.model.praxis1.components.chunk_mask import encoder_codes, visible
 from mstar.model.praxis1.components.encoder import dense_chunk_causal_mask
 from mstar.model.praxis1.components.sampler import ACTION_SALT, VIDEO_SALT, seeded_normal
-from mstar.model.praxis1.episode_history import STATE_NAME
 from mstar.model.praxis1.native_towers import build_backbone, build_expert
 from mstar.model.praxis1.praxis1_model import Praxis1Model
 from mstar.model.praxis1.submodules import (
@@ -157,7 +156,7 @@ def _run_case(k: int, engine_autocast: bool, declared_resources: bool, video_sca
         declared_model = SimpleNamespace(declare_state=lambda: arrays)
         bn.state_handles = node_handles(declared_model, "backbone", resources)
         en.state_handles = node_handles(declared_model, "action_expert", resources)
-        episode = EpisodeView("r", 0, {STATE_NAME: 1} if k == 2 else {})
+        episode = EpisodeView("r", int(k == 2), {})
         walk = model.walk_plan(
             "", ["image"], ["action"], {"image_inputs": [object()]},
             {"executed_rows": 21 if k == 2 else 0, "text_tokens": 3,

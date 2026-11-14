@@ -257,7 +257,7 @@ def test_droid_session_config_keeps_idless_openpi_cold(tmp_path, monkeypatch):
     )
     assert steps[-1].walk == model.CHUNK_WALK
     assert steps[-1].step_metadata["history_held"] == 0
-    assert steps[-1].step_metadata["history_append"] == 1
+    assert steps[-1].step_metadata["history_append"] == 0
 
 
 @pytest.mark.parametrize("changed", [

@@ -249,7 +249,7 @@ def test_warm_episode_text_final_step_reads_only_conditional_state() -> None:
     assert encoder.calls == 1 and decoder.calls == 0
 
 
-@pytest.mark.parametrize("held,rows,clean_frames", [(0, 0, 0), (1, 21, 6)])
+@pytest.mark.parametrize("held,rows,clean_frames", [(0, 0, 0), (0, 21, 6)])
 def test_episode_layout_plans_both_guidance_branches_on_shared_resource(
     held: int, rows: int, clean_frames: int,
 ) -> None:
@@ -265,7 +265,7 @@ def test_episode_layout_plans_both_guidance_branches_on_shared_resource(
     resources = {spec.resource_key: SimpleNamespace(run=lambda *args, **kw: None) for spec in specs}
     handles = node_handles(SimpleNamespace(declare_state=lambda: arrays), "backbone", resources)
     node = Praxis1BackboneSubmodule(model.config, SimpleNamespace())
-    episode = EpisodeView("session", 0, {STATE_NAME: held} if held else {})
+    episode = EpisodeView("session", int(rows > 0), {STATE_NAME: held} if held else {})
     walk = model.walk_plan(
         "", ["image"], ["action"], {"image_inputs": [object()]},
         {"executed_rows": rows, "text_tokens": 3, "blank_tokens": 2,
@@ -293,7 +293,7 @@ def test_episode_layout_plans_both_guidance_branches_on_shared_resource(
     assert len(expanded.steps["praxis_decoder_cond_attn"].segments) == 2
 
 
-@pytest.mark.parametrize("held,rows,warm", [(0, 0, False), (1, 21, True)])
+@pytest.mark.parametrize("held,rows,warm", [(0, 0, False), (0, 21, True)])
 def test_graph_backbone_is_ready_after_actual_producers(held: int, rows: int, warm: bool) -> None:
     model = Praxis1Model(
         "runwayml/praxis-1-droid", skip_weight_loading=True,

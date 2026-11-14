@@ -342,14 +342,10 @@ class Praxis1VaeEncoderSubmodule(_Praxis1Node):
                 assert history_pose is not None and history_pose_valid is not None
                 if any(view.shape[0] != tiles[0].shape[0] for view in tiles):
                     raise ValueError("executed camera stacks have different lengths")
-                # Select only rows new to the episode. On first warm the
-                # seed already contains the overlap's first frame.
-                selected = [view[-(history_append + 1):-1] if history_append > 1
-                            else view[-1:] for view in tiles]
-                added = build_canvas(self._tiles(selected)).squeeze(0).permute(1, 0, 2, 3).to(torch.uint8)
-                poses = history_pose[-(history_append + 1):-1] if history_append > 1 else history_pose[-1:]
+                # A cold call has no executed frames. The first warm call
+                # takes all 21 rows from the client's executed stack.
                 pose_valid = (history_pose_valid[-(history_append + 1):-1]
-                              if history_append > 1 else history_pose_valid[-1:])
+                              if history_append else history_pose_valid[-1:])
                 handle = self.state_handles[STATE_NAME]
                 boundary = self.state_handles[BOUNDARY_STATE_NAME]
                 previous = boundary.read(0).fields
@@ -362,8 +358,12 @@ class Praxis1VaeEncoderSubmodule(_Praxis1Node):
                     0, pose=history_pose[-1:].to(device=device, dtype=torch.float32),
                     history_valid=torch.tensor([[int(history_valid)]], dtype=torch.uint8, device=device),
                 )
-                handle.add(0, frame=added, pose=poses.to(device=device, dtype=torch.float32),
-                           pose_valid=pose_valid.to(device=device, dtype=torch.uint8))
+                if history_append:
+                    selected = [view[-(history_append + 1):-1] for view in tiles]
+                    added = build_canvas(self._tiles(selected)).squeeze(0).permute(1, 0, 2, 3).to(torch.uint8)
+                    poses = history_pose[-(history_append + 1):-1]
+                    handle.add(0, frame=added, pose=poses.to(device=device, dtype=torch.float32),
+                               pose_valid=pose_valid.to(device=device, dtype=torch.uint8))
                 observed = handle.read(0).fields
                 boundaries = boundary.read(0).fields
                 tiles = [view[-1:] for view in tiles]

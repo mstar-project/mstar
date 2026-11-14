@@ -77,7 +77,14 @@ from mstar.model.praxis1.components.commands import compose_commands
 from mstar.model.praxis1.components.pose_frames import pose_to_model
 from mstar.model.praxis1.components.proprio import normalized_proprio
 from mstar.model.praxis1.config import Praxis1Config, Praxis1ConfigError
-from mstar.model.praxis1.episode_history import BOUNDARY_STATE_NAME, STATE_NAME, append_count, clean_depth, window_size
+from mstar.model.praxis1.episode_history import (
+    BOUNDARY_STATE_NAME,
+    FIRST_ROWS,
+    STATE_NAME,
+    append_count,
+    clean_depth,
+    window_size,
+)
 from mstar.model.praxis1.submodules import (
     ATTN_READS,
     DECODER_BLANK_KV,
@@ -694,10 +701,12 @@ class Praxis1Model(Model):
         if self.sampler_defaults["max_context_chunks"]:
             metadata["text_write"] = not has_episode_text
             held = 0 if episode is None else episode.held.get(STATE_NAME, 0)
-            if held and metadata["action_format"] != "positronic":
-                raise ValueError("warm Praxis episodes require Positronic action_format")
             rows = model_kwargs.get("executed_rows", 0)
-            metadata["history_append"] = append_count(held, rows)
+            first_warm = (held == 0 and episode is not None and episode.calls > 0
+                          and episode.cold is None and rows == FIRST_ROWS)
+            if (held or first_warm) and metadata["action_format"] != "positronic":
+                raise ValueError("warm Praxis episodes require Positronic action_format")
+            metadata["history_append"] = append_count(held, rows, first_warm=first_warm)
             metadata["history_held"] = held
         else:
             held = 0

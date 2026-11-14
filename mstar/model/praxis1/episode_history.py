@@ -1,8 +1,7 @@
 """Executed real-frame history for a Praxis session.
 
 The reference keeps 21 frames after the first executed chunk and appends 24
-after each later chunk. A cold call has no executed chunk yet, but we retain
-its current observation as the first frame of that future 21-frame window.
+after each later chunk. A cold call has no executed chunk to retain.
 """
 
 from __future__ import annotations
@@ -19,8 +18,8 @@ def window_size(max_context_chunks: int) -> int:
     return FIRST_ROWS + LATER_ROWS * (max_context_chunks - 1)
 
 
-def append_count(held: int, executed_rows: int) -> int:
-    """How many new rows to append, excluding overlap with the cold seed.
+def append_count(held: int, executed_rows: int, *, first_warm: bool = False) -> int:
+    """How many executed rows this call adds to the retained window.
 
     ``held`` is the conductor's resident count before this request, after
     episode reset or eviction. The caller must reset the episode before
@@ -29,13 +28,14 @@ def append_count(held: int, executed_rows: int) -> int:
     if type(held) is not int or held < 0:
         raise ValueError(f"invalid held history count {held!r}")
     if held == 0:
-        # Admission can evict an otherwise warm session. The frontend may
-        # still report its last reply's span; the state view is authoritative.
-        return 1  # current real frame becomes the window's first anchor
-    if held == 1:
+        # A completed cold call leaves no executed history. Its next call
+        # supplies the entire first executed clip. Evicted/reset episodes
+        # start cold even if the frontend still reports a prior reply span.
+        if not first_warm:
+            return 0
         if executed_rows != FIRST_ROWS:
             raise ValueError("first warm call requires 21 executed rows")
-        return FIRST_ROWS - 1  # seed is the first row of the overlap
+        return FIRST_ROWS
     if executed_rows != LATER_ROWS:
         raise ValueError("later warm calls require 24 executed rows")
     return LATER_ROWS
