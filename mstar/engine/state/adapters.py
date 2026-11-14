@@ -791,7 +791,8 @@ def checked_step_mask_layouts(
                 chunk_causal=chunk, expert_cross=cross, expert_self=self_attn,
             )
     # Reuse the declaration validators, including the expert frame offset rule.
-    return expert_layouts(declarations, typed) if expert else chunk_causal_layouts(declarations, typed)
+    return (expert_layouts(declarations, typed, require_all=False) if expert
+            else chunk_causal_layouts(declarations, typed, require_all=False))
 
 
 def _check_expert_layout(array: Array, label: str, layout: Layout, *, require_all: bool = True) -> None:
