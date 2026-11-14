@@ -211,13 +211,11 @@ class NodeResourceSpec(ABC):
         none."""
         return dataclasses.replace(self, resource_key=instance_key(self.resource_key, node), nodes={node})
 
-    def request_config(
-        self, model_kwargs: dict | None, current: "ResourceReqConfig | None" = None,
-    ) -> "ResourceReqConfig | None":
+    def request_config(self, model_kwargs: dict | None) -> "ResourceReqConfig | None":
         """The config a request is opened with on this resource, built from its kwargs, or
-        None to keep ``current``, the config the model built for it (``get_request_resource_configs``)
-        or None. The conductor puts it in place of ``current``, so a resource needs no model
-        code to take request settings, even where the model builds the config."""
+        None. The conductor adds it to the model's own (``get_request_resource_configs``),
+        so a resource the deployment declares needs no model code to take request
+        settings."""
         return None
 
     def capacity_problem(

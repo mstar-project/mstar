@@ -23,6 +23,7 @@ from mstar.engine.resources.sampler.config import SamplerSpec, SamplerStep, Samp
 from mstar.engine.resources.sampler.grammar import MAX_GRAMMAR_CHARS, GrammarRequest, grammar_request  # noqa: E402
 from mstar.engine.resources.sampler.resource import GrammarSamplerResource  # noqa: E402
 from mstar.engine.resources.step import ASKS, SlotLease, StepContext  # noqa: E402
+from mstar.engine.state.contract import Sampler, SampleSettings  # noqa: E402
 from mstar.model.submodule_base import TokenStop  # noqa: E402
 from mstar.model.utils import TextChunkDetokenizer  # noqa: E402
 from mstar.testing_utils.resource import StubResource  # noqa: E402
@@ -421,14 +422,20 @@ def test_a_chat_response_format_becomes_structured_outputs(response_format, want
     assert mk.get("structured_outputs") == want and "response_format" not in mk
 
 
-def _conductor(enable_grammar: bool):
-    """The conductor's intake: there a ValueError is the client's 400."""
+def _conductor(enable_grammar: bool, attaches: bool = True):
+    """The conductor's intake: there a ValueError is the client's 400. ``attaches``: the model
+    puts the request's grammar on its sampler settings, as a model declaring STRUCTURED_OUTPUTS does."""
     spec = SamplerSpec(resource_key="sampler", nodes={"LLM"}, vocab_size=V, enable_grammar=enable_grammar)
+
+    def configs(i, o, kw):
+        grammar = grammar_request(kw.get("structured_outputs")) if attaches else None
+        return {"sampler": SampleSettings(temperature=0.3, grammar=grammar)}
+
     conductor = Conductor.__new__(Conductor)
-    conductor.model = SimpleNamespace(
-        get_request_resource_configs=lambda i, o, kw: {"sampler": SamplingReqConfig(temperature=0.3)})
+    conductor.model = SimpleNamespace(get_request_resource_configs=configs)
     conductor._kv_labels = {}
     conductor._node_resources_cache = [spec]
+    conductor._declarations = lambda: [Sampler("sampler", nodes={"LLM"}, vocab_size=V)]
     return conductor
 
 
@@ -436,8 +443,12 @@ def test_the_conductor_serves_structured_outputs_only_where_a_sampler_enables_it
     kwargs = {"structured_outputs": {"regex": "a+"}}
     with pytest.raises(ValueError, match="does not serve structured_outputs"):
         _conductor(False)._get_resource_configs(["text"], ["text"], kwargs)
+    with pytest.raises(ValueError, match="does not serve structured_outputs"):
+        _conductor(True, attaches=False)._get_resource_configs(["text"], ["text"], kwargs)
     config = _conductor(True)._get_resource_configs(["text"], ["text"], kwargs)["sampler"]
-    assert config.temperature == 0.3 and config.grammar.kind == "regex", "the model's own config was dropped"
+    assert config.temperature == 0.3 and config.grammar.kind == "regex", "the model's own settings were dropped"
+    plain = _conductor(False)._get_resource_configs(["text"], ["text"], {})["sampler"]
+    assert plain.grammar is None and plain.temperature == 0.3
 
 
 @pytest.mark.parametrize("knob", [{"min_tokens": 4}, {"ignore_eos": True}], ids=str)

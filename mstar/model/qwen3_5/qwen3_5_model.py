@@ -1,10 +1,12 @@
 import logging
+from dataclasses import replace
 from typing import Any
 
 import torch
 from jinja2 import TemplateError
 from transformers import AutoTokenizer
 
+from mstar.engine.resources.sampler.grammar import STRUCTURED_OUTPUTS_KWARG, grammar_request
 from mstar.engine.state import (
     Array,
     Attend,
@@ -18,6 +20,7 @@ from mstar.engine.state import (
     Positions,
     Read,
     Sampler,
+    SampleSettings,
     SeqShard,
     TensorType,
     Value,
@@ -191,6 +194,13 @@ class Qwen3_5DenseModel(DeclaredDecoderModel):
         processor = self.image_processor
         min_patches = processor.size["shortest_edge"] // processor.patch_size ** 2
         return VisionEncoderSubmodule.BLOCK_LOOP_PATCH_BUCKETS[-1] // min_patches
+
+    def get_request_resource_configs(
+        self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
+    ) -> dict[str, SampleSettings]:
+        settings = super().get_request_resource_configs(input_modalities, output_modalities, model_kwargs)[SAMPLER]
+        grammar = grammar_request((model_kwargs or {}).get(STRUCTURED_OUTPUTS_KWARG))
+        return {SAMPLER: replace(settings, grammar=grammar)}
 
     # -----------------------------------------------------------------------
     # Chunked prefill

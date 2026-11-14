@@ -7,12 +7,12 @@ step without pulling them in behind it.
 
 import hashlib
 import math
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 import torch
 
-from mstar.engine.resources.sampler.grammar import STRUCTURED_OUTPUTS_KWARG, GrammarRequest, grammar_request
+from mstar.engine.resources.sampler.grammar import GrammarRequest
 from mstar.engine.resources.spec import NodeResourceSpec, ResourceReqConfig, check_sizes
 from mstar.engine.resources.step import ResourceStep
 
@@ -143,18 +143,6 @@ class SamplerSpec(NodeResourceSpec):
         if self.enable_processed_logprobs and not self.enable_logprobs:
             raise ValueError("enable_processed_logprobs needs enable_logprobs")
 
-    def request_config(
-        self, model_kwargs: dict | None, current: ResourceReqConfig | None = None,
-    ) -> "SamplingReqConfig | None":
-        """The model's sampler config with the request's grammar, when this node
-        serves ``structured_outputs`` and the request asks for one."""
-        if not self.enable_grammar:
-            return None
-        grammar = grammar_request((model_kwargs or {}).get(STRUCTURED_OUTPUTS_KWARG))
-        if grammar is None:
-            return None
-        base = current if isinstance(current, SamplingReqConfig) else SamplingReqConfig()
-        return replace(base, grammar=grammar)
 
     @property
     def resource_class(self) -> "type[Resource]":

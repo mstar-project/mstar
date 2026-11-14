@@ -92,3 +92,17 @@ def test_a_reply_grammar_starts_where_the_prompt_leaves_the_reasoning(tmp_path, 
     (repo / "chat_template.jinja").write_text(template)
     kwargs = _prepared_kwargs(Qwen3_5DenseModel(str(repo)), {"json_object": True})
     assert kwargs["structured_outputs"].get("after") == after
+
+
+def test_qwen3_5_attaches_the_requests_grammar_to_its_sampler_settings(tmp_path):
+    """Qwen3.5 declares STRUCTURED_OUTPUTS, so its own sampler settings carry the request's
+    grammar (the conductor then checks a sampler serves it); a bad one is the client's 400."""
+    from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
+
+    model = Qwen3_5DenseModel(str(_repo(tmp_path / "repo", None)))
+    settings = model.get_request_resource_configs(
+        ["text"], ["text"], {"temperature": 0.2, "structured_outputs": {"regex": "a+"}})["sampler"]
+    assert settings.temperature == 0.2 and settings.grammar.kind == "regex"
+    assert model.get_request_resource_configs(["text"], ["text"], {})["sampler"].grammar is None
+    with pytest.raises(ValueError, match="structured_outputs"):
+        model.get_request_resource_configs(["text"], ["text"], {"structured_outputs": {"regex": "a", "json": {}}})

@@ -46,6 +46,7 @@ from mstar.engine.resources.kv.config import (
     without_layouts,
 )
 from mstar.engine.resources.lora.config import LoraSpec
+from mstar.engine.resources.sampler.config import SamplerSpec
 from mstar.engine.resources.sampler.grammar import STRUCTURED_OUTPUTS_KWARG
 from mstar.engine.state import SampleSettings
 from mstar.engine.state.adapters import sampling_configs
@@ -828,12 +829,18 @@ class Conductor:
         # each declared resource builds its own config from the request's kwargs (a LoRA
         # pool's from the adapter it names), so a model needs no request code for one
         for spec in self._node_resources():
-            config = spec.request_config(model_kwargs, configs.get(spec.resource_key))
+            config = spec.request_config(model_kwargs)
             if config is not None:
-                configs[spec.resource_key] = config
-        # as return_logprobs above: a sampler with enable_grammar took it, or none serves it
-        if model_kwargs.get(STRUCTURED_OUTPUTS_KWARG) is not None and not any(
-            getattr(cfg, "grammar", None) is not None for cfg in configs.values()
+                configs.setdefault(spec.resource_key, config)
+        # as return_logprobs above: the model attached the grammar to a sampler whose spec enables it, or nothing
+        # serves it (a model that doesn't declare STRUCTURED_OUTPUTS attaches none)
+        with_grammar = {key for key, cfg in configs.items() if getattr(cfg, "grammar", None) is not None}
+        serving = {
+            spec.resource_key for spec in self._node_resources()
+            if isinstance(spec, SamplerSpec) and spec.enable_grammar
+        }
+        if (model_kwargs.get(STRUCTURED_OUTPUTS_KWARG) is not None or with_grammar) and not (
+            with_grammar and with_grammar <= serving
         ):
             raise ValueError("this deployment does not serve structured_outputs")
         lora_ops = getattr(self, "_lora_ops_cache", None)

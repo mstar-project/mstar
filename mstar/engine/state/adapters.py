@@ -6,7 +6,7 @@ import functools
 from abc import ABC, abstractmethod
 from collections import Counter
 from collections.abc import Callable, Collection, Mapping, Sequence
-from dataclasses import asdict, astuple, dataclass, replace
+from dataclasses import astuple, dataclass, fields, replace
 from functools import partial
 from itertools import groupby
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
@@ -604,7 +604,7 @@ def sampling_configs(
         if settings.return_logprobs and sampler.draws > 1:
             raise ValueError(f"Sampler {name!r}: return_logprobs, and draws is {sampler.draws}; log-probs take one "
                              "token per step")
-        converted[name] = SamplingReqConfig(**asdict(settings))
+        converted[name] = SamplingReqConfig(**{f.name: getattr(settings, f.name) for f in fields(settings)})
     return converted
 
 
