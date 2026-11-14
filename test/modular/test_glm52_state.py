@@ -234,6 +234,25 @@ def test_only_a_decode_step_is_input_free(k):
     )
 
 
+@pytest.mark.parametrize("k", [0, 3])
+def test_a_decode_row_from_prepare_inputs_has_the_template_row_s_span(k):
+    """The engine runs the step a pre-plan declared over the capture's template rows on the model's word that every
+    real decode row has the template's span. Without MTP the span is the number of ids the row is fed, so a decode
+    row fed two would run a step declared and admitted for one, and nothing would refuse it."""
+    sub = _submodule(k)
+    template = sub.get_accelerator_graph_configs(torch.device("cpu"))[0].single_request_inputs
+    info = _info("decode", 16, 5)
+    info.resource_configs[SAMPLER].temperature, info.resource_configs[SAMPLER].repetition_penalty = 0, 1
+    signals = {"text_inputs": [torch.tensor([7])], "count": [torch.tensor(5)]}
+    row = sub.prepare_inputs("decode", info, signals)
+    declared, real = (sub.declare_step("decode", ["a"], [one]) for one in (template, row))
+    assert (declared.segments, declared.state) == (real.segments, real.state), (
+        "the pre-plan's step is not the one the forward would declare for this row"
+    )
+    with pytest.raises(RuntimeError, match="a decode row of 2 ids"):
+        sub.prepare_inputs("decode", info, {**signals, "text_inputs": [torch.tensor([7, 8])]})
+
+
 def _reduced(monkeypatch, **fields) -> None:
     """``config_variant: reduced`` building a config with ``fields`` set."""
     cfg = Glm52ModelConfig.reduced()
