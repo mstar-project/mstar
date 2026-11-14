@@ -52,6 +52,19 @@ The loop is circular, so this starts at an arbitrary point: **batch N is running
 
 **7. Postprocess N.** Now wait for the actual GPU work (`event_sync`), D2H the outputs, pre-materialize on the side stream, run `check_stop` to look for EOS, extend prefix hash chains from the host copy of sampled tokens, then route and send outputs. The side stream exists because the default stream has GPU(N+1) queued behind GPU(N)'s outputs by this point.
 
+Completion waits can service unrelated teardown after all launched steps have admitted and no pre-plan holds
+reserved state. `InputIngest.process_teardown_messages` only records lifecycle messages for unheld rows and queues
+TP decisions; it defers everything else to the normal preamble. Even recording an in-flight row's drain/removal
+would change `RequestLifecycle.publishable`, read by the GPU thread. Input signals can replace forward metadata
+or end a stream, and peer loop stops can change routing; none may land halfway through postprocess. A deferred NEW
+or REMOVE also holds later teardowns, preserving admission/removal order. TP heads still enter their queue so a
+drain cannot ACK before a queued step.
+
+`step_threads: serial` always synchronizes directly on the main thread without teardown callbacks.
+Otherwise, GPU completion waits use a helper thread when the preceding incomplete-event wait for that node/walk was at least
+10 ms, or is unknown. Shorter waits synchronize directly; a newly slow direct wait can defer cleanup once before
+its timing restores the helper path.
+
 ## Steps beside the chain
 
 A node whose group sets `side_stream: true` runs its `side_stream_walks` on a side lane (`StepPipeline._launch_side`, `_finish_side`), not in the stages above. The chain is lane 0: a step carries its lane (`PendingBatch.lane`), both submit through `StepExecutor.submit` and finish through `_finish_step`, `next_batch(lane=...)` hands each lane only its own keys (`MicroScheduler.lane_of`), and `_hold_rows` keeps each lane's rows in flight. The lane launches at the top of a pass and postprocesses once its step has landed, at the top when the chain is idle or after N's postprocess otherwise, so it costs no pass and the chain never yields to it. One step at a time; it is never speculated, pre-planned or lockstep, which `EngineManager.build` enforces at startup for the groups that ask.
