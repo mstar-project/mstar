@@ -6,7 +6,6 @@ import torch
 from jinja2 import TemplateError
 from transformers import AutoTokenizer
 
-from mstar.engine.resources.sampler.grammar import STRUCTURED_OUTPUTS_KWARG, grammar_request
 from mstar.engine.state import (
     Array,
     Attend,
@@ -24,6 +23,7 @@ from mstar.engine.state import (
     SeqShard,
     TensorType,
     Value,
+    request_grammar,
 )
 from mstar.model.base import ProcessPromptOutput, TensorAndMetadata
 from mstar.model.components.lora.modules import LoraRoot
@@ -199,8 +199,7 @@ class Qwen3_5DenseModel(DeclaredDecoderModel):
         self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
     ) -> dict[str, SampleSettings]:
         settings = super().get_request_resource_configs(input_modalities, output_modalities, model_kwargs)[SAMPLER]
-        grammar = grammar_request((model_kwargs or {}).get(STRUCTURED_OUTPUTS_KWARG))
-        return {SAMPLER: replace(settings, grammar=grammar)}
+        return {SAMPLER: replace(settings, grammar=request_grammar(model_kwargs))}
 
     # -----------------------------------------------------------------------
     # Chunked prefill

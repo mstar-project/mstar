@@ -472,7 +472,7 @@ class SampleSettings:
     return_logprobs: bool = False
     logprobs_mode: str = "raw"
     # the request's ``structured_outputs`` grammar, which a model that declares ``STRUCTURED_OUTPUTS`` attaches
-    # (`grammar.grammar_request`); it needs the sampler's ``enable_grammar``
+    # (`request_grammar`); it needs the sampler's ``enable_grammar``
     grammar: "GrammarRequest | None" = None
 
 

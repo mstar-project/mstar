@@ -154,6 +154,12 @@ def grammar_request(value: Any) -> GrammarRequest | None:
     return request
 
 
+def request_grammar(model_kwargs: dict | None) -> GrammarRequest | None:
+    """The grammar a request's kwargs ask for (``structured_outputs``), checked, for a model to
+    attach to its `SampleSettings`; None when unset. ``ValueError`` (the client's 400) for a bad one."""
+    return grammar_request((model_kwargs or {}).get(STRUCTURED_OUTPUTS_KWARG))
+
+
 def after_reasoning(structured: Any, text_output: TextOutput | None, prompt_ids: torch.Tensor) -> Any:
     """``structured`` with ``after`` the model's ``reasoning_end`` when the prompt
     leaves the reasoning open, so a thinking turn reasons freely and then answers

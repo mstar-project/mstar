@@ -146,6 +146,7 @@ SNAPSHOT = {
         ["top_p_min_keep", "KEYWORD_ONLY", '1'],
         ["return_logprobs", "KEYWORD_ONLY", 'False'],
         ["logprobs_mode", "KEYWORD_ONLY", "'raw'"],
+        ["grammar", "KEYWORD_ONLY", 'None'],
     ],
     "SampleStep": [
         ["apply_penalty", "KEYWORD_ONLY", 'True'],
