@@ -1113,7 +1113,7 @@ def _wan_step(rank, world, grid, reuse=False):
     from mstar.engine.resources import RaggedAttentionConfig, StepRunner
     from mstar.engine.resources.base import build_resource
     from mstar.engine.state.adapters import node_handles, node_resources
-    from mstar.model.components.diffusion.step_cache import RESIDUAL, BlockCache
+    from mstar.model.components.diffusion.step_cache import RESIDUAL, BlockCache, CacheRow
     from mstar.model.submodule_base import NodeInputs, engine_step
     from mstar.model.wan22.components.dit import Wan22DiT
     from mstar.model.wan22.config import DIT_SHARD, Wan22Config
@@ -1160,7 +1160,8 @@ def _wan_step(rank, world, grid, reuse=False):
     steps = [(False, args), (True, later)] if reuse else [(None, args)]
 
     def predict(sub, step_args, decision, state, plan=lambda: None):
-        cache = None if decision is None else BlockCache(decision, [state], [False])
+        # the computing step is step 0, the reusing one step 1
+        cache = None if decision is None else BlockCache(decision, [CacheRow(state, step=int(decision))])
         step = plan()
         with torch.no_grad():
             out = sub._noise_prediction(*step_args, cache)

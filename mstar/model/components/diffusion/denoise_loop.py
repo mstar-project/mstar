@@ -53,9 +53,9 @@ Conventions the base fixes:
   and ``denoise`` reads the step's dtype off :attr:`step_dtype` while the hooks
   keep seeing the model's own key.
 * Step caching (``step_cache``, off by default) is the base's too: a step's key
-  then also says whether it reuses the cached residual (:class:`StepBucket`), so
-  rows batch only with rows making the same decision, and ``denoise`` gets the
-  step's :meth:`block_cache` to route its block stack through
+  then also says whether it skips its block stack (:class:`StepBucket`), so rows
+  batch only with rows making the same decision, and ``denoise`` gets the step's
+  :meth:`block_cache` to route its block stack through
   (``components/diffusion/step_cache.py``).
 """
 
@@ -204,6 +204,10 @@ class DenoiseLoopSubmodule(NodeSubmodule):
             raise ValueError(f"{type(self).__name__}: step_cache does not support captured buckets yet")
         self.step_cache = step_cache
         self._step_reuse = False
+        # each schedule's sigmas as host floats, for a step cache forecast spaced by them
+        self._step_sigmas = functools.lru_cache(_MEMO_ENTRIES)(
+            lambda *schedule_key: tuple(self._schedules(*schedule_key).sigmas.tolist())
+        )
 
     @property
     def loop_back_names(self) -> tuple[str, ...]:
@@ -562,20 +566,25 @@ class DenoiseLoopSubmodule(NodeSubmodule):
     def block_cache(self, engine_inputs: ModelInputsFromEngine) -> BlockCache | None:
         """The step's view of its rows' cached block residuals, for ``denoise`` to route its block stack through; None
         without a step cache. Call it from ``denoise``, where the step's decision is set."""
-        if self.step_cache is None:
+        policy = self.step_cache
+        if policy is None:
             return None
-        from mstar.model.components.diffusion.step_cache import BlockCache
+        from mstar.model.components.diffusion.step_cache import BlockCache, CacheRow
 
-        infos = [engine_inputs.per_request_info[rid] for rid in engine_inputs.request_ids]
-        final = [
-            self.step_index(info) + 1 >= self.schedule_of(info, self.bucket_key_for(info)).num_steps
-            for info in infos
-        ] if self.step_cache.records else [False] * len(infos)
-        return BlockCache(
-            reuse=self._step_reuse,
-            _states=[self.request_state(rid) for rid in engine_inputs.request_ids],
-            _final=final, _records=self.step_cache.records,
-        )
+        rows = []
+        for rid in engine_inputs.request_ids:
+            info = engine_inputs.per_request_info[rid]
+            bucket_key = self.bucket_key_for(info)
+            schedule_key = self._schedule_key(info, bucket_key)
+            num_steps, k = self._schedules(*schedule_key).num_steps, self.step_index(info)
+            # a forecast reads nothing kept before the row's last segment start
+            segments = self.step_cache_segments(info, bucket_key)
+            rows.append(CacheRow(
+                state=self.request_state(rid), step=k,
+                sigmas=self._step_sigmas(*schedule_key) if policy.forecast.time == "sigma" else None,
+                floor=max((s for s in segments if s <= k), default=0), final=k + 1 >= num_steps, num_steps=num_steps,
+            ))
+        return BlockCache(reuse=self._step_reuse, _rows=rows, _forecast=policy.forecast, _records=policy.records)
 
     def declare_step(
         self, graph_walk: str, request_ids: list[str], inputs: list[NodeInputs],

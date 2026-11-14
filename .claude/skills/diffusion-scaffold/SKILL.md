@@ -54,11 +54,12 @@ Every attention in the DiT should go through the read of an array with `max_len=
 
 ## Step caching
 
-`DenoiseLoopSubmodule(step_cache=...)` takes a `StepCachePolicy` (`components/diffusion/step_cache.py`; today MagCache) that says which steps skip the block stack and add back the residual of the last step that ran it. The decision joins the step key, so rows batch per decision, and the residuals are `request_state`, one per rank.
+`DenoiseLoopSubmodule(step_cache=...)` takes a `StepCachePolicy` (`components/diffusion/step_cache.py`) that says which steps skip the block stack (`MagCache`, `Interval`, or `ExplicitPlan` for a searched list) and what they add back in its place (`forecast`: the residual of the last step that ran it, its order-1/2 extrapolation, or weights fitted on dense runs). The decision joins the step key, so rows batch per decision, and the residuals are `request_state`, one per rank.
 
-- A model opts in by giving its transformer `cached_residual=` / `return_residual=` around the block loop (embed and head still run) and calling `self.block_cache(engine_inputs)` in `denoise`; `wan22` and `minimax_h3` are the references. Keep the residual row-leading and fp32.
-- The policy decides from host values only (the step index, the step count, a calibrated table), so it needs no sync and every CFG/SP rank agrees. A rule that reads a device value (TeaCache, DBCache) would need a reduce and a host read per step.
-- Calibrate per model (`{method: magcache_calibrate}` logs the table) and ship a quality table against dense: it is lossy. Captured buckets are refused for now (the residual has no fixed address).
+- A model opts in by giving its transformer `cached_residual=` / `return_residual=` around the block loop (embed and head still run) and calling `self.block_cache(engine_inputs)` in `denoise`; `wan22` and `minimax_h3` are the references. Keep the residual row-leading and fp32. The forecast is behind `block_cache.residual`, so a model needs nothing more for it.
+- A model that changes weights over the schedule returns those steps from `step_cache_segments`: they compute, and nothing kept before them is read after.
+- The policy decides from host values only (the step index, the step count and schedule, a calibrated table), so it needs no sync and every CFG/SP rank agrees. A rule that reads a device value (TeaCache, DBCache) would need a reduce and a host read per step.
+- Calibrate per model (`{method: magcache_calibrate}` logs MagCache's table; `benchmark/step_cache` scores a setting against dense and searches plans and their forecast weights) and ship a quality table against dense: it is lossy. Captured buckets are refused for now (the residual has no fixed address).
 
 ## Ending the loop
 

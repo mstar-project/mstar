@@ -1,5 +1,6 @@
-"""Opt-in step caching in the DiT scaffold (``components/diffusion/step_cache.py``): MagCache's skip schedule, the
-step key that carries the decision, and Wan2.2's block stack routed through it. CPU only, tiny random weights."""
+"""Opt-in step caching in the DiT scaffold (``components/diffusion/step_cache.py``): which steps skip (MagCache, an
+interval, a listed plan), what stands in for their blocks (reuse or a forecast), the step key that carries the
+decision, and Wan2.2's block stack routed through it. CPU only, tiny random weights."""
 
 from __future__ import annotations
 
@@ -10,11 +11,17 @@ from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.model.components.diffusion.denoise_loop import DenoiseLoopSubmodule, StepBucket
 from mstar.model.components.diffusion.step_cache import (
     RESIDUAL,
+    BlockCache,
+    CacheRow,
+    ExplicitPlan,
+    FittedWeights,
+    Forecast,
+    Interval,
     MagCache,
     MagCacheCalibration,
     step_cache_policy,
 )
-from mstar.model.submodule_base import InputMetadata, ModelInputsFromEngine
+from mstar.model.submodule_base import InputMetadata, ModelInputsFromEngine, PerRequestState
 from mstar.model.wan22.components.dit import Wan22DiT
 from mstar.model.wan22.config import MAG_RATIOS, WAN22_VARIANT_T2V_A14B, WAN22_VARIANT_TI2V_5B, Wan22Config
 from mstar.model.wan22.submodules import DENOISE_LOOP_NAME, Wan22DitSubmodule
@@ -66,6 +73,15 @@ def test_the_calibration_policy_computes_every_step():
     ({"method": "magcache", "threshold": 0.1}, MagCache(mag_ratios=(1.0, 0.9), threshold=0.1)),
     ({"mag_ratios": "other", "max_skip_steps": 3}, MagCache(mag_ratios=(1.0, 0.8), max_skip_steps=3)),
     ({"mag_ratios": [1.0, 0.7, 0.6]}, MagCache(mag_ratios=(1.0, 0.7, 0.6))),
+    ({"method": "interval", "every": 3, "forecast": 1}, Interval(every=3, forecast=Forecast(order=1))),
+    ({"method": "plan", "computed": [3, 0, 1], "num_steps": 6}, ExplicitPlan(computed=(0, 1, 3), num_steps=6)),
+    ({"method": "plan", "computed": [0, 2, 5], "num_steps": 6,
+      "forecast": {"order": 1, "fitted": {"num_steps": 6, "weights": [[4, [2, 0], [1.2, -0.1]], [3, [2], [0.9]]]}}},
+     ExplicitPlan(computed=(0, 2, 5), num_steps=6, forecast=Forecast(
+         order=1, fitted=FittedWeights(6, ((3, (2,), (0.9,)), (4, (2, 0), (1.2, -0.1)))),
+     ))),
+    ({"mag_ratios": [1.0, 0.9], "forecast": {"order": 2, "damping": 0.5, "time": "sigma"}},
+     MagCache(mag_ratios=(1.0, 0.9), forecast=Forecast(order=2, damping=0.5, time="sigma"))),
 ])
 def test_a_serving_config_names_its_policy(spec, expected):
     assert step_cache_policy(spec, {"default": (1.0, 0.9), "other": (1.0, 0.8)}) == expected
@@ -77,6 +93,17 @@ def test_a_serving_config_names_its_policy(spec, expected):
     ({"method": "magcache"}, "no calibrated"),
     ({"method": "magcache_calibrate", "threshold": 0.1}, "takes no options"),
     ({"mag_ratios": [1.0, 0.9], "threshold": -1}, "threshold"),
+    ({"method": "interval", "every": 0}, "every"),
+    ({"method": "interval", "threshold": 0.1}, "unknown interval options"),
+    ({"method": "plan", "computed": [0, 2]}, "num_steps"),
+    ({"method": "plan", "computed": [0, 9], "num_steps": 6}, "computed steps"),
+    ({"method": "interval", "forecast": 3}, "order"),
+    ({"method": "interval", "forecast": {"order": 1, "kind": "hermite"}}, "unknown forecast options"),
+    ({"method": "interval", "forecast": {"order": 1, "fitted": {"weights": []}}}, "num_steps"),
+    ({"method": "interval",
+      "forecast": {"order": 1, "fitted": {"num_steps": 6, "weights": [[4, [2, 1, 0], [1, 0, 0]]]}}}, "fitted entry"),
+    ({"method": "interval", "forecast": {"order": 1, "fitted": {"num_steps": 6, "weights": [[2, [3], [1.0]]]}}},
+     "fitted entry"),
 ])
 def test_a_bad_serving_config_is_refused(spec, fragment):
     with pytest.raises(ValueError, match=fragment):
@@ -386,3 +413,192 @@ def test_a_step_cache_with_a_distilled_sampler_is_refused():
     assert step_cache_policy({"method": "magcache"}, table).reuse_plan(3) == (False, True, False)
     with pytest.raises(ValueError, match="unipc sampler only"):
         Wan22Config(sampler="dmd", step_cache=_FLAT)
+
+
+# --------------------------------------------------------------------- which steps skip: an interval, a listed plan
+
+
+def test_an_interval_computes_one_step_in_every_past_the_retained_ones():
+    assert Interval(every=3, retention_ratio=0.2).reuse_plan(10) == (
+        False, False, True, True, False, True, True, False, True, False,
+    )
+    # a segment start computes and the count restarts there; every 1 computes all
+    assert Interval(every=3, retention_ratio=0.0).reuse_plan(8, (4,)) == (
+        False, True, True, False, False, True, True, False,
+    )
+    assert not any(Interval(every=1).reuse_plan(12))
+
+
+def test_a_listed_plan_computes_its_steps_and_always_the_ends_and_segment_starts():
+    plan = ExplicitPlan(computed=(0, 1, 4, 5), num_steps=8)
+    assert plan.reuse_plan(8) == (False, False, True, True, False, False, True, False)
+    assert plan.reuse_plan(8, (3,)) == (False, False, True, False, False, False, True, False)
+    # another step count takes the nearest listed step's decision
+    assert plan.reuse_plan(4) == (False, True, False, False)
+    assert ExplicitPlan(computed=(), num_steps=5).reuse_plan(5) == (False, True, True, True, False)
+
+
+# --------------------------------------------------------------------- what stands in for the blocks: a forecast
+
+
+def test_a_forecast_of_order_one_or_two_is_exact_on_a_line_at_any_spacing():
+    line = lambda t: 3.0 - 2.0 * t  # noqa: E731
+    for kept, now in [((5.0, 3.0), 6.0), ((5.0, 3.0), 8.0), ((0.4, 0.7, 0.9), 0.1), ((7.0, 6.0, 2.0), 9.0)]:
+        for order in (1, 2):
+            weights = Forecast(order=order).weights(kept, now)
+            assert len(weights) == min(order, len(kept) - 1) + 1
+            assert sum(w * line(t) for w, t in zip(weights, kept, strict=False)) == pytest.approx(line(now))
+
+
+def test_a_forecast_at_equal_spacing_is_taylorseers():
+    """Kept every N steps, d steps past the newest: F0 + (F0 - F1) d/N + (F0 - 2 F1 + F2) d^2 / (2 N^2)."""
+    n, d = 3.0, 2.0
+    assert Forecast(order=1).weights((6.0, 3.0), 8.0) == pytest.approx((1 + d / n, -d / n))
+    assert Forecast(order=2).weights((6.0, 3.0, 0.0), 8.0) == pytest.approx(
+        (1 + d / n + d * d / (2 * n * n), -d / n - d * d / (n * n), d * d / (2 * n * n))
+    )
+
+
+def test_a_forecast_uses_the_order_it_has_values_for_and_damping_scales_the_step():
+    assert Forecast(order=2).weights((4.0,), 6.0) == (1.0,)
+    assert Forecast(order=2).weights((4.0, 2.0), 6.0) == Forecast(order=1).weights((4.0, 2.0), 6.0)
+    assert Forecast(order=0).weights((4.0, 2.0), 6.0) == (1.0,)
+    assert Forecast(order=1, damping=0.0).weights((4.0, 2.0), 6.0) == pytest.approx((1.0, 0.0))
+    assert Forecast(order=1, damping=0.5).weights((4.0, 2.0), 6.0) == pytest.approx((1.5, -0.5))
+
+
+def test_a_block_cache_predicts_each_row_from_its_own_kept_steps():
+    """Two rows at different steps of different histories share a reusing step; each gets its own extrapolation."""
+    forecast = Forecast(order=1)
+    a, b = PerRequestState(), PerRequestState()
+    for step, value in [(0, 1.0), (2, 2.0)]:
+        BlockCache(False, [CacheRow(a, step)], forecast).keep(torch.full((1, 3), value))
+    for step, value in [(4, 10.0), (5, 20.0)]:
+        BlockCache(False, [CacheRow(b, step)], forecast).keep(torch.full((1, 3), value))
+    cache = BlockCache(True, [CacheRow(a, 3), CacheRow(b, 7)], forecast)
+    assert cache.residual.shape == (2, 3)
+    # a: 2 + (2 - 1) / 2 * 1; b: 20 + (20 - 10) / 1 * 2
+    assert torch.equal(cache.residual, torch.tensor([[2.5] * 3, [40.0] * 3]))
+    # order 0 hands back the kept tensor itself, and predicting changes nothing kept
+    assert torch.equal(BlockCache(True, [CacheRow(a, 3)]).residual[0], torch.full((3,), 2.0))
+    assert torch.equal(a.tensors[RESIDUAL], torch.full((3,), 2.0)) and a.kwargs[RESIDUAL + "_steps"] == [2, 0]
+    # a subset of the rows (another expert's) reads only its own
+    assert torch.equal(cache.rows([1]).residual, torch.full((1, 3), 40.0))
+
+
+def test_a_forecast_spaced_by_sigma_reads_the_rows_schedule():
+    forecast = Forecast(order=1, time="sigma")
+    state, sigmas = PerRequestState(), (1.0, 0.9, 0.5, 0.4)
+    for step, value in [(0, 0.0), (1, 1.0)]:
+        BlockCache(False, [CacheRow(state, step, sigmas)], forecast).keep(torch.full((1, 2), value))
+    predicted = BlockCache(True, [CacheRow(state, 2, sigmas)], forecast).residual
+    # 1 + (1 - 0) / (0.9 - 1.0) * (0.5 - 0.9) = 5; by step index it would be 2
+    torch.testing.assert_close(predicted, torch.full((1, 2), 5.0))
+
+
+def test_a_fitted_forecast_takes_its_tables_weights_where_the_table_has_the_step():
+    """The table is for one step count and names the kept steps each entry was fitted for; anywhere else the
+    forecast's own expansion applies."""
+    fitted = FittedWeights(8, ((3, (2, 0), (1.5, -0.25)), (5, (4,), (0.5,))))
+    forecast = Forecast(order=1, fitted=fitted)
+    assert forecast.fitted_weights(8, 3, (2, 0)) == (1.5, -0.25) and forecast.fitted_weights(8, 5, (4,)) == (0.5,)
+    assert forecast.fitted_weights(6, 3, (2, 0)) is None and forecast.fitted_weights(8, 3, (2, 1)) is None
+    assert Forecast(order=1).fitted_weights(8, 3, (2, 0)) is None
+    assert forecast == Forecast(order=1, fitted=fitted) and hash(forecast) == hash(Forecast(order=1, fitted=fitted))
+    assert forecast != Forecast(order=1)
+
+    def predicted(step: int, num_steps: int, kept: list[tuple[int, float]]) -> torch.Tensor:
+        state = PerRequestState()
+        for at, value in kept:
+            BlockCache(False, [CacheRow(state, at, num_steps=num_steps)], forecast).keep(torch.full((1, 2), value))
+        out = BlockCache(True, [CacheRow(state, step, num_steps=num_steps)], forecast).residual
+        # predicting leaves what was kept as it was
+        assert torch.equal(state.tensors[RESIDUAL], torch.full((2,), kept[-1][1]))
+        return out
+
+    # the table's weights: 1.5 * 4 - 0.25 * 8
+    assert torch.equal(predicted(3, 8, [(0, 8.0), (2, 4.0)]), torch.full((1, 2), 4.0))
+    # another step count, or other kept steps: the line through the two kept values, 4 + (4 - 8) / 2
+    assert torch.equal(predicted(3, 6, [(0, 8.0), (2, 4.0)]), torch.full((1, 2), 2.0))
+    assert torch.equal(predicted(3, 8, [(1, 8.0), (2, 4.0)]), torch.full((1, 2), 0.0))
+    # one kept value and a fitted gain on it
+    assert torch.equal(predicted(5, 8, [(4, 6.0)]), torch.full((1, 2), 3.0))
+
+
+def test_nothing_kept_before_a_segment_start_is_read_or_left_allocated():
+    forecast = Forecast(order=2)
+    state = PerRequestState()
+    for step in (0, 1, 2):
+        BlockCache(False, [CacheRow(state, step)], forecast).keep(torch.full((1, 2), float(step)))
+    assert sorted(state.tensors) == [RESIDUAL, RESIDUAL + "_1", RESIDUAL + "_2"]
+    # step 5 starts a segment (another expert's first step): its residual is the only one a later step reads
+    BlockCache(False, [CacheRow(state, 5, floor=5)], forecast).keep(torch.full((1, 2), 9.0))
+    assert sorted(state.tensors) == [RESIDUAL] and state.kwargs[RESIDUAL + "_steps"] == [5]
+    assert torch.equal(BlockCache(True, [CacheRow(state, 6, floor=5)], forecast).residual, torch.full((1, 2), 9.0))
+    with pytest.raises(RuntimeError, match="must compute"):
+        _ = BlockCache(True, [CacheRow(state, 9, floor=8)], forecast).residual
+
+
+# --------------------------------------------------------------------- a forecast through Wan2.2
+
+
+@pytest.mark.parametrize("spec", [
+    {"method": "interval", "every": 1, "forecast": 2},
+    {"method": "plan", "computed": list(range(_STEPS)), "num_steps": _STEPS,
+     "forecast": {"order": 2, "time": "sigma", "fitted": {"num_steps": _STEPS, "weights": [[3, [2, 1], [1.5, -0.5]]]}}},
+])
+def test_a_policy_with_nothing_to_skip_is_bit_identical_to_no_cache(spec):
+    """A forecast is idle until a step skips: the compute path keeps what later steps would read and changes no
+    output."""
+    sub = _submodule(spec)
+    assert not any(sub.step_cache.reuse_plan(_STEPS))
+    for a, b in zip(_run_loop(_submodule()), _run_loop(sub), strict=True):
+        assert torch.equal(a["r0"], b["r0"])
+
+
+@pytest.mark.parametrize("spec", [
+    {"method": "interval", "every": 3, "retention_ratio": 0.0, "forecast": 2},
+    # step 2 takes the fitted weights, step 4 the sigma-spaced line
+    {"method": "plan", "computed": [0, 1, 3, 5], "num_steps": _STEPS,
+     "forecast": {"order": 1, "time": "sigma", "fitted": {"num_steps": _STEPS, "weights": [[2, [1, 0], [1.5, -0.4]]]}}},
+])
+def test_rows_of_a_batch_are_independent_under_a_forecast(spec):
+    """Two requests in one forward each get back what they get alone: a forecast reads the row's own kept residuals
+    and schedule."""
+    batched = _run_loop(_submodule(spec), rids=("a", "b"))
+    for rid in ("a", "b"):
+        alone = _run_loop(_submodule(spec), rids=(rid,))
+        for x, y in zip(batched, alone, strict=True):
+            torch.testing.assert_close(x[rid], y[rid], rtol=1e-4, atol=1e-4)
+
+
+def test_a_forecast_changes_what_a_skipping_step_adds_once_two_steps_are_kept():
+    every3 = {"method": "interval", "every": 3, "retention_ratio": 0.0}
+    reuse, forecast = _run_loop(_submodule(every3)), _run_loop(_submodule({**every3, "forecast": 1}))
+    # steps 1 and 2 skip on one kept residual, so both add it; step 3 computes; step 4 extrapolates steps 0 and 3
+    for k in range(4):
+        assert torch.equal(reuse[k]["r0"], forecast[k]["r0"])
+    assert not torch.equal(reuse[4]["r0"], forecast[4]["r0"])
+    # weights fitted for step 4 from steps 3 and 0 take the line's place there: all on step 3 is a reuse again
+    fitted = {"order": 1, "fitted": {"num_steps": _STEPS, "weights": [[4, [3, 0], [1.0, 0.0]]]}}
+    for a, b in zip(reuse, _run_loop(_submodule({**every3, "forecast": fitted})), strict=True):
+        assert torch.equal(a["r0"], b["r0"])
+
+
+def test_a14b_forecasts_nothing_from_before_the_low_noise_experts_first_step():
+    """The low-noise expert's first step computes, and its skipping steps read nothing the high-noise expert kept."""
+    sub, high, low = _a14b({"method": "interval", "every": 2, "retention_ratio": 0.0, "forecast": 2})
+    key = sub.bucket_key_for(_a14b_info(0))
+    first_low = sub.step_cache_segments(_a14b_info(0), key)[0]
+    plan = sub.step_cache.reuse_plan(_A14B_STEPS, (first_low,))
+    assert not plan[first_low] and any(plan[first_low:])
+    carried, state = {}, sub.request_state("r0")
+    for k in range(_A14B_STEPS):
+        out = _a14b_step(sub, {"r0": k}, {"r0": carried})["r0"]
+        carried = {name: out[name] for name in sub.loop_back_names}
+        if k >= first_low:
+            assert min(state.kwargs[RESIDUAL + "_steps"]) >= first_low
+        if k == first_low:
+            assert sorted(state.tensors) == [RESIDUAL]
+    assert high.calls == plan[:first_low].count(False)
+    assert low.calls == plan[first_low:].count(False)
