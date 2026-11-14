@@ -636,14 +636,19 @@ class WithinStepSteps(StepBuilder):
         if isinstance(read.mask, ExpertSelf):
             if not isinstance(lengths, (list, tuple)) or len(lengths) != 1:
                 raise ValueError(f"Array {array.name!r}: invalid expert self lengths")
-            layout = ExpertSelfLayout(lengths[0])
+            layout = ExpertSelfLayout(num_chunks=lengths[0])
             result = (layout.num_chunks, 0, 0, layout.num_chunks * read.mask.chunk_len)
             span = layout.num_chunks * (1 + read.mask.future_per_chunk + read.mask.chunk_len)
         else:
             if not isinstance(lengths, (list, tuple)) or len(lengths) != 4:
                 raise ValueError(f"Array {array.name!r}: invalid expert cross lengths")
-            layout = ExpertCrossLayout(*lengths)
-            _check_expert_layout(array, segment.label, Layout(expert_cross={next(iter(array.reads)): layout}))
+            layout = ExpertCrossLayout(
+                num_chunks=lengths[0], global_len=lengths[1],
+                clean_frames=lengths[2], noised_frames=lengths[3],
+            )
+            _check_expert_layout(
+                array, segment.label, Layout(expert_cross={next(iter(array.reads)): layout}), require_all=False,
+            )
             result = (layout.num_chunks, layout.global_len, layout.clean_frames, layout.noised_frames)
             span = layout.global_len + (layout.clean_frames + layout.noised_frames) * read.mask.tokens_per_frame
         if span != segment.span:
@@ -732,7 +737,7 @@ def expert_layouts(
     return rows
 
 
-def _check_expert_layout(array: Array, label: str, layout: Layout) -> None:
+def _check_expert_layout(array: Array, label: str, layout: Layout, *, require_all: bool = True) -> None:
     from mstar.engine.resources.attn.ragged.expert_mask import noised_frame_offset
 
     if not isinstance(layout, Layout):
@@ -756,6 +761,13 @@ def _check_expert_layout(array: Array, label: str, layout: Layout) -> None:
                     noised_frame_offset(lengths.noised_frames, lengths.clean_frames, mask.chunk_len)
                 except ValueError as exc:
                     raise RuntimeError(f"{where}: {exc}") from exc
+    if require_all:
+        for field, kind in (("expert_cross", ExpertCross), ("expert_self", ExpertSelf)):
+            required = {key for key, read in array.reads.items() if isinstance(read.mask, kind)}
+            if missing := required - getattr(layout, field).keys():
+                raise RuntimeError(
+                    f"state_layout[{array.name!r}][{label!r}].{field} is missing reads {sorted(missing)}"
+                )
 
 
 def kv_layouts(

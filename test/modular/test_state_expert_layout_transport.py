@@ -25,12 +25,13 @@ def _arrays() -> list[Array]:
     return [
         Array(
             "expert_queries", nodes={"expert"}, layers={0}, entry=KVEntry(heads=2, head_dim=32),
-            max_len=0, reads={"self_attn": Read(mask=ExpertSelf(2, 1), op=Attend(q_heads=2))},
+            max_len=0, reads={"self_attn": Read(mask=ExpertSelf(2, future_per_chunk=1), op=Attend(q_heads=2))},
         ),
         Array(
             "trunk_keys", nodes={"expert"}, layers={0}, entry=KVEntry(heads=2, head_dim=32),
             max_len=0, reads={"cross_attn": Read(
-                mask=ExpertCross(2, 1, 1, 2), op=Attend(q_heads=2), queries="expert_queries",
+                mask=ExpertCross(2, future_per_chunk=1, tokens_per_frame=1, window_frames=2),
+                op=Attend(q_heads=2), queries="expert_queries",
             )},
         ),
     ]
@@ -38,9 +39,9 @@ def _arrays() -> list[Array]:
 
 def _layouts() -> dict:
     return {
-        "expert_queries": {"main": Layout(expert_self={"self_attn": ExpertSelfLayout(2)})},
+        "expert_queries": {"main": Layout(expert_self={"self_attn": ExpertSelfLayout(num_chunks=2)})},
         "trunk_keys": {"main": Layout(expert_cross={
-            "cross_attn": ExpertCrossLayout(2, 2, 2, 4),
+            "cross_attn": ExpertCrossLayout(num_chunks=2, global_len=2, clean_frames=2, noised_frames=4),
         })},
     }
 
@@ -59,8 +60,8 @@ def test_expert_layout_transport_is_read_keyed_and_small() -> None:
 
 
 @pytest.mark.parametrize("bad,pattern", [
-    (ExpertCrossLayout(2, 2, 2, 2), "noised frames"),
-    (ExpertCrossLayout(2, 2, 1, 4), "unsupported expert frame layout"),
+    (ExpertCrossLayout(num_chunks=2, global_len=2, clean_frames=2, noised_frames=2), "noised frames"),
+    (ExpertCrossLayout(num_chunks=2, global_len=2, clean_frames=1, noised_frames=4), "unsupported expert frame layout"),
 ])
 def test_bad_cross_geometry_fails_before_transport(bad, pattern) -> None:
     layouts = _layouts()
@@ -71,9 +72,22 @@ def test_bad_cross_geometry_fails_before_transport(bad, pattern) -> None:
 
 def test_wrong_read_key_or_kind_fails_before_transport() -> None:
     layouts = _layouts()
-    layouts["trunk_keys"]["main"] = Layout(expert_cross={"other": ExpertCrossLayout(2, 2, 2, 4)})
+    layouts["trunk_keys"]["main"] = Layout(expert_cross={
+        "other": ExpertCrossLayout(num_chunks=2, global_len=2, clean_frames=2, noised_frames=4),
+    })
     with pytest.raises(RuntimeError, match="names no ExpertCross read"):
         expert_layouts(_arrays(), layouts)
-    layouts["trunk_keys"]["main"] = Layout(expert_self={"cross_attn": ExpertSelfLayout(2)})
+    layouts["trunk_keys"]["main"] = Layout(expert_self={"cross_attn": ExpertSelfLayout(num_chunks=2)})
     with pytest.raises(RuntimeError, match="names no ExpertSelf read"):
+        expert_layouts(_arrays(), layouts)
+
+
+@pytest.mark.parametrize("array_name,field,read", [
+    ("expert_queries", "expert_self", "self_attn"),
+    ("trunk_keys", "expert_cross", "cross_attn"),
+])
+def test_missing_expert_layout_fails_before_transport(array_name, field, read) -> None:
+    layouts = _layouts()
+    layouts[array_name]["main"] = Layout()
+    with pytest.raises(RuntimeError, match=f"{field} is missing reads \\['{read}'\\]"):
         expert_layouts(_arrays(), layouts)
