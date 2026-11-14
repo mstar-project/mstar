@@ -485,8 +485,10 @@ def test_call_budget_refuses_after_the_first_admitted_call(tmp_path, monkeypatch
 def test_call_budget_closes_later_calls_in_the_waiting_batch(tmp_path, monkeypatch):
     conductor, _, comm = _conductor(tmp_path, monkeypatch, max_calls=1, max_queued_calls=2)
     conductor._ingest_request(_request("first", "robot-a"))
+    conductor._status_interval_s = 1.0
     conductor._ingest_request(_request("second", "robot-a"))
     conductor._ingest_request(_request("third", "robot-a"))
+    assert set(conductor._queued_since) == {"second", "third"}
 
     _complete(conductor, "first", {"frames": 4})
     failures = {
@@ -496,6 +498,7 @@ def test_call_budget_closes_later_calls_in_the_waiting_batch(tmp_path, monkeypat
     assert failures["second"].status == 400
     assert failures["third"].status == 410
     assert conductor.waiting_queue == []
+    assert conductor._queued_since == {}
 
 
 def test_only_one_overlapping_call_is_queued_for_an_episode(tmp_path, monkeypatch):
