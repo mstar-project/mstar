@@ -97,6 +97,21 @@ class Block(Mask):
     """Sees the entries of q's own segment in this step, on an array with ``max_len`` 0."""
 
 
+@dataclass(frozen=True, kw_only=True)
+class Retained(Mask):
+    """Sees, as of the step's start, the first ``sink`` and the last ``window`` entries of the row's log, and every
+    entry the step adds; with ``source_in_sink`` or ``source_in_window`` its source's length (`Source`) adds to that
+    count. So a row keeps at most that many entries between steps, and its log may outgrow them. With
+    ``reverse_steps`` a step's entries join the log last-first, for an op that reads entries as a set, where it decides
+    which of a step's entries the window drops first."""
+
+    sink: int = 0
+    window: int = 0
+    source_in_sink: bool = False
+    source_in_window: bool = False
+    reverse_steps: bool = False
+
+
 @dataclass(frozen=True)
 class BlockPrefix(Block):
     """Sees the first entries of q's own segment in this step, as many as the step gives that segment
@@ -122,20 +137,28 @@ class Op:
 
 @dataclass(frozen=True)
 class Attend(Op):
+    """Attention over an entry's k and v, (h, d). With a leading rows axis, (rows, h, d), each of an entry's rows
+    attends alike, its own keys under its own query row (a guidance pair), a request's rows then consecutive rows of
+    the read's queries."""
+
     reads = ("k", "v")
     q_heads: int    # a multiple of the heads of the entry's k and v
+    _: KW_ONLY
+    # the read takes ``distance_bias``, a score term per query and key distance (a relative-position term)
+    distance_bias: bool = False
 
     def check(self, where: str, entry: Entry) -> None:
         if not _is_positive(self.q_heads):
             raise ValueError(f"{where}.q_heads must be a positive int, got {self.q_heads!r}")
         k, v = entry.tensors["k"], entry.tensors["v"]
-        if len(k.shape) != 2 or len(v.shape) != 2 or k.shape[0] != v.shape[0]:
-            raise ValueError(f"{where}: Attend needs entry fields k (h, d_k) and v (h, d_v)")
-        if k.dtype != v.dtype or k.shard != v.shard or k.shard not in (0, None):
-            raise ValueError(f"{where}: Attend needs k and v of one dtype and one shard, 0 or None; "
+        if len(k.shape) not in (2, 3) or len(v.shape) != len(k.shape) or k.shape[:-1] != v.shape[:-1]:
+            raise ValueError(f"{where}: Attend needs entry fields k (h, d_k) and v (h, d_v), or both with a leading "
+                             f"rows axis (rows, h, d)")
+        if k.dtype != v.dtype or k.shard != v.shard or k.shard not in (len(k.shape) - 2, None):
+            raise ValueError(f"{where}: Attend needs k and v of one dtype and one shard, their heads or None; "
                              f"got {k.dtype}, {v.dtype} and {k.shard}, {v.shard}")
-        if self.q_heads % k.shape[0]:
-            raise ValueError(f"{where}: q_heads {self.q_heads} is not a multiple of k's {k.shape[0]} heads")
+        if self.q_heads % k.shape[-2]:
+            raise ValueError(f"{where}: q_heads {self.q_heads} is not a multiple of k's {k.shape[-2]} heads")
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -206,6 +229,16 @@ class Rope:
 
 
 @dataclass(frozen=True, kw_only=True)
+class Source:
+    """Each row's log starts with ``min_len`` to ``max_len`` entries it never adds: a read-only prefix that every row
+    naming it shares (a voice prompt's entries), which the node hands its handle once (``set_sources``) and each step
+    names per row (``ArrayStep.sources``)."""
+
+    min_len: int = 0
+    max_len: int
+
+
+@dataclass(frozen=True, kw_only=True)
 class Positions:
     """Each row's position on the array, which the model rotates or embeds its next tokens at. It reads no entries,
     and it lives on the host and moves when a step is planned: by the row's span, by ``ArrayStep.advance`` or by
@@ -236,6 +269,7 @@ class Array:
     rewritable: bool = False
     labels: frozenset[str] = frozenset({"main"})
     positions: Positions | None = None
+    source: Source | None = None
 
     def __post_init__(self):
         object.__setattr__(self, "nodes", frozenset(self.nodes))
@@ -255,6 +289,12 @@ class Array:
         if not (type(self.max_len) is int and self.max_len >= 0):
             raise ValueError(f"{where}.max_len must be an int >= 0, got {self.max_len!r}")
         self._check_entry()
+        source = self.source
+        if source is not None and not (
+            type(source.min_len) is int and type(source.max_len) is int and 0 <= source.min_len <= source.max_len
+        ):
+            raise ValueError(f"{where}.source: min_len and max_len must be ints with 0 <= min_len <= max_len, got "
+                             f"{source!r}")
         for key, read in self.reads.items():
             self._check_read(key, read)
         for key, update in self.updates.items():
@@ -289,6 +329,15 @@ class Array:
             raise ValueError(f"{where}.layers has {sorted(read.layers - self.layers)}, outside the array's layers")
         if isinstance(read.mask, Window) and not _is_positive(read.mask.size):
             raise ValueError(f"{where}.mask.size must be a positive int, got {read.mask.size!r}")
+        if isinstance(read.mask, Retained):
+            mask = read.mask
+            if not all(type(n) is int and n >= 0 for n in (mask.sink, mask.window)) or not (
+                mask.sink or mask.window or mask.source_in_sink or mask.source_in_window
+            ):
+                raise ValueError(f"{where}.mask: Retained's sink and window must be ints >= 0 that keep something, got "
+                                 f"{mask!r}")
+            if (mask.source_in_sink or mask.source_in_window) and self.source is None:
+                raise ValueError(f"{where}.mask counts the source's length, and the array declares no source")
         if read.queries is not None and type(read.mask) is not Block:
             raise ValueError(f"{where}.queries: a read of another array's queries takes a mask that uses no query "
                              f"position, and {type(read.mask).__name__} does")
@@ -431,6 +480,7 @@ class ArrayStep:
     position_ids: torch.Tensor | None = None       # explicit ids, (tokens,) in segment order
     host: Mapping[tuple[int, str, int], Mapping[str, object]] = EMPTY    # (row, label, layer) -> fields, at commit
     prefix_lens: tuple[int, ...] | None = None     # per segment, the entries a BlockPrefix read sees
+    sources: Mapping[int, int] = EMPTY             # row -> the index of its source (`Array.source`)
 
 
 @dataclass(frozen=True, kw_only=True)

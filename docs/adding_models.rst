@@ -719,7 +719,10 @@ deployment YAML tunes them under ``resources:`` (see :ref:`Step 6 <config-yaml>`
   the one read declared for its layer and walk, and loading refuses two reads over one
   layer and walk. ``Causal()`` sees every entry up to the query's own, ``Window(size)`` the
   last ``size`` of them, its own included. ``Attend(q_heads=)`` is attention with the model's
-  query heads, a multiple of the entry's heads.
+  query heads, a multiple of the entry's heads. An entry of k and v with a leading rows axis,
+  ``(rows, heads, head_dim)``, holds a request's rows apart (a guidance pair): each attends its
+  own keys under its own query row, a request's rows consecutive rows of the queries. Today
+  only a ``Retained`` read takes one.
 - ``Value(name, nodes=, layers=, entry=, updates=)``: a rewritable array of one entry, such
   as a recurrent state. ``updates`` names the kernels that read and write one of its fields
   in place: ``CausalConv()`` needs a field ``conv`` of shape ``(channels, kernel - 1)``, and
@@ -730,6 +733,25 @@ deployment YAML tunes them under ``resources:`` (see :ref:`Step 6 <config-yaml>`
   segment, as many as ``ArrayStep(prefix_lens=)`` gives it: a key padding mask, whose entries
   past the prefix still query (Step-Audio2's Whisper tower, whose clips pad to a request's
   longest). It takes no ``queries`` and no ``segmented`` rows, and SDPA doesn't run it.
+- ``Retained(sink=, window=, source_in_sink=, source_in_window=, reverse_steps=)``: a read that
+  sees, as of its step's start, the first ``sink`` and the last ``window`` entries of its row's
+  log, and every entry its step adds; ``source_in_sink`` and ``source_in_window`` add the
+  source's length to either. A row keeps at most that many between steps, and its log may
+  outgrow them (a streaming vocoder's attention sinks and window). ``reverse_steps`` joins a
+  step's entries to the log last-first, for an op that reads them as a set. The read takes rows
+  of one length (``packed=False``), ``(rows, len, heads, head_dim)``: a row adds its segment's
+  span of entries first, and the rest of its row attends as the step's own but isn't kept (a
+  window's lookahead). Its ``Attend`` takes as many query heads as the entry has, an entry with
+  a rows axis runs as rows of a request (token2wav's DiT keeps its guidance pair so), and with
+  ``distance_bias=True`` the read takes a score term per query and key distance (a
+  relative-position term). ``retained(h)`` gives each row's entries its read sees before its
+  step's, on the device. It runs on today's ``BoundedKVSpec``, whose slots ``kernel_settings``
+  sizes (``max_slots``); token2wav's three caches are the example.
+- ``Source(min_len=, max_len=)``, an array's ``source=``: each row's log starts with entries it
+  never adds, a read-only prefix every row naming it shares (a voice prompt's caches). The node
+  hands them over once, before its first step, with ``h.set_sources({"k": ..., "v": ...},
+  lengths)``, each field ``[sources, layers, len, *entry shape]``, and each step names a row's
+  source with ``ArrayStep(sources={row: index})``. Today only a ``Retained`` read reads one.
 - ``Positions(rope=)``: a position counter per request and label, on an append-only array
   that keeps entries. ``rope=None`` is a counter only. ``Rope`` carries ``theta``,
   ``rotary_dim``, ``interleave``, ``scale``, the Llama 3.1 factors (all three or none), the
@@ -2239,13 +2261,14 @@ step does to each array and sampler it touches. The engine expands ``state`` int
   plan and a sequence shard read the same grouping; positions take their packing from the
   KV plan, and ``PositionStep`` keys its ``pos_ids`` by the combined label.
 - ``ArrayStep(segments=, keep=, forks=, placeholders=, eager_add=, fixed_layout=, advance=, position_ids=,
-  prefix_lens=)``.
+  prefix_lens=, sources=)``.
   A step lists every array it touches, and a call on one it doesn't list raises. ``segments``
   gives one array its own spans, ``None`` being the step's. ``keep=False`` makes every add
   this step scratch. ``advance`` moves each row's position counter by something other than
   its span, for a prompt whose grid covers fewer positions than tokens, and ``position_ids``
   passes explicit ids. ``prefix_lens`` gives each segment the entries a ``BlockPrefix`` read
-  sees, one per segment, above 0 and within its span.
+  sees, one per segment, above 0 and within its span. ``sources`` names each row's source on an
+  array that declares one (``Source``).
 - ``SampleStep(apply_penalty=, apply_filters=, prompt_tokens=, kept_rows=)``.
   ``prompt_tokens`` initializes the repetition-penalty mask with the prompt tokens. Only the
   prefill step passes them, because the sampler tracks every token it samples afterwards.
@@ -2394,6 +2417,7 @@ The rest are free functions in ``mstar.engine.state``:
    q, k = rope(self.kv, q, k)                 # rotate at this step's ids with the declared Rope
    tokens = sample(self.sampler, logits)      # one token per row, each a fresh draw
    last = at_last_token(self.kv, hidden)      # each row's last token in this step
+   n    = retained(self.cache)                # each row's entries a Retained read sees before its step's
    ids  = last_sampled(self.sampler)          # each row's last sampled token, for a DeviceLoopback
    x, cos, sin = scatter(self.shard, x, cos, sin)  # this rank's share where the step splits, else as they are
    hidden = gather(self.shard, hidden)        # every rank's share, back whole

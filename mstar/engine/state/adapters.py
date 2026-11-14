@@ -22,6 +22,7 @@ from mstar.engine.resources.attn.ragged.config import (
     RaggedKeyPrefixAttentionSpec,
     cross_label,
 )
+from mstar.engine.resources.kv.bounded.config import BoundedKVConfig, BoundedKVSpec, BoundedKVStep, SinkWindow
 from mstar.engine.resources.kv.config import KVLayout, KVSpec, KVStep, PagedKVConfig
 from mstar.engine.resources.linear_attn.config import (
     LinearAttnConfig,
@@ -61,10 +62,12 @@ from mstar.engine.state.contract import (
     Positions,
     Reached,
     Read,
+    Retained,
     Sampler,
     SampleSettings,
     SampleStep,
     SeqShard,
+    Source,
     TensorType,
     Window,
     is_value,
@@ -201,6 +204,15 @@ def _kv_shape(array: Array) -> tuple[int, ...]:
         raise _no_layout(array, "entry must be a KVEntry, all PagedKVConfig holds: k and v of one shape, sharded on "
                                 "their heads, with no dtype")
     return k.shape
+
+
+def _bounded_kv_shape(array: Array) -> tuple[int, int, int]:
+    """``array``'s (rows, heads, head_dim): a request's rows, one when the entry has no rows axis."""
+    k = array.entry.tensors.get("k")
+    if k is None or len(k.shape) not in (2, 3) or k.shard is not None or array.entry != Entry({"k": k, "v": k}):
+        raise _no_layout(array, "entry must be k and v of one shape, (heads, head_dim) or (rows, heads, head_dim), "
+                                "unsharded, which may declare one dtype, all BoundedKVConfig holds")
+    return (1, *k.shape) if len(k.shape) == 2 else k.shape
 
 
 def _within_step_read(array: Array, setup: "StateSetup") -> tuple["BoundOp", int, int, torch.dtype | None]:
@@ -579,6 +591,7 @@ class PagedAttend(OpBinding):
     def check(self, array: Array, key: str, read: Read) -> None:
         if not isinstance(read.mask, Causal | Window):
             raise _no_layout(array, f"reads[{key!r}].mask must be Causal or Window, the masks AttentionConfig has")
+        _no_distance_bias(array, key, read)
         if read.walks is not None:
             raise _no_layout(array, f"reads[{key!r}].walks must be None, since AttentionConfig has no walk")
 
@@ -627,6 +640,36 @@ class PositionsBinding(OpBinding):
         handle.positions, handle.rope_dtype = run, None if rope is None else rope.dtype
 
 
+def _no_distance_bias(array: Array, key: str, read: Read) -> None:
+    if read.op.distance_bias:
+        raise _no_layout(array, f"reads[{key!r}].op takes a distance_bias, which only a Retained read runs")
+
+
+class BoundedAttend(OpBinding):
+    """`Attend` over a `Retained` read: the bounded KV resource's attention over each row's source, its kept entries
+    and its step's, which also keeps the step's entries. The array's one read runs on the array's own resource."""
+
+    def check(self, array: Array, key: str, read: Read) -> None:
+        if len(array.reads) != 1:
+            raise _no_layout(array, f"a Retained array takes one read, the bounded resource's attention, and it has "
+                                    f"{sorted(array.reads)}")
+        if not isinstance(read.mask, Retained):
+            raise _no_layout(array, f"reads[{key!r}].mask must be Retained, as the array's other reads are")
+        if read.walks is not None or read.layers is not None or read.queries is not None or read.packed:
+            raise _no_layout(array, f"reads[{key!r}] takes rows of one length (packed=False), every walk and layer, "
+                                    "and its own queries, all a bounded resource's attention holds")
+        heads = array.entry.tensors["k"].shape[-2]
+        if read.op.q_heads != heads:
+            raise _no_layout(array, f"reads[{key!r}].op.q_heads is {read.op.q_heads}, and the bounded kernel takes "
+                                    f"the entry's {heads} heads")
+
+    def resource(self, array: Array, key: str) -> str:
+        return array.name
+
+    def attach(self, handle: "BoundedArrayHandle", key: str, run: Any) -> None:
+        handle.reads[key] = run
+
+
 class WithinStepAttend(OpBinding, ABC):
     """`Attend` within a step, over the step's own adds."""
 
@@ -638,6 +681,7 @@ class WithinStepAttend(OpBinding, ABC):
     def check(self, array: Array, key: str, read: Read) -> None:
         if not isinstance(read.mask, Block):
             raise _no_layout(array, f"reads[{key!r}].mask must be Block, the only mask a read within a step takes")
+        _no_distance_bias(array, key, read)
         if read.walks is not None:
             raise _no_layout(array, f"reads[{key!r}].walks must be None, since a read within a step has no walk")
 
@@ -1103,6 +1147,104 @@ class HostValueHandle(ArrayHandle):
         return fields
 
 
+class BoundedArrayHandle(ArrayHandle):
+    """Adds and reads on an array whose read is `Retained`, through a bounded KV resource: a slot per request holding
+    the kept entries past its source, and the sources the node hands over (``set_sources``). Rows are of one length,
+    ``(rows, len, heads, head_dim)``, a request's entry rows consecutive ones: a row adds its segment's span of entries
+    first, and the rest of its row attends as the step's own but isn't kept (a window's lookahead)."""
+
+    def __init__(
+        self, array: Array, resources: Mapping[str, Any], bindings: tuple[BoundOp, ...], resolved: "Resolved",
+    ):
+        super().__init__(array, resources)
+        self._bindings = bindings
+        self._kv = resources[array.name]
+        self.reads = {}
+        for bound in bindings:
+            bound.binding.attach(self, bound.key, bound.binding.bind(array, array.name, resources))
+        # the sources in the resource's layout, [sources, layers, rows, heads, max_len, 2 head_dim]; their lengths
+        self._sources: torch.Tensor | None = None
+        self.source_lengths: tuple[int, ...] = ()
+        self._stepped = False
+
+    def set_sources(self, fields: Mapping[str, torch.Tensor], lengths: Sequence[int]) -> None:
+        if self._stepped:
+            raise self._refusal("set_sources after the handle's first step, whose captured reads keep the sources "
+                                "they read")
+        source = self.array.source
+        if source is None:
+            raise self._refusal("set_sources, and the array declares no source")
+        if fields.keys() != {"k", "v"}:
+            raise self._refusal(f"set_sources takes fields k and v, and got {sorted(fields)}")
+        k, v = fields["k"], fields["v"]
+        entry = tuple(self.array.entry.tensors["k"].shape)
+        if k.shape != v.shape or tuple(k.shape[3:]) != entry or k.ndim != 3 + len(entry) or (
+            k.shape[1] != len(self.array.layers)
+        ) or len(lengths) != k.shape[0]:
+            raise self._refusal(f"set_sources takes k and v [sources, {len(self.array.layers)} layers, len, "
+                                f"{', '.join(map(str, entry))}] and a length per source, and got {tuple(k.shape)}, "
+                                f"{tuple(v.shape)} and {len(lengths)} lengths")
+        if any(not source.min_len <= n <= min(source.max_len, k.shape[2]) for n in lengths):
+            raise self._refusal(f"source lengths {list(lengths)} are outside {source.min_len}..{source.max_len} or "
+                                f"past the {k.shape[2]} entries given")
+        held = self._kv.layer(0).dtype
+        if k.dtype != held or v.dtype != held:
+            raise self._refusal(f"sources of {k.dtype} and {v.dtype}, and the array holds {held}: the read attends "
+                                "both in one dtype")
+        stored = torch.cat([k, v], dim=-1)
+        if len(entry) == 2:
+            stored = stored.unsqueeze(3)
+        # [sources, layers, rows, heads, len, 2 head_dim], as the resource reads them
+        self._sources = stored.permute(0, 1, 3, 4, 2, 5).contiguous()
+        self.source_lengths = tuple(int(n) for n in lengths)
+
+    def begin_step(self, step) -> None:
+        super().begin_step(step)
+        self._stepped = True
+
+    def _check_storage(self, declared: ArrayStep, segments, ctx) -> None:
+        super()._check_storage(declared, segments, ctx)
+        if declared.forks or not declared.keep:
+            raise self._refusal("a step forks or keeps nothing on a Retained array, whose reads keep the step's "
+                                "entries as they run")
+        if self.array.source is not None:
+            missing = sorted({s.request_id for s in segments if not ctx.is_padding_row(s.request_id)}
+                             - declared.sources.keys(), key=repr)
+            if missing:
+                raise self._refusal(f"rows {missing} name no source, and the array declares one")
+
+    @torch.compiler.disable
+    def add(self, layer: int | torch.Tensor, *, keep: bool | None = None, **fields: torch.Tensor) -> None:
+        if keep is False:
+            raise self._refusal("keep=False on a Retained array, whose read keeps the step's entries as it runs")
+        layer = self._layer_id(layer)
+        self._record_add(layer, keep)
+        self._held, self._held_layer = (fields["k"], fields["v"]), layer
+
+    @torch.compiler.disable
+    def read(self, layer: int | torch.Tensor, q: torch.Tensor | None = None, **mask_args: Any) -> torch.Tensor:
+        """Attend ``q`` over the row's source, its kept entries and this layer's add, keeping the add's first span
+        entries. ``distance_bias``, where the op takes one, is ``(rows, heads, len, reach + 2 len - 1)``: the score
+        term of query ``i`` and the key at distance ``d`` from it at index ``d + len - 1``, ``reach`` being the most
+        entries a row's read sees before its step's."""
+        if q is None:
+            raise self._no_layout("a read with no op")
+        bias = mask_args.pop("distance_bias", None)
+        if mask_args or (bias is not None) != next(iter(self.array.reads.values())).op.distance_bias:
+            raise self._refusal(f"a read takes distance_bias exactly where its op declares one, and got "
+                                f"{sorted({*mask_args, *(('distance_bias',) if bias is not None else ())})}")
+        layer = self._layer_id(layer)
+        self._record_read(layer)
+        k, v = self._take_hold(layer)
+        i = self._pool_layer[layer]
+        source = None if self._sources is None else self._sources[:, i]
+        out = self._kv.attend(i, q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), source, rel_bias=bias)
+        return out
+
+    def _retained(self) -> torch.Tensor:
+        return self._kv.current.retained()
+
+
 class RowLayout:
     """How a within-step read's rows hold a step's segments: here a row a segment, all of one span, which keeps
     nothing of its step. Its handle picks one at bind, from the read."""
@@ -1508,6 +1650,47 @@ class HostValueStorage(Storage):
         return HostValueHandle(array, setup.host_fields)
 
 
+class BoundedStorage(Storage):
+    """An append-only array whose read is `Retained`, in a bounded KV resource: a slot per request of its kept
+    entries, the sources apart."""
+
+    handle_class = BoundedArrayHandle
+    kernel_settings = frozenset({"max_slots"})
+
+    def resolve(self, arrays: Sequence[Array], declared: Sequence[Array], setup: "StateSetup") -> Resolved:
+        resolved = Resolved({}, {}, {}, {})
+        for array in arrays:
+            bound = _bindings(self, array)
+            rows, heads, head_dim = _bounded_kv_shape(array)
+            ((key, read, _),) = bound
+            mask, source = read.mask, array.source or Source(max_len=0)
+
+            def retention(source_len: int, mask: Retained = mask) -> SinkWindow:
+                return SinkWindow(mask.sink + source_len * mask.source_in_sink,
+                                  mask.window + source_len * mask.source_in_window)
+
+            resolved.specs[array.name] = [BoundedKVSpec(
+                resource_key=array.name, nodes=array.nodes,
+                config=BoundedKVConfig(
+                    num_layers=len(array.layers), num_heads=heads, head_dim=head_dim, rows_per_request=rows,
+                    max_source_len=source.max_len, min_source_len=source.min_len, retention=retention,
+                    dtype=array.entry.tensors["k"].dtype, reverse_step_order=mask.reverse_steps,
+                ),
+            )]
+            resolved.bound[array.name] = bound
+            resolved.resource_of[key] = array.name
+        return resolved
+
+    def steps(self, handle: ArrayHandle, declared: ArrayStep, segments, steps: dict[str, Any]) -> None:
+        lengths = handle.source_lengths
+        steps[handle.name] = BoundedKVStep(
+            segments=segments,
+            sources={rid: (lengths[index], index) for rid, index in declared.sources.items()} if lengths else {
+                segment.request_id: (0, 0) for segment in segments
+            },
+        )
+
+
 class WithinStepStorage(Storage):
     """An array with ``max_len`` 0, whose adds last only the step, so it has no pool."""
 
@@ -1550,6 +1733,7 @@ class WithinStepStorage(Storage):
 
 
 PAGED = PagedStorage()
+BOUNDED = BoundedStorage()
 VALUE = ValueStorage()
 HOST_VALUE = HostValueStorage()
 WITHIN_STEP = WithinStepStorage()
@@ -1561,6 +1745,8 @@ def storage_of(array: Array) -> Storage:
         return VALUE if array.entry.tensors else HOST_VALUE
     if array.rewritable:
         raise _no_layout(array, "a rewritable array has no spec unless it is a Value, of max_len 1")
+    if array.max_len and any(isinstance(read.mask, Retained) for read in array.reads.values()):
+        return BOUNDED
     return PAGED if array.max_len else WITHIN_STEP
 
 
@@ -1568,6 +1754,7 @@ def storage_of(array: Array) -> Storage:
 # and op type.
 BINDINGS: dict[tuple[Storage, type[Op | Positions]], OpBinding] = {
     (PAGED, Attend): PagedAttend(),
+    (BOUNDED, Attend): BoundedAttend(),
     (PAGED, Positions): PositionsBinding(),
     (WITHIN_STEP, Attend): RaggedAttend(),
     (VALUE, GatedDeltaNet): GDN(),

@@ -25,7 +25,7 @@ _POSITIONAL = {"PagedNHDTarget", "Segment", "SlotLease", "Span"}
 # The calls take the handle first, then what every call names, and only then keywords.
 _CALLS = {
     "at_last_token", "causal_conv", "gated_delta_net", "gather", "host", "last_sampled", "position", "positions",
-    "rope", "sample", "scatter", "split_range",
+    "retained", "rope", "sample", "scatter", "split_range",
 }
 # Each public name's parameters as ``[name, kind, default]``. A dataclass's parameters are its fields.
 SNAPSHOT = {
@@ -40,6 +40,7 @@ SNAPSHOT = {
         ["rewritable", "KEYWORD_ONLY", 'False'],
         ["labels", "KEYWORD_ONLY", "frozenset({'main'})"],
         ["positions", "KEYWORD_ONLY", 'None'],
+        ["source", "KEYWORD_ONLY", 'None'],
     ],
     "ArrayStep": [
         ["segments", "KEYWORD_ONLY", 'None'],
@@ -52,9 +53,11 @@ SNAPSHOT = {
         ["position_ids", "KEYWORD_ONLY", 'None'],
         ["host", "KEYWORD_ONLY", '{}'],
         ["prefix_lens", "KEYWORD_ONLY", 'None'],
+        ["sources", "KEYWORD_ONLY", '{}'],
     ],
     "Attend": [
         ["q_heads", "POSITIONAL_OR_KEYWORD", None],
+        ["distance_bias", "KEYWORD_ONLY", 'False'],
     ],
     "Block": [],
     "BlockPrefix": [],
@@ -110,6 +113,13 @@ SNAPSHOT = {
         ["queries", "KEYWORD_ONLY", 'None'],
         ["packed", "KEYWORD_ONLY", 'True'],
         ["segmented", "KEYWORD_ONLY", 'False'],
+    ],
+    "Retained": [
+        ["sink", "KEYWORD_ONLY", '0'],
+        ["window", "KEYWORD_ONLY", '0'],
+        ["source_in_sink", "KEYWORD_ONLY", 'False'],
+        ["source_in_window", "KEYWORD_ONLY", 'False'],
+        ["reverse_steps", "KEYWORD_ONLY", 'False'],
     ],
     "Rope": [
         ["theta", "KEYWORD_ONLY", '10000.0'],
@@ -178,6 +188,10 @@ SNAPSHOT = {
         ["scratch", "POSITIONAL_OR_KEYWORD", '0'],
         ["opens_step", "POSITIONAL_OR_KEYWORD", 'True'],
     ],
+    "Source": [
+        ["min_len", "KEYWORD_ONLY", '0'],
+        ["max_len", "KEYWORD_ONLY", None],
+    ],
     "TensorType": [
         ["shape", "POSITIONAL_OR_KEYWORD", None],
         ["dtype", "KEYWORD_ONLY", None],
@@ -235,6 +249,9 @@ SNAPSHOT = {
         ["label", "POSITIONAL_OR_KEYWORD", None],
     ],
     "positions": [
+        ["h", "POSITIONAL_OR_KEYWORD", None],
+    ],
+    "retained": [
         ["h", "POSITIONAL_OR_KEYWORD", None],
     ],
     "rope": [
