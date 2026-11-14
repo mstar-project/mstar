@@ -421,7 +421,7 @@ def state_steps(
 ) -> SubmoduleStep | None:
     """``step`` on ``graph_walk`` as a new step, with what its ``state`` declares expanded into today's step objects by
     each storage's builder, afresh for each step, since each carries the step's segments. ``leased``: whether the step
-    holds a slot lease, which picks the kernel of a read with two (`OpBinding.leg`). The handles it opens are
+    holds a slot lease, an input to the kernel of a read with two (`OpBinding.leg`). The handles it opens are
     those of what ``state`` lists, then the node's sequence shard's, whose step is the node's segments. None when no
     array or sampler it lists needs it, nor a shard that can split, and it holds no other resource's step, so the step
     skips its resources' admit, plan and commit."""
@@ -544,7 +544,7 @@ class ArraySteps(StepBuilder):
         segments = segments_of(declared, step)
         self._storage.steps(handle, declared, step, segments, self._steps)
         for key, bound in handle._step_ops(walk):
-            key = bound.binding.leg(bound, leased) or key
+            key = bound.binding.leg(bound, leased, declared.keep) or key
             bound.binding.steps(handle.array, key, bound.declared, declared, segments, self._steps)
 
     def steps(self) -> dict[str, Any]:
@@ -721,9 +721,10 @@ class OpBinding:
         """The key of the resource the op under ``key`` runs on."""
         return key
 
-    def leg(self, bound: BoundOp, leased: bool) -> str | None:
-        """The key ``bound`` runs under on a step with or without a slot lease (``leased``), where the binding builds a
-        second kernel under the read's own key; None where it runs on the paged spec its read is grouped into."""
+    def leg(self, bound: BoundOp, leased: bool, keeps: bool) -> str | None:
+        """The key ``bound`` runs under on a step with or without a slot lease (``leased``) that keeps its adds or not
+        (``keeps``), where the binding builds a second kernel under the read's own key; None where it runs on the
+        paged spec its read is grouped into."""
         return None
 
     def apply(self, spec: NodeResourceSpec | None, settings: Mapping[str, Any]) -> None:
@@ -787,9 +788,9 @@ class PagedAttend(OpBinding):
 
 
 class EagerDenseAttend(PagedAttend):
-    """`Attend` on a paged array that runs the dense kernel on a step with no slot lease and the paged one on a leased
-    step, whose graph replays. The dense kernel is a spec under the read's own key, beside the paged spec of its
-    group."""
+    """`Attend` on a paged array that runs the dense kernel on a step with no slot lease that keeps nothing, and the
+    paged one on a leased step, whose graph replays, and on a step that keeps its adds, so every entry the pages keep
+    comes from one kernel. The dense kernel is a spec under the read's own key, beside the paged spec of its group."""
 
     kernel_settings = PagedAttend.kernel_settings | {"eager_backend"}
 
@@ -804,8 +805,8 @@ class EagerDenseAttend(PagedAttend):
         )
         return [*super().specs(array, key, read), dense]
 
-    def leg(self, bound: BoundOp, leased: bool) -> str | None:
-        return None if leased else bound.key
+    def leg(self, bound: BoundOp, leased: bool, keeps: bool) -> str | None:
+        return None if leased or keeps else bound.key
 
     def apply(self, spec: NodeResourceSpec | None, settings: Mapping[str, Any]) -> None:
         super().apply(spec, {field: value for field, value in settings.items() if field != "eager_backend"})
@@ -1232,7 +1233,7 @@ class PagedArrayHandle(ArrayHandle):
         self._legs = [
             (bound.key, read_layers(array, bound.declared), self.reads[bound.key],
              bound.binding.bind(array, leg, resources))
-            for bound in bindings if (leg := bound.binding.leg(bound, False)) is not None
+            for bound in bindings if (leg := bound.binding.leg(bound, False, False)) is not None
         ]
         self.first_read = next(iter(self.reads.values()))
         self._attn: dict[int, PagedRead] = {

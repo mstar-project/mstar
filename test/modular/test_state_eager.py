@@ -84,9 +84,9 @@ def _handle(kv=None, paged=None, dense=None, array=None):
     return node_handles(model, "LLM", resources, setup=setup)["kv"]
 
 
-def _expanded(h, leased: bool) -> SubmoduleStep:
+def _expanded(h, leased: bool, keep: bool = False) -> SubmoduleStep:
     """``h``'s step on the generation walk. A leased one is its capture, since a replay makes no call."""
-    step = SubmoduleStep(segments=[Segment(1, "main", TOKENS)], state={"kv": ArrayStep()})
+    step = SubmoduleStep(segments=[Segment(1, "main", TOKENS)], state={"kv": ArrayStep(keep=keep)})
     expanded = state_steps(step, {"kv": h}, graph_walk="gen", leased=leased)
     lease = _ctx(leased=leased).slot_lease
     expanded.set_ctx(StepContext(request_ids=(1,), graph_walk="gen", slot=0, capture=leased, slot_lease=lease))
@@ -135,10 +135,10 @@ def test_an_eager_read_runs_the_paged_leg_before_its_first_step():
     )
 
 
-def test_a_kept_add_reaches_the_pages_on_the_dense_kernel():
+def test_a_kept_add_reaches_the_pages():
     kv = _StubKV()
     h = _handle(kv=kv)
-    step = _expanded(h, leased=False)
+    step = _expanded(h, leased=False, keep=True)
     h.begin_step(step)
     q, k, v = _tensors()
     for layer in range(LAYERS):
