@@ -130,6 +130,8 @@ def _ready(value: Any, index: int) -> str:
         "stop_on_fault", "restrict_image_size", "temporal_stack", "chunked_schedule",
     ]:
         raise ProtocolError("Positronic ready metadata has no DROID client stack")
+    if [s.get("version", 1) for s in seq] != [2, 1, 2, 2] or seq[3].get("args") != {"fps": 15.0}:
+        raise ProtocolError("Positronic ready metadata has an incompatible v2 client stack")
     resize, temporal = seq[1].get("args"), seq[2].get("args")
     offsets = temporal.get("offsets_sec") if isinstance(temporal, dict) else None
     expected = [0.0 if frame == 0 else -frame / 15 + 0.5 / 15 for frame in range(24, -1, -1)]

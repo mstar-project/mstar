@@ -152,14 +152,14 @@ def test_positronic_probe_checks_warm_reset_and_phase_latency(tmp_path):
             "meta": {"sample_seed_base": 1234, "chunk_rows": 24, "action_fps": 15.0,
                      "image_codecs": ["h264", "jpeg"], "compress_images": True,
                      "local_stack": {"seq": [
-                         {"name": "stop_on_fault"},
+                         {"name": "stop_on_fault", "version": 2},
                          {"name": "restrict_image_size", "args": {"width": 416, "height": 234}},
-                         {"name": "temporal_stack", "args": {
+                         {"name": "temporal_stack", "version": 2, "args": {
                              "keys": ["image.wrist", "image.exterior", "robot_state.ee_pose", "grip"],
                              "offsets_sec": [0.0 if frame == 0 else -frame / 15 + 0.5 / 15
                                              for frame in range(24, -1, -1)], "pad_start": False,
                          }},
-                         {"name": "chunked_schedule"},
+                         {"name": "chunked_schedule", "version": 2, "args": {"fps": 15.0}},
                      ]}}
         }))
         async for msg in ws:
