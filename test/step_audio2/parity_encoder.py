@@ -21,6 +21,10 @@ and the adapter's kept tokens are compared, in four configurations:
   (which changes GEMM shapes).
 * **fp32**: the port in fp32 on that same reference-route attention, against the fp32
   reference: the port's arithmetic without bf16 rounding; must agree to ``FP32_TOL``.
+* **served at padded widths**: the served path's convolutions at widths padded to the
+  submodule's ``CONV_WIDTH_QUANTUM``, held to the served bounds; and the fp32 port so padded
+  (reference-route attention) to ``FP32_TOL`` from the fp32 reference, which shows the padding
+  changes no output, only the kernels' widths.
 * **negative control**: the key mask off, as ``mask_probe.py`` runs the reference: each clip
   alone, every post-conv frame computed and a key. Must move the kept adapter tokens by
   more than ``CONTROL_FACTOR`` times the served error (the reference moves them 11-30%).
@@ -38,6 +42,7 @@ from mstar.engine.resources.base import EngineResourceInfo, build_resource
 from mstar.engine.resources.step import StepContext
 from mstar.model.step_audio2.components.audio import ClipLayout, StepAudio2Audio, request_layout
 from mstar.model.step_audio2.config import StepAudio2Config
+from mstar.model.step_audio2.submodules import AudioEncoderSubmodule
 from mstar.model.step_audio2.weight_loader import load_audio_weights
 
 ATTN = "audio_attn"
@@ -45,6 +50,7 @@ TOKEN_SPREAD = 1.5
 BLOCK_SPREAD = 2.5
 FP32_TOL = 1e-4
 CONTROL_FACTOR = 3.0
+QUANTUM = AudioEncoderSubmodule.CONV_WIDTH_QUANTUM
 
 
 class ReferenceRouteAttention:
@@ -113,14 +119,14 @@ def build(config, dtype) -> StepAudio2Audio:
 
 
 @torch.inference_mode()
-def run(model: StepAudio2Audio, mels, layout, attention) -> tuple[list[torch.Tensor], torch.Tensor]:
+def run(model: StepAudio2Audio, mels, layout, attention, quantum: int = 1) -> tuple[list[torch.Tensor], torch.Tensor]:
     """Each block's output (packed) and the adapter's tokens."""
     for block in model.encoder.blocks:
         block.self_attn.bind_resources({ATTN: attention})
     blocks = []
     hooks = [b.register_forward_hook(lambda _m, _i, o: blocks.append(o.clone())) for b in model.encoder.blocks]
     try:
-        tokens = model([m.to(DEVICE) for m in mels], layout)
+        tokens = model([m.to(DEVICE) for m in mels], layout, quantum)
     finally:
         for hk in hooks:
             hk.remove()
@@ -176,6 +182,10 @@ def main() -> None:
         r_rel16, r_tok16, r_max16 = compare(route_blocks, route_tokens, ref16, ref_shapes)
         exact32 = run(fp32, mels, layout, ReferenceRouteAttention(layout))
         f_rel32, f_tok32, _ = compare(*exact32, ref32, layout)
+        padded = run(bf16, mels, layout, key_prefix_resource(config, layout), QUANTUM)
+        q_rel32, q_tok32, _ = compare(*padded, ref32, layout)
+        padded32 = run(fp32, mels, layout, ReferenceRouteAttention(layout), QUANTUM)
+        fq_rel32, fq_tok32, _ = compare(*padded32, ref32, layout)
         off = unmasked(layout)
         _, control = run(bf16, mels, off, key_prefix_resource(config, off))
         c_tok16 = diff(control, want_tokens(ref16, layout)).rel
@@ -196,6 +206,13 @@ def main() -> None:
                       f"fp32 (worst ratio {block_ratio:.2f})")
         verdict.check(max(f_rel32 + [f_tok32]) < FP32_TOL,
                       f"{case}: fp32 port matches the fp32 reference (worst rel {max(f_rel32 + [f_tok32]):.2e})")
+        q_ratio = max(a / b for a, b in zip(q_rel32, spread, strict=True))
+        verdict.check(q_tok32 <= TOKEN_SPREAD * spread_tok and q_ratio <= BLOCK_SPREAD,
+                      f"{case}: served at widths padded to {QUANTUM} mel frames, the adapter tokens and every block "
+                      f"are within the served bounds ({q_tok32:.3e}, worst block ratio {q_ratio:.2f})")
+        verdict.check(max(fq_rel32 + [fq_tok32]) < FP32_TOL,
+                      f"{case}: the fp32 port at padded widths matches the fp32 reference "
+                      f"(worst rel {max(fq_rel32 + [fq_tok32]):.2e})")
         verdict.check(c_tok16 > CONTROL_FACTOR * s_tok16,
                       f"{case}: negative control (key mask off) diverges: tokens rel {c_tok16:.3e} vs served "
                       f"{s_tok16:.3e}")
