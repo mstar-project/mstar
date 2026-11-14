@@ -560,21 +560,21 @@ class WithinStepSteps(StepBuilder):
                 )
 
     def _chunk_layout(self, array: Array, read: Read, segment: Segment) -> ResourceChunkCausalLayout:
-        if self._info is None:
-            self._info = {}
-            for rid, info in self._per_request_info.items():
-                self._info[rid] = info
-                self._info[info.request_id] = info
-        info = self._info.get(segment.request_id)
-        if info is None:
-            raise ValueError(f"Array {array.name!r}: no request info for chunk layout of {segment.request_id!r}")
-        raw = info.step_metadata.get(CHUNK_CAUSAL_LAYOUT_KWARG, {})
-        lengths = raw.get(array.name, {}).get(segment.label, {}).get(next(iter(array.reads)))
-        if lengths is None:
-            if type(segment.request_id) is int and segment.request_id < -1:
-                # Capture padding has no request layout; a full global span is a safe well-formed mask.
-                lengths = [segment.span, 0, 0]
-            else:
+        if type(segment.request_id) is int and segment.request_id < -1:
+            # Capture and replay padding has no request layout.
+            lengths = [segment.span, 0, 0]
+        else:
+            if self._info is None:
+                self._info = {}
+                for rid, info in self._per_request_info.items():
+                    self._info[rid] = info
+                    self._info[info.request_id] = info
+            info = self._info.get(segment.request_id)
+            if info is None:
+                raise ValueError(f"Array {array.name!r}: no request info for chunk layout of {segment.request_id!r}")
+            raw = info.step_metadata.get(CHUNK_CAUSAL_LAYOUT_KWARG, {})
+            lengths = raw.get(array.name, {}).get(segment.label, {}).get(next(iter(array.reads)))
+            if lengths is None:
                 raise ValueError(
                     f"Array {array.name!r}: request {segment.request_id!r} has no "
                     f"state_layout chunk lengths for read {next(iter(array.reads))!r}"
