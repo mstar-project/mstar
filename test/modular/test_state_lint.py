@@ -22,7 +22,7 @@ PORTED = (
     "mstar/model/kokoro", "mstar/model/omnilingual_asr", "mstar/model/omnivoice", "mstar/model/orpheus",
     "mstar/model/voxcpm2",
     "mstar/model/canary_qwen", "mstar/model/qwen3_asr", "mstar/model/parakeet", "mstar/model/fish_s2_pro",
-    "mstar/model/qwen3_tts",
+    "mstar/model/qwen3_tts", "mstar/model/step_audio2",
 )
 FORBIDDEN_ATTRIBUTES = {
     "node_resources", "resources", "request_state", "request_states", "per_request_states", "sequence_shard",
