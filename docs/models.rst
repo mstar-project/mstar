@@ -104,6 +104,9 @@ Registry keys live in ``mstar/model/registry.py`` (``MODEL_REGISTRY`` / ``HF_MOD
        (see :doc:`clients`).
        ``LLM`` and ``action_expert`` share a KV cache, so ``node_groups`` must list them in
        one entry; the server refuses to start otherwise.
+   * - ``qwen3_8b``
+     - ``Qwen/Qwen3-8B``
+     - Dense Qwen3 text chat; see the notes below.
    * - ``qwen3_5_{0.8,2,4,9,27}b``
      - ``Qwen/Qwen3.5-4B``
      - Hybrid-attention VLM (text + image in, text out): gated DeltaNet linear
@@ -631,6 +634,18 @@ is the model's channel stream as generated: reasoning addressed ``to=self``,
 then the answer ``to=user``. Tool calls are refused for now. Images resize with the
 reference's antialiased Lanczos, which torchvision has from 0.27 (torch 2.12); an older
 torchvision falls back to PIL's Lanczos with a warning, and its pixels differ slightly.
+
+Qwen3-8B (``qwen3_8b``)
+-----------------------
+
+Text-only chat on ``Qwen/Qwen3-8B`` (``Qwen3ForCausalLM``) on the shared decoder
+scaffold, through the checkpoint's chat template (``enable_thinking``, flat or in
+``chat_template_kwargs``, reaches it); other sizes aren't registered. Prefill, the
+mixed prefill/decode step and decode are captured. Sampling defaults come from the
+checkpoint's ``generation_config.json``. A request is bounded by the checkpoint's
+context: one that asks no length decodes to the room its prompt leaves, and a prompt
+past it is a 400. Rope scaling, sliding windows and attention biases are refused at
+startup rather than ignored.
 
 Qwen3.5 / Qwen3.8 (``qwen3_5_*``, ``qwen3_8_27b``)
 --------------------------------------------------

@@ -130,8 +130,11 @@ def _preprocess(model: _Model, model_kwargs: dict, **config) -> dict:
 
 
 def _conduct(
-    model: _Model, model_kwargs: dict, tmp_path, monkeypatch, rids=("r",), streaming=False, outputs=("text",), **config,
+    model: _Model, model_kwargs: dict, tmp_path, monkeypatch, rids=("r",), streaming=False, outputs=("text",),
+    initial_signals: dict | None = None, **config,
 ) -> _Comm:
+    """``initial_signals``: the prompt's tensors as the data worker sends them, for a model whose
+    walk plan reads them (none for the harness's own model)."""
     path = tmp_path / "cfg.yaml"
     path.write_text(yaml.safe_dump({
         "max_seq_len": 4096, "node_groups": [{"node_names": ["llm", "talker"], "ranks": [0]}], **config,
@@ -143,7 +146,7 @@ def _conduct(
     comm.batches.extend([
         [ConductorMessage(ConductorMessageType.SETUP_DONE, SetupDone(w)) for w in conductor.worker_ids],
         [ConductorMessage(ConductorMessageType.NEW_REQUEST, NewRequestConductor(
-            request_id=rid, initial_signals={}, initial_input_modalities=["text"],
+            request_id=rid, initial_signals=initial_signals or {}, initial_input_modalities=["text"],
             initial_output_modalities=list(outputs), input_metadata={}, model_kwargs=model_kwargs,
             streaming=streaming,
         )) for rid in rids],
