@@ -58,6 +58,8 @@ from mstar.engine.state.adapters import (
     chunk_causal_layouts,
     expert_layouts,
     kv_layouts,
+    sized_values,
+    state_sizes,
 )
 from mstar.engine.state.contract import Array
 from mstar.model.base import (
@@ -1008,8 +1010,8 @@ class PreprocessWorkerThread:
         # and only this worker knows which client streams the opening leaves open.
         internal = getattr(self.model, "INTERNAL_KWARGS", ())
         for name in (
-            "prefix_keys", "prefix_tail", "prefix_decode", "kv_layout", "state_layout", "keyed_spans", "prefix_root",
-            "stream_lead_items", "open_streams", MAX_POSITION_KWARG, CHUNK_CAUSAL_LAYOUT_KWARG,
+            "prefix_keys", "prefix_tail", "prefix_decode", "kv_layout", "state_layout", "state_sizes", "keyed_spans",
+            "prefix_root", "stream_lead_items", "open_streams", MAX_POSITION_KWARG, CHUNK_CAUSAL_LAYOUT_KWARG,
             EXPERT_LAYOUT_KWARG, *internal,
         ):
             model_kwargs.pop(name, None)
@@ -1050,6 +1052,8 @@ class PreprocessWorkerThread:
                 expert_layout = expert_layouts(self._declarations, state_layout)
                 if expert_layout:
                     model_kwargs[EXPERT_LAYOUT_KWARG] = expert_layout
+            if self._sized:
+                model_kwargs["state_sizes"] = state_sizes(self._sized, state_layout or {})
             num_prompt_tokens = self.model.prompt_tokens(tensors, layouts)
             rows = {
                 key: {label: layout.row() for label, layout in by_label.items()}
@@ -1383,6 +1387,11 @@ class PreprocessWorkerThread:
         """Built once, since a prompt on this thread holds up the API server's GIL, and building them on each prompt
         took a tenth of Qwen3.5's one-token throughput."""
         return self.model.declare_state()
+
+    @cached_property
+    def _sized(self) -> list:
+        """The sized Values among `_declarations`, which most models have none of."""
+        return list(sized_values(self._declarations).values())
 
     @cached_property
     def _item_limits(self) -> dict[str, ClientStreamLimits]:
