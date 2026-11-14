@@ -327,22 +327,26 @@ class H3PackedDenoise(DenoiseLoopSubmodule):
         if self.LAYOUT_FROM_INPUTS:
             text, video = bucket_key.text_len, bucket_key.total_rows - bucket_key.text_len
             # a padding row reads the prompt's first zero row, there whenever there is padding
-            sources = torch.cat([torch.arange(text), torch.arange(text + pad, text + pad + video),
-                                 torch.full((pad,), text)]).to(device)
-            video_rows = torch.arange(text, text + video).to(device)
+            sources = to_device_nonblocking(torch.cat([torch.arange(text), torch.arange(text + pad, text + pad + video),
+                                                       torch.full((pad,), text)]), device)
+            video_rows = to_device_nonblocking(torch.arange(text, text + video), device)
 
         def padded(rows: torch.Tensor) -> torch.Tensor:
             # a padding row sits at position 0 (rope cos 1, sin 0) on AdaLN table row 0
             return torch.cat([rows, rows.new_zeros((pad, *rows.shape[1:]))])
 
-        # the positions travel to the device in fp64 and round to fp32 there, as the reference's do
-        pos = padded(positions).to(device)
+        # The positions travel to the device in fp64 and round to fp32 there, as the reference's do. Every host
+        # tensor goes through pinned memory: a pageable `.to(device)` waits for the GPU work in flight (a whole loop
+        # when the loop is one graph), and a new prompt length builds its layout on the step's own thread.
+        pos = to_device_nonblocking(padded(positions), device)
         cfg = self.config.transformer
         rope = rope_table(pos, rope_inv_freq(cfg), self.transformer.dtype, cfg.attention_head_dim)
         classes, tags = padded(classes), padded(tags)
         return H3StepLayout(
-            rope=rope, row_index=(classes * NUM_MODALITIES + tags).to(device), row_class=classes.to(device),
-            no_class=torch.zeros_like(classes).to(device), tags=tags.to(device), text_len=bucket_key.text_len,
+            rope=rope, row_index=to_device_nonblocking(classes * NUM_MODALITIES + tags, device),
+            row_class=to_device_nonblocking(classes, device),
+            no_class=to_device_nonblocking(torch.zeros_like(classes), device),
+            tags=to_device_nonblocking(tags, device), text_len=bucket_key.text_len,
             num_condition_rows=bucket_key.num_condition_rows, num_audio_rows=bucket_key.num_audio_rows,
             num_pad_rows=pad, row_source=sources, video_rows=video_rows,
         )
