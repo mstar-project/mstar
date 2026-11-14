@@ -83,7 +83,7 @@ class TestDraftLoading:
         assert config.draft_layers == (7, 8, 9)
         pool = engine._resources[STATE]
         assert pool.config.num_layers == config.num_hidden_layers + 3
-        assert pool.block(WINDOW, config.draft_layers[-1]).shape[1:] == (config.sliding_window, config.head_dim)
+        assert pool.block(WINDOW, config.draft_layers[-1]).shape[1:] == (config.window_slots, config.head_dim)
 
     def test_a_missing_draft_tensor_refuses_to_load(self, snapshot, tmp_path):
         path = tmp_path

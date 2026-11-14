@@ -91,6 +91,32 @@ class TestTokenClock:
         manager.remove_request("a")
         assert manager.kv_segments([Segment("a", "main", 1)])["pairs"][0].span == 0
 
+    def test_tokens_taken_back_give_each_cache_back_the_groups_they_completed(self):
+        manager = self._manager()
+        moved = []
+
+        class Cache:
+            def __init__(self, key):
+                self.key = key
+
+            def correct_len(self, rid, label, delta):
+                moved.append((self.key, rid, label, delta))
+
+        manager.bind_dependencies({key: Cache(key) for key in ("every", "pairs", "fours")})
+        self._commit(manager, [Segment("a", "main", 9)])
+        manager.take_back("a", 3)  # 9 tokens to 6: 4 pairs to 3, 2 fours to 1
+        assert sorted(moved) == [("every", "a", "main", -3), ("fours", "a", "main", -1), ("pairs", "a", "main", -1)]
+        # the next step stands where the count was left
+        spans = {key: rows[0].span for key, rows in manager.kv_segments([Segment("a", "main", 2)]).items()}
+        assert spans == {"every": 2, "pairs": 1, "fours": 1}
+        moved.clear()
+        manager.take_back("a", 1)  # 6 to 5: a pair opens again, the four stays
+        manager.take_back("a", 0)
+        assert sorted(moved) == [("every", "a", "main", -1), ("pairs", "a", "main", -1)]
+        for tokens in (6, -1, True):
+            with pytest.raises(ValueError, match="cannot take"):
+                manager.take_back("a", tokens)
+
     @pytest.mark.parametrize("caches", [{}, {0: "x"}, {1: "x", 2: "x"}])
     def test_a_config_maps_each_ratio_to_its_own_cache(self, caches):
         with pytest.raises(ValueError, match="caches"):

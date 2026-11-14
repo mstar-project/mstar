@@ -160,7 +160,9 @@ class DeepseekV41Config:
     engram_tables: str = "device"
     # load the draft head and run it after each step: a block of drafts for every request,
     # from its last token and the backbone's hidden states (no speculative path is served yet,
-    # so nothing reads the drafts). Off, its tensors stay in the checkpoint.
+    # so nothing reads the drafts). A decode step may then carry drafts to verify behind its
+    # token, and a request's state keeps room to take the rejected ones back
+    # (``take_back_tokens``). Off, its tensors stay in the checkpoint.
     draft_head: bool = False
 
     def __post_init__(self):
@@ -321,6 +323,19 @@ class DeepseekV41Config:
         if not self.draft_head:
             return ()
         return tuple(range(self.num_hidden_layers, self.num_hidden_layers + self.num_nextn_predict_layers))
+
+    @property
+    def take_back_tokens(self) -> int:
+        """The most of a request's last tokens that can be taken back out of its context: the
+        drafts one decode step may carry, a draft block's with the draft head, none without.
+        What a request keeps by position (windows, open groups, its last ids) keeps this many
+        positions more than it reads, so a rejected draft overwrites nothing still needed."""
+        return self.dspark_block_size if self.draft_head else 0
+
+    @property
+    def window_slots(self) -> int:
+        """Rows of a layer's window ring in ``STATE``."""
+        return self.sliding_window + self.take_back_tokens
 
     def draft_block_config(self) -> "DeepseekV41Config":
         """The config a draft block's layers are built from: the backbone's, with the draft

@@ -123,18 +123,20 @@ class DeepseekV41Model(ByteLevelTextOutput, Model):
 
     def get_node_resources(self) -> list[NodeResourceSpec]:
         cfg = self.config
+        # every block is a ring by position, with room for the tokens a request may take back
+        spare = cfg.take_back_tokens
         blocks = {
-            # each layer's last sliding_window latents, a ring by position; a draft layer's
-            # holds the backbone's projected hidden states of those positions
-            WINDOW: RecurrentBlockConfig(shape=(cfg.sliding_window, cfg.head_dim), dtype=None),
+            # each layer's last sliding_window latents; a draft layer's holds the backbone's
+            # projected hidden states of those positions
+            WINDOW: RecurrentBlockConfig(shape=(cfg.window_slots, cfg.head_dim), dtype=None),
             # the n-gram hashes read a request's last ids
             NGRAM: RecurrentBlockConfig(
-                shape=(max(cfg.engram_max_ngram_size - 1, 1),), dtype=torch.long, per_layer=False),
+                shape=(max(cfg.engram_max_ngram_size - 1, 1) + spare,), dtype=torch.long, per_layer=False),
         }
         if cfg.pooled_sources:
             # a pooling source's open group: its tokens' projections and gate scores. A block
             # is per layer, so each source reads and writes its own, the other layers' unused.
-            shape = (cfg.max_ratio, cfg.head_dim)
+            shape = (cfg.max_ratio + spare, cfg.head_dim)
             blocks[POOL_KV] = RecurrentBlockConfig(shape=shape, dtype=torch.float32)
             blocks[POOL_SCORE] = RecurrentBlockConfig(shape=shape, dtype=torch.float32)
         latent_width, key_width = cfg.cache_widths()

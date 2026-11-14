@@ -41,7 +41,9 @@ class SharedSelection:
 class Compressor(nn.Module):
     """A compressed source's latents: every ``ratio`` tokens pooled into one by a softmax gate
     per dim (``ratio`` 1: a plain projection). A group still open at the end of a step waits
-    in the request's ``POOL_KV`` / ``POOL_SCORE`` rows of this layer."""
+    in the request's ``POOL_KV`` / ``POOL_SCORE`` rows of this layer: rings by position, which
+    hold the request's last tokens, more of them than a group so that tokens taken back
+    (``take_back_tokens``) overwrite none of an open group."""
 
     def __init__(self, config: DeepseekV41Config, layer: int) -> None:
         super().__init__()
@@ -65,22 +67,23 @@ class Compressor(nn.Module):
         if ratio == 1:
             return self.norm(self.wkv(x))
         kv, score = self.wkv(x.float()), self.wgate(x.float())
-        held_kv = self._state.gather(POOL_KV, self.layer, label=LABEL)  # (requests, ratio, D)
+        held_kv = self._state.gather(POOL_KV, self.layer, label=LABEL)  # (requests, slots, D)
         held_score = self._state.gather(POOL_SCORE, self.layer, label=LABEL)
+        slots = held_kv.shape[1]
         row = torch.arange(x.shape[0], device=x.device)
         in_span = row - rows.first
         members_kv, members_score = [], []
         for back in range(ratio - 1, -1, -1):  # the group's tokens, oldest first
             here = (in_span >= back)[:, None]
             src = (row - back).clamp_min(0)
-            slot = (rows.pos - back) % ratio
+            slot = (rows.pos - back) % slots
             members_kv.append(torch.where(here, kv[src], held_kv[rows.row_req, slot]))
             members_score.append(torch.where(here, score[src], held_score[rows.row_req, slot]))
         members_kv, members_score = torch.stack(members_kv, 1), torch.stack(members_score, 1)
         pooled = (members_kv * members_score.softmax(dim=1)).sum(dim=1)
-        # the step's last tokens are the next step's open group
-        tail = rows.tail(ratio)
-        req, slot = rows.row_req[tail], rows.pos[tail] % ratio
+        # the step's last tokens, among them the next step's open group
+        tail = rows.tail(slots)
+        req, slot = rows.row_req[tail], rows.pos[tail] % slots
         held_kv[req, slot] = kv[tail]
         held_score[req, slot] = score[tail]
         self._state.scatter_(POOL_KV, held_kv, self.layer, label=LABEL)
@@ -184,29 +187,32 @@ class DeepseekV41Attention(nn.Module):
     def _window(self, kv: torch.Tensor, rows) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """The rows each query's window holds, as ``(rows, idx, columns)`` for the CSA resource:
         the step's own ``kv`` and, for positions before the step, the request's ring in ``STATE``
-        (a token at position p sits in ring slot ``p % window``). Then the ring takes the
-        step's last ``window`` rows.
+        (a token at position p sits in ring slot ``p % slots``; the ring has ``take_back_tokens``
+        slots more than the window, so tokens taken back overwrite none the next row attends).
+        Then the ring takes the step's last rows.
 
         The columns are laid out as the checkpoint's reference lays them, since the softmax
         accumulates over a row's entries in blocks: a prompt's row has as many columns as the
         prompt has tokens, up to the window, from its oldest row on; a decode row has the whole
-        ring, oldest first, the slots not yet filled leading."""
+        window, oldest first, the positions before the request's first token leading."""
         win = self.window
-        ring = self._state.gather(WINDOW, self.layer, label=LABEL)  # (requests, window, D)
-        requests = ring.shape[0]
+        ring = self._state.gather(WINDOW, self.layer, label=LABEL)  # (requests, slots, D)
+        requests, slots = ring.shape[:2]
         row = torch.arange(kv.shape[0], device=kv.device)
         col = torch.arange(win, device=kv.device)[None, :]
         start = rows.pos - (row - rows.first)
-        decode = (rows.req_rows[rows.row_req] == 1) & (start > 0)
+        decode = start > 0
+        if not rows.decode:  # a prompt's later step: its one-token steps alone are decode rows
+            decode = decode & (rows.req_rows[rows.row_req] == 1)
         columns = torch.where(decode, win, rows.end.clamp_max(win))
         pos = torch.where(decode, rows.pos - win + 1, (rows.pos - win + 1).clamp_min(0))[:, None] + col
         held = (pos >= 0) & (pos <= rows.pos[:, None]) & (col < columns[:, None])
-        in_step = requests * win + rows.first[:, None] + pos - start[:, None]
-        in_ring = rows.row_req[:, None] * win + pos % win
+        in_step = requests * slots + rows.first[:, None] + pos - start[:, None]
+        in_ring = rows.row_req[:, None] * slots + pos % slots
         idx = torch.where(held, torch.where(pos >= start[:, None], in_step, in_ring), -1)
         source = torch.cat([ring.flatten(0, 1), kv], dim=0)
-        tail = rows.tail(win)
-        ring[rows.row_req[tail], rows.pos[tail] % win] = kv[tail].to(ring.dtype)
+        tail = rows.tail(slots)
+        ring[rows.row_req[tail], rows.pos[tail] % slots] = kv[tail].to(ring.dtype)
         self._state.scatter_(WINDOW, ring, self.layer, label=LABEL)
         return source, idx, columns
 

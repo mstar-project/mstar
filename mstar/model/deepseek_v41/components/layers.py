@@ -173,10 +173,12 @@ class DeepseekV41ForCausalLM(nn.Module):
                 taps: list[torch.Tensor] | None = None) -> torch.Tensor:
         return self.logits(self.model(input_ids, rows, taps))
 
-    def draft(self, tokens: torch.Tensor, taps: list[torch.Tensor]):
+    def draft(self, tokens: torch.Tensor, taps: list[torch.Tensor], kept: torch.Tensor | None = None):
         """The draft head's block for each request (``Draft``), continuing from ``tokens``
-        (requests,), after a ``forward`` of the step that filled ``taps``."""
-        return self.model.mtp(tokens, torch.cat(taps, dim=-1), self.model.embed, self.logits, self.model.rope)
+        (requests,) after its last row of the step, or after its step row ``kept``. Follows a
+        ``forward`` of the step that filled ``taps``."""
+        return self.model.mtp(
+            tokens, torch.cat(taps, dim=-1), self.model.embed, self.logits, self.model.rope, kept)
 
     def load_weights(self, weights, sliced: bool = False, **kwargs) -> set[str]:
         from mstar.model.deepseek_v41.weight_loader import load_deepseek_v41_weights

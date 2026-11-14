@@ -17,6 +17,11 @@ A decode step can be captured: under a capture lease ``plan`` lays the bucket's 
 rows among them, into the (bucket, slot)'s own buffers, and every row scores each cache at one
 width (``CSAStep.context`` tokens, else all the cache holds), so the forward's shapes follow from
 the bucket alone and its values from the buffers a later plan refills.
+
+A decode step may run drafts of a request's next tokens behind its token
+(``CSAStep(decode_rows=True)``), each row as a one-token step. ``take_back`` then takes the
+rejected ones out of the request's count and its caches' lengths, between steps: their cache
+rows lie past the lengths, where no row sees them and the next step's writes land.
 """
 
 from collections.abc import Mapping, Sequence
@@ -53,9 +58,10 @@ class CSARows:
     its request (the step's order), ``first`` the step row its request starts at, ``end`` the
     position after its request's last row. Per request: ``req_first`` and ``req_rows`` (its
     rows in the step). ``caches`` by pooling ratio. Host: ``spans``, each request's ``(first
-    row, rows, first position)``; ``one_row_each``, whether every request runs one row (a decode
-    step); and under a capture lease ``widths``, the groups every row scores each cache at (the
-    most a request can hold), by ratio."""
+    row, rows, first position)``; ``one_row_each``, whether every request runs one row; ``decode``:
+    every row runs as a one-token step would (``CSAStep.decode_rows``), whatever its request's
+    rows in the step; and under a capture lease ``widths``, the groups every row scores each cache
+    at (the most a request can hold), by ratio."""
 
     pos: torch.Tensor
     row_req: torch.Tensor
@@ -67,6 +73,7 @@ class CSARows:
     spans: list[tuple[int, int, int]]
     one_row_each: bool = False
     widths: dict[int, int] | None = None
+    decode: bool = False
 
     def slots(self, ratio: int, req: torch.Tensor, groups: torch.Tensor) -> torch.Tensor:
         """Slots (``page * page_size + offset``) of ``groups`` of requests ``req`` in the cache
@@ -260,11 +267,12 @@ class CSAManager(Resource):
         for segment in step.segments:
             labels.setdefault(segment.label, []).append(segment)
         self._current = {
-            label: self._rows(label, segments, ctx, step.context) for label, segments in labels.items()}
+            label: self._rows(label, segments, ctx, step.context, step.decode_rows)
+            for label, segments in labels.items()}
         return self._current
 
     def _rows(self, label: str, segments: list[Segment], ctx: StepContext,
-              context: int | None = None) -> CSARows:
+              context: int | None = None, decode: bool = False) -> CSARows:
         lease = ctx.slot_lease
         graph = lease is not None and lease.bucket is not None
         tokens = self._tokens
@@ -336,7 +344,7 @@ class CSAManager(Resource):
             widths = {ratio: self._capacity(ratio) if context is None else min(self._capacity(ratio), context // ratio)
                       for ratio in self.config.caches}
         rows = CSARows(*(next(cuts) for _ in range(6)), caches={}, spans=spans, one_row_each=one_row_each,
-                       widths=widths)
+                       widths=widths, decode=decode)
         starts = [next(cuts) for _ in self.config.caches]
         pages = next(cuts)
         for (ratio, page_start) in zip(self.config.caches, starts, strict=True):
@@ -354,6 +362,23 @@ class CSAManager(Resource):
         for rid, _, span in step.segments:
             if span and not ctx.is_padding_row(rid):
                 tokens[rid] = tokens.get(rid, 0) + span
+
+    def take_back(self, rid, tokens: int, label: str | None = None) -> None:
+        """Take request ``rid``'s last ``tokens`` tokens out of its context, between steps:
+        drafts a decode step ran (``CSAStep.decode_rows``) and its caller rejected. Its count
+        moves back, and each cache's length by the groups those tokens completed. The rows
+        stay on their pages, past the lengths: no later row sees them, and the request's next
+        tokens overwrite them. State a model keeps by position beside the caches (a window,
+        an open group) is the model's to keep whole across a take-back."""
+        have = self._tokens.get(rid, 0)
+        if isinstance(tokens, bool) or not isinstance(tokens, int) or not 0 <= tokens <= have:
+            raise ValueError(f"csa: cannot take {tokens!r} tokens back from a request at {have}")
+        for ratio, kv in self._kv.items():
+            rows = have // ratio - (have - tokens) // ratio
+            if rows:
+                kv.correct_len(rid, label or _MAIN, -rows)
+        if tokens:
+            self._tokens[rid] = have - tokens
 
     # -- what the layers and the submodule call ----------------------------------------------
 
@@ -408,7 +433,7 @@ class CSAManager(Resource):
                 out = decode_scores(q.contiguous(), w.to(q.dtype).contiguous(), view, cache.pages,
                                     cache.page_start, rows.row_req, seen, width)
                 return out.masked_fill_(group[None, :] >= seen[:, None], -torch.inf)
-            if rows.one_row_each:
+            if rows.decode or rows.one_row_each:
                 # a decode step: every row against its own request's keys, a launch per chunk
                 # of rows instead of one per request
                 chunk = max(1, self.config.score_bytes // (4 * width * max(heads, q.shape[-1])))

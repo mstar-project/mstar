@@ -4,8 +4,9 @@ Each position is hashed as the 2- to ``max_ngram``-grams ending there, over a co
 token vocabulary in which tokens that normalize alike share an id. Every (n-gram size, head)
 pair owns a prime-sized bucket range of the layer's table; the rows it fetches become one key
 per stream and a shared value, and a gate from the streams' match with the key scales the
-value in. The hashes depend only on token ids, so a request carries just its last
-``max_ngram - 1`` ids between steps (``NGRAM`` in the recurrent pool).
+value in. The hashes depend only on token ids, so a request carries just its last ids between
+steps (``NGRAM`` in the recurrent pool, a ring by position): ``max_ngram - 1`` of them, and as
+many more as tokens it may take back (``take_back_tokens``).
 """
 from __future__ import annotations
 
@@ -149,14 +150,15 @@ class NgramHasher(nn.Module):
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         rows, n = self._csa.current(LABEL), self.max_ngram
         compressed = self._dev["token_map"][input_ids]
-        held = self._state.gather(NGRAM, None, label=LABEL)  # (requests, n - 1), the newest last
+        held = self._state.gather(NGRAM, None, label=LABEL)  # (requests, slots): position p in slot p % slots
+        slots = held.shape[1]
         row = torch.arange(input_ids.shape[0], device=input_ids.device)
         in_span = row - rows.first
         tokens, blocked = [], torch.zeros_like(row, dtype=torch.bool)
         for shift in range(n):
             source = torch.where(
                 in_span >= shift, compressed[(row - shift).clamp_min(0)],
-                held[rows.row_req, (n - 1 + in_span - shift).clamp(0, n - 2)])
+                held[rows.row_req, (rows.pos - shift) % slots])
             # an n-gram never reaches before the sequence's first token
             blocked = blocked | (rows.pos < shift)
             tokens.append(torch.where(blocked, self.pad_id, source))
@@ -165,12 +167,9 @@ class NgramHasher(nn.Module):
         for i in range(1, n):
             rolling = torch.bitwise_xor(rolling, products[..., i])
             hashes.append(rolling.unsqueeze(-1) % self._dev["primes"][:, i - 1])
-        # each request's last n - 1 ids, for its next step
-        slot = torch.arange(n - 1, device=input_ids.device)[None, :]
-        at = rows.req_rows[:, None] - (n - 1) + slot  # index in the request's rows of the step
-        held = torch.where(
-            at >= 0, compressed[(rows.req_first[:, None] + at).clamp(0, max(input_ids.shape[0] - 1, 0))],
-            held.gather(1, (n - 1 + at).clamp(0, n - 2)))
+        # each request's last ids, for its next step
+        tail = rows.tail(slots)
+        held[rows.row_req[tail], rows.pos[tail] % slots] = compressed[tail]
         self._state.scatter_(NGRAM, held, None, label=LABEL)
         return torch.cat(hashes, dim=-1) + self._dev["offsets"]
 

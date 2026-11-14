@@ -1052,10 +1052,20 @@ blocks with their own 128 experts (top 3) draft a block of 5 tokens for each req
 every step, from the token the step sampled and the backbone's hidden states entering layers
 37 to 39; a low-rank Markov head corrects each row's logits from the token drafted before it,
 and a confidence head scores each row. Each draft block keeps a window of those hidden states
-per request in ``state`` (0.4 MB more a request). The head is held to the checkpoint's
-reference (``forward_spec``), but no speculative path is served yet: nothing reads the
-drafts, so the knob is for parity and measurement, at the cost of a draft pass per step. Off
-(the default), its tensors stay in the checkpoint and nothing is allocated.
+per request in ``state``. The head is held to the checkpoint's reference (``forward_spec``),
+but no speculative path is served yet: nothing reads the drafts, so the knob is for parity
+and measurement, at the cost of a draft pass per step. Off (the default), its tensors stay in
+the checkpoint and nothing is allocated.
+
+With the head, a decode step may also carry up to 5 drafts behind a request's token: the step
+runs them as decode rows, keeps the drafts that hold (each the argmax of the row before it),
+samples the token after the last kept row and drafts on from there, and
+``DeepseekV41LLMSubmodule.take_back`` takes the rejected rows out of the request's context
+before its next step. Every ring a request keeps in ``state`` then holds 5 positions more
+than it reads, so a rejected row overwrites nothing still needed (7.1 MB a request with the
+head, 5.6 MB without). This is the mechanism a speculative path would stand on, driven so
+far only by the tests' loop (``_testing.draft_verify``), where its tokens are plain greedy
+decoding's.
 
 Chat renders each message in its role through the checkpoint's chat template (``developer``
 as ``system``; tool results fold into the next user turn, as the checkpoint's encoder writes

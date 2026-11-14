@@ -15,6 +15,7 @@ import json
 import sys
 import types
 from pathlib import Path
+from typing import NamedTuple
 
 import torch
 
@@ -475,6 +476,86 @@ def record_drafts(model) -> list:
     head = model.get_submodule("LLM").language_model.model.mtp
     head.register_forward_hook(lambda module, args, out: drafts.append(out))
     return drafts
+
+
+def record_logits(model) -> list:
+    """The logits of every step ``model``'s LLM node runs from here on, a row per step row:
+    of a decode step that carries drafts, every row's, where the sampler sees the kept ones."""
+    logits: list = []
+    lm = model.get_submodule("LLM").language_model
+    lm.register_forward_hook(lambda module, args, out: logits.append(out.detach().float().clone()))
+    return logits
+
+
+def greedy(engine, sampler, prompt: torch.Tensor, new_tokens: int, rid: str = "r"):
+    """Plain greedy decoding, a token a step: the ``new_tokens`` tokens after ``prompt`` and
+    the logits each is the argmax of. The request stays in the engine."""
+    add_request(engine, rid)
+    logits = [run_step(engine, sampler, "prefill", {rid: prompt})[rid]]
+    tokens = [logits[0].argmax()]
+    while len(tokens) < new_tokens:
+        logits.append(run_step(engine, sampler, "decode", {rid: tokens[-1].view(1)})[rid])
+        tokens.append(logits[-1].argmax())
+    return torch.stack(tokens), torch.stack(logits)
+
+
+class DraftVerify(NamedTuple):
+    """A greedy draft-and-verify run."""
+    tokens: torch.Tensor   # the tokens emitted, the last not yet run
+    logits: torch.Tensor   # the logits each is the argmax of
+    accepted: list         # per verify step, the drafts kept
+    drafted: list          # per verify step, the drafts it ran
+
+
+def likely_drafter(truth: torch.Tensor, vocab_size: int, probability: float, block: int, seed: int = 0,
+                   miss: int = 1):
+    """A stand-in drafter that knows the continuation ``truth``: after ``emitted`` tokens it
+    drafts the next ``block``, each the true one with ``probability``, otherwise the token
+    ``miss`` ids after it."""
+    generator = torch.Generator().manual_seed(seed)
+
+    def drafter(emitted: int) -> torch.Tensor:
+        true = truth[emitted:emitted + block]
+        wrong = torch.rand(true.shape, generator=generator) >= probability
+        return torch.where(wrong, (true + miss) % vocab_size, true)
+
+    return drafter
+
+
+def draft_verify(engine, sampler, model, prompt: torch.Tensor, new_tokens: int, drafter=None,
+                 one_step: bool = True, rid: str = "r") -> DraftVerify:
+    """Greedy decoding by draft and verify on a model built with ``draft_head``, at least
+    ``new_tokens`` tokens after ``prompt``. Each round runs the last emitted token and the
+    drafts of the tokens after it, keeps the drafts that hold and takes the rest back
+    (``take_back``). ``drafter(emitted)`` gives the round's drafts (``likely_drafter``); None:
+    the draft head's own. The round is one decode step of all its rows (``one_step``), or a
+    decode step a row, whose arithmetic is a plain decode's. The request stays in the engine."""
+    sub = model.get_submodule("LLM")
+    rows, heads = record_logits(model), record_drafts(model)
+    add_request(engine, rid)
+    run_step(engine, sampler, "prefill", {rid: prompt})
+    logits, tokens, accepted, drafted = [rows[-1][-1]], [rows[-1][-1].argmax()], [], []
+    drafts = heads[-1].ids[0] if drafter is None else drafter(len(tokens))
+    while len(tokens) < new_tokens:
+        block = torch.cat([tokens[-1].view(1), drafts])
+        if one_step:
+            run_step(engine, sampler, "decode", {rid: block})
+            out, after = rows[-1], [heads[-1]]
+        else:
+            first = len(rows)
+            for token in block:
+                run_step(engine, sampler, "decode", {rid: token.view(1)})
+            out, after = torch.cat(rows[first:]), heads[first:]
+        target = out.argmax(-1)
+        kept = int((drafts == target[:-1]).long().cumprod(0).sum())
+        sub.take_back(rid, drafts.numel() - kept)
+        logits += out[:kept + 1]
+        tokens += target[:kept + 1]
+        accepted.append(kept)
+        drafted.append(drafts)
+        # the head drafted on from the last kept row: the step's one block, or that row's step's
+        drafts = (after[0] if one_step else after[kept]).ids[0] if drafter is None else drafter(len(tokens))
+    return DraftVerify(torch.stack(tokens), torch.stack(logits), accepted, drafted)
 
 
 def gloo_tp_rank(rank: int, world_size: int, store: str):

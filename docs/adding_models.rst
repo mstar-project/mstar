@@ -957,6 +957,14 @@ The spec types are:
        each cache at one width, ``CSAStep(context=...)`` tokens (all the cache holds when
        unset), so a replay's shapes follow from its bucket alone; a step of another shape
        under a lease, or a request past the step's context, is refused.
+       A decode step that carries drafts of a request's next tokens behind its token declares
+       ``CSAStep(decode_rows=True)``: every row is then scored as a one-token step's
+       (``CSARows.decode`` tells the layers). ``take_back(rid, tokens)`` takes the rejected
+       ones out between steps: the request's count moves back, and each cache's length by the
+       groups those tokens completed (``KVManager.correct_len``), their rows left past the
+       lengths for the next tokens to overwrite. What a model keeps by position beside the
+       caches is its own to keep whole across a take-back (DeepSeek-V4.1's rings hold spare
+       positions for it).
    * - ``DSASpec(config=DSAConfig(kv_cache=..., topk=...))``
      - DeepSeek sparse attention (DSA) over the named ``KVLayout.MLA`` cache: past ``topk``
        keys, each query row attends only the ``topk`` tokens its indexer scores highest.

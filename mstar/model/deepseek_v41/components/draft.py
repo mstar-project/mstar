@@ -1,7 +1,7 @@
 """DeepSeek-V4.1's draft head (DSpark, ``mtp.*`` in the checkpoint): a block of draft tokens
 for each request in one pass.
 
-A draft block is ``dspark_block_size`` rows after a request's last token: the token to
+A draft block is ``dspark_block_size`` rows after a request's last kept token: the token to
 continue from, then a noise token per further row. The draft layers, window-only blocks with
 their own experts, run over those rows. A row attends every row of its block, the later ones
 too, and a window of the backbone's hidden states: the mean of the streams entering the target
@@ -57,12 +57,15 @@ class DraftAttention(DeepseekV41Attention):
     request's last tokens, not the layer's own rows."""
 
     def _keep(self, main: torch.Tensor, rows: CSARows, rope: Rope) -> torch.Tensor:
-        """The requests' windows ``(requests, window, D)`` with the step's rows in: each
-        position's projected hidden state as this layer's latent, at ring slot ``p % window``."""
+        """The requests' windows ``(requests, slots, D)`` with the step's rows in: each
+        position's projected hidden state as this layer's latent, at ring slot ``p % slots``.
+        Every row of the step, a rejected draft's too: the draft rows attend by position, up
+        to the last kept one."""
         ring = self._state.gather(WINDOW, self.layer, label=LABEL)
+        slots = ring.shape[1]
         latent = self._latent(main, rope.angles(rows.pos, False))
-        tail = rows.pos >= rows.end - self.window
-        ring[rows.row_req[tail], rows.pos[tail] % self.window] = latent[tail].to(ring.dtype)
+        tail = rows.tail(slots)
+        ring[rows.row_req[tail], rows.pos[tail] % slots] = latent[tail].to(ring.dtype)
         self._state.scatter_(WINDOW, ring, self.layer, label=LABEL)
         return ring
 
@@ -132,38 +135,44 @@ class DraftHead(nn.ModuleList):
         super().__init__(
             DraftBlock(config, stage, comm_group, moe_parallel) for stage in range(config.num_nextn_predict_layers))
         self.block, self.window, self.hc_mult = config.dspark_block_size, config.sliding_window, config.hc_mult
+        self.slots = config.window_slots
         self.noise_token_id = config.dspark_noise_token_id
         self._csa = None
 
     def bind_resources(self, resources: dict) -> None:
         self._csa = resources[CSA]
 
-    def _rows(self, rows: CSARows, main: torch.Tensor) -> DraftRows:
-        """The draft rows after each request's last row of the step. A row's entries are laid
-        out as the checkpoint's reference lays them, since the softmax accumulates over them in
-        blocks: the window's ring slots in order (slot ``j`` holds the latest position that is
-        ``j`` modulo the window), as many as the request has tokens, then the block's rows."""
-        size, win, device = self.block, self.window, main.device
+    def _rows(self, rows: CSARows, main: torch.Tensor, kept: torch.Tensor | None) -> DraftRows:
+        """The draft rows after each request's last kept row of the step. A row's entries are
+        laid out as the checkpoint's reference lays them, since the softmax accumulates over
+        them in blocks: the window in the order of a ring of its size (entry ``j`` is the
+        latest kept position that is ``j`` modulo the window), as many as the request has
+        tokens, then the block's rows."""
+        size, win, slots, device = self.block, self.window, self.slots, main.device
         requests = rows.req_first.shape[0]
-        last = rows.pos[rows.req_first + rows.req_rows - 1]
+        last = rows.pos[rows.req_first + rows.req_rows - 1 if kept is None else kept]
         req = torch.arange(requests, device=device).repeat_interleave(size)
         pos = (last[:, None] + 1 + torch.arange(size, device=device)).flatten()
-        # as wide as the longest row, which the host knows from the step's spans
+        # as wide as the longest row can be, which the host knows from the step's spans
         width = min(win, max(start + n for _, n, start in rows.spans)) + size
         col = torch.arange(width, device=device)[None, :]
-        held = (last[req, None] + 1).clamp_max(win)
-        in_ring = req[:, None] * win + col
-        in_block = requests * win + req[:, None] * size + col - held
+        last = last[req, None]
+        held = (last + 1).clamp_max(win)
+        in_ring = req[:, None] * slots + (last - (last - col) % win) % slots
+        in_block = requests * slots + req[:, None] * size + col - held
         idx = torch.where(col < held, in_ring, torch.where(col < held + size, in_block, -1))
         return DraftRows(main, rows, pos, idx, (held + size).squeeze(1))
 
-    def forward(self, tokens: torch.Tensor, taps: torch.Tensor, embed: nn.Module, logits, rope: Rope) -> Draft:
-        """A draft block per request, continuing from ``tokens (requests,)``, the token each
-        request's last row of the step sampled. ``taps (T, targets * hidden)``: the mean of the
-        streams entering each target layer, for every row of the step, which the draft layers'
-        windows take in first. ``embed`` and ``logits`` are the backbone's embedding and head."""
+    def forward(self, tokens: torch.Tensor, taps: torch.Tensor, embed: nn.Module, logits, rope: Rope,
+                kept: torch.Tensor | None = None) -> Draft:
+        """A draft block per request, continuing from ``tokens (requests,)``, the token sampled
+        after each request's last kept row: its last row of the step, or the step row ``kept
+        (requests,)`` names where the rows after it were drafts that did not hold.
+        ``taps (T, targets * hidden)``: the mean of the streams entering each target layer, for
+        every row of the step, which the draft layers' windows take in first. ``embed`` and
+        ``logits`` are the backbone's embedding and head."""
         first, last = self[0], self[-1]
-        draft = self._rows(self._csa.current(LABEL), first.main_norm(first.main_proj(taps)))
+        draft = self._rows(self._csa.current(LABEL), first.main_norm(first.main_proj(taps)), kept)
         requests, size = tokens.shape[0], self.block
         ids = torch.full((requests, size), self.noise_token_id, dtype=tokens.dtype, device=tokens.device)
         ids[:, 0] = tokens

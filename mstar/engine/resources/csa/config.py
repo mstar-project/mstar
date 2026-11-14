@@ -123,3 +123,9 @@ class CSAStep(ResourceStep):
     # a captured step's rows score each cache over this many tokens of context, the width its
     # graph was recorded at, which every request of the step must fit; None: all a cache holds
     context: int | None = None
+
+    # every row of the step is its request's next token, run as a one-token step runs it,
+    # however many rows a request has (``CSARows.decode``): a decode step that carries drafts
+    # of the tokens after its first, of which the caller may take the last ones back
+    # (``CSAManager.take_back``)
+    decode_rows: bool = False

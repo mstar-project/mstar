@@ -37,7 +37,13 @@ logger = logging.getLogger(__name__)
 
 class DeepseekV41LLMSubmodule(ARNodeSubmodule):
     """Embed, the hyper-connected blocks and the LM head, one TP node; with ``draft_head`` the
-    draft layers too, which draft a block for each request after every step."""
+    draft layers too, which draft a block for each request after every step.
+
+    With the draft head a decode step may carry drafts: a request's ids after its first are
+    drafts of the tokens that follow it. The step runs them all as decode rows, keeps the
+    drafts that hold (each the argmax of the row before it), samples the token after the last
+    kept row and drafts on from there. The rejected rows stay counted until the caller takes
+    them back (``take_back``), before the request's next step."""
 
     # the reference numerics run in fp32 on purpose in many places, which the engine's bf16
     # autocast and a compile of the eager forward would both undo
@@ -137,7 +143,35 @@ class DeepseekV41LLMSubmodule(ARNodeSubmodule):
                 f"max_seq_len={self.config.max_seq_len}")
         if graph_walk == "prefill":
             state.add("prompt_len", context + seq_len)
+        elif seq_len > 1 + self.config.take_back_tokens:
+            raise RuntimeError(
+                f"request {fwd_info.request_id}: a decode step of {seq_len} tokens; it takes one and "
+                f"at most {self.config.take_back_tokens} drafts to verify")
+        elif seq_len > 1:
+            self._check_draft_sampling(fwd_info)
         return ARNodeInputs(input_ids=text_inputs, input_seq_len=seq_len)
+
+    def _check_draft_sampling(self, fwd_info: CurrentForwardPassInfo) -> None:
+        """Drafts are kept by argmax: refuse a request whose own next token would be another,
+        one that samples (as a request with no sampler config does) or penalizes repeats."""
+        cfg = fwd_info.resource_configs.get(SAMPLER) if fwd_info.resource_configs else None
+        temperature = None if cfg is None else cfg.temperature
+        penalty = None if cfg is None else cfg.repetition_penalty
+        if temperature != 0.0 or penalty not in (None, 1.0):
+            raise RuntimeError(
+                f"request {fwd_info.request_id}: a decode step carries drafts, which are verified by argmax; "
+                f"the request has temperature={temperature} and repetition_penalty={penalty}")
+
+    def take_back(self, request_id, tokens: int) -> None:
+        """Take a request's last ``tokens`` tokens out of its context: the drafts its last decode
+        step ran and did not keep. Between its steps; its windows and open groups hold room
+        for as many as one step may carry (``take_back_tokens``)."""
+        if not 0 <= tokens <= self.config.take_back_tokens:
+            raise ValueError(f"take_back of {tokens} tokens; the request's state keeps room for "
+                             f"{self.config.take_back_tokens}")
+        self.node_resources[CSA].take_back(request_id, tokens, LABEL)
+        state = self.request_state(request_id)
+        state.add("context", state.get("context", 0) - tokens)
 
     def declare_step(
         self,
@@ -164,7 +198,8 @@ class DeepseekV41LLMSubmodule(ARNodeSubmodule):
             cg_key_info=context,
             steps={
                 **{key: KVStep(segments=rows) for key, rows in caches.items()},
-                CSA: CSAStep(context=context),
+                # a decode step's rows are each a next token of their request, drafts included
+                CSA: CSAStep(context=context, decode_rows=graph_walk == "decode"),
                 STATE: RecurrentStep(),
                 SAMPLER: SamplerStep(apply_penalty=True, prefill_tracked_tokens=prefill_tokens),
                 **({ENGRAM: HostTableStep()} if self.config.engram_on_host else {}),
@@ -189,16 +224,31 @@ class DeepseekV41LLMSubmodule(ARNodeSubmodule):
             out["last_rows"] = rows
         return out
 
+    def _kept_rows(self, input_ids: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
+        """Each request's last kept row of a decode step that carries drafts: its first row,
+        then its drafts while each is the argmax of the row before it."""
+        rows = self.node_resources[CSA].current(LABEL)
+        row = torch.arange(input_ids.shape[0], device=input_ids.device)
+        wrong = (row > rows.first) & (input_ids != logits.argmax(-1).roll(1))
+        ends = rows.req_first + rows.req_rows
+        first_wrong = ends.scatter_reduce(0, rows.row_req[wrong], row[wrong], "amin")
+        return first_wrong - 1
+
     def _forward(
-        self, engine_inputs: ModelInputsFromEngine, input_ids: torch.Tensor,
+        self, graph_walk: str, engine_inputs: ModelInputsFromEngine, input_ids: torch.Tensor,
         last_rows: torch.Tensor | None = None,
     ) -> torch.Tensor:
         taps = [] if self.config.draft_head else None
         logits = self.language_model(input_ids, last_rows, taps)
+        kept = None
+        if graph_walk == "decode" and logits.shape[0] != len(engine_inputs.request_ids):
+            # some request carries drafts: the token after its last kept row is the one sampled
+            kept = self._kept_rows(input_ids, logits)
+            logits = logits.index_select(0, kept)
         new_tokens = engine_inputs.resources[SAMPLER].sample(engine_inputs.request_ids, logits=logits)
         if taps is not None:
             # the draft layers' windows follow every step; nothing reads the drafts yet
-            self.language_model.draft(new_tokens, taps)
+            self.language_model.draft(new_tokens, taps, kept)
         return new_tokens
 
     def forward(
@@ -209,7 +259,7 @@ class DeepseekV41LLMSubmodule(ARNodeSubmodule):
         last_rows: torch.Tensor | None = None,
         **kwargs,
     ) -> NameToTensorList:
-        return {"new_token": self._forward(engine_inputs, input_ids, last_rows)}
+        return {"new_token": self._forward(graph_walk, engine_inputs, input_ids, last_rows)}
 
     def can_batch(self, batch: ExecutingBatch, model_inputs: list[NodeInputs]) -> bool:
         return True
@@ -222,7 +272,7 @@ class DeepseekV41LLMSubmodule(ARNodeSubmodule):
         last_rows: torch.Tensor | None = None,
         **kwargs,
     ) -> dict[str, NameToTensorList] | BatchedModelOutput:
-        new_tokens = self._forward(engine_inputs, input_ids, last_rows)
+        new_tokens = self._forward(graph_walk, engine_inputs, input_ids, last_rows)
         return BatchedModelOutput(
             row_outputs={"new_token": new_tokens},
             check_stop_buffers={"new_token": new_tokens},
