@@ -119,6 +119,20 @@ def test_unbounded_dense_log_has_finite_read_derived_retention():
         build_specs([frames])
 
 
+def test_unbounded_noop_window_keeps_kv_attention_contract():
+    for lifetime in ("request", "episode"):
+        frames = _frames(lifetime=lifetime)
+        assert storage_of(frames) is DENSE_WINDOW
+        assert isinstance(build_specs([frames])[0], DenseWindowSpec)
+
+    kv = Array(
+        "kv", nodes={"decoder"}, layers={0}, entry=KVEntry(heads=2, head_dim=8),
+        max_len=None, reads={"context": Read(mask=Window(4))},
+    )
+    with pytest.raises(ValueError, match="op must be Attend"):
+        build_specs([kv])
+
+
 def test_dense_window_keeps_only_latest_executed_frames_across_calls():
     frames = _frames(reads={"context": Read(mask=Window(48))})
     (spec,) = build_specs([frames])
@@ -768,4 +782,10 @@ def test_idle_end_then_new_in_one_worker_batch_waits_for_slot_release():
 ])
 def test_unbounded_log_refuses_declarations_without_provable_dense_retention(override, match):
     with pytest.raises(ValueError, match=match):
-        _frames(**override)
+        _frames(lifetime="episode", **override)
+
+
+def test_request_dense_window_refuses_positions_it_cannot_serve():
+    frames = _frames(positions=object())
+    with pytest.raises(ValueError, match="append-only tensor log"):
+        storage_of(frames)
