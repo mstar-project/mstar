@@ -924,7 +924,9 @@ a refused admit draws the same noise.
 ``splits`` on a ``GatedDeltaNet``, and ``max_segments_per_request``, ``max_segments_per_step``,
 ``compile_op`` and ``workspace_mb`` on a ``Block`` read. Under an array's name it sets the default size of the array's pool, ``max_num_pages``
 on a paged array and ``max_slots`` on a ``Value`` with tensor fields or an unbounded array, which a deployment's
-``resources:`` block overrides. A cross read on an array that keeps entries takes
+``resources:`` block overrides. ``max_slots_of`` names a paged array whose pages size the
+``Value``'s pool, a slot per label for each request those pages could hold, for state every
+request holds beside its KV. A cross read on an array that keeps entries takes
 ``decode_tensor_cores`` alone, and two reads that share a resource can't set one field to two
 values. It refuses anything else.
 
@@ -3219,8 +3221,9 @@ that a misspelled setting is never silently ignored:
        draw takes each row's argmax in a step whose rows all sample greedily, in a twin of
        each batched capture)
    * - ``RecurrentStateSpec``
-     - ``max_slots``, ``state_dtype`` (on a ``Value``, only with a ``GatedDeltaNet``),
-       ``prefix_slots`` (see **Cross-request prefix reuse**).
+     - ``max_slots``, ``max_slots_of`` (a paged KV pool, whose ``max_num_pages`` size this
+       one unless its block sets ``max_slots``), ``state_dtype`` (on a ``Value``, only with a
+       ``GatedDeltaNet``), ``prefix_slots`` (see **Cross-request prefix reuse**).
        ``max_slots`` counts the sink unless ``disable_sink_slot``; a value that leaves no
        slot for a request is refused at startup.
    * - ``AttentionSpec``
