@@ -468,7 +468,7 @@ pub struct GraphRuntime {
                 }
                 if state.ingest(
                     g, node, slot, tensors, can_buffer, final_chunk,
-                ) {
+                ).is_some() {
                     return true;
                 }
             }
@@ -838,17 +838,14 @@ pub struct GraphRuntime {
         let was_in_flight = state.is_in_flight(spec_node);
         state.set_in_flight(spec_node, true);
 
-        // ingest reports success without saying WHICH slot it used, so the
-        // slot is inferred by peeking first -- the rollback removes from the
-        // two separately.
         let mut kept = Vec::new();
         let mut ingested = Vec::new();
         for (idx, slot, tensors, final_chunk) in resolved {
-            let already = state.has_input(spec_node, slot, false);
-            if state.ingest(&g, spec_node, slot, tensors, same_node, final_chunk)
+            if let Some(in_next) =
+                state.ingest(&g, spec_node, slot, tensors, same_node, final_chunk)
             {
                 kept.push(idx);
-                ingested.push((slot, already));
+                ingested.push((slot, in_next));
             }
         }
 
@@ -3074,7 +3071,7 @@ impl GraphRuntime {
                                 took = st.ingest(
                                     owner_g, d, slot, &e.tensors,
                                     true, false,
-                                );
+                                ).is_some();
                             }
                         }
                     }

@@ -442,7 +442,7 @@ def test_an_add_while_another_layers_scratch_add_waits_for_its_read_is_refused(a
     h = _kv_handle(attn=attn())
     _begin(h)
     _add(h, 0, keep=False)
-    _refused(r"Array 'kv': an add on layer 1 while layer 0's scratch add waits for its read", lambda: _add(h, 1))
+    _refused(r"Array 'kv': an add on layer 1 while layer 0's add waits for its read", lambda: _add(h, 1))
 
 
 @pytest.mark.parametrize("attn", [_StubDense, _DenseExchange], ids=["direct", "exchange"])

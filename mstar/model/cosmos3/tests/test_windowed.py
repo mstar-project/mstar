@@ -906,3 +906,17 @@ def test_long_rollout_state_stays_flat(monkeypatch) -> None:
             pinned = out[WINDOW_COND][0]
         # the first window's statics, chained windows' one more, and each kv window's own
         assert sum(key[0] == "window" for key in sub._statics.entries) == (2 + 23 if kv else 2)
+
+
+def test_action_batches_only_rows_that_agree_on_guidance() -> None:
+    """A batched action step runs both guidance branches for every row once
+    any row guides, so rows inside and outside their guidance_interval at this
+    step run apart."""
+    sub = _dit()
+    batch = SimpleNamespace(graph_walk=C.ACTION_GEN_WALK, request_ids=["a", "b"])
+    row = lambda active: SimpleNamespace(  # noqa: E731
+        resource_step_info=GenStepInfo(cfg=True, cfg_active=active, capture_key=None),
+    )
+    assert sub.can_batch(batch, [row(True), row(True)])
+    assert sub.can_batch(batch, [row(False), row(False)])
+    assert not sub.can_batch(batch, [row(True), row(False)])

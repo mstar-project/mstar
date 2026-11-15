@@ -1328,9 +1328,11 @@ Qwen3-TTS notes
   accumulates in the model dtype, rounding after every add (the reference sums
   in fp32 and rounds once), and Qwen3-Omni in fp32, rounded once. With
   ``depth_kernel: true`` in ``model_kwargs`` on a Hopper GPU with 128 or more
-  SMs, a step of up to 64 rows whose residual draws the graph sampler can hand
+  SMs, a step of 2 to 64 rows whose residual draws the graph sampler can hand
   over runs the whole loop, sampling included, as one persistent kernel
-  (``mstar.model.qwen3_tts.components.depth_frame``). The kernel needs Triton
+  (``mstar.model.qwen3_tts.components.depth_frame``), on the 0.6B and the
+  1.7B; the 0.6B's 1024-wide Talker runs it zero-padded to the 1.7B's width.
+  A one-row step runs the loop, which is faster there. The kernel needs Triton
   3.7, which comes with torch 2.12. Under torch 2.11's Triton 3.6, startup logs
   why and runs the loop.
 - The Codec does not run beside the Talker on a side stream (``side_stream``,
@@ -1571,29 +1573,31 @@ Nemotron VoiceChat (``nemotron_duplex``) notes
   (``mamba``) and the agent-text sampler (``nano_sampler``). Its decode step is
   captured as a CUDA graph for batch sizes 1 to 32.
 - Every per-session resource is sized for 32 sessions: a slot in each of
-  ``mamba_state``, ``encoder_state``, ``encoder_front`` and ``codec_state`` (``max_slots``, one
-  more than the sessions, for the sink) and in ``encoder_kv`` (``max_slots``,
+  ``mamba_state``, ``encoder_state``, ``encoder_front``, ``codec_state`` and ``talker_prev``
+  (``max_slots``, one more than the sessions, for the sink) and in ``encoder_kv`` (``max_slots``,
   no sink), and its pages in ``nano_kv`` and
   ``talker_kv`` (``max_num_pages``; both sized from ``max_session_s``, and the
   nano's from ``max_prompt_tokens`` too). The shipped configs set a
   conservative ``max_concurrent_requests: 16`` (below); raising it to 32 needs
-  no other change, and to serve more, raise the cap and all six with it. The server
+  no other change, and to serve more, raise the cap and all eight with it. The server
   refuses to start with a cap one of them cannot hold, since a session past
   any of them would wait on admit, and its frames with it, until another ends.
   The nano, the talker and the encoder each run at most 32 sessions
   a step, their widest CUDA graph; more are split over several steps rather
   than run eagerly.
 - ``eartts_talker`` advances every live session in one backbone pass per frame
-  through the engine's paged KV (``talker_kv`` / ``talker_attn`` /
-  ``talker_pos``): each session owns two streams, the conditional and the
+  through the engine's paged KV (``talker_kv``): each session owns two
+  streams, the conditional and the
   unconditional CFG context, planned together under one combined label, so a
   step is one packed batch of two tokens per session (a session's first step
   prefills its 38-token speaker/text warm-up instead). The pool's head dim is
   128: FlashInfer computes 64/128/256 exactly and returns wrong values for the
   talker's 72, so q/k/v are zero-padded (exact) and RoPE is applied in torch
-  from the positions the position resource planned. Sampling noise is drawn
-  per row from the request's seeded generator before the step, so a session's
-  speech does not depend on which other sessions share it. The per-frame step
+  from the step's positions. A session's sampling noise at its k-th talker
+  step is row k of a memo that one generator, seeded as every session's is,
+  fills in step order, so a session's speech does not depend on which other
+  sessions share it. The memo holds a row per step of the talker loop's cap,
+  about 0.61 MB per second of ``max_session_s`` (99 MB at 160 s). The per-frame step
   is captured as a CUDA graph for 1 to 32 sessions; a session's first step
   (its 38-token speaker warm-up) runs eager. The talker KV pool is 1025 pages
   of 128 positions (28 GiB): 32 sessions x 2 streams x 16 pages plus a sink
@@ -1653,8 +1657,11 @@ Nemotron VoiceChat (``nemotron_duplex``) notes
   any one file, past it gets a 400, as does one of more than two channels, and so
   does a live call whose appends pass it: ``audio_in`` declares the session's
   samples as its ``max_items``, which the client stream counts before the encoder
-  sees them (raise ``max_session_s``, not the stream's limit, for longer calls). A
-  call that ends with no more than 16 ms of audio, which the encoder cannot
+  sees them (raise ``max_session_s``, not the stream's limit, for longer calls).
+  The server refuses to start with a ``max_session_s`` past 596 s, where a
+  session's talker positions would pass the talker's 7500-position sliding
+  window: the talker reads every layer causally, which Gemma3's sliding layers
+  match only within it. A call that ends with no more than 16 ms of audio, which the encoder cannot
   featurize, fails with a 500 (the worker reports it without a client status).
   ``/generate/ws`` appends must be 16 kHz audio (they are neither
   resampled nor rescaled one by one, which would put a seam at every append);
@@ -1707,7 +1714,7 @@ Nemotron VoiceChat (``nemotron_duplex``) notes
   talker (with its codec) on two ranks. Launch with ``--tensor-comm-protocol SHM`` on a
   single node. Text samples at ``temperature: 0.7, top_p: 0.9`` by default;
   send ``temperature: 0`` for greedy. The talker's mixture-of-Gaussians sampling
-  is stochastic by design and seeded per request.
+  is stochastic by design, and every session draws the same seeded noise.
 - Known limitation of the checkpoint: it often answers speech that is not
   addressed to it, such as a side conversation or background speech, where it
   should keep its turn (about half of such pairs on Full-Duplex-Bench v1.5).
@@ -1860,8 +1867,10 @@ Cosmos3 environment requirements
   prefill, the captured CUDA graphs, and multi-request batches.
 - The default denoise attention backend is ``dense_gen``
   (``Cosmos3Config.attention_backend``), which runs bs=1 eager generation
-  attention as one FlashAttention-3 varlen kernel from the ``fa3-fwd`` wheel
-  (AITER's varlen kernel on ROCm).
+  attention as FlashAttention-3 kernels from the ``fa3-fwd`` wheel: varlen, or
+  on Hopper the fixed-length kernel for a single non-causal segment such as a
+  guidance-off step, and once per segment when every segment is at least 1536
+  rows, such as the guidance pair (AITER's varlen kernel on ROCm).
   That wheel is ABI-tied to the installed torch/CUDA build (Hopper builds
   exist for at least torch 2.9 + cu12.8 and torch 2.11 + cu13.0); install the
   one matching your environment. It ships kernels for sm_80 and sm_90a only.
@@ -1885,7 +1894,10 @@ Cosmos3 environment requirements
 - Generated video containers are written with ``torchcodec``'s ``VideoEncoder``
   when available (torchcodec >= 0.9), otherwise directly with PyAV (``av``,
   ``video_encode.encode_mp4``), whose wheel bundles FFmpeg with libx264; that also
-  covers a torchcodec that cannot load FFmpeg.
+  covers a torchcodec that cannot load FFmpeg. With torchcodec a clip of 48 frames or
+  more encodes in parallel pieces (``video_encode.encode_mp4_chunked``, up to 4, without
+  B-frames), joined into one stream: a keyframe starts each piece, and the file is a few
+  percent larger. A 121-frame 832x480 clip encodes in about half the time of one encode.
 - Sound-enabled video responses mux the AAC track with the ``ffmpeg`` and
   ``ffprobe`` binaries, which must be on ``PATH`` (system packages, not
   pip-installable).
@@ -1997,7 +2009,7 @@ rank peaks about 10 GB above its idle use on an H200, with about 60 GB to spare.
 Two or more requests at the same denoise step run one cross-request forward
 (``max_gen_batch_size``, default 8) for video, image, sound and action. With
 ``compile_denoise_batched`` (default on) the layer stack these steps share is
-compiled with the same mode, once, while the server starts, with the packed
+compiled with the same mode while the server starts, with only the packed
 length dynamic: no batch size or mix of resolutions compiles mid-traffic. The
 per-request patchify, rotary tables and unpatchify around it run eager.
 Compiled, a batched action step's outputs differ from the eager stack's at the
@@ -2006,14 +2018,18 @@ which already fills the GPU's GEMM and attention throughput, so a batch of N
 costs about N single steps: batching keeps requests in step rather than adding
 throughput.
 
-Captures (the text prefill and the denoise steps) are built for the guidance
-regime the deployment's default ``guidance_scale`` runs: both branches when it
-is not 1, the conditional branch alone when it is 1, which the distilled 4-step
-Super checkpoints force. A request in the other regime runs eager.
+The denoise-step captures are built for the guidance regime the deployment's
+default ``guidance_scale`` runs: both branches when it is not 1, the
+conditional branch alone when it is 1, which the distilled 4-step Super
+checkpoints force. A denoise step in the other regime runs eager. The text
+prefill is captured in both regimes, since a guided checkpoint also serves
+guidance-scale-1 requests (the Edge configs' action requests, forward and
+inverse dynamics); a distilled checkpoint captures only its own.
 ``gen_capture_image`` lists the (height, width) image tiers to capture
 (default 192x320, 480x832 and 720x1280, each still bounded by
 ``graph_max_latent_area``); the Super T2I config captures its 1024x1024
-default.
+default. ``compile_prefill`` (default off) compiles the captured text prefill
+in ``denoise_compile_mode``; the Super T2I config turns it on.
 
 The action policy (``cosmos3_edge_droid``, or ``cosmos3_edge`` with an action
 ``domain_name``) predicts a chunk of robot actions from the current observation:
@@ -2041,7 +2057,13 @@ and ``cosmos3_edge_droid`` guides only inside the cookbook's interval
 runs alone, batched requests too). For a control loop use ``/generate/ws`` (one
 connection, pipelined observations): ``examples/cosmos3_action_ws_client.py``
 builds that request, runs the loop and reports chunks/s, actions/s and latency
-percentiles.
+percentiles. Both DROID configs set ``compile_vae_encode_size: [736, 544]``:
+the ``vae_encoder`` node compiles the one-frame encode at that size, in
+Inductor's deterministic mode on channels-last encoder weights, and a startup
+``warmup_requests`` entry builds it, so a RoboLab observation encodes in 4.6 ms
+instead of 9.3 ms on an H200 (Nano). Every other encode (another size, a
+video clip) runs eager, about 9% slower than on stock weights, so nothing
+compiles mid-traffic. Unset, every encode runs eager on stock weights.
 
 Cosmos3 streaming rollout (windowed video)
 ------------------------------------------

@@ -56,7 +56,6 @@ from functools import partial
 from typing import Any, NamedTuple
 
 import torch
-from torch.fx.experimental import _config as fx_config
 
 from mstar.conductor.request_info import CurrentForwardPassInfo
 from mstar.engine.accelerator_graph_config import (
@@ -244,13 +243,19 @@ REASONER_DECODE_LOOP = "decode_loop"
 REASONER_LABEL = "main"
 
 
+def engine_compile_mode(mode: str) -> str | None:
+    """The engine compile mode for a ``Cosmos3Config.denoise_compile_mode``:
+    "deterministic" and "default" are the engine's modes of those names,
+    "level" (None) its -O level."""
+    return None if mode == "level" else mode
+
+
 def denoise_compile_kwargs(mode: str) -> dict:
     """``torch.compile`` arguments for the denoise step; see
-    ``Cosmos3Config.denoise_compile_mode``. "deterministic" and "default" are
-    the engine's compile modes of those names, "level" its -O level."""
+    ``Cosmos3Config.denoise_compile_mode``."""
     from mstar.engine.accelerator_graph_runner import compile_kwargs
 
-    return compile_kwargs(None if mode == "level" else mode)
+    return compile_kwargs(engine_compile_mode(mode))
 
 
 def latent_frames(num_frames: int, config) -> int:
@@ -463,8 +468,9 @@ class GenStepInfo:
     speedup; declaring the dense one for a step that does get a slot would try
     to capture an eager-only backend, so the safe direction over-declares.
 
-    ``cfg_active`` narrows the eager single-request declaration only. It is
-    deliberately not part of ``capture_key`` — see ``cg_key_info``.
+    ``cfg_active`` narrows the eager declarations: the single-request step's,
+    and a cross-request action step's, whose rows ``can_batch`` keeps to one
+    value. It is deliberately not part of ``capture_key`` — see ``cg_key_info``.
     """
     cfg: bool                 # this request has an unconditional branch at all
     cfg_active: bool          # ...and this step is inside its guidance interval
@@ -558,12 +564,14 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             )
             if config.compile_denoise_batched:
                 # Only the cross-request step's layer stack, with the pack
-                # length dynamic: one compile, built by `warmup_compiles`
-                # before the first request, serves every batch size and mix of
-                # resolutions. The per-request patchify, rotary and unpatchify
-                # around it run eager.
+                # length dynamic: built by `warmup_compiles` before the first
+                # request, it serves every batch size and mix of resolutions.
+                # The per-request patchify, rotary and unpatchify around it run
+                # eager. Automatic dynamic rather than dynamic=True, so only
+                # the pack length is symbolic: with the head dim symbolic too,
+                # the QK-norm + RoPE kernel ran 5x slower.
                 self.transformer.gen_layers_batched = torch.compile(
-                    self.transformer.gen_layers_batched, **{**kwargs, "dynamic": True},
+                    self.transformer.gen_layers_batched, **{**kwargs, "dynamic": None},
                 )
             logger.info("Cosmos3 denoise compute torch.compile enabled (%s)", config.denoise_compile_mode)
 
@@ -578,11 +586,14 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
 
     def warmup_compiles(self) -> None:
         """Build the compiled cross-request layer stack before the first
-        request: one two-request step at the default size, through
+        request: a two- and a three-request step at the default size, through
         ``denoise_step_batched`` with a stand-in for the ``kv`` handle, since no
-        request has planned a step yet. The handle's calls are graph breaks, so
-        what the stand-in returns never enters a compiled graph, and the graph
-        does not depend on the size it was built at."""
+        request has planned a step yet. The layers' code is shared with the
+        single-request step, so where a capture compiled it first, the first
+        length already builds the dynamic graph; otherwise that one compiles
+        static, and the second length is the one that makes the pack length
+        symbolic. The handle's calls are graph breaks, so what the stand-in
+        returns never enters a compiled graph."""
         if not (self.config.compile_denoise and self.config.compile_denoise_batched) or self.transformer is None:
             return
         cfg = self.config
@@ -603,15 +614,14 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             static["rotary"],
         )
         t0 = time.perf_counter()
-        # as `forward_batched` runs it: native dtype, no autocast. Without duck sizing, which would
-        # tie a pack as long as the hidden size (Nano's default, 4096) to that static size and
-        # compile again at the first other length.
+        # as `forward_batched` runs it: native dtype, no autocast
         self._bind_transformer({**self.state_handles, KV_CACHE: _warmup_kv(self.state_handles[KV_CACHE])})
-        with torch.autocast(device_type=device.type, enabled=False), fx_config.patch(use_duck_shape=False):
-            self.transformer.denoise_step_batched([row, row])
+        with torch.autocast(device_type=device.type, enabled=False):
+            for rows in (2, 3):
+                self.transformer.denoise_step_batched([row] * rows)
         self._bind_transformer(self.state_handles)
         logger.info(
-            "Cosmos3 cross-request layer stack compiled in %.1f s (%dx%dx%d, two requests)",
+            "Cosmos3 cross-request layer stack compiled in %.1f s (%dx%dx%d, two and three requests)",
             time.perf_counter() - t0, width, height, frames,
         )
 
@@ -639,8 +649,9 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         — so every condition the old gate checked lives here:
 
         * a request's guidance regime (``_regime``: both branches, or the
-          conditional one alone) is part of every key, and only the regime the
-          deployment's default guidance runs is captured (``_capture_regime``);
+          conditional one alone) is part of every key; the denoise step is
+          captured only in the regime the deployment's default guidance runs
+          (``_capture_regime``), the prefill in both (``_prefill_capture_regimes``);
         * of the denoise walks only ``image_gen`` and the plain and chained
           video walks, and only at a latent shape a graph was captured for
           (``_capture_keys``);
@@ -1674,9 +1685,8 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             # Cross-request batch: one step over every request's guidance
             # branches (a single branch when guidance is off). The image and
             # sound batched forwards run both branches whenever the branch
-            # exists. The action one runs the conditional branch alone when no
-            # row is inside its guidance interval, as a single request does
-            # (rows outside it in a guided batch drop the other branch).
+            # exists. An action batch's rows agree on guidance this step
+            # (`can_batch`), so it runs both branches or the conditional one alone.
             cfg = infos[0].cfg and (graph_walk not in ACTION_WALKS or any(info.cfg_active for info in infos))
         else:
             # Guidance off, or a guidance_interval out-of-interval step, runs
@@ -1838,9 +1848,11 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         ``_forward_action_gen`` call this for the same step, so the declared
         attention (batched vs cond-only) matches the forward that runs.
 
-        A captured two-branch step and the cross-request batch always run both
-        branches; ``postprocess`` and ``forward_batched`` call this to keep
-        the conditional one outside the interval. See ``cg_key_info`` for why
+        A captured two-branch step and the cross-request image / video batch
+        always run both branches; ``postprocess`` and ``forward_batched`` call
+        this to keep the conditional one outside the interval. A cross-request
+        action batch runs only the branches its rows' shared value calls for
+        (``can_batch``). See ``cg_key_info`` for why
         the interval is not folded into the capture key."""
         if st["uncond"] is None:
             return False
@@ -2061,7 +2073,10 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             # policy -- or all two-branch), so one step covers the batch. Modes
             # and embodiment domains may differ: each request's masks, scheduler
             # and domain-aware action projection are applied per request.
-            return len({info.cfg for info in infos}) == 1
+            # Rows must also agree on whether this step guides: a batch runs
+            # both branches for every row once any row is inside its
+            # guidance_interval, which doubles the work of the rows outside it.
+            return len({info.cfg for info in infos}) == 1 and len({info.cfg_active for info in infos}) == 1
         if batch.graph_walk not in GEN_WALKS and batch.graph_walk not in SOUND_WALKS:
             return False
         # Image/video/sound batch only in the two-branch guidance regime.
@@ -2215,9 +2230,9 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         forward. Mirrors the image batched path: build each request's static gen
         inputs (clamping a request that has run one step past its denoise count),
         run one batched transformer pass, then per request combine the guidance
-        branches (when present) and apply its own joint scheduler step. When no
-        row is inside its guidance interval the batch runs the conditional
-        branch alone, as ``declare_step`` planned it."""
+        branches (when present) and apply its own joint scheduler step. The rows
+        agree on guidance this step (``can_batch``), so the batch runs both
+        branches or the conditional one alone, as ``declare_step`` planned it."""
         rids = engine_inputs.request_ids
         with_cfg = states[rids[0]]["uncond"] is not None and any(
             self._cfg_active(states[rid], _loop_step(engine_inputs.per_request_info[rid], graph_walk))
@@ -2260,8 +2275,7 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
         out = {}
         for (rid, st, lat, act, k), branches in zip(meta, results, strict=True):
             video_v, action_v = branches[0]
-            # The batch runs both branches, but a step outside the request's
-            # guidance_interval keeps the conditional one, as the single path does.
+            # `can_batch` keeps the rows to one value; the per-row check is belt and braces.
             if with_cfg and self._cfg_active(st, k):
                 uncond_video, uncond_action = branches[1]
                 video_v = _guided(video_v, uncond_video, st["gs"], lat.dtype)
@@ -2280,10 +2294,12 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
     def get_accelerator_graph_configs(self, device, tp_world_size: int = 1):
         """Declare one fixed-shape capture of the image denoise step per
         resolution, in the guidance regime the deployment's default guidance
-        runs (``_capture_regime``). Requests at other resolutions, or in the
-        other regime, fall back to the eager path. The per-resolution token layout is prompt-independent,
-        so bake it once here and key it by latent shape; the per-prompt rotary
-        tables, the latents and the timestep flow in as static-buffer inputs.
+        runs (``_capture_regime``), and the text prefill in every regime a
+        request can run (``_prefill_capture_regimes``). Denoise steps at other
+        resolutions, or in the other regime, fall back to the eager path. The
+        per-resolution token layout is prompt-independent, so bake it once here
+        and key it by latent shape; the per-prompt rotary tables, the latents
+        and the timestep flow in as static-buffer inputs.
 
         Set ``COSMOS3_DISABLE_CUDA_GRAPH=1`` to skip capture and run the denoise
         loop eagerly (escape hatch for a misbehaving driver, and an A/B switch).
@@ -2357,9 +2373,17 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
                 walk, replay_walks, regime,
             ))
 
-        configs.extend(self._prefill_capture_configs(device, regime))
+        configs.extend(self._prefill_capture_configs(device, self._prefill_capture_regimes()))
         self._captured_walks = frozenset(w for c in configs for w in c.replay_graph_walks)
         return configs
+
+    def _prefill_capture_regimes(self) -> tuple[GuidanceRegime, ...]:
+        """The prefill is captured in every regime a request can run, since
+        each regime keys its own graph (`cg_key_info`) and an uncaptured one
+        runs eager and host-bound. A guided checkpoint serves both, whatever
+        its default (action requests, forward and inverse dynamics and client
+        overrides change the scale); a distilled one refuses any scale but 1."""
+        return (COND_REGIME,) if self.config.distilled_sigmas else (CFG_REGIME, COND_REGIME)
 
     def _capture_regime(self) -> GuidanceRegime:
         """The guidance regime the captures are built for: the one a request
@@ -2438,9 +2462,9 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             total_tokens_multiplier=regime.tokens_multiplier,
         )
 
-    def _prefill_capture_configs(self, device, regime: GuidanceRegime) -> list:
+    def _prefill_capture_configs(self, device, regimes: tuple[GuidanceRegime, ...]) -> list:
         configs = []
-        # Understanding-tower text prefill in the captured regime: cond+uncond
+        # Understanding-tower text prefill, one config per regime: cond+uncond
         # packed into one combined sequence (batched CFG), or the conditional
         # prompt alone. The dummy zeros are placeholders — the real
         # input_ids / mrope ids are copied into the static buffers at replay.
@@ -2452,20 +2476,22 @@ class Cosmos3DiTSubmodule(ARNodeSubmodule):
             )
             mrope_dtype = torch.float32 if self.config.enable_fps_modulation else torch.long
 
-            configs.append(PackedAcceleratorGraphConfig(
+            configs.extend(PackedAcceleratorGraphConfig(
                 capture_graph_walk=PREFILL_WALK,
                 replay_graph_walks=list(PREFILL_WALKS),
                 capture_token_lengths=list(self.prefill_capture_token_buckets),
-                make_node_input=lambda n: self._prefill_capture_input(
+                make_node_input=lambda n, regime=regime: self._prefill_capture_input(
                     n, device, mrope_dtype, regime,
                 ),
-                # A prefill in the other regime declares a different set of
-                # labels, so it keys elsewhere (`cg_key_info`) and runs eager.
+                # Each regime declares its own set of labels, so it keys its
+                # own graph (`cg_key_info`).
                 additional_key_info=regime.name,
-                compile=False,
-                capture_batch_sizes=prefill_bs,
+                compile=self.config.compile_prefill,
+                compile_mode=engine_compile_mode(self.config.denoise_compile_mode),
+                # a regime that never batches never fills a wider bucket
+                capture_batch_sizes=prefill_bs if regime.batches else [1],
                 caps_eager_batch_size=False,
-            ))
+            ) for regime in regimes)
         return configs
 
     def _prefill_capture_input(
@@ -2626,8 +2652,9 @@ class Cosmos3VAEEncoderSubmodule(NodeSubmodule):
         frames of a full-latent-shape tensor (zeros elsewhere).
     """
 
-    # One-shot per-request encode at request-specific shapes; nothing to gain
-    # from compiling the submodule wrapper.
+    # One-shot per-request encode at request-specific shapes; a deployment
+    # with a fixed observation size compiles that one encode itself
+    # (``compile_vae_encode_size``).
     disable_torch_compile = True
 
     def __init__(self, vae, config):
@@ -2639,6 +2666,17 @@ class Cosmos3VAEEncoderSubmodule(NodeSubmodule):
         self.vae = vae
         self.config = config
         self._video_processor = None
+        # the pixel shape [1, 3, 1, H, W] whose encode is compiled, and the compiled call
+        self._compiled_shape: tuple[int, ...] | None = None
+        self._compiled_encode = None
+        self._compiled_encode_warmed = False
+        if config.compile_vae_encode_size is not None and vae is not None:
+            # Compiled, the encoder's norms and activations fuse around cuDNN's
+            # channels-last convs; eager, channels-last alone is slower.
+            width, height = config.compile_vae_encode_size
+            self._compiled_shape = (1, 3, 1, int(height), int(width))
+            _wan_vae().encoder_to_channels_last(vae)
+            self._compiled_encode = _wan_vae().compile_encode(vae)
 
     def _latent_t(self, num_frames: int) -> int:
         return 1 if num_frames == 1 else 1 + (num_frames - 1) // self.config.vae.scale_factor_temporal
@@ -2742,7 +2780,19 @@ class Cosmos3VAEEncoderSubmodule(NodeSubmodule):
         device = vision.device
         mean, inv_std = latent_affine(vae, dtype, device)
         with torch.autocast(device_type=device.type, enabled=False):
-            raw_mu = vae.encode(vision.to(dtype)).latent_dist.mode()
+            pixels = vision.to(dtype)
+            if self._compiled_encode is not None and tuple(pixels.shape) == self._compiled_shape:
+                if not self._compiled_encode_warmed:
+                    # As in ``_decode_pixels``: a process's first run of a
+                    # compiled bf16 Wan VAE graph can return wrong values on
+                    # some torch/cuDNN stacks, even from a warm Inductor cache.
+                    # Run it once and discard, so no request depends on a
+                    # startup warmup having been the first caller.
+                    self._compiled_encode(pixels)
+                    self._compiled_encode_warmed = True
+                raw_mu = self._compiled_encode(pixels)
+            else:
+                raw_mu = vae.encode(pixels).latent_dist.mode()
         latents = ((raw_mu - mean) * inv_std).to(torch.bfloat16)
         if condition_indexes:
             full = torch.zeros(latent_shape, device=device, dtype=latents.dtype)
