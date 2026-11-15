@@ -3425,7 +3425,7 @@ def storage_of(array: Array) -> Storage:
         return RING
     if array.reads and all(isinstance(read.op, TopK) for read in array.reads.values()):
         return DSA_KEYS
-    if "ckv" in array.entry.tensors:
+    if array.reads and all(isinstance(read.op, LatentAttend) for read in array.reads.values()):
         return LATENT
     if len(array.reads) == 1 and len(array.labels) == 1 and array.positions is None:
         (read,) = array.reads.values()
