@@ -791,9 +791,9 @@ reply: chat ``response_format`` (``json_object``, or ``json_schema`` with its ``
 JSON schema), ``json_object``, ``regex``, ``choice`` (a list of strings) or ``grammar`` (EBNF),
 as vLLM takes it. A reasoning model thinks freely first: Qwen3.5 declares the texts that open and
 end its reasoning (``<think>``, ``</think>``), and on a turn whose prompt opens a reasoning block
-it doesn't close, the constraint starts once the reply holds ``</think>``. Until a reply parser serves ``reasoning_content``, such a reply's
-``content`` holds the reasoning, ``</think>`` and then the reply its grammar holds; send
-``chat_template_kwargs: {"enable_thinking": false}`` for a ``content`` that is the JSON alone. An
+it doesn't close, the constraint starts once the reply holds ``</think>``. On chat, the reasoning
+comes back in ``reasoning`` and ``content`` is the reply its grammar holds; on ``/generate`` the
+text is the reasoning, ``</think>``, then that reply. An
 unsupported schema is a 400, and so is a request on a deployment without ``enable_grammar`` or a
 grammar over 131072 characters, or a ``structured_outputs`` with another key (``after`` included), or one that also sends ``min_tokens`` or
 ``ignore_eos``.
@@ -823,6 +823,25 @@ sampler), resident planning, a declared ``Sampler`` with ``draws`` above 1 (its 
 split twice), and a text sampler whose walks run on different ranks (a prefill/decode split);
 the deployment is refused at startup for the last two, and for ``enable_grammar`` on more than
 one sampler or on one narrower than the text vocabulary.
+
+**Reasoning and tool calls.** A chat reply's thinking comes back in the message's ``reasoning``
+field (``delta.reasoning`` when streamed; vLLM's name), and ``content`` holds only the answer.
+``/generate`` returns the reply as generated. A chat's ``tools`` reach the prompt through
+Qwen3.5's chat template, and the calls in a reply come back as OpenAI ``tool_calls``, each call's
+``arguments`` a JSON object typed by its tool's schema, with ``finish_reason`` ``tool_calls``. In
+a tool loop, an assistant message's ``tool_calls`` and the ``tool`` messages that answer them
+render as the template renders them, and an assistant message's ``reasoning`` (or
+``reasoning_content``) goes back into its turn. Under ``tool_choice`` ``auto`` (the default) the
+reply is parsed but not constrained, so a call the model writes badly comes back as text in
+``content``. ``required``, a named function, and any tool with ``strict: true`` hold the reply to
+Qwen3.5's call format with the grammar sampler, so they need ``enable_grammar`` (a 400
+without it). Such a reply makes one call when ``parallel_tool_calls`` is false (under ``auto``
+with no strict tool, it has no effect), and a call's arguments follow its tool's schema only
+when the tool is ``strict`` (vLLM's rule). ``tool_choice`` ``none`` keeps the
+tools in the prompt and asks for no call, and a call written anyway stays text. Calls are found
+only after the reasoning, and a call cut off by ``max_tokens`` stays text, with
+``finish_reason`` ``length``. Refused with a 400: ``functions`` / ``function_call`` (send
+``tools``), and ``tools`` with a JSON ``response_format``. Through Dynamo, tools are refused.
 
 **LoRA adapters.** A ``resources: lora:`` block in the serving config serves
 per-request LoRA adapters (PEFT ``adapter_model.safetensors``; the scaling comes

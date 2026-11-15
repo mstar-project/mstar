@@ -490,7 +490,9 @@ Endpoints and model coverage:
        ``logit_bias``, ``presence_penalty`` / ``frequency_penalty`` and a ``response_format``
        other than text are refused. ``stream_options``, ``parallel_tool_calls``, ``user``,
        ``store``, ``metadata`` and ``service_tier`` are accepted and have no effect; a stream
-       sends no usage chunk.
+       sends no usage chunk. Qwen3.5 also serves ``tools``, ``tool_choice`` and
+       ``parallel_tool_calls``, and returns its reasoning in ``reasoning``; see the Qwen3.5
+       notes in :doc:`models`.
    * - ``POST /v1/load_lora_adapter``, ``POST /v1/unload_lora_adapter``
      - any LoRA model whose ``resources: lora:`` block sets ``runtime_updates: true``;
        404 otherwise
