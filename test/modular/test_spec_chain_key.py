@@ -155,3 +155,61 @@ def test_a_prompt_chain_with_no_token_budget_does_not_yield_from_its_first_step(
     speculation, _ = _build(speculator, 0)
 
     assert speculation is chunk and not peeked and not excluded
+
+
+def test_the_cap_counts_a_yield_to_another_capture_group_of_the_same_walk():
+    target = SpeculationTarget(SimpleNamespace(node_name="LLM", graph_walk="decode"), [0, 1])
+    speculator, _, excluded = _speculator(target, peek=False)
+    speculator._max_consecutive = 2
+    batch = SimpleNamespace(node_name="LLM", graph_walk="decode", tp_seq=-1)
+    yield_away = SimpleNamespace(
+        is_yield_away=True, gave_way=False, scheduled_batch=batch, node_batch=SimpleNamespace(),
+    )
+    speculator.scheduler.next_batch = lambda exclude_target: excluded.append(exclude_target) or batch
+    speculator._yield_away_speculation = lambda picked: yield_away
+    speculator.lockstep.broadcast = lambda node_batch: -1
+
+    for _ in range(2):
+        launched, _ = speculator.build(_pending())
+        assert launched is yield_away
+        speculator.note_launched(launched)
+
+    _, yielded_from = speculator.build(_pending())
+    assert yielded_from == ("LLM", "decode")
+    assert excluded == [None, None, ("LLM", "decode")]
+
+
+def test_the_cap_restarts_after_another_walk_runs():
+    target = SpeculationTarget(SimpleNamespace(node_name="LLM", graph_walk="decode"), [0, 1])
+    speculator, _, excluded = _speculator(target, peek=False)
+    speculator._max_consecutive = 2
+    speculator.build(_pending())
+
+    same = SimpleNamespace(
+        is_yield_away=True, gave_way=False,
+        scheduled_batch=SimpleNamespace(node_name="LLM", graph_walk="decode"),
+    )
+    other = SimpleNamespace(
+        is_yield_away=True, gave_way=False,
+        scheduled_batch=SimpleNamespace(node_name="audio", graph_walk="emit"),
+    )
+    speculator.note_launched(same)
+    speculator.note_launched(other)
+    _, yielded_from = speculator.build(_pending())
+    assert yielded_from is None and excluded[-1] is None
+    speculator.chain_ended()
+    _, yielded_from = speculator.build(_pending())
+    assert yielded_from is None and excluded[-1] is None
+
+
+def test_another_capture_group_keeps_the_default_peek_cadence():
+    target = SpeculationTarget(SimpleNamespace(node_name="LLM", graph_walk="decode"), [0, 1])
+    speculator, peeked, _ = _speculator(target, peek=True, budgeted=False)
+    speculator.build(_pending())
+    speculator.note_launched(SimpleNamespace(
+        is_yield_away=True, gave_way=False,
+        scheduled_batch=SimpleNamespace(node_name="LLM", graph_walk="decode"),
+    ))
+
+    speculator.build(_pending())
+    assert peeked == []
