@@ -511,6 +511,11 @@ class TextOutput(NamedTuple):
     detokenizer: ByteLevelDetokenizer | TextChunkDetokenizer | SentencePieceDetokenizer | ByteIdDetokenizer
     # ids that end a reply, dropped unless the request sets ``ignore_eos``
     stop_token_ids: Container[int] = frozenset()
+    # the texts that open and end the model's reasoning, None for a model that does not
+    # reason: a reply's ``structured_outputs`` grammar starts after the end on a turn
+    # whose prompt opens a reasoning block it doesn't close (`grammar.after_reasoning`)
+    reasoning_start: str | None = None
+    reasoning_end: str | None = None
 
 
 class ByteLevelTextOutput:

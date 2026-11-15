@@ -349,16 +349,22 @@ def _combined_walk_problems(array: Array, combined: Mapping[str, Collection[str]
     return problems
 
 
+_ONE_DRAW_OPTIONS = (
+    ("enable_logprobs", "log-probs take one token per step"),
+    ("enable_grammar", "a grammar masks one draw per step"),
+)
+
+
 def deployment_problems(model: "Model", resources: Mapping[str, Mapping[str, object]]) -> list[str]:
     """What a deployment's ``resources:`` block asks of the declarations that they can't do: of a sampler, and of an
     array whose step writes its state itself."""
     declarations = model.declare_state()
     problems = [
-        f"Sampler {declared.name!r}.draws: enable_logprobs, and draws is {declared.draws}; log-probs take one token "
-        "per step"
+        f"Sampler {declared.name!r}.draws: {key}, and draws is {declared.draws}; {why}"
         for declared in declarations
         if isinstance(declared, Sampler) and declared.draws > 1
-        and resources.get(declared.name, {}).get("enable_logprobs")
+        for key, why in _ONE_DRAW_OPTIONS
+        if resources.get(declared.name, {}).get(key)
     ]
     for array in declarations:
         if not isinstance(array, Array):

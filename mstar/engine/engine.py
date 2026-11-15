@@ -850,6 +850,7 @@ class Engine:
                     host_allowance=self.host_allowance,
                     prefix_caches=prefix_caches,
                     replicated_over_sp=replicated,
+                    text_output=None if model is None else model.text_output,
                 ),
             )
             for node in relevant_nodes:
@@ -2453,7 +2454,7 @@ class Engine:
         if self._enable_profile and batch.exec_timings.fwd_start is None:
             batch.exec_timings.fwd_start = time.perf_counter()
         # The waiter is released inside the forward, immediately before the
-        # launch that drops the GIL — not here, which is still several GIL-held
+        # step's last launch that drops the GIL — not here, which is still several GIL-held
         # staging copies away from it.
         release_event = batch.launch_started_event if set_launch else None
         if nvtx:

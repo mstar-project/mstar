@@ -14,6 +14,7 @@ from mstar.engine.engine import Engine
 from mstar.engine.node_dtype import resolve_model_dtype, resolve_node_dtype
 from mstar.engine.resources import ResourceReqConfig
 from mstar.engine.resources.kv.transfer import TransferEngineInfo
+from mstar.engine.resources.sampler.config import SamplerSpec
 from mstar.engine.state.analysis import declaration_digests, digest_mismatch
 from mstar.graph.base import GraphNode
 from mstar.graph.runtime.base import GraphRuntime, inline_column
@@ -161,6 +162,31 @@ def _refuse_speculated_spans(submodules: dict, model: Model) -> None:
                         f"feeds {edge.next_node!r} on the same worker in walk {walk!r}; "
                         "set enable_async_scheduling=False on one of them"
                     )
+
+
+def _refuse_unlisted_grammar_stops(submodules: dict, specs: Collection, model: Model) -> None:
+    """The grammar sampler ends a constrained reply on the ids ``text_output()``
+    declares, and the loop ends it on its ``TokenStop`` ids. A stop id of a loop
+    that draws from the grammar sampler and is not declared would be masked out
+    of a finished grammar's row, so the reply would never end there."""
+    keys = {spec.resource_key: spec for spec in specs if isinstance(spec, SamplerSpec) and spec.enable_grammar}
+    for name, submodule in submodules.items():
+        stop = getattr(submodule, "token_stop", None)
+        if stop is None or stop.sampler not in keys:
+            continue
+        text = model.text_output()
+        if text is None:  # the sampler's own refusal says so
+            return
+        tokenizer = getattr(text.detokenizer, "tokenizer", None)
+        vocab_size = keys[stop.sampler].vocab_size
+        if tokenizer is not None and vocab_size is not None and vocab_size < len(tokenizer):
+            continue  # not the text sampler: the sampler's own refusal names that
+        if missing := stop.stop_ids - frozenset(text.stop_token_ids):
+            raise ValueError(
+                f"{type(model).__name__}: {name!r} draws from {stop.sampler!r} with enable_grammar and stops on "
+                f"token ids {sorted(missing)} that its text_output() does not list: declare them there, "
+                "or put enable_grammar on the text sampler"
+            )
 
 
 def _refuse_unroutable_withholds(submodules: dict, model: Model) -> None:
@@ -490,6 +516,7 @@ class EngineManager:
         _refuse_speculated_spans(submodules, model)
         _refuse_unroutable_withholds(submodules, model)
         _refuse_combined_loopbacks(submodules, model)
+        _refuse_unlisted_grammar_stops(submodules, specs, model)
         inline_streams = _inline_streams(submodules, model, parallel_groups)
         side_keys = _side_lane_keys(
             submodules, specs, model, node_names, side_stream_nodes(model_config["node_groups"]),

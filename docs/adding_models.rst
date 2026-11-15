@@ -3176,7 +3176,8 @@ that a misspelled setting is never silently ignored:
      - ``enable_logprobs``, ``enable_processed_logprobs`` (see ``SamplingReqConfig``),
        ``greedy_capture`` (``true`` / ``false``; by default a sampler past the one-kernel
        draw takes each row's argmax in a step whose rows all sample greedily, in a twin of
-       each batched capture)
+       each batched capture), ``enable_grammar`` and ``grammar_cache_mb`` (see **Structured
+       output** in models.rst)
    * - ``RecurrentStateSpec``
      - ``max_slots``, ``state_dtype`` (on a ``Value``, only with a ``GatedDeltaNet``),
        ``prefix_slots`` (see **Cross-request prefix reuse**).
@@ -3536,6 +3537,29 @@ its context partial before the gather.
    A top-level ``kv_cache:`` block is no longer read. It raises an error at load time,
    with a message describing the migration. Move the block under ``resources:``, keyed by
    the resource name.
+
+Serving structured outputs
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+A model serves ``response_format`` and ``structured_outputs`` (see **Structured output** in
+:doc:`models`) once it does four things; Qwen3.5 is the reference:
+
+* sets ``STRUCTURED_OUTPUTS = True`` on its model class, or a deployment with
+  ``enable_grammar`` is refused at startup;
+* attaches the request's grammar to its text sampler's settings: in
+  ``get_request_resource_configs``, the settings the base class builds with
+  ``grammar=request_grammar(model_kwargs)`` added (Qwen3.5: ``replace(settings, grammar=...)``),
+  with ``request_grammar`` from ``mstar.engine.state`` (a bad grammar raises the client's 400);
+* lists its reply's stop ids in ``text_output()``, the stops the grammar lets a reply end on (a
+  loop that stops through a ``TokenStop`` on the grammar sampler without them is refused at
+  startup);
+* if it reasons, declares the texts that open and end its reasoning, ``TextOutput.reasoning_start``
+  and ``reasoning_end`` (``REASONING_START`` and ``REASONING_END`` on a
+  ``MultimodalDecoderModel``), so a turn whose prompt leaves a reasoning block open thinks freely
+  and answers in its grammar.
+
+The deployment then sets ``enable_grammar: true`` on that sampler, and installs the ``grammar``
+extra.
 
 Routing across data-parallel replicas
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

@@ -66,3 +66,50 @@ def test_a_fresh_cache_renders_chats_with_the_checkpoints_template(tmp_path, mon
         return text.tolist()
 
     assert ids(fresh) == ids(full)
+
+
+def _prepared_kwargs(model, structured_outputs, **client) -> dict:
+    """The request kwargs the data worker hands the conductor, without its threads or sockets."""
+    from mstar.api_server.data_worker import PreprocessWorkerThread
+    from mstar.api_server.request_types import PreprocessInput
+
+    worker = PreprocessWorkerThread.__new__(PreprocessWorkerThread)
+    worker.model, worker.device, worker._keyed_labels = model, "cpu", None
+    return worker._prepare_input(PreprocessInput(
+        request_id="r", text="Reply in JSON.", file_paths=None, input_modalities=["text"],
+        output_modalities=["text"],
+        model_kwargs={"prefix_cache": False, "structured_outputs": structured_outputs, **client},
+    )).model_kwargs
+
+
+@pytest.mark.parametrize("template, after", [(CHAT_TEMPLATE, "</think>"), (OTHER_TEMPLATE, None)],
+                         ids=["thinking", "reasoning closed"])
+def test_a_reply_grammar_starts_where_the_prompt_leaves_the_reasoning(tmp_path, template, after):
+    """A thinking turn reasons freely and then answers in its grammar; a turn
+    whose prompt already closed the reasoning is held to it from the start."""
+    from mstar.engine.resources.sampler.grammar import GRAMMAR_AFTER_KWARG
+    from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
+
+    repo = _repo(tmp_path / "repo", None)
+    (repo / "chat_template.jinja").write_text(template)
+    model = Qwen3_5DenseModel(str(repo))
+    kwargs = _prepared_kwargs(model, {"json_object": True})
+    assert kwargs.get(GRAMMAR_AFTER_KWARG) == after and kwargs["structured_outputs"] == {"json_object": True}
+    # only the data worker says where the grammar starts: a client's value is dropped
+    kwargs = _prepared_kwargs(model, {"json_object": True}, **{GRAMMAR_AFTER_KWARG: "x"})
+    assert kwargs.get(GRAMMAR_AFTER_KWARG) == after
+
+
+def test_qwen3_5_attaches_the_requests_grammar_to_its_sampler_settings(tmp_path):
+    """Qwen3.5 declares STRUCTURED_OUTPUTS, so its own sampler settings carry the request's
+    grammar (the conductor then checks a sampler serves it); a bad one is the client's 400."""
+    pytest.importorskip("xgrammar")
+    from mstar.model.qwen3_5.qwen3_5_model import Qwen3_5DenseModel
+
+    model = Qwen3_5DenseModel(str(_repo(tmp_path / "repo", None)))
+    settings = model.get_request_resource_configs(
+        ["text"], ["text"], {"temperature": 0.2, "structured_outputs": {"regex": "a+"}})["sampler"]
+    assert settings.temperature == 0.2 and settings.grammar.kind == "regex"
+    assert model.get_request_resource_configs(["text"], ["text"], {})["sampler"].grammar is None
+    with pytest.raises(ValueError, match="structured_outputs"):
+        model.get_request_resource_configs(["text"], ["text"], {"structured_outputs": {"regex": "a", "json": {}}})

@@ -64,7 +64,7 @@ def _worker(*, follower=False, engine_manager=None, **components):
     w.reported: dict[int, str] = {}
     w.pipeline._fail_requests = w.reported.update
     # what Admission fails, whether or not the test admitted the request
-    w.lifecycle.fail = w.reported.update
+    w.lifecycle.fail = lambda errors, status=500: w.reported.update(errors)
     return w
 
 

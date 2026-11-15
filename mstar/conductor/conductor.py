@@ -46,6 +46,8 @@ from mstar.engine.resources.kv.config import (
     without_layouts,
 )
 from mstar.engine.resources.lora.config import LoraSpec
+from mstar.engine.resources.sampler.config import SamplerSpec
+from mstar.engine.resources.sampler.grammar import STRUCTURED_OUTPUTS_KWARG
 from mstar.engine.state import SampleSettings
 from mstar.engine.state.adapters import sampling_configs
 from mstar.engine.state.analysis import declaration_digests
@@ -830,6 +832,20 @@ class Conductor:
             config = spec.request_config(model_kwargs)
             if config is not None:
                 configs.setdefault(spec.resource_key, config)
+        # as return_logprobs above: the model attached the grammar to a sampler whose spec enables it, or nothing
+        # serves it (a model that doesn't declare STRUCTURED_OUTPUTS attaches none)
+        with_grammar = {key for key, cfg in configs.items() if getattr(cfg, "grammar", None) is not None}
+        serving = {
+            spec.resource_key for spec in self._node_resources()
+            if isinstance(spec, SamplerSpec) and spec.enable_grammar
+        }
+        if (model_kwargs.get(STRUCTURED_OUTPUTS_KWARG) is not None or with_grammar) and not (
+            with_grammar and with_grammar <= serving
+        ):
+            raise ValueError(
+                "this deployment does not serve a JSON response_format or structured_outputs: they need a model "
+                "that serves them, with enable_grammar on its sampler"
+            )
         lora_ops = getattr(self, "_lora_ops_cache", None)
         if lora_ops is not None:
             lora_ops.refuse_request(configs.values())
@@ -1818,7 +1834,9 @@ class Conductor:
                 continue
             logger.error("Request %s failed on a worker: %s", rid, error_message)
             try:
-                self._remove_request(rid, request_data, failure_error=error_message)
+                self._remove_request(
+                    rid, request_data, failure_error=error_message, failure_status=body.statuses.get(rid, 500),
+                )
             except Exception as exc:
                 # the other requests in the batch keep their own error
                 self._fail_after_error(rid, "failing it", exc)
@@ -1860,7 +1878,7 @@ class Conductor:
 
     def _remove_request(
         self, request_id: str, request_data: RequestData,
-        failure_error: str | None = None,
+        failure_error: str | None = None, failure_status: int = 500,
     ):
         """Begin teardown for an abort/fail: drain every participant's reads,
         then (on the barrier's completion) hard-remove. Shared by the abort
@@ -1880,6 +1898,7 @@ class Conductor:
             expected_acks=participants,
             participants=participants,
             failure_error=failure_error,
+            failure_status=failure_status,
         )
 
     def _process_request_done(

@@ -430,9 +430,11 @@ class FailRequests(MessageBody):
     ``errors`` maps request_id -> message. It's a dict rather than a
     (rids, message) pair because per-rid stages (prepare_inputs,
     postprocess) attribute a distinct error to each request, and one
-    step can fail several of them for different reasons.
+    step can fail several of them for different reasons. ``statuses``: the
+    HTTP status of each that isn't a 500 (the request's own fault, say).
     """
     errors: dict[str, str]
+    statuses: dict[str, int] = field(default_factory=dict)
 
 
 @dataclass

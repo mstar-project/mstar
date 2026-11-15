@@ -1,4 +1,5 @@
 import logging
+from dataclasses import replace
 from typing import Any
 
 import torch
@@ -18,9 +19,11 @@ from mstar.engine.state import (
     Positions,
     Read,
     Sampler,
+    SampleSettings,
     SeqShard,
     TensorType,
     Value,
+    request_grammar,
 )
 from mstar.model.base import ProcessPromptOutput, TensorAndMetadata
 from mstar.model.components.lora.modules import LoraRoot
@@ -69,6 +72,9 @@ logger = logging.getLogger(__name__)
 # TODO: implement MoE variants
 class Qwen3_5DenseModel(DeclaredDecoderModel):
     NAME = "Qwen3.5"
+    REASONING_START = "<think>"
+    REASONING_END = "</think>"
+    STRUCTURED_OUTPUTS = True
     METADATA_FILES = (
         "config.json",
         "preprocessor_config.json",
@@ -189,6 +195,12 @@ class Qwen3_5DenseModel(DeclaredDecoderModel):
         processor = self.image_processor
         min_patches = processor.size["shortest_edge"] // processor.patch_size ** 2
         return VisionEncoderSubmodule.BLOCK_LOOP_PATCH_BUCKETS[-1] // min_patches
+
+    def get_request_resource_configs(
+        self, input_modalities: list[str], output_modalities: list[str], model_kwargs: dict,
+    ) -> dict[str, SampleSettings]:
+        settings = super().get_request_resource_configs(input_modalities, output_modalities, model_kwargs)[SAMPLER]
+        return {SAMPLER: replace(settings, grammar=request_grammar(model_kwargs))}
 
     # -----------------------------------------------------------------------
     # Chunked prefill

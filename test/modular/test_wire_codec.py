@@ -282,6 +282,9 @@ def test_fail_requests_and_empty_collections():
         body=FailRequests(errors={"r0": "oom", "r1": "admit rejected"}),
     )
     assert roundtrip(msg).body.errors == {"r0": "oom", "r1": "admit rejected"}
+    assert roundtrip(msg).body.statuses == {}
+    msg.body.statuses = {"r1": 400}
+    assert roundtrip(msg).body == FailRequests(errors={"r0": "oom", "r1": "admit rejected"}, statuses={"r1": 400})
 
     # a body where every optional collection is left at its default
     msg = ConductorMessage(
@@ -366,6 +369,20 @@ def test_none_in_a_field_with_a_non_none_default_survives():
     assert out.top_k is None
     assert out.temperature is None
     assert out.top_p == 1
+
+
+def test_a_sampler_config_s_grammar_survives():
+    from mstar.engine.resources.sampler.config import SamplingReqConfig
+    from mstar.engine.resources.sampler.grammar import GrammarRequest
+
+    grammar = GrammarRequest("json", '{"type": "object"}', after="</think>")
+    fi = _fwd_info()
+    fi.resource_configs = {"sampler": SamplingReqConfig(grammar=grammar)}
+    msg = WorkerMessage(
+        message_type=WorkerMessageType.INPUT_SIGNALS,
+        body=InputSignals(request_id="r", partition_name="p", request_info=fi, inputs=[]),
+    )
+    assert roundtrip(msg).body.request_info.resource_configs["sampler"].grammar == grammar
 
 
 def test_a_rolling_kv_request_config_crosses_the_wire_typed():

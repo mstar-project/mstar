@@ -25,7 +25,7 @@ from torch.distributed import ReduceOp
 
 from mstar.distributed.communication import CommGroup, JointGroups
 from mstar.engine import accelerator_graph_runner
-from mstar.engine.accelerator_graph_backend import AcceleratorGraphPool
+from mstar.engine.accelerator_graph_backend import AcceleratorGraphPool, SplitGraph, split_capture
 from mstar.engine.accelerator_graph_runner import (
     AcceleratorGraphRunner,
     CaptureCost,
@@ -36,6 +36,7 @@ from mstar.engine.accelerator_graph_runner import (
 )
 from mstar.engine.resources import BucketKey, CGSlotSpec, SubmoduleStep
 from mstar.testing_utils.engine import make_engine, make_mgmt
+from mstar.utils.device import DeviceCapability
 
 _GIB = 2**30
 _MIB = 2**20
@@ -65,6 +66,7 @@ class _StubMeasuredRunner:
 
     size_captures = AcceleratorGraphRunner.size_captures
     size_lent_captures = AcceleratorGraphRunner.size_lent_captures
+    _splittable = AcceleratorGraphRunner._splittable
     NUM_WARMUP = AcceleratorGraphRunner.NUM_WARMUP
     _capture_stream = None
 
@@ -75,6 +77,7 @@ class _StubMeasuredRunner:
         self._submodule_name = "Thinker"
         self._resident = None
         self._num_slots = 2
+        self._resources = {}
         self._capture_costs = {}
         self._lent = set()
         self._executables = {}
@@ -264,6 +267,88 @@ def test_a_regions_inputs_and_outputs_count_outside_its_pool(monkeypatch):
     assert size(peak=8, kept=4) == (CaptureCost(8 * _MIB, 64 * _MIB, 4 * _MIB, 1), False)
     assert size(peak=4, kept=2) == (CaptureCost(4 * _MIB, 62 * _MIB, 2 * _MIB, 1), False)
     assert size(peak=2, kept=1) == (CaptureCost(2 * _MIB, 61 * _MIB, _MIB, 1), True)
+
+
+class _SplitsCapture:
+    """A resource like the grammar sampler, whose draw splits its node's captures."""
+
+    splits_capture = True
+
+
+@pytest.mark.parametrize("splits", [True, False], ids=["a resource splits", "none splits"])
+def test_every_capture_of_a_node_may_split_when_a_resource_splits_it(measured, monkeypatch, splits):
+    """Sizing captures a bucket, thrown away, before the real capture does, and the
+    grammar sampler's draw splits whichever capture runs it: a sizing capture that
+    may not split fails the boot. A node without such a resource never splits."""
+    asked = []
+
+    def capture(run, pool, device, autocast_dtype, splittable=False, **_):
+        asked.append(splittable)
+        # sizing reads the stub step's cost off the output; the real capture, a step's outputs
+        return None, ({} if pool == "node pool" else run())
+
+    monkeypatch.setattr(accelerator_graph_runner, "capture_into_graph", capture)
+    monkeypatch.setattr(torch.accelerator, "empty_cache", lambda: None)
+    walk = {_bucket("decode", bs, bs): CaptureCost(bs * _MIB, 2 * bs * _MIB, 0, 2) for bs in (16, 8, 4)}
+    runner = _StubMeasuredRunner(torch.device("cuda", 0), walk)
+    runner._resources = {"sampler": _SplitsCapture()} if splits else {}
+    runner._memory_pool = "node pool"
+    runner._build_slot_from_capture = lambda **slot: slot
+
+    runner.size_captures()
+    sized = len(asked)
+    runner.size_lent_captures(True)
+    lent = len(asked) - sized
+    for spec in runner.prepare_for_capture():
+        AcceleratorGraphRunner._capture_one(runner, spec, forwards=0)
+
+    assert sized and lent and len(asked) > sized + lent, "each path: sizing, lent sizing and the real capture"
+    assert asked == [splits] * len(asked)
+
+
+@requires_cuda
+def test_a_node_whose_resource_splits_sizes_and_captures_a_split_graph():
+    """On a GPU, through the runner's own sizing and capture: a forward whose draw
+    calls `split_capture` sizes its bucket and captures it as a split graph, whose
+    replay runs the host call between its halves."""
+    device = torch.device("cuda", torch.cuda.current_device())
+    x, w = torch.randn(8, 64, device=device), torch.randn(64, 64, device=device)
+    mask = torch.zeros(8, 64, device=device)
+    filled = []
+
+    def forward():
+        logits = x @ w
+        split_capture(lambda: (filled.append(1), mask.fill_(float(len(filled)))))
+        return {"logits": logits + mask}
+
+    class _Runner(_StubMeasuredRunner):
+        @contextmanager
+        def _warmed(self, spec, forwards):
+            for _ in range(forwards):
+                x @ w  # the warm-up runs eagerly, outside any capture
+            torch.cuda.synchronize()
+            yield WarmedSpec(
+                run=forward, static_inputs={}, static_input_keys=(), dummy_rids=[], dummy_metadata={},
+                peak=_MIB, returned=0,
+            )
+
+    walk = {_bucket("decode", 8, 8): CaptureCost(_MIB, None, 0, 1)}
+    runner = _Runner(device, walk)
+    runner._num_slots = 1
+    runner._resources = {"sampler": _SplitsCapture()}
+    runner.prepare_for_capture = lambda: [CGSlotSpec(bucket=b, slot=0, config=SimpleNamespace()) for b in walk]
+    runner._memory_pool = DeviceCapability.of(device).graph_backend.graph_pool_handle()
+    runner._build_slot_from_capture = lambda **slot: slot
+
+    runner.size_captures()
+    (spec,) = runner.prepare_for_capture()
+    slot = AcceleratorGraphRunner._capture_one(runner, spec, forwards=0)
+
+    assert isinstance(slot["graph"], SplitGraph)
+    slot["graph"].replay()
+    torch.cuda.synchronize()
+    want = x @ w + float(len(filled))
+    torch.testing.assert_close(slot["output"].per_rid_outputs["logits"], want)
 
 
 def test_every_slot_is_warmed_before_any_capture(measured):

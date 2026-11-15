@@ -121,7 +121,7 @@ def _worker(**overrides):
     w._kv_writes = {"kv": {NODE: NodeWrites(frozenset({PREFILL, DECODE}), frozenset({"loop"}))}}
     preempting(w)
     w.seen, w.failed, w.infos = seen, {}, infos
-    w.lifecycle.fail = w.failed.update
+    w.lifecycle.fail = lambda errors, status=500: w.failed.update(errors)
     return w, eng
 
 
