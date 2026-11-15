@@ -884,6 +884,10 @@ fn chat_delta(c: &ResultChunk, text: &mut Utf8Stream) -> Option<Value> {
             if !content.is_empty() {
                 delta.insert("content".to_string(), json!(content));
             }
+            // the reply's finished tool calls, each with its index, as the backend's parser wrote them
+            if let Some(calls) = c.metadata.get("tool_calls").filter(|v| v.as_array().is_some_and(|a| !a.is_empty())) {
+                delta.insert("tool_calls".to_string(), calls.clone());
+            }
             if delta.is_empty() {
                 return None;
             }
@@ -953,6 +957,7 @@ fn build_chat_response(
 ) -> Result<Value, String> {
     let mut text_bytes: Vec<u8> = Vec::new();
     let mut reasoning = String::new();
+    let mut calls: Vec<Value> = Vec::new();
     let mut audio_pcm: Vec<u8> = Vec::new();
     let mut images: Vec<Vec<u8>> = Vec::new();
     let mut usage: Option<&Value> = None;
@@ -962,6 +967,9 @@ fn build_chat_response(
                 text_bytes.extend_from_slice(&c.data);
                 if let Some(r) = c.metadata.get("reasoning").and_then(Value::as_str) {
                     reasoning.push_str(r);
+                }
+                if let Some(cs) = c.metadata.get("tool_calls").and_then(Value::as_array) {
+                    calls.extend(cs.iter().cloned());
                 }
             }
             "audio" => audio_pcm.extend_from_slice(&c.data),
@@ -976,6 +984,18 @@ fn build_chat_response(
     if !reasoning.is_empty() {
         // a reasoning model's thinking, split off its answer by the backend's reply parser
         message["reasoning"] = json!(reasoning);
+    }
+    if !calls.is_empty() {
+        // the reply's tool calls; a reply that is only calls has no content, as OpenAI's
+        for call in &mut calls {
+            if let Some(o) = call.as_object_mut() {
+                o.remove("index");
+            }
+        }
+        message["tool_calls"] = Value::Array(calls);
+        if text.is_empty() {
+            message["content"] = Value::Null;
+        }
     }
 
     if !audio_pcm.is_empty() {

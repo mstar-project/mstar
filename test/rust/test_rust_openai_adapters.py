@@ -364,6 +364,71 @@ def test_both_frontends_answer_a_chat_with_the_same_status_and_body(case, model,
     assert _normalized(*rust, stream) == _normalized(py.status_code, py.content, stream)
 
 
+_CALL = {"index": 0, "id": "call_0", "type": "function",
+         "function": {"name": "get_weather", "arguments": '{"city": "Paris"}'}}
+PARSED_REPLIES = {
+    # a reply split by the backend's parser: the reasoning, then the answer or the calls
+    "answer": [_Chunk("text", b"", {"reasoning": "Simple"}), _Chunk("text", b"Paris", {"reasoning": " question."}),
+               _Chunk("text", b"!")],
+    "tool-calls": [_Chunk("text", b"", {"reasoning": "Check the weather."}),
+                   _Chunk("text", b"", {"tool_calls": [_CALL]}),
+                   _Chunk("text", b"", {"tool_calls": [{**_CALL, "index": 1, "id": "call_1"}]})],
+}
+
+
+class _ParsedPythonServer(_PythonServer):
+    def __init__(self, model_name, upload_dir, chunks, finish):
+        super().__init__(model_name, upload_dir)
+        self.parsed, self.finish = chunks, finish
+
+    def submit_request(self, **kwargs):
+        self.tail = [_Chunk("usage", b"", {**_USAGE, "finish_reason": self.finish})]
+        return kwargs["request_id"]
+
+    async def collect_results(self, request_id, raw_request=None):
+        return [*self.parsed, *self.tail]
+
+    async def iter_result_chunk_batches(self, request_id):
+        yield self.parsed[:1]
+        yield [*self.parsed[1:], *self.tail]
+
+
+class _ParsedStub(_StubAPIServer):
+    def __init__(self, chunks, finish):
+        super().__init__()
+        self.parsed, self.finish = chunks, finish
+
+    async def iter_result_chunks(self, request_id):
+        for chunk in [*self.parsed, _Chunk("usage", b"", {**_USAGE, "finish_reason": self.finish})]:
+            yield chunk
+
+
+@pytest.mark.parametrize("stream", [False, True], ids=["whole", "stream"])
+@pytest.mark.parametrize("reply", sorted(PARSED_REPLIES))
+def test_both_frontends_render_a_parsed_reply_alike(reply, stream, tmp_path, monkeypatch):
+    """The backend's parser splits a reply once; each frontend renders its pieces the same way:
+    ``reasoning`` (whole and as deltas), ``tool_calls`` (``content`` null when the reply is only
+    calls, each delta carrying its index) and ``finish_reason: tool_calls``."""
+    pytest.importorskip("fastapi")
+    from fastapi.testclient import TestClient
+
+    from mstar.api_server import entrypoint
+
+    finish = "tool_calls" if reply == "tool-calls" else "stop"
+    body = {"messages": [{"role": "user", "content": "Weather in Paris?"}], "stream": stream}
+    monkeypatch.setattr(entrypoint, "api_server",
+                        _ParsedPythonServer("qwen3_5_0.8b", tmp_path, PARSED_REPLIES[reply], finish))
+    py = TestClient(entrypoint.app).post("/v1/chat/completions", json=body)
+    with _model_stack("qwen3_5_0.8b", _ParsedStub(PARSED_REPLIES[reply], finish)) as (port, _upload):
+        rust = _post(port, "/v1/chat/completions", body, timeout=30)
+    ours = _normalized(py.status_code, py.content, stream)
+    assert _normalized(*rust, stream) == ours
+    if not stream:
+        message = ours[1]["choices"][0]["message"]
+        assert message.get("reasoning") and (message.get("tool_calls") or message["content"])
+        assert ours[1]["choices"][0]["finish_reason"] == finish
+
+
 # ── GET /v1/audio/voices ─────────────────────────────────────────────────────
 
 class _VoicedModel:

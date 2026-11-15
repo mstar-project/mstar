@@ -16,7 +16,7 @@ from fastapi import HTTPException
 
 from mstar.api_server import media_io
 from mstar.api_server.openai._util import SSE_DONE, error_type, now, rid, sse
-from mstar.api_server.reply_parser import REASONING
+from mstar.api_server.reply_parser import REASONING, TOOL_CALLS
 from mstar.api_server.request_types import USAGE
 from mstar.api_server.streaming_response import ReleasingStreamingResponse
 from mstar.engine.resources.lora.config import LORA_ADAPTER_KWARG
@@ -92,6 +92,7 @@ def _finish_reason(reported: dict | None) -> str:
 def _build_response(model_name, request_id, chunks, sample_rate, audio_format="wav") -> dict:
     text_parts: list[bytes] = []
     reasoning: list[str] = []
+    calls: list[dict] = []
     audio_pcm: list[bytes] = []
     images: list[bytes] = []
     usage = None
@@ -100,6 +101,7 @@ def _build_response(model_name, request_id, chunks, sample_rate, audio_format="w
             text_parts.append(c.data)
             if REASONING in c.metadata:
                 reasoning.append(c.metadata[REASONING])
+            calls += c.metadata.get(TOOL_CALLS, ())
         elif c.modality == "audio":
             audio_pcm.append(c.data)
         elif c.modality == "image":
@@ -113,6 +115,10 @@ def _build_response(model_name, request_id, chunks, sample_rate, audio_format="w
     if reasoning:
         # a reasoning model's thinking, split off its answer (`ReplyParser`), under vLLM's name
         message[REASONING] = "".join(reasoning)
+    if calls:
+        # the reply's tool calls; a reply that is only calls has no content, as OpenAI's
+        message[TOOL_CALLS] = [{k: v for k, v in call.items() if k != "index"} for call in calls]
+        message["content"] = text or None
 
     if audio_pcm:
         audio, _ = media_io.pcm16_to_container(b"".join(audio_pcm), sample_rate, audio_format)
@@ -177,6 +183,8 @@ async def _stream_events(batches, model_name, request_id, sample_rate, include_u
                     content = text.feed(c.data)
                     if content:
                         delta["content"] = content
+                    if TOOL_CALLS in c.metadata:
+                        delta[TOOL_CALLS] = c.metadata[TOOL_CALLS]
                     if delta:
                         text_events.append(chunk({**role, **delta}))
                         role = {}

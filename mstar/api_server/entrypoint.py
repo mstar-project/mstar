@@ -46,7 +46,7 @@ from mstar.api_server.body_limit import BodyLimitMiddleware, max_body_bytes
 from mstar.api_server.data_worker import PreprocessWorker, unlink_files
 from mstar.api_server.lora_admin import LoraAdmin
 from mstar.api_server.openpi import OpenpiPolicy, serve_connection
-from mstar.api_server.reply_parser import REASONING, REPLY_IN_REASONING, ReplyParser
+from mstar.api_server.reply_parser import REASONING, REPLY_IN_REASONING, TOOL_CALLS, TOOL_FORMATS, ReplyParser
 from mstar.api_server.request_types import (
     USAGE,
     APIServerMessage,
@@ -374,9 +374,10 @@ class PendingRequest:
     stopped: bool = False
     prompt_tokens: int | None = None
     max_output_tokens: int | None = None
-    # submit_request's parse_reply, and the reply's parser, built on its first text chunk; only
-    # the message thread touches it
+    # submit_request's parse_reply, the tools its parser finds calls to (None: it finds none), and
+    # the parser, built on the reply's first text chunk; only the message thread touches it
     parse_reply: bool = False
+    reply_tools: list | None = None
     parser: ReplyParser | None = None
 
     def notify(self) -> None:
@@ -412,19 +413,31 @@ def _set_events(wakes: list) -> None:
         wake.set()
 
 
+def _split_chunk(chunk: ResultChunk, reasoning: str, answer: str, calls: list[dict]) -> None:
+    """A parsed reply's text chunk as the parser split it: its answer as the text, its reasoning and
+    finished calls in its metadata."""
+    chunk.data = answer.encode()
+    if reasoning:
+        chunk.metadata[REASONING] = reasoning
+    if calls:
+        chunk.metadata[TOOL_CALLS] = calls
+
+
 def usage_chunk(request_id: str, req: PendingRequest) -> ResultChunk:
     """The chunk that ends a successful request submitted with ``report_usage``.
     Its ``finish_reason`` is ``length`` when the reply used all of the
     ``max_output_tokens`` the conductor resolved for it without sampling a stop
     token, and ``stop`` otherwise. A stop token in the last allowed slot is
     ``stop``, as OpenAI and vLLM report it. Only a model that declares
-    ``text_output`` has its stop tokens seen; any other is ``length`` at the cap."""
+    ``text_output`` has its stop tokens seen; any other is ``length`` at the cap. A reply whose
+    parser found a call, and that wasn't cut at the cap, is ``tool_calls``."""
     cap = req.max_output_tokens
     at_cap = cap is not None and req.completion_tokens >= cap
+    called = req.parser is not None and req.parser.calls > 0
     return ResultChunk(request_id=request_id, modality=USAGE, data=b"", metadata={
         "prompt_tokens": req.prompt_tokens or 0,
         "completion_tokens": req.completion_tokens,
-        "finish_reason": "length" if at_cap and not req.stopped else "stop",
+        "finish_reason": "length" if at_cap and not req.stopped else "tool_calls" if called else "stop",
     })
 
 
@@ -850,21 +863,18 @@ class APIServer:
         moves to ``metadata["reasoning"]``. On the message thread, in the request's chunk order."""
         if req.parser is None:
             starts = bool(chunk.metadata.pop(REPLY_IN_REASONING, False))
-            req.parser = ReplyParser(self._reply_reasoning_end(), starts)
-        reasoning, answer = req.parser.feed(chunk.data)
-        chunk.data = answer.encode()
-        if reasoning:
-            chunk.metadata[REASONING] = reasoning
+            tool_format = TOOL_FORMATS.get(getattr(self.model, "TOOL_FORMAT", None)) if req.reply_tools else None
+            req.parser = ReplyParser(self._reply_reasoning_end(), starts, tool_format, req.reply_tools)
+        _split_chunk(chunk, *req.parser.feed(chunk.data))
 
     @staticmethod
     def _finish_reply(req: PendingRequest, rid: str) -> None:
-        """The text a parsed reply's parser still holds, as its last text chunk."""
-        reasoning, answer = req.parser.finish()
-        if reasoning or answer:
-            req.chunks.append(ResultChunk(
-                request_id=req.request_id or rid, modality="text", data=answer.encode(),
-                metadata={REASONING: reasoning} if reasoning else {},
-            ))
+        """What a parsed reply's parser still holds, as its last text chunk."""
+        reasoning, answer, calls = req.parser.finish()
+        if reasoning or answer or calls:
+            chunk = ResultChunk(request_id=req.request_id or rid, modality="text", data=b"")
+            _split_chunk(chunk, reasoning, answer, calls)
+            req.chunks.append(chunk)
 
     def _report_ignored_params(self, model_kwargs: dict) -> None:
         """Log the keys the model does not read, once per set of keys; the
@@ -933,9 +943,9 @@ class APIServer:
 
         ``report_usage`` ends a successful request's chunks with a ``usage``
         chunk (:func:`usage_chunk`). ``parse_reply`` (a chat reply) splits its text, on a model
-        that reasons, into the answer and ``metadata["reasoning"]`` (`ReplyParser`).
+        that reasons or calls tools, into the answer, ``metadata["reasoning"]`` and
+        ``metadata["tool_calls"]`` (`ReplyParser`).
         """
-        parse_reply = parse_reply and self._reply_reasoning_end() is not None
         if raw_inputs is not None:
             _check_raw_inputs(raw_inputs, file_paths)
         if request_id is None:
@@ -958,6 +968,11 @@ class APIServer:
         # checked once for every endpoint, and an over-wide seed cannot be packed
         model_kwargs = normalize_generation_kwargs(model_kwargs)
         self._refuse_unserved_tools(model_kwargs, prompt_parts)
+        reply_tools = None
+        if parse_reply and getattr(getattr(self, "model", None), "TOOL_FORMAT", None) in TOOL_FORMATS \
+                and model_kwargs.get("tool_choice") != "none":
+            reply_tools = model_kwargs.get("tools") or None
+        parse_reply = parse_reply and (self._reply_reasoning_end() is not None or reply_tools is not None)
         model_kwargs, prefix_root = self.lora_kwargs(model, model_kwargs)
         self._report_ignored_params(model_kwargs)
 
@@ -999,6 +1014,7 @@ class APIServer:
                 input_bytes=input_bytes,
                 report_usage=report_usage,
                 parse_reply=parse_reply,
+                reply_tools=reply_tools,
             )
         if self.metrics is not None:
             mark_submitted()
